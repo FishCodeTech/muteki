@@ -1,0 +1,12 @@
+{
+  "_comment": "OPTIONAL knowledge-base MCP client config. Muteki can let a worker query a knowledge-base MCP (e.g. your own security-intel / CVE / writeup index) as a first-class tool. This is OFF by default — there is no bundled KB service. To use one: copy this file to .mcp.json (gitignored), point `url` at YOUR MCP server, set MUTEKI_KB_MCP_NAME to the server key below, provide its bearer token via env, and run with kb enabled. See README 'Knowledge base (optional)'.",
+  "mcpServers": {
+    "my-kb": {
+      "type": "http",
+      "url": "https://your-kb-mcp.example/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${MY_KB_TOKEN}"
+      }
+    }
+  }
+}

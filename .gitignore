@@ -1,0 +1,69 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Worker image build artifact — the cross-compiled Go supervisor. Source lives in
+# cmd/runtime-agent/; build.sh regenerates this into the docker build context.
+docker/worker/runtime_agent
+docker/worker/blackboard.py
+docker/worker/blackboard.SKILL.md
+
+# Virtual environments
+.venv
+
+# OS / editor cruft
+.DS_Store
+
+# Runtime output (artifacts the kernel writes, session event logs, eval runs,
+# distilled knowledge templates)
+artifacts/
+sessions/
+eval_runs/
+knowledge/
+
+# pytest / tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+harness-assessment.html
+
+# Secrets — NEVER commit real API keys / MCP bearer tokens.
+# .mcp.json is the LOCAL knowledge-base MCP client config (may point at a private
+# service + token) and is NOT committed; .mcp.json.example is the sanitized template.
+.env
+.env.*
+!.env.example
+.mcp.json
+.mcp.local.json
+!.mcp.json.example
+*.local.json
+secrets/
+.secrets/
+.claude/scheduled_tasks.lock
+
+# VPS residue archive (272MB pretask backup — not part of the codebase)
+vps_archive_backup/
+
+# Re-test marathon runtime data — ledgers, session JSONL, staged inputs, logs,
+# pulled challenge containers' artifacts. Pure eval output, not source. The
+# distilled public report lives in public_eval/ (committed); the raw run data here
+# (retest_runs/ledger.jsonl, _sessions/*.jsonl, _inputs_*, _logs) stays out.
+retest_runs/
+
+# Go binary built into the source dir by a bare `go build .` (the real build
+# artifact goes to docker/worker/runtime_agent via build.sh).
+cmd/runtime-agent/runtime-agent
+
+# internal dev-tracking files (not part of the OSS distribution)
+progress.md
+feature_list.json
+session-handoff.md
+
+# Local-only working notes — kept on disk for reference, NOT part of the
+# distribution (working notes, not user-facing documentation).
+docs/_local/
+docs/internal-design/

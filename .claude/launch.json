@@ -1,0 +1,32 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "muteki-web",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": [
+        "run",
+        "uvicorn",
+        "apps.web.server:app",
+        "--port",
+        "8000"
+      ],
+      "port": 8000
+    },
+    {
+      "name": "muteki-ui",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "--prefix",
+        "apps/web/ui",
+        "run",
+        "dev"
+      ],
+      "port": 3001,
+      "env": {
+        "NEXT_PUBLIC_MUTEKI_API": "http://127.0.0.1:8000"
+      },
+      "autoPort": false
+    }
+  ]
+}
