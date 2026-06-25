@@ -37,6 +37,8 @@ def test_info_handles_non_binary(tmp_path) -> None:
 
 @pytest.mark.skipif(shutil.which("gcc") is None and shutil.which("cc") is None,
                     reason="no C compiler to build a test ELF")
+@pytest.mark.skipif(shutil.which("radare2") is None,
+                    reason="radare2 binary not in PATH (r2pipe needs it)")
 def test_decompile_real_binary(tmp_path) -> None:
     # build a tiny native binary and decompile its main (r2 is cross-arch, so a
     # native arm64 binary works fine as the decompile target)
