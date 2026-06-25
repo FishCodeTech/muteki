@@ -389,7 +389,7 @@ Thanks to master [l4n](https://github.com/lancer0rz) for the inspiration — the
 
 Thanks to master [陈橘墨](https://github.com/Randark-JMT) for the range resources and writeups, used for extensive testing and fine-tuning.
 
-Thanks to Sam Altman for not banning my account.
+~~Thanks to Sam Altman for not banning my account.~~ Now banned, I will always remember his name.
 
 Thanks to Dario Amodei for not banning my account.
 

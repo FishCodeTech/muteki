@@ -391,7 +391,7 @@ go test -C cmd/runtime-agent ./...         # Go supervisor(module 在 cmd/runtim
 
 感谢 [陈橘墨](https://github.com/Randark-JMT) 师傅提供的靶场资源和writeup，用于大量测试和精调。
 
-感谢山姆奥特曼 不封我号
+~~感谢山姆奥特曼 不封我号~~ 现在已经被封了，我将永远记住他的名字。
 
 感谢Dario Amodei 不封我号
 

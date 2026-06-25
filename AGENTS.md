@@ -61,6 +61,9 @@ and the invariants — facts live in the code and in `README.md` / `README_CN.md
   (only `.env.example` is tracked) and a shell-exported var always wins. Never commit a
   real key or token.
 - **Commit only test-backed work.** Working on `main` is fine for this repo.
+- **Publishing:** if a `RELEASING.md` exists in this checkout, follow it for any public
+  release — do not invent your own publish path or add new remotes. (On a plain clone
+  there is none, and nothing special is needed.)
 
 ## Verification & definition of done
 
