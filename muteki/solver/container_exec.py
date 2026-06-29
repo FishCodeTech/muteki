@@ -53,8 +53,8 @@ from muteki.solver.credential_accounts import CONTAINER_ACCOUNTS_ROOT
 # at runtime; do not bake claude/codex/cursor login state into this image.
 # One generic worker image (NOT a per-recipe tag), published to Docker Hub so any
 # host can `docker pull` it. Default to the moving :latest; override with
-# MUTEKI_WORKER_IMAGE to pin a version (e.g. snowywar/muteki-worker:0.2.0).
-WORKER_IMAGE = os.environ.get("MUTEKI_WORKER_IMAGE", "snowywar/muteki-worker:latest")
+# MUTEKI_WORKER_IMAGE to pin a version (e.g. ghcr.io/fishcodetech/muteki-worker:0.2.3).
+WORKER_IMAGE = os.environ.get("MUTEKI_WORKER_IMAGE", "ghcr.io/fishcodetech/muteki-worker:latest")
 CONTAINER_WORKSPACE = "/home/kali/workspace"
 CONTAINER_CONTROL_DIR = "/run/muteki/control"  # bind-mounted; carries the per-run token
 _RUN_PREFIX = "muteki-run-"

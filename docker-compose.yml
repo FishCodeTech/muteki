@@ -25,7 +25,9 @@ name: muteki
 
 networks:
   muteki_net:
-    name: muteki_net          # fixed external-style name → workers join by name
+    # fixed external-style name → workers join by name; overridable for multiple
+    # deployments on one host.
+    name: ${MUTEKI_WORKER_NETWORK:-muteki_net}
 
 services:
   web-api:
@@ -45,7 +47,7 @@ services:
       MUTEKI_IN_CONTAINER: "1"
       MUTEKI_CONTROL_BIND: "0.0.0.0"
       MUTEKI_CONTROL_HOST: "web-api"
-      MUTEKI_WORKER_NETWORK: "muteki_net"
+      MUTEKI_WORKER_NETWORK: "${MUTEKI_WORKER_NETWORK:-muteki_net}"
       MUTEKI_HOST_DATA_ROOT: "${MUTEKI_HOST_DATA_ROOT}"
       # container data root == host root (identity mirror), so _mount_source is a no-op
       MUTEKI_CONTAINER_DATA_ROOT: "${MUTEKI_HOST_DATA_ROOT}"
@@ -59,11 +61,9 @@ services:
       # baked into the image), so it can only reach the container via compose.
       # Without it LLMClient sends "Authorization: Bearer " (empty) and httpx
       # rejects it ("Illegal header value"). Pass it through from the host .env.
-      # (base_url is intentionally NOT passed: an empty "${VAR:-}" would override
-      # the code default https://api.deepseek.com/v1 with "" and break requests.
-      # Set MUTEKI_DEEPSEEK_BASE_URL here explicitly only if using a non-default
-      # endpoint.)
       MUTEKI_DEEPSEEK_API_KEY: "${MUTEKI_DEEPSEEK_API_KEY:-}"
+      MUTEKI_DEEPSEEK_BASE_URL: "${MUTEKI_DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}"
+      MUTEKI_LLM_TRUST_ENV: "${MUTEKI_LLM_TRUST_ENV:-0}"
     restart: unless-stopped
 
   ui:

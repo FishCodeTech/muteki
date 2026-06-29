@@ -16,12 +16,15 @@ All notable public release changes are tracked here.
 - `/btw` now reads run files, JSONL, shared graph state, winner snapshots, and artifacts through the worker instead of answering from a compressed summary.
 - `/btw` defaults to the configured Review worker when the frontend does not specify a profile, while still allowing explicit API overrides.
 - Release metadata, package versions, and worker build examples now point at `0.2.3`.
+- Expanded `.env.example` into a fuller operator map covering web auth, compose deployment, worker backends, `/btw` timeouts, credential fallbacks, CLI binary overrides, retention, and internal runtime envs.
+- Aligned the default worker image across backend code, Worker Settings, Docker Compose, and docs on `ghcr.io/fishcodetech/muteki-worker:latest`.
 
 ### Fixed
 
 - Reduced `/btw` answer distortion by letting the side worker inspect source run evidence directly.
 - Kept `/btw` out of swarm scheduling, review concurrency, max-worker slots, graph writes, and run cost accounting.
 - Removed the redundant read-only explainer banner from the `/btw` drawer.
+- Fixed Docker Compose env passthrough for `MUTEKI_DEEPSEEK_BASE_URL`, `MUTEKI_LLM_TRUST_ENV`, and custom worker network names.
 
 ## 0.2.1 - 2026-06-29
 
