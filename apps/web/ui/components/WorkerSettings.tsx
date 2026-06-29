@@ -65,7 +65,7 @@ const ORDINARY_PROFILE_ROLES = new Set(["race", "bootstrap", "explore", "respond
 // muteki/solver/container_exec.py WORKER_IMAGE). Surfaced in the Runtime tab so
 // the operator knows what to set; documented in .env.example.
 const WORKER_IMAGE_ENV = "MUTEKI_WORKER_IMAGE";
-const WORKER_IMAGE_DEFAULT = "snowywar/muteki-worker:latest";
+const WORKER_IMAGE_DEFAULT = "ghcr.io/fishcodetech/muteki-worker:latest";
 
 // prefer the human-readable label; fall back to name/id. After the identity
 // migration a profile's id/name is an opaque seat id (seat_claude_ab12cd), so
