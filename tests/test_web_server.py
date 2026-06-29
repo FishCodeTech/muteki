@@ -157,6 +157,83 @@ async def test_credentials_endpoint_reads_shared_graph(tmp_path) -> None:
     assert creds[0]["value"] == "hunter2"
 
 
+async def test_btw_endpoint_streams_one_shot_worker_without_swarm_slot(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.delenv("MUTEKI_WEB_PASSWORD", raising=False)
+    monkeypatch.delenv("MUTEKI_WEB_BIND", raising=False)
+    mgr = RunManager(sessions_root=tmp_path)
+    run = mgr.create("btw-run")
+    run.name = "btw demo"
+    run.category = "web"
+    # UI does not pass profile/engine. Even if a historical winner exists, /btw
+    # should default to the configured review profile so it behaves like review
+    # without consuming a review/swarm slot.
+    root = mgr.workspace_dir(run.run_id)
+    (root / "winner.json").write_text(
+        json.dumps({"engine": "cursor-api-container"}),
+        encoding="utf-8",
+    )
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "apps.web.worker_config.backend_for_profile",
+        lambda *args, **kwargs: "local",
+    )
+
+    async def fake_stream_btw_worker_deltas(**kwargs):
+        seen.update(kwargs)
+        yield "worker "
+        yield "answer"
+
+    monkeypatch.setattr(
+        "muteki.solver.btw.stream_btw_worker_deltas",
+        fake_stream_btw_worker_deltas,
+    )
+
+    app = create_app(mgr)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+        timeout=10,
+        trust_env=False,
+    ) as client:
+        resp = await client.post(
+            "/api/runs/btw-run/btw",
+            json={
+                "question": "本轮问题",
+                "transcript": [
+                    {"role": "user", "content": "上一问"},
+                    {"role": "assistant", "content": "上一答"},
+                ],
+                "worker_backend": "local",
+            },
+        )
+
+    assert resp.status_code == 200
+    frames = [
+        json.loads(line.removeprefix("data: "))
+        for line in resp.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert [f.get("delta") for f in frames if f.get("delta")] == [
+        "worker ",
+        "answer",
+    ]
+    assert frames[-1] == {"done": True}
+    prompt = str(seen["prompt"])
+    assert "本轮问题" in prompt
+    assert "上一问" in prompt
+    assert "上一答" in prompt
+    assert "shared_graph.db" in prompt
+    assert seen["web_access"] is False
+    assert seen["kb_access"] is False
+    assert seen["env"]["MUTEKI_BTW_WORKER"] == "1"  # type: ignore[index]
+    assert getattr(seen["driver"], "profile", {}).get("name") == "claude-sub-container"
+    assert "/workers/_btw/" in str(seen["cwd"])
+    assert run.worker_cmds.empty()
+
+
 async def test_hitl_post_is_accepted_and_echoed(server) -> None:
     async with httpx.AsyncClient(base_url=server.base, timeout=30, trust_env=False) as client:
         # idle run keeps the bus open so the HITL echo is observable (a fast mock

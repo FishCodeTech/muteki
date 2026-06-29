@@ -757,6 +757,40 @@ class SQLiteSharedGraph:
              artifacts: Any = None) -> "SQLiteSharedGraph":
         return cls(db_path, challenge, artifacts)
 
+    @classmethod
+    def open_readonly(cls, *, db_path: str | Path, challenge: Challenge) -> "SQLiteSharedGraph":
+        """TRUE read-only open for observer paths (btw side-query, replay QA).
+
+        Unlike `open()`, this NEVER: creates the parent dir, sets WAL, runs the
+        schema/migration script, or commits. It opens the existing DB file in
+        SQLite `mode=ro` + `query_only=ON` so even a buggy caller cannot write.
+
+        Assumes the DB was already initialised by a prior `open()` (true for any
+        run that has reached the coordination phase). If the file is missing or
+        the schema is absent/stale, raises sqlite3.OperationalError — callers
+        must catch and degrade to a minimal context, NOT attempt migration.
+
+        WAL sidecar note: `mode=ro` reads an active WAL DB fine when `-wal`/`-shm`
+        exist; if they are missing on a live run the read may fail or miss
+        un-checkpointed rows. Callers should treat any OperationalError as
+        "graph temporarily unreadable" and degrade, never as a reason to open RW.
+        """
+        p = str(db_path)
+        uri = f"file:{p}?mode=ro"
+        inst = cls.__new__(cls)
+        inst.db_path = p
+        inst.challenge = challenge
+        inst.artifacts = None
+        inst._lock = threading.Lock()
+        # URI mode=ro: open the file read-only at the SQLite VFS layer.
+        inst._conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        cur = inst._conn.cursor()
+        # query_only blocks ANY write DDL/DML even if a caller tried; belt+suspenders
+        # on top of mode=ro. These PRAGMAs are read-only-safe.
+        cur.execute("PRAGMA query_only=ON")
+        cur.execute("PRAGMA busy_timeout=3000")
+        return inst
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -2855,6 +2889,33 @@ class SQLiteSharedGraph:
         for seq, ts, actor, kind, payload, aid, verified, conf in rows:
             out.append({"seq": seq, "ts": ts, "actor": actor, "kind": kind,
                         "payload": json.loads(payload), "artifact_id": aid,
+                        "verified": bool(verified), "confidence": conf})
+        return out
+
+    def recent_events(self, limit: int = 40) -> list[dict]:
+        """Last `limit` events, oldest-first, filtered to this challenge.
+
+        Unlike `events()[-limit:]` this is bounded at the SQL layer (no full-table
+        scan) and scopes to challenge_id so a shared sessions DB stays correct.
+        Used by the read-only btw observer to build a recent timeline snapshot.
+        """
+        if limit <= 0:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT seq, ts, actor, kind, payload, artifact_id, verified, "
+                "confidence FROM events WHERE challenge_id=? "
+                "ORDER BY seq DESC LIMIT ?",
+                (self.challenge.id, int(limit)),
+            ).fetchall()
+        out = []
+        for seq, ts, actor, kind, payload, aid, verified, conf in reversed(rows):
+            try:
+                p = json.loads(payload)
+            except Exception:
+                p = {}
+            out.append({"seq": seq, "ts": ts, "actor": actor, "kind": kind,
+                        "payload": p, "artifact_id": aid,
                         "verified": bool(verified), "confidence": conf})
         return out
 

@@ -12,6 +12,7 @@ import { ArtifactPanel } from "@/components/ArtifactPanel";
 import { LoginGate } from "@/components/LoginGate";
 import { WorkerSettings } from "@/components/WorkerSettings";
 import { CommandPalette } from "@/components/CommandPalette";
+import { BtwPanel } from "@/components/BtwPanel";
 import { ToastLane, useToasts } from "@/components/Toast";
 import type { ArtifactView } from "@/components/ArtifactPanel";
 import { clampRailWidth, RAIL_WIDTH_DEFAULT, RAIL_WIDTH_STORAGE_KEY } from "@/lib/railSizing";
@@ -117,6 +118,7 @@ function Deck() {
   const [theme, setTheme] = useState<ThemeMode>("light");
   const [showSettings, setShowSettings] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [btwOpen, setBtwOpen] = useState(false);
   const [artifactOpen, setArtifactOpen] = useState(false);
   const [artifactView, setArtifactView] = useState<ArtifactView>("graph");
   const [artifactWidth, setArtifactWidth] = useState(() => artifactWidthDefault(typeof window !== "undefined" ? window.innerWidth : 1280));
@@ -261,6 +263,21 @@ function Deck() {
     return () => window.removeEventListener("keydown", onKey);
   }, [showSettings]);
 
+  // BTW observer: Ctrl/Cmd+Shift+/ opens the read-only side-query drawer.
+  // Avoids Cmd+B (bookmark bar), `?` (help), and bare-key panel shortcuts
+  // (those bail on any modifier). While settings/palette are up we defer.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "/" || e.key === "?")) {
+        if (showSettings || paletteOpen) return;
+        e.preventDefault();
+        setBtwOpen((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [showSettings, paletteOpen]);
+
   // Escape closes the open artifact panel (graph / blackboard / timeline / …).
   // Layering: the settings modal sits on top and owns Esc first (its handler is
   // capture-phase + stopPropagation, and we also guard on `showSettings` here so
@@ -271,13 +288,13 @@ function Deck() {
   // native window listener), so gate on !paletteOpen too — otherwise one Esc
   // would close both the palette and the panel beneath it.
   useEffect(() => {
-    if (!artifactOpen || showSettings || paletteOpen) return;
+    if (!artifactOpen || showSettings || paletteOpen || btwOpen) return;
     const onEsc = (e: KeyboardEvent) => {
       if (e.key === "Escape") { e.preventDefault(); setArtifactOpen(false); }
     };
     window.addEventListener("keydown", onEsc);
     return () => window.removeEventListener("keydown", onEsc);
-  }, [artifactOpen, showSettings, paletteOpen]);
+  }, [artifactOpen, showSettings, paletteOpen, btwOpen]);
 
   // Single-key shortcuts to jump the secondary panels from the keyboard, so a
   // power operator watching a run never has to reach for the mouse. Mnemonic map:
@@ -295,7 +312,7 @@ function Deck() {
     f: "findings", c: "credentials", p: "pocs", r: "routes", d: "directives",
   };
   useEffect(() => {
-    if (!deck.started || showSettings || paletteOpen) return;
+    if (!deck.started || showSettings || paletteOpen || btwOpen) return;
     const isTyping = (el: EventTarget | Element | null): boolean => {
       const node = el as HTMLElement | null;
       if (!node || typeof node.tagName !== "string") return false;
@@ -578,6 +595,7 @@ function Deck() {
           onOpenWorker={onOpenWorker}
           onOpenWorkspace={onOpenWorkspace}
           onHitlAnswered={() => pushToast({ msg: t("hitl.answered"), variant: "success" })}
+          onOpenBtw={() => setBtwOpen(true)}
         />
         <ArtifactPanel
           open={artifactOpen}
@@ -613,6 +631,11 @@ function Deck() {
         onSelectRun={onSelectRun}
         onSpawnWorker={onSpawnWorker}
         onOpenSettings={() => setShowSettings(true)}
+      />
+      <BtwPanel
+        open={btwOpen}
+        onClose={() => setBtwOpen(false)}
+        runId={runId}
       />
     </div>
   );

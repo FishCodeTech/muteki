@@ -1226,6 +1226,7 @@ export function Conversation({
   onOpenWorkspace,
   onHitlAnswered,
   connected,
+  onOpenBtw,
 }: {
   deck: DeckState;
   running: boolean;
@@ -1250,6 +1251,7 @@ export function Conversation({
   // fired after an operator answers a blocking HITL decision — owner toasts.
   onHitlAnswered?: () => void;
   connected: boolean;
+  onOpenBtw?: () => void;
 }) {
   const t = useT();
   const { lang, setLang } = useLang();
@@ -1386,6 +1388,16 @@ export function Conversation({
           </span>
         )}
         <span className="spacer" />
+        {onOpenBtw && (
+          <button
+            className="btw-btn"
+            onClick={onOpenBtw}
+            title={t("btw.btnTitle")}
+            aria-label={t("btw.btnTitle")}
+          >
+            {t("btw.btn")}
+          </button>
+        )}
         {deck.started && (
           <span className={`runstate ${runStateClass}`}>{runStateLabel}</span>
         )}

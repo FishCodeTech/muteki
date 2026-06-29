@@ -1552,6 +1552,9 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
                     <b>{t("settings.reviewToggle")}</b>
                     {!reviewEnabled && <span className="ws2-pill">{t("settings.reviewRevealHint")}</span>}
                   </div>
+                  <div className="ws-note ws-note-info ws2-review-note">
+                    {t("settings.reviewBtwNote")}
+                  </div>
                   {reviewEnabled && (
                     <div className="ws-grid ws2-review-sub">
                       <div className="ws-field">
