@@ -51,7 +51,10 @@ jobs:
           # strip a leading refs/tags/ if present and fall back to a sane default
           TAG="${TAG#refs/tags/}"
           [ -z "$TAG" ] && TAG="latest"
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+          echo "Resolved image namespace: $OWNER"
           echo "Resolved tag: $TAG"
 
       - uses: docker/setup-buildx-action@v3
@@ -70,8 +73,8 @@ jobs:
           file: docker/web/Dockerfile
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/muteki-web:${{ steps.tag.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/muteki-web:latest
+            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-web:${{ steps.tag.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-web:latest
           cache-from: type=gha,scope=muteki-web
           cache-to: type=gha,scope=muteki-web,mode=max
 
@@ -87,7 +90,9 @@ jobs:
           [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
           TAG="${TAG#refs/tags/}"
           [ -z "$TAG" ] && TAG="latest"
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -110,8 +115,8 @@ jobs:
           build-args: |
             MUTEKI_BACKEND=http://web-api:8000
           tags: |
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/muteki-ui:${{ steps.tag.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/muteki-ui:latest
+            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-ui:${{ steps.tag.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-ui:latest
           cache-from: type=gha,scope=muteki-ui
           cache-to: type=gha,scope=muteki-ui,mode=max
 
@@ -128,7 +133,9 @@ jobs:
           [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
           TAG="${TAG#refs/tags/}"
           [ -z "$TAG" ] && TAG="latest"
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v5
         with:
@@ -171,8 +178,8 @@ jobs:
           build-args: |
             IMAGE_VERSION=${{ steps.tag.outputs.tag }}
           tags: |
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/muteki-worker-slim:${{ steps.tag.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/muteki-worker-slim:latest
+            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker-slim:${{ steps.tag.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker-slim:latest
           cache-from: type=gha,scope=muteki-worker-slim
           cache-to: type=gha,scope=muteki-worker-slim,mode=max
 
@@ -201,7 +208,9 @@ jobs:
           [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
           TAG="${TAG#refs/tags/}"
           [ -z "$TAG" ] && TAG="latest"
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v5
         with:
@@ -243,9 +252,9 @@ jobs:
           build-args: |
             IMAGE_VERSION=${{ steps.tag.outputs.tag }}
           tags: |
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/muteki-worker:${{ steps.tag.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/muteki-worker:latest
+            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker:${{ steps.tag.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker:latest
           # GHA cache has a 10G/repo cap; the Kali image alone can exceed it, so use a
           # registry-side cache image instead (does not count against the GHA cache).
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ github.repository_owner }}/muteki-worker:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ github.repository_owner }}/muteki-worker:buildcache,mode=max
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker:buildcache,mode=max
