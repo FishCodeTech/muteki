@@ -9,6 +9,7 @@ import { ThreadRail } from "@/components/ThreadRail";
 import { Conversation } from "@/components/Conversation";
 import type { DispatchOpts } from "@/components/Conversation";
 import { ArtifactPanel } from "@/components/ArtifactPanel";
+import { LoginGate } from "@/components/LoginGate";
 import { WorkerSettings } from "@/components/WorkerSettings";
 import { CommandPalette } from "@/components/CommandPalette";
 import { ToastLane, useToasts } from "@/components/Toast";
@@ -68,7 +69,9 @@ const urlForRun = (id: string): string =>
 export default function Page() {
   return (
     <I18nProvider>
-      <Deck />
+      <LoginGate>
+        <Deck />
+      </LoginGate>
     </I18nProvider>
   );
 }
@@ -332,16 +335,7 @@ function Deck() {
     && !!activeSummary?.started
     && !activeSummary?.finished
     && !deck.started;
-  useDeckMotion(shellRef, {
-    runId,
-    started: deck.started,
-    loading,
-    artifactOpen,
-    artifactView,
-    chatLength: deck.chat.length,
-    flagCount: deck.flags.length,
-    cost: deck.usd,
-  });
+  useDeckMotion(shellRef, { flagCount: deck.flags.length });
   // Attach files to the next dispatch. They're uploaded to the run's folder
   // immediately and we keep the saved absolute paths. A draft conversation has
   // no backend run yet, so promote it to a real run-NNNN FIRST (same idiom as

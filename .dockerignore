@@ -1,0 +1,47 @@
+# Build-context exclusions for the P2-v3 images (docker/web, docker/ui).
+#
+# WITHOUT this file `COPY . /app` in docker/web/Dockerfile drags the ENTIRE repo
+# into the build context — including retest_runs/ (multi-GB raw disk images),
+# sessions/, and .git — which both bloats the image and can fill the Docker VM
+# disk ("no space left on device" mid-build). Keep this list tight.
+
+# ── version control / tooling ────────────────────────────────────────────────
+.git
+.gitignore
+.github
+.claude
+*.md
+docs/
+
+# ── Python caches / venvs / build artifacts ──────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# ── runtime / data that must NEVER be baked into an image ─────────────────────
+# huge: raw disk images, recovered artifacts, per-run worker workspaces
+retest_runs/
+sessions/
+data/
+*.img
+*.qcow2
+*.raw
+
+# ── node (the web image doesn't need the UI tree; the ui image has its own ctx)─
+node_modules/
+apps/web/ui/.next/
+apps/web/ui/node_modules/
+
+# ── local scratch / secrets ──────────────────────────────────────────────────
+.env
+.env.*
+*.log
+.DS_Store
+docs/_local/

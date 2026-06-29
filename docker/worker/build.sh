@@ -34,9 +34,11 @@ chmod +x "$HERE/blackboard.py"
 # containerd image store, the default OCI exporter has hit "operating system is not
 # supported" at load time for this image even after layers export fine; --load avoids
 # that path. If your build still trips it, see the docker-load fallback note below.
-echo ">> [2/2] docker build --platform linux/amd64 --load -t $TAG $HERE ..."
-docker build --platform linux/amd64 --load -t "$TAG" "$HERE"
+echo ">> [2/2] docker build --platform linux/amd64 --load -t $TAG -t $LATEST $HERE ..."
+docker build --platform linux/amd64 --load \
+  --build-arg "IMAGE_VERSION=${VERSION}" \
+  -t "$TAG" -t "$LATEST" "$HERE"
 
-echo ">> done: $TAG"
+echo ">> done: $TAG (+ $LATEST)"
 echo ">> quick verify (bypass ENTRYPOINT, it's the supervisor):"
 echo "   docker run --rm --entrypoint sh $TAG -c 'which claude codex cursor-agent ghidra sage vol radare2; ls /opt/muteki'"

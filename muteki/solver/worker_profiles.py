@@ -112,6 +112,10 @@ def normalize_worker_profile(item: dict[str, Any], *, reject_invalid: bool = Fal
     normalized = {
         "id": pid,
         "name": pid,
+        # human-readable display name, carried through so a seat-id-based pid (post
+        # identity migration) still renders a friendly name in the UI. Defaults to
+        # the pid when no explicit label is given.
+        "label": str(item.get("label") or pid).strip(),
         "engine": engine,
         "transport": transport or engine,
         "credential_mode": credential_mode,
@@ -173,7 +177,9 @@ def normalize_profile_roster(values: Any, profiles: list[dict[str, Any]]) -> lis
         return []
     by_name = {str(p["name"]): p for p in profiles}
     by_engine: dict[str, list[str]] = {}
-    for p in sorted(profiles, key=lambda p: (int(p.get("priority") or 100), str(p["name"]))):
+    # coerce_nonneg_int (NOT `priority or 100`): preserve a legal priority 0
+    # (highest precedence) instead of silently demoting it to the default.
+    for p in sorted(profiles, key=lambda p: (coerce_nonneg_int(p.get("priority"), 100), str(p["name"]))):
         by_engine.setdefault(str(p["engine"]), []).append(str(p["name"]))
     out: list[str] = []
     seen: set[str] = set()
@@ -191,5 +197,48 @@ def normalize_profile_roster(values: Any, profiles: list[dict[str, Any]]) -> lis
 def profile_uses_endpoint(profile: dict[str, Any] | None) -> bool:
     if not profile:
         return False
-    return bool(profile.get("base_url") or profile.get("api_key_ref")
-                or profile.get("credential_mode") in {"api", "api_key", "oauth_token"})
+    return bool(profile.get("base_url"))
+
+
+def resolve_seat_ref(
+    ref: Any,
+    *,
+    seats: list[dict[str, Any]],
+    alias_table: dict[str, str] | None = None,
+) -> str | None:
+    """THE single seat-reference resolver (plan §5.0(b)).
+
+    A foreign key in config (engines[]/review.engine/race_engines/...) may name a
+    seat THREE ways:
+      - a new seat id (`seat_claude_ab12cd`),
+      - a legacy profile name (`claude-local`),
+      - a legacy hyphen "canonical" alias (`claude-api-local`, from the old
+        worker_config._canonical_profile_id), OR a bare base engine (`claude`).
+    All four must resolve to the new seat id. Shared by worker_config / drivers /
+    server / swarm so they can never disagree.
+
+    Returns the matched seat id; None when nothing matches (caller decides the
+    fallback — NEVER silently swallowed) or when a bare engine is ambiguous across
+    multiple seats (None + the caller can expand via the engine fan-out instead).
+    """
+    if not isinstance(ref, str) or not ref.strip():
+        return None
+    ref = ref.strip()
+    by_id = {str(s.get("id")): s for s in seats if isinstance(s, dict) and s.get("id")}
+    if ref in by_id:
+        return ref
+    alias_table = alias_table or {}
+    if ref in alias_table and alias_table[ref] in by_id:
+        return alias_table[ref]
+    # label match (legacy name kept as the seat label).
+    by_label = {str(s.get("label")): str(s.get("id")) for s in seats
+                if isinstance(s, dict) and s.get("label")}
+    if ref in by_label:
+        return by_label[ref]
+    # bare base engine → resolve ONLY if exactly one seat for that engine (else
+    # ambiguous: the caller should fan out across the engine's seats instead).
+    if ref in VALID_BASE_ENGINES:
+        matches = [str(s["id"]) for s in seats
+                   if isinstance(s, dict) and str(s.get("engine")) == ref and s.get("id")]
+        return matches[0] if len(matches) == 1 else None
+    return None

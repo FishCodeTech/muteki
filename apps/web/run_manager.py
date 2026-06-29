@@ -169,7 +169,15 @@ def _apply_blackboard_meta(run: "Run", ev: Event) -> None:
 
 
 class RunManager:
-    def __init__(self, *, sessions_root: str | Path = "sessions") -> None:
+    def __init__(self, *, sessions_root: "str | Path | None" = None) -> None:
+        # P2-v3: in the compose layout the sessions/ tree must live UNDER the
+        # mirrored data root (MUTEKI_HOST_DATA_ROOT bind-mounted into the web
+        # container), so worker sibling containers — launched by the host daemon —
+        # can bind-mount the same physical dir. MUTEKI_SESSIONS_ROOT names it
+        # (compose points it at <data root>/sessions). Default "sessions" (CWD-
+        # relative) preserves the bare-host behaviour.
+        if sessions_root is None:
+            sessions_root = os.environ.get("MUTEKI_SESSIONS_ROOT") or "sessions"
         self.sessions_root = Path(sessions_root)
         self.sessions_root.mkdir(parents=True, exist_ok=True)
         self.runs: dict[str, Run] = {}
@@ -864,7 +872,31 @@ class RunManager:
 
         async def _go() -> None:
             try:
+                LOG.info("standby worker starting for %s action=%s",
+                         run_id, cmd.get("action"))
                 await driver(run)
+                LOG.info("standby worker finished for %s action=%s",
+                         run_id, cmd.get("action"))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                detail = str(exc)[:500]
+                LOG.exception("standby worker failed for %s action=%s",
+                              run_id, cmd.get("action"))
+                try:
+                    await run.bus.emit(Event(
+                        event_type=EventType.HITL_REQUEST,
+                        run_id=run_id,
+                        payload={
+                            "target": cmd.get("target") or "global",
+                            "source": "standby",
+                            "action": cmd.get("action"),
+                            "need": f"standby worker failed: {detail}",
+                            "text": f"standby worker failed: {detail}",
+                        },
+                    ))
+                except Exception:
+                    pass
             finally:
                 # do NOT close the bus — keep the run reachable for more follow-ups.
                 run.standby_task = None

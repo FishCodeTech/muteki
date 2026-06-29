@@ -18,7 +18,9 @@ deck + Textual TUI), P4 (swarm + Insight Bus, first-valid-flag), P6 (NYU black-b
 self-learning distill/retrieve) are **built and verified**. Real NYU result: **1/3 web solved
 black-box, provenance gate held (no false flags)**. 114 tests green.
 
-P3 muteki_kit is **web-only** — `crypto/pwn/reverse/forensics` are empty stubs.
+P3 muteki_kit (the code-driven kernel's capability SDK) was **removed** — that
+kernel is retired; the CLI-agent swarm uses its own in-container tools. The
+crypto/reverse build-out below (I2/I3) is obsolete and kept only as a record.
 P5 (L0 coordinator / CTFBridge / auto-submit) is **user-skipped**.
 
 ## The dominant lever (exact data)
@@ -73,7 +75,7 @@ Close the 1/3 gap on the track that already works, before widening.
   hypotheses populate, a REFUTED hypothesis lands in `dead_ends`/`to_summary()`, and the guard
   passes sqli-union→sqli-blind but blocks a true triple-repeat.
 
-### I2 — Crypto track SDK (RSA-first) + per-track eval subset  *(large; reuses I1 discipline)*
+### I2 — Crypto track SDK (RSA-first) + per-track eval subset  *(OBSOLETE — muteki_kit removed; CLI agents use their own crypto tools)*
 Crypto = 26% of the bench, highest automation ceiling, lightweight deps (gmpy2/sympy).
 - `muteki_kit/crypto/{rsa,classical,symmetric}.py`, typed Pydantic results + artifact peek.
 - `RSABreaker(n,e,c).auto()`: small-e, common-modulus, Wiener, factordb, RsaCtfTool fallback.
@@ -81,7 +83,7 @@ Crypto = 26% of the bench, highest automation ceiling, lightweight deps (gmpy2/s
 - **Accept:** `test_kit_crypto.py` recovers plaintext on ≥3 classic vuln param sets (pure-math
   CI); crypto NYU subset solves ≥1 real challenge black-box, provenance intact.
 
-### I3 — Reverse track SDK (decompile + disasm + best-effort symexec)  *(large; reuses I2 scaffold)*
+### I3 — Reverse track SDK (decompile + disasm + best-effort symexec)  *(OBSOLETE — muteki_kit removed; CLI agents use their own RE tools)*
 Rev = 25.5% of the bench. Heavier deps (Ghidra/pyghidra/angr) → ranked after crypto.
 - `muteki_kit/reverse/{decompile,disasm,symexec}.py`; **always** route pseudocode through
   `save_artifact`+peek (never inline a 10KB decompilation → hallucination risk).

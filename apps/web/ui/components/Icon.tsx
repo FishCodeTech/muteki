@@ -17,7 +17,7 @@ export type IconName =
   | "terminal" | "cpu" | "dot" | "help" | "alert" | "clock" | "plug"
   | "target" | "play" | "network" | "list" | "board" | "layers"
   | "chevronDown" | "chevronRight" | "rows" | "upload" | "copy" | "search" | "refresh"
-  | "sun" | "moon";
+  | "sun" | "moon" | "eye" | "eyeOff";
 
 // Each entry is the inner markup of a 24×24 icon. Stroke paths use
 // currentColor; solid marks (dot) use fill.
@@ -64,6 +64,8 @@ const PATHS: Record<IconName, JSX.Element> = {
   refresh: (<><path d="M21 12a9 9 0 1 1-2.64-6.36" /><path d="M21 4v5h-5" /></>),
   sun: (<><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" /></>),
   moon: <path d="M21 13.2A8.5 8.5 0 0 1 10.8 3 7 7 0 1 0 21 13.2Z" />,
+  eye: (<><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" /><circle cx="12" cy="12" r="3" /></>),
+  eyeOff: (<><path d="M9.9 4.2A10 10 0 0 1 12 4c6.5 0 10 7 10 7a18 18 0 0 1-3 3.6M6.6 6.6A18 18 0 0 0 2 11s3.5 7 10 7a10 10 0 0 0 4-.8" /><path d="M9.5 9.5a3 3 0 0 0 4.2 4.2" /><path d="M3 3l18 18" /></>),
 };
 
 export function Icon({

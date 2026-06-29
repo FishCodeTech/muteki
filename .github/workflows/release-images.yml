@@ -1,0 +1,251 @@
+name: release-images
+
+# Build the four muteki images and push them to GitHub Container Registry (GHCR).
+#
+# Images (all under ghcr.io/<owner>/...):
+#   muteki-web          — FastAPI control plane          (docker/web/Dockerfile,  context = repo root)
+#   muteki-ui           — Next command deck              (docker/ui/Dockerfile,   context = apps/web/ui)
+#   muteki-worker-slim  — ubuntu base + 3 CLIs + agent   (docker/worker-slim,     needs cross-compiled runtime_agent)
+#   muteki-worker       — Kali base + full pentest kit   (docker/worker,          heavy: ~kali + 2.6G knowledges)
+#
+# Auth: the built-in GITHUB_TOKEN with packages:write — no PAT, no Docker Hub.
+# Triggers:
+#   - release published  → tag images with the release tag (e.g. v0.0.1) + latest
+#   - workflow_dispatch  → manual run for testing the pipeline inside the private repo
+#                          (optionally skip the slow Kali worker via the input)
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      build_kali_worker:
+        description: "Also build the heavy Kali muteki-worker image"
+        type: boolean
+        default: true
+      tag:
+        description: "Image tag to push (defaults to the git ref name)"
+        type: string
+        default: ""
+
+# Least-privilege: read the code, write packages (GHCR).
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  GO_VERSION: "1.26"
+
+jobs:
+  # ── lightweight images: plain docker build-push ───────────────────────────────
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
+          # strip a leading refs/tags/ if present and fall back to a sane default
+          TAG="${TAG#refs/tags/}"
+          [ -z "$TAG" ] && TAG="latest"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag: $TAG"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push muteki-web
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/web/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/muteki-web:${{ steps.tag.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/muteki-web:latest
+          cache-from: type=gha,scope=muteki-web
+          cache-to: type=gha,scope=muteki-web,mode=max
+
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
+          TAG="${TAG#refs/tags/}"
+          [ -z "$TAG" ] && TAG="latest"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push muteki-ui
+        uses: docker/build-push-action@v6
+        with:
+          context: apps/web/ui
+          file: docker/ui/Dockerfile
+          push: true
+          # The Next standalone server freezes the /api proxy target at build time.
+          # Bake the compose service alias so the composed stack works out of the box;
+          # a non-compose deployment overrides NEXT/MUTEKI_BACKEND at its own build.
+          build-args: |
+            MUTEKI_BACKEND=http://web-api:8000
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/muteki-ui:${{ steps.tag.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/muteki-ui:latest
+          cache-from: type=gha,scope=muteki-ui
+          cache-to: type=gha,scope=muteki-ui,mode=max
+
+  # ── worker images: cross-compile the Go runtime_agent, stage context, build ───
+  worker-slim:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
+          TAG="${TAG#refs/tags/}"
+          [ -z "$TAG" ] && TAG="latest"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # the runtime-agent module has no external deps (no go.sum), so the module
+          # cache has nothing to restore — disable it to skip the "go.sum not found" warning
+          cache: false
+
+      - name: Stage build context (cross-compile runtime_agent + copy skill files)
+        run: |
+          set -euo pipefail
+          ctx=docker/worker-slim
+          echo ">> cross-compiling runtime_agent (linux/amd64, static)"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -C cmd/runtime-agent -trimpath -ldflags="-s -w" \
+              -o "$GITHUB_WORKSPACE/$ctx/runtime_agent" .
+          file "$ctx/runtime_agent" || true
+          echo ">> staging AGENTS.md + blackboard skill"
+          cp docker/worker/AGENTS.md "$ctx/AGENTS.md"
+          cp skills/muteki-blackboard/SKILL.md "$ctx/blackboard.SKILL.md"
+          cp skills/muteki-blackboard/blackboard.py "$ctx/blackboard.py"
+          chmod +x "$ctx/blackboard.py"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push muteki-worker-slim
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/worker-slim
+          file: docker/worker-slim/Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            IMAGE_VERSION=${{ steps.tag.outputs.tag }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/muteki-worker-slim:${{ steps.tag.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/muteki-worker-slim:latest
+          cache-from: type=gha,scope=muteki-worker-slim
+          cache-to: type=gha,scope=muteki-worker-slim,mode=max
+
+  worker:
+    runs-on: ubuntu-latest
+    # The Kali image is large (kali-linux-headless + ~2.6G knowledges/pocs/templates).
+    # Skip it on a manual run when the operator unchecks the input; always build on a
+    # real release.
+    if: ${{ github.event_name == 'release' || github.event.inputs.build_kali_worker == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free up disk space
+        # The default runner has ~14G free; the Kali build needs more. Drop the big
+        # preinstalled toolchains we don't use so the build doesn't ENOSPC.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
+          TAG="${TAG#refs/tags/}"
+          [ -z "$TAG" ] && TAG="latest"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # the runtime-agent module has no external deps (no go.sum), so the module
+          # cache has nothing to restore — disable it to skip the "go.sum not found" warning
+          cache: false
+
+      - name: Stage build context (cross-compile runtime_agent + copy skill files)
+        run: |
+          set -euo pipefail
+          ctx=docker/worker
+          echo ">> cross-compiling runtime_agent (linux/amd64, static)"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -C cmd/runtime-agent -trimpath -ldflags="-s -w" \
+              -o "$GITHUB_WORKSPACE/$ctx/runtime_agent" .
+          file "$ctx/runtime_agent" || true
+          echo ">> staging blackboard skill"
+          cp skills/muteki-blackboard/SKILL.md "$ctx/blackboard.SKILL.md"
+          cp skills/muteki-blackboard/blackboard.py "$ctx/blackboard.py"
+          chmod +x "$ctx/blackboard.py"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push muteki-worker (Kali)
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/worker
+          file: docker/worker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            IMAGE_VERSION=${{ steps.tag.outputs.tag }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/muteki-worker:${{ steps.tag.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/muteki-worker:latest
+          # GHA cache has a 10G/repo cap; the Kali image alone can exceed it, so use a
+          # registry-side cache image instead (does not count against the GHA cache).
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ github.repository_owner }}/muteki-worker:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ github.repository_owner }}/muteki-worker:buildcache,mode=max

@@ -27,6 +27,22 @@
         "NEXT_PUBLIC_MUTEKI_API": "http://127.0.0.1:8000"
       },
       "autoPort": false
+    },
+    {
+      "name": "muteki-ui-preview",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": [
+        "next",
+        "dev",
+        "-p",
+        "3002"
+      ],
+      "cwd": "apps/web/ui",
+      "port": 3002,
+      "env": {
+        "NEXT_PUBLIC_MUTEKI_API": "http://127.0.0.1:8000"
+      },
+      "autoPort": false
     }
   ]
 }

@@ -21,6 +21,20 @@ from muteki.solver import control_client as cc
 from muteki.solver import control_receiver as cr
 
 
+def test_control_bind_defaults_to_loopback_and_honors_env(monkeypatch):
+    # P2-v3: the receiver bind address is env-driven (MUTEKI_CONTROL_BIND). Default
+    # stays 127.0.0.1 (classic single-host) so this is a pure additive knob; the
+    # compose layout sets 0.0.0.0 so sibling worker containers can reach it. An
+    # explicit host always wins over the env default (tests pass host=...).
+    # __init__ reads the module global at call time, so patch the attribute.
+    monkeypatch.setattr(cr, "DEFAULT_CONTROL_BIND", "127.0.0.1")
+    assert cr.ControlReceiver(port=0).host == "127.0.0.1"      # default
+    monkeypatch.setattr(cr, "DEFAULT_CONTROL_BIND", "0.0.0.0")
+    assert cr.ControlReceiver(port=0).host == "0.0.0.0"        # env → compose
+    # explicit host beats the env default
+    assert cr.ControlReceiver(host="127.0.0.1", port=0).host == "127.0.0.1"
+
+
 class _FakeSupervisor:
     """A stand-in supervisor: dials the receiver, sends Hello, then services ops on
     that one connection (reverse-connect). Scriptable per-worker stream + started
@@ -216,8 +230,18 @@ def test_link_drop_mid_worker_raises_control_error(receiver):
 
     # close the supervisor's socket shortly after it streams the opening line, so the
     # host's queue.get returns None with link.alive False and no exit seen.
+    # shutdown(SHUT_RDWR) BEFORE close: a bare close() only drops this thread's fd
+    # reference, but the fake's _serve thread is blocked in recv() on the SAME socket
+    # and keeps the fd (hence the connection) alive — so the receiver never sees EOF
+    # and the host hangs until the q.get timeout. A real dying supervisor is a process
+    # exit that closes every fd at once; shutdown() reproduces that by sending FIN
+    # immediately and unblocking _serve's recv, so the drop is detected at once.
     def drop():
         time.sleep(0.1)
+        try:
+            sup._s.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         try:
             sup._s.close()
         except OSError:

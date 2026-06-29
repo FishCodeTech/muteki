@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -34,10 +35,19 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
+from apps.web.auth import (
+    PUBLIC_API_PATHS,
+    AuthConfig,
+    TicketStore,
+    bearer_from_header,
+    check_password,
+    issue_token,
+    verify_token,
+)
 from apps.web.run_manager import Run, RunManager
 from muteki.core.dotenv_boot import load_env
 from muteki.core.events import Event, EventType
@@ -140,6 +150,15 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     app = FastAPI(title="Project Muteki — Command Deck", lifespan=lifespan)
     app.state.manager = mgr
 
+    # Auth (P3): a single-password gate in front of /api. fail_fast_check refuses
+    # to start if bound to a non-loopback host with no password — see auth.py and
+    # docs/_local/plan_p3_auth.md. When no password is set AND the bind is
+    # loopback, auth is disabled and the deck behaves exactly as before.
+    auth = AuthConfig.from_env()
+    auth.fail_fast_check()
+    app.state.auth = auth
+    app.state.tickets = TicketStore()
+
     # Dev convenience: the Next dev server (:3001) can talk to this backend
     # directly. Connecting the browser's EventSource straight here (instead of
     # through Next's dev rewrite proxy) avoids the proxy BUFFERING the SSE stream
@@ -152,6 +171,90 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Auth gate. Added AFTER CORS, so CORS wraps it (outermost) — preflight
+    # OPTIONS are answered by CORS and never reach here. We still bypass OPTIONS
+    # defensively (a same-origin request via the Next proxy often omits Origin,
+    # so CORS does not short-circuit it). Only /api is gated; the Next server
+    # (:3001) owns the UI/login page and must be secured separately when exposed
+    # (reverse proxy / loopback bind) — see docs/_local/plan_p3_auth.md.
+    #
+    # @app.middleware("http") does NOT see websocket scope; the /terminal WS and
+    # the SSE /events stream do their own ticket/token check in-handler.
+    #
+    # IMPORTANT (CORS): a middleware that SHORT-CIRCUITS with its own Response
+    # bypasses CORSMiddleware's response path, so a cross-origin 401 would arrive
+    # at the browser WITHOUT Access-Control-Allow-Origin — the browser then
+    # reports a network error instead of a 401, and the frontend can't tell "needs
+    # login" from "backend down". The Next dev UI (:3001) talks to this backend
+    # (:8000) cross-origin, so we must mirror the CORS allow-origin header onto the
+    # 401 ourselves. (CORSMiddleware only auto-adds headers when the inner app
+    # actually runs; our early return never reaches it.)
+    _cors_origin_re = re.compile(r"http://(localhost|127\.0\.0\.1)(:\d+)?$")
+
+    def _unauthorized(request: Request) -> JSONResponse:
+        resp = JSONResponse({"error": "unauthorized"}, status_code=401)
+        origin = request.headers.get("origin")
+        if origin and _cors_origin_re.match(origin):
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Vary"] = "Origin"
+        return resp
+
+    @app.middleware("http")
+    async def _auth_gate(request: Request, call_next):
+        cfg: AuthConfig = app.state.auth
+        if not cfg.enabled:
+            return await call_next(request)
+        path = request.url.path
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        if not path.startswith("/api/"):
+            return await call_next(request)  # static/UI (only present if built)
+        if path in PUBLIC_API_PATHS:
+            return await call_next(request)
+        # SSE events stream authenticates via one-time ticket query param, not a
+        # header (EventSource can't set headers); let the handler enforce it.
+        if path.endswith("/events"):
+            return await call_next(request)
+        token = bearer_from_header(request.headers.get("Authorization"))
+        if not verify_token(cfg, token):
+            return _unauthorized(request)
+        return await call_next(request)
+
+    @app.post("/api/auth/login")
+    async def auth_login(request: Request) -> Any:
+        # Exchange the operator password for a signed session token. This route
+        # is intentionally reachable WITHOUT a token (you have none yet). When
+        # auth is disabled it still returns a (useless) token so the frontend
+        # flow is uniform.
+        cfg: AuthConfig = app.state.auth
+        body = await _require_dict_body(request, allow_empty=True)
+        if not cfg.enabled:
+            return {"ok": True, "token": "", "auth_required": False}
+        if not check_password(cfg, body.get("password")):
+            # constant-time compare already done; uniform 401, no "wrong length"
+            raise HTTPException(status_code=401, detail="invalid password")
+        return {"ok": True, "token": issue_token(cfg), "auth_required": True}
+
+    @app.get("/api/auth/me")
+    async def auth_me(request: Request) -> Any:
+        # Cheap "is my token still valid?" probe. Reachable past the gate only
+        # with a valid token (when enabled), so a 200 means authenticated.
+        # in_container (P2-v3): tells the UI the coordinator runs inside a
+        # container, so the deck must force container mode and disable the
+        # "local" worker-isolation toggle (local is rejected server-side anyway).
+        from muteki.core.runtime_env import is_web_container
+        cfg: AuthConfig = app.state.auth
+        return {"authenticated": True, "auth_required": cfg.enabled,
+                "in_container": is_web_container()}
+
+    @app.post("/api/auth/ticket")
+    async def auth_ticket(request: Request) -> Any:
+        # Mint a one-time, short-TTL ticket for opening an SSE/WS connection
+        # (which can't carry an Authorization header). Requires a valid token —
+        # it sits behind the gate, so reaching here already proves auth.
+        ticket = app.state.tickets.mint()
+        return {"ticket": ticket}
 
     @app.get("/api/runs")
     async def list_runs(archived: int = 0) -> Any:
@@ -335,6 +438,106 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc))
         return {"ok": True, "config": cfg}
 
+    @app.put("/api/settings/identity")
+    async def put_identity_model(request: Request) -> Any:
+        # Save the NEW Credential/Seat/Environment model. Additive to the legacy
+        # PUT /workers above (which still accepts worker_profiles/engines). The
+        # store validates the container×system_inherit legality gate and rejects an
+        # illegal combo with 400. GET the model back via GET /workers (config.seats
+        # / config.credentials / config.environments are attached there).
+        body = await _require_dict_body(request)
+        try:
+            cfg = app.state.manager.worker_config.set_identity_model(
+                seats=body.get("seats"),
+                credentials=body.get("credentials"),
+                environments=body.get("environments"),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"ok": True, "config": cfg}
+
+    @app.get("/api/settings/profiles/health")
+    async def get_profiles_health() -> Any:
+        # Per-profile readiness for the settings badge + account rows. Uses the
+        # CHEAP binding layer (zero network / zero docker) so opening the modal
+        # never fires a wall of CLI hellos — the deep auth probe is the explicit
+        # "测连通" button (POST below). Backend is resolved from SERVER context
+        # via backend_for_profile (the same per-profile runtime→backend mapping
+        # dispatch uses), NEVER trusted from the client, so the verdict predicts
+        # what a real run would use.
+        from dataclasses import asdict
+
+        from muteki.core.runtime_env import is_web_container
+        from muteki.solver.profile_health import evaluate_profile_health
+        from apps.web.worker_config import backend_for_profile
+
+        cfg = app.state.manager.worker_config.get()
+        profiles = [p for p in (cfg.get("worker_profiles") or []) if isinstance(p, dict)]
+        runtime_profiles = cfg.get("runtime_profiles") or []
+        worker_backend = str(cfg.get("worker_backend") or "")
+        in_web = is_web_container()
+        sessions_root = app.state.manager.sessions_root
+
+        def _eval_all() -> list[dict]:
+            out: list[dict] = []
+            for p in profiles:
+                backend = backend_for_profile(
+                    p, runtime_profiles=runtime_profiles,
+                    worker_backend=worker_backend, in_web_container=in_web,
+                )
+                h = evaluate_profile_health(
+                    p, backend=backend, sessions_root=sessions_root, depth="binding"
+                )
+                out.append(asdict(h))
+            return out
+
+        return {"profiles": await asyncio.to_thread(_eval_all)}
+
+    @app.post("/api/settings/profiles/{profile_id}/health")
+    async def test_profile_health(profile_id: str) -> Any:
+        # "测连通" — the DEEP probe for one profile: binding + (container) plumbing
+        # + a real auth hello using the profile's PINNED model. This is the verdict
+        # that matches the dispatch precheck, so a green here means the run won't
+        # die on profile_unhealthy.
+        from dataclasses import asdict
+
+        from muteki.core.runtime_env import is_web_container
+        from muteki.solver.profile_health import evaluate_profile_health
+        from apps.web.worker_config import backend_for_profile
+
+        cfg = app.state.manager.worker_config.get()
+        profiles = [p for p in (cfg.get("worker_profiles") or []) if isinstance(p, dict)]
+        match = next(
+            (p for p in profiles
+             if str(p.get("name") or p.get("id")) == profile_id
+             or str(p.get("id")) == profile_id),
+            None,
+        )
+        # After the identity migration a profile's id is the new seat id; the old
+        # name (e.g. "claude-local") survives only in the alias table. Resolve it so
+        # the "测连通" button keeps working with either an old name or a new seat id.
+        if match is None:
+            from muteki.solver.worker_profiles import resolve_seat_ref
+            sid = resolve_seat_ref(
+                profile_id, seats=cfg.get("seats") or [],
+                alias_table=cfg.get("seat_alias") or {},
+            )
+            if sid is not None:
+                match = next((p for p in profiles if str(p.get("id")) == sid), None)
+        if match is None:
+            raise HTTPException(status_code=404, detail=f"unknown profile: {profile_id}")
+        backend = backend_for_profile(
+            match, runtime_profiles=cfg.get("runtime_profiles") or [],
+            worker_backend=str(cfg.get("worker_backend") or ""),
+            in_web_container=is_web_container(),
+        )
+        h = await asyncio.to_thread(
+            evaluate_profile_health,
+            match, backend=backend,
+            sessions_root=app.state.manager.sessions_root, depth="auth",
+        )
+        return asdict(h)
+
     @app.get("/api/settings/worker-models")
     async def get_worker_models() -> Any:
         from apps.web.worker_models import worker_model_options_payload
@@ -356,6 +559,20 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             sessions_root=app.state.manager.sessions_root,
             backend=str(body.get("backend") or "local"),
         )
+
+    @app.get("/api/settings/worker-image")
+    async def get_worker_image() -> Any:
+        # P2-v3: worker-image health (daemon reachable / image pulled / version
+        # match). Docker probes are blocking subprocess.run → off the event loop.
+        from apps.web.worker_image import image_status
+        return await asyncio.to_thread(image_status)
+
+    @app.post("/api/settings/worker-image/pull")
+    async def pull_worker_image() -> Any:
+        # P2-v3: one-click `docker pull` of the worker image. Can take minutes;
+        # to_thread it so the single uvicorn loop keeps serving.
+        from apps.web.worker_image import pull_image
+        return await asyncio.to_thread(pull_image)
 
     @app.get("/api/settings/credential-accounts")
     async def list_credential_accounts() -> Any:
@@ -388,6 +605,28 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     async def delete_credential_account(account_id: str) -> Any:
         store = CredentialAccountStore(account_store_root(app.state.manager.sessions_root))
         return {"ok": store.delete(account_id)}
+
+    @app.post("/api/settings/credential-accounts/{account_id}/import-host-codex")
+    async def import_host_codex(account_id: str) -> Any:
+        # One-click refresh of a codex account from the HOST's ~/.codex/auth.json.
+        # `codex login` writes the host file; container workers mount the account
+        # COPY, so a fresh login must be re-imported. Only valid on a bare host —
+        # inside the web container ~/.codex is the container's, not the operator's.
+        from muteki.core.runtime_env import is_web_container
+
+        if is_web_container():
+            raise HTTPException(
+                status_code=409,
+                detail="import-from-host is unavailable when the web control plane "
+                       "runs in a container (~/.codex is not the operator's). Paste "
+                       "or upload the auth.json instead.",
+            )
+        store = CredentialAccountStore(account_store_root(app.state.manager.sessions_root))
+        try:
+            account = await asyncio.to_thread(store.import_host_codex_auth, account_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"ok": True, "account": account}
 
     @app.post("/api/settings/credential-accounts/{account_id}/test")
     async def test_credential_account(account_id: str, request: Request) -> Any:
@@ -563,6 +802,18 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
 
     @app.get("/api/runs/{run_id}/events")
     async def events(run_id: str, request: Request) -> Any:
+        # Auth: EventSource can't send an Authorization header, so the SSE stream
+        # authenticates via a one-time ticket (?ticket=) minted by an
+        # authenticated POST /api/auth/ticket. A bearer header is also accepted
+        # (non-browser clients). This MUST run before manager.create() below, so
+        # an unauthenticated open can't spawn empty run handles.
+        cfg: AuthConfig = app.state.auth
+        if cfg.enabled:
+            tok = bearer_from_header(request.headers.get("Authorization"))
+            authed = verify_token(cfg, tok) or app.state.tickets.redeem(
+                request.query_params.get("ticket"))
+            if not authed:
+                raise HTTPException(status_code=401, detail="unauthorized")
         manager: RunManager = app.state.manager
         # A deck commonly opens its event stream BEFORE the run is launched (the
         # operator stares at an empty board, then fills the form). Create the run
@@ -654,6 +905,17 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
 
     @app.websocket("/api/runs/{run_id}/terminal")
     async def terminal(ws: WebSocket, run_id: str) -> None:
+        # Auth check BEFORE accept(): a WebSocket can't carry an Authorization
+        # header from the browser, so it presents a one-time ticket (?ticket=)
+        # or a bearer token (?token=, non-browser). Reject the handshake outright
+        # (close 4401) on failure so we never expose an authenticated socket.
+        cfg: AuthConfig = app.state.auth
+        if cfg.enabled:
+            authed = app.state.tickets.redeem(ws.query_params.get("ticket")) or \
+                verify_token(cfg, ws.query_params.get("token"))
+            if not authed:
+                await ws.close(code=4401)
+                return
         await ws.accept()
         manager: RunManager = app.state.manager
         run = manager.get(run_id)

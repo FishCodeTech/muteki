@@ -225,16 +225,49 @@ docker pull snowywar/muteki-worker:latest        # 或钉版本: :0.2.3
 
 ## 部署
 
-由于目前暂未实现鉴权逻辑，所以暂不推荐部署在公网vps服务器上。在做了在做了
+有两种启动方式。
 
-最佳使用实践比较推荐本地直接启动，登陆和安装好相关的worker，随时启动。
+### A) 本地启动（单人使用推荐）
+
+在自己机器上跑——登陆、安装好相关 worker、随时启动。web 进程跑在宿主上；worker 既可以作为宿主 CLI 跑（`local` 后端），也可以作为兄弟容器跑（`container` 后端）。
 
 ```bash
 ./run.sh web
 # 访问 localhost:3001
 ```
 
-你也可以去启动容器模式进行使用，但是这块未经过最佳验证，可能会有暗藏的坑，欢迎广大player一起来测试。
+默认绑 loopback，密码可选。如果你把后端暴露到非 loopback 地址（`./run.sh web --host 0.0.0.0`），就**必须**先设 `MUTEKI_WEB_PASSWORD`——否则服务器拒绝启动，保证 `/api`（含订阅 token）永不裸奔。详见 [`.env.example`](.env.example) 里的 P3 鉴权段。
+
+### B) Docker Compose（整套控制面容器化）
+
+`docker-compose.yml` 一条命令把**整个平台拉进容器**——FastAPI 协调器 + Next UI。这是**在 Linux / Windows 上不依赖宿主 OS 运行**的路子：与其去抹平裸宿主的差异（POSIX 信号、`C:\` 路径翻译、控制台编码各不相同），不如让控制面跑在 Linux 容器里，宿主是什么 OS 就无所谓了。
+
+拓扑：
+
+- **`web-api`** —— FastAPI 协调器。挂宿主 docker socket，把 **worker 作为兄弟容器**起在宿主 daemon 上（不是 dind）。容器内 supervisor 经 `muteki_net` 回连 `web-api:9100`。
+- **`ui`** —— Next 命令台，`/api` 反代到 `web-api`。
+- **worker** 不是 compose 服务 —— 由 `web-api` 每次 run 时 `docker run` 拉一个。
+
+```bash
+# 1. 宿主 daemon 上要先有 worker 镜像（compose 不负责构建）：
+docker pull snowywar/muteki-worker:latest        # 或自己构建：./docker/worker/build.sh
+
+# 2. 起控制面。两个变量必填：
+#    - MUTEKI_HOST_DATA_ROOT：一个宿主绝对路径，以同一路径挂进 web-api，
+#      让 worker 的 mount（由宿主 daemon 解析）落到真实宿主路径上。
+#    - MUTEKI_WEB_PASSWORD：compose 把命令台绑到 0.0.0.0，所以密码强制。
+MUTEKI_HOST_DATA_ROOT=/opt/muteki/data \
+MUTEKI_WEB_PASSWORD='choose-a-strong-one' \
+  docker compose up --build
+
+# 3. 访问 http://localhost:3001  （UI 端口可用 MUTEKI_UI_PORT 改）
+```
+
+容器模式下平台强制**强一致性**：web 进程一旦检测到自己在容器内，就*必须*用容器 worker 后端，**拒绝回落宿主本机 CLI**——镜像缺失 / socket 不可达 / 网络名错会让 run 显式失败，而不是悄悄起错东西。UI 里 `local` 开关被隐藏/锁死。
+
+完整 env 契约（以及哪些变量 compose 会自动帮你设、不要手动设）见 [`.env.example`](.env.example)。
+
+> ⚠️ **跨平台状态。** compose 路径在 macOS + Docker Desktop 上验过（mount / 网络 / `host.docker.internal`）。**Windows + Docker Desktop 尚未在真机验证**——`C:\` 盘符 mount 语法和 UTF-8 控制台输出只能在真正的 Windows 机器上确认。Linux 宿主走 macOS 同一条路。Windows compose 在有人端到端跑通之前请当作未测。容器模式整体仍不如本地模式经过充分打磨。
 
 ---
 
@@ -310,7 +343,6 @@ Muteki 在 **NYU CTF Bench** `test` 集(CSAW 2017–2023,共 200 题)上做了�
 | `apps/tui/`          | Textual TUI 指挥台 （未完工）                                                             |
 | `cmd/runtime-agent/` | 容器内的 Go supervisor(反向连接控制器)                                                       |
 | `docker/worker/`     | worker 镜像(Dockerfile、构建脚本、工具感知地图)                                                 |
-| `muteki_kit/`        | 小型 SDK helper(如 flag 提交)                                                          |
 | `scripts/`           | eval / 回测 harness                                                                 |
 | `docs/`              | eval 报告 + 开源就绪审查;设计文档在 `docs/internal-design/`                                    |
 
@@ -391,7 +423,7 @@ go test -C cmd/runtime-agent ./...         # Go supervisor(module 在 cmd/runtim
 
 ~~感谢山姆奥特曼 不封我号~~ 现在已经被封了，我将永远记住他的名字。
 
-感谢Dario Amodei 不封我号
+~~感谢Dario Amodei 不封我号~~ 现在已经被封了，我将永远记住他的名字。
 
 ---
 

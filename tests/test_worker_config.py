@@ -53,6 +53,97 @@ def test_config_set_engines_dedupes_and_filters(tmp_path):
     assert cfg["engines"] == ["claude-sub-container", "codex-sub-container"]
 
 
+# ── seat lineup tracks enabled toggles (regression) ──────────────────────────
+# Bug: the seat UI showed 3 seats enabled, but a stale top-level `engines`
+# lineup (left from an older config) won at get() — it short-circuits the
+# "else enabled seats" fallback — so dispatch raced only the one stale engine.
+# The new-model lineup must always reconcile to the enabled seats.
+
+def _seat(sid: str, engine: str, *, enabled: bool = True) -> dict:
+    return {
+        "id": sid, "label": sid, "engine": engine, "transport": engine,
+        "credential_mode": "api_key", "credential_account": f"{engine}-main",
+        "runtime": "docker-web", "roles": ["race", "bootstrap"], "race": True,
+        "enabled": enabled,
+    }
+
+
+def test_seat_lineup_reconciles_stale_engines_to_enabled_seats(tmp_path):
+    wc = WorkerConfigStore(root=tmp_path)
+    # 3 enabled seats, but a stale lineup naming only one (the exact bug shape).
+    wc.set_identity_model(seats=[
+        _seat("seat_claude_x", "claude"),
+        _seat("seat_codex_x", "codex"),
+        _seat("seat_cursor_x", "cursor"),
+    ])
+    # inject a stale lineup the way a legacy config would carry it, then re-project.
+    wc._data["engines"] = ["cursor"]
+    wc._project_identity_to_legacy()
+    engines = wc.get()["engines"]
+    # all three enabled seats race now — not just the stale "cursor".
+    assert set(engines) == {"seat_claude_x", "seat_codex_x", "seat_cursor_x"}
+
+
+def test_seat_lineup_drops_disabled_seat(tmp_path):
+    wc = WorkerConfigStore(root=tmp_path)
+    wc.set_identity_model(seats=[
+        _seat("seat_claude_x", "claude"),
+        _seat("seat_codex_x", "codex", enabled=False),  # disabled → out of lineup
+        _seat("seat_cursor_x", "cursor"),
+    ])
+    engines = wc.get()["engines"]
+    assert set(engines) == {"seat_claude_x", "seat_cursor_x"}
+    assert "seat_codex_x" not in engines
+
+
+def test_seat_lineup_preserves_prior_order(tmp_path):
+    wc = WorkerConfigStore(root=tmp_path)
+    wc.set_identity_model(seats=[
+        _seat("seat_claude_x", "claude"),
+        _seat("seat_codex_x", "codex"),
+        _seat("seat_cursor_x", "cursor"),
+    ])
+    # an intentional ordering already present in `engines` is kept; newly-enabled
+    # seats are appended (not reordered).
+    wc._data["engines"] = ["seat_cursor_x", "seat_claude_x"]
+    wc._project_identity_to_legacy()
+    engines = wc.get()["engines"]
+    assert engines[:2] == ["seat_cursor_x", "seat_claude_x"]
+    assert set(engines) == {"seat_claude_x", "seat_codex_x", "seat_cursor_x"}
+
+
+def test_backend_set_local_rejected_in_web_container(tmp_path, monkeypatch):
+    # P2-v3: an EXPLICIT operator set() of local-in-container is rejected (400 at
+    # the API) so the operator sees why, rather than silently doing the wrong thing.
+    import apps.web.worker_config as wcmod
+    monkeypatch.setattr(wcmod, "is_web_container", lambda: True)
+    wc = WorkerConfigStore(root=tmp_path)
+    with pytest.raises(ValueError, match="not allowed when the web control plane"):
+        wc.set(engines=["codex"], worker_backend="local")
+
+
+def test_backend_stale_local_coerced_on_read_in_web_container(tmp_path, monkeypatch):
+    # A config persisted as local on a bare host, then loaded inside a container,
+    # is silently COERCED to container on read (get) — never reaches the swarm as
+    # local. Persist local on a host, then flip is_web_container True and re-read.
+    import apps.web.worker_config as wcmod
+    monkeypatch.setattr(wcmod, "is_web_container", lambda: False)
+    wc = WorkerConfigStore(root=tmp_path)
+    wc.set(engines=["codex"], worker_backend="local")
+    assert wc.get()["worker_backend"] == "local"   # host: preserved
+    monkeypatch.setattr(wcmod, "is_web_container", lambda: True)
+    assert wc.get()["worker_backend"] == "container"  # container: coerced on read
+
+
+def test_backend_local_preserved_on_bare_host(tmp_path, monkeypatch):
+    # On a bare host the local backend is preserved (historical behaviour).
+    import apps.web.worker_config as wcmod
+    monkeypatch.setattr(wcmod, "is_web_container", lambda: False)
+    wc = WorkerConfigStore(root=tmp_path)
+    cfg = wc.set(engines=["codex"], worker_backend="local")
+    assert cfg["worker_backend"] == "local"
+
+
 def test_config_set_rejects_empty_engine_list(tmp_path):
     wc = WorkerConfigStore(root=tmp_path)
     with pytest.raises(ValueError):
@@ -67,11 +158,15 @@ def test_config_set_rejects_nonpositive_counts(tmp_path):
         wc.set(max_workers=-3)
 
 
-def test_config_set_links_profile_capacity_to_max_workers(tmp_path):
+def test_config_max_workers_is_derived_from_roster_sum(tmp_path):
+    # max_workers is a READ-ONLY derived ceiling = Σ of the dispatched seats'
+    # max_running. The per-seat values the operator typed persist VERBATIM (never
+    # mutated), and max_workers is computed FROM them — even if the request body
+    # carries a stale/explicit max_workers, the derived sum wins.
     wc = WorkerConfigStore(root=tmp_path)
     cfg = wc.set(
         engines=["claude", "codex", "cursor"],
-        max_workers=10,
+        max_workers=10,  # stale/ignored — overwritten by the derived sum
         worker_profiles=[
             {**p, "max_running": p["max_running"]}
             for p in DEFAULT_WORKER_PROFILES
@@ -80,8 +175,100 @@ def test_config_set_links_profile_capacity_to_max_workers(tmp_path):
 
     by_name = {p["name"]: p for p in cfg["worker_profiles"]}
     selected = [by_name[name] for name in cfg["engines"]]
-    assert sum(int(p["max_running"]) for p in selected) == 10
-    assert [p["max_running"] for p in selected] == [4, 3, 3]
+    # Defaults are [2, 1, 2] (claude, codex, cursor) — left untouched.
+    assert [p["max_running"] for p in selected] == [2, 1, 2]
+    # max_workers tracks the sum, NOT the supplied 10.
+    assert cfg["max_workers"] == 5
+
+
+def test_config_set_does_not_balloon_sole_eligible_seat(tmp_path):
+    # Regression (Bug B): a stale single-engine dispatch lineup (cursor-only) used
+    # to make cursor the ONLY eligible profile, so the auto-grow loop ballooned
+    # cursor's max_running up to max_workers — any value the user typed "reverted"
+    # on every save. Now seats are NEVER mutated; cursor keeps exactly what was
+    # set, and max_workers just equals that seat's capacity.
+    wc = WorkerConfigStore(root=tmp_path)
+    profiles = [
+        {**p, "max_running": 1 if p["engine"] == "cursor" else p["max_running"]}
+        for p in DEFAULT_WORKER_PROFILES
+    ]
+    cfg = wc.set(
+        engines=["cursor"],  # stale cursor-only dispatch lineup
+        max_workers=6,
+        worker_profiles=profiles,
+    )
+    by_engine = {p["engine"]: p for p in cfg["worker_profiles"]}
+    assert by_engine["cursor"]["max_running"] == 1  # NOT bumped to 6
+    assert cfg["max_workers"] == 1  # derived = the one eligible seat's cap
+
+
+def test_config_max_workers_tracks_roster_edit_up_and_down(tmp_path):
+    # Editing a seat's concurrency moves the derived max_workers BOTH ways.
+    wc = WorkerConfigStore(root=tmp_path)
+    base = [{**p, "max_running": p["max_running"]} for p in DEFAULT_WORKER_PROFILES]
+    wc.set(engines=["claude", "codex", "cursor"], worker_profiles=base)
+
+    # raise cursor 2 → 4: sum 2+1+2=5 becomes 2+1+4=7
+    up = [{**p, "max_running": 4 if p["engine"] == "cursor" else p["max_running"]}
+          for p in DEFAULT_WORKER_PROFILES]
+    cfg = wc.set(worker_profiles=up)
+    assert cfg["max_workers"] == 7
+
+    # lower claude 2 → 1: sum 1+1+4 = 6  (max follows DOWN, not just up)
+    down = [{**p, "max_running": (1 if p["engine"] == "claude"
+                                  else 4 if p["engine"] == "cursor"
+                                  else p["max_running"])}
+            for p in DEFAULT_WORKER_PROFILES]
+    cfg = wc.set(worker_profiles=down)
+    assert cfg["max_workers"] == 6
+
+
+def test_config_max_workers_counts_only_dispatched_seats(tmp_path):
+    # Only seats in the dispatch lineup (engines) contribute to the derived max.
+    wc = WorkerConfigStore(root=tmp_path)
+    profiles = [{**p, "max_running": p["max_running"]} for p in DEFAULT_WORKER_PROFILES]
+    # dispatch only claude(2) + codex(1); cursor(2) excluded → sum = 3
+    cfg = wc.set(engines=["claude", "codex"], worker_profiles=profiles)
+    assert cfg["max_workers"] == 3
+
+
+def test_config_dedicated_review_seat_does_not_inflate_max_workers(tmp_path):
+    # The review worker is an INDEPENDENT seat. A review-only profile (roles ==
+    # ["review"], no ordinary race/bootstrap/explore/respond role) must NOT count
+    # toward max_workers (that ceiling gates ORDINARY worker concurrency only,
+    # which the swarm enforces via max_running / _active_profile_counts — a path
+    # totally separate from review's max_review_running / _active_review_profile_
+    # counts). Its review concurrency field must also survive untouched. This
+    # guards against folding review capacity into the ordinary ceiling.
+    wc = WorkerConfigStore(root=tmp_path)
+    ordinary = [
+        {**p, "max_running": 2} for p in DEFAULT_WORKER_PROFILES if p["engine"] == "claude"
+    ]
+    review_seat = {
+        "id": "review-only",
+        "name": "review-only",
+        "engine": "claude",
+        "transport": "claude_code",
+        "runtime": "local",
+        "roles": ["review"],          # review-ONLY, no ordinary role
+        "max_running": 9,             # would balloon max_workers IF wrongly counted
+        "max_review_running": 1,
+        "enabled": True,
+    }
+    cfg = wc.set(
+        engines=["claude"],            # only the ordinary claude seat is dispatched
+        worker_profiles=ordinary + [review_seat],
+    )
+    # Derived ceiling = the ordinary claude seat's max_running (2) ONLY. The
+    # review-only seat's max_running (9) is excluded — NOT 2+9=11.
+    assert cfg["max_workers"] == 2
+    saved_review = next(p for p in cfg["worker_profiles"] if p["name"] == "review-only")
+    # review-only stayed review-only (no ordinary role auto-appended) and its
+    # review concurrency is preserved verbatim — we never mutate it.
+    assert "review" in saved_review["roles"]
+    assert not ({"race", "bootstrap", "explore", "respond"} & set(saved_review["roles"]))
+    assert saved_review["max_review_running"] == 1
+    assert saved_review["max_running"] == 9  # untouched even though excluded
 
 
 def test_config_set_clamps_start_workers_to_max_workers(tmp_path):
@@ -118,7 +305,9 @@ def test_config_persists_across_reload(tmp_path):
                                          })
     cfg = WorkerConfigStore(root=tmp_path).get()  # fresh load from disk
     assert cfg["engines"] == ["claude-sub-container"]
-    assert cfg["start_workers"] == 1 and cfg["max_workers"] == 4
+    # max_workers is derived (Σ dispatched seats' max_running); dispatching the
+    # single claude seat (default max_running=2) yields 2, NOT the supplied 4.
+    assert cfg["start_workers"] == 1 and cfg["max_workers"] == 2
     assert cfg["worker_backend"] == "container"
     assert cfg["race_scout"] is False
     assert cfg["race_timeout"] == 300
@@ -321,7 +510,11 @@ def test_config_rejects_duplicate_profile_ids_and_unknown_runtime(tmp_path):
 
 
 def test_missing_profile_accounts_detects_container_and_api_profiles(tmp_path, monkeypatch):
-    monkeypatch.setattr("apps.web.drivers.detect_system_login", lambda engine: "absent")
+    # detect_system_login now lives in the profile_health kernel that the dispatch
+    # precheck delegates to (single source of truth).
+    monkeypatch.setattr(
+        "muteki.solver.profile_health.detect_system_login", lambda engine, env=None: "absent"
+    )
     missing = _missing_profile_accounts(
         worker_profiles=[
             {"id": "claude-sub", "engine": "claude", "runtime": "docker-web",
@@ -343,8 +536,10 @@ def test_missing_profile_accounts_detects_container_and_api_profiles(tmp_path, m
 
 
 def test_missing_profile_accounts_allows_local_system_login_without_account(tmp_path, monkeypatch):
-    monkeypatch.setattr("apps.web.drivers.detect_system_login", lambda engine: "present")
-    monkeypatch.setattr("apps.web.drivers.driver_for", lambda profile: type(
+    monkeypatch.setattr(
+        "muteki.solver.profile_health.detect_system_login", lambda engine, env=None: "present"
+    )
+    monkeypatch.setattr("muteki.solver.cli_driver.driver_for", lambda profile: type(
         "D", (), {"health_detail": lambda self, env=None: (True, "")})())
 
     missing = _missing_profile_accounts(
@@ -383,11 +578,18 @@ def test_worker_config_accepts_api_endpoint_profile_names(tmp_path):
         engines=["deepseek-codex"],
     )
 
+    # legacy foreign keys stay readable; the new model is attached additively.
     assert cfg["engines"] == ["deepseek-codex"]
     p = cfg["worker_profiles"][0]
     assert p["engine"] == "codex"
     assert p["base_url"] == "https://api.deepseek.example/v1"
     assert p["api_key_ref"] == "env:MUTEKI_DEEPSEEK_API_KEY"
+    # the endpoint is also captured in the new Credential/Seat model (additive)
+    seat = next(s for s in cfg["seats"] if s["engine"] == "codex")
+    assert seat["label"] == "deepseek-codex"
+    cred = next(c for c in cfg["credentials"] if c["id"] == seat["credential_id"])
+    assert cred["kind"] == "custom_endpoint"
+    assert cred["endpoint"]["base_url"] == "https://api.deepseek.example/v1"
 
 
 def test_profile_endpoint_healthcheck_uses_endpoint_url(tmp_path, monkeypatch):

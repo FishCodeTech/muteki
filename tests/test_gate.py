@@ -154,7 +154,8 @@ def test_gate_still_accepts_real_flag_in_output():
 
 def test_bare_brace_templates_are_placeholders():
     for p in ["{name}", "{uuid}", "{id}", "{comp}", "{path}", "{country}",
-              "{1,2,66,67,68}", "{username}", "{img}", "{token}"]:
+              "{1,2,66,67,68}", "{username}", "{img}", "{token}",
+              "{out3[i:j].decode()}"]:
         assert gate.is_placeholder_flag(p) is True, p
 
 
@@ -178,6 +179,14 @@ def test_gate_rejects_number_set_template():
     # run-3613-class: {1,2,66,67,68} was a port/id range quoted in prose.
     out = "the candidate ids were {1,2,66,67,68}"
     assert gate.flag_ok("{1,2,66,67,68}", out, flag_format=LOOSE, artifacts=None) is False
+
+
+def test_gate_rejects_bare_brace_code_expression_from_found_flag_source():
+    # run-0835: a worker pasted Python source containing an f-string marker and
+    # the extractor grabbed the template expression rather than command output.
+    out = 'print(f"FOUND_FLAG={out3[i:j].decode()}")'
+    assert gate.flag_ok("{out3[i:j].decode()}", out,
+                        flag_format=LOOSE, artifacts=None) is False
 
 
 # ── bare-brace comma-set code literals (run-1763) ────────────────────────────
@@ -298,13 +307,3 @@ def test_token_mode_rejects_rockyou_words_and_sentences(tmp_path):
     assert gate.flag_ok("the flag is the admin password", out,
                         flag_format=gate.TOKEN_FLAG_FORMAT, artifacts=None) is False
 
-
-def test_submit_confidence_gate_is_token_aware():
-    # review #4: muteki_kit/submit.py's confidence gate must mirror the floor so a
-    # token flag isn't blocked before POST, while brace + weak words behave.
-    from muteki_kit.submit import _looks_like_flag
-    assert _looks_like_flag("W3lc0m3T0Gh0st", "token") is True
-    assert _looks_like_flag("admin", "token") is False
-    assert _looks_like_flag("the flag is here", "token") is False
-    assert _looks_like_flag("flag{abc}", r"flag\{.*?\}") is True   # brace path intact
-    assert _looks_like_flag("W3lc0m3T0Gh0st", r"flag\{.*?\}") is False  # brace rejects token

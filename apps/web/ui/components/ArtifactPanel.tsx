@@ -12,7 +12,7 @@ import { ActivityStream } from "@/components/ActivityStream";
 import { EvidenceChain } from "@/components/EvidenceChain";
 import { PanelSkeleton } from "@/components/Skeleton";
 import { Icon } from "@/components/Icon";
-import { API } from "@/lib/useRun";
+import { apiFetch } from "@/lib/useRun";
 
 /** The five secondary detail panels (the conversation stays the primary view). */
 export type ArtifactView =
@@ -147,7 +147,7 @@ function CredentialsPanel({ runId }: { runId: string }) {
   useEffect(() => {
     let alive = true;
     setLoading(true);
-    fetch(`${API}/api/runs/${encodeURIComponent(runId)}/credentials`)
+    apiFetch(`/api/runs/${encodeURIComponent(runId)}/credentials`)
       .then((r) => r.ok ? r.json() : { credentials: [] })
       .then((j) => { if (alive) setRows(Array.isArray(j.credentials) ? j.credentials : []); })
       .catch(() => { if (alive) setRows([]); })

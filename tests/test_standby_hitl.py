@@ -120,6 +120,7 @@ def test_post_hitl_finished_run_triggers_standby(tmp_path, monkeypatch):
 
     async def _run():
         mgr = rm.RunManager(sessions_root=str(tmp_path / "sessions"))
+        mgr.worker_config.resolve = lambda category: {"worker_backend": "local"}
         run = mgr.create("run-x")
         run.finished = True
         run.solved = True
@@ -154,6 +155,7 @@ def test_post_hitl_repeated_writeup_triggers_new_standby(tmp_path, monkeypatch):
 
     async def _run():
         mgr = rm.RunManager(sessions_root=str(tmp_path / "sessions"))
+        mgr.worker_config.resolve = lambda category: {"worker_backend": "local"}
         run = mgr.create("run-x")
         run.finished = True
         run.solved = True
@@ -446,6 +448,7 @@ def test_mark_false_standby_uses_operator_selected_flag(tmp_path, monkeypatch):
 
     async def _run():
         mgr = rm.RunManager(sessions_root=str(tmp_path / "sessions"))
+        mgr.worker_config.resolve = lambda category: {"worker_backend": "local"}
         run = mgr.create("run-x")
         run.started = True
         run.finished = True
@@ -479,6 +482,201 @@ def test_mark_false_standby_uses_operator_selected_flag(tmp_path, monkeypatch):
     assert captured["found_flags"] == ["flag{a}", "flag{c}"]
     assert run.flags == ["flag{a}", "flag{c}"]
     assert run.flag == "flag{a}"
+
+
+def test_finished_hitl_in_web_container_uses_worker_container(tmp_path, monkeypatch):
+    """A finished-run follow-up in compose must cold-start a worker container.
+
+    This covers writeup/ask/mark_false's shared standby path: the web container
+    must not shell a host-native CLI with the wrong toolchain/credentials.
+    """
+    from apps.web import run_manager as rm
+    import apps.web.drivers as drivers
+    import muteki.solver.cli_solver as cli_solver
+    import muteki.solver.container_exec as container_exec
+
+    monkeypatch.setattr(drivers, "is_web_container", lambda: True)
+    captured = {}
+
+    class FakeHandle:
+        container = "muteki-run-run-x"
+
+        def to_container_path(self, host_path):
+            return "/home/kali/workspace/" + Path(host_path).name
+
+        def to_container_cwd(self, host_cwd):
+            return self.to_container_path(host_cwd)
+
+    def fake_ensure_container(run_id, host_workspace, **kwargs):
+        captured["ensure"] = {
+            "run_id": run_id,
+            "host_workspace": host_workspace,
+            **kwargs,
+        }
+        return FakeHandle()
+
+    def fake_teardown(run_id, *, remove=True):
+        captured["teardown"] = {"run_id": run_id, "remove": remove}
+
+    def fake_chown(path):
+        captured.setdefault("chown", []).append(Path(path).name)
+
+    class FakeCliSolver:
+        def __init__(self, *args, **kwargs):
+            captured["solver_kwargs"] = kwargs
+
+        async def run(self):
+            return SolveOutcome(False, None, 1, None, "writeup",
+                                engine="codex", reply="# Writeup")
+
+    monkeypatch.setattr(container_exec, "ensure_container", fake_ensure_container)
+    monkeypatch.setattr(container_exec, "teardown_container", fake_teardown)
+    monkeypatch.setattr(container_exec, "_chown_tree_to_worker", fake_chown)
+    monkeypatch.setattr(cli_solver, "CliSolver", FakeCliSolver)
+
+    async def _run():
+        mgr = rm.RunManager(sessions_root=str(tmp_path / "sessions"))
+        mgr.worker_config.resolve = lambda category: {
+            "worker_backend": "container",
+            "runtime_profiles": [
+                {"id": "docker-web", "backend": "container", "network": "bridge"},
+            ],
+            "worker_profiles": [
+                {
+                    "id": "seat-codex",
+                    "name": "seat-codex",
+                    "engine": "codex",
+                    "runtime": "docker-web",
+                    "credential_account": "codex-main",
+                    "model": "gpt-5.4",
+                    "enabled": True,
+                    "roles": ["bootstrap", "explore", "worker"],
+                },
+            ],
+        }
+        run = mgr.create("run-x")
+        run.started = True
+        run.finished = True
+        run.solved = True
+        home = mgr.workspace_dir("run-x") / "homes" / "cli-codex"
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "session.txt").write_text("thread-1")
+        wp = mgr.workspace_dir("run-x") / "winner.json"
+        wp.write_text(json.dumps({
+            "engine": "codex",
+            "session": "thread-1",
+            "workdir": str(mgr.workspace_dir("run-x") / "workers" / "cli-codex-1"),
+            "flag": "flag{ok}",
+            "flags": ["flag{ok}"],
+            "challenge": {
+                "id": "run-x",
+                "name": "t",
+                "category": "web",
+                "description": "",
+            },
+        }))
+        await run.bus.close()
+        ok = await mgr.post_hitl("run-x", "global", "writeup", text="")
+        assert run.standby_task is not None
+        await run.standby_task
+        return ok
+
+    ok = asyncio.run(_run())
+    assert ok is True
+    assert captured["ensure"]["run_id"] == "run-x"
+    assert captured["ensure"]["network"] == "bridge"
+    assert captured["solver_kwargs"]["container"].container == "muteki-run-run-x"
+    assert captured["solver_kwargs"]["engine"] == "codex"
+    assert captured["solver_kwargs"]["resume_session"] == "thread-1"
+    assert captured["solver_kwargs"]["worker_env"]["MUTEKI_WORKER_MODEL"] == "gpt-5.4"
+    assert captured["solver_kwargs"]["worker_env"]["HOME"].endswith("/cli-codex")
+    assert captured["chown"] == ["standby-codex", "cli-codex"]
+    assert captured["teardown"] == {"run_id": "run-x", "remove": True}
+
+
+def test_standby_reuses_challenge_from_session_jsonl_without_winner(tmp_path, monkeypatch):
+    """Old runs may have no winner.json; standby must still recover the original
+    challenge payload instead of launching a context-free worker."""
+    from apps.web import run_manager as rm
+    import muteki.solver.cli_solver as cli_solver
+    from muteki.core.events import Event, EventType
+    from apps.web.drivers import build_standby_driver
+
+    captured = {}
+
+    class FakeCliSolver:
+        def __init__(self, _llm, challenge, **kwargs):
+            captured["challenge"] = challenge
+            captured["kwargs"] = kwargs
+
+        async def run(self):
+            return SolveOutcome(False, None, 1, None, "reply",
+                                engine="claude", reply="ok")
+
+    monkeypatch.setattr(cli_solver, "CliSolver", FakeCliSolver)
+
+    async def _run():
+        mgr = rm.RunManager(sessions_root=str(tmp_path / "sessions"))
+        mgr.worker_config.resolve = lambda category: {"worker_backend": "local"}
+        run = mgr.create("run-x")
+        await run.bus.emit(Event(
+            event_type=EventType.RUN_STARTED,
+            run_id="run-x",
+            payload={"challenge": {
+                "name": "threadweaver",
+                "category": "misc",
+                "description": "live challenge",
+                "target": "94.237.52.90:12345",
+                "expected_flags": 1,
+            }},
+        ))
+        run.finished = True
+        run.solved = True
+        run.flag = "flag{bad}"
+        driver = build_standby_driver({"target": "global", "action": "ask",
+                                       "text": "continue"}, mgr=mgr)
+        await driver(run)
+
+    asyncio.run(_run())
+    ch = captured["challenge"]
+    assert ch.name == "threadweaver"
+    assert ch.category == "misc"
+    assert ch.description == "live challenge"
+    assert ch.target == "94.237.52.90:12345"
+
+
+def test_standby_failure_is_logged_and_emitted(tmp_path, monkeypatch, caplog):
+    from apps.web import run_manager as rm
+    from muteki.core.events import EventType
+    import apps.web.drivers as drivers
+
+    async def _boom(run):
+        raise RuntimeError("container did not start")
+
+    monkeypatch.setattr(drivers, "build_standby_driver",
+                        lambda cmd, mgr=None: _boom)
+
+    async def _run():
+        mgr = rm.RunManager(sessions_root=str(tmp_path / "sessions"))
+        run = mgr.create("run-x")
+        run.started = True
+        run.finished = True
+        run.solved = True
+        run.task = None
+        await run.bus.close()
+        ok = await mgr.post_hitl("run-x", "global", "ask", text="continue")
+        assert ok is True
+        assert run.standby_task is not None
+        await asyncio.gather(run.standby_task, return_exceptions=True)
+        seen = [ev async for ev in run.store.replay("run-x")]
+        return seen
+
+    caplog.set_level("INFO")
+    seen = asyncio.run(_run())
+    assert any("standby worker failed" in r.message for r in caplog.records)
+    reqs = [e for e in seen if e.event_type is EventType.HITL_REQUEST]
+    assert reqs
+    assert "container did not start" in reqs[-1].payload["need"]
 
 
 def test_resolve_reuses_challenge_from_winner_json(tmp_path, monkeypatch):

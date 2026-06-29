@@ -112,7 +112,7 @@ def _runs_ok(path: str) -> bool:
     `--version` is the cheapest probe that distinguishes a real CLI from a binary
     that dies before parsing argv."""
     try:
-        r = subprocess.run([path, "--version"], capture_output=True, text=True,
+        r = subprocess.run([path, "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace",
                            timeout=20)
         return r.returncode == 0
     except Exception:
@@ -258,6 +258,9 @@ class CliDriver(abc.ABC):
 
     @property
     def bin(self) -> str:
+        override = os.environ.get(_ENV_OVERRIDE.get(self.name, ""), "").strip()
+        if override:
+            return override
         if self._bin is None:
             self._bin = resolve_engine_bin(self.name)
         return self._bin
@@ -374,7 +377,7 @@ class CliDriver(abc.ABC):
         if not argv:  # engine has no cheap dry-run → fall back to version liveness
             try:
                 r = subprocess.run([self.bin, "--version"], capture_output=True,
-                                   text=True, timeout=20, env=env)
+                                   text=True, encoding="utf-8", errors="replace", timeout=20, env=env)
                 if r.returncode == 0:
                     return True, ""
                 return False, "binary not runnable (--version failed)"
@@ -388,7 +391,7 @@ class CliDriver(abc.ABC):
         last = "no reply"
         for attempt in range(self._HELLO_RETRIES + 1):
             try:
-                r = subprocess.run(argv, capture_output=True, text=True,
+                r = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
                                    timeout=self._HELLO_TIMEOUT, env=env)
             except FileNotFoundError:
                 return False, "binary not found on PATH"
@@ -1039,10 +1042,18 @@ class EndpointDriver(CliDriver):
             return []
         wire_api = str(self.profile.get("wire_api") or "responses").strip() or "responses"
         model = str(self.profile.get("model") or "").strip()
+        # `name` is REQUIRED by codex: a [model_providers.X] block with no `name`
+        # fails config load with "provider name must not be empty", so a custom
+        # endpoint never even reaches the request. `env_key` pins which env var
+        # holds the bearer token — OPENAI_API_KEY is exactly what the Credential
+        # Account injection populates for codex (see _api_key / runtime_env_for_engine),
+        # so codex reads the worker's endpoint key instead of silently sending none.
         flags = [
             "-c", "model_provider=muteki",
+            "-c", "model_providers.muteki.name=muteki",
             "-c", f"model_providers.muteki.base_url={base_url}",
             "-c", f"model_providers.muteki.wire_api={wire_api}",
+            "-c", "model_providers.muteki.env_key=OPENAI_API_KEY",
         ]
         if model:
             flags += ["-c", f"model={model}"]
@@ -1151,7 +1162,7 @@ class EndpointDriver(CliDriver):
             })
         argv += ["--data", body, self._endpoint_probe_url()]
         try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=25,
+            r = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=25,
                                env=env)
         except FileNotFoundError:
             return False, "curl binary not found"
@@ -1271,7 +1282,7 @@ def _claude_oauth() -> "Optional[tuple[str, int]]":
     try:
         r = subprocess.run(
             ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-            capture_output=True, text=True, timeout=5)
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
         if r.returncode == 0 and r.stdout.strip():
             raw = r.stdout.strip()
     except Exception:
@@ -1305,7 +1316,7 @@ def _cursor_session_cookie() -> "Optional[str]":
     try:
         r = subprocess.run(
             ["security", "find-generic-password", "-s", "cursor-access-token", "-w"],
-            capture_output=True, text=True, timeout=5)
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
         if r.returncode == 0 and r.stdout.strip():
             tok = r.stdout.strip()
     except Exception:
@@ -1419,7 +1430,7 @@ def engine_health(backend: str = "local",
             b, version, healthy, detail = name, "", False, ""
             try:
                 b = drv.bin
-                r = subprocess.run([b, "--version"], capture_output=True, text=True, timeout=20)
+                r = subprocess.run([b, "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
                 raw = (r.stdout or r.stderr or "").strip()
                 version = raw.splitlines()[0][:80] if raw else ""
                 if r.returncode != 0:
@@ -1446,7 +1457,7 @@ def engine_health(backend: str = "local",
                                 healthy, detail = False, "driver has no hello probe"
                             else:
                                 rr = subprocess.run(
-                                    argv, capture_output=True, text=True,
+                                    argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
                                     timeout=getattr(drv, "_HELLO_TIMEOUT", 90))
                                 healthy = bool(drv._hello_ok(rr))  # noqa: SLF001
                                 if not healthy:
@@ -1478,7 +1489,7 @@ def engine_health(backend: str = "local",
         b, version, healthy, detail = name, "", False, ""
         try:
             b = drv.bin
-            r = subprocess.run([b, "--version"], capture_output=True, text=True, timeout=20)
+            r = subprocess.run([b, "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
             raw = (r.stdout or r.stderr or "").strip()
             version = raw.splitlines()[0][:80] if raw else ""
             if r.returncode != 0:
@@ -1530,7 +1541,7 @@ def _engine_health_container() -> list[dict]:
     else:
         try:
             r = subprocess.run([docker, "image", "inspect", WORKER_IMAGE],
-                               capture_output=True, text=True, timeout=20)
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
             image_ok = r.returncode == 0
             if not image_ok:
                 image_detail = f"image missing: {WORKER_IMAGE}"
@@ -1553,7 +1564,7 @@ def _engine_health_container() -> list[dict]:
                     [docker, "run", "--rm", "--network", "none",
                      "--entrypoint", "bash", WORKER_IMAGE,
                      "-lc", f"{bin_in} --version 2>&1 || echo MUTEKI_CLI_FAIL"],
-                    capture_output=True, text=True, timeout=60)
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
                 raw = (r.stdout or "").strip()
                 if "MUTEKI_CLI_FAIL" in raw or r.returncode != 0:
                     detail = f"{name} CLI not launchable in container"
@@ -1581,7 +1592,7 @@ def _descendant_pids(root_pid: int) -> "list[int]":
     """
     try:
         out = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True,
-                             text=True, timeout=10).stdout
+                             text=True, encoding="utf-8", errors="replace", timeout=10).stdout
     except Exception:
         return []
     children: "dict[int, list[int]]" = {}
@@ -1660,7 +1671,7 @@ def run_cli(driver: CliDriver, argv: list[str], *, cwd: str, timeout: int,
     t0 = time.time()
     run_env = {**os.environ, **env} if env else None
     try:
-        proc = subprocess.run(argv, cwd=cwd, capture_output=True, text=True,
+        proc = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                               timeout=timeout, env=run_env)
     except subprocess.TimeoutExpired as e:
         out = e.stdout if isinstance(e.stdout, str) else ""
@@ -1752,7 +1763,7 @@ def run_cli_streaming(
     # parent leaves a `sleep`/`curl` child holding the stdout pipe open, so the read
     # loop blocks until timeout (the deeper form of bug #2). We kill the whole GROUP.
     proc = _sp.Popen(argv, cwd=cwd, stdout=_sp.PIPE, stderr=_sp.PIPE,
-                     text=True, bufsize=1, env=run_env,
+                     text=True, encoding="utf-8", errors="replace", bufsize=1, env=run_env,
                      start_new_session=True)  # line-buffered + own process group
     try:
         proc_pgid: "Optional[int]" = os.getpgid(proc.pid)

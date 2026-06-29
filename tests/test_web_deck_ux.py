@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import subprocess
 import textwrap
 from pathlib import Path
+
+import pytest
 
 from apps.web.run_manager import RunManager
 from apps.web.run_meta import RunMetaStore
@@ -29,6 +32,25 @@ from muteki.models.solve_graph import Challenge
 
 ROOT = Path(__file__).resolve().parents[1]
 UI_ROOT = ROOT / "apps" / "web" / "ui"
+
+
+def _run_ui_node(script: str) -> None:
+    """Run a Node snippet that transpiles a UI .ts helper via the bundled
+    `typescript` package and asserts on its behavior.
+
+    These tests exercise REAL frontend logic, so they need `node` on PATH and the
+    UI's node_modules (for `require("typescript")`). Neither is installed by
+    `./init.sh` (it's a Python bootstrap; the UI deps land on the first
+    `./run.sh web` / `npm install`), so on a fresh checkout we SKIP rather than
+    hard-fail — the suite stays green on a bare host, and CI (which installs the UI
+    deps) still runs them for real. A genuine assertion failure inside the script
+    still raises (check=True)."""
+    if shutil.which("node") is None:
+        pytest.skip("node not on PATH — UI reducer tests need Node (npm install in apps/web/ui)")
+    if not (UI_ROOT / "node_modules" / "typescript").exists():
+        pytest.skip("apps/web/ui/node_modules/typescript missing — run `npm install` in apps/web/ui")
+    subprocess.run(["node", "-e", script], cwd=UI_ROOT, check=True,
+                   capture_output=True, text=True)
 
 
 # ---- titler -----------------------------------------------------------------
@@ -104,7 +126,7 @@ def test_worker_lane_header_compacts_tool_status():
         assert(offline.kind === "i18n" && offline.key === "workerDock.offline", "offline wins over tool text");
         """
     )
-    subprocess.run(["node", "-e", script], cwd=UI_ROOT, check=True, capture_output=True, text=True)
+    _run_ui_node(script)
 
 
 def test_worker_filter_chips_are_compact_scroll_rail():
@@ -131,7 +153,7 @@ def test_worker_filter_chips_are_compact_scroll_rail():
         assert(lib.workerShortLabel("reason") === "reason", "reason role label");
         """
     )
-    subprocess.run(["node", "-e", script], cwd=UI_ROOT, check=True, capture_output=True, text=True)
+    _run_ui_node(script)
 
     activity = (UI_ROOT / "components" / "ActivityStream.tsx").read_text()
     lanes = (UI_ROOT / "components" / "WorkerLanes.tsx").read_text()
@@ -198,74 +220,92 @@ def test_worker_identity_uses_transport_not_name_substrings():
         assert(lib.resumeCommand("cursor_agent", "s2") === "cursor-agent --resume s2", "cursor resume from transport");
         """
     )
-    subprocess.run(["node", "-e", script], cwd=UI_ROOT, check=True, capture_output=True, text=True)
+    _run_ui_node(script)
 
 
 def test_worker_settings_redesigned_ia():
-    """Settings panel IA after the redesign (DESIGN_settings_panel_redesign).
+    """Settings panel IA after the v2 redesign (left tab rail + right content) and
+    the health self-check unification (per-profile readiness, single source of
+    truth shared with the dispatch precheck).
 
-    CONTRACT CHANGE, not a weakening: the old flat 13-column profile table +
-    dead subscription-mode base_url/api_key_ref columns are intentionally gone.
-    The panel is now split by semantics: engines · credential accounts that
-    change face by run environment · run environment (one container per solve) ·
-    scheduling · reasoning models (endpoint configurable, key in .env) · an
-    advanced profile drawer · self-check. This pins the new shape so a future
-    edit can't silently regress it back to the mush.
+    CONTRACT: the panel is organised by INTENT tabs — roster · accounts · runtime
+    · budget · advanced — not the old flat profile table. Account readiness is
+    PER PROFILE with a three honest states badge (not the old per-engine
+    "an account exists ⇒ green" inference that let a run die on profile_unhealthy
+    while the page showed green). This pins the new shape so a future edit can't
+    silently regress it.
     """
     src = (UI_ROOT / "components" / "WorkerSettings.tsx").read_text()
     css = (UI_ROOT / "app" / "globals.css").read_text()
     i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
 
-    # the redesigned sections exist
-    assert 't("settings.secEngines")' in src
-    assert 't("settings.secCredentials")' in src
-    assert 't("settings.secRuntime")' in src
-    assert 't("settings.secReason")' in src
+    # ── intent tabs (the v2 left rail) ───────────────────────────────────────
+    for tab in ("tabRoster", "tabAccounts", "tabRuntime", "tabBudget", "tabAdvanced"):
+        assert f't("settings.{tab}")' in src, f"missing intent tab {tab}"
 
-    # credential block CHANGES FACE by run environment (local note vs container warn)
+    # ── credential block CHANGES FACE by run environment ─────────────────────
     assert 'workerBackend === "container"' in src
-    assert 't("settings.credContainerWarn")' in src
-    assert 't("settings.credLocalNote")' in src
+    assert 't("settings.acctSub")' in src        # container: every engine needs an account
+    assert 't("settings.credLocalNote")' in src  # local: system-login note
     # system-login status is consumed for local mode
     assert "getSystemLogin" in src and "sysLogin" in src
 
-    # run environment = one container per run: backend + recipe, recipe disabled local
+    # ── run environment = one container per run: backend + recipe ─────────────
     assert "putRuntimeEnvironment" in src
-    assert 'disabled={workerBackend === "local"}' in src
     assert "alignProfileRefs" in src
     assert "worker_backend: workerBackend" in src
 
-    # reasoning models: base_url configurable, key NOT in the panel (goes to .env)
+    # ── reasoning models: base_url configurable, key NOT in the panel (.env) ──
     assert "llmBaseUrl" in src
     assert "base_url: llmBaseUrl" in src
-    assert 't("settings.reasonKeyNote")' in src
     assert "testLlmEndpoint" in src
 
-    # worker execution models: profile-level selector + custom model name + real
-    # model probe button. This must stay visible, not buried only in advanced
-    # profile details.
+    # ── worker execution models: profile-level selector + real model probe ────
     assert "getWorkerModelOptions" in src
     assert "testWorkerProfileModel" in src
-    assert 't("settings.secWorkerModels")' in src
-    assert "ws-cred-model" in src
-    assert 't("settings.customModel")' in src
+    assert "customModel" in src
     assert "runModelTest" in src
-    # Saving first normalizes runtime, then writes profiles. That runtime response
+    assert "customModelOpen" in src
+    assert 'if (v === "__custom__")' in src
+    assert "setCustomModelOpen((cur) => ({ ...cur, [p.id]: true }))" in src
+    assert 'updateProfile(p.id, { model: "__custom__" })' not in src
+    assert "enabledDispatchRefs" in src
+    assert "profileCapacity(workerProfiles)" in src
+    assert "alignProfileRefs(enabledDispatchRefs(profilesToSave), profilesToSave, workerProfiles)" in src
+    assert "profileCapacity(workerProfiles, engines)" not in src
+    # Saving normalizes runtime first, then writes profiles — the runtime response
     # must not overwrite model edits already made in the modal.
     assert "currentById" in src
     assert "runtime: p.runtime" in src
 
-    # account test wired (local/container), per-account
-    assert "testCredentialAccount" in src
-    # the test BUTTON stays a button (label "测连通") — the result is a SEPARATE
-    # span beside it, never rendered AS the button label (regression: the failure
-    # layer "image" was showing up as the button text, looking like a broken btn).
-    assert "ws-cred-test" in src
+    # ── HEALTH SELF-CHECK UNIFICATION (single source of truth) ────────────────
+    # Readiness comes from the server's per-profile health, NOT a client-side
+    # per-engine guess. The old engine-dimension inference is GONE.
+    assert "fetchProfilesHealth" in src and "testProfileHealth" in src
+    assert "profileHealth" in src
+    assert "accountForEngine" not in src, "engine-dimension health inference must be gone"
+    assert "missingEngines" not in src, "engine-dimension badge must be gone"
+    # the account tab renders PER PROFILE (ws2-acct rows), with three honest states.
+    # (profileAuthFailed takes an interpolated {layer} arg, so match the t(" prefix
+    # rather than a bare closing paren.)
+    assert "ws2-acct" in src
+    for key in ("acctUnbound", "profileVerified", "profileUnverified", "profileAuthFailed"):
+        assert f't("settings.{key}"' in src, f"missing three-state key {key}"
+    # the badge has an explicit "bound but unverified" state (not a false green)
+    assert '"settings.healthAcctUnverified"' in i18n
+
+    # ── account test wired (the "测连通" button stays a button) ───────────────
+    assert "testCredentialAccount" in src        # still used by the registration form
     assert 't("settings.testConn")' in src
-    # the registration form can save AND test the just-saved account in one click
     assert "saveAndTestAccount" in src
     assert 't("settings.saveAndTest")' in src
     assert '"settings.saveAndTest"' in i18n
+
+    # ── codex one-click re-auth from the host ~/.codex (after `codex login`) ───
+    assert "importHostCodexAuth" in src and "importCodexFromHost" in src
+    assert 't("settings.importHostCodex")' in src
+    assert '"settings.importHostCodex"' in i18n
+    assert 'p.engine === "codex"' in src, "import-from-host must be gated to codex rows"
 
     # local-vs-container is explicit: tests run against the CURRENT run env and
     # say so (account test labels the backend; self-check probes the right env).
@@ -275,19 +315,13 @@ def test_worker_settings_redesigned_ia():
     assert 't("settings.selfcheckContainerNote")' in src
     assert '"settings.selfcheckContainerNote"' in i18n
 
-    # profile details live in an advanced <details> drawer, not a flat table
-    assert "ws-details" in src
-    assert 't("settings.advProfiles")' in src
-    # the old flat 13-col table contract is GONE
+    # the old flat 13-col profile table + dead subscription-mode columns are GONE
     assert 'className="ws-profile-table"' not in src
     assert "api_key_ref" not in src
 
-    # i18n + css for the new pieces
+    # i18n for the still-present notes
     assert '"settings.credContainerWarn"' in i18n
     assert '"settings.reasonKeyNote"' in i18n
-    assert ".ws-note-warn" in css
-    assert ".ws-cred-row" in css
-    assert ".ws-details > summary" in css
 
 
 def test_custom_endpoint_account_form_binds_to_agent():
@@ -324,6 +358,20 @@ def test_run_inspector_renders_runtime_degraded_badge():
     assert ".insp-runtime-degraded" in css
 
 
+def test_worker_settings_save_keeps_race_roster_in_sync_with_visible_roster():
+    """Saving the visible seat lineup must also update the race roster.
+
+    The settings UI does not expose a separate race-only subset. If save only
+    updates `engines`, an old `race_engines`/`stage_policy.race.engines` subset
+    can survive on disk and silently drop codex from new runs even though the
+    roster shows it enabled.
+    """
+    src = (UI_ROOT / "components" / "WorkerSettings.tsx").read_text()
+
+    assert "race_engines: nextEngines" in src
+    assert "race: { enabled: raceScout, timeout: raceTimeout, engines: nextEngines }" in src
+
+
 def test_events_reducer_tracks_poc_blackboard_lifecycle():
     helper = UI_ROOT / "lib" / "events.ts"
     script = textwrap.dedent(
@@ -357,7 +405,7 @@ def test_events_reducer_tracks_poc_blackboard_lifecycle():
         assert(s.blackboard.events.some((e) => e.kind === "poc_concluded"), "timeline event");
         """
     )
-    subprocess.run(["node", "-e", script], cwd=UI_ROOT, check=True, capture_output=True, text=True)
+    _run_ui_node(script)
 
 
 def test_events_reducer_upserts_fact_and_dead_end_by_db_seq():
@@ -394,7 +442,7 @@ def test_events_reducer_upserts_fact_and_dead_end_by_db_seq():
         assert(s.blackboard.deadEnds[0].deadEndSeq === 43, "dead end seq preserved");
         """
     )
-    subprocess.run(["node", "-e", script], cwd=UI_ROOT, check=True, capture_output=True, text=True)
+    _run_ui_node(script)
 
 
 def test_events_reducer_uses_intent_id_product_edge_and_branch_resolve():
@@ -445,7 +493,7 @@ def test_events_reducer_uses_intent_id_product_edge_and_branch_resolve():
         assert(s.blackboard.branches[0].status === "resolved", "branch resolved");
         """
     )
-    subprocess.run(["node", "-e", script], cwd=UI_ROOT, check=True, capture_output=True, text=True)
+    _run_ui_node(script)
 
 
 def test_blackboard_canvas_consumes_g0_product_edges():
@@ -509,7 +557,7 @@ def test_events_reducer_tracks_runtime_degraded_blackboard_delta():
         assert(s.lanes.claude.runtime.status === "degraded", "lane runtime degraded");
         """
     )
-    subprocess.run(["node", "-e", script], cwd=UI_ROOT, check=True, capture_output=True, text=True)
+    _run_ui_node(script)
 
 
 def test_events_reducer_tracks_phase_and_budget_events():
@@ -631,7 +679,7 @@ def test_events_reducer_tracks_operator_paused_blackboard_delta():
         assert(lib.swarmDigest(s).phase !== "paused", "digest resumed from hitl response");
         """
     )
-    subprocess.run(["node", "-e", script], cwd=UI_ROOT, check=True, capture_output=True, text=True)
+    _run_ui_node(script)
 
 
 def test_events_reducer_surfaces_standby_writeup_in_coordinator_thread():
@@ -669,7 +717,7 @@ def test_events_reducer_surfaces_standby_writeup_in_coordinator_thread():
         assert(!lib.coordinatorThread(worker).some((m) => m.content.includes("ordinary worker")), "ordinary worker text stays out of main thread");
         """
     )
-    subprocess.run(["node", "-e", script], cwd=UI_ROOT, check=True, capture_output=True, text=True)
+    _run_ui_node(script)
 
 
 def test_events_reducer_labels_resolve_reopen_separately_from_false_positive():
@@ -717,7 +765,7 @@ def test_events_reducer_labels_resolve_reopen_separately_from_false_positive():
         assert(falseDeck.flags.length === 1 && falseDeck.flags[0] === "flag{{good}}", "drops only bad flag");
         """
     )
-    subprocess.run(["node", "-e", script], cwd=UI_ROOT, check=True, capture_output=True, text=True)
+    _run_ui_node(script)
 
 
 def test_run_active_selector_closes_controls_after_terminal_flag_signal():
@@ -757,7 +805,7 @@ def test_run_active_selector_closes_controls_after_terminal_flag_signal():
         assert(lib.isRunActive(collecting) === true, "partial multi-flag run keeps controls active");
         """
     )
-    subprocess.run(["node", "-e", script], cwd=UI_ROOT, check=True, capture_output=True, text=True)
+    _run_ui_node(script)
 
 
 def test_evidence_chain_is_compact_expandable_workbench():

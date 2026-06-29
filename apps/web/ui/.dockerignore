@@ -1,0 +1,10 @@
+# Build-context exclusions for docker/ui/Dockerfile (context = this dir).
+# A .dockerignore only applies from the build context root, so the repo-root
+# .dockerignore does NOT cover this image — keep a dedicated one here.
+node_modules/
+.next/
+.turbo/
+*.log
+.env
+.env.*
+.DS_Store

@@ -1,0 +1,85 @@
+# muteki — unified containerized deployment (P2-v3).
+#
+# One command brings up the whole control plane:
+#   MUTEKI_HOST_DATA_ROOT=/opt/muteki/data MUTEKI_WEB_PASSWORD=... \
+#     docker compose up --build
+#
+# Topology:
+#   web-api  — FastAPI coordinator. Mounts the host docker socket and launches
+#              WORKER containers as SIBLINGS on the host daemon (not dind). The
+#              in-container supervisor dials back to web-api:9100 over muteki_net.
+#   ui       — Next command deck; proxies /api → web-api.
+#   (workers are NOT a compose service — web-api `docker run`s them per-run.)
+#
+# The four P2-v3 BLOCKERs are addressed by the env + mounts here:
+#   a) MUTEKI_CONTROL_BIND=0.0.0.0 — receiver reachable by sibling workers.
+#   b) MUTEKI_WORKER_NETWORK=muteki_net + MUTEKI_CONTROL_HOST=web-api — workers
+#      join this network and resolve the receiver by the web-api alias.
+#   c) ${MUTEKI_HOST_DATA_ROOT} bind-mounted at the SAME path in web-api, and
+#      MUTEKI_SESSIONS_ROOT under it, so worker sibling mounts (resolved by the
+#      HOST daemon) point at real host paths. _mount_source() is identity here.
+#   d) MUTEKI_IN_CONTAINER=1 — the swarm hard-fails instead of falling back to a
+#      host-native local worker.
+
+name: muteki
+
+networks:
+  muteki_net:
+    name: muteki_net          # fixed external-style name → workers join by name
+
+services:
+  web-api:
+    build:
+      context: .
+      dockerfile: docker/web/Dockerfile
+    image: muteki-web:latest
+    networks: [muteki_net]
+    ports:
+      - "8000:8000"           # operator/API; remove to keep it compose-internal
+    volumes:
+      # talk to the HOST docker daemon (launch worker sibling containers)
+      - /var/run/docker.sock:/var/run/docker.sock
+      # mirror the host data root at the SAME path so worker mounts resolve on host
+      - ${MUTEKI_HOST_DATA_ROOT:?set MUTEKI_HOST_DATA_ROOT to an absolute host path}:${MUTEKI_HOST_DATA_ROOT}
+    environment:
+      MUTEKI_IN_CONTAINER: "1"
+      MUTEKI_CONTROL_BIND: "0.0.0.0"
+      MUTEKI_CONTROL_HOST: "web-api"
+      MUTEKI_WORKER_NETWORK: "muteki_net"
+      MUTEKI_HOST_DATA_ROOT: "${MUTEKI_HOST_DATA_ROOT}"
+      # container data root == host root (identity mirror), so _mount_source is a no-op
+      MUTEKI_CONTAINER_DATA_ROOT: "${MUTEKI_HOST_DATA_ROOT}"
+      MUTEKI_SESSIONS_ROOT: "${MUTEKI_HOST_DATA_ROOT}/sessions"
+      MUTEKI_WEB_BIND: "0.0.0.0"
+      MUTEKI_WEB_PASSWORD: "${MUTEKI_WEB_PASSWORD:?set MUTEKI_WEB_PASSWORD — non-loopback bind requires it}"
+      MUTEKI_WORKER_IMAGE: "${MUTEKI_WORKER_IMAGE:-snowywar/muteki-worker:latest}"
+      MUTEKI_WORKER_IMAGE_VERSION: "${MUTEKI_WORKER_IMAGE_VERSION:-}"
+      # The coordinator brain (planner) + auto-titler use LLMClient, which reads
+      # the key from the process env. .env is .dockerignore'd (secrets must NOT be
+      # baked into the image), so it can only reach the container via compose.
+      # Without it LLMClient sends "Authorization: Bearer " (empty) and httpx
+      # rejects it ("Illegal header value"). Pass it through from the host .env.
+      # (base_url is intentionally NOT passed: an empty "${VAR:-}" would override
+      # the code default https://api.deepseek.com/v1 with "" and break requests.
+      # Set MUTEKI_DEEPSEEK_BASE_URL here explicitly only if using a non-default
+      # endpoint.)
+      MUTEKI_DEEPSEEK_API_KEY: "${MUTEKI_DEEPSEEK_API_KEY:-}"
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: ./apps/web/ui
+      dockerfile: ../../../docker/ui/Dockerfile
+      args:
+        # Next standalone freezes the rewrites() proxy target at BUILD time, so the
+        # backend alias must be passed as a build arg (not just a runtime env).
+        MUTEKI_BACKEND: "http://web-api:8000"
+    image: muteki-ui:latest
+    networks: [muteki_net]
+    ports:
+      # host port overridable (a dev server may already own 3001); container stays 3001
+      - "${MUTEKI_UI_PORT:-3001}:3001"
+    environment:
+      MUTEKI_BACKEND: "http://web-api:8000"   # kept for parity; baked at build (see args)
+    depends_on: [web-api]
+    restart: unless-stopped

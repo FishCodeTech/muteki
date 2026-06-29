@@ -20,6 +20,7 @@ red status is actionable.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -27,10 +28,7 @@ from typing import Any, Optional
 
 from muteki.solver.credential_accounts import (
     CONTAINER_ACCOUNTS_ROOT,
-    CredentialAccountStore,
-    account_store_root,
     project_account_root,
-    runtime_env_for_engine,
 )
 
 # in-container worker binary per engine — mirrors container_exec._CONTAINER_BIN.
@@ -55,49 +53,138 @@ def probe_account(
     sessions_root: str | Path,
     backend: str,
 ) -> dict[str, Any]:
-    """Test the registered account. Never raises; returns {ok, detail, layer?}."""
+    """LEGACY entry — test a bare (engine, account) credential, NOT a profile.
+
+    Kept for back-compat (the old credential-accounts/{id}/test endpoint). It
+    routes through the profile_health kernel so its verdict matches dispatch for
+    plumbing + auth, but it synthesizes a profile WITHOUT a pinned model, so the
+    auth hello uses the engine-DEFAULT model. That is fine for "can this raw
+    credential authenticate?" but it is NOT equivalent to a specific profile's
+    run health (a profile may pin a model the default check can't see). Profile
+    readiness must use the per-profile health endpoint instead.
+
+    Returns the historical {ok, detail, layer?} shape. Never raises.
+    """
+    from muteki.solver.credential_accounts import (
+        CredentialAccountStore,
+        account_store_root,
+    )
+    from muteki.solver.profile_health import evaluate_profile_health
+
     engine = (engine or "").strip().lower()
     account_id = (account_id or "").strip()
-    root = account_store_root(sessions_root)
+    backend = "container" if backend == "container" else "local"
 
-    # Account must actually be registered — no host-login fallback (reviewer P1).
-    store = CredentialAccountStore(root)
+    # Legacy contract (reviewer P1): the account MUST be registered with present
+    # credential material — there is NO host-login fallback for the account-test
+    # entry, even on a host that happens to be logged in. This is STRICTER than a
+    # real profile (which may legitimately use a present system login), so we gate
+    # it here rather than relying on the kernel's profile-grade binding rule.
+    store = CredentialAccountStore(account_store_root(sessions_root))
     acct = store.inspect(account_id) if account_id else None
     if not account_id or acct is None or not acct.present:
         return _result(False, "账号未登记凭据", layer="auth")
 
-    if backend == "container":
-        return _probe_container(engine=engine, account_id=account_id, root=root)
-    return _probe_local(engine=engine, account_id=account_id, root=root)
+    # A custom-endpoint account (third-party OpenAI/Anthropic-compatible endpoint,
+    # e.g. DeepSeek) has NO model bound to it — so synthesizing a profile and
+    # shelling claude-code makes the CLI pick a wrong DEFAULT model the endpoint
+    # doesn't know, which HANGS until timeout even though the endpoint is fine.
+    # Probe the endpoint DIRECTLY instead (cheap curl, model-agnostic): "can this
+    # base_url + key authenticate?" — the right question for an account, with no
+    # CLI and no pinned model. (A profile's real run-readiness still uses the
+    # per-profile health endpoint, which DOES carry the pinned model.)
+    if acct.mode == "custom_endpoint":
+        return _probe_endpoint_account(account_id=account_id, acct=acct,
+                                       root=account_store_root(sessions_root))
+
+    # Synthesize a minimal profile (no pinned model — see docstring) so the
+    # kernel's plumbing + auth layers run with the account's resolved env.
+    profile = {
+        "id": account_id,
+        "name": account_id,
+        "engine": engine,
+        "credential_account": account_id,
+        "credential_mode": "api_key",
+        "enabled": True,
+    }
+    h = evaluate_profile_health(
+        profile, backend=backend, sessions_root=sessions_root, depth="auth"
+    )
+    out: dict[str, Any] = {"ok": h.ok, "detail": h.detail}
+    if h.layer:
+        out["layer"] = h.layer
+    return out
 
 
-def _probe_local(*, engine: str, account_id: str, root: Path) -> dict[str, Any]:
-    """Resolve the account into env (container=False) and run the host probe."""
-    from muteki.solver.cli_driver import driver_for  # lazy: avoid import cycle
+def _probe_endpoint_account(*, account_id: str, acct: Any, root: Path) -> dict[str, Any]:
+    """Model-agnostic auth probe for a custom-endpoint credential.
 
-    env = runtime_env_for_engine(
-        engine, account_root=root, account_id=account_id, container=False
-    ).env
-    if not env:
-        return _result(False, "账号未登记凭据", layer="auth")
-    prev = {k: os.environ.get(k) for k in env}
+    Reads the account's API_KEY + BASE_URL + target engine and sends ONE minimal
+    request (max_tokens=1) in the wire format the target engine speaks:
+      - claude target → Anthropic Messages  ({base}/v1/messages, x-api-key)
+      - codex/cursor/other → OpenAI Chat Completions ({base}/chat/completions, Bearer)
+    Never shells a CLI, never needs a pinned model, returns fast. NEVER raises.
+    """
+    base = root / account_id
     try:
-        os.environ.update(env)
-        ok, detail = driver_for(engine).health_detail()
-    except Exception as exc:  # noqa: BLE001
-        return _result(False, str(exc)[:160], layer="cli")
-    finally:
-        for k, v in prev.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-    return _result(ok, detail or ("ok" if ok else "unhealthy"),
-                   layer=None if ok else "auth")
+        api_key = (base / "API_KEY").read_text(encoding="utf-8").strip()
+    except OSError:
+        return _result(False, "账号缺少 API_KEY", layer="auth")
+    base_url = ""
+    if (base / "BASE_URL").exists():
+        try:
+            base_url = (base / "BASE_URL").read_text(encoding="utf-8").strip().rstrip("/")
+        except OSError:
+            base_url = ""
+    if not base_url:
+        return _result(False, "自定义端点缺少 base_url", layer="auth")
+    if not api_key:
+        return _result(False, "自定义端点缺少 API key", layer="auth")
+
+    target = (acct.details or {}).get("target_engine") or acct.engine or ""
+    # build the right wire request for the target engine.
+    if target == "claude":
+        url = f"{base_url}/v1/messages"
+        headers = ["-H", f"x-api-key: {api_key}", "-H", "anthropic-version: 2023-06-01",
+                   "-H", "Content-Type: application/json"]
+        body = json.dumps({"model": "probe", "max_tokens": 1,
+                           "messages": [{"role": "user", "content": "ok"}]})
+    else:
+        url = f"{base_url}/chat/completions"
+        headers = ["-H", f"Authorization: Bearer {api_key}", "-H", "Content-Type: application/json"]
+        body = json.dumps({"model": "probe", "max_tokens": 1,
+                           "messages": [{"role": "user", "content": "ok"}]})
+
+    # -w writes the HTTP status on its own line so we can classify auth vs other.
+    argv = ["curl", "-sS", "-m", "20", "-o", "/dev/null", "-w", "%{http_code}",
+            "-X", "POST", *headers, "--data", body, url]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=25)
+    except FileNotFoundError:
+        return _result(False, "curl 不可用", layer="auth")
+    except subprocess.TimeoutExpired:
+        return _result(False, "端点探测超时（>20s）", layer="auth")
+    code = (r.stdout or "").strip()[-3:]
+    # 200 → key authenticates. 400/422 → endpoint reached + key OK, just our dummy
+    # "probe" model/body was rejected — that still PROVES auth+reachability, which is
+    # all an account test asserts. 401/403 → bad key. 404 → wrong endpoint path.
+    if code in ("200", "400", "422"):
+        return _result(True, f"端点可达且凭据通过认证（HTTP {code}）")
+    if code in ("401", "403"):
+        return _result(False, f"端点拒绝凭据（HTTP {code}，key 可能无效）", layer="auth")
+    if code == "404":
+        return _result(False, f"端点路径不存在（HTTP 404，base_url 或目标引擎不匹配）", layer="auth")
+    tail = (r.stderr or "").strip().splitlines()
+    detail = f"端点探测失败（HTTP {code or '?'}）" + (f": {tail[-1][:80]}" if tail else "")
+    return _result(False, detail, layer="auth")
 
 
 def _docker(*args: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
-    return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout)
+    # encoding=utf-8/errors=replace (P2-v3): decode docker output as UTF-8, not the
+    # host locale codepage (Windows cp936 would corrupt non-ASCII output).
+    return subprocess.run(["docker", *args], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=timeout)
 
 
 def _probe_container(*, engine: str, account_id: str, root: Path) -> dict[str, Any]:
@@ -112,6 +199,8 @@ def _probe_container(*, engine: str, account_id: str, root: Path) -> dict[str, A
     from muteki.solver.container_exec import (
         WORKER_IMAGE,
         CONTAINER_WORKSPACE,
+        _HOST_DATA_ROOT,
+        _mount_source,
     )
 
     image = WORKER_IMAGE
@@ -127,8 +216,21 @@ def _probe_container(*, engine: str, account_id: str, root: Path) -> dict[str, A
         return _result(False, f"镜像缺失或不可用: {image}", layer="image")
 
     # 2) project the account store into a throwaway, container-readable dir.
+    #    P2-v3 BLOCKER-c: the sibling probe container is launched by the HOST
+    #    daemon, so the temp dir must live somewhere the host can see. /tmp inside
+    #    the web container is invisible to the host — root the temp dir under the
+    #    mirrored data root instead. On a bare host (_HOST_DATA_ROOT unset) this is
+    #    the normal system temp dir.
     import tempfile
-    with tempfile.TemporaryDirectory(prefix="muteki-acct-test-") as td:
+    _tmp_base = None
+    if _HOST_DATA_ROOT:
+        _tmp_base = os.path.join(os.environ.get("MUTEKI_CONTAINER_DATA_ROOT") or _HOST_DATA_ROOT,
+                                 "_tmp", "account-tests")
+        try:
+            os.makedirs(_tmp_base, exist_ok=True)
+        except OSError:
+            _tmp_base = None
+    with tempfile.TemporaryDirectory(prefix="muteki-acct-test-", dir=_tmp_base) as td:
         workspace = os.path.join(td, "ws")
         projection = os.path.join(td, "accounts")
         os.makedirs(workspace, exist_ok=True)
@@ -156,9 +258,9 @@ def _probe_container(*, engine: str, account_id: str, root: Path) -> dict[str, A
             # passed as args to the supervisor and the probe hangs / errors.
             "--entrypoint", "bash",
             "--mount",
-            f"type=bind,source={os.path.abspath(workspace)},target={CONTAINER_WORKSPACE}",
+            f"type=bind,source={_mount_source(workspace)},target={CONTAINER_WORKSPACE}",
             "--mount",
-            f"type=bind,source={os.path.abspath(projection)},target={CONTAINER_ACCOUNTS_ROOT}",
+            f"type=bind,source={_mount_source(projection)},target={CONTAINER_ACCOUNTS_ROOT}",
             image, "-lc", script,
         ]
         try:

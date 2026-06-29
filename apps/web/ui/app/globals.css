@@ -70,6 +70,12 @@
   --r-input: 7px;
   --r-bubble: 12px;
   --r-pill: 999px;
+
+  /* Shared entrance easing — a soft ease-out-quint. One curve across every deck
+     entrance (mount choreography, run-swap, artifact slide, bubbles, welcome,
+     rows) so elements share a single motion "personality" instead of mixing
+     plain ease-out with bespoke curves. */
+  --ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 :root[data-theme="dark"] {
@@ -290,6 +296,7 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
 .rail-foot .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block;
   background: var(--green); box-shadow: 0 0 6px var(--green); }
 .rail-foot .dot.off { background: var(--red); box-shadow: none; }
+.rail-foot .dot.idle { background: var(--dim); box-shadow: none; }
 .rail-settings-btn { flex: none; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center;
   color: var(--muted); background: transparent; border: 1px solid transparent; border-radius: 7px; padding: 0; }
 .rail-settings-btn:hover { color: var(--accent); border-color: var(--accent);
@@ -359,6 +366,7 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
 .convo-top .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
 .convo-top .dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
 .convo-top .dot.off { background: var(--red); }
+.convo-top .dot.idle { background: var(--dim); }
 .convo-top .lang-btn { background: transparent; border: 1px solid var(--border2); color: var(--dim);
   border-radius: 6px; padding: 3px 9px; font-size: 11px; min-width: 30px; }
 .convo-top .lang-btn:hover { border-color: var(--accent); color: var(--bright); }
@@ -384,9 +392,9 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
 @keyframes welcome-fade { from { opacity: 0; } to { opacity: 1; } }
 @keyframes welcome-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 .welcome-hero { display: flex; flex-direction: column; align-items: center; gap: 14px;
-  animation: welcome-in .4s ease-out both; }
-.welcome .suggest-label { animation: welcome-in .4s ease-out .08s both; }
-.welcome .suggest { animation: welcome-in .4s ease-out .16s both; }
+  animation: welcome-in .4s var(--ease-out-soft) both; }
+.welcome .suggest-label { animation: welcome-in .4s var(--ease-out-soft) .08s both; }
+.welcome .suggest { animation: welcome-in .4s var(--ease-out-soft) .16s both; }
 .welcome .wm { font-size: 34px; font-weight: 800; color: var(--bright); letter-spacing: .02em;
   line-height: 1.1; text-wrap: balance; }
 .welcome .wm em { color: var(--accent); font-style: normal; font-weight: 600; font-size: 19px;
@@ -479,6 +487,9 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
 .websearch-toggle.on { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--border2)); }
 .websearch-toggle.off { color: var(--dim); }
 .websearch-toggle:hover { border-color: var(--accent); }
+/* P2-v3: container mode forced (control plane runs in a container) — toggle locked. */
+.websearch-toggle.locked { cursor: not-allowed; opacity: .7; }
+.websearch-toggle.locked:hover { border-color: var(--border2); }
 .advanced-toggle { display: inline-flex; align-items: center; gap: 4px; cursor: pointer;
   font-size: 11px; padding: 5px 9px; border-radius: 7px; border: 1px solid var(--border2);
   color: var(--dim); background: var(--bg); white-space: nowrap; }
@@ -932,6 +943,24 @@ body.artifact-resizing, body.artifact-resizing * { cursor: col-resize !important
 .ws-section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
 .ws-section-head h3 { margin: 0; color: var(--bright); font-size: 13px; line-height: 1.25; }
 .ws-section-head span { color: var(--dim); font-size: 11.5px; line-height: 1.4; text-align: right; }
+/* P2-v3 worker-image health panel */
+.ws-image { display: flex; align-items: center; gap: 12px; }
+.ws-image-dot { flex: 0 0 auto; width: 10px; height: 10px; border-radius: 50%; background: var(--dim); }
+.ws-image-dot.green { background: #2faf5b; box-shadow: 0 0 0 3px color-mix(in srgb, #2faf5b 22%, transparent); }
+.ws-image-dot.yellow { background: #d6a32a; box-shadow: 0 0 0 3px color-mix(in srgb, #d6a32a 22%, transparent); }
+.ws-image-dot.red { background: #d24b4b; box-shadow: 0 0 0 3px color-mix(in srgb, #d24b4b 22%, transparent); }
+.ws-image-body { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.ws-image-name { font-size: 12px; color: var(--bright); word-break: break-all; }
+.ws-image-checks { display: flex; flex-wrap: wrap; gap: 12px; font-size: 11.5px; }
+.ws-image-checks .ok { color: #2faf5b; }
+.ws-image-checks .bad { color: #d24b4b; }
+.ws-image-checks .muted { color: var(--dim); }
+.ws-image-actions { flex: 0 0 auto; display: flex; gap: 8px; }
+.ws-btn { padding: 5px 11px; border-radius: 6px; border: 1px solid var(--border2); background: var(--bg);
+  color: var(--text); font-size: 12px; cursor: pointer; }
+.ws-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--bright); }
+.ws-btn.primary { border-color: color-mix(in srgb, var(--accent) 45%, var(--border2)); color: var(--accent); }
+.ws-btn:disabled { opacity: .5; cursor: not-allowed; }
 .ws-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
 .ws-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .ws-span-all { grid-column: 1 / -1; }
@@ -946,6 +975,47 @@ body.artifact-resizing, body.artifact-resizing * { cursor: col-resize !important
 .ws-engine { flex: 0 1 auto; min-width: 118px; background: var(--bg); border: 1px solid var(--border2); color: var(--dim); border-radius: 8px;
   padding: 6px 10px; font-size: 13px; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ws-engine.on { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
+
+/* ── worker composer (P1 §10: drag out N same-engine instances) ───────────── */
+.ws-add-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.ws-add-btn { display: inline-flex; align-items: center; gap: 5px; background: var(--bg);
+  border: 1px dashed var(--border2); color: var(--dim); border-radius: 8px; padding: 6px 11px;
+  font-size: 12.5px; cursor: pointer; }
+.ws-add-btn:hover { color: var(--bright); border-color: var(--accent); }
+.ws-add-plus { font-weight: 700; font-size: 14px; line-height: 1; color: var(--accent); }
+.ws-composer { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 7px; }
+.ws-card { display: flex; align-items: center; gap: 9px; background: var(--panel); border: 1px solid var(--border2);
+  border-radius: 9px; padding: 8px 10px; transition: border-color .12s, box-shadow .12s, opacity .12s, transform .06s; }
+.ws-card.dragging { opacity: .45; }
+.ws-card.drop-target { border-color: var(--accent); box-shadow: 0 -2px 0 0 var(--accent) inset; }
+.ws-card.no-race { background: color-mix(in srgb, var(--panel2) 60%, var(--panel)); }
+.ws-card-grip { cursor: grab; color: var(--dim); font-size: 13px; letter-spacing: -2px; user-select: none; line-height: 1; }
+.ws-card-grip:active { cursor: grabbing; }
+.ws-card-prio { min-width: 20px; height: 20px; display: inline-flex; align-items: center; justify-content: center;
+  background: var(--bg); border: 1px solid var(--border2); border-radius: 6px; color: var(--dim);
+  font-size: 11px; font-variant-numeric: tabular-nums; }
+.ws-card-engine { flex: 0 0 auto; min-width: 64px; text-align: center; padding: 3px 8px; border-radius: 6px;
+  font-size: 11.5px; font-weight: 600; background: color-mix(in srgb, var(--accent) 14%, var(--panel));
+  color: var(--bright); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent); }
+.ws-card-engine.eng-codex { background: color-mix(in srgb, #10a37f 16%, var(--panel)); border-color: color-mix(in srgb, #10a37f 34%, transparent); }
+.ws-card-engine.eng-cursor { background: color-mix(in srgb, #7c5cff 16%, var(--panel)); border-color: color-mix(in srgb, #7c5cff 34%, transparent); }
+.ws-card-name { flex: 0 1 150px; min-width: 90px; background: var(--bg); border: 1px solid var(--border2);
+  color: var(--text); border-radius: 6px; padding: 5px 7px; font-size: 12px; font-family: var(--mono); }
+.ws-card-model { flex: 1 1 200px; display: flex; gap: 6px; min-width: 150px; }
+.ws-card-model select { flex: 1 1 auto; min-width: 0; }
+.ws-card-model-custom { flex: 1 1 110px; min-width: 80px; background: var(--bg); border: 1px solid var(--border2);
+  color: var(--text); border-radius: 6px; padding: 5px 7px; font-size: 12px; font-family: var(--mono); }
+.ws-card-race { flex: 0 0 auto; background: var(--bg); border: 1px solid var(--border2); color: var(--dim);
+  border-radius: 6px; padding: 4px 9px; font-size: 11.5px; cursor: pointer; }
+.ws-card-race.on { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
+.ws-card-cap { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 2px; color: var(--dim); font-size: 12px; }
+.ws-card-cap input { width: 42px; background: var(--bg); border: 1px solid var(--border2); color: var(--text);
+  border-radius: 6px; padding: 4px 5px; font-size: 12px; font-variant-numeric: tabular-nums; }
+.ws-card-test { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; }
+.ws-card-del { flex: 0 0 auto; background: transparent; border: 1px solid transparent; color: var(--dim);
+  border-radius: 6px; padding: 3px 4px; cursor: pointer; display: inline-flex; }
+.ws-card-del:hover { color: var(--red); border-color: color-mix(in srgb, var(--red) 40%, transparent); }
+
 .ws-profile-table { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
 .ws-profile-head, .ws-profile-row { display: grid; grid-template-columns: 180px 92px 150px 170px 180px 170px 142px 86px 92px 150px 82px 34px;
   min-width: 1528px; align-items: center; gap: 8px; padding: 8px; }
@@ -969,9 +1039,35 @@ body.artifact-resizing, body.artifact-resizing * { cursor: col-resize !important
 .ws-ov input[type="number"] { flex: 0 0 64px; }
 .ws-ov select { flex: 0 1 118px; }
 .ws-account-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
-.ws-account-row { display: grid; grid-template-columns: minmax(150px, 1fr) 100px minmax(110px, 1fr) 32px; align-items: center; gap: 8px;
-  padding: 7px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--panel); font-size: 12px; color: var(--text); }
+.ws-account-row { display: grid; grid-template-columns: minmax(140px, 1fr) 90px minmax(100px, 1fr) auto 16px 28px; align-items: center; gap: 8px;
+  padding: 7px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--panel); font-size: 12px; color: var(--text);
+  transition: border-color .12s ease, background .12s ease; }
 .ws-account-row span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); }
+/* Clickable rows open the account in the edit form below. */
+.ws-account-row.clickable { cursor: pointer; }
+.ws-account-row.clickable:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 6%, var(--panel)); }
+.ws-account-row.clickable:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.ws-account-row.editing { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--panel)); }
+.ws-account-edit-hint { color: var(--dim); opacity: 0; transition: opacity .12s ease; justify-self: center; }
+.ws-account-row.clickable:hover .ws-account-edit-hint,
+.ws-account-row.editing .ws-account-edit-hint { opacity: 1; color: var(--accent); }
+.ws-account-tag { font-size: 10px; color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border-radius: 999px; padding: 1px 7px; justify-self: start; white-space: nowrap; }
+.ws-label-hint { color: var(--dim); font-weight: 400; font-size: 11px; }
+/* SECRET field with an inline show/hide (eye) toggle. The stored secret is
+   echoed into the field, masked by default; the eye reveals plaintext. */
+.ws-secret-wrap { position: relative; }
+.ws-secret-wrap > input,
+.ws-secret-wrap > textarea { width: 100%; padding-right: 34px; }
+/* Mask a textarea's contents (no type=password for <textarea>). */
+.ws-secret-masked { -webkit-text-security: disc; text-security: disc; }
+.ws-secret-eye { position: absolute; top: 7px; right: 7px; width: 22px; height: 22px;
+  display: flex; align-items: center; justify-content: center; padding: 0;
+  background: none; border: none; cursor: pointer; color: var(--dim); border-radius: 5px; }
+.ws-secret-eye:hover { color: var(--text); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.ws-link-btn { background: none; border: none; color: var(--accent); font-size: 12px; cursor: pointer; padding: 0; }
+.ws-link-btn:hover { text-decoration: underline; }
+.ws2-form.editing { border-color: var(--accent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent); }
 .ws-empty { margin-bottom: 12px; padding: 10px 12px; border: 1px dashed var(--border2); border-radius: 8px;
   color: var(--dim); font-size: 12px; background: var(--panel); }
 .ws-account-form { margin-top: 4px; }
@@ -1044,6 +1140,11 @@ body.artifact-resizing, body.artifact-resizing * { cursor: col-resize !important
 .ws-ok { color: var(--green); display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; }
 .ws-bad { color: var(--red); display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; }
 .ws-muted { color: var(--dim); white-space: nowrap; }
+/* multi-line contextual notes under a form field (DO wrap, unlike .ws-bad) */
+.ws-warn-note { color: var(--red); display: flex; align-items: flex-start; gap: 5px;
+  font-size: 12px; line-height: 1.45; margin: 2px 0 0; white-space: normal; }
+.ws-warn-note > svg { flex: 0 0 auto; margin-top: 2px; }
+.ws-muted-note { color: var(--dim); font-size: 12px; line-height: 1.45; margin: 2px 0 0; white-space: normal; }
 .ws-mini-btn { display: inline-flex; align-items: center; gap: 4px; background: var(--bg); color: var(--text);
   border: 1px solid var(--border2); border-radius: 7px; padding: 5px 10px; font-size: 12px; cursor: pointer; white-space: nowrap; }
 .ws-mini-btn:hover { border-color: var(--accent); color: var(--bright); }
@@ -1063,10 +1164,188 @@ body.artifact-resizing, body.artifact-resizing * { cursor: col-resize !important
   font-size: 12px; color: var(--text); min-width: 0; width: 100%; }
 .ws-profile-mini-row input:focus { border-color: var(--accent); }
 
+/* ── settings redesign v2: left tab rail + right content + health bar ──────────
+   The .ws2 modal keeps the shared .modal-head but replaces the linear .ws-scroll
+   with a config-health bar, a left rail of intent tabs, and a per-tab content
+   pane. Reuses the existing .ws-* atoms (.ws-section-head/.ws-grid/.ws-field/
+   .ws-card-engine/.ws-image/.ws-sc-*) so only the new structure needs styling. */
+/* fixed footprint — the modal does NOT resize per tab; only .ws2-content
+   scrolls. Height is a clamped viewport value so it's stable across tabs but
+   still fits small screens. */
+.worker-settings.ws2 { display: flex; flex-direction: column; height: min(86vh, 760px); max-height: min(86vh, 760px); }
+.worker-settings.ws2 .modal-head { flex: 0 0 auto; }
+.worker-settings.ws2 .ws2-health { flex: 0 0 auto; }
+.worker-settings.ws2 .ws2-savebar { flex: 0 0 auto; }
+/* shared inline deep-link used across cards / health segments / capacity notes */
+.ws-jump { display: inline; background: none; border: 0; padding: 0 0 0 6px; margin: 0;
+  font: inherit; color: var(--accent); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; white-space: nowrap; }
+.ws-jump:hover { color: var(--bright); }
+
+/* health bar */
+.ws2-health { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 18px;
+  border-bottom: 1px solid var(--border); background: var(--panel2); }
+.ws2-health-sep { color: var(--border2); }
+.ws2-draft { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; letter-spacing: .04em;
+  text-transform: uppercase; padding: 2px 8px; border-radius: 999px; font-weight: 600; }
+.ws2-draft.dirty { color: var(--amber); background: color-mix(in srgb, var(--amber) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--amber) 40%, transparent); }
+.ws2-draft.clean { color: var(--green); background: color-mix(in srgb, var(--green) 13%, transparent);
+  border: 1px solid color-mix(in srgb, var(--green) 38%, transparent); }
+.ws2-seg { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 7px;
+  border: 1px solid transparent; background: none; color: var(--text); font: inherit; font-size: 11.5px; cursor: pointer; white-space: nowrap;
+  transition: border-color .14s ease, background-color .14s ease, transform .08s ease; }
+.ws2-seg:hover { border-color: var(--border2); background: var(--panel); }
+.ws2-seg:active { transform: scale(.96); }
+.ws-dot, .ws2-tdot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; background: var(--dim); }
+.ws-dot.ok, .ws2-tdot.ok { background: var(--green); }
+.ws-dot.amber, .ws2-tdot.amber { background: var(--amber); }
+.ws-dot.red, .ws2-tdot.red { background: var(--red); }
+
+/* body split */
+.ws2-body { display: flex; flex: 1 1 auto; min-height: 0; }
+.ws2-rail { flex: 0 0 172px; border-right: 1px solid var(--border); background: var(--rail);
+  padding: 10px 8px; display: flex; flex-direction: column; gap: 2px; }
+.ws2-tab { display: flex; align-items: center; gap: 9px; padding: 9px 11px; min-height: 40px; border-radius: 9px; cursor: pointer;
+  border: 1px solid transparent; background: none; color: var(--dim); font: inherit; font-size: 13px; text-align: left;
+  transition: background-color .14s ease, color .14s ease, border-color .14s ease, transform .08s ease; }
+.ws2-tab:hover { background: color-mix(in srgb, var(--panel) 60%, transparent); color: var(--text); }
+.ws2-tab:active { transform: scale(.97); }
+.ws2-tab.on { background: var(--panel); color: var(--bright); border-color: var(--border2); font-weight: 600; box-shadow: var(--shadow-sm); }
+.ws2-tab > span:not(.ws2-tdot) { flex: 1 1 auto; }
+.ws2-tab > .ws2-tdot { flex: 0 0 auto; display: inline-block; }
+.ws2-content { flex: 1 1 auto; min-width: 0; overflow-y: auto; padding: 16px 20px 20px;
+  -webkit-font-smoothing: antialiased; scrollbar-gutter: stable; }
+/* gentle cross-tab fade — content settles in without the rail jumping */
+.ws2-content > section { animation: ws2-fade .18s cubic-bezier(0.2,0,0,1); }
+@keyframes ws2-fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+.ws2-content .ws-section-head h3 { text-wrap: balance; }
+.ws2-sub { font-size: 11.5px; color: var(--dim); margin: 0 0 14px; line-height: 1.55; display: flex; align-items: baseline; gap: 5px; flex-wrap: wrap; text-wrap: pretty; }
+.ws2-env { font-family: var(--mono); font-size: 11px; color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--border2)); border-radius: 5px; padding: 1px 6px; }
+
+/* roster cards */
+.ws2-roster { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 9px; }
+.ws2-card { background: var(--panel); border: 1px solid var(--border2); border-radius: 10px; overflow: hidden; }
+.ws2-card.dragging { opacity: .45; }
+.ws2-card.drop-target { border-color: var(--accent); box-shadow: 0 -2px 0 0 var(--accent) inset; }
+.ws2-card.disabled { background: var(--panel2); }
+.ws2-card.blocked { border-color: color-mix(in srgb, var(--red) 55%, var(--border2)); }
+.ws2-card-row { display: flex; align-items: center; gap: 9px; padding: 10px 11px; }
+.ws2-card .ws-card-grip { cursor: grab; color: var(--dim); letter-spacing: -2px; font-size: 13px; user-select: none; }
+.ws2-card .ws-card-name { flex: 0 1 130px; min-width: 90px; background: var(--bg); border: 1px solid var(--border2);
+  border-radius: 7px; padding: 5px 8px; font: inherit; font-size: 12px; color: var(--text); }
+.ws2-card .ws-card-model { flex: 1 1 180px; display: flex; gap: 6px; min-width: 150px; }
+.ws2-card .ws-card-model select { flex: 1 1 auto; min-width: 0; background: var(--bg); border: 1px solid var(--border2);
+  border-radius: 7px; padding: 5px 8px; font: inherit; font-size: 12px; color: var(--text); }
+.ws2-card .ws-card-model-custom { flex: 1 1 100px; min-width: 80px; background: var(--bg); border: 1px solid var(--border2);
+  border-radius: 7px; padding: 5px 8px; font: inherit; font-size: 12px; color: var(--text); }
+.ws2-card input:focus, .ws2-card select:focus { outline: none; border-color: var(--accent); }
+.ws2-ready { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; white-space: nowrap; flex: 0 0 auto; }
+.ws2-ready.g { color: var(--green); }
+.ws2-ready.r { color: var(--red); }
+.ws2-ready.a { color: var(--dim); }
+
+/* enabled / race toggle */
+.ws2-toggle { flex: 0 0 auto; width: 34px; height: 19px; border-radius: 999px; background: var(--border2);
+  border: 0; position: relative; cursor: pointer; padding: 0;
+  transition: background-color .16s cubic-bezier(0.2,0,0,1), transform .08s ease; }
+.ws2-toggle:active { transform: scale(.94); }
+.ws2-toggle.on { background: var(--accent); }
+.ws2-toggle.sm { width: 30px; height: 17px; }
+.ws2-knob { position: absolute; top: 2px; left: 2px; width: 15px; height: 15px; border-radius: 50%;
+  background: #fff; box-shadow: 0 1px 2px rgba(20,30,50,.25); transition: left .16s cubic-bezier(0.2,0,0,1); }
+.ws2-toggle.sm .ws2-knob { width: 13px; height: 13px; }
+.ws2-toggle.on .ws2-knob { left: 17px; }
+.ws2-toggle.sm.on .ws2-knob { left: 15px; }
+/* visible caret is small (14px) but the hit area is padded out to 40×40 so the
+   expand affordance is comfortable to click. */
+.ws2-caret { flex: 0 0 auto; background: none; border: 0; color: var(--dim); cursor: pointer;
+  width: 34px; height: 34px; margin: -8px -6px -8px 0; display: inline-flex; align-items: center; justify-content: center;
+  transition: transform .16s cubic-bezier(0.2,0,0,1), color .14s ease; }
+.ws2-caret:hover { color: var(--text); }
+.ws2-caret.open { transform: rotate(90deg); }
+
+/* per-card blocker bar + expanded drawer */
+.ws2-blocker { display: flex; align-items: center; gap: 7px; padding: 7px 11px; font-size: 11px; color: var(--red);
+  background: color-mix(in srgb, var(--red) 9%, var(--panel)); border-top: 1px solid color-mix(in srgb, var(--red) 30%, transparent); }
+.ws2-expand { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; padding: 11px;
+  border-top: 1px dashed var(--border); background: var(--panel2); }
+.ws2-xf { display: flex; flex-direction: column; gap: 5px; }
+.ws2-xf > span { font-size: 10px; letter-spacing: var(--ls-label); text-transform: uppercase; color: var(--dim); }
+.ws2-xf input { width: 70px; background: var(--bg); border: 1px solid var(--border2); border-radius: 7px;
+  padding: 5px 8px; font: inherit; font-size: 12px; color: var(--text); font-variant-numeric: tabular-nums;
+  transition: border-color .14s ease; }
+.ws2-xf input:focus { outline: none; border-color: var(--accent); }
+.ws2-xf input[readonly] { color: var(--dim); background: var(--panel2); cursor: default; }
+.ws2-xf-actions { display: flex; gap: 8px; align-items: center; margin-left: auto; }
+.ws-mini-btn.danger { border-color: color-mix(in srgb, var(--red) 40%, var(--border2)); color: var(--red); }
+.ws-mini-btn.danger:hover { border-color: var(--red); color: var(--red); }
+
+/* empty-state onboarding */
+.ws2-empty { border: 1px dashed var(--border2); border-radius: 10px; padding: 16px 18px; margin-bottom: 14px; background: var(--panel2); }
+.ws2-empty h4 { margin: 0 0 10px; font-size: 13px; color: var(--bright); }
+.ws2-steps { list-style: none; margin: 0; padding: 0; }
+.ws2-steps li { display: flex; gap: 11px; align-items: flex-start; padding: 9px 0; font-size: 12px; color: var(--text);
+  border-bottom: 1px dashed var(--border); }
+.ws2-steps li:last-child { border-bottom: 0; }
+.ws2-stepn { flex: 0 0 22px; height: 22px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 600; border: 1px solid var(--border2); color: var(--dim); }
+.ws2-stepn.done { background: var(--green); color: #fff; border-color: var(--green); }
+.ws2-stepn.now { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* accounts tab */
+.ws2-acct-list { display: flex; flex-direction: column; gap: 9px; margin-bottom: 14px; }
+.ws2-acct { display: flex; align-items: center; gap: 10px; padding: 10px 11px; border: 1px solid var(--border2);
+  border-radius: 10px; background: var(--panel); font-size: 12px; }
+.ws2-acct.miss { border-color: color-mix(in srgb, var(--red) 55%, var(--border2)); background: color-mix(in srgb, var(--red) 6%, var(--panel)); }
+.ws2-acct.opt { opacity: .8; }
+.ws2-acct-id { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); }
+.ws2-acct.miss .ws2-acct-id { color: var(--red); }
+.ws2-acct-id em { font-style: normal; color: var(--dim); }
+.ws2-acct-state { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+.ws-save.sm { padding: 5px 11px; font-size: 12px; border-radius: 7px; display: inline-flex; align-items: center; gap: 5px; }
+.ws2-form { margin-top: 16px; border: 1px solid var(--border2); border-radius: 10px; padding: 12px; background: var(--panel); }
+
+/* budget tab */
+.ws2-capnote { display: flex; align-items: flex-start; gap: 7px; }
+/* read-only derived field (max workers = Σ seat concurrency) */
+.ws-field input.ws2-derived { background: var(--panel); color: var(--dim); cursor: not-allowed; opacity: .85; }
+.ws-field-hint { font-size: var(--fs-caption); color: var(--dim); line-height: 1.3; }
+.ws2-review { margin-top: 14px; border: 1px solid var(--border2); border-radius: 10px; padding: 12px; background: var(--panel); }
+.ws2-review-head { display: flex; align-items: center; gap: 10px; }
+.ws2-review-head b { color: var(--bright); font-size: 12.5px; }
+.ws2-review-sub { margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border); margin-bottom: 0; }
+.ws2-pill { font-size: 10px; padding: 2px 8px; border-radius: 999px; letter-spacing: .04em;
+  color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+
+/* dynamically-updating numbers don't shift the layout */
+.ws2-content input[type="number"] { font-variant-numeric: tabular-nums; }
+/* tactile press feedback on every action button inside the panel */
+.worker-settings.ws2 .ws-save,
+.worker-settings.ws2 .ws-btn,
+.worker-settings.ws2 .ws-mini-btn,
+.worker-settings.ws2 .ws-add-btn,
+.worker-settings.ws2 .modal-x { transition: border-color .14s ease, background-color .14s ease, color .14s ease, transform .08s ease; }
+.worker-settings.ws2 .ws-save:active:not(:disabled),
+.worker-settings.ws2 .ws-btn:active:not(:disabled),
+.worker-settings.ws2 .ws-mini-btn:active:not(:disabled),
+.worker-settings.ws2 .ws-add-btn:active,
+.worker-settings.ws2 .modal-x:active { transform: scale(.96); }
+
+/* footer save bar */
+.ws2-savebar { justify-content: space-between; }
+.ws2-foot-note { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--dim); }
+.ws2-foot-actions { display: inline-flex; gap: 8px; align-items: center; }
+.ws2-foot-actions .ws-save { display: inline-flex; align-items: center; gap: 5px; }
+
 @media (max-width: 760px) {
   .worker-settings { width: calc(100vw - 20px); max-height: calc(100vh - 20px); }
   .worker-settings .modal-head, .ws-summary, .ws-scroll, .ws-savebar { padding-left: 12px; padding-right: 12px; }
   .ws-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ws2-health { padding-left: 12px; padding-right: 12px; }
+  .ws2-body { flex-direction: column; }
+  .ws2-rail { flex: 0 0 auto; flex-direction: row; flex-wrap: wrap; border-right: 0; border-bottom: 1px solid var(--border); }
+  .ws2-tab { flex: 1 1 auto; justify-content: center; }
   .ws-section-head { align-items: flex-start; flex-direction: column; gap: 4px; }
   .ws-section-head span { text-align: left; }
   .ws-add-profile { grid-template-columns: 1fr; }
@@ -2587,9 +2866,17 @@ body.inspector-resizing, body.inspector-resizing * { cursor: col-resize !importa
 .activity-feed .act-msg { animation: row-enter .18s ease-out both; }
 .wlane { animation: row-enter .18s ease-out both; }
 
-/* Anime.js v4 orchestration hooks. These classes are intentionally semantic
-   markers for lib/useDeckMotion.ts; CSS only supplies stable transform origins
-   and small hover cues, leaving the timeline/cleanup to Anime.js. */
+/* Deck entrance motion. These were once anime.js-driven from lib/useDeckMotion.ts,
+   but driving an opacity:[0,1] entrance with JS on a React-owned element is fragile
+   — a re-render/remount orphans the in-flight instance and freezes the element at
+   opacity:0 (hit on bubbles AND the inspector). So every ENTRANCE is now a keyed
+   CSS keyframe: it runs once on mount, has no JS instance to orphan, and never
+   replays on re-render. The hook keeps only the event-driven flag pulse.
+
+   Shared rule for all of these: the keyframe `to` carries NO transform. Holding a
+   transform via fill-mode would shadow the `:hover` lifts below (an inline/animated
+   transform outranks a class rule). We put the offset only in `from`; the browser
+   interpolates back to identity, then hands transform fully back to CSS. */
 .motion-shell-piece,
 .motion-run-enter,
 .motion-rail-item,
@@ -2600,6 +2887,50 @@ body.inspector-resizing, body.inspector-resizing * { cursor: col-resize !importa
   backface-visibility: hidden;
 }
 .motion-feedback { transform-origin: left center; }
+
+@keyframes motion-rise {
+  from { opacity: 0; transform: translateY(10px); }
+  70%  { opacity: 1; }
+  to   { opacity: 1; }
+}
+@keyframes motion-rise-sm {
+  from { opacity: 0; transform: translateY(6px); }
+  70%  { opacity: 1; }
+  to   { opacity: 1; }
+}
+@keyframes motion-slide-in {
+  from { opacity: 0; transform: translateX(14px); }
+  70%  { opacity: 1; }
+  to   { opacity: 1; }
+}
+@keyframes motion-slide-in-sm {
+  from { opacity: 0; transform: translateX(8px); }
+  70%  { opacity: 1; }
+  to   { opacity: 1; }
+}
+
+/* Mount choreography — durable shell furniture. Rail rows and shell pieces stagger
+   via nth-child so the deck assembles top-to-bottom instead of all at once. */
+.motion-shell-piece { animation: motion-rise .42s var(--ease-out-soft) both; }
+.motion-panel-btn   { animation: motion-rise-sm .28s var(--ease-out-soft) both; }
+.motion-rail-item   { animation: motion-rise-sm .32s var(--ease-out-soft) both; }
+.motion-rail-item:nth-child(1) { animation-delay: 0ms; }
+.motion-rail-item:nth-child(2) { animation-delay: 22ms; }
+.motion-rail-item:nth-child(3) { animation-delay: 44ms; }
+.motion-rail-item:nth-child(4) { animation-delay: 66ms; }
+.motion-rail-item:nth-child(5) { animation-delay: 88ms; }
+.motion-rail-item:nth-child(n+6) { animation-delay: 110ms; }
+
+/* Run-swap: the conversation column fades up once when a run's content mounts.
+   Keyed to the React node, so streaming text updates never replay it. */
+.motion-run-enter { animation: motion-rise .36s var(--ease-out-soft) both; }
+
+/* Artifact panel opens (slide from the right); the run-inspector slides a touch
+   when it (re)mounts as the panel closes. Both mount conditionally, so the mount
+   animation is exactly the open/close transition. */
+.artifact.motion-artifact   { animation: motion-slide-in .26s var(--ease-out-soft) both; }
+.run-inspector.motion-inspector { animation: motion-slide-in-sm .26s var(--ease-out-soft) both; }
+
 .motion-panel-btn:hover:not(:disabled):not(:active) { transform: translateY(-1px); }
 .thread-item.motion-rail-item:hover:not(:active) { transform: translateX(1px); }
 .coord-bubble {
@@ -2609,6 +2940,24 @@ body.inspector-resizing, body.inspector-resizing * { cursor: col-resize !importa
   transform: translateY(-1px);
   box-shadow: var(--shadow-sm);
 }
+/* Bubble entrance — CSS-only so it fires exactly once on mount (React keeps the
+   keyed node) and never replays when streaming text mutates the bubble. This
+   replaced an anime.js effect that re-fired on every chatLength change and
+   froze bubbles at opacity:0 when its instances were orphaned mid-replay.
+   The keyframe's `to` carries NO transform: holding a transform via fill-mode
+   would shadow the `:hover` lift above. We let the animation snap opacity to 1
+   and ride the translate back to 0, then hand transform back to CSS entirely. */
+@keyframes bubble-enter {
+  from { opacity: 0; transform: translateY(8px); }
+  60%  { opacity: 1; }
+  to   { opacity: 1; }
+}
+.coord-bubble { animation: bubble-enter .26s var(--ease-out-soft) both; }
+/* Persistent summary bubbles (digest / answer) re-render on every metric tick;
+   they are not append-only messages, so an entrance would replay. They carry no
+   data-mid — exclude them so only real message bubbles animate in. */
+.coord-bubble.digest,
+.coord-bubble.answer { animation: none; }
 .artifact.motion-artifact,
 .run-inspector.motion-inspector {
   transition: border-color .16s ease, box-shadow .16s ease;
@@ -2629,6 +2978,8 @@ body.inspector-resizing, body.inspector-resizing * { cursor: col-resize !importa
   .motion-panel-btn,
   .motion-feedback,
   .motion-artifact,
+  .motion-inspector,
+  .coord-bubble,
   .welcome,
   .welcome-hero,
   .welcome .suggest-label,
