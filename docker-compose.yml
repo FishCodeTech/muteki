@@ -52,7 +52,7 @@ services:
       MUTEKI_SESSIONS_ROOT: "${MUTEKI_HOST_DATA_ROOT}/sessions"
       MUTEKI_WEB_BIND: "0.0.0.0"
       MUTEKI_WEB_PASSWORD: "${MUTEKI_WEB_PASSWORD:?set MUTEKI_WEB_PASSWORD — non-loopback bind requires it}"
-      MUTEKI_WORKER_IMAGE: "${MUTEKI_WORKER_IMAGE:-snowywar/muteki-worker:latest}"
+      MUTEKI_WORKER_IMAGE: "${MUTEKI_WORKER_IMAGE:-ghcr.io/fishcodetech/muteki-worker:latest}"
       MUTEKI_WORKER_IMAGE_VERSION: "${MUTEKI_WORKER_IMAGE_VERSION:-}"
       # The coordinator brain (planner) + auto-titler use LLMClient, which reads
       # the key from the process env. .env is .dockerignore'd (secrets must NOT be

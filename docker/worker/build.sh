@@ -5,7 +5,7 @@
 #   2) docker build the amd64 image, tagging both the version and :latest.
 #
 # Usage: ./docker/worker/build.sh [repo] [version]
-#   repo:    image repository (default: muteki-worker; e.g. snowywar/muteki-worker)
+#   repo:    image repository (default: muteki-worker; e.g. ghcr.io/fishcodetech/muteki-worker)
 #   version: version tag       (default: 0.2.1)
 # Tags built: <repo>:<version> AND <repo>:latest (code defaults to :latest).
 set -euo pipefail

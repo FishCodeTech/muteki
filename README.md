@@ -117,7 +117,7 @@ To keep Muteki from falling into a dead-loop while working a single task, we set
 # 1. Bootstrap: install deps + run the quick test suite
 ./init.sh
 
-# 2a. Web command deck — FastAPI backend (:8000) + Next UI (:3001)
+# 2a. Web command deck — FastAPI backend (:8000) + production Next UI (:3001)
 ./run.sh web
 #     Backend only:  ./run.sh web --backend-only
 ```
@@ -140,7 +140,7 @@ If you don't set it, the main impact is that the Reason planner won't autonomous
 
 - **[uv](https://docs.astral.sh/uv/)** — Python toolchain and runner
 - **Python ≥ 3.13** (declared in `pyproject.toml`; managed by `uv`)
-- **Node.js** — only needed for the web UI (`apps/web/ui`, Next.js)
+- **Node.js** — only needed for the local web UI (`apps/web/ui`, Next.js)
 - **Go ≥ 1.26** — only needed when building the in-container supervisor inside the worker image
 - **Docker** — only needed for the `container` worker backend / building the worker image
 - The **engine CLIs** you intend to use, available on your `PATH` (see below)
@@ -196,51 +196,68 @@ The DeepSeek reasoning model (used by the coordinator, not a worker engine) is c
 
 For the credential trust model, see [SECURITY.md](SECURITY.md).
 
-### Worker image (container backend)
+### Worker images (container backend)
 
-To meet environment-isolation and containerization needs, I also provide a container mode. That said, this container mode hasn't been tested enough and isn't guaranteed to always work.
+The `container` backend runs workers in sibling Docker containers launched by the web API. The default worker is **one general-purpose Kali image** (not per-template variants) with the CTF toolchain, offline knowledge, engine CLIs, and the supervisor. **No credentials are baked into any image** — accounts and keys are injected at runtime.
 
-The `container` backend runs workers inside **a single general-purpose Kali image** (no more per-template/recipe variants), containing the full CTF toolchain + an offline knowledge base + the engine CLIs + the supervisor. **No credentials are baked into the image** — they are injected at runtime.
+Official release images are published to GHCR:
 
-**Pull the prebuilt image (recommended):**
+| Image | Use |
+| --- | --- |
+| `ghcr.io/fishcodetech/muteki-worker:latest` | Full Kali worker image for real CTF runs. Large, but contains the expected exploit/reversing toolkit. |
+| `ghcr.io/fishcodetech/muteki-worker-slim:latest` | Lightweight worker for wiring tests and constrained deployments. It has the supervisor and engine CLIs, but not the full Kali toolkit. |
+| `ghcr.io/fishcodetech/muteki-web:latest` | FastAPI control plane image produced by the release pipeline. |
+| `ghcr.io/fishcodetech/muteki-ui:latest` | Next command deck image produced by the release pipeline. |
 
-```bash
-docker pull snowywar/muteki-worker:latest        # or pin a version: :0.2.3
-```
-
-The code defaults to `snowywar/muteki-worker:latest` (the published image);
-
-use the `MUTEKI_WORKER_IMAGE` environment variable to override it with a different name/tag (e.g. `MUTEKI_WORKER_IMAGE=snowywar/muteki-worker:0.2.3`).
-
-**Or build from source:**
+For a normal compose deployment, pull the worker image on the host Docker daemon:
 
 ```bash
-./docker/worker/build.sh                          # → muteki-worker:0.2.3 + muteki-worker:latest
-./docker/worker/build.sh snowywar/muteki-worker 0.2.0   # custom repo + version (for push)
+docker pull ghcr.io/fishcodetech/muteki-worker:latest
 ```
 
-The image is large (~19.7 GB: Kali headless + Ghidra + SageMath installed via conda + the offline knowledge base).
+The app defaults to `ghcr.io/fishcodetech/muteki-worker:latest`. Override it with `MUTEKI_WORKER_IMAGE`, for example:
+
+```bash
+MUTEKI_WORKER_IMAGE=ghcr.io/fishcodetech/muteki-worker-slim:latest ./run.sh web
+```
+
+**Or build a worker image locally:**
+
+```bash
+./docker/worker/build.sh
+./docker/worker/build.sh ghcr.io/fishcodetech/muteki-worker 0.2.0
+./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim 0.2.0 amd64
+```
+
+The full image is intentionally large (Kali headless + Ghidra + SageMath via conda + offline knowledge). Use the slim image only when you understand that workers may need to install more tooling during a run.
 
 ---
 
 ## Deployment
 
-There are two ways to run the command deck.
+There are two supported ways to run the command deck.
 
 ### A) Local (recommended for a single operator)
 
-Launch it on your own machine — log in, install the relevant workers, start it whenever you like. The web process runs on the host; workers run either as host CLIs (`local` backend) or as sibling containers (`container` backend).
+Launch it on your own machine — log in, install the relevant worker CLIs, start it whenever you like. The web process runs on the host; workers run either as host CLIs (`local` backend) or as sibling containers (`container` backend).
 
 ```bash
 ./run.sh web
 # visit localhost:3001
 ```
 
+`./run.sh web` runs the Next UI as a production build/server, not the Next dev server. The first run builds `apps/web/ui/.next`; use `./run.sh web --rebuild-ui` after changing UI code or changing the baked backend URL. Useful flags:
+
+```bash
+./run.sh web --host 0.0.0.0 --ui-port 3001
+./run.sh web --backend-only
+```
+
 By default this binds to loopback, so a password is optional. If you expose the backend on a non-loopback host (`./run.sh web --host 0.0.0.0`), you **must** set `MUTEKI_WEB_PASSWORD` first — the server refuses to start otherwise, so the `/api` surface (including subscription tokens) is never exposed unauthenticated. See the P3 auth block in [`.env.example`](.env.example).
 
 ### B) Docker Compose (the whole control plane, containerized)
 
-`docker-compose.yml` brings up the **entire platform in containers** — FastAPI coordinator + Next UI — with one command. This is the path for **running on Linux or Windows without depending on the host OS**: instead of making the bare host portable (POSIX signals, `C:\` path translation, console-codepage encoding all differ), the control plane runs inside Linux containers and the host OS stops mattering.
+`docker-compose.yml` brings up the **control plane in containers** — FastAPI coordinator + Next UI — with one command. Workers are still launched as sibling containers by the host Docker daemon. This is the path for **running on Linux or Windows without depending on the host OS**: instead of making the bare host portable (POSIX signals, `C:\` path translation, console-codepage encoding all differ), the control plane runs inside Linux containers and the host OS stops mattering.
 
 Topology:
 
@@ -249,8 +266,9 @@ Topology:
 - **workers** are *not* a compose service — `web-api` `docker run`s one per run.
 
 ```bash
-# 1. Have the worker image available on the host daemon (compose does NOT build it):
-docker pull snowywar/muteki-worker:latest        # or build: ./docker/worker/build.sh
+# 1. Have the worker image available on the host daemon.
+#    Compose builds web-api/ui from this checkout, but it does NOT build workers.
+docker pull ghcr.io/fishcodetech/muteki-worker:latest
 
 # 2. Bring up the control plane. Two vars are REQUIRED:
 #    - MUTEKI_HOST_DATA_ROOT: an absolute HOST path, bind-mounted at the SAME path
@@ -262,6 +280,8 @@ MUTEKI_WEB_PASSWORD='choose-a-strong-one' \
 
 # 3. visit http://localhost:3001  (UI port overridable via MUTEKI_UI_PORT)
 ```
+
+Use `MUTEKI_WORKER_IMAGE=ghcr.io/fishcodetech/muteki-worker-slim:latest` only for smoke tests or deployments where workers can install missing tools themselves. For real CTF runs, prefer the full worker image.
 
 In container mode the platform enforces **strong consistency**: when the web process detects it is running inside a container, it *requires* the container worker backend and **refuses to fall back to a host-native CLI** — a missing image / unreachable socket / wrong network fails the run loudly instead of silently launching the wrong thing. The `local` toggle is hidden/locked in the UI.
 
