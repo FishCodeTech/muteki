@@ -54,7 +54,7 @@ At RIFFHACK 2026, fully automated for 3 hours with zero human takeover, it speed
 
 ![image-20260624162932292](./assets/image-20260624162932292.png)
 
-On the Qianxin Yunjing penetration-testing range "blackmaze" — zero solves for three months — Muteki speed-ran the first blood in 2 hours. (Why does the platform show 39 hours? Because during that time I was dealing with all sorts of debugging, testing, and multi-flag mode support, which wasted a lot of time; the actual solving took only 2 hours.)
+On the iChunQiu Yunjing penetration-testing range "blackmaze" — zero solves for three months — Muteki speed-ran the first blood in 2 hours. (Why does the platform show 39 hours? Because during that time I was dealing with all sorts of debugging, testing, and multi-flag mode support, which wasted a lot of time; the actual solving took only 2 hours.)
 
 ![ee318ffa895e4b2ffd6df67da6c15f90](./assets/ee318ffa895e4b2ffd6df67da6c15f90.png)
 
@@ -225,16 +225,49 @@ The image is large (~19.7 GB: Kali headless + Ghidra + SageMath installed via co
 
 ## Deployment
 
-Since authentication logic isn't implemented yet, deploying on a public VPS server is not recommended for now. Working on it, working on it.
+There are two ways to run the command deck.
 
-The recommended best practice is to launch it locally — log in and install the relevant workers, and start it whenever you like.
+### A) Local (recommended for a single operator)
+
+Launch it on your own machine — log in, install the relevant workers, start it whenever you like. The web process runs on the host; workers run either as host CLIs (`local` backend) or as sibling containers (`container` backend).
 
 ```bash
 ./run.sh web
 # visit localhost:3001
 ```
 
-You can also start it in container mode, but this part hasn't been thoroughly validated and may have hidden pitfalls — players are welcome to test it together.
+By default this binds to loopback, so a password is optional. If you expose the backend on a non-loopback host (`./run.sh web --host 0.0.0.0`), you **must** set `MUTEKI_WEB_PASSWORD` first — the server refuses to start otherwise, so the `/api` surface (including subscription tokens) is never exposed unauthenticated. See the P3 auth block in [`.env.example`](.env.example).
+
+### B) Docker Compose (the whole control plane, containerized)
+
+`docker-compose.yml` brings up the **entire platform in containers** — FastAPI coordinator + Next UI — with one command. This is the path for **running on Linux or Windows without depending on the host OS**: instead of making the bare host portable (POSIX signals, `C:\` path translation, console-codepage encoding all differ), the control plane runs inside Linux containers and the host OS stops mattering.
+
+Topology:
+
+- **`web-api`** — FastAPI coordinator. Mounts the host docker socket and launches **worker containers as siblings on the host daemon** (not dind). The in-container supervisor dials back to `web-api:9100` over `muteki_net`.
+- **`ui`** — Next command deck; proxies `/api` → `web-api`.
+- **workers** are *not* a compose service — `web-api` `docker run`s one per run.
+
+```bash
+# 1. Have the worker image available on the host daemon (compose does NOT build it):
+docker pull snowywar/muteki-worker:latest        # or build: ./docker/worker/build.sh
+
+# 2. Bring up the control plane. Two vars are REQUIRED:
+#    - MUTEKI_HOST_DATA_ROOT: an absolute HOST path, bind-mounted at the SAME path
+#      into web-api so worker mounts (resolved by the host daemon) hit real host paths.
+#    - MUTEKI_WEB_PASSWORD: compose binds the deck to 0.0.0.0, so a password is mandatory.
+MUTEKI_HOST_DATA_ROOT=/opt/muteki/data \
+MUTEKI_WEB_PASSWORD='choose-a-strong-one' \
+  docker compose up --build
+
+# 3. visit http://localhost:3001  (UI port overridable via MUTEKI_UI_PORT)
+```
+
+In container mode the platform enforces **strong consistency**: when the web process detects it is running inside a container, it *requires* the container worker backend and **refuses to fall back to a host-native CLI** — a missing image / unreachable socket / wrong network fails the run loudly instead of silently launching the wrong thing. The `local` toggle is hidden/locked in the UI.
+
+The full env contract (and which vars compose sets for you automatically — don't set those by hand) is documented in [`.env.example`](.env.example).
+
+> ⚠️ **Cross-platform status.** The compose path is exercised on macOS + Docker Desktop (mounts, networking, `host.docker.internal`). **Windows + Docker Desktop has not been validated on real hardware** — `C:\` drive-letter mount syntax and UTF-8 console output can only be confirmed on an actual Windows box. Linux hosts follow the macOS path. Treat Windows compose as untested until someone runs it end-to-end. Container mode in general is still less battle-tested than local mode.
 
 ---
 
@@ -310,7 +343,6 @@ with per-challenge details in [eval_nyu/_reports/RESULTS.md](eval_nyu/_reports/R
 | `apps/tui/`          | Textual TUI command deck (unfinished)                                             |
 | `cmd/runtime-agent/` | In-container Go supervisor (reverse-connects to the control plane)                 |
 | `docker/worker/`     | Worker image (Dockerfile, build scripts, tool-awareness map)                      |
-| `muteki_kit/`        | Small SDK helpers (e.g. flag submission)                                          |
 | `scripts/`           | eval / backtest harness                                                            |
 | `docs/`              | eval reports + open-source-readiness review; design docs in `docs/internal-design/` |
 
@@ -391,8 +423,7 @@ Thanks to master [陈橘墨](https://github.com/Randark-JMT) for the range resou
 
 ~~Thanks to Sam Altman for not banning my account.~~ Now banned, I will always remember his name.
 
-Thanks to Dario Amodei for not banning my account.
-
+~~Thanks to Dario Amodei for not banning my account.~~ Now banned, I will always remember his name.
 ---
 
 ## License

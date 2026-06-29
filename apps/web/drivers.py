@@ -16,25 +16,43 @@ import copy
 import re
 import os
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from apps.web.run_manager import Run, RunManager
-from apps.web.worker_config import DEFAULT_WORKER_BACKEND
-from muteki.solver.credential_accounts import (
-    CredentialAccountStore,
-    account_store_root,
-    detect_system_login,
-    runtime_env_for_engine,
+from apps.web.worker_config import (
+    DEFAULT_WORKER_BACKEND,
+    backend_for_profile,
+    resolve_worker_backend,
 )
-from muteki.solver.cli_driver import driver_for
+from muteki.solver.credential_accounts import account_store_root
+from muteki.core.runtime_env import is_web_container
 from muteki.solver.worker_profiles import (
     base_engine_for_profile,
     normalize_profile_roster,
     profile_uses_endpoint,
 )
 
+if TYPE_CHECKING:
+    from muteki.solver.profile_health import ProfileHealth
+
 Driver = Callable[[Run], Awaitable[None]]
 
+
+
+def _format_missing(p: dict, h: "ProfileHealth") -> str:
+    """Reconstruct the historical `missing` string from a kernel verdict so any
+    log/operator reading it sees the same tokens as before the unification:
+      - binding failure → `<id>:<account_id or '<missing>'>`
+      - endpoint-profile probe failure → `<name>:endpoint:<detail>`
+      - other probe failure → `<name>:probe:<detail>`
+    The string is display-only (never parsed), but its readability is the point.
+    """
+    if h.layer == "binding":
+        account_id = str(p.get("credential_account") or "")
+        return f"{p.get('id') or p.get('engine')}:{account_id or '<missing>'}"
+    probe = "endpoint" if profile_uses_endpoint(p) else "probe"
+    name = p.get("name") or p.get("id") or p.get("engine")
+    return f"{name}:{probe}:{h.detail or 'unhealthy'}"
 
 
 def _missing_profile_accounts(
@@ -43,73 +61,38 @@ def _missing_profile_accounts(
     runtime_profiles: list[dict],
     sessions_root: Path,
 ) -> list[str]:
+    """Dispatch precheck — now a thin wrapper over the profile_health kernel so it
+    can never disagree with the settings self-check. Same two-pass cost profile:
+    the kernel does cheap binding inline and only fires the slow CLI hello when a
+    profile `needs_auth_probe`; we fan out across profiles so the dispatch path
+    pays max(timeout), not sum(timeout) (the "/start freezes" symptom)."""
     from concurrent.futures import ThreadPoolExecutor
 
-    runtime_by_id = {str(r.get("id")): r for r in runtime_profiles if isinstance(r, dict)}
-    store = CredentialAccountStore(account_store_root(sessions_root))
-    missing: list[str] = []
-    # First pass: the CHEAP checks (account existence) run inline. Every profile that
-    # needs the SLOW real CLI hello probe (api_key / endpoint) is collected so the
-    # probes fan out in parallel below — serially they cost sum(timeouts) on the
-    # dispatch path (the "/start freezes" symptom); in parallel it's max(timeout).
-    to_probe: list[dict] = []
-    for p in worker_profiles:
-        if not isinstance(p, dict) or not p.get("enabled", True):
-            continue
-        runtime = runtime_by_id.get(str(p.get("runtime") or ""))
-        backend = str((runtime or {}).get("backend") or "")
-        auth = str(p.get("credential_mode") or p.get("auth") or "subscription")
-        account_id = str(p.get("credential_account") or "")
-        explicit_endpoint = bool(p.get("base_url") or p.get("api_key_ref"))
-        system_login_ok = (
-            backend != "container"
-            and not explicit_endpoint
-            and detect_system_login(base_engine_for_profile(p)) == "present"
-        )
-        requires_account = (
-            backend == "container"
-            or (explicit_endpoint and auth in {"api_key", "oauth_token", "api"})
-            or (auth in {"api_key", "oauth_token", "api"} and not system_login_ok)
-        )
-        account = store.inspect(account_id) if account_id else None
-        if requires_account and (not account_id or account is None):
-            missing.append(f"{p.get('id') or p.get('engine')}:{account_id or '<missing>'}")
-            continue
-        if requires_account or profile_uses_endpoint(p):
-            to_probe.append(p)
+    from muteki.solver.profile_health import evaluate_profile_health
 
-    def _probe(p: dict) -> "tuple[dict, bool, str]":
-        account_id = str(p.get("credential_account") or "")
-        engine = base_engine_for_profile(p)
-        overlay = runtime_env_for_engine(
-            engine,
-            account_root=account_store_root(sessions_root),
-            account_id=account_id or None,
-            container=False,
-        ).env
-        # explicit complete env (os.environ + overlay) so parallel probes don't
-        # clobber each other's credentials via a global os.environ patch.
-        env = {**os.environ, **overlay}
-        try:
-            ok, detail = driver_for(p).health_detail(env=env)
-        except Exception as exc:  # noqa: BLE001
-            ok, detail = False, str(exc)[:120]
-        return p, ok, detail
+    enabled = [
+        p for p in worker_profiles if isinstance(p, dict) and p.get("enabled", True)
+    ]
+    if not enabled:
+        return []
 
-    if to_probe:
-        if len(to_probe) == 1:
-            verdicts = [_probe(to_probe[0])]
-        else:
-            with ThreadPoolExecutor(max_workers=len(to_probe)) as pool:
-                verdicts = list(pool.map(_probe, to_probe))
-        for p, ok, detail in verdicts:
-            if not ok:
-                probe = "endpoint" if profile_uses_endpoint(p) else "probe"
-                missing.append(
-                    f"{p.get('name') or p.get('id') or p.get('engine')}:{probe}:"
-                    f"{detail or 'unhealthy'}"
-                )
-    return missing
+    def _ev(p: dict) -> "tuple[dict, ProfileHealth]":
+        backend = backend_for_profile(
+            p,
+            runtime_profiles=runtime_profiles,
+            worker_backend=DEFAULT_WORKER_BACKEND,
+            in_web_container=is_web_container(),
+        )
+        return p, evaluate_profile_health(
+            p, backend=backend, sessions_root=sessions_root, depth="auth"
+        )
+
+    if len(enabled) == 1:
+        verdicts = [_ev(enabled[0])]
+    else:
+        with ThreadPoolExecutor(max_workers=len(enabled)) as pool:
+            verdicts = list(pool.map(_ev, enabled))
+    return [_format_missing(p, h) for p, h in verdicts if not h.ok]
 
 
 def _selected_profiles(engines: list[str], worker_profiles: list[dict]) -> list[dict]:
@@ -434,23 +417,17 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         # caller that omits this is still protected on a populated graph.
         cold_start = bool(body["cold_start"]) if "cold_start" in body else True
 
-        # worker execution backend: "local" (host subprocess, default) or
-        # "container" (each worker in the run's Kali tool container). Request body
-        # wins, else config, else env default.
-        #   worker_backend: "local" | "container"
-        # NOTE: MUTEKI_WORKER_BACKEND may also carry "container_dockerexec" — that's
-        # the CONTAINER transport selector (rcp vs legacy docker-exec) read inside
-        # container_exec.py. For the swarm's backend choice it still means "container",
-        # so map it here; otherwise this gate would wrongly fall through to local.
-        worker_backend = (
-            body.get("worker_backend")
-            or wc.get("worker_backend")
-            or os.environ.get("MUTEKI_WORKER_BACKEND", DEFAULT_WORKER_BACKEND)
+        # worker execution backend: "local" (host subprocess) or "container" (each
+        # worker in the run's Kali tool container). Request body wins, else config,
+        # else env, else default — with the container_dockerexec alias, invalid
+        # fallback, and the web-container override all owned by the single resolver
+        # so the settings health endpoints resolve the SAME effective backend.
+        worker_backend = resolve_worker_backend(
+            request_backend=body.get("worker_backend"),
+            config_backend=wc.get("worker_backend"),
+            env_backend=os.environ.get("MUTEKI_WORKER_BACKEND"),
+            in_web_container=is_web_container(),
         )
-        if worker_backend == "container_dockerexec":
-            worker_backend = "container"
-        if worker_backend not in ("local", "container"):
-            worker_backend = "local"
         if mgr is not None and worker_profiles:
             # The precheck runs a real per-profile health probe (a synchronous
             # `subprocess.run` that shells the CLI for a one-turn hello) for any
@@ -559,14 +536,116 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
 # server restart. No winner.json (old run) → degrade to a fresh worker seeded with
 # the board context.
 
+def _standby_profile_for(engine: str, worker_profiles: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Pick the profile that should serve a post-solve standby command."""
+    if not worker_profiles:
+        return None
+    engine = (engine or "").strip()
+    by_name = {
+        str(p.get("name") or p.get("id")): p
+        for p in worker_profiles
+        if isinstance(p, dict) and p.get("enabled", True)
+    }
+    if engine in by_name:
+        return by_name[engine]
+    for p in by_name.values():
+        if base_engine_for_profile(p) == engine:
+            return p
+    return None
+
+
+def _runtime_for_profile(
+    profile: dict[str, Any] | None,
+    runtime_profiles: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not profile:
+        return {}
+    rid = str(profile.get("runtime") or "")
+    for rt in runtime_profiles:
+        if isinstance(rt, dict) and str(rt.get("id") or "") == rid:
+            return rt
+    return {}
+
+
+def _standby_worker_env(
+    *,
+    root: Path,
+    label: str,
+    engine: str,
+    profile: dict[str, Any] | None,
+    account_root: Path | None,
+    container: object | None,
+) -> dict[str, str]:
+    from muteki.solver.credential_accounts import runtime_env_for_engine
+
+    env = runtime_env_for_engine(
+        engine,
+        account_root=account_root,
+        account_id=(profile.get("credential_account") if profile else None),
+        container=container is not None,
+    ).env
+    if profile:
+        env["MUTEKI_WORKER_PROFILE_ID"] = str(profile.get("id") or "")
+        env["MUTEKI_CREDENTIAL_ACCOUNT_ID"] = str(profile.get("credential_account") or "")
+        if profile.get("model"):
+            env["MUTEKI_WORKER_MODEL"] = str(profile["model"])
+    if container is not None:
+        from muteki.swarm.swarm import _ensure_blackboard_skill_links
+        from muteki.solver.container_exec import _chown_tree_to_worker
+        home_host = root / "homes" / label
+        home_host.mkdir(parents=True, exist_ok=True)
+        _ensure_blackboard_skill_links(home_host)
+        _chown_tree_to_worker(str(home_host))
+        mapper = getattr(container, "to_container_path", None)
+        env["HOME"] = mapper(str(home_host)) if callable(mapper) else str(home_host)
+    return env
+
+
+def _standby_home_label(root: Path, engine: str, session: str) -> str:
+    """Best-effort reuse of the winner worker's HOME for CLI session resume."""
+    fallback = f"cli-{engine}-standby"
+    homes = root / "homes"
+    if not homes.exists():
+        return fallback
+    candidates = sorted(
+        p for p in homes.glob(f"cli-{engine}*")
+        if p.is_dir()
+    )
+    needle = (session or "").strip()
+    if needle:
+        for home in candidates:
+            try:
+                for p in home.rglob("*"):
+                    if needle in str(p):
+                        return home.name
+                    if not p.is_file():
+                        continue
+                    try:
+                        if p.stat().st_size > 2_000_000:
+                            continue
+                        if needle in p.read_text(encoding="utf-8", errors="ignore"):
+                            return home.name
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+    primary = homes / f"cli-{engine}"
+    if primary.exists():
+        return primary.name
+    return candidates[0].name if candidates else fallback
+
+
 def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -> Driver:
     """A driver that serves ONE post-solve HITL command via a resumed worker."""
     async def drive(run: Run) -> None:
+        import asyncio
         import json
         from pathlib import Path
 
         from muteki.models.solve_graph import Challenge
+        from muteki.solver.cli_driver import driver_for
         from muteki.solver.cli_solver import CliSolver
+        from muteki.solver.credential_accounts import account_store_root
         from muteki.solver.result import ArtifactStore
         from muteki.solver.types import SolverConfig
         from muteki.swarm.shared_graph import SQLiteSharedGraph
@@ -581,6 +660,8 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
         graph_dir = root / "graph"
         winner_path = root / "winner.json"
         arts = ArtifactStore(root=root / "arts")
+        worker_root = root / "workers"
+        worker_root.mkdir(parents=True, exist_ok=True)
 
         winner: dict[str, Any] = {}
         if winner_path.exists():
@@ -589,9 +670,20 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             except Exception:
                 winner = {}
 
-        # rebuild the Challenge: prefer the snapshot stored in winner.json, else a
-        # minimal one from the run id (degraded — board context still helps).
+        # Rebuild the Challenge: prefer the snapshot stored in winner.json. Older
+        # runs may not have winner.json, so recover the original launch payload from
+        # the durable JSONL before degrading to rail metadata.
         ch = winner.get("challenge") or {}
+        if not ch:
+            try:
+                from muteki.core.events import EventType
+                async for ev in run.store.replay(run.run_id):
+                    if ev.event_type == EventType.RUN_STARTED:
+                        ch = (ev.payload or {}).get("challenge") or {}
+                        if ch:
+                            break
+            except Exception:
+                ch = {}
         challenge = Challenge(
             id=run.run_id,
             name=ch.get("name", run.name or run.run_id),
@@ -610,6 +702,43 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             multi_flag=bool(ch.get("multi_flag", False)),
             verifier_rate_limited=bool(ch.get("verifier_rate_limited", False)),
         )
+
+        wc = mgr.worker_config.resolve(challenge.category) if mgr is not None else {}
+        runtime_profiles = wc.get("runtime_profiles") or []
+        worker_profiles = wc.get("worker_profiles") or []
+        winner_engine = str(winner.get("engine") or "claude")
+        profile = _standby_profile_for(winner_engine, worker_profiles)
+        transport = base_engine_for_profile(profile or winner_engine)
+        worker_backend = resolve_worker_backend(
+            request_backend=None,
+            config_backend=wc.get("worker_backend"),
+            env_backend=os.environ.get("MUTEKI_WORKER_BACKEND"),
+            in_web_container=is_web_container(),
+        )
+        backend = (
+            backend_for_profile(
+                profile,
+                runtime_profiles=runtime_profiles,
+                worker_backend=worker_backend,
+                in_web_container=is_web_container(),
+            )
+            if profile else worker_backend
+        )
+        runtime = _runtime_for_profile(profile, runtime_profiles)
+        container = None
+        account_root = account_store_root(mgr.sessions_root) if mgr is not None else None
+        if backend == "container":
+            from muteki.solver.container_exec import ensure_container
+            container = await asyncio.to_thread(
+                ensure_container,
+                run.run_id,
+                str(root),
+                network=str(runtime.get("network") or "bridge"),
+                memory=str(runtime.get("memory") or "") or None,
+                cpus=str(runtime.get("cpus") or "") or None,
+                pids_limit=int(runtime.get("pids_limit") or 0) or None,
+                account_root=(str(account_root) if account_root is not None else None),
+            )
 
         # re-open the persisted shared graph (verified facts / dead-ends / flag).
         shared_graph = None
@@ -671,16 +800,39 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             except Exception:
                 pass
 
+        workdir = str(winner.get("workdir") or "")
+        if not workdir or not Path(workdir).exists():
+            workdir = str(worker_root / f"standby-{transport}")
+        Path(workdir).mkdir(parents=True, exist_ok=True)
+        if container is not None:
+            from muteki.solver.container_exec import _chown_tree_to_worker
+            _chown_tree_to_worker(workdir)
+        solver_label = f"cli-{transport}-standby"
+        home_label = _standby_home_label(
+            root, transport, str(winner.get("session") or ""))
+        worker_env = _standby_worker_env(
+            root=root,
+            label=home_label,
+            engine=transport,
+            profile=profile,
+            account_root=account_root,
+            container=container,
+        )
+
         worker = CliSolver(
             None, challenge, bus=run.bus, cost=run.cost, artifacts=arts,
             config=SolverConfig(), run_id=run.run_id, shared_graph=shared_graph,
-            engine=winner.get("engine") or "claude",
-            workdir=winner.get("workdir") or None,
+            engine=transport,
+            driver=driver_for(profile or transport),
+            workdir=workdir,
             web_access=True, kb=False,
             mode="respond",
             resume_session=winner.get("session") or None,
             hitl_cmd={**cmd, "flag": flag},
             found_flags=prior_flags,
+            solver_label=solver_label,
+            container=container,
+            worker_env=worker_env,
         )
         try:
             out = await worker.run()
@@ -711,6 +863,12 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             if shared_graph is not None:
                 try:
                     shared_graph.close()
+                except Exception:
+                    pass
+            if container is not None:
+                try:
+                    from muteki.solver.container_exec import teardown_container
+                    await asyncio.to_thread(teardown_container, run.run_id, remove=True)
                 except Exception:
                     pass
 

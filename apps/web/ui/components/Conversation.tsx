@@ -6,7 +6,7 @@ import {
   ChatMessage, DeckState, HitlRequest, SolverCost, SwarmDigest,
   coordinatorThread, swarmDigest,
 } from "@/lib/events";
-import { getWorkerSettings, SavedFile } from "@/lib/useRun";
+import { getWorkerSettings, checkAuth, SavedFile } from "@/lib/useRun";
 import { useT, useLang } from "@/lib/i18n";
 import { EngineBar } from "@/components/EngineBar";
 import { Icon, type IconName } from "@/components/Icon";
@@ -185,7 +185,7 @@ function CoordBubble({
   // the operator's own + system lifecycle lines.
   const copyable = m.role === "agent" && (m.kind === "text" || m.kind === "reasoning") && text.trim().length > 40;
   return (
-    <div className={`coord-bubble ${cls}`}>
+    <div className={`coord-bubble ${cls}`} data-mid={m.id}>
       <div className="who">
         {who} <span className="k">{t(`msg.kind.${m.kind}`)}</span>
         {copyable && (
@@ -747,6 +747,9 @@ function Composer({
   const [flagFormat, setFlagFormat] = useState<"brace" | "token" | "custom">("brace");
   const [flagWrapper, setFlagWrapper] = useState("");
   const [containerMode, setContainerMode] = useState(false);
+  // P2-v3: when the coordinator runs inside a container, local worker mode is
+  // rejected server-side — force container mode and lock the toggle.
+  const [containerLocked, setContainerLocked] = useState(false);
   const [raceTimeout, setRaceTimeout] = useState("720");
   const [wallClockBudget, setWallClockBudget] = useState("0");
   const [maxTotalWorkers, setMaxTotalWorkers] = useState("0");
@@ -772,6 +775,12 @@ function Composer({
         });
       }
     } catch { /* ignore */ }
+    // P2-v3: ask the backend whether IT runs in a container. If so, container
+    // mode is mandatory — force it on and lock the toggle (local is server-side
+    // rejected, so a local toggle would only produce confusing 400s).
+    checkAuth().then((a) => {
+      if (!cancelled && a?.inContainer) { setContainerMode(true); setContainerLocked(true); }
+    }).catch(() => { /* ignore */ });
     return () => { cancelled = true; };
   }, []);
   const toggleWeb = () => setWebSearch((v) => {
@@ -792,11 +801,14 @@ function Composer({
     setFlagWrapper(value);
     try { window.localStorage.setItem("muteki.flagWrapper", value); } catch { /* ignore */ }
   };
-  const toggleContainer = () => setContainerMode((v) => {
-    const nv = !v;
-    try { window.localStorage.setItem("muteki.containerMode", nv ? "1" : "0"); } catch { /* ignore */ }
-    return nv;
-  });
+  const toggleContainer = () => {
+    if (containerLocked) return;  // P2-v3: forced on inside a container
+    setContainerMode((v) => {
+      const nv = !v;
+      try { window.localStorage.setItem("muteki.containerMode", nv ? "1" : "0"); } catch { /* ignore */ }
+      return nv;
+    });
+  };
   const pickMode = (m: "ctf" | "pentest") => {
     setMode(m);
     try { window.localStorage.setItem("muteki.mode", m); } catch { /* ignore */ }
@@ -969,10 +981,13 @@ function Composer({
             </button>
             <button
               type="button"
-              className={`websearch-toggle ${containerMode ? "on" : "off"}`}
+              className={`websearch-toggle ${containerMode ? "on" : "off"}${containerLocked ? " locked" : ""}`}
               onClick={toggleContainer}
               aria-pressed={containerMode}
-              title={t(containerMode ? "composer.containerOnTitle" : "composer.containerOffTitle")}
+              disabled={containerLocked}
+              title={containerLocked
+                ? t("composer.containerLockedTitle")
+                : t(containerMode ? "composer.containerOnTitle" : "composer.containerOffTitle")}
             >
               <Icon name={containerMode ? "lock" : "globe"} size={14} />
               {containerMode ? t("composer.containerOn") : t("composer.containerOff")}
@@ -1324,11 +1339,17 @@ export function Conversation({
   const blockingHitlCount = deck.hitlRequests.filter((r) => (r.pausesBehavior ?? true)).length;
   const onWriteup = () => onCommand("global", "writeup", "");
   const onMarkFalseFlag = (flag: string) => onCommand("global", "mark_false", flag);
+  // Before a solve is dispatched the deck is a local draft with no backend run,
+  // so useRun opens no SSE stream by design — that's "idle", not "disconnected".
+  // Only a started-but-unfinished run that has lost its stream is truly off.
+  const connState = connected ? "on" : !deck.started || deck.finished ? "idle" : "off";
   const connectionLabel = connected
     ? t("convo.connected")
     : deck.finished
       ? t("convo.finished")
-      : t("convo.disconnected");
+      : !deck.started
+        ? t("convo.idle")
+        : t("convo.disconnected");
   const runStateLabel = digest.phase === "paused"
     ? t("convo.paused")
     : running
@@ -1348,7 +1369,7 @@ export function Conversation({
 
   return (
     <div
-      className={`convo motion-run-enter ${deck.started && !artifactOpen ? "has-inspector" : ""} ${inspectorResizing ? "inspector-resizing" : ""}`}
+      className={`convo ${deck.started && !artifactOpen ? "has-inspector" : ""} ${inspectorResizing ? "inspector-resizing" : ""}`}
       style={{ "--inspector-width": `${inspectorWidth}px` } as CSSProperties}
     >
       <div className="sr-only" role="status" aria-live="polite" aria-atomic="true" aria-label={t("a11y.status")}>{liveStatus}</div>
@@ -1369,7 +1390,7 @@ export function Conversation({
           <span className={`runstate ${runStateClass}`}>{runStateLabel}</span>
         )}
         <EngineBar degradedEngines={deck.degradedEngines} />
-        <span className={`dot ${connected ? "on" : "off"}`} role="img" aria-label={connectionLabel} title={connectionLabel} />
+        <span className={`dot ${connState}`} role="img" aria-label={connectionLabel} title={connectionLabel} />
         <button
           className="icon-btn"
           onClick={onToggleTheme}
@@ -1394,7 +1415,7 @@ export function Conversation({
             {!deck.started && !loading ? (
               <Welcome t={t} />
             ) : (
-              <div className={`workspace motion-run-enter ${artifactOpen ? "solo" : ""}`}>
+              <div className={`workspace ${artifactOpen ? "solo" : ""}`}>
                 <div className="coord-col motion-run-enter">
                   {deck.started && running && !connected && (
                     <div className="conn-banner" role="status" aria-live="polite">
@@ -1467,7 +1488,7 @@ export function Conversation({
               onDoubleClick={() => setInspectorWidth(clampInspectorWidth(INSPECTOR_WIDTH_DEFAULT, window.innerWidth))}
             />
             {loading ? (
-              <aside className="run-inspector motion-inspector motion-shell-piece motion-run-enter" aria-label={t("insp.run.title")} aria-busy="true">
+              <aside className="run-inspector motion-inspector" aria-label={t("insp.run.title")} aria-busy="true">
                   <InspectorSkeleton />
               </aside>
             ) : (

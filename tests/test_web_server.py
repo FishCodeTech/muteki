@@ -340,7 +340,12 @@ async def test_engines_endpoint_passes_enabled_worker_profiles(tmp_path, monkeyp
     assert seen["profiles"][0]["model"] == "sonnet"
 
 
-async def test_credential_account_api_masks_and_persists(tmp_path) -> None:
+async def test_credential_account_api_echoes_secret_and_persists(tmp_path) -> None:
+    """The credential endpoints deliberately ECHO the stored secret back so the
+    settings UI can show & edit it in place (operator request — see
+    credential_accounts._read_secret_value's SECURITY POSTURE note). The route is
+    password-authenticated; the plaintext travels only over that gated channel.
+    Here we assert the secret round-trips through both PUT and the list GET."""
     app = create_app(RunManager(sessions_root=str(tmp_path / "sessions")))
     with _Server(app) as srv:
         async with httpx.AsyncClient(base_url=srv.base, timeout=15, trust_env=False) as client:
@@ -349,17 +354,16 @@ async def test_credential_account_api_masks_and_persists(tmp_path) -> None:
                 json={"engine": "claude", "secret": "super-secret-token"},
             )
             assert r.status_code == 200
-            body = r.text
-            assert "super-secret-token" not in body
             assert r.json()["account"]["engine"] == "claude"
+            # echoed for in-place editing, not masked
+            assert r.json()["account"]["details"]["secret_value"] == "super-secret-token"
 
             listed = await client.get("/api/settings/credential-accounts")
             assert listed.status_code == 200
-            text = listed.text
-            assert "super-secret-token" not in text
             accounts = listed.json()["accounts"]
             assert accounts[0]["account_id"] == "claude-team"
             assert accounts[0]["present"] is True
+            assert accounts[0]["details"]["secret_value"] == "super-secret-token"
 
             api = await client.put(
                 "/api/settings/credential-accounts/deepseek-main",
@@ -370,8 +374,13 @@ async def test_credential_account_api_masks_and_persists(tmp_path) -> None:
                 },
             )
             assert api.status_code == 200
-            assert "deepseek-secret" not in api.text
+            # both the api key and base_url are echoed for editing
+            assert api.json()["account"]["details"]["secret_value"] == "deepseek-secret"
             assert api.json()["account"]["details"]["base_url"] is True
+            assert (
+                api.json()["account"]["details"]["base_url_value"]
+                == "https://api.deepseek.example/v1"
+            )
 
             bad = await client.put(
                 "/api/settings/credential-accounts/bad/cut",

@@ -4,13 +4,112 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { DeckState, EventType, MutekiEvent, emptyDeck, reduce } from "./events";
 
 /**
- * API base. Empty string = same-origin (prod: the static UI is served by the
- * FastAPI backend, so /api works directly). In dev, set NEXT_PUBLIC_MUTEKI_API
- * to the backend (e.g. http://127.0.0.1:8000) so the browser's EventSource
- * connects STRAIGHT to it — the Next dev rewrite proxy buffers SSE and makes a
- * live run look frozen until it ends. CORS on the backend allows localhost.
+ * API base. Empty string = same-origin: `run.sh web` serves the production
+ * Next UI and proxies /api to the FastAPI backend. NEXT_PUBLIC_MUTEKI_API is
+ * still available for manual experiments that intentionally bypass that proxy.
  */
 export const API = process.env.NEXT_PUBLIC_MUTEKI_API || "";
+
+// ---------------------------------------------------------------------------
+// Auth (P3): single-password gate. The operator types a password once; the
+// backend returns a signed session token we keep in localStorage and attach to
+// every /api request. The password itself is never stored. SSE/WS connections
+// (which can't carry a header) use a one-time ticket minted via apiFetch.
+// ---------------------------------------------------------------------------
+const TOKEN_KEY = "muteki_auth_token";
+
+export function getToken(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    return window.localStorage.getItem(TOKEN_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+export function setToken(token: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (token) window.localStorage.setItem(TOKEN_KEY, token);
+    else window.localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    /* storage disabled — auth simply won't persist */
+  }
+}
+
+// When a request comes back 401 the token is stale/missing; clear it and notify
+// the app shell so it can show the login gate. The shell subscribes via
+// onAuthRequired(); we keep it a tiny pub-sub to avoid threading a context
+// through every standalone fetch helper.
+type AuthListener = () => void;
+const authListeners = new Set<AuthListener>();
+export function onAuthRequired(fn: AuthListener): () => void {
+  authListeners.add(fn);
+  return () => authListeners.delete(fn);
+}
+function fireAuthRequired(): void {
+  setToken("");
+  authListeners.forEach((fn) => {
+    try {
+      fn();
+    } catch {
+      /* ignore listener errors */
+    }
+  });
+}
+
+/**
+ * Authenticated fetch. Prepends the API base, attaches the bearer token, and
+ * routes 401s to the login gate. `path` is the API-relative path (e.g.
+ * "/api/runs"); callers pass the same path they used to build by hand.
+ */
+export async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
+  const headers = new Headers(init?.headers || {});
+  const token = getToken();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const res = await fetch(`${API}${path}`, { ...init, headers });
+  if (res.status === 401) fireAuthRequired();
+  return res;
+}
+
+/** POST the operator password; on success store the returned session token. */
+export async function login(password: string): Promise<{ ok: boolean; authRequired: boolean }> {
+  const res = await fetch(`${API}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password }),
+  });
+  if (!res.ok) return { ok: false, authRequired: true };
+  const data = await res.json().catch(() => ({} as any));
+  if (data?.token) setToken(String(data.token));
+  return { ok: true, authRequired: Boolean(data?.auth_required) };
+}
+
+/** True if the current token is accepted (or auth is disabled). */
+export async function checkAuth(): Promise<{ authenticated: boolean; authRequired: boolean; inContainer: boolean }> {
+  const res = await apiFetch("/api/auth/me");
+  if (res.status === 401) return { authenticated: false, authRequired: true, inContainer: false };
+  const data = await res.json().catch(() => ({} as any));
+  // in_container (P2-v3): the coordinator runs in a container → the deck must
+  // force container mode and disable the "local" worker-isolation toggle.
+  return { authenticated: true, authRequired: Boolean(data?.auth_required), inContainer: Boolean(data?.in_container) };
+}
+
+/**
+ * Mint a one-time ticket for opening an SSE/WS connection (no header possible).
+ * Returns "" when auth is disabled or the mint fails — callers append it as a
+ * query param only when non-empty.
+ */
+export async function authTicket(): Promise<string> {
+  try {
+    const res = await apiFetch("/api/auth/ticket", { method: "POST" });
+    if (!res.ok) return "";
+    const data = await res.json().catch(() => ({} as any));
+    return data?.ticket ? String(data.ticket) : "";
+  } catch {
+    return "";
+  }
+}
 
 export type RunStatus = "draft" | "running" | "paused" | "solved" | "finished" | "failed";
 
@@ -68,10 +167,7 @@ export function useRun(runId: string) {
     // empty backend runs and long-lived idle SSE sockets; enough refreshes/tabs can
     // exhaust the browser's per-origin connection pool and starve real run streams.
     if (!runId || isDraftRunId(runId)) return;
-    const es = new EventSource(`${API}/api/runs/${runId}/events`);
-    esRef.current = es;
-    es.onopen = () => setConnected(true);
-    es.onerror = () => setConnected(false);
+
     // every EventType is a named SSE event; one generic handler folds them all
     const handler = (e: MessageEvent) => {
       try {
@@ -81,13 +177,32 @@ export function useRun(runId: string) {
         /* ignore malformed frame */
       }
     };
-    // listen to all known event names plus the default. Derived directly from the
-    // EventType enum (single source of truth) — a hand-copied list silently dropped
-    // any newly-added SSE event whose name was forgotten (e.g. node.summarized).
-    Object.values(EventType).forEach((name) => es.addEventListener(name, handler as EventListener));
-    es.onmessage = handler;
+
+    // EventSource can't send an Authorization header, so when auth is on we mint
+    // a one-time ticket first and pass it as ?ticket=. authTicket() returns ""
+    // when auth is disabled (or on failure) — then we open the stream plainly,
+    // exactly as before. `cancelled` guards the await: if runId changes (or the
+    // component unmounts) before the ticket resolves, we must not open a now-
+    // orphaned EventSource.
+    let cancelled = false;
+    (async () => {
+      const ticket = await authTicket();
+      if (cancelled) return;
+      const qs = ticket ? `?ticket=${encodeURIComponent(ticket)}` : "";
+      const es = new EventSource(`${API}/api/runs/${runId}/events${qs}`);
+      esRef.current = es;
+      es.onopen = () => setConnected(true);
+      es.onerror = () => setConnected(false);
+      // listen to all known event names plus the default. Derived directly from
+      // the EventType enum (single source of truth) — a hand-copied list silently
+      // dropped any newly-added SSE event whose name was forgotten.
+      Object.values(EventType).forEach((name) => es.addEventListener(name, handler as EventListener));
+      es.onmessage = handler;
+    })();
+
     return () => {
-      es.close();
+      cancelled = true;
+      esRef.current?.close();
       esRef.current = null;
     };
   }, [runId]);
@@ -98,7 +213,7 @@ export function useRun(runId: string) {
       // waiting for the runId state update to flush (avoids a one-render race
       // where a draft is promoted to a real run id at send time).
       const target = overrideRunId || runId;
-      const res = await fetch(`${API}/api/runs/${target}/start`, {
+      const res = await apiFetch(`/api/runs/${target}/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -151,7 +266,7 @@ export function useRun(runId: string) {
                /\b(ssh|vps|反弹|reverse[- ]?shell|root@|端口转发|port[- ]?forward|credential|凭证|账号|密码|password|跳板|中转)\b/i.test(text)) {
         body.standing = true;
       }
-      await fetch(`${API}/api/runs/${runId}/hitl`, {
+      await apiFetch(`/api/runs/${runId}/hitl`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -167,7 +282,7 @@ export function useRun(runId: string) {
     async (text?: string) => {
       const body: Record<string, unknown> = {};
       if (text && text.trim()) body.challenge = { description: text.trim() };
-      await fetch(`${API}/api/runs/${runId}/resolve`, {
+      await apiFetch(`/api/runs/${runId}/resolve`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -197,7 +312,7 @@ export function useRunList(pollMs = 4000, bump = 0) {
         // ?archived=1 returns ALL runs (archived + active) so the rail can render
         // its Archived section — without it the backend hides archived rows and
         // the section is always empty (the archive-view bug).
-        const r = await fetch(`${API}/api/runs?archived=1`, { signal: ctrl.signal });
+        const r = await apiFetch(`/api/runs?archived=1`, { signal: ctrl.signal });
         const j = await r.json();
         if (alive) setRuns(j.runs ?? []);
       } catch {
@@ -241,7 +356,7 @@ export async function uploadFiles(
   const fd = new FormData();
   Array.from(files).forEach((f) => fd.append("files", f));
   try {
-    const r = await fetch(`${API}/api/runs/${runId}/uploads`, {
+    const r = await apiFetch(`/api/runs/${runId}/uploads`, {
       method: "POST",
       body: fd,
     });
@@ -256,7 +371,7 @@ export async function uploadFiles(
 /** Mint a fresh run id for "+ New solve". Falls back to a local id if offline. */
 export async function newRun(): Promise<string> {
   try {
-    const r = await fetch(`${API}/api/runs`, { method: "POST" });
+    const r = await apiFetch(`/api/runs`, { method: "POST" });
     const j = await r.json();
     if (j.run_id) return j.run_id as string;
   } catch {
@@ -272,7 +387,7 @@ export async function patchRun(
   patch: { pinned?: boolean; archived?: boolean; name?: string; folder_id?: string | null; order?: number }
 ): Promise<boolean> {
   try {
-    const r = await fetch(`${API}/api/runs/${runId}`, {
+    const r = await apiFetch(`/api/runs/${runId}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(patch),
@@ -286,7 +401,7 @@ export async function patchRun(
 /** Hard-delete a run (irreversible — the caller confirms first). */
 export async function deleteRun(runId: string): Promise<boolean> {
   try {
-    const r = await fetch(`${API}/api/runs/${runId}`, { method: "DELETE" });
+    const r = await apiFetch(`/api/runs/${runId}`, { method: "DELETE" });
     return r.ok;
   } catch {
     return false;
@@ -296,7 +411,7 @@ export async function deleteRun(runId: string): Promise<boolean> {
 /** Open the run's workspace dir in the host file manager (operator-local). */
 export async function openWorkspace(runId: string): Promise<boolean> {
   try {
-    const r = await fetch(`${API}/api/runs/${runId}/open`, { method: "POST" });
+    const r = await apiFetch(`/api/runs/${runId}/open`, { method: "POST" });
     const j = await r.json().catch(() => ({}));
     return !!j.ok;
   } catch {
@@ -335,7 +450,7 @@ export interface EngineHealth {
  *  worker image). On-demand, not polled. */
 export async function getEngineHealth(backend: "local" | "container" = "local"): Promise<EngineHealth[]> {
   try {
-    const r = await fetch(`${API}/api/engines/health?backend=${backend}`);
+    const r = await apiFetch(`/api/engines/health?backend=${backend}`);
     const j = await r.json();
     return (j.engines ?? []) as EngineHealth[];
   } catch {
@@ -352,7 +467,7 @@ export function useEngines(pollMs = 300000): EngineStatus[] {
       if (inFlight.current) return;
       inFlight.current = true;
       try {
-        const r = await fetch(`${API}/api/engines`);
+        const r = await apiFetch(`/api/engines`);
         const j = await r.json();
         if (alive) setEngines(j.engines ?? []);
       } catch { /* offline — keep last */ }
@@ -369,7 +484,7 @@ export function useEngines(pollMs = 300000): EngineStatus[] {
 
 export async function listFolders(): Promise<Folder[]> {
   try {
-    const r = await fetch(`${API}/api/folders`);
+    const r = await apiFetch(`/api/folders`);
     const j = await r.json();
     return (j.folders ?? []) as Folder[];
   } catch {
@@ -379,7 +494,7 @@ export async function listFolders(): Promise<Folder[]> {
 
 export async function createFolder(name: string): Promise<Folder | null> {
   try {
-    const r = await fetch(`${API}/api/folders`, {
+    const r = await apiFetch(`/api/folders`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name }),
@@ -393,7 +508,7 @@ export async function createFolder(name: string): Promise<Folder | null> {
 
 export async function renameFolder(id: string, name: string): Promise<boolean> {
   try {
-    const r = await fetch(`${API}/api/folders/${id}`, {
+    const r = await apiFetch(`/api/folders/${id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name }),
@@ -407,7 +522,7 @@ export async function renameFolder(id: string, name: string): Promise<boolean> {
 
 export async function deleteFolder(id: string): Promise<boolean> {
   try {
-    const r = await fetch(`${API}/api/folders/${id}`, { method: "DELETE" });
+    const r = await apiFetch(`/api/folders/${id}`, { method: "DELETE" });
     const j = await r.json().catch(() => ({}));
     return !!j.ok;
   } catch {
@@ -525,7 +640,7 @@ export interface WorkerModelOptions {
 
 export async function getWorkerSettings(): Promise<WorkerSettings | null> {
   try {
-    const r = await fetch(`${API}/api/settings/workers`);
+    const r = await apiFetch(`/api/settings/workers`);
     if (!r.ok) return null;
     const j = await r.json();
     return (j.config ?? null) as WorkerSettings | null;
@@ -536,7 +651,7 @@ export async function getWorkerSettings(): Promise<WorkerSettings | null> {
 
 export async function getWorkerModelOptions(): Promise<WorkerModelOptions> {
   try {
-    const r = await fetch(`${API}/api/settings/worker-models`);
+    const r = await apiFetch(`/api/settings/worker-models`);
     if (!r.ok) return { allow_custom: true, models: {} };
     const j = await r.json();
     return {
@@ -548,13 +663,42 @@ export async function getWorkerModelOptions(): Promise<WorkerModelOptions> {
   }
 }
 
+// ── P2-v3: worker image health (daemon / pulled / version) ──────────────────
+export type WorkerImageStatus = {
+  image: string;
+  daemon: { ok: boolean; detail: string };
+  pulled: { ok: boolean; detail: string };
+  version: { status: "match" | "mismatch" | "unknown"; expected: string | null; actual: string | null; detail: string };
+  overall: "green" | "yellow" | "red";
+};
+
+export async function getWorkerImageStatus(): Promise<WorkerImageStatus | null> {
+  try {
+    const r = await apiFetch(`/api/settings/worker-image`);
+    if (!r.ok) return null;
+    return (await r.json()) as WorkerImageStatus;
+  } catch {
+    return null;
+  }
+}
+
+export async function pullWorkerImage(): Promise<{ ok: boolean; detail: string; version?: string | null }> {
+  try {
+    const r = await apiFetch(`/api/settings/worker-image/pull`, { method: "POST" });
+    const j = await r.json().catch(() => ({}));
+    return { ok: Boolean(j?.ok), detail: String(j?.detail ?? (r.ok ? "" : "pull failed")), version: j?.version ?? null };
+  } catch (e) {
+    return { ok: false, detail: String(e) };
+  }
+}
+
 export async function testWorkerProfileModel(
   profile: WorkerSettings["worker_profiles"][number],
   model: string,
   backend: "local" | "container"
 ): Promise<{ ok: boolean; detail: string; model: string; engine: string }> {
   try {
-    const r = await fetch(`${API}/api/settings/worker-model/test`, {
+    const r = await apiFetch(`/api/settings/worker-model/test`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ profile, model, backend }),
@@ -571,13 +715,65 @@ export async function testWorkerProfileModel(
   }
 }
 
+// ── per-profile health (single source of truth shared with the dispatch precheck) ──
+export type ProfileHealth = {
+  profile_id: string;
+  engine: string;
+  backend: string;
+  status: "ok" | "blocked" | "auth_failed" | "disabled";
+  layer: string | null;
+  blocker: string | null;
+  detail: string;
+  model: string;
+  account_id: string;
+  // SINGLE SOURCE OF TRUTH for "bound?" — read these instead of the literal
+  // credential_account field (which caused the "未绑定 vs 已绑定" contradiction).
+  // explicit = profile named the account; inherited = empty → fell back to the
+  // default/host login (show "自动: <id>", NOT "未绑定"); missing = no credential.
+  binding_kind?: "explicit" | "inherited" | "missing";
+  effective_credential_id?: string;
+};
+
+/** Batch readiness for every profile at the CHEAP binding depth (zero network /
+ *  zero docker) — drives the settings badge + account rows. Backend is resolved
+ *  server-side (same per-profile runtime→backend mapping dispatch uses). */
+export async function fetchProfilesHealth(): Promise<ProfileHealth[]> {
+  try {
+    const r = await apiFetch(`/api/settings/profiles/health`);
+    if (!r.ok) return [];
+    const j = await r.json();
+    return (j.profiles ?? []) as ProfileHealth[];
+  } catch {
+    return [];
+  }
+}
+
+/** DEEP probe for one profile ("测连通"): binding + (container) plumbing + a real
+ *  auth hello with the profile's pinned model. A green here matches the dispatch
+ *  precheck, so the run won't die on profile_unhealthy. */
+export async function testProfileHealth(profileId: string): Promise<ProfileHealth | null> {
+  try {
+    // A container deep-probe (docker run + real one-turn hello) can take ~60-120s
+    // on a cold cursor/codex start; cap it so "测试中…" can't hang forever (no
+    // client timeout was the reason the button spun indefinitely on a slow probe).
+    const r = await apiFetch(`/api/settings/profiles/${encodeURIComponent(profileId)}/health`, {
+      method: "POST",
+      signal: AbortSignal.timeout(180_000),
+    });
+    if (!r.ok) return null;
+    return (await r.json()) as ProfileHealth;
+  } catch {
+    return null;
+  }
+}
+
 /** Update the default roster. Returns the persisted config, or null on
  *  failure (e.g. 400 for an invalid roster). */
 export async function putWorkerSettings(
   patch: Partial<WorkerSettings>
 ): Promise<WorkerSettings | null> {
   try {
-    const r = await fetch(`${API}/api/settings/workers`, {
+    const r = await apiFetch(`/api/settings/workers`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(patch),
@@ -592,7 +788,7 @@ export async function putWorkerSettings(
 
 export async function listCredentialAccounts(): Promise<CredentialAccount[]> {
   try {
-    const r = await fetch(`${API}/api/settings/credential-accounts`);
+    const r = await apiFetch(`/api/settings/credential-accounts`);
     if (!r.ok) return [];
     const j = await r.json();
     return (j.accounts ?? []) as CredentialAccount[];
@@ -606,7 +802,7 @@ export async function putCredentialAccount(
   body: { engine: string; secret?: string; codex_auth_json?: string; base_url?: string; target_engine?: string }
 ): Promise<CredentialAccount | null> {
   try {
-    const r = await fetch(`${API}/api/settings/credential-accounts/${encodeURIComponent(accountId)}`, {
+    const r = await apiFetch(`/api/settings/credential-accounts/${encodeURIComponent(accountId)}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -621,7 +817,7 @@ export async function putCredentialAccount(
 
 export async function deleteCredentialAccount(accountId: string): Promise<boolean> {
   try {
-    const r = await fetch(`${API}/api/settings/credential-accounts/${encodeURIComponent(accountId)}`, {
+    const r = await apiFetch(`/api/settings/credential-accounts/${encodeURIComponent(accountId)}`, {
       method: "DELETE",
     });
     if (!r.ok) return false;
@@ -632,12 +828,30 @@ export async function deleteCredentialAccount(accountId: string): Promise<boolea
   }
 }
 
+/** One-click refresh of a codex account from the HOST's ~/.codex/auth.json (after
+ *  `codex login`). Returns {ok, detail} — detail carries the server's error (e.g.
+ *  host file missing, or unavailable when web runs in a container). */
+export async function importHostCodexAuth(
+  accountId: string
+): Promise<{ ok: boolean; detail: string }> {
+  try {
+    const r = await apiFetch(
+      `/api/settings/credential-accounts/${encodeURIComponent(accountId)}/import-host-codex`,
+      { method: "POST" }
+    );
+    const j = await r.json().catch(() => ({}));
+    return { ok: r.ok && Boolean(j.ok), detail: String(j.detail ?? (r.ok ? "" : "import failed")) };
+  } catch (e) {
+    return { ok: false, detail: String(e) };
+  }
+}
+
 export type SystemLoginStatus = "present" | "absent" | "unknown";
 
 /** Host-side login presence per engine (drives the local-mode credentials UI). */
 export async function getSystemLogin(): Promise<Record<string, SystemLoginStatus>> {
   try {
-    const r = await fetch(`${API}/api/settings/system-login`);
+    const r = await apiFetch(`/api/settings/system-login`);
     if (!r.ok) return {};
     const j = await r.json();
     return (j.logins ?? {}) as Record<string, SystemLoginStatus>;
@@ -653,7 +867,7 @@ export async function testLlmEndpoint(
   model: string
 ): Promise<{ ok: boolean; detail: string; model: string }> {
   try {
-    const r = await fetch(`${API}/api/settings/llm/test`, {
+    const r = await apiFetch(`/api/settings/llm/test`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ which, base_url, model }),
@@ -673,18 +887,24 @@ export async function testCredentialAccount(
   backend: "local" | "container"
 ): Promise<{ ok: boolean; detail: string; layer?: string }> {
   try {
-    const r = await fetch(
-      `${API}/api/settings/credential-accounts/${encodeURIComponent(accountId)}/test`,
+    const r = await apiFetch(
+      `/api/settings/credential-accounts/${encodeURIComponent(accountId)}/test`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ engine, backend }),
+        // cap the wait — a container probe + cold hello can be slow, but the
+        // button must never spin forever (the "测试中…" hang).
+        signal: AbortSignal.timeout(180_000),
       }
     );
     const j = await r.json().catch(() => ({}));
     return { ok: !!j.ok, detail: String(j.detail ?? ""), layer: j.layer };
   } catch (e) {
-    return { ok: false, detail: String(e) };
+    const msg = (e as Error)?.name === "TimeoutError"
+      ? "测试超时（>180s）——容器探测或冷启动太慢，请重试或检查引擎状态"
+      : String(e);
+    return { ok: false, detail: msg };
   }
 }
 
@@ -694,7 +914,7 @@ export async function putRuntimeEnvironment(
   runtime_id: string
 ): Promise<WorkerSettings | null> {
   try {
-    const r = await fetch(`${API}/api/settings/runtime-environment`, {
+    const r = await apiFetch(`/api/settings/runtime-environment`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ backend, runtime_id }),
@@ -711,7 +931,7 @@ export async function putRuntimeEnvironment(
  *  (omit engine → coordinator picks heterogeneity-aware). */
 export async function spawnWorker(runId: string, engine?: string): Promise<boolean> {
   try {
-    const r = await fetch(`${API}/api/runs/${runId}/workers`, {
+    const r = await apiFetch(`/api/runs/${runId}/workers`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(engine ? { engine } : {}),
@@ -726,7 +946,7 @@ export async function spawnWorker(runId: string, engine?: string): Promise<boole
 /** Operator runtime control: stop a specific worker by its solver_id. */
 export async function killWorker(runId: string, solverId: string): Promise<boolean> {
   try {
-    const r = await fetch(`${API}/api/runs/${runId}/workers`, {
+    const r = await apiFetch(`/api/runs/${runId}/workers`, {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ solver_id: solverId }),

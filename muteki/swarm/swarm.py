@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
 from muteki.core.cost import CostController
 from muteki.core.event_bus import EventBus
+from muteki.core.runtime_env import is_web_container
 from muteki.core.events import Event, EventType, blackboard_delta_payload
 from muteki.core.llm import LLMClient, ModelSpec
 from muteki.models.solve_graph import Challenge
@@ -37,6 +38,7 @@ from muteki.solver.types import SolverConfig, SolveOutcome
 from muteki.solver.credential_accounts import runtime_env_for_engine
 from muteki.solver.worker_profiles import (
     base_engine_for_profile,
+    coerce_nonneg_int,
     normalize_profile_roster,
     normalize_worker_profiles,
     profile_names,
@@ -56,6 +58,32 @@ _STANDING_MAX = 8
 # so this only bites when many DISTINCT blockers pile up on a long never-give-up run;
 # bounding it keeps the awaiting_operator count honest and memory flat.
 _PENDING_HELP_MAX = 16
+
+_CONTAINER_BLACKBOARD_SKILL = "/opt/muteki/muteki-blackboard"
+_BLACKBOARD_SKILL_LINKS = (
+    ".claude/skills/muteki-blackboard",
+    ".agents/skills/muteki-blackboard",
+    ".codex/skills/muteki-blackboard",
+    ".cursor/skills-cursor/muteki-blackboard",
+    ".cursor/skills/muteki-blackboard",
+)
+
+
+def _ensure_blackboard_skill_links(home: Path) -> None:
+    """Expose the image-baked blackboard skill inside an isolated worker HOME."""
+    for rel in _BLACKBOARD_SKILL_LINKS:
+        link = home / rel
+        try:
+            if link.is_symlink():
+                if os.readlink(link) == _CONTAINER_BLACKBOARD_SKILL:
+                    continue
+                link.unlink()
+            elif link.exists():
+                continue
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(_CONTAINER_BLACKBOARD_SKILL, target_is_directory=True)
+        except OSError:
+            continue
 
 # ── shared health-probe cache ────────────────────────────────────────────────
 # `Swarm._healthy_engines` shells a REAL one-turn CLI hello per engine on EVERY
@@ -306,11 +334,28 @@ class Swarm:
         self._budget_exhausted_kind: str | None = None
         self.worker_profiles = self._clean_worker_profiles(worker_profiles)
         self.runtime_profiles = self._clean_runtime_profiles(runtime_profiles)
-        # engine roster (deduped, order preserved) — now profile names. Legacy
-        # values like "claude" expand to every enabled claude profile.
+        # engine roster (deduped) — now profile names. Legacy values like "claude"
+        # expand to every enabled claude profile.
         if self.worker_profiles:
             roster = normalize_profile_roster(engines, self.worker_profiles) if engines else []
             self.engines = roster or profile_names(self.worker_profiles)
+            # Order the roster by each profile's (priority, name). The dispatcher
+            # (_pick_engine → _healthy_role_candidates) walks self.engines in order
+            # and prefers the first not-currently-running candidate, so roster
+            # ORDER == dispatch preference. Without this sort the priority field is
+            # dead on the dispatch path (the roster kept its assembly order, which
+            # for an explicit profile-name list is just declaration order). Sorting
+            # here makes priority authoritative for BOTH classic-race lineup and
+            # coordinator dispatch, and matches what the drag-drop composer writes
+            # (top card = lowest priority number = picked first). Stable + total:
+            # unknown names (defensive) sink to the end deterministically by name.
+            # coerce_nonneg_int (NOT `priority or 100`): priority 0 is a legal,
+            # MEANINGFUL value (highest precedence) reachable via hand-edited JSON /
+            # API import — `0 or 100` would silently demote it to the default and
+            # sink the top-priority profile. coerce also guards a non-int string.
+            _prio = {str(p["name"]): (coerce_nonneg_int(p.get("priority"), 100), str(p["name"]))
+                     for p in self.worker_profiles}
+            self.engines.sort(key=lambda e: _prio.get(e, (10**9, e)))
         else:
             roster = engines if engines else ["claude", "codex"]
             seen: set[str] = set()
@@ -320,7 +365,7 @@ class Swarm:
         for p in self.worker_profiles:
             self._profiles_by_engine.setdefault(p["engine"], []).append(p)
         for profiles in self._profiles_by_engine.values():
-            profiles.sort(key=lambda p: (int(p.get("priority") or 100), p["id"]))
+            profiles.sort(key=lambda p: (coerce_nonneg_int(p.get("priority"), 100), p["id"]))
         self._profile_rr: dict[str, int] = {}
         self._active_profile_by_solver: dict[str, str] = {}
         self._active_profile_role_by_solver: dict[str, str] = {}
@@ -672,7 +717,24 @@ class Swarm:
             except WorkerBudgetExhausted:
                 break
             transport = base_engine_for_profile(profile or engine)
-            label = f"cli-{transport}"
+            # solver_id labelling differs by mode:
+            #  - race mode: spec=None, so without help every same-base-engine racer
+            #    (e.g. 3 codex profiles each pinned to a different model) collapses
+            #    onto one solver_id "cli-codex" and their event lanes /
+            #    _active_profile_by_solver / account release maps overwrite each
+            #    other. Apply the same _label_seq scheme as _make_cli_worker (the
+            #    classic cli_race path bypasses it): first worker of a base engine
+            #    keeps the bare "cli-<engine>" id (winner bookkeeping / existing
+            #    tests), the rest get "-2", "-3", … . This is the bug fix.
+            #  - single mode: the lineup spec already supplies a distinct solver_id
+            #    label (preserved by passing solver_label=None → spec.solver_id wins
+            #    in CliSolver). Don't override it.
+            if self.cli_race:
+                self._label_seq[transport] = self._label_seq.get(transport, 0) + 1
+                n = self._label_seq[transport]
+                label = f"cli-{transport}" if n == 1 else f"cli-{transport}-{n}"
+            else:
+                label = f"cli-{transport}"
             workdir = self._alloc_workdir(engine)
             container = self._container_for_engine(engine, profile)
             worker = CliSolver(
@@ -685,6 +747,7 @@ class Swarm:
                 web_access=self.web_access, kb=self.kb,
                 workdir=workdir,
                 lifecycle_scope="worker",
+                solver_label=label if self.cli_race else None,
                 container=container,
                 worker_env=self._runtime_env_for(transport, label, container=container, profile=profile),
             )
@@ -1473,6 +1536,16 @@ class Swarm:
         degrade-time drop is explainable, not silent. This is the slow part (a
         subprocess.run with a 60–150s timeout + retry); callers parallelize +
         cache around it."""
+        # When the coordinator runs INSIDE the web container (compose deploy), the
+        # engine CLI binary is NOT present here — it lives only in the worker image.
+        # Shelling a host-local hello fails with "binary not found on PATH" and the
+        # engine is wrongly dropped from the roster ("no available worker profile"),
+        # so no worker ever spawns. The real worker container has the CLI and does
+        # real auth on spawn; defer to it instead of false-failing here. Mirrors the
+        # dispatch precheck guard in profile_health.evaluate_profile_health.
+        from muteki.core.runtime_env import is_web_container
+        if is_web_container():
+            return True, "deferred to worker container"
         from muteki.solver.cli_driver import driver_for
         try:
             profile = self._profile_for_engine(name, role=role, advance=False)
@@ -1818,6 +1891,9 @@ class Swarm:
                 home_host.mkdir(parents=True, exist_ok=True)
             except OSError:
                 return env
+            _ensure_blackboard_skill_links(home_host)
+            from muteki.solver.container_exec import _chown_tree_to_worker
+            _chown_tree_to_worker(str(home_host))
             mapper = getattr(container, "to_container_path", None)
             if callable(mapper):
                 try:
@@ -1834,11 +1910,32 @@ class Swarm:
             runtime = self._runtime_for_engine(engine, profile)
             if runtime:
                 if self._container_unavailable and runtime["backend"] == "container":
+                    self._fail_if_container_required(engine)
                     return "local"
                 return runtime["backend"]
         if self._container_unavailable and self.worker_backend == "container":
+            self._fail_if_container_required(engine)
             return "local"
         return "container" if self.worker_backend == "container" else "local"
+
+    def _fail_if_container_required(self, engine: str) -> None:
+        """P2-v3: when the coordinator runs INSIDE the web container, a container
+        backend that has gone unavailable must NOT silently degrade to local — that
+        would launch a host-native agent CLI inside the web container (no tools,
+        wrong creds, broken isolation), violating the "web container ⇒ worker
+        container" invariant. Hard-fail the run instead so the operator sees the
+        real cause (docker socket unreachable / image missing / network name wrong)
+        rather than a subtly-wrong run. On a bare host this is a no-op and the
+        historical local fallback stands."""
+        if is_web_container():
+            raise RuntimeError(
+                f"container worker backend is unavailable for {engine!r} and this "
+                f"coordinator runs inside the web container — refusing to fall back "
+                f"to a host-native (local) worker (it would run with no tools / wrong "
+                f"credentials). Fix the container backend: check the docker socket "
+                f"mount, the worker image is pulled, and MUTEKI_CONTROL_BIND/"
+                f"MUTEKI_CONTROL_HOST + the compose network are set."
+            )
 
     def _note_engine_degraded(self, engine: str, reason: str, *, role: str) -> None:
         """An engine failed its dispatch-time health check and was dropped from the
@@ -1972,6 +2069,7 @@ class Swarm:
                 engine=engine, profile=profile,
                 reason="container worker_backend requires worker_root",
                 requested_backend="container")
+            self._fail_if_container_required(engine)  # P2-v3: no local fallback in-container
             return None
         try:
             from muteki.solver.container_exec import ensure_container
@@ -1997,6 +2095,7 @@ class Swarm:
                 engine=engine, profile=profile,
                 reason=f"container worker backend failed for {self.run_id}: {exc}",
                 requested_backend="container")
+            self._fail_if_container_required(engine)  # P2-v3: no local fallback in-container
             return None
         return self._container_handle
 

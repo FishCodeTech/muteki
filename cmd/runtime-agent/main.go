@@ -82,6 +82,16 @@ func main() {
 		s.token = s.readToken(tp)
 	}
 
+	// The host bind-mounts the workspace dir created by the (root) web process, so
+	// it lands here owned by root:root. The worker runs as kali and writes its cwd
+	// (codex app-server state, claude session/config, PoC files) DIRECTLY in the
+	// workspace root — a root-owned root makes every such write fail with EACCES
+	// ("could not create PATH aliases: Permission denied" for codex; a silent
+	// no-output for claude). Chown the workspace root to kali BEFORE seeding/working
+	// so the worker owns its own cwd. (seedWorkspaceDocs already chowns the files it
+	// writes; this fixes the directory the host handed us.)
+	s.chownWorkspaceRoot()
+
 	// Bootstrap the workspace tool-awareness files (坑 A): the host bind-mounts an
 	// (initially empty) workspace over /home/kali/workspace, shadowing anything baked
 	// there. We cp the baked /opt/muteki/{AGENTS,CLAUDE}.md in AFTER the mount so the
@@ -297,6 +307,26 @@ func (s *supervisor) readToken(path string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
+}
+
+// chownWorkspaceRoot makes the bind-mounted workspace directory owned by the kali
+// user the worker runs as. The host (root) created and mounted it root:root, which
+// would block every cwd write the worker CLI does. Best-effort: log and continue if
+// kali isn't resolvable or chown fails (e.g. unusual mount) — the worker may still
+// manage in some cases, and we don't want to abort the supervisor over it.
+func (s *supervisor) chownWorkspaceRoot() {
+	if kaliUID < 0 || kaliGID < 0 {
+		return
+	}
+	if err := os.MkdirAll(s.workspace, 0o755); err != nil {
+		log.Printf("chown workspace: mkdir %s: %v", s.workspace, err)
+		return
+	}
+	if err := os.Chown(s.workspace, kaliUID, kaliGID); err != nil {
+		log.Printf("chown workspace %s -> kali(%d:%d): %v", s.workspace, kaliUID, kaliGID, err)
+		return
+	}
+	log.Printf("chowned workspace %s to kali(%d:%d)", s.workspace, kaliUID, kaliGID)
 }
 
 func (s *supervisor) seedWorkspaceDocs() {

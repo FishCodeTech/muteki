@@ -2,8 +2,9 @@
 
 Topology (see docs/DESIGN_worker_image_clean_rebuild.md §8-9): the in-container
 supervisor does NOT listen — it DIALS this receiver. So the host runs ONE long-lived
-receiver (a TCP listener bound to 127.0.0.1, default :9100) that every run's
-supervisor connects into. Each supervisor sends a Hello {run_id, token}; we validate
+receiver (a TCP listener bound to MUTEKI_CONTROL_BIND, default 127.0.0.1:9100; the
+compose layout sets 0.0.0.0 so sibling worker containers can reach it) that every
+run's supervisor connects into. Each supervisor sends a Hello {run_id, token}; we validate
 the token against what `ensure_container` registered for that run, then keep the
 connection as a `_SupervisorLink` keyed by run_id.
 
@@ -37,6 +38,16 @@ DEFAULT_CONTROL_PORT = int(os.environ.get("MUTEKI_CONTROL_PORT", "9100"))
 # Desktop (mac/win); on Linux we add --add-host host.docker.internal:host-gateway.
 CONTROL_HOST_FROM_CONTAINER = os.environ.get(
     "MUTEKI_CONTROL_HOST", "host.docker.internal")
+# Address the receiver BINDS to. Default 127.0.0.1: the classic single-host
+# layout where the coordinator runs on the host and worker containers reach it
+# via host.docker.internal (Docker Desktop) or the bridge gateway. In the P2-v3
+# compose layout the coordinator runs INSIDE the web container and workers are
+# SIBLING containers on a shared compose network — a loopback bind there is
+# unreachable by siblings, so compose sets MUTEKI_CONTROL_BIND=0.0.0.0. Safe to
+# expose on a compose-internal network: every link is still gated by the
+# per-run Hello token (see _handle_hello), and the port is not published to the
+# host's public interface.
+DEFAULT_CONTROL_BIND = os.environ.get("MUTEKI_CONTROL_BIND", "127.0.0.1")
 
 
 class ControlError(RuntimeError):
@@ -281,8 +292,10 @@ class ControlReceiver:
     _instance: "Optional[ControlReceiver]" = None
     _instance_lock = threading.Lock()
 
-    def __init__(self, host: str = "127.0.0.1", port: int = DEFAULT_CONTROL_PORT):
-        self.host = host
+    def __init__(self, host: Optional[str] = None, port: int = DEFAULT_CONTROL_PORT):
+        # host=None → env-driven default (MUTEKI_CONTROL_BIND, normally 127.0.0.1;
+        # 0.0.0.0 in the compose layout). An explicit host always wins (tests).
+        self.host = host if host is not None else DEFAULT_CONTROL_BIND
         self.port = port
         self._tokens: dict[str, str] = {}             # run_id → expected token
         self._links: dict[str, _SupervisorLink] = {}  # run_id → live link

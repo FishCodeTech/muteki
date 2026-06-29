@@ -157,6 +157,196 @@ def test_engines_roster_deduped(challenge, tmp_path: Path) -> None:
     assert sw.engines == ["cursor", "claude", "codex"]
 
 
+# ── single-engine multi-instance: N same-engine profiles, distinct models ─────
+# (P1 §10: "drag out 3 codex, each pinned to a different model; race them
+# concurrently; dispatch later phases by priority".)
+
+def _codex_trio_profiles():
+    """Three codex profiles (same base engine), each a distinct model, with
+    priorities deliberately OUT of declaration order so an order-preserving
+    roster would NOT be priority-sorted. id == name (normalize copies one to the
+    other)."""
+    mk = lambda pid, model, prio: {
+        "id": pid, "name": pid, "engine": "codex", "runtime": "local",
+        "credential_account": "codex-main", "auth": "subscription",
+        "roles": ["race", "bootstrap", "explore", "review"],
+        "race": True, "max_running": 1, "priority": prio, "model": model,
+        "enabled": True,
+    }
+    # declaration order a,b,c but priorities 30,10,20 → priority order is b,c,a
+    return [mk("codex-a", "gpt-5.3", 30),
+            mk("codex-b", "gpt-5.5", 10),
+            mk("codex-c", "gpt-5.4", 20)]
+
+
+def _build_profile_race(challenge, tmp_path, profiles, *, healthy_base):
+    """Build a cli_race Swarm over worker_profiles and return _build_solvers().
+
+    NOTE: with profiles, _build_solvers' liveness check goes through
+    _probe_engine_health → driver_for(profile).health_detail. driver_for(profile)
+    returns a ProfileDriver that INHERITS health_detail from CliDriver (it doesn't
+    delegate to the DRIVERS-dict instance), so stubbing DRIVERS[...].health_detail
+    (as _cli_swarm does for bare engine names) would be BYPASSED and a real CLI
+    hello would run. So we stub at the swarm method level instead: the healthcheck
+    just consults the base-engine name against `healthy_base`."""
+    sandbox = SandboxManager(root=tmp_path / "sbx")
+    arts = ArtifactStore(root=tmp_path / "arts")
+    swarm = Swarm(
+        challenge, [ModelSpec(solver_id="seat", model="mock")],
+        llm=None, sandbox=sandbox, artifacts=arts,
+        executor="cli", cli_race=True, worker_profiles=profiles,
+    )
+    from muteki.solver.worker_profiles import base_engine_for_profile
+    def _stub_probe(name, role):
+        prof = swarm._profile_for_engine(name, role=role, advance=False)
+        base = base_engine_for_profile(prof or name)
+        ok = base in healthy_base
+        return (ok, "" if ok else f"down ({base})")
+    swarm._health_probe_ttl = 0
+    swarm._probe_engine_health = _stub_probe  # type: ignore[assignment]
+    return swarm._build_solvers()
+
+
+def test_cli_race_same_engine_trio_distinct_solver_ids(challenge, tmp_path: Path) -> None:
+    # THE BUG FIX (§10.8 Step 2): the classic cli_race path (_build_solvers,
+    # which bypasses _make_cli_worker) used to give every same-base-engine racer
+    # the same solver_id "cli-codex" → event lanes / account maps overwrite each
+    # other. Now each gets a unique id via the _label_seq scheme.
+    solvers = _build_profile_race(challenge, tmp_path,
+                                  _codex_trio_profiles(), healthy_base={"codex"})
+    # all three actually spawned, one worker per profile
+    assert len(solvers) == 3
+    assert all(s.driver.name == "codex" for s in solvers)
+    # distinct solver_ids — no collapse
+    ids = [s.solver_id for s in solvers]
+    assert len(set(ids)) == 3, ids
+    # first keeps the bare id (winner bookkeeping / back-compat), rest get -2/-3
+    assert set(ids) == {"cli-codex", "cli-codex-2", "cli-codex-3"}, ids
+    # each worker carries its profile's distinct model down to the driver
+    models = sorted(s.driver._model() for s in solvers)
+    assert models == ["gpt-5.3", "gpt-5.4", "gpt-5.5"], models
+
+
+def test_engines_roster_sorted_by_priority(challenge, tmp_path: Path) -> None:
+    # THE BUG FIX (§10.8 Step 3): self.engines drives dispatch order
+    # (_pick_engine walks it and prefers the first not-running candidate), so it
+    # must be priority-sorted. Declaration order is a,b,c but priorities are
+    # 30,10,20 → expect b(10), c(20), a(30).
+    sandbox = SandboxManager(root=tmp_path / "sbx")
+    arts = ArtifactStore(root=tmp_path / "arts")
+    sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
+               llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
+               worker_profiles=_codex_trio_profiles())
+    assert sw.engines == ["codex-b", "codex-c", "codex-a"], sw.engines
+    # race_engines (derived from self.engines when not given explicitly) inherits
+    # the priority order too.
+    assert sw.race_engines == ["codex-b", "codex-c", "codex-a"], sw.race_engines
+
+
+def test_pick_engine_honors_priority_order(challenge, tmp_path: Path) -> None:
+    # The priority sort only matters if the DISPATCHER actually honors it. This
+    # proves _pick_engine returns the priority-TOP instance when all are idle.
+    # NOTE the real semantics (§10.8 "语义澄清"): _running_count_for_candidate
+    # aggregates by BASE ENGINE, so once ANY codex instance runs, the remaining
+    # same-engine instances are NOT priority-distinguished (heterogeneity-first
+    # treats them as "the codex slot, already covered"). Priority is authoritative
+    # exactly when the contenders are idle — which is the all-idle pick below and
+    # the classic-race lineup order (test_engines_roster_sorted_by_priority).
+    sandbox = SandboxManager(root=tmp_path / "sbx")
+    arts = ArtifactStore(root=tmp_path / "arts")
+    sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
+               llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
+               worker_profiles=_codex_trio_profiles())
+    healthy = ["codex-a", "codex-b", "codex-c"]
+    # _pick_engine(running_engines, healthy, *, role)
+    # all idle → top priority (codex-b, prio 10) picked first
+    assert sw._pick_engine([], healthy, role="bootstrap") == "codex-b"
+    # all-idle pick is deterministic regardless of declaration order: priority wins
+    assert sw._pick_engine([], list(reversed(healthy)), role="bootstrap") == "codex-b"
+
+
+def test_priority_zero_is_highest_not_demoted(challenge, tmp_path: Path) -> None:
+    # REGRESSION (GPT-5.5 §10 impl review): `int(priority or 100)` turned a legal
+    # priority 0 (highest precedence, reachable via hand-edited JSON / API import —
+    # coerce_nonneg_int keeps 0) into 100, sinking the top-priority profile. The
+    # fix uses coerce_nonneg_int so 0 stays 0 and sorts FIRST.
+    mk = lambda pid, prio: {
+        "id": pid, "name": pid, "engine": "codex", "runtime": "local",
+        "credential_account": "codex-main", "auth": "subscription",
+        "roles": ["race", "bootstrap"], "race": True, "max_running": 1,
+        "priority": prio, "model": "gpt-5.5", "enabled": True,
+    }
+    sandbox = SandboxManager(root=tmp_path / "sbx")
+    arts = ArtifactStore(root=tmp_path / "arts")
+    # zero-prio declared LAST; must still sort first (not demoted to 100).
+    sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
+               llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
+               worker_profiles=[mk("codex-ten", 10), mk("codex-zero", 0)])
+    assert sw.engines == ["codex-zero", "codex-ten"], sw.engines
+
+
+def test_container_unavailable_falls_back_local_on_host(challenge, tmp_path: Path) -> None:
+    # P2-v3 BLOCKER-d: on a BARE HOST (not in the web container), an unavailable
+    # container backend keeps the historical silent fallback to a local worker.
+    sandbox = SandboxManager(root=tmp_path / "sbx")
+    arts = ArtifactStore(root=tmp_path / "arts")
+    sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
+               llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
+               worker_backend="container")
+    sw._container_unavailable = True
+    import muteki.swarm.swarm as swmod
+    # force host semantics regardless of where the test actually runs
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(swmod, "is_web_container", lambda: False)
+    try:
+        assert sw._backend_for_engine("codex") == "local"  # degrades, no raise
+    finally:
+        monkey.undo()
+
+
+def test_container_unavailable_hard_fails_in_web_container(challenge, tmp_path: Path) -> None:
+    # P2-v3 BLOCKER-d: INSIDE the web container, an unavailable container backend
+    # must HARD-FAIL — never silently launch a host-native CLI in the web container.
+    sandbox = SandboxManager(root=tmp_path / "sbx")
+    arts = ArtifactStore(root=tmp_path / "arts")
+    sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
+               llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
+               worker_backend="container")
+    sw._container_unavailable = True
+    import muteki.swarm.swarm as swmod
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(swmod, "is_web_container", lambda: True)
+    try:
+        with pytest.raises(RuntimeError, match="refusing to fall back"):
+            sw._backend_for_engine("codex")
+    finally:
+        monkey.undo()
+
+
+def test_engines_priority_sort_only_when_profiles(challenge, tmp_path: Path) -> None:
+    # GUARD: the priority sort is scoped to worker_profiles. A bare engine-name
+    # roster (no profiles) must keep its given order untouched — this is what
+    # test_engines_roster_deduped relies on and what the historical race lineup
+    # expects.
+    sandbox = SandboxManager(root=tmp_path / "sbx")
+    arts = ArtifactStore(root=tmp_path / "arts")
+    sw = Swarm(challenge, [ModelSpec(solver_id="seat", model="mock")],
+               llm=None, sandbox=sandbox, artifacts=arts, executor="cli",
+               engines=["cursor", "claude", "codex"])
+    assert sw.engines == ["cursor", "claude", "codex"]
+
+
+def test_cli_single_mode_preserves_lineup_label(challenge, tmp_path: Path) -> None:
+    # GUARD: the §10.8 Step 2 fix is race-mode-only. Single mode must still take
+    # its solver_id from the lineup spec (solver_label stays None), not get
+    # overridden to "cli-<engine>".
+    solvers = _cli_swarm(challenge, tmp_path, cli_race=False, healthy={"claude"},
+                         cli_engine="claude")
+    assert len(solvers) == 1
+    # the lineup ModelSpec passed by _cli_swarm has solver_id="seat"
+    assert solvers[0].solver_id == "seat", solvers[0].solver_id
+
+
 # ── _healthy_engines: silent-degrade NO LONGER silent ────────────────────────
 # An engine dropped from the roster by a dispatch-time health-check failure now
 # emits an `engine_degraded` blackboard delta (with the failure REASON) so the
@@ -3326,6 +3516,41 @@ def test_container_runtime_mismatch_records_degraded(challenge, tmp_path, monkey
     sw._container_for_engine("codex", off_profile)
     assert len(sw._runtime_degraded) > len(degraded_before), \
         "#11: a different requested runtime on the cached container must record degraded"
+
+
+def test_container_runtime_links_blackboard_skill_into_isolated_home(challenge, tmp_path, monkeypatch):
+    import muteki.solver.container_exec as container_exec
+
+    wroot = tmp_path / "workspace" / "workers"
+    wroot.mkdir(parents=True, exist_ok=True)
+    sw = _coordinator_swarm(
+        challenge, tmp_path, worker_backend="container", worker_root=wroot,
+    )
+    chowned = []
+    monkeypatch.setattr(
+        container_exec, "_chown_tree_to_worker",
+        lambda path: chowned.append(Path(path)),
+    )
+
+    class _FakeContainer:
+        def to_container_path(self, path: str) -> str:
+            return path.replace(str(tmp_path / "workspace"), "/home/kali/workspace")
+
+    env = sw._runtime_env_for("codex", "cli-codex", container=_FakeContainer())
+
+    assert env["HOME"] == "/home/kali/workspace/homes/cli-codex"
+    home = tmp_path / "workspace" / "homes" / "cli-codex"
+    assert chowned == [home]
+    for rel in (
+        ".claude/skills/muteki-blackboard",
+        ".agents/skills/muteki-blackboard",
+        ".codex/skills/muteki-blackboard",
+        ".cursor/skills-cursor/muteki-blackboard",
+        ".cursor/skills/muteki-blackboard",
+    ):
+        link = home / rel
+        assert link.is_symlink()
+        assert str(link.readlink()) == "/opt/muteki/muteki-blackboard"
 
 
 # ── review-policy sanitization ───────────────────────────────────────────────

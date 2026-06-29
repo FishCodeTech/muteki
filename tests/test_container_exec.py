@@ -16,6 +16,7 @@ import os
 
 import signal
 
+import muteki.solver.container_exec as cx
 from muteki.solver.container_exec import (
     CONTAINER_WORKSPACE,
     CONTAINER_CONTROL_DIR,
@@ -23,6 +24,7 @@ from muteki.solver.container_exec import (
     _containerize_argv,
     _ContainerProc,
     _DockerExecBackend,
+    _mount_source,
     ensure_container,
     run_cli_container,
     runtime_execs_for_run,
@@ -103,6 +105,19 @@ def test_worker_image_installs_blackboard_skill_for_all_engine_user_scopes():
     assert "/home/kali/.claude/skills/muteki-blackboard" in dockerfile
     assert "/home/kali/.agents/skills/muteki-blackboard" in dockerfile
     assert "/opt/muteki/muteki-blackboard/SKILL.md" in dockerfile
+
+
+def test_worker_images_wrap_package_managers_with_auto_sudo():
+    """Slim workers are intentionally light, but agents must be able to install
+    missing tools even when they forget to prefix apt/dpkg commands with sudo."""
+    repo = os.path.dirname(os.path.dirname(__file__))
+    for rel in ("docker/worker/Dockerfile", "docker/worker-slim/Dockerfile"):
+        dockerfile = open(os.path.join(repo, rel), encoding="utf-8").read()
+        assert "muteki-auto-sudo" in dockerfile
+        assert "/usr/local/bin/apt-get" in dockerfile
+        assert "/usr/local/bin/apt" in dockerfile
+        assert "/usr/local/bin/dpkg" in dockerfile
+        assert 'exec sudo -n "$real" "$@"' in dockerfile
 
 
 # ── legacy docker exec command shape (_DockerExecBackend fallback) ────────────
@@ -252,6 +267,89 @@ def test_ensure_container_rcp_mounts_workspace_control_and_accounts(monkeypatch,
     assert (acct / "API_KEY").stat().st_mode & 0o777 == 0o600
     proj_auth = projection / "codex-main" / "codex-home" / "auth.json"
     assert proj_auth.stat().st_mode & 0o002, "#14: codex auth.json writable in projection"
+
+
+# ── shared workspace is made kali-writable (blackboard readonly regression) ───
+# Bug: graph/shared_graph.db (the team board) is created root-owned host-side and
+# bind-mounted into the kali worker, so worker writes hit sqlite "readonly db".
+# ensure_container must chown the workspace tree to the worker uid first.
+
+def test_chown_tree_to_worker_noop_when_not_root(monkeypatch, tmp_path):
+    import muteki.solver.container_exec as ce
+    f = tmp_path / "graph" / "shared_graph.db"
+    f.parent.mkdir(parents=True)
+    f.write_text("db")
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)  # non-root
+    chowns = []
+    monkeypatch.setattr(os, "chown", lambda *a, **k: chowns.append(a))
+    ce._chown_tree_to_worker(str(tmp_path))
+    assert chowns == [], "non-root must not attempt chown (can't, and same uid anyway)"
+
+
+def test_chown_tree_to_worker_recurses_when_root(monkeypatch, tmp_path):
+    import muteki.solver.container_exec as ce
+    (tmp_path / "graph").mkdir()
+    (tmp_path / "graph" / "shared_graph.db").write_text("db")
+    (tmp_path / "winner.json").write_text("{}")
+    monkeypatch.setattr(os, "geteuid", lambda: 0)  # simulate root
+    chowned = {}
+    def fake_chown(path, uid, gid):
+        chowned[os.path.abspath(path)] = (uid, gid)
+    monkeypatch.setattr(os, "chown", fake_chown)
+    ce._chown_tree_to_worker(str(tmp_path))
+    db = os.path.abspath(str(tmp_path / "graph" / "shared_graph.db"))
+    assert db in chowned, "the shared board DB must be chowned to the worker uid"
+    assert chowned[db] == (ce._WORKER_UID, ce._WORKER_GID)
+    # the dir tree + sibling files are covered too
+    assert os.path.abspath(str(tmp_path)) in chowned
+    assert os.path.abspath(str(tmp_path / "graph")) in chowned
+
+
+def test_chown_tree_to_worker_does_not_follow_skill_symlinks(monkeypatch, tmp_path):
+    import muteki.solver.container_exec as ce
+    target = tmp_path / "image-skill"
+    target.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    link = home / "muteki-blackboard"
+    link.symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    chowned = []
+    lchowned = []
+    monkeypatch.setattr(os, "chown", lambda path, uid, gid: chowned.append(os.path.abspath(path)))
+    monkeypatch.setattr(os, "lchown", lambda path, uid, gid: lchowned.append(os.path.abspath(path)))
+
+    ce._chown_tree_to_worker(str(home))
+
+    assert os.path.abspath(str(home)) in chowned
+    assert os.path.abspath(str(link)) in lchowned
+    assert os.path.abspath(str(target)) not in chowned
+
+
+def test_ensure_container_chowns_workspace_to_worker(monkeypatch, tmp_path):
+    # End to end through ensure_container: a pre-existing root-owned board DB under
+    # the workspace gets chowned to the worker uid before the container comes up.
+    calls = []
+    import muteki.solver.container_exec as ce
+    monkeypatch.setattr(ce, "_docker", _fake_docker_factory(calls))
+    monkeypatch.setattr(ce, "_USE_DOCKEREXEC", False)
+    monkeypatch.setattr(ce, "_await_supervisor", lambda handle: None)
+    import muteki.solver.control_receiver as cr
+    class _FakeRcv:
+        def expect(self, run_id, token): pass
+    monkeypatch.setattr(cr.ControlReceiver, "instance", classmethod(lambda cls: _FakeRcv()))
+    ws = tmp_path / "run" / "workspace"
+    (ws / "graph").mkdir(parents=True)
+    (ws / "graph" / "shared_graph.db").write_text("db")  # pre-created (swarm bootstrap)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)  # simulate the root web process
+    chowned = []
+    monkeypatch.setattr(os, "chown", lambda p, u, g: chowned.append((os.path.abspath(p), u, g)))
+
+    ensure_container("run-cw", str(ws), image="img", network="bridge")
+
+    db = os.path.abspath(str(ws / "graph" / "shared_graph.db"))
+    assert any(p == db and (u, g) == (ce._WORKER_UID, ce._WORKER_GID) for p, u, g in chowned), \
+        "ensure_container must chown the shared board DB to the worker uid"
 
 
 def test_ensure_container_rcp_upgrades_none_network_to_bridge(monkeypatch, tmp_path):
@@ -410,3 +508,37 @@ def test_run_cli_container_dockerexec_dispatch(monkeypatch):
     assert res.runtime_status["backend"] == "container"
     assert res.runtime_status["status"] == "finished"
     assert res.runtime_status["container"] == "muteki-run-runtime"
+
+
+# ── P2-v3 BLOCKER-c: host-path translation for sibling-container mounts ────────
+
+def test_mount_source_identity_on_bare_host(monkeypatch):
+    # No MUTEKI_HOST_DATA_ROOT → identity (abspath), the historical behaviour.
+    monkeypatch.setattr(cx, "_HOST_DATA_ROOT", "")
+    monkeypatch.setattr(cx, "_CONTAINER_DATA_ROOT", "")
+    assert _mount_source("/some/abs/path") == "/some/abs/path"
+
+
+def test_mount_source_identity_mirror(monkeypatch):
+    # host root == container root (path mirrored at the SAME path) → identity.
+    monkeypatch.setattr(cx, "_HOST_DATA_ROOT", "/opt/muteki/data")
+    monkeypatch.setattr(cx, "_CONTAINER_DATA_ROOT", "/opt/muteki/data")
+    assert _mount_source("/opt/muteki/data/run-x/ws") == "/opt/muteki/data/run-x/ws"
+
+
+def test_mount_source_remaps_container_prefix_to_host(monkeypatch):
+    # container data root differs from host root → remap the prefix so the HOST
+    # daemon binds the real host path, not the (nonexistent) in-container path.
+    monkeypatch.setattr(cx, "_HOST_DATA_ROOT", "/opt/muteki/data")
+    monkeypatch.setattr(cx, "_CONTAINER_DATA_ROOT", "/app/data")
+    assert _mount_source("/app/data/run-x/ws") == "/opt/muteki/data/run-x/ws"
+    assert _mount_source("/app/data") == "/opt/muteki/data"
+
+
+def test_mount_source_outside_root_passes_through(monkeypatch):
+    monkeypatch.setattr(cx, "_HOST_DATA_ROOT", "/opt/muteki/data")
+    monkeypatch.setattr(cx, "_CONTAINER_DATA_ROOT", "/app/data")
+    # not under the mirrored root → pass through (best effort)
+    assert _mount_source("/elsewhere/x") == "/elsewhere/x"
+    # guard: /app/data2 must NOT match the /app/data prefix
+    assert _mount_source("/app/data2/y") == "/app/data2/y"

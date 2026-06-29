@@ -291,7 +291,7 @@ export function RunInspector({
   };
 
   return (
-    <aside className={`run-inspector lang-${lang} motion-inspector motion-shell-piece motion-run-enter`} aria-label={t("insp.run.title")}>
+    <aside className={`run-inspector lang-${lang} motion-inspector`} aria-label={t("insp.run.title")}>
       {degradedEvents.length > 0 && (
         <div className="insp-runtime-degraded" role="status">
           <Icon name="xCircle" size={14} />

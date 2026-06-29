@@ -87,7 +87,7 @@ Primary check: **`./init.sh`** (or `uv run pytest -q`). A change is done only wh
 | Per-track / per-mode prompts | inline in `muteki/solver/cli_solver.py` (`_EXEC_PROMPT`, `_EXPLORE_PROMPT`, …) |
 | Swarm + Insight Bus | `muteki/swarm/` (`swarm.py`, `insight_bus.py`, `models.py`) |
 | Shared evidence graph (event-sourced) | `muteki/swarm/shared_graph.py` |
-| Capability SDK (the agent's tools) | `muteki_kit/{web,crypto,forensics,misc,reverse,pwn}/` |
+| Worker tools | the shelled CLI agent's OWN in-container toolkit (bash/python/ghidra/pwntools/…) — Muteki does not ship a capability SDK |
 | Sandbox kernel | `muteki/sandbox/` |
 | Event spine / cost ledger / sessions | `muteki/core/` |
 | Frontends | `apps/web/` (FastAPI+SSE+Next.js), `apps/tui/` (Textual) |
@@ -99,7 +99,7 @@ Primary check: **`./init.sh`** (or `uv run pytest -q`). A change is done only wh
 ```bash
 ./run.sh tui                      # Textual TUI, mock stream (UI demo, no key)
 ./run.sh tui --swarm --key <k>    # TUI solving a real challenge (needs a key)
-./run.sh web                      # FastAPI backend (:8000, API-only) + Next UI (:3001)
+./run.sh web                      # FastAPI backend (:8000, API-only) + production Next UI (:3001)
 ./run.sh web --backend-only       # backend only (:8000)
 ```
 
@@ -108,10 +108,10 @@ API-only (serves the SSE / `/api` contract). The web UI's chat input *commands t
 swarm* (hint / redirect / focus / pause / resume / submit) through the HITL backend —
 but guidance is context, never a flag source (the provenance gate is unchanged).
 
-> Dev SSE gotcha: the Next dev proxy buffers Server-Sent-Events, so a live run can look
-> frozen until it ends. Point the browser at the backend directly with
-> `NEXT_PUBLIC_MUTEKI_API=http://127.0.0.1:8000`. A detached backend can also linger on
-> :8000 (EADDRINUSE) — `lsof -ti :8000` and kill it before reusing the port.
+`./run.sh web` intentionally uses `next build` + a production Next server, not
+`next dev`, so `/api` remains same-origin through the Next rewrite proxy. A detached
+backend can still linger on :8000 (EADDRINUSE) — `lsof -ti :8000` and kill it before
+reusing the port.
 
 ## Blackboard skill (worker coordination)
 

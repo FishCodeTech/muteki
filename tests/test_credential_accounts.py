@@ -140,7 +140,9 @@ def test_credential_account_store_masks_and_replaces_material(tmp_path):
         account_id="shared-main", engine="claude", secret="claude-secret")
     assert claude["account_id"] == "shared-main"
     assert claude["engine"] == "claude"
-    assert "claude-secret" not in repr(claude)
+    # Secrets are now ECHOED (operator opted into edit-in-place); the token is
+    # surfaced as details.secret_value so the UI can show/edit it.
+    assert claude["details"]["secret_value"] == "claude-secret"
 
     cursor = store.upsert_secret(
         account_id="shared-main", engine="cursor", secret="cursor-secret")
@@ -159,8 +161,11 @@ def test_credential_account_store_validates_codex_json(tmp_path):
     acct = store.upsert_secret(account_id="codex-main", engine="codex", secret='{"token":"x"}')
     assert acct["engine"] == "codex"
     assert acct["writable_state"] is True
-    assert acct["details"] == {"codex_home": True, "mutable_auth_home": True}
+    assert acct["details"]["codex_home"] is True
+    assert acct["details"]["mutable_auth_home"] is True
     assert "lease" not in acct["details"]
+    # codex echoes the auth.json contents so the UI can show/edit it
+    assert '"token":"x"' in acct["details"]["secret_value"]
 
 
 def test_invalid_update_does_not_destroy_existing_account(tmp_path):
@@ -183,7 +188,7 @@ def test_custom_endpoint_account_maps_to_engine_specific_env(tmp_path):
         base_url="https://api.deepseek.example/v1",
     )
     assert acct["engine"] == "api"
-    assert "deepseek-key" not in repr(acct)
+    assert acct["details"]["secret_value"] == "deepseek-key"   # echoed for edit
 
     codex = runtime_env_for_engine(
         "codex", account_root=root, account_id="deepseek-main", container=True)
@@ -224,6 +229,54 @@ def test_custom_endpoint_records_target_engine_for_binding(tmp_path):
     assert env["ANTHROPIC_API_KEY"] == "endpoint-key"
 
 
+def test_custom_endpoint_echoes_base_url_and_secret_for_editing(tmp_path):
+    """The panel echoes BOTH the base_url and the API key so the operator can see
+    and edit them in place (secrets are deliberately surfaced — see
+    _read_secret_value's security note). inspect() and list() agree."""
+    root = account_store_root(tmp_path)
+    store = CredentialAccountStore(root)
+    acct = store.upsert_secret(
+        account_id="deepseek-main", engine="api", secret="sk-super-secret",
+        base_url="https://api.deepseek.com/v1", target_engine="claude")
+
+    assert acct["details"]["base_url_value"] == "https://api.deepseek.com/v1"
+    assert acct["details"]["base_url"] is True
+    assert acct["details"]["secret_value"] == "sk-super-secret"
+    # inspect()/list() agree (list() echoes secrets for every account)
+    assert store.inspect("deepseek-main").details["secret_value"] == "sk-super-secret"
+    listed = [a for a in store.list() if a["account_id"] == "deepseek-main"][0]
+    assert listed["details"]["base_url_value"] == "https://api.deepseek.com/v1"
+    assert listed["details"]["secret_value"] == "sk-super-secret"
+
+
+def test_custom_endpoint_without_base_url_reports_empty_value(tmp_path):
+    """No BASE_URL on disk → empty value + false boolean (not a crash)."""
+    root = account_store_root(tmp_path)
+    store = CredentialAccountStore(root)
+    acct = store.upsert_secret(account_id="bare-main", engine="api", secret="k")
+    assert acct["details"]["base_url_value"] == ""
+    assert acct["details"]["base_url"] is False
+
+
+def test_secret_value_echoed_for_claude_and_cursor(tmp_path):
+    """Subscription token & cursor key are echoed as details.secret_value so the
+    UI can show/edit them. An empty/absent account exposes no secret_value."""
+    root = account_store_root(tmp_path)
+    store = CredentialAccountStore(root)
+
+    claude = store.upsert_secret(account_id="claude-main", engine="claude", secret="oauth-tok")
+    assert claude["details"]["secret_value"] == "oauth-tok"
+
+    cursor = store.upsert_secret(account_id="cursor-main", engine="cursor", secret="cur-key")
+    assert cursor["details"]["secret_value"] == "cur-key"
+
+    # an empty account (no material) has no secret_value key at all
+    (root / "ghost").mkdir()
+    ghost = store.inspect("ghost")
+    assert ghost is not None and ghost.present is False
+    assert "secret_value" not in (ghost.details or {})
+
+
 def test_custom_endpoint_without_target_engine_stays_api(tmp_path):
     """Back-compat: no target agent → engine "api" (legacy/programmatic accounts)."""
     root = account_store_root(tmp_path)
@@ -255,6 +308,83 @@ def test_resaving_account_clears_stale_engine_marker(tmp_path):
         account_id="claude-main", engine="claude", secret="oauth-token")
     assert not (root / "claude-main" / "ENGINE").exists()
     assert again["mode"] == "subscription_token"
+
+
+def test_blank_secret_edit_preserves_custom_endpoint_key(tmp_path):
+    """Metadata-only edit: re-saving a custom endpoint with a blank secret keeps the
+    stored API_KEY while updating base_url — the UI never reads the key back, so a
+    base_url change must not require re-pasting it."""
+    root = account_store_root(tmp_path)
+    store = CredentialAccountStore(root)
+    store.upsert_secret(
+        account_id="deepseek-main", engine="api", secret="kept-key",
+        base_url="https://old.example/v1", target_engine="claude")
+
+    edited = store.upsert_secret(
+        account_id="deepseek-main", engine="api", secret="",
+        base_url="https://new.example/v1")
+
+    base = root / "deepseek-main"
+    assert (base / "API_KEY").read_text(encoding="utf-8").strip() == "kept-key"
+    assert (base / "BASE_URL").read_text(encoding="utf-8").strip() == "https://new.example/v1"
+    # target_engine left blank on edit → preserved from the prior save.
+    assert edited["details"]["target_engine"] == "claude"
+    assert (base / "ENGINE").read_text(encoding="utf-8").strip() == "claude"
+
+
+def test_blank_secret_edit_preserves_target_engine_when_base_url_unchanged(tmp_path):
+    """Re-pointing only the target engine (claude→codex) with a blank secret and
+    blank base_url keeps both the key and the base_url."""
+    root = account_store_root(tmp_path)
+    store = CredentialAccountStore(root)
+    store.upsert_secret(
+        account_id="ep-main", engine="api", secret="kept",
+        base_url="https://x/v1", target_engine="claude")
+
+    edited = store.upsert_secret(
+        account_id="ep-main", engine="api", secret="", target_engine="codex")
+
+    base = root / "ep-main"
+    assert (base / "API_KEY").read_text(encoding="utf-8").strip() == "kept"
+    assert (base / "BASE_URL").read_text(encoding="utf-8").strip() == "https://x/v1"
+    assert edited["details"]["target_engine"] == "codex"
+
+
+def test_blank_secret_edit_preserves_claude_and_cursor_tokens(tmp_path):
+    """Blank-secret re-save of a subscription/cursor account keeps the token rather
+    than erroring on the required-secret guard."""
+    root = account_store_root(tmp_path)
+    store = CredentialAccountStore(root)
+
+    store.upsert_secret(account_id="claude-main", engine="claude", secret="oauth-x")
+    store.upsert_secret(account_id="claude-main", engine="claude", secret="")
+    assert (root / "claude-main" / "CLAUDE_CODE_OAUTH_TOKEN").read_text(
+        encoding="utf-8").strip() == "oauth-x"
+
+    store.upsert_secret(account_id="cursor-main", engine="cursor", secret="cur-x")
+    store.upsert_secret(account_id="cursor-main", engine="cursor", secret="")
+    assert (root / "cursor-main" / "CURSOR_API_KEY").read_text(
+        encoding="utf-8").strip() == "cur-x"
+
+
+def test_blank_secret_edit_preserves_codex_auth_json(tmp_path):
+    """Blank-secret re-save of a codex account keeps the stored auth.json."""
+    root = account_store_root(tmp_path)
+    store = CredentialAccountStore(root)
+    store.upsert_secret(account_id="codex-main", engine="codex", secret='{"token":"keep"}')
+    store.upsert_secret(account_id="codex-main", engine="codex", secret="")
+    auth = root / "codex-main" / "codex-home" / "auth.json"
+    assert '"keep"' in auth.read_text(encoding="utf-8")
+
+
+def test_blank_secret_on_new_account_still_errors(tmp_path):
+    """The preserve path must NOT weaken account creation: a blank secret with no
+    prior account on disk still raises the required-secret error."""
+    root = account_store_root(tmp_path)
+    store = CredentialAccountStore(root)
+    for engine in ("claude", "cursor", "api", "codex"):
+        with pytest.raises(ValueError):
+            store.upsert_secret(account_id=f"fresh-{engine}", engine=engine, secret="")
 
 
 def test_local_runtime_does_not_override_host_home(tmp_path):
@@ -823,3 +953,34 @@ def test_detect_system_login_never_raises_on_probe_failure(monkeypatch):
     monkeypatch.setattr(cli_driver, "_claude_oauth", _boom)
     assert ca.detect_system_login("claude", env={}) == "unknown"
     assert ca.detect_system_login("bogus-engine", env={}) == "unknown"
+
+
+# ── import-from-host codex auth (one-click re-auth after `codex login`) ───────
+
+def test_import_host_codex_auth_reads_host_file(tmp_path, monkeypatch):
+    """import_host_codex_auth reads the HOST ~/.codex/auth.json and upserts it into
+    the account store (the fix for: codex login refreshes the host file but the
+    container mounts the account COPY)."""
+    fake_home = tmp_path / "home"
+    (fake_home / ".codex").mkdir(parents=True)
+    (fake_home / ".codex" / "auth.json").write_text(
+        '{"tokens": {"access_token": "fresh-xyz"}, "last_refresh": "2026-06-26T14:11:00Z"}'
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    store = CredentialAccountStore(account_store_root(tmp_path))
+    acct = store.import_host_codex_auth("codex-main")
+    assert acct["account_id"] == "codex-main"
+    assert acct["present"] is True
+    # the account-store copy now holds the fresh host content
+    written = (account_store_root(tmp_path) / "codex-main" / "codex-home" / "auth.json").read_text()
+    assert "fresh-xyz" in written
+
+
+def test_import_host_codex_auth_missing_host_file_raises(tmp_path, monkeypatch):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    store = CredentialAccountStore(account_store_root(tmp_path))
+    with pytest.raises(ValueError, match="not found"):
+        store.import_host_codex_auth("codex-main")

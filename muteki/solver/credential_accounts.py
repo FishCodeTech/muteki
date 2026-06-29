@@ -106,7 +106,7 @@ class CredentialAccountStore:
                 present=True,
                 writable_state=False,
                 updated_at=updated,
-                details={"token_file": True},
+                details={"token_file": True, "secret_value": self._read_secret_value(base)},
             )
         if (base / "codex-home" / "auth.json").exists():
             return CredentialAccount(
@@ -116,7 +116,11 @@ class CredentialAccountStore:
                 present=True,
                 writable_state=True,
                 updated_at=updated,
-                details={"codex_home": True, "mutable_auth_home": True},
+                details={
+                    "codex_home": True,
+                    "mutable_auth_home": True,
+                    "secret_value": self._read_secret_value(base),
+                },
             )
         if (base / "CURSOR_API_KEY").exists():
             return CredentialAccount(
@@ -126,7 +130,7 @@ class CredentialAccountStore:
                 present=True,
                 writable_state=False,
                 updated_at=updated,
-                details={"api_key_file": True},
+                details={"api_key_file": True, "secret_value": self._read_secret_value(base)},
             )
         if (base / "API_KEY").exists():
             # A custom endpoint (API_KEY + BASE_URL) is engine-agnostic on disk —
@@ -135,6 +139,7 @@ class CredentialAccountStore:
             # it FOR, so the panel can bind/display it (claude/codex/cursor) instead
             # of an orphan "api". No marker → legacy/programmatic "api".
             target = self._read_target_engine(base)
+            base_url = self._read_base_url(base)
             return CredentialAccount(
                 account_id=account_id,
                 engine=target or "api",
@@ -144,7 +149,12 @@ class CredentialAccountStore:
                 updated_at=updated,
                 details={
                     "api_key_file": True,
-                    "base_url": (base / "BASE_URL").exists(),
+                    "base_url": bool(base_url),
+                    # base_url is non-sensitive config (a public host); secret_value
+                    # is the API key (see _read_secret_value's security note). Both
+                    # are echoed so the panel can show & edit them in place.
+                    "base_url_value": base_url,
+                    "secret_value": self._read_secret_value(base),
                     "custom_endpoint": True,
                     "target_engine": target or None,
                 },
@@ -176,24 +186,34 @@ class CredentialAccountStore:
         if engine not in {"claude", "codex", "cursor", "api"}:
             raise ValueError("engine must be claude, codex, cursor, or api")
 
+        # EDIT support: secrets are never read back to the UI, so an operator who
+        # only wants to change an endpoint's base_url / target_engine cannot
+        # re-supply the key. When the incoming secret is blank AND a matching
+        # account already exists on disk, fall back to the stored secret so the
+        # edit preserves it. _replace_account wipes the dir, so snapshot first.
+        prior = self._snapshot_material(account_id)
+
         if engine == "claude":
-            value = str(secret or "").strip()
+            value = str(secret or "").strip() or prior.get("CLAUDE_CODE_OAUTH_TOKEN", "")
             if not value:
                 raise ValueError("CLAUDE_CODE_OAUTH_TOKEN is required")
             base = self._replace_account(account_id)
             self._atomic_write(base / "CLAUDE_CODE_OAUTH_TOKEN", value + "\n")
         elif engine == "cursor":
-            value = str(secret or "").strip()
+            value = str(secret or "").strip() or prior.get("CURSOR_API_KEY", "")
             if not value:
                 raise ValueError("CURSOR_API_KEY is required")
             base = self._replace_account(account_id)
             self._atomic_write(base / "CURSOR_API_KEY", value + "\n")
         elif engine == "api":
-            value = str(secret or "").strip()
+            value = str(secret or "").strip() or prior.get("API_KEY", "")
             if not value:
                 raise ValueError("API_KEY is required")
-            b = str(base_url or "").strip()
-            te = str(target_engine or "").strip().lower()
+            # base_url / target_engine: a blank field on edit keeps the stored
+            # value (the UI sends "" when the operator didn't touch it). An
+            # explicit clear isn't expressible here, and isn't needed by the panel.
+            b = str(base_url or "").strip() or prior.get("BASE_URL", "")
+            te = str(target_engine or "").strip().lower() or prior.get("ENGINE", "")
             if te and te not in {"claude", "codex", "cursor"}:
                 raise ValueError("target_engine must be claude, codex, or cursor")
             base = self._replace_account(account_id)
@@ -206,7 +226,7 @@ class CredentialAccountStore:
             if te:
                 self._atomic_write(base / "ENGINE", te + "\n")
         else:
-            value = str(codex_auth_json or secret or "").strip()
+            value = str(codex_auth_json or secret or "").strip() or prior.get("codex_auth_json", "")
             if not value:
                 raise ValueError("codex auth.json content is required")
             # Ensure it is at least syntactically JSON before persisting.
@@ -221,6 +241,32 @@ class CredentialAccountStore:
         acct = self.inspect(account_id)
         assert acct is not None
         return self._public(acct)
+
+    def import_host_codex_auth(self, account_id: str) -> dict[str, Any]:
+        """Refresh a codex account from the HOST's ~/.codex/auth.json.
+
+        `codex login` refreshes the host's ~/.codex/auth.json, but container
+        workers mount the account-store COPY — so a fresh host login never reaches
+        the account until it's re-imported. This reads the host file and upserts it
+        (one click from the settings page). Only meaningful on a bare host where
+        ~/.codex belongs to the operator; the caller guards on is_web_container().
+
+        Raises ValueError with an actionable message if the host file is missing
+        or invalid (the route maps it to a 400/404).
+        """
+        host_auth = Path.home() / ".codex" / "auth.json"
+        if not host_auth.exists():
+            raise ValueError(
+                f"host ~/.codex/auth.json not found ({host_auth}) — run `codex login` first"
+            )
+        try:
+            content = host_auth.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(f"could not read {host_auth}: {exc}") from exc
+        # upsert_secret validates it's JSON and writes codex-home/auth.json.
+        return self.upsert_secret(
+            account_id=account_id, engine="codex", codex_auth_json=content
+        )
 
     def _replace_account(self, account_id: str) -> Path:
         base = self.root / account_id
@@ -263,6 +309,50 @@ class CredentialAccountStore:
         return marker if marker in {"claude", "codex", "cursor"} else ""
 
     @staticmethod
+    def _read_base_url(base: Path) -> str:
+        """The custom endpoint's BASE_URL value, or "" if unset/unreadable.
+
+        Non-sensitive (a public host) — safe to surface so the UI can display and
+        edit it.
+        """
+        p = base / "BASE_URL"
+        if not p.exists():
+            return ""
+        try:
+            return p.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _read_secret_value(base: Path) -> str:
+        """The account's stored SECRET in plaintext, or "" if absent/unreadable.
+
+        ⚠️ SECURITY POSTURE: this deliberately returns the raw credential
+        (OAuth token / API key / codex auth.json) so the settings UI can ECHO it
+        into the edit form (operator request: "show it, let me edit it"). It is
+        therefore included in the JSON of the (password-authenticated) credential
+        endpoints and visible in the browser's Network tab. Callers that don't
+        want the plaintext must strip details.secret_value before forwarding.
+
+        For codex the value is the auth.json contents (the form edits it as JSON);
+        for the other engines it's the single-line token/key.
+        """
+        for rel in ("CLAUDE_CODE_OAUTH_TOKEN", "CURSOR_API_KEY", "API_KEY"):
+            p = base / rel
+            if p.exists():
+                try:
+                    return p.read_text(encoding="utf-8").strip()
+                except OSError:
+                    return ""
+        codex_auth = base / "codex-home" / "auth.json"
+        if codex_auth.exists():
+            try:
+                return codex_auth.read_text(encoding="utf-8").strip()
+            except OSError:
+                return ""
+        return ""
+
+    @staticmethod
     def _updated_at(path: Path) -> float | None:
         try:
             newest = path.stat().st_mtime
@@ -296,6 +386,32 @@ class CredentialAccountStore:
             path.chmod(0o600)
         except OSError:
             pass
+
+    def _snapshot_material(self, account_id: str) -> dict[str, str]:
+        """Read an existing account's stored secrets/markers before a rewrite.
+
+        Returns a dict keyed by the on-disk filename (plus the synthetic key
+        ``codex_auth_json``) holding the trimmed prior values, or empty strings
+        for anything absent. Used so a metadata-only edit (blank secret) can fall
+        back to the stored credential instead of erroring or wiping it. Never
+        raises — a fresh/unreadable account simply yields blanks.
+        """
+        base = self.root / account_id
+        out: dict[str, str] = {}
+        for rel in ("CLAUDE_CODE_OAUTH_TOKEN", "CURSOR_API_KEY", "API_KEY", "BASE_URL", "ENGINE"):
+            p = base / rel
+            try:
+                out[rel] = p.read_text(encoding="utf-8").strip() if p.exists() else ""
+            except OSError:
+                out[rel] = ""
+        codex_auth = base / "codex-home" / "auth.json"
+        try:
+            out["codex_auth_json"] = (
+                codex_auth.read_text(encoding="utf-8").strip() if codex_auth.exists() else ""
+            )
+        except OSError:
+            out["codex_auth_json"] = ""
+        return out
 
     @staticmethod
     def _clear_account_material(base: Path) -> None:

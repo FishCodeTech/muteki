@@ -81,8 +81,92 @@ _CONTAINER_BIN = {
 }
 
 
+# P2-v3 BLOCKER-c: when the coordinator runs INSIDE the web container, a
+# `docker run --mount source=<abspath>` is interpreted by the HOST daemon (the
+# worker is a SIBLING container on the host's docker, reached via the mounted
+# socket). An abspath computed inside the web container (e.g. /app/data/run-x)
+# does not exist on the host, so the bind silently mounts an empty dir and the
+# worker can't read the workspace. The compose contract (decision #2): the host
+# data root is bind-mounted into the web container, and these env vars name both
+# sides so we can translate a container path back to the host path for the mount:
+#   MUTEKI_HOST_DATA_ROOT      — the host's real path (e.g. /opt/muteki/data)
+#   MUTEKI_CONTAINER_DATA_ROOT — where it's mounted in the web container
+#                                (default: same as host root → identity mirror)
+# Unset (bare host) → identity, no translation.
+_HOST_DATA_ROOT = (os.environ.get("MUTEKI_HOST_DATA_ROOT") or "").strip()
+_CONTAINER_DATA_ROOT = (os.environ.get("MUTEKI_CONTAINER_DATA_ROOT") or _HOST_DATA_ROOT).strip()
+
+# The worker runs as the image's `kali` user (uid:gid 1001:1001 — see the slim &
+# Kali Dockerfiles). The run workspace is created HOST-side by the (root) web
+# process and bind-mounted at /home/kali/workspace, so it lands root-owned and
+# the kali worker can't WRITE it. The runtime_agent chowns each per-worker HOME +
+# cwd, but the SHARED state created before/outside a worker spawn — most importantly
+# graph/shared_graph.db, the team blackboard — stays root:root 0644, so a worker's
+# `blackboard.py write_fact` hits "attempt to write a readonly database" (every
+# engine that reaches for the live board: claude via the skill, codex via raw
+# sqlite). Chown the workspace tree to the worker uid when we bring the container
+# up so the shared board (and any pre-created file under the mount) is writable.
+_WORKER_UID = int(os.environ.get("MUTEKI_WORKER_UID", "1001"))
+_WORKER_GID = int(os.environ.get("MUTEKI_WORKER_GID", "1001"))
+
+
+def _chown_tree_to_worker(root: str) -> None:
+    """Best-effort recursive chown of a host dir tree to the worker uid:gid so the
+    bind-mounted `kali` worker can write shared state (the blackboard DB lives here).
+    No-op when we're not root (bare-host dev: the web process already owns it and
+    runs the worker as itself) or the path is missing. Never raises — a failed
+    chown must not break the run; the worst case is the pre-existing readonly bug."""
+    try:
+        if os.geteuid() != 0:  # not root → can't chown, and don't need to (same uid)
+            return
+    except AttributeError:  # no geteuid (non-POSIX) — nothing to do
+        return
+    def _chown_one(path: str) -> None:
+        try:
+            if os.path.islink(path):
+                lchown = getattr(os, "lchown", None)
+                if callable(lchown):
+                    lchown(path, _WORKER_UID, _WORKER_GID)
+                return
+            os.chown(path, _WORKER_UID, _WORKER_GID)
+        except OSError:
+            pass  # one stubborn entry shouldn't abort the whole sweep
+
+    try:
+        _chown_one(root)
+        for dirpath, dirnames, filenames in os.walk(root):
+            for name in dirnames + filenames:
+                _chown_one(os.path.join(dirpath, name))
+    except OSError:
+        pass
+
+
+def _mount_source(path: str) -> str:
+    """Translate a coordinator-visible path into the path the HOST docker daemon
+    should bind-mount. Identity unless MUTEKI_HOST_DATA_ROOT is set AND `path` is
+    under MUTEKI_CONTAINER_DATA_ROOT (the mirrored data volume)."""
+    ap = os.path.abspath(path)
+    if not _HOST_DATA_ROOT:
+        return ap
+    croot = os.path.abspath(_CONTAINER_DATA_ROOT)
+    hroot = os.path.abspath(_HOST_DATA_ROOT)
+    if croot == hroot:
+        return ap  # identity mirror — container path already IS the host path
+    # remap the prefix; require a real path boundary so /app/data2 isn't matched
+    if ap == croot:
+        return hroot
+    if ap.startswith(croot + os.sep):
+        return hroot + ap[len(croot):]
+    # path is outside the mirrored root — pass through (best effort; logged upstream)
+    return ap
+
+
 def _docker(*args: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
-    return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout)
+    # encoding=utf-8/errors=replace (P2-v3): docker/agent output is UTF-8; without
+    # an explicit encoding text=True decodes by the host's locale (cp1252/cp936 on
+    # Windows), corrupting non-ASCII output / the JSON event stream.
+    return subprocess.run(["docker", *args], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=timeout)
 
 
 def _safe(run_id: str) -> str:
@@ -258,6 +342,13 @@ def ensure_container(run_id: str, host_workspace: str, *,
     find it running and reuse it. Only the run workspace is bind-mounted (plus the
     control-socket dir and the account projection)."""
     os.makedirs(host_workspace, exist_ok=True)
+    # Make the shared workspace (incl. the already-created graph/shared_graph.db
+    # team board) writable by the kali worker uid — it's created root-owned here
+    # and bind-mounted into the worker, which runs as kali. Without this the board
+    # is read-only to workers (sqlite "attempt to write a readonly database").
+    # This runs before the FIRST worker spawns; the DB is created earlier (swarm
+    # bootstrap), so a recursive chown of the tree covers it. Best-effort.
+    _chown_tree_to_worker(host_workspace)
     mount_account_root = account_root
     if account_root:
         os.makedirs(account_root, exist_ok=True)
@@ -291,6 +382,16 @@ def ensure_container(run_id: str, host_workspace: str, *,
     # is still offline at the engine layer.
     if mode == "rcp" and str(network).strip() == "none":
         network = "bridge"
+    # P2-v3 BLOCKER-b: in the compose layout the coordinator runs inside the web
+    # container and workers are SIBLING containers; the supervisor reaches the
+    # receiver by the web service's network alias (MUTEKI_CONTROL_HOST=web), which
+    # only resolves if the worker joins the SAME compose network. MUTEKI_WORKER_NETWORK
+    # names that network (e.g. "muteki_net"); when set it overrides the per-profile
+    # network (the bridge/host/none UI control is meaningless across the socket). It
+    # does NOT override an explicit "host" request (offline/host-target runtimes).
+    _net_override = (os.environ.get("MUTEKI_WORKER_NETWORK") or "").strip()
+    if mode == "rcp" and _net_override and str(network).strip() != "host":
+        network = _net_override
     host_net = str(network).strip() == "host"
     control_dir: Optional[str] = None
     token = ""
@@ -346,12 +447,12 @@ def ensure_container(run_id: str, host_workspace: str, *,
             "--network", network,
             "--tmpfs", "/tmp:rw,exec,size=2g",
             "--mount",
-            f"type=bind,source={os.path.abspath(host_workspace)},target={CONTAINER_WORKSPACE}",
+            f"type=bind,source={_mount_source(host_workspace)},target={CONTAINER_WORKSPACE}",
         ]
         if mode == "rcp" and control_dir:
             run_cmd += [
                 "--mount",
-                f"type=bind,source={os.path.abspath(control_dir)},target={CONTAINER_CONTROL_DIR}",
+                f"type=bind,source={_mount_source(control_dir)},target={CONTAINER_CONTROL_DIR}",
             ]
             # The supervisor dials OUT to host.docker.internal. On Docker Desktop that
             # DNS resolves to the host automatically; on a Linux host it does NOT, so
@@ -374,7 +475,7 @@ def ensure_container(run_id: str, host_workspace: str, *,
             # the raw host store is NEVER mounted here — only its projection is.
             run_cmd += [
                 "--mount",
-                f"type=bind,source={os.path.abspath(handle.account_root)},target={CONTAINER_ACCOUNTS_ROOT}",
+                f"type=bind,source={_mount_source(handle.account_root)},target={CONTAINER_ACCOUNTS_ROOT}",
             ]
         if mode == "dockerexec":
             run = _docker(*run_cmd, image, "sleep", "infinity", timeout=60)
@@ -694,7 +795,8 @@ class _DockerExecBackend:
         t0 = time.time()
         oom_before = _oom_kill_count(handle.container)
         try:
-            proc = subprocess.run(full, capture_output=True, text=True, timeout=timeout + 15)
+            proc = subprocess.run(full, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=timeout + 15)
         except subprocess.TimeoutExpired as e:
             _docker("exec", handle.container, "pkill", "-KILL", "-f", f"muteki_wtag_{tag}",
                     timeout=15)
@@ -744,7 +846,7 @@ class _DockerExecBackend:
         t0 = time.time()
         oom_before = _oom_kill_count(handle.container)
         client = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                  text=True, bufsize=1)
+                                  text=True, encoding="utf-8", errors="replace", bufsize=1)
         proc = _ContainerProc(handle.container, tag, client, runtime_record=rec)
         if on_proc is not None:
             try:

@@ -18,10 +18,17 @@ import json
 from pathlib import Path
 from typing import Any, Optional
 
+from muteki.core.runtime_env import is_web_container
 from muteki.solver.worker_profiles import (
     VALID_BASE_ENGINES,
     normalize_profile_roster,
     normalize_worker_profiles,
+    resolve_seat_ref,
+)
+from muteki.solver.identity_model import (
+    migrate_legacy_config,
+    seats_to_legacy_profiles,
+    is_legal_combo,
 )
 
 VALID_ENGINES = VALID_BASE_ENGINES
@@ -93,6 +100,63 @@ DEFAULT_WORKER_PROFILES = [
      "enabled": True},
 ]
 DEFAULT_ENGINES = [p["name"] for p in DEFAULT_WORKER_PROFILES]
+
+
+def resolve_worker_backend(
+    *,
+    request_backend: Any = None,
+    config_backend: Any = None,
+    env_backend: Any = None,
+    default_backend: str = DEFAULT_WORKER_BACKEND,
+    in_web_container: bool,
+) -> str:
+    """THE single backend resolver. Every caller (dispatch precheck, settings
+    health endpoints, config read/write) routes through this so they can never
+    disagree on the effective backend — a disagreement was a false-green axis
+    (settings evaluated `local` while dispatch force-containerized).
+
+    Precedence: explicit request > stored config > env > default. Then:
+      - `container_dockerexec` is the CONTAINER transport selector; it still means
+        "container" for the backend choice, so normalize it.
+      - anything not in VALID_BACKENDS falls back to `local`.
+      - WEB-CONTAINER OVERRIDE (always applied, NOT optional): when this process
+        runs inside a container, `local` would spawn a host-native CLI inside the
+        web container (no tools, wrong creds). Force `container`. The override is
+        unconditional precisely so settings and dispatch are identical.
+    """
+    backend = request_backend or config_backend or env_backend or default_backend
+    if backend == "container_dockerexec":
+        backend = "container"
+    if backend not in VALID_BACKENDS:
+        backend = "local"
+    if backend == "local" and in_web_container:
+        return "container"
+    return backend
+
+
+def backend_for_profile(
+    profile: dict[str, Any],
+    *,
+    runtime_profiles: list[dict[str, Any]] | None,
+    worker_backend: str,
+    in_web_container: bool,
+) -> str:
+    """Effective backend for ONE profile. A profile names a `runtime` whose own
+    `backend` (e.g. `docker-web` → container, `local` → local) takes precedence
+    over the global `worker_backend`; the web-container override still applies on
+    top via resolve_worker_backend. This is the per-profile resolution dispatch
+    uses, so the settings page must use the SAME mapping or the badge can predict
+    a different backend than the run actually uses.
+    """
+    runtime_by_id = {
+        str(r.get("id")): r for r in (runtime_profiles or []) if isinstance(r, dict)
+    }
+    rt = runtime_by_id.get(str(profile.get("runtime") or ""))
+    rt_backend = str((rt or {}).get("backend") or "") if rt else ""
+    return resolve_worker_backend(
+        config_backend=rt_backend or worker_backend,
+        in_web_container=in_web_container,
+    )
 
 
 def _profile_kind(profile: dict[str, Any]) -> str:
@@ -167,7 +231,8 @@ def _ordinary_worker_roles(profile: dict[str, Any]) -> set[str]:
 
 class WorkerConfigStore:
     def __init__(self, root: str | Path = "sessions") -> None:
-        self.path = Path(root) / "_worker_config.json"
+        self._root = Path(root)
+        self.path = self._root / "_worker_config.json"
         self._data: dict[str, Any] = {}
         self._load()
 
@@ -181,6 +246,74 @@ class WorkerConfigStore:
         except (json.JSONDecodeError, OSError):
             # a corrupt config must never break startup — fall back to defaults
             self._data = {}
+        self._project_identity_to_legacy()
+
+    def _project_identity_to_legacy(self) -> None:
+        """If the on-disk config is NEW-shaped (seats/credentials/environments),
+        adapt it into the legacy worker_profiles/runtime_profiles `self._data`
+        carries, so the entire existing get() pipeline (5 foreign keys, backend
+        remap, drivers) keeps working with ZERO change. Legacy-shaped configs are
+        left untouched. Never raises."""
+        d = self._data
+        if not (isinstance(d.get("seats"), list) and d.get("seats")):
+            return
+        try:
+            seats = [s for s in d["seats"] if isinstance(s, dict)]
+            creds = [c for c in (d.get("credentials") or []) if isinstance(c, dict)]
+            envs = [e for e in (d.get("environments") or []) if isinstance(e, dict)]
+            # adapt seats → legacy worker_profiles for the scheduler/drivers.
+            d["worker_profiles"] = seats_to_legacy_profiles(seats, creds, envs)
+            # environments → runtime_profiles (same shape, just renamed concept).
+            if envs:
+                d["runtime_profiles"] = [
+                    {k: v for k, v in {
+                        "id": e.get("id"), "backend": e.get("backend"),
+                        "label": e.get("label"), "network": e.get("network"),
+                        "memory": e.get("memory"), "cpus": e.get("cpus"),
+                        "pids_limit": e.get("pids_limit"),
+                    }.items() if v not in (None, "", 0)}
+                    for e in envs
+                ]
+            # remap any seat-id/label foreign keys (engines[], review.engine, ...)
+            # to legacy profile names so the existing remap machinery resolves them.
+            alias = {str(s.get("label")): str(s.get("id")) for s in seats if s.get("label")}
+            id_to_name = {str(s.get("id")): str(s.get("id")) for s in seats}
+
+            def _to_name(ref: Any) -> Any:
+                sid = resolve_seat_ref(ref, seats=seats, alias_table=alias)
+                return sid if sid in id_to_name else ref
+
+            if isinstance(d.get("engines"), list):
+                d["engines"] = [_to_name(r) for r in d["engines"]]
+            if isinstance(d.get("race_engines"), list):
+                d["race_engines"] = [_to_name(r) for r in d["race_engines"]]
+            # The dispatch lineup MUST track the seats' enabled toggles — that's
+            # the only lineup control the seat UI exposes. A stale top-level
+            # `engines` (e.g. left over from a legacy config, or a seat that was
+            # since enabled/disabled) otherwise wins at get() (it short-circuits
+            # the "else enabled seats" fallback), so enabling two more seats in
+            # the UI left dispatch racing only the one stale engine. Reconcile:
+            # the lineup is exactly the enabled seats, preserving the order of any
+            # already named in `engines`, then appending newly-enabled ones.
+            enabled_ids = [str(s.get("id")) for s in seats
+                           if s.get("enabled", True) and s.get("id")]
+            enabled_set = set(enabled_ids)
+            prior = [r for r in (d.get("engines") or []) if r in enabled_set]
+            d["engines"] = prior + [sid for sid in enabled_ids if sid not in prior]
+            # race_engines is an optional SUBSET knob: keep only still-enabled
+            # seats (drop stale refs), but don't force-add — empty means "all".
+            if isinstance(d.get("race_engines"), list):
+                d["race_engines"] = [r for r in d["race_engines"] if r in enabled_set]
+            sp = d.get("stage_policy")
+            if isinstance(sp, dict):
+                race = sp.get("race")
+                if isinstance(race, dict) and isinstance(race.get("engines"), list):
+                    race["engines"] = [_to_name(r) for r in race["engines"]]
+                review = (sp.get("coordinator") or {}).get("review") if isinstance(sp.get("coordinator"), dict) else None
+                if isinstance(review, dict) and review.get("engine"):
+                    review["engine"] = _to_name(review["engine"])
+        except Exception:  # noqa: BLE001 — projection must never break startup
+            pass
 
     def _flush(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -188,6 +321,35 @@ class WorkerConfigStore:
         tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=2),
                        encoding="utf-8")
         tmp.replace(self.path)  # atomic on POSIX
+
+    def _account_modes(self) -> dict[str, str]:
+        """Map account_id → on-disk credential mode, so migration binds an empty
+        profile to its real default account as engine_key (not host-inherit).
+        Never raises — a missing/locked secrets store just yields {}."""
+        try:
+            from muteki.solver.credential_accounts import (
+                CredentialAccountStore, account_store_root,
+            )
+            store = CredentialAccountStore(account_store_root(self._root))
+            return {a["account_id"]: str(a.get("mode") or "") for a in store.list()}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def identity_model(self) -> dict[str, Any]:
+        """The NEW Credential/Seat/Environment view, authoritative when the on-disk
+        config is already new-shaped. Never raises. (When legacy-shaped, callers
+        should read get()['seats'/'credentials'/'environments'], which migrates.)"""
+        d = self._data
+        seats = [s for s in (d.get("seats") or []) if isinstance(s, dict)]
+        creds = [c for c in (d.get("credentials") or []) if isinstance(c, dict)]
+        envs = [e for e in (d.get("environments") or []) if isinstance(e, dict)]
+        seat_alias = {str(s.get("label")): str(s.get("id")) for s in seats if s.get("label")}
+        cred_alias = {str(c.get("secret_ref")): str(c.get("id"))
+                      for c in creds if c.get("secret_ref")}
+        return {
+            "credentials": creds, "seats": seats, "environments": envs,
+            "seat_alias": seat_alias, "credential_alias": cred_alias,
+        }
 
     def get(self) -> dict[str, Any]:
         """The current default config with everything filled in (never raises)."""
@@ -264,7 +426,7 @@ class WorkerConfigStore:
                     "start_workers": self._coerce_pos_int(
                         ov.get("start_workers"), len(cat_engines)),
                 }
-        return {
+        result = {
             "engines": engines,
             "start_workers": start_workers,
             "max_workers": max_workers,
@@ -281,6 +443,29 @@ class WorkerConfigStore:
             "worker_profiles": worker_profiles,
             "overrides": overrides,
         }
+        # ── additive: attach the new Credential/Seat/Environment view (Phase A
+        # iron rule — old fields above stay; new fields are added alongside so the
+        # legacy frontend keeps working while the new UI can consume these). ──
+        if isinstance(self._data.get("seats"), list) and self._data.get("seats"):
+            ident = self.identity_model()
+        else:
+            res = migrate_legacy_config(
+                worker_profiles=worker_profiles, runtime_profiles=runtime_profiles,
+                account_modes=self._account_modes(),
+            )
+            ident = {
+                "credentials": [c.to_dict() for c in res.credentials],
+                "seats": [s.to_dict() for s in res.seats],
+                "environments": [e.to_dict() for e in res.environments],
+                "seat_alias": res.seat_alias,
+                "credential_alias": res.credential_alias,
+            }
+        result["credentials"] = ident["credentials"]
+        result["seats"] = ident["seats"]
+        result["environments"] = ident["environments"]
+        result["seat_alias"] = ident["seat_alias"]
+        result["credential_alias"] = ident["credential_alias"]
+        return result
 
     def resolve(self, category: Optional[str]) -> dict[str, Any]:
         """The effective roster for a challenge category — the per-category
@@ -447,70 +632,144 @@ class WorkerConfigStore:
                         ov["start_workers"], f"{cat}.start_workers")
                 clean_ov[str(cat)] = entry
             self._data["overrides"] = clean_ov
+        # max_workers is a READ-ONLY derived value = sum of the eligible seats'
+        # max_running. Recompute it whenever the roster (per-seat capacity) or the
+        # dispatch lineup could have changed — i.e. worker_profiles or engines were
+        # supplied. (The frontend no longer sends an editable max_workers; a stale
+        # one in the payload is overwritten by the derived sum.) We deliberately do
+        # NOT mutate any seat's max_running, so an edited value never "reverts".
         self._sync_worker_counts(
             link_profile_capacity=(
-                max_workers is not None
-                or engines is not None
-                or (worker_profiles is not None and max_workers is not None)
+                worker_profiles is not None or engines is not None
             )
         )
+        # New-schema-on-disk (user decision): whenever the legacy worker_profiles
+        # change (the v2 frontend still saves in legacy shape), derive and persist
+        # the Credential/Seat/Environment model alongside, so disk carries the new
+        # shape as the source of truth. Reads then prefer the seats[] block.
+        if worker_profiles is not None or runtime_profiles is not None:
+            self._persist_identity_from_legacy()
+        self._flush()
+        return self.get()
+
+    def _persist_identity_from_legacy(self) -> None:
+        """Derive seats/credentials/environments from the current legacy
+        worker_profiles + runtime_profiles and write them into self._data, so the
+        on-disk config is the new shape. Never raises — a derivation failure just
+        leaves the legacy shape (still readable)."""
+        try:
+            # preserve any labels the user already set on existing seats (the
+            # legacy save path drops the label field, so re-deriving would reset
+            # them to "<engine> worker"); keyed by the stable seat id.
+            prior_labels = {
+                str(s.get("id")): str(s.get("label") or "")
+                for s in (self._data.get("seats") or []) if isinstance(s, dict)
+            }
+            cfg = self.get()  # normalized legacy view
+            res = migrate_legacy_config(
+                worker_profiles=cfg["worker_profiles"],
+                runtime_profiles=cfg["runtime_profiles"],
+                account_modes=self._account_modes(),
+            )
+            seats = []
+            for s in res.seats:
+                d = s.to_dict()
+                if prior_labels.get(d["id"]):
+                    d["label"] = prior_labels[d["id"]]
+                seats.append(d)
+            self._data["seats"] = seats
+            self._data["credentials"] = [c.to_dict() for c in res.credentials]
+            self._data["environments"] = [e.to_dict() for e in res.environments]
+            # The seats[] block is additive; we leave the legacy engines[]/
+            # review.engine foreign keys in their current (readable) form rather than
+            # rewriting them to seat ids on every save. Rationale: the legacy
+            # set_runtime_environment recipe path renames profiles by readable
+            # canonical id, and churning foreign keys to seat ids here would collide
+            # with it. resolve_seat_ref() bridges either form at the read boundaries
+            # (health route, scheduler), and _project_identity_to_legacy reconciles a
+            # new-shaped file on load. Stable seat ids still live in seats[].
+        except Exception:  # noqa: BLE001
+            pass
+
+    def set_identity_model(
+        self,
+        *,
+        seats: Any = None,
+        credentials: Any = None,
+        environments: Any = None,
+    ) -> dict[str, Any]:
+        """Persist the NEW Credential/Seat/Environment model to disk.
+
+        Validates the §3.7 hard constraint (container environment forbids a
+        system_inherit credential) and rejects an illegal combo with ValueError —
+        the save-time gate Codex specified, so an illegal config never persists.
+        After writing, re-projects to legacy worker_profiles so the in-memory
+        scheduler view stays consistent. Each arg optional; only provided ones
+        change. Never silently drops a bad value — it raises."""
+        if seats is not None:
+            if not isinstance(seats, list):
+                raise ValueError("seats must be a list")
+            self._data["seats"] = [s for s in seats if isinstance(s, dict)]
+        if credentials is not None:
+            if not isinstance(credentials, list):
+                raise ValueError("credentials must be a list")
+            self._data["credentials"] = [c for c in credentials if isinstance(c, dict)]
+        if environments is not None:
+            if not isinstance(environments, list):
+                raise ValueError("environments must be a list")
+            self._data["environments"] = [e for e in environments if isinstance(e, dict)]
+
+        # §3.7 legality gate: a seat on a container environment may not use a
+        # system_inherit credential (host login isn't mounted into the container).
+        cred_by_id = {str(c.get("id")): c for c in self._data.get("credentials") or []}
+        env_by_id = {str(e.get("id")): e for e in self._data.get("environments") or []}
+        for s in self._data.get("seats") or []:
+            cred = cred_by_id.get(str(s.get("credential_id"))) or {}
+            env = env_by_id.get(str(s.get("environment_id"))) or {}
+            kind = str(cred.get("kind") or "")
+            backend = str(env.get("backend") or "")
+            if kind and backend and not is_legal_combo(kind=kind, backend=backend):
+                label = s.get("label") or s.get("id")
+                raise ValueError(
+                    f"非法组合:Agent「{label}」在容器环境下使用了「系统登录」凭据。"
+                    f"容器不挂载宿主登录态,请改用引擎凭据或自定义端点。"
+                )
+        # keep the legacy projection in sync so get()/scheduler see the change.
+        self._project_identity_to_legacy()
         self._flush()
         return self.get()
 
     def _sync_worker_counts(self, *, link_profile_capacity: bool) -> None:
+        # Direction is roster→max (the operator owns per-seat capacity; the global
+        # `max_workers` ceiling is a READ-ONLY derived value = sum of the eligible
+        # seats' `max_running`). We NEVER mutate a seat's max_running here — that
+        # is what ballooned a stale single-seat lineup up to max_workers and made
+        # an edited value "revert" on save (Bug B). Instead max_workers tracks the
+        # roster sum, up AND down, so "3 workers each running 1 → max 3" always
+        # holds and editing any seat is reflected immediately.
+        if link_profile_capacity:
+            profiles = self._clean_worker_profiles(self._data.get("worker_profiles"))
+            backend = self._clean_backend(self._data.get("worker_backend"))
+            selected = _clean_engines_for_backend(
+                self._data.get("engines"), profiles, backend) or [
+                    _profile_name(p) for p in profiles if p.get("enabled", True)
+                ]
+            selected_set = set(selected)
+            eligible = [
+                p for p in profiles
+                if _profile_name(p) in selected_set and _ordinary_worker_roles(p)
+            ]
+            if eligible:
+                self._data["max_workers"] = sum(
+                    self._coerce_pos_int(p.get("max_running"), 1) for p in eligible)
+
+        # start_workers is still capped by the (possibly just-derived) ceiling.
         max_workers = self._coerce_pos_int(
             self._data.get("max_workers"), DEFAULT_MAX_WORKERS)
         start_workers = self._coerce_pos_int(
             self._data.get("start_workers"), len(DEFAULT_ENGINES))
         if start_workers > max_workers:
             self._data["start_workers"] = max_workers
-        if not link_profile_capacity:
-            return
-
-        profiles = self._clean_worker_profiles(self._data.get("worker_profiles"))
-        backend = self._clean_backend(self._data.get("worker_backend"))
-        selected = _clean_engines_for_backend(
-            self._data.get("engines"), profiles, backend) or [
-                _profile_name(p) for p in profiles if p.get("enabled", True)
-            ]
-        selected_set = set(selected)
-        eligible = [
-            p for p in sorted(
-                profiles,
-                key=lambda item: (int(item.get("priority") or 100), _profile_name(item)),
-            )
-            if _profile_name(p) in selected_set and _ordinary_worker_roles(p)
-        ]
-        if not eligible:
-            return
-
-        floor = len(eligible)
-        target = max(max_workers, floor)
-        total = sum(int(p.get("max_running") or 1) for p in eligible)
-        if total < target:
-            idx = 0
-            while total < target:
-                p = eligible[idx % len(eligible)]
-                p["max_running"] = int(p.get("max_running") or 1) + 1
-                total += 1
-                idx += 1
-        elif total > target:
-            shrink = sorted(
-                eligible,
-                key=lambda item: (int(item.get("priority") or 100), _profile_name(item)),
-                reverse=True,
-            )
-            idx = 0
-            while total > target and shrink:
-                p = shrink[idx % len(shrink)]
-                current = int(p.get("max_running") or 1)
-                if current > 1:
-                    p["max_running"] = current - 1
-                    total -= 1
-                if all(int(item.get("max_running") or 1) <= 1 for item in shrink):
-                    break
-                idx += 1
-        self._data["worker_profiles"] = profiles
 
     def set_runtime_environment(self, *, backend: str, runtime_id: str) -> dict[str, Any]:
         """Unify the run's runtime across ALL enabled worker profiles (DESIGN §5).
@@ -724,13 +983,21 @@ class WorkerConfigStore:
 
     @staticmethod
     def _clean_backend(value: Any) -> str:
-        if isinstance(value, str) and value in VALID_BACKENDS:
-            return value
-        return DEFAULT_WORKER_BACKEND
+        # Single source of truth for the effective backend (precedence + alias +
+        # fallback + the web-container override that coerces local→container so a
+        # stale/explicit "local" never reaches the swarm). No-op on a bare host.
+        return resolve_worker_backend(
+            config_backend=value if isinstance(value, str) else None,
+            in_web_container=is_web_container(),
+        )
 
     @staticmethod
     def _require_backend(value: Any) -> str:
         if isinstance(value, str) and value in VALID_BACKENDS:
+            if value == "local" and is_web_container():
+                raise ValueError(
+                    "worker_backend 'local' is not allowed when the web control "
+                    "plane runs inside a container — use 'container'")
             return value
         raise ValueError("worker_backend must be local or container")
 

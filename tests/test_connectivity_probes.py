@@ -114,19 +114,23 @@ def test_account_test_no_account_never_falls_back_to_host(tmp_path, monkeypatch)
 
 
 def test_account_test_local_uses_account_env(tmp_path, monkeypatch):
-    """backend=local resolves the ACCOUNT's env (not host) and runs health_detail."""
+    """backend=local resolves the ACCOUNT's env (not host) and runs health_detail.
+
+    Post-unification the kernel passes the resolved env EXPLICITLY via
+    health_detail(env=...) rather than mutating os.environ globally, so the probe
+    reads the account's token from the passed env, not the process environment.
+    """
     _register_claude(tmp_path)
     seen = {}
 
     import muteki.solver.cli_driver as cli_driver
 
     class _Drv:
-        def health_detail(self):
-            import os
-            seen["token"] = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+        def health_detail(self, env=None):
+            seen["token"] = (env or {}).get("CLAUDE_CODE_OAUTH_TOKEN")
             return True, ""
 
-    monkeypatch.setattr(cli_driver, "driver_for", lambda e: _Drv())
+    monkeypatch.setattr(cli_driver, "driver_for", lambda profile: _Drv())
     res = account_test.probe_account(
         engine="claude", account_id="claude-main",
         sessions_root=tmp_path, backend="local")
@@ -135,10 +139,80 @@ def test_account_test_local_uses_account_env(tmp_path, monkeypatch):
     assert seen["token"] == "tok-123"
 
 
+def _register_endpoint(tmp_path, *, target="claude", base="https://api.deepseek.com/anthropic"):
+    from muteki.solver.credential_accounts import CredentialAccountStore, account_store_root
+    store = CredentialAccountStore(account_store_root(tmp_path))
+    store.upsert_secret(account_id="ds", engine="api", secret="sk-test-key",
+                        base_url=base, target_engine=target)
+
+
+def test_account_test_custom_endpoint_probes_directly_not_via_cli(tmp_path, monkeypatch):
+    """A custom-endpoint account must be tested with a DIRECT curl probe (cheap,
+    model-agnostic), NOT by synthesizing a profile + shelling claude-code with a
+    wrong default model (which hangs against a third-party endpoint). We assert the
+    CLI driver is NEVER invoked and the HTTP status classifies correctly."""
+    _register_endpoint(tmp_path)
+    import muteki.solver.cli_driver as cli_driver
+
+    def _boom(*a, **k):
+        raise AssertionError("driver_for must NOT be called for a custom-endpoint test")
+    monkeypatch.setattr(cli_driver, "driver_for", _boom)
+
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, "400", "")  # endpoint reached, key ok
+    monkeypatch.setattr(account_test.subprocess, "run", fake_run)
+
+    res = account_test.probe_account(
+        engine="claude", account_id="ds", sessions_root=tmp_path, backend="local")
+    assert res["ok"] is True                         # 400 = auth+reachability proven
+    assert "curl" in seen["argv"][0]                 # used curl, not the CLI
+    # claude target → Anthropic Messages endpoint + x-api-key header
+    assert any("/v1/messages" in str(a) for a in seen["argv"])
+    assert any("x-api-key" in str(a) for a in seen["argv"])
+
+
+def test_account_test_custom_endpoint_bad_key_fails_fast(tmp_path, monkeypatch):
+    _register_endpoint(tmp_path, target="codex", base="https://api.deepseek.com")
+    monkeypatch.setattr(
+        account_test.subprocess, "run",
+        lambda argv, **k: subprocess.CompletedProcess(argv, 0, "401", ""))
+    res = account_test.probe_account(
+        engine="codex", account_id="ds", sessions_root=tmp_path, backend="local")
+    assert res["ok"] is False
+    assert res["layer"] == "auth"
+    assert "401" in res["detail"]
+
+
+def test_account_test_custom_endpoint_codex_uses_chat_completions(tmp_path, monkeypatch):
+    """A non-claude target must probe OpenAI Chat Completions ({base}/chat/completions
+    with a Bearer header), NOT codex's /responses (which DeepSeek 404s)."""
+    _register_endpoint(tmp_path, target="codex", base="https://api.deepseek.com")
+    seen = {}
+    monkeypatch.setattr(
+        account_test.subprocess, "run",
+        lambda argv, **k: (seen.__setitem__("argv", argv),
+                           subprocess.CompletedProcess(argv, 0, "200", ""))[1])
+    res = account_test.probe_account(
+        engine="codex", account_id="ds", sessions_root=tmp_path, backend="local")
+    assert res["ok"] is True
+    assert any("/chat/completions" in str(a) for a in seen["argv"])
+    assert not any("/responses" in str(a) for a in seen["argv"])
+    assert any("Authorization: Bearer" in str(a) for a in seen["argv"])
+
+
 def test_account_test_container_uses_docker_run_rm_not_local(tmp_path, monkeypatch):
     """backend=container must `docker run --rm` a one-shot container (operator
     requirement), mounting the account projection + a throwaway workspace, and
-    NEVER the bench tree. We assert the docker argv shape."""
+    NEVER the bench tree. We assert the docker argv shape.
+
+    Post-unification the container probe runs BOTH the plumbing docker-run AND a
+    host-local auth hello (the fix for the false-green where container test only
+    ran `--version`). We mock the auth layer so this test isolates the plumbing
+    argv; a dedicated test covers the auth layer firing.
+    """
     _register_claude(tmp_path)
     calls = []
 
@@ -149,7 +223,10 @@ def test_account_test_container_uses_docker_run_rm_not_local(tmp_path, monkeypat
         # the run --rm probe
         return subprocess.CompletedProcess(args, 0, "MUTEKI_OK\n", "")
 
+    import muteki.solver.cli_driver as cli_driver
     monkeypatch.setattr(account_test, "_docker", fake_docker)
+    monkeypatch.setattr(cli_driver, "driver_for", lambda profile: type(
+        "D", (), {"health_detail": lambda self, env=None: (True, "")})())
     res = account_test.probe_account(
         engine="claude", account_id="claude-main",
         sessions_root=tmp_path, backend="container")

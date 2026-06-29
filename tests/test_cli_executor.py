@@ -726,13 +726,35 @@ def test_driver_for_codex_endpoint_injects_provider_before_exec(monkeypatch):
     argv = drv.build_execute("PROMPT", None, web_access=False)
 
     exec_idx = argv.index("exec")
+    # `name` and `env_key` are mandatory: without `name` codex aborts config load
+    # ("provider name must not be empty") so the endpoint never works; `env_key`
+    # pins the bearer-token env var the Credential Account injection populates.
     assert argv[1:exec_idx] == [
         "-c", "model_provider=muteki",
+        "-c", "model_providers.muteki.name=muteki",
         "-c", "model_providers.muteki.base_url=https://api.deepseek.example/v1",
         "-c", "model_providers.muteki.wire_api=responses",
+        "-c", "model_providers.muteki.env_key=OPENAI_API_KEY",
         "-c", "model=deepseek-chat",
     ]
     assert argv[exec_idx:exec_idx + 2] == ["exec", "--json"]
+
+
+def test_driver_for_codex_keyed_profile_without_endpoint_still_injects_model(monkeypatch):
+    monkeypatch.setenv("MUTEKI_CODEX_BIN", "/usr/bin/codex")
+    drv = driver_for({
+        "name": "codex-main",
+        "engine": "codex",
+        "transport": "codex_cli",
+        "credential_mode": "api_key",
+        "model": "gpt-5.4",
+    })
+
+    argv = drv.build_execute("PROMPT", None, web_access=False)
+
+    assert "-c" not in argv
+    assert "--model" in argv
+    assert argv[argv.index("--model") + 1] == "gpt-5.4"
 
 
 def test_driver_for_claude_endpoint_healthcheck_posts_messages(monkeypatch):
@@ -2356,7 +2378,11 @@ def test_on_proc_kills_immediately_if_already_cancelled():
     s.cancel()                          # cancel BEFORE any proc exists
 
     class _FakeProc:
-        def __init__(self): self.killed = False; self.pid = 1
+        # pid 999999 doesn't exist, so _signal_proc's os.getpgid() raises and it
+        # falls through to proc.kill() — matching the sibling test above. (pid=1 is
+        # init: as root os.killpg(getpgid(1), SIGKILL) is permitted and returns early,
+        # so proc.kill() is never reached and the test fails ONLY when run as root.)
+        def __init__(self): self.killed = False; self.pid = 999999
         def kill(self): self.killed = True
 
     p = _FakeProc()
@@ -2985,6 +3011,15 @@ def test_extract_flag_rejects_found_flag_marker_placeholder():
     # even an explicit FOUND_FLAG= marker is rejected if it's a placeholder
     assert s._extract_flag("FOUND_FLAG=flag{...}") is None
     assert s._extract_flag("FOUND_FLAG=<flag>") is None
+
+
+def test_extract_flag_rejects_found_flag_marker_code_expression():
+    ch = Challenge(id="t", name="t", category="web",
+                   flag_format=r"[A-Za-z0-9_]{0,15}\{[^}]{1,200}\}")
+    s = _cli_solver(ch)
+    text = 'print(f"FOUND_FLAG={out3[i:j].decode()}")'
+    assert s._extract_flag(text) is None
+    assert s._extract_flags(text) == []
 
 
 def test_extract_need_inputs_parses_marker():

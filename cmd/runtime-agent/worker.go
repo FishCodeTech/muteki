@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"log"
 	"os"
 	"os/exec"
 	"strconv"
@@ -99,6 +100,50 @@ func startWorker(id string, spec *WorkerSpec) (*worker, <-chan Frame, error) {
 	}
 	// Worker reads nothing from stdin → instant EOF (codex hangs on an open stdin).
 	cmd.Stdin = nil
+
+	// Make the dirs the worker writes owned by the kali user it runs as. Both the
+	// worker's cwd (a per-worker dir like workspace/workers/cli-<seat>-N) AND its HOME
+	// (a per-worker workspace/homes/cli-<id>) are created HOST-side by the ROOT web
+	// process and bind-mount in owned root:root. The worker runs as kali and writes
+	// BOTH dirs — codex app-server state + PATH aliases, claude session/config, PoC
+	// files. A root-owned cwd/home makes every such write fail with EACCES, and the
+	// engine then exits SILENTLY producing ZERO output (codex first warns "could not
+	// create PATH aliases" then aborts the in-process app-server; claude exits 0 with
+	// no stdout at all). chownWorkspaceRoot only fixes the workspace root, not these
+	// per-worker subdirs. So chown the cwd and the (env-declared) HOME to kali right
+	// before spawning, and pre-create the engine state dirs — the raw-setuid spawn
+	// can't always mkdir them the way a `su` login shell can.
+	if kaliUID >= 0 && kaliGID >= 0 {
+		chownToKali := func(d string) {
+			if d == "" {
+				return
+			}
+			if err := os.MkdirAll(d, 0o755); err == nil {
+				if err := os.Chown(d, kaliUID, kaliGID); err != nil {
+					log.Printf("runtime-agent: chown %s -> kali(%d:%d): %v", d, kaliUID, kaliGID, err)
+				}
+			}
+		}
+		chownToKali(cmd.Dir)
+		home := "/home/kali"
+		for _, kv := range cmd.Env {
+			if strings.HasPrefix(kv, "HOME=") {
+				if v := kv[len("HOME="):]; v != "" {
+					home = v
+				}
+				break
+			}
+		}
+		chownToKali(home)
+		for _, sub := range []string{
+			"/.codex", "/.claude", "/.local", "/.local/bin",
+			"/.local/share", "/.config", "/.cache",
+		} {
+			if err := os.MkdirAll(home+sub, 0o775); err == nil {
+				_ = os.Chown(home+sub, kaliUID, kaliGID)
+			}
+		}
+	}
 
 	oomBefore := readOOMKill()
 	if err := cmd.Start(); err != nil {

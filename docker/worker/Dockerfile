@@ -44,6 +44,24 @@ RUN apt update && \
 RUN useradd -m -s /bin/bash kali && \
     echo "kali ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
+# 2b) Agent ergonomics: workers are supposed to be able to install missing tools on
+# demand. Models sometimes type `apt-get install ...` without `sudo`; because
+# /usr/local/bin is before /usr/bin, these wrappers transparently retry common
+# package-manager commands through NOPASSWD sudo when the caller is not root.
+RUN cat > /usr/local/sbin/muteki-auto-sudo <<'EOF' && \
+    chmod +x /usr/local/sbin/muteki-auto-sudo && \
+    ln -sf /usr/local/sbin/muteki-auto-sudo /usr/local/bin/apt-get && \
+    ln -sf /usr/local/sbin/muteki-auto-sudo /usr/local/bin/apt && \
+    ln -sf /usr/local/sbin/muteki-auto-sudo /usr/local/bin/dpkg
+#!/bin/sh
+name="$(basename "$0")"
+real="/usr/bin/$name"
+if [ "$(id -u)" = "0" ]; then
+  exec "$real" "$@"
+fi
+exec sudo -n "$real" "$@"
+EOF
+
 # 3) CTF supplements + RE/forensics/crypto heavyweights. Split so a single flaky
 #    mirror doesn't void the whole layer. (kali-linux-headless already pulls many of
 #    these; listing the ones we depend on makes the image self-documenting and pins
@@ -148,7 +166,10 @@ RUN chmod +x /opt/muteki/muteki-blackboard/blackboard.py && \
     chmod +x /usr/local/bin/blackboard.py && \
     install -d -o kali -g kali \
       /home/kali/.claude/skills/muteki-blackboard \
-      /home/kali/.agents/skills/muteki-blackboard && \
+      /home/kali/.agents/skills/muteki-blackboard \
+      /home/kali/.codex/skills/muteki-blackboard \
+      /home/kali/.cursor/skills-cursor/muteki-blackboard \
+      /home/kali/.cursor/skills/muteki-blackboard && \
     cp /opt/muteki/muteki-blackboard/SKILL.md \
       /home/kali/.claude/skills/muteki-blackboard/SKILL.md && \
     cp /opt/muteki/muteki-blackboard/blackboard.py \
@@ -157,15 +178,38 @@ RUN chmod +x /opt/muteki/muteki-blackboard/blackboard.py && \
       /home/kali/.agents/skills/muteki-blackboard/SKILL.md && \
     cp /opt/muteki/muteki-blackboard/blackboard.py \
       /home/kali/.agents/skills/muteki-blackboard/blackboard.py && \
-    chown -R kali:kali /home/kali/.claude /home/kali/.agents && \
+    cp /opt/muteki/muteki-blackboard/SKILL.md \
+      /home/kali/.codex/skills/muteki-blackboard/SKILL.md && \
+    cp /opt/muteki/muteki-blackboard/blackboard.py \
+      /home/kali/.codex/skills/muteki-blackboard/blackboard.py && \
+    cp /opt/muteki/muteki-blackboard/SKILL.md \
+      /home/kali/.cursor/skills-cursor/muteki-blackboard/SKILL.md && \
+    cp /opt/muteki/muteki-blackboard/blackboard.py \
+      /home/kali/.cursor/skills-cursor/muteki-blackboard/blackboard.py && \
+    cp /opt/muteki/muteki-blackboard/SKILL.md \
+      /home/kali/.cursor/skills/muteki-blackboard/SKILL.md && \
+    cp /opt/muteki/muteki-blackboard/blackboard.py \
+      /home/kali/.cursor/skills/muteki-blackboard/blackboard.py && \
+    chown -R kali:kali /home/kali/.claude /home/kali/.agents /home/kali/.codex /home/kali/.cursor && \
     chmod +x \
       /home/kali/.claude/skills/muteki-blackboard/blackboard.py \
-      /home/kali/.agents/skills/muteki-blackboard/blackboard.py
+      /home/kali/.agents/skills/muteki-blackboard/blackboard.py \
+      /home/kali/.codex/skills/muteki-blackboard/blackboard.py \
+      /home/kali/.cursor/skills-cursor/muteki-blackboard/blackboard.py \
+      /home/kali/.cursor/skills/muteki-blackboard/blackboard.py
 
 # 9) workspace + control dir; supervisor as ENTRYPOINT (PID1, replaces sleep infinity).
 RUN mkdir -p /home/kali/workspace && chown kali:kali /home/kali/workspace && \
     mkdir -p /run/muteki/control /run/muteki/accounts && \
     chown -R kali:kali /run/muteki
+
+# OCI version label so the settings "worker image check" (P2-v3) can compare the
+# pulled image's version against what the app expects. build.sh passes
+# --build-arg IMAGE_VERSION=<version>.
+ARG IMAGE_VERSION=dev
+LABEL org.opencontainers.image.title="muteki-worker" \
+      org.opencontainers.image.description="Kali muteki worker: full CTF toolchain + reverse-connector + 3 agent CLIs" \
+      org.opencontainers.image.version="${IMAGE_VERSION}"
 
 WORKDIR /home/kali/workspace
 # Supervisor runs as root (PID1) so it can drop workers to the kali uid; the worker

@@ -79,6 +79,13 @@ def is_placeholder_flag(flag: str) -> bool:
         # guard below precisely because `127`/`localhost` look "real").
         if "," in inner:
             return True
+        # Bare brace bodies that look like code expressions are not flags. The
+        # run-0835 false positive was the literal f-string source
+        # `{out3[i:j].decode()}`: it has letters+digits, so the old "looks_real"
+        # guard let it through even though the punctuation clearly comes from a
+        # Python expression, not a recovered token.
+        if re.search(r"[\[\]().:=+*/%$\\`'\"<>]", inner):
+            return True
         looks_real = (
             len(inner) >= 8
             and bool(re.search(r"[0-9]", inner))

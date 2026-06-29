@@ -66,11 +66,17 @@ export function ThreadRail({
   const [showArchived, setShowArchived] = useState(false);
   const activeRun = runs.find((r) => r.run_id === activeRunId);
   const activeFinished = !draftActive && !!activeRun?.finished;
+  // A not-yet-dispatched draft has no backend run, so no SSE stream is opened by
+  // design (see useRun). That's "idle", not "disconnected" — only show the red
+  // disconnected state when a real, unfinished run has actually lost its stream.
+  const footState = connected ? "online" : draftActive || activeFinished ? "idle" : "off";
   const footLabel = connected
     ? t("rail.swarmOnline")
     : activeFinished
       ? t("rail.runFinished")
-      : t("rail.disconnected");
+      : draftActive
+        ? t("rail.idle")
+        : t("rail.disconnected");
   // Client-side rail search/filter over the already-loaded runs (name / category /
   // status / run_id). Mirrors the search affordance the graph + blackboard already
   // have — the run list is the one busy surface that lacked one. Empty = show all.
@@ -422,7 +428,7 @@ export function ThreadRail({
         <div className="rail-foot">
           <div className="rail-foot-status">
             <span className="rail-foot-state">
-              <span className={`dot ${connected ? "" : "off"}`} />
+              <span className={`dot ${footState === "online" ? "" : footState}`} />
               <span>{footLabel}</span>
             </span>
             <button className="rail-settings-btn" onClick={onOpenSettings} title={t("settings.open")} aria-label={t("settings.open")}>
