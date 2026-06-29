@@ -342,6 +342,237 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             if graph is not None:
                 graph.close()
 
+    # ── BTW side-query worker (separate one-shot process, no swarm slot) ──────
+    # Independent route (not /hitl), no run.hitl queue, no InsightBus GUIDANCE,
+    # no bus.emit, no CostController, no CliSolver, no scheduler/max_worker slot.
+    # Each turn cold-starts one CLI worker process, passes the frontend transcript
+    # for multi-turn context, streams its answer, and kills it on disconnect or
+    # superseding /btw request. The process exits after the turn.
+    @app.post("/api/runs/{run_id}/btw")
+    async def btw(run_id: str, request: Request) -> Any:
+        from apps.web.drivers import (
+            _runtime_for_profile,
+            _standby_profile_for,
+        )
+        from apps.web.worker_config import backend_for_profile, resolve_worker_backend
+        from muteki.core.runtime_env import is_web_container
+        from muteki.solver.btw import (
+            BtwLimiter,
+            BtwWorkerPaths,
+            build_btw_worker_prompt,
+            run_meta_dict,
+            sanitize_transcript,
+            stream_btw_worker_deltas,
+        )
+        from muteki.solver.cli_driver import driver_for
+        from muteki.solver.credential_accounts import (
+            account_store_root,
+            runtime_env_for_engine,
+        )
+        from muteki.solver.worker_profiles import base_engine_for_profile
+
+        body = await _require_dict_body(request)
+        question = str(body.get("question") or "").strip()
+        if not question:
+            return JSONResponse({"error": "empty question"}, status_code=400)
+        transcript = sanitize_transcript(body.get("transcript"))
+        context_hint = str(body.get("context_hint") or "")
+
+        mgr: RunManager = app.state.manager
+        run = mgr.get(run_id)
+        if run is None:
+            # Unknown run → 404. Do NOT create a workspace for it.
+            return JSONResponse({"error": "unknown run"}, status_code=404)
+
+        # The worker needs a cwd, so /btw creates only a per-turn scratch dir under
+        # the run workspace. It never opens the graph read-write or joins the swarm.
+        safe = run_id.replace("/", "_").replace("..", "_")
+        root = mgr.workspace_dir(run_id).resolve()
+        graph_db = root / "graph" / "shared_graph.db"
+        jsonl_path = (mgr.sessions_root / f"{safe}.jsonl").resolve()
+        board_path = root / ".muteki_board.md"
+        winner_path = root / "winner.json"
+        arts_path = root / "arts"
+        uploads_path = (mgr.sessions_root / safe / "uploads").resolve()
+        challenge_name = run.name or run_id
+        challenge_category = (run.category or "web") or "web"
+        meta = run_meta_dict(run)
+        try:
+            deck_workers = getattr(run, "deck_workers", None)
+            if deck_workers:
+                meta["workers"] = list(deck_workers)
+        except Exception:
+            pass
+
+        # Lazy-init the per-app limiter (one BtwLimiter for all runs, keyed by run_id).
+        limiter: BtwLimiter = getattr(app.state, "btw_limiters", None)
+        if limiter is None:
+            limiter = BtwLimiter()
+            app.state.btw_limiters = limiter  # type: ignore[attr-defined]
+
+        winner: dict[str, Any] = {}
+        if winner_path.exists():
+            try:
+                raw = json.loads(winner_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    winner = raw
+            except Exception:
+                winner = {}
+        wc = mgr.worker_config.resolve(challenge_category)
+        worker_profiles = wc.get("worker_profiles") or []
+        runtime_profiles = wc.get("runtime_profiles") or []
+
+        def _pick_profile() -> tuple[dict[str, Any] | None, str]:
+            requested = str(
+                body.get("profile") or body.get("engine") or ""
+            ).strip()
+            review = ((wc.get("stage_policy") or {}).get("coordinator") or {}).get("review") or {}
+            candidates = [
+                requested,
+                str(review.get("engine") or "").strip(),
+                str(winner.get("engine") or "").strip(),
+            ]
+            for p in worker_profiles:
+                if isinstance(p, dict) and p.get("enabled", True):
+                    roles = p.get("roles") or []
+                    if "respond" in roles or "review" in roles:
+                        candidates.append(str(p.get("name") or p.get("id") or ""))
+            candidates.extend(str(e) for e in (wc.get("engines") or []))
+            candidates.extend(["claude", "codex"])
+            for cand in candidates:
+                if not cand:
+                    continue
+                profile = _standby_profile_for(cand, worker_profiles)
+                if profile is not None:
+                    return profile, cand
+                base = base_engine_for_profile(cand)
+                if base in ("claude", "codex", "cursor"):
+                    return None, base
+            return None, "claude"
+
+        async def stream():
+            # Register this generation as the run's active btw; cancel any prior.
+            this_task = asyncio.current_task()
+            if this_task is not None:
+                limiter.acquire(run_id, this_task)
+            profile, selected = _pick_profile()
+            transport = base_engine_for_profile(profile or selected)
+            worker_backend = resolve_worker_backend(
+                request_backend=body.get("worker_backend"),
+                config_backend=wc.get("worker_backend"),
+                env_backend=os.environ.get("MUTEKI_WORKER_BACKEND"),
+                in_web_container=is_web_container(),
+            )
+            backend = (
+                backend_for_profile(
+                    profile,
+                    runtime_profiles=runtime_profiles,
+                    worker_backend=worker_backend,
+                    in_web_container=is_web_container(),
+                )
+                if profile else worker_backend
+            )
+            runtime = _runtime_for_profile(profile, runtime_profiles)
+            container = None
+            account_root = account_store_root(mgr.sessions_root)
+            worker_root = root / "workers" / "_btw"
+            worker_root.mkdir(parents=True, exist_ok=True)
+            workdir = worker_root / f"{transport}-{int(time.time() * 1000)}"
+            workdir.mkdir(parents=True, exist_ok=True)
+            try:
+                if backend == "container":
+                    from muteki.solver.container_exec import (
+                        _chown_tree_to_worker,
+                        ensure_container,
+                    )
+
+                    container = await asyncio.to_thread(
+                        ensure_container,
+                        run_id,
+                        str(root),
+                        network=str(runtime.get("network") or "bridge"),
+                        memory=str(runtime.get("memory") or "") or None,
+                        cpus=str(runtime.get("cpus") or "") or None,
+                        pids_limit=int(runtime.get("pids_limit") or 0) or None,
+                        account_root=str(account_root),
+                    )
+                    await asyncio.to_thread(_chown_tree_to_worker, str(workdir))
+
+                def _worker_path(p: Path) -> str:
+                    if container is not None:
+                        mapper = getattr(container, "to_container_path", None)
+                        if callable(mapper):
+                            return str(mapper(str(p)))
+                    return str(p)
+
+                prompt = build_btw_worker_prompt(
+                    question=question,
+                    paths=BtwWorkerPaths(
+                        workspace=_worker_path(root),
+                        jsonl=_worker_path(jsonl_path),
+                        graph_db=_worker_path(graph_db),
+                        board=_worker_path(board_path),
+                        winner=_worker_path(winner_path),
+                        arts=_worker_path(arts_path),
+                        uploads=_worker_path(uploads_path),
+                    ),
+                    challenge_id=run_id,
+                    challenge_name=challenge_name,
+                    challenge_category=challenge_category,
+                    run_state=str(meta.get("state") or ""),
+                    context_hint=context_hint,
+                    transcript=transcript,
+                )
+                worker_env = runtime_env_for_engine(
+                    transport,
+                    account_root=account_root,
+                    account_id=(profile.get("credential_account") if profile else None),
+                    container=container is not None,
+                ).env
+                worker_env["MUTEKI_BTW_WORKER"] = "1"
+                worker_env["MUTEKI_BLACKBOARD_DB"] = ""
+                if profile:
+                    worker_env["MUTEKI_WORKER_PROFILE_ID"] = str(profile.get("id") or "")
+                    worker_env["MUTEKI_CREDENTIAL_ACCOUNT_ID"] = str(
+                        profile.get("credential_account") or ""
+                    )
+                    if profile.get("model"):
+                        worker_env["MUTEKI_WORKER_MODEL"] = str(profile["model"])
+                if container is not None:
+                    home_host = root / "homes" / f"btw-{transport}"
+                    home_host.mkdir(parents=True, exist_ok=True)
+                    from muteki.solver.container_exec import _chown_tree_to_worker
+                    await asyncio.to_thread(_chown_tree_to_worker, str(home_host))
+                    mapper = getattr(container, "to_container_path", None)
+                    worker_env["HOME"] = (
+                        mapper(str(home_host)) if callable(mapper) else str(home_host)
+                    )
+                async for chunk in stream_btw_worker_deltas(
+                    driver=driver_for(profile or transport),
+                    prompt=prompt,
+                    cwd=str(workdir),
+                    timeout=_env_int("MUTEKI_BTW_WORKER_TIMEOUT", 240),
+                    env=worker_env,
+                    container=container,
+                    web_access=False,
+                    kb_access=False,
+                ):
+                    if await request.is_disconnected():
+                        break
+                    yield {"data": json.dumps({"delta": chunk}, ensure_ascii=False)}
+            except asyncio.CancelledError:
+                # limiter cancel or client disconnect — stop cleanly.
+                pass
+            except Exception as e:  # noqa: BLE001
+                yield {"data": json.dumps({"error": str(e)[:300]}, ensure_ascii=False)}
+            finally:
+                this_task = asyncio.current_task()
+                if this_task is not None:
+                    limiter.release(run_id, this_task)
+            yield {"data": json.dumps({"done": True}, ensure_ascii=False)}
+
+        return EventSourceResponse(stream(), ping=10)
+
     # cheap TTL cache so a polling deck doesn't re-probe every engine's --version
     # on each request (the probes are subprocess spawns). Codex' real-turn probe can
     # legitimately take minutes during websocket→HTTPS fallback, so keep a long UI

@@ -923,6 +923,49 @@ body.artifact-resizing, body.artifact-resizing * { cursor: col-resize !important
   margin-bottom: 14px; }
 .modal-x { background: transparent; border: 0; color: var(--dim); font-size: 15px; cursor: pointer; }
 .modal-x:hover { color: var(--bright); }
+
+/* ── BTW side-query observer drawer (read-only, isolated from workers) ── */
+.btw-btn { background: color-mix(in srgb, var(--accent) 14%, var(--panel)); color: var(--bright);
+  border: 1px solid var(--border2); border-radius: 8px; padding: 4px 10px; font-size: 11.5px;
+  font-weight: 700; letter-spacing: .04em; cursor: pointer; transition: background .12s ease, border-color .12s ease; }
+.btw-btn:hover { background: color-mix(in srgb, var(--accent) 26%, var(--panel)); border-color: var(--accent); }
+.btw-backdrop { justify-content: flex-end; align-items: stretch; }
+.btw-drawer { width: min(560px, 92vw); height: 100vh; max-height: 100vh; background: var(--panel);
+  border-left: 1px solid var(--border2); box-shadow: var(--shadow-pop); display: flex; flex-direction: column;
+  animation: mk-btw-in .18s cubic-bezier(.2,.8,.3,1); }
+@keyframes mk-btw-in { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+.btw-head { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--panel2) 60%, var(--panel)); }
+.btw-title { display: inline-flex; align-items: center; gap: 7px; color: var(--bright); font-weight: 700; font-size: 14px; }
+.btw-sub { color: var(--dim); font-size: 11px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.btw-spacer { flex: 1; }
+.btw-x { background: transparent; border: 1px solid transparent; border-radius: 7px; color: var(--dim);
+  width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+.btw-x:hover { color: var(--bright); border-color: var(--border2); background: var(--bg); }
+.btw-quick { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 16px; border-bottom: 1px solid var(--border); }
+.btw-quick-btn { background: var(--bg); border: 1px solid var(--border2); border-radius: 7px; color: var(--dim);
+  padding: 5px 10px; font-size: 11.5px; cursor: pointer; transition: all .12s ease; }
+.btw-quick-btn:hover:not(:disabled) { color: var(--bright); border-color: var(--accent); }
+.btw-quick-btn:disabled { opacity: .5; cursor: not-allowed; }
+.btw-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
+.btw-empty { color: var(--dim); font-size: 12.5px; line-height: 1.5; padding: 24px 8px; text-align: center; }
+.btw-msg { display: flex; flex-direction: column; gap: 4px; }
+.btw-msg-role { font-size: 10.5px; color: var(--dim); font-weight: 700; letter-spacing: .03em; }
+.btw-msg-body { font-size: 13px; line-height: 1.55; color: var(--bright); white-space: pre-wrap; word-wrap: break-word; }
+.btw-user .btw-msg-role { color: var(--accent); }
+.btw-assistant { background: color-mix(in srgb, var(--panel2) 50%, var(--panel)); border: 1px solid var(--border);
+  border-radius: 10px; padding: 10px 12px; }
+.btw-error { color: #e4575a; font-size: 12px; line-height: 1.5; padding: 8px 10px; border-radius: 7px;
+  background: color-mix(in srgb, #e4575a 10%, var(--panel)); border: 1px solid color-mix(in srgb, #e4575a 30%, var(--border)); }
+.btw-input-row { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); background: var(--panel); }
+.btw-input { flex: 1; resize: none; background: var(--bg); border: 1px solid var(--border2); border-radius: 8px;
+  color: var(--bright); font-size: 13px; line-height: 1.5; padding: 8px 10px; font-family: inherit; outline: none;
+  min-height: 44px; max-height: 120px; }
+.btw-input:focus { border-color: var(--accent); }
+.btw-input:disabled { opacity: .55; }
+.btw-send { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 0 16px;
+  font-size: 12.5px; font-weight: 700; cursor: pointer; transition: opacity .12s ease; align-self: stretch; }
+.btw-send:disabled { opacity: .4; cursor: not-allowed; }
 .worker-settings { width: min(1040px, calc(100vw - 48px)); max-width: none; max-height: min(88vh, 820px); padding: 0;
   overflow: hidden; display: flex; flex-direction: column; border-radius: 12px; }
 .worker-settings .modal-head { margin: 0; padding: 16px 18px 14px; border-bottom: 1px solid var(--border);
@@ -1314,6 +1357,7 @@ body.artifact-resizing, body.artifact-resizing * { cursor: col-resize !important
 .ws2-review { margin-top: 14px; border: 1px solid var(--border2); border-radius: 10px; padding: 12px; background: var(--panel); }
 .ws2-review-head { display: flex; align-items: center; gap: 10px; }
 .ws2-review-head b { color: var(--bright); font-size: 12.5px; }
+.ws2-review-note { margin: 10px 0 0; }
 .ws2-review-sub { margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border); margin-bottom: 0; }
 .ws2-pill { font-size: 10px; padding: 2px 8px; border-radius: 999px; letter-spacing: .04em;
   color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }

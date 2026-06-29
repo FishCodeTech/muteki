@@ -1,6 +1,6 @@
 {
   "name": "muteki-command-deck",
-  "version": "0.2.1",
+  "version": "0.2.3",
   "private": true,
   "description": "Project Muteki web command deck — a conversation-first frontend over the agent SSE stream with a live fact graph, blackboard, worker dock, and HITL controls.",
   "scripts": {

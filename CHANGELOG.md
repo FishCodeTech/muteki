@@ -2,6 +2,27 @@
 
 All notable public release changes are tracked here.
 
+## 0.2.3 - 2026-06-29
+
+### Added
+
+- Added the `/btw` side-query drawer to the web command deck for quick, local multi-turn Q&A over a run.
+- Added a worker-backed `/api/runs/{run_id}/btw` stream that starts a short-lived read-only CLI worker for each turn.
+- Added deterministic tests for `/btw` prompt construction, transcript handling, read-only graph access, and worker-slot isolation.
+- Documented in Worker Settings that `/btw` follows the configured Review worker by default.
+
+### Changed
+
+- `/btw` now reads run files, JSONL, shared graph state, winner snapshots, and artifacts through the worker instead of answering from a compressed summary.
+- `/btw` defaults to the configured Review worker when the frontend does not specify a profile, while still allowing explicit API overrides.
+- Release metadata, package versions, and worker build examples now point at `0.2.3`.
+
+### Fixed
+
+- Reduced `/btw` answer distortion by letting the side worker inspect source run evidence directly.
+- Kept `/btw` out of swarm scheduling, review concurrency, max-worker slots, graph writes, and run cost accounting.
+- Removed the redundant read-only explainer banner from the `/btw` drawer.
+
 ## 0.2.1 - 2026-06-29
 
 ### Added

@@ -320,3 +320,81 @@ class LLMClient:
             output_tokens=usage.get("completion_tokens", 0),
             model=body["model"],
         )
+
+    async def iter_chat_deltas(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        temperature: float = 0.3,
+        max_tokens: Optional[int] = 4000,
+        run_id: Optional[str] = None,
+        challenge_id: Optional[str] = None,
+        solver_id: Optional[str] = None,
+        emit: bool = False,
+        record_cost: bool = False,
+    ) -> "AsyncIterator[str]":
+        """Stream content deltas from a chat completion, yielding one string chunk
+        at a time. Designed for the read-only btw observer: by default it does NOT
+        emit REASONING_DELTA/TEXT_MESSAGE_DELTA to the run bus and does NOT record
+        cost into the run CostController — so a btw Q&A never pollutes the SSE event
+        stream, the deck's DeckState, or the run cost/budget.
+
+        `emit=True`/`record_cost=True` re-enable those side effects for non-btw
+        callers. Reasoning deltas are NOT yielded (only `content` is), matching the
+        observer UX which shows only the final answer text streaming in.
+
+        Never raises mid-stream on parse errors: a malformed SSE line is skipped.
+        Transport/HTTP errors propagate so the caller can render an error frame.
+        The caller is responsible for aclose() (typically via `async with`).
+        """
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": True,
+        }
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
+        usage: dict[str, int] = {}
+        async with self._client.stream(
+            "POST", f"{self.base_url}/chat/completions",
+            headers=self._headers(), json=body,
+        ) as r:
+            if r.status_code >= 400:
+                await r.aread()
+                _raise_for_status(r)
+            async for line in r.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data_str = line[len("data:"):].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                rc = delta.get("reasoning_content")
+                if rc and emit:
+                    await self._emit(
+                        EventType.REASONING_DELTA,
+                        run_id=run_id, challenge_id=challenge_id,
+                        solver_id=solver_id, text=rc,
+                    )
+                cc = delta.get("content")
+                if cc:
+                    if emit:
+                        await self._emit(
+                            EventType.TEXT_MESSAGE_DELTA,
+                            run_id=run_id, challenge_id=challenge_id,
+                            solver_id=solver_id, text=cc,
+                        )
+                    yield cc
+        if record_cost:
+            await self._record_cost(body["model"], usage, run_id, challenge_id, solver_id)

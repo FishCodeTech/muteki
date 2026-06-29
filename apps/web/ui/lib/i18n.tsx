@@ -591,6 +591,10 @@ const STRINGS: Dict = {
   "settings.capacityGoRoster": { zh: "去阵容 →", en: "Go to Roster →" },
   "settings.reviewToggle": { zh: "启用 review 审稿", en: "Enable review" },
   "settings.reviewRevealHint": { zh: "开启后展开子设置", en: "Sub-settings appear when on" },
+  "settings.reviewBtwNote": {
+    zh: "右侧「顺嘴问 / BTW」默认使用这里选择的 Review worker；它会作为一次性只读旁路进程启动，不占 max worker 或 review 并发槽，不写入 graph，也不计入成本账。",
+    en: "The right-side \"BTW\" panel uses the Review worker selected here by default. It starts as a one-shot read-only side process, consumes no max-worker or review concurrency slot, writes no graph state, and is not counted in the cost ledger.",
+  },
   // advanced tab
   "settings.advReasoning": { zh: "推理 Reasoning", en: "Reasoning" },
   "settings.advDiagnostics": { zh: "诊断 Diagnostics", en: "Diagnostics" },
@@ -949,6 +953,16 @@ const STRINGS: Dict = {
   "a11y.artifact": { zh: "详情面板", en: "Detail panel" },
   "a11y.panelTabs": { zh: "详情面板视图", en: "Detail panel views" },
   "a11y.status": { zh: "运行状态播报", en: "Run status announcements" },
+  // ---- BTW side-query worker ----
+  "btw.title": { zh: "顺嘴问 · 旁路 worker", en: "BTW · side worker" },
+  "btw.empty": {
+    zh: "问点什么，比如「总结当前进展」。多轮对话，关闭即丢弃。",
+    en: "Ask something, e.g. \"summarize progress\". Multi-turn; discarded on close.",
+  },
+  "btw.placeholder": { zh: "顺嘴问一句… (Enter 发送)", en: "Ask a side question… (Enter to send)" },
+  "btw.send": { zh: "发送", en: "Send" },
+  "btw.btn": { zh: "BTW", en: "BTW" },
+  "btw.btnTitle": { zh: "顺嘴问 (Ctrl/Cmd+Shift+/)", en: "Side ask (Ctrl/Cmd+Shift+/)" },
 };
 
 const LangCtx = createContext<{ lang: Lang; setLang: (l: Lang) => void }>({
