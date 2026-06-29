@@ -6,7 +6,7 @@
 #   2) docker build the amd64 image, tagging both the version and :latest.
 #
 # Usage: ./docker/worker-slim/build.sh [repo] [version] [arch]
-#   repo:    image repository (default: muteki-worker-slim; e.g. snowywar/muteki-worker-slim)
+#   repo:    image repository (default: muteki-worker-slim; e.g. ghcr.io/fishcodetech/muteki-worker-slim)
 #   version: version tag       (default: 0.1.0)
 #   arch:    amd64 | arm64     (default: HOST arch — arm64 on Apple Silicon)
 # Tags built: <repo>:<version> AND <repo>:latest.

@@ -115,7 +115,7 @@ nyuctf benchmark全题目测评成绩，可看文章结尾
 # 1. 引导:装依赖 + 跑快速测试套件
 ./init.sh
 
-# 2a. web 指挥台 —— FastAPI 后端(:8000)+ Next UI(:3001)
+# 2a. web 指挥台 —— FastAPI 后端(:8000)+ 生产模式 Next UI(:3001)
 ./run.sh web
 #     只起后端:  ./run.sh web --backend-only
 ```
@@ -138,7 +138,7 @@ MUTEKI_DEEPSEEK_API_KEY=sk-xxxx
 
 - `**[uv](https://docs.astral.sh/uv/)**` —— Python 工具链与运行器
 - **Python ≥ 3.13**(在 `pyproject.toml` 声明;`uv` 负责管理)
-- **Node.js** —— 仅 web UI 需要(`apps/web/ui`,Next.js)
+- **Node.js** —— 仅本地 web UI 需要(`apps/web/ui`,Next.js)
 - **Go ≥ 1.26** —— 仅构建 worker 镜像里的容器内 supervisor 时需要
 - **Docker** —— 仅 `container` worker 后端 / 构建 worker 镜像时需要
 - 你打算用的**引擎 CLI**,需在 `PATH` 上(见下)
@@ -198,49 +198,66 @@ DeepSeek 推理模型(协调器用,不是 worker 引擎)单独通过 `.env` 里�
 
 ### Worker 镜像(容器后端)
 
-为了满足环境隔离、容器化的需要，我这边同时提供了一套容器模式。不过这个容器模式下测试的不够充足，不保证随时可用。
+`container` 后端会让 web API 在宿主 Docker daemon 上拉起兄弟 worker 容器。默认 worker 是**一个通用 Kali 镜像**(不再分各种模板/recipe),内含 CTF 工具链、离线知识库、引擎 CLI 和 supervisor。**镜像里不烤任何凭据** —— 账户和 key 都在运行时注入。
 
-`container` 后端把 worker 跑在**一个通用 Kali 镜像**里(不再分各种模板/recipe),内含全套 CTF工具链 + 离线知识库 + 引擎 CLI + supervisor。**镜像里不烤任何凭据** —— 凭据在运行时注入。
+官方发布镜像在 GHCR：
 
-**拉取预构建镜像(推荐):**
+| 镜像 | 用途 |
+| --- | --- |
+| `ghcr.io/fishcodetech/muteki-worker:latest` | 完整 Kali worker 镜像，用于真实 CTF 运行。体积大，但包含预期的 pwn/rev/取证工具链。 |
+| `ghcr.io/fishcodetech/muteki-worker-slim:latest` | 轻量 worker，用于联调、冒烟测试和受限部署。有 supervisor 和三个引擎 CLI，但没有完整 Kali 工具链。 |
+| `ghcr.io/fishcodetech/muteki-web:latest` | release 流水线产出的 FastAPI 控制面镜像。 |
+| `ghcr.io/fishcodetech/muteki-ui:latest` | release 流水线产出的 Next 指挥台镜像。 |
 
-```bash
-docker pull snowywar/muteki-worker:latest        # 或钉版本: :0.2.3
-```
-
-代码默认用 `snowywar/muteki-worker:latest`(已发布的镜像);
-
-用 `MUTEKI_WORKER_IMAGE` 环境变量覆盖成别的名字/tag(例如 `MUTEKI_WORKER_IMAGE=snowywar/muteki-worker:0.2.3`)。
-
-**或从源码构建:**
+正常 compose 部署时，先在宿主 Docker daemon 上拉 worker 镜像：
 
 ```bash
-./docker/worker/build.sh                          # → muteki-worker:0.2.3 + muteki-worker:latest
-./docker/worker/build.sh snowywar/muteki-worker 0.2.0   # 自定义 repo + 版本(用于 push)
+docker pull ghcr.io/fishcodetech/muteki-worker:latest
 ```
 
-镜像很大(~19.7 GB:Kali headless + ghidra + 经 conda 装的 SageMath + 离线知识库)。
+应用默认使用 `ghcr.io/fishcodetech/muteki-worker:latest`。如需覆盖，用 `MUTEKI_WORKER_IMAGE`：
+
+```bash
+MUTEKI_WORKER_IMAGE=ghcr.io/fishcodetech/muteki-worker-slim:latest ./run.sh web
+```
+
+**或从源码构建 worker 镜像:**
+
+```bash
+./docker/worker/build.sh
+./docker/worker/build.sh ghcr.io/fishcodetech/muteki-worker 0.2.0
+./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim 0.2.0 amd64
+```
+
+完整镜像会比较大(Kali headless + Ghidra + 经 conda 装的 SageMath + 离线知识库)。只有在你明确知道 worker 可以在运行中自行安装缺失工具时，才建议用 slim 镜像跑真实题目。
 
 ---
 
 ## 部署
 
-有两种启动方式。
+有两种支持的启动方式。
 
 ### A) 本地启动（单人使用推荐）
 
-在自己机器上跑——登陆、安装好相关 worker、随时启动。web 进程跑在宿主上；worker 既可以作为宿主 CLI 跑（`local` 后端），也可以作为兄弟容器跑（`container` 后端）。
+在自己机器上跑——登陆、安装好相关 worker CLI、随时启动。web 进程跑在宿主上；worker 既可以作为宿主 CLI 跑（`local` 后端），也可以作为兄弟容器跑（`container` 后端）。
 
 ```bash
 ./run.sh web
 # 访问 localhost:3001
 ```
 
+`./run.sh web` 会用生产构建/生产 server 启动 Next UI，不走 Next dev server。首次运行会构建 `apps/web/ui/.next`；修改 UI 代码或需要重新烤入后端地址时，用 `./run.sh web --rebuild-ui`。常用参数：
+
+```bash
+./run.sh web --host 0.0.0.0 --ui-port 3001
+./run.sh web --backend-only
+```
+
 默认绑 loopback，密码可选。如果你把后端暴露到非 loopback 地址（`./run.sh web --host 0.0.0.0`），就**必须**先设 `MUTEKI_WEB_PASSWORD`——否则服务器拒绝启动，保证 `/api`（含订阅 token）永不裸奔。详见 [`.env.example`](.env.example) 里的 P3 鉴权段。
 
 ### B) Docker Compose（整套控制面容器化）
 
-`docker-compose.yml` 一条命令把**整个平台拉进容器**——FastAPI 协调器 + Next UI。这是**在 Linux / Windows 上不依赖宿主 OS 运行**的路子：与其去抹平裸宿主的差异（POSIX 信号、`C:\` 路径翻译、控制台编码各不相同），不如让控制面跑在 Linux 容器里，宿主是什么 OS 就无所谓了。
+`docker-compose.yml` 一条命令把**控制面拉进容器**——FastAPI 协调器 + Next UI。worker 仍由宿主 Docker daemon 作为兄弟容器拉起。这是**在 Linux / Windows 上不依赖宿主 OS 运行**的路子：与其去抹平裸宿主的差异（POSIX 信号、`C:\` 路径翻译、控制台编码各不相同），不如让控制面跑在 Linux 容器里，宿主是什么 OS 就无所谓了。
 
 拓扑：
 
@@ -249,8 +266,9 @@ docker pull snowywar/muteki-worker:latest        # 或钉版本: :0.2.3
 - **worker** 不是 compose 服务 —— 由 `web-api` 每次 run 时 `docker run` 拉一个。
 
 ```bash
-# 1. 宿主 daemon 上要先有 worker 镜像（compose 不负责构建）：
-docker pull snowywar/muteki-worker:latest        # 或自己构建：./docker/worker/build.sh
+# 1. 宿主 daemon 上要先有 worker 镜像。
+#    compose 会从当前 checkout 构建 web-api/ui，但不负责构建 worker。
+docker pull ghcr.io/fishcodetech/muteki-worker:latest
 
 # 2. 起控制面。两个变量必填：
 #    - MUTEKI_HOST_DATA_ROOT：一个宿主绝对路径，以同一路径挂进 web-api，
@@ -262,6 +280,8 @@ MUTEKI_WEB_PASSWORD='choose-a-strong-one' \
 
 # 3. 访问 http://localhost:3001  （UI 端口可用 MUTEKI_UI_PORT 改）
 ```
+
+只有做冒烟测试，或确认 worker 可以自行安装缺失工具时，才建议用 `MUTEKI_WORKER_IMAGE=ghcr.io/fishcodetech/muteki-worker-slim:latest`。真实 CTF 运行优先用完整 worker 镜像。
 
 容器模式下平台强制**强一致性**：web 进程一旦检测到自己在容器内，就*必须*用容器 worker 后端，**拒绝回落宿主本机 CLI**——镜像缺失 / socket 不可达 / 网络名错会让 run 显式失败，而不是悄悄起错东西。UI 里 `local` 开关被隐藏/锁死。
 

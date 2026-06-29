@@ -19,7 +19,7 @@
 #
 # Build (always via docker/worker-slim/build.sh, which cross-compiles runtime_agent):
 #   ./docker/worker-slim/build.sh                       # → muteki-worker-slim:0.1.0 + :latest
-#   ./docker/worker-slim/build.sh snowywar/muteki-worker-slim 0.1.0
+#   ./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim 0.1.0
 # Then run a slim swarm with:  MUTEKI_WORKER_IMAGE=muteki-worker-slim:latest ./run.sh …
 #
 # Platform: amd64 (match the Kali image + the cross-compiled runtime_agent). Set by the
