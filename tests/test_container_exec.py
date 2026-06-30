@@ -286,12 +286,45 @@ def test_chown_tree_to_worker_noop_when_not_root(monkeypatch, tmp_path):
     assert chowns == [], "non-root must not attempt chown (can't, and same uid anyway)"
 
 
+def test_worker_uid_gid_detects_image_kali_user(monkeypatch):
+    import muteki.solver.container_exec as ce
+    ce._WORKER_ID_CACHE.clear()
+    monkeypatch.delenv("MUTEKI_WORKER_UID", raising=False)
+    monkeypatch.delenv("MUTEKI_WORKER_GID", raising=False)
+    calls = []
+
+    def fake_docker(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("image", "inspect"):
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        if args and args[0] == "run":
+            return type("R", (), {"returncode": 0, "stdout": "4242\n4243\n", "stderr": ""})()
+        raise AssertionError(args)
+
+    monkeypatch.setattr(ce, "_docker", fake_docker)
+
+    assert ce._worker_uid_gid("worker:uid-test") == (4242, 4243)
+    assert ce._worker_uid_gid("worker:uid-test") == (4242, 4243)
+    assert [a[0] for a in calls].count("run") == 1, "image uid lookup should be cached"
+
+
+def test_worker_uid_gid_env_override_skips_image_probe(monkeypatch):
+    import muteki.solver.container_exec as ce
+    ce._WORKER_ID_CACHE.clear()
+    monkeypatch.setenv("MUTEKI_WORKER_UID", "2000")
+    monkeypatch.setenv("MUTEKI_WORKER_GID", "2001")
+    monkeypatch.setattr(ce, "_docker", lambda *a, **k: (_ for _ in ()).throw(AssertionError(a)))
+
+    assert ce._worker_uid_gid("worker:override-test") == (2000, 2001)
+
+
 def test_chown_tree_to_worker_recurses_when_root(monkeypatch, tmp_path):
     import muteki.solver.container_exec as ce
     (tmp_path / "graph").mkdir()
     (tmp_path / "graph" / "shared_graph.db").write_text("db")
     (tmp_path / "winner.json").write_text("{}")
     monkeypatch.setattr(os, "geteuid", lambda: 0)  # simulate root
+    monkeypatch.setattr(ce, "_worker_uid_gid", lambda image=ce.WORKER_IMAGE: (1234, 1235))
     chowned = {}
     def fake_chown(path, uid, gid):
         chowned[os.path.abspath(path)] = (uid, gid)
@@ -299,7 +332,7 @@ def test_chown_tree_to_worker_recurses_when_root(monkeypatch, tmp_path):
     ce._chown_tree_to_worker(str(tmp_path))
     db = os.path.abspath(str(tmp_path / "graph" / "shared_graph.db"))
     assert db in chowned, "the shared board DB must be chowned to the worker uid"
-    assert chowned[db] == (ce._WORKER_UID, ce._WORKER_GID)
+    assert chowned[db] == (1234, 1235)
     # the dir tree + sibling files are covered too
     assert os.path.abspath(str(tmp_path)) in chowned
     assert os.path.abspath(str(tmp_path / "graph")) in chowned
@@ -314,6 +347,7 @@ def test_chown_tree_to_worker_does_not_follow_skill_symlinks(monkeypatch, tmp_pa
     link = home / "muteki-blackboard"
     link.symlink_to(target, target_is_directory=True)
     monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(ce, "_worker_uid_gid", lambda image=ce.WORKER_IMAGE: (1234, 1235))
     chowned = []
     lchowned = []
     monkeypatch.setattr(os, "chown", lambda path, uid, gid: chowned.append(os.path.abspath(path)))
