@@ -21,6 +21,7 @@ from typing import Any, Optional
 from muteki.core.runtime_env import is_web_container
 from muteki.solver.worker_profiles import (
     VALID_BASE_ENGINES,
+    base_engine_for_profile,
     normalize_profile_roster,
     normalize_worker_profiles,
     resolve_seat_ref,
@@ -335,6 +336,91 @@ class WorkerConfigStore:
         except Exception:  # noqa: BLE001
             return {}
 
+    def _custom_endpoint_accounts(self) -> dict[str, dict[str, str]]:
+        """Return non-secret custom-endpoint account metadata keyed by account id.
+
+        The credential account store is the UI's source of truth for base_url +
+        target_engine. The scheduler/CLI drivers, however, still consume the flat
+        legacy profile dict and only switch to EndpointDriver when profile.base_url
+        is present. Keep that bridge here so account edits immediately affect both
+        settings health checks and real dispatch without copying secrets into the
+        worker config JSON.
+        """
+        try:
+            from muteki.solver.credential_accounts import (
+                CredentialAccountStore, account_store_root,
+            )
+            store = CredentialAccountStore(account_store_root(self._root))
+            out: dict[str, dict[str, str]] = {}
+            for row in store.list():
+                if not isinstance(row, dict):
+                    continue
+                if row.get("mode") != "custom_endpoint" or not row.get("present"):
+                    continue
+                details = row.get("details") if isinstance(row.get("details"), dict) else {}
+                base_url = str(details.get("base_url_value") or "").strip()
+                if not base_url:
+                    continue
+                account_id = str(row.get("account_id") or "").strip()
+                if not account_id:
+                    continue
+                out[account_id] = {
+                    "base_url": base_url,
+                    "target_engine": str(
+                        details.get("target_engine") or row.get("engine") or ""
+                    ).strip().lower(),
+                }
+            return out
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _hydrate_profiles_from_accounts(
+        self,
+        profiles: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Overlay account-store custom endpoint metadata onto worker profiles.
+
+        This fixes the "settings account has BASE_URL but Codex still calls
+        OpenAI" class of bugs: Codex's provider override is driven by profile
+        base_url, while the settings form stores base_url on the credential
+        account. Explicit profile base_url still wins; the account store only
+        fills the gap.
+        """
+        endpoints = self._custom_endpoint_accounts()
+        if not endpoints:
+            return profiles
+        out: list[dict[str, Any]] = []
+        for profile in profiles:
+            p = dict(profile)
+            engine = base_engine_for_profile(p)
+            if engine not in VALID_BASE_ENGINES:
+                out.append(p)
+                continue
+            explicit_account = str(p.get("credential_account") or "").strip()
+            account_ids = [explicit_account] if explicit_account else [f"{engine}-main"]
+            for account_id in account_ids:
+                ep = endpoints.get(account_id)
+                if not ep:
+                    continue
+                target = str(ep.get("target_engine") or "").strip().lower()
+                # A legacy endpoint with no target marker may be used by an
+                # explicitly-bound profile. Empty profile bindings only inherit
+                # the engine's own default endpoint when the marker matches.
+                if target and target != engine:
+                    continue
+                if not explicit_account and target != engine:
+                    continue
+                if not str(p.get("base_url") or "").strip():
+                    p["base_url"] = ep["base_url"]
+                p["credential_account"] = account_id
+                p["credential_mode"] = "api_key"
+                p["auth"] = "api_key"
+                if engine == "codex" and not str(p.get("wire_api") or "").strip():
+                    p["wire_api"] = "responses"
+                break
+            out.append(p)
+        return out
+
     def identity_model(self) -> dict[str, Any]:
         """The NEW Credential/Seat/Environment view, authoritative when the on-disk
         config is already new-shaped. Never raises. (When legacy-shaped, callers
@@ -355,7 +441,9 @@ class WorkerConfigStore:
         """The current default config with everything filled in (never raises)."""
         d = self._data
         runtime_profiles = self._clean_runtime_profiles(d.get("runtime_profiles"))
-        worker_profiles = self._clean_worker_profiles(d.get("worker_profiles"))
+        worker_profiles = self._hydrate_profiles_from_accounts(
+            self._clean_worker_profiles(d.get("worker_profiles"))
+        )
         worker_backend = self._clean_backend(d.get("worker_backend"))
         engines = _clean_engines_for_backend(d.get("engines"), worker_profiles, worker_backend) or [
             p["name"] for p in worker_profiles if p.get("enabled", True)

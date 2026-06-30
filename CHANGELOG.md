@@ -2,6 +2,18 @@
 
 All notable public release changes are tracked here.
 
+## 0.2.4 - 2026-06-30
+
+### Changed
+
+- Release metadata, package versions, and worker build examples now point at `0.2.4`.
+
+### Fixed
+
+- Fixed Codex custom endpoint dispatch so a settings-page credential account `base_url` is applied to the actual worker profile instead of falling back to OpenAI.
+- Made Codex custom endpoint health checks run the real Codex CLI Responses turn, surfacing LiteLLM/DeepSeek schema failures before a run starts.
+- Preserved file-backed API key probing for Codex custom endpoints by injecting the resolved key into the CLI health-check environment.
+
 ## 0.2.3 - 2026-06-29
 
 ### Added

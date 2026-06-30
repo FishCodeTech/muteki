@@ -740,6 +740,38 @@ def test_driver_for_codex_endpoint_injects_provider_before_exec(monkeypatch):
     assert argv[exec_idx:exec_idx + 2] == ["exec", "--json"]
 
 
+def test_codex_endpoint_health_uses_real_cli_turn(monkeypatch):
+    monkeypatch.setenv("MUTEKI_CODEX_BIN", "/usr/bin/codex")
+    drv = driver_for({
+        "name": "deepseek-codex",
+        "engine": "codex",
+        "transport": "codex_cli",
+        "credential_mode": "api",
+        "base_url": "https://api.deepseek.example/v1",
+        "wire_api": "responses",
+        "model": "deepseek-chat",
+    })
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"] = argv
+        return _CP(
+            1,
+            '{"type":"turn.failed","error":{"message":"tools[10].type: unknown variant `namespace`"}}',
+            "",
+        )
+
+    monkeypatch.setattr("muteki.solver.cli_driver.subprocess.run", fake_run)
+    monkeypatch.setattr("muteki.solver.cli_driver.time.sleep", lambda *_: None)
+    ok, detail = drv.health_detail(env={"OPENAI_API_KEY": "secret"})
+
+    assert ok is False
+    exec_idx = seen["argv"].index("exec")
+    assert "model_provider=muteki" in seen["argv"][:exec_idx]
+    assert "model_providers.muteki.base_url=https://api.deepseek.example/v1" in seen["argv"][:exec_idx]
+    assert "namespace" in detail
+
+
 def test_driver_for_codex_keyed_profile_without_endpoint_still_injects_model(monkeypatch):
     monkeypatch.setenv("MUTEKI_CODEX_BIN", "/usr/bin/codex")
     drv = driver_for({
@@ -789,7 +821,12 @@ def test_endpoint_healthcheck_resolves_file_backed_key(monkeypatch, tmp_path):
 
     def fake_run(argv, **kwargs):
         seen["argv"] = argv
-        return subprocess.CompletedProcess(argv, 0, "{}", "")
+        seen["env"] = kwargs.get("env") or {}
+        return subprocess.CompletedProcess(
+            argv, 0,
+            '{"type":"turn.completed","usage":{}}\n',
+            "",
+        )
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     # (a) explicit file: ref
@@ -801,8 +838,8 @@ def test_endpoint_healthcheck_resolves_file_backed_key(monkeypatch, tmp_path):
         "api_key_ref": f"file:{keyfile}",
     })
     assert drv.healthcheck() is True
-    assert any("Authorization: Bearer file-secret-123" == str(x) for x in seen["argv"]), \
-        "#5: file: api_key_ref must be read and sent as the bearer token"
+    assert seen["env"]["OPENAI_API_KEY"] == "file-secret-123", \
+        "#5: file: api_key_ref must be read and injected for the Codex CLI"
 
     # (b) no ref, but the credential-injection *_API_KEY_FILE env is set (the
     # container path) → still resolved.
@@ -813,8 +850,8 @@ def test_endpoint_healthcheck_resolves_file_backed_key(monkeypatch, tmp_path):
         "credential_mode": "api", "base_url": "https://ds.example",
     })
     assert drv2.healthcheck() is True
-    assert any("Authorization: Bearer file-secret-123" == str(x) for x in seen["argv"]), \
-        "#5: *_API_KEY_FILE env fallback must be read for the probe auth header"
+    assert seen["env"]["OPENAI_API_KEY"] == "file-secret-123", \
+        "#5: *_API_KEY_FILE env fallback must be read for the Codex CLI probe"
 
 
 # ── engine binary resolution (pin official, skip broken third-party) ──────────

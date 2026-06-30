@@ -404,9 +404,24 @@ class CliDriver(abc.ABC):
                     return True, ""
                 # classify the miss so a retry/the operator knows what happened
                 if r.returncode != 0:
-                    tail = (r.stderr or r.stdout or "").strip().splitlines()
+                    failed_detail = ""
+                    if '"type":"turn.failed"' in (r.stdout or ""):
+                        for line in reversed((r.stdout or "").splitlines()):
+                            try:
+                                ev = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if ev.get("type") != "turn.failed":
+                                continue
+                            err = ev.get("error") or {}
+                            failed_detail = str(
+                                err.get("message") if isinstance(err, dict) else err
+                            )
+                            break
+                    detail_src = failed_detail or r.stderr or r.stdout or ""
+                    tail = detail_src.strip().splitlines()
                     last = (f"hello exited {r.returncode}"
-                            + (f": {tail[-1][:120]}" if tail else ""))
+                            + (f": {tail[-1][:300]}" if tail else ""))
                 else:
                     last = "hello returned no model reply"
             if attempt < self._HELLO_RETRIES:
@@ -1100,6 +1115,14 @@ class EndpointDriver(CliDriver):
             return f"{base_url}/responses"
         return base_url
 
+    def _hello_argv(self) -> list[str]:
+        if self.name != "codex":
+            return []
+        return self._inject_before_exec(self.base._hello_argv())  # noqa: SLF001
+
+    def _hello_ok(self, r: "subprocess.CompletedProcess") -> bool:
+        return self.base._hello_ok(r)  # noqa: SLF001
+
     def _api_key(self, env: "dict[str, str] | None" = None) -> str:
         """Resolve the endpoint API key for the health probe, mirroring how the
         real worker authenticates (#5). The old version only handled `env:NAME`,
@@ -1137,6 +1160,16 @@ class EndpointDriver(CliDriver):
         base_url = str(self.profile.get("base_url") or "").strip()
         if not base_url:
             return self.base.health_detail(env=env)
+        if self.name == "codex":
+            # Codex custom endpoints are only ready if the actual CLI can complete
+            # a turn with its Responses tool schema. A bare HTTP /responses probe
+            # can pass while the real worker fails immediately, e.g. LiteLLM →
+            # DeepSeek rejects Codex's `tools[].type = "namespace"`.
+            probe_env = env
+            key = self._api_key(env)
+            if key and not (env or {}).get("OPENAI_API_KEY"):
+                probe_env = {**os.environ, **(env or {}), "OPENAI_API_KEY": key}
+            return CliDriver.health_detail(self, env=probe_env)
         argv = [
             "curl", "-fsS", "-X", "POST", "--max-time", "20",
             "-H", "Content-Type: application/json",

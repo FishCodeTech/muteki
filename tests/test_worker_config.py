@@ -592,6 +592,80 @@ def test_worker_config_accepts_api_endpoint_profile_names(tmp_path):
     assert cred["endpoint"]["base_url"] == "https://api.deepseek.example/v1"
 
 
+def test_account_base_url_hydrates_codex_profile_for_dispatch(tmp_path, monkeypatch):
+    """Regression: the settings account form stores BASE_URL in the account store,
+    but Codex dispatch switches away from OpenAI only when profile.base_url is
+    present. Reading worker config must bridge the two."""
+    from muteki.solver.credential_accounts import CredentialAccountStore, account_store_root
+    from muteki.solver.cli_driver import driver_for
+
+    monkeypatch.setenv("MUTEKI_CODEX_BIN", "/usr/bin/codex")
+    CredentialAccountStore(account_store_root(tmp_path)).upsert_secret(
+        account_id="codex-main",
+        engine="api",
+        secret="deepseek-secret",
+        base_url="https://api.deepseek.example/v1",
+        target_engine="codex",
+    )
+
+    cfg = WorkerConfigStore(root=tmp_path).get()
+    profile = next(p for p in cfg["worker_profiles"] if p["engine"] == "codex")
+
+    assert profile["credential_account"] == "codex-main"
+    assert profile["credential_mode"] == "api_key"
+    assert profile["base_url"] == "https://api.deepseek.example/v1"
+    assert profile["wire_api"] == "responses"
+
+    argv = driver_for(profile).build_execute("PROMPT", None, web_access=False)
+    exec_idx = argv.index("exec")
+    assert "model_provider=muteki" in argv[:exec_idx]
+    assert "model_providers.muteki.base_url=https://api.deepseek.example/v1" in argv[:exec_idx]
+
+
+def test_account_base_url_hydrates_empty_binding_new_schema_codex_profile(tmp_path):
+    """A saved seat can still be host-inherit/empty from the identity migration.
+    If the operator later registers codex-main as a custom endpoint, dispatch
+    should use that default endpoint instead of silently inheriting OpenAI."""
+    from muteki.solver.credential_accounts import CredentialAccountStore, account_store_root
+    from muteki.solver.identity_model import credential_id_for
+
+    CredentialAccountStore(account_store_root(tmp_path)).upsert_secret(
+        account_id="codex-main",
+        engine="api",
+        secret="deepseek-secret",
+        base_url="https://api.deepseek.example/v1",
+        target_engine="codex",
+    )
+    cred_id = credential_id_for("codex", legacy_account_id="codex-main")
+    WorkerConfigStore(root=tmp_path).set_identity_model(
+        seats=[{
+            "id": "seat_codex_default",
+            "label": "codex-local",
+            "engine": "codex",
+            "credential_id": cred_id,
+            "environment_id": "local",
+            "model": "deepseek-chat",
+            "roles": ["race", "bootstrap", "explore", "review"],
+            "enabled": True,
+        }],
+        credentials=[{
+            "id": cred_id,
+            "label": "codex system CLI",
+            "engine": "codex",
+            "kind": "system_inherit",
+            "secret_ref": "",
+        }],
+        environments=[{"id": "local", "label": "Local host", "backend": "local"}],
+    )
+
+    cfg = WorkerConfigStore(root=tmp_path).get()
+    profile = cfg["worker_profiles"][0]
+
+    assert profile["credential_account"] == "codex-main"
+    assert profile["base_url"] == "https://api.deepseek.example/v1"
+    assert profile["credential_mode"] == "api_key"
+
+
 def test_profile_endpoint_healthcheck_uses_endpoint_url(tmp_path, monkeypatch):
     root = tmp_path / "_secrets" / "accounts" / "deepseek-main"
     root.mkdir(parents=True)
@@ -601,7 +675,12 @@ def test_profile_endpoint_healthcheck_uses_endpoint_url(tmp_path, monkeypatch):
 
     def fake_run(argv, **kwargs):
         seen["argv"] = argv
-        return subprocess.CompletedProcess(argv, 0, "{}", "")
+        seen["env"] = kwargs.get("env") or {}
+        return subprocess.CompletedProcess(
+            argv, 0,
+            '{"type":"item.completed","item":{"type":"agent_message","text":"OK"}}\n',
+            "",
+        )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     missing = _missing_profile_accounts(
@@ -622,7 +701,11 @@ def test_profile_endpoint_healthcheck_uses_endpoint_url(tmp_path, monkeypatch):
     )
 
     assert missing == []
-    assert "https://api.deepseek.example/v1/responses" in seen["argv"]
+    exec_idx = seen["argv"].index("exec")
+    assert "model_provider=muteki" in seen["argv"][:exec_idx]
+    assert "model_providers.muteki.base_url=https://api.deepseek.example/v1" in seen["argv"][:exec_idx]
+    assert "model_providers.muteki.wire_api=responses" in seen["argv"][:exec_idx]
+    assert seen["env"]["OPENAI_API_KEY"] == "secret"
 
 
 def test_profile_account_probe_runs_minimal_model_with_injected_account(tmp_path, monkeypatch):
