@@ -225,8 +225,8 @@ MUTEKI_WORKER_IMAGE=ghcr.io/fishcodetech/muteki-worker-slim:latest ./run.sh web
 
 ```bash
 ./docker/worker/build.sh
-./docker/worker/build.sh ghcr.io/fishcodetech/muteki-worker 0.2.4
-./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim 0.2.4 amd64
+./docker/worker/build.sh ghcr.io/fishcodetech/muteki-worker 0.2.5
+./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim 0.2.5 amd64
 ```
 
 The full image is intentionally large (Kali headless + Ghidra + SageMath via conda + offline knowledge). Use the slim image only when you understand that workers may need to install more tooling during a run.

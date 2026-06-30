@@ -227,8 +227,8 @@ MUTEKI_WORKER_IMAGE=ghcr.io/fishcodetech/muteki-worker-slim:latest ./run.sh web
 
 ```bash
 ./docker/worker/build.sh
-./docker/worker/build.sh ghcr.io/fishcodetech/muteki-worker 0.2.4
-./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim 0.2.4 amd64
+./docker/worker/build.sh ghcr.io/fishcodetech/muteki-worker 0.2.5
+./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim 0.2.5 amd64
 ```
 
 完整镜像会比较大(Kali headless + Ghidra + 经 conda 装的 SageMath + 离线知识库)。只有在你明确知道 worker 可以在运行中自行安装缺失工具时，才建议用 slim 镜像跑真实题目。
