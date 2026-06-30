@@ -96,21 +96,94 @@ _CONTAINER_BIN = {
 _HOST_DATA_ROOT = (os.environ.get("MUTEKI_HOST_DATA_ROOT") or "").strip()
 _CONTAINER_DATA_ROOT = (os.environ.get("MUTEKI_CONTAINER_DATA_ROOT") or _HOST_DATA_ROOT).strip()
 
-# The worker runs as the image's `kali` user (uid:gid 1001:1001 — see the slim &
-# Kali Dockerfiles). The run workspace is created HOST-side by the (root) web
-# process and bind-mounted at /home/kali/workspace, so it lands root-owned and
-# the kali worker can't WRITE it. The runtime_agent chowns each per-worker HOME +
-# cwd, but the SHARED state created before/outside a worker spawn — most importantly
-# graph/shared_graph.db, the team blackboard — stays root:root 0644, so a worker's
-# `blackboard.py write_fact` hits "attempt to write a readonly database" (every
-# engine that reaches for the live board: claude via the skill, codex via raw
-# sqlite). Chown the workspace tree to the worker uid when we bring the container
-# up so the shared board (and any pre-created file under the mount) is writable.
-_WORKER_UID = int(os.environ.get("MUTEKI_WORKER_UID", "1001"))
-_WORKER_GID = int(os.environ.get("MUTEKI_WORKER_GID", "1001"))
+# The worker runs as the image's `kali` user. Do NOT hard-code its uid/gid: the
+# Kali and slim Dockerfiles intentionally create the user by name, and different
+# base images may assign 1000, 1001, or another value. The run workspace is created
+# HOST-side by the (root) web process and bind-mounted at /home/kali/workspace, so
+# it lands root-owned and the kali worker can't WRITE it. Chown the workspace tree
+# to the image's actual kali uid/gid when we bring the container up so shared state
+# (graph/shared_graph.db, workspace/shared, etc.) is writable.
+_WORKER_USER = (os.environ.get("MUTEKI_WORKER_USER") or "kali").strip() or "kali"
+_WORKER_ID_FALLBACK = (1000, 1000)
+_WORKER_ID_CACHE: dict[str, tuple[int, int]] = {}
+_WORKER_ID_LOCK = threading.Lock()
 
 
-def _chown_tree_to_worker(root: str) -> None:
+def _env_int(name: str) -> Optional[int]:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+def _fallback_worker_uid_gid() -> tuple[int, int]:
+    uid = _env_int("MUTEKI_WORKER_UID")
+    gid = _env_int("MUTEKI_WORKER_GID")
+    return (
+        uid if uid is not None else _WORKER_ID_FALLBACK[0],
+        gid if gid is not None else _WORKER_ID_FALLBACK[1],
+    )
+
+
+_WORKER_UID, _WORKER_GID = _fallback_worker_uid_gid()
+
+
+def _query_worker_uid_gid(image: str) -> tuple[int, int]:
+    """Read the worker uid/gid from the local worker image.
+
+    `docker run` is used instead of image metadata because the Dockerfiles create
+    `kali` by name and do not set Config.User to that uid. `image inspect` first
+    prevents an accidental pull when the image is missing.
+    """
+    if _docker("image", "inspect", image, timeout=20).returncode != 0:
+        return _fallback_worker_uid_gid()
+    quoted_user = shlex.quote(_WORKER_USER)
+    r = _docker(
+        "run", "--rm", "--entrypoint", "sh", image,
+        "-lc", f"id -u {quoted_user} && id -g {quoted_user}",
+        timeout=30,
+    )
+    if r.returncode != 0:
+        return _fallback_worker_uid_gid()
+    vals: list[int] = []
+    for line in (r.stdout or "").splitlines():
+        try:
+            vals.append(int(line.strip()))
+        except ValueError:
+            continue
+        if len(vals) == 2:
+            break
+    if len(vals) != 2:
+        return _fallback_worker_uid_gid()
+    uid_override = _env_int("MUTEKI_WORKER_UID")
+    gid_override = _env_int("MUTEKI_WORKER_GID")
+    return (
+        uid_override if uid_override is not None else vals[0],
+        gid_override if gid_override is not None else vals[1],
+    )
+
+
+def _worker_uid_gid(image: str = WORKER_IMAGE) -> tuple[int, int]:
+    """Actual uid/gid that host-created workspace files must be chowned to."""
+    uid_override = _env_int("MUTEKI_WORKER_UID")
+    gid_override = _env_int("MUTEKI_WORKER_GID")
+    if uid_override is not None and gid_override is not None:
+        return uid_override, gid_override
+    with _WORKER_ID_LOCK:
+        if image not in _WORKER_ID_CACHE:
+            _WORKER_ID_CACHE[image] = _query_worker_uid_gid(image)
+        uid, gid = _WORKER_ID_CACHE[image]
+    return (
+        uid_override if uid_override is not None else uid,
+        gid_override if gid_override is not None else gid,
+    )
+
+
+def _chown_tree_to_worker(root: str, *, image: str = WORKER_IMAGE) -> None:
     """Best-effort recursive chown of a host dir tree to the worker uid:gid so the
     bind-mounted `kali` worker can write shared state (the blackboard DB lives here).
     No-op when we're not root (bare-host dev: the web process already owns it and
@@ -121,14 +194,15 @@ def _chown_tree_to_worker(root: str) -> None:
             return
     except AttributeError:  # no geteuid (non-POSIX) — nothing to do
         return
+    uid, gid = _worker_uid_gid(image)
     def _chown_one(path: str) -> None:
         try:
             if os.path.islink(path):
                 lchown = getattr(os, "lchown", None)
                 if callable(lchown):
-                    lchown(path, _WORKER_UID, _WORKER_GID)
+                    lchown(path, uid, gid)
                 return
-            os.chown(path, _WORKER_UID, _WORKER_GID)
+            os.chown(path, uid, gid)
         except OSError:
             pass  # one stubborn entry shouldn't abort the whole sweep
 
@@ -348,7 +422,7 @@ def ensure_container(run_id: str, host_workspace: str, *,
     # is read-only to workers (sqlite "attempt to write a readonly database").
     # This runs before the FIRST worker spawns; the DB is created earlier (swarm
     # bootstrap), so a recursive chown of the tree covers it. Best-effort.
-    _chown_tree_to_worker(host_workspace)
+    _chown_tree_to_worker(host_workspace, image=image)
     mount_account_root = account_root
     if account_root:
         os.makedirs(account_root, exist_ok=True)

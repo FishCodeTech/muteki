@@ -2,6 +2,16 @@
 
 All notable public release changes are tracked here.
 
+## 0.2.5 - 2026-06-30
+
+### Changed
+
+- Release metadata, package versions, and worker build examples now point at `0.2.5`.
+
+### Fixed
+
+- Resolved container workspace permission mismatches by detecting the worker image's actual `kali` UID/GID before chowning shared run state.
+
 ## 0.2.4 - 2026-06-30
 
 ### Changed
