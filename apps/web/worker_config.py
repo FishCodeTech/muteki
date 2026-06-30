@@ -246,6 +246,7 @@ class WorkerConfigStore:
         except (json.JSONDecodeError, OSError):
             # a corrupt config must never break startup — fall back to defaults
             self._data = {}
+        self._sync_custom_endpoint_urls()
         self._project_identity_to_legacy()
 
     def _project_identity_to_legacy(self) -> None:
@@ -335,10 +336,82 @@ class WorkerConfigStore:
         except Exception:  # noqa: BLE001
             return {}
 
+    def _account_endpoint_base_urls(self) -> dict[str, str]:
+        """Map custom endpoint account_id → BASE_URL from the credential store.
+
+        The account form persists a custom endpoint's URL with the secret material
+        under sessions/_secrets/accounts/<id>/BASE_URL. The scheduler, however,
+        reads `base_url` from worker_profiles (via the identity projection). Keep
+        those two sources joined so saving an account is enough to make Codex use
+        its custom endpoint instead of falling back to the default OpenAI provider.
+        """
+        try:
+            from muteki.solver.credential_accounts import (
+                CredentialAccountStore, account_store_root,
+            )
+            store = CredentialAccountStore(account_store_root(self._root))
+            out: dict[str, str] = {}
+            for a in store.list():
+                if str(a.get("mode") or "") != "custom_endpoint":
+                    continue
+                details = a.get("details") if isinstance(a.get("details"), dict) else {}
+                base_url = str(details.get("base_url_value") or "").strip()
+                account_id = str(a.get("account_id") or "").strip()
+                if account_id and base_url:
+                    out[account_id] = base_url
+            return out
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _sync_custom_endpoint_urls(self) -> None:
+        """Backfill custom endpoint URLs from account store into config.
+
+        This is intentionally best-effort and runs before legacy projection and
+        before returning config. It repairs both new-shaped credentials[] and the
+        legacy worker_profiles[] view because either shape may be the on-disk
+        source depending on which settings UI path last saved.
+        """
+        urls = self._account_endpoint_base_urls()
+        if not urls:
+            return
+        for cred in self._data.get("credentials") or []:
+            if not isinstance(cred, dict):
+                continue
+            account_id = str(cred.get("secret_ref") or "").strip()
+            base_url = urls.get(account_id)
+            if not base_url:
+                continue
+            if str(cred.get("kind") or "") != "custom_endpoint":
+                continue
+            endpoint = cred.get("endpoint")
+            if not isinstance(endpoint, dict):
+                endpoint = {}
+                cred["endpoint"] = endpoint
+            if not str(endpoint.get("base_url") or "").strip():
+                endpoint["base_url"] = base_url
+            if str(cred.get("engine") or "") == "codex" and not str(endpoint.get("wire_api") or "").strip():
+                endpoint["wire_api"] = "responses"
+        for profile in self._data.get("worker_profiles") or []:
+            if not isinstance(profile, dict):
+                continue
+            account_id = str(profile.get("credential_account") or "").strip()
+            base_url = urls.get(account_id)
+            if not base_url:
+                continue
+            engine = str(profile.get("engine") or "").strip()
+            if engine and engine != "codex":
+                continue
+            if not str(profile.get("base_url") or "").strip():
+                profile["base_url"] = base_url
+            profile["credential_mode"] = profile["auth"] = "api_key"
+            if engine == "codex" and not str(profile.get("wire_api") or "").strip():
+                profile["wire_api"] = "responses"
+
     def identity_model(self) -> dict[str, Any]:
         """The NEW Credential/Seat/Environment view, authoritative when the on-disk
         config is already new-shaped. Never raises. (When legacy-shaped, callers
         should read get()['seats'/'credentials'/'environments'], which migrates.)"""
+        self._sync_custom_endpoint_urls()
         d = self._data
         seats = [s for s in (d.get("seats") or []) if isinstance(s, dict)]
         creds = [c for c in (d.get("credentials") or []) if isinstance(c, dict)]
@@ -353,6 +426,7 @@ class WorkerConfigStore:
 
     def get(self) -> dict[str, Any]:
         """The current default config with everything filled in (never raises)."""
+        self._sync_custom_endpoint_urls()
         d = self._data
         runtime_profiles = self._clean_runtime_profiles(d.get("runtime_profiles"))
         worker_profiles = self._clean_worker_profiles(d.get("worker_profiles"))
