@@ -129,6 +129,113 @@ def test_worker_lane_header_compacts_tool_status():
     _run_ui_node(script)
 
 
+def test_clipboard_copy_falls_back_after_async_clipboard_rejects():
+    """Flag-copy must actually write text, not just flip the UI to "copied".
+
+    Browsers can expose navigator.clipboard but reject writeText on non-secure
+    origins, denied permissions, or unfocused documents. The deck should then
+    use the textarea/execCommand path and only show copied after a real success.
+    """
+    helper = UI_ROOT / "lib" / "clipboard.ts"
+    hook = UI_ROOT / "lib" / "useCopied.ts"
+    script = textwrap.dedent(
+        f"""
+        const fs = require("fs");
+        const ts = require("typescript");
+        const vm = require("vm");
+        const source = fs.readFileSync({json.dumps(str(helper))}, "utf8");
+        const hookSource = fs.readFileSync({json.dumps(str(hook))}, "utf8");
+        const out = ts.transpileModule(source, {{
+          compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }}
+        }}).outputText;
+
+        function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
+
+        let appended = null;
+        let copiedViaFallback = "";
+        class FakeHTMLElement {{
+          focus() {{ this.focused = true; }}
+        }}
+        const active = new FakeHTMLElement();
+        const selection = {{
+          rangeCount: 1,
+          restored: [],
+          getRangeAt(i) {{ return {{ idx: i }}; }},
+          removeAllRanges() {{ this.removed = true; }},
+          addRange(r) {{ this.restored.push(r); }},
+        }};
+        const document = {{
+          activeElement: active,
+          body: {{
+            appendChild(el) {{ appended = el; }},
+            removeChild(el) {{
+              assert(appended === el, "fallback removes the textarea it appended");
+              appended = null;
+            }},
+          }},
+          getSelection() {{ return selection; }},
+          createElement(tag) {{
+            assert(tag === "textarea", "fallback uses a textarea");
+            const el = new FakeHTMLElement();
+            el.style = {{}};
+            el.setAttribute = (key, value) => {{ el[key] = value; }};
+            el.select = () => {{ el.selected = true; }};
+            el.setSelectionRange = (start, end) => {{ el.range = [start, end]; }};
+            return el;
+          }},
+          execCommand(cmd) {{
+            assert(cmd === "copy", "fallback invokes copy");
+            copiedViaFallback = appended && appended.value;
+            return true;
+          }},
+        }};
+        const navigator = {{
+          clipboard: {{
+            writeText: async () => {{ throw new Error("permission denied"); }},
+          }},
+        }};
+        const sandbox = {{
+          module: {{ exports: {{}} }},
+          exports: {{}},
+          document,
+          navigator,
+          HTMLElement: FakeHTMLElement,
+        }};
+        sandbox.exports = sandbox.module.exports;
+        vm.runInNewContext(out, sandbox, {{ filename: "clipboard.js" }});
+        const lib = sandbox.module.exports;
+
+        (async () => {{
+          const ok = await lib.copyToClipboard("flag{{real}}");
+          assert(ok === true, "fallback copy should report success");
+          assert(copiedViaFallback === "flag{{real}}", "fallback copies the actual flag text");
+          assert(appended === null, "fallback textarea is cleaned up");
+          assert(active.focused === true, "fallback restores focus");
+          assert(selection.removed === true && selection.restored.length === 1, "selection is restored");
+
+          let asyncText = "";
+          sandbox.navigator.clipboard.writeText = async (text) => {{ asyncText = text; }};
+          sandbox.document.execCommand = () => {{ throw new Error("should not use fallback after async success"); }};
+          const asyncOk = await lib.copyToClipboard("flag{{api}}");
+          assert(asyncOk === true && asyncText === "flag{{api}}", "async clipboard success writes the flag");
+
+          sandbox.navigator.clipboard.writeText = async () => {{ throw new Error("denied"); }};
+          sandbox.document.body = null;
+          const failOk = await lib.copyToClipboard("flag{{lost}}");
+          assert(failOk === false, "copy reports false when both clipboard paths fail");
+
+          assert(hookSource.includes("copyToClipboard(text).then((ok)"), "hook waits for copy result");
+          assert(hookSource.includes("if (!ok || !mounted.current) return;"), "hook gates copied state on success");
+          assert(!hookSource.includes("navigator.clipboard"), "hook no longer silently calls clipboard directly");
+        }})().catch((err) => {{
+          console.error(err);
+          process.exit(1);
+        }});
+        """
+    )
+    _run_ui_node(script)
+
+
 def test_worker_filter_chips_are_compact_scroll_rail():
     helper = UI_ROOT / "lib" / "workers.ts"
     script = textwrap.dedent(

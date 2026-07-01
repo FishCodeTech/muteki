@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { DeckState, SolverLane, isReviewWorkerLane, isFactRetired, workerChat, workerIds } from "@/lib/events";
 import { useT } from "@/lib/i18n";
+import { copyToClipboard } from "@/lib/clipboard";
 import { workerColor, workerEngine, workerInitial, workerShortLabel, resumeCommand } from "@/lib/workers";
 import { compactLaneStatus, latestLaneActivity } from "@/lib/workerLanePresentation";
 import { Icon } from "@/components/Icon";
@@ -79,10 +80,12 @@ export function WorkerLanes({
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const copyResume = (id: string, cmd: string) => {
     if (!cmd) return;
-    try { navigator.clipboard?.writeText(cmd); } catch { /* insecure context */ }
-    setCopiedId(id);
-    if (copyTimer.current) clearTimeout(copyTimer.current);
-    copyTimer.current = setTimeout(() => setCopiedId(null), 1200);
+    void copyToClipboard(cmd).then((ok) => {
+      if (!ok) return;
+      setCopiedId(id);
+      if (copyTimer.current) clearTimeout(copyTimer.current);
+      copyTimer.current = setTimeout(() => setCopiedId(null), 1200);
+    });
   };
 
   // group worker chat by solver: reasoning text (live) + recent tool lines
