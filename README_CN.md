@@ -26,6 +26,16 @@
   <a href="README.md">English</a> · <strong>简体中文</strong>
 </p>
 
+<p align="center">
+  <a href="https://www.star-history.com/#fishcodetech/muteki&amp;Date">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date&amp;theme=dark">
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date">
+      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date">
+    </picture>
+  </a>
+</p>
+
 ---
 
 这是一款 **真正意义上的开源的多模型 CTF 求解 AI agent 蜂群。** 目标就是成为如项目名称，**無敵 · Project Muteki**

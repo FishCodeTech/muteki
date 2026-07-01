@@ -76,3 +76,5 @@ session-handoff.md
 # distribution (working notes, not user-facing documentation).
 docs/_local/
 docs/internal-design/
+docs/wechat/
+docs/assets/wechat-promo/
