@@ -2,6 +2,12 @@
 
 All notable public release changes are tracked here.
 
+## Unreleased
+
+### Fixed
+
+- Fixed draft-run attachment upload returning 422 when using the file-picker button: the live `FileList` was cleared before the async upload finished on new solves.
+
 ## 0.2.5 - 2026-06-30
 
 ### Changed

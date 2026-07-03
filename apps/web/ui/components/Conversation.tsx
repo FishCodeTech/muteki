@@ -945,7 +945,15 @@ function Composer({
           <div className="crow">
             <button type="button" className="attach-btn" onClick={() => fileRef.current?.click()} title={t("composer.attach")} aria-label={t("composer.attach")}><Icon name="paperclip" /></button>
             <input ref={fileRef} type="file" multiple style={{ display: "none" }}
-              onChange={(e) => { if (e.target.files?.length) onAddFiles(e.target.files); e.target.value = ""; }} />
+              onChange={(e) => {
+                // Snapshot to a static array BEFORE resetting value: onAddFiles is
+                // async (it may await newRun() on a draft), and `value = ""` clears
+                // the live FileList mid-flight — leaving the upload with 0 files and
+                // a 422 from the endpoint. Array.from() copies the File refs first.
+                const picked = e.target.files ? Array.from(e.target.files) : [];
+                e.target.value = "";
+                if (picked.length) onAddFiles(picked);
+              }} />
             <span className="auto-note"><b>▸</b> {t("composer.autoNote")}</span>
             <span className="spacer" />
             {mode === "ctf" && (
