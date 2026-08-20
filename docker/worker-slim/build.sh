@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the SLIM muteki worker image (plain Ubuntu + reverse-connector + 3 agent CLIs).
+# Build the SLIM muteki worker image (plain Ubuntu + reverse-connector + 9 agent CLIs).
 # A lightweight alternative to docker/worker/build.sh for FAST testing — same two steps:
 #   1) cross-compile the Go runtime-agent (supervisor) to docker/worker-slim/runtime_agent
 #      (the docker build context — COPY ./runtime_agent resolves relative to it).
@@ -7,7 +7,7 @@
 #
 # Usage: ./docker/worker-slim/build.sh [repo] [version] [arch]
 #   repo:    image repository (default: muteki-worker-slim; e.g. ghcr.io/fishcodetech/muteki-worker-slim)
-#   version: version tag       (default: 0.2.5)
+#   version: version tag       (default: v0.3.0; GHCR release tags keep the leading v)
 #   arch:    amd64 | arm64     (default: HOST arch — arm64 on Apple Silicon)
 # Tags built: <repo>:<version> AND <repo>:latest.
 #
@@ -26,7 +26,7 @@
 set -euo pipefail
 
 REPO_IMAGE="${1:-muteki-worker-slim}"
-VERSION="${2:-0.2.5}"
+VERSION="${2:-v0.3.0}"
 # Default arch = host arch (uname -m → docker/go naming). Override with 3rd arg.
 _host_arch="$(uname -m)"
 case "${_host_arch}" in
@@ -43,10 +43,22 @@ LATEST="${REPO_IMAGE}:latest"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 
-echo ">> [1/2] cross-compiling runtime-agent (linux/${ARCH}, static)..."
-CGO_ENABLED=0 GOOS=linux GOARCH="${ARCH}" \
-  go build -C "$REPO/cmd/runtime-agent" -trimpath -ldflags="-s -w" \
-    -o "$HERE/runtime_agent" .
+echo ">> [1/3] cross-compiling runtime-agent (linux/${ARCH}, static)..."
+if command -v go >/dev/null 2>&1; then
+  CGO_ENABLED=0 GOOS=linux GOARCH="${ARCH}" \
+    go build -C "$REPO/cmd/runtime-agent" -trimpath -ldflags="-s -w" \
+      -o "$HERE/runtime_agent" .
+else
+  echo ">> host Go unavailable; compiling with golang:1.26-bookworm..."
+  docker run --rm \
+    --user "$(id -u):$(id -g)" \
+    -e CGO_ENABLED=0 -e GOOS=linux -e GOARCH="${ARCH}" \
+    -e GOCACHE=/tmp/go-cache -e GOMODCACHE=/tmp/go-mod \
+    -v "$REPO:/src" -w /src/cmd/runtime-agent \
+    golang:1.26-bookworm \
+    go build -trimpath -ldflags="-s -w" \
+      -o /src/docker/worker-slim/runtime_agent .
+fi
 ls -la "$HERE/runtime_agent"
 file "$HERE/runtime_agent" 2>/dev/null || true
 
@@ -56,17 +68,84 @@ echo ">> syncing AGENTS.md + muteki-blackboard skill into docker build context..
 cp "$REPO/docker/worker/AGENTS.md" "$HERE/AGENTS.md"
 cp "$REPO/skills/muteki-blackboard/SKILL.md" "$HERE/blackboard.SKILL.md"
 cp "$REPO/skills/muteki-blackboard/blackboard.py" "$HERE/blackboard.py"
+cp "$REPO/muteki/solver/deepseek_harness_worker.py" "$HERE/deepseek_harness_worker.py"
+cp "$REPO/muteki/solver/offline_acp_bridge.py" "$HERE/offline_acp_bridge.py"
+cp "$REPO/muteki/solver/omp_offline_config.yml" "$HERE/omp_offline_config.yml"
+cp "$REPO/muteki/solver/kimi_offline_agent.md" "$HERE/kimi_offline_agent.md"
+cp "$REPO/muteki/solver/grok_offline_agent.md" "$HERE/grok_offline_agent.md"
 chmod +x "$HERE/blackboard.py"
 
 # --platform linux/${ARCH} + --load forces the docker exporter into the local image
 # store (avoids the arm64 Docker Desktop containerd-store export bug the Kali build
 # documents). --build-arg IMAGE_VERSION stamps the OCI version label. Native host arch
 # by default → no QEMU.
-echo ">> [2/2] docker build --platform linux/${ARCH} --load -t $TAG -t $LATEST $HERE ..."
+echo ">> [2/3] docker build --platform linux/${ARCH} --load -t $TAG -t $LATEST $HERE ..."
+build_args=(--build-arg "IMAGE_VERSION=${VERSION}")
+# Docker build stages cannot reach a proxy bound to the host loopback address.
+# Forward the developer shell's proxy through Docker Desktop's stable host name.
+# apt reads the lowercase variables while several installers read the uppercase
+# variants, so always populate both spellings from whichever one the shell has.
+http_proxy_value="${http_proxy:-${HTTP_PROXY:-}}"
+https_proxy_value="${https_proxy:-${HTTPS_PROXY:-}}"
+all_proxy_value="${all_proxy:-${ALL_PROXY:-}}"
+for proxy_name in HTTP_PROXY http_proxy; do
+  if [[ -n "$http_proxy_value" ]]; then
+    proxy_value="${http_proxy_value//127.0.0.1/host.docker.internal}"
+    proxy_value="${proxy_value//localhost/host.docker.internal}"
+    build_args+=(--build-arg "${proxy_name}=${proxy_value}")
+  fi
+done
+for proxy_name in HTTPS_PROXY https_proxy; do
+  if [[ -n "$https_proxy_value" ]]; then
+    proxy_value="${https_proxy_value//127.0.0.1/host.docker.internal}"
+    proxy_value="${proxy_value//localhost/host.docker.internal}"
+    build_args+=(--build-arg "${proxy_name}=${proxy_value}")
+  fi
+done
+for proxy_name in ALL_PROXY all_proxy; do
+  if [[ -n "$all_proxy_value" ]]; then
+    proxy_value="${all_proxy_value//127.0.0.1/host.docker.internal}"
+    proxy_value="${proxy_value//localhost/host.docker.internal}"
+    build_args+=(--build-arg "${proxy_name}=${proxy_value}")
+  fi
+done
+no_proxy_value="${no_proxy:-${NO_PROXY:-}}"
+for no_proxy_name in NO_PROXY no_proxy; do
+  if [[ -n "$no_proxy_value" ]]; then
+    build_args+=(--build-arg "${no_proxy_name}=${no_proxy_value}")
+  fi
+done
+if [[ -n "${MUTEKI_UBUNTU_MIRROR:-}" ]]; then
+  build_args+=(--build-arg "UBUNTU_MIRROR=${MUTEKI_UBUNTU_MIRROR}")
+fi
+if [[ -n "${MUTEKI_NODE_MIRROR:-}" ]]; then
+  build_args+=(--build-arg "NODE_MIRROR=${MUTEKI_NODE_MIRROR}")
+fi
+if [[ -n "${MUTEKI_NPM_REGISTRY:-}" ]]; then
+  build_args+=(--build-arg "NPM_REGISTRY=${MUTEKI_NPM_REGISTRY}")
+fi
 docker build --platform "linux/${ARCH}" --load \
-  --build-arg "IMAGE_VERSION=${VERSION}" \
+  "${build_args[@]}" \
   -t "$TAG" -t "$LATEST" "$HERE"
 
-echo ">> done: $TAG (+ $LATEST)"
-echo ">> quick verify (bypass ENTRYPOINT, it's the supervisor):"
-echo "   docker run --rm --entrypoint sh $TAG -c 'id; which claude codex; ls -la /home/kali/.local/bin/cursor-agent; ls /opt/muteki'"
+echo ">> [3/3] verifying all 9 engines..."
+docker run --rm --platform "linux/${ARCH}" --user kali \
+  -e HOME=/home/kali --entrypoint bash "$TAG" -lc '
+    set -e
+    claude --version
+    codex --version
+    /home/kali/.local/bin/cursor-agent --version
+    pi --version
+    /home/kali/.local/bin/omp --version
+    kimi --version
+    /home/kali/.grok/bin/grok --version
+    opencode --version
+    python3 /opt/muteki/deepseek_harness_worker.py --version
+    test -r /opt/muteki/offline_acp_bridge.py
+    test -r /opt/muteki/omp_offline_config.yml
+    test -r /opt/muteki/kimi_offline_agent.md
+    test -r /opt/muteki/grok_offline_agent.md
+    test -x /opt/muteki/runtime_agent
+    test -x /usr/local/bin/blackboard.py
+  '
+echo ">> done: $TAG (+ $LATEST); all 9 engines verified"

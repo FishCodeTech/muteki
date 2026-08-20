@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import subprocess
 from types import SimpleNamespace
 
@@ -18,7 +17,13 @@ def test_worker_model_options_are_static_and_custom_enabled() -> None:
     assert {m["id"] for m in payload["models"]["claude"]} >= {"sonnet", "opus"}
     assert {m["id"] for m in payload["models"]["codex"]} >= {"gpt-5.5", "gpt-5.4-mini"}
     assert {m["id"] for m in payload["models"]["cursor"]} >= {"auto", "composer-2.5-fast"}
-    assert payload["models"] == WORKER_MODEL_OPTIONS
+    assert {
+        engine: [model["id"] for model in models]
+        for engine, models in payload["models"].items()
+    } == {
+        engine: [model["id"] for model in models]
+        for engine, models in WORKER_MODEL_OPTIONS.items()
+    }
 
 
 def test_probe_worker_model_injects_profile_model_and_account_env(tmp_path, monkeypatch) -> None:
@@ -29,7 +34,7 @@ def test_probe_worker_model_injects_profile_model_and_account_env(tmp_path, monk
 
     def fake_run(argv, **kwargs):
         seen["argv"] = argv
-        seen["token"] = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+        seen["token"] = kwargs["env"].get("CLAUDE_CODE_OAUTH_TOKEN")
         return subprocess.CompletedProcess(argv, 0, '{"result":"OK"}\n', "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -93,7 +98,7 @@ def test_probe_worker_model_does_not_default_local_codex_to_stale_account(
 
     def fake_run(argv, **kwargs):
         seen["argv"] = argv
-        seen["codex_home"] = os.environ.get("CODEX_HOME")
+        seen["codex_home"] = kwargs["env"].get("CODEX_HOME")
         return subprocess.CompletedProcess(
             argv,
             0,
@@ -121,6 +126,78 @@ def test_probe_worker_model_does_not_default_local_codex_to_stale_account(
     assert seen["codex_home"] is None
     assert "--model" in seen["argv"]
     assert seen["argv"][seen["argv"].index("--model") + 1] == "gpt-5.5"
+
+
+def test_probe_worker_model_local_claude_endpoint_runs_real_cli(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "_secrets" / "accounts" / "deepseek-main"
+    root.mkdir(parents=True)
+    (root / "API_KEY").write_text("deepseek-key\n")
+    (root / "BASE_URL").write_text("https://api.deepseek.example/anthropic\n")
+    (root / "ENGINE").write_text("claude\n")
+    seen: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        seen["base_url"] = kwargs["env"].get("ANTHROPIC_BASE_URL")
+        seen["api_key"] = kwargs["env"].get("ANTHROPIC_API_KEY")
+        return subprocess.CompletedProcess(argv, 0, '{"result":"OK"}\n', "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    res = probe_worker_model(
+        profile={
+            "id": "claude-deepseek-local",
+            "engine": "claude",
+            "transport": "claude_code",
+            "credential_account": "deepseek-main",
+            "credential_mode": "api_key",
+            "base_url": "https://api.deepseek.example/anthropic",
+            "runtime": "local",
+        },
+        model="deepseek-v4-pro",
+        sessions_root=tmp_path,
+        backend="local",
+    )
+
+    assert res["ok"] is True
+    assert seen["base_url"] == "https://api.deepseek.example/anthropic"
+    assert seen["api_key"] == "deepseek-key"
+    assert "--model" in seen["argv"]
+    assert seen["argv"][seen["argv"].index("--model") + 1] == "deepseek-v4-pro"
+
+
+def test_probe_worker_model_local_cursor_keeps_host_binary_path(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "_secrets" / "accounts" / "cursor-main"
+    root.mkdir(parents=True)
+    (root / "CURSOR_API_KEY").write_text("cursor-key\n")
+    seen: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        seen["api_key"] = kwargs["env"].get("CURSOR_API_KEY")
+        return subprocess.CompletedProcess(
+            argv, 0, '{"type":"result","result":"OK"}\n', "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    res = probe_worker_model(
+        profile={
+            "id": "cursor-local", "engine": "cursor",
+            "transport": "cursor_agent", "credential_account": "cursor-main",
+            "runtime": "local",
+        },
+        model="auto", sessions_root=tmp_path, backend="local",
+    )
+
+    assert res["ok"] is True
+    assert seen["api_key"] == "cursor-key"
+    argv = [str(arg) for arg in seen["argv"]]
+    assert argv[1].endswith("offline_acp_bridge.py")
+    assert argv[argv.index("--agent-bin") + 1].endswith("cursor-agent")
+    assert not argv[argv.index("--agent-bin") + 1].startswith("/home/kali/")
 
 
 def test_probe_worker_model_runs_real_worker_container_when_web_is_containerized(

@@ -99,20 +99,9 @@ func main() {
 	s.seedWorkspaceDocs()
 
 	// Reap-on-signal: as PID1, handle TERM/INT so `docker stop` is graceful.
-	sigc := make(chan os.Signal, 4)
-	signal.Notify(sigc, syscall.SIGTERM, syscall.SIGINT, syscall.SIGCHLD)
-	go func() {
-		for sig := range sigc {
-			switch sig {
-			case syscall.SIGCHLD:
-				reapOrphans()
-			default:
-				log.Printf("received %v, shutting down", sig)
-				s.killAll()
-				os.Exit(0)
-			}
-		}
-	}()
+	// Managed workers retain Cmd.Wait as their sole reaper; SIGCHLD only reaps
+	// adopted, unregistered descendants (see childReaper).
+	_ = s.installSignalHandlers(os.Exit)
 
 	if *connect == "" {
 		log.Fatalf("no --connect host:port given (reverse-connect model requires it)")
@@ -164,6 +153,10 @@ func (s *supervisor) dialHost(addr string, deadline time.Duration) net.Conn {
 			conn.Close()
 			return nil // auth failure is terminal, don't retry
 		}
+		// The bootstrap token is a one-shot capability.  Once the host has accepted
+		// Hello, the authenticated socket replaces it as the control authority; do
+		// not retain a replayable copy for the lifetime of the supervisor.
+		s.token = ""
 		s.enc = enc
 		// stash the reader so serve() continues from where Hello left off.
 		s.helloReader = r
@@ -303,10 +296,22 @@ func (s *supervisor) opHealth(req *Request) {
 func (s *supervisor) readToken(path string) string {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		log.Printf("no token file at %s (%v) — auth disabled", path, err)
+		log.Printf("no token file at %s (%v) — cannot authenticate", path, err)
 		return ""
 	}
-	return strings.TrimSpace(string(data))
+	// Unlink immediately after the root supervisor reads it, before any worker can
+	// be started.  The bind-mounted bootstrap directory remains, but is empty.
+	token := strings.TrimSpace(string(data))
+	for i := range data {
+		data[i] = 0
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		// Fail closed: retaining a replayable file until workers start would defeat
+		// the private one-shot bootstrap boundary.
+		log.Printf("could not remove bootstrap token %s: %v", path, err)
+		return ""
+	}
+	return token
 }
 
 // chownWorkspaceRoot makes the bind-mounted workspace directory owned by the kali
@@ -372,13 +377,36 @@ func (s *supervisor) killAll() {
 	}
 }
 
-func reapOrphans() {
-	for {
-		var ws syscall.WaitStatus
-		pid, err := syscall.Wait4(-1, &ws, syscall.WNOHANG, nil)
-		if pid <= 0 || err != nil {
-			return
+// installSignalHandlers installs the same signal path used by production and
+// returns a stopper for integration tests. exit is injectable so tests never call
+// os.Exit while still exercising real SIGCHLD delivery.
+func (s *supervisor) installSignalHandlers(exit func(int)) func() {
+	sigc := make(chan os.Signal, 16)
+	done := make(chan struct{})
+	var once sync.Once
+	signal.Notify(sigc, syscall.SIGTERM, syscall.SIGINT, syscall.SIGCHLD)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case sig := <-sigc:
+				switch sig {
+				case syscall.SIGCHLD:
+					reapOrphans()
+				default:
+					log.Printf("received %v, shutting down", sig)
+					s.killAll()
+					exit(0)
+				}
+			}
 		}
+	}()
+	return func() {
+		once.Do(func() {
+			signal.Stop(sigc)
+			close(done)
+		})
 	}
 }
 

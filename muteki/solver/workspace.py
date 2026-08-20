@@ -12,8 +12,11 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import time
+from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -29,6 +32,86 @@ def workspace_root_for_worker(wd: str | Path) -> Path:
     if p.parent.name == "workers":
         return p.parent.parent
     return p.parent
+
+
+def _app_version() -> str:
+    try:
+        return package_version("project-muteki")
+    except PackageNotFoundError:
+        return ""
+
+
+def _git_commit() -> str:
+    repo = Path(__file__).resolve().parents[2]
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return (result.stdout or "").strip()
+
+
+def worker_image_identity(image: str) -> dict[str, str]:
+    identity = {"name": image, "id": "", "digest": ""}
+    try:
+        result = subprocess.run(
+            [
+                "docker", "image", "inspect", image,
+                "--format", "{{.Id}}\n{{index .RepoDigests 0}}",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return identity
+    if result.returncode != 0:
+        return identity
+    lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    if lines:
+        identity["id"] = lines[0]
+    if len(lines) > 1 and lines[1] not in {"<no value>", "<nil>"}:
+        identity["digest"] = lines[1]
+    return identity
+
+
+def run_identity() -> dict[str, str]:
+    return {
+        "app_version": _app_version(),
+        "git_commit": _git_commit(),
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
+
+def load_manifest_runtime(root: str | Path) -> dict[str, Any]:
+    path = Path(root) / "manifest.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    runtime = data.get("runtime") if isinstance(data, dict) else None
+    return dict(runtime) if isinstance(runtime, dict) else {}
+
+
+def merge_manifest_runtime(
+    existing: dict[str, Any],
+    update: dict[str, Any] | None,
+) -> dict[str, Any]:
+    merged = dict(existing)
+    if update:
+        merged.update(update)
+    return merged
 
 
 def ensure_workspace(root: str | Path, *, runtime: dict[str, Any] | None = None) -> Path:
@@ -230,7 +313,7 @@ def write_manifest(root: str | Path, *, runtime: dict[str, Any] | None = None) -
             "final": "final",
         },
         "inputs": inputs,
-        "runtime": runtime or {},
+        "runtime": merge_manifest_runtime(load_manifest_runtime(root), runtime),
         "artifact_truth": "shared_graph.events",
         "shared_index": "shared/index.jsonl (rebuildable materialized view)",
     }

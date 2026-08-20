@@ -14,11 +14,11 @@ launch. On success it emits RUN_TITLED on the run's bus, which the rail picks up
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from muteki.core.events import Event, EventType
 from muteki.core.event_bus import EventBus
-from muteki.core.llm import LLMClient
+from muteki.core.llm import LLMClient, llm_temperature_kwargs
 
 TITLE_MODEL = "deepseek-v4-flash"
 
@@ -72,6 +72,9 @@ async def generate_title(
     run_id: Optional[str] = None,
     model: Optional[str] = None,
     base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    temperature_mode: Optional[str] = None,
+    temperature: Any = None,
 ) -> str:
     """Return a short title for `prompt`; emit RUN_TITLED on `bus` if given.
 
@@ -80,15 +83,21 @@ async def generate_title(
     from surfacing as an unhandled-task warning.
 
     `base_url` overrides the titler endpoint (DESIGN §2.2 補强A) — empty/None =
-    default DeepSeek. The API key is NOT passed here; it stays in .env. Only used
-    when `llm` is not injected (we own the client lifecycle).
+    default DeepSeek. `api_key` can override the environment fallback when this
+    function owns the client lifecycle.
     """
     title = fallback_title(prompt)
     owns_llm = llm is None
     try:
-        client = llm or (
-            LLMClient(base_url=base_url) if (base_url or "").strip() else LLMClient()
-        )
+        client_kwargs = llm_temperature_kwargs({
+            "temperature_mode": temperature_mode,
+            "temperature": temperature,
+        })
+        if (base_url or "").strip():
+            client_kwargs["base_url"] = str(base_url).strip()
+        if (api_key or "").strip():
+            client_kwargs["api_key"] = str(api_key).strip()
+        client = llm or LLMClient(**client_kwargs)
         try:
             resp = await client.chat(
                 model=model or TITLE_MODEL,

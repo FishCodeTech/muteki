@@ -28,6 +28,8 @@ from muteki.core.event_bus import EventBus
 from muteki.core.events import Event, EventType
 
 DEFAULT_BASE_URL = os.environ.get("MUTEKI_DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+LLM_TEMPERATURE_MODES = ("default", "custom", "omit")
+DEFAULT_CUSTOM_TEMPERATURE = 1.0
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -35,6 +37,65 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def normalize_llm_temperature(
+    mode: Any = None,
+    value: Any = None,
+    *,
+    reject_invalid: bool = False,
+    field: str = "temperature",
+) -> tuple[str, float]:
+    """Normalize a profile/request temperature switch.
+
+    ``default`` keeps each call site's built-in value, ``custom`` sends ``value``,
+    and ``omit`` drops the field so models that reject temperature still work.
+    """
+    cleaned_mode = str(mode or "default").strip().lower()
+    if cleaned_mode not in LLM_TEMPERATURE_MODES:
+        if reject_invalid:
+            raise ValueError(f"{field}_mode must be default, custom, or omit")
+        cleaned_mode = "default"
+    cleaned_value = DEFAULT_CUSTOM_TEMPERATURE
+    if value is not None and value != "":
+        try:
+            cleaned_value = float(value)
+        except (TypeError, ValueError) as exc:
+            if reject_invalid:
+                raise ValueError(f"{field} must be a number") from exc
+            cleaned_value = DEFAULT_CUSTOM_TEMPERATURE
+            if cleaned_mode == "custom":
+                cleaned_mode = "default"
+    if cleaned_value != cleaned_value or cleaned_value < 0 or cleaned_value > 2:
+        if reject_invalid:
+            raise ValueError(f"{field} must be between 0 and 2")
+        cleaned_value = DEFAULT_CUSTOM_TEMPERATURE
+        if cleaned_mode == "custom":
+            cleaned_mode = "default"
+    return cleaned_mode, cleaned_value
+
+
+def llm_temperature_kwargs(profile: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Constructor kwargs that apply an llm_profiles temperature switch."""
+    row = profile or {}
+    mode, value = normalize_llm_temperature(
+        row.get("temperature_mode"), row.get("temperature")
+    )
+    return {"temperature_mode": mode, "temperature_value": value}
+
+
+def resolve_request_temperature(
+    *,
+    mode: str,
+    value: Optional[float],
+    requested: Optional[float],
+) -> Optional[float]:
+    """Return the temperature to send, or None to omit the field."""
+    if mode == "omit":
+        return None
+    if mode == "custom" and value is not None:
+        return value
+    return requested
 
 
 def _raise_for_status(r: httpx.Response) -> None:
@@ -101,11 +162,16 @@ class LLMClient:
         timeout: float = 180.0,
         overall_timeout: float = 300.0,
         trust_env: Optional[bool] = None,
+        temperature_mode: str = "default",
+        temperature_value: Optional[float] = None,
     ) -> None:
         self.api_key = api_key or os.environ.get("MUTEKI_DEEPSEEK_API_KEY", "")
         self.base_url = base_url.rstrip("/")
         self.bus = bus
         self.cost = cost
+        self.temperature_mode, self.temperature_value = normalize_llm_temperature(
+            temperature_mode, temperature_value
+        )
         # Keep tests and local evals isolated from desktop-wide proxy settings.
         # Users who really need a proxy for the LLM API can opt in explicitly.
         self.trust_env = _env_bool("MUTEKI_LLM_TRUST_ENV", False) if trust_env is None else trust_env
@@ -133,6 +199,15 @@ class LLMClient:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+
+    def _apply_temperature(self, body: dict[str, Any], requested: Optional[float]) -> None:
+        resolved = resolve_request_temperature(
+            mode=self.temperature_mode,
+            value=self.temperature_value,
+            requested=requested,
+        )
+        if resolved is not None:
+            body["temperature"] = resolved
 
     async def _emit(self, etype: EventType, *, run_id, challenge_id, solver_id, **payload):
         if self.bus is not None and run_id is not None:
@@ -163,7 +238,7 @@ class LLMClient:
         model: str,
         messages: list[dict[str, Any]],
         tools: Optional[list[dict[str, Any]]] = None,
-        temperature: float = 0.4,
+        temperature: Optional[float] = 0.4,
         max_tokens: Optional[int] = 8000,
         stream: bool = True,
         run_id: Optional[str] = None,
@@ -173,9 +248,9 @@ class LLMClient:
         body: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "temperature": temperature,
             "stream": stream,
         }
+        self._apply_temperature(body, temperature)
         # max_tokens=None → omit the cap entirely (let the API use the model's own
         # maximum). Critical for reasoning models (deepseek-v4-pro): tokens go to
         # reasoning_content FIRST, so a small cap can be fully consumed by thinking
@@ -326,7 +401,7 @@ class LLMClient:
         *,
         model: str,
         messages: list[dict[str, Any]],
-        temperature: float = 0.3,
+        temperature: Optional[float] = 0.3,
         max_tokens: Optional[int] = 4000,
         run_id: Optional[str] = None,
         challenge_id: Optional[str] = None,
@@ -351,9 +426,9 @@ class LLMClient:
         body: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "temperature": temperature,
             "stream": True,
         }
+        self._apply_temperature(body, temperature)
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
         usage: dict[str, int] = {}

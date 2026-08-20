@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 
 import pytest
 
 from muteki.models.solve_graph import Challenge, SolveGraph
 from muteki.solver.reason import (
-    Intent, build_reason_prompt, parse_reason_reply, run_reason, dispatch_intents,
+    CognitiveHypothesisDraft,
+    Intent,
+    build_reason_prompt,
+    parse_reason_reply,
+    run_reason,
+    dispatch_intents,
+    PlannerFailureKind,
+    ReasonResult,
+    cognitive_shadow_baseline_digest,
+    run_cognitive_shadow_annotation,
 )
 from muteki.swarm.shared_graph import SQLiteSharedGraph
 
@@ -22,6 +32,7 @@ class _Resp:
 
 class ScriptedLLM:
     """Returns a fixed reply for chat()."""
+
     def __init__(self, reply: str):
         self.reply = reply
         self.calls = 0
@@ -48,8 +59,11 @@ def test_parse_clean_json():
 
 
 def test_parse_caps_intents():
-    reply = '{"intents":[' + ",".join(
-        f'{{"id":"I{i}","goal":"g{i}"}}' for i in range(10)) + ']}'
+    reply = (
+        '{"intents":['
+        + ",".join(f'{{"id":"I{i}","goal":"g{i}"}}' for i in range(10))
+        + "]}"
+    )
     r = parse_reason_reply(reply, max_intents=3)
     assert len(r.intents) == 3
 
@@ -58,6 +72,14 @@ def test_parse_garbage_is_safe():
     r = parse_reason_reply("the model rambled with no json")
     assert r.intents == []
     assert r.goal_met is False
+    assert r.planner_failure is not None
+    assert r.planner_failure.kind is PlannerFailureKind.INVALID_PLAN
+
+
+def test_parse_valid_empty_plan_is_typed():
+    r = parse_reason_reply('{"verdict":"explore","intents":[]}')
+    assert r.planner_failure is not None
+    assert r.planner_failure.kind is PlannerFailureKind.EMPTY_PLAN
 
 
 def test_shell_agent_only_when_declared():
@@ -113,9 +135,11 @@ def test_parse_preserves_lane_metadata():
 
 
 def test_audit_flags_unverified_fact():
-    reply = ('{"goal_met":false,'
-             '"intents":[{"id":"I1","goal":"VERIFY the claimed key before using it"}],'
-             '"audit":["the key is 0x1337 — unverified, no artifact"]}')
+    reply = (
+        '{"goal_met":false,'
+        '"intents":[{"id":"I1","goal":"VERIFY the claimed key before using it"}],'
+        '"audit":["the key is 0x1337 — unverified, no artifact"]}'
+    )
     r = parse_reason_reply(reply)
     assert r.audit_notes
     assert "0x1337" in r.audit_notes[0]
@@ -123,10 +147,19 @@ def test_audit_flags_unverified_fact():
 
 def test_prompt_includes_summary_and_candidate_section():
     g = SolveGraph(challenge=Challenge(id="t", name="t", category="crypto"))
-    g.add_evidence(source="x", fact="ciphertext loaded", verified=True,
-                   verifier="substring_in_artifact")
-    g.add_evidence(source="x", fact="maybe rsa", verified=False, confidence=0.4,
-                   verifier="artifact_readable_unlocated")
+    g.add_evidence(
+        source="x",
+        fact="ciphertext loaded",
+        verified=True,
+        verifier="substring_in_artifact",
+    )
+    g.add_evidence(
+        source="x",
+        fact="maybe rsa",
+        verified=False,
+        confidence=0.4,
+        verifier="artifact_readable_unlocated",
+    )
     summary = g.to_summary()
     msgs = build_reason_prompt(summary)
     assert "Candidates / needs verification" in msgs[1]["content"]
@@ -134,7 +167,9 @@ def test_prompt_includes_summary_and_candidate_section():
 
 
 def test_run_reason_end_to_end():
-    llm = ScriptedLLM('{"goal_met":false,"intents":[{"id":"I1","goal":"do the thing"}]}')
+    llm = ScriptedLLM(
+        '{"goal_met":false,"intents":[{"id":"I1","goal":"do the thing"}]}'
+    )
     r = asyncio.run(run_reason(llm=llm, model="flash", graph_summary="# c"))
     assert llm.calls == 1
     assert r.intents[0].goal == "do the thing"
@@ -147,23 +182,100 @@ def test_run_reason_prompt_includes_fact_index_for_model_pinning():
             return await super().chat(**kw)
 
     llm = CapturingLLM('{"goal_met":false,"pinned_facts":[9],"intents":[]}')
-    r = asyncio.run(run_reason(
-        llm=llm, model="flash", graph_summary="# c",
-        fact_index="[#9] verified :: 后台口令是 admin / 猎人二号",
-    ))
+    r = asyncio.run(
+        run_reason(
+            llm=llm,
+            model="flash",
+            graph_summary="# c",
+            fact_index="[#9] verified :: 后台口令是 admin / 猎人二号",
+        )
+    )
     user_msg = llm.messages[1]["content"]
     assert "Fact retention index" in user_msg
     assert "后台口令" in user_msg
     assert r.pinned_facts == [9]
 
 
+def test_separate_cognitive_annotation_call_is_attributably_metered_and_plan_bound():
+    baseline = ReasonResult(
+        goal_met=False,
+        intents=[Intent("I1", "Run the frozen probe", route_hash="probe:frozen")],
+        audit_notes=[],
+    )
+    reply = json.dumps(
+        {
+            "baseline_digest": cognitive_shadow_baseline_digest(baseline),
+            "annotations": [
+                {
+                    "id": "I1",
+                    "goal": "Run the frozen probe",
+                    "cognitive_experiment": {
+                        "predictions": {"CH1": "yes", "CH2": "no"},
+                        "capability": "general-code",
+                        "supplied_cost_estimate_units": 2,
+                    },
+                }
+            ],
+            "cognitive_hypotheses": [
+                {
+                    "id": "CH1",
+                    "claim": "first",
+                    "rationale": "fact A",
+                    "weight_units": 60,
+                },
+                {
+                    "id": "CH2",
+                    "claim": "second",
+                    "rationale": "fact B",
+                    "weight_units": 40,
+                },
+            ],
+        }
+    )
+
+    class CapturingLLM(ScriptedLLM):
+        async def chat(self, **kwargs):
+            self.kwargs = kwargs
+            return await super().chat(**kwargs)
+
+    llm = CapturingLLM(reply)
+    annotated = asyncio.run(
+        run_cognitive_shadow_annotation(
+            llm=llm,
+            model="flash",
+            graph_summary="verified graph",
+            baseline_result=baseline,
+            run_id="run-1",
+            challenge_id="challenge-1",
+        )
+    )
+
+    assert llm.kwargs["solver_id"] == "reason-cognitive-shadow"
+    assert llm.kwargs["run_id"] == "run-1"
+    assert llm.kwargs["challenge_id"] == "challenge-1"
+    assert llm.kwargs["stream"] is False
+    assert annotated.intents[0].to_payload() == baseline.intents[0].to_payload()
+    assert annotated.intents[0].goal == baseline.intents[0].goal
+    assert annotated.intents[0].cognitive_predictions == {"CH1": "yes", "CH2": "no"}
+    assert annotated.intents[0].cognitive_supplied_cost_estimate_units == 2
+    assert all(
+        type(item) is CognitiveHypothesisDraft
+        for item in annotated.cognitive_hypotheses
+    )
+
+
 def test_dispatch_intents_to_shared_graph(tmp_path):
-    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
-                               challenge=Challenge(id="t", name="t", category="crypto"))
+    g = SQLiteSharedGraph.open(
+        db_path=tmp_path / "g.db",
+        challenge=Challenge(id="t", name="t", category="crypto"),
+    )
     from muteki.solver.reason import ReasonResult
-    res = ReasonResult(goal_met=False,
-                       intents=[Intent("I1", "crack xor"), Intent("I2", "find header")],
-                       audit_notes=[])
+
+    res = ReasonResult(
+        goal_met=False,
+        intents=[Intent("I1", "crack xor"), Intent("I2", "find header")],
+        audit_notes=[],
+    )
     proposed = dispatch_intents(g, res)
     # dispatch_intents returns the list of intents actually proposed (so the caller
     # can emit blackboard intent_proposed events), not a bare count. Each id is now
@@ -187,18 +299,36 @@ def test_dispatch_intents_unique_id_survives_round_reuse(tmp_path):
     DIFFERENT goal under the same raw id is a distinct intent; the SAME goal is still
     correctly deduped."""
     from muteki.solver.reason import ReasonResult
-    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
-                               challenge=Challenge(id="t", name="t", category="web"))
+
+    g = SQLiteSharedGraph.open(
+        db_path=tmp_path / "g.db", challenge=Challenge(id="t", name="t", category="web")
+    )
     # round 1: I1 = "probe /login"
-    r1 = dispatch_intents(g, ReasonResult(
-        goal_met=False, intents=[Intent("I1", "probe /login")], audit_notes=[]))
+    r1 = dispatch_intents(
+        g,
+        ReasonResult(
+            goal_met=False, intents=[Intent("I1", "probe /login")], audit_notes=[]
+        ),
+    )
     # round 2: model reuses id "I1" but for a genuinely different direction
-    r2 = dispatch_intents(g, ReasonResult(
-        goal_met=False, intents=[Intent("I1", "fuzz /export for SSRF")], audit_notes=[]))
+    r2 = dispatch_intents(
+        g,
+        ReasonResult(
+            goal_met=False,
+            intents=[Intent("I1", "fuzz /export for SSRF")],
+            audit_notes=[],
+        ),
+    )
     # round 3: same raw id AND same goal as round 1 → must dedupe (no duplicate work)
-    r3 = dispatch_intents(g, ReasonResult(
-        goal_met=False, intents=[Intent("I1", "probe /login")], audit_notes=[]))
-    assert len(r1) == 1 and len(r2) == 1, "different goals under reused I1 must BOTH propose"
+    r3 = dispatch_intents(
+        g,
+        ReasonResult(
+            goal_met=False, intents=[Intent("I1", "probe /login")], audit_notes=[]
+        ),
+    )
+    assert len(r1) == 1 and len(r2) == 1, (
+        "different goals under reused I1 must BOTH propose"
+    )
     assert r1[0]["intent_id"] != r2[0]["intent_id"], "distinct goals → distinct ids"
     assert len(r3) == 0, "identical goal re-proposed must be deduped"
     g.close()
@@ -210,139 +340,195 @@ def test_dispatch_drops_near_duplicate_of_open_intent(tmp_path):
     so 'Submit the L1 flag to the dashboard' would otherwise re-propose as new
     against an open 'Request the operator to submit L1 flag to dashboard'."""
     from muteki.solver.reason import ReasonResult
-    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
-                               challenge=Challenge(id="t", name="t", category="web"))
-    r1 = dispatch_intents(g, ReasonResult(
-        goal_met=False,
-        intents=[Intent("I1", "Submit the L1 flag to the dashboard")],
-        audit_notes=[]))
+
+    g = SQLiteSharedGraph.open(
+        db_path=tmp_path / "g.db", challenge=Challenge(id="t", name="t", category="web")
+    )
+    r1 = dispatch_intents(
+        g,
+        ReasonResult(
+            goal_met=False,
+            intents=[Intent("I1", "Submit the L1 flag to the dashboard")],
+            audit_notes=[],
+        ),
+    )
     assert len(r1) == 1
     # a filler-word rewording of the SAME direction → dropped
-    r2 = dispatch_intents(g, ReasonResult(
-        goal_met=False,
-        intents=[Intent("I1", "Submit L1 flag to dashboard now")],
-        audit_notes=[]))
+    r2 = dispatch_intents(
+        g,
+        ReasonResult(
+            goal_met=False,
+            intents=[Intent("I1", "Submit L1 flag to dashboard now")],
+            audit_notes=[],
+        ),
+    )
     assert len(r2) == 0, "near-duplicate of an open intent must be dropped"
     # a genuinely different direction still gets through
-    r3 = dispatch_intents(g, ReasonResult(
-        goal_met=False,
-        intents=[Intent("I1", "Brute-force the SSH password for ghost3")],
-        audit_notes=[]))
+    r3 = dispatch_intents(
+        g,
+        ReasonResult(
+            goal_met=False,
+            intents=[Intent("I1", "Brute-force the SSH password for ghost3")],
+            audit_notes=[],
+        ),
+    )
     assert len(r3) == 1, "a distinct direction must still propose"
     g.close()
 
 
 def test_dispatch_drops_llm_marked_duplicate(tmp_path):
     from muteki.solver.reason import ReasonResult
-    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
-                               challenge=Challenge(id="t", name="t", category="web"))
-    g.propose_intent(actor="reason", intent_id="I-old",
-                     goal="enumerate admin routes")
 
-    out = dispatch_intents(g, ReasonResult(
-        goal_met=False,
-        intents=[Intent("I1", "list the administrator endpoints", dup_of="I-old")],
-        audit_notes=[],
-        semantic_dedupe_available=True,
-    ))
+    g = SQLiteSharedGraph.open(
+        db_path=tmp_path / "g.db", challenge=Challenge(id="t", name="t", category="web")
+    )
+    g.propose_intent(actor="reason", intent_id="I-old", goal="enumerate admin routes")
+
+    out = dispatch_intents(
+        g,
+        ReasonResult(
+            goal_met=False,
+            intents=[Intent("I1", "list the administrator endpoints", dup_of="I-old")],
+            audit_notes=[],
+            semantic_dedupe_available=True,
+        ),
+    )
 
     assert out == []
     g.close()
 
 
-def test_dispatch_semantic_mode_does_not_apply_character_fallback(tmp_path):
+def test_dispatch_semantic_mode_keeps_mechanical_near_duplicate_backstop(tmp_path):
     from muteki.solver.reason import ReasonResult
-    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
-                               challenge=Challenge(id="t", name="t", category="web"))
-    g.propose_intent(actor="reason", intent_id="I-old",
-                     goal="Submit the L1 flag to the dashboard")
 
-    out = dispatch_intents(g, ReasonResult(
-        goal_met=False,
-        intents=[Intent("I1", "Submit L1 flag to dashboard now")],
-        audit_notes=[],
-        semantic_dedupe_available=True,
-    ))
+    g = SQLiteSharedGraph.open(
+        db_path=tmp_path / "g.db", challenge=Challenge(id="t", name="t", category="web")
+    )
+    g.propose_intent(
+        actor="reason", intent_id="I-old", goal="Submit the L1 flag to the dashboard"
+    )
 
-    assert len(out) == 1
-    assert out[0]["goal"] == "Submit L1 flag to dashboard now"
+    out = dispatch_intents(
+        g,
+        ReasonResult(
+            goal_met=False,
+            intents=[Intent("I1", "Submit L1 flag to dashboard now")],
+            audit_notes=[],
+            semantic_dedupe_available=True,
+        ),
+    )
+
+    assert out == []
     g.close()
 
 
 def test_dispatch_fallback_duplicate_only_when_semantic_unavailable(tmp_path):
     from muteki.solver.reason import ReasonResult
-    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
-                               challenge=Challenge(id="t", name="t", category="web"))
-    g.propose_intent(actor="reason", intent_id="I-old",
-                     goal="Submit the L1 flag to the dashboard")
 
-    out = dispatch_intents(g, ReasonResult(
-        goal_met=False,
-        intents=[Intent("I1", "Submit L1 flag to dashboard now")],
-        audit_notes=[],
-    ))
+    g = SQLiteSharedGraph.open(
+        db_path=tmp_path / "g.db", challenge=Challenge(id="t", name="t", category="web")
+    )
+    g.propose_intent(
+        actor="reason", intent_id="I-old", goal="Submit the L1 flag to the dashboard"
+    )
+
+    out = dispatch_intents(
+        g,
+        ReasonResult(
+            goal_met=False,
+            intents=[Intent("I1", "Submit L1 flag to dashboard now")],
+            audit_notes=[],
+        ),
+    )
 
     assert out == []
     g.close()
 
 
-def test_dispatch_starvation_valve_allows_one_when_wall_empty(tmp_path):
+def test_dispatch_does_not_force_duplicate_when_wall_empty(tmp_path):
     from muteki.solver.reason import ReasonResult
-    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
-                               challenge=Challenge(id="t", name="t", category="web"))
 
-    out = dispatch_intents(g, ReasonResult(
-        goal_met=False,
-        intents=[Intent("I1", "rerun login recon", dup_of="I-gone")],
-        audit_notes=[],
-        semantic_dedupe_available=True,
-    ))
+    g = SQLiteSharedGraph.open(
+        db_path=tmp_path / "g.db", challenge=Challenge(id="t", name="t", category="web")
+    )
 
-    assert len(out) == 1
-    assert out[0]["goal"] == "rerun login recon"
+    out = dispatch_intents(
+        g,
+        ReasonResult(
+            goal_met=False,
+            intents=[Intent("I1", "rerun login recon", dup_of="I-gone")],
+            audit_notes=[],
+            semantic_dedupe_available=True,
+        ),
+    )
+
+    assert out == []
     g.close()
 
 
-def test_dispatch_starvation_valve_uses_dispatchable_not_claimed_goals(tmp_path):
+def test_dispatch_does_not_force_duplicate_around_claimed_goal(tmp_path):
     from muteki.solver.reason import ReasonResult
-    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
-                               challenge=Challenge(id="t", name="t", category="web"))
-    g.propose_intent(actor="reason", intent_id="I-held",
-                     goal="enumerate login injection")
+
+    g = SQLiteSharedGraph.open(
+        db_path=tmp_path / "g.db", challenge=Challenge(id="t", name="t", category="web")
+    )
+    g.propose_intent(
+        actor="reason", intent_id="I-held", goal="enumerate login injection"
+    )
     assert g.claim_intent(worker="cli-held", intent_id="I-held", lease_s=3600) is True
 
-    out = dispatch_intents(g, ReasonResult(
-        goal_met=False,
-        intents=[Intent("I1", "enumerate login injection more carefully",
-                        dup_of="I-held")],
-        audit_notes=[],
-        semantic_dedupe_available=True,
-    ))
+    out = dispatch_intents(
+        g,
+        ReasonResult(
+            goal_met=False,
+            intents=[
+                Intent(
+                    "I1", "enumerate login injection more carefully", dup_of="I-held"
+                )
+            ],
+            audit_notes=[],
+            semantic_dedupe_available=True,
+        ),
+    )
 
-    assert len(out) == 1
-    assert out[0]["goal"] == "enumerate login injection more carefully"
+    assert out == []
     g.close()
 
 
 def test_dispatch_route_dedupes_plain_intents_but_exempts_review(tmp_path):
     from muteki.solver.reason import ReasonResult
-    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
-                               challenge=Challenge(id="t", name="t", category="web"))
-    g.propose_intent(
-        actor="reason", intent_id="I-open", goal="try login SQL injection",
-        payload={"worker_class": "code", "route_hash": "web:login:sqli"})
 
-    out = dispatch_intents(g, ReasonResult(
-        goal_met=False,
-        intents=[
-            Intent("I1", "try SQL injection on the login form",
-                   route_hash="WEB LOGIN SQLi"),
-            Intent("I2", "review the repeated login SQLi loop",
-                   worker_class="review", route_hash="WEB LOGIN SQLi"),
-        ],
-        audit_notes=[],
-        semantic_dedupe_available=True,
-    ))
+    g = SQLiteSharedGraph.open(
+        db_path=tmp_path / "g.db", challenge=Challenge(id="t", name="t", category="web")
+    )
+    g.propose_intent(
+        actor="reason",
+        intent_id="I-open",
+        goal="try login SQL injection",
+        payload={"worker_class": "code", "route_hash": "web:login:sqli"},
+    )
+
+    out = dispatch_intents(
+        g,
+        ReasonResult(
+            goal_met=False,
+            intents=[
+                Intent(
+                    "I1",
+                    "try SQL injection on the login form",
+                    route_hash="WEB LOGIN SQLi",
+                ),
+                Intent(
+                    "I2",
+                    "review the repeated login SQLi loop",
+                    worker_class="review",
+                    route_hash="WEB LOGIN SQLi",
+                ),
+            ],
+            audit_notes=[],
+            semantic_dedupe_available=True,
+        ),
+    )
 
     assert [x["worker_class"] for x in out] == ["review"]
     assert out[0]["goal"].startswith("review")
@@ -353,14 +539,56 @@ def test_dispatch_dedupes_two_wordings_within_one_batch(tmp_path):
     """Reason sometimes emits two wordings of one direction in a SINGLE round; the
     second must drop against the first proposed this batch (not just the board)."""
     from muteki.solver.reason import ReasonResult
-    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
-                               challenge=Challenge(id="t", name="t", category="web"))
-    out = dispatch_intents(g, ReasonResult(
-        goal_met=False,
-        intents=[Intent("I1", "Download and analyze the admin JS bundle"),
-                 Intent("I2", "Download and analyze admin JS bundle now")],
-        audit_notes=[]))
+
+    g = SQLiteSharedGraph.open(
+        db_path=tmp_path / "g.db", challenge=Challenge(id="t", name="t", category="web")
+    )
+    out = dispatch_intents(
+        g,
+        ReasonResult(
+            goal_met=False,
+            intents=[
+                Intent("I1", "Download and analyze the admin JS bundle"),
+                Intent("I2", "Download and analyze admin JS bundle now"),
+            ],
+            audit_notes=[],
+        ),
+    )
     assert len(out) == 1, "two wordings of one direction in a batch → one proposed"
+    g.close()
+
+
+def test_dispatch_rewrites_same_batch_dependencies_to_suffixed_ids(tmp_path):
+    from muteki.solver.reason import ReasonResult
+
+    g = SQLiteSharedGraph.open(
+        db_path=tmp_path / "g.db", challenge=Challenge(id="t", name="t", category="web")
+    )
+    out = dispatch_intents(
+        g,
+        ReasonResult(
+            goal_met=False,
+            intents=[
+                Intent("I1", "derive session token"),
+                Intent("I2", "use session token", depends_on=["I1"]),
+            ],
+            audit_notes=[],
+            semantic_dedupe_available=True,
+        ),
+    )
+
+    assert len(out) == 2
+    parent, child = out[0]["intent_id"], out[1]["intent_id"]
+    assert parent.startswith("I1-")
+    with g._lock:
+        row = g._conn.execute(
+            "SELECT depends_on_intent_id FROM intent_dependencies "
+            "WHERE intent_id=?",
+            (child,),
+        ).fetchone()
+    assert row == (parent,)
+    rows = g.query_legacy_candidates(now=0)
+    assert [row["intent_id"] for row in rows] == [parent]
     g.close()
 
 
@@ -369,34 +597,45 @@ def test_dispatch_allows_distinct_directions_not_overpruned(tmp_path):
     be so aggressive it collapses genuinely distinct directions (which would starve
     Explore). Four clearly-different goals must ALL propose."""
     from muteki.solver.reason import ReasonResult
-    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db",
-                               challenge=Challenge(id="t", name="t", category="web"))
-    out = dispatch_intents(g, ReasonResult(
-        goal_met=False,
-        intents=[Intent("I1", "Probe /api/v3/admin for an IDOR"),
-                 Intent("I2", "Decode the JWT and forge an admin token"),
-                 Intent("I3", "Fetch HAR files from har.telos-health.local"),
-                 Intent("I4", "Query the Wayback Machine for archived JS")],
-        audit_notes=[]))
+
+    g = SQLiteSharedGraph.open(
+        db_path=tmp_path / "g.db", challenge=Challenge(id="t", name="t", category="web")
+    )
+    out = dispatch_intents(
+        g,
+        ReasonResult(
+            goal_met=False,
+            intents=[
+                Intent("I1", "Probe /api/v3/admin for an IDOR"),
+                Intent("I2", "Decode the JWT and forge an admin token"),
+                Intent("I3", "Fetch HAR files from har.telos-health.local"),
+                Intent("I4", "Query the Wayback Machine for archived JS"),
+            ],
+            audit_notes=[],
+        ),
+    )
     assert len(out) == 4, "distinct directions must not be over-pruned"
     g.close()
 
 
 # ── verdict state machine (complete / course_correct / explore) ──
 
+
 def test_verdict_explicit_complete():
     r = parse_reason_reply(
         '{"verdict":"complete","complete_why":"flag printed in real stdout",'
-        '"intents":[]}')
+        '"intents":[]}'
+    )
     assert r.verdict == "complete"
-    assert r.goal_met is True          # complete implies goal_met for old callers
+    assert r.goal_met is True  # complete implies goal_met for old callers
     assert "real stdout" in r.complete_why
 
 
 def test_verdict_course_correct_carries_drift():
     r = parse_reason_reply(
         '{"verdict":"course_correct","drift":"stuck probing /login; flag is on /home",'
-        '"intents":[{"id":"I1","goal":"follow the redirect to /home"}]}')
+        '"intents":[{"id":"I1","goal":"follow the redirect to /home"}]}'
+    )
     assert r.verdict == "course_correct"
     assert "home" in r.drift
     assert r.intents[0].goal.startswith("follow the redirect")

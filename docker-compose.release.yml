@@ -1,0 +1,65 @@
+# Project Muteki 版本化生产部署。
+#
+# 公开默认镜像仓库是 ghcr.io/fishcodetech。
+# Git / GHCR 标签带 v，例如 v0.3.0。
+# 私有 GHCR 需要先 docker login ghcr.io，并设置 MUTEKI_IMAGE_REGISTRY。
+#
+# MUTEKI_IMAGE_REGISTRY=ghcr.io/fishcodetech \
+# MUTEKI_RELEASE_VERSION=v0.3.0 \
+# MUTEKI_HOST_DATA_ROOT=/opt/muteki/data \
+# MUTEKI_WEB_PASSWORD=... docker compose -f docker-compose.release.yml up -d --wait
+
+name: muteki
+
+networks:
+  muteki_net:
+    name: ${MUTEKI_WORKER_NETWORK:-muteki_net}
+
+services:
+  web-api:
+    image: ${MUTEKI_IMAGE_REGISTRY:-ghcr.io/fishcodetech}/muteki-web:${MUTEKI_RELEASE_VERSION:-v0.3.0}
+    networks: [muteki_net]
+    ports:
+      - "${MUTEKI_API_PORT:-8000}:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${MUTEKI_HOST_DATA_ROOT:?set MUTEKI_HOST_DATA_ROOT to an absolute host path}:${MUTEKI_HOST_DATA_ROOT}
+    environment:
+      MUTEKI_DEPLOYMENT_MODE: "compose"
+      MUTEKI_IN_CONTAINER: "1"
+      MUTEKI_CONTROL_BIND: "0.0.0.0"
+      MUTEKI_CONTROL_HOST: "web-api"
+      MUTEKI_WORKER_NETWORK: "${MUTEKI_WORKER_NETWORK:-muteki_net}"
+      MUTEKI_HOST_DATA_ROOT: "${MUTEKI_HOST_DATA_ROOT}"
+      MUTEKI_CONTAINER_DATA_ROOT: "${MUTEKI_HOST_DATA_ROOT}"
+      MUTEKI_SESSIONS_ROOT: "${MUTEKI_HOST_DATA_ROOT}/sessions"
+      MUTEKI_COORDINATOR_CONTROL_ROOT: "${MUTEKI_HOST_DATA_ROOT}/coordinator-control"
+      MUTEKI_WEB_BIND: "0.0.0.0"
+      MUTEKI_WEB_PASSWORD: "${MUTEKI_WEB_PASSWORD:?set MUTEKI_WEB_PASSWORD}"
+      MUTEKI_WORKER_IMAGE: "${MUTEKI_IMAGE_REGISTRY:-ghcr.io/fishcodetech}/muteki-worker:${MUTEKI_RELEASE_VERSION:-v0.3.0}"
+      MUTEKI_WORKER_IMAGE_VERSION: "${MUTEKI_RELEASE_VERSION:-v0.3.0}"
+      MUTEKI_RELEASE_REPOSITORY: "${MUTEKI_RELEASE_REPOSITORY:-FishCodeTech/muteki}"
+      MUTEKI_IMAGE_REGISTRY: "${MUTEKI_IMAGE_REGISTRY:-ghcr.io/fishcodetech}"
+      MUTEKI_GITHUB_TOKEN: "${MUTEKI_GITHUB_TOKEN:-}"
+      MUTEKI_UPDATE_MANIFEST_URL: "${MUTEKI_UPDATE_MANIFEST_URL:-}"
+      MUTEKI_DEEPSEEK_API_KEY: "${MUTEKI_DEEPSEEK_API_KEY:-}"
+      MUTEKI_DEEPSEEK_BASE_URL: "${MUTEKI_DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}"
+      MUTEKI_LLM_TRUST_ENV: "${MUTEKI_LLM_TRUST_ENV:-0}"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  ui:
+    image: ${MUTEKI_IMAGE_REGISTRY:-ghcr.io/fishcodetech}/muteki-ui:${MUTEKI_RELEASE_VERSION:-v0.3.0}
+    networks: [muteki_net]
+    ports:
+      - "${MUTEKI_UI_PORT:-3001}:3001"
+    environment:
+      MUTEKI_BACKEND: "http://web-api:8000"
+    depends_on:
+      web-api:
+        condition: service_healthy
+    restart: unless-stopped

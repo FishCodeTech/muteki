@@ -9,6 +9,9 @@ import { DeckState, EventType, MutekiEvent, emptyDeck, reduce } from "./events";
  * still available for manual experiments that intentionally bypass that proxy.
  */
 export const API = process.env.NEXT_PUBLIC_MUTEKI_API || "";
+const CONTROL_CAS_ACTIONS = new Set([
+  "pause", "freeze", "resume", "thaw", "stop", "complete",
+]);
 
 // ---------------------------------------------------------------------------
 // Auth (P3): single-password gate. The operator types a password once; the
@@ -238,7 +241,12 @@ export function useRun(runId: string) {
   );
 
   const sendHitl = useCallback(
-    async (target: string, action: string, text: string, opts?: { preemption?: string }) => {
+    async (target: string, action: string, text: string, opts?: {
+      preemption?: string;
+      requestId?: string;
+      commandId?: string;
+      expectedGeneration?: number;
+    }) => {
       // A redirect can carry a NEW target URL ("the challenge moved here") — pull
       // the first URL out of the text and send it as `url` so the worker retargets
       // its next turn. A message prefixed with "standing:" (or 常驻:) is persistent
@@ -247,6 +255,15 @@ export function useRun(runId: string) {
       // B: an explicit directive carries a preemption policy (how aggressively it
       // overrides in-flight work). Default soft_rebind (rebind next batch, no kill).
       if (opts?.preemption) body.preempt_policy = opts.preemption;
+      if (opts?.requestId) body.request_id = opts.requestId;
+      if (opts?.commandId) body.command_id = opts.commandId;
+      if (opts?.expectedGeneration != null) {
+        body.expected_generation = opts.expectedGeneration;
+      } else if (CONTROL_CAS_ACTIONS.has(action)) {
+        // Stable run-state mutations use the latest generation observed over SSE.
+        // A stale tab gets a clean 409 instead of silently overwriting newer intent.
+        body.expected_generation = deck.controlGeneration;
+      }
       if (action === "directive" && !opts?.preemption) body.preempt_policy = "soft_rebind";
       const m = text.match(/https?:\/\/[^\s"'<>]+/);
       if ((action === "redirect" || action === "directive") && m) body.url = m[0].replace(/[.,;)]+$/, "");
@@ -266,13 +283,21 @@ export function useRun(runId: string) {
                /\b(ssh|vps|反弹|reverse[- ]?shell|root@|端口转发|port[- ]?forward|credential|凭证|账号|密码|password|跳板|中转)\b/i.test(text)) {
         body.standing = true;
       }
-      await apiFetch(`/api/runs/${runId}/hitl`, {
+      const res = await apiFetch(`/api/runs/${runId}/control`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
+      const data: any = await res.json().catch(() => ({}));
+      // The control endpoint can return a structured admission failure with an
+      // HTTP 2xx status. Do not let callers interpret `{ok:false}` as a recorded
+      // answer and lock the decision card.
+      if (!res.ok || data?.ok === false) {
+        throw new Error(data?.detail || `control failed (${res.status})`);
+      }
+      return data;
     },
-    [runId]
+    [runId, deck.controlGeneration]
   );
 
   // "继续做题": relaunch the FULL swarm on a finished run (reuses its workspace so
@@ -421,13 +446,15 @@ export async function openWorkspace(runId: string): Promise<boolean> {
 
 // ── engine status ────────────────────────────────────────────────────────────
 
-/** Per-engine availability + health. */
+/** Per-dispatched-worker availability + health. */
 export interface EngineStatus {
   engine: string;
   bin: string;
   available: boolean;
   healthy?: boolean;
   health_detail?: string;
+  profile_id?: string;
+  profile_name?: string;
 }
 
 /** Deep per-engine self-check result (FE-healthcheck-page). */
@@ -548,6 +575,20 @@ export function useFolders(pollMs = 8000, bump = 0): Folder[] {
 
 // ── worker-roster management (BE-worker-management) ─────────────────────────
 
+export type LlmTemperatureMode = "default" | "custom" | "omit";
+
+export type LlmProfile = {
+  provider: string;
+  model: string;
+  base_url?: string;
+  connection?: "default" | "custom_endpoint";
+  temperature_mode?: LlmTemperatureMode;
+  temperature?: number;
+  api_key?: string;
+  clear_api_key?: boolean;
+  credential_source?: "saved" | "environment" | "missing";
+};
+
 /** The default worker roster the dispatch path falls back to. Mirrors the
  *  backend WorkerConfigStore (apps/web/worker_config.py). */
 export interface WorkerSettings {
@@ -555,6 +596,7 @@ export interface WorkerSettings {
   start_workers: number;
   max_workers: number;
   worker_backend: "local" | "container";
+  worker_network: "bridge" | "host" | "none";
   race_scout: boolean;
   race_timeout: number;
   wall_clock_budget: number;
@@ -583,23 +625,24 @@ export interface WorkerSettings {
         max_concurrent?: number;
         cooldown_events?: number;
         max_review_workers?: number;
+        reasoning_effort?: string;
+      };
+      verifier?: {
+        enabled?: boolean;
+        engine?: string;
+        timeout?: number;
+        max_concurrent?: number;
+        max_verifier_workers?: number;
+        allow_verifier_fallback?: boolean;
+        reasoning_effort?: string;
       };
     };
     budgets: { max_total_workers: number; cost_budget_usd: number };
   };
   llm_profiles: {
-    planner: { provider: string; model: string; base_url?: string };
-    titler: { provider: string; model: string; base_url?: string };
+    planner: LlmProfile;
+    titler: LlmProfile;
   };
-  runtime_profiles: {
-    id: string;
-    backend: "local" | "container";
-    label: string;
-    network?: string;
-    memory?: string;
-    cpus?: string;
-    pids_limit?: number;
-  }[];
   worker_profiles: {
     id: string;
     name?: string;
@@ -611,21 +654,55 @@ export interface WorkerSettings {
     api_key_ref?: string;
     base_url?: string;
     wire_api?: string;
-    runtime: string;
     roles: string[];
     race: boolean;
     max_running: number;
     max_review_running?: number;
     priority: number;
     model?: string;
+    reasoning_effort?: string;
     enabled: boolean;
   }[];
+  /** Canonical settings identity model. The legacy worker_profiles projection is
+   * still returned for the scheduler and health routes, but new settings UI must
+   * edit these objects so disabled seats and explicit credential bindings survive. */
+  seats?: {
+    id: string;
+    label: string;
+    engine: string;
+    credential_id: string;
+    model?: string;
+    reasoning_effort?: string;
+    roles: string[];
+    race: boolean;
+    capacity: { max_running: number; max_review_running: number };
+    priority: number;
+    enabled: boolean;
+  }[];
+  credentials?: {
+    id: string;
+    label: string;
+    engine: string;
+    kind: "system_inherit" | "engine_key" | "custom_endpoint";
+    secret_ref: string;
+    target_engine?: string;
+    endpoint?: { base_url?: string; wire_api?: string };
+    updated_at?: number | null;
+  }[];
+  seat_alias?: Record<string, string>;
+  credential_alias?: Record<string, string>;
   overrides: Record<string, { engines: string[]; start_workers: number }>;
 }
 
 export interface CredentialAccount {
   account_id: string;
   engine: string;
+  worker_engine?: string;
+  connection?: "official" | "custom_endpoint";
+  base_url?: string;
+  provider?: string;
+  suggested_model?: string;
+  credential_format?: "oauth_token" | "auth_json" | "auth_home" | "api_key" | "unknown";
   mode: string;
   present: boolean;
   writable_state: boolean;
@@ -633,10 +710,36 @@ export interface CredentialAccount {
   details: Record<string, unknown>;
 }
 
+export type WorkerModelOption = {
+  id: string;
+  label: string;
+  reasoning?: {
+    supported: boolean;
+    levels: string[];
+    default?: string;
+  };
+};
+
 export interface WorkerModelOptions {
   allow_custom: boolean;
-  models: Record<string, { id: string; label: string }[]>;
+  manual_updated_at?: string | null;
+  manual_models: Record<string, WorkerModelOption[]>;
+  discovered_models: Record<string, WorkerModelOption[]>;
+  models_by_profile: Record<string, WorkerModelOption[]>;
+  discovery: Record<string, { engine: string; source: string; updated_at?: number | null; count: number }>;
+  discovery_results?: { profile_id: string; engine: string; ok: boolean; detail: string; source: string; models: WorkerModelOption[] }[];
+  discovery_ok?: boolean;
+  models: Record<string, WorkerModelOption[]>;
 }
+
+const emptyWorkerModelOptions = (): WorkerModelOptions => ({
+  allow_custom: true,
+  manual_models: {},
+  discovered_models: {},
+  models_by_profile: {},
+  discovery: {},
+  models: {},
+});
 
 export async function getWorkerSettings(): Promise<WorkerSettings | null> {
   try {
@@ -649,17 +752,105 @@ export async function getWorkerSettings(): Promise<WorkerSettings | null> {
   }
 }
 
+export interface PlatformUpdateStatus {
+  status: "idle" | "checking" | "available" | "current" | "downloading" | "preparing" | "switching" | "installed" | "rolled_back" | "error" | string;
+  current_version: string;
+  active_version?: string | null;
+  latest_version?: string | null;
+  previous_version?: string | null;
+  available: boolean;
+  progress?: number | null;
+  message?: string | null;
+  error?: string | null;
+  checked_at?: string | null;
+  updated_at?: string | null;
+  restart_required: boolean;
+  install_kind: "source" | "managed" | "compose";
+  install_root: string;
+  channel: string;
+  deployment: string;
+  running?: boolean;
+}
+
+async function platformUpdateRequest(path: string, init?: RequestInit): Promise<PlatformUpdateStatus | null> {
+  try {
+    const headers = new Headers(init?.headers || {});
+    const method = (init?.method || "GET").toUpperCase();
+    if (method !== "GET" && method !== "HEAD" && !headers.has("Content-Type")) {
+      headers.set("Content-Type", "application/json");
+    }
+    const response = await apiFetch(path, {
+      ...init,
+      headers,
+      body: init?.body ?? (method === "GET" || method === "HEAD" ? undefined : "{}"),
+    });
+    if (!response.ok) return null;
+    const payload = await response.json();
+    return (payload.update ?? null) as PlatformUpdateStatus | null;
+  } catch {
+    return null;
+  }
+}
+
+export async function getPlatformUpdateStatus(): Promise<PlatformUpdateStatus | null> {
+  return platformUpdateRequest("/api/settings/system-update");
+}
+
+export async function checkPlatformUpdate(): Promise<PlatformUpdateStatus | null> {
+  return platformUpdateRequest("/api/settings/system-update/check", { method: "POST" });
+}
+
+export async function installPlatformUpdate(): Promise<PlatformUpdateStatus | null> {
+  return platformUpdateRequest("/api/settings/system-update/install", { method: "POST" });
+}
+
+export async function rollbackPlatformUpdate(): Promise<PlatformUpdateStatus | null> {
+  return platformUpdateRequest("/api/settings/system-update/rollback", { method: "POST" });
+}
+
 export async function getWorkerModelOptions(): Promise<WorkerModelOptions> {
   try {
     const r = await apiFetch(`/api/settings/worker-models`);
-    if (!r.ok) return { allow_custom: true, models: {} };
+    if (!r.ok) return emptyWorkerModelOptions();
     const j = await r.json();
     return {
       allow_custom: Boolean(j.allow_custom ?? true),
+      manual_updated_at: j.manual_updated_at ?? null,
+      manual_models: (j.manual_models ?? j.models ?? {}) as WorkerModelOptions["manual_models"],
+      discovered_models: (j.discovered_models ?? {}) as WorkerModelOptions["discovered_models"],
+      models_by_profile: (j.models_by_profile ?? {}) as WorkerModelOptions["models_by_profile"],
+      discovery: (j.discovery ?? {}) as WorkerModelOptions["discovery"],
       models: (j.models ?? {}) as WorkerModelOptions["models"],
     };
   } catch {
-    return { allow_custom: true, models: {} };
+    return emptyWorkerModelOptions();
+  }
+}
+
+export async function discoverWorkerModels(profileId?: string): Promise<WorkerModelOptions> {
+  try {
+    const r = await apiFetch(`/api/settings/worker-models/discover`, {
+      method: "POST",
+      ...(profileId ? {
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ profile_id: profileId }),
+      } : {}),
+    });
+    if (!r.ok) return emptyWorkerModelOptions();
+    const j = await r.json();
+    return {
+      allow_custom: Boolean(j.allow_custom ?? true),
+      manual_updated_at: j.manual_updated_at ?? null,
+      manual_models: (j.manual_models ?? j.models ?? {}) as WorkerModelOptions["manual_models"],
+      discovered_models: (j.discovered_models ?? {}) as WorkerModelOptions["discovered_models"],
+      models_by_profile: (j.models_by_profile ?? {}) as WorkerModelOptions["models_by_profile"],
+      discovery: (j.discovery ?? {}) as WorkerModelOptions["discovery"],
+      discovery_results: (j.discovery_results ?? []) as WorkerModelOptions["discovery_results"],
+      discovery_ok: Boolean(j.discovery_ok),
+      models: (j.models ?? {}) as WorkerModelOptions["models"],
+    };
+  } catch {
+    return emptyWorkerModelOptions();
   }
 }
 
@@ -692,16 +883,42 @@ export async function pullWorkerImage(): Promise<{ ok: boolean; detail: string; 
   }
 }
 
+export type WorkerModelTestLog = {
+  stream: "system" | "command" | "stdout" | "stderr" | "success" | "error";
+  message: string;
+  elapsed_ms: number;
+};
+
+export type WorkerModelTestResult = {
+  ok: boolean;
+  detail: string;
+  model: string;
+  engine: string;
+  backend?: "local" | "container";
+  command?: string;
+  stdout?: string;
+  stderr?: string;
+  exit_code?: number | null;
+  elapsed_ms?: number;
+  layer?: string;
+  logs: WorkerModelTestLog[];
+};
+
 export async function testWorkerProfileModel(
   profile: WorkerSettings["worker_profiles"][number],
   model: string,
   backend: "local" | "container"
-): Promise<{ ok: boolean; detail: string; model: string; engine: string }> {
+): Promise<WorkerModelTestResult> {
   try {
     const r = await apiFetch(`/api/settings/worker-model/test`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ profile, model, backend }),
+      body: JSON.stringify({
+        profile,
+        model,
+        reasoning_effort: profile.reasoning_effort ?? "default",
+        backend,
+      }),
     });
     const j = await r.json().catch(() => ({}));
     return {
@@ -709,9 +926,103 @@ export async function testWorkerProfileModel(
       detail: String(j.detail ?? ""),
       model: String(j.model ?? model),
       engine: String(j.engine ?? profile.engine),
+      backend: j.backend === "container" ? "container" : "local",
+      command: typeof j.command === "string" ? j.command : undefined,
+      stdout: typeof j.stdout === "string" ? j.stdout : undefined,
+      stderr: typeof j.stderr === "string" ? j.stderr : undefined,
+      exit_code: typeof j.exit_code === "number" ? j.exit_code : null,
+      elapsed_ms: typeof j.elapsed_ms === "number" ? j.elapsed_ms : undefined,
+      layer: typeof j.layer === "string" ? j.layer : undefined,
+      logs: Array.isArray(j.logs)
+        ? j.logs.map((item: Record<string, unknown>) => ({
+            stream: String(item.stream || "system") as WorkerModelTestLog["stream"],
+            message: String(item.message || ""),
+            elapsed_ms: Number(item.elapsed_ms) || 0,
+          }))
+        : [],
     };
   } catch (e) {
-    return { ok: false, detail: String(e), model, engine: profile.engine };
+    const detail = String(e);
+    return {
+      ok: false,
+      detail,
+      model,
+      engine: profile.engine,
+      backend,
+      logs: [{ stream: "error", message: detail, elapsed_ms: 0 }],
+    };
+  }
+}
+
+export type WorkerModelBatchTestItem = {
+  profile_id: string;
+  profile: WorkerSettings["worker_profiles"][number];
+  model: string;
+  reasoning_effort?: string;
+};
+
+export type WorkerModelBatchTestResult = {
+  backend: "local" | "container";
+  container_count: number;
+  results: WorkerModelTestResult[];
+};
+
+export async function testWorkerProfileModelsBatch(
+  items: WorkerModelBatchTestItem[],
+  backend: "local" | "container"
+): Promise<WorkerModelBatchTestResult> {
+  try {
+    const response = await apiFetch(`/api/settings/worker-model/test-batch`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ items, backend }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    const rawResults = Array.isArray(payload?.results) ? payload.results : [];
+    const results = items.map((item, index): WorkerModelTestResult => {
+      const row = rawResults[index] || {};
+      const detail = String(row.detail ?? (response.ok ? "" : `批量模型测试请求失败（HTTP ${response.status}）`));
+      return {
+        ok: !!row.ok,
+        detail,
+        model: String(row.model ?? item.model),
+        engine: String(row.engine ?? item.profile.engine),
+        backend: row.backend === "container" ? "container" : "local",
+        command: typeof row.command === "string" ? row.command : undefined,
+        stdout: typeof row.stdout === "string" ? row.stdout : undefined,
+        stderr: typeof row.stderr === "string" ? row.stderr : undefined,
+        exit_code: typeof row.exit_code === "number" ? row.exit_code : null,
+        elapsed_ms: typeof row.elapsed_ms === "number" ? row.elapsed_ms : undefined,
+        layer: typeof row.layer === "string" ? row.layer : undefined,
+        logs: Array.isArray(row.logs)
+          ? row.logs.map((log: Record<string, unknown>) => ({
+              stream: String(log.stream || "system") as WorkerModelTestLog["stream"],
+              message: String(log.message || ""),
+              elapsed_ms: Number(log.elapsed_ms) || 0,
+            }))
+          : [{ stream: "error", message: detail || "批量模型测试没有返回结果", elapsed_ms: 0 }],
+      };
+    });
+    return {
+      backend: payload?.backend === "container" ? "container" : "local",
+      container_count: Number(payload?.container_count) || 0,
+      results,
+    };
+  } catch (error) {
+    const detail = String(error);
+    return {
+      backend,
+      container_count: 0,
+      results: items.map((item) => ({
+        ok: false,
+        detail,
+        model: item.model,
+        engine: item.profile.engine,
+        backend,
+        layer: "request",
+        logs: [{ stream: "error", message: detail, elapsed_ms: 0 }],
+      })),
+    };
   }
 }
 
@@ -786,6 +1097,27 @@ export async function putWorkerSettings(
   }
 }
 
+/** Persist the canonical Seat / Credential model. This is kept
+ * separate from scheduler policy because the backend validates identity bindings
+ * (including container × system-login legality) before projecting them to the
+ * legacy worker profiles consumed by live dispatch. */
+export async function putWorkerIdentity(
+  patch: Partial<Pick<WorkerSettings, "seats" | "credentials">>
+): Promise<WorkerSettings | null> {
+  try {
+    const r = await apiFetch(`/api/settings/identity`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    return (j.config ?? null) as WorkerSettings | null;
+  } catch {
+    return null;
+  }
+}
+
 export async function listCredentialAccounts(): Promise<CredentialAccount[]> {
   try {
     const r = await apiFetch(`/api/settings/credential-accounts`);
@@ -799,7 +1131,16 @@ export async function listCredentialAccounts(): Promise<CredentialAccount[]> {
 
 export async function putCredentialAccount(
   accountId: string,
-  body: { engine: string; secret?: string; codex_auth_json?: string; base_url?: string; target_engine?: string }
+  body: {
+    engine: string;
+    worker_engine?: string;
+    connection?: "official" | "custom_endpoint";
+    secret?: string;
+    codex_auth_json?: string;
+    base_url?: string;
+    provider?: string;
+    target_engine?: string;
+  }
 ): Promise<CredentialAccount | null> {
   try {
     const r = await apiFetch(`/api/settings/credential-accounts/${encodeURIComponent(accountId)}`, {
@@ -833,16 +1174,47 @@ export async function deleteCredentialAccount(accountId: string): Promise<boolea
  *  host file missing, or unavailable when web runs in a container). */
 export async function importHostCodexAuth(
   accountId: string
-): Promise<{ ok: boolean; detail: string }> {
+): Promise<{ ok: boolean; detail: string; account: CredentialAccount | null }> {
   try {
     const r = await apiFetch(
       `/api/settings/credential-accounts/${encodeURIComponent(accountId)}/import-host-codex`,
       { method: "POST" }
     );
     const j = await r.json().catch(() => ({}));
-    return { ok: r.ok && Boolean(j.ok), detail: String(j.detail ?? (r.ok ? "" : "import failed")) };
+    return {
+      ok: r.ok && Boolean(j.ok),
+      detail: String(j.detail ?? (r.ok ? "" : "import failed")),
+      account: (j.account ?? null) as CredentialAccount | null,
+    };
   } catch (e) {
-    return { ok: false, detail: String(e) };
+    return { ok: false, detail: String(e), account: null };
+  }
+}
+
+/** Import the host's existing Claude gateway, Kimi Code login, or Grok login
+ * into a durable Worker account. Only the required credential/config material
+ * is copied; caches, sessions and binaries are not included. */
+export async function importHostWorkerLogin(
+  accountId: string,
+  engine: "claude" | "kimi" | "grok",
+): Promise<{ ok: boolean; detail: string; account: CredentialAccount | null }> {
+  try {
+    const r = await apiFetch(
+      `/api/settings/credential-accounts/${encodeURIComponent(accountId)}/import-host-login`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ engine }),
+      },
+    );
+    const j = await r.json().catch(() => ({}));
+    return {
+      ok: r.ok && Boolean(j.ok),
+      detail: String(j.detail ?? (r.ok ? "" : "import failed")),
+      account: (j.account ?? null) as CredentialAccount | null,
+    };
+  } catch (e) {
+    return { ok: false, detail: String(e), account: null };
   }
 }
 
@@ -860,17 +1232,20 @@ export async function getSystemLogin(): Promise<Record<string, SystemLoginStatus
   }
 }
 
-/** Test the planner/titler endpoint the operator is editing (key from .env). */
+/** Test the planner/titler endpoint the operator is editing. */
 export async function testLlmEndpoint(
   which: "planner" | "titler",
   base_url: string,
-  model: string
+  model: string,
+  api_key = "",
+  temperature_mode: LlmTemperatureMode = "default",
+  temperature?: number,
 ): Promise<{ ok: boolean; detail: string; model: string }> {
   try {
     const r = await apiFetch(`/api/settings/llm/test`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ which, base_url, model }),
+      body: JSON.stringify({ which, base_url, model, api_key, temperature_mode, temperature }),
     });
     const j = await r.json().catch(() => ({}));
     return { ok: !!j.ok, detail: String(j.detail ?? ""), model: String(j.model ?? model) };
@@ -905,25 +1280,6 @@ export async function testCredentialAccount(
       ? "测试超时（>180s）——容器探测或冷启动太慢，请重试或检查引擎状态"
       : String(e);
     return { ok: false, detail: msg };
-  }
-}
-
-/** Unify backend + runtime across all enabled profiles (one-container-per-run). */
-export async function putRuntimeEnvironment(
-  backend: "local" | "container",
-  runtime_id: string
-): Promise<WorkerSettings | null> {
-  try {
-    const r = await apiFetch(`/api/settings/runtime-environment`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ backend, runtime_id }),
-    });
-    if (!r.ok) return null;
-    const j = await r.json();
-    return (j.config ?? null) as WorkerSettings | null;
-  } catch {
-    return null;
   }
 }
 

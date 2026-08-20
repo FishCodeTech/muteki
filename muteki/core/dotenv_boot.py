@@ -39,7 +39,8 @@ def load_env(path: Optional[Path] = None) -> bool:
         return False
     _loaded = True
 
-    env_path = Path(path) if path is not None else _REPO_ROOT / ".env"
+    configured = os.environ.get("MUTEKI_ENV_FILE")
+    env_path = Path(path) if path is not None else Path(configured).expanduser() if configured else _REPO_ROOT / ".env"
     if not env_path.is_file():
         return False
 

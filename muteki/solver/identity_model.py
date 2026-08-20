@@ -1,4 +1,4 @@
-"""Identity model — THE canonical Credential / Seat / Environment schema.
+"""Identity model — canonical Credential / Seat schema.
 
 This replaces the old flat "worker_profile" dict (which conflated a credential,
 an execution environment, and a scheduling unit into one object with redundant
@@ -17,15 +17,14 @@ Three orthogonal first-class objects (DESIGN: plan_settings_identity_refactor.md
       custom_endpoint — point an engine at a third-party OpenAI/Anthropic-compatible
                         endpoint (DeepSeek/Kimi/GLM): base_url + key + target_engine.
   Seat        — an out-the-door scheduling unit (UI label: "Agent"). References a
-                Credential + Environment by id, pins a `model`, owns roles/capacity.
-  Environment — an execution template: backend (local|container) + container limits.
+                Credential by id, pins a `model`, owns roles/capacity.
 
 Ids are SEMI-READABLE + STABLE: `cred_<engine>_<6hex>`, `seat_<engine>_<6hex>`.
 The 6hex is deterministic (sha1 of the legacy name) so a migration re-run yields
 the SAME id, and the legacy name maps to it via the alias table.
 
 Storage: these objects ARE the on-disk `_worker_config.json` shape (credentials[],
-seats[], environments[]). The swarm/drivers still consume a flat legacy-profile
+seats[]). The swarm/drivers still consume a flat legacy-profile
 dict — `seat_to_legacy_profile()` (in cli_driver) adapts new→old at the boundary,
 so the scheduler and drivers need no change.
 """
@@ -42,10 +41,10 @@ from muteki.solver.worker_profiles import (
     base_engine_for_profile,
     coerce_nonneg_int,
     coerce_pos_int,
+    normalize_reasoning_effort,
 )
 
 CredentialKind = Literal["system_inherit", "engine_key", "custom_endpoint"]
-Backend = Literal["local", "container"]
 
 # Legacy credential-account `mode` (from CredentialAccountStore.inspect) → new kind.
 # subscription_token/chatgpt_auth_home/api_key are all the engine's own official
@@ -55,6 +54,7 @@ Backend = Literal["local", "container"]
 _MODE_TO_KIND: dict[str, str] = {
     "subscription_token": "engine_key",
     "chatgpt_auth_home": "engine_key",
+    "login_home": "engine_key",
     "api_key": "engine_key",
     "custom_endpoint": "custom_endpoint",
 }
@@ -119,34 +119,13 @@ class Credential:
 
 
 @dataclass(frozen=True)
-class Environment:
-    id: str
-    label: str
-    backend: str                      # local | container
-    network: str = ""
-    memory: str = ""
-    cpus: str = ""
-    pids_limit: int = 0
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {"id": self.id, "label": self.label, "backend": self.backend}
-        for k in ("network", "memory", "cpus"):
-            v = getattr(self, k)
-            if v:
-                d[k] = v
-        if self.pids_limit:
-            d["pids_limit"] = self.pids_limit
-        return d
-
-
-@dataclass(frozen=True)
 class Seat:
     id: str
     label: str
     engine: str
     credential_id: str
-    environment_id: str
     model: str = ""
+    reasoning_effort: str = "default"
     roles: list[str] = field(default_factory=lambda: list(DEFAULT_ROLES))
     race: bool = True
     max_running: int = 1
@@ -157,8 +136,9 @@ class Seat:
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id, "label": self.label, "engine": self.engine,
-            "credential_id": self.credential_id, "environment_id": self.environment_id,
-            "model": self.model, "roles": list(self.roles), "race": self.race,
+            "credential_id": self.credential_id,
+            "model": self.model, "reasoning_effort": self.reasoning_effort,
+            "roles": list(self.roles), "race": self.race,
             "capacity": {
                 "max_running": self.max_running,
                 "max_review_running": self.max_review_running,
@@ -182,13 +162,12 @@ def is_legal_combo(*, kind: str, backend: str) -> bool:
     return True
 
 
-# ── migration: legacy worker_profiles/runtime_profiles → new identity model ──
+# ── migration: legacy worker_profiles → new identity model ──
 
 @dataclass
 class MigrationResult:
     credentials: list[Credential]
     seats: list[Seat]
-    environments: list[Environment]
     # legacy ref (old profile name / hyphen canonical alias) → new seat id.
     seat_alias: dict[str, str]
     # legacy account id → new credential id.
@@ -218,7 +197,6 @@ def _legacy_kind(profile: dict[str, Any]) -> str:
 def migrate_legacy_config(
     *,
     worker_profiles: list[dict[str, Any]],
-    runtime_profiles: list[dict[str, Any]],
     account_modes: dict[str, str] | None = None,
 ) -> MigrationResult:
     """Pure transform: legacy config → new identity model + alias tables.
@@ -233,19 +211,6 @@ def migrate_legacy_config(
     cred_alias: dict[str, str] = {}
     seats: list[Seat] = []
     seat_alias: dict[str, str] = {}
-
-    # 1) environments ← runtime_profiles (id reused verbatim; it's already stable).
-    envs: list[Environment] = []
-    for rt in runtime_profiles:
-        if not isinstance(rt, dict) or not rt.get("id"):
-            continue
-        envs.append(Environment(
-            id=str(rt["id"]), label=str(rt.get("label") or rt["id"]),
-            backend="container" if str(rt.get("backend")) == "container" else "local",
-            network=str(rt.get("network") or ""), memory=str(rt.get("memory") or ""),
-            cpus=str(rt.get("cpus") or ""),
-            pids_limit=coerce_nonneg_int(rt.get("pids_limit"), 0),
-        ))
 
     def _ensure_credential(engine: str, profile: dict[str, Any]) -> str:
         """Synthesize/return a Credential for this profile, return its new id.
@@ -303,7 +268,7 @@ def migrate_legacy_config(
             )
         return cid
 
-    # 2) seats ← worker_profiles.
+    # Seats ← worker_profiles.
     for p in worker_profiles:
         if not isinstance(p, dict):
             continue
@@ -315,7 +280,6 @@ def migrate_legacy_config(
             continue
         sid = seat_id_for(engine, legacy_name=legacy_name)
         cid = _ensure_credential(engine, p)
-        env_id = str(p.get("runtime") or "docker-web").strip()
         roles = [str(r).strip() for r in (p.get("roles") or []) if str(r).strip()] or list(DEFAULT_ROLES)
         cap = p.get("capacity") if isinstance(p.get("capacity"), dict) else {}
         # label survives re-migration: prefer an explicit label, else the legacy
@@ -326,8 +290,10 @@ def migrate_legacy_config(
             label = legacy_name if not _SEAT_ID_RE.match(legacy_name) else f"{engine} worker"
         seats.append(Seat(
             id=sid, label=label, engine=engine,
-            credential_id=cid, environment_id=env_id,
+            credential_id=cid,
             model=str(p.get("model") or "").strip(),
+            reasoning_effort=normalize_reasoning_effort(
+                p.get("reasoning_effort"), "default"),
             roles=roles,
             race=bool(p.get("race", "race" in roles)),
             max_running=coerce_pos_int(p.get("max_running", cap.get("max_running")), 1),
@@ -339,7 +305,7 @@ def migrate_legacy_config(
         seat_alias[legacy_name] = sid
 
     return MigrationResult(
-        credentials=list(creds.values()), seats=seats, environments=envs,
+        credentials=list(creds.values()), seats=seats,
         seat_alias=seat_alias, credential_alias=cred_alias,
     )
 
@@ -362,9 +328,8 @@ _KIND_TO_LEGACY_MODE = {
 def seat_to_legacy_profile(
     seat: dict[str, Any],
     credential: dict[str, Any] | None,
-    environment: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Flatten a Seat (+ its Credential + Environment) into the flat profile dict
+    """Flatten a Seat (+ its Credential) into the flat profile dict
     the existing scheduler/drivers expect. Pure; never raises.
 
     Credential mode mapping is intentionally faithful to old behavior:
@@ -378,7 +343,6 @@ def seat_to_legacy_profile(
     """
     seat = seat or {}
     credential = credential or {}
-    environment = environment or {}
     engine = str(seat.get("engine") or credential.get("engine") or "").strip()
     kind = str(credential.get("kind") or "system_inherit").strip()
     cap = seat.get("capacity") if isinstance(seat.get("capacity"), dict) else {}
@@ -409,13 +373,14 @@ def seat_to_legacy_profile(
         "api_key_ref": "",
         "base_url": base_url,
         "wire_api": wire_api or ("responses" if engine == "codex" and base_url else ""),
-        "runtime": str(seat.get("environment_id") or environment.get("id") or "docker-web").strip(),
         "roles": roles,
         "race": bool(seat.get("race", "race" in roles)),
         "max_running": coerce_pos_int(seat.get("max_running", cap.get("max_running")), 1),
         "max_review_running": coerce_nonneg_int(seat.get("max_review_running", cap.get("max_review_running")), 0),
         "priority": coerce_nonneg_int(seat.get("priority"), 100),
         "model": str(seat.get("model") or "").strip(),
+        "reasoning_effort": normalize_reasoning_effort(
+            seat.get("reasoning_effort"), "default"),
         "enabled": bool(seat.get("enabled", True)),
     }
 
@@ -423,17 +388,14 @@ def seat_to_legacy_profile(
 def seats_to_legacy_profiles(
     seats: list[dict[str, Any]],
     credentials: list[dict[str, Any]],
-    environments: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Adapt a whole identity model into the legacy worker_profiles list."""
     cred_by_id = {str(c.get("id")): c for c in credentials if isinstance(c, dict)}
-    env_by_id = {str(e.get("id")): e for e in environments if isinstance(e, dict)}
     out: list[dict[str, Any]] = []
     for s in seats:
         if not isinstance(s, dict):
             continue
         out.append(seat_to_legacy_profile(
             s, cred_by_id.get(str(s.get("credential_id"))),
-            env_by_id.get(str(s.get("environment_id"))),
         ))
     return out

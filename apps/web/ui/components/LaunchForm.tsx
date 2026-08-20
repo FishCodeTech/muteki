@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { NumberField } from "@/components/NumberField";
 
 /**
  * Launch a run — a "new project" form, scoped to a CTF challenge spec.
@@ -67,8 +68,8 @@ export function LaunchForm({
         </label>
         <label>
           <span>Solvers</span>
-          <input type="number" min={1} max={6} value={nSolvers}
-            onChange={(e) => setNSolvers(Math.max(1, Math.min(6, Number(e.target.value) || 1)))} />
+          <NumberField min={1} max={6} value={nSolvers}
+            onChange={(next) => setNSolvers(Math.max(1, Math.min(6, Number(next) || 1)))} />
         </label>
       </div>
       <div className="launch-actions">

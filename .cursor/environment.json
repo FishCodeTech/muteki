@@ -1,0 +1,15 @@
+{
+  "name": "Project Muteki",
+  "install": "bash .cursor/install.sh",
+  "terminals": [
+    {
+      "name": "web-deck",
+      "command": "./run.sh web",
+      "description": "Muteki command deck: FastAPI backend on :8000 + production Next UI on :3001 (loopback). Open http://127.0.0.1:3001. Set MUTEKI_DEEPSEEK_API_KEY (and an engine CLI login) to run real solves."
+    }
+  ],
+  "ports": [
+    { "name": "backend", "port": 8000 },
+    { "name": "web-ui", "port": 3001 }
+  ]
+}

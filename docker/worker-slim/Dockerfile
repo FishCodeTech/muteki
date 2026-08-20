@@ -1,10 +1,10 @@
-# muteki worker image — SLIM build (plain Ubuntu + reverse-connector + 3 engine CLIs).
+# muteki worker image — SLIM build (plain Ubuntu + reverse-connector + 9 engine CLIs).
 # A lightweight alternative to the full Kali image for FAST testing: it ships ONLY
 #   - the in-container Runtime Control Plane supervisor (runtime_agent, PID1/ENTRYPOINT)
-#   - the three engine CLIs (claude / codex / cursor-agent)
+#   - all nine Worker CLIs
 #   - the muteki-blackboard skill
-# and NOTHING from the CTF toolchain (no kali-linux-headless, ghidra, sagemath,
-# volatility3, pwntools, knowledge base, …). It pulls/builds in a fraction of the
+# and no full Kali toolchain (no kali-linux-headless, ghidra, sagemath,
+# volatility3 or knowledge base). It pulls/builds in a fraction of the
 # time and is meant for wiring/integration tests where you only need a worker that
 # can connect back, run an agent, and write the blackboard — not actually solve.
 #
@@ -18,15 +18,17 @@
 #   - ENTRYPOINT      : /opt/muteki/runtime_agent --sock … --workspace …
 #
 # Build (always via docker/worker-slim/build.sh, which cross-compiles runtime_agent):
-#   ./docker/worker-slim/build.sh                       # → muteki-worker-slim:0.1.0 + :latest
-#   ./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim 0.1.0
+#   ./docker/worker-slim/build.sh                       # → muteki-worker-slim:0.2.5 + :latest
+#   ./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim 0.2.5
 # Then run a slim swarm with:  MUTEKI_WORKER_IMAGE=muteki-worker-slim:latest ./run.sh …
 #
-# Platform: amd64 (match the Kali image + the cross-compiled runtime_agent). Set by the
-# build command (--platform linux/amd64), NOT a FROM const (same BuildKit arm64 export
-# bug the Kali Dockerfile documents). Leave FROM platform-less.
+# Platform defaults to the host architecture and can be selected by build.sh.
 
 FROM ubuntu:24.04
+
+# Optional build-time mirror for environments where ports.ubuntu.com is slow.
+# The default stays on Ubuntu's image-provided source configuration.
+ARG UBUNTU_MIRROR=""
 
 ENV TZ=Asia/Shanghai \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
@@ -40,8 +42,13 @@ ENV TZ=Asia/Shanghai \
 #    - python3/pip    : blackboard.py is python; agents use python3
 #    - sudo           : the worker runs as kali WITH sudo (parity with Kali image §2)
 #    - openssh-client : nested-SSH challenges (cheap, keep it)
-#    Ubuntu 24.04's nodejs is recent enough for the CLIs; no NodeSource needed.
-RUN apt-get update && \
+#    Ubuntu's node package also supplies base integration; an exact Node 22 runtime
+#    is installed below because Kimi Code requires 22.19 or newer.
+RUN if [ -n "$UBUNTU_MIRROR" ]; then \
+      sed -i "s|http://ports.ubuntu.com/ubuntu-ports|$UBUNTU_MIRROR|g" \
+        /etc/apt/sources.list.d/ubuntu.sources; \
+    fi && \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
       ca-certificates curl wget git unzip \
       nodejs npm \
@@ -77,24 +84,56 @@ EOF
 #    is the one solvers reach for most; keep it so a slim worker can still do a basic
 #    interaction. Everything heavy (angr/sage/z3/volatility3) is intentionally absent.
 RUN pip3 install --break-system-packages --no-cache-dir \
-      requests pwntools
+      requests pwntools deepseek-harness-sdk==0.1.0rc6
+
+# Ubuntu 24.04 ships Node.js 18, while the pinned Pi CLI requires Node.js
+# 22.19 or newer. Install one architecture-matched runtime ahead of /usr/bin.
+ARG TARGETARCH
+ARG NODE_VERSION="22.19.0"
+ARG NODE_MIRROR="https://nodejs.org/dist"
+RUN case "$TARGETARCH" in \
+      amd64) node_arch="x64" ;; \
+      arm64) node_arch="arm64" ;; \
+      *) echo "unsupported Node architecture: $TARGETARCH" >&2; exit 2 ;; \
+    esac && \
+    curl -fsSL "$NODE_MIRROR/v$NODE_VERSION/node-v$NODE_VERSION-linux-$node_arch.tar.gz" \
+      -o /tmp/node.tar.gz && \
+    tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 && \
+    rm -f /tmp/node.tar.gz && \
+    node --version && npm --version
 
 # 4) Engine CLIs — same pins as the Kali image (§5) so behaviour matches.
 #    Credentials are injected at runtime from Credential Accounts — NEVER baked.
-RUN npm install -g \
-      @openai/codex@0.138.0 \
-      @anthropic-ai/claude-code@2.1.98
+ARG NPM_REGISTRY=""
+RUN if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi && \
+    npm install -g \
+      @openai/codex@0.146.0 \
+      @anthropic-ai/claude-code@2.1.220 \
+      @earendil-works/pi-coding-agent@0.84.1 \
+      @moonshot-ai/kimi-code@0.36.1 \
+      opencode-ai@1.18.18
 
 # cursor-agent is NOT an npm package — installs via cursor.com/install into the kali
 # user's ~/.local/bin. Run as kali so it lands in kali's HOME (container_exec pins the
 # absolute path /home/kali/.local/bin/cursor-agent). Mirror the Kali image exactly.
+# OMP's npm entrypoint requires Bun at runtime. Install its official prebuilt binary
+# and pin the release so slim/full stay reproducible and use the same executable.
 USER kali
 RUN curl -fsSL https://cursor.com/install | bash
+RUN curl -fsSL https://omp.sh/install | sh -s -- --binary --ref v17.3.5 && \
+    /home/kali/.local/bin/omp --version
+RUN curl -fsSL https://x.ai/cli/install.sh | bash -s 1.0.4 && \
+    /home/kali/.grok/bin/grok --version
 USER root
 
 # 5) Runtime Agent (Go supervisor) — cross-compiled static binary, COPY'd in.
 #    build.sh outputs it to docker/worker-slim/runtime_agent (this build context).
 COPY ./runtime_agent /opt/muteki/runtime_agent
+COPY ./deepseek_harness_worker.py /opt/muteki/deepseek_harness_worker.py
+COPY ./offline_acp_bridge.py /opt/muteki/offline_acp_bridge.py
+COPY ./omp_offline_config.yml /opt/muteki/omp_offline_config.yml
+COPY ./kimi_offline_agent.md /opt/muteki/kimi_offline_agent.md
+COPY ./grok_offline_agent.md /opt/muteki/grok_offline_agent.md
 RUN chmod +x /opt/muteki/runtime_agent
 
 # 6) Tool-awareness map + blackboard skill, baked OUTSIDE the mounted workspace. The
@@ -108,40 +147,7 @@ COPY ./blackboard.SKILL.md /opt/muteki/muteki-blackboard/SKILL.md
 COPY ./blackboard.py /opt/muteki/muteki-blackboard/blackboard.py
 RUN chmod +x /opt/muteki/muteki-blackboard/blackboard.py && \
     cp /opt/muteki/muteki-blackboard/blackboard.py /usr/local/bin/blackboard.py && \
-    chmod +x /usr/local/bin/blackboard.py && \
-    install -d -o kali -g kali \
-      /home/kali/.claude/skills/muteki-blackboard \
-      /home/kali/.agents/skills/muteki-blackboard \
-      /home/kali/.codex/skills/muteki-blackboard \
-      /home/kali/.cursor/skills-cursor/muteki-blackboard \
-      /home/kali/.cursor/skills/muteki-blackboard && \
-    cp /opt/muteki/muteki-blackboard/SKILL.md \
-      /home/kali/.claude/skills/muteki-blackboard/SKILL.md && \
-    cp /opt/muteki/muteki-blackboard/blackboard.py \
-      /home/kali/.claude/skills/muteki-blackboard/blackboard.py && \
-    cp /opt/muteki/muteki-blackboard/SKILL.md \
-      /home/kali/.agents/skills/muteki-blackboard/SKILL.md && \
-    cp /opt/muteki/muteki-blackboard/blackboard.py \
-      /home/kali/.agents/skills/muteki-blackboard/blackboard.py && \
-    cp /opt/muteki/muteki-blackboard/SKILL.md \
-      /home/kali/.codex/skills/muteki-blackboard/SKILL.md && \
-    cp /opt/muteki/muteki-blackboard/blackboard.py \
-      /home/kali/.codex/skills/muteki-blackboard/blackboard.py && \
-    cp /opt/muteki/muteki-blackboard/SKILL.md \
-      /home/kali/.cursor/skills-cursor/muteki-blackboard/SKILL.md && \
-    cp /opt/muteki/muteki-blackboard/blackboard.py \
-      /home/kali/.cursor/skills-cursor/muteki-blackboard/blackboard.py && \
-    cp /opt/muteki/muteki-blackboard/SKILL.md \
-      /home/kali/.cursor/skills/muteki-blackboard/SKILL.md && \
-    cp /opt/muteki/muteki-blackboard/blackboard.py \
-      /home/kali/.cursor/skills/muteki-blackboard/blackboard.py && \
-    chown -R kali:kali /home/kali/.claude /home/kali/.agents /home/kali/.codex /home/kali/.cursor && \
-    chmod +x \
-      /home/kali/.claude/skills/muteki-blackboard/blackboard.py \
-      /home/kali/.agents/skills/muteki-blackboard/blackboard.py \
-      /home/kali/.codex/skills/muteki-blackboard/blackboard.py \
-      /home/kali/.cursor/skills-cursor/muteki-blackboard/blackboard.py \
-      /home/kali/.cursor/skills/muteki-blackboard/blackboard.py
+    chmod +x /usr/local/bin/blackboard.py
 
 # 7) workspace + control dir; supervisor as ENTRYPOINT (PID1). Verbatim parity with
 #    the Kali image §9 so the bind-mount targets and control socket path are identical.
@@ -153,7 +159,7 @@ RUN mkdir -p /home/kali/workspace && chown kali:kali /home/kali/workspace && \
 # build.sh passes --build-arg IMAGE_VERSION=<version>.
 ARG IMAGE_VERSION=dev
 LABEL org.opencontainers.image.title="muteki-worker-slim" \
-      org.opencontainers.image.description="Slim Ubuntu muteki worker: reverse-connector + 3 agent CLIs, no CTF toolchain" \
+      org.opencontainers.image.description="Slim Ubuntu muteki worker: reverse-connector + 9 agent CLIs, no full Kali toolchain" \
       org.opencontainers.image.version="${IMAGE_VERSION}"
 
 WORKDIR /home/kali/workspace

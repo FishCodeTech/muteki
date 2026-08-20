@@ -62,7 +62,8 @@ NEXT_PUBLIC_MUTEKI_API=http://127.0.0.1:8000 npm run dev          # http://local
   backend infers `challenge.{category,target,name}` when structured fields are
   absent (caller-provided fields always win).
 - `GET  /api/runs/{id}/events` — the typed SSE event stream (Last-Event-ID resume).
-- `POST /api/runs/{id}/hitl` — a human command into the live run.
+- `POST /api/runs/{id}/control` — durable, idempotent operator command admission.
+- `POST /api/runs/{id}/hitl` — legacy compatibility adapter onto `/control`.
 
 ## Files
 

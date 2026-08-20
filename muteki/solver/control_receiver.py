@@ -25,11 +25,13 @@ NOT touch flag/fact/graph/key business logic — that stays in the swarm/gate.
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import socket
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, Callable, Optional
 
 # Default host receiver port. The container reaches it via host.docker.internal:<port>.
@@ -49,10 +51,21 @@ CONTROL_HOST_FROM_CONTAINER = os.environ.get(
 # host's public interface.
 DEFAULT_CONTROL_BIND = os.environ.get("MUTEKI_CONTROL_BIND", "127.0.0.1")
 
+# A malicious/damaged supervisor can stream before the host installs a worker's
+# queue. Buffer enough for the normal started→queue race, but never without bounds.
+_EARLY_FRAMES_PER_WORKER = 128
+_EARLY_FRAMES_TOTAL = 2048
+_STREAM_TOMBSTONES_MAX = 4096
+_TERMINAL_FRAMES_MAX = 4096
+
 
 class ControlError(RuntimeError):
     """A control-plane failure (no supervisor connected, link dropped, auth failed).
     The caller treats this as `runtime_degraded` — NEVER a silent local fallback."""
+
+
+class StartWorkerRejected(ControlError):
+    """Supervisor definitively proved the requested child was never spawned."""
 
 
 class _PendingReply:
@@ -76,7 +89,8 @@ class _SupervisorLink:
         self._req_seq = 0
         self._req_lock = threading.Lock()
         self._pending: dict[int, _PendingReply] = {}   # req_id → waiter (non-stream ops)
-        # stream routing: worker_id → queue of frames ("out"/"err"/"exit"); plus the
+        # stream routing: worker_id → queue of frames
+        # ("stdin"/"out"/"err"/"exit"); plus the
         # StartWorker "started" reply correlated by req_id.
         self._streams: dict[str, "_FrameQueue"] = {}
         # early-frame buffer: the supervisor may stream a worker's first lines BEFORE
@@ -85,6 +99,13 @@ class _SupervisorLink:
         # are stashed here by worker_id and flushed when start_worker registers the
         # queue — otherwise the worker's opening output is silently dropped.
         self._early: dict[str, list[dict]] = {}
+        self._early_count = 0
+        # Once a registered stream is dropped, late stdout/stderr must never create
+        # a fresh `_early` bucket. Keep a bounded LRU tombstone set. Exit frames use
+        # the dedicated callback/terminal fence below before stream routing.
+        self._stream_tombstones: "OrderedDict[str, None]" = OrderedDict()
+        self._terminal_frames: "OrderedDict[str, dict]" = OrderedDict()
+        self._exit_callbacks: dict[str, "Callable[[], None]"] = {}
         self._streams_lock = threading.Lock()
         self.alive = True
         self._buf = b""
@@ -128,15 +149,42 @@ class _SupervisorLink:
     def _dispatch_frame(self, f: dict) -> None:
         t = f.get("t")
         wid = f.get("worker_id")
-        if t in ("out", "err", "exit") and wid:
+        if t in ("stdin", "out", "err", "exit") and wid:
+            exit_callback: "Optional[Callable[[], None]]" = None
+            if t == "exit":
+                with self._streams_lock:
+                    exit_callback = self._exit_callbacks.pop(wid, None)
+                    if exit_callback is None:
+                        self._terminal_frames.pop(wid, None)
+                        self._terminal_frames[wid] = dict(f)
+                        while len(self._terminal_frames) > _TERMINAL_FRAMES_MAX:
+                            self._terminal_frames.popitem(last=False)
+                    else:
+                        self._terminal_frames.pop(wid, None)
+                if exit_callback is not None:
+                    try:
+                        exit_callback()
+                    except Exception:
+                        pass
             with self._streams_lock:
                 q = self._streams.get(wid)
                 if q is not None:
                     q.put(f)
+                elif wid in self._stream_tombstones:
+                    # Stream ownership was explicitly dropped. The terminal fence
+                    # above still ran; all stream payload is now intentionally dead.
+                    return
                 else:
                     # queue not registered yet (started reply still in flight) —
                     # buffer so the worker's opening frames aren't lost.
-                    self._early.setdefault(wid, []).append(f)
+                    bucket = self._early.get(wid)
+                    bucket_size = len(bucket) if bucket is not None else 0
+                    if (bucket_size < _EARLY_FRAMES_PER_WORKER
+                            and self._early_count < _EARLY_FRAMES_TOTAL):
+                        if bucket is None:
+                            bucket = self._early.setdefault(wid, [])
+                        bucket.append(f)
+                        self._early_count += 1
             return
         # "started" reply (StartWorker) AND "resp" replies (Signal/Status/Health) are
         # correlated by req_id.
@@ -159,6 +207,10 @@ class _SupervisorLink:
         with self._streams_lock:
             qs = list(self._streams.values())
             self._early.clear()
+            self._early_count = 0
+            self._stream_tombstones.clear()
+            self._terminal_frames.clear()
+            self._exit_callbacks.clear()
         for q in qs:
             q.close()
 
@@ -208,37 +260,88 @@ class _SupervisorLink:
         except ControlError:
             pass
 
-    def start_worker(self, spec: dict, *, timeout: float) -> "tuple[str, _FrameQueue]":
+    def start_worker(
+        self, spec: dict, *, timeout: float,
+        on_dispatched: "Optional[Callable[[], None]]" = None,
+    ) -> "tuple[str, _FrameQueue]":
         """Send StartWorker, register a stream queue for the assigned worker_id, and
-        return (worker_id, queue). The caller drains the queue (out/err/exit frames)."""
+        return (worker_id, queue). The caller drains stdin/out/err/exit frames."""
         if not self.alive:
             raise ControlError(f"control link for run {self.run_id} is down")
         rid = self._next_req()
         waiter = _PendingReply()
         with self._req_lock:
             self._pending[rid] = waiter
-        self._send({"op": "StartWorker", "req_id": rid, "spec": spec})
+        # Fence BEFORE sendall: an OSError can occur after the kernel accepted a
+        # prefix or even the complete request.  Once we attempt the write, remote
+        # spawn/delivery is uncertain until a started ACK proves the outcome.
+        if on_dispatched is not None:
+            try:
+                on_dispatched()
+            except Exception:
+                # The fence notification is advisory bookkeeping; a broken observer
+                # must not strand the pending slot or suppress the actual request.
+                pass
+        try:
+            self._send({"op": "StartWorker", "req_id": rid, "spec": spec})
+        except Exception:
+            with self._req_lock:
+                self._pending.pop(rid, None)
+            raise
         if not waiter.event.wait(min(60.0, timeout + 30)):
             with self._req_lock:
                 self._pending.pop(rid, None)
             raise ControlError(f"StartWorker timed out (run {self.run_id})")
         f = waiter.frame
-        if not f or f.get("t") != "started" or not f.get("worker_id"):
+        if (not f or f.get("t") != "started" or not f.get("worker_id")
+                or f.get("error")):
             err = (f or {}).get("error") or "supervisor did not start worker"
+            if f and f.get("t") == "started" and f.get("error"):
+                raise StartWorkerRejected(f"StartWorker rejected: {err}")
             raise ControlError(f"StartWorker failed: {err}")
         wid = f["worker_id"]
         q = _FrameQueue()
         with self._streams_lock:
             self._streams[wid] = q
+            self._stream_tombstones.pop(wid, None)
             # flush any frames that arrived before this queue existed, in order.
-            for early in self._early.pop(wid, []):
+            early_frames = self._early.pop(wid, [])
+            self._early_count -= len(early_frames)
+            for early in early_frames:
                 q.put(early)
         return wid, q
+
+    def register_exit_callback(
+        self, worker_id: str, callback: "Callable[[], None]",
+    ) -> None:
+        """Install a hard-exit fence independent from the disposable stream queue."""
+        terminal_seen = False
+        with self._streams_lock:
+            if worker_id in self._terminal_frames:
+                self._terminal_frames.pop(worker_id, None)
+                terminal_seen = True
+            else:
+                self._exit_callbacks[worker_id] = callback
+        if terminal_seen:
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def unregister_exit_callback(self, worker_id: str) -> None:
+        with self._streams_lock:
+            self._exit_callbacks.pop(worker_id, None)
+            self._terminal_frames.pop(worker_id, None)
 
     def drop_stream(self, worker_id: str) -> None:
         with self._streams_lock:
             self._streams.pop(worker_id, None)
-            self._early.pop(worker_id, None)
+            dropped = self._early.pop(worker_id, [])
+            self._early_count -= len(dropped)
+            self._stream_tombstones.pop(worker_id, None)
+            self._stream_tombstones[worker_id] = None
+            while len(self._stream_tombstones) > _STREAM_TOMBSTONES_MAX:
+                self._stream_tombstones.popitem(last=False)
 
     def close(self) -> None:
         self.alive = False
@@ -334,7 +437,13 @@ class ControlReceiver:
                              name="rcp-handshake", daemon=True).start()
 
     def _handshake(self, conn: socket.socket, addr: Any) -> None:
-        """Read the supervisor's Hello, validate the token, bind the link."""
+        """Read Hello and atomically consume its one-shot bootstrap capability.
+
+        A live run link is never replaceable, even by a client replaying the exact
+        token.  The expected token is removed only after the acknowledgement has
+        been written successfully, in the same lock critical section that publishes
+        the new link.
+        """
         conn.settimeout(30.0)
         try:
             buf = b""
@@ -351,32 +460,65 @@ class ControlReceiver:
             return
         run_id = hello.get("run_id") or ""
         token = hello.get("token") or ""
+        if not isinstance(run_id, str) or not isinstance(token, str):
+            run_id, token = "", ""
+        error = "unauthorized"
         with self._lock:
             expected = self._tokens.get(run_id)
-        ok = expected is not None and token == expected
+            current = self._links.get(run_id)
+            live = current is not None and current.alive
+            ok = (not live and expected is not None
+                  and hmac.compare_digest(token.encode(), expected.encode()))
+            if live:
+                error = "already connected"
+            if ok:
+                try:
+                    conn.sendall((json.dumps({"ok": True}) + "\n").encode())
+                except OSError:
+                    conn.close()
+                    return
+                # Successful ACK is the consumption point.  A concurrent/replayed
+                # Hello now sees no pending token and the live link below.
+                self._tokens.pop(run_id, None)
+                if current is not None:
+                    self._links.pop(run_id, None)
+                conn.settimeout(None)
+                link = _SupervisorLink(run_id, conn, addr)
+                self._links[run_id] = link
+                self._link_event.notify_all()
+                return
         try:
-            conn.sendall((json.dumps({"ok": ok, **({} if ok else {"error": "unauthorized"})}) + "\n").encode())
+            conn.sendall((json.dumps({"ok": False, "error": error}) + "\n").encode())
         except OSError:
-            conn.close()
-            return
-        if not ok:
-            conn.close()
-            return
-        conn.settimeout(None)
-        link = _SupervisorLink(run_id, conn, addr)
-        with self._lock:
-            old = self._links.get(run_id)
-            self._links[run_id] = link
-            self._link_event.notify_all()
-        if old is not None:
-            old.close()
+            pass
+        conn.close()
 
     # ── API for ensure_container / worker threads ─────────────────────────────
     def expect(self, run_id: str, token: str) -> None:
         """Register the token a run's supervisor must present. Call BEFORE the
-        container starts (the supervisor may dial in immediately)."""
+        container starts (the supervisor may dial in immediately).
+
+        Registration is idempotent only for the same pending token.  It cannot
+        rotate credentials beneath a live authenticated supervisor.
+        """
+        if not run_id or not token:
+            raise ControlError("run id and bootstrap token must be non-empty")
+        stale: Optional[_SupervisorLink] = None
         with self._lock:
+            current = self._links.get(run_id)
+            if current is not None and current.alive:
+                raise ControlError(
+                    f"refusing to rotate bootstrap token for live run {run_id}")
+            if current is not None:
+                stale = self._links.pop(run_id, None)
+            pending = self._tokens.get(run_id)
+            if pending is not None and not hmac.compare_digest(
+                    pending.encode(), token.encode()):
+                raise ControlError(
+                    f"bootstrap token already pending for run {run_id}")
             self._tokens[run_id] = token
+        if stale is not None:
+            stale.close()
 
     def await_link(self, run_id: str, *, deadline_s: float = 40.0) -> _SupervisorLink:
         """Block until the run's supervisor has dialed in (and is alive). Raises

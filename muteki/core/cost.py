@@ -12,6 +12,7 @@ accounting, not the exact rate. Update PRICES when real rates are known.
 from __future__ import annotations
 
 import time
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -45,6 +46,12 @@ PRICES: dict[str, ModelPrice] = {
     "codex": ModelPrice(input_per_m=1.25, output_per_m=10.0),
     "gpt-5": ModelPrice(input_per_m=1.25, output_per_m=10.0),
 }
+# Ollama serves the same models under a ``:cloud`` tag and bills GPU-time, not
+# tokens. Keep the DeepSeek list rates so a serving-stack switch does not silently
+# reprice every run against _DEFAULT_PRICE (~14x on flash) and blow the budget gate.
+PRICES.update(
+    {f"{name}:cloud": price for name, price in list(PRICES.items())}
+)
 # Cached-input rate for codex/GPT-5 (per 1M). cli_driver prices cached tokens at
 # this rate and fresh tokens at the full input rate when computing codex cost.
 CODEX_CACHED_INPUT_PER_M = 0.125
@@ -89,10 +96,17 @@ class CostController:
     _global: Ledger = field(default_factory=Ledger)
     _by_challenge: dict[str, Ledger] = field(default_factory=dict)
     _by_solver: dict[str, Ledger] = field(default_factory=dict)
+    _usage_windows: dict[str, Ledger] = field(default_factory=dict)
+    _usage_context: ContextVar[str | None] = field(
+        default_factory=lambda: ContextVar("muteki_usage_window", default=None)
+    )
     _points: int = 0  # solved points, for the North Star metric
 
     def price_for(self, model: str) -> ModelPrice:
-        return self.prices.get(model, _DEFAULT_PRICE)
+        found = self.prices.get(model)
+        if found is None and ":" in model:
+            found = self.prices.get(model.split(":", 1)[0])
+        return found if found is not None else _DEFAULT_PRICE
 
     async def add_external_usd(
         self, usd: float, *, run_id: str, solver_id: Optional[str] = None,
@@ -125,6 +139,9 @@ class CostController:
             _bump(self._by_challenge.setdefault(challenge_id, Ledger()))
         if solver_id:
             _bump(self._by_solver.setdefault(solver_id, Ledger()))
+        window_id = self._usage_context.get()
+        if window_id is not None and window_id in self._usage_windows:
+            _bump(self._usage_windows[window_id])
         if self.bus is not None:
             if solver_id:
                 led = self._by_solver[solver_id]
@@ -162,6 +179,11 @@ class CostController:
             )
         if solver_id:
             self._by_solver.setdefault(solver_id, Ledger()).add(
+                price, input_tokens, output_tokens
+            )
+        window_id = self._usage_context.get()
+        if window_id is not None and window_id in self._usage_windows:
+            self._usage_windows[window_id].add(
                 price, input_tokens, output_tokens
             )
         if self.bus is not None:
@@ -240,6 +262,69 @@ class CostController:
     def solver_usd(self, solver_id: str) -> float:
         led = self._by_solver.get(solver_id)
         return led.usd if led else 0.0
+
+    def solver_usage(self, solver_id: str) -> dict[str, int]:
+        """Exact integer counters for a worker settlement receipt.
+
+        Protocol 2 budget accounting must not scrape the presentation-oriented
+        rounded ``snapshot()`` payload.  Micro-dollars keep the durable contract
+        integer-only and deterministic.
+        """
+        usage = self.solver_usage_or_none(solver_id)
+        if usage is None:
+            return {
+                "tokens": 0, "input_tokens": 0, "output_tokens": 0,
+                "cost_micro_usd": 0, "calls": 0,
+            }
+        return usage
+
+    def solver_usage_or_none(self, solver_id: str) -> dict[str, int] | None:
+        """Return cumulative exact counters, preserving absent telemetry as None.
+
+        Protocol 2 uses this form so a provider that emitted no usage record is
+        accounted as UNKNOWN rather than silently converted into a zero charge.
+        """
+        led = self._by_solver.get(solver_id)
+        if led is None:
+            return None
+        return {
+            "tokens": int(led.tokens),
+            "input_tokens": int(led.input_tokens),
+            "output_tokens": int(led.output_tokens),
+            "cost_micro_usd": int(round(led.usd * 1_000_000)),
+            "calls": int(led.calls),
+        }
+
+    def begin_usage_window(self, window_id: str) -> Token[str | None]:
+        """Bind subsequent cost records in this async context to one attempt."""
+        if (
+            type(window_id) is not str
+            or not window_id
+            or window_id != window_id.strip()
+        ):
+            raise ValueError("window_id must be a non-empty canonical string")
+        if window_id in self._usage_windows:
+            raise ValueError("usage window is already active")
+        self._usage_windows[window_id] = Ledger()
+        return self._usage_context.set(window_id)
+
+    def finish_usage_window(
+        self,
+        window_id: str,
+        token: Token[str | None],
+    ) -> dict[str, int]:
+        """Close an exact attempt window and return its non-cumulative counters."""
+        if self._usage_context.get() != window_id:
+            raise ValueError("usage window is not current in this context")
+        ledger = self._usage_windows.pop(window_id, None)
+        if ledger is None:
+            raise ValueError("usage window is not active")
+        self._usage_context.reset(token)
+        return {
+            "calls": int(ledger.calls),
+            "cost_micro_usd": int(round(ledger.usd * 1_000_000)),
+            "tokens": int(ledger.tokens),
+        }
 
     def points_per_dollar_hour(self, now: Optional[float] = None) -> float:
         """North Star: points / (USD * hours). 0 when no spend yet."""

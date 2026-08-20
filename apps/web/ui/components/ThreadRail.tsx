@@ -5,6 +5,7 @@ import type { CSSProperties, DragEvent as ReactDragEvent, PointerEvent as ReactP
 import { RunSummary, RunStatus, Folder } from "@/lib/useRun";
 import { useLang, useT, type Lang } from "@/lib/i18n";
 import { Icon, type IconName } from "@/components/Icon";
+import { SelectionGlider } from "@/components/SelectionGlider";
 import { clampRailWidth, railWidthMax, RAIL_WIDTH_DEFAULT, RAIL_WIDTH_MIN, RAIL_WIDTH_MAX } from "@/lib/railSizing";
 
 /**
@@ -290,10 +291,11 @@ export function ThreadRail({
         </div>
 
         <div
-          className="rail-scroll"
+          className="rail-scroll selection-glide-host"
           ref={scrollRef}
           onScroll={(e) => { scrollTop.current = (e.target as HTMLDivElement).scrollTop; }}
         >
+        <SelectionGlider selectedKey={activeRunId} selector=".thread-item.active" className="rail" ensureVisible />
         {draftActive && (
           <>
             <div className="rail-sec">{t("rail.active")}</div>
@@ -752,7 +754,7 @@ function StatusIcon({ status, t }: { status: RunStatus; t: (k: string) => string
     draft: "dot",
     paused: "pause",
     solved: "flag",
-    finished: "check",
+    finished: "stop",
     failed: "alert",
   };
   return (
