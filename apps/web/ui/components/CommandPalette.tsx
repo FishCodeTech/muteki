@@ -4,7 +4,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Icon, type IconName } from "@/components/Icon";
 import { useT, useLang } from "@/lib/i18n";
 import type { RunSummary } from "@/lib/useRun";
-import type { ArtifactView } from "@/components/ArtifactPanel";
+import type { ArtifactView } from "@/lib/events";
+import { SelectionGlider } from "@/components/SelectionGlider";
 
 /**
  * Cmd/Ctrl+K command palette — a Linear/Slack/VSCode-style centered overlay that
@@ -82,7 +83,6 @@ export function CommandPalette(props: PaletteData) {
   const [active, setActive] = useState(0);
 
   const inputRef = useRef<HTMLInputElement | null>(null);
-  const listRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLElement | null>(null);
 
   // Build the full command list (pre-filter). Only commands whose `when` holds
@@ -213,13 +213,6 @@ export function CommandPalette(props: PaletteData) {
     setActive((i) => (filtered.length === 0 ? 0 : Math.min(i, filtered.length - 1)));
   }, [filtered.length]);
 
-  // keep the highlighted row scrolled into view.
-  useEffect(() => {
-    if (!open) return;
-    const el = listRef.current?.querySelector<HTMLElement>(`[data-idx="${active}"]`);
-    el?.scrollIntoView({ block: "nearest" });
-  }, [active, open]);
-
   if (!open) return null;
 
   const choose = (c: Command | undefined) => {
@@ -281,7 +274,8 @@ export function CommandPalette(props: PaletteData) {
           <kbd className="cmdk-esc">esc</kbd>
         </div>
 
-        <div className="cmdk-list" id="cmdk-list" role="listbox" aria-label={t("palette.title")} ref={listRef}>
+        <div className="cmdk-list selection-glide-host" id="cmdk-list" role="listbox" aria-label={t("palette.title")}>
+          <SelectionGlider selectedKey={filtered[active]?.id ?? ""} selector='.cmdk-item[aria-selected="true"]' className="palette" ensureVisible duration={240} />
           {filtered.length === 0 ? (
             <div className="cmdk-empty">{t("palette.empty")}</div>
           ) : (

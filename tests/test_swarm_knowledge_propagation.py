@@ -157,25 +157,6 @@ def test_p5_gist_is_label_only_worker_reads_raw_fact(tmp_path):
 # 问题 ③:fact/hint 传不到 + flag1 做好几次 —— P0 + P2 + P3
 # ─────────────────────────────────────────────────────────────────────────────
 
-@pytest.mark.asyncio
-async def test_p0_static_flag_reused_across_runs_accepted():
-    """P0: a static flag (same value across runs) recovered from REAL output must be
-    accepted — the cross-run value-dedup误杀 that stuck the operator at a false 1/4
-    is gone. (Also covered in test_stream_flag_extraction; kept here as the ③ link.)"""
-    bus = EventBus()
-    seen = []
-
-    async def _sink(ev):
-        from muteki.core.events import EventType
-        if ev.event_type == EventType.BLACKBOARD_DELTA and (ev.payload or {}).get("kind") == "flag_found":
-            seen.append((ev.payload or {}).get("flag"))
-    bus.add_sink(_sink)
-    sv = _worker(bus)
-    static = "flag2{9f23aa16-33e7-11f1-9508-7e92a294591d}"
-    await sv._stream_markers(f"# type C:\\flag2.txt\nFOUND_FLAG={static}\n")
-    assert static in seen, "a static flag from real output must register"
-
-
 def test_p2_multi_flag_sibling_flag_does_not_interrupt_current_turn():
     """P2: multi-flag collection must keep sibling workers alive after one teammate
     lands a flag. The worker records the flag so it won't re-hunt it, but only the
@@ -268,7 +249,9 @@ def test_resume_falls_back_to_execute_when_session_not_established():
     assert not sv._session_established, "a fresh worker has no established session"
 
     # session NOT established → must NOT emit a resume (-r) argv; falls back to execute
-    argv = sv._resume_or_execute_argv("CONTINUE", "ghost-uuid-never-seated")
+    argv, stdin_text = sv._resume_or_execute_argv(
+        "CONTINUE", "ghost-uuid-never-seated")
+    assert stdin_text is None
     assert "-r" not in argv, "resume of an unseated session must fall back to execute"
     assert "ghost-uuid-never-seated" not in argv, "the ghost session id is not reused"
     assert "-p" in argv, "the fallback is a fresh execute"
@@ -285,7 +268,9 @@ def test_resume_used_once_session_is_established():
                                        session="real-sess-123"))
     assert sv._session_established
 
-    argv = sv._resume_or_execute_argv("CONTINUE", "real-sess-123")
+    argv, stdin_text = sv._resume_or_execute_argv(
+        "CONTINUE", "real-sess-123")
+    assert stdin_text is None
     assert "-r" in argv and "real-sess-123" in argv, \
         "an established session resumes with -r to keep its memory"
 

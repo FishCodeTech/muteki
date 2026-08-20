@@ -3,6 +3,8 @@
 #
 #   ./run.sh tui [tui-args...]      Textual TUI command deck (in-process).
 #   ./run.sh web [web-opts...]      Web command deck (FastAPI backend + Next UI).
+#   ./run.sh upgrade [version]      Check and install a verified release bundle.
+#   ./run.sh rollback               Switch back to the previous installed version.
 #
 # TUI examples:
 #   ./run.sh tui                              mock event stream (UI demo, no key)
@@ -179,8 +181,12 @@ main() {
   case "$mode" in
     tui) run_tui "$@" ;;
     web) run_web "$@" ;;
+    version|status|upgrade|install|rollback)
+      require_uv
+      exec uv run python -m muteki.cli "$mode" "$@"
+      ;;
     -h|--help|help) usage 0 ;;
-    *) echo "ERROR: unknown mode '$mode' (expected: tui | web)" >&2; usage 1 ;;
+    *) echo "ERROR: unknown mode '$mode' (expected: tui | web | version | status | upgrade | install | rollback)" >&2; usage 1 ;;
   esac
 }
 

@@ -7,7 +7,8 @@ Endpoints:
   GET  /api/runs/{run_id}/events      SSE: the typed event stream (Last-Event-ID
                                        resume via the standard header)
   WS   /api/runs/{run_id}/terminal    sandbox terminal: TERMINAL_OUTPUT bytes
-  POST /api/runs/{run_id}/hitl        human command into the run (hint/pause/etc.)
+  POST /api/runs/{run_id}/control     durable operator command admission
+  POST /api/runs/{run_id}/hitl        legacy adapter onto /control
   GET  /                              the single-page UI (static)
 
 The server holds NO solving logic — it only brokers the event bus + HITL. Event
@@ -17,6 +18,7 @@ schema is the only contract (§3).
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import re
@@ -37,8 +39,10 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError as PydanticValidationError
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
+from apps.web.control_adapter import ControlPayloadError
 from apps.web.auth import (
     PUBLIC_API_PATHS,
     AuthConfig,
@@ -49,14 +53,19 @@ from apps.web.auth import (
     verify_token,
 )
 from apps.web.run_manager import Run, RunManager
+from apps.web.platform_update import PlatformUpdateController
+from muteki.control import IdempotencyConflict, StateConflict
 from muteki.core.dotenv_boot import load_env
 from muteki.core.events import Event, EventType
+from muteki.runtime.release_receipts import load_verified_release_receipts
+from muteki.version import get_version
 from muteki.solver.credential_accounts import (
     CredentialAccountStore,
     account_store_root,
 )
 
 load_env()  # local convenience: pick up repo-root .env (shell env still wins)
+load_verified_release_receipts(root=Path(__file__).resolve().parents[2])
 
 UI_DIR = Path(__file__).parent / "ui"
 
@@ -149,6 +158,24 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
 
     app = FastAPI(title="Project Muteki — Command Deck", lifespan=lifespan)
     app.state.manager = mgr
+    app.state.platform_updates = PlatformUpdateController()
+
+    @app.get("/api/health")
+    async def health() -> Any:
+        return {"status": "ok", "version": get_version()}
+
+    def llm_settings_payload(config: dict[str, Any]) -> dict[str, Any]:
+        """Expose credential presence/source without returning any secret value."""
+        from apps.web.llm_credentials import LlmCredentialStore
+
+        payload = copy.deepcopy(config)
+        store = LlmCredentialStore(app.state.manager.sessions_root)
+        profiles = payload.get("llm_profiles") or {}
+        for which in ("planner", "titler"):
+            row = profiles.get(which)
+            if isinstance(row, dict):
+                row["credential_source"] = store.source(which)
+        return payload
 
     # Auth (P3): a single-password gate in front of /api. fail_fast_check refuses
     # to start if bound to a non-loopback host with no password — see auth.py and
@@ -309,13 +336,70 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     async def delete_run(run_id: str) -> Any:
         # Hard-delete: cancels the task, drops the in-memory handle, the JSONL
         # log, and the meta row. Irreversible — the UI confirms before calling.
+        if app.state.manager.is_protocol2_run(run_id):
+            raise HTTPException(
+                status_code=409, detail="PROTOCOL2_PURGE_UNAVAILABLE")
         ok = await app.state.manager.delete(run_id)
         return {"ok": ok}
+
+    @app.post("/api/runs/{run_id}/archive")
+    async def archive_protocol2_run(run_id: str) -> Any:
+        if not app.state.manager.is_protocol2_run(run_id):
+            raise HTTPException(status_code=404, detail="unknown Protocol 2 run")
+        try:
+            status = await app.state.manager.archive_protocol2(run_id)
+        except (StateConflict, RuntimeError) as exc:
+            raise HTTPException(
+                status_code=409, detail=type(exc).__name__
+            ) from exc
+        return {"operation_id": status["operation_id"],
+                "run_id": status["run_id"], "state": status["state"].upper(),
+                "archive_receipt_digest": status["archive_receipt_digest"]}
+
+    @app.get("/api/archive-operations/{operation_id}")
+    async def archive_operation_status(operation_id: str) -> Any:
+        adapter = app.state.manager.protocol2
+        if adapter is None:
+            raise HTTPException(status_code=503, detail="Protocol 2 unavailable")
+        try:
+            status = adapter.archive_status(operation_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="unknown archive operation") from exc
+        return {**status, "state": status["state"].upper()}
+
+    @app.post("/api/runs/{run_id}/purge")
+    async def purge_protocol2_run(run_id: str) -> Any:
+        if not app.state.manager.is_protocol2_run(run_id):
+            raise HTTPException(status_code=404, detail="unknown Protocol 2 run")
+        try:
+            status = await app.state.manager.purge_protocol2(run_id)
+        except (StateConflict, RuntimeError) as exc:
+            raise HTTPException(
+                status_code=409, detail=type(exc).__name__
+            ) from exc
+        return {"operation_id": status["operation_id"],
+                "run_id": status["run_id"], "state": status["state"].upper(),
+                "plan_receipt_digest": status["plan_receipt_digest"],
+                "absence_receipt_digest": status["absence_receipt_digest"]}
+
+    @app.get("/api/purge-operations/{operation_id}")
+    async def purge_operation_status(operation_id: str) -> Any:
+        adapter = app.state.manager.protocol2
+        if adapter is None:
+            raise HTTPException(status_code=503, detail="Protocol 2 unavailable")
+        try:
+            status = adapter.purge_status(operation_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="unknown purge operation") from exc
+        return {**status, "state": status["state"].upper()}
 
     @app.post("/api/runs/{run_id}/open")
     async def open_run_workspace(run_id: str) -> Any:
         # Reveal the run's workspace dir in the host file manager. Only meaningful
         # when the operator runs the backend locally; a no-op (ok:false) otherwise.
+        if app.state.manager.is_protocol2_run(run_id):
+            raise HTTPException(
+                status_code=409, detail="PROTOCOL2_WORKSPACE_REVEAL_UNAVAILABLE")
         ok = app.state.manager.open_workspace(run_id)
         return {"ok": ok}
 
@@ -326,6 +410,11 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
 
         mgr: RunManager = app.state.manager
         run = mgr.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="unknown run")
+        if not mgr.is_protocol1_run(run_id, run=run):
+            raise HTTPException(
+                status_code=409, detail="PROTOCOL2_CREDENTIALS_UNAVAILABLE")
         graph_db = mgr.workspace_dir(run_id) / "graph" / "shared_graph.db"
         if not graph_db.exists():
             return {"credentials": []}
@@ -350,10 +439,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     # superseding /btw request. The process exits after the turn.
     @app.post("/api/runs/{run_id}/btw")
     async def btw(run_id: str, request: Request) -> Any:
-        from apps.web.drivers import (
-            _runtime_for_profile,
-            _standby_profile_for,
-        )
+        from apps.web.drivers import _standby_profile_for, _standby_worker_env
         from apps.web.worker_config import backend_for_profile, resolve_worker_backend
         from muteki.core.runtime_env import is_web_container
         from muteki.solver.btw import (
@@ -365,10 +451,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             stream_btw_worker_deltas,
         )
         from muteki.solver.cli_driver import driver_for
-        from muteki.solver.credential_accounts import (
-            account_store_root,
-            runtime_env_for_engine,
-        )
+        from muteki.solver.credential_accounts import account_store_root
         from muteki.solver.worker_profiles import base_engine_for_profile
 
         body = await _require_dict_body(request)
@@ -383,10 +466,13 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         if run is None:
             # Unknown run → 404. Do NOT create a workspace for it.
             return JSONResponse({"error": "unknown run"}, status_code=404)
+        if not mgr.is_protocol1_run(run_id, run=run):
+            return JSONResponse(
+                {"error": "PROTOCOL2_BTW_UNAVAILABLE"}, status_code=409)
 
         # The worker needs a cwd, so /btw creates only a per-turn scratch dir under
         # the run workspace. It never opens the graph read-write or joins the swarm.
-        safe = run_id.replace("/", "_").replace("..", "_")
+        safe = mgr._safe_run_id(run_id)
         root = mgr.workspace_dir(run_id).resolve()
         graph_db = root / "graph" / "shared_graph.db"
         jsonl_path = (mgr.sessions_root / f"{safe}.jsonl").resolve()
@@ -420,7 +506,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
                 winner = {}
         wc = mgr.worker_config.resolve(challenge_category)
         worker_profiles = wc.get("worker_profiles") or []
-        runtime_profiles = wc.get("runtime_profiles") or []
+        worker_network = str(wc.get("worker_network") or "bridge")
 
         def _pick_profile() -> tuple[dict[str, Any] | None, str]:
             requested = str(
@@ -446,7 +532,10 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
                 if profile is not None:
                     return profile, cand
                 base = base_engine_for_profile(cand)
-                if base in ("claude", "codex", "cursor"):
+                if base in (
+                    "claude", "codex", "cursor", "pi", "omp", "kimi", "grok",
+                    "opencode", "dsh",
+                ):
                     return None, base
             return None, "claude"
 
@@ -465,15 +554,16 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             )
             backend = (
                 backend_for_profile(
-                    profile,
-                    runtime_profiles=runtime_profiles,
                     worker_backend=worker_backend,
                     in_web_container=is_web_container(),
                 )
                 if profile else worker_backend
             )
-            runtime = _runtime_for_profile(profile, runtime_profiles)
             container = None
+            # A BTW turn on a finished run cold-starts a run container that has no
+            # swarm owner to tear it down.  Remember that ownership here; live runs
+            # keep sharing their existing container with the active swarm.
+            owns_finished_run_container = bool(run.finished)
             account_root = account_store_root(mgr.sessions_root)
             worker_root = root / "workers" / "_btw"
             worker_root.mkdir(parents=True, exist_ok=True)
@@ -490,10 +580,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
                         ensure_container,
                         run_id,
                         str(root),
-                        network=str(runtime.get("network") or "bridge"),
-                        memory=str(runtime.get("memory") or "") or None,
-                        cpus=str(runtime.get("cpus") or "") or None,
-                        pids_limit=int(runtime.get("pids_limit") or 0) or None,
+                        network=worker_network,
                         account_root=str(account_root),
                     )
                     await asyncio.to_thread(_chown_tree_to_worker, str(workdir))
@@ -523,30 +610,16 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
                     context_hint=context_hint,
                     transcript=transcript,
                 )
-                worker_env = runtime_env_for_engine(
-                    transport,
+                worker_env = _standby_worker_env(
+                    root=root,
+                    label=f"btw-{transport}",
+                    engine=transport,
+                    profile=profile,
                     account_root=account_root,
-                    account_id=(profile.get("credential_account") if profile else None),
-                    container=container is not None,
-                ).env
+                    container=container,
+                )
                 worker_env["MUTEKI_BTW_WORKER"] = "1"
                 worker_env["MUTEKI_BLACKBOARD_DB"] = ""
-                if profile:
-                    worker_env["MUTEKI_WORKER_PROFILE_ID"] = str(profile.get("id") or "")
-                    worker_env["MUTEKI_CREDENTIAL_ACCOUNT_ID"] = str(
-                        profile.get("credential_account") or ""
-                    )
-                    if profile.get("model"):
-                        worker_env["MUTEKI_WORKER_MODEL"] = str(profile["model"])
-                if container is not None:
-                    home_host = root / "homes" / f"btw-{transport}"
-                    home_host.mkdir(parents=True, exist_ok=True)
-                    from muteki.solver.container_exec import _chown_tree_to_worker
-                    await asyncio.to_thread(_chown_tree_to_worker, str(home_host))
-                    mapper = getattr(container, "to_container_path", None)
-                    worker_env["HOME"] = (
-                        mapper(str(home_host)) if callable(mapper) else str(home_host)
-                    )
                 async for chunk in stream_btw_worker_deltas(
                     driver=driver_for(profile or transport),
                     prompt=prompt,
@@ -566,6 +639,22 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             except Exception as e:  # noqa: BLE001
                 yield {"data": json.dumps({"error": str(e)[:300]}, ensure_ascii=False)}
             finally:
+                if (container is not None and owns_finished_run_container
+                        and run.finished):
+                    from muteki.solver.container_exec import teardown_container
+                    try:
+                        removed = await asyncio.to_thread(
+                            teardown_container, run_id, remove=True)
+                        if removed is not True:
+                            import logging
+                            logging.getLogger(__name__).warning(
+                                "BTW container teardown could not be proven for %s",
+                                run_id,
+                            )
+                    except Exception:
+                        import logging
+                        logging.getLogger(__name__).exception(
+                            "BTW container teardown failed for %s", run_id)
                 this_task = asyncio.current_task()
                 if this_task is not None:
                     limiter.release(run_id, this_task)
@@ -580,6 +669,13 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     _engine_cache: dict[str, Any] = {"ts": 0.0, "data": None}
     _engine_cache_ttl_s = 300.0
     _engine_refresh_lock = asyncio.Lock()
+
+    def _invalidate_engine_cache() -> None:
+        # The header polls this cache slowly.  A user who changes the enabled
+        # Worker roster must see the saved engine on the very next run instead of
+        # the previous roster for up to five minutes.
+        _engine_cache["ts"] = 0.0
+        _engine_cache["data"] = None
 
     @app.get("/api/engines")
     async def engines() -> Any:
@@ -642,17 +738,59 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     async def get_worker_settings() -> Any:
         # the default worker roster (engines + bootstrap count + per-category
         # overrides) the dispatch path falls back to when a request is silent.
-        return {"config": app.state.manager.worker_config.get()}
+        return {"config": llm_settings_payload(app.state.manager.worker_config.get())}
+
+    @app.get("/api/settings/system-update")
+    async def get_system_update() -> Any:
+        return {"update": app.state.platform_updates.status()}
+
+    @app.post("/api/settings/system-update/check")
+    async def check_system_update(request: Request) -> Any:
+        body = await _require_dict_body(request, allow_empty=True)
+        target = str(body.get("target") or "").strip() or None
+        try:
+            update = await app.state.platform_updates.check(target)
+        except Exception:
+            update = app.state.platform_updates.status()
+        return {"update": update}
+
+    @app.post("/api/settings/system-update/install")
+    async def install_system_update(request: Request) -> Any:
+        body = await _require_dict_body(request, allow_empty=True)
+        target = str(body.get("target") or "").strip() or None
+        try:
+            update = await app.state.platform_updates.start(target, force=bool(body.get("force", False)))
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        return {"update": update}
+
+    @app.post("/api/settings/system-update/rollback")
+    async def rollback_system_update() -> Any:
+        try:
+            update = await app.state.platform_updates.rollback()
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        return {"update": update}
 
     @app.put("/api/settings/workers")
     async def put_worker_settings(request: Request) -> Any:
         body = await _require_dict_body(request)
+        raw_llm_profiles = body.get("llm_profiles")
+        llm_profiles = copy.deepcopy(raw_llm_profiles)
+        if isinstance(llm_profiles, dict):
+            for which in ("planner", "titler"):
+                row = llm_profiles.get(which)
+                if isinstance(row, dict):
+                    row.pop("api_key", None)
+                    row.pop("clear_api_key", None)
+                    row.pop("credential_source", None)
         try:
             cfg = app.state.manager.worker_config.set(
                 engines=body.get("engines"),
                 start_workers=body.get("start_workers"),
                 max_workers=body.get("max_workers"),
                 worker_backend=body.get("worker_backend"),
+                worker_network=body.get("worker_network"),
                 race_scout=body.get("race_scout"),
                 race_timeout=body.get("race_timeout"),
                 wall_clock_budget=body.get("wall_clock_budget"),
@@ -660,31 +798,45 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
                 max_total_workers=body.get("max_total_workers"),
                 cost_budget_usd=body.get("cost_budget_usd"),
                 stage_policy=body.get("stage_policy"),
-                llm_profiles=body.get("llm_profiles"),
-                runtime_profiles=body.get("runtime_profiles"),
+                llm_profiles=llm_profiles,
                 worker_profiles=body.get("worker_profiles"),
                 overrides=body.get("overrides"),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        return {"ok": True, "config": cfg}
+        if isinstance(raw_llm_profiles, dict):
+            from apps.web.llm_credentials import LlmCredentialStore
+
+            store = LlmCredentialStore(app.state.manager.sessions_root)
+            try:
+                for which in ("planner", "titler"):
+                    row = raw_llm_profiles.get(which)
+                    if not isinstance(row, dict):
+                        continue
+                    if bool(row.get("clear_api_key")):
+                        store.clear(which)
+                    elif isinstance(row.get("api_key"), str) and row["api_key"].strip():
+                        store.save(which, row["api_key"])
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+        _invalidate_engine_cache()
+        return {"ok": True, "config": llm_settings_payload(cfg)}
 
     @app.put("/api/settings/identity")
     async def put_identity_model(request: Request) -> Any:
-        # Save the NEW Credential/Seat/Environment model. Additive to the legacy
+        # Save the Credential/Seat model. Additive to the legacy
         # PUT /workers above (which still accepts worker_profiles/engines). The
         # store validates the container×system_inherit legality gate and rejects an
-        # illegal combo with 400. GET the model back via GET /workers (config.seats
-        # / config.credentials / config.environments are attached there).
+        # illegal combo with 400. GET the model back via GET /workers.
         body = await _require_dict_body(request)
         try:
             cfg = app.state.manager.worker_config.set_identity_model(
                 seats=body.get("seats"),
                 credentials=body.get("credentials"),
-                environments=body.get("environments"),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
+        _invalidate_engine_cache()
         return {"ok": True, "config": cfg}
 
     @app.get("/api/settings/profiles/health")
@@ -693,8 +845,8 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         # CHEAP binding layer (zero network / zero docker) so opening the modal
         # never fires a wall of CLI hellos — the deep auth probe is the explicit
         # "测连通" button (POST below). Backend is resolved from SERVER context
-        # via backend_for_profile (the same per-profile runtime→backend mapping
-        # dispatch uses), NEVER trusted from the client, so the verdict predicts
+        # via backend_for_profile (the same global backend mapping dispatch uses),
+        # NEVER trusted from the client, so the verdict predicts
         # what a real run would use.
         from dataclasses import asdict
 
@@ -704,7 +856,6 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
 
         cfg = app.state.manager.worker_config.get()
         profiles = [p for p in (cfg.get("worker_profiles") or []) if isinstance(p, dict)]
-        runtime_profiles = cfg.get("runtime_profiles") or []
         worker_backend = str(cfg.get("worker_backend") or "")
         in_web = is_web_container()
         sessions_root = app.state.manager.sessions_root
@@ -713,7 +864,6 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             out: list[dict] = []
             for p in profiles:
                 backend = backend_for_profile(
-                    p, runtime_profiles=runtime_profiles,
                     worker_backend=worker_backend, in_web_container=in_web,
                 )
                 h = evaluate_profile_health(
@@ -758,7 +908,6 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         if match is None:
             raise HTTPException(status_code=404, detail=f"unknown profile: {profile_id}")
         backend = backend_for_profile(
-            match, runtime_profiles=cfg.get("runtime_profiles") or [],
             worker_backend=str(cfg.get("worker_backend") or ""),
             in_web_container=is_web_container(),
         )
@@ -773,22 +922,101 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     async def get_worker_models() -> Any:
         from apps.web.worker_models import worker_model_options_payload
 
-        return worker_model_options_payload()
+        return worker_model_options_payload(app.state.manager.sessions_root)
+
+    @app.post("/api/settings/worker-models/discover")
+    async def discover_worker_models_now(request: Request) -> Any:
+        from muteki.core.runtime_env import is_web_container
+        from apps.web.worker_config import backend_for_profile
+        from apps.web.worker_models import (
+            WorkerModelDiscoveryStore,
+            discover_worker_models,
+            worker_model_options_payload,
+        )
+
+        cfg = app.state.manager.worker_config.get()
+        profiles = [
+            profile
+            for profile in (cfg.get("worker_profiles") or [])
+            if isinstance(profile, dict)
+        ]
+        body = await _require_dict_body(request, allow_empty=True)
+        profile_id = str(body.get("profile_id") or "").strip()
+        if profile_id:
+            profiles = [
+                profile for profile in profiles
+                if profile_id in {
+                    str(profile.get("id") or "").strip(),
+                    str(profile.get("name") or "").strip(),
+                }
+            ]
+        results: list[dict[str, Any]] = []
+        for profile in profiles:
+            backend = backend_for_profile(
+                worker_backend=str(cfg.get("worker_backend") or ""),
+                in_web_container=is_web_container(),
+            )
+            results.append(
+                await asyncio.to_thread(
+                    discover_worker_models,
+                    profile=profile,
+                    sessions_root=app.state.manager.sessions_root,
+                    backend=backend,
+                )
+            )
+
+        WorkerModelDiscoveryStore(app.state.manager.sessions_root).save_results(results)
+        payload = worker_model_options_payload(app.state.manager.sessions_root)
+        payload["discovery_results"] = results
+        payload["discovery_ok"] = any(bool(result.get("ok")) for result in results)
+        return payload
 
     @app.post("/api/settings/worker-model/test")
     async def test_worker_model(request: Request) -> Any:
         body = await _require_dict_body(request)
+        from apps.web.worker_config import backend_for_profile
         from apps.web.worker_models import probe_worker_model
+        from muteki.core.runtime_env import is_web_container
 
         profile = body.get("profile")
         if not isinstance(profile, dict):
             raise HTTPException(status_code=400, detail="profile must be an object")
+        cfg = app.state.manager.worker_config.get()
+        backend = backend_for_profile(
+            worker_backend=str(cfg.get("worker_backend") or ""),
+            in_web_container=is_web_container(),
+        )
         return await asyncio.to_thread(
             probe_worker_model,
             profile=profile,
             model=str(body.get("model") or ""),
+            reasoning_effort=str(body.get("reasoning_effort") or "default"),
             sessions_root=app.state.manager.sessions_root,
-            backend=str(body.get("backend") or "local"),
+            backend=backend,
+            runtime={"network": str(cfg.get("worker_network") or "bridge")},
+        )
+
+    @app.post("/api/settings/worker-model/test-batch")
+    async def test_worker_models_batch(request: Request) -> Any:
+        body = await _require_dict_body(request)
+        from apps.web.worker_config import backend_for_profile
+        from apps.web.worker_models import probe_worker_models_batch
+        from muteki.core.runtime_env import is_web_container
+
+        items = body.get("items")
+        if not isinstance(items, list):
+            raise HTTPException(status_code=400, detail="items must be an array")
+        cfg = app.state.manager.worker_config.get()
+        backend = backend_for_profile(
+            worker_backend=str(cfg.get("worker_backend") or ""),
+            in_web_container=is_web_container(),
+        )
+        return await asyncio.to_thread(
+            probe_worker_models_batch,
+            items=[item for item in items if isinstance(item, dict)],
+            sessions_root=app.state.manager.sessions_root,
+            backend=backend,
+            runtime={"network": str(cfg.get("worker_network") or "bridge")},
         )
 
     @app.get("/api/settings/worker-image")
@@ -814,19 +1042,46 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     async def put_credential_account(account_id: str, request: Request) -> Any:
         body = await _require_dict_body(request)
         store = CredentialAccountStore(account_store_root(app.state.manager.sessions_root))
+        requested_engine = str(
+            body.get("worker_engine") or body.get("target_engine") or body.get("engine") or ""
+        ).strip().lower()
+        connection = str(body.get("connection") or "").strip().lower()
+        if not connection:
+            legacy_engine = str(body.get("engine") or "").strip().lower()
+            legacy_base_url = str(body.get("base_url") or "").strip()
+            connection = (
+                "custom_endpoint"
+                if legacy_engine == "api" or legacy_base_url
+                else "official"
+            )
+        if connection not in {"official", "custom_endpoint"}:
+            raise HTTPException(status_code=400, detail="connection must be official or custom_endpoint")
+        if requested_engine not in {
+            "claude", "codex", "cursor", "pi", "omp", "kimi", "grok",
+            "opencode", "dsh"
+        }:
+            raise HTTPException(
+                status_code=400,
+                detail="worker_engine must be claude, codex, cursor, pi, omp, kimi, "
+                       "grok, opencode, or dsh",
+            )
+        base_url = str(body.get("base_url") or "").strip()
+        if connection == "custom_endpoint" and not base_url:
+            raise HTTPException(status_code=400, detail="自定义端点必须填写 Base URL")
+        storage_engine = "api" if connection == "custom_endpoint" else requested_engine
         try:
             account = store.upsert_secret(
                 account_id=account_id,
-                engine=str(body.get("engine") or ""),
+                engine=storage_engine,
                 secret=(body.get("secret") if body.get("secret") is not None else None),
                 codex_auth_json=(
                     body.get("codex_auth_json")
                     if body.get("codex_auth_json") is not None else None
                 ),
-                base_url=(body.get("base_url") if body.get("base_url") is not None else None),
-                target_engine=(
-                    body.get("target_engine") if body.get("target_engine") is not None else None
-                ),
+                base_url=base_url,
+                target_engine=requested_engine if connection == "custom_endpoint" else None,
+                provider=(body.get("provider") if body.get("provider") is not None else None),
+                clear_base_url=connection == "official",
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
@@ -834,6 +1089,22 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
 
     @app.delete("/api/settings/credential-accounts/{account_id}")
     async def delete_credential_account(account_id: str) -> Any:
+        cfg = app.state.manager.worker_config.get()
+        credential_ids = {
+            str(item.get("id"))
+            for item in (cfg.get("credentials") or [])
+            if isinstance(item, dict) and str(item.get("secret_ref") or "") == account_id
+        }
+        used_by = [
+            str(item.get("label") or item.get("id") or "Worker")
+            for item in (cfg.get("seats") or [])
+            if isinstance(item, dict) and str(item.get("credential_id") or "") in credential_ids
+        ]
+        if used_by:
+            raise HTTPException(
+                status_code=409,
+                detail=f"账号仍被 {len(used_by)} 个 Worker 使用：{'、'.join(used_by[:4])}",
+            )
         store = CredentialAccountStore(account_store_root(app.state.manager.sessions_root))
         return {"ok": store.delete(account_id)}
 
@@ -855,6 +1126,31 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         store = CredentialAccountStore(account_store_root(app.state.manager.sessions_root))
         try:
             account = await asyncio.to_thread(store.import_host_codex_auth, account_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"ok": True, "account": account}
+
+    @app.post("/api/settings/credential-accounts/{account_id}/import-host-login")
+    async def import_host_login(account_id: str, request: Request) -> Any:
+        """Copy a minimal Claude, Kimi Code, or Grok host login into an account.
+
+        Container workers receive the account projection, so they can authenticate
+        without mounting the operator's complete home directory.
+        """
+        from muteki.core.runtime_env import is_web_container
+
+        if is_web_container():
+            raise HTTPException(
+                status_code=409,
+                detail="import-from-host is unavailable when the web control plane runs in a container",
+            )
+        body = await _require_dict_body(request)
+        engine = str(body.get("engine") or "").strip().lower()
+        if engine not in {"claude", "kimi", "grok"}:
+            raise HTTPException(status_code=400, detail="engine must be claude, kimi, or grok")
+        store = CredentialAccountStore(account_store_root(app.state.manager.sessions_root))
+        try:
+            account = await asyncio.to_thread(store.import_host_login, account_id, engine)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         return {"ok": True, "account": account}
@@ -887,37 +1183,38 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         from muteki.solver.credential_accounts import detect_system_login
 
         logins = await asyncio.to_thread(
-            lambda: {e: detect_system_login(e) for e in ("claude", "codex", "cursor")}
+            lambda: {
+                e: detect_system_login(e)
+                for e in (
+                    "claude", "codex", "cursor", "pi", "omp", "kimi", "grok",
+                    "opencode", "dsh",
+                )
+            }
         )
         return {"logins": logins}
 
     @app.post("/api/settings/llm/test")
     async def test_llm_endpoint_route(request: Request) -> Any:
-        # Test the planner/titler endpoint the operator is EDITING (DESIGN §2.4
-        # 補強C-1): base_url + model from the request body, key from .env. ok by
-        # API success, not content non-empty (reasoning models).
+        # Test the planner/titler endpoint the operator is editing. A freshly
+        # entered key takes precedence over the saved profile key and env fallback.
         body = await _require_dict_body(request)
+        from apps.web.llm_credentials import LlmCredentialStore
         from apps.web.llm_test import test_llm_endpoint
 
-        return await test_llm_endpoint(
-            which=str(body.get("which") or "planner"),
-            base_url=(body.get("base_url") if body.get("base_url") is not None else None),
-            model=(body.get("model") if body.get("model") is not None else None),
-        )
-
-    @app.put("/api/settings/runtime-environment")
-    async def put_runtime_environment(request: Request) -> Any:
-        # Unify backend + runtime across all enabled profiles (DESIGN §5) so the
-        # displayed run environment is what actually runs.
-        body = await _require_dict_body(request)
+        which = str(body.get("which") or "planner")
+        entered_key = str(body.get("api_key") or "").strip()
         try:
-            cfg = app.state.manager.worker_config.set_runtime_environment(
-                backend=str(body.get("backend") or ""),
-                runtime_id=str(body.get("runtime_id") or ""),
-            )
+            api_key = entered_key or LlmCredentialStore(app.state.manager.sessions_root).resolve(which)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        return {"ok": True, "config": cfg}
+        return await test_llm_endpoint(
+            which=which,
+            base_url=(body.get("base_url") if body.get("base_url") is not None else None),
+            model=(body.get("model") if body.get("model") is not None else None),
+            api_key=api_key,
+            temperature_mode=body.get("temperature_mode"),
+            temperature=body.get("temperature"),
+        )
 
     @app.post("/api/runs")
     async def new_run(request: Request) -> Any:
@@ -926,32 +1223,54 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         run = app.state.manager.create_new()
         return {"run_id": run.run_id}
 
+    @app.get("/api/protocol2/status")
+    async def protocol2_status() -> Any:
+        adapter = app.state.manager.protocol2
+        if adapter is None:
+            return {
+                "protocol_version": 2,
+                "available": False,
+                "production_enabled": False,
+                "reason": app.state.manager.protocol2_error or "unavailable",
+            }
+        return adapter.status()
+
+    @app.get("/api/protocol2/runs/{run_id}/status")
+    async def protocol2_run_status(run_id: str) -> Any:
+        adapter = app.state.manager.protocol2
+        if adapter is None:
+            raise HTTPException(status_code=503, detail="Protocol 2 unavailable")
+        try:
+            return adapter.canonical_run_status(run_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="unknown Protocol 2 run") from exc
+
     @app.post("/api/runs/{run_id}/start")
     async def start_run(run_id: str, request: Request) -> Any:
         body = await _require_dict_body(request)
         from apps.web.drivers import build_driver
 
         driver = build_driver(body, mgr=app.state.manager)
-        # seed rail metadata up front so the row appears the instant we dispatch
-        # (before run.started lands) — conversational dispatch infers the rest.
-        run = app.state.manager.get(run_id) or app.state.manager.create(run_id)
+        from muteki.core.path_ids import RunIdPathError
+        try:
+            run = app.state.manager.get(run_id) or app.state.manager.create(run_id)
+        except RunIdPathError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            run = await app.state.manager.start(run_id, driver)
+        except RunIdPathError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except StateConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        # Mutate rail metadata only after lifecycle admission succeeds. A duplicate
+        # live start must be a pure 409 and may not erase the active generation's
+        # solved/flag/name projection before the manager rejects it.
         ch = (body.get("challenge") or {})
         if ch.get("name"):
             run.name = ch["name"]
         if ch.get("category"):
             run.category = ch["category"]
-        # Re-starting an existing run_id (e.g. a re-test redo of the same challenge):
-        # the run object still carries the PRIOR run's terminal state (finished/solved/
-        # flag). Reset it synchronously here so the rail doesn't show a freshly-
-        # dispatched run as "已解出" until the new run.started bus event is sinked
-        # (it would otherwise display the stale solved flag the whole time it runs).
-        run.finished = False
-        run.solved = False
-        run.flag = None
-        run.flags = []
-        run.paused = False
-        run.started = True
-        await app.state.manager.start(run_id, driver)
 
         # ChatGPT-style auto-title: if the operator gave no explicit name, kick off
         # a background summarizer that names the conversation from the prompt and
@@ -965,12 +1284,85 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
                 titler_profile = llm_profiles.get("titler") or {}
                 title_model = titler_profile.get("model")
                 title_base_url = titler_profile.get("base_url") or None
-                asyncio.create_task(
-                    generate_title(prompt, bus=run.bus, run_id=run_id,
-                                   model=title_model, base_url=title_base_url)
-                )
+                from apps.web.llm_credentials import LlmCredentialStore
+                title_api_key = LlmCredentialStore(
+                    app.state.manager.sessions_root).resolve("titler")
+                title_generation = run.execution_generation
+                title_bus = run.bus
+
+                async def _generate_owned_title() -> None:
+                    current = asyncio.current_task()
+                    try:
+                        title = await generate_title(
+                        prompt, bus=None, run_id=None,
+                        model=title_model, base_url=title_base_url,
+                        api_key=title_api_key,
+                        temperature_mode=titler_profile.get("temperature_mode"),
+                        temperature=titler_profile.get("temperature"),
+                        )
+                        if (run.execution_generation == title_generation
+                                and run.bus is title_bus and not run.finished
+                                and title):
+                            await title_bus.emit(Event(
+                                event_type=EventType.RUN_TITLED,
+                                run_id=run_id,
+                                payload={
+                                    "title": title,
+                                    "execution_generation": title_generation,
+                                },
+                            ))
+                    finally:
+                        if run.title_task is current:
+                            run.title_task = None
+
+                run.title_task = asyncio.create_task(_generate_owned_title())
 
         return {"run_id": run_id, "started": True, "kind": body.get("kind", "swarm")}
+
+    @app.post("/api/dispatch/parse")
+    async def dispatch_parse_preflight(request: Request) -> Any:
+        """Preflight LLM parse of a dispatch prompt, so the deck can warn BEFORE
+        launch when neither the count field nor the prompt carries a collect
+        quota (open-ended collect may run until the operator stops it).
+        Never raises: ``parsed`` is {} when the planner LLM is unavailable or
+        cannot decide — the caller falls back to its own heuristics."""
+        body = await _require_dict_body(request)
+        prompt = str(body.get("prompt") or "")[:4000]
+        goal = str(body.get("goal") or "")
+        mode = str(body.get("mode") or "ctf")
+        if mode not in ("ctf", "pentest"):
+            mode = "ctf"
+        mgr = app.state.manager
+        try:
+            llm_profiles = dict(mgr.worker_config.get().get("llm_profiles") or {})
+        except Exception:
+            llm_profiles = {}
+        planner_profile = llm_profiles.get("planner") or {}
+        planner_model = str(planner_profile.get("model") or "deepseek-v4-pro")
+        from apps.web.llm_credentials import LlmCredentialStore
+        from muteki.core.llm import LLMClient, llm_temperature_kwargs
+
+        llm_kwargs: dict[str, Any] = dict(
+            llm_temperature_kwargs(planner_profile))
+        planner_base = str(planner_profile.get("base_url") or "").strip()
+        if planner_base:
+            llm_kwargs["base_url"] = planner_base
+        planner_key = LlmCredentialStore(mgr.sessions_root).resolve("planner")
+        if planner_key:
+            llm_kwargs["api_key"] = planner_key
+        parsed: dict[str, Any] = {}
+        try:
+            from apps.web.dispatch_parse import parse_dispatch
+
+            async with LLMClient(**llm_kwargs) as llm:
+                parsed = await asyncio.wait_for(
+                    parse_dispatch(
+                        prompt, goal, mode, llm=llm, model=planner_model),
+                    timeout=15.0,
+                )
+        except Exception:
+            parsed = {}
+        return {"parsed": parsed or {}}
 
     @app.post("/api/runs/{run_id}/uploads")
     async def upload_files(
@@ -986,7 +1378,11 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         # ensure a run handle exists so an upload BEFORE dispatch still works
         # (the deck promotes a draft to a real run id before uploading, but be
         # robust — mirror the get-or-create the events/start endpoints use).
-        mgr.get(run_id) or mgr.create(run_id)
+        from muteki.core.path_ids import RunIdPathError
+        try:
+            mgr.get(run_id) or mgr.create(run_id)
+        except RunIdPathError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         if len(files) > MAX_UPLOAD_FILES:
             raise HTTPException(status_code=413, detail="too many files")
 
@@ -1068,7 +1464,8 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             async for ev in run.store.replay_monotonic(run_id, after_seq=last_id):
                 replayed_seq = ev.seq
                 replayed_count += 1
-                if ev.event_type in (EventType.RUN_STARTED,
+                if ev.event_type in (EventType.RUN_PREPARING,
+                                     EventType.RUN_STARTED,
                                      EventType.RUN_FINISHED,
                                      EventType.RUN_REOPENED):
                     last_lifecycle = ev.event_type.value
@@ -1089,7 +1486,10 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             # lifecycle from the skipped prefix and should simply wait on the bus.
             task = getattr(run, "task", None)
             live = task is not None and not task.done()
-            if fresh and not live and last_lifecycle in ("run.started", "run.reopened"):
+            if (fresh and not live
+                    and manager.is_protocol1_run(run_id, run=run)
+                    and last_lifecycle in (
+                        "run.preparing", "run.started", "run.reopened")):
                 replayed_seq = max(replayed_seq, run.store.last_stream_seq(run_id)) + 1
                 synth = Event(
                     event_type=EventType.RUN_FINISHED, run_id=run_id,
@@ -1111,7 +1511,12 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             # keep the SSE open (ping handles liveness) and hop to a fresh bus if
             # resolve/standby reopens the run.
             manager._sync_bus_seq(run.bus, store=run.store, run_id=run_id)
-            tail_from = max(last_id, replayed_seq, run.store.last_stream_seq(run_id))
+            # Do not advance the cursor from a second store lookup here.  An event
+            # can commit after replay reached EOF but before this line; adopting its
+            # sequence without yielding it would skip that event permanently.  Live
+            # in-process writes are present in the EventBus ring and subscribe()
+            # delivers everything after the last sequence actually replayed.
+            tail_from = max(last_id, replayed_seq)
             while True:
                 bus = run.bus
                 async for ev in bus.subscribe(last_event_id=tail_from):
@@ -1126,6 +1531,13 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
                 while run.bus is bus:
                     if await request.is_disconnected():
                         return
+                    # STOP/COMPLETE confirms runtime exit only after the generation
+                    # task has emitted RUN_FINISHED and closed its bus.  The final
+                    # control receipt is therefore a valid late publication on that
+                    # closed bus.  Re-enter subscribe() when its sequence advances so
+                    # the existing SSE connection receives the durable receipt.
+                    if bus.current_seq > tail_from:
+                        break
                     await asyncio.sleep(1)
 
         return EventSourceResponse(
@@ -1191,15 +1603,51 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             run_id, "kill", solver_id=body.get("solver_id"))
         return {"ok": ok}
 
+    @app.post("/api/runs/{run_id}/control")
+    async def control(run_id: str, request: Request) -> Any:
+        """Persist an idempotent command; effects arrive later over SSE."""
+        body = await _require_dict_body(request)
+        if app.state.manager.get(run_id) is None:
+            raise HTTPException(status_code=404, detail="unknown run")
+        try:
+            result = await app.state.manager.post_control(run_id, body)
+        except (ControlPayloadError, PydanticValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except (IdempotencyConflict, StateConflict) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if result.get("status") == "rejected":
+            code = str(result.get("code") or "")
+            status = 409 if code == "generation_conflict" else 422
+            return JSONResponse(result, status_code=status)
+        return result
+
+    @app.get("/api/runs/{run_id}/control/{command_id}")
+    async def control_receipt(run_id: str, command_id: str) -> Any:
+        """Reconcile a command whose SSE terminal projection was interrupted."""
+        if app.state.manager.get(run_id) is None:
+            raise HTTPException(status_code=404, detail="unknown run")
+        if not app.state.manager.is_protocol1_run(run_id):
+            raise HTTPException(
+                status_code=409, detail="PROTOCOL2_CONTROL_UNAVAILABLE")
+        receipt = app.state.manager.control_receipt(run_id, command_id)
+        if receipt is None:
+            raise HTTPException(status_code=404, detail="unknown control command")
+        return receipt
+
     @app.post("/api/runs/{run_id}/hitl")
     async def hitl(run_id: str, request: Request) -> Any:
         body = await _require_dict_body(request)
-        ok = await app.state.manager.post_hitl(
-            run_id,
-            body.get("target", "global"),
-            body.get("action", "hint"),
-            **{k: v for k, v in body.items() if k not in ("target", "action")},
-        )
+        try:
+            ok = await app.state.manager.post_hitl(
+                run_id,
+                body.get("target", "global"),
+                body.get("action", "hint"),
+                **{k: v for k, v in body.items() if k not in ("target", "action")},
+            )
+        except (ControlPayloadError, PydanticValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except (IdempotencyConflict, StateConflict) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"ok": ok}
 
     # static UI: the deck is the Next.js app (run `./run.sh web` → :3001, which

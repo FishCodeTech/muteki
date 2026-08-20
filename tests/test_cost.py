@@ -145,3 +145,26 @@ def test_custom_price_table() -> None:
     cc = CostController(prices={"x": ModelPrice(input_per_m=10, output_per_m=20)})
     p = cc.price_for("x")
     assert p.cost(1_000_000, 1_000_000) == pytest.approx(30.0)
+def test_protocol2_usage_distinguishes_absent_telemetry_from_zero():
+    controller = CostController()
+    assert controller.solver_usage_or_none("missing") is None
+    assert controller.solver_usage("missing")["tokens"] == 0
+
+
+async def test_attempt_usage_window_is_non_cumulative_and_context_bound():
+    controller = CostController()
+    first_token = controller.begin_usage_window("attempt-1")
+    await controller.add_external_usd(
+        0.001, run_id="run", solver_id="solver",
+        input_tokens=3, output_tokens=2,
+    )
+    first = controller.finish_usage_window("attempt-1", first_token)
+    second_token = controller.begin_usage_window("attempt-2")
+    await controller.add_external_usd(
+        0.002, run_id="run", solver_id="solver",
+        input_tokens=7, output_tokens=4,
+    )
+    second = controller.finish_usage_window("attempt-2", second_token)
+    assert first == {"calls": 1, "cost_micro_usd": 1_000, "tokens": 5}
+    assert second == {"calls": 1, "cost_micro_usd": 2_000, "tokens": 11}
+    assert controller.solver_usage("solver")["tokens"] == 16

@@ -128,7 +128,7 @@ def test_post_hitl_finished_run_triggers_standby(tmp_path, monkeypatch):
         # close the bus to mimic a finished run; _fresh_bus must revive it
         await run.bus.close()
         ok = await mgr.post_hitl("run-x", "global", "ask", text="how?")
-        assert ok
+        assert ok is False  # scheduled, but fake driver supplied no delivery proof
         # standby driver was built + scheduled
         assert run.standby_task is not None
         await asyncio.gather(run.standby_task, return_exceptions=True)
@@ -162,12 +162,14 @@ def test_post_hitl_repeated_writeup_triggers_new_standby(tmp_path, monkeypatch):
         run.task = None
         await run.bus.close()
 
-        assert await mgr.post_hitl("run-x", "global", "writeup", text="")
+        assert await mgr.post_hitl(
+            "run-x", "global", "writeup", text="") is False
         first = run.standby_task
         assert first is not None
         await first
 
-        assert await mgr.post_hitl("run-x", "global", "writeup", text="")
+        assert await mgr.post_hitl(
+            "run-x", "global", "writeup", text="") is False
         second = run.standby_task
         assert second is not None
         await second
@@ -284,7 +286,7 @@ def test_post_hitl_stop_cancels_live_task(tmp_path, monkeypatch):
         return ok, run, called
 
     ok, run, called = asyncio.run(_run())
-    assert ok is True
+    assert ok is True  # fallback cancelled+awaited the only live runtime owner
     assert run.task.cancelled() or run.task.done()   # the live task was cancelled
     assert called["n"] == 0                            # stop never spawns a standby
 
@@ -339,24 +341,30 @@ def test_m2_post_hitl_drops_identical_back_to_back_hint(tmp_path):
         mgr = rm.RunManager(sessions_root=str(tmp_path / "sessions"))
         run = mgr.create("run-x")
         run.task = asyncio.create_task(asyncio.sleep(30))
+        seen = []
+        async def _consume_two():
+            for _ in range(2):
+                wire = await run.hitl.get()
+                ack = wire.pop("_control_ack")
+                seen.append(wire)
+                ack.set_result({"state": "effect_observed"})
+        consumer = asyncio.create_task(_consume_two())
         # first send queues; the 10 identical resends are dropped
         for _ in range(11):
             await mgr.post_hitl("run-x", "global", "hint", text="try /admin")
-        depth = run.hitl.qsize()
         # a genuinely new hint goes through
         await mgr.post_hitl("run-x", "global", "hint", text="now try /api")
-        depth2 = run.hitl.qsize()
+        await consumer
         run.task.cancel()
-        return depth, depth2
+        return seen
 
-    depth, depth2 = asyncio.run(_run())
-    assert depth == 1, f"11 identical hints must queue once, got {depth}"
-    assert depth2 == 2, "a changed hint must still queue"
+    seen = asyncio.run(_run())
+    assert [wire.get("text") for wire in seen] == ["try /admin", "now try /api"]
 
 
-def test_m4_post_hitl_reports_delivery_status(tmp_path):
-    """M4: HITL_RESPONSE carries a `delivery` status so the operator knows where a
-    command went — queued_for_next_worker (live hint) vs no_live_workers / standby."""
+def test_m4_post_hitl_reports_persisted_not_predicted_delivery(tmp_path):
+    """The legacy endpoint now echoes only the durable acceptance fact. A live
+    task is not proof that a worker consumed the command."""
     from apps.web import run_manager as rm
     from muteki.core.events import EventType
 
@@ -378,7 +386,9 @@ def test_m4_post_hitl_reports_delivery_status(tmp_path):
     seen = asyncio.run(_run())
     hitl = [e for e in seen if e.event_type is EventType.HITL_RESPONSE]
     assert hitl, "a hint must echo a HITL_RESPONSE"
-    assert hitl[-1].payload.get("delivery") == "queued_for_next_worker"
+    assert hitl[-1].payload.get("status") == "persisted"
+    assert hitl[-1].payload.get("command_id")
+    assert "delivery" not in hitl[-1].payload
 
 
 # ── resolve action: "继续做题" relaunches the FULL swarm (not a single standby) ──
@@ -517,6 +527,7 @@ def test_finished_hitl_in_web_container_uses_worker_container(tmp_path, monkeypa
 
     def fake_teardown(run_id, *, remove=True):
         captured["teardown"] = {"run_id": run_id, "remove": remove}
+        return True
 
     def fake_chown(path):
         captured.setdefault("chown", []).append(Path(path).name)
@@ -525,7 +536,25 @@ def test_finished_hitl_in_web_container_uses_worker_container(tmp_path, monkeypa
         def __init__(self, *args, **kwargs):
             captured["solver_kwargs"] = kwargs
 
+        def cancel(self):
+            captured["cancel_calls"] = captured.get("cancel_calls", 0) + 1
+
+        def runtime_exit_confirmed(self):
+            return bool(captured.get("runtime_done"))
+
+        async def wait_runtime_exit(self, timeout=None):
+            deadline = asyncio.get_running_loop().time() + float(timeout or 1)
+            while not self.runtime_exit_confirmed():
+                if asyncio.get_running_loop().time() >= deadline:
+                    return False
+                await asyncio.sleep(0.001)
+            return True
+
         async def run(self):
+            active_run = captured["run"]
+            assert callable(active_run.standby_cancel)
+            assert callable(active_run.standby_runtime_exited)
+            assert callable(active_run.standby_wait_runtime_exit)
             return SolveOutcome(False, None, 1, None, "writeup",
                                 engine="codex", reply="# Writeup")
 
@@ -538,15 +567,12 @@ def test_finished_hitl_in_web_container_uses_worker_container(tmp_path, monkeypa
         mgr = rm.RunManager(sessions_root=str(tmp_path / "sessions"))
         mgr.worker_config.resolve = lambda category: {
             "worker_backend": "container",
-            "runtime_profiles": [
-                {"id": "docker-web", "backend": "container", "network": "bridge"},
-            ],
+            "worker_network": "bridge",
             "worker_profiles": [
                 {
                     "id": "seat-codex",
                     "name": "seat-codex",
                     "engine": "codex",
-                    "runtime": "docker-web",
                     "credential_account": "codex-main",
                     "model": "gpt-5.4",
                     "enabled": True,
@@ -555,6 +581,7 @@ def test_finished_hitl_in_web_container_uses_worker_container(tmp_path, monkeypa
             ],
         }
         run = mgr.create("run-x")
+        captured["run"] = run
         run.started = True
         run.finished = True
         run.solved = True
@@ -579,10 +606,21 @@ def test_finished_hitl_in_web_container_uses_worker_container(tmp_path, monkeypa
         ok = await mgr.post_hitl("run-x", "global", "writeup", text="")
         assert run.standby_task is not None
         await run.standby_task
+        # Wrapper completion is not runtime completion: callbacks stay registered
+        # and an autonomous reaper keeps issuing real worker.cancel calls.
+        assert callable(run.standby_cancel)
+        assert callable(run.standby_runtime_exited)
+        assert callable(run.standby_wait_runtime_exit)
+        assert run.standby_runtime_cleanup_task is not None
+        captured["runtime_done"] = True
+        await run.standby_runtime_cleanup_task
+        assert run.standby_cancel is None
+        assert run.standby_runtime_exited is None
+        assert run.standby_wait_runtime_exit is None
         return ok
 
     ok = asyncio.run(_run())
-    assert ok is True
+    assert ok is False  # fake solver never acknowledges prompt transport
     assert captured["ensure"]["run_id"] == "run-x"
     assert captured["ensure"]["network"] == "bridge"
     assert captured["solver_kwargs"]["container"].container == "muteki-run-run-x"
@@ -592,6 +630,7 @@ def test_finished_hitl_in_web_container_uses_worker_container(tmp_path, monkeypa
     assert captured["solver_kwargs"]["worker_env"]["HOME"].endswith("/cli-codex")
     assert captured["chown"] == ["standby-codex", "cli-codex"]
     assert captured["teardown"] == {"run_id": "run-x", "remove": True}
+    assert captured["cancel_calls"] >= 2
 
 
 def test_standby_reuses_challenge_from_session_jsonl_without_winner(tmp_path, monkeypatch):
@@ -665,7 +704,7 @@ def test_standby_failure_is_logged_and_emitted(tmp_path, monkeypatch, caplog):
         run.task = None
         await run.bus.close()
         ok = await mgr.post_hitl("run-x", "global", "ask", text="continue")
-        assert ok is True
+        assert ok is False
         assert run.standby_task is not None
         await asyncio.gather(run.standby_task, return_exceptions=True)
         seen = [ev async for ev in run.store.replay("run-x")]
@@ -676,7 +715,38 @@ def test_standby_failure_is_logged_and_emitted(tmp_path, monkeypatch, caplog):
     assert any("standby worker failed" in r.message for r in caplog.records)
     reqs = [e for e in seen if e.event_type is EventType.HITL_REQUEST]
     assert reqs
-    assert "container did not start" in reqs[-1].payload["need"]
+    assert reqs[-1].payload["need"] == (
+        "standby worker failed (RuntimeError): container did not start")
+
+
+def test_standby_final_cancel_log_redacts_callback_exception(
+        tmp_path, monkeypatch, caplog):
+    from apps.web import run_manager as rm
+    import apps.web.drivers as drivers
+
+    raw_secret = "password=FINAL-CANCEL-SECRET"
+
+    async def _driver(run):
+        def _cancel():
+            raise RuntimeError(raw_secret)
+        run.standby_cancel = _cancel
+
+    monkeypatch.setattr(
+        drivers, "build_standby_driver", lambda cmd, mgr=None: _driver)
+
+    async def _run():
+        mgr = rm.RunManager(sessions_root=tmp_path / "sessions")
+        run = mgr.create("run-final-cancel-redaction")
+        assert mgr._ensure_standby(run.run_id, {"action": "ask"}) is True
+        await asyncio.gather(run.standby_task, return_exceptions=True)
+        run.standby_cancel = None
+        await mgr.shutdown()
+
+    caplog.set_level("ERROR")
+    asyncio.run(_run())
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    assert "error_type=RuntimeError" in rendered
+    assert raw_secret not in rendered
 
 
 def test_resolve_reuses_challenge_from_winner_json(tmp_path, monkeypatch):
@@ -774,6 +844,153 @@ def test_resolve_noop_on_live_run(tmp_path):
         return ok
 
     assert asyncio.run(_run()) is False
+
+
+def test_resolve_refuses_until_standby_runtime_exit_is_proven(tmp_path, monkeypatch):
+    from apps.web import run_manager as rm
+
+    async def _run():
+        monkeypatch.setenv("MUTEKI_STANDBY_CANCEL_TIMEOUT", "0.02")
+        mgr = rm.RunManager(sessions_root=str(tmp_path / "sessions"))
+        run = mgr.create("run-x")
+        run.started = True
+        run.finished = True
+        run.task = None
+        run.standby_task = asyncio.create_task(asyncio.sleep(3600))
+        run.standby_cancel = lambda: None
+        run.standby_runtime_exited = lambda: False
+
+        async def _never_confirms(timeout=None):
+            await asyncio.sleep(float(timeout or 0))
+            return False
+
+        run.standby_wait_runtime_exit = _never_confirms
+        ok = await mgr.resolve("run-x", {})
+        assert ok is False
+        assert run.task is None
+        assert run.finished is True
+        assert run.standby_task.done()
+        run.standby_runtime_exited = None
+        run.standby_wait_runtime_exit = None
+        run.standby_cancel = None
+
+    asyncio.run(_run())
+
+
+def test_cancel_during_container_acquisition_retains_fence_then_tears_down(
+        tmp_path, monkeypatch):
+    import threading
+    from apps.web import run_manager as rm
+    import muteki.solver.container_exec as container_exec
+
+    started = threading.Event()
+    release = threading.Event()
+    torn_down = threading.Event()
+
+    def _ensure(*_args, **_kwargs):
+        started.set()
+        release.wait(timeout=2)
+        return object()
+
+    def _teardown(run_id, remove=True):
+        assert run_id == "run-x"
+        assert remove is True
+        torn_down.set()
+        return True
+
+    monkeypatch.setattr(container_exec, "ensure_container", _ensure)
+    monkeypatch.setattr(container_exec, "teardown_container", _teardown)
+    monkeypatch.setenv("MUTEKI_STANDBY_CANCEL_TIMEOUT", "0.02")
+
+    async def _run():
+        mgr = rm.RunManager(sessions_root=str(tmp_path / "sessions"))
+        mgr.worker_config.resolve = lambda _category: {
+            "worker_backend": "container",
+            "worker_profiles": [],
+        }
+        run = mgr.create("run-x")
+        run.started = True
+        run.finished = True
+        run.task = None
+        (mgr.workspace_dir("run-x") / "winner.json").write_text(json.dumps({
+            "worker_id": "cli-claude", "engine": "claude",
+            "session": "s", "challenge": {"name": "x", "category": "web"},
+        }))
+        post = asyncio.create_task(mgr.post_hitl(
+            "run-x", "global", "writeup", text=""))
+        for _ in range(200):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.001)
+        assert started.is_set()
+        setup = run.standby_setup_task
+        assert setup is not None and not setup.done()
+        assert await mgr.delete("run-x") is False
+        assert mgr.runs["run-x"] is run
+        assert not setup.done()
+        release.set()
+        assert await post is False
+        await asyncio.gather(run.standby_task, return_exceptions=True)
+        assert torn_down.is_set()
+        assert run.standby_setup_task is None
+        assert await mgr.delete("run-x") is True
+
+    asyncio.run(_run())
+
+
+def test_container_setup_failure_retains_owner_until_teardown_is_proven(
+        tmp_path, monkeypatch):
+    from apps.web import run_manager as rm
+    import muteki.solver.container_exec as container_exec
+
+    teardown_allowed = asyncio.Event()
+    teardown_calls = {"n": 0}
+
+    def _ensure(*_args, **_kwargs):
+        # Models docker run succeeding followed by supervisor handshake failure.
+        raise RuntimeError("supervisor handshake failed after container create")
+
+    def _teardown(_run_id, remove=True):
+        assert remove is True
+        teardown_calls["n"] += 1
+        return teardown_allowed.is_set()
+
+    monkeypatch.setattr(container_exec, "ensure_container", _ensure)
+    monkeypatch.setattr(container_exec, "teardown_container", _teardown)
+    monkeypatch.setenv("MUTEKI_STANDBY_CANCEL_TIMEOUT", "0.02")
+
+    async def _run():
+        mgr = rm.RunManager(sessions_root=str(tmp_path / "sessions"))
+        mgr.worker_config.resolve = lambda _category: {
+            "worker_backend": "container",
+            "worker_profiles": [],
+        }
+        run = mgr.create("run-x")
+        run.started = True
+        run.finished = True
+        (mgr.workspace_dir("run-x") / "winner.json").write_text(json.dumps({
+            "worker_id": "cli-claude", "engine": "claude", "session": "s",
+            "challenge": {"name": "x", "category": "web"},
+        }))
+        assert await mgr.post_hitl(
+            "run-x", "global", "writeup", text="") is False
+        for _ in range(100):
+            if run.standby_runtime_cleanup_task is not None:
+                break
+            await asyncio.sleep(0.005)
+        cleanup = run.standby_runtime_cleanup_task
+        assert cleanup is not None and not cleanup.done()
+        assert teardown_calls["n"] > 0
+        assert run.standby_runtime_exited() is False
+        assert await mgr.delete("run-x") is False
+        assert mgr.runs["run-x"] is run
+
+        teardown_allowed.set()
+        await asyncio.wait_for(cleanup, timeout=1)
+        assert run.standby_setup_task is None
+        assert await mgr.delete("run-x") is True
+
+    asyncio.run(_run())
 
 # ── stop must settle a GHOST run (no live task but deck thinks it's running) ──
 def test_post_hitl_stop_settles_ghost_run(tmp_path):

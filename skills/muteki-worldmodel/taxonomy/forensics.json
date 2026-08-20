@@ -1,0 +1,14 @@
+{
+  "domain": "forensics",
+  "entity_kinds": ["disk_image", "file_system", "memory_dump", "network_capture", "artifact"],
+  "state_variables": ["file_system.deleted_entries", "network_capture.protocols", "artifact.file_type", "goal.flag_recovery"],
+  "completion_state": "goal.flag_recovery",
+  "initial_reachability": 0.15,
+  "actions": [
+    {"name": "carve_file", "risk_class": "safe", "cost_estimate_units": 2},
+    {"name": "parse_filesystem", "risk_class": "safe", "cost_estimate_units": 2},
+    {"name": "analyze_memory", "risk_class": "probe", "cost_estimate_units": 3},
+    {"name": "extract_network_object", "risk_class": "probe", "cost_estimate_units": 2},
+    {"name": "timeline_reconstruct", "risk_class": "probe", "cost_estimate_units": 3}
+  ]
+}

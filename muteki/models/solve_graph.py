@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import Literal, Optional
+from typing import Literal, Never, Optional
 
 from pydantic import BaseModel, Field
 
@@ -49,6 +49,122 @@ class Hypothesis(BaseModel):
     status: HypothesisStatus = HypothesisStatus.PROPOSED
     priority: float = 0.5  # parallel-verification ordering (RAG prior may init)
     refuted_reason: Optional[str] = None
+
+
+QuantityKind = Literal["first", "collect", "recon"]
+
+
+class EngagementGoal(BaseModel):
+    """Pentest objective attached to Challenge.goal / Challenge.scope.
+
+    Default: expected_findings=1, finding_class parsed from goal text or generic.
+    success_predicate defaults to gated_report (report collection after
+    independent reproduction and value judgment).
+    """
+    raw: str = ""
+    finding_class: str = "generic"
+    quantity: QuantityKind = "first"
+    expected_findings: int = 1
+    collect_until_coverage: bool = False
+    success_predicate: str = "gated_report"
+
+
+def parse_engagement_goal(raw: str) -> EngagementGoal:
+    """Map operator goal text onto EngagementGoal. Unknown text stays generic."""
+    text = (raw or "").strip()
+    low = text.lower()
+    finding_class = "generic"
+    if any(h in text or h in low for h in (
+        "rce", "远程代码", "命令注入", "command injection", "os command",
+    )):
+        finding_class = "rce"
+    elif any(h in text or h in low for h in (
+        "idor", "越权", "bola", "broken access", "未授权",
+    )):
+        finding_class = "idor"
+    elif any(h in low for h in ("sqli", "sql注入", "sql injection")):
+        finding_class = "sqli"
+    elif any(h in low for h in ("xss", "跨站")):
+        finding_class = "xss"
+    elif "ssrf" in low:
+        finding_class = "ssrf"
+    quantity: QuantityKind = "first"
+    expected = 1
+    until_coverage = False
+    if any(h in text or h in low for h in ("侦察", "recon", "测绘")):
+        quantity = "recon"
+        until_coverage = True
+    elif any(h in text or h in low for h in ("收集", "全部", "所有", "collect")):
+        quantity = "collect"
+        m = re.search(r"(\d+)", text)
+        if m:
+            expected = max(1, int(m.group(1)))
+            until_coverage = False
+        else:
+            expected = 1
+            until_coverage = True
+    else:
+        m = re.search(r"(\d+)", text)
+        if m:
+            expected = max(1, int(m.group(1)))
+    return EngagementGoal(
+        raw=text,
+        finding_class=finding_class or "generic",
+        quantity=quantity,
+        expected_findings=max(1, expected),
+        collect_until_coverage=until_coverage,
+        success_predicate="gated_report",
+    )
+
+
+def engagement_goal_of(challenge: "Challenge") -> EngagementGoal:
+    stored = getattr(challenge, "engagement", None)
+    if stored is not None:
+        return stored
+    if getattr(challenge, "mode", "ctf") != "pentest":
+        return EngagementGoal(raw="", finding_class="", expected_findings=1)
+    return parse_engagement_goal(getattr(challenge, "goal", "") or "")
+
+
+def apply_expected_findings(
+    engagement: EngagementGoal, expected_findings: int,
+) -> EngagementGoal:
+    """Apply the operator's explicit report count from the dispatch form.
+
+    A filled number is a known collection size, including N=1. Open-ended
+    collect is only when the count field is left blank.
+    """
+    want = max(1, int(expected_findings))
+    quantity = engagement.quantity
+    if quantity == "recon":
+        return engagement.model_copy(update={"expected_findings": want})
+    if want > 1 or quantity == "collect":
+        quantity = "collect"
+    return engagement.model_copy(update={
+        "expected_findings": want,
+        "quantity": quantity,
+        "collect_until_coverage": False,
+    })
+
+
+def engagement_reports_complete(
+    engagement: EngagementGoal, n_accepted: int,
+) -> bool:
+    """True when the accepted report collection satisfies the engagement."""
+    if engagement.success_predicate not in {"gated_finding", "gated_report"}:
+        return False
+    q = engagement.quantity
+    got = max(0, int(n_accepted))
+    if q == "recon":
+        return False
+    if q == "collect":
+        if engagement.collect_until_coverage:
+            return False
+        return got >= max(1, int(engagement.expected_findings or 1))
+    if q == "first":
+        return got >= max(1, int(engagement.expected_findings or 1))
+    _exhaustive: Never = q
+    raise AssertionError(_exhaustive)
 
 
 class Challenge(BaseModel):
@@ -91,13 +207,19 @@ class Challenge(BaseModel):
     # ── engagement mode (Origin/Goal/Hints framing, BE-pentest-mode) ──────────
     # "ctf" (default): the goal is to recover a flag — completion is the hardcoded
     # provenance gate (_flag_ok). "pentest": the goal is operator-defined (find +
-    # prove vulnerabilities in scope, produce a findings report) — completion is
-    # GOAL-driven (Reason judges the goal met), with findings kept honest by the
-    # SAME witness gate (muteki/swarm/verifier.py). mode="ctf" leaves every CTF
+    # prove vulnerabilities in scope). Product success is gated_report (accepted
+    # reports after independent reproduction and value judgment);
+    # Reason verdict=complete is a planning signal only. mode="ctf" leaves every CTF
     # code path byte-identical (the pentest branches only fire when mode=="pentest").
     mode: Literal["ctf", "pentest"] = "ctf"
-    goal: str = ""    # pentest: the engagement objective (drives Reason completion)
+    goal: str = ""    # pentest: the engagement objective (drives Reason planning)
     scope: str = ""   # pentest: in-scope targets / authorization boundary
+    engagement: Optional[EngagementGoal] = None
+    # Eval-only bypass (tsecbench-style ranges: pentest prompt shape, but there IS
+    # a flag and a judge). Product default False — not a product success condition.
+    # When True, Reason complete may end the run only after a provenance-admitted
+    # flag is in the store (salvage from verified evidence is attempted first).
+    pentest_flag_required: bool = False
 
 
 class SolveGraph(BaseModel):
@@ -118,6 +240,9 @@ class SolveGraph(BaseModel):
     # from the append-only EV_FLAG_INVALIDATED log, so it survives worker respawn
     # (worker-local `_already_found` does not). Same permanence as a placeholder.
     rejected_flags: list[str] = Field(default_factory=list)
+    findings: list[dict] = Field(default_factory=list)
+    rejected_findings: list[str] = Field(default_factory=list)
+    vuln_reports: list[dict] = Field(default_factory=list)
 
     def add_flag(self, flag: str) -> bool:
         """Record a flag if not already present (dedup, exact-match). Keeps the
@@ -141,6 +266,50 @@ class SolveGraph(BaseModel):
             self.flag = self.flags[0] if self.flags else None
         if flag not in self.rejected_flags:
             self.rejected_flags.append(flag)
+
+    @staticmethod
+    def _finding_identity(finding: dict) -> str:
+        cls = str((finding or {}).get("finding_class") or "").strip().lower()
+        resource = str((finding or {}).get("resource_id") or "").strip()
+        a = str((finding or {}).get("identity_a") or "").strip()
+        b = str((finding or {}).get("identity_b") or "").strip()
+        ids = tuple(sorted((a, b), key=str.casefold))
+        return f"{cls}::{resource}::{ids[0]}::{ids[1]}"
+
+    def add_finding(self, finding: dict) -> bool:
+        """Record a gated finding if its key is new and not operator-rejected."""
+        if not finding:
+            return False
+        key = self._finding_identity(finding)
+        if not key or key in self.rejected_findings:
+            return False
+        if any(self._finding_identity(f) == key for f in self.findings):
+            return False
+        self.findings.append(dict(finding))
+        return True
+
+    def reject_finding(self, finding: dict | str) -> None:
+        key = finding if isinstance(finding, str) else self._finding_identity(finding or {})
+        if not key:
+            return
+        self.findings = [f for f in self.findings if self._finding_identity(f) != key]
+        if key not in self.rejected_findings:
+            self.rejected_findings.append(key)
+
+    def add_vuln_report(self, report: dict) -> bool:
+        if not report:
+            return False
+        rid = str(report.get("report_id") or "").strip()
+        if not rid:
+            rid = self._finding_identity(report)
+        if not rid:
+            return False
+        if any(str(item.get("report_id") or "") == rid for item in self.vuln_reports):
+            return False
+        row = dict(report)
+        row["report_id"] = rid
+        self.vuln_reports.append(row)
+        return True
 
     def _next_hid(self) -> str:
         """Derive the next H-id from existing hypotheses (no shared counter)."""
@@ -288,4 +457,10 @@ class SolveGraph(BaseModel):
 
         if self.flag:
             lines.append(f"\n## FLAG: {self.flag}")
+        if self.findings:
+            lines.append("\n## Gated findings")
+            for f in self.findings:
+                cls = f.get("finding_class", "")
+                res = f.get("resource_id", "")
+                lines.append(f"- {cls} {res} ({f.get('identity_a','')} / {f.get('identity_b','')})")
         return "\n".join(lines)

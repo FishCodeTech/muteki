@@ -5,17 +5,17 @@ name: release-images
 # Images (all under ghcr.io/<owner>/...):
 #   muteki-web          — FastAPI control plane          (docker/web/Dockerfile,  context = repo root)
 #   muteki-ui           — Next command deck              (docker/ui/Dockerfile,   context = apps/web/ui)
-#   muteki-worker-slim  — ubuntu base + 3 CLIs + agent   (docker/worker-slim,     needs cross-compiled runtime_agent)
+#   muteki-worker-slim  — ubuntu base + 9 engine CLIs + agent (docker/worker-slim, needs cross-compiled runtime_agent)
 #   muteki-worker       — Kali base + full pentest kit   (docker/worker,          heavy: ~kali + 2.6G knowledges)
 #
 # Auth: the built-in GITHUB_TOKEN with packages:write — no PAT, no Docker Hub.
 # Triggers:
-#   - release published  → tag images with the release tag (e.g. v0.0.1) + latest
+#   - push v* tag        → build every artifact, then create the GitHub Release
 #   - workflow_dispatch  → manual run for testing the pipeline inside the private repo
 #                          (optionally skip the slow Kali worker via the input)
 on:
-  release:
-    types: [published]
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       build_kali_worker:
@@ -23,13 +23,14 @@ on:
         type: boolean
         default: true
       tag:
-        description: "Image tag to push (defaults to the git ref name)"
+        description: "SemVer tag to build, for example v0.3.0"
         type: string
-        default: ""
+        required: true
+        default: "v0.3.0"
 
-# Least-privilege: read the code, write packages (GHCR).
+# 发布任务需要创建 Release 并上传应用包；镜像任务写入 GHCR。
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 env:
@@ -37,6 +38,30 @@ env:
   GO_VERSION: "1.26"
 
 jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Resolve release version
+        id: version
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
+          TAG="${TAG#refs/tags/}"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - name: Build application bundle
+        run: python scripts/build_release_bundle.py --version "${{ steps.version.outputs.version }}" --repository "${{ github.repository }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: muteki-release-bundle
+          path: |
+            dist/muteki-*.tar.gz
+            dist/release-manifest.json
+          if-no-files-found: error
+
   # ── lightweight images: plain docker build-push ───────────────────────────────
   web:
     runs-on: ubuntu-latest
@@ -71,6 +96,9 @@ jobs:
         with:
           context: .
           file: docker/web/Dockerfile
+          build-args: |
+            IMAGE_VERSION=${{ steps.tag.outputs.tag }}
+            IMAGE_REVISION=${{ github.sha }}
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-web:${{ steps.tag.outputs.tag }}
@@ -114,6 +142,8 @@ jobs:
           # a non-compose deployment overrides NEXT/MUTEKI_BACKEND at its own build.
           build-args: |
             MUTEKI_BACKEND=http://web-api:8000
+            IMAGE_VERSION=${{ steps.tag.outputs.tag }}
+            IMAGE_REVISION=${{ github.sha }}
           tags: |
             ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-ui:${{ steps.tag.outputs.tag }}
             ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-ui:latest
@@ -153,10 +183,15 @@ jobs:
             go build -C cmd/runtime-agent -trimpath -ldflags="-s -w" \
               -o "$GITHUB_WORKSPACE/$ctx/runtime_agent" .
           file "$ctx/runtime_agent" || true
-          echo ">> staging AGENTS.md + blackboard skill"
+          echo ">> staging AGENTS.md + blackboard skill + offline engine files"
           cp docker/worker/AGENTS.md "$ctx/AGENTS.md"
           cp skills/muteki-blackboard/SKILL.md "$ctx/blackboard.SKILL.md"
           cp skills/muteki-blackboard/blackboard.py "$ctx/blackboard.py"
+          cp muteki/solver/deepseek_harness_worker.py "$ctx/deepseek_harness_worker.py"
+          cp muteki/solver/offline_acp_bridge.py "$ctx/offline_acp_bridge.py"
+          cp muteki/solver/omp_offline_config.yml "$ctx/omp_offline_config.yml"
+          cp muteki/solver/kimi_offline_agent.md "$ctx/kimi_offline_agent.md"
+          cp muteki/solver/grok_offline_agent.md "$ctx/grok_offline_agent.md"
           chmod +x "$ctx/blackboard.py"
 
       - uses: docker/setup-buildx-action@v3
@@ -188,7 +223,7 @@ jobs:
     # The Kali image is large (kali-linux-headless + ~2.6G knowledges/pocs/templates).
     # Skip it on a manual run when the operator unchecks the input; always build on a
     # real release.
-    if: ${{ github.event_name == 'release' || github.event.inputs.build_kali_worker == 'true' }}
+    if: ${{ github.event_name == 'push' || github.event.inputs.build_kali_worker == 'true' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -228,9 +263,14 @@ jobs:
             go build -C cmd/runtime-agent -trimpath -ldflags="-s -w" \
               -o "$GITHUB_WORKSPACE/$ctx/runtime_agent" .
           file "$ctx/runtime_agent" || true
-          echo ">> staging blackboard skill"
+          echo ">> staging blackboard skill + offline engine files"
           cp skills/muteki-blackboard/SKILL.md "$ctx/blackboard.SKILL.md"
           cp skills/muteki-blackboard/blackboard.py "$ctx/blackboard.py"
+          cp muteki/solver/deepseek_harness_worker.py "$ctx/deepseek_harness_worker.py"
+          cp muteki/solver/offline_acp_bridge.py "$ctx/offline_acp_bridge.py"
+          cp muteki/solver/omp_offline_config.yml "$ctx/omp_offline_config.yml"
+          cp muteki/solver/kimi_offline_agent.md "$ctx/kimi_offline_agent.md"
+          cp muteki/solver/grok_offline_agent.md "$ctx/grok_offline_agent.md"
           chmod +x "$ctx/blackboard.py"
 
       - uses: docker/setup-buildx-action@v3
@@ -258,3 +298,17 @@ jobs:
           # registry-side cache image instead (does not count against the GHA cache).
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker:buildcache,mode=max
+
+  publish:
+    needs: [bundle, web, ui, worker-slim, worker]
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && needs.bundle.result == 'success' && needs.web.result == 'success' && needs.ui.result == 'success' && needs.worker-slim.result == 'success' && needs.worker.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: muteki-release-bundle
+          path: dist
+      - name: Create release with upgrade assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" --verify-tag --generate-notes --title "Muteki ${{ github.ref_name }}"

@@ -13,8 +13,11 @@ surface relies on (rcp Signal op + legacy pkill).
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import signal
+
+import pytest
 
 import muteki.solver.container_exec as cx
 from muteki.solver.container_exec import (
@@ -84,17 +87,19 @@ def test_containerize_argv_cursor_maps_to_cursor_agent_abs_path():
     assert _containerize_argv("cursor", ["/opt/cursor-agent", "-p"])[0] == "/home/kali/.local/bin/cursor-agent"
 
 
+def test_containerize_argv_pi_and_omp():
+    # pi is npm-global (on the container PATH) → bare name; omp installs into the
+    # kali user's ~/.local/bin (like cursor-agent) → absolute path.
+    assert _containerize_argv("pi", ["/usr/local/bin/pi", "-p"])[0] == "pi"
+    assert _containerize_argv("omp", ["/home/x/.bun/bin/omp", "-p"])[0] == "/home/kali/.local/bin/omp"
+
+
 def test_containerize_argv_unknown_engine_strips_dir():
     assert _containerize_argv("weird", ["/a/b/weird-bin", "-x"])[0] == "weird-bin"
 
 
-def test_worker_image_installs_blackboard_skill_for_all_engine_user_scopes():
-    """Container workers need both the compat CLI and discoverable user-scope skills.
-
-    Claude/Cursor discover ~/.claude/skills; Codex discovers ~/.agents/skills.
-    Keeping this as a static test prevents the image from silently regressing to
-    only shipping /usr/local/bin/blackboard.py.
-    """
+def test_worker_image_keeps_blackboard_out_of_agent_user_scopes():
+    """The image ships one source copy and no permanent auto-discovery copies."""
     repo = os.path.dirname(os.path.dirname(__file__))
     dockerfile = open(os.path.join(repo, "docker", "worker", "Dockerfile"), encoding="utf-8").read()
     build_sh = open(os.path.join(repo, "docker", "worker", "build.sh"), encoding="utf-8").read()
@@ -102,9 +107,9 @@ def test_worker_image_installs_blackboard_skill_for_all_engine_user_scopes():
     assert "blackboard.SKILL.md" in build_sh
     assert "blackboard.py" in build_sh
     assert "/usr/local/bin/blackboard.py" in dockerfile
-    assert "/home/kali/.claude/skills/muteki-blackboard" in dockerfile
-    assert "/home/kali/.agents/skills/muteki-blackboard" in dockerfile
     assert "/opt/muteki/muteki-blackboard/SKILL.md" in dockerfile
+    assert "/home/kali/.claude/skills/muteki-blackboard" not in dockerfile
+    assert "/home/kali/.agents/skills/muteki-blackboard" not in dockerfile
 
 
 def test_worker_images_wrap_package_managers_with_auto_sudo():
@@ -145,6 +150,31 @@ def test_exec_argv_targets_the_run_container_with_cwd_and_sentinel():
     assert "exec timeout -s KILL 720s" in joined
     assert "< /dev/null" in joined
     assert "setsid" not in joined
+
+
+def test_exec_argv_secret_prompt_uses_docker_stdin_not_shell_or_argv():
+    h = _handle("/run/ws")
+    secret = "docker-stdin-secret-11223344"
+    cmd = _DockerExecBackend._exec_argv(
+        h, ["/host/claude", "-p", "--no-session-persistence", "--"],
+        container_cwd=CONTAINER_WORKSPACE, env=None, driver_name="claude",
+        tag="secret", timeout=60, has_stdin=True)
+    joined = "\0".join(cmd)
+    assert cmd[:3] == ["docker", "exec", "-i"]
+    assert "< /dev/null" not in joined
+    assert secret not in joined
+
+
+def test_legacy_dockerexec_rejects_exact_stdin_without_inner_ack(monkeypatch):
+    import pytest
+    from muteki.solver.cli_driver import ClaudeCodeDriver, SecurePromptUnsupported
+
+    monkeypatch.setattr(cx, "_ensure_alive", lambda _handle: None)
+    with pytest.raises(SecurePromptUnsupported, match="cannot prove"):
+        cx.run_cli_streaming_container(
+            ClaudeCodeDriver(), ["claude", "-p", "--"],
+            handle=_handle(mode="dockerexec"), cwd="/run/ws", timeout=10,
+            on_step=lambda _s: None, stdin_text="one-shot-secret")
 
 
 def test_exec_argv_passes_only_whitelisted_env():
@@ -207,6 +237,8 @@ def _fake_docker_factory(calls):
             return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
         if args[:2] == ("inspect", "-f"):
             return type("R", (), {"returncode": 1, "stdout": "", "stderr": "no"})()
+        if args and args[0] == "inspect":
+            return type("R", (), {"returncode": 1, "stdout": "", "stderr": "No such object"})()
         if args and args[0] == "run":
             return type("R", (), {"returncode": 0, "stdout": "cid\n", "stderr": ""})()
         return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
@@ -224,8 +256,20 @@ def test_ensure_container_rcp_mounts_workspace_control_and_accounts(monkeypatch,
     # token it registers.
     import muteki.solver.control_receiver as cr
     expected = {}
+    bootstrap_at_expect = {}
     class _FakeRcv:
-        def expect(self, run_id, token): expected[run_id] = token
+        def has_link(self, run_id): return False
+        def forget(self, run_id): expected.pop(f"forgot:{run_id}", None)
+        def expect(self, run_id, token):
+            expected[run_id] = token
+            control_dir = Path(ce._bootstrap_dir(run_id, str(ws)))
+            token_path = control_dir / "token"
+            bootstrap_at_expect.update({
+                "path": token_path,
+                "value": token_path.read_text(),
+                "token_mode": token_path.stat().st_mode & 0o777,
+                "dir_mode": control_dir.stat().st_mode & 0o777,
+            })
     monkeypatch.setattr(cr.ControlReceiver, "instance", classmethod(lambda cls: _FakeRcv()))
     ws = tmp_path / "run" / "workspace"
     accounts = tmp_path / "_secrets" / "accounts"
@@ -246,14 +290,21 @@ def test_ensure_container_rcp_mounts_workspace_control_and_accounts(monkeypatch,
     assert "sleep" not in run_call
     assert "-p" not in run_call
     assert handle.mode == "rcp"
-    # reverse-connect: control dir mounted (carries token) + token written +
+    # reverse-connect: a coordinator-private sibling dir carries a one-shot token +
     # supervisor told to --connect host.docker.internal --run-id, + --add-host.
-    control_dir = ws / ".muteki_control"
+    control_dir = Path(ce._bootstrap_dir("run-x", str(ws)))
     assert f"source={control_dir},target={CONTAINER_CONTROL_DIR}" in joined
     assert handle.control_dir == str(control_dir)
-    assert handle.token and (control_dir / "token").read_text() == handle.token
-    assert (control_dir / "token").stat().st_mode & 0o777 == 0o600
+    assert os.path.commonpath([str(ws), str(control_dir)]) != str(ws)
+    assert bootstrap_at_expect["value"] == expected["run-x"]
+    assert bootstrap_at_expect["token_mode"] == 0o600
+    assert bootstrap_at_expect["dir_mode"] == 0o700
+    # Readiness retires the host copy too; the authenticated socket is authority.
+    assert handle.token == ""
+    assert not (control_dir / "token").exists()
     assert "--connect" in run_call and "--run-id" in run_call and "run-x" in run_call
+    label_arg = run_call[run_call.index("--label") + 1]
+    assert label_arg == f"{ce._RUN_ID_LABEL}={ce._run_digest('run-x')}"
     assert "host.docker.internal:host-gateway" in joined  # Linux dial-back
     # workspace + account projection mounts (unchanged from before).
     projection = ws / ".muteki_accounts"
@@ -370,6 +421,8 @@ def test_ensure_container_chowns_workspace_to_worker(monkeypatch, tmp_path):
     monkeypatch.setattr(ce, "_await_supervisor", lambda handle: None)
     import muteki.solver.control_receiver as cr
     class _FakeRcv:
+        def has_link(self, run_id): return False
+        def forget(self, run_id): pass
         def expect(self, run_id, token): pass
     monkeypatch.setattr(cr.ControlReceiver, "instance", classmethod(lambda cls: _FakeRcv()))
     ws = tmp_path / "run" / "workspace"
@@ -398,6 +451,8 @@ def test_ensure_container_rcp_upgrades_none_network_to_bridge(monkeypatch, tmp_p
     monkeypatch.setattr(ce, "_USE_DOCKEREXEC", False)
     monkeypatch.setattr(ce, "_await_supervisor", lambda handle: None)
     class _FakeRcv:
+        def has_link(self, run_id): return False
+        def forget(self, run_id): pass
         def expect(self, *a): pass
     monkeypatch.setattr(cr.ControlReceiver, "instance", classmethod(lambda cls: _FakeRcv()))
     ws = tmp_path / "run" / "workspace"
@@ -406,6 +461,279 @@ def test_ensure_container_rcp_upgrades_none_network_to_bridge(monkeypatch, tmp_p
     run_call = next(a for a in calls if a and a[0] == "run")
     assert "--network bridge" in " ".join(run_call)
     assert "none" not in [x for i, x in enumerate(run_call) if i > 0 and run_call[i-1] == "--network"]
+
+
+def test_ensure_container_reuses_live_rcp_link_without_rotating_token(monkeypatch, tmp_path):
+    import muteki.solver.container_exec as ce
+    import muteki.solver.control_receiver as cr
+    calls = []
+
+    def fake_docker(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("image", "inspect"):
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        if args[:2] == ("inspect", "-f"):
+            return type("R", (), {"returncode": 0, "stdout": "running\n", "stderr": ""})()
+        raise AssertionError(args)
+
+    class _LiveReceiver:
+        def has_link(self, run_id): return True
+        def expect(self, *args): raise AssertionError("must not rotate live token")
+        def forget(self, *args): raise AssertionError("must not forget live link")
+
+    monkeypatch.setattr(ce, "_docker", fake_docker)
+    monkeypatch.setattr(ce, "_USE_DOCKEREXEC", False)
+    monkeypatch.setattr(ce, "_await_supervisor", lambda handle: None)
+    monkeypatch.setattr(cr.ControlReceiver, "instance", classmethod(lambda cls: _LiveReceiver()))
+
+    handle = ensure_container("run-live", str(tmp_path / "workspace"), image="img")
+
+    assert handle.mode == "rcp" and handle.token == ""
+    assert not any(a and a[0] in ("run", "rm") for a in calls)
+
+
+def test_ensure_container_recreates_running_orphan_without_live_link(monkeypatch, tmp_path):
+    import muteki.solver.container_exec as ce
+    import muteki.solver.control_receiver as cr
+    calls = []
+    expected = []
+    forgotten = []
+
+    def fake_docker(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("image", "inspect"):
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        if args[:2] == ("inspect", "-f"):
+            return type("R", (), {"returncode": 0, "stdout": "running\n", "stderr": ""})()
+        if args and args[0] == "inspect":
+            return type("R", (), {"returncode": 1, "stdout": "", "stderr": "No such container"})()
+        if args and args[0] == "run":
+            return type("R", (), {"returncode": 0, "stdout": "new-cid\n", "stderr": ""})()
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    class _OrphanReceiver:
+        def has_link(self, run_id): return False
+        def forget(self, run_id): forgotten.append(run_id)
+        def expect(self, run_id, token): expected.append((run_id, token))
+
+    monkeypatch.setattr(ce, "_docker", fake_docker)
+    monkeypatch.setattr(ce, "_USE_DOCKEREXEC", False)
+    monkeypatch.setattr(ce, "_await_supervisor", lambda handle: None)
+    monkeypatch.setattr(cr.ControlReceiver, "instance", classmethod(lambda cls: _OrphanReceiver()))
+
+    handle = ensure_container("run-orphan", str(tmp_path / "workspace"), image="img")
+
+    operations = [a[0] for a in calls]
+    assert "rm" in operations and "run" in operations
+    assert operations.index("rm") < operations.index("run")
+    assert expected and expected[0][0] == "run-orphan"
+    assert forgotten, "stale receiver state must be cleared before rebootstrap"
+    assert handle.token == ""
+
+
+def test_ensure_alive_does_not_treat_running_rcp_orphan_as_healthy(monkeypatch):
+    import muteki.solver.container_exec as ce
+    import muteki.solver.control_receiver as cr
+    handle = ContainerHandle(
+        run_id="run-lost-link", host_workspace="/tmp/run-lost/workspace",
+        container=ce._run_container_name("run-lost-link"), mode="rcp",
+        control_dir="/old/bootstrap", token="old",
+    )
+    monkeypatch.setattr(ce, "_container_state", lambda name: "running")
+
+    class _NoLink:
+        def has_link(self, run_id): return False
+    monkeypatch.setattr(cr.ControlReceiver, "instance", classmethod(lambda cls: _NoLink()))
+    calls = []
+    fresh = ContainerHandle(
+        run_id=handle.run_id, host_workspace=handle.host_workspace,
+        container=handle.container, mode="rcp", control_dir="/new/bootstrap", token="",
+    )
+    monkeypatch.setattr(
+        ce, "ensure_container",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or fresh,
+    )
+
+    ce._ensure_alive(handle)
+
+    assert calls, "lost reverse link must force ensure_container recovery"
+    assert handle.control_dir == "/new/bootstrap" and handle.token == ""
+
+
+def test_teardown_keeps_bootstrap_dir_until_container_absence_is_proven(monkeypatch, tmp_path):
+    import muteki.solver.container_exec as ce
+    import muteki.solver.control_receiver as cr
+    run_id = "run-bootstrap-cleanup"
+    bootstrap = tmp_path / "private-bootstrap"
+    bootstrap.mkdir(mode=0o700)
+    (bootstrap / "token").write_text("pending")
+    ce._BOOTSTRAP_DIRS[run_id] = str(bootstrap)
+    absent = {"value": False}
+
+    def fake_docker(*args, **kwargs):
+        if args and args[0] == "inspect":
+            if absent["value"]:
+                return type("R", (), {"returncode": 1, "stdout": "", "stderr": "No such object"})()
+            return type("R", (), {"returncode": 0, "stdout": "exists", "stderr": ""})()
+        if args[:2] == ("ps", "-aq"):
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        return type("R", (), {"returncode": 1, "stdout": "", "stderr": "rm failed"})()
+
+    forgotten = []
+    class _Receiver:
+        def forget(self, rid): forgotten.append(rid)
+
+    monkeypatch.setattr(ce, "_docker", fake_docker)
+    monkeypatch.setattr(cr.ControlReceiver, "instance", classmethod(lambda cls: _Receiver()))
+
+    assert ce.teardown_container(run_id) is False
+    assert bootstrap.exists()
+    assert run_id in ce._BOOTSTRAP_DIRS
+    assert forgotten == []
+
+    absent["value"] = True
+    assert ce.teardown_container(run_id) is True
+    assert not bootstrap.exists()
+    assert run_id not in ce._BOOTSTRAP_DIRS
+    assert forgotten == [run_id]
+
+
+def test_container_absence_proof_closes_retained_rcp_exit_fence(monkeypatch):
+    import muteki.solver.container_exec as ce
+    import muteki.solver.control_receiver as cr
+    from muteki.solver.control_client import _RcpProc
+
+    run_id = "run-hard-exit-fence"
+    proc = _RcpProc(object(), "w-lost-frame", run_id=run_id)
+
+    def fake_docker(*args, **kwargs):
+        if args[:2] == ("inspect", "-f"):
+            return type("R", (), {"returncode": 1, "stdout": "", "stderr": "no"})()
+        if args and args[0] == "inspect":
+            return type("R", (), {"returncode": 1, "stdout": "", "stderr": "No such object"})()
+        if args[:2] == ("ps", "-aq"):
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    class _Receiver:
+        def forget(self, rid): pass
+
+    monkeypatch.setattr(ce, "_docker", fake_docker)
+    monkeypatch.setattr(cr.ControlReceiver, "instance", classmethod(lambda cls: _Receiver()))
+
+    assert proc._exit_confirmed is False
+    assert ce.teardown_container(run_id) is True
+    assert proc._exit_confirmed is True
+
+
+def test_run_container_name_encoding_is_collision_resistant():
+    import muteki.solver.container_exec as ce
+    assert ce._run_container_name("a/b") != ce._run_container_name("a?b")
+    assert ce._run_container_name("x" * 200 + "A") != ce._run_container_name("x" * 200 + "B")
+    assert len(ce._run_container_name("x" * 1000)) <= 120
+
+
+def test_unicode_run_ids_encode_to_valid_unique_ascii_container_names():
+    import muteki.solver.container_exec as ce
+    first = ce._run_container_name("任务/一")
+    second = ce._run_container_name("任务?一")
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
+    assert first != second
+    assert first.isascii() and second.isascii()
+    assert set(first) <= allowed and set(second) <= allowed
+
+
+def test_ensure_refuses_unlabeled_lossy_legacy_primary(monkeypatch, tmp_path):
+    import muteki.solver.container_exec as ce
+    import muteki.solver.control_receiver as cr
+    run_id = "a/b"
+    legacy = ce._legacy_run_container_name(run_id)
+    calls = []
+
+    def fake_docker(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("image", "inspect"):
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        if args[:3] == ("inspect", "-f", "{{.State.Status}}"):
+            return type("R", (), {"returncode": 1, "stdout": "", "stderr": "no"})()
+        if args[:2] == ("inspect", "-f"):
+            return type("R", (), {"returncode": 0, "stdout": "<no value>\n", "stderr": ""})()
+        if args and args[0] == "inspect" and args[-1] == legacy:
+            return type("R", (), {"returncode": 0, "stdout": "exists", "stderr": ""})()
+        if args and args[0] == "inspect":
+            return type("R", (), {"returncode": 1, "stdout": "", "stderr": "No such object"})()
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    class _Receiver:
+        def has_link(self, _run_id): return False
+        def forget(self, _run_id): raise AssertionError("must not disturb ownership")
+        def expect(self, *_args): raise AssertionError("must not rotate token")
+
+    monkeypatch.setattr(ce, "_docker", fake_docker)
+    monkeypatch.setattr(ce, "_USE_DOCKEREXEC", False)
+    monkeypatch.setattr(cr.ControlReceiver, "instance", classmethod(lambda cls: _Receiver()))
+
+    with pytest.raises(RuntimeError, match="ambiguous legacy runtime"):
+        ensure_container(run_id, str(tmp_path / "workspace"), image="img")
+    assert not any(a and a[0] in ("run", "rm") for a in calls)
+
+
+def test_teardown_never_prefix_deletes_ambiguous_legacy_runtime(monkeypatch, tmp_path):
+    import muteki.solver.container_exec as ce
+    run_id = "a/b"
+    other_run = "a?b"  # same legacy _safe prefix, different exact ownership
+    bootstrap = tmp_path / "bootstrap"
+    bootstrap.mkdir()
+    ce._BOOTSTRAP_DIRS[run_id] = str(bootstrap)
+    calls = []
+
+    def fake_docker(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("ps", "-aq"):
+            return type("R", (), {"returncode": 0, "stdout": "legacy-other\n", "stderr": ""})()
+        if args[:2] == ("inspect", "-f"):
+            return type(
+                "R", (),
+                {"returncode": 0, "stdout": ce._run_digest(other_run) + "\n", "stderr": ""})()
+        if args and args[0] == "inspect":
+            return type("R", (), {"returncode": 1, "stdout": "", "stderr": "No such object"})()
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(ce, "_docker", fake_docker)
+
+    assert ce.teardown_container(run_id) is False
+    assert not any(a[:3] == ("rm", "-f", "legacy-other") for a in calls)
+    assert bootstrap.exists(), "ambiguous ownership keeps cleanup unproven"
+    ce._BOOTSTRAP_DIRS.pop(run_id, None)  # isolate the process-global registry
+
+
+def test_teardown_removes_legacy_runtime_only_with_exact_ownership_label(monkeypatch):
+    import muteki.solver.container_exec as ce
+    import muteki.solver.control_receiver as cr
+    run_id = "a/b"
+    calls = []
+
+    def fake_docker(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("ps", "-aq"):
+            return type("R", (), {"returncode": 0, "stdout": "legacy-owned\n", "stderr": ""})()
+        if args[:2] == ("inspect", "-f"):
+            # bootstrap-source inspect for the primary has no mount; ownership
+            # inspect for the candidate returns the exact digest.
+            value = ce._run_digest(run_id) + "\n" if args[-1] == "legacy-owned" else ""
+            return type("R", (), {"returncode": 0, "stdout": value, "stderr": ""})()
+        if args and args[0] == "inspect":
+            return type("R", (), {"returncode": 1, "stdout": "", "stderr": "No such object"})()
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    class _Receiver:
+        def forget(self, rid): pass
+
+    monkeypatch.setattr(ce, "_docker", fake_docker)
+    monkeypatch.setattr(cr.ControlReceiver, "instance", classmethod(lambda cls: _Receiver()))
+
+    assert ce.teardown_container(run_id) is True
+    assert any(a[:3] == ("rm", "-f", "legacy-owned") for a in calls)
 
 
 def test_ensure_container_dockerexec_appends_sleep_infinity(monkeypatch, tmp_path):
@@ -457,7 +785,14 @@ def test_rcp_proc_signal_maps_to_control_ops():
     import muteki.solver.control_client as cc
     sent = []
     class _FakeLink:
-        def signal(self, worker_id, name, **k): sent.append((worker_id, name))
+        paused = False
+        def signal(self, worker_id, name, **k):
+            sent.append((worker_id, name))
+            if name == "STOP": self.paused = True
+            if name == "CONT": self.paused = False
+            return True
+        def status(self, worker_id, **k):
+            return {"ok": True, "state": "running", "paused": self.paused}
     proc = cc._RcpProc(_FakeLink(), "w-1-abcd")
     proc._container_signal(signal.SIGSTOP)
     proc._container_signal(signal.SIGCONT)
@@ -479,6 +814,15 @@ def test_signal_proc_prefers_container_routing():
     assert seen == [signal.SIGKILL]
 
 
+def test_signal_proc_preserves_explicit_container_signal_failure():
+    from muteki.solver.cli_solver import CliSolver
+    class _CP:
+        pid = 1  # must never fall back to a host PID for a container worker
+        def _container_signal(self, sig): return False
+        def kill(self): raise AssertionError("must not claim a local fallback")
+    assert CliSolver._signal_proc(_CP(), signal.SIGSTOP) is False
+
+
 # ── run dispatch: rcp (default) vs legacy docker-exec ─────────────────────────
 
 def test_run_cli_container_rcp_dispatch_records_runtime_status(monkeypatch):
@@ -494,7 +838,10 @@ def test_run_cli_container_rcp_dispatch_records_runtime_status(monkeypatch):
     # stub the rcp transport — assert container_exec forwards the container-side
     # argv + cwd + run_id and wraps the result with the registry record.
     captured = {}
-    def fake_run_cli_rcp(driver, argv, *, run_id, container_cwd, timeout, env=None):
+    def fake_run_cli_rcp(
+        driver, argv, *, run_id, container_cwd, timeout, env=None,
+        stdin_text=None,
+    ):
         captured.update(argv=argv, run_id=run_id, cwd=container_cwd)
         r = CliResult(text="ok")
         r.runtime_status = {"backend": "container_rcp", "status": "finished", "rc": 0}

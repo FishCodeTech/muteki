@@ -19,7 +19,7 @@
   <a href="https://github.com/FishCodeTech/muteki/issues"><img src="https://img.shields.io/github/issues/FishCodeTech/muteki" alt="Issues"></a>
   <a href="https://github.com/FishCodeTech/muteki/pulls"><img src="https://img.shields.io/github/issues-pr/FishCodeTech/muteki" alt="PRs"></a>
   <img src="https://img.shields.io/badge/NYU_CTF_Bench-200%2F200_solved-brightgreen" alt="Benchmark">
-  <img src="https://img.shields.io/badge/engines-Claude_Code_%7C_Codex_%7C_Cursor-orange" alt="Engines">
+  <img src="https://img.shields.io/badge/engines-9_CLIs-orange" alt="Engines: Claude, Codex, Cursor, Pi, OMP, Kimi, Grok, OpenCode, DeepSeek Harness">
 </p>
 
 <p align="center">
@@ -40,7 +40,7 @@
 
 这是一款 **真正意义上的开源的多模型 CTF 求解 AI agent 蜂群。** 目标就是成为如项目名称，**無敵 · Project Muteki**
 
-项目核心是实现了一套ai agent的调度方案，自动、智能化协调控制每个agent的上下文，像蜂群一样，各有分工，但都是为了完成最终的目标，目前只支持cursor、codex、claude code的指挥和下发。未来将持续更新迭代支持更多种类的cli agent。
+项目核心是实现了一套ai agent的调度方案，自动、智能化协调控制每个agent的上下文，像蜂群一样，各有分工，但都是为了完成最终的目标。当前 Worker 引擎为 Claude、Codex、Cursor、Pi、OMP、Kimi、Grok、OpenCode、DeepSeek Harness。
 
 Muteki就是为了解决单一ai agent在解决一个目标是极其容易陷入一个点死循环，无法自拔，无法完成最终的目标，并且单一agent效率极低，我设计了一套架构来解决这个问题，他可能不是最完美的，我将继续不断迭代升级。
 
@@ -88,13 +88,13 @@ nyuctf benchmark全题目测评成绩，可看文章结尾
 
 ## 架构
 
-無敵让一群异构的编码 Agent（Claude Code / Codex / cursor-agent）扑同一道题，在一张**共享黑板**上协作：谁发现的事实大家都能用，谁走过的死路大家都不再试，而 flag 只有**逐字出现在真实执行输出里**才被接受。核心不是「换个更强的脑子」，而是 **异构 + 共享证据 + 溯源闸门**。
+無敵让一群异构的编码 Agent（Claude、Codex、Cursor、Pi、OMP、Kimi、Grok、OpenCode、DeepSeek Harness）扑同一道题，在一张**共享黑板**上协作：谁发现的事实大家都能用，谁走过的死路大家都不再试，而 flag 只有**逐字出现在真实执行输出里**才被接受。核心不是「换个更强的脑子」，而是 **异构 + 共享证据 + 溯源闸门**。
 
 而 worker 是怎么把数据交到平台、又怎么看到队友进展的？**全靠每个 worker 内置的 `muteki-blackboard` skill**——这是 worker 与黑板之间唯一的数据通道。
 
 详细架构说明，请参考：[docs/工作原理.md](docs/工作原理.md)
 
-项目秉承着 less is more的原则，不注入任何安全工具、安全知识，开放网络，让worker自由发挥，自由编写和自由安装依赖脚本。
+项目秉承着 less is more的原则，不注入任何安全工具、安全知识，开放网络，让worker自由发挥，自由编写和自由安装依赖脚本。启动页的 **Web 工具** 开关只关闭 Agent 的 WebSearch、WebFetch 和知识库；Worker 的 shell 仍可访问网络。
 
 ![image-20260624164618066](./assets/image-20260624164618066.png)
 
@@ -112,10 +112,12 @@ nyuctf benchmark全题目测评成绩，可看文章结尾
 | 阶段            | 什么时候进                 | 干什么                                   | 产出                    |
 | ------------- | --------------------- | ------------------------------------- | --------------------- |
 | **① 准备**      | run 一开始               | 建黑板、暂存附件、探活引擎、装好 skill、（容器模式）起容器+反向连接 | 空黑板 + 可用引擎 + 接好通道     |
-| **② 侦察 Race** | 仅冷启动（复盘已解的题跳过）        | 多引擎并行单发扑整题，做广度侦察                      | flag（→快路径）或一批 fact    |
-| **③ 协调主循环**   | 侦察没直接解出时              | `(1)~(5)` 不断转圈，随证据扩张 swarm            | 黑板持续长大，直到攒够 flag      |
+| **② 侦察 Race** | 可选的 race-scout 轮次（复盘已解的题跳过） | 多引擎各做一次主调用，并行扑整题 | flag（→快路径）或一批 fact    |
+| **③ 协调主循环**   | Web 默认；race-scout 未解出时也走这里 | `(1)~(5)` 不断转圈，随证据扩张 swarm            | 黑板持续长大，直到攒够 flag      |
 | **④ 收尾**      | 攒够 flag / 操作员停 / 预算耗尽 | 落 winner、释放认领、发终态事件、清扫                | RUN_FINISHED + 可复盘的黑板 |
 
+
+Web 默认使用 Coordinator，并可先跑一轮可选的 race-scout。TUI 的 `--swarm` 路径使用直接 race。直接构造 `Swarm` 时需要显式选择模式。
 
 为了防止muteki在做单一任务时进入死循环，我们设定了一个review机制，当muteki在执行任务时，会定期进行review，review机制会检查已经记录的事实并验证，然后随时及时纠正。
 
@@ -132,7 +134,22 @@ nyuctf benchmark全题目测评成绩，可看文章结尾
 #     只起后端:  ./run.sh web --backend-only
 ```
 
-仓库根目录的 `.env` 会被自动加载(从 `.env.example` 复制);shell 导出的变量始终优先。配置通过`MUTEKI_*` 环境变量。
+仓库根目录的 `.env` 会被自动加载（从 `.env.example` 复制）；Shell 导出的变量始终优先。配置通过 `MUTEKI_*` 环境变量。
+
+### 内置升级
+
+应用升级不再要求执行 `git pull`。首次安装会创建托管应用目录，并继续使用现有 `.env` 和 `sessions` 路径。后续升级使用原子方式切换版本，同时保留一个上一版本用于回滚。
+
+```bash
+./run.sh upgrade --check       # 检查最新稳定版本
+./run.sh install               # 按 GitHub Release 清单下载并做成托管安装
+muteki upgrade                 # 下载、校验、安装并切换版本
+muteki upgrade v0.3.1          # 安装指定版本
+muteki rollback                # 回滚到上一已安装版本
+muteki version                 # 查看当前版本和安装形态
+```
+
+Web 控制台的“设置 → 系统更新”提供相同操作。版本化容器部署使用 `muteki upgrade --compose` 和 [`docker-compose.release.yml`](docker-compose.release.yml)。私有 GitHub Release 需要 `MUTEKI_RELEASE_REPOSITORY` 和 `MUTEKI_GITHUB_TOKEN`；私有 GHCR 镜像需要 `MUTEKI_IMAGE_REGISTRY` 并先执行 `docker login ghcr.io`。Git 标签和镜像标签带 `v`，例如 `v0.3.0`。
 
 推荐设置项：
 
@@ -156,19 +173,25 @@ MUTEKI_DEEPSEEK_API_KEY=sk-xxxx
 - 你打算用的**引擎 CLI**,需在 `PATH` 上(见下)
 - 当前项目仅在macos上进行过测试，未在windows上进行测试，请酌情处理。
 
-### 专有引擎 CLI
+### Worker 引擎 CLI
 
-Muteki **套壳调用**下面三个闭源 agent CLI;装好并认证你想用的那些。它们各有自己的 license, 且会向各自的厂商回传数据:
+Muteki **套壳调用**下面的 Worker 引擎 CLI；装好并认证你想用的那些。厂商 CLI 各有自己的 license，并可能向各自的厂商回传数据:
 
 
 | 引擎       | CLI                                  | 厂商        | 凭据                                  |
 | -------- | ------------------------------------ | --------- | ----------------------------------- |
-| `claude` | `@anthropic-ai/claude-code`          | Anthropic | OAuth token(`claude setup-token`)   |
-| `codex`  | `@openai/codex`                      | OpenAI    | `~/.codex/auth.json`(`codex login`) |
-| `cursor` | `cursor-agent`(`cursor.com/install`) | Cursor    | API key                             |
+| `claude` | `claude`（`@anthropic-ai/claude-code`） | Anthropic | OAuth token（`claude setup-token`） |
+| `codex`  | `codex`（`@openai/codex`） | OpenAI | `~/.codex/auth.json`（`codex login`） |
+| `cursor` | `cursor-agent`（`cursor.com/install`） | Cursor | API key |
+| `pi` | `pi` | Pi | API key / 宿主登录 |
+| `omp` | `omp` | OMP | API key / 宿主登录 |
+| `kimi` | `kimi` | Moonshot | Kimi Code 登录目录 |
+| `grok` | `grok` | xAI | Grok 登录目录 |
+| `opencode` | `opencode` | OpenCode | API key |
+| `dsh` | DeepSeek Harness worker | DeepSeek | API key |
 
 
-至少需要其中一个才能跑。除这三个外,还可在 worker profile 里配置**自定义 OpenAI 兼容端点**
+至少需要其中一个才能跑。还可在 worker profile 里配置**自定义 OpenAI 兼容端点**
 (`base_url` + key)—— 适合自托管或第三方模型。凭据从 macOS Keychain / 环境读取并注入到 worker
 环境;见 [凭据](#凭据) 与 [SECURITY.md](SECURITY.md)。
 
@@ -176,7 +199,7 @@ Muteki **套壳调用**下面三个闭源 agent CLI;装好并认证你想用的�
 
 ## 凭据
 
-三个agent 凭据会跟随着网页设置中进行配置，走本地模式一下可以不需要配置，只需要保证你自己运行cli的时候，订阅可用即可。
+各引擎凭据会跟随着网页设置中进行配置，走本地模式一下可以不需要配置，只需要保证你自己运行cli的时候，订阅可用即可。
 
 剩余情况一般用于配置远程环境、容器环境，需要涉及到容器的凭据信息。
 
@@ -202,7 +225,7 @@ Muteki **套壳调用**下面三个闭源 agent CLI;装好并认证你想用的�
 - `**container`** 模式下账户是**必须的** —— 宿主登录不会挂进容器，会通过命令注入和文件挂在的方式将凭据挂到容器里
 - `**local`** 模式下,若没注册账户,worker 会继承宿主 CLI 已有的登录，当然你也可以手工配置。
 
-DeepSeek 推理模型(协调器用,不是 worker 引擎)单独通过 `.env` 里的 `MUTEKI_DEEPSEEK_API_KEY`配置。
+DeepSeek 推理模型（协调器用）单独通过 `.env` 里的 `MUTEKI_DEEPSEEK_API_KEY`配置。DeepSeek Harness（`dsh`）是单独的 Worker 引擎，在 Worker 设置里配置。
 
 ![image-20260624184600517](./assets/image-20260624184600517.png)
 
@@ -217,7 +240,7 @@ DeepSeek 推理模型(协调器用,不是 worker 引擎)单独通过 `.env` 里�
 | 镜像 | 用途 |
 | --- | --- |
 | `ghcr.io/fishcodetech/muteki-worker:latest` | 完整 Kali worker 镜像，用于真实 CTF 运行。体积大，但包含预期的 pwn/rev/取证工具链。 |
-| `ghcr.io/fishcodetech/muteki-worker-slim:latest` | 轻量 worker，用于联调、冒烟测试和受限部署。有 supervisor 和三个引擎 CLI，但没有完整 Kali 工具链。 |
+| `ghcr.io/fishcodetech/muteki-worker-slim:latest` | 轻量 worker，用于联调、冒烟测试和受限部署。有 supervisor 和引擎 CLI，但没有完整 Kali 工具链。 |
 | `ghcr.io/fishcodetech/muteki-web:latest` | release 流水线产出的 FastAPI 控制面镜像。 |
 | `ghcr.io/fishcodetech/muteki-ui:latest` | release 流水线产出的 Next 指挥台镜像。 |
 
@@ -237,8 +260,8 @@ MUTEKI_WORKER_IMAGE=ghcr.io/fishcodetech/muteki-worker-slim:latest ./run.sh web
 
 ```bash
 ./docker/worker/build.sh
-./docker/worker/build.sh ghcr.io/fishcodetech/muteki-worker 0.2.5
-./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim 0.2.5 amd64
+./docker/worker/build.sh ghcr.io/fishcodetech/muteki-worker v0.3.0
+./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim v0.3.0 amd64
 ```
 
 完整镜像会比较大(Kali headless + Ghidra + 经 conda 装的 SageMath + 离线知识库)。只有在你明确知道 worker 可以在运行中自行安装缺失工具时，才建议用 slim 镜像跑真实题目。
@@ -277,6 +300,12 @@ MUTEKI_WORKER_IMAGE=ghcr.io/fishcodetech/muteki-worker-slim:latest ./run.sh web
 - **`ui`** —— Next 命令台，`/api` 反代到 `web-api`。
 - **worker** 不是 compose 服务 —— 由 `web-api` 每次 run 时 `docker run` 拉一个。
 
+持久化的操作指令 journal 与 SecretStore 只放在协调器私有的
+`MUTEKI_COORDINATOR_CONTROL_ROOT`（compose 默认为
+`$MUTEKI_HOST_DATA_ROOT/coordinator-control`）。该路径不会挂进 worker，也不会
+进入 worker workspace 的属主改写。每个 run 在 workspace 旁有独立的 sibling bootstrap
+目录 `.muteki_rcp`，仅挂载到 worker 内的 `/run/muteki/control`，只携带反向连接的启动 token。
+
 ```bash
 # 1. 宿主 daemon 上要先有 worker 镜像。
 #    compose 会从当前 checkout 构建 web-api/ui，但不负责构建 worker。
@@ -314,7 +343,7 @@ MUTEKI_WEB_PASSWORD='choose-a-strong-one' \
 3. 运行环境推荐选择本地，如有特殊需求可以选择容器，容器会提醒你配置相关的凭据，这块请自行配置，你可以通过点击测模型来测试是否正确工作，测试方式会调用agent并让模型重复 ok。
   ![image-20260624192439759](./assets/image-20260624192439759.png)
 4. 接下来可以详细配置你的 worker情况，推荐按照图中的方式进行配置。
-  起始worker数量表示竞速阶段的数量，数量跟随着你的引擎数，会三个agent引擎同时进行，直至flag解出或者题目超时。用于解决简单题的快速抢血和快速解答。
+  起始worker数量表示启用 race-scout 时这一轮的数量，数量跟随着你启用的引擎数。用于解决简单题的快速抢血和快速解答。
    最大worker数推荐保留5-6个左右，因为对于web题目来讲，过多的worker可能会造成ddos的情况。
    ![image-20260624192517250](./assets/image-20260624192517250.png)
 5. 推荐配置和测联通这块推理模型，更好的规划和把控题目节奏。
@@ -323,7 +352,7 @@ MUTEKI_WEB_PASSWORD='choose-a-strong-one' \
 7. 题目解题的推荐prompt方式如下：
   1. 说明题目描述，题目类型，题目名称，网站地址，flag格式
   2. 同时前端页面支持复制粘贴和上传文件，可直接进行附件题目进行上传。
-  3. 图中联网代表是否开始agent自身网络搜索功能，默认开启，关闭是用于数据测评。
+  3. 图中 Web 工具开关控制 Agent 自身的 WebSearch、WebFetch 和知识库，默认开启，关闭用于数据测评。Worker 的 shell 仍可访问网络。
   4. 本地容器按钮不用管，这是跟设置功能一支，后续可以删除。高级中可以手工指定flag格式，和一些简单配置，可以忽略。
     ![image-20260624193322483](./assets/image-20260624193322483.png)
     ![image-20260624193441654](./assets/image-20260624193441654.png)
@@ -372,7 +401,7 @@ Muteki 在 **NYU CTF Bench** `test` 集(CSAW 2017–2023,共 200 题)上做了�
 | -------------------- | --------------------------------------------------------------------------------- |
 | `muteki/`            | 核心:`swarm/`(协调器)、`solver/`(CLI driver、gate、控制平面)、`models/`、`platform/`、`sandbox/` |
 | `apps/web/`          | FastAPI 后端(`server.py`)+ Next.js 操作者 UI(`ui/`)                                    |
-| `apps/tui/`          | Textual TUI 指挥台 （未完工）                                                             |
+| `apps/tui/`          | Textual TUI 指挥台（`--swarm` 走直接 race；Coordinator / Settings 接入仍暂缓） |
 | `cmd/runtime-agent/` | 容器内的 Go supervisor(反向连接控制器)                                                       |
 | `docker/worker/`     | worker 镜像(Dockerfile、构建脚本、工具感知地图)                                                 |
 | `scripts/`           | eval / 回测 harness                                                                 |
@@ -427,7 +456,7 @@ sessions/
 ## 测试
 
 ```bash
-uv run pytest                              # Python 套件(无 key 时 live 测试自动跳过)
+uv run --extra dev python -m pytest -q     # Python 套件，固定使用项目解释器
 go test -C cmd/runtime-agent ./...         # Go supervisor(module 在 cmd/runtime-agent/ 下)
 ( cd apps/web/ui && npx tsc --noEmit )     # UI 类型检查
 ```
@@ -436,12 +465,11 @@ go test -C cmd/runtime-agent ./...         # Go supervisor(module 在 cmd/runtim
 
 ## 后续 TODO
 
-- [ ] 添加鉴权逻辑
-- [ ] 完整优化测试容器模式
-- [ ] 持续迭代升级webui体验
-- [ ] 更多agent worker类型支持，如pi、zai、opencode等。
-- [ ] TUI模式
-- [ ] 全自动爬ctf平台题目，自动解题，自动提交，自动生成报告功能。
+- [ ] 继续打磨容器模式
+- [ ] 持续迭代升级 web UI 体验
+- [ ] TUI 接入当前 Coordinator 与 Worker Settings（暂缓）
+- [ ] 额外 Worker 引擎，例如 ZAI（暂缓）
+- [ ] 全自动爬 CTF 平台题目，自动解题，自动提交，自动生成报告（暂缓）
 
 ---
 

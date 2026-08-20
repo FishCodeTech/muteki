@@ -25,6 +25,8 @@ import os
 import subprocess
 from pathlib import Path
 from typing import Any, Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from muteki.solver.credential_accounts import (
     CONTAINER_ACCOUNTS_ROOT,
@@ -36,6 +38,12 @@ _CONTAINER_BIN = {
     "claude": "claude",
     "codex": "codex",
     "cursor": "/home/kali/.local/bin/cursor-agent",
+    "pi": "pi",
+    "omp": "/home/kali/.local/bin/omp",
+    "kimi": "kimi",
+    "grok": "/home/kali/.grok/bin/grok",
+    "opencode": "opencode",
+    "dsh": "python3",
 }
 
 
@@ -145,27 +153,35 @@ def _probe_endpoint_account(*, account_id: str, acct: Any, root: Path) -> dict[s
     # build the right wire request for the target engine.
     if target == "claude":
         url = f"{base_url}/v1/messages"
-        headers = ["-H", f"x-api-key: {api_key}", "-H", "anthropic-version: 2023-06-01",
-                   "-H", "Content-Type: application/json"]
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
         body = json.dumps({"model": "probe", "max_tokens": 1,
                            "messages": [{"role": "user", "content": "ok"}]})
     else:
         url = f"{base_url}/chat/completions"
-        headers = ["-H", f"Authorization: Bearer {api_key}", "-H", "Content-Type: application/json"]
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
         body = json.dumps({"model": "probe", "max_tokens": 1,
                            "messages": [{"role": "user", "content": "ok"}]})
 
-    # -w writes the HTTP status on its own line so we can classify auth vs other.
-    argv = ["curl", "-sS", "-m", "20", "-o", "/dev/null", "-w", "%{http_code}",
-            "-X", "POST", *headers, "--data", body, url]
+    request = Request(
+        url, data=body.encode("utf-8"), headers=headers, method="POST")
     try:
-        r = subprocess.run(argv, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=25)
-    except FileNotFoundError:
-        return _result(False, "curl 不可用", layer="auth")
-    except subprocess.TimeoutExpired:
+        with urlopen(request, timeout=20) as response:  # noqa: S310
+            code = str(int(response.getcode() or 0))
+            response.read(4096)
+    except HTTPError as exc:
+        code = str(int(exc.code or 0))
+    except (TimeoutError, URLError) as exc:
+        if isinstance(exc, URLError) and not isinstance(
+                getattr(exc, "reason", None), TimeoutError):
+            return _result(False, f"端点探测失败: {str(exc.reason)[:80]}", layer="auth")
         return _result(False, "端点探测超时（>20s）", layer="auth")
-    code = (r.stdout or "").strip()[-3:]
     # 200 → key authenticates. 400/422 → endpoint reached + key OK, just our dummy
     # "probe" model/body was rejected — that still PROVES auth+reachability, which is
     # all an account test asserts. 401/403 → bad key. 404 → wrong endpoint path.
@@ -175,9 +191,7 @@ def _probe_endpoint_account(*, account_id: str, acct: Any, root: Path) -> dict[s
         return _result(False, f"端点拒绝凭据（HTTP {code}，key 可能无效）", layer="auth")
     if code == "404":
         return _result(False, f"端点路径不存在（HTTP 404，base_url 或目标引擎不匹配）", layer="auth")
-    tail = (r.stderr or "").strip().splitlines()
-    detail = f"端点探测失败（HTTP {code or '?'}）" + (f": {tail[-1][:80]}" if tail else "")
-    return _result(False, detail, layer="auth")
+    return _result(False, f"端点探测失败（HTTP {code or '?'}）", layer="auth")
 
 
 def _docker(*args: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
@@ -240,6 +254,10 @@ def _probe_container(*, engine: str, account_id: str, root: Path) -> dict[str, A
             return _result(False, f"凭据投影失败: {str(exc)[:120]}", layer="mount")
 
         bin_path = _CONTAINER_BIN.get(engine, engine)
+        version_cmd = (
+            "python3 /opt/muteki/deepseek_harness_worker.py --version"
+            if engine == "dsh" else f"{bin_path} --version"
+        )
         # in-container probe: the credential file must be READABLE at the mount
         # path (catches #15 uid-mismatch) AND the engine binary must launch
         # (--version is the cheap liveness check; a full authed turn would spend
@@ -247,7 +265,7 @@ def _probe_container(*, engine: str, account_id: str, root: Path) -> dict[str, A
         cred_path = f"{CONTAINER_ACCOUNTS_ROOT}/{account_id}"
         script = (
             f"test -r {cred_path} || {{ echo MUTEKI_MOUNT_UNREADABLE; exit 71; }}; "
-            f"{bin_path} --version >/dev/null 2>&1 || {{ echo MUTEKI_CLI_FAIL; exit 72; }}; "
+            f"{version_cmd} >/dev/null 2>&1 || {{ echo MUTEKI_CLI_FAIL; exit 72; }}; "
             "echo MUTEKI_OK"
         )
         run_cmd = [

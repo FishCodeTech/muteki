@@ -3,7 +3,9 @@
 import { ContextGauge } from "@/lib/events";
 import { useT } from "@/lib/i18n";
 
-const COLORS = ["#4ea1ff", "#d29922", "#3fb950", "#bc8cff", "#6b7385"];
+// zone colours are palette tokens (resolved inline so the stacked bar tracks
+// the active scheme); the last slot is the quiet "free/headroom" zone.
+const ZONE_TOKENS = ["--blue", "--amber", "--green", "--violet", "--dim"];
 
 /** Context window "fuel gauge" (§14.3 #2): stacked zones vs the model limit,
  *  driven by CONTEXT_STATE events. */
@@ -19,7 +21,7 @@ export function ContextGaugeBar({ gauge }: { gauge: ContextGauge }) {
             <span
               key={i}
               title={`${z.label}: ${z.tokens}`}
-              style={{ width: `${pct}%`, background: COLORS[i % COLORS.length] }}
+              style={{ width: `${pct}%`, background: `var(${ZONE_TOKENS[i % ZONE_TOKENS.length]})` }}
             />
           );
         })}

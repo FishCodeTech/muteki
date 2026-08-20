@@ -7,8 +7,10 @@ import pytest
 from muteki.core.events import (
     Event,
     EventType,
+    control_command_payload,
     context_state_payload,
     cost_payload,
+    hitl_request_payload,
     hitl_response_payload,
     insight_payload,
     solve_graph_delta_payload,
@@ -26,6 +28,27 @@ def test_every_event_type_roundtrips(etype: EventType) -> None:
     assert back.event_type is etype
     assert back.seq == 7
     assert back.ts > 0  # auto-filled
+
+
+def test_flag_accepted_event_roundtrips_exact_projection_payload() -> None:
+    payload = {
+        "schema_id": "muteki.flag-accepted-projection.v1",
+        "publication_id": "outbox:flag:" + "a" * 64,
+        "evaluation_id": "a" * 64,
+        "flag": "flag{accepted_only}",
+        "flag_digest": "b" * 64,
+        "gate_receipt_digest": "c" * 64,
+    }
+    event = Event(
+        event_type=EventType.FLAG_ACCEPTED,
+        run_id="run-protocol2",
+        solver_id="protocol2-authority-projector",
+        payload=payload,
+    )
+
+    restored = Event.model_validate_json(event.model_dump_json())
+    assert restored.event_type is EventType.FLAG_ACCEPTED
+    assert restored.payload == payload
 
 
 def test_ts_autofill_and_override() -> None:
@@ -119,3 +142,31 @@ def test_hitl_and_solvegraph_payloads() -> None:
     sg = solve_graph_delta_payload("hypothesis_status", id="H3", status="refuted")
     assert sg["kind"] == "hypothesis_status"
     assert sg["status"] == "refuted"
+
+
+def test_control_command_payload_separates_receipt_from_observed_effect() -> None:
+    received = control_command_payload(
+        "cmd-1", "pause", target="global", status="received")
+    assert received == {
+        "command_id": "cmd-1",
+        "action": "pause",
+        "target": "global",
+        "status": "received",
+    }
+    observed = control_command_payload(
+        "cmd-1", "pause", status="effect_observed",
+        request_id="H-123", effect={"kind": "run_quiesced"})
+    assert observed["request_id"] == "H-123"
+    assert observed["effect"] == {"kind": "run_quiesced"}
+
+
+def test_hitl_request_payload_has_stable_request_id() -> None:
+    first = hitl_request_payload(
+        "cli-claude", "need a dashboard token", need_kind="external_blocker")
+    replay = hitl_request_payload(
+        "cli-claude", "need a dashboard token", need_kind="external_blocker")
+    other = hitl_request_payload(
+        "cli-cursor", "need a dashboard token", need_kind="external_blocker")
+    assert first["request_id"] == first["id"] == replay["request_id"]
+    assert first["request_id"].startswith("H-")
+    assert other["request_id"] != first["request_id"]

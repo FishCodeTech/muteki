@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Worker 详情 · 改版对照</title>
+<style>
+  :root {
+    --bg: #15181c;
+    --bg2: #121519;
+    --panel: #1b1f24;
+    --panel2: #181c20;
+    --panel3: #22272d;
+    --line: #292e34;
+    --line2: #353b43;
+    --text: #dfe3e8;
+    --bright: #f0f2f5;
+    --muted: #9aa2ac;
+    --dim: #68717c;
+    --blue: #7896bc;
+    --green: #79a286;
+    --amber: #b49a70;
+    --red: #bd787d;
+    --wc: #5ec8c8;
+    --r-pill: 999px;
+    --sans: "SF Pro Text", "PingFang SC", "Noto Sans SC", system-ui, sans-serif;
+    --mono: "SF Mono", ui-monospace, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; background: #0e1013; color: var(--text); font: 13px/1.45 var(--sans); }
+  button, select { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+
+  .page { min-height: 100vh; display: flex; flex-direction: column; }
+  .top {
+    flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px;
+    padding: 14px 20px; border-bottom: 1px solid #24282e; background: #101317;
+  }
+  .top h1 { margin: 0; font-size: 14px; font-weight: 750; color: var(--bright); letter-spacing: .01em; }
+  .top p { margin: 0; color: var(--muted); font-size: 12px; }
+  .seg { display: inline-flex; padding: 3px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel2); }
+  .seg button {
+    min-height: 28px; padding: 0 11px; border: 0; border-radius: 7px;
+    background: transparent; color: var(--muted); font-size: 12px; font-weight: 650;
+  }
+  .seg button.on { color: var(--bright); background: var(--panel3); }
+
+  .stage { flex: 1; display: grid; grid-template-columns: 1fr 1fr; min-height: 0; }
+  .stage.only-before { grid-template-columns: 1fr; }
+  .stage.only-before .after { display: none; }
+  .stage.only-after { grid-template-columns: 1fr; }
+  .stage.only-after .before { display: none; }
+  .col { min-width: 0; display: flex; flex-direction: column; border-right: 1px solid #24282e; }
+  .col.after { border-right: 0; }
+  .col-h {
+    flex: none; display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+    padding: 10px 16px 8px; background: #101317; border-bottom: 1px solid var(--line);
+  }
+  .col-h b { font-size: 12px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+  .before .col-h b { color: var(--amber); }
+  .after .col-h b { color: var(--green); }
+  .col-h span { color: var(--dim); font-size: 11px; }
+  .frame { flex: 1; min-height: 0; overflow: auto; padding: 12px; background: var(--bg); }
+
+  .deck {
+    border: 1px solid var(--line); border-radius: 14px; overflow: hidden;
+    background: var(--bg2); box-shadow: 0 12px 40px #0006;
+  }
+  .nav { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--line); background: var(--panel2); }
+  .nav .g { display: flex; gap: 4px; }
+  .chip {
+    min-height: 26px; padding: 0 9px; border: 1px solid transparent; border-radius: 8px;
+    background: transparent; color: var(--dim); font-size: 11.5px; font-weight: 650;
+  }
+  .chip.on { color: var(--bright); background: var(--panel); border-color: var(--line); }
+  .chip b { margin-left: 5px; color: var(--muted); font: 700 10px/1 var(--mono); }
+  .div { width: 1px; height: 16px; background: var(--line2); margin: 0 4px; }
+
+  .graph { padding: 8px 10px 10px; border-bottom: 1px solid var(--line); background: var(--panel2); }
+  .graph-h { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 11px; margin-bottom: 8px; }
+  .graph-h strong { color: var(--text); font-size: 12px; }
+  .plot {
+    height: 92px; border-radius: 8px; border: 1px solid var(--line);
+    background:
+      linear-gradient(#292e34 1px, transparent 1px) 0 0 / 100% 23px,
+      linear-gradient(90deg, transparent 0, transparent 99%, #292e34 100%) 0 0 / 12.5% 100%,
+      #161a1e;
+    position: relative; overflow: hidden;
+  }
+  .lane { position: absolute; left: 8px; right: 8px; height: 8px; border-radius: 99px; opacity: .9; }
+  .lane i { position: absolute; top: 0; height: 100%; border-radius: 99px; background: currentColor; }
+  .l1 { top: 14px; color: #8aa0c0; }
+  .l2 { top: 36px; color: #5ec8c8; }
+  .l3 { top: 58px; color: #c4a06a; }
+  .l4 { top: 76px; color: #9a86c4; }
+
+  .ov { display: grid; grid-template-columns: minmax(160px,.9fr) minmax(240px,1.3fr); gap: 10px; padding: 12px; }
+  .box { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }
+  .ov-copy { padding: 14px 16px; }
+  .kicker { color: var(--blue); font-size: 9.5px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+  .ov-copy strong { display: block; margin-top: 3px; color: var(--bright); font-size: 15px; }
+  .phase { display: inline-flex; margin-top: 8px; padding: 3px 9px; border-radius: var(--r-pill); background: color-mix(in srgb, var(--blue) 12%, transparent); color: var(--blue); font-size: 11px; font-weight: 700; }
+  .stats { display: grid; grid-template-columns: repeat(5, 1fr); overflow: hidden; background: var(--line); gap: 1px; border-radius: 14px; }
+  .stats div { padding: 11px 10px; background: var(--panel); }
+  .stats span { display: block; color: var(--muted); font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+  .stats b { display: block; margin-top: 3px; color: var(--bright); font: 700 16px/1 var(--mono); }
+  .stats b.ok { color: var(--green); }
+  .stats b.info { color: var(--blue); }
+
+  .tools { display: flex; gap: 8px; padding: 0 12px 10px; }
+  .focus { flex: 1; min-height: 32px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border: 1px solid var(--line); border-radius: 10px; color: var(--muted); background: var(--panel); font-size: 12px; }
+  .abn { min-height: 32px; padding: 0 10px; border: 1px solid var(--line); border-radius: var(--r-pill); color: var(--muted); background: var(--panel); font-size: 12px; font-weight: 650; }
+
+  .list { padding: 0 12px 12px; display: flex; flex-direction: column; gap: 8px; }
+  .card {
+    --wc: #5ec8c8; border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+    display: grid; grid-template-columns: 32px minmax(0,1fr) auto 24px; gap: 10px; align-items: center;
+    padding: 8px 12px; opacity: .72;
+  }
+  .av {
+    width: 32px; height: 32px; border-radius: 8px; display: grid; place-items: center;
+    font-size: 11px; font-weight: 800; color: var(--wc);
+    border: 1px solid color-mix(in srgb, var(--wc) 50%, var(--line2));
+    background: color-mix(in srgb, var(--wc) 13%, var(--bg));
+  }
+  .meta { min-width: 0; }
+  .idrow { display: flex; align-items: center; gap: 6px; }
+  .name { color: var(--bright); font-weight: 800; font-size: 13px; }
+  .eng { color: var(--wc); font-size: 10.5px; font-weight: 800; border: 1px solid color-mix(in srgb, var(--wc) 35%, var(--line2)); border-radius: var(--r-pill); padding: 1px 7px; }
+  .latest { margin-top: 4px; color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .latest em { font-style: normal; color: var(--wc); font-size: 9px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; margin-right: 5px; }
+  .st { font-size: 11px; font-weight: 700; border: 1px solid var(--line2); border-radius: var(--r-pill); padding: 2px 9px; color: var(--muted); }
+  .st.tool { color: var(--blue); border-color: color-mix(in srgb, var(--blue) 45%, var(--line2)); background: color-mix(in srgb, var(--blue) 10%, transparent); }
+  .st.think { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 45%, var(--line2)); background: color-mix(in srgb, var(--amber) 10%, transparent); }
+  .st.stall { color: var(--red); border-color: color-mix(in srgb, var(--red) 45%, var(--line2)); background: color-mix(in srgb, var(--red) 10%, transparent); }
+  .st.pause { color: var(--dim); border-style: dashed; }
+  .chev { width: 24px; height: 24px; display: grid; place-items: center; color: var(--muted); border: 1px solid var(--line2); border-radius: 6px; font-size: 10px; }
+
+  /* after */
+  .graph-mini {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 7px 12px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11.5px;
+    background: var(--panel2);
+  }
+  .graph-mini strong { color: var(--text); font-weight: 650; }
+  .bar {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+    padding: 8px 12px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  .bar-l { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
+  .bar-l b { color: var(--bright); font-weight: 750; }
+  .dot { width: 6px; height: 6px; border-radius: 99px; background: var(--dim); }
+  .dot.live { background: var(--green); box-shadow: 0 0 7px var(--green); }
+  .bar-r { display: flex; align-items: center; gap: 6px; }
+  .ghost {
+    min-height: 26px; padding: 0 9px; border: 1px solid var(--line); border-radius: var(--r-pill);
+    background: transparent; color: var(--muted); font-size: 11.5px; font-weight: 650;
+  }
+  .ghost.on { color: var(--red); border-color: color-mix(in srgb, var(--red) 45%, var(--line)); background: color-mix(in srgb, var(--red) 8%, var(--panel)); }
+  .ghost.pri { color: var(--blue); border-color: color-mix(in srgb, var(--blue) 40%, var(--line)); }
+
+  .roster { padding: 6px 0 8px; }
+  .grp { }
+  .grp-h {
+    width: 100%; display: flex; align-items: center; gap: 8px; padding: 7px 14px;
+    border: 0; background: transparent; color: var(--muted); text-align: left;
+  }
+  .grp-h:hover { color: var(--text); background: color-mix(in srgb, var(--blue) 5%, transparent); }
+  .grp-h b { color: var(--bright); font-weight: 750; }
+  .grp-h .n { margin-left: auto; font: 700 11px/1 var(--mono); color: var(--dim); }
+  .row {
+    width: 100%; display: grid; grid-template-columns: 22px minmax(110px, .9fr) 42px minmax(0,1.4fr) 64px 28px;
+    align-items: center; gap: 8px; padding: 5px 14px; border: 0; background: transparent; text-align: left;
+  }
+  .row:hover { background: color-mix(in srgb, var(--blue) 6%, transparent); }
+  .row.stall { box-shadow: inset 3px 0 0 var(--red); background: color-mix(in srgb, var(--red) 6%, transparent); }
+  .row.pause { box-shadow: inset 3px 0 0 var(--dim); }
+  .row .av { width: 22px; height: 22px; border-radius: 6px; font-size: 9px; }
+  .row .name { font-size: 12.5px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row .eng { font-size: 10px; justify-self: start; }
+  .row .act { color: var(--muted); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row .st { justify-self: end; }
+  .xbtn {
+    width: 22px; height: 22px; border: 1px solid var(--line2); border-radius: 6px;
+    background: transparent; color: var(--dim); opacity: .45;
+  }
+  .row:hover .xbtn { opacity: 1; }
+  .toast {
+    margin: 0 12px 10px; padding: 7px 10px; border-radius: 8px; border: 1px solid color-mix(in srgb, var(--blue) 35%, var(--line));
+    background: color-mix(in srgb, var(--blue) 10%, var(--panel)); color: var(--text); font-size: 12px;
+  }
+
+  @media (max-width: 1100px) {
+    .stage { grid-template-columns: 1fr; }
+    .col { border-right: 0; border-bottom: 1px solid #24282e; min-height: 70vh; }
+    .ov { grid-template-columns: 1fr; }
+    .stats { grid-template-columns: repeat(3, 1fr); }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+  <header class="top">
+    <div>
+      <h1>Worker 详情 · 改版对照</h1>
+      <p>静态示意，不是线上页。左边是现在，右边是建议改成的花名册。</p>
+    </div>
+    <div class="seg" id="scene">
+      <button type="button" data-scene="done" class="on">已结束 · 33 人</button>
+      <button type="button" data-scene="live">进行中</button>
+    </div>
+    <div class="seg" id="view">
+      <button type="button" data-view="both" class="on">并排</button>
+      <button type="button" data-view="before">只看现在</button>
+      <button type="button" data-view="after">只看改后</button>
+    </div>
+  </header>
+  <div class="stage" id="stage">
+    <section class="col before">
+      <div class="col-h"><b>现在</b><span>图谱 + 两块概要 + 通栏卡</span></div>
+      <div class="frame" id="before"></div>
+    </section>
+    <section class="col after">
+      <div class="col-h"><b>改后</b><span>一行工具条 + 按状态收组的花名册</span></div>
+      <div class="frame" id="after"></div>
+    </section>
+  </div>
+</div>
+<script>
+const NAMES = [
+  ["pi-lan-deepseek", "PL"],
+  ["jiayuqi7813", "JI"],
+  ["jiayuqi7813 · 2", "JI"],
+];
+for (let i = 3; i <= 32; i++) NAMES.push([`pi-${i}`, `P${i > 9 ? String(i).slice(-1) : i}`]);
+
+const LIVE_EXTRA = {
+  0: { kind: "tool", st: "工具中", act: "bash: curl -s http://127.0.0.1:4280/login.php" },
+  1: { kind: "think", st: "思考", act: "确认 guestbook 里的 payload 已渲染" },
+  2: { kind: "stall", st: "停滞", act: "等 token，已 90s 无输出" },
+  3: { kind: "pause", st: "已暂停", act: "等你确认下一步" },
+  4: { kind: "tool", st: "工具中", act: "bash: python3 replay_sqli.py" },
+};
+
+function workers(scene) {
+  return NAMES.map(([name, ini], i) => {
+    if (scene === "live" && LIVE_EXTRA[i]) return { name, ini, ...LIVE_EXTRA[i], online: true };
+    return { name, ini, kind: "off", st: i === 0 ? "已取消" : "已退出", act: i === 0 ? "cancelled" : "finished", online: false };
+  });
+}
+
+function graph() {
+  return `<div class="graph">
+    <div class="graph-h"><strong>运行图谱</strong><span>113 Worker · 87 工具</span><span style="margin-left:auto">3:44</span></div>
+    <div class="plot">
+      <div class="lane l1"><i style="left:4%;width:8%"></i><i style="left:80%;width:16%"></i></div>
+      <div class="lane l2"><i style="left:6%;width:7%"></i><i style="left:16%;width:9%"></i><i style="left:30%;width:11%"></i><i style="left:48%;width:8%"></i><i style="left:62%;width:14%"></i><i style="left:80%;width:6%"></i></div>
+      <div class="lane l3"><i style="left:8%;width:5%"></i><i style="left:18%;width:12%"></i><i style="left:40%;width:7%"></i><i style="left:55%;width:15%"></i><i style="left:78%;width:9%"></i></div>
+      <div class="lane l4"><i style="left:42%;width:4%"></i><i style="left:88%;width:3%"></i></div>
+    </div>
+  </div>`;
+}
+
+function tabs() {
+  return `<div class="nav">
+    <div class="g"><span class="chip on">轨迹</span><span class="chip">调查</span><span class="chip">资产</span></div>
+    <i class="div"></i>
+    <div class="g"><span class="chip">活动时间线 <b>208</b></span><span class="chip on">Worker 详情 <b>33</b></span><span class="chip">事实图 <b>140</b></span></div>
+  </div>`;
+}
+
+function card(w) {
+  return `<div class="card">
+    <span class="av">${w.ini}</span>
+    <div class="meta">
+      <div class="idrow"><span class="name">${w.name}</span><span class="eng">Pi</span></div>
+      <div class="latest"><em>最新</em>${w.act}</div>
+    </div>
+    <span class="st ${w.kind}">${w.st}</span>
+    <span class="chev">▾</span>
+  </div>`;
+}
+
+function renderBefore(scene) {
+  const ws = workers(scene);
+  const live = scene === "live";
+  const online = ws.filter((w) => w.online).length;
+  const active = ws.filter((w) => w.kind === "tool" || w.kind === "think").length;
+  document.getElementById("before").innerHTML = `<div class="deck">
+    ${tabs()}
+    ${graph()}
+    <div class="ov">
+      <div class="box ov-copy">
+        <div class="kicker">执行阵列</div>
+        <strong>Worker 详情</strong>
+        <span class="phase">${live ? "● 运行中" : "✓ 已结束"}</span>
+      </div>
+      <div class="stats">
+        <div><span>在线</span><b class="ok">${online}</b></div>
+        <div><span>活动</span><b class="info">${active}</b></div>
+        <div><span>完成</span><b>0</b></div>
+        <div><span>调用</span><b>87</b></div>
+        <div><span>总耗时</span><b>3:44</b></div>
+      </div>
+    </div>
+    <div class="tools"><div class="focus">聚焦　全部 <span>▾</span></div><button class="abn" type="button">异常</button></div>
+    <div class="list">${ws.map(card).join("")}</div>
+  </div>`;
+}
+
+const state = { scene: "done", toast: "", finishedOpen: false, issuesOnly: false };
+
+function groups(ws) {
+  const live = ws.filter((w) => w.kind === "tool" || w.kind === "think");
+  const bad = ws.filter((w) => w.kind === "stall" || w.kind === "pause");
+  const done = ws.filter((w) => w.kind === "off");
+  return { live, bad, done };
+}
+
+function row(w, canKill) {
+  return `<button type="button" class="row ${w.kind === "stall" ? "stall" : w.kind === "pause" ? "pause" : ""}" data-jump="${w.name}">
+    <span class="av">${w.ini}</span>
+    <span class="name">${w.name}</span>
+    <span class="eng">Pi</span>
+    <span class="act">${w.act}</span>
+    <span class="st ${w.kind}">${w.st}</span>
+    ${canKill && w.online ? `<span class="xbtn" data-kill="${w.name}">×</span>` : `<span></span>`}
+  </button>`;
+}
+
+function renderAfter(scene) {
+  const ws = workers(scene);
+  const live = scene === "live";
+  const g = groups(ws);
+  const shownDone = state.finishedOpen;
+  const toast = state.toast ? `<div class="toast">${state.toast}</div>` : "";
+  const liveBlock = g.live.length ? `<div class="grp">
+    <div class="grp-h"><b>在干活</b><span class="n">${g.live.length}</span></div>
+    ${g.live.map((w) => row(w, live)).join("")}
+  </div>` : "";
+  const badBlock = g.bad.length ? `<div class="grp">
+    <div class="grp-h"><b>异常</b><span class="n">${g.bad.length}</span></div>
+    ${g.bad.map((w) => row(w, live)).join("")}
+  </div>` : "";
+  const doneBlock = g.done.length ? `<div class="grp">
+    <button type="button" class="grp-h" data-toggle-done>
+      <b>已结束</b>
+      <span>${shownDone ? "▾" : "▸"} 默认收起，避免 30 条相同长条</span>
+      <span class="n">${g.done.length}</span>
+    </button>
+    ${shownDone ? g.done.map((w) => row(w, false)).join("") : ""}
+  </div>` : "";
+
+  document.getElementById("after").innerHTML = `<div class="deck">
+    ${tabs()}
+    <div class="graph-mini"><strong>运行图谱已收起</strong><span>只在活动时间线展开 · ${ws.length} 人 · 87 次调用</span></div>
+    <div class="bar">
+      <div class="bar-l">
+        <i class="dot ${live ? "live" : ""}"></i>
+        <b>${live ? "运行中" : "已结束"}</b>
+        <span>${ws.length} 人</span>
+        <span>调用 87</span>
+        <span>3:44</span>
+      </div>
+      <div class="bar-r">
+        <button type="button" class="ghost ${state.issuesOnly ? "on" : ""}" data-issues>异常</button>
+        ${live ? `<button type="button" class="ghost pri" data-spawn>＋ 加 worker</button>` : ""}
+      </div>
+    </div>
+    ${toast}
+    <div class="roster">
+      ${state.issuesOnly ? (g.bad.length ? badBlock : `<div class="grp-h">没有异常 worker</div>`) : (liveBlock + badBlock + doneBlock)}
+    </div>
+  </div>`;
+}
+
+function render() {
+  document.getElementById("stage").className = "stage " + (document.querySelector('#view .on').dataset.view === "both" ? "" : "only-" + document.querySelector('#view .on').dataset.view);
+  renderBefore(state.scene);
+  renderAfter(state.scene);
+}
+
+document.getElementById("scene").addEventListener("click", (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  document.querySelectorAll("#scene button").forEach((x) => x.classList.toggle("on", x === b));
+  state.scene = b.dataset.scene;
+  state.toast = "";
+  if (state.scene === "done") state.finishedOpen = false;
+  render();
+});
+document.getElementById("view").addEventListener("click", (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  document.querySelectorAll("#view button").forEach((x) => x.classList.toggle("on", x === b));
+  render();
+});
+document.getElementById("after").addEventListener("click", (e) => {
+  if (e.target.closest("[data-toggle-done]")) { state.finishedOpen = !state.finishedOpen; render(); return; }
+  if (e.target.closest("[data-issues]")) { state.issuesOnly = !state.issuesOnly; render(); return; }
+  if (e.target.closest("[data-spawn]")) { state.toast = "这里会派一个新 worker（示意）"; render(); return; }
+  const kill = e.target.closest("[data-kill]");
+  if (kill) { e.stopPropagation(); state.toast = `停止 ${kill.dataset.kill}（示意）`; render(); return; }
+  const jump = e.target.closest("[data-jump]");
+  if (jump) { state.toast = `跳到活动时间线，只看 ${jump.dataset.jump}`; render(); }
+});
+
+render();
+</script>
+</body>
+</html>

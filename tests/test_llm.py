@@ -237,3 +237,63 @@ async def test_max_tokens_sent_when_set() -> None:
                      messages=[{"role": "user", "content": "x"}],
                      max_tokens=512, stream=False)
     assert captured["body"].get("max_tokens") == 512
+
+
+async def test_temperature_sent_by_default() -> None:
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": "ok"},
+                               "finish_reason": "stop"}],
+                  "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                  "model": "deepseek-v4-pro"},
+        )
+
+    async with _client_with(handler) as c:
+        await c.chat(model="deepseek-v4-pro",
+                     messages=[{"role": "user", "content": "x"}],
+                     temperature=0.3, stream=False)
+    assert captured["body"].get("temperature") == 0.3
+
+
+async def test_temperature_override_replaces_call_value() -> None:
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": "ok"},
+                               "finish_reason": "stop"}],
+                  "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                  "model": "k3"},
+        )
+
+    async with _client_with(handler, temperature_mode="custom", temperature_value=1.0) as c:
+        await c.chat(model="k3",
+                     messages=[{"role": "user", "content": "x"}],
+                     temperature=0.0, stream=False)
+    assert captured["body"].get("temperature") == 1.0
+
+
+async def test_temperature_omitted_when_mode_is_omit() -> None:
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": "ok"},
+                               "finish_reason": "stop"}],
+                  "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                  "model": "k3"},
+        )
+
+    async with _client_with(handler, temperature_mode="omit") as c:
+        await c.chat(model="k3",
+                     messages=[{"role": "user", "content": "x"}],
+                     temperature=0.0, stream=False)
+    assert "temperature" not in captured["body"]

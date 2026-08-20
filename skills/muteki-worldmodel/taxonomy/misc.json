@@ -1,0 +1,13 @@
+{
+  "domain": "misc",
+  "entity_kinds": ["service", "file_format", "encoding", "automation_api"],
+  "state_variables": ["service.banner", "file_format.magic", "encoding.detected", "goal.flag_recovery"],
+  "completion_state": "goal.flag_recovery",
+  "initial_reachability": 0.2,
+  "actions": [
+    {"name": "probe_service", "risk_class": "safe", "cost_estimate_units": 1},
+    {"name": "decode_layer", "risk_class": "safe", "cost_estimate_units": 1},
+    {"name": "script_interact", "risk_class": "probe", "cost_estimate_units": 2},
+    {"name": "bruteforce_range", "risk_class": "probe", "cost_estimate_units": 3}
+  ]
+}

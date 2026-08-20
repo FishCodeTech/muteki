@@ -1,14 +1,18 @@
 /**
  * The typed event stream contract — mirrors muteki/core/events.py EventType +
  * Event. The UI is a DUMB SUBSCRIBER (§3): it never calls the core, it only
- * consumes these events and POSTs HITL. Keep this enum in lockstep with Python.
+ * consumes these events and POSTs typed control commands. Keep this enum in
+ * lockstep with Python.
  */
 
 export enum EventType {
+  RUN_PREPARING = "run.preparing",
   RUN_STARTED = "run.started",
   RUN_TITLED = "run.titled",
   RUN_FINISHED = "run.finished",
   RUN_REOPENED = "run.reopened",
+  FLAG_ACCEPTED = "flag.accepted",
+  PROJECTION_INCOMPLETE = "projection.incomplete",
   WORKER_STATUS = "worker.status",
   WORKER_FINISHED = "worker.finished",
   TEXT_MESSAGE_DELTA = "text.delta",
@@ -29,6 +33,7 @@ export enum EventType {
   GUIDANCE_INJECTED = "coordinator.guidance",
   HITL_REQUEST = "hitl.request",
   HITL_RESPONSE = "hitl.response",
+  CONTROL_COMMAND = "control.command",
   HITL_TRANSLATED = "hitl.translated",
   GRAPH_COMPACTED = "graph.compacted",
   WORKER_LIFECYCLE = "worker.lifecycle",
@@ -67,7 +72,13 @@ export interface WorkerRuntimeStatus {
   tokens_spent?: number;   // I: running token total for this worker
 }
 
-export type WorkerLaneRole = "worker" | "review";
+export type WorkerLaneRole = "worker" | "review" | "verifier";
+export type WorkerConnectionKind = "official" | "custom_endpoint" | "system";
+
+/** The runtime panel's secondary detail views (the conversation stays primary). */
+export type ArtifactView =
+  | "graph" | "blackboard" | "workers" | "timeline" | "evidence"
+  | "findings" | "reports" | "credentials" | "pocs" | "routes" | "directives";
 
 /** Per-solver derived view the deck renders (the "race" lanes). */
 export interface SolverLane {
@@ -87,6 +98,15 @@ export interface SolverLane {
   paused?: boolean;       // I: worker is paused (operator pause / lane wait)
   session?: string; // live CLI session id — `claude -r <id>` / `codex exec resume <id>`
   runtime?: WorkerRuntimeStatus;
+  profileId?: string;
+  profileLabel?: string;
+  model?: string;
+  accountId?: string;
+  endpointHost?: string;
+  connection?: WorkerConnectionKind;
+  provider?: string;
+  /** Sticky: spawned during race-scout (phase may later read bootstrap). */
+  raceScout?: boolean;
 }
 
 /** A single agent's running cost/token totals, for the cost hover card. */
@@ -158,6 +178,15 @@ export interface ChatMessage {
   // language the swarm emitted.
   i18nKey?: string;
   i18nVars?: Record<string, string>;
+  // Sealed bubbles no longer accept streamed deltas. Set when a Pi/OMP
+  // message_end (or equivalent) closes the current assistant message so the
+  // next turn opens a new row instead of concatenating into the previous one.
+  sealed?: boolean;
+  // Tool rows: command stays in `content`; stdout lives here so the ledger can
+  // collapse a group to one line and expand a single call for the output.
+  toolOutput?: string;
+  toolFailed?: boolean;
+  toolPending?: boolean;
 }
 
 /** Derived graph model for the Cytoscape view. Nodes accrete as the run evolves:
@@ -197,7 +226,62 @@ export interface HitlRequest {
   options: string[];
   needKind?: HitlNeedKind;  // F: how the swarm triaged the hand-raise
   pausesBehavior?: boolean; // F: only external_blocker freezes the swarm for an answer
+  /** Once `decision_closed=true` proves the durable DecisionAnswer companion
+   *  exists, the decision becomes read-only. A later delivery failure does not
+   *  mean the answer was never recorded, so the UI recovers that command instead
+   *  of submitting a second answer for the same request. */
+  deliveryCommandId?: string;
+  deliveryStatus?: ControlCommandStatus;
+  deliveryDetail?: string;
   ts: number;
+}
+
+export type ControlCommandStatus =
+  | "received" | "persisted" | "routed" | "effect_observed"
+  | "partial" | "failed" | "unknown" | "rejected";
+
+/** Auditable lifecycle of one operator command. An accepted HTTP request is not
+ *  proof of an effect; only `effect_observed` may change displayed runtime state. */
+export interface ControlCommand {
+  id: string;
+  action: string;
+  target: string;
+  status: ControlCommandStatus;
+  requestId?: string;
+  effect?: Record<string, any>;
+  detail?: string;
+  ts: number;
+}
+
+export type HitlDeliveryPhase =
+  | "open" | "pending" | "observed"
+  | "partial" | "failed" | "unknown" | "rejected";
+
+/** Pure decision-delivery projection shared by the reducer tests and HitlCard.
+ *  Anything except `open` is deliberately locked: even UNKNOWN/FAILED/PARTIAL
+ *  is a durable answer command whose effect needs recovery, not a second answer. */
+export function hitlDeliveryState(req: HitlRequest): {
+  phase: HitlDeliveryPhase;
+  locked: boolean;
+  commandId?: string;
+  detail?: string;
+} {
+  if (!req.deliveryCommandId && !req.deliveryStatus) {
+    return { phase: "open", locked: false };
+  }
+  const status = req.deliveryStatus;
+  const phase: HitlDeliveryPhase = status === "effect_observed" ? "observed"
+    : status === "partial" ? "partial"
+      : status === "failed" ? "failed"
+        : status === "unknown" ? "unknown"
+          : status === "rejected" ? "rejected"
+            : "pending";
+  return {
+    phase,
+    locked: true,
+    commandId: req.deliveryCommandId,
+    detail: req.deliveryDetail,
+  };
 }
 
 export interface ResourceLock {
@@ -273,9 +357,237 @@ export interface BlackboardReviewFinding {
   summary: string;
   routeHash?: string;
   branchId?: string;
+  recommendedActions?: string[];
+  evidenceSeqs?: number[];
+  intentIds?: string[];
   actor: string;
   ts: number;
 }
+export interface BlackboardGatedFinding {
+  id: string;
+  findingClass: string;
+  resourceId: string;
+  identityA?: string;
+  identityB?: string;
+  actor: string;
+  ts: number;
+}
+export type VulnReportStatus =
+  | "submitted"
+  | "repro_failed"
+  | "reproduced"
+  | "accepted"
+  | "rejected";
+export interface ReportHistoryEntry {
+  status: VulnReportStatus;
+  ts: number;
+  actor: string;
+  eventSeq: number;
+  reason?: string;
+}
+export interface BlackboardVulnReport {
+  id: string;
+  title: string;
+  findingClass: string;
+  resourceId: string;
+  impactWho?: string;
+  impactWhat?: string;
+  witness?: string;
+  replayCommand?: string;
+  steps?: string[];
+  preconditions?: string;
+  affectedRole?: string;
+  narrative?: string;
+  markdown?: string;
+  status: VulnReportStatus;
+  code?: string;
+  reason?: string;
+  actor: string;
+  ts: number;
+  eventSeq?: number;
+  intentId?: string;
+  submitter?: string;
+  history: ReportHistoryEntry[];
+}
+
+export const REPORT_CAP = 80;
+export const REVIEW_CAP = 80;
+export const POC_CAP = 80;
+export const ROUTE_CAP = 60;
+export const DIRECTIVE_CAP = 60;
+export const FACT_CAP = 200;
+export const DEAD_END_CAP = 50;
+
+export type BlackboardTruncation = {
+  facts?: boolean;
+  reports?: boolean;
+  reviews?: boolean;
+  pocs?: boolean;
+  routes?: boolean;
+  directives?: boolean;
+  deadEnds?: boolean;
+};
+
+const REPORT_RANK: Record<VulnReportStatus, number> = {
+  submitted: 1,
+  repro_failed: 2,
+  reproduced: 3,
+  accepted: 4,
+  rejected: 4,
+};
+
+export function canAdvanceReportStatus(from: VulnReportStatus, to: VulnReportStatus): boolean {
+  if (from === to) return true;
+  if (from === "accepted" || from === "rejected") return false;
+  if (from === "repro_failed" && to === "reproduced") return true;
+  return REPORT_RANK[to] > REPORT_RANK[from];
+}
+
+function stringField(value: unknown): string | undefined {
+  if (value == null) return undefined;
+  const text = String(value).trim();
+  return text ? text : undefined;
+}
+
+function stringListField(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const items = value.map((item) => String(item ?? "").trim()).filter(Boolean);
+  return items.length ? items : undefined;
+}
+
+function vulnReportPatch(
+  p: Record<string, unknown>,
+  actor: string,
+  ts: number,
+  status: VulnReportStatus,
+): BlackboardVulnReport {
+  const id = stringField(p.report_id) || "";
+  return {
+    id,
+    title: stringField(p.title) || id,
+    findingClass: stringField(p.finding_class) || "",
+    resourceId: stringField(p.resource_id) || "",
+    impactWho: stringField(p.impact_who),
+    impactWhat: stringField(p.impact_what),
+    witness: stringField(p.witness),
+    replayCommand: stringField(p.replay_command),
+    steps: stringListField(p.steps),
+    preconditions: stringField(p.preconditions),
+    affectedRole: stringField(p.affected_role),
+    narrative: stringField(p.narrative),
+    markdown: stringField(p.markdown),
+    status,
+    code: stringField(p.code),
+    reason: stringField(p.reason) ?? stringField(p.detail),
+    actor,
+    ts,
+    intentId: stringField(p.intent_id),
+    submitter: stringField(p.submitter),
+    history: [],
+  };
+}
+
+function mergeVulnReportFields(existing: BlackboardVulnReport, patch: BlackboardVulnReport): BlackboardVulnReport {
+  const next: BlackboardVulnReport = { ...existing, history: [...(existing.history ?? [])] };
+  (Object.keys(patch) as (keyof BlackboardVulnReport)[]).forEach((key) => {
+    if (key === "status" || key === "history" || key === "eventSeq") return;
+    const value = patch[key];
+    if (value === undefined) return;
+    if (typeof value === "string" && value === "") return;
+    (next as unknown as Record<string, unknown>)[key] = value;
+  });
+  if (patch.title === patch.id && existing.title && existing.title !== existing.id) {
+    next.title = existing.title;
+  }
+  return next;
+}
+
+function applyReportTransition(
+  existing: BlackboardVulnReport | undefined,
+  patch: BlackboardVulnReport,
+  eventSeq: number,
+): BlackboardVulnReport {
+  if (!existing) {
+    return {
+      ...patch,
+      eventSeq,
+      history: [{
+        status: patch.status,
+        ts: patch.ts,
+        actor: patch.actor,
+        eventSeq,
+        reason: patch.reason,
+      }],
+    };
+  }
+  const merged = mergeVulnReportFields(existing, patch);
+  if (!canAdvanceReportStatus(existing.status, patch.status)) {
+    return merged;
+  }
+  if (existing.status !== patch.status) {
+    merged.status = patch.status;
+    merged.ts = patch.ts;
+    merged.eventSeq = eventSeq;
+    if (patch.actor) merged.actor = patch.actor;
+    if (patch.reason) merged.reason = patch.reason;
+    if (patch.code) merged.code = patch.code;
+    merged.history = [...(existing.history ?? []), {
+      status: patch.status,
+      ts: patch.ts,
+      actor: patch.actor,
+      eventSeq,
+      reason: patch.reason,
+    }];
+  }
+  return merged;
+}
+
+function markTruncated(bb: BlackboardView, key: keyof BlackboardTruncation): void {
+  bb.truncated = { ...(bb.truncated ?? {}), [key]: true };
+}
+
+function capPush<T>(list: T[], item: T, cap: number): { list: T[]; truncated: boolean } {
+  const next = [...list, item];
+  if (next.length <= cap) return { list: next, truncated: false };
+  return { list: next.slice(-cap), truncated: true };
+}
+
+function upsertVulnReport(bb: BlackboardView, row: BlackboardVulnReport, eventSeq: number): void {
+  if (!row.id) return;
+  const existing = bb.vulnReports.find((item) => item.id === row.id);
+  const nextRow = applyReportTransition(existing, row, eventSeq);
+  if (existing) {
+    bb.vulnReports = bb.vulnReports.map((item) => item.id === row.id ? nextRow : item);
+    return;
+  }
+  const pushed = capPush(bb.vulnReports, nextRow, REPORT_CAP);
+  bb.vulnReports = pushed.list;
+  if (pushed.truncated) markTruncated(bb, "reports");
+}
+
+function patchReportStatus(
+  bb: BlackboardView,
+  ev: MutekiEvent,
+  id: string,
+  status: VulnReportStatus,
+  extra: Partial<BlackboardVulnReport> = {},
+): void {
+  if (!id) return;
+  const existing = bb.vulnReports.find((item) => item.id === id);
+  if (!existing) return;
+  const patch: BlackboardVulnReport = {
+    ...existing,
+    ...extra,
+    id,
+    status,
+    actor: extra.actor || ev.solver_id || existing.actor,
+    ts: ev.ts,
+    history: existing.history ?? [],
+  };
+  const next = applyReportTransition(existing, patch, ev.seq || 0);
+  bb.vulnReports = bb.vulnReports.map((item) => item.id === id ? next : item);
+}
+
 export interface BlackboardSuppressedRoute {
   routeHash: string;
   label?: string;
@@ -323,6 +635,8 @@ export interface BlackboardView {
   facts: BlackboardFact[];
   pocs: BlackboardPoc[];
   deadEnds: { deadEndSeq?: number; reason: string; actor: string; ts: number }[];
+  gatedFindings: BlackboardGatedFinding[];
+  vulnReports: BlackboardVulnReport[];
   reviewFindings: BlackboardReviewFinding[];
   suppressedRoutes: BlackboardSuppressedRoute[];
   branches: BlackboardBranch[];
@@ -331,11 +645,14 @@ export interface BlackboardView {
   flags?: string[];                    // every distinct flag captured (multi-flag)
   events: BlackboardEvent[];           // append-only timeline
   workers: string[];                   // distinct actors seen (for lanes/legend)
+  truncated?: BlackboardTruncation;
 }
 
 export interface DeckState {
   runId: string;
   challengeName: string;
+  /** True when challengeName is a regex slug that RUN_TITLED may replace. */
+  challengeNameAutogen?: boolean;
   category: string;
   target: string;
   lanes: Record<string, SolverLane>;
@@ -348,6 +665,9 @@ export interface DeckState {
   model: GraphModel;
   blackboard: BlackboardView;
   hitlRequests: HitlRequest[];
+  controlCommands: ControlCommand[];          // durable command lifecycle/effects
+  controlGeneration: number;                  // latest observed desired-state generation
+  executionGeneration: number;                // latest run execution generation
   operatorDirectives: OperatorDirective[];  // B: first-class operator steering
   resourceLocks: ResourceLock[];            // E: unified site/account/listener locks
   compactEpochs: number;                    // H: how many times the graph was compacted
@@ -365,6 +685,7 @@ export interface DeckState {
   // per-agent breakdown for the cost/token hover card: solverId → running totals.
   costBySolver: Record<string, SolverCost>;
   started: boolean;
+  preparing: boolean;
   finished: boolean;
   // wall-clock bookends (event ts, seconds or ms — normalised at read time).
   // startedAt = first RUN_STARTED; finishedAt = RUN_FINISHED. A running run has
@@ -373,10 +694,18 @@ export interface DeckState {
   finishedAt?: number;
   solved: boolean;
   flag?: string;
+  // Set only by Protocol 2 flag.accepted. It prevents count-based digest inference
+  // from turning public accepted visibility into solved/finished lifecycle state.
+  acceptedOnly?: boolean;
   // multi-flag: every distinct flag collected (dedup, order). `flag` stays the
   // first for back-compat. expectedFlags drives the "collecting N/total" state.
   flags: string[];
+  // Flags the operator marked false. A reopened run reuses the same graph, so old
+  // flag_found events may be replayed; keep them out of the current solved state.
+  invalidatedFlags: string[];
   expectedFlags: number;
+  mode?: "ctf" | "pentest";
+  expectedFindings: number;
   // multi-flag MODE bit. When true with an unknown count (expectedFlags<=1), a
   // saved flag does NOT mark the run solved — it keeps "collecting" until the run
   // finishes (operator STOP / no-progress pause). Decouples save from finish in the
@@ -385,8 +714,23 @@ export interface DeckState {
   // how a finished run concluded: "solved" = a CTF flag was gated; "goal_met" =
   // a pentest engagement goal was reached (no flag); "finished" = ended without
   // either. Drives the outcome label (flag chip vs findings summary).
-  outcomeReason?: "solved" | "goal_met" | "finished" | "operator_stop" | "budget_exhausted" | "runtime_failure";
+  outcomeReason?: "solved" | "goal_met" | "finished" | "operator_stop" | "budget_exhausted" | "runtime_failure" | "preflight_failed";
   outcomeDetail?: string;
+  outcomeErrorId?: string;
+  outcomeFailureCode?: string;
+  outcomeFailurePhase?: string;
+  preflightFailures: Array<{
+    errorId?: string;
+    profileId: string;
+    engine: string;
+    model?: string;
+    backend?: string;
+    runtime?: string;
+    stage?: string;
+    layer?: string;
+    code?: string;
+    detail: string;
+  }>;
   // pentest: why the engagement goal was judged met (from the goal_complete event).
   goalWhy?: string;
   // set when the coordinator PAUSED waiting for operator input (a worker raised a
@@ -395,6 +739,12 @@ export interface DeckState {
   // race-scout layer: true while the front race round (3 engines in parallel,
   // single-shot) is running, before the main coordinator loop. Drives the "racing" status pill.
   racing?: boolean;
+  /** Race-scout roster size (from race_started). */
+  raceTotal?: number;
+  /** Race-scout workers that have finished (from race_worker_finished). */
+  raceFinished?: number;
+  /** Active report-reproduction verifier workers (independent channel). */
+  verifying?: number;
   // engines dropped from THIS run's roster by a dispatch-time health-check failure
   // (e.g. cursor headless auth lapsed → "Authentication required"). engine → reason.
   // Lets the worker panel / engine bar show "cursor degraded: …" instead of the
@@ -406,6 +756,7 @@ export function emptyDeck(runId: string): DeckState {
   return {
     runId,
     challengeName: "",
+    challengeNameAutogen: false,
     category: "",
     target: "",
     lanes: {},
@@ -421,6 +772,8 @@ export function emptyDeck(runId: string): DeckState {
       facts: [],
       pocs: [],
       deadEnds: [],
+      gatedFindings: [],
+      vulnReports: [],
       reviewFindings: [],
       suppressedRoutes: [],
       branches: [],
@@ -428,8 +781,12 @@ export function emptyDeck(runId: string): DeckState {
       flags: [],
       events: [],
       workers: [],
+      truncated: {},
     },
     hitlRequests: [],
+    controlCommands: [],
+    controlGeneration: 0,
+    executionGeneration: 0,
     operatorDirectives: [],
     resourceLocks: [],
     compactEpochs: 0,
@@ -439,11 +796,15 @@ export function emptyDeck(runId: string): DeckState {
     tokensOut: 0,
     costBySolver: {},
     started: false,
+    preparing: false,
     finished: false,
     solved: false,
     flags: [],
+    invalidatedFlags: [],
     expectedFlags: 1,
+    expectedFindings: 1,
     multiFlag: false,
+    preflightFailures: [],
     degradedEngines: {},
   };
 }
@@ -452,10 +813,43 @@ export function emptyDeck(runId: string): DeckState {
  *  flag/flags[0] invariant. Accepts a single flag or a list. */
 function mergeFlags(s: DeckState, flags?: string | string[] | null): void {
   const list = typeof flags === "string" ? [flags] : (flags ?? []);
+  const invalidated = new Set(s.invalidatedFlags);
   for (const f of list) {
+    if (invalidated.has(f)) continue;
     if (f && !s.flags.includes(f)) s.flags.push(f);
   }
   if (s.flags.length && !s.flag) s.flag = s.flags[0];
+}
+
+function isInvalidatedFlag(s: DeckState, flag?: string | null): boolean {
+  return !!flag && s.invalidatedFlags.includes(flag);
+}
+
+function invalidateFlag(s: DeckState, flag?: string | null): void {
+  const bad = (flag || "").trim();
+  if (bad) {
+    if (!s.invalidatedFlags.includes(bad)) s.invalidatedFlags.push(bad);
+    s.flags = s.flags.filter((f) => f !== bad);
+  } else {
+    for (const f of s.flags) {
+      if (!s.invalidatedFlags.includes(f)) s.invalidatedFlags.push(f);
+    }
+    s.flags = [];
+  }
+  s.flag = s.flags[0];
+  if (!s.flags.length) s.solved = false;
+  for (const id of Object.keys(s.lanes)) {
+    const l = s.lanes[id];
+    if (!bad || l.flag === bad || (l.solved && !s.flags.length)) {
+      s.lanes[id] = {
+        ...l,
+        solved: false,
+        flag: l.flag === bad ? undefined : l.flag,
+        status: l.online ? l.status : "done",
+        statusReason: l.statusReason === "solved" ? undefined : l.statusReason,
+      };
+    }
+  }
 }
 
 function lane(state: DeckState, sid?: string | null): SolverLane {
@@ -474,13 +868,59 @@ function lane(state: DeckState, sid?: string | null): SolverLane {
 }
 
 function reviewRoleFromPhase(phase?: string | null): WorkerLaneRole | undefined {
-  return phase && phase.toLowerCase().includes("review") ? "review" : undefined;
+  const token = (phase || "").toLowerCase();
+  if (token.includes("review")) return "review";
+  if (token.includes("verifier")) return "verifier";
+  return undefined;
 }
 
 function roleFromWorkerRole(workerRole?: unknown): WorkerLaneRole | undefined {
   const raw = (workerRole ?? "").toString().toLowerCase();
   if (!raw) return undefined;
-  return raw === "review" ? "review" : "worker";
+  if (raw === "review") return "review";
+  if (raw === "verifier") return "verifier";
+  return "worker";
+}
+
+function asWorkerConnection(value: unknown): WorkerConnectionKind | undefined {
+  const raw = String(value || "");
+  if (raw === "official" || raw === "custom_endpoint" || raw === "system") return raw;
+  return undefined;
+}
+
+function identityFromPayload(p: Record<string, any>): Partial<SolverLane> {
+  return {
+    profileId: String(p.profile_id || "").trim() || undefined,
+    profileLabel: String(p.profile_label || "").trim() || undefined,
+    model: String(p.model || "").trim() || undefined,
+    accountId: String(p.account_id || "").trim() || undefined,
+    endpointHost: String(p.endpoint_host || "").trim() || undefined,
+    connection: asWorkerConnection(p.connection),
+    provider: String(p.provider || "").trim() || undefined,
+  };
+}
+
+function withLaneIdentity(l: SolverLane, p: Record<string, any>): SolverLane {
+  const patch = identityFromPayload(p);
+  return {
+    ...l,
+    profileId: patch.profileId || l.profileId,
+    profileLabel: patch.profileLabel || l.profileLabel,
+    model: patch.model || l.model,
+    accountId: patch.accountId || l.accountId,
+    endpointHost: patch.endpointHost || l.endpointHost,
+    connection: patch.connection || l.connection,
+    provider: patch.provider || l.provider,
+  };
+}
+
+function relabelSolverNode(m: GraphModel, sid: string, label?: string): void {
+  if (!sid || !label) return;
+  const node = m.nodes.find((n) => n.id === `solver:${sid}`);
+  if (node && node.label !== label) {
+    node.label = label;
+    m.version += 1;
+  }
 }
 
 function activityOnline(state: DeckState): boolean {
@@ -575,6 +1015,41 @@ function pushChat(s: DeckState, msg: Omit<ChatMessage, "id">): void {
   s.chat = [...s.chat, { ...msg, id: gid("c") }].slice(-CHAT_CAP);
 }
 
+const ENGINE_TAG = /\[(?:claude|codex|cursor|pi|omp|kimi|grok|opencode|dsh|oh-my-pi|ohmypi)\]\s+/gi;
+
+function stripEnginePrefix(text: string): string {
+  if (!text) return text;
+  return text.replace(ENGINE_TAG, "");
+}
+
+function glueReasoningDelta(prev: string, incoming: string): string {
+  const next = stripEnginePrefix(incoming);
+  if (!prev) return next.replace(/\n$/, "");
+  if (next.startsWith("\n") || next.startsWith(" ")) return (prev + next).slice(-6000);
+  const token = next.endsWith("\n") && next.length <= 24 && !next.slice(0, -1).includes("\n")
+    ? next.slice(0, -1)
+    : next;
+  if (prev.endsWith("\n") && token.length <= 24 && !token.includes("\n")) {
+    return (prev.slice(0, -1) + token).slice(-6000);
+  }
+  return (prev + token).slice(-6000);
+}
+
+function toolOutputLooksFailed(text: string): boolean {
+  const s = text.trim();
+  if (!s) return false;
+  if (/\bexit(?:ed)?(?:\s+with)?(?:\s*code)?\s*[:=]?\s*(?!0\b)(?:[1-9]\d*)\b/i.test(s)) return true;
+  if (/\b(?:command not found|permission denied|no such file or directory)\b/i.test(s)) return true;
+  return false;
+}
+
+function lastOwnAgentIndex(chat: ChatMessage[], solverId: string): number {
+  for (let i = chat.length - 1; i >= 0; i--) {
+    if (chat[i].role === "agent" && chat[i].solverId === solverId) return i;
+  }
+  return -1;
+}
+
 /** The operator's launch input, reconstructed from the RUN_STARTED challenge for
  *  display as the opening "you" bubble: the free-text description first, then a
  *  compact context footer (target / goal / scope / attachments) for whatever was
@@ -597,6 +1072,34 @@ function userPromptBubble(ch: Record<string, any> | undefined): string {
   return lines.join("\n\n").trim();
 }
 
+/** Apply only a control effect the backend says it actually observed. Receipt,
+ * persistence, and routing are useful audit states but cannot prove pause/resume. */
+function applyObservedControlState(s: DeckState, p: Record<string, any>): void {
+  if (p.status !== "effect_observed") return;
+  const effect = (p.effect && typeof p.effect === "object") ? p.effect : {};
+  const effectKind = String(effect.kind ?? p.effect_kind ?? "").toLowerCase();
+  const held = effectKind === "run_quiesced" || effectKind === "run_frozen";
+  const released = effectKind === "run_resumed" || effectKind === "run_thawed";
+  if (effectKind === "workers_frozen" || effectKind === "workers_thawed") {
+    const frozen = effectKind === "workers_frozen";
+    const targetIds = Array.isArray(p.target_ids)
+      ? p.target_ids.map((id: unknown) => String(id)) : [];
+    for (const id of targetIds) {
+      const current = lane(s, id);
+      s.lanes[id] = { ...current, paused: frozen };
+    }
+  }
+  if (held) {
+    s.awaitingOperator = String(effect.reason ?? p.detail
+      ?? (effectKind === "run_frozen"
+        ? "operator froze the swarm" : "operator paused the swarm"));
+  } else if (released) {
+    // Resuming a manual hold must not hide another still-blocking decision.
+    const pending = s.hitlRequests.find((r) => (r.pausesBehavior ?? true));
+    s.awaitingOperator = pending?.prompt;
+  }
+}
+
 /** Fold one event into the deck state (pure-ish; mutates a draft copy). */
 export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
   const s: DeckState = {
@@ -614,6 +1117,8 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
       facts: [...prev.blackboard.facts],
       pocs: [...prev.blackboard.pocs],
       deadEnds: [...prev.blackboard.deadEnds],
+      gatedFindings: [...(prev.blackboard.gatedFindings ?? [])],
+      vulnReports: [...(prev.blackboard.vulnReports ?? [])],
       reviewFindings: [...(prev.blackboard.reviewFindings ?? [])],
       suppressedRoutes: [...(prev.blackboard.suppressedRoutes ?? [])],
       branches: [...(prev.blackboard.branches ?? [])],
@@ -622,29 +1127,86 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
       workers: [...prev.blackboard.workers],
       flag: prev.blackboard.flag,
       flags: [...(prev.blackboard.flags ?? [])],
+      truncated: { ...(prev.blackboard.truncated ?? {}) },
     },
     hitlRequests: [...prev.hitlRequests],
+    controlCommands: [...(prev.controlCommands ?? [])],
     operatorDirectives: [...(prev.operatorDirectives ?? [])],
     resourceLocks: [...(prev.resourceLocks ?? [])],
+    preflightFailures: [...(prev.preflightFailures ?? [])],
   };
   const m = s.model;
   const sid = ev.solver_id || "";
   if (sid) ensureSolverNode(m, sid);
   const p = ev.payload || {};
+  const executionGeneration = Number(p.execution_generation);
+  if (Number.isFinite(executionGeneration) && executionGeneration >= 0) {
+    if (executionGeneration < (s.executionGeneration ?? 0)) return prev;
+    s.executionGeneration = Math.max(
+      s.executionGeneration ?? 0, executionGeneration);
+  }
+  const projectedControlGeneration = Number(p.control_generation);
+  if (Number.isFinite(projectedControlGeneration)
+      && projectedControlGeneration >= 0) {
+    s.controlGeneration = Math.max(
+      s.controlGeneration ?? 0, projectedControlGeneration);
+  }
   switch (ev.event_type) {
+    case EventType.RUN_PREPARING: {
+      const firstStart = !prev.started;
+      s.started = true;
+      s.preparing = true;
+      s.finished = false;
+      s.preflightFailures = [];
+      // New execution generation boundary: reset the race pill. If this generation
+      // actually races, race_started will set it again; a resolve generation never
+      // races, and a hard-stopped race may never have emitted race_concluded.
+      s.racing = false;
+      if (firstStart) { s.startedAt = ev.ts; s.finishedAt = undefined; }
+      s.challengeName = p.challenge?.name ?? s.challengeName;
+      if (typeof p.name_autogen === "boolean") s.challengeNameAutogen = p.name_autogen;
+      s.category = p.challenge?.category ?? s.category;
+      s.target = p.challenge?.target ?? s.target;
+      if (typeof p.challenge?.expected_flags === "number") s.expectedFlags = p.challenge.expected_flags;
+      if (typeof p.challenge?.multi_flag === "boolean") s.multiFlag = p.challenge.multi_flag;
+      if (p.challenge?.mode === "pentest" || p.challenge?.mode === "ctf") s.mode = p.challenge.mode;
+      if (typeof p.challenge?.expected_findings === "number") s.expectedFindings = p.challenge.expected_findings;
+      if (typeof p.challenge?.engagement?.expected_findings === "number") {
+        s.expectedFindings = p.challenge.engagement.expected_findings;
+      }
+      const root = m.nodes.find((n) => n.id === "challenge");
+      if (root && s.challengeName) { root.label = s.challengeName; m.version += 1; }
+      if (firstStart) {
+        const prompt = userPromptBubble(p.challenge);
+        if (prompt) pushChat(s, { role: "human", kind: "text", content: prompt, ts: ev.ts });
+        pushChat(s, {
+          role: "system", kind: "status", content: "Checking Worker availability…",
+          ts: ev.ts, i18nKey: "sys.preparing",
+        });
+      }
+      break;
+    }
     case EventType.RUN_STARTED: {
       // RUN_STARTED fires once PER worker; only the first one opens the thread.
       const firstStart = !prev.started;
+      const wasPreparing = !!prev.preparing;
       s.started = true;
+      s.preparing = false;
       s.finished = false;
       if (firstStart) { s.startedAt = ev.ts; s.finishedAt = undefined; }
       s.challengeName = p.challenge?.name ?? s.challengeName;
+      if (typeof p.name_autogen === "boolean") s.challengeNameAutogen = p.name_autogen;
       s.category = p.challenge?.category ?? s.category;
       s.target = p.challenge?.target ?? s.target;
       // multi-flag: pick up the target flag count + mode bit so "collecting" works
       // from the start of the run, not just at RUN_FINISHED.
       if (typeof p.challenge?.expected_flags === "number") s.expectedFlags = p.challenge.expected_flags;
       if (typeof p.challenge?.multi_flag === "boolean") s.multiFlag = p.challenge.multi_flag;
+      if (p.challenge?.mode === "pentest" || p.challenge?.mode === "ctf") s.mode = p.challenge.mode;
+      if (typeof p.challenge?.expected_findings === "number") s.expectedFindings = p.challenge.expected_findings;
+      if (typeof p.challenge?.engagement?.expected_findings === "number") {
+        s.expectedFindings = p.challenge.engagement.expected_findings;
+      }
       if (sid) {
         const l = lane(s, sid);
         s.lanes[l.solverId] = { ...l, online: true, status: "online", statusReason: "started" };
@@ -657,8 +1219,20 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
         // the thread shows what kicked the run off — not just a system line.
         const prompt = userPromptBubble(p.challenge);
         if (prompt) pushChat(s, { role: "human", kind: "text", content: prompt, ts: ev.ts });
-        pushChat(s, { role: "system", kind: "status", content: `Run started — ${s.challengeName || s.runId}`, ts: ev.ts, i18nKey: "sys.runStarted", i18nVars: { name: s.challengeName || s.runId } });
       }
+      if (firstStart || wasPreparing) pushChat(s, { role: "system", kind: "status", content: `Run started — ${s.challengeName || s.runId}`, ts: ev.ts, i18nKey: "sys.runStarted", i18nVars: { name: s.challengeName || s.runId } });
+      break;
+    }
+    case EventType.FLAG_ACCEPTED: {
+      // Protocol 2 authority projected an exact accepted flag for public display.
+      // This is not a collaboration timeline event and proves no lifecycle state.
+      mergeFlags(s, typeof p.flag === "string" ? p.flag : undefined);
+      if (!s.finished) s.acceptedOnly = true;
+      break;
+    }
+    case EventType.PROJECTION_INCOMPLETE: {
+      // Redacted, non-terminal startup diagnostic. It intentionally has no visible
+      // progress/success side effect; operators can inspect durable raw history.
       break;
     }
     case EventType.WORKER_STATUS: {
@@ -666,7 +1240,7 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
       const online = p.online !== false;
       const phase = (p.phase ?? l.phase ?? "").toString() || undefined;
       const role = roleFromWorkerRole(p.worker_role) ?? reviewRoleFromPhase(phase) ?? l.role;
-      s.lanes[l.solverId] = {
+      s.lanes[l.solverId] = withLaneIdentity({
         ...l,
         online,
         status: (p.status ?? (online ? "online" : "offline")).toString(),
@@ -683,7 +1257,8 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
         // sticky: a later status emit with no session must not wipe a known id.
         session: (p.session ?? l.session ?? "").toString() || undefined,
         runtime: (p.runtime && typeof p.runtime === "object") ? p.runtime : l.runtime,
-      };
+      }, p);
+      relabelSolverNode(m, l.solverId, s.lanes[l.solverId].profileLabel);
       break;
     }
     case EventType.WORKER_LIFECYCLE: {
@@ -705,15 +1280,17 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
       } else if (phaseName === "exited") {
         next.online = false;
       }
-      s.lanes[l.solverId] = next;
+      s.lanes[l.solverId] = withLaneIdentity(next, p);
+      relabelSolverNode(m, l.solverId, s.lanes[l.solverId].profileLabel);
       break;
     }
     case EventType.RUN_TITLED: {
-      // Auto-title landed (ChatGPT-style). Only adopt it as the conversation
-      // name if the operator hasn't supplied a real challenge name.
+      // Auto-title landed (ChatGPT-style). Adopt it when the operator did not
+      // supply a name, or when the current name is a regex slug (name_autogen).
       const title = p.title ?? "";
-      if (title && !s.challengeName) {
+      if (title && (!s.challengeName || s.challengeNameAutogen)) {
         s.challengeName = title;
+        s.challengeNameAutogen = false;
         const root = m.nodes.find((n) => n.id === "challenge");
         if (root) { root.label = title; m.version += 1; }
       }
@@ -721,20 +1298,31 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
     }
     case EventType.REASONING_DELTA: {
       const l = lane(s, ev.solver_id);
+      const incoming = stripEnginePrefix(String(p.text ?? ""));
       s.lanes[l.solverId] = {
         ...l,
-        reasoning: (l.reasoning + (p.text ?? "")).slice(-4000),
+        reasoning: (l.reasoning + incoming).slice(-4000),
         status: "thinking",
         online: activityOnline(s),
         statusReason: undefined,
       };
-      // stream reasoning into the chat transcript: append to the last open
-      // reasoning bubble for this solver, else start a new one.
-      const last = s.chat[s.chat.length - 1];
-      if (last && last.role === "agent" && last.kind === "reasoning" && last.solverId === l.solverId) {
-        s.chat = [...s.chat.slice(0, -1), { ...last, content: (last.content + (p.text ?? "")).slice(-6000) }];
-      } else if (p.text) {
-        pushChat(s, { role: "agent", solverId: l.solverId, kind: "reasoning", content: p.text, ts: ev.ts });
+      if (p.turn_end) {
+        const idx = lastOwnAgentIndex(s.chat, l.solverId);
+        if (idx >= 0 && s.chat[idx].kind === "reasoning") {
+          const next = s.chat.slice();
+          next[idx] = { ...next[idx], sealed: true };
+          s.chat = next;
+        }
+        break;
+      }
+      const idx = lastOwnAgentIndex(s.chat, l.solverId);
+      const last = idx >= 0 ? s.chat[idx] : undefined;
+      if (last && last.kind === "reasoning" && !last.sealed && incoming) {
+        const next = s.chat.slice();
+        next[idx] = { ...last, content: glueReasoningDelta(last.content, incoming), ts: ev.ts };
+        s.chat = next;
+      } else if (incoming) {
+        pushChat(s, { role: "agent", solverId: l.solverId, kind: "reasoning", content: incoming, ts: ev.ts });
       }
       break;
     }
@@ -742,24 +1330,48 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
       const l = lane(s, ev.solver_id);
       s.lanes[l.solverId] = { ...l, online: activityOnline(s), statusReason: undefined };
       const mainThread = !!p.main_thread || l.statusReason === "standby";
-      const last = s.chat[s.chat.length - 1];
-      if (last && last.role === "agent" && last.kind === "text" && last.solverId === l.solverId && !!last.mainThread === mainThread) {
-        s.chat = [...s.chat.slice(0, -1), { ...last, content: (last.content + (p.text ?? "")).slice(-6000) }];
-      } else if (p.text) {
-        pushChat(s, { role: "agent", solverId: l.solverId, mainThread, kind: "text", content: p.text, ts: ev.ts });
+      const incoming = stripEnginePrefix(String(p.text ?? ""));
+      const idx = lastOwnAgentIndex(s.chat, l.solverId);
+      const last = idx >= 0 ? s.chat[idx] : undefined;
+      if (last && last.kind === "text" && !last.sealed && !!last.mainThread === mainThread && incoming) {
+        const next = s.chat.slice();
+        next[idx] = { ...last, content: glueReasoningDelta(last.content, incoming), ts: ev.ts };
+        s.chat = next;
+      } else if (incoming) {
+        if (last && last.kind === "reasoning" && !last.sealed) {
+          const next = s.chat.slice();
+          next[idx] = { ...last, sealed: true };
+          s.chat = next;
+        }
+        pushChat(s, { role: "agent", solverId: l.solverId, mainThread, kind: "text", content: incoming, ts: ev.ts });
       }
       break;
     }
     case EventType.TOOL_CALL_START: {
       const l = lane(s, ev.solver_id);
+      const command = String(p.tool ?? "tool");
+      const sealIdx = lastOwnAgentIndex(s.chat, l.solverId);
+      const sealLast = sealIdx >= 0 ? s.chat[sealIdx] : undefined;
+      if (sealLast && (sealLast.kind === "reasoning" || sealLast.kind === "text") && !sealLast.sealed) {
+        const sealed = s.chat.slice();
+        sealed[sealIdx] = { ...sealLast, sealed: true };
+        s.chat = sealed;
+      }
       s.lanes[l.solverId] = {
         ...l,
-        status: `tool: ${p.tool ?? "?"}`,
+        status: `tool: ${command}`,
         reasoning: "",
         online: activityOnline(s),
         statusReason: undefined,
       };
-      pushChat(s, { role: "agent", solverId: l.solverId, kind: "tool", content: `▶ ${p.tool ?? "tool"}`, ts: ev.ts });
+      pushChat(s, {
+        role: "agent",
+        solverId: l.solverId,
+        kind: "tool",
+        content: command,
+        ts: ev.ts,
+        toolPending: true,
+      });
       break;
     }
     case EventType.TOOL_CALL_RESULT: {
@@ -767,17 +1379,37 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
       const res = p.result || {};
       const cond = (res.condensed ?? "").toString();
       const head = cond.split("\n")[0] || "(result)";
-      // keep a fuller preview in the transcript (up to ~6 lines / 800 chars) so a
-      // tool's output isn't reduced to a single line — the timeline redesign lets
-      // the bubble wrap/scroll instead of truncating to the first line.
-      const preview = cond.split("\n").slice(0, 6).join("\n").slice(0, 800) || head;
+      const preview = cond.split("\n").slice(0, 40).join("\n").slice(0, 4000) || head;
+      const failed = toolOutputLooksFailed(cond);
       s.lanes[l.solverId] = {
         ...l,
         toolLines: [...l.toolLines, head].slice(-12),
         online: activityOnline(s),
         statusReason: undefined,
       };
-      pushChat(s, { role: "agent", solverId: l.solverId, kind: "tool", content: `↳ ${preview}`, ts: ev.ts });
+      const pendingIdx = s.chat.findIndex((m) => m.solverId === l.solverId && m.kind === "tool" && m.toolPending);
+      if (pendingIdx >= 0) {
+        const next = s.chat.slice();
+        const open = next[pendingIdx];
+        next[pendingIdx] = {
+          ...open,
+          ts: ev.ts,
+          toolPending: false,
+          toolOutput: preview,
+          toolFailed: failed,
+        };
+        s.chat = next;
+      } else if (preview) {
+        pushChat(s, {
+          role: "agent",
+          solverId: l.solverId,
+          kind: "tool",
+          content: head,
+          ts: ev.ts,
+          toolOutput: preview,
+          toolFailed: failed,
+        });
+      }
       break;
     }
     case EventType.TERMINAL_OUTPUT:
@@ -785,7 +1417,10 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
       break;
     case EventType.SOLVE_GRAPH_DELTA:
       if (p.kind === "evidence_added") s.graph.evidence = [...s.graph.evidence, p.fact].slice(-50);
-      else if (p.kind === "flag") { s.graph.flag = p.flag; mergeFlags(s, p.flag); }
+      else if (p.kind === "flag" && !isInvalidatedFlag(s, p.flag)) {
+        s.graph.flag = p.flag;
+        mergeFlags(s, p.flag);
+      }
       else if (p.kind === "dead_end") {
         s.graph.deadEnds = [...s.graph.deadEnds, p.reason];
         addGraphNode(m, "dead_end", p.reason ?? "dead end", { from: sid ? `solver:${sid}` : undefined, kind: "refutes" });
@@ -910,14 +1545,20 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
           };
           if (factSeq) {
             const existing = bb.facts.find((f) => f.factSeq === factSeq);
-            bb.facts = existing
-              ? bb.facts.map((f) => f.factSeq === factSeq
+            if (existing) {
+              bb.facts = bb.facts.map((f) => f.factSeq === factSeq
                   // never let a re-emit with a blank intent_id clobber a known one
                   ? { ...f, ...row, summary: f.summary, intentId: row.intentId ?? f.intentId }
-                  : f)
-              : [...bb.facts, row].slice(-100);
+                  : f);
+            } else {
+              const pushed = capPush(bb.facts, row, FACT_CAP);
+              bb.facts = pushed.list;
+              if (pushed.truncated) markTruncated(bb, "facts");
+            }
           } else {
-            bb.facts = [...bb.facts, row].slice(-100);
+            const pushed = capPush(bb.facts, row, FACT_CAP);
+            bb.facts = pushed.list;
+            if (pushed.truncated) markTruncated(bb, "facts");
           }
           tlabel(`${actor} ${p.verified ? "verified" : "candidate"}: ${(p.fact ?? "").slice(0, 56)}`);
           const factSolver = actor ? `solver:${actor}` : (sid ? `solver:${sid}` : undefined);
@@ -959,7 +1600,7 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
                   : (!d.deadEndSeq && sameText(d)))
                   ? { ...d, ...row }
                   : d)
-            : [...bb.deadEnds, row].slice(-50);
+            : (() => { const pushed = capPush(bb.deadEnds, row, DEAD_END_CAP); if (pushed.truncated) markTruncated(bb, "deadEnds"); return pushed.list; })();
           tlabel(`${actor} dead-end: ${(p.reason ?? "").slice(0, 56)}`);
           // also grow a dead-end node on the FACT GRAPH (red octagon). Prefer hanging
           // it off the INTENT it refuted (so the intent-radar groups dead-ends with
@@ -995,9 +1636,13 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
             claimedTs: existing?.claimedTs,
             concludedTs: existing?.concludedTs,
           };
-          bb.pocs = existing
-            ? bb.pocs.map((x) => x.id === id ? { ...x, ...row } : x)
-            : [...bb.pocs, row].slice(-80);
+          if (existing) {
+            bb.pocs = bb.pocs.map((x) => x.id === id ? { ...x, ...row } : x);
+          } else {
+            const pushed = capPush(bb.pocs, row, POC_CAP);
+            bb.pocs = pushed.list;
+            if (pushed.truncated) markTruncated(bb, "pocs");
+          }
           tlabel(`${actor} saved PoC ${id} (${row.status})`);
           const pocFrom = row.intentId ? `intent:${row.intentId}` : (actor ? `solver:${actor}` : undefined);
           addGraphNode(m, "poc", row.entryCommand || row.name, {
@@ -1188,11 +1833,8 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
         case "flag_invalidated": {
           // the recovered flag was wrong — drop it from the board and strike the
           // flag node on the graph. multi-flag: remove only THIS flag from the set.
+          invalidateFlag(s, p.flag);
           if (bb.flag === p.flag) bb.flag = undefined;
-          if (p.flag) {
-            s.flags = s.flags.filter((f) => f !== p.flag);
-            if (s.flag === p.flag) s.flag = s.flags[0];
-          }
           bb.flags = [...s.flags]; // keep the board's flag set in sync after a drop
           if (!bb.flag) bb.flag = bb.flags[0];
           tlabel(`flag invalidated: ${(p.flag ?? "").slice(0, 40)}`);
@@ -1214,12 +1856,113 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
           break;
         }
         case "flag_found": {
+          if (isInvalidatedFlag(s, p.flag)) {
+            tlabel(`${actor} ignored invalidated flag ${p.flag ?? ""}`);
+            break;
+          }
           bb.flag = p.flag ?? bb.flag;
           // multi-flag: collect on the deck in real time so the UI shows N/total
           // as flags land, not just at run end.
           mergeFlags(s, p.flag);
           bb.flags = [...s.flags]; // mirror the deduped flag set onto the blackboard
           tlabel(`${actor} FLAG ${p.flag ?? ""}`);
+          break;
+        }
+        case "finding_found": {
+          const findingClass = String(p.finding_class ?? "generic");
+          const resourceId = String(p.resource_id ?? "");
+          const identityA = p.identity_a ? String(p.identity_a) : undefined;
+          const identityB = p.identity_b ? String(p.identity_b) : undefined;
+          const id = [findingClass.toLowerCase(), resourceId, identityA ?? "", identityB ?? ""].join("::");
+          const row: BlackboardGatedFinding = {
+            id,
+            findingClass,
+            resourceId,
+            identityA,
+            identityB,
+            actor,
+            ts: ev.ts,
+          };
+          if (!bb.gatedFindings.some((finding) => finding.id === id)) {
+            bb.gatedFindings = [...bb.gatedFindings, row].slice(-80);
+            const identities = [identityA, identityB].filter(Boolean).join(" ↔ ");
+            const summary = [findingClass.toUpperCase(), resourceId, identities].filter(Boolean).join(" · ");
+            tlabel(`${actor} accepted finding: ${summary}`);
+            pushChat(s, {
+              role: "system",
+              kind: "insight",
+              content: `Verified finding accepted — ${summary}`,
+              ts: ev.ts,
+            });
+          }
+          break;
+        }
+        case "finding_rejected": {
+          const findingClass = String(p.finding_class ?? "generic");
+          tlabel(`${actor} rejected finding ${findingClass}: ${String(p.reason ?? "missing evidence").slice(0, 72)}`);
+          break;
+        }
+        case "report_submitted": {
+          const row = vulnReportPatch(p, actor, ev.ts, "submitted");
+          if (row.id) {
+            upsertVulnReport(bb, row, ev.seq || 0);
+            tlabel(`${actor} submitted report: ${row.title}`);
+            pushChat(s, {
+              role: "system",
+              kind: "insight",
+              content: `Report submitted — ${row.title}`,
+              ts: ev.ts,
+            });
+          }
+          break;
+        }
+        case "report_rejected": {
+          const row = vulnReportPatch(p, actor, ev.ts, "rejected");
+          const reason = row.reason || row.code || "incomplete";
+          if (row.id) upsertVulnReport(bb, { ...row, reason }, ev.seq || 0);
+          tlabel(`${actor} rejected report: ${reason.slice(0, 72)}`);
+          break;
+        }
+        case "report_reproduced": {
+          const id = String(p.report_id ?? "");
+          patchReportStatus(bb, ev, id, "reproduced", { actor });
+          tlabel(`${actor} reproduced report ${String(p.title ?? id).slice(0, 72)}`);
+          break;
+        }
+        case "report_repro_failed": {
+          const id = String(p.report_id ?? "");
+          const reason = String(p.reason ?? p.code ?? "not reproducible");
+          patchReportStatus(bb, ev, id, "repro_failed", {
+            code: String(p.code ?? "not_reproducible"),
+            reason,
+            actor,
+          });
+          tlabel(`${actor} reproduction failed: ${reason.slice(0, 72)}`);
+          break;
+        }
+        case "report_value_rejected": {
+          const id = String(p.report_id ?? "");
+          const reason = String(p.reason ?? p.code ?? "no impact");
+          patchReportStatus(bb, ev, id, "rejected", {
+            code: String(p.code ?? ""),
+            reason,
+            actor,
+          });
+          tlabel(`${actor} value rejected: ${reason.slice(0, 72)}`);
+          break;
+        }
+        case "report_accepted": {
+          const row = vulnReportPatch(p, actor, ev.ts, "accepted");
+          if (row.id) {
+            upsertVulnReport(bb, row, ev.seq || 0);
+            tlabel(`${actor} accepted report: ${row.title}`);
+            pushChat(s, {
+              role: "system",
+              kind: "insight",
+              content: `Report accepted — ${row.title}`,
+              ts: ev.ts,
+            });
+          }
           break;
         }
         case "need_input": {
@@ -1260,16 +2003,21 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
           // real worker id is in `worker`; register it for lanes/legend. Lane
           // presence flips via WORKER_STATUS; here we just narrate + remember it.
           const w = p.worker ?? actor;
+          const phase = (p.phase ?? "").toString() || undefined;
           if (w && !bb.workers.includes(w)) bb.workers = [...bb.workers, w];
           if (w) {
-            const phase = (p.phase ?? "").toString() || undefined;
             const l = lane(s, w);
-            s.lanes[l.solverId] = {
+            s.lanes[l.solverId] = withLaneIdentity({
               ...l,
               role: roleFromWorkerRole(p.worker_role) ?? reviewRoleFromPhase(phase) ?? l.role,
               phase: phase ?? l.phase,
               statusReason: phase ?? l.statusReason,
-            };
+              raceScout: phase === "race" ? true : l.raceScout,
+            }, p);
+            relabelSolverNode(m, l.solverId, s.lanes[l.solverId].profileLabel);
+          }
+          if (phase === "verifier") {
+            s.verifying = (s.verifying ?? 0) + 1;
           }
           tlabel(`+ ${w} spawned${p.phase ? ` (${p.phase})` : ""}`);
           break;
@@ -1307,7 +2055,17 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
           break;
         }
         case "review_finding": {
-          const id = String(p.finding_id ?? p.seq ?? gid("rvw"));
+          const id = String(p.finding_id ?? (p.seq != null ? `rvw-${p.seq}` : ""));
+          if (!id) break;
+          const recommendedActions = Array.isArray(p.recommended_actions)
+            ? p.recommended_actions.map((item: unknown) => String(item ?? "").trim()).filter(Boolean)
+            : undefined;
+          const evidenceSeqs = Array.isArray(p.evidence_seqs)
+            ? p.evidence_seqs.map((item: unknown) => Number(item)).filter((n: number) => Number.isFinite(n) && n > 0)
+            : undefined;
+          const intentIds = Array.isArray(p.intent_ids)
+            ? p.intent_ids.map((item: unknown) => String(item ?? "").trim()).filter(Boolean)
+            : undefined;
           const row: BlackboardReviewFinding = {
             id,
             kind: String(p.finding_kind ?? "finding"),
@@ -1315,10 +2073,20 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
             summary: String(p.summary ?? ""),
             routeHash: p.route_hash ? String(p.route_hash) : undefined,
             branchId: p.branch_id ? String(p.branch_id) : undefined,
+            recommendedActions,
+            evidenceSeqs,
+            intentIds,
             actor,
             ts: ev.ts,
           };
-          bb.reviewFindings = [...bb.reviewFindings, row].slice(-80);
+          const existing = bb.reviewFindings.find((item) => item.id === id);
+          if (existing) {
+            bb.reviewFindings = bb.reviewFindings.map((item) => item.id === id ? { ...item, ...row } : item);
+          } else {
+            const pushed = capPush(bb.reviewFindings, row, REVIEW_CAP);
+            bb.reviewFindings = pushed.list;
+            if (pushed.truncated) markTruncated(bb, "reviews");
+          }
           tlabel(`review ${row.severity}: ${row.summary.slice(0, 72)}`);
           break;
         }
@@ -1357,10 +2125,11 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
             ts: ev.ts,
             reopened: false,
           };
-          bb.suppressedRoutes = [
-            ...bb.suppressedRoutes.filter((r) => r.routeHash !== routeHash),
-            row,
-          ].slice(-60);
+          {
+            const nextRoutes = [...bb.suppressedRoutes.filter((r) => r.routeHash !== routeHash), row];
+            if (nextRoutes.length > ROUTE_CAP) markTruncated(bb, "routes");
+            bb.suppressedRoutes = nextRoutes.slice(-ROUTE_CAP);
+          }
           tlabel(`route suppressed: ${routeHash}${row.reason ? ` · ${row.reason.slice(0, 48)}` : ""}`);
           const from = actor ? `solver:${actor}` : undefined;
           if (from) ensureSolverNode(m, actor);
@@ -1381,13 +2150,17 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
         }
         case "branch_split": {
           const branchId = String(p.branch_id ?? p.parent ?? "");
-          bb.branches = [...bb.branches, {
-            branchId,
-            title: String(p.title ?? branchId),
-            actor,
-            ts: ev.ts,
-            status: "open",
-          }].slice(-60);
+          {
+            const pushed = capPush(bb.branches, {
+              branchId,
+              title: String(p.title ?? branchId),
+              actor,
+              ts: ev.ts,
+              status: "open",
+            }, ROUTE_CAP);
+            bb.branches = pushed.list;
+            if (pushed.truncated) markTruncated(bb, "routes");
+          }
           tlabel(`branch split: ${String(p.title ?? branchId).slice(0, 72)}`);
           break;
         }
@@ -1404,7 +2177,11 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
         case "coordinator_directive": {
           const directive = String(p.directive ?? "");
           const action = String(p.action ?? "note");
-          bb.directives = [...bb.directives, { action, directive, actor, ts: ev.ts }].slice(-60);
+          {
+            const pushed = capPush(bb.directives, { action, directive, actor, ts: ev.ts }, DIRECTIVE_CAP);
+            bb.directives = pushed.list;
+            if (pushed.truncated) markTruncated(bb, "directives");
+          }
           tlabel(`directive ${action}: ${directive.slice(0, 72)}`);
           if (directive) {
             pushChat(s, { role: "system", kind: "status",
@@ -1434,7 +2211,37 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
         case "worker_finished": {
           // coordinator-level reap narration (the lane itself is handled by the
           // WORKER_FINISHED event); just add a timeline line.
+          const w = (p.worker ?? actor)?.toString();
+          if (s.racing && w && (p.phase === "race" || lane(s, w).raceScout)) {
+            const l = lane(s, w);
+            s.lanes[l.solverId] = {
+              ...l,
+              raceScout: true,
+              online: false,
+              status: p.result === "solved" ? "SOLVED" : "done",
+              statusReason: p.result === "solved" ? "solved" : "finished",
+            };
+          }
           tlabel(`− ${p.worker ?? actor} finished${p.result ? ` (${p.result})` : ""}`);
+          break;
+        }
+        case "race_worker_finished": {
+          const w = (p.worker ?? actor)?.toString();
+          const finished = Number(p.finished ?? 0);
+          const total = Number(p.total ?? 0);
+          if (total > 0) s.raceTotal = total;
+          if (finished > 0) s.raceFinished = finished;
+          if (w) {
+            const l = lane(s, w);
+            s.lanes[l.solverId] = {
+              ...l,
+              raceScout: true,
+              online: false,
+              status: p.result === "solved" ? "SOLVED" : "done",
+              statusReason: p.result === "solved" ? "solved" : "finished",
+            };
+          }
+          tlabel(`race worker finished ${finished}/${total || "?"}`);
           break;
         }
         case "goal_complete": {
@@ -1472,7 +2279,10 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
           // the front race-scout round started: N engines probe the whole challenge
           // in parallel (single-shot) before the main coordinator loop. Show a status pill.
           s.racing = true;
-          const engines = Array.isArray(p.engines) ? p.engines.join(", ") : "";
+          s.raceFinished = 0;
+          const engineList = Array.isArray(p.engines) ? p.engines : [];
+          if (engineList.length > 0) s.raceTotal = engineList.length;
+          const engines = engineList.join(", ");
           tlabel(`race scout started${engines ? `: ${engines}` : ""}`);
           pushChat(s, { role: "system", kind: "status",
             content: `Race scout — ${engines || "engines"} probing in parallel`,
@@ -1565,6 +2375,76 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
       // the solver acknowledged a human command landed in its context
       pushChat(s, { role: "system", kind: "guidance", content: p.note ?? "(human guidance applied)", ts: ev.ts });
       break;
+    case EventType.CONTROL_COMMAND: {
+      const commandId = String(p.command_id ?? p.commandId ?? "");
+      const requestId = p.request_id ?? p.requestId;
+      const generation = Number(p.generation);
+      const staleControlGeneration = Number.isFinite(generation)
+        && generation < (s.controlGeneration ?? 0);
+      if (Number.isFinite(generation) && generation >= 0) {
+        s.controlGeneration = Math.max(s.controlGeneration ?? 0, generation);
+      }
+      let effectiveRow: ControlCommand | undefined;
+      if (commandId) {
+        const row: ControlCommand = {
+          id: commandId,
+          action: String(p.action ?? "hint"),
+          target: String(p.target ?? "global"),
+          status: (p.status ?? "received") as ControlCommandStatus,
+          requestId: requestId ?? undefined,
+          effect: (p.effect && typeof p.effect === "object") ? p.effect : undefined,
+          detail: p.detail ? String(p.detail) : undefined,
+          ts: ev.ts,
+        };
+        const existing = s.controlCommands.find((c) => c.id === commandId);
+        const terminal = new Set<ControlCommandStatus>([
+          "effect_observed", "partial", "failed", "unknown", "rejected",
+        ]).has(row.status);
+        const existingTerminal = existing && new Set<ControlCommandStatus>([
+          "effect_observed", "partial", "failed", "unknown", "rejected",
+        ]).has(existing.status);
+        // Never let a delayed PERSISTED/ROUTED event regress an already-terminal
+        // receipt. A later terminal receipt may still refine UNKNOWN into an
+        // observed result during reconciliation.
+        effectiveRow = existing && existingTerminal && !terminal
+          ? existing : { ...existing, ...row };
+        if (existing && terminal) {
+          // A late terminal receipt is the newest operator-relevant change. Move it
+          // to the tail so the top-bar "latest command" cannot stay stuck on a newer
+          // command's non-terminal routed receipt.
+          s.controlCommands = [
+            ...s.controlCommands.filter((c) => c.id !== commandId),
+            effectiveRow,
+          ].slice(-200);
+        } else {
+          s.controlCommands = (existing
+            ? s.controlCommands.map((c) => c.id === commandId ? effectiveRow! : c)
+            : [...s.controlCommands, effectiveRow]).slice(-200);
+        }
+      }
+      const decisionAction = String(p.action ?? "");
+      if (p.decision_closed === true && requestId && effectiveRow
+          && (decisionAction === "answer_decision" || decisionAction === "dismiss")) {
+        // `decision_closed` is the durable DecisionAnswer companion fence. A
+        // merely RECEIVED command (or a pre-persistence failure/rejection) did
+        // not record the answer and must leave the card editable. Once fenced,
+        // correlation survives replay/reconnect and UNKNOWN/PARTIAL means recover
+        // this command rather than submit a duplicate human answer.
+        s.hitlRequests = s.hitlRequests.map((r) => r.id === String(requestId) ? {
+          ...r,
+          deliveryCommandId: effectiveRow!.id,
+          deliveryStatus: effectiveRow!.status,
+          deliveryDetail: effectiveRow!.detail,
+        } : r);
+      }
+      if (p.decision_closed === true && effectiveRow?.status === "effect_observed") {
+        if (requestId) {
+          s.hitlRequests = s.hitlRequests.filter((r) => r.id !== String(requestId));
+        }
+      }
+      if (!staleControlGeneration) applyObservedControlState(s, p);
+      break;
+    }
     case EventType.HITL_REQUEST: {
       // a worker raised its hand: it needs a resource (need_input) or the env is
       // down (env_down). payload = {worker, need, kind}. Fall back to the older
@@ -1572,8 +2452,9 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
       const need = (p.need ?? p.prompt ?? "needs your input").toString();
       const isEnv = p.kind === "env_down";
       const needKind = (p.need_kind ?? p.needKind) as HitlNeedKind | undefined;
-      s.hitlRequests = [...s.hitlRequests, {
-        id: p.id ?? gid("hitl"),
+      const requestId = String(p.request_id ?? p.requestId ?? p.id ?? gid("hitl"));
+      const row: HitlRequest = {
+        id: requestId,
         prompt: need,
         worker: p.worker ? String(p.worker) : undefined,
         options: p.options ?? [],
@@ -1583,7 +2464,11 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
         // back-compat (no need_kind → treat as a blocker, as before).
         pausesBehavior: needKind ? needKind === "external_blocker" : true,
         ts: ev.ts,
-      }];
+      };
+      const existing = s.hitlRequests.some((r) => r.id === requestId);
+      s.hitlRequests = existing
+        ? s.hitlRequests.map((r) => r.id === requestId ? { ...r, ...row } : r)
+        : [...s.hitlRequests, row];
       const lead = isEnv ? "environment problem" : "needs input";
       pushChat(s, {
         role: "agent", solverId: sid || undefined, kind: "text",
@@ -1597,18 +2482,9 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
       // scrolls up into the coordinator thread).
       const t = p.text ?? p.hint ?? "";
       pushChat(s, { role: "human", kind: "guidance", content: `/${p.action ?? "hint"}${t ? " " + t : ""}  → ${p.target ?? "global"}`, ts: ev.ts });
-      // ANY operator reply resolves the pending decision card: the backend wakes
-      // the swarm on every operator command (not just submit/answer — a hint /
-      // redirect / stop also clears _pending_help and sets _operator_event), so
-      // the blocking "needs your decision" card must clear too. Before this it
-      // only cleared on submit/answer, so replying with a /hint (e.g. handing the
-      // worker a VPS) left the card stuck on screen even though the run resumed.
-      // The reply itself stays as the human bubble above (history); the card just
-      // stops blocking.
-      s.hitlRequests = [];
-      if (p.action !== "pause") {
-        s.awaitingOperator = undefined;
-      }
+      // Compatibility path for old clients that receive lifecycle on the echo:
+      // accepted/routed is not an effect; only an observed effect changes pause.
+      applyObservedControlState(s, p);
       break;
     }
     case EventType.HITL_TRANSLATED: {
@@ -1643,9 +2519,11 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
       // worker's lane; presence already flipped via WORKER_STATUS. If this worker
       // actually found the flag, reflect that on its lane + graft the flag node, and
       // record the flag/solved on the deck — but leave s.finished to RUN_FINISHED.
-      const wf = (p.flags as string[] | undefined) ?? (p.flag ? [p.flag] : []);
+      const wfRaw = (p.flags as string[] | undefined) ?? (p.flag ? [p.flag] : []);
+      const wf = wfRaw.filter((f) => !isInvalidatedFlag(s, f));
       if (wf.length) {
         mergeFlags(s, wf);
+        if (p.solved) s.acceptedOnly = false;
         s.solved = !!p.solved || s.solved;
         const winner = sid ? `solver:${sid}` : undefined;
         const latestFact = [...m.nodes]
@@ -1665,14 +2543,22 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
         const l = lane(s, ev.solver_id);
         s.lanes[l.solverId] = {
           ...l,
-          solved: !!p.solved || l.solved,
-          flag: p.flag ?? l.flag,
-          status: p.solved ? "SOLVED" : l.solved ? "SOLVED" : "done",
+          solved: (wf.length > 0 && !!p.solved) || l.solved,
+          flag: (p.flag && !isInvalidatedFlag(s, p.flag)) ? p.flag : l.flag,
+          status: (wf.length > 0 && p.solved) ? "SOLVED" : l.solved ? "SOLVED" : "done",
           online: false,
-          statusReason: p.solved ? "solved" : "finished",
+          statusReason: (wf.length > 0 && p.solved)
+            ? "solved"
+            : String(p.reason || l.statusReason || "finished"),
         };
+        if (l.phase === "verifier" || l.role === "verifier") {
+          s.verifying = Math.max(0, (s.verifying ?? 0) - 1);
+        }
+        if (s.racing && (l.raceScout || l.phase === "race")) {
+          s.lanes[l.solverId] = { ...s.lanes[l.solverId], raceScout: true };
+        }
       }
-      if (p.solved) {
+      if (p.solved && wf.length > 0) {
         pushChat(s, { role: "system", kind: "status", content: `SOLVED — ${p.flag ?? ""}`, ts: ev.ts, i18nKey: "sys.solved", i18nVars: { flag: p.flag ?? "" } });
       }
       break;
@@ -1683,6 +2569,11 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
         if (s.startedAt == null) s.startedAt = ev.ts;
       }
       s.finished = true;
+      s.preparing = false;
+      // A hard stop can kill the coordinator before it ever emits race_concluded
+      // (operator stop cancels the whole run task mid-race). Clear the pill here so
+      // the UI never sticks on "racing" past the terminal event.
+      s.racing = false;
       s.awaitingOperator = undefined;
       s.hitlRequests = [];
       // Keep the FIRST finish ts of the current run cycle — the backend re-emits
@@ -1691,25 +2582,46 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
       // re-open fires RUN_STARTED first, which clears finishedAt, so the next
       // finish is captured correctly.
       if (s.finishedAt == null) s.finishedAt = ev.ts;
-      mergeFlags(s, (p.flags as string[] | undefined) ?? p.flag);
+      const finishFlagsRaw = (p.flags as string[] | undefined) ?? (p.flag ? [p.flag] : []);
+      const finishFlags = finishFlagsRaw.filter((f) => !isInvalidatedFlag(s, f));
+      mergeFlags(s, finishFlags);
       if (typeof p.expected_flags === "number") s.expectedFlags = p.expected_flags;
       if (typeof p.multi_flag === "boolean") s.multiFlag = p.multi_flag;
-      s.solved = !!p.solved || s.solved;
+      const solvedByPayload = !!p.solved && (finishFlagsRaw.length === 0 || finishFlags.length > 0);
+      if (solvedByPayload) s.acceptedOnly = false;
+      s.solved = solvedByPayload || s.solved;
       // classify the outcome so the UI shows the right thing: a gated flag →
       // "solved"; solved without a flag → pentest "goal_met"; else "finished".
       // The backend may also send payload.reason; goal_complete may have set it
       // already, in which case we don't downgrade it.
       const finishReason = String(p.reason ?? "");
       const finishDetail = String(p.detail ?? p.error ?? "").trim();
+      s.preflightFailures = Array.isArray(p.profile_failures)
+        ? p.profile_failures.map((failure: Record<string, any>) => ({
+          profileId: String(failure.profile_id ?? ""),
+          errorId: String(failure.error_id ?? "") || undefined,
+          engine: String(failure.engine ?? ""),
+          model: String(failure.model ?? "") || undefined,
+          backend: String(failure.backend ?? "") || undefined,
+          runtime: String(failure.runtime ?? "") || undefined,
+          stage: String(failure.stage ?? "") || undefined,
+          layer: String(failure.layer ?? "") || undefined,
+          code: String(failure.code ?? "") || undefined,
+          detail: String(failure.detail ?? "预检失败"),
+        }))
+        : [];
       s.outcomeReason = s.flag
         ? "solved"
         : (finishReason === "goal_met" || s.solved || s.outcomeReason === "goal_met")
           ? "goal_met"
-          : (finishReason === "operator_stop" || finishReason === "budget_exhausted" || finishReason === "runtime_failure")
+          : (finishReason === "operator_stop" || finishReason === "budget_exhausted" || finishReason === "runtime_failure" || finishReason === "preflight_failed")
             ? finishReason
             : "finished";
       s.outcomeDetail = finishDetail || s.outcomeDetail;
-      if (p.flag) {
+      s.outcomeErrorId = String(p.error_id ?? "") || undefined;
+      s.outcomeFailureCode = String(p.failure_code ?? "") || undefined;
+      s.outcomeFailurePhase = String(p.failure_phase ?? "") || undefined;
+      if (p.flag && !isInvalidatedFlag(s, p.flag)) {
         const winner = sid ? `solver:${sid}` : undefined;
         const latestFact = [...m.nodes]
           .reverse()
@@ -1726,11 +2638,11 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
         // Don't let a run-level RUN_FINISHED (which the coordinator may emit with
         // p.solved=false even after a lane already solved) wipe a lane's solved
         // boolean — preserve it with `|| l.solved` (mock/race/standby finishes).
-        const stillSolved = !!p.solved || l.solved;
+        const stillSolved = solvedByPayload || l.solved;
         s.lanes[l.solverId] = {
           ...l,
           solved: stillSolved,
-          flag: p.flag ?? l.flag,
+          flag: (p.flag && !isInvalidatedFlag(s, p.flag)) ? p.flag : l.flag,
           status: stillSolved ? "SOLVED" : "done",
           online: false,
           statusReason: stillSolved ? "solved" : (finishReason || "finished"),
@@ -1741,19 +2653,19 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
         const isWinner = !!ev.solver_id && id === ev.solver_id;
         s.lanes[id] = {
           ...l,
-          status: (isWinner && p.solved) || l.solved ? "SOLVED" : "done",
+          status: (isWinner && solvedByPayload) || l.solved ? "SOLVED" : "done",
           online: false,
           statusReason: isWinner
-            ? (p.solved ? "solved" : (finishReason || "finished"))
+            ? (solvedByPayload ? "solved" : (finishReason || "finished"))
             : (l.statusReason && l.online === false ? l.statusReason : (finishReason || "finished")),
         };
       }
-      if (p.solved && s.flag) {
+      if (solvedByPayload && s.flag) {
         pushChat(s, {
           role: "system", kind: "status", content: `SOLVED — ${p.flag ?? ""}`,
           ts: ev.ts, i18nKey: "sys.solved", i18nVars: { flag: p.flag ?? "" },
         });
-      } else if (p.solved) {
+      } else if (solvedByPayload) {
         pushChat(s, {
           role: "system", kind: "status",
           content: `Goal met — ${s.goalWhy ?? "engagement objective reached"}`,
@@ -1765,6 +2677,13 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
           content: `Run failed — ${s.outcomeDetail || "runtime failure"}`,
           ts: ev.ts, i18nKey: "sys.runtimeFailure",
           i18nVars: { detail: s.outcomeDetail || "runtime failure" },
+        });
+      } else if (s.outcomeReason === "preflight_failed") {
+        pushChat(s, {
+          role: "system", kind: "status",
+          content: `Worker preflight failed — ${s.outcomeDetail || "profile unavailable"}`,
+          ts: ev.ts, i18nKey: "sys.preflightFailed",
+          i18nVars: { detail: s.outcomeDetail || "profile unavailable" },
         });
       } else {
         pushChat(s, {
@@ -1789,21 +2708,31 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
       // The same lifecycle event reopens a run for either "continue solving" or a
       // false-positive flag invalidation. Keep the operator copy precise.
       s.finished = false;
+      s.preparing = false;
       s.solved = false;
+      s.acceptedOnly = false;
+      s.finishedAt = undefined;
+      // A reopen starts a new generation outside race-scout (resolve skips the
+      // race); the previous generation's racing pill must not carry over.
+      s.racing = false;
       s.awaitingOperator = undefined;
       s.hitlRequests = [];
       const reopenedForResolve = p.reason === "resolve";
       if (reopenedForResolve) {
         // Continue solving from the same evidence graph: keep already recovered
         // flags visible and let new worker prompts inherit them.
-      } else if (p.flag && s.flags.length) {
-        s.flags = s.flags.filter((f) => f !== p.flag);
+      } else if (p.flag) {
+        invalidateFlag(s, p.flag);
       } else {
-        s.flags = [];
+        invalidateFlag(s);
       }
       s.flag = s.flags[0];
       s.outcomeReason = undefined;
       s.outcomeDetail = undefined;
+      s.outcomeErrorId = undefined;
+      s.outcomeFailureCode = undefined;
+      s.outcomeFailurePhase = undefined;
+      s.preflightFailures = [];
       s.goalWhy = undefined;
       pushChat(s, { role: "system", kind: "status",
         content: reopenedForResolve ? "↻ continuing solve" : "↻ flag marked false — re-solving",
@@ -1830,10 +2759,27 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
 
 /** solver_ids that are the COORDINATOR, not a shell worker. */
 export const COORDINATOR_IDS = new Set(["reason", "coordinator"]);
+export const CONTROL_SOLVER_IDS = new Set(["reason", "coordinator", "report-value"]);
 
 /** Is this solver id a shell WORKER (vs the coordinator / unscoped)? */
 export function isWorkerLane(id?: string | null): boolean {
-  return !!id && !COORDINATOR_IDS.has(id);
+  return !!id && !CONTROL_SOLVER_IDS.has(id);
+}
+
+/** Execution generation of a worker id: continued runs (web resolve) mint ids
+ * with a `-gN` suffix (cli-pi-g2); anything without the suffix is generation 1.
+ * Canonical home is events.ts (the dependency-free event contract); workers.ts
+ * re-exports from here. */
+export function workerGeneration(id: string): number {
+  const m = id.match(/-g(\d+)$/);
+  return m ? parseInt(m[1], 10) : 1;
+}
+
+/** True when any worker id in the set carries an explicit generation suffix —
+ * i.e. this run has seen a resolve under the generation-aware naming. */
+export function hasGenerationSuffixedIds(ids: Iterable<string>): boolean {
+  for (const id of ids) if (/-g\d+$/.test(id)) return true;
+  return false;
 }
 
 /** Review/arbiter workers are shell workers with a review phase/role. Keep the
@@ -1845,13 +2791,55 @@ export function isReviewWorkerLane(lane?: Pick<SolverLane, "role" | "phase" | "s
   return phase.includes("review");
 }
 
+export function isVerifierWorkerLane(lane?: Pick<SolverLane, "role" | "phase" | "statusReason"> | null): boolean {
+  if (!lane) return false;
+  if (lane.role === "verifier") return true;
+  const phase = (lane.phase || lane.statusReason || "").toLowerCase();
+  return phase.includes("verifier");
+}
+
+function lanePhaseToken(lane: SolverLane): string {
+  return (lane.phase || lane.statusReason || lane.role || "").toLowerCase();
+}
+
+function isRaceWorkerLane(lane: SolverLane): boolean {
+  if (lane.raceScout) return true;
+  return lanePhaseToken(lane).includes("race");
+}
+
+function isLaneActive(lane: SolverLane): boolean {
+  if (lane.online === false) return false;
+  const status = (lane.status || "").toLowerCase();
+  return status !== "done" && status !== "finished" && status !== "error";
+}
+
+export function raceWorkerCounts(deck: DeckState): { active: number; total: number; finished: number } {
+  const raceLanes = workerLanes(deck).filter(isRaceWorkerLane);
+  const active = raceLanes.filter(isLaneActive).length;
+  const total = deck.raceTotal ?? raceLanes.length;
+  const finished = deck.raceFinished ?? Math.max(0, total - active);
+  return { active, total, finished };
+}
+
+export function reportPipelineCounts(deck: DeckState): {
+  submitted: number;
+  reproducing: number;
+  accepted: number;
+} {
+  const rows = deck.blackboard.vulnReports ?? [];
+  const submitted = rows.filter((row) => row.status === "submitted").length;
+  const reproducing = Math.max(0, deck.verifying ?? 0);
+  const accepted = rows.filter((row) => row.status === "accepted").length;
+  return { submitted, reproducing, accepted };
+}
+
 /** A chat message belongs to the main (coordinator) thread when it's operator
  *  input, a system lifecycle line, or coordinator/unscoped agent text. Worker
  *  agent bubbles are excluded — they live in the secondary worker panels. */
 export function isCoordinatorMessage(m: ChatMessage): boolean {
   if (m.role === "human" || m.role === "system") return true;
   if (m.mainThread) return true;
-  return !m.solverId || COORDINATOR_IDS.has(m.solverId);
+  return !m.solverId || CONTROL_SOLVER_IDS.has(m.solverId);
 }
 
 export function coordinatorThread(deck: DeckState): ChatMessage[] {
@@ -1869,12 +2857,28 @@ export function workerLanes(deck: DeckState): SolverLane[] {
 }
 
 /** Distinct worker ids seen across lanes AND chat (a worker that only streamed
- *  text before a WORKER_STATUS lane was created still appears). */
+ *  text before a WORKER_STATUS lane was created still appears). Chat-derived ids
+ *  pass the same isWorkerLane filter as lanes so system actors (reason /
+ *  coordinator / report-value) never inflate the roster denominator. */
 export function workerIds(deck: DeckState): string[] {
   const ids = new Set<string>();
   for (const l of workerLanes(deck)) ids.add(l.solverId);
-  for (const m of workerChat(deck)) if (m.solverId) ids.add(m.solverId);
+  for (const m of workerChat(deck)) if (m.solverId && isWorkerLane(m.solverId)) ids.add(m.solverId);
   return Array.from(ids);
+}
+
+/** Worker ids of the CURRENT execution generation. Continued runs (web resolve)
+ * mint generation-suffixed ids (cli-pi-g2); when any such id exists, only the
+ * latest generation counts — previous generations are finished workers kept for
+ * display, not roster members. Runs without suffixed ids (fresh starts, older
+ * recordings) keep the legacy behavior: every known id counts. */
+export function currentGenWorkerIds(deck: DeckState): string[] {
+  const ids = workerIds(deck);
+  if (!hasGenerationSuffixedIds(ids)) return ids;
+  const cur = deck.executionGeneration > 0
+    ? deck.executionGeneration
+    : Math.max(...ids.map(workerGeneration));
+  return ids.filter((id) => workerGeneration(id) === cur);
 }
 
 function uniqueTexts(values: string[]): string[] {
@@ -1943,6 +2947,22 @@ export interface SwarmDigest {
   flag?: string;
   flags: string[];
   expectedFlags: number;
+  mode?: "ctf" | "pentest";
+  reports: BlackboardVulnReport[];
+  expectedReports: number;
+  /** Pentest report pipeline: submitted → reproducing → accepted. */
+  reportSubmitted: number;
+  reportReproducing: number;
+  reportAccepted: number;
+  /** Active race-scout workers (when racing). */
+  raceActive: number;
+  raceTotal: number;
+  /** Race-scout workers already finished (while phase may still be racing). */
+  raceFinished: number;
+  /** Active verifier workers vs configured concurrent cap. */
+  verifyingActive: number;
+  verifyingMax: number;
+  challengeName: string;
   goalWhy?: string;
   usd: number;
   tokensIn: number;
@@ -1955,38 +2975,44 @@ export interface SwarmDigest {
   finishedAt?: number;
 }
 
+/** UI-level phase label derived from folded deck state. */
+export function deckPhase(deck: DeckState): SwarmDigest["phase"] {
+  return swarmDigest(deck).phase;
+}
+
 export function swarmDigest(deck: DeckState): SwarmDigest {
   const verified = verifiedFactTexts(deck);
   const candidates = candidateFactTexts(deck);
   const intents = openIntentTexts(deck);
   const deads = deadEndTexts(deck);
-  const lanes = workerLanes(deck);
-  const ids = workerIds(deck);
-  const online = ids.filter((id) => (deck.lanes[id]?.online ?? !deck.finished) !== false).length;
+  // Roster denominator = current generation only (continued runs keep previous
+  // generations' finished workers visible but out of the count).
+  const curIds = currentGenWorkerIds(deck);
+  const online = curIds.filter((id) => (deck.lanes[id]?.online ?? !deck.finished) !== false).length;
+  const reports = (deck.blackboard.vulnReports ?? []).filter((row) => row.status === "accepted");
+  const pipeline = reportPipelineCounts(deck);
+  const raceCounts = raceWorkerCounts(deck);
+  const expectedReports = Math.max(1, deck.expectedFindings || 1);
+  const pentest = deck.mode === "pentest";
   const need = Math.max(1, deck.expectedFlags || 1);
-  // collect mode with an UNKNOWN count (multiFlag + need<=1): a saved flag never
-  // auto-completes the run — it stays "collecting" while live (decouples save from
-  // finish in the UI, mirroring the backend _flags_complete). With a known count, or
-  // in single-flag mode, completion is the count as before.
   const collectUnknown = !!deck.multiFlag && need <= 1;
-  const complete = !collectUnknown && deck.flags.length >= need;
-  // multi-flag: "solved" requires the count met (or any flag in single-flag mode). A
-  // live run with some-but-not-all flags is "collecting". A finished run with a flag
-  // reads "solved" even if short (it ended — no more coming).
+  const flagComplete = !deck.acceptedOnly && !collectUnknown && deck.flags.length >= need;
+  const verifyingActive = deck.verifying ?? 0;
+  const verifyingMax = Math.max(1, verifyingActive);
   const phase: SwarmDigest["phase"] = !deck.started
-    ? "draft"
-    : complete || (deck.finished && deck.flags.length > 0)
+    ? (deck.acceptedOnly ? "collecting" : "draft")
+    : (!pentest && (flagComplete || (!deck.acceptedOnly && deck.finished && deck.flags.length > 0)))
       ? "solved"
-      : deck.awaitingOperator
-        ? "paused"
-        : deck.flags.length > 0 && !deck.finished
-          ? "collecting"
-          : deck.racing && !deck.finished
-            ? "racing"
-            : deck.outcomeReason === "goal_met"
-              ? "goal_met"
+      : deck.outcomeReason === "goal_met"
+        ? "goal_met"
+        : deck.awaitingOperator
+          ? "paused"
+          : ((pentest ? reports.length > 0 : deck.flags.length > 0) && !deck.finished)
+            ? "collecting"
+            : deck.racing && !deck.finished
+              ? "racing"
               : deck.finished
-                ? "finished"
+                ? (pentest && deck.solved ? "goal_met" : "finished")
                 : "running";
   return {
     phase,
@@ -1995,11 +3021,23 @@ export function swarmDigest(deck: DeckState): SwarmDigest {
     openIntents: intents.length,
     deadEnds: deads.length,
     onlineWorkers: online,
-    totalWorkers: Math.max(ids.length, lanes.length),
+    totalWorkers: curIds.length,
     latestVerified: verified[verified.length - 1],
     flag: deck.flag,
     flags: deck.flags,
     expectedFlags: need,
+    mode: deck.mode,
+    reports,
+    expectedReports,
+    reportSubmitted: pipeline.submitted,
+    reportReproducing: pipeline.reproducing,
+    reportAccepted: pipeline.accepted,
+    raceActive: raceCounts.active,
+    raceTotal: raceCounts.total,
+    raceFinished: raceCounts.finished,
+    verifyingActive,
+    verifyingMax,
+    challengeName: deck.challengeName,
     goalWhy: deck.goalWhy,
     usd: deck.usd,
     tokensIn: deck.tokensIn,
@@ -2017,9 +3055,13 @@ export function swarmDigest(deck: DeckState): SwarmDigest {
  * from worker/blackboard events. In single-flag mode, or when expected_flags is
  * already satisfied, the digest is enough to close live controls; partial
  * multi-flag collection stays active.
+ *
+ * Pentest can emit `goal_complete` (and the digest may show `goal_met`) while
+ * workers are still being cancelled. Keep stop/steer until `RUN_FINISHED`.
  */
 export function isRunActive(deck: DeckState): boolean {
   if (!deck.started || deck.finished) return false;
+  if (deck.mode === "pentest") return true;
   const phase = swarmDigest(deck).phase;
   return phase !== "solved" && phase !== "goal_met" && phase !== "finished";
 }

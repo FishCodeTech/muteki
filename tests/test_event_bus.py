@@ -101,6 +101,89 @@ async def test_slow_sink_does_not_reorder_realtime_fanout() -> None:
     assert order == [1, 2, 3, 4, 5], f"sink ran out of seq order: {order}"
 
 
+async def test_cancellation_during_sink_finishes_local_publication_then_reraises() -> None:
+    bus = EventBus()
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    published: list[tuple[str, int]] = []
+
+    async def first(ev: Event) -> None:
+        first_entered.set()
+        await release_first.wait()
+        published.append(("durable", ev.seq))
+
+    async def second(ev: Event) -> None:
+        published.append(("metadata", ev.seq))
+
+    bus.add_sink(first)
+    bus.add_sink(second)
+    subscriber_received = asyncio.Event()
+    subscriber_events: list[Event] = []
+
+    async def consume_one() -> None:
+        async for received in bus.subscribe():
+            subscriber_events.append(received)
+            subscriber_received.set()
+            return
+
+    subscriber = asyncio.create_task(consume_one())
+    await asyncio.sleep(0)  # register before publication snapshots subscribers
+    event = Event(event_type=EventType.RUN_FINISHED, run_id="run-cancelled-publish")
+    task = asyncio.create_task(bus.emit(event))
+    await first_entered.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()  # repeated caller cancellation must not split local publication
+    release_first.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.wait_for(subscriber_received.wait(), timeout=1)
+    await subscriber
+
+    assert published == [("durable", 1), ("metadata", 1)]
+    assert subscriber_events == [event]
+    assert bus.current_seq == 1
+    assert event.seq == 1
+
+
+async def test_cancellation_safe_publish_persists_finished_and_updates_metadata(
+    tmp_path: Path,
+) -> None:
+    bus = EventBus()
+    store = SessionStore(root=tmp_path)
+    first_entered = asyncio.Event()
+    release_store = asyncio.Event()
+    metadata = {"finished": False}
+
+    async def delayed_store(ev: Event) -> None:
+        first_entered.set()
+        await release_store.wait()
+        await store.sink(ev)
+
+    async def metadata_sink(ev: Event) -> None:
+        if ev.event_type is EventType.RUN_FINISHED:
+            metadata["finished"] = True
+
+    bus.add_sink(delayed_store)
+    bus.add_sink(metadata_sink)
+    task = asyncio.create_task(bus.emit(Event(
+        event_type=EventType.RUN_FINISHED,
+        run_id="run-finished-cancel",
+        payload={"solved": False},
+    )))
+    await first_entered.wait()
+    task.cancel()
+    release_store.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert metadata["finished"] is True
+    assert [row["event_type"] for row in store.load_all("run-finished-cancel")] == [
+        "run.finished"
+    ]
+
+
 async def test_sink_exception_does_not_block_fanout() -> None:
     """Finding A: a sink that raises must be isolated — the fan-out (and the durable
     sink registered before/after it) must still run, never wedging the stream."""

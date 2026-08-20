@@ -1,7 +1,7 @@
 "use client";
 
 import type { ReactNode } from "react";
-import type { MouseEvent } from "react";
+import type { MouseEvent, PointerEvent as ReactPointerEvent } from "react";
 import { useT } from "@/lib/i18n";
 import { useCopied } from "@/lib/useCopied";
 import { Icon } from "@/components/Icon";
@@ -39,9 +39,22 @@ export function CopyText({
 }) {
   const t = useT();
   const [copied, copy] = useCopied();
+  const hasFlagGlow = className.split(/\s+/).some((token) => [
+    "ans-flag",
+    "insp-run-flag",
+    "sh-detail-flag",
+    "sh-result-value",
+    "bb-flagchip",
+  ].includes(token));
   const onCopy = (event: MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
     copy(value);
+  };
+  const onGlowMove = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (!hasFlagGlow || event.pointerType !== "mouse") return;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    event.currentTarget.style.setProperty("--copy-glow-x", `${event.clientX - bounds.left}px`);
+    event.currentTarget.style.setProperty("--copy-glow-y", `${event.clientY - bounds.top}px`);
   };
   return (
     <button
@@ -49,7 +62,9 @@ export function CopyText({
       className={`copytext ${className} ${copied ? "copied" : ""}`.trim()}
       title={t(titleKey)}
       aria-label={t(ariaLabelKey, { flag: value, text: value })}
+      data-flag-glow={hasFlagGlow ? "true" : undefined}
       onClick={onCopy}
+      onPointerMove={onGlowMove}
     >
       <span className="copytext-val">{children ?? value}</span>
       <span className="copytext-aff" aria-hidden="true">

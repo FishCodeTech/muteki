@@ -19,7 +19,7 @@
   <a href="https://github.com/FishCodeTech/muteki/issues"><img src="https://img.shields.io/github/issues/FishCodeTech/muteki" alt="Issues"></a>
   <a href="https://github.com/FishCodeTech/muteki/pulls"><img src="https://img.shields.io/github/issues-pr/FishCodeTech/muteki" alt="PRs"></a>
   <img src="https://img.shields.io/badge/NYU_CTF_Bench-200%2F200_solved-brightgreen" alt="Benchmark">
-  <img src="https://img.shields.io/badge/engines-Claude_Code_%7C_Codex_%7C_Cursor-orange" alt="Engines">
+  <img src="https://img.shields.io/badge/engines-9_CLIs-orange" alt="Engines: Claude, Codex, Cursor, Pi, OMP, Kimi, Grok, OpenCode, DeepSeek Harness">
 </p>
 
 <p align="center">
@@ -40,7 +40,7 @@
 
 This is a **truly open-source, multi-model CTF-solving AI agent swarm.** The goal is to live up to its very name — **無敵 · Project Muteki** ("Invincible").
 
-At its core, the project implements a scheduling scheme for AI agents that automatically and intelligently coordinates and controls each agent's context — like a swarm, each with its own division of labor, but all working toward the final goal. It currently supports commanding and dispatching only cursor, codex, and Claude Code. More kinds of CLI agents will be supported through continuous iteration.
+At its core, the project implements a scheduling scheme for AI agents that automatically and intelligently coordinates and controls each agent's context — like a swarm, each with its own division of labor, but all working toward the final goal. Current Worker engines are Claude, Codex, Cursor, Pi, OMP, Kimi, Grok, OpenCode, and DeepSeek Harness.
 
 Muteki exists to solve a specific problem: a single AI agent, when working toward a goal, very easily falls into a dead-loop at one spot — unable to pull itself out, unable to reach the final goal — and a single agent is extremely inefficient. I designed an architecture to solve this. It may not be the most perfect one, but I'll keep iterating and upgrading it.
 
@@ -88,13 +88,13 @@ You're welcome to use it and help build and upgrade it together. If you run into
 
 ## Architecture
 
-Muteki points a group of heterogeneous coding agents (Claude Code / Codex / cursor-agent) at the same challenge, collaborating on a single **shared blackboard**: facts one of them discovers are usable by all, dead ends one of them walks are never retried by the others, and a flag is accepted only when it **appears verbatim in real execution output**. The core isn't "swap in a smarter brain" — it's **heterogeneity + shared evidence + a provenance gate**.
+Muteki points a group of heterogeneous coding agents (Claude, Codex, Cursor, Pi, OMP, Kimi, Grok, OpenCode, DeepSeek Harness) at the same challenge, collaborating on a single **shared blackboard**: facts one of them discovers are usable by all, dead ends one of them walks are never retried by the others, and a flag is accepted only when it **appears verbatim in real execution output**. The core isn't "swap in a smarter brain" — it's **heterogeneity + shared evidence + a provenance gate**.
 
 So how does a worker hand its data to the platform, and how does it see its teammates' progress? **It all relies on the `muteki-blackboard` skill built into every worker** — this is the only data channel between a worker and the blackboard.
 
 For a detailed architecture explanation, see: [docs/工作原理.md](docs/工作原理.md)
 
-The project follows a "less is more" principle: it injects no security tools and no security knowledge, keeps the network open, and lets workers improvise freely — writing and installing their own dependencies and scripts.
+The project follows a "less is more" principle: it injects no security tools and no security knowledge, keeps the network open, and lets workers improvise freely — writing and installing their own dependencies and scripts. The composer **Web tools** toggle only closes the agent's WebSearch, WebFetch, and knowledge base; the worker shell can still reach the network.
 
 ![image-20260624164618066](./assets/image-20260624164618066.png)
 
@@ -112,10 +112,12 @@ The outer `①②③④` are the four phases of a single run; the inner `(1)~(5)
 | Phase | When it starts | What it does | Output |
 | ------------- | --------------------- | ------------------------------------- | --------------------- |
 | **① Prepare** | At the start of a run | Build the blackboard, stage attachments, health-check engines, install the skill, and (in container mode) start containers + reverse connection | Empty blackboard + available engines + channels wired up |
-| **② Recon Race** | Cold start only (skipped when re-examining an already-solved challenge) | Multiple engines single-shot the whole challenge in parallel for breadth-first recon | A flag (→ fast path) or a batch of facts |
-| **③ Coordination main loop** | When recon didn't solve it directly | `(1)~(5)` keeps looping, expanding the swarm as evidence grows | The blackboard keeps growing until there's enough for a flag |
+| **② Recon Race** | Optional race-scout round (skipped when re-examining an already-solved challenge) | Multiple engines each make one main call on the whole challenge in parallel | A flag (→ fast path) or a batch of facts |
+| **③ Coordination main loop** | Web default; also used after race-scout if no flag | `(1)~(5)` keeps looping, expanding the swarm as evidence grows | The blackboard keeps growing until there's enough for a flag |
 | **④ Wind-down** | Enough for a flag / operator stops / budget exhausted | Persist the winner, release claims, emit terminal events, clean up | RUN_FINISHED + a replayable blackboard |
 
+
+Web defaults to Coordinator and may run an optional race-scout round first. The TUI `--swarm` path uses a direct race. Callers that construct `Swarm` directly must select the intended mode explicitly.
 
 To keep Muteki from falling into a dead-loop while working a single task, we set up a review mechanism: while Muteki executes the task, it periodically runs a review that checks and verifies the facts already recorded, then corrects course promptly whenever needed.
 
@@ -133,6 +135,21 @@ To keep Muteki from falling into a dead-loop while working a single task, we set
 ```
 
 The `.env` at the repo root is loaded automatically (copy it from `.env.example`); variables exported in your shell always take precedence. Configuration is done through `MUTEKI_*` environment variables.
+
+### Built-in updates
+
+Application updates no longer require `git pull`. The first install creates a managed application directory and keeps the existing `.env` and `sessions` paths. Later upgrades switch versions atomically and retain one previous version for rollback.
+
+```bash
+./run.sh upgrade --check       # check the latest stable release
+./run.sh install               # download the latest GitHub Release into a managed install
+muteki upgrade                 # download, verify, install, and switch
+muteki upgrade v0.3.1          # install an exact release
+muteki rollback                # switch back to the previous installed release
+muteki version                 # show the active version and install mode
+```
+
+The same controls are available under **Settings → System update** in the Web command deck. For the versioned container deployment, use `muteki upgrade --compose` with [`docker-compose.release.yml`](docker-compose.release.yml). Private GitHub Releases need `MUTEKI_RELEASE_REPOSITORY` and `MUTEKI_GITHUB_TOKEN`; private GHCR images need `MUTEKI_IMAGE_REGISTRY` and `docker login ghcr.io`. Git tags and image tags use a leading `v`, for example `v0.3.0`.
 
 Recommended setting:
 
@@ -156,25 +173,31 @@ If you don't set it, the main impact is that the Reason planner won't autonomous
 - The **engine CLIs** you intend to use, available on your `PATH` (see below)
 - This project has so far only been tested on macOS, not on Windows — handle accordingly.
 
-### Proprietary engine CLIs
+### Worker engine CLIs
 
-Muteki **shells out to** the three closed-source agent CLIs below; install and authenticate whichever ones you want to use. Each has its own license and sends data back to its respective vendor:
+Muteki **shells out to** the Worker engine CLIs below; install and authenticate whichever ones you want to use. Vendor CLIs have their own licenses and may send data back to their vendors:
 
 
 | Engine | CLI | Vendor | Credential |
 | -------- | ------------------------------------ | --------- | ----------------------------------- |
-| `claude` | `@anthropic-ai/claude-code`          | Anthropic | OAuth token (`claude setup-token`)   |
-| `codex`  | `@openai/codex`                      | OpenAI    | `~/.codex/auth.json` (`codex login`) |
-| `cursor` | `cursor-agent` (`cursor.com/install`) | Cursor    | API key                             |
+| `claude` | `claude` (`@anthropic-ai/claude-code`) | Anthropic | OAuth token (`claude setup-token`) |
+| `codex`  | `codex` (`@openai/codex`) | OpenAI | `~/.codex/auth.json` (`codex login`) |
+| `cursor` | `cursor-agent` (`cursor.com/install`) | Cursor | API key |
+| `pi` | `pi` | Pi | API key / host login |
+| `omp` | `omp` | OMP | API key / host login |
+| `kimi` | `kimi` | Moonshot | Kimi Code login directory |
+| `grok` | `grok` | xAI | Grok login directory |
+| `opencode` | `opencode` | OpenCode | API key |
+| `dsh` | DeepSeek Harness worker | DeepSeek | API key |
 
 
-You need at least one of them to run. Beyond these three, you can also configure a **custom OpenAI-compatible endpoint** (`base_url` + key) in a worker profile — suitable for self-hosted or third-party models. Credentials are read from the macOS Keychain / environment and injected into the worker environment; see [Credentials](#credentials) and [SECURITY.md](SECURITY.md).
+You need at least one of them to run. You can also configure a **custom OpenAI-compatible endpoint** (`base_url` + key) in a worker profile — suitable for self-hosted or third-party models. Credentials are read from the macOS Keychain / environment and injected into the worker environment; see [Credentials](#credentials) and [SECURITY.md](SECURITY.md).
 
 ---
 
 ## Credentials
 
-The three agents' credentials are configured along with the web settings. In local mode you can skip configuring them — you just need your subscription to be usable when you run the CLI yourself.
+Worker credentials are configured in the web settings. In local mode you can skip configuring them — you just need your subscription to be usable when you run the CLI yourself.
 
 The remaining cases are generally for configuring remote or container environments, where container credential information is involved.
 
@@ -200,7 +223,7 @@ After saving, you can click "Save & test" at any time.
 - In **`container`** mode an account is **mandatory** — the host login is not mounted into the container; credentials are mounted into the container via command injection and file mounting.
 - In **`local`** mode, if no account is registered, the worker inherits the host CLI's existing login — though you can also configure it manually.
 
-The DeepSeek reasoning model (used by the coordinator, not a worker engine) is configured separately via `MUTEKI_DEEPSEEK_API_KEY` in `.env`.
+The DeepSeek reasoning model (used by the coordinator) is configured separately via `MUTEKI_DEEPSEEK_API_KEY` in `.env`. DeepSeek Harness (`dsh`) is a separate Worker engine and is configured in Worker settings.
 
 ![image-20260624184600517](./assets/image-20260624184600517.png)
 
@@ -235,8 +258,8 @@ MUTEKI_WORKER_IMAGE=ghcr.io/fishcodetech/muteki-worker-slim:latest ./run.sh web
 
 ```bash
 ./docker/worker/build.sh
-./docker/worker/build.sh ghcr.io/fishcodetech/muteki-worker 0.2.5
-./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim 0.2.5 amd64
+./docker/worker/build.sh ghcr.io/fishcodetech/muteki-worker v0.3.0
+./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim v0.3.0 amd64
 ```
 
 The full image is intentionally large (Kali headless + Ghidra + SageMath via conda + offline knowledge). Use the slim image only when you understand that workers may need to install more tooling during a run.
@@ -275,6 +298,13 @@ Topology:
 - **`ui`** — Next command deck; proxies `/api` → `web-api`.
 - **workers** are *not* a compose service — `web-api` `docker run`s one per run.
 
+The durable operator journal and SecretStore live under the coordinator-only
+`MUTEKI_COORDINATOR_CONTROL_ROOT` (compose defaults it to
+`$MUTEKI_HOST_DATA_ROOT/coordinator-control`). That path is never a worker mount and
+is never included in the worker-workspace ownership rewrite. A per-run sibling
+bootstrap directory (`.muteki_rcp` beside the workspace, mounted at
+`/run/muteki/control` in the worker) carries only the reverse-connect bootstrap token.
+
 ```bash
 # 1. Have the worker image available on the host daemon.
 #    Compose builds web-api/ui from this checkout, but it does NOT build workers.
@@ -312,7 +342,7 @@ The full env contract (and which vars compose sets for you automatically — don
 3. For the runtime environment, local is recommended; if you have special needs you can choose container, which will remind you to configure the relevant credentials — please configure those yourself. You can click "Test model" to check whether it works correctly; the test invokes the agent and asks the model to repeat "ok".
    ![image-20260624192439759](./assets/image-20260624192439759.png)
 4. Next, you can configure your workers in detail; configuring them as shown in the picture is recommended.
-   The starting worker count is the number for the race phase; it follows your engine count and runs all three agent engines simultaneously until the flag is solved or the challenge times out. It's used for quickly grabbing first blood and quickly solving easy challenges.
+   The starting worker count is the number for the race-scout round when that round is enabled; it follows your enabled engine count. It is used for quickly grabbing first blood and quickly solving easy challenges.
    The maximum worker count is recommended to stay around 5–6, because for web challenges too many workers could cause a DDoS-like situation.
    ![image-20260624192517250](./assets/image-20260624192517250.png)
 5. It's recommended to configure and test connectivity for the reasoning model here, for better planning and pacing of the challenge.
@@ -321,7 +351,7 @@ The full env contract (and which vars compose sets for you automatically — don
 7. The recommended prompting approach for solving a challenge is as follows:
    1. State the challenge description, category, name, website/URL, and flag format.
    2. The frontend also supports copy-paste and file upload, so you can directly upload attachment-based challenges.
-   3. The "network" toggle in the picture controls whether the agent's own web-search capability is enabled; it's on by default, and turning it off is for benchmark evaluation.
+   3. The "Web tools" toggle in the picture controls whether the agent's own WebSearch, WebFetch, and knowledge base are enabled; they are on by default. Turning them off is for benchmark evaluation. The worker shell can still use the network.
    4. Ignore the local/container button — it's tied to the settings feature and may be removed later. Under "Advanced" you can manually specify the flag format and a few simple settings, which can be ignored.
       ![image-20260624193322483](./assets/image-20260624193322483.png)
       ![image-20260624193441654](./assets/image-20260624193441654.png)
@@ -370,7 +400,7 @@ with per-challenge details in [eval_nyu/_reports/RESULTS.md](eval_nyu/_reports/R
 | -------------------- | --------------------------------------------------------------------------------- |
 | `muteki/`            | Core: `swarm/` (coordinator), `solver/` (CLI driver, gate, control plane), `models/`, `platform/`, `sandbox/` |
 | `apps/web/`          | FastAPI backend (`server.py`) + Next.js operator UI (`ui/`)                        |
-| `apps/tui/`          | Textual TUI command deck (unfinished)                                             |
+| `apps/tui/`          | Textual TUI command deck (`--swarm` uses a direct race; Coordinator/Settings integration is deferred) |
 | `cmd/runtime-agent/` | In-container Go supervisor (reverse-connects to the control plane)                 |
 | `docker/worker/`     | Worker image (Dockerfile, build scripts, tool-awareness map)                      |
 | `scripts/`           | eval / backtest harness                                                            |
@@ -425,7 +455,7 @@ A few key points:
 ## Testing
 
 ```bash
-uv run pytest                              # Python suite (live tests auto-skip when no key is set)
+uv run --extra dev python -m pytest -q     # Python suite, using the project interpreter
 go test -C cmd/runtime-agent ./...         # Go supervisor (the module lives under cmd/runtime-agent/)
 ( cd apps/web/ui && npx tsc --noEmit )     # UI type-check
 ```
@@ -434,12 +464,11 @@ go test -C cmd/runtime-agent ./...         # Go supervisor (the module lives und
 
 ## Roadmap / TODO
 
-- [ ] Add authentication logic
-- [ ] Fully optimize and test the container mode
+- [ ] Continue container-mode hardening
 - [ ] Keep iterating and improving the web UI experience
-- [ ] Support more agent worker types, e.g. pi, zai, opencode, etc.
-- [ ] TUI mode
-- [ ] Fully automatic crawling of CTF-platform challenges, with auto-solving, auto-submission, and auto report generation
+- [ ] TUI integration with the current Coordinator and Worker Settings (deferred)
+- [ ] Additional worker engines such as ZAI (deferred)
+- [ ] Fully automatic crawling of CTF-platform challenges, with auto-solving, auto-submission, and auto report generation (deferred)
 
 ---
 

@@ -78,42 +78,17 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
   if (phase === "open") return <>{children}</>;
 
   return (
-    <div
-      style={{
-        position: "fixed",
-        inset: 0,
-        display: "grid",
-        placeItems: "center",
-        background: "var(--bg)",
-        zIndex: 9999,
-      }}
-    >
+    <div className="login-gate">
       {phase === "checking" ? (
-        <div style={{ color: "var(--muted)", fontSize: 14 }}>{t("login.checking")}</div>
+        <div className="login-gate-checking">{t("login.checking")}</div>
       ) : (
-        <form
-          onSubmit={submit}
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            gap: 14,
-            width: 320,
-            padding: 28,
-            background: "var(--panel)",
-            border: "1px solid var(--line)",
-            borderRadius: 14,
-            boxShadow: "0 10px 40px rgba(8,12,20,0.12)",
-          }}
-        >
-          <div style={{ textAlign: "center" }}>
-            <div style={{ fontSize: 17, fontWeight: 650, color: "var(--bright)" }}>
-              Project Muteki
-            </div>
-            <div style={{ marginTop: 4, fontSize: 13, color: "var(--muted)" }}>
-              {t("login.subtitle")}
-            </div>
+        <form className="login-gate-card" onSubmit={submit}>
+          <div className="login-gate-copy">
+            <div className="login-gate-title">Project Muteki</div>
+            <div className="login-gate-sub">{t("login.subtitle")}</div>
           </div>
           <input
+            className={`login-gate-input ${error ? "error" : ""}`}
             type="password"
             autoFocus
             autoComplete="current-password"
@@ -121,34 +96,9 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
             onChange={(e) => setPassword(e.target.value)}
             placeholder={t("login.placeholder")}
             disabled={busy}
-            style={{
-              padding: "10px 12px",
-              fontSize: 14,
-              color: "var(--text)",
-              background: "var(--panel2)",
-              border: `1px solid ${error ? "var(--red)" : "var(--line2)"}`,
-              borderRadius: 9,
-              outline: "none",
-            }}
           />
-          {error ? (
-            <div style={{ fontSize: 12.5, color: "var(--red)" }}>{error}</div>
-          ) : null}
-          <button
-            type="submit"
-            disabled={busy}
-            style={{
-              padding: "10px 12px",
-              fontSize: 14,
-              fontWeight: 600,
-              color: "#fff",
-              background: "var(--accent)",
-              border: "none",
-              borderRadius: 9,
-              cursor: busy ? "default" : "pointer",
-              opacity: busy ? 0.7 : 1,
-            }}
-          >
+          {error ? <div className="login-gate-error">{error}</div> : null}
+          <button className="login-gate-submit" type="submit" disabled={busy}>
             {busy ? t("login.checking") : t("login.submit")}
           </button>
         </form>

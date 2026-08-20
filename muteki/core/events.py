@@ -9,6 +9,7 @@ producers don't hand-build dicts (which drift and break the frontend).
 
 from __future__ import annotations
 
+import hashlib
 import time
 from enum import Enum
 from typing import Any, Optional
@@ -17,11 +18,16 @@ from pydantic import BaseModel, Field
 
 
 class EventType(str, Enum):
+    RUN_PREPARING = "run.preparing"
     RUN_STARTED = "run.started"
     RUN_TITLED = "run.titled"  # auto-generated conversation title landed (rail label)
     RUN_FINISHED = "run.finished"
     RUN_REOPENED = "run.reopened"  # a terminal run was re-opened (continue solving
     #   or flag marked false-positive) — rail flips solved/finished→running
+    FLAG_ACCEPTED = "flag.accepted"  # CAS/outbox-verified Protocol 2 publication;
+    #   accepted-only visibility does not imply solved, finished, or clean closure
+    PROJECTION_INCOMPLETE = "projection.incomplete"  # non-terminal, redacted startup
+    #   reconciliation diagnostic; never carries candidate/CAS/credential material
     WORKER_STATUS = "worker.status"  # a solver worker came online/offline
     WORKER_FINISHED = "worker.finished"  # ONE swarm sub-worker ended (worker-level,
     #   NOT the run). In coordinator mode many workers come and go while the run keeps
@@ -52,6 +58,7 @@ class EventType(str, Enum):
     GUIDANCE_INJECTED = "coordinator.guidance"
     HITL_REQUEST = "hitl.request"  # agent asks a human to decide
     HITL_RESPONSE = "hitl.response"  # human issues a command / interrupt
+    CONTROL_COMMAND = "control.command"  # durable command lifecycle / observed effect
     HITL_TRANSLATED = "hitl.translated"  # a zh translation of a worker's hand-raise
     GRAPH_COMPACTED = "graph.compacted"  # H: a long-run graph compaction epoch landed
     WORKER_LIFECYCLE = "worker.lifecycle"  # I: granular worker lifecycle (spawned/
@@ -122,10 +129,16 @@ def cost_payload(scope: str, usd: float, tokens: int, **extra: Any) -> dict[str,
     return {"scope": scope, "usd": round(usd, 6), "tokens": tokens, **extra}
 
 
+_WORKER_IDENTITY_FIELDS = (
+    "profile_id", "profile_label", "model", "account_id",
+    "endpoint_host", "connection", "provider",
+)
+
+
 def worker_status_payload(
     online: bool, *, status: str = "", reason: str = "", engine: str = "",
     session: str = "", runtime: Optional[dict[str, Any]] = None,
-    worker_role: str = "",
+    worker_role: str = "", identity: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Live worker presence for the deck's interpreter cluster.
 
@@ -136,6 +149,9 @@ def worker_status_payload(
     `session` is the worker's live CLI session id (claude `-r <id>` / codex
     `exec resume <id>`), shown on the lane so an operator can manually attach to a
     running worker. Empty until the engine assigns one.
+
+    `identity` is the operator-facing profile snapshot (label, model, account,
+    endpoint host). It never includes secrets or a full credentialed URL.
     """
     payload = {"online": online, "status": status, "reason": reason,
                "engine": engine, "session": session}
@@ -143,6 +159,11 @@ def worker_status_payload(
         payload["worker_role"] = worker_role
     if runtime:
         payload["runtime"] = runtime
+    if identity:
+        for key in _WORKER_IDENTITY_FIELDS:
+            value = identity.get(key)
+            if value:
+                payload[key] = str(value)
     return payload
 
 
@@ -151,14 +172,65 @@ def hitl_response_payload(target: str, action: str, **fields: Any) -> dict[str, 
     return {"target": target, "action": action, **fields}
 
 
+def control_command_payload(
+    command_id: str,
+    action: str,
+    *,
+    target: str = "global",
+    status: str = "received",
+    request_id: Optional[str] = None,
+    effect: Optional[dict[str, Any]] = None,
+    detail: str = "",
+    **fields: Any,
+) -> dict[str, Any]:
+    """Lifecycle projection for one operator control command.
+
+    ``HITL_RESPONSE`` remains the immutable echo of what the operator submitted;
+    this payload reports what the control plane can actually prove happened.  In
+    particular, frontends must not infer an effect from ``received``/``routed``.
+    Only ``effect_observed`` is allowed to change displayed runtime state.
+    """
+    payload: dict[str, Any] = dict(fields)
+    payload.update({
+        "command_id": str(command_id),
+        "action": str(action),
+        "target": str(target or "global"),
+        "status": str(status or "received"),
+    })
+    if request_id:
+        payload["request_id"] = str(request_id)
+    if effect is not None:
+        payload["effect"] = dict(effect)
+    if detail:
+        payload["detail"] = str(detail)
+    return payload
+
+
+def hitl_request_id(worker: str, need: str, need_kind: str = "external_blocker") -> str:
+    """Return the stable id shared by the emitted card and graph projection.
+
+    The graph already deduplicates hand-raises on this semantic identity.  Giving
+    the event the same id lets an answer resolve exactly one card after SSE replay,
+    instead of relying on array position or clearing every outstanding decision.
+    """
+    digest = hashlib.sha1(
+        f"{worker}:{need}:{need_kind}".encode("utf-8", "ignore")
+    ).hexdigest()[:10]
+    return f"H-{digest}"
+
+
 def hitl_request_payload(worker: str, need: str, *, kind: str = "need_input",
+                         request_id: Optional[str] = None,
                          **fields: Any) -> dict[str, Any]:
     """A worker RAISES ITS HAND: it needs something only the operator can supply
     (`kind="need_input"`: a VPS/credential/tool) or the environment is unusable
     (`kind="env_down"`: target unreachable/expired). `need` is the concrete ask.
     The deck renders this so the operator knows what to provide; the coordinator
     pauses re-spawning that direction until an operator command arrives."""
-    return {"worker": worker, "need": need, "kind": kind, **fields}
+    need_kind = str(fields.get("need_kind") or "external_blocker")
+    rid = str(request_id or hitl_request_id(worker, need, need_kind))
+    return {"request_id": rid, "id": rid, "worker": worker, "need": need,
+            "kind": kind, **fields}
 
 
 def solve_graph_delta_payload(kind: str, **fields: Any) -> dict[str, Any]:
