@@ -27,6 +27,7 @@
 </p>
 
 
+<p align="center">
 <a href="https://www.star-history.com/?type=date&repos=fishcodetech%2Fmuteki">
  <picture>
    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=fishcodetech/muteki&type=date&theme=dark&legend=top-left&sealed_token=vc5ui3lb58WYq6M_OxJxFxhljtWwz7lvILAOd7RrD3vDJqvJq4jyPgfCQAq59gjzAmnYMdjLpJ80k_2PpNe-_nYL1Jf5RxCVVbHHiqrMdmCW0UHU43ZYMg" />
@@ -34,6 +35,7 @@
    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=fishcodetech/muteki&type=date&legend=top-left&sealed_token=vc5ui3lb58WYq6M_OxJxFxhljtWwz7lvILAOd7RrD3vDJqvJq4jyPgfCQAq59gjzAmnYMdjLpJ80k_2PpNe-_nYL1Jf5RxCVVbHHiqrMdmCW0UHU43ZYMg" />
  </picture>
 </a>
+</p>
 
 ---
 
