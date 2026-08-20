@@ -97,7 +97,7 @@ def _image_registry(images: dict[str, str] | None = None) -> str:
 
 
 def _github_release_asset_url(page_url: str) -> str | None:
-    """把 GitHub Release 浏览器下载地址换成 API asset URL，避免私有仓跳转丢鉴权头。"""
+    """把 GitHub Release 浏览器下载地址换成 API asset URL，避免跳转时丢掉鉴权头。"""
     parsed = urllib.parse.urlparse(page_url)
     if parsed.netloc.lower() not in {"github.com", "www.github.com"}:
         return None
@@ -275,7 +275,7 @@ class UpdateManager:
             with _urlopen(url) as response:
                 raw = response.read(1024 * 1024 + 1)
         except (OSError, urllib.error.URLError) as exc:
-            hint = "。私有仓库需要设置 MUTEKI_GITHUB_TOKEN" if "github.com" in url and not _github_token() else ""
+            hint = "。非公开 Release 需要设置 MUTEKI_GITHUB_TOKEN" if "github.com" in url and not _github_token() else ""
             raise UpdateError(f"无法读取发布清单：{exc}{hint}") from exc
         if len(raw) > 1024 * 1024:
             raise UpdateError("发布清单超过 1 MiB")

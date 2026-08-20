@@ -72,8 +72,8 @@ README、ROADMAP 和历史会话记录只提供背景信息。
 8. F01–F11、ChainForce、PEX、DualRush、ReapClose、RoleSwarm、HypoLedger、Phased
    都是实验 / 评测臂。未经过正式讨论并写入产品默认之前，不得把它们接到 Web / TUI /
    渗透默认启动，不得改 `_resolve_swarm_class` 的空 spec 返回值，不得在
-   `coordinator_loop` 或默认 `CliSolver` 路径里无条件调用这些包。细则见
-   `docs/TODO_EXPERIMENTAL_FRAMEWORKS.md`。
+   `coordinator_loop` 或默认 `CliSolver` 路径里无条件调用这些包。约束见下文
+   「实验框架」。
 
 ## 主要路径
 
@@ -127,9 +127,8 @@ uv run --extra dev python -m pytest -q <相关测试路径>
 - 评测脚本若要跑实验臂，必须在请求或命令行里写明完整
   `module.path:ClassName`，并在评测记录里注明。不得把这种指定写进产品默认。
 
-历史原因：PR #6 的 research 提交把 Web 默认改成了 `SwarmChainForce`
-（评测基线臂）。该默认已改回 `Swarm`。剩余挂钩见
-`docs/TODO_EXPERIMENTAL_FRAMEWORKS.md`。
+历史原因：一次 research 提交曾把 Web 默认改成 `SwarmChainForce`
+（评测基线臂）。该默认已改回 `Swarm`。
 
 ## Blackboard
 

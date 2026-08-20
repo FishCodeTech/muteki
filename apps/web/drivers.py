@@ -289,7 +289,7 @@ def _resolve_swarm_class(spec: Any) -> type:
     Empty / omitted spec must stay on that class. Experimental arms
     (ChainForce, PEX, DualRush, ReapClose, F01–F11) load only when a
     caller writes an explicit allowlisted spec. Web UI does not send
-    this field. See docs/TODO_EXPERIMENTAL_FRAMEWORKS.md.
+    this field. See AGENTS.md.
     """
     from muteki.swarm.swarm import Swarm
 
