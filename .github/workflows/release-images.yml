@@ -10,9 +10,9 @@ name: release-images
 #
 # Auth: the built-in GITHUB_TOKEN with packages:write — no PAT, no Docker Hub.
 # Triggers:
-#   - push v* tag        → build every artifact, then create the GitHub Release
-#   - workflow_dispatch  → manual run for testing the pipeline without creating a GitHub Release
-#                          (optionally skip the slow Kali worker via the input)
+#   - push v* tag        → build every artifact, create the GitHub Release, and move :latest
+#   - workflow_dispatch  → pipeline test; tags with the input or branch name; no GitHub Release
+#                          and does not move :latest (optionally skip the Kali worker)
 on:
   push:
     tags: ["v*"]
@@ -23,10 +23,9 @@ on:
         type: boolean
         default: true
       tag:
-        description: "SemVer tag to build, for example v0.3.0"
+        description: "Leave empty to tag images with the branch or git tag name. Do not enter an existing release tag unless you intend to overwrite that image."
         type: string
-        required: true
-        default: "v0.3.0"
+        required: false
 
 # 发布任务需要创建 Release 并上传应用包；镜像任务写入 GHCR。
 permissions:
@@ -70,15 +69,27 @@ jobs:
 
       - name: Resolve image tag
         id: tag
+        env:
+          IMAGE_NAME: muteki-web
         run: |
           TAG="${{ github.event.inputs.tag }}"
           [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
-          # strip a leading refs/tags/ if present and fall back to a sane default
           TAG="${TAG#refs/tags/}"
           [ -z "$TAG" ] && TAG="latest"
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          {
+            echo "${REGISTRY}/${OWNER}/${IMAGE_NAME}:${TAG}"
+            if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+              echo "${REGISTRY}/${OWNER}/${IMAGE_NAME}:latest"
+            fi
+          } | tee /tmp/image-tags.txt
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<EOF"
+            cat /tmp/image-tags.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
           echo "Resolved image namespace: $OWNER"
           echo "Resolved tag: $TAG"
 
@@ -100,9 +111,7 @@ jobs:
             IMAGE_VERSION=${{ steps.tag.outputs.tag }}
             IMAGE_REVISION=${{ github.sha }}
           push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-web:${{ steps.tag.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-web:latest
+          tags: ${{ steps.tag.outputs.tags }}
           cache-from: type=gha,scope=muteki-web
           cache-to: type=gha,scope=muteki-web,mode=max
 
@@ -113,14 +122,27 @@ jobs:
 
       - name: Resolve image tag
         id: tag
+        env:
+          IMAGE_NAME: muteki-ui
         run: |
           TAG="${{ github.event.inputs.tag }}"
           [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
           TAG="${TAG#refs/tags/}"
           [ -z "$TAG" ] && TAG="latest"
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          {
+            echo "${REGISTRY}/${OWNER}/${IMAGE_NAME}:${TAG}"
+            if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+              echo "${REGISTRY}/${OWNER}/${IMAGE_NAME}:latest"
+            fi
+          } | tee /tmp/image-tags.txt
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<EOF"
+            cat /tmp/image-tags.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -144,9 +166,7 @@ jobs:
             MUTEKI_BACKEND=http://web-api:8000
             IMAGE_VERSION=${{ steps.tag.outputs.tag }}
             IMAGE_REVISION=${{ github.sha }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-ui:${{ steps.tag.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-ui:latest
+          tags: ${{ steps.tag.outputs.tags }}
           cache-from: type=gha,scope=muteki-ui
           cache-to: type=gha,scope=muteki-ui,mode=max
 
@@ -158,14 +178,27 @@ jobs:
 
       - name: Resolve image tag
         id: tag
+        env:
+          IMAGE_NAME: muteki-worker-slim
         run: |
           TAG="${{ github.event.inputs.tag }}"
           [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
           TAG="${TAG#refs/tags/}"
           [ -z "$TAG" ] && TAG="latest"
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          {
+            echo "${REGISTRY}/${OWNER}/${IMAGE_NAME}:${TAG}"
+            if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+              echo "${REGISTRY}/${OWNER}/${IMAGE_NAME}:latest"
+            fi
+          } | tee /tmp/image-tags.txt
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<EOF"
+            cat /tmp/image-tags.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v5
         with:
@@ -212,9 +245,7 @@ jobs:
           push: true
           build-args: |
             IMAGE_VERSION=${{ steps.tag.outputs.tag }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker-slim:${{ steps.tag.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker-slim:latest
+          tags: ${{ steps.tag.outputs.tags }}
           cache-from: type=gha,scope=muteki-worker-slim
           cache-to: type=gha,scope=muteki-worker-slim,mode=max
 
@@ -238,14 +269,27 @@ jobs:
 
       - name: Resolve image tag
         id: tag
+        env:
+          IMAGE_NAME: muteki-worker
         run: |
           TAG="${{ github.event.inputs.tag }}"
           [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
           TAG="${TAG#refs/tags/}"
           [ -z "$TAG" ] && TAG="latest"
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          {
+            echo "${REGISTRY}/${OWNER}/${IMAGE_NAME}:${TAG}"
+            if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+              echo "${REGISTRY}/${OWNER}/${IMAGE_NAME}:latest"
+            fi
+          } | tee /tmp/image-tags.txt
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<EOF"
+            cat /tmp/image-tags.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v5
         with:
@@ -291,9 +335,7 @@ jobs:
           push: true
           build-args: |
             IMAGE_VERSION=${{ steps.tag.outputs.tag }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker:${{ steps.tag.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker:latest
+          tags: ${{ steps.tag.outputs.tags }}
           # GHA cache has a 10G/repo cap; the Kali image alone can exceed it, so use a
           # registry-side cache image instead (does not count against the GHA cache).
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker:buildcache
