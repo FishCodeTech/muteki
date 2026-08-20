@@ -404,7 +404,7 @@ with per-challenge details in [eval_nyu/_reports/RESULTS.md](eval_nyu/_reports/R
 | `cmd/runtime-agent/` | In-container Go supervisor (reverse-connects to the control plane)                 |
 | `docker/worker/`     | Worker image (Dockerfile, build scripts, tool-awareness map)                      |
 | `scripts/`           | eval / backtest harness                                                            |
-| `docs/`              | Operator docs (`工作原理.md`) and worker catalog notes |
+| `docs/`              | Operator docs (`工作原理.md`) |
 
 
 ### Working directory of a single runner (challenge)

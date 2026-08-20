@@ -405,7 +405,7 @@ Muteki 在 **NYU CTF Bench** `test` 集(CSAW 2017–2023,共 200 题)上做了�
 | `cmd/runtime-agent/` | 容器内的 Go supervisor(反向连接控制器)                                                       |
 | `docker/worker/`     | worker 镜像(Dockerfile、构建脚本、工具感知地图)                                                 |
 | `scripts/`           | eval / 回测 harness                                                                 |
-| `docs/`              | 操作说明（`工作原理.md`）和 Worker 模型目录 |
+| `docs/`              | 操作说明（`工作原理.md`） |
 
 
 ### 单个 runner（题目）的工作目录
