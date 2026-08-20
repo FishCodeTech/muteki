@@ -149,7 +149,7 @@ muteki rollback                # 回滚到上一已安装版本
 muteki version                 # 查看当前版本和安装形态
 ```
 
-Web 控制台的“设置 → 系统更新”提供相同操作。版本化容器部署使用 `muteki upgrade --compose` 和 [`docker-compose.release.yml`](docker-compose.release.yml)。私有 GitHub Release 需要 `MUTEKI_RELEASE_REPOSITORY` 和 `MUTEKI_GITHUB_TOKEN`；私有 GHCR 镜像需要 `MUTEKI_IMAGE_REGISTRY` 并先执行 `docker login ghcr.io`。Git 标签和镜像标签带 `v`，例如 `v0.3.0`。
+Web 控制台的“设置 → 系统更新”提供相同操作。发布包和镜像默认来自本仓库和 `ghcr.io/fishcodetech`。版本化容器部署使用 `muteki upgrade --compose` 和 [`docker-compose.release.yml`](docker-compose.release.yml)。若自行发布 tag 和镜像，设置 `MUTEKI_RELEASE_REPOSITORY` 和 `MUTEKI_IMAGE_REGISTRY`；非公开 GitHub Release 还需要 `MUTEKI_GITHUB_TOKEN`。Git 标签和镜像标签带 `v`，例如 `v0.3.0`。
 
 推荐设置项：
 
@@ -405,7 +405,7 @@ Muteki 在 **NYU CTF Bench** `test` 集(CSAW 2017–2023,共 200 题)上做了�
 | `cmd/runtime-agent/` | 容器内的 Go supervisor(反向连接控制器)                                                       |
 | `docker/worker/`     | worker 镜像(Dockerfile、构建脚本、工具感知地图)                                                 |
 | `scripts/`           | eval / 回测 harness                                                                 |
-| `docs/`              | eval 报告 + 开源就绪审查;设计文档在 `docs/internal-design/`                                    |
+| `docs/`              | 操作说明（`工作原理.md`）和 Worker 模型目录 |
 
 
 ### 单个 runner（题目）的工作目录

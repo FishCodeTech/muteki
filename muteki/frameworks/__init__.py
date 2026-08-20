@@ -3,8 +3,7 @@
 These packages are research / eval arms. They are not the product
 Coordinator. Web, TUI, and pentest default start must not construct
 them. Load only with an explicit ``swarm_class`` / ``--swarm-class``
-after a formal access review. See docs/TODO_EXPERIMENTAL_FRAMEWORKS.md
-and AGENTS.md.
+after a formal access review. See AGENTS.md.
 """
 
 from __future__ import annotations

@@ -149,7 +149,7 @@ muteki rollback                # switch back to the previous installed release
 muteki version                 # show the active version and install mode
 ```
 
-The same controls are available under **Settings → System update** in the Web command deck. For the versioned container deployment, use `muteki upgrade --compose` with [`docker-compose.release.yml`](docker-compose.release.yml). Private GitHub Releases need `MUTEKI_RELEASE_REPOSITORY` and `MUTEKI_GITHUB_TOKEN`; private GHCR images need `MUTEKI_IMAGE_REGISTRY` and `docker login ghcr.io`. Git tags and image tags use a leading `v`, for example `v0.3.0`.
+The same controls are available under **Settings → System update** in the Web command deck. Releases and images default to this repository and `ghcr.io/fishcodetech`. For the versioned container deployment, use `muteki upgrade --compose` with [`docker-compose.release.yml`](docker-compose.release.yml). If you publish your own tags and images, set `MUTEKI_RELEASE_REPOSITORY` and `MUTEKI_IMAGE_REGISTRY`; non-public GitHub Releases also need `MUTEKI_GITHUB_TOKEN`. Git tags and image tags use a leading `v`, for example `v0.3.0`.
 
 Recommended setting:
 
@@ -404,7 +404,7 @@ with per-challenge details in [eval_nyu/_reports/RESULTS.md](eval_nyu/_reports/R
 | `cmd/runtime-agent/` | In-container Go supervisor (reverse-connects to the control plane)                 |
 | `docker/worker/`     | Worker image (Dockerfile, build scripts, tool-awareness map)                      |
 | `scripts/`           | eval / backtest harness                                                            |
-| `docs/`              | eval reports + open-source-readiness review; design docs in `docs/internal-design/` |
+| `docs/`              | Operator docs (`工作原理.md`) and worker catalog notes |
 
 
 ### Working directory of a single runner (challenge)

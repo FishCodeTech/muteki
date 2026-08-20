@@ -11,7 +11,7 @@ name: release-images
 # Auth: the built-in GITHUB_TOKEN with packages:write — no PAT, no Docker Hub.
 # Triggers:
 #   - push v* tag        → build every artifact, then create the GitHub Release
-#   - workflow_dispatch  → manual run for testing the pipeline inside the private repo
+#   - workflow_dispatch  → manual run for testing the pipeline without creating a GitHub Release
 #                          (optionally skip the slow Kali worker via the input)
 on:
   push:

@@ -5,19 +5,16 @@
 > current web deck, so it was archived. For the authoritative "what this is" and
 > "how to run it", see [`README.md`](README.md) and [`AGENTS.md`](AGENTS.md).
 
-> **Current execution scope (2026-08-17):** the operator-approved near-term TODO,
-> deferred items, and recommended order are recorded in
-> [`docs/current_iteration_todo.md`](docs/current_iteration_todo.md). Cognitive
-> studies, new swarm-core mechanisms, managed OAuth, strict shell-level offline
-> isolation, credential-projection narrowing, TUI/platform automation, and other
-> public feature expansion are currently deferred. The sections below retain the
-> architecture history and long-term evidence requirements; they do not by
-> themselves authorize implementation.
+> **Current execution scope:** the public near-term list is in the README
+> Roadmap / TODO section. Cognitive studies, new swarm-core mechanisms, managed
+> OAuth, strict shell-level offline isolation, credential-projection narrowing,
+> TUI/platform automation, and other public feature expansion are currently
+> deferred. The sections below retain the architecture history and long-term
+> evidence requirements; they do not by themselves authorize implementation.
 
 ## Active architecture upgrade (foundation complete; cognitive research loop default-off)
 
-The durable objective and selection rule for future work is
-[`MUTEKI_NORTH_STAR.md`](MUTEKI_NORTH_STAR.md).  The goal is measurable cognition:
+The durable objective for future work is measurable cognition:
 better thinking, search, learning, heterogeneous collaboration, local recovery and
 hard long-chain reliability under the same complete budget.
 
@@ -156,9 +153,8 @@ are not on the active route.
 
 ## Recorded product backlog and disposition
 
-The detailed current status is maintained in
-[`docs/current_iteration_todo.md`](docs/current_iteration_todo.md). The previous
-product backlog is retained here with its current disposition:
+The previous product backlog is retained here with its current disposition.
+The public near-term list is in the README Roadmap / TODO section.
 
 1. **Candidate, requires product-priority confirmation — Pentest full engagement.**
    `mode="pentest"` shares the swarm,
@@ -178,7 +174,7 @@ product backlog is retained here with its current disposition:
 
 Authentication and nine-engine support are implemented. The remaining public
 feature expansion, including TUI integration and generic CTF-platform automation,
-is currently deferred; see the current iteration document for the exact scope.
+is currently deferred; see the README Roadmap / TODO section for the public list.
 
 ## Invariants (never traded away)
 
