@@ -26,16 +26,15 @@
   <strong>English</strong> · <a href="README_CN.md">简体中文</a>
 </p>
 
-[<p align="center">
-  <a href="https://www.star-history.com/#fishcodetech/muteki&amp;Date">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date&amp;theme=dark">
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date">
-      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date">
-    </picture>
-  </a>
-</p>
-](https://www.star-history.com/?type=date&repos=fishcodetech%2Fmuteki)
+
+<a href="https://www.star-history.com/?type=date&repos=fishcodetech%2Fmuteki">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=fishcodetech/muteki&type=date&theme=dark&legend=top-left&sealed_token=vc5ui3lb58WYq6M_OxJxFxhljtWwz7lvILAOd7RrD3vDJqvJq4jyPgfCQAq59gjzAmnYMdjLpJ80k_2PpNe-_nYL1Jf5RxCVVbHHiqrMdmCW0UHU43ZYMg" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=fishcodetech/muteki&type=date&legend=top-left&sealed_token=vc5ui3lb58WYq6M_OxJxFxhljtWwz7lvILAOd7RrD3vDJqvJq4jyPgfCQAq59gjzAmnYMdjLpJ80k_2PpNe-_nYL1Jf5RxCVVbHHiqrMdmCW0UHU43ZYMg" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=fishcodetech/muteki&type=date&legend=top-left&sealed_token=vc5ui3lb58WYq6M_OxJxFxhljtWwz7lvILAOd7RrD3vDJqvJq4jyPgfCQAq59gjzAmnYMdjLpJ80k_2PpNe-_nYL1Jf5RxCVVbHHiqrMdmCW0UHU43ZYMg" />
+ </picture>
+</a>
+
 ---
 
 This is a **truly open-source, multi-model CTF-solving AI agent swarm.** The goal is to live up to its very name — **無敵 · Project Muteki** ("Invincible").
