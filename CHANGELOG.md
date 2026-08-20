@@ -2,6 +2,16 @@
 
 All notable public release changes are tracked here.
 
+## 0.3.1 - 2026-08-20
+
+### Fixed
+
+- The sidebar folder menu item **Delete folder** could not be clicked. The open menu overlapped the next folder row, and that later row received the click.
+
+### Changed
+
+- Package versions are `0.3.1`. Git tags and GHCR image tags keep the leading `v`, for example `v0.3.1`.
+
 ## 0.3.0 - 2026-08-17
 
 ### Added
