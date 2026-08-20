@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 from pathlib import Path
 
 import pytest
@@ -140,9 +142,7 @@ def test_credential_account_store_masks_and_replaces_material(tmp_path):
         account_id="shared-main", engine="claude", secret="claude-secret")
     assert claude["account_id"] == "shared-main"
     assert claude["engine"] == "claude"
-    # Secrets are now ECHOED (operator opted into edit-in-place); the token is
-    # surfaced as details.secret_value so the UI can show/edit it.
-    assert claude["details"]["secret_value"] == "claude-secret"
+    assert "secret_value" not in claude["details"]
 
     cursor = store.upsert_secret(
         account_id="shared-main", engine="cursor", secret="cursor-secret")
@@ -164,8 +164,7 @@ def test_credential_account_store_validates_codex_json(tmp_path):
     assert acct["details"]["codex_home"] is True
     assert acct["details"]["mutable_auth_home"] is True
     assert "lease" not in acct["details"]
-    # codex echoes the auth.json contents so the UI can show/edit it
-    assert '"token":"x"' in acct["details"]["secret_value"]
+    assert "secret_value" not in acct["details"]
 
 
 def test_invalid_update_does_not_destroy_existing_account(tmp_path):
@@ -188,7 +187,7 @@ def test_custom_endpoint_account_maps_to_engine_specific_env(tmp_path):
         base_url="https://api.deepseek.example/v1",
     )
     assert acct["engine"] == "api"
-    assert acct["details"]["secret_value"] == "deepseek-key"   # echoed for edit
+    assert "secret_value" not in acct["details"]
 
     codex = runtime_env_for_engine(
         "codex", account_root=root, account_id="deepseek-main", container=True)
@@ -229,10 +228,8 @@ def test_custom_endpoint_records_target_engine_for_binding(tmp_path):
     assert env["ANTHROPIC_API_KEY"] == "endpoint-key"
 
 
-def test_custom_endpoint_echoes_base_url_and_secret_for_editing(tmp_path):
-    """The panel echoes BOTH the base_url and the API key so the operator can see
-    and edit them in place (secrets are deliberately surfaced — see
-    _read_secret_value's security note). inspect() and list() agree."""
+def test_custom_endpoint_exposes_base_url_without_secret(tmp_path):
+    """Public account metadata retains Base URL and omits the stored key."""
     root = account_store_root(tmp_path)
     store = CredentialAccountStore(root)
     acct = store.upsert_secret(
@@ -241,12 +238,12 @@ def test_custom_endpoint_echoes_base_url_and_secret_for_editing(tmp_path):
 
     assert acct["details"]["base_url_value"] == "https://api.deepseek.com/v1"
     assert acct["details"]["base_url"] is True
-    assert acct["details"]["secret_value"] == "sk-super-secret"
-    # inspect()/list() agree (list() echoes secrets for every account)
+    assert "secret_value" not in acct["details"]
+    # Internal runtime inspection still resolves the key; public listing does not.
     assert store.inspect("deepseek-main").details["secret_value"] == "sk-super-secret"
     listed = [a for a in store.list() if a["account_id"] == "deepseek-main"][0]
     assert listed["details"]["base_url_value"] == "https://api.deepseek.com/v1"
-    assert listed["details"]["secret_value"] == "sk-super-secret"
+    assert "secret_value" not in listed["details"]
 
 
 def test_custom_endpoint_without_base_url_reports_empty_value(tmp_path):
@@ -258,17 +255,16 @@ def test_custom_endpoint_without_base_url_reports_empty_value(tmp_path):
     assert acct["details"]["base_url"] is False
 
 
-def test_secret_value_echoed_for_claude_and_cursor(tmp_path):
-    """Subscription token & cursor key are echoed as details.secret_value so the
-    UI can show/edit them. An empty/absent account exposes no secret_value."""
+def test_secret_value_is_omitted_for_claude_and_cursor(tmp_path):
+    """Public account metadata never returns stored credential material."""
     root = account_store_root(tmp_path)
     store = CredentialAccountStore(root)
 
     claude = store.upsert_secret(account_id="claude-main", engine="claude", secret="oauth-tok")
-    assert claude["details"]["secret_value"] == "oauth-tok"
+    assert "secret_value" not in claude["details"]
 
     cursor = store.upsert_secret(account_id="cursor-main", engine="cursor", secret="cur-key")
-    assert cursor["details"]["secret_value"] == "cur-key"
+    assert "secret_value" not in cursor["details"]
 
     # an empty account (no material) has no secret_value key at all
     (root / "ghost").mkdir()
@@ -402,51 +398,6 @@ def test_local_runtime_does_not_override_host_home(tmp_path):
     assert "HOME" not in env
 
 
-def test_swarm_worker_profile_selects_credential_account_and_runtime(tmp_path, monkeypatch):
-    root = tmp_path / "_secrets" / "accounts"
-    acct = root / "claude-team"
-    acct.mkdir(parents=True)
-    (acct / "CLAUDE_CODE_OAUTH_TOKEN").write_text("token\n")
-    ch = Challenge(
-        id="profile-runtime",
-        name="profile-runtime",
-        category="misc",
-        description="profile runtime",
-        flag_format="flag{...}",
-    )
-    swarm = Swarm(
-        ch, [], llm=None, sandbox=None,
-        worker_root=tmp_path / "run" / "workspace" / "workers",
-        worker_backend="local",
-        credential_accounts_root=root,
-        runtime_profiles=[
-            {"id": "local", "backend": "local"},
-            {"id": "docker-web", "backend": "container"},
-        ],
-        worker_profiles=[{
-            "id": "claude-sub-container",
-            "engine": "claude",
-            "runtime": "docker-web",
-            "credential_account": "claude-team",
-            "enabled": True,
-        }],
-    )
-
-    class FakeHandle:
-        def to_container_path(self, path: str) -> str:
-            return "/home/kali/workspace/" + path.rsplit("/", 1)[-1]
-
-    profile = swarm._profile_for_engine("claude")
-    assert profile["credential_account"] == "claude-team"
-    assert swarm._backend_for_engine("claude", profile) == "container"
-    env = swarm._runtime_env_for("claude", "cli-claude", container=FakeHandle(), profile=profile)
-    assert env["CLAUDE_CODE_OAUTH_TOKEN_FILE"].endswith(
-        "/claude-team/CLAUDE_CODE_OAUTH_TOKEN")
-    assert env["MUTEKI_WORKER_PROFILE_ID"] == "claude-sub-container"
-    assert env["MUTEKI_CREDENTIAL_ACCOUNT_ID"] == "claude-team"
-    assert env["HOME"].startswith("/home/kali/workspace/")
-
-
 def test_cursor_endpoint_is_inserted_before_prompt():
     ch = Challenge(
         id="cursor-endpoint",
@@ -478,6 +429,46 @@ def test_profile_model_is_inserted_before_prompt_for_cli_drivers():
     out = solver._apply_runtime_argv(argv, {"MUTEKI_WORKER_MODEL": "deepseek-reasoner"})
 
     assert out[-3:] == ["--model", "deepseek-reasoner", "PROMPT"]
+
+
+def test_pi_provider_and_model_are_inserted_before_prompt():
+    ch = Challenge(
+        id="pi-provider",
+        name="pi-provider",
+        category="misc",
+        description="pi provider",
+        flag_format="flag{...}",
+    )
+    solver = CliSolver(None, ch, engine="pi")
+    argv = ["/usr/bin/pi", "-p", "--mode", "json", "PROMPT"]
+
+    out = solver._apply_runtime_argv(argv, {
+        "MUTEKI_PI_PROVIDER": "muteki",
+        "MUTEKI_PI_MODEL": "deepseek-v4-flash:0731-cloud",
+    })
+
+    assert out[-5:] == ["--provider", "muteki",
+                        "--model", "deepseek-v4-flash:0731-cloud", "PROMPT"]
+
+
+def test_omp_provider_and_model_are_inserted_before_prompt():
+    ch = Challenge(
+        id="omp-provider",
+        name="omp-provider",
+        category="misc",
+        description="omp provider",
+        flag_format="flag{...}",
+    )
+    solver = CliSolver(None, ch, engine="omp")
+    argv = ["/usr/local/bin/omp", "-p", "--mode", "json", "PROMPT"]
+
+    out = solver._apply_runtime_argv(argv, {
+        "MUTEKI_OMP_PROVIDER": "muteki",
+        "MUTEKI_OMP_MODEL": "deepseek-v4-flash:0731-cloud",
+    })
+
+    assert out[-5:] == ["--provider", "muteki",
+                        "--model", "deepseek-v4-flash:0731-cloud", "PROMPT"]
 
 
 def test_swarm_profile_roles_and_capacity_are_hard_limits(tmp_path):
@@ -808,57 +799,37 @@ def test_ordinary_profile_capacity_is_isolated_from_review_capacity(tmp_path):
     assert swarm._profile_for_engine("claude", role="review", advance=False) is None
 
 
-def test_swarm_runtime_profile_options_reach_container_create(tmp_path, monkeypatch):
-    ch = Challenge(
-        id="runtime-options",
-        name="runtime-options",
-        category="misc",
-        description="runtime options",
-        flag_format="flag{...}",
-    )
-    seen = {}
+def test_swarm_container_failure_hard_fails_by_default(tmp_path, monkeypatch):
+    """New contract (round-10 approval): a container backend that fails on a
+    bare host must HARD-FAIL by default — never silently fall back to
+    host-native workers."""
+    ch = Challenge(id="runtime-degraded", name="runtime-degraded", category="misc",
+                   description="", flag_format="flag{...}")
 
-    class FakeHandle:
-        def to_container_path(self, path: str) -> str:
-            return path
-
-    def fake_ensure_container(*args, **kwargs):
-        seen.update(kwargs)
-        return FakeHandle()
+    def boom(*args, **kwargs):
+        raise RuntimeError("docker unavailable")
 
     import muteki.solver.container_exec as ce
-    monkeypatch.setattr(ce, "ensure_container", fake_ensure_container)
+    monkeypatch.setattr(ce, "ensure_container", boom)
+    monkeypatch.delenv("MUTEKI_ALLOW_CONTAINER_LOCAL_FALLBACK", raising=False)
 
     swarm = Swarm(
-        ch, [], llm=None, sandbox=None,
+        ch, [], llm=None, sandbox=None, bus=None,
         worker_root=tmp_path / "run" / "workspace" / "workers",
-        worker_backend="local",
-        runtime_profiles=[{
-            "id": "docker-web",
-            "backend": "container",
-            "network": "bridge",
-            "memory": "10g",
-            "cpus": "3",
-            "pids_limit": 1024,
-        }],
-        worker_profiles=[{
-            "id": "codex-api",
-            "engine": "codex",
-            "runtime": "docker-web",
-            "credential_account": "deepseek-main",
-            "enabled": True,
-        }],
+        worker_backend="container",
     )
-    profile = swarm._profile_for_engine("codex")
-    swarm._container_for_engine("codex", profile)
+    import pytest as _pytest
 
-    assert seen["network"] == "bridge"
-    assert seen["memory"] == "10g"
-    assert seen["cpus"] == "3"
-    assert seen["pids_limit"] == 1024
+    with _pytest.raises(RuntimeError, match="refusing to silently run"):
+        swarm._container_for_engine("claude")
+    # the failure was still recorded loudly before the raise
+    assert swarm._runtime_degraded
+    assert "docker unavailable" in swarm._runtime_degraded[0]["reason"]
 
 
-def test_swarm_container_failure_emits_runtime_degraded_and_falls_back(tmp_path, monkeypatch):
+def test_swarm_container_failure_falls_back_only_with_opt_in(tmp_path, monkeypatch):
+    """The legacy degraded+fallback path survives ONLY under the explicit
+    operator opt-in env."""
     ch = Challenge(id="runtime-degraded", name="runtime-degraded", category="misc",
                    description="", flag_format="flag{...}")
     events = []
@@ -872,6 +843,7 @@ def test_swarm_container_failure_emits_runtime_degraded_and_falls_back(tmp_path,
 
     import muteki.solver.container_exec as ce
     monkeypatch.setattr(ce, "ensure_container", boom)
+    monkeypatch.setenv("MUTEKI_ALLOW_CONTAINER_LOCAL_FALLBACK", "1")
 
     swarm = Swarm(
         ch, [], llm=None, sandbox=None, bus=FakeBus(),
@@ -984,3 +956,195 @@ def test_import_host_codex_auth_missing_host_file_raises(tmp_path, monkeypatch):
     store = CredentialAccountStore(account_store_root(tmp_path))
     with pytest.raises(ValueError, match="not found"):
         store.import_host_codex_auth("codex-main")
+
+
+# ── pi / omp accounts (custom OpenAI-compatible provider via agent config) ────
+
+def test_pi_runtime_env_writes_models_json_and_provider_env(tmp_path, monkeypatch):
+    root = tmp_path / "_secrets" / "accounts"
+    acct = root / "pi-main"
+    acct.mkdir(parents=True)
+    (acct / "API_KEY").write_text("fake-pi-key\n")
+    (acct / "BASE_URL").write_text("https://ollama.example.com/v1\n")
+    (acct / "MODEL").write_text("deepseek-v4-flash:0731-cloud\n")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    resolved = runtime_env_for_engine("pi", account_root=root, container=False)
+
+    cfg = json.loads((acct / "pi-agent" / "models.json").read_text())
+    prov = cfg["providers"]["muteki"]
+    assert prov["baseUrl"] == "https://ollama.example.com/v1"
+    assert prov["api"] == "openai-completions"
+    assert prov["apiKey"] == "fake-pi-key"
+    assert prov["models"] == [{
+        "id": "deepseek-v4-flash:0731-cloud",
+        "contextWindow": 128000,
+        "maxTokens": 8192,
+    }]
+    # 0600 like every other account secret file
+    assert (os.stat(acct / "pi-agent" / "models.json").st_mode & 0o777) == 0o600
+    assert resolved.env["PI_CODING_AGENT_DIR"] == str((acct / "pi-agent").resolve())
+    assert resolved.env["MUTEKI_PI_PROVIDER"] == "muteki"
+    assert resolved.env["MUTEKI_PI_MODEL"] == "deepseek-v4-flash:0731-cloud"
+    # harmless native fallback, value inline in local mode
+    assert resolved.env["OPENAI_API_KEY"] == "fake-pi-key"
+
+
+def test_pi_runtime_env_materializes_profile_model_in_private_state(tmp_path):
+    root = tmp_path / "_secrets" / "accounts"
+    acct = root / "pi-main"
+    acct.mkdir(parents=True)
+    (acct / "API_KEY").write_text("fake-pi-key\n")
+    (acct / "BASE_URL").write_text("https://ollama.example.com/v1\n")
+    (acct / "MODEL").write_text("legacy-model\n")
+    private_state = tmp_path / "run-state" / "pi-agent"
+
+    resolved = runtime_env_for_engine(
+        "pi",
+        account_root=root,
+        account_id="pi-main",
+        container=False,
+        env={},
+        agent_state_dir=private_state,
+        model="profile-model",
+    )
+
+    assert resolved.env["PI_CODING_AGENT_DIR"] == str(private_state.resolve())
+    assert resolved.env["MUTEKI_PI_MODEL"] == "profile-model"
+    cfg = json.loads((private_state / "models.json").read_text())
+    assert cfg["providers"]["muteki"]["models"][0]["id"] == "profile-model"
+    assert not (acct / "pi-agent").exists()
+
+
+def test_pi_runtime_env_container_maps_agent_dir_into_mount(tmp_path, monkeypatch):
+    root = tmp_path / "_secrets" / "accounts"
+    acct = root / "pi-main"
+    acct.mkdir(parents=True)
+    (acct / "API_KEY").write_text("fake-pi-key\n")
+    (acct / "BASE_URL").write_text("https://ollama.example.com/v1\n")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    resolved = runtime_env_for_engine("pi", account_root=root, container=True)
+
+    # container path mapping mirrors CODEX_HOME: env points at the mount, the
+    # models.json is still written HOST-side (the projection carries it in).
+    assert resolved.env["PI_CODING_AGENT_DIR"] == (
+        f"{CONTAINER_ACCOUNTS_ROOT}/pi-main/pi-agent")
+    assert (acct / "pi-agent" / "models.json").exists()
+    # no MODEL file → no MUTEKI_PI_MODEL, and the config falls back to "default"
+    assert "MUTEKI_PI_MODEL" not in resolved.env
+    cfg = json.loads((acct / "pi-agent" / "models.json").read_text())
+    assert cfg["providers"]["muteki"]["models"][0]["id"] == "default"
+    # secret goes through the _FILE indirection, never `docker exec -e`
+    assert resolved.env["OPENAI_API_KEY_FILE"] == (
+        f"{CONTAINER_ACCOUNTS_ROOT}/pi-main/API_KEY")
+    assert "OPENAI_API_KEY" not in resolved.env
+
+
+def test_pi_runtime_env_api_key_only_sets_openai_fallback(tmp_path, monkeypatch):
+    root = tmp_path / "_secrets" / "accounts"
+    acct = root / "pi-main"
+    acct.mkdir(parents=True)
+    (acct / "API_KEY").write_text("fake-pi-key\n")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    resolved = runtime_env_for_engine("pi", account_root=root, container=False)
+
+    # no BASE_URL → no provider config is generated at all
+    assert resolved.env == {"OPENAI_API_KEY": "fake-pi-key"}
+    assert not (acct / "pi-agent").exists()
+
+
+def test_omp_runtime_env_writes_models_yml(tmp_path, monkeypatch):
+    root = tmp_path / "_secrets" / "accounts"
+    acct = root / "omp-main"
+    acct.mkdir(parents=True)
+    (acct / "API_KEY").write_text("fake-omp-key\n")
+    (acct / "BASE_URL").write_text("https://ollama.example.com/v1\n")
+    (acct / "MODEL").write_text("deepseek-v4-flash:0731-cloud\n")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    resolved = runtime_env_for_engine("omp", account_root=root, container=False)
+
+    text = (acct / "omp-agent" / "models.yml").read_text()
+    assert "providers:\n  muteki:\n" in text
+    assert 'baseUrl: "https://ollama.example.com/v1"' in text
+    assert "api: openai-completions" in text
+    assert 'apiKey: "fake-omp-key"' in text
+    assert '- id: "deepseek-v4-flash:0731-cloud"' in text
+    assert "contextWindow: 128000" in text and "maxTokens: 8192" in text
+    assert (os.stat(acct / "omp-agent" / "models.yml").st_mode & 0o777) == 0o600
+    assert resolved.env["PI_CODING_AGENT_DIR"] == str((acct / "omp-agent").resolve())
+    assert resolved.env["MUTEKI_OMP_PROVIDER"] == "muteki"
+    assert resolved.env["MUTEKI_OMP_MODEL"] == "deepseek-v4-flash:0731-cloud"
+    assert resolved.env["OPENAI_API_KEY"] == "fake-omp-key"
+    # omp honors OPENAI_BASE_URL natively — set alongside the provider config
+    assert resolved.env["OPENAI_BASE_URL"] == "https://ollama.example.com/v1"
+
+
+def test_upsert_secret_accepts_pi_and_omp(tmp_path):
+    store = CredentialAccountStore(account_store_root(tmp_path))
+    pi = store.upsert_secret(
+        account_id="pi-main", engine="pi",
+        secret="fake-pi-key", base_url="https://ollama.example.com/v1")
+    assert pi["engine"] == "pi" and pi["present"] is True
+    root = account_store_root(tmp_path)
+    assert (root / "pi-main" / "API_KEY").read_text().strip() == "fake-pi-key"
+    assert (root / "pi-main" / "BASE_URL").read_text().strip() == (
+        "https://ollama.example.com/v1")
+    # a pi/omp account self-marks its ENGINE so inspect() binds it to the engine
+    assert (root / "pi-main" / "ENGINE").read_text().strip() == "pi"
+
+    omp = store.upsert_secret(account_id="omp-main", engine="omp", secret="fake-omp-key")
+    assert omp["engine"] == "omp" and omp["present"] is True
+    assert (root / "omp-main" / "ENGINE").read_text().strip() == "omp"
+
+
+def test_pi_agent_dir_is_projected_writable_like_codex_home(tmp_path):
+    from muteki.solver.credential_accounts import (
+        _WRITABLE_STATE_DIRS, project_account_root)
+    assert "pi-agent" in _WRITABLE_STATE_DIRS
+    assert "omp-agent" in _WRITABLE_STATE_DIRS
+
+    root = tmp_path / "_secrets" / "accounts"
+    agent_dir = root / "pi-main" / "pi-agent"
+    agent_dir.mkdir(parents=True)
+    (agent_dir / "models.json").write_text("{}\n")
+
+    projection = tmp_path / "projection"
+    project_account_root(root, projection)
+    projected = projection / "pi-main" / "pi-agent"
+    assert (projected / "models.json").exists()
+    # writable state: dir 0777 + files 0666 (the CLI rewrites state in place)
+    assert (os.stat(projected).st_mode & 0o777) == 0o777
+    assert (os.stat(projected / "models.json").st_mode & 0o777) == 0o666
+
+
+def test_reupsert_clears_generated_pi_omp_provider_configs(tmp_path):
+    store = CredentialAccountStore(account_store_root(tmp_path))
+    root = account_store_root(tmp_path)
+    store.upsert_secret(
+        account_id="pi-main", engine="pi",
+        secret="fake-pi-key", base_url="https://ollama.example.com/v1")
+    runtime_env_for_engine("pi", account_root=root, container=False)
+    assert (root / "pi-main" / "pi-agent" / "models.json").exists()
+
+    # a fresh upsert wipes the generated config (it regenerates on next resolve)
+    store.upsert_secret(account_id="pi-main", engine="pi", secret="fake-pi-key-2")
+    assert not (root / "pi-main" / "pi-agent").exists()
+
+
+def test_detect_system_login_pi_and_omp(tmp_path, monkeypatch):
+    from muteki.solver import credential_accounts as ca
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    assert ca.detect_system_login("pi", env={}) == "absent"
+    assert ca.detect_system_login("omp", env={}) == "absent"
+    pi_agent = fake_home / ".pi" / "agent"
+    pi_agent.mkdir(parents=True)
+    (pi_agent / "auth.json").write_text("{}")
+    assert ca.detect_system_login("pi", env={}) == "present"
+    (fake_home / ".omp" / "agent").mkdir(parents=True)
+    assert ca.detect_system_login("omp", env={}) == "present"

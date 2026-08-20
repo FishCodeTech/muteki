@@ -52,6 +52,10 @@ services:
       # container data root == host root (identity mirror), so _mount_source is a no-op
       MUTEKI_CONTAINER_DATA_ROOT: "${MUTEKI_HOST_DATA_ROOT}"
       MUTEKI_SESSIONS_ROOT: "${MUTEKI_HOST_DATA_ROOT}/sessions"
+      # Journal + SecretStore are coordinator-only. This sibling is available to
+      # web-api through the data-root mirror but is never one of the exact paths
+      # bind-mounted into a worker container.
+      MUTEKI_COORDINATOR_CONTROL_ROOT: "${MUTEKI_HOST_DATA_ROOT}/coordinator-control"
       MUTEKI_WEB_BIND: "0.0.0.0"
       MUTEKI_WEB_PASSWORD: "${MUTEKI_WEB_PASSWORD:?set MUTEKI_WEB_PASSWORD — non-loopback bind requires it}"
       MUTEKI_WORKER_IMAGE: "${MUTEKI_WORKER_IMAGE:-ghcr.io/fishcodetech/muteki-worker:latest}"

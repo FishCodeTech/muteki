@@ -1,0 +1,14 @@
+{
+  "domain": "crypto",
+  "entity_kinds": ["cipher", "key_material", "oracle", "plaintext_space", "leak"],
+  "state_variables": ["cipher.algorithm", "key_material.length", "oracle.response_type", "goal.flag_recovery"],
+  "completion_state": "goal.flag_recovery",
+  "initial_reachability": 0.12,
+  "actions": [
+    {"name": "encrypt_oracle", "risk_class": "safe", "cost_estimate_units": 1},
+    {"name": "decrypt_oracle", "risk_class": "safe", "cost_estimate_units": 1},
+    {"name": "key_recovery", "risk_class": "exploit", "cost_estimate_units": 4},
+    {"name": "ciphertext_manipulate", "risk_class": "probe", "cost_estimate_units": 2},
+    {"name": "mode_attack", "risk_class": "exploit", "cost_estimate_units": 3}
+  ]
+}

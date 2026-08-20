@@ -9,6 +9,8 @@ cannot be laundered through prose or a side channel.
 
 from __future__ import annotations
 
+import json
+
 from muteki.solver import gate
 from muteki.solver.result import ArtifactStore
 
@@ -306,4 +308,163 @@ def test_token_mode_rejects_rockyou_words_and_sentences(tmp_path):
     # a whole quoted sentence is rejected (no-whitespace floor)
     assert gate.flag_ok("the flag is the admin password", out,
                         flag_format=gate.TOKEN_FLAG_FORMAT, artifacts=None) is False
+
+
+def test_finding_ok_idor_differential_accepted(tmp_path):
+    art = ArtifactStore(root=str(tmp_path / "a"))
+    http = (
+        "GET /notes/1 HTTP/1.1\n"
+        "Cookie: sess=alice\n"
+        "HTTP/1.1 403 Forbidden\n"
+        "\n"
+        "GET /notes/1 HTTP/1.1\n"
+        "Cookie: sess=bob\n"
+        "HTTP/1.1 200 OK\n"
+        '{"id":1,"owner":"alice","body":"alice-note-1"}\n'
+    )
+    claim = {
+        "finding_class": "idor",
+        "identity_a": "alice",
+        "identity_b": "bob",
+        "resource_id": "/notes/1",
+        "auth_result_a": "403 Forbidden",
+        "auth_result_b": "200 OK",
+    }
+    assert gate.finding_ok(claim, http, expected_class="idor", artifacts=art) is True
+
+
+def test_finding_ok_idor_verbal_claim_rejected(tmp_path):
+    art = ArtifactStore(root=str(tmp_path / "a"))
+    claim = {
+        "finding_class": "idor",
+        "identity_a": "alice",
+        "identity_b": "bob",
+        "resource_id": "/notes/1",
+        "auth_result_a": "401 Unauthorized",
+        "auth_result_b": "200 OK",
+    }
+    verbal = (
+        "VERIFIED_FACT=this is IDOR: alice vs bob on /notes/1 (401 Unauthorized vs 200 OK)\n"
+        "FOUND_FINDING=" + json.dumps(claim) + "\n"
+        "complete_why=越权已证明\n"
+    )
+    assert gate.finding_ok(claim, verbal, expected_class="idor", artifacts=art) is False
+    same_id = dict(claim, identity_b="alice")
+    dump = "alice alice /notes/1 401 Unauthorized 200 OK"
+    assert gate.finding_ok(same_id, dump, expected_class="idor", artifacts=art) is False
+    same_auth = dict(claim, auth_result_b="401 Unauthorized")
+    dump2 = "alice bob /notes/1 401 Unauthorized"
+    assert gate.finding_ok(same_auth, dump2, expected_class="idor", artifacts=art) is False
+
+
+def test_finding_ok_idor_same_status_with_two_sessions(tmp_path):
+    art = ArtifactStore(root=str(tmp_path / "a"))
+    http = (
+        "POST /login HTTP/1.1\n"
+        'Set-Cookie: sess=alice; Path=/\n'
+        '{"ok": true, "user": "alice"}\n'
+        "GET /notes/1 HTTP/1.1\n"
+        "Cookie: sess=alice\n"
+        "HTTP/1.1 200 OK\n"
+        '{"id":1,"owner":"alice","body":"alice-note-1"}\n'
+        "POST /login HTTP/1.1\n"
+        'Set-Cookie: sess=bob; Path=/\n'
+        '{"ok": true, "user": "bob"}\n'
+        "GET /notes/1 HTTP/1.1\n"
+        "Cookie: sess=bob\n"
+        "HTTP/1.1 200 OK\n"
+        '{"id":1,"owner":"alice","body":"alice-note-1"}\n'
+    )
+    claim = {
+        "finding_class": "idor",
+        "identity_a": "alice",
+        "identity_b": "bob",
+        "resource_id": "/notes/1",
+        "auth_result_a": "alice-note-1",
+        "auth_result_b": "alice-note-1",
+    }
+    assert gate.finding_ok(claim, http, expected_class="idor", artifacts=art) is True
+
+
+def test_finding_ok_rce_witness_in_http_accepted(tmp_path):
+    art = ArtifactStore(root=str(tmp_path / "a"))
+    http = (
+        "GET /lookup?hostname=example.com HTTP/1.1\n"
+        "HTTP/1.1 200 OK\n"
+        '{"hostname":"example.com","stdout":"uid=501(staff) gid=20(staff)"}\n'
+    )
+    claim = {
+        "finding_class": "rce",
+        "resource_id": "/lookup",
+        "input": "hostname=example.com",
+        "witness": "uid=501(staff)",
+    }
+    assert gate.finding_ok(claim, http, expected_class="rce", artifacts=art) is True
+
+
+def test_finding_ok_rce_verbal_and_ping_rejected(tmp_path):
+    art = ArtifactStore(root=str(tmp_path / "a"))
+    claim = {
+        "finding_class": "rce",
+        "resource_id": "/lookup",
+        "input": "hostname=127.0.0.1",
+        "witness": "uid=501(staff)",
+    }
+    verbal = "FOUND_FINDING=" + json.dumps(claim) + "\nthis is rce\n"
+    assert gate.finding_ok(claim, verbal, expected_class="rce", artifacts=art) is False
+    ping = (
+        "GET /lookup?hostname=127.0.0.1 HTTP/1.1\n"
+        "HTTP/1.1 200 OK\n"
+        "64 bytes from 127.0.0.1: icmp_seq=1 ttl=64 time=0.1 ms\n"
+        "1 packets transmitted, 1 received, 0% packet loss\n"
+    )
+    ping_claim = dict(claim, witness="64 bytes from 127.0.0.1: icmp_seq=1 ttl=64")
+    assert gate.finding_ok(ping_claim, ping, expected_class="rce", artifacts=art) is False
+    wrong_class = dict(claim, finding_class="idor")
+    assert gate.finding_ok(wrong_class, ping, expected_class="rce", artifacts=art) is False
+
+
+def test_finding_ok_rce_accepts_get_wrapper_and_json_stdout(tmp_path):
+    art = ArtifactStore(root=str(tmp_path / "a"))
+    http = (
+        'curl -s "http://127.0.0.1:18082/lookup?hostname=example.com%3Bid"\n'
+        '{"hostname":"example.com;id","ok":true,'
+        '"stdout":"uid=501(snowywar) gid=20(staff) groups=20(staff)"}\n'
+    )
+    claim = {
+        "finding_class": "rce",
+        "resource_id": "/lookup",
+        "input": "GET /lookup?hostname=example.com%3Bid",
+        "witness": (
+            '{"hostname": "example.com;id", "ok": true, '
+            '"stdout": "uid=501(snowywar) gid=20(staff)"}'
+        ),
+    }
+    assert gate.finding_ok(claim, http, expected_class="rce", artifacts=art) is True
+    invented = dict(claim, input="GET /secret?hostname=nope")
+    assert gate.finding_ok(invented, http, expected_class="rce", artifacts=art) is False
+
+
+def test_parse_finding_claim_json_with_trailing_prose():
+    raw = (
+        '{"finding_class":"rce","resource_id":"/lookup",'
+        '"input":"hostname=x","witness":"uid=1"} extra words'
+    )
+    claim = gate.parse_finding_claim(raw)
+    assert claim is not None
+    assert claim["finding_class"] == "rce"
+    assert claim["resource_id"] == "/lookup"
+    assert claim["witness"] == "uid=1"
+
+
+def test_finding_ok_rce_claim_json_is_not_evidence(tmp_path):
+    art = ArtifactStore(root=str(tmp_path / "a"))
+    claim = {
+        "finding_class": "rce",
+        "resource_id": "/lookup",
+        "input": "hostname=x",
+        "witness": "uid=501(staff)",
+    }
+    dump = json.dumps(claim) + "\n"
+    assert gate.finding_ok(claim, dump, expected_class="rce", artifacts=art) is False
 

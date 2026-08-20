@@ -39,7 +39,7 @@ const (
 
 // Hello is the FIRST frame the supervisor sends after dialing the host receiver.
 type Hello struct {
-	Hello   int    `json:"hello"`            // protocol marker, always 1
+	Hello   int    `json:"hello"` // protocol marker, always 1
 	RunID   string `json:"run_id"`
 	Token   string `json:"token"`
 	Version string `json:"version,omitempty"`
@@ -69,6 +69,9 @@ type Request struct {
 type WorkerSpec struct {
 	Argv []string `json:"argv"` // resolved container-side argv (argv[0] = bin)
 	Cwd  string   `json:"cwd"`  // absolute path inside the container
+	// Stdin carries an optional one-shot prompt over the authenticated control
+	// channel.  It is never copied into Argv, logs, status, or response frames.
+	Stdin string `json:"stdin,omitempty"`
 	// Env overlays the worker's environment (NOT the supervisor's). Only keys the
 	// host chooses to pass arrive here; the supervisor adds nothing of its own
 	// except a sane PATH/HOME default if absent.
@@ -87,6 +90,7 @@ type WorkerSpec struct {
 // connection).
 //
 //	T == "started"  -> StartWorker reply: WorkerID set (or Error on spawn failure)
+//	T == "stdin"    -> full stdin pipe handoff completed (OK) or failed (Error)
 //	T == "out"|"err" -> one raw line of worker stdout/stderr (Line), WorkerID set
 //	T == "exit"     -> worker terminated: Rc/OOM/TimedOut/Signalled, WorkerID set
 //	T == "resp"     -> generic Response payload (Signal/Status/Teardown/Health)
@@ -99,7 +103,7 @@ type Frame struct {
 	// t == "out" | "err"
 	Line string `json:"line,omitempty"`
 
-	// t == "started"
+	// t == "started" | "stdin"
 	Error string `json:"error,omitempty"`
 
 	// t == "exit"
@@ -109,11 +113,11 @@ type Frame struct {
 	Signalled int  `json:"signalled,omitempty"`
 
 	// t == "resp" (Signal / Status / TeardownRun / Health)
-	OK       bool   `json:"ok,omitempty"`
-	State    string `json:"state,omitempty"` // Status: running | exited | timed_out | oom | unknown
-	RcPtr    *int   `json:"rc_ptr,omitempty"`
-	Paused   bool   `json:"paused,omitempty"`
-	Version  string `json:"version,omitempty"` // Health
-	Workers  int    `json:"workers,omitempty"` // Health: running worker count
-	Uptime   int64  `json:"uptime_sec,omitempty"`
+	OK      bool   `json:"ok,omitempty"`
+	State   string `json:"state,omitempty"` // Status: running | exited | timed_out | oom | unknown
+	RcPtr   *int   `json:"rc_ptr,omitempty"`
+	Paused  bool   `json:"paused,omitempty"`
+	Version string `json:"version,omitempty"` // Health
+	Workers int    `json:"workers,omitempty"` // Health: running worker count
+	Uptime  int64  `json:"uptime_sec,omitempty"`
 }

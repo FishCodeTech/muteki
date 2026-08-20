@@ -1,0 +1,6 @@
+web_search:
+  enabled: false
+fetch:
+  enabled: false
+browser:
+  enabled: false

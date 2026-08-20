@@ -2,12 +2,36 @@
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 
 import pytest
 
 from muteki.models.solve_graph import Challenge
 from muteki.swarm.shared_graph import SQLiteSharedGraph, SharedGraph, canonicalize_lane
+
+
+class _FailNthCommitConnection:
+    """Transparent connection proxy used to expose rollback correctness."""
+
+    def __init__(self, connection, *, fail_at: int) -> None:
+        self._connection = connection
+        self._fail_at = fail_at
+        self.commits = 0
+        self.rollbacks = 0
+
+    def commit(self):
+        self.commits += 1
+        if self.commits == self._fail_at:
+            raise sqlite3.OperationalError("injected commit failure")
+        return self._connection.commit()
+
+    def rollback(self):
+        self.rollbacks += 1
+        return self._connection.rollback()
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
 
 
 def _chal() -> Challenge:
@@ -69,6 +93,200 @@ def test_events_since_returns_incremental_filtered_rows(tmp_path):
     g.close()
 
 
+def test_standing_clear_graph_inbox_is_atomic_idempotent_and_cutoff_bounded(
+        tmp_path):
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "standing-clear.db", challenge=_chal())
+    old = g.add_operator_directive(
+        action="hint", text="old standing", standing=True,
+        source_command_id="C-before")
+    new = g.add_operator_directive(
+        action="hint", text="new standing", standing=True,
+        source_command_id="C-after")
+
+    first = g.apply_standing_clear(
+        command_id="C-clear-graph", text="", cutoff_before=0.0,
+        eligible_command_ids=["C-before"])
+    assert first["already_applied"] is False
+    assert first["expired_directives"] == [old["directive_id"]]
+    active_ids = {
+        row["directive_id"] for row in g.operator_directives(active_only=True)
+    }
+    assert old["directive_id"] not in active_ids
+    assert new["directive_id"] in active_ids
+
+    second = g.apply_standing_clear(
+        command_id="C-clear-graph", text="", cutoff_before=None)
+    assert second["already_applied"] is True
+    assert second["marker_seq"] == first["marker_seq"]
+    # A wider retry cannot retract guidance beyond the original transaction.
+    assert new["directive_id"] in {
+        row["directive_id"] for row in g.operator_directives(active_only=True)
+    }
+    markers = [
+        event for event in g.events()
+        if event["kind"] == "control_standing_clear_applied"
+        and event["payload"].get("source_command_id") == "C-clear-graph"
+    ]
+    assert len(markers) == 1
+    with pytest.raises(ValueError, match="different text"):
+        g.apply_standing_clear(
+            command_id="C-clear-graph", text="different standing")
+    g.close()
+
+
+def test_secret_exact_clear_matches_only_closed_source_ids(tmp_path):
+    g = SQLiteSharedGraph.open(
+        db_path=tmp_path / "secret-standing-clear.db", challenge=_chal())
+    selected = g.add_operator_directive(
+        action="hint", text="secret://old-opaque-ref", standing=True,
+        source_command_id="C-secret-selected")
+    unrelated = g.add_operator_directive(
+        action="hint", text="secret://other-opaque-ref", standing=True,
+        source_command_id="C-secret-other")
+    legacy = g.add_operator_directive(
+        action="hint", text="legacy standing", standing=True)
+
+    result = g.apply_standing_clear(
+        command_id="C-secret-clear",
+        eligible_command_ids=["C-secret-selected"],
+        match_by_source_ids=True,
+    )
+
+    assert result["expired_directives"] == [selected["directive_id"]]
+    active = {
+        row["directive_id"] for row in g.operator_directives(active_only=True)
+    }
+    assert unrelated["directive_id"] in active
+    assert legacy["directive_id"] in active
+    marker = next(
+        event for event in g.events()
+        if event["kind"] == "control_standing_clear_applied")
+    assert marker["payload"]["match_by_source_ids"] is True
+    assert marker["payload"]["text"] == ""
+    with pytest.raises(ValueError, match="different selector"):
+        g.apply_standing_clear(
+            command_id="C-secret-clear",
+            eligible_command_ids=["C-secret-selected"],
+            match_by_source_ids=False,
+        )
+    g.close()
+
+
+def test_hitl_request_preserves_emitted_occurrence_id(tmp_path):
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    result = g.add_hitl_request(
+        worker="cli-claude", need="need a dashboard token",
+        need_kind="external_blocker", request_id="DR-occurrence-2",
+    )
+    assert result["request_id"] == "DR-occurrence-2"
+    event = next(e for e in g.events() if e["kind"] == "hitl_classified")
+    assert event["payload"]["request_id"] == "DR-occurrence-2"
+    g.close()
+
+
+def test_release_intent_claim_rolls_back_failed_commit_before_retry(tmp_path):
+    path = tmp_path / "release-intent-commit.db"
+    g = SQLiteSharedGraph.open(db_path=path, challenge=_chal())
+    g.propose_intent(actor="reason", intent_id="I-release", goal="work")
+    assert g.claim_intent(worker="cli-a", intent_id="I-release")
+    proxy = _FailNthCommitConnection(g._conn, fail_at=1)
+    g._conn = proxy
+
+    with pytest.raises(sqlite3.OperationalError, match="injected commit"):
+        g.release_intent_claim(worker="cli-a", intent_id="I-release")
+    assert proxy.rollbacks == 1
+    with sqlite3.connect(path) as durable:
+        assert durable.execute(
+            "SELECT status, worker FROM intents WHERE intent_id='I-release'"
+        ).fetchone() == ("claimed", "cli-a")
+    assert g.intent_claim_state("I-release")["status"] == "claimed"
+
+    assert g.release_intent_claim(worker="cli-a", intent_id="I-release") is True
+    with sqlite3.connect(path) as durable:
+        assert durable.execute(
+            "SELECT status, worker FROM intents WHERE intent_id='I-release'"
+        ).fetchone() == ("open", None)
+    g.close()
+
+
+def test_terminalize_intent_rolls_back_failed_materialization_commit(tmp_path):
+    path = tmp_path / "terminalize-intent-commit.db"
+    g = SQLiteSharedGraph.open(db_path=path, challenge=_chal())
+    g.propose_intent(actor="reason", intent_id="I-terminal", goal="work")
+    assert g.claim_intent(worker="cli-a", intent_id="I-terminal")
+    # The terminal event append commits first; fail the materialized-row commit.
+    proxy = _FailNthCommitConnection(g._conn, fail_at=2)
+    g._conn = proxy
+
+    with pytest.raises(sqlite3.OperationalError, match="injected commit"):
+        g.terminalize_intent_claim(
+            worker="cli-a", intent_id="I-terminal", reason="runtime exited")
+    assert proxy.rollbacks == 1
+    with sqlite3.connect(path) as durable:
+        assert durable.execute(
+            "SELECT status, worker FROM intents WHERE intent_id='I-terminal'"
+        ).fetchone() == ("claimed", "cli-a")
+    assert g.intent_claim_state("I-terminal")["status"] == "claimed"
+
+    assert g.terminalize_intent_claim(
+        worker="cli-a", intent_id="I-terminal", reason="runtime exited") is True
+    with sqlite3.connect(path) as durable:
+        status, dispatch_state, result_seq = durable.execute(
+            "SELECT status, dispatch_state, result_seq FROM intents "
+            "WHERE intent_id='I-terminal'"
+        ).fetchone()
+        assert (status, dispatch_state) == ("done", "closed")
+        event_seq, event_count = durable.execute(
+            "SELECT MIN(seq), COUNT(*) FROM events WHERE dedupe_key="
+            "'runtime-retire::I-terminal::cli-a'"
+        ).fetchone()
+        assert event_count == 1
+        assert result_seq == event_seq
+        assert durable.execute(
+            "SELECT COUNT(*) FROM events WHERE dedupe_key="
+            "'runtime-retire::I-terminal::cli-a'"
+        ).fetchone()[0] == 1
+    g.close()
+
+
+def test_release_lane_rolls_back_failed_materialization_commit(tmp_path):
+    path = tmp_path / "release-lane-commit.db"
+    g = SQLiteSharedGraph.open(db_path=path, challenge=_chal())
+    lane = "network:target.local"
+    locked = g.lock_lane(
+        actor="coordinator", lane_key=lane, risk_class="network",
+        owner_worker="cli-a", owner_intent="I-lane", lease_s=600,
+    )
+    assert locked["acquired"] is True
+    # The lane-release event append commits first; fail the owner-row commit.
+    proxy = _FailNthCommitConnection(g._conn, fail_at=2)
+    g._conn = proxy
+
+    with pytest.raises(sqlite3.OperationalError, match="injected commit"):
+        g.release_lane(actor="coordinator", lane_key=lane, by_worker="cli-a")
+    assert proxy.rollbacks == 1
+    with sqlite3.connect(path) as durable:
+        assert durable.execute(
+            "SELECT owner_worker FROM lane_locks WHERE lane_key=?", (lane,)
+        ).fetchone() == ("cli-a",)
+    assert g.active_lanes()[0]["owner_worker"] == "cli-a"
+
+    assert g.release_lane(
+        actor="coordinator", lane_key=lane, by_worker="cli-a")["released"] is True
+    with sqlite3.connect(path) as durable:
+        owner_worker, released_seq = durable.execute(
+            "SELECT owner_worker, released_seq FROM lane_locks WHERE lane_key=?",
+            (lane,),
+        ).fetchone()
+        assert owner_worker is None
+        event_seq, event_count = durable.execute(
+            "SELECT MIN(seq), COUNT(*) FROM events WHERE kind='lane_released'"
+        ).fetchone()
+        assert event_count == 1
+        assert released_seq == event_seq
+    g.close()
+
+
 def test_add_evidence_records_intent_products(tmp_path):
     g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
     g.propose_intent(actor="reason", intent_id="I-prod", goal="check admin panel")
@@ -101,6 +319,36 @@ def test_deduped_evidence_still_links_product_to_later_intent(tmp_path):
     assert f2 == -1, "event dedupe should still avoid appending duplicate facts"
     assert g.intent_products("I-a") == [f1]
     assert g.intent_products("I-b") == [f1]
+    g.close()
+
+
+def test_verified_duplicate_appends_new_fact_and_supersedes_candidate(tmp_path):
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    candidate = g.add_evidence(
+        actor="cli-a", source="cmd", fact="same observed service", verified=False
+    )
+    verified = g.add_evidence(
+        actor="cli-a", source="cmd", fact="same observed service",
+        verified=True, verifier="substring", witness="raw output"
+    )
+
+    assert candidate > 0 and verified > candidate
+    events = [
+        event for event in g.events()
+        if event["kind"] == "fact_added"
+        and event["payload"].get("fact") == "same observed service"
+    ]
+    assert [event["seq"] for event in events] == [candidate, verified]
+    assert [event["verified"] for event in events] == [False, True]
+    with g._lock:
+        row = g._conn.execute(
+            "SELECT verified FROM events WHERE seq=?", (candidate,)
+        ).fetchone()
+    assert row == (0,)
+    facts = [item for item in g.snapshot().evidence if item.fact == "same observed service"]
+    assert len(facts) == 1
+    assert facts[0].verified is True
+    assert facts[0].verifier == "substring"
     g.close()
 
 
@@ -960,6 +1208,29 @@ def test_resume_intent_not_claimable(tmp_path):
     revived = g.revive_resume_intents()
     assert "I2" in revived
     assert g.claim_intent(worker="w2", intent_id="I2") is True
+    g.close()
+
+
+def test_intent_dependencies_block_dispatch_and_claim_until_parent_done(tmp_path):
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    g.propose_intent(actor="reason", intent_id="parent", goal="derive token")
+    g.propose_intent(
+        actor="reason",
+        intent_id="child",
+        goal="use token",
+        payload={"priority": 100, "depends_on": ["parent"]},
+    )
+
+    rows = g.query_legacy_candidates(now=0)
+    assert [row["intent_id"] for row in rows] == ["parent"]
+    assert g.claim_intent(worker="w-child", intent_id="child") is False
+    assert g.claim_intent(worker="w-parent", intent_id="parent") is True
+    g.conclude_intent(actor="w-parent", intent_id="parent", result="explored")
+
+    rows = g.query_legacy_candidates(now=0)
+    assert [row["intent_id"] for row in rows] == ["child"]
+    assert rows[0]["depends_on"] == ["parent"]
+    assert g.claim_intent(worker="w-child", intent_id="child") is True
     g.close()
 
 

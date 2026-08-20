@@ -1,0 +1,13 @@
+{
+  "domain": "pwn",
+  "entity_kinds": ["binary", "memory_region", "gadget", "io_channel", "mitigation"],
+  "state_variables": ["binary.arch", "mitigation.aslr", "mitigation.canary", "goal.flag_recovery"],
+  "completion_state": "goal.flag_recovery",
+  "initial_reachability": 0.1,
+  "actions": [
+    {"name": "leak_offset", "risk_class": "probe", "cost_estimate_units": 2},
+    {"name": "overwrite_return", "risk_class": "exploit", "cost_estimate_units": 4},
+    {"name": "rop_chain", "risk_class": "exploit", "cost_estimate_units": 4},
+    {"name": "format_string", "risk_class": "exploit", "cost_estimate_units": 3}
+  ]
+}

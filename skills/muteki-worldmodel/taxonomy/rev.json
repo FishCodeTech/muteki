@@ -1,0 +1,14 @@
+{
+  "domain": "rev",
+  "entity_kinds": ["binary", "function", "data_section", "protocol", "vm"],
+  "state_variables": ["function.decompiled", "protocol.message_format", "goal.flag_recovery"],
+  "completion_state": "goal.flag_recovery",
+  "initial_reachability": 0.12,
+  "actions": [
+    {"name": "decompile", "risk_class": "safe", "cost_estimate_units": 2},
+    {"name": "trace_execution", "risk_class": "probe", "cost_estimate_units": 2},
+    {"name": "emulate_vm", "risk_class": "probe", "cost_estimate_units": 3},
+    {"name": "recover_protocol", "risk_class": "probe", "cost_estimate_units": 3},
+    {"name": "patch_binary", "risk_class": "exploit", "cost_estimate_units": 3}
+  ]
+}

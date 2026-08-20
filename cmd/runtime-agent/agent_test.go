@@ -6,7 +6,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -16,15 +19,15 @@ import (
 // drives commands on that connection. This mirrors the reverse-connect topology
 // without docker — the supervisor logic (fork/stream/signal) is what's exercised.
 type fakeHost struct {
-	ln       net.Listener
-	token    string
-	mu       sync.Mutex
-	conn     net.Conn
-	enc      *json.Encoder
-	r        *bufio.Reader
-	hello    Hello
-	reqSeq   int64
-	frames   chan Frame // every frame the supervisor sends, fanned out to tests
+	ln     net.Listener
+	token  string
+	mu     sync.Mutex
+	conn   net.Conn
+	enc    *json.Encoder
+	r      *bufio.Reader
+	hello  Hello
+	reqSeq int64
+	frames chan Frame // every frame the supervisor sends, fanned out to tests
 }
 
 func newFakeHost(t *testing.T, token string) *fakeHost {
@@ -34,7 +37,12 @@ func newFakeHost(t *testing.T, token string) *fakeHost {
 		t.Fatal(err)
 	}
 	h := &fakeHost{ln: ln, token: token, frames: make(chan Frame, 1024)}
-	t.Cleanup(func() { ln.Close(); if h.conn != nil { h.conn.Close() } })
+	t.Cleanup(func() {
+		ln.Close()
+		if h.conn != nil {
+			h.conn.Close()
+		}
+	})
 	return h
 }
 
@@ -187,6 +195,208 @@ func TestHelloHandshakeAndStartWorker(t *testing.T) {
 	}
 }
 
+func waitWorkerExit(t *testing.T, frames <-chan Frame) Frame {
+	t.Helper()
+	timer := time.NewTimer(8 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case frame, ok := <-frames:
+			if !ok {
+				t.Fatal("worker event stream closed without exit frame")
+			}
+			if frame.T == "exit" {
+				return frame
+			}
+		case <-timer.C:
+			t.Fatal("timed out waiting for worker exit")
+		}
+	}
+}
+
+func TestSupervisorSIGCHLDKeepsManagedWaitStatusAuthoritative(t *testing.T) {
+	// This installs the production signal.Notify/SIGCHLD loop. Every child below
+	// produces a real OS SIGCHLD while Cmd.Wait and the PID1 orphan reaper race to
+	// observe it; only Cmd.Wait is allowed to consume a managed worker's status.
+	s := &supervisor{workers: map[string]*worker{}}
+	unexpectedExit := make(chan int, 1)
+	stopSignals := s.installSignalHandlers(func(code int) { unexpectedExit <- code })
+	defer stopSignals()
+
+	cases := []struct {
+		name       string
+		script     string
+		wantRC     int
+		wantSignal int
+	}{
+		{name: "normal", script: "exit 0", wantRC: 0},
+		{name: "nonzero", script: "exit 23", wantRC: 23},
+		{name: "signal", script: "kill -TERM $$", wantRC: 128 + int(syscall.SIGTERM), wantSignal: int(syscall.SIGTERM)},
+	}
+	for round := 0; round < 12; round++ {
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				_, frames, err := startWorker("sigchld-worker", &WorkerSpec{
+					Argv: []string{"sh", "-c", tc.script}, Cwd: t.TempDir(), TimeoutSec: 5,
+				})
+				if err != nil {
+					t.Fatalf("startWorker: %v", err)
+				}
+				exit := waitWorkerExit(t, frames)
+				if exit.Rc != tc.wantRC || exit.Signalled != tc.wantSignal {
+					t.Fatalf("lost/corrupt wait status: got rc=%d signal=%d, want rc=%d signal=%d", exit.Rc, exit.Signalled, tc.wantRC, tc.wantSignal)
+				}
+				if exit.Rc == -1 {
+					t.Fatal("managed Cmd.Wait returned no-child status")
+				}
+			})
+		}
+	}
+	select {
+	case code := <-unexpectedExit:
+		t.Fatalf("SIGCHLD entered shutdown path with code %d", code)
+	default:
+	}
+}
+
+func TestConcurrentWorkersDoNotClaimContainerOOMDelta(t *testing.T) {
+	// memory.events is container-wide. Make two real managed processes overlap,
+	// inject one cumulative counter increment, then SIGKILL both. Neither worker may
+	// claim the shared delta as its own OOM evidence.
+	var counter atomic.Int64
+	tracker := newOOMTracker(func() int { return int(counter.Load()) })
+	trigger := filepath.Join(t.TempDir(), "release")
+	spec := func() *WorkerSpec {
+		return &WorkerSpec{
+			Argv:       []string{"sh", "-c", `while [ ! -e "$TRIGGER" ]; do :; done; kill -KILL $$`},
+			Cwd:        t.TempDir(),
+			Env:        map[string]string{"TRIGGER": trigger},
+			TimeoutSec: 5,
+		}
+	}
+	_, framesA, err := startWorkerWithRuntime("oom-a", spec(), runtimeChildReaper, tracker)
+	if err != nil {
+		t.Fatalf("start worker A: %v", err)
+	}
+	_, framesB, err := startWorkerWithRuntime("oom-b", spec(), runtimeChildReaper, tracker)
+	if err != nil {
+		t.Fatalf("start worker B: %v", err)
+	}
+	counter.Store(1)
+	if err := os.WriteFile(trigger, []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exitA := waitWorkerExit(t, framesA)
+	exitB := waitWorkerExit(t, framesB)
+	for name, exit := range map[string]Frame{"A": exitA, "B": exitB} {
+		if exit.Signalled != int(syscall.SIGKILL) || exit.Rc != 128+int(syscall.SIGKILL) {
+			t.Fatalf("worker %s did not follow SIGKILL test path: %+v", name, exit)
+		}
+		if exit.OOM {
+			t.Fatalf("worker %s falsely claimed ambiguous container OOM delta", name)
+		}
+	}
+}
+
+func TestUniqueUncausedSIGKILLCanClaimOOMDelta(t *testing.T) {
+	var counter atomic.Int64
+	tracker := newOOMTracker(func() int { return int(counter.Load()) })
+	trigger := filepath.Join(t.TempDir(), "release")
+	_, frames, err := startWorkerWithRuntime("oom-only", &WorkerSpec{
+		Argv:       []string{"sh", "-c", `while [ ! -e "$TRIGGER" ]; do :; done; kill -KILL $$`},
+		Cwd:        t.TempDir(),
+		Env:        map[string]string{"TRIGGER": trigger},
+		TimeoutSec: 5,
+	}, runtimeChildReaper, tracker)
+	if err != nil {
+		t.Fatalf("start worker: %v", err)
+	}
+	counter.Store(1)
+	if err := os.WriteFile(trigger, []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exit := waitWorkerExit(t, frames)
+	if !exit.OOM || exit.Signalled != int(syscall.SIGKILL) {
+		t.Fatalf("unique SIGKILL + counter delta was not attributed: %+v", exit)
+	}
+	if (oomEvidence{delta: 1}).attributable(int(syscall.SIGKILL), true, false) {
+		t.Fatal("supervisor timeout KILL must override container-level OOM evidence")
+	}
+	if (oomEvidence{delta: 1}).attributable(int(syscall.SIGKILL), false, true) {
+		t.Fatal("operator KILL must override container-level OOM evidence")
+	}
+}
+
+func TestStartWorkerPipesStdinWithoutArgvExposure(t *testing.T) {
+	secret := "runtime-stdin-secret-44556677"
+	spec := &WorkerSpec{
+		Argv:       []string{"sh", "-c", "IFS= read -r line; printf '%s\\n' \"$line\""},
+		Cwd:        t.TempDir(),
+		Stdin:      secret + "\n",
+		TimeoutSec: 5,
+	}
+	for _, arg := range spec.Argv {
+		if strings.Contains(arg, secret) {
+			t.Fatalf("secret leaked into argv: %q", arg)
+		}
+	}
+	_, frames, err := startWorker("stdin-worker", spec)
+	if err != nil {
+		t.Fatalf("startWorker: %v", err)
+	}
+	got := ""
+	gotReceipt := false
+	for frame := range frames {
+		if frame.T == "out" {
+			got += frame.Line
+		}
+		if frame.T == "stdin" {
+			gotReceipt = frame.OK
+		}
+	}
+	if got != secret {
+		t.Fatalf("stdin prompt not delivered: got %q want %q", got, secret)
+	}
+	if !gotReceipt {
+		t.Fatal("missing positive stdin completion receipt")
+	}
+	if spec.Stdin != "" {
+		t.Fatal("runtime retained stdin prompt after worker exit")
+	}
+}
+
+func TestStartWorkerReportsIncompleteLargeStdinForImmediateExit(t *testing.T) {
+	spec := &WorkerSpec{
+		Argv:       []string{"sh", "-c", "exit 0"},
+		Cwd:        t.TempDir(),
+		Stdin:      strings.Repeat("x", 4*1024*1024),
+		TimeoutSec: 5,
+	}
+	_, frames, err := startWorker("stdin-epipe", spec)
+	if err != nil {
+		t.Fatalf("startWorker: %v", err)
+	}
+	gotReceipt := false
+	gotExit := false
+	for frame := range frames {
+		switch frame.T {
+		case "stdin":
+			gotReceipt = true
+			if frame.OK {
+				t.Fatal("immediate-exit child falsely acknowledged full stdin")
+			}
+		case "exit":
+			gotExit = true
+		}
+	}
+	if !gotReceipt || !gotExit {
+		t.Fatalf("missing terminal frames stdin=%v exit=%v", gotReceipt, gotExit)
+	}
+	if spec.Stdin != "" {
+		t.Fatal("runtime retained failed stdin payload")
+	}
+}
+
 func TestSignalKill(t *testing.T) {
 	host := newFakeHost(t, "")
 	go startSupervisorDialing(t, host, "run-K", "")
@@ -234,6 +444,31 @@ func TestStopContPauseResume(t *testing.T) {
 	host.send(t, Request{Op: OpSignal, WorkerID: wid, Signal: "KILL"})
 }
 
+func TestSignalFailureDoesNotMutatePausedState(t *testing.T) {
+	// A definitely nonexistent process group makes syscall.Kill return ESRCH.  The
+	// supervisor must report that error and preserve its prior logical state.
+	w := &worker{pgid: 1 << 30}
+	if err := w.signal("STOP"); err == nil {
+		t.Fatal("STOP on nonexistent process group falsely succeeded")
+	}
+	if w.paused {
+		t.Fatal("failed STOP mutated paused=true")
+	}
+	w.paused = true
+	if err := w.signal("CONT"); err == nil {
+		t.Fatal("CONT on nonexistent process group falsely succeeded")
+	}
+	if !w.paused {
+		t.Fatal("failed CONT mutated paused=false")
+	}
+	if err := w.signal("KILL"); err == nil {
+		t.Fatal("KILL on nonexistent process group falsely succeeded")
+	}
+	if !w.killRequested {
+		t.Fatal("failed KILL attempt did not preserve conservative cause fence")
+	}
+}
+
 func TestHealth(t *testing.T) {
 	host := newFakeHost(t, "")
 	go startSupervisorDialing(t, host, "run-H", "")
@@ -267,6 +502,40 @@ func TestTokenRejected(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("supervisor did not abort on rejected hello")
+	}
+}
+
+func TestReadTokenUnlinksBootstrapFileImmediately(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "token")
+	if err := os.WriteFile(path, []byte("one-shot-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := &supervisor{}
+	if got := s.readToken(path); got != "one-shot-secret" {
+		t.Fatalf("read token = %q", got)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("bootstrap token file still exists after read: %v", err)
+	}
+}
+
+func TestSuccessfulHelloClearsTokenFromSupervisorMemory(t *testing.T) {
+	host := newFakeHost(t, "one-shot")
+	s := &supervisor{runID: "run-clear", token: "one-shot", workers: map[string]*worker{}}
+	result := make(chan net.Conn, 1)
+	go func() { result <- s.dialHost(host.addr(), 5*time.Second) }()
+	hello := host.accept(t)
+	if hello.Token != "one-shot" {
+		t.Fatalf("host saw token %q", hello.Token)
+	}
+	conn := <-result
+	if conn == nil {
+		t.Fatal("successful hello returned no connection")
+	}
+	defer conn.Close()
+	if s.token != "" {
+		t.Fatalf("supervisor retained consumed token %q", s.token)
 	}
 }
 

@@ -58,9 +58,18 @@ class _Server:
         return f"http://127.0.0.1:{self.port}"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_local_web_auth(monkeypatch):
+    """Repo-local operator auth must not change isolated test semantics."""
+    monkeypatch.delenv("MUTEKI_WEB_PASSWORD", raising=False)
+
+
 @pytest.fixture
-def server():
-    app = create_app(RunManager(sessions_root="/tmp/muteki_web_sessions"))
+def server(monkeypatch, tmp_path):
+    # A developer's repo-local .env may intentionally protect their real deck.
+    # The ephemeral test server is isolated and explicitly unauthenticated.
+    monkeypatch.delenv("MUTEKI_WEB_PASSWORD", raising=False)
+    app = create_app(RunManager(sessions_root=tmp_path / "sessions"))
     with _Server(app) as s:
         yield s
 
@@ -234,7 +243,7 @@ async def test_btw_endpoint_streams_one_shot_worker_without_swarm_slot(
     assert run.worker_cmds.empty()
 
 
-async def test_hitl_post_is_accepted_and_echoed(server) -> None:
+async def test_hitl_post_is_audited_without_faking_idle_runtime_effect(server) -> None:
     async with httpx.AsyncClient(base_url=server.base, timeout=30, trust_env=False) as client:
         # idle run keeps the bus open so the HITL echo is observable (a fast mock
         # run could close the stream before we post)
@@ -249,7 +258,11 @@ async def test_hitl_post_is_accepted_and_echoed(server) -> None:
             "/api/runs/hitl-run/hitl",
             json={"target": "solver:mock-flash", "action": "hint", "text": "try base64"},
         )
-        assert r.status_code == 200 and r.json()["ok"] is True
+        assert r.status_code == 200
+        # The idle smoke driver has no coordinator/control consumer. Persistence
+        # and the operator echo are real, but runtime delivery is UNKNOWN and the
+        # legacy bool facade must not call that a successful effect.
+        assert r.json()["ok"] is False
         await asyncio.wait_for(watcher, timeout=15)
     assert EventType.HITL_RESPONSE.value in seen
 
@@ -263,6 +276,7 @@ async def test_non_dict_body_is_rejected_with_400(server) -> None:
         await client.post("/api/runs/badbody-run/start", json={"kind": "idle"})
         for method, path in [
             ("POST", "/api/runs/badbody-run/hitl"),
+            ("POST", "/api/runs/badbody-run/control"),
             ("PATCH", "/api/runs/badbody-run"),
             ("POST", "/api/runs/badbody-run/start"),
             ("POST", "/api/folders"),
@@ -417,12 +431,8 @@ async def test_engines_endpoint_passes_enabled_worker_profiles(tmp_path, monkeyp
     assert seen["profiles"][0]["model"] == "sonnet"
 
 
-async def test_credential_account_api_echoes_secret_and_persists(tmp_path) -> None:
-    """The credential endpoints deliberately ECHO the stored secret back so the
-    settings UI can show & edit it in place (operator request — see
-    credential_accounts._read_secret_value's SECURITY POSTURE note). The route is
-    password-authenticated; the plaintext travels only over that gated channel.
-    Here we assert the secret round-trips through both PUT and the list GET."""
+async def test_credential_account_api_omits_secret_and_persists(tmp_path) -> None:
+    """Credential APIs report presence without returning stored material."""
     app = create_app(RunManager(sessions_root=str(tmp_path / "sessions")))
     with _Server(app) as srv:
         async with httpx.AsyncClient(base_url=srv.base, timeout=15, trust_env=False) as client:
@@ -432,27 +442,26 @@ async def test_credential_account_api_echoes_secret_and_persists(tmp_path) -> No
             )
             assert r.status_code == 200
             assert r.json()["account"]["engine"] == "claude"
-            # echoed for in-place editing, not masked
-            assert r.json()["account"]["details"]["secret_value"] == "super-secret-token"
+            assert "secret_value" not in r.json()["account"]["details"]
 
             listed = await client.get("/api/settings/credential-accounts")
             assert listed.status_code == 200
             accounts = listed.json()["accounts"]
             assert accounts[0]["account_id"] == "claude-team"
             assert accounts[0]["present"] is True
-            assert accounts[0]["details"]["secret_value"] == "super-secret-token"
+            assert "secret_value" not in accounts[0]["details"]
 
             api = await client.put(
                 "/api/settings/credential-accounts/deepseek-main",
                 json={
-                    "engine": "api",
+                    "worker_engine": "claude",
+                    "connection": "custom_endpoint",
                     "secret": "deepseek-secret",
                     "base_url": "https://api.deepseek.example/v1",
                 },
             )
             assert api.status_code == 200
-            # both the api key and base_url are echoed for editing
-            assert api.json()["account"]["details"]["secret_value"] == "deepseek-secret"
+            assert "secret_value" not in api.json()["account"]["details"]
             assert api.json()["account"]["details"]["base_url"] is True
             assert (
                 api.json()["account"]["details"]["base_url_value"]
@@ -466,10 +475,8 @@ async def test_credential_account_api_echoes_secret_and_persists(tmp_path) -> No
             assert bad.status_code == 404
 
 
-async def test_settings_redesign_endpoints(tmp_path) -> None:
-    """The four new settings endpoints (DESIGN §2.3/§2.4/§5) exist and behave:
-    system-login (read-only), runtime-environment write-back, account test
-    (no-creds → ok:false), llm test (bogus → ok:false, no network success)."""
+async def test_settings_support_endpoints(tmp_path) -> None:
+    """当前登录状态、账号探测和 LLM 探测接口可以独立调用。"""
     app = create_app(RunManager(sessions_root=str(tmp_path / "sessions")))
     with _Server(app) as srv:
         async with httpx.AsyncClient(base_url=srv.base, timeout=20, trust_env=False) as client:
@@ -477,20 +484,11 @@ async def test_settings_redesign_endpoints(tmp_path) -> None:
             sl = await client.get("/api/settings/system-login")
             assert sl.status_code == 200
             logins = sl.json()["logins"]
-            assert set(logins) == {"claude", "codex", "cursor"}
+            assert set(logins) == {
+                "claude", "codex", "cursor", "pi", "omp", "kimi", "grok",
+                "opencode", "dsh",
+            }
             assert all(v in ("present", "absent", "unknown") for v in logins.values())
-
-            # runtime-environment: flip to local, all profiles follow
-            rt = await client.put("/api/settings/runtime-environment",
-                                  json={"backend": "local", "runtime_id": "local"})
-            assert rt.status_code == 200
-            cfg = rt.json()["config"]
-            assert cfg["worker_backend"] == "local"
-            assert all(p["runtime"] == "local" for p in cfg["worker_profiles"])
-            # mismatch rejected
-            bad = await client.put("/api/settings/runtime-environment",
-                                   json={"backend": "local", "runtime_id": "docker-web"})
-            assert bad.status_code == 400
 
             # account test: unregistered account → ok:false, no host fallback
             at = await client.post(
@@ -504,6 +502,33 @@ async def test_settings_redesign_endpoints(tmp_path) -> None:
                                    json={"which": "planner", "model": ""})
             assert lt.status_code == 200
             assert lt.json()["ok"] is False
+
+            # planner/titler custom endpoint keys are persisted outside config;
+            # GET exposes only the credential source.
+            saved = await client.put("/api/settings/workers", json={
+                "llm_profiles": {
+                    "planner": {
+                        "provider": "custom",
+                        "model": "planner-custom",
+                        "connection": "custom_endpoint",
+                        "base_url": "https://llm.example/v1",
+                        "api_key": "sk-planner-test",
+                    },
+                    "titler": {
+                        "provider": "deepseek",
+                        "model": "titler-default",
+                        "connection": "default",
+                    },
+                },
+            })
+            assert saved.status_code == 200
+            planner = saved.json()["config"]["llm_profiles"]["planner"]
+            assert planner["connection"] == "custom_endpoint"
+            assert planner["credential_source"] == "saved"
+            assert "api_key" not in planner
+            key_path = (tmp_path / "sessions" / "_secrets" / "llm_profiles"
+                        / "planner" / "API_KEY")
+            assert key_path.read_text(encoding="utf-8").strip() == "sk-planner-test"
 
 
 async def test_events_opens_for_not_yet_started_run(server) -> None:
@@ -677,8 +702,8 @@ async def test_upload_sanitizes_path_traversal_filename(tmp_path) -> None:
 # live task must get a synthetic RUN_FINISHED on stream open, so the deck settles
 # to "finished" (not stuck on running → only Stop shown). This is the run-4305 fix.
 @pytest.fixture
-def server_mgr():
-    mgr = RunManager(sessions_root="/tmp/muteki_web_ghost_sessions")
+def server_mgr(tmp_path):
+    mgr = RunManager(sessions_root=tmp_path / "ghost-sessions")
     app = create_app(mgr)
     with _Server(app) as s:
         yield s, mgr
@@ -704,6 +729,98 @@ async def test_events_injects_run_finished_for_ghost_run(server_mgr) -> None:
             _collect_sse(client, rid, seen, EventType.RUN_FINISHED.value), timeout=15)
     assert EventType.RUN_STARTED.value in seen
     assert EventType.RUN_FINISHED.value in seen  # the synthetic terminator
+
+
+async def test_events_do_not_inject_run_finished_for_protocol2_ghost(server_mgr) -> None:
+    from muteki.core.events import Event
+
+    s, mgr = server_mgr
+    rid = "protocol2-ghost-run"
+    catalog = mgr.protocol2.catalog
+    catalog.create_draft(
+        draft_id=f"draft:{rid}", policy={"protocol": 2}, occurred_at_ns=1)
+    catalog.begin_provision(
+        operation_id=f"provision:{rid}", draft_id=f"draft:{rid}",
+        run_id=rid, target_root=mgr.protocol2.root / "runs" / rid,
+        manifest_digest="a" * 64, owner_epoch=1, occurred_at_ns=2)
+    catalog.materialize(operation_id=f"provision:{rid}", occurred_at_ns=3)
+    run = mgr.create(rid)
+    await run.bus.emit(Event(
+        event_type=EventType.RUN_STARTED,
+        run_id=rid,
+        payload={"challenge": {"name": "protocol2"}},
+    ))
+    await run.bus.emit(Event(
+        event_type=EventType.REASONING_DELTA,
+        run_id=rid,
+        payload={"text": "interrupted"},
+    ))
+    run.started = True
+    run.finished = False
+    run.task = None
+
+    async with httpx.AsyncClient(base_url=s.base, timeout=30, trust_env=False) as client:
+        async with client.stream("GET", f"/api/runs/{rid}/events") as resp:
+            assert resp.status_code == 200
+            lines = resp.aiter_lines()
+            seen: set[str] = set()
+            while EventType.REASONING_DELTA.value not in seen:
+                line = await asyncio.wait_for(lines.__anext__(), timeout=3)
+                if line.startswith("event:"):
+                    seen.add(line.split(":", 1)[1].strip())
+            assert EventType.RUN_FINISHED.value not in seen
+
+            async def next_event() -> str:
+                while True:
+                    line = await lines.__anext__()
+                    if line.startswith("event:"):
+                        return line.split(":", 1)[1].strip()
+
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(next_event(), timeout=0.25)
+
+
+async def test_confirmed_protocol1_ghost_settles_after_catalog_failure(
+    server_mgr, monkeypatch, caplog,
+) -> None:
+    from muteki.core.events import Event
+
+    s, mgr = server_mgr
+    rid = "catalog-ownership-unknown"
+    run = mgr.create(rid)
+    await run.bus.emit(Event(
+        event_type=EventType.RUN_STARTED,
+        run_id=rid,
+        payload={"challenge": {"name": "unknown ownership"}},
+    ))
+    await run.bus.emit(Event(
+        event_type=EventType.REASONING_DELTA,
+        run_id=rid,
+        payload={"text": "interrupted"},
+    ))
+    run.started = True
+    run.finished = False
+    run.task = None
+
+    def unavailable(_run_id):
+        raise RuntimeError("catalog diagnostic secret")
+
+    monkeypatch.setattr(mgr.protocol2, "has_run", unavailable)
+    async with httpx.AsyncClient(base_url=s.base, timeout=30, trust_env=False) as client:
+        async with client.stream("GET", f"/api/runs/{rid}/events") as resp:
+            assert resp.status_code == 200
+            lines = resp.aiter_lines()
+            seen: set[str] = set()
+            while EventType.REASONING_DELTA.value not in seen:
+                line = await asyncio.wait_for(lines.__anext__(), timeout=3)
+                if line.startswith("event:"):
+                    seen.add(line.split(":", 1)[1].strip())
+            while EventType.RUN_FINISHED.value not in seen:
+                line = await asyncio.wait_for(lines.__anext__(), timeout=3)
+                if line.startswith("event:"):
+                    seen.add(line.split(":", 1)[1].strip())
+            assert EventType.RUN_FINISHED.value in seen
+    assert "catalog diagnostic secret" not in caplog.text
 
 
 async def test_finished_event_stream_stays_open_after_replay(server_mgr) -> None:
@@ -749,6 +866,53 @@ async def test_finished_event_stream_stays_open_after_replay(server_mgr) -> None
                 await asyncio.wait_for(next_nonempty_line_or_closed(), timeout=0.25)
 
 
+async def test_closed_event_stream_delivers_late_terminal_control_receipt(
+    server_mgr,
+) -> None:
+    from muteki.core.events import Event
+
+    s, mgr = server_mgr
+    rid = f"finished-control-{uuid.uuid4().hex}"
+    run = mgr.create(rid)
+    await run.bus.emit(Event(
+        event_type=EventType.RUN_STARTED,
+        run_id=rid,
+        payload={"challenge": {"name": "x"}},
+    ))
+    await run.bus.emit(Event(
+        event_type=EventType.RUN_FINISHED,
+        run_id=rid,
+        payload={"solved": False, "reason": "operator_stop"},
+    ))
+    run.started = True
+    run.finished = True
+    await run.bus.close()
+
+    async with httpx.AsyncClient(base_url=s.base, timeout=30, trust_env=False) as client:
+        async with client.stream("GET", f"/api/runs/{rid}/events") as resp:
+            lines = resp.aiter_lines()
+            while True:
+                line = await asyncio.wait_for(lines.__anext__(), timeout=3)
+                if line.startswith("event:") and EventType.RUN_FINISHED.value in line:
+                    break
+
+            await run.bus.emit(Event(
+                event_type=EventType.CONTROL_COMMAND,
+                run_id=rid,
+                payload={
+                    "command_id": "C-stop",
+                    "action": "stop",
+                    "status": "effect_observed",
+                },
+            ))
+
+            while True:
+                line = await asyncio.wait_for(lines.__anext__(), timeout=3)
+                if line.startswith("event:"):
+                    assert EventType.CONTROL_COMMAND.value in line
+                    break
+
+
 def test_rehydrate_force_settles_started_unfinished_run(tmp_path) -> None:
     # ghost run: a run whose on-disk summary says started=True but finished=False
     # (killed mid-run before RUN_FINISHED). On restart, _rehydrate has no live task,
@@ -772,6 +936,100 @@ def test_rehydrate_force_settles_started_unfinished_run(tmp_path) -> None:
     assert r2 is not None
     assert r2.started is True
     assert r2.finished is True   # force-settled (was a ghost otherwise)
+
+
+def test_rehydrate_protocol2_started_run_stays_unfinished(tmp_path) -> None:
+    from muteki.core.events import Event
+
+    sessions = tmp_path / "sessions"
+    control = tmp_path / "control"
+    mgr1 = RunManager(sessions_root=sessions, control_root=control)
+    rid = "protocol2-rehydrate-interrupted"
+    catalog = mgr1.protocol2.catalog
+    catalog.create_draft(
+        draft_id=f"draft:{rid}", policy={"protocol": 2}, occurred_at_ns=1)
+    catalog.begin_provision(
+        operation_id=f"provision:{rid}", draft_id=f"draft:{rid}",
+        run_id=rid, target_root=mgr1.protocol2.root / "runs" / rid,
+        manifest_digest="a" * 64, owner_epoch=1, occurred_at_ns=2)
+    catalog.materialize(operation_id=f"provision:{rid}", occurred_at_ns=3)
+    run = mgr1.create(rid)
+    asyncio.run(run.store.append(Event(
+        event_type=EventType.RUN_STARTED,
+        run_id=rid,
+        payload={"challenge": {"name": "protocol2"}},
+    )))
+
+    mgr2 = RunManager(sessions_root=sessions, control_root=control)
+    recovered = mgr2.get(rid)
+    assert recovered is not None
+    assert recovered.protocol_version == 2
+    assert recovered.started is True
+    assert recovered.solved is False
+    assert recovered.finished is False
+
+
+async def test_protocol2_catalog_lookup_failure_cannot_synthesize_ghost_terminal(
+    tmp_path, monkeypatch, caplog,
+) -> None:
+    from apps.web.protocol2_adapter import Protocol2WebAdapter
+    from muteki.core.events import Event
+
+    sessions = tmp_path / "sessions"
+    control = tmp_path / "control"
+    rid = "protocol2-lookup-failure"
+    first = RunManager(sessions_root=sessions, control_root=control)
+    catalog = first.protocol2.catalog
+    catalog.create_draft(
+        draft_id=f"draft:{rid}", policy={"protocol": 2}, occurred_at_ns=1)
+    catalog.begin_provision(
+        operation_id=f"provision:{rid}", draft_id=f"draft:{rid}",
+        run_id=rid, target_root=first.protocol2.root / "runs" / rid,
+        manifest_digest="a" * 64, owner_epoch=1, occurred_at_ns=2)
+    catalog.materialize(operation_id=f"provision:{rid}", occurred_at_ns=3)
+    run = first.create(rid)
+    await run.store.append(Event(
+        event_type=EventType.RUN_STARTED,
+        run_id=rid,
+        payload={"challenge": {"name": "protocol2"}},
+    ))
+
+    def unavailable(_self, _run_id):
+        raise RuntimeError("catalog secret must not escape")
+
+    monkeypatch.setattr(Protocol2WebAdapter, "has_run", unavailable)
+    restarted = RunManager(sessions_root=sessions, control_root=control)
+    recovered = restarted.get(rid)
+    assert recovered is not None
+    assert recovered.protocol_version == 2
+    assert recovered.finished is False
+    assert recovered.solved is False
+
+    app = create_app(restarted)
+    with _Server(app) as server:
+        async with httpx.AsyncClient(
+            base_url=server.base, timeout=30, trust_env=False
+        ) as client:
+            async with client.stream("GET", f"/api/runs/{rid}/events") as resp:
+                assert resp.status_code == 200
+                lines = resp.aiter_lines()
+                seen: set[str] = set()
+                while EventType.RUN_STARTED.value not in seen:
+                    line = await asyncio.wait_for(lines.__anext__(), timeout=3)
+                    if line.startswith("event:"):
+                        seen.add(line.split(":", 1)[1].strip())
+                assert EventType.RUN_FINISHED.value not in seen
+
+                async def next_event() -> str:
+                    while True:
+                        line = await lines.__anext__()
+                        if line.startswith("event:"):
+                            return line.split(":", 1)[1].strip()
+
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(next_event(), timeout=0.25)
+    assert "catalog secret must not escape" not in caplog.text
+
 
 
 def test_start_finally_emits_run_finished_on_cancel(tmp_path) -> None:
@@ -799,7 +1057,7 @@ def test_start_finally_emits_run_finished_on_cancel(tmp_path) -> None:
     asyncio.run(go())
 
 
-def test_start_finally_includes_runtime_failure_detail(tmp_path) -> None:
+def test_start_finally_sanitizes_runtime_failure_detail(tmp_path) -> None:
     mgr = RunManager(sessions_root=str(tmp_path / "sessions"))
     seen: list[dict] = []
 
@@ -810,7 +1068,9 @@ def test_start_finally_includes_runtime_failure_detail(tmp_path) -> None:
 
         async def driver(run) -> None:
             run.bus.add_sink(sink)
-            raise RuntimeError("profile_unhealthy missing credential account(s): cursor-api-local:cursor-main")
+            raise RuntimeError(
+                "profile_unhealthy secret=do-not-persist "
+                "account=cursor-api-local:cursor-main")
 
         run = await mgr.start("failed-run", driver)
         await run.task
@@ -819,4 +1079,13 @@ def test_start_finally_includes_runtime_failure_detail(tmp_path) -> None:
     asyncio.run(go())
     assert seen
     assert seen[-1]["reason"] == "runtime_failure"
-    assert "cursor-api-local:cursor-main" in seen[-1]["detail"]
+    assert seen[-1]["detail"].startswith(
+        "driver failed (RuntimeError): profile_unhealthy")
+    assert "secret=<redacted>" in seen[-1]["detail"]
+    assert "do-not-persist" not in seen[-1]["detail"]
+    persisted = "\n".join(
+        path.read_text(errors="replace")
+        for path in (tmp_path / "sessions").rglob("*.jsonl")
+    )
+    assert "do-not-persist" not in persisted
+    assert "cursor-api-local:cursor-main" in persisted

@@ -80,7 +80,7 @@ function FactItem({ f, t, zh, expanded, onToggle }: {
   const hasRaw = !!gist && gist !== f.fact;
   const when = relTime(f.ts, zh);
   return (
-    <div className={`evi-item ${f.verified ? "v" : "c"} ${expanded ? "expanded" : ""}`.trim()}>
+    <div id={f.factSeq ? `fact-${f.factSeq}` : undefined} className={`evi-item ${f.verified ? "v" : "c"} ${expanded ? "expanded" : ""}`.trim()}>
       <div className="evi-head">
         <button
           type="button"
@@ -166,7 +166,7 @@ function DeadEndItem({ d, t, zh, expanded, onToggle }: {
   );
 }
 
-export function EvidenceChain({ deck }: { deck: DeckState }) {
+export function EvidenceChain({ deck, focusFactSeq, focusNonce }: { deck: DeckState; focusFactSeq?: number; focusNonce?: number }) {
   const t = useT();
   const { lang } = useLang();
   const zh = lang === "zh";
@@ -180,6 +180,13 @@ export function EvidenceChain({ deck }: { deck: DeckState }) {
       if (v != null) setNewestFirst(v === "1");
     } catch { /* private mode — keep default */ }
   }, []);
+  useEffect(() => {
+    if (!focusFactSeq) return;
+    const id = `v${focusFactSeq}`;
+    setExpandedIds((prev) => { const next = new Set(prev); next.add(id); return next; });
+    const node = document.getElementById(`fact-${focusFactSeq}`);
+    node?.scrollIntoView({ block: "nearest" });
+  }, [focusFactSeq, focusNonce]);
   const toggleSort = (next: boolean) => {
     setNewestFirst(next);
     try { localStorage.setItem(SORT_KEY, next ? "1" : "0"); } catch { /* best effort */ }
@@ -224,6 +231,7 @@ export function EvidenceChain({ deck }: { deck: DeckState }) {
         <div className="evi-toolbar-title">
           <div className="panel-title">{t("evidence.title")}</div>
           <div className="evi-summary">
+            {deck.blackboard.truncated?.facts && <span>{t("runtime.truncated", { n: 200 })}</span>}
             <span>{t("evidence.total", { n: total })}</span>
             <span>{t("evidence.actors", { n: actorCount })}</span>
             <span>{newestFirst ? t("evidence.sortNewest") : t("evidence.sortOldest")}</span>

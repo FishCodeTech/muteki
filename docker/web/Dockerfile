@@ -11,6 +11,13 @@
 
 FROM python:3.13-slim
 
+ARG IMAGE_VERSION=development
+ARG IMAGE_REVISION=unknown
+LABEL org.opencontainers.image.title="Project Muteki Web" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      org.opencontainers.image.revision="${IMAGE_REVISION}" \
+      org.opencontainers.image.source="https://github.com/FishCodeTech/muteki"
+
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     # P2-v3: this process runs inside a container → force container worker backend,

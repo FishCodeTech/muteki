@@ -1,27 +1,33 @@
 "use client";
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import type { CSSProperties, PointerEvent as ReactPointerEvent } from "react";
+import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import {
   ChatMessage, DeckState, HitlRequest, SolverCost, SwarmDigest,
-  coordinatorThread, swarmDigest,
+  coordinatorThread, hitlDeliveryState, swarmDigest,
 } from "@/lib/events";
 import { getWorkerSettings, checkAuth, SavedFile } from "@/lib/useRun";
+import {
+  commandIdForDecision, type DecisionControlAction,
+} from "@/lib/controlClient";
 import { useT, useLang } from "@/lib/i18n";
 import { EngineBar } from "@/components/EngineBar";
 import { Icon, type IconName } from "@/components/Icon";
+import { SelectionGlider } from "@/components/SelectionGlider";
 import { RunInspector } from "@/components/RunInspector";
 import { CopyText } from "@/components/CopyText";
+import { NumberField } from "@/components/NumberField";
+import { reportToMarkdown } from "@/lib/reportMarkdown";
 import { useCopied } from "@/lib/useCopied";
 import { InspectorSkeleton, SkelLine } from "@/components/Skeleton";
-import type { ArtifactView } from "@/components/ArtifactPanel";
+import type { ArtifactView } from "@/lib/events";
 
 /**
  * The conversation spine (the redesign's centre column): a ChatGPT/Claude-style
  * thread between the operator and the COORDINATOR (DeepSeek `reason`). It owns
  * the welcome/dispatch state and the dual-mode composer. The worker firehose,
- * fact-graph and blackboard are NOT here — they live in the persistent right-
- * column RunInspector + the secondary panels. The deck stays a dumb subscriber.
+ * fact-graph and blackboard live in the persistent right-column RunInspector
+ * and the peer runtime workspace. The deck stays a dumb subscriber.
  *
  * i18n: static UI is translated; agent-produced text renders verbatim. Only
  * system lifecycle lines + the synthesized progress/answer turns carry keys.
@@ -50,20 +56,26 @@ export interface DispatchOpts {
   raceEngines?: string[];
 }
 
+export interface ControlCommandOpts {
+  requestId?: string;
+  commandId?: string;
+}
+
 // RUNNING — steer the live swarm:
-const QUICK_RUNNING = [
-  { key: "hint", labelKey: "quick.hint", tipKey: "quick.hint.tip" },
-  { key: "directive", labelKey: "quick.directive", tipKey: "quick.directive.tip" },
-  { key: "redirect", labelKey: "quick.redirect", tipKey: "quick.redirect.tip" },
-  { key: "focus", labelKey: "quick.focus", tipKey: "quick.focus.tip" },
-  { key: "pause", labelKey: "quick.pause", tipKey: "quick.pause.tip" },
-  { key: "resume", labelKey: "quick.thaw", tipKey: "quick.thaw.tip" },
+const QUICK_RUNNING: Array<{ key: string; labelKey: string; tipKey: string; icon: IconName }> = [
+  { key: "hint", labelKey: "quick.hint", tipKey: "quick.hint.tip", icon: "help" },
+  { key: "directive", labelKey: "quick.directive", tipKey: "quick.directive.tip", icon: "pencil" },
+  { key: "redirect", labelKey: "quick.redirect", tipKey: "quick.redirect.tip", icon: "network" },
+  { key: "focus", labelKey: "quick.focus", tipKey: "quick.focus.tip", icon: "target" },
+  { key: "pause", labelKey: "quick.pause", tipKey: "quick.pause.tip", icon: "pause" },
+  { key: "freeze", labelKey: "quick.freeze", tipKey: "quick.freeze.tip", icon: "lock" },
+  { key: "thaw", labelKey: "quick.thaw", tipKey: "quick.thaw.tip", icon: "play" },
 ];
 // FINISHED — relaunch / converse / wrap up.
-const QUICK_FINISHED = [
-  { key: "resolve", labelKey: "quick.resolve", tipKey: "quick.resolve.tip", primary: true },
-  { key: "ask", labelKey: "quick.ask", tipKey: "quick.ask.tip" },
-  { key: "writeup", labelKey: "quick.writeup", tipKey: "quick.writeup.tip" },
+const QUICK_FINISHED: Array<{ key: string; labelKey: string; tipKey: string; icon: IconName; primary?: boolean }> = [
+  { key: "resolve", labelKey: "quick.resolve", tipKey: "quick.resolve.tip", icon: "play", primary: true },
+  { key: "ask", labelKey: "quick.ask", tipKey: "quick.ask.tip", icon: "help" },
+  { key: "writeup", labelKey: "quick.writeup", tipKey: "quick.writeup.tip", icon: "pencil" },
 ];
 
 // max height the dispatch textarea auto-grows to (~6–7 rows) before it scrolls
@@ -99,13 +111,6 @@ function fmtSize(n: number): string {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-/** Compact token count: "842" / "12.3k" / "1.4M". */
-function fmtTokens(n: number): string {
-  if (n < 1000) return `${n}`;
-  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;
-  return `${(n / 1_000_000).toFixed(2)}M`;
-}
-
 /** event ts (seconds or ms) → ms. */
 function tsMs(ts: number): number {
   return ts < 1e12 ? ts * 1000 : ts;
@@ -124,16 +129,19 @@ function fmtDuration(ms: number): string {
 
 /** Live run duration: ticks every second while the run is open, freezes at
  *  finishedAt − startedAt once it ends. "" when the run hasn't started. */
-function useElapsed(startedAt?: number, finishedAt?: number): string {
+function useElapsed(startedAt?: number, finishedAt?: number, freeze = false): string {
   const [now, setNow] = useState(() => Date.now());
-  const live = startedAt != null && finishedAt == null;
+  const freezeRef = useRef<number | undefined>(undefined);
+  if (freeze && freezeRef.current == null) freezeRef.current = now;
+  if (!freeze) freezeRef.current = undefined;
+  const live = startedAt != null && finishedAt == null && !freeze;
   useEffect(() => {
     if (!live) return;
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, [live]);
   if (startedAt == null) return "";
-  const end = finishedAt != null ? tsMs(finishedAt) : now;
+  const end = finishedAt != null ? tsMs(finishedAt) : (freezeRef.current ?? now);
   return fmtDuration(end - tsMs(startedAt));
 }
 
@@ -184,8 +192,12 @@ function CoordBubble({
   // the natural terminal action (mirrors flag-copy). Skip terse/empty bubbles and
   // the operator's own + system lifecycle lines.
   const copyable = m.role === "agent" && (m.kind === "text" || m.kind === "reasoning") && text.trim().length > 40;
+  const nodeIcon: IconName = m.role === "human" ? "send"
+    : m.role === "agent" ? "cpu"
+      : m.kind === "insight" ? "pencil" : "clock";
   return (
     <div className={`coord-bubble ${cls}`} data-mid={m.id}>
+      <span className="coord-node" aria-hidden="true"><Icon name={nodeIcon} size={12} /></span>
       <div className="who">
         {who} <span className="k">{t(`msg.kind.${m.kind}`)}</span>
         {copyable && (
@@ -217,6 +229,7 @@ function CoordBubble({
 function DigestBubble({ digest, t }: { digest: SwarmDigest; t: (k: string, v?: Record<string, string | number>) => string }) {
   return (
     <div className="coord-bubble digest">
+      <span className="coord-node" aria-hidden="true"><Icon name="radio" size={12} /></span>
       <div className="coord-digest-title">{t("coord.digestTitle")}</div>
       <div className="body">
         {t("coord.digest", {
@@ -234,17 +247,38 @@ function DigestBubble({ digest, t }: { digest: SwarmDigest; t: (k: string, v?: R
 }
 
 function AnswerBubble({ digest, t }: { digest: SwarmDigest; t: (k: string, v?: Record<string, string | number>) => string }) {
-  const none = digest.flags.length === 0 && digest.phase !== "goal_met";
-  const multi = digest.expectedFlags > 1;
+  const pentest = digest.mode === "pentest";
+  const none = pentest
+    ? digest.reports.length === 0 && digest.phase !== "goal_met"
+    : digest.flags.length === 0 && digest.phase !== "goal_met";
+  const multi = pentest ? digest.expectedReports > 1 : digest.expectedFlags > 1;
   return (
     <div className={`coord-bubble answer ${none ? "none" : ""}`}>
+      <span className="coord-node" aria-hidden="true"><Icon name={none ? "clock" : "check"} size={12} /></span>
       <div className="coord-digest-title">
         {t("coord.answerTitle")}
-        {multi && digest.flags.length > 0 && (
-          <span className="ans-flag-count">{digest.flags.length}/{digest.expectedFlags}</span>
+        {multi && (pentest ? digest.reports.length > 0 : digest.flags.length > 0) && (
+          <span className="ans-flag-count">
+            {pentest ? `${digest.reports.length}/${digest.expectedReports}` : `${digest.flags.length}/${digest.expectedFlags}`}
+          </span>
         )}
       </div>
-      {digest.flags.length > 0 ? (
+      {pentest && digest.reports.length > 0 ? (
+        <div className="body">
+          {digest.reports.map((row) => (
+            <div key={row.id}>
+              <CopyText
+                value={reportToMarkdown(row)}
+                className="ans-flag"
+                titleKey="runtime.reports.copyMarkdown"
+                ariaLabelKey="runtime.reports.copyMarkdownAria"
+              >
+                {row.title}
+              </CopyText>
+            </div>
+          ))}
+        </div>
+      ) : !pentest && digest.flags.length > 0 ? (
         <div className="body">
           {digest.flags.map((f) => (
             <div key={f}>
@@ -283,12 +317,10 @@ const PHASE_ICON: Record<SwarmDigest["phase"], IconName> = {
   finished: "check",
 };
 
-/** Always-visible run-status hero band at the top of the coordinator column.
- *  Surfaces the single thing an operator wants at a glance — the run's phase
- *  (solved / collecting / paused / running / finished) plus the one most-relevant
- *  detail — instead of forcing them to read the bottom of a scrolled thread or
- *  the side inspector. Reads only existing `swarmDigest` fields; the live pulse
- *  is gated on prefers-reduced-motion in CSS. */
+/** Always-visible run-status summary at the top of the coordinator column.
+ *  It keeps the current phase and timing compact while exposing every accepted
+ *  flag through an expandable result ledger. Reads only existing `swarmDigest`
+ *  fields; the live pulse is gated on prefers-reduced-motion in CSS. */
 function FlowPopover({
   digest,
   hitlCount,
@@ -343,11 +375,25 @@ function FlowPopover({
 
 function StatusHero({ digest, hitlCount, t }: { digest: SwarmDigest; hitlCount: number; t: (k: string, v?: Record<string, string | number>) => string }) {
   const [flowOpen, setFlowOpen] = useState(false);
-  const elapsed = useElapsed(digest.startedAt, digest.finishedAt);
+  const [resultsOpen, setResultsOpen] = useState(false);
+  const elapsed = useElapsed(
+    digest.startedAt,
+    digest.finishedAt,
+    digest.phase === "solved" || digest.phase === "goal_met" || digest.phase === "finished",
+  );
   const live = digest.phase === "running" || digest.phase === "collecting" || digest.phase === "racing";
-  // when the hero detail embeds a single raw flag, make it click-to-copy; copyFlag
-  // holds that raw flag (single-flag solved only — multi/no-flag stay plain text).
-  const copyFlag = digest.phase === "solved" && digest.expectedFlags <= 1 ? digest.flags[0] : "";
+  const singleFlag = digest.flags.length === 1 ? digest.flags[0] : "";
+  const hasResultLedger = digest.mode === "pentest"
+    ? digest.reports.length > 1 || digest.expectedReports > 1 || (digest.phase === "collecting" && digest.reports.length > 0)
+    : digest.flags.length > 1 || digest.expectedFlags > 1 || (digest.phase === "collecting" && digest.flags.length > 0);
+  const resultsVisible = resultsOpen && hasResultLedger;
+  const resultCount = digest.mode === "pentest"
+    ? (digest.expectedReports > 1
+      ? t("hero.results.reportProgress", { n: digest.reports.length, total: digest.expectedReports })
+      : t("hero.results.reportCount", { n: digest.reports.length }))
+    : (digest.expectedFlags > 1
+      ? t("hero.results.progress", { n: digest.flags.length, total: digest.expectedFlags })
+      : t("hero.results.count", { n: digest.flags.length }));
   // the one detail line that matters most for THIS phase.
   let detail: string;
   if (digest.phase === "solved") {
@@ -355,7 +401,14 @@ function StatusHero({ digest, hitlCount, t }: { digest: SwarmDigest; hitlCount: 
       ? t("hero.detail.solvedMulti", { n: digest.flags.length, total: digest.expectedFlags })
       : (digest.flags[0] ? t("hero.detail.solved", { flag: digest.flags[0] }) : t("hero.detail.solvedNoFlag"));
   } else if (digest.phase === "collecting") {
-    detail = t("hero.detail.collecting", { n: digest.flags.length, total: digest.expectedFlags });
+    detail = digest.mode === "pentest"
+      ? t("hero.detail.reportPipeline", {
+          submitted: digest.reportSubmitted,
+          reproducing: digest.reportReproducing,
+          accepted: digest.reportAccepted,
+          total: digest.expectedReports,
+        })
+      : t("hero.detail.collecting", { n: digest.flags.length, total: digest.expectedFlags });
   } else if (digest.phase === "paused") {
     detail = hitlCount > 0 ? t("hero.detail.pausedN", { n: hitlCount }) : t("hero.detail.paused");
   } else if (digest.phase === "goal_met") {
@@ -363,163 +416,157 @@ function StatusHero({ digest, hitlCount, t }: { digest: SwarmDigest; hitlCount: 
   } else if (digest.phase === "finished") {
     detail = t("hero.detail.finished", { verified: digest.verified, dead: digest.deadEnds });
   } else if (digest.phase === "racing") {
-    detail = t("hero.detail.racing", { online: digest.onlineWorkers, total: digest.totalWorkers });
+    detail = digest.verifyingActive > 0 || digest.raceTotal > 0
+      ? t("hero.detail.racingVerify", {
+          raceActive: digest.raceActive || digest.onlineWorkers,
+          raceTotal: digest.raceTotal || digest.totalWorkers,
+          verifyingActive: digest.verifyingActive,
+          verifyingMax: digest.verifyingMax,
+        })
+      : t("hero.detail.racing", { online: digest.onlineWorkers, total: digest.totalWorkers });
   } else if (digest.phase === "running") {
-    detail = digest.latestVerified
-      ? t("hero.detail.runningFact", { fact: digest.latestVerified })
-      : digest.onlineWorkers > 0
-        ? t("hero.detail.running", { online: digest.onlineWorkers, total: digest.totalWorkers })
-        : t("hero.detail.runningIdle", { total: digest.totalWorkers });
+    detail = digest.mode === "pentest"
+      && (digest.reportSubmitted > 0 || digest.reportReproducing > 0 || digest.verifyingActive > 0)
+      ? t("hero.detail.reportPipeline", {
+          submitted: digest.reportSubmitted,
+          reproducing: digest.reportReproducing,
+          accepted: digest.reportAccepted,
+          total: digest.expectedReports,
+        })
+      : digest.latestVerified
+        ? t("hero.detail.runningFact", { fact: digest.latestVerified })
+        : digest.onlineWorkers > 0
+          ? t("hero.detail.running", { online: digest.onlineWorkers, total: digest.totalWorkers })
+          : t("hero.detail.runningIdle", { total: digest.totalWorkers });
   } else {
     detail = t("hero.detail.draft");
   }
   useEffect(() => {
-    if (!flowOpen) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setFlowOpen(false); };
+    if (!flowOpen && !resultsVisible) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      setFlowOpen(false);
+      setResultsOpen(false);
+    };
     const onDoc = () => setFlowOpen(false);
     window.addEventListener("keydown", onKey);
-    window.addEventListener("click", onDoc);
+    if (flowOpen) window.addEventListener("click", onDoc);
     return () => {
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("click", onDoc);
     };
-  }, [flowOpen]);
+  }, [flowOpen, resultsVisible]);
 
-  const toggleFlow = (e?: { stopPropagation: () => void }) => {
-    e?.stopPropagation();
+  const toggleFlow = (e: { stopPropagation: () => void }) => {
+    e.stopPropagation();
+    setResultsOpen(false);
     setFlowOpen((v) => !v);
   };
-
+  const toggleResults = () => {
+    setFlowOpen(false);
+    setResultsOpen((value) => !value);
+  };
   return (
-    <div className="status-hero-shell">
+    <div className={`status-hero-shell ${resultsVisible ? "results-open" : ""}`}>
       <div
-        className={`status-hero phase-${digest.phase} ${live ? "live" : ""} ${flowOpen ? "open" : ""}`}
-        role="button"
-        tabIndex={0}
-        aria-haspopup="dialog"
-        aria-expanded={flowOpen}
-        aria-label={t("flow.open")}
-        onClick={toggleFlow}
-        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleFlow(e); } }}
+        className={`status-hero phase-${digest.phase} ${live ? "live" : ""} ${flowOpen || resultsVisible ? "open" : ""}`}
       >
-        <span className="sh-dot" aria-hidden="true" />
-        <span className="sh-ico" aria-hidden="true"><Icon name={PHASE_ICON[digest.phase]} size={15} /></span>
-        <span className="sh-phase">{t(`coord.phase.${digest.phase}`)}</span>
-        {copyFlag
-          ? <CopyText value={copyFlag} className="sh-detail sh-detail-flag">{detail}</CopyText>
-          : <span className="sh-detail" title={detail}>{detail}</span>}
-        <span className="sh-spacer" />
-        {live && digest.onlineWorkers > 0 && (
-          <span className="sh-workers" title={t("meta.workers")}>
-            <Icon name="cpu" size={12} /> {digest.onlineWorkers}/{digest.totalWorkers}
-          </span>
-        )}
-        {elapsed && <span className="sh-elapsed" title={t("meta.elapsed")}>{elapsed}</span>}
-        <span className="sh-flow" aria-hidden="true"><Icon name="list" size={12} /> {t("flow.short")}</span>
+        <span className="sh-status">
+          <span className="sh-ico" aria-hidden="true"><Icon name={PHASE_ICON[digest.phase]} size={15} /></span>
+          <span className="sh-phase">{t(`coord.phase.${digest.phase}`)}</span>
+          {(digest.phase === "racing" || digest.verifyingActive > 0) && (
+            <span className="sh-phase-pills" aria-label={t("hero.label.progress")}>
+              {(digest.phase === "racing" || digest.raceTotal > 0) && (
+                <span className="sh-phase-pill race">
+                  {t("coord.phasePill.race", {
+                    n: digest.raceFinished || 0,
+                    m: digest.raceTotal || digest.totalWorkers,
+                  })}
+                </span>
+              )}
+              {digest.verifyingActive > 0 && (
+                <span className="sh-phase-pill verifying">
+                  {t("coord.phasePill.verifying", {
+                    k: digest.verifyingActive,
+                    l: digest.verifyingMax,
+                  })}
+                </span>
+              )}
+            </span>
+          )}
+        </span>
+        <span className="sh-main">
+          {hasResultLedger ? (
+            <button
+              type="button"
+              className="sh-results-toggle"
+              aria-expanded={resultsVisible}
+              aria-controls="status-flag-results"
+              onClick={toggleResults}
+              title={t(resultsVisible ? "hero.results.collapse" : "hero.results.expand")}
+            >
+              <span className="sh-results-count">{resultCount}</span>
+              {digest.flags[0] && <code className="sh-results-preview">{digest.flags[0]}</code>}
+              {digest.flags.length > 1 && <span className="sh-results-more">+{digest.flags.length - 1}</span>}
+              <Icon name="chevronDown" size={13} />
+            </button>
+          ) : singleFlag ? (
+            <CopyText value={singleFlag} className="sh-detail sh-detail-flag">{singleFlag}</CopyText>
+          ) : (
+            <span className="sh-detail" title={detail}>{detail}</span>
+          )}
+        </span>
+        <span className="sh-meta">
+          {live && digest.onlineWorkers > 0 && (
+            <span className="sh-workers" title={t("meta.workers")}>
+              <Icon name="cpu" size={12} /> {digest.onlineWorkers}/{digest.totalWorkers}
+            </span>
+          )}
+          {elapsed && <span className="sh-elapsed" title={t("meta.elapsed")}><Icon name="clock" size={12} /> {elapsed}</span>}
+          <button
+            type="button"
+            className="sh-flow"
+            aria-haspopup="dialog"
+            aria-expanded={flowOpen}
+            aria-label={t("flow.open")}
+            onClick={toggleFlow}
+          >
+            <Icon name="list" size={12} /> {t("flow.short")}
+          </button>
+        </span>
       </div>
+      {resultsVisible && (
+        <section id="status-flag-results" className="sh-results-panel" aria-label={digest.mode === "pentest" ? t("hero.results.reportTitle") : t("hero.results.title")}>
+          <header className="sh-results-head">
+            <span><Icon name={digest.mode === "pentest" ? "list" : "flag"} size={13} /> {digest.mode === "pentest" ? t("hero.results.reportTitle") : t("hero.results.title")}</span>
+            <span>{resultCount}</span>
+          </header>
+          <div className="sh-results-list">
+            {digest.mode === "pentest"
+              ? digest.reports.map((row, index) => (
+                <div className="sh-result-row" key={row.id}>
+                  <span className="sh-result-index">{String(index + 1).padStart(2, "0")}</span>
+                  <CopyText
+                    value={reportToMarkdown(row)}
+                    className="sh-result-value"
+                    titleKey="runtime.reports.copyMarkdown"
+                    ariaLabelKey="runtime.reports.copyMarkdownAria"
+                  >
+                    {row.title}
+                  </CopyText>
+                </div>
+              ))
+              : digest.flags.map((flag, index) => (
+                <div className="sh-result-row" key={`${index}-${flag}`}>
+                  <span className="sh-result-index">{String(index + 1).padStart(2, "0")}</span>
+                  <CopyText value={flag} className="sh-result-value">{flag}</CopyText>
+                </div>
+              ))}
+          </div>
+        </section>
+      )}
       {flowOpen && <FlowPopover digest={digest} hitlCount={hitlCount} onClose={() => setFlowOpen(false)} t={t} />}
     </div>
-  );
-}
-
-function QuietMeta({ digest, t }: { digest: SwarmDigest; t: (k: string) => string }) {
-  const elapsed = useElapsed(digest.startedAt, digest.finishedAt);
-  // "Warming up": the run is genuinely live (running, not finished, started) but no
-  // progress has landed yet — all four progress metrics are still 0. In that window the
-  // strip of zeros otherwise reads as "broken/nothing happening" rather than "spinning
-  // up". We only soften the cells (dim + gentle pulse, reduced-motion-gated in CSS); the
-  // moment any metric becomes non-zero this flips false and the strip looks normal again.
-  // Gated on running + !finished so a real finished run that ended with zeros stays plain.
-  const warming = digest.phase === "running" && digest.finishedAt == null && digest.startedAt != null
-    && digest.verified === 0 && digest.candidates === 0 && digest.openIntents === 0 && digest.deadEnds === 0;
-  // per-cell: dim the genuinely-zero progress values while warming so they don't look final.
-  const z = (n: number) => (warming && n === 0 ? " zero" : "");
-  return (
-    <div className={`quiet-meta${warming ? " warming" : ""}`}>
-      <div className="qm verified"><span className="qk">{t("meta.verified")}</span><span className={`qv${z(digest.verified)}`}>{digest.verified}</span></div>
-      <div className="qm candidates"><span className="qk">{t("meta.candidates")}</span><span className={`qv${z(digest.candidates)}`}>{digest.candidates}</span></div>
-      <div className="qm intents"><span className="qk">{t("meta.intents")}</span><span className={`qv${z(digest.openIntents)}`}>{digest.openIntents}</span></div>
-      <div className="qm dead"><span className="qk">{t("meta.dead")}</span><span className={`qv${z(digest.deadEnds)}`}>{digest.deadEnds}</span></div>
-      <div className="qm workers"><span className="qk">{t("meta.workers")}</span><span className="qv">{digest.onlineWorkers}/{digest.totalWorkers}</span></div>
-      <div className="qm cost has-pop">
-        <span className="qk">{t("meta.cost")}</span><span className="qv">${digest.usd.toFixed(4)}</span>
-        <CostPopover digest={digest} t={t} metric="usd" />
-      </div>
-      <div className="qm tokens has-pop">
-        <span className="qk">{t("meta.tokens")}</span>
-        <span className="qv" title={`${digest.tokensIn.toLocaleString()} ${t("meta.tokensIn")} / ${digest.tokensOut.toLocaleString()} ${t("meta.tokensOut")}`}>{fmtTokens(digest.tokensIn + digest.tokensOut)}</span>
-        <CostPopover digest={digest} t={t} metric="tokens" />
-      </div>
-      <div className={`qm elapsed ${digest.finishedAt == null && digest.startedAt != null ? "live" : ""}`}><span className="qk">{t("meta.elapsed")}</span><span className="qv">{elapsed || "—"}</span></div>
-    </div>
-  );
-}
-
-const ENGINE_LABELS: Record<string, string> = {
-  claude: "Claude", codex: "Codex", cursor: "Cursor", deepseek: "DeepSeek",
-};
-
-/** A friendly agent name from a solverId + engine. solverIds look like
- *  "cli-claude-2" / "reason" / "coordinator"; prefer the engine label, append a
- *  short suffix (the trailing index) when several share an engine. */
-function agentLabel(solverId: string, engine?: string): string {
-  const base = engine ? (ENGINE_LABELS[engine] || engine) : null;
-  const idx = solverId.match(/-(\d+)$/)?.[1];
-  if (base) return idx ? `${base} #${idx}` : base;
-  // no engine (deepseek reason/coordinator) — title-case the raw id
-  return solverId.charAt(0).toUpperCase() + solverId.slice(1);
-}
-
-/** Hover card over the cost / token cell: a per-agent breakdown, styled like the
- *  engine quota popover. `metric` decides what the bar + headline figure show
- *  ($ spent, or total tokens) while the row always lists both. */
-function CostPopover({ digest, t, metric }: {
-  digest: SwarmDigest; t: (k: string) => string; metric: "usd" | "tokens";
-}) {
-  const rows = Object.entries(digest.costBySolver)
-    .map(([sid, c]) => ({
-      sid, engine: c.engine, usd: c.usd,
-      tokens: c.tokensIn + c.tokensOut, tokensIn: c.tokensIn, tokensOut: c.tokensOut,
-    }))
-    .filter((r) => r.usd > 0 || r.tokens > 0)
-    .sort((a, b) => (metric === "usd" ? b.usd - a.usd : b.tokens - a.tokens));
-  const total = metric === "usd" ? digest.usd : digest.tokensIn + digest.tokensOut;
-  const max = Math.max(1, ...rows.map((r) => (metric === "usd" ? r.usd : r.tokens)));
-  return (
-    <span className="engine-pop cost-pop" role="tooltip">
-      <span className="engine-pop-head">
-        <b>{t(metric === "usd" ? "meta.costByAgent" : "meta.tokensByAgent")}</b>
-        <span className="engine-pop-sub" style={{ marginLeft: "auto" }}>
-          {metric === "usd" ? `$${total.toFixed(4)}` : fmtTokens(total as number)}
-        </span>
-      </span>
-      {rows.length > 0 ? (
-        <span className="engine-pop-rows">
-          {rows.map((r) => {
-            const val = metric === "usd" ? r.usd : r.tokens;
-            const pct = (val / max) * 100;
-            return (
-              <span className="engine-pop-row cost-row" key={r.sid}>
-                <span className="engine-pop-label">{agentLabel(r.sid, r.engine)}</span>
-                <span className="engine-pop-bar">
-                  <span className="engine-pop-fill q-ok" style={{ width: `${pct}%` }} />
-                </span>
-                <span className="engine-pop-pct">
-                  {metric === "usd" ? `$${r.usd.toFixed(4)}` : fmtTokens(r.tokens)}
-                </span>
-                <span className="engine-pop-reset cost-sub">
-                  {metric === "usd"
-                    ? `${fmtTokens(r.tokens)} ${t("meta.tokens")}`
-                    : `${r.tokensIn.toLocaleString()} ${t("meta.tokensIn")} / ${r.tokensOut.toLocaleString()} ${t("meta.tokensOut")}`}
-                </span>
-              </span>
-            );
-          })}
-        </span>
-      ) : (
-        <span className="engine-pop-note">{t("meta.costNoData")}</span>
-      )}
-    </span>
   );
 }
 
@@ -528,19 +575,27 @@ function CostPopover({ digest, t, metric }: {
  *  "needs your decision" heading). When the request carries `options`, each is a
  *  one-click answer button; the free-text input is always available for a custom
  *  answer (Enter submits). The FIRST pending card autofocuses its input so the
- *  operator can just type + Enter. `sending` disables controls until the request
- *  leaves deck.hitlRequests (a HITL_RESPONSE clears it). */
+ *  operator can just type + Enter. Admission locks the answer exactly once; the
+ *  correlated durable control receipt then renders pending/recovery state until
+ *  EFFECT_OBSERVED closes the card. */
 function HitlCard({
   req, first, onAnswer, onDismiss,
 }: {
   req: HitlRequest;
   first: boolean;
-  onAnswer: (opt: string) => void;
-  onDismiss?: () => void;
+  onAnswer: (requestId: string, opt: string, commandId: string) => Promise<boolean>;
+  onDismiss?: (requestId: string, commandId: string) => Promise<boolean>;
 }) {
   const t = useT();
   const [free, setFree] = useState("");
   const [sending, setSending] = useState(false);
+  const [locallyRecorded, setLocallyRecorded] = useState(false);
+  const commandIdsRef = useRef<Partial<Record<DecisionControlAction, string>>>({});
+  const attemptRef = useRef<{
+    action: DecisionControlAction;
+    value: string;
+    commandId: string;
+  } | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const hasOptions = req.options.length > 0;
   // F: only an external_blocker actually freezes the swarm + needs an operator
@@ -548,20 +603,61 @@ function HitlCard({
   // candidate). An unclassified card (no needKind) defaults to blocking (back-compat).
   const pauses = req.pausesBehavior ?? true;
   const kindLabel = req.needKind ? t(`hitl.kind.${req.needKind}`) : t("hitl.title");
+  const durableDelivery = hitlDeliveryState(req);
+  // Lock immediately when POST /control succeeds; the SSE projection replaces
+  // this local bridge as soon as PERSISTED/terminal lifecycle events arrive.
+  const answerRecorded = locallyRecorded || durableDelivery.locked;
+  const deliveryPhase = durableDelivery.locked ? durableDelivery.phase
+    : locallyRecorded ? "pending" : "open";
   // autofocus the topmost pending request's input — when the current first card
   // is answered and clears, the next one becomes `first` and grabs focus.
   useEffect(() => {
     if (first && pauses) inputRef.current?.focus();
   }, [first, pauses]);
-  const submit = (value: string) => {
+  useEffect(() => {
+    if (durableDelivery.locked) {
+      setLocallyRecorded(true);
+      setSending(false);
+    }
+  }, [durableDelivery.locked]);
+  const submit = async (value: string) => {
     const v = value.trim();
-    if (!v || sending) return;
+    if (!v || sending || answerRecorded) return;
+    const commandId = commandIdForDecision(commandIdsRef.current, "answer_decision");
+    attemptRef.current = { action: "answer_decision", value: v, commandId };
     setSending(true);
-    onAnswer(v);
+    const ok = await onAnswer(req.id, v, commandId);
+    setSending(false);
+    if (ok) setLocallyRecorded(true);
   };
+  const dismiss = async () => {
+    if (!onDismiss || sending || answerRecorded) return;
+    const commandId = commandIdForDecision(commandIdsRef.current, "dismiss");
+    attemptRef.current = { action: "dismiss", value: "", commandId };
+    setSending(true);
+    const ok = await onDismiss(req.id, commandId);
+    setSending(false);
+    if (ok) setLocallyRecorded(true);
+  };
+  const retryDelivery = async () => {
+    const attempt = attemptRef.current;
+    if (!attempt || sending) return;
+    setSending(true);
+    const ok = attempt.action === "answer_decision"
+      ? await onAnswer(req.id, attempt.value, attempt.commandId)
+      : await onDismiss?.(req.id, attempt.commandId) ?? false;
+    setSending(false);
+    if (ok) setLocallyRecorded(true);
+  };
+  const deliveryKey = deliveryPhase === "open"
+    ? undefined : `hitl.delivery.${deliveryPhase}`;
+  const retryable = answerRecorded && deliveryPhase !== "observed"
+    && attemptRef.current !== null;
+  const activeCommandId = durableDelivery.commandId
+    ?? attemptRef.current?.commandId;
   return (
     <div
-      className={`hitl-card ${first ? "first" : ""} ${sending ? "sending" : ""} ${pauses ? "blocking" : "auto"}`}
+      className={`hitl-card ${first ? "first" : ""} ${sending ? "sending" : ""} ${answerRecorded ? "answered-readonly" : ""} delivery-${deliveryPhase} ${pauses ? "blocking" : "auto"}`}
       role="group"
       aria-label={t("hitl.region")}
     >
@@ -580,7 +676,29 @@ function HitlCard({
         </details>
       )}
       {/* F: auto-resolving cards are informational — no input, the swarm handles it */}
-      {pauses && <div className="hitl-opts">
+      {pauses && answerRecorded && deliveryKey && (
+        <div
+          className={`hitl-delivery-state ${deliveryPhase}`}
+          role="status"
+          aria-live="polite"
+          data-command-id={activeCommandId}
+          title={durableDelivery.detail}
+        >
+          <Icon name={deliveryPhase === "pending" || deliveryPhase === "observed" ? "clock" : "alert"} size={14} />
+          <span className="hitl-delivery-copy">{t(deliveryKey)}</span>
+          {retryable && (
+            <button
+              type="button"
+              className="hitl-delivery-retry"
+              disabled={sending}
+              onClick={retryDelivery}
+            >
+              {sending ? t("hitl.delivery.retrying") : t("hitl.delivery.retry")}
+            </button>
+          )}
+        </div>
+      )}
+      {pauses && !answerRecorded && <div className="hitl-opts">
         {req.options.map((o) => (
           <button key={o} type="button" disabled={sending} onClick={() => submit(o)}>{o}</button>
         ))}
@@ -608,7 +726,7 @@ function HitlCard({
             className="hitl-dismiss"
             disabled={sending}
             title={t("hitl.dismiss.tip")}
-            onClick={() => { setSending(true); onDismiss(); }}
+            onClick={dismiss}
           >
             {t("hitl.dismiss")}
           </button>
@@ -626,8 +744,8 @@ function CoordinatorThread({
 }: {
   deck: DeckState;
   running: boolean;
-  onAnswer: (opt: string) => void;
-  onDismiss?: () => void;
+  onAnswer: (requestId: string, opt: string, commandId: string) => Promise<boolean>;
+  onDismiss?: (requestId: string, commandId: string) => Promise<boolean>;
 }) {
   const t = useT();
   const messages = coordinatorThread(deck);
@@ -667,6 +785,7 @@ function Composer({
   started,
   solved,
   running,
+  paused,
   solvers,
   flags,
   onDispatch,
@@ -675,18 +794,26 @@ function Composer({
   attachments,
   onAddFiles,
   onRemoveFile,
+  prefill,
+  onPrefillConsumed,
 }: {
   started: boolean;
   solved: boolean;
   running: boolean;
+  paused: boolean;
   solvers: string[];
   flags: string[];
-  onDispatch: (prompt: string, opts: DispatchOpts) => void;
-  onCommand: (target: string, action: string, text: string) => void;
+  // Returns false when the dispatch was intercepted before launch (e.g. the
+  // open-ended collect confirm) — the composer keeps the prompt text then.
+  onDispatch: (prompt: string, opts: DispatchOpts) => void | boolean | Promise<void | boolean>;
+  onCommand: (target: string, action: string, text: string,
+              opts?: ControlCommandOpts) => Promise<boolean>;
   onResolve: (text?: string) => void;
   attachments: SavedFile[];
   onAddFiles: (files: FileList | File[]) => void;
   onRemoveFile: (path: string) => void;
+  prefill: ComposerPrefill | null;
+  onPrefillConsumed: () => void;
 }) {
   const t = useT();
   const [text, setText] = useState("");
@@ -755,6 +882,8 @@ function Composer({
   const [maxTotalWorkers, setMaxTotalWorkers] = useState("0");
   const [costBudgetUsd, setCostBudgetUsd] = useState("0");
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  /** Per-run overrides are sent only after the operator edits advanced fields. */
+  const [advancedTouched, setAdvancedTouched] = useState(false);
   useEffect(() => {
     let cancelled = false;
     try {
@@ -814,7 +943,21 @@ function Composer({
     try { window.localStorage.setItem("muteki.mode", m); } catch { /* ignore */ }
   };
 
-  const dispatch = () => {
+  useEffect(() => {
+    if (!prefill || started) return;
+    setText(prefill.text);
+    setMode(prefill.mode);
+    setGoal(prefill.goal ?? "");
+    setScope(prefill.scope ?? "");
+    try { window.localStorage.setItem("muteki.mode", prefill.mode); } catch { /* ignore */ }
+    window.requestAnimationFrame(() => {
+      dispatchRef.current?.focus();
+      dispatchRef.current?.setSelectionRange(prefill.text.length, prefill.text.length);
+    });
+    onPrefillConsumed();
+  }, [onPrefillConsumed, prefill, started]);
+
+  const dispatch = async () => {
     const v = text.trim();
     if (!v) return;
     const optionalInt = (raw: string) => {
@@ -825,24 +968,31 @@ function Composer({
       const parsed = parseFloat(raw);
       return Number.isNaN(parsed) ? undefined : parsed;
     };
-    const runCaps = {
-      raceTimeout: parseInt(raceTimeout, 10) || undefined,
-      wallClockBudget: optionalInt(wallClockBudget),
-      maxTotalWorkers: optionalInt(maxTotalWorkers),
-      costBudgetUsd: optionalFloat(costBudgetUsd),
-    };
-    onDispatch(v, mode === "pentest"
-      ? { webSearch, mode, goal: goal.trim(), scope: scope.trim(), containerMode, ...runCaps }
+    const runCaps = advancedTouched
+      ? {
+          raceTimeout: parseInt(raceTimeout, 10) || undefined,
+          wallClockBudget: optionalInt(wallClockBudget),
+          maxTotalWorkers: optionalInt(maxTotalWorkers),
+          costBudgetUsd: optionalFloat(costBudgetUsd),
+        }
+      : {};
+    const dispatched = await onDispatch(v, mode === "pentest"
+      ? { webSearch, mode, goal: goal.trim(), scope: scope.trim(),
+          collectCount: parseInt(collectCount, 10) || 0, containerMode, ...runCaps }
       : { webSearch, mode: "ctf", collect, containerMode,
           flagFormat,
           flagWrapper: flagFormat === "custom" ? flagWrapper.trim() : undefined,
           collectCount: collect ? (parseInt(collectCount, 10) || 0) : undefined,
           ...runCaps });
-    setText("");
+    // Intercepted dispatches (open-ended collect confirm) keep the text so
+    // "返回填写数量" does not throw the prompt away.
+    if (dispatched !== false) setText("");
   };
   const command = (action: string) => {
     const raw = text.trim();
-    if (action === "pause" || action === "resume") { onCommand(cmdTarget, action, ""); return; }
+    if (["pause", "resume", "freeze", "thaw"].includes(action)) {
+      onCommand(cmdTarget, action, ""); return;
+    }
     let a = action, payload = raw;
     if (raw.startsWith("/")) { const [v, ...rest] = raw.slice(1).split(" "); a = v; payload = rest.join(" "); }
     if (a === "resolve") { onResolve(payload || undefined); setText(""); return; }
@@ -850,12 +1000,19 @@ function Composer({
       setMarkFalseOpen((v) => !v);
       return;
     }
-    const NO_ARG = new Set(["writeup", "mark_false", "ask", "stop", "pause", "resume"]);
+    const NO_ARG = new Set([
+      "writeup", "mark_false", "ask", "stop", "pause", "resume", "freeze", "thaw",
+    ]);
     if (!payload && !NO_ARG.has(a)) return;
     onCommand(cmdTarget, a, payload);
     setMarkFalseOpen(false);
     setText("");
   };
+  const runningActions = paused
+    ? QUICK_RUNNING.map((action) => action.key === "pause"
+      ? { key: "resume", labelKey: "quick.resume", tipKey: "quick.resume.tip", icon: "play" as IconName }
+      : action)
+    : QUICK_RUNNING;
 
   if (!started) {
     return (
@@ -909,7 +1066,7 @@ function Composer({
             value={text}
             onChange={(e) => setText(e.target.value)}
             onInput={autoGrow}
-            onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); dispatch(); } }}
+            onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void dispatch(); } }}
             onPaste={(e) => {
               // Paste-to-attach: if the clipboard carries files (e.g. a screenshot,
               // a pcap, a binary), attach them instead of dumping bytes/text. Check
@@ -929,6 +1086,17 @@ function Composer({
             <div className="pentest-fields">
               <input className="pf-input" value={goal} onChange={(e) => setGoal(e.target.value)} placeholder={t("composer.goalPlaceholder")} />
               <input className="pf-input" value={scope} onChange={(e) => setScope(e.target.value)} placeholder={t("composer.scopePlaceholder")} />
+              <NumberField
+                className="collect-count"
+                min={0}
+                allowEmpty
+                value={collectCount}
+                onChange={setCollectCount}
+                scrubLabel="#"
+                placeholder={t("composer.findingsCountPlaceholder")}
+                title={t("composer.findingsCountTitle")}
+                ariaLabel={t("composer.findingsCountPlaceholder")}
+              />
             </div>
           )}
           {attachments.length > 0 && (
@@ -969,12 +1137,16 @@ function Composer({
               </button>
             )}
             {mode === "ctf" && collect && (
-              <input
-                type="number" min={0} className="collect-count"
+              <NumberField
+                className="collect-count"
+                min={0}
+                allowEmpty
                 value={collectCount}
-                onChange={(e) => setCollectCount(e.target.value)}
+                onChange={setCollectCount}
+                scrubLabel="#"
                 placeholder={t("composer.collectCountPlaceholder")}
                 title={t("composer.collectCountTitle")}
+                ariaLabel={t("composer.collectCountPlaceholder")}
               />
             )}
             <button
@@ -1048,26 +1220,29 @@ function Composer({
               <div className="advanced-metrics-grid">
                 <label className="advanced-field advanced-metric-field">
                   <span>{t("composer.raceTimeout")}</span>
-                  <input className="collect-count" type="number" min={1} value={raceTimeout}
-                    onChange={(e) => setRaceTimeout(e.target.value)}
+                  <NumberField className="collect-count" min={1} value={raceTimeout}
+                    onChange={(v) => { setAdvancedTouched(true); setRaceTimeout(v); }}
+                    suffix="s"
                     title={t("composer.raceTimeoutTitle")} />
                 </label>
                 <label className="advanced-field advanced-metric-field">
                   <span>{t("composer.wallBudget")}</span>
-                  <input className="collect-count" type="number" min={0} value={wallClockBudget}
-                    onChange={(e) => setWallClockBudget(e.target.value)}
+                  <NumberField className="collect-count" min={0} value={wallClockBudget}
+                    onChange={(v) => { setAdvancedTouched(true); setWallClockBudget(v); }}
+                    suffix="s"
                     title={t("composer.wallBudgetTitle")} />
                 </label>
                 <label className="advanced-field advanced-metric-field">
                   <span>{t("composer.maxTotalWorkers")}</span>
-                  <input className="collect-count" type="number" min={0} value={maxTotalWorkers}
-                    onChange={(e) => setMaxTotalWorkers(e.target.value)}
+                  <NumberField className="collect-count" min={0} value={maxTotalWorkers}
+                    onChange={(v) => { setAdvancedTouched(true); setMaxTotalWorkers(v); }}
                     title={t("composer.maxTotalWorkersTitle")} />
                 </label>
                 <label className="advanced-field advanced-metric-field">
                   <span>{t("composer.costBudget")}</span>
-                  <input className="collect-count" type="number" min={0} step="0.01" value={costBudgetUsd}
-                    onChange={(e) => setCostBudgetUsd(e.target.value)}
+                  <NumberField className="collect-count" min={0} step={0.01} value={costBudgetUsd}
+                    onChange={(v) => { setAdvancedTouched(true); setCostBudgetUsd(v); }}
+                    suffix="USD"
                     title={t("composer.costBudgetTitle")} />
                 </label>
               </div>
@@ -1088,19 +1263,20 @@ function Composer({
   }
 
   return (
-    <div className="composer2 motion-run-enter">
-      <div className="wrap">
-        <div className="crow" style={{ marginTop: 0 }}>
-          <span className="chip">{t("composer.to")}
+    <div className="composer2 command-composer motion-run-enter">
+      <div className="wrap command-wrap">
+        <div className="command-row">
+          <label className="command-target">{t("composer.to")}
             <select value={cmdTarget} onChange={(e) => setCmdTarget(e.target.value)}>
               <option value="global">{t("composer.allSolvers")}</option>
               {solvers.map((s) => <option key={s} value={`solver:${s}`}>{s}</option>)}
             </select>
-          </span>
+            <Icon name="chevronDown" size={12} />
+          </label>
           <input
             ref={commandRef}
             data-composer-input
-            style={{ flex: 1, background: "transparent", border: 0, color: "var(--text)", outline: "none", font: "inherit" }}
+            className="command-input"
             value={text}
             onChange={(e) => setText(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); command("hint"); } }}
@@ -1108,104 +1284,121 @@ function Composer({
           />
           <button className="send" onClick={() => command("hint")} title={t("composer.send")} aria-label={t("composer.send")}><Icon name="send" size={15} /></button>
         </div>
-      </div>
-      <div className="quick">
-        {running ? (
-          <>
-            {QUICK_RUNNING.map((a) => (
-              <button key={a.key} title={t(a.tipKey)} aria-label={t(a.tipKey)} onClick={() => command(a.key)}>{t(a.labelKey)}</button>
-            ))}
-            <span className="quick-sep" />
-            <button className="danger" onClick={() => command("stop")} title={t("quick.stopTitle")}>{t("quick.stop")}</button>
-          </>
-        ) : (
-          <>
-            {QUICK_FINISHED.map((a) => (
-              <button
-                key={a.key}
-                className={(a as { primary?: boolean }).primary ? "primary" : ""}
-                title={a.key === "resolve" ? t("quick.resolveTitle") : t(a.tipKey)}
-                aria-label={t(a.tipKey)}
-                onClick={() => command(a.key)}
-              >
-                {t(a.labelKey)}
-              </button>
-            ))}
-            {solved && (
+        <div className="command-actionbar">
+          <div className="quick">
+            {running ? (
               <>
+                {runningActions.map((a) => (
+                  <button key={a.key} title={t(a.tipKey)} aria-label={t(a.tipKey)} onClick={() => command(a.key)}><Icon name={a.icon} size={13} />{t(a.labelKey)}</button>
+                ))}
                 <span className="quick-sep" />
-                <button
-                  className="danger"
-                  title={t("quick.markFalseTitle")}
-                  onClick={() => {
-                    if (flags.length === 1) {
-                      onCommand(cmdTarget, "mark_false", flags[0]);
-                      setMarkFalseOpen(false);
-                    } else {
-                      command("mark_false");
-                    }
-                  }}
-                >
-                  {t("quick.markFalse")}
-                </button>
+                <button className="danger" onClick={() => command("stop")} title={t("quick.stopTitle")}><Icon name="xCircle" size={13} />{t("quick.stop")}</button>
+              </>
+            ) : (
+              <>
+                {QUICK_FINISHED.map((a) => (
+                  <button
+                    key={a.key}
+                    className={a.primary ? "primary" : ""}
+                    title={a.key === "resolve" ? t("quick.resolveTitle") : t(a.tipKey)}
+                    aria-label={t(a.tipKey)}
+                    onClick={() => command(a.key)}
+                  >
+                    <Icon name={a.icon} size={13} />{t(a.labelKey)}
+                  </button>
+                ))}
+                {solved && (
+                  <>
+                    <span className="quick-sep" />
+                    <button
+                      className="danger"
+                      title={t("quick.markFalseTitle")}
+                      onClick={() => {
+                        if (flags.length === 1) {
+                          onCommand(cmdTarget, "mark_false", flags[0]);
+                          setMarkFalseOpen(false);
+                        } else {
+                          command("mark_false");
+                        }
+                      }}
+                    >
+                      <Icon name="alert" size={13} />{t("quick.markFalse")}
+                    </button>
+                  </>
+                )}
               </>
             )}
-          </>
-        )}
-      </div>
-      {solved && markFalseOpen && flags.length > 1 && (
-        <div className="markfalse-picker" role="group" aria-label={t("quick.markFalseTitle")}>
-          {flags.map((f) => (
-            <button
-              key={f}
-              type="button"
-              title={f}
-              onClick={() => {
-                onCommand(cmdTarget, "mark_false", f);
-                setMarkFalseOpen(false);
-                setText("");
-              }}
-            >
-              {f}
-            </button>
-          ))}
+          </div>
+          <div className="command-hint">{running ? t("composer.steerHint") : t("composer.finishedHint")}</div>
         </div>
-      )}
-      <div className="hintline">
-        {running ? t("composer.steerHint") : t("composer.finishedHint")}
+        {solved && markFalseOpen && flags.length > 1 && (
+          <div className="markfalse-picker" role="group" aria-label={t("quick.markFalseTitle")}>
+            {flags.map((f) => (
+              <button
+                key={f}
+                type="button"
+                title={f}
+                onClick={() => {
+                  onCommand(cmdTarget, "mark_false", f);
+                  setMarkFalseOpen(false);
+                  setText("");
+                }}
+              >
+                {f}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
-/** First-run hero: the brand mark, the one-line pitch, and a row of example
- *  cards that hint at the kinds of challenges the swarm takes. The cards are
- *  presentational (the composer below is the single dispatch surface — kept
- *  untouched), so they read as "here's what this does", not dead buttons. */
-const WELCOME_EXAMPLES: { key: string; icon: IconName }[] = [
-  { key: "ex1", icon: "globe" },
-  { key: "ex2", icon: "lock" },
-  { key: "ex3", icon: "target" },
+type ComposerPrefill = {
+  mode: "ctf" | "pentest";
+  text: string;
+  goal?: string;
+  scope?: string;
+};
+
+/** First-run actions that prefill the real dispatch composer. */
+const WELCOME_EXAMPLES: Array<{ key: string; icon: IconName; mode: "ctf" | "pentest" }> = [
+  { key: "ex1", icon: "globe", mode: "ctf" },
+  { key: "ex2", icon: "lock", mode: "ctf" },
+  { key: "ex3", icon: "target", mode: "pentest" },
 ];
 
-function Welcome({ t }: { t: (k: string) => string }) {
+function Welcome({
+  t,
+  onChoose,
+}: {
+  t: (k: string) => string;
+  onChoose: (prefill: ComposerPrefill) => void;
+}) {
   return (
     <div className="welcome">
       <div className="welcome-hero">
         <div className="wm">無敵 <em>Muteki</em></div>
-        <div className="sub">
-          {t("welcome.sub")}<code>{t("welcome.subCode")}</code>{t("welcome.subTail")}
-        </div>
+        <div className="sub">{t("welcome.sub")}</div>
       </div>
       <div className="suggest-label">{t("welcome.examplesLabel")}</div>
       <div className="suggest">
         {WELCOME_EXAMPLES.map((ex) => (
-          <div className="suggest-card" key={ex.key}>
+          <button
+            type="button"
+            className="suggest-card"
+            key={ex.key}
+            onClick={() => onChoose({
+              mode: ex.mode,
+              text: t(`welcome.${ex.key}.prompt`),
+              goal: ex.mode === "pentest" ? t("welcome.ex3.goal") : undefined,
+            })}
+          >
             <span className="s-ico" aria-hidden="true"><Icon name={ex.icon} size={16} /></span>
             <span className="s-cat">{t(`welcome.${ex.key}.cat`)}</span>
             <span className="s-nm">{t(`welcome.${ex.key}.nm`)}</span>
             <span className="s-tg">{t(`welcome.${ex.key}.tg`)}</span>
-          </div>
+          </button>
         ))}
       </div>
     </div>
@@ -1225,6 +1418,8 @@ export function Conversation({
   artifactOpen,
   artifactView,
   onOpenArtifact,
+  onShowConversation,
+  runtimePanel,
   onToggleRail,
   theme,
   onToggleTheme,
@@ -1232,6 +1427,7 @@ export function Conversation({
   onKillWorker,
   onOpenWorker,
   onOpenWorkspace,
+  onOpenReport,
   onHitlAnswered,
   connected,
   onOpenBtw,
@@ -1239,15 +1435,20 @@ export function Conversation({
   deck: DeckState;
   running: boolean;
   loading: boolean;
-  onCommand: (target: string, action: string, text: string) => void;
+  onCommand: (target: string, action: string, text: string,
+              opts?: ControlCommandOpts) => Promise<boolean>;
   onResolve: (text?: string) => void;
-  onDispatch: (prompt: string, opts: DispatchOpts) => void;
+  // Returns false when the dispatch was intercepted before launch (e.g. the
+  // open-ended collect confirm) — the composer keeps the prompt text then.
+  onDispatch: (prompt: string, opts: DispatchOpts) => void | boolean | Promise<void | boolean>;
   attachments: SavedFile[];
   onAddFiles: (files: FileList | File[]) => void;
   onRemoveFile: (path: string) => void;
   artifactOpen: boolean;
   artifactView: ArtifactView;
   onOpenArtifact: (view: ArtifactView) => void;
+  onShowConversation: () => void;
+  runtimePanel: ReactNode;
   onToggleRail: () => void;
   theme: "light" | "dark";
   onToggleTheme: () => void;
@@ -1256,6 +1457,7 @@ export function Conversation({
   // open the "Worker 详情" panel focused on a single worker (roster row click).
   onOpenWorker: (solverId: string) => void;
   onOpenWorkspace: () => void;
+  onOpenReport: (reportId: string) => void;
   // fired after an operator answers a blocking HITL decision — owner toasts.
   onHitlAnswered?: () => void;
   connected: boolean;
@@ -1266,6 +1468,8 @@ export function Conversation({
   const scrollRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const [inspectorWidth, setInspectorWidth] = useState(INSPECTOR_WIDTH_DEFAULT);
+  const [composerPrefill, setComposerPrefill] = useState<ComposerPrefill | null>(null);
+  const consumeComposerPrefill = useCallback(() => setComposerPrefill(null), []);
   const [inspectorResizing, setInspectorResizing] = useState(false);
   const inspectorResizeCleanup = useRef<(() => void) | null>(null);
   useEffect(() => {
@@ -1360,12 +1564,15 @@ export function Conversation({
       : !deck.started
         ? t("convo.idle")
         : t("convo.disconnected");
-  const runStateLabel = digest.phase === "paused"
+  const runStateLabel = deck.preparing
+    ? t("convo.preparing")
+    : digest.phase === "paused"
     ? t("convo.paused")
     : running
       ? t("convo.live")
       : t("convo.finished");
-  const runStateClass = digest.phase === "paused" ? "paused" : running ? "live" : "done";
+  const runStateClass = deck.preparing ? "live" : digest.phase === "paused" ? "paused" : running ? "live" : "done";
+  const latestControl = deck.controlCommands[deck.controlCommands.length - 1];
 
   // Screen-reader live region: mirror ONLY the latest system lifecycle line
   // (run started, solved, finished, reopened, goal met, …) into a visually-hidden
@@ -1379,7 +1586,7 @@ export function Conversation({
 
   return (
     <div
-      className={`convo ${deck.started && !artifactOpen ? "has-inspector" : ""} ${inspectorResizing ? "inspector-resizing" : ""}`}
+      className={`convo ${deck.started && !artifactOpen ? "has-inspector" : ""} ${artifactOpen ? "runtime-peer-open" : ""} ${inspectorResizing ? "inspector-resizing" : ""}`}
       style={{ "--inspector-width": `${inspectorWidth}px` } as CSSProperties}
     >
       <div className="sr-only" role="status" aria-live="polite" aria-atomic="true" aria-label={t("a11y.status")}>{liveStatus}</div>
@@ -1395,6 +1602,19 @@ export function Conversation({
             )}
           </span>
         )}
+        {deck.started && (
+          <div className="convo-view-switch selection-glide-host" role="tablist" aria-label={t("convo.viewSwitcher")}>
+            <SelectionGlider selectedKey={artifactOpen ? "runtime" : "conversation"} selector='button[aria-selected="true"]' className="compact" duration={240} />
+            <button type="button" role="tab" aria-selected={!artifactOpen} className={!artifactOpen ? "on" : ""} onClick={onShowConversation}>
+              <Icon name="rows" size={13} />
+              <span>{t("convo.viewConversation")}</span>
+            </button>
+            <button type="button" role="tab" aria-selected={artifactOpen} className={artifactOpen ? "on" : ""} onClick={() => onOpenArtifact(artifactView)}>
+              <Icon name="panel" size={13} />
+              <span>{t("convo.viewRuntime")}</span>
+            </button>
+          </div>
+        )}
         <span className="spacer" />
         {onOpenBtw && (
           <button
@@ -1408,6 +1628,14 @@ export function Conversation({
         )}
         {deck.started && (
           <span className={`runstate ${runStateClass}`}>{runStateLabel}</span>
+        )}
+        {latestControl && (
+          <span
+            className={`control-receipt status-${latestControl.status}`}
+            title={latestControl.detail || `${latestControl.id} · ${latestControl.target}`}
+          >
+            /{latestControl.action} · {t(`control.status.${latestControl.status}`)}
+          </span>
         )}
         <EngineBar degradedEngines={deck.degradedEngines} />
         <span className={`dot ${connState}`} role="img" aria-label={connectionLabel} title={connectionLabel} />
@@ -1433,7 +1661,7 @@ export function Conversation({
             }}
           >
             {!deck.started && !loading ? (
-              <Welcome t={t} />
+              <Welcome t={t} onChoose={setComposerPrefill} />
             ) : (
               <div className={`workspace ${artifactOpen ? "solo" : ""}`}>
                 <div className="coord-col motion-run-enter">
@@ -1444,7 +1672,6 @@ export function Conversation({
                     </div>
                   )}
                   <StatusHero digest={digest} hitlCount={blockingHitlCount} t={t} />
-                  <QuietMeta digest={digest} t={t} />
                   {loading ? (
                     <div className="coord-thread">
                       <div className="coord-wrap">
@@ -1467,8 +1694,18 @@ export function Conversation({
                     <CoordinatorThread
                       deck={deck}
                       running={running}
-                      onAnswer={(opt) => { onCommand("global", "submit", opt); onHitlAnswered?.(); }}
-                      onDismiss={() => { onCommand("global", "dismiss", ""); onHitlAnswered?.(); }}
+                      onAnswer={async (requestId, opt, commandId) => {
+                        const ok = await onCommand(
+                          "global", "answer_decision", opt, { requestId, commandId });
+                        if (ok) onHitlAnswered?.();
+                        return ok;
+                      }}
+                      onDismiss={async (requestId, commandId) => {
+                        const ok = await onCommand(
+                          "global", "dismiss", "", { requestId, commandId });
+                        if (ok) onHitlAnswered?.();
+                        return ok;
+                      }}
                     />
                   )}
                 </div>
@@ -1480,6 +1717,7 @@ export function Conversation({
             started={deck.started}
             solved={deck.solved}
             running={running}
+            paused={digest.phase === "paused"}
             solvers={solvers}
             flags={deck.flags}
             onDispatch={onDispatch}
@@ -1488,11 +1726,13 @@ export function Conversation({
             attachments={attachments}
             onAddFiles={onAddFiles}
             onRemoveFile={onRemoveFile}
+            prefill={composerPrefill}
+            onPrefillConsumed={consumeComposerPrefill}
           />
         </div>
 
         {deck.started && !artifactOpen && (
-          <div className="inspector-shell">
+          <div className="inspector-shell conversation-inspector-shell">
             <div
               className="inspector-resizer"
               role="separator"
@@ -1523,10 +1763,15 @@ export function Conversation({
                 onOpenWorker={onOpenWorker}
                 onWriteup={onWriteup}
                 onMarkFalseFlag={onMarkFalseFlag}
+                onOpenReport={onOpenReport}
               />
             )}
           </div>
         )}
+
+        <div className="convo-runtime-peer">
+          {runtimePanel}
+        </div>
       </div>
     </div>
   );

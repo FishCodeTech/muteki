@@ -24,13 +24,16 @@ import os
 import re
 import shutil
 import signal
+import stat
 import tempfile
 import threading
 import time
 import uuid
-from pathlib import Path
-from typing import Any, Optional
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable, Mapping, Optional
+from urllib.parse import unquote, urlsplit
 
+from muteki.control.models import stable_decision_request_id
 from muteki.core.cost import CostController
 from muteki.core.event_bus import EventBus
 from muteki.core.events import (
@@ -38,12 +41,32 @@ from muteki.core.events import (
     insight_payload, shared_graph_delta_payload, solve_graph_delta_payload,
     tool_result_payload, worker_status_payload, worker_lifecycle_payload,
 )
-from muteki.models.solve_graph import Challenge, SolveGraph
+from muteki.models.solve_graph import Challenge, SolveGraph, engagement_goal_of
 from muteki.solver.cli_driver import (
-    CliDriver, CliResult, KB_MCP_NAME, StreamStep, driver_for, run_cli,
-    run_cli_streaming,
+    CliDriver, CliResult, KB_MCP_NAME, SecurePromptUnsupported, StreamStep,
+    apply_runtime_argv, driver_for, run_cli, run_cli_streaming,
 )
-from muteki.solver.gate import flag_ok as _gate_flag_ok, is_placeholder_flag
+from muteki.solver.gate import (
+    flag_ok as _gate_flag_ok,
+    finding_ok as _gate_finding_ok,
+    finding_key as _finding_key,
+    is_placeholder_flag,
+    parse_finding_claim,
+)
+from muteki.solver.vuln_report import (
+    VERIFIER_PROMPT as _VERIFIER_PROMPT,
+    _PENTEST_REPORT_BLOCK,
+    completeness_code,
+    missing_report_fields,
+    parse_report_files,
+    report_id_from_intent,
+    report_sse_fields,
+    replay_attempted,
+    witness_in_corpus,
+    VALUE_REJECT_DUPLICATE,
+    VALUE_REJECT_INCOMPLETE,
+    VALUE_REJECT_NOT_REPRODUCIBLE,
+)
 from muteki.solver.result import ArtifactStore
 from muteki.solver.result_codes import (
     RESULT_CANCELLED,
@@ -55,6 +78,7 @@ from muteki.solver.result_codes import (
     RESULT_TIMED_OUT,
 )
 from muteki.solver.types import SolverConfig, SolveOutcome
+from muteki.solver.worker_profiles import profile_uses_endpoint, worker_identity_from_env
 from muteki.solver.workspace import (
     ensure_workspace,
     link_input_into_worker,
@@ -67,6 +91,30 @@ from muteki.solver.workspace import (
 
 
 _WORKER_HEARTBEAT_SECONDS = 15.0
+_IDLE_REPEAT_LIMIT = 5
+_IDLE_REPEAT_STEER = (
+    "你在重复读取黑板且内容无变化，停止重复读取，按当前 intent 目标执行实际操作"
+)
+
+
+def _is_reasoning_replay(accumulated: str, incoming: str) -> bool:
+    """True when `incoming` restates the whole turn already streamed.
+
+    Pi/OMP emit token deltas, then `message_end` repeats the full assistant
+    text. A replay is that full snapshot: equal to the turn, or a longer
+    snapshot that already contains it as a prefix. A short suffix is a
+    normal incremental token — incremental engines often emit one letter
+    that already ends the buffer. Thinking deltas never enter the
+    accumulator (StreamStep.thinking), so the answer-only snapshot always
+    matches here instead of arriving as an unsealable suffix.
+    """
+    acc = (accumulated or "").strip()
+    text = (incoming or "").strip()
+    if not acc or not text:
+        return False
+    if text == acc:
+        return True
+    return len(text) >= len(acc) and text.startswith(acc)
 
 
 _WORKER_PATH_PREFIX = (
@@ -76,6 +124,8 @@ _WORKER_PATH_PREFIX = (
     "/sbin",
     "/opt/homebrew/bin",
     "/usr/local/bin",
+    # macOS Wireshark.app — host tshark/capinfos often live here, not in PATH.
+    "/Applications/Wireshark.app/Contents/MacOS",
 )
 
 
@@ -119,14 +169,6 @@ def _repo_blackboard_script() -> Optional[str]:
         return None
 
 
-# The user-scope copies the worker CLIs auto-discover (Claude/Cursor: ~/.claude/skills;
-# Codex: ~/.agents/skills), installed once by scripts/install_blackboard_skill.sh.
-_DEPLOYED_BLACKBOARD_SCRIPTS = (
-    "~/.claude/skills/muteki-blackboard/blackboard.py",
-    "~/.agents/skills/muteki-blackboard/blackboard.py",
-)
-
-
 def _file_sha256(path: Path) -> Optional[str]:
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -135,65 +177,12 @@ def _file_sha256(path: Path) -> Optional[str]:
 
 
 def sync_deployed_blackboard_skills() -> list[dict]:
-    """SAFETY NET (run once at swarm launch): reconcile the DEPLOYED user-scope skill
-    copies with the in-repo source.
+    """Compatibility shim retained for older callers.
 
-    Source runs invoke the repo skill directly (see _blackboard_script_path), so the
-    deployed copies don't gate THAT path. But a worker CLI also AUTO-DISCOVERS the
-    skill from its user-scope dir for any unprompted `muteki-blackboard` use, and an
-    installed (non-source) deployment relies on the deployed copy outright. Those
-    copies are installed once and then rot whenever the repo skill changes (run-75378:
-    deployed skill missing the entire G0-G4 + lifecycle landing). When a repo source is
-    present we treat it as truth and overwrite any stale/missing deployed copy.
-
-    Returns one report row per deployed target: {path, status, ...} where status is
-      'synced'        — was stale/missing, overwritten from repo (action taken)
-      'ok'            — already byte-identical to repo
-      'no-source'     — no in-repo source (installed deployment); nothing to compare
-      'error'         — copy failed (details in 'error')
-    The caller logs this + emits a board delta so a silent drift can't recur unseen."""
-    src = _repo_blackboard_script()
-    if src is None:
-        # Installed deployment with no adjacent repo skill: the deployed copy IS the
-        # source of truth, kept fresh by the package install, so there's nothing to
-        # reconcile against.
-        return [{"path": os.path.expanduser(t), "status": "no-source"}
-                for t in _DEPLOYED_BLACKBOARD_SCRIPTS]
-    src_path = Path(src)
-    src_hash = _file_sha256(src_path)
-    rows: list[dict] = []
-    for target in _DEPLOYED_BLACKBOARD_SCRIPTS:
-        dest = Path(os.path.expanduser(target))
-        if dest.resolve() == src_path.resolve():
-            # Deployed dir is a symlink (or the same file) into the repo — already
-            # impossible to drift; nothing to do.
-            rows.append({"path": str(dest), "status": "ok"})
-            continue
-        dest_hash = _file_sha256(dest)
-        if dest_hash == src_hash:
-            rows.append({"path": str(dest), "status": "ok"})
-            continue
-        # Stale or missing → overwrite from repo. Also refresh SKILL.md alongside it so
-        # the discovered skill's docs and code move together.
-        try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_path, dest)
-            try:
-                os.chmod(dest, 0o755)
-            except OSError:
-                pass
-            skill_md = src_path.parent / "SKILL.md"
-            if skill_md.is_file():
-                shutil.copy2(skill_md, dest.parent / "SKILL.md")
-            rows.append({
-                "path": str(dest),
-                "status": "synced",
-                "was": "missing" if dest_hash is None else f"stale({dest_hash[:12]})",
-                "now": (src_hash or "")[:12],
-            })
-        except OSError as e:
-            rows.append({"path": str(dest), "status": "error", "error": str(e)})
-    return rows
+    User-level installation is intentionally disabled.  Skill projection now
+    happens in :func:`worker_skills.stage_blackboard_skill` for each Worker cwd.
+    """
+    return []
 
 
 # A focused, black-box prompt. No domain how-to — just "become an expert";
@@ -231,12 +220,22 @@ _EXEC_PROMPT = (
     "or NEED_INPUT=the target is returning connection-refused, the instance may have expired. "
     "Print NEED_INPUT only for a genuine external blocker, not for a hard puzzle.\n\n"
     "The flag is shaped like {fmt}. When you recover it FROM REAL output (not a "
-    "guess), write it on its own line IN YOUR REPLY (your assistant message — NOT "
-    "only inside an `echo`/shell command, and NOT only in your private reasoning) "
-    "exactly as:\n  FOUND_FLAG=<the flag>\n"
-    "The flag value must also appear verbatim in your real shell output. If a "
-    "verifier or command already printed the flag, restate it as a FOUND_FLAG= line "
-    "in your final reply — do not assume the tool echo alone counts."
+    "guess), submit it through the team Blackboard API exactly as:\n"
+    "  python3 \"$MUTEKI_BLACKBOARD_SCRIPT\" submit-flag '<the flag>'\n"
+    "The flag value must first appear verbatim in real command output or a real "
+    "artifact. Ordinary reply text and FOUND_FLAG= do not submit a result."
+)
+
+_PROTOCOL2_CANARY_PROMPT = (
+    "You are executing a neutral local runtime conformance check, not a security "
+    "challenge. Work only in the current worker directory and follow the fixture "
+    "description below. Run only the minimal local shell command needed to read the "
+    "explicitly staged fixture file. Do not enumerate parent or unrelated paths, do "
+    "not contact a target service, and do not use web/search tools.\n\n"
+    "{ctx}\n\n"
+    "When the requested token has appeared in real local command output, submit it "
+    "once with `python3 \"$MUTEKI_BLACKBOARD_SCRIPT\" submit-flag '<token>'`. "
+    "The accepted shape is {fmt}. Never guess or manufacture a token."
 )
 
 # Pentest mode (BE-pentest-mode, Origin/Goal/Hints framing): the SAME swarm,
@@ -246,37 +245,29 @@ _EXEC_PROMPT = (
 # VERIFIED_FACT= marker so they pass the SAME witness gate (a claim is only a
 # finding once it's backed by real output — the provenance moat is unchanged).
 _PENTEST_EXEC_PROMPT = (
-    "You are an expert penetration tester and security auditor with a FULL shell "
-    "(curl, nmap, python3, sqlmap/nuclei/ffuf and common offensive tooling). "
-    "Become an expert in this target's stack.\n\n"
+    "You are an expert penetration tester with a FULL shell "
+    "(curl, python3, and common offensive tooling).\n\n"
     "{ctx}\n"
     "{kb}\n"
     "## Engagement goal\n{goal}\n\n"
     "## Scope / authorization — operate STRICTLY within this\n{scope}\n\n"
-    "Work the goal end-to-end: reconnaissance -> identify weaknesses -> VERIFY each "
-    "one by ACTUALLY exploiting/triggering it against the real target (for a "
-    "white-box source review, trace the vulnerable data-flow to a concrete, "
-    "demonstrable proof) -> capture reproducible evidence. Touch nothing outside the "
-    "scope above. Actually RUN commands and read every response end-to-end — a "
-    "finding is REAL only once you have proof from REAL output, never a guess.\n\n"
-    "## Report findings to your team (a swarm works this with you)\n"
-    "As you CONFIRM a vulnerability or key fact, print it on its own line so "
-    "teammates build on it and nobody repeats work:\n"
-    "  VERIFIED_FACT=<confirmed finding + its proof: what, where, impact, evidence>\n"
+    "Work the goal against the live in-scope HTTP origin. Send real requests. "
+    "If the target exposes login, try common username field names "
+    "(user, username, email) with the credentials you actually have; do not "
+    "invent extra accounts. Save request/response bodies to files and cite them.\n\n"
+    "Do NOT read parent directories, the muteki source tree, labs/, or any "
+    "server.py on disk. The origin in Scope is the only system you test.\n\n"
+    f"{_PENTEST_REPORT_BLOCK}"
+    "Also print team markers:\n"
+    "  VERIFIED_FACT=<confirmed fact + pointer to the request/response evidence>\n"
     "  DEADEND=<a direction you ruled out — so nobody retries it>\n"
-    "Each VERIFIED_FACT must be backed by real output you can point to.\n"
-    "Print VERIFIED_FACT only for NEW findings not already on the team board. Do NOT "
-    "re-state findings, credentials, or accesses a teammate already recorded — reuse "
-    "them. Put long data blobs in a file and reference the path, not the blob itself.\n\n"
+    "Print VERIFIED_FACT only for NEW facts not already on the team board.\n\n"
     "## If you are BLOCKED on something only the operator can give you\n"
     "When you are missing an external RESOURCE (a public VPS, a credential, a tool) "
     "or the target is objectively unusable (unreachable / out of scope / expired), "
     "do NOT keep blindly retrying — state exactly what you need on its own line:\n"
     "  NEED_INPUT=<the ONE specific thing the operator must supply, concretely>\n"
-    "  NEED_KIND=<external_blocker|lane_lock_request|route_dead_end|worker_uncertainty|operator_directive_needed>\n\n"
-    "When the goal is achieved (or in-scope avenues are exhausted), produce a "
-    "concise findings summary: each confirmed vulnerability, its impact, and "
-    "reproduction steps, referencing the evidence above."
+    "  NEED_KIND=<external_blocker|lane_lock_request|route_dead_end|worker_uncertainty|operator_directive_needed>\n"
 )
 
 # Injected only when a KB MCP is configured AND mounted. Teaches the agent to
@@ -298,8 +289,9 @@ _KB_PROMPT = (
 
 _RESUME_PROMPT = (
     "CONCLUDE: stop exploring now. If you already saw a correctly-formatted flag in "
-    "REAL output this session, print it once more as FOUND_FLAG=<flag>. If not, print "
-    "FOUND_FLAG=NONE and one line on the furthest confirmed fact. Do not guess."
+    "REAL output this session, submit it through `python3 "
+    "\"$MUTEKI_BLACKBOARD_SCRIPT\" submit-flag '<flag>'`. If not, report the "
+    "furthest confirmed fact. Do not guess."
 )
 
 # P3: a resume turn that KEEPS WORKING (not conclude), used when teammates reported
@@ -342,9 +334,39 @@ _EXPLORE_PROMPT = (
     "  NEED_KIND=<external_blocker|lane_lock_request|route_dead_end|worker_uncertainty|operator_directive_needed>\n"
     "  POC_SAVE=<path>|<entry_command>|<status>|<note>  (optional: register a reusable "
     "PoC/payload/script from YOUR cwd; status is available/wip/directional/spent)\n"
-    "  FOUND_FLAG=<the flag>  (only if you recovered it from REAL output; write this "
-    "line IN YOUR REPLY, not only inside an echo/shell command or your reasoning)\n\n"
+    "  python3 \"$MUTEKI_BLACKBOARD_SCRIPT\" submit-flag '<the flag>'  "
+    "(only after REAL output produced it)\n\n"
     "You may output multiple VERIFIED_FACT lines. The flag is shaped like {fmt}."
+)
+
+_PENTEST_EXPLORE_PROMPT = (
+    "You are an expert penetration tester with a FULL shell "
+    "(curl, python3, and common offensive tooling).\n\n"
+    "{ctx}\n"
+    "{kb}\n"
+    "## Engagement goal\n{goal}\n\n"
+    "## Scope / authorization — operate STRICTLY within this\n{scope}\n\n"
+    "{box}\n\n"
+    "## Your assigned direction\n"
+    "You have been assigned ONE specific exploration direction:\n"
+    "  {intent_goal}\n\n"
+    "Explore ONLY this direction against the live in-scope HTTP origin. "
+    "Send real requests. If the target exposes login, try common username "
+    "field names (user, username, email) with the credentials you actually "
+    "have; do not invent extra accounts. Save request/response bodies to "
+    "files and cite them. If this direction leads nowhere, that is a valid "
+    "result — report it as a dead-end.\n\n"
+    "Do NOT read parent directories, the muteki source tree, labs/, or any "
+    "server.py on disk. The origin in Scope is the only system you test.\n\n"
+    f"{_PENTEST_REPORT_BLOCK}"
+    "Also print team markers:\n"
+    "  VERIFIED_FACT=<confirmed fact + pointer to the request/response evidence>\n"
+    "  DEADEND=<a direction you ruled out — so nobody retries it>\n"
+    "  NEED_INPUT=<an EXTERNAL blocker only the operator can fix>\n"
+    "  NEED_KIND=<external_blocker|lane_lock_request|route_dead_end|worker_uncertainty|operator_directive_needed>\n"
+    "  POC_SAVE=<path>|<entry_command>|<status>|<note>\n"
+    "Print VERIFIED_FACT only for NEW facts not already on the team board. "
+    "Do not submit a flag."
 )
 
 _EXPLORE_CONCLUDE_PROMPT = (
@@ -354,8 +376,135 @@ _EXPLORE_CONCLUDE_PROMPT = (
     "  VERIFIED_FACT=<a confirmed finding from real output>\n"
     "  DEADEND=<why this direction failed>\n"
     "  POC_SAVE=<path>|<entry_command>|<status>|<note>\n"
-    "  FOUND_FLAG=<the flag>  (only if seen in real output this session)\n"
+    "  python3 \"$MUTEKI_BLACKBOARD_SCRIPT\" submit-flag '<the flag>'  "
+    "(only if seen in real output this session)\n"
     "If you found nothing, output DEADEND=<reason>. Do not guess."
+)
+
+_PENTEST_EXPLORE_CONCLUDE_PROMPT = (
+    "CONCLUDE: stop exploring NOW. Do not run any more commands.\n"
+    "Summarize ONLY what you have already confirmed in REAL output, using these "
+    "markers on their own lines:\n"
+    "  SUBMIT_REPORT=<path>  (only if you already wrote a complete report file)\n"
+    "  VERIFIED_FACT=<a confirmed finding from real output>\n"
+    "  DEADEND=<why this direction failed>\n"
+    "  POC_SAVE=<path>|<entry_command>|<status>|<note>\n"
+    "If you found nothing, output DEADEND=<reason>. Do not guess. Do not submit a flag."
+)
+
+_PENTEST_RESUME_PROMPT = (
+    "CONCLUDE: stop exploring now. If you already wrote a complete in-scope "
+    "report file this session, print SUBMIT_REPORT=<path>. Otherwise report the "
+    "furthest confirmed fact. Do not guess. Do not submit a flag."
+)
+
+# ── f10 edge-cognition worker shell loop (design §1/§2) ──────────────────────
+# Active ONLY when the worker carries an IntentEnvelope (SwarmF10 injects it as
+# a [f10-shell-v1] guidance marker, or a caller passes shell_envelope=). The
+# worker becomes a multi-step mini-agent: observe → plan → execute → verify →
+# reflect → checkpoint, ≤ TURN_LIMIT turns, re-planning every PLAN_EVERY turns,
+# with a local .shell/state.json checkpoint after every turn (crash-resumable).
+_SHELL_TURN1_PROMPT = (
+    "You are an expert CTF solver running as an EDGE WORKER SHELL with a FULL "
+    "shell — a multi-step autonomous mini-agent, NOT a one-shot executor.\n\n"
+    "{ctx}\n"
+    "{kb}\n"
+    "## Your assignment envelope\n"
+    "Goal: {goal}\n"
+    "Goal-ID: {goal_id}\n"
+    "{effects_block}"
+    "{criteria_block}"
+    "## Your cognitive loop (you get at most {turn_limit} turns — this is turn 1)\n"
+    "Each turn: OBSERVE (the board snapshot/workspace is refreshed for you) → "
+    "act on ONE atomic step → VERIFY it against the verifier you predefined → "
+    "REPORT. Rules:\n"
+    "  - Reject soliloquizing: every observation must come from REAL tool/shell "
+    "output. Never claim a finding you did not see in output.\n"
+    "  - This is a PLANNING turn: decide your next 1-3 atomic steps. For each, "
+    "predefine a runnable verifier (a passing condition you can check in output):\n"
+    "      PLAN_STEP=<step#>|<one atomic action>|<verifier — what output proves it worked>\n"
+    "  - Then execute step 1 immediately (run real commands).\n"
+    "  - End EVERY turn with a one-line belief verdict:\n"
+    "      REFLECT=<changed|unchanged>: <what you learned, or why nothing new>\n"
+    "  - If you discover a genuinely DIFFERENT direction that deserves its own "
+    "worker, declare it once:\n"
+    "      SUB_INTENT=<a concrete new goal for the central arbiter to queue>\n"
+    "{resume_block}"
+    "## Standard reporting (unchanged)\n"
+    "  VERIFIED_FACT=<a confirmed, objective finding from REAL output>\n"
+    "  DEADEND=<a direction you ruled out — so nobody retries it>\n"
+    "  NEED_INPUT=<an EXTERNAL blocker only the operator can fix>\n"
+    "  NEED_KIND=<external_blocker|lane_lock_request|route_dead_end|worker_uncertainty|operator_directive_needed>\n"
+    "  POC_SAVE=<path>|<entry_command>|<status>|<note>\n"
+    "  python3 \"$MUTEKI_BLACKBOARD_SCRIPT\" submit-flag '<the flag>'  "
+    "(only after REAL output produced it)\n"
+    "The flag is shaped like {fmt}."
+)
+
+_PENTEST_SHELL_TURN1_PROMPT = (
+    "You are an expert penetration tester running as an EDGE WORKER SHELL with a "
+    "FULL shell — a multi-step autonomous mini-agent, NOT a one-shot executor.\n\n"
+    "{ctx}\n"
+    "{kb}\n"
+    "## Engagement goal\n{engagement_goal}\n\n"
+    "## Scope / authorization — operate STRICTLY within this\n{scope}\n\n"
+    "{box}\n\n"
+    "## Your assignment envelope\n"
+    "Goal: {goal}\n"
+    "Goal-ID: {goal_id}\n"
+    "{effects_block}"
+    "{criteria_block}"
+    "## Your cognitive loop (you get at most {turn_limit} turns — this is turn 1)\n"
+    "Each turn: OBSERVE (the board snapshot/workspace is refreshed for you) → "
+    "act on ONE atomic step → VERIFY it against the verifier you predefined → "
+    "REPORT. Rules:\n"
+    "  - Reject soliloquizing: every observation must come from REAL tool/shell "
+    "output. Never claim a finding you did not see in output.\n"
+    "  - This is a PLANNING turn: decide your next 1-3 atomic steps. For each, "
+    "predefine a runnable verifier (a passing condition you can check in output):\n"
+    "      PLAN_STEP=<step#>|<one atomic action>|<verifier — what output proves it worked>\n"
+    "  - Then execute step 1 immediately (run real commands).\n"
+    "  - End EVERY turn with a one-line belief verdict:\n"
+    "      REFLECT=<changed|unchanged>: <what you learned, or why nothing new>\n"
+    "  - If you discover a genuinely DIFFERENT direction that deserves its own "
+    "worker, declare it once:\n"
+    "      SUB_INTENT=<a concrete new goal for the central arbiter to queue>\n"
+    "{resume_block}"
+    "## Standard reporting (unchanged)\n"
+    "  SUBMIT_REPORT=<path>  (complete JSON report file; FOUND_FINDING is ignored)\n"
+    "  VERIFIED_FACT=<a confirmed, objective finding from REAL output>\n"
+    "  DEADEND=<a direction you ruled out — so nobody retries it>\n"
+    "  NEED_INPUT=<an EXTERNAL blocker only the operator can fix>\n"
+    "  NEED_KIND=<external_blocker|lane_lock_request|route_dead_end|worker_uncertainty|operator_directive_needed>\n"
+    "  POC_SAVE=<path>|<entry_command>|<status>|<note>\n"
+    "Do not submit a flag. Stay inside Scope."
+)
+
+_SHELL_PLAN_TURN_PROMPT = (
+    "TURN {turn}/{turn_limit} — PLANNING turn (strong re-plan).\n"
+    "Budget: ~{tokens_used}/{token_limit} tokens used.{budget_warn}\n"
+    "Re-evaluate your direction against the assignment goal:\n  {goal}\n"
+    "{effects_block}"
+    "Confirmed so far this shell:\n{subfacts_block}"
+    "Dead-ends so far (do NOT retry):\n{deadends_block}"
+    "Decide the next 1-3 atomic steps, each with a runnable verifier:\n"
+    "  PLAN_STEP=<step#>|<one atomic action>|<verifier>\n"
+    "Then execute the first step NOW with real commands. If the current direction "
+    "is dead, say DEADEND=<why> and pivot within the goal, or declare "
+    "SUB_INTENT=<new direction> if it deserves a separate worker.\n"
+    "End with: REFLECT=<changed|unchanged>: <one line>"
+)
+
+_SHELL_EXEC_TURN_PROMPT = (
+    "TURN {turn}/{turn_limit} — EXECUTE turn (no re-planning).\n"
+    "Budget: ~{tokens_used}/{token_limit} tokens used.{budget_warn}\n"
+    "Execute this planned step NOW with real commands:\n"
+    "  step {step}: {action}\n"
+    "  verifier: {verifier}\n"
+    "Check the output against the verifier. If it PASSED, report "
+    "VERIFIED_FACT=<what is now confirmed>. If it FAILED, adjust within the step "
+    "once; if the whole approach is ruled out, report DEADEND=<why>.\n"
+    "End with: REFLECT=<changed|unchanged>: <one line>"
 )
 
 _REVIEW_PROMPT = (
@@ -366,6 +515,7 @@ _REVIEW_PROMPT = (
     "or issue a coordinator directive.\n\n"
     "{ctx}\n"
     "{kb}\n"
+    "{engagement}"
     "## Review assignment\n{intent_goal}\n\n"
     "## Full review board\n{review_board}\n\n"
     "Output only machine-readable markers, one per line. Every challenge must carry "
@@ -409,7 +559,7 @@ _REVIEW_PROMPT = (
     "LANE_UNLOCK={{\"lane_key\":\"destructive:tcp:445@172.22.11.45\","
     "\"reason\":\"owner finished or lock was stale\"}}\n"
     "NEXT_INTENT={{\"worker_class\":\"verifier\",\"goal\":\"Verify JWT alg from a real token\"}}\n\n"
-    "Never output FOUND_FLAG. If you see a flag in the board, treat it as existing "
+    "Never submit a flag. If you see a flag in the board, treat it as existing "
     "state only; the normal flag gate already handled it."
 )
 
@@ -419,6 +569,11 @@ _REVIEW_PROMPT = (
 # token from the captured tail. (run-15161: \S+ truncated `flag{H1570rY 12'N7...}`
 # to `flag{H1570rY` → never closed → never registered, despite the worker solving.)
 _FLAG_LINE = re.compile(r"FOUND_FLAG=\s*(.+)")
+_FINDING_LINE = re.compile(r"FOUND_FINDING=\s*(.+)")
+_SUBMIT_REPORT_LINE = re.compile(r"SUBMIT_REPORT=\s*[`'\"]?([^\s`'\"]+)")
+_REPRODUCED_LINE = re.compile(r"REPRODUCED=\s*(yes|no)\b", re.IGNORECASE)
+_REPRO_WITNESS_LINE = re.compile(r"REPRO_WITNESS=\s*(.+)")
+_REPRO_REASON_LINE = re.compile(r"REPRO_REASON=\s*(.+)")
 # A xxx{...} brace-structured flag anywhere in the captured tail — inner spaces OK.
 _BRACE_FLAG = re.compile(r"[A-Za-z0-9_]{0,15}\{[^}]{1,200}\}")
 
@@ -450,6 +605,14 @@ _DEADEND_LINE = re.compile(r"DEADEND=\s*(.+)")
 _NEED_INPUT_LINE = re.compile(r"NEED_INPUT=\s*(.+)")
 _NEED_KIND_LINE = re.compile(r"NEED_KIND\s*=\s*([a-z_]+)", re.IGNORECASE)
 _POC_SAVE_LINE = re.compile(r"POC_SAVE=\s*([^|]+)\|([^|]+)\|([^|]+)\|(.*)")
+# ── f10 edge-cognition shell-loop markers (parsed only on the shell path) ─────
+# PLAN_STEP=<n>|<atomic action>|<verifier>  — the worker's own 1-3 step sub-plan,
+# refreshed on planning turns (every PLAN_EVERY). SUB_INTENT= hands a genuinely
+# new direction back to the central arbiter's intent queue. REFLECT= is the
+# per-turn belief-change verdict used for stuck detection.
+_SHELL_PLAN_LINE = re.compile(r"PLAN_STEP=\s*(.+)")
+_SHELL_SUB_INTENT_LINE = re.compile(r"SUB_INTENT=\s*(.+)")
+_SHELL_REFLECT_LINE = re.compile(r"REFLECT=\s*(.+)")
 _SECRET_LITERAL_RE = re.compile(
     r"(-----BEGIN [A-Z ]*PRIVATE KEY-----|"
     r"\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[A-Za-z0-9_./+=-]{12,})",
@@ -612,8 +775,9 @@ _RESPOND_MARK_FALSE_PROMPT = (
     "Resume solving from the facts you already confirmed and find the REAL flag.\n"
     "{note}\n"
     "Actually RUN commands against the real target/files. When you recover the TRUE "
-    "flag from REAL output, print it on its own line exactly as:\n  FOUND_FLAG=<flag>\n"
-    "It must appear verbatim in your shell output. Also print VERIFIED_FACT=<...> / "
+    "flag from REAL output, call the Blackboard API exactly as:\n"
+    "  python3 \"$MUTEKI_BLACKBOARD_SCRIPT\" submit-flag '<flag>'\n"
+    "It must appear verbatim in your shell output first. Also print VERIFIED_FACT=<...> / "
     "DEADEND=<...> lines as you go so the team's board stays current."
 )
 
@@ -665,6 +829,10 @@ class CliSolver:
         found_flags: Optional[list] = None,
         container: "Optional[object]" = None,
         worker_env: Optional[dict[str, str]] = None,
+        identity: Optional[dict[str, Any]] = None,
+        execution_occurrence: Optional[str] = None,
+        resolve_epoch: Optional[str | int] = None,
+        shell_envelope: Optional[dict] = None,
     ) -> None:
         self.spec = spec
         self.challenge = challenge
@@ -675,6 +843,11 @@ class CliSolver:
         # tool container (consistent toolchain). None → host subprocess.
         self.container = container
         self._extra_worker_env = dict(worker_env or {})
+        self.identity = {
+            str(key): str(value)
+            for key, value in (identity or {}).items()
+            if value
+        } or worker_identity_from_env(self._extra_worker_env)
         self.run_id = run_id or challenge.id
         self.graph = SolveGraph(challenge=challenge)
         # solver_id: prefer an explicit label (the coordinator hands each spawned
@@ -729,6 +902,18 @@ class CliSolver:
         # {action, text} that this respond worker is serving.
         self.resume_session = resume_session
         self.hitl_cmd = hitl_cmd or {}
+        # Decision ids must distinguish a fresh execution encountering the same
+        # blocker from an SSE replay of the original occurrence.  The occurrence is
+        # created once per CliSolver instance (or injected by a deterministic caller);
+        # a resolve epoch may be supplied explicitly or carried by the standby HITL
+        # command.  Both are emitted with the request for audit/debug correlation.
+        supplied_occurrence = (execution_occurrence
+                               or self.hitl_cmd.get("execution_occurrence"))
+        self._execution_occurrence = str(supplied_occurrence or uuid.uuid4().hex)
+        supplied_epoch = (resolve_epoch if resolve_epoch is not None
+                          else self.hitl_cmd.get("resolve_epoch", ""))
+        self._resolve_epoch = str(supplied_epoch if supplied_epoch is not None else "")
+        self._decision_request_ids: "dict[tuple[str, str], str]" = {}
         # lifecycle_scope: "run" = this solver IS the run (mock / race / standby) →
         # its terminal emit is a run-level RUN_FINISHED. "worker" = a swarm sub-worker
         # under a coordinator that re-bootstraps until solved/stopped → its terminal
@@ -753,6 +938,8 @@ class CliSolver:
         # guidance folded in (the "steering" channel). The monitor sets it on a
         # redirect; the streaming runner kills the subproc and reports res.steered.
         self._steer_event = threading.Event()
+        self._stalled_at: "Optional[float]" = None
+        self._idle_repeat_steered = False
         # P2 regression guard: only allow an in-turn steer (FLAG / standing
         # correction → _steer_event.set) while a subprocess turn is ACTUALLY
         # running. Without this, a freshly-spawned worker's _drain_control replays
@@ -785,6 +972,22 @@ class CliSolver:
         # via the live InsightBus inbox while running.
         self._standing_guidance: "list[str]" = (
             [str(s) for s in standing_guidance if s] if standing_guidance else [])
+        # Operator context is UNTRUSTED input, never flag evidence.  Keep the exact
+        # strings separately from the execution-output corpus so a worker cannot turn
+        # an operator-supplied candidate into a "real" flag by running
+        # `echo FOUND_FLAG=<candidate>`.  The target/verifier must produce a value that
+        # did not originate in operator context for it to pass the hard gate.
+        self._operator_context_texts: "list[str]" = list(self._standing_guidance)
+        # Exact plaintext values materialised from secret:// ContextResources are
+        # installed by the Swarm/standby builder.  Their prompt is delivered over a
+        # non-persistent stdin-only engine invocation (never argv); every durable
+        # event/graph/artifact boundary additionally uses this list for deterministic
+        # output redaction.
+        self._control_secret_values: "list[str]" = []
+        for _key in ("text", "hint", "flag", "url", "target_url"):
+            _value = self.hitl_cmd.get(_key)
+            if _value:
+                self._remember_operator_context(str(_value))
         # a redirect can retarget the worker at a new URL; _build_prompt prefers it
         # over challenge.target. Per-worker (NOT mutating the shared Challenge, which
         # sibling workers share by reference).
@@ -798,6 +1001,46 @@ class CliSolver:
             self._standing_guidance.append(str(self.hitl_cmd["text"]))
         self._live_procs: "set[Any]" = set()   # Popen handles of running subprocs
         self._procs_lock = threading.Lock()
+        # asyncio cancellation does not stop a function already running inside
+        # to_thread. Keep runner Tasks independently from the coroutine that awaited
+        # them so callers can prove the runtime really exited after the outer worker
+        # or standby task has already unwound.
+        self._runner_tasks: "set[asyncio.Task[Any]]" = set()
+        self._runner_proc_local = threading.local()
+        # Typed operator context is reserved before prompt materialisation and
+        # committed only when the prompt-carrying subprocess exists.  The swarm
+        # installs the journal callbacks on constructed workers.
+        self._pending_control_context_reservations: list[tuple[str, str]] = []
+        # One row per durable reservation, carrying the exact materialized text
+        # expected in the final invocation prompt.  The coordinator installs this
+        # after construction.  It is reconciled immediately before argv/stdin is
+        # built, so prompt budgeting cannot falsely consume a context that never
+        # reached the model.
+        self._control_context_prompt_manifest: "list[dict[str, Any]]" = []
+        self._control_context_prompt_manifest_finalized = False
+        self._control_context_prompt_included: "tuple[tuple[str, str], ...]" = ()
+        self._context_committer: Optional[Any] = None
+        self._context_releaser: Optional[Any] = None
+        self._context_delivery_unknown_marker: Optional[Any] = None
+        self._context_binding_worker_id = ""
+        self._context_delivery_callback: Optional[Any] = None
+        self._context_delivery_lock = threading.Lock()
+        self._control_context_delivery_unknown = False
+        self._control_context_delivery_committed = False
+        # C6: the host may bind one sealed, attempt-specific ContextPacket after
+        # canonical admission preparation and before this worker can launch.  The
+        # worker can render the lossy view but receives no store/compiler authority.
+        self._cognitive_context_packet: Optional[Any] = None
+        self._c6_invocation_runner: Optional[Any] = None
+        self._cognitive_pending_prompt: Optional[str] = None
+        self._cognitive_stage_released = False
+        self._cognitive_stage_unknown = False
+        self._cognitive_stage_lock = threading.Lock()
+        # Monotonic execution fence used by coordinator retirement.  A claimed
+        # intent is replay-safe only when the worker runtime is proven exited and
+        # this flag is still false (no Popen/remote child ever existed).
+        self._runtime_process_started = False
+        self._remote_start_uncertain = False
         # M9/M10: a mkdtemp fallback scratch dir THIS worker owns (set only when the
         # swarm didn't provide a managed self._workdir). run()'s finally rmtree's it on
         # EVERY exit path — solved-early-return, cancel, exception — except when the
@@ -827,6 +1070,13 @@ class CliSolver:
         # A re-bootstrapped worker is seeded with the run's already-found flags so
         # its prompt lists them and it hunts only the rest.
         self._already_found: "set[str]" = set(found_flags or [])
+        self._already_found_findings: "set[str]" = set()
+        self._already_submitted_reports: "set[str]" = set()
+        self._pending_report_paths: "list[str]" = []
+        # Protocol 2 must return same-attempt accepted values to its host authority for
+        # receipt reconciliation without projecting them through the legacy SolveGraph.
+        # Unlike _already_found, this contains only flags accepted by THIS worker.
+        self._protocol2_accepted_flags: "list[str]" = []
         # flags accepted via the LIVE stream (_stream_markers caught a FOUND_FLAG=
         # in an intermediate/streamed chunk that never reached the terminal result
         # text). run()'s per-turn flag extraction reads res.text only, so the run
@@ -848,6 +1098,44 @@ class CliSolver:
         # balloon memory; the per-chunk artifact persist keeps the full transcript.
         self._raw_tool_outputs: "list[str]" = []
         self._raw_tool_outputs_chars = 0
+        # Target-identity attestation (round-10): the command text paired with each
+        # raw output record, same ring-trim. Lets the flag gate distinguish a flag
+        # EXTRACTED from a sanctioned resource from one the worker manufactured
+        # (planted file / self-seeded service / writeup fetch).
+        self._raw_tool_commands: "list[str]" = []
+        # Whether each raw result was paired to an observed tool invocation. Unmatched
+        # results remain available for audit but cannot become authoritative evidence.
+        self._raw_tool_attributed: "list[bool]" = []
+        # Protocol 2 stores the capture receipt alongside the exact raw record. Empty
+        # outside Protocol 2. Keeping it parallel preserves existing corpus consumers
+        # while making receipt-backed authority mechanically checkable.
+        self._raw_tool_capture_receipts: "list[str]" = []
+        # Protocol 1 Flag authority is API-driven.  The blackboard command appends
+        # flag_submission; only candidates consumed and provenance-validated by this
+        # Worker may reach _accept_flag.  Plain FOUND_FLAG text remains diagnostic.
+        self._validated_flag_submissions: set[str] = set()
+        self._last_flag_submission_seq = 0
+        self._flag_submission_dir: "Optional[Path]" = None
+        if self.shared_graph is not None:
+            try:
+                existing_events = self.shared_graph.events()
+                self._last_flag_submission_seq = max(
+                    (int(row.get("seq") or 0) for row in existing_events),
+                    default=0,
+                )
+            except Exception:
+                pass
+        # Ordered unresolved calls. A result with an id consumes only its exact match;
+        # an id-less result consumes the oldest call. The FIFO fallback matters because
+        # some engine versions expose execution identity on only the tool side.
+        self._pending_tool_calls: "list[tuple[str, str]]" = []
+        # Live stream activity counters — used to price a floor COST_UPDATE when the
+        # CLI is killed before a final usage block / CliResult can be salvaged
+        # (NYU-AB metering gap: ~900s FAILs with dozens of tools but cost_usd=0).
+        self._stream_tool_starts = 0
+        self._stream_reasoning_chars = 0
+        self._stream_cost_flushed = False
+        self._reasoning_turn_acc = ""
         # ── submission gate (only meaningful when challenge.verifier_rate_limited) ──
         # _submit_blocked_until: epoch-secs deadline before which a SIBLING holds the
         #   global submit-lock → this worker should HOLD its own submission. Advisory
@@ -863,14 +1151,161 @@ class CliSolver:
         self._verifier_locked_until = 0.0
         # how long a sibling's SUBMIT_LOCKED holds us off before self-clearing.
         self._SUBMIT_HOLD_S = 90.0
+        # ── f10 edge-cognition worker shell loop (OFF by default) ──────────────
+        # Enabled two ways, both opt-in so every other framework and the default
+        # single-shot path are byte-identical: (a) an explicit shell_envelope
+        # kwarg (tests / direct construction), or (b) a "[f10-shell-v1]{json}"
+        # IntentEnvelope marker line inside standing_guidance, injected by
+        # SwarmF10.framework_worker_guidance_for_intent — the only per-worker
+        # channel the coordinator exposes to frameworks. Only meaningful for the
+        # solve modes; respond/review never enter the loop.
+        self._shell_envelope: Optional[dict] = (
+            dict(shell_envelope) if isinstance(shell_envelope, dict) else None)
+        if self._shell_envelope is None:
+            for _g in self._standing_guidance:
+                _env = self._parse_shell_envelope_marker(_g)
+                if _env:
+                    self._shell_envelope = _env
+                    break
+        self._shell_loop = bool(self._shell_envelope) and self.mode in (
+            "bootstrap", "explore", "shell")
+
+    @staticmethod
+    def _parse_shell_envelope_marker(line: Any) -> Optional[dict]:
+        """Parse one standing-guidance line into an f10 IntentEnvelope (None when
+        it is not a shell marker). Import is lazy so the default path never
+        touches the frameworks package."""
+        try:
+            from muteki.frameworks.f10_edge_cognition.state import (
+                parse_envelope_guidance,
+            )
+            return parse_envelope_guidance(line)
+        except Exception:
+            return None
+
+    def _redact_control_secrets(self, text: Any) -> Any:
+        if not isinstance(text, str) or not text:
+            return text
+        redacted = text
+        exact_tokens: set[str] = set()
+        component_tokens: set[str] = set()
+        for raw in self._control_secret_values:
+            value = str(raw or "")
+            if not value:
+                continue
+            # Always protect the exact materialized value.
+            exact_tokens.add(value)
+            # Workers often echo only the credential component rather than the
+            # operator's full ``password=...`` or URL. Derive only sufficiently
+            # distinctive components to avoid corrupting ordinary prose.
+            for match in re.finditer(
+                r"(?i)(?:password|passwd|token|secret|credential|api[_ -]?key|"
+                r"private[_ -]?key|bearer)\s*(?::|=|\bis\b)\s*([^\s,;]+)",
+                value,
+            ):
+                component = match.group(1).strip("'\"()[]{}")
+                if component:
+                    component_tokens.add(component)
+            try:
+                parsed = urlsplit(value)
+            except ValueError:
+                parsed = None
+            if parsed is not None and parsed.netloc:
+                for component in (parsed.username, parsed.password):
+                    if component:
+                        for candidate in {component, unquote(component)}:
+                            if candidate:
+                                component_tokens.add(candidate)
+        values = sorted(exact_tokens | component_tokens, key=len, reverse=True)
+        for value in values:
+            if len(value) >= 6:
+                redacted = redacted.replace(
+                    value, "<REDACTED_OPERATOR_SECRET>")
+            else:
+                # Short exact values (notably decision answers such as "A"/"1")
+                # and short parsed credentials are still secrets, but global
+                # substring replacement would destroy unrelated telemetry. Match a
+                # standalone token so the value is hidden without turning ACTIVE,
+                # phase-1, or every ordinary word into redaction noise.
+                redacted = re.sub(
+                    rf"(?<![A-Za-z0-9_]){re.escape(value)}(?![A-Za-z0-9_])",
+                    "<REDACTED_OPERATOR_SECRET>", redacted,
+                )
+        return redacted
+
+    def _redact_control_secret_payload(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return self._redact_control_secrets(value)
+        if isinstance(value, dict):
+            return {
+                key: self._redact_control_secret_payload(child)
+                for key, child in value.items()
+            }
+        if isinstance(value, list):
+            return [self._redact_control_secret_payload(child) for child in value]
+        if isinstance(value, tuple):
+            return tuple(
+                self._redact_control_secret_payload(child) for child in value)
+        return value
+
+    _PROTOCOL2_PRIVATE_CONTENT_EVENTS = frozenset({
+        EventType.TEXT_MESSAGE_DELTA,
+        EventType.REASONING_DELTA,
+        EventType.TOOL_CALL_START,
+        EventType.TOOL_CALL_ARGS,
+        EventType.TOOL_CALL_RESULT,
+        EventType.TERMINAL_OUTPUT,
+        EventType.SOLVE_GRAPH_DELTA,
+        EventType.INSIGHT_BUS_EVENT,
+        EventType.SHARED_GRAPH_DELTA,
+        EventType.BLACKBOARD_DELTA,
+        EventType.NODE_SUMMARIZED,
+        EventType.HITL_REQUEST,
+    })
 
     async def _emit(self, etype: EventType, **payload: Any) -> None:
+        if (bool(getattr(self, "_protocol2_mode", False))
+                and etype in self._PROTOCOL2_PRIVATE_CONTENT_EVENTS):
+            # Protocol 2 provider/terminal content is private capture input. It can
+            # contain an accepted value before the canonical gate commits, so no
+            # legacy chat, tool, graph, insight, blackboard, or equivalent content
+            # projection may persist it. Lifecycle/cost telemetry remains public;
+            # accepted values are projected only as reconciled typed flag.accepted.
+            return
         if self.bus is not None:
             await self.bus.emit(Event(
                 event_type=etype, run_id=self.run_id,
                 challenge_id=self.challenge.id, solver_id=self.solver_id,
-                payload=payload,
+                payload=self._redact_control_secret_payload(payload),
             ))
+
+    def _decision_request_identity(self, need: str, need_kind: str) -> tuple[str, dict]:
+        """Return one stable id + correlation payload for this execution occurrence."""
+        key = (str(need), str(need_kind))
+        request_id = self._decision_request_ids.get(key)
+        execution_id = str(
+            self._cli_session or self.resume_session
+            or f"attempt:{self._execution_occurrence}"
+        )
+        if request_id is None:
+            request_id = stable_decision_request_id(
+                run_id=self.run_id,
+                worker_id=self.solver_id,
+                prompt=str(need),
+                kind=str(need_kind),
+                correlation_key=str(
+                    getattr(self, "_intent_id", "") or self.intent_id_assigned or self.mode
+                ),
+                execution_id=execution_id,
+                execution_occurrence=self._execution_occurrence,
+                resolve_epoch=self._resolve_epoch,
+            )
+            self._decision_request_ids[key] = request_id
+        return request_id, {
+            "execution_id": execution_id,
+            "execution_occurrence": self._execution_occurrence,
+            "resolve_epoch": self._resolve_epoch,
+        }
 
     async def _emit_bb(self, kind: str, **fields: Any) -> None:
         """One blackboard.delta — the swarm's collaboration layer (intent claim
@@ -904,6 +1339,15 @@ class CliSolver:
         conclude_intent."""
         if self.shared_graph is None:
             return
+        if self._control_context_delivery_unknown and not result_detail:
+            # Popen already received argv, so an unconfirmed journal commit is a
+            # terminal disclosure-unknown attempt, not a safe-to-retry pre-start
+            # failure. A new operator command can create fresh context without
+            # replaying this one-shot material.
+            result_detail = (
+                "required operator context delivery became unknown after process start")
+        result = self._redact_control_secrets(result)
+        result_detail = self._redact_control_secrets(result_detail)
         try:
             self.shared_graph.conclude_intent(
                 actor=self.solver_id, intent_id=self._intent_id,
@@ -920,14 +1364,33 @@ class CliSolver:
         scope="worker" → WORKER_FINISHED (a swarm sub-worker; the coordinator owns the
                          single run-level RUN_FINISHED emitted when its loop exits).
         Payload carries `flag` (first, back-compat) + `flags` (all, multi-flag) +
-        `solved`, so the deck can mark the lane SOLVED and graft the flag node(s)
-        without conflating it with run completion."""
+        `solved`. Worker-scoped events also carry `reason` (timeout / oom /
+        cancelled / steered / ...). Run-scoped RUN_FINISHED keeps its own reason
+        vocabulary and is not overwritten here."""
         etype = (EventType.RUN_FINISHED if self.lifecycle_scope == "run"
                  else EventType.WORKER_FINISHED)
+        # Protocol 2 publishes accepted values only through its typed reconciliation
+        # layer.  The lifecycle may still report completion, but it must not become an
+        # additional public flag projection.
+        public_flag = None if bool(getattr(self, "_protocol2_mode", False)) else flag
+        public_flags = (
+            [] if bool(getattr(self, "_protocol2_mode", False))
+            else list(flags or ([flag] if flag else []))
+        )
+        stop_reason = (
+            self._worker_stop_reason
+            or ("solved" if solved else "finished")
+        ).strip()
+        if stop_reason:
+            self._note_worker_stop(stop_reason)
         # I: granular lifecycle — the worker has exited (with its final token total).
         await self._emit_lifecycle("exited", solved=solved)
-        await self._emit(etype, flag=flag, flags=list(flags or ([flag] if flag else [])),
-                         solved=solved)
+        finished_payload: dict[str, Any] = {
+            "flag": public_flag, "flags": public_flags, "solved": solved,
+        }
+        if etype is EventType.WORKER_FINISHED:
+            finished_payload["reason"] = stop_reason
+        await self._emit(etype, **finished_payload)
 
     async def _emit_worker_status(
         self, *, online: bool, reason: str, status: Optional[str] = None,
@@ -942,6 +1405,7 @@ class CliSolver:
                 session=self._cli_session or "",
                 runtime=self._last_runtime_status if not online else None,
                 worker_role=self.mode,
+                identity=self.identity or None,
             ))
 
     def _tokens_spent(self) -> int:
@@ -961,6 +1425,8 @@ class CliSolver:
                               **extra: Any) -> None:
         """I: emit a granular worker-lifecycle event (spawned/phase_changed/
         stalled/exited). Best-effort; never disturbs the solve."""
+        if phase == "stalled" and getattr(self, "_stalled_at", None) is None:
+            self._stalled_at = time.monotonic()
         try:
             await self._emit(
                 EventType.WORKER_LIFECYCLE,
@@ -969,7 +1435,8 @@ class CliSolver:
                     intent_id=getattr(self, "intent_id_assigned", "") or getattr(self, "_intent_id", "") or "",
                     tokens_spent=self._tokens_spent(),
                     paused=paused,
-                    engine=self.driver.name, worker_role=self.mode, **extra))
+                    engine=self.driver.name, worker_role=self.mode,
+                    **{**self.identity, **extra}))
         except Exception:
             pass
 
@@ -1000,15 +1467,11 @@ class CliSolver:
         repo = _repo_blackboard_script()
         if repo is not None:
             return repo
-        # Installed deployment (pip/wheel; skills/ not adjacent to the package):
-        # fall back to the engine-specific user-scope copy installed by
-        # scripts/install_blackboard_skill.sh. Claude/Cursor read ~/.claude/skills;
-        # Codex reads ~/.agents/skills.
-        skill_root = ".agents" if self.driver.name == "codex" else ".claude"
-        return os.path.expanduser(
-            f"~/{skill_root}/skills/muteki-blackboard/blackboard.py")
+        raise FileNotFoundError(
+            "project muteki-blackboard script is unavailable; "
+            "user-level Skill directories are not a Worker fallback")
 
-    def _worker_env(self) -> dict:
+    def _worker_env(self, cwd: Optional[str] = None) -> dict:
         """Env vars handed to the worker subprocess.
 
         The PRIMARY board mechanism is coordinator-driven: the board
@@ -1022,15 +1485,112 @@ class CliSolver:
         gives a FRESHER read than the prompt snapshot (teammates' newest facts), so
         it complements injection rather than replacing it. Without this var the skill
         exits non-zero (it can't find the DB) — a dangling failure we avoid."""
-        env = dict(self._extra_worker_env)
+        # The host-owned invocation runner consumes this environment directly.
+        # Merge driver-level model variables here so custom Claude endpoints use
+        # the same model selection in both standard and host-owned execution.
+        from muteki.solver.worker_skills import stage_blackboard_skill
+
+        skill_workdir = cwd or self._workdir
+        if skill_workdir:
+            stage_blackboard_skill(
+                skill_workdir,
+                engine=self.driver.name,
+                container=self.container is not None,
+            )
+
+        env_extra = getattr(self.driver, "env_extra", None)
+        driver_env = env_extra() if callable(env_extra) else {}
+        env = {**driver_env, **self._extra_worker_env}
+        state_root = Path(cwd or self._workdir).resolve() if (cwd or self._workdir) else None
+        if self.driver.name == "opencode" and state_root is not None:
+            opencode_root = state_root / ".muteki-opencode"
+            for dirname in ("data", "config", "cache"):
+                (opencode_root / dirname).mkdir(parents=True, exist_ok=True)
+            runtime_root = str(opencode_root)
+            mapper = getattr(self.container, "to_container_path", None)
+            if callable(mapper):
+                runtime_root = mapper(runtime_root)
+            env.setdefault("XDG_DATA_HOME", f"{runtime_root}/data")
+            env.setdefault("XDG_CONFIG_HOME", f"{runtime_root}/config")
+            env.setdefault("XDG_CACHE_HOME", f"{runtime_root}/cache")
+        if self.driver.name == "dsh" and state_root is not None:
+            sessions = state_root / ".muteki-dsh-sessions"
+            sessions.mkdir(parents=True, exist_ok=True)
+            runtime_sessions = str(sessions)
+            runtime_cwd = str(state_root)
+            mapper = getattr(self.container, "to_container_path", None)
+            if callable(mapper):
+                runtime_sessions = mapper(runtime_sessions)
+                runtime_cwd = mapper(runtime_cwd)
+            env.setdefault("DSH_SESSION_ROOT", runtime_sessions)
+            env.setdefault("DSH_CWD", runtime_cwd)
+            env.setdefault("DSH_TELEMETRY_DISABLED", "1")
+        profile = getattr(self.driver, "profile", None)
+        if (
+            self.driver.name == "claude"
+            and isinstance(profile, dict)
+            and profile_uses_endpoint(profile)
+        ):
+            # Claude Code loads ~/.claude/settings.json after process launch. A
+            # host-level ANTHROPIC_BASE_URL / ANTHROPIC_MODEL there can replace
+            # the selected Worker's custom endpoint even though the subprocess
+            # received the correct environment. Keep endpoint-backed Workers in a
+            # per-worker config directory; subscription Workers continue to use
+            # the operator's normal Claude configuration.
+            config_root = cwd or self._workdir
+            if config_root:
+                config_host = Path(config_root).resolve() / ".muteki-claude-config"
+                config_host.mkdir(parents=True, exist_ok=True)
+                if self.container is not None:
+                    # Claude creates `session-env/` below CLAUDE_CONFIG_DIR before
+                    # its Bash/Write tools run.  This directory is also created
+                    # after the run-level workspace chown, so make the late path
+                    # writable by the container worker as well.
+                    from muteki.solver.container_exec import _chown_tree_to_worker
+
+                    _chown_tree_to_worker(
+                        str(config_host), image=self.container.image
+                    )
+                config_path = str(config_host)
+                mapper = getattr(self.container, "to_container_path", None)
+                if callable(mapper):
+                    try:
+                        config_path = mapper(config_path)
+                    except Exception:
+                        pass
+                env["CLAUDE_CONFIG_DIR"] = config_path
         env["PATH"] = _stable_worker_path(env.get("PATH") or os.environ.get("PATH", ""))
         env["MUTEKI_WORKER_ID"] = self.solver_id
         intent_id = getattr(self, "intent_id_assigned", "") or getattr(self, "_intent_id", "") or ""
         if intent_id:
             env["MUTEKI_INTENT_ID"] = intent_id
         env["MUTEKI_BLACKBOARD_SCRIPT"] = self._blackboard_script_path()
+        if cwd:
+            submission_host = Path(cwd).resolve() / ".muteki-flag-submissions"
+            submission_host.mkdir(parents=True, exist_ok=True)
+            if self.container is not None:
+                # The run workspace is chowned when the container is created, but
+                # this per-Worker ingress directory is created later, immediately
+                # before the CLI starts.  A root-owned directory prevents the
+                # container's unprivileged `kali` user from atomically writing a
+                # submission request.  Align this late-created path with the image's
+                # actual worker uid/gid just like the rest of the mounted workspace.
+                from muteki.solver.container_exec import _chown_tree_to_worker
+
+                _chown_tree_to_worker(
+                    str(submission_host), image=self.container.image
+                )
+            self._flag_submission_dir = submission_host
+            submission_path = str(submission_host)
+            mapper = getattr(self.container, "to_container_path", None)
+            if callable(mapper):
+                try:
+                    submission_path = mapper(submission_path)
+                except Exception:
+                    pass
+            env["MUTEKI_FLAG_SUBMISSION_DIR"] = submission_path
         db = getattr(self.shared_graph, "db_path", None)
-        if db:
+        if db and not bool(getattr(self, "_protocol2_mode", False)):
             # ABSOLUTE path: the worker subprocess runs with cwd=<its own workdir>,
             # so a relative db_path would resolve against the wrong dir and the
             # blackboard skill / raw sqlite would hit "unable to open database file"
@@ -1046,7 +1606,7 @@ class CliSolver:
         return env
 
     @staticmethod
-    def _signal_proc(proc: Any, sig: int) -> None:
+    def _signal_proc(proc: Any, sig: int) -> bool:
         """Send `sig` to a worker's whole PROCESS GROUP (the CLI agent spawns
         curl/python/sh helpers; signalling only the parent leaves them running —
         the deeper form of bug #2). The subprocess is a group leader because the
@@ -1059,30 +1619,41 @@ class CliSolver:
         cont_sig = getattr(proc, "_container_signal", None)
         if callable(cont_sig):
             try:
-                cont_sig(sig)
-                return
+                # RCP returns an explicit delivery/verification bool. Legacy
+                # container wrappers predate that contract and return None after a
+                # successful synchronous docker call, which remains accepted.
+                return cont_sig(sig) is not False
             except Exception:
-                pass
+                return False
+        local_owner = getattr(proc, "_muteki_process_owner", None)
+        owner_signal = getattr(local_owner, "signal", None)
+        if callable(owner_signal):
+            try:
+                return owner_signal(sig) is not False
+            except Exception:
+                return False
         pid = getattr(proc, "pid", None)
         if pid is not None:
             try:
                 os.killpg(os.getpgid(pid), sig)
-                return
+                return True
             except Exception:
                 pass
             try:
                 os.kill(pid, sig)
-                return
+                return True
             except Exception:
                 pass
         # last resort for SIGKILL: Popen.kill() (covers test fakes with no pid)
         if sig == getattr(signal, "SIGKILL", -9):
             try:
                 proc.kill()
+                return True
             except Exception:
                 pass
+        return False
 
-    def cancel(self) -> None:
+    def cancel(self) -> bool:
         """Stop this worker NOW. Sets the cancel flag (the streaming runner's
         watcher kills the subprocess) and force-kills any live subprocess group
         directly — so a winning sibling actually stops this one (bug #2), not just
@@ -1090,10 +1661,124 @@ class CliSolver:
         self._cancel_event.set()
         with self._procs_lock:
             procs = list(self._live_procs)
-        for p in procs:
+        if not procs:
+            # The durable cancel flag fences any future subprocess registration.
+            return True
+        results = [
             self._signal_proc(p, getattr(signal, "SIGKILL", 9))
+            for p in procs
+        ]
+        return all(results)
 
-    def _on_proc(self, proc: Any) -> None:
+    def _notify_context_delivery(self, ok: bool) -> None:
+        callback = None
+        with self._context_delivery_lock:
+            callback = self._context_delivery_callback
+            self._context_delivery_callback = None
+        if callable(callback):
+            try:
+                callback(bool(ok))
+            except Exception:
+                pass
+
+    def _context_delivery_reservation_snapshot(self) -> tuple[tuple[str, str], ...]:
+        """Capture the reservation batch owned by one prompt transport attempt."""
+        with self._context_delivery_lock:
+            return tuple(self._pending_control_context_reservations)
+
+    def _commit_control_context_delivery(
+        self, *, actor: str,
+        reservations: "Optional[tuple[tuple[str, str], ...]]" = None,
+    ) -> bool:
+        """Commit reservations only after their actual transport boundary.
+
+        Ordinary prompts cross that boundary at Popen because the prompt is already
+        in argv. Secret-bearing prompts cross it only after the stdin writer (or the
+        acknowledged remote supervisor) accepts the complete payload.
+        """
+        with self._context_delivery_lock:
+            current = list(self._pending_control_context_reservations)
+            pending = list(
+                reservations if reservations is not None else tuple(current))
+            binding_worker_id = str(
+                self._context_binding_worker_id or self.solver_id)
+            if not pending:
+                # An explicitly captured empty batch is valid only while no later
+                # reservation has appeared.  More importantly, a late callback for
+                # a non-empty batch never turns into success merely because another
+                # owner prematurely cleared the mutable pending list.
+                confirmed = (
+                    not current and not self._control_context_delivery_unknown)
+            else:
+                committer = self._context_committer
+                confirmed = callable(committer)
+                if confirmed:
+                    for context_id, reservation_id in pending:
+                        try:
+                            if not committer(
+                                context_id, worker_id=binding_worker_id,
+                                reservation_id=reservation_id,
+                            ):
+                                confirmed = False
+                                break
+                        except Exception:
+                            confirmed = False
+                            break
+                if confirmed:
+                    consumed = set(pending)
+                    self._pending_control_context_reservations = [
+                        reservation for reservation in current
+                        if reservation not in consumed
+                    ]
+                    self._control_context_delivery_committed = True
+        if confirmed:
+            self._notify_context_delivery(True)
+            return True
+        self._mark_control_context_delivery_unknown(
+            actor=actor,
+            reason="delivery commit unavailable after prompt transport",
+            reservations=tuple(pending),
+        )
+        return False
+
+    def _mark_control_context_delivery_unknown(
+        self, *, actor: str, reason: str,
+        reservations: "Optional[tuple[tuple[str, str], ...]]" = None,
+    ) -> None:
+        with self._context_delivery_lock:
+            current = list(self._pending_control_context_reservations)
+            pending = list(
+                reservations if reservations is not None else tuple(current))
+            binding_worker_id = str(
+                self._context_binding_worker_id or self.solver_id)
+            marker = self._context_delivery_unknown_marker
+            if callable(marker):
+                for context_id, reservation_id in pending:
+                    try:
+                        marker(
+                            context_id, worker_id=binding_worker_id,
+                            reservation_id=reservation_id,
+                            actor=actor, reason=reason,
+                        )
+                    except Exception:
+                        pass
+            # Even if the journal marker failed, a post-transport reservation must
+            # remain stranded for recovery; generic cleanup may never replay it.
+            consumed = set(pending)
+            self._pending_control_context_reservations = [
+                reservation for reservation in current
+                if reservation not in consumed
+            ]
+            if pending:
+                self._control_context_delivery_unknown = True
+        self._cancel_event.set()
+        self.cancel()
+        self._notify_context_delivery(False)
+
+    def _on_proc(
+        self, proc: Any, *, context_via_stdin: bool = False,
+        context_reservations: "Optional[tuple[tuple[str, str], ...]]" = None,
+    ) -> None:
         """Called by the streaming runner with the live Popen — track it so cancel()
         and the pause monitor can signal it. If a cancel already fired before the
         subprocess registered, kill it immediately. If the operator PAUSED this worker
@@ -1101,8 +1786,20 @@ class CliSolver:
         between the execute pass and the conclude-fallback subprocess — freeze the new
         process too, so pause state doesn't silently leak across the turn boundary and
         let a paused worker keep running."""
+        self._runtime_process_started = True
         with self._procs_lock:
             self._live_procs.add(proc)
+        runner_procs = getattr(self._runner_proc_local, "procs", None)
+        if isinstance(runner_procs, set):
+            runner_procs.add(proc)
+        if not context_via_stdin:
+            self._commit_control_context_delivery(
+                actor="cli-popen-commit", reservations=context_reservations)
+            if (
+                self._c6_invocation_runner is None
+                and not self._record_cognitive_context_release(proc)
+            ):
+                raise RuntimeError("CognitiveContextReleaseUnconfirmed")
         if self._cancel_event.is_set():
             self._signal_proc(proc, getattr(signal, "SIGKILL", 9))
         elif self._paused:
@@ -1110,23 +1807,69 @@ class CliSolver:
             if sig is not None:
                 self._signal_proc(proc, sig)
 
-    def _set_paused(self, paused: bool) -> None:
+    def _on_proc_start_uncertain(
+        self,
+        reservations: "Optional[tuple[tuple[str, str], ...]]" = None,
+        *,
+        mark_c6_unknown: bool = True,
+    ) -> None:
+        """Fail closed when a remote StartWorker was sent but no started ACK arrived.
+
+        The supervisor may already have spawned the prompt-carrying process. Without
+        a worker id there is no honest Popen binding or targeted kill proof, so mark
+        every pending disclosure unknown and prevent generic pre-start cleanup from
+        replaying it.
+        """
+        # Dispatch crossed the remote supervisor boundary.  Even without a started
+        # ACK, a child may exist, so this intent is never pre-start replay-safe.
+        self._runtime_process_started = True
+        self._remote_start_uncertain = True
+        self._mark_control_context_delivery_unknown(
+            actor="rcp-start-uncertain",
+            reason="remote StartWorker dispatched without started ACK",
+            reservations=reservations,
+        )
+        if mark_c6_unknown:
+            self._mark_cognitive_context_stage_unknown(
+                reason="worker start crossed a remote boundary without an exact ACK",
+            )
+
+    def _set_paused(self, paused: bool) -> bool:
         """SIGSTOP/SIGCONT every live subprocess GROUP — a genuine freeze (same
         PIDs), not a kill. POSIX only; on platforms without SIGSTOP it no-ops."""
+        sig = getattr(signal, "SIGSTOP", None) if paused else getattr(signal, "SIGCONT", None)
+        with self._procs_lock:
+            procs = list(self._live_procs)
+        # No child exists yet: recording the desired flag is itself sufficient;
+        # _on_proc applies it before the future subprocess can do work.
+        if not procs:
+            self._paused = paused
+            if paused:
+                self._paused_event.set()
+            else:
+                self._paused_event.clear()
+            return True
+        if sig is None:
+            return False
+        signalled: list[Any] = []
+        for proc in procs:
+            if self._signal_proc(proc, sig):
+                signalled.append(proc)
+                continue
+            # All-or-nothing confirmation: compensate every process already
+            # signalled, leaving the prior logical state intact.
+            inverse = (getattr(signal, "SIGCONT", None) if paused
+                       else getattr(signal, "SIGSTOP", None))
+            if inverse is not None:
+                for prior in signalled:
+                    self._signal_proc(prior, inverse)
+            return False
         self._paused = paused
-        # M7: tell the streaming runner to stop counting wall-clock while frozen, so a
-        # long operator pause doesn't trip the turn timeout and mislabel the worker.
         if paused:
             self._paused_event.set()
         else:
             self._paused_event.clear()
-        sig = getattr(signal, "SIGSTOP", None) if paused else getattr(signal, "SIGCONT", None)
-        if sig is None:
-            return
-        with self._procs_lock:
-            procs = list(self._live_procs)
-        for p in procs:
-            self._signal_proc(p, sig)
+        return True
 
     def _enable_in_turn_steer(self) -> bool:
         """P2: whether a teammate's new flag / an operator correction may
@@ -1179,7 +1922,22 @@ class CliSolver:
             try:
                 if ins.kind is InsightKind.GUIDANCE:
                     target = getattr(ins, "target", "global") or "global"
-                    if target not in ("global", f"solver:{self.solver_id}", self.solver_id):
+                    intent_id = str(
+                        getattr(self, "intent_id_assigned", "")
+                        or getattr(self, "_intent_id", "") or "")
+                    lane = str(getattr(self, "lane", "") or "")
+                    engine = str(getattr(self, "engine", "") or "")
+                    eligible_targets = {
+                        "global", self.solver_id,
+                        f"solver:{self.solver_id}", f"worker:{self.solver_id}",
+                    }
+                    if engine:
+                        eligible_targets.add(f"engine:{engine}")
+                    if intent_id:
+                        eligible_targets.update({intent_id, f"intent:{intent_id}"})
+                    if lane:
+                        eligible_targets.update({lane, f"lane:{lane}"})
+                    if target not in eligible_targets:
                         continue
                     act = (getattr(ins, "action", "hint") or "hint").lower()
                     if act == "pause":
@@ -1190,6 +1948,8 @@ class CliSolver:
                         text = getattr(ins, "text", "") or ""
                         url = getattr(ins, "url", "") or ""
                         standing = bool(getattr(ins, "standing", False))
+                        self._remember_operator_context(text)
+                        self._remember_operator_context(url)
                         if standing:
                             # persistent background guidance — held, not consumed.
                             with self._guidance_lock:
@@ -1271,74 +2031,313 @@ class CliSolver:
 
     def _apply_runtime_argv(self, argv: list[str], env: dict) -> list[str]:
         """Apply profile/runtime options that must be command-line flags."""
-        out = list(argv)
-
-        def insert_before_prompt(args: list[str], extra: list[str]) -> list[str]:
-            if not extra:
-                return args
-            if "--" in args:
-                idx = args.index("--")
-                return [*args[:idx], *extra, *args[idx:]]
-            if len(args) <= 1:
-                return [*args, *extra]
-            return [*args[:-1], *extra, args[-1]]
-
-        model = (env.get("MUTEKI_WORKER_MODEL") or "").strip()
-        if model and "--model" not in out and "-m" not in out:
-            out = insert_before_prompt(out, ["--model", model])
-
-        if self.driver.name == "cursor":
-            endpoint = (env.get("CURSOR_ENDPOINT") or "").strip()
-            if endpoint and "--endpoint" not in out:
-                out = insert_before_prompt(out, ["--endpoint", endpoint])
+        out = apply_runtime_argv(argv, driver=self.driver, env=env)
+        seatbelt = str(env.get("MUTEKI_NETWORK_SANDBOX_PROFILE") or "")
+        if seatbelt:
+            if not bool(getattr(self, "_protocol2_mode", False)):
+                raise RuntimeError("network sandbox profile is Protocol 2 only")
+            if self.container is not None:
+                raise RuntimeError("Darwin host network sandbox cannot wrap a container")
+            sandbox_exec = "/usr/bin/sandbox-exec"
+            if not os.path.isfile(sandbox_exec):
+                raise RuntimeError("sandbox-exec is unavailable")
+            out = [sandbox_exec, "-p", seatbelt, *out]
         return out
 
-    async def _run_streaming(self, argv: list[str], *, cwd: str, timeout: int) -> CliResult:
+    @staticmethod
+    def _proc_is_alive(proc: Any) -> bool:
+        """Conservatively decide whether a registered child may still be alive.
+
+        Real ``Popen`` and container handles expose ``poll``.  Unknown/fake handles
+        are deliberately retained: dropping an unprovably-dead handle is precisely
+        how a cancelled ``asyncio.to_thread`` runner loses its last kill boundary.
+        """
+        local_owner = getattr(proc, "_muteki_process_owner", None)
+        owner_has_live = getattr(local_owner, "has_live_processes", None)
+        if callable(owner_has_live):
+            try:
+                if owner_has_live():
+                    return True
+            except Exception:
+                return True
+        if hasattr(proc, "_exit_confirmed"):
+            # RCP logical handles have a dedicated wire-level fence. A returned or
+            # failed transport wrapper is not equivalent to the supervisor's exit
+            # frame and must never prune an unknown remote owner.
+            return not bool(getattr(proc, "_exit_confirmed", False))
+        poll = getattr(proc, "poll", None)
+        # The legacy docker-exec wrapper exposes its host Popen as _client_proc.
+        # Prefer that real poll fence rather than treating the wrapper as immortal.
+        if not callable(poll):
+            poll = getattr(getattr(proc, "_client_proc", None), "poll", None)
+        if not callable(poll):
+            # Unknown logical handles without either poll, a dedicated RCP fence,
+            # or this legacy transport-return proof remain conservatively live.
+            return not bool(getattr(proc, "_muteki_runner_exited", False))
+        try:
+            return poll() is None
+        except Exception:
+            return True
+
+    def _prune_finished_procs(self) -> None:
+        with self._procs_lock:
+            self._live_procs = {
+                proc for proc in self._live_procs if self._proc_is_alive(proc)
+            }
+
+    def runtime_exit_confirmed(self) -> bool:
+        """Query the hard runtime termination fence.
+
+        True means every to_thread runner has returned AND every registered process
+        handle is provably exited (``poll() is not None`` or the equivalent RCP
+        transport-return proof). It deliberately remains False when only the outer
+        asyncio worker task has finished.
+        """
+        self._prune_finished_procs()
+        self._runner_tasks = {
+            task for task in self._runner_tasks if not task.done()
+        }
+        with self._procs_lock:
+            has_live_process = bool(self._live_procs)
+        return not self._runner_tasks and not has_live_process
+
+    async def wait_runtime_exit(self, timeout: Optional[float] = None) -> bool:
+        """Await runtime termination without cancelling runner Tasks.
+
+        ``timeout=None`` waits until proof exists. A finite timeout returns False;
+        it never turns a kill request or an already-done wrapper into proof.
+        Multiple waiters (driver cleanup plus RunManager receipt fencing) are safe.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + max(0.0, float(timeout))
+        while True:
+            if self.runtime_exit_confirmed():
+                return True
+            if deadline is not None:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return False
+            else:
+                remaining = 0.05
+
+            pending = tuple(
+                task for task in self._runner_tasks if not task.done()
+            )
+            wait_for = min(0.05, remaining) if deadline is not None else 0.05
+            if pending:
+                # asyncio.wait observes completion without propagating this waiter's
+                # cancellation into the shielded runner tasks.
+                await asyncio.wait(pending, timeout=wait_for)
+            else:
+                # A process may expose its terminal poll code shortly after runner
+                # return; keep polling conservatively until the caller's deadline.
+                await asyncio.sleep(wait_for)
+
+    @staticmethod
+    def _thread_cancel_cleanup_timeout() -> float:
+        try:
+            return max(0.01, float(os.environ.get(
+                "MUTEKI_CLI_CANCEL_CLEANUP_TIMEOUT", "2")))
+        except (TypeError, ValueError):
+            return 2.0
+
+    async def _to_thread_with_cancel_cleanup(
+        self, func: Any, /, *args: Any, **kwargs: Any
+    ) -> Any:
+        """Run a blocking CLI call without orphaning it on asyncio cancellation.
+
+        ``asyncio.to_thread`` keeps running after its awaiting task is cancelled.
+        Shield the runner task, signal the real subprocess tree via ``cancel()``,
+        then give the runner a bounded window to reap.  If that window expires the
+        thread may still finish later, so live process handles remain registered and
+        the done callback prunes them only after ``poll`` proves they exited.
+        """
+        runner_procs: set[Any] = set()
+
+        def _blocking_call() -> Any:
+            self._runner_proc_local.procs = runner_procs
+            try:
+                return func(*args, **kwargs)
+            finally:
+                # RCP logical handles do not expose poll(); transport return is their
+                # own explicit exit-frame proof. Unknown legacy logical handles use
+                # transport return, while RCP handles must never be laundered by it.
+                # Handles with a real poll still require the poll result.
+                for proc in tuple(runner_procs):
+                    if hasattr(proc, "_exit_confirmed"):
+                        continue
+                    try:
+                        setattr(proc, "_muteki_runner_exited", True)
+                    except Exception:
+                        pass
+                try:
+                    del self._runner_proc_local.procs
+                except AttributeError:
+                    pass
+
+        runner_task = asyncio.create_task(asyncio.to_thread(_blocking_call))
+        self._runner_tasks.add(runner_task)
+
+        def _runner_done(done: "asyncio.Task[Any]") -> None:
+            # Retrieve a late exception when the outer coroutine already left after
+            # its bounded cancellation window; otherwise asyncio logs an unrelated
+            # "Task exception was never retrieved" warning during shutdown.
+            try:
+                done.exception()
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._prune_finished_procs()
+            self._runner_tasks.discard(done)
+
+        runner_task.add_done_callback(_runner_done)
+        try:
+            result = await asyncio.shield(runner_task)
+        except asyncio.CancelledError:
+            # The outer task was cancelled, but shield kept the blocking runner
+            # alive.  Kill its real child first, then wait briefly for thread/proc
+            # teardown before propagating cancellation to the caller.
+            self.cancel()
+            salvaged: Any = None
+            try:
+                salvaged = await asyncio.wait_for(
+                    asyncio.shield(runner_task),
+                    timeout=self._thread_cancel_cleanup_timeout(),
+                )
+            except asyncio.TimeoutError:
+                # A second signal is idempotent and catches a process that registered
+                # just as the first snapshot was taken.  Do NOT clear its handle.
+                self.cancel()
+            except asyncio.CancelledError:
+                # A second cancellation of this coroutine must still re-signal the
+                # child; the runner remains shielded and its handle remains retained.
+                self.cancel()
+            except Exception:
+                # The blocking runner failed while unwinding.  The original asyncio
+                # cancellation remains the externally meaningful terminal cause.
+                pass
+            finally:
+                self._prune_finished_procs()
+            # NYU-AB metering gap: asyncio cancel used to discard a completed
+            # CliResult, so COST_UPDATE never fired despite real tool activity.
+            # Salvage tokens/cost before re-raising so receipts stay measurable.
+            # If the runner outlives the cleanup window, price a floor from live
+            # stream activity so zero-dollar cells cannot erase a real run.
+            if salvaged is None and runner_task.done() and not runner_task.cancelled():
+                try:
+                    salvaged = runner_task.result()
+                except Exception:
+                    salvaged = None
+            if isinstance(salvaged, CliResult):
+                try:
+                    await self._stream_cost(salvaged)
+                except Exception:
+                    pass
+            else:
+                try:
+                    await self._flush_stream_activity_cost()
+                except Exception:
+                    pass
+            raise
+        finally:
+            # Normal completion/exception may leave a short-lived dead Popen handle.
+            # Poll before removal; never use an unconditional clear here.
+            self._prune_finished_procs()
+        return result
+
+    async def _run_streaming(
+        self, argv: list[str], *, cwd: str, timeout: int,
+        stdin_text: "Optional[str]" = None,
+        runtime_env: "Optional[dict]" = None,
+        argv_is_final: bool = False,
+        on_c6_process_started: "Optional[Callable[[Any], None]]" = None,
+        on_c6_start_uncertain: "Optional[Callable[[], None]]" = None,
+    ) -> CliResult:
         """Run a CLI worker and stream each step (think / tool call / tool result)
         to the deck live. The subprocess blocks in a worker thread; its per-line
-        callback schedules deck-emits back onto THIS event loop. No bus → just the
-        plain (non-streaming) runner.
+        callback schedules processing back onto THIS event loop. With no bus the
+        event emission becomes a no-op, but the same Popen/on_proc delivery fence is
+        still mandatory for context disclosure and cancellation correctness.
 
         Runtime control: the cancel_event lets the swarm kill the subprocess (winner
         found / abort); a daemon monitor thread polls the InsightBus inbox so HITL
         pause/resume (SIGSTOP/SIGCONT) and a sibling's FLAG reach this live worker."""
-        env = self._worker_env()
-        argv = self._apply_runtime_argv(argv, env)
-        if self.bus is None:
-            res = await asyncio.to_thread(
-                run_cli, self.driver, argv, cwd=cwd, timeout=timeout, env=env,
-                container=self.container)
-            self._last_runtime_status = getattr(res, "runtime_status", {}) or {}
-            return res
-
+        env = dict(runtime_env) if runtime_env is not None else self._worker_env(cwd)
+        if not argv_is_final:
+            argv = self._apply_runtime_argv(argv, env)
         loop = asyncio.get_running_loop()
+        step_futures: "list[Any]" = []
+        step_tail: "list[Any]" = []
+        step_tasks: "set[asyncio.Task[Any]]" = set()
+        step_ingress_failures: "list[BaseException]" = []
+        step_ingress_lock = threading.Lock()
+        step_ingress_open = True
+        step_abort = False
 
         def on_step(step: StreamStep) -> None:
-            # called from the worker thread — hop back to the loop to emit.
-            asyncio.run_coroutine_threadsafe(self._emit_step(step), loop)
+            # Called from one worker thread. Chain each coroutine to the prior step:
+            # scheduling order alone does not preserve completion order when _emit_step
+            # awaits a slow event sink, and attribution state must match stream order.
+            nonlocal step_ingress_open
+            with step_ingress_lock:
+                if not step_ingress_open:
+                    return
+                previous = step_tail[-1] if step_tail else None
 
-        # monitor thread: drain control commands ~10x/s while the subprocess runs.
-        monitor_stop = threading.Event()
+                async def emit_in_order() -> None:
+                    task = asyncio.current_task()
+                    if task is not None:
+                        step_tasks.add(task)
+                    try:
+                        if step_abort:
+                            return
+                        if previous is not None:
+                            try:
+                                await asyncio.wrap_future(previous)
+                            except Exception:
+                                # Protocol 2 is prefix-closed at the stream-step level:
+                                # once one step fails, successors cannot add more local
+                                # provenance. Ordinary workers remain best effort.
+                                if bool(getattr(self, "_protocol2_mode", False)):
+                                    raise
+                        if step_abort:
+                            return
+                        await self._emit_step(step)
+                    finally:
+                        if task is not None:
+                            step_tasks.discard(task)
 
-        def _monitor() -> None:
-            while not monitor_stop.is_set():
-                # _drain_control touches asyncio.Queue.get_nowait(), which is not
-                # thread-safe to call from another thread; hop it onto the loop.
-                fut = asyncio.run_coroutine_threadsafe(
-                    self._drain_control_async(), loop)
+                pending = emit_in_order()
                 try:
-                    fut.result(timeout=1)
-                except Exception:
-                    pass
-                monitor_stop.wait(0.1)
+                    future = asyncio.run_coroutine_threadsafe(pending, loop)
+                except RuntimeError as exc:
+                    pending.close()
+                    if bool(getattr(self, "_protocol2_mode", False)):
+                        step_ingress_failures.append(exc)
+                        step_ingress_open = False
+                    return
+                step_tail[:] = [future]
+                step_futures.append(future)
 
-        monitor = threading.Thread(target=_monitor, name="cli-control-mon", daemon=True)
+        # Control queues belong to this event loop. Poll them in a loop-owned task;
+        # the previous daemon thread submitted untracked drain coroutines that could
+        # resume and mutate state after _run_streaming had already returned.
+        monitor_stop = asyncio.Event()
+
+        async def _monitor() -> None:
+            while not monitor_stop.is_set():
+                await self._drain_control_async()
+                try:
+                    await asyncio.wait_for(monitor_stop.wait(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    pass
+
+        monitor_task: "Optional[asyncio.Task[Any]]" = None
         # Drain any replayed InsightBus history while no subprocess is active. This
         # folds prior human hints into the prompt context without letting old guidance
         # kill the brand-new turn the moment it starts.
         self._turn_active = False
         self._drain_control()
-        monitor.start()
+        monitor_task = asyncio.create_task(_monitor())
         heartbeat_stop = asyncio.Event()
 
         async def _heartbeat() -> None:
@@ -1374,30 +2373,182 @@ class CliSolver:
         # in-turn redirects/flags are valid for the duration of THIS subprocess only.
         self._steer_event.clear()
         self._turn_active = True
+        self._stalled_at = None
+        self._idle_repeat_steered = False
         self._current_workdir = Path(cwd).resolve()
+        context_via_stdin = stdin_text is not None
+        context_reservations = self._context_delivery_reservation_snapshot()
+
+        def on_proc(proc: Any) -> None:
+            self._on_proc(
+                proc, context_via_stdin=context_via_stdin,
+                context_reservations=context_reservations)
+            if on_c6_process_started is not None:
+                on_c6_process_started(proc)
+
+        def on_stdin_delivered() -> None:
+            self._commit_control_context_delivery(
+                actor="cli-stdin-delivery", reservations=context_reservations)
+
+        def on_stdin_uncertain() -> None:
+            self._mark_control_context_delivery_unknown(
+                actor="cli-stdin-uncertain",
+                reason="prompt stdin handoff failed or did not finish",
+                reservations=context_reservations,
+            )
+            if self._c6_invocation_runner is None:
+                self._mark_cognitive_context_stage_unknown(
+                    reason="prompt stdin handoff failed or did not finish",
+                )
+
+        def on_start_uncertain() -> None:
+            self._on_proc_start_uncertain(
+                context_reservations,
+                mark_c6_unknown=self._c6_invocation_runner is None,
+            )
+            if on_c6_start_uncertain is not None:
+                on_c6_start_uncertain()
+
+        runner_returned = False
+        result: "Optional[CliResult]" = None
+        runner_failure: "Optional[tuple[BaseException, Any]]" = None
+        caller_cancel: "Optional[tuple[asyncio.CancelledError, Any]]" = None
         try:
-            res = await asyncio.to_thread(
+            result = await self._to_thread_with_cancel_cleanup(
                 run_cli_streaming, self.driver, argv, cwd=cwd, timeout=timeout,
                 on_step=on_step, env=env, cancel_event=self._cancel_event,
-                on_proc=self._on_proc, steer_event=self._steer_event,
+                on_proc=on_proc, steer_event=self._steer_event,
+                on_start_uncertain=on_start_uncertain,
+                on_stdin_delivered=(on_stdin_delivered
+                                    if context_via_stdin else None),
+                on_stdin_uncertain=(on_stdin_uncertain
+                                    if context_via_stdin else None),
                 paused_event=self._paused_event,
-                container=self.container)
-            self._last_runtime_status = getattr(res, "runtime_status", {}) or {}
-            return res
-        finally:
-            self._turn_active = False  # steers invalid again until the next turn
-            self._current_workdir = None
-            monitor_stop.set()
-            # a steer is scoped to ONE turn — clear it so the next resume turn isn't
-            # killed on arrival. cancel is NOT cleared (it means die, permanently).
-            self._steer_event.clear()
-            # drop finished proc handles so a later cancel/pause can't signal a
-            # recycled PID (the next subprocess re-registers via _on_proc).
-            with self._procs_lock:
-                self._live_procs.clear()
-            heartbeat_stop.set()
-            heartbeat_task.cancel()
-            await asyncio.gather(heartbeat_task, return_exceptions=True)
+                container=self.container, stdin_text=stdin_text)
+            runner_returned = True
+            self._last_runtime_status = getattr(result, "runtime_status", {}) or {}
+        except asyncio.CancelledError as exc:
+            current = asyncio.current_task()
+            outcome = (exc, exc.__traceback__)
+            if current is not None and current.cancelling():
+                caller_cancel = outcome
+            else:
+                runner_failure = outcome
+        except BaseException as exc:
+            runner_failure = (exc, exc.__traceback__)
+
+        # Close ingress before the first cleanup await. The blocking runner can outlive
+        # cancellation briefly, but callbacks arriving after this fence own no state.
+        with step_ingress_lock:
+            step_ingress_open = False
+            pending_steps = tuple(step_futures)
+            ingress_failure = (step_ingress_failures[0]
+                               if step_ingress_failures else None)
+
+        def abort_steps() -> None:
+            # Do not cancel the run_coroutine_threadsafe proxy futures: a cancelled
+            # proxy can report done before its actual loop Task has stopped. The abort
+            # bit prevents late-starting callbacks from mutating state; actual Tasks are
+            # the cancellation handles and the untouched proxies remain completion
+            # fences for callbacks that have not registered yet.
+            nonlocal step_abort
+            step_abort = True
+            for task in tuple(step_tasks):
+                if not task.done():
+                    task.cancel()
+            if monitor_task is not None and not monitor_task.done():
+                monitor_task.cancel()
+            if not heartbeat_task.done():
+                heartbeat_task.cancel()
+
+        if caller_cancel is not None or runner_failure is not None:
+            abort_steps()
+
+        # Steers and helper tasks stop at the synchronous terminal fence. Keep the
+        # workdir until callbacks retire because Cursor spill materialization needs it.
+        self._turn_active = False
+        monitor_stop.set()
+        heartbeat_stop.set()
+        if monitor_task is not None:
+            monitor_task.cancel()
+        heartbeat_task.cancel()
+
+        async def retire_turn() -> "Optional[BaseException]":
+            step_failure = ingress_failure
+            try:
+                step_results: "list[Any]" = []
+                if pending_steps:
+                    step_results = await asyncio.gather(
+                        *(asyncio.wrap_future(f) for f in pending_steps),
+                        return_exceptions=True)
+
+                # Tasks can register after the proxy snapshot while their coroutine is
+                # queued on the loop. Re-snapshot until every actual callback Task has
+                # retired; repeated caller cancellation re-enters abort_steps().
+                while True:
+                    live_steps = tuple(
+                        task for task in step_tasks if not task.done())
+                    if not live_steps:
+                        break
+                    if step_abort:
+                        for task in live_steps:
+                            task.cancel()
+                    await asyncio.gather(*live_steps, return_exceptions=True)
+
+                if (step_failure is None and runner_returned
+                        and bool(getattr(self, "_protocol2_mode", False))):
+                    step_failure = next(
+                        (item for item in step_results
+                         if isinstance(item, BaseException)), None)
+                return step_failure
+            finally:
+                self._current_workdir = None
+                # A steer is scoped to one turn; cancel remains permanent.
+                self._steer_event.clear()
+                self._prune_finished_procs()
+                helpers = tuple(
+                    task for task in (heartbeat_task, monitor_task)
+                    if task is not None)
+                if helpers:
+                    await asyncio.gather(*helpers, return_exceptions=True)
+
+        # A retained teardown Task is the completion fence. Shield it repeatedly so a
+        # second or third caller cancellation cannot expose partially retired state.
+        retirement = asyncio.create_task(retire_turn())
+        step_failure: "Optional[BaseException]" = None
+        retirement_failure: "Optional[tuple[BaseException, Any]]" = None
+        while not retirement.done():
+            try:
+                step_failure = await asyncio.shield(retirement)
+            except asyncio.CancelledError as exc:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    if caller_cancel is None:
+                        caller_cancel = (exc, exc.__traceback__)
+                    abort_steps()
+                    continue
+                retirement_failure = (exc, exc.__traceback__)
+                break
+        if retirement.done():
+            try:
+                step_failure = retirement.result()
+            except BaseException as exc:
+                retirement_failure = (exc, exc.__traceback__)
+
+        if caller_cancel is not None:
+            exc, traceback = caller_cancel
+            raise exc.with_traceback(traceback)
+        if runner_failure is not None:
+            exc, traceback = runner_failure
+            raise exc.with_traceback(traceback)
+        if step_failure is not None:
+            raise RuntimeError(
+                "Protocol2CaptureOrIngressFailed") from step_failure
+        if retirement_failure is not None:
+            exc, traceback = retirement_failure
+            raise exc.with_traceback(traceback)
+        assert result is not None
+        return result
 
     def _mark_session_if_live(self, res: "CliResult") -> None:
         """Record that the engine session is really established — i.e. a turn just
@@ -1406,6 +2557,11 @@ class CliSolver:
         found" (run-42598 claude spawn-death loop). Cancel/steer don't count (the
         turn was cut short, but the session was already seated if it ran)."""
         if res is None:
+            return
+        if self._control_secret_values:
+            # stdin secret invocations are intentionally non-persistent.  Some CLIs
+            # still report an in-memory session id in their result envelope; treating
+            # it as resumable would create a guaranteed failed/disk-unsafe follow-up.
             return
         if res.cancelled or res.steered:
             # the turn was interrupted; if it had run at all it already seated the
@@ -1416,21 +2572,135 @@ class CliSolver:
         if produced:
             self._session_established = True
 
+    def _execute_invocation(
+        self, prompt: str, session: "Optional[str]",
+    ) -> "tuple[list[str], Optional[str]]":
+        """Build one invocation, selecting the stdin-only capability for secrets."""
+        self._finalize_control_context_prompt_manifest(prompt)
+        if self._control_secret_values:
+            # Direct stdin only reports a write after a child exists.  Strict C6
+            # refuses to mislabel that as a pre-effect ContextPacket handoff.
+            self._stage_cognitive_context_prompt(prompt, transport="stdin")
+            preflight = getattr(self.driver, "secure_prompt_preflight", None)
+            if not callable(preflight):
+                raise SecurePromptUnsupported(
+                    f"{self.driver.name} has no secure prompt preflight")
+            supported, detail = preflight()
+            if not supported:
+                raise SecurePromptUnsupported(
+                    detail or f"{self.driver.name} secure prompt transport unavailable")
+            argv = self.driver.build_execute_stdin(
+                prompt, session, web_access=self.web_access,
+                kb_access=self.kb, stream=True)
+            return argv, prompt
+        self._stage_cognitive_context_prompt(prompt, transport="argv")
+        return self.driver.build_execute(
+            prompt, session, web_access=self.web_access,
+            kb_access=self.kb, stream=True), None
+
+    def _resume_invocation(
+        self, prompt: str, session: str,
+    ) -> "tuple[list[str], Optional[str]]":
+        """Build a resume only after the same final-prompt delivery fence.
+
+        Resume used to bypass ``_execute_invocation`` entirely.  A pending typed
+        context could therefore be absent from the resume prompt yet still be in the
+        reservation snapshot committed by ``_on_proc``.  Reconcile first; if an
+        included secret remains, deliberately fall back to a fresh ephemeral stdin
+        invocation because persisted sessions are not a valid secret boundary.
+        """
+        # A resume may be just a short control instruction.  Strict C6 still binds
+        # every released CLI invocation to the exact packet, so restore the sealed
+        # block rather than relying on a vendor's opaque session memory.
+        cognitive = self._cognitive_context_block()
+        if cognitive and cognitive not in prompt:
+            prompt = prompt.rstrip() + "\n" + cognitive
+        self._finalize_control_context_prompt_manifest(prompt)
+        if self._control_secret_values:
+            return self._execute_invocation(prompt, None)
+        self._stage_cognitive_context_prompt(prompt, transport="argv")
+        return self.driver.build_resume(
+            prompt, session, web_access=self.web_access,
+            kb_access=self.kb, stream=True), None
+
+    async def _run_invocation(
+        self, argv: list[str], *, cwd: str, timeout: int,
+        stdin_text: "Optional[str]" = None,
+    ) -> CliResult:
+        """Run an invocation without perturbing legacy/mock runner signatures."""
+        runner = self._c6_invocation_runner
+        if runner is not None:
+            # Phase-A C6 is intentionally argv/local-Popen only.  Freeze every
+            # runtime argv mutation *before* the host broker seals it; a later
+            # _run_streaming mutation would make the receipt describe a different
+            # child command than the one Popen receives.
+            if stdin_text is not None:
+                raise RuntimeError("C6 Phase A refuses stdin prompt transport")
+            if self.container is not None:
+                raise RuntimeError("C6 Phase A refuses container/remote execution")
+            with self._cognitive_stage_lock:
+                prompt = self._cognitive_pending_prompt
+            if type(prompt) is not str or not prompt:
+                raise RuntimeError("C6 host runner has no pending argv prompt")
+            env = self._worker_env(cwd)
+            final_argv = self._apply_runtime_argv(argv, env)
+            try:
+                result = await runner.run(
+                    prompt=prompt,
+                    final_argv=final_argv,
+                    cwd=cwd,
+                    timeout=timeout,
+                    runtime_env=env,
+                )
+            except Exception:
+                # The broker records canonical UNKNOWN if an invocation crossed
+                # the launch boundary.  This local bit only prevents UI/worker code
+                # from treating a failed C6 turn as confirmed delivery.
+                with self._cognitive_stage_lock:
+                    self._cognitive_stage_unknown = True
+                raise
+            with self._cognitive_stage_lock:
+                self._cognitive_stage_released = True
+            await self._drain_blackboard_flag_submissions()
+            return result
+        # A ContextPacket without the host-owned runner is intentionally render-only.
+        # It must never fall back to this worker-owned streaming path, because that
+        # would bypass the durable C6 launch claim and its Popen interlock.
+        if self._cognitive_context_packet is not None:
+            raise RuntimeError(
+                "strict C6 execution requires the host-owned invocation runner"
+            )
+        if stdin_text is None:
+            result = await self._run_streaming(argv, cwd=cwd, timeout=timeout)
+        else:
+            result = await self._run_streaming(
+                argv, cwd=cwd, timeout=timeout, stdin_text=stdin_text)
+        # A few CLIs buffer tool frames until process exit. Drain the host-owned
+        # handoff once more at the invocation boundary so those submissions do not
+        # depend on a vendor-specific streaming event.
+        await self._drain_blackboard_flag_submissions()
+        return result
+
     def _resume_or_execute_argv(self, prompt: str, session: "Optional[str]", *,
-                                fresh_prompt: "Optional[str]" = None) -> list:
+                                fresh_prompt: "Optional[str]" = None
+                                ) -> "tuple[list[str], Optional[str]]":
         """Build a resume argv when the session is known-established; otherwise fall
         back to a FRESH execute (the prior turn never seated the session, so `-r`
         would 0-token-die). The fallback still carries the solve context: callers
         pass the resume prompt (which already folds in board + peer/guidance), or a
         richer `fresh_prompt` to use when starting clean."""
+        if self._control_secret_values:
+            # A secret-bearing turn is explicitly non-persistent, so there is no
+            # session that may be resumed safely.  Start another ephemeral stdin
+            # turn and require callers to provide the full fresh context when the
+            # short follow-up prompt alone would be insufficient.
+            return self._execute_invocation(
+                fresh_prompt if fresh_prompt is not None else prompt, None)
         if self._session_established and session:
-            return self.driver.build_resume(
-                prompt, session, web_access=self.web_access,
-                kb_access=self.kb, stream=True)
+            return self._resume_invocation(prompt, session)
         new_sid = self.driver.new_session()
-        return self.driver.build_execute(
-            fresh_prompt if fresh_prompt is not None else prompt, new_sid,
-            web_access=self.web_access, kb_access=self.kb, stream=True)
+        return self._execute_invocation(
+            fresh_prompt if fresh_prompt is not None else prompt, new_sid)
 
     async def _drain_control_async(self) -> None:
         """Loop-thread wrapper around _drain_control (Queue.get_nowait must run on
@@ -1442,16 +2712,24 @@ class CliSolver:
         tool bubble / tool-result lane). Best-effort — never raises into the run."""
         try:
             if step.kind == "reasoning" and step.text:
-                await self._emit(EventType.REASONING_DELTA,
-                                 text=f"[{self.driver.name}] {step.text}\n")
+                incoming = step.text
+                if _is_reasoning_replay(self._reasoning_turn_acc, incoming):
+                    await self._emit(EventType.REASONING_DELTA, text="", turn_end=True)
+                    self._reasoning_turn_acc = ""
+                else:
+                    self._stream_reasoning_chars += len(incoming)
+                    # Thinking deltas are displayed but not accumulated: the
+                    # message_end snapshot repeats only the answer text, so the
+                    # accumulator must hold answer text only, otherwise the
+                    # snapshot becomes a suffix the replay check cannot seal.
+                    if not getattr(step, "thinking", False):
+                        self._reasoning_turn_acc = (self._reasoning_turn_acc or "") + incoming
+                    await self._emit(EventType.REASONING_DELTA, text=incoming)
             elif step.kind == "tool":
+                self._reasoning_turn_acc = ""
+                self._stream_tool_starts += 1
                 label = f"{step.tool}: {step.text}" if step.text else step.tool
                 await self._emit(EventType.TOOL_CALL_START, tool=label[:200])
-            elif step.kind == "tool_result" and step.text:
-                await self._emit(
-                    EventType.TOOL_CALL_RESULT,
-                    **tool_result_payload(self.driver.name,
-                                          {"condensed": step.text}))
             # LIVE marker streaming: if this step's text carries a VERIFIED_FACT=/
             # DEADEND=/FOUND_FLAG= marker, push it to the board NOW (not at end-of-run)
             # so a teammate racing in parallel sees it mid-solve — the whole point of a
@@ -1482,48 +2760,327 @@ class CliSolver:
             #    ssh forwarded here, is still gateable. The raw output is also persisted
             #    (see _persist_raw_tool_output) so the end-of-run backstop can gate
             #    against what commands actually printed, not the summarized envelope.
+            if step.kind == "tool":
+                # Keep command/output identity when the engine exposes a call id. The
+                # FIFO fallback covers older stream shapes that preserve order only.
+                command = (step.text or "")[:2000]
+                self._pending_tool_calls.append((step.call_id, command))
             if step.kind == "tool_result":
                 raw = step.raw or step.text
+                spill_status: "Optional[dict[str, Any]]" = None
+                if step.spill_path:
+                    spilled, spill_status = self._materialize_tool_result_spill(step)
+                    if spilled:
+                        raw = spilled
+                    if (spill_status.get("status") != "loaded"
+                            and bool(getattr(self, "_protocol2_mode", False))):
+                        await self._emit(
+                            EventType.TOOL_CALL_RESULT,
+                            **tool_result_payload(
+                                self.driver.name,
+                                {"condensed": "", "spill": spill_status}))
+                        raise RuntimeError("Protocol2SpillMaterializationFailed")
+                match_idx = None
+                if step.call_id:
+                    match_idx = next((
+                        idx for idx, (call_id, _) in enumerate(self._pending_tool_calls)
+                        if call_id == step.call_id
+                    ), None)
+                if (match_idx is None and not step.call_id
+                        and self._pending_tool_calls):
+                    match_idx = 0
+                attributed = match_idx is not None
+                command = (self._pending_tool_calls[match_idx][1]
+                           if attributed else "")
+                capture_receipt = ""
                 if raw:
-                    self._persist_raw_tool_output(raw)
-                if step.text:
-                    await self._stream_markers(
-                        step.text, allow_flags=True, flag_provenance=raw)
+                    capture_receipt = self._persist_raw_tool_output(
+                        raw, command=command, attributed=attributed)
+                # Capture/persistence is the Protocol 2 authority boundary. A failed
+                # capture leaves the invocation pending and emits no result event or
+                # marker. Once it succeeds, consuming the invocation is safe even if a
+                # later best-effort candidate publication fails.
+                if attributed:
+                    self._pending_tool_calls.pop(match_idx)
+                result_text = raw[:600] if raw else ""
+                result_view: "dict[str, Any]" = {"condensed": result_text}
+                if spill_status is not None:
+                    result_view["spill"] = spill_status
+                if result_text or spill_status is not None:
+                    await self._emit(
+                        EventType.TOOL_CALL_RESULT,
+                        **tool_result_payload(
+                            self.driver.name, result_view,
+                            truncated=len(raw) > len(result_text)))
+                if raw:
+                    try:
+                        await self._stream_markers(
+                            result_text, allow_flags=attributed,
+                            flag_provenance=raw)
+                    finally:
+                        # The Blackboard command commits flag_submission during
+                        # this exact tool turn.  Submission admission must not be
+                        # skipped when any legacy marker/fact parser above raises:
+                        # the API event is the sole Protocol 1 completion input.
+                        await self._drain_blackboard_flag_submissions()
+                    if not attributed:
+                        await self._surface_unverified_flags(
+                            raw, reason="tool result has no matching invocation; "
+                                        "execution source is unattributed")
             elif step.kind == "reasoning" and step.text:
                 await self._stream_markers(step.text, allow_flags=False)
         except Exception:
-            pass
+            if bool(getattr(self, "_protocol2_mode", False)):
+                raise
 
     # bound the in-memory raw-output corpus (the per-chunk artifact persist keeps the
     # full transcript; this buffer only needs to be a searchable provenance haystack).
     _RAW_OUTPUT_CHAR_CAP = 4_000_000
+    _SPILL_OUTPUT_BYTE_CAP = 4_000_000
 
-    def _persist_raw_tool_output(self, raw: str) -> None:
-        """Append one tool execution's FULL stdout/stderr to the provenance corpus.
+    def _spill_host_path(self, spill_path: str) -> "Optional[tuple[Path, Path]]":
+        """Map one engine spill pointer to (active cwd, host candidate).
+
+        The path is hostile metadata. Accept only paths beneath the exact active
+        worker cwd; a sibling worker, graph DB, shared artifact, or arbitrary host
+        file must never become this execution's output provenance.
+        """
+        cwd = self._current_workdir
+        if cwd is None or not spill_path:
+            return None
+        raw = str(spill_path)
+        if self.container is None:
+            candidate = Path(raw) if Path(raw).is_absolute() else cwd / raw
+            return cwd, candidate
+        mapper = getattr(self.container, "to_container_cwd", None)
+        if not callable(mapper):
+            return None
+        try:
+            container_cwd = PurePosixPath(str(mapper(str(cwd))))
+            reported = PurePosixPath(raw)
+        except (TypeError, ValueError):
+            return None
+        candidate_container = (reported if reported.is_absolute()
+                               else container_cwd / reported)
+        try:
+            rel = candidate_container.relative_to(container_cwd)
+        except ValueError:
+            return None
+        if any(part in {"", ".", ".."} for part in rel.parts):
+            return None
+        return cwd, cwd.joinpath(*rel.parts)
+
+    def _materialize_tool_result_spill(
+        self, step: StreamStep,
+    ) -> "tuple[str, dict[str, Any]]":
+        """Read a bounded Cursor spill without following symlinks.
+
+        Metadata remains observable in the result event, but rejected paths and
+        partial/oversized bytes never enter provenance or marker extraction.
+        """
+        audit: "dict[str, Any]" = {
+            "path": str(step.spill_path or ""),
+            "status": "rejected",
+            "reason": "invalid_path",
+            "declared_size_bytes": int(step.spill_size_bytes),
+            "declared_line_count": int(step.spill_line_count),
+        }
+        mapped = self._spill_host_path(step.spill_path)
+        if mapped is None:
+            return "", audit
+        cwd, candidate = mapped
+        try:
+            rel = candidate.relative_to(cwd)
+        except ValueError:
+            return "", audit
+        if not rel.parts or any(part in {"", ".", ".."} for part in rel.parts):
+            return "", audit
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory = getattr(os, "O_DIRECTORY", 0)
+        dir_fd: "Optional[int]" = None
+        file_fd: "Optional[int]" = None
+        try:
+            dir_fd = os.open(str(cwd), flags | directory | nofollow)
+            for part in rel.parts[:-1]:
+                next_fd = os.open(part, flags | directory | nofollow, dir_fd=dir_fd)
+                os.close(dir_fd)
+                dir_fd = next_fd
+            file_fd = os.open(rel.parts[-1], flags | nofollow, dir_fd=dir_fd)
+            info = os.fstat(file_fd)
+            if not stat.S_ISREG(info.st_mode):
+                audit["reason"] = "not_regular"
+                return "", audit
+            if info.st_size > self._SPILL_OUTPUT_BYTE_CAP:
+                audit["reason"] = "oversized"
+                audit["actual_size_bytes"] = int(info.st_size)
+                return "", audit
+            chunks: "list[bytes]" = []
+            remaining = self._SPILL_OUTPUT_BYTE_CAP + 1
+            while remaining > 0:
+                chunk = os.read(file_fd, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+            audit["actual_size_bytes"] = len(data)
+            if len(data) > self._SPILL_OUTPUT_BYTE_CAP:
+                audit["reason"] = "oversized"
+                return "", audit
+            audit["status"] = "loaded"
+            audit["reason"] = ""
+            return data.decode("utf-8", errors="replace"), audit
+        except OSError as exc:
+            audit["reason"] = f"os_error:{exc.errno or 0}"
+            return "", audit
+        finally:
+            if file_fd is not None:
+                os.close(file_fd)
+            if dir_fd is not None:
+                os.close(dir_fd)
+
+    def _persist_raw_tool_output(
+        self, raw: str, *, command: str = "", attributed: bool = True,
+    ) -> str:
+        """Append one tool execution's FULL stdout/stderr to the audit corpus.
         Called from the LIVE path (_emit_step) for every tool_result, BEFORE any
-        truncation/summarization, so a later flag claim can be checked against what
-        the command actually printed (run-75379)."""
-        if not raw:
-            return
-        # ring-trim from the front if we'd blow the cap — keep the most recent output,
-        # which is where a just-found flag lives.
-        self._raw_tool_outputs.append(raw)
-        self._raw_tool_outputs_chars += len(raw)
-        while (self._raw_tool_outputs_chars > self._RAW_OUTPUT_CHAR_CAP
-               and len(self._raw_tool_outputs) > 1):
-            dropped = self._raw_tool_outputs.pop(0)
-            self._raw_tool_outputs_chars -= len(dropped)
+        truncation/summarization. Results without a matching invocation are retained
+        for audit but marked non-authoritative. The paired `command` is kept for the
+        target-identity attestation (round-10). Protocol 2 captures first and requires
+        a digest receipt before local bytes can become authoritative."""
+        if not raw and not command:
+            return ""
+        receipt = ""
+        if bool(getattr(self, "_protocol2_mode", False)):
+            capture = getattr(self, "_protocol2_capture_callback", None)
+            if not callable(capture):
+                raise RuntimeError("Protocol2CaptureUnavailable")
+            receipt = str(capture(raw) or "")
+            expected = hashlib.sha256(
+                raw.encode("utf-8", errors="replace")).hexdigest()
+            if receipt != expected:
+                raise RuntimeError("Protocol2CaptureReceiptMismatch")
+        # Build the complete trimmed state off to the side, then swap all parallel
+        # fields together so an exception cannot leave their indexes misaligned.
+        outputs = [*self._raw_tool_outputs, raw]
+        commands = [*self._raw_tool_commands, command or ""]
+        attributed_rows = [*self._raw_tool_attributed, bool(attributed)]
+        receipts = [*self._raw_tool_capture_receipts, receipt]
+        chars = self._raw_tool_outputs_chars + len(raw)
+        while chars > self._RAW_OUTPUT_CHAR_CAP and len(outputs) > 1:
+            chars -= len(outputs.pop(0))
+            commands.pop(0)
+            attributed_rows.pop(0)
+            receipts.pop(0)
+        self._raw_tool_outputs = outputs
+        self._raw_tool_commands = commands
+        self._raw_tool_attributed = attributed_rows
+        self._raw_tool_capture_receipts = receipts
+        self._raw_tool_outputs_chars = chars
+        self._maybe_steer_idle_repeat()
+        return receipt
 
-    def _provenance_corpus(self, *extra: str) -> str:
-        """The authoritative text a flag must trace to: every raw command output this
-        worker captured live, plus any caller-supplied text (the summarized result
-        envelope / transcript). Used by the end-of-run flag gate so a flag that landed
-        only in real command output (past char 600, or in a nested-ssh remote stdout)
-        is still accepted, while a flag that appears NOWHERE in real output — only in
-        the worker's prose — is rejected (run-75379)."""
-        parts = list(self._raw_tool_outputs)
-        parts.extend(x for x in extra if x)
+    def _maybe_steer_idle_repeat(self) -> None:
+        """Soft-correct a worker repeating the same command with unchanged output."""
+        if self.mode in ("review", "verifier"):
+            return
+        self._stalled_at = None
+        cmds = list(getattr(self, "_raw_tool_commands", []) or [])
+        outs = list(getattr(self, "_raw_tool_outputs", []) or [])
+        n = _IDLE_REPEAT_LIMIT
+        if len(cmds) < n or len(outs) < n:
+            return
+        window_cmds = cmds[-n:]
+        window_outs = outs[-n:]
+        if len(set(window_cmds)) != 1:
+            return
+        hashes = [
+            hashlib.sha256((out or "").encode("utf-8", errors="replace")).hexdigest()
+            for out in window_outs
+        ]
+        if len(set(hashes)) != 1:
+            return
+        if getattr(self, "_idle_repeat_steered", False):
+            return
+        with self._guidance_lock:
+            if _IDLE_REPEAT_STEER not in self._standing_guidance:
+                self._standing_guidance.append(_IDLE_REPEAT_STEER)
+        if self._enable_in_turn_steer():
+            self._idle_repeat_steered = True
+            self._steer_event.set()
+
+    def _provenance_corpus(self) -> str:
+        """Return the ONLY authoritative flag-evidence corpus: raw tool output.
+
+        Assistant reasoning/final text, resumed-session replay, operator context, and
+        result envelopes are claims or context — never evidence.  Callers used to pass
+        the assistant's final ``result_text`` as ``extra`` here, making a
+        ``FOUND_FLAG=...`` claim self-proving.  Keeping this method argument-free makes
+        that category error impossible at every bootstrap/explore/respond call site.
+        """
+        return "\n".join(
+            output for idx, output in enumerate(self._raw_tool_outputs)
+            if (idx < len(self._raw_tool_attributed)
+                and self._raw_tool_attributed[idx])
+        )
+
+    def _finding_evidence_corpus(self) -> str:
+        """Request (attributed command) plus response (that command's output).
+
+        FOUND_FINDING fields are request/response fragments. Flag provenance is
+        output-only so a FOUND_FLAG= line cannot self-prove; findings need the
+        argv/URL as well, because resource_id and input often live in the
+        request and never appear again in the body.
+        """
+        parts: list[str] = []
+        for idx, output in enumerate(self._raw_tool_outputs):
+            if (idx >= len(self._raw_tool_attributed)
+                    or not self._raw_tool_attributed[idx]):
+                continue
+            cmd = (self._raw_tool_commands[idx]
+                   if idx < len(self._raw_tool_commands) else "")
+            parts.append(f"{cmd}\n{output}")
         return "\n".join(parts)
+
+    def _flag_provenance_records(self, flag: str, raw_output: str) -> "list[str]":
+        """Return candidate-bearing command+output records represented by one gate input.
+
+        End-of-run callers pass the flattened corpus, while live callers pass the just-
+        persisted tool result.  Only executions whose OUTPUT contains the candidate are
+        evidence for that candidate; unrelated board reads must not poison it.  Commands
+        remain paired with their own output so an internal-file read cannot hide its
+        source. Direct callers without persisted records retain single-record behavior.
+        """
+        text = raw_output or ""
+        if not self._raw_tool_outputs:
+            return [text]
+        if text == self._provenance_corpus():
+            indexes = [
+                idx for idx, output in enumerate(self._raw_tool_outputs)
+                if (idx < len(self._raw_tool_attributed)
+                    and self._raw_tool_attributed[idx]
+                    and flag in output)
+            ]
+        else:
+            # Live admission follows the newest matching execution. Output strings can
+            # repeat; identity comes from stream order/call id, not value equality.
+            indexes = [
+                idx for idx in range(len(self._raw_tool_outputs) - 1, -1, -1)
+                if (idx < len(self._raw_tool_attributed)
+                    and self._raw_tool_attributed[idx]
+                    and self._raw_tool_outputs[idx] == text)
+            ][:1]
+            if not indexes:
+                if any(output == text for output in self._raw_tool_outputs):
+                    return []  # known execution, but its invocation was unattributed
+                return [text]
+        return [
+            ((self._raw_tool_commands[idx]
+              if idx < len(self._raw_tool_commands) else "")
+             + "\n" + self._raw_tool_outputs[idx])
+            for idx in indexes
+        ]
 
     async def _stream_markers(self, text: str, *, allow_flags: bool = True,
                               flag_provenance: "Optional[str]" = None) -> None:
@@ -1552,10 +3109,14 @@ class CliSolver:
           can sit past char 600, so scanning the 600-char `text` would miss it
           entirely — we must read the marker out of the raw output AND verify the value
           against that same raw output. Facts/dead-ends/need-input still come from
-          `text` (the displayed chunk). Defaults to `text`."""
+        `text` (the displayed chunk). Defaults to `text`."""
         if self.mode == "review":
             return
-        prov = flag_provenance if flag_provenance is not None else text
+        raw_text = text
+        prov = flag_provenance if flag_provenance is not None else raw_text
+        # Marker-derived facts/dead-ends/requests are durable graph/event data.
+        # Preserve unredacted provenance only in memory for the hard flag gate.
+        text = self._redact_control_secrets(raw_text)
         if allow_flags:
             # extract AND gate flags from the provenance corpus (the marker can be past
             # the 600-char truncation point of `text`).
@@ -1566,6 +3127,28 @@ class CliSolver:
                     continue
                 if await self._accept_flag(f):
                     self._stream_accepted.append(f)
+            # Bare-flag harvest (tsec-f03: a-01/a-02/a-04 were really solved but
+            # scored 0 — the flag sat in the raw tool output of a file read / shell
+            # command and the worker never wrote FOUND_FLAG=, so nothing was ever
+            # registered or submitted). This scans ONLY real captured command
+            # output: allow_flags=True is restricted to attributed tool_result
+            # chunks (reasoning/prose always passes allow_flags=False), so the
+            # historical prose false positives (run-1619/3613/4305) do not apply.
+            # Every candidate still clears the placeholder filter (inside
+            # _poc_flag_literals) and the full provenance/launder/target gate.
+            for f in self._poc_flag_literals(prov):
+                if f in self._already_found:
+                    continue
+                if not self._flag_ok(f, prov):
+                    continue
+                if await self._accept_flag(f):
+                    self._stream_accepted.append(f)
+        if getattr(self.challenge, "mode", "ctf") == "pentest":
+            await self._stream_report_submissions(raw_text)
+            if self.mode == "verifier":
+                await self._stream_repro_decision(raw_text)
+            else:
+                await self._stream_finding_claims(raw_text, flag_provenance)
         for path_text, entry_command, status, note in self._extract_poc_saves(text):
             await self._handle_poc_save(path_text, entry_command, status, note)
         facts, deadends = self._extract_structured_facts(text)
@@ -1635,10 +3218,14 @@ class CliSolver:
             # isn't silently cut mid-sentence (the "...the data, or" symptom).
             need_card = str(need) if len(str(need)) <= 1000 else (str(need)[:1000] + " …")
             try:
+                request_id, correlation = self._decision_request_identity(
+                    need_card, need_kind)
                 await self._emit(
                     EventType.HITL_REQUEST,
                     **hitl_request_payload(self.solver_id, need_card, kind=kind,
-                                           need_kind=need_kind))
+                                           need_kind=need_kind,
+                                           request_id=request_id,
+                                           **correlation))
             except Exception:
                 pass
             # blackboard delta: first arg is the delta KIND ("need_input"); the
@@ -1665,6 +3252,121 @@ class CliSolver:
                     except Exception:
                         pass
             await self._maybe_broadcast_lockout(text)
+    async def _drain_blackboard_flag_submissions(self) -> None:
+        """Validate this Worker's pending Blackboard API Flag submissions."""
+        sg = getattr(self, "shared_graph", None)
+        if sg is None or bool(getattr(self, "_protocol2_mode", False)):
+            return
+        queued: list[dict[str, Any]] = []
+        request_dir = self._flag_submission_dir
+        if request_dir is not None:
+            try:
+                request_paths = sorted(request_dir.glob("fs-*.json"))
+            except OSError:
+                request_paths = []
+            for request_path in request_paths:
+                try:
+                    if request_path.stat().st_size > 4096:
+                        raise ValueError("submission request exceeds 4096 bytes")
+                    payload = json.loads(request_path.read_text(encoding="utf-8"))
+                    if not isinstance(payload, dict):
+                        raise ValueError("submission request is not an object")
+                    submission_id = str(payload.get("submission_id") or "")
+                    if (submission_id != request_path.stem
+                            or not re.fullmatch(r"fs-[0-9a-f]{16}", submission_id)):
+                        raise ValueError("submission id does not match request file")
+                    if str(payload.get("actor") or "") != self.solver_id:
+                        raise ValueError("submission actor does not own this Worker")
+                    if str(payload.get("protocol") or "") != "blackboard-api-v1":
+                        raise ValueError("unsupported submission protocol")
+                    flag = str(payload.get("flag") or "").strip()
+                    intent_id = str(payload.get("intent_id") or "")
+                    submission_seq = sg.flag_submission(
+                        actor=self.solver_id,
+                        submission_id=submission_id,
+                        flag=flag,
+                        intent_id=intent_id or None,
+                    )
+                    queued.append({
+                        "seq": max(0, int(submission_seq or 0)),
+                        "actor": self.solver_id,
+                        "payload": {
+                            "submission_id": submission_id,
+                            "flag": flag,
+                            "intent_id": intent_id,
+                            "protocol": "blackboard-api-v1",
+                        },
+                    })
+                except Exception as exc:
+                    await self._emit_bb(
+                        "flag_submission_rejected",
+                        submission_id=request_path.stem,
+                        reason=f"invalid submission request: {type(exc).__name__}: {exc}",
+                    )
+                finally:
+                    try:
+                        request_path.unlink()
+                    except OSError:
+                        pass
+        try:
+            rows = sg.events_since(
+                self._last_flag_submission_seq, kinds=["flag_submission"])
+        except Exception:
+            rows = []
+        queued_ids = {
+            str((row.get("payload") or {}).get("submission_id") or "")
+            for row in queued
+        }
+        rows = [
+            *queued,
+            *(row for row in rows
+              if str((row.get("payload") or {}).get("submission_id") or "")
+              not in queued_ids),
+        ]
+        for row in rows:
+            seq = int(row.get("seq") or 0)
+            self._last_flag_submission_seq = max(self._last_flag_submission_seq, seq)
+            if str(row.get("actor") or "") != self.solver_id:
+                continue
+            payload = dict(row.get("payload") or {})
+            submission_id = str(payload.get("submission_id") or f"seq-{seq}")
+            flag = str(payload.get("flag") or "").strip()
+            try:
+                accepted = bool(
+                    flag and self._flag_ok(flag, self._provenance_corpus()))
+                code = "accepted" if accepted else "provenance_rejected"
+                detail = (
+                    "Flag matched captured execution evidence"
+                    if accepted else
+                    "Flag did not match an admissible prior command output or artifact"
+                )
+            except Exception as exc:
+                accepted = False
+                code = "validation_error"
+                detail = (
+                    "Flag provenance validation failed: "
+                    f"{type(exc).__name__}: {str(exc)[:160]}"
+                )
+            try:
+                sg.flag_submission_decision(
+                    actor=self.solver_id,
+                    submission_id=submission_id,
+                    accepted=accepted,
+                    code=code,
+                    detail=detail,
+                )
+            except Exception:
+                pass
+            if accepted:
+                self._validated_flag_submissions.add(flag)
+                if await self._accept_flag(flag):
+                    self._stream_accepted.append(flag)
+            else:
+                await self._emit_bb(
+                    "flag_submission_rejected",
+                    submission_id=submission_id,
+                    reason=detail,
+                )
 
     async def _maybe_broadcast_lockout(self, text: str) -> None:
         """Parse a cooldown/burn-lockout duration out of verifier output and, if it
@@ -1757,6 +3459,46 @@ class CliSolver:
         r"dump(?:ing|ed)?)\b",
         re.IGNORECASE)
 
+    def _remember_operator_context(self, text: str) -> None:
+        """Remember untrusted operator text for anti-echo flag tainting.
+
+        This deliberately stores text only in worker memory.  It does not add it to
+        the evidence graph or the raw-output corpus.  Exact-string dedupe keeps a
+        standing hint replay from growing the list forever.
+        """
+        clean = str(text or "").strip()
+        if not clean:
+            return
+        contexts = getattr(self, "_operator_context_texts", None)
+        if contexts is None:
+            self._operator_context_texts = []
+            contexts = self._operator_context_texts
+        if clean not in contexts:
+            contexts.append(clean)
+
+    def _operator_context_corpus(self) -> str:
+        """Return all operator-authored context visible to this worker.
+
+        Shared-graph directives are included dynamically because a respawn/reopen can
+        learn them from the board without receiving ``standing_guidance`` directly.
+        Failure to read the graph degrades closed: the in-memory context remains.
+        """
+        texts = list(getattr(self, "_operator_context_texts", []) or [])
+        sg = getattr(self, "shared_graph", None)
+        if sg is not None and hasattr(sg, "operator_directives"):
+            try:
+                for directive in sg.operator_directives(active_only=False):
+                    text = str((directive or {}).get("text") or "").strip()
+                    if text and text not in texts:
+                        texts.append(text)
+            except Exception:
+                pass
+        return "\n".join(texts)
+
+    def _flag_from_operator_context(self, flag: str) -> bool:
+        """True when ``flag`` was supplied by the operator rather than discovered."""
+        return bool(flag and flag in self._operator_context_corpus())
+
     # the REAL provenance gate — the one shared, hardcoded acceptance check.
     def _flag_ok(self, flag: str, raw_output: str) -> bool:
         # run-75379 defense-in-depth: a flag the operator invalidated as a false
@@ -1765,6 +3507,12 @@ class CliSolver:
         # load-bearing enforcement is in _accept_flag (before broadcast); this is the
         # belt to that suspenders — both read the same durable shared-graph set.
         if flag and flag in self._rejected_flags():
+            return False
+        # Operator input has no truth privilege.  Even if the worker echoes it through
+        # a shell/tool (thereby placing it in raw stdout), it remains tainted and cannot
+        # satisfy provenance.  This closes the operator → `echo FOUND_FLAG=...` laundering
+        # path while leaving the hardcoded gate itself unchanged.
+        if self._flag_from_operator_context(flag):
             return False
         # anti-launder: a flag whose provenance text shows it was SCRAPED from local
         # muteki / agent storage (another run's log, the engine's own history, a
@@ -1783,19 +3531,142 @@ class CliSolver:
         # it added no value, while _LAUNDER_RE independently catches the real
         # run-11551 grep-from-disk launder via its path signature. Removed.
         text = raw_output or ""
-        if self._LAUNDER_RE.search(text):
+        evidence_records = self._flag_provenance_records(flag, text)
+        if not evidence_records:
+            return False
+        if any(self._LAUNDER_RE.search(record) for record in evidence_records):
             return False
         # file-token launder: an internal-storage filename is a tell ONLY when the
-        # transcript also shows a READ action (cat/grep/read/harvest/…). This keeps
-        # the run-11551 grep-from-disk steal caught (it reads then restates) while no
-        # longer false-rejecting a genuine flag whose transcript merely MENTIONS such
-        # a path (a target that serves /winner.json, a forensics blob, etc.).
-        if (self._LAUNDER_FILE_RE.search(text)
-                and self._READ_ACTION_RE.search(text)):
+        # SAME tool execution also shows a READ action (cat/grep/read/harvest/…). The
+        # command and its output form one record, but unrelated executions do not: a
+        # prior board read must not poison a later genuine extraction (round-15 F).
+        if any(
+            self._LAUNDER_FILE_RE.search(record)
+            and self._READ_ACTION_RE.search(record)
+            for record in evidence_records
+        ):
             return False
-        return _gate_flag_ok(flag, raw_output,
-                             flag_format=self.challenge.flag_format,
-                             artifacts=self.artifacts)
+        accepted = _gate_flag_ok(
+            flag, raw_output, flag_format=self.challenge.flag_format,
+            artifacts=self.artifacts)
+        if not accepted:
+            return False
+        # Target-identity attestation (round-10): the flag's evidence must trace
+        # to a SANCTIONED resource — the declared target, or pure computation
+        # over the provisioned files. A flag the worker manufactured (planted
+        # into a self-hosted instance, fetched from a public writeup, or
+        # otherwise present in its own commands before any tool produced it)
+        # fails here even when the final extraction output is genuine: the
+        # provenance moat binds flag→tool-output, this binds flag→resource-origin.
+        origin_rejection = self._origin_tainted(flag)
+        if origin_rejection is not None:
+            self._note_flag_origin_rejected(flag, origin_rejection)
+            return False
+        protocol2_gate = getattr(self, "_protocol2_gate_callback", None)
+        if callable(protocol2_gate):
+            # Missing/divergent V2 receipt rejects; there is no v1 fail-open.
+            return bool(protocol2_gate(flag, raw_output))
+        return True
+
+    _ORIGIN_URL_RE = re.compile(r"https?://[^\s\"'<>\)\\]+")
+
+    def _sanctioned_origin_hosts(self) -> "set[str]":
+        """Hosts a flag may be extracted FROM: the live challenge target (an
+        operator redirect's override wins). Computation over provisioned
+        workspace files needs no host entry; a file challenge (no target)
+        sanctions NO network origin."""
+        out: set[str] = set()
+        raw = self._target() or ""
+        if raw:
+            parsed = urlsplit(raw if "://" in raw else f"tcp://{raw}")
+            host = (parsed.hostname or "").lower()
+            if host:
+                out.add(host)
+                if parsed.port:
+                    out.add(f"{host}:{parsed.port}")
+        return out
+
+    def _origin_tainted(self, flag: str) -> "Optional[str]":
+        """Why this flag's evidence chain fails target-identity, else None.
+
+        1. WORKER FOREKNOWLEDGE — the value appears in one of the worker's
+           COMMANDS before it appears in ANY tool output: the worker wrote
+           the flag before recovering it (self-manufactured resource — the
+           round-10 run-7 chain: echo the writeup flag into a self-hosted
+           flag.php, then 'extract' it back). Extraction must precede
+           knowledge; equal-index (an echo FOUND_FLAG= report) is fine.
+        2. UNSANCTIONED ENDPOINT — EVERY output record containing the flag
+           references an unsanctioned network endpoint: the bytes only ever
+           originated from outside the sanctioned set (a public writeup
+           fetch, a self-hosted copy on 127.0.0.1 with no declared target).
+           A writeup READ for hints followed by a real extraction from the
+           declared target stays clean — the target record is a clean
+           occurrence. Pure local computation has no endpoint and is clean."""
+        if not flag or not self._raw_tool_outputs:
+            return None
+        first_cmd: "Optional[int]" = None
+        first_out: "Optional[int]" = None
+        occurrences: list[int] = []
+        for idx, out in enumerate(self._raw_tool_outputs):
+            if (idx < len(self._raw_tool_attributed)
+                    and self._raw_tool_attributed[idx]
+                    and flag in out):
+                if first_out is None:
+                    first_out = idx
+                occurrences.append(idx)
+        for idx, cmd in enumerate(self._raw_tool_commands):
+            if (idx < len(self._raw_tool_attributed)
+                    and self._raw_tool_attributed[idx]
+                    and flag in cmd):
+                first_cmd = idx
+                break
+        if first_cmd is not None and (first_out is None or first_cmd < first_out):
+            return (
+                "worker foreknowledge: the flag value appeared in a worker "
+                "command before any tool output produced it (self-manufactured "
+                "resource — planted file or self-seeded service)")
+        if not occurrences:
+            return None
+        sanctioned = self._sanctioned_origin_hosts()
+        first_tainted_reason: "Optional[str]" = None
+        for idx in occurrences:
+            cmd = (self._raw_tool_commands[idx]
+                   if idx < len(self._raw_tool_commands) else "")
+            record = cmd + "\n" + self._raw_tool_outputs[idx]
+            record_clean = True
+            for url in self._ORIGIN_URL_RE.findall(record):
+                parsed = urlsplit(url)
+                host = (parsed.hostname or "").lower()
+                if not host:
+                    continue
+                hp = f"{host}:{parsed.port}" if parsed.port else host
+                if host not in sanctioned and hp not in sanctioned:
+                    record_clean = False
+                    if first_tainted_reason is None:
+                        first_tainted_reason = (
+                            f"unsanctioned origin: flag evidence traces to "
+                            f"{url[:80]} — not the declared target "
+                            f"({self._target() or 'none (file challenge)'})")
+            if record_clean:
+                return None  # at least one genuine-origin occurrence
+        return first_tainted_reason
+
+    def _note_flag_origin_rejected(self, flag: str, reason: str) -> None:
+        """Board-visible record of an origin-attestation rejection (once per
+        flag value): operators must SEE a self-manufacture attempt, not hunt
+        for it in worker logs."""
+        noted = getattr(self, "_origin_rejections_noted", None)
+        if noted is None:
+            noted = self._origin_rejections_noted = set()
+        if flag in noted:
+            return
+        noted.add(flag)
+        if self.bus is not None:
+            try:
+                asyncio.get_running_loop().create_task(self._emit_bb(
+                    "flag_origin_rejected", flag=flag, reason=reason[:400]))
+            except RuntimeError:
+                pass
 
     def _stage_attachments(self, wd: Path) -> list[str]:
         """Materialize challenge attachments into the run workspace CAS, then link
@@ -1814,13 +3685,14 @@ class CliSolver:
         })
         staged: list[str] = []
         for src in (self.challenge.attachments or []):
+            logical_name = Path(src).name
             p = Path(src).resolve()
             if not p.exists():
                 continue
             try:
-                materialize_input(root, p, name=p.name)
-                link_input_into_worker(root, wd, p.name)
-                staged.append(p.name)
+                materialize_input(root, p, name=logical_name)
+                link_input_into_worker(root, wd, logical_name)
+                staged.append(logical_name)
             except (OSError, FileNotFoundError):
                 continue
         self._link_existing_shared_artifacts(root, wd)
@@ -1981,6 +3853,19 @@ class CliSolver:
         digest = self._credential_digest()
         ruled_out = self._ruled_out_digest()  # P1-C: inline, not just in the file
         if wrote_file:
+            if bool(getattr(self, "_protocol2_mode", False)):
+                block = (
+                    "\n## Shared candidate snapshot\n"
+                    f"Read `./{self.BOARD_FILENAME}` for non-authoritative teammate "
+                    "leads. Treat every row as a lead until host authority promotes "
+                    "it from sealed execution evidence. Protocol 2 workers have no "
+                    "direct database or mutation path.\n"
+                )
+                if digest:
+                    block += digest
+                if ruled_out:
+                    block += ruled_out + "\n"
+                return block
             block = (
                 "\n## Shared team board (teammates' findings)\n"
                 f"A file `./{self.BOARD_FILENAME}` in your working directory holds the "
@@ -2106,6 +3991,83 @@ class CliSolver:
     # empty-exit). Most-recent hints win when over budget.
     _STANDING_CHAR_BUDGET = 4000
 
+    def _finalize_control_context_prompt_manifest(self, prompt: str) -> None:
+        """Fence durable context against the *rendered* invocation prompt.
+
+        Context is reserved before worker construction, while ``_standing_block``
+        enforces a separate size budget later.  This final pre-Popen reconciliation
+        is therefore the first point where we can truthfully say which reservations
+        are represented in the bytes handed to the CLI.  Missing optional rows are
+        released (restoring one-shot capacity); missing exact-continuation rows abort
+        the launch instead of manufacturing a delivery receipt.
+        """
+        manifest = list(getattr(self, "_control_context_prompt_manifest", []) or [])
+        if not manifest:
+            return
+        pending = set(self._pending_control_context_reservations)
+        worker_id = str(self._context_binding_worker_id or self.solver_id)
+        included: list[tuple[str, str]] = []
+        dropped: list[tuple[str, str]] = []
+        included_secret_texts: set[str] = set()
+        dropped_texts: set[str] = set()
+        for item in manifest:
+            reservation = (
+                str(item.get("context_id") or ""),
+                str(item.get("reservation_id") or ""),
+            )
+            if reservation not in pending:
+                continue
+            text = str(item.get("text") or "")
+            if text and text in prompt:
+                included.append(reservation)
+                if bool(item.get("secret")):
+                    included_secret_texts.add(text)
+                continue
+            if bool(item.get("required")):
+                raise RuntimeError(
+                    "required operator continuation context is absent from the "
+                    "rendered worker prompt")
+            releaser = self._context_releaser
+            if not callable(releaser):
+                raise RuntimeError(
+                    "optional operator context was omitted but its reservation "
+                    "cannot be released")
+            try:
+                released = releaser(
+                    reservation[0], worker_id=worker_id,
+                    reservation_id=reservation[1])
+            except Exception as exc:
+                raise RuntimeError(
+                    "optional operator context reservation release failed") from exc
+            if released is not True:
+                raise RuntimeError(
+                    "optional operator context reservation release was not confirmed")
+            dropped.append(reservation)
+            if text:
+                dropped_texts.add(text)
+
+        if dropped:
+            dropped_set = set(dropped)
+            self._pending_control_context_reservations = [
+                reservation
+                for reservation in self._pending_control_context_reservations
+                if reservation not in dropped_set
+            ]
+            # Dropped secrets never enter argv/stdin and therefore must not force a
+            # secure-transport preflight.  Retain any value represented by another
+            # included manifest row.
+            self._control_secret_values = [
+                value for value in self._control_secret_values
+                if value not in dropped_texts or value in included_secret_texts
+            ]
+            if dropped_texts:
+                self._operator_context_texts = [
+                    value for value in self._operator_context_texts
+                    if value not in dropped_texts or value in prompt
+                ]
+        self._control_context_prompt_included = tuple(included)
+        self._control_context_prompt_manifest_finalized = True
+
     def _standing_block(self) -> str:
         """Persistent operator guidance (VPS/SSH creds, global constraints) folded
         into every turn's prompt. Empty when none set. Bounded to the most recent
@@ -2113,6 +4075,36 @@ class CliSolver:
         sg = getattr(self, "_standing_guidance", None)
         if not sg:
             return ""
+        # Exact continuation context is not optional background: reserve its full
+        # text first, even when it alone exceeds the ordinary standing budget.  The
+        # final invocation fence below will reject the launch if it somehow fails to
+        # appear.  All other guidance retains the most-recent-first budget policy.
+        required_texts = {
+            str(item.get("text") or "")
+            for item in (getattr(
+                self, "_control_context_prompt_manifest", []) or [])
+            if bool(item.get("required")) and item.get("text")
+        }
+        if required_texts:
+            kept_indices = {
+                index for index, value in enumerate(sg)
+                if value in required_texts
+            }
+            used = sum(len(sg[index]) + 3 for index in kept_indices)
+            for index in range(len(sg) - 1, -1, -1):
+                if index in kept_indices:
+                    continue
+                cost = len(sg[index]) + 3
+                if used + cost > self._STANDING_CHAR_BUDGET:
+                    continue
+                kept_indices.add(index)
+                used += cost
+            kept = [value for index, value in enumerate(sg)
+                    if index in kept_indices]
+            body = "\n".join(f"- {s}" for s in kept)
+            return ("\n## Operator standing guidance (applies to ALL your work):\n"
+                    f"{body}\n")
+
         # keep the most recent hints that fit the char budget (iterate newest-first)
         kept: list[str] = []
         used = 0
@@ -2129,6 +4121,109 @@ class CliSolver:
 
     def _verifier_rate_limited(self) -> bool:
         return bool(getattr(self.challenge, "verifier_rate_limited", False))
+
+    def bind_cognitive_context(
+        self,
+        packet: Any,
+        *,
+        stage_port: Any = None,
+        invocation_runner: Any = None,
+    ) -> None:
+        """Install one host-compiled packet and its narrow launch interface.
+
+        A bare binding remains useful for prompt-render tests, but it cannot execute.
+        A real Protocol 2 C6 attempt receives an exact ``C6InvocationRunner`` before
+        admission.  The old direct stage port was removed because an arbitrary PID
+        must never be enough to manufacture a canonical local-Popen receipt.
+        """
+
+        from muteki.runtime.cognition import DeliveredContextPacketV1
+        from muteki.runtime.c6_transport import C6InvocationRunner
+
+        if type(packet) is not DeliveredContextPacketV1:
+            raise TypeError("packet must be DeliveredContextPacketV1")
+        if stage_port is not None:
+            raise RuntimeError("direct C6 stage ports are retired; use the host runner")
+        if invocation_runner is not None and type(invocation_runner) is not C6InvocationRunner:
+            raise TypeError("invocation_runner must be C6InvocationRunner or None")
+        if self._cognitive_context_packet is not None:
+            if self._cognitive_context_packet.binding.digest != packet.binding.digest:
+                raise RuntimeError("cognitive context is already bound")
+            if (
+                invocation_runner is not None
+                and self._c6_invocation_runner is not None
+                and self._c6_invocation_runner is not invocation_runner
+            ):
+                raise RuntimeError("cognitive invocation runner is already bound")
+            if invocation_runner is not None:
+                self._c6_invocation_runner = invocation_runner
+            return
+        if packet.packet.manifest.run_id != self.run_id:
+            raise ValueError("cognitive context belongs to another run")
+        self._cognitive_context_packet = packet
+        self._c6_invocation_runner = invocation_runner
+
+    def cognitive_context_stage_confirmed(self) -> bool:
+        if self._cognitive_context_packet is None:
+            return True
+        with self._cognitive_stage_lock:
+            return bool(self._c6_invocation_runner is not None and (
+                self._cognitive_stage_released and not self._cognitive_stage_unknown
+            ))
+
+    def _stage_cognitive_context_prompt(self, prompt: str, *, transport: str) -> None:
+        if self._cognitive_context_packet is None:
+            return
+        if type(prompt) is not str or not prompt:
+            raise ValueError("materialized cognitive prompt must be non-empty")
+        if self._c6_invocation_runner is not None:
+            if transport != "argv":
+                raise RuntimeError("C6 Phase A requires argv prompt transport")
+            # The broker seals/stages only after final runtime argv materialisation.
+            # Holding the exact prompt here grants no write/effect authority.
+            with self._cognitive_stage_lock:
+                self._cognitive_pending_prompt = prompt
+                self._cognitive_stage_released = False
+                self._cognitive_stage_unknown = False
+            return
+        raise RuntimeError("strict C6 execution requires the host-owned invocation runner")
+
+    def _bind_cognitive_context_invocation(self, argv: list[str]) -> None:
+        """Seal the exact locally constructed argv before ``Popen`` is reachable."""
+
+        if self._cognitive_context_packet is None:
+            return
+        del argv
+        raise RuntimeError("C6 host broker owns final argv invocation binding")
+
+    def _mark_cognitive_context_stage_unknown(self, *, reason: str) -> None:
+        if self._cognitive_context_packet is None:
+            return
+        del reason
+        with self._cognitive_stage_lock:
+            if self._cognitive_stage_released or self._cognitive_stage_unknown:
+                return
+            self._cognitive_stage_unknown = True
+        self._cancel_event.set()
+        self.cancel()
+
+    def _record_cognitive_context_release(self, proc: Any) -> bool:
+        if self._cognitive_context_packet is None:
+            return True
+        del proc
+        # Only C6HostPopenAdapter can now write a C6 RELEASED receipt.  A passive
+        # ContextPacket without that runner is intentionally non-executable.
+        return self._c6_invocation_runner is not None
+
+    def _cognitive_context_block(self) -> str:
+        packet = getattr(self, "_cognitive_context_packet", None)
+        if packet is None:
+            return ""
+        from muteki.runtime.cognition import DeliveredContextPacketV1
+
+        if type(packet) is not DeliveredContextPacketV1:
+            raise RuntimeError("cognitive context binding changed type")
+        return packet.render_for_prompt()
 
     def _verifier_locked_now(self) -> bool:
         """True while a broadcast verifier cooldown/burn-lockout is still in force."""
@@ -2189,6 +4284,58 @@ class CliSolver:
                     f"Find and prove exploitable vulnerabilities in {c.name}.")
         return f"Solve {c.name} [{c.category}]"
 
+    def _engagement_scope(self) -> str:
+        c = self.challenge
+        if getattr(c, "mode", "ctf") != "pentest":
+            return ""
+        if getattr(c, "scope", "") and c.scope.strip():
+            return c.scope.strip()
+        tgt = self._target()
+        if tgt:
+            return tgt
+        return "Only the target/files provided above. Ask if unsure."
+
+    def _box_mode_line(self) -> str:
+        staged = list(getattr(self, "_staged_files", None) or [])
+        attachments = list(getattr(self.challenge, "attachments", None) or [])
+        if staged or attachments:
+            return (
+                "White-box: attached files in the working directory may be reviewed "
+                "as source. The live origin in Scope is still the only system you test."
+            )
+        return (
+            "Black-box: test the live HTTP origin only. Do not search the host "
+            "filesystem for challenge source."
+        )
+
+    def _review_engagement_block(self) -> str:
+        if getattr(self.challenge, "mode", "ctf") != "pentest":
+            return ""
+        return (
+            "## Engagement goal\n"
+            f"{self._engagement_goal()}\n\n"
+            "## Scope / authorization\n"
+            f"{self._engagement_scope()}\n\n"
+            "Review does not accept findings or reports. Stay inside scope. "
+            "Reproduction and value judgment are separate from Review.\n\n"
+        )
+
+    def _explore_conclude_text(self) -> str:
+        if self.mode == "verifier":
+            return (
+                "CONCLUDE: stop now. If YOUR command output already contains the "
+                "report witness, print REPRODUCED=yes and REPRO_WITNESS=<snippet>. "
+                "Otherwise print REPRODUCED=no and REPRO_REASON=<why>."
+            )
+        if getattr(self.challenge, "mode", "ctf") == "pentest":
+            return _PENTEST_EXPLORE_CONCLUDE_PROMPT
+        return _EXPLORE_CONCLUDE_PROMPT
+
+    def _resume_text(self) -> str:
+        if getattr(self.challenge, "mode", "ctf") == "pentest":
+            return _PENTEST_RESUME_PROMPT
+        return _RESUME_PROMPT
+
     def _build_prompt(self) -> str:
         c = self.challenge
         ctx_lines = [f"Challenge: {c.name} [{c.category}]"]
@@ -2201,6 +4348,22 @@ class CliSolver:
                 "FIRST): " + ", ".join(self._staged_files))
         if c.description:
             ctx_lines.append(f"Brief: {c.description.strip()[:600]}")
+        if not bool(getattr(self, "web_access", True)):
+            ctx_lines.append(
+                "\n## Offline black-box evaluation boundary\n"
+                "Use only the challenge target and files already staged in your "
+                "current working directory. Do NOT inspect parent directories, "
+                "benchmark metadata, challenge manifests, README solution text, "
+                "reference solvers, generators containing answers, other run logs, "
+                "or agent/session history. If a required player-facing file is not "
+                "staged here, report it missing instead of searching the host."
+            )
+        cognitive = self._cognitive_context_block()
+        if cognitive:
+            ctx_lines.append(cognitive)
+        if bool(getattr(self, "_protocol2_mode", False)):
+            return _PROTOCOL2_CANARY_PROMPT.format(
+                ctx="\n".join(ctx_lines), fmt=self._flag_hint())
         board = self._board_context()
         if board:
             ctx_lines.append(board)
@@ -2236,13 +4399,12 @@ class CliSolver:
             ctx_lines.append(rejected)
         # pentest mode → goal-driven prompt (no flag); else the unchanged CTF prompt.
         if getattr(c, "mode", "ctf") == "pentest":
+            ctx_lines.append(self._box_mode_line())
             return _PENTEST_EXEC_PROMPT.format(
                 ctx="\n".join(ctx_lines),
                 kb=_KB_PROMPT if self.kb else "",
-                goal=(c.goal.strip() if c.goal else
-                      f"Find and prove exploitable vulnerabilities in {c.name}."),
-                scope=(c.scope.strip() if c.scope else
-                       "Only the target/files provided above. Ask if unsure."))
+                goal=self._engagement_goal(),
+                scope=self._engagement_scope())
         return _EXEC_PROMPT.format(
             ctx="\n".join(ctx_lines),
             kb=_KB_PROMPT if self.kb else "",
@@ -2304,14 +4466,50 @@ class CliSolver:
         exec, explore, resume) so an explore worker also knows N/total and doesn't
         stop after one. Empty for a single-flag challenge (byte-identical prompt)."""
         n = self._expected_flags()
+        if getattr(self.challenge, "mode", "ctf") == "pentest":
+            eg = engagement_goal_of(self.challenge)
+            if eg.quantity == "recon":
+                return ""
+            want = max(1, int(eg.expected_findings or 1))
+            if eg.quantity == "collect" and want <= 1 and eg.collect_until_coverage:
+                return ""
+            got = 0
+            sg = getattr(self, "shared_graph", None)
+            if sg is not None and hasattr(sg, "accepted_reports"):
+                try:
+                    got = len(sg.accepted_reports() or [])
+                except Exception:
+                    got = 0
+            remaining = max(0, want - got)
+            block = [
+                f"\n## This engagement needs {want} accepted report(s) "
+                f"({got}/{want} in the report collection, {remaining} remaining).",
+                "Write a complete JSON report file, then print SUBMIT_REPORT=<path>.",
+                "FOUND_FINDING= is ignored. A report is accepted only after a "
+                "different Worker reproduces it and a host-side value check passes.",
+            ]
+            if got and sg is not None:
+                try:
+                    titles = [
+                        str(r.get("title") or r.get("resource_id") or r.get("report_id") or "")
+                        for r in (sg.accepted_reports() or [])
+                    ]
+                    titles = [t for t in titles if t]
+                    if titles:
+                        block.append("Already accepted (do not resubmit the same issue):")
+                        block += [f"  - {t}" for t in titles[:12]]
+                except Exception:
+                    pass
+            return "\n".join(block)
         if n <= 1:
             return ""
         got = self._known_flags()
         remaining = max(0, n - len(got))
         block = [f"\n## This challenge has {n} flags — find them ALL "
                  f"({len(got)}/{n} captured, {remaining} remaining).",
-                 "Keep going after each flag until the team has all of them; print "
-                 "each on its own line as FOUND_FLAG=<flag> the moment you recover it "
+                 "Keep going after each flag until the team has all of them; submit "
+                 "each with `python3 \"$MUTEKI_BLACKBOARD_SCRIPT\" submit-flag '<flag>'` "
+                 "the moment you recover it "
                  "from REAL output. Do NOT stop until all are captured or you hit a "
                  "hard wall only the operator can clear."]
         if got:
@@ -2384,6 +4582,369 @@ class CliSolver:
                 EventType.REASONING_DELTA,
                 text=f"[{self.driver.name}] produced no stdout; stderr tail:\n{tail}\n",
             )
+
+    def _pentest_findings_ready(self) -> bool:
+        """True after this worker submitted at least one complete report.
+
+        Product success is still Coordinator accept (repro + value). This only
+        stops the submitter from concluding as a CTF 'no flag' miss.
+        """
+        if getattr(self.challenge, "mode", "ctf") != "pentest":
+            return False
+        return bool(self._already_submitted_reports)
+
+    async def _finish_pentest_finding(
+        self, *, session: "Optional[str]", wd: Path, steps: int, label: str,
+    ) -> SolveOutcome:
+        lfs = self._last_fact_seq if self._last_fact_seq > 0 else None
+        self._conclude_intent_db(
+            result=RESULT_SOLVED, to_fact_seq=lfs,
+            result_detail="Exploit report submitted.")
+        await self._emit_bb(
+            "intent_concluded", intent_id=self._intent_id,
+            worker=self.solver_id, result=RESULT_SOLVED,
+            to_fact_seq=lfs,
+            result_detail="Exploit report submitted.")
+        self._note_worker_stop("solved")
+        await self._emit_finished(flag=None, flags=[], solved=True)
+        return SolveOutcome(
+            True, None, steps, self.graph,
+            f"solved via {self.driver.name} {label}",
+            session=session, engine=self.driver.name, workdir=str(wd),
+            flags=[])
+
+    async def _stream_finding_claims(
+        self, text: str, provenance: "Optional[str]",
+    ) -> None:
+        """Pentest: FOUND_FINDING= is no longer a success channel."""
+        if getattr(self.challenge, "mode", "ctf") != "pentest":
+            return
+        if self.mode == "verifier":
+            return
+        blobs = [text or ""]
+        if provenance and provenance != text:
+            blobs.append(provenance)
+        seen: set[str] = set()
+        for blob in blobs:
+            for claim in self._extract_findings(blob):
+                key = _finding_key(claim)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                await self._emit_bb(
+                    "finding_rejected",
+                    finding_class=claim.get("finding_class", ""),
+                    reason="submit_report_required")
+
+    def _workdir_path(self) -> "Optional[Path]":
+        for raw in (getattr(self, "_current_workdir", None), getattr(self, "_workdir", None)):
+            if not raw:
+                continue
+            try:
+                return Path(raw).resolve()
+            except OSError:
+                continue
+        return None
+
+    def _workdir_roots(self) -> list[Path]:
+        roots: list[Path] = []
+        seen: set[Path] = set()
+        for raw in (getattr(self, "_current_workdir", None), getattr(self, "_workdir", None)):
+            if not raw:
+                continue
+            try:
+                path = Path(raw).resolve()
+            except OSError:
+                continue
+            if path in seen:
+                continue
+            seen.add(path)
+            roots.append(path)
+        return roots
+
+    @staticmethod
+    def _path_inside(path: Path, root: Path) -> bool:
+        try:
+            path.resolve().relative_to(root.resolve())
+            return True
+        except (ValueError, OSError):
+            return False
+
+    def _resolve_report_path(self, raw: str) -> "Optional[Path]":
+        text = (raw or "").strip().strip("`\"'")
+        if not text or text.startswith("<") or text.endswith(">"):
+            return None
+        roots = self._workdir_roots()
+        wd = roots[0] if roots else None
+        path = Path(text)
+        candidates: list[Path] = []
+        if path.is_absolute():
+            candidates.append(path)
+        elif wd is not None:
+            candidates.append(wd / path)
+        name = Path(text).name
+        for root in roots:
+            if name:
+                candidates.append(root / name)
+                try:
+                    candidates.extend(root.glob(name))
+                    candidates.extend(root.glob(f"*/{name}"))
+                    candidates.extend(root.glob(f"*/*/{name}"))
+                except OSError:
+                    pass
+        seen: set[Path] = set()
+        for cand in candidates:
+            try:
+                resolved = cand.resolve()
+            except OSError:
+                continue
+            if resolved in seen or not resolved.is_file():
+                continue
+            seen.add(resolved)
+            if name and resolved.name != name:
+                continue
+            if roots and not any(self._path_inside(resolved, root) for root in roots):
+                continue
+            return resolved
+        return None
+
+    async def _stream_report_submissions(self, text: str) -> None:
+        if getattr(self.challenge, "mode", "ctf") != "pentest":
+            return
+        if self.mode in {"review", "verifier"}:
+            return
+        for match in _SUBMIT_REPORT_LINE.finditer(text or ""):
+            await self._submit_report_path(match.group(1), final=False)
+
+    async def _finalize_report_submissions(self) -> None:
+        if getattr(self.challenge, "mode", "ctf") != "pentest":
+            return
+        if self.mode in {"review", "verifier"}:
+            return
+        pending = list(self._pending_report_paths)
+        self._pending_report_paths = []
+        for raw in pending:
+            await self._submit_report_path(raw, final=True)
+
+    async def _submit_report_path(self, raw_path: str, *, final: bool = True) -> None:
+        text = (raw_path or "").strip().strip("`\"'")
+        if not text or text.startswith("<") or text.endswith(">"):
+            return
+        path = self._resolve_report_path(text)
+        if path is None:
+            if not final:
+                self._pending_report_paths.append(text)
+                return
+            await self._emit_bb(
+                "report_rejected",
+                code=VALUE_REJECT_INCOMPLETE,
+                reason="report file missing or outside the worker directory")
+            if self.shared_graph is not None:
+                try:
+                    self.shared_graph.report_rejected(
+                        actor=self.solver_id, report_id="unknown",
+                        code=VALUE_REJECT_INCOMPLETE,
+                        detail="report file missing or outside the worker directory",
+                        intent_id=getattr(self, "_intent_id", "") or None)
+                except Exception:
+                    pass
+            return
+        reports = parse_report_files(path)
+        if not reports:
+            await self._reject_report_payload(
+                {}, VALUE_REJECT_INCOMPLETE, "incomplete: parse", path)
+            return
+        for report in reports:
+            await self._accept_or_reject_report(report, path)
+
+    async def _reject_report_payload(
+        self, report: dict, code: str, detail: str, path: "Optional[Path]" = None,
+    ) -> None:
+        await self._emit_bb(
+            "report_rejected",
+            report_id=(report or {}).get("report_id", ""),
+            title=(report or {}).get("title", ""),
+            code=code,
+            reason=detail)
+        if self.shared_graph is not None:
+            try:
+                self.shared_graph.report_rejected(
+                    actor=self.solver_id,
+                    report_id=str((report or {}).get("report_id") or (path.name if path else "unknown")),
+                    code=code, detail=detail,
+                    intent_id=getattr(self, "_intent_id", "") or None)
+            except Exception:
+                pass
+
+    async def _accept_or_reject_report(self, report: dict, path: Path) -> None:
+        try:
+            code = completeness_code(
+                report,
+                scope=getattr(self.challenge, "scope", "") or "",
+                target=self._target() or "",
+            )
+        except Exception as exc:
+            await self._reject_report_payload(
+                report, VALUE_REJECT_INCOMPLETE,
+                f"completeness check failed: {exc}"[:200], path)
+            return
+        if code != "ok":
+            missing = missing_report_fields(report or {})
+            detail = code if code != VALUE_REJECT_INCOMPLETE else (
+                "incomplete: " + ",".join(missing or ["parse"])
+            )
+            await self._reject_report_payload(report, code, detail, path)
+            return
+        report_id = str(report.get("report_id") or "")
+        if not report_id or report_id in self._already_submitted_reports:
+            return
+        self._already_submitted_reports.add(report_id)
+        report["submitter"] = self.solver_id
+        report["path"] = str(path)
+        if self.shared_graph is not None:
+            try:
+                states = self.shared_graph.report_states()
+                existing = states.get(report_id) or {}
+                if existing.get("status") in {"accepted", "submitted", "reproduced", "value_accepted"}:
+                    await self._emit_bb(
+                        "report_rejected",
+                        report_id=report_id, code=VALUE_REJECT_DUPLICATE,
+                        reason="duplicate report identity")
+                    self.shared_graph.report_rejected(
+                        actor=self.solver_id, report_id=report_id,
+                        code=VALUE_REJECT_DUPLICATE, detail="duplicate report identity",
+                        intent_id=getattr(self, "_intent_id", "") or None)
+                    return
+                self.shared_graph.report_submitted(
+                    actor=self.solver_id, report=report,
+                    intent_id=getattr(self, "_intent_id", "") or None)
+            except Exception:
+                pass
+        await self._emit_bb("report_submitted", **report_sse_fields(report))
+
+    async def _stream_repro_decision(self, text: str) -> None:
+        if self.mode != "verifier":
+            return
+        report_id = report_id_from_intent(
+            getattr(self, "_intent_id", "") or self.intent_id_assigned or "")
+        if not report_id or getattr(self, "_repro_decided", False):
+            return
+        reproduced = None
+        for match in _REPRODUCED_LINE.finditer(text or ""):
+            reproduced = match.group(1).strip().lower() == "yes"
+        if reproduced is None:
+            return
+        self._repro_decided = True
+        report = {}
+        if self.shared_graph is not None:
+            try:
+                report = self.shared_graph.report_record(report_id) or {}
+            except Exception:
+                report = {}
+        corpus = self._finding_evidence_corpus()
+        commands = list(getattr(self, "_raw_tool_commands", []) or [])
+        witness = str(report.get("witness") or "").strip()
+        for match in _REPRO_WITNESS_LINE.finditer(text or ""):
+            claimed = match.group(1).strip()
+            if claimed:
+                witness = claimed
+        reason = ""
+        for match in _REPRO_REASON_LINE.finditer(text or ""):
+            reason = match.group(1).strip()
+        ok = bool(
+            reproduced
+            and witness_in_corpus(str(report.get("witness") or ""), corpus)
+            and replay_attempted(report, commands)
+        )
+        if not ok:
+            if not reproduced:
+                code = VALUE_REJECT_NOT_REPRODUCIBLE
+                detail = reason or "verifier printed REPRODUCED=no"
+            elif not replay_attempted(report, commands):
+                code = VALUE_REJECT_NOT_REPRODUCIBLE
+                detail = "verifier did not re-run a replay command"
+            else:
+                code = VALUE_REJECT_NOT_REPRODUCIBLE
+                detail = "witness missing from verifier command output"
+            await self._emit_bb(
+                "report_repro_failed",
+                report_id=report_id, code=code, reason=detail)
+            if self.shared_graph is not None:
+                try:
+                    self.shared_graph.report_repro_decision(
+                        actor=self.solver_id, report_id=report_id,
+                        reproduced=False, detail=detail,
+                        intent_id=getattr(self, "_intent_id", "") or None)
+                except Exception:
+                    pass
+            return
+        await self._emit_bb(
+            "report_reproduced",
+            report_id=report_id,
+            title=report.get("title", ""),
+            finding_class=report.get("finding_class", ""))
+        if self.shared_graph is not None:
+            try:
+                self.shared_graph.report_repro_decision(
+                    actor=self.solver_id, report_id=report_id,
+                    reproduced=True, witness=str(report.get("witness") or ""),
+                    intent_id=getattr(self, "_intent_id", "") or None)
+            except Exception:
+                pass
+
+    async def _finalize_verifier_repro(self) -> None:
+        if self.mode != "verifier" or getattr(self, "_repro_decided", False):
+            return
+        await self._stream_repro_decision(
+            "REPRODUCED=no\nREPRO_REASON=verifier did not print REPRODUCED=")
+
+    def _extract_findings(self, text: str) -> list[dict]:
+        """FOUND_FINDING= claims, last-wins per finding_key."""
+        found: dict[str, dict] = {}
+        order: list[str] = []
+        for m in _FINDING_LINE.finditer(text or ""):
+            claim = parse_finding_claim(m.group(1))
+            if not claim:
+                continue
+            key = _finding_key(claim)
+            if key not in found:
+                order.append(key)
+            found[key] = claim
+        return [found[k] for k in order]
+
+    def _finding_ok(self, finding: dict, raw_output: str) -> bool:
+        eg = engagement_goal_of(self.challenge)
+        expected = eg.finding_class if getattr(self.challenge, "mode", "ctf") == "pentest" else ""
+        return _gate_finding_ok(
+            finding, raw_output, expected_class=expected, artifacts=self.artifacts,
+            scope=getattr(self.challenge, "scope", "") or "",
+            target=self._target() or "")
+
+    async def _accept_finding(self, finding: dict) -> bool:
+        if not finding:
+            return False
+        key = _finding_key(finding)
+        if not key or key in self._already_found_findings:
+            return False
+        self._already_found_findings.add(key)
+        if self.shared_graph is not None:
+            try:
+                self.shared_graph.finding_found(
+                    actor=self.solver_id, finding=finding,
+                    intent_id=getattr(self, "_intent_id", "") or None)
+            except Exception:
+                pass
+        try:
+            self.graph.add_finding(finding)
+        except Exception:
+            pass
+        await self._emit_bb(
+            "finding_found",
+            finding_class=finding.get("finding_class", ""),
+            resource_id=finding.get("resource_id", ""),
+            identity_a=finding.get("identity_a", ""),
+            identity_b=finding.get("identity_b", ""))
+        return True
 
     def _extract_flags(self, text: str) -> list[str]:
         """Every distinct flag the worker explicitly claimed via FOUND_FLAG=
@@ -2473,6 +5034,8 @@ class CliSolver:
         """
         _STOP = ("FOUND_FLAG=", "VERIFIED_FACT=", "DEADEND=", "DEAD_END=",
                  "POC_SAVE=", "READY_TO_SUBMIT=", "ALL_FLAGS_FOUND=")
+        if getattr(self.challenge, "mode", "ctf") == "pentest":
+            _STOP = _STOP + ("FOUND_FINDING=", "SUBMIT_REPORT=", "REPRODUCED=")
         lines = (text or "").splitlines()
         out: list[tuple[str, str]] = []
         i = 0
@@ -2527,16 +5090,43 @@ class CliSolver:
 
     def _poc_flag_literals(self, body: str) -> list[str]:
         matches = set(_BRACE_FLAG.findall(body or ""))
-        try:
-            matches.update(re.findall(self.challenge.flag_format, body or ""))
-        except re.error:
-            pass
-        return sorted(f for f in matches if not is_placeholder_flag(f))
+        # flag_format="token" is a MODE SELECTOR (bare-secret flags), not a regex —
+        # findall("token", body) would manufacture junk candidates.
+        fmt = (self.challenge.flag_format or "")
+        if fmt and fmt != "token":
+            try:
+                matches.update(re.findall(fmt, body or ""))
+            except re.error:
+                pass
+        out = sorted(f for f in matches if not is_placeholder_flag(f))
+        # De-glue (tsec-f03 a-04): real command output often concatenates a status
+        # marker straight onto the flag (`SHELL_OKflag{...}`); the greedy prefix in
+        # flag_format swallows the glue and the judge rejects the combined token.
+        # Also emit the variant re-anchored at the wrapper word when one appears
+        # past position 0, so BOTH forms reach the submit gate (the judge sorts out
+        # which is real). The wrapper set is `flag` plus any hint-derived wrapper.
+        wrappers = ["flag"]
+        hint = (getattr(self.challenge, "flag_format_hint", "") or "").strip()
+        hm = re.match(r"^([A-Za-z0-9_]+)\{", hint)
+        if hm and hm.group(1) not in wrappers:
+            wrappers.append(hm.group(1))
+        extra: list[str] = []
+        for f in out:
+            for w in wrappers:
+                idx = f.find(w + "{", 1)
+                if idx > 0:
+                    v = f[idx:]
+                    if v not in out and not is_placeholder_flag(v):
+                        extra.append(v)
+        return sorted(set(out) | set(extra))
 
     def _sanitize_poc_body(self, body: str) -> tuple[str, bool, str]:
         quarantined = False
         note_parts: list[str] = []
-        out = body
+        out = self._redact_control_secrets(body)
+        if out != body:
+            quarantined = True
+            note_parts.append("operator secret redacted")
         flags = self._poc_flag_literals(out)
         for flag in flags:
             out = out.replace(flag, "<PRIOR_FLAG>")
@@ -2660,6 +5250,9 @@ class CliSolver:
                 "FIRST): " + ", ".join(self._staged_files))
         if c.description:
             ctx_lines.append(f"Brief: {c.description.strip()[:600]}")
+        cognitive = self._cognitive_context_block()
+        if cognitive:
+            ctx_lines.append(cognitive)
         board = self._board_context()
         if board:
             ctx_lines.append(board)
@@ -2681,6 +5274,21 @@ class CliSolver:
         rejected = self._rejected_flags_block()
         if rejected:
             ctx_lines.append(rejected)
+        if getattr(c, "mode", "ctf") == "pentest":
+            if self.mode == "verifier":
+                report_json = self.intent_goal or "{}"
+                return _VERIFIER_PROMPT.format(
+                    ctx="\n".join(ctx_lines),
+                    goal=self._engagement_goal(),
+                    scope=self._engagement_scope(),
+                    report_json=report_json)
+            return _PENTEST_EXPLORE_PROMPT.format(
+                ctx="\n".join(ctx_lines),
+                kb=_KB_PROMPT if self.kb else "",
+                goal=self._engagement_goal(),
+                scope=self._engagement_scope(),
+                box=self._box_mode_line(),
+                intent_goal=self.intent_goal or "general exploration")
         return _EXPLORE_PROMPT.format(
             ctx="\n".join(ctx_lines),
             kb=_KB_PROMPT if self.kb else "",
@@ -2695,6 +5303,9 @@ class CliSolver:
             ctx_lines.append(f"Target: {tgt}")
         if c.description:
             ctx_lines.append(f"Brief: {c.description.strip()[:1000]}")
+        cognitive = self._cognitive_context_block()
+        if cognitive:
+            ctx_lines.append(cognitive)
         standing = self._standing_block()
         if standing:
             ctx_lines.append(standing)
@@ -2707,6 +5318,7 @@ class CliSolver:
         return _REVIEW_PROMPT.format(
             ctx="\n".join(ctx_lines),
             kb=_KB_PROMPT if self.kb else "",
+            engagement=self._review_engagement_block(),
             intent_goal=self.intent_goal or "Audit the current swarm trajectory.",
             review_board=review_board or "(no shared graph available)")
 
@@ -2752,11 +5364,16 @@ class CliSolver:
                     if not need:
                         continue
                     need_kind = classify_need_kind(need)
+                    need_card = need[:1000]
+                    request_id, correlation = self._decision_request_identity(
+                        need_card, need_kind)
                     await self._emit(
                         EventType.HITL_REQUEST,
-                        **hitl_request_payload(self.solver_id, need[:1000],
+                        **hitl_request_payload(self.solver_id, need_card,
                                                kind="need_input",
-                                               need_kind=need_kind))
+                                               need_kind=need_kind,
+                                               request_id=request_id,
+                                               **correlation))
                     await self._emit_bb("need_input", need=need[:1000],
                                         need_kind=need_kind,
                                         legacy_kind="need_input")
@@ -2820,7 +5437,11 @@ class CliSolver:
                 outcome = await self._run_respond()
             elif self.mode == "review":
                 outcome = await self._run_review()
-            elif self.mode == "explore":
+            elif self._shell_loop:
+                # f10 edge cognition: thick worker — multi-step internal
+                # observe→plan→execute→verify→reflect→checkpoint loop.
+                outcome = await self._run_shell()
+            elif self.mode in ("explore", "verifier"):
                 outcome = await self._run_explore()
             else:
                 outcome = await self._run_bootstrap()
@@ -2829,11 +5450,43 @@ class CliSolver:
             return outcome
         except asyncio.CancelledError:
             self._note_worker_stop("cancelled")
+            exact_control_intent = str(
+                getattr(self, "_intent_id", "")
+                or self.intent_id_assigned or "").startswith("I-control-")
+            if exact_control_intent and (
+                    self._control_context_delivery_committed
+                    or self._control_context_delivery_unknown):
+                self._conclude_intent_db(
+                    result=RESULT_CANCELLED,
+                    result_detail=(
+                        "exact operator continuation terminated after its context "
+                        "crossed the process boundary"),
+                )
             raise
         except Exception:
             self._note_worker_stop("error")
+            exact_control_intent = str(
+                getattr(self, "_intent_id", "")
+                or self.intent_id_assigned or "").startswith("I-control-")
+            if exact_control_intent and (
+                    self._control_context_delivery_committed
+                    or self._control_context_delivery_unknown):
+                self._conclude_intent_db(
+                    result=RESULT_CANCELLED,
+                    result_detail=(
+                        "exact operator continuation failed after its context "
+                        "crossed the process boundary"),
+                )
             raise
         finally:
+            # A runner thread can outlive cancellation of the coroutine awaiting it.
+            # Reap provably-dead handles and re-signal anything still live before
+            # this CliSolver relinquishes its final process-control boundary.
+            self._prune_finished_procs()
+            with self._procs_lock:
+                has_live_process = bool(self._live_procs)
+            if has_live_process:
+                self.cancel()
             # M9/M10: clean a mkdtemp scratch dir we own on EVERY exit path (the
             # in-method rmtree only ran on the no-flag fall-through — solved returned
             # early, cancel/exception skipped it, and respond never cleaned at all).
@@ -2865,6 +5518,570 @@ class CliSolver:
                 except Exception:
                     pass
 
+    # ── f10 edge-cognition worker shell loop ─────────────────────────────────
+    # Reached only when self._shell_loop is on (opt-in envelope). Everything in
+    # here is additive: the default bootstrap/explore/review/respond paths are
+    # untouched.
+
+    def _shell_context_lines(self) -> "list[str]":
+        """Context block for the shell turn-1 prompt. Mirrors the explore
+        prompt's context assembly — duplicated deliberately so the default
+        explore prompt stays byte-identical."""
+        c = self.challenge
+        ctx_lines = [f"Challenge: {c.name} [{c.category}]"]
+        tgt = self._target()
+        if tgt:
+            ctx_lines.append(f"Target: {tgt}")
+        if getattr(self, "_staged_files", None):
+            ctx_lines.append(
+                "Attached files (already in your working directory — inspect them "
+                "FIRST): " + ", ".join(self._staged_files))
+        if c.description:
+            ctx_lines.append(f"Brief: {c.description.strip()[:600]}")
+        cognitive = self._cognitive_context_block()
+        if cognitive:
+            ctx_lines.append(cognitive)
+        board = self._board_context()
+        if board:
+            ctx_lines.append(board)
+        neighborhood = self._intent_neighborhood_context()
+        if neighborhood:
+            ctx_lines.append(neighborhood)
+        if getattr(self.challenge, "mode", "ctf") == "pentest":
+            ctx_lines.append(self._box_mode_line())
+        ctx_lines.append(self._workspace_protocol_block())
+        poc_block = self._poc_prompt_block()
+        if poc_block:
+            ctx_lines.append(poc_block)
+        standing = self._standing_block()
+        if standing:
+            ctx_lines.append(standing)
+        team = self._team_context_block()
+        if team:
+            ctx_lines.append(team)
+        rejected = self._rejected_flags_block()
+        if rejected:
+            ctx_lines.append(rejected)
+        return ctx_lines
+
+    @staticmethod
+    def _shell_effects_block(envelope: dict) -> str:
+        effects = envelope.get("predicted_effects") or []
+        if not effects:
+            return ""
+        lines = ["Predicted effects (falsifiable targets — verify or refute):"]
+        for e in list(effects)[:6]:
+            if isinstance(e, dict):
+                lines.append(
+                    f"  - {e.get('selector', '?')} {e.get('op', '?')} "
+                    f"{e.get('value', '?')}")
+            else:
+                lines.append(f"  - {e}")
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _shell_criteria_block(envelope: dict) -> str:
+        criteria = envelope.get("success_criteria") or []
+        if not criteria:
+            return ""
+        lines = ["Success criteria for this intent:"]
+        lines += [f"  - {str(c)[:200]}" for c in list(criteria)[:6]]
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _shell_parse_plan_steps(text: str) -> "list[dict]":
+        """PLAN_STEP=<n>|<action>|<verifier> → plan_queue entries (max 3)."""
+        steps: "list[dict]" = []
+        for line in (text or "").splitlines():
+            m = _SHELL_PLAN_LINE.match(line.strip())
+            if not m:
+                continue
+            parts = [p.strip() for p in m.group(1).strip().split("|")]
+            action = parts[1] if len(parts) > 1 else (parts[0] if parts else "")
+            verifier = parts[2] if len(parts) > 2 else ""
+            try:
+                step_no = int(parts[0]) if parts else len(steps) + 1
+            except (TypeError, ValueError):
+                step_no = len(steps) + 1
+            if action:
+                steps.append({"step": step_no, "action": action[:300],
+                              "verifier": verifier[:300]})
+        return steps[:3]
+
+    @staticmethod
+    def _shell_parse_sub_intents(text: str) -> "list[str]":
+        out: "list[str]" = []
+        for line in (text or "").splitlines():
+            m = _SHELL_SUB_INTENT_LINE.match(line.strip())
+            if m:
+                goal = m.group(1).strip()
+                if goal and goal not in out:
+                    out.append(goal[:600])
+        return out[:2]
+
+    @staticmethod
+    def _shell_parse_reflect(text: str) -> str:
+        for line in (text or "").splitlines():
+            m = _SHELL_REFLECT_LINE.match(line.strip())
+            if m:
+                return m.group(1).strip()[:300]
+        return ""
+
+    async def _run_shell(self) -> SolveOutcome:
+        """f10 edge-cognition worker shell loop (docs/frameworks_2026/
+        10_edge_cognition_swarm.md): the worker is a thick mini-agent running
+        observe → plan → execute → verify → reflect → checkpoint internally,
+        ≤ turn_limit turns, re-planning every plan_every turns.
+
+        - Belief state persists to <wd>/.shell/state.json after EVERY turn, so
+          a crashed worker resumes from its last checkpoint instead of
+          re-walking the recon chain (§7).
+        - Verified checkpoints and SUB_INTENT= declarations are appended to the
+          event bus; the central arbiter ingests them into its ledger (the
+          central never ghost-writes worker state).
+        - Stuck detection: stuck_limit consecutive turns with no new
+          fact/dead-end/artifact → self-kill (§3 Stuck Detection).
+        - Budget: the envelope's token/turn ceilings are enforced locally as a
+          hard stop; the reported budget_signal lets the central Budget
+          Enforcer cancel a runaway shell.
+        """
+        from muteki.frameworks.f10_edge_cognition import shell as edge_shell
+        from muteki.frameworks.f10_edge_cognition import state as edge_state
+
+        env = dict(self._shell_envelope or {})
+        env_budget = env.get("budget") or {}
+        env_profile = env.get("profile") or {}
+        turn_limit = max(1, int(env_budget.get("turn_limit")
+                                or edge_state.TURN_LIMIT))
+        token_limit = max(1, int(env_budget.get("token_limit")
+                                 or edge_state.TOKEN_LIMIT))
+        plan_every = max(1, int(env_profile.get("plan_every")
+                                or edge_state.PLAN_EVERY))
+        stuck_limit = max(1, int(env_profile.get("stuck_limit")
+                                 or edge_state.STUCK_LIMIT))
+
+        await self._emit(EventType.RUN_STARTED,
+                         challenge=self.challenge.model_dump())
+        goal = str(env.get("goal") or self.intent_goal
+                   or self._engagement_goal())
+        await self._emit(
+            EventType.REASONING_DELTA,
+            text=f"[{self.driver.name}] edge shell loop — intent: "
+                 f"{goal[:120]}, ≤{turn_limit} turns, plan every "
+                 f"{plan_every}.\n")
+
+        self._intent_id = str(
+            env.get("intent_id")
+            or getattr(self, "intent_id_assigned", "")
+            or f"intent:{self.solver_id}")
+        shell_id = str(env.get("shell_id") or f"shell-{uuid.uuid4().hex[:10]}")
+        # the central Budget Enforcer finds this live worker by shell_id.
+        self._f10_shell_id = shell_id
+        self._last_fact_seq = -1
+        await self._emit_bb("intent_claimed", intent_id=self._intent_id,
+                            worker=self.solver_id)
+        if self.mode == "bootstrap":
+            # standalone shell (no central intent row): register the attempt so
+            # the board shows this direction was tried (same as _run_bootstrap).
+            self._record_intent_db(goal)
+
+        wd = Path(self._workdir) if self._workdir else Path(
+            tempfile.mkdtemp(prefix=f"muteki-shell-{self.solver_id}-"))
+        if not self._workdir:
+            self._owned_scratch = wd   # M9: cleanup on ALL exit paths
+        wd.mkdir(parents=True, exist_ok=True)
+        self._staged_files = self._stage_attachments(wd)
+
+        # crash-resume: adopt the persisted shell state when one exists; the
+        # current envelope's ceilings always win (they may have shrunk).
+        st = edge_state.load_state(wd)
+        resumed = st is not None
+        if st is None:
+            st = edge_state.new_state(
+                shell_id=shell_id, intent_id=self._intent_id, goal=goal,
+                predicted_effects=env.get("predicted_effects"),
+                success_criteria=env.get("success_criteria"),
+                token_limit=token_limit, turn_limit=turn_limit)
+        else:
+            st.setdefault("budget", {})
+            st["budget"]["token_limit"] = token_limit
+            st["budget"]["turn_limit"] = turn_limit
+            await self._emit(
+                EventType.REASONING_DELTA,
+                text=f"[{self.driver.name}] shell resumed from checkpoint: turn "
+                     f"{st['budget'].get('turns_used', 0)}/{turn_limit}.\n")
+
+        session = None if self._control_secret_values else self.driver.new_session()
+        await self._note_cli_session(session)
+        all_text = ""
+        accepted: "Optional[str]" = None
+        worker_cancelled = False
+        worker_steered = False
+        worker_oom_killed = False
+        worker_timed_out = False
+        stuck_killed = False
+        budget_killed = False
+        local_tokens = 0
+        res: CliResult = CliResult(text="")
+
+        async def _absorb(r: CliResult) -> None:
+            """Fold one turn's result into worker state: cost + markers +
+            transcript + every gate-passing flag (same semantics as the
+            bootstrap/explore absorb)."""
+            nonlocal all_text, accepted, local_tokens
+            self._mark_session_if_live(r)
+            await self._emit_empty_stderr_diagnostic(r)
+            result_text = self._result_text_with_stderr(r)
+            all_text = (all_text + "\n" + result_text).strip()
+            local_tokens += int(r.input_tokens or 0) + int(r.output_tokens or 0)
+            await self._stream_cost(r)
+            prov = self._provenance_corpus()
+            await self._stream_markers(result_text, flag_provenance=prov)
+            concl = result_text.strip().splitlines()
+            if concl:
+                await self._emit(EventType.REASONING_DELTA,
+                                 text=f"[{self.driver.name}] ⮑ "
+                                      f"{concl[-1][:300]}\n")
+            for f in [x for x in self._extract_flags(result_text)
+                      if self._flag_ok(x, prov)]:
+                if await self._accept_flag(f):
+                    accepted = accepted or f
+            if self._stream_accepted and accepted is None:
+                accepted = self._stream_accepted[0]
+
+        def _tokens_now() -> int:
+            # cost-ledger total when available; else the local per-turn sum.
+            return max(self._tokens_spent(), local_tokens)
+
+        def _checkpoint(turn_no: int, *, facts: list, deadends: list,
+                        artifacts: list, reflect: str, next_action: str,
+                        stuck: bool) -> None:
+            """Persist the local shell state + append the real checkpoint event
+            for the central arbiter. Never raises into the solve."""
+            st["budget"]["tokens_used"] = _tokens_now()
+            st["budget"]["turns_used"] = turn_no
+            seq = -1
+            if self.shared_graph is not None:
+                try:
+                    seq = edge_shell.emit_shell_checkpoint(
+                        self.shared_graph,
+                        shell_id=shell_id,
+                        intent_id=self._intent_id,
+                        checkpoint={
+                            "turn": turn_no,
+                            "new_facts": [{"text": str(f)[:300]} for f in facts],
+                            "new_deadends": [{"reason": str(d)[:300]}
+                                             for d in deadends],
+                            "artifacts": [str(a)[:300] for a in artifacts],
+                            "reflect": reflect,
+                            "next_action_summary": str(next_action)[:300],
+                        },
+                        budget_signal=dict(st["budget"]),
+                        stuck=stuck)
+                except Exception:
+                    seq = -1
+            if seq and seq > 0:
+                st["last_checkpoint_seq"] = int(seq)
+            try:
+                edge_state.save_state(wd, st)
+            except Exception:
+                pass
+
+        effects_block = self._shell_effects_block(env)
+        criteria_block = self._shell_criteria_block(env)
+        resume_block = ""
+        if resumed:
+            done_turns = int(st["budget"].get("turns_used") or 0)
+            confirmed = (st.get("working_memory", {}) or {}).get(
+                "confirmed_subfacts", []) or []
+            resume_block = (
+                f"\n## RESUMED FROM CHECKPOINT (turn {done_turns} already spent)\n"
+                "You crashed or were interrupted; continue from your prior "
+                "belief state — do NOT redo confirmed work.\n"
+                "Confirmed so far:\n"
+                + ("\n".join(f"  - {str(f)[:200]}" for f in confirmed[-10:])
+                   or "  (none)")
+                + "\n")
+        if getattr(self.challenge, "mode", "ctf") == "pentest":
+            turn1_prompt = _PENTEST_SHELL_TURN1_PROMPT.format(
+                ctx="\n".join(self._shell_context_lines()),
+                kb=_KB_PROMPT if self.kb else "",
+                engagement_goal=self._engagement_goal(),
+                scope=self._engagement_scope(),
+                box=self._box_mode_line(),
+                goal=goal[:600],
+                goal_id=str(env.get("goal_id") or ""),
+                effects_block=effects_block,
+                criteria_block=criteria_block,
+                turn_limit=turn_limit,
+                resume_block=resume_block)
+        else:
+            turn1_prompt = _SHELL_TURN1_PROMPT.format(
+                ctx="\n".join(self._shell_context_lines()),
+                kb=_KB_PROMPT if self.kb else "",
+                goal=goal[:600],
+                goal_id=str(env.get("goal_id") or ""),
+                effects_block=effects_block,
+                criteria_block=criteria_block,
+                turn_limit=turn_limit,
+                resume_block=resume_block,
+                fmt=self._flag_hint())
+
+        # ── the cognitive loop ────────────────────────────────────────────────
+        while int(st["budget"].get("turns_used") or 0) < turn_limit:
+            if self._cancel_event.is_set():
+                worker_cancelled = True
+                break
+            if self._steer_event.is_set():
+                worker_steered = True
+                break
+            turn_no = int(st["budget"].get("turns_used") or 0) + 1
+            planning_turn = (
+                turn_no == 1
+                or (turn_no - 1) % plan_every == 0
+                or not st.get("plan_queue"))
+            # observe: refresh the board snapshot so this turn sees teammates.
+            self._write_board_file(wd)
+            if turn_no == 1:
+                argv, stdin_text = self._execute_invocation(
+                    turn1_prompt, session)
+            else:
+                if planning_turn:
+                    confirmed = (st.get("working_memory", {}) or {}).get(
+                        "confirmed_subfacts", []) or []
+                    dead = (st.get("working_memory", {}) or {}).get(
+                        "dead_ends", []) or []
+                    tokens_now = _tokens_now()
+                    warn = (
+                        " WARNING: ≥80% of your token budget is gone — converge."
+                        if tokens_now >= int(token_limit
+                                             * edge_state.TOKEN_WARN_FRACTION)
+                        else "")
+                    prompt = _SHELL_PLAN_TURN_PROMPT.format(
+                        turn=turn_no, turn_limit=turn_limit,
+                        tokens_used=tokens_now, token_limit=token_limit,
+                        budget_warn=warn,
+                        goal=goal[:600],
+                        effects_block=effects_block,
+                        subfacts_block=(
+                            "\n".join(f"  - {str(f)[:200]}"
+                                      for f in confirmed[-10:])
+                            or "  (none yet)"),
+                        deadends_block=(
+                            "\n".join(f"  - {str(d.get('reason', d))[:200]}"
+                                      for d in dead[-10:])
+                            or "  (none)"))
+                else:
+                    nxt = (st.get("plan_queue") or [{}])[0]
+                    tokens_now = _tokens_now()
+                    warn = (
+                        " WARNING: ≥80% of your token budget is gone — converge."
+                        if tokens_now >= int(token_limit
+                                             * edge_state.TOKEN_WARN_FRACTION)
+                        else "")
+                    prompt = _SHELL_EXEC_TURN_PROMPT.format(
+                        turn=turn_no, turn_limit=turn_limit,
+                        tokens_used=tokens_now, token_limit=token_limit,
+                        budget_warn=warn,
+                        step=nxt.get("step", "?"),
+                        action=str(nxt.get("action") or "continue the plan")[:300],
+                        verifier=str(nxt.get("verifier")
+                                     or "new fact or dead-end")[:300])
+                argv, stdin_text = self._resume_or_execute_argv(
+                    prompt, session,
+                    fresh_prompt=turn1_prompt + "\n\n" + prompt)
+            res = await self._run_invocation(
+                argv, cwd=str(wd), timeout=self.timeout, stdin_text=stdin_text)
+            session = (None if self._control_secret_values
+                       else (res.session or session))
+            await self._note_cli_session(session)
+            await _absorb(res)
+            worker_cancelled = worker_cancelled or res.cancelled
+            worker_steered = worker_steered or res.steered
+            worker_oom_killed = (worker_oom_killed
+                                 or getattr(res, "oom_killed", False))
+            worker_timed_out = res.timed_out
+
+            # verify + reflect: did this turn actually change belief?
+            turn_text = self._result_text_with_stderr(res)
+            facts, deadends = self._extract_structured_facts(turn_text)
+            artifacts = [p for p, *_ in self._extract_poc_saves(turn_text)]
+            reflect = self._shell_parse_reflect(turn_text)
+            new_steps = (self._shell_parse_plan_steps(turn_text)
+                         if planning_turn else [])
+            belief_changed = bool(facts or deadends or artifacts or accepted)
+            st["stuck_counter"] = (
+                0 if belief_changed
+                else int(st.get("stuck_counter") or 0) + 1)
+            wm = st.setdefault("working_memory", {})
+            wm["last_tool_output_digest"] = (
+                "sha256:" + hashlib.sha256(
+                    turn_text.encode("utf-8", "replace")).hexdigest())
+            if facts:
+                confirmed = list(wm.get("confirmed_subfacts") or [])
+                confirmed += [str(f)[:300] for f in facts]
+                wm["confirmed_subfacts"] = confirmed[-20:]
+            if deadends:
+                dead = list(wm.get("dead_ends") or [])
+                dead += [{"reason": str(d)[:300], "turn": turn_no}
+                         for d in deadends]
+                wm["dead_ends"] = dead[-20:]
+            # the step just executed leaves the queue; a fresh plan replaces it.
+            if new_steps:
+                st["plan_queue"] = list(new_steps)[1:]
+            elif st.get("plan_queue"):
+                st["plan_queue"] = list(st["plan_queue"])[1:]
+
+            # sub-intent writeback (§4.1b): append-only event; the central
+            # arbiter persists + dispatches it.
+            for sub_goal in self._shell_parse_sub_intents(turn_text):
+                sub_id = f"{self._intent_id}-sub-{uuid.uuid4().hex[:6]}"
+                if self.shared_graph is not None:
+                    try:
+                        edge_shell.emit_sub_intent(
+                            self.shared_graph,
+                            shell_id=shell_id,
+                            intent_id=sub_id,
+                            goal=sub_goal,
+                            parent_intent_id=self._intent_id)
+                    except Exception:
+                        pass
+                await self._emit_bb(
+                    "sub_intent_declared", intent_id=sub_id,
+                    parent_intent_id=self._intent_id, goal=sub_goal[:200],
+                    worker=self.solver_id)
+
+            stuck_now = int(st.get("stuck_counter") or 0) >= stuck_limit
+            _checkpoint(
+                turn_no, facts=facts, deadends=deadends, artifacts=artifacts,
+                reflect=reflect,
+                next_action=((st.get("plan_queue") or [{}])[0].get("action", "")
+                             if st.get("plan_queue") else ""),
+                stuck=stuck_now)
+
+            if accepted or self._pentest_findings_ready():
+                break
+            if worker_cancelled or worker_steered or worker_oom_killed:
+                break
+            if _tokens_now() >= int(token_limit * edge_state.TOKEN_KILL_FRACTION):
+                budget_killed = True
+                break
+            if stuck_now:
+                stuck_killed = True
+                await self._emit(
+                    EventType.REASONING_DELTA,
+                    text=f"[{self.driver.name}] stuck: {stuck_limit} barren "
+                         f"turns → self-kill.\n")
+                break
+
+        # one conclude fallback when the loop ended without a flag for a
+        # "natural" reason (turn limit / budget / stuck / timeout): force a
+        # summary of what is confirmed. cancel/steer/OOM skip it — die now.
+        if (not accepted and not worker_cancelled and not worker_steered
+                and not worker_oom_killed
+                and not self._pentest_findings_ready()):
+            await self._emit(EventType.REASONING_DELTA,
+                             text=f"[{self.driver.name}] shell loop ended → one "
+                                  f"conclude turn.\n")
+            self._write_board_file(wd)
+            argv, stdin_text = self._resume_or_execute_argv(
+                self._explore_conclude_text(), session,
+                fresh_prompt=turn1_prompt + "\n\n" + self._explore_conclude_text())
+            res = await self._run_invocation(
+                argv, cwd=str(wd), timeout=min(self.timeout, 600),
+                stdin_text=stdin_text)
+            session = (None if self._control_secret_values
+                       else (res.session or session))
+            await self._note_cli_session(session)
+            await _absorb(res)
+            worker_cancelled = worker_cancelled or res.cancelled
+            worker_steered = worker_steered or res.steered
+
+        # persist the agent's full transcript as a provenance artifact; end-of-run
+        # marker backstop + unverified-flag surfacing (same as bootstrap).
+        self.artifacts.put(
+            self._redact_control_secrets(all_text), suffix=".txt")
+        await self._stream_markers(
+            all_text, flag_provenance=self._provenance_corpus())
+        await self._finalize_report_submissions()
+        await self._finalize_verifier_repro()
+        if self._stream_accepted and accepted is None:
+            accepted = self._stream_accepted[0]
+        await self._surface_unverified_flags(all_text)
+        try:
+            edge_state.save_state(wd, st)
+        except Exception:
+            pass
+
+        if accepted:
+            found = self._accepted_flags_for_outcome()
+            lfs = self._last_fact_seq if self._last_fact_seq > 0 else None
+            self._conclude_intent_db(result=RESULT_SOLVED, to_fact_seq=lfs,
+                                     result_detail="Verified flag accepted.")
+            await self._emit_bb("intent_concluded", intent_id=self._intent_id,
+                                worker=self.solver_id, result=RESULT_SOLVED,
+                                to_fact_seq=lfs,
+                                result_detail="Verified flag accepted.")
+            self._note_worker_stop("solved")
+            await self._emit_finished(flag=accepted, flags=found, solved=True)
+            return SolveOutcome(
+                True, accepted, int(st["budget"].get("turns_used") or 1),
+                self.graph, f"solved via {self.driver.name} edge shell",
+                session=session, engine=self.driver.name, workdir=str(wd),
+                flags=found)
+        if self._pentest_findings_ready():
+            return await self._finish_pentest_finding(
+                session=session, wd=wd,
+                steps=int(st["budget"].get("turns_used") or 1),
+                label="edge shell")
+
+        _, deadends = self._extract_structured_facts(all_text)
+        if worker_cancelled:
+            self._note_worker_stop("cancelled")
+            result_code = RESULT_CANCELLED
+            detail = "Worker was cancelled before a verified flag."
+        elif worker_steered:
+            self._note_worker_stop("steered")
+            result_code = RESULT_STEERED
+            detail = "Worker was steered before producing a verified flag."
+        elif worker_oom_killed:
+            self._note_worker_stop("oom")
+            result_code = RESULT_OOM
+            detail = "Killed by the OOM killer before a verified flag."
+        elif stuck_killed:
+            self._note_worker_stop("stuck")
+            result_code = RESULT_DEAD_END
+            detail = (f"Shell self-killed after {stuck_limit} consecutive "
+                      "barren turns (stuck detection).")
+        elif budget_killed:
+            self._note_worker_stop("budget")
+            result_code = RESULT_EXPLORED
+            detail = (f"Shell stopped at its token budget "
+                      f"({token_limit} token ceiling).")
+        elif deadends:
+            self._note_worker_stop("finished")
+            result_code = RESULT_DEAD_END
+            detail = f"Worker explicitly ruled out: {deadends[0][:220]}"
+        elif worker_timed_out:
+            self._note_worker_stop("timeout")
+            result_code = RESULT_TIMED_OUT
+            detail = "Timed out before a verified flag."
+        else:
+            self._note_worker_stop("finished")
+            result_code = RESULT_EXPLORED
+            detail = "Shell loop exhausted its turn budget without a flag."
+        self._conclude_intent_db(result=result_code, result_detail=detail)
+        await self._emit_bb("intent_concluded", intent_id=self._intent_id,
+                            worker=self.solver_id, result=result_code,
+                            result_detail=detail)
+        partial_flags = list(self.graph.flags)
+        await self._emit_finished(flag=None, flags=partial_flags, solved=False)
+        return SolveOutcome(False, None,
+                            int(st["budget"].get("turns_used") or 1),
+                            self.graph,
+                            f"{self.driver.name} edge shell: no verified flag",
+                            flags=partial_flags)
+
     async def _run_bootstrap(self) -> SolveOutcome:
         await self._emit(EventType.RUN_STARTED, challenge=self.challenge.model_dump())
         mode = "offline" if not self.web_access else "web"
@@ -2875,12 +6092,14 @@ class CliSolver:
                  f"black-box, {mode}{kb_note}, up to {self.max_turns} turns.\n")
 
         # Blackboard collaboration layer: a CLI worker takes the WHOLE challenge as
-        # one intent it owns end-to-end. Surface that lifecycle the same way the
-        # code-driven path does — propose → claim (this worker) → … → conclude — so
-        # the OneNote board shows "intent claimed by <engine> → produced facts/flag",
-        # not just loose fact stickies. intent_id is per-worker so claude & codex
-        # each own a distinct intent in the race.
-        self._intent_id = f"intent:{self.solver_id}"
+        # one intent it owns end-to-end. Planning architectures assign and persist an
+        # intent before constructing the Worker; use that same id for claim, conclude,
+        # and runtime retirement. Direct race Workers have no assigned id and retain
+        # the per-worker fallback.
+        self._intent_id = (
+            getattr(self, "intent_id_assigned", "")
+            or f"intent:{self.solver_id}"
+        )
         self._last_fact_seq = -1
         # pentest mode → the operator's goal is the engagement objective; CTF mode
         # keeps the original "Solve {name} [{category}]" string byte-for-byte.
@@ -2916,7 +6135,7 @@ class CliSolver:
         # Operator guidance / teammate findings now reach the NEXT worker the swarm
         # spawns (intent-level HITL), not a resume of this live one. The session is
         # used only for the immediate conclude fallback, then discarded.
-        session = self.driver.new_session()
+        session = None if self._control_secret_values else self.driver.new_session()
         await self._note_cli_session(session)  # claude pre-seeds; codex stays None
         worker_timed_out = False
         worker_cancelled = False
@@ -2934,11 +6153,10 @@ class CliSolver:
             result_text = self._result_text_with_stderr(r)
             all_text = (all_text + "\n" + result_text).strip()
             await self._stream_cost(r)
-            # gate flags in the summarized result against the FULL provenance corpus
-            # (raw command outputs ∪ result text), not the envelope alone — a flag the
-            # agent names in its summary is accepted only if a real command actually
-            # printed it (run-75379).
-            prov = self._provenance_corpus(result_text)
+            # Gate summary claims against raw tool stdout/stderr ONLY.  The assistant's
+            # final result is deliberately absent from this corpus; otherwise its own
+            # FOUND_FLAG line self-proves the claim.
+            prov = self._provenance_corpus()
             await self._stream_markers(result_text, flag_provenance=prov)
             concl = result_text.strip().splitlines()
             if concl:
@@ -2957,11 +6175,11 @@ class CliSolver:
         # refresh the board file so the prompt's pointer/digest reflects teammates'
         # latest, then run the one execute pass.
         self._write_board_file(wd)
-        argv = self.driver.build_execute(
-            self._build_prompt(), session,
-            web_access=self.web_access, kb_access=self.kb, stream=True)
-        res = await self._run_streaming(argv, cwd=str(wd), timeout=self.timeout)
-        session = res.session or session
+        initial_prompt = self._build_prompt()
+        argv, stdin_text = self._execute_invocation(initial_prompt, session)
+        res = await self._run_invocation(
+            argv, cwd=str(wd), timeout=self.timeout, stdin_text=stdin_text)
+        session = None if self._control_secret_values else (res.session or session)
         await self._note_cli_session(session)
         await _absorb(res)
         worker_cancelled = res.cancelled
@@ -2981,21 +6199,27 @@ class CliSolver:
                 and not worker_steered
                 and not worker_oom_killed
                 and worker_timed_out
-                and len(self._already_found) < self._expected_flags()):
+                and len(self._already_found) < self._expected_flags()
+                and not self._pentest_findings_ready()
+                and not getattr(self, "_skip_bootstrap_conclude", False)):
             await self._emit(EventType.REASONING_DELTA,
                              text=f"[{self.driver.name}] timed out → one conclude turn.\n")
             self._write_board_file(wd)
-            argv = self._resume_or_execute_argv(_RESUME_PROMPT, session)
-            res = await self._run_streaming(
-                argv, cwd=str(wd), timeout=min(self.timeout, 600))
-            session = res.session or session
+            argv, stdin_text = self._resume_or_execute_argv(
+                self._resume_text(), session,
+                fresh_prompt=initial_prompt + "\n\n" + self._resume_text())
+            res = await self._run_invocation(
+                argv, cwd=str(wd), timeout=min(self.timeout, 600),
+                stdin_text=stdin_text)
+            session = None if self._control_secret_values else (res.session or session)
             await self._note_cli_session(session)
             await _absorb(res)
             worker_cancelled = worker_cancelled or res.cancelled
             worker_steered = worker_steered or res.steered
 
         # persist the agent's full transcript as a provenance artifact.
-        aid = self.artifacts.put(all_text, suffix=".txt")
+        aid = self.artifacts.put(
+            self._redact_control_secrets(all_text), suffix=".txt")
 
         if worker_steered and not accepted:
             self._note_worker_stop("steered")
@@ -3015,11 +6239,12 @@ class CliSolver:
         # executor). Most markers already streamed live to the board mid-solve via
         # _emit_step → _stream_markers (bug #1); this end-of-run pass is a backstop
         # that catches anything missed and is deduped against what already went out.
-        # Gate flags against the FULL provenance corpus (raw command outputs ∪
-        # transcript) so a flag that landed only in real command output — past char
-        # 600, or in a nested-ssh remote stdout — is still accepted here (run-75379).
+        # Gate flags against raw command output only.  The assistant transcript is a
+        # claim source for facts/dead-ends, never flag evidence.
         await self._stream_markers(
-            all_text, flag_provenance=self._provenance_corpus(all_text))
+            all_text, flag_provenance=self._provenance_corpus())
+        await self._finalize_report_submissions()
+        await self._finalize_verifier_repro()
         # the end-of-run backstop may have accepted a flag from the streamed-only
         # transcript — promote it to `accepted` so the solved branch fires.
         if self._stream_accepted and accepted is None:
@@ -3032,14 +6257,12 @@ class CliSolver:
         # instead of silently dropping it OR silently trusting prose (run-75379 BUG①).
         await self._surface_unverified_flags(all_text)
 
-        # always record the closing summary fact too (verified iff a flag landed).
-        lines = [ln for ln in all_text.strip().splitlines() if ln.strip()]
-        summary = lines[-1][:200] if lines else "(no output)"
-        fact = f"[{self.driver.name}] {summary}"
-        await self._record_fact(fact, verified=bool(accepted), artifact_id=aid)
+        # The transcript remains a provenance artifact, but its closing prose is
+        # telemetry, not evidence.  Manufacturing a candidate from the final line
+        # made an empty worker look like progress and kept the coordinator alive.
 
         if accepted:
-            found = list(self.graph.flags)  # every flag this worker accepted
+            found = self._accepted_flags_for_outcome()
             lfs = self._last_fact_seq if self._last_fact_seq > 0 else None
             # P1-B: conclude in DB unconditionally (was gated on lfs is not None,
             # which dropped the conclude when no fact seq was recorded → the intent
@@ -3058,6 +6281,9 @@ class CliSolver:
                 True, accepted, 1, self.graph, f"solved via {self.driver.name} CLI",
                 session=session, engine=self.driver.name, workdir=str(wd),
                 flags=found)
+        if self._pentest_findings_ready():
+            return await self._finish_pentest_finding(
+                session=session, wd=wd, steps=1, label="CLI")
 
         if worker_cancelled:
             self._note_worker_stop("cancelled")
@@ -3133,7 +6359,7 @@ class CliSolver:
         # (on timeout or no structured markers) to force a summary. NO multi-turn
         # resume loop. Operator guidance reaches the NEXT spawned worker, not a resume
         # of this one. The session is used only for the conclude fallback, then dropped.
-        session = self.driver.new_session()
+        session = None if self._control_secret_values else self.driver.new_session()
         await self._note_cli_session(session)  # claude pre-seeds; codex stays None
         worker_cancelled = False
         worker_steered = False
@@ -3141,18 +6367,19 @@ class CliSolver:
         res: CliResult = CliResult(text="")
 
         self._write_board_file(wd)
-        argv = self.driver.build_execute(
-            self._build_explore_prompt(), session,
-            web_access=self.web_access, kb_access=self.kb, stream=True)
-        res = await self._run_streaming(argv, cwd=str(wd), timeout=self.timeout)
-        session = res.session or session
+        initial_prompt = self._build_explore_prompt()
+        argv, stdin_text = self._execute_invocation(initial_prompt, session)
+        res = await self._run_invocation(
+            argv, cwd=str(wd), timeout=self.timeout, stdin_text=stdin_text)
+        session = None if self._control_secret_values else (res.session or session)
         self._mark_session_if_live(res)
         await self._note_cli_session(session)
         await self._emit_empty_stderr_diagnostic(res)
         result_text = self._result_text_with_stderr(res)
         all_text = (all_text + "\n" + result_text).strip()
         await self._stream_cost(res)
-        await self._stream_markers(result_text)
+        await self._stream_markers(
+            result_text, flag_provenance=self._provenance_corpus())
         worker_cancelled = res.cancelled
         worker_steered = res.steered
         worker_timed_out = res.timed_out
@@ -3162,21 +6389,26 @@ class CliSolver:
         if not worker_cancelled and not worker_steered:
             facts, deadends = self._extract_structured_facts(all_text)
             flag = self._extract_flag(all_text)
-            if worker_timed_out or (not facts and not deadends and not flag):
+            if ((not self._pentest_findings_ready())
+                    and (worker_timed_out or (not facts and not deadends and not flag))):
                 await self._emit(EventType.REASONING_DELTA,
                                  text=f"[{self.driver.name}] explore → one conclude fallback.\n")
                 self._write_board_file(wd)
-                argv = self._resume_or_execute_argv(_EXPLORE_CONCLUDE_PROMPT, session)
-                res = await self._run_streaming(
-                    argv, cwd=str(wd), timeout=self.conclude_timeout)
-                session = res.session or session
+                argv, stdin_text = self._resume_or_execute_argv(
+                    self._explore_conclude_text(), session,
+                    fresh_prompt=initial_prompt + "\n\n" + self._explore_conclude_text())
+                res = await self._run_invocation(
+                    argv, cwd=str(wd), timeout=self.conclude_timeout,
+                    stdin_text=stdin_text)
+                session = None if self._control_secret_values else (res.session or session)
                 self._mark_session_if_live(res)
                 await self._note_cli_session(session)
                 await self._emit_empty_stderr_diagnostic(res)
                 result_text = self._result_text_with_stderr(res)
                 all_text = (all_text + "\n" + result_text).strip()
                 await self._stream_cost(res)
-                await self._stream_markers(result_text)
+                await self._stream_markers(
+                    result_text, flag_provenance=self._provenance_corpus())
                 worker_cancelled = worker_cancelled or res.cancelled
                 worker_steered = worker_steered or res.steered
 
@@ -3185,16 +6417,22 @@ class CliSolver:
         flag = self._extract_flag(all_text)
 
         # provenance: persist full transcript, bind artifact to each fact
-        aid = self.artifacts.put(all_text, suffix=".txt")
-        # accept EVERY gate-passing flag (explore is narrow but multi-flag-safe).
-        gate_ok = [f for f in self._extract_flags(all_text) if self._flag_ok(f, all_text)]
-        accepted = gate_ok[0] if gate_ok else None
+        aid = self.artifacts.put(
+            self._redact_control_secrets(all_text), suffix=".txt")
+        # A command output may contain a valid-looking Flag before the Worker has
+        # submitted it through the Blackboard API.  Keep that text as evidence,
+        # but derive the outcome only from `_stream_accepted`, which is populated
+        # after a matching flag_submission passes the provenance check.
+        provenance = self._provenance_corpus()
+        accepted = self._stream_accepted[0] if self._stream_accepted else None
 
         # write structured facts/dead-ends to the board — deduped against anything
         # already streamed live mid-solve (bug #1). The full combined transcript is
         # re-scanned so the conclude-pass markers are caught too. This also accepts
         # any FOUND_FLAG that only ever appeared in streamed/intermediate text.
-        await self._stream_markers(all_text)
+        await self._stream_markers(all_text, flag_provenance=provenance)
+        await self._finalize_report_submissions()
+        await self._finalize_verifier_repro()
         # a flag accepted only via the live stream (not in all_text's terminal-result
         # tail) still makes this explore worker solved (run-11189).
         if self._stream_accepted and accepted is None:
@@ -3202,13 +6440,8 @@ class CliSolver:
         # recompute the full marker set for the result decision below.
         facts, deadends = self._extract_structured_facts(all_text)
 
-        # if no structured output at all, record the transcript tail as a candidate fact
-        if not facts and not deadends and not accepted:
-            lines = [ln for ln in all_text.strip().splitlines() if ln.strip()]
-            summary = lines[-1][:200] if lines else "(no output)"
-            await self._record_fact(
-                f"[{self.driver.name}] {summary}",
-                verified=False, artifact_id=aid)
+        # Unstructured transcript text stays in the artifact only.  It must not be
+        # promoted to a synthetic candidate that resets no-progress containment.
 
         if accepted:
             lfs = self._last_fact_seq if self._last_fact_seq > 0 else None
@@ -3227,15 +6460,16 @@ class CliSolver:
                                 to_fact_seq=lfs,
                                 result_detail="Verified flag accepted.")
             self._note_worker_stop("solved")
-            for f in gate_ok:
-                await self._accept_flag(f)
-            found = list(self.graph.flags)
+            found = self._accepted_flags_for_outcome()
             await self._emit_finished(flag=accepted, flags=found, solved=True)
             return SolveOutcome(
                 True, accepted, 1, self.graph,
                 f"solved via {self.driver.name} explore",
                 session=session, engine=self.driver.name, workdir=str(wd),
                 flags=found)
+        if self._pentest_findings_ready():
+            return await self._finish_pentest_finding(
+                session=session, wd=wd, steps=1, label="explore")
 
         if worker_cancelled:
             self._note_worker_stop("cancelled")
@@ -3258,6 +6492,8 @@ class CliSolver:
             result_label = RESULT_EXPLORED
             result_detail = "Explored this intent and produced no explicit dead-end."
         lfs = self._last_fact_seq if self._last_fact_seq > 0 else None
+        result_label = self._redact_control_secrets(result_label)
+        result_detail = self._redact_control_secrets(result_detail)
         # ALWAYS flip the intent to done on exit — even when this worker recorded NO
         # new fact (lfs is None). Previously the DB conclude was gated on `lfs is not
         # None`, so a "need operator" / no-fact dead-end left the intent status=
@@ -3306,22 +6542,23 @@ class CliSolver:
         wd.mkdir(parents=True, exist_ok=True)
         self._staged_files = self._stage_attachments(wd)
 
-        session = self.driver.new_session()
+        session = None if self._control_secret_values else self.driver.new_session()
         await self._note_cli_session(session)
         self._write_board_file(wd)
-        argv = self.driver.build_execute(
-            self._build_review_prompt(), session,
-            web_access=self.web_access, kb_access=self.kb, stream=True)
-        res = await self._run_streaming(argv, cwd=str(wd), timeout=self.timeout)
-        session = res.session or session
+        prompt = self._build_review_prompt()
+        argv, stdin_text = self._execute_invocation(prompt, session)
+        res = await self._run_invocation(
+            argv, cwd=str(wd), timeout=self.timeout, stdin_text=stdin_text)
+        session = None if self._control_secret_values else (res.session or session)
         self._mark_session_if_live(res)
         await self._note_cli_session(session)
         await self._emit_empty_stderr_diagnostic(res)
         text = self._result_text_with_stderr(res)
         await self._stream_cost(res)
 
-        aid = self.artifacts.put(text, suffix=".txt")
-        actions = self._extract_review_actions(text)
+        safe_text = self._redact_control_secrets(text)
+        aid = self.artifacts.put(safe_text, suffix=".txt")
+        actions = self._extract_review_actions(safe_text)
         applied = await self._apply_review_actions(actions)
         if not actions:
             try:
@@ -3339,6 +6576,7 @@ class CliSolver:
                 pass
 
         result = f"reviewed: {applied} proposal(s)"
+        result = self._redact_control_secrets(result)
         if self.shared_graph is not None:
             try:
                 self.shared_graph.conclude_intent(
@@ -3392,8 +6630,22 @@ class CliSolver:
                 flag=self.hitl_cmd.get("flag") or "(the reported flag)", note=note)
         elif action == "writeup":
             prompt = _RESPOND_WRITEUP_PROMPT
-        else:  # ask / hint / anything conversational
-            prompt = _RESPOND_ASK_PROMPT.format(text=text or "(no question text)")
+        else:  # ask / hint / redirect / anything conversational
+            question = text or "(no question text)"
+            if action == "redirect":
+                endpoint = str(self.hitl_cmd.get("url") or "").strip()
+                # A redirect is not delivered merely because it reached
+                # _target_override.  This one-shot standby path does not call the
+                # normal solve prompt builder, so the resumed CLI must receive the
+                # endpoint in this exact turn before the reservation can be
+                # committed at Popen.
+                if endpoint:
+                    question = (
+                        "Continue the investigation against this new target "
+                        f"endpoint: {endpoint}"
+                        + (f"\nOperator note: {text}" if text else "")
+                    )
+            prompt = _RESPOND_ASK_PROMPT.format(text=question)
 
         # RESUME the winner's session (full memory) when we have one; otherwise a
         # fresh session, with the prompt already carrying the board context.
@@ -3402,11 +6654,19 @@ class CliSolver:
         # answer-turn, not a long-lived loop accumulating context across a solve —
         # so resuming the winner's session here doesn't reintroduce the bloat the
         # migration removed; it just gives the answer the winner's full memory.
-        if self.resume_session:
+        stdin_text: "Optional[str]" = None
+        if self._control_secret_values:
+            # The winner session may contain durable history and Cursor cannot make
+            # it ephemeral.  A secret-bearing response is always a fresh stdin-only
+            # turn with an explicit board snapshot instead of a resume.
+            board = self._board_context()
+            if board:
+                prompt = prompt + "\n" + board
+            argv, stdin_text = self._execute_invocation(prompt, None)
+        elif self.resume_session:
             await self._note_cli_session(self.resume_session)
-            argv = self.driver.build_resume(
-                prompt, self.resume_session, web_access=self.web_access,
-                kb_access=self.kb, stream=True)
+            argv, stdin_text = self._resume_invocation(
+                prompt, self.resume_session)
         else:
             if action != "mark_false":
                 # no session to resume → seed the conversational prompt with the
@@ -3414,52 +6674,49 @@ class CliSolver:
                 board = self._board_context()
                 if board:
                     prompt = prompt + "\n" + board
-            session = self.driver.new_session()
+            session = None if self._control_secret_values else self.driver.new_session()
             await self._note_cli_session(session)
-            argv = self.driver.build_execute(
-                prompt, session, web_access=self.web_access, kb_access=self.kb,
-                stream=True)
+            argv, stdin_text = self._execute_invocation(prompt, session)
 
-        res: CliResult = await self._run_streaming(
-            argv, cwd=str(wd), timeout=min(self.timeout, 1200))
+        res: CliResult = await self._run_invocation(
+            argv, cwd=str(wd), timeout=min(self.timeout, 1200),
+            stdin_text=stdin_text)
         await self._emit_empty_stderr_diagnostic(res)
         await self._stream_cost(res)
         all_text = self._result_text_with_stderr(res)
+        safe_all_text = self._redact_control_secrets(all_text)
 
         # stream the reply to the deck (the worker's answer / writeup body).
-        if all_text.strip():
+        if safe_all_text.strip():
             await self._emit(
                 EventType.TEXT_MESSAGE_DELTA,
-                text=all_text.strip(),
+                text=safe_all_text.strip(),
                 main_thread=action in {"ask", "writeup"},
             )
 
         # mark_false: the worker kept solving — try to accept a NEW flag through the
         # real gate (same provenance rule). On success, re-conclude + accept.
         if action == "mark_false":
-            await self._stream_markers(all_text)
-            gate_ok = [f for f in self._extract_flags(all_text)
-                       if self._flag_ok(f, all_text)]
-            accepted = gate_ok[0] if gate_ok else None
+            provenance = self._provenance_corpus()
+            await self._stream_markers(all_text, flag_provenance=provenance)
+            accepted = self._stream_accepted[0] if self._stream_accepted else None
             # a flag accepted only via the live stream still counts (consistency
             # with bootstrap/explore — run-11189).
             if self._stream_accepted and accepted is None:
                 accepted = self._stream_accepted[0]
-            aid = self.artifacts.put(all_text, suffix=".txt")
-            await self._record_fact(
-                f"[{self.driver.name}] standby re-solve: "
-                f"{(all_text.strip().splitlines() or ['(no output)'])[-1][:160]}",
-                verified=bool(accepted), artifact_id=aid)
+            # Preserve the response as an artifact, but do not manufacture a
+            # candidate from its transcript tail when the re-solve misses.
+            self.artifacts.put(
+                self._redact_control_secrets(all_text), suffix=".txt")
             if accepted:
                 self._note_worker_stop("solved")
-                for f in gate_ok:
-                    await self._accept_flag(f)
-                found = list(self.graph.flags)
+                found = self._accepted_flags_for_outcome()
                 await self._emit_finished(flag=accepted, flags=found, solved=True)
                 return SolveOutcome(
                     True, accepted, 1, self.graph,
                     f"re-solved via {self.driver.name} standby",
-                    session=res.session or self.resume_session,
+                    session=(None if self._control_secret_values
+                             else res.session or self.resume_session),
                     engine=self.driver.name, workdir=str(wd), flags=found)
             partial_flags = list(self.graph.flags)
             await self._emit_finished(flag=None, flags=partial_flags, solved=False)
@@ -3473,9 +6730,50 @@ class CliSolver:
         self._note_worker_stop("finished")
         return SolveOutcome(
             False, None, 1, self.graph, f"{self.driver.name} standby {action}",
-            session=res.session or self.resume_session,
-            engine=self.driver.name, workdir=str(wd), reply=all_text.strip(),
+            session=(None if self._control_secret_values
+                     else res.session or self.resume_session),
+            engine=self.driver.name, workdir=str(wd), reply=safe_all_text.strip(),
             flags=list(self.graph.flags))
+
+    def _estimated_cli_result_from_stream(self) -> CliResult:
+        """Floor usage from live stream activity when the vendor omitted usage.
+
+        DeepSeek-via-claude.orig kills often leave no final ``result`` / usage
+        block. Tool starts and reasoning chars still prove the model ran.
+        """
+        tools = int(getattr(self, "_stream_tool_starts", 0) or 0)
+        reason_chars = int(getattr(self, "_stream_reasoning_chars", 0) or 0)
+        out_tok = 0
+        if tools or reason_chars:
+            out_tok = max(1, (reason_chars // 4) + (tools * 256))
+        in_tok = out_tok * 4 if out_tok else 0
+        return CliResult(
+            text="",
+            cost_usd=None,
+            input_tokens=in_tok or None,
+            output_tokens=out_tok or None,
+        )
+
+    async def _flush_stream_activity_cost(self) -> None:
+        """Emit a floor COST_UPDATE from stream counters if nothing was charged yet."""
+        if self.cost is None or self._stream_cost_flushed:
+            return
+        try:
+            usage = None
+            if hasattr(self.cost, "solver_usage_or_none"):
+                usage = self.cost.solver_usage_or_none(self.solver_id)
+            if usage and (
+                int(usage.get("output_tokens") or 0) > 0
+                or int(usage.get("cost_micro_usd") or 0) > 0
+            ):
+                self._stream_cost_flushed = True
+                return
+        except Exception:
+            pass
+        est = self._estimated_cli_result_from_stream()
+        if not (est.input_tokens or est.output_tokens):
+            return
+        await self._stream_cost(est)
 
     async def _stream_cost(self, res: CliResult) -> None:
         if self.cost is None:
@@ -3488,12 +6786,44 @@ class CliSolver:
         # is subscription-backed (usd is None → $0) but still reports tokens, so it
         # contributes to the deck's token-usage column at zero cost.
         if usd is None and not (in_tok or out_tok):
-            return
+            # Last resort: price from live stream activity so a killed turn with
+            # real tools cannot seal a zero-cost receipt.
+            est = self._estimated_cli_result_from_stream()
+            in_tok = int(est.input_tokens or 0)
+            out_tok = int(est.output_tokens or 0)
+            if not (in_tok or out_tok):
+                return
         try:
+            reported = None if usd is None else float(usd)
+            # DeepSeek-via-claude.orig often emits usage with total_cost_usd=0 (or
+            # omits it). When dollars are missing/zero but tokens exist, price from
+            # the local table (same path Reason uses) so receipts stay measurable.
+            if (reported is None or reported <= 0.0) and (in_tok or out_tok):
+                model = (
+                    str(getattr(self, "model", "") or "").strip()
+                    or str(
+                        (getattr(self, "profile", None) or {}).get("model") or ""
+                    ).strip()
+                    or str(
+                        __import__("os").environ.get("MUTEKI_WORKER_MODEL") or ""
+                    ).strip()
+                    or "deepseek-v4-flash"
+                )
+                await self.cost.record(
+                    model=model,
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
+                    run_id=self.run_id,
+                    solver_id=self.solver_id,
+                    challenge_id=self.challenge.id,
+                )
+                self._stream_cost_flushed = True
+                return
             await self.cost.add_external_usd(
-                float(usd or 0.0), run_id=self.run_id,
+                float(reported or 0.0), run_id=self.run_id,
                 solver_id=self.solver_id, challenge_id=self.challenge.id,
                 input_tokens=in_tok, output_tokens=out_tok)
+            self._stream_cost_flushed = True
         except Exception:
             pass
 
@@ -3528,6 +6858,20 @@ class CliSolver:
     async def _record_fact(self, fact: str, *, verified: bool, artifact_id: str,
                            witness: str = "") -> int:
         """Record a fact and return its shared_graph seq (or -1 if unavailable)."""
+        fact = self._redact_control_secrets(fact)
+        witness = self._redact_control_secrets(witness)
+        if bool(getattr(self, "_protocol2_mode", False)):
+            # The worker can only submit a candidate.  It cannot promote its own
+            # prose into canonical truth, and the compatibility graph row remains
+            # explicitly unverified.
+            verified = False
+            candidate = getattr(self, "_protocol2_candidate_callback", None)
+            if callable(candidate):
+                candidate("fact", {
+                    "artifact_id": str(artifact_id or ""),
+                    "fact": str(fact),
+                    "worker_id": self.solver_id,
+                })
         # defect-1: downgrade a bare "solved/已解" claim to an unverified candidate so
         # it can't masquerade as confirmed evidence on the shared board.
         if verified and self._is_solved_claim(fact):
@@ -3621,6 +6965,12 @@ class CliSolver:
         except Exception:
             return set()
 
+    def _accepted_flags_for_outcome(self) -> "list[str]":
+        """Return accepted values to the owning runtime without public projection."""
+        if bool(getattr(self, "_protocol2_mode", False)):
+            return list(self._protocol2_accepted_flags)
+        return list(self.graph.flags)
+
     async def _accept_flag(self, flag: str) -> bool:
         """Record + broadcast ONE distinct flag. Dedup against this worker's
         already-accepted set (a flag found twice, or one a sibling already
@@ -3628,6 +6978,17 @@ class CliSolver:
         terminal lifecycle event — that fires once in run() with ALL flags, so a
         multi-flag worker can accept several and finish once."""
         if not flag or flag in self._already_found:
+            return False
+        if (not bool(getattr(self, "_protocol2_mode", False))
+                and flag not in self._validated_flag_submissions):
+            key = ("FLAG_API_REQUIRED", flag[:200])
+            if key not in self._published_markers:
+                self._published_markers.add(key)
+                await self._emit_bb(
+                    "flag_submission_required",
+                    reason=("Flag text was observed but no validated "
+                            "muteki-blackboard submit-flag request exists"),
+                )
             return False
         # run-75379 LOAD-BEARING reject gate: a flag an operator invalidated must
         # NEVER be re-accepted, even after its producing intent is reopened and a
@@ -3644,6 +7005,15 @@ class CliSolver:
                 reason="operator marked this flag false-positive; permanently rejected")
             return False
         self._already_found.add(flag)
+        if bool(getattr(self, "_protocol2_mode", False)):
+            # GateAuthority has already committed FLAG_ACCEPTED + its immutable
+            # flag.accepted outbox before this method runs.  Keep only the private
+            # worker bookkeeping that lets Protocol2RunSession resolve that canonical
+            # handoff from the returned outcome.  Every public legacy projection below
+            # remains Protocol 1-only; the reconciliation layer owns Protocol 2's typed
+            # flag.accepted publication.
+            self._protocol2_accepted_flags.append(flag)
+            return True
         self.graph.add_flag(flag)
         # P0 defect-0 (DESIGN_swarm_defect_remediation.md): ALSO record the flag on
         # the SHARED graph, not just this worker's local SolveGraph. shared_graph.
@@ -3670,7 +7040,9 @@ class CliSolver:
                 pass
         return True
 
-    async def _surface_unverified_flags(self, all_text: str) -> None:
+    async def _surface_unverified_flags(
+        self, all_text: str, *, reason: "Optional[str]" = None,
+    ) -> None:
         """run-75379 BUG①: a flag the worker CLAIMED via FOUND_FLAG= but that did NOT
         pass the provenance gate (it traces to NO real command output — only to the
         worker's prose) is neither silently dropped nor trusted as a solve. It is
@@ -3689,6 +7061,8 @@ class CliSolver:
         for flag in self._extract_flags(all_text):
             if flag in self._already_found:
                 continue  # accepted — already a real flag, nothing to surface
+            if self._flag_from_operator_context(flag):
+                continue  # known operator context, not a newly discovered candidate
             if flag in rejected:
                 continue  # operator already ruled this value out; don't re-nag
             key = ("U", flag[:200])
@@ -3697,5 +7071,6 @@ class CliSolver:
             self._published_markers.add(key)
             await self._emit_bb(
                 "flag_unverified", flag=flag,
-                reason="claimed via FOUND_FLAG= but traces to no real command "
-                       "output — operator verification needed")
+                reason=reason or (
+                    "claimed via FOUND_FLAG= but traces to no real command "
+                    "output — operator verification needed"))

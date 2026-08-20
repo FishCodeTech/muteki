@@ -319,3 +319,63 @@ def test_run_reopened_per_flag_drops_only_the_bad_one() -> None:
     run = asyncio.run(go())
     assert run.flags == ["flag{a}", "flag{c}"]   # only flag{b} dropped
     assert run.flag == "flag{a}" and run.solved is False and run.finished is False
+
+
+def test_invalidated_flag_is_not_readded_from_replayed_blackboard_events() -> None:
+    # A mark_false relaunch reuses the same shared graph. When the coordinator
+    # replays old graph events, the previous flag_found must not make the rail
+    # look solved again while the run is actively re-solving.
+    from apps.web.run_manager import RunManager
+    from muteki.core.events import Event, EventType
+    import asyncio
+
+    async def go():
+        mgr = RunManager.__new__(RunManager)
+        mgr._seq = 0
+        run = _bare_run()
+        run.flags = ["flag{bad}"]
+        run.flag = "flag{bad}"
+        run.solved = True
+        run.finished = True
+        sink = mgr._meta_sink_for(run)
+        await sink(Event(event_type=EventType.RUN_REOPENED, run_id="r1",
+                         payload={"flag": "flag{bad}"}))
+        await sink(Event(event_type=EventType.BLACKBOARD_DELTA, run_id="r1",
+                         payload={"kind": "flag_found", "flag": "flag{bad}"}))
+        await sink(Event(event_type=EventType.RUN_FINISHED, run_id="r1",
+                         payload={"solved": True, "flag": "flag{bad}",
+                                  "flags": ["flag{bad}"]}))
+        return run
+
+    run = asyncio.run(go())
+    assert run.flags == []
+    assert run.flag is None
+    assert run.solved is False
+
+
+def test_stale_run_finished_for_invalidated_flag_does_not_resolve_survivor() -> None:
+    # Multi-flag false-positive flow: one collected flag survives, but a replayed
+    # terminal event for the invalidated flag must not flip the run back to solved.
+    from apps.web.run_manager import RunManager
+    from muteki.core.events import Event, EventType
+    import asyncio
+
+    async def go():
+        mgr = RunManager.__new__(RunManager)
+        mgr._seq = 0
+        run = _bare_run()
+        run.flags = ["flag{bad}", "flag{good}"]
+        run.flag = "flag{bad}"
+        run.solved = True
+        run.finished = True
+        sink = mgr._meta_sink_for(run)
+        await sink(Event(event_type=EventType.RUN_REOPENED, run_id="r1",
+                         payload={"flag": "flag{bad}"}))
+        await sink(Event(event_type=EventType.RUN_FINISHED, run_id="r1",
+                         payload={"solved": True, "flag": "flag{bad}"}))
+        return run
+
+    run = asyncio.run(go())
+    assert run.flags == ["flag{good}"]
+    assert run.flag == "flag{good}"
+    assert run.solved is False

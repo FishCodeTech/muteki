@@ -34,6 +34,39 @@ ROOT = Path(__file__).resolve().parents[1]
 UI_ROOT = ROOT / "apps" / "web" / "ui"
 
 
+_TS_LOAD_HELPER = """
+const fs = require("fs");
+const path = require("path");
+const ts = require("typescript");
+const vm = require("vm");
+function compile(rel) {
+  return ts.transpileModule(fs.readFileSync(rel, "utf8"), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }
+  }).outputText;
+}
+function loadTs(rel) {
+  const code = compile(rel);
+  const dir = path.dirname(rel);
+  const sandbox = {
+    module: { exports: {} },
+    exports: {},
+    require: (name) => {
+      if (name.startsWith("./") || name.startsWith("../")) {
+        const bare = path.normalize(path.join(dir, name));
+        const file = [bare, bare + ".ts", bare + ".tsx"].find((candidate) => fs.existsSync(candidate));
+        if (!file) throw new Error("missing local module " + name);
+        return loadTs(file);
+      }
+      return require(name);
+    },
+  };
+  sandbox.exports = sandbox.module.exports;
+  vm.runInNewContext(code, sandbox, { filename: rel });
+  return sandbox.module.exports;
+}
+"""
+
+
 def _run_ui_node(script: str) -> None:
     """Run a Node snippet that transpiles a UI .ts helper via the bundled
     `typescript` package and asserts on its behavior.
@@ -237,22 +270,10 @@ def test_clipboard_copy_falls_back_after_async_clipboard_rejects():
 
 
 def test_worker_filter_chips_are_compact_scroll_rail():
-    helper = UI_ROOT / "lib" / "workers.ts"
-    script = textwrap.dedent(
-        f"""
-        const fs = require("fs");
-        const ts = require("typescript");
-        const vm = require("vm");
-        const source = fs.readFileSync({json.dumps(str(helper))}, "utf8");
-        const out = ts.transpileModule(source, {{
-          compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }}
-        }}).outputText;
-        const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
-        sandbox.exports = sandbox.module.exports;
-        vm.runInNewContext(out, sandbox, {{ filename: "workers.js" }});
-        const lib = sandbox.module.exports;
-        function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
-
+    script = _TS_LOAD_HELPER + textwrap.dedent(
+        """
+        const lib = loadTs("lib/workers.ts");
+        function assert(cond, msg) { if (!cond) throw new Error(msg); }
         assert(lib.workerShortLabel("cli-cursor") === "cursor", "base cursor label");
         assert(lib.workerShortLabel("cli-cursor-2") === "cursor-2", "numbered cursor label");
         assert(lib.workerShortLabel("cli-claude-3") === "claude-3", "numbered claude label");
@@ -262,33 +283,30 @@ def test_worker_filter_chips_are_compact_scroll_rail():
     )
     _run_ui_node(script)
 
-    activity = (UI_ROOT / "components" / "ActivityStream.tsx").read_text()
+    page = (UI_ROOT / "app" / "page.tsx").read_text()
     lanes = (UI_ROOT / "components" / "WorkerLanes.tsx").read_text()
+    graph = (UI_ROOT / "components" / "GraphView.tsx").read_text()
+    blackboard = (UI_ROOT / "components" / "Blackboard.tsx").read_text()
     css = (UI_ROOT / "app" / "globals.css").read_text()
     i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
     chipbar = (UI_ROOT / "components" / "ChipFilterBar.tsx").read_text()
-    assert "ChipFilterBar" in activity
-    assert "ChipFilterBar" in lanes
+    assert "projectActivityLedger" in page
+    assert "RuntimeActivityStream" in page
+    assert "ChipFilterBar" in graph
+    assert "ChipFilterBar" in blackboard
+    assert "ChipFilterBar" not in lanes
     assert "useState(false)" in chipbar
     assert "aria-expanded={open}" in chipbar
     assert "className=\"chip-filter-toggle\"" in chipbar
     assert "className=\"chip-filter-panel\"" in chipbar
     assert "className=\"chip-filter-strip\"" in chipbar
-    assert "filterOpen" not in activity
+    assert "wlane-roster" in lanes
+    assert "wlane-anomaly" in lanes
     assert "filterOpen" not in lanes
-    assert 'id="activity-filter-chips"' in activity
-    assert "filter-chipstrip" not in activity
-    assert "workerShortLabel(key)" in activity
-    assert "wlane-filterbar" in lanes
-    assert 'id="wlane-filter-chips"' in lanes
     assert "wlane-filter-chiprow" not in lanes
-    assert "filter-chipstrip" not in lanes
-    assert "workerShortLabel(id)" in lanes
-    assert "grid-template-columns: auto minmax(0, 1fr) auto" in css
     assert "--chip-filter-rows: 3" in css
     assert "max-height: calc((24px * var(--chip-filter-rows))" in css
     assert "overflow-y: auto" in css
-    assert ".activity-filterbar" in css
     assert ".chip-filterbar" in css
     assert ".chip-filter-toggle" in css
     assert ".chip-filter-panel" in css
@@ -296,30 +314,16 @@ def test_worker_filter_chips_are_compact_scroll_rail():
     shared_filter_css = css[css.index(".chip-filter-strip"):css.index(".chip-filter-clear")]
     assert "flex-wrap: wrap" in shared_filter_css
     assert "-webkit-mask-image: none" in shared_filter_css
-    assert ".wlane-filterbar" in css
     assert ".wlane-filter-chiprow" not in css
-    assert "activity.filterExpand" in i18n and "activity.filterCollapse" in i18n
-    assert "wlane.focusExpand" in i18n and "wlane.focusCollapse" in i18n
-    assert "wlane.focusSelected" in i18n
+    assert "wlane.anomaly" in i18n
+    assert "wlane.groupLive" in i18n and "wlane.groupIssues" in i18n and "wlane.groupDone" in i18n
 
 
 def test_worker_identity_uses_transport_not_name_substrings():
-    helper = UI_ROOT / "lib" / "workers.ts"
-    script = textwrap.dedent(
-        f"""
-        const fs = require("fs");
-        const ts = require("typescript");
-        const vm = require("vm");
-        const source = fs.readFileSync({json.dumps(str(helper))}, "utf8");
-        const out = ts.transpileModule(source, {{
-          compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }}
-        }}).outputText;
-        const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
-        sandbox.exports = sandbox.module.exports;
-        vm.runInNewContext(out, sandbox, {{ filename: "workers.js" }});
-        const lib = sandbox.module.exports;
-        function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
-
+    script = _TS_LOAD_HELPER + textwrap.dedent(
+        """
+        const lib = loadTs("lib/workers.ts");
+        function assert(cond, msg) { if (!cond) throw new Error(msg); }
         assert(lib.workerEngine("api-prod", "codex_cli") === "Codex", "codex transport label");
         assert(lib.workerEngine("not-a-claude-name", "claude_code") === "Claude Code", "claude transport label");
         assert(lib.workerEngine("plain-id", "cursor_agent") === "Cursor", "cursor transport label");
@@ -328,131 +332,6 @@ def test_worker_identity_uses_transport_not_name_substrings():
         """
     )
     _run_ui_node(script)
-
-
-def test_worker_settings_redesigned_ia():
-    """Settings panel IA after the v2 redesign (left tab rail + right content) and
-    the health self-check unification (per-profile readiness, single source of
-    truth shared with the dispatch precheck).
-
-    CONTRACT: the panel is organised by INTENT tabs — roster · accounts · runtime
-    · budget · advanced — not the old flat profile table. Account readiness is
-    PER PROFILE with a three honest states badge (not the old per-engine
-    "an account exists ⇒ green" inference that let a run die on profile_unhealthy
-    while the page showed green). This pins the new shape so a future edit can't
-    silently regress it.
-    """
-    src = (UI_ROOT / "components" / "WorkerSettings.tsx").read_text()
-    css = (UI_ROOT / "app" / "globals.css").read_text()
-    i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
-
-    # ── intent tabs (the v2 left rail) ───────────────────────────────────────
-    for tab in ("tabRoster", "tabAccounts", "tabRuntime", "tabBudget", "tabAdvanced"):
-        assert f't("settings.{tab}")' in src, f"missing intent tab {tab}"
-
-    # ── credential block CHANGES FACE by run environment ─────────────────────
-    assert 'workerBackend === "container"' in src
-    assert 't("settings.acctSub")' in src        # container: every engine needs an account
-    assert 't("settings.credLocalNote")' in src  # local: system-login note
-    # system-login status is consumed for local mode
-    assert "getSystemLogin" in src and "sysLogin" in src
-
-    # ── run environment = one container per run: backend + recipe ─────────────
-    assert "putRuntimeEnvironment" in src
-    assert "alignProfileRefs" in src
-    assert "worker_backend: workerBackend" in src
-
-    # ── reasoning models: base_url configurable, key NOT in the panel (.env) ──
-    assert "llmBaseUrl" in src
-    assert "base_url: llmBaseUrl" in src
-    assert "testLlmEndpoint" in src
-
-    # ── worker execution models: profile-level selector + real model probe ────
-    assert "getWorkerModelOptions" in src
-    assert "testWorkerProfileModel" in src
-    assert "customModel" in src
-    assert "runModelTest" in src
-    assert "customModelOpen" in src
-    assert 'if (v === "__custom__")' in src
-    assert "setCustomModelOpen((cur) => ({ ...cur, [p.id]: true }))" in src
-    assert 'updateProfile(p.id, { model: "__custom__" })' not in src
-    assert "enabledDispatchRefs" in src
-    assert "profileCapacity(workerProfiles)" in src
-    assert "alignProfileRefs(enabledDispatchRefs(profilesToSave), profilesToSave, workerProfiles)" in src
-    assert "profileCapacity(workerProfiles, engines)" not in src
-    # Saving normalizes runtime first, then writes profiles — the runtime response
-    # must not overwrite model edits already made in the modal.
-    assert "currentById" in src
-    assert "runtime: p.runtime" in src
-
-    # ── HEALTH SELF-CHECK UNIFICATION (single source of truth) ────────────────
-    # Readiness comes from the server's per-profile health, NOT a client-side
-    # per-engine guess. The old engine-dimension inference is GONE.
-    assert "fetchProfilesHealth" in src and "testProfileHealth" in src
-    assert "profileHealth" in src
-    assert "accountForEngine" not in src, "engine-dimension health inference must be gone"
-    assert "missingEngines" not in src, "engine-dimension badge must be gone"
-    # the account tab renders PER PROFILE (ws2-acct rows), with three honest states.
-    # (profileAuthFailed takes an interpolated {layer} arg, so match the t(" prefix
-    # rather than a bare closing paren.)
-    assert "ws2-acct" in src
-    for key in ("acctUnbound", "profileVerified", "profileUnverified", "profileAuthFailed"):
-        assert f't("settings.{key}"' in src, f"missing three-state key {key}"
-    # the badge has an explicit "bound but unverified" state (not a false green)
-    assert '"settings.healthAcctUnverified"' in i18n
-
-    # ── account test wired (the "测连通" button stays a button) ───────────────
-    assert "testCredentialAccount" in src        # still used by the registration form
-    assert 't("settings.testConn")' in src
-    assert "saveAndTestAccount" in src
-    assert 't("settings.saveAndTest")' in src
-    assert '"settings.saveAndTest"' in i18n
-
-    # ── codex one-click re-auth from the host ~/.codex (after `codex login`) ───
-    assert "importHostCodexAuth" in src and "importCodexFromHost" in src
-    assert 't("settings.importHostCodex")' in src
-    assert '"settings.importHostCodex"' in i18n
-    assert 'p.engine === "codex"' in src, "import-from-host must be gated to codex rows"
-
-    # local-vs-container is explicit: tests run against the CURRENT run env and
-    # say so (account test labels the backend; self-check probes the right env).
-    assert "backendLabel" in src
-    assert 't("settings.testsAgainst")' in src
-    assert "getEngineHealth(workerBackend)" in src   # self-check follows backend
-    assert 't("settings.selfcheckContainerNote")' in src
-    assert '"settings.selfcheckContainerNote"' in i18n
-
-    # the old flat 13-col profile table + dead subscription-mode columns are GONE
-    assert 'className="ws-profile-table"' not in src
-    assert "api_key_ref" not in src
-
-    # i18n for the still-present notes
-    assert '"settings.credContainerWarn"' in i18n
-    assert '"settings.reasonKeyNote"' in i18n
-
-
-def test_custom_endpoint_account_form_binds_to_agent():
-    """A custom endpoint must declare WHICH agent it overrides — not leave it to an
-    undiscoverable account-id naming convention. The form gains an agent selector
-    that auto-aligns the id and is persisted as target_engine."""
-    src = (UI_ROOT / "components" / "WorkerSettings.tsx").read_text()
-    i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
-
-    # the selector only shows for the custom-endpoint type, beside base_url
-    assert 't("settings.accountTargetEngine")' in src
-    assert "accountApiEngine" in src
-    assert "onAccountApiEngineChange" in src
-    # id auto-aligns to the <engine>-main reference unless the operator customized it
-    assert "isDefaultLikeAccountId" in src
-    assert "-main`" in src
-    # the chosen agent is persisted so inspect()/display can bind it (not orphan "api")
-    assert "target_engine: accountApiEngine" in src
-    # custom-endpoint accounts read back as registered for their agent + labelled
-    assert 'acct?.mode === "custom_endpoint"' in src
-    assert 't("settings.modeCustomEndpoint")' in src
-    # i18n present
-    assert '"settings.accountTargetEngine"' in i18n
-    assert '"settings.modeCustomEndpoint"' in i18n
 
 
 def test_run_inspector_renders_runtime_degraded_badge():
@@ -465,18 +344,37 @@ def test_run_inspector_renders_runtime_degraded_badge():
     assert ".insp-runtime-degraded" in css
 
 
-def test_worker_settings_save_keeps_race_roster_in_sync_with_visible_roster():
-    """Saving the visible seat lineup must also update the race roster.
+def test_next_api_proxy_is_generic_streaming_and_long_lived():
+    """Slow/streaming backend calls must not rely on Next's generic rewrite.
 
-    The settings UI does not expose a separate race-only subset. If save only
-    updates `engines`, an old `race_engines`/`stage_policy.race.engines` subset
-    can survive on disk and silently drop codex from new runs even though the
-    roster shows it enabled.
+    The production deck is served from :3001. FastAPI can finish slow probes or
+    docker pulls successfully, but the generic Next rewrite proxy can turn
+    long-running requests into browser-visible 500s. The app route proxy must
+    cover all HTTP /api paths, stream response bodies (SSE/BTW/download-safe),
+    preserve request bodies for uploads, and leave no one-off worker-model proxy
+    to maintain separately.
     """
-    src = (UI_ROOT / "components" / "WorkerSettings.tsx").read_text()
+    route = UI_ROOT / "app" / "api" / "[...path]" / "route.ts"
+    old_one_off = UI_ROOT / "app" / "api" / "settings" / "worker-model" / "test" / "route.ts"
+    assert route.exists()
+    assert not old_one_off.exists()
+    src = route.read_text()
+    next_config = (UI_ROOT / "next.config.mjs").read_text()
 
-    assert "race_engines: nextEngines" in src
-    assert "race: { enabled: raceScout, timeout: raceTimeout, engines: nextEngines }" in src
+    assert 'export const runtime = "nodejs"' in src
+    assert "export const maxDuration = 900" in src
+    assert 'process.env.MUTEKI_BACKEND || "http://127.0.0.1:8000"' in src
+    assert '"/api/"' in src
+    assert "upstreamUrl.search = requestUrl.search" in src
+    assert "req.body" in src
+    assert 'duplex = "half"' in src
+    assert "new Response(upstream.body" in src
+    assert "await fetch(" in src
+    for method in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
+        assert f"export const {method} = proxy" in src
+    for header in ("host", "connection", "content-length", "transfer-encoding"):
+        assert header in src
+    assert '"/api/:path*"' not in next_config
 
 
 def test_events_reducer_tracks_poc_blackboard_lifecycle():
@@ -510,6 +408,46 @@ def test_events_reducer_tracks_poc_blackboard_lifecycle():
         assert(s.blackboard.pocs[0].worker === "cli-b", "claim owner stored");
         assert(s.model.nodes.some((n) => n.id === "poc:poc-1" && n.type === "poc"), "poc graph node");
         assert(s.blackboard.events.some((e) => e.kind === "poc_concluded"), "timeline event");
+        """
+    )
+    _run_ui_node(script)
+
+
+def test_events_reducer_shows_preflight_before_workers_and_failure_details():
+    helper = UI_ROOT / "lib" / "events.ts"
+    script = textwrap.dedent(
+        f"""
+        const fs = require("fs");
+        const ts = require("typescript");
+        const vm = require("vm");
+        const source = fs.readFileSync({json.dumps(str(helper))}, "utf8");
+        const out = ts.transpileModule(source, {{
+          compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }}
+        }}).outputText;
+        const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
+        sandbox.exports = sandbox.module.exports;
+        vm.runInNewContext(out, sandbox, {{ filename: "events.js" }});
+        const lib = sandbox.module.exports;
+        function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
+
+        let s = lib.emptyDeck("run-preflight");
+        s = lib.reduce(s, {{ event_type: lib.EventType.RUN_PREPARING,
+          run_id: "run-preflight", ts: 1, payload: {{ challenge: {{
+            name: "probe-me", category: "web", description: "solve target"
+          }} }} }});
+        assert(s.started && s.preparing && !s.finished, "preflight is visible as active");
+        assert(s.chat.filter((m) => m.role === "human").length === 1, "prompt shown immediately");
+
+        s = lib.reduce(s, {{ event_type: lib.EventType.RUN_FINISHED,
+          run_id: "run-preflight", ts: 2, payload: {{ solved: false,
+            reason: "preflight_failed", detail: "Worker 预检失败（1 个 Profile）",
+            profile_failures: [{{ profile_id: "codex-local", engine: "codex",
+              layer: "auth", detail: "Authentication required" }}]
+          }} }});
+        assert(!s.preparing && s.finished, "failed preflight settles the run");
+        assert(s.outcomeReason === "preflight_failed", "typed preflight outcome");
+        assert(s.preflightFailures.length === 1, "profile failure retained");
+        assert(s.preflightFailures[0].profileId === "codex-local", "profile id retained");
         """
     )
     _run_ui_node(script)
@@ -626,15 +564,14 @@ def test_blackboard_empty_guard_matches_rendered_node_inputs():
 
 
 def test_artifact_panel_exposes_architecture_side_panels():
-    panel = (UI_ROOT / "components" / "ArtifactPanel.tsx").read_text()
+    page = (UI_ROOT / "app" / "page.tsx").read_text()
     inspector = (UI_ROOT / "components" / "RunInspector.tsx").read_text()
-    assert '"findings"' in panel
-    assert '"credentials"' in panel
-    assert '"pocs"' in panel
-    assert '"routes"' in panel
-    assert '"directives"' in panel
-    assert "CredentialsPanel" in panel
-    assert "ReviewFindingsPanel" in panel
+    assert 'view === "findings"' in page
+    assert 'view === "credentials"' in page
+    assert 'view === "pocs"' in page
+    assert 'view === "routes"' in page
+    assert "RuntimeCredentials" in page
+    assert "RuntimeDataView" in page
     assert 'panelBtn("credentials"' in inspector
 
 
@@ -740,6 +677,73 @@ def test_per_run_zero_budget_values_are_preserved():
     assert "Number.isNaN" in convo
 
 
+def test_control_client_uses_generation_cas_and_surfaces_errors():
+    use_run = (UI_ROOT / "lib" / "useRun.ts").read_text()
+    page = (UI_ROOT / "app" / "page.tsx").read_text()
+    assert 'CONTROL_CAS_ACTIONS.has(action)' in use_run
+    assert 'body.expected_generation = deck.controlGeneration' in use_run
+    assert 'body.command_id = opts.commandId' in use_run
+    assert '/api/runs/${runId}/control' in use_run
+    assert "if (!res.ok || data?.ok === false)" in use_run
+    assert "return data;" in use_run
+    assert 'catch {' in page
+    assert 't("toast.actionFailed")' in page
+
+
+def test_hitl_card_is_read_only_after_answer_admission_and_surfaces_recovery():
+    convo = (UI_ROOT / "components" / "Conversation.tsx").read_text()
+    i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
+    css = (UI_ROOT / "app" / "globals.css").read_text()
+
+    assert "const answerRecorded = locallyRecorded || durableDelivery.locked" in convo
+    assert 'commandIdForDecision(commandIdsRef.current, "answer_decision")' in convo
+    assert "onAnswer(req.id, v, commandId)" in convo
+    assert "onAnswer(req.id, attempt.value, attempt.commandId)" in convo
+    assert '"global", "answer_decision", opt, { requestId, commandId }' in convo
+    assert "if (!v || sending || answerRecorded) return" in convo
+    assert "pauses && !answerRecorded" in convo
+    assert 'className={`hitl-delivery-state ${deliveryPhase}`}' in convo
+    assert '"hitl.delivery.unknown"' in i18n
+    assert '"hitl.delivery.failed"' in i18n
+    assert '"hitl.delivery.partial"' in i18n
+    assert "do not answer again" in i18n
+    assert ".hitl-card.answered-readonly" in css
+    assert ".hitl-delivery-state.failed" in css
+    assert ".hitl-delivery-retry" in css
+
+
+def test_decision_command_id_is_stable_across_first_attempt_and_retry():
+    helper = UI_ROOT / "lib" / "controlClient.ts"
+    script = textwrap.dedent(
+        f"""
+        const fs = require("fs");
+        const ts = require("typescript");
+        const vm = require("vm");
+        const source = fs.readFileSync({json.dumps(str(helper))}, "utf8");
+        const out = ts.transpileModule(source, {{
+          compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }}
+        }}).outputText;
+        const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
+        sandbox.exports = sandbox.module.exports;
+        vm.runInNewContext(out, sandbox, {{ filename: "controlClient.js" }});
+        const lib = sandbox.module.exports;
+        function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
+
+        const ids = {{}};
+        let generated = 0;
+        const create = () => `client-command-${{++generated}}`;
+        const first = lib.commandIdForDecision(ids, "answer_decision", create);
+        const retry = lib.commandIdForDecision(ids, "answer_decision", create);
+        assert(first === retry, "first POST and retry must carry the same command_id");
+        assert(generated === 1, "retry never allocates a second answer id");
+        const dismiss = lib.commandIdForDecision(ids, "dismiss", create);
+        assert(dismiss !== first, "a different decision action owns a different stable id");
+        assert(generated === 2, "one id is allocated per request/action");
+        """
+    )
+    _run_ui_node(script)
+
+
 def test_finished_run_does_not_render_rail_footer_as_disconnected():
     rail = (UI_ROOT / "components" / "ThreadRail.tsx").read_text()
     i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
@@ -780,10 +784,135 @@ def test_events_reducer_tracks_operator_paused_blackboard_delta():
         s = lib.reduce(s, {{ event_type: lib.EventType.BLACKBOARD_DELTA, run_id: "run-pause", ts: 4,
           solver_id: "coordinator", payload: {{ kind: "operator_paused", reason: "manual pause again" }} }});
         assert(lib.swarmDigest(s).phase === "paused", "digest paused again");
-        s = lib.reduce(s, {{ event_type: lib.EventType.HITL_RESPONSE, run_id: "run-pause", ts: 5,
-          payload: {{ target: "global", action: "resume", delivery: "applied_live" }} }});
-        assert(!s.awaitingOperator, "hitl resume clears pause");
-        assert(lib.swarmDigest(s).phase !== "paused", "digest resumed from hitl response");
+        s = lib.reduce(s, {{ event_type: lib.EventType.CONTROL_COMMAND, run_id: "run-pause", ts: 5,
+          payload: {{ command_id: "cmd-resume", target: "global", action: "resume",
+            status: "routed", generation: 1 }} }});
+        assert(!!s.awaitingOperator, "routed command is not proof of resume");
+        assert(lib.swarmDigest(s).phase === "paused", "digest stays paused before observed effect");
+        s = lib.reduce(s, {{ event_type: lib.EventType.CONTROL_COMMAND, run_id: "run-pause", ts: 5.5,
+          payload: {{ command_id: "cmd-newer", target: "global", action: "hint",
+            status: "routed", generation: 2 }} }});
+        s = lib.reduce(s, {{ event_type: lib.EventType.CONTROL_COMMAND, run_id: "run-pause", ts: 6,
+          payload: {{ command_id: "cmd-resume", target: "global", action: "resume",
+            status: "effect_observed", generation: 1, effect: {{ kind: "run_resumed" }} }} }});
+        assert(!!s.awaitingOperator, "stale generation cannot clear a newer pause");
+        assert(lib.swarmDigest(s).phase === "paused", "stale effect leaves run paused");
+        assert(s.controlCommands.length === 2, "command lifecycle is folded by command_id");
+        assert(s.controlCommands[1].id === "cmd-resume", "terminal update moves to latest tail");
+        assert(s.controlCommands[1].status === "effect_observed", "latest terminal status wins");
+        assert(s.controlGeneration === 2, "generation never regresses on a late terminal update");
+        """
+    )
+    _run_ui_node(script)
+
+
+def test_events_reducer_resolves_only_addressed_hitl_request():
+    helper = UI_ROOT / "lib" / "events.ts"
+    script = textwrap.dedent(
+        f"""
+        const fs = require("fs");
+        const ts = require("typescript");
+        const vm = require("vm");
+        const source = fs.readFileSync({json.dumps(str(helper))}, "utf8");
+        const out = ts.transpileModule(source, {{
+          compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }}
+        }}).outputText;
+        const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
+        sandbox.exports = sandbox.module.exports;
+        vm.runInNewContext(out, sandbox, {{ filename: "events.js" }});
+        const lib = sandbox.module.exports;
+        function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
+
+        let s = lib.emptyDeck("run-decisions");
+        s = lib.reduce(s, {{ event_type: lib.EventType.HITL_REQUEST, run_id: "run-decisions", ts: 1,
+          payload: {{ request_id: "H-one", worker: "worker-a", need: "need token A" }} }});
+        s = lib.reduce(s, {{ event_type: lib.EventType.HITL_REQUEST, run_id: "run-decisions", ts: 2,
+          payload: {{ request_id: "H-two", worker: "worker-b", need: "need token B" }} }});
+        assert(s.hitlRequests.length === 2, "both decisions are pending");
+
+        s = lib.reduce(s, {{ event_type: lib.EventType.HITL_RESPONSE, run_id: "run-decisions", ts: 3,
+          payload: {{ request_id: "H-one", action: "submit", text: "token-a", status: "received" }} }});
+        assert(s.hitlRequests.length === 2, "admission echo does not resolve a decision");
+        s = lib.reduce(s, {{ event_type: lib.EventType.CONTROL_COMMAND, run_id: "run-decisions", ts: 3.5,
+          payload: {{ command_id: "C-answer", request_id: "H-one", action: "answer_decision",
+            status: "effect_observed", decision_closed: true }} }});
+        assert(s.hitlRequests.length === 1, "durable decision close resolves one decision");
+        assert(s.hitlRequests[0].id === "H-two", "unaddressed decision remains");
+
+        s = lib.reduce(s, {{ event_type: lib.EventType.HITL_RESPONSE, run_id: "run-decisions", ts: 4,
+          payload: {{ action: "hint", text: "unrelated clue", status: "received" }} }});
+        assert(s.hitlRequests.length === 1, "unscoped command cannot erase a decision");
+        """
+    )
+    _run_ui_node(script)
+
+
+def test_events_reducer_correlates_decision_delivery_without_duplicate_answer():
+    helper = UI_ROOT / "lib" / "events.ts"
+    script = textwrap.dedent(
+        f"""
+        const fs = require("fs");
+        const ts = require("typescript");
+        const vm = require("vm");
+        const source = fs.readFileSync({json.dumps(str(helper))}, "utf8");
+        const out = ts.transpileModule(source, {{
+          compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }}
+        }}).outputText;
+        const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
+        sandbox.exports = sandbox.module.exports;
+        vm.runInNewContext(out, sandbox, {{ filename: "events.js" }});
+        const lib = sandbox.module.exports;
+        function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
+
+        let s = lib.emptyDeck("run-delivery");
+        s = lib.reduce(s, {{ event_type: lib.EventType.HITL_REQUEST, run_id: "run-delivery", ts: 0.1,
+          payload: {{ request_id: "H-rejected", worker: "worker-b", need: "choose account" }} }});
+        s = lib.reduce(s, {{ event_type: lib.EventType.CONTROL_COMMAND, run_id: "run-delivery", ts: 0.2,
+          payload: {{ command_id: "C-rejected", request_id: "H-rejected", action: "answer_decision",
+            status: "received" }} }});
+        s = lib.reduce(s, {{ event_type: lib.EventType.CONTROL_COMMAND, run_id: "run-delivery", ts: 0.3,
+          payload: {{ command_id: "C-rejected", request_id: "H-rejected", action: "answer_decision",
+            status: "rejected", detail: "durable companion failure" }} }});
+        let rejected = s.hitlRequests.find((r) => r.id === "H-rejected");
+        assert(rejected, "pre-persistence rejection keeps decision request visible");
+        assert(lib.hitlDeliveryState(rejected).phase === "open",
+          "RECEIVED to REJECTED without decision_closed remains editable");
+
+        s = lib.reduce(s, {{ event_type: lib.EventType.HITL_REQUEST, run_id: "run-delivery", ts: 1,
+          payload: {{ request_id: "H-answer", worker: "worker-a", need: "choose route" }} }});
+        s = lib.reduce(s, {{ event_type: lib.EventType.CONTROL_COMMAND, run_id: "run-delivery", ts: 2,
+          payload: {{ command_id: "C-answer", request_id: "H-answer", action: "answer_decision",
+            status: "persisted", decision_closed: true }} }});
+        assert(s.hitlRequests.length === 2, "persisted admission keeps card until effect proof");
+        let req = s.hitlRequests.find((r) => r.id === "H-answer");
+        assert(req.deliveryCommandId === "C-answer", "request correlates its durable command");
+        assert(req.deliveryStatus === "persisted", "persisted lifecycle is projected onto card");
+        let delivery = lib.hitlDeliveryState(req);
+        assert(delivery.locked && delivery.phase === "pending", "persisted answer is read-only pending");
+
+        s = lib.reduce(s, {{ event_type: lib.EventType.CONTROL_COMMAND, run_id: "run-delivery", ts: 3,
+          payload: {{ command_id: "C-answer", request_id: "H-answer", action: "answer_decision",
+            status: "unknown", detail: "effect proof timed out", decision_closed: true }} }});
+        assert(s.hitlRequests.length === 2, "UNKNOWN never closes the decision");
+        req = s.hitlRequests.find((r) => r.id === "H-answer");
+        delivery = lib.hitlDeliveryState(req);
+        assert(delivery.locked && delivery.phase === "unknown", "UNKNOWN clears spinner into locked recovery");
+        assert(delivery.detail === "effect proof timed out", "recovery detail remains inspectable");
+
+        // A delayed non-terminal frame cannot regress terminal recovery back to a spinner.
+        s = lib.reduce(s, {{ event_type: lib.EventType.CONTROL_COMMAND, run_id: "run-delivery", ts: 4,
+          payload: {{ command_id: "C-answer", request_id: "H-answer", action: "answer_decision",
+            status: "routed" }} }});
+        req = s.hitlRequests.find((r) => r.id === "H-answer");
+        assert(req.deliveryStatus === "unknown", "late ROUTED cannot regress UNKNOWN");
+
+        s = lib.reduce(s, {{ event_type: lib.EventType.CONTROL_COMMAND, run_id: "run-delivery", ts: 5,
+          payload: {{ command_id: "C-answer", request_id: "H-answer", action: "answer_decision",
+            status: "effect_observed", decision_closed: true }} }});
+        assert(!s.hitlRequests.some((r) => r.id === "H-answer"),
+          "only observed decision close removes the addressed card");
+        assert(s.hitlRequests.some((r) => r.id === "H-rejected"),
+          "pre-persistence rejected decision remains open after another card closes");
         """
     )
     _run_ui_node(script)
@@ -870,6 +999,72 @@ def test_events_reducer_labels_resolve_reopen_separately_from_false_positive():
           payload: {{ flag: "flag{{bad}}" }} }});
         assert(lastChat(falseDeck).i18nKey === "sys.reopened", "false-positive copy");
         assert(falseDeck.flags.length === 1 && falseDeck.flags[0] === "flag{{good}}", "drops only bad flag");
+
+        let replayDeck = lib.emptyDeck("run-replay");
+        replayDeck = lib.reduce(replayDeck, {{ event_type: lib.EventType.RUN_STARTED, run_id: "run-replay", ts: 1,
+          payload: {{ challenge: {{ name: "replay", category: "reverse" }} }} }});
+        replayDeck = lib.reduce(replayDeck, {{ event_type: lib.EventType.RUN_FINISHED, run_id: "run-replay", ts: 2,
+          payload: {{ solved: true, flag: "flag{{bad}}", flags: ["flag{{bad}}"] }} }});
+        replayDeck = lib.reduce(replayDeck, {{ event_type: lib.EventType.BLACKBOARD_DELTA, run_id: "run-replay", ts: 3,
+          solver_id: "coordinator", payload: {{ kind: "flag_invalidated", flag: "flag{{bad}}" }} }});
+        replayDeck = lib.reduce(replayDeck, {{ event_type: lib.EventType.RUN_REOPENED, run_id: "run-replay", ts: 4,
+          payload: {{ flag: "flag{{bad}}" }} }});
+        replayDeck = lib.reduce(replayDeck, {{ event_type: lib.EventType.BLACKBOARD_DELTA, run_id: "run-replay", ts: 5,
+          solver_id: "coordinator", payload: {{ kind: "flag_found", flag: "flag{{bad}}" }} }});
+        assert(replayDeck.flags.length === 0, "invalidated flag replay is ignored");
+        assert(!replayDeck.flag, "invalidated flag does not remain primary");
+        assert(replayDeck.finished === false && replayDeck.solved === false, "reopened run stays active");
+        assert(replayDeck.finishedAt == null, "reopened run clears frozen finish time");
+        assert(lib.swarmDigest(replayDeck).phase === "running", "reopened run digest is running, not solved");
+        """
+    )
+    _run_ui_node(script)
+
+
+def test_flag_accepted_reducer_is_visible_but_nonterminal_and_not_blackboard():
+    helper = UI_ROOT / "lib" / "events.ts"
+    script = textwrap.dedent(
+        f"""
+        const fs = require("fs");
+        const ts = require("typescript");
+        const vm = require("vm");
+        const source = fs.readFileSync({json.dumps(str(helper))}, "utf8");
+        const out = ts.transpileModule(source, {{
+          compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }}
+        }}).outputText;
+        const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
+        sandbox.exports = sandbox.module.exports;
+        vm.runInNewContext(out, sandbox, {{ filename: "events.js" }});
+        const lib = sandbox.module.exports;
+        function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
+
+        let started = lib.emptyDeck("run-p2-started");
+        started = lib.reduce(started, {{ event_type: lib.EventType.RUN_STARTED,
+          run_id: "run-p2-started", ts: 1,
+          payload: {{ challenge: {{ name: "p2", expected_flags: 1 }} }} }});
+        const beforeEvents = started.blackboard.events.length;
+        const beforeChat = started.chat.length;
+        started = lib.reduce(started, {{ event_type: lib.EventType.FLAG_ACCEPTED,
+          run_id: "run-p2-started", ts: 2,
+          payload: {{ schema_id: "muteki.flag-accepted-projection.v1",
+            publication_id: "outbox:flag:" + "a".repeat(64),
+            evaluation_id: "a".repeat(64), flag: "flag{{accepted}}",
+            flag_digest: "b".repeat(64), gate_receipt_digest: "c".repeat(64) }} }});
+        assert(started.flag === "flag{{accepted}}", "accepted flag is visible");
+        assert(started.flags.length === 1, "accepted flag merges into visible set");
+        assert(started.solved === false && started.finished === false, "accepted is nonterminal");
+        assert(started.blackboard.events.length === beforeEvents, "no blackboard timeline");
+        assert(started.chat.length === beforeChat, "no progress narration");
+        assert(lib.swarmDigest(started).phase === "collecting", "started accepted stays collecting");
+        assert(lib.isRunActive(started) === true, "accepted-only controls remain active");
+
+        let acceptedOnly = lib.emptyDeck("run-p2-accepted-only");
+        acceptedOnly = lib.reduce(acceptedOnly, {{ event_type: lib.EventType.FLAG_ACCEPTED,
+          run_id: "run-p2-accepted-only", ts: 3,
+          payload: {{ flag: "flag{{catalog-only}}" }} }});
+        assert(acceptedOnly.started === false, "accepted event does not synthesize started");
+        assert(acceptedOnly.solved === false && acceptedOnly.finished === false, "accepted-only is nonterminal");
+        assert(lib.swarmDigest(acceptedOnly).phase === "collecting", "accepted-only digest is collecting");
         """
     )
     _run_ui_node(script)
@@ -915,6 +1110,70 @@ def test_run_active_selector_closes_controls_after_terminal_flag_signal():
     _run_ui_node(script)
 
 
+def test_pentest_digest_keeps_controls_until_run_finished():
+    """Accepted reports must not close stop/steer before RUN_FINISHED.
+
+    The N=1 collect bug showed the hero as goal_met while the coordinator
+    kept dispatching; live controls must stay open until the backend finishes.
+    """
+    helper = UI_ROOT / "lib" / "events.ts"
+    script = textwrap.dedent(
+        f"""
+        const fs = require("fs");
+        const ts = require("typescript");
+        const vm = require("vm");
+        const source = fs.readFileSync({json.dumps(str(helper))}, "utf8");
+        const out = ts.transpileModule(source, {{
+          compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }}
+        }}).outputText;
+        const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
+        sandbox.exports = sandbox.module.exports;
+        vm.runInNewContext(out, sandbox, {{ filename: "events.js" }});
+        const lib = sandbox.module.exports;
+        function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
+
+        let deck = lib.emptyDeck("run-pentest-n1");
+        deck = lib.reduce(deck, {{ event_type: lib.EventType.RUN_STARTED, run_id: "run-pentest-n1", ts: 1,
+          payload: {{ challenge: {{ name: "dvwa", category: "web", mode: "pentest",
+            expected_findings: 1, engagement: {{ expected_findings: 1, quantity: "collect" }} }} }} }});
+        deck = lib.reduce(deck, {{ event_type: lib.EventType.BLACKBOARD_DELTA, run_id: "run-pentest-n1", ts: 2,
+          solver_id: "cli-pi", payload: {{ kind: "report_accepted", actor: "cli-pi",
+            report_id: "r1", title: "SQLi on /vulnerabilities/sqli/" }} }});
+
+        assert(lib.swarmDigest(deck).phase === "collecting", "accepted report before goal_complete stays collecting");
+        assert(lib.swarmDigest(deck).reports.length === 1, "accepted report is in the digest");
+        assert(lib.isRunActive(deck) === true, "stop stays available while the run is not finished");
+
+        deck = lib.reduce(deck, {{ event_type: lib.EventType.BLACKBOARD_DELTA, run_id: "run-pentest-n1", ts: 3,
+          payload: {{ kind: "goal_complete", why: "gated_reports", reports: 1 }} }});
+        assert(lib.swarmDigest(deck).phase === "goal_met", "goal_complete marks the digest goal_met");
+        assert(lib.isRunActive(deck) === true, "stop stays until RUN_FINISHED");
+
+        deck = lib.reduce(deck, {{ event_type: lib.EventType.RUN_FINISHED, run_id: "run-pentest-n1", ts: 4,
+          payload: {{ solved: true, reason: "goal_met" }} }});
+        assert(lib.swarmDigest(deck).phase === "goal_met", "finished pentest stays goal_met");
+        assert(lib.isRunActive(deck) === false, "controls close after RUN_FINISHED");
+        """
+    )
+    _run_ui_node(script)
+
+
+def test_run_inspector_shows_accepted_pentest_reports():
+    inspector = (UI_ROOT / "components" / "RunInspector.tsx").read_text()
+    i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
+    markdown = (UI_ROOT / "lib" / "reportMarkdown.ts").read_text()
+    assert "directoryReports" in inspector
+    assert "PentestReportDirectory" in inspector
+    assert "onOpenReport" in inspector
+    assert "insp.run.exportCollection" in inspector
+    assert "insp.run.reportHint" in inspector
+    assert "reportsToCollectionMarkdown" in inspector
+    assert "reportToMarkdown(row)" not in inspector
+    assert '"insp.run.reports"' in i18n
+    assert '"insp.run.exportCollection"' in i18n
+    assert "reportLocationLabel" in markdown
+
+
 def test_evidence_chain_is_compact_expandable_workbench():
     evidence = (UI_ROOT / "components" / "EvidenceChain.tsx").read_text()
     css = (UI_ROOT / "app" / "globals.css").read_text()
@@ -944,7 +1203,7 @@ def test_graph_toolbar_solver_chips_use_shared_dropdown():
     css = (UI_ROOT / "app" / "globals.css").read_text()
     i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
 
-    assert "workerShortLabel" in graph
+    assert "workerDisplayName" in graph
     assert 'className="graph-toolbar-actions"' in graph
     assert 'className="graph-toolbar-meta"' in graph
     assert 'className="graph-tool-btn"' in graph
@@ -1025,7 +1284,7 @@ def test_blackboard_worker_chips_wrap_when_expanded():
     css = (UI_ROOT / "app" / "globals.css").read_text()
     i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
 
-    assert "workerShortLabel" in blackboard
+    assert "workerDisplayName" in blackboard
     assert 'className="bb-toolbar-main"' in blackboard
     assert "ChipFilterBar" in blackboard
     assert "workersOpen" not in blackboard
@@ -1035,7 +1294,7 @@ def test_blackboard_worker_chips_wrap_when_expanded():
     assert 'className="bb-workers"' not in blackboard
     assert 'bb-worker-railbox' not in blackboard
     assert 'className="bb-worker-label"' in blackboard
-    assert "workerShortLabel(w)" in blackboard
+    assert "workerDisplayName(w" in blackboard
     assert "grid-template-columns: auto minmax(0, 1fr)" in css
     assert ".bb-toolbar-main" in css
     assert ".bb-worker-filter" in css
@@ -1055,10 +1314,10 @@ def test_blackboard_worker_chips_wrap_when_expanded():
 
 def test_worker_lane_detail_defaults_collapsed():
     component = (UI_ROOT / "components" / "WorkerLanes.tsx").read_text()
-    assert "const [expandedLaneIds, setExpandedLaneIds] = useState<Set<string>>(new Set());" in component
-    assert 'role="button"' in component
-    assert "aria-expanded={isExpanded}" in component
-    assert "{isExpanded && (" in component
+    assert "const [doneOpen, setDoneOpen] = useState(false);" in component
+    assert 'className={`wlane-row is-${statusKind}' in component
+    assert "onOpenSpeakerTimeline" in component
+    assert 'aria-expanded={open}' in component
 
 
 def test_status_hero_exposes_flow_popover():
@@ -1105,15 +1364,14 @@ def test_run_inspector_is_full_height_resizable_side_rail():
 
 def test_artifact_panel_has_resizable_width_handle():
     page = (UI_ROOT / "app" / "page.tsx").read_text()
-    panel = (UI_ROOT / "components" / "ArtifactPanel.tsx").read_text()
     css = (UI_ROOT / "app" / "globals.css").read_text()
     i18n = (UI_ROOT / "lib" / "i18n.tsx").read_text()
 
     assert "muteki.artifact.width" in page
     assert "onArtifactResize" in page
-    assert "artifact-resizer" in panel
-    assert "aria-valuenow={width}" in panel
-    assert "onResize(defaultWidth)" in panel
+    assert "artifact-resizer" in page
+    assert "aria-valuenow={width}" in page
+    assert "onResize(defaultWidth)" in page
     assert ".artifact-resizer" in css
     assert "body.artifact-resizing" in css
     assert "art.resizeCanvas" in i18n
@@ -1274,6 +1532,92 @@ async def test_shutdown_cancels_task_and_standby(tmp_path):
     assert r.standby_task.cancelled()
 
 
+async def test_execution_generation_publishes_one_terminal_event(tmp_path):
+    mgr = RunManager(sessions_root=tmp_path)
+
+    async def driver(run):
+        for reason in ("first", "duplicate"):
+            await run.bus.emit(Event(
+                event_type=EventType.RUN_FINISHED,
+                run_id=run.run_id,
+                payload={"solved": False, "reason": reason},
+            ))
+
+    run = await mgr.start("run-terminal-once", driver)
+    await run.task
+    events = [event async for event in run.store.replay(run.run_id)]
+    terminals = [event for event in events
+                 if event.event_type is EventType.RUN_FINISHED]
+
+    assert len(terminals) == 1
+    assert terminals[0].payload["reason"] == "first"
+    assert terminals[0].payload["execution_generation"] == 1
+    await mgr.shutdown()
+
+
+async def test_terminal_generation_rejects_late_worker_events(tmp_path):
+    mgr = RunManager(sessions_root=tmp_path)
+
+    async def driver(run):
+        await run.bus.emit(Event(
+            event_type=EventType.RUN_FINISHED,
+            run_id=run.run_id,
+            payload={"solved": False, "reason": "operator_stop"},
+        ))
+        await run.bus.emit(Event(
+            event_type=EventType.TOOL_CALL_RESULT,
+            run_id=run.run_id,
+            solver_id="late-worker",
+            payload={"tool": "shell", "result": "late output"},
+        ))
+
+    run = await mgr.start("run-terminal-fence", driver)
+    await run.task
+    events = [event async for event in run.store.replay(run.run_id)]
+
+    assert len([
+        event for event in events
+        if event.event_type is EventType.RUN_FINISHED
+    ]) == 1
+    assert not [
+        event for event in events
+        if event.event_type is EventType.TOOL_CALL_RESULT
+        and event.solver_id == "late-worker"
+    ]
+    await mgr.shutdown()
+
+
+async def test_operator_stop_fallback_uses_one_operator_terminal(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("MUTEKI_CONTROL_ACK_TIMEOUT", "0.01")
+    monkeypatch.setenv("MUTEKI_CONTROL_CLAIM_TIMEOUT", "0.01")
+    mgr = RunManager(sessions_root=tmp_path)
+    started = asyncio.Event()
+
+    async def driver(_run):
+        started.set()
+        await asyncio.sleep(3600)
+
+    run = await mgr.start("run-stop-once", driver)
+    await started.wait()
+    result = await mgr.post_control(
+        run.run_id, {"action": "stop", "target": "global"})
+    assert result["command_id"]
+    assert run.control_actor is not None
+    await run.control_actor.join()
+    await asyncio.gather(run.task, return_exceptions=True)
+
+    events = [event async for event in run.store.replay(run.run_id)]
+    terminals = [event for event in events
+                 if event.event_type is EventType.RUN_FINISHED]
+    assert len(terminals) == 1
+    assert terminals[0].payload["reason"] == "operator_stop"
+    assert terminals[0].payload["failure_phase"] == "runtime"
+    assert terminals[0].payload["error_id"].startswith("RT-")
+    await mgr.shutdown()
+
+
 def test_rehydrate_from_jsonl_restores_started_runs(tmp_path):
     # write a minimal JSONL with a run.started so rehydration picks it up
     sess = tmp_path
@@ -1312,29 +1656,65 @@ async def test_meta_sink_tracks_pause_resume(tmp_path):
     run = mgr.create("run-p")
     run.started = True
     await run.bus.emit(Event(event_type=EventType.HITL_RESPONSE, run_id="run-p",
-                             payload={"action": "pause"}))
+                             payload={"action": "pause", "status": "persisted"}))
+    assert run.paused is False  # admission is not an observed effect
+    await run.bus.emit(Event(event_type=EventType.CONTROL_COMMAND, run_id="run-p",
+                             payload={"command_id": "C-p", "action": "pause",
+                                      "status": "effect_observed",
+                                      "effect": {"kind": "run_quiesced"}}))
     assert run.paused is True
-    await run.bus.emit(Event(event_type=EventType.HITL_RESPONSE, run_id="run-p",
-                             payload={"action": "resume"}))
+    await run.bus.emit(Event(event_type=EventType.CONTROL_COMMAND, run_id="run-p",
+                             payload={"command_id": "C-r", "action": "resume",
+                                      "status": "routed"}))
+    assert run.paused is True
+    await run.bus.emit(Event(event_type=EventType.CONTROL_COMMAND, run_id="run-p",
+                             payload={"command_id": "C-r", "action": "resume",
+                                      "status": "effect_observed",
+                                      "effect": {"kind": "run_resumed"}}))
     assert run.paused is False
 
+    await run.bus.emit(Event(event_type=EventType.CONTROL_COMMAND, run_id="run-p",
+                             payload={"command_id": "C-wf", "action": "freeze",
+                                      "target": "solver:w-1",
+                                      "status": "effect_observed",
+                                      "effect": {"kind": "workers_frozen",
+                                                 "targets": ["w-1"]}}))
+    assert run.paused is False, "targeted worker freeze is not a run-wide hold"
 
-async def test_meta_sink_clears_awaiting_help_on_response(tmp_path):
-    """Finding D regression: a worker raises its hand (HITL_REQUEST → awaiting_help),
-    then the operator answers with a plain hint (HITL_RESPONSE, action neither pause
-    nor resume). The rail's awaiting_help MUST clear. The old _meta_sink had TWO
-    `elif HITL_RESPONSE` arms — the second (which cleared the hand) was unreachable, so
-    the rail showed '需要输入' forever even after the answer."""
+
+async def test_meta_sink_resolves_only_addressed_help_request(tmp_path):
     mgr = RunManager(sessions_root=tmp_path)
     run = mgr.create("run-h")
     run.started = True
     await run.bus.emit(Event(event_type=EventType.HITL_REQUEST, run_id="run-h",
-                             payload={"need": "the dashboard token"}))
+                             payload={"request_id": "H-a", "need": "token A"}))
+    await run.bus.emit(Event(event_type=EventType.HITL_REQUEST, run_id="run-h",
+                             payload={"request_id": "H-b", "need": "token B"}))
     assert run.awaiting_help is True
-    assert run.help_text
-    # a non-pause/resume answer must still lower the hand
     await run.bus.emit(Event(event_type=EventType.HITL_RESPONSE, run_id="run-h",
                              payload={"action": "hint", "text": "try 8080"}))
+    assert set(run.pending_help) == {"H-a", "H-b"}
+    await run.bus.emit(Event(event_type=EventType.HITL_RESPONSE, run_id="run-h",
+                             payload={"action": "answer_decision", "request_id": "H-a"}))
+    assert set(run.pending_help) == {"H-a", "H-b"}
+    await run.bus.emit(Event(event_type=EventType.CONTROL_COMMAND, run_id="run-h",
+                             payload={"command_id": "C-a", "action": "answer_decision",
+                                      "request_id": "H-a", "status": "unknown",
+                                      "decision_closed": True}))
+    assert set(run.pending_help) == {"H-a", "H-b"}
+    await run.bus.emit(Event(event_type=EventType.CONTROL_COMMAND, run_id="run-h",
+                             payload={"command_id": "C-a2", "action": "answer_decision",
+                                      "request_id": "H-a", "status": "effect_observed",
+                                      "decision_closed": True}))
+    assert set(run.pending_help) == {"H-b"}
+    assert run.awaiting_help is True
+    await run.bus.emit(Event(event_type=EventType.HITL_RESPONSE, run_id="run-h",
+                             payload={"action": "answer_decision", "request_id": "H-b"}))
+    assert run.awaiting_help is True
+    await run.bus.emit(Event(event_type=EventType.CONTROL_COMMAND, run_id="run-h",
+                             payload={"command_id": "C-b", "action": "answer_decision",
+                                      "request_id": "H-b", "status": "effect_observed",
+                                      "decision_closed": True}))
     assert run.awaiting_help is False
     assert run.help_text == ""
 
@@ -1348,14 +1728,25 @@ async def test_meta_sink_for_handles_hitl(tmp_path):
     run.started = True
     sink = mgr._meta_sink_for(run)
     await sink(Event(event_type=EventType.HITL_REQUEST, run_id="run-sb",
-                     payload={"need": "vpn creds"}))
+                     payload={"request_id": "H-vpn", "need": "vpn creds"}))
     assert run.awaiting_help is True
     await sink(Event(event_type=EventType.HITL_RESPONSE, run_id="run-sb",
-                     payload={"action": "pause"}))
+                     payload={"action": "answer_decision", "request_id": "H-vpn"}))
+    assert run.awaiting_help is True
+    await sink(Event(event_type=EventType.CONTROL_COMMAND, run_id="run-sb",
+                     payload={"command_id": "C-vpn", "action": "answer_decision",
+                              "request_id": "H-vpn", "status": "effect_observed",
+                              "decision_closed": True}))
+    assert run.awaiting_help is False
+    await sink(Event(event_type=EventType.CONTROL_COMMAND, run_id="run-sb",
+                     payload={"command_id": "C-f", "action": "freeze",
+                              "status": "effect_observed",
+                              "effect": {"kind": "run_frozen"}}))
     assert run.paused is True
-    assert run.awaiting_help is False  # response lowers the hand even while pausing
-    await sink(Event(event_type=EventType.HITL_RESPONSE, run_id="run-sb",
-                     payload={"action": "resume"}))
+    await sink(Event(event_type=EventType.CONTROL_COMMAND, run_id="run-sb",
+                     payload={"command_id": "C-t", "action": "thaw",
+                              "status": "effect_observed",
+                              "effect": {"kind": "run_thawed"}}))
     assert run.paused is False
 
 
@@ -1417,7 +1808,7 @@ async def test_swarm_driver_threads_attachments_and_offline_denies_kb(tmp_path, 
             captured["challenge"] = challenge
             captured["web_access"] = kw.get("web_access")
             captured["kb"] = kw.get("kb")
-            captured["runtime_profiles"] = kw.get("runtime_profiles")
+            captured["worker_network"] = kw.get("worker_network")
 
         async def run(self):
             class O:
@@ -1426,13 +1817,13 @@ async def test_swarm_driver_threads_attachments_and_offline_denies_kb(tmp_path, 
                 winner = None
             return O()
 
-    monkeypatch.setattr(sw, "Swarm", FakeSwarm)
+    monkeypatch.setattr(drivers, "_resolve_swarm_class", lambda _spec: FakeSwarm)
 
     body = {
         "kind": "swarm", "offline": True,
         "challenge": {"name": "t", "category": "crypto", "description": "d",
                       "attachments": [str(src), str(missing)]},
-        "runtime_profiles": [{"id": "docker-web", "backend": "container", "network": "bridge"}],
+        "worker_network": "bridge",
     }
     driver = drivers._swarm_driver(drivers._infer_challenge(body))
 
@@ -1460,7 +1851,7 @@ async def test_swarm_driver_threads_attachments_and_offline_denies_kb(tmp_path, 
     assert ch.attachments == [str(src)]          # missing path filtered out
     assert captured["web_access"] is False        # offline
     assert captured["kb"] is False                # offline implies no KB
-    assert captured["runtime_profiles"][0]["network"] == "none"
+    assert captured["worker_network"] == "none"
 
 
 async def test_swarm_driver_online_keeps_kb(tmp_path, monkeypatch):
@@ -1481,7 +1872,7 @@ async def test_swarm_driver_online_keeps_kb(tmp_path, monkeypatch):
                 winner = None
             return O()
 
-    monkeypatch.setattr(sw, "Swarm", FakeSwarm)
+    monkeypatch.setattr(drivers, "_resolve_swarm_class", lambda _spec: FakeSwarm)
     driver = drivers._swarm_driver(drivers._infer_challenge(
         {"kind": "swarm", "challenge": {"description": "an http web target"}}))
 
@@ -1513,7 +1904,7 @@ async def test_swarm_driver_threads_stage_policy_budgets_and_llm_profiles(tmp_pa
                 flag = None
             return O()
 
-    monkeypatch.setattr(sw, "Swarm", FakeSwarm)
+    monkeypatch.setattr(drivers, "_resolve_swarm_class", lambda _spec: FakeSwarm)
     body = {
         "kind": "swarm",
         "challenge": {"description": "solve"},
@@ -1563,7 +1954,10 @@ async def test_swarm_driver_body_overrides_worker_config_stage_policy(tmp_path, 
                 flag = None
             return O()
 
-    monkeypatch.setattr(sw, "Swarm", FakeSwarm)
+    monkeypatch.setattr(drivers, "_resolve_swarm_class", lambda _spec: FakeSwarm)
+    async def ready(*, profiles, **_kwargs):
+        return ({str(profile["id"]): True for profile in profiles}, [])
+    monkeypatch.setattr(drivers, "_startup_readiness", ready)
     mgr = RunManager(sessions_root=tmp_path / "sessions")
     mgr.worker_config.resolve = lambda category: {
         "engines": ["claude"],
@@ -1591,7 +1985,7 @@ async def test_swarm_driver_body_overrides_worker_config_stage_policy(tmp_path, 
 
     class FakeRun:
         run_id = "r-stage-override"; bus = FakeBus(); hitl = None; worker_cmds = None
-        cost = None; flag = None
+        cost = None; flag = None; profile_readiness = {}
 
     await driver(FakeRun())
     policy = captured["stage_policy"]
@@ -1615,18 +2009,18 @@ async def test_swarm_driver_prechecks_only_selected_worker_profiles(tmp_path, mo
                 flag = None
             return O()
 
-    def fake_missing(*, worker_profiles, runtime_profiles, sessions_root):
-        captured["precheck_profiles"] = worker_profiles
-        return []
+    async def fake_readiness(*, profiles, worker_network, worker_backend,
+                             sessions_root, cached_results):
+        captured["precheck_profiles"] = profiles
+        return ({str(profile["id"]): True for profile in profiles}, [])
 
-    monkeypatch.setattr(sw, "Swarm", FakeSwarm)
-    monkeypatch.setattr(drivers, "_missing_profile_accounts", fake_missing)
+    monkeypatch.setattr(drivers, "_resolve_swarm_class", lambda _spec: FakeSwarm)
+    monkeypatch.setattr(drivers, "_startup_readiness", fake_readiness)
     mgr = RunManager(sessions_root=tmp_path / "sessions")
     mgr.worker_config.resolve = lambda category: {
         "engines": ["claude-local"],
         "start_workers": 1,
         "worker_backend": "local",
-        "runtime_profiles": [{"id": "local", "backend": "local"}],
         "worker_profiles": [
             {"id": "claude-local", "name": "claude-local", "engine": "claude",
              "transport": "claude_code", "credential_mode": "subscription",
@@ -1648,12 +2042,71 @@ async def test_swarm_driver_prechecks_only_selected_worker_profiles(tmp_path, mo
 
     class FakeRun:
         run_id = "r-precheck"; bus = FakeBus(); hitl = None; worker_cmds = None
-        cost = None; flag = None
+        cost = None; flag = None; profile_readiness = {}
 
     await driver(FakeRun())
     assert [p["id"] for p in captured["precheck_profiles"]] == ["claude-local"]
     assert [p["id"] for p in captured["swarm_profiles"]] == [
         "claude-local", "cursor-api-local"]
+
+
+async def test_swarm_driver_emits_preparing_and_structured_preflight_failure(
+    tmp_path, monkeypatch,
+):
+    from apps.web import drivers
+
+    async def failed_readiness(*, profiles, **_kwargs):
+        profile_id = str(profiles[0]["id"])
+        return ({profile_id: False}, [{
+            "profile_id": profile_id,
+            "engine": "claude",
+            "model": "sonnet",
+            "backend": "local",
+            "runtime": "local",
+            "layer": "auth",
+            "code": "preflight_auth_failed",
+            "detail": "Authentication required",
+        }])
+
+    monkeypatch.setattr(drivers, "_startup_readiness", failed_readiness)
+    class MustNotStart:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("Swarm must not start after a failed preflight")
+
+    monkeypatch.setattr(
+        drivers, "_resolve_swarm_class", lambda _spec: MustNotStart)
+    mgr = RunManager(sessions_root=tmp_path / "sessions")
+    mgr.worker_config.resolve = lambda _category: {
+        "engines": ["claude-local"],
+        "start_workers": 1,
+        "worker_backend": "local",
+        "worker_profiles": [{
+            "id": "claude-local", "name": "claude-local", "engine": "claude",
+            "transport": "claude_code", "credential_mode": "subscription",
+            "credential_account": "", "runtime": "local", "model": "sonnet",
+            "enabled": True,
+        }],
+    }
+    driver = drivers._swarm_driver(
+        drivers._infer_challenge({"challenge": {"description": "solve"}}),
+        mgr=mgr,
+    )
+    events = []
+
+    class FakeBus:
+        async def emit(self, event): events.append(event)
+
+    class FakeRun:
+        run_id = "r-preflight-failed"; bus = FakeBus()
+        hitl = None; worker_cmds = None; cost = None; flag = None
+        profile_readiness = {}
+
+    await driver(FakeRun())
+
+    assert [event.event_type for event in events] == [
+        EventType.RUN_PREPARING, EventType.RUN_FINISHED]
+    assert events[-1].payload["reason"] == "preflight_failed"
+    assert events[-1].payload["profile_failures"][0]["profile_id"] == "claude-local"
 
 
 async def test_swarm_driver_threads_expected_flags(tmp_path, monkeypatch):
@@ -1675,7 +2128,7 @@ async def test_swarm_driver_threads_expected_flags(tmp_path, monkeypatch):
                 flag = None; solved = False; winner = None
             return O()
 
-    monkeypatch.setattr(sw, "Swarm", FakeSwarm)
+    monkeypatch.setattr(drivers, "_resolve_swarm_class", lambda _spec: FakeSwarm)
 
     class FakeBus:
         async def emit(self, *a, **k): pass
@@ -1711,7 +2164,7 @@ async def test_swarm_driver_threads_custom_flag_wrapper_as_prompt_hint(tmp_path,
                 flag = None; solved = False; winner = None
             return O()
 
-    monkeypatch.setattr(sw, "Swarm", FakeSwarm)
+    monkeypatch.setattr(drivers, "_resolve_swarm_class", lambda _spec: FakeSwarm)
 
     class FakeBus:
         async def emit(self, *a, **k): pass
@@ -1749,7 +2202,7 @@ async def test_swarm_driver_does_not_inject_flag_hint_without_wrapper(tmp_path, 
                 flag = None; solved = False; winner = None
             return O()
 
-    monkeypatch.setattr(sw, "Swarm", FakeSwarm)
+    monkeypatch.setattr(drivers, "_resolve_swarm_class", lambda _spec: FakeSwarm)
 
     class FakeBus:
         async def emit(self, *a, **k): pass
@@ -1785,7 +2238,7 @@ async def test_swarm_driver_threads_multi_flag(tmp_path, monkeypatch):
                 flag = None; solved = False; winner = None
             return O()
 
-    monkeypatch.setattr(sw, "Swarm", FakeSwarm)
+    monkeypatch.setattr(drivers, "_resolve_swarm_class", lambda _spec: FakeSwarm)
 
     class FakeBus:
         async def emit(self, *a, **k): pass

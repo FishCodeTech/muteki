@@ -1,0 +1,96 @@
+{
+  "updated_at": "2026-08-14",
+  "sources": {
+    "claude": "https://code.claude.com/docs/en/model-config",
+    "codex": "https://learn.chatgpt.com/docs/models",
+    "cursor": "https://cursor.com/docs/models",
+    "pi": "pi --help / pi --list-models",
+    "omp": "omp --help / omp models --json",
+    "kimi": "https://moonshotai.github.io/kimi-code/en/configuration/config-files.html",
+    "grok": "grok --help / grok models",
+    "opencode": "opencode models",
+    "dsh": "DeepSeek Harness SDK 0.1.0rc6"
+  },
+  "reasoning": {
+    "claude": {"supported": true, "levels": ["low", "medium", "high", "xhigh", "max"], "default": ""},
+    "pi": {"supported": true, "levels": ["none", "minimal", "low", "medium", "high", "xhigh", "max"], "default": ""},
+    "omp": {"supported": true, "levels": ["none", "minimal", "low", "medium", "high", "xhigh", "max"], "default": "auto"},
+    "grok": {"supported": true, "levels": ["low", "medium", "high", "xhigh"], "default": ""},
+    "opencode": {"supported": true, "levels": ["none", "minimal", "low", "medium", "high", "xhigh", "max"], "default": ""}
+  },
+  "models": {
+    "claude": [
+      {"id": "default", "label": "Default (account default)"},
+      {"id": "best", "label": "Best (alias)"},
+      {"id": "sonnet", "label": "Sonnet (alias)"},
+      {"id": "opus", "label": "Opus (alias)"},
+      {"id": "fable", "label": "Fable (alias)"},
+      {"id": "haiku", "label": "Haiku (alias)"},
+      {"id": "sonnet[1m]", "label": "Sonnet 1M (alias)"},
+      {"id": "opus[1m]", "label": "Opus 1M (alias)"},
+      {"id": "opusplan", "label": "Opus plan / Sonnet execute"},
+      {"id": "claude-fable-5", "label": "Claude Fable 5"},
+      {"id": "claude-opus-5", "label": "Claude Opus 5"},
+      {"id": "claude-sonnet-5", "label": "Claude Sonnet 5"},
+      {"id": "claude-opus-4-8", "label": "Claude Opus 4.8"},
+      {"id": "claude-opus-4-7", "label": "Claude Opus 4.7"},
+      {"id": "claude-opus-4-6", "label": "Claude Opus 4.6"},
+      {"id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6"},
+      {"id": "claude-haiku-4-5-20251001", "label": "Claude Haiku 4.5"},
+      {"id": "claude-sonnet-4-5-20250929", "label": "Claude Sonnet 4.5"}
+    ],
+    "codex": [
+      {"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol", "reasoning": {"supported": true, "levels": ["low", "medium", "high", "xhigh", "max"], "default": "low"}},
+      {"id": "gpt-5.6-terra", "label": "GPT-5.6 Terra", "reasoning": {"supported": true, "levels": ["low", "medium", "high", "xhigh", "max"], "default": "medium"}},
+      {"id": "gpt-5.6-luna", "label": "GPT-5.6 Luna", "reasoning": {"supported": true, "levels": ["low", "medium", "high", "xhigh", "max"], "default": "medium"}},
+      {"id": "gpt-5.5", "label": "GPT-5.5", "reasoning": {"supported": true, "levels": ["low", "medium", "high", "xhigh"], "default": "medium"}},
+      {"id": "gpt-5.4", "label": "GPT-5.4", "reasoning": {"supported": true, "levels": ["low", "medium", "high", "xhigh"], "default": "medium"}},
+      {"id": "gpt-5.4-mini", "label": "GPT-5.4 Mini", "reasoning": {"supported": true, "levels": ["low", "medium", "high", "xhigh"], "default": "medium"}},
+      {"id": "gpt-5.3-codex-spark", "label": "GPT-5.3 Codex Spark", "reasoning": {"supported": true, "levels": ["low", "medium", "high", "xhigh"], "default": "high"}},
+      {"id": "gpt-5.2", "label": "GPT-5.2", "reasoning": {"supported": true, "levels": ["low", "medium", "high", "xhigh"], "default": "medium"}},
+      {"id": "gpt-5.1", "label": "GPT-5.1", "reasoning": {"supported": true, "levels": ["low", "medium", "high"], "default": "medium"}},
+      {"id": "gpt-5-mini", "label": "GPT-5 Mini", "reasoning": {"supported": true, "levels": ["minimal", "low", "medium", "high"], "default": "medium"}}
+    ],
+    "cursor": [
+      {"id": "auto", "label": "Auto", "reasoning": {"supported": false, "levels": [], "default": ""}},
+      {"id": "composer-2.5-fast", "label": "Composer 2.5 Fast"},
+      {"id": "composer-2.5", "label": "Composer 2.5"},
+      {"id": "gpt-5.3-codex", "label": "Codex 5.3", "reasoning": {"supported": true, "levels": ["low", "medium", "high", "xhigh"], "default": "medium"}},
+      {"id": "gpt-5.3-codex-high", "label": "Codex 5.3 High", "reasoning": {"supported": true, "levels": ["low", "medium", "high", "xhigh"], "default": "high"}},
+      {"id": "gpt-5.2", "label": "GPT-5.2"},
+      {"id": "claude-4.5-sonnet", "label": "Sonnet 4.5"},
+      {"id": "claude-4.5-sonnet-thinking", "label": "Sonnet 4.5 Thinking"}
+    ],
+    "pi": [
+      {"id": "deepseek-v4-flash:0731-cloud", "label": "DeepSeek V4 Flash (cloud)"},
+      {"id": "deepseek-v4-pro", "label": "DeepSeek V4 Pro"},
+      {"id": "gpt-5-mini", "label": "GPT-5 Mini"},
+      {"id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6"}
+    ],
+    "omp": [
+      {"id": "deepseek-v4-flash:0731-cloud", "label": "DeepSeek V4 Flash (cloud)"},
+      {"id": "deepseek-v4-pro", "label": "DeepSeek V4 Pro"},
+      {"id": "gpt-5-mini", "label": "GPT-5 Mini"},
+      {"id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6"}
+    ],
+    "kimi": [
+      {"id": "kimi-code/k3", "label": "Kimi K3", "reasoning": {"supported": true, "levels": ["low", "high", "max"], "default": "high"}},
+      {"id": "kimi-code/k3-256k", "label": "Kimi K3 256K", "reasoning": {"supported": true, "levels": ["low", "high", "max"], "default": "high"}},
+      {"id": "kimi-code/kimi-for-coding", "label": "Kimi for Coding", "reasoning": {"supported": true, "levels": ["low", "high", "max"], "default": "high"}},
+      {"id": "kimi-code/kimi-for-coding-highspeed", "label": "Kimi for Coding High Speed", "reasoning": {"supported": true, "levels": ["low", "high", "max"], "default": "high"}}
+    ],
+    "grok": [
+      {"id": "grok-4.6", "label": "Grok 4.6"},
+      {"id": "grok-4.5", "label": "Grok 4.5"}
+    ],
+    "opencode": [
+      {"id": "opencode/deepseek-v4-flash-free", "label": "DeepSeek V4 Flash Free"},
+      {"id": "opencode/laguna-s-2.1-free", "label": "Laguna S 2.1 Free"},
+      {"id": "opencode/nemotron-3.5-lightning-free", "label": "Nemotron 3.5 Lightning Free"}
+    ],
+    "dsh": [
+      {"id": "deepseek-v4-flash", "label": "DeepSeek V4 Flash"},
+      {"id": "deepseek-v4-pro", "label": "DeepSeek V4 Pro"}
+    ]
+  }
+}

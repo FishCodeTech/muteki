@@ -58,6 +58,9 @@ class RunMetaStore:
     def all(self) -> dict[str, dict[str, Any]]:
         return {rid: self.get(rid) for rid in self._data}
 
+    def contains(self, run_id: str) -> bool:
+        return run_id in self._data
+
     def _mutate(self, run_id: str, **changes: Any) -> dict[str, Any]:
         m = dict(self._data.get(run_id, {}))
         m.update(changes)
