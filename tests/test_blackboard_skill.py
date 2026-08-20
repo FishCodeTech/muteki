@@ -295,45 +295,38 @@ def test_resolved_blackboard_script_dedupe_matches_repo(tmp_path):
     assert got == expected
 
 
-# ── safety-net: sync_deployed_blackboard_skills reconciles deployed copies ────
+# ── Worker-local Skill projection ────────────────────────────────────────────
 
-def test_sync_deployed_blackboard_skills_resyncs_stale_and_missing(tmp_path, monkeypatch):
-    """The launch-time safety net overwrites a stale/missing deployed copy from the
-    repo source and leaves a fresh one alone — closing the run-75378 drift gap for the
-    auto-discovered user-scope copies."""
+def test_sync_deployed_blackboard_skills_never_writes_user_scope(tmp_path):
     from muteki.solver import cli_solver
 
-    claude = tmp_path / ".claude" / "skills" / "muteki-blackboard" / "blackboard.py"
-    agents = tmp_path / ".agents" / "skills" / "muteki-blackboard" / "blackboard.py"
-    monkeypatch.setattr(cli_solver, "_DEPLOYED_BLACKBOARD_SCRIPTS",
-                        (str(claude), str(agents)))
-    src = Path(cli_solver._repo_blackboard_script())
+    user_copy = tmp_path / ".agents" / "skills" / "personal" / "SKILL.md"
+    user_copy.parent.mkdir(parents=True)
+    user_copy.write_text("personal skill\n")
 
-    # First run: both missing → both synced from repo (and SKILL.md moves too).
-    rows = cli_solver.sync_deployed_blackboard_skills()
-    assert {r["status"] for r in rows} == {"synced"}
-    assert claude.read_bytes() == src.read_bytes()
-    assert agents.read_bytes() == src.read_bytes()
-    assert (claude.parent / "SKILL.md").is_file()
-
-    # Second run: identical → no action.
-    rows = cli_solver.sync_deployed_blackboard_skills()
-    assert {r["status"] for r in rows} == {"ok"}
-
-    # Drift ONE copy → only it is re-synced; the fresh one is left untouched.
-    claude.write_text("# drifted out of sync\n")
-    rows = cli_solver.sync_deployed_blackboard_skills()
-    by_path = {r["path"]: r["status"] for r in rows}
-    assert by_path[str(claude)] == "synced"
-    assert by_path[str(agents)] == "ok"
-    assert claude.read_bytes() == src.read_bytes()  # restored
+    assert cli_solver.sync_deployed_blackboard_skills() == []
+    assert user_copy.read_text() == "personal skill\n"
+    assert not (tmp_path / ".agents" / "skills" / "muteki-blackboard").exists()
 
 
-def test_sync_deployed_blackboard_skills_no_source_is_noop(monkeypatch):
-    """An installed deployment (no repo skill adjacent to the package) reports
-    'no-source' and touches nothing — the deployed copy IS the source of truth there."""
-    from muteki.solver import cli_solver
+@pytest.mark.parametrize(
+    "engine", ["claude", "codex", "cursor", "pi", "omp", "kimi", "grok"])
+def test_stage_blackboard_skill_is_worker_local_for_all_engines(tmp_path, engine):
+    from muteki.solver.worker_skills import project_skill_roots, stage_blackboard_skill
 
-    monkeypatch.setattr(cli_solver, "_repo_blackboard_script", lambda: None)
-    rows = cli_solver.sync_deployed_blackboard_skills()
-    assert rows and all(r["status"] == "no-source" for r in rows)
+    worker = tmp_path / "worker"
+    user_home = tmp_path / "user-home"
+    personal = user_home / ".agents" / "skills" / "personal" / "SKILL.md"
+    personal.parent.mkdir(parents=True)
+    personal.write_text("keep me\n")
+
+    staged = stage_blackboard_skill(worker, engine=engine)
+
+    assert len(staged) == len(project_skill_roots(engine))
+    for path in staged:
+        link = Path(path)
+        assert link.is_symlink()
+        assert (link / "SKILL.md").is_file()
+        assert (link / "blackboard.py").is_file()
+    assert personal.read_text() == "keep me\n"
+    assert not (user_home / ".agents" / "skills" / "muteki-blackboard").exists()

@@ -1,6 +1,6 @@
 """BTW side-query observer — isolation guarantees.
 
-Verifies the 10 invariants from docs/internal-design/BTW_SIDEQUERY_DESIGN.md hold:
+Verifies the 10 BTW side-query isolation invariants hold:
 open_readonly is truly read-only (no mkdir / no WAL / no schema write / file mtime
 unchanged), recent_events is bounded + challenge-scoped, sanitize_transcript caps
 runaway input, and btw_messages assembles the multi-turn prompt correctly.

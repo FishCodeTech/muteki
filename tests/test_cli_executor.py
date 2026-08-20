@@ -4,8 +4,12 @@ external-USD cost accounting. Pure/unit (no real CLI subprocess, no API key)."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 
@@ -16,7 +20,10 @@ from muteki.core.events import EventType
 from muteki.models.solve_graph import Challenge
 from muteki.solver import cli_solver
 from muteki.solver.cli_driver import (
-    ClaudeCodeDriver, CodexDriver, CursorDriver, DRIVERS, driver_for, get_driver,
+    ClaudeCodeDriver, CliResult, CodexDriver, CursorDriver, DRIVERS,
+    SecurePromptUnsupported, StreamStep,
+    OhMyPiDriver, PiDriver,
+    apply_runtime_argv, driver_for, get_driver,
     _descendant_pids, _kill_proc_tree, _probe_health_with_creds,
 )
 from muteki.solver.cli_solver import CliSolver
@@ -65,7 +72,7 @@ def test_worker_env_maps_blackboard_db_into_container_workspace(tmp_path):
 def test_worker_env_prepends_stable_tool_path_before_host_shims(monkeypatch):
     monkeypatch.setenv(
         "PATH",
-        "/Users/snowywar/.jenv/shims:/opt/homebrew/bin:/custom/bin",
+        "/custom/jenv/shims:/opt/homebrew/bin:/custom/bin",
     )
     ch = Challenge(
         id="env-path",
@@ -79,7 +86,7 @@ def test_worker_env_prepends_stable_tool_path_before_host_shims(monkeypatch):
     parts = solver._worker_env()["PATH"].split(":")
 
     assert parts[:4] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
-    assert parts.index("/usr/bin") < parts.index("/Users/snowywar/.jenv/shims")
+    assert parts.index("/usr/bin") < parts.index("/custom/jenv/shims")
     assert parts.count("/opt/homebrew/bin") == 1
     assert "/custom/bin" in parts
 
@@ -102,7 +109,7 @@ def test_worker_env_blackboard_script_points_at_repo_copy_for_source_runs(tmp_pa
     )
     assert repo_skill.is_file()  # sanity: we ARE running from a source checkout
 
-    for engine in ("claude", "cursor", "codex"):
+    for engine in ("claude", "codex", "cursor", "pi", "omp", "kimi", "grok"):
         env = CliSolver(None, ch, engine=engine)._worker_env()
         assert env["MUTEKI_BLACKBOARD_SCRIPT"] == str(repo_skill)
 
@@ -115,9 +122,8 @@ def test_worker_env_blackboard_script_points_at_repo_copy_for_source_runs(tmp_pa
     assert cont_env["MUTEKI_BLACKBOARD_SCRIPT"] == "/usr/local/bin/blackboard.py"
 
 
-def test_worker_env_blackboard_script_falls_back_to_deployed_for_installs(monkeypatch):
-    """An installed deployment (no repo skill adjacent to the package) falls back to the
-    engine-specific user-scope copy installed by scripts/install_blackboard_skill.sh."""
+def test_worker_env_does_not_fall_back_to_user_skill_directories(monkeypatch):
+    """A missing project Skill fails explicitly and leaves user Skills untouched."""
     ch = Challenge(
         id="env-board-install",
         name="env-board-install",
@@ -128,16 +134,9 @@ def test_worker_env_blackboard_script_falls_back_to_deployed_for_installs(monkey
     # Simulate "no in-repo skill" so the install fallback path is exercised.
     monkeypatch.setattr(cli_solver, "_repo_blackboard_script", lambda: None)
 
-    claude_env = CliSolver(None, ch, engine="claude")._worker_env()
-    cursor_env = CliSolver(None, ch, engine="cursor")._worker_env()
-    codex_env = CliSolver(None, ch, engine="codex")._worker_env()
-
-    assert claude_env["MUTEKI_BLACKBOARD_SCRIPT"].endswith(
-        "/.claude/skills/muteki-blackboard/blackboard.py")
-    assert cursor_env["MUTEKI_BLACKBOARD_SCRIPT"].endswith(
-        "/.claude/skills/muteki-blackboard/blackboard.py")
-    assert codex_env["MUTEKI_BLACKBOARD_SCRIPT"].endswith(
-        "/.agents/skills/muteki-blackboard/blackboard.py")
+    for engine in ("claude", "codex", "cursor", "pi", "omp", "kimi", "grok"):
+        with pytest.raises(FileNotFoundError, match="user-level Skill"):
+            CliSolver(None, ch, engine=engine)._worker_env()
 
 
 def test_worker_env_exposes_current_intent_id():
@@ -182,12 +181,94 @@ def test_claude_resume_uses_dash_r():
 
 def test_codex_execute_and_resume():
     d = CodexDriver()
-    # offline keeps the argv minimal: codex exec ... (no global --search)
+    # Offline removes native search plus Desktop's app/browser/plugin tool
+    # providers while preserving CODEX_HOME auth and Skills.
     ex = d.build_execute("GO", None, web_access=False)
     assert ex[:2] == [d.bin, "exec"]
     assert "--dangerously-bypass-approvals-and-sandbox" in ex
+    assert 'web_search="disabled"' in ex
+    assert "code_mode" in ex
+    assert "browser_use" in ex
+    assert "plugins" in ex
     rs = d.build_resume("CONCLUDE", "abc", web_access=False)
     assert rs[:4] == [d.bin, "exec", "resume", "abc"]
+    assert "code_mode" in rs
+
+
+def test_secret_prompt_invocations_are_stdin_only_and_non_persistent():
+    from muteki.solver.cli_driver import SecurePromptUnsupported
+
+    secret = "operator-secret-argv-998877"
+
+    claude = ClaudeCodeDriver()
+    assert claude.secure_prompt_transport is True
+    claude_argv = claude.build_execute_stdin(secret, claude.new_session(), stream=True)
+    assert secret not in "\0".join(claude_argv)
+    assert "--no-session-persistence" in claude_argv
+    assert "--bare" in claude_argv
+    assert claude_argv[-1] == "--"
+
+    codex = CodexDriver()
+    assert codex.secure_prompt_transport is True
+    codex_argv = codex.build_execute_stdin(secret, None, stream=True)
+    assert secret not in "\0".join(codex_argv)
+    assert "--ephemeral" in codex_argv
+    assert codex_argv[-1] == "-"
+
+    wrapped = driver_for({"id": "claude-secure", "engine": "claude", "model": "x"})
+    assert wrapped.secure_prompt_transport is True
+    wrapped_argv = wrapped.build_execute_stdin(secret, None, stream=True)
+    assert secret not in "\0".join(wrapped_argv)
+    assert wrapped_argv[wrapped_argv.index("--model") + 1] == "x"
+
+    # Cursor's installed CLI reads a missing headless positional from stdin, but
+    # exposes no no-persistence mode; exact secret delivery must fail closed.
+    cursor = CursorDriver()
+    assert cursor.secure_prompt_transport is False
+    with pytest.raises(SecurePromptUnsupported, match="cannot disable.*persistence"):
+        cursor.build_execute_stdin(secret, None, stream=True)
+
+
+def test_secret_result_session_id_is_never_marked_resumable():
+    ch = Challenge(id="secret-session", name="secret", category="misc")
+    solver = CliSolver(None, ch, engine="claude")
+    solver._control_secret_values = ["one-shot-secret"]
+    solver._mark_session_if_live(
+        CliResult(text="completed", session="in-memory-only-session"))
+    assert solver._session_established is False
+
+
+def test_secure_prompt_preflight_validates_installed_help_contract(monkeypatch):
+    from muteki.solver import cli_driver as mod
+
+    mod._SECURE_HELP_CACHE.clear()
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if "exec" in argv:
+            text = "--ephemeral Run without persisting; prompt is read from stdin"
+        else:
+            text = "--print --bare --no-session-persistence"
+        return subprocess.CompletedProcess(argv, 0, stdout=text, stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    claude = ClaudeCodeDriver()
+    claude._bin = "/missing/test-claude"
+    codex = CodexDriver()
+    codex._bin = "/missing/test-codex"
+    assert claude.secure_prompt_preflight() == (True, "")
+    assert codex.secure_prompt_preflight() == (True, "")
+    assert len(calls) == 2
+
+    mod._SECURE_HELP_CACHE.clear()
+    monkeypatch.setattr(
+        mod.subprocess, "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, stdout="--print only", stderr=""))
+    ok, detail = claude.secure_prompt_preflight()
+    assert ok is False
+    assert "--no-session-persistence" in detail
 
 
 def test_codex_search_is_a_global_flag_before_exec():
@@ -401,6 +482,37 @@ def test_engine_status_is_cheap_and_does_not_deep_probe(monkeypatch):
     }]
 
 
+def test_engine_status_lists_each_dispatched_worker(monkeypatch):
+    import muteki.solver.cli_driver as cli_driver
+
+    monkeypatch.setenv("MUTEKI_PI_BIN", "/usr/bin/pi")
+    monkeypatch.setattr(cli_driver, "_runs_ok", lambda _path: True)
+
+    rows = cli_driver.engine_status(
+        profiles=[
+            {
+                "id": "seat_pi_lan",
+                "name": "seat_pi_lan",
+                "label": "pi-lan-deepseek",
+                "engine": "pi",
+                "model": "deepseek-local",
+            },
+            {
+                "id": "seat_pi_ollama",
+                "name": "seat_pi_ollama",
+                "label": "pi-ollama",
+                "engine": "pi",
+                "model": "deepseek-cloud",
+            },
+        ],
+    )
+
+    assert [(row["engine"], row["profile_id"], row["profile_name"]) for row in rows] == [
+        ("pi", "seat_pi_lan", "pi-lan-deepseek"),
+        ("pi", "seat_pi_ollama", "pi-ollama"),
+    ]
+
+
 def test_health_detail_falls_back_to_version_when_no_hello(monkeypatch):
     # a hypothetical driver with no cheap dry-run (empty _hello_argv) degrades to
     # the --version liveness check rather than reporting red.
@@ -463,7 +575,8 @@ def test_cursor_parse_stream_line_shapes():
     assert s1 and s1.kind == "reasoning" and "reading" in s1.text
     # tool_call started (readToolCall) → tool with the path
     s2 = d.parse_stream_line('{"type":"tool_call","subtype":"started","call_id":"x","tool_call":{"readToolCall":{"args":{"path":"a.txt"}}}}')
-    assert s2 and s2.kind == "tool" and s2.tool == "read" and "a.txt" in s2.text
+    assert (s2 and s2.kind == "tool" and s2.tool == "read"
+            and "a.txt" in s2.text and s2.call_id == "x")
     # tool_call started (function shape) → tool with the name
     s3 = d.parse_stream_line('{"type":"tool_call","subtype":"started","tool_call":{"function":{"name":"shell","arguments":"curl x"}}}')
     assert s3 and s3.kind == "tool" and s3.tool == "shell" and "curl" in s3.text
@@ -482,12 +595,14 @@ def test_claude_parse_stream_steps_emits_all_blocks():
     d = ClaudeCodeDriver()
     line = ('{"type":"assistant","message":{"content":['
             '{"type":"text","text":"let me check the response"},'
-            '{"type":"tool_use","name":"Bash","input":{"command":"curl x"}},'
+            '{"type":"tool_use","id":"call-1","name":"Bash",'
+            '"input":{"command":"curl x"}},'
             '{"type":"text","text":"FOUND_FLAG=flag{multi_block}"}]}}')
     steps = d.parse_stream_steps(line)
     assert len(steps) == 3, f"all 3 blocks must emit, got {len(steps)}"
     assert steps[0].kind == "reasoning"
-    assert steps[1].kind == "tool" and steps[1].tool == "Bash"
+    assert (steps[1].kind == "tool" and steps[1].tool == "Bash"
+            and steps[1].call_id == "call-1")
     # the LAST block (the one with the flag) must be present — this is the bug fix
     assert any("FOUND_FLAG=flag{multi_block}" in s.text for s in steps)
     # back-compat: parse_stream_line still returns the FIRST step
@@ -563,17 +678,475 @@ def test_codex_web_is_opt_in():
     assert "--search" in d.build_execute("GO", None, web_access=True)
 
 
+def test_codex_offline_kb_isolation_skips_user_mcp_config():
+    d = CodexDriver()
+    offline = d.build_execute(
+        "GO", None, web_access=False, kb_access=False)
+    assert "--ignore-user-config" in offline
+    online = d.build_execute(
+        "GO", None, web_access=True, kb_access=True)
+    assert "--ignore-user-config" not in online
+
+
+def test_claude_endpoint_preserves_offline_web_isolation():
+    profile = {
+        "id": "deepseek-claude",
+        "name": "deepseek-claude",
+        "engine": "claude",
+        "base_url": "https://api.deepseek.example/anthropic",
+    }
+    d = driver_for(profile)
+    assert d.offline_web_isolation is True
+    argv = d.build_execute("GO", d.new_session(), web_access=False)
+    deny = argv.index("--disallowed-tools")
+    prompt = argv.index("--")
+    assert "WebSearch" in argv[deny:prompt]
+    assert "WebFetch" in argv[deny:prompt]
+
+
+def test_cursor_offline_uses_acp_while_online_keeps_force():
+    driver = CursorDriver()
+    assert driver.offline_web_isolation is True
+    offline = driver.build_execute("GO", None, web_access=False)
+    assert "offline_acp_bridge.py" in " ".join(offline)
+    assert "--force" not in offline
+    online = driver.build_execute("GO", None, web_access=True)
+    assert "--force" in online
+    assert "--trust" in online
+
+
+# ── pi / oh-my-pi drivers (the pi CLI family) ────────────────────────────────
+# Both speak the same headless protocol: `[bin, -p, --mode, json, ...flags, PROMPT]`
+# (trailing positional, no `--`), an engine-assigned session scraped from the
+# {"type":"session"} header, and JSONL events parsed into CliResult/StreamStep.
+
+def _pi_usage(**over):
+    u = {"input": 1200, "output": 42, "cacheRead": 300, "cacheWrite": 100,
+         "totalTokens": 1642,
+         "cost": {"input": 0.001, "output": 0.0004, "cacheRead": 0.0001,
+                  "cacheWrite": 0.0002, "total": 0.0017}}
+    u.update(over)
+    return u
+
+
+def _pi_run_dump() -> str:
+    """A realistic two-tool pi --mode json transcript (event shapes verified
+    against pi 0.84.1 / omp 17.2.12 live output)."""
+    usage = _pi_usage()
+    assistant = {"role": "assistant",
+                 "content": [{"type": "text", "text": "FOUND_FLAG=flag{pi_ok}"}],
+                 "api": "openai-completions", "provider": "muteki",
+                 "model": "deepseek-v4-flash:0731-cloud",
+                 "usage": usage, "stopReason": "stop", "timestamp": 3}
+    return "\n".join([
+        '{"type":"session","version":3,"id":"pi-sess-1",'
+        '"timestamp":"2026-08-11T10:57:20.215Z","cwd":"/work"}',
+        '{"type":"agent_start"}',
+        '{"type":"turn_start"}',
+        '{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"GO"}],"timestamp":1}}',
+        '{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"GO"}],"timestamp":1}}',
+        '{"type":"message_start","message":{"role":"assistant","content":[],"api":"openai-completions","provider":"muteki","timestamp":2}}',
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"FOUND_FLAG=flag{pi_ok}"}}',
+        json.dumps({"type": "tool_execution_start", "toolCallId": "call-1",
+                    "toolName": "bash", "args": {"command": "cat flag.txt"}}),
+        json.dumps({"type": "tool_execution_end", "toolCallId": "call-1",
+                    "toolName": "bash", "isError": False,
+                    "result": {"content": [{"type": "text", "text": "flag{pi_ok}\n"}]}}),
+        json.dumps({"type": "message_end", "message": assistant}),
+        json.dumps({"type": "turn_end", "message": assistant, "toolResults": []}),
+        json.dumps({"type": "agent_end", "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "GO"}]},
+            assistant]}),
+    ])
+
+
+def test_pi_execute_argv_json_mode_trailing_prompt():
+    d = PiDriver()
+    assert d.new_session() is None  # the engine assigns the session id itself
+    argv = d.build_execute("DO THE THING", None, stream=True)
+    assert argv[0] == d.bin
+    assert argv[1:3] == ["-p", "--mode"] and argv[3] == "json"
+    assert "--" not in argv  # no separator: prompt is the bare trailing positional
+    assert argv[-1] == "DO THE THING"
+    # --mode json already streams per-step events; stream=True adds nothing
+    assert argv == d.build_execute("DO THE THING", None, stream=False)
+
+
+def test_pi_stdin_argv_is_ephemeral_and_prompt_free():
+    secret = "exact-operator-secret"
+    d = PiDriver()
+    assert d.secure_prompt_transport is True
+    argv = d.build_execute_stdin(secret, None, stream=True)
+    assert secret not in "\0".join(argv)      # prompt rides stdin, never argv
+    assert "--no-session" in argv
+    assert argv[1:3] == ["-p", "--mode"]
+
+
+def test_omp_stdin_argv_is_ephemeral_and_prompt_free():
+    secret = "exact-operator-secret"
+    d = OhMyPiDriver()
+    assert d.secure_prompt_transport is True
+    argv = d.build_execute_stdin(secret, None)
+    assert secret not in "\0".join(argv) and "--no-session" in argv
+
+
+def test_pi_secure_prompt_preflight(monkeypatch):
+    from muteki.solver import cli_driver as mod
+    mod._SECURE_HELP_CACHE.clear()
+
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv, 0,
+            stdout="--no-session Don't save session (ephemeral)\n--mode <mode>", stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    d = PiDriver()
+    d._bin = "/missing/test-pi"
+    assert d.secure_prompt_preflight() == (True, "")
+
+
+def test_pi_resume_uses_session_flag():
+    d = PiDriver()
+    argv = d.build_resume("CONCLUDE", "019ff078-3f57", stream=True)
+    assert argv[0] == d.bin
+    assert argv[argv.index("--session") + 1] == "019ff078-3f57"
+    assert "--mode" in argv and argv[-1] == "CONCLUDE"
+
+
+def test_omp_resume_uses_resume_flag():
+    d = OhMyPiDriver()
+    argv = d.build_resume("CONCLUDE", "019ff078-3f57", stream=True)
+    assert argv[argv.index("--resume") + 1] == "019ff078-3f57"
+    assert "--session" not in argv
+    assert argv[-1] == "CONCLUDE"
+
+
+def test_pi_bin_resolution_env_override_and_fallback(monkeypatch):
+    from muteki.solver import cli_driver as mod
+    monkeypatch.setenv("MUTEKI_PI_BIN", "/custom/pi")
+    assert mod.resolve_engine_bin("pi") == "/custom/pi"
+    monkeypatch.delenv("MUTEKI_PI_BIN", raising=False)
+    monkeypatch.setattr(mod, "_KNOWN_GOOD", {**mod._KNOWN_GOOD, "pi": []})
+    monkeypatch.setattr(mod, "_which_all", lambda name: [])
+    assert mod.resolve_engine_bin("pi") == "pi"
+
+
+def test_omp_bin_resolution_env_override_and_fallback(monkeypatch):
+    from muteki.solver import cli_driver as mod
+    monkeypatch.setenv("MUTEKI_OMP_BIN", "/custom/omp")
+    assert mod.resolve_engine_bin("omp") == "/custom/omp"
+    monkeypatch.delenv("MUTEKI_OMP_BIN", raising=False)
+    monkeypatch.setattr(mod, "_KNOWN_GOOD", {**mod._KNOWN_GOOD, "omp": []})
+    monkeypatch.setattr(mod, "_which_all", lambda name: [])
+    assert mod.resolve_engine_bin("omp") == "omp"
+
+
+def test_omp_offline_uses_acp_with_empty_mcp_and_disabled_native_web():
+    d = OhMyPiDriver()
+    assert d.offline_web_isolation is True
+    online = d.build_execute("GO", None, web_access=True)
+    assert "offline_acp_bridge.py" not in "\0".join(online)
+    offline = d.build_execute("GO", None, web_access=False)
+    joined = "\0".join(offline)
+    assert "offline_acp_bridge.py" in joined
+    assert "omp_offline_config.yml" in joined
+    assert "--agent-label\0omp" in joined
+    assert offline[-1] == "GO"
+    resumed = d.build_resume("CONCLUDE", "s1", web_access=False)
+    assert resumed[resumed.index("--resume") + 1] == "s1"
+    with pytest.raises(SecurePromptUnsupported, match="persists prompts"):
+        d.build_execute_stdin("S", None, web_access=False)
+
+
+def test_pi_offline_needs_no_argv_change():
+    # pi's built-in tools (read/bash/edit/write/grep/find/ls) have no web access,
+    # so offline is a capability claim with NO argv change.
+    d = PiDriver()
+    assert d.offline_web_isolation is True
+    assert (d.build_execute("GO", None, web_access=False)
+            == d.build_execute("GO", None, web_access=True))
+
+
+def test_pi_model_provider_runtime_flags():
+    d = PiDriver()
+    argv = apply_runtime_argv(
+        d.build_execute("GO", None),
+        driver=d,
+        env={
+            "MUTEKI_PI_MODEL": "deepseek-v4-flash:0731-cloud",
+            "MUTEKI_PI_PROVIDER": "muteki",
+        },
+    )
+    # a model id may contain ":" — passed through verbatim
+    assert argv[argv.index("--model") + 1] == "deepseek-v4-flash:0731-cloud"
+    assert argv[argv.index("--provider") + 1] == "muteki"
+    assert argv[-1] == "GO"  # flags never swallow the trailing prompt
+    rs = apply_runtime_argv(
+        d.build_resume("CONCLUDE", "s1"),
+        driver=d,
+        env={
+            "MUTEKI_PI_MODEL": "deepseek-v4-flash:0731-cloud",
+            "MUTEKI_PI_PROVIDER": "muteki",
+        },
+    )
+    assert "--model" in rs and rs[-1] == "CONCLUDE"
+    clean = d.build_execute("GO", None)
+    assert "--model" not in clean and "--provider" not in clean
+
+
+def test_omp_model_provider_runtime_flags(monkeypatch):
+    d = OhMyPiDriver()
+    argv = apply_runtime_argv(
+        d.build_execute("GO", None),
+        driver=d,
+        env={"MUTEKI_OMP_MODEL": "gpt-5-mini", "MUTEKI_OMP_PROVIDER": "openai"},
+    )
+    assert argv[argv.index("--model") + 1] == "gpt-5-mini"
+    assert argv[argv.index("--provider") + 1] == "openai"
+    # pi env vars must NOT leak into the omp driver
+    monkeypatch.setenv("MUTEKI_PI_MODEL", "pi-only")
+    assert "--model" not in d.build_execute("GO", None)
+
+
+def test_pi_profile_model_injected_before_prompt():
+    # pi/omp argv has NO `--` separator, so the profile model must land BEFORE the
+    # trailing positional prompt (generic _insert_model_arg path).
+    d = driver_for({"id": "pi-sub-container", "engine": "pi",
+                    "model": "deepseek-v4-flash:0731-cloud"})
+    argv = d.build_execute("GO", None)
+    assert argv[-1] == "GO"
+    assert argv[argv.index("--model") + 1] == "deepseek-v4-flash:0731-cloud"
+    # stdin argv has no prompt at all — insertion before the last flag is fine
+    stdin_argv = d.build_execute_stdin("S", None)
+    assert "--model" in stdin_argv and "S" not in "\0".join(stdin_argv)
+
+
+def test_pi_process_env_does_not_override_profile_model(monkeypatch):
+    # The selected Profile is authoritative. A stale process-global value from
+    # another account/probe must not change its argv.
+    monkeypatch.setenv("MUTEKI_PI_MODEL", "env-model")
+    d = driver_for({"id": "pi-x", "engine": "pi", "model": "profile-model"})
+    argv = d.build_execute("GO", None)
+    assert argv.count("--model") == 1
+    assert argv[argv.index("--model") + 1] == "profile-model"
+
+
+def test_pi_parse_jsonl_full_run():
+    d = PiDriver()
+    r = d.parse(_pi_run_dump(), "")
+    assert r.text == "FOUND_FLAG=flag{pi_ok}"
+    assert r.session == "pi-sess-1"
+    # input = fresh + cacheRead + cacheWrite; output straight from usage
+    assert r.input_tokens == 1200 + 300 + 100
+    assert r.output_tokens == 42
+    assert r.cost_usd == pytest.approx(0.0017)
+    assert r.num_turns == 1
+
+
+def test_pi_parse_last_assistant_message_wins():
+    d = PiDriver()
+    first = {"role": "assistant",
+             "content": [{"type": "text", "text": "working on it"}],
+             "usage": _pi_usage(input=10, output=5,
+                                cost={"total": 0.0001})}
+    second = {"role": "assistant",
+              "content": [{"type": "text", "text": "FOUND_FLAG=flag{final}"}],
+              "usage": _pi_usage(input=20, output=7,
+                                 cost={"total": 0.002})}
+    dump = "\n".join([
+        '{"type":"session","version":3,"id":"s2"}',
+        json.dumps({"type": "message_end", "message": first}),
+        json.dumps({"type": "turn_end", "message": first, "toolResults": []}),
+        json.dumps({"type": "message_end", "message": second}),
+        json.dumps({"type": "turn_end", "message": second, "toolResults": []}),
+        '{"type":"agent_end","messages":[]}',
+    ])
+    r = d.parse(dump, "")
+    assert r.text == "FOUND_FLAG=flag{final}"
+    assert r.input_tokens == 20 + 300 + 100 and r.output_tokens == 7
+    assert r.cost_usd == pytest.approx(0.002)
+    assert r.num_turns == 2
+
+
+def test_pi_parse_falls_back_to_agent_end_messages():
+    # a worker killed mid-stream may miss the assistant message_end; the final
+    # agent_end still carries the messages array.
+    d = PiDriver()
+    dump = "\n".join([
+        '{"type":"session","version":3,"id":"s3"}',
+        '{"type":"agent_start"}',
+        json.dumps({"type": "agent_end", "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "GO"}]},
+            {"role": "assistant",
+             "content": [{"type": "text", "text": "partial answer"}],
+             "usage": _pi_usage()}]}),
+    ])
+    r = d.parse(dump, "")
+    assert r.text == "partial answer"
+    assert r.session == "s3"
+    assert r.num_turns == 1  # min 1 when an assistant message exists
+
+
+def test_pi_parse_error_turn_tolerates_empty_content_and_zero_cost():
+    # pi json mode exits 0 even when every turn errored (verified live): the
+    # assistant message carries stopReason=error, empty content, zeroed usage.
+    d = PiDriver()
+    err = {"role": "assistant", "content": [], "stopReason": "error",
+           "errorMessage": "Request timed out.",
+           "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+                     "totalTokens": 0,
+                     "cost": {"input": 0, "output": 0, "cacheRead": 0,
+                              "cacheWrite": 0, "total": 0}}}
+    dump = "\n".join([
+        '{"type":"session","version":3,"id":"s4"}',
+        json.dumps({"type": "message_end", "message": err}),
+        json.dumps({"type": "turn_end", "message": err, "toolResults": []}),
+        json.dumps({"type": "agent_end", "messages": [err], "willRetry": False}),
+    ])
+    r = d.parse(dump, "")
+    assert r.session == "s4"
+    assert r.cost_usd is None  # cost.total 0 means "not priced", not $0.00
+    assert r.input_tokens is None and r.output_tokens is None
+
+
+def test_omp_parse_with_thinking_blocks():
+    d = OhMyPiDriver()
+    assistant = {"role": "assistant",
+                 "content": [
+                     {"type": "thinking",
+                      "thinking": "the flag is probably in /flag.txt"},
+                     {"type": "text", "text": "FOUND_FLAG=flag{omp_think}"}],
+                 "usage": _pi_usage(output=77)}
+    dump = "\n".join([
+        '{"type":"session","version":3,"id":"omp-sess-1"}',
+        '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"the flag is"}}',
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"FOUND_"}}',
+        json.dumps({"type": "message_end", "message": assistant}),
+        json.dumps({"type": "turn_end", "message": assistant, "toolResults": []}),
+        json.dumps({"type": "agent_end", "messages": [assistant]}),
+        '{"type":"auto_retry_start","attempt":1}',  # omp extras are ignored
+    ])
+    r = d.parse(dump, "")
+    # thinking blocks are reasoning, not answer text
+    assert r.text == "FOUND_FLAG=flag{omp_think}"
+    assert r.session == "omp-sess-1" and r.output_tokens == 77
+    assert r.num_turns == 1
+
+
+def test_pi_parse_stream_steps_shapes():
+    d = PiDriver()
+    # session header → session step
+    s0 = d.parse_stream_steps('{"type":"session","version":3,"id":"s1"}')
+    assert s0 and s0[0].kind == "session" and s0[0].session == "s1"
+    # streaming deltas → reasoning (text and thinking)
+    s1 = d.parse_stream_steps('{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"reading main.c"}}')
+    assert s1 and s1[0].kind == "reasoning" and "reading main.c" in s1[0].text
+    s2 = d.parse_stream_steps('{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"hmm"}}')
+    assert s2 and s2[0].kind == "reasoning" and "hmm" in s2[0].text
+    # assistant message_end → reasoning with the full text
+    s3 = d.parse_stream_steps('{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}')
+    assert s3 and s3[0].kind == "reasoning" and s3[0].text == "done"
+    # a USER message_end is NOT reasoning
+    assert d.parse_stream_steps('{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}') == []
+    # tool_execution_start: bash command / read path surfaced for the deck
+    s4 = d.parse_stream_steps('{"type":"tool_execution_start","toolCallId":"c1","toolName":"bash","args":{"command":"curl x"}}')
+    assert (s4 and s4[0].kind == "tool" and s4[0].tool == "bash"
+            and "curl x" in s4[0].text and s4[0].call_id == "c1")
+    s5 = d.parse_stream_steps('{"type":"tool_execution_start","toolCallId":"c2","toolName":"read","args":{"path":"a.txt"}}')
+    assert s5 and s5[0].kind == "tool" and s5[0].tool == "read" and "a.txt" in s5[0].text
+    # tool_execution_end → tool_result; MCP-shaped result content is unwrapped,
+    # text truncated for the deck but raw kept full for the provenance gate.
+    s6 = d.parse_stream_steps('{"type":"tool_execution_end","toolCallId":"c1","toolName":"bash","result":{"content":[{"type":"text","text":"FOUND_FLAG=flag{tool_out}"}]},"isError":false}')
+    assert (s6 and s6[0].kind == "tool_result"
+            and "FOUND_FLAG=flag{tool_out}" in s6[0].raw
+            and s6[0].call_id == "c1")
+    # isError is honored in the serialized output
+    s7 = d.parse_stream_steps('{"type":"tool_execution_end","toolCallId":"c3","toolName":"bash","result":{"content":[{"type":"text","text":"boom"}]},"isError":true}')
+    assert s7 and s7[0].text.startswith("[error]") and "boom" in s7[0].raw
+    # unknown/extra events and noise are ignored
+    assert d.parse_stream_steps('{"type":"auto_retry_start","attempt":1}') == []
+    assert d.parse_stream_steps('{"type":"turn_start"}') == []
+    assert d.parse_stream_steps("not json") == []
+
+
+def test_pi_hello_ok_requires_assistant_text():
+    d = PiDriver()
+    answer = '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"OK"}]}}'
+    assert d._hello_ok(_CP(0, answer)) is True
+    assert d._hello_ok(_CP(0, '{"type":"agent_end","messages":[]}')) is False
+    assert d._hello_ok(_CP(0, '{"type":"message_end","message":{"role":"assistant","content":[]}}')) is False
+    # post-turn noise flipping the exit code must not false-fail (codex leniency)
+    assert d._hello_ok(_CP(1, answer)) is True
+    assert d._hello_ok(_CP(0, "nothing useful")) is False
+    # a user-only stream never proves a model turn
+    assert d._hello_ok(_CP(0, '{"type":"message_end","message":{"role":"user","content":[]}}')) is False
+
+
+def test_pi_hello_probe_runs_a_real_json_turn(monkeypatch):
+    d = PiDriver()
+    _ = d.bin  # resolve+cache the binary BEFORE we mock run (resolution probes too)
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"] = argv
+        return _CP(0, '{"type":"session","version":3,"id":"s"}\n'
+                      '{"type":"message_end","message":{"role":"assistant",'
+                      '"content":[{"type":"text","text":"OK"}]}}')
+
+    monkeypatch.setattr("muteki.solver.cli_driver.subprocess.run", fake_run)
+    ok, detail = d.health_detail()
+    assert ok is True and detail == ""
+    assert seen["argv"][:4] == [d.bin, "-p", "--mode", "json"]
+    assert d.HELLO_PROMPT in seen["argv"]
+
+
+def test_run_cli_merges_pi_env_extra_under_overlay(monkeypatch, tmp_path):
+    from muteki.solver import cli_driver as mod
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["env"] = kwargs.get("env") or {}
+        return subprocess.CompletedProcess(
+            argv, 0, stdout='{"type":"agent_end","messages":[]}', stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    d = PiDriver()
+    d._bin = "/missing/test-pi"
+    mod.run_cli(d, [d.bin, "-p", "--mode", "json", "GO"],
+                cwd=str(tmp_path), timeout=5, env={"OPENAI_API_KEY": "fake"})
+    assert seen["env"]["PI_OFFLINE"] == "1"
+    assert seen["env"]["PI_SKIP_VERSION_CHECK"] == "1"
+    assert seen["env"]["OPENAI_API_KEY"] == "fake"
+
+
+def test_run_cli_env_extra_yields_to_explicit_overlay(monkeypatch, tmp_path):
+    from muteki.solver import cli_driver as mod
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["env"] = kwargs.get("env") or {}
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    d = OhMyPiDriver()
+    d._bin = "/missing/test-omp"
+    mod.run_cli(d, [d.bin, "-p", "--mode", "json", "GO"],
+                cwd=str(tmp_path), timeout=5, env={"OMP_SKIP_SETUP": "0"})
+    assert seen["env"]["OMP_SKIP_SETUP"] == "0"  # explicit overlay wins
+
+
+
 # ── KB access (optional user-scope MCP; off unless MUTEKI_KB_MCP_NAME is set) ──
 
-def test_claude_no_kb_configured_is_inert():
-    # No MUTEKI_KB_MCP_NAME → KB_TOOL_PREFIX is empty → nothing KB-related ever
-    # appears, even when kb_access is denied. This is the out-of-the-box default.
+def test_claude_kb_off_uses_strict_empty_mcp_config():
+    # Offline mode excludes every inherited MCP server even when no single
+    # MUTEKI_KB_MCP_NAME has been configured.
     d = ClaudeCodeDriver()
     assert d.KB_TOOL_PREFIX == ""  # no KB configured
     argv = d.build_execute("GO", d.new_session(), kb_access=False)
-    assert "--mcp-config" not in argv
-    # denying a non-existent KB adds nothing (only web tools could be denied)
-    assert "mcp__" not in " ".join(argv)
+    assert "--strict-mcp-config" in argv
+    config = argv[argv.index("--mcp-config") + 1]
+    assert config == '{"mcpServers":{}}'
 
 
 def test_claude_kb_inherited_when_configured():
@@ -590,6 +1163,7 @@ def test_claude_kb_off_denies_kb_tools_when_configured():
     d = ClaudeCodeDriver()
     d.KB_TOOL_PREFIX = "mcp__my-kb"  # simulate a configured KB
     argv = d.build_execute("GO", d.new_session(), kb_access=False)
+    assert "--strict-mcp-config" in argv
     assert "--disallowed-tools" in argv
     assert d.KB_TOOL_PREFIX in argv  # the whole configured KB server is denied
 
@@ -606,9 +1180,14 @@ def test_claude_offline_and_kb_off_share_one_deny_flag():
 
 
 def test_registry():
-    assert set(DRIVERS) == {"claude", "codex", "cursor"}
+    assert set(DRIVERS) == {
+        "claude", "codex", "cursor", "pi", "omp", "kimi", "grok",
+        "opencode", "dsh",
+    }
     assert get_driver("claude").name == "claude"
     assert get_driver("cursor").name == "cursor"
+    assert get_driver("pi").name == "pi"
+    assert get_driver("omp").name == "omp"
 
 
 def test_kill_proc_tree_kills_setsid_escaped_orphan_and_reaps():
@@ -737,7 +1316,9 @@ def test_driver_for_codex_endpoint_injects_provider_before_exec(monkeypatch):
         "-c", "model_providers.muteki.env_key=OPENAI_API_KEY",
         "-c", "model=deepseek-chat",
     ]
-    assert argv[exec_idx:exec_idx + 2] == ["exec", "--json"]
+    assert argv[exec_idx] == "exec"
+    assert argv.index("--json") > exec_idx
+    assert 'web_search="disabled"' in argv[exec_idx:]
 
 
 def test_codex_endpoint_health_uses_real_cli_turn(monkeypatch):
@@ -772,6 +1353,57 @@ def test_codex_endpoint_health_uses_real_cli_turn(monkeypatch):
     assert "namespace" in detail
 
 
+def test_claude_endpoint_health_never_places_api_key_in_subprocess_argv(monkeypatch):
+    secret = "sk-health-argv-secret"
+    drv = driver_for({
+        "name": "deepseek-claude",
+        "engine": "claude",
+        "transport": "claude_cli",
+        "credential_mode": "api",
+        "base_url": "https://api.deepseek.example/anthropic",
+        "api_key_ref": "env:DEEPSEEK_API_KEY",
+        "model": "deepseek-chat",
+    })
+    seen = {}
+
+    def fake_subprocess(argv, **kwargs):
+        assert secret not in "\0".join(str(arg) for arg in argv)
+        seen["argv"] = argv
+        seen["env"] = kwargs.get("env") or {}
+        return _CP(0, '{"result":"OK"}', "")
+
+    monkeypatch.setattr(
+        "muteki.solver.cli_driver.subprocess.run", fake_subprocess)
+    ok, detail = drv.health_detail(env={"DEEPSEEK_API_KEY": secret})
+
+    assert ok is True and detail == ""
+    assert seen["env"]["ANTHROPIC_API_KEY"] == secret
+    assert seen["env"]["ANTHROPIC_BASE_URL"] == (
+        "https://api.deepseek.example/anthropic")
+    assert any("Reply with exactly: OK" in str(arg) for arg in seen["argv"])
+
+
+def test_endpoint_health_error_never_echoes_secret_response_body(monkeypatch):
+    secret = "sk-reflected-health-secret"
+    drv = driver_for({
+        "name": "claude-api", "engine": "claude",
+        "transport": "claude_cli", "credential_mode": "api",
+        "base_url": "https://proxy.invalid",
+        "api_key_ref": "env:PROXY_KEY",
+    })
+
+    monkeypatch.setattr(
+        "muteki.solver.cli_driver.subprocess.run",
+        lambda argv, **_kwargs: _CP(
+            1, "", f"HTTP 401 mirrored x-api-key: {secret}"))
+    monkeypatch.setattr("muteki.solver.cli_driver.time.sleep", lambda *_: None)
+    ok, detail = drv.health_detail(env={"PROXY_KEY": secret})
+
+    assert ok is False
+    assert "HTTP 401" in detail
+    assert secret not in detail
+
+
 def test_driver_for_codex_keyed_profile_without_endpoint_still_injects_model(monkeypatch):
     monkeypatch.setenv("MUTEKI_CODEX_BIN", "/usr/bin/codex")
     drv = driver_for({
@@ -784,17 +1416,19 @@ def test_driver_for_codex_keyed_profile_without_endpoint_still_injects_model(mon
 
     argv = drv.build_execute("PROMPT", None, web_access=False)
 
-    assert "-c" not in argv
+    assert not any("model_provider=" in arg for arg in argv)
+    assert 'web_search="disabled"' in argv
     assert "--model" in argv
     assert argv[argv.index("--model") + 1] == "gpt-5.4"
 
 
-def test_driver_for_claude_endpoint_healthcheck_posts_messages(monkeypatch):
+def test_driver_for_claude_endpoint_healthcheck_runs_real_cli(monkeypatch):
     seen = {}
 
     def fake_run(argv, **kwargs):
         seen["argv"] = argv
-        return subprocess.CompletedProcess(argv, 0, "{}", "")
+        seen["env"] = kwargs.get("env") or {}
+        return _CP(0, '{"result":"OK"}', "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     monkeypatch.setenv("CLAUDE_ENDPOINT_TOKEN", "secret")
@@ -808,8 +1442,9 @@ def test_driver_for_claude_endpoint_healthcheck_posts_messages(monkeypatch):
     })
 
     assert drv.healthcheck() is True
-    assert "https://anthropic-proxy.example/v1/messages" in seen["argv"]
-    assert any(str(x).startswith("x-api-key: ") for x in seen["argv"])
+    assert any("Reply with exactly: OK" in str(arg) for arg in seen["argv"])
+    assert seen["env"]["ANTHROPIC_BASE_URL"] == "https://anthropic-proxy.example"
+    assert seen["env"]["ANTHROPIC_API_KEY"] == "secret"
 
 
 def test_endpoint_healthcheck_resolves_file_backed_key(monkeypatch, tmp_path):
@@ -1055,6 +1690,22 @@ def test_cli_solver_offline_flag_threads_through():
     assert "--disallowed-tools" in argv
 
 
+def test_protocol2_canary_prompt_is_neutral_and_has_no_legacy_team_protocol():
+    ch = Challenge(
+        id="neutral", name="neutral fixture", category="misc",
+        description="Read fixture.txt and return its token.",
+        flag_format=r"flag\{[a-z0-9_]+\}")
+    solver = _cli_solver(ch, web_access=False, kb=False)
+    solver._protocol2_mode = True
+    solver._staged_files = ["fixture.txt"]
+    prompt = solver._build_prompt()
+    assert "neutral local runtime conformance check" in prompt
+    assert "expert CTF solver" not in prompt
+    assert "Share findings with your team" not in prompt
+    assert "blackboard skill" not in prompt
+    assert "submit-flag '<token>'" in prompt
+
+
 def test_cli_solver_kb_off_by_default_when_no_kb_configured():
     # Out of the box (no MUTEKI_KB_MCP_NAME) the KB is inert regardless of kb=...:
     # self.kb is False and the prompt teaches no KB tool.
@@ -1167,12 +1818,491 @@ def test_launder_does_not_reject_genuine_flag_mentioning_path():
     # a forensics challenge whose artifact string mentions shared_graph.db, flag found
     forensic = ("strings dump mentions a file named shared_graph.db in the pcap\n"
                 "but the actual flag decoded from the payload is flag{from_pcap}\n")
-    # NOTE: this transcript DOES contain a read verb ("strings") — but it's reading the
-    # CHALLENGE artifact, not internal storage. This is the residual edge the report
-    # flags as acceptable (a read verb + an internal filename mention together is rare
-    # in a genuine solve); we keep the conservative reject here to preserve the
-    # run-11551 catch. Document the trade-off rather than weaken the steal defense.
+    # Within one execution, the conservative read+internal-name combination remains a
+    # rejection. The record-boundary regression below only prevents unrelated tools
+    # from contributing one half of that signature each.
     assert s._flag_ok("flag{from_pcap}", forensic) is False
+
+
+def test_launder_signals_do_not_cross_tool_record_boundaries_round15():
+    """Round-15 F: a board read in one tool must not poison a later real extraction.
+
+    The old flattened corpus joined ``read`` from one output with
+    ``shared_graph.db`` from another and rejected a CRC-derived flag that appeared in
+    genuine command output. Each ambiguous signature now has to occur within the same
+    command+output execution record.
+    """
+    ch = Challenge(id="t", name="t", category="forensics",
+                   flag_format=r"flag\{.*?\}")
+    s = _cli_solver(ch)
+    s._persist_raw_tool_output(
+        "Loaded teammate notes for the next step.\n",
+        command="python /usr/local/bin/blackboard.py read")
+    s._persist_raw_tool_output(
+        "Workspace graph is /workspace/graph/shared_graph.db\n",
+        command="pwd")
+    recovered = "Flag: flag{crc_recovered}\nFOUND_FLAG=flag{crc_recovered}\n"
+    s._persist_raw_tool_output(recovered, command="python decode_crc.py Evidence.zip")
+
+    assert s._flag_ok("flag{crc_recovered}", s._provenance_corpus()) is True
+
+
+def test_launder_command_and_output_share_one_tool_record():
+    """A real steal stays blocked when the read verb is in the command and the
+    internal-storage filename is printed in that same execution's output."""
+    ch = Challenge(id="t", name="t", category="forensics",
+                   flag_format=r"flag\{.*?\}")
+    s = _cli_solver(ch)
+    output = ("opened /workspace/graph/shared_graph.db\n"
+              "FOUND_FLAG=flag{stolen}\n")
+    s._persist_raw_tool_output(output, command="python helper.py read")
+
+    assert s._flag_ok("flag{stolen}", s._provenance_corpus()) is False
+
+
+def test_launder_unrelated_record_does_not_poison_flag_evidence():
+    ch = Challenge(id="t", name="t", category="forensics",
+                   flag_format=r"flag\{.*?\}")
+    s = _cli_solver(ch)
+    s._persist_raw_tool_output(
+        "opened /workspace/graph/shared_graph.db\n",
+        command="python helper.py read")
+    recovered = "FOUND_FLAG=flag{clean_later}\n"
+    s._persist_raw_tool_output(recovered, command="python decode.py")
+
+    assert s._flag_ok("flag{clean_later}", s._provenance_corpus()) is True
+
+
+def test_live_duplicate_output_uses_newest_execution_identity():
+    ch = Challenge(id="t", name="t", category="forensics",
+                   flag_format=r"flag\{.*?\}")
+    s = _cli_solver(ch)
+    duplicated = "FOUND_FLAG=flag{same_output}\n"
+    s._persist_raw_tool_output(
+        duplicated, command="python helper.py read shared_graph.db")
+    s._persist_raw_tool_output(duplicated, command="python decode.py Evidence.zip")
+
+    assert s._flag_ok("flag{same_output}", duplicated) is True
+
+
+def test_emit_step_pairs_interleaved_tool_results_by_call_id():
+    from muteki.solver.cli_driver import StreamStep
+
+    ch = Challenge(id="t", name="t", category="forensics",
+                   flag_format=r"flag\{.*?\}")
+    s = _cli_solver(ch)
+    asyncio.run(s._emit_step(StreamStep(
+        "tool", text="python helper.py read shared_graph.db", call_id="tainted")))
+    asyncio.run(s._emit_step(StreamStep(
+        "tool", text="python decode.py Evidence.zip", call_id="clean")))
+    real = "FOUND_FLAG=flag{interleaved_clean}\n"
+    asyncio.run(s._emit_step(StreamStep(
+        "tool_result", text=real, raw=real, call_id="clean")))
+    asyncio.run(s._emit_step(StreamStep(
+        "tool_result", text="no candidate\n", raw="no candidate\n",
+        call_id="tainted")))
+
+    _submit_captured_flags(s)
+    assert s._already_found == {"flag{interleaved_clean}"}
+    assert s._raw_tool_commands == [
+        "python decode.py Evidence.zip",
+        "python helper.py read shared_graph.db",
+    ]
+
+
+def test_emit_step_mixed_call_ids_fall_back_to_oldest_pending_tool():
+    from muteki.solver.cli_driver import StreamStep
+
+    ch = Challenge(id="t", name="t", category="forensics",
+                   flag_format=r"flag\{.*?\}")
+    s = _cli_solver(ch)
+    asyncio.run(s._emit_step(StreamStep(
+        "tool", text="python helper.py read shared_graph.db", call_id="started-id")))
+    claimed = "FOUND_FLAG=flag{mixed_id_stolen}\n"
+    asyncio.run(s._emit_step(StreamStep(
+        "tool_result", text=claimed, raw=claimed)))
+
+    assert s._already_found == set()
+    assert s._raw_tool_commands == ["python helper.py read shared_graph.db"]
+
+
+def test_emit_step_empty_result_consumes_pending_tool_call():
+    from muteki.solver.cli_driver import StreamStep
+
+    ch = Challenge(id="t", name="t", category="forensics",
+                   flag_format=r"flag\{.*?\}")
+    s = _cli_solver(ch)
+    asyncio.run(s._emit_step(StreamStep(
+        "tool", text="python helper.py read shared_graph.db", call_id="empty")))
+    asyncio.run(s._emit_step(StreamStep("tool_result", call_id="empty")))
+    asyncio.run(s._emit_step(StreamStep(
+        "tool", text="python decode.py Evidence.zip")))
+    recovered = "FOUND_FLAG=flag{after_empty_result}\n"
+    asyncio.run(s._emit_step(StreamStep(
+        "tool_result", text=recovered, raw=recovered)))
+
+    _submit_captured_flags(s)
+    assert s._already_found == {"flag{after_empty_result}"}
+    assert s._raw_tool_commands == ["python decode.py Evidence.zip"]
+
+
+def test_emit_step_unknown_result_id_is_unattributed_and_fail_closed():
+    from muteki.solver.cli_driver import StreamStep
+
+    ch = Challenge(id="t", name="t", category="forensics",
+                   flag_format=r"flag\{.*?\}")
+    bus = _CaptureBus()
+    s = _cli_solver(ch, bus=bus)
+    stale_command = "python helper.py read shared_graph.db"
+    asyncio.run(s._emit_step(StreamStep(
+        "tool", text=stale_command, call_id="stale")))
+    recovered = "FOUND_FLAG=flag{clean_unknown_id}\n"
+    asyncio.run(s._emit_step(StreamStep(
+        "tool_result", text=recovered, raw=recovered, call_id="different")))
+
+    assert s._already_found == set()
+    assert s._raw_tool_outputs == [recovered]
+    assert s._raw_tool_commands == [""]
+    assert s._raw_tool_attributed == [False]
+    assert s._provenance_corpus() == ""
+    assert s._flag_ok("flag{clean_unknown_id}", recovered) is False
+    assert s._pending_tool_calls == [("stale", stale_command)]
+    unverified = [
+        event for event in bus.events
+        if (event.event_type is EventType.BLACKBOARD_DELTA
+            and event.payload.get("kind") == "flag_unverified")
+    ]
+    assert len(unverified) == 1
+    assert "unattributed" in unverified[0].payload["reason"]
+
+
+def test_emit_step_unknown_result_keeps_pending_for_later_exact_match():
+    from muteki.solver.cli_driver import StreamStep
+
+    ch = Challenge(id="t", name="t", category="forensics",
+                   flag_format=r"flag\{.*?\}")
+    s = _cli_solver(ch)
+    command = "python decode.py Evidence.zip"
+    asyncio.run(s._emit_step(StreamStep(
+        "tool", text=command, call_id="known")))
+    unknown = "FOUND_FLAG=flag{unknown_rejected}\n"
+    asyncio.run(s._emit_step(StreamStep(
+        "tool_result", text=unknown, raw=unknown, call_id="other")))
+    known = "FOUND_FLAG=flag{known_accepted}\n"
+    asyncio.run(s._emit_step(StreamStep(
+        "tool_result", text=known, raw=known, call_id="known")))
+
+    _submit_captured_flags(s)
+    assert s._already_found == {"flag{known_accepted}"}
+    assert s._raw_tool_outputs == [unknown, known]
+    assert s._raw_tool_commands == ["", command]
+    assert s._raw_tool_attributed == [False, True]
+    assert s._pending_tool_calls == []
+    assert "flag{unknown_rejected}" not in s._provenance_corpus()
+    assert "flag{known_accepted}" in s._provenance_corpus()
+
+
+def test_run_streaming_serializes_attribution_across_slow_sink(monkeypatch, tmp_path):
+    from muteki.core.event_bus import EventBus
+    from muteki.solver import cli_solver as mod
+    from muteki.solver.cli_driver import CliResult, StreamStep
+
+    bus = EventBus()
+
+    async def slow_sink(event):
+        if event.event_type is EventType.TOOL_CALL_START:
+            await asyncio.sleep(0.02)
+
+    bus.add_sink(slow_sink)
+    ch = Challenge(id="t", name="t", category="forensics",
+                   flag_format=r"flag\{.*?\}")
+    s = _cli_solver(ch, bus=bus)
+
+    def fake_stream(*args, on_step, **kwargs):
+        on_step(StreamStep(
+            "tool", text="python helper.py read shared_graph.db", call_id="old"))
+        on_step(StreamStep("tool_result", call_id="old"))
+        on_step(StreamStep("tool", text="python decode.py Evidence.zip"))
+        on_step(StreamStep(
+            "tool_result", text="decoded\n", raw="decoded\n"))
+        return CliResult(text="decoded\n")
+
+    monkeypatch.setattr(mod, "run_cli_streaming", fake_stream)
+    asyncio.run(s._run_streaming(
+        ["true"], cwd=str(tmp_path), timeout=5, argv_is_final=True))
+
+    assert s._raw_tool_outputs == ["decoded\n"]
+    assert s._raw_tool_commands == ["python decode.py Evidence.zip"]
+    assert s._raw_tool_attributed == [True]
+    assert s._pending_tool_calls == []
+
+
+def test_protocol2_capture_failure_keeps_local_provenance_and_call_pending():
+    ch = Challenge(id="t", name="t", category="forensics",
+                   flag_format=r"flag\{.*?\}")
+    s = _cli_solver(ch)
+    s._protocol2_mode = True
+    s._protocol2_capture_callback = lambda _raw: (_ for _ in ()).throw(
+        RuntimeError("capture failed"))
+
+    async def drive():
+        await s._emit_step(StreamStep(
+            "tool", text="python solve.py", call_id="p2-call"))
+        with pytest.raises(RuntimeError, match="capture failed"):
+            await s._emit_step(StreamStep(
+                "tool_result", text="FOUND_FLAG=flag{unsealed}\n",
+                raw="FOUND_FLAG=flag{unsealed}\n", call_id="p2-call"))
+
+    asyncio.run(drive())
+
+    assert s._raw_tool_outputs == []
+    assert s._raw_tool_commands == []
+    assert s._raw_tool_attributed == []
+    assert s._raw_tool_capture_receipts == []
+    assert s._raw_tool_outputs_chars == 0
+    assert s._pending_tool_calls == [("p2-call", "python solve.py")]
+    assert s._already_found == set()
+
+
+def test_protocol2_capture_receipt_must_match_exact_raw_digest():
+    s = _cli_solver(Challenge(id="t", name="t", category="forensics"))
+    s._protocol2_mode = True
+    s._protocol2_capture_callback = lambda _raw: "not-the-raw-digest"
+
+    with pytest.raises(RuntimeError, match="Protocol2CaptureReceiptMismatch"):
+        s._persist_raw_tool_output("decoded\n", command="python solve.py")
+
+    assert s._raw_tool_outputs == []
+    assert s._raw_tool_capture_receipts == []
+
+
+def test_protocol2_capture_commits_receipt_with_local_provenance():
+    raw = "decoded\n"
+    digest = __import__("hashlib").sha256(raw.encode()).hexdigest()
+    s = _cli_solver(Challenge(id="t", name="t", category="forensics"))
+    s._protocol2_mode = True
+
+    def capture(value):
+        assert value == raw
+        assert s._raw_tool_outputs == []
+        return digest
+
+    s._protocol2_capture_callback = capture
+    assert s._persist_raw_tool_output(raw, command="python solve.py") == digest
+    assert s._raw_tool_outputs == [raw]
+    assert s._raw_tool_capture_receipts == [digest]
+
+
+def test_protocol2_run_streaming_cleans_up_before_capture_failure(
+    monkeypatch, tmp_path,
+):
+    from muteki.solver import cli_solver as mod
+
+    s = _cli_solver(Challenge(
+        id="t", name="t", category="forensics", flag_format=r"flag\{.*?\}"))
+    s._protocol2_mode = True
+    s._protocol2_capture_callback = lambda _raw: (_ for _ in ()).throw(
+        RuntimeError("capture failed"))
+
+    def fake_stream(*args, on_step, **kwargs):
+        on_step(StreamStep(
+            "tool", text="python solve.py", call_id="p2-call"))
+        on_step(StreamStep(
+            "tool_result", text="FOUND_FLAG=flag{unsealed}\n",
+            raw="FOUND_FLAG=flag{unsealed}\n", call_id="p2-call"))
+        return CliResult(text="done")
+
+    monkeypatch.setattr(mod, "run_cli_streaming", fake_stream)
+
+    with pytest.raises(RuntimeError, match="Protocol2CaptureOrIngressFailed"):
+        asyncio.run(s._run_streaming(
+            ["true"], cwd=str(tmp_path), timeout=5, argv_is_final=True))
+
+    assert s._turn_active is False
+    assert s._current_workdir is None
+    assert s._raw_tool_outputs == []
+    assert s._pending_tool_calls == [("p2-call", "python solve.py")]
+
+
+def test_run_streaming_retires_loop_owned_control_monitor(monkeypatch, tmp_path):
+    from muteki.solver import cli_solver as mod
+
+    ch = Challenge(id="t", name="t", category="forensics")
+    s = _cli_solver(ch)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    mutations = []
+
+    async def delayed_drain():
+        started.set()
+        await release.wait()
+        mutations.append("late-monitor")
+
+    s._drain_control_async = delayed_drain
+
+    def fake_stream(*args, **kwargs):
+        time.sleep(0.02)
+        return CliResult(text="done")
+
+    monkeypatch.setattr(mod, "run_cli_streaming", fake_stream)
+
+    async def drive():
+        result = await s._run_streaming(
+            ["true"], cwd=str(tmp_path), timeout=5, argv_is_final=True)
+        assert result.text == "done"
+        assert started.is_set()
+        release.set()
+        await asyncio.sleep(0.05)
+        assert mutations == []
+
+    asyncio.run(drive())
+
+
+def test_run_streaming_cancellation_retires_step_callbacks(monkeypatch, tmp_path):
+    from muteki.core.event_bus import EventBus
+    from muteki.solver import cli_solver as mod
+    from muteki.solver.cli_driver import CliResult, StreamStep
+
+    bus = EventBus()
+
+    async def slow_sink(event):
+        if event.event_type is EventType.TOOL_CALL_START:
+            await asyncio.sleep(0.1)
+
+    bus.add_sink(slow_sink)
+    ch = Challenge(id="t", name="t", category="forensics",
+                   flag_format=r"flag\{.*?\}")
+    s = _cli_solver(ch, bus=bus)
+
+    def fake_stream(*args, on_step, cancel_event, **kwargs):
+        on_step(StreamStep("tool", text="python solve.py", call_id="late"))
+        output = "FOUND_FLAG=flag{must_not_arrive_after_cancel}\n"
+        on_step(StreamStep(
+            "tool_result", text=output, raw=output, call_id="late"))
+        cancel_event.wait(1)
+        return CliResult(text=output, cancelled=True)
+
+    monkeypatch.setattr(mod, "run_cli_streaming", fake_stream)
+
+    async def drive():
+        task = asyncio.create_task(s._run_streaming(
+            ["true"], cwd=str(tmp_path), timeout=5, argv_is_final=True))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert s._raw_tool_outputs == []
+        assert s._already_found == set()
+        await asyncio.sleep(0.2)
+        assert s._raw_tool_outputs == []
+        assert s._already_found == set()
+
+    asyncio.run(drive())
+
+
+def test_run_streaming_post_return_repeated_cancel_waits_for_teardown(
+    monkeypatch, tmp_path,
+):
+    from muteki.solver import cli_solver as mod
+
+    s = _cli_solver(Challenge(id="t", name="t", category="forensics"))
+    callback_started = asyncio.Event()
+    first_callback_cancel = asyncio.Event()
+    second_callback_cancel = asyncio.Event()
+    late_mutations = []
+
+    async def stubborn_emit(_step):
+        callback_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            first_callback_cancel.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            second_callback_cancel.set()
+        late_mutations.append("retired")
+
+    s._emit_step = stubborn_emit
+
+    def fake_stream(*args, on_step, **kwargs):
+        on_step(StreamStep("tool", text="python solve.py", call_id="late"))
+        return CliResult(text="done")
+
+    monkeypatch.setattr(mod, "run_cli_streaming", fake_stream)
+
+    async def drive():
+        task = asyncio.create_task(s._run_streaming(
+            ["true"], cwd=str(tmp_path), timeout=5, argv_is_final=True))
+        await asyncio.wait_for(callback_started.wait(), timeout=1)
+        # _turn_active becomes false only after the blocking runner returned normally;
+        # the callback keeps the independently owned retirement task pending.
+        while s._turn_active:
+            await asyncio.sleep(0)
+        assert not task.done()
+
+        task.cancel("first")
+        await asyncio.wait_for(first_callback_cancel.wait(), timeout=1)
+        assert not task.done()
+        task.cancel("second")
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await asyncio.wait_for(task, timeout=1)
+
+        assert caught.value.args == ("first",)
+        assert second_callback_cancel.is_set()
+        assert late_mutations == ["retired"]
+        assert s._turn_active is False
+        assert s._current_workdir is None
+        await asyncio.sleep(0)
+        assert not any(
+            not candidate.done()
+            and getattr(candidate.get_coro(), "__qualname__", "").endswith(
+                ("emit_in_order", "_monitor", "_heartbeat", "retire_turn"))
+            for candidate in asyncio.all_tasks()
+            if candidate is not asyncio.current_task()
+        )
+
+    asyncio.run(drive())
+
+
+def test_run_streaming_caller_cancel_wins_protocol2_step_failure(
+    monkeypatch, tmp_path,
+):
+    from muteki.solver import cli_solver as mod
+
+    s = _cli_solver(Challenge(id="t", name="t", category="forensics"))
+    s._protocol2_mode = True
+    callback_started = asyncio.Event()
+
+    async def fail_when_cancelled(_step):
+        callback_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise RuntimeError("delayed protocol2 failure")
+
+    s._emit_step = fail_when_cancelled
+
+    def fake_stream(*args, on_step, **kwargs):
+        on_step(StreamStep("tool", text="python solve.py", call_id="p2"))
+        return CliResult(text="done")
+
+    monkeypatch.setattr(mod, "run_cli_streaming", fake_stream)
+
+    async def drive():
+        task = asyncio.create_task(s._run_streaming(
+            ["true"], cwd=str(tmp_path), timeout=5, argv_is_final=True))
+        await asyncio.wait_for(callback_started.wait(), timeout=1)
+        while s._turn_active:
+            await asyncio.sleep(0)
+        task.cancel("caller wins")
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await asyncio.wait_for(task, timeout=1)
+        assert caught.value.args == ("caller wins",)
+        assert s._turn_active is False
+        assert s._current_workdir is None
+
+    asyncio.run(drive())
 
 
 # ── multi-flag worker layer (Phase 2) ────────────────────────────────────────
@@ -1194,6 +2324,7 @@ def test_extract_flags_empty_when_no_markers():
 
 def test_accept_flag_dedups_against_already_found():
     s = _cli_solver(Challenge(id="t", name="t", category="web"))
+    s._validated_flag_submissions.update({"flag{a}", "flag{b}"})
     # first accept is new; the same flag again is a no-op (no double broadcast)
     assert asyncio.run(s._accept_flag("flag{a}")) is True
     assert asyncio.run(s._accept_flag("flag{a}")) is False
@@ -1211,6 +2342,143 @@ def test_accept_flag_dedups_against_already_found():
 def _flag_solver():
     ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
     return _cli_solver(ch, bus=_CaptureBus())
+
+
+def _submit_captured_flags(solver) -> list[str]:
+    """Model a validated submit-flag call after real output was captured.
+
+    Most tests in this section isolate stream attribution and provenance without
+    creating a SQLite graph. The Blackboard event/decision path has dedicated
+    integration tests below; this helper applies the same final authority bit.
+    """
+    provenance = solver._provenance_corpus()
+    candidates = [
+        *solver._extract_flags(provenance),
+        *solver._poc_flag_literals(provenance),
+    ]
+    accepted: list[str] = []
+
+    async def drive() -> None:
+        for flag in dict.fromkeys(candidates):
+            if flag in solver._already_found:
+                continue
+            if not solver._flag_ok(flag, provenance):
+                continue
+            solver._validated_flag_submissions.add(flag)
+            if await solver._accept_flag(flag):
+                solver._stream_accepted.append(flag)
+                accepted.append(flag)
+
+    asyncio.run(drive())
+    return accepted
+
+
+def _emit_attributed_tool_result(
+    solver, raw: str, *, command: str = "python solve.py",
+    text: "str | None" = None, call_id: str = "test-call",
+    submit: bool = True,
+) -> None:
+    from muteki.solver.cli_driver import StreamStep
+
+    async def drive():
+        await solver._emit_step(StreamStep(
+            "tool", text=command, call_id=call_id))
+        await solver._emit_step(StreamStep(
+            "tool_result", text=raw if text is None else text,
+            raw=raw, call_id=call_id))
+
+    asyncio.run(drive())
+    if submit:
+        _submit_captured_flags(solver)
+
+
+def test_reasoning_replay_ignores_incremental_suffix():
+    assert cli_solver._is_reasoning_replay("The answer is 42", "2") is False
+    assert cli_solver._is_reasoning_replay("The answer is 42", "42") is False
+    assert cli_solver._is_reasoning_replay("aa", "a") is False
+    assert cli_solver._is_reasoning_replay("The answer is 42", "The answer is 42") is True
+    assert cli_solver._is_reasoning_replay("The", "The answer is 42") is True
+    assert cli_solver._is_reasoning_replay("", "The") is False
+
+
+def test_emit_step_forwards_suffix_token_then_seals_full_snapshot():
+    from muteki.core.event_bus import EventBus
+    from muteki.solver.cli_driver import StreamStep
+
+    bus = EventBus()
+    seen: list = []
+
+    async def sink(ev):
+        seen.append(ev)
+
+    bus.add_sink(sink)
+    ch = Challenge(id="t", name="t", category="misc", flag_format=r"flag\{.*?\}")
+    s = _cli_solver(ch, bus=bus)
+
+    async def drive():
+        await s._emit_step(StreamStep("reasoning", text="The answer is 4"))
+        await s._emit_step(StreamStep("reasoning", text="2"))
+        await s._emit_step(StreamStep("reasoning", text="The answer is 42"))
+
+    asyncio.run(drive())
+    reasoning = [
+        ev for ev in seen if ev.event_type is EventType.REASONING_DELTA
+    ]
+    assert [ev.payload.get("text") for ev in reasoning] == [
+        "The answer is 4", "2", "",
+    ]
+    assert reasoning[2].payload.get("turn_end") is True
+    assert s._reasoning_turn_acc == ""
+
+
+def test_pi_parse_marks_thinking_delta():
+    from muteki.solver.cli_driver import PiDriver
+
+    d = PiDriver()
+    thinking = d.parse_stream_steps(
+        '{"type":"message_update","assistantMessageEvent":'
+        '{"type":"thinking_delta","delta":"pondering"}}')
+    assert thinking and thinking[0].kind == "reasoning"
+    assert thinking[0].thinking is True
+    answer = d.parse_stream_steps(
+        '{"type":"message_update","assistantMessageEvent":'
+        '{"type":"text_delta","delta":"the answer"}}')
+    assert answer and answer[0].thinking is False
+
+
+def test_emit_step_thinking_not_accumulated_then_answer_snapshot_seals():
+    """Pi/OMP message_end repeats ONLY the answer text. With thinking mixed
+    into the replay accumulator that snapshot is an unsealable suffix and the
+    answer would be appended twice; thinking must display but not accumulate."""
+    from muteki.core.event_bus import EventBus
+    from muteki.solver.cli_driver import StreamStep
+
+    bus = EventBus()
+    seen: list = []
+
+    async def sink(ev):
+        seen.append(ev)
+
+    bus.add_sink(sink)
+    ch = Challenge(id="t", name="t", category="misc", flag_format=r"flag\{.*?\}")
+    s = _cli_solver(ch, bus=bus)
+
+    async def drive():
+        await s._emit_step(
+            StreamStep("reasoning", text="let me think ", thinking=True))
+        await s._emit_step(StreamStep("reasoning", text="OK"))
+        # message_end snapshot: answer-only, thinking excluded.
+        await s._emit_step(StreamStep("reasoning", text="OK"))
+
+    asyncio.run(drive())
+    reasoning = [
+        ev for ev in seen if ev.event_type is EventType.REASONING_DELTA
+    ]
+    assert [ev.payload.get("text") for ev in reasoning] == [
+        "let me think ", "OK", "",
+    ]
+    assert reasoning[2].payload.get("turn_end") is True
+    assert s._reasoning_turn_acc == ""
 
 
 def test_reasoning_only_flag_is_rejected_run75379():
@@ -1237,9 +2505,105 @@ def test_tool_result_flag_in_real_output_is_accepted_run75379():
     from muteki.solver.cli_driver import StreamStep
     s = _flag_solver()
     real = "root@dc:~# type flag.txt\nFOUND_FLAG=flag{real-from-output}\n"
-    asyncio.run(s._emit_step(StreamStep("tool_result", text=real, raw=real)))
+    _emit_attributed_tool_result(s, real, command="type flag.txt")
     assert s._already_found == {"flag{real-from-output}"}
     assert s._stream_accepted == ["flag{real-from-output}"]
+
+
+def test_materialized_operator_secret_is_redacted_from_events_graph_and_artifacts(
+        tmp_path):
+    from muteki.solver.cli_driver import StreamStep
+    from muteki.solver.result import ArtifactStore
+
+    secret = "p4ss-EXACT-9988776655"
+    bus = _CaptureBus()
+    artifacts = ArtifactStore(root=tmp_path / "secret-redaction-artifacts")
+    ch = Challenge(id="secret-redaction", name="secret", category="web")
+    solver = CliSolver(
+        None, ch, bus=bus, artifacts=artifacts,
+        driver=_StubDriver(""), engine="claude", kb=False)
+    solver._control_secret_values = [secret]
+    reasoning = f"VERIFIED_FACT=credential {secret} authenticated"
+    tool_output = (
+        f"curl -H 'Authorization: Bearer {secret}' /admin\n"
+        f"DEADEND=token {secret} was rejected on legacy endpoint\n")
+
+    asyncio.run(solver._emit_step(StreamStep("reasoning", text=reasoning)))
+    _emit_attributed_tool_result(
+        solver, tool_output, command="curl -H '<secret>' /admin")
+
+    event_dump = json.dumps(
+        [event.model_dump(mode="json") for event in bus.events],
+        ensure_ascii=False, default=str)
+    graph_dump = solver.graph.model_dump_json()
+    artifact_dump = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in artifacts.root.glob("*") if path.is_file())
+    assert secret not in event_dump
+    assert secret not in graph_dump
+    assert secret not in artifact_dump
+    assert "<REDACTED_OPERATOR_SECRET>" in event_dump
+    # Raw execution provenance remains in memory for the hard flag gate only.
+    assert secret in solver._provenance_corpus()
+
+
+def test_secret_redactor_survives_wrapper_account_release_for_late_steps(
+        tmp_path):
+    from muteki.solver.cli_driver import StreamStep
+    from muteki.solver.result import ArtifactStore
+    from muteki.swarm.swarm import Swarm
+    from muteki.core.llm import ModelSpec
+    from muteki.sandbox.manager import SandboxManager
+
+    secret = "late-secret-112233445566"
+    bus = _CaptureBus()
+    challenge = Challenge(id="late-secret", name="late", category="web")
+    solver = CliSolver(
+        None, challenge, bus=bus,
+        artifacts=ArtifactStore(root=tmp_path / "late-secret-artifacts"),
+        driver=_StubDriver(""), engine="claude", kb=False)
+    solver._control_secret_values = [secret]
+    swarm = Swarm(
+        challenge, [ModelSpec(solver_id="seat", model="mock")],
+        llm=None,
+        sandbox=SandboxManager(root=tmp_path / "late-secret-sbx"),
+        artifacts=solver.artifacts)
+    swarm._release_worker_account(solver)
+    asyncio.run(solver._emit_step(StreamStep(
+        "reasoning", text=f"late callback echoed {secret}")))
+    dump = json.dumps(
+        [event.model_dump(mode="json") for event in bus.events], default=str)
+    assert secret not in dump
+    assert solver._control_secret_values == [secret]
+
+
+def test_secret_redactor_covers_short_parsed_credential_components():
+    solver = CliSolver(
+        None, Challenge(id="short-secret", name="short", category="web"),
+        driver=_StubDriver(""), engine="claude", kb=False)
+    solver._control_secret_values = ["password=abc", "ssh://u:p@host.invalid"]
+
+    redacted = solver._redact_control_secrets("worker echoed abc and p exactly")
+
+    assert " abc " not in redacted
+    assert " p " not in redacted
+    assert redacted.count("<REDACTED_OPERATOR_SECRET>") == 2
+
+
+def test_secret_redactor_short_exact_decision_tokens_preserve_telemetry():
+    solver = CliSolver(
+        None, Challenge(id="short-answer", name="short", category="web"),
+        driver=_StubDriver(""), engine="claude", kb=False)
+    solver._control_secret_values = ["A", "1"]
+
+    redacted = solver._redact_control_secrets(
+        "answer A accepted; worker ACTIVE; phase 1 complete; phase 10 pending")
+
+    assert "answer A accepted" not in redacted
+    assert "phase 1 complete" not in redacted
+    assert "worker ACTIVE" in redacted
+    assert "phase 10 pending" in redacted
+    assert redacted.count("<REDACTED_OPERATOR_SECRET>") == 2
 
 
 def test_flag_past_char_600_still_accepted_via_untruncated_raw_run75379():
@@ -1255,7 +2619,8 @@ def test_flag_past_char_600_still_accepted_via_untruncated_raw_run75379():
     step = StreamStep("tool_result", text=full[:600], raw=full)
     assert flag not in step.text          # truncated chunk genuinely lacks the flag
     assert flag in step.raw               # but the raw output carries it
-    asyncio.run(s._emit_step(step))
+    _emit_attributed_tool_result(
+        s, full, text=step.text, command="python recover.py")
     assert s._already_found == {flag}     # accepted because the gate saw raw
 
 
@@ -1270,7 +2635,8 @@ def test_nested_ssh_remote_stdout_flag_accepted_when_captured_run75379():
     # the outer ssh command's captured output = the remote host's stdout.
     remote = (f"root@workstation:~# ssh root@10.0.0.6 'cat /root/flag.txt'\n"
               f"{flag}\nFOUND_FLAG={flag}\n")
-    asyncio.run(s._emit_step(StreamStep("tool_result", text=remote, raw=remote)))
+    _emit_attributed_tool_result(
+        s, remote, command="ssh root@10.0.0.6 'cat /root/flag.txt'")
     assert s._already_found == {flag}
 
 
@@ -1296,7 +2662,7 @@ def test_stream_markers_extracts_and_gates_from_flag_provenance():
     # (e.g. the marker landed past the 600-char truncation point).
     display = "...output truncated for the deck..."
     raw = "the command printed FOUND_FLAG=flag{from-raw} to stdout\n"
-    asyncio.run(s._stream_markers(display, flag_provenance=raw))
+    _emit_attributed_tool_result(s, raw, text=display)
     assert s._already_found == {"flag{from-raw}"}
 
     # and a marker whose value is corroborated by a launder signature is rejected: a
@@ -1323,11 +2689,88 @@ def test_surface_unverified_flags_emits_for_untraceable_claim_run75379():
     assert unv[0].payload.get("reason")   # operator-facing reason present
     # an ACCEPTED flag is verified, not unverified — no event for it.
     s2 = _flag_solver()
+    s2._validated_flag_submissions.add("flag{accepted}")
     asyncio.run(s2._accept_flag("flag{accepted}"))
     asyncio.run(s2._surface_unverified_flags("FOUND_FLAG=flag{accepted}\n"))
     assert not [e for e in s2.bus.events
                 if e.event_type is EventType.BLACKBOARD_DELTA
                 and e.payload.get("kind") == "flag_unverified"]
+
+
+def test_assistant_final_is_not_part_of_provenance_corpus():
+    """A terminal assistant claim must not become its own execution witness."""
+    s = _flag_solver()
+    s._persist_raw_tool_output("HTTP/1.1 200 OK\nno flag here\n")
+    final = "I solved it.\nFOUND_FLAG=flag{assistant-only}\n"
+
+    assert "flag{assistant-only}" not in s._provenance_corpus()
+    asyncio.run(s._stream_markers(
+        final, flag_provenance=s._provenance_corpus()))
+    assert s._already_found == set()
+
+
+def test_operator_flag_echo_is_tainted_even_when_it_reaches_tool_output():
+    """Operator context has no truth privilege and cannot be laundered via `echo`."""
+    from muteki.solver.cli_driver import StreamStep
+
+    ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
+    bus = _CaptureBus()
+    s = CliSolver(
+        None, ch, bus=bus, driver=_StubDriver(""), engine="claude", kb=False,
+        standing_guidance=["possible answer: flag{operator-supplied}"],
+    )
+    echoed = "$ echo FOUND_FLAG=flag{operator-supplied}\n" \
+             "FOUND_FLAG=flag{operator-supplied}\n"
+
+    _emit_attributed_tool_result(
+        s, echoed, command="echo FOUND_FLAG=flag{operator-supplied}")
+
+    assert "flag{operator-supplied}" in s._provenance_corpus()  # real echo stdout
+    assert s._already_found == set()  # but its value originated with the operator
+    assert s._stream_accepted == []
+
+
+def test_operator_redirect_url_flag_is_tainted_when_target_echoes_it():
+    """Redirect URLs are operator context too. A server/curl echo of the URL
+    cannot launder an operator-supplied candidate through raw tool provenance."""
+    from muteki.solver.cli_driver import StreamStep
+
+    candidate = "flag{from-operator-url}"
+    url = f"http://target.invalid/next/{candidate}"
+    ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
+    s = CliSolver(
+        None, ch, bus=_CaptureBus(), driver=_StubDriver(""), engine="claude",
+        kb=False, hitl_cmd={"action": "redirect", "url": url},
+    )
+    echoed = f"$ curl {url}\nHTTP/1.1 200 OK\nredirected={url}\n"
+
+    _emit_attributed_tool_result(s, echoed, command=f"curl {url}")
+
+    assert candidate in s._provenance_corpus()
+    assert s._flag_from_operator_context(candidate) is True
+    assert s._already_found == set()
+    assert s._stream_accepted == []
+
+
+def test_bootstrap_assistant_only_flag_does_not_solve(monkeypatch):
+    """End-to-end regression: CliResult.text is a claim, not raw target output."""
+    from muteki.solver import cli_solver as mod
+    from muteki.solver.cli_driver import CliResult
+
+    bus = _CaptureBus()
+    ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
+    s = CliSolver(
+        None, ch, bus=bus, driver=_StubDriver(""), engine="claude", kb=False)
+    canned = lambda *a, **k: CliResult(
+        text="FOUND_FLAG=flag{assistant-only}\n", session="sess-x")
+    monkeypatch.setattr(mod, "run_cli_streaming", canned)
+    monkeypatch.setattr(mod, "run_cli", canned)
+
+    out = asyncio.run(s.run())
+
+    assert out.solved is False
+    assert "flag_found" not in _bb_kinds(bus.events)
+    assert "flag_unverified" in _bb_kinds(bus.events)
 
 
 def test_persist_raw_tool_output_ring_trims_to_cap():
@@ -1349,22 +2792,26 @@ def test_claude_driver_tool_result_raw_is_untruncated():
     flag = "flag{deep-in-claude-output}"
     body = ("B" * 900) + f" FOUND_FLAG={flag}"
     line = json.dumps({"type": "user", "message": {
-        "content": [{"type": "tool_result", "content": body}]}})
+        "content": [{"type": "tool_result", "tool_use_id": "call-raw",
+                     "content": body}]}})
     steps = ClaudeCodeDriver().parse_stream_steps(line)
     tr = [s for s in steps if s.kind == "tool_result"][0]
     assert len(tr.text) == 600 and flag not in tr.text   # deck chunk truncated
     assert flag in tr.raw                                  # gate sees full output
+    assert tr.call_id == "call-raw"
 
 
 def test_codex_driver_tool_result_raw_is_untruncated():
     flag = "flag{deep-in-codex-output}"
     body = ("C" * 900) + f" FOUND_FLAG={flag}"
     line = json.dumps({"type": "item.completed", "item": {
-        "type": "command_execution", "aggregated_output": body}})
+        "id": "item-raw", "type": "command_execution",
+        "aggregated_output": body}})
     step = CodexDriver().parse_stream_line(line)
     assert step.kind == "tool_result"
     assert len(step.text) == 600 and flag not in step.text
     assert flag in step.raw
+    assert step.call_id == "item-raw"
 
 
 def test_cursor_driver_tool_result_raw_is_untruncated():
@@ -1372,11 +2819,232 @@ def test_cursor_driver_tool_result_raw_is_untruncated():
     body = ("D" * 900) + f" FOUND_FLAG={flag}"
     tc = {"shell": {"result": {"success": {"content": body}}}}
     line = json.dumps(
-        {"type": "tool_call", "subtype": "completed", "tool_call": tc})
+        {"type": "tool_call", "subtype": "completed", "call_id": "cursor-raw",
+         "tool_call": tc})
     steps = CursorDriver().parse_stream_steps(line)
     tr = [s for s in steps if s.kind == "tool_result"][0]
     assert len(tr.text) == 600 and flag not in tr.text
     assert flag in tr.raw
+    assert tr.call_id == "cursor-raw"
+
+
+def test_cursor_driver_shell_completion_reads_actual_stdout_shape():
+    flag = "flag{cursor-shell-stdout}"
+    body = f"FOUND_FLAG={flag}\n"
+    tc = {"shellToolCall": {
+        "args": {"command": "python solve.py"},
+        "result": {"success": {
+            "exitCode": 0,
+            "stdout": body,
+            "stderr": "warning\n",
+            "interleavedOutput": body + "warning\n",
+        }},
+    }}
+    line = json.dumps({
+        "type": "tool_call", "subtype": "completed",
+        "call_id": "cursor-shell", "tool_call": tc,
+    })
+
+    steps = CursorDriver().parse_stream_steps(line)
+    result = [step for step in steps if step.kind == "tool_result"][0]
+
+    assert result.raw == body + "warning\n"
+    assert flag in result.text
+    assert result.call_id == "cursor-shell"
+
+
+def test_cursor_shell_started_completed_pair_admits_real_flag():
+    flag = "flag{cursor-paired-output}"
+    started = json.dumps({
+        "type": "tool_call", "subtype": "started", "call_id": "cursor-pair",
+        "tool_call": {"shellToolCall": {
+            "args": {"command": "python solve.py"}}},
+    })
+    completed = json.dumps({
+        "type": "tool_call", "subtype": "completed", "call_id": "cursor-pair",
+        "tool_call": {"shellToolCall": {"result": {"success": {
+            "exitCode": 0,
+            "stdout": f"FOUND_FLAG={flag}\n",
+            "stderr": "",
+            "interleavedOutput": f"FOUND_FLAG={flag}\n",
+        }}}},
+    })
+    driver = CursorDriver()
+    solver = _flag_solver()
+
+    async def drive():
+        for line in (started, completed):
+            for step in driver.parse_stream_steps(line):
+                await solver._emit_step(step)
+
+    asyncio.run(drive())
+
+    _submit_captured_flags(solver)
+    assert solver._already_found == {flag}
+    assert solver._raw_tool_commands == ["python solve.py"]
+    assert solver._raw_tool_attributed == [True]
+
+
+def test_cursor_failed_shell_result_keeps_real_stdout_provenance():
+    flag = "flag{cursor-output-before-nonzero-exit}"
+    started = json.dumps({
+        "type": "tool_call", "subtype": "started", "call_id": "cursor-failure",
+        "tool_call": {"shellToolCall": {
+            "args": {"command": "python solve_then_fail.py"}}},
+    })
+    completed = json.dumps({
+        "type": "tool_call", "subtype": "completed", "call_id": "cursor-failure",
+        "tool_call": {"shellToolCall": {"result": {
+            "case": "failure",
+            "value": {
+                "exitCode": 1,
+                "stdout": f"FOUND_FLAG={flag}\n",
+                "stderr": "post-processing failed\n",
+                "interleavedOutput": (
+                    f"FOUND_FLAG={flag}\npost-processing failed\n"),
+            },
+        }}},
+    })
+    driver = CursorDriver()
+    solver = _flag_solver()
+
+    async def drive():
+        for line in (started, completed):
+            for step in driver.parse_stream_steps(line):
+                await solver._emit_step(step)
+
+    asyncio.run(drive())
+
+    _submit_captured_flags(solver)
+    assert solver._already_found == {flag}
+    assert solver._raw_tool_commands == ["python solve_then_fail.py"]
+    assert solver._raw_tool_attributed == [True]
+    assert "post-processing failed" in solver._provenance_corpus()
+
+
+def _cursor_spill_step(path: str, *, call_id: str = "cursor-spill",
+                       size_bytes: int = 90000):
+    line = json.dumps({
+        "type": "tool_call", "subtype": "completed", "call_id": call_id,
+        "tool_call": {"shellToolCall": {"result": {
+            "case": "success",
+            "value": {
+                "exitCode": 0,
+                "stdout": "",
+                "stderr": "",
+                "interleavedOutput": "",
+                "outputLocation": {
+                    "filePath": path,
+                    "lineCount": 12000,
+                    "sizeBytes": size_bytes,
+                },
+            },
+        }}},
+    })
+    return CursorDriver().parse_stream_steps(line)[0]
+
+
+def test_cursor_spilled_shell_result_keeps_location_metadata_only():
+    result = _cursor_spill_step(
+        "/workspace/.cursor/FOUND_FLAG=flag{path_is_not_output}.txt")
+
+    assert result.kind == "tool_result"
+    assert result.raw == ""
+    assert result.text == ""
+    assert result.spill_path.endswith("flag{path_is_not_output}.txt")
+    assert result.spill_size_bytes == 90000
+    assert result.spill_line_count == 12000
+    assert result.call_id == "cursor-spill"
+
+
+def test_cursor_spilled_shell_result_loads_real_local_output(tmp_path):
+    workdir = tmp_path / "worker"
+    spill = workdir / ".cursor" / "shell-output.txt"
+    spill.parent.mkdir(parents=True)
+    flag = "flag{cursor_spill_loaded}"
+    spill.write_text(f"decoded\nFOUND_FLAG={flag}\n")
+    solver = _flag_solver()
+    solver._current_workdir = workdir.resolve()
+
+    async def drive():
+        await solver._emit_step(StreamStep(
+            "tool", text="python solve.py", call_id="cursor-spill"))
+        await solver._emit_step(_cursor_spill_step(
+            str(spill), size_bytes=spill.stat().st_size))
+
+    asyncio.run(drive())
+
+    _submit_captured_flags(solver)
+    assert solver._raw_tool_outputs == [spill.read_text()]
+    assert solver._raw_tool_commands == ["python solve.py"]
+    assert solver._raw_tool_attributed == [True]
+    assert solver._already_found == {flag}
+
+
+@pytest.mark.parametrize("escape_kind", ["parent", "sibling", "symlink"])
+def test_cursor_spilled_shell_result_rejects_escape_paths(tmp_path, escape_kind):
+    workdir = tmp_path / "workspace" / "workers" / "cli-cursor"
+    workdir.mkdir(parents=True)
+    outside = tmp_path / "workspace" / "graph" / "shared_graph.db"
+    outside.parent.mkdir(parents=True)
+    outside.write_text("FOUND_FLAG=flag{must_not_be_read}\n")
+    if escape_kind == "parent":
+        reported = "../../graph/shared_graph.db"
+    elif escape_kind == "sibling":
+        reported = str(outside)
+    else:
+        link = workdir / "spill.txt"
+        link.symlink_to(outside)
+        reported = str(link)
+    bus = _CaptureBus()
+    solver = _cli_solver(
+        Challenge(id="t", name="t", category="forensics",
+                  flag_format=r"flag\{.*?\}"), bus=bus)
+    solver._current_workdir = workdir.resolve()
+
+    async def drive():
+        await solver._emit_step(StreamStep(
+            "tool", text="python solve.py", call_id="cursor-spill"))
+        await solver._emit_step(_cursor_spill_step(reported))
+
+    asyncio.run(drive())
+
+    assert solver._raw_tool_outputs == []
+    assert solver._already_found == set()
+    assert solver._pending_tool_calls == []
+    result_events = [
+        event for event in bus.events
+        if event.event_type is EventType.TOOL_CALL_RESULT
+    ]
+    assert result_events[-1].payload["result"]["spill"]["status"] == "rejected"
+
+
+def test_cursor_spill_translates_exact_container_worker_cwd(tmp_path):
+    workspace = tmp_path / "workspace"
+    workdir = workspace / "workers" / "cli-cursor"
+    spill = workdir / ".cursor" / "shell-output.txt"
+    spill.parent.mkdir(parents=True)
+    flag = "flag{cursor_container_spill}"
+    spill.write_text(f"FOUND_FLAG={flag}\n")
+    handle = ContainerHandle(
+        run_id="spill", host_workspace=str(workspace),
+        container="muteki-run-spill")
+    solver = _flag_solver()
+    solver.container = handle
+    solver._current_workdir = workdir.resolve()
+    container_spill = (
+        f"{CONTAINER_WORKSPACE}/workers/cli-cursor/.cursor/shell-output.txt")
+
+    async def drive():
+        await solver._emit_step(StreamStep(
+            "tool", text="python solve.py", call_id="cursor-spill"))
+        await solver._emit_step(_cursor_spill_step(container_spill))
+
+    asyncio.run(drive())
+
+    _submit_captured_flags(solver)
+    assert solver._raw_tool_outputs == [spill.read_text()]
+    assert solver._already_found == {flag}
 
 
 def test_single_flag_prompt_has_no_multiflag_block():
@@ -1479,7 +3147,7 @@ def _worker_statuses(events):
     return [e for e in events if e.event_type is EventType.WORKER_STATUS]
 
 
-def _run_cli_solver(monkeypatch, transcript):
+def _run_cli_solver(monkeypatch, transcript, *, intent_id=""):
     """Run a CliSolver with the streaming runner stubbed to return `transcript`
     (CliSolver streams when a bus is present). Returns the bus + solver."""
     from muteki.solver import cli_solver as mod
@@ -1488,8 +3156,17 @@ def _run_cli_solver(monkeypatch, transcript):
     ch = Challenge(id="t", name="login", category="web", flag_format=r"flag\{.*?\}",
                    target="http://x")
     drv = _StubDriver(transcript)
-    s = CliSolver(None, ch, bus=bus, driver=drv, engine="claude", kb=False)
-    canned = lambda *a, **k: CliResult(text=transcript, session="sess-x")
+    s = CliSolver(
+        None, ch, bus=bus, driver=drv, engine="claude", kb=False,
+        intent_id=intent_id,
+    )
+    def canned(*a, **k):
+        # This helper models a successful command-backed solve.  CliResult.text is the
+        # assistant's final claim; explicitly seed the independent tool-output corpus
+        # instead of relying on that claim to self-prove provenance.
+        s._persist_raw_tool_output(transcript)
+        s._validated_flag_submissions.update(s._extract_flags(transcript))
+        return CliResult(text=transcript, session="sess-x")
     monkeypatch.setattr(mod, "run_cli_streaming", canned)
     monkeypatch.setattr(mod, "run_cli", canned)  # the no-bus fallback path
     asyncio.run(s.run())
@@ -1499,10 +3176,11 @@ def _run_cli_solver(monkeypatch, transcript):
 def test_cli_solver_emits_full_intent_lifecycle_on_solve(monkeypatch):
     bus, s = _run_cli_solver(monkeypatch, "did the thing\nFOUND_FLAG=flag{real}\n")
     kinds = _bb_kinds(bus.events)
-    # the OneNote board needs the claim lifecycle, not just loose facts
+    # The claim lifecycle and gated flag are sufficient.  A transcript closing
+    # line must not be manufactured into a fact merely to decorate the solve.
     assert kinds[0] == "intent_proposed"
     assert "intent_claimed" in kinds
-    assert "fact_added" in kinds
+    assert "fact_added" not in kinds
     assert "intent_concluded" in kinds
     assert "flag_found" in kinds
     # concluded must say solved
@@ -1515,6 +3193,25 @@ def test_cli_solver_emits_full_intent_lifecycle_on_solve(monkeypatch):
                if e.event_type is EventType.BLACKBOARD_DELTA
                and e.payload.get("kind") == "intent_claimed"][0]
     assert claimed.payload.get("worker") == s.solver_id
+
+
+def test_bootstrap_uses_assigned_planning_intent_for_full_lifecycle(monkeypatch):
+    bus, _solver = _run_cli_solver(
+        monkeypatch,
+        "poked around, found nothing useful\n",
+        intent_id="I-plan-assigned",
+    )
+    intent_events = [
+        event for event in bus.events
+        if event.event_type is EventType.BLACKBOARD_DELTA
+        and event.payload.get("kind") in {
+            "intent_proposed", "intent_claimed", "intent_concluded",
+        }
+    ]
+    assert intent_events
+    assert {
+        event.payload.get("intent_id") for event in intent_events
+    } == {"I-plan-assigned"}
 
 
 def test_cli_solver_concludes_explored_on_miss_without_dead_end(monkeypatch):
@@ -1761,7 +3458,11 @@ def test_explore_solved_concludes_intent_without_fact_seq(monkeypatch, tmp_path)
     s = _cli_solver(ch, kb=False, shared_graph=g, mode="explore",
                     intent_goal="probe /admin", intent_id="I-solve")
     # transcript has ONLY a flag — no VERIFIED_FACT → _last_fact_seq never set → lfs None
-    canned = lambda *a, **k: CliResult(text="FOUND_FLAG=flag{got_it}\n", session="sess-x")
+    def canned(*a, **k):
+        raw = "target verifier printed FOUND_FLAG=flag{got_it}\n"
+        s._persist_raw_tool_output(raw)
+        s._validated_flag_submissions.add("flag{got_it}")
+        return CliResult(text="FOUND_FLAG=flag{got_it}\n", session="sess-x")
     monkeypatch.setattr(mod, "run_cli_streaming", canned)
     monkeypatch.setattr(mod, "run_cli", canned)
     out = asyncio.run(s.run())
@@ -1881,6 +3582,41 @@ def test_run_cli_streaming_fires_on_step_per_line(tmp_path):
     assert "reasoning" in seen  # the live step fired
     assert "FOUND_FLAG=flag{ok}" in res.text  # final result still parsed
     assert res.session == "z"
+
+
+def test_run_cli_streaming_pipes_secret_without_putting_it_in_argv(tmp_path):
+    from muteki.solver.cli_driver import run_cli_streaming
+
+    secret = "stdin-only-secret-5544332211"
+    seen_argv = []
+    delivery = []
+    # Claude's parser tolerates a plain line as its final text fallback.
+    res = run_cli_streaming(
+        ClaudeCodeDriver(),
+        ["/bin/sh", "-c", "IFS= read -r line; printf '%s\\n' \"$line\""],
+        cwd=str(tmp_path), timeout=10, on_step=lambda _s: None,
+        on_proc=lambda proc: seen_argv.extend(proc.args), stdin_text=secret + "\n",
+        on_stdin_delivered=lambda: delivery.append("delivered"),
+        on_stdin_uncertain=lambda: delivery.append("uncertain"),
+    )
+    assert secret in res.text
+    assert secret not in "\0".join(str(arg) for arg in seen_argv)
+    assert delivery == ["delivered"]
+
+
+def test_run_cli_streaming_broken_stdin_is_uncertain_not_delivered(tmp_path):
+    from muteki.solver.cli_driver import run_cli_streaming
+
+    delivery = []
+    # Larger than the pipe buffer + an immediate-exit child makes the writer observe
+    # BrokenPipe. Popen alone must never manufacture a positive delivery receipt.
+    run_cli_streaming(
+        ClaudeCodeDriver(), ["/bin/sh", "-c", "exit 0"], cwd=str(tmp_path), timeout=10,
+        on_step=lambda _s: None, stdin_text="x" * (4 * 1024 * 1024),
+        on_stdin_delivered=lambda: delivery.append("delivered"),
+        on_stdin_uncertain=lambda: delivery.append("uncertain"),
+    )
+    assert delivery == ["uncertain"]
 
 
 # ── dispatcher control: blackboard context + cancel + pause ───────────────────
@@ -2007,6 +3743,70 @@ def _real_graph(tmp_path, facts=(), deadends=()):
     return ch, g
 
 
+def _blackboard_submit(solver: CliSolver, flag: str) -> subprocess.CompletedProcess:
+    if solver._flag_submission_dir is None:
+        solver._flag_submission_dir = _P(tempfile.mkdtemp(
+            prefix="muteki-flag-submission-test-"))
+    env = {
+        **os.environ,
+        "MUTEKI_BLACKBOARD_DB": str(solver.shared_graph.db_path),
+        "MUTEKI_WORKER_ID": solver.solver_id,
+        "MUTEKI_FLAG_SUBMISSION_DIR": str(solver._flag_submission_dir),
+    }
+    return subprocess.run(
+        [sys.executable, solver._blackboard_script_path(), "submit-flag", flag],
+        capture_output=True, text=True, env=env, timeout=30, check=True)
+
+
+def test_submit_flag_is_the_only_protocol1_acceptance_path(tmp_path):
+    flag = "flag{api_only_acceptance}"
+    ch, graph = _real_graph(tmp_path)
+    solver = _cli_solver(ch, kb=False, shared_graph=graph, bus=_CaptureBus())
+    raw = f"decoder output\nFOUND_FLAG={flag}\n"
+
+    _emit_attributed_tool_result(
+        solver, raw, command="python decode.py", submit=False)
+    assert solver._already_found == set()
+    assert graph.snapshot().flags == []
+
+    submitted = _blackboard_submit(solver, flag)
+    assert flag not in submitted.stdout
+    asyncio.run(solver._drain_blackboard_flag_submissions())
+
+    assert solver._already_found == {flag}
+    assert solver._stream_accepted == [flag]
+    assert graph.snapshot().flags == [flag]
+    decisions = [
+        event for event in graph.events()
+        if event["kind"] == "flag_submission_decision"
+    ]
+    assert decisions[-1]["payload"]["accepted"] is True
+
+
+def test_submit_confirmation_cannot_prove_its_own_candidate(tmp_path):
+    flag = "flag{confirmation_is_not_evidence}"
+    ch, graph = _real_graph(tmp_path)
+    solver = _cli_solver(ch, kb=False, shared_graph=graph, bus=_CaptureBus())
+    submitted = _blackboard_submit(solver, flag)
+    assert flag not in submitted.stdout
+
+    _emit_attributed_tool_result(
+        solver,
+        submitted.stdout,
+        command=(f"python3 $MUTEKI_BLACKBOARD_SCRIPT submit-flag '{flag}'"),
+        submit=False,
+    )
+
+    assert solver._already_found == set()
+    assert graph.snapshot().flags == []
+    decisions = [
+        event for event in graph.events()
+        if event["kind"] == "flag_submission_decision"
+    ]
+    assert decisions[-1]["payload"]["accepted"] is False
+    assert decisions[-1]["payload"]["code"] == "provenance_rejected"
+
+
 def test_write_board_file_full_untruncated(tmp_path):
     # the file holds ALL facts with no [-16]/[:2000] truncation, creds on top.
     facts = [("cli-c", f"ghost{i} login succeeds with password PW{i}aB; whoami ghost{i}",
@@ -2070,6 +3870,8 @@ def test_defect0_accept_flag_records_on_shared_graph(tmp_path):
     ch, g = _real_graph(tmp_path)
     s = _cli_solver(ch, kb=False, shared_graph=g)
     assert g.snapshot().flags == []                       # nothing yet
+    s._validated_flag_submissions.update({
+        "flag{real_one}", "flag{second}"})
     assert asyncio.run(s._accept_flag("flag{real_one}")) is True
     assert g.snapshot().flags == ["flag{real_one}"]       # now on the SHARED graph
     # idempotent: same flag again is a no-op (dedup), graph still has exactly one
@@ -2078,6 +3880,113 @@ def test_defect0_accept_flag_records_on_shared_graph(tmp_path):
     # a second distinct flag accumulates (multi-flag)
     assert asyncio.run(s._accept_flag("flag{second}")) is True
     assert g.snapshot().flags == ["flag{real_one}", "flag{second}"]
+
+
+@pytest.mark.parametrize(
+    ("protocol2", "legacy_visible"),
+    [(False, True), (True, False)],
+    ids=["protocol1", "protocol2"],
+)
+def test_accepted_flag_protocol_channel_matrix(
+    tmp_path, protocol2, legacy_visible,
+):
+    """Protocol 2 accepts canonically but leaves every legacy flag channel silent."""
+    from muteki.swarm.insight_bus import InsightBus, InsightKind
+
+    flag = "flag{channel_matrix}"
+    raw = f"decoder output\nFOUND_FLAG={flag}\n"
+    challenge, shared_graph = _real_graph(tmp_path)
+    event_bus = _CaptureBus()
+    insight_bus = InsightBus(challenge_id=challenge.id)
+    solver = _cli_solver(
+        challenge,
+        kb=False,
+        bus=event_bus,
+        insight=insight_bus,
+        shared_graph=shared_graph,
+    )
+    gate_calls = []
+    capture_calls = []
+    if protocol2:
+        solver._protocol2_mode = True
+
+        def capture(value):
+            capture_calls.append(value)
+            return hashlib.sha256(value.encode()).hexdigest()
+
+        def canonical_gate(candidate, provenance):
+            gate_calls.append((candidate, provenance))
+            return True
+
+        solver._protocol2_capture_callback = capture
+        solver._protocol2_gate_callback = canonical_gate
+
+    # Content-bearing legacy events are private in Protocol 2, but ordinary
+    # lifecycle telemetry must remain available in both protocols.
+    asyncio.run(solver._emit(
+        EventType.WORKER_LIFECYCLE, phase="running", state="active"))
+    _emit_attributed_tool_result(
+        solver, raw, command="python solve.py", call_id="channel-matrix")
+
+    # The hardcoded provenance gate ran in both protocols. Protocol 2 additionally
+    # reached its GateAuthority callback before the private acceptance bookkeeping.
+    assert solver._already_found == {flag}
+    assert solver._stream_accepted == [flag]
+    assert capture_calls == ([raw] if protocol2 else [])
+    assert gate_calls == ([(flag, raw)] if protocol2 else [])
+    assert any(
+        event.event_type is EventType.WORKER_LIFECYCLE
+        and event.payload == {"phase": "running", "state": "active"}
+        for event in event_bus.events
+    )
+
+    legacy_channels = {
+        "tool_result_flag": any(
+            event.event_type is EventType.TOOL_CALL_RESULT
+            and flag in json.dumps(event.payload, ensure_ascii=False)
+            for event in event_bus.events
+        ),
+        "solve_graph_flag": flag in solver.graph.flags,
+        "shared_graph_flag_found": any(
+            event["kind"] == "flag_found"
+            and event["payload"].get("flag") == flag
+            for event in shared_graph.events()
+        ),
+        "solvegraph_delta_flag": any(
+            event.event_type is EventType.SOLVE_GRAPH_DELTA
+            and event.payload.get("kind") == "flag"
+            and event.payload.get("flag") == flag
+            for event in event_bus.events
+        ),
+        "insight_event_flag_found": any(
+            event.event_type is EventType.INSIGHT_BUS_EVENT
+            and event.payload.get("kind") == "FlagFound"
+            and event.payload.get("flag") == flag
+            for event in event_bus.events
+        ),
+        "blackboard_delta_flag_found": any(
+            event.event_type is EventType.BLACKBOARD_DELTA
+            and event.payload.get("kind") == "flag_found"
+            and event.payload.get("flag") == flag
+            for event in event_bus.events
+        ),
+        "insight_bus_flag": any(
+            insight.kind is InsightKind.FLAG and insight.text == flag
+            for insight in insight_bus.history
+        ),
+    }
+    assert legacy_channels == {
+        channel: legacy_visible for channel in legacy_channels
+    }
+
+    if protocol2:
+        # Protocol2RunSession consumes this private same-attempt list, resolves the
+        # committed flag.accepted outbox, and hands it to the typed reconciler.
+        assert solver._accepted_flags_for_outcome() == [flag]
+        assert solver._protocol2_accepted_flags == [flag]
+    else:
+        assert solver._accepted_flags_for_outcome() == [flag]
+        assert shared_graph.snapshot().flags == [flag]
 
 
 def test_defect1_solved_claim_downgraded_not_verified(tmp_path):
@@ -2108,6 +4017,7 @@ def test_defect1_solved_claim_downgraded_not_verified(tmp_path):
     assert real["verified"] is True, "concrete evidence must stay verified"
 
     # once this worker holds a real gated flag, its claims are earned → not downgraded
+    s._validated_flag_submissions.add("flag{got_it}")
     asyncio.run(s._accept_flag("flag{got_it}"))
     asyncio.run(s._record_fact("challenge solved — flag recovered",
                                verified=True, artifact_id="art2"))
@@ -2310,6 +4220,45 @@ def test_inherited_poc_mounts_under_inherited_and_claims(tmp_path):
     assert "python poc.py" in s._poc_prompt_block()
 
 
+def test_stage_attachment_preserves_cas_alias_basename(tmp_path):
+    """A run-local by-name symlink resolves to a digest object, but the worker
+    contract must remain the harmless player filename rather than leaking the hash
+    or the operator's original source path."""
+    from muteki.solver.workspace import materialize_input
+
+    source_root = _P(tmp_path) / "operator-benchmark-with-solutions"
+    source_root.mkdir()
+    source = source_root / "ciphertext.txt"
+    source.write_text("player bytes")
+    root = _P(tmp_path) / "run" / "workspace"
+    row = materialize_input(root, source, name=source.name)
+    ch = Challenge(
+        id="cas-alias", name="cas-alias", category="crypto",
+        attachments=[str(row["by_name"])],
+    )
+    wd = root / "workers" / "cli-1"
+    wd.mkdir(parents=True)
+    s = _cli_solver(ch, kb=False, workdir=str(wd))
+
+    assert s._stage_attachments(wd) == ["ciphertext.txt"]
+    assert (wd / "ciphertext.txt").read_text() == "player bytes"
+
+
+def test_offline_prompt_forbids_benchmark_and_solution_traversal(tmp_path):
+    ch = Challenge(
+        id="offline-boundary", name="offline-boundary", category="crypto",
+        attachments=[str(_P(tmp_path) / "ciphertext.txt")],
+    )
+    s = _cli_solver(ch, kb=False, web_access=False)
+    s._staged_files = ["ciphertext.txt"]
+
+    prompt = s._build_prompt()
+
+    assert "Offline black-box evaluation boundary" in prompt
+    assert "Do NOT inspect parent directories" in prompt
+    assert "reference solvers" in prompt
+
+
 def test_to_board_markdown_has_creds_facts_and_intents(tmp_path):
     ch, g = _real_graph(
         tmp_path,
@@ -2425,6 +4374,247 @@ def test_on_proc_kills_immediately_if_already_cancelled():
     p = _FakeProc()
     s._on_proc(p)
     assert p.killed is True
+
+
+def test_cancel_aggregates_runtime_signal_failures_without_short_circuiting():
+    ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
+    s = _cli_solver(ch, kb=False)
+    first, second = object(), object()
+    s._live_procs.update((first, second))
+    attempted = []
+    s._signal_proc = lambda proc, _sig: (attempted.append(proc) or proc is second)
+
+    assert s.cancel() is False
+    assert set(attempted) == {first, second}
+    assert s._cancel_event.is_set()
+
+
+def test_secret_context_commits_only_after_stdin_handoff():
+    ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
+    solver = _cli_solver(ch, kb=False)
+    solver._pending_control_context_reservations = [("CTX-secret", "RSV-one")]
+    commits = []
+    deliveries = []
+    solver._context_committer = lambda context_id, **kw: (
+        commits.append((context_id, kw["reservation_id"])) or True)
+    solver._context_delivery_callback = deliveries.append
+
+    class _FakeProc:
+        pid = 999999
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            return None
+
+    proc = _FakeProc()
+    solver._on_proc(proc, context_via_stdin=True)
+    assert commits == []
+    assert deliveries == []
+    assert solver._pending_control_context_reservations
+
+    assert solver._commit_control_context_delivery(
+        actor="test-stdin-delivered") is True
+    assert commits == [("CTX-secret", "RSV-one")]
+    assert deliveries == [True]
+    assert solver._pending_control_context_reservations == []
+
+
+def test_failed_secret_stdin_handoff_is_delivery_unknown_and_kills_worker():
+    ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
+    solver = _cli_solver(ch, kb=False)
+    solver._pending_control_context_reservations = [("CTX-secret", "RSV-two")]
+    marked = []
+    deliveries = []
+    solver._context_delivery_unknown_marker = lambda context_id, **kw: (
+        marked.append((context_id, kw["reservation_id"], kw["actor"])) or True)
+    solver._context_delivery_callback = deliveries.append
+
+    class _FakeProc:
+        pid = 999999
+
+        def __init__(self):
+            self.killed = False
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            self.killed = True
+
+    proc = _FakeProc()
+    solver._on_proc(proc, context_via_stdin=True)
+    solver._mark_control_context_delivery_unknown(
+        actor="test-stdin-failed", reason="broken pipe")
+
+    assert marked == [("CTX-secret", "RSV-two", "test-stdin-failed")]
+    assert deliveries == [False]
+    assert solver._control_context_delivery_unknown is True
+    assert solver._pending_control_context_reservations == []
+    assert proc.killed is True
+
+
+def test_late_secret_stdin_callback_uses_immutable_reservation_batch():
+    """Clearing mutable pending state cannot launder a late handoff as success."""
+    ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
+    solver = _cli_solver(ch, kb=False)
+    batch = (("CTX-secret", "RSV-late"),)
+    solver._pending_control_context_reservations = list(batch)
+    commits = []
+    marked = []
+    deliveries = []
+    # Model an early owner release: the journal no longer accepts the reservation,
+    # but the writer thread later reports that plaintext crossed stdin.
+    solver._context_committer = lambda context_id, **kw: (
+        commits.append((context_id, kw["reservation_id"])) or False)
+    solver._context_delivery_unknown_marker = lambda context_id, **kw: (
+        marked.append((context_id, kw["reservation_id"])) or True)
+    solver._context_delivery_callback = deliveries.append
+    solver._pending_control_context_reservations = []
+
+    assert solver._commit_control_context_delivery(
+        actor="late-stdin", reservations=batch) is False
+    assert commits == [("CTX-secret", "RSV-late")]
+    assert marked == [("CTX-secret", "RSV-late")]
+    assert deliveries == [False]
+    assert solver._control_context_delivery_unknown is True
+    assert solver._control_context_delivery_committed is False
+
+
+def test_to_thread_cancellation_kills_fake_proc_and_awaits_delayed_cleanup(
+        monkeypatch):
+    """Cancelling the asyncio wrapper must kill the real child and give the
+    underlying runner thread time to reap it before the wrapper disappears."""
+    ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
+    s = _cli_solver(ch, kb=False)
+    monkeypatch.setenv("MUTEKI_CLI_CANCEL_CLEANUP_TIMEOUT", "0.5")
+
+    started = threading.Event()
+    runner_finished = threading.Event()
+
+    class _FakeProc:
+        def __init__(self):
+            self.pid = 999999
+            self.killed = False
+            self.alive = True
+
+        def kill(self):
+            self.killed = True
+
+        def poll(self):
+            return None if self.alive else 0
+
+    proc = _FakeProc()
+
+    def blocking_runner():
+        s._on_proc(proc)
+        started.set()
+        while not proc.killed:
+            time.sleep(0.001)
+        # Adversarial delayed cleanup: asyncio cancellation has happened, but the
+        # runner still owns its thread/process teardown for a short interval.
+        time.sleep(0.04)
+        proc.alive = False
+        runner_finished.set()
+        return "done"
+
+    async def drive():
+        task = asyncio.create_task(
+            s._to_thread_with_cancel_cleanup(blocking_runner))
+        while not started.is_set():
+            await asyncio.sleep(0.001)
+        t0 = time.monotonic()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return time.monotonic() - t0
+
+    elapsed = asyncio.run(drive())
+    assert proc.killed is True
+    assert runner_finished.is_set()
+    assert elapsed >= 0.03, "outer task must await bounded runner cleanup"
+    assert proc not in s._live_procs
+    assert s.runtime_exit_confirmed() is True
+
+
+def test_to_thread_cleanup_timeout_retains_unproven_live_proc(monkeypatch):
+    """A bounded cleanup timeout must not erase the final handle to a child whose
+    runner thread is still alive; the late done callback prunes it after poll()."""
+    ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
+    s = _cli_solver(ch, kb=False)
+    monkeypatch.setenv("MUTEKI_CLI_CANCEL_CLEANUP_TIMEOUT", "0.01")
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class _FakeProc:
+        def __init__(self):
+            self.pid = 999999
+            self.killed = False
+            self.alive = True
+
+        def kill(self):
+            self.killed = True
+
+        def poll(self):
+            return None if self.alive else 0
+
+    proc = _FakeProc()
+
+    def stuck_runner():
+        s._on_proc(proc)
+        started.set()
+        release.wait(timeout=2)
+        proc.alive = False
+        return "done"
+
+    async def drive():
+        task = asyncio.create_task(s._to_thread_with_cancel_cleanup(stuck_runner))
+        while not started.is_set():
+            await asyncio.sleep(0.001)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert proc.killed is True
+        assert proc in s._live_procs, "live handle must survive cleanup timeout"
+        assert s.runtime_exit_confirmed() is False
+        assert await s.wait_runtime_exit(0.005) is False
+        release.set()
+        assert await s.wait_runtime_exit(0.5) is True
+
+    asyncio.run(drive())
+    assert proc not in s._live_procs
+    assert s.runtime_exit_confirmed() is True
+
+
+def test_rcp_transport_return_without_exit_frame_never_launders_runtime_exit():
+    from muteki.solver.control_client import (
+        ControlError, _RcpProc, confirm_run_absent,
+    )
+
+    ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
+    s = _cli_solver(ch, kb=False)
+
+    class _Link:
+        def signal(self, worker_id, name, **kwargs): return False
+
+    proc = _RcpProc(_Link(), "w-unknown-exit", run_id="run-unknown-exit")
+
+    def failed_transport():
+        s._on_proc(proc)
+        raise ControlError("exit frame never arrived")
+
+    async def drive():
+        with pytest.raises(ControlError, match="never arrived"):
+            await s._to_thread_with_cancel_cleanup(failed_transport)
+
+    asyncio.run(drive())
+    assert proc._exit_confirmed is False
+    assert proc in s._live_procs
+    assert s.runtime_exit_confirmed() is False
+    confirm_run_absent("run-unknown-exit")
+    assert s.runtime_exit_confirmed() is True
 
 
 def test_run_cli_streaming_cancel_event_kills_process(tmp_path):
@@ -2603,6 +4793,24 @@ def test_on_proc_freezes_subprocess_registered_while_paused():
     assert _signal.SIGKILL not in sent, "must freeze, not kill, a paused worker's proc"
 
 
+def test_set_paused_requires_real_signal_confirmation():
+    """Logical freeze state cannot change when the OS/container signal boundary
+    cannot prove delivery."""
+    ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
+    s = _cli_solver(ch, kb=False)
+
+    class _FakeProc:
+        pid = 4242
+
+    proc = _FakeProc()
+    s._live_procs.add(proc)
+    s._signal_proc = lambda _proc, _sig: False
+
+    assert s._set_paused(True) is False
+    assert s._paused is False
+    assert not s._paused_event.is_set()
+
+
 def test_pause_resume_via_insight_bus_signals_process(monkeypatch):
     # bug #3 fix: a HITL pause GUIDANCE on the InsightBus reaches the live worker
     # and SIGSTOPs its subprocess; resume SIGCONTs it. We capture the signals.
@@ -2626,12 +4834,37 @@ def test_pause_resume_via_insight_bus_signals_process(monkeypatch):
         await bus_insight.guidance("", action="resume", target="global")
         s._drain_control()
     asyncio.run(drive())
-
     import signal as _sig
     assert (4242, _sig.SIGSTOP) in signals
     assert (4242, _sig.SIGCONT) in signals
     assert s._paused is False  # ended resumed
 
+
+def test_live_guidance_accepts_engine_intent_and_lane_selectors():
+    from muteki.swarm.insight_bus import InsightBus
+
+    ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}")
+    for target, attr in (
+        ("engine:claude", ("engine", "claude")),
+        ("intent:I-live", ("intent_id_assigned", "I-live")),
+        ("lane:exclusive:web", ("lane", "exclusive:web")),
+    ):
+        insight = InsightBus(challenge_id="t")
+        solver = _cli_solver(ch, kb=False, insight=insight)
+        solver.engine = "claude"
+        setattr(solver, *attr)
+        solver._insight_inbox = insight.subscribe(solver.solver_id)
+        solver._turn_active = True
+
+        async def _send():
+            await insight.guidance(
+                "switch route", action="redirect", target=target,
+                url="http://selector.invalid")
+
+        asyncio.run(_send())
+        solver._drain_control()
+        assert solver._target_override == "http://selector.invalid"
+        assert solver._steer_event.is_set()
 
 def test_live_markers_stream_to_board_and_insight_bus():
     # bug #1 (full fix): a VERIFIED_FACT= seen MID-RUN is pushed to the shared graph
@@ -2843,6 +5076,9 @@ def test_single_shot_buffered_guidance_does_not_resume(monkeypatch):
         # operator drops guidance during the execute pass — recorded for the next
         # spawned worker (single-shot), must NOT trigger a resume of THIS worker.
         s._standing_guidance.append("try /admin")
+        s._persist_raw_tool_output(
+            "target verifier printed FOUND_FLAG=flag{got_it_first_pass}\n")
+        s._validated_flag_submissions.add("flag{got_it_first_pass}")
         return CliResult(text="FOUND_FLAG=flag{got_it_first_pass}\n", session="sess-x")
 
     monkeypatch.setattr(mod, "run_cli_streaming", fake_stream)
@@ -3004,7 +5240,158 @@ def test_hitl_cmd_url_sets_target_override():
     assert "Target: http://new" in s._build_prompt()
 
 
-def test_run_cli_streaming_steer_event_kills_and_flags():
+def test_standby_redirect_endpoint_crosses_the_actual_prompt_boundary(tmp_path):
+    from muteki.solver.cli_driver import CliResult
+
+    captured = {}
+
+    class _CaptureResumeDriver(_StubDriver):
+        def build_resume(self, prompt, *args, **kwargs):
+            captured["prompt"] = prompt
+            return ["true"]
+
+    endpoint = "https://private-target.invalid/next"
+    ch = Challenge(
+        id="redirect-standby", name="redirect", category="web",
+        flag_format=r"flag\{.*?\}", target="https://old.invalid",
+    )
+    solver = CliSolver(
+        None, ch, bus=_CaptureBus(), driver=_CaptureResumeDriver(""),
+        engine="claude", kb=False, mode="respond", resume_session="sess",
+        workdir=str(tmp_path),
+        hitl_cmd={"action": "redirect", "url": endpoint},
+    )
+
+    async def _finished(_argv, *, cwd, timeout, stdin_text=None):
+        return CliResult(text="redirect received", session="sess")
+
+    solver._run_streaming = _finished
+    asyncio.run(solver._run_respond())
+
+    assert endpoint in captured["prompt"]
+    assert "new target endpoint" in captured["prompt"]
+
+
+def test_standby_resume_releases_optional_context_absent_from_prompt(tmp_path):
+    """A resume Popen cannot commit a context omitted from that exact turn."""
+    from muteki.solver.cli_driver import CliResult
+
+    built_prompts = []
+    released = []
+    committed = []
+
+    class _CaptureResumeDriver(_StubDriver):
+        def build_resume(self, prompt, *args, **kwargs):
+            built_prompts.append(prompt)
+            return ["true"]
+
+    ch = Challenge(
+        id="resume-manifest-optional", name="resume-manifest", category="misc",
+        flag_format=r"flag\{.*?\}",
+    )
+    solver = CliSolver(
+        None, ch, bus=_CaptureBus(), driver=_CaptureResumeDriver(""),
+        engine="claude", kb=False, mode="respond", resume_session="sess",
+        workdir=str(tmp_path), hitl_cmd={"action": "ask", "text": "status?"},
+    )
+    reservation = ("CTX-resume-optional", "RSV-resume-optional")
+    omitted = "OPTIONAL CONTEXT THAT IS NOT PART OF THIS RESUME TURN"
+    solver._pending_control_context_reservations = [reservation]
+    solver._control_context_prompt_manifest = [{
+        "context_id": reservation[0],
+        "reservation_id": reservation[1],
+        "text": omitted,
+        "required": False,
+        "kind": "clue",
+        "secret": False,
+    }]
+    solver._context_releaser = lambda context_id, **kw: (
+        released.append((context_id, kw["reservation_id"])) or True)
+    solver._context_committer = lambda context_id, **kw: (
+        committed.append((context_id, kw["reservation_id"])) or True)
+
+    class _ExitedProc:
+        pid = None
+
+        def poll(self):
+            return 0
+
+        def kill(self):
+            return None
+
+    async def _finished(_argv, *, cwd, timeout, stdin_text=None):
+        # Exercise the real Popen delivery callback after argv construction.  The
+        # omitted reservation must already have been removed from its snapshot.
+        solver._on_proc(_ExitedProc())
+        return CliResult(text="answered", session="sess")
+
+    solver._run_streaming = _finished
+    asyncio.run(solver._run_respond())
+
+    assert len(built_prompts) == 1
+    assert omitted not in built_prompts[0]
+    assert released == [reservation]
+    assert committed == []
+    assert solver._pending_control_context_reservations == []
+    assert solver._control_context_delivery_committed is False
+    solver._prune_finished_procs()
+
+
+def test_standby_resume_missing_required_context_aborts_before_argv_or_popen(
+        tmp_path):
+    """An exact continuation absent from a resume prompt fails at zero Popen."""
+    built = []
+    started = []
+    released = []
+    committed = []
+
+    class _CaptureResumeDriver(_StubDriver):
+        def build_resume(self, prompt, *args, **kwargs):
+            built.append(prompt)
+            return ["true"]
+
+    ch = Challenge(
+        id="resume-manifest-required", name="resume-manifest", category="misc",
+        flag_format=r"flag\{.*?\}",
+    )
+    solver = CliSolver(
+        None, ch, bus=_CaptureBus(), driver=_CaptureResumeDriver(""),
+        engine="claude", kb=False, mode="respond", resume_session="sess",
+        workdir=str(tmp_path), hitl_cmd={"action": "ask", "text": "status?"},
+    )
+    reservation = ("CTX-resume-required", "RSV-resume-required")
+    solver._pending_control_context_reservations = [reservation]
+    solver._control_context_prompt_manifest = [{
+        "context_id": reservation[0],
+        "reservation_id": reservation[1],
+        "text": "EXACT REQUIRED CONTINUATION ABSENT FROM ASK PROMPT",
+        "required": True,
+        "kind": "clue",
+        "secret": False,
+    }]
+    solver._context_releaser = lambda context_id, **kw: (
+        released.append((context_id, kw["reservation_id"])) or True)
+    solver._context_committer = lambda context_id, **kw: (
+        committed.append((context_id, kw["reservation_id"])) or True)
+
+    async def _must_not_start(*args, **kwargs):
+        started.append(True)
+        raise AssertionError("worker process must not start")
+
+    solver._run_streaming = _must_not_start
+    with pytest.raises(
+            RuntimeError, match="required operator continuation context is absent"):
+        asyncio.run(solver._run_respond())
+
+    assert built == []
+    assert started == []
+    assert released == []
+    assert committed == []
+    assert solver._runtime_process_started is False
+    assert solver._pending_control_context_reservations == [reservation]
+
+
+def test_run_cli_streaming_steer_event_kills_and_flags(tmp_path):
     import threading
     import time as _t
     from muteki.solver.cli_driver import run_cli_streaming, get_driver
@@ -3015,11 +5402,66 @@ def test_run_cli_streaming_steer_event_kills_and_flags():
         _t.sleep(0.3); steer.set()
     threading.Thread(target=fire, daemon=True).start()
     t0 = _t.time()
-    res = run_cli_streaming(drv, ["sleep", "10"], cwd="/tmp", timeout=30,
+    res = run_cli_streaming(drv, ["sleep", "10"], cwd=str(tmp_path), timeout=30,
                             on_step=lambda s: None, steer_event=steer)
     assert res.steered is True
     assert res.cancelled is False
     assert _t.time() - t0 < 5                     # killed promptly, not at timeout
+
+
+def test_local_streaming_runner_reports_complete_stdin_handoff(tmp_path):
+    from muteki.solver.cli_driver import CliResult, run_cli_streaming
+
+    class _Driver:
+        name = "test"
+
+        def parse_stream_steps(self, _line):
+            return []
+
+        def parse(self, out, err):
+            return CliResult(text=out, raw_stderr=err)
+
+    secret = "stdin-boundary-445566"
+    argv = ["/bin/sh", "-c", "IFS= read -r line; printf '%s\\n' \"$line\""]
+    lifecycle = []
+    result = run_cli_streaming(
+        _Driver(), argv, cwd=str(tmp_path), timeout=5,
+        on_step=lambda _step: None,
+        on_proc=lambda _proc: lifecycle.append("popen"),
+        on_stdin_delivered=lambda: lifecycle.append("stdin"),
+        on_stdin_uncertain=lambda: lifecycle.append("unknown"),
+        stdin_text=secret + "\n",
+    )
+
+    assert secret not in "\0".join(argv)
+    assert lifecycle == ["popen", "stdin"]
+    assert secret in result.text
+
+
+def test_prestart_cancelled_stdin_handoff_reports_unknown(tmp_path):
+    from muteki.solver.cli_driver import CliResult, run_cli_streaming
+
+    class _Driver:
+        name = "test"
+
+        def parse_stream_steps(self, _line):
+            return []
+
+        def parse(self, out, err):
+            return CliResult(text=out, raw_stderr=err)
+
+    cancel = threading.Event()
+    cancel.set()
+    lifecycle = []
+    run_cli_streaming(
+        _Driver(), ["/bin/cat"], cwd=str(tmp_path), timeout=5,
+        on_step=lambda _step: None, cancel_event=cancel,
+        on_proc=lambda _proc: lifecycle.append("popen"),
+        on_stdin_delivered=lambda: lifecycle.append("stdin"),
+        on_stdin_uncertain=lambda: lifecycle.append("unknown"),
+        stdin_text="must-not-be-replayed",
+    )
+    assert lifecycle == ["popen", "unknown"]
 
 
 # ── _extract_flag must not surface placeholders (run-1619 false-positive) ─────
@@ -3096,6 +5538,44 @@ def test_stream_markers_uses_worker_reported_need_kind():
         "NEED_KIND=operator_directive_needed\n"))
     reqs = [e for e in bus.events if e.event_type is EventType.HITL_REQUEST]
     assert reqs[0].payload.get("need_kind") == "operator_directive_needed"
+
+
+def test_need_input_request_id_is_scoped_to_execution_occurrence():
+    import asyncio
+    from muteki.core.events import EventType
+
+    ch = Challenge(id="t", name="t", category="web", flag_format=r"flag\{.*?\}",
+                   target="http://x")
+    text = "NEED_INPUT=provide the dashboard token\n"
+
+    first_bus = _CaptureBus()
+    first = CliSolver(
+        None, ch, bus=first_bus, driver=_StubDriver(""), engine="claude", kb=False,
+        run_id="run-1", execution_occurrence="attempt-1", resolve_epoch=1,
+    )
+    asyncio.run(first._stream_markers(text))
+    first_request = next(
+        event for event in first_bus.events
+        if event.event_type is EventType.HITL_REQUEST)
+
+    second_bus = _CaptureBus()
+    second = CliSolver(
+        None, ch, bus=second_bus, driver=_StubDriver(""), engine="claude", kb=False,
+        run_id="run-1", execution_occurrence="attempt-2", resolve_epoch=2,
+    )
+    asyncio.run(second._stream_markers(text))
+    second_request = next(
+        event for event in second_bus.events
+        if event.event_type is EventType.HITL_REQUEST)
+
+    assert first_request.payload["request_id"].startswith("DR-")
+    assert first_request.payload["request_id"] != second_request.payload["request_id"]
+    assert first_request.payload["execution_occurrence"] == "attempt-1"
+    assert first_request.payload["resolve_epoch"] == "1"
+    # Reconstructing the same semantic identity inside one execution is stable.
+    replay_id, _ = first._decision_request_identity(
+        "provide the dashboard token", "external_blocker")
+    assert replay_id == first_request.payload["request_id"]
 
 
 def test_stream_markers_emits_hitl_request_on_need_input():

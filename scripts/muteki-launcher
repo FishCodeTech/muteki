@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""托管安装的稳定入口；该文件独立于具体应用版本。"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from datetime import datetime, timezone
+import uuid
+from pathlib import Path
+
+
+def install_root() -> Path:
+    configured = os.environ.get("MUTEKI_INSTALL_ROOT")
+    return Path(configured).expanduser().resolve() if configured else (Path.home() / ".local" / "share" / "muteki").resolve()
+
+
+def set_link(root: Path, name: str, target: Path) -> None:
+    temporary = root / f".{name}.{uuid.uuid4().hex}"
+    os.symlink(os.path.relpath(target, root), temporary)
+    os.replace(temporary, root / name)
+
+
+def emergency_rollback(root: Path) -> int:
+    current = root / "current"
+    previous = root / "previous"
+    if not current.exists() or not previous.exists():
+        print("回滚失败：没有可用的上一版本", file=sys.stderr)
+        return 1
+    current_target = current.resolve()
+    previous_target = previous.resolve()
+    if not previous_target.is_dir():
+        print("回滚失败：上一版本目录不存在", file=sys.stderr)
+        return 1
+    set_link(root, "current", previous_target)
+    set_link(root, "previous", current_target)
+    metadata_path = root / "install.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        metadata = {"schema_version": 1}
+    release_path = previous_target / ".muteki-release.json"
+    try:
+        release = json.loads(release_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        release = {"version": previous_target.name}
+    prior_version = metadata.get("current_version")
+    metadata.update({
+        "current_version": release.get("version", previous_target.name),
+        "previous_version": prior_version,
+        "release": release,
+    })
+    temporary = metadata_path.with_name(f".{metadata_path.name}.{uuid.uuid4().hex}")
+    temporary.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, metadata_path)
+    state_path = root / "update-state.json"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        state = {"schema_version": 1}
+    state.update({
+        "status": "rolled_back",
+        "current_version": metadata["current_version"],
+        "latest_version": metadata["current_version"],
+        "available": False,
+        "progress": 100,
+        "restart_required": True,
+        "error": None,
+        "message": f"已回滚到 {metadata['current_version']}，重启服务后生效",
+        "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    })
+    state_temporary = state_path.with_name(f".{state_path.name}.{uuid.uuid4().hex}")
+    state_temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(state_temporary, state_path)
+    print(f"已回滚到 {metadata['current_version']}，重启服务后生效")
+    return 0
+
+
+def main() -> int:
+    root = install_root()
+    if len(sys.argv) > 1 and sys.argv[1] == "rollback":
+        return emergency_rollback(root)
+    current = root / "current"
+    if not current.exists():
+        print(f"Muteki 托管安装不完整：{current} 不存在", file=sys.stderr)
+        return 1
+    release = current.resolve()
+    python = release / ".venv" / "bin" / "python"
+    if not python.is_file():
+        python = Path(sys.executable)
+    os.environ["MUTEKI_INSTALL_ROOT"] = str(root)
+    os.environ["MUTEKI_RELEASE_ROOT"] = str(release)
+    os.chdir(release)
+    os.execv(str(python), [str(python), "-m", "muteki.cli", *sys.argv[1:]])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

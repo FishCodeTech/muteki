@@ -36,6 +36,8 @@ def format_event(ev: Event) -> Optional[str]:
         return f"[b]▶ RUN[/b] {ch.get('name','?')} [{ch.get('category','?')}]"
     if et is EventType.REASONING_DELTA:
         t = p.get("text", "").strip()
+        if p.get("turn_end") and not t:
+            return None
         return f"[dim]{sid} ⋯ {t}[/dim]" if t else None
     if et is EventType.TOOL_CALL_START:
         return f"[cyan]{sid} ⚙ {p.get('tool','?')}[/cyan]"

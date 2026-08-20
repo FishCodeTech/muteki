@@ -1,5 +1,5 @@
 # muteki worker image — clean Kali build (only public tooling, no baked login state).
-# Ships the full Kali/CTF toolchain + offline knowledge base + the three engine CLIs
+# Ships the full Kali/CTF toolchain + offline knowledge base + all nine engine CLIs
 # + the in-container Runtime Control Plane supervisor (runtime_agent, PID1/ENTRYPOINT).
 # Credentials are injected at runtime from Credential Accounts — never baked here.
 #
@@ -17,6 +17,11 @@
 # then read the new digest from `docker images --digests`. Last pinned: 2026-06-17.
 FROM kalilinux/kali-rolling@sha256:256893c92bbd289b07d9ef8a62e75f9c7cb3d9e570fb3d3725b2e86b9acd5728
 
+# http.kali.org is a redirector and can send one apt transaction across several
+# mirrors. A single unavailable mirror then stalls the complete image build. Use
+# Kali's official CDN by default; build.sh exposes MUTEKI_KALI_MIRROR as an override.
+ARG KALI_MIRROR="http://kali.download/kali"
+
 ENV TZ=Asia/Shanghai \
     PLAYWRIGHT_MCP_BROWSER=chromium \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
@@ -28,11 +33,18 @@ ENV TZ=Asia/Shanghai \
 #    mirror is mid-sync — "File has unexpected size. Mirror sync in progress?" — which
 #    would otherwise abort an `apt update` and the whole layer). Without it, installs
 #    work fine off the Packages index.
-RUN printf 'Acquire::Retries "8";\nAcquire::IndexTargets::deb::Contents-deb::DefaultEnabled "false";\nAcquire::IndexTargets::deb::Contents-deb-legacy::DefaultEnabled "false";\n' \
+RUN sed -i "s|http://http.kali.org/kali/|${KALI_MIRROR%/}/|g" \
+      /etc/apt/sources.list.d/kali.sources && \
+    kali_mirror_host="${KALI_MIRROR#*://}" && \
+    kali_mirror_host="${kali_mirror_host%%/*}" && \
+    printf 'Acquire::Retries "8";\nAcquire::Queue-Mode "host";\nAcquire::http::Pipeline-Depth "0";\nAcquire::https::Pipeline-Depth "0";\nAcquire::http::Proxy::%s "DIRECT";\nAcquire::https::Proxy::%s "DIRECT";\nAcquire::IndexTargets::deb::Contents-deb::DefaultEnabled "false";\nAcquire::IndexTargets::deb::Contents-deb-legacy::DefaultEnabled "false";\n' \
+      "$kali_mirror_host" "$kali_mirror_host" \
       > /etc/apt/apt.conf.d/99muteki-robust
 
 # 1) Kali headless metapackage — the broad tool base every track draws on.
-RUN apt update && \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt update && \
     apt -y install kali-linux-headless && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
@@ -68,9 +80,10 @@ EOF
 #    the big optional ones — ghidra/sagemath/volatility3.)
 RUN apt update && \
     apt install -y --no-install-recommends \
-      npm jq ncat netcat-traditional rlwrap tmux ripgrep fd-find \
+      npm jq ncat netcat-traditional rlwrap tmux ripgrep fd-find cmake \
       binwalk foremost exiftool sqlmap gobuster ffuf nikto gdb tshark \
-      radare2 git curl wget unzip openssh-client sshpass python3-pip && \
+      radare2 git curl wget unzip openssh-client sshpass python3-pip \
+      python3-pwntools && \
     apt clean && rm -rf /var/lib/apt/lists/*
 
 # ghidra in its own layer (slow, large, apt-installable). sagemath/volatility3 are
@@ -81,15 +94,18 @@ RUN apt update && \
     apt install -y --no-install-recommends ghidra && \
     apt clean && rm -rf /var/lib/apt/lists/*
 
-# 4) CTF python stack (system-wide, so any worker/user picks it up). volatility3 is
-#    here (pip) since Kali no longer packages it — gives the `vol`/`vol3` commands.
+# 4) CTF python stack (system-wide, so any worker/user picks it up). Pwntools stays
+#    on Kali's Python 3.14-compatible package; its PyPI dependency currently selects
+#    unicorn 2.1.2, which does not compile on this rolling base. volatility3 is here
+#    (pip) since Kali no longer packages it — gives the `vol`/`vol3` commands.
 #    --ignore-installed: angr pulls a newer mpmath, but Kali's mpmath was apt-
 #    installed with no pip RECORD file, so pip refuses to uninstall it and aborts
 #    ("Cannot uninstall mpmath ... no RECORD file"). --ignore-installed tells pip to
 #    install its versions ALONGSIDE the apt ones instead of trying to remove them.
 RUN pip3 install --break-system-packages --no-cache-dir --ignore-installed \
-      pwntools requests beautifulsoup4 lxml pymongo \
-      pycryptodome sympy gmpy2 z3-solver ropgadget angr volatility3
+      requests beautifulsoup4 lxml pymongo \
+      pycryptodome sympy gmpy2 z3-solver ropgadget angr volatility3 \
+      deepseek-harness-sdk==0.1.0rc6
 
 # 4b) SageMath via conda-forge (SageMath's officially-recommended install; the only
 #     reliable route while the apt package is gone). Installed into /opt/conda; the
@@ -102,33 +118,56 @@ RUN pip3 install --break-system-packages --no-cache-dir --ignore-installed \
 # Re-pin: bump MINIFORGE_VERSION, download the installer, `shasum -a 256` it.
 ARG MINIFORGE_VERSION=26.3.2-3
 ARG MINIFORGE_SHA256=848194851a98903134187fbb4ab50efe87b003e0c0f808f97644b7524a62bf2c
-RUN sudo curl -fsSL --retry 8 --retry-all-errors -o /tmp/miniforge.sh \
+RUN curl -fsSL --retry 8 --retry-all-errors -o /tmp/miniforge.sh \
       "https://github.com/conda-forge/miniforge/releases/download/${MINIFORGE_VERSION}/Miniforge3-${MINIFORGE_VERSION}-Linux-x86_64.sh" && \
     echo "${MINIFORGE_SHA256}  /tmp/miniforge.sh" | sha256sum -c - && \
-    sudo bash /tmp/miniforge.sh -b -p /opt/conda && \
-    sudo rm -f /tmp/miniforge.sh && \
-    sudo /opt/conda/bin/conda config --set remote_max_retries 10 && \
-    sudo /opt/conda/bin/conda config --set remote_connect_timeout_secs 30 && \
-    sudo /opt/conda/bin/conda config --set remote_read_timeout_secs 120 && \
+    bash /tmp/miniforge.sh -b -p /opt/conda && \
+    rm -f /tmp/miniforge.sh && \
+    /opt/conda/bin/conda config --set remote_max_retries 10 && \
+    /opt/conda/bin/conda config --set remote_connect_timeout_secs 30 && \
+    /opt/conda/bin/conda config --set remote_read_timeout_secs 120 && \
     for i in 1 2 3 4 5; do \
-      sudo /opt/conda/bin/conda install -y -c conda-forge sage && break || \
+      /opt/conda/bin/conda install -y -c conda-forge sage && break || \
       { echo "conda install attempt $i failed, retrying..."; sleep 10; }; \
     done && \
-    sudo /opt/conda/bin/conda list sage | grep -qi '^sage ' && \
-    sudo /opt/conda/bin/conda clean -afy && \
-    sudo ln -sf /opt/conda/bin/sage /usr/local/bin/sage
+    /opt/conda/bin/conda list sage | grep -qi '^sage ' && \
+    /opt/conda/bin/conda clean -afy && \
+    ln -sf /opt/conda/bin/sage /usr/local/bin/sage
 
-# 5) Engine CLIs. claude/codex via npm (global, on PATH at /usr/local/bin).
+# Keep the CLI runtime identical to slim. Kimi Code requires Node.js 22.19+;
+# relying on Kali rolling's current Node version would make this image drift.
+ARG NODE_VERSION="22.19.0"
+ARG NODE_MIRROR="https://nodejs.org/dist"
+RUN curl -fsSL "$NODE_MIRROR/v$NODE_VERSION/node-v$NODE_VERSION-linux-x64.tar.gz" \
+      -o /tmp/node.tar.gz && \
+    tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 && \
+    rm -f /tmp/node.tar.gz && \
+    node --version && npm --version
+
+# 5) Engine CLIs. claude/codex/pi via npm (global, on PATH at /usr/local/bin).
 #    Credentials are injected at runtime — login state is NEVER baked.
-RUN npm install -g \
-      @openai/codex@0.138.0 \
-      @anthropic-ai/claude-code@2.1.98
+ARG NPM_REGISTRY=""
+RUN if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi && \
+    npm install -g \
+      @openai/codex@0.146.0 \
+      @anthropic-ai/claude-code@2.1.220 \
+      @earendil-works/pi-coding-agent@0.84.1 \
+      @moonshot-ai/kimi-code@0.36.1 \
+      opencode-ai@1.18.18
 
 # cursor-agent is NOT an npm package — it installs via cursor.com/install into
 # ~/.local/bin. Do it as the kali user so it lands in kali's HOME (the worker runs as
 # kali; container_exec pins the absolute path /home/kali/.local/bin/cursor-agent).
 USER kali
 RUN curl -fsSL https://cursor.com/install | bash
+# OMP's npm entrypoint requires Bun at runtime. Use its official prebuilt binary and
+# pin the release so full/slim use the same executable.
+RUN curl -fsSL https://omp.sh/install | sh -s -- --binary --ref v17.3.5 && \
+    /home/kali/.local/bin/omp --version
+# Grok Build is a native binary. Pin the official installer to the version used by
+# the host integration so image behaviour does not change between rebuilds.
+RUN curl -fsSL https://x.ai/cli/install.sh | bash -s 1.0.4 && \
+    /home/kali/.grok/bin/grok --version
 USER root
 
 # 6) Offline knowledge base (public upstream repos only). Shallow
@@ -152,6 +191,11 @@ RUN mkdir -p /home/kali/knowledges /home/kali/pocs /home/kali/.local && \
 # 7) Runtime Agent (Go supervisor, §10) — cross-compiled static binary, COPY'd in.
 #    build.sh outputs it to docker/worker/runtime_agent (this build context) first.
 COPY ./runtime_agent /opt/muteki/runtime_agent
+COPY ./deepseek_harness_worker.py /opt/muteki/deepseek_harness_worker.py
+COPY ./offline_acp_bridge.py /opt/muteki/offline_acp_bridge.py
+COPY ./omp_offline_config.yml /opt/muteki/omp_offline_config.yml
+COPY ./kimi_offline_agent.md /opt/muteki/kimi_offline_agent.md
+COPY ./grok_offline_agent.md /opt/muteki/grok_offline_agent.md
 RUN chmod +x /opt/muteki/runtime_agent
 
 # 8) Tool-awareness map, baked OUTSIDE the mounted workspace (坑 A). The supervisor
@@ -163,40 +207,7 @@ COPY ./blackboard.SKILL.md /opt/muteki/muteki-blackboard/SKILL.md
 COPY ./blackboard.py /opt/muteki/muteki-blackboard/blackboard.py
 RUN chmod +x /opt/muteki/muteki-blackboard/blackboard.py && \
     cp /opt/muteki/muteki-blackboard/blackboard.py /usr/local/bin/blackboard.py && \
-    chmod +x /usr/local/bin/blackboard.py && \
-    install -d -o kali -g kali \
-      /home/kali/.claude/skills/muteki-blackboard \
-      /home/kali/.agents/skills/muteki-blackboard \
-      /home/kali/.codex/skills/muteki-blackboard \
-      /home/kali/.cursor/skills-cursor/muteki-blackboard \
-      /home/kali/.cursor/skills/muteki-blackboard && \
-    cp /opt/muteki/muteki-blackboard/SKILL.md \
-      /home/kali/.claude/skills/muteki-blackboard/SKILL.md && \
-    cp /opt/muteki/muteki-blackboard/blackboard.py \
-      /home/kali/.claude/skills/muteki-blackboard/blackboard.py && \
-    cp /opt/muteki/muteki-blackboard/SKILL.md \
-      /home/kali/.agents/skills/muteki-blackboard/SKILL.md && \
-    cp /opt/muteki/muteki-blackboard/blackboard.py \
-      /home/kali/.agents/skills/muteki-blackboard/blackboard.py && \
-    cp /opt/muteki/muteki-blackboard/SKILL.md \
-      /home/kali/.codex/skills/muteki-blackboard/SKILL.md && \
-    cp /opt/muteki/muteki-blackboard/blackboard.py \
-      /home/kali/.codex/skills/muteki-blackboard/blackboard.py && \
-    cp /opt/muteki/muteki-blackboard/SKILL.md \
-      /home/kali/.cursor/skills-cursor/muteki-blackboard/SKILL.md && \
-    cp /opt/muteki/muteki-blackboard/blackboard.py \
-      /home/kali/.cursor/skills-cursor/muteki-blackboard/blackboard.py && \
-    cp /opt/muteki/muteki-blackboard/SKILL.md \
-      /home/kali/.cursor/skills/muteki-blackboard/SKILL.md && \
-    cp /opt/muteki/muteki-blackboard/blackboard.py \
-      /home/kali/.cursor/skills/muteki-blackboard/blackboard.py && \
-    chown -R kali:kali /home/kali/.claude /home/kali/.agents /home/kali/.codex /home/kali/.cursor && \
-    chmod +x \
-      /home/kali/.claude/skills/muteki-blackboard/blackboard.py \
-      /home/kali/.agents/skills/muteki-blackboard/blackboard.py \
-      /home/kali/.codex/skills/muteki-blackboard/blackboard.py \
-      /home/kali/.cursor/skills-cursor/muteki-blackboard/blackboard.py \
-      /home/kali/.cursor/skills/muteki-blackboard/blackboard.py
+    chmod +x /usr/local/bin/blackboard.py
 
 # 9) workspace + control dir; supervisor as ENTRYPOINT (PID1, replaces sleep infinity).
 RUN mkdir -p /home/kali/workspace && chown kali:kali /home/kali/workspace && \
@@ -208,7 +219,7 @@ RUN mkdir -p /home/kali/workspace && chown kali:kali /home/kali/workspace && \
 # --build-arg IMAGE_VERSION=<version>.
 ARG IMAGE_VERSION=dev
 LABEL org.opencontainers.image.title="muteki-worker" \
-      org.opencontainers.image.description="Kali muteki worker: full CTF toolchain + reverse-connector + 3 agent CLIs" \
+      org.opencontainers.image.description="Kali muteki worker: full CTF toolchain + reverse-connector + 9 agent CLIs" \
       org.opencontainers.image.version="${IMAGE_VERSION}"
 
 WORKDIR /home/kali/workspace

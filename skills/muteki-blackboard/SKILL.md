@@ -90,6 +90,16 @@ Run these at the RIGHT moments — not constantly, not never:
    python3 blackboard.py read-directives
    ```
 
+8. **Submit a recovered Flag through the Blackboard API** — this is the only path
+   that can complete a CTF task:
+   ```
+   python3 blackboard.py submit-flag '<exact flag>'
+   ```
+   Submit only after the Flag appeared in real command output or a real artifact.
+   The API records a candidate; the owning Worker validates it against captured
+   execution output before the Coordinator accepts it. Writing `FOUND_FLAG=` or
+   placing a Flag in ordinary assistant text does not submit or accept it.
+
 ## Rules
 
 - Query the board with intent, then get back to running real commands. Do **not**
@@ -98,8 +108,61 @@ Run these at the RIGHT moments — not constantly, not never:
   verified facts; a hallucinated "fact" poisons everyone's plan.
 - Writing a dead-end is as valuable as writing a fact — it's how the swarm avoids
   going in circles.
+- Never use ordinary reply text or `FOUND_FLAG=` as a submission mechanism. Call
+  `submit-flag` once for every distinct candidate recovered from real output.
 - Treat Review-Arbiter output as control guidance, not ground truth. A challenged
   fact is temporarily unsafe to rely on; a suppressed route should be avoided unless
   you have fresh evidence that reopens it.
 - The board persists across workers: a worker that starts after you will read what
   you wrote. That's the whole point — you're building a shared map.
+
+## Teammate mode (f11 agent-teams)
+
+When your prompt hat says you are a named teammate on a team (e.g. `exploit-1` on
+`team-<challenge>`), you are in **teammate mode**. Always pass `--mode=teammate`;
+in this mode the full-board read subcommands (`read-facts`, `read-routes`,
+`read-branches`, …) are **not registered at all** — your world is your task, your
+mailbox, and evidence-backed assertions, not the whole board.
+
+Your identity comes from `$MUTEKI_TEAM_MEMBER` (set it to your teammate name).
+Loop: `heartbeat` (~every 30s while working) → `msg-check` → `task-list` →
+`task-claim` → real tools → `task-done`/`assert-write`/`msg-send`.
+
+```
+# liveness (protocol frame, free — do it often)
+python3 blackboard.py --mode=teammate heartbeat
+
+# inbox + team channel digest (pull-style; never dumps the raw channel)
+python3 blackboard.py --mode=teammate msg-check
+python3 blackboard.py --mode=teammate msg-check --digest
+
+# shared task list: claim atomically (WON/LOST), finish with evidence
+python3 blackboard.py --mode=teammate task-list --status pending
+python3 blackboard.py --mode=teammate task-claim task-abc123
+python3 blackboard.py --mode=teammate task-done task-abc123 \
+    --evidence artifact:ws/poc/resp.txt:sha256:deadbeef...
+
+# direct messages (typed; evidence-kind messages REQUIRE --evidence; hop≤2)
+python3 blackboard.py --mode=teammate msg-send --kind=evidence --to=verify-1 \
+    --body="login param looks injectable" \
+    --evidence artifact:ws/poc/login_resp.txt:sha256:...
+
+# team channel: ONLY evidence|dead_end|surprise|request_help (no coordination,
+# no chatter); ≤12 posts per member per challenge
+python3 blackboard.py --mode=teammate msg-send --kind=channel \
+    --channel-kind=surprise --body="unexpected Set-Cookie on 403"
+
+# register a file as citable evidence first
+python3 blackboard.py --mode=teammate artifact-put ws/poc/login_resp.txt
+
+# order-sensitive chain steps: block on the turn token, attach the printed
+# fence to token-gated claims
+python3 blackboard.py --mode=teammate token-wait --protocol=chain-handoff-1 --timeout=60
+python3 blackboard.py --mode=teammate task-claim task-xyz --token-id=tt-... --token-fence=7
+```
+
+Hard rules enforced by the server (not by your good intentions): messages past
+`msg_cap` or an open circuit breaker are rejected unless they are evidence-class;
+`hop>2`, evidence-less evidence/dead_end/contradiction messages, and off-whitelist
+channel kinds are rejected; `task-done` and `assert-write` without `--evidence`
+are rejected.

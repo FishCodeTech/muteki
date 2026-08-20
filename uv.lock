@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.13"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -152,6 +152,28 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d8/53/6f443c9a4a8358a93a6792e2acffb9d9d5cb0a5cfd8802644b7b1c9a02e4/colorama-0.4.6.tar.gz", hash = "sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44", size = 27697, upload-time = "2022-10-25T02:36:22.414Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colorama-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6", size = 25335, upload-time = "2022-10-25T02:36:20.889Z" },
+]
+
+[[package]]
+name = "deepseek-harness-runtime-bin"
+version = "0.1.0rc6"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/72/19/548c84e9d02683612b6a3a23571d68480c657ef5f4aa1e3c656898ee1824/deepseek_harness_runtime_bin-0.1.0rc6-py3-none-macosx_14_0_arm64.whl", hash = "sha256:2bbd65edd52dfc340d74f88a890e8031a272a820e58406c2de1f5f5dee51bd9f", size = 52313658, upload-time = "2026-08-13T12:51:03.522Z" },
+    { url = "https://files.pythonhosted.org/packages/f6/0b/d9128f0b3edc5ab5fc6d8746e669c924bd23fd017e645796b3b439dd0eb3/deepseek_harness_runtime_bin-0.1.0rc6-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:99d0ef334a4e3cb178d7b0302bbdd01c8dde6068ee5fe8b01e074541db5c7747", size = 56774186, upload-time = "2026-08-13T12:51:07.783Z" },
+    { url = "https://files.pythonhosted.org/packages/c6/26/1c6bc9c26618ca5b2f155a428d4c0c5d5174b68077cccbc10a1629bb3611/deepseek_harness_runtime_bin-0.1.0rc6-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:d7261d3bdadfa8d10ab03fd06c6bbc66a182ae27d39892a0eb7c2ce9d63a5448", size = 57038106, upload-time = "2026-08-13T12:51:11.387Z" },
+]
+
+[[package]]
+name = "deepseek-harness-sdk"
+version = "0.1.0rc6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "deepseek-harness-runtime-bin" },
+    { name = "pydantic" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/47/10/efd7ad88cd6140be4883d055abf9acd7fa8e5424a20de8a224d310e67f2f/deepseek_harness_sdk-0.1.0rc6-py3-none-any.whl", hash = "sha256:8a05421be4298196cf94383e0a3164b020f5f5977a8d30019cc5add64cb208eb", size = 12880, upload-time = "2026-08-13T12:52:09.047Z" },
 ]
 
 [[package]]
@@ -571,12 +593,13 @@ wheels = [
 
 [[package]]
 name = "project-muteki"
-version = "0.2.5"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
     { name = "beautifulsoup4" },
     { name = "capstone" },
+    { name = "deepseek-harness-sdk" },
     { name = "fastapi" },
     { name = "gmpy2" },
     { name = "httpx" },
@@ -617,6 +640,7 @@ requires-dist = [
     { name = "anyio", specifier = ">=4.3" },
     { name = "beautifulsoup4", specifier = ">=4.12" },
     { name = "capstone", specifier = ">=5.0.9" },
+    { name = "deepseek-harness-sdk", specifier = "==0.1.0rc6" },
     { name = "fastapi", specifier = ">=0.110" },
     { name = "gmpy2", specifier = ">=2.3.0" },
     { name = "httpx", specifier = ">=0.27" },

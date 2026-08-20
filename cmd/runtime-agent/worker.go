@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -24,13 +25,14 @@ type worker struct {
 	cmd  *exec.Cmd
 	pgid int
 
-	mu        sync.Mutex
-	paused    bool
-	exited    bool
-	rc        int
-	signalled int
-	timedOut  bool
-	oom       bool
+	mu            sync.Mutex
+	paused        bool
+	exited        bool
+	rc            int
+	signalled     int
+	timedOut      bool
+	oom           bool
+	killRequested bool
 }
 
 // uid/gid of the kali user the worker runs as. Resolved once at startup. The
@@ -66,6 +68,10 @@ func resolveKali() {
 // channel so the host can distinguish (the driver only re-parses stdout, but stderr
 // is surfaced for diagnostics).
 func startWorker(id string, spec *WorkerSpec) (*worker, <-chan Frame, error) {
+	return startWorkerWithRuntime(id, spec, runtimeChildReaper, runtimeOOMTracker)
+}
+
+func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oomTracker *oomTracker) (*worker, <-chan Frame, error) {
 	if len(spec.Argv) == 0 {
 		return nil, nil, &startErr{"empty argv"}
 	}
@@ -98,8 +104,24 @@ func startWorker(id string, spec *WorkerSpec) (*worker, <-chan Frame, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	// Worker reads nothing from stdin → instant EOF (codex hangs on an open stdin).
-	cmd.Stdin = nil
+	// Ordinary workers get instant EOF (codex hangs on an open stdin). A secure
+	// prompt gets an explicit pipe + completion frame: cmd.Start alone is NOT proof
+	// that os/exec's asynchronous Reader copy reached the child.
+	var stdinPipe io.WriteCloser
+	var stdinPayload []byte
+	if spec.Stdin != "" {
+		stdinPayload = []byte(spec.Stdin)
+		spec.Stdin = "" // drop the decoded request copy before spawning
+		stdinPipe, err = cmd.StdinPipe()
+		if err != nil {
+			for i := range stdinPayload {
+				stdinPayload[i] = 0
+			}
+			return nil, nil, err
+		}
+	} else {
+		cmd.Stdin = nil
+	}
 
 	// Make the dirs the worker writes owned by the kali user it runs as. Both the
 	// worker's cwd (a per-worker dir like workspace/workers/cli-<seat>-N) AND its HOME
@@ -145,8 +167,15 @@ func startWorker(id string, spec *WorkerSpec) (*worker, <-chan Frame, error) {
 		}
 	}
 
-	oomBefore := readOOMKill()
-	if err := cmd.Start(); err != nil {
+	oomObservation := oomTracker.begin()
+	if err := reaper.start(cmd); err != nil {
+		oomTracker.cancel(oomObservation)
+		if stdinPipe != nil {
+			_ = stdinPipe.Close()
+		}
+		for i := range stdinPayload {
+			stdinPayload[i] = 0
+		}
 		return nil, nil, err
 	}
 	pgid, _ := syscall.Getpgid(cmd.Process.Pid)
@@ -167,6 +196,39 @@ func startWorker(id string, spec *WorkerSpec) (*worker, <-chan Frame, error) {
 	se := bufio.NewScanner(stderr)
 	go pump(so, "out")
 	go pump(se, "err")
+
+	var stdinWG sync.WaitGroup
+	if stdinPipe != nil {
+		stdinWG.Add(1)
+		go func(payload []byte) {
+			defer stdinWG.Done()
+			ok := true
+			offset := 0
+			for offset < len(payload) {
+				n, writeErr := stdinPipe.Write(payload[offset:])
+				if n > 0 {
+					offset += n
+				}
+				if writeErr != nil || n == 0 {
+					ok = false
+					break
+				}
+			}
+			if closeErr := stdinPipe.Close(); closeErr != nil {
+				ok = false
+			}
+			// Best-effort zero the mutable transport copy immediately after the pipe
+			// completes; do not retain it for the worker's 30s status grace period.
+			for i := range payload {
+				payload[i] = 0
+			}
+			frame := Frame{T: "stdin", OK: ok}
+			if !ok {
+				frame.Error = "stdin handoff incomplete"
+			}
+			events <- frame
+		}(stdinPayload)
+	}
 
 	// Wall-clock cap: SIGKILL the whole tree once it has spent TimeoutSec ACTIVELY
 	// running (authoritative, replaces the in-container `timeout -s KILL`). M7: the
@@ -195,10 +257,18 @@ func startWorker(id string, spec *WorkerSpec) (*worker, <-chan Frame, error) {
 				}
 				last = now
 				if active >= budget {
+					// Publish the supervisor-authored KILL cause before delivering the
+					// signal. The child can exit and Cmd.Wait can return immediately;
+					// setting this afterwards would leave a window where a concurrent
+					// cgroup delta could be falsely attributed as an OOM.
 					w.mu.Lock()
-					w.timedOut = true
+					w.killRequested = true
 					w.mu.Unlock()
-					w.signalTree(syscall.SIGKILL)
+					if err := w.signalTree(syscall.SIGKILL); err == nil {
+						w.mu.Lock()
+						w.timedOut = true
+						w.mu.Unlock()
+					}
 					return
 				}
 			}
@@ -206,21 +276,30 @@ func startWorker(id string, spec *WorkerSpec) (*worker, <-chan Frame, error) {
 	}()
 
 	go func() {
-		// Wait for both pumps to drain the pipes, THEN reap — otherwise Wait() can
-		// close the pipes mid-read and we lose trailing output.
+		// The stdin receipt must precede exit/channel-close. Wait for its writer and
+		// both output pumps, THEN reap — otherwise Wait can close pipes mid-transfer.
+		stdinWG.Wait()
 		streamWG.Wait()
-		err := cmd.Wait()
+		err := reaper.wait(cmd)
 		close(timerDone)
 		rc, sig := exitInfo(err)
-		oomAfter := readOOMKill()
-		oom := oomBefore >= 0 && oomAfter > oomBefore
+
+		w.mu.Lock()
+		timedOutRequested := w.timedOut
+		killRequested := w.killRequested
+		w.mu.Unlock()
+		oomEvidence := oomTracker.finish(oomObservation)
+		oom := oomEvidence.attributable(sig, timedOutRequested, killRequested)
+		if oomEvidence.delta > 0 && !oom {
+			log.Printf("runtime-agent: observed container oom_kill delta=%d for worker %s but attribution was ambiguous or contradicted by the exit cause", oomEvidence.delta, id)
+		}
 
 		w.mu.Lock()
 		w.exited = true
 		w.rc = rc
 		w.signalled = sig
 		w.oom = oom
-		timedOut := w.timedOut && !oom // an OOM that races the timer is an OOM
+		timedOut := w.timedOut && !oom
 		w.timedOut = timedOut
 		w.mu.Unlock()
 
@@ -233,34 +312,46 @@ func startWorker(id string, spec *WorkerSpec) (*worker, <-chan Frame, error) {
 
 // signalTree sends sig to the worker's whole process group (negative pgid). Used for
 // STOP/CONT/KILL/TERM. Safe to call after exit (best-effort).
-func (w *worker) signalTree(sig syscall.Signal) {
+func (w *worker) signalTree(sig syscall.Signal) error {
 	if w.pgid > 0 {
-		_ = syscall.Kill(-w.pgid, sig)
-		return
+		return syscall.Kill(-w.pgid, sig)
 	}
 	if w.cmd != nil && w.cmd.Process != nil {
-		_ = w.cmd.Process.Signal(sig)
+		return w.cmd.Process.Signal(sig)
 	}
+	return &startErr{"worker process unavailable"}
 }
 
 func (w *worker) signal(name string) error {
+	var sig syscall.Signal
 	switch name {
 	case "STOP":
-		w.mu.Lock()
-		w.paused = true
-		w.mu.Unlock()
-		w.signalTree(syscall.SIGSTOP)
+		sig = syscall.SIGSTOP
 	case "CONT":
-		w.mu.Lock()
-		w.paused = false
-		w.mu.Unlock()
-		w.signalTree(syscall.SIGCONT)
+		sig = syscall.SIGCONT
 	case "TERM":
-		w.signalTree(syscall.SIGTERM)
+		sig = syscall.SIGTERM
 	case "KILL":
-		w.signalTree(syscall.SIGKILL)
+		sig = syscall.SIGKILL
 	default:
 		return &startErr{"unknown signal " + name}
+	}
+	if name == "KILL" {
+		// See the timer path above: cause publication must happen before the
+		// signal, otherwise the waiter can win the race and label an operator KILL
+		// from unrelated container-wide OOM evidence. A failed attempt may leave
+		// this true, which is an intentional conservative false-negative boundary.
+		w.mu.Lock()
+		w.killRequested = true
+		w.mu.Unlock()
+	}
+	if err := w.signalTree(sig); err != nil {
+		return err
+	}
+	if name == "STOP" || name == "CONT" {
+		w.mu.Lock()
+		w.paused = name == "STOP"
+		w.mu.Unlock()
 	}
 	return nil
 }

@@ -2,7 +2,19 @@
 
 All notable public release changes are tracked here.
 
-## Unreleased
+## 0.3.0 - 2026-08-17
+
+### Added
+
+- Added managed install, upgrade, and rollback through `muteki` / `./run.sh`, using a signed GitHub Release bundle and SHA-256 verification.
+- Added a versioned Compose deployment (`docker-compose.release.yml`) with `muteki upgrade --compose` / `muteki rollback --compose`.
+- Added **Settings → System update** in the web command deck, including compose-mode commands that stay on the host.
+- Added `/api/health` for Compose liveness checks.
+
+### Changed
+
+- Package versions are `0.3.0`. Git tags and GHCR image tags keep the leading `v`, for example `v0.3.0`.
+- Slim worker image documentation now matches the nine engine CLIs.
 
 ### Fixed
 

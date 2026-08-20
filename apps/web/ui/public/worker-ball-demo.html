@@ -1,0 +1,1207 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Muteki Worker 出战原型</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0b0e13;
+        --panel: #11151c;
+        --panel-2: #151a22;
+        --line: rgba(226, 232, 240, 0.1);
+        --line-strong: rgba(226, 232, 240, 0.18);
+        --text: #f4f6fa;
+        --muted: #868e9c;
+        --faint: #596170;
+        --accent: #91adff;
+        --accent-soft: rgba(145, 173, 255, 0.14);
+        --success: #77d6ae;
+        --ease: cubic-bezier(0.22, 1, 0.36, 1);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: var(--bg);
+        color: var(--text);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+
+      button {
+        color: inherit;
+        font: inherit;
+      }
+
+      .app {
+        display: grid;
+        grid-template-rows: 64px minmax(0, 1fr);
+        width: 100%;
+        height: 100%;
+        background:
+          radial-gradient(circle at 44% 18%, rgba(115, 143, 214, 0.05), transparent 28%),
+          var(--bg);
+      }
+
+      .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 22px;
+        border-bottom: 1px solid var(--line);
+        background: rgba(11, 14, 19, 0.86);
+        backdrop-filter: blur(18px);
+      }
+
+      .brand,
+      .actions,
+      .status,
+      .basket-title,
+      .worker-meta,
+      .field-row {
+        display: flex;
+        align-items: center;
+      }
+
+      .brand {
+        gap: 13px;
+      }
+
+      .mark {
+        display: grid;
+        width: 31px;
+        height: 31px;
+        place-items: center;
+        border: 1px solid var(--line-strong);
+        border-radius: 9px;
+        background: linear-gradient(145deg, #202633, #12161d);
+        box-shadow: inset 0 1px rgba(255, 255, 255, 0.05);
+        font-size: 13px;
+        font-weight: 750;
+        letter-spacing: -0.05em;
+      }
+
+      h1,
+      h2,
+      p {
+        margin: 0;
+      }
+
+      h1 {
+        font-size: 14px;
+        font-weight: 650;
+        letter-spacing: -0.01em;
+      }
+
+      .brand p {
+        margin-top: 3px;
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      .actions {
+        gap: 8px;
+      }
+
+      .btn {
+        min-height: 34px;
+        padding: 0 13px;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        background: rgba(255, 255, 255, 0.025);
+        color: #cbd1dc;
+        cursor: pointer;
+        font-size: 12px;
+        transition:
+          transform 150ms var(--ease),
+          border-color 220ms var(--ease),
+          background 220ms var(--ease),
+          color 220ms var(--ease);
+      }
+
+      .btn:hover {
+        border-color: var(--line-strong);
+        background: rgba(255, 255, 255, 0.055);
+        color: #fff;
+      }
+
+      .btn:active {
+        transform: scale(0.97);
+      }
+
+      .btn.primary {
+        border-color: rgba(145, 173, 255, 0.34);
+        background: var(--accent-soft);
+        color: #dce5ff;
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns: minmax(620px, 1fr) 292px;
+        min-height: 0;
+      }
+
+      .stage-shell {
+        display: grid;
+        grid-template-rows: 82px minmax(0, 1fr);
+        min-width: 0;
+        min-height: 0;
+        border-right: 1px solid var(--line);
+      }
+
+      .shelf-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        padding: 19px 24px 0;
+      }
+
+      .shelf-head h2 {
+        font-size: 13px;
+        font-weight: 620;
+      }
+
+      .shelf-head p {
+        margin-top: 6px;
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      .hint {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        color: var(--faint);
+        font-size: 10px;
+      }
+
+      .mouse-icon {
+        width: 15px;
+        height: 19px;
+        border: 1px solid #596272;
+        border-radius: 8px;
+        position: relative;
+      }
+
+      .mouse-icon::after {
+        position: absolute;
+        top: 3px;
+        left: 6px;
+        width: 1px;
+        height: 4px;
+        background: #778193;
+        content: "";
+      }
+
+      #stage {
+        position: relative;
+        min-height: 0;
+        overflow: hidden;
+        touch-action: none;
+        user-select: none;
+        background-image:
+          linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px);
+        background-size: 36px 36px;
+      }
+
+      #stage::before {
+        position: absolute;
+        top: 118px;
+        right: 24px;
+        left: 24px;
+        height: 1px;
+        background: linear-gradient(90deg, transparent, var(--line), transparent);
+        content: "";
+      }
+
+      .shelf-label {
+        position: absolute;
+        top: 103px;
+        left: 30px;
+        padding-right: 10px;
+        background: var(--bg);
+        color: var(--faint);
+        font-size: 9px;
+        letter-spacing: 0.13em;
+      }
+
+      #basket {
+        position: absolute;
+        right: 24px;
+        bottom: 24px;
+        left: 24px;
+        height: calc(100% - 176px);
+        min-height: 270px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-top-color: transparent;
+        border-radius: 0 0 28px 28px;
+        background:
+          radial-gradient(circle at 50% 0%, rgba(145, 173, 255, 0.055), transparent 34%),
+          rgba(16, 20, 27, 0.68);
+        box-shadow:
+          inset 18px 0 32px -30px rgba(180, 197, 239, 0.35),
+          inset -18px 0 32px -30px rgba(180, 197, 239, 0.35),
+          inset 0 -20px 38px -34px rgba(180, 197, 239, 0.38);
+        pointer-events: none;
+        transition:
+          background 240ms var(--ease),
+          border-color 240ms var(--ease),
+          box-shadow 240ms var(--ease);
+      }
+
+      #basket::before,
+      #basket::after {
+        position: absolute;
+        top: 0;
+        width: 23%;
+        height: 1px;
+        background: var(--line);
+        content: "";
+      }
+
+      #basket::before {
+        left: 0;
+      }
+
+      #basket::after {
+        right: 0;
+      }
+
+      #basket.active {
+        border-color: rgba(145, 173, 255, 0.32);
+        border-top-color: transparent;
+        background:
+          radial-gradient(circle at 50% 0%, rgba(145, 173, 255, 0.12), transparent 38%),
+          rgba(18, 23, 31, 0.82);
+        box-shadow:
+          inset 20px 0 36px -28px rgba(145, 173, 255, 0.48),
+          inset -20px 0 36px -28px rgba(145, 173, 255, 0.48),
+          inset 0 -24px 42px -32px rgba(145, 173, 255, 0.5);
+      }
+
+      .basket-title {
+        position: absolute;
+        top: -12px;
+        left: 50%;
+        gap: 9px;
+        padding: 0 14px;
+        transform: translateX(-50%);
+        background: var(--bg);
+        color: #9ca5b4;
+        font-size: 11px;
+        white-space: nowrap;
+      }
+
+      .basket-count {
+        display: grid;
+        min-width: 20px;
+        height: 20px;
+        place-items: center;
+        border: 1px solid var(--line-strong);
+        border-radius: 7px;
+        color: #dce5ff;
+        font-size: 10px;
+      }
+
+      .basket-empty {
+        position: absolute;
+        top: 42%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        color: #525a68;
+        font-size: 11px;
+        letter-spacing: 0.02em;
+        transition: opacity 180ms ease;
+      }
+
+      .basket-empty.hidden {
+        opacity: 0;
+      }
+
+      .ball {
+        --size: 74px;
+        --ball-tone: #3d4656;
+        position: absolute;
+        top: 0;
+        left: 0;
+        z-index: 4;
+        display: grid;
+        width: var(--size);
+        height: var(--size);
+        place-items: center;
+        border: 1px solid rgba(226, 232, 240, 0.17);
+        border-radius: 50%;
+        background: #11161e;
+        box-shadow:
+          inset 0 1px rgba(255, 255, 255, 0.08),
+          inset -12px -14px 25px rgba(0, 0, 0, 0.2),
+          0 14px 32px rgba(0, 0, 0, 0.28);
+        color: #e8ebf1;
+        cursor: grab;
+        transform: translate3d(0, 0, 0);
+        transform-style: preserve-3d;
+        perspective: 260px;
+        will-change: transform;
+      }
+
+      .ball::before {
+        position: absolute;
+        inset: 3px;
+        z-index: 2;
+        border-radius: 50%;
+        background:
+          linear-gradient(108deg, rgba(255, 255, 255, 0.12), transparent 35%, transparent 66%, rgba(0, 0, 0, 0.22)),
+          radial-gradient(circle at 31% 25%, rgba(255, 255, 255, 0.12), transparent 24%);
+        content: "";
+        pointer-events: none;
+      }
+
+      .ball::after {
+        position: absolute;
+        inset: -5px;
+        z-index: 5;
+        border: 1px solid transparent;
+        border-radius: 50%;
+        content: "";
+        transition:
+          border-color 180ms var(--ease),
+          box-shadow 240ms var(--ease);
+      }
+
+      .ball:hover::after,
+      .ball.selected::after {
+        border-color: rgba(145, 173, 255, 0.48);
+        box-shadow: 0 0 28px rgba(110, 146, 255, 0.18);
+      }
+
+      .ball.dragging {
+        z-index: 20;
+        cursor: grabbing;
+        box-shadow:
+          inset 0 1px rgba(255, 255, 255, 0.12),
+          0 24px 54px rgba(0, 0, 0, 0.5),
+          0 0 30px rgba(119, 151, 244, 0.14);
+      }
+
+      .ball.in-basket {
+        border-color: rgba(145, 173, 255, 0.26);
+      }
+
+      .ball.disabled {
+        filter: grayscale(0.8);
+        opacity: 0.48;
+      }
+
+      .sphere-surface {
+        --grid-x: 0px;
+        --grid-y: 0px;
+        --grid-angle: 0deg;
+        position: absolute;
+        inset: 2px;
+        z-index: 1;
+        display: grid;
+        place-items: center;
+        overflow: hidden;
+        border-radius: 50%;
+        background:
+          radial-gradient(circle at 30% 22%, rgba(255, 255, 255, 0.2), transparent 28%),
+          radial-gradient(circle at 46% 52%, color-mix(in srgb, var(--ball-tone) 88%, white 12%) 0%, var(--ball-tone) 58%, #10141b 118%);
+        box-shadow:
+          inset -12px -14px 25px rgba(0, 0, 0, 0.2),
+          inset 7px 6px 14px rgba(255, 255, 255, 0.035);
+        pointer-events: none;
+      }
+
+      .sphere-surface::before {
+        position: absolute;
+        inset: -28px;
+        background:
+          repeating-linear-gradient(90deg, transparent 0 16px, rgba(255, 255, 255, 0.085) 17px, transparent 18px 34px),
+          repeating-linear-gradient(0deg, transparent 0 16px, rgba(0, 0, 0, 0.11) 17px, transparent 18px 34px);
+        content: "";
+        opacity: 0.68;
+        transform: translate(var(--grid-x), var(--grid-y)) rotate(var(--grid-angle));
+        will-change: transform;
+      }
+
+      .sphere-surface::after {
+        position: absolute;
+        inset: 0;
+        border-radius: 50%;
+        background:
+          linear-gradient(90deg, rgba(0, 0, 0, 0.2), transparent 22%, transparent 70%, rgba(0, 0, 0, 0.26)),
+          radial-gradient(circle at 50% 118%, rgba(0, 0, 0, 0.28), transparent 53%);
+        content: "";
+      }
+
+      .logo-orbit {
+        position: absolute;
+        inset: 0;
+        z-index: 2;
+        display: grid;
+        place-items: center;
+        transform-origin: center;
+        will-change: transform, opacity;
+      }
+
+      .brand-logo {
+        position: relative;
+        z-index: 2;
+        width: 32px;
+        height: 32px;
+        color: rgba(248, 250, 255, 0.84);
+        filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.32));
+      }
+
+      .brand-logo path,
+      .brand-logo rect,
+      .brand-logo line,
+      .brand-logo polyline {
+        vector-effect: non-scaling-stroke;
+      }
+
+      .ball-status {
+        position: absolute;
+        right: 5px;
+        bottom: 9px;
+        width: 9px;
+        height: 9px;
+        border: 2px solid #141922;
+        border-radius: 50%;
+        background: #5d6572;
+        z-index: 6;
+        pointer-events: none;
+      }
+
+      .ball.in-basket .ball-status {
+        background: var(--success);
+        box-shadow: 0 0 10px rgba(119, 214, 174, 0.5);
+      }
+
+      .ball-name {
+        position: absolute;
+        top: calc(100% + 10px);
+        left: 50%;
+        max-width: 110px;
+        overflow: hidden;
+        transform: translateX(-50%);
+        color: #a8afbb;
+        font-size: 10px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        pointer-events: none;
+        transition: color 180ms ease;
+      }
+
+      .ball:hover .ball-name,
+      .ball.selected .ball-name {
+        color: #f3f5f8;
+      }
+
+      .inspector {
+        min-width: 0;
+        padding: 24px 22px;
+        overflow: auto;
+        background: rgba(16, 20, 27, 0.76);
+      }
+
+      .inspector-kicker {
+        color: var(--faint);
+        font-size: 9px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+
+      .worker-meta {
+        gap: 12px;
+        margin: 15px 0 24px;
+      }
+
+      .detail-logo {
+        display: grid;
+        width: 42px;
+        height: 42px;
+        flex: 0 0 auto;
+        place-items: center;
+        border: 1px solid var(--line-strong);
+        border-radius: 50%;
+        background: #181d26;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-weight: 700;
+      }
+
+      .detail-logo svg {
+        width: 21px;
+        height: 21px;
+        color: #dce1e9;
+      }
+
+      .detail-title {
+        max-width: 185px;
+        overflow: hidden;
+        font-size: 14px;
+        font-weight: 650;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .detail-subtitle {
+        margin-top: 4px;
+        color: var(--muted);
+        font-size: 10px;
+      }
+
+      .detail-section {
+        padding: 18px 0;
+        border-top: 1px solid var(--line);
+      }
+
+      .detail-section h2 {
+        margin-bottom: 13px;
+        font-size: 11px;
+        font-weight: 620;
+      }
+
+      .field-row {
+        justify-content: space-between;
+        min-height: 31px;
+        gap: 12px;
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      .field-row strong {
+        max-width: 155px;
+        overflow: hidden;
+        color: #d7dbe2;
+        font-weight: 540;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .switch {
+        position: relative;
+        width: 34px;
+        height: 20px;
+        padding: 0;
+        border: 1px solid rgba(145, 173, 255, 0.34);
+        border-radius: 999px;
+        background: rgba(145, 173, 255, 0.17);
+        cursor: pointer;
+      }
+
+      .switch::after {
+        position: absolute;
+        top: 3px;
+        right: 3px;
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: #dce5ff;
+        content: "";
+        transition: transform 220ms var(--ease);
+      }
+
+      .switch.off {
+        border-color: var(--line);
+        background: rgba(255, 255, 255, 0.035);
+      }
+
+      .switch.off::after {
+        transform: translateX(-14px);
+        background: #737c8b;
+      }
+
+      .tip {
+        margin-top: 22px;
+        padding: 12px 13px;
+        border: 1px solid var(--line);
+        border-radius: 11px;
+        background: rgba(255, 255, 255, 0.02);
+        color: #747d8c;
+        font-size: 10px;
+        line-height: 1.65;
+      }
+
+      .save-toast {
+        position: fixed;
+        right: 24px;
+        bottom: 24px;
+        z-index: 50;
+        padding: 10px 14px;
+        border: 1px solid rgba(119, 214, 174, 0.24);
+        border-radius: 10px;
+        background: rgba(18, 29, 27, 0.94);
+        color: #bcebd7;
+        font-size: 11px;
+        opacity: 0;
+        transform: translateY(8px);
+        pointer-events: none;
+        transition:
+          opacity 220ms var(--ease),
+          transform 220ms var(--ease);
+      }
+
+      .save-toast.show {
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      @media (max-width: 860px) {
+        .layout {
+          grid-template-columns: 1fr;
+        }
+
+        .inspector {
+          display: none;
+        }
+
+        .stage-shell {
+          border-right: 0;
+        }
+
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before,
+        *::after {
+          scroll-behavior: auto !important;
+          transition-duration: 0.01ms !important;
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="mark">無敵</div>
+          <div>
+            <h1>Worker 出战实验</h1>
+            <p>把 Worker 拖入出战区域</p>
+          </div>
+        </div>
+        <div class="actions">
+          <button class="btn" id="clearButton" type="button">清空阵容</button>
+          <button class="btn" id="deployButton" type="button">全部投放</button>
+          <button class="btn primary" id="saveButton" type="button">保存阵容</button>
+        </div>
+      </header>
+
+      <div class="layout">
+        <section class="stage-shell">
+          <div class="shelf-head">
+            <div>
+              <h2>可用 Worker</h2>
+              <p>圆球对应独立实例，位置不代表执行顺序</p>
+            </div>
+            <div class="hint"><span class="mouse-icon"></span>拖动圆球进行投放或移出</div>
+          </div>
+
+          <div id="stage" aria-label="Worker 出战交互区域">
+            <span class="shelf-label">待命</span>
+            <div id="basket">
+              <div class="basket-title">
+                <span>出战区域</span>
+                <span class="basket-count" id="basketCount">0</span>
+              </div>
+              <div class="basket-empty" id="basketEmpty">把 Worker 拖到这里</div>
+            </div>
+          </div>
+        </section>
+
+        <aside class="inspector">
+          <div class="inspector-kicker">当前 Worker</div>
+          <div class="worker-meta">
+            <div class="detail-logo" id="detailLogo">π</div>
+            <div>
+              <div class="detail-title" id="detailTitle">pi-main</div>
+              <div class="detail-subtitle" id="detailSubtitle">Pi · 侦察</div>
+            </div>
+          </div>
+
+          <section class="detail-section">
+            <h2>身份与运行</h2>
+            <div class="field-row"><span>运行账号</span><strong id="detailAccount">pi-main</strong></div>
+            <div class="field-row"><span>模型</span><strong id="detailModel">auto</strong></div>
+            <div class="field-row"><span>职责</span><strong id="detailRole">侦察</strong></div>
+            <div class="field-row"><span>并发</span><strong id="detailConcurrency">1</strong></div>
+          </section>
+
+          <section class="detail-section">
+            <div class="field-row">
+              <span>启用 Worker</span>
+              <button class="switch" id="enabledSwitch" type="button" aria-label="切换 Worker 启用状态"></button>
+            </div>
+            <div class="field-row"><span>出战状态</span><strong id="detailStatus">待命</strong></div>
+          </section>
+
+          <div class="tip">
+            这个页面只验证“Logo 球体 + 投放 + 物理效果”的操作方向。球体会根据移动速度滚动和旋转；账号编辑和阵容持久化暂时使用演示数据。
+          </div>
+        </aside>
+      </div>
+    </main>
+
+    <div class="save-toast" id="saveToast">阵容已保存（演示）</div>
+
+    <script>
+      (() => {
+        const stage = document.querySelector("#stage");
+        const basket = document.querySelector("#basket");
+        const basketCount = document.querySelector("#basketCount");
+        const basketEmpty = document.querySelector("#basketEmpty");
+        const clearButton = document.querySelector("#clearButton");
+        const deployButton = document.querySelector("#deployButton");
+        const saveButton = document.querySelector("#saveButton");
+        const saveToast = document.querySelector("#saveToast");
+        const enabledSwitch = document.querySelector("#enabledSwitch");
+        const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+        const detail = {
+          logo: document.querySelector("#detailLogo"),
+          title: document.querySelector("#detailTitle"),
+          subtitle: document.querySelector("#detailSubtitle"),
+          account: document.querySelector("#detailAccount"),
+          model: document.querySelector("#detailModel"),
+          role: document.querySelector("#detailRole"),
+          concurrency: document.querySelector("#detailConcurrency"),
+          status: document.querySelector("#detailStatus"),
+        };
+
+        const seed = [
+          { id: "pi-main", provider: "Pi", brand: "pi", tone: "#465b70", account: "pi-main", model: "auto", role: "侦察", concurrency: 2 },
+          { id: "pi-ollama", provider: "Pi", brand: "pi", tone: "#4a5365", account: "pi-ollama", model: "qwen3", role: "验证", concurrency: 1 },
+          { id: "claude-main", provider: "Claude", brand: "claude", tone: "#5d5364", account: "claude-main", model: "sonnet", role: "分析", concurrency: 1 },
+          { id: "codex-main", provider: "Codex", brand: "codex", tone: "#465a54", account: "codex-main", model: "gpt-5", role: "执行", concurrency: 2 },
+          { id: "cursor-main", provider: "Cursor", brand: "cursor", tone: "#4b5263", account: "cursor-main", model: "auto", role: "审查", concurrency: 1 },
+          { id: "omp-local", provider: "Omp", brand: "omp", tone: "#5b5549", account: "omp-local", model: "local", role: "补充", concurrency: 1 },
+        ];
+
+        function logoSvg(brand) {
+          const marks = {
+            pi: '<path fill="currentColor" d="M0 0v24h6v-6h6v-6H6V6h6v6h6V0Zm18 12v12h6V12Z"/>',
+            claude: '<path fill="currentColor" d="M17.304 3.541h-3.672l6.696 16.918H24ZM6.696 3.541 0 20.459h3.744l1.37-3.553h7.005l1.369 3.553h3.744L10.536 3.541Zm-.371 10.223 2.291-5.946 2.292 5.946Z"/>',
+            cursor: '<path fill="currentColor" d="M11.503.131 1.891 5.678a.84.84 0 0 0-.42.726v11.188c0 .3.162.575.42.724l9.609 5.55a1 1 0 0 0 .998 0l9.61-5.55a.84.84 0 0 0 .42-.724V6.404a.84.84 0 0 0-.42-.726L12.497.131a1.01 1.01 0 0 0-.996 0M2.657 6.338h18.55c.263 0 .43.287.297.515L12.23 22.918c-.062.107-.229.064-.229-.06V12.335a.59.59 0 0 0-.295-.51l-9.11-5.257c-.109-.063-.064-.23.061-.23"/>',
+            codex: '<rect x="3.5" y="4.5" width="17" height="15" rx="3" fill="none" stroke="currentColor" stroke-width="1.7"/><polyline points="7.5,9 10.5,12 7.5,15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><line x1="12.5" y1="15" x2="16.8" y2="15" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
+            omp: '<rect x="6" y="6" width="12" height="12" rx="2.2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M9 2.8v3.1M15 2.8v3.1M9 18.1v3.1M15 18.1v3.1M2.8 9h3.1M2.8 15h3.1M18.1 9h3.1M18.1 15h3.1" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M9.5 14.8v-5.6h2.7a2.15 2.15 0 0 1 0 4.3H9.5" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round"/>',
+          };
+          return `<svg class="brand-logo" viewBox="0 0 24 24" aria-hidden="true">${marks[brand] ?? marks.omp}</svg>`;
+        }
+
+        const balls = [];
+        let selected = null;
+        let dragging = null;
+        let dragOffsetX = 0;
+        let dragOffsetY = 0;
+        let lastPointerX = 0;
+        let lastPointerY = 0;
+        let lastPointerTime = 0;
+        let lastFrame = performance.now();
+        let toastTimer = 0;
+
+        function makeBall(data, index) {
+          const element = document.createElement("div");
+          element.className = "ball";
+          element.setAttribute("role", "button");
+          element.setAttribute("tabindex", "0");
+          element.setAttribute("aria-label", `${data.id}，拖入出战区域`);
+          element.style.setProperty("--ball-tone", data.tone);
+          element.innerHTML = `
+            <span class="sphere-surface" aria-hidden="true">
+              <span class="logo-orbit">${logoSvg(data.brand)}</span>
+            </span>
+            <span class="ball-status"></span>
+            <span class="ball-name">${data.id}</span>
+          `;
+          stage.appendChild(element);
+
+          const ball = {
+            ...data,
+            element,
+            index,
+            x: 0,
+            y: 0,
+            vx: 0,
+            vy: 0,
+            rotationX: 0,
+            rotationY: 0,
+            rotationZ: 0,
+            radius: 37,
+            inBasket: false,
+            enabled: true,
+            dragging: false,
+            surface: element.querySelector(".sphere-surface"),
+            logoOrbit: element.querySelector(".logo-orbit"),
+          };
+
+          element.addEventListener("pointerdown", (event) => startDrag(event, ball));
+          element.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              ball.inBasket ? removeBall(ball) : deployBall(ball, index);
+              selectBall(ball);
+            }
+          });
+
+          balls.push(ball);
+          return ball;
+        }
+
+        function getBasketBounds() {
+          const stageRect = stage.getBoundingClientRect();
+          const rect = basket.getBoundingClientRect();
+          return {
+            left: rect.left - stageRect.left,
+            right: rect.right - stageRect.left,
+            top: rect.top - stageRect.top,
+            bottom: rect.bottom - stageRect.top,
+          };
+        }
+
+        function getHome(ball) {
+          const usableWidth = Math.max(440, stage.clientWidth - 72);
+          const spacing = Math.min(126, usableWidth / balls.length);
+          const start = (stage.clientWidth - spacing * (balls.length - 1)) / 2;
+          return { x: start + spacing * ball.index, y: 52 };
+        }
+
+        function selectBall(ball) {
+          selected = ball;
+          balls.forEach((item) => item.element.classList.toggle("selected", item === ball));
+          detail.logo.innerHTML = logoSvg(ball.brand);
+          detail.title.textContent = ball.id;
+          detail.subtitle.textContent = `${ball.provider} · ${ball.role}`;
+          detail.account.textContent = ball.account;
+          detail.model.textContent = ball.model;
+          detail.role.textContent = ball.role;
+          detail.concurrency.textContent = String(ball.concurrency);
+          detail.status.textContent = ball.inBasket ? "已出战" : "待命";
+          enabledSwitch.classList.toggle("off", !ball.enabled);
+        }
+
+        function setPosition(ball, x, y, scale = 1) {
+          ball.x = x;
+          ball.y = y;
+          ball.element.style.transform = `translate3d(${x - ball.radius}px, ${y - ball.radius}px, 0) scale(${scale})`;
+          renderSphere(ball);
+        }
+
+        function renderSphere(ball) {
+          const toRadians = Math.PI / 180;
+          const rx = ball.rotationX * toRadians;
+          const ry = ball.rotationY * toRadians;
+          const rz = ball.rotationZ * toRadians;
+          const sinX = Math.sin(rx);
+          const cosX = Math.cos(rx);
+          const sinY = Math.sin(ry);
+          const cosY = Math.cos(ry);
+          const sinZ = Math.sin(rz);
+          const cosZ = Math.cos(rz);
+
+          const frontX = sinY * cosX;
+          const frontY = -sinX;
+          const frontZ = cosY * cosX;
+          const projectedX = frontX * cosZ - frontY * sinZ;
+          const projectedY = frontX * sinZ + frontY * cosZ;
+          const depth = Math.max(-1, Math.min(1, frontZ));
+          const visibility = Math.max(0, Math.min(1, (depth + 0.06) / 0.3));
+          const foreshorten = Math.max(0.08, depth);
+
+          ball.logoOrbit.style.opacity = String(visibility);
+          ball.logoOrbit.style.transform = `translate3d(${projectedX * 18}px, ${projectedY * 18}px, 3px) rotate(${ball.rotationZ * 0.16}deg) scaleX(${foreshorten}) scaleY(${0.86 + Math.max(0, depth) * 0.14})`;
+          ball.surface.style.setProperty("--grid-x", `${((ball.rotationY % 72) / 72) * 34}px`);
+          ball.surface.style.setProperty("--grid-y", `${((ball.rotationX % 72) / 72) * 34}px`);
+          ball.surface.style.setProperty("--grid-angle", `${ball.rotationZ * 0.22}deg`);
+        }
+
+        function updateRotation(ball, dt) {
+          if (reducedMotion) {
+            ball.rotationX = 0;
+            ball.rotationY = 0;
+            ball.rotationZ = 0;
+            return;
+          }
+          const speed = Math.hypot(ball.vx, ball.vy);
+          if (speed < 0.72) {
+            const frontX = ((ball.rotationX % 360) + 540) % 360 - 180;
+            const frontY = ((ball.rotationY % 360) + 540) % 360 - 180;
+            const frontZ = ((ball.rotationZ % 360) + 540) % 360 - 180;
+            const settle = Math.min(1, 0.105 * dt);
+            ball.rotationX -= frontX * settle;
+            ball.rotationY -= frontY * settle;
+            ball.rotationZ -= frontZ * settle;
+          } else {
+            ball.rotationX -= ball.vy * 2.15 * dt;
+            ball.rotationY += ball.vx * 2.15 * dt;
+            ball.rotationZ += ball.vx * ball.vy * 0.012 * dt;
+          }
+        }
+
+        function startDrag(event, ball) {
+          event.preventDefault();
+          const rect = stage.getBoundingClientRect();
+          dragging = ball;
+          ball.dragging = true;
+          ball.vx = 0;
+          ball.vy = 0;
+          dragOffsetX = event.clientX - rect.left - ball.x;
+          dragOffsetY = event.clientY - rect.top - ball.y;
+          lastPointerX = event.clientX;
+          lastPointerY = event.clientY;
+          lastPointerTime = performance.now();
+          ball.element.classList.add("dragging");
+          ball.element.setPointerCapture(event.pointerId);
+          selectBall(ball);
+
+          ball.element.addEventListener("pointermove", moveDrag);
+          window.addEventListener("pointerup", endDrag, { once: true });
+          window.addEventListener("pointercancel", endDrag, { once: true });
+        }
+
+        function moveDrag(event) {
+          if (!dragging) return;
+          const rect = stage.getBoundingClientRect();
+          const now = performance.now();
+          const elapsed = Math.max(8, now - lastPointerTime);
+          const x = Math.max(dragging.radius, Math.min(stage.clientWidth - dragging.radius, event.clientX - rect.left - dragOffsetX));
+          const y = Math.max(dragging.radius, Math.min(stage.clientHeight - dragging.radius, event.clientY - rect.top - dragOffsetY));
+          const pointerDeltaX = event.clientX - lastPointerX;
+          const pointerDeltaY = event.clientY - lastPointerY;
+          dragging.vx = (pointerDeltaX / elapsed) * 16;
+          dragging.vy = (pointerDeltaY / elapsed) * 16;
+          dragging.rotationX -= pointerDeltaY * 1.25;
+          dragging.rotationY += pointerDeltaX * 1.25;
+          dragging.rotationZ += (pointerDeltaX * pointerDeltaY) * 0.004;
+          setPosition(dragging, x, y, 1.07);
+          lastPointerX = event.clientX;
+          lastPointerY = event.clientY;
+          lastPointerTime = now;
+
+          const bounds = getBasketBounds();
+          basket.classList.toggle("active", y > bounds.top - 34 && x > bounds.left && x < bounds.right);
+        }
+
+        function endDrag(event) {
+          if (!dragging) return;
+          const ball = dragging;
+          const bounds = getBasketBounds();
+          ball.element.releasePointerCapture?.(event.pointerId);
+          ball.element.removeEventListener("pointermove", moveDrag);
+          window.removeEventListener("pointerup", endDrag);
+          window.removeEventListener("pointercancel", endDrag);
+          ball.element.classList.remove("dragging");
+          ball.dragging = false;
+          dragging = null;
+          basket.classList.remove("active");
+
+          if (
+            ball.x > bounds.left + ball.radius &&
+            ball.x < bounds.right - ball.radius &&
+            ball.y > bounds.top - ball.radius * 0.25
+          ) {
+            ball.inBasket = true;
+            ball.y = Math.max(bounds.top + ball.radius, ball.y);
+            ball.element.classList.add("in-basket");
+          } else {
+            removeBall(ball);
+          }
+          updateRoster();
+          selectBall(ball);
+        }
+
+        function deployBall(ball, order = 0) {
+          const bounds = getBasketBounds();
+          ball.inBasket = true;
+          ball.element.classList.add("in-basket");
+          ball.x = bounds.left + (bounds.right - bounds.left) * (0.24 + ((order * 0.137) % 0.52));
+          ball.y = bounds.top + ball.radius + Math.min(32, order * 7);
+          ball.vx = (order % 2 ? -1 : 1) * (1.5 + order * 0.22);
+          ball.vy = 0.5 + order * 0.18;
+          updateRoster();
+        }
+
+        function removeBall(ball) {
+          ball.inBasket = false;
+          ball.element.classList.remove("in-basket");
+          ball.vx = 0;
+          ball.vy = 0;
+          updateRoster();
+        }
+
+        function updateRoster() {
+          const count = balls.filter((ball) => ball.inBasket).length;
+          basketCount.textContent = String(count);
+          basketEmpty.classList.toggle("hidden", count > 0);
+          if (selected) detail.status.textContent = selected.inBasket ? "已出战" : "待命";
+        }
+
+        function resolveCollisions() {
+          const active = balls.filter((ball) => ball.inBasket && !ball.dragging);
+          for (let i = 0; i < active.length; i += 1) {
+            for (let j = i + 1; j < active.length; j += 1) {
+              const a = active[i];
+              const b = active[j];
+              const dx = b.x - a.x;
+              const dy = b.y - a.y;
+              const minDistance = a.radius + b.radius + 2;
+              const distanceSquared = dx * dx + dy * dy;
+              if (distanceSquared === 0 || distanceSquared >= minDistance * minDistance) continue;
+
+              const distance = Math.sqrt(distanceSquared);
+              const nx = dx / distance;
+              const ny = dy / distance;
+              const overlap = (minDistance - distance) * 0.5;
+              a.x -= nx * overlap;
+              a.y -= ny * overlap;
+              b.x += nx * overlap;
+              b.y += ny * overlap;
+
+              const relativeVelocity = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+              if (relativeVelocity < 0) {
+                const impulse = -(1.42 * relativeVelocity) / 2;
+                a.vx -= impulse * nx;
+                a.vy -= impulse * ny;
+                b.vx += impulse * nx;
+                b.vy += impulse * ny;
+              }
+            }
+          }
+        }
+
+        function animate(now) {
+          const dt = Math.min(1.7, (now - lastFrame) / 16.667);
+          lastFrame = now;
+          const bounds = getBasketBounds();
+
+          balls.forEach((ball) => {
+            if (ball.dragging) return;
+
+            if (!ball.inBasket) {
+              const home = getHome(ball);
+              if (reducedMotion) {
+                setPosition(ball, home.x, home.y);
+                return;
+              }
+              const dx = home.x - ball.x;
+              const dy = home.y - ball.y;
+              ball.vx = (ball.vx + dx * 0.055 * dt) * Math.pow(0.75, dt);
+              ball.vy = (ball.vy + dy * 0.055 * dt) * Math.pow(0.75, dt);
+              ball.x += ball.vx * dt;
+              ball.y += ball.vy * dt;
+              updateRotation(ball, dt);
+              setPosition(ball, ball.x, ball.y);
+              return;
+            }
+
+            if (reducedMotion) {
+              const active = balls.filter((item) => item.inBasket);
+              const index = active.indexOf(ball);
+              const columns = Math.max(1, Math.floor((bounds.right - bounds.left) / 104));
+              setPosition(
+                ball,
+                bounds.left + 64 + (index % columns) * 96,
+                bounds.top + 68 + Math.floor(index / columns) * 96,
+              );
+              return;
+            }
+
+            ball.vy += 0.34 * dt;
+            ball.vx *= Math.pow(0.994, dt);
+            ball.vy *= Math.pow(0.997, dt);
+            ball.x += ball.vx * dt;
+            ball.y += ball.vy * dt;
+
+            const left = bounds.left + ball.radius + 5;
+            const right = bounds.right - ball.radius - 5;
+            const top = bounds.top + ball.radius + 2;
+            const bottom = bounds.bottom - ball.radius - 5;
+
+            if (ball.x < left) {
+              ball.x = left;
+              ball.vx = Math.abs(ball.vx) * 0.68;
+            } else if (ball.x > right) {
+              ball.x = right;
+              ball.vx = -Math.abs(ball.vx) * 0.68;
+            }
+
+            if (ball.y < top) {
+              ball.y = top;
+              ball.vy = Math.abs(ball.vy) * 0.55;
+            } else if (ball.y > bottom) {
+              ball.y = bottom;
+              ball.vy = -Math.abs(ball.vy) * 0.58;
+              if (Math.abs(ball.vy) < 0.55) ball.vy = 0;
+              ball.vx *= 0.94;
+            }
+            updateRotation(ball, dt);
+          });
+
+          resolveCollisions();
+          balls.forEach((ball) => {
+            if (!ball.dragging) setPosition(ball, ball.x, ball.y);
+          });
+          requestAnimationFrame(animate);
+        }
+
+        clearButton.addEventListener("click", () => {
+          balls.forEach(removeBall);
+          selectBall(balls[0]);
+        });
+
+        deployButton.addEventListener("click", () => {
+          balls.forEach((ball, index) => deployBall(ball, index));
+          selectBall(balls[0]);
+        });
+
+        saveButton.addEventListener("click", () => {
+          window.clearTimeout(toastTimer);
+          saveToast.classList.add("show");
+          toastTimer = window.setTimeout(() => saveToast.classList.remove("show"), 1800);
+        });
+
+        enabledSwitch.addEventListener("click", () => {
+          if (!selected) return;
+          selected.enabled = !selected.enabled;
+          selected.element.classList.toggle("disabled", !selected.enabled);
+          enabledSwitch.classList.toggle("off", !selected.enabled);
+        });
+
+        window.addEventListener("resize", () => {
+          balls.forEach((ball) => {
+            if (!ball.inBasket && !ball.dragging) {
+              const home = getHome(ball);
+              ball.x = home.x;
+              ball.y = home.y;
+            }
+          });
+        });
+
+        seed.forEach(makeBall);
+        requestAnimationFrame(() => {
+          balls.forEach((ball) => {
+            const home = getHome(ball);
+            setPosition(ball, home.x, home.y - 10);
+          });
+          selectBall(balls[0]);
+          requestAnimationFrame(animate);
+        });
+      })();
+    </script>
+  </body>
+</html>

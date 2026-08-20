@@ -9,8 +9,9 @@ tokens go to `reasoning_content` first, so a small cap can return empty `content
 on a perfectly healthy endpoint. We use the client's default cap and treat "chat
 returned without raising" as success.
 
-The API key is NOT taken from the request — it stays in .env
-(MUTEKI_DEEPSEEK_API_KEY). base_url empty → default DeepSeek endpoint.
+The caller resolves the selected profile's saved key, with
+MUTEKI_DEEPSEEK_API_KEY retained as the fallback. base_url empty means the
+default DeepSeek endpoint.
 """
 
 from __future__ import annotations
@@ -23,9 +24,12 @@ async def test_llm_endpoint(
     which: str,
     base_url: Optional[str] = None,
     model: Optional[str] = None,
+    api_key: Optional[str] = None,
+    temperature_mode: Optional[str] = None,
+    temperature: Any = None,
 ) -> dict[str, Any]:
     """Make one minimal chat against the (edited) endpoint. Never raises."""
-    from muteki.core.llm import LLMClient
+    from muteki.core.llm import LLMClient, llm_temperature_kwargs
 
     which = (which or "").strip() or "planner"
     base_url = (base_url or "").strip()
@@ -33,7 +37,15 @@ async def test_llm_endpoint(
     if not model:
         return {"ok": False, "detail": "model 不能为空", "model": ""}
 
-    client = LLMClient(base_url=base_url) if base_url else LLMClient()
+    client_kwargs: dict[str, Any] = llm_temperature_kwargs({
+        "temperature_mode": temperature_mode,
+        "temperature": temperature,
+    })
+    if base_url:
+        client_kwargs["base_url"] = base_url
+    if (api_key or "").strip():
+        client_kwargs["api_key"] = str(api_key).strip()
+    client = LLMClient(**client_kwargs)
     try:
         # default cap (generous) so a reasoning model's content isn't starved.
         resp = await client.chat(

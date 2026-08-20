@@ -1,0 +1,14 @@
+{
+  "domain": "web",
+  "entity_kinds": ["endpoint", "parameter", "header", "session", "waf", "asset"],
+  "state_variables": ["endpoint.method", "parameter.is_injectable", "session.auth_state", "goal.flag_recovery"],
+  "completion_state": "goal.flag_recovery",
+  "initial_reachability": 0.1,
+  "actions": [
+    {"name": "send_request", "risk_class": "safe", "cost_estimate_units": 1},
+    {"name": "fuzz_parameter", "risk_class": "probe", "cost_estimate_units": 2},
+    {"name": "test_sqli", "risk_class": "exploit", "cost_estimate_units": 3},
+    {"name": "test_auth_bypass", "risk_class": "exploit", "cost_estimate_units": 3},
+    {"name": "exploit_chain", "risk_class": "exploit", "cost_estimate_units": 4}
+  ]
+}

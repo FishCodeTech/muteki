@@ -18,6 +18,23 @@ import apps.web.llm_test as llm_test
 import apps.web.account_test as account_test
 
 
+class _HTTPResponse:
+    def __init__(self, code: int):
+        self.code = code
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def getcode(self):
+        return self.code
+
+    def read(self, _limit=-1):
+        return b""
+
+
 # ── LLM endpoint test (補強C-1) ──────────────────────────────────────────────
 
 def test_llm_test_uses_request_body_base_url(monkeypatch):
@@ -46,6 +63,29 @@ def test_llm_test_uses_request_body_base_url(monkeypatch):
     assert res["ok"] is True
     assert seen["base_url"] == "https://edited.endpoint.test/v1"
     assert seen["model"] == "edited-model"
+
+
+def test_llm_test_uses_selected_profile_api_key(monkeypatch):
+    seen = {}
+
+    class _LLM:
+        def __init__(self, *, api_key=None, **_kw):
+            seen["api_key"] = api_key
+
+        async def chat(self, **_kw):
+            class _R:
+                finish_reason = "stop"
+            return _R()
+
+        async def aclose(self):
+            pass
+
+    import muteki.core.llm as llm_mod
+    monkeypatch.setattr(llm_mod, "LLMClient", _LLM)
+    res = asyncio.run(llm_test.test_llm_endpoint(
+        which="planner", model="custom-model", api_key="sk-profile-key"))
+    assert res["ok"] is True
+    assert seen["api_key"] == "sk-profile-key"
 
 
 def test_llm_test_empty_content_still_ok(monkeypatch):
@@ -90,6 +130,54 @@ def test_llm_test_chat_raises_is_not_ok(monkeypatch):
 def test_llm_test_empty_model_rejected():
     res = asyncio.run(llm_test.test_llm_endpoint(which="planner", model=""))
     assert res["ok"] is False
+
+
+def test_llm_test_forwards_custom_temperature(monkeypatch):
+    seen = {}
+
+    class _LLM:
+        def __init__(self, *, temperature_mode=None, temperature_value=None, **_kw):
+            seen["temperature_mode"] = temperature_mode
+            seen["temperature_value"] = temperature_value
+
+        async def chat(self, **_kw):
+            class _R:
+                finish_reason = "stop"
+            return _R()
+
+        async def aclose(self):
+            pass
+
+    import muteki.core.llm as llm_mod
+    monkeypatch.setattr(llm_mod, "LLMClient", _LLM)
+    res = asyncio.run(llm_test.test_llm_endpoint(
+        which="planner", model="k3", temperature_mode="custom", temperature=1))
+    assert res["ok"] is True
+    assert seen["temperature_mode"] == "custom"
+    assert seen["temperature_value"] == 1.0
+
+
+def test_llm_test_forwards_omit_temperature(monkeypatch):
+    seen = {}
+
+    class _LLM:
+        def __init__(self, *, temperature_mode=None, **_kw):
+            seen["temperature_mode"] = temperature_mode
+
+        async def chat(self, **_kw):
+            class _R:
+                finish_reason = "stop"
+            return _R()
+
+        async def aclose(self):
+            pass
+
+    import muteki.core.llm as llm_mod
+    monkeypatch.setattr(llm_mod, "LLMClient", _LLM)
+    res = asyncio.run(llm_test.test_llm_endpoint(
+        which="titler", model="k3", temperature_mode="omit"))
+    assert res["ok"] is True
+    assert seen["temperature_mode"] == "omit"
 
 
 # ── account test (補強C-2) ───────────────────────────────────────────────────
@@ -147,7 +235,7 @@ def _register_endpoint(tmp_path, *, target="claude", base="https://api.deepseek.
 
 
 def test_account_test_custom_endpoint_probes_directly_not_via_cli(tmp_path, monkeypatch):
-    """A custom-endpoint account must be tested with a DIRECT curl probe (cheap,
+    """A custom-endpoint account uses a direct in-process HTTP probe (cheap,
     model-agnostic), NOT by synthesizing a profile + shelling claude-code with a
     wrong default model (which hangs against a third-party endpoint). We assert the
     CLI driver is NEVER invoked and the HTTP status classifies correctly."""
@@ -160,25 +248,27 @@ def test_account_test_custom_endpoint_probes_directly_not_via_cli(tmp_path, monk
 
     seen = {}
 
-    def fake_run(argv, **kwargs):
-        seen["argv"] = argv
-        return subprocess.CompletedProcess(argv, 0, "400", "")  # endpoint reached, key ok
-    monkeypatch.setattr(account_test.subprocess, "run", fake_run)
+    def fake_urlopen(request, **_kwargs):
+        seen["request"] = request
+        return _HTTPResponse(400)  # endpoint reached, key ok
+    monkeypatch.setattr(account_test, "urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        account_test.subprocess, "run",
+        lambda argv, **_kwargs: (_ for _ in ()).throw(
+            AssertionError(f"secret-bearing subprocess argv forbidden: {argv}")),
+    )
 
     res = account_test.probe_account(
         engine="claude", account_id="ds", sessions_root=tmp_path, backend="local")
     assert res["ok"] is True                         # 400 = auth+reachability proven
-    assert "curl" in seen["argv"][0]                 # used curl, not the CLI
-    # claude target → Anthropic Messages endpoint + x-api-key header
-    assert any("/v1/messages" in str(a) for a in seen["argv"])
-    assert any("x-api-key" in str(a) for a in seen["argv"])
+    assert seen["request"].full_url.endswith("/v1/messages")
+    assert seen["request"].get_header("X-api-key") == "sk-test-key"
 
 
 def test_account_test_custom_endpoint_bad_key_fails_fast(tmp_path, monkeypatch):
     _register_endpoint(tmp_path, target="codex", base="https://api.deepseek.com")
     monkeypatch.setattr(
-        account_test.subprocess, "run",
-        lambda argv, **k: subprocess.CompletedProcess(argv, 0, "401", ""))
+        account_test, "urlopen", lambda *_a, **_k: _HTTPResponse(401))
     res = account_test.probe_account(
         engine="codex", account_id="ds", sessions_root=tmp_path, backend="local")
     assert res["ok"] is False
@@ -192,15 +282,15 @@ def test_account_test_custom_endpoint_codex_uses_chat_completions(tmp_path, monk
     _register_endpoint(tmp_path, target="codex", base="https://api.deepseek.com")
     seen = {}
     monkeypatch.setattr(
-        account_test.subprocess, "run",
-        lambda argv, **k: (seen.__setitem__("argv", argv),
-                           subprocess.CompletedProcess(argv, 0, "200", ""))[1])
+        account_test, "urlopen",
+        lambda request, **_k: (
+            seen.__setitem__("request", request), _HTTPResponse(200))[1])
     res = account_test.probe_account(
         engine="codex", account_id="ds", sessions_root=tmp_path, backend="local")
     assert res["ok"] is True
-    assert any("/chat/completions" in str(a) for a in seen["argv"])
-    assert not any("/responses" in str(a) for a in seen["argv"])
-    assert any("Authorization: Bearer" in str(a) for a in seen["argv"])
+    assert seen["request"].full_url.endswith("/chat/completions")
+    assert "/responses" not in seen["request"].full_url
+    assert seen["request"].get_header("Authorization") == "Bearer sk-test-key"
 
 
 def test_account_test_container_uses_docker_run_rm_not_local(tmp_path, monkeypatch):

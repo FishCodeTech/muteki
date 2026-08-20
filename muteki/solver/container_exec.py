@@ -11,8 +11,9 @@ to the supervisor over a per-run Unix domain socket (the `rcp` backend, default)
     mode the supervisor IS the container's main process (no `sleep infinity`).
   - The run's host workspace is bind-mounted at /home/kali/workspace, so worker
     products survive teardown and sibling workers share board/shared_graph via the
-    SAME volume. A second mount exposes the control socket dir; a third exposes the
-    credential-account projection.
+    SAME volume. A second tiny mount exposes only the reverse-connect bootstrap
+    token; a third exposes the credential-account projection. The coordinator's
+    control journal and SecretStore are never mounted.
   - A worker is started by asking the supervisor (StartWorker over the socket); the
     supervisor forks it as the kali user (with sudo), applies a wall-clock cap, and
     streams its stdout/stderr back verbatim. Per-worker control (kill/pause/resume)
@@ -35,9 +36,12 @@ proc wrapper's _container_signal (STOP/CONT/KILL).
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import os
 import secrets
 import shlex
+import shutil
 import signal as _signal
 import subprocess
 import threading
@@ -46,18 +50,22 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Any
 
-from muteki.solver.cli_driver import CliDriver, CliResult, StreamStep
+from muteki.solver.cli_driver import (
+    CliDriver, CliResult, SecurePromptUnsupported, StreamStep,
+)
 from muteki.solver.credential_accounts import CONTAINER_ACCOUNTS_ROOT
 
 # Tool-only worker image. Real credentials are injected from Credential Accounts
 # at runtime; do not bake claude/codex/cursor login state into this image.
 # One generic worker image (NOT a per-recipe tag), published to Docker Hub so any
 # host can `docker pull` it. Default to the moving :latest; override with
-# MUTEKI_WORKER_IMAGE to pin a version (e.g. ghcr.io/fishcodetech/muteki-worker:0.2.5).
+# MUTEKI_WORKER_IMAGE to pin a version (e.g. ghcr.io/fishcodetech/muteki-worker:v0.3.0).
 WORKER_IMAGE = os.environ.get("MUTEKI_WORKER_IMAGE", "ghcr.io/fishcodetech/muteki-worker:latest")
 CONTAINER_WORKSPACE = "/home/kali/workspace"
 CONTAINER_CONTROL_DIR = "/run/muteki/control"  # bind-mounted; carries the per-run token
 _RUN_PREFIX = "muteki-run-"
+_RUN_ID_LABEL = "io.muteki.run-id-sha256"
+LOG = logging.getLogger(__name__)
 
 # Backend selection. "container" (default) → rcp supervisor. "container_dockerexec"
 # → legacy host-side `docker exec` (emergency fallback). Anything else (incl unset)
@@ -78,7 +86,18 @@ _CONTAINER_BIN = {
     "claude": "claude",
     "codex": "codex",
     "cursor": "/home/kali/.local/bin/cursor-agent",
+    "pi": "pi",
+    "omp": "/home/kali/.local/bin/omp",
+    "opencode": "opencode",
+    "dsh": "python3",
+    "kimi": "kimi",
+    "grok": "/home/kali/.grok/bin/grok",
 }
+
+_CONTAINER_OFFLINE_BRIDGE = "/opt/muteki/offline_acp_bridge.py"
+_CONTAINER_OMP_OFFLINE_CONFIG = "/opt/muteki/omp_offline_config.yml"
+_CONTAINER_KIMI_OFFLINE_AGENT = "/opt/muteki/kimi_offline_agent.md"
+_CONTAINER_GROK_OFFLINE_AGENT = "/opt/muteki/grok_offline_agent.md"
 
 
 # P2-v3 BLOCKER-c: when the coordinator runs INSIDE the web container, a
@@ -244,17 +263,87 @@ def _docker(*args: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
 
 
 def _safe(run_id: str) -> str:
-    return "".join(c if (c.isalnum() or c in "-_.") else "-" for c in run_id)
+    # Docker container names accept ASCII alnum plus ``_.-``. ``str.isalnum`` also
+    # accepts Unicode letters/digits, so require ASCII explicitly before preserving
+    # a character; the digest below retains uniqueness after replacement.
+    return "".join(
+        c if (c.isascii() and (c.isalnum() or c in "-_.")) else "-"
+        for c in run_id
+    )
+
+
+def _run_identity(run_id: str) -> str:
+    """A readable, collision-resistant identifier safe for Docker/path names.
+
+    Sanitising alone aliases values such as ``a/b`` and ``a?b``; truncating a long
+    value introduces another alias class.  Keep a short readable prefix, but always
+    bind it to the complete run id with a digest.
+    """
+    readable = _safe(run_id).strip("-_.") or "run"
+    digest = _run_digest(run_id)[:16]
+    return f"{readable[:72]}-{digest}"
+
+
+def _run_digest(run_id: str) -> str:
+    return hashlib.sha256(
+        run_id.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 
 def _run_container_name(run_id: str) -> str:
+    return f"{_RUN_PREFIX}{_run_identity(run_id)}"
+
+
+def _legacy_run_container_name(run_id: str) -> str:
+    """Lossy pre-digest primary name; detection only, never ownership proof."""
     return f"{_RUN_PREFIX}{_safe(run_id)}"[:120]
+
+
+def _bootstrap_dir(run_id: str, host_workspace: str) -> str:
+    """Coordinator-private one-shot bootstrap mount, outside the worker workspace.
+
+    The sibling location stays under the same mirrored data root (important when
+    the coordinator itself runs in Docker) while remaining unreachable through the
+    worker's ``/home/kali/workspace`` bind mount.
+    """
+    workspace = os.path.realpath(os.path.abspath(host_workspace))
+    path = os.path.join(os.path.dirname(workspace), ".muteki_rcp", _run_identity(run_id))
+    if os.path.commonpath((workspace, path)) == workspace:
+        raise RuntimeError("worker workspace has no private sibling for RCP bootstrap")
+    return path
+
+
+_BOOTSTRAP_DIRS: dict[str, str] = {}
+
+
+def _cleanup_bootstrap_dir(run_id: str, *, fallback: Optional[str] = None) -> None:
+    """Remove bootstrap material after the caller has proven runtime absence.
+
+    This helper intentionally does not inspect Docker itself so teardown can make
+    one authoritative proof covering the main and legacy containers.  Every call
+    site is behind that proof (or occurs before a brand-new container is created).
+    """
+    registered = _BOOTSTRAP_DIRS.pop(run_id, None)
+    for path in dict.fromkeys(p for p in (registered, fallback) if p):
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            pass
+
+
+def _retire_bootstrap_token(handle: "ContainerHandle") -> None:
+    """Erase the host copy once the authenticated supervisor link is ready."""
+    if handle.control_dir:
+        try:
+            os.unlink(os.path.join(handle.control_dir, "token"))
+        except FileNotFoundError:
+            pass
+    handle.token = ""
 
 
 @dataclass
 class ContainerHandle:
     """Identifies the RUN's single long-lived container + shared workspace + (rcp
-    mode) its control socket. One handle per run; every worker runs in the SAME
+    mode) its bootstrap-token directory. One handle per run; every worker runs in the SAME
     container, started via the supervisor (rcp) or `docker exec` (legacy)."""
     run_id: str
     host_workspace: str
@@ -267,11 +356,12 @@ class ContainerHandle:
     account_root: Optional[str] = None
     # rcp control plane (mode == "rcp"): REVERSE-CONNECT — the supervisor dials the
     # host ControlReceiver and is routed by run_id, so the host side just needs the
-    # run_id (above) to find the link. control_dir carries the token into the
-    # container; token is also registered with the receiver.
+    # run_id (above) to find the link. control_dir carries the one-shot token into
+    # PID1, then remains mounted but empty; token is cleared after authenticated
+    # readiness.
     mode: str = "rcp"               # "rcp" | "dockerexec"
-    control_dir: Optional[str] = None   # host dir bind-mounted to /run/muteki/control (carries the token)
-    token: str = ""                     # per-run control token
+    control_dir: Optional[str] = None   # private host dir bind-mounted to /run/muteki/control
+    token: str = ""                     # pending token only; blank after Hello succeeds
 
     def to_container_cwd(self, host_cwd: str) -> str:
         """Map a host cwd under host_workspace → its path inside the container."""
@@ -467,57 +557,153 @@ def ensure_container(run_id: str, host_workspace: str, *,
     if mode == "rcp" and _net_override and str(network).strip() != "host":
         network = _net_override
     host_net = str(network).strip() == "host"
-    control_dir: Optional[str] = None
-    token = ""
-    if mode == "rcp":
-        # REVERSE-CONNECT control plane: the supervisor does NOT listen — it DIALS the
-        # host's ControlReceiver (host.docker.internal:<port>) and sends a Hello with
-        # {run_id, token}. So here we just (a) register the expected token with the
-        # receiver BEFORE the container starts (it may dial in immediately), and (b)
-        # ferry that token into the container via a tiny bind-mounted control dir. No
-        # port publish, no per-run host port — N runs all dial the receiver's one
-        # port and are routed by run_id. (This sidesteps both the UDS-across-VM
-        # problem and the "supervisor as open network service" problem.)
-        from muteki.solver.control_receiver import ControlReceiver
-        control_dir = os.path.join(host_workspace, ".muteki_control")
-        os.makedirs(control_dir, exist_ok=True)
-        token = secrets.token_hex(16)
-        try:
-            with open(os.path.join(control_dir, "token"), "w") as f:
-                f.write(token)
-            os.chmod(os.path.join(control_dir, "token"), 0o600)
-        except OSError:
-            pass
-        ControlReceiver.instance().expect(run_id, token)
-
-    handle = ContainerHandle(run_id=run_id, host_workspace=host_workspace,
-                             container=name, image=image, network=network,
-                             memory=memory, cpus=cpus, pids_limit=pids_limit,
-                             account_root=mount_account_root,
-                             mode=mode, control_dir=control_dir, token=token)
     with _ENSURE_LOCK:
+        receiver = None
+        if mode == "rcp":
+            from muteki.solver.control_receiver import ControlReceiver
+            receiver = ControlReceiver.instance()
         state = _container_state(name)
+        if state is None:
+            # Upgrade fence: older releases used a lossy, unhashed primary name.
+            # Never create a second runtime while such a container may exist.  It
+            # can be removed only when an exact ownership label proves this run;
+            # unlabeled legacy state requires explicit operator cleanup.
+            legacy_name = _legacy_run_container_name(run_id)
+            if legacy_name != name and not _container_absence_proven(legacy_name):
+                if _container_run_digest(legacy_name) != _run_digest(run_id):
+                    raise RuntimeError(
+                        f"ambiguous legacy runtime {legacy_name} exists without an "
+                        "exact run ownership label; refusing duplicate creation")
+                legacy_bootstrap = _container_bootstrap_source(legacy_name)
+                _docker("rm", "-f", legacy_name, timeout=20)
+                if not _container_absence_proven(legacy_name):
+                    raise RuntimeError(
+                        f"exact-owned legacy runtime {legacy_name} could not be removed")
+                if receiver is not None:
+                    receiver.forget(run_id)
+                _cleanup_bootstrap_dir(run_id, fallback=legacy_bootstrap)
         if state == "running":
-            if mode == "rcp":
+            if mode == "dockerexec":
+                return ContainerHandle(
+                    run_id=run_id, host_workspace=host_workspace, container=name,
+                    image=image, network=network, memory=memory, cpus=cpus,
+                    pids_limit=pids_limit, account_root=mount_account_root,
+                    mode=mode,
+                )
+            # Never rotate a bootstrap token underneath a live reverse-control
+            # owner.  The token was consumed at Hello and the file was unlinked;
+            # the authenticated socket is now the authority.
+            assert receiver is not None
+            if receiver.has_link(run_id):
+                handle = ContainerHandle(
+                    run_id=run_id, host_workspace=host_workspace, container=name,
+                    image=image, network=network, memory=memory, cpus=cpus,
+                    pids_limit=pids_limit, account_root=mount_account_root,
+                    mode=mode, control_dir=_BOOTSTRAP_DIRS.get(run_id), token="",
+                )
                 _await_supervisor(handle)
-            return handle
-        if state in ("created", "restarting", "paused"):
-            # mid-creation or transient — start it, DON'T remove (removing would kill
-            # a sibling's in-flight container). start is a no-op if already running.
-            _docker("start", name, timeout=20)
-            if _container_state(name) in ("running", "created", "restarting"):
-                if mode == "rcp":
-                    _await_supervisor(handle)
                 return handle
+            # A running container without a live receiver link cannot authenticate
+            # again: its one-shot token has already been consumed (or its bootstrap
+            # state is unknowable after a coordinator restart).  Recreate it instead
+            # of manufacturing a replacement credential for an orphan runtime.
+            stale_bootstrap = (_BOOTSTRAP_DIRS.get(run_id)
+                               or _container_bootstrap_source(name))
+            _docker("rm", "-f", name, timeout=20)
+            if not _container_absence_proven(name):
+                raise RuntimeError(
+                    f"orphan runtime {name} has no live control link and its "
+                    "absence could not be proven")
+            receiver.forget(run_id)
+            _cleanup_bootstrap_dir(run_id, fallback=stale_bootstrap)
+            state = None
+        if state in ("created", "restarting", "paused"):
+            if mode == "dockerexec":
+                # Legacy transport has no authenticated link to preserve.
+                _docker("start", name, timeout=20)
+                if _container_state(name) in ("running", "created", "restarting"):
+                    return ContainerHandle(
+                        run_id=run_id, host_workspace=host_workspace, container=name,
+                        image=image, network=network, memory=memory, cpus=cpus,
+                        pids_limit=pids_limit, account_root=mount_account_root,
+                        mode=mode,
+                    )
+            # In RCP mode a non-running pre-existing container has no usable live
+            # link.  Remove and bootstrap a fresh supervisor instead of rotating a
+            # token beneath an ambiguous owner.
+            stale_bootstrap = (_BOOTSTRAP_DIRS.get(run_id)
+                               or _container_bootstrap_source(name))
+            _docker("rm", "-f", name, timeout=20)
+            if not _container_absence_proven(name):
+                raise RuntimeError(
+                    f"stale runtime {name} could not be proven absent before recreate")
+            if receiver is not None:
+                receiver.forget(run_id)
+            _cleanup_bootstrap_dir(run_id, fallback=stale_bootstrap)
+            state = None
         if state is not None:
             # genuinely dead (exited/dead) leftover — remove and recreate clean.
+            stale_bootstrap = (_BOOTSTRAP_DIRS.get(run_id)
+                               or _container_bootstrap_source(name))
             _docker("rm", "-f", name, timeout=20)
+            if not _container_absence_proven(name):
+                raise RuntimeError(
+                    f"stale runtime {name} could not be proven absent before recreate")
+            if receiver is not None:
+                receiver.forget(run_id)
+            _cleanup_bootstrap_dir(run_id, fallback=stale_bootstrap)
+
+        control_dir: Optional[str] = None
+        token = ""
+        if mode == "rcp":
+            # A private sibling mount ferries a single-use token to PID1.  It is
+            # deliberately outside host_workspace, because every worker can read
+            # that workspace.  PID1 unlinks the file immediately after reading it;
+            # the receiver atomically consumes the expected value on the first
+            # successful Hello.
+            assert receiver is not None
+            if not _container_absence_proven(name):
+                raise RuntimeError(
+                    f"cannot bootstrap {name}: container absence is not proven")
+            receiver.forget(run_id)
+            control_dir = _bootstrap_dir(run_id, host_workspace)
+            _cleanup_bootstrap_dir(run_id, fallback=control_dir)
+            bootstrap_root = os.path.dirname(control_dir)
+            os.makedirs(bootstrap_root, mode=0o700, exist_ok=True)
+            os.chmod(bootstrap_root, 0o700)
+            os.mkdir(control_dir, mode=0o700)
+            os.chmod(control_dir, 0o700)
+            try:
+                _BOOTSTRAP_DIRS[run_id] = control_dir
+                token = secrets.token_hex(32)
+                token_path = os.path.join(control_dir, "token")
+                fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                try:
+                    payload = token.encode("ascii")
+                    if os.write(fd, payload) != len(payload):
+                        raise OSError("short write creating RCP bootstrap token")
+                finally:
+                    os.close(fd)
+                receiver.expect(run_id, token)
+            except Exception:
+                # No container exists yet (proved above), so bootstrap preparation
+                # failure can be erased without creating an unknown-runtime window.
+                receiver.forget(run_id)
+                _cleanup_bootstrap_dir(run_id, fallback=control_dir)
+                raise
+
+        handle = ContainerHandle(run_id=run_id, host_workspace=host_workspace,
+                                 container=name, image=image, network=network,
+                                 memory=memory, cpus=cpus, pids_limit=pids_limit,
+                                 account_root=mount_account_root,
+                                 mode=mode, control_dir=control_dir, token=token)
         # --mount (key=value) NOT -v: the workspace path has run_id ("nyu:KEY") whose
         # colon makes `-v host:ctr:rw` mis-parse → silent bind-mount failure. `--init`
         # reaps zombie trees. In rcp mode the ENTRYPOINT (supervisor) is the keepalive
         # (no `sleep infinity`); in legacy mode we append `sleep infinity`.
         run_cmd = [
             "run", "-d", "--init", "--name", name,
+            "--label", f"{_RUN_ID_LABEL}={_run_digest(run_id)}",
             "--network", network,
             "--tmpfs", "/tmp:rw,exec,size=2g",
             "--mount",
@@ -570,10 +756,16 @@ def ensure_container(run_id: str, host_workspace: str, *,
             if st in ("running", "created"):
                 if mode == "rcp":
                     _await_supervisor(handle)
+                    _retire_bootstrap_token(handle)
                 return handle
+            if mode == "rcp" and _container_absence_proven(name):
+                assert receiver is not None
+                receiver.forget(run_id)
+                _cleanup_bootstrap_dir(run_id)
             raise RuntimeError(f"failed to start run container {name}: {run.stderr.strip()[:300]}")
         if mode == "rcp":
             _await_supervisor(handle)
+            _retire_bootstrap_token(handle)
         return handle
 
 
@@ -624,26 +816,110 @@ def _oom_kill_count(container: str) -> Optional[int]:
     return None
 
 
-def teardown_container(run_id: str, *, remove: bool = True) -> None:
+def _container_absence_proven(name: str) -> bool:
+    """True only when Docker itself confirms that a container does not exist."""
+    result = _docker("inspect", name, timeout=15)
+    if result.returncode == 0:
+        return False
+    detail = f"{result.stdout}\n{result.stderr}".lower()
+    return "no such object" in detail or "no such container" in detail
+
+
+def _container_bootstrap_source(name: str) -> Optional[str]:
+    """Recover the private bootstrap mount source across coordinator restarts."""
+    template = (
+        '{{range .Mounts}}{{if eq .Destination "' + CONTAINER_CONTROL_DIR
+        + '"}}{{.Source}}{{end}}{{end}}'
+    )
+    result = _docker("inspect", "-f", template, name, timeout=15)
+    if result.returncode != 0:
+        return None
+    source = (result.stdout or "").strip()
+    return source or None
+
+
+def _container_run_digest(name: str) -> Optional[str]:
+    """Return the exact run-ownership label, if this runtime has one."""
+    template = '{{index .Config.Labels "' + _RUN_ID_LABEL + '"}}'
+    result = _docker("inspect", "-f", template, name, timeout=15)
+    if result.returncode != 0:
+        return None
+    value = (result.stdout or "").strip()
+    return value if len(value) == 64 else None
+
+
+def teardown_container(run_id: str, *, remove: bool = True) -> bool:
+    """Serialize whole-run teardown against bootstrap/recreation."""
+    with _ENSURE_LOCK:
+        return _teardown_container_locked(run_id, remove=remove)
+
+
+def _teardown_container_locked(run_id: str, *, remove: bool = True) -> bool:
     """Tear down the run's single container — its PID namespace takes the supervisor
     + every worker with it. Also sweeps any stray per-worker containers from the OLD
     per-worker design, so a mixed-version state never leaks. Filters are end-anchored
     on the run's safe name to avoid the substring误杀 that killed live targets under
     the old fixed-name scheme."""
-    # drop the run's control link + registered token from the receiver first (the
-    # supervisor goes away with the container, but free the host-side registry).
-    try:
-        from muteki.solver.control_receiver import ControlReceiver
-        ControlReceiver.instance().forget(run_id)
-    except Exception:
-        pass
     name = _run_container_name(run_id)
-    _docker("rm", "-f", name, timeout=20)
-    # legacy sweep: old design left muteki-w-<safe>-<uuid> containers; clean any.
+    bootstrap_dir = _BOOTSTRAP_DIRS.get(run_id) or _container_bootstrap_source(name)
+    legacy_bootstrap: Optional[str] = None
+    if remove:
+        _docker("rm", "-f", name, timeout=20)
+    proven = _container_absence_proven(name)
+    legacy_primary = _legacy_run_container_name(run_id)
+    if legacy_primary != name and not _container_absence_proven(legacy_primary):
+        if _container_run_digest(legacy_primary) != _run_digest(run_id):
+            LOG.warning(
+                "refusing ambiguous legacy primary cleanup for run %s: %s has "
+                "no matching exact ownership label", run_id, legacy_primary)
+            proven = False
+        else:
+            legacy_bootstrap = _container_bootstrap_source(legacy_primary)
+            if remove:
+                _docker("rm", "-f", legacy_primary, timeout=20)
+            if not _container_absence_proven(legacy_primary):
+                proven = False
+    # Legacy candidates used a lossy safe(run_id) prefix.  `a/b`, `a?b`, and `a-b`
+    # therefore alias and MUST NOT be removed from that prefix alone.  Only an exact
+    # ownership label is sufficient; unlabeled/mismatched candidates remain
+    # explicitly unproven for operator cleanup instead of risking a cross-run kill.
     safe = _safe(run_id)
     r = _docker("ps", "-aq", "--filter", f"name=muteki-w-{safe}-", timeout=15)
-    for cid in [x for x in (r.stdout or "").split() if x]:
-        _docker("rm", "-f", cid, timeout=15)
+    if r.returncode != 0:
+        proven = False
+    else:
+        for cid in [x for x in (r.stdout or "").split() if x]:
+            if _container_run_digest(cid) != _run_digest(run_id):
+                LOG.warning(
+                    "refusing ambiguous legacy runtime cleanup for run %s: %s "
+                    "has no matching exact ownership label", run_id, cid)
+                proven = False
+                continue
+            if remove:
+                _docker("rm", "-f", cid, timeout=15)
+            if not _container_absence_proven(cid):
+                proven = False
+    if proven:
+        # Only discard the reverse-control owner after Docker proves every matching
+        # runtime absent. A failed rm must keep the link/token retryable.
+        try:
+            from muteki.solver.control_client import confirm_run_absent
+            confirm_run_absent(run_id)
+        except Exception:
+            # Preserve the process-local owner until the hard-exit fence can be
+            # published; a later teardown retry sees the same Docker absence proof.
+            return False
+        try:
+            from muteki.solver.control_receiver import ControlReceiver
+            ControlReceiver.instance().forget(run_id)
+        except Exception:
+            pass
+        # The one-shot mount directory is deliberately retained while Docker cannot
+        # prove absence: an unknown/live container may still have it mounted.  Once
+        # absence is authoritative, erase the empty mount and any unconsumed token.
+        _cleanup_bootstrap_dir(run_id, fallback=bootstrap_dir)
+        _cleanup_bootstrap_dir(run_id, fallback=legacy_bootstrap)
+    return proven
 
 
 # ── argv translation (shared by both backends) ───────────────────────────────
@@ -652,9 +928,34 @@ def _containerize_argv(driver_name: str, argv: list[str]) -> list[str]:
     if not argv:
         return argv
     bin_in_container = _CONTAINER_BIN.get(driver_name)
-    if bin_in_container:
-        return [bin_in_container, *argv[1:]]
-    return [os.path.basename(argv[0]), *argv[1:]]
+    out = list(argv)
+    if len(out) >= 2 and os.path.basename(out[1]) == "offline_acp_bridge.py":
+        out[0] = "python3"
+        out[1] = _CONTAINER_OFFLINE_BRIDGE
+        for index, arg in enumerate(out):
+            if arg == "--agent-bin" and index + 1 < len(out):
+                out[index + 1] = bin_in_container or os.path.basename(out[index + 1])
+            elif arg.startswith("--agent-arg=") and os.path.basename(
+                    arg.removeprefix("--agent-arg=")) == "omp_offline_config.yml":
+                out[index] = f"--agent-arg={_CONTAINER_OMP_OFFLINE_CONFIG}"
+        return out
+    if driver_name == "opencode" and len(out) >= 3 and out[0] == "env":
+        out[2] = bin_in_container or "opencode"
+    elif driver_name == "grok" and len(out) >= 4 and out[0] == "env":
+        out[3] = bin_in_container or "grok"
+    else:
+        out[0] = bin_in_container or os.path.basename(out[0])
+    if driver_name == "dsh" and len(out) >= 2:
+        out[1] = "/opt/muteki/deepseek_harness_worker.py"
+    if driver_name == "kimi":
+        for index, arg in enumerate(out[:-1]):
+            if arg == "--agent-file":
+                out[index + 1] = _CONTAINER_KIMI_OFFLINE_AGENT
+    if driver_name == "grok":
+        for index, arg in enumerate(out[:-1]):
+            if arg == "--agent":
+                out[index + 1] = _CONTAINER_GROK_OFFLINE_AGENT
+    return out
 
 
 # ── public entry points (mirror cli_driver.run_cli / run_cli_streaming) ───────
@@ -665,7 +966,14 @@ def _ensure_alive(handle: ContainerHandle) -> None:
     doesn't die "No such container". Cheap when it's already running (one inspect).
     Re-syncs the handle's rcp token (+ receiver registration) if it had to recreate."""
     if _container_state(handle.container) == "running":
-        return
+        if handle.mode != "rcp":
+            return
+        from muteki.solver.control_receiver import ControlReceiver
+        if ControlReceiver.instance().has_link(handle.run_id):
+            return
+        # A running PID namespace with no authenticated reverse link is an orphan,
+        # not a healthy keepalive.  Fall through to ensure_container, which proves
+        # removal and issues a fresh one-shot bootstrap for a new supervisor.
     fresh = ensure_container(handle.run_id, handle.host_workspace,
                              image=handle.image, network=handle.network,
                              memory=handle.memory, cpus=handle.cpus,
@@ -679,9 +987,14 @@ def _ensure_alive(handle: ContainerHandle) -> None:
 
 
 def run_cli_container(driver: CliDriver, argv: list[str], *, handle: ContainerHandle,
-                      cwd: str, timeout: int, env: Optional[dict] = None) -> CliResult:
+                      cwd: str, timeout: int, env: Optional[dict] = None,
+                      stdin_text: Optional[str] = None) -> CliResult:
     """Non-streaming worker run inside the run container. Dispatches to rcp (default)
     or the legacy docker-exec backend based on handle.mode."""
+    if handle.mode != "rcp" and stdin_text is not None:
+        raise SecurePromptUnsupported(
+            "legacy docker-exec cannot prove an exact stdin prompt reached the "
+            "inner worker; use the RCP container backend")
     _ensure_alive(handle)
     cont_cwd = handle.to_container_cwd(cwd)
     if handle.mode == "rcp":
@@ -691,8 +1004,10 @@ def run_cli_container(driver: CliDriver, argv: list[str], *, handle: ContainerHa
         rec = _RUNTIME_REGISTRY.create(handle=handle, tag=tag, driver=driver.name,
                                        cwd=cont_cwd, argv=cont_argv)
         _RUNTIME_REGISTRY.mark(rec, status="running")
+        rcp_kwargs = {"stdin_text": stdin_text} if stdin_text is not None else {}
         res = run_cli_rcp(driver, cont_argv, run_id=handle.run_id,
-                          container_cwd=cont_cwd, timeout=timeout, env=env)
+                          container_cwd=cont_cwd, timeout=timeout, env=env,
+                          **rcp_kwargs)
         status = ("oom" if res.oom_killed else "timeout" if res.timed_out else "finished")
         res.runtime_status = _RUNTIME_REGISTRY.finish(
             rec, status=status, rc=(res.runtime_status or {}).get("rc"),
@@ -700,7 +1015,7 @@ def run_cli_container(driver: CliDriver, argv: list[str], *, handle: ContainerHa
             error=(res.raw_stderr or "").strip()[:300])
         return res
     return _DockerExecBackend.run(driver, argv, handle=handle, cwd=cwd,
-                                  timeout=timeout, env=env)
+                                  timeout=timeout, env=env, stdin_text=stdin_text)
 
 
 def run_cli_streaming_container(
@@ -710,8 +1025,12 @@ def run_cli_streaming_container(
     env: Optional[dict] = None,
     cancel_event: "Optional[threading.Event]" = None,
     on_proc: "Optional[Callable[[object], None]]" = None,
+    on_start_uncertain: "Optional[Callable[[], None]]" = None,
+    on_stdin_delivered: "Optional[Callable[[], None]]" = None,
+    on_stdin_uncertain: "Optional[Callable[[], None]]" = None,
     steer_event: "Optional[threading.Event]" = None,
     paused_event: "Optional[threading.Event]" = None,
+    stdin_text: Optional[str] = None,
 ) -> CliResult:
     """Streaming worker run inside the run container — mirrors
     cli_driver.run_cli_streaming (cancel/steer/pause). Dispatches to rcp (default,
@@ -721,6 +1040,14 @@ def run_cli_streaming_container(
     mode the timeout is enforced supervisor-side (its kill-timer is pause-aware — it
     stops the clock on STOP and resumes on CONT), so the host does not run a
     wall-clock kill loop here and the event is forwarded for any backend that wants it."""
+    if handle.mode != "rcp" and stdin_text is not None:
+        # docker -i accepting bytes only proves its client-side pipe was filled; a
+        # missing container/bad cwd/inner exec failure can still prevent the worker
+        # from ever receiving them.  Without an inner ACK there is no honest exact
+        # delivery receipt, so the emergency legacy backend fails closed.
+        raise SecurePromptUnsupported(
+            "legacy docker-exec cannot prove an exact stdin prompt reached the "
+            "inner worker; use the RCP container backend")
     _ensure_alive(handle)
     cont_cwd = handle.to_container_cwd(cwd)
     if handle.mode == "rcp":
@@ -735,15 +1062,20 @@ def run_cli_streaming_container(
         # docker-exec path did (the rcp proc has no runtime_record of its own).
         def _on_proc(proc: object) -> None:
             if on_proc is not None:
-                try:
-                    on_proc(proc)
-                except Exception:
-                    pass
+                on_proc(proc)
 
+        rcp_kwargs = {"stdin_text": stdin_text} if stdin_text is not None else {}
+        if on_stdin_delivered is not None:
+            rcp_kwargs["on_stdin_delivered"] = on_stdin_delivered
+        if on_stdin_uncertain is not None:
+            rcp_kwargs["on_stdin_uncertain"] = on_stdin_uncertain
         res = run_cli_streaming_rcp(
             driver, cont_argv, run_id=handle.run_id,
             container_cwd=cont_cwd, timeout=timeout, on_step=on_step, env=env,
-            cancel_event=cancel_event, on_proc=_on_proc, steer_event=steer_event)
+            cancel_event=cancel_event, on_proc=_on_proc,
+            on_start_uncertain=on_start_uncertain, steer_event=steer_event,
+            paused_event=paused_event,
+            **rcp_kwargs)
         rs = res.runtime_status or {}
         res.runtime_status = _RUNTIME_REGISTRY.finish(
             rec, status=rs.get("status", "finished"), rc=rs.get("rc"),
@@ -753,7 +1085,10 @@ def run_cli_streaming_container(
         return res
     return _DockerExecBackend.run_streaming(
         driver, argv, handle=handle, cwd=cwd, timeout=timeout, on_step=on_step,
-        env=env, cancel_event=cancel_event, on_proc=on_proc, steer_event=steer_event)
+        env=env, cancel_event=cancel_event, on_proc=on_proc, steer_event=steer_event,
+        on_stdin_delivered=on_stdin_delivered,
+        on_stdin_uncertain=on_stdin_uncertain,
+        stdin_text=stdin_text)
 
 
 # ── LEGACY docker-exec backend (emergency fallback only) ──────────────────────
@@ -813,7 +1148,8 @@ class _DockerExecBackend:
 
     @staticmethod
     def _exec_argv(handle: ContainerHandle, argv: list[str], *, container_cwd: str,
-                   env: Optional[dict], driver_name: str, tag: str, timeout: int) -> list[str]:
+                   env: Optional[dict], driver_name: str, tag: str, timeout: int,
+                   has_stdin: bool = False) -> list[str]:
         """Build `docker exec -w <cwd> -e ... <container> sh -c 'exec timeout -s KILL <N> <argv> </dev/null'`.
 
         - NO `setsid`: the worker MUST stay the docker-exec FOREGROUND process. setsid
@@ -826,7 +1162,12 @@ class _DockerExecBackend:
           target ONLY this worker's tree for per-worker kill/pause.
         """
         argv = _containerize_argv(driver_name, argv)
-        cmd = ["docker", "exec", "-w", container_cwd, "-e", f"MUTEKI_WTAG={tag}"]
+        cmd = ["docker", "exec"]
+        if has_stdin:
+            # Keep docker's stdin attached so the host can pipe the prompt.  The
+            # plaintext is passed via subprocess input, never interpolated here.
+            cmd.append("-i")
+        cmd += ["-w", container_cwd, "-e", f"MUTEKI_WTAG={tag}"]
         if env:
             for k, v in env.items():
                 if k == "HOME":
@@ -834,34 +1175,49 @@ class _DockerExecBackend:
                         cmd += ["-e", f"{k}={v}"]
                     continue
                 if k.startswith((
-                    "MUTEKI_", "ANTHROPIC_", "CLAUDE_", "CODEX_", "CURSOR_", "OPENAI_"
+                    "MUTEKI_", "ANTHROPIC_", "CLAUDE_", "CODEX_", "CURSOR_", "OPENAI_",
+                    "PI_", "KIMI_", "GROK_", "XAI_", "OPENCODE_", "DEEPSEEK_", "DSH_", "XDG_"
                 )):
                     cmd += ["-e", f"{k}={v}"]
         cmd.append(handle.container)
         prelude = [
             'if [ -r "$CLAUDE_CODE_OAUTH_TOKEN_FILE" ]; then '
             'export CLAUDE_CODE_OAUTH_TOKEN="$(cat "$CLAUDE_CODE_OAUTH_TOKEN_FILE")"; fi',
+            'if [ -r "$ANTHROPIC_AUTH_TOKEN_FILE" ]; then '
+            'export ANTHROPIC_AUTH_TOKEN="$(cat "$ANTHROPIC_AUTH_TOKEN_FILE")"; fi',
             'if [ -r "$CURSOR_API_KEY_FILE" ]; then '
             'export CURSOR_API_KEY="$(cat "$CURSOR_API_KEY_FILE")"; fi',
             'if [ -r "$ANTHROPIC_API_KEY_FILE" ]; then '
             'export ANTHROPIC_API_KEY="$(cat "$ANTHROPIC_API_KEY_FILE")"; fi',
             'if [ -r "$OPENAI_API_KEY_FILE" ]; then '
             'export OPENAI_API_KEY="$(cat "$OPENAI_API_KEY_FILE")"; fi',
+            'if [ -r "$OPENCODE_API_KEY_FILE" ]; then '
+            'export OPENCODE_API_KEY="$(cat "$OPENCODE_API_KEY_FILE")"; fi',
+            'if [ -r "$DEEPSEEK_API_KEY_FILE" ]; then '
+            'export DEEPSEEK_API_KEY="$(cat "$DEEPSEEK_API_KEY_FILE")"; fi',
+            'if [ -r "$KIMI_MODEL_API_KEY_FILE" ]; then '
+            'export KIMI_MODEL_API_KEY="$(cat "$KIMI_MODEL_API_KEY_FILE")"; fi',
+            'if [ -r "$XAI_API_KEY_FILE" ]; then '
+            'export XAI_API_KEY="$(cat "$XAI_API_KEY_FILE")"; fi',
         ]
+        stdin_redirect = "" if has_stdin else " < /dev/null"
         inner = (
             "; ".join(prelude)
-            + f"; exec timeout -s KILL {max(1, int(timeout))}s {shlex.join(argv)} < /dev/null"
+            + f"; exec timeout -s KILL {max(1, int(timeout))}s {shlex.join(argv)}"
+            + stdin_redirect
         )
         cmd += ["sh", "-c", inner, f"muteki_wtag_{tag}"]
         return cmd
 
     @staticmethod
     def run(driver: CliDriver, argv: list[str], *, handle: ContainerHandle,
-            cwd: str, timeout: int, env: Optional[dict] = None) -> CliResult:
+            cwd: str, timeout: int, env: Optional[dict] = None,
+            stdin_text: Optional[str] = None) -> CliResult:
         tag = uuid.uuid4().hex[:12]
         cont_cwd = handle.to_container_cwd(cwd)
         full = _DockerExecBackend._exec_argv(handle, argv, container_cwd=cont_cwd, env=env,
-                                             driver_name=driver.name, tag=tag, timeout=timeout)
+                                             driver_name=driver.name, tag=tag, timeout=timeout,
+                                             has_stdin=stdin_text is not None)
         rec = _RUNTIME_REGISTRY.create(
             handle=handle, tag=tag, driver=driver.name,
             cwd=cont_cwd, argv=_containerize_argv(driver.name, argv))
@@ -869,8 +1225,11 @@ class _DockerExecBackend:
         t0 = time.time()
         oom_before = _oom_kill_count(handle.container)
         try:
-            proc = subprocess.run(full, capture_output=True, text=True,
-                                  encoding="utf-8", errors="replace", timeout=timeout + 15)
+            input_kwargs = ({"input": stdin_text} if stdin_text is not None
+                            else {"stdin": subprocess.DEVNULL})
+            proc = subprocess.run(
+                full, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=timeout + 15, **input_kwargs)
         except subprocess.TimeoutExpired as e:
             _docker("exec", handle.container, "pkill", "-KILL", "-f", f"muteki_wtag_{tag}",
                     timeout=15)
@@ -907,11 +1266,15 @@ class _DockerExecBackend:
         cancel_event: "Optional[threading.Event]" = None,
         on_proc: "Optional[Callable[[object], None]]" = None,
         steer_event: "Optional[threading.Event]" = None,
+        on_stdin_delivered: "Optional[Callable[[], None]]" = None,
+        on_stdin_uncertain: "Optional[Callable[[], None]]" = None,
+        stdin_text: Optional[str] = None,
     ) -> CliResult:
         tag = uuid.uuid4().hex[:12]
         cont_cwd = handle.to_container_cwd(cwd)
         full = _DockerExecBackend._exec_argv(handle, argv, container_cwd=cont_cwd, env=env,
-                                             driver_name=driver.name, tag=tag, timeout=timeout)
+                                             driver_name=driver.name, tag=tag, timeout=timeout,
+                                             has_stdin=stdin_text is not None)
         rec = _RUNTIME_REGISTRY.create(
             handle=handle, tag=tag, driver=driver.name,
             cwd=cont_cwd, argv=_containerize_argv(driver.name, argv))
@@ -920,13 +1283,57 @@ class _DockerExecBackend:
         t0 = time.time()
         oom_before = _oom_kill_count(handle.container)
         client = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  stdin=(subprocess.PIPE if stdin_text is not None
+                                         else subprocess.DEVNULL),
                                   text=True, encoding="utf-8", errors="replace", bufsize=1)
         proc = _ContainerProc(handle.container, tag, client, runtime_record=rec)
+        proc_registered = True
         if on_proc is not None:
             try:
                 on_proc(proc)
             except Exception:
+                proc_registered = False
+
+        stdin_thread: "Optional[threading.Thread]" = None
+        stdin_notice_lock = threading.Lock()
+        stdin_notice_sent = False
+
+        def _notify_stdin(callback: "Optional[Callable[[], None]]") -> None:
+            nonlocal stdin_notice_sent
+            with stdin_notice_lock:
+                if stdin_notice_sent:
+                    return
+                stdin_notice_sent = True
+            if callable(callback):
+                try:
+                    callback()
+                except Exception:
+                    pass
+
+        if stdin_text is not None and proc_registered and not (
+            cancel_event is not None and cancel_event.is_set()
+        ):
+            def _feed_stdin() -> None:
+                delivered = False
+                try:
+                    if client.stdin is not None:
+                        client.stdin.write(stdin_text)
+                        client.stdin.close()
+                        delivered = True
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
+                _notify_stdin(
+                    on_stdin_delivered if delivered else on_stdin_uncertain)
+
+            stdin_thread = threading.Thread(
+                target=_feed_stdin, name="container-secret-stdin", daemon=True)
+            stdin_thread.start()
+        elif client.stdin is not None:
+            try:
+                client.stdin.close()
+            except (OSError, ValueError):
                 pass
+            _notify_stdin(on_stdin_uncertain)
 
         cancelled = False
         steered = False
@@ -989,6 +1396,10 @@ class _DockerExecBackend:
             watcher_stop.set()
             if watcher is not None:
                 watcher.join(timeout=1)
+            if stdin_thread is not None:
+                stdin_thread.join(timeout=1)
+                if stdin_thread.is_alive():
+                    _notify_stdin(on_stdin_uncertain)
         stderr = ""
         try:
             stderr = client.stderr.read() if client.stderr else ""
@@ -1010,11 +1421,17 @@ class _DockerExecBackend:
                 _dbg = f"/tmp/muteki_container_diag/{tag}.log"
                 os.makedirs("/tmp/muteki_container_diag", exist_ok=True)
                 with open(_dbg, "w") as _f:
-                    _f.write(f"=== argv ===\n{' '.join(full)}\n\n"
-                             f"=== rc={client.poll()} elapsed={time.time()-t0:.2f}s "
-                             f"out_lines={len(out_lines)} ===\n\n"
-                             f"=== STDOUT ===\n{''.join(out_lines)[:4000]}\n\n"
-                             f"=== STDERR ===\n{(stderr or '')[:8000]}\n")
+                    # Prompts, argv, stdout and stderr may contain an exact
+                    # materialised operator secret. This low-level layer does not
+                    # own the redaction values, so debug diagnostics are metadata
+                    # only—never attempt heuristic partial logging.
+                    _f.write(
+                        f"argv0={os.path.basename(str(full[0])) if full else ''}\n"
+                        f"argc={len(full)}\n"
+                        f"rc={client.poll()}\n"
+                        f"elapsed={time.time()-t0:.2f}s\n"
+                        f"stdout_lines={len(out_lines)}\n"
+                        f"stderr_present={bool(stderr.strip())}\n")
             except Exception:
                 pass
         res = driver.parse("".join(out_lines), stderr or "")

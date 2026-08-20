@@ -27,26 +27,20 @@ class EventBus:
         self._subscribers: set[asyncio.Queue[Event]] = set()
         self._ring: deque[Event] = deque(maxlen=ring_size)
         self._sinks: list[Callable[[Event], Awaitable[None]]] = []
+        self._filters: list[Callable[[Event], Awaitable[bool]]] = []
         self._closed = False
 
     # -- producer side -----------------------------------------------------
-    async def emit(self, event: Event) -> Event:
-        """Assign seq + ts, persist to sinks, fan out to all subscribers.
-
-        Returns the same event with its seq filled in (handy for callers).
-
-        Ordering: the WHOLE publish — assign seq → ring → sinks → fan-out — runs
-        under one lock, so concurrent emits are serialized and a subscriber always
-        receives events in strict seq order. The previous version assigned seq under
-        the lock but ran the sink/fan-out loops OUTSIDE it: emit-A could yield at
-        `await sink(event)` and let emit-B's `q.put` land first, so an online
-        subscriber observed seq=2 before seq=1 (the real-time reorder bug). Holding
-        the lock across the awaits costs a little producer concurrency but is the
-        only way to keep one ordered stream without a background drain task (the bus
-        is constructed in sync contexts with no running loop, so we can't start one).
-        A slow/failing sink is isolated so it can't block fan-out or wedge the lock.
-        """
+    async def _publish(self, event: Event) -> Event:
         async with self._lock:
+            for event_filter in list(self._filters):
+                try:
+                    if not await event_filter(event):
+                        return event
+                except Exception:
+                    # A lifecycle filter is an ownership boundary. An exception
+                    # cannot grant publication that the filter failed to approve.
+                    return event
             self._seq += 1
             object.__setattr__(event, "seq", self._seq)
             self._ring.append(event)
@@ -65,6 +59,42 @@ class EventBus:
                 await q.put(event)
         return event
 
+    async def emit(self, event: Event) -> Event:
+        """Assign seq + ts, persist to sinks, fan out to all subscribers.
+
+        Returns the same event with its seq filled in (handy for callers).
+
+        Ordering: the WHOLE publish — assign seq → ring → sinks → fan-out — runs
+        under one lock, so concurrent emits are serialized and a subscriber always
+        receives events in strict seq order. The previous version assigned seq under
+        the lock but ran the sink/fan-out loops OUTSIDE it: emit-A could yield at
+        `await sink(event)` and let emit-B's `q.put` land first, so an online
+        subscriber observed seq=2 before seq=1 (the real-time reorder bug). Holding
+        the lock across the awaits costs a little producer concurrency but is the
+        only way to keep one ordered stream without a background drain task (the bus
+        is constructed in sync contexts with no running loop, so we can't start one).
+
+        Publication is local cancellation-complete: after this caller is admitted to
+        the bus lock, cancellation is deferred until every snapshotted local sink and
+        subscriber queue has been processed, then re-raised. This prevents one local
+        publication from splitting durable JSONL and metadata; it is not an
+        exactly-once or distributed-delivery guarantee.
+        """
+        publish = asyncio.create_task(self._publish(event))
+        try:
+            return await asyncio.shield(publish)
+        except asyncio.CancelledError:
+            # ``shield`` keeps the publication owner alive. Wait through repeated
+            # cancellation requests, then preserve caller cancellation only after
+            # the local publication boundary has completed.
+            while not publish.done():
+                try:
+                    await asyncio.shield(publish)
+                except asyncio.CancelledError:
+                    continue
+            publish.result()
+            raise
+
     @property
     def current_seq(self) -> int:
         return self._seq
@@ -72,6 +102,15 @@ class EventBus:
     # -- durable sinks (SessionStore plugs in here) ------------------------
     def add_sink(self, sink: Callable[[Event], Awaitable[None]]) -> None:
         self._sinks.append(sink)
+
+    def add_filter(self, event_filter: Callable[[Event], Awaitable[bool]]) -> None:
+        """Register an admission filter that runs before sequence assignment.
+
+        Filters may add local metadata to an event and return ``False`` to drop a
+        stale or duplicate publication before it reaches the ring, durable sinks,
+        or subscribers.
+        """
+        self._filters.append(event_filter)
 
     def remove_sink(self, sink: Callable[[Event], Awaitable[None]]) -> bool:
         """Detach a previously-added sink (L3). Returns True if it was present. The

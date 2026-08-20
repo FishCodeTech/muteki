@@ -29,6 +29,12 @@ RUN npm run build
 RUN mkdir -p /ui/public
 
 FROM node:20-slim AS run
+ARG IMAGE_VERSION=development
+ARG IMAGE_REVISION=unknown
+LABEL org.opencontainers.image.title="Project Muteki UI" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      org.opencontainers.image.revision="${IMAGE_REVISION}" \
+      org.opencontainers.image.source="https://github.com/FishCodeTech/muteki"
 WORKDIR /ui
 ENV NODE_ENV=production
 # Standalone bundle: the server + its minimal node_modules, plus static assets.

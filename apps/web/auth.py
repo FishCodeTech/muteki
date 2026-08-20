@@ -59,7 +59,7 @@ DEFAULT_TTL_S = 12 * 3600
 # Paths under the gate that must stay reachable WITHOUT a token, otherwise the
 # operator could never obtain one. Everything else under /api requires auth.
 #   /api/auth/login  — exchange password for a token (you have no token yet)
-#   /api/health      — liveness probe (does not exist today, harmless to allow)
+#   /api/health      — liveness probe used by compose and load balancers
 # NOTE: /api/auth/ticket and /api/auth/me are deliberately NOT public — minting a
 # ticket or reading identity both require an already-valid token.
 PUBLIC_API_PATHS = frozenset({"/api/auth/login", "/api/health"})
