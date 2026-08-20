@@ -8,7 +8,7 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
-FALLBACK_VERSION = "0.3.0"
+FALLBACK_VERSION = "0.3.1"
 
 
 def project_root() -> Path:

@@ -343,7 +343,7 @@ export function ThreadRail({
                   )}
                   <span className="rail-folder-count">{items.length}</span>
                 </button>
-                <div className="row-menu">
+                <div className={`row-menu ${menuFor === `folder:${f.id}` ? "menu-open" : ""}`}>
                   <button className="dots" title={t("rail.menu.moreActions")} aria-label={t("rail.menu.moreActions")}
                     onClick={(e) => { e.stopPropagation(); setMenuFor((cur) => (cur === `folder:${f.id}` ? null : `folder:${f.id}`)); }}><Icon name="more" size={15} /></button>
                   {menuFor === `folder:${f.id}` && (

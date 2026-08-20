@@ -5186,6 +5186,13 @@ button.ws2-overview-tr:hover { background: var(--ink-wash); }
   position: relative;
   z-index: 1;
 }
+/* Open ⋯ menus overflow their row. Equal-z siblings later in the list would
+   intercept clicks on the overflowing items (folder "Delete" sits over the
+   next folder). Raise the open host above its neighbours. */
+.selection-glide-host > .rail-folder.menu-open,
+.selection-glide-host .thread-item.menu-open {
+  z-index: 90;
+}
 
 /* The shared layer owns selected backgrounds; items continue to own content,
    focus rings and semantic colours. */
