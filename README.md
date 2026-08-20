@@ -149,7 +149,7 @@ muteki rollback                # switch back to the previous installed release
 muteki version                 # show the active version and install mode
 ```
 
-The same controls are available under **Settings → System update** in the Web command deck. Releases and images default to this repository and `ghcr.io/fishcodetech`. For the versioned container deployment, use `muteki upgrade --compose` with [`docker-compose.release.yml`](docker-compose.release.yml). If you publish your own tags and images, set `MUTEKI_RELEASE_REPOSITORY` and `MUTEKI_IMAGE_REGISTRY`; non-public GitHub Releases also need `MUTEKI_GITHUB_TOKEN`. Git tags and image tags use a leading `v`, for example `v0.3.0`.
+The same controls are available under **Settings → System update** in the Web command deck. Releases and images default to this repository and `ghcr.io/fishcodetech`. For the versioned container deployment, use `muteki upgrade --compose` with [`docker-compose.release.yml`](docker-compose.release.yml). If you publish your own tags and images, set `MUTEKI_RELEASE_REPOSITORY` and `MUTEKI_IMAGE_REGISTRY`; non-public GitHub Releases also need `MUTEKI_GITHUB_TOKEN`. Git tags and image tags use a leading `v`, for example `v0.3.1`.
 
 Recommended setting:
 
@@ -258,8 +258,8 @@ MUTEKI_WORKER_IMAGE=ghcr.io/fishcodetech/muteki-worker-slim:latest ./run.sh web
 
 ```bash
 ./docker/worker/build.sh
-./docker/worker/build.sh ghcr.io/fishcodetech/muteki-worker v0.3.0
-./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim v0.3.0 amd64
+./docker/worker/build.sh ghcr.io/fishcodetech/muteki-worker v0.3.1
+./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim v0.3.1 amd64
 ```
 
 The full image is intentionally large (Kali headless + Ghidra + SageMath via conda + offline knowledge). Use the slim image only when you understand that workers may need to install more tooling during a run.

@@ -6,12 +6,12 @@
 #
 # Usage: ./docker/worker/build.sh [repo] [version]
 #   repo:    image repository (default: muteki-worker; e.g. ghcr.io/fishcodetech/muteki-worker)
-#   version: version tag       (default: v0.3.0; GHCR release tags keep the leading v)
+#   version: version tag       (default: v0.3.1; GHCR release tags keep the leading v)
 # Tags built: <repo>:<version> AND <repo>:latest (code defaults to :latest).
 set -euo pipefail
 
 REPO_IMAGE="${1:-muteki-worker}"
-VERSION="${2:-v0.3.0}"
+VERSION="${2:-v0.3.1}"
 TAG="${REPO_IMAGE}:${VERSION}"
 LATEST="${REPO_IMAGE}:latest"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
