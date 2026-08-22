@@ -2766,9 +2766,12 @@ class _CoordinatorLoopMixin:
         self, outcome: "Optional[SolveOutcome]", flag: "Optional[str]",
         *, worker_id: str = "",
     ) -> None:
-        """Write the winner's CLI continuation handle to workspace/winner.json so a
-        post-solve standby driver can resume the SAME session for a human
-        follow-up. Best-effort: a write failure must never fail a solved run.
+        """Persist the winner's CLI continuation handle for human follow-ups.
+
+        The Web driver installs a coordinator-only writer. ``winner.json`` remains
+        a compatibility artifact in the Worker workspace and carries no profile,
+        credential endpoint or backend authority. Best-effort: a write failure must
+        never fail a solved run.
 
         Needs graph_dir (web runs) — winner.json lands beside graph/ (a sibling of
         the sandbox root, so sandbox.shutdown_all()'s rmtree can't delete it). TUI
@@ -2781,19 +2784,37 @@ class _CoordinatorLoopMixin:
             return
         try:
             import json
-            payload = {
+            workdir = getattr(outcome, "workdir", "") or ""
+            self._winner_workdir_name = Path(workdir).name if workdir else ""
+            trusted_payload = {
                 "engine": getattr(outcome, "engine", "") or "",
                 "worker_id": str(worker_id or ""),
                 "session": session,
-                "workdir": getattr(outcome, "workdir", "") or "",
+                "workdir": workdir,
                 "flag": flag or outcome.flag or "",
                 # multi-flag: every flag the run collected (the run's authoritative
                 # set, not just this one worker's). `flag` stays the first.
                 "flags": list(self._found_flags) or (
                     [flag] if flag else (outcome.flags or [])),
                 "challenge": self.challenge.model_dump(),
+                "profile": dict(getattr(outcome, "runtime_profile", {}) or {}),
                 **self._runtime_metadata_for(outcome),
             }
+            writer = getattr(self, "_winner_continuation_writer", None)
+            if callable(writer):
+                writer(dict(trusted_payload))
+            profile = trusted_payload.get("profile") or {}
+            payload = {
+                key: trusted_payload[key]
+                for key in (
+                    "engine", "worker_id", "session", "workdir", "flag",
+                    "flags", "challenge",
+                )
+            }
+            if isinstance(profile, dict):
+                payload["profile_id"] = str(
+                    profile.get("id") or profile.get("name") or ""
+                )
             dest = self._graph_dir.parent / "winner.json"
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(json.dumps(payload, ensure_ascii=False, indent=2))

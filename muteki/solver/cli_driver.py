@@ -244,6 +244,10 @@ class CliResult:
     output_tokens: Optional[int] = None
     num_turns: Optional[int] = None
     elapsed_s: float = 0.0
+    # Real subprocess exit status. Parsers normalize vendor output and cannot infer
+    # process success from response text alone, so execution layers attach this
+    # after the child exits. None means the runner could not observe an exit code.
+    returncode: Optional[int] = None
     timed_out: bool = False
     # OOM-killed: the worker's process was SIGKILL'd by the kernel out-of-memory
     # killer (a sibling run's container ballooned and starved the Docker VM — no
@@ -596,7 +600,7 @@ _FLAG_LINE = re.compile(r"FOUND_FLAG=\s*(\S+)")
 
 
 class ClaudeCodeDriver(CliDriver):
-    """`claude -p` — pre-seeds a uuid session; resumes with `-r`. Bare host,
+    """`claude -p` — pre-seeds a uuid session; resumes with `-r`. Host CLI,
     --dangerously-skip-permissions (full shell), JSON output for clean parsing."""
     name = "claude"
     secure_prompt_transport = True
@@ -658,14 +662,14 @@ class ClaudeCodeDriver(CliDriver):
     ) -> list[str]:
         # Claude print mode reads text input from stdin when no positional prompt is
         # supplied.  --no-session-persistence is the vendor-supported disk fence;
-        # --bare also disables auto-memory, hooks/plugin sync, background prefetches,
-        # and keychain reads that are unnecessary for an env-authenticated worker.
+        # ProfileDriver adds --bare for injected credentials and endpoints. The
+        # base driver represents host system login and must retain Keychain access.
         # Keep a trailing `--` sentinel so profile model injection has an unambiguous
         # insertion point, but never put the prompt itself in argv.
         del prompt, session
         return [
             self.bin, "-p", *self._fmt(stream),
-            "--dangerously-skip-permissions", "--bare",
+            "--dangerously-skip-permissions",
             "--no-session-persistence",
             *self._mcp_isolation(kb_access=kb_access),
             *self._denied(web_access=web_access, kb_access=kb_access),
@@ -675,7 +679,7 @@ class ClaudeCodeDriver(CliDriver):
     def secure_prompt_preflight(self) -> "tuple[bool, str]":
         return _secure_help_preflight(
             self.bin, ["--help"],
-            ("--no-session-persistence", "--bare", "--print"))
+            ("--no-session-persistence", "--print"))
 
     def build_resume(
         self, prompt: str, session: str, *,
@@ -826,12 +830,11 @@ class ClaudeCodeDriver(CliDriver):
 
     def _hello_argv(self) -> list[str]:
         # one-turn JSON dry-run; _hello_ok asserts the result envelope came back.
-        # Match build_execute_stdin's --bare / --no-session-persistence fence so a
-        # host plugin SessionEnd hook (or missing `node`) cannot false-fail the
-        # coordinator health probe and empty the entire engine roster.
+        # Keep the minimal turn non-persistent. ProfileDriver adds --bare only for
+        # injected credentials/endpoints; host system login needs Keychain reads.
         return [
             self.bin, "-p", "--output-format", "json", "--max-turns", "1",
-            "--dangerously-skip-permissions", "--bare", "--no-session-persistence",
+            "--dangerously-skip-permissions", "--no-session-persistence",
             *self._mcp_isolation(kb_access=False),
             "--tools", "",
             "--", self.HELLO_PROMPT,
@@ -2428,7 +2431,15 @@ class ProfileDriver(CliDriver):
             self.profile.get("reasoning_effort"), "default")
 
     def _with_profile_options(self, argv: list[str]) -> list[str]:
-        out = _insert_model_arg(argv, self._model(), engine=self.name)
+        out = list(argv)
+        credential_kind = str(
+            self.profile.get("credential_kind")
+            or ("engine_key" if self.profile.get("credential_account") else "system_inherit")
+        ).strip()
+        if self.name == "claude" and credential_kind != "system_inherit" and "--bare" not in out:
+            sentinel = out.index("--") if "--" in out else len(out)
+            out.insert(sentinel, "--bare")
+        out = _insert_model_arg(out, self._model(), engine=self.name)
         return apply_reasoning_effort(
             out, engine=self.name, reasoning_effort=self._reasoning_effort())
 
@@ -2523,7 +2534,10 @@ class EndpointDriver(CliDriver):
         return env
 
     def _with_profile_options(self, argv: list[str]) -> list[str]:
-        out = argv
+        out = list(argv)
+        if self.name == "claude" and "--bare" not in out:
+            sentinel = out.index("--") if "--" in out else len(out)
+            out.insert(sentinel, "--bare")
         if not (self.name == "codex" and self._codex_config_flags()):
             selected_model = str(self.profile.get("model") or "").strip()
             if self.name == "opencode" and selected_model and "/" not in selected_model:
@@ -3512,6 +3526,7 @@ def run_cli(driver: CliDriver, argv: list[str], *, cwd: str, timeout: int,
         res.elapsed_s = time.time() - t0
         return res
     res = driver.parse(proc.stdout or "", proc.stderr or "")
+    res.returncode = proc.returncode
     res.elapsed_s = time.time() - t0
     return res
 
@@ -3833,6 +3848,7 @@ def run_cli_streaming(
     if on_raw_streams is not None:
         on_raw_streams(stdout, stderr)
     res = driver.parse(stdout, stderr or "")
+    res.returncode = proc.returncode
     res.timed_out = timed_out
     res.cancelled = cancelled
     res.steered = steered

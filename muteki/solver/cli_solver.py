@@ -784,11 +784,22 @@ _RESPOND_MARK_FALSE_PROMPT = (
 _RESPOND_WRITEUP_PROMPT = (
     "Write a concise CTF WRITEUP for the challenge you just solved, in Chinese. "
     "Base it ONLY on what you actually confirmed this session — do not invent steps. "
+    "Do not run commands, call tools, search the filesystem, or continue the "
+    "investigation. Synthesize the report from the confirmed session history now. "
     "Structure it as:\n"
     "  ## 漏洞点  (the root cause / vulnerability)\n"
     "  ## 利用步骤  (numbered, reproducible — the real commands/requests you used)\n"
     "  ## Flag  (the flag and where it came from)\n"
     "Keep it tight and technical. Output ONLY the markdown writeup, nothing else."
+)
+
+_RESPOND_PENTEST_WRITEUP_PROMPT = (
+    "Write a concise penetration-testing report in Chinese for the engagement you "
+    "just completed. Base it ONLY on evidence confirmed this session. "
+    "Do not run commands, call tools, search the filesystem, or continue the "
+    "investigation. Synthesize the report from the confirmed session history now. "
+    "Structure it as:\n  ## 范围与目标\n  ## 已确认发现\n  ## 复现步骤\n  ## 影响与修复建议\n"
+    "Do not invent findings, commands, requests, or impact. Output ONLY markdown."
 )
 
 
@@ -6604,11 +6615,20 @@ class CliSolver:
         keeps going and any NEW flag it finds STILL passes the real gate."""
         action = (self.hitl_cmd.get("action") or "ask").lower()
         text = (self.hitl_cmd.get("text") or "").strip()
-        await self._emit(EventType.RUN_STARTED, challenge=self.challenge.model_dump())
-        await self._emit(
-            EventType.REASONING_DELTA,
-            text=f"[{self.driver.name}] standby — resuming session for "
-                 f"{action}{(': ' + text[:80]) if text else ''}\n")
+        followup_id = str(self.hitl_cmd.get("followup_id") or "")
+        if action in {"ask", "writeup"}:
+            await self._emit(
+                EventType.FOLLOWUP_STARTED,
+                followup_id=followup_id,
+                kind=action,
+                question=text,
+            )
+        else:
+            await self._emit(EventType.RUN_STARTED, challenge=self.challenge.model_dump())
+            await self._emit(
+                EventType.REASONING_DELTA,
+                text=f"[{self.driver.name}] standby — resuming session for "
+                     f"{action}{(': ' + text[:80]) if text else ''}\n")
 
         # per-worker cwd: reuse the winner's workdir if it still exists (keeps any
         # files it downloaded), else a fresh scratch dir. Computed FIRST so we can
@@ -6629,7 +6649,11 @@ class CliSolver:
             prompt = _RESPOND_MARK_FALSE_PROMPT.format(
                 flag=self.hitl_cmd.get("flag") or "(the reported flag)", note=note)
         elif action == "writeup":
-            prompt = _RESPOND_WRITEUP_PROMPT
+            prompt = (
+                _RESPOND_PENTEST_WRITEUP_PROMPT
+                if str(getattr(self.challenge, "mode", "ctf")) == "pentest"
+                else _RESPOND_WRITEUP_PROMPT
+            )
         else:  # ask / hint / redirect / anything conversational
             question = text or "(no question text)"
             if action == "redirect":
@@ -6678,16 +6702,41 @@ class CliSolver:
             await self._note_cli_session(session)
             argv, stdin_text = self._execute_invocation(prompt, session)
 
+        # Conversational follow-ups should return promptly. A resumed model can
+        # otherwise start another investigation and leave the deck pending for the
+        # normal 40-minute solve timeout. mark_false remains a real re-solve and
+        # retains the longer bound.
+        respond_timeout = 300 if action in {"ask", "writeup"} else 1200
         res: CliResult = await self._run_invocation(
-            argv, cwd=str(wd), timeout=min(self.timeout, 1200),
+            argv, cwd=str(wd), timeout=min(self.timeout, respond_timeout),
             stdin_text=stdin_text)
         await self._emit_empty_stderr_diagnostic(res)
         await self._stream_cost(res)
         all_text = self._result_text_with_stderr(res)
         safe_all_text = self._redact_control_secrets(all_text)
 
+        if action in {"ask", "writeup"}:
+            observed_rc = res.returncode
+            if observed_rc is None:
+                runtime_rc = (res.runtime_status or {}).get("rc")
+                try:
+                    observed_rc = int(runtime_rc) if runtime_rc is not None else None
+                except (TypeError, ValueError):
+                    observed_rc = None
+            if res.timed_out:
+                raise RuntimeError(f"standby {action} worker timed out")
+            if res.oom_killed:
+                raise RuntimeError(f"standby {action} worker was terminated by OOM")
+            if res.cancelled or res.steered:
+                raise RuntimeError(f"standby {action} worker did not complete")
+            if observed_rc not in {None, 0}:
+                raise RuntimeError(
+                    f"standby {action} worker exited with code {observed_rc}")
+            if not safe_all_text.strip():
+                raise RuntimeError(f"standby {action} worker returned an empty response")
+
         # stream the reply to the deck (the worker's answer / writeup body).
-        if safe_all_text.strip():
+        if safe_all_text.strip() and action not in {"ask", "writeup"}:
             await self._emit(
                 EventType.TEXT_MESSAGE_DELTA,
                 text=safe_all_text.strip(),

@@ -22,6 +22,7 @@ import re
 import shutil
 import stat
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -187,6 +188,9 @@ class Run:
     # Lifecycle admission state. Old-generation events are dropped before they
     # reach the durable log, and each generation may publish RUN_FINISHED once.
     terminal_generations: set[int] = field(default_factory=set)
+    # Ask/Writeup run after RUN_FINISHED but still publish durable, typed output.
+    # IDs stay active until their terminal follow-up event has been emitted.
+    active_followups: set[str] = field(default_factory=set)
     termination_reasons: dict[int, str] = field(default_factory=dict)
     # One task owns one readiness result for each exact participating profile
     # configuration.  A continuation generation reuses the result; changing the
@@ -424,6 +428,8 @@ class RunManager:
         # dispatch path falls back to this when a request doesn't say otherwise.
         self.worker_config = WorkerConfigStore(root=self.sessions_root)
         protocol2_run_ids = self._reconcile_protocol2_flags()
+        self._recover_interrupted_followups(
+            SessionStore(root=self.sessions_root))
         self._rehydrate(protocol2_run_ids=protocol2_run_ids)
 
     def _execution_owned(
@@ -451,8 +457,19 @@ class RunManager:
             if generation < run.execution_generation:
                 return False
             payload.setdefault("control_generation", run.control_generation)
+            followup_types = {
+                EventType.FOLLOWUP_STARTED,
+                EventType.FOLLOWUP_COMPLETED,
+                EventType.FOLLOWUP_FAILED,
+            }
+            # These event types are exclusively produced by the post-run driver.
+            # Their own lifecycle ID provides UI correlation; admission must not
+            # depend on a transient in-memory set because a very short worker can
+            # complete while its control receipt is still settling.
+            allowed_followup = ev.event_type in followup_types
             if (generation in run.terminal_generations
-                    and ev.event_type is not EventType.CONTROL_COMMAND):
+                    and ev.event_type is not EventType.CONTROL_COMMAND
+                    and not allowed_followup):
                 # The terminal event closes this execution generation.  A worker
                 # subprocess may still flush a buffered frame while cancellation is
                 # propagating, but that frame belongs to a closed runtime and must not
@@ -547,6 +564,103 @@ class RunManager:
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
 
+    def _winner_continuation_path(self, run_id: str) -> Path:
+        return (
+            self.control_root / self._safe_run_id(run_id)
+            / "winner-continuation.json"
+        )
+
+    def persist_winner_continuation(
+        self, run_id: str, payload: dict[str, Any],
+    ) -> None:
+        """Persist the resumable winner outside the Worker-writable workspace.
+
+        Only stable identifiers and continuation data are retained. The current
+        Worker configuration remains authoritative for credentials, endpoints,
+        models and backend selection when a follow-up starts.
+        """
+        directory = self.coordinator_control_dir(run_id)
+        path = directory / "winner-continuation.json"
+        temporary = directory / (
+            f".winner-continuation-{os.getpid()}-{time.time_ns()}.tmp"
+        )
+        workspace = self.workspace_dir(run_id).resolve()
+        worker_root = (workspace / "workers").resolve()
+        workdir_rel = ""
+        raw_workdir = str(payload.get("workdir") or "").strip()
+        if raw_workdir:
+            try:
+                resolved_workdir = Path(raw_workdir).resolve()
+                if self._is_within(resolved_workdir, worker_root):
+                    workdir_rel = str(resolved_workdir.relative_to(workspace))
+            except (OSError, ValueError):
+                workdir_rel = ""
+
+        raw_profile = payload.get("profile")
+        profile_id = str(payload.get("profile_id") or "").strip()
+        if not profile_id and isinstance(raw_profile, dict):
+            profile_id = str(
+                raw_profile.get("id") or raw_profile.get("name") or ""
+            ).strip()
+        backend = str(payload.get("backend") or "").strip()
+        if backend not in {"local", "container"}:
+            backend = ""
+        flags = [
+            str(value).strip() for value in list(payload.get("flags") or [])
+            if str(value).strip()
+        ]
+        first_flag = str(payload.get("flag") or "").strip()
+        if first_flag and first_flag not in flags:
+            flags.insert(0, first_flag)
+        challenge = payload.get("challenge")
+        stored = {
+            "version": 1,
+            "worker_id": str(payload.get("worker_id") or "").strip(),
+            "profile_id": profile_id,
+            "engine": str(payload.get("engine") or "").strip(),
+            "session": str(payload.get("session") or "").strip(),
+            "workdir_rel": workdir_rel,
+            "backend": backend,
+            "flag": flags[0] if flags else "",
+            "flags": list(dict.fromkeys(flags)),
+            "challenge": challenge if isinstance(challenge, dict) else {},
+        }
+        temporary.write_text(
+            json.dumps(stored, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+
+    def load_winner_continuation(self, run_id: str) -> dict[str, Any]:
+        """Load coordinator-owned continuation metadata, failing closed."""
+        path = self._winner_continuation_path(run_id)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            return {}
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            return {}
+        return dict(payload)
+
+    def update_winner_continuation_flags(
+        self, run_id: str, flags: list[str],
+    ) -> None:
+        continuation = self.load_winner_continuation(run_id)
+        if not continuation:
+            return
+        continuation["flags"] = list(dict.fromkeys(
+            str(value).strip() for value in flags if str(value).strip()
+        ))
+        continuation["flag"] = (
+            continuation["flags"][0] if continuation["flags"] else ""
+        )
+        rel = str(continuation.pop("workdir_rel", "") or "")
+        continuation["workdir"] = (
+            str((self.workspace_dir(run_id) / rel).resolve()) if rel else ""
+        )
+        self.persist_winner_continuation(run_id, continuation)
+
     def _apply_meta(self, run: "Run") -> None:
         """Overlay persisted operator metadata (pin/archive/rename) onto a run."""
         m = self.meta.get(run.run_id)
@@ -634,6 +748,80 @@ class RunManager:
                         run_id,
                     )
         return frozenset(catalog_run_ids)
+
+    def _recover_interrupted_followups(self, store: SessionStore) -> None:
+        """Persist a terminal event for follow-ups abandoned by a process exit.
+
+        Ask and writeup executions belong to the web process that started them.
+        During manager construction there cannot be a surviving standby task from
+        the previous process, so every durable ``followup.started`` without a
+        matching terminal event is interrupted.  Recording the recovery in the
+        same JSONL log keeps replay deterministic and unlocks every fresh client,
+        rather than synthesizing a different result per SSE connection.
+        """
+        started_type = EventType.FOLLOWUP_STARTED.value
+        terminal_types = {
+            EventType.FOLLOWUP_COMPLETED.value,
+            EventType.FOLLOWUP_FAILED.value,
+        }
+        for run_id in store.list_runs():
+            pending: dict[str, dict[str, Any]] = {}
+            try:
+                for index, row in enumerate(store.load_all(run_id)):
+                    event_type = str(row.get("event_type") or "")
+                    payload = row.get("payload")
+                    payload = payload if isinstance(payload, dict) else {}
+                    followup_id = str(payload.get("followup_id") or "")
+                    if event_type == started_type:
+                        key = followup_id or f"legacy:{index}"
+                        pending[key] = {
+                            "followup_id": followup_id,
+                            "kind": str(payload.get("kind") or "ask"),
+                            "execution_generation": payload.get(
+                                "execution_generation"),
+                            "recovery_id": (
+                                f"interrupted-followup:{index}:{followup_id}"
+                            ),
+                        }
+                    elif event_type in terminal_types:
+                        if followup_id:
+                            pending.pop(followup_id, None)
+                        else:
+                            legacy_key = next(
+                                (key for key in reversed(pending)
+                                 if not pending[key]["followup_id"]),
+                                None,
+                            )
+                            if legacy_key is not None:
+                                pending.pop(legacy_key, None)
+
+                for interrupted in pending.values():
+                    payload = {
+                        "followup_id": interrupted["followup_id"],
+                        "kind": interrupted["kind"],
+                        "detail": "服务已重启，后续操作已中断",
+                        "recovery_id": interrupted["recovery_id"],
+                    }
+                    generation = interrupted.get("execution_generation")
+                    if generation is not None:
+                        payload["execution_generation"] = generation
+                    recovery = Event(
+                        event_type=EventType.FOLLOWUP_FAILED,
+                        run_id=run_id,
+                        solver_id="web-runtime-recovery",
+                        seq=store.last_stream_seq(run_id) + 1,
+                        payload=payload,
+                    )
+                    store.append_if_absent_sync(
+                        recovery,
+                        identity_field="recovery_id",
+                        identity=interrupted["recovery_id"],
+                    )
+            except Exception as exc:
+                LOG.error(
+                    "Interrupted follow-up recovery failed for %s error_type=%s",
+                    run_id, type(exc).__name__,
+                )
 
     def _rehydrate(
         self, *, protocol2_run_ids: Optional[frozenset[str]] = None
@@ -1696,27 +1884,22 @@ class RunManager:
             return True
         if scope.kind.value in {"run", "challenge"}:
             return scope.value == run.run_id
-        try:
-            import json
-            winner_path = self.workspace_dir(run.run_id) / "winner.json"
-            winner = json.loads(winner_path.read_text())
-        except Exception:
+        winner = self.load_winner_continuation(run.run_id)
+        if not winner:
             return False
         if scope.kind.value == "worker":
             persisted_worker = str(winner.get("worker_id") or "")
             return bool(persisted_worker and persisted_worker == scope.value)
         if scope.kind.value == "engine":
             return str(winner.get("engine") or "") == scope.value
-        # Intent/lane identity is not persisted in winner.json; never widen it to
+        # Intent/lane identity is not persisted in continuation state; never widen it to
         # the winner merely because that is the only standby session available.
         return False
 
     def _register_standby_winner(self, run: Run) -> None:
         """Project the persisted winner as the only valid finished-run mailbox."""
         try:
-            import json
-            winner = json.loads(
-                (self.workspace_dir(run.run_id) / "winner.json").read_text())
+            winner = self.load_winner_continuation(run.run_id)
             worker_id = str(winner.get("worker_id") or "").strip()
             if not worker_id:
                 return
@@ -2074,6 +2257,13 @@ class RunManager:
             busy = self._standby_busy(run)
             target = str(wire.get("target") or "global")
             exact_text = str(wire.get("text") or wire.get("hint") or "").strip()
+            if action == "ask" and not exact_text:
+                return {
+                    "state": "unknown",
+                    "detail": "ask requires a question",
+                    "target_ids": [],
+                    "metadata": {"code": "followup_question_required"},
+                }
 
             if action in self._OFFLINE_CONTROL_ACTIONS:
                 # The actor already expired typed ContextResources. Atomically
@@ -2228,33 +2418,24 @@ class RunManager:
                         graph.close()
 
                 run.invalidate_flag(flag)
-                # Keep the post-solve snapshot aligned immediately. A failed
-                # re-solve must not let a later writeup/ask seed workers from a
-                # winner.json that still contains the invalidated flag.
                 try:
-                    import json
-                    winner_path = self.workspace_dir(run.run_id) / "winner.json"
-                    winner = (json.loads(winner_path.read_text())
-                              if winner_path.exists() else {})
-                    surviving = [
-                        value for value in list(winner.get("flags") or run.flags)
-                        if value and value != flag
-                    ]
-                    winner["flags"] = surviving
-                    winner["flag"] = surviving[0] if surviving else ""
-                    temp = winner_path.with_suffix(".json.tmp")
-                    temp.write_text(json.dumps(
-                        winner, ensure_ascii=False, indent=2))
-                    os.replace(temp, winner_path)
+                    self.update_winner_continuation_flags(
+                        run.run_id, list(run.flags))
                 except Exception:
-                    # The graph/run projection remains authoritative; standby also
-                    # reads graph flags first. Snapshot repair is retried naturally
-                    # on the next successful solve.
                     pass
                 runtime_wire = dict(wire)
                 runtime_wire["_control_mark_false_applied"] = True
                 try:
                     from muteki.core.events import blackboard_delta_payload
+                    # A false-positive invalidation resumes solving and therefore
+                    # owns a new execution generation. This lets its normal
+                    # RUN_STARTED/RUN_FINISHED stream through while the completed
+                    # generation remains sealed against late worker frames.
+                    run.execution_generation += 1
+                    self._fresh_bus(run)
+                    run.finished = False
+                    run.solved = False
+                    run.paused = False
                     await run.bus.emit(Event(
                         event_type=EventType.BLACKBOARD_DELTA,
                         run_id=run.run_id,
@@ -2264,7 +2445,10 @@ class RunManager:
                     await run.bus.emit(Event(
                         event_type=EventType.RUN_REOPENED,
                         run_id=run.run_id,
-                        payload={"flag": flag},
+                        payload={
+                            "flag": flag,
+                            "execution_generation": run.execution_generation,
+                        },
                     ))
                 except Exception:
                     pass
@@ -2904,8 +3088,9 @@ class RunManager:
         so the persisted shared_graph (verified facts / dead-ends) carries straight
         over — the swarm builds ON the prior evidence instead of from scratch.
 
-        The challenge is reconstructed from winner.json (the durable run snapshot),
-        falling back to the run's rail metadata. Caller-supplied `body` fields win
+        The challenge is reconstructed from coordinator-owned continuation state,
+        falling back to durable lifecycle events and rail metadata. Caller-supplied
+        `body` fields win
         (e.g. an operator hint folded into the description, a new target)."""
         if run.runtime_incomplete and not await self._settle_incomplete_runtime(
                 run, timeout=self._standby_cancel_timeout()):
@@ -2929,15 +3114,8 @@ class RunManager:
         if not await self._drain_control_before_launch(run_id, run):
             return False
 
-        # rebuild the challenge body from the durable winner.json snapshot.
-        ch: dict[str, Any] = {}
-        try:
-            import json
-            wp = self.workspace_dir(run_id) / "winner.json"
-            if wp.exists():
-                ch = (json.loads(wp.read_text()) or {}).get("challenge") or {}
-        except Exception:
-            ch = {}
+        continuation = self.load_winner_continuation(run_id)
+        ch = continuation.get("challenge") or {}
         if not ch:
             try:
                 async for ev in run.store.replay(run_id):
@@ -3035,6 +3213,15 @@ class RunManager:
             return False
         if self._standby_busy(run):
             return False  # a standby is already serving this run — don't pile on
+        action = str(cmd.get("action") or "").lower()
+        if action in {"ask", "writeup"}:
+            followup_id = str(
+                cmd.get("followup_id")
+                or cmd.get("command_id")
+                or uuid.uuid4().hex
+            )
+            cmd["followup_id"] = followup_id
+            run.active_followups.add(followup_id)
         # A prior driver clears these only after the runtime-exit fence. Clear stale
         # registrations defensively before publishing the next worker instance.
         run.standby_cancel = None
@@ -3050,6 +3237,41 @@ class RunManager:
         driver = build_standby_driver(cmd, mgr=self)
 
         async def _go() -> None:
+            followup_terminal = False
+
+            async def _note_followup_terminal(ev: Event) -> None:
+                nonlocal followup_terminal
+                if ev.event_type not in {
+                    EventType.FOLLOWUP_COMPLETED,
+                    EventType.FOLLOWUP_FAILED,
+                }:
+                    return
+                wanted = str(cmd.get("followup_id") or "")
+                event_id = str(ev.payload.get("followup_id") or "")
+                if not wanted or event_id == wanted:
+                    followup_terminal = True
+
+            async def _emit_followup_failed(detail: str) -> None:
+                nonlocal followup_terminal
+                if action not in {"ask", "writeup"} or followup_terminal:
+                    return
+                try:
+                    if bool(getattr(run.bus, "_closed", False)):
+                        self._fresh_bus(run)
+                    await run.bus.emit(Event(
+                        event_type=EventType.FOLLOWUP_FAILED,
+                        run_id=run_id,
+                        payload={
+                            "followup_id": cmd.get("followup_id"),
+                            "kind": action,
+                            "detail": detail,
+                        },
+                    ))
+                    followup_terminal = True
+                except Exception:
+                    pass
+
+            run.bus.add_sink(_note_followup_terminal)
             try:
                 LOG.info("standby worker starting for %s action=%s",
                          run_id, cmd.get("action"))
@@ -3057,6 +3279,7 @@ class RunManager:
                 LOG.info("standby worker finished for %s action=%s",
                          run_id, cmd.get("action"))
             except asyncio.CancelledError:
+                await _emit_followup_failed("后续操作已取消")
                 raise
             except Exception as exc:
                 detail = _safe_exception_detail("standby worker failed", exc)
@@ -3065,20 +3288,26 @@ class RunManager:
                 LOG.error("standby worker failed for %s action=%s error_type=%s",
                           run_id, cmd.get("action"), type(exc).__name__)
                 try:
-                    await run.bus.emit(Event(
-                        event_type=EventType.HITL_REQUEST,
-                        run_id=run_id,
-                        payload={
-                            "target": cmd.get("target") or "global",
-                            "source": "standby",
-                            "action": cmd.get("action"),
-                            "need": detail,
-                            "text": detail,
-                        },
-                    ))
+                    if action in {"ask", "writeup"}:
+                        await _emit_followup_failed(detail)
+                    else:
+                        await run.bus.emit(Event(
+                            event_type=EventType.HITL_REQUEST,
+                            run_id=run_id,
+                            payload={
+                                "target": cmd.get("target") or "global",
+                                "source": "standby",
+                                "action": cmd.get("action"),
+                                "need": detail,
+                                "text": detail,
+                            },
+                        ))
                 except Exception:
                     pass
             finally:
+                run.bus.remove_sink(_note_followup_terminal)
+                if action in {"ask", "writeup"} and not followup_terminal:
+                    await _emit_followup_failed("后续操作已中断")
                 # Do not close the bus; retain the completed task as an observable
                 # receipt. `_ensure_standby` checks `.done()` and replaces it on the
                 # next command, so this does not block subsequent follow-ups.
@@ -3114,6 +3343,9 @@ class RunManager:
                 ]
                 self._ensure_standby_context_cleanup(
                     run, owner=owner, reservations=reservations)
+                followup_id = str(cmd.get("followup_id") or "")
+                if followup_id:
+                    run.active_followups.discard(followup_id)
 
         run.standby_task = asyncio.create_task(_go())
         return True
