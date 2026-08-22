@@ -428,6 +428,8 @@ class RunManager:
         # dispatch path falls back to this when a request doesn't say otherwise.
         self.worker_config = WorkerConfigStore(root=self.sessions_root)
         protocol2_run_ids = self._reconcile_protocol2_flags()
+        self._recover_interrupted_followups(
+            SessionStore(root=self.sessions_root))
         self._rehydrate(protocol2_run_ids=protocol2_run_ids)
 
     def _execution_owned(
@@ -746,6 +748,80 @@ class RunManager:
                         run_id,
                     )
         return frozenset(catalog_run_ids)
+
+    def _recover_interrupted_followups(self, store: SessionStore) -> None:
+        """Persist a terminal event for follow-ups abandoned by a process exit.
+
+        Ask and writeup executions belong to the web process that started them.
+        During manager construction there cannot be a surviving standby task from
+        the previous process, so every durable ``followup.started`` without a
+        matching terminal event is interrupted.  Recording the recovery in the
+        same JSONL log keeps replay deterministic and unlocks every fresh client,
+        rather than synthesizing a different result per SSE connection.
+        """
+        started_type = EventType.FOLLOWUP_STARTED.value
+        terminal_types = {
+            EventType.FOLLOWUP_COMPLETED.value,
+            EventType.FOLLOWUP_FAILED.value,
+        }
+        for run_id in store.list_runs():
+            pending: dict[str, dict[str, Any]] = {}
+            try:
+                for index, row in enumerate(store.load_all(run_id)):
+                    event_type = str(row.get("event_type") or "")
+                    payload = row.get("payload")
+                    payload = payload if isinstance(payload, dict) else {}
+                    followup_id = str(payload.get("followup_id") or "")
+                    if event_type == started_type:
+                        key = followup_id or f"legacy:{index}"
+                        pending[key] = {
+                            "followup_id": followup_id,
+                            "kind": str(payload.get("kind") or "ask"),
+                            "execution_generation": payload.get(
+                                "execution_generation"),
+                            "recovery_id": (
+                                f"interrupted-followup:{index}:{followup_id}"
+                            ),
+                        }
+                    elif event_type in terminal_types:
+                        if followup_id:
+                            pending.pop(followup_id, None)
+                        else:
+                            legacy_key = next(
+                                (key for key in reversed(pending)
+                                 if not pending[key]["followup_id"]),
+                                None,
+                            )
+                            if legacy_key is not None:
+                                pending.pop(legacy_key, None)
+
+                for interrupted in pending.values():
+                    payload = {
+                        "followup_id": interrupted["followup_id"],
+                        "kind": interrupted["kind"],
+                        "detail": "服务已重启，后续操作已中断",
+                        "recovery_id": interrupted["recovery_id"],
+                    }
+                    generation = interrupted.get("execution_generation")
+                    if generation is not None:
+                        payload["execution_generation"] = generation
+                    recovery = Event(
+                        event_type=EventType.FOLLOWUP_FAILED,
+                        run_id=run_id,
+                        solver_id="web-runtime-recovery",
+                        seq=store.last_stream_seq(run_id) + 1,
+                        payload=payload,
+                    )
+                    store.append_if_absent_sync(
+                        recovery,
+                        identity_field="recovery_id",
+                        identity=interrupted["recovery_id"],
+                    )
+            except Exception as exc:
+                LOG.error(
+                    "Interrupted follow-up recovery failed for %s error_type=%s",
+                    run_id, type(exc).__name__,
+                )
 
     def _rehydrate(
         self, *, protocol2_run_ids: Optional[frozenset[str]] = None
@@ -3161,10 +3237,27 @@ class RunManager:
         driver = build_standby_driver(cmd, mgr=self)
 
         async def _go() -> None:
+            followup_terminal = False
+
+            async def _note_followup_terminal(ev: Event) -> None:
+                nonlocal followup_terminal
+                if ev.event_type not in {
+                    EventType.FOLLOWUP_COMPLETED,
+                    EventType.FOLLOWUP_FAILED,
+                }:
+                    return
+                wanted = str(cmd.get("followup_id") or "")
+                event_id = str(ev.payload.get("followup_id") or "")
+                if not wanted or event_id == wanted:
+                    followup_terminal = True
+
             async def _emit_followup_failed(detail: str) -> None:
-                if action not in {"ask", "writeup"}:
+                nonlocal followup_terminal
+                if action not in {"ask", "writeup"} or followup_terminal:
                     return
                 try:
+                    if bool(getattr(run.bus, "_closed", False)):
+                        self._fresh_bus(run)
                     await run.bus.emit(Event(
                         event_type=EventType.FOLLOWUP_FAILED,
                         run_id=run_id,
@@ -3174,9 +3267,11 @@ class RunManager:
                             "detail": detail,
                         },
                     ))
+                    followup_terminal = True
                 except Exception:
                     pass
 
+            run.bus.add_sink(_note_followup_terminal)
             try:
                 LOG.info("standby worker starting for %s action=%s",
                          run_id, cmd.get("action"))
@@ -3210,6 +3305,9 @@ class RunManager:
                 except Exception:
                     pass
             finally:
+                run.bus.remove_sink(_note_followup_terminal)
+                if action in {"ask", "writeup"} and not followup_terminal:
+                    await _emit_followup_failed("后续操作已中断")
                 # Do not close the bus; retain the completed task as an observable
                 # receipt. `_ensure_standby` checks `.done()` and replaces it on the
                 # next command, so this does not block subsequent follow-ups.
