@@ -869,6 +869,56 @@ def test_cancelled_standby_emits_correlated_terminal_followup(tmp_path, monkeypa
     assert lifecycle[-1].payload["detail"] == "后续操作已取消"
 
 
+def test_standby_wrapper_fails_followup_when_driver_exits_without_terminal(
+        tmp_path, monkeypatch):
+    from apps.web import run_manager as rm
+    from muteki.core.events import Event, EventType
+    import apps.web.drivers as drivers
+
+    async def _started_then_exit(run):
+        await run.bus.emit(Event(
+            event_type=EventType.FOLLOWUP_STARTED,
+            run_id=run.run_id,
+            payload={
+                "followup_id": "followup-orphan",
+                "kind": "ask",
+                "question": "证据来源是什么？",
+            },
+        ))
+
+    monkeypatch.setattr(
+        drivers, "build_standby_driver", lambda cmd, mgr=None: _started_then_exit,
+    )
+
+    async def _run():
+        mgr = rm.RunManager(sessions_root=tmp_path / "sessions")
+        run = mgr.create("run-x")
+        run.started = True
+        run.finished = True
+        run.solved = True
+        assert mgr._ensure_standby(run.run_id, {
+            "action": "ask",
+            "text": "证据来源是什么？",
+            "followup_id": "followup-orphan",
+        })
+        await asyncio.gather(run.standby_task, return_exceptions=True)
+        return [event async for event in run.store.replay(run.run_id)]
+
+    events = asyncio.run(_run())
+    lifecycle = [
+        event for event in events if event.event_type in {
+            EventType.FOLLOWUP_STARTED,
+            EventType.FOLLOWUP_FAILED,
+        }
+    ]
+    assert [event.event_type for event in lifecycle] == [
+        EventType.FOLLOWUP_STARTED,
+        EventType.FOLLOWUP_FAILED,
+    ]
+    assert lifecycle[-1].payload["followup_id"] == "followup-orphan"
+    assert lifecycle[-1].payload["detail"] == "后续操作已中断"
+
+
 def test_standby_final_cancel_log_redacts_callback_exception(
         tmp_path, monkeypatch, caplog):
     from apps.web import run_manager as rm

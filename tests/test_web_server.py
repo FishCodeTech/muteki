@@ -938,6 +938,75 @@ def test_rehydrate_force_settles_started_unfinished_run(tmp_path) -> None:
     assert r2.finished is True   # force-settled (was a ghost otherwise)
 
 
+def test_rehydrate_persists_failure_for_interrupted_followup(tmp_path) -> None:
+    from muteki.core.events import Event
+    from muteki.core.session_store import SessionStore
+
+    sessions = tmp_path / "sessions"
+    mgr1 = RunManager(sessions_root=sessions)
+    run = mgr1.create("interrupted-followup")
+
+    async def seed() -> None:
+        await run.bus.emit(Event(
+            event_type=EventType.RUN_STARTED,
+            run_id=run.run_id,
+            payload={"challenge": {"name": "x"}},
+        ))
+        await run.bus.emit(Event(
+            event_type=EventType.RUN_FINISHED,
+            run_id=run.run_id,
+            payload={"solved": True},
+        ))
+        await run.bus.emit(Event(
+            event_type=EventType.FOLLOWUP_STARTED,
+            run_id=run.run_id,
+            payload={
+                "followup_id": "F-complete",
+                "kind": "ask",
+                "question": "已经回答的问题",
+            },
+        ))
+        await run.bus.emit(Event(
+            event_type=EventType.FOLLOWUP_COMPLETED,
+            run_id=run.run_id,
+            payload={
+                "followup_id": "F-complete",
+                "kind": "ask",
+                "text": "回答",
+            },
+        ))
+        await run.bus.emit(Event(
+            event_type=EventType.FOLLOWUP_STARTED,
+            run_id=run.run_id,
+            payload={
+                "followup_id": "F-interrupted",
+                "kind": "writeup",
+            },
+        ))
+
+    asyncio.run(seed())
+
+    RunManager(sessions_root=sessions)
+    events = SessionStore(sessions).load_all(run.run_id)
+    recovered = [
+        event for event in events
+        if event["event_type"] == EventType.FOLLOWUP_FAILED.value
+    ]
+    assert len(recovered) == 1
+    assert recovered[0]["payload"]["followup_id"] == "F-interrupted"
+    assert recovered[0]["payload"]["kind"] == "writeup"
+    assert recovered[0]["payload"]["detail"] == "服务已重启，后续操作已中断"
+    assert recovered[0]["solver_id"] == "web-runtime-recovery"
+
+    # Recovery is durable and idempotent across subsequent restarts.
+    RunManager(sessions_root=sessions)
+    events = SessionStore(sessions).load_all(run.run_id)
+    assert sum(
+        event["event_type"] == EventType.FOLLOWUP_FAILED.value
+        for event in events
+    ) == 1
+
+
 def test_rehydrate_protocol2_started_run_stays_unfinished(tmp_path) -> None:
     from muteki.core.events import Event
 
