@@ -1049,6 +1049,20 @@ async def test_standby_redirect_binds_one_context_and_decrypts_only_authorized_r
     assert run.control_journal.context_bindings(context_id) == [
         f"standby:{command_id}"]
     assert run.control_journal.context_delivery_status(context_id) == "bound"
+
+    ask_command_id = "C-standby-secret-ask"
+    await mgr.post_control(run.run_id, {
+        "command_id": ask_command_id,
+        "action": "ask",
+        "target": "global",
+        "text": "password=ASK-SECRET",
+    })
+    await run.control_actor.join()
+    ask_receipt = run.control_journal.latest_effect(ask_command_id)
+    assert ask_receipt is not None
+    assert ask_receipt.state is EffectState.EFFECT_OBSERVED
+    assert captured["hitl_cmd"]["text"] == "password=ASK-SECRET"
+    assert captured["hitl_cmd"]["followup_id"]
     await mgr.shutdown()
 
 

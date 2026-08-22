@@ -152,9 +152,10 @@ def build_btw_worker_prompt(
         f"- event log JSONL: {paths.jsonl}",
         f"- shared graph SQLite DB: {paths.graph_db}",
         f"- markdown board: {paths.board}",
-        f"- winner snapshot: {paths.winner}",
         f"- artifacts dir: {paths.arts}",
     ]
+    if paths.winner:
+        path_lines.append(f"- winner snapshot: {paths.winner}")
     if paths.uploads:
         path_lines.append(f"- uploaded challenge files: {paths.uploads}")
 

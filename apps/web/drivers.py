@@ -1079,6 +1079,14 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             control_state_provider=control_state_provider,
             protocol2_session=protocol2_session,
         )
+        if mgr is not None:
+            # Swarm owns the trusted winning outcome; RunManager owns storage that
+            # Worker containers cannot modify. Keep this hook process-local so
+            # experimental Swarm classes do not need a constructor API change.
+            swarm._winner_continuation_writer = (  # type: ignore[attr-defined]
+                lambda payload: mgr.persist_winner_continuation(
+                    run.run_id, payload)
+            )
         deferred_cleanup = False
         try:
             out = await swarm.run()
@@ -1183,14 +1191,17 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
 # ---- standby (post-solve HITL) ----------------------------------------------
 # After a run finishes (or the server restarted), a human follow-up no longer has
 # a live swarm to reach. The standby driver COLD-STARTS a single worker from disk:
-# it reads winner.json (the winning worker's CLI session) + the persisted
-# shared_graph, resumes that SAME session, and serves one command — answer a
+# it reads coordinator-owned continuation state + the persisted shared_graph,
+# resumes that SAME session, and serves one command — answer a
 # question, mark the flag a false-positive and keep solving, or write a writeup.
 # Everything it needs is durable, so this works identically before and after a
-# server restart. No winner.json (old run) → degrade to a fresh worker seeded with
-# the board context.
+# server restart. Older runs without private continuation metadata recover only
+# non-sensitive identity from durable events and start a fresh session if needed.
 
-def _standby_profile_for(engine: str, worker_profiles: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _standby_profile_for(
+    engine: str,
+    worker_profiles: list[dict[str, Any]],
+) -> dict[str, Any] | None:
     """Pick the profile that should serve a post-solve standby command."""
     if not worker_profiles:
         return None
@@ -1350,6 +1361,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                 for key in (
                     "action", "target", "command_id", "request_id",
                     "standing", "preempt_policy", "preemption", "flag",
+                    "followup_id",
                 )
                 if key in safe_cmd
             }
@@ -1367,34 +1379,70 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             return  # no workspace → nothing durable to resume from
 
         graph_dir = root / "graph"
-        winner_path = root / "winner.json"
         arts = ArtifactStore(root=root / "arts")
         worker_root = root / "workers"
         worker_root.mkdir(parents=True, exist_ok=True)
 
-        winner: dict[str, Any] = {}
-        if winner_path.exists():
-            try:
-                winner = json.loads(winner_path.read_text())
-            except Exception:
-                winner = {}
+        winner = mgr.load_winner_continuation(run.run_id)
 
-        # Rebuild the Challenge: prefer the snapshot stored in winner.json. Older
-        # runs may not have winner.json, so recover the original launch payload from
-        # the durable JSONL before degrading to rail metadata.
+        # Rebuild the Challenge from coordinator-owned state. Older runs recover
+        # the launch payload and winning Worker identity from durable server events.
+        # Worker-writable workspace files never select profiles, credentials,
+        # backends, sessions or host paths.
         ch = winner.get("challenge") or {}
-        if not ch:
+        legacy_workers: dict[str, dict[str, str]] = {}
+        legacy_winner_actor = ""
+        if not ch or not winner.get("engine") or not winner.get("profile_id"):
             try:
                 from muteki.core.events import EventType
                 async for ev in run.store.replay(run.run_id):
-                    if ev.event_type in {
+                    payload = ev.payload or {}
+                    if not ch and ev.event_type in {
                         EventType.RUN_PREPARING, EventType.RUN_STARTED,
                     }:
-                        ch = (ev.payload or {}).get("challenge") or {}
-                        if ch:
-                            break
+                        ch = payload.get("challenge") or {}
+
+                    solver_id = str(ev.solver_id or "").strip()
+                    if solver_id and ev.event_type in {
+                        EventType.WORKER_STATUS, EventType.WORKER_LIFECYCLE,
+                    }:
+                        current = legacy_workers.setdefault(solver_id, {})
+                        for source, target in (
+                            ("engine", "engine"),
+                            ("profile_id", "profile_id"),
+                            ("session", "session"),
+                        ):
+                            value = str(payload.get(source) or "").strip()
+                            if value:
+                                current[target] = value
+
+                    kind = str(payload.get("kind") or "")
+                    actor = ""
+                    if (ev.event_type is EventType.BLACKBOARD_DELTA
+                            and kind == "flag_found"):
+                        actor = str(payload.get("actor") or solver_id).strip()
+                    elif (ev.event_type is EventType.SOLVE_GRAPH_DELTA
+                          and kind == "flag"):
+                        actor = solver_id
+                    elif (ev.event_type is EventType.INSIGHT_BUS_EVENT
+                          and kind == "FlagFound"):
+                        actor = str(payload.get("by") or solver_id).strip()
+                    elif ev.event_type is EventType.FLAG_ACCEPTED:
+                        actor = str(payload.get("actor") or solver_id).strip()
+                    if actor and actor != "coordinator":
+                        legacy_winner_actor = actor
+
             except Exception:
-                ch = {}
+                pass
+        if legacy_winner_actor:
+            legacy_worker = legacy_workers.get(legacy_winner_actor) or {}
+            winner.setdefault("worker_id", legacy_winner_actor)
+            if legacy_worker.get("engine"):
+                winner.setdefault("engine", legacy_worker["engine"])
+            if legacy_worker.get("profile_id"):
+                winner.setdefault("profile_id", legacy_worker["profile_id"])
+            if legacy_worker.get("session"):
+                winner.setdefault("session", legacy_worker["session"])
         mode = ch.get("mode") or "ctf"
         if mode not in ("ctf", "pentest"):
             mode = "ctf"
@@ -1419,9 +1467,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             flag_format=ch.get("flag_format", _DEFAULT_BRACE_FLAG_FORMAT),
             flag_format_hint=ch.get("flag_format_hint", ""),
             flag_format_wrapper=ch.get("flag_format_wrapper", ""),
-            # carry the run's flag mode across a post-solve standby re-solve so a
-            # mark_false/resolve doesn't silently revert a collection run to single
-            # flag (review #15). winner.json persists these in the challenge block.
+            # Carry the run's flag mode across a post-solve standby re-solve.
             expected_flags=int(ch.get("expected_flags") or 1),
             multi_flag=bool(ch.get("multi_flag", False)),
             verifier_rate_limited=bool(ch.get("verifier_rate_limited", False)),
@@ -1436,7 +1482,14 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
         worker_profiles = wc.get("worker_profiles") or []
         worker_network = str(wc.get("worker_network") or "bridge")
         winner_engine = str(winner.get("engine") or "claude")
-        profile = _standby_profile_for(winner_engine, worker_profiles)
+        winner_profile_ref = str(
+            winner.get("profile_id") or winner_engine
+        ).strip()
+        profile = _standby_profile_for(winner_profile_ref, worker_profiles)
+        if winner.get("profile_id") and profile is None:
+            raise RuntimeError(
+                "winning Worker profile is unavailable in current configuration"
+            )
         transport = base_engine_for_profile(profile or winner_engine)
         worker_backend = resolve_worker_backend(
             request_backend=None,
@@ -1609,7 +1662,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             return raw if " " not in raw and len(raw) <= 240 else ""
 
         flag = (_flag_from_operator_cmd() if action == "mark_false" else "") or stored_flag
-        # multi-flag: the flags already collected (from winner.json), minus the one
+        # Multi-flag: the flags already collected, minus the one
         # the operator is marking false — so a mark_false re-solve worker is seeded
         # with the SURVIVING flags and re-finds only the missing one, not the rest.
         prior_flags = list(
@@ -1651,8 +1704,17 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             except Exception:
                 pass
 
-        workdir = str(winner.get("workdir") or "")
-        if not workdir or not Path(workdir).exists():
+        workdir = ""
+        workdir_rel = str(winner.get("workdir_rel") or "").strip()
+        if workdir_rel:
+            try:
+                candidate = (root / workdir_rel).resolve()
+                candidate.relative_to(worker_root.resolve())
+                if candidate.exists():
+                    workdir = str(candidate)
+            except (OSError, ValueError):
+                workdir = ""
+        if not workdir:
             workdir = str(worker_root / f"standby-{transport}")
         Path(workdir).mkdir(parents=True, exist_ok=True)
         if container is not None:
@@ -1816,25 +1878,54 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             out = await worker.run()
             # writeup: persist the body to sessions/{id}/writeup.md (and it already
             # streamed to the chat as the worker's reply).
+            artifact_path = ""
             if action == "writeup" and getattr(out, "reply", ""):
                 try:
-                    (root / "writeup.md").write_text(out.reply)
-                except Exception:
-                    pass
-            # mark_false that re-solved: refresh winner.json + run flags. Multi-flag:
-            # merge the re-found flag(s) into the run set (the invalidated one was
-            # already removed via reopen_after_false_positive) and persist the full
-            # list, mirroring Swarm._persist_winner.
+                    writeup_path = root / "writeup.md"
+                    writeup_path.write_text(out.reply)
+                    artifact_path = str(writeup_path)
+                except Exception as exc:
+                    raise RuntimeError("writeup artifact could not be persisted") from exc
+            if action in {"ask", "writeup"}:
+                from muteki.core.events import Event, EventType
+                await run.bus.emit(Event(
+                    event_type=EventType.FOLLOWUP_COMPLETED,
+                    run_id=run.run_id,
+                    solver_id=solver_label,
+                    payload={
+                        "followup_id": runtime_cmd.get("followup_id") or "",
+                        "kind": action,
+                        "text": getattr(out, "reply", "") or "",
+                        "artifact_path": artifact_path,
+                    },
+                ))
+            # A successful false-positive re-solve becomes the next trusted
+            # continuation owner. Persist identifiers in coordinator-only storage;
+            # the workspace JSON remains a compatibility artifact.
             if action == "mark_false" and out.solved and out.flag:
                 refound = list(getattr(out, "flags", None) or [out.flag])
                 run.merge_flags(refound)
                 try:
-                    (root / "winner.json").write_text(json.dumps({
+                    persisted = {
                         "engine": out.engine, "worker_id": solver_label,
                         "session": out.session,
                         "workdir": out.workdir, "flag": run.flag,
                         "flags": list(run.flags),
                         "challenge": challenge.model_dump(),
+                        "profile_id": str(
+                            (profile or {}).get("id")
+                            or (profile or {}).get("name")
+                            or ""
+                        ),
+                        "backend": backend,
+                    }
+                    mgr.persist_winner_continuation(run.run_id, persisted)
+                    (root / "winner.json").write_text(json.dumps({
+                        key: persisted[key]
+                        for key in (
+                            "engine", "worker_id", "session", "workdir",
+                            "flag", "flags", "challenge", "profile_id",
+                        )
                     }, ensure_ascii=False, indent=2))
                 except Exception:
                     pass
