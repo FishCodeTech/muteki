@@ -194,6 +194,42 @@ def test_disabled_host_login_seat_can_remain_in_container_config(tmp_path) -> No
     assert config["engines"] == ["seat_codex_main"]
 
 
+def test_atomic_configuration_validates_the_final_backend(tmp_path) -> None:
+    store = WorkerConfigStore(tmp_path)
+    seat = _seat("claude")
+    credential = _credential("claude", kind="system_inherit")
+
+    config = store.set_configuration(
+        seats=[seat],
+        credentials=[credential],
+        worker_backend="local",
+        engines=[seat["id"]],
+        race_engines=[seat["id"]],
+        stage_policy={
+            "coordinator": {
+                "review": {"enabled": False, "engine": seat["id"]},
+                "verifier": {"enabled": False, "engine": ""},
+            },
+        },
+    )
+
+    assert config["worker_backend"] == "local"
+    assert config["engines"] == [seat["id"]]
+    assert config["stage_policy"]["coordinator"]["review"]["engine"] == seat["id"]
+
+    with pytest.raises(ValueError, match="系统登录"):
+        store.set_configuration(
+            seats=[seat],
+            credentials=[credential],
+            worker_backend="container",
+            engines=[seat["id"]],
+        )
+
+    reloaded = WorkerConfigStore(tmp_path).get()
+    assert reloaded["worker_backend"] == "local"
+    assert reloaded["credentials"] == [credential]
+
+
 def test_backend_network_and_budget_settings_persist(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("apps.web.worker_config.is_web_container", lambda: False)
     WorkerConfigStore(tmp_path).set(

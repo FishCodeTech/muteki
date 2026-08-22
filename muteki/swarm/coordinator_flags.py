@@ -1223,22 +1223,16 @@ class _FlagsBusMixin:
         """Remove failed/finished worker scratch while preserving durable run data.
 
         The workspace root keeps shared/, inputs/, graph/, final/, manifest.json,
-        and winner.json.  Only non-winner worker cwd directories under workers/ are
+        and winner.json. Only non-winner worker cwd directories under workers/ are
         removed at run finish to avoid long coordinator runs accumulating hundreds
         of duplicate scratch trees.
         """
         if self.worker_root is None:
             return
-        keep: list[str] = []
-        if self.workspace_root is not None:
-            winner = self.workspace_root / "winner.json"
-            try:
-                data = json.loads(winner.read_text(encoding="utf-8"))
-                workdir = data.get("workdir")
-                if workdir:
-                    keep.append(Path(str(workdir)).name)
-            except Exception:
-                pass
+        winner_workdir_name = str(
+            getattr(self, "_winner_workdir_name", "") or ""
+        ).strip()
+        keep = [winner_workdir_name] if winner_workdir_name else []
         cleanup_worker_scratch(self.worker_root, keep=keep)
 
     @staticmethod

@@ -7,7 +7,7 @@ swarm can depend on these dataclasses without importing the old Solver class.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from muteki.models.solve_graph import SolveGraph
 
@@ -55,3 +55,6 @@ class SolveOutcome:
     # so the standby driver can persist it (e.g. writeup.md) without re-parsing the
     # event stream. Empty for solve runs.
     reply: str = ""
+    # Non-secret profile snapshot used to resume the exact winning seat after a
+    # settings change or server restart.
+    runtime_profile: dict[str, Any] = field(default_factory=dict)

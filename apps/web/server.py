@@ -167,6 +167,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     def llm_settings_payload(config: dict[str, Any]) -> dict[str, Any]:
         """Expose credential presence/source without returning any secret value."""
         from apps.web.llm_credentials import LlmCredentialStore
+        from muteki.solver.worker_profiles import resolve_seat_ref
 
         payload = copy.deepcopy(config)
         store = LlmCredentialStore(app.state.manager.sessions_root)
@@ -175,6 +176,24 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             row = profiles.get(which)
             if isinstance(row, dict):
                 row["credential_source"] = store.source(which)
+        # The settings UI edits canonical Seat IDs. Scheduler policy may still be
+        # stored with a legacy profile name, so translate only the API payload and
+        # leave the scheduler's legacy projection unchanged.
+        seats = [row for row in (payload.get("seats") or []) if isinstance(row, dict)]
+        aliases = payload.get("seat_alias") if isinstance(payload.get("seat_alias"), dict) else {}
+        coordinator = (payload.get("stage_policy") or {}).get("coordinator") or {}
+        for key, role in (("review", "review"), ("verifier", "verifier")):
+            policy = coordinator.get(key)
+            if not isinstance(policy, dict):
+                continue
+            canonical = resolve_seat_ref(
+                policy.get("engine"), seats=seats, alias_table=aliases)
+            if canonical is None:
+                canonical = next((
+                    str(seat.get("id")) for seat in seats
+                    if role in (seat.get("roles") or []) and seat.get("enabled", True)
+                ), None)
+            policy["engine"] = canonical or ""
         return payload
 
     # Auth (P3): a single-password gate in front of /api. fail_fast_check refuses
@@ -477,7 +496,6 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         graph_db = root / "graph" / "shared_graph.db"
         jsonl_path = (mgr.sessions_root / f"{safe}.jsonl").resolve()
         board_path = root / ".muteki_board.md"
-        winner_path = root / "winner.json"
         arts_path = root / "arts"
         uploads_path = (mgr.sessions_root / safe / "uploads").resolve()
         challenge_name = run.name or run_id
@@ -496,14 +514,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             limiter = BtwLimiter()
             app.state.btw_limiters = limiter  # type: ignore[attr-defined]
 
-        winner: dict[str, Any] = {}
-        if winner_path.exists():
-            try:
-                raw = json.loads(winner_path.read_text(encoding="utf-8"))
-                if isinstance(raw, dict):
-                    winner = raw
-            except Exception:
-                winner = {}
+        winner = mgr.load_winner_continuation(run_id)
         wc = mgr.worker_config.resolve(challenge_category)
         worker_profiles = wc.get("worker_profiles") or []
         worker_network = str(wc.get("worker_network") or "bridge")
@@ -599,7 +610,9 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
                         jsonl=_worker_path(jsonl_path),
                         graph_db=_worker_path(graph_db),
                         board=_worker_path(board_path),
-                        winner=_worker_path(winner_path),
+                        # The Worker-writable winner artifact is intentionally not
+                        # supplied as evidence to a side-query worker.
+                        winner="",
                         arts=_worker_path(arts_path),
                         uploads=_worker_path(uploads_path),
                     ),
@@ -785,23 +798,31 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
                     row.pop("clear_api_key", None)
                     row.pop("credential_source", None)
         try:
-            cfg = app.state.manager.worker_config.set(
-                engines=body.get("engines"),
-                start_workers=body.get("start_workers"),
-                max_workers=body.get("max_workers"),
-                worker_backend=body.get("worker_backend"),
-                worker_network=body.get("worker_network"),
-                race_scout=body.get("race_scout"),
-                race_timeout=body.get("race_timeout"),
-                wall_clock_budget=body.get("wall_clock_budget"),
-                race_engines=body.get("race_engines"),
-                max_total_workers=body.get("max_total_workers"),
-                cost_budget_usd=body.get("cost_budget_usd"),
-                stage_policy=body.get("stage_policy"),
-                llm_profiles=llm_profiles,
-                worker_profiles=body.get("worker_profiles"),
-                overrides=body.get("overrides"),
-            )
+            settings = {
+                "engines": body.get("engines"),
+                "start_workers": body.get("start_workers"),
+                "max_workers": body.get("max_workers"),
+                "worker_backend": body.get("worker_backend"),
+                "worker_network": body.get("worker_network"),
+                "race_scout": body.get("race_scout"),
+                "race_timeout": body.get("race_timeout"),
+                "wall_clock_budget": body.get("wall_clock_budget"),
+                "race_engines": body.get("race_engines"),
+                "max_total_workers": body.get("max_total_workers"),
+                "cost_budget_usd": body.get("cost_budget_usd"),
+                "stage_policy": body.get("stage_policy"),
+                "llm_profiles": llm_profiles,
+                "worker_profiles": body.get("worker_profiles"),
+                "overrides": body.get("overrides"),
+            }
+            if "seats" in body or "credentials" in body:
+                cfg = app.state.manager.worker_config.set_configuration(
+                    seats=body.get("seats"),
+                    credentials=body.get("credentials"),
+                    **settings,
+                )
+            else:
+                cfg = app.state.manager.worker_config.set(**settings)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         if isinstance(raw_llm_profiles, dict):

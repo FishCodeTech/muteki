@@ -704,7 +704,8 @@ class Swarm(
                 else:
                     db_path = self.sandbox.root / self.run_id / "shared_graph.db"
                 # remember where durable per-run state lives (sibling of graph/) so a
-                # post-solve standby can find winner.json + the shared graph again.
+                # post-solve standby can find private continuation state and the
+                # shared graph again.
                 self._graph_dir = Path(graph_dir) if graph_dir is not None else None
                 self.shared_graph = SQLiteSharedGraph.open(
                     db_path=db_path,

@@ -22,11 +22,11 @@ import {
   getWorkerModelOptions,
   getWorkerImageStatus,
   getWorkerSettings,
+  getSystemLogin,
   importHostCodexAuth,
   importHostWorkerLogin,
   listCredentialAccounts,
   putCredentialAccount,
-  putWorkerIdentity,
   putWorkerSettings,
   pullWorkerImage,
   testCredentialAccount,
@@ -179,6 +179,10 @@ function effortSummary(value?: string, defaultLevel = ""): string {
 
 function isOrdinarySeat(seat: Seat): boolean {
   return seat.roles.some((role) => ORDINARY_ROLES.includes(role));
+}
+
+function canServeChannel(seat: Seat, role: "review" | "verifier"): boolean {
+  return isOrdinarySeat(seat) || seat.roles.includes(role);
 }
 
 function accountWorkerEngine(account?: CredentialAccount | null): Engine | null {
@@ -1407,7 +1411,7 @@ function ReviewInspector({
   testing: boolean;
   testResult: WorkerModelTestResult | null;
 }) {
-  const options = seats.filter((seat) => seat.roles.includes("review"));
+  const options = seats.filter((seat) => canServeChannel(seat, "review"));
   const selected = options.find((seat) => seat.id === review.engine);
   const credential = credentials.find((item) => item.id === selected?.credential_id);
   const dedicated = Boolean(selected && !isOrdinarySeat(selected));
@@ -1427,7 +1431,7 @@ function ReviewInspector({
         <div className="wset-switch-row"><span><b>启用 Review</b><small>按触发条件启动独立审查进程</small></span><Toggle label="启用 Review" value={review.enabled ?? true} onChange={(enabled) => onReview({ enabled })} /></div>
         <label><span>使用 Worker</span><select value={review.engine || ""} onChange={(event) => onReview({ engine: event.target.value })}>
           <option value="">选择 Worker</option>
-          {options.map((seat) => <option key={seat.id} value={seat.id}>{seat.label} · {credentials.find((item) => item.id === seat.credential_id)?.secret_ref || "系统登录"}</option>)}
+          {options.map((seat) => <option key={seat.id} value={seat.id} disabled={!seat.enabled}>{seat.label} · {credentials.find((item) => item.id === seat.credential_id)?.secret_ref || "系统登录"}{seat.enabled ? "" : " · 已停用"}</option>)}
         </select></label>
         <div className="wset-binding-help"><span>普通并发与 Review 并发相互独立</span><button type="button" onClick={onCreateDedicated}>创建独立配置</button></div>
         <ReasoningEffortSelect engine={selectedEngine} model={selected?.model || ""} options={modelOptions} value={review.reasoning_effort || "inherit"} inherit onChange={(reasoning_effort) => onReview({ reasoning_effort })} />
@@ -1521,7 +1525,7 @@ function VerifierInspector({
   testing: boolean;
   testResult: WorkerModelTestResult | null;
 }) {
-  const options = seats.filter((seat) => seat.roles.includes("verifier"));
+  const options = seats.filter((seat) => canServeChannel(seat, "verifier"));
   const selected = options.find((seat) => seat.id === verifier.engine);
   const credential = credentials.find((item) => item.id === selected?.credential_id);
   const dedicated = Boolean(selected && !isOrdinarySeat(selected));
@@ -1544,7 +1548,7 @@ function VerifierInspector({
         <div className="wset-switch-row"><span><b>启用 Verifier</b><small>race-scout 期间独立复现已提交报告</small></span><Toggle label="启用 Verifier" value={verifier.enabled ?? true} onChange={(enabled) => onVerifier({ enabled })} /></div>
         <label><span>使用 Worker</span><select value={verifier.engine || ""} onChange={(event) => onVerifier({ engine: event.target.value })}>
           <option value="">选择 Worker</option>
-          {options.map((seat) => <option key={seat.id} value={seat.id}>{seat.label} · {credentials.find((item) => item.id === seat.credential_id)?.secret_ref || "系统登录"}</option>)}
+          {options.map((seat) => <option key={seat.id} value={seat.id} disabled={!seat.enabled}>{seat.label} · {credentials.find((item) => item.id === seat.credential_id)?.secret_ref || "系统登录"}{seat.enabled ? "" : " · 已停用"}</option>)}
         </select></label>
         <div className="wset-binding-help"><span>普通并发与 Verifier 并发相互独立</span><button type="button" onClick={onCreateDedicated}>创建独立配置</button></div>
         <ReasoningEffortSelect engine={selectedEngine} model={selected?.model || ""} options={modelOptions} value={verifier.reasoning_effort || "inherit"} inherit onChange={(reasoning_effort) => onVerifier({ reasoning_effort })} />
@@ -2023,6 +2027,7 @@ export function WorkerOrchestration() {
   const [batchCheck, setBatchCheck] = useState<BatchCheckState>({ running: false, completed: 0, total: 0 });
   const [discoveringModels, setDiscoveringModels] = useState(false);
   const [testResults, setTestResults] = useState<Record<string, WorkerModelTestResult>>({});
+  const [systemLogins, setSystemLogins] = useState<Record<string, "present" | "absent" | "unknown">>({});
   const [feedback, setFeedback] = useState("");
 
   const returnTo = useMemo(() => {
@@ -2075,7 +2080,7 @@ export function WorkerOrchestration() {
 
   useEffect(() => {
     let alive = true;
-    Promise.all([getWorkerSettings(), listCredentialAccounts(), getWorkerModelOptions(), fetchProfilesHealth(), getWorkerImageStatus()]).then(([cfg, accountRows, modelRows, healthRows, workerImage]) => {
+    Promise.all([getWorkerSettings(), listCredentialAccounts(), getWorkerModelOptions(), fetchProfilesHealth(), getWorkerImageStatus(), getSystemLogin()]).then(([cfg, accountRows, modelRows, healthRows, workerImage, loginRows]) => {
       if (!alive || !cfg) return;
       const identity = legacyIdentity(cfg);
       const ordinary = identity.seats.filter(isOrdinarySeat);
@@ -2091,6 +2096,7 @@ export function WorkerOrchestration() {
       setBackend(cfg.worker_backend || "local");
       setNetwork(cfg.worker_network || "bridge");
       setImageStatus(workerImage);
+      setSystemLogins(loginRows);
       setRaceScout(cfg.race_scout);
       setRaceTimeout(cfg.race_timeout);
       setStartWorkers(cfg.start_workers);
@@ -2169,10 +2175,10 @@ export function WorkerOrchestration() {
     setSeats(next);
     setSelectedId(next.find(isOrdinarySeat)?.id || next[0]?.id || null);
     if (review.engine === id) {
-      setReview((current) => ({ ...current, engine: next.find((seat) => seat.roles.includes("review") && seat.enabled)?.id || "" }));
+      setReview((current) => ({ ...current, engine: next.find((seat) => canServeChannel(seat, "review") && seat.enabled)?.id || "" }));
     }
     if (verifier.engine === id) {
-      setVerifier((current) => ({ ...current, engine: next.find((seat) => seat.roles.includes("verifier") && seat.enabled)?.id || "" }));
+      setVerifier((current) => ({ ...current, engine: next.find((seat) => canServeChannel(seat, "verifier") && seat.enabled)?.id || "" }));
     }
     markDirty();
   }, [markDirty, review.engine, verifier.engine, seats]);
@@ -2260,7 +2266,7 @@ export function WorkerOrchestration() {
     setTestResults((current) => { const next = { ...current }; delete next[seat.id]; return next; });
     const accountId = credential?.kind === "system_inherit" ? "__system__" : credential?.secret_ref || "";
     try {
-      const result: WorkerModelTestResult = connection === "custom_endpoint" && !seat.model?.trim()
+      const probed: WorkerModelTestResult = connection === "custom_endpoint" && !seat.model?.trim()
         ? {
             ok: false,
             detail: "自定义 API 缺少模型 ID，无法发起真实模型请求",
@@ -2280,6 +2286,16 @@ export function WorkerOrchestration() {
             model: seat.model || "",
             reasoningEffort: seat.reasoning_effort || "default",
           }), seat.model || "", backend);
+      const systemLoginPresent = connection === "system"
+        && backend === "local"
+        && systemLogins[engineOf(seat.engine)] === "present";
+      const result: WorkerModelTestResult = !probed.ok && systemLoginPresent
+        ? {
+            ...probed,
+            detail: `已检测到系统登录；真实模型请求失败：${probed.detail}`,
+            layer: probed.layer === "auth" ? "model" : probed.layer,
+          }
+        : probed;
       setTestResults((current) => ({ ...current, [seat.id]: result }));
       setHealth((current) => ({
         ...current,
@@ -2300,7 +2316,7 @@ export function WorkerOrchestration() {
     } finally {
       setTestingIds((current) => { const next = new Set(current); next.delete(seat.id); return next; });
     }
-  }, [accounts, backend, credentials, showFeedback]);
+  }, [accounts, backend, credentials, showFeedback, systemLogins]);
 
   const testAllSeats = useCallback(async () => {
     const targets = seats.filter((seat) => seat.enabled && (
@@ -2402,8 +2418,8 @@ export function WorkerOrchestration() {
     if (!config) return;
     const enabledOrdinary = seats.filter((seat) => isOrdinarySeat(seat) && seat.enabled);
     if (!enabledOrdinary.length) { setSaveState("error"); showFeedback("至少需要一个启用的普通 Worker"); return; }
-    if (review.enabled && !seats.some((seat) => seat.id === review.engine && seat.enabled && seat.roles.includes("review"))) { setSaveState("error"); showFeedback("Review 已启用，但没有指定可用 Worker"); return; }
-    if (verifier.enabled && !seats.some((seat) => seat.id === verifier.engine && seat.enabled && seat.roles.includes("verifier"))) { setSaveState("error"); showFeedback("Verifier 已启用，但没有指定可用 Worker"); return; }
+    if (review.enabled && !seats.some((seat) => seat.id === review.engine && seat.enabled && canServeChannel(seat, "review"))) { setSaveState("error"); showFeedback("Review 已启用，但没有指定可用 Worker"); return; }
+    if (verifier.enabled && !seats.some((seat) => seat.id === verifier.engine && seat.enabled && canServeChannel(seat, "verifier"))) { setSaveState("error"); showFeedback("Verifier 已启用，但没有指定可用 Worker"); return; }
     const invalidLlm = (["planner", "titler"] as const).find((which) => {
       const profile = llmProfiles[which];
       return !profile.model.trim() || ((profile.connection || (profile.base_url ? "custom_endpoint" : "default")) === "custom_endpoint" && !profile.base_url?.trim());
@@ -2418,11 +2434,11 @@ export function WorkerOrchestration() {
     if (invalidTemperature) { setSaveState("error"); showFeedback(`${invalidTemperature === "planner" ? "Reason / Planner" : "Titler"} 的 Temperature 需在 0 到 2 之间`); return; }
     setSaveState("saving");
     const normalizedSeats = seats.map((seat, index) => ({ ...seat, priority: (index + 1) * 10, roles: [...seat.roles], capacity: { ...seat.capacity } }));
-    const identity = await putWorkerIdentity({ seats: normalizedSeats, credentials });
-    if (!identity) { setSaveState("error"); showFeedback(backend === "container" ? "保存失败：请检查容器 Worker 是否都绑定了可注入凭据" : "身份配置保存失败"); return; }
     const refs = enabledOrdinary.map((seat) => seat.id);
     const raceRefs = enabledOrdinary.filter((seat) => seat.race).map((seat) => seat.id);
     const saved = await putWorkerSettings({
+      seats: normalizedSeats,
+      credentials,
       engines: refs,
       race_engines: raceRefs,
       start_workers: Math.min(Math.max(1, startWorkers), Math.max(1, maxWorkers)),
@@ -2450,7 +2466,7 @@ export function WorkerOrchestration() {
         budgets: { max_total_workers: maxTotal, cost_budget_usd: costBudget },
       },
     });
-    if (!saved) { setSaveState("error"); showFeedback("阵容策略保存失败"); return; }
+    if (!saved) { setSaveState("error"); showFeedback(backend === "container" ? "保存失败：请检查容器 Worker 是否都绑定了可注入凭据" : "Worker 配置保存失败"); return; }
     setConfig(saved);
     setSeats(normalizedSeats);
     setLlmProfiles(saved.llm_profiles);

@@ -14,6 +14,7 @@ always wins, so this never overrides an intentional per-run choice.
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from typing import Any, Optional
@@ -63,7 +64,9 @@ DEFAULT_REVIEW_POLICY = {
     "max_review_workers": 12,
 }
 DEFAULT_VERIFIER_POLICY = {
-    "enabled": True,
+    # Verification requires an explicitly assigned verifier seat. Keeping this
+    # disabled avoids a default policy that is enabled with an empty foreign key.
+    "enabled": False,
     "engine": "",
     "reasoning_effort": "inherit",
     "max_concurrent": 0,
@@ -830,10 +833,17 @@ class WorkerConfigStore:
             if not isinstance(credentials, list):
                 raise ValueError("credentials must be a list")
             self._data["credentials"] = [c for c in credentials if isinstance(c, dict)]
-        # A container Worker may not use a system_inherit credential because the
-        # host login is not mounted into the container.
+        self._validate_identity_backend(
+            self._clean_backend(self._data.get("worker_backend")))
+        # keep the legacy projection in sync so get()/scheduler see the change.
+        self._project_identity_to_legacy()
+        self._sync_worker_counts(link_profile_capacity=True)
+        self._flush()
+        return self.get()
+
+    def _validate_identity_backend(self, backend: str) -> None:
+        """Validate enabled seats against one final target backend."""
         cred_by_id = {str(c.get("id")): c for c in self._data.get("credentials") or []}
-        backend = self._clean_backend(self._data.get("worker_backend"))
         for s in self._data.get("seats") or []:
             # Disabled seats are retained and never dispatched.
             # They may keep their host-login binding while an active container
@@ -848,11 +858,41 @@ class WorkerConfigStore:
                     f"非法组合:Agent「{label}」在容器环境下使用了「系统登录」凭据。"
                     f"容器不挂载宿主登录态,请改用引擎凭据或自定义端点。"
                 )
-        # keep the legacy projection in sync so get()/scheduler see the change.
-        self._project_identity_to_legacy()
-        self._sync_worker_counts(link_profile_capacity=True)
-        self._flush()
-        return self.get()
+
+    def set_configuration(
+        self,
+        *,
+        seats: Any,
+        credentials: Any,
+        **settings: Any,
+    ) -> dict[str, Any]:
+        """Validate and persist identity, runtime and policy as one final state.
+
+        ``set()`` performs the only file replacement. Any validation failure
+        restores the in-memory snapshot, so callers never observe a half-saved
+        backend/identity combination.
+        """
+        if not isinstance(seats, list):
+            raise ValueError("seats must be a list")
+        if not isinstance(credentials, list):
+            raise ValueError("credentials must be a list")
+        previous = copy.deepcopy(self._data)
+        try:
+            self._data["seats"] = [copy.deepcopy(s) for s in seats if isinstance(s, dict)]
+            self._data["credentials"] = [
+                copy.deepcopy(c) for c in credentials if isinstance(c, dict)
+            ]
+            self._project_identity_to_legacy()
+            target_backend = self._require_backend(
+                settings.get("worker_backend")
+                if settings.get("worker_backend") is not None
+                else self._clean_backend(self._data.get("worker_backend"))
+            )
+            self._validate_identity_backend(target_backend)
+            return self.set(**settings)
+        except Exception:
+            self._data = previous
+            raise
 
     def _sync_worker_counts(self, *, link_profile_capacity: bool) -> None:
         # Direction is roster→max (the operator owns per-seat capacity; the global

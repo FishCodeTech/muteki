@@ -11,6 +11,9 @@ export enum EventType {
   RUN_TITLED = "run.titled",
   RUN_FINISHED = "run.finished",
   RUN_REOPENED = "run.reopened",
+  FOLLOWUP_STARTED = "followup.started",
+  FOLLOWUP_COMPLETED = "followup.completed",
+  FOLLOWUP_FAILED = "followup.failed",
   FLAG_ACCEPTED = "flag.accepted",
   PROJECTION_INCOMPLETE = "projection.incomplete",
   WORKER_STATUS = "worker.status",
@@ -163,6 +166,9 @@ export interface ChatMessage {
   id: string;
   role: ChatRole;
   solverId?: string;
+  /** Correlates a post-solve pending row with its terminal event. */
+  followupId?: string;
+  followupKind?: string;
   // True for worker-produced conversational follow-ups (post-solve standby ask /
   // writeup) that should still appear in the main coordinator thread. The solverId
   // is kept for activity/diagnostics, but the conversation spine treats it as an
@@ -687,6 +693,8 @@ export interface DeckState {
   started: boolean;
   preparing: boolean;
   finished: boolean;
+  /** Ask/Writeup lifecycle is independent from the completed run lifecycle. */
+  followupPending: boolean;
   // wall-clock bookends (event ts, seconds or ms — normalised at read time).
   // startedAt = first RUN_STARTED; finishedAt = RUN_FINISHED. A running run has
   // startedAt but no finishedAt → elapsed is measured against "now".
@@ -798,6 +806,7 @@ export function emptyDeck(runId: string): DeckState {
     started: false,
     preparing: false,
     finished: false,
+    followupPending: false,
     solved: false,
     flags: [],
     invalidatedFlags: [],
@@ -2701,6 +2710,79 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
           i.status !== "done" && (i.dispatchState ?? "active") === "active"
             ? { ...i, dispatchState: ds }
             : i);
+      }
+      break;
+    }
+    case EventType.FOLLOWUP_STARTED: {
+      const kind = String(p.kind || "ask");
+      const followupId = String(p.followup_id || "");
+      if (followupId && s.chat.some((message) =>
+        message.role === "system" && message.followupId === followupId)) {
+        break;
+      }
+      s.followupPending = true;
+      const question = String(p.question || "").trim();
+      if (kind === "ask" && question) {
+        pushChat(s, {
+          role: "human", kind: "text", content: question, ts: ev.ts,
+        });
+      }
+      pushChat(s, {
+        role: "system", kind: "status",
+        content: kind === "writeup" ? "正在生成报告…" : "正在回答追问…",
+        ts: ev.ts, followupId, followupKind: kind,
+      });
+      break;
+    }
+    case EventType.FOLLOWUP_COMPLETED: {
+      s.followupPending = false;
+      const kind = String(p.kind || "ask");
+      const followupId = String(p.followup_id || "");
+      const pendingStatus = kind === "writeup" ? "正在生成报告…" : "正在回答追问…";
+      const completedStatus = kind === "writeup" ? "报告已生成" : "追问已回答";
+      const pendingIndex = [...s.chat].reverse().findIndex(
+        (message) => message.role === "system"
+          && (followupId
+            ? message.followupId === followupId
+            : message.content === pendingStatus),
+      );
+      if (pendingIndex >= 0) {
+        const index = s.chat.length - pendingIndex - 1;
+        s.chat = s.chat.map((message, messageIndex) => messageIndex === index
+          ? { ...message, content: completedStatus, ts: ev.ts }
+          : message);
+      }
+      const text = String(p.text || "").trim();
+      if (text) {
+        pushChat(s, {
+          role: "agent", solverId: sid || "standby", mainThread: true,
+          kind: "text", content: text, ts: ev.ts, sealed: true,
+        });
+      }
+      break;
+    }
+    case EventType.FOLLOWUP_FAILED: {
+      s.followupPending = false;
+      const followupId = String(p.followup_id || "");
+      const kind = String(p.kind || "ask");
+      const pendingStatus = kind === "writeup" ? "正在生成报告…" : "正在回答追问…";
+      const failedStatus = `后续操作失败：${String(p.detail || "原因未查明")}`;
+      const pendingIndex = [...s.chat].reverse().findIndex(
+        (message) => message.role === "system"
+          && (followupId
+            ? message.followupId === followupId
+            : message.content === pendingStatus),
+      );
+      if (pendingIndex >= 0) {
+        const index = s.chat.length - pendingIndex - 1;
+        s.chat = s.chat.map((message, messageIndex) => messageIndex === index
+          ? { ...message, content: failedStatus, ts: ev.ts }
+          : message);
+      } else {
+        pushChat(s, {
+          role: "system", kind: "status", content: failedStatus, ts: ev.ts,
+          followupId, followupKind: kind,
+        });
       }
       break;
     }
