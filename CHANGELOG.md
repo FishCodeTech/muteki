@@ -2,6 +2,30 @@
 
 All notable public release changes are tracked here.
 
+## 0.3.2 - 2026-08-22
+
+### Added
+
+- Added explicit post-solve Ask and writeup lifecycles with correlated started, completed, failed, and cancelled events. Finished tasks now show the real Worker response or generated report in the conversation.
+- Added durable recovery for interrupted follow-ups. A service restart records an orphaned Ask or writeup as failed, so the finished-task composer does not remain disabled.
+- Added ordinary Worker reuse for Review and Verifier roles, including candidate filtering and configuration validation in Worker Settings.
+
+### Changed
+
+- Winner continuation data now lives in Coordinator-private storage. Post-solve Ask, writeup, resolve, and BTW recover the trusted Worker identity, account, backend, session, and validated work directory from that record.
+- Worker backend, credential mode, enabled seats, Review, and Verifier settings now save as one validated configuration snapshot.
+- Claude local system-login Workers omit `--bare`; injected-credential Workers continue to use isolated authentication.
+- Writeup workers use confirmed session evidence, avoid new investigation, and have an explicit five-minute response timeout.
+- Package versions are `0.3.2`. Git tags and GHCR image tags keep the leading `v`, for example `v0.3.2`.
+
+### Fixed
+
+- Fixed local/container mode changes failing to save while Review or Verifier referenced a Worker configuration affected by the mode switch.
+- Fixed system-login health checks reporting logged-in local Workers as unavailable.
+- Fixed Verifier being enabled with an empty Worker list and then becoming impossible to save.
+- Fixed completed-task Ask and writeup actions finishing without displaying their output.
+- Fixed cancelled, failed, timed-out, or interrupted follow-ups leaving Ask, writeup, resolve, and false-positive controls permanently disabled.
+
 ## 0.3.1 - 2026-08-20
 
 ### Fixed

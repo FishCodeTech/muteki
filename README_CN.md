@@ -144,12 +144,12 @@ Web 默认使用 Coordinator，并可先跑一轮可选的 race-scout。TUI 的 
 ./run.sh upgrade --check       # 检查最新稳定版本
 ./run.sh install               # 按 GitHub Release 清单下载并做成托管安装
 muteki upgrade                 # 下载、校验、安装并切换版本
-muteki upgrade v0.3.1          # 安装指定版本
+muteki upgrade v0.3.2          # 安装指定版本
 muteki rollback                # 回滚到上一已安装版本
 muteki version                 # 查看当前版本和安装形态
 ```
 
-Web 控制台的“设置 → 系统更新”提供相同操作。发布包和镜像默认来自本仓库和 `ghcr.io/fishcodetech`。版本化容器部署使用 `muteki upgrade --compose` 和 [`docker-compose.release.yml`](docker-compose.release.yml)。若自行发布 tag 和镜像，设置 `MUTEKI_RELEASE_REPOSITORY` 和 `MUTEKI_IMAGE_REGISTRY`；非公开 GitHub Release 还需要 `MUTEKI_GITHUB_TOKEN`。Git 标签和镜像标签带 `v`，例如 `v0.3.1`。
+Web 控制台的“设置 → 系统更新”提供相同操作。发布包和镜像默认来自本仓库和 `ghcr.io/fishcodetech`。版本化容器部署使用 `muteki upgrade --compose` 和 [`docker-compose.release.yml`](docker-compose.release.yml)。若自行发布 tag 和镜像，设置 `MUTEKI_RELEASE_REPOSITORY` 和 `MUTEKI_IMAGE_REGISTRY`；非公开 GitHub Release 还需要 `MUTEKI_GITHUB_TOKEN`。Git 标签和镜像标签带 `v`，例如 `v0.3.2`。
 
 推荐设置项：
 
@@ -260,8 +260,8 @@ MUTEKI_WORKER_IMAGE=ghcr.io/fishcodetech/muteki-worker-slim:latest ./run.sh web
 
 ```bash
 ./docker/worker/build.sh
-./docker/worker/build.sh ghcr.io/fishcodetech/muteki-worker v0.3.1
-./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim v0.3.1 amd64
+./docker/worker/build.sh ghcr.io/fishcodetech/muteki-worker v0.3.2
+./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim v0.3.2 amd64
 ```
 
 完整镜像会比较大(Kali headless + Ghidra + 经 conda 装的 SageMath + 离线知识库)。只有在你明确知道 worker 可以在运行中自行安装缺失工具时，才建议用 slim 镜像跑真实题目。
