@@ -71,13 +71,6 @@ const QUICK_RUNNING: Array<{ key: string; labelKey: string; tipKey: string; icon
   { key: "freeze", labelKey: "quick.freeze", tipKey: "quick.freeze.tip", icon: "lock" },
   { key: "thaw", labelKey: "quick.thaw", tipKey: "quick.thaw.tip", icon: "play" },
 ];
-// FINISHED — relaunch / converse / wrap up.
-const QUICK_FINISHED: Array<{ key: string; labelKey: string; tipKey: string; icon: IconName; primary?: boolean }> = [
-  { key: "resolve", labelKey: "quick.resolve", tipKey: "quick.resolve.tip", icon: "play", primary: true },
-  { key: "ask", labelKey: "quick.ask", tipKey: "quick.ask.tip", icon: "help" },
-  { key: "writeup", labelKey: "quick.writeup", tipKey: "quick.writeup.tip", icon: "pencil" },
-];
-
 // max height the dispatch textarea auto-grows to (~6–7 rows) before it scrolls
 // internally; mirrored by `.composer2 textarea { max-height }` in globals.css.
 const DISPATCH_MAX_H = 180;
@@ -181,8 +174,10 @@ function CoordBubble({
 }) {
   const [copied, copy] = useCopied();
   const text = m.i18nKey ? t(m.i18nKey, m.i18nVars) : m.content;
+  const standbyReply = m.role === "agent" && m.solverId?.endsWith("-standby");
   const who = m.role === "human" ? t("coord.you") : m.role === "system"
-    ? (m.kind === "insight" ? "insight" : "system") : t("coord.title");
+    ? (m.kind === "insight" ? "insight" : "system")
+    : standbyReply ? t("coord.solveWorker") : t("coord.title");
   const cls = m.role === "human" ? "you" : m.role === "system" ? `system ${m.kind}` : `coordinator ${m.kind}`;
   // long coordinator reasoning folds to keep the thread scannable
   const isLong = m.role === "agent" && m.kind === "reasoning" && text.length > 520;
@@ -785,6 +780,8 @@ function Composer({
   started,
   solved,
   running,
+  finished,
+  followupPending,
   paused,
   solvers,
   flags,
@@ -800,6 +797,8 @@ function Composer({
   started: boolean;
   solved: boolean;
   running: boolean;
+  finished: boolean;
+  followupPending: boolean;
   paused: boolean;
   solvers: string[];
   flags: string[];
@@ -1262,6 +1261,59 @@ function Composer({
     );
   }
 
+  if (finished) {
+    const ask = () => {
+      const question = text.trim();
+      if (!question || followupPending) return;
+      void onCommand("global", "ask", question).then((ok) => {
+        if (ok) setText("");
+      });
+    };
+    return (
+      <div className="composer2 command-composer motion-run-enter">
+        <div className="wrap command-wrap">
+          <div className="command-row">
+            <input
+              ref={commandRef}
+              data-composer-input
+              className="command-input"
+              value={text}
+              disabled={followupPending}
+              onChange={(e) => setText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ask(); }
+              }}
+              placeholder="输入要向解题 Worker 追问的问题"
+            />
+            <button className="send" disabled={!text.trim() || followupPending} onClick={ask} title="Ask" aria-label="Ask"><Icon name="send" size={15} /></button>
+          </div>
+          <div className="command-actionbar">
+            <div className="quick">
+              <button className="primary" disabled={followupPending} title={t("quick.resolveTitle")} onClick={() => onResolve()}><Icon name="refresh" size={13} />{t("quick.resolve")}</button>
+              <button disabled={!text.trim() || followupPending} title={t("quick.ask.tip")} onClick={ask}><Icon name="help" size={13} />{t("quick.ask")}</button>
+              <button disabled={followupPending} title={t("quick.writeup.tip")} onClick={() => void onCommand("global", "writeup", "")}><Icon name="pencil" size={13} />{t("quick.writeup")}</button>
+              {solved ? (
+                <>
+                  <span className="quick-sep" />
+                  <button className="danger" disabled={followupPending} title={t("quick.markFalseTitle")} onClick={() => {
+                    if (flags.length === 1) void onCommand("global", "mark_false", flags[0]);
+                    else setMarkFalseOpen((value) => !value);
+                  }}><Icon name="alert" size={13} />{t("quick.markFalse")}</button>
+                </>
+              ) : null}
+            </div>
+            <div className="command-hint">{followupPending ? "正在处理后续操作…" : t("composer.finishedHint")}</div>
+          </div>
+          {solved && markFalseOpen && flags.length > 1 ? (
+            <div className="markfalse-picker" role="group" aria-label={t("quick.markFalseTitle")}>{flags.map((flag) => (
+              <button key={flag} type="button" title={flag} onClick={() => { void onCommand("global", "mark_false", flag); setMarkFalseOpen(false); }}>{flag}</button>
+            ))}</div>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="composer2 command-composer motion-run-enter">
       <div className="wrap command-wrap">
@@ -1295,38 +1347,7 @@ function Composer({
                 <button className="danger" onClick={() => command("stop")} title={t("quick.stopTitle")}><Icon name="xCircle" size={13} />{t("quick.stop")}</button>
               </>
             ) : (
-              <>
-                {QUICK_FINISHED.map((a) => (
-                  <button
-                    key={a.key}
-                    className={a.primary ? "primary" : ""}
-                    title={a.key === "resolve" ? t("quick.resolveTitle") : t(a.tipKey)}
-                    aria-label={t(a.tipKey)}
-                    onClick={() => command(a.key)}
-                  >
-                    <Icon name={a.icon} size={13} />{t(a.labelKey)}
-                  </button>
-                ))}
-                {solved && (
-                  <>
-                    <span className="quick-sep" />
-                    <button
-                      className="danger"
-                      title={t("quick.markFalseTitle")}
-                      onClick={() => {
-                        if (flags.length === 1) {
-                          onCommand(cmdTarget, "mark_false", flags[0]);
-                          setMarkFalseOpen(false);
-                        } else {
-                          command("mark_false");
-                        }
-                      }}
-                    >
-                      <Icon name="alert" size={13} />{t("quick.markFalse")}
-                    </button>
-                  </>
-                )}
-              </>
+              <span className="command-hint">任务正在结束，请等待完成事件</span>
             )}
           </div>
           <div className="command-hint">{running ? t("composer.steerHint") : t("composer.finishedHint")}</div>
@@ -1717,6 +1738,8 @@ export function Conversation({
             started={deck.started}
             solved={deck.solved}
             running={running}
+            finished={deck.finished}
+            followupPending={deck.followupPending}
             paused={digest.phase === "paused"}
             solvers={solvers}
             flags={deck.flags}

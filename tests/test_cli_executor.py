@@ -205,7 +205,7 @@ def test_secret_prompt_invocations_are_stdin_only_and_non_persistent():
     claude_argv = claude.build_execute_stdin(secret, claude.new_session(), stream=True)
     assert secret not in "\0".join(claude_argv)
     assert "--no-session-persistence" in claude_argv
-    assert "--bare" in claude_argv
+    assert "--bare" not in claude_argv
     assert claude_argv[-1] == "--"
 
     codex = CodexDriver()
@@ -220,6 +220,14 @@ def test_secret_prompt_invocations_are_stdin_only_and_non_persistent():
     wrapped_argv = wrapped.build_execute_stdin(secret, None, stream=True)
     assert secret not in "\0".join(wrapped_argv)
     assert wrapped_argv[wrapped_argv.index("--model") + 1] == "x"
+    assert "--bare" not in wrapped_argv
+
+    injected = driver_for({
+        "id": "claude-key", "engine": "claude", "model": "x",
+        "credential_kind": "engine_key", "credential_account": "claude-main",
+    })
+    injected_argv = injected.build_execute_stdin(secret, None, stream=True)
+    assert "--bare" in injected_argv
 
     # Cursor's installed CLI reads a missing headless positional from stdin, but
     # exposes no no-persistence mode; exact secret delivery must fail closed.
@@ -5270,6 +5278,40 @@ def test_standby_redirect_endpoint_crosses_the_actual_prompt_boundary(tmp_path):
 
     assert endpoint in captured["prompt"]
     assert "new target endpoint" in captured["prompt"]
+
+
+def test_standby_writeup_forbids_new_investigation_and_uses_short_timeout(tmp_path):
+    from muteki.solver.cli_driver import CliResult
+
+    captured = {}
+
+    class _CaptureResumeDriver(_StubDriver):
+        def build_resume(self, prompt, *args, **kwargs):
+            captured["prompt"] = prompt
+            return ["true"]
+
+    ch = Challenge(
+        id="writeup-standby", name="writeup", category="web",
+        flag_format=r"flag\{.*?\}",
+    )
+    solver = CliSolver(
+        None, ch, bus=_CaptureBus(), driver=_CaptureResumeDriver(""),
+        engine="claude", kb=False, mode="respond", resume_session="sess",
+        workdir=str(tmp_path), timeout=2400,
+        hitl_cmd={"action": "writeup", "followup_id": "F-writeup"},
+    )
+
+    async def _finished(_argv, *, cwd, timeout, stdin_text=None):
+        captured["timeout"] = timeout
+        return CliResult(text="## 漏洞点\n已确认。", session="sess")
+
+    solver._run_streaming = _finished
+    outcome = asyncio.run(solver._run_respond())
+
+    assert "Do not run commands" in captured["prompt"]
+    assert "search the filesystem" in captured["prompt"]
+    assert captured["timeout"] == 300
+    assert outcome.reply.startswith("## 漏洞点")
 
 
 def test_standby_resume_releases_optional_context_absent_from_prompt(tmp_path):

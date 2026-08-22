@@ -370,6 +370,9 @@ def seat_to_legacy_profile(
         "credential_mode": credential_mode,
         "auth": credential_mode,
         "credential_account": credential_account,
+        # Preserve the canonical source so command construction can distinguish
+        # host system login from injected credentials.
+        "credential_kind": kind,
         "api_key_ref": "",
         "base_url": base_url,
         "wire_api": wire_api or ("responses" if engine == "codex" and base_url else ""),

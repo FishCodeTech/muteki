@@ -1078,7 +1078,19 @@ class _RaceHealthMixin:
 
     async def _run_control_worker(self, worker: Any) -> Any:
         """Run a worker; CliSolver commits reserved context from ``_on_proc``."""
-        return await worker.run()
+        outcome = await worker.run()
+        profile = getattr(getattr(worker, "driver", None), "profile", None)
+        if isinstance(profile, dict):
+            outcome.runtime_profile = {
+                key: profile.get(key)
+                for key in (
+                    "id", "name", "label", "engine", "transport", "model",
+                    "reasoning_effort", "credential_account", "credential_kind",
+                    "credential_mode", "base_url", "wire_api",
+                )
+                if profile.get(key) not in (None, "")
+            }
+        return outcome
 
     async def _schedule_control_worker(
         self, worker: Any, *, name: str, intent_id: str = "",

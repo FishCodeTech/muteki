@@ -1008,9 +1008,12 @@ def run_cli_container(driver: CliDriver, argv: list[str], *, handle: ContainerHa
         res = run_cli_rcp(driver, cont_argv, run_id=handle.run_id,
                           container_cwd=cont_cwd, timeout=timeout, env=env,
                           **rcp_kwargs)
+        observed_rc = (res.runtime_status or {}).get("rc")
+        if res.returncode is None and observed_rc is not None:
+            res.returncode = int(observed_rc)
         status = ("oom" if res.oom_killed else "timeout" if res.timed_out else "finished")
         res.runtime_status = _RUNTIME_REGISTRY.finish(
-            rec, status=status, rc=(res.runtime_status or {}).get("rc"),
+            rec, status=status, rc=observed_rc,
             timed_out=res.timed_out, oom_killed=res.oom_killed,
             error=(res.raw_stderr or "").strip()[:300])
         return res
@@ -1077,6 +1080,8 @@ def run_cli_streaming_container(
             paused_event=paused_event,
             **rcp_kwargs)
         rs = res.runtime_status or {}
+        if res.returncode is None and rs.get("rc") is not None:
+            res.returncode = int(rs["rc"])
         res.runtime_status = _RUNTIME_REGISTRY.finish(
             rec, status=rs.get("status", "finished"), rc=rs.get("rc"),
             timed_out=res.timed_out, oom_killed=res.oom_killed,
@@ -1242,6 +1247,7 @@ class _DockerExecBackend:
                 rec, status="timeout", timed_out=True, error="host timeout")
             return res
         res = driver.parse(proc.stdout or "", proc.stderr or "")
+        res.returncode = proc.returncode
         if proc.returncode == 137:
             oom_after = _oom_kill_count(handle.container)
             if (oom_before is not None and oom_after is not None
@@ -1435,6 +1441,7 @@ class _DockerExecBackend:
             except Exception:
                 pass
         res = driver.parse("".join(out_lines), stderr or "")
+        res.returncode = rc
         res.timed_out = timed_out
         res.oom_killed = oom_killed
         res.cancelled = cancelled

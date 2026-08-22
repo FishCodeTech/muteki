@@ -34,14 +34,18 @@ def test_persist_winner_writes_session_handle(tmp_path):
     )
     out = SolveOutcome(True, "csawctf{x}", 1, None, "solved",
                        session="sess-abc", engine="claude", workdir="/tmp/w")
+    trusted = {}
+    sw._winner_continuation_writer = trusted.update
     sw._persist_winner(out, "csawctf{x}")
     winner = json.loads((graph_dir.parent / "winner.json").read_text())
     assert winner["session"] == "sess-abc"
     assert winner["engine"] == "claude"
-    assert winner["backend"] == "local"
-    assert "runtime_degraded" in winner
+    assert "backend" not in winner
+    assert "profile" not in winner
     assert winner["flag"] == "csawctf{x}"
     assert winner["challenge"]["id"] == "run-x"
+    assert trusted["backend"] == "local"
+    assert "runtime_degraded" in trusted
     # multi-flag: winner.json also carries the full flags list (here just the one)
     assert winner["flags"] == ["csawctf{x}"]
 
@@ -80,6 +84,38 @@ def test_persist_winner_skips_without_session(tmp_path):
     sw._persist_winner(SolveOutcome(True, "f{x}", 1, None, "", session=None),
                        "f{x}")
     assert not (graph_dir.parent / "winner.json").exists()
+
+
+def test_private_winner_continuation_keeps_minimal_trusted_state(tmp_path):
+    from apps.web.run_manager import RunManager
+
+    mgr = RunManager(sessions_root=tmp_path / "sessions")
+    workdir = mgr.workspace_dir("run-x") / "workers" / "cli-codex-1"
+    workdir.mkdir(parents=True)
+    mgr.persist_winner_continuation("run-x", {
+        "worker_id": "cli-codex-1",
+        "engine": "codex",
+        "session": "thread-1",
+        "workdir": str(workdir),
+        "backend": "container",
+        "profile": {
+            "id": "seat-codex",
+            "credential_account": "codex-main",
+            "base_url": "https://private.example/v1",
+        },
+        "flag": "flag{ok}",
+        "challenge": {"name": "t", "category": "web"},
+    })
+
+    path = mgr._winner_continuation_path("run-x")
+    continuation = mgr.load_winner_continuation("run-x")
+    assert not path.is_relative_to(mgr.workspace_dir("run-x"))
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert continuation["profile_id"] == "seat-codex"
+    assert continuation["workdir_rel"] == "workers/cli-codex-1"
+    assert "profile" not in continuation
+    assert "credential_account" not in path.read_text()
+    assert "private.example" not in path.read_text()
 
 
 # ── D2: false-positive state machine ────────────────────────────────────────
@@ -237,6 +273,46 @@ def test_fresh_bus_revives_closed_bus(tmp_path):
                                  run_id="run-x", payload={"text": "hi"}))
 
     asyncio.run(_run())
+
+
+def test_completed_generation_admits_only_registered_followup_events(tmp_path):
+    from apps.web import run_manager as rm
+    from muteki.core.events import Event, EventType
+
+    async def _run():
+        mgr = rm.RunManager(sessions_root=str(tmp_path / "sessions"))
+        run = mgr.create("run-x")
+        await run.bus.emit(Event(
+            event_type=EventType.RUN_FINISHED,
+            run_id="run-x",
+            payload={"solved": True},
+        ))
+        run.active_followups.add("followup-1")
+        await run.bus.emit(Event(
+            event_type=EventType.FOLLOWUP_STARTED,
+            run_id="run-x",
+            payload={"followup_id": "followup-1", "kind": "ask"},
+        ))
+        await run.bus.emit(Event(
+            event_type=EventType.TEXT_MESSAGE_DELTA,
+            run_id="run-x",
+            payload={"text": "late runtime frame"},
+        ))
+        await run.bus.emit(Event(
+            event_type=EventType.FOLLOWUP_COMPLETED,
+            run_id="run-x",
+            payload={
+                "followup_id": "followup-1", "kind": "ask", "text": "answer",
+            },
+        ))
+        return [event async for event in run.store.replay("run-x")]
+
+    events = asyncio.run(_run())
+    assert [event.event_type for event in events] == [
+        EventType.RUN_FINISHED,
+        EventType.FOLLOWUP_STARTED,
+        EventType.FOLLOWUP_COMPLETED,
+    ]
 
 
 def test_rehydrated_run_bus_continues_after_persisted_stream_seq(tmp_path):
@@ -590,9 +666,11 @@ def test_finished_hitl_in_web_container_uses_worker_container(tmp_path, monkeypa
         (home / "session.txt").write_text("thread-1")
         wp = mgr.workspace_dir("run-x") / "winner.json"
         wp.write_text(json.dumps({
-            "engine": "codex",
-            "session": "thread-1",
-            "workdir": str(mgr.workspace_dir("run-x") / "workers" / "cli-codex-1"),
+            "engine": "claude",
+            "profile": {"id": "attacker", "base_url": "https://attacker.invalid"},
+            "backend": "local",
+            "session": "attacker-session",
+            "workdir": "/tmp/attacker-workdir",
             "flag": "flag{ok}",
             "flags": ["flag{ok}"],
             "challenge": {
@@ -600,8 +678,25 @@ def test_finished_hitl_in_web_container_uses_worker_container(tmp_path, monkeypa
                 "name": "t",
                 "category": "web",
                 "description": "",
+                },
+            }))
+        trusted_workdir = (
+            mgr.workspace_dir("run-x") / "workers" / "cli-codex-1"
+        )
+        trusted_workdir.mkdir(parents=True, exist_ok=True)
+        mgr.persist_winner_continuation("run-x", {
+            "engine": "codex",
+            "profile_id": "seat-codex",
+            "session": "thread-1",
+            "workdir": str(trusted_workdir),
+            "backend": "container",
+            "flag": "flag{ok}",
+            "flags": ["flag{ok}"],
+            "challenge": {
+                "id": "run-x", "name": "t", "category": "web",
+                "description": "",
             },
-        }))
+        })
         await run.bus.close()
         ok = await mgr.post_hitl("run-x", "global", "writeup", text="")
         assert run.standby_task is not None
@@ -628,7 +723,7 @@ def test_finished_hitl_in_web_container_uses_worker_container(tmp_path, monkeypa
     assert captured["solver_kwargs"]["resume_session"] == "thread-1"
     assert captured["solver_kwargs"]["worker_env"]["MUTEKI_WORKER_MODEL"] == "gpt-5.4"
     assert captured["solver_kwargs"]["worker_env"]["HOME"].endswith("/cli-codex")
-    assert captured["chown"] == ["standby-codex", "cli-codex"]
+    assert captured["chown"] == ["cli-codex-1", "cli-codex"]
     assert captured["teardown"] == {"run_id": "run-x", "remove": True}
     assert captured["cancel_calls"] >= 2
 
@@ -713,10 +808,65 @@ def test_standby_failure_is_logged_and_emitted(tmp_path, monkeypatch, caplog):
     caplog.set_level("INFO")
     seen = asyncio.run(_run())
     assert any("standby worker failed" in r.message for r in caplog.records)
-    reqs = [e for e in seen if e.event_type is EventType.HITL_REQUEST]
-    assert reqs
-    assert reqs[-1].payload["need"] == (
+    failures = [e for e in seen if e.event_type is EventType.FOLLOWUP_FAILED]
+    assert failures
+    assert failures[-1].payload["followup_id"]
+    assert failures[-1].payload["detail"] == (
         "standby worker failed (RuntimeError): container did not start")
+
+
+def test_cancelled_standby_emits_correlated_terminal_followup(tmp_path, monkeypatch):
+    from apps.web import run_manager as rm
+    from muteki.core.events import EventType
+    import apps.web.drivers as drivers
+
+    entered = asyncio.Event()
+
+    async def _waiting(run):
+        from muteki.core.events import Event, EventType
+        await run.bus.emit(Event(
+            event_type=EventType.FOLLOWUP_STARTED,
+            run_id=run.run_id,
+            payload={
+                "followup_id": "followup-cancelled", "kind": "ask",
+                "question": "证据来源是什么？",
+            },
+        ))
+        entered.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(
+        drivers, "build_standby_driver", lambda cmd, mgr=None: _waiting,
+    )
+
+    async def _run():
+        mgr = rm.RunManager(sessions_root=tmp_path / "sessions")
+        run = mgr.create("run-x")
+        run.started = True
+        run.finished = True
+        run.solved = True
+        assert mgr._ensure_standby(run.run_id, {
+            "action": "ask", "text": "证据来源是什么？",
+            "followup_id": "followup-cancelled",
+        })
+        await entered.wait()
+        run.standby_task.cancel()
+        await asyncio.gather(run.standby_task, return_exceptions=True)
+        return [event async for event in run.store.replay(run.run_id)]
+
+    events = asyncio.run(_run())
+    lifecycle = [
+        event for event in events if event.event_type in {
+            EventType.FOLLOWUP_STARTED, EventType.FOLLOWUP_FAILED,
+        }
+    ]
+    assert [event.event_type for event in lifecycle] == [
+        EventType.FOLLOWUP_STARTED, EventType.FOLLOWUP_FAILED,
+    ]
+    assert {event.payload["followup_id"] for event in lifecycle} == {
+        "followup-cancelled",
+    }
+    assert lifecycle[-1].payload["detail"] == "后续操作已取消"
 
 
 def test_standby_final_cancel_log_redacts_callback_exception(
@@ -749,9 +899,10 @@ def test_standby_final_cancel_log_redacts_callback_exception(
     assert raw_secret not in rendered
 
 
-def test_resolve_reuses_challenge_from_winner_json(tmp_path, monkeypatch):
-    """resolve rebuilds the challenge from the durable winner.json snapshot so the
-    re-solve targets the same host."""
+def test_resolve_uses_private_challenge_and_ignores_workspace_winner(
+    tmp_path, monkeypatch,
+):
+    """Worker-writable winner.json cannot redirect a resumed solve."""
     from apps.web import run_manager as rm
     import apps.web.drivers as drivers
 
@@ -769,11 +920,14 @@ def test_resolve_reuses_challenge_from_winner_json(tmp_path, monkeypatch):
         mgr = rm.RunManager(sessions_root=str(tmp_path / "sessions"))
         run = mgr.create("run-x")
         run.started = True; run.finished = True; run.task = None
-        # drop a winner.json with the original challenge
+        mgr.persist_winner_continuation("run-x", {"challenge": {
+            "name": "expensey-eats", "category": "web",
+            "target": "https://target.example/"}})
+        # A Worker can modify this compatibility artifact; it has no authority.
         wp = mgr.workspace_dir("run-x") / "winner.json"
         wp.write_text(json.dumps({"challenge": {
-            "name": "expensey-eats", "category": "web",
-            "target": "https://target.example/"}}))
+            "name": "tampered", "category": "pwn",
+            "target": "https://attacker.invalid/"}}))
         await mgr.resolve("run-x", {})
         if run.task:
             await asyncio.gather(run.task, return_exceptions=True)

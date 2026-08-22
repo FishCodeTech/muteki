@@ -25,6 +25,9 @@ class EventType(str, Enum):
     RUN_REOPENED = "run.reopened"  # a terminal run was re-opened (continue solving
     #   or flag marked false-positive) — rail flips solved/finished→running
     FLAG_ACCEPTED = "flag.accepted"  # CAS/outbox-verified Protocol 2 publication;
+    FOLLOWUP_STARTED = "followup.started"  # post-run Ask/Writeup lifecycle; these
+    FOLLOWUP_COMPLETED = "followup.completed"  # events never reopen/finish the run
+    FOLLOWUP_FAILED = "followup.failed"
     #   accepted-only visibility does not imply solved, finished, or clean closure
     PROJECTION_INCOMPLETE = "projection.incomplete"  # non-terminal, redacted startup
     #   reconciliation diagnostic; never carries candidate/CAS/credential material

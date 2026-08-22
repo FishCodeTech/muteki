@@ -413,6 +413,59 @@ def test_events_reducer_tracks_poc_blackboard_lifecycle():
     _run_ui_node(script)
 
 
+def test_followup_failure_replaces_its_correlated_pending_status():
+    helper = UI_ROOT / "lib" / "events.ts"
+    script = textwrap.dedent(
+        f"""
+        const fs = require("fs");
+        const ts = require("typescript");
+        const vm = require("vm");
+        const source = fs.readFileSync({json.dumps(str(helper))}, "utf8");
+        const out = ts.transpileModule(source, {{
+          compilerOptions: {{ module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }}
+        }}).outputText;
+        const sandbox = {{ module: {{ exports: {{}} }}, exports: {{}} }};
+        sandbox.exports = sandbox.module.exports;
+        vm.runInNewContext(out, sandbox, {{ filename: "events.js" }});
+        const lib = sandbox.module.exports;
+        function assert(cond, msg) {{ if (!cond) throw new Error(msg); }}
+
+        let s = lib.emptyDeck("run-followup");
+        s = lib.reduce(s, {{ event_type: lib.EventType.FOLLOWUP_STARTED,
+          run_id: "run-followup", ts: 1, payload: {{ followup_id: "F1",
+            kind: "ask", question: "证据来源是什么？" }} }});
+        s = lib.reduce(s, {{ event_type: lib.EventType.FOLLOWUP_STARTED,
+          run_id: "run-followup", ts: 1.1, payload: {{ followup_id: "F1",
+            kind: "ask", question: "证据来源是什么？" }} }});
+        assert(s.followupPending, "follow-up is pending");
+        assert(s.chat.filter((m) => m.content === "证据来源是什么？").length === 1,
+          "duplicate lifecycle event does not duplicate the question");
+        assert(s.chat.some((m) => m.followupId === "F1"
+          && m.content === "正在回答追问…"), "pending row is correlated");
+
+        s = lib.reduce(s, {{ event_type: lib.EventType.FOLLOWUP_FAILED,
+          run_id: "run-followup", ts: 2, payload: {{ followup_id: "F1",
+            kind: "ask", detail: "后续操作已取消" }} }});
+        assert(!s.followupPending, "terminal failure clears pending state");
+        assert(!s.chat.some((m) => m.content === "正在回答追问…"),
+          "pending row is removed");
+        assert(s.chat.filter((m) => m.followupId === "F1"
+          && m.content.includes("后续操作已取消")).length === 1,
+          "one correlated failure row remains");
+
+        s = lib.reduce(s, {{ event_type: lib.EventType.FOLLOWUP_STARTED,
+          run_id: "run-followup", ts: 3, payload: {{ followup_id: "F1",
+            kind: "ask", question: "证据来源是什么？" }} }});
+        assert(!s.followupPending,
+          "a replayed start after terminal failure cannot restore pending state");
+        assert(s.chat.filter((m) => m.followupId === "F1"
+          && m.content.includes("后续操作已取消")).length === 1,
+          "terminal row remains idempotent after replay");
+        """
+    )
+    _run_ui_node(script)
+
+
 def test_events_reducer_shows_preflight_before_workers_and_failure_details():
     helper = UI_ROOT / "lib" / "events.ts"
     script = textwrap.dedent(
