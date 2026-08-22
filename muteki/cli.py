@@ -57,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--root", type=Path)
 
     upgrade = subparsers.add_parser("upgrade", help="检查或安装指定版本")
-    upgrade.add_argument("target", nargs="?", help="目标版本，例如 v0.3.1；省略时使用最新稳定版")
+    upgrade.add_argument("target", nargs="?", help="目标版本，例如 v0.3.2；省略时使用最新稳定版")
     upgrade.add_argument("--check", action="store_true", help="只检查，不下载或切换")
     upgrade.add_argument("--force", action="store_true", help="重新安装相同版本")
     upgrade.add_argument("--json", action="store_true")
