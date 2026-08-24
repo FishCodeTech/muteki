@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build the SLIM muteki worker image (plain Ubuntu + reverse-connector + 9 agent CLIs).
 # A lightweight alternative to docker/worker/build.sh for FAST testing — same two steps:
-#   1) cross-compile the Go runtime-agent (supervisor) to docker/worker-slim/runtime_agent
-#      (the docker build context — COPY ./runtime_agent resolves relative to it).
+#   1) cross-compile the Go runtime-agent (supervisor) to an architecture-named
+#      file in docker/worker-slim (the docker build context).
 #   2) docker build the amd64 image, tagging both the version and :latest.
 #
 # Usage: ./docker/worker-slim/build.sh [repo] [version] [arch]
@@ -44,10 +44,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 
 echo ">> [1/3] cross-compiling runtime-agent (linux/${ARCH}, static)..."
+RUNTIME_AGENT="$HERE/runtime_agent-${ARCH}"
 if command -v go >/dev/null 2>&1; then
   CGO_ENABLED=0 GOOS=linux GOARCH="${ARCH}" \
     go build -C "$REPO/cmd/runtime-agent" -trimpath -ldflags="-s -w" \
-      -o "$HERE/runtime_agent" .
+      -o "$RUNTIME_AGENT" .
 else
   echo ">> host Go unavailable; compiling with golang:1.26-bookworm..."
   docker run --rm \
@@ -57,10 +58,10 @@ else
     -v "$REPO:/src" -w /src/cmd/runtime-agent \
     golang:1.26-bookworm \
     go build -trimpath -ldflags="-s -w" \
-      -o /src/docker/worker-slim/runtime_agent .
+      -o "/src/docker/worker-slim/runtime_agent-${ARCH}" .
 fi
-ls -la "$HERE/runtime_agent"
-file "$HERE/runtime_agent" 2>/dev/null || true
+ls -la "$RUNTIME_AGENT"
+file "$RUNTIME_AGENT" 2>/dev/null || true
 
 echo ">> syncing AGENTS.md + muteki-blackboard skill into docker build context..."
 # AGENTS.md: reuse the trimmed copy the Kali build context already maintains (it is a

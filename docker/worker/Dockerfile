@@ -5,8 +5,9 @@
 #
 # Build (always via docker/worker/build.sh, which cross-compiles runtime_agent first):
 #   ./docker/worker/build.sh
-# Platform is amd64 (Kali main + ghidra/sage are amd64; arm64 mac builds via QEMU).
-# The platform is set by the BUILD COMMAND (--platform linux/amd64), NOT a const here:
+# The local helper defaults to amd64. GitHub Actions builds amd64 and arm64 on
+# matching native runners and publishes one two-platform image index.
+# The platform is set by the BUILD COMMAND, NOT a const here:
 # a `FROM --platform=amd64` const trips a BuildKit export bug on arm64 Docker Desktop
 # with the containerd image store ("operating system is not supported" at load time,
 # after the layers already exported) — and is what the FromPlatformFlagConstDisallowed
@@ -16,6 +17,8 @@
 # changes daily). Re-pin periodically: `docker pull kalilinux/kali-rolling:latest`
 # then read the new digest from `docker images --digests`. Last pinned: 2026-06-17.
 FROM kalilinux/kali-rolling@sha256:256893c92bbd289b07d9ef8a62e75f9c7cb3d9e570fb3d3725b2e86b9acd5728
+
+ARG TARGETARCH
 
 # http.kali.org is a redirector and can send one apt transaction across several
 # mirrors. A single unavailable mirror then stalls the complete image build. Use
@@ -117,10 +120,16 @@ RUN pip3 install --break-system-packages --no-cache-dir --ignore-installed \
 # root (supply-chain: never pipe an unverified `latest` installer into a root shell).
 # Re-pin: bump MINIFORGE_VERSION, download the installer, `shasum -a 256` it.
 ARG MINIFORGE_VERSION=26.3.2-3
-ARG MINIFORGE_SHA256=848194851a98903134187fbb4ab50efe87b003e0c0f808f97644b7524a62bf2c
-RUN curl -fsSL --retry 8 --retry-all-errors -o /tmp/miniforge.sh \
-      "https://github.com/conda-forge/miniforge/releases/download/${MINIFORGE_VERSION}/Miniforge3-${MINIFORGE_VERSION}-Linux-x86_64.sh" && \
-    echo "${MINIFORGE_SHA256}  /tmp/miniforge.sh" | sha256sum -c - && \
+ARG MINIFORGE_SHA256_AMD64=848194851a98903134187fbb4ab50efe87b003e0c0f808f97644b7524a62bf2c
+ARG MINIFORGE_SHA256_ARM64=2c113a69297e612b01ca0f320c22a3107a11f2ab9b573d79ac868a175945ce29
+RUN case "$TARGETARCH" in \
+      amd64) miniforge_arch="x86_64"; miniforge_sha="$MINIFORGE_SHA256_AMD64" ;; \
+      arm64) miniforge_arch="aarch64"; miniforge_sha="$MINIFORGE_SHA256_ARM64" ;; \
+      *) echo "unsupported Miniforge architecture: $TARGETARCH" >&2; exit 2 ;; \
+    esac && \
+    curl -fsSL --retry 8 --retry-all-errors -o /tmp/miniforge.sh \
+      "https://github.com/conda-forge/miniforge/releases/download/${MINIFORGE_VERSION}/Miniforge3-${MINIFORGE_VERSION}-Linux-${miniforge_arch}.sh" && \
+    echo "${miniforge_sha}  /tmp/miniforge.sh" | sha256sum -c - && \
     bash /tmp/miniforge.sh -b -p /opt/conda && \
     rm -f /tmp/miniforge.sh && \
     /opt/conda/bin/conda config --set remote_max_retries 10 && \
@@ -138,7 +147,12 @@ RUN curl -fsSL --retry 8 --retry-all-errors -o /tmp/miniforge.sh \
 # relying on Kali rolling's current Node version would make this image drift.
 ARG NODE_VERSION="22.19.0"
 ARG NODE_MIRROR="https://nodejs.org/dist"
-RUN curl -fsSL "$NODE_MIRROR/v$NODE_VERSION/node-v$NODE_VERSION-linux-x64.tar.gz" \
+RUN case "$TARGETARCH" in \
+      amd64) node_arch="x64" ;; \
+      arm64) node_arch="arm64" ;; \
+      *) echo "unsupported Node architecture: $TARGETARCH" >&2; exit 2 ;; \
+    esac && \
+    curl -fsSL "$NODE_MIRROR/v$NODE_VERSION/node-v$NODE_VERSION-linux-$node_arch.tar.gz" \
       -o /tmp/node.tar.gz && \
     tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 && \
     rm -f /tmp/node.tar.gz && \
@@ -189,8 +203,8 @@ RUN mkdir -p /home/kali/knowledges /home/kali/pocs /home/kali/.local && \
     chown -R kali:kali /home/kali/knowledges /home/kali/pocs /home/kali/.local
 
 # 7) Runtime Agent (Go supervisor, §10) — cross-compiled static binary, COPY'd in.
-#    build.sh outputs it to docker/worker/runtime_agent (this build context) first.
-COPY ./runtime_agent /opt/muteki/runtime_agent
+#    build.sh and release-images.yml name it by the target architecture.
+COPY ./runtime_agent-${TARGETARCH} /opt/muteki/runtime_agent
 COPY ./deepseek_harness_worker.py /opt/muteki/deepseek_harness_worker.py
 COPY ./offline_acp_bridge.py /opt/muteki/offline_acp_bridge.py
 COPY ./omp_offline_config.yml /opt/muteki/omp_offline_config.yml

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the muteki worker image (ONE generic image — not a per-recipe tag). Two steps:
-#   1) cross-compile the Go runtime-agent (supervisor) to docker/worker/runtime_agent
-#      (the docker build context — COPY ./runtime_agent resolves relative to it).
+#   1) cross-compile the Go runtime-agent (supervisor) to
+#      docker/worker/runtime_agent-amd64 (the docker build context).
 #   2) docker build the amd64 image, tagging both the version and :latest.
 #
 # Usage: ./docker/worker/build.sh [repo] [version]
@@ -18,10 +18,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 
 echo ">> [1/3] cross-compiling runtime-agent (linux/amd64, static)..."
+RUNTIME_AGENT="$HERE/runtime_agent-amd64"
 if command -v go >/dev/null 2>&1; then
   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -C "$REPO/cmd/runtime-agent" -trimpath -ldflags="-s -w" \
-      -o "$HERE/runtime_agent" .
+      -o "$RUNTIME_AGENT" .
 else
   echo ">> host Go unavailable; compiling with golang:1.26-bookworm..."
   docker run --rm \
@@ -31,10 +32,10 @@ else
     -v "$REPO:/src" -w /src/cmd/runtime-agent \
     golang:1.26-bookworm \
     go build -trimpath -ldflags="-s -w" \
-      -o /src/docker/worker/runtime_agent .
+      -o /src/docker/worker/runtime_agent-amd64 .
 fi
-ls -la "$HERE/runtime_agent"
-file "$HERE/runtime_agent" 2>/dev/null || true
+ls -la "$RUNTIME_AGENT"
+file "$RUNTIME_AGENT" 2>/dev/null || true
 
 echo ">> syncing muteki-blackboard skill into docker build context..."
 cp "$REPO/skills/muteki-blackboard/SKILL.md" "$HERE/blackboard.SKILL.md"

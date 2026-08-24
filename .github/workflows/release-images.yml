@@ -1,18 +1,11 @@
 name: release-images
 
-# Build the four muteki images and push them to GitHub Container Registry (GHCR).
+# Build the four Muteki images on native amd64/arm64 GitHub-hosted runners.
+# Each architecture is pushed by digest. A merge job then publishes one tag
+# containing exactly linux/amd64 and linux/arm64.
 #
-# Images (all under ghcr.io/<owner>/...):
-#   muteki-web          — FastAPI control plane          (docker/web/Dockerfile,  context = repo root)
-#   muteki-ui           — Next command deck              (docker/ui/Dockerfile,   context = apps/web/ui)
-#   muteki-worker-slim  — ubuntu base + 9 engine CLIs + agent (docker/worker-slim, needs cross-compiled runtime_agent)
-#   muteki-worker       — Kali base + full pentest kit   (docker/worker,          heavy: ~kali + 2.6G knowledges)
-#
-# Auth: the built-in GITHUB_TOKEN with packages:write — no PAT, no Docker Hub.
-# Triggers:
-#   - push v* tag        → build every artifact, create the GitHub Release, and move :latest
-#   - workflow_dispatch  → pipeline test; tags with the input or branch name; no GitHub Release
-#                          and does not move :latest (optionally skip the Kali worker)
+# provenance and SBOM descriptors are disabled for these release images so
+# imagetools inspect does not show an extra unknown/unknown entry.
 on:
   push:
     tags: ["v*"]
@@ -23,11 +16,10 @@ on:
         type: boolean
         default: true
       tag:
-        description: "Leave empty to tag images with the branch or git tag name. Do not enter an existing release tag unless you intend to overwrite that image."
+        description: "Leave empty to use the branch or Git tag name. Existing release tags are overwritten only when entered explicitly."
         type: string
         required: false
 
-# 发布任务需要创建 Release 并上传应用包；镜像任务写入 GHCR。
 permissions:
   contents: write
   packages: write
@@ -38,7 +30,7 @@ env:
 
 jobs:
   bundle:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -61,162 +53,97 @@ jobs:
             dist/release-manifest.json
           if-no-files-found: error
 
-  # ── lightweight images: plain docker build-push ───────────────────────────────
-  web:
-    runs-on: ubuntu-latest
+  images:
+    name: ${{ matrix.image }} (${{ matrix.target.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - muteki-web
+          - muteki-ui
+          - muteki-worker-slim
+        target:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.target.runner }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve image tag
-        id: tag
+      - name: Resolve image build
+        id: image
         env:
-          IMAGE_NAME: muteki-web
+          IMAGE_NAME: ${{ matrix.image }}
         run: |
+          set -euo pipefail
           TAG="${{ github.event.inputs.tag }}"
           [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
           TAG="${TAG#refs/tags/}"
           [ -z "$TAG" ] && TAG="latest"
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          REPOSITORY="${REGISTRY}/${OWNER}/${IMAGE_NAME}"
           {
-            echo "${REGISTRY}/${OWNER}/${IMAGE_NAME}:${TAG}"
-            if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-              echo "${REGISTRY}/${OWNER}/${IMAGE_NAME}:latest"
-            fi
-          } | tee /tmp/image-tags.txt
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
-          {
-            echo "tags<<EOF"
-            cat /tmp/image-tags.txt
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-          echo "Resolved image namespace: $OWNER"
-          echo "Resolved tag: $TAG"
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build & push muteki-web
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/web/Dockerfile
-          build-args: |
-            IMAGE_VERSION=${{ steps.tag.outputs.tag }}
-            IMAGE_REVISION=${{ github.sha }}
-          push: true
-          tags: ${{ steps.tag.outputs.tags }}
-          cache-from: type=gha,scope=muteki-web
-          cache-to: type=gha,scope=muteki-web,mode=max
-
-  ui:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Resolve image tag
-        id: tag
-        env:
-          IMAGE_NAME: muteki-ui
-        run: |
-          TAG="${{ github.event.inputs.tag }}"
-          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
-          TAG="${TAG#refs/tags/}"
-          [ -z "$TAG" ] && TAG="latest"
-          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
-          {
-            echo "${REGISTRY}/${OWNER}/${IMAGE_NAME}:${TAG}"
-            if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-              echo "${REGISTRY}/${OWNER}/${IMAGE_NAME}:latest"
-            fi
-          } | tee /tmp/image-tags.txt
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
-          {
-            echo "tags<<EOF"
-            cat /tmp/image-tags.txt
-            echo "EOF"
+            echo "tag=$TAG"
+            echo "owner=$OWNER"
+            echo "repository=$REPOSITORY"
           } >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build & push muteki-ui
-        uses: docker/build-push-action@v6
-        with:
-          context: apps/web/ui
-          file: docker/ui/Dockerfile
-          push: true
-          # The Next standalone server freezes the /api proxy target at build time.
-          # Bake the compose service alias so the composed stack works out of the box;
-          # a non-compose deployment overrides NEXT/MUTEKI_BACKEND at its own build.
-          build-args: |
-            MUTEKI_BACKEND=http://web-api:8000
-            IMAGE_VERSION=${{ steps.tag.outputs.tag }}
-            IMAGE_REVISION=${{ github.sha }}
-          tags: ${{ steps.tag.outputs.tags }}
-          cache-from: type=gha,scope=muteki-ui
-          cache-to: type=gha,scope=muteki-ui,mode=max
-
-  # ── worker images: cross-compile the Go runtime_agent, stage context, build ───
-  worker-slim:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Resolve image tag
-        id: tag
-        env:
-          IMAGE_NAME: muteki-worker-slim
-        run: |
-          TAG="${{ github.event.inputs.tag }}"
-          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
-          TAG="${TAG#refs/tags/}"
-          [ -z "$TAG" ] && TAG="latest"
-          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
-          {
-            echo "${REGISTRY}/${OWNER}/${IMAGE_NAME}:${TAG}"
-            if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-              echo "${REGISTRY}/${OWNER}/${IMAGE_NAME}:latest"
-            fi
-          } | tee /tmp/image-tags.txt
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
-          {
-            echo "tags<<EOF"
-            cat /tmp/image-tags.txt
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          case "$IMAGE_NAME" in
+            muteki-web)
+              echo "context=." >> "$GITHUB_OUTPUT"
+              echo "file=docker/web/Dockerfile" >> "$GITHUB_OUTPUT"
+              {
+                echo "build_args<<EOF"
+                echo "IMAGE_VERSION=$TAG"
+                echo "IMAGE_REVISION=$GITHUB_SHA"
+                echo "EOF"
+              } >> "$GITHUB_OUTPUT"
+              ;;
+            muteki-ui)
+              echo "context=apps/web/ui" >> "$GITHUB_OUTPUT"
+              echo "file=docker/ui/Dockerfile" >> "$GITHUB_OUTPUT"
+              {
+                echo "build_args<<EOF"
+                echo "MUTEKI_BACKEND=http://web-api:8000"
+                echo "IMAGE_VERSION=$TAG"
+                echo "IMAGE_REVISION=$GITHUB_SHA"
+                echo "EOF"
+              } >> "$GITHUB_OUTPUT"
+              ;;
+            muteki-worker-slim)
+              echo "context=docker/worker-slim" >> "$GITHUB_OUTPUT"
+              echo "file=docker/worker-slim/Dockerfile" >> "$GITHUB_OUTPUT"
+              {
+                echo "build_args<<EOF"
+                echo "IMAGE_VERSION=$TAG"
+                echo "EOF"
+              } >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "unsupported image: $IMAGE_NAME" >&2
+              exit 2
+              ;;
+          esac
 
       - uses: actions/setup-go@v5
+        if: ${{ matrix.image == 'muteki-worker-slim' }}
         with:
           go-version: ${{ env.GO_VERSION }}
-          # the runtime-agent module has no external deps (no go.sum), so the module
-          # cache has nothing to restore — disable it to skip the "go.sum not found" warning
           cache: false
 
-      - name: Stage build context (cross-compile runtime_agent + copy skill files)
+      - name: Stage slim Worker build context
+        if: ${{ matrix.image == 'muteki-worker-slim' }}
+        env:
+          TARGET_ARCH: ${{ matrix.target.arch }}
         run: |
           set -euo pipefail
           ctx=docker/worker-slim
-          echo ">> cross-compiling runtime_agent (linux/amd64, static)"
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+          CGO_ENABLED=0 GOOS=linux GOARCH="$TARGET_ARCH" \
             go build -C cmd/runtime-agent -trimpath -ldflags="-s -w" \
-              -o "$GITHUB_WORKSPACE/$ctx/runtime_agent" .
-          file "$ctx/runtime_agent" || true
-          echo ">> staging AGENTS.md + blackboard skill + offline engine files"
+              -o "$GITHUB_WORKSPACE/$ctx/runtime_agent-$TARGET_ARCH" .
           cp docker/worker/AGENTS.md "$ctx/AGENTS.md"
           cp skills/muteki-blackboard/SKILL.md "$ctx/blackboard.SKILL.md"
           cp skills/muteki-blackboard/blackboard.py "$ctx/blackboard.py"
@@ -226,6 +153,7 @@ jobs:
           cp muteki/solver/kimi_offline_agent.md "$ctx/kimi_offline_agent.md"
           cp muteki/solver/grok_offline_agent.md "$ctx/grok_offline_agent.md"
           chmod +x "$ctx/blackboard.py"
+          file "$ctx/runtime_agent-$TARGET_ARCH" || true
 
       - uses: docker/setup-buildx-action@v3
 
@@ -236,78 +164,89 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push muteki-worker-slim
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
-          context: docker/worker-slim
-          file: docker/worker-slim/Dockerfile
-          platforms: linux/amd64
-          push: true
-          build-args: |
-            IMAGE_VERSION=${{ steps.tag.outputs.tag }}
-          tags: ${{ steps.tag.outputs.tags }}
-          cache-from: type=gha,scope=muteki-worker-slim
-          cache-to: type=gha,scope=muteki-worker-slim,mode=max
+          context: ${{ steps.image.outputs.context }}
+          file: ${{ steps.image.outputs.file }}
+          platforms: ${{ matrix.target.platform }}
+          tags: ${{ steps.image.outputs.repository }}
+          outputs: type=image,name=${{ steps.image.outputs.repository }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          sbom: false
+          build-args: ${{ steps.image.outputs.build_args }}
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.target.arch }}
+          cache-to: type=gha,scope=${{ matrix.image }}-${{ matrix.target.arch }},mode=max
+
+      - name: Export image digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          test -n "$digest"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.image }}-${{ matrix.target.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
 
   worker:
-    runs-on: ubuntu-latest
-    # The Kali image is large (kali-linux-headless + ~2.6G knowledges/pocs/templates).
-    # Skip it on a manual run when the operator unchecks the input; always build on a
-    # real release.
+    name: muteki-worker (${{ matrix.target.arch }})
     if: ${{ github.event_name == 'push' || github.event.inputs.build_kali_worker == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.target.runner }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Free up disk space
-        # The default runner has ~14G free; the Kali build needs more. Drop the big
-        # preinstalled toolchains we don't use so the build doesn't ENOSPC.
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                       /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
           sudo docker image prune -af || true
           df -h /
 
-      - name: Resolve image tag
-        id: tag
-        env:
-          IMAGE_NAME: muteki-worker
+      - name: Resolve image build
+        id: image
         run: |
+          set -euo pipefail
           TAG="${{ github.event.inputs.tag }}"
           [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
           TAG="${TAG#refs/tags/}"
           [ -z "$TAG" ] && TAG="latest"
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
           {
-            echo "${REGISTRY}/${OWNER}/${IMAGE_NAME}:${TAG}"
-            if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-              echo "${REGISTRY}/${OWNER}/${IMAGE_NAME}:latest"
-            fi
-          } | tee /tmp/image-tags.txt
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
-          {
-            echo "tags<<EOF"
-            cat /tmp/image-tags.txt
-            echo "EOF"
+            echo "tag=$TAG"
+            echo "owner=$OWNER"
+            echo "repository=${REGISTRY}/${OWNER}/muteki-worker"
           } >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-          # the runtime-agent module has no external deps (no go.sum), so the module
-          # cache has nothing to restore — disable it to skip the "go.sum not found" warning
           cache: false
 
-      - name: Stage build context (cross-compile runtime_agent + copy skill files)
+      - name: Stage full Worker build context
+        env:
+          TARGET_ARCH: ${{ matrix.target.arch }}
         run: |
           set -euo pipefail
           ctx=docker/worker
-          echo ">> cross-compiling runtime_agent (linux/amd64, static)"
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+          CGO_ENABLED=0 GOOS=linux GOARCH="$TARGET_ARCH" \
             go build -C cmd/runtime-agent -trimpath -ldflags="-s -w" \
-              -o "$GITHUB_WORKSPACE/$ctx/runtime_agent" .
-          file "$ctx/runtime_agent" || true
-          echo ">> staging blackboard skill + offline engine files"
+              -o "$GITHUB_WORKSPACE/$ctx/runtime_agent-$TARGET_ARCH" .
           cp skills/muteki-blackboard/SKILL.md "$ctx/blackboard.SKILL.md"
           cp skills/muteki-blackboard/blackboard.py "$ctx/blackboard.py"
           cp muteki/solver/deepseek_harness_worker.py "$ctx/deepseek_harness_worker.py"
@@ -316,6 +255,7 @@ jobs:
           cp muteki/solver/kimi_offline_agent.md "$ctx/kimi_offline_agent.md"
           cp muteki/solver/grok_offline_agent.md "$ctx/grok_offline_agent.md"
           chmod +x "$ctx/blackboard.py"
+          file "$ctx/runtime_agent-$TARGET_ARCH" || true
 
       - uses: docker/setup-buildx-action@v3
 
@@ -326,25 +266,151 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push muteki-worker (Kali)
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: docker/worker
           file: docker/worker/Dockerfile
-          platforms: linux/amd64
-          push: true
+          platforms: ${{ matrix.target.platform }}
+          tags: ${{ steps.image.outputs.repository }}
+          outputs: type=image,name=${{ steps.image.outputs.repository }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          sbom: false
           build-args: |
-            IMAGE_VERSION=${{ steps.tag.outputs.tag }}
-          tags: ${{ steps.tag.outputs.tags }}
-          # GHA cache has a 10G/repo cap; the Kali image alone can exceed it, so use a
-          # registry-side cache image instead (does not count against the GHA cache).
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.tag.outputs.owner }}/muteki-worker:buildcache,mode=max
+            IMAGE_VERSION=${{ steps.image.outputs.tag }}
+          cache-from: type=registry,ref=${{ steps.image.outputs.repository }}:buildcache-${{ matrix.target.arch }}
+          cache-to: type=registry,ref=${{ steps.image.outputs.repository }}:buildcache-${{ matrix.target.arch }},mode=max
+
+      - name: Export image digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          test -n "$digest"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-muteki-worker-${{ matrix.target.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: merge ${{ matrix.image }}
+    needs: images
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - muteki-web
+          - muteki-ui
+          - muteki-worker-slim
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download architecture digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-${{ matrix.image }}-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish two-platform image index
+        env:
+          IMAGE_NAME: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag }}"
+          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
+          TAG="${TAG#refs/tags/}"
+          [ -z "$TAG" ] && TAG="latest"
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          REPOSITORY="${REGISTRY}/${OWNER}/${IMAGE_NAME}"
+
+          mapfile -t DIGEST_FILES < <(find "${{ runner.temp }}/digests" -type f | sort)
+          test "${#DIGEST_FILES[@]}" -eq 2
+          SOURCES=()
+          for digest_file in "${DIGEST_FILES[@]}"; do
+            SOURCES+=("${REPOSITORY}@sha256:$(basename "$digest_file")")
+          done
+
+          TAG_ARGS=(-t "${REPOSITORY}:${TAG}")
+          if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG_ARGS+=(-t "${REPOSITORY}:latest")
+          fi
+          docker buildx imagetools create "${TAG_ARGS[@]}" "${SOURCES[@]}"
+
+          ACTUAL="$(docker buildx imagetools inspect "${REPOSITORY}:${TAG}" --raw |
+            jq -r '.manifests[].platform | "\(.os)/\(.architecture)"' | sort)"
+          EXPECTED=$'linux/amd64\nlinux/arm64'
+          test "$ACTUAL" = "$EXPECTED"
+          printf '%s\n' "$ACTUAL"
+
+  merge-worker:
+    name: merge muteki-worker
+    needs: worker
+    if: ${{ github.event_name == 'push' || github.event.inputs.build_kali_worker == 'true' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download architecture digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-muteki-worker-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish two-platform image index
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag }}"
+          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
+          TAG="${TAG#refs/tags/}"
+          [ -z "$TAG" ] && TAG="latest"
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          REPOSITORY="${REGISTRY}/${OWNER}/muteki-worker"
+
+          mapfile -t DIGEST_FILES < <(find "${{ runner.temp }}/digests" -type f | sort)
+          test "${#DIGEST_FILES[@]}" -eq 2
+          SOURCES=()
+          for digest_file in "${DIGEST_FILES[@]}"; do
+            SOURCES+=("${REPOSITORY}@sha256:$(basename "$digest_file")")
+          done
+
+          TAG_ARGS=(-t "${REPOSITORY}:${TAG}")
+          if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG_ARGS+=(-t "${REPOSITORY}:latest")
+          fi
+          docker buildx imagetools create "${TAG_ARGS[@]}" "${SOURCES[@]}"
+
+          ACTUAL="$(docker buildx imagetools inspect "${REPOSITORY}:${TAG}" --raw |
+            jq -r '.manifests[].platform | "\(.os)/\(.architecture)"' | sort)"
+          EXPECTED=$'linux/amd64\nlinux/arm64'
+          test "$ACTUAL" = "$EXPECTED"
+          printf '%s\n' "$ACTUAL"
 
   publish:
-    needs: [bundle, web, ui, worker-slim, worker]
-    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && needs.bundle.result == 'success' && needs.web.result == 'success' && needs.ui.result == 'success' && needs.worker-slim.result == 'success' && needs.worker.result == 'success' }}
-    runs-on: ubuntu-latest
+    needs: [bundle, merge, merge-worker]
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && needs.bundle.result == 'success' && needs.merge.result == 'success' && needs.merge-worker.result == 'success' }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
         with:

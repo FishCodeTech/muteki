@@ -127,8 +127,9 @@ RUN curl -fsSL https://x.ai/cli/install.sh | bash -s 1.0.4 && \
 USER root
 
 # 5) Runtime Agent (Go supervisor) — cross-compiled static binary, COPY'd in.
-#    build.sh outputs it to docker/worker-slim/runtime_agent (this build context).
-COPY ./runtime_agent /opt/muteki/runtime_agent
+#    build.sh and release-images.yml name it by the target architecture so one
+#    Dockerfile can build amd64 and arm64 without copying the wrong executable.
+COPY ./runtime_agent-${TARGETARCH} /opt/muteki/runtime_agent
 COPY ./deepseek_harness_worker.py /opt/muteki/deepseek_harness_worker.py
 COPY ./offline_acp_bridge.py /opt/muteki/offline_acp_bridge.py
 COPY ./omp_offline_config.yml /opt/muteki/omp_offline_config.yml

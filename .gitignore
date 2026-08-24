@@ -9,6 +9,7 @@ wheels/
 # Worker image build artifact — the cross-compiled Go supervisor. Source lives in
 # cmd/runtime-agent/; build.sh regenerates this into the docker build context.
 docker/worker/runtime_agent
+docker/worker/runtime_agent-*
 docker/worker/blackboard.py
 docker/worker/deepseek_harness_worker.py
 docker/worker/blackboard.SKILL.md
@@ -20,6 +21,7 @@ docker/worker/grok_offline_agent.md
 # Slim worker image build context. build.sh cross-compiles runtime_agent and copies
 # the shared prompt, skill, bridges and engine profiles from their maintained sources.
 docker/worker-slim/runtime_agent
+docker/worker-slim/runtime_agent-*
 docker/worker-slim/AGENTS.md
 docker/worker-slim/blackboard.py
 docker/worker-slim/deepseek_harness_worker.py
