@@ -1326,7 +1326,13 @@ def test_driver_for_codex_endpoint_injects_provider_before_exec(monkeypatch):
     ]
     assert argv[exec_idx] == "exec"
     assert argv.index("--json") > exec_idx
-    assert 'web_search="disabled"' in argv[exec_idx:]
+    assert "--disable" not in argv[exec_idx:]
+    assert 'web_search="disabled"' not in argv[exec_idx:]
+
+    isolated = drv.build_execute("PROMPT", None, web_access=False, kb_access=False)
+    isolated_exec_idx = isolated.index("exec")
+    assert "--ignore-user-config" in isolated[isolated_exec_idx:]
+    assert "--disable" not in isolated[isolated_exec_idx:]
 
 
 def test_codex_endpoint_health_uses_real_cli_turn(monkeypatch):
@@ -1358,6 +1364,8 @@ def test_codex_endpoint_health_uses_real_cli_turn(monkeypatch):
     exec_idx = seen["argv"].index("exec")
     assert "model_provider=muteki" in seen["argv"][:exec_idx]
     assert "model_providers.muteki.base_url=https://api.deepseek.example/v1" in seen["argv"][:exec_idx]
+    assert "--ignore-user-config" in seen["argv"][exec_idx:]
+    assert "--disable" not in seen["argv"][exec_idx:]
     assert "namespace" in detail
 
 

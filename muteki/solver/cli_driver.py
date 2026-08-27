@@ -2614,10 +2614,52 @@ class EndpointDriver(CliDriver):
             return [argv[0], *flags, *argv[1:]]
         return [*argv[:idx], *flags, *argv[idx:]]
 
+    def _codex_endpoint_isolation(self, *, kb_access: bool) -> list[str]:
+        """Return the stable Codex isolation envelope for custom endpoints.
+
+        Codex 0.143's WebSocket-to-HTTPS fallback drops ``model_provider`` when
+        any of its Desktop feature gates are disabled.  The retry then targets
+        api.openai.com with the endpoint key, which looks like an invalid-key
+        failure.  Custom endpoints therefore retain config isolation without
+        adding those feature gates; native web search remains opt-in via
+        ``_globals`` just as it is for every other Codex invocation.
+        """
+        return ["--ignore-user-config"] if not kb_access else []
+
+    def _build_codex_endpoint_execute(
+        self, prompt: str, *, web_access: bool, kb_access: bool,
+        stdin: bool = False,
+    ) -> list[str]:
+        flags = self._codex_config_flags()
+        argv = [
+            self.bin,
+            *self.base._globals(web_access=web_access),  # noqa: SLF001
+            *flags,
+            "exec",
+            *self._codex_endpoint_isolation(kb_access=kb_access),
+            "--json",
+        ]
+        if stdin:
+            return [
+                *argv,
+                "--ephemeral",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-",
+            ]
+        return [
+            *argv,
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--",
+            prompt,
+        ]
+
     def build_execute(
         self, prompt: str, session: Optional[str], *,
         web_access: bool = True, kb_access: bool = True, stream: bool = False,
     ) -> list[str]:
+        if self.name == "codex" and self._codex_config_flags():
+            return self._with_profile_options(self._build_codex_endpoint_execute(
+                prompt, web_access=web_access, kb_access=kb_access))
         return self._with_profile_options(self._inject_before_exec(
             self.base.build_execute(
                 prompt, session, web_access=web_access,
@@ -2627,6 +2669,9 @@ class EndpointDriver(CliDriver):
         self, prompt: str, session: Optional[str], *,
         web_access: bool = True, kb_access: bool = True, stream: bool = False,
     ) -> list[str]:
+        if self.name == "codex" and self._codex_config_flags():
+            return self._with_profile_options(self._build_codex_endpoint_execute(
+                prompt, web_access=web_access, kb_access=kb_access, stdin=True))
         return self._with_profile_options(self._inject_before_exec(
             self.base.build_execute_stdin(
                 prompt, session, web_access=web_access,
@@ -2639,6 +2684,17 @@ class EndpointDriver(CliDriver):
         self, prompt: str, session: str, *,
         web_access: bool = True, kb_access: bool = True, stream: bool = False,
     ) -> list[str]:
+        if self.name == "codex" and self._codex_config_flags():
+            argv = [
+                self.bin,
+                *self.base._globals(web_access=web_access),  # noqa: SLF001
+                *self._codex_config_flags(),
+                "exec", "resume", session,
+                *self._codex_endpoint_isolation(kb_access=kb_access),
+                "--json", "--dangerously-bypass-approvals-and-sandbox",
+                "--", prompt,
+            ]
+            return self._with_profile_options(argv)
         return self._with_profile_options(self._inject_before_exec(
             self.base.build_resume(
                 prompt, session, web_access=web_access,
@@ -2654,6 +2710,9 @@ class EndpointDriver(CliDriver):
         return self.base.parse_stream_steps(line)
 
     def _hello_argv(self) -> list[str]:
+        if self.name == "codex" and self._codex_config_flags():
+            return self._with_profile_options(self._build_codex_endpoint_execute(
+                self.HELLO_PROMPT, web_access=False, kb_access=False))
         argv = self.base._hello_argv()  # noqa: SLF001
         if argv:
             return self._with_profile_options(self._inject_before_exec(argv))
