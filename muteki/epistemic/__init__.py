@@ -1,4 +1,7 @@
-"""Protocol 2 epistemic kernel primitives.
+"""Epistemic kernel primitives.
+
+Research substrate for muteki.eval/muteki.research; not part of the production
+solver path.
 
 This package is host-authority code.  It deliberately does not import the legacy
 shared graph or expose an authority database path to workers.

@@ -1,4 +1,4 @@
-"""Experimental cognitive framework swarm classes (F01–F11).
+"""Experimental cognitive framework swarm classes (F01–F12).
 
 These packages are research / eval arms. They are not the product
 Coordinator. Web, TUI, and pentest default start must not construct

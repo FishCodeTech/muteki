@@ -9,6 +9,11 @@
 
 import { ENGINE_HUE, currentMode, hueColor } from "./palette-engine";
 
+/** Engine ids the operator can pick when adding a worker to a live run. */
+export const SPAWN_ENGINES = [
+  "claude", "codex", "cursor", "pi", "omp", "kimi", "grok", "opencode", "devin",
+] as const;
+
 // neutral slate for unknown workers — a whisper of chroma, deliberately quiet.
 const defaultColor = (): string => hueColor(250, currentMode(), 0.18);
 
@@ -29,6 +34,7 @@ export function workerEngine(id: string, engine?: string): string {
   if (s === "kimi_code" || s === "kimi" || s === "kimi-code") return "Kimi Code";
   if (s === "grok_cli" || s === "grok") return "Grok";
   if (s === "opencode_cli" || s === "opencode") return "OpenCode";
+  if (s === "devin_cli" || s === "devin") return "Devin CLI";
   if (s === "dsh_sdk_worker" || s === "dsh" || s === "deepseek_harness") return "DeepSeek Harness";
   if (s === "pi" || s === "omp" || s === "oh_my_pi" || s === "oh-my-pi" || s === "ohmypi") {
     return s === "pi" ? "Pi" : "Oh My Pi";
@@ -42,6 +48,7 @@ export function workerEngine(id: string, engine?: string): string {
   if (s.includes("kimi")) return "Kimi Code";
   if (s.includes("grok")) return "Grok";
   if (s.includes("opencode")) return "OpenCode";
+  if (s.includes("devin")) return "Devin CLI";
   if (s.includes("dsh") || s.includes("deepseek-harness")) return "DeepSeek Harness";
   if (s.includes("deepseek") || s === "reason") return "DeepSeek";
   if (s.includes("mock")) return "Mock";
@@ -49,19 +56,35 @@ export function workerEngine(id: string, engine?: string): string {
   return "Worker";
 }
 
-export function workerColor(id: string, engine?: string): string {
+/** The ENGINE_HUE / EngineLogo key a worker resolves to; "" when unknown. */
+export function workerEngineKey(id: string, engine?: string): string {
   const s = (engine || id).toLowerCase();
-  const key = (k: string): string => hueColor(ENGINE_HUE[k], currentMode());
-  if (s === "claude_code") return key("claude");
-  if (s === "codex_cli") return key("codex");
-  if (s === "cursor_agent") return key("cursor");
+  if (s === "claude_code") return "claude";
+  if (s === "codex_cli") return "codex";
+  if (s === "cursor_agent") return "cursor";
   const seg = engineSegment(s);
-  if (seg) return key(seg);
+  if (seg) return seg;
   for (const k of Object.keys(ENGINE_HUE)) {
     if (k === "pi" || k === "omp") continue; // substring-unsafe; segment-matched above
-    if (s.includes(k)) return key(k);
+    if (s.includes(k)) return k;
   }
-  return defaultColor();
+  return "";
+}
+
+export function workerColor(id: string, engine?: string): string {
+  const key = workerEngineKey(id, engine);
+  return key ? hueColor(ENGINE_HUE[key], currentMode()) : defaultColor();
+}
+
+/**
+ * CSS-variable form of workerColor. It resolves in the stylesheet, so it
+ * follows a theme switch without a re-render and never touches
+ * getComputedStyle; base.css carries the static fallbacks and palette-engine
+ * regenerates the --eng-* tokens on load.
+ */
+export function workerColorVar(id: string, engine?: string): string {
+  const key = workerEngineKey(id, engine);
+  return key ? `var(--eng-${key}, var(--blue))` : "var(--eng-default)";
 }
 
 export function workerInitial(id: string): string {
@@ -69,13 +92,11 @@ export function workerInitial(id: string): string {
   return tail.slice(0, 2).toUpperCase();
 }
 
-// workerGeneration / hasGenerationSuffixedIds live in ./events (the
-// dependency-free event contract) and are re-exported here for worker-identity
-// consumers.
-export { workerGeneration, hasGenerationSuffixedIds } from "./events";
-import { workerGeneration } from "./events";
+// workerGeneration lives in ./events (the dependency-free event contract) and
+// is re-exported here for worker-identity consumers.
+export { workerGeneration } from "./events";
 
-export function workerShortLabel(id: string, engine?: string): string {
+function workerShortLabel(id: string, engine?: string): string {
   const raw = (id || "").toLowerCase();
   if (raw === "reason" || raw === "solver" || raw === "coordinator") return raw;
   const resolved = workerEngine(id, engine);
@@ -115,7 +136,7 @@ export type WorkerDisplayName = {
   connectionDetail?: string;
 };
 
-export function workerInitialFromLabel(label: string, fallbackId: string): string {
+function workerInitialFromLabel(label: string, fallbackId: string): string {
   const text = (label || "").trim();
   if (!text) return workerInitial(fallbackId);
   if (/[\u3400-\u9fff]/.test(text)) return text.slice(0, 2);
@@ -124,11 +145,11 @@ export function workerInitialFromLabel(label: string, fallbackId: string): strin
   return text.slice(0, 2).toUpperCase();
 }
 
-export function workerIdentityKey(lane: WorkerIdentity): string {
+function workerIdentityKey(lane: WorkerIdentity): string {
   return lane.profileId || lane.profileLabel || lane.solverId;
 }
 
-export function workerInstanceIndex(
+function workerInstanceIndex(
   id: string,
   siblings: WorkerIdentity[],
 ): { index: number; count: number } {
@@ -225,7 +246,8 @@ export function actorDisplayTitle(
   lane?: WorkerIdentity | null,
   siblings: WorkerIdentity[] = [],
 ): string {
-  if (id === "human") return t("runtime.actor.operator");
+  // "operator" is the collaboration model's fixed id for the human (OPERATOR_ID).
+  if (id === "human" || id === "operator") return t("runtime.actor.operator");
   if (id === "system") return t("runtime.actor.system");
   if (id === "report-value") return t("runtime.actor.reportValue");
   if (id === "reason" || id === "coordinator") return t("coord.title");
@@ -243,6 +265,7 @@ export function resumeCommand(engine: string, session: string): string {
   if (resolved === "Kimi Code") return `kimi --session ${session}`;
   if (resolved === "Grok") return `grok --resume ${session}`;
   if (resolved === "OpenCode") return `opencode run --session ${session}`;
-  if (resolved === "DeepSeek Harness") return `python -m muteki.solver.deepseek_harness_worker --session ${session}`;
+  if (resolved === "Devin CLI") return `devin --resume ${session}`;
+  if (resolved === "DeepSeek Harness") return "";
   return `claude -r ${session}`;
 }

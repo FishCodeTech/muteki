@@ -2,7 +2,7 @@
 
 The design's heterogeneous lineup is Opus/GPT-5/o-series for complementary blind
 spots. For now we're unified on DeepSeek (per the current constraint), so the
-"lineup" varies model + temperature + role label rather than vendor. The shape
+"lineup" varies model + role label rather than vendor. The shape
 is what matters: `default_lineup(n)` returns N ModelSpecs the swarm races.
 
 When other vendors come back, add their ModelSpecs here — nothing else changes.
@@ -13,8 +13,7 @@ from __future__ import annotations
 from muteki.core.llm import ModelSpec
 
 # Role preambles give each swarm seat a different STRATEGIC PRIOR so they explore
-# disjoint hypothesis spaces (temperature alone perturbs sampling, not strategy —
-# all seats tend to try the same thing first). The InsightBus then fuses
+# disjoint hypothesis spaces. The InsightBus then fuses
 # COMPLEMENTARY discoveries instead of duplicate ones. One seat stays generalist
 # (role="") so coverage is a SUPERSET, not a partition (§5.2 + audit caveat).
 ROLE_PREAMBLES: dict[str, str] = {
@@ -44,17 +43,17 @@ ROLE_PREAMBLES: dict[str, str] = {
     ),
 }
 
-# The full default lineup. Heterogeneity is model + temperature + ROLE PRIOR.
+# The full default lineup. Heterogeneity is model + ROLE PRIOR.
 # Seat order matters: a 2-solver swarm gets a generalist + an exploit specialist
 # (the highest-ROI complementary pair); 3+ adds recon then lateral.
 _FULL_LINEUP: list[ModelSpec] = [
-    ModelSpec(solver_id="pro-gen", model="deepseek-v4-pro", temperature=0.3,
+    ModelSpec(solver_id="pro-gen", model="deepseek-v4-pro",
               role="", label="pro/generalist — methodical all-rounder"),
-    ModelSpec(solver_id="pro-exploit", model="deepseek-v4-pro", temperature=0.6,
+    ModelSpec(solver_id="pro-exploit", model="deepseek-v4-pro",
               role="exploit", label="pro/exploit specialist"),
-    ModelSpec(solver_id="flash-recon", model="deepseek-v4-flash", temperature=0.4,
+    ModelSpec(solver_id="flash-recon", model="deepseek-v4-flash",
               role="recon", label="flash/recon specialist — cheap broad discovery"),
-    ModelSpec(solver_id="flash-lateral", model="deepseek-v4-flash", temperature=0.8,
+    ModelSpec(solver_id="flash-lateral", model="deepseek-v4-flash",
               role="lateral", label="flash/lateral — high-variance unconventional"),
 ]
 

@@ -34,6 +34,7 @@ const (
 	OpSignal      = "Signal"
 	OpStatus      = "Status"
 	OpTeardownRun = "TeardownRun"
+	OpRegisterRun = "RegisterRun"
 	OpHealth      = "Health"
 )
 
@@ -61,14 +62,21 @@ type Request struct {
 
 	// Signal / Status — the worker to act on.
 	WorkerID string `json:"worker_id,omitempty"`
+	// TeardownRun: only the requested logical Run in a shared supervisor.
+	OwnerRunID     string `json:"owner_run_id,omitempty"`
+	OwnerToken     string `json:"owner_token,omitempty"`
+	OwnerWorkspace string `json:"owner_workspace,omitempty"`
 	// Signal — one of "STOP" | "CONT" | "TERM" | "KILL".
 	Signal string `json:"signal,omitempty"`
 }
 
 // WorkerSpec is everything the supervisor needs to fork+exec a worker.
 type WorkerSpec struct {
-	Argv []string `json:"argv"` // resolved container-side argv (argv[0] = bin)
-	Cwd  string   `json:"cwd"`  // absolute path inside the container
+	OwnerRunID     string   `json:"owner_run_id,omitempty"`
+	OwnerToken     string   `json:"owner_token,omitempty"`
+	OwnerWorkspace string   `json:"owner_workspace,omitempty"`
+	Argv           []string `json:"argv"` // resolved container-side argv (argv[0] = bin)
+	Cwd            string   `json:"cwd"`  // absolute path inside the container
 	// Stdin carries an optional one-shot prompt over the authenticated control
 	// channel.  It is never copied into Argv, logs, status, or response frames.
 	Stdin string `json:"stdin,omitempty"`
@@ -82,6 +90,13 @@ type WorkerSpec struct {
 	// Tag is an opaque per-worker label the host uses for its own bookkeeping; the
 	// supervisor echoes it back in the Started reply for correlation.
 	Tag string `json:"tag,omitempty"`
+	// OutputLimitBytes caps combined stdout+stderr for this worker (0 = default
+	// from MUTEKI_WORKER_OUTPUT_LIMIT / built-in). Over-limit kills the tree and
+	// sets exit.output_limit — never a silent Scanner failure (#170 / MNT-09.03).
+	OutputLimitBytes int64 `json:"output_limit_bytes,omitempty"`
+	// DiskLimitBytes caps workdir growth from StartWorker (0 = default from
+	// MUTEKI_WORKER_DISK_LIMIT / built-in). Over-limit kills + exit.disk_limit.
+	DiskLimitBytes int64 `json:"disk_limit_bytes,omitempty"`
 }
 
 // Frame is the tagged union the supervisor sends back on the connection. Exactly one
@@ -92,7 +107,7 @@ type WorkerSpec struct {
 //	T == "started"  -> StartWorker reply: WorkerID set (or Error on spawn failure)
 //	T == "stdin"    -> full stdin pipe handoff completed (OK) or failed (Error)
 //	T == "out"|"err" -> one raw line of worker stdout/stderr (Line), WorkerID set
-//	T == "exit"     -> worker terminated: Rc/OOM/TimedOut/Signalled, WorkerID set
+//	T == "exit"     -> worker terminated: Rc/OOM/TimedOut/OutputLimit/DiskLimit/Signalled
 //	T == "resp"     -> generic Response payload (Signal/Status/Teardown/Health)
 type Frame struct {
 	T        string `json:"t"`
@@ -107,17 +122,20 @@ type Frame struct {
 	Error string `json:"error,omitempty"`
 
 	// t == "exit"
-	Rc        int  `json:"rc,omitempty"`
-	OOM       bool `json:"oom,omitempty"`
-	TimedOut  bool `json:"timed_out,omitempty"`
-	Signalled int  `json:"signalled,omitempty"`
+	Rc          int  `json:"rc,omitempty"`
+	OOM         bool `json:"oom,omitempty"`
+	TimedOut    bool `json:"timed_out,omitempty"`
+	OutputLimit bool `json:"output_limit,omitempty"`
+	DiskLimit   bool `json:"disk_limit,omitempty"`
+	Signalled   int  `json:"signalled,omitempty"`
 
 	// t == "resp" (Signal / Status / TeardownRun / Health)
-	OK      bool   `json:"ok,omitempty"`
-	State   string `json:"state,omitempty"` // Status: running | exited | timed_out | oom | unknown
-	RcPtr   *int   `json:"rc_ptr,omitempty"`
-	Paused  bool   `json:"paused,omitempty"`
-	Version string `json:"version,omitempty"` // Health
-	Workers int    `json:"workers,omitempty"` // Health: running worker count
-	Uptime  int64  `json:"uptime_sec,omitempty"`
+	OK             bool   `json:"ok,omitempty"`
+	State          string `json:"state,omitempty"` // Status: running | exited | timed_out | oom | output_limit | disk_limit | unknown
+	RcPtr          *int   `json:"rc_ptr,omitempty"`
+	Paused         bool   `json:"paused,omitempty"`
+	Version        string `json:"version,omitempty"` // Health
+	ScopedTeardown bool   `json:"scoped_teardown,omitempty"`
+	Workers        int    `json:"workers,omitempty"` // Health: running worker count
+	Uptime         int64  `json:"uptime_sec,omitempty"`
 }

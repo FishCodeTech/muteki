@@ -1,26 +1,24 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { Header, Kbd, ListBox, ListBoxItem, Modal, SearchField } from "@heroui/react";
 import { Icon, type IconName } from "@/components/Icon";
 import { useT, useLang } from "@/lib/i18n";
 import type { RunSummary } from "@/lib/useRun";
 import type { ArtifactView } from "@/lib/events";
-import { SelectionGlider } from "@/components/SelectionGlider";
+import { panelHotkey } from "@/lib/runtimeTabs";
 
 /**
- * Cmd/Ctrl+K command palette — a Linear/Slack/VSCode-style centered overlay that
- * turns the deck's whole action surface into keyboard-reachable commands.
+ * Cmd/Ctrl+K command palette — a Linear/Slack/VSCode-style overlay built on
+ * standard HeroUI components (Modal, SearchField, ListBox, Kbd).
  *
  * Open/close + the Cmd+K shortcut are OWNED by the parent (page.tsx) so a single
- * global handler arbitrates with the panel single-key shortcuts and Esc layers.
+ * global handler arbitrates with panel single-key shortcuts and Esc layers.
  * This component is a pure modal: it renders nothing when `open` is false, builds
  * its command list from the props it's handed, fuzzy-filters on a flat query, and
- * runs the selected command (closing itself). The old Cmd+K "focus the composer"
- * affordance survives as the "focus composer" command + the bare "/" key.
+ * runs the selected command (closing itself).
  */
 
-// One palette command. `keywords` widen fuzzy matching; `sub` is a muted second
-// line (used for runs: category · status); `kbd` shows a direct-shortcut hint.
 export interface Command {
   id: string;
   label: string;
@@ -46,6 +44,8 @@ export interface PaletteData {
   onSelectRun: (id: string) => void;
   onSpawnWorker: (engine?: string) => void;
   onOpenSettings: () => void;
+  agents?: Array<{ id: string; title: string; engine: string; status?: string }>;
+  onOpenAgent?: (id: string) => void;
 }
 
 const MAX_RUNS = 8; // cap the "switch run" matches so the list stays scannable
@@ -59,9 +59,7 @@ function focusComposer() {
   }
 }
 
-/** B: seed the composer with a `/<verb> ` prefix and focus it — keyboard-first way
- *  to start an operator directive. Uses the native value setter so React's
- *  controlled input picks up the change. */
+/** Seed the composer with a `/<verb> ` prefix and focus it. */
 function seedComposer(prefix: string) {
   const el = document.querySelector<HTMLInputElement | HTMLTextAreaElement>("[data-composer-input]");
   if (!el) return;
@@ -80,17 +78,27 @@ export function CommandPalette(props: PaletteData) {
   const t = useT();
   const { lang, setLang } = useLang();
   const [query, setQuery] = useState("");
-  const [active, setActive] = useState(0);
 
-  const inputRef = useRef<HTMLInputElement | null>(null);
-  const triggerRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    if (open) {
+      setQuery("");
+    }
+  }, [open]);
 
-  // Build the full command list (pre-filter). Only commands whose `when` holds
-  // are included. Runs are appended as dynamic "switch run" commands.
+  // Build the full command list (pre-filter).
   const commands = useMemo<Command[]>(() => {
     const list: Command[] = [];
     const PANEL = t("palette.sec.panels");
     const GENERAL = t("palette.sec.general");
+    const WORKSPACES = "工作区";
+
+    const navigate = (href: string) => () => window.location.assign(href);
+    list.push(
+      { id: "workspace-home", section: WORKSPACES, icon: "grid", label: "Muteki 首页", keywords: "home 首页", run: navigate("/") },
+      { id: "workspace-chat", section: WORKSPACES, icon: "terminal", label: "对话工作区", keywords: "chat conversation 对话", run: navigate("/chat") },
+      { id: "workspace-task", section: WORKSPACES, icon: "crosshair", label: "单题工作区", keywords: "task solve ctf pentest 单题", run: navigate("/task") },
+      { id: "workspace-competition", section: WORKSPACES, icon: "grid", label: "比赛工作区", keywords: "competition contest 比赛", run: navigate("/competitions") },
+    );
 
     // — General —
     list.push({
@@ -101,23 +109,50 @@ export function CommandPalette(props: PaletteData) {
 
     // — Panels (only meaningful once a run has started) —
     if (props.started) {
-      const panels: Array<[ArtifactView, string, IconName, string, string]> = [
-        ["evidence", "palette.cmd.evidence", "list", "e", "evidence 证据 证据链"],
-        ["workers", "palette.cmd.workers", "cpu", "w", "workers worker 详情"],
-        ["graph", "palette.cmd.graph", "network", "g", "graph fact 事实 图"],
-        ["timeline", "palette.cmd.timeline", "clock", "t", "timeline activity 活动 时间线"],
-        ["blackboard", "palette.cmd.blackboard", "board", "b", "blackboard 黑板 知识"],
-        ["findings", "palette.cmd.findings", "alert", "f", "findings review 审查"],
-        ["credentials", "palette.cmd.credentials", "lock", "c", "credentials creds 凭据"],
-        ["pocs", "palette.cmd.pocs", "terminal", "p", "poc payload 工具"],
-        ["routes", "palette.cmd.routes", "network", "r", "routes branches 路线 分支"],
-        ["directives", "palette.cmd.directives", "help", "d", "directives 指令"],
+      // kbd hints come from lib/runtimeTabs.ts so they always match the global key handler.
+      const panels: Array<[ArtifactView, string, IconName, string]> = [
+        ["evidence", "palette.cmd.evidence", "list", "evidence 证据 证据链"],
+        ["workers", "palette.cmd.workers", "cpu", "workers worker 详情"],
+        ["collaboration", "palette.cmd.collaboration", "network", "agents collaboration 协作 拓扑 知识"],
+        ["timeline", "palette.cmd.timeline", "clock", "timeline activity 活动 时间线"],
+        ["findings", "palette.cmd.findings", "alert", "findings review 审查"],
+        ["credentials", "palette.cmd.credentials", "lock", "credentials creds 凭据"],
+        ["pocs", "palette.cmd.pocs", "terminal", "poc payload 工具"],
+        ["routes", "palette.cmd.routes", "network", "routes branches 路线 分支"],
+        ["directives", "palette.cmd.directives", "help", "directives 指令"],
       ];
-      for (const [view, key, icon, kbd, kw] of panels) {
+      for (const [view, key, icon, kw] of panels) {
         list.push({
           id: `panel-${view}`, section: PANEL, icon,
-          label: t(key), keywords: kw, kbd,
+          label: t(key), keywords: kw, kbd: panelHotkey(view),
           run: () => props.onOpenArtifact(view),
+        });
+      }
+      list.push({
+        id: "collab-search",
+        section: PANEL,
+        icon: "search",
+        label: t("palette.cmd.collabSearch"),
+        keywords: "collab search agents map 协作 搜索 /",
+        kbd: "/",
+        sub: t("palette.cmd.collabSearchHint"),
+        run: () => {
+          props.onOpenArtifact("collaboration");
+          requestAnimationFrame(() => {
+            document.querySelector<HTMLInputElement>(".collab-toolbar-search input")?.focus();
+          });
+        },
+      });
+      const AGENTS = t("palette.sec.agents");
+      for (const agent of props.agents ?? []) {
+        list.push({
+          id: `agent-${agent.id}`,
+          section: AGENTS,
+          icon: "cpu",
+          label: agent.title,
+          sub: t("palette.agentMeta", { engine: agent.engine, status: agent.status || "—" }),
+          keywords: `${agent.id} ${agent.engine} ${agent.title} ${agent.status ?? ""} agent worker 协作`,
+          run: () => props.onOpenAgent?.(agent.id),
         });
       }
     }
@@ -129,10 +164,9 @@ export function CommandPalette(props: PaletteData) {
         label: t("palette.cmd.spawnWorker"), keywords: "spawn worker add engine 新增 派发",
         run: () => props.onSpawnWorker(),
       });
-      // B: keyboard-first operator directive — seed `/directive ` then type the text.
       list.push({
         id: "send-directive", section: GENERAL, icon: "send",
-        label: t("palette.cmd.directive"), keywords: "directive steer operator 指令 操作员 转向",
+        label: t("palette.cmd.directive"), keywords: "directive assign steer operator 下达 指令 聚焦 转向 操作员",
         run: () => seedComposer("/directive "),
       });
     }
@@ -154,10 +188,10 @@ export function CommandPalette(props: PaletteData) {
       run: focusComposer,
     });
 
-    // — Switch run (dynamic) — list non-draft runs so typing filters to one.
+    // — Switch run (dynamic) —
     const RUNS = t("palette.sec.runs");
     for (const r of props.runs) {
-      if (r.run_id === props.activeRunId) continue; // already here
+      if (r.run_id === props.activeRunId) continue;
       const status = t(`rail.status.${r.status}`) || r.status;
       list.push({
         id: `run-${r.run_id}`, section: RUNS, icon: "target",
@@ -169,10 +203,9 @@ export function CommandPalette(props: PaletteData) {
     }
     return list;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, props.started, props.running, props.runs, props.activeRunId, lang, t]);
+  }, [open, props.started, props.running, props.runs, props.activeRunId, props.agents, lang, t]);
 
-  // Fuzzy filter = case-insensitive substring across label + keywords + sub. Run
-  // commands are capped so a long history can't bury the static actions.
+  // Fuzzy filter
   const filtered = useMemo<Command[]>(() => {
     const q = query.trim().toLowerCase();
     let runMatches = 0;
@@ -192,126 +225,151 @@ export function CommandPalette(props: PaletteData) {
     return out;
   }, [commands, query]);
 
-  // reset query + selection each time the palette opens; capture the trigger so
-  // focus can be restored on close.
-  useEffect(() => {
-    if (!open) return;
-    triggerRef.current = (document.activeElement as HTMLElement) ?? null;
-    setQuery("");
-    setActive(0);
-    // focus the search input on the next frame (after the modal paints)
-    const id = window.requestAnimationFrame(() => inputRef.current?.focus());
-    return () => {
-      window.cancelAnimationFrame(id);
-      // restore focus to whatever opened the palette
-      triggerRef.current?.focus?.();
-    };
-  }, [open]);
-
-  // keep the highlighted index in range as the filtered list shrinks/grows.
-  useEffect(() => {
-    setActive((i) => (filtered.length === 0 ? 0 : Math.min(i, filtered.length - 1)));
-  }, [filtered.length]);
-
-  if (!open) return null;
-
   const choose = (c: Command | undefined) => {
     if (!c) return;
     onClose();
-    // run AFTER close so a command that moves focus (focus composer) wins the
-    // focus-restore race in the open-effect cleanup.
     c.run();
   };
 
-  const onKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      setActive((i) => (filtered.length ? (i + 1) % filtered.length : 0));
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      setActive((i) => (filtered.length ? (i - 1 + filtered.length) % filtered.length : 0));
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      choose(filtered[active]);
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      e.stopPropagation();
-      onClose();
+  const grouped = useMemo(() => {
+    const sections = new Map<string, Command[]>();
+    for (const command of filtered) {
+      const rows = sections.get(command.section) || [];
+      rows.push(command);
+      sections.set(command.section, rows);
     }
-    // Tab is naturally trapped: the only focusable element is the search input.
-  };
-
-  // group consecutive items by section for header rendering (flat ranked list,
-  // but we show a section label when it changes).
-  let prevSection = "";
+    return [...sections.entries()];
+  }, [filtered]);
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div
-        className="cmdk"
-        role="dialog"
-        aria-modal="true"
-        aria-label={t("palette.title")}
-        onClick={(e) => e.stopPropagation()}
-        onKeyDown={onKeyDown}
-      >
-        <div className="cmdk-search">
-          <Icon name="search" size={16} className="cmdk-search-ico" />
-          <input
-            ref={inputRef}
-            className="cmdk-input"
-            value={query}
-            onChange={(e) => { setQuery(e.target.value); setActive(0); }}
-            placeholder={t("palette.placeholder")}
-            aria-label={t("palette.searchAria")}
-            role="combobox"
-            aria-expanded="true"
-            aria-controls="cmdk-list"
-            aria-activedescendant={filtered[active] ? `cmdk-opt-${filtered[active].id}` : undefined}
-            autoComplete="off"
-            spellCheck={false}
-          />
-          <kbd className="cmdk-esc">esc</kbd>
-        </div>
+    <Modal
+      isOpen={open}
+      onOpenChange={(isOpen) => {
+        if (!isOpen) onClose();
+      }}
+    >
+      <Modal.Backdrop variant="opaque" isDismissable>
+        <Modal.Container
+          size="lg"
+          placement="top"
+          scroll="inside"
+          className="pt-16 sm:pt-20 items-center"
+        >
+          <Modal.Dialog
+            aria-label={t("palette.title")}
+            className="w-full max-w-xl overflow-hidden p-0 rounded-2xl border border-line bg-surface shadow-overlay"
+          >
+            <Modal.Header className="p-3 border-b border-line">
+              <div className="flex items-center gap-2 w-full">
+                <SearchField
+                  value={query}
+                  onChange={setQuery}
+                  aria-label={t("palette.searchAria")}
+                  autoFocus
+                  fullWidth
+                  className="w-full"
+                >
+                  <SearchField.Group className="w-full h-10 border border-line bg-inset/50 rounded-control px-2.5 flex items-center gap-2">
+                    <SearchField.SearchIcon>
+                      <Icon name="search" size={16} className="text-muted shrink-0" />
+                    </SearchField.SearchIcon>
+                    <SearchField.Input
+                      placeholder={t("palette.placeholder")}
+                      autoComplete="off"
+                      spellCheck={false}
+                      className="text-sm text-ink placeholder:text-muted w-full"
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && filtered.length > 0) {
+                          e.preventDefault();
+                          choose(filtered[0]);
+                        }
+                      }}
+                    />
+                    <SearchField.ClearButton aria-label="清除搜索">
+                      <Icon name="x" size={14} />
+                    </SearchField.ClearButton>
+                  </SearchField.Group>
+                </SearchField>
+                <Kbd variant="default" className="shrink-0 text-[11px] font-mono px-1.5 py-0.5">
+                  esc
+                </Kbd>
+              </div>
+            </Modal.Header>
 
-        <div className="cmdk-list selection-glide-host" id="cmdk-list" role="listbox" aria-label={t("palette.title")}>
-          <SelectionGlider selectedKey={filtered[active]?.id ?? ""} selector='.cmdk-item[aria-selected="true"]' className="palette" ensureVisible duration={240} />
-          {filtered.length === 0 ? (
-            <div className="cmdk-empty">{t("palette.empty")}</div>
-          ) : (
-            filtered.map((c, i) => {
-              const header = c.section !== prevSection ? c.section : null;
-              prevSection = c.section;
-              const selected = i === active;
-              return (
-                <div key={c.id}>
-                  {header && <div className="cmdk-sec">{header}</div>}
-                  <div
-                    id={`cmdk-opt-${c.id}`}
-                    data-idx={i}
-                    role="option"
-                    aria-selected={selected}
-                    className={`cmdk-item${selected ? " sel" : ""}`}
-                    onMouseMove={() => setActive(i)}
-                    onClick={() => choose(c)}
-                  >
-                    <Icon name={c.icon} size={16} className="cmdk-item-ico" />
-                    <span className="cmdk-item-body">
-                      <span className="cmdk-item-label">{c.label}</span>
-                      {c.sub && <span className="cmdk-item-sub">{c.sub}</span>}
-                    </span>
-                    {c.kbd && <kbd className="cmdk-item-kbd">{c.kbd}</kbd>}
-                  </div>
+            <Modal.Body className="p-2 max-h-[50vh] overflow-y-auto">
+              {filtered.length === 0 ? (
+                <div className="py-10 text-center text-sm text-muted">
+                  {t("palette.empty")}
                 </div>
-              );
-            })
-          )}
-        </div>
+              ) : (
+                <ListBox
+                  aria-label={t("palette.title")}
+                  onAction={(key) => choose(filtered.find((command) => command.id === String(key)))}
+                  className="w-full p-0 flex flex-col gap-1"
+                >
+                  {grouped.map(([section, sectionCommands]) => (
+                    <ListBox.Section key={section} className="flex flex-col gap-0.5">
+                      <Header className="px-2.5 pt-2 pb-1 text-[11px] font-semibold uppercase tracking-wider text-muted select-none">
+                        {section}
+                      </Header>
+                      {sectionCommands.map((command) => (
+                        <ListBoxItem
+                          id={command.id}
+                          textValue={`${command.label} ${command.sub || ""}`}
+                          key={command.id}
+                          className="group flex w-full items-center justify-between gap-3 rounded-lg px-2.5 py-2 text-sm text-ink cursor-pointer hover:bg-hover data-[focused=true]:bg-hover data-[pressed=true]:scale-[0.99] transition-all outline-none"
+                        >
+                          <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                            <Icon
+                              name={command.icon}
+                              size={16}
+                              className="shrink-0 text-muted group-hover:text-accent group-data-[focused=true]:text-accent transition-colors"
+                            />
+                            <div className="flex flex-col min-w-0 flex-1">
+                              <span className="truncate font-medium text-ink group-hover:text-ink-strong">
+                                {command.label}
+                              </span>
+                              {command.sub && (
+                                <span className="truncate text-xs text-muted">
+                                  {command.sub}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                          {command.kbd && (
+                            <Kbd variant="default" className="shrink-0 text-[11px] font-mono px-1.5 py-0.5">
+                              {command.kbd}
+                            </Kbd>
+                          )}
+                        </ListBoxItem>
+                      ))}
+                    </ListBox.Section>
+                  ))}
+                </ListBox>
+              )}
+            </Modal.Body>
 
-        <div className="cmdk-foot">{t("palette.navHint")}</div>
-      </div>
-    </div>
+            <Modal.Footer className="flex items-center justify-between border-t border-line bg-inset/30 px-3.5 py-2 text-[11px] text-muted font-mono select-none">
+              <div className="flex items-center gap-3">
+                <span className="inline-flex items-center gap-1.5">
+                  <Kbd variant="default" className="px-1.5 py-0.5 text-[10px]">↑↓</Kbd>
+                  <span>{lang === "zh" ? "选择" : "navigate"}</span>
+                </span>
+                <span className="opacity-40">·</span>
+                <span className="inline-flex items-center gap-1.5">
+                  <Kbd variant="default" className="px-1.5 py-0.5 text-[10px]">↵</Kbd>
+                  <span>{lang === "zh" ? "执行" : "run"}</span>
+                </span>
+                <span className="opacity-40">·</span>
+                <span className="inline-flex items-center gap-1.5">
+                  <Kbd variant="default" className="px-1.5 py-0.5 text-[10px]">esc</Kbd>
+                  <span>{lang === "zh" ? "关闭" : "close"}</span>
+                </span>
+              </div>
+            </Modal.Footer>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </Modal>
   );
 }
-
-export default CommandPalette;

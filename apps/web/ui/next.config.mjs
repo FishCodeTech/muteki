@@ -9,6 +9,9 @@
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  // Allow an isolated production build while the normal `.next` directory is
+  // serving an active development session. The default remains unchanged.
+  distDir: process.env.MUTEKI_NEXT_DIST_DIR || ".next",
   // P2-v3: standalone output for the compose `ui` image and bare-host `run.sh web`
   // path (a self-contained server bundle — no full node_modules in the runtime layer).
   output: "standalone",
@@ -19,6 +22,12 @@ const nextConfig = {
   // of its conversation (only reproduces behind the standalone server / docker,
   // not next dev). text/event-stream must never be compressed; disable Next gzip.
   compress: false,
+  // HeroUI exposes a large barrel entrypoint. Rewriting named imports to its
+  // component entrypoints keeps webpack dev compilations focused on components
+  // used by the current route instead of traversing the complete UI library.
+  experimental: {
+    optimizePackageImports: ["@heroui/react"],
+  },
 };
 
 export default nextConfig;

@@ -19,7 +19,7 @@
   <a href="https://github.com/FishCodeTech/muteki/issues"><img src="https://img.shields.io/github/issues/FishCodeTech/muteki" alt="Issues"></a>
   <a href="https://github.com/FishCodeTech/muteki/pulls"><img src="https://img.shields.io/github/issues-pr/FishCodeTech/muteki" alt="PRs"></a>
   <img src="https://img.shields.io/badge/NYU_CTF_Bench-200%2F200_solved-brightgreen" alt="Benchmark">
-  <img src="https://img.shields.io/badge/engines-9_CLIs-orange" alt="Engines: Claude, Codex, Cursor, Pi, OMP, Kimi, Grok, OpenCode, DeepSeek Harness">
+  <img src="https://img.shields.io/badge/engines-8_active_CLIs-orange" alt="八类可用 CLI 引擎；DeepSeek Harness 仅登记并暂不支持">
 </p>
 
 <p align="center">
@@ -27,20 +27,20 @@
 </p>
 
 <p align="center">
-<a href="https://www.star-history.com/?type=date&repos=fishcodetech%2Fmuteki">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=fishcodetech/muteki&type=date&theme=dark&legend=top-left&sealed_token=vc5ui3lb58WYq6M_OxJxFxhljtWwz7lvILAOd7RrD3vDJqvJq4jyPgfCQAq59gjzAmnYMdjLpJ80k_2PpNe-_nYL1Jf5RxCVVbHHiqrMdmCW0UHU43ZYMg" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=fishcodetech/muteki&type=date&legend=top-left&sealed_token=vc5ui3lb58WYq6M_OxJxFxhljtWwz7lvILAOd7RrD3vDJqvJq4jyPgfCQAq59gjzAmnYMdjLpJ80k_2PpNe-_nYL1Jf5RxCVVbHHiqrMdmCW0UHU43ZYMg" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=fishcodetech/muteki&type=date&legend=top-left&sealed_token=vc5ui3lb58WYq6M_OxJxFxhljtWwz7lvILAOd7RrD3vDJqvJq4jyPgfCQAq59gjzAmnYMdjLpJ80k_2PpNe-_nYL1Jf5RxCVVbHHiqrMdmCW0UHU43ZYMg" />
- </picture>
-</a>
+  <a href="https://www.star-history.com/#fishcodetech/muteki&amp;Date">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date&amp;theme=dark">
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date">
+      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date">
+    </picture>
+  </a>
 </p>
 
 ---
 
 这是一款 **真正意义上的开源的多模型 CTF 求解 AI agent 蜂群。** 目标就是成为如项目名称，**無敵 · Project Muteki**
 
-项目核心是实现了一套ai agent的调度方案，自动、智能化协调控制每个agent的上下文，像蜂群一样，各有分工，但都是为了完成最终的目标。当前 Worker 引擎为 Claude、Codex、Cursor、Pi、OMP、Kimi、Grok、OpenCode、DeepSeek Harness。
+项目核心是实现了一套ai agent的调度方案，自动、智能化协调控制每个agent的上下文，像蜂群一样，各有分工，但都是为了完成最终的目标。当前可用 Worker 引擎为 Claude、Codex、Cursor、Pi、OMP、Kimi、Grok、OpenCode。DeepSeek Harness 保留登记项，但暂不允许配置或执行。
 
 Muteki就是为了解决单一ai agent在解决一个目标是极其容易陷入一个点死循环，无法自拔，无法完成最终的目标，并且单一agent效率极低，我设计了一套架构来解决这个问题，他可能不是最完美的，我将继续不断迭代升级。
 
@@ -88,7 +88,7 @@ nyuctf benchmark全题目测评成绩，可看文章结尾
 
 ## 架构
 
-無敵让一群异构的编码 Agent（Claude、Codex、Cursor、Pi、OMP、Kimi、Grok、OpenCode、DeepSeek Harness）扑同一道题，在一张**共享黑板**上协作：谁发现的事实大家都能用，谁走过的死路大家都不再试，而 flag 只有**逐字出现在真实执行输出里**才被接受。核心不是「换个更强的脑子」，而是 **异构 + 共享证据 + 溯源闸门**。
+無敵让一群异构的编码 Agent（Claude、Codex、Cursor、Pi、OMP、Kimi、Grok、OpenCode）处理同一道题，在一张**共享黑板**上协作：谁发现的事实大家都能用，谁走过的死路大家都不再试，而 flag 只有**逐字出现在真实执行输出里**才被接受。核心是 **异构 + 共享证据 + 溯源闸门**。
 
 而 worker 是怎么把数据交到平台、又怎么看到队友进展的？**全靠每个 worker 内置的 `muteki-blackboard` skill**——这是 worker 与黑板之间唯一的数据通道。
 
@@ -138,7 +138,9 @@ Web 默认使用 Coordinator，并可先跑一轮可选的 race-scout。TUI 的 
 
 ### 内置升级
 
-应用升级不再要求执行 `git pull`。首次安装会创建托管应用目录，并继续使用现有 `.env` 和 `sessions` 路径。后续升级使用原子方式切换版本，同时保留一个上一版本用于回滚。
+应用升级不再要求执行 `git pull`。首次安装会创建托管应用目录，并继续使用现有
+`.env`、`sessions` 和 `state` 路径。后续升级使用原子方式切换版本，同时保留一个
+上一版本用于回滚。
 
 ```bash
 ./run.sh upgrade --check       # 检查最新稳定版本
@@ -188,7 +190,6 @@ Muteki **套壳调用**下面的 Worker 引擎 CLI；装好并认证你想用的
 | `kimi` | `kimi` | Moonshot | Kimi Code 登录目录 |
 | `grok` | `grok` | xAI | Grok 登录目录 |
 | `opencode` | `opencode` | OpenCode | API key |
-| `dsh` | DeepSeek Harness worker | DeepSeek | API key |
 
 
 至少需要其中一个才能跑。还可在 worker profile 里配置**自定义 OpenAI 兼容端点**
@@ -225,7 +226,7 @@ Muteki **套壳调用**下面的 Worker 引擎 CLI；装好并认证你想用的
 - `**container`** 模式下账户是**必须的** —— 宿主登录不会挂进容器，会通过命令注入和文件挂在的方式将凭据挂到容器里
 - `**local`** 模式下,若没注册账户,worker 会继承宿主 CLI 已有的登录，当然你也可以手工配置。
 
-DeepSeek 推理模型（协调器用）单独通过 `.env` 里的 `MUTEKI_DEEPSEEK_API_KEY`配置。DeepSeek Harness（`dsh`）是单独的 Worker 引擎，在 Worker 设置里配置。
+协调器使用的 DeepSeek 推理模型继续通过 `.env` 里的 `MUTEKI_DEEPSEEK_API_KEY` 配置。DeepSeek Harness（`dsh`）仅保留锁定的登记项和历史数据识别；上游 CLI 补齐结构化事件、工具结果和会话恢复能力后再开放。
 
 ![image-20260624184600517](./assets/image-20260624184600517.png)
 
@@ -264,7 +265,7 @@ MUTEKI_WORKER_IMAGE=ghcr.io/fishcodetech/muteki-worker-slim:latest ./run.sh web
 ./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim v0.3.2 amd64
 ```
 
-完整镜像会比较大(Kali headless + Ghidra + 经 conda 装的 SageMath + 离线知识库)。只有在你明确知道 worker 可以在运行中自行安装缺失工具时，才建议用 slim 镜像跑真实题目。
+完整镜像会比较大(Kali headless + 经 conda 装的 SageMath + 离线知识库)。只有在你明确知道 worker 可以在运行中自行安装缺失工具时，才建议用 slim 镜像跑真实题目。
 
 ---
 
@@ -300,11 +301,13 @@ MUTEKI_WORKER_IMAGE=ghcr.io/fishcodetech/muteki-worker-slim:latest ./run.sh web
 - **`ui`** —— Next 命令台，`/api` 反代到 `web-api`。
 - **worker** 不是 compose 服务 —— 由 `web-api` 每次 run 时 `docker run` 拉一个。
 
-持久化的操作指令 journal 与 SecretStore 只放在协调器私有的
-`MUTEKI_COORDINATOR_CONTROL_ROOT`（compose 默认为
-`$MUTEKI_HOST_DATA_ROOT/coordinator-control`）。该路径不会挂进 worker，也不会
-进入 worker workspace 的属主改写。每个 run 在 workspace 旁有独立的 sibling bootstrap
-目录 `.muteki_rcp`，仅挂载到 worker 内的 `/run/muteki/control`，只携带反向连接的启动 token。
+每个 Run 始终只有一份工作区：`MUTEKI_SESSIONS_ROOT/<run-id>/workspace`，本地
+Worker、独立容器和共享容器都使用它。服务状态与凭据位于 `MUTEKI_STATE_ROOT`，
+持久化操作指令 journal 位于协调器私有的 `MUTEKI_COORDINATOR_CONTROL_ROOT`
+（compose 分别默认为 `$MUTEKI_HOST_DATA_ROOT/state` 及其 `control` 子目录）。这些
+路径不会挂进 worker，也不会进入 worker workspace 的属主改写。每个容器的启动
+材料位于 `state/runtime/rcp`，仅短暂挂载到 worker 内的 `/run/muteki/control`，
+只携带反向连接的启动 token。
 
 ```bash
 # 1. 宿主 daemon 上要先有 worker 镜像。
@@ -410,66 +413,69 @@ Muteki 在 **NYU CTF Bench** `test` 集(CSAW 2017–2023,共 200 题)上做了�
 
 ### 单个 runner（题目）的工作目录
 
-每发起一道题就是一个 **run**。它在 `sessions/` 下的工作路径和结构如下——`host` 与 `container` 两种后端的 worker 看到的是同一套布局：
+每发起一道题就是一个 **Run**。本地 Worker、独立 Run 容器和共享容器都使用
+`sessions/` 下的同一份工作区；Coordinator 权威状态单独放在 `state/`：
 
 ```
 sessions/
-├── run-XXXX.jsonl              # 这道题的「事件流」：SSE 回放 / 断点续传的真相源（一行 = 一个事件）
-├── run-XXXX/                   # 这道题的工作根目录
-│   ├── uploads/                # 网页上传的原始题目文件（未加工；加工后进 workspace/inputs）
-│   └── workspace/              # 这道题的工作区
-│       ├── inputs/             # 不可变的题目输入（内容寻址 CAS）
-│       │   ├── objects/        #    CAS 对象库（按 sha256 分桶存）
-│       │   └── by-name/        #    按原始文件名 → 对象的符号链接
-│       ├── shared/             # worker 之间共享的产出物（CAS）
-│       │   ├── objects/        #    CAS 对象库
-│       │   ├── links/          #    按名字 → 对象的符号链接
-│       │   └── index.jsonl     #    共享产物索引（可重建的物化视图）
-│       ├── graph/
-│       │   └── shared_graph.db #    ★ 共享黑板：事件溯源 SQLite，唯一事实来源（facts/intents/dead-ends/...）
-│       ├── arts/               # 工件库：工具输出 / 转录快照（<hex>.txt，按 artifact_id 寻址、可 peek 回看）
-│       ├── workers/            # 每个 worker 各自的 cwd（scratch）
-│       │   └── cli-codex-2/    #    一个 worker 的工作目录（agent 临时文件 + 指向 inputs/shared 的相对符号链接）
-│       ├── homes/              # 每个 worker 的隔离 HOME（容器模式尤其需要）
-│       ├── final/              # 最终产物
-│       ├── tmp/                # 临时目录
-│       ├── logs/               # 日志
-│       ├── manifest.json       # 工作区清单：拓扑 + inputs 列表 + runtime 元数据
-│       ├── winner.json         # 胜出 worker 的续接句柄（解出后追问 / 写 writeup / 复盘用）
-│       ├── writeup.md          # （解出后生成的）题解，可选
-│       └── .muteki_board.md    # 黑板快照：写给 worker 直接读的 Markdown 版
-│
-├── _secrets/accounts/<id>/     # 凭据账号库（目录 0700 / 文件 0600，从不进镜像或 prompt）
-├── _worker_config.json         # 全局 worker 配置（引擎名册 / profile）
-└── _rail_meta.json             # 导轨元数据（run 列表的名字 / 顺序）
+└── run-XXXX/                   # 单个 Run 的 Worker 可见根目录
+    ├── uploads/                # 网页上传的原始文件
+    └── workspace/              # 所有 Worker 后端共用的唯一工作区
+        ├── inputs/             # 不可变题目输入（内容寻址 CAS）
+        │   ├── objects/
+        │   └── by-name/
+        ├── shared/             # Worker 间共享产物（CAS）
+        │   ├── objects/
+        │   ├── links/
+        │   └── index.jsonl
+        ├── arts/               # 工具输出与转录快照
+        ├── workers/            # 每个 Worker 的独立 scratch cwd
+        ├── homes/              # 隔离 HOME
+        ├── final/              # 最终产物
+        ├── tmp/
+        ├── logs/
+        ├── manifest.json
+        ├── winner.json
+        ├── writeup.md
+        └── .muteki_board.md
+
+state/                          # Coordinator 私有，不作为 Worker 工作区挂载
+├── run-XXXX.jsonl              # 用于回放与恢复的持久事件流
+├── control/
+│   ├── graphs/run-XXXX/shared_graph.db  # 权威 SharedGraph
+│   └── run-XXXX/control.db              # 每 Run 控制日志
+├── runtime/
+│   ├── account-projections/    # 临时容器凭据投影
+│   └── rcp/                    # 一次性反向控制启动材料
+├── _platform/                  # 产品数据库与扩展状态
+├── _secrets/accounts/<id>/     # 私有凭据账号库
+├── _worker_config.json
+└── _rail_meta.json
 ```
 
 几个要点：
 
-- `**run-XXXX.jsonl`（事件历史）** 和 `**run-XXXX/`（干活的文件）** 用同一个 run id 关联：前者能重放给前端，后者是真正落盘的工作区。
-- `**inputs/` 和 `shared/` 都是内容寻址（CAS）**：同一份文件只存一份，worker 目录里全是相对符号链接——所以 `workers/` 可随用随删而不丢数据。
-- `**graph/shared_graph.db` 是核心**：黑板的全部状态都在这；worker 通过 `muteki-blackboard` skill 读写它。
-- **收尾只清 `workers/` 下非 winner 的 scratch**，`shared/`、`graph/`、`arts/`、`final/`、`winner.json` 都保留，所以一道题跑完后仍可完整复盘。
+- **`state/run-XXXX.jsonl` 与 `sessions/run-XXXX/`** 使用同一个 Run id 关联。
+- **`inputs/` 和 `shared/` 都是内容寻址（CAS）**：同一份文件只存一份，Worker 目录使用相对符号链接，因此 `workers/` 可随用随删而不丢数据。
+- **`state/control/graphs/<run-id>/shared_graph.db` 是权威图**：Worker 通过按角色约束的 `muteki-blackboard` 接口访问，不挂载数据库文件。
+- **收尾只清 `workers/` 下非 winner 的 scratch**；`shared/`、`arts/`、`final/`、`winner.json`、事件和 Coordinator 状态均保留，可继续复盘。
 
 ---
 
-## 测试
+## 验证
 
 ```bash
-uv run --extra dev python -m pytest -q     # Python 套件，固定使用项目解释器
-go test -C cmd/runtime-agent ./...         # Go supervisor(module 在 cmd/runtime-agent/ 下)
 ( cd apps/web/ui && npx tsc --noEmit )     # UI 类型检查
 ```
 
+产品验收证据来自真实生产运行和浏览器操作。仓库不保留自动化测试套件。
+
 ---
 
-## 后续 TODO
+## 当前进展与任务
 
-- [ ] 继续打磨容器模式
-- [ ] 持续迭代升级 web UI 体验
-- [ ] TUI 接入当前 Coordinator 与 Worker Settings（暂缓）
-- [ ] 额外 Worker 引擎，例如 ZAI（暂缓）
-- [ ] 全自动爬 CTF 平台题目，自动解题，自动提交，自动生成报告（暂缓）
+P1 授权比赛平台验收和 P2 部署与可选路径验收均已完成。仓库只维护一份任务清单：
+[`docs/current_iteration_todo.md`](docs/current_iteration_todo.md)。README 不再复制待办项，避免状态重复和失效。
 
 ---
 

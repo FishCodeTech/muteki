@@ -502,7 +502,7 @@ class SwarmF11(Swarm):
             return
         # T07 ledger: the base Swarm never calls framework_record_worker_outcome
         # (dormant hook), so cost + the +30% breaker learn from intent_concluded
-        # events on the append-only log instead (f05/f10 pattern).
+        # events on the append-only log instead (f05 pattern).
         try:
             self._f11_settle_costs_from_events()
         except Exception:
@@ -688,7 +688,7 @@ class SwarmF11(Swarm):
         """T07 ledger feed from intent_concluded graph events (idempotent).
 
         The base Swarm never calls ``framework_record_worker_outcome`` (dormant
-        hook upstream — same finding as f04/f05/f10), so the team cost ledger
+        hook upstream — same finding as f04/f05), so the team cost ledger
         and the +30% circuit breaker learn from the append-only event log
         instead. Only intents owned by this team's members count, and only
         when the event carries a real cost — no fabricated numbers. The seq

@@ -3,7 +3,7 @@
 These are OPERATOR preferences, not part of the event-sourced solve. Keeping them
 out of the per-run JSONL (which is the immutable solve log) means the rail can be
 reorganized freely without polluting the replayable history. One small JSON file
-under the sessions root, loaded on startup and rewritten on every mutation (the
+under the private state root, loaded on startup and rewritten on every mutation (the
 table is tiny — a few dozen rows at most).
 """
 
@@ -12,11 +12,183 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+from muteki.core.events import Event, EventType
+
+if TYPE_CHECKING:
+    from apps.web.run_state import Run
+    from muteki.core.session_store import SessionStore
+
+
+class RunSummaryStore:
+    """Small durable projection used to rebuild the run rail at startup.
+
+    The JSONL files remain the source of truth and are still replayed on demand.
+    This index only contains the fields needed to create lightweight historical
+    Run handles, plus unfinished follow-up lifecycle state used by crash recovery.
+    """
+
+    _VERSION = 1
+    _FIELDS = (
+        "run_id", "name", "category", "started", "finished", "solved",
+        "flag", "flags", "expected_flags", "multi_flag", "events", "ts",
+        "execution_generation", "stream_seq", "terminal_generations",
+        "pending_followups",
+    )
+    _PERSISTED_EVENT_TYPES = frozenset({
+        EventType.RUN_PREPARING,
+        EventType.RUN_STARTED,
+        EventType.RUN_TITLED,
+        EventType.RUN_FINISHED,
+        EventType.RUN_REOPENED,
+        EventType.INSIGHT_BUS_EVENT,
+        EventType.FLAG_ACCEPTED,
+        EventType.BLACKBOARD_DELTA,
+        EventType.FOLLOWUP_STARTED,
+        EventType.FOLLOWUP_COMPLETED,
+        EventType.FOLLOWUP_FAILED,
+    })
+
+    def __init__(self, root: str | Path = "state") -> None:
+        self.path = Path(root) / "_run_summaries.json"
+        self._data: dict[str, dict[str, Any]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict) or raw.get("version") != self._VERSION:
+                return
+            rows = raw.get("runs")
+            if isinstance(rows, dict):
+                self._data = {
+                    str(run_id): dict(row)
+                    for run_id, row in rows.items()
+                    if isinstance(row, dict)
+                }
+        except (json.JSONDecodeError, OSError):
+            self._data = {}
+
+    def _flush(self) -> None:
+        temporary = self.path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps({
+            "version": self._VERSION,
+            "runs": self._data,
+        }, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        temporary.replace(self.path)
+
+    @classmethod
+    def _clean(cls, summary: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: summary.get(key)
+            for key in cls._FIELDS
+            if key in summary
+        }
+
+    def summaries(self, store: "SessionStore") -> list[dict[str, Any]]:
+        """Return every summary, building missing legacy rows only once."""
+        changed = False
+        rows: list[dict[str, Any]] = []
+        run_ids = store.list_runs()
+        live_ids = set(run_ids)
+        for run_id in run_ids:
+            cached = self._data.get(run_id)
+            if cached is None:
+                cached = self._clean(store.summary(run_id, bounded=True))
+                self._data[run_id] = cached
+                changed = True
+            rows.append(dict(cached))
+        stale_ids = set(self._data).difference(live_ids)
+        if stale_ids:
+            for run_id in stale_ids:
+                self._data.pop(run_id, None)
+            changed = True
+        if changed:
+            self._flush()
+        rows.sort(key=lambda row: float(row.get("ts") or 0.0), reverse=True)
+        return rows
+
+    def update(self, run: "Run", event: Event) -> None:
+        """Project a state-changing durable event after the JSONL sink accepts it."""
+        if event.event_type not in self._PERSISTED_EVENT_TYPES:
+            return
+        if (event.event_type is EventType.BLACKBOARD_DELTA
+                and str(event.payload.get("kind") or "") not in {
+                    "flag_found", "flag_invalidated", "awaiting_operator",
+                    "collect_idle", "operator_resumed", "operator_stopped",
+                }):
+            return
+        if (event.event_type is EventType.INSIGHT_BUS_EVENT
+                and event.payload.get("kind") != "FlagFound"):
+            return
+        previous = self._data.get(run.run_id, {})
+        pending = dict(previous.get("pending_followups") or {})
+        followup_id = str(event.payload.get("followup_id") or "")
+        if event.event_type is EventType.FOLLOWUP_STARTED:
+            key = followup_id or f"legacy:{event.seq}"
+            pending[key] = {
+                "followup_id": followup_id,
+                "kind": str(event.payload.get("kind") or "ask"),
+                "execution_generation": event.payload.get("execution_generation"),
+                "recovery_id": f"interrupted-followup:{event.seq}:{followup_id}",
+            }
+        elif event.event_type in {
+            EventType.FOLLOWUP_COMPLETED, EventType.FOLLOWUP_FAILED,
+        }:
+            if followup_id:
+                pending.pop(followup_id, None)
+            else:
+                legacy_key = next(
+                    (key for key in reversed(pending)
+                     if not pending[key].get("followup_id")),
+                    None,
+                )
+                if legacy_key is not None:
+                    pending.pop(legacy_key, None)
+
+        flags = list(run.flags)
+        solved = run.solved
+        if event.event_type is EventType.INSIGHT_BUS_EVENT:
+            flag = event.payload.get("flag")
+            if flag is not None and flag not in flags:
+                flags.append(flag)
+            solved = (
+                len(flags) >= run.expected_flags
+                if run.multi_flag else bool(flags)
+            )
+        row = {
+            "run_id": run.run_id,
+            "name": run.name or run.run_id,
+            "category": run.category,
+            "started": run.started,
+            "finished": run.finished,
+            "solved": solved,
+            "flag": flags[0] if flags else None,
+            "flags": flags,
+            "expected_flags": run.expected_flags,
+            "multi_flag": run.multi_flag,
+            "events": int(previous.get("events") or 0) + 1,
+            "ts": float(event.ts or 0.0),
+            "execution_generation": run.execution_generation,
+            "stream_seq": max(
+                int(previous.get("stream_seq") or 0), int(event.seq or 0)),
+            "terminal_generations": sorted(run.terminal_generations),
+            "pending_followups": pending,
+        }
+        self._data[run.run_id] = self._clean(row)
+        self._flush()
+
+    def forget(self, run_id: str) -> None:
+        if run_id in self._data:
+            self._data.pop(run_id, None)
+            self._flush()
 
 
 class RunMetaStore:
-    def __init__(self, root: str | Path = "sessions") -> None:
+    def __init__(self, root: str | Path = "state") -> None:
         self.path = Path(root) / "_rail_meta.json"
         self._data: dict[str, dict[str, Any]] = {}
         self._load()
@@ -127,7 +299,7 @@ class FolderStore:
     """Operator-created rail folders (id → name + order). A tiny JSON side-table,
     separate from the per-run meta so folders persist independently of any run."""
 
-    def __init__(self, root: str | Path = "sessions") -> None:
+    def __init__(self, root: str | Path = "state") -> None:
         self.path = Path(root) / "_folders.json"
         self._data: dict[str, dict[str, Any]] = {}
         self._seq = 0

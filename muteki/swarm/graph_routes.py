@@ -25,7 +25,8 @@ from muteki.swarm.graph_defs import (  # noqa: F401
     EV_INTENT_PROPOSED, EV_INTENT_CLAIMED, EV_INTENT_CONCLUDED, EV_FLAG_FOUND,
     EV_FLAG_INVALIDATED, EV_POC_SAVED, EV_POC_CLAIMED, EV_POC_CONCLUDED,
     EV_REVIEW_FINDING, EV_FACT_CHALLENGED, EV_FACT_REVALIDATED,
-    EV_ROUTE_SUPPRESSED, EV_ROUTE_REOPENED, EV_BRANCH_SPLIT, EV_BRANCH_RESOLVED,
+    EV_ROUTE_SUPPRESSED, EV_ROUTE_REOPENED, EV_BRANCH_SPLIT,
+    EV_BRANCH_FACTS_BOUND, EV_BRANCH_RESOLVED,
     EV_COORDINATOR_DIRECTIVE, EV_REVIEW_PROPOSAL, EV_REVIEW_PROPOSAL_DECISION,
     EV_LANE_LOCKED, EV_LANE_RELEASED, EV_INTENT_LANE_DEFERRED, EV_FACT_REJECTED,
     EV_FACT_MERGED, EV_FACT_SUPERSEDED, EV_FACT_PINNED, EV_INTENT_STATE_CHANGED,
@@ -166,30 +167,156 @@ class _RoutesDirectivesMixin:
                 "reopened": reopened}
 
     def split_branch(self, *, actor: str, title: str,
-                     branches: list[dict[str, Any]]) -> dict:
-        parent = f"branch-{hashlib.sha1((title or str(time.time())).encode()).hexdigest()[:10]}"
-        payload = {"branch_id": parent, "title": title, "branches": branches}
+                     branches: list[dict[str, Any]],
+                     parent_id: str = "") -> dict:
+        parent = (parent_id or "").strip() or (
+            f"branch-{hashlib.sha1((title or str(time.time())).encode()).hexdigest()[:10]}"
+        )
+        ctf_mode = getattr(self.challenge, "mode", "ctf") == "ctf"
+        try:
+            active_fact_seqs = (
+                self._active_fact_seq_set() if ctf_mode else None
+            )
+        except Exception:
+            active_fact_seqs = set() if ctf_mode else None
+        normalized_branches: list[dict[str, Any]] = []
+        for raw in branches:
+            branch = dict(raw)
+            if active_fact_seqs is not None:
+                valid_sources: set[int] = set()
+                for raw_seq in list(raw.get("from_facts") or []):
+                    try:
+                        fact_seq = int(raw_seq)
+                    except (TypeError, ValueError):
+                        continue
+                    if fact_seq > 0 and fact_seq in active_fact_seqs:
+                        valid_sources.add(fact_seq)
+                branch["from_facts"] = sorted(valid_sources)
+            normalized_branches.append(branch)
+        payload = {
+            "branch_id": parent,
+            "title": title,
+            "branches": normalized_branches,
+        }
         seq = self._append(EV_BRANCH_SPLIT, actor, payload,
-                           dedupe_key=f"branch-split::{title}::{len(branches)}")
+                           dedupe_key=(
+                               f"branch-split::{parent}::{title}::{len(normalized_branches)}"))
         with self._lock:
-            for raw in branches:
+            for raw in normalized_branches:
                 bid = str(raw.get("id") or "").strip() or (
                     f"{parent}-{hashlib.sha1(str(raw).encode()).hexdigest()[:6]}")
                 self._conn.execute(
                     "INSERT INTO branches "
                     "(branch_id, challenge_id, parent_id, title, assumption, "
-                    " prove_or_disprove, status, created_seq) "
-                    "VALUES (?,?,?,?,?,?,?,?) "
+                    " prove_or_disprove, source_intent, from_facts_json, "
+                    " expected_observable, stop_condition, coverage_key, route_hash, "
+                    " lane_key, risk_class, resource_key, "
+                    " status, created_seq) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT(branch_id) DO UPDATE SET "
                     " title=excluded.title, assumption=excluded.assumption, "
-                    " prove_or_disprove=excluded.prove_or_disprove, status='open'",
+                    " prove_or_disprove=excluded.prove_or_disprove, "
+                    " source_intent=excluded.source_intent, "
+                    " from_facts_json=excluded.from_facts_json, "
+                    " expected_observable=excluded.expected_observable, "
+                    " stop_condition=excluded.stop_condition, "
+                    " coverage_key=excluded.coverage_key, route_hash=excluded.route_hash, "
+                    " lane_key=excluded.lane_key, risk_class=excluded.risk_class, "
+                    " resource_key=excluded.resource_key, "
+                    " status='open'",
                     (bid, self.challenge.id, parent, title,
                      str(raw.get("assumption") or "").strip(),
                      str(raw.get("prove_or_disprove") or "").strip(),
+                     str(raw.get("source_intent") or "").strip(),
+                     json.dumps(list(raw.get("from_facts") or [])),
+                     str(raw.get("expected_observable") or "").strip(),
+                     str(raw.get("stop_condition") or "").strip(),
+                     str(raw.get("coverage_key") or "").strip(),
+                     str(raw.get("route_hash") or "").strip(),
+                     str(raw.get("lane_key") or "").strip(),
+                     str(raw.get("risk_class") or "").strip(),
+                     str(raw.get("resource_key") or "").strip(),
                      "open", seq if seq > 0 else 0),
                 )
             self._conn.commit()
         return {"branch_id": parent, "seq": seq}
+
+    def bind_open_branch_facts(self, *, actor: str, source_intent: str,
+                               fact_seqs: list[int]) -> dict:
+        """Ground pending branch handoffs in their source Intent's commit."""
+        source = str(source_intent or "").strip()
+        if (getattr(self.challenge, "mode", "ctf") != "ctf"
+                or not source):
+            return {"branch_ids": [], "fact_seqs": [], "seq": 0}
+        try:
+            active = self._active_fact_seq_set()
+        except Exception:
+            active = set()
+        incoming_set: set[int] = set()
+        for raw_seq in list(fact_seqs or []):
+            try:
+                fact_seq = int(raw_seq)
+            except (TypeError, ValueError):
+                continue
+            if fact_seq > 0 and fact_seq in active:
+                incoming_set.add(fact_seq)
+        incoming = sorted(incoming_set)
+        if not incoming:
+            return {"branch_ids": [], "fact_seqs": [], "seq": 0}
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT branch_id, from_facts_json FROM branches "
+                    "WHERE challenge_id=? AND source_intent=? AND status='open' "
+                    "ORDER BY created_seq, branch_id",
+                    (self.challenge.id, source),
+                ).fetchall()
+                updates: list[tuple[str, list[int]]] = []
+                for branch_id, raw_facts in rows:
+                    try:
+                        existing = set()
+                        for raw_value in json.loads(raw_facts or "[]"):
+                            value = int(raw_value)
+                            if value > 0 and value in active:
+                                existing.add(value)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        existing = set()
+                    merged = sorted(existing | set(incoming))
+                    if merged != sorted(existing):
+                        updates.append((str(branch_id), merged))
+                if not updates:
+                    return {"branch_ids": [], "fact_seqs": incoming, "seq": 0}
+                branch_ids = [branch_id for branch_id, _facts in updates]
+                payload = {
+                    "source_intent": source,
+                    "branch_ids": branch_ids,
+                    "from_facts": incoming,
+                }
+                digest = hashlib.sha1(
+                    json.dumps(payload, sort_keys=True).encode("utf-8", "ignore")
+                ).hexdigest()[:16]
+                seq = self._append_locked(
+                    EV_BRANCH_FACTS_BOUND,
+                    actor,
+                    payload,
+                    dedupe_key=f"branch-facts::{source}::{digest}",
+                )
+                if seq < 0:
+                    self._conn.rollback()
+                    return {"branch_ids": [], "fact_seqs": incoming, "seq": -1}
+                self._conn.executemany(
+                    "UPDATE branches SET from_facts_json=? "
+                    "WHERE challenge_id=? AND branch_id=? AND status='open'",
+                    [
+                        (json.dumps(facts), self.challenge.id, branch_id)
+                        for branch_id, facts in updates
+                    ],
+                )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        return {"branch_ids": branch_ids, "fact_seqs": incoming, "seq": seq}
 
     def resolve_branch(self, *, actor: str, branch_id: str, reason: str = "",
                        status: str = "resolved") -> dict:
@@ -569,7 +696,7 @@ class _RoutesDirectivesMixin:
         """The directive texts the planner must prioritize (highest-priority first)."""
         return [d["text"] for d in self.operator_directives(active_only=True) if d.get("text")]
 
-    # ── F: classified HITL requests (need_kind drives auto vs operator pause) ──
+    # ── Durable HITL requests ────────────────────────────────────────────
     def add_hitl_request(self, *, worker: str, need: str, need_kind: str,
                          classification_confidence: float = 1.0,
                          status: str = "classified",
@@ -577,8 +704,9 @@ class _RoutesDirectivesMixin:
                          directive_id: Optional[str] = None,
                          resource_lock_id: Optional[str] = None,
                          auto_action_seq: Optional[int] = None) -> dict:
-        """F: record a classified worker hand-raise. need_kind decides downstream
-        handling (external_blocker pauses; the others auto-resolve)."""
+        """Record a worker hand-raise. ``need_kind`` is retained in the durable
+        row for historical compatibility; new NEED_INPUT requests all wait for
+        the operator instead of triggering a text-classified automatic action."""
         nk = (need_kind or "external_blocker").strip()
         rid = str(request_id or "").strip()[:128]
         if not rid:

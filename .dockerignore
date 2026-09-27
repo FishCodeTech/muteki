@@ -29,6 +29,10 @@ dist/
 # huge: raw disk images, recovered artifacts, per-run worker workspaces
 retest_runs/
 sessions/
+state/
+*-state/
+.manual-runtime/
+run-*/
 data/
 *.img
 *.qcow2
@@ -45,3 +49,4 @@ apps/web/ui/node_modules/
 *.log
 .DS_Store
 docs/_local/
+**/.last-engine-versions.txt

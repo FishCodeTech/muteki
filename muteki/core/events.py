@@ -24,14 +24,17 @@ class EventType(str, Enum):
     RUN_FINISHED = "run.finished"
     RUN_REOPENED = "run.reopened"  # a terminal run was re-opened (continue solving
     #   or flag marked false-positive) — rail flips solved/finished→running
-    FLAG_ACCEPTED = "flag.accepted"  # CAS/outbox-verified Protocol 2 publication;
+    FLAG_ACCEPTED = "flag.accepted"  # historical Protocol 2 publication event;
+    #   retained so replay of old session logs stays tolerant (no live producer)
     FOLLOWUP_STARTED = "followup.started"  # post-run Ask/Writeup lifecycle; these
     FOLLOWUP_COMPLETED = "followup.completed"  # events never reopen/finish the run
     FOLLOWUP_FAILED = "followup.failed"
+    PROGRESS_BRIEF = "progress.brief"  # durable, user-facing run progress summary
     #   accepted-only visibility does not imply solved, finished, or clean closure
-    PROJECTION_INCOMPLETE = "projection.incomplete"  # non-terminal, redacted startup
+    PROJECTION_INCOMPLETE = "projection.incomplete"  # non-terminal startup
     #   reconciliation diagnostic; never carries candidate/CAS/credential material
     WORKER_STATUS = "worker.status"  # a solver worker came online/offline
+    WORKER_PROMPT = "worker.prompt"  # per-invocation prompt and CLI delivery receipt
     WORKER_FINISHED = "worker.finished"  # ONE swarm sub-worker ended (worker-level,
     #   NOT the run). In coordinator mode many workers come and go while the run keeps
     #   going (re-bootstrap until solved/stopped), so a worker ending must NOT mark the
@@ -63,6 +66,7 @@ class EventType(str, Enum):
     HITL_RESPONSE = "hitl.response"  # human issues a command / interrupt
     CONTROL_COMMAND = "control.command"  # durable command lifecycle / observed effect
     HITL_TRANSLATED = "hitl.translated"  # a zh translation of a worker's hand-raise
+    AGENT_RUNTIME_EVENT = "agent.runtime"  # 标准 Swarm 的结构化 Runtime 事件
     GRAPH_COMPACTED = "graph.compacted"  # H: a long-run graph compaction epoch landed
     WORKER_LIFECYCLE = "worker.lifecycle"  # I: granular worker lifecycle (spawned/
     #   phase_changed/stalled/exited) — finer than WORKER_STATUS online/offline

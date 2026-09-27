@@ -1,22 +1,53 @@
+<!-- muteki-workspace-doc:1 -->
 # 环境
 
 你在 Muteki CTF Worker 容器中。当前镜像可能是 Kali full，也可能是 Ubuntu slim。
-当前目录是本题工作空间，脚本、产物、扫描结果和中间文件都放在这里，并与同一运行中的协作
-Worker 共享。联网状态由本次运行参数决定。当前用户为 `kali`，可以使用 NOPASSWD sudo
-安装软件、修改系统配置和启动服务。
+当前目录是本 Worker 独立使用的工作目录（私有 cwd），其他 Worker 不会自动以此为当前目录。
+同一 Run 的 Worker 共享容器用户与挂载，这不是 Worker 之间的文件权限隔离。
+需要交接的文件放到 `shared/` 或按黑板协议登记，避免依赖其他 Worker 的临时路径。
+联网及权限以本次运行配置为准。默认禁止提权；只有显式选择扩展权限时才可能使用 sudo。
+需要额外系统软件而权限不足时，报告所缺依赖。
 
 # 已安装工具
 
-- **两个镜像均提供**：shell、Python 3、pwntools、curl、wget、git、jq、ripgrep。
-- **Worker CLI**：Claude Code、Codex、Cursor、Pi、OMP、Kimi Code、Grok Build、
-  OpenCode、DeepSeek Harness。当前任务由其中一个 CLI 执行。
-- **Kali full 额外提供**：sqlmap、ffuf、gobuster、nikto、nuclei、GDB、radare2、
-  ROPgadget、angr、Ghidra、SageMath、Volatility 3、tshark、binwalk、foremost、exiftool
-  以及完整 Kali headless 工具集。
-- **Ubuntu slim**：保留基础命令与九个 Worker CLI，不包含完整 Kali 工具集和离线资料。
+先使用镜像内已经安装的工具。需要某项能力时，先执行 `command -v <command>` 和
+`<command> --help`；确认确实缺失后，再通过 `apt`、`apt-get` 或
+`pip3 install --break-system-packages` 安装。宿主投影的 `./toolbox/` 只包含本镜像内
+实际存在的路径，不要假设 slim 具备 full 的全部链接。
 
-工具列表可能随镜像版本变化。使用前可以执行 `which <command>` 或 `<command> --help`。
-缺少工具时可以使用 `apt`、`apt-get` 或 `pip3 install --break-system-packages` 安装。
+两个镜像均提供 shell、Python 3、pwntools、curl、wget、git、jq、ripgrep，以及 Claude
+Code、Codex、Cursor、Pi、OMP、Kimi Code、Grok Build、OpenCode 八个 Worker CLI。
+当前任务由其中一个 CLI 执行。
+
+Kali full 还提供完整的 `kali-linux-headless` 工具集。下列为构建时强制安装的核心入口
+（缺失会使镜像验收失败）；使用前仍应先 `command -v` / `--help` 确认：
+
+- Web 与网络：`nmap`、`masscan`、`ffuf`、`gobuster`、`dirb`、`nikto`、`whatweb`、
+  `sqlmap`、`nuclei`、`curl`、`socat`、`ncat`、`proxychains4`、`sshpass`、`openvpn`、
+  `chisel`。
+- 凭据与口令：`hydra`、`john`、`hashcat`、`jwt_tool`。
+- Pwn 与逆向：`gdb`、`gdb-multiarch`、GEF、`radare2`、`ROPgadget`、`angr`、
+  `patchelf`、`strace`、`ltrace`、`qemu-*`、`upx`。
+- 取证与隐写：Volatility 3（`vol`）、`tshark`、`tcpdump`、`binwalk`、`foremost`、
+  `exiftool`、`steghide`、Sleuth Kit、`tesseract`、StegSolve。
+- 密码与数学：SageMath（`sage`）、SymPy、GMPY2、Z3、PyCryptodome。
+- 云、容器与区块链：`cloudfox`、CDK、Foundry（`forge`、`cast`、`anvil`）。
+- Java 与 .NET：`ilspycmd`，以及 `/opt/tools/` 下的 `ysoserial.jar`、
+  `marshalsec.jar`、`JNDI-Injection-Exploit.jar`、`stegsolve.jar`。
+- 发布与运维辅助：`gh`。
+
+下列为**可选**能力：构建时安装失败不会使镜像失败，文件存在也不等于可用。需要时用
+`command -v` 和一次真实启动（`--version` / `--help`）确认，缺失则自行安装：
+
+- 移动端：`jadx`、`apktool`、`aapt`、`apksigner`、`zipalign`、`adb`、`dex2jar`、
+  Androguard、Frida、Objection。
+- 额外 Python / Ruby：`fpylll`、Playwright Chromium、Semgrep、Bandit、mitmproxy、
+  Slither、Web3、AWS CLI、`one_gadget`、`seccomp-tools`、`zsteg` 等。
+
+Kali 本机 chisel 客户端是 `/usr/bin/chisel`。可上传到受控目标的 Linux AMD64、ARM64
+静态程序分别位于 `/usr/share/chisel-common-binaries/chisel-linux-amd64` 和
+`/usr/share/chisel-common-binaries/chisel-linux-arm64`。GoReSym 只在 AMD64 镜像提供，
+ARM64 镜像不安装（可选）。Ubuntu slim 不包含上述 Kali full 工具和离线资料。
 
 # Kali full 离线资料
 
@@ -24,65 +55,22 @@ Worker 共享。联网状态由本次运行参数决定。当前用户为 `kali`
   `/home/kali/knowledges/InternalAllTheThings`
 - 技术资料：`/home/kali/knowledges/hacktricks`、`hacktricks-cloud`
 - CVE 与 PoC：`/home/kali/pocs/vulhub`、`/home/kali/pocs/Awesome-POC`
+- Nuclei 模板：`/home/kali/.local/nuclei-templates`
 
 这些目录只存在于 Kali full。目录存在时，可以先使用 `rg` 搜索本地资料；联网模式下也可以
 查询外部资料。
 
 # 共享黑板流程
 
-如果 `$MUTEKI_BLACKBOARD_DB` 存在，开始工作前按以下顺序读取当前状态：
-
-1. `blackboard.py read-directives`：读取 Operator 当前指令。Operator 指令具有最高调度优先级。
-2. `blackboard.py read-review`：读取 Review 结论和 challenged fact。
-3. `blackboard.py read-deadends`、`blackboard.py read-facts`：读取失败记录和现有事实。
-4. `blackboard.py read-routes`、`blackboard.py read-branches`：确认当前路线和独立假设。
-5. 多 Flag 任务执行 `blackboard.py read-flags`，确认已经收集的结果。
-
-接手开放任务时先领取 Intent：
-
-```bash
-blackboard.py list-intents
-blackboard.py claim <intent-id>
-```
-
-`claim` 输出 `WON` 后再执行对应任务；输出 `LOST` 时选择其他开放 Intent。
-
-端口、监听器、目标会话、独占 shell、限流账户等可能被多个 Worker 同时使用的资源，通过
-resource claim 协调：
-
-```bash
-blackboard.py claim-resource "<resource-key>" --risk-class <risk-class>
-blackboard.py release-resource "<resource-key>"
-```
-
-具体参数以 `blackboard.py --help` 和已安装的 `muteki-blackboard` 技能说明为准。
-
-# 事实和结果记录
-
-- challenged fact 暂不作为已确认依据，先完成重新验证。
-- suppressed route 只有在得到新证据后再 reopen。
-- 每个 branch 对应一个独立假设，分别记录命令、结果和结论。
-- 尚未核查的信息写为 candidate。写入 verified fact 时附带 witness、命令输出或产物路径。
-- 记录结论时注明命令实际运行位置，例如当前 Worker、其他容器、VPS 或目标主机。
-- Review 角色提交 review proposal，由 Coordinator 决定接受、拒绝或应用。
-- Operator 指令属于调度输入。执行后继续记录实际命令和结果。
+开始工作前完整读取任务 Prompt 指定的 `muteki-blackboard/SKILL.md`。共享状态的读取、事实与
+结果写入、分支声明、资源协调和结果提交全部以该 Skill 为准。当前 Step 已由 Coordinator
+分配，不要自行改用未领取的分支。
 
 # 工作方式
 
-- 需要持续运行的 HTTP 服务、监听器、反向 shell 或长时间扫描放入 tmux，并在结果中写明
-  tmux 会话名。
+- 需要跨 Worker 交接的文件写入 `shared/`，不要依赖私有 cwd 被其他 Worker 看见。
+- 需要持续运行的 HTTP 服务、监听器、反向 shell 或长时间扫描放入 tmux（若镜像提供），
+  并在结果中写明 tmux 会话名。
 - 大型扫描、抓包和反编译结果写入工作空间文件，在回复中给出文件路径和结论。
 - 修改脚本后先运行与当前操作路径直接相关的命令，确认功能可以执行。
 - 功能路径完成后等待后续指令，再补充额外防护、回归测试或兼容性处理。
-
-# Flag 结果
-
-Flag 必须来自目标的真实执行输出或真实产物。占位符、模板内容、示例值以及模型自行生成的
-候选结果不能作为有效 Flag。得到真实 Flag 后，必须通过 Blackboard API 提交：
-
-```bash
-blackboard.py submit-flag '<flag>'
-```
-
-普通回复、`FOUND_FLAG=` 文本和正则匹配结果都不会完成任务。提交前保留产生该 Flag 的真实命令
-输出或产物；Coordinator 会将 API 提交与当前 Worker 已捕获的执行证据进行校验。

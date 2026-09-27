@@ -6,8 +6,7 @@ In-process subscriber to an EventBus — no server needed (the kernel is Python,
   - a status bar (solver lineup, cost, last cost/context)
   - a command input (HITL: hint / pause / submit) routed to a callback
 
-Esc requests interrupt; the transcript updates live as events stream. Designed
-to be headless-testable via Textual's run_test() (see tests/test_tui.py).
+Esc requests interrupt; the transcript updates live as events stream.
 """
 
 from __future__ import annotations

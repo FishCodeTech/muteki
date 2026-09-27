@@ -1,0 +1,45 @@
+name: muteki-m6-gzctf
+
+services:
+  db:
+    image: postgres:18.0@sha256:5d1822a7565aecbf17323dd54754ab8b832963e62b9512f465c2f155db9262dd
+    container_name: muteki-m6-gzctf-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${GZCTF_DATABASE_PASSWORD}
+      POSTGRES_DB: gzctf
+    volumes:
+      - ./data/postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d gzctf"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [database]
+
+  web:
+    image: gztime/gzctf:v1.8.7@sha256:fcf87ae5b750daa9d1ecbe65c3a7ffdfd7cad99871570f54b589438151f4a19e
+    container_name: muteki-m6-gzctf-web
+    restart: unless-stopped
+    environment:
+      GZCTF_ADMIN_PASSWORD: ${GZCTF_ADMIN_PASSWORD}
+      ASPNETCORE_ENVIRONMENT: Development
+      LC_ALL: en_US.UTF-8
+    ports:
+      - "127.0.0.1:34103:8080"
+    volumes:
+      - ./appsettings.json:/app/appsettings.json:ro
+      - ./data/files:/app/files
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [public, database]
+
+networks:
+  public:
+    name: muteki-m6-gzctf-public
+  database:
+    name: muteki-m6-gzctf-database
+    internal: true

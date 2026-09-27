@@ -486,7 +486,8 @@ class CaptureSession:
         occurred_at_ns: int,
     ) -> GateInputReference:
         candidate_id = _required_text(candidate_id, "candidate_id")
-        flag = _required_text(flag, "flag")
+        if type(flag) is not str:
+            raise ValueError("flag must be exact text")
         flag_format = _required_text(flag_format, "flag_format")
         policy_digest = _sha256(policy_digest, "policy_digest")
         if policy_digest != self.permit.policy_digest:

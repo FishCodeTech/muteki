@@ -43,6 +43,13 @@ from muteki.solver.worker_profiles import (
     coerce_pos_int,
     normalize_reasoning_effort,
 )
+from muteki.solver.credential_accounts import (
+    account_credential_id,
+    account_id_from_credential_id,
+    canonical_credential_id,
+    engine_from_system_credential_id,
+    system_credential_id,
+)
 
 CredentialKind = Literal["system_inherit", "engine_key", "custom_endpoint"]
 
@@ -76,12 +83,11 @@ def _short_hash(seed: str) -> str:
 
 
 def credential_id_for(engine: str, *, legacy_account_id: str) -> str:
-    """`cred_<engine>_<6hex>` — deterministic from the legacy account id.
-    Idempotent: an already-formed cred id passes through unchanged."""
-    if _CRED_ID_RE.match(str(legacy_account_id or "")):
-        return str(legacy_account_id)
-    e = (engine or "unknown").strip().lower() or "unknown"
-    return f"cred_{e}_{_short_hash('cred:' + str(legacy_account_id))}"
+    """Return the global stable id for a persisted account reference."""
+    value = str(legacy_account_id or "").strip()
+    if value.startswith(("account:", "system:")):
+        return canonical_credential_id(value, engine=engine)
+    return account_credential_id(value)
 
 
 def seat_id_for(engine: str, *, legacy_name: str) -> str:
@@ -247,7 +253,11 @@ def migrate_legacy_config(
         if disk_mode and disk_mode != "empty":
             kind = kind_from_mode(disk_mode)
 
-        cid = credential_id_for(engine, legacy_account_id=seed_acct)
+        cid = (
+            system_credential_id(engine)
+            if kind == "system_inherit"
+            else credential_id_for(engine, legacy_account_id=seed_acct)
+        )
         if legacy_acct:
             cred_alias[legacy_acct] = cid
         # also alias the default account id when we fell back to it, so a foreign
@@ -344,7 +354,14 @@ def seat_to_legacy_profile(
     seat = seat or {}
     credential = credential or {}
     engine = str(seat.get("engine") or credential.get("engine") or "").strip()
-    kind = str(credential.get("kind") or "system_inherit").strip()
+    seat_credential_id = str(seat.get("credential_id") or "").strip()
+    inferred_kind = (
+        "system_inherit"
+        if engine_from_system_credential_id(seat_credential_id)
+        else "engine_key" if account_id_from_credential_id(seat_credential_id)
+        else "system_inherit"
+    )
+    kind = str(credential.get("kind") or inferred_kind).strip()
     cap = seat.get("capacity") if isinstance(seat.get("capacity"), dict) else {}
 
     endpoint = credential.get("endpoint") if isinstance(credential.get("endpoint"), dict) else {}
@@ -357,6 +374,9 @@ def seat_to_legacy_profile(
         credential_account = ""
     else:
         credential_account = str(credential.get("secret_ref") or "").strip()
+        if not credential_account:
+            credential_account = account_id_from_credential_id(
+                seat.get("credential_id"))
 
     credential_mode = _KIND_TO_LEGACY_MODE.get(kind, "subscription")
     roles = [str(r).strip() for r in (seat.get("roles") or []) if str(r).strip()] or list(DEFAULT_ROLES)
@@ -370,6 +390,9 @@ def seat_to_legacy_profile(
         "credential_mode": credential_mode,
         "auth": credential_mode,
         "credential_account": credential_account,
+        "credential_id": (
+            str(seat.get("credential_id") or credential.get("id") or "").strip()
+        ),
         # Preserve the canonical source so command construction can distinguish
         # host system login from injected credentials.
         "credential_kind": kind,
@@ -402,3 +425,73 @@ def seats_to_legacy_profiles(
             s, cred_by_id.get(str(s.get("credential_id"))),
         ))
     return out
+
+
+def migrate_identity_credential_references(
+    credentials: list[dict[str, Any]],
+    seats: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+    """Upgrade ``cred_*`` identity ids to the global credential namespace.
+
+    The transform is lossless for public metadata and keeps an alias table long
+    enough to rewrite every Seat reference in the same operation.
+    """
+    aliases: dict[str, str] = {}
+    projected: dict[str, dict[str, Any]] = {}
+    originals: dict[str, list[dict[str, Any]]] = {}
+    changed = False
+    for raw in credentials:
+        if not isinstance(raw, dict):
+            continue
+        original = dict(raw)
+        row = dict(raw)
+        old_id = str(row.get("id") or "").strip()
+        engine = str(row.get("engine") or "").strip().lower()
+        kind = str(row.get("kind") or "").strip()
+        secret_ref = str(row.get("secret_ref") or "").strip()
+        try:
+            if kind == "system_inherit" or (
+                not secret_ref and engine_from_system_credential_id(old_id)
+            ):
+                new_id = system_credential_id(engine)
+                row["secret_ref"] = ""
+            elif secret_ref:
+                new_id = account_credential_id(secret_ref)
+            else:
+                new_id = canonical_credential_id(old_id, engine=engine)
+        except ValueError:
+            # Malformed legacy rows remain readable; the settings validation path
+            # can surface them without dropping the operator's configuration.
+            new_id = old_id
+        if not new_id:
+            continue
+        aliases[old_id] = new_id
+        changed = changed or new_id != old_id
+        row["id"] = new_id
+        if new_id not in projected:
+            projected[new_id] = row
+            originals[new_id] = [original]
+            continue
+
+        # Two old identity rows can legitimately name the same stored account.
+        # The global namespace has one canonical row, so retain every complete
+        # legacy variant on that row instead of silently discarding later labels,
+        # endpoint metadata or timestamps. Consumers ignore this compatibility
+        # field; a second migration sees one row and is byte-for-byte idempotent.
+        changed = True
+        variants = originals.setdefault(new_id, [])
+        variants.append(original)
+        projected[new_id]["legacy_variants"] = [dict(item) for item in variants]
+
+    migrated_seats: list[dict[str, Any]] = []
+    for raw in seats:
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        old_ref = str(row.get("credential_id") or "").strip()
+        new_ref = aliases.get(old_ref, old_ref)
+        if new_ref != old_ref:
+            changed = True
+            row["credential_id"] = new_ref
+        migrated_seats.append(row)
+    return list(projected.values()), migrated_seats, changed

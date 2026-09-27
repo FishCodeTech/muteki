@@ -40,6 +40,7 @@ async def _pace() -> None:
 async def run_mock_solve(
     bus: EventBus, cost: CostController, run_id: str = "mock-c1",
     *, tick: float = 0.0, expected_flags: int = 1,
+    flag_value: str = "",
 ) -> SolveGraph:
     global _TICK
     _TICK = tick
@@ -219,7 +220,7 @@ async def run_mock_solve(
     # --- decode tool (primary closes it out) ---
     await emit(EventType.TOOL_CALL_START, tool="misc.encoding.auto_decode", call_id="t2")
     await emit(EventType.TERMINAL_OUTPUT, call_id="t2", text="$ auto_decode -> base64 x2 -> flag\n")
-    flag = "flag{mock_encoding_solved}"
+    flag = str(flag_value or "flag{mock_encoding_solved}")
     await emit(
         EventType.TOOL_CALL_RESULT,
         **tool_result_payload("misc.encoding.auto_decode", {"flag": flag}),
@@ -273,7 +274,7 @@ async def run_mock_solve(
 
 
 async def main() -> None:
-    store = SessionStore(root="sessions")
+    store = SessionStore(root="state")
     bus = EventBus()
     bus.add_sink(store.sink)
     cost = CostController(bus=bus)

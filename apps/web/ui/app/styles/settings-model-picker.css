@@ -1,0 +1,610 @@
+/* Compact HeroUI SearchField — shared by model picker + settings hub */
+.search-field.is-compact {
+  width: 100%;
+  gap: 0;
+}
+.search-field.is-compact .search-field__group {
+  width: 100%;
+  height: 34px;
+  min-height: 34px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 9px;
+  background: var(--field);
+  color: var(--dsw-alias-label-tertiary);
+  box-shadow: none;
+}
+.search-field.is-compact .search-field__group:hover:not(:focus-within),
+.search-field.is-compact .search-field__group[data-hovered="true"]:not([data-focus-within="true"]) {
+  border-color: var(--dsw-alias-border-l2);
+  background: var(--field);
+}
+.search-field.is-compact .search-field__group:focus-within,
+.search-field.is-compact .search-field__group[data-focus-within="true"] {
+  border-color: var(--focus-ring);
+  background: var(--field);
+  box-shadow: none;
+  outline: none;
+}
+.search-field.is-compact .search-field__search-icon {
+  width: 15px;
+  height: 15px;
+  margin-inline: 10px 0;
+  color: var(--dsw-alias-label-tertiary);
+}
+.search-field.is-compact .search-field__input {
+  height: 100%;
+  padding-block: 0;
+  padding-inline: 8px;
+  font-size: 13px;
+  line-height: 1.2;
+  color: var(--dsw-alias-label-primary);
+}
+.search-field.is-compact .search-field__input::placeholder {
+  color: var(--dsw-alias-label-tertiary);
+}
+.search-field.is-compact .search-field__group:has(.search-field__search-icon) .search-field__input,
+.search-field.is-compact .search-field__group:has([data-slot="search-field-search-icon"]) .search-field__input {
+  padding-inline-start: 8px;
+}
+.search-field.is-compact .search-field__group:has([slot="clear"]) .search-field__input {
+  padding-inline-end: 4px;
+}
+.search-field.is-compact .search-field__clear-button {
+  width: 22px;
+  height: 22px;
+  min-width: 22px;
+  margin-inline-end: 6px;
+  border-radius: 6px;
+  color: var(--dsw-alias-label-tertiary);
+  transition:
+    width var(--resize-dur) var(--ease-out), min-width 120ms ease, margin 120ms ease, opacity var(--control-feedback-dur) var(--ease-out), color var(--duration-quick, var(--control-feedback-dur)) var(--ease-out), background-color var(--duration-quick, var(--control-feedback-dur)) var(--ease-out);
+}
+.search-field.is-compact .search-field__clear-button:hover {
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+.search-field.is-compact[data-empty="true"] .search-field__clear-button {
+  width: 0 !important;
+  min-width: 0 !important;
+  height: 0;
+  margin-inline: 0 !important;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.search-field.is-compact:not([data-empty="true"]) .search-field__group:has([slot="clear"]) .search-field__input {
+  padding-inline-end: 4px;
+}
+
+.conversation-model-list-scroll { min-height:0; flex:1; overflow-y:auto; overscroll-behavior:contain; scrollbar-gutter:stable; padding:7px 10px 10px; }
+.conversation-model-group-title { padding:4px 9px 8px; color:var(--dsw-alias-label-tertiary); font-size:11px; font-weight:600; }
+.conversation-model-row {
+  width: 100%;
+  min-height: 49px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 4px 0 10px;
+  border-radius: 12px;
+  color: var(--dsw-alias-label-primary);
+}
+.conversation-model-row:hover,
+.conversation-model-row.selected {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+.conversation-model-pick {
+  min-width: 0;
+  flex: 1;
+  min-height: 49px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 6px 7px 0;
+  border-radius: 0;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  box-shadow: none;
+}
+.conversation-model-pick:hover,
+.conversation-model-pick[data-hovered],
+.conversation-model-pick[data-pressed],
+.conversation-model-pick[data-focus-visible] {
+  background: transparent;
+  box-shadow: none;
+}
+.conversation-model-pick > span { min-width:0; display:flex; flex-direction:column; gap:3px; }
+.conversation-model-list-scroll strong { overflow:hidden; font-size:13px; font-weight:570; text-overflow:ellipsis; white-space:nowrap; }
+.conversation-model-list-scroll small { overflow:hidden; color:var(--dsw-alias-label-tertiary); font-size:10.5px; text-overflow:ellipsis; white-space:nowrap; }
+.conversation-model-list-scroll b { color:var(--blue); }
+.conversation-model-star {
+  width: 28px;
+  height: 28px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  color: var(--dsw-alias-label-tertiary);
+  background: transparent;
+  cursor: pointer;
+  box-shadow: none;
+}
+.conversation-model-star:hover,
+.conversation-model-star[data-hovered],
+.conversation-model-star[data-pressed],
+.conversation-model-star[data-focus-visible] {
+  color: var(--dsw-alias-label-primary);
+  background: transparent;
+  box-shadow: none;
+  opacity: 1;
+}
+.conversation-model-star.on { color: var(--amber); }
+.conversation-model-star.on:hover,
+.conversation-model-star.on[data-hovered],
+.conversation-model-star.on[data-pressed] {
+  color: var(--amber);
+  background: transparent;
+}
+.conversation-model-pending {
+  min-height: 44px;
+  margin: 0 0 2px;
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-radius: 8px;
+  color: var(--dsw-alias-label-secondary);
+  background: color-mix(in srgb, var(--amber) 8%, transparent);
+}
+.conversation-model-pending > span {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.conversation-model-pending strong {
+  overflow: hidden;
+  color: var(--dsw-alias-label-primary);
+  font-size: 13px;
+  font-weight: 570;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conversation-model-pending small {
+  overflow: hidden;
+  color: var(--amber);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conversation-model-pending a {
+  flex: none;
+  color: var(--blue);
+  font-size: 11px;
+  text-decoration: underline;
+  white-space: nowrap;
+}
+.conversation-picker-empty { grid-column:1/-1; min-height:120px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; padding:20px; color:var(--dsw-alias-label-tertiary); font-size:12px; text-align:center; }
+.conversation-picker-empty a { color:var(--blue); text-decoration:underline; }
+.conversation-picker-empty.compact { min-height:90px; }
+.conversation-compact-menu,
+.conversation-permission-menu {
+  position: absolute;
+  z-index: 60;
+  bottom: 38px;
+  left: 0;
+  padding: 7px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 14px;
+  background: var(--dsw-alias-bg-layer-1);
+  box-shadow: var(--shadow-xl);
+}
+.conversation-compact-menu { width: 180px; max-height: 330px; overflow-y:auto; }
+.conversation-menu-title { padding:6px 9px; color:var(--dsw-alias-label-tertiary); font-size:11px; font-weight:600; }
+.conversation-compact-menu > button { width:100%; min-height:34px; display:grid; grid-template-columns:22px 1fr; align-items:center; border-radius:8px; color:var(--dsw-alias-label-primary); font-size:12px; text-align:left; cursor:pointer; }
+.conversation-compact-menu > button:hover { background:var(--dsw-alias-interactive-bg-hover); }
+.conversation-compact-menu > button > span { text-align:center; }
+.conversation-runtime-button.effort { max-width: 148px; gap: 4px; padding: 0 8px 0 10px; }
+.conversation-effort-trigger-label {
+  display: inline-grid;
+  justify-items: start;
+  align-items: center;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+.conversation-effort-popover {
+  /* Select/Popover portals to body — rebind shell aliases on the surface itself. */
+  --dsw-alias-bg-layer-1: var(--panel);
+  --dsw-alias-border-l2: var(--line);
+  --dsw-alias-label-primary: var(--bright);
+  --dsw-alias-label-secondary: var(--text);
+  --dsw-alias-label-tertiary: var(--muted);
+  --dsw-alias-interactive-bg-hover: color-mix(in srgb, var(--bright) 7%, transparent);
+  width: 240px;
+  max-width: calc(100vw - 36px);
+  padding: 0;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 18px;
+  /* background-color + global palette token; avoid background shorthand IACVT wipe. */
+  background-color: var(--overlay);
+  color: var(--overlay-foreground);
+  box-shadow: var(--shadow-overlay);
+  pointer-events: auto;
+}
+.conversation-effort-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px 12px;
+}
+.conversation-effort-head {
+  padding: 0 2px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  font-weight: 550;
+  line-height: 1.35;
+}
+.conversation-effort-slider {
+  width: 100%;
+  padding: 6px 2px 4px;
+  outline: none;
+}
+.conversation-effort-track {
+  position: relative;
+  width: 100%;
+  height: 8px !important;
+  border-radius: 999px;
+  /* Kill HeroUI default thumb-gutter borders (border-x + border-s-accent on
+     data-fill-start). Those left a dark seam between the rounded track edge
+     and the absolute fill / first mark. */
+  border: none !important;
+  border-width: 0 !important;
+  border-inline-width: 0 !important;
+  border-inline-start-width: 0 !important;
+  border-inline-end-width: 0 !important;
+  background: color-mix(in srgb, var(--line) 72%, var(--surface));
+  background-clip: border-box;
+  cursor: pointer;
+  /* Keep overflow visible so the thumb can sit half outside the track. */
+  overflow: visible;
+}
+.conversation-effort-track[data-fill-start],
+.conversation-effort-track[data-fill-end],
+.conversation-effort-track[data-fill-start="true"],
+.conversation-effort-track[data-fill-end="true"] {
+  border: none !important;
+  border-color: transparent !important;
+  border-inline-start-color: transparent !important;
+  border-inline-end-color: transparent !important;
+}
+/* Clip fill to the track pill without clipping the thumb. */
+.conversation-effort-fill-clip {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 0;
+}
+.conversation-effort-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  height: 100% !important;
+  /* Square corners — the clip layer supplies the left/right pill radius. */
+  border-radius: 0;
+  background: var(--accent) !important;
+  pointer-events: none;
+  /* Follow pointer while dragging; ease only when snapping after release. */
+  transition: width var(--resize-dur) var(--ease-out, var(--ease-out));
+}
+.conversation-effort-track:has(.conversation-effort-thumb[data-dragging="true"]) .conversation-effort-fill {
+  transition: none;
+}
+.conversation-effort-marks {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+}
+.conversation-effort-marks > i {
+  position: absolute;
+  top: 50%;
+  width: 3px;
+  height: 3px;
+  margin-left: -1.5px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--dsw-alias-label-tertiary) 45%, transparent);
+  transform: translateY(-50%);
+  transition: none;
+  box-shadow: none;
+  border: none;
+}
+/* Leftmost mark sits on the fill cap and reads as a dark seam — omit it. */
+.conversation-effort-marks > i:first-child {
+  display: none;
+}
+.conversation-effort-marks > i.on {
+  background: color-mix(in srgb, var(--on-accent, var(--surface)) 75%, transparent);
+}
+.conversation-effort-thumb {
+  /* Override HeroUI horizontal thumb: width calc(1.5rem+0.25rem), h-full. */
+  width: 14px !important;
+  height: 14px !important;
+  min-width: 14px !important;
+  min-height: 14px !important;
+  top: 50% !important;
+  z-index: 2;
+  border-radius: 50% !important;
+  border: 1.5px solid color-mix(in srgb, var(--line-strong) 55%, var(--bright));
+  background: color-mix(in srgb, var(--bright) 96%, var(--surface)) !important;
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--shadow-color, #000) 22%, transparent);
+  transform: translate(-50%, -50%) !important;
+  cursor: grab;
+  /* Snap ease after release; disable while dragging so it stays glued to pointer. */
+  transition:
+    left var(--control-press-dur) var(--ease-out, var(--ease-out)), outline-color var(--duration-quick) ease;
+}
+/* HeroUI thumb draws a ::after chip; hide it so our circle is the only handle. */
+.conversation-effort-thumb::after {
+  display: none !important;
+  content: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+.conversation-effort-thumb[data-dragging="true"] {
+  cursor: grabbing;
+  will-change: left, transform;
+  transition: outline-color var(--duration-quick) ease;
+}
+.conversation-effort-thumb:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--focus-ring, var(--accent)) 70%, transparent);
+  outline-offset: 2px;
+}
+.conversation-effort-current {
+  align-self: center;
+  min-height: 28px;
+  height: 28px;
+  display: inline-grid;
+  justify-items: center;
+  align-items: center;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface) 88%, var(--panel2));
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  font-weight: 550;
+  line-height: 1;
+  /* Width locked to the widest effort label so Low ↔ Extra High does not
+     resize the pill or nudge the popover. */
+  width: max-content;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+/* Invisible width probe only — stacked labels must not contribute height,
+   otherwise the pill stretches into a tall capsule. */
+.conversation-effort-current-sizer {
+  grid-area: 1 / 1;
+  visibility: hidden;
+  pointer-events: none;
+  height: 0;
+  overflow: hidden;
+  display: block;
+  white-space: nowrap;
+}
+.conversation-effort-current-sizer > span {
+  display: block;
+  height: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.conversation-effort-current-label {
+  grid-area: 1 / 1;
+  white-space: nowrap;
+  line-height: 1;
+}
+.conversation-runtime-select {
+  min-width: 0;
+  flex: none;
+}
+.conversation-runtime-select [data-slot="trigger"] {
+  min-width: 0;
+}
+.conversation-runtime-button.permission {
+  max-width: 148px;
+  gap: 4px;
+  padding: 0 8px 0 10px;
+}
+.conversation-runtime-permission-mark {
+  flex: none;
+  color: var(--dsw-alias-label-secondary);
+}
+.conversation-runtime-button.permission:hover .conversation-runtime-permission-mark,
+.conversation-runtime-button.permission[aria-expanded="true"] .conversation-runtime-permission-mark {
+  color: var(--dsw-alias-label-primary);
+}
+.conversation-runtime-permission-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conversation-runtime-permission-indicator {
+  flex: none;
+  color: var(--dsw-alias-label-tertiary);
+}
+.conversation-access-popover {
+  /* Select.Popover portals to body — shell aliases are not inherited there. */
+  --dsw-alias-bg-layer-1: var(--panel);
+  --dsw-alias-border-l2: var(--line);
+  --dsw-alias-label-primary: var(--bright);
+  --dsw-alias-label-secondary: var(--text);
+  --dsw-alias-label-tertiary: var(--muted);
+  --dsw-alias-interactive-bg-hover: color-mix(in srgb, var(--bright) 7%, transparent);
+  width: 372px;
+  max-width: calc(100vw - 36px);
+  padding: 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 24px;
+  /* Use background-color + --overlay (palette → --panel). A `background: var(--undefined)`
+     shorthand is invalid-at-computed-value-time and wipes HeroUI's bg-overlay to transparent. */
+  background-color: var(--overlay);
+  color: var(--overlay-foreground);
+  box-shadow: var(--shadow-overlay);
+  pointer-events: auto;
+}
+.conversation-access-list { display: flex; flex-direction: column; gap: 1px; outline: none; }
+.conversation-access-list [role="option"] {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 22px;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  color: var(--dsw-alias-label-primary);
+  text-align: left;
+  cursor: pointer;
+}
+.conversation-access-list [role="option"][data-hovered="true"] {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+.conversation-access-list [role="option"]:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--focus-ring, var(--blue)) 55%, transparent);
+  outline-offset: -2px;
+}
+.conversation-access-list [role="option"].is-warning,
+.conversation-access-list [role="option"].is-warning strong,
+.conversation-access-list [role="option"].is-warning small {
+  color: var(--amber);
+}
+.conversation-permission-menu {
+  --permission-warning: #c45d26;
+  width: 372px;
+  max-width: calc(100vw - 36px);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 12px 8px 8px;
+  border-radius: 24px;
+  overflow: visible;
+  box-shadow: var(--shadow-overlay);
+}
+.conversation-permission-head {
+  padding: 2px 12px 10px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+.conversation-permission-menu > button {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 22px;
+  align-items: center;
+  gap: 10px;
+  min-height: 0;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 12px;
+  color: var(--dsw-alias-label-primary);
+  text-align: left;
+  cursor: pointer;
+  background: transparent;
+  box-shadow: none;
+}
+.conversation-permission-menu > button:hover,
+.conversation-permission-menu > button.selected:hover {
+  background: var(--panel2);
+  box-shadow: none;
+}
+.conversation-permission-menu > button.selected {
+  background: transparent;
+  box-shadow: none;
+}
+.conversation-permission-menu > button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--focus-ring, var(--blue)) 55%, transparent);
+  outline-offset: -2px;
+}
+.conversation-access-list .conversation-permission-icon,
+.conversation-permission-menu .conversation-permission-icon {
+  width: 28px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  color: var(--dsw-alias-label-primary);
+}
+.conversation-access-list .conversation-permission-check,
+.conversation-permission-menu .conversation-permission-check {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  color: var(--dsw-alias-label-primary);
+}
+.conversation-access-list .conversation-permission-check .muteki-icon,
+.conversation-permission-menu .conversation-permission-check .muteki-icon {
+  stroke-width: 2.5;
+}
+.conversation-access-list .conversation-permission-copy,
+.conversation-permission-menu .conversation-permission-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.conversation-access-list .conversation-permission-copy strong,
+.conversation-permission-menu strong {
+  display: block;
+  color: var(--dsw-alias-label-primary);
+  font-size: 14px;
+  font-weight: 620;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+.conversation-access-list .conversation-permission-copy small,
+.conversation-permission-menu small {
+  display: block;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.45;
+}
+.conversation-permission-menu > button.is-warning,
+.conversation-permission-menu > button.is-warning .conversation-permission-icon,
+.conversation-permission-menu > button.is-warning .conversation-permission-check,
+.conversation-permission-menu > button.is-warning strong,
+.conversation-permission-menu > button.is-warning small {
+  color: var(--permission-warning);
+}
+
+@media (max-width: 760px) {
+  .conversation-runtime-controls { max-width: calc(100vw - 105px); overflow-x: auto; }
+  .conversation-model-popover.is-anchored {
+    width: calc(100vw - 24px);
+  }
+  .conversation-model-layout { grid-template-columns:56px 88px minmax(0, 1fr); }
+  .ai-conv-shell.conversation-model-popover.is-anchored { width: calc(100vw - 24px); }
+  .conversation-model-popover.is-default-model,
+  .conversation-model-popover.is-default-model.t-modal,
+  .conversation-model-popover.is-default-model.t-modal.is-open,
+  .conversation-model-popover.is-default-model.t-modal.is-closing { top:68px; left:12px; width:calc(100vw - 24px); height:calc(100vh - 88px); transform:none; }
+  .provider-default-model { align-items:flex-start; flex-direction:column; gap:8px; padding:8px 0 12px; }
+  .provider-default-model-controls { width:100%; }
+  .provider-default-model-picker { flex:1; max-width:none; overflow:visible; }
+  .provider-default-model-picker .ai-model-picker,
+  .provider-default-model-picker .conversation-runtime-button.model { width:100%; max-width:none; }
+  .conversation-agent-rail button { justify-content:center; padding:0; }
+  .conversation-agent-rail button > small { display:none; }
+  .conversation-endpoint-rail > button { min-height:42px; padding:6px; }
+  .conversation-endpoint-rail small { display:none; }
+  .conversation-permission-menu { left:auto; right:0; }
+}

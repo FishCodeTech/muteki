@@ -19,10 +19,10 @@ docker/worker/kimi_offline_agent.md
 docker/worker/grok_offline_agent.md
 
 # Slim worker image build context. build.sh cross-compiles runtime_agent and copies
-# the shared prompt, skill, bridges and engine profiles from their maintained sources.
+# skill/bridges/profiles from maintained sources. AGENTS.md is tracked here with
+# slim-specific capability guidance (not a copy of the Kali full prompt).
 docker/worker-slim/runtime_agent
 docker/worker-slim/runtime_agent-*
-docker/worker-slim/AGENTS.md
 docker/worker-slim/blackboard.py
 docker/worker-slim/deepseek_harness_worker.py
 docker/worker-slim/blackboard.SKILL.md
@@ -41,6 +41,10 @@ docker/worker-slim/grok_offline_agent.md
 # distilled knowledge templates)
 artifacts/
 sessions/
+/state/
+/*-state/
+/.manual-runtime/
+/run-*/
 eval_runs/
 knowledge/
 output/
@@ -90,3 +94,9 @@ docs/internal-design/
 docs/wechat/
 docs/assets/wechat-promo/
 .codegraph/
+
+# Local machine residue — not part of the distribution.
+exports/
+data/
+.muteki/
+.pi/

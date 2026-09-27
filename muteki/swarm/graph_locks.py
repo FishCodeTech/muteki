@@ -31,7 +31,8 @@ from muteki.swarm.graph_defs import (  # noqa: F401
     EV_LANE_LOCKED, EV_LANE_RELEASED, EV_INTENT_LANE_DEFERRED, EV_FACT_REJECTED,
     EV_FACT_MERGED, EV_FACT_SUPERSEDED, EV_FACT_PINNED, EV_INTENT_STATE_CHANGED,
     EV_OPERATOR_DIRECTIVE, EV_OPERATOR_DIRECTIVE_STATUS, EV_HITL_CLASSIFIED,
-    EV_RESOURCE_LOCKED, EV_RESOURCE_RELEASED, EV_GRAPH_COMPACTED,
+    EV_RESOURCE_LOCKED, EV_RESOURCE_RELEASED, EV_RESOURCE_LOCK_DENIED,
+    EV_GRAPH_COMPACTED,
     FACT_STATE_UNRESOLVED, FACT_STATE_CHALLENGED, FACT_STATE_REVALIDATED,
     FACT_STATE_REJECTED, FACT_STATE_MERGED, FACT_STATE_SUPERSEDED,
     _FACT_TERMINAL_STATES, _FACT_STATES,
@@ -702,6 +703,7 @@ class _LanesLocksMixin:
         lock_id = f"rl-{rkey}"
         policy = conflict_policy if conflict_policy in {
             "dedupe", "exclusive", "serialize", "cooldown"} else "exclusive"
+        denied: Optional[dict] = None
         with self._lock:
             row = self._conn.execute(
                 "SELECT owner_worker, lease_until, status FROM resource_locks "
@@ -712,24 +714,34 @@ class _LanesLocksMixin:
                 held_by = str(row[0] or "")
                 lease_until = float(row[1] or 0.0)
                 if held_by and held_by != owner and lease_until > now:
-                    return {"lock_id": lock_id, "acquired": False,
-                            "held_by": held_by, "resource_key": rkey,
-                            "lease_until": lease_until}
-            self._conn.execute(
-                "INSERT INTO resource_locks "
-                "(lock_id, challenge_id, resource_key, scope, risk_class, status, "
-                " owner_worker, owner_intent, lease_until, conflict_policy, cooldown_s) "
-                "VALUES (?,?,?,?,?,'active',?,?,?,?,?) "
-                "ON CONFLICT(lock_id) DO UPDATE SET "
-                " status='active', owner_worker=excluded.owner_worker, "
-                " owner_intent=excluded.owner_intent, scope=excluded.scope, "
-                " risk_class=excluded.risk_class, lease_until=excluded.lease_until, "
-                " conflict_policy=excluded.conflict_policy, cooldown_s=excluded.cooldown_s",
-                (lock_id, self.challenge.id, rkey, scope or "activity",
-                 risk_class or None, owner, owner_intent or None, now + float(lease_s),
-                 policy, float(cooldown_s)),
-            )
-            self._conn.commit()
+                    denied = {"lock_id": lock_id, "acquired": False,
+                              "held_by": held_by, "resource_key": rkey,
+                              "lease_until": lease_until}
+            if denied is None:
+                self._conn.execute(
+                    "INSERT INTO resource_locks "
+                    "(lock_id, challenge_id, resource_key, scope, risk_class, status, "
+                    " owner_worker, owner_intent, lease_until, conflict_policy, cooldown_s) "
+                    "VALUES (?,?,?,?,?,'active',?,?,?,?,?) "
+                    "ON CONFLICT(lock_id) DO UPDATE SET "
+                    " status='active', owner_worker=excluded.owner_worker, "
+                    " owner_intent=excluded.owner_intent, scope=excluded.scope, "
+                    " risk_class=excluded.risk_class, lease_until=excluded.lease_until, "
+                    " conflict_policy=excluded.conflict_policy, cooldown_s=excluded.cooldown_s",
+                    (lock_id, self.challenge.id, rkey, scope or "activity",
+                     risk_class or None, owner, owner_intent or None, now + float(lease_s),
+                     policy, float(cooldown_s)),
+                )
+                self._conn.commit()
+        if denied is not None:
+            # Record the refused requester so the board can show who waits on whom.
+            denied["seq"] = self._append(
+                EV_RESOURCE_LOCK_DENIED, actor,
+                {"lock_id": lock_id, "resource_key": rkey, "scope": scope,
+                 "risk_class": risk_class, "owner_worker": owner,
+                 "owner_intent": owner_intent, "held_by": denied["held_by"],
+                 "lease_until": denied["lease_until"]})
+            return denied
         seq = self._append(EV_RESOURCE_LOCKED, actor,
                            {"lock_id": lock_id, "resource_key": rkey, "scope": scope,
                             "risk_class": risk_class, "owner_worker": owner,

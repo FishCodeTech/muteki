@@ -68,8 +68,9 @@ run 的真实状态回答。
 # Rough per-message char cap before we even send — keeps a runaway transcript
 # from blowing the flash model's window. The frontend truncates too; this is a
 # server-side second line of defense.
-_MAX_TRANSCRIPT_TURNS = 24
-_MAX_TRANSCRIPT_CHARS = 60000
+_MAX_TRANSCRIPT_TURNS = 80
+_MAX_TRANSCRIPT_CHARS = 200000
+_MAX_TRANSCRIPT_SUMMARY_CHARS = 12000
 _MAX_QUESTION_CHARS = 2000
 
 
@@ -117,12 +118,13 @@ _BTWWORKER_RULES = """你是 Muteki `/btw` 的只读旁路 worker。你不是正
 def _fmt_transcript(transcript: list[dict[str, str]]) -> str:
     if not transcript:
         return "(无历史 /btw 对话)"
+    labels = {"user": "操作员", "assistant": "btw", "summary": "历史摘要"}
     lines: list[str] = []
-    for t in transcript[-12:]:
-        role = "操作员" if t.get("role") == "user" else "btw"
-        content = (t.get("content") or "").strip()
+    for turn in transcript:
+        role = labels.get(str(turn.get("role") or ""), "btw")
+        content = (turn.get("content") or "").strip()
         if content:
-            lines.append(f"{role}: {content[:2000]}")
+            lines.append(f"{role}: {content}")
     return "\n".join(lines) if lines else "(无历史 /btw 对话)"
 
 
@@ -202,6 +204,7 @@ async def stream_btw_worker_deltas(
     web_access: bool = False,
     kb_access: bool = False,
     request_disconnected: Callable[[], Any] | None = None,
+    usage_callback: Callable[[Any], Any] | None = None,
 ) -> AsyncIterator[str]:
     """Run one CLI worker turn and yield assistant text chunks for `/btw`.
 
@@ -227,7 +230,8 @@ async def stream_btw_worker_deltas(
             pass
 
     def _on_step(step: Any) -> None:
-        if getattr(step, "kind", "") != "reasoning":
+        if (getattr(step, "kind", "") != "reasoning"
+                or bool(getattr(step, "thinking", False))):
             return
         text = str(getattr(step, "text", "") or "").strip()
         if not text:
@@ -255,6 +259,8 @@ async def stream_btw_worker_deltas(
                 cancel_event=cancel_event,
                 container=container,
             )
+            if usage_callback is not None:
+                usage_callback(res)
             result_holder.append(res)
         except BaseException as exc:  # noqa: BLE001
             error_holder.append(exc)
@@ -303,39 +309,67 @@ async def stream_btw_worker_deltas(
 
 
 def sanitize_transcript(transcript: Any) -> list[dict[str, str]]:
-    """Validate + cap the caller-supplied multi-turn transcript.
-
-    Returns a clean list of {role, content} dicts. Drops anything that isn't a
-    user/assistant turn, caps total turns and chars, and trims over-long single
-    messages. Never raises — a malformed transcript degrades to [] so the turn
-    still works as a one-shot.
-    """
+    """Validate + compact the caller-supplied multi-turn transcript."""
     if not isinstance(transcript, list):
         return []
-    out: list[dict[str, str]] = []
-    total = 0
-    for t in transcript:
-        if not isinstance(t, dict):
+    clean: list[dict[str, str]] = []
+    for turn in transcript:
+        if not isinstance(turn, dict):
             continue
-        role = str(t.get("role") or "").lower()
-        if role not in ("user", "assistant"):
+        role = str(turn.get("role") or "").lower()
+        if role not in ("user", "assistant", "summary"):
             continue
-        content = str(t.get("content") or "")
-        if not content:
-            continue
-        if len(content) > _MAX_TRANSCRIPT_CHARS // 4:
-            content = content[: _MAX_TRANSCRIPT_CHARS // 4] + "…"
-        out.append({"role": role, "content": content})
-        total += len(content)
-        if len(out) >= _MAX_TRANSCRIPT_TURNS or total >= _MAX_TRANSCRIPT_CHARS:
+        content = str(turn.get("content") or "").strip()
+        if content:
+            clean.append({"role": role, "content": content})
+    if not clean:
+        return []
+    if (len(clean) <= _MAX_TRANSCRIPT_TURNS
+            and sum(len(turn["content"]) for turn in clean) <= _MAX_TRANSCRIPT_CHARS):
+        return clean
+
+    anchor_index = next((
+        index for index, turn in enumerate(clean)
+        if turn["role"] == "user"
+    ), 0)
+    anchor = clean[anchor_index]
+    recent: list[dict[str, str]] = []
+    used = len(anchor["content"])
+    for turn in reversed(clean[anchor_index + 1:]):
+        if len(recent) >= _MAX_TRANSCRIPT_TURNS - 2:
             break
-    # keep the first user turn (anchors the conversation) then the most recent
-    # turns — drop from the middle if we capped.
-    if len(out) > _MAX_TRANSCRIPT_TURNS:
-        head = out[:1]
-        tail = out[-(_MAX_TRANSCRIPT_TURNS - 1):]
-        out = head + tail
-    return out
+        cost = len(turn["content"])
+        if recent and used + cost > _MAX_TRANSCRIPT_CHARS - _MAX_TRANSCRIPT_SUMMARY_CHARS:
+            break
+        recent.append(turn)
+        used += cost
+    recent.reverse()
+    kept_ids = {id(turn) for turn in recent}
+    omitted = [
+        turn for turn in clean[anchor_index + 1:]
+        if id(turn) not in kept_ids
+    ]
+    summary_lines = []
+    summary_used = 0
+    for turn in omitted:
+        compact = " ".join(turn["content"].split())
+        line = f"{turn['role']}: {compact}"
+        if len(line) > _MAX_TRANSCRIPT_SUMMARY_CHARS:
+            line = (
+                f"{turn['role']}: [message omitted; {len(compact)} characters]"
+            )
+        if summary_lines and summary_used + len(line) > _MAX_TRANSCRIPT_SUMMARY_CHARS:
+            break
+        summary_lines.append(line)
+        summary_used += len(line)
+    summary = {
+        "role": "summary",
+        "content": (
+            f"Earlier /btw history ({len(omitted)} turns):\n"
+            + "\n".join(summary_lines)
+        ),
+    }
+    return [anchor, summary, *recent]
 
 
 def btw_messages(

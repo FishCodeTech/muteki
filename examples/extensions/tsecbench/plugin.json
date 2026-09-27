@@ -1,0 +1,60 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "org.muteki.platforms.tsecbench",
+  "version": "1.2.7",
+  "description": "Tsecbench 测评",
+  "author": {
+    "name": "FishCodeTech",
+    "url": "https://github.com/FishCodeTech"
+  },
+  "homepage": "https://github.com/FishCodeTech/muteki",
+  "repository": "https://github.com/FishCodeTech/muteki",
+  "license": "AGPL-3.0-or-later",
+  "keywords": [
+    "muteki",
+    "platform-adapter",
+    "tsecbench",
+    "competition"
+  ],
+  "extensions": {
+    "io.github.fishcodetech.muteki": {
+      "manifest_version": 1,
+      "extension_version": "1.2.7",
+      "requires_core": ">=1.0,<2.0",
+      "origin": "community",
+      "retain_previous_versions": false,
+      "entrypoints": {
+        "host": "subprocess",
+        "command": [
+          "python3",
+          "./io.github.fishcodetech.muteki/server.py",
+          "serve"
+        ]
+      },
+      "provides": [
+        {
+          "type": "platform-adapter",
+          "id": "tsecbench",
+          "api_version": 1
+        }
+      ],
+      "requires": [],
+      "permissions": {
+        "filesystem": [
+          "state-read",
+          "state-write"
+        ],
+        "network": [
+          "tsecbench.zc.tencent.com"
+        ],
+        "secrets": [],
+        "events_write": [
+          "ext.org.muteki.platforms.tsecbench.*"
+        ]
+      },
+      "config_schema": "./io.github.fishcodetech.muteki/schemas/config.json",
+      "state_schema": "./io.github.fishcodetech.muteki/schemas/state.json",
+      "ui": "./io.github.fishcodetech.muteki/ui/contributions.json"
+    }
+  }
+}

@@ -19,29 +19,28 @@
   <a href="https://github.com/FishCodeTech/muteki/issues"><img src="https://img.shields.io/github/issues/FishCodeTech/muteki" alt="Issues"></a>
   <a href="https://github.com/FishCodeTech/muteki/pulls"><img src="https://img.shields.io/github/issues-pr/FishCodeTech/muteki" alt="PRs"></a>
   <img src="https://img.shields.io/badge/NYU_CTF_Bench-200%2F200_solved-brightgreen" alt="Benchmark">
-  <img src="https://img.shields.io/badge/engines-9_CLIs-orange" alt="Engines: Claude, Codex, Cursor, Pi, OMP, Kimi, Grok, OpenCode, DeepSeek Harness">
+  <img src="https://img.shields.io/badge/engines-8_active_CLIs-orange" alt="Eight active CLI engines; DeepSeek Harness is registered but temporarily unavailable">
 </p>
 
 <p align="center">
   <strong>English</strong> · <a href="README_CN.md">简体中文</a>
 </p>
 
-
 <p align="center">
-<a href="https://www.star-history.com/?type=date&repos=fishcodetech%2Fmuteki">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=fishcodetech/muteki&type=date&theme=dark&legend=top-left&sealed_token=vc5ui3lb58WYq6M_OxJxFxhljtWwz7lvILAOd7RrD3vDJqvJq4jyPgfCQAq59gjzAmnYMdjLpJ80k_2PpNe-_nYL1Jf5RxCVVbHHiqrMdmCW0UHU43ZYMg" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=fishcodetech/muteki&type=date&legend=top-left&sealed_token=vc5ui3lb58WYq6M_OxJxFxhljtWwz7lvILAOd7RrD3vDJqvJq4jyPgfCQAq59gjzAmnYMdjLpJ80k_2PpNe-_nYL1Jf5RxCVVbHHiqrMdmCW0UHU43ZYMg" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=fishcodetech/muteki&type=date&legend=top-left&sealed_token=vc5ui3lb58WYq6M_OxJxFxhljtWwz7lvILAOd7RrD3vDJqvJq4jyPgfCQAq59gjzAmnYMdjLpJ80k_2PpNe-_nYL1Jf5RxCVVbHHiqrMdmCW0UHU43ZYMg" />
- </picture>
-</a>
+  <a href="https://www.star-history.com/#fishcodetech/muteki&amp;Date">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date&amp;theme=dark">
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date">
+      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=fishcodetech/muteki&amp;type=Date">
+    </picture>
+  </a>
 </p>
 
 ---
 
 This is a **truly open-source, multi-model CTF-solving AI agent swarm.** The goal is to live up to its very name — **無敵 · Project Muteki** ("Invincible").
 
-At its core, the project implements a scheduling scheme for AI agents that automatically and intelligently coordinates and controls each agent's context — like a swarm, each with its own division of labor, but all working toward the final goal. Current Worker engines are Claude, Codex, Cursor, Pi, OMP, Kimi, Grok, OpenCode, and DeepSeek Harness.
+At its core, the project implements a scheduling scheme for AI agents that automatically and intelligently coordinates and controls each agent's context — like a swarm, each with its own division of labor, but all working toward the final goal. Current Worker engines are Claude, Codex, Cursor, Pi, OMP, Kimi, Grok, and OpenCode. DeepSeek Harness remains visible as a registered engine but is temporarily unavailable for configuration or execution.
 
 Muteki exists to solve a specific problem: a single AI agent, when working toward a goal, very easily falls into a dead-loop at one spot — unable to pull itself out, unable to reach the final goal — and a single agent is extremely inefficient. I designed an architecture to solve this. It may not be the most perfect one, but I'll keep iterating and upgrading it.
 
@@ -89,7 +88,7 @@ You're welcome to use it and help build and upgrade it together. If you run into
 
 ## Architecture
 
-Muteki points a group of heterogeneous coding agents (Claude, Codex, Cursor, Pi, OMP, Kimi, Grok, OpenCode, DeepSeek Harness) at the same challenge, collaborating on a single **shared blackboard**: facts one of them discovers are usable by all, dead ends one of them walks are never retried by the others, and a flag is accepted only when it **appears verbatim in real execution output**. The core isn't "swap in a smarter brain" — it's **heterogeneity + shared evidence + a provenance gate**.
+Muteki points a group of heterogeneous coding agents (Claude, Codex, Cursor, Pi, OMP, Kimi, Grok and OpenCode) at the same challenge, collaborating on a single **shared blackboard**: facts one of them discovers are usable by all, dead ends one of them walks are never retried by the others, and a flag is accepted only when it **appears verbatim in real execution output**. Structured transports such as app-server, Agent SDK, ACP and RPC are used when the installed runtime supports them; CLI remains an explicit compatibility transport with reported capability differences. The core is **heterogeneity + shared evidence + a provenance gate**.
 
 So how does a worker hand its data to the platform, and how does it see its teammates' progress? **It all relies on the `muteki-blackboard` skill built into every worker** — this is the only data channel between a worker and the blackboard.
 
@@ -137,6 +136,34 @@ To keep Muteki from falling into a dead-loop while working a single task, we set
 
 The `.env` at the repo root is loaded automatically (copy it from `.env.example`); variables exported in your shell always take precedence. Configuration is done through `MUTEKI_*` environment variables.
 
+### Product workspaces and current support
+
+| Workspace | Product path | Current support |
+|---|---|---|
+| Conversation | `/chat` | Structured Runtime sessions, approvals, user input, tools, artifacts, usage, memory and restart recovery |
+| Single task | `/task` | Standard `muteki.swarm.swarm.Swarm`, per-run SharedGraph and execution-source gate |
+| Competition | `/competitions` | Platform connection, probe, incremental sync, artifacts, scheduling, instances, Run bindings, Gate, approval, submission and verdict projection |
+| Extensions | `/settings/extensions` | Install, trust and permission review, enable/disable, upgrade, rollback, recovery and declarative UI |
+| Operations | `/settings/operations` | Readiness, metrics, alerts, receipt/outbox trace, recovery preview, maintenance preview and redacted diagnostics |
+
+Runtime adapters are registered for Codex App Server, Claude Agent SDK, Cursor ACP, Grok ACP, Pi RPC,
+OpenCode Server, Kimi ACP and OMP RPC v2. The Runtime settings page reports the installed
+version, authentication state, probe source, actual capabilities and any fallback reason for each instance.
+
+Competition adapters for CTFd, rCTF, GZCTF and an authorized browser session are implemented and
+validated against authorized isolated deployments with newly created competitions, challenges, attachments,
+real submission receipts, target-specific rate limits, restart recovery and dynamic-instance replacement. See
+[the P1 platform acceptance record](docs/validation/p1_authorized_platform_acceptance_2026-08-24.md).
+
+For isolated local instances, specify separate ports and roots:
+
+```bash
+./run.sh web --port 9000 --ui-port 3002 --control-port 9299 \
+  --sessions-root /tmp/muteki-a-sessions --control-root /tmp/muteki-a-control
+```
+
+Use `uv run python scripts/muteki_ops.py overview` for a CLI readiness snapshot.
+
 ### Built-in updates
 
 Application updates no longer require `git pull`. The first install creates a managed application directory and keeps the existing `.env` and `sessions` paths. Later upgrades switch versions atomically and retain one previous version for rollback.
@@ -174,9 +201,9 @@ If you don't set it, the main impact is that the Reason planner won't autonomous
 - The **engine CLIs** you intend to use, available on your `PATH` (see below)
 - This project has so far only been tested on macOS, not on Windows — handle accordingly.
 
-### Worker engine CLIs
+### Worker engine runtimes
 
-Muteki **shells out to** the Worker engine CLIs below; install and authenticate whichever ones you want to use. Vendor CLIs have their own licenses and may send data back to their vendors:
+Install and authenticate whichever Worker runtimes you want to use. Muteki selects their structured interface when available and uses the CLI compatibility transport only when required. Vendor runtimes have their own licenses and may send data back to their vendors:
 
 
 | Engine | CLI | Vendor | Credential |
@@ -189,7 +216,6 @@ Muteki **shells out to** the Worker engine CLIs below; install and authenticate 
 | `kimi` | `kimi` | Moonshot | Kimi Code login directory |
 | `grok` | `grok` | xAI | Grok login directory |
 | `opencode` | `opencode` | OpenCode | API key |
-| `dsh` | DeepSeek Harness worker | DeepSeek | API key |
 
 
 You need at least one of them to run. You can also configure a **custom OpenAI-compatible endpoint** (`base_url` + key) in a worker profile — suitable for self-hosted or third-party models. Credentials are read from the macOS Keychain / environment and injected into the worker environment; see [Credentials](#credentials) and [SECURITY.md](SECURITY.md).
@@ -224,7 +250,7 @@ After saving, you can click "Save & test" at any time.
 - In **`container`** mode an account is **mandatory** — the host login is not mounted into the container; credentials are mounted into the container via command injection and file mounting.
 - In **`local`** mode, if no account is registered, the worker inherits the host CLI's existing login — though you can also configure it manually.
 
-The DeepSeek reasoning model (used by the coordinator) is configured separately via `MUTEKI_DEEPSEEK_API_KEY` in `.env`. DeepSeek Harness (`dsh`) is a separate Worker engine and is configured in Worker settings.
+The DeepSeek reasoning model used by the coordinator remains available through `MUTEKI_DEEPSEEK_API_KEY` in `.env`. DeepSeek Harness (`dsh`) is only retained as a locked registry and historical-data identifier until its upstream CLI provides the required structured events, tool results, and session recovery.
 
 ![image-20260624184600517](./assets/image-20260624184600517.png)
 
@@ -263,7 +289,7 @@ MUTEKI_WORKER_IMAGE=ghcr.io/fishcodetech/muteki-worker-slim:latest ./run.sh web
 ./docker/worker-slim/build.sh ghcr.io/fishcodetech/muteki-worker-slim v0.3.2 amd64
 ```
 
-The full image is intentionally large (Kali headless + Ghidra + SageMath via conda + offline knowledge). Use the slim image only when you understand that workers may need to install more tooling during a run.
+The full image is intentionally large (Kali headless + SageMath via conda + offline knowledge). Use the slim image only when you understand that workers may need to install more tooling during a run.
 
 ---
 
@@ -299,12 +325,14 @@ Topology:
 - **`ui`** — Next command deck; proxies `/api` → `web-api`.
 - **workers** are *not* a compose service — `web-api` `docker run`s one per run.
 
-The durable operator journal and SecretStore live under the coordinator-only
-`MUTEKI_COORDINATOR_CONTROL_ROOT` (compose defaults it to
-`$MUTEKI_HOST_DATA_ROOT/coordinator-control`). That path is never a worker mount and
-is never included in the worker-workspace ownership rewrite. A per-run sibling
-bootstrap directory (`.muteki_rcp` beside the workspace, mounted at
-`/run/muteki/control` in the worker) carries only the reverse-connect bootstrap token.
+Each Run has one workspace at `MUTEKI_SESSIONS_ROOT/<run-id>/workspace`, regardless
+of whether workers run locally, in a per-Run container, or in the shared container.
+Service state and credentials live under `MUTEKI_STATE_ROOT`; the durable operator
+journal uses the coordinator-only `MUTEKI_COORDINATOR_CONTROL_ROOT` (Compose defaults
+these to `$MUTEKI_HOST_DATA_ROOT/state` and its `control` child). Those paths are
+never worker mounts or part of worker-workspace ownership changes. Per-container
+bootstrap material lives under `state/runtime/rcp` and is mounted at
+`/run/muteki/control` only long enough to carry the reverse-connect bootstrap token.
 
 ```bash
 # 1. Have the worker image available on the host daemon.
@@ -410,66 +438,72 @@ with per-challenge details in [eval_nyu/_reports/RESULTS.md](eval_nyu/_reports/R
 
 ### Working directory of a single runner (challenge)
 
-Each challenge you launch is a **run**. Its working path and structure under `sessions/` is as follows — workers on both the `host` and `container` backends see the same layout:
+Each challenge you launch is a **run**. Local, per-Run-container, and shared-container
+workers all use the same workspace under `sessions/`. Coordinator authority stays in
+the separate `state/` tree:
 
 ```
 sessions/
-├── run-XXXX.jsonl              # The "event stream" for this challenge: the source of truth for SSE replay / resume (one line = one event)
-├── run-XXXX/                   # The working root for this challenge
-│   ├── uploads/                # Raw challenge files uploaded via the web (unprocessed; processed ones go to workspace/inputs)
-│   └── workspace/              # The workspace for this challenge
-│       ├── inputs/             # Immutable challenge inputs (content-addressed, CAS)
-│       │   ├── objects/        #    CAS object store (bucketed by sha256)
-│       │   └── by-name/        #    Symlinks from original filename → object
-│       ├── shared/             # Artifacts shared between workers (CAS)
-│       │   ├── objects/        #    CAS object store
-│       │   ├── links/          #    Symlinks by name → object
-│       │   └── index.jsonl     #    Shared-artifact index (a rebuildable materialized view)
-│       ├── graph/
-│       │   └── shared_graph.db #    ★ Shared blackboard: event-sourced SQLite, the single source of truth (facts/intents/dead-ends/...)
-│       ├── arts/               # Artifact store: tool output / transcript snapshots (<hex>.txt, addressed by artifact_id, peekable)
-│       ├── workers/            # Each worker's own cwd (scratch)
-│       │   └── cli-codex-2/    #    One worker's working directory (agent temp files + relative symlinks into inputs/shared)
-│       ├── homes/              # Each worker's isolated HOME (especially needed in container mode)
-│       ├── final/              # Final artifacts
-│       ├── tmp/                # Temp directory
-│       ├── logs/               # Logs
-│       ├── manifest.json       # Workspace manifest: topology + inputs list + runtime metadata
-│       ├── winner.json         # The winning worker's continuation handle (for follow-ups / writeups / review after solving)
-│       ├── writeup.md          # The (post-solve generated) writeup, optional
-│       └── .muteki_board.md    # Blackboard snapshot: a Markdown version for workers to read directly
-│
-├── _secrets/accounts/<id>/     # Credential account store (dirs 0700 / files 0600, never enters the image or prompts)
-├── _worker_config.json         # Global worker config (engine roster / profiles)
-└── _rail_meta.json             # Rail metadata (names / order of the run list)
+└── run-XXXX/                   # One Run's worker-visible root
+    ├── uploads/                # Raw files uploaded from the Web deck
+    └── workspace/              # The only workspace for every worker backend
+        ├── inputs/             # Immutable challenge inputs (content-addressed CAS)
+        │   ├── objects/
+        │   └── by-name/
+        ├── shared/             # Artifacts shared between workers (CAS)
+        │   ├── objects/
+        │   ├── links/
+        │   └── index.jsonl
+        ├── arts/               # Tool output and transcript snapshots
+        ├── workers/            # One scratch cwd per worker
+        ├── homes/              # Isolated worker HOME directories
+        ├── final/              # Final artifacts
+        ├── tmp/
+        ├── logs/
+        ├── manifest.json
+        ├── winner.json
+        ├── writeup.md
+        └── .muteki_board.md
+
+state/                          # Coordinator-private; never a worker workspace mount
+├── run-XXXX.jsonl              # Durable event stream for replay and recovery
+├── control/
+│   ├── graphs/run-XXXX/shared_graph.db  # Authoritative SharedGraph
+│   └── run-XXXX/control.db              # Per-Run control journal
+├── runtime/
+│   ├── account-projections/    # Ephemeral container credential projections
+│   └── rcp/                    # One-shot reverse-control bootstrap material
+├── _platform/                  # Product databases and extension state
+├── _secrets/accounts/<id>/     # Credential account store (private files)
+├── _worker_config.json
+└── _rail_meta.json
 ```
 
 A few key points:
 
-- **`run-XXXX.jsonl` (the event history)** and **`run-XXXX/` (the files that do the work)** are linked by the same run id: the former can be replayed to the frontend, the latter is the workspace actually written to disk.
+- **`state/run-XXXX.jsonl`** and **`sessions/run-XXXX/`** are linked by the same Run id.
 - **`inputs/` and `shared/` are both content-addressed (CAS)**: the same file is stored only once, and worker directories are full of relative symlinks — so `workers/` can be created and deleted at will without losing data.
-- **`graph/shared_graph.db` is the core**: all of the blackboard's state lives here; workers read and write it through the `muteki-blackboard` skill.
-- **Wind-down only clears the non-winner scratch under `workers/`**; `shared/`, `graph/`, `arts/`, `final/`, and `winner.json` are all kept, so a challenge can still be fully reviewed after it finishes.
+- **`state/control/graphs/<run-id>/shared_graph.db` is the authority**: workers use the role-scoped `muteki-blackboard` interface without receiving the database as a mount.
+- **Wind-down only clears non-winner scratch under `workers/`**; `shared/`, `arts/`, `final/`, `winner.json`, events, and coordinator state remain available for review.
 
 ---
 
-## Testing
+## Verification
 
 ```bash
-uv run --extra dev python -m pytest -q     # Python suite, using the project interpreter
-go test -C cmd/runtime-agent ./...         # Go supervisor (the module lives under cmd/runtime-agent/)
 ( cd apps/web/ui && npx tsc --noEmit )     # UI type-check
 ```
 
+Product acceptance evidence is recorded from real production runs and browser operations. The repository does not contain an automated test suite.
+
 ---
 
-## Roadmap / TODO
+## Current status and tasks
 
-- [ ] Continue container-mode hardening
-- [ ] Keep iterating and improving the web UI experience
-- [ ] TUI integration with the current Coordinator and Worker Settings (deferred)
-- [ ] Additional worker engines such as ZAI (deferred)
-- [ ] Fully automatic crawling of CTF-platform challenges, with auto-solving, auto-submission, and auto report generation (deferred)
+P1 authorized-platform acceptance and P2 deployment/optional-path acceptance are complete.
+The repository maintains one task list only:
+[`docs/current_iteration_todo.md`](docs/current_iteration_todo.md). The README no longer
+duplicates backlog entries.
 
 ---
 

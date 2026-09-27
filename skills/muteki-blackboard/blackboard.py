@@ -8,20 +8,25 @@ directly (stigmergy). The board holds:
   - dead-ends  : ruled-out directions (so nobody retries them)
   - intents    : declared exploration directions, claimable atomically
 
-The DB path comes from $MUTEKI_BLACKBOARD_DB (the coordinator sets it per worker).
+The DB path comes from $MUTEKI_BLACKBOARD_DB. It is provided only to framework
+workers and the post-solve respond path; ordinary role-scoped workers do not get
+a raw graph path.
 
-Usage:
-  blackboard.py read-facts [--verified-only]   # what teammates confirmed
-  blackboard.py read-review                    # review-arbiter challenges/directives
-  blackboard.py read-routes                    # suppressed/reopened routes
-  blackboard.py read-branches                  # branch hypotheses to split/verify
-  blackboard.py read-deadends                  # paths already ruled out — AVOID
-  blackboard.py read-flags                     # flags already found (multi-flag) — don't re-hunt
-  blackboard.py list-intents                   # open directions you can claim
-  blackboard.py write-fact "<text>" [--verified]
-  blackboard.py mark-deadend "<reason>"
+An ordinary worker never WRITES the DB: commands publish structured requests
+into $MUTEKI_BLACKBOARD_INGRESS_DIR and the owning host validates + applies them;
+its initial graph context is already present in the prompt. Framework swarms
+($MUTEKI_BLACKBOARD_FRAMEWORK set, e.g. f02/f11) keep direct RW access for
+their framework/teammate commands, which are otherwise not even registered.
+
+Ordinary Worker usage:
+  blackboard.py context                        # complete role-scoped live view
+  blackboard.py submit-fact "<title>" "<content>" # overwriteable draft
+  blackboard.py commit-step                    # publish draft and finish Step
   blackboard.py submit-flag '<flag>'             # the only Flag submission API
-  blackboard.py claim <intent_id>              # atomic; prints WON or LOST
+
+Framework-only teammate commands include read-facts/read-review/read-routes,
+read-branches/read-deadends/read-flags and list-intents. They are registered only
+when MUTEKI_BLACKBOARD_FRAMEWORK is set.
 
 This script is intentionally dependency-free (stdlib sqlite3 only) so it runs in
 any worker container without setup.
@@ -37,26 +42,69 @@ import sqlite3
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 
 _ACTOR = os.environ.get("MUTEKI_WORKER_ID", "worker")
 _INTENT_ID = os.environ.get("MUTEKI_INTENT_ID", "").strip()
+_TARGET_EPOCH = os.environ.get("MUTEKI_TARGET_EPOCH", "1").strip() or "1"
+_AUTONOMOUS_PROFILE = (
+    os.environ.get("MUTEKI_BLACKBOARD_PROFILE", "").strip().casefold()
+    == "autonomous"
+)
+# Framework swarms (f02 world-model, f11 agent-teams, ...) mark their workers
+# with this env var; those workers keep direct RW board access. Ordinary
+# workers (env empty) submit host-drained claim files and receive their scoped
+# read context in the prompt; framework/teammate subcommands are not registered.
+_FRAMEWORK_MODE = bool(os.environ.get("MUTEKI_BLACKBOARD_FRAMEWORK", "").strip())
+_ROLE = os.environ.get("MUTEKI_BLACKBOARD_ROLE", "solve").strip().casefold() or "solve"
+_CHALLENGE_MODE = (
+    os.environ.get("MUTEKI_CHALLENGE_MODE", "ctf").strip().casefold() or "ctf"
+)
+
+_SOLVE_COMMANDS = (
+    {"context", "read-artifact", "submit-fact", "commit-step", "mark-deadend", "request-input", "save-poc", "submit-flag"}
+    if _CHALLENGE_MODE == "ctf"
+    else {
+        "context", "write-fact", "mark-deadend", "request-input", "save-poc",
+        "submit-flag", "submit-report",
+    }
+)
+
+_ROLE_COMMANDS = {
+    "solve": _SOLVE_COMMANDS,
+    "verifier": (
+        {"context", "read-artifact", "submit-fact", "commit-step", "mark-deadend", "save-poc"}
+        if _CHALLENGE_MODE == "ctf"
+        else {"context", "write-fact", "mark-deadend", "save-poc"}
+    ),
+    "reproducer": {"context", "submit-repro"},
+    "review": {
+        "context", "review-finding", "challenge-fact", "merge-fact",
+        "reject-fact", "revalidate-fact",
+    },
+    "respond": {"context"},
+}
 
 
 def _db_path() -> str:
     p = os.environ.get("MUTEKI_BLACKBOARD_DB", "")
     if not p:
-        # fallback: a path file dropped in cwd by the coordinator
-        for cand in (".muteki_blackboard", "shared_graph.db"):
-            if os.path.isfile(cand):
-                return cand
-        print("ERROR: no blackboard DB ($MUTEKI_BLACKBOARD_DB unset and no "
-              "shared_graph.db in cwd)", file=sys.stderr)
+        print("ERROR: this Worker role has no raw blackboard DB capability",
+              file=sys.stderr)
         sys.exit(2)
     return p
 
 
 def _conn() -> sqlite3.Connection:
+    if not _FRAMEWORK_MODE:
+        # Post-solve respond may receive the DB for a full-board operator view,
+        # but never direct write authority. Ordinary solve roles have no path and
+        # therefore never reach this branch successfully.
+        path = os.path.abspath(_db_path())
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+        c.execute("PRAGMA query_only=ON")
+        return c
     c = sqlite3.connect(_db_path(), timeout=10)
     c.execute("PRAGMA busy_timeout=5000")
     return c
@@ -147,7 +195,7 @@ def read_flags() -> None:
     found: list[str] = []
     for payload, kind in rows:
         f = (json.loads(payload) or {}).get("flag")
-        if not f:
+        if f is None:
             continue
         if kind == "flag_found" and f not in found:
             found.append(f)
@@ -162,43 +210,47 @@ def read_flags() -> None:
 
 
 def submit_flag(flag: str) -> None:
-    """Submit one Flag candidate to the owning Worker for provenance validation.
+    _submit_request("submit_flag", {"flag": str(flag)})
 
-    This command never writes ``flag_found`` or the shared SQLite database. The
-    CliSolver that owns ``_ACTOR`` imports the atomic request through the host DB
-    owner, validates it against command output captured before this API call, then
-    appends a decision and publishes ``flag_found`` only when the gate accepts it.
-    """
 
-    value = str(flag or "").strip()
-    if not value or len(value) > 1024 or any(ord(ch) < 32 for ch in value):
-        print("ERROR: flag must be one non-empty line (maximum 1024 characters)",
-              file=sys.stderr)
-        sys.exit(2)
-    submission_id = f"fs-{uuid.uuid4().hex[:16]}"
-    request_dir = os.environ.get("MUTEKI_FLAG_SUBMISSION_DIR", "").strip()
+def submit_fact(title: str, content: str) -> None:
+    _submit_request("submit_fact", {
+        "title": str(title),
+        "content": str(content),
+    })
+
+
+def commit_step() -> None:
+    _submit_request("commit_step", {})
+
+
+def _ingress_dir() -> str:
+    return os.environ.get("MUTEKI_BLACKBOARD_INGRESS_DIR", "").strip()
+
+
+def _write_request(operation: str, payload: dict) -> str:
+    """Publish one structured request for the owning host to validate and apply."""
+    request_dir = _ingress_dir()
     if not request_dir:
-        print("ERROR: the owning Worker did not provide a Flag submission ingress",
+        print("ERROR: no Blackboard ingress ($MUTEKI_BLACKBOARD_INGRESS_DIR unset)",
               file=sys.stderr)
         sys.exit(2)
     os.makedirs(request_dir, mode=0o700, exist_ok=True)
-    request = {
-        "submission_id": submission_id,
-        "flag": value,
-        "intent_id": _INTENT_ID,
-        "actor": _ACTOR,
-        "protocol": "blackboard-api-v1",
+    request_id = f"br-{uuid.uuid4().hex[:16]}"
+    body = {
+        "protocol": "muteki-blackboard-v2",
+        "request_id": request_id,
+        "operation": operation,
         "created_at": time.time(),
     }
-    # Container and host must not write the same SQLite WAL.  Publish one complete
-    # request through an atomic rename; the owning host CliSolver is the only DB
-    # writer and the only component allowed to validate provenance.
+    body.update(payload)
     fd, temporary = tempfile.mkstemp(
-        prefix=f".{submission_id}-", suffix=".tmp", dir=request_dir)
-    final_path = os.path.join(request_dir, f"{submission_id}.json")
+        prefix=f".{request_id}-", suffix=".tmp", dir=request_dir)
+    final_path = os.path.join(
+        request_dir, f"request-{operation}-{request_id}.json")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(request, handle, ensure_ascii=False, separators=(",", ":"))
+            json.dump(body, handle, ensure_ascii=False, separators=(",", ":"))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, final_path)
@@ -208,9 +260,50 @@ def submit_flag(flag: str) -> None:
         except OSError:
             pass
         raise
-    # Do not echo the candidate. Tool output from the submission call must never
-    # become evidence for its own payload.
-    print(f"SUBMITTED {submission_id}; awaiting provenance validation")
+    return request_id
+
+
+def _await_request_result(request_id: str, timeout_s: float = 30.0) -> dict | None:
+    result_path = os.path.join(_ingress_dir(), f"result-{request_id}.json")
+    deadline = time.time() + timeout_s
+    while True:
+        try:
+            with open(result_path, "r", encoding="utf-8") as handle:
+                result = json.load(handle)
+            if isinstance(result, dict):
+                return result
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            pass  # partially written — retry next tick
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.2)
+
+
+def _request_timeout() -> None:
+    print("ERROR: host did not answer the Blackboard request within 30s",
+          file=sys.stderr)
+    sys.exit(3)
+
+
+def _submit_request(operation: str, payload: dict) -> dict:
+    request_id = _write_request(operation, payload)
+    result = _await_request_result(request_id)
+    if result is None:
+        _request_timeout()
+    message = str(result.get("message") or result.get("detail") or "")
+    if not result.get("ok"):
+        print(f"REJECTED{(': ' + message) if message else ''}", file=sys.stderr)
+        sys.exit(2)
+    print(message or "OK")
+    return result
+
+
+def _print_claim_verdict(result: dict | None) -> None:
+    if result is None:
+        _request_timeout()
+    print("WON" if result.get("won") else "LOST")
 
 
 def read_deadends() -> None:
@@ -365,43 +458,125 @@ def list_intents() -> None:
 
 
 
-def write_fact(text: str, verified: bool) -> None:
+def write_fact(text: str, verified: bool, witness: str = "", *,
+               subject: str = "", predicate: str = "", object_value=None,
+               scope: str = "", canonical_key: str = "",
+               capability_key: str = "", capability_kind: str = "generic",
+               capability_quality: str = "",
+               capability_sharing: str = "run-shared") -> None:
+    if not _FRAMEWORK_MODE:
+        _submit_request("fact", {"text": text})
+        return
     c = _conn()
     cid = _challenge_id(c)
-    payload_obj = {"source": _ACTOR, "fact": text, "source_solver": _ACTOR,
-                   "witness": None, "verifier": _ACTOR if verified else ""}
-    if _INTENT_ID:
-        payload_obj["intent_id"] = _INTENT_ID
-    payload = json.dumps(payload_obj)
-    # dedupe on fact IDENTITY, matching SQLiteSharedGraph.add_evidence exactly so a
-    # bare skill fact and its "[engine] <text>" VERIFIED_FACT marker echo collide on
-    # one key (strip a leading "[engine] " tag, fold whitespace, lowercase; artifact
-    # is provenance, not identity). Keep this in lockstep with _normalize_fact_identity.
-    _norm = re.sub(r"^\[[a-z0-9 _.-]{1,40}\]\s*", "", text, flags=re.IGNORECASE)
-    _norm = " ".join(_norm.split()).lower()
-    dk = f"fact::{_ACTOR}::{_norm}"
-    try:
-        cur = c.execute(
-            "INSERT INTO events (ts, challenge_id, actor, kind, payload, "
-            "artifact_id, verified, confidence, dedupe_key) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (time.time(), cid, _ACTOR, "fact_added", payload, None,
-             int(verified), 1.0 if verified else 0.4, dk))
-        fact_seq = int(cur.lastrowid or 0)
-        if _INTENT_ID and fact_seq > 0 and _has_table(c, "intent_products"):
-            c.execute(
-                "INSERT OR IGNORE INTO intent_products (intent_id, fact_seq) VALUES (?,?)",
-                (_INTENT_ID, fact_seq))
-        c.commit()
-        print(f"OK wrote {'verified' if verified else 'candidate'} fact")
-    except sqlite3.IntegrityError:
-        print("OK (duplicate fact, already on board)")
+    # Framework workers have no host-captured tool binding. Preserve their
+    # claim as an Observation; it cannot enter the planning Fact set.
+    observed_at = time.time()
+    _norm = unicodedata.normalize("NFKC", text)
+    _norm = re.sub(
+        r"^\[[a-z0-9 _.-]{1,40}\]\s*", "", _norm,
+        flags=re.IGNORECASE)
+    _norm = _norm.translate(str.maketrans({
+        "“": '"', "”": '"', "‘": "'", "’": "'",
+        "—": "-", "–": "-", "：": ":", "，": ",", "。": ".",
+    }))
+    _norm = " ".join(_norm.split()).strip(" \t\r\n.,;:!").casefold()
+    canonical = canonical_key.strip().casefold() or _norm
+    payload_obj = {
+        "source": _ACTOR, "text": text, "source_solver": _ACTOR,
+        "intent_id": _INTENT_ID, "target_epoch": _TARGET_EPOCH,
+        "witness": witness or None, "claimed_verified": bool(verified),
+        "admitted": False, "canonical_key": canonical,
+        "subject": subject, "predicate": predicate, "object": object_value,
+        "scope": scope or _TARGET_EPOCH,
+        "evidence_provenance": {"worker_id": _ACTOR, "intent_id": _INTENT_ID,
+                                "target_epoch": _TARGET_EPOCH,
+                                "observed_at": observed_at},
+    }
+    digest = hashlib.sha256(
+        f"{_ACTOR}\x1f{_INTENT_ID}\x1f{_TARGET_EPOCH}\x1f{canonical}".encode()
+    ).hexdigest()
+    cur = c.execute(
+        "INSERT OR IGNORE INTO events (ts,challenge_id,actor,kind,payload,artifact_id,"
+        "verified,confidence,dedupe_key) VALUES (?,?,?,?,?,NULL,0,0.4,?)",
+        (observed_at, cid, _ACTOR, "observation_added",
+         json.dumps(payload_obj, ensure_ascii=False), f"observation::{cid}::{digest}"),
+    )
+    observation_seq = int(cur.lastrowid or 0)
+    if observation_seq and _has_table(c, "observations"):
+        c.execute(
+            "INSERT OR IGNORE INTO observations (observation_seq,challenge_id,actor,intent_id,"
+            "target_epoch,text,witness,artifact_id,provenance_json,canonical_key,"
+            "admitted_fact_seq,created_at) VALUES (?,?,?,?,?,?,?,NULL,?,?,NULL,?)",
+            (observation_seq, cid, _ACTOR, _INTENT_ID, _TARGET_EPOCH, text,
+             witness or None, json.dumps(payload_obj["evidence_provenance"]),
+             canonical, observed_at),
+        )
+    c.commit()
+    print(f"OK observation_seq={observation_seq}")
 
 
-def mark_deadend(reason: str) -> None:
+def report_capability_gap(description: str, required: list[str],
+                          consumers: list[str]) -> None:
+    _submit_request("report_capability_gap", {
+        "description": description, "required_capabilities": required,
+        "consumers": consumers,
+    })
+
+
+def publish_capability(key: str, kind: str, quality: str, sharing: str,
+                       evidence: list[int], metadata_json: str) -> None:
+    metadata = json.loads(metadata_json) if metadata_json else {}
+    _submit_request("publish_capability", {
+        "capability_key": key, "kind": kind, "quality": quality,
+        "sharing": sharing, "evidence_fact_seqs": evidence, "metadata": metadata,
+    })
+
+
+def launch_runtime_resource(name: str, command: str, allocate_port: bool,
+                            cleanup_command: str = "") -> None:
+    _submit_request("launch_runtime_resource", {
+        "name": name, "command": command, "allocate_port": allocate_port,
+        "cleanup_command": cleanup_command,
+    })
+
+
+def publish_access_path(resource_id: str, reach: list[str], operations: list[str],
+                        quality: str, endpoint: str, use_env: list[str],
+                        health_host: str, health_port: int,
+                        dependency_facts: list[int], capabilities: list[str]) -> None:
+    env = {}
+    for item in use_env:
+        key, sep, value = str(item).partition("=")
+        if sep and key.strip():
+            env[key.strip()] = value
+    health = ({"kind": "tcp", "host": health_host, "port": health_port}
+              if health_port > 0 else {})
+    _submit_request("publish_access_path", {
+        "runtime_resource_id": resource_id, "reach": reach,
+        "operations": operations, "quality": quality, "endpoint": endpoint,
+        "use_spec": {"env": env}, "health": health,
+        "dependency_fact_seqs": dependency_facts,
+        "capability_keys": capabilities,
+    })
+
+
+def mark_deadend(reason: str, tested_scope: str = "",
+                 observed_result: str = "") -> None:
+    if not _FRAMEWORK_MODE:
+        _submit_request("dead_end", {
+            "reason": reason,
+            "tested_scope": tested_scope,
+            "observed_result": observed_result,
+        })
+        return
     c = _conn()
     cid = _challenge_id(c)
-    payload = json.dumps({"reason": reason})
+    payload = json.dumps({
+        "reason": reason,
+        "tested_scope": tested_scope,
+        "observed_result": observed_result,
+    })
     try:
         c.execute(
             "INSERT INTO events (ts, challenge_id, actor, kind, payload, "
@@ -414,7 +589,124 @@ def mark_deadend(reason: str) -> None:
         print("OK (dead-end already recorded)")
 
 
+def request_input(need: str) -> None:
+    _submit_request("need_input", {"need": need})
+
+
+def save_poc(path: str, entry_command: str, status: str, note: str) -> None:
+    _submit_request("save_poc", {
+        "path": path,
+        "entry_command": entry_command,
+        "status": status,
+        "note": note,
+    })
+
+
+def submit_report(path: str) -> None:
+    _submit_request("submit_report", {"path": path})
+
+
+def submit_repro(result: str, witness: str, reason: str) -> None:
+    _submit_request("submit_repro", {
+        "reproduced": result == "yes",
+        "witness": witness,
+        "reason": reason,
+    })
+
+
+def propose_branch(goal: str, expected_observable: str,
+                   stop_condition: str, coverage_key: str,
+                   route_hash: str, lane_key: str = "",
+                   risk_class: str = "", resource_key: str = "") -> None:
+    _submit_request("branch_proposal", {
+        "goal": goal,
+        "expected_observable": expected_observable,
+        "stop_condition": stop_condition,
+        "coverage_key": coverage_key,
+        "route_hash": route_hash,
+        "lane_key": lane_key,
+        "risk_class": risk_class,
+        "resource_key": resource_key,
+    })
+
+
+def review_finding(kind: str, severity: str, summary: str,
+                   recommended_actions: list[str]) -> None:
+    _submit_request("review_finding", {
+        "kind": kind,
+        "severity": severity,
+        "summary": summary,
+        "recommended_actions": recommended_actions,
+    })
+
+
+def challenge_fact(fact_seq: int, reason: str, verification_goal: str) -> None:
+    _submit_request("fact_challenge", {
+        "fact_seq": fact_seq,
+        "reason": reason,
+        "verification_goal": verification_goal,
+    })
+
+
+def merge_fact(from_fact_seq: int, to_fact_seq: int, reason: str) -> None:
+    _submit_request("fact_merge", {
+        "from_fact_seq": from_fact_seq,
+        "to_fact_seq": to_fact_seq,
+        "reason": reason,
+    })
+
+
+def reject_fact(fact_seq: int, reason: str) -> None:
+    _submit_request("fact_reject", {"fact_seq": fact_seq, "reason": reason})
+
+
+def revalidate_fact(fact_seq: int, reason: str) -> None:
+    _submit_request("fact_revalidation", {
+        "fact_seq": fact_seq,
+        "reason": reason,
+    })
+
+
+def refresh_context() -> None:
+    request_id = _write_request("context", {})
+    result = _await_request_result(request_id)
+    if result is None:
+        _request_timeout()
+    if not result.get("ok"):
+        print(str(result.get("detail") or "context unavailable"), file=sys.stderr)
+        sys.exit(2)
+    print(str(result.get("content") or "(no scoped context available)"))
+
+
+def read_artifact(artifact_id: str) -> None:
+    request_id = _write_request("read_artifact", {"artifact_id": artifact_id})
+    result = _await_request_result(request_id)
+    if result is None:
+        _request_timeout()
+    if not result.get("ok"):
+        print(str(result.get("detail") or "artifact unavailable"), file=sys.stderr)
+        sys.exit(2)
+    sys.stdout.write(str(result.get("content") or ""))
+
+
+def submission_lock(action: str, note: str) -> None:
+    request_id = _write_request(
+        "submission_lock", {"action": action, "note": note})
+    result = _await_request_result(request_id)
+    if result is None:
+        _request_timeout()
+    if not result.get("ok"):
+        message = str(result.get("message") or result.get("detail") or "")
+        print(f"REJECTED{(': ' + message) if message else ''}", file=sys.stderr)
+        sys.exit(2)
+    print("WON" if result.get("won") else "LOST")
+
+
 def claim(intent_id: str) -> None:
+    if not _FRAMEWORK_MODE:
+        claim_id = _write_request("claim_intent", {"intent_id": intent_id})
+        _print_claim_verdict(_await_request_result(claim_id))
+        return
     c = _conn()
     cid = _challenge_id(c)
     now = time.time()
@@ -450,6 +742,10 @@ def _norm_activity_key(key: str) -> str:
 def claim_activity(key: str, lease_s: float = 600.0) -> None:
     """P4: claim a high-cost activity (e.g. 'nmap:8.130.96.176'). WON = go ahead;
     LOST = a teammate is already doing it, AVOID redoing."""
+    if not _FRAMEWORK_MODE:
+        claim_id = _write_request("claim_activity", {"key": key})
+        _print_claim_verdict(_await_request_result(claim_id))
+        return
     c = _conn()
     cid = _challenge_id(c)
     nkey = _norm_activity_key(key)
@@ -506,6 +802,12 @@ def claim_resource(resource_key: str, scope: str = "activity",
                    risk_class: str = "", lease_s: float = 600.0) -> None:
     """E: claim a shared RESOURCE (exclusive site/account/listener). WON = exclusive
     access granted; LOST = a teammate holds it — do not run conflicting work."""
+    if not _FRAMEWORK_MODE:
+        claim_id = _write_request("claim_resource", {
+            "resource_key": resource_key, "scope": scope,
+            "risk_class": risk_class})
+        _print_claim_verdict(_await_request_result(claim_id))
+        return
     c = _conn()
     cid = _challenge_id(c)
     rkey = _normalize_resource_key(resource_key)
@@ -548,6 +850,14 @@ def claim_resource(resource_key: str, scope: str = "activity",
 
 def release_resource(resource_key: str) -> None:
     """E: release a resource lock this worker holds (owner-fenced, best-effort)."""
+    if not _FRAMEWORK_MODE:
+        claim_id = _write_request("release_resource",
+                                {"resource_key": resource_key})
+        result = _await_request_result(claim_id)
+        if result is None:
+            _request_timeout()
+        print("OK" if result.get("ok") else "LOST")
+        return
     c = _conn()
     cid = _challenge_id(c)
     rkey = _normalize_resource_key(resource_key)
@@ -910,20 +1220,6 @@ def read_epistemic() -> None:
         print(f"n{r[0]} {r[1]} [{r[2]}] conf={r[3]} {r[4]}")
 
 
-def read_edge_shells() -> None:
-    c = _conn()
-    if not _has_table(c, "edge_worker_budget"):
-        print("(no edge_worker_budget — framework not active)")
-        return
-    for r in c.execute(
-        "SELECT shell_id, intent_id, turns_used, turn_limit, killed "
-        "FROM edge_worker_budget ORDER BY updated_at DESC LIMIT 40"
-    ):
-        print(
-            f"shell {r[0]} intent={r[1]} turns={r[2]}/{r[3]} killed={r[4]}"
-        )
-
-
 def write_outcome(text: str, state: str = "satisfied", note: str = "") -> None:
     """f01: append a zero-authority worker observation for one declared target."""
     c = _conn()
@@ -987,7 +1283,8 @@ TEAMMATE_ALLOWED_CMDS = frozenset({
     "msg-send", "msg-check", "task-list", "task-claim", "task-done",
     "assert-write", "artifact-put", "token-wait", "heartbeat",
     "write-fact", "mark-deadend", "claim", "claim-resource", "release-resource",
-    "list-intents", "read-flags", "read-resource-locks", "read-deadends",
+    "list-intents", "read-flags",
+    "read-resource-locks", "read-deadends",
     "read-review",
     "submit-flag",
 })
@@ -1421,6 +1718,17 @@ def heartbeat() -> None:
     print("OK")
 
 
+def _read_guard(fn, *args) -> None:
+    """Ordinary-mode board reads degrade gracefully: an unreadable DB prints a
+    stderr note and empty output instead of crashing the worker's turn."""
+    try:
+        fn(*args)
+    except sqlite3.OperationalError as exc:
+        if _FRAMEWORK_MODE:
+            raise
+        print(f"(blackboard read unavailable: {exc})", file=sys.stderr)
+
+
 def main() -> None:
     # Gate-0b: --mode=teammate registers ONLY the teammate whitelist — the
     # full-board read subcommands are not merely rejected, they do not exist.
@@ -1432,6 +1740,9 @@ def main() -> None:
     def _reg(name: str):
         if teammate_mode and name not in TEAMMATE_ALLOWED_CMDS:
             return None  # not registered in teammate mode
+        if (not _FRAMEWORK_MODE
+                and name not in _ROLE_COMMANDS.get(_ROLE, {"context"})):
+            return None
         return sub.add_parser(name)
 
     ap = argparse.ArgumentParser(prog="blackboard.py")
@@ -1452,17 +1763,87 @@ def main() -> None:
     p = _reg("write-fact")
     if p is not None:
         p.add_argument("text")
-        p.add_argument("--verified", action="store_true")
+    p = _reg("submit-fact")
+    if p is not None:
+        p.add_argument("title")
+        p.add_argument("content")
+    _reg("commit-step")
     p = _reg("mark-deadend")
     if p is not None:
         p.add_argument("reason")
+        p.add_argument("--tested", default="")
+        p.add_argument("--observed", default="")
+    if not _AUTONOMOUS_PROFILE:
+        p = _reg("request-input")
+        if p is not None:
+            p.add_argument("need")
+    p = _reg("save-poc")
+    if p is not None:
+        p.add_argument("path")
+        p.add_argument("--entry-command", default="")
+        p.add_argument(
+            "--status", choices=("available", "wip", "directional", "spent"),
+            default="available")
+        p.add_argument("--note", default="")
+    p = _reg("submit-report")
+    if p is not None:
+        p.add_argument("path")
+    p = _reg("submit-repro")
+    if p is not None:
+        p.add_argument("--result", choices=("yes", "no"), required=True)
+        p.add_argument("--witness", default="")
+        p.add_argument("--reason", default="")
+    p = _reg("propose-branch")
+    if p is not None:
+        p.add_argument("goal")
+        p.add_argument("--expected-observable", required=True)
+        p.add_argument("--stop-condition", required=True)
+        p.add_argument("--coverage-key", default="")
+        p.add_argument("--route-hash", default="")
+        p.add_argument("--lane-key", default="")
+        p.add_argument("--risk-class", default="")
+        p.add_argument("--resource-key", default="")
+    p = _reg("review-finding")
+    if p is not None:
+        p.add_argument("--kind", required=True)
+        p.add_argument("--severity", default="info")
+        p.add_argument("--summary", required=True)
+        p.add_argument("--recommended-action", action="append", default=[])
+    p = _reg("challenge-fact")
+    if p is not None:
+        p.add_argument("fact_seq", type=int)
+        p.add_argument("--reason", required=True)
+        p.add_argument("--verification-goal", required=True)
+    p = _reg("merge-fact")
+    if p is not None:
+        p.add_argument("from_fact_seq", type=int)
+        p.add_argument("to_fact_seq", type=int)
+        p.add_argument("--reason", required=True)
+    p = _reg("reject-fact")
+    if p is not None:
+        p.add_argument("fact_seq", type=int)
+        p.add_argument("--reason", required=True)
+    p = _reg("revalidate-fact")
+    if p is not None:
+        p.add_argument("fact_seq", type=int)
+        p.add_argument("--reason", required=True)
+    _reg("context")
+    p = _reg("read-artifact")
+    if p is not None:
+        p.add_argument("artifact_id")
+    p = _reg("submission-lock")
+    if p is not None:
+        p.add_argument("action", choices=("acquire", "release"))
+        p.add_argument("--note", default="")
     p = _reg("claim")
     if p is not None:
         p.add_argument("intent_id")
     if not teammate_mode:
-        p = sub.add_parser("claim-activity")
-        p.add_argument("key")
-        sub.add_parser("list-activities")
+        p = _reg("claim-activity")
+        if p is not None:
+            p.add_argument("key")
+        if _FRAMEWORK_MODE:
+            sub.add_parser("list-activities")
     p = _reg("claim-resource")
     if p is not None:
         p.add_argument("resource_key")
@@ -1471,146 +1852,230 @@ def main() -> None:
     p = _reg("release-resource")
     if p is not None:
         p.add_argument("resource_key")
+    p = _reg("report-capability-gap")
+    if p is not None:
+        p.add_argument("description")
+        p.add_argument("--requires", action="append", default=[])
+        p.add_argument("--consumer", action="append", default=[])
+    p = _reg("publish-capability")
+    if p is not None:
+        p.add_argument("capability_key")
+        p.add_argument("--kind", default="generic")
+        p.add_argument("--quality", default="")
+        p.add_argument("--sharing", default="run-shared")
+        p.add_argument("--fact", action="append", type=int, default=[])
+        p.add_argument("--metadata-json", default="{}")
+    p = _reg("launch-runtime-resource")
+    if p is not None:
+        p.add_argument("name")
+        p.add_argument("--command", required=True)
+        p.add_argument("--allocate-port", action="store_true")
+        p.add_argument("--cleanup-command", default="")
+    p = _reg("publish-access-path")
+    if p is not None:
+        p.add_argument("runtime_resource_id")
+        p.add_argument("--reach", action="append", default=[])
+        p.add_argument("--operation", action="append", default=[])
+        p.add_argument("--quality", default="multiplexed")
+        p.add_argument("--endpoint", default="")
+        p.add_argument("--use-env", action="append", default=[])
+        p.add_argument("--health-host", default="127.0.0.1")
+        p.add_argument("--health-port", type=int, default=0)
+        p.add_argument("--fact", action="append", type=int, default=[])
+        p.add_argument("--capability", action="append", default=[])
     _reg("read-resource-locks")
-    if not teammate_mode:
+    if not teammate_mode and _FRAMEWORK_MODE:
         sub.add_parser("read-directives")
         p = sub.add_parser("directive-status")
         p.add_argument("directive_id")
         # f01 declared-effects (lazy: tables may be absent on production Swarm)
         sub.add_parser("read-declarations")
-        p = sub.add_parser("write-outcome")
-        p.add_argument("text", help="declared target_id (or note when only one target exists)")
-        p.add_argument(
-            "--state",
-            choices=("satisfied", "unsatisfied", "indeterminate"),
-            default="satisfied",
-        )
-        p.add_argument("--note", default="")
+        # Framework writes exist ONLY for framework workers — an ordinary
+        # worker ($MUTEKI_BLACKBOARD_FRAMEWORK unset) submits host-drained
+        # claim files and never sees these subcommands.
+        if _FRAMEWORK_MODE:
+            p = sub.add_parser("write-outcome")
+            p.add_argument("text", help="declared target_id (or note when only one target exists)")
+            p.add_argument(
+                "--state",
+                choices=("satisfied", "unsatisfied", "indeterminate"),
+                default="satisfied",
+            )
+            p.add_argument("--note", default="")
         # f02 world-model (lazy: tables may be absent)
         sub.add_parser("read-model")
-        p = sub.add_parser("write-prediction")
-        p.add_argument("text")
-        p = sub.add_parser("write-observation")
-        p.add_argument("text")
+        if _FRAMEWORK_MODE:
+            p = sub.add_parser("write-prediction")
+            p.add_argument("text")
+            p = sub.add_parser("write-observation")
+            p.add_argument("text")
         # f03 solution-tree (lazy)
         sub.add_parser("read-tree")
-        p = sub.add_parser("write-checkpoint")
-        p.add_argument("checkpoint_id")
+        if _FRAMEWORK_MODE:
+            p = sub.add_parser("write-checkpoint")
+            p.add_argument("checkpoint_id")
         # f04 qd-archive (lazy)
         sub.add_parser("read-archive")
         # f05 market (lazy)
         sub.add_parser("market-list")
         # f06 case-bank (lazy)
         sub.add_parser("read-cases")
-        # f07–f10 lazy readouts
+        # f07–f09 lazy readouts
         sub.add_parser("read-slow-tree")
         sub.add_parser("read-lineages")
         sub.add_parser("read-epistemic")
-        sub.add_parser("read-edge-shells")
-    # f11 agent-teams (teammate whitelist; always registered outside teammate
-    # mode too, so lead/coordinator tooling can inspect)
-    p = sub.add_parser("msg-send")
-    p.add_argument("--kind", default="direct")
-    p.add_argument("--to", default="", help="comma-separated members, or *")
-    p.add_argument("--body", default="")
-    p.add_argument("--verbatim", action="append", default=[])
-    p.add_argument("--evidence", action="append", default=[],
-                   help="kind:ref:digest (repeatable)")
-    p.add_argument("--hop", type=int, default=0)
-    p.add_argument("--require-ack", action="store_true")
-    p.add_argument("--thread", default=None)
-    p.add_argument("--channel-kind", default=None)
-    p.add_argument("--ack-of", default=None)
-    p = sub.add_parser("msg-check")
-    p.add_argument("--after-seq", type=int, default=0)
-    p.add_argument("--digest", action="store_true",
-                   help="pull the latest channel digest instead of raw messages")
-    p = sub.add_parser("task-list")
-    p.add_argument("--status", default="")
-    p = sub.add_parser("task-claim")
-    p.add_argument("task_id")
-    p.add_argument("--token-id", default="")
-    p.add_argument("--token-fence", type=int, default=-1)
-    p = sub.add_parser("task-done")
-    p.add_argument("task_id")
-    p.add_argument("--evidence", action="append", default=[])
-    p = sub.add_parser("assert-write")
-    p.add_argument("text")
-    p.add_argument("--evidence", action="append", default=[])
-    p.add_argument("--confidence", type=float, default=0.7)
-    p = sub.add_parser("artifact-put")
-    p.add_argument("path")
-    p = sub.add_parser("token-wait")
-    p.add_argument("--token-id", default="")
-    p.add_argument("--protocol", default="")
-    p.add_argument("--timeout", type=float, default=60.0)
-    sub.add_parser("heartbeat")
+    # f11 agent-teams (teammate whitelist). Registered ONLY for framework
+    # workers ($MUTEKI_BLACKBOARD_FRAMEWORK set) — an ordinary worker never
+    # sees the team subcommands at all.
+    if _FRAMEWORK_MODE:
+        p = sub.add_parser("msg-send")
+        p.add_argument("--kind", default="direct")
+        p.add_argument("--to", default="", help="comma-separated members, or *")
+        p.add_argument("--body", default="")
+        p.add_argument("--verbatim", action="append", default=[])
+        p.add_argument("--evidence", action="append", default=[],
+                       help="kind:ref:digest (repeatable)")
+        p.add_argument("--hop", type=int, default=0)
+        p.add_argument("--require-ack", action="store_true")
+        p.add_argument("--thread", default=None)
+        p.add_argument("--channel-kind", default=None)
+        p.add_argument("--ack-of", default=None)
+        p = sub.add_parser("msg-check")
+        p.add_argument("--after-seq", type=int, default=0)
+        p.add_argument("--digest", action="store_true",
+                       help="pull the latest channel digest instead of raw messages")
+        p = sub.add_parser("task-list")
+        p.add_argument("--status", default="")
+        p = sub.add_parser("task-claim")
+        p.add_argument("task_id")
+        p.add_argument("--token-id", default="")
+        p.add_argument("--token-fence", type=int, default=-1)
+        p = sub.add_parser("task-done")
+        p.add_argument("task_id")
+        p.add_argument("--evidence", action="append", default=[])
+        p = sub.add_parser("assert-write")
+        p.add_argument("text")
+        p.add_argument("--evidence", action="append", default=[])
+        p.add_argument("--confidence", type=float, default=0.7)
+        p = sub.add_parser("artifact-put")
+        p.add_argument("path")
+        p = sub.add_parser("token-wait")
+        p.add_argument("--token-id", default="")
+        p.add_argument("--protocol", default="")
+        p.add_argument("--timeout", type=float, default=60.0)
+        sub.add_parser("heartbeat")
     args = ap.parse_args()
 
     if args.cmd == "read-facts":
-        read_facts(args.verified_only)
+        _read_guard(read_facts, args.verified_only)
     elif args.cmd == "read-review":
-        read_review()
+        _read_guard(read_review)
     elif args.cmd == "read-routes":
-        read_routes()
+        _read_guard(read_routes)
     elif args.cmd == "read-branches":
-        read_branches()
+        _read_guard(read_branches)
     elif args.cmd == "read-deadends":
-        read_deadends()
+        _read_guard(read_deadends)
     elif args.cmd == "read-flags":
-        read_flags()
+        _read_guard(read_flags)
     elif args.cmd == "submit-flag":
         submit_flag(args.flag)
     elif args.cmd == "list-intents":
-        list_intents()
+        _read_guard(list_intents)
     elif args.cmd == "write-fact":
-        write_fact(args.text, args.verified)
+        write_fact(args.text, False)
+    elif args.cmd == "submit-fact":
+        submit_fact(args.title, args.content)
+    elif args.cmd == "commit-step":
+        commit_step()
     elif args.cmd == "mark-deadend":
-        mark_deadend(args.reason)
+        mark_deadend(args.reason, args.tested, args.observed)
+    elif args.cmd == "request-input":
+        request_input(args.need)
+    elif args.cmd == "save-poc":
+        save_poc(args.path, args.entry_command, args.status, args.note)
+    elif args.cmd == "submit-report":
+        submit_report(args.path)
+    elif args.cmd == "submit-repro":
+        submit_repro(args.result, args.witness, args.reason)
+    elif args.cmd == "propose-branch":
+        propose_branch(
+            args.goal, args.expected_observable,
+            args.stop_condition, args.coverage_key, args.route_hash,
+            args.lane_key, args.risk_class, args.resource_key)
+    elif args.cmd == "review-finding":
+        review_finding(
+            args.kind, args.severity, args.summary, args.recommended_action)
+    elif args.cmd == "challenge-fact":
+        challenge_fact(args.fact_seq, args.reason, args.verification_goal)
+    elif args.cmd == "merge-fact":
+        merge_fact(args.from_fact_seq, args.to_fact_seq, args.reason)
+    elif args.cmd == "reject-fact":
+        reject_fact(args.fact_seq, args.reason)
+    elif args.cmd == "revalidate-fact":
+        revalidate_fact(args.fact_seq, args.reason)
+    elif args.cmd == "context":
+        refresh_context()
+    elif args.cmd == "read-artifact":
+        read_artifact(args.artifact_id)
+    elif args.cmd == "submission-lock":
+        submission_lock(args.action, args.note)
     elif args.cmd == "claim":
         claim(args.intent_id)
     elif args.cmd == "claim-activity":
         claim_activity(args.key)
     elif args.cmd == "list-activities":
-        list_activities()
+        _read_guard(list_activities)
     elif args.cmd == "claim-resource":
         claim_resource(args.resource_key, scope=args.scope, risk_class=args.risk_class)
     elif args.cmd == "release-resource":
         release_resource(args.resource_key)
+    elif args.cmd == "report-capability-gap":
+        report_capability_gap(args.description, args.requires, args.consumer)
+    elif args.cmd == "publish-capability":
+        publish_capability(args.capability_key, args.kind, args.quality,
+                           args.sharing, args.fact, args.metadata_json)
+    elif args.cmd == "launch-runtime-resource":
+        launch_runtime_resource(
+            args.name, args.command, args.allocate_port, args.cleanup_command)
+    elif args.cmd == "publish-access-path":
+        publish_access_path(
+            args.runtime_resource_id, args.reach, args.operation, args.quality,
+            args.endpoint, args.use_env, args.health_host, args.health_port,
+            args.fact, args.capability,
+        )
     elif args.cmd == "read-resource-locks":
-        read_resource_locks()
+        _read_guard(read_resource_locks)
     elif args.cmd == "read-directives":
-        read_directives()
+        _read_guard(read_directives)
     elif args.cmd == "directive-status":
-        directive_status(args.directive_id)
+        _read_guard(directive_status, args.directive_id)
     elif args.cmd == "read-declarations":
-        read_declarations()
+        _read_guard(read_declarations)
     elif args.cmd == "write-outcome":
         write_outcome(args.text, state=args.state, note=args.note)
     elif args.cmd == "read-model":
-        read_model()
+        _read_guard(read_model)
     elif args.cmd == "write-prediction":
         write_prediction(args.text)
     elif args.cmd == "write-observation":
         write_observation(args.text)
     elif args.cmd == "read-tree":
-        read_tree()
+        _read_guard(read_tree)
     elif args.cmd == "write-checkpoint":
         write_checkpoint(args.checkpoint_id)
     elif args.cmd == "read-archive":
-        read_archive()
+        _read_guard(read_archive)
     elif args.cmd == "market-list":
-        market_list()
+        _read_guard(market_list)
     elif args.cmd == "read-cases":
-        read_cases()
+        _read_guard(read_cases)
     elif args.cmd == "read-slow-tree":
-        read_slow_tree()
+        _read_guard(read_slow_tree)
     elif args.cmd == "read-lineages":
-        read_lineages()
+        _read_guard(read_lineages)
     elif args.cmd == "read-epistemic":
-        read_epistemic()
-    elif args.cmd == "read-edge-shells":
-        read_edge_shells()
+        _read_guard(read_epistemic)
     # f11 agent-teams team subcommands
     elif args.cmd == "msg-send":
         msg_send(args.kind, [t for t in str(args.to).split(",") if t],

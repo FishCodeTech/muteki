@@ -1,5 +1,7 @@
 "use client";
 
+import { MotionIcon } from "@/components/MotionIcon";
+
 import { useEffect, useState, useRef, type ReactNode } from "react";
 import type {
   BlackboardFact,
@@ -21,6 +23,7 @@ import {
 import { useCopied } from "@/lib/useCopied";
 import { useT } from "@/lib/i18n";
 import { Icon } from "@/components/Icon";
+import { Button, Tabs } from "@heroui/react";
 
 export type ReportCredential = { entity: string; value: string; seq?: number };
 export type ReportStatusFilter = "all" | VulnReportStatus;
@@ -122,16 +125,16 @@ function CopyAction({
   const t = useT();
   const [copied, copy] = useCopied();
   return (
-    <button
+    <Button
       type="button"
       className={`${className} ${copied ? "copied" : ""}`.trim()}
-      title={t(titleKey)}
+      data-tooltip={t(titleKey)}
       aria-label={t(ariaKey, { text })}
       onClick={() => copy(text)}
     >
-      <Icon name={copied ? "check" : "copy"} size={13} />
+      <MotionIcon active={copied} from="copy" to="check" size={13} />
       {label !== undefined && <span>{copied ? t("common.copied") : label}</span>}
-    </button>
+    </Button>
   );
 }
 
@@ -146,7 +149,7 @@ function Field({ label, value }: { label: string; value?: string }) {
   );
 }
 
-export function VulnReportDoc({
+function VulnReportDoc({
   row,
   clock,
   focused,
@@ -196,21 +199,21 @@ export function VulnReportDoc({
       <div className="artifact-row-top">
         <span
           className={`artifact-badge ${severityBadgeClass(cvss.rating)}`}
-          title={t("runtime.reports.cvssHint")}
+          data-tooltip={t("runtime.reports.cvssHint")}
         >
           {cvss.badge}
         </span>
         <span className={`artifact-badge ${badgeClass(row.status)}`}>{statusLabel(row.status, t)}</span>
-        <button
+        <Button
           type="button"
           className="report-toggle"
           aria-expanded={open}
-          title={t(open ? "runtime.reports.collapse" : "runtime.reports.expand")}
+          aria-label={t(open ? "runtime.reports.collapse" : "runtime.reports.expand")}
           onClick={() => setOpen((value) => !value)}
         >
           <span className="artifact-row-title">{row.title || row.id}</span>
           <Icon name="chevronDown" size={13} />
-        </button>
+        </Button>
         {row.findingClass && (
           <span className="artifact-chip">{findingClassLabel(row.findingClass)}</span>
         )}
@@ -237,6 +240,22 @@ export function VulnReportDoc({
           />
           <Field label={t("runtime.reports.preconditions")} value={row.preconditions} />
           <Field label={t("runtime.reports.role")} value={row.affectedRole} />
+          <Field label={t("runtime.reports.vector")} value={row.vector} />
+          {row.goalQualified !== undefined && (
+            <Field
+              label={t("runtime.reports.goal")}
+              value={[
+                row.goalQualified
+                  ? t("runtime.reports.goalMet")
+                  : t("runtime.reports.goalNotMet"),
+                row.goalDetail || row.goalCode,
+              ].filter(Boolean).join(" — ")}
+            />
+          )}
+          <Field label={t("runtime.reports.reproVerifier")} value={row.reproVerifier} />
+          <Field label={t("runtime.reports.reproCommand")} value={row.reproCommand} />
+          <Field label={t("runtime.reports.reproTarget")} value={row.reproTarget} />
+          <Field label={t("runtime.reports.reproResponse")} value={row.reproResponseSummary} />
           {row.narrative && <div className="artifact-row-body">{row.narrative}</div>}
           {row.reason && <div className="artifact-row-body">{row.reason}</div>}
           {row.steps && row.steps.length > 0 && (
@@ -262,14 +281,14 @@ export function VulnReportDoc({
               {witnessFacts.length > 0 && (
                 <div className="report-links">
                   {witnessFacts.map((fact) => fact.factSeq ? (
-                    <button
+                    <Button
                       type="button"
                       key={`wit-${fact.factSeq}`}
                       className="report-link-btn"
                       onClick={() => onOpenFact?.(fact.factSeq!)}
                     >
                       {t("runtime.reports.openEvidence")} #{fact.factSeq}
-                    </button>
+                    </Button>
                   ) : null)}
                 </div>
               )}
@@ -295,9 +314,9 @@ export function VulnReportDoc({
               <div className="artifact-row-body"><b>{t("runtime.reports.relatedPoc")}</b></div>
               <div className="report-links">
                 {relatedPocs.map((poc) => (
-                  <button type="button" key={poc.id} className="report-link-btn" onClick={() => onOpenPoc?.(poc.id)}>
+                  <Button type="button" key={poc.id} className="report-link-btn" onClick={() => onOpenPoc?.(poc.id)}>
                     {poc.name || poc.id}
-                  </button>
+                  </Button>
                 ))}
               </div>
             </>
@@ -387,21 +406,20 @@ export function VulnReportsList({
       <div className="evi-toolbar">
         <div className="evi-toolbar-title">
           {truncated && <div className="evi-density-note">{t("runtime.truncated", { n: 80 })}</div>}
-          <div className="evi-filter" role="tablist" aria-label={t("runtime.reports.filterAll")}>
+          <Tabs selectedKey={filter} onSelectionChange={(key) => setFilter(key as ReportStatusFilter)} aria-label={t("runtime.reports.filterAll")}>
+            <Tabs.List className="evi-filter">
             {chips.filter((chip) => chip.key === "all" || chip.n > 0).map((chip) => (
-              <button
+              <Tabs.Tab
+                id={chip.key}
                 key={chip.key}
-                type="button"
-                role="tab"
-                aria-selected={filter === chip.key}
                 className={`evi-filter-btn ${filter === chip.key ? "on" : ""}`.trim()}
-                onClick={() => setFilter(chip.key)}
               >
                 <span>{chip.label}</span>
                 <b>{chip.n}</b>
-              </button>
+              </Tabs.Tab>
             ))}
-          </div>
+            </Tabs.List>
+          </Tabs>
           {accepted.length > 0 && (
             <CopyAction
               text={collection}

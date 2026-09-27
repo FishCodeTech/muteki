@@ -1,0 +1,57 @@
+import type { ConversationCredential, ConversationCredentialModel } from "./useConversation";
+
+const MEMORY_KEY = "muteki.chat.model-efforts.v1";
+const KNOWN_ORDER = ["off", "none", "on", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+
+export function credentialForRuntime(credential: ConversationCredential, runtimeKey: string): ConversationCredential {
+  const catalog = credential.model_catalogs?.[runtimeKey];
+  const models = new Map((catalog || []).map(model => [model.id, model]));
+  const scope = (rows: ConversationCredentialModel[]) => rows.map(model => ({
+    ...model, reasoning: models.get(model.id)?.reasoning,
+  }));
+  return { ...credential, runtime_instance: runtimeKey, models: scope(credential.models), candidate_models: scope(credential.candidate_models) };
+}
+
+export function modelEffortLevels(model: ConversationCredentialModel | null | undefined): string[] {
+  const reasoning = model?.reasoning;
+  if (!reasoning || reasoning.supported === false) return [];
+  const levels = [...new Set((reasoning.levels || []).map(value => value.trim()).filter(Boolean))]
+    .filter(value => value !== "default");
+  // Named variants belong to the provider; preserve their spelling and order.
+  if (reasoning.kind === "variant") return levels;
+  return levels.sort((a, b) => {
+    const left = KNOWN_ORDER.indexOf(a);
+    const right = KNOWN_ORDER.indexOf(b);
+    return (left < 0 ? KNOWN_ORDER.length : left) - (right < 0 ? KNOWN_ORDER.length : right);
+  });
+}
+
+export function validModelEffort(model: ConversationCredentialModel | null | undefined, effort: string): boolean {
+  return !effort || effort === "default" || modelEffortLevels(model).includes(effort);
+}
+
+function readMemory(): Record<string, string> {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(MEMORY_KEY) || "{}");
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string"))
+      : {};
+  } catch { return {}; }
+}
+
+export function rememberModelEffort(credentialId: string, model: ConversationCredentialModel, effort: string): void {
+  if (!credentialId || !validModelEffort(model, effort)) return;
+  try {
+    const memory = readMemory();
+    const key = JSON.stringify([credentialId, model.id]);
+    delete memory[key];
+    memory[key] = effort === "default" ? "" : effort;
+    localStorage.setItem(MEMORY_KEY, JSON.stringify(Object.fromEntries(Object.entries(memory).slice(-128))));
+  } catch { /* Optional preference storage must not block model selection. */ }
+}
+
+export function rememberedModelEffort(credentialId: string, model: ConversationCredentialModel | undefined): string {
+  if (!model) return "";
+  const effort = readMemory()[JSON.stringify([credentialId, model.id])] || "";
+  return validModelEffort(model, effort) ? effort : "";
+}

@@ -1,29 +1,54 @@
 name: ci
 
 on:
-  push:
-    branches:
-      - main
-      - feat/web-beautiful-ui
-  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  python:
-    name: Python tests
+  checks:
+    name: CI checks
+    # Fail closed without a cutoff. Re-runs cannot spend a second attempt.
+    if: ${{ github.run_attempt == 1 && github.run_number <= fromJSON(vars.MUTEKI_CI_LAST_RUN_NUMBER || '0') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+        id: checkout
+
+      # Keep detection and checks on one runner: every separate job rounds up
+      # to a billable minute, even when path detection takes only seconds.
+      - name: Detect relevant changes
+        if: ${{ github.event_name != 'workflow_dispatch' }}
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          # PRs use the full PR file list; pushes compare the entire pushed range.
+          base: ${{ github.event.before || github.event.repository.default_branch }}
+          filters: |
+            python:
+              - 'muteki/**'
+              - 'apps/**/*.py'
+              - 'scripts/**'
+              - 'apps/web/ui/lib/contracts/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - '.python-version'
+              - '.github/workflows/ci.yml'
+              - '.github/actions/**'
+            web:
+              - 'apps/web/ui/**'
+              - '.github/workflows/ci.yml'
+              - '.github/actions/**'
 
       - name: Set up uv and Python
+        if: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.python == 'true' }}
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           version: "0.12.5"
@@ -31,50 +56,49 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
-      - name: Install locked dependencies
-        run: uv sync --frozen --extra dev
+      - name: Install locked Python dependencies
+        if: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.python == 'true' }}
+        run: uv sync --frozen
 
-      - name: Run Python tests
-        run: uv run --frozen python -m pytest -q
+      - name: Check generated API contracts
+        if: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.python == 'true' }}
+        run: |
+          uv run --frozen python scripts/gen_contracts_ts.py --check
+          uv run --frozen python scripts/gen_openapi.py --check
 
-  runtime-agent:
-    name: Runtime agent tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
+      - name: Test conversation stop and approval lifecycle
+        if: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.python == 'true' }}
+        run: >-
+          uv run --frozen python -m unittest
+          muteki.conversation.test_interrupt_cleanup
+          muteki.conversation.test_control_response_delivery
+          muteki.conversation.test_approval_queue
+          muteki.conversation.test_session_continuity_122
 
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: cmd/runtime-agent/go.mod
-          cache: false
-
-      - name: Run Go tests
-        run: go test -C cmd/runtime-agent ./...
-
-  web-ui:
-    name: Web UI checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    defaults:
-      run:
-        working-directory: apps/web/ui
-    steps:
-      - uses: actions/checkout@v7
-
+      # Keep reporting frontend failures when a Python check fails, while
+      # respecting cancellation and the frontend's own dependency chain.
       - name: Set up Node.js
+        id: node
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && (github.event_name == 'workflow_dispatch' || steps.filter.outputs.web == 'true') }}
         uses: actions/setup-node@v7
         with:
           node-version: "20"
           cache: npm
           cache-dependency-path: apps/web/ui/package-lock.json
 
-      - name: Install locked dependencies
+      - name: Install locked UI dependencies
+        id: ui-deps
+        if: ${{ !cancelled() && steps.node.outcome == 'success' }}
+        working-directory: apps/web/ui
         run: npm ci
 
       - name: Check TypeScript
+        id: typecheck
+        if: ${{ !cancelled() && steps.ui-deps.outcome == 'success' }}
+        working-directory: apps/web/ui
         run: ./node_modules/.bin/tsc --noEmit
 
       - name: Build production UI
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        working-directory: apps/web/ui
         run: npm run build

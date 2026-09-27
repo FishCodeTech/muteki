@@ -9,15 +9,23 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import urlparse
 
+from muteki.solver.engine_registry import (
+    KNOWN_ENGINE_IDS,
+    SUPPORTED_ENGINE_IDS,
+    EngineTemporarilyUnsupportedError,
+    canonical_engine_id,
+)
+from muteki.solver.credential_accounts import (
+    account_credential_id,
+    account_id_from_credential_id,
+    canonical_credential_id,
+    system_credential_id,
+)
 
-VALID_BASE_ENGINES = (
-    "claude", "codex", "cursor", "pi", "omp", "kimi", "grok",
-    "opencode", "dsh",
-)
-CONTAINER_BASE_ENGINES = (
-    "claude", "codex", "cursor", "pi", "omp", "kimi", "grok",
-    "opencode", "dsh",
-)
+
+KNOWN_BASE_ENGINES = KNOWN_ENGINE_IDS
+VALID_BASE_ENGINES = SUPPORTED_ENGINE_IDS
+CONTAINER_BASE_ENGINES = SUPPORTED_ENGINE_IDS
 VALID_REASONING_EFFORTS = (
     "default", "none", "minimal", "low", "medium", "high", "xhigh", "max",
 )
@@ -42,6 +50,8 @@ TRANSPORT_TO_ENGINE = {
     "opencode": "opencode",
     "opencode_cli": "opencode",
     "opencode-cli": "opencode",
+    "devin": "devin",
+    "devin_cli": "devin",
     "dsh": "dsh",
     "deepseek_harness": "dsh",
     "deepseek-harness": "dsh",
@@ -90,11 +100,11 @@ def base_engine_for_profile(profile_or_name: Any) -> str:
     s = str(profile_or_name or "").strip()
     if s in TRANSPORT_TO_ENGINE:
         return TRANSPORT_TO_ENGINE[s]
-    if s in VALID_BASE_ENGINES:
+    if s in KNOWN_BASE_ENGINES:
         return s
     # profile id like "codex-sub-container" / "cursor-api-container" → recover base.
     for seg in s.split("-"):
-        if seg in VALID_BASE_ENGINES:
+        if seg in KNOWN_BASE_ENGINES:
             return seg
         if seg in TRANSPORT_TO_ENGINE:
             return TRANSPORT_TO_ENGINE[seg]
@@ -110,6 +120,10 @@ def normalize_worker_profile(item: dict[str, Any], *, reject_invalid: bool = Fal
         return None
     transport = str(item.get("transport") or item.get("engine") or "").strip()
     engine = TRANSPORT_TO_ENGINE.get(transport, str(item.get("engine") or "").strip())
+    if canonical_engine_id(engine) == "dsh":
+        if reject_invalid:
+            raise EngineTemporarilyUnsupportedError("dsh")
+        return None
     if engine not in VALID_BASE_ENGINES:
         if reject_invalid:
             raise ValueError("worker profile requires valid transport/engine")
@@ -125,23 +139,50 @@ def normalize_worker_profile(item: dict[str, Any], *, reject_invalid: bool = Fal
         for r in raw_roles
         if isinstance(r, str) and str(r).strip()
     ] if isinstance(raw_roles, list) else []
+    # review/verifier capability must be EXPLICIT. Roles that only land on an
+    # ordinary profile through the default list or this auto-extension are
+    # recorded in implicit_roles; the scheduler serves them only when the
+    # operator opted into the review/verifier fallback policy flag.
+    implicit_roles: list[str] = []
     if not roles:
         roles = list(DEFAULT_ROLES)
+        implicit_roles = ["review", "verifier"]
     elif any(r in roles for r in ("race", "bootstrap", "explore", "respond")):
         if "review" not in roles:
             roles = [*roles, "review"]
+            implicit_roles.append("review")
         if "verifier" not in roles:
             roles = [*roles, "verifier"]
+            implicit_roles.append("verifier")
     credential_mode = str(
         item.get("credential_mode") or item.get("auth") or "subscription"
     ).strip() or "subscription"
+    raw_credential_id = str(item.get("credential_id") or "").strip()
     if "credential_account" in item:
         raw_account = item.get("credential_account")
     elif "credential_account_ref" in item:
         raw_account = item.get("credential_account_ref")
+    elif account_id_from_credential_id(raw_credential_id):
+        raw_account = account_id_from_credential_id(raw_credential_id)
+    elif raw_credential_id.startswith("system:"):
+        raw_account = ""
     else:
         raw_account = f"{engine}-main"
     credential_account = str(raw_account or "").strip()
+    try:
+        credential_id = (
+            canonical_credential_id(raw_credential_id, engine=engine)
+            if raw_credential_id
+            else account_credential_id(credential_account)
+            if credential_account
+            else system_credential_id(engine)
+            if str(item.get("credential_kind") or "") == "system_inherit"
+            else ""
+        )
+    except ValueError:
+        if reject_invalid:
+            raise ValueError("worker profile credential_id is invalid")
+        credential_id = ""
     normalized = {
         "id": pid,
         "name": pid,
@@ -154,10 +195,12 @@ def normalize_worker_profile(item: dict[str, Any], *, reject_invalid: bool = Fal
         "credential_mode": credential_mode,
         "auth": credential_mode,
         "credential_account": credential_account,
+        "credential_id": credential_id,
         "api_key_ref": str(item.get("api_key_ref") or "").strip(),
         "base_url": str(item.get("base_url") or "").strip(),
         "wire_api": str(item.get("wire_api") or ("responses" if engine == "codex" else "")).strip(),
         "roles": roles,
+        "implicit_roles": implicit_roles,
         "race": bool(item.get("race", "race" in roles)),
         "max_running": coerce_pos_int(item.get("max_running"), 1),
         # 0 means "inherit the global review.max_concurrent"; review capacity is
@@ -169,6 +212,12 @@ def normalize_worker_profile(item: dict[str, Any], *, reject_invalid: bool = Fal
         "model": str(item.get("model") or "").strip(),
         "reasoning_effort": normalize_reasoning_effort(
             item.get("reasoning_effort"), "default"),
+        # RUNTIME-05（任务书 7.3）：Profile 引用 Runtime instance 或 credential
+        # seat 的确定映射。只保存引用（"adapter_id:instance_id" / seat id /
+        # secret:// 句柄），不复制真实 Secret。空串表示未显式绑定，由
+        # resolve_profile_runtime_instance 按 engine+账户推导。
+        "runtime_instance_ref": str(item.get("runtime_instance_ref") or "").strip(),
+        "credential_seat_ref": str(item.get("credential_seat_ref") or "").strip(),
         "enabled": True,
     }
     return normalized
@@ -319,6 +368,122 @@ def worker_identity_event_fields(worker: Any) -> dict[str, str]:
     if not isinstance(identity, dict):
         return {}
     return {str(key): str(value) for key, value in identity.items() if value}
+
+
+def parse_runtime_instance_ref(ref: Any) -> tuple[str, str] | None:
+    """解析 ``"adapter_id:instance_id"`` 引用；非法输入返回 None。
+
+    instance 身份为 ``adapter_id + instance_id``（任务书 7.3）。bare
+    adapter id（无冒号）不算 instance 引用，调用方应走 engine 推导。
+    """
+    text = str(ref or "").strip()
+    if not text or ":" not in text:
+        return None
+    adapter_id, _, instance_id = text.partition(":")
+    adapter_id = adapter_id.strip()
+    instance_id = instance_id.strip()
+    if not adapter_id or not instance_id:
+        return None
+    return adapter_id, instance_id
+
+
+def resolve_profile_runtime_instance(
+    profile: dict[str, Any] | None,
+    instances: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Worker Profile → CLI instance 的唯一确定映射。
+
+    ``instances`` 为 instance 配置视图（dict，至少含 ``adapter_id`` /
+    ``instance_id`` / ``engine`` / ``credential_account`` / ``enabled``）。
+    判定顺序固定，任何调用方结果一致：
+
+    1. Profile 显式 ``runtime_instance_ref``（``adapter:instance``）精确匹配；
+    2. Profile ``credential_seat_ref`` 匹配 instance 的 seat 引用；
+    3. engine 相同且 instance 的 ``credential_account`` 等于 Profile 的
+       ``credential_account``；
+    4. 该 engine 有唯一 ``default_for_engine`` CLI 实例时取它；
+    5. 该 engine 只有一个启用 instance 时取它；
+    6. 其余（无匹配 / 多实例歧义）返回 None，由调用方显式报错或回退，
+       不静默挑选。
+    """
+    if not isinstance(profile, dict):
+        return None
+    # Worker 只允许已注册的 CLI。Conversation 的 ACP、App Server、SDK instance
+    # 即使出现在同一个设置存储中，也不进入这里的候选集合。
+    rows = [
+        i for i in instances
+        if isinstance(i, dict) and i.get("adapter_id") and i.get("instance_id")
+        and str(i.get("adapter_id") or "").startswith("cli.")
+    ]
+    if not rows:
+        return None
+
+    def _key(item: dict[str, Any]) -> str:
+        return f"{item['adapter_id']}:{item['instance_id']}"
+
+    def _healthy_for_default(item: dict[str, Any]) -> bool:
+        # 显式引用仍返回具体实例并由调用方显示故障；自动默认只能使用已
+        # 完成最低 probe 的实例。旧调用方未提供 health 字段时保持兼容。
+        if "health" not in item:
+            return True
+        health = item.get("health")
+        return isinstance(health, dict) and bool(health.get("healthy"))
+
+    # 1. 显式引用优先（含指向已停用 instance：返回给调用方自行判定）。
+    ref = parse_runtime_instance_ref(profile.get("runtime_instance_ref"))
+    if ref is not None:
+        want = f"{ref[0]}:{ref[1]}"
+        for item in rows:
+            if _key(item) == want:
+                return item
+        return None
+
+    # 2. credential seat 引用。
+    seat_ref = str(profile.get("credential_seat_ref") or "").strip()
+    if seat_ref:
+        for item in rows:
+            if str(item.get("credential_seat_ref") or "").strip() == seat_ref:
+                return item
+        return None
+
+    engine = base_engine_for_profile(profile)
+    engine_rows = [
+        i for i in rows
+        if str(i.get("engine") or "").strip() == engine
+        or str(i.get("adapter_id") or "").strip() in (engine, f"cli.{engine}")
+    ]
+
+    # 3. engine + 账户引用精确匹配。
+    account = str(profile.get("credential_account") or "").strip()
+    if account:
+        matched = [
+            i for i in engine_rows
+            if str(i.get("credential_account") or "").strip() == account
+        ]
+        if len(matched) == 1:
+            return matched[0]
+        if len(matched) > 1:
+            return None  # 同账户多实例歧义，不静默挑选
+
+    # 4. 产品明确指定的 CLI 默认实例。
+    defaults = [
+        i for i in engine_rows
+        if i.get("enabled", True) and i.get("default_for_engine", False)
+        and _healthy_for_default(i)
+    ]
+    if len(defaults) == 1:
+        return defaults[0]
+    if len(defaults) > 1:
+        return None
+
+    # 5. 该 engine 唯一启用 instance。
+    enabled = [
+        i for i in engine_rows
+        if i.get("enabled", True) and _healthy_for_default(i)
+    ]
+    if len(enabled) == 1:
+        return enabled[0]
+    return None
 
 
 def resolve_seat_ref(

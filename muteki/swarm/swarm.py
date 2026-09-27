@@ -15,11 +15,7 @@ that the real edge is per-Solver cognition, not the racing harness.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import os
-import re
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -28,24 +24,18 @@ if TYPE_CHECKING:
 
 from muteki.core.cost import CostController
 from muteki.core.event_bus import EventBus
-from muteki.core.runtime_env import is_web_container
-from muteki.core.events import Event, EventType, blackboard_delta_payload
 from muteki.core.llm import LLMClient, ModelSpec
 from muteki.models.solve_graph import Challenge
 from muteki.sandbox.manager import SandboxManager
 from muteki.solver.container_exec import WORKER_IMAGE
 from muteki.solver.result import ArtifactStore
-from muteki.solver.types import SolverConfig, SolveOutcome
-from muteki.solver.credential_accounts import runtime_env_for_engine
+from muteki.solver.types import SolverConfig
 from muteki.solver.worker_profiles import (
-    base_engine_for_profile,
     coerce_nonneg_int,
     normalize_profile_roster,
-    normalize_worker_profiles,
     profile_names,
 )
 from muteki.solver.workspace import (
-    cleanup_worker_scratch,
     ensure_workspace,
     materialize_input,
     run_identity,
@@ -53,7 +43,7 @@ from muteki.solver.workspace import (
 )
 from muteki.swarm.insight_bus import InsightBus
 from muteki.swarm.stage_policy import StagePolicy
-from muteki.swarm.shared_graph import SharedGraph, SQLiteSharedGraph, canonicalize_lane
+from muteki.swarm.shared_graph import SharedGraph, SQLiteSharedGraph
 
 # Stateless helpers, run-level constants, exception types, and the SwarmOutcome
 # dataclass live in swarm_support (code-health G1). Re-exported here so existing
@@ -81,10 +71,21 @@ from muteki.swarm.swarm_support import (  # noqa: E402,F401
 # (code-health G1); they are composed back into the class below, so behavior and
 # the public surface are unchanged.
 from muteki.swarm.coordinator_flags import _FlagsBusMixin  # noqa: E402
-from muteki.swarm.coordinator_race import _RaceHealthMixin  # noqa: E402
+from muteki.swarm.coordinator_race import _RaceRunMixin  # noqa: E402
 from muteki.swarm.coordinator_dispatch import _DispatchReasonMixin  # noqa: E402
 from muteki.swarm.coordinator_review import _ReviewLocksMixin  # noqa: E402
 from muteki.swarm.coordinator_loop import _CoordinatorLoopMixin  # noqa: E402
+
+
+
+def _require_worker_network_mode(network: str) -> str:
+    """Reject unknown modes instead of silently widening to bridge (#171)."""
+    mode = str(network or "").strip() or "bridge"
+    if mode not in {"bridge", "host", "none"}:
+        raise ValueError(
+            f"worker_network must be bridge, host, or none; got {mode!r}"
+        )
+    return mode
 
 
 def _workspace_runtime_payload(
@@ -97,7 +98,6 @@ def _workspace_runtime_payload(
     coordinator: bool,
     cli_race: bool,
     race_scout: bool,
-    protocol2: bool,
     max_workers: int,
     max_total_workers: int | None,
     cost_budget_usd: float | None,
@@ -107,8 +107,19 @@ def _workspace_runtime_payload(
 ) -> dict[str, Any]:
     requested = network if backend == "container" else ""
     actual = requested
-    if backend == "container" and requested == "none":
-        actual = "bridge"
+    network_reason = ""
+    if backend == "container" and requested:
+        from muteki.solver.container_exec import (
+            WorkerNetworkConfigError,
+            project_worker_network,
+        )
+        try:
+            proj = project_worker_network(requested)
+            actual = proj["effective"]
+            network_reason = str(proj.get("reason") or "")
+        except WorkerNetworkConfigError:
+            # Keep requested; create/ensure paths reject — never rewrite to bridge.
+            actual = requested
     image: dict[str, str] = {"name": "", "id": "", "digest": ""}
     if backend == "container":
         image = worker_image_identity(WORKER_IMAGE)
@@ -148,6 +159,14 @@ def _workspace_runtime_payload(
         "backend": backend,
         "network": actual,
         "network_requested": requested,
+        "effective_network": actual,
+        "network_reason": network_reason,
+        "dispatch_mode": (
+            str(coordinator_cfg.get("dispatch_mode") or "fixed").strip().lower()
+            if str(coordinator_cfg.get("dispatch_mode") or "fixed").strip().lower()
+            in {"fixed", "auto"}
+            else "fixed"
+        ),
         "run_id": run_id,
         "image": image,
         "seats": seats,
@@ -164,13 +183,13 @@ def _workspace_runtime_payload(
         "coordinator": bool(coordinator),
         "cli_race": bool(cli_race),
         "race_scout": bool(race_scout),
-        "protocol": 2 if protocol2 else 1,
+        "protocol": 1,
     }
 
 
 class Swarm(
     _FlagsBusMixin,
-    _RaceHealthMixin,
+    _RaceRunMixin,
     _DispatchReasonMixin,
     _ReviewLocksMixin,
     _CoordinatorLoopMixin,
@@ -194,6 +213,8 @@ class Swarm(
         # operator worker commands (spawn/kill a specific engine on demand). The
         # coordinator loop drains this each tick. None → no runtime worker control.
         worker_cmds: "Optional[asyncio.Queue]" = None,
+        control_ready: "Optional[asyncio.Event]" = None,
+        worker_control_ready: "Optional[asyncio.Event]" = None,
         executor: str = "cli",
         cli_engine: str = "claude",
         cli_race: bool = False,
@@ -210,17 +231,17 @@ class Swarm(
         max_workers: int = 10,
         start_workers: int = 2,
         reason_model: str = "deepseek-v4-pro",
+        planner_unavailable_detail: str = "",
         stall_seconds: float = 120.0,  # retained for back-compat; no longer used to
         #   reclaim workers (see _run_coordinator note). Safe to ignore.
         # how many NEW explore workers the coordinator may spawn per loop iteration.
         # 1 = smooth ramp (a slot refills within one ~2s poll anyway); higher values
         # re-introduce the "spawn a burst that shares a fate" problem (run-7352).
         explore_spawn_batch: int = 1,
-        # per-turn timeout (s) for an EXPLORE or BOOTSTRAP worker's turn-1. Short,
-        # because this is the ONLY backstop that frees a max_workers slot held by a
-        # stuck worker (replacing the old stall-kill). A timed-out worker still gets
-        # one conclude turn (min(timeout, 600s)) to summarize before dying.
-        explore_timeout: int = 720,
+        # Configured execute boundary. CTF workers get one reminder at 600s, then
+        # resume the same session until this boundary and receive a separate
+        # conclude turn before the Worker exits.
+        explore_timeout: int = 750,
         # no-progress backpressure, ALL modes: after this many CONSECUTIVE worker
         # completions with NO new fact (incl. candidates) and NO new flag, the
         # coordinator soft-PAUSES for the operator instead of burning tokens
@@ -247,7 +268,7 @@ class Swarm(
         # configurable; race_scout=False is byte-identical to the plain coordinator.
         race_scout: bool = True,  # whole-layer on/off
         race_engines: "Optional[list[str]]" = None,  # which engines race (None = all)
-        race_timeout: int = 720,  # short timeout (breadth recon, not deep dig)
+        race_timeout: int = 300,  # short timeout (breadth recon, not deep dig)
         race_rounds: int = 1,  # one round (>1 reintroduces accumulation)
         # cold-start signal (run-75379 BUG④). race-scout is a cold-start warmup for an
         # EMPTY graph; on a reopen/resume of a populated graph (33+ verified facts) it
@@ -265,7 +286,10 @@ class Swarm(
         execution_generation: int = 1,
         # Cognitive cluster planner: reorder open intents + bias engine pick using
         # graph evidence (dead-ends, barren goals, fact continuity, heterogeneity).
-        # Default OFF — enable explicitly or via MUTEKI_COGNITIVE_CLUSTER_PLANNER=1.
+        # Default OFF. The flag is only STORED here — the planner module is
+        # imported and the MUTEKI_COGNITIVE_CLUSTER_PLANNER env gate read solely
+        # by the experimental opt-in (muteki.swarm.experimental.ExperimentalSwarm),
+        # which registers the dispatch_reorder / engine_pick_bias hooks.
         cognitive_cluster_planner: bool = False,
         # ── worker execution backend ─────────────────────────────────────────
         # "local"  → workers shell out on the HOST (default; unchanged).
@@ -274,6 +298,19 @@ class Swarm(
         #   material. The image is tool-only; credentials are injected at runtime.
         worker_backend: str = "local",
         worker_network: str = "bridge",
+        worker_container_scope: str = "run",
+        worker_privilege: str = "default",
+        # MNT-09.03 / #170 — cgroup + stream/workdir budgets for container workers.
+        # None → leave unset so ensure_container / env defaults apply.
+        worker_memory: "Optional[str]" = None,
+        worker_cpus: "Optional[str]" = None,
+        worker_pids_limit: "Optional[int]" = None,
+        worker_output_limit: "Optional[str]" = None,
+        worker_disk_limit: "Optional[str]" = None,
+        shared_mount_root: "Optional[Path]" = None,
+        account_projection_root: "Optional[Path]" = None,
+        container_bootstrap_root: "Optional[Path]" = None,
+        worker_vpn_config: "Optional[Path]" = None,
         worker_profiles: "Optional[list[dict]]" = None,
         startup_health_snapshot: "Optional[dict[str, bool]]" = None,
         credential_accounts_root: "Optional[Path]" = None,
@@ -298,13 +335,21 @@ class Swarm(
         context_expirer: "Optional[Any]" = None,
         standing_clear_provider: "Optional[Any]" = None,
         control_state_provider: "Optional[Any]" = None,
-        # Protocol 2 live-canary authority.  When present every CLI worker task is
-        # admitted/owned by this session; there is no parallel create_task path.
-        protocol2_session: "Optional[Any]" = None,
+        # EXEC-01：历史构造参数。做题 Worker 由 supervisor 建立私有 CLI
+        # 注册表；Conversation 的 ACP/App Server/SDK Runtime 不参与调度。
+        adapter_registry: "Optional[Any]" = None,
     ) -> None:
         self.challenge = challenge
         self.lineup = lineup
+        # Experiment hook registry (stage-4b): the production Swarm registers
+        # nothing, so every _experiment_stage / _experiment_call site in the
+        # coordinator pipeline is a no-op and behavior is byte-identical to the
+        # pre-experiment path. ExperimentalSwarm (muteki.swarm.experimental)
+        # fills this map with the extracted v1 experiment bodies on opt-in.
+        self._experiment_hooks: dict[str, Any] = {}
         self.llm = llm
+        self._reason_max_intents_override: int | None = None
+        self.planner_unavailable_detail = str(planner_unavailable_detail or "")
         self.sandbox = sandbox
         self.bus = bus
         self.cost = cost
@@ -321,13 +366,12 @@ class Swarm(
         self._context_delivery_unknown_marker = context_delivery_unknown_marker
         # Plaintext resolved from a reserved secret:// resource lives only between
         # materialisation and worker construction. Keys are reservation tuples; the
-        # value is transferred to CliSolver's exact-output redactor and popped here.
+        # value is transferred to CliSolver for exact output and popped here.
         self._reserved_context_secret_values: "dict[tuple[str, str], str]" = {}
         self._context_status_provider = context_status_provider
         self._context_expirer = context_expirer
         self._standing_clear_provider = standing_clear_provider
         self._control_state_provider = control_state_provider
-        self.protocol2_session = protocol2_session
         # Runtime objects stay process-local; the registry above only exposes
         # serializable WorkerRef rows.  Keeping both lets emergency freeze/cancel
         # touch the real subprocess while API/status readers remain decoupled.
@@ -348,6 +392,21 @@ class Swarm(
         # engine's healthcheck fails (e.g. codex usage-limited).
         self.cli_race = cli_race
         self.stage_policy = StagePolicy.from_config(stage_policy)
+        raw_dispatch_mode = str(
+            self.stage_policy.coordinator.get("dispatch_mode") or "fixed"
+        ).strip().lower()
+        self.dispatch_mode = (
+            raw_dispatch_mode
+            if raw_dispatch_mode in {"fixed", "auto"}
+            else "fixed"
+        )
+        # Cairn-y runs at most three Workers for one challenge.  Auto mode may
+        # reuse healthy profiles, but that must not increase per-run concurrency.
+        if (
+            getattr(self.challenge, "mode", "ctf") == "ctf"
+            and self.dispatch_mode == "auto"
+        ):
+            max_workers = 3
         self.llm_profiles = dict(llm_profiles or {})
         self.review_policy = self._clean_review_policy(
             self.stage_policy.coordinator.get("review")
@@ -357,7 +416,17 @@ class Swarm(
         )
         self._last_review_seq = 0
         self._last_review_proposal_seq = 0
-        self._last_directive_seq = 0
+        # Restart-safe review-proposal cursor: decisions are persisted events, so
+        # the first drain reloads them (lazy _review_cursor_restored) and skips any
+        # proposal already decided before a coordinator restart.
+        self._decided_proposal_seqs: set[int] = set()
+        self._review_cursor_restored = False
+        # Cursor for the evidence-conflict watcher (deterministic, host-side: a
+        # non-review worker's verified evidence superseding a challenged fact).
+        self._last_evidence_conflict_seq = 0
+        # Watermark for the deterministic semantic-duplicate scan: the check only
+        # re-runs when the verified-fact count has advanced since the last scan.
+        self._semantic_dup_fact_watermark = 0
         # E: last resource-lock event seq surfaced as a board delta (workers acquire
         # locks directly via the blackboard skill; the coordinator mirrors them to UI).
         self._last_resource_seq = 0
@@ -366,7 +435,10 @@ class Swarm(
         self._review_workers_spawned = 0
         self._verifier_workers_spawned = 0
         self._queued_review_requests: list[dict[str, str]] = []
-        self._pending_uncertainty_reviews: list[dict[str, Any]] = []
+        # Review scope per review worker (fact_seqs / since_seq handed to the
+        # review prompt); used to attribute REVIEW_FINDING references the
+        # reviewer omitted.
+        self._review_scopes_by_worker: dict[str, dict[str, Any]] = {}
         self._completed_workers_since_review = 0
         self._last_candidate_review_count = 0
         if self.stage_policy.race:
@@ -403,6 +475,8 @@ class Swarm(
             else self.stage_policy.budgets.cost_budget_usd
         )
         self._spawned_total = 0
+        self._worker_admission_closed = False
+        self._worker_admission_event_emitted = False
         self._budget_exhausted_kind: str | None = None
         self.worker_profiles = self._clean_worker_profiles(worker_profiles)
         # engine roster (deduped) — now profile names. Legacy values like "claude"
@@ -476,7 +550,19 @@ class Swarm(
         if self.stage_policy.race and "cold_start" in self.stage_policy.race:
             self.cold_start = bool(self.stage_policy.race["cold_start"])
         self._execution_generation = max(1, int(execution_generation or 1))
+        # Evidence about a concrete target instance is fenced independently from
+        # Worker identity.  Fresh/continued executions start with their generation;
+        # an in-run redirect advances this value before another Worker is built.
+        self._target_epoch = self._execution_generation
+        # EXEC-01：Worker 会话监督层（懒创建，见 _worker_session_supervisor）。
+        self._adapter_registry = adapter_registry
+        self._ws_supervisor: "Optional[Any]" = None
         self.race_timeout = int(race_timeout)
+        if (
+            getattr(self.challenge, "mode", "ctf") == "ctf"
+            and self.dispatch_mode == "auto"
+        ):
+            self.race_timeout = max(self.race_timeout, 900)
         self.race_rounds = max(1, int(race_rounds))
         _rseen: set[str] = set()
         if self.worker_profiles and race_engines is not None:
@@ -499,11 +585,10 @@ class Swarm(
         # default so existing race behavior (and tests) are unchanged; the web driver
         # opts in.
         self.coordinator = coordinator
-        from muteki.swarm.cognitive_cluster_planner import planner_enabled_from_env
-
-        self.cognitive_cluster_planner = bool(
-            cognitive_cluster_planner or planner_enabled_from_env()
-        )
+        # Stored flag only — the planner module import and the
+        # MUTEKI_COGNITIVE_CLUSTER_PLANNER env read moved to ExperimentalSwarm
+        # (stage-4b); the production Swarm never imports the planner module.
+        self.cognitive_cluster_planner = bool(cognitive_cluster_planner)
         # worker_root: a persistent per-run dir under which each CLI worker gets
         # its OWN cwd (worker_root/{solver_id}-{n}/) instead of a system $TMPDIR
         # mkdtemp. The web driver points this at sessions/{id}/workspace/workers/
@@ -514,19 +599,20 @@ class Swarm(
         self.workspace_root = (
             self.worker_root.parent if self.worker_root is not None else None
         )
+        self._ctf_tmux_socket: Optional[Path] = None
         if self.workspace_root is not None:
             ensure_workspace(
                 self.workspace_root,
+                include_graph=graph_dir is None,
                 runtime=_workspace_runtime_payload(
                     backend=worker_backend,
-                    network=worker_network if worker_network in {"bridge", "host", "none"} else "bridge",
+                    network=_require_worker_network_mode(worker_network),
                     run_id=self.run_id,
                     web_access=web_access,
                     kb=kb,
                     coordinator=coordinator,
                     cli_race=cli_race,
                     race_scout=self.race_scout,
-                    protocol2=protocol2_session is not None,
                     max_workers=max_workers,
                     max_total_workers=self.max_total_workers,
                     cost_budget_usd=self.cost_budget_usd,
@@ -555,6 +641,16 @@ class Swarm(
             if provisioned:
                 challenge = challenge.model_copy(update={"attachments": provisioned})
                 self.challenge = challenge
+            if (
+                getattr(self.challenge, "mode", "ctf") == "ctf"
+                and worker_backend == "local"
+            ):
+                live_dir = (self.workspace_root / "shared" / "live").resolve()
+                live_dir.mkdir(parents=True, exist_ok=True)
+                # Workers own persistent-process creation.  The coordinator only
+                # gives every local CTF Worker one run-scoped tmux socket path and
+                # removes that server, if a Worker created it, during finalization.
+                self._ctf_tmux_socket = live_dir / "tmux.sock"
         self.credential_accounts_root = (
             Path(credential_accounts_root).expanduser().resolve()
             if credential_accounts_root is not None
@@ -564,8 +660,52 @@ class Swarm(
         # run in the run's Kali tool container for a consistent toolchain). The
         # ContainerHandle is created lazily on first worker spawn (worker_root first).
         self.worker_backend = worker_backend
-        self.worker_network = (
-            worker_network if worker_network in {"bridge", "host", "none"} else "bridge"
+        self.worker_network = _require_worker_network_mode(worker_network)
+        self.effective_worker_network = ""
+        if self.worker_backend == "container":
+            from muteki.solver.container_exec import (
+                WorkerNetworkConfigError,
+                project_worker_network,
+                resolve_worker_run_network,
+            )
+            # Reject incompatible none / compose conflicts before any container
+            # is created; never silently widen to bridge (#171 / MNT-09.04).
+            try:
+                proj = project_worker_network(self.worker_network)
+                resolve_worker_run_network(self.worker_network, needs_egress=True)
+            except WorkerNetworkConfigError as exc:
+                raise ValueError(str(exc)) from exc
+            self.effective_worker_network = proj["effective"]
+        # Shared scope is an explicit mutually trusted pool; run remains default.
+        if worker_container_scope not in {"run", "shared"}:
+            raise ValueError("worker_container_scope must be run or shared")
+        self.worker_container_scope = worker_container_scope
+        priv = str(worker_privilege or "default").strip().lower()
+        self.worker_privilege = priv if priv in {"default", "elevated"} else "default"
+        from muteki.solver.worker_resource_limits import resolve_worker_resource_limits
+        limits = resolve_worker_resource_limits(
+            memory=worker_memory, cpus=worker_cpus, pids_limit=worker_pids_limit,
+            output_limit=worker_output_limit, disk_limit=worker_disk_limit)
+        self.worker_memory = limits.memory
+        self.worker_cpus = limits.cpus
+        self.worker_pids_limit = limits.pids_limit
+        self.worker_output_limit = limits.output_limit
+        self.worker_disk_limit = limits.disk_limit
+        self.shared_mount_root = (
+            Path(shared_mount_root).expanduser().resolve()
+            if shared_mount_root is not None else None
+        )
+        self.account_projection_root = (
+            Path(account_projection_root).expanduser().resolve()
+            if account_projection_root is not None else None
+        )
+        self.container_bootstrap_root = (
+            Path(container_bootstrap_root).expanduser().resolve()
+            if container_bootstrap_root is not None else None
+        )
+        self.worker_vpn_config = (
+            Path(worker_vpn_config).expanduser().resolve()
+            if worker_vpn_config is not None else None
         )
         self._container_handle = (
             None  # set lazily by _container() when backend=container
@@ -591,7 +731,7 @@ class Swarm(
         # per-engine monotonic label counter → unique solver_id per spawn so the
         # deck draws one lane per worker (1st keeps the bare "cli-<engine>" id).
         self._label_seq: dict[str, int] = {}
-        self.max_workers = max_workers
+        self.max_workers = int(max_workers)
         self.start_workers = start_workers
         self.reason_model = reason_model
         self.stall_seconds = stall_seconds
@@ -664,6 +804,9 @@ class Swarm(
         self._operator_paused: bool = False
         self._last_reason = None
         self._last_planner_failure = None
+        self._last_reason_context_wm = -1
+        self._last_reason_attempts: "list[dict[str, Any]]" = []
+        self._last_dispatch_decisions: "list[dict[str, Any]]" = []
         # GRACEFUL_DRAIN forbids new dispatch while the ordinary reap loop keeps
         # collecting in-flight workers. It is not a soft-pause wait latch.
         self._operator_draining: bool = False
@@ -673,65 +816,60 @@ class Swarm(
         # into insight.guidance() so the broadcast reaches every solver's inbox.
         self.hitl_inbox = hitl_inbox
         self.worker_cmds = worker_cmds
+        self.control_ready = control_ready
+        self.worker_control_ready = worker_control_ready
         # P-A: ONE shared, event-sourced, evidence-bearing graph for the swarm.
         # InsightBus stays the write-NOTIFY channel; this is the persistent
         # global state every solver writes to (and reason/flywheel read from).
         self.shared_graph: Optional[SharedGraph] = None
-        if self.protocol2_session is not None:
-            # Protocol 2 workers report through the candidate broker/capture
-            # callbacks installed by Protocol2RunSession. The legacy graph is not
-            # opened even as a fallback; JSONL/SSE remains display-only.
-            self._graph_dir = None
-            self._search_state_port = None
-        else:
-            try:
-                # graph_dir (web driver) keeps the DB OUTSIDE sandbox.root so it
-                # survives sandbox.shutdown_all()'s rmtree of the sandbox root. Falls
-                # back to the sandbox tree when unset (TUI / tests, where ephemeral
-                # is fine).
-                if graph_dir is not None:
-                    base = Path(graph_dir)
-                    base.mkdir(parents=True, exist_ok=True)
-                    db_path = base / "shared_graph.db"
-                elif self.workspace_root is not None:
-                    # Constructor-level tests and non-Web composition roots may supply
-                    # a persistent worker_root without a SandboxManager. The run
-                    # workspace is still an explicit authority location; derive the
-                    # sibling graph path instead of dereferencing sandbox=None.
-                    base = self.workspace_root / "graph"
-                    base.mkdir(parents=True, exist_ok=True)
-                    db_path = base / "shared_graph.db"
-                else:
-                    db_path = self.sandbox.root / self.run_id / "shared_graph.db"
-                # remember where durable per-run state lives (sibling of graph/) so a
-                # post-solve standby can find private continuation state and the
-                # shared graph again.
-                self._graph_dir = Path(graph_dir) if graph_dir is not None else None
-                self.shared_graph = SQLiteSharedGraph.open(
-                    db_path=db_path,
-                    challenge=challenge,
-                    artifacts=artifacts,
-                )
-                from muteki.swarm.state_port import V1SearchStatePort
+        try:
+            # graph_dir (web driver) keeps the DB OUTSIDE sandbox.root so it
+            # survives sandbox.shutdown_all()'s rmtree of the sandbox root. Falls
+            # back to the sandbox tree when unset (TUI / tests, where ephemeral
+            # is fine).
+            if graph_dir is not None:
+                base = Path(graph_dir)
+                base.mkdir(parents=True, exist_ok=True)
+                db_path = base / "shared_graph.db"
+            elif self.workspace_root is not None:
+                # Constructor-level tests and non-Web composition roots may supply
+                # a persistent worker_root without a SandboxManager. The run
+                # workspace is still an explicit authority location; derive the
+                # sibling graph path instead of dereferencing sandbox=None.
+                base = self.workspace_root / "graph"
+                base.mkdir(parents=True, exist_ok=True)
+                db_path = base / "shared_graph.db"
+            else:
+                db_path = self.sandbox.root / self.run_id / "shared_graph.db"
+            # remember where durable per-run state lives (sibling of graph/) so a
+            # post-solve standby can find private continuation state and the
+            # shared graph again.
+            self._graph_dir = Path(graph_dir) if graph_dir is not None else None
+            self.shared_graph = SQLiteSharedGraph.open(
+                db_path=db_path,
+                challenge=challenge,
+                artifacts=artifacts,
+            )
+            from muteki.swarm.state_port import V1SearchStatePort
 
-                self._search_state_port = V1SearchStatePort(
-                    run_id=self.run_id, graph=self.shared_graph
-                )
-                state_provider = getattr(self, "_control_state_provider", None)
-                if callable(state_provider):
-                    state = state_provider()
-                    if (
-                        str(getattr(getattr(state, "mode", None), "value", ""))
-                        == "active"
-                    ):
-                        self.shared_graph.recover_suspended_leases()
-            except Exception as exc:
-                # Evidence authority is a prerequisite.  Continuing with
-                # shared_graph=None launders an infrastructure failure into an empty
-                # business state and lets workers run without the provenance spine.
-                self.shared_graph = None
-                self._search_state_port = None
-                raise RuntimeError(f"SharedGraphUnavailable: {exc}") from exc
+            self._search_state_port = V1SearchStatePort(
+                run_id=self.run_id, graph=self.shared_graph
+            )
+            state_provider = getattr(self, "_control_state_provider", None)
+            if callable(state_provider):
+                state = state_provider()
+                if (
+                    str(getattr(getattr(state, "mode", None), "value", ""))
+                    == "active"
+                ):
+                    self.shared_graph.recover_suspended_leases()
+        except Exception as exc:
+            # Evidence authority is a prerequisite.  Continuing with
+            # shared_graph=None launders an infrastructure failure into an empty
+            # business state and lets workers run without the provenance spine.
+            self.shared_graph = None
+            self._search_state_port = None
+            raise RuntimeError(f"SharedGraphUnavailable: {exc}") from exc
         prepare = getattr(self, "framework_prepare_hook", None)
         if callable(prepare):
             try:
@@ -746,9 +884,39 @@ class Swarm(
         # _flags_complete() flips true immediately — byte-identical to the old
         # "first flag wins" behaviour.
         self._found_flags: list[str] = []
+        for initial_flag in getattr(challenge, "initial_flags", []) or []:
+            flag = str(initial_flag or "").strip()
+            if not flag or flag in self._found_flags:
+                continue
+            self._found_flags.append(flag)
+            self.shared_graph.flag_found(
+                actor="initial-progress",
+                flag=flag,
+                complete_intent=False,
+            )
         self._found_findings: list[dict] = []
         self._found_reports: list[dict] = []
         self._coverage_exhausted: bool = False
+
+    async def _experiment_stage(self, name: str, state) -> str:
+        """Dispatch one coordinator-stage experiment hook.
+
+        No hook registered (production default) → "proceed", so the pipeline
+        position the extracted experiment block used to own is a pure no-op.
+        """
+        hook = self._experiment_hooks.get(name)
+        if hook is None:
+            return "proceed"
+        return await hook(self, state)
+
+    def _experiment_call(
+        self, name: str, *args: Any, default: Any = None, **kwargs: Any
+    ) -> Any:
+        """Dispatch a non-stage experiment hook; ``default`` when unregistered."""
+        hook = self._experiment_hooks.get(name)
+        if hook is None:
+            return default
+        return hook(self, *args, **kwargs)
 
 
 async def run_swarm(

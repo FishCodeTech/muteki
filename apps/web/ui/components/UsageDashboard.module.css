@@ -1,0 +1,556 @@
+.root {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  padding: 24px;
+  overflow: auto;
+  color: var(--ink);
+  background: var(--bg);
+  font: 13px/1.5 var(--font-sans);
+}
+
+.root[data-scope="global"] {
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: clamp(20px, 3vw, 36px);
+}
+
+.root[data-scope="run"] {
+  flex: 1 1 auto;
+  max-width: none;
+  margin: 0;
+  padding: 16px;
+  background: var(--panel2);
+}
+
+.root[data-scope="competition"] {
+  height: auto;
+  padding: 0;
+  overflow: visible;
+  background: transparent;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.header h1 {
+  margin: 4px 0 5px;
+  color: var(--bright);
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: -.025em;
+}
+
+.header p,
+.footnote {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.65;
+}
+
+.eyebrow {
+  color: var(--blue);
+  font: 700 9px/1 var(--font-mono);
+  letter-spacing: .18em;
+}
+
+.root button,
+.root select,
+.root input {
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: inherit;
+  background: var(--panel);
+  font: inherit;
+}
+
+.root button {
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.root button:hover:not(:disabled) {
+  border-color: var(--line2);
+  background: var(--panel3);
+}
+
+.root button:disabled {
+  cursor: default;
+  opacity: .4;
+}
+
+.root input {
+  width: 190px;
+  min-width: 0;
+}
+
+.filters {
+  display: flex;
+  align-items: end;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 16px 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.filters label {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.filters select {
+  max-width: 240px;
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.card,
+.panel {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.card span,
+.card small {
+  display: block;
+  color: var(--muted);
+}
+
+.card strong {
+  display: block;
+  margin: 8px 0 6px;
+  overflow-wrap: anywhere;
+  color: var(--bright);
+  font: 620 20px/1.25 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.card small {
+  font-size: 9.5px;
+  line-height: 1.5;
+}
+
+.health {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 11px 1px;
+  color: var(--muted);
+}
+
+.health span {
+  display: inline-block;
+  margin-right: 14px;
+  font-size: 10px;
+}
+
+.health b {
+  margin-left: 3px;
+  color: var(--ink);
+}
+
+.health [data-warning="true"] {
+  color: var(--amber, #bd792b);
+}
+
+.health small {
+  font-size: 9.5px;
+}
+
+.panel {
+  margin: 10px 0;
+}
+
+.panel h2 {
+  margin: 0 0 12px;
+  color: var(--bright);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.panel h2 small {
+  margin-left: 7px;
+  color: var(--muted);
+  font-size: 9.5px;
+  font-weight: 400;
+}
+
+.chart {
+  height: 96px;
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  overflow: auto;
+}
+
+.barSlot {
+  height: 100%;
+  min-width: 3px;
+  max-width: 90px;
+  display: flex;
+  flex: 1;
+  align-items: flex-end;
+}
+
+.bar {
+  width: 100%;
+  border-radius: 3px 3px 0 0;
+  background: var(--blue);
+  opacity: .78;
+}
+
+.chartLabels {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 9.5px;
+}
+
+.tableScroll {
+  width: 100%;
+  overflow: auto;
+}
+
+.distributionPanel .tableScroll {
+  max-height: 340px;
+}
+
+.distributionPanel thead {
+  position: sticky;
+  z-index: 1;
+  top: 0;
+  background: var(--panel);
+}
+
+.root table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.root th {
+  padding: 8px 10px;
+  color: var(--muted);
+  font-size: 9.5px;
+  font-weight: 500;
+}
+
+.root td {
+  padding: 10px;
+  border-top: 1px solid var(--line);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  vertical-align: top;
+}
+
+.root td small {
+  display: block;
+  max-width: 300px;
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9.5px;
+  text-overflow: ellipsis;
+}
+
+.root a {
+  color: var(--blue);
+}
+
+.challengeName {
+  display: block;
+  max-width: 280px;
+  margin-bottom: 3px;
+  overflow: hidden;
+  color: var(--bright);
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+}
+
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.pagination span {
+  margin-right: auto;
+  color: var(--muted);
+}
+
+.error {
+  margin-bottom: 12px;
+  padding: 10px;
+  border: 1px solid var(--red, #bc706a);
+  border-radius: 8px;
+  color: var(--red, #bf6159);
+}
+
+.empty {
+  padding: 48px 16px;
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  text-align: center;
+}
+
+.empty p {
+  max-width: 600px;
+  margin: 10px auto;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.7;
+}
+
+.footnote {
+  margin-top: 14px;
+  font-size: 9.5px;
+}
+
+/* ── Subscription Quota Panel ───────────────────────────────── */
+
+.quotaPanel {
+  margin: 16px 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--panel);
+}
+
+.quotaToggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 14px;
+  background: none;
+  border: none;
+  border-radius: 0;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+  min-height: 0;
+}
+
+.quotaToggle:hover {
+  background: var(--hover, rgba(255,255,255,.04));
+}
+
+.quotaToggleLabel {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--bright);
+}
+
+.quotaChevron {
+  font-size: 9px;
+  color: var(--muted);
+}
+
+.quotaBody {
+  padding: 0 14px 14px;
+  border-top: 1px solid var(--line);
+}
+
+.quotaNote {
+  margin: 10px 0 8px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.quotaTable {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.quotaRow {
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel2, var(--panel));
+}
+
+.quotaRowHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 5px;
+}
+
+.quotaLabel {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--bright);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.quotaEngine {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--muted);
+  background: var(--panel);
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+}
+
+.quotaStatus {
+  font-size: 10px;
+  font-weight: 500;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.quotaStatus[data-status="ok"] {
+  color: var(--green, #3a9d5b);
+  border-color: var(--green, #3a9d5b);
+}
+
+.quotaStatus[data-status="unknown"] {
+  color: var(--amber, #bd792b);
+  border-color: transparent;
+}
+
+.quotaStatus[data-status="unsupported"] {
+  color: var(--muted);
+  border-color: transparent;
+}
+
+.quotaRefreshBtn {
+  min-height: 22px;
+  padding: 0 7px;
+  font-size: 12px;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.quotaRefreshBtn:hover:not(:disabled) {
+  background: var(--panel3, var(--panel));
+  border-color: var(--line2);
+  color: var(--ink);
+}
+
+.quotaRefreshBtn:disabled {
+  opacity: .4;
+  cursor: default;
+}
+
+.quotaDetails {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.quotaDetails b {
+  color: var(--bright);
+  font-weight: 600;
+}
+
+.quotaUpdated {
+  font-size: 9.5px;
+  color: var(--muted);
+}
+
+.quotaUnknown {
+  font-size: 10px;
+  color: var(--muted);
+  font-style: italic;
+}
+
+/* ── end quota panel ─────────────────────────────────────────── */
+
+.root[data-scope="competition"] > .header {
+  padding-top: 2px;
+}
+
+@media (max-width: 1100px) {
+  .cards {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 700px) {
+  .root,
+  .root[data-scope="run"],
+  .root[data-scope="global"] {
+    padding: 12px;
+  }
+
+  .root[data-scope="competition"] {
+    padding: 0;
+  }
+
+  .header {
+    align-items: flex-start;
+  }
+
+  .header h1 {
+    font-size: 19px;
+  }
+
+  .header p {
+    font-size: 11px;
+  }
+
+  .filters {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .filters input,
+  .filters select {
+    width: 100%;
+    max-width: none;
+  }
+
+  .cards {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .card strong {
+    font-size: 18px;
+  }
+}

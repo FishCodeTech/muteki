@@ -1,0 +1,45 @@
+{
+  "name": "Muteki — Agent 安全工作台",
+  "short_name": "Muteki",
+  "description": "管理 Agent 对话、单项安全任务和比赛调度。",
+  "start_url": "/chat",
+  "id": "/chat",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0f1011",
+  "theme_color": "#0f1011",
+  "lang": "zh-CN",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "新对话",
+      "short_name": "新对话",
+      "description": "直接开始一个新的 Agent 对话",
+      "url": "/chat",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "单项任务",
+      "short_name": "任务",
+      "description": "打开单项安全任务面板",
+      "url": "/task",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+    }
+  ],
+  "categories": ["productivity", "developer"],
+  "display_override": ["window-controls-overlay", "standalone", "browser"]
+}

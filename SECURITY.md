@@ -54,7 +54,7 @@ the worker, and isolate accordingly.
   worker environment. These are passed to the proprietary engine CLIs
   (`claude` / `codex` / `cursor-agent`), which transmit data to their
   respective providers (Anthropic / OpenAI / Cursor). Credential stores live under
-  gitignored paths (`sessions/_secrets/`, `.env`) and are never committed; verify your
+  gitignored paths (`state/_secrets/`, `.env`) and are never committed; verify your
   own deployment keeps them out of version control.
 - **Control plane.** In container mode the in-container supervisor dials back to a
   host-local control receiver (`127.0.0.1`, default port `9100`, per-run token). This
