@@ -147,7 +147,7 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
      from just-above so the row ⋯ menu reads as "dropping into place", not popping.
      transform-origin pins it to the trigger's top edge; one-shot keyframe. */
   transform-origin: top right; }
-.menu .mi { background: transparent; border: 0; color: var(--text); text-align: left; padding: 7px 9px;
+.menu .mi { width: 100%; box-sizing: border-box; justify-content: flex-start; background: transparent; border: 0; color: var(--text); text-align: left; padding: 7px 9px;
   border-radius: 4px; font-size: 12px; cursor: pointer; white-space: nowrap; }
 .menu .mi:hover { background: var(--panel); }
 .menu .mi:disabled { color: var(--dim); opacity: .45; cursor: default; }
