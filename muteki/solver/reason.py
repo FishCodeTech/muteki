@@ -18,11 +18,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import uuid
 from difflib import SequenceMatcher
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Final, Optional
 
@@ -61,18 +60,6 @@ class Intent:
     # source-less intent from the orphan filter in dispatch_intents (cold
     # start is the other exemption). Absent/False is the ordinary case.
     initial: bool = False
-    # Optional, shadow-only typed execution boundary.  The ordinary dispatcher
-    # ignores these fields; an opt-in counterfactual adapter can evaluate them.
-    cognitive_predictions: dict[str, str] = field(default_factory=dict)
-    cognitive_capability: str = ""
-    cognitive_supplied_cost_estimate_units: int | None = None
-    cognitive_other_unknown_lane: bool = False
-    # Schema'd declaration (round-14 seam, default-off): the proposer's typed
-    # expected effects {"effect_types": [...], "expected_artifacts": [...],
-    # "confidence": "low|medium|high"}. Absent/empty = no declaration — valid
-    # first-class state, never a proposal failure. The ordinary dispatcher
-    # does not read this; research-side instruments consume it offline.
-    declared_effects: dict = field(default_factory=dict)
 
     def to_payload(self) -> dict:
         payload = {
@@ -107,61 +94,7 @@ class Intent:
             payload["required_pocs"] = self.required_pocs
         if self.initial:
             payload["initial"] = True
-        if self.declared_effects:
-            payload["declares"] = self.declared_effects
         return payload
-
-
-@dataclass(frozen=True)
-class CognitiveHypothesisDraft:
-    """Shadow-only open hypothesis; never written as canonical evidence."""
-
-    hypothesis_id: str
-    claim: str
-    rationale: str
-    weight_units: int
-
-
-COGNITIVE_SHADOW_ANNOTATION_SYSTEM = """You are a counterfactual cognition annotator.
-You do not plan or execute work. The ordinary Reason planner has already produced a
-FROZEN executable plan. You may only annotate that exact plan for an offline shadow
-comparison. Output STRICT JSON with this shape:
-{
-  "baseline_digest": "<echo the supplied digest exactly>",
-  "annotations": [
-    {"id": "<exact frozen id>", "goal": "<exact frozen goal>",
-     "cognitive_experiment": {
-       "predictions": {"H1": "short_outcome_id", "H2": "other_outcome_id"},
-       "capability": "short_capability_id",
-       "supplied_cost_estimate_units": 1,
-       "other_unknown_lane": true
-     }}
-  ],
-  "cognitive_hypotheses": [
-    {"id": "CH1", "claim": "short competing explanation",
-     "rationale": "fact-bound reason", "weight_units": 45}
-  ]
-}
-
-Rules:
-- Echo every frozen intent exactly once, with byte-exact `id` and `goal`. Never add,
-  remove, rename, reorder semantically, or rewrite executable work.
-- The only allowed annotation field is `cognitive_experiment`. Omit that field for an
-  open-ended discovery intent or when predictions are not concrete.
-- A typed experiment needs at least two active hypothesis ids and at least two distinct
-  short outcomes. Predict every active hypothesis explicitly. If an open-ended
-  remainder cannot be enumerated, set `other_unknown_lane` true.
-- `supplied_cost_estimate_units` is a coarse proposer estimate covering execution
-  and checking. It is not measured usage, a reservation, or budget authority.
-- Add 2-8 genuinely competing `cognitive_hypotheses` only when the graph has no active
-  ids. These are shadow proposals, never facts.
-- Output only the JSON object. This response has no dispatch, evidence, acceptance, or
-  production authority.
-"""
-
-
-class CognitiveShadowAnnotationError(ValueError):
-    """The shadow annotator failed to bind exactly to the frozen Reason plan."""
 
 
 # Reason's verdict — a state-machine decision, not just a bool. The solver acts on
@@ -230,7 +163,6 @@ class ReasonResult:
     supersede_why: str = ""
     reprioritize_intents: dict[str, str] = field(default_factory=dict)
     planner_failure: PlannerFailure | None = None
-    cognitive_hypotheses: list[CognitiveHypothesisDraft] = field(default_factory=list)
     diagnostics: ReasonDiagnostics = field(default_factory=ReasonDiagnostics)
     intent_parse_rejections: list[dict[str, Any]] = field(default_factory=list)
 
@@ -251,69 +183,6 @@ REASON_SYSTEM = """你负责读取完整 Fact-Goal-Step 图并决定下一步，
 - 不创建能力、资源、访问路径、风险、路线、覆盖、审计或抢占合同。
 - progress.summary 使用简体中文概括当前进展和下一步。
 - 只输出 JSON。"""
-
-# Round-14 declaration prompt addendum (default-OFF; only appended when
-# MUTEKI_REASON_DECLARE_EFFECTS=1 — the stock REASON_SYSTEM stays
-# byte-identical otherwise). Asks the planner to attach a typed expected-
-# effects declaration to each intent. Declarations are optional metadata;
-# the ordinary dispatcher never reads them.
-DECLARE_EFFECTS_ADDENDUM: Final = """
-
-DECLARATIONS (required for every intent): add a
-"declares" object to each intent: {"effect_types": [...], "expected_artifacts":
-[...], "confidence": "low|medium|high"}. effect_types must come from:
-recover_secret (flag/key/password/plaintext), verify_hypothesis (confirm or
-refute a specific claim), discover_artifact (find/extract/catalog files or
-artifacts), analyze_mechanism (understand a protocol/cipher/binary),
-exploit_chain (weaponize a vulnerability into an effect), eliminate_direction
-(rule a path out), other. expected_artifacts: at most 3 short noun phrases
-naming what should exist after success (e.g. "file-type mapping table",
-"recovered key bytes", "verdict on deployment config"). If an effect cannot
-be estimated, use effect_types ["other"], expected_artifacts [], confidence
-"low". Never omit the object in this experimental mode."""
-
-# Round-16 exact target/receipt seam.  This is a separate, default-off schema;
-# v1 and v2 are mutually exclusive so a measurement cannot silently mix their
-# truth conditions.  Target ids and receipt keys must come from the caller's
-# bounded catalog.  The production dispatcher still treats this as inert JSON.
-DECLARE_TARGET_RECEIPTS_V2_ADDENDUM: Final = """
-
-EXACT DECLARATIONS V2 (required for every intent): add a "declares" object:
-{"schema":"muteki.research.declaration-target-receipt.v2","targets":[
-{"target_id":"<exact catalog id>","predicate":"fact_active|artifact_present|hypothesis_true|terminal_admitted|poststate_holds|direction_viable",
-"polarity":"establish|retract","receipt":{"class":"verified_fact|structured_artifact|fact_review|admitted_flag|applied_poststate","key":"<exact catalog receipt key>"}}],
-"effect_types":[...],"confidence":"low|medium|high"}. Use only target ids and
-receipt keys explicitly present in the graph's target catalog. Never invent or
-lexically approximate them. Every target is an auditable promise: retract
-requires an explicit refuting review or applied poststate, never mere absence.
-If no catalog target fits an intent, omit the declares object. Output remains
-planning metadata only; it cannot prove progress or authorize dispatch."""
-
-
-def _env_true(name: str) -> bool:
-    raw = (os.environ.get(name) or "").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
-
-
-def declare_effects_enabled_from_env() -> bool:
-    return _env_true("MUTEKI_REASON_DECLARE_EFFECTS")
-
-
-def declare_target_receipts_v2_enabled_from_env() -> bool:
-    return _env_true("MUTEKI_REASON_DECLARE_TARGET_RECEIPTS_V2")
-
-
-def _declaration_mode_from_env() -> str:
-    v1 = declare_effects_enabled_from_env()
-    v2 = declare_target_receipts_v2_enabled_from_env()
-    if v1 and v2:
-        raise ValueError("Reason declaration v1 and v2 gates are mutually exclusive")
-    if v2:
-        return "v2"
-    if v1:
-        return "v1"
-    return ""
-
 
 # Pentest variant: SAME planner. Success is finding_ok (evidence predicate).
 # verdict=complete is a planning/coverage signal, not goal_met by itself.
@@ -594,18 +463,6 @@ async def compact_reason_context(
     )
 
 
-def resolve_declaration_mode(declaration_mode: Optional[str] = None) -> str:
-    """Resolve declaration mode: explicit override wins; else env (may be cleared)."""
-    if declaration_mode is None or not str(declaration_mode).strip():
-        return _declaration_mode_from_env()
-    mode = str(declaration_mode).strip().lower()
-    if mode in {"off", "none", "0"}:
-        return ""
-    if mode not in {"v1", "v2"}:
-        raise ValueError(f"unsupported declaration_mode: {declaration_mode!r}")
-    return mode
-
-
 def build_reason_prompt(
     summary: str,
     max_intents: int = 4,
@@ -613,17 +470,7 @@ def build_reason_prompt(
     goal: Optional[str] = None,
     mode: str = "ctf",
     scope: Optional[str] = None,
-    cognitive_shadow: bool = False,
-    declaration_target_catalog_v2: frozenset[
-        tuple[str, str, str, str, str]
-    ] | None = None,
-    declaration_mode: Optional[str] = None,
 ) -> list[dict]:
-    if cognitive_shadow:
-        raise CognitiveShadowAnnotationError(
-            "ordinary Reason prompts cannot carry cognitive shadow metadata; "
-            "use the separate frozen-plan annotation call"
-        )
     # pentest → goal-driven planner (the operator's engagement goal anchors the
     # `complete` verdict). CTF uses the compact graph-planning contract above.
     if mode == "pentest":
@@ -645,83 +492,6 @@ def build_reason_prompt(
         {
             "role": "user",
             "content": f"共享求解图：\n\n{summary}\n\n只输出规划 JSON。",
-        },
-    ]
-
-
-def _intent_execution_body(intent: Intent) -> dict[str, object]:
-    """Everything the ordinary dispatcher can observe, excluding shadow fields."""
-
-    body: dict[str, object] = {
-        "intent_id": intent.intent_id,
-        "goal": intent.goal,
-        "worker_class": intent.worker_class,
-        "depends_on": tuple(intent.depends_on),
-        "rationale": intent.rationale,
-        "from_facts": tuple(intent.from_facts),
-        "route_hash": intent.route_hash,
-        "branch_id": intent.branch_id,
-        "lane_key": intent.lane_key,
-        "risk_class": intent.risk_class,
-        "resource_key": intent.resource_key,
-        "dup_of": intent.dup_of,
-        "reopen_because": intent.reopen_because,
-        "priority": intent.priority,
-        "value_claim": intent.value_claim,
-        "requires_capabilities": tuple(intent.requires_capabilities),
-    }
-    if intent.expected_observable:
-        body["expected_observable"] = intent.expected_observable
-    if intent.stop_condition:
-        body["stop_condition"] = intent.stop_condition
-    if intent.coverage_key:
-        body["coverage_key"] = intent.coverage_key
-    return body
-
-
-def cognitive_shadow_baseline_digest(result: ReasonResult) -> str:
-    """Bind a shadow annotation to one exact, already-produced Reason plan."""
-
-    if type(result) is not ReasonResult:
-        raise TypeError("result must be ReasonResult")
-    body = {
-        "schema": "muteki.reason-frozen-shadow-baseline.v1",
-        "intents": tuple(_intent_execution_body(item) for item in result.intents),
-    }
-    return hashlib.sha256(
-        json.dumps(
-            body,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
-
-
-def build_cognitive_shadow_annotation_prompt(
-    *,
-    graph_summary: str,
-    baseline_result: ReasonResult,
-) -> list[dict[str, str]]:
-    """Build a non-dispatching annotation request over frozen ordinary intents."""
-
-    digest = cognitive_shadow_baseline_digest(baseline_result)
-    frozen = tuple(_intent_execution_body(item) for item in baseline_result.intents)
-    user = {
-        "baseline_digest": digest,
-        "frozen_intents": frozen,
-        "shared_graph_summary": graph_summary,
-    }
-    return [
-        {"role": "system", "content": COGNITIVE_SHADOW_ANNOTATION_SYSTEM},
-        {
-            "role": "user",
-            "content": json.dumps(
-                user,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
         },
     ]
 
@@ -752,377 +522,12 @@ def _extract_json(text: str) -> dict:
     return parsed
 
 
-def _cognitive_meta(raw: dict) -> dict:
-    value = raw.get("cognitive_experiment")
-    return value if isinstance(value, dict) else {}
-
-
-def _parse_cognitive_predictions(raw: dict) -> dict[str, str]:
-    value = _cognitive_meta(raw).get("predictions")
-    if not isinstance(value, dict):
-        return {}
-    predictions: dict[str, str] = {}
-    for hypothesis_id, outcome in value.items():
-        hypothesis_id = str(hypothesis_id).strip()
-        outcome = str(outcome).strip()
-        if (
-            hypothesis_id
-            and outcome
-            and len(hypothesis_id) <= 80
-            and len(outcome) <= 80
-        ):
-            predictions[hypothesis_id] = outcome
-    return predictions
-
-
-# Round-14 declaration taxonomy (production-local copy of the frozen
-# research taxonomy in muteki/research/declaration_effect_precision_v1.py —
-# production must not import research, so the 7 type NAMES are mirrored as
-# data here; any taxonomy change is a new measurement round, not an edit).
-DECLARED_EFFECT_TYPES = frozenset({
-    "recover_secret",
-    "verify_hypothesis",
-    "discover_artifact",
-    "analyze_mechanism",
-    "exploit_chain",
-    "eliminate_direction",
-    "other",
-})
-
-
-def _parse_declares(raw: dict) -> dict:
-    """Validate an optional v1 ``declares`` object; keep the intent on error."""
-    value = raw.get("declares")
-    if not isinstance(value, dict):
-        return {}
-    raw_types = value.get("effect_types")
-    raw_artifacts = value.get("expected_artifacts", [])
-    if not isinstance(raw_types, list) or not isinstance(raw_artifacts, list):
-        return {}
-    effect_types: list[str] = []
-    for item in raw_types:
-        if not isinstance(item, str):
-            return {}
-        effect_type = item.strip()
-        if effect_type not in DECLARED_EFFECT_TYPES:
-            continue
-        if effect_type not in effect_types:
-            effect_types.append(effect_type)
-    if not effect_types:
-        return {}
-    artifacts: list[str] = []
-    for item in raw_artifacts[:3]:
-        if not isinstance(item, str):
-            return {}
-        text = item.strip()
-        if text and text not in artifacts:
-            artifacts.append(text[:120])
-    confidence = str(value.get("confidence") or "").strip().lower()
-    if confidence not in ("low", "medium", "high"):
-        confidence = ""
-    declares: dict = {"effect_types": effect_types}
-    if artifacts:
-        declares["expected_artifacts"] = artifacts
-    if confidence:
-        declares["confidence"] = confidence
-    return declares
-
-
-_V2_DECLARATION_SCHEMA: Final = "muteki.research.declaration-target-receipt.v2"
-_V2_PREDICATES: Final = frozenset({
-    "fact_active", "artifact_present", "hypothesis_true", "terminal_admitted",
-    "poststate_holds", "direction_viable",
-})
-_V2_POLARITIES: Final = frozenset({"establish", "retract"})
-_V2_RECEIPT_CLASSES: Final = frozenset({
-    "verified_fact", "structured_artifact", "fact_review", "admitted_flag",
-    "applied_poststate",
-})
-_V2_COMPATIBLE_RECEIPTS: Final = {
-    ("fact_active", "establish"): frozenset({"verified_fact"}),
-    ("fact_active", "retract"): frozenset({"fact_review", "applied_poststate"}),
-    ("artifact_present", "establish"): frozenset({"structured_artifact"}),
-    ("artifact_present", "retract"): frozenset({"applied_poststate"}),
-    ("hypothesis_true", "establish"): frozenset({"fact_review"}),
-    ("hypothesis_true", "retract"): frozenset({"fact_review"}),
-    ("terminal_admitted", "establish"): frozenset({"admitted_flag"}),
-    ("terminal_admitted", "retract"): frozenset({"fact_review"}),
-    ("poststate_holds", "establish"): frozenset({"applied_poststate"}),
-    ("poststate_holds", "retract"): frozenset({"applied_poststate"}),
-    ("direction_viable", "establish"): frozenset({"fact_review"}),
-    ("direction_viable", "retract"): frozenset({"fact_review"}),
-}
-
-
-def _v2_text(value: object, limit: int) -> str:
-    if not isinstance(value, str):
-        return ""
-    text = value.strip()
-    if not text or len(text) > limit or any(ord(char) < 32 for char in text):
-        return ""
-    return text
-
-
-def _parse_declares_v2(
-    raw: dict,
-    *,
-    target_catalog: frozenset[tuple[str, str, str, str, str]] | None,
-) -> dict:
-    """Strict v2 parser with caller-owned exact catalog membership."""
-
-    # A prompt-visible string is not authority. Without a separately supplied
-    # catalog, optional declaration metadata is dropped while the intent stays.
-    if target_catalog is None:
-        return {}
-    value = raw.get("declares")
-    if not isinstance(value, dict) or set(value) - {
-        "schema", "targets", "effect_types", "confidence",
-    }:
-        return {}
-    if value.get("schema") != _V2_DECLARATION_SCHEMA:
-        return {}
-    raw_targets = value.get("targets")
-    if not isinstance(raw_targets, list) or not 1 <= len(raw_targets) <= 8:
-        return {}
-    targets: list[dict[str, object]] = []
-    seen: set[tuple[str, str]] = set()
-    for target in raw_targets:
-        if not isinstance(target, dict) or set(target) != {
-            "target_id", "predicate", "polarity", "receipt",
-        }:
-            return {}
-        receipt = target.get("receipt")
-        if not isinstance(receipt, dict) or set(receipt) != {"class", "key"}:
-            return {}
-        target_id = _v2_text(target.get("target_id"), 160)
-        predicate = _v2_text(target.get("predicate"), 40)
-        polarity = _v2_text(target.get("polarity"), 20)
-        receipt_class = _v2_text(receipt.get("class"), 40)
-        receipt_key = _v2_text(receipt.get("key"), 160)
-        identity = (target_id, predicate)
-        if (
-            not target_id or predicate not in _V2_PREDICATES
-            or polarity not in _V2_POLARITIES
-            or receipt_class not in _V2_RECEIPT_CLASSES or not receipt_key
-            or receipt_class not in _V2_COMPATIBLE_RECEIPTS[(predicate, polarity)]
-            or identity in seen
-        ):
-            return {}
-        if (
-            target_id,
-            predicate,
-            polarity,
-            receipt_class,
-            receipt_key,
-        ) not in target_catalog:
-            return {}
-        seen.add(identity)
-        targets.append({
-            "target_id": target_id,
-            "predicate": predicate,
-            "polarity": polarity,
-            "receipt": {"class": receipt_class, "key": receipt_key},
-        })
-    targets.sort(key=lambda item: (
-        str(item["target_id"]), str(item["predicate"]), str(item["polarity"]),
-        str(item["receipt"]),
-    ))
-    raw_effects = value.get("effect_types", [])
-    if not isinstance(raw_effects, list):
-        return {}
-    effects: list[str] = []
-    for item in raw_effects:
-        if not isinstance(item, str) or item.strip() not in DECLARED_EFFECT_TYPES:
-            return {}
-        effect = item.strip()
-        if effect not in effects:
-            effects.append(effect)
-    confidence = str(value.get("confidence") or "").strip().lower()
-    if confidence not in ("", "low", "medium", "high"):
-        return {}
-    declares: dict[str, object] = {
-        "schema": _V2_DECLARATION_SCHEMA,
-        "targets": targets,
-    }
-    if effects:
-        declares["effect_types"] = effects
-    if confidence:
-        declares["confidence"] = confidence
-    return declares
-
-
-def _parse_cognitive_capability(raw: dict) -> str:
-    return str(_cognitive_meta(raw).get("capability") or "").strip()[:80]
-
-
-def _parse_cognitive_cost_estimate(raw: dict) -> int | None:
-    value = _cognitive_meta(raw).get("supplied_cost_estimate_units")
-    if type(value) is int and 0 < value <= 1_000_000:
-        return value
-    return None
-
-
-def _parse_cognitive_other_lane(raw: dict) -> bool:
-    return _cognitive_meta(raw).get("other_unknown_lane") is True
-
-
-def _parse_cognitive_hypotheses(value: object) -> list[CognitiveHypothesisDraft]:
-    if not isinstance(value, list):
-        return []
-    drafts: list[CognitiveHypothesisDraft] = []
-    seen: set[str] = set()
-    for raw in value[:8]:
-        if not isinstance(raw, dict):
-            continue
-        hypothesis_id = str(raw.get("id") or "").strip()[:80]
-        claim = str(raw.get("claim") or "").strip()[:500]
-        rationale = str(raw.get("rationale") or "").strip()[:500]
-        weight = raw.get("weight_units")
-        if (
-            hypothesis_id
-            and hypothesis_id not in seen
-            and claim
-            and type(weight) is int
-            and 0 < weight <= 1_000_000
-        ):
-            seen.add(hypothesis_id)
-            drafts.append(
-                CognitiveHypothesisDraft(hypothesis_id, claim, rationale, weight)
-            )
-    return drafts
-
-
-def validate_cognitive_shadow_annotation(
-    baseline_result: ReasonResult,
-    annotated_result: ReasonResult,
-) -> None:
-    """Reject any annotation that changes the frozen executable plan.
-
-    The coordinator dispatches ``baseline_result`` regardless, but validating the
-    complete execution body here also prevents a future caller from accidentally
-    treating the annotation response as a substitute plan.
-    """
-
-    if (
-        type(baseline_result) is not ReasonResult
-        or type(annotated_result) is not ReasonResult
-    ):
-        raise TypeError("baseline_result and annotated_result must be ReasonResult")
-
-    def by_id(result: ReasonResult, label: str) -> dict[str, Intent]:
-        out: dict[str, Intent] = {}
-        for item in result.intents:
-            if item.intent_id in out:
-                raise CognitiveShadowAnnotationError(
-                    f"{label} contains duplicate intent id {item.intent_id!r}"
-                )
-            out[item.intent_id] = item
-        return out
-
-    baseline = by_id(baseline_result, "baseline")
-    annotated = by_id(annotated_result, "annotation")
-    if set(annotated) != set(baseline):
-        raise CognitiveShadowAnnotationError(
-            "annotation intent ids do not exactly match the frozen baseline"
-        )
-    for intent_id, baseline_intent in baseline.items():
-        if _intent_execution_body(annotated[intent_id]) != _intent_execution_body(
-            baseline_intent
-        ):
-            raise CognitiveShadowAnnotationError(
-                f"annotation changed frozen executable intent {intent_id!r}"
-            )
-
-
-def parse_cognitive_shadow_annotation_reply(
-    text: str,
-    *,
-    baseline_result: ReasonResult,
-) -> ReasonResult:
-    """Parse annotations while copying executable fields only from the baseline."""
-
-    if not baseline_result.intents:
-        raise CognitiveShadowAnnotationError("cannot annotate an empty baseline plan")
-    payload = _extract_json(text)
-    if not payload:
-        raise CognitiveShadowAnnotationError("annotation reply is not a JSON object")
-    expected_digest = cognitive_shadow_baseline_digest(baseline_result)
-    if payload.get("baseline_digest") != expected_digest:
-        raise CognitiveShadowAnnotationError(
-            "annotation baseline digest does not match the frozen plan"
-        )
-    raw_annotations = payload.get("annotations")
-    if not isinstance(raw_annotations, list):
-        raise CognitiveShadowAnnotationError("annotations must be a JSON array")
-
-    annotations: dict[str, dict] = {}
-    for raw in raw_annotations:
-        if not isinstance(raw, dict):
-            raise CognitiveShadowAnnotationError("every annotation must be an object")
-        unexpected = set(raw) - {"id", "goal", "cognitive_experiment"}
-        if unexpected:
-            raise CognitiveShadowAnnotationError(
-                "annotation attempted non-shadow fields: "
-                + ",".join(sorted(unexpected))
-            )
-        intent_id = raw.get("id")
-        if not isinstance(intent_id, str) or intent_id in annotations:
-            raise CognitiveShadowAnnotationError(
-                "annotation ids must be unique exact strings"
-            )
-        annotations[intent_id] = raw
-
-    baseline_by_id = {item.intent_id: item for item in baseline_result.intents}
-    if len(baseline_by_id) != len(baseline_result.intents):
-        raise CognitiveShadowAnnotationError("baseline contains duplicate intent ids")
-    if set(annotations) != set(baseline_by_id):
-        raise CognitiveShadowAnnotationError(
-            "annotation must echo every frozen intent exactly once"
-        )
-
-    annotated_intents: list[Intent] = []
-    for baseline_intent in baseline_result.intents:
-        raw = annotations[baseline_intent.intent_id]
-        if raw.get("goal") != baseline_intent.goal:
-            raise CognitiveShadowAnnotationError(
-                f"annotation changed frozen goal for {baseline_intent.intent_id!r}"
-            )
-        annotated_intents.append(
-            replace(
-                baseline_intent,
-                cognitive_predictions=_parse_cognitive_predictions(raw),
-                cognitive_capability=_parse_cognitive_capability(raw),
-                cognitive_supplied_cost_estimate_units=(
-                    _parse_cognitive_cost_estimate(raw)
-                ),
-                cognitive_other_unknown_lane=_parse_cognitive_other_lane(raw),
-            )
-        )
-
-    result = replace(
-        baseline_result,
-        intents=annotated_intents,
-        cognitive_hypotheses=_parse_cognitive_hypotheses(
-            payload.get("cognitive_hypotheses")
-        ),
-    )
-    validate_cognitive_shadow_annotation(baseline_result, result)
-    return result
-
-
 def parse_reason_reply(
     text: str,
     *,
     finish_reason: str = "",
     max_intents: int = 4,
-    allow_declares: bool = False,
-    allow_declares_v2: bool = False,
-    declaration_target_catalog_v2: frozenset[
-        tuple[str, str, str, str, str]
-    ] | None = None,
 ) -> ReasonResult:
-    if allow_declares and allow_declares_v2:
-        raise ValueError("Reason declaration v1 and v2 parsers are mutually exclusive")
     raw_response = str(text or "")
     d, parse_status, parse_detail = _extract_json_diagnostic(raw_response)
     plan_is_valid = bool(d) and isinstance(d.get("intents"), list)
@@ -1219,20 +624,6 @@ def parse_reason_reply(
                 requires_capabilities=requires_capabilities,
                 requested_priority=priority,
                 initial=bool(raw.get("initial")),
-                cognitive_predictions=_parse_cognitive_predictions(raw),
-                cognitive_capability=_parse_cognitive_capability(raw),
-                cognitive_supplied_cost_estimate_units=_parse_cognitive_cost_estimate(
-                    raw
-                ),
-                cognitive_other_unknown_lane=_parse_cognitive_other_lane(raw),
-                declared_effects=(
-                    _parse_declares_v2(
-                        raw,
-                        target_catalog=declaration_target_catalog_v2,
-                    )
-                    if allow_declares_v2
-                    else _parse_declares(raw) if allow_declares else {}
-                ),
             )
         )
     for i, raw in enumerate(raw_intents[max_intents:], start=max_intents):
@@ -1386,7 +777,6 @@ def parse_reason_reply(
         supersede_why=supersede_why,
         reprioritize_intents=reprioritize_intents,
         planner_failure=planner_failure,
-        cognitive_hypotheses=_parse_cognitive_hypotheses(d.get("cognitive_hypotheses")),
         diagnostics=ReasonDiagnostics(
             response_status="received" if raw_response.strip() else "empty",
             timed_out=False,
@@ -1416,32 +806,14 @@ async def run_reason(
     goal: Optional[str] = None,
     mode: str = "ctf",
     scope: Optional[str] = None,
-    cognitive_shadow: bool = False,
-    declaration_target_catalog_v2: frozenset[
-        tuple[str, str, str, str, str]
-    ] | None = None,
-    declaration_mode: Optional[str] = None,
 ) -> ReasonResult:
-    """Call the cheap planner model and parse its intents + audit. `mode`/`goal`
-    select the CTF (default, byte-identical) vs pentest (goal-driven) prompt.
-
-    ``declaration_mode`` is an optional class-side override (``\"v1\"``/``\"v2\"``).
-    When omitted, falls back to env gates (which A/B harnesses clear per cell).
-    """
-    if cognitive_shadow:
-        raise CognitiveShadowAnnotationError(
-            "ordinary Reason cannot produce shadow metadata; run the separate "
-            "frozen-plan annotation call"
-        )
+    """Call the planner and parse CTF or pentest intents and audit."""
     messages = build_reason_prompt(
         graph_summary,
         max_intents=max_intents,
         goal=goal,
         mode=mode,
         scope=scope,
-        cognitive_shadow=cognitive_shadow,
-        declaration_target_catalog_v2=declaration_target_catalog_v2,
-        declaration_mode=declaration_mode,
     )
     # The planner returns a small structured decision. Keep the output cap absent,
     # and disable extended reasoning so an OpenAI-compatible provider cannot spend
@@ -1522,52 +894,14 @@ async def run_reason(
                 parse_detail="planner request exceeded its overall timeout",
             ),
         )
-    resolved_mode = resolve_declaration_mode(declaration_mode)
     result = parse_reason_reply(
         raw_response,
         finish_reason=finish_reason,
         max_intents=max_intents,
-        allow_declares=resolved_mode == "v1",
-        allow_declares_v2=resolved_mode == "v2",
-        declaration_target_catalog_v2=declaration_target_catalog_v2,
     )
     result.diagnostics.input_tokens = int(getattr(resp, "input_tokens", 0) or 0)
     result.diagnostics.output_tokens = int(getattr(resp, "output_tokens", 0) or 0)
     return result
-
-
-async def run_cognitive_shadow_annotation(
-    *,
-    llm: Any,
-    model: str,
-    graph_summary: str,
-    baseline_result: ReasonResult,
-    run_id: Optional[str] = None,
-    challenge_id: Optional[str] = None,
-) -> ReasonResult:
-    """Make a second, normally metered LLM call with zero dispatch authority.
-
-    ``LLMClient.chat`` records usage through the same CostController as every
-    other call. A distinct solver id keeps the shadow spend attributable instead
-    of hiding it inside ordinary planning cost.
-    """
-
-    messages = build_cognitive_shadow_annotation_prompt(
-        graph_summary=graph_summary,
-        baseline_result=baseline_result,
-    )
-    response = await llm.chat(
-        model=model,
-        messages=messages,
-        stream=False,
-        run_id=run_id,
-        challenge_id=challenge_id,
-        solver_id="reason-cognitive-shadow",
-    )
-    return parse_cognitive_shadow_annotation_reply(
-        getattr(response, "content", "") or "",
-        baseline_result=baseline_result,
-    )
 
 
 def _route_key(shared_graph: Any, route_hash: str) -> str:
@@ -1808,7 +1142,6 @@ def _propose_one(
         "requires_capabilities": list(it.requires_capabilities),
         "dup_of": it.dup_of,
         "reopen_because": it.reopen_because,
-        "declares": dict(it.declared_effects) if it.declared_effects else None,
     }
 
 

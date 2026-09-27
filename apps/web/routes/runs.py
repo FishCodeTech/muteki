@@ -409,6 +409,8 @@ def register(app: FastAPI) -> None:
     @app.post("/api/runs/{run_id}/start")
     async def start_run(run_id: str, request: Request) -> Any:
         body = await _require_dict_body(request)
+        if str(body.get("kind") or "swarm") not in {"swarm", "idle"}:
+            raise HTTPException(status_code=422, detail="unsupported run kind")
         _reject_temporarily_disabled_engine(body)
         if str(body.get("kind") or "swarm") == "swarm":
             from apps.web.task_contract import prepare_dispatch_contract

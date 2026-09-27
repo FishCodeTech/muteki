@@ -100,3 +100,12 @@ exports/
 data/
 .muteki/
 .pi/
+
+# Local development output and generated build contexts.
+/.apodex/
+/.playwright-cli/
+/.cursor/
+/tmp/
+/docker/tsec-hosted/.build-ctx/
+
+/apps/web/ui/.next-readme/

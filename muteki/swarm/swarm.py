@@ -290,7 +290,6 @@ class Swarm(
         # imported and the MUTEKI_COGNITIVE_CLUSTER_PLANNER env gate read solely
         # by the experimental opt-in (muteki.swarm.experimental.ExperimentalSwarm),
         # which registers the dispatch_reorder / engine_pick_bias hooks.
-        cognitive_cluster_planner: bool = False,
         # ── worker execution backend ─────────────────────────────────────────
         # "local"  → workers shell out on the HOST (default; unchanged).
         # "container" → workers run inside the run's isolated Docker execution
@@ -341,12 +340,6 @@ class Swarm(
     ) -> None:
         self.challenge = challenge
         self.lineup = lineup
-        # Experiment hook registry (stage-4b): the production Swarm registers
-        # nothing, so every _experiment_stage / _experiment_call site in the
-        # coordinator pipeline is a no-op and behavior is byte-identical to the
-        # pre-experiment path. ExperimentalSwarm (muteki.swarm.experimental)
-        # fills this map with the extracted v1 experiment bodies on opt-in.
-        self._experiment_hooks: dict[str, Any] = {}
         self.llm = llm
         self._reason_max_intents_override: int | None = None
         self.planner_unavailable_detail = str(planner_unavailable_detail or "")
@@ -585,10 +578,6 @@ class Swarm(
         # default so existing race behavior (and tests) are unchanged; the web driver
         # opts in.
         self.coordinator = coordinator
-        # Stored flag only — the planner module import and the
-        # MUTEKI_COGNITIVE_CLUSTER_PLANNER env read moved to ExperimentalSwarm
-        # (stage-4b); the production Swarm never imports the planner module.
-        self.cognitive_cluster_planner = bool(cognitive_cluster_planner)
         # worker_root: a persistent per-run dir under which each CLI worker gets
         # its OWN cwd (worker_root/{solver_id}-{n}/) instead of a system $TMPDIR
         # mkdtemp. The web driver points this at sessions/{id}/workspace/workers/
@@ -870,12 +859,6 @@ class Swarm(
             self.shared_graph = None
             self._search_state_port = None
             raise RuntimeError(f"SharedGraphUnavailable: {exc}") from exc
-        prepare = getattr(self, "framework_prepare_hook", None)
-        if callable(prepare):
-            try:
-                prepare()
-            except Exception:
-                pass
         self._last_graph_event_seq = 0
         self._graph_bridge_failures: dict[int, int] = {}
         # multi-flag: the authoritative dedup set of flags collected so far. The
@@ -898,25 +881,6 @@ class Swarm(
         self._found_reports: list[dict] = []
         self._coverage_exhausted: bool = False
 
-    async def _experiment_stage(self, name: str, state) -> str:
-        """Dispatch one coordinator-stage experiment hook.
-
-        No hook registered (production default) → "proceed", so the pipeline
-        position the extracted experiment block used to own is a pure no-op.
-        """
-        hook = self._experiment_hooks.get(name)
-        if hook is None:
-            return "proceed"
-        return await hook(self, state)
-
-    def _experiment_call(
-        self, name: str, *args: Any, default: Any = None, **kwargs: Any
-    ) -> Any:
-        """Dispatch a non-stage experiment hook; ``default`` when unregistered."""
-        hook = self._experiment_hooks.get(name)
-        if hook is None:
-            return default
-        return hook(self, *args, **kwargs)
 
 
 async def run_swarm(

@@ -1,15 +1,9 @@
 #!/usr/bin/env bash
 # run.sh — launch Project Muteki.
 #
-#   ./run.sh tui [tui-args...]      Textual TUI command deck (in-process).
 #   ./run.sh web [web-opts...]      Web command deck (FastAPI backend + Next UI).
 #   ./run.sh upgrade [version]      Check and install a verified release bundle.
 #   ./run.sh rollback               Switch back to the previous installed version.
-#
-# TUI examples:
-#   ./run.sh tui                              mock event stream (UI demo, no key)
-#   ./run.sh tui --swarm --key 2020f-cry-hybrid2     solve for real (needs key)
-#   ./run.sh tui --swarm --desc "..." --target http://host --category web
 #
 # Web options:
 #   ./run.sh web                              backend (:8000) + production Next UI (:3001)
@@ -34,7 +28,7 @@
 # loopback-only (127.0.0.1) single-operator setup.
 #
 # Secrets: a repo-root .env is auto-loaded (see .env.example). A shell-exported
-# var always wins. --swarm needs MUTEKI_DEEPSEEK_API_KEY.
+# var always wins.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -85,12 +79,6 @@ require_uv() {
   fi
   command -v uv >/dev/null 2>&1 || {
     echo "ERROR: 'uv' still not on PATH after install. Add ~/.local/bin to PATH." >&2; exit 1; }
-}
-
-run_tui() {
-  require_uv
-  echo "==> Launching TUI  (Ctrl+C to quit, Esc to interrupt a run)"
-  exec uv run python -m apps.tui "$@"
 }
 
 run_web() {
@@ -173,6 +161,13 @@ run_web() {
     local pid="${1:-}"
     [ -n "$pid" ] || return 0
     kill -TERM -- "-$pid" 2>/dev/null || true
+    # Some macOS shells cannot create the requested child process group.
+    # Stop the direct children and wrapper as well in that case.
+    local child
+    while IFS= read -r child; do
+      [ -n "$child" ] && kill -TERM "$child" 2>/dev/null || true
+    done < <(pgrep -P "$pid" 2>/dev/null || true)
+    kill -TERM "$pid" 2>/dev/null || true
   }
   record_service_exit() {
     # Persist exit code / inferred signal even after the launching PTY is gone.
@@ -187,7 +182,7 @@ run_web() {
       printf 'status=%s\n' "$status"
       printf 'signal=%s\n' "${signal}"
       printf 'timestamp=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
-      printf '---\n'
+      printf '%s\n' '---'
     } >>"$dest" 2>/dev/null || true
   }
   cleanup() {
@@ -197,13 +192,15 @@ run_web() {
     local attempt alive
     for attempt in 1 2 3 4 5 6 7 8 9 10; do
       alive=0
-      [ -n "${ui_pid:-}" ] && kill -0 -- "-${ui_pid}" 2>/dev/null && alive=1
-      [ -n "${backend_pid:-}" ] && kill -0 -- "-${backend_pid}" 2>/dev/null && alive=1
+      [ -n "${ui_pid:-}" ] && kill -0 "$ui_pid" 2>/dev/null && alive=1
+      [ -n "${backend_pid:-}" ] && kill -0 "$backend_pid" 2>/dev/null && alive=1
       [ "$alive" -eq 0 ] && break
       sleep 0.1
     done
     [ -n "${ui_pid:-}" ] && kill -KILL -- "-${ui_pid}" 2>/dev/null || true
     [ -n "${backend_pid:-}" ] && kill -KILL -- "-${backend_pid}" 2>/dev/null || true
+    [ -n "${ui_pid:-}" ] && kill -KILL "$ui_pid" 2>/dev/null || true
+    [ -n "${backend_pid:-}" ] && kill -KILL "$backend_pid" 2>/dev/null || true
     [ -n "${ui_pid:-}" ] && wait "$ui_pid" 2>/dev/null || true
     [ -n "${backend_pid:-}" ] && wait "$backend_pid" 2>/dev/null || true
     set +m
@@ -379,14 +376,13 @@ main() {
   [ $# -ge 1 ] || usage 1
   local mode="$1"; shift || true
   case "$mode" in
-    tui) run_tui "$@" ;;
     web) run_web "$@" ;;
     version|status|upgrade|install|rollback)
       require_uv
       exec uv run python -m muteki.cli "$mode" "$@"
       ;;
     -h|--help|help) usage 0 ;;
-    *) echo "ERROR: unknown mode '$mode' (expected: tui | web | version | status | upgrade | install | rollback)" >&2; usage 1 ;;
+    *) echo "ERROR: unknown mode '$mode' (expected: web | version | status | upgrade | install | rollback)" >&2; usage 1 ;;
   esac
 }
 

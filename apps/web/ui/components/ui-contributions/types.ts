@@ -1,8 +1,7 @@
 /**
  * EXT-02：声明式 UI Contribution 的类型契约。
  *
- * 扩展在 manifest 的 `ui` 字段声明一个 JSON 文件（见
- * examples/extensions/hello/ui/contributions.json），内容必须落在这里定义的
+ * 扩展在 manifest 的 `ui` 字段声明一个 JSON 文件，内容必须落在这里定义的
  * 声明式 schema 内。渲染器只按这份 schema 解释数据，**不加载第三方任意
  * React / JS 代码**；复杂界面只能通过 `artifact_viewers` 的 `iframe` 种类
  * 以受控沙箱 iframe 呈现（无 allow-scripts，内容来自公开 API 的 projection

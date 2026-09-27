@@ -90,15 +90,6 @@ def _is_external_planning_input(
 async def reason_trigger_stage(self, state) -> str:
     """Start one coalesced Decide pass for each changed planning frontier."""
     emit_bb = partial(emit_scheduler_bb, self, state)
-    just_reaped = state.reaped_n > 0
-    if just_reaped:
-        fw_after = getattr(self, "framework_after_workers", None)
-        if callable(fw_after):
-            try:
-                await fw_after()
-            except Exception:
-                pass
-
     ctf_mode = getattr(self.challenge, "mode", "ctf") == "ctf"
     planning_limit = self._ordinary_planning_slots(state.tasks)
     state.open_intents = self._open_intents()
@@ -192,11 +183,6 @@ async def reason_trigger_stage(self, state) -> str:
                 max_workers=self.max_workers,
                 dispatch_mode=self.dispatch_mode,
                 planning_limit=self._ordinary_capacity_limit(),
-            )
-        await self._experiment_stage("reason_trigger_force", state)
-        if state.force_reason_after_fruitless_interrupt:
-            await self._experiment_stage(
-                "reason_trigger_interrupt_packet", state
             )
         if state.need_reason and state.reason_requested_intents <= 0:
             state.reason_requested_intents = max(1, planning_limit)
@@ -649,7 +635,6 @@ async def reason_collect_stage(self, state) -> str:
             state.last_consumed_wm = wm_after
             state.last_decided_wm = wm_after
 
-    await self._experiment_stage("reason_empty_retry", state)
     return "proceed"
 
 

@@ -129,7 +129,7 @@ def _worker_env(self, cwd: Optional[str] = None) -> dict:
     # container Workers.  The role checks below grant back only the capabilities
     # assigned to this Worker.
     for controlled_name in (
-        "MUTEKI_BLACKBOARD_DB", "MUTEKI_BLACKBOARD_FRAMEWORK",
+        "MUTEKI_BLACKBOARD_DB",
         "MUTEKI_BLACKBOARD_INGRESS_DIR", "MUTEKI_BLACKBOARD_PROFILE",
         "MUTEKI_BLACKBOARD_ROLE",
     ):
@@ -262,16 +262,10 @@ def _worker_env(self, cwd: Optional[str] = None) -> dict:
             except Exception:
                 pass
         env["MUTEKI_BLACKBOARD_INGRESS_DIR"] = ingress_path
-    # Framework swarms keep direct graph access for their framework commands.
-    # Ordinary solve/review Workers receive only the role-scoped projection in
-    # their prompt plus host-drained mutation ingress; exposing the raw DB path
-    # would recreate an unscoped context channel outside ContextManifest.
-    framework_id = str(getattr(self, "blackboard_framework", "") or "")
-    env["MUTEKI_BLACKBOARD_FRAMEWORK"] = framework_id
-    if framework_id:
-        env["MUTEKI_BLACKBOARD_ROLE"] = "framework"
+    # Workers receive role-scoped context and host-drained mutation ingress.
+    # Only post-solve respond receives read-only raw graph access.
     db = getattr(self.shared_graph, "db_path", None)
-    if db and (framework_id or self.mode == "respond"):
+    if db and self.mode == "respond":
         # ABSOLUTE path: the worker subprocess runs with cwd=<its own workdir>,
         # so a relative db_path would resolve against the wrong dir and the
         # blackboard skill / raw sqlite would hit "unable to open database file"

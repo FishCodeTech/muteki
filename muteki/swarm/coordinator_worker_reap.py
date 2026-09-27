@@ -50,8 +50,7 @@ async def _retire_finished_worker(self, state, t):
     # hook; default (no hook) is the historical module-absent 20.0s.
     retire_timeout: float | None = None
     if was_fruitless_interrupt:
-        retire_timeout = self._experiment_call(
-            "reap_settle_seconds", default=20.0)
+        retire_timeout = 20.0
     retired_ok = await self._retire_worker_account(
         solver, intent_id=str(
             intent_id
@@ -80,9 +79,7 @@ async def _retire_finished_worker(self, state, t):
             # Stage-4b: the fruitless-interrupt soft-continue consult is an
             # experimental hook; default (no hook) preserves the historical
             # module-absent behavior (True).
-            soft_continue = bool(
-                self._experiment_call("reap_soft_continue", default=True)
-            )
+            soft_continue = True
         if soft_continue and supervised_retirement:
             await emit_bb(
                 "fruitless_interrupt_retire_deferred",

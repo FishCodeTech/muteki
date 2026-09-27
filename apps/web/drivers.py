@@ -6,8 +6,6 @@ Kinds:
     executor) against a challenge spec. Needs a live target (URL in the prompt /
     challenge.target) and the claude (and optionally codex) CLI on PATH — no
     DeepSeek key (the CLI executor doesn't use the code-driven kernel).
-  - "mock": scripts the canned event stream (no model, no target) — UI dev / e2e
-    ONLY. Must be asked for explicitly (kind:"mock"); it is no longer the default.
 """
 
 from __future__ import annotations
@@ -284,60 +282,24 @@ async def _startup_readiness(
     return snapshot, failures
 
 
-# Allowlisted module prefixes for the optional `swarm_class` /start knob. The
-# endpoint loads a class by dotted path, so without this list it would be an
-# arbitrary-import (RCE) surface.
-_SWARM_CLASS_PREFIXES: tuple[str, ...] = (
-    "muteki.swarm.",
-    "muteki.solver.",
-    "muteki.frameworks.",
-)
-
-
 def _resolve_swarm_class(spec: Any) -> type:
-    """Resolve the optional `swarm_class` body knob (``module.path:ClassName``).
-
-    Product default is ``muteki.swarm.swarm.Swarm`` (coordinator_loop).
-    Empty / omitted spec must stay on that class. Experimental arms
-    (ChainForce, PEX, DualRush, ReapClose, F01–F12) load only when a
-    caller writes an explicit allowlisted spec. Web UI does not send
-    this field. See AGENTS.md.
-    """
+    """Accept only the shipped Coordinator, including legacy explicit specs."""
     from muteki.swarm.swarm import Swarm
 
     text = str(spec or "").strip()
-    if not text:
+    if text in ("", "muteki.swarm.swarm:Swarm"):
         return Swarm
-    module_name, sep, class_name = text.partition(":")
-    if not sep or not module_name or not class_name:
-        raise RuntimeError(
-            f"swarm_class must be 'module.path:ClassName', got {text!r}")
-    if not module_name.startswith(_SWARM_CLASS_PREFIXES):
-        raise RuntimeError(
-            f"swarm_class module {module_name!r} not in allowlist "
-            f"{_SWARM_CLASS_PREFIXES}")
-    import importlib
-
-    cls = getattr(importlib.import_module(module_name), class_name, None)
-    if not (isinstance(cls, type) and issubclass(cls, Swarm)):
-        raise RuntimeError(
-            f"swarm_class {text!r} is not a muteki.swarm.swarm.Swarm subclass")
-    return cls
+    raise RuntimeError(f"swarm_class {text!r} is unavailable; use the standard Swarm")
 
 
 def build_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver:
-    # Real solving is the DEFAULT now — the deck launches the CLI executor swarm.
-    # "mock" is opt-in (UI dev / e2e only).
+    # Only shipped product drivers are accepted.
     body = _normalize_start_flag_contract(body)
     kind = body.get("kind", "swarm")
-    if kind == "mock":
-        return _mock_driver(body)
-    if kind == "mock_platform_acceptance":
-        return _swarm_driver(_infer_challenge(body), mgr=mgr)
-    if kind == "pentest_demo":
-        return _pentest_demo_driver(body, mgr=mgr)
     if kind == "idle":
         return _idle_driver(body)
+    if kind != "swarm":
+        raise ValueError(f"unsupported run kind: {kind}")
     return _swarm_driver(_infer_challenge(body), mgr=mgr)
 
 
@@ -445,46 +407,6 @@ def _idle_driver(body: dict[str, Any]) -> Driver:
     return drive
 
 
-def _mock_driver(body: dict[str, Any]) -> Driver:
-    async def drive(run: Run) -> None:
-        from examples.mock_solver import run_mock_solve
-
-        # pace the canned stream so the evolving graph + chat animate in the
-        # browser and a human has a window to inject HITL commands mid-run.
-        tick = float(body.get("tick", 0.6))
-        # optional multi-flag demo: body.expected_flags (or challenge.expected_flags)
-        ef = int(body.get("expected_flags")
-                 or (body.get("challenge") or {}).get("expected_flags") or 1)
-        await run_mock_solve(run.bus, run.cost, run_id=run.run_id, tick=tick,
-                             expected_flags=ef,
-                             flag_value=str(body.get("mock_flag") or ""))
-
-    return drive
-
-
-def _pentest_demo_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver:
-    """Scripts a full pentest run whose sole purpose is to populate every
-    runtime-asset / review panel on the deck (findings, vuln reports, PoCs,
-    routes/branches, directives, credentials). UI/demo ONLY — kind:"pentest_demo".
-
-    Credentials read the run's persisted shared_graph.db, so when a RunManager is
-    available the demo uses its coordinator-private graph directory and writes the
-    verified credential facts there (matching what /api/runs/{id}/credentials
-    reads). Without a manager it degrades to counting-only (no db)."""
-    async def drive(run: Run) -> None:
-        from examples.pentest_demo_solver import run_pentest_demo_solve
-
-        # pace the canned stream so the panels visibly fill in the browser.
-        tick = float(body.get("tick", 0.5))
-        graph_dir = None
-        if mgr is not None:
-            graph_dir = mgr.graph_dir(run.run_id)
-        await run_pentest_demo_solve(
-            run.bus, run.cost, run_id=run.run_id, tick=tick, graph_dir=graph_dir)
-
-    return drive
-
-
 async def _open_planner_llm(
     *,
     llm_profiles: dict[str, Any],
@@ -539,11 +461,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
       engines: list[str] (default [cursor,claude,codex]) — engine roster; offline
                                                 drops cursor (can't go offline cleanly)
       start_workers: int (default len(engines)) — bootstrap workers (one per engine)
-      swarm_class: "module.path:ClassName" (default muteki.swarm.swarm:Swarm)
-                                                — product Coordinator. Omit this
-                                                field for CTF and pentest.
-                                                Experimental arms are eval-only
-                                                and require an explicit spec.
+      swarm_class: omitted or muteki.swarm.swarm:Swarm — standard Coordinator
     """
     async def drive(run: Run) -> None:
         import os
@@ -559,7 +477,8 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         from muteki.solver.types import SolverConfig
         from muteki.swarm.models import default_lineup
 
-        # Empty spec → production Swarm. Explicit spec is eval-only.
+        # Legacy explicit standard spec is accepted; research implementations
+        # are no longer shipped.
         swarm_cls = _resolve_swarm_class(body.get("swarm_class"))
 
         ch = dict(body.get("challenge") or {})
@@ -690,11 +609,6 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         executor = body.get("executor", "cli")
         cli_race = bool(body.get("cli_race", False))
         cli_engine = body.get("cli_engine", "claude")
-        # Default-off cognitive cluster planner (intent ranking + engine match).
-        # Env MUTEKI_COGNITIVE_CLUSTER_PLANNER=1 also enables (Swarm ctor).
-        cognitive_cluster_planner = bool(
-            body.get("cognitive_cluster_planner", False)
-        )
         offline = bool(body.get("offline", False))
         web_access = not offline
         # offline implies NO KB (a clean black-box eval denies every external
@@ -1104,7 +1018,6 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             executor=executor, cli_engine=cli_engine, cli_race=cli_race,
             engines=engines, start_workers=start_workers, max_workers=max_workers,
             web_access=web_access, kb=kb, coordinator=coordinator,
-            cognitive_cluster_planner=cognitive_cluster_planner,
             graph_dir=graph_dir, worker_root=worker_root,
             wall_clock_budget=wall_clock_budget,
             race_scout=race_scout, race_engines=race_engines,

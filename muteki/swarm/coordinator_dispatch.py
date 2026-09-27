@@ -497,13 +497,7 @@ class _DispatchReasonMixin:
         # verifier processes consume the same capacity; role-specific limits below
         # may narrow it further but can never expand it.
         configured = int(self.max_workers)
-        # An explicitly armed experiment may narrow the ceiling only.
-        raw_cap = self._experiment_call(
-            "ordinary_capacity_cap", configured, default=configured)
-        try:
-            return max(0, min(configured, int(raw_cap)))
-        except (TypeError, ValueError):
-            return max(0, configured)
+        return max(0, int(self.max_workers))
 
     def _total_active_count(self, tasks: Optional[dict] = None) -> int:
         # _live_solvers includes workers constructed before their asyncio task is
@@ -794,10 +788,6 @@ class _DispatchReasonMixin:
                 compact_cutoff_seq = 0
 
             def _render_graph_context() -> str:
-                folded = self._experiment_call(
-                    "reason_context_fold", self.shared_graph, default=None)
-                if folded is not None:
-                    return str(folded)
                 return self.shared_graph.to_reason_summary(
                     standing_guidance=list(self._standing_guidance),
                     compact_summary=compact_summary,
@@ -903,28 +893,6 @@ class _DispatchReasonMixin:
                 )
                 retry_note_chars = len(retry_context)
                 summary = f"{summary}\n\n{retry_context}"
-            # Framework Sense prefix (f02 world-model etc.). Default Swarm: no-op.
-            fw_prefix_chars = 0
-            extra = ""
-            fw_prefix = getattr(self, "framework_reason_context_prefix", None)
-            if callable(fw_prefix):
-                try:
-                    extra = str(fw_prefix() or "")
-                    if extra:
-                        fw_prefix_chars = len(extra)
-                        summary = f"{extra}\n\n{summary}"
-                except Exception:
-                    pass
-            # Framework class-side declaration override (env keys are cleared by
-            # A/B harnesses). Default Swarm has neither attribute nor catalog → inert.
-            decl_mode = getattr(self, "reason_declaration_mode", None)
-            decl_catalog = None
-            catalog_fn = getattr(self, "_declaration_target_catalog_v2", None)
-            if callable(catalog_fn) and decl_mode:
-                try:
-                    decl_catalog = catalog_fn()
-                except Exception:
-                    decl_catalog = None
             requested = max_intents
             if requested is None:
                 requested = getattr(
@@ -946,8 +914,6 @@ class _DispatchReasonMixin:
                 value = f"{task_context}\n\n{graph_body}"
                 if retry_context:
                     value = f"{value}\n\n{retry_context}"
-                if extra:
-                    value = f"{extra}\n\n{value}"
                 return value
 
             async def _compact_reason_graph(tokens_before: int) -> bool:
@@ -1031,8 +997,6 @@ class _DispatchReasonMixin:
                     goal=None,
                     mode=getattr(self.challenge, "mode", "ctf"),
                     scope=(getattr(self.challenge, "scope", "") or None),
-                    declaration_mode=decl_mode,
-                    declaration_target_catalog_v2=decl_catalog,
                 )
             )
             estimated_reason_tokens = estimate_reason_messages_tokens(preview_messages)
@@ -1064,9 +1028,6 @@ class _DispatchReasonMixin:
                 "mode": getattr(self.challenge, "mode", "ctf"),
                 "goal": None,
                 "scope": (getattr(self.challenge, "scope", "") or None),
-                "cognitive_shadow": False,
-                "declaration_mode": decl_mode,
-                "declaration_target_catalog_v2": decl_catalog,
             }
 
             async def _call_reason() -> Any:
@@ -1117,9 +1078,7 @@ class _DispatchReasonMixin:
                         goal=reason_args["goal"],
                         mode=reason_args["mode"],
                         scope=reason_args["scope"],
-                        declaration_mode=decl_mode,
-                        declaration_target_catalog_v2=decl_catalog,
-                    )
+                            )
                 )
                 section_chars: dict[str, int] = {
                     "system": sum(
@@ -1135,8 +1094,6 @@ class _DispatchReasonMixin:
                     )
                 else:
                     section_chars["operator_task"] = len(task_context)
-                if fw_prefix_chars:
-                    section_chars["framework_prefix"] = fw_prefix_chars
                 if retry_note_chars:
                     section_chars["planner_retry"] = retry_note_chars
                 if compact_summary:
@@ -1412,12 +1369,6 @@ class _DispatchReasonMixin:
                     })
                 self._last_reason_preemptions = preemptions
             self._last_dispatch_decisions = dispatch_decisions
-            on_proposed = getattr(self, "framework_on_intents_proposed", None)
-            if callable(on_proposed):
-                try:
-                    on_proposed(proposed)
-                except Exception:
-                    pass
             failure = result.planner_failure
             if not proposed and result.intents and failure is None:
                 failure = PlannerFailure(
