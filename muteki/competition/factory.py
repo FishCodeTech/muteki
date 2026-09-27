@@ -13,7 +13,6 @@ from muteki.competition.models import (
 from muteki.competition.platforms.browser import GenericBrowserAdapter
 from muteki.competition.platforms.ctfd import CTFdAdapter
 from muteki.competition.platforms.gzctf import GZCTFAdapter
-from muteki.competition.platforms.mock import MockCompetitionAdapter
 from muteki.competition.platforms.rctf import RCtfAdapter
 from muteki.competition.secrets import PlatformSecretStore
 from muteki.competition.store import CompetitionStore, NotFoundError
@@ -21,7 +20,6 @@ from muteki.extensions.integrations import ExtensionPlatformAdapter
 from muteki.platform.contracts.modules import PlatformConnectionRef
 
 _BUILTIN_KIND_META: dict[str, dict[str, str]] = {
-    PlatformKind.MOCK.value: {"label": "本地模拟", "icon": "cpu"},
     PlatformKind.CTFD.value: {"label": "CTFd", "icon": "flag"},
     PlatformKind.RCTF.value: {"label": "rCTF", "icon": "flag"},
     PlatformKind.GZCTF.value: {"label": "GZCTF", "icon": "flag"},
@@ -97,7 +95,7 @@ class PlatformAdapterFactory:
         return kinds
 
     def is_supported_kind(self, kind: str) -> bool:
-        if kind in {k.value for k in PlatformKind}:
+        if kind in {k.value for k in PlatformKind if k is not PlatformKind.MOCK}:
             return True
         if self.extension_bridge is not None:
             return bool(self.extension_bridge.platform_adapter_supported(kind))
@@ -132,12 +130,7 @@ class PlatformAdapterFactory:
             return cached[1]
         policy = dict(self.transport_policy.get(connection.connection_id) or {})
         kind = connection.platform_kind
-        if kind == PlatformKind.MOCK.value:
-            adapter = MockCompetitionAdapter(
-                connection,
-                state_root=self.state_root / "mock-platform",
-            )
-        elif kind == PlatformKind.CTFD.value:
+        if kind == PlatformKind.CTFD.value:
             adapter = CTFdAdapter(
                 connection, self.secrets,
                 client_transport=policy.get("client_transport"),

@@ -63,13 +63,6 @@ async def dispatch_stage(self, state) -> str:
             if str(intent.get("intent_id") or "") not in checkpoint_replan_ids
         ]
     state.open_intents = self._capacity_dispatchable_open_intents(state.open_intents, state.tasks)
-    # Cognitive cluster planner: reorder open intents so the next
-    # explore worker takes the highest-evidence-value direction, not
-    # FIFO creation order. Stage-4b: lives behind the experimental hook
-    # registry (ExperimentalSwarm + the cluster-planner flag);
-    # default no-op, state.open_intents is mutated in place when hooked.
-    self._experiment_call(
-        "dispatch_reorder", state, running_engines(), default=None)
     spawned_this_round = 0
     batch_engines: list[str] = []
     scan_remaining = len(state.open_intents)

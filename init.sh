@@ -42,7 +42,7 @@ fi
 
 echo "==> [3/3] Environment ready"
 echo
-echo "OK — setup complete. See README.md to get started; AGENTS.md for the dev map."
+echo "OK — setup complete. See README.md to get started."
 
 # To run a real challenge (needs an API key), use the web deck:
 #   ./run.sh web   → create a run, flip the offline toggle for a clean black-box.

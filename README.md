@@ -61,15 +61,7 @@ CTF is only the most basic capability. The core architecture is built for goal-d
 ## What can it do?
 
 At RIFFHACK 2026, fully automated for 3 hours with zero human takeover, it speed-ran and AK'd (solved every) challenge — taking 8th place.
-
-![image-20260624162932292](./assets/image-20260624162932292.png)
-
 On the iChunQiu Yunjing penetration-testing range "blackmaze" — zero solves for three months — Muteki speed-ran the first blood in 2 hours. (Why does the platform show 39 hours? Because during that time I was dealing with all sorts of debugging, testing, and multi-flag mode support, which wasted a lot of time; the actual solving took only 2 hours.)
-
-![ee318ffa895e4b2ffd6df67da6c15f90](./assets/ee318ffa895e4b2ffd6df67da6c15f90.png)
-
-![image-20260624163414544](./assets/image-20260624163414544.png)
-
 AK'd all badge scenarios on Qianxin Yunjing.
 
 AK'd all categories of HackTheBox Insane and Hard difficulty.
@@ -81,9 +73,6 @@ Many more first-bloods and high scores — across competitions you know and ones
 In short, after a month of engineering optimization, architecture/capability tuning, and bug fixing, this project is now officially open-sourced — no star-baiting, no boastful marketing copy, no undermining your confidence, no sub-groups, no community gatekeeping, no money scams, no paywalls, no marketing — just open-sourced and shared directly.
 
 You're welcome to use it and help build and upgrade it together. If you run into any problems, feel free to open an issue, and you're welcome to join the discussion group. Let's build the world's strongest CTF agent together.
-
-![mmqrcode1782307542963](./assets/mmqrcode1782307542963..png)
-
 ---
 
 ## Architecture
@@ -92,20 +81,13 @@ Muteki points a group of heterogeneous coding agents (Claude, Codex, Cursor, Pi,
 
 So how does a worker hand its data to the platform, and how does it see its teammates' progress? **It all relies on the `muteki-blackboard` skill built into every worker** — this is the only data channel between a worker and the blackboard.
 
-For a detailed architecture explanation, see: [docs/工作原理.md](docs/工作原理.md)
 
 The project follows a "less is more" principle: it injects no security tools and no security knowledge, keeps the network open, and lets workers improvise freely — writing and installing their own dependencies and scripts. The composer **Web tools** toggle only closes the agent's WebSearch, WebFetch, and knowledge base; the worker shell can still reach the network.
-
-![image-20260624164618066](./assets/image-20260624164618066.png)
-
 > *Web command deck: the run list on the left, the coordinator conversation stream in the middle, and a live run control panel with per-worker status on the right.*
 
 ### One picture: solve phases × agent loop
 
 The outer `①②③④` are the four phases of a single run; the inner `(1)~(5)` are the per-tick collaboration loop of phase ③. All the hard work on tough challenges happens inside the ③ loop, and every read/write between a worker ↔ the blackboard inside that loop goes through the `muteki-blackboard` skill.
-
-![1782305107059](./assets/1782305107059.png)
-
 **One lap of `(1)→(5)` is the heart of Muteki**: the coordinator reads the blackboard → Reason plans the next step → an intent goes onto the blackboard → workers each claim one and run real commands → **the results are written back to the blackboard via the skill (flags still have to pass the gate)**, then it reads again… one lap every 2 seconds — that's how hard challenges pile evidence thicker, lap after lap. The outer `①②③④` is the full timeline of a single run.
 
 
@@ -117,7 +99,7 @@ The outer `①②③④` are the four phases of a single run; the inner `(1)~(5)
 | **④ Wind-down** | Enough for a flag / operator stops / budget exhausted | Persist the winner, release claims, emit terminal events, clean up | RUN_FINISHED + a replayable blackboard |
 
 
-Web defaults to Coordinator and may run an optional race-scout round first. The TUI `--swarm` path uses a direct race. Callers that construct `Swarm` directly must select the intended mode explicitly.
+Web defaults to Coordinator and may run an optional race-scout round first. Callers that construct `Swarm` directly must select the intended mode explicitly.
 
 To keep Muteki from falling into a dead-loop while working a single task, we set up a review mechanism: while Muteki executes the task, it periodically runs a review that checks and verifies the facts already recorded, then corrects course promptly whenever needed.
 
@@ -152,8 +134,7 @@ version, authentication state, probe source, actual capabilities and any fallbac
 
 Competition adapters for CTFd, rCTF, GZCTF and an authorized browser session are implemented and
 validated against authorized isolated deployments with newly created competitions, challenges, attachments,
-real submission receipts, target-specific rate limits, restart recovery and dynamic-instance replacement. See
-[the P1 platform acceptance record](docs/validation/p1_authorized_platform_acceptance_2026-08-24.md).
+real submission receipts, target-specific rate limits, restart recovery and dynamic-instance replacement..
 
 For isolated local instances, specify separate ports and roots:
 
@@ -227,9 +208,6 @@ You need at least one of them to run. You can also configure a **custom OpenAI-c
 Worker credentials are configured in the web settings. In local mode you can skip configuring them — you just need your subscription to be usable when you run the CLI yourself.
 
 The remaining cases are generally for configuring remote or container environments, where container credential information is involved.
-
-![image-20260624184241572](./assets/image-20260624184241572.png)
-
 In container mode, or in other cases where you need to use a key, you can configure it as follows:
 
 
@@ -239,10 +217,6 @@ In container mode, or in other cases where you need to use a key, you can config
 | `codex`  | `codex-home/auth.json`    | `codex login` (copy `~/.codex/auth.json`) |
 | `cursor` | `CURSOR_API_KEY`          | cursor.com → API key                  |
 | Custom endpoint | `API_KEY` + `BASE_URL`    | Any OpenAI-compatible vendor          |
-
-
-![image-20260624184417919](./assets/image-20260624184417919.png)
-
 After saving, you can click "Save & test" at any time.
 
 **local vs container mode:**
@@ -251,9 +225,6 @@ After saving, you can click "Save & test" at any time.
 - In **`local`** mode, if no account is registered, the worker inherits the host CLI's existing login — though you can also configure it manually.
 
 The DeepSeek reasoning model used by the coordinator remains available through `MUTEKI_DEEPSEEK_API_KEY` in `.env`. DeepSeek Harness (`dsh`) is only retained as a locked registry and historical-data identifier until its upstream CLI provides the required structured events, tool results, and session recovery.
-
-![image-20260624184600517](./assets/image-20260624184600517.png)
-
 For the credential trust model, see [SECURITY.md](SECURITY.md).
 
 ### Worker images (container backend)
@@ -363,32 +334,23 @@ The full env contract (and which vars compose sets for you automatically — don
 ## Best practices
 
 1. After opening the project, you'll land on a page like this
-   ![image-20260624192301784](./assets/image-20260624192301784.png)
 2. First, open the settings page in the bottom-left, check the engines you want to field, and configure your worker models.
    For model selection: if you already hold the Cyber / CVP certification, I recommend Opus 4.8 and GPT-5.5; if not, I personally recommend GPT-5.4 and Opus 4.6. For Cursor I personally recommend Compose 2.5, which works wonders on easy challenges.
    Of course, you can also configure custom domestic models via a custom base_url (DeepSeek, Kimi, GLM).
-   ![image-20260624192335651](./assets/image-20260624192335651.png)
 3. For the runtime environment, local is recommended; if you have special needs you can choose container, which will remind you to configure the relevant credentials — please configure those yourself. You can click "Test model" to check whether it works correctly; the test invokes the agent and asks the model to repeat "ok".
-   ![image-20260624192439759](./assets/image-20260624192439759.png)
 4. Next, you can configure your workers in detail; configuring them as shown in the picture is recommended.
    The starting worker count is the number for the race-scout round when that round is enabled; it follows your enabled engine count. It is used for quickly grabbing first blood and quickly solving easy challenges.
    The maximum worker count is recommended to stay around 5–6, because for web challenges too many workers could cause a DDoS-like situation.
-   ![image-20260624192517250](./assets/image-20260624192517250.png)
 5. It's recommended to configure and test connectivity for the reasoning model here, for better planning and pacing of the challenge.
-   ![image-20260624192921371](./assets/image-20260624192921371.png)
 6. Once everything is configured, you can click "Run self-check"; if there are no issues, save and close the settings page.
 7. The recommended prompting approach for solving a challenge is as follows:
    1. State the challenge description, category, name, website/URL, and flag format.
    2. The frontend also supports copy-paste and file upload, so you can directly upload attachment-based challenges.
    3. The "Web tools" toggle in the picture controls whether the agent's own WebSearch, WebFetch, and knowledge base are enabled; they are on by default. Turning them off is for benchmark evaluation. The worker shell can still use the network.
    4. Ignore the local/container button — it's tied to the settings feature and may be removed later. Under "Advanced" you can manually specify the flag format and a few simple settings, which can be ignored.
-      ![image-20260624193322483](./assets/image-20260624193322483.png)
-      ![image-20260624193441654](./assets/image-20260624193441654.png)
 8. After starting, it initializes for about half a minute — initialization involves file setup and config-file setup, which is a bit slow — and then you'll enter the main page.
-   ![image-20260624193525341](./assets/image-20260624193525341.png)
-9. ![image-20260624194842261](./assets/image-20260624194842261.png)
-10. After a challenge is solved, you can use the "x" in the top-right to report a specific flag as a false positive, which will spin workers back up to keep re-solving; you can click "Generate writeup" to generate it directly.
-11. The other pages are for viewing or exploring on your own — feel free to try and use them.
+9. After a challenge is solved, you can use the "x" in the top-right to report a specific flag as a false positive, which will spin workers back up to keep re-solving; you can click "Generate writeup" to generate it directly.
+10. The other pages are for viewing or exploring on your own — feel free to try and use them.
 
 ---
 
@@ -413,9 +375,7 @@ Covering all six major categories and spanning the full CSAW difficulty range ac
 | Winners per engine | cursor 80 · claude 75 · codex 45 |
 
 
-The three engines' blind spots don't overlap — together they sweep all six categories, including CSAW top-tier challenge types such as V8-engine pwn, Windows remote privilege escalation, and 16 GB disk-image forensics. Full report:
-[eval_nyu/_reports/FINAL_eval_report.md](eval_nyu/_reports/FINAL_eval_report.md),
-with per-challenge details in [eval_nyu/_reports/RESULTS.md](eval_nyu/_reports/RESULTS.md).
+The three engines' blind spots don't overlap — together they sweep all six categories, including CSAW top-tier challenge types such as V8-engine pwn, Windows remote privilege escalation, and 16 GB disk-image forensics..
 
 > Engine/model versions change as the CLIs update (workers shell out and run each CLI's own default model: Claude Opus 4.7 / GPT-5.5 / Cursor).
 > Treat these numbers as a capability snapshot, not a leaderboard verdict.
@@ -429,11 +389,9 @@ with per-challenge details in [eval_nyu/_reports/RESULTS.md](eval_nyu/_reports/R
 | -------------------- | --------------------------------------------------------------------------------- |
 | `muteki/`            | Core: `swarm/` (coordinator), `solver/` (CLI driver, gate, control plane), `models/`, `platform/`, `sandbox/` |
 | `apps/web/`          | FastAPI backend (`server.py`) + Next.js operator UI (`ui/`)                        |
-| `apps/tui/`          | Textual TUI command deck (`--swarm` uses a direct race; Coordinator/Settings integration is deferred) |
 | `cmd/runtime-agent/` | In-container Go supervisor (reverse-connects to the control plane)                 |
 | `docker/worker/`     | Worker image (Dockerfile, build scripts, tool-awareness map)                      |
-| `scripts/`           | eval / backtest harness                                                            |
-| `docs/`              | Operator docs (`工作原理.md`) |
+| `scripts/`           | Installation, release and generated API contracts                                  |
 
 
 ### Working directory of a single runner (challenge)
@@ -501,9 +459,6 @@ Product acceptance evidence is recorded from real production runs and browser op
 ## Current status and tasks
 
 P1 authorized-platform acceptance and P2 deployment/optional-path acceptance are complete.
-The repository maintains one task list only:
-[`docs/current_iteration_todo.md`](docs/current_iteration_todo.md). The README no longer
-duplicates backlog entries.
 
 ---
 

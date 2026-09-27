@@ -4,9 +4,9 @@
 
 ```bash
 python -m muteki.extensions.cli --root state/control list
-python -m muteki.extensions.cli install --kind local-dir --path examples/extensions/hello
-python -m muteki.extensions.cli enable org.muteki.examples.hello
-python -m muteki.extensions.cli invoke org.muteki.examples.hello ext.org.muteki.examples.hello.greet --params '{"name":"muteki"}'
+python -m muteki.extensions.cli install --kind local-dir --path /path/to/extension
+python -m muteki.extensions.cli enable your.extension.id
+python -m muteki.extensions.cli invoke your.extension.id ext.your.extension.id.greet --params '{"name":"muteki"}'
 python -m muteki.extensions.cli health / logs / projection / disable / rollback / uninstall ...
 ```
 """

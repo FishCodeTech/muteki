@@ -718,36 +718,6 @@ class _RaceRunMixin:
         untried = [candidate for candidate in available if candidate not in avoided]
         if untried:
             available = untried
-        # Framework capability profiler (f01+): default Swarm has no hook → inert.
-        effect_pick = getattr(self, "_effect_capability_pick_engine", None)
-        if callable(effect_pick) and role in {"explore", "bootstrap", "review"}:
-            try:
-                chosen = effect_pick(
-                    running_engines,
-                    available,
-                    role=role,
-                    intent_id=intent_id,
-                    lane=lane,
-                    intent=intent,
-                    avoid_engines=list(avoid_engines or ()),
-                )
-                if chosen and chosen in available:
-                    return chosen
-            except Exception:
-                pass
-        # Stage-4b: cognitive-cluster engine bias lives behind the experimental
-        # hook registry; None (or no hook) falls through to the default pick.
-        biased = self._experiment_call(
-            "engine_pick_bias",
-            available,
-            running_engines,
-            role=role,
-            intent=intent,
-            avoid_engines=avoid_engines,
-            default=None,
-        )
-        if biased is not None:
-            return biased
         # A configured profile is the scheduling unit.  Two profiles may share
         # one transport (for example pi-main and pi-ollama) while carrying
         # different accounts/models/endpoints.  Ranking only by base-engine load
@@ -2239,15 +2209,6 @@ class _RaceRunMixin:
             list(self._next_worker_guidance) if solve_guidance_role else []
         )
         raw_guidance = list(self._standing_guidance) + pending_next_guidance
-        # Framework worker shell injection (f01 declarations etc.). Default: no-op.
-        fw_guide = getattr(self, "framework_worker_guidance_for_intent", None)
-        if callable(fw_guide) and intent_id:
-            try:
-                extra = fw_guide(str(intent_id))
-                if extra:
-                    raw_guidance = list(raw_guidance) + list(extra)
-            except Exception:
-                pass
         # secret:// values have a typed ContextResource twin and may be
         # materialised only after its atomic reservation.  Legacy queues/directives
         # retain opaque refs for audit but never inject them into a prompt directly.
@@ -2351,11 +2312,7 @@ class _RaceRunMixin:
             raise
         worker.engine = transport
         worker.lane = str(lane or "")
-        # Framework swarms (SwarmF02/SwarmF11/... define framework_id) mark their
-        # workers so the blackboard skill keeps its direct RW framework/teammate
-        # commands. The base Swarm has no framework_id, so ordinary workers get
-        # role-scoped prompt context plus host-drained claim files and no raw DB.
-        worker.blackboard_framework = str(getattr(self, "framework_id", "") or "")
+        # Workers use role-scoped prompt context and host-drained claim files.
         # Construction is the legacy single-shot delivery boundary: the prompt now
         # contains each matching one-shot directive.  Close those rows so future
         # workers cannot inherit them again.  Status is an auditable delivery receipt,

@@ -1,8 +1,0 @@
-{
-  "type": "object",
-  "properties": {
-    "greeting": {"type": "string"},
-    "fail_health": {"type": "boolean"}
-  },
-  "additionalProperties": false
-}

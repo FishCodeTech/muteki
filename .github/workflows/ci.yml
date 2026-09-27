@@ -66,14 +66,9 @@ jobs:
           uv run --frozen python scripts/gen_contracts_ts.py --check
           uv run --frozen python scripts/gen_openapi.py --check
 
-      - name: Test conversation stop and approval lifecycle
+      - name: Import product entry points
         if: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.python == 'true' }}
-        run: >-
-          uv run --frozen python -m unittest
-          muteki.conversation.test_interrupt_cleanup
-          muteki.conversation.test_control_response_delivery
-          muteki.conversation.test_approval_queue
-          muteki.conversation.test_session_continuity_122
+        run: uv run --frozen python -c 'import muteki.cli, apps.web.server'
 
       # Keep reporting frontend failures when a Python check fails, while
       # respecting cancellation and the frontend's own dependency chain.

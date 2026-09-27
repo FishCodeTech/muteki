@@ -29,12 +29,6 @@ async def compact_rebootstrap_stage(self, state) -> str:
                    if state.fruitless_workers >= 2 * self.barren_limit
                    else "no_progress_time")
         try:
-            fw_compact = getattr(self, "framework_before_compact", None)
-            if callable(fw_compact):
-                try:
-                    fw_compact()
-                except Exception:
-                    pass
             info = self.shared_graph.compact_graph(
                 actor="coordinator", trigger=trigger,
                 summary=(f"compacted after {state.fruitless_workers} fruitless "
@@ -135,12 +129,6 @@ async def idle_stage(self, state) -> str:
         if getattr(self.challenge, "mode", "ctf") == "ctf" \
                 and not state.reason_retry_pending:
             return "break"
-        # Experimental recovery may still provide concrete work first.
-        action = await self._experiment_stage("planner_failure_rebootstrap", state)
-        if action == "break":
-            return "break"
-        if action == "continue":
-            return "continue"
         failure = getattr(self, "_last_planner_failure", None)
         if not state.reason_retry_pending:
             state.reason_retry_pending = True

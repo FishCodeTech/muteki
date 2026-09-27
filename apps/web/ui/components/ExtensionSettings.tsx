@@ -365,7 +365,7 @@ function SourceForm({
             <label style={muted}>路径</label>
             <Input
               style={{ ...input, flex: 1 }}
-              placeholder={draft.kind === "local-dir" ? "如 examples/extensions/hello" : "如 /tmp/hello-1.1.0.tar.gz"}
+              placeholder={draft.kind === "local-dir" ? "如 /path/to/extension" : "如 /tmp/hello-1.1.0.tar.gz"}
               value={draft.path}
               onChange={set("path")}
             />

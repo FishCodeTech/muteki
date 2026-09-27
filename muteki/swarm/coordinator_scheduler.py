@@ -60,10 +60,6 @@ async def worker_maintenance_stage(self, state) -> str:
                 actor="coordinator",
                 target_epoch=str(getattr(self, "_target_epoch", "") or ""),
             )
-    # ── Round-16: solo-depth live verify/harvest (no cancel) ─────
-    # Experiment hook (stage-4b): default-registered nowhere, so production
-    # is a no-op; ExperimentalSwarm wires the solo-depth verify/harvest here.
-    await self._experiment_stage("solo_depth_maintenance", state)
     return "proceed"
 
 
@@ -151,17 +147,7 @@ async def _run_coordinator(self) -> SwarmOutcome:
             if action == "continue":
                 continue
 
-            # Production bookkeeping (stage-4b: relocated out of the deleted
-            # fruitless_interrupt_stage) — per-worker start marks must be
-            # synced every tick regardless of any experiment.
             scheduler_sync_worker_start_marks(self, state)
-            # Experiment hook: the fruitless-interrupt mid-flight cancel stage.
-            action = await self._experiment_stage("fruitless_interrupt", state)
-            if action == "break":
-                break
-            if action == "continue":
-                continue
-
             action = await worker_maintenance_stage(self, state)
             if action == "break":
                 break

@@ -1117,8 +1117,6 @@ class CompetitionScheduler:
             store.get(PlatformConnection, competition.connection_id)
             if competition is not None else None
         )
-        if connection is not None and connection.platform_kind == "mock":
-            dispatch_extra.setdefault("kind", "mock_platform_acceptance")
         if connection is not None and connection.platform_kind == "tsecbench":
             dispatch_extra["allow_operator_input"] = False
         policy = (
