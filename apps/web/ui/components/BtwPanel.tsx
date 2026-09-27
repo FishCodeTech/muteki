@@ -2,20 +2,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  Button,
-  Card,
-  Chip,
   Drawer,
-  Kbd,
-  ScrollShadow,
   Spinner,
-  TextArea,
-  Tooltip,
 } from "@heroui/react";
 import { Icon } from "@/components/Icon";
 import { MessageMarkdown } from "@/components/ai-native/message-markdown";
 import { useT } from "@/lib/i18n";
 import { apiFetch } from "@/lib/useRun";
+import styles from "./BtwPanel.module.css";
 
 /**
  * BTW side-query worker — a right-side drawer for read-only Q&A over a run.
@@ -193,293 +187,78 @@ export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
   const userTurnCount = turns.filter((t) => t.role === "user").length;
 
   return (
-    <Drawer
-      isOpen={open}
-      onOpenChange={(isOpen) => {
-        if (!isOpen) onClose();
-      }}
-    >
+    <Drawer isOpen={open} onOpenChange={(isOpen) => { if (!isOpen) onClose(); }}>
       <Drawer.Backdrop variant="blur" className="!z-[150] bg-black/40 backdrop-blur-sm">
         <Drawer.Content placement="right" className="!z-[150]">
-          <Drawer.Dialog
-            aria-label={t("btw.title")}
-            className="!p-0 flex flex-col h-full w-full sm:w-[480px] md:w-[540px] max-w-[100vw] bg-surface/95 backdrop-blur-xl border-l border-line shadow-2xl text-ink outline-none overflow-hidden"
-          >
-            {/* Header */}
-            <Drawer.Header className="flex flex-col gap-2.5 border-b border-line bg-inset/40 px-4 py-3 shrink-0">
-            <div className="flex items-center justify-between gap-3">
-              <div className="flex items-center gap-2.5 min-w-0">
-                <div className="flex size-8 shrink-0 items-center justify-center rounded-xl bg-accent/10 text-accent border border-accent/20 shadow-sm">
-                  <Icon name="sparkles" size={16} />
+          <Drawer.Dialog aria-label={t("btw.title")} className={styles.dialog}>
+            <Drawer.Header className={styles.header}>
+              <div className={styles.headerMain}>
+                <div className={styles.mark} aria-hidden="true"><Icon name="sparkles" size={18} /></div>
+                <div className={styles.heading}>
+                  <h2>顺嘴问</h2>
+                  <p>针对当前解题的临时问答</p>
                 </div>
-                <div className="flex flex-col min-w-0">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <h2 className="text-[13.5px] font-semibold text-ink leading-tight truncate">
-                      {t("btw.title")}
-                    </h2>
-                    <Chip size="sm" variant="soft" color="accent" className="text-[10px] px-1.5 py-0 h-4 shrink-0 font-medium">
-                      旁路 Worker
-                    </Chip>
-                  </div>
-                  {runId ? (
-                    <span className="text-[11px] font-mono text-ink-3 truncate max-w-[220px]" title={runId}>
-                      {runId}
-                    </span>
-                  ) : null}
+                <div className={styles.headerActions}>
+                  {turns.length > 0 && <button type="button" className={styles.iconButton} disabled={streaming} onClick={handleClear} aria-label="清空对话" title="清空对话"><Icon name="trash" size={16} /></button>}
+                  <button type="button" className={styles.iconButton} onClick={onClose} aria-label="关闭" title="关闭"><Icon name="x" size={17} /></button>
                 </div>
               </div>
+              <div className={styles.contextRow}>
+                <span className={styles.contextDot} aria-hidden="true" />
+                <span className={styles.contextRun} title={runId}>{runId}</span>
+                <span className={styles.contextDivider} aria-hidden="true" />
+                <span>只读旁路</span>
+                <span className={styles.turnCount}>{userTurnCount} 轮</span>
+              </div>
+            </Drawer.Header>
 
-              <div className="flex items-center gap-1 shrink-0">
-                {turns.length > 0 && (
-                  <Tooltip delay={300}>
-                    <Tooltip.Trigger>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        isIconOnly
-                        isDisabled={streaming}
-                        onPress={handleClear}
-                        aria-label="清空对话"
-                        className="flex size-7 items-center justify-center rounded-control text-ink-3 hover:bg-hover hover:text-ink transition-colors"
-                      >
-                        <Icon name="trash" size={14} />
-                      </Button>
-                    </Tooltip.Trigger>
-                    <Tooltip.Content>清空对话记录</Tooltip.Content>
-                  </Tooltip>
+            <Drawer.Body className={styles.body}>
+              <div ref={scrollRef} className={styles.scroll} role="log" aria-label="顺嘴问对话" aria-live="polite">
+                {turns.length === 0 && !streaming ? (
+                  <div className={styles.empty}>
+                    <div className={styles.emptyMark} aria-hidden="true"><Icon name="sparkles" size={22} /></div>
+                    <h3>有什么想快速确认的？</h3>
+                    <p>询问进展、证据或下一步。回答来自临时旁路 Worker，关闭面板后不会保留。</p>
+                    <div className={styles.suggestionHeading}>从这些问题开始</div>
+                    <div className={styles.suggestions}>
+                      {QUICK_ASKS.map((q) => <button key={q} type="button" onClick={() => void send(q)} className={styles.suggestion}><span>{q}</span><Icon name="arrowRight" size={15} /></button>)}
+                    </div>
+                  </div>
+                ) : (
+                  <div className={styles.messages}>
+                    {turns.map((turn, i) => <div key={i} className={turn.role === "user" ? styles.userTurn : styles.assistantTurn}>
+                      <div className={styles.turnLabel}>{turn.role === "user" ? "你" : "旁路 Worker"}{turn.role === "assistant" && streaming && i === turns.length - 1 ? <span className={styles.generating}><Spinner size="sm" />生成中</span> : null}</div>
+                      <div className={turn.role === "user" ? styles.userBubble : styles.assistantBubble}>
+                        {turn.role === "user" ? turn.content : turn.content ? <MessageMarkdown text={turn.content} /> : streaming && i === turns.length - 1 ? <span className={styles.pending}>正在读取当前运行状态…</span> : <span className={styles.pending}>（无回复内容）</span>}
+                      </div>
+                    </div>)}
+                    {!streaming && <div className={styles.followUps} aria-label="快捷追问">{QUICK_ASKS.slice(0, 2).map((q) => <button key={q} type="button" onClick={() => void send(q)}>{q}</button>)}</div>}
+                  </div>
                 )}
-
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  isIconOnly
-                  onPress={onClose}
-                  aria-label="关闭"
-                  className="flex size-7 items-center justify-center rounded-control text-ink-3 hover:bg-hover hover:text-ink transition-colors cursor-pointer"
-                >
-                  <Icon name="x" size={15} />
-                </Button>
+                {error && <div className={styles.error} role="alert"><Icon name="alert" size={16} /><span>{error}</span></div>}
+                {overCap && <div className={styles.warning} role="status">对话记录过长，请清空记录后继续提问。</div>}
               </div>
-            </div>
+            </Drawer.Body>
 
-            <div className="flex items-center justify-between text-[11px] text-ink-3 bg-inset/60 px-2.5 py-1 rounded-control border border-line/60 select-none">
-              <div className="flex items-center gap-1.5 truncate">
-                <span className="size-1.5 rounded-full bg-green animate-pulse shrink-0" />
-                <span className="truncate">只读旁路问答 · 不占用 Worker 槽位 · 关闭即释放</span>
-              </div>
-              <span className="font-mono text-[10px] opacity-75 shrink-0 ml-2">
-                {userTurnCount} 轮
-              </span>
-            </div>
-          </Drawer.Header>
-
-          {/* Quick suggestions bar if conversation already has turns */}
-          {turns.length > 0 && (
-            <div className="flex items-center gap-1.5 px-4 py-2 border-b border-line/50 bg-inset/20 overflow-x-auto scrollbar-none shrink-0">
-              <div className="flex items-center gap-1 text-[11px] font-medium text-ink-3 shrink-0 mr-1">
-                <Icon name="sparkles" size={12} className="text-accent" />
-                <span>快捷提问:</span>
-              </div>
-              <div className="flex items-center gap-1.5 flex-wrap sm:flex-nowrap">
-                {QUICK_ASKS.map((q) => (
-                  <Button
-                    key={q}
-                    size="sm"
-                    variant="secondary"
-                    isDisabled={streaming}
-                    onPress={() => send(q)}
-                    className="text-[11px] px-2.5 py-0.5 h-6 rounded-full border border-line hover:border-accent/40 hover:bg-accent/5 text-ink-2 whitespace-nowrap shrink-0 transition-colors"
-                  >
-                    {q}
-                  </Button>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Body: message stream */}
-          <Drawer.Body className="flex-1 flex flex-col min-h-0 p-0 overflow-hidden bg-canvas/30">
-            <ScrollShadow
-              ref={scrollRef}
-              className="flex-1 overflow-y-auto px-4 py-4 space-y-4"
-              size={20}
-            >
-              {turns.length === 0 && !streaming && (
-                <div className="flex flex-col items-center justify-center text-center px-4 py-8 my-auto">
-                  <div className="size-12 rounded-2xl bg-accent/10 border border-accent/20 flex items-center justify-center text-accent mb-3 shadow-sm">
-                    <Icon name="sparkles" size={22} />
-                  </div>
-                  <h3 className="text-[14px] font-semibold text-ink mb-1">
-                    {t("btw.title")}
-                  </h3>
-                  <p className="text-[12px] text-ink-3 max-w-xs leading-relaxed mb-6">
-                    随时向旁路观察员提问当前任务进展、已获证据或已排除死路。问答在隔离进程运行，不占用主解题槽位，关闭抽屉后自动释放。
-                  </p>
-
-                  <div className="w-full max-w-sm space-y-2 text-left">
-                    <div className="text-[11px] font-medium text-ink-3 px-1 uppercase tracking-wider flex items-center gap-1.5">
-                      <Icon name="sparkles" size={12} className="text-accent" />
-                      <span>快捷提问建议</span>
-                    </div>
-                    <div className="grid grid-cols-1 gap-2">
-                      {QUICK_ASKS.map((q) => (
-                        <Card
-                          key={q}
-                          variant="secondary"
-                          className="p-3 rounded-xl border border-line hover:border-accent/40 hover:bg-hover transition-all cursor-pointer group shadow-sm"
-                          onClick={() => !streaming && send(q)}
-                        >
-                          <Card.Content className="flex items-center justify-between gap-2 p-0">
-                            <span className="text-[12.5px] text-ink font-medium group-hover:text-accent transition-colors">
-                              {q}
-                            </span>
-                            <Icon
-                              name="arrowRight"
-                              size={13}
-                              className="text-ink-3 group-hover:text-accent group-hover:translate-x-0.5 transition-all shrink-0"
-                            />
-                          </Card.Content>
-                        </Card>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {turns.map((turn, i) => (
-                <div key={i} className="space-y-1.5">
-                  {turn.role === "user" ? (
-                    <div className="flex flex-col items-end gap-1 pl-8">
-                      <div className="flex items-center gap-1.5 text-[11px] font-medium text-accent">
-                        <span>你</span>
-                      </div>
-                      <div className="rounded-2xl rounded-tr-sm bg-accent/15 border border-accent/25 px-3.5 py-2.5 text-[13px] text-ink leading-relaxed shadow-sm break-words whitespace-pre-wrap max-w-full">
-                        {turn.content}
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="flex flex-col items-start gap-1 pr-2">
-                      <div className="flex items-center gap-1.5 text-[11px] font-medium text-ink-3">
-                        <div className="flex size-4 items-center justify-center rounded-full bg-accent/20 text-accent">
-                          <Icon name="sparkles" size={10} />
-                        </div>
-                        <span>旁路观察员</span>
-                        {streaming && i === turns.length - 1 && (
-                          <span className="flex items-center gap-1 text-[10.5px] text-accent ml-1">
-                            <Spinner size="sm" className="size-3" />
-                            <span>生成中…</span>
-                          </span>
-                        )}
-                      </div>
-                      <Card
-                        variant="default"
-                        className="w-full rounded-2xl rounded-tl-sm border border-line bg-surface p-3.5 shadow-sm text-[13px] text-ink leading-relaxed"
-                      >
-                        <Card.Content className="p-0">
-                          {turn.content ? (
-                            <MessageMarkdown text={turn.content} />
-                          ) : streaming && i === turns.length - 1 ? (
-                            <div className="flex items-center gap-2 py-1 text-[12px] text-ink-3">
-                              <span className="size-2 rounded-full bg-accent animate-pulse" />
-                              <span>正在读取当前 Run 状态并生成分析…</span>
-                            </div>
-                          ) : (
-                            <span className="text-ink-3 italic text-[12px]">（无回复内容）</span>
-                          )}
-                        </Card.Content>
-                      </Card>
-                    </div>
-                  )}
-                </div>
-              ))}
-
-              {error && (
-                <Card
-                  variant="secondary"
-                  className="rounded-xl border border-red/30 bg-red/10 p-3 text-[12px] text-red shadow-sm flex items-start gap-2.5"
-                >
-                  <Card.Content className="flex items-start gap-2.5 p-0 w-full">
-                    <Icon name="alert" size={16} className="shrink-0 mt-0.5" />
-                    <div className="flex-1 min-w-0">
-                      <div className="font-semibold mb-0.5">请求出错</div>
-                      <div className="break-words leading-relaxed">{error}</div>
-                    </div>
-                  </Card.Content>
-                </Card>
-              )}
-
-              {overCap && (
-                <Card
-                  variant="secondary"
-                  className="rounded-xl border border-amber/30 bg-amber/10 p-3 text-[12px] text-amber shadow-sm flex items-start gap-2.5"
-                >
-                  <Card.Content className="flex items-start gap-2.5 p-0 w-full">
-                    <Icon name="alert" size={16} className="shrink-0 mt-0.5" />
-                    <div className="flex-1 min-w-0 leading-relaxed">
-                      对话记录过长，建议点击右上角清空记录或关闭抽屉重新开始。
-                    </div>
-                  </Card.Content>
-                </Card>
-              )}
-            </ScrollShadow>
-          </Drawer.Body>
-
-          {/* Footer: Modern Composer */}
-          <Drawer.Footer className="flex flex-col gap-2 border-t border-line bg-surface/95 backdrop-blur-sm p-3.5 shrink-0">
-            <div className="relative flex flex-col rounded-xl border border-line bg-field/60 focus-within:border-accent focus-within:ring-2 focus-within:ring-accent/20 focus-within:bg-surface transition-all p-2.5 shadow-sm">
-              <TextArea
-                className="w-full resize-none border-0 bg-transparent p-0 text-[13px] leading-relaxed text-ink placeholder:text-ink-3 focus:outline-none focus:ring-0 shadow-none min-h-[44px] max-h-[140px]"
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                placeholder={t("btw.placeholder") || "顺嘴问一句… (Enter 发送)"}
-                disabled={streaming}
-                rows={2}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    send(input);
-                  }
-                }}
-              />
-
-              <div className="flex items-center justify-between pt-2 border-t border-line/40 mt-1.5">
-                <div className="flex items-center gap-1.5 text-[10.5px] text-ink-3 select-none">
-                  <Kbd variant="default" className="px-1 py-0.5 text-[9.5px]">Enter</Kbd>
-                  <span>发送</span>
-                  <span className="opacity-40">·</span>
-                  <Kbd variant="default" className="px-1 py-0.5 text-[9.5px]">Shift+Enter</Kbd>
-                  <span>换行</span>
-                </div>
-
-                <div className="flex items-center gap-2">
-                  {streaming ? (
-                    <Button
-                      size="sm"
-                      variant="danger-soft"
-                      className="h-7 px-2.5 text-[11.5px] rounded-control font-medium flex items-center gap-1"
-                      onPress={handleStop}
-                    >
-                      <Icon name="stop" size={12} />
-                      <span>停止</span>
-                    </Button>
-                  ) : (
-                    <Button
-                      size="sm"
-                      variant="primary"
-                      isDisabled={!input.trim()}
-                      onPress={() => send(input)}
-                      className="h-7 px-3 text-[11.5px] rounded-control font-medium flex items-center gap-1.5 shadow-sm"
-                    >
-                      <span>{t("btw.send") || "发送"}</span>
-                      <Icon name="send" size={12} />
-                    </Button>
-                  )}
+            <Drawer.Footer className={styles.footer}>
+              <div className={styles.composer}>
+                <textarea
+                  className={styles.textarea}
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  placeholder={t("btw.placeholder") || "顺嘴问一句…"}
+                  disabled={streaming}
+                  rows={2}
+                  onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send(input); } }}
+                />
+                <div className={styles.composerBottom}>
+                  <span>Enter 发送 <span aria-hidden="true">·</span> Shift+Enter 换行</span>
+                  {streaming ? <button type="button" className={styles.stopButton} onClick={handleStop}><Icon name="stop" size={14} />停止</button> : <button type="button" className={styles.sendButton} disabled={!input.trim() || overCap} onClick={() => void send(input)}><span>{t("btw.send") || "发送"}</span><Icon name="send" size={14} /></button>}
                 </div>
               </div>
-            </div>
-          </Drawer.Footer>
-        </Drawer.Dialog>
-      </Drawer.Content>
+            </Drawer.Footer>
+          </Drawer.Dialog>
+        </Drawer.Content>
       </Drawer.Backdrop>
     </Drawer>
   );

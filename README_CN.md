@@ -41,7 +41,7 @@
 **無敵 · Project Muteki** 是一款基于Remix Engineering 的开源 多agent协作网络安全框架。
 
 本项目核心是实现了一套ai agent的调度方案，自动、智能化协调控制每个agent的上下文，像蜂群一样，各有分工，但都是为了完成最终的目标。并且可以兼容市面大部分的agent引擎，用于使用，当前可用 Worker 引擎为 Claude、Codex、Cursor、Pi、OMP、Kimi、Grok、OpenCode，后续将逐步支持更多引擎。
-项目未来将不断更新，成为all in one，而不是局限于单一ctf 场景，未来将不断迭代升级，成为成熟的开源agent产品。
+项目未来将不断更新，成为all in one，而不是局限于单一安全场景，未来将不断迭代升级，成为成熟的开源agent产品。
 
 
 
@@ -99,7 +99,7 @@ tsecbench 托管模式下+deepseek-flash，排名13
 
 ### 1. 准备环境并启动
 
-需要 [uv](https://docs.astral.sh/uv/)（Python 依赖管理）、Python 3.13 或更新版本，以及 Node.js/npm（Web 界面）。本地做题还需要至少安装并登录一个受支持的 Agent CLI。`./init.sh` 会同步 Python 依赖；首次启动 Web 时会安装和构建前端依赖。
+需要 [uv](https://docs.astral.sh/uv/)（Python 依赖管理）、Python 3.13 或更新版本，以及 Node.js/npm（Web 界面）。本地做题还需要至少安装并登录一个受支持的 Agent CLI。`./init.sh` 会同步 Python 依赖；首次启动 Web 时会安装和构建前端依赖。下面是手动启动的最短路径；macOS、Ubuntu 和虚拟机的工具安装步骤见[推荐运行方式与工具安装](#推荐运行方式与工具安装)。
 
 ```bash
 git clone https://github.com/FishCodeTech/muteki.git
@@ -133,6 +133,71 @@ cd muteki
 
 > 只对你拥有或获授权的题目与目标运行。Worker 可以执行命令并访问目标服务。
 
+## 推荐运行方式与工具安装
+
+项目已在 **macOS 26** 和 **Ubuntu 24.04** 上进行相关测试。Windows 主机推荐通过 VMware 运行 Ubuntu 24.04 虚拟机，在虚拟机内安装 Muteki。
+
+| 运行方式 | 应用与 Worker 在哪里运行 | 工具准备 |
+| --- | --- | --- |
+| **macOS 本机** | Web 与 Worker 都在 Mac 上 | 运行 `./ctf-tools/setup.sh` 安装原生 CTF 工具 |
+| **macOS + Docker** | Web 在 Mac 上，Worker 在 Docker 容器内 | 拉取完整 Worker 镜像；容器内已含 CTF 工具链 |
+| **Ubuntu 24.04 本机** | Web 与 Worker 都在 Ubuntu 上 | 安装脚本加 `--with-ctf-tools`，或单独运行 `./ctf-tools/setup-ubuntu.sh` |
+| **Windows + VMware** | Windows 只作为宿主和浏览器；Muteki 与 Worker 在 Ubuntu 24.04 虚拟机内 | 在虚拟机里运行 Ubuntu 一键安装脚本 |
+
+### 1. macOS 本机直接运行
+
+先安装 Homebrew、Node.js/npm 和准备使用的 Agent CLI；CLI 的登录由各厂商完成。仓库根目录执行：
+
+```bash
+./init.sh
+export PATH="$HOME/.local/bin:$PATH"  # 若新安装的 uv 还不在 PATH
+./ctf-tools/setup.sh
+./run.sh web
+```
+
+`setup.sh` 使用 [`ctf-tools/Brewfile`](ctf-tools/Brewfile) 安装 macOS 原生工具，创建目录内的 Python/Ruby 工具环境，并生成统一命令入口；它**不会替你登录 Agent CLI**。完成后在“单题设置 → 运行环境”选择“本地运行”。`run.sh` 检测到 `ctf-tools/.ready` 后会自动加载工具路径。离线字典、知识库等大体积资料可按 [`ctf-tools/README.md`](ctf-tools/README.md) 从 Worker 镜像单独同步；只需要刷新已有工具的入口时可运行 `./ctf-tools/setup.sh --link-only`。macOS 原生工具与 Kali 容器内的 Linux 工具不完全相同。
+
+### 2. macOS + Docker 容器运行
+
+安装 Docker Desktop 并确认它正在运行，然后在仓库根目录执行：
+
+```bash
+./init.sh
+docker pull ghcr.io/fishcodetech/muteki-worker:latest
+./run.sh web
+```
+
+在“单题设置 → 运行环境”选择“容器运行”，检查页面显示 Docker 与 Worker 镜像可用，再给出战 Worker 配置**可注入的凭据**。宿主机的 CLI 登录不会直接进入容器。完整 Worker 镜像已带 CTF 工具链，因此这一方式不需要在 Mac 上运行 `ctf-tools/setup.sh`。Web 控制台仍在 Mac 上运行，Worker 按任务由 Docker 启动。
+
+### 3. Ubuntu 24.04 本机直接运行
+
+```bash
+git clone https://github.com/FishCodeTech/muteki.git
+cd muteki
+./scripts/install-ubuntu.sh --backend local --preflight
+./scripts/install-ubuntu.sh --backend local --with-ctf-tools
+./scripts/install-ubuntu.sh --backend local --check
+```
+
+这个安装器准备应用依赖、Node.js、Web 服务和本地 Worker CLI，并调用 `ctf-tools/setup-ubuntu.sh` 安装 Ubuntu 可用的 CTF 工具。当前脚本会安装并检查全部受支持的本地 CLI；Agent CLI 仍需分别完成登录或在设置中配置凭据。默认创建 `muteki-web.service`；Web 密码写在当前用户的 `~/.config/muteki/ubuntu.env`，界面使用 Ubuntu 主机的 `3001` 端口。可选 apt 包可能随镜像源和 CPU 架构不同而缺失，脚本会逐项报告。
+
+若已自行安装并启动 Muteki，只想补装本地 CTF 工具，可先确保 `uv` 可用，再运行 `./ctf-tools/setup-ubuntu.sh`。该脚本目前只测试过ubuntu24.04，其他发行版本的linux，建议让ai进行对应的优化和修改。
+
+安装成功后 `./run.sh web` 会自动加载 `ctf-tools/.ready` 对应的工具路径。
+
+### 4. Windows + VMware 虚拟机
+
+在 VMware 中创建 **Ubuntu 24.04** 虚拟机，把仓库克隆到虚拟机内，然后在虚拟机终端执行与 Linux 本机相同的安装命令：
+
+```bash
+git clone https://github.com/FishCodeTech/muteki.git
+cd muteki
+./scripts/install-ubuntu.sh --backend local --with-ctf-tools
+./scripts/install-ubuntu.sh --backend local --check
+```
+
+Muteki、Agent CLI、CTF 工具和运行目录都在 Ubuntu 虚拟机内；Windows 只负责打开浏览器。安装完成后在 Windows 浏览器访问 `http://<虚拟机IP>:3001`，使用虚拟机中 `~/.config/muteki/ubuntu.env` 保存的 Web 密码。请让 Windows 能访问虚拟机的 UI 端口；若 VMware 使用 NAT 且无法直连虚拟机 IP，可配置端口转发或改用合适的虚拟网络。后端 API 默认只监听虚拟机回环地址。
+
 ## 配置详情说明
 
 | 位置 | 主要内容 | 建议的首次操作 |
@@ -150,9 +215,7 @@ cd muteki
 
 当前界面可配置 Claude Code、Codex、Cursor、Pi、OMP、Kimi、Grok 和 OpenCode 等 CLI；具体能否使用取决于本机安装、厂商登录和所选运行环境。至少准备其中一个。DeepSeek Harness 由于其没有acp、等provider内容，目前只保留登记信息，暂不可作为出战 Worker。各 CLI 的安装和授权流程以对应厂商说明为准。
 
-
-
-如果页面显示“待自检”或“没有可用凭据”，先到“Agent 凭据”测试连接，再检查“出战配置”中的凭据绑定、模型和运行环境。自检会发起真实模型请求，可能产生用量。
+**注意：**如果页面显示“待自检”或“没有可用凭据”，先到“Agent 凭据”测试连接，再检查“出战配置”中的凭据绑定、模型和运行环境。自检会发起真实模型请求，可能产生用量。
 
 ## 如何做题
 
@@ -168,6 +231,8 @@ cd muteki
 
 运行页可查看协调器消息、Worker 状态、活动记录、证据与候选 Flag。输入框上方可选择“全部解题器”或单个 Worker 作为目标。按钮会随运行状态变化：
 
+![CSAW Finals 2021 sfc 题目正在解题：运行时活动时间线显示多个 Worker 的工具调用](./assets/readme-cn-solving-nyu-sfc.png)
+
 | 操作 | 作用 | 什么时候用 |
 | --- | --- | --- |
 | **直接输入并回车 / 发送** | 把文字作为“提示”传给所选目标，**不新建 Step** | 补充线索、纠正题面、告诉 Worker 已知结果 |
@@ -177,20 +242,23 @@ cd muteki
 | **冻结 / 解冻** | 立即冻结正在执行的 Worker，再放行 | 需要更强的即时干预时 |
 | **停止** | 结束本次运行并停止 Worker，保留记录 | 目标已变、运行不应继续或达到人工判断的上限 |
 
-“提示”与“下达”不同：例如输入“目录 `/admin` 已确认存在”，直接回车是补充线索；点击“下达”则会把这句话作为新step提交，会新建worker去执行任务，比较适合目标明确的情况。运行中不要反复点击控制按钮；先看对话与状态反馈。
+“提示”与“下达”不同：例如输入“目录 `/admin` 已确认存在”，直接回车是补充线索；点击“下达”则会把这句话作为新step提交，会新建worker去执行任务，比较适合目标明确的情况。运行中不要反复点击控制按钮，否则会出现问题。
 
-如果 Worker 暂停并向你索取输入，在待处理卡片中回答、提供资源，或选择相应的拒绝/误报处理，让运行继续。对话模式里的“引导当前回答”是另一种交互：它只在接入的 Agent 支持即时引导时可用，不能等同于单题的“下达”。
+![正在解题的对话和运行控制按钮](./assets/readme-cn-solving-controls.png)
+
+如果 Worker 暂停并向你索取输入，在待处理卡片中回答、提供资源，或选择相应的拒绝/误报处理，让运行继续。
 
 ### 出现 Flag 或运行结束后
 
-- **复制 Flag 并到题目平台验证。**系统的候选校验要求能追溯到真实执行输出，但平台是否接受仍以平台回执为准。
+- **复制 Flag 并到题目平台验证。**
 - **标记误报：**如果候选 Flag 被平台判错，在结果区用“标记误报”（单个 Flag 行上的 `×` 也有此作用）。多 Flag 时先选择要否定的那个。此操作会标记候选并重新打开解题。
 - **继续做题：**在已结束页面重新拉起完整蜂群，沿用已有证据继续探索。
-- **追问 / 生成复盘：**结束后可向解题 Worker 追问，或生成复盘报告；复盘会在对话中出现，生成需要时间。复盘是辅助整理，仍应核对实际命令输出和平台结果。
+- **追问 / 生成复盘：**结束后可向解题 Worker 追问，或生成复盘报告。生成成功后，正文会显示在对话中，同时写入该 Run 的 `sessions/<run-id>/workspace/writeup.md`（若自定义了 `MUTEKI_SESSIONS_ROOT`，以该目录为起点）。生成会调用实际整个run的全部上下文进行总结。所以会需要一些时间。
 
 ## 测试中的扩展功能
 
-这些功能已有入口和部分完整流程，但仍在测试中。默认首页只显示做题；在 **设置 → 外观配色 → 工作区模式** 打开“显示对话和比赛模式”后，首页、导航和搜索会出现“对话”“比赛”。这是**当前浏览器的显示偏好**，不是为所有用户打开服务端功能。
+默认首页只显示做题模式；在 **设置 → 外观配色 → 工作区模式** 打开“显示对话和比赛模式”后，首页、导航和搜索会出现“对话”“比赛”。默认关闭。
+后续muteki的目标是建设成为一个ai native的融合产品。目前该功能为测试阶段，可能bug较多，如有问题随时反馈。
 
 ![当前工作区模式设置：开启对话与比赛入口](./assets/readme-cn-workspace-mode.png)
 
@@ -266,6 +334,13 @@ Web 的“单题设置 → 系统更新”也提供相应操作。升级前保�
 - **问题反馈：**功能缺陷和文档问题请到 [GitHub Issues](https://github.com/FishCodeTech/muteki/issues) 提交复现步骤、版本和已脱敏日志。安全漏洞请按 [SECURITY.md](SECURITY.md) 通过私密渠道报告。
 - **许可证：**本项目以 [GNU AGPL-3.0](LICENSE) 发布。外部 Agent CLI 和模型服务分别适用其自身的许可、服务条款与费用规则。
 
+## 后续todo：
+
+- [ ] 渗透模式重构
+- [ ] src漏洞挖掘模式
+- [ ] all in one的agent聊天功能。
+- [ ] 全面插件化
+
 ## 鸣谢
 
 感谢 [c3](https://github.com/Real-C3ngH) 提供的云镜靶场账号，浪费了很多沙砾，疯狂爆米。
@@ -294,4 +369,4 @@ Web 的“单题设置 → 系统更新”也提供相应操作。升级前保�
    Jiaze Sun, et al. *Computers & Security*, 2025. [ScienceDirect](https://doi.org/10.1016/j.cose.2025.104488)
 6. **Co-RedTeam: Orchestrated Security Discovery and Exploitation with LLM Agents**
    Jiahao Zhu, et al. 2025. [arXiv:2602.02164](https://arxiv.org/abs/2602.02164)
-7. [相关项目文章](https://mp.weixin.qq.com/s/ZzKF_0MOb0cak9izhHqCUQ)
+7. https://mp.weixin.qq.com/s/ZzKF_0MOb0cak9izhHqCUQ
