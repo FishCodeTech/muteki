@@ -1,0 +1,26 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "muteki-control",
+  "version": "1.0.0",
+  "description": "Portable Muteki task, run, competition, worker, and runtime controls for AI agents.",
+  "author": {
+    "name": "FishCodeTech",
+    "url": "https://github.com/FishCodeTech"
+  },
+  "homepage": "https://github.com/FishCodeTech/muteki",
+  "repository": "https://github.com/FishCodeTech/muteki",
+  "license": "AGPL-3.0-or-later",
+  "keywords": [
+    "muteki",
+    "agent-tools",
+    "mcp",
+    "ctf",
+    "pentest",
+    "competition"
+  ],
+  "extensions": {
+    "io.github.fishcodetech.pi": {
+      "entry": "./io.github.fishcodetech.pi/extension.ts"
+    }
+  }
+}

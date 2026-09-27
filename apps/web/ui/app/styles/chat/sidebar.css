@@ -1,0 +1,78 @@
+/* Chat workbench: sidebar. Rules are prefixed `.cx-` and never target other pages. */
+
+/*
+ * The aside keeps `.ai-conv-sidebar` for the global collapse / mobile-drawer /
+ * width rules; legacy unlayered colour rules on it outrank Tailwind utilities,
+ * so the surface and the new-chat button are styled here with higher specificity.
+ */
+.ai-conv-sidebar.cx-sidebar {
+  background: var(--cx-sidebar);
+  border-right-color: var(--cx-border-subtle);
+  font-family: var(--cx-font-sans);
+  color: var(--cx-fg);
+  -webkit-font-smoothing: antialiased;
+}
+
+.ai-conv-sidebar.cx-sidebar .cx-sb-new {
+  display: flex;
+  width: 100%;
+  height: 34px;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 0 6px 0 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--cx-fg);
+  font-size: 13.5px;
+  font-weight: 500;
+  line-height: 20px;
+  cursor: pointer;
+  transition:
+    background-color var(--cx-dur-fast) var(--cx-ease-out),
+    transform var(--cx-dur-fast) var(--cx-ease-out);
+}
+.ai-conv-sidebar.cx-sidebar .cx-sb-new:hover {
+  background: var(--cx-hover);
+}
+.ai-conv-sidebar.cx-sidebar .cx-sb-new:active {
+  background: var(--cx-active);
+  transform: scale(0.985);
+}
+.ai-conv-sidebar.cx-sidebar .cx-sb-new:focus-visible {
+  outline: 2px solid var(--cx-focus);
+  outline-offset: -2px;
+}
+.ai-conv-sidebar.cx-sidebar .cx-sb-new svg {
+  flex: none;
+  color: var(--cx-fg-2);
+  transition: color var(--cx-dur-fast) var(--cx-ease-out);
+}
+.ai-conv-sidebar.cx-sidebar .cx-sb-new:hover svg,
+.ai-conv-sidebar.cx-sidebar .cx-sb-new:focus-visible svg {
+  color: var(--cx-fg);
+}
+.ai-conv-sidebar.cx-sidebar .cx-sb-new .cx-sb-new-kbd {
+  opacity: 0;
+  transition: opacity var(--cx-dur) var(--cx-ease-out);
+}
+.ai-conv-sidebar.cx-sidebar .cx-sb-new:hover .cx-sb-new-kbd,
+.ai-conv-sidebar.cx-sidebar .cx-sb-new:focus-visible .cx-sb-new-kbd {
+  opacity: 1;
+}
+.ai-conv-sidebar.cx-sidebar .cx-sb-new kbd {
+  color: var(--cx-fg-3);
+  font: 500 10.5px/1 var(--cx-font-sans);
+}
+
+/* Right-edge fade for truncated row titles (no ellipsis, like ChatGPT). */
+.cx-sb-fade {
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 20px), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 20px), transparent);
+}
+
+@media (hover: none) {
+  .ai-conv-sidebar.cx-sidebar .cx-sb-new .cx-sb-new-kbd { display: none; }
+}

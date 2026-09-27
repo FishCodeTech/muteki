@@ -6,8 +6,6 @@ Kinds:
     executor) against a challenge spec. Needs a live target (URL in the prompt /
     challenge.target) and the claude (and optionally codex) CLI on PATH — no
     DeepSeek key (the CLI executor doesn't use the code-driven kernel).
-  - "mock": scripts the canned event stream (no model, no target) — UI dev / e2e
-    ONLY. Must be asked for explicitly (kind:"mock"); it is no longer the default.
 """
 
 from __future__ import annotations
@@ -22,8 +20,8 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
-from apps.web.dispatch_parse import parse_dispatch
-from apps.web.llm_credentials import LlmCredentialStore
+from apps.web.dispatch_parse import explicit_category
+from apps.web.llm_credentials import resolve_llm_profile_credential
 from apps.web.run_manager import Run, RunManager
 from apps.web.worker_config import (
     backend_for_profile,
@@ -40,6 +38,11 @@ from muteki.solver.worker_profiles import (
 )
 from muteki.solver.cli_driver import driver_for
 from muteki.core.llm import LLMClient, llm_temperature_kwargs
+from muteki.solver.gate import (
+    DEFAULT_BRACE_FLAG_FORMAT,
+    normalize_flag_contract,
+    normalize_flag_wrapper,
+)
 
 if TYPE_CHECKING:
     from muteki.solver.profile_health import ProfileHealth
@@ -71,10 +74,9 @@ def _missing_profile_accounts(
     sessions_root: Path,
 ) -> list[str]:
     """Dispatch precheck — now a thin wrapper over the profile_health kernel so it
-    can never disagree with the settings self-check. Same two-pass cost profile:
-    the kernel does cheap binding inline and only fires the slow CLI hello when a
-    profile `needs_auth_probe`; we fan out across profiles so the dispatch path
-    pays max(timeout), not sum(timeout) (the "/start freezes" symptom)."""
+    can never disagree with the settings self-check. The kernel does cheap binding
+    inline, then every enabled profile executes a real CLI hello; probes fan out so
+    the dispatch path pays max(timeout), not sum(timeout)."""
     from concurrent.futures import ThreadPoolExecutor
 
     from muteki.solver.profile_health import evaluate_profile_health
@@ -146,7 +148,7 @@ def _startup_profiles(
 
 
 def _safe_preflight_detail(value: Any, *, layer: str) -> str:
-    """Preserve the actionable probe error after the probe redacts credentials."""
+    """Preserve the actionable probe error."""
     text = str(value or "预检失败").replace("\x00", "").strip()
     text = "".join(ch for ch in text if ch in "\n\t" or ord(ch) >= 32)
     return text[:2000] or f"{layer or 'model'} preflight failed"
@@ -166,6 +168,10 @@ def _profile_readiness_key(
 ) -> str:
     """Identify the exact runnable profile configuration for task-level reuse."""
     material = {
+        # v2 只接受真实 CLI model probe；使旧版由 structured Runtime 健康
+        # 状态写入的绿色缓存立即失效。
+        "readiness_contract": "worker-cli-v2",
+        "execution_transport": "cli",
         "profile_id": str(
             profile.get("id") or profile.get("name") or profile.get("engine") or ""
         ),
@@ -190,8 +196,9 @@ async def _startup_readiness(
     worker_backend: str,
     sessions_root: Path,
     cached_results: dict[str, tuple[bool, dict[str, Any] | None]],
+    effective_network: str = "",
 ) -> tuple[dict[str, bool], list[dict[str, Any]]]:
-    """Send one real minimal model request for every participating profile."""
+    """Send one real CLI model request for every participating Worker profile."""
     from apps.web.worker_models import ProbeProcessOwner, probe_worker_model
     from muteki.solver.profile_health import evaluate_profile_health
 
@@ -251,6 +258,9 @@ async def _startup_readiness(
             "model": str(profile.get("model") or ""),
             "backend": backend,
             "network": worker_network if backend == "container" else "",
+            "effective_network": (
+                (effective_network or worker_network) if backend == "container" else ""
+            ),
             "stage": "preflight",
             "layer": layer,
             "code": code,
@@ -272,104 +282,32 @@ async def _startup_readiness(
     return snapshot, failures
 
 
-# Allowlisted module prefixes for the optional `swarm_class` /start knob. The
-# endpoint loads a class by dotted path, so without this list it would be an
-# arbitrary-import (RCE) surface.
-_SWARM_CLASS_PREFIXES: tuple[str, ...] = (
-    "muteki.swarm.",
-    "muteki.solver.",
-    "muteki.frameworks.",
-)
-
-
 def _resolve_swarm_class(spec: Any) -> type:
-    """Resolve the optional `swarm_class` body knob (``module.path:ClassName``).
-
-    Product default is ``muteki.swarm.swarm.Swarm`` (coordinator_loop).
-    Empty / omitted spec must stay on that class. Experimental arms
-    (ChainForce, PEX, DualRush, ReapClose, F01–F11) load only when a
-    caller writes an explicit allowlisted spec. Web UI does not send
-    this field. See AGENTS.md.
-    """
+    """Accept only the shipped Coordinator, including legacy explicit specs."""
     from muteki.swarm.swarm import Swarm
 
     text = str(spec or "").strip()
-    if not text:
+    if text in ("", "muteki.swarm.swarm:Swarm"):
         return Swarm
-    module_name, sep, class_name = text.partition(":")
-    if not sep or not module_name or not class_name:
-        raise RuntimeError(
-            f"swarm_class must be 'module.path:ClassName', got {text!r}")
-    if not module_name.startswith(_SWARM_CLASS_PREFIXES):
-        raise RuntimeError(
-            f"swarm_class module {module_name!r} not in allowlist "
-            f"{_SWARM_CLASS_PREFIXES}")
-    import importlib
-
-    cls = getattr(importlib.import_module(module_name), class_name, None)
-    if not (isinstance(cls, type) and issubclass(cls, Swarm)):
-        raise RuntimeError(
-            f"swarm_class {text!r} is not a muteki.swarm.swarm.Swarm subclass")
-    return cls
+    raise RuntimeError(f"swarm_class {text!r} is unavailable; use the standard Swarm")
 
 
 def build_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver:
-    # Real solving is the DEFAULT now — the deck launches the CLI executor swarm.
-    # "mock" is opt-in (UI dev / e2e only).
-    kind = (body or {}).get("kind", "swarm")
-    if kind == "mock":
-        return _mock_driver(body)
-    if kind == "pentest_demo":
-        return _pentest_demo_driver(body, mgr=mgr)
+    # Only shipped product drivers are accepted.
+    body = _normalize_start_flag_contract(body)
+    kind = body.get("kind", "swarm")
     if kind == "idle":
         return _idle_driver(body)
+    if kind != "swarm":
+        raise ValueError(f"unsupported run kind: {kind}")
     return _swarm_driver(_infer_challenge(body), mgr=mgr)
 
 
-# ---- conversational dispatch ------------------------------------------------
-# The conversation-first deck lets the operator DESCRIBE a challenge in prose
-# instead of filling a form: "Flag's behind layers of encoding at
-# http://host/secret". The swarm infers category/target/name from that prompt.
-# This is a deliberately small heuristic — the real planner refines it; this just
-# seeds the Challenge so a run can start from one sentence.
-
-_CATEGORY_HINTS: list[tuple[str, tuple[str, ...]]] = [
-    ("crypto", ("rsa", "aes", "cipher", "encrypt", "decrypt", "xor", "crypto", "modulus", "ecc")),
-    ("pwn", ("overflow", "ret2", "rop", "shellcode", "pwn", "gets(", "libc", "canary", "heap")),
-    ("reverse", ("reverse", "disassemble", "binary", "decompile", "ghidra", "ida", "rev", ".exe", "elf")),
-    ("forensics", ("pcap", "wireshark", "memory dump", "stego", "forensic", "carve", "volatility")),
-    ("web", ("http", "https", "url", "cookie", "jwt", "sqli", "xss", "endpoint", "/admin", "/secret", "web")),
-]
-
-_DEFAULT_BRACE_FLAG_FORMAT = r"[A-Za-z0-9_]{0,15}\{[^}]{1,200}\}"
-
-# Stop inferred URLs at fullwidth / CJK wrappers. ASCII rstrip alone leaves
-# `http://127.0.0.1:4280）做黑盒渗透。账号` which later blows up urllib port parse.
-_INFERRED_URL_CUT = re.compile(r"[）】」』，。；、（【「『<>\"']")
-_INFERRED_URL_KEEP = re.compile(
-    r"(https?://(?:\[[0-9A-Fa-f:]+\]|[^/:?#\s]+)"
-    r"(?::\d{1,5})?(?:[/?#][^\s]*)?)"
-)
-
-
-def _inferred_http_target(prompt: str) -> str:
-    m = re.search(r"https?://[^\s\"'<>]+", prompt or "")
-    if not m:
-        return ""
-    raw = m.group(0)
-    cut = _INFERRED_URL_CUT.search(raw)
-    if cut:
-        raw = raw[:cut.start()]
-    raw = raw.rstrip(".,;)/]\\")
-    kept = _INFERRED_URL_KEEP.match(raw)
-    return (kept.group(1) if kept else raw).rstrip(".,;)/]\\")
+_DEFAULT_BRACE_FLAG_FORMAT = DEFAULT_BRACE_FLAG_FORMAT
 
 
 def _clean_flag_wrapper(raw: Any) -> str:
-    wrapper = str(raw or "").strip()
-    if not wrapper:
-        return ""
-    return "".join(wrapper.split())[:80]
+    return normalize_flag_wrapper(raw)
 
 
 def _flag_format_fields(ch: dict[str, Any], body: dict[str, Any]) -> tuple[str, str, str]:
@@ -388,55 +326,73 @@ def _flag_format_fields(ch: dict[str, Any], body: dict[str, Any]) -> tuple[str, 
         or ""
     )
     hint = str(ch.get("flag_format_hint") or ch.get("flagFormatHint") or "").strip()
-    if raw_format == "token":
-        return "token", hint, ""
-
     cleaned_wrapper = _clean_flag_wrapper(wrapper)
+    # The helper owns the selector/wrapper precedence for every start path:
+    # custom-or-empty format may use the wrapper as a contract, while an explicit
+    # regex or token mode remains authoritative.
+    contract = normalize_flag_contract(raw_format, cleaned_wrapper)
+    flag_format = contract.flag_format
+    cleaned_wrapper = contract.flag_format_wrapper
+    if flag_format == "token":
+        return flag_format, hint, ""
+
     if cleaned_wrapper:
-        flag_format = str(raw_format) if raw_format and raw_format not in ("brace", "custom") else _DEFAULT_BRACE_FLAG_FORMAT
         return flag_format, cleaned_wrapper, cleaned_wrapper
 
-    if raw_format in ("", "brace", "custom"):
-        return _DEFAULT_BRACE_FLAG_FORMAT, hint, ""
-    return str(raw_format), hint, ""
+    return flag_format, hint, ""
+
+
+def _normalize_start_flag_contract(body: dict[str, Any] | None) -> dict[str, Any]:
+    """Copy and normalize the start payload's flag contract synchronously.
+
+    ``build_driver`` is shared by HTTP, Command API and RunGateway starts.  Doing
+    this before a Driver coroutine is returned makes an invalid regex an admission
+    error, rather than a delayed runtime failure after Workers have started.
+    """
+    normalized = dict(body or {})
+    challenge = dict(normalized.get("challenge") or {})
+    flag_format, hint, wrapper = _flag_format_fields(challenge, normalized)
+    challenge["flag_format"] = flag_format
+    if hint:
+        challenge["flag_format_hint"] = hint
+    if wrapper:
+        challenge["flag_format_wrapper"] = wrapper
+    normalized["challenge"] = challenge
+    return normalized
 
 
 def _infer_challenge(body: dict[str, Any]) -> dict[str, Any]:
-    """Fill a `challenge` block from a conversational `prompt` when the caller
-    didn't pass structured fields. Caller-provided fields always win."""
+    """Copy the conversational prompt onto ``challenge.description`` when missing.
+
+    Title and category are not guessed here. The left rail gets them from a
+    later Planner label; Swarm keeps the original instruction.
+    """
     body = dict(body or {})
     ch = dict(body.get("challenge") or {})
+    roster_category = explicit_category(ch.get("category"))
+    if roster_category:
+        ch["category"] = roster_category
+    else:
+        ch.pop("category", None)
     prompt = (body.get("prompt") or ch.get("description") or "").strip()
-    if not prompt:
-        body["challenge"] = ch
-        return body
-    low = prompt.lower()
-
-    inferred: list[str] = []
-    if not ch.get("description"):
+    if prompt and not ch.get("description"):
         ch["description"] = prompt
-        inferred.append("description")
-    if not ch.get("category"):
-        ch["category"] = next(
-            (cat for cat, kws in _CATEGORY_HINTS if any(k in low for k in kws)),
-            "misc",
-        )
-        inferred.append("category")
-    if not ch.get("target"):
-        target = _inferred_http_target(prompt)
-        if target:
-            ch["target"] = target
-            inferred.append("target")
     if (body.get("mode") or ch.get("mode")) == "pentest":
         ch["mode"] = "pentest"
-    if not ch.get("name"):
-        # first few words, slugified — a readable thread-rail label
-        words = re.findall(r"[A-Za-z0-9]+", prompt)[:4]
-        ch["name"] = "-".join(w.lower() for w in words) or "challenge"
-        inferred.append("name")
     body["challenge"] = ch
-    body["_inferred_fields"] = inferred
     return body
+
+
+def _public_challenge_payload(
+    challenge: Any, *, operator_name: str, roster_category: str,
+) -> dict[str, Any]:
+    """Drop default name/category so the rail stays empty until RUN_TITLED."""
+    payload = challenge.model_dump(mode="json")
+    if not operator_name:
+        payload.pop("name", None)
+    if not roster_category:
+        payload.pop("category", None)
+    return payload
 
 
 def _idle_driver(body: dict[str, Any]) -> Driver:
@@ -451,86 +407,43 @@ def _idle_driver(body: dict[str, Any]) -> Driver:
     return drive
 
 
-def _mock_driver(body: dict[str, Any]) -> Driver:
-    async def drive(run: Run) -> None:
-        from examples.mock_solver import run_mock_solve
-
-        # pace the canned stream so the evolving graph + chat animate in the
-        # browser and a human has a window to inject HITL commands mid-run.
-        tick = float(body.get("tick", 0.6))
-        # optional multi-flag demo: body.expected_flags (or challenge.expected_flags)
-        ef = int(body.get("expected_flags")
-                 or (body.get("challenge") or {}).get("expected_flags") or 1)
-        await run_mock_solve(run.bus, run.cost, run_id=run.run_id, tick=tick,
-                             expected_flags=ef)
-
-    return drive
-
-
-def _pentest_demo_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver:
-    """Scripts a full pentest run whose sole purpose is to populate every
-    runtime-asset / review panel on the deck (findings, vuln reports, PoCs,
-    routes/branches, directives, credentials). UI/demo ONLY — kind:"pentest_demo".
-
-    Credentials read the run's persisted shared_graph.db, so when a RunManager is
-    available we point the demo at ``sessions/{id}/workspace/graph`` and it writes
-    the verified credential facts there (matching what /api/runs/{id}/credentials
-    reads). Without a manager it degrades to counting-only (no db)."""
-    async def drive(run: Run) -> None:
-        from examples.pentest_demo_solver import run_pentest_demo_solve
-
-        # pace the canned stream so the panels visibly fill in the browser.
-        tick = float(body.get("tick", 0.5))
-        graph_dir = None
-        if mgr is not None:
-            graph_dir = mgr.workspace_dir(run.run_id) / "graph"
-        await run_pentest_demo_solve(
-            run.bus, run.cost, run_id=run.run_id, tick=tick, graph_dir=graph_dir)
-
-    return drive
-
-
 async def _open_planner_llm(
     *,
     llm_profiles: dict[str, Any],
     run: Run,
     mgr: RunManager | None,
 ) -> tuple[Any, Any]:
-    """Return (context manager, client). Never raises; (None, None) on failure."""
-    try:
-        planner_profile = llm_profiles.get("planner") or {}
-        planner_base = str(planner_profile.get("base_url") or "").strip()
-        llm_kwargs: dict[str, Any] = {
-            "cost": run.cost,
-            "bus": run.bus,
-            **llm_temperature_kwargs(planner_profile),
-        }
-        if planner_base:
-            llm_kwargs["base_url"] = planner_base
-        if mgr is not None:
-            planner_key = LlmCredentialStore(mgr.sessions_root).resolve("planner")
-            if planner_key:
-                llm_kwargs["api_key"] = planner_key
-        llm_cm = LLMClient(**llm_kwargs)
-        llm = await llm_cm.__aenter__()
-        return llm_cm, llm
-    except Exception:
-        return None, None
-
-
-def _llm_may_override(field: str, inferred: set[str], current: Any) -> bool:
-    if field in inferred:
-        return True
-    return not str(current or "").strip()
+    """Open the planner HTTP client used by pentest Reason."""
+    planner_profile = llm_profiles.get("planner") or {}
+    llm_kwargs: dict[str, Any] = {
+        "cost": run.cost,
+        "bus": run.bus,
+        **llm_temperature_kwargs(planner_profile),
+    }
+    if mgr is not None:
+        credential = resolve_llm_profile_credential(
+            "planner", planner_profile, sessions_root=mgr.state_root)
+        if credential.base_url:
+            llm_kwargs["base_url"] = credential.base_url
+        if credential.api_key:
+            llm_kwargs["api_key"] = credential.api_key
+    elif str(planner_profile.get("base_url") or "").strip():
+        llm_kwargs["base_url"] = str(planner_profile["base_url"]).strip()
+    llm_cm = LLMClient(**llm_kwargs)
+    if not llm_cm.api_key:
+        raise ValueError("planner API key is missing")
+    llm = await llm_cm.__aenter__()
+    llm.usage_generation = run.execution_generation
+    return llm_cm, llm
 
 
 def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver:
     """The REAL solver: a shelled-CLI swarm (claude + codex race) against the
-    challenge. No DeepSeek key — CliSolver runs the subscription CLIs directly and
-    still gates every flag through the real provenance check.
+    challenge. CliSolver runs subscription CLIs directly; a Flag is recorded only
+    when the model calls the Blackboard Skill's submit command.
 
     Knobs from the request body (all optional):
-      challenge.{name,category,target,description,flag_format}  (inferred from prompt)
+      challenge.{name,category,target,description,flag_format}
       cli_race: bool (default True)           — race claude + codex
       cli_engine: "claude" | "codex"          — single engine when not racing
       race_scout: bool (default True)         — one parallel single-shot recon round
@@ -538,43 +451,41 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                                                 (fast path on flag, else hands facts
                                                 to the coordinator loop)
       race_engines: list (default = engines)  — which engines race (worker switch)
-      race_timeout: int (default 720)         — short per-worker recon timeout (s)
+      race_timeout: int (default 300)         — short per-worker recon timeout (s)
       offline: bool (default False)           — deny worker web tools (clean eval);
-                                                also denies the KB unless `kb` is set
+                                                also denies the KB unless `kb` is set.
+                                                Does NOT force Docker --network none
+                                                (#171 / MNT-09.04); egress is separate.
       kb: bool (default: True online / False offline) — let the worker query the KB
       n_solvers: int (default 2)              — bootstrap lineup size
       engines: list[str] (default [cursor,claude,codex]) — engine roster; offline
                                                 drops cursor (can't go offline cleanly)
       start_workers: int (default len(engines)) — bootstrap workers (one per engine)
-      swarm_class: "module.path:ClassName" (default muteki.swarm.swarm:Swarm)
-                                                — product Coordinator. Omit this
-                                                field for CTF and pentest.
-                                                Experimental arms are eval-only
-                                                and require an explicit spec.
+      swarm_class: omitted or muteki.swarm.swarm:Swarm — standard Coordinator
     """
-    try:
-        declared_protocol = int(body.get("protocol", 1) or 1)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("protocol must be 1 or 2") from exc
-
     async def drive(run: Run) -> None:
         import os
         import tempfile
         from pathlib import Path
 
         from muteki.models.solve_graph import (
-            Challenge, apply_expected_findings, parse_engagement_goal,
+            Challenge, EngagementGoal, TaskContract, apply_expected_findings,
+            parse_engagement_goal,
         )
         from muteki.sandbox.manager import SandboxManager
         from muteki.solver.result import ArtifactStore
         from muteki.solver.types import SolverConfig
         from muteki.swarm.models import default_lineup
 
-        # Empty spec → production Swarm. Explicit spec is eval-only.
+        # Legacy explicit standard spec is accepted; research implementations
+        # are no longer shipped.
         swarm_cls = _resolve_swarm_class(body.get("swarm_class"))
 
-        ch = body.get("challenge", {})
-        inferred_fields = set(body.get("_inferred_fields") or [])
+        ch = dict(body.get("challenge") or {})
+        task_contract = None
+        contract_payload = body.get("task_contract") or ch.get("task_contract")
+        if isinstance(contract_payload, dict):
+            task_contract = TaskContract.model_validate(contract_payload)
         # attachments: local file paths for FILE-based tracks (crypto/rev/forensics
         # /misc). The worker stages them into its cwd. Keep only paths that exist so
         # a stray entry can't crash the run.
@@ -584,96 +495,84 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         # under challenge.* ; default keeps every CTF dispatch byte-identical.
         mode = (ch.get("mode") or body.get("mode") or "ctf")
         if mode not in ("ctf", "pentest"):
-            mode = "ctf"
+            raise ValueError(f"unknown dispatch mode {mode!r}")
         prompt_text = (body.get("prompt") or ch.get("description") or "").strip()
         goal_text = (ch.get("goal") or body.get("goal") or "")
         if mode == "pentest" and not str(goal_text).strip():
             goal_text = prompt_text
         scope_text = (ch.get("scope") or body.get("scope") or "")
-        if mode == "pentest" and not scope_text and ch.get("target"):
-            scope_text = str(ch.get("target") or "")
         coordinator = bool(body.get("coordinator", True))
         llm_profiles = dict(body.get("llm_profiles") or {})
         if not llm_profiles and mgr is not None:
-            try:
-                llm_profiles = dict(
-                    mgr.worker_config.get().get("llm_profiles") or {})
-            except Exception:
-                llm_profiles = {}
+            llm_profiles = dict(
+                mgr.worker_config.get().get("llm_profiles") or {})
         llm_cm = None
         llm = None
-        parse_audit: dict[str, Any] = {"source": "regex", "model": ""}
-        planner_model = str(
-            (llm_profiles.get("planner") or {}).get("model") or "deepseek-v4-pro")
-        parsed: dict[str, Any] = {}
-        if coordinator:
+        if task_contract is not None:
+            completion = task_contract.completion_contract
+            ch["description"] = task_contract.raw_instruction
+            if task_contract.title:
+                ch["name"] = task_contract.title
+            else:
+                ch.pop("name", None)
+            if task_contract.category:
+                ch["category"] = task_contract.category
+            else:
+                ch.pop("category", None)
+            if task_contract.execution_target:
+                ch["target"] = task_contract.execution_target
+            else:
+                ch.pop("target", None)
+            ch["scope"] = task_contract.authorization_scope
+            mode = task_contract.mode
+            goal_text = completion.goal if mode == "pentest" else ""
+            scope_text = task_contract.authorization_scope
+            attachments = [item.path for item in task_contract.attachments]
+        if coordinator and mode == "pentest":
             llm_cm, llm = await _open_planner_llm(
                 llm_profiles=llm_profiles, run=run, mgr=mgr)
-            if llm is not None:
-                try:
-                    parsed = await asyncio.wait_for(
-                        parse_dispatch(
-                            prompt_text, goal_text, mode,
-                            llm=llm, model=planner_model),
-                        timeout=15.0,
-                    )
-                except Exception:
-                    parsed = {}
-                if parsed:
-                    parse_audit = {"source": "llm", "model": planner_model}
-                    if (_llm_may_override("category", inferred_fields, ch.get("category"))
-                            and parsed.get("category")):
-                        ch["category"] = parsed["category"]
-                        inferred_fields.discard("category")
-                    if (_llm_may_override("target", inferred_fields, ch.get("target"))
-                            and parsed.get("target")):
-                        ch["target"] = parsed["target"]
-                        inferred_fields.discard("target")
-                    if (_llm_may_override("name", inferred_fields, ch.get("name"))
-                            and parsed.get("name")):
-                        ch["name"] = parsed["name"]
-                        inferred_fields.discard("name")
-                    if not str(scope_text or "").strip() and parsed.get("scope"):
-                        scope_text = parsed["scope"]
-        name_autogen = "name" in inferred_fields
-        engagement = parse_engagement_goal(goal_text) if mode == "pentest" else None
-        if engagement is not None and parsed:
-            updates: dict[str, Any] = {}
-            if parsed.get("finding_class"):
-                updates["finding_class"] = parsed["finding_class"]
-            if parsed.get("quantity"):
-                updates["quantity"] = parsed["quantity"]
-            if parsed.get("expected_findings") is not None:
-                updates["expected_findings"] = parsed["expected_findings"]
-            if parsed.get("collect_until_coverage") is not None:
-                updates["collect_until_coverage"] = parsed["collect_until_coverage"]
-            if parsed.get("expected_findings") and parsed.get("quantity") != "recon":
-                updates.setdefault("quantity", "collect")
-                updates["collect_until_coverage"] = False
-            if updates:
-                engagement = engagement.model_copy(update=updates)
+        if task_contract is not None and mode == "pentest":
+            completion = task_contract.completion_contract
+            engagement = EngagementGoal(
+                raw=completion.goal,
+                finding_class=completion.finding_class or "generic",
+                quantity=(
+                    "recon" if completion.kind == "coverage"
+                    else "collect" if completion.kind == "count"
+                    else "first"
+                ),
+                expected_findings=max(1, int(completion.quantity or 1)),
+                collect_until_coverage=bool(completion.collect_until_coverage),
+                success_predicate="gated_report",
+                completion_kind=(
+                    completion.kind if completion.kind in {"outcome", "count", "coverage"}
+                    else "outcome"
+                ),
+                outcome_predicate=completion.outcome_predicate,
+            )
+        else:
+            engagement = parse_engagement_goal(goal_text) if mode == "pentest" else None
         expected_findings_raw = (
             body.get("expected_findings")
             if body.get("expected_findings") is not None
             else ch.get("expected_findings")
         )
-        if engagement is not None and expected_findings_raw not in (None, ""):
-            try:
-                want = int(expected_findings_raw)
-            except (TypeError, ValueError):
-                want = None
-            if want is not None:
-                engagement = apply_expected_findings(engagement, want)
+        if (task_contract is None and engagement is not None
+                and expected_findings_raw not in (None, "")):
+            engagement = apply_expected_findings(
+                engagement, int(expected_findings_raw))
         expected_flags = int(body.get("expected_flags")
                              or ch.get("expected_flags") or 1)
         multi_flag = bool(body.get("multi_flag")
                           if body.get("multi_flag") is not None
                           else ch.get("multi_flag", False))
         flag_format, flag_format_hint, flag_format_wrapper = _flag_format_fields(ch, body)
+        operator_name = str(ch.get("name") or "").strip()
+        roster_category = explicit_category(ch.get("category"))
         challenge = Challenge(
             id=run.run_id,
-            name=ch.get("name", run.run_id),
-            category=ch.get("category", "web"),
+            name=operator_name or run.run_id,
+            category=roster_category or "misc",
             points=ch.get("points", 0),
             description=ch.get("description", ""),
             target=ch.get("target"),
@@ -682,7 +581,19 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             flag_format_hint=flag_format_hint,
             flag_format_wrapper=flag_format_wrapper,
             expected_flags=max(1, expected_flags),
+            initial_flags=list(
+                body.get("initial_flags") or ch.get("initial_flags") or []),
+            platform_confirmation_required=bool(
+                body.get("platform_confirmation_required")
+                if body.get("platform_confirmation_required") is not None
+                else ch.get("platform_confirmation_required", False)
+            ),
             multi_flag=multi_flag,
+            allow_operator_input=bool(
+                body.get("allow_operator_input")
+                if body.get("allow_operator_input") is not None
+                else ch.get("allow_operator_input", True)
+            ),
             verifier_rate_limited=bool(body.get("verifier_rate_limited")
                                        if body.get("verifier_rate_limited") is not None
                                        else ch.get("verifier_rate_limited", False)),
@@ -693,21 +604,11 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             pentest_flag_required=bool(body.get("pentest_flag_required")
                                        if body.get("pentest_flag_required") is not None
                                        else ch.get("pentest_flag_required", False)),
+            task_contract=task_contract,
         )
         executor = body.get("executor", "cli")
-        try:
-            protocol_version = int(body.get("protocol", 1) or 1)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("protocol must be 1 or 2") from exc
-        if protocol_version not in {1, 2}:
-            raise RuntimeError("protocol must be 1 or 2")
         cli_race = bool(body.get("cli_race", False))
         cli_engine = body.get("cli_engine", "claude")
-        # Default-off cognitive cluster planner (intent ranking + engine match).
-        # Env MUTEKI_COGNITIVE_CLUSTER_PLANNER=1 also enables (Swarm ctor).
-        cognitive_cluster_planner = bool(
-            body.get("cognitive_cluster_planner", False)
-        )
         offline = bool(body.get("offline", False))
         web_access = not offline
         # offline implies NO KB (a clean black-box eval denies every external
@@ -719,10 +620,10 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         # engine roster: three-engine race by default (cursor + claude + codex).
         # Resolution order: explicit body.engines > the operator's per-category
         # worker-config default (apps/web/worker_config.py) > the hardcoded roster.
-        # Offline capability is checked per selected profile below. Cursor uses its
-        # ACP permission channel in this mode; the other engines use their native
-        # deny flags or local-only tool allowlists.
-        wc = mgr.worker_config.resolve(challenge.category) if mgr is not None else {}
+        # Offline capability is checked per selected profile below. Cursor 当前无
+        # 可核验的原生离线开关，因此明确拒绝；其他引擎使用 CLI 原生 deny
+        # 参数、只读配置覆盖或本地工具 allowlist。
+        wc = mgr.worker_config.resolve(roster_category or None) if mgr is not None else {}
         engines = body.get("engines") or wc.get("engines") or ["cursor", "claude", "codex", "pi", "omp"]
         worker_profiles = body.get("worker_profiles") or wc.get("worker_profiles") or []
         worker_network = str(
@@ -730,8 +631,10 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         ).strip()
         if worker_network not in {"bridge", "host", "none"}:
             raise RuntimeError("worker_network must be bridge, host, or none")
+        # #171 / MNT-09.04: offline / web_access=false denies WebSearch/WebFetch
+        # only. It must NOT silently force Docker --network none, and must not
+        # report "cannot reach network". Container egress is a separate knob.
         if offline:
-            worker_network = "none"
             incompatible_profiles = [
                 p for p in _selected_profiles(engines, worker_profiles)
                 if not bool(getattr(
@@ -746,6 +649,43 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                     "profile_incompatible offline eval cannot isolate web tools for profile(s): "
                     + names
                 )
+        worker_container_scope = str(
+            body.get("worker_container_scope")
+            or wc.get("worker_container_scope") or "run"
+        ).strip()
+        if worker_container_scope not in {"run", "shared"}:
+            raise RuntimeError("worker_container_scope must be run or shared")
+        worker_privilege = str(
+            body.get("worker_privilege")
+            or wc.get("worker_privilege") or "default"
+        ).strip().lower()
+        if worker_privilege not in {"default", "elevated"}:
+            raise RuntimeError("worker_privilege must be default or elevated")
+        # MNT-09.03 / #170 — resolve cgroup + stream/workdir budgets (not TSec defaults).
+        from muteki.solver.worker_resource_limits import resolve_worker_resource_limits
+        _limits = resolve_worker_resource_limits(
+            memory=body.get("worker_memory", wc.get("worker_memory")),
+            cpus=body.get("worker_cpus", wc.get("worker_cpus")),
+            pids_limit=body.get("worker_pids_limit", wc.get("worker_pids_limit")),
+            output_limit=body.get(
+                "worker_output_limit", wc.get("worker_output_limit")),
+            disk_limit=body.get("worker_disk_limit", wc.get("worker_disk_limit")),
+            config=wc,
+        )
+        worker_memory = _limits.memory
+        worker_cpus = _limits.cpus
+        worker_pids_limit = _limits.pids_limit
+        worker_output_limit = _limits.output_limit
+        worker_disk_limit = _limits.disk_limit
+        worker_vpn_config = None
+        if bool(wc.get("worker_vpn_enabled")) and mgr is not None:
+            candidate = (
+                mgr.state_root
+                / "_secrets" / "runtime" / "openvpn" / "client.ovpn"
+            )
+            if not candidate.is_file():
+                raise RuntimeError("OpenVPN 已启用，但尚未上传配置文件")
+            worker_vpn_config = candidate
         # bootstrap worker count: explicit body wins, else the config default, else
         # one per engine (heterogeneous rush). max_workers likewise from config.
         default_sw = wc.get("start_workers") or len(engines)
@@ -755,34 +695,17 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         # never gives up on its own; only solve / operator-stop ends it). A batch
         # eval, which is unattended, MUST pass a finite budget so a hard challenge
         # can't run forever. `0`/None/negative are treated as "no cap" too.
-        _wcb = body.get("wall_clock_budget", wc.get("wall_clock_budget") if wc else None)
+        _wcb = body.get("wall_clock_budget")
+        if _wcb is None:
+            _wcb = body.get("visit_timebox_s")
+        if _wcb is None and wc:
+            _wcb = wc.get("wall_clock_budget")
         wall_clock_budget = float(_wcb) if (_wcb and float(_wcb) > 0) else float("inf")
         max_total_workers = int(body.get("max_total_workers", wc.get("max_total_workers", 0)) or 0) or None
         cost_budget_usd = float(body.get("cost_budget_usd", wc.get("cost_budget_usd", 0.0)) or 0.0) or None
         token_budget = int(body.get("token_budget", 0) or 0)
         tool_call_budget = int(body.get("tool_call_budget", 0) or 0)
-        max_barren_attempts = int(body.get("max_barren_attempts", 1) or 1)
         llm_profiles = body.get("llm_profiles") or wc.get("llm_profiles") or {}
-        if protocol_version == 2:
-            if mgr is None or mgr.protocol2 is None:
-                raise RuntimeError(
-                    "Protocol2Unavailable: "
-                    + (mgr.protocol2_error if mgr is not None else "no Web composition root"))
-            selected = _selected_profiles(engines, worker_profiles)
-            if not offline or kb:
-                raise RuntimeError(
-                    "Protocol2CanaryRejected: live canary requires offline=true and kb=false")
-            if (coordinator or bool(body.get("race_scout", True))
-                    or len(selected) != 1):
-                raise RuntimeError(
-                    "Protocol2CanaryRejected: use one profile, coordinator=false, race_scout=false")
-            if start_workers != 1 or max_workers != 1 or max_total_workers != 1:
-                raise RuntimeError(
-                    "Protocol2CanaryRejected: minimal canary requires exactly one worker/attempt")
-            if (wall_clock_budget == float("inf") or not cost_budget_usd
-                    or token_budget <= 0 or tool_call_budget <= 0):
-                raise RuntimeError(
-                    "Protocol2CanaryRejected: finite wall/cost/token/tool budgets are required")
         if "stage_policy" in body:
             stage_policy = copy.deepcopy(body.get("stage_policy") or {})
         elif wc.get("stage_policy"):
@@ -792,21 +715,21 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                 "race": {
                     "enabled": bool(body["race_scout"]) if "race_scout" in body else (
                         False if mode == "pentest" else bool(wc.get("race_scout", True))),
-                    "timeout": int(body.get("race_timeout", wc.get("race_timeout", 720))),
+                    "timeout": int(body.get("race_timeout", wc.get("race_timeout", 300))),
                     "engines": body.get("race_engines") or wc.get("race_engines") or [],
                 },
                 "coordinator": {"wall_clock_budget": 0 if wall_clock_budget == float("inf") else int(wall_clock_budget)},
                 "budgets": {"max_total_workers": max_total_workers or 0,
                             "cost_budget_usd": cost_budget_usd or 0.0},
             }
-        if "race_scout" in body:
-            stage_policy.setdefault("race", {})["enabled"] = bool(body["race_scout"])
         if "race_timeout" in body:
             stage_policy.setdefault("race", {})["timeout"] = int(body["race_timeout"])
-        if "race_engines" in body:
-            stage_policy.setdefault("race", {})["engines"] = list(body.get("race_engines") or [])
-        if "wall_clock_budget" in body:
-            v = float(body["wall_clock_budget"] or 0)
+        if "wall_clock_budget" in body or "visit_timebox_s" in body:
+            v = float(
+                body.get("wall_clock_budget")
+                or body.get("visit_timebox_s")
+                or 0
+            )
             stage_policy.setdefault("coordinator", {})["wall_clock_budget"] = (
                 int(v) if v > 0 else 0)
         if "max_total_workers" in body:
@@ -818,17 +741,34 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         stage_policy.setdefault("coordinator", {})
         stage_policy["coordinator"]["token_budget"] = token_budget
         stage_policy["coordinator"]["tool_call_budget"] = tool_call_budget
-        # race-scout layer (DESIGN_race_scout_layer.md): one parallel single-shot
-        # round in front of the main coordinator loop. Operator-configurable from the request:
-        #   race_scout (bool, default on) — whole-layer toggle
-        #   race_engines (list, default = engines) — which engines race (worker switch)
-        #   race_timeout (int, default 720s) — short per-worker recon timeout
-        race_scout = (
-            bool(body["race_scout"]) if "race_scout" in body
-            else (False if mode == "pentest" else bool(wc.get("race_scout", True)))
-        )
-        race_engines = body.get("race_engines") or wc.get("race_engines") or None  # None → defaults to the roster
-        race_timeout = int(body.get("race_timeout", wc.get("race_timeout", 720)))
+        # Web exposes two scheduling modes: auto (Decide-led, no first-round
+        # Race) and fixed (all selected ordinary seats join the first Race).
+        # A legacy race_scout/race_engines request cannot create fixed-without-
+        # Race or auto-with-Race as a hidden third mode.
+        dispatch_mode = str(
+            stage_policy.setdefault("coordinator", {}).get("dispatch_mode")
+            or "fixed"
+        ).strip().lower()
+        if dispatch_mode not in {"auto", "fixed"}:
+            dispatch_mode = "fixed"
+        stage_policy["coordinator"]["dispatch_mode"] = dispatch_mode
+        race_scout = dispatch_mode == "fixed"
+        race_engines = list(engines) if race_scout else []
+        race_timeout = int(body.get("race_timeout", wc.get("race_timeout", 300)))
+        stage_policy.setdefault("race", {})["enabled"] = race_scout
+        stage_policy["race"]["engines"] = list(race_engines)
+        if race_scout:
+            worker_profiles = copy.deepcopy(worker_profiles)
+            selected = set(race_engines)
+            for profile in worker_profiles:
+                if not isinstance(profile, dict):
+                    continue
+                if str(profile.get("name") or profile.get("id") or "") not in selected:
+                    continue
+                profile["race"] = True
+                roles = list(profile.get("roles") or [])
+                if "race" not in roles:
+                    profile["roles"] = [*roles, "race"]
         # cold_start (run-75379 BUG④): "继续做题"/standby relaunch sets this False so the
         # coordinator skips the race-scout warmup and continues on the existing graph.
         # Default True = a fresh run. The Swarm ALSO has a graph-state backstop, so a
@@ -846,12 +786,21 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             env_backend=os.environ.get("MUTEKI_WORKER_BACKEND"),
             in_web_container=is_web_container(),
         )
-        if protocol_version == 2 and worker_backend != "local":
-            raise RuntimeError(
-                "Protocol2CanaryRejected: current live-local egress enforcer "
-                "requires worker_backend=local")
+        effective_worker_network = ""
+        if worker_backend == "container":
+            from muteki.solver.container_exec import (
+                WorkerNetworkConfigError,
+                project_worker_network,
+                resolve_worker_run_network,
+            )
+            try:
+                _net_proj = project_worker_network(worker_network)
+                resolve_worker_run_network(worker_network, needs_egress=True)
+            except WorkerNetworkConfigError as exc:
+                raise RuntimeError(str(exc)) from exc
+            effective_worker_network = _net_proj["effective"]
         startup_health_snapshot: dict[str, bool] | None = None
-        if mgr is not None and protocol_version != 2:
+        if mgr is not None:
             from muteki.core.events import Event, EventType
 
             precheck_profiles, unknown_profile_refs = _startup_profiles(
@@ -879,9 +828,11 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                 challenge_id=challenge.id,
                 payload={
                     "phase": "preflight",
-                    "challenge": challenge.model_dump(mode="json"),
-                    "parse": parse_audit,
-                    "name_autogen": bool(name_autogen),
+                    "challenge": _public_challenge_payload(
+                        challenge,
+                        operator_name=operator_name,
+                        roster_category=roster_category,
+                    ),
                     "profiles": [
                         {
                             "profile_id": str(
@@ -911,6 +862,10 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                         "model": "",
                         "backend": worker_backend,
                         "network": worker_network if worker_backend == "container" else "",
+                        "effective_network": (
+                            (effective_worker_network or worker_network)
+                            if worker_backend == "container" else ""
+                        ),
                         "stage": "preflight",
                         "layer": "binding",
                         "code": "unknown_profile_ref",
@@ -925,11 +880,37 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                     profiles=precheck_profiles,
                     worker_network=worker_network,
                     worker_backend=worker_backend,
-                    sessions_root=mgr.sessions_root,
+                    sessions_root=mgr.state_root,
                     cached_results=run.profile_readiness,
+                    effective_network=effective_worker_network,
                 )
                 mgr.persist_profile_readiness(run)
-            if preflight_failures:
+            # A stale optional profile must not make a task unusable when another
+            # selected profile has passed its real model preflight.  The Swarm
+            # consumes the same snapshot and excludes the failed profile from its
+            # roster.  Only fail the whole task when there is no runnable profile.
+            healthy_profile_ids = {
+                profile_id
+                for profile_id, ok in (startup_health_snapshot or {}).items()
+                if ok
+            }
+            if preflight_failures and healthy_profile_ids:
+                for failure in preflight_failures:
+                    await run.bus.emit(Event(
+                        event_type=EventType.BLACKBOARD_DELTA,
+                        run_id=run.run_id,
+                        challenge_id=challenge.id,
+                        payload={
+                            "kind": "engine_degraded",
+                            "actor": "preflight",
+                            "engine": str(failure.get("engine") or failure.get("profile_id") or ""),
+                            "profile_id": str(failure.get("profile_id") or ""),
+                            "status": "degraded",
+                            "reason": str(failure.get("detail") or "preflight failed"),
+                            "code": str(failure.get("code") or "preflight_failed"),
+                        },
+                    ))
+            elif preflight_failures:
                 await run.bus.emit(Event(
                     event_type=EventType.RUN_FINISHED,
                     run_id=run.run_id,
@@ -964,6 +945,8 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                 return
 
         if mgr is not None:
+            if worker_backend == "container" and worker_container_scope == "shared":
+                mgr.prepare_shared_workspace(run.run_id)
             root = mgr.workspace_dir(run.run_id)
         else:
             root = Path(tempfile.mkdtemp(prefix="muteki-web-"))
@@ -972,27 +955,12 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         # they persist (the shared_graph.db is the run's queryable fact graph).
         sandbox = SandboxManager(bus=run.bus, root=root / "sbx")
         arts = ArtifactStore(root=root / "arts")
-        protocol2_session = None
-        if protocol_version == 2:
-            protocol2_session = mgr.protocol2.prepare_live_session(
-                run_id=run.run_id,
-                challenge_id=challenge.id,
-                attachments=attachments,
-                profiles=_selected_profiles(engines, worker_profiles),
-                artifacts=arts,
-                max_attempts=int(max_total_workers or 0),
-                max_barren_attempts=max_barren_attempts,
-                wall_ms=int(wall_clock_budget * 1000),
-                token_budget=token_budget,
-                cost_micro_usd=int(float(cost_budget_usd or 0.0) * 1_000_000),
-                tool_call_budget=tool_call_budget,
-                expected_goal_units=max(1, expected_flags),
-            )
-        graph_dir = root / "graph"
-        # worker_root is a SIBLING of sbx (NOT under it) so each CLI worker's cwd —
-        # staged attachments, agent-extracted files, PoCs — lives under the run's
-        # sessions/{id}/workspace/ and survives sandbox.shutdown_all()'s rmtree of
-        # sbx. It's cleaned up with the run (RunManager.delete drops sessions/{id}).
+        graph_dir = (
+            mgr.graph_dir(run.run_id) if mgr is not None else root / "graph"
+        )
+        # Every backend and container scope writes into the same logical Run
+        # workspace. Shared scope redirects only enrolled Run workspaces into a
+        # dedicated pool mount; Coordinator state stays outside that mount.
         worker_root = root / "workers"
 
         # Planner LLMClient was opened before Challenge construction (dispatch
@@ -1017,7 +985,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         standing_clear_provider = None
         control_state_provider = None
         worker_registry = getattr(run, "worker_registry", None)
-        if mgr is not None and protocol_version != 2:
+        if mgr is not None:
             try:
                 _actor, control_journal, secret_store = mgr._ensure_control(run)
                 secret_resolver = secret_store.resolve
@@ -1043,12 +1011,13 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             bus=run.bus, cost=run.cost, artifacts=arts,
             config=SolverConfig(), run_id=run.run_id, knowledge=knowledge,
             execution_generation=int(getattr(run, "execution_generation", 1) or 1),
-            hitl_inbox=(None if protocol_version == 2 else run.hitl),
-            worker_cmds=(None if protocol_version == 2 else run.worker_cmds),
+            hitl_inbox=run.hitl,
+            worker_cmds=run.worker_cmds,
+            control_ready=run.control_ready,
+            worker_control_ready=run.worker_control_ready,
             executor=executor, cli_engine=cli_engine, cli_race=cli_race,
             engines=engines, start_workers=start_workers, max_workers=max_workers,
             web_access=web_access, kb=kb, coordinator=coordinator,
-            cognitive_cluster_planner=cognitive_cluster_planner,
             graph_dir=graph_dir, worker_root=worker_root,
             wall_clock_budget=wall_clock_budget,
             race_scout=race_scout, race_engines=race_engines,
@@ -1060,10 +1029,27 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             reason_model=(llm_profiles.get("planner") or {}).get("model", "deepseek-v4-pro"),
             worker_backend=worker_backend,
             worker_network=worker_network,
+            worker_container_scope=worker_container_scope,
+            worker_privilege=worker_privilege,
+            worker_memory=worker_memory,
+            worker_cpus=worker_cpus,
+            worker_pids_limit=worker_pids_limit,
+            worker_output_limit=worker_output_limit,
+            worker_disk_limit=worker_disk_limit,
+            shared_mount_root=(
+                mgr.storage.shared_worker_mount() if mgr is not None else None
+            ),
+            account_projection_root=(
+                mgr.account_projection_root if mgr is not None else None
+            ),
+            container_bootstrap_root=(
+                mgr.container_bootstrap_root if mgr is not None else None
+            ),
+            worker_vpn_config=worker_vpn_config,
             worker_profiles=worker_profiles,
             startup_health_snapshot=startup_health_snapshot,
             credential_accounts_root=(
-                account_store_root(mgr.sessions_root) if mgr is not None else None
+                account_store_root(mgr.state_root) if mgr is not None else None
             ),
             worker_registry=worker_registry,
             secret_resolver=secret_resolver,
@@ -1077,7 +1063,9 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             context_expirer=context_expirer,
             standing_clear_provider=standing_clear_provider,
             control_state_provider=control_state_provider,
-            protocol2_session=protocol2_session,
+            # 做题模式只使用已注册的无交互 CLI Worker。Conversation 的 ACP、
+            # App Server、SDK 注册表不得进入 Swarm。
+            adapter_registry=None,
         )
         if mgr is not None:
             # Swarm owns the trusted winning outcome; RunManager owns storage that
@@ -1090,32 +1078,10 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         deferred_cleanup = False
         try:
             out = await swarm.run()
-            if protocol2_session is not None:
-                await mgr.protocol2.complete_live_session(
-                    run_id=run.run_id, session=protocol2_session,
-                    solved=bool(out.solved))
-            else:
-                # Protocol 1 keeps its direct outcome projection. Protocol 2's
-                # private outcome is only a canonical-finalization handoff; accepted
-                # values become public later through typed flag.accepted recovery.
-                run.flag = out.flag
+            run.flag = out.flag
         except BaseException as exc:
             from muteki.swarm.swarm_support import ControlShutdownIncomplete
             if not isinstance(exc, ControlShutdownIncomplete):
-                if protocol2_session is not None:
-                    try:
-                        await mgr.protocol2.abort_live_session(
-                            run_id=run.run_id, session=protocol2_session)
-                    except BaseException as cleanup_exc:
-                        # Never let best-effort cleanup erase the original owner
-                        # failure/cancellation. Protocol2WebAdapter retains its live
-                        # owner and store until canonical finalization itself lands.
-                        if not isinstance(exc, asyncio.CancelledError):
-                            exc.add_note(
-                                "Protocol 2 abort cleanup failed without replacing "
-                                "the original exception; "
-                                f"cleanup_error_class={type(cleanup_exc).__name__}"
-                            )
                 raise
             deferred_cleanup = True
             run.runtime_incomplete = True
@@ -1127,10 +1093,6 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             async def _settle_incomplete_runtime() -> None:
                 try:
                     await swarm.settle_control_shutdown()
-                    if protocol2_session is not None:
-                        await mgr.protocol2.complete_live_session(
-                            run_id=run.run_id, session=protocol2_session,
-                            solved=bool(run.solved))
                     if not cleanup_state["sandbox"]:
                         await sandbox.shutdown_all()
                         cleanup_state["sandbox"] = True
@@ -1141,6 +1103,9 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                     # event only after the orphan owner has left and graph/container
                     # teardown is safe.
                     run.finished = True
+                    if run.progress_publisher is not None:
+                        await run.progress_publisher.publish_pending(
+                            trigger="terminal")
                     await run.bus.close()
                 except BaseException as cleanup_exc:
                     run.runtime_error = (
@@ -1184,7 +1149,6 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                             f"original exception; cleanup_error_classes={classes}"
                         )
 
-    drive.protocol_version = declared_protocol  # type: ignore[attr-defined]
     return drive
 
 
@@ -1232,7 +1196,7 @@ def _standby_worker_env(
 
     agent_state_dir: Path | None = None
     agent_state_container_path: str | None = None
-    if engine in {"pi", "omp", "opencode", "dsh"}:
+    if engine in {"pi", "omp", "opencode"}:
         agent_state_dir = root / ".muteki-agent-state" / label
         agent_state_dir.mkdir(parents=True, exist_ok=True)
         if container is not None:
@@ -1316,6 +1280,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
         from muteki.solver.result import ArtifactStore
         from muteki.solver.types import SolverConfig
         from muteki.swarm.shared_graph import SQLiteSharedGraph
+        from muteki.swarm.worker_session import WorkerSessionSupervisor
 
         mark_false_already_applied = bool(
             cmd.get("_control_mark_false_applied", False))
@@ -1374,14 +1339,9 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
         action = (runtime_cmd.get("action") or "ask").lower()
 
         if mgr is not None:
-            root = mgr.workspace_dir(run.run_id)
+            root = mgr.storage.workspace(run.run_id)
         else:
             return  # no workspace → nothing durable to resume from
-
-        graph_dir = root / "graph"
-        arts = ArtifactStore(root=root / "arts")
-        worker_root = root / "workers"
-        worker_root.mkdir(parents=True, exist_ok=True)
 
         winner = mgr.load_winner_continuation(run.run_id)
 
@@ -1456,6 +1416,10 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                     engagement = parse_engagement_goal(ch.get("goal") or "")
             else:
                 engagement = parse_engagement_goal(ch.get("goal") or "")
+        standby_flag_contract = normalize_flag_contract(
+            ch.get("flag_format", _DEFAULT_BRACE_FLAG_FORMAT),
+            ch.get("flag_format_wrapper", ""),
+        )
         challenge = Challenge(
             id=run.run_id,
             name=ch.get("name", run.name or run.run_id),
@@ -1464,12 +1428,19 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             description=ch.get("description", ""),
             target=ch.get("target"),
             attachments=[],
-            flag_format=ch.get("flag_format", _DEFAULT_BRACE_FLAG_FORMAT),
-            flag_format_hint=ch.get("flag_format_hint", ""),
-            flag_format_wrapper=ch.get("flag_format_wrapper", ""),
+            flag_format=standby_flag_contract.flag_format,
+            flag_format_hint=(
+                ch.get("flag_format_hint", "")
+                or standby_flag_contract.flag_format_wrapper
+            ),
+            flag_format_wrapper=standby_flag_contract.flag_format_wrapper,
             # Carry the run's flag mode across a post-solve standby re-solve.
             expected_flags=int(ch.get("expected_flags") or 1),
+            initial_flags=list(ch.get("initial_flags") or []),
+            platform_confirmation_required=bool(
+                ch.get("platform_confirmation_required", False)),
             multi_flag=bool(ch.get("multi_flag", False)),
+            allow_operator_input=bool(ch.get("allow_operator_input", True)),
             verifier_rate_limited=bool(ch.get("verifier_rate_limited", False)),
             mode=mode,
             goal=ch.get("goal") or "",
@@ -1481,6 +1452,26 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
         wc = mgr.worker_config.resolve(challenge.category) if mgr is not None else {}
         worker_profiles = wc.get("worker_profiles") or []
         worker_network = str(wc.get("worker_network") or "bridge")
+        worker_container_scope = str(wc.get("worker_container_scope") or "run")
+        if root.is_symlink():
+            if root.resolve() != mgr.storage.shared_workspace(run.run_id).resolve():
+                raise RuntimeError("Run workspace points outside its shared pool slot")
+            worker_container_scope = "shared"
+        from muteki.solver.worker_resource_limits import resolve_worker_resource_limits
+        _standby_limits = resolve_worker_resource_limits(config=wc)
+        worker_memory = _standby_limits.memory
+        worker_cpus = _standby_limits.cpus
+        worker_pids_limit = _standby_limits.pids_limit
+        worker_output_limit = _standby_limits.output_limit
+        worker_disk_limit = _standby_limits.disk_limit
+        worker_vpn_config = None
+        if bool(wc.get("worker_vpn_enabled")) and mgr is not None:
+            candidate = (
+                mgr.state_root
+                / "_secrets" / "runtime" / "openvpn" / "client.ovpn"
+            )
+            if candidate.is_file():
+                worker_vpn_config = candidate
         winner_engine = str(winner.get("engine") or "claude")
         winner_profile_ref = str(
             winner.get("profile_id") or winner_engine
@@ -1504,10 +1495,17 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             )
             if profile else worker_backend
         )
+        if backend == "container" and worker_container_scope == "shared":
+            mgr.prepare_shared_workspace(run.run_id)
+        root = mgr.workspace_dir(run.run_id)
+        graph_dir = mgr.graph_dir(run.run_id)
+        arts = ArtifactStore(root=root / "arts")
+        worker_root = root / "workers"
+        worker_root.mkdir(parents=True, exist_ok=True)
         container = None
         setup_cancel_boundary = None
         setup_exit_query = None
-        account_root = account_store_root(mgr.sessions_root) if mgr is not None else None
+        account_root = account_store_root(mgr.state_root) if mgr is not None else None
         if backend == "container":
             from muteki.solver.container_exec import ensure_container
             setup_container_active = True
@@ -1518,7 +1516,9 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                     return
                 from muteki.solver.container_exec import teardown_container
                 removed = await asyncio.to_thread(
-                    teardown_container, run.run_id, remove=True)
+                    teardown_container, run.run_id, remove=True,
+                    container_scope=worker_container_scope,
+                    bootstrap_root=str(mgr.container_bootstrap_root))
                 if removed is not True:
                     raise RuntimeError("container teardown could not be proven")
                 setup_container_active = False
@@ -1575,9 +1575,31 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             setup_task = asyncio.create_task(asyncio.to_thread(
                     ensure_container,
                     run.run_id,
-                    str(root),
+                    str(worker_root.parent),
                     network=worker_network,
+                    memory=worker_memory,
+                    cpus=worker_cpus,
+                    pids_limit=worker_pids_limit,
+                    output_limit=worker_output_limit,
+                    disk_limit=worker_disk_limit,
                     account_root=(str(account_root) if account_root is not None else None),
+                    account_ids=sorted({
+                        str(p.get("credential_account") or "").strip()
+                        for p in (worker_profiles or [])
+                        if str(p.get("credential_account") or "").strip()
+                    }),
+                    container_scope=worker_container_scope,
+                    shared_mount_root=(
+                        str(mgr.storage.shared_worker_mount()) if mgr is not None else None
+                    ),
+                    account_projection_root=(
+                        str(mgr.account_projection_root) if mgr is not None else None
+                    ),
+                    bootstrap_root=(
+                        str(mgr.container_bootstrap_root) if mgr is not None else None
+                    ),
+                    vpn_config=(str(worker_vpn_config) if worker_vpn_config else None),
+                    worker_privilege=str(wc.get("worker_privilege") or "default"),
                 ), name=f"standby-runtime-setup:{run.run_id}")
             run.standby_setup_task = setup_task
             try:
@@ -1721,8 +1743,20 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             from muteki.solver.container_exec import _chown_tree_to_worker
             _chown_tree_to_worker(workdir)
         solver_label = f"cli-{transport}-standby"
-        home_label = _standby_home_label(
-            root, transport, str(winner.get("session") or ""))
+        home_label = ""
+        agent_state_rel = str(winner.get("agent_state_rel") or "").strip()
+        if agent_state_rel:
+            try:
+                state_root = (root / ".muteki-agent-state").resolve()
+                state_dir = (root / agent_state_rel).resolve()
+                state_dir.relative_to(state_root)
+                if state_dir.is_dir():
+                    home_label = state_dir.name
+            except (OSError, ValueError):
+                home_label = ""
+        if not home_label:
+            home_label = _standby_home_label(
+                root, transport, str(winner.get("session") or ""))
         worker_env = _standby_worker_env(
             root=root,
             label=home_label,
@@ -1732,6 +1766,12 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             container=container,
         )
 
+        session_supervisor = WorkerSessionSupervisor(
+            run_id=run.run_id,
+            execution_generation=max(
+                1, int(getattr(run, "execution_generation", 1) or 1)),
+            shared_graph=shared_graph,
+        )
         worker = CliSolver(
             None, challenge, bus=run.bus, cost=run.cost, artifacts=arts,
             config=SolverConfig(), run_id=run.run_id, shared_graph=shared_graph,
@@ -1747,6 +1787,10 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             container=container,
             worker_env=worker_env,
             identity=worker_identity_fields(profile),
+            target_epoch=max(
+                1, int(getattr(run, "execution_generation", 1) or 1)),
+            session_supervisor=session_supervisor,
+            worker_profile=profile or {"engine": transport},
         )
         worker._control_secret_values = list(materialized_secret_values)
         if context_reservations and control_journal is not None:

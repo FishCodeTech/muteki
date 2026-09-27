@@ -2,27 +2,30 @@
 ships the full Kali/CTF toolchain, so workers have a consistent tool environment
 regardless of the host.
 
-Architecture: ONE long-lived container PER RUN. Inside it, an in-container
-supervisor (`runtime_agent`, the Runtime Control Plane — DESIGN_worker_image_clean
-_rebuild.md §7-11) is PID1/ENTRYPOINT and forks workers on demand. The host talks
-to the supervisor over a per-run Unix domain socket (the `rcp` backend, default).
+Architecture: one long-lived container per Run, or an explicitly trusted shared
+container for Runs that choose the shared scope.
+Inside it, an in-container supervisor (`runtime_agent`, the Runtime Control Plane)
+is PID1/ENTRYPOINT and forks workers on demand. It dials an authenticated host
+receiver (the `rcp` backend, default).
 
-  - ONE container per RUN (`muteki-run-<safe_run_id>`), from the tool image. In rcp
-    mode the supervisor IS the container's main process (no `sleep infinity`).
+  - Run scope gives each Run its own container. Shared scope gives all enrolled
+    Runs one container, UID, resource budget, credential projection and network.
+    Those Runs are mutually trusted; workspace layout is organizational only.
+    In rcp mode the supervisor is the container's main process.
   - The run's host workspace is bind-mounted at /home/kali/workspace, so worker
-    products survive teardown and sibling workers share board/shared_graph via the
-    SAME volume. A second tiny mount exposes only the reverse-connect bootstrap
+    products survive teardown and sibling workers share workspace artifacts via the
+    same volume. A second tiny mount exposes only the reverse-connect bootstrap
     token; a third exposes the credential-account projection. The coordinator's
-    control journal and SecretStore are never mounted.
+    event log, graph, control journal and SecretStore are never mounted.
   - A worker is started by asking the supervisor (StartWorker over the socket); the
-    supervisor forks it as the kali user (with sudo), applies a wall-clock cap, and
+    supervisor forks it as the kali user, applies a wall-clock cap, and
     streams its stdout/stderr back verbatim. Per-worker control (kill/pause/resume)
     is a Signal op the supervisor routes to that worker's process group — so killing
     or pausing one worker never touches a sibling, and there's no host-side PPID/
     pgid/cmdline-sentinel追溯 to sever (the reason the original docker-exec shared-
     container attempt was fragile; the supervisor owning the PIDs fixes it cleanly).
-  - Whole-run teardown = `docker rm -f` the single container (its PID namespace
-    takes the supervisor + every worker with it).
+  - Run-scope teardown removes that Run's container. Shared-scope teardown stops
+    the Run's registered workers; the last owner removes the pool container.
 
 LEGACY fallback (`container_dockerexec`): the previous model shelled `docker exec`
 per worker from the host into a `sleep infinity` container, with `pkill -f <tag>`
@@ -37,6 +40,7 @@ proc wrapper's _container_signal (STOP/CONT/KILL).
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import secrets
@@ -47,22 +51,130 @@ import subprocess
 import threading
 import time
 import uuid
+from muteki.solver.worker_resource_limits import WorkerResourceLimits, resolve_worker_resource_limits
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Optional, Any
 
 from muteki.solver.cli_driver import (
     CliDriver, CliResult, SecurePromptUnsupported, StreamStep,
+    finalize_cli_result,
 )
+from muteki.solver.cli_launch_check import check_process_launch
 from muteki.solver.credential_accounts import CONTAINER_ACCOUNTS_ROOT
 
 # Tool-only worker image. Real credentials are injected from Credential Accounts
 # at runtime; do not bake claude/codex/cursor login state into this image.
 # One generic worker image (NOT a per-recipe tag), published to Docker Hub so any
 # host can `docker pull` it. Default to the moving :latest; override with
-# MUTEKI_WORKER_IMAGE to pin a version (e.g. ghcr.io/fishcodetech/muteki-worker:v0.3.2).
+# MUTEKI_WORKER_IMAGE to pin a version (e.g. ghcr.io/fishcodetech/muteki-worker:v0.4.0).
 WORKER_IMAGE = os.environ.get("MUTEKI_WORKER_IMAGE", "ghcr.io/fishcodetech/muteki-worker:latest")
 CONTAINER_WORKSPACE = "/home/kali/workspace"
 CONTAINER_CONTROL_DIR = "/run/muteki/control"  # bind-mounted; carries the per-run token
+CONTAINER_VPN_CONFIG = "/run/muteki/vpn/client.ovpn"
+CONTAINER_VPN_DIGEST = "/run/muteki-openvpn.sha256"
+SHARED_RUNTIME_ID = "shared-runtime"
+
+
+def _shared_runtime_id(bootstrap_root: str) -> str:
+    """Keep independent installations from claiming each other's Docker pool."""
+    root = str(Path(bootstrap_root).expanduser().resolve())
+    return f"{SHARED_RUNTIME_ID}-{hashlib.sha256(root.encode()).hexdigest()[:16]}"
+
+
+class WorkerNetworkConfigError(ValueError):
+    """Requested Docker network cannot be applied without silent privilege widening.
+
+    Raised for #171 / MNT-09.04: never rewrite ``none`` → ``bridge``. Reject
+    clearly when RCP/model egress is required under ``none``, or when compose
+    ``MUTEKI_WORKER_NETWORK`` conflicts with true offline networking.
+    """
+
+
+_VALID_WORKER_NETWORKS = frozenset({"bridge", "host", "none"})
+
+
+def _normalize_requested_network(requested: str | None) -> str:
+    network = str(requested or "").strip() or "bridge"
+    if network not in _VALID_WORKER_NETWORKS:
+        raise WorkerNetworkConfigError(
+            f"worker_network must be bridge, host, or none; got {network!r}"
+        )
+    return network
+
+
+def project_worker_network(requested: str | None = None) -> dict[str, str]:
+    """Project requested vs effective Docker network without widening privileges.
+
+    Honesty rules (#171 / MNT-09.04):
+    - ``none`` means Docker ``--network none`` and is never rewritten to bridge.
+    - Compose ``MUTEKI_WORKER_NETWORK`` remaps only ``bridge`` onto the shared
+      network name for service discovery (web-api / lab aliases).
+    - Selecting ``none`` while that override is set is rejected: a container
+      cannot be truly offline and join the compose network at once.
+    - ``host`` is kept as ``host`` (override does not apply).
+
+    Returns ``{"requested", "effective", "reason"}``.
+    """
+    req = _normalize_requested_network(requested)
+    override = (os.environ.get("MUTEKI_WORKER_NETWORK") or "").strip()
+    if req == "host":
+        return {"requested": "host", "effective": "host", "reason": ""}
+    if req == "none":
+        if override:
+            raise WorkerNetworkConfigError(
+                "worker_network=none conflicts with MUTEKI_WORKER_NETWORK="
+                f"{override!r}: compose shared network is required for service "
+                "discovery, so true Docker --network none cannot be applied. "
+                "Choose bridge (joins the compose network) or unset "
+                "MUTEKI_WORKER_NETWORK. Disabling WebSearch/WebFetch (offline / "
+                "web_access=false) is separate from container network none and "
+                "does not isolate shell egress (#171 / MNT-09.04)."
+            )
+        return {
+            "requested": "none",
+            "effective": "none",
+            "reason": "docker --network none",
+        }
+    # Only a named bridge network may override the bridge choice.
+    if override in {"host", "none"} or override.startswith("container:"):
+        raise WorkerNetworkConfigError("MUTEKI_WORKER_NETWORK must name a bridge network; choose host explicitly")
+    if override:
+        return {
+            "requested": "bridge",
+            "effective": override,
+            "reason": "MUTEKI_WORKER_NETWORK compose shared network",
+        }
+    return {"requested": "bridge", "effective": "bridge", "reason": ""}
+
+
+def resolve_worker_run_network(
+    requested: str | None = None,
+    *,
+    needs_egress: bool = True,
+) -> str:
+    """Return the Docker ``--network`` value, or raise WorkerNetworkConfigError.
+
+    ``none`` is never silently upgraded to bridge. Product paths default
+    ``needs_egress=True`` (RCP dial-out / remote model HTTPS) and reject ``none``
+    before container create. Pass ``needs_egress=False`` only to project the raw
+    Docker mode (tests / future P3-04 offline). Web-tool toggles are not a
+    substitute for Docker network isolation (#171 / MNT-09.04).
+    """
+    projection = project_worker_network(requested)
+    if needs_egress and projection["effective"] == "none":
+        raise WorkerNetworkConfigError(
+            "worker_network=none (Docker --network none) cannot reach the RCP "
+            "control receiver or remote model/API endpoints. Refusing to create "
+            "the container rather than silently upgrading to bridge. Use "
+            "worker_network=bridge (or host) for egress; use offline / "
+            "web_access=false to deny WebSearch/WebFetch only — that does not "
+            "isolate shell egress (#171 / MNT-09.04). Full shell offline "
+            "isolation remains P3-04."
+        )
+    return projection["effective"]
+
+
 _RUN_PREFIX = "muteki-run-"
 _RUN_ID_LABEL = "io.muteki.run-id-sha256"
 LOG = logging.getLogger(__name__)
@@ -89,7 +201,6 @@ _CONTAINER_BIN = {
     "pi": "pi",
     "omp": "/home/kali/.local/bin/omp",
     "opencode": "opencode",
-    "dsh": "python3",
     "kimi": "kimi",
     "grok": "/home/kali/.grok/bin/grok",
 }
@@ -293,33 +404,102 @@ def _run_container_name(run_id: str) -> str:
     return f"{_RUN_PREFIX}{_run_identity(run_id)}"
 
 
-def _legacy_run_container_name(run_id: str) -> str:
-    """Lossy pre-digest primary name; detection only, never ownership proof."""
-    return f"{_RUN_PREFIX}{_safe(run_id)}"[:120]
-
-
-def _bootstrap_dir(run_id: str, host_workspace: str) -> str:
+def _bootstrap_dir(
+    run_id: str,
+    host_workspace: str,
+    bootstrap_root: Optional[str] = None,
+) -> str:
     """Coordinator-private one-shot bootstrap mount, outside the worker workspace.
 
-    The sibling location stays under the same mirrored data root (important when
-    the coordinator itself runs in Docker) while remaining unreachable through the
-    worker's ``/home/kali/workspace`` bind mount.
+    The explicit state/runtime location stays under the mirrored data root
+    (important when the coordinator itself runs in Docker) while remaining
+    unreachable through the worker's ``/home/kali/workspace`` bind mount.
     """
+    if not bootstrap_root:
+        raise ValueError("RCP containers require an explicit bootstrap root")
     workspace = os.path.realpath(os.path.abspath(host_workspace))
-    path = os.path.join(os.path.dirname(workspace), ".muteki_rcp", _run_identity(run_id))
-    if os.path.commonpath((workspace, path)) == workspace:
-        raise RuntimeError("worker workspace has no private sibling for RCP bootstrap")
+    root = os.path.realpath(os.path.abspath(bootstrap_root))
+    if os.path.commonpath((workspace, root)) == workspace:
+        raise RuntimeError("RCP bootstrap root must be outside the worker mount")
+    path = os.path.join(root, _run_identity(run_id))
     return path
 
 
 _BOOTSTRAP_DIRS: dict[str, str] = {}
+_ACCOUNT_PROJECTIONS: dict[str, str] = {}
+
+
+def _shared_leases_root(bootstrap_root: str) -> Path:
+    root = Path(bootstrap_root).expanduser().absolute()
+    leases = root / "shared-run-leases"
+    if root.is_symlink() or leases.is_symlink():
+        raise RuntimeError("shared lease root cannot be a symlink")
+    leases.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(leases, 0o700)
+    return leases
+
+
+def _shared_lease_path(logical_run_id: str, bootstrap_root: str) -> Path:
+    return _shared_leases_root(bootstrap_root) / f"{_run_identity(logical_run_id)}.json"
+
+
+def _other_shared_owners(logical_run_id: str, bootstrap_root: str) -> list[str]:
+    leases = _shared_leases_root(bootstrap_root)
+    current = _shared_lease_path(logical_run_id, bootstrap_root).name
+    owners: list[str] = []
+    for path in leases.iterdir():
+        if path.name == current:
+            continue
+        if path.name.startswith(".") and path.suffix == ".tmp":
+            continue
+        if path.is_symlink() or not path.is_file() or path.suffix != ".json":
+            raise RuntimeError("unexpected shared runtime owner record")
+        try:
+            item = json.loads(path.read_text(encoding="utf-8"))
+            owner = str(item["run_id"])
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise RuntimeError("invalid shared runtime owner record") from exc
+        if path.name != f"{_run_identity(owner)}.json":
+            raise RuntimeError("shared runtime owner record identity mismatch")
+        owners.append(owner)
+    return owners
+
+
+def _register_shared_owner(logical_run_id: str, bootstrap_root: str, policy: str) -> str:
+    path = _shared_lease_path(logical_run_id, bootstrap_root)
+    if path.is_symlink():
+        raise RuntimeError("shared runtime owner record cannot be a symlink")
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise RuntimeError("invalid shared runtime owner record") from exc
+        if (existing.get("run_id") != logical_run_id
+                or existing.get("policy") != policy
+                or not isinstance(existing.get("token"), str)
+                or len(existing["token"]) < 32):
+            raise RuntimeError("shared Run policy changed; start a new Run")
+        token = existing["token"]
+    else:
+        token = secrets.token_hex(32)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            data = json.dumps({"run_id": logical_run_id, "policy": policy,
+                               "token": token}).encode()
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temporary, path)
+    return token
 
 
 def _cleanup_bootstrap_dir(run_id: str, *, fallback: Optional[str] = None) -> None:
     """Remove bootstrap material after the caller has proven runtime absence.
 
     This helper intentionally does not inspect Docker itself so teardown can make
-    one authoritative proof covering the main and legacy containers.  Every call
+    one authoritative proof covering the active container.  Every call
     site is behind that proof (or occurs before a brand-new container is created).
     """
     registered = _BOOTSTRAP_DIRS.pop(run_id, None)
@@ -342,18 +522,33 @@ def _retire_bootstrap_token(handle: "ContainerHandle") -> None:
 
 @dataclass
 class ContainerHandle:
-    """Identifies the RUN's single long-lived container + shared workspace + (rcp
-    mode) its bootstrap-token directory. One handle per run; every worker runs in the SAME
-    container, started via the supervisor (rcp) or `docker exec` (legacy)."""
+    """Identifies a Run's selected long-lived container and mounted workspace."""
     run_id: str
+    # The logical per-Run workspace supplied by the caller.  In shared mode the
+    # container mounts its parent, so this must be retained separately from
+    # host_workspace.  Reusing host_workspace as ensure_container() input would
+    # apply that parent transform a second time after a container restart.
+    run_workspace: str
     host_workspace: str
     container: str
     image: str = WORKER_IMAGE
     network: str = "bridge"
+    requested_network: Optional[str] = None
     memory: Optional[str] = None
     cpus: Optional[str] = None
     pids_limit: Optional[int] = None
+    resource_limits: Optional[WorkerResourceLimits] = None
     account_root: Optional[str] = None
+    # IDs projected into account_root (Run or explicitly trusted pool). Empty = none.
+    account_ids: tuple[str, ...] = ()
+    # default: no privilege gains; elevated: explicit operator opt-in to image sudo.
+    worker_privilege: str = "default"
+    # account_root above is the projected directory mounted into the container;
+    # this is the original host account store needed to rebuild that projection.
+    account_source_root: Optional[str] = None
+    shared_mount_root: Optional[str] = None
+    account_projection_root: Optional[str] = None
+    bootstrap_root: Optional[str] = None
     # rcp control plane (mode == "rcp"): REVERSE-CONNECT — the supervisor dials the
     # host ControlReceiver and is routed by run_id, so the host side just needs the
     # run_id (above) to find the link. control_dir carries the one-shot token into
@@ -362,6 +557,14 @@ class ContainerHandle:
     mode: str = "rcp"               # "rcp" | "dockerexec"
     control_dir: Optional[str] = None   # private host dir bind-mounted to /run/muteki/control
     token: str = ""                     # pending token only; blank after Hello succeeds
+    control_run_id: str = ""
+    container_scope: str = "run"
+    owner_token: str = ""
+    vpn_config: Optional[str] = None
+
+    @property
+    def supervisor_run_id(self) -> str:
+        return self.control_run_id or self.run_id
 
     def to_container_cwd(self, host_cwd: str) -> str:
         """Map a host cwd under host_workspace → its path inside the container."""
@@ -370,21 +573,26 @@ class ContainerHandle:
     def to_container_path(self, host_path: str) -> str:
         """Map a host path under a mounted root to its container path."""
         try:
-            rel = os.path.relpath(os.path.abspath(host_path), os.path.abspath(self.host_workspace))
+            rel = os.path.relpath(
+                os.path.realpath(os.path.abspath(host_path)),
+                os.path.realpath(os.path.abspath(self.host_workspace)),
+            )
         except ValueError:
             rel = ".."
         if rel == "." or rel.startswith(".."):
             if self.account_root:
                 try:
-                    arel = os.path.relpath(os.path.abspath(host_path),
-                                           os.path.abspath(self.account_root))
+                    arel = os.path.relpath(
+                        os.path.realpath(os.path.abspath(host_path)),
+                        os.path.realpath(os.path.abspath(self.account_root)),
+                    )
                 except ValueError:
                     arel = ".."
                 if arel == ".":
                     return CONTAINER_ACCOUNTS_ROOT
                 if not arel.startswith(".."):
                     return f"{CONTAINER_ACCOUNTS_ROOT}/{arel}"
-            return CONTAINER_WORKSPACE
+            raise ValueError("host path is outside the container's declared mounts")
         return f"{CONTAINER_WORKSPACE}/{rel}"
 
 
@@ -491,7 +699,9 @@ def runtime_execs_for_run(run_id: str) -> list[dict[str, Any]]:
 # container mid-creation → every subsequent worker dies "No such container" (the bug
 # that made all worker turns 0.02s rc=1 empty exits). The lock + a created-state
 # aware path (start, don't blindly remove) fixes it.
-_ENSURE_LOCK = threading.Lock()
+_ENSURE_LOCK = threading.RLock()
+_ACCOUNT_PROJECTION_LOCK = threading.Lock()
+
 
 
 def ensure_container(run_id: str, host_workspace: str, *,
@@ -499,109 +709,227 @@ def ensure_container(run_id: str, host_workspace: str, *,
                      memory: Optional[str] = None,
                      cpus: Optional[str] = None,
                      pids_limit: Optional[int] = None,
-                     account_root: Optional[str] = None) -> ContainerHandle:
-    """Idempotently bring up the run's ONE long-lived worker container and return a
-    handle. The first caller `docker run -d`s it (ENTRYPOINT = supervisor in rcp
-    mode; `sleep infinity` in legacy dockerexec mode); later callers (other workers)
-    find it running and reuse it. Only the run workspace is bind-mounted (plus the
-    control-socket dir and the account projection)."""
+                     output_limit: Optional[str] = None,
+                     disk_limit: Optional[str] = None,
+                     account_root: Optional[str] = None,
+                     account_ids: Optional[list[str] | tuple[str, ...] | set[str]] = None,
+                     container_scope: str = "run",
+                     shared_mount_root: Optional[str] = None,
+                     account_projection_root: Optional[str] = None,
+                     bootstrap_root: Optional[str] = None,
+                     vpn_config: Optional[str] = None,
+                     worker_privilege: str = "default") -> ContainerHandle:
+    """Bring up a Run container or an explicitly trusted shared container.
+
+    ``account_ids`` selects which credential accounts are
+    projected; default empty means project none. ``worker_privilege`` is
+    ``default`` (deny privilege gains) or ``elevated`` (keep image sudo).
+    """
+    limits = resolve_worker_resource_limits(image=image, memory=memory, cpus=cpus,
+                                            pids_limit=pids_limit, output_limit=output_limit, disk_limit=disk_limit)
+    memory, cpus, pids_limit = limits.memory, limits.cpus, limits.pids_limit
+    requested_network = _normalize_requested_network(network)
+    logical_run_id = run_id
+    run_workspace = str(Path(host_workspace).expanduser().resolve())
+    account_source_root = (
+        str(Path(account_root).expanduser().resolve()) if account_root else None
+    )
+    if container_scope not in {"run", "shared"}:
+        raise ValueError("container_scope must be run or shared")
+    if container_scope == "shared":
+        if not shared_mount_root or not bootstrap_root:
+            raise ValueError("shared scope requires dedicated mount and bootstrap roots")
+        shared_root = Path(shared_mount_root).expanduser().resolve()
+        if shared_root.is_symlink() or Path(shared_mount_root).is_symlink():
+            raise RuntimeError("shared mount root cannot be a symlink")
+        if Path(run_workspace).parent != shared_root:
+            raise ValueError("shared Run workspace must be a direct slot of its dedicated pool root")
+        private_root = Path(bootstrap_root).expanduser().resolve()
+        if private_root == shared_root or private_root.is_relative_to(shared_root):
+            raise ValueError("shared runtime bootstrap root must be outside its worker mount")
+        if account_projection_root:
+            projection = Path(account_projection_root).expanduser().resolve()
+            if projection == shared_root or projection.is_relative_to(shared_root):
+                raise ValueError("shared account projection root must be outside its worker mount")
+        host_workspace = str(shared_root)
+        run_id = _shared_runtime_id(bootstrap_root)
+    else:
+        host_workspace = run_workspace
+    privilege = str(worker_privilege or "default").strip().lower()
+    if privilege not in {"default", "elevated"}:
+        raise ValueError("worker_privilege must be default or elevated")
+    selected_account_ids = tuple(sorted({
+        str(a).strip() for a in (account_ids or ()) if str(a).strip()
+    }))
     os.makedirs(host_workspace, exist_ok=True)
-    # Make the shared workspace (incl. the already-created graph/shared_graph.db
-    # team board) writable by the kali worker uid — it's created root-owned here
-    # and bind-mounted into the worker, which runs as kali. Without this the board
-    # is read-only to workers (sqlite "attempt to write a readonly database").
-    # This runs before the FIRST worker spawns; the DB is created earlier (swarm
-    # bootstrap), so a recursive chown of the tree covers it. Best-effort.
-    _chown_tree_to_worker(host_workspace, image=image)
-    mount_account_root = account_root
-    if account_root:
-        os.makedirs(account_root, exist_ok=True)
-        # Mount a container-READABLE projection of the account store, NOT the raw
-        # 0600 host store (#15: the container 'kali' user's uid differs from the
-        # host owner so it can't read 0600 files; #14: codex needs CODEX_HOME/
-        # auth.json WRITABLE to refresh its token). project_account_root copies the
-        # store under the (gitignored, ephemeral) run workspace with container-
-        # readable perms + a writable codex-home, leaving the host store untouched
-        # and read-only. The projection — not the raw store — is what's mounted.
-        from muteki.solver.credential_accounts import project_account_root
-        projection = os.path.join(host_workspace, ".muteki_accounts")
-        try:
-            project_account_root(account_root, projection)
-            mount_account_root = projection
-        except OSError:
-            mount_account_root = account_root  # fall back to raw store mount
+    # Make the Worker-only workspace writable by the kali uid. Coordinator logs,
+    # secrets and SharedGraph live outside this mount and are never chowned here.
+    _chown_tree_to_worker(run_workspace, image=image)
+    if container_scope == "shared" and getattr(os, "geteuid", lambda: -1)() == 0:
+        uid, gid = _worker_uid_gid(image)
+        os.chown(host_workspace, uid, gid)
+    mount_account_root = None
     r = _docker("image", "inspect", image, timeout=20)
     if r.returncode != 0:
         raise RuntimeError(
-            f"worker image {image!r} not found — build it first "
-            f"(./docker/worker/build.sh)")
+            f"worker image {image!r} not found — pull the image built by GitHub Actions")
     name = _run_container_name(run_id)
 
     mode = "dockerexec" if _USE_DOCKEREXEC else "rcp"
-    # The rcp supervisor must DIAL OUT to the host receiver, which needs outbound
-    # networking — impossible with `--network none`. Offline-ness is NOT enforced by
-    # network isolation anyway; it's the CLI flags (claude --disallowed-tools Web*,
-    # codex --no-search) that deny the agent web access. So in rcp mode upgrade
-    # `none` → `bridge`: the supervisor can reach host.docker.internal and the worker
-    # is still offline at the engine layer.
-    if mode == "rcp" and str(network).strip() == "none":
-        network = "bridge"
-    # P2-v3 BLOCKER-b: in the compose layout the coordinator runs inside the web
-    # container and workers are SIBLING containers; the supervisor reaches the
-    # receiver by the web service's network alias (MUTEKI_CONTROL_HOST=web), which
-    # only resolves if the worker joins the SAME compose network. MUTEKI_WORKER_NETWORK
-    # names that network (e.g. "muteki_net"); when set it overrides the per-profile
-    # network (the bridge/host/none UI control is meaningless across the socket). It
-    # does NOT override an explicit "host" request (offline/host-target runtimes).
-    _net_override = (os.environ.get("MUTEKI_WORKER_NETWORK") or "").strip()
-    if mode == "rcp" and _net_override and str(network).strip() != "host":
-        network = _net_override
+    if container_scope == "shared" and mode != "rcp":
+        raise RuntimeError("shared scope requires the scoped RCP supervisor")
+    # RCP supervisor dials out to the host receiver; remote model HTTPS also needs
+    # egress. ``none`` is never rewritten to bridge (#171 / MNT-09.04) — resolve
+    # rejects clearly when egress is required. Web-tool deny (offline) is separate
+    # from Docker network isolation; full shell offline remains P3-04.
+    network = resolve_worker_run_network(network, needs_egress=True)
     host_net = str(network).strip() == "host"
+    owner_token = ""
+
+    def _handle(**kwargs: Any) -> ContainerHandle:
+        return ContainerHandle(
+            run_id=logical_run_id,
+            run_workspace=run_workspace,
+            control_run_id=run_id,
+            container_scope=container_scope,
+            owner_token=owner_token,
+            vpn_config=vpn_config,
+            account_source_root=account_source_root,
+            account_ids=selected_account_ids,
+            worker_privilege=privilege,
+            resource_limits=limits,
+            requested_network=requested_network,
+            shared_mount_root=(
+                str(Path(shared_mount_root).expanduser().resolve())
+                if shared_mount_root else None
+            ),
+            account_projection_root=(
+                str(Path(account_projection_root).expanduser().resolve())
+                if account_projection_root else None
+            ),
+            bootstrap_root=(
+                str(Path(bootstrap_root).expanduser().resolve())
+                if bootstrap_root else None
+            ),
+            **kwargs,
+        )
+
+    def _activate(handle: ContainerHandle) -> None:
+        if handle.container_scope != "shared":
+            return
+        from muteki.solver.control_client import register_owner
+        if not register_owner(handle.supervisor_run_id, handle.run_id,
+                              handle.owner_token,
+                              handle.to_container_path(handle.run_workspace)):
+            raise RuntimeError("shared runtime rejected Run registration")
+
     with _ENSURE_LOCK:
         receiver = None
         if mode == "rcp":
             from muteki.solver.control_receiver import ControlReceiver
             receiver = ControlReceiver.instance()
         state = _container_state(name)
-        if state is None:
-            # Upgrade fence: older releases used a lossy, unhashed primary name.
-            # Never create a second runtime while such a container may exist.  It
-            # can be removed only when an exact ownership label proves this run;
-            # unlabeled legacy state requires explicit operator cleanup.
-            legacy_name = _legacy_run_container_name(run_id)
-            if legacy_name != name and not _container_absence_proven(legacy_name):
-                if _container_run_digest(legacy_name) != _run_digest(run_id):
-                    raise RuntimeError(
-                        f"ambiguous legacy runtime {legacy_name} exists without an "
-                        "exact run ownership label; refusing duplicate creation")
-                legacy_bootstrap = _container_bootstrap_source(legacy_name)
-                _docker("rm", "-f", legacy_name, timeout=20)
-                if not _container_absence_proven(legacy_name):
-                    raise RuntimeError(
-                        f"exact-owned legacy runtime {legacy_name} could not be removed")
-                if receiver is not None:
-                    receiver.forget(run_id)
-                _cleanup_bootstrap_dir(run_id, fallback=legacy_bootstrap)
+        vpn_digest = None
+        if vpn_config:
+            vpn_digest = hashlib.sha256(Path(vpn_config).read_bytes()).hexdigest()
+        policy = hashlib.sha256(json.dumps({
+            "image": image, "network": network, "privilege": privilege,
+            "accounts": selected_account_ids, "workspace": host_workspace,
+            "account_source_root": account_source_root,
+            "projection_root": account_projection_root,
+            "memory": memory, "cpus": cpus, "pids_limit": pids_limit,
+            "vpn_config": vpn_config, "vpn_digest": vpn_digest,
+        }, sort_keys=True).encode()).hexdigest()
+        if container_scope == "shared":
+            other_owners = _other_shared_owners(logical_run_id, bootstrap_root)
+            for owner in other_owners:
+                other_lease = _shared_lease_path(owner, bootstrap_root)
+                try:
+                    owner_policy = json.loads(other_lease.read_text(encoding="utf-8"))["policy"]
+                except (OSError, ValueError, TypeError, KeyError) as exc:
+                    raise RuntimeError("invalid shared runtime owner policy") from exc
+                if owner_policy != policy:
+                    raise RuntimeError("shared runtime policy differs from another Run owner")
+        reusable = (state in {"running", "created", "paused", "restarting"}
+                    and (mode == "dockerexec" or (state == "running" and receiver.has_link(run_id))))
+        if state is not None and not reusable:
+            stale_bootstrap = _BOOTSTRAP_DIRS.get(run_id) or _container_bootstrap_source(name)
+            _docker("rm", "-f", name, timeout=20)
+            if not _container_absence_proven(name):
+                raise RuntimeError("stale container absence could not be proven before reprojecting credentials")
+            if container_scope == "shared":
+                from muteki.solver.control_client import confirm_run_absent
+                for owner in (logical_run_id, *other_owners):
+                    confirm_run_absent(owner)
+            if receiver is not None:
+                receiver.forget(run_id)
+            _cleanup_bootstrap_dir(run_id, fallback=stale_bootstrap)
+            state = None
+        if reusable:
+            existing = _docker("inspect", "--format",
+                               '{{index .Config.Labels "io.muteki.worker-policy"}}', name)
+            if existing.returncode != 0 or existing.stdout.strip() != policy:
+                raise RuntimeError("Worker container policy changed; stop the existing Run container before restarting")
+        if container_scope == "shared":
+            owner_token = _register_shared_owner(logical_run_id, bootstrap_root, policy)
+        mount_account_root = None
+        if account_root:
+            if not account_projection_root:
+                raise ValueError("container credentials require an account projection root")
+            os.makedirs(account_root, exist_ok=True)
+            # Mount a container-READABLE projection of the account store, NOT the raw
+            # 0600 host store (#15: the container 'kali' user's uid differs from the
+            # host owner so it can't read 0600 files; #14: codex needs CODEX_HOME/
+            # auth.json WRITABLE to refresh its token). project_account_root copies the
+            # store under the (gitignored, ephemeral) run workspace with container-
+            # readable perms + a writable codex-home, leaving the host store untouched
+            # and read-only. The projection — not the raw store — is what's mounted.
+            from muteki.solver.credential_accounts import project_account_root
+            projection_base = Path(account_projection_root).expanduser().resolve()
+            mounted_root = Path(host_workspace).resolve()
+            try:
+                projection_base.relative_to(mounted_root)
+            except ValueError:
+                pass
+            else:
+                raise ValueError("account projection root cannot be worker-visible")
+            projection_base.mkdir(mode=0o700, parents=True, exist_ok=True)
+            projection = str(projection_base / _run_identity(run_id))
+            with _ACCOUNT_PROJECTION_LOCK:
+                if Path(projection).is_symlink():
+                    raise RuntimeError("account projection cannot be a symlink")
+                # Preserve directory inodes and refreshed CLI state on repeated setup.
+                project_account_root(
+                    account_root, projection, account_ids=selected_account_ids,
+                )
+            if not Path(projection).is_dir() or Path(projection).is_symlink():
+                raise RuntimeError("account projection is not a real directory")
+            mount_account_root = projection
+            _ACCOUNT_PROJECTIONS[run_id] = projection
         if state == "running":
             if mode == "dockerexec":
-                return ContainerHandle(
-                    run_id=run_id, host_workspace=host_workspace, container=name,
+                handle = _handle(
+                    host_workspace=host_workspace, container=name,
                     image=image, network=network, memory=memory, cpus=cpus,
                     pids_limit=pids_limit, account_root=mount_account_root,
                     mode=mode,
                 )
+                _ensure_openvpn(handle)
+                return handle
             # Never rotate a bootstrap token underneath a live reverse-control
             # owner.  The token was consumed at Hello and the file was unlinked;
             # the authenticated socket is now the authority.
             assert receiver is not None
             if receiver.has_link(run_id):
-                handle = ContainerHandle(
-                    run_id=run_id, host_workspace=host_workspace, container=name,
+                handle = _handle(
+                    host_workspace=host_workspace, container=name,
                     image=image, network=network, memory=memory, cpus=cpus,
                     pids_limit=pids_limit, account_root=mount_account_root,
                     mode=mode, control_dir=_BOOTSTRAP_DIRS.get(run_id), token="",
                 )
                 _await_supervisor(handle)
+                _activate(handle)
+                _ensure_openvpn(handle)
                 return handle
             # A running container without a live receiver link cannot authenticate
             # again: its one-shot token has already been consumed (or its bootstrap
@@ -619,15 +947,17 @@ def ensure_container(run_id: str, host_workspace: str, *,
             state = None
         if state in ("created", "restarting", "paused"):
             if mode == "dockerexec":
-                # Legacy transport has no authenticated link to preserve.
+                # Docker-exec transport has no authenticated link to preserve.
                 _docker("start", name, timeout=20)
-                if _container_state(name) in ("running", "created", "restarting"):
-                    return ContainerHandle(
-                        run_id=run_id, host_workspace=host_workspace, container=name,
+                if _container_state(name) == "running":
+                    handle = _handle(
+                        host_workspace=host_workspace, container=name,
                         image=image, network=network, memory=memory, cpus=cpus,
                         pids_limit=pids_limit, account_root=mount_account_root,
                         mode=mode,
                     )
+                    _ensure_openvpn(handle)
+                    return handle
             # In RCP mode a non-running pre-existing container has no usable live
             # link.  Remove and bootstrap a fresh supervisor instead of rotating a
             # token beneath an ambiguous owner.
@@ -666,11 +996,11 @@ def ensure_container(run_id: str, host_workspace: str, *,
                 raise RuntimeError(
                     f"cannot bootstrap {name}: container absence is not proven")
             receiver.forget(run_id)
-            control_dir = _bootstrap_dir(run_id, host_workspace)
+            control_dir = _bootstrap_dir(run_id, host_workspace, bootstrap_root)
             _cleanup_bootstrap_dir(run_id, fallback=control_dir)
-            bootstrap_root = os.path.dirname(control_dir)
-            os.makedirs(bootstrap_root, mode=0o700, exist_ok=True)
-            os.chmod(bootstrap_root, 0o700)
+            bootstrap_parent = os.path.dirname(control_dir)
+            os.makedirs(bootstrap_parent, mode=0o700, exist_ok=True)
+            os.chmod(bootstrap_parent, 0o700)
             os.mkdir(control_dir, mode=0o700)
             os.chmod(control_dir, 0o700)
             try:
@@ -692,18 +1022,18 @@ def ensure_container(run_id: str, host_workspace: str, *,
                 _cleanup_bootstrap_dir(run_id, fallback=control_dir)
                 raise
 
-        handle = ContainerHandle(run_id=run_id, host_workspace=host_workspace,
-                                 container=name, image=image, network=network,
-                                 memory=memory, cpus=cpus, pids_limit=pids_limit,
-                                 account_root=mount_account_root,
-                                 mode=mode, control_dir=control_dir, token=token)
+        handle = _handle(host_workspace=host_workspace, container=name,
+                         image=image, network=network, memory=memory, cpus=cpus,
+                         pids_limit=pids_limit, account_root=mount_account_root,
+                         mode=mode, control_dir=control_dir, token=token)
         # --mount (key=value) NOT -v: the workspace path has run_id ("nyu:KEY") whose
         # colon makes `-v host:ctr:rw` mis-parse → silent bind-mount failure. `--init`
         # reaps zombie trees. In rcp mode the ENTRYPOINT (supervisor) is the keepalive
-        # (no `sleep infinity`); in legacy mode we append `sleep infinity`.
+        # (no `sleep infinity`); docker-exec mode uses sleep as PID 1.
         run_cmd = [
             "run", "-d", "--init", "--name", name,
             "--label", f"{_RUN_ID_LABEL}={_run_digest(run_id)}",
+            "--label", f"io.muteki.worker-policy={policy}",
             "--network", network,
             "--tmpfs", "/tmp:rw,exec,size=2g",
             "--mount",
@@ -727,18 +1057,38 @@ def ensure_container(run_id: str, host_workspace: str, *,
         if pids_limit and int(pids_limit) > 0:
             run_cmd += ["--pids-limit", str(int(pids_limit))]
         if account_root:
-            # Mount the container-readable PROJECTION (handle.account_root, set to
-            # the projected dir above), NOT read-only: codex needs CODEX_HOME/
-            # auth.json writable to refresh its token (#14). Per-file perms in the
-            # projection keep the static secrets effectively read-only (0644) while
-            # only codex-home is writable; the HOST store stays untouched. NOTE:
-            # the raw host store is NEVER mounted here — only its projection is.
+            # Static projection is read-only even for elevated workers. Only the
+            # explicitly mounted refresh-state directories below are writable.
             run_cmd += [
                 "--mount",
-                f"type=bind,source={_mount_source(handle.account_root)},target={CONTAINER_ACCOUNTS_ROOT}",
+                f"type=bind,source={_mount_source(handle.account_root)},target={CONTAINER_ACCOUNTS_ROOT},readonly",
+            ]
+        if mount_account_root:
+            from muteki.solver.credential_accounts import _WRITABLE_STATE_DIRS
+            for account_id in selected_account_ids:
+                for state_dir in _WRITABLE_STATE_DIRS:
+                    source = str(Path(mount_account_root) / account_id / state_dir)
+                    target = f"{CONTAINER_ACCOUNTS_ROOT}/{account_id}/{state_dir}"
+                    run_cmd += ["--mount", f"type=bind,source={_mount_source(source)},target={target}"]
+        if privilege == "default":
+            run_cmd += ["--security-opt", "no-new-privileges=true"]
+        if vpn_config:
+            resolved_vpn = os.path.realpath(os.path.abspath(vpn_config))
+            if not os.path.isfile(resolved_vpn):
+                raise RuntimeError("OpenVPN 配置文件不存在")
+            run_cmd += [
+                "--cap-add", "NET_ADMIN",
+                "--device", "/dev/net/tun:/dev/net/tun",
+                "--mount",
+                f"type=bind,source={_mount_source(os.path.dirname(resolved_vpn))},target=/run/muteki/vpn,readonly",
             ]
         if mode == "dockerexec":
-            run = _docker(*run_cmd, image, "sleep", "infinity", timeout=60)
+            # The worker image has the RCP supervisor as its ENTRYPOINT. Override
+            # it for the docker-exec transport so the keepalive is really
+            # sleep(1), rather than passing "sleep infinity" to the supervisor.
+            run = _docker(
+                *run_cmd, "--entrypoint", "sleep", image, "infinity", timeout=60
+            )
         else:
             # ENTRYPOINT (supervisor) runs; append the reverse-connect args so it DIALS
             # the host receiver and identifies as this run. These append to the exec-
@@ -746,27 +1096,137 @@ def ensure_container(run_id: str, host_workspace: str, *,
             # uses --connect/--run-id (token comes from the bind-mounted control file).
             from muteki.solver.control_receiver import (
                 CONTROL_HOST_FROM_CONTAINER, DEFAULT_CONTROL_PORT)
-            run = _docker(*run_cmd, image,
-                          "--connect", f"{CONTROL_HOST_FROM_CONTAINER}:{DEFAULT_CONTROL_PORT}",
-                          "--run-id", run_id,
-                          timeout=60)
+            supervisor_args = [
+                "--connect", f"{CONTROL_HOST_FROM_CONTAINER}:{DEFAULT_CONTROL_PORT}",
+                "--run-id", run_id,
+            ]
+            if container_scope == "shared":
+                supervisor_args.append("--shared-pool")
+            run = _docker(*run_cmd, image, *supervisor_args, timeout=60)
         if run.returncode != 0:
             # lost a create race (name conflict) → reuse whoever won if it's up.
             st = _container_state(name)
-            if st in ("running", "created"):
+            if st == "running" or (mode == "rcp" and st == "created"):
                 if mode == "rcp":
                     _await_supervisor(handle)
+                    _activate(handle)
                     _retire_bootstrap_token(handle)
+                _ensure_openvpn(handle)
                 return handle
             if mode == "rcp" and _container_absence_proven(name):
                 assert receiver is not None
                 receiver.forget(run_id)
                 _cleanup_bootstrap_dir(run_id)
             raise RuntimeError(f"failed to start run container {name}: {run.stderr.strip()[:300]}")
+        if mode == "dockerexec" and _container_state(name) != "running":
+            _docker("rm", "-f", name, timeout=20)
+            raise RuntimeError(f"docker-exec runtime {name} exited during startup")
         if mode == "rcp":
             _await_supervisor(handle)
+            _activate(handle)
             _retire_bootstrap_token(handle)
+        _ensure_openvpn(handle)
         return handle
+
+
+def _ensure_openvpn(handle: ContainerHandle) -> None:
+    """Start the optional VPN, reloading a changed mounted config before a new Run."""
+    if not handle.vpn_config:
+        return
+    mounted = _docker("exec", handle.container, "test", "-r", CONTAINER_VPN_CONFIG,
+                      timeout=10)
+    if mounted.returncode != 0:
+        raise RuntimeError("共享容器已存在但未挂载 OpenVPN 配置，请先停止现有任务")
+    digest = _docker(
+        "exec", handle.container, "sha256sum", CONTAINER_VPN_CONFIG, timeout=10,
+    )
+    current_digest = (digest.stdout or "").split(maxsplit=1)[0]
+    if digest.returncode != 0 or not current_digest:
+        raise RuntimeError("无法读取 OpenVPN 配置摘要")
+    active = _docker(
+        "exec", handle.container, "sh", "-lc",
+        f"pgrep -x openvpn >/dev/null && ip link show tun0 >/dev/null 2>&1 "
+        f"&& test \"$(cat {CONTAINER_VPN_DIGEST} 2>/dev/null)\" = \"{current_digest}\"",
+        timeout=10,
+    )
+    if active.returncode == 0:
+        return
+    stopped = _docker(
+        "exec", "--user", "root", handle.container, "sh", "-lc",
+        "pkill -x openvpn >/dev/null 2>&1 || true; "
+        "i=0; while pgrep -x openvpn >/dev/null && [ $i -lt 50 ]; do "
+        "i=$((i+1)); sleep 0.1; done; ! pgrep -x openvpn >/dev/null",
+        timeout=10,
+    )
+    if stopped.returncode != 0:
+        raise RuntimeError("旧 OpenVPN 进程未能停止")
+
+    def _log_tail() -> str:
+        detail = _docker(
+            "exec", handle.container, "tail", "-n", "30",
+            "/run/muteki-openvpn.log", timeout=10,
+        )
+        return (detail.stdout or detail.stderr or "")[-800:]
+
+    # TSec permits only one client per profile.  Immediately reconnecting after a
+    # previous client exits can briefly return AUTH_FAILED while the server still
+    # owns that old session.  Retry only that explicit transient response; invalid
+    # credentials and every other startup failure must remain immediate failures.
+    retry_deadline = time.monotonic() + 90
+    while True:
+        started = _docker(
+            "exec", "--user", "root", handle.container,
+            "openvpn", "--config", CONTAINER_VPN_CONFIG,
+            "--daemon", "muteki-openvpn", "--writepid", "/run/muteki-openvpn.pid",
+            "--log", "/run/muteki-openvpn.log", timeout=20,
+        )
+        if started.returncode != 0:
+            raise RuntimeError(
+                f"OpenVPN 启动失败: {(started.stderr or started.stdout or '')[:240]}"
+            )
+        attempt_deadline = time.monotonic() + 30
+        while time.monotonic() < attempt_deadline:
+            ready = _docker(
+                "exec", handle.container, "ip", "link", "show", "tun0", timeout=5,
+            )
+            if ready.returncode == 0:
+                recorded = _docker(
+                    "exec", "--user", "root", handle.container, "sh", "-lc",
+                    f"printf '%s\\n' '{current_digest}' > {CONTAINER_VPN_DIGEST}",
+                    timeout=10,
+                )
+                if recorded.returncode != 0:
+                    raise RuntimeError("无法记录 OpenVPN 配置摘要")
+                return
+            alive = _docker(
+                "exec", handle.container, "pgrep", "-x", "openvpn", timeout=5,
+            )
+            if alive.returncode != 0:
+                detail = _log_tail()
+                if ("Exceeded number of clients connecting to server" in detail
+                        and time.monotonic() < retry_deadline):
+                    time.sleep(5)
+                    break
+                if "AUTH_FAILED" in detail:
+                    raise RuntimeError(f"OpenVPN 认证失败: {detail}")
+                raise RuntimeError(f"OpenVPN 在建立 tun0 前退出: {detail}")
+            time.sleep(0.5)
+        else:
+            detail = _log_tail()
+            if time.monotonic() < retry_deadline:
+                _docker(
+                    "exec", "--user", "root", handle.container,
+                    "pkill", "-x", "openvpn", timeout=10,
+                )
+                time.sleep(2)
+                continue
+            raise RuntimeError(f"OpenVPN 未建立 tun0: {detail}")
+
+        if time.monotonic() >= retry_deadline:
+            raise RuntimeError(
+                "OpenVPN 服务端拒绝连接：同一配置的客户端连接数已满，"
+                f"自动重试后仍未释放。{_log_tail()}"
+            )
 
 
 def _await_supervisor(handle: ContainerHandle) -> None:
@@ -778,10 +1238,14 @@ def _await_supervisor(handle: ContainerHandle) -> None:
     if handle.mode != "rcp":
         return
     from muteki.solver.control_client import wait_supervisor_ready
-    if not wait_supervisor_ready(handle.run_id, deadline_s=40.0):
+    if not wait_supervisor_ready(handle.supervisor_run_id, deadline_s=40.0):
         raise RuntimeError(
-            f"runtime supervisor for run {handle.run_id} never dialed back "
+            f"runtime supervisor for run {handle.supervisor_run_id} never dialed back "
             f"(container {handle.container} up but control plane unreachable)")
+    if handle.container_scope == "shared":
+        from muteki.solver.control_client import health
+        if not health(handle.supervisor_run_id).get("scoped_teardown"):
+            raise RuntimeError("shared scope requires an image with scoped Run teardown support")
 
 
 def _container_state(name: str) -> Optional[str]:
@@ -825,10 +1289,10 @@ def _container_absence_proven(name: str) -> bool:
     return "no such object" in detail or "no such container" in detail
 
 
-def _container_bootstrap_source(name: str) -> Optional[str]:
-    """Recover the private bootstrap mount source across coordinator restarts."""
+def _container_mount_source(name: str, destination: str) -> Optional[str]:
+    """Recover one exact bind-mount source across coordinator restarts."""
     template = (
-        '{{range .Mounts}}{{if eq .Destination "' + CONTAINER_CONTROL_DIR
+        '{{range .Mounts}}{{if eq .Destination "' + destination
         + '"}}{{.Source}}{{end}}{{end}}'
     )
     result = _docker("inspect", "-f", template, name, timeout=15)
@@ -838,67 +1302,106 @@ def _container_bootstrap_source(name: str) -> Optional[str]:
     return source or None
 
 
-def _container_run_digest(name: str) -> Optional[str]:
-    """Return the exact run-ownership label, if this runtime has one."""
-    template = '{{index .Config.Labels "' + _RUN_ID_LABEL + '"}}'
-    result = _docker("inspect", "-f", template, name, timeout=15)
-    if result.returncode != 0:
-        return None
-    value = (result.stdout or "").strip()
-    return value if len(value) == 64 else None
+def _container_bootstrap_source(name: str) -> Optional[str]:
+    return _container_mount_source(name, CONTAINER_CONTROL_DIR)
 
 
-def teardown_container(run_id: str, *, remove: bool = True) -> bool:
+def _cleanup_account_projection(path: Optional[str], owner_id: str) -> None:
+    if not path:
+        return
+    candidate = Path(path)
+    # Only process-registered projections reach this path. The caller may have
+    # configured a different private projection base, so its basename is not a
+    # safe or reliable cleanup criterion. The generated Run identity still is.
+    if candidate.is_symlink() or candidate.name != _run_identity(owner_id):
+        LOG.warning("refusing unexpected account projection cleanup: %s", path)
+        return
+    shutil.rmtree(candidate, ignore_errors=True)
+
+
+def teardown_container(run_id: str, *, remove: bool = True,
+                       container_scope: str = "run",
+                       bootstrap_root: Optional[str] = None) -> bool:
     """Serialize whole-run teardown against bootstrap/recreation."""
     with _ENSURE_LOCK:
+        if container_scope == "shared":
+            return _teardown_shared_owner_locked(
+                run_id, remove=remove, bootstrap_root=bootstrap_root)
         return _teardown_container_locked(run_id, remove=remove)
 
 
+def _teardown_shared_owner_locked(logical_run_id: str, *, remove: bool,
+                                  bootstrap_root: Optional[str]) -> bool:
+    root = bootstrap_root
+    if not root:
+        return False
+    lease = _shared_lease_path(logical_run_id, root)
+    if lease.is_symlink():
+        return False
+    if lease.is_file():
+        try:
+            item = json.loads(lease.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return False
+        if item.get("run_id") != logical_run_id:
+            return False
+        owner_token = str(item.get("token") or "")
+    else:
+        owner_token = ""
+    others = _other_shared_owners(logical_run_id, root)
+    runtime_id = _shared_runtime_id(root)
+    name = _run_container_name(runtime_id)
+    state = _container_state(name)
+    from muteki.solver.control_receiver import ControlReceiver
+    live_link = (ControlReceiver.instance().has_link(runtime_id)
+                 if state == "running" else False)
+    if others and state == "running" and live_link:
+        if not remove:
+            return False
+        from muteki.solver.control_client import health, teardown_owner
+        try:
+            if not health(runtime_id, timeout=2).get("scoped_teardown"):
+                return False
+            if not teardown_owner(runtime_id, logical_run_id, owner_token):
+                return False
+        except Exception:
+            return False
+    else:
+        if state is not None and not remove:
+            return False
+        bootstrap = (_BOOTSTRAP_DIRS.get(runtime_id)
+                     or _container_bootstrap_source(name))
+        if remove and state is not None:
+            _docker("rm", "-f", name, timeout=20)
+        if not _container_absence_proven(name):
+            return False
+        from muteki.solver.control_client import confirm_run_absent
+        confirm_run_absent(logical_run_id)
+        for owner in others:
+            confirm_run_absent(owner)
+        confirm_run_absent(runtime_id)
+        try:
+            ControlReceiver.instance().forget(runtime_id)
+        except Exception:
+            pass
+        _cleanup_bootstrap_dir(runtime_id, fallback=bootstrap)
+        projection = _ACCOUNT_PROJECTIONS.pop(runtime_id, None)
+        _cleanup_account_projection(projection, runtime_id)
+    lease.unlink(missing_ok=True)
+    return True
+
+
 def _teardown_container_locked(run_id: str, *, remove: bool = True) -> bool:
-    """Tear down the run's single container — its PID namespace takes the supervisor
-    + every worker with it. Also sweeps any stray per-worker containers from the OLD
-    per-worker design, so a mixed-version state never leaks. Filters are end-anchored
-    on the run's safe name to avoid the substring误杀 that killed live targets under
-    the old fixed-name scheme."""
+    """Tear down the run's container and its process namespace."""
     name = _run_container_name(run_id)
     bootstrap_dir = _BOOTSTRAP_DIRS.get(run_id) or _container_bootstrap_source(name)
-    legacy_bootstrap: Optional[str] = None
+    # Delete only a projection registered by this process. After a coordinator
+    # restart the mount source is untrusted container metadata; leaving an orphan
+    # for later reuse/GC is safer than recursively deleting an attacker-chosen path.
+    account_projection = _ACCOUNT_PROJECTIONS.get(run_id)
     if remove:
         _docker("rm", "-f", name, timeout=20)
     proven = _container_absence_proven(name)
-    legacy_primary = _legacy_run_container_name(run_id)
-    if legacy_primary != name and not _container_absence_proven(legacy_primary):
-        if _container_run_digest(legacy_primary) != _run_digest(run_id):
-            LOG.warning(
-                "refusing ambiguous legacy primary cleanup for run %s: %s has "
-                "no matching exact ownership label", run_id, legacy_primary)
-            proven = False
-        else:
-            legacy_bootstrap = _container_bootstrap_source(legacy_primary)
-            if remove:
-                _docker("rm", "-f", legacy_primary, timeout=20)
-            if not _container_absence_proven(legacy_primary):
-                proven = False
-    # Legacy candidates used a lossy safe(run_id) prefix.  `a/b`, `a?b`, and `a-b`
-    # therefore alias and MUST NOT be removed from that prefix alone.  Only an exact
-    # ownership label is sufficient; unlabeled/mismatched candidates remain
-    # explicitly unproven for operator cleanup instead of risking a cross-run kill.
-    safe = _safe(run_id)
-    r = _docker("ps", "-aq", "--filter", f"name=muteki-w-{safe}-", timeout=15)
-    if r.returncode != 0:
-        proven = False
-    else:
-        for cid in [x for x in (r.stdout or "").split() if x]:
-            if _container_run_digest(cid) != _run_digest(run_id):
-                LOG.warning(
-                    "refusing ambiguous legacy runtime cleanup for run %s: %s "
-                    "has no matching exact ownership label", run_id, cid)
-                proven = False
-                continue
-            if remove:
-                _docker("rm", "-f", cid, timeout=15)
-            if not _container_absence_proven(cid):
-                proven = False
     if proven:
         # Only discard the reverse-control owner after Docker proves every matching
         # runtime absent. A failed rm must keep the link/token retryable.
@@ -918,7 +1421,8 @@ def _teardown_container_locked(run_id: str, *, remove: bool = True) -> bool:
         # prove absence: an unknown/live container may still have it mounted.  Once
         # absence is authoritative, erase the empty mount and any unconsumed token.
         _cleanup_bootstrap_dir(run_id, fallback=bootstrap_dir)
-        _cleanup_bootstrap_dir(run_id, fallback=legacy_bootstrap)
+        _cleanup_account_projection(account_projection, run_id)
+        _ACCOUNT_PROJECTIONS.pop(run_id, None)
     return proven
 
 
@@ -945,8 +1449,6 @@ def _containerize_argv(driver_name: str, argv: list[str]) -> list[str]:
         out[3] = bin_in_container or "grok"
     else:
         out[0] = bin_in_container or os.path.basename(out[0])
-    if driver_name == "dsh" and len(out) >= 2:
-        out[1] = "/opt/muteki/deepseek_harness_worker.py"
     if driver_name == "kimi":
         for index, arg in enumerate(out[:-1]):
             if arg == "--agent-file":
@@ -961,29 +1463,85 @@ def _containerize_argv(driver_name: str, argv: list[str]) -> list[str]:
 # ── public entry points (mirror cli_driver.run_cli / run_cli_streaming) ───────
 
 def _ensure_alive(handle: ContainerHandle) -> None:
+    with _ENSURE_LOCK:
+        _ensure_alive_locked(handle)
+
+
+def _ensure_alive_locked(handle: ContainerHandle) -> None:
     """Guarantee the run container is up right before a worker starts. If a teardown
     / crash / race removed it, lazily recreate it (same name + mounts) so this worker
     doesn't die "No such container". Cheap when it's already running (one inspect).
     Re-syncs the handle's rcp token (+ receiver registration) if it had to recreate."""
+    if handle.container_scope == "shared":
+        root = handle.bootstrap_root
+        if not root:
+            raise RuntimeError("shared Run has no active runtime ownership record")
+        lease = _shared_lease_path(handle.run_id, root)
+        if lease.is_symlink() or not lease.is_file():
+            raise RuntimeError("shared Run has no active runtime ownership record")
+        try:
+            active_token = json.loads(lease.read_text(encoding="utf-8"))["token"]
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise RuntimeError("shared Run ownership record is invalid") from exc
+        if active_token != handle.owner_token:
+            raise RuntimeError("shared Run handle belongs to an older ownership generation")
     if _container_state(handle.container) == "running":
         if handle.mode != "rcp":
             return
         from muteki.solver.control_receiver import ControlReceiver
-        if ControlReceiver.instance().has_link(handle.run_id):
+        if ControlReceiver.instance().has_link(handle.supervisor_run_id):
+            if handle.container_scope == "shared":
+                from muteki.solver.control_client import register_owner
+                if not register_owner(
+                    handle.supervisor_run_id, handle.run_id, handle.owner_token,
+                    handle.to_container_path(handle.run_workspace),
+                ):
+                    raise RuntimeError("shared runtime rejected Run re-registration")
             return
         # A running PID namespace with no authenticated reverse link is an orphan,
         # not a healthy keepalive.  Fall through to ensure_container, which proves
         # removal and issues a fresh one-shot bootstrap for a new supervisor.
-    fresh = ensure_container(handle.run_id, handle.host_workspace,
-                             image=handle.image, network=handle.network,
+    fresh = ensure_container(handle.run_id, handle.run_workspace,
+                             image=handle.image, network=(handle.requested_network or handle.network),
                              memory=handle.memory, cpus=handle.cpus,
                              pids_limit=handle.pids_limit,
-                             account_root=handle.account_root)
-    # a recreate regenerates the token (+ re-registers it with the receiver) — adopt
-    # it so this worker's link resolves.
+                             output_limit=(handle.resource_limits.output_limit if handle.resource_limits else None),
+                             disk_limit=(handle.resource_limits.disk_limit if handle.resource_limits else None),
+                             account_root=handle.account_source_root,
+                             account_ids=getattr(handle, "account_ids", ()) or (),
+                             container_scope=handle.container_scope,
+                             shared_mount_root=handle.shared_mount_root,
+                             account_projection_root=handle.account_projection_root,
+                             bootstrap_root=handle.bootstrap_root,
+                             vpn_config=handle.vpn_config,
+                             worker_privilege=getattr(handle, "worker_privilege", "default") or "default")
+    # A recreate can change every mounted/control identity.  Adopt the complete
+    # fresh mapping so path translation and later recreations use the same roots
+    # that Docker actually mounted.
+    handle.run_workspace = fresh.run_workspace
+    handle.host_workspace = fresh.host_workspace
+    handle.container = fresh.container
+    handle.image = fresh.image
+    handle.network = fresh.network
+    handle.requested_network = fresh.requested_network
+    handle.memory = fresh.memory
+    handle.cpus = fresh.cpus
+    handle.pids_limit = fresh.pids_limit
+    handle.resource_limits = fresh.resource_limits
+    handle.account_root = fresh.account_root
+    handle.account_source_root = fresh.account_source_root
+    handle.account_ids = getattr(fresh, "account_ids", ())
+    handle.worker_privilege = getattr(fresh, "worker_privilege", "default")
+    handle.shared_mount_root = fresh.shared_mount_root
+    handle.account_projection_root = fresh.account_projection_root
+    handle.bootstrap_root = fresh.bootstrap_root
     handle.mode = fresh.mode
     handle.control_dir = fresh.control_dir
     handle.token = fresh.token
+    handle.control_run_id = fresh.control_run_id
+    handle.container_scope = fresh.container_scope
+    handle.owner_token = fresh.owner_token
+    handle.vpn_config = fresh.vpn_config
 
 
 def run_cli_container(driver: CliDriver, argv: list[str], *, handle: ContainerHandle,
@@ -1000,22 +1558,30 @@ def run_cli_container(driver: CliDriver, argv: list[str], *, handle: ContainerHa
     if handle.mode == "rcp":
         from muteki.solver.control_client import run_cli_rcp
         cont_argv = _containerize_argv(driver.name, argv)
+        check_process_launch(
+            cont_argv, cwd=cont_cwd, env=env, stdin_text=stdin_text,
+            source="container-run")
         tag = uuid.uuid4().hex[:12]
         rec = _RUNTIME_REGISTRY.create(handle=handle, tag=tag, driver=driver.name,
                                        cwd=cont_cwd, argv=cont_argv)
         _RUNTIME_REGISTRY.mark(rec, status="running")
         rcp_kwargs = {"stdin_text": stdin_text} if stdin_text is not None else {}
-        res = run_cli_rcp(driver, cont_argv, run_id=handle.run_id,
+        res = run_cli_rcp(driver, cont_argv, run_id=handle.supervisor_run_id,
                           container_cwd=cont_cwd, timeout=timeout, env=env,
-                          **rcp_kwargs)
-        observed_rc = (res.runtime_status or {}).get("rc")
+                          resource_limits=handle.resource_limits,
+                          owner_run_id=handle.run_id if handle.container_scope == "shared" else "",
+                          owner_token=handle.owner_token if handle.container_scope == "shared" else "",
+                          owner_workspace=handle.to_container_path(handle.run_workspace)
+                          if handle.container_scope == "shared" else "", **rcp_kwargs)
+        rs = res.runtime_status or {}
+        observed_rc = rs.get("rc")
         if res.returncode is None and observed_rc is not None:
             res.returncode = int(observed_rc)
-        status = ("oom" if res.oom_killed else "timeout" if res.timed_out else "finished")
-        res.runtime_status = _RUNTIME_REGISTRY.finish(
+        status = rs.get("status") or ("oom" if res.oom_killed else "output_limit" if res.output_limit else "disk_limit" if res.disk_limit else "timeout" if res.timed_out else "finished")
+        res.runtime_status = {**rs, **_RUNTIME_REGISTRY.finish(
             rec, status=status, rc=observed_rc,
             timed_out=res.timed_out, oom_killed=res.oom_killed,
-            error=(res.raw_stderr or "").strip()[:300])
+            error=(res.raw_stderr or "").strip()[:300])}
         return res
     return _DockerExecBackend.run(driver, argv, handle=handle, cwd=cwd,
                                   timeout=timeout, env=env, stdin_text=stdin_text)
@@ -1056,6 +1622,9 @@ def run_cli_streaming_container(
     if handle.mode == "rcp":
         from muteki.solver.control_client import run_cli_streaming_rcp
         cont_argv = _containerize_argv(driver.name, argv)
+        check_process_launch(
+            cont_argv, cwd=cont_cwd, env=env, stdin_text=stdin_text,
+            source="container-stream")
         tag = uuid.uuid4().hex[:12]
         rec = _RUNTIME_REGISTRY.create(handle=handle, tag=tag, driver=driver.name,
                                        cwd=cont_cwd, argv=cont_argv)
@@ -1073,20 +1642,24 @@ def run_cli_streaming_container(
         if on_stdin_uncertain is not None:
             rcp_kwargs["on_stdin_uncertain"] = on_stdin_uncertain
         res = run_cli_streaming_rcp(
-            driver, cont_argv, run_id=handle.run_id,
+            driver, cont_argv, run_id=handle.supervisor_run_id,
             container_cwd=cont_cwd, timeout=timeout, on_step=on_step, env=env,
+            owner_run_id=handle.run_id if handle.container_scope == "shared" else "",
+            owner_token=handle.owner_token if handle.container_scope == "shared" else "",
+            owner_workspace=handle.to_container_path(handle.run_workspace)
+            if handle.container_scope == "shared" else "",
             cancel_event=cancel_event, on_proc=_on_proc,
             on_start_uncertain=on_start_uncertain, steer_event=steer_event,
-            paused_event=paused_event,
+            paused_event=paused_event, resource_limits=handle.resource_limits,
             **rcp_kwargs)
         rs = res.runtime_status or {}
         if res.returncode is None and rs.get("rc") is not None:
             res.returncode = int(rs["rc"])
-        res.runtime_status = _RUNTIME_REGISTRY.finish(
+        res.runtime_status = {**rs, **_RUNTIME_REGISTRY.finish(
             rec, status=rs.get("status", "finished"), rc=rs.get("rc"),
             timed_out=res.timed_out, oom_killed=res.oom_killed,
             cancelled=res.cancelled, steered=res.steered,
-            error=(res.raw_stderr or "").strip()[:300])
+            error=(res.raw_stderr or "").strip()[:300])}
         return res
     return _DockerExecBackend.run_streaming(
         driver, argv, handle=handle, cwd=cwd, timeout=timeout, on_step=on_step,
@@ -1181,7 +1754,7 @@ class _DockerExecBackend:
                     continue
                 if k.startswith((
                     "MUTEKI_", "ANTHROPIC_", "CLAUDE_", "CODEX_", "CURSOR_", "OPENAI_",
-                    "PI_", "KIMI_", "GROK_", "XAI_", "OPENCODE_", "DEEPSEEK_", "DSH_", "XDG_"
+                    "PI_", "KIMI_", "GROK_", "XAI_", "OPENCODE_", "DEEPSEEK_", "XDG_"
                 )):
                     cmd += ["-e", f"{k}={v}"]
         cmd.append(handle.container)
@@ -1247,7 +1820,10 @@ class _DockerExecBackend:
                 rec, status="timeout", timed_out=True, error="host timeout")
             return res
         res = driver.parse(proc.stdout or "", proc.stderr or "")
-        res.returncode = proc.returncode
+        finalize_cli_result(
+            res, driver_name=driver.name,
+            stdout=proc.stdout or "", stderr=proc.stderr or "",
+            returncode=proc.returncode)
         if proc.returncode == 137:
             oom_after = _oom_kill_count(handle.container)
             if (oom_before is not None and oom_after is not None
@@ -1429,7 +2005,7 @@ class _DockerExecBackend:
                 with open(_dbg, "w") as _f:
                     # Prompts, argv, stdout and stderr may contain an exact
                     # materialised operator secret. This low-level layer does not
-                    # own the redaction values, so debug diagnostics are metadata
+                    # own the runtime credentials, so debug diagnostics are metadata
                     # only—never attempt heuristic partial logging.
                     _f.write(
                         f"argv0={os.path.basename(str(full[0])) if full else ''}\n"
@@ -1440,12 +2016,15 @@ class _DockerExecBackend:
                         f"stderr_present={bool(stderr.strip())}\n")
             except Exception:
                 pass
-        res = driver.parse("".join(out_lines), stderr or "")
-        res.returncode = rc
+        stdout = "".join(out_lines)
+        res = driver.parse(stdout, stderr or "")
         res.timed_out = timed_out
         res.oom_killed = oom_killed
         res.cancelled = cancelled
         res.steered = steered
+        finalize_cli_result(
+            res, driver_name=driver.name, stdout=stdout,
+            stderr=stderr or "", returncode=rc)
         res.elapsed_s = elapsed
         if oom_killed:
             status = "oom"

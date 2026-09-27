@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import re
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Optional
@@ -23,11 +22,10 @@ from muteki.control import (
     ControlScope,
     EffectReceipt,
     EffectState,
-    IdempotencyConflict,
     RunControlState,
     WorkerRef,
 )
-from muteki.control.secrets import SecretStore, SecretStoreError
+from muteki.control.secrets import SecretStore
 from muteki.core.events import control_command_payload
 
 
@@ -35,209 +33,8 @@ _RESERVED_BODY_KEYS = {
     "action", "target", "scope", "payload", "command_id",
     "expected_generation", "deadline_at",
 }
-_SENSITIVE_KEY = re.compile(
-    r"(?:password|passwd|token|secret|credential|api[_-]?key|private[_-]?key|"
-    r"密码|凭证|令牌|密钥)",
-    re.IGNORECASE,
-)
-_SENSITIVE_TEXT = re.compile(
-    r"(?:\b(?:password|passwd|token|secret|credential|api[ _-]?key|private[ _-]?key)"
-    r"\b|密码|凭证|令牌|密钥)\s*(?::|=|is\s+|是\s*)?\S+",
-    re.IGNORECASE,
-)
-_URL_USERINFO = re.compile(r"^[a-z][a-z0-9+.-]*://[^/@\s]+:[^/@\s]+@", re.IGNORECASE)
-
-
 class ControlPayloadError(ValueError):
     """A clean client error while compiling a wire request."""
-
-
-class _RetrySecretStore:
-    """Reuse refs by canonical payload path, independent of JSON key order."""
-
-    def __init__(self, base: SecretStore, command: ControlCommand) -> None:
-        self.base = base
-        self.command_id = command.command_id
-        self.refs_by_path: dict[tuple[str, ...], str] = {}
-
-        def _walk(value: Any, path: tuple[str, ...] = ()) -> None:
-            if isinstance(value, Mapping):
-                for key, child in value.items():
-                    skey = str(key)
-                    if not path and skey in {"secret_refs", "redacted"}:
-                        continue
-                    _walk(child, (*path, skey))
-            elif isinstance(value, list):
-                for index, child in enumerate(value):
-                    _walk(child, (*path, str(index)))
-            elif isinstance(value, str) and value.startswith("secret://"):
-                self.refs_by_path[path] = value
-
-        _walk(command.payload)
-
-    def put(self, value: str) -> str:
-        # Compatibility for callers without a path. A retry with multiple secret
-        # fields is intentionally rejected rather than positionally guessing.
-        if len(self.refs_by_path) != 1:
-            raise IdempotencyConflict(
-                f"command_id {self.command_id!r} was reused with different secret fields")
-        return self._reuse(value, next(iter(self.refs_by_path.values())))
-
-    def put_for_path(self, value: str, path: tuple[str, ...]) -> str:
-        reference = self.refs_by_path.get(tuple(path))
-        if not reference:
-            raise IdempotencyConflict(
-                f"command_id {self.command_id!r} was reused with different secret fields")
-        return self._reuse(value, reference)
-
-    def _reuse(self, value: str, reference: str) -> str:
-        try:
-            prior = self.base.resolve(reference)
-        except Exception as exc:
-            raise IdempotencyConflict(
-                f"command_id {self.command_id!r} references unavailable secret material") from exc
-        if prior != value:
-            raise IdempotencyConflict(
-                f"command_id {self.command_id!r} was reused with different content")
-        return reference
-
-    def get(self, reference: str) -> Any:
-        return self.base.get(reference)
-
-
-class _StagedSecretStore:
-    """Roll back newly-created secret files if command validation fails.
-
-    SecretStore publication is intentionally atomic, but compiling a command is a
-    larger transaction: Pydantic/CAS fields are validated after payload traversal.
-    Without this small staging owner, an invalid command could leave unreachable
-    secret files behind even though no journal command existed.
-    """
-
-    def __init__(self, base: SecretStore) -> None:
-        self.base = base
-        self.created: list[str] = []
-
-    def put(self, value: str) -> str:
-        reference = self.base.put(value)
-        self.created.append(reference)
-        return reference
-
-    def put_for_path(self, value: str, _path: tuple[str, ...]) -> str:
-        return self.put(value)
-
-    def get(self, reference: str) -> Any:
-        return self.base.get(reference)
-
-    def rollback(self) -> None:
-        for reference in reversed(self.created):
-            try:
-                self.base.delete(reference)
-            except SecretStoreError:
-                pass
-        self.created.clear()
-
-
-def _looks_sensitive_text(value: str) -> bool:
-    return bool(_SENSITIVE_TEXT.search(value))
-
-
-def _put_secret(secrets: Any, value: str, path: tuple[str, ...]) -> str:
-    by_path = getattr(secrets, "put_for_path", None)
-    if callable(by_path):
-        return str(by_path(value, path))
-    return str(secrets.put(value))
-
-
-def _validate_secret_reference(secrets: Any, reference: str) -> str:
-    getter = getattr(secrets, "get", None)
-    if not callable(getter):
-        base = getattr(secrets, "base", None)
-        getter = getattr(base, "get", None)
-    if not callable(getter):
-        raise ControlPayloadError("secret reference store is unavailable")
-    try:
-        metadata = getter(reference)
-    except SecretStoreError as exc:
-        raise ControlPayloadError("unknown or invalid secret reference") from exc
-    canonical = str(getattr(metadata, "reference", reference) or reference)
-    if canonical != reference:
-        raise ControlPayloadError("non-canonical secret reference")
-    return canonical
-
-
-def _redact_value(value: Any, *, key: str, secrets: SecretStore,
-                  references: list[str], path: tuple[str, ...] = ()) -> Any:
-    if isinstance(value, Mapping):
-        return {
-            str(k): _redact_value(v, key=str(k), secrets=secrets,
-                                  references=references,
-                                  path=(*path, str(k)))
-            for k, v in value.items()
-        }
-    if isinstance(value, list):
-        return [
-            _redact_value(v, key=key, secrets=secrets, references=references,
-                          path=(*path, str(index)))
-            for index, v in enumerate(value)
-        ]
-    if not isinstance(value, str):
-        return value
-    if value.startswith("secret://"):
-        reference = _validate_secret_reference(secrets, value)
-        references.append(reference)
-        return reference
-    sensitive = (
-        bool(_SENSITIVE_KEY.search(key))
-        or _looks_sensitive_text(value)
-        or bool(_URL_USERINFO.search(value))
-    )
-    if not sensitive:
-        return value
-    reference = _put_secret(secrets, value, path)
-    references.append(reference)
-    return reference
-
-
-def secure_payload(payload: Mapping[str, Any], *, secrets: SecretStore,
-                   force_text_secret: bool = False) -> dict[str, Any]:
-    """Replace operator secrets with run-local opaque references before journaling.
-
-    The original value exists only inside ``SecretStore``.  The returned mapping is
-    safe to place in SQLite and event payloads.
-    """
-    references: list[str] = []
-    secured: dict[str, Any] = {}
-    for key, value in payload.items():
-        skey = str(key)
-        if skey == "context" and isinstance(value, Mapping):
-            context = dict(value)
-            content = context.get("content")
-            if (str(context.get("kind") or "").lower() == "secret_ref"
-                    and isinstance(content, str)
-                    and content and not content.startswith("secret://")):
-                reference = _put_secret(secrets, content, (skey, "content"))
-                references.append(reference)
-                context["content"] = reference
-            secured[skey] = _redact_value(
-                context, key=skey, secrets=secrets, references=references,
-                path=(skey,))
-            continue
-        if (force_text_secret and skey in {"text", "hint", "answer"}
-                and isinstance(value, str) and value
-                and not value.startswith("secret://")):
-            reference = _put_secret(secrets, value, (skey,))
-            references.append(reference)
-            secured[skey] = reference
-        else:
-            secured[skey] = _redact_value(
-                value, key=skey, secrets=secrets, references=references,
-                path=(skey,))
-    if references:
-        # Semantic payload hashes must not depend on object insertion order.
-        secured["secret_refs"] = sorted(set(references))
-        secured["redacted"] = True
-    return secured
 
 
 def compile_control_command(
@@ -273,40 +70,23 @@ def compile_control_command(
     except (TypeError, ValueError) as exc:
         raise ControlPayloadError(str(exc)) from exc
 
-    staged: Optional[_StagedSecretStore] = None
-    secret_writer: Any
-    if existing_command is not None:
-        secret_writer = _RetrySecretStore(secrets, existing_command)
-    else:
-        staged = _StagedSecretStore(secrets)
-        secret_writer = staged
-    try:
-        secured = secure_payload(
-            payload,
-            secrets=secret_writer,
-            force_text_secret=action is ControlAction.ANSWER_DECISION,
-        )
-        values: dict[str, Any] = {
-            "run_id": run_id,
-            "action": action,
-            "scope": scope,
-            "payload": secured,
-        }
-        if body.get("command_id") is not None:
-            values["command_id"] = body.get("command_id")
-        if body.get("expected_generation") is not None:
-            values["expected_generation"] = body.get("expected_generation")
-        if body.get("deadline_at") is not None:
-            values["deadline_at"] = body.get("deadline_at")
-        return ControlCommand.model_validate(values)
-    except Exception:
-        if staged is not None:
-            staged.rollback()
-        raise
+    values: dict[str, Any] = {
+        "run_id": run_id,
+        "action": action,
+        "scope": scope,
+        "payload": payload,
+    }
+    if body.get("command_id") is not None:
+        values["command_id"] = body.get("command_id")
+    if body.get("expected_generation") is not None:
+        values["expected_generation"] = body.get("expected_generation")
+    if body.get("deadline_at") is not None:
+        values["deadline_at"] = body.get("deadline_at")
+    return ControlCommand.model_validate(values)
 
 
 def safe_hitl_echo(command: ControlCommand, *, status: str) -> dict[str, Any]:
-    """Small, non-secret operator echo for the conversation event stream."""
+    """Return the complete operator command to the conversation event stream."""
     payload = command.payload
     result: dict[str, Any] = {
         "target": command.scope.as_legacy_target(),
@@ -317,18 +97,12 @@ def safe_hitl_echo(command: ControlCommand, *, status: str) -> dict[str, Any]:
     request_id = payload.get("request_id")
     if request_id:
         result["request_id"] = str(request_id)
-    if payload.get("redacted"):
-        result["text"] = "[redacted operator secret]"
-        refs = payload.get("secret_refs") or []
-        if refs:
-            result["secret_ref"] = str(refs[0])
-    else:
-        text = payload.get("text") or payload.get("hint")
-        if text:
-            result["text"] = str(text)[:2000]
-        url = payload.get("url") or payload.get("target_url")
-        if url:
-            result["url"] = str(url)[:2000]
+    text = payload.get("text") or payload.get("hint") or payload.get("answer")
+    if text:
+        result["text"] = str(text)
+    url = payload.get("url") or payload.get("target_url")
+    if url:
+        result["url"] = str(url)
     return result
 
 
@@ -369,8 +143,6 @@ def effect_event_payload(command: ControlCommand,
     request_id = (receipt.metadata.get("request_id")
                   or command.payload.get("request_id"))
     detail = str(receipt.detail or "")
-    if command.payload.get("redacted") or _looks_sensitive_text(detail):
-        detail = "[redacted control detail]"
     return control_command_payload(
         command.command_id,
         command.action.value,
@@ -389,10 +161,7 @@ def effect_event_payload(command: ControlCommand,
 
 
 def safe_receipt_detail(command: ControlCommand, detail: Any) -> str:
-    value = str(detail or "")
-    if command.payload.get("redacted") or _looks_sensitive_text(value):
-        return "[redacted control detail]"
-    return value[:32768]
+    return str(detail or "")
 
 
 def materialize_runtime_secrets(value: Any, *, secrets: SecretStore) -> Any:
@@ -447,6 +216,8 @@ class QueueControlPort:
         *,
         inbox: "asyncio.Queue[dict[str, Any]]",
         is_live: Callable[[], bool],
+        ready: Optional[asyncio.Event] = None,
+        worker_ready: Optional[asyncio.Event] = None,
         ack_timeout: float = 2.0,
         claim_timeout: Optional[float] = None,
         standby_actions: Sequence[str] = (),
@@ -454,6 +225,8 @@ class QueueControlPort:
     ) -> None:
         self.inbox = inbox
         self.is_live = is_live
+        self.ready = ready
+        self.worker_ready = worker_ready
         self.ack_timeout = max(0.01, float(ack_timeout))
         self.claim_timeout = max(
             self.ack_timeout,
@@ -492,6 +265,33 @@ class QueueControlPort:
                 detail="no live coordinator accepted the command",
                 target_ids=[],
             )
+
+        # RunManager publishes the Python driver task before the Swarm has started
+        # its queue consumers.  Waiting on explicit readiness keeps startup-time
+        # commands ordered and prevents the ordinary two-second ACK budget from
+        # expiring while no consumer can possibly claim them.  Run termination is
+        # deliberately exempt so STOP can still cancel a driver stuck in setup.
+        termination_actions = {
+            ControlAction.STOP,
+            ControlAction.COMPLETE,
+            ControlAction.FORCE_CANCEL,
+        }
+        readiness = self.ready
+        if command.action in {
+            ControlAction.SPAWN_WORKER,
+            ControlAction.CANCEL_WORKER,
+        }:
+            readiness = self.worker_ready or readiness
+        if (readiness is not None and not readiness.is_set()
+                and command.action not in termination_actions):
+            await readiness.wait()
+            if not self.is_live():
+                return ApplyResult(
+                    state=EffectState.UNKNOWN,
+                    detail="run ended before the coordinator control consumer became ready",
+                    target_ids=[],
+                    metadata={"code": "control_consumer_unavailable"},
+                )
 
         loop = asyncio.get_running_loop()
         acknowledgement: "asyncio.Future[Any]" = loop.create_future()

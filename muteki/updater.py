@@ -452,14 +452,22 @@ class UpdateManager:
         source = project_root()
         env_file = source / ".env"
         source_sessions = source / "sessions"
+        source_state = source / "state"
         default_data = self.root / "data"
+        sessions_root = str(existing.get("sessions_root") or (
+            source_sessions if source_sessions.is_dir() else default_data / "sessions"
+        ))
+        state_root = str(existing.get("state_root") or (
+            source_state if source_state.is_dir() else default_data / "state"
+        ))
         return {
             "schema_version": INSTALL_SCHEMA,
             "channel": str(existing.get("channel") or "stable"),
             "deployment": str(os.environ.get("MUTEKI_DEPLOYMENT_MODE") or existing.get("deployment") or "local"),
             "data_root": str(existing.get("data_root") or (source_sessions.parent if source_sessions.is_dir() else default_data)),
-            "sessions_root": str(existing.get("sessions_root") or (source_sessions if source_sessions.is_dir() else default_data / "sessions")),
-            "control_root": str(existing.get("control_root") or default_data / "coordinator-control"),
+            "sessions_root": sessions_root,
+            "state_root": state_root,
+            "control_root": str(existing.get("control_root") or Path(state_root) / "control"),
             "env_file": str(existing.get("env_file") or (env_file if env_file.is_file() else self.root / "config" / ".env")),
             "installed_at": str(existing.get("installed_at") or _now()),
             **existing,
@@ -539,6 +547,7 @@ class UpdateManager:
                         "release": release_meta,
                     })
                     Path(metadata["sessions_root"]).mkdir(parents=True, exist_ok=True)
+                    Path(metadata["state_root"]).mkdir(parents=True, exist_ok=True)
                     Path(metadata["control_root"]).mkdir(parents=True, exist_ok=True)
                     Path(metadata["env_file"]).parent.mkdir(parents=True, exist_ok=True)
                     _atomic_json(self.metadata_path, metadata)
@@ -685,6 +694,7 @@ def apply_managed_environment(install_root: Path | None = None) -> dict[str, Any
     mappings = {
         "MUTEKI_ENV_FILE": "env_file",
         "MUTEKI_SESSIONS_ROOT": "sessions_root",
+        "MUTEKI_STATE_ROOT": "state_root",
         "MUTEKI_COORDINATOR_CONTROL_ROOT": "control_root",
     }
     for environment_name, key in mappings.items():

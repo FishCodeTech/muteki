@@ -1,11 +1,13 @@
 package main
 
 import (
-	"bufio"
+	"errors"
 	"io"
 	"log"
+	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,10 +22,12 @@ import (
 // pgid. This is strictly cleaner than the old `pkill -f <tag>` cmdline-sentinel
 // hack, which only worked because the host couldn't reach the in-container tree.
 type worker struct {
-	id   string
-	tag  string
-	cmd  *exec.Cmd
-	pgid int
+	id         string
+	ownerRunID string
+	ownerToken string
+	tag        string
+	cmd        *exec.Cmd
+	pgid       int
 
 	mu            sync.Mutex
 	paused        bool
@@ -32,6 +36,8 @@ type worker struct {
 	signalled     int
 	timedOut      bool
 	oom           bool
+	outputLimit   bool
+	diskLimit     bool
 	killRequested bool
 }
 
@@ -167,6 +173,15 @@ func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oo
 		}
 	}
 
+	diskLimitBytes := resolveByteLimit(spec.DiskLimitBytes, "MUTEKI_WORKER_DISK_LIMIT", defaultDiskLimitBytes)
+	budgetRoot := spec.Cwd
+	if budgetRoot == "" {
+		budgetRoot, _ = os.Getwd()
+	}
+	cwdBaseline := dirSizeBytes(budgetRoot)
+	if diskLimitBytes > 0 && cwdBaseline < 0 {
+		return nil, nil, &startErr{"cannot measure worker directory"}
+	}
 	oomObservation := oomTracker.begin()
 	if err := reaper.start(cmd); err != nil {
 		oomTracker.cancel(oomObservation)
@@ -179,23 +194,80 @@ func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oo
 		return nil, nil, err
 	}
 	pgid, _ := syscall.Getpgid(cmd.Process.Pid)
-	w := &worker{id: id, tag: spec.Tag, cmd: cmd, pgid: pgid}
+	w := &worker{id: id, ownerRunID: spec.OwnerRunID, ownerToken: spec.OwnerToken, tag: spec.Tag, cmd: cmd, pgid: pgid}
 
 	events := make(chan Frame, 256)
 	var streamWG sync.WaitGroup
 	streamWG.Add(2)
-	pump := func(r *bufio.Scanner, t string) {
+	outputLimitBytes := resolveByteLimit(spec.OutputLimitBytes, "MUTEKI_WORKER_OUTPUT_LIMIT", defaultOutputLimitBytes)
+	var streamBytes sync.Mutex
+	var totalStreamBytes int64
+	// Bounded byte streaming replaces bufio.Scanner (4 MiB max-token): long
+	// JSONL tool lines must not fail silently, and total capture stays capped.
+	pump := func(r io.Reader, t string) {
 		defer streamWG.Done()
-		// Large buffer: CLI JSON lines (full tool outputs) can be long.
-		r.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-		for r.Scan() {
-			events <- Frame{T: t, Line: r.Text()}
+		buf := make([]byte, 64*1024)
+		var pending []byte
+		for {
+			n, readErr := r.Read(buf)
+			if n > 0 {
+				chunk := buf[:n]
+				streamBytes.Lock()
+				remaining := outputLimitBytes - totalStreamBytes
+				over := int64(n) > remaining
+				if over {
+					if remaining < 0 {
+						remaining = 0
+					}
+					chunk = chunk[:int(remaining)]
+				}
+				totalStreamBytes += int64(len(chunk))
+				streamBytes.Unlock()
+				searchStart := len(pending)
+				pending = append(pending, chunk...)
+				for {
+					idx := indexByte(pending[searchStart:], '\n')
+					if idx < 0 {
+						break
+					}
+					idx += searchStart
+					searchStart = 0
+					line := pending[:idx]
+					pending = pending[idx+1:]
+					events <- Frame{T: t, Line: string(line)}
+				}
+				if over {
+					if len(pending) > 0 {
+						events <- Frame{T: t, Line: string(pending)}
+					}
+					w.mu.Lock()
+					w.outputLimit = true
+					w.killRequested = true
+					w.mu.Unlock()
+					_ = w.signalTree(syscall.SIGKILL)
+					return
+				}
+				// Cap pending incomplete line so a single huge line cannot grow forever.
+				if int64(len(pending)) > outputLimitBytes && outputLimitBytes > 0 {
+					w.mu.Lock()
+					w.outputLimit = true
+					w.killRequested = true
+					w.mu.Unlock()
+					_ = w.signalTree(syscall.SIGKILL)
+					return
+				}
+			}
+			if readErr != nil {
+				if len(pending) > 0 {
+					events <- Frame{T: t, Line: string(pending)}
+					pending = nil
+				}
+				return
+			}
 		}
 	}
-	so := bufio.NewScanner(stdout)
-	se := bufio.NewScanner(stderr)
-	go pump(so, "out")
-	go pump(se, "err")
+	go pump(stdout, "out")
+	go pump(stderr, "err")
 
 	var stdinWG sync.WaitGroup
 	if stdinPipe != nil {
@@ -236,11 +308,13 @@ func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oo
 	// (w.paused), the clock does NOT advance, so a long HITL pause can't trip the
 	// timeout and mislabel a deliberately paused worker as timed_out. A polling
 	// goroutine (vs a fixed AfterFunc) so it can discount paused intervals.
+	// Same loop also enforces workdir growth budget (#170).
 	timerDone := make(chan struct{})
 	go func() {
 		budget := time.Duration(maxInt(1, spec.TimeoutSec)) * time.Second
 		var active time.Duration // wall-clock spent NOT paused
 		const tick = 200 * time.Millisecond
+		var diskTicks int
 		last := time.Now()
 		ticker := time.NewTicker(tick)
 		defer ticker.Stop()
@@ -251,11 +325,27 @@ func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oo
 			case now := <-ticker.C:
 				w.mu.Lock()
 				paused := w.paused
+				alreadyLimited := w.outputLimit || w.diskLimit
 				w.mu.Unlock()
 				if !paused {
 					active += now.Sub(last)
 				}
 				last = now
+				if alreadyLimited {
+					return
+				}
+				diskTicks++
+				if diskLimitBytes > 0 && cwdBaseline >= 0 && diskTicks%10 == 0 {
+					cur := dirSizeBytes(budgetRoot)
+					if cur >= 0 && cur-cwdBaseline > diskLimitBytes {
+						w.mu.Lock()
+						w.diskLimit = true
+						w.killRequested = true
+						w.mu.Unlock()
+						_ = w.signalTree(syscall.SIGKILL)
+						return
+					}
+				}
 				if active >= budget {
 					// Publish the supervisor-authored KILL cause before delivering the
 					// signal. The child can exit and Cmd.Wait can return immediately;
@@ -282,16 +372,30 @@ func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oo
 		streamWG.Wait()
 		err := reaper.wait(cmd)
 		close(timerDone)
+		// Fast writers may finish before the periodic monitor's first tick.
+		if cur := dirSizeBytes(budgetRoot); diskLimitBytes > 0 && cur >= 0 && cur-cwdBaseline > diskLimitBytes {
+			w.mu.Lock()
+			w.diskLimit = true
+			w.mu.Unlock()
+		}
 		rc, sig := exitInfo(err)
 
 		w.mu.Lock()
 		timedOutRequested := w.timedOut
 		killRequested := w.killRequested
+		outputLimitHit := w.outputLimit
+		diskLimitHit := w.diskLimit
 		w.mu.Unlock()
 		oomEvidence := oomTracker.finish(oomObservation)
 		oom := oomEvidence.attributable(sig, timedOutRequested, killRequested)
 		if oomEvidence.delta > 0 && !oom {
 			log.Printf("runtime-agent: observed container oom_kill delta=%d for worker %s but attribution was ambiguous or contradicted by the exit cause", oomEvidence.delta, id)
+		}
+		// Supervisors that killed for output/disk keep those typed causes; OOM still
+		// wins when the kernel also claimed the tree (cgroup evidence attributable).
+		if oom {
+			outputLimitHit = false
+			diskLimitHit = false
 		}
 
 		w.mu.Lock()
@@ -299,11 +403,16 @@ func startWorkerWithRuntime(id string, spec *WorkerSpec, reaper *childReaper, oo
 		w.rc = rc
 		w.signalled = sig
 		w.oom = oom
-		timedOut := w.timedOut && !oom
+		w.outputLimit = outputLimitHit
+		w.diskLimit = diskLimitHit
+		timedOut := w.timedOut && !oom && !outputLimitHit && !diskLimitHit
 		w.timedOut = timedOut
 		w.mu.Unlock()
 
-		events <- Frame{T: "exit", Rc: rc, OOM: oom, TimedOut: timedOut, Signalled: sig}
+		events <- Frame{
+			T: "exit", Rc: rc, OOM: oom, TimedOut: timedOut,
+			OutputLimit: outputLimitHit, DiskLimit: diskLimitHit, Signalled: sig,
+		}
 		close(events)
 	}()
 
@@ -369,6 +478,10 @@ func (w *worker) status() (state string, rc *int, paused, oom, timedOut bool) {
 	switch {
 	case w.oom:
 		state = "oom"
+	case w.outputLimit:
+		state = "output_limit"
+	case w.diskLimit:
+		state = "disk_limit"
 	case w.timedOut:
 		state = "timed_out"
 	default:
@@ -422,6 +535,110 @@ func readOOMKill() int {
 		}
 	}
 	return -1
+}
+
+// default stream / workdir budgets when the host omits override and env is unset.
+// Intentionally not TSec's 64MiB/256MiB/4GiB product numbers (#170).
+const (
+	defaultOutputLimitBytes int64 = 64 * 1024 * 1024       // 64 MiB combined stdout+stderr
+	defaultDiskLimitBytes   int64 = 4 * 1024 * 1024 * 1024 // 4 GiB workdir growth
+)
+
+func indexByte(b []byte, c byte) int {
+	for i, v := range b {
+		if v == c {
+			return i
+		}
+	}
+	return -1
+}
+
+// resolveByteLimit prefers an explicit StartWorker value, then a docker-style
+// MUTEKI_WORKER_* env (e.g. "64m"), then the built-in default.
+func resolveByteLimit(explicit int64, envKey string, fallback int64) int64 {
+	if explicit > 0 {
+		return explicit
+	}
+	raw := strings.TrimSpace(os.Getenv(envKey))
+	if raw == "" {
+		return fallback
+	}
+	if n, ok := parseDockerSize(raw); ok && n > 0 {
+		return n
+	}
+	return fallback
+}
+
+func parseDockerSize(raw string) (int64, bool) {
+	s := strings.TrimSpace(strings.ToLower(raw))
+	if s == "" {
+		return 0, false
+	}
+	mult := int64(1)
+	switch {
+	case strings.HasSuffix(s, "kib") || strings.HasSuffix(s, "ki"):
+		mult = 1024
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "kib"), "ki")
+	case strings.HasSuffix(s, "mib") || strings.HasSuffix(s, "mi"):
+		mult = 1024 * 1024
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "mib"), "mi")
+	case strings.HasSuffix(s, "gib") || strings.HasSuffix(s, "gi"):
+		mult = 1024 * 1024 * 1024
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "gib"), "gi")
+	case strings.HasSuffix(s, "tib") || strings.HasSuffix(s, "ti"):
+		mult = 1024 * 1024 * 1024 * 1024
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "tib"), "ti")
+	case strings.HasSuffix(s, "kb") || strings.HasSuffix(s, "k"):
+		mult = 1024
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "kb"), "k")
+	case strings.HasSuffix(s, "mb") || strings.HasSuffix(s, "m"):
+		mult = 1024 * 1024
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "mb"), "m")
+	case strings.HasSuffix(s, "gb") || strings.HasSuffix(s, "g"):
+		mult = 1024 * 1024 * 1024
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "gb"), "g")
+	case strings.HasSuffix(s, "tb") || strings.HasSuffix(s, "t"):
+		mult = 1024 * 1024 * 1024 * 1024
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "tb"), "t")
+	case strings.HasSuffix(s, "b"):
+		s = strings.TrimSuffix(s, "b")
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, false
+	}
+	// Accept integers only for simplicity (host already normalizes).
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n <= 0 || n > math.MaxInt64/mult {
+		return 0, false
+	}
+	return n * mult, true
+}
+
+// dirSizeBytes walks a directory tree and sums regular file sizes. Returns -1
+// on error so a transient walk failure never falsely trips the disk budget.
+func dirSizeBytes(root string) int64 {
+	if root == "" {
+		return -1
+	}
+	var total int64
+	err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			if errors.Is(walkErr, os.ErrNotExist) {
+				return nil
+			}
+			return walkErr
+		}
+		if info == nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		total += info.Size()
+		return nil
+	})
+	if err != nil {
+		return -1
+	}
+	return total
 }
 
 func maxInt(a, b int) int {

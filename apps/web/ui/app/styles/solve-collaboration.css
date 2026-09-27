@@ -1,0 +1,1963 @@
+/* Registered lengths so open/close can interpolate 0px ↔ Npx. Animating the
+   variables (not grid-template-columns itself) avoids browsers getting stuck
+   when a custom property inside a transitioning grid track changes. */
+@property --collab-index-w {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+@property --collab-detail-w {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+
+.collab-shell {
+  --collab-index-open-w: 286px;
+  --collab-detail-open-w: 372px;
+  --collab-index-w: 0px;
+  --collab-detail-w: 0px;
+  /* Drawers keep a fixed panel width and slide via transform; grid tracks
+     only reserve layout space so the canvas does not jump under squashed content. */
+  --collab-index-panel-w: var(--collab-index-open-w);
+  --collab-detail-panel-w: var(--collab-detail-open-w);
+  --collab-toolbar-h: 50px;
+  --collab-drawer-ease: cubic-bezier(.22, .8, .28, 1);
+  --collab-drawer-ms: .24s;
+  position: relative;
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: var(--collab-index-w) minmax(0, 1fr) var(--collab-detail-w);
+  grid-template-rows: var(--collab-toolbar-h) minmax(0, 1fr);
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  transition:
+    --collab-index-w var(--collab-drawer-ms) var(--collab-drawer-ease),
+    --collab-detail-w var(--collab-drawer-ms) var(--collab-drawer-ease);
+}
+.collab-shell.index-open { --collab-index-w: var(--collab-index-open-w); }
+.collab-shell.detail-open { --collab-detail-w: var(--collab-detail-open-w); }
+/* One focus style for the whole panel: toolbar, index rows, tabs, nodes and
+   canvas controls all draw the same 2px ring. --focus-ring is raised to the
+   accent inside the panel so the ring reads at 3:1 against the dot grid. */
+.collab-shell { --focus-ring: var(--accent); }
+.collab-shell :is(button, [role="button"], [role="tab"], .react-flow__node):focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; box-shadow: none; }
+/* Closed drawers keep fading for the full duration, then drop out of the
+   hit-test and accessibility trees. Visibility is delayed on close only. */
+.collab-index,
+.collab-inspector {
+  opacity: 1;
+  visibility: visible;
+}
+.collab-shell:not(.index-open) .collab-index,
+.collab-shell:not(.detail-open) .collab-inspector {
+  visibility: hidden;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity calc(var(--collab-drawer-ms) - var(--control-feedback-dur)) var(--ease-out), transform var(--collab-drawer-ms) var(--collab-drawer-ease), visibility 0s linear var(--collab-drawer-ms);
+}
+.collab-shell:not(.index-open) .collab-index { transform: translateX(calc(-100% - 12px)); }
+.collab-shell:not(.detail-open) .collab-inspector { transform: translateX(calc(100% + 12px)); }
+.collab-shell.sidebar-resizing {
+  transition: none;
+}
+.collab-shell.sidebar-resizing .collab-index,
+.collab-shell.sidebar-resizing .collab-inspector {
+  transition: none;
+}
+.collab-toolbar {
+  /* Full-width control strip above canvas and both drawers. */
+  grid-column: 1 / -1;
+  grid-row: 1;
+  z-index: 20;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 11px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  scrollbar-width: none;
+  /* Container breakpoints below fold the view group into the "more" menu by the
+     toolbar's own width, so a narrow runtime panel in a wide window is handled. */
+  container: collab-toolbar / inline-size;
+}
+.collab-toolbar::-webkit-scrollbar { display: none; }
+.collab-toolbar-search {
+  flex: 1 1 200px;
+  min-width: 160px;
+  max-width: 260px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 7px 0 10px;
+  color: var(--muted);
+  border: 1px solid var(--line2);
+  border-radius: 9px;
+  background: var(--panel2);
+}
+.collab-toolbar-search:focus-within { color: var(--text); border-color: var(--focus-ring); }
+.collab-toolbar-search > .input { min-width: 0; width: 100%; height: 30px; padding: 0; border: 0; background: transparent; box-shadow: none; }
+.collab-toolbar-search input { min-width: 0; width: 100%; height: 30px; padding: 0; border: 0; outline: 0; color: var(--text); background: transparent; font-size: 11.5px; }
+.collab-toolbar-search > button { width: 24px; min-width: 24px; height: 24px; min-height: 24px; padding: 0; color: var(--muted); }
+.collab-search-hits {
+  flex: none;
+  color: var(--muted);
+  font: 600 var(--fs-label)/1 var(--font-mono);
+  white-space: nowrap;
+}
+.collab-scope {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 34px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel2);
+}
+.collab-scope button,
+.collab-tool {
+  width: auto;
+  min-width: 0;
+  height: 28px;
+  min-height: 28px;
+  padding: 0 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 10.5px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+/* Override HeroUI Button primary/secondary fills so export + view tools share one neutral chrome. */
+.collab-tool {
+  flex: none;
+  height: 34px;
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--muted);
+  background: var(--panel2);
+  box-shadow: none;
+  transform: none;
+  will-change: auto;
+}
+/* HeroUI `.button svg` adds 3.5px block margins and negative inline margins that
+   push the glyph off-centre inside a 34px square; Popover triggers are not
+   `.button`s but share the same chrome, so both get a hard reset here. */
+.collab-tool svg,
+.collab-icon-tool svg {
+  width: auto;
+  height: auto;
+  margin: 0;
+  flex: none;
+}
+.collab-tool.icon-only {
+  width: 34px;
+  min-width: 34px;
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+}
+.collab-tool.icon-only .collab-tool-label,
+.collab-tool.icon-only .collab-tool-caret { display: none; }
+.collab-tool-caret { display: inline-flex; flex: none; align-items: center; }
+.collab-icon-tool { display: inline-flex; flex: none; align-items: center; }
+.collab-tool:active,
+.collab-tool[data-pressed="true"] { transform: none; }
+.collab-scope button:hover,
+.collab-tool:hover,
+.collab-tool[data-hovered],
+.collab-tool[data-pressed] { color: var(--text); background: var(--panel3); }
+/* Filters in effect use the accent; panel toggles (below) use a neutral fill. */
+.collab-scope button.on,
+.collab-tool.on,
+.collab-tool[aria-pressed="true"] {
+  color: var(--blue);
+  border-color: color-mix(in srgb, var(--blue) 35%, var(--line));
+  background: color-mix(in srgb, var(--blue) 8%, var(--panel));
+}
+.collab-tool.danger,
+.collab-tool.danger.on { color: var(--red); border-color: color-mix(in srgb, var(--red) 40%, var(--line)); background: color-mix(in srgb, var(--red) 8%, var(--panel)); }
+.collab-tool-badge { min-width: 17px; padding: 1px 4px; border-radius: 8px; color: var(--panel); background: var(--blue); font: 700 var(--fs-meta)/1.2 var(--font-mono); text-align: center; }
+.collab-tool.danger .collab-tool-badge { background: var(--red); }
+.collab-toolbar-divider { flex: none; width: 1px; height: 22px; margin: 0 2px; background: var(--line); }
+.collab-panel-toggle-index { flex: none; }
+.collab-toolbar-panels { flex: none; margin-left: auto; display: inline-flex; gap: 5px; }
+.collab-panel-toggle[aria-pressed="true"] { color: var(--text); border-color: var(--line2); background: var(--panel3); }
+.collab-panel-toggle[aria-pressed="true"]:hover { color: var(--bright); }
+.collab-toolbar-more { display: none; }
+.collab-relation-menu { width: 226px; padding: 5px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); box-shadow: var(--shadow-pop); }
+.collab-relation-menu [role="dialog"] { display: grid; gap: 2px; }
+/* Neutralize HeroUI Button primary fill so default items stay readable on the dark popover. */
+.collab-relation-menu button { width: 100%; min-height: 34px; display: grid; grid-template-columns: 24px minmax(0, 1fr) 16px; align-items: center; gap: 8px; padding: 0 9px; border: 0; border-radius: 7px; color: var(--muted); background: transparent; box-shadow: none; text-align: left; }
+.collab-relation-menu button:hover,
+.collab-relation-menu button:focus-visible,
+.collab-relation-menu button[data-hovered],
+.collab-relation-menu button[data-pressed],
+.collab-relation-menu button.on { color: var(--text); background: var(--panel2); }
+.collab-relation-menu button > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.collab-relation-menu .collab-relation-reset { margin-top: 3px; border-top: 1px solid var(--line); border-radius: 0 0 7px 7px; color: var(--blue); }
+.collab-relation-menu .collab-relation-reset > svg:first-child { justify-self: center; }
+.collab-more-menu { width: 210px; }
+.collab-more-menu button { grid-template-columns: 16px minmax(0, 1fr) 16px; }
+.collab-more-menu button > svg:first-child { justify-self: center; }
+.collab-export-menu { width: 200px; }
+.collab-export-menu button { grid-template-columns: 16px minmax(0, 1fr); }
+.collab-toolbar-tip {
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: var(--shadow-pop);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+.collab-context-anchor {
+  position: fixed;
+  z-index: 50;
+  width: 1px;
+  height: 1px;
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  opacity: 0;
+}
+.collab-context-menu {
+  width: 226px;
+  padding: 5px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  box-shadow: var(--shadow-pop);
+}
+.collab-context-menu [role="menu"] { display: grid; gap: 2px; }
+.collab-context-menu [role="menuitem"] {
+  width: 100%;
+  min-height: 34px;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 0 9px;
+  border-radius: 7px;
+  color: var(--muted);
+  text-align: left;
+}
+.collab-context-menu [role="menuitem"]:hover { color: var(--text); background: var(--panel2); }
+.collab-context-menu [role="menuitem"].danger { color: var(--red); }
+.collab-context-menu [role="menuitem"].danger:hover { color: var(--red); background: color-mix(in srgb, var(--red) 8%, var(--panel2)); }
+/* Line sample shared by the relation menu and the legend; stroke rules live with the edges below. */
+.collab-relation-swatch { flex: none; display: block; overflow: visible; }
+.collab-relation-swatch line { fill: none; }
+.collab-mobile-tabs { display: none; }
+.collab-index {
+  grid-column: 1;
+  grid-row: 2;
+  /* Absolute drawer over a spacer column: the column reserves layout space
+     while grid row 2 already places the panel below the full-width toolbar. */
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 12;
+  width: var(--collab-index-panel-w);
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-right: 1px solid var(--line);
+  background: var(--panel);
+  transform: translateX(0);
+  transition:
+    opacity calc(var(--collab-drawer-ms, var(--control-feedback-dur)) - .04s) var(--ease-out), transform var(--collab-drawer-ms, var(--control-press-dur)) var(--collab-drawer-ease, var(--ease-smooth-out)), visibility 0s;
+}
+.collab-panel-head {
+  flex: none;
+  min-height: 45px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel2);
+}
+.collab-panel-head > span { min-width: 0; display: inline-flex; align-items: center; gap: 7px; }
+.collab-panel-head strong { color: var(--bright); font-size: 11.5px; }
+/* Shown only in the overlay container band (901–1100cqi). */
+.collab-panel-close {
+  display: none;
+  flex: none;
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  color: var(--muted);
+  background: transparent;
+}
+.collab-panel-close:hover { color: var(--text); background: var(--panel3); }
+.collab-panel-head > b,
+.collab-index-section h2 > b {
+  min-width: 21px;
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--muted);
+  background: var(--panel);
+  font: 700 var(--fs-meta)/1.2 var(--font-mono);
+  text-align: center;
+}
+.collab-index-section { min-height: 0; display: flex; flex-direction: column; }
+/* The queue takes its content height up to a cap; empty, it is just its heading
+   with the hint inline, and the knowledge list gets everything else. */
+.collab-index-section.queue { flex: 0 0 auto; max-height: 38%; border-bottom: 1px solid var(--line); }
+.collab-index-section.queue.empty { max-height: none; }
+.collab-index-section.knowledge { flex: 1 1 0; }
+.collab-index-section h2 {
+  flex: none;
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0;
+  padding: 7px 12px 5px;
+  color: var(--muted);
+  font-size: var(--fs-label);
+  font-weight: 760;
+  letter-spacing: var(--ls-label);
+  text-transform: uppercase;
+}
+.collab-index-section h2 > small { flex: 1 1 auto; min-width: 0; overflow: hidden; color: var(--muted); font-size: var(--fs-label); font-weight: 500; letter-spacing: 0; text-align: right; text-overflow: ellipsis; text-transform: none; white-space: nowrap; }
+.collab-queue-spawn {
+  margin-left: auto;
+  height: 24px;
+  min-height: 24px;
+  padding: 0 7px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  background: var(--panel);
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0;
+  text-transform: none;
+  white-space: nowrap;
+}
+.collab-queue-spawn:hover { color: var(--text); background: var(--panel2); }
+.collab-queue-list,
+.collab-index-list,
+.collab-inspector-list,
+.collab-activity-list { min-height: 0; overflow: auto; scrollbar-gutter: stable; }
+.collab-queue-list { padding: 0 7px 8px; }
+.collab-index-list { flex: 1; padding: 0 7px 10px; }
+.collab-kind-chips {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 0 12px 8px;
+}
+.collab-inspector-body .collab-kind-chips { padding: 0 0 10px; }
+.collab-kind-chip {
+  cursor: pointer;
+  max-width: 100%;
+}
+.collab-kind-chip.on { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--blue) 45%, var(--line)); }
+.collab-index-more {
+  appearance: none;
+  width: 100%;
+  margin: 4px 0 0;
+  padding: 8px 9px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  background: transparent;
+  font: 600 var(--fs-label)/1.4 inherit;
+  cursor: pointer;
+}
+.collab-index-more:hover { color: var(--text); background: var(--panel2); }
+/* Index rows are plain buttons (not the heroui Button): they wrap, clamp to two
+   lines and grow with their content, so the reset lives here rather than in
+   the .ai-conv-shell scope the panel sits outside of. */
+.collab-queue-row,
+.collab-knowledge-row,
+.collab-relation-row {
+  appearance: none;
+  width: 100%;
+  min-width: 0;
+  height: auto;
+  min-height: 0;
+  margin: 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--text);
+  background: transparent;
+  font: inherit;
+  line-height: 1.4;
+  text-align: left;
+  white-space: normal;
+  cursor: pointer;
+}
+.collab-queue-row {
+  display: grid;
+  gap: 4px;
+  padding: 8px 9px;
+}
+.collab-queue-row:hover { border-color: var(--line); background: var(--panel2); }
+.collab-queue-row.selected { border-color: color-mix(in srgb, var(--blue) 35%, var(--line)); background: color-mix(in srgb, var(--blue) 8%, var(--panel2)); }
+.collab-queue-row > span { display: flex; align-items: center; gap: 5px; color: var(--blue); font-size: var(--fs-label); font-weight: 700; letter-spacing: .03em; text-transform: uppercase; }
+.collab-queue-row > strong { overflow: hidden; color: var(--text); font-size: var(--fs-caption); line-height: 1.4; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.collab-queue-row > small { overflow: hidden; color: var(--muted); font: var(--fs-meta)/1.3 var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
+.collab-queue-row time,
+.collab-knowledge-copy time { font: inherit; font-variant-numeric: tabular-nums; }
+.collab-index-empty,
+.collab-section-empty {
+  padding: 18px 12px;
+  color: var(--muted);
+  font-size: var(--fs-caption);
+  line-height: 1.5;
+  text-align: center;
+}
+.collab-index-empty {
+  display: grid;
+  justify-items: center;
+  gap: 4px;
+}
+.collab-index-empty > strong { color: var(--text); font-weight: 700; }
+.collab-index-empty > span { color: var(--muted); }
+.collab-knowledge-row {
+  min-height: 60px;
+  display: grid;
+  grid-template-columns: 27px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  padding: 7px 8px;
+  content-visibility: auto;
+  contain-intrinsic-size: 0 60px;
+}
+.collab-knowledge-row:hover { border-color: var(--line); background: var(--panel2); }
+.collab-knowledge-row.selected { border-color: color-mix(in srgb, var(--blue) 35%, var(--line)); background: color-mix(in srgb, var(--blue) 8%, var(--panel2)); }
+.collab-knowledge-row.fresh,
+.collab-activity-row.fresh {
+  animation: collab-fresh-fade 1.2s ease forwards;
+}
+@keyframes collab-fresh-fade {
+  from { background: color-mix(in srgb, var(--blue) 14%, transparent); }
+  to { background: transparent; }
+}
+.collab-feed-new {
+  flex: none;
+  width: calc(100% - 24px);
+  margin: 0 12px 6px;
+  padding: 6px 8px;
+  border: 1px solid color-mix(in srgb, var(--blue) 35%, var(--line));
+  border-radius: 8px;
+  color: var(--blue);
+  background: color-mix(in srgb, var(--blue) 8%, var(--panel));
+  font: 650 var(--fs-label)/1.3 inherit;
+  cursor: pointer;
+}
+.collab-feed-new:hover { background: color-mix(in srgb, var(--blue) 14%, var(--panel)); }
+.collab-inspector-body:has(.collab-activity-feed) { display: flex; flex-direction: column; }
+.collab-activity-feed { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.collab-activity-feed .collab-activity-list { flex: 1; min-height: 0; overflow: auto; }
+.collab-knowledge-icon {
+  width: 27px;
+  height: 27px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--muted);
+  background: var(--panel2);
+}
+.collab-knowledge-row.tone-success .collab-knowledge-icon { color: var(--green); border-color: color-mix(in srgb, var(--green) 32%, var(--line)); background: color-mix(in srgb, var(--green) 7%, var(--panel)); }
+.collab-knowledge-row.tone-warning .collab-knowledge-icon { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 35%, var(--line)); background: color-mix(in srgb, var(--amber) 7%, var(--panel)); }
+.collab-knowledge-row.tone-danger .collab-knowledge-icon { color: var(--red); border-color: color-mix(in srgb, var(--red) 35%, var(--line)); background: color-mix(in srgb, var(--red) 7%, var(--panel)); }
+.collab-knowledge-row.tone-accent .collab-knowledge-icon { color: var(--blue); border-color: color-mix(in srgb, var(--blue) 35%, var(--line)); background: color-mix(in srgb, var(--blue) 7%, var(--panel)); }
+/* Retired / muted knowledge: the icon and label grey out, the title stays legible. */
+.collab-knowledge-row.tone-muted .collab-knowledge-icon { color: var(--dim); border-style: dashed; background: transparent; }
+.collab-knowledge-row.tone-muted .collab-knowledge-copy > span b,
+.collab-knowledge-row.tone-muted .collab-knowledge-copy > strong { color: var(--muted); }
+.collab-knowledge-copy { min-width: 0; display: grid; gap: 2px; }
+.collab-knowledge-copy > span { min-width: 0; display: flex; align-items: center; gap: 5px; }
+.collab-knowledge-copy > span b { color: var(--muted); font-size: var(--fs-label); font-weight: 760; letter-spacing: .05em; text-transform: uppercase; }
+.collab-knowledge-copy > span small { min-width: 0; overflow: hidden; color: var(--muted); font: var(--fs-meta)/1 var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
+.collab-knowledge-copy > strong { overflow: hidden; color: var(--text); font-size: var(--fs-caption); font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.collab-knowledge-copy mark,
+.collab-agent-title mark,
+.collab-coordinator-identity strong mark {
+  color: inherit;
+  background: color-mix(in srgb, var(--amber) 36%, transparent);
+  padding: 0 1px;
+  border-radius: 2px;
+}
+.collab-knowledge-copy > small { overflow: hidden; color: var(--muted); font-size: var(--fs-label); text-overflow: ellipsis; white-space: nowrap; }
+.collab-knowledge-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 26px;
+  align-items: center;
+  gap: 2px;
+}
+.collab-knowledge-flag-copy {
+  appearance: none;
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+.collab-knowledge-flag-copy:hover { color: var(--blue); background: var(--panel2); }
+.collab-knowledge-flag-copy.copied { color: var(--green); }
+.collab-canvas {
+  grid-column: 2;
+  grid-row: 2;
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg2);
+}
+.collab-canvas .react-flow { width: 100%; height: 100%; }
+.collab-canvas.flow-view .react-flow { visibility: hidden; pointer-events: none; }
+.collab-canvas .react-flow__pane { cursor: grab; }
+.collab-canvas .react-flow__pane.dragging { cursor: grabbing; }
+/* Node size comes from LAYOUT via the node's width/height; height:auto lets
+   an expanded card grow without the old 148px lock. */
+.collab-canvas .react-flow__node { width: auto; height: auto; border: 0; border-radius: 13px; background: transparent; }
+/* Sits outside the card's own 2px selection outline (offset 2px) so both stay visible. */
+.collab-canvas .react-flow__node:focus-visible { outline-offset: 5px; }
+.collab-canvas .react-flow__node.selected { box-shadow: none; }
+/* Mini map (size from MINIMAP in lib/agentCollaborationLayout.ts) stacked above its toggle. */
+.collab-canvas .react-flow__minimap {
+  margin-bottom: 51px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  box-shadow: var(--shadow-md);
+}
+.collab-minimap-toggle button,
+.collab-canvas-zoom button {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  background: var(--panel);
+  cursor: pointer;
+}
+.collab-minimap-toggle button { box-shadow: var(--shadow-md); }
+.collab-minimap-toggle button:hover,
+.collab-canvas-zoom button:hover { color: var(--bright); background: var(--panel2); }
+.collab-minimap-toggle button.on { color: var(--blue); border-color: color-mix(in srgb, var(--blue) 35%, var(--line)); }
+/* AgentTrail-style summary card: one neutral surface, with engine colour kept
+   on the small agent mark and status colour kept on the status dot. */
+.collab-agent-node {
+  --card-alpha: 1;
+  position: relative;
+  width: 100%;
+  height: 100%;
+  color: var(--text);
+  opacity: var(--card-alpha);
+  transition: opacity var(--control-feedback-dur) var(--ease-out), filter var(--control-feedback-dur) var(--ease-out);
+}
+.collab-agent-card {
+  position: relative;
+  width: 100%;
+  height: 164px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--line2);
+  border-radius: 12px;
+  color: var(--text);
+  background: var(--panel);
+  box-shadow: 0 2px 10px color-mix(in srgb, var(--shadow-color) 7%, transparent);
+  transition: border-color var(--control-feedback-dur) var(--ease-out), background-color var(--control-feedback-dur) var(--ease-out);
+}
+.collab-agent-card:hover { border-color: var(--muted); background: color-mix(in srgb, var(--panel2) 72%, var(--panel)); }
+/* Compact (zoom below ZOOM.compact): same fixed box, rebuilt as a filled
+   identity tile — large mark + title + status — so body-less cards do not
+   leave a tall empty lower half. Expansion state stays in the canvas and
+   returns on zoom-in. */
+.collab-agent-node.compact .collab-agent-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-rows: auto auto;
+  align-content: center;
+  align-items: center;
+  column-gap: 14px;
+  row-gap: 6px;
+  padding: 20px 22px;
+}
+.collab-agent-node.compact .collab-agent-head { display: contents; }
+.collab-agent-node.compact .collab-agent-kicker {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  align-self: center;
+  gap: 0;
+  overflow: visible;
+  color: inherit;
+  font: inherit;
+  letter-spacing: normal;
+  text-transform: none;
+}
+.collab-agent-node.compact .collab-agent-kicker > b,
+.collab-agent-node.compact .collab-agent-kicker > span:not(.collab-agent-avatar) { display: none; }
+.collab-agent-node.compact .collab-agent-avatar {
+  width: 56px;
+  height: 56px;
+  border-radius: 12px;
+  font-size: 18px;
+}
+.collab-agent-node.compact .collab-agent-avatar .engine-logo {
+  width: 28px;
+  height: 28px;
+}
+.collab-agent-node.compact .collab-agent-title {
+  grid-column: 2;
+  grid-row: 1;
+  align-self: end;
+  padding: 0;
+  font-size: 22px;
+  line-height: 1.15;
+}
+.collab-agent-node.compact .collab-agent-state {
+  grid-column: 2;
+  grid-row: 2;
+  align-self: start;
+  max-width: none;
+  gap: 7px;
+  font-size: 15px;
+}
+.collab-agent-node.compact .collab-agent-state i { width: 11px; height: 11px; }
+.collab-coordinator-card.compact {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto;
+  align-content: center;
+  align-items: center;
+  column-gap: 14px;
+  padding: 20px 22px;
+}
+.collab-coordinator-card.compact .collab-coordinator-head {
+  display: contents;
+  border-bottom: 0;
+}
+.collab-coordinator-card.compact .collab-coordinator-avatar {
+  grid-column: 1;
+  width: 56px;
+  height: 56px;
+  border-radius: 12px;
+}
+.collab-coordinator-card.compact .collab-coordinator-avatar svg { width: 26px; height: 26px; }
+.collab-coordinator-card.compact .collab-coordinator-identity {
+  grid-column: 2;
+  min-width: 0;
+  gap: 4px;
+}
+.collab-coordinator-card.compact .collab-coordinator-identity strong {
+  padding: 0;
+  font-size: 22px;
+  line-height: 1.15;
+}
+.collab-coordinator-card.compact .collab-coordinator-identity small { display: none; }
+.collab-coordinator-card.compact .collab-agent-state {
+  grid-column: 3;
+  max-width: none;
+  gap: 7px;
+  font-size: 15px;
+}
+.collab-coordinator-card.compact .collab-agent-state i { width: 11px; height: 11px; }
+/* A fresh event (lastEventAt moved): one glow in the card's own colour, then a
+   slightly stronger border until the recency window closes. */
+.collab-agent-node.recent .collab-agent-state i { animation: collab-recent 1.4s ease-out 1; }
+@keyframes collab-recent {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 55%, transparent); }
+  70% { box-shadow: 0 0 0 9px color-mix(in srgb, currentColor 0%, transparent); }
+}
+.collab-agent-node.entering,
+.collab-coordinator-card.entering { animation: collab-agent-enter .42s ease-out 1; }
+@keyframes collab-agent-enter { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+.collab-agent-node.exiting,
+.collab-coordinator-card.exiting { animation: collab-agent-exit .55s ease-out 1; }
+@keyframes collab-agent-exit { from { opacity: .7; } to { opacity: 1; } }
+.collab-agent-node.status-stalled .collab-agent-card,
+.collab-agent-node.status-error .collab-agent-card { border-color: color-mix(in srgb, var(--red) 65%, var(--line)); }
+.collab-agent-node.status-paused .collab-agent-card,
+.collab-agent-node.status-idle .collab-agent-card { border-color: color-mix(in srgb, var(--amber) 55%, var(--line)); }
+.collab-agent-node.status-solved .collab-agent-card { border-color: color-mix(in srgb, var(--green) 52%, var(--line)); }
+.collab-agent-node.status-offline .collab-agent-avatar { filter: saturate(.3); border-color: var(--line2); color: var(--muted); background: var(--panel2); }
+.collab-agent-node.status-offline .collab-agent-kicker,
+.collab-agent-node.status-offline .collab-agent-state { color: var(--muted); }
+/* Selection: an outline in the neutral --selection ink, so it never competes
+   with the status border colours or the agent's engine hue. */
+.collab-agent-node.selected .collab-agent-card,
+.collab-coordinator-card.selected { border-color: var(--selection); border-width: 1.5px; }
+/* Selected-edge endpoints: ink matches .collab-relation-route (handoff/dispatch blue). */
+.collab-agent-node.relation-endpoint .collab-agent-card,
+.collab-coordinator-card.relation-endpoint { border-color: var(--blue); border-width: 1.5px; }
+.collab-agent-node.relation-endpoint.relation-review .collab-agent-card,
+.collab-coordinator-card.relation-endpoint.relation-review { border-color: var(--violet); }
+.collab-agent-node.relation-endpoint.relation-verify .collab-agent-card,
+.collab-coordinator-card.relation-endpoint.relation-verify { border-color: var(--green); }
+.collab-agent-node.relation-endpoint.relation-report .collab-agent-card,
+.collab-coordinator-card.relation-endpoint.relation-report { border-color: var(--amber); }
+.collab-agent-node.relation-endpoint.relation-directive .collab-agent-card,
+.collab-coordinator-card.relation-endpoint.relation-directive { border-color: var(--magenta); }
+.collab-agent-node.relation-endpoint.relation-lock .collab-agent-card,
+.collab-coordinator-card.relation-endpoint.relation-lock { border-color: var(--red); }
+/* Search miss or unrelated to the selected agent — written last so it wins over
+   every status / role rule and the same fade applies to online and exited cards. */
+.collab-agent-node.dimmed,
+.collab-coordinator-card.dimmed { --card-alpha: .26; filter: grayscale(.7); }
+/* Floating edges anchor to the node rectangle, not a handle, so the handles are
+   invisible attachment points rather than visible dots. */
+.collab-canvas .react-flow__handle { width: 1px; height: 1px; min-width: 0; min-height: 0; border: 0; background: transparent; opacity: 0; }
+/* Coordinator keeps the same neutral card language and differs through its
+   network mark and dispatch metrics. */
+.collab-coordinator-card {
+  --card-alpha: 1;
+  position: relative;
+  width: 100%;
+  height: 180px;
+  display: grid;
+  grid-template-rows: 50px 1fr 32px;
+  overflow: hidden;
+  border: 1px solid var(--line2);
+  border-radius: 12px;
+  color: var(--text);
+  background: var(--panel);
+  box-shadow: 0 2px 10px color-mix(in srgb, var(--shadow-color) 7%, transparent);
+  opacity: var(--card-alpha);
+  transition: opacity var(--control-feedback-dur) var(--ease-out), filter var(--control-feedback-dur) var(--ease-out), border-color var(--control-feedback-dur) var(--ease-out), background-color var(--control-feedback-dur) var(--ease-out);
+}
+.collab-coordinator-card:hover { border-color: var(--muted); background: color-mix(in srgb, var(--panel2) 72%, var(--panel)); }
+.collab-coordinator-card.status-solved { border-color: color-mix(in srgb, var(--green) 52%, var(--line)); }
+.collab-coordinator-card.status-error { border-color: color-mix(in srgb, var(--red) 65%, var(--line)); }
+.collab-coordinator-card.status-paused { border-color: color-mix(in srgb, var(--amber) 55%, var(--line)); }
+.collab-coordinator-head { min-width: 0; display: grid; grid-template-columns: 26px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 9px 14px 6px; border-bottom: 1px solid var(--line); }
+.collab-coordinator-head:has(.collab-agent-badges) { grid-template-columns: 26px minmax(0, 1fr) auto auto; }
+.collab-coordinator-avatar { width: 24px; height: 24px; display: grid; place-items: center; border: 1px solid color-mix(in srgb, var(--blue) 45%, var(--line)); border-radius: 7px; color: var(--blue); background: transparent; }
+.collab-coordinator-identity { min-width: 0; display: grid; gap: 1px; }
+.collab-coordinator-identity strong { overflow: hidden; color: var(--bright); font-size: 12.5px; font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }
+.collab-coordinator-identity small { overflow: hidden; color: var(--muted); font-size: var(--fs-label); text-overflow: ellipsis; white-space: nowrap; }
+.collab-coordinator-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: center; align-content: center; gap: 4px; padding: 8px 12px; }
+.collab-coordinator-metrics span { min-width: 0; display: grid; justify-items: center; gap: 3px; padding: 5px 2px; border-radius: 7px; background: color-mix(in srgb, var(--panel2) 70%, transparent); }
+.collab-coordinator-metrics b { color: var(--bright); font: 800 14px/1 var(--font-mono); font-variant-numeric: tabular-nums; }
+.collab-coordinator-metrics b.zero { color: var(--muted); font-weight: 600; opacity: .55; }
+.collab-coordinator-metrics small { color: var(--muted); font-size: var(--fs-label); text-align: center; white-space: nowrap; }
+.collab-coordinator-foot { min-width: 0; display: flex; align-items: center; gap: 8px; padding: 5px 12px 7px; color: var(--muted); font: var(--fs-label)/1 var(--font-mono); border-top: 1px solid color-mix(in srgb, var(--line) 70%, transparent); }
+.collab-coordinator-activity { min-width: 0; display: inline-flex; align-items: center; gap: 5px; color: var(--muted); }
+.collab-coordinator-activity span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.collab-coordinator-foot time { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+/* Generation grouping box (all-executions view): a labelled background frame
+   behind one generation's worker band. */
+.collab-group {
+  width: 100%;
+  height: 100%;
+  border: 1px dashed color-mix(in srgb, var(--muted) 42%, var(--line));
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--panel) 40%, transparent);
+}
+.collab-group-label {
+  position: absolute;
+  top: 7px;
+  left: 14px;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  background: var(--panel);
+  font: 700 var(--fs-meta)/1.3 var(--font-mono);
+  letter-spacing: .03em;
+  white-space: nowrap;
+}
+.collab-canvas .react-flow__node-group { border: 0; background: transparent; }
+/* Wide, quiet head borrowed from AgentTrail: metadata first, then one clear title. */
+.collab-agent-head { min-width: 0; min-height: 31px; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 8px; padding: 8px 14px 2px; }
+.collab-agent-kicker { min-width: 0; display: flex; align-items: center; gap: 5px; overflow: hidden; color: var(--muted); font: 700 9.5px/1.2 var(--font-mono); letter-spacing: .045em; text-transform: uppercase; white-space: nowrap; }
+.collab-agent-kicker > b { color: var(--muted); font-weight: 700; }
+.collab-agent-kicker > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.collab-agent-badges { display: inline-flex; align-items: center; gap: 4px; }
+.collab-agent-badge { max-width: 92px; min-height: 18px; display: inline-flex; align-items: center; gap: 3px; padding: 1px 5px; border: 1px solid color-mix(in srgb, var(--amber) 40%, var(--line)); border-radius: 5px; color: var(--amber); background: transparent; font: 700 var(--fs-meta)/1.2 var(--font-mono); }
+.collab-agent-badge.danger { color: var(--red); border-color: color-mix(in srgb, var(--red) 42%, var(--line)); background: transparent; }
+.collab-agent-badge b { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.collab-agent-node.compact .collab-agent-badges,
+.collab-coordinator-card.compact .collab-agent-badges { display: none; }
+.collab-agent-avatar,
+.collab-inspector-avatar { width: 20px; height: 20px; display: grid; place-items: center; flex: none; border: 1px solid color-mix(in srgb, var(--agent-color) 50%, var(--line)); border-radius: 6px; color: var(--agent-color); background: transparent; font-size: 8px; font-weight: 800; line-height: 1; }
+.collab-agent-avatar .engine-logo,
+.collab-inspector-avatar .engine-logo { display: block; }
+.collab-inspector-avatar { width: 36px; height: 36px; border-radius: 9px; font-size: 11px; }
+.collab-agent-title { min-width: 0; overflow: hidden; padding: 0 14px; color: var(--bright); font-size: 15px; font-weight: 680; line-height: 25px; text-overflow: ellipsis; white-space: nowrap; }
+.collab-agent-state,
+.collab-inspector-status { min-width: 0; display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: var(--fs-label); font-weight: 650; white-space: nowrap; }
+/* Fixed cap (not a percentage: the head's auto column would resolve it against itself). */
+.collab-agent-state { max-width: 130px; }
+.collab-agent-state > span,
+.collab-inspector-status > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.collab-agent-state i,
+.collab-inspector-status i { flex: none; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.collab-agent-state.state-running-tool,
+.collab-agent-state.state-thinking,
+.collab-agent-state.state-online,
+.collab-inspector-status.state-running-tool,
+.collab-inspector-status.state-thinking,
+.collab-inspector-status.state-online { color: var(--blue); }
+.collab-agent-state.state-paused,
+.collab-agent-state.state-waiting,
+.collab-agent-state.state-idle,
+.collab-inspector-status.state-paused,
+.collab-inspector-status.state-waiting { color: var(--amber); }
+.collab-agent-state.state-stalled,
+.collab-agent-state.state-error,
+.collab-inspector-status.state-stalled,
+.collab-inspector-status.state-error { color: var(--red); }
+.collab-agent-state.state-solved,
+.collab-inspector-status.state-solved { color: var(--green); }
+.collab-agent-state.state-thinking i,
+.collab-agent-state.state-running-tool i,
+.collab-inspector-status.state-thinking i,
+.collab-inspector-status.state-running-tool i { animation: collab-pulse 1.7s ease-in-out infinite; }
+@keyframes collab-pulse { 50% { box-shadow: 0 0 0 4px color-mix(in srgb, currentColor 16%, transparent); } }
+.collab-agent-intent { min-width: 0; min-height: 32px; padding: 1px 14px 4px; }
+.collab-agent-intent span { overflow: hidden; color: var(--text); font-size: 11px; font-weight: 550; line-height: 1.35; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.collab-agent-activity { min-width: 0; min-height: 27px; display: flex; align-items: center; gap: 6px; margin: 0 14px; padding: 5px 0; border-top: 1px solid var(--line); color: var(--muted); font: var(--fs-label)/1.2 var(--font-mono); }
+.collab-agent-activity span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.collab-sparkline {
+  flex: none;
+  margin-left: auto;
+  width: 22px;
+  height: 10px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+.collab-sparkline svg { display: block; }
+.collab-sparkline.partial polyline { stroke-dasharray: 2 1.5; }
+.collab-agent-duration { position: absolute; left: 14px; right: 14px; bottom: 3px; height: 2px; border-radius: 1px; background: color-mix(in srgb, var(--agent-color) 18%, transparent); }
+.collab-agent-duration > i { display: block; height: 100%; width: 100%; border-radius: inherit; background: var(--agent-color); }
+.collab-timeline-ruler {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  border-bottom: 1px solid var(--line);
+}
+.collab-timeline-ruler > span {
+  position: absolute;
+  top: 2px;
+  display: grid;
+  justify-items: center;
+  gap: 3px;
+  color: var(--muted);
+  font: 600 var(--fs-meta)/1 var(--font-mono);
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+.collab-timeline-ruler i { width: 1px; height: 8px; background: var(--line2); }
+.collab-canvas .react-flow__node-ruler { border: 0; background: transparent; }
+.collab-agent-foot { min-width: 0; min-height: 22px; margin-top: auto; display: flex; align-items: center; gap: 10px; padding: 2px 14px 5px; color: var(--muted); font: var(--fs-label)/1 var(--font-mono); }
+.collab-agent-foot > span { display: inline-flex; align-items: center; gap: 2px; }
+.collab-agent-foot .ok { color: var(--green); }
+.collab-agent-foot .warn { color: var(--amber); }
+.collab-agent-foot .bad { color: var(--red); }
+.collab-agent-foot time { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+.collab-agent-expand { width: 100%; min-height: 27px; display: flex; align-items: center; justify-content: space-between; padding: 0 14px; border: 0; border-top: 1px solid var(--line); border-radius: 0; color: var(--muted); background: transparent; font: 700 9px/1 var(--font-mono); letter-spacing: .05em; text-transform: uppercase; cursor: pointer; }
+.collab-agent-expand span { display: inline-flex; align-items: center; gap: 5px; }
+.collab-agent-expand b { color: var(--text); font-weight: 700; }
+.collab-agent-expand:hover { color: var(--text); background: var(--panel2); }
+.collab-agent-node.expanded .collab-agent-expand { color: var(--text); }
+.collab-agent-node.expanded .collab-agent-expand svg { transform: rotate(180deg); }
+.collab-agent-worklist { width: 100%; margin-top: 8px; overflow: hidden; border: 1px solid var(--line2); border-radius: 12px; background: var(--panel); box-shadow: 0 4px 18px color-mix(in srgb, var(--shadow-color) 9%, transparent); }
+.collab-agent-workitem { width: 100%; height: 40px; display: grid; grid-template-columns: 16px minmax(0, 1fr) auto 12px; align-items: center; gap: 8px; padding: 0 12px; border: 0; border-bottom: 1px solid var(--line); color: var(--muted); background: transparent; font: 10.5px/1.25 var(--font-sans); text-align: left; cursor: pointer; }
+.collab-agent-workitem:last-child { border-bottom: 0; }
+.collab-agent-workitem:hover { color: var(--text); background: var(--panel2); }
+.collab-agent-workitem.selected { color: var(--blue); background: color-mix(in srgb, var(--blue) 8%, var(--panel)); }
+.collab-agent-workitem > svg:first-child { color: var(--muted); }
+.collab-agent-workitem.tone-success > svg:first-child { color: var(--green); }
+.collab-agent-workitem.tone-warning > svg:first-child { color: var(--amber); }
+.collab-agent-workitem.tone-danger > svg:first-child { color: var(--red); }
+.collab-agent-workitem.tone-accent > svg:first-child { color: var(--blue); }
+.collab-agent-workitem > span { min-width: 0; overflow: hidden; color: var(--text); text-overflow: ellipsis; white-space: nowrap; }
+.collab-agent-workitem > b { max-width: 108px; overflow: hidden; padding: 2px 6px; border-radius: 5px; color: var(--muted); background: var(--panel2); font: 700 9px/1.2 var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
+.collab-agent-show-all { grid-template-columns: 16px minmax(0, 1fr); color: var(--blue); }
+.collab-agent-show-all > span { color: var(--blue); }
+/* Knowledge-flow matrix (P3-06): source × target grid, kind colours match the edges. */
+.collab-flow {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  overflow: auto;
+  padding: 18px 20px 56px;
+  background: var(--bg2);
+}
+.collab-canvas:has(.collab-run-banner) .collab-flow { padding-top: 40px; }
+.collab-flow-empty {
+  height: 100%;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 8px;
+  color: var(--muted);
+  text-align: center;
+}
+.collab-flow-empty svg { color: var(--muted); }
+.collab-flow-empty strong { color: var(--bright); font-size: 12px; }
+.collab-flow-empty span { font-size: var(--fs-caption); }
+.collab-flow-grid {
+  --flow-label: 92px;
+  --flow-cell: 36px;
+  --flow-total: 44px;
+  display: grid;
+  grid-template-columns: var(--flow-label) repeat(var(--flow-n), minmax(var(--flow-cell), 1fr)) var(--flow-total);
+  grid-auto-rows: minmax(var(--flow-cell), auto);
+  gap: 2px;
+  width: max-content;
+  min-width: 100%;
+}
+.collab-flow-corner,
+.collab-flow-col,
+.collab-flow-row-head,
+.collab-flow-cell.total {
+  color: var(--muted);
+  font-size: var(--fs-label);
+  font-weight: 650;
+}
+.collab-flow-corner,
+.collab-flow-col {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: end;
+  justify-content: center;
+  padding: 4px 2px 8px;
+  background: var(--bg2);
+}
+.collab-flow-corner,
+.collab-flow-row-head {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  background: var(--bg2);
+}
+.collab-flow-corner { z-index: 3; align-items: end; justify-content: start; font-weight: 760; letter-spacing: var(--ls-label); text-transform: uppercase; }
+.collab-flow-col {
+  max-height: 88px;
+  overflow: hidden;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.collab-flow-row-head {
+  display: flex;
+  align-items: center;
+  padding: 0 8px 0 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.collab-flow-cell {
+  --flow-ink: var(--line2);
+  position: relative;
+  min-width: var(--flow-cell);
+  min-height: var(--flow-cell);
+  display: grid;
+  place-items: center;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 4px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--flow-ink) var(--flow-depth, 0%), var(--panel));
+  font: 700 var(--fs-label)/1 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.collab-flow-cell.empty {
+  background: color-mix(in srgb, var(--panel2) 70%, transparent);
+  cursor: default;
+}
+.collab-flow-cell.total,
+.collab-flow-col.total,
+.collab-flow-row-head.total { color: var(--muted); font-weight: 700; cursor: default; background: transparent; }
+.collab-flow-cell.grand { color: var(--bright); }
+.collab-flow-cell.kind-handoff { --flow-ink: var(--blue); }
+.collab-flow-cell.kind-review { --flow-ink: var(--violet); }
+.collab-flow-cell.kind-verify { --flow-ink: var(--green); }
+.collab-flow-cell.selected { outline: 2px solid var(--selection); outline-offset: 1px; }
+.collab-flow-cell:hover:not(.empty):not(.total) { filter: brightness(1.08); }
+.collab-flow-cell > span { position: relative; z-index: 1; }
+.collab-flow-stack {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  height: 3px;
+  pointer-events: none;
+}
+.collab-flow-stack > b { display: block; min-width: 0; }
+.collab-flow-stack > b.kind-handoff { background: var(--blue); }
+.collab-flow-stack > b.kind-review { background: var(--violet); }
+.collab-flow-stack > b.kind-verify { background: var(--green); }
+/* One stroke rule per relation kind, applied to the canvas edge and to the
+   swatch in the legend / relation menu alike. */
+.collab-edge .react-flow__edge-path,
+.collab-relation-swatch line { stroke: var(--line2); stroke-width: 1.35; }
+.collab-edge.relation-handoff .react-flow__edge-path,
+.collab-relation-swatch.relation-handoff line { stroke: var(--blue); stroke-width: 2.1; }
+.collab-edge.relation-model .react-flow__edge-path,
+.collab-relation-swatch.relation-model line { stroke: var(--violet); stroke-width: 1.8; }
+.collab-edge.relation-review .react-flow__edge-path,
+.collab-relation-swatch.relation-review line { stroke: var(--violet); stroke-width: 1.7; stroke-dasharray: 3 5; }
+.collab-edge.relation-verify .react-flow__edge-path,
+.collab-relation-swatch.relation-verify line { stroke: var(--green); stroke-width: 1.9; stroke-dasharray: 7 4; }
+.collab-edge.relation-dispatch .react-flow__edge-path,
+.collab-relation-swatch.relation-dispatch line { stroke: color-mix(in srgb, var(--muted) 52%, var(--line)); }
+.collab-edge.relation-report .react-flow__edge-path,
+.collab-relation-swatch.relation-report line { stroke: var(--amber); stroke-width: 1.9; stroke-dasharray: 1.5 4; stroke-linecap: round; }
+.collab-edge.relation-directive .react-flow__edge-path,
+.collab-relation-swatch.relation-directive line { stroke: var(--magenta); stroke-width: 1.7; }
+.collab-edge.relation-lock .react-flow__edge-path,
+.collab-relation-swatch.relation-lock line { stroke: var(--red); stroke-width: 1.8; stroke-dasharray: 8 3 2 3; }
+/* Fired inside RELATION_RECENT_WINDOW_MS: heavier line and a readable label even when unselected. */
+.collab-edge.recent .react-flow__edge-path { stroke-width: 2.6; }
+.collab-edge.selected .react-flow__edge-path { stroke-width: 3; filter: drop-shadow(0 0 4px color-mix(in srgb, currentColor 32%, transparent)); }
+/* Keyboard focus on an edge: a clear accent glow, distinct from the library's
+   low-contrast #555 focus stroke. Specificity (0,4,0) beats the library rule. */
+.collab-canvas .collab-edge:focus-visible .react-flow__edge-path { stroke-width: 3; filter: drop-shadow(0 0 4px color-mix(in srgb, var(--accent) 45%, transparent)); }
+.collab-canvas .collab-edge:focus-visible .react-flow__edge-textbg { stroke: var(--accent); stroke-width: 1; }
+.collab-edge.dimmed { opacity: .12; }
+/* Labels sit on an opaque panel-coloured plate; the text is full --text so the
+   label reads over the dot grid at every zoom. */
+.collab-edge .react-flow__edge-text { fill: var(--text); }
+.collab-edge.selected .react-flow__edge-text,
+.collab-edge.recent .react-flow__edge-text { fill: var(--bright); }
+.collab-edge .react-flow__edge-textbg { fill: var(--panel); fill-opacity: 1; stroke: var(--line2); stroke-width: .8; }
+.collab-edge .react-flow__edge-textwrapper { transition: opacity var(--control-feedback-dur) var(--ease-out); }
+/* A dispatch label is the same on every worker's edge: hidden until the edge is
+   hovered, focused or selected, unless the relation fired more than once (.multi). */
+.collab-edge.relation-dispatch:not(.multi):not(.selected):not(:hover):not(:focus-visible) .react-flow__edge-textwrapper { opacity: 0; }
+.collab-canvas-empty {
+  position: absolute;
+  z-index: 8;
+  left: 50%;
+  top: 50%;
+  width: min(320px, calc(100% - 32px));
+  transform: translate(-50%, -50%);
+  display: grid;
+  justify-items: center;
+  gap: 7px;
+  padding: 22px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--green);
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  box-shadow: var(--shadow-pop);
+  text-align: center;
+}
+.collab-canvas-empty strong { color: var(--bright); font-size: 12px; }
+.collab-canvas-empty span { color: var(--muted); font-size: var(--fs-caption); }
+/* Coordinator-only canvas: the note sits under the lone card, not over it. */
+.collab-canvas-empty.neutral { top: auto; bottom: 62px; transform: translateX(-50%); color: var(--muted); }
+.collab-canvas-empty ul {
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+  list-style: none;
+  text-align: left;
+}
+.collab-canvas-empty li { color: var(--muted); font-size: var(--fs-caption); }
+.collab-canvas-empty > button {
+  margin-top: 4px;
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  background: var(--panel2);
+  font: 600 var(--fs-label)/1.3 inherit;
+  cursor: pointer;
+}
+.collab-canvas-empty > button:hover { border-color: var(--focus-ring); }
+/* A filter hid every relation kind: a small status strip with the way back. */
+.collab-canvas-notice {
+  position: absolute;
+  z-index: 8;
+  left: 50%;
+  top: 12px;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 7px 5px 10px;
+  border: 1px solid color-mix(in srgb, var(--amber) 40%, var(--line));
+  border-radius: 8px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  box-shadow: var(--shadow-sm);
+  font-size: var(--fs-caption);
+  white-space: nowrap;
+}
+.collab-canvas-notice > svg { color: var(--amber); }
+.collab-canvas-notice > button { min-height: 22px; padding: 0 8px; border: 1px solid var(--line); border-radius: 6px; color: var(--blue); background: var(--panel2); font-size: var(--fs-label); font-weight: 650; cursor: pointer; }
+.collab-canvas-notice > button:hover { background: var(--panel3); }
+/* Finished-run strip at the top of the canvas; the filter notice drops below it. */
+.collab-run-banner {
+  position: absolute;
+  z-index: 8;
+  top: 0;
+  right: 0;
+  left: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 28px;
+  padding: 5px 14px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+  background: color-mix(in srgb, var(--panel) 92%, transparent);
+  box-shadow: var(--shadow-sm);
+  font-size: var(--fs-caption);
+  line-height: 1.4;
+  text-align: center;
+}
+.collab-canvas:has(.collab-run-banner) .collab-canvas-notice { top: 40px; }
+/* Finished-run appearance-order scrubber sits above the zoom bar. */
+.collab-scrubber {
+  position: absolute;
+  z-index: 9;
+  left: 15px;
+  right: 58px;
+  bottom: 56px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas:
+    "play track time"
+    "note note note"
+    "warn warn warn";
+  gap: 4px 8px;
+  align-items: center;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--panel) 93%, transparent);
+  box-shadow: var(--shadow-sm);
+}
+.collab-scrubber-play {
+  grid-area: play;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--panel2);
+}
+.collab-scrubber-play[aria-pressed="true"] { color: var(--blue); background: var(--panel3); }
+.collab-scrubber-track {
+  grid-area: track;
+  position: relative;
+  min-width: 0;
+  padding-top: 8px;
+}
+.collab-scrubber-marks { position: absolute; top: 0; right: 0; left: 0; height: 10px; }
+.collab-scrubber-marks button {
+  position: absolute;
+  top: 0;
+  width: 8px;
+  height: 10px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  transform: translateX(-50%);
+  cursor: pointer;
+}
+.collab-scrubber-marks button::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 3px;
+  width: 2px;
+  height: 8px;
+  border-radius: 1px;
+  background: var(--blue);
+}
+.collab-scrubber-marks button.kind-flag_found::before { background: var(--green); }
+.collab-scrubber-marks button.kind-intent_claimed::before { background: var(--blue); }
+.collab-scrubber-marks button.kind-worker_spawned::before { background: var(--amber); }
+.collab-scrubber-marks button.kind-reason_done::before { background: var(--violet); }
+.collab-scrubber-track input[type="range"] {
+  width: 100%;
+  margin: 0;
+  accent-color: var(--blue);
+}
+.collab-scrubber-time {
+  grid-area: time;
+  color: var(--bright);
+  font: 650 var(--fs-label)/1 var(--font-mono);
+  white-space: nowrap;
+}
+.collab-scrubber-note {
+  grid-area: note;
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--fs-label);
+}
+.collab-scrubber-warn {
+  grid-area: warn;
+  margin: 0;
+  color: var(--amber);
+  font-size: var(--fs-label);
+}
+.collab-canvas-live small {
+  color: var(--muted);
+  font-size: var(--fs-label);
+}
+.collab-canvas:has(.collab-scrubber) .collab-canvas-empty.neutral { bottom: 118px; }
+/* Bottom bar: zoom / fit, live state, counts, relayout, legend — one Panel at
+   bottom-left; the mini map and its toggle own the bottom-right corner. */
+.collab-canvas .collab-canvas-bar {
+  min-height: 31px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 15px;
+  padding: 4px 7px 4px 4px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--panel) 93%, transparent);
+  box-shadow: var(--shadow-sm);
+  font-size: var(--fs-label);
+}
+.collab-canvas-zoom { display: inline-flex; gap: 3px; padding-right: 6px; border-right: 1px solid var(--line); }
+.collab-canvas-zoom button { width: 26px; height: 26px; border-radius: 6px; background: var(--panel2); }
+.collab-canvas-live { display: inline-flex; align-items: center; gap: 5px; padding-right: 7px; border-right: 1px solid var(--line); }
+.collab-canvas-live i { width: 6px; height: 6px; border-radius: 50%; background: var(--line2); }
+.collab-canvas-live i.live { background: var(--green); animation: collab-pulse 1.7s ease-in-out infinite; }
+.collab-canvas-live time { color: var(--muted); font: var(--fs-label)/1 var(--font-mono); }
+.collab-canvas-stat { display: inline-flex; align-items: baseline; gap: 4px; }
+.collab-canvas-stat b { color: var(--bright); font: 750 var(--fs-label)/1 var(--font-mono); }
+.collab-canvas-stat small { color: var(--muted); font-size: var(--fs-label); }
+.collab-presence-toast {
+  min-height: 24px;
+  padding: 0 8px;
+  border: 1px solid color-mix(in srgb, var(--blue) 35%, var(--line));
+  border-radius: 6px;
+  color: var(--blue);
+  background: color-mix(in srgb, var(--blue) 8%, var(--panel));
+  font: 650 var(--fs-label)/1.2 inherit;
+  cursor: pointer;
+}
+.collab-presence-toast:hover { background: color-mix(in srgb, var(--blue) 14%, var(--panel)); }
+.collab-outside-agents {
+  position: absolute;
+  z-index: 9;
+  top: 12px;
+  right: 12px;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid color-mix(in srgb, var(--amber) 40%, var(--line));
+  border-radius: 8px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  box-shadow: var(--shadow-sm);
+  font: 650 var(--fs-caption)/1.3 inherit;
+  cursor: pointer;
+}
+.collab-outside-agents:hover { background: var(--panel2); }
+.collab-canvas:has(.collab-run-banner) .collab-outside-agents { top: 40px; }
+.collab-legend-toggle {
+  min-height: 24px;
+  margin-left: 2px;
+  padding: 0 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  background: var(--panel2);
+  font-size: var(--fs-label);
+  font-weight: 650;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.collab-legend-toggle:hover { color: var(--text); background: var(--panel3); }
+.collab-legend-toggle.on { color: var(--text); border-color: var(--line2); background: var(--panel3); }
+/* Legend pops up above the bar so it never covers the mini map corner. */
+.collab-canvas-legend {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 8px);
+  width: 252px;
+  display: grid;
+  gap: 6px;
+  padding: 10px 11px 11px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--panel) 96%, transparent);
+  box-shadow: var(--shadow-pop);
+  font-size: var(--fs-caption);
+  white-space: normal;
+}
+.collab-canvas-legend h4 { margin: 0; color: var(--muted); font-size: var(--fs-label); font-weight: 760; letter-spacing: var(--ls-label); text-transform: uppercase; }
+.collab-canvas-legend h4 + * { margin-top: -1px; }
+.collab-canvas-legend h4:not(:first-child) { margin-top: 5px; }
+.collab-canvas-legend p { margin: 0; color: var(--muted); font-size: var(--fs-label); line-height: 1.5; }
+.collab-legend-relations { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2px 6px; }
+.collab-legend-relations button {
+  min-width: 0;
+  min-height: 26px;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--muted);
+  background: transparent;
+  font-size: var(--fs-caption);
+  text-align: left;
+  cursor: pointer;
+}
+.collab-legend-relations button > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.collab-legend-relations button:hover { background: var(--panel2); }
+.collab-legend-relations button.on { color: var(--text); }
+/* A hidden kind keeps its swatch but fades, so the legend doubles as the filter state. */
+.collab-legend-relations button:not(.on) { text-decoration: line-through; opacity: .55; }
+.collab-legend-states { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 8px; }
+.collab-legend-states .collab-agent-state { max-width: none; font-weight: 600; }
+.collab-legend-states .collab-agent-state.state-offline { color: var(--muted); }
+.collab-legend-states .collab-agent-state.state-thinking i { animation: none; }
+.collab-canvas-bar > .collab-relayout {
+  margin-left: 2px;
+  min-height: 22px;
+  padding: 0 7px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid color-mix(in srgb, var(--amber) 40%, var(--line));
+  border-radius: 6px;
+  color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 8%, var(--panel));
+  font-size: var(--fs-label);
+  font-weight: 650;
+  white-space: nowrap;
+}
+.collab-canvas-bar > .collab-relayout:hover { color: var(--text); background: color-mix(in srgb, var(--amber) 16%, var(--panel)); }
+.collab-inspector {
+  grid-column: 3;
+  grid-row: 2;
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  z-index: 12;
+  width: var(--collab-detail-panel-w);
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-left: 1px solid var(--line);
+  background: var(--panel);
+  transform: translateX(0);
+  transition:
+    opacity calc(var(--collab-drawer-ms, var(--control-feedback-dur)) - .04s) var(--ease-out), transform var(--collab-drawer-ms, var(--control-press-dur)) var(--collab-drawer-ease, var(--ease-smooth-out)), visibility 0s;
+}
+.collab-inspector-head {
+  --agent-color: var(--blue);
+  flex: none;
+  min-height: 62px;
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel2);
+}
+.collab-inspector-head:focus,
+.collab-relation-head:focus,
+.collab-canvas:focus { outline: none; }
+.collab-inspector-head:focus-visible,
+.collab-relation-head:focus-visible,
+.collab-canvas:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.collab-inspector-avatar { width: 36px; height: 36px; border-radius: 9px; font-size: 11px; }
+.collab-inspector-head > span:nth-child(2) { min-width: 0; display: grid; gap: 2px; }
+.collab-inspector-head strong { overflow: hidden; color: var(--bright); font-size: 12.5px; text-overflow: ellipsis; white-space: nowrap; }
+.collab-inspector-head small { overflow: hidden; color: var(--muted); font-size: var(--fs-label); text-overflow: ellipsis; white-space: nowrap; }
+.collab-inspector-scope {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--amber) 40%, var(--line));
+  color: var(--text);
+  background: color-mix(in srgb, var(--amber) 8%, var(--panel));
+  font-size: var(--fs-caption);
+}
+.collab-inspector-scope > svg { flex: none; color: var(--amber); }
+.collab-inspector-scope > span { min-width: 0; flex: 1; }
+.collab-inspector-scope > button {
+  flex: none;
+  min-height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--blue);
+  background: var(--panel2);
+  font-size: var(--fs-label);
+  font-weight: 650;
+  cursor: pointer;
+}
+.collab-inspector-scope > button:hover { background: var(--panel3); }
+.collab-inspector-status { padding: 3px 7px; border: 1px solid color-mix(in srgb, currentColor 28%, var(--line)); border-radius: 6px; }
+.collab-inspector-tabs { flex: none; height: 38px; display: grid; grid-template-columns: repeat(auto-fit, minmax(0, 1fr)); gap: 2px; padding: 4px 7px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.collab-inspector-tabs button { width: 100%; min-width: 0; min-height: 29px; padding: 0 4px; overflow: hidden; border: 0; border-radius: 6px; color: var(--muted); background: transparent; font-size: var(--fs-caption); font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.collab-inspector-tabs button:hover { color: var(--text); background: var(--panel2); }
+.collab-inspector-tabs button.on { color: var(--blue); background: color-mix(in srgb, var(--blue) 8%, var(--panel)); }
+.collab-decision-list { display: grid; gap: 10px; }
+.collab-decision-card {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel2);
+}
+.collab-decision-card header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  color: var(--muted);
+  font-size: var(--fs-label);
+}
+.collab-decision-card header .tone-danger,
+.collab-decision-intents .tone-danger { color: var(--red); }
+.collab-decision-empty { margin: 0; color: var(--muted); font-size: var(--fs-caption); }
+.collab-decision-attempts { width: 100%; border-collapse: collapse; font: var(--fs-meta)/1.4 var(--font-mono); }
+.collab-decision-attempts th,
+.collab-decision-attempts td { padding: 4px 6px; border-bottom: 1px solid var(--line); text-align: left; }
+.collab-decision-attempts th { color: var(--muted); font-weight: 650; }
+.collab-decision-intents,
+.collab-decision-follow { margin: 0; padding: 0; list-style: none; display: grid; gap: 6px; }
+.collab-decision-intents li,
+.collab-decision-follow li {
+  display: grid;
+  gap: 2px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.collab-decision-intents strong,
+.collab-decision-follow strong { color: var(--text); font-size: var(--fs-caption); overflow-wrap: anywhere; }
+.collab-decision-intents small,
+.collab-decision-follow small { color: var(--muted); font: var(--fs-meta)/1.3 var(--font-mono); }
+.collab-decision-intents button {
+  justify-self: start;
+  margin-top: 3px;
+  padding: 0;
+  border: 0;
+  color: var(--blue);
+  background: transparent;
+  font: 650 var(--fs-label)/1.3 inherit;
+  cursor: pointer;
+}
+.collab-decision-follow li.collab-decision-follow-label { color: var(--muted); font-size: var(--fs-label); font-weight: 650; border: 0; background: transparent; padding: 0; }
+.collab-section-empty small { display: block; margin-top: 4px; }
+.collab-inspector-body { flex: 1; min-height: 0; overflow: auto; padding: 0 12px 14px; scrollbar-gutter: stable; }
+.collab-detail-section { padding: 14px 0; border-top: 1px solid var(--line); }
+.collab-detail-section:first-child,
+.collab-detail-section.no-border { border-top: 0; }
+.collab-detail-section h3 {
+  min-height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: var(--fs-label);
+  font-weight: 760;
+  letter-spacing: var(--ls-label);
+  text-transform: uppercase;
+}
+.collab-detail-section h3 span { color: var(--muted); font: 700 var(--fs-meta)/1 var(--font-mono); }
+.collab-intent-detail,
+.collab-selected-knowledge {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel2);
+}
+.collab-intent-detail > strong,
+.collab-selected-knowledge > strong,
+.collab-selected-knowledge-content > strong { color: var(--bright); font-size: 11.5px; line-height: 1.45; }
+.collab-intent-detail > p,
+.collab-selected-knowledge > p,
+.collab-selected-knowledge-content > p { margin: 0; color: var(--muted); font-size: var(--fs-caption); line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.collab-selected-knowledge-content {
+  min-width: 0;
+  max-height: min(36vh, 280px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.collab-selected-knowledge-content > strong {
+  display: block;
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.collab-intent-detail dl,
+.collab-selected-knowledge dl,
+.collab-runtime-detail { margin: 0; display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 5px 8px; }
+.collab-intent-detail dt,
+.collab-selected-knowledge dt,
+.collab-runtime-detail dt { color: var(--muted); font-size: var(--fs-label); line-height: 1.45; }
+.collab-intent-detail dd,
+.collab-selected-knowledge dd,
+.collab-runtime-detail dd { min-width: 0; margin: 0; color: var(--text); font: var(--fs-label)/1.45 var(--font-mono); overflow-wrap: anywhere; }
+.collab-selected-knowledge { margin: 0 0 12px; }
+.collab-selected-knowledge.tone-success { border-color: color-mix(in srgb, var(--green) 35%, var(--line)); }
+.collab-selected-knowledge.tone-warning { border-color: color-mix(in srgb, var(--amber) 38%, var(--line)); }
+.collab-selected-knowledge.tone-danger { border-color: color-mix(in srgb, var(--red) 38%, var(--line)); }
+.collab-selected-knowledge.tone-accent { border-color: color-mix(in srgb, var(--blue) 38%, var(--line)); }
+.collab-selected-knowledge.tone-muted { border-color: var(--line); }
+.collab-selected-knowledge-head {
+  margin: -11px -11px 0;
+  padding: 8px 11px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+  border-radius: 8px 8px 0 0;
+  background: color-mix(in srgb, var(--blue) 8%, var(--panel2));
+}
+.collab-selected-knowledge-head > span { display: inline-flex; align-items: center; gap: 6px; color: var(--blue); font-size: var(--fs-label); font-weight: 700; }
+.collab-selected-knowledge-tools { display: inline-flex; align-items: center; gap: 8px; }
+.collab-selected-knowledge-head b { color: var(--muted); font: 700 var(--fs-meta)/1 var(--font-mono); }
+.collab-selected-knowledge-close {
+  width: 22px;
+  height: 22px;
+  min-width: 22px;
+  min-height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted);
+  background: transparent;
+}
+.collab-selected-knowledge-close:hover { color: var(--text); background: var(--panel3); }
+.collab-detail-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+/* Detail-area buttons share one control shape with the toolbar (28px, 7px radius)
+   instead of the heroui pill; both action rows use size="sm" variant="ghost". */
+.collab-detail-actions button,
+.collab-inspector-actions button { height: 28px; min-height: 28px; padding: 0 9px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: var(--panel2); font-size: 10.5px; font-weight: 600; }
+.collab-detail-actions button:hover,
+.collab-inspector-actions button:hover { color: var(--blue); border-color: color-mix(in srgb, var(--blue) 35%, var(--line)); background: var(--panel3); }
+.collab-detail-actions button.copied { color: var(--green); }
+.collab-knowledge-link {
+  appearance: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--blue);
+  font: inherit;
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.collab-knowledge-link:hover { color: var(--text); }
+.collab-cited { display: grid; min-width: 0; gap: 6px; }
+.collab-cited > h4 {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--fs-label);
+  font-weight: 760;
+  letter-spacing: var(--ls-label);
+  text-transform: uppercase;
+}
+.collab-cited-list {
+  margin: 0;
+  min-width: 0;
+  padding: 0;
+  display: grid;
+  gap: 3px;
+  list-style: none;
+}
+.collab-cited-list .collab-knowledge-link { max-width: 100%; overflow-wrap: anywhere; font-size: var(--fs-caption); line-height: 1.4; }
+.collab-metric-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.collab-metric-grid > span { min-width: 0; display: grid; gap: 2px; padding: 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel2); }
+.collab-metric-grid b { color: var(--bright); font: 750 14px/1.2 var(--font-mono); }
+/* Zero is absence: muted and lighter; a non-zero value carries its category colour. */
+.collab-metric-grid b.zero { color: var(--muted); font-weight: 600; opacity: .55; }
+.collab-metric-grid b.ok { color: var(--green); }
+.collab-metric-grid b.warn { color: var(--amber); }
+.collab-metric-grid b.bad { color: var(--red); }
+.collab-metric-grid small { overflow: hidden; color: var(--muted); font-size: var(--fs-label); text-overflow: ellipsis; white-space: nowrap; }
+.collab-inspector-list { display: grid; gap: 2px; overflow: visible; }
+.collab-activity-list { display: grid; overflow: visible; }
+.collab-activity-row {
+  appearance: none;
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 8px;
+  padding: 8px 5px;
+  border: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 72%, transparent);
+  border-radius: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.collab-activity-row:hover { background: var(--panel2); }
+.collab-activity-row > i { width: 6px; height: 6px; margin-top: 5px; border-radius: 50%; background: var(--line2); }
+.collab-activity-row.tone-failed > i { background: var(--red); }
+.collab-activity-row.tone-tool > i,
+.collab-activity-row.tone-runtime > i { background: var(--blue); }
+.collab-activity-row > span { min-width: 0; display: grid; gap: 2px; }
+.collab-activity-row strong { overflow: hidden; color: var(--text); font: 700 var(--fs-label)/1.3 var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
+.collab-activity-row p { max-height: 46px; margin: 0; overflow: hidden; color: var(--muted); font-size: 10.5px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+.collab-activity-row.is-open p { max-height: none; }
+.collab-activity-row time { color: var(--muted); font: var(--fs-meta)/1.3 var(--font-mono); }
+.collab-relation-row {
+  min-height: 54px;
+  display: grid;
+  grid-template-columns: 27px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  padding: 7px 8px;
+}
+.collab-relation-row:hover { border-color: var(--line); background: var(--panel2); }
+.collab-relation-row-swatch { width: 27px; height: 27px; display: grid; place-items: center; }
+.collab-relation-row-copy { min-width: 0; display: grid; gap: 2px; }
+.collab-relation-row-copy > span { min-width: 0; display: flex; align-items: center; gap: 5px; }
+.collab-relation-row-copy > span b { color: var(--muted); font-size: var(--fs-label); font-weight: 760; letter-spacing: .05em; text-transform: uppercase; }
+.collab-relation-row-copy > span small { flex: none; color: var(--muted); font-size: var(--fs-label); }
+.collab-relation-row-copy > strong { overflow: hidden; color: var(--text); font-size: var(--fs-caption); font-weight: 600; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.collab-relation-row-copy > small { overflow: hidden; color: var(--muted); font-size: var(--fs-label); text-overflow: ellipsis; white-space: nowrap; }
+.collab-inspector-actions { flex: none; min-height: 48px; display: flex; align-items: center; gap: 7px; padding: 8px 12px; border-top: 1px solid var(--line); background: var(--panel2); }
+.collab-inspector-actions button { background: var(--panel); }
+.collab-inspector-actions button.danger { margin-left: auto; color: var(--red); }
+.collab-inspector-actions button.danger:hover { color: var(--red); border-color: color-mix(in srgb, var(--red) 40%, var(--line)); }
+.collab-relation-head { flex: none; min-height: 62px; display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 9px 12px; border-bottom: 1px solid var(--line); background: var(--panel2); }
+.collab-relation-head > button { width: 30px; min-width: 30px; height: 30px; padding: 0; border-radius: 7px; }
+.collab-back-icon { transform: rotate(180deg); }
+.collab-relation-head > span { min-width: 0; display: grid; gap: 2px; }
+.collab-relation-head small { color: var(--muted); font-size: var(--fs-label); letter-spacing: var(--ls-label); text-transform: uppercase; }
+.collab-relation-head strong { color: var(--bright); font-size: 12px; }
+.collab-relation-head > b { min-width: 24px; padding: 4px 7px; border: 1px solid var(--line); border-radius: 10px; color: var(--blue); font: 750 var(--fs-label)/1 var(--font-mono); text-align: center; }
+.collab-relation-route { display: grid; grid-template-columns: minmax(0, 1fr) 28px minmax(0, 1fr); align-items: center; gap: 8px; margin: 13px 0 0; padding: 11px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel2); }
+.collab-relation-route > button {
+  appearance: none;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 7px;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.collab-relation-route > button:last-child { text-align: right; }
+.collab-relation-route > button:hover { background: var(--panel3); }
+.collab-relation-route b { overflow: hidden; color: var(--bright); font-size: var(--fs-caption); text-overflow: ellipsis; white-space: nowrap; }
+.collab-relation-route small { color: var(--muted); font-size: var(--fs-label); }
+.collab-relation-route > i { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 50%; color: var(--blue); background: color-mix(in srgb, var(--blue) 8%, var(--panel)); }
+.collab-relation-route.relation-review > i { color: var(--violet); background: color-mix(in srgb, var(--violet) 8%, var(--panel)); }
+.collab-relation-route.relation-verify > i { color: var(--green); background: color-mix(in srgb, var(--green) 8%, var(--panel)); }
+.collab-relation-route.relation-report > i { color: var(--amber); background: color-mix(in srgb, var(--amber) 8%, var(--panel)); }
+.collab-relation-route.relation-directive > i { color: var(--magenta); background: color-mix(in srgb, var(--magenta) 8%, var(--panel)); }
+.collab-relation-route.relation-lock > i { color: var(--red); background: color-mix(in srgb, var(--red) 8%, var(--panel)); }
+.collab-relation-direction { margin: 8px 0 0; color: var(--muted); font-size: 10.5px; line-height: 1.5; }
+/* loading skeleton for the dynamically imported canvas: same grid as the live shell */
+.collab-skeleton .collab-toolbar > .skel-box { flex: none; }
+.collab-skeleton .collab-skeleton-search { flex: 1 1 200px; min-width: 160px; max-width: 260px; }
+.collab-skeleton-spacer { flex: 1; }
+.collab-skeleton .collab-queue-list,
+.collab-skeleton .collab-index-list { display: grid; align-content: start; gap: 4px; padding-top: 2px; }
+.collab-skeleton-row { display: grid; grid-template-columns: 27px minmax(0, 1fr); align-items: start; gap: 8px; padding: 7px 8px; }
+.collab-skeleton-row > span { display: grid; gap: 6px; }
+.collab-skeleton .collab-inspector-head > span:nth-child(2) { gap: 5px; }
+.collab-skeleton .collab-inspector-tabs { align-items: center; }
+.collab-skeleton .collab-detail-section { display: grid; gap: 8px; }
+/* Toolbar folding by its own width (the runtime panel can be narrow inside a
+   wide window): the view group collapses into the "more" menu first, then the
+   filter buttons drop their labels. */
+@container collab-toolbar (max-width: 1080px) {
+  .collab-icon-tool:has(.fit),
+  .collab-icon-tool:has(.flow),
+  .collab-icon-tool:has(.follow),
+  .collab-tool.fit,
+  .collab-tool.flow,
+  .collab-tool.follow,
+  .collab-tool.export,
+  .collab-toolbar-panels,
+  .collab-toolbar-divider { display: none; }
+  .collab-toolbar-more { display: inline-flex; margin-left: auto; }
+}
+@container collab-toolbar (max-width: 860px) {
+  .collab-toolbar-search { flex-basis: 160px; min-width: 132px; }
+  .collab-tool .collab-tool-label,
+  .collab-tool .collab-tool-caret { display: none; }
+}
+/* Layout modes follow the runtime panel container, not the viewport (the
+   run-list rail takes 220–420px). Thresholds match COLLAB_OVERLAY_MAX /
+   COLLAB_MOBILE_MAX in lib/agentCollaborationLayout.ts. */
+@container runtimepanel (max-width: 1240px) {
+  .collab-tool:not(.icon-only) { padding-inline: 7px; }
+}
+@container runtimepanel (max-width: 1100px) and (min-width: 901px) {
+  /* Overlay band: columns no longer size the drawers, so the open/close
+     motion is a full slide from the edge instead of a grid-width shrink. */
+  .collab-shell { --collab-index-w: 0px; --collab-detail-w: 0px; grid-template-columns: minmax(0, 1fr); transition: none; }
+  .collab-index,
+  .collab-inspector {
+    position: absolute;
+    z-index: 18;
+    top: 0;
+    bottom: 0;
+    width: clamp(220px, 22cqi, 286px);
+    min-width: 0;
+    justify-self: auto;
+    box-shadow: var(--shadow-overlay);
+    transition:
+      opacity calc(var(--collab-drawer-ms) - var(--control-feedback-dur)) var(--ease-out), transform var(--collab-drawer-ms) var(--collab-drawer-ease), visibility 0s;
+  }
+  .collab-index { left: 0; }
+  .collab-inspector { right: 0; width: clamp(280px, 28cqi, 372px); }
+  .collab-canvas { grid-column: 1; }
+  .collab-shell:not(.index-open) .collab-index {
+    transform: translateX(calc(-100% - 12px));
+    transition:
+      opacity calc(var(--collab-drawer-ms) - var(--control-feedback-dur)) var(--ease-out), transform var(--collab-drawer-ms) var(--collab-drawer-ease), visibility 0s linear var(--collab-drawer-ms);
+  }
+  .collab-shell:not(.detail-open) .collab-inspector {
+    transform: translateX(calc(100% + 12px));
+    transition:
+      opacity calc(var(--collab-drawer-ms) - var(--control-feedback-dur)) var(--ease-out), transform var(--collab-drawer-ms) var(--collab-drawer-ease), visibility 0s linear var(--collab-drawer-ms);
+  }
+  .collab-shell.index-open .collab-index,
+  .collab-shell.detail-open .collab-inspector { visibility: visible; opacity: 1; pointer-events: auto; transform: translateX(0); }
+  .collab-panel-close { display: inline-flex; align-items: center; justify-content: center; }
+  .collab-inspector-head { grid-template-columns: 36px minmax(0, 1fr) auto 28px; }
+  .collab-relation-head { grid-template-columns: 30px minmax(0, 1fr) auto 28px; }
+}
+@container runtimepanel (max-width: 900px) {
+  .collab-shell {
+    --collab-index-w: 0px;
+    --collab-detail-w: 0px;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: var(--collab-toolbar-h) 38px minmax(0, 1fr);
+    transition: none;
+  }
+  .collab-toolbar { grid-column: 1; }
+  .collab-toolbar-search { flex-basis: 160px; min-width: 132px; }
+  .collab-toolbar > .collab-scope,
+  .collab-toolbar-panels,
+  .collab-toolbar-divider { display: none; }
+  .collab-icon-tool:has(.fit),
+  .collab-icon-tool:has(.flow),
+  .collab-icon-tool:has(.follow),
+  .collab-icon-tool:has(.collab-panel-toggle-index),
+  .collab-tool.fit,
+  .collab-tool.flow,
+  .collab-tool.follow,
+  .collab-tool.export { display: none; }
+  .collab-toolbar-more { display: inline-flex; margin-left: auto; }
+  .collab-tool .collab-tool-label,
+  .collab-tool .collab-tool-caret { display: none; }
+  .collab-mobile-tabs {
+    grid-column: 1;
+    grid-row: 2;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+  .collab-mobile-tablist { min-width: 0; display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px; }
+  .collab-mobile-tablist button { width: 100%; min-height: 29px; border: 0; border-radius: 6px; color: var(--muted); background: transparent; font-size: 10.5px; }
+  .collab-mobile-tablist button.on { color: var(--blue); background: color-mix(in srgb, var(--blue) 8%, var(--panel)); }
+  .collab-mobile-tabs .collab-scope { height: 29px; padding: 2px; }
+  .collab-mobile-tabs .collab-scope button { height: 25px; min-height: 25px; padding: 0 7px; }
+  .collab-index,
+  .collab-canvas,
+  .collab-inspector { grid-column: 1; grid-row: 3; position: relative; width: 100%; border: 0; visibility: hidden !important; opacity: 0 !important; pointer-events: none !important; transform: none !important; transition: none !important; }
+  .collab-shell.mobile-index .collab-index,
+  .collab-shell.mobile-canvas .collab-canvas,
+  .collab-shell.mobile-detail .collab-inspector { visibility: visible !important; opacity: 1 !important; pointer-events: auto !important; }
+  .collab-index-section.queue { max-height: 32%; }
+  .collab-canvas .react-flow__minimap,
+  .collab-minimap-toggle { display: none; }
+}
+@container runtimepanel (max-width: 560px) {
+  .collab-toolbar { gap: 5px; padding-inline: 8px; }
+  .collab-toolbar-search { min-width: 180px; max-width: none; }
+  .collab-tool { padding-inline: 7px; }
+  .collab-canvas .collab-canvas-bar { margin: 10px; }
+  .collab-scrubber { left: 10px; right: 10px; bottom: 48px; }
+  .collab-canvas-legend { width: min(252px, calc(100cqi - 40px)); }
+  .collab-metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+.collab-node-tip-trigger {
+  display: block;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+}
+.collab-node-tip {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 280px;
+  padding: 8px 10px;
+}
+.collab-node-tip > strong { color: var(--bright); font-size: 11.5px; font-weight: 700; line-height: 1.4; overflow-wrap: anywhere; }
+.collab-node-tip > span { color: var(--muted); font-size: 10.5px; line-height: 1.4; }
+.collab-edge-tip {
+  position: absolute;
+  z-index: 8;
+  width: min(280px, calc(100% - 24px));
+  margin: 0;
+  pointer-events: none;
+  transform: translate(12px, 12px);
+  transition: opacity var(--control-feedback-dur) var(--ease-out);
+}
+.collab-edge-tip.instant { transition: none; }
+@media (prefers-reduced-motion: reduce) {
+  .collab-shell,
+  .collab-agent-card,
+  .collab-coordinator-card,
+  .collab-edge .react-flow__edge-textwrapper,
+  .collab-edge-tip,
+  .collab-index,
+  .collab-inspector { transition: none; }
+  .collab-agent-state i,
+  .collab-inspector-status i,
+  .collab-agent-card.recent,
+  .collab-agent-card.entering,
+  .collab-agent-card.exiting,
+  .collab-coordinator-card.entering,
+  .collab-coordinator-card.exiting,
+  .collab-knowledge-row.fresh,
+  .collab-activity-row.fresh,
+  .collab-canvas-live i.live { animation: none; }
+  /* stop the edge flow immediately; the React side drops `animated` on the next render */
+  .collab-canvas .react-flow__edge.animated .react-flow__edge-path { animation: none; stroke-dasharray: none; }
+  .collab-canvas .react-flow__edge.animated.relation-review .react-flow__edge-path { stroke-dasharray: 3 5; }
+  .collab-canvas .react-flow__edge.animated.relation-verify .react-flow__edge-path { stroke-dasharray: 7 4; }
+  .collab-canvas .react-flow__edge.animated.relation-report .react-flow__edge-path { stroke-dasharray: 1.5 4; }
+  .collab-canvas .react-flow__edge.animated.relation-lock .react-flow__edge-path { stroke-dasharray: 8 3 2 3; }
+}
+/* Drag handles update React width state → --collab-*-open-w. Hidden when
+   columns no longer size the layout (overlay / stacked). */
+.collab-sidebar-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 20;
+  width: 10px;
+  cursor: col-resize;
+  touch-action: none;
+  outline: none;
+}
+.collab-index-resizer { right: -5px; }
+.collab-detail-resizer { left: -5px; }
+.collab-sidebar-resizer::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 4px;
+  width: 1px;
+  background: transparent;
+}
+.collab-sidebar-resizer:hover::before,
+.collab-sidebar-resizer:focus-visible::before,
+.collab-shell.sidebar-resizing .collab-sidebar-resizer::before {
+  width: 2px;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent);
+}
+body.collab-sidebar-resizing,
+body.collab-sidebar-resizing * { cursor: col-resize !important; user-select: none !important; }
+@container runtimepanel (max-width: 1100px) {
+  .collab-sidebar-resizer { display: none; }
+}

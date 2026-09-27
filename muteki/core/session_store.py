@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Any, AsyncIterator, Mapping
+from typing import Any, AsyncIterator, Iterator, Mapping
 
 from muteki.core.events import Event
 from muteki.core.path_ids import decode_run_id, encode_run_id
@@ -17,6 +17,36 @@ from muteki.core.path_ids import decode_run_id, encode_run_id
 
 _REPLAY_YIELD_EVERY = 100
 _TRANSPORT_FIELDS = frozenset({"seq", "ts"})
+_SUMMARY_EVENT_NEEDLES = tuple(
+    f'"{value}"'.encode("ascii")
+    for value in (
+        "run.preparing", "run.started", "run.titled", "run.finished",
+        "run.reopened", "insight.event", "flag.accepted",
+        "blackboard.delta", "followup.started", "followup.completed",
+        "followup.failed",
+    )
+)
+
+
+def _json_number_field(raw: bytes, field: bytes) -> float:
+    """Read a top-level JSON number without decoding a potentially huge payload."""
+    marker = b'"' + field + b'"'
+    start = raw.find(marker)
+    if start < 0:
+        return 0.0
+    start = raw.find(b":", start + len(marker))
+    if start < 0:
+        return 0.0
+    start += 1
+    while start < len(raw) and raw[start] in b" \t":
+        start += 1
+    end = start
+    while end < len(raw) and raw[end] in b"-+0123456789.eE":
+        end += 1
+    try:
+        return float(raw[start:end])
+    except (TypeError, ValueError):
+        return 0.0
 
 
 class ProjectionIdentityConflict(ValueError):
@@ -45,7 +75,7 @@ def _logical_event(event: Event | Mapping[str, Any]) -> dict[str, Any]:
 
 
 class SessionStore:
-    def __init__(self, root: str | Path = "sessions") -> None:
+    def __init__(self, root: str | Path = "state") -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self._locks: dict[str, asyncio.Lock] = {}
@@ -251,7 +281,42 @@ class SessionStore:
                 out.append(parsed)
         return out
 
-    def summary(self, run_id: str) -> dict:
+    def iter_matching_events(
+        self,
+        run_id: str,
+        *,
+        event_types: tuple[str, ...] = (),
+        payload_kinds: tuple[str, ...] = (),
+    ) -> Iterator[Event]:
+        """流式读取少量目标事件，避免为投影恢复反序列化完整 Run 历史。"""
+        path = self._path(run_id)
+        if not path.exists():
+            return
+        type_set = frozenset(event_types)
+        kind_set = frozenset(payload_kinds)
+        needles = tuple(
+            json.dumps(value, ensure_ascii=False)
+            for value in (*event_types, *payload_kinds)
+        )
+        with path.open("r", encoding="utf-8") as f:
+            for raw in f:
+                if needles and not any(needle in raw for needle in needles):
+                    continue
+                try:
+                    parsed = _object_row(json.loads(raw))
+                    if parsed is None:
+                        continue
+                    event = Event.model_validate(parsed)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+                payload = event.payload or {}
+                if (
+                    event.event_type.value in type_set
+                    or str(payload.get("kind") or "") in kind_set
+                ):
+                    yield event
+
+    def summary(self, run_id: str, *, bounded: bool = False) -> dict:
         """Cheap one-run digest for the deck's thread rail (name/category/won/flag).
 
         Scans the persisted JSONL without reconstructing deck state — pulls the
@@ -274,6 +339,7 @@ class SessionStore:
             "started": False, "finished": False, "solved": False, "flag": None,
             "flags": [], "expected_flags": 1, "multi_flag": False,
             "events": 0, "ts": 0.0, "execution_generation": 0,
+            "stream_seq": 0,
             "terminal_generations": [],
         }
         if not path.exists():
@@ -284,18 +350,18 @@ class SessionStore:
 
         def _add_flag(val) -> None:
             for f in (val if isinstance(val, list) else [val]):
-                if f and f not in invalidated and f not in flags:
+                if f is not None and f not in invalidated and f not in flags:
                     flags.append(f)
 
         def _valid_flags(val) -> list[str]:
             return [
                 f for f in (val if isinstance(val, list) else [val])
-                if f and f not in invalidated
+                if f is not None and f not in invalidated
             ]
 
         def _invalidate_flag(val) -> None:
-            bad = str(val or "").strip()
-            if bad:
+            if val is not None:
+                bad = str(val)
                 invalidated.add(bad)
                 flags[:] = [f for f in flags if f != bad]
             else:
@@ -305,83 +371,158 @@ class SessionStore:
         finished_solved: bool | None = None  # explicit verdict from run.finished
         flag_implies_solved = False
         terminal_generations: set[int] = set()
+        pending_followups: dict[str, dict[str, Any]] = {}
 
-        with path.open("r", encoding="utf-8") as f:
-            for raw in f:
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    ev = _object_row(json.loads(raw))
-                except json.JSONDecodeError:
-                    continue
-                if ev is None:
-                    continue
-                summary["events"] += 1
-                summary["ts"] = ev.get("ts", summary["ts"]) or summary["ts"]
-                et = ev.get("event_type")
-                p = _payload_object(ev)
-                try:
-                    generation = int(p.get("execution_generation") or 0)
-                except (TypeError, ValueError):
-                    generation = 0
-                summary["execution_generation"] = max(
-                    summary["execution_generation"], generation)
-                if et in {"run.preparing", "run.started"}:
-                    summary["started"] = True
-                    ch = p.get("challenge") or {}
-                    summary["name"] = ch.get("name") or summary["name"]
-                    summary["category"] = ch.get("category") or summary["category"]
-                    if ch.get("expected_flags"):
-                        summary["expected_flags"] = int(ch["expected_flags"])
-                    if "multi_flag" in ch:
-                        summary["multi_flag"] = bool(ch["multi_flag"])
-                elif et == "run.titled":
-                    # ChatGPT-style auto-title persisted on the run — survives restart
-                    summary["name"] = p.get("title") or summary["name"]
-                elif et == "run.finished":
-                    summary["finished"] = True
-                    if generation > 0:
-                        terminal_generations.add(generation)
-                    incoming_flags = p.get("flags") or p.get("flag")
-                    valid_incoming = _valid_flags(incoming_flags)
-                    if p.get("solved"):
-                        finished_solved = bool(valid_incoming) if incoming_flags else True
-                    else:
-                        finished_solved = False
-                    _add_flag(incoming_flags)
-                    # run.finished may carry the authoritative mode (the single-solver
-                    # _emit_finished does not — default fallbacks above cover that).
-                    if p.get("expected_flags"):
-                        summary["expected_flags"] = int(p["expected_flags"])
-                    if "multi_flag" in p:
-                        summary["multi_flag"] = bool(p["multi_flag"])
-                elif et == "run.reopened":
-                    summary["finished"] = False
+        def _rows() -> Iterator[bytes]:
+            if not bounded:
+                with path.open("rb") as source:
+                    yield from source
+                return
+            # A legacy install has no summary index yet. Startup only needs the
+            # initial challenge identity and the latest terminal state, which are
+            # written at the beginning and end of the append-only log. Bound this
+            # one-time migration independently of total history size.
+            size = path.stat().st_size
+            head_size = min(size, 128 * 1024)
+            tail_start = max(head_size, size - 512 * 1024)
+            with path.open("rb") as source:
+                head = source.read(head_size)
+                for row in head.splitlines(
+                        keepends=True)[:-1 if head_size < size else None]:
+                    yield row
+                if tail_start < size:
+                    source.seek(tail_start)
+                    tail = source.read()
+                    if tail_start > head_size:
+                        split = tail.find(b"\n")
+                        tail = tail[split + 1:] if split >= 0 else b""
+                    yield from tail.splitlines(keepends=True)
+
+        for raw in _rows():
+            raw = raw.strip()
+            if not raw:
+                continue
+            raw_seq = int(_json_number_field(raw, b"seq"))
+            summary["stream_seq"] = max(summary["stream_seq"] + 1, raw_seq)
+            summary["events"] += 1
+            summary["ts"] = _json_number_field(raw, b"ts") or summary["ts"]
+            # Tool output and token deltas dominate large logs. None of those
+            # rows can change the rail or startup recovery projection, so avoid
+            # feeding their often multi-megabyte payloads through json.loads.
+            if not any(needle in raw for needle in _SUMMARY_EVENT_NEEDLES):
+                continue
+            try:
+                ev = _object_row(json.loads(raw))
+            except json.JSONDecodeError:
+                continue
+            if ev is None:
+                continue
+            et = ev.get("event_type")
+            p = _payload_object(ev)
+            try:
+                generation = int(p.get("execution_generation") or 0)
+            except (TypeError, ValueError):
+                generation = 0
+            summary["execution_generation"] = max(
+                summary["execution_generation"], generation)
+            if et in {"run.preparing", "run.started"}:
+                summary["started"] = True
+                ch = p.get("challenge") or {}
+                summary["name"] = ch.get("name") or summary["name"]
+                summary["category"] = ch.get("category") or summary["category"]
+                if ch.get("expected_flags"):
+                    summary["expected_flags"] = int(ch["expected_flags"])
+                if "multi_flag" in ch:
+                    summary["multi_flag"] = bool(ch["multi_flag"])
+            elif et == "run.titled":
+                # ChatGPT-style auto-title persisted on the run — survives restart
+                summary["name"] = p.get("title") or summary["name"]
+            elif et == "run.finished":
+                summary["finished"] = True
+                if generation > 0:
+                    terminal_generations.add(generation)
+                incoming_flags = (
+                    p.get("flags") if "flags" in p else p.get("flag")
+                )
+                incoming_values = (
+                    incoming_flags if isinstance(incoming_flags, list)
+                    else [incoming_flags]
+                )
+                had_flag_payload = any(
+                    value is not None for value in incoming_values)
+                valid_incoming = _valid_flags(incoming_flags)
+                if p.get("solved"):
+                    finished_solved = (
+                        bool(valid_incoming) if had_flag_payload else True)
+                else:
                     finished_solved = False
-                    if p.get("reason") == "resolve":
-                        continue
+                _add_flag(incoming_flags)
+                # run.finished may carry the authoritative mode (the single-solver
+                # _emit_finished does not — default fallbacks above cover that).
+                if p.get("expected_flags"):
+                    summary["expected_flags"] = int(p["expected_flags"])
+                if "multi_flag" in p:
+                    summary["multi_flag"] = bool(p["multi_flag"])
+            elif et == "run.reopened":
+                summary["finished"] = False
+                finished_solved = False
+                if p.get("reason") == "resolve":
+                    continue
+                _invalidate_flag(p.get("flag"))
+            elif et == "insight.event" and p.get("kind") == "FlagFound":
+                _add_flag(p.get("flag"))
+                flag_implies_solved = True
+            elif et == "flag.accepted":
+                # A verified accepted handoff is public evidence of that flag,
+                # but not proof of solved, finished, progress, or clean closure.
+                _add_flag(p.get("flag"))
+            elif et == "blackboard.delta":
+                kind = p.get("kind")
+                if kind == "flag_invalidated":
                     _invalidate_flag(p.get("flag"))
-                elif et == "insight.event" and p.get("kind") == "FlagFound":
+                    finished_solved = False
+                elif kind == "flag_found":
                     _add_flag(p.get("flag"))
-                    flag_implies_solved = True
-                elif et == "flag.accepted":
-                    # A verified accepted handoff is public evidence of that flag,
-                    # but not proof of solved, finished, progress, or clean closure.
-                    _add_flag(p.get("flag"))
-                elif et == "blackboard.delta":
-                    kind = p.get("kind")
-                    if kind == "flag_invalidated":
-                        _invalidate_flag(p.get("flag"))
-                        finished_solved = False
-                    elif kind == "flag_found":
-                        _add_flag(p.get("flag"))
-                        if not p.get("authority_receipt_digest"):
-                            flag_implies_solved = True
+                    if not p.get("authority_receipt_digest"):
+                        flag_implies_solved = True
+            elif et == "followup.started":
+                followup_id = str(p.get("followup_id") or "")
+                key = followup_id or f"legacy:{summary['events']}"
+                pending_followups[key] = {
+                    "followup_id": followup_id,
+                    "kind": str(p.get("kind") or "ask"),
+                    "execution_generation": p.get("execution_generation"),
+                    "recovery_id": (
+                        f"interrupted-followup:{summary['events']}:{followup_id}"
+                    ),
+                }
+            elif et in {"followup.completed", "followup.failed"}:
+                followup_id = str(p.get("followup_id") or "")
+                if followup_id:
+                    pending_followups.pop(followup_id, None)
+                else:
+                    legacy_key = next(
+                        (key for key in reversed(pending_followups)
+                         if not pending_followups[key]["followup_id"]),
+                        None,
+                    )
+                    if legacy_key is not None:
+                        pending_followups.pop(legacy_key, None)
+
+        if bounded:
+            # A file byte offset is a stable upper bound for all historic event
+            # sequence values. New events may safely continue above it; replay of
+            # the immutable JSONL remains independent of this startup cursor.
+            stat_result = path.stat()
+            summary["stream_seq"] = max(
+                int(summary["stream_seq"]), int(stat_result.st_size))
+            summary["ts"] = max(
+                float(summary["ts"]), float(stat_result.st_mtime))
 
         summary["flags"] = flags
         summary["flag"] = flags[0] if flags else None
         summary["terminal_generations"] = sorted(terminal_generations)
+        summary["pending_followups"] = pending_followups
 
         # ── verdict, by mode ────────────────────────────────────────────────
         if finished_solved is not None:

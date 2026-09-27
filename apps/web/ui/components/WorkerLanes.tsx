@@ -1,26 +1,25 @@
 "use client";
 
+import { Button, Chip, ListBox, ListBoxItem, Select, Tooltip } from "@heroui/react";
+
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties } from "react";
+import type { CSSProperties, KeyboardEvent } from "react";
 import { DeckState, SolverLane, isReviewWorkerLane, isVerifierWorkerLane, workerChat, workerIds, currentGenWorkerIds } from "@/lib/events";
 import type { SwarmDigest } from "@/lib/events";
 import { useT } from "@/lib/i18n";
-import { workerColor, workerEngine, toWorkerIdentity, workerDisplayName, workerGeneration } from "@/lib/workers";
-import { compactLaneStatus, latestLaneActivity, laneStatusKind, rosterGroup } from "@/lib/workerLanePresentation";
+import { SPAWN_ENGINES, workerColor, workerEngine, workerEngineKey, toWorkerIdentity, workerDisplayName, workerGeneration } from "@/lib/workers";
+import { compactLaneStatus, laneActivityDetail, laneStatusKind, laneStatusTone, rosterGroup } from "@/lib/workerLanePresentation";
 import type { RosterGroup } from "@/lib/workerLanePresentation";
 import { Icon } from "@/components/Icon";
-import { PanelEmpty } from "@/components/PanelEmpty";
+import { EngineLogo } from "@/components/EngineLogo";
+import { WorkerPromptButton } from "@/components/WorkerPromptButton";
 
 /**
  * Worker roster: a compact control list (who is working / stuck / done).
  * Event content lives in the activity stream — a row click jumps there.
  */
 
-const SPAWN_ENGINES = [
-  "claude", "codex", "cursor", "pi", "omp", "kimi", "grok", "opencode", "dsh",
-];
-
-export function WorkerSpawnControl({
+function WorkerSpawnControl({
   running,
   onSpawnWorker,
 }: {
@@ -32,12 +31,12 @@ export function WorkerSpawnControl({
   if (!running) return null;
   return (
     <div className="wlane-spawn">
-      <select value={spawnEngine} onChange={(e) => setSpawnEngine(e.target.value)} title={t("workerDock.engine")}>
-        <option value="">{t("workerDock.auto")}</option>
-        {SPAWN_ENGINES.map((engine) => <option key={engine} value={engine}>{engine}</option>)}
-      </select>
-      <button className="wlane-spawn-btn" onClick={() => onSpawnWorker(spawnEngine || undefined)}
-        title={t("workerDock.addTitle")}>＋ {t("workerDock.add")}</button>
+      <Select aria-label={t("workerDock.engine")} selectedKey={spawnEngine} onSelectionChange={(key) => setSpawnEngine(String(key ?? ""))}>
+        <Select.Trigger><Select.Value /></Select.Trigger>
+        <Select.Popover><ListBox><ListBoxItem id="" textValue={t("workerDock.auto")}>{t("workerDock.auto")}</ListBoxItem>{SPAWN_ENGINES.map((engine) => <ListBoxItem key={engine} id={engine} textValue={engine}>{engine}</ListBoxItem>)}</ListBox></Select.Popover>
+      </Select>
+      <Button className="wlane-spawn-btn" onClick={() => onSpawnWorker(spawnEngine || undefined)}
+        data-tooltip={t("workerDock.addTitle")}>＋ {t("workerDock.add")}</Button>
     </div>
   );
 }
@@ -49,6 +48,7 @@ export function WorkerLanes({
   onSpawnWorker,
   onKillWorker,
   onOpenSpeakerTimeline,
+  onOpenAgent,
   phase,
   elapsed,
   calls,
@@ -59,6 +59,7 @@ export function WorkerLanes({
   onSpawnWorker: (engine?: string) => void;
   onKillWorker: (id: string) => void;
   onOpenSpeakerTimeline?: (id: string) => void;
+  onOpenAgent?: (id: string) => void;
   phase: SwarmDigest["phase"];
   elapsed?: string;
   calls: number;
@@ -72,7 +73,7 @@ export function WorkerLanes({
   // roster members of the live generation.
   const curIds = useMemo(() => currentGenWorkerIds(deck), [deck]);
   const lastNonce = useRef<number | null>(null);
-  const rowRefs = useRef(new Map<string, HTMLButtonElement>());
+  const rowRefs = useRef(new Map<string, HTMLDivElement>());
 
   useEffect(() => {
     if (!focusWorker || focusWorker.nonce === lastNonce.current) return;
@@ -127,54 +128,109 @@ export function WorkerLanes({
     const engine = workerEngine(id, lane.engine);
     const color = workerColor(id, lane.engine);
     const tools = (toolsByWorker.get(id) || []).slice(-6);
-    const latestActivity = latestLaneActivity(lane.status, lane.statusReason, tools);
+    const activity = laneActivityDetail(lane, online, tools);
     const statusKind = laneStatusKind(lane, online);
     const statusLabel = compactLaneStatus(lane, online, t);
+    const statusTone = laneStatusTone(statusKind);
+    const rawStatus = (lane.statusReason || lane.status || "").trim();
+    const rawStatusHint = rawStatus && !/^tool:/i.test(rawStatus) && rawStatus !== statusLabel
+      ? rawStatus
+      : "";
     const display = workerDisplayName(id, toWorkerIdentity(id, lane), siblings);
+    const generation = workerGeneration(id);
     const isReview = isReviewWorkerLane(lane);
+    const engineKey = workerEngineKey(id, lane.engine);
     const isVerifier = isVerifierWorkerLane(lane);
     const focused = focusWorker?.id === id;
     const openTimeline = () => onOpenSpeakerTimeline?.(id);
+    const activateOnKey = (event: KeyboardEvent<HTMLDivElement>) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      openTimeline();
+    };
     return (
       <div
         key={id}
+        ref={(node) => {
+          if (node) rowRefs.current.set(id, node);
+          else rowRefs.current.delete(id);
+        }}
         className={`wlane-row is-${statusKind} ${focused ? "focused" : ""}`}
         style={{ "--wc": color } as CSSProperties}
       >
-        <button
-          type="button"
-          className="wlane-row-main"
-          ref={(node) => {
-            if (node) rowRefs.current.set(id, node);
-            else rowRefs.current.delete(id);
-          }}
-          onClick={openTimeline}
-          title={onOpenSpeakerTimeline ? t("wlane.viewInStream") : display.titleAttr}
-        >
-          <span className="wlane-avatar">{display.initial}</span>
-          <span className="wlane-id">
-            <span className="wlane-name" title={display.titleAttr}>{display.title}</span>
-            {workerGeneration(id) > 1 && <span className="wlane-gen" title={id}>g{workerGeneration(id)}</span>}
-          </span>
-          <span className="wlane-eng">{engine}</span>
-          <span className="wlane-latest" title={latestActivity || undefined}>{latestActivity || "—"}</span>
-          <span className={`wlane-status is-${statusKind}`}>
-            {statusLabel}
-            {isReview && <span className="worker-role-chip review">{t("worker.role.review")}</span>}
-            {isVerifier && <span className="worker-role-chip verifier">{t("worker.role.verifier")}</span>}
-          </span>
-        </button>
-        {running && online ? (
-          <button
-            type="button"
-            className="wlane-kill"
-            title={t("worker.killTitle")}
-            aria-label={t("worker.killTitle")}
-            onClick={() => onKillWorker(id)}
+        <Tooltip delay={320} closeDelay={60}>
+          <Tooltip.Trigger
+            className="wlane-row-main"
+            aria-label={`${display.title} · ${engine} · ${statusLabel}`}
+            onClick={openTimeline}
+            onKeyDown={activateOnKey}
           >
-            <Icon name="x" size={13} />
-          </button>
-        ) : <span />}
+            <span className="wlane-avatar" aria-hidden="true">
+              {engineKey
+                ? <EngineLogo engine={engineKey} size={14} />
+                : display.initial}
+            </span>
+            <span className="wlane-id">
+              <span className="wlane-name">{display.title}</span>
+              {generation > 1 && (
+                <Chip className="wlane-gen" size="sm" variant="soft" color="accent">
+                  <Chip.Label>g{generation}</Chip.Label>
+                </Chip>
+              )}
+              {isReview && (
+                <Chip className="worker-role-chip review" size="sm" variant="soft">
+                  <Chip.Label>{t("worker.role.review")}</Chip.Label>
+                </Chip>
+              )}
+              {isVerifier && (
+                <Chip className="worker-role-chip verifier" size="sm" variant="soft">
+                  <Chip.Label>{t("worker.role.verifier")}</Chip.Label>
+                </Chip>
+              )}
+            </span>
+            <Chip className="wlane-eng" size="sm" variant="soft">
+              <Chip.Label>{engine}</Chip.Label>
+            </Chip>
+            <Chip className={`wlane-status is-${statusKind}`} size="sm" variant="soft" color={statusTone}>
+              <Chip.Label>{statusLabel}</Chip.Label>
+            </Chip>
+          </Tooltip.Trigger>
+          <Tooltip.Content className="wlane-tip">
+            <b className="wlane-tip-name">{display.title}</b>
+            <span className="wlane-tip-meta">{engine} · {statusLabel}{rawStatusHint ? ` · ${rawStatusHint}` : ""}</span>
+            {display.titleAttr ? <span className="wlane-tip-meta">{display.titleAttr}</span> : null}
+            {activity ? <span className="wlane-tip-activity">{activity}</span> : null}
+            {onOpenSpeakerTimeline ? <span className="wlane-tip-hint">{t("wlane.viewInStream")}</span> : null}
+            {onOpenAgent ? (
+              <button type="button" className="wlane-tip-action" onClick={() => onOpenAgent(id)}>
+                {t("collab.action.viewOnMap")}
+              </button>
+            ) : null}
+          </Tooltip.Content>
+        </Tooltip>
+        <div className="wlane-row-actions">
+          <WorkerPromptButton deck={deck} workerId={id} name={display.title} compact className="wlane-collab" />
+          {onOpenAgent ? (
+            <Button
+              type="button"
+              className="wlane-collab"
+              aria-label={t("collab.action.viewOnMap")}
+              onClick={() => onOpenAgent(id)}
+            >
+              <Icon name="network" size={13} />
+            </Button>
+          ) : null}
+          {running && online ? (
+            <Button
+              type="button"
+              className="wlane-kill"
+              aria-label={t("worker.killTitle")}
+              onClick={() => onKillWorker(id)}
+            >
+              <Icon name="x" size={13} />
+            </Button>
+          ) : onOpenAgent ? null : <span />}
+        </div>
       </div>
     );
   };
@@ -185,11 +241,11 @@ export function WorkerLanes({
     return (
       <div className={`wlane-grp ${key}`}>
         {onToggle ? (
-          <button type="button" className="wlane-grp-h" onClick={onToggle} aria-expanded={open}>
+          <Button type="button" className="wlane-grp-h" onClick={onToggle} aria-expanded={open}>
             <b>{label}</b>
             <Icon name={open ? "chevronDown" : "chevronRight"} size={13} />
             <span className="wlane-grp-n">{ids.length}</span>
-          </button>
+          </Button>
         ) : (
           <div className="wlane-grp-h">
             <b>{label}</b>
@@ -213,25 +269,25 @@ export function WorkerLanes({
         </div>
         <div className="wlane-bar-r">
           {allIds.length > 0 && (
-            <button
+            <Button
               type="button"
               className={`wlane-anomaly ${onlyAnomaly ? "on" : ""}`}
               aria-pressed={onlyAnomaly}
-              title={t("wlane.anomalyTitle")}
+              aria-label={t("wlane.anomalyTitle")}
               onClick={() => setOnlyAnomaly((value) => !value)}
             >
               {t("wlane.anomaly")}
-            </button>
+            </Button>
           )}
           <WorkerSpawnControl running={running} onSpawnWorker={onSpawnWorker} />
         </div>
       </div>
 
       {allIds.length === 0 ? (
-        <PanelEmpty icon="grid" title={t("wlane.empty")} hint={t("wlane.emptyHint")} />
+        <div className="panel-empty"><span className="panel-empty-ico" aria-hidden="true"><Icon name="grid" size={26} /></span><span className="panel-empty-title">{t("wlane.empty")}</span><span className="panel-empty-hint">{t("wlane.emptyHint")}</span></div>
       ) : onlyAnomaly ? (
         grouped.issue.length === 0 ? (
-          <PanelEmpty icon="alert" title={t("wlane.anomalyEmpty")} hint={t("wlane.anomalyEmptyHint")} />
+          <div className="panel-empty"><span className="panel-empty-ico" aria-hidden="true"><Icon name="alert" size={26} /></span><span className="panel-empty-title">{t("wlane.anomalyEmpty")}</span><span className="panel-empty-hint">{t("wlane.anomalyEmptyHint")}</span></div>
         ) : (
           <div className="wlane-roster">{grouped.issue.map(renderRow)}</div>
         )

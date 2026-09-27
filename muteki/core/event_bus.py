@@ -20,6 +20,12 @@ from typing import AsyncIterator, Awaitable, Callable, Optional
 from muteki.core.events import Event
 
 
+class EventPersistenceError(RuntimeError):
+    """The authoritative event sink did not confirm publication."""
+
+    code = "event_persistence_failed"
+
+
 class EventBus:
     def __init__(self, *, ring_size: int = 4096) -> None:
         self._seq = 0
@@ -27,12 +33,16 @@ class EventBus:
         self._subscribers: set[asyncio.Queue[Event]] = set()
         self._ring: deque[Event] = deque(maxlen=ring_size)
         self._sinks: list[Callable[[Event], Awaitable[None]]] = []
+        self._required_sink: Optional[Callable[[Event], Awaitable[None]]] = None
         self._filters: list[Callable[[Event], Awaitable[bool]]] = []
         self._closed = False
+        self._persistence_failure: Optional[EventPersistenceError] = None
 
     # -- producer side -----------------------------------------------------
     async def _publish(self, event: Event) -> Event:
         async with self._lock:
+            if self._persistence_failure is not None:
+                raise self._persistence_failure
             for event_filter in list(self._filters):
                 try:
                     if not await event_filter(event):
@@ -41,16 +51,29 @@ class EventBus:
                     # A lifecycle filter is an ownership boundary. An exception
                     # cannot grant publication that the filter failed to approve.
                     return event
-            self._seq += 1
-            object.__setattr__(event, "seq", self._seq)
-            self._ring.append(event)
+            next_seq = self._seq + 1
+            object.__setattr__(event, "seq", next_seq)
             subs = list(self._subscribers)
             sinks = list(self._sinks)
-            # sinks (e.g. SessionStore JSONL) run before fan-out so a replay can
-            # never observe an event that wasn't durably recorded. A sink raising
-            # must NOT abort the publish (it would drop the fan-out and leave the
-            # stream stuck), so each sink is isolated.
+            required = self._required_sink
+            if required is not None:
+                try:
+                    await required(event)
+                except Exception as exc:
+                    # The event remains unpublished: no ring entry, subscriber
+                    # delivery, or optional projection may claim it succeeded.
+                    failure = EventPersistenceError(
+                        f"required event sink failed: {type(exc).__name__}: {exc}"
+                    )
+                    self._persistence_failure = failure
+                    raise failure from exc
+            self._seq = next_seq
+            self._ring.append(event)
+            # Observers are projections, not authorities. Keep their failures
+            # isolated after the required JSONL append has succeeded.
             for sink in sinks:
+                if sink == required:
+                    continue
                 try:
                     await sink(event)
                 except Exception:
@@ -99,8 +122,26 @@ class EventBus:
     def current_seq(self) -> int:
         return self._seq
 
+    async def replay_window(
+        self, last_event_id: int
+    ) -> Optional[tuple[list[Event], int]]:
+        async with self._lock:
+            if last_event_id < 0 or last_event_id > self._seq:
+                return None
+            if last_event_id == self._seq:
+                return [], self._seq
+            if not self._ring or last_event_id < self._ring[0].seq - 1:
+                return None
+            return [event for event in self._ring if event.seq > last_event_id], self._seq
+
     # -- durable sinks (SessionStore plugs in here) ------------------------
-    def add_sink(self, sink: Callable[[Event], Awaitable[None]]) -> None:
+    def add_sink(
+        self, sink: Callable[[Event], Awaitable[None]], *, required: bool = False,
+    ) -> None:
+        if required:
+            if self._required_sink is not None and self._required_sink != sink:
+                raise ValueError("EventBus supports one authoritative event sink")
+            self._required_sink = sink
         self._sinks.append(sink)
 
     def add_filter(self, event_filter: Callable[[Event], Awaitable[bool]]) -> None:
@@ -120,6 +161,8 @@ class EventBus:
         Idempotent — removing an absent sink is a no-op."""
         try:
             self._sinks.remove(sink)
+            if self._required_sink == sink:
+                self._required_sink = None
             return True
         except ValueError:
             return False

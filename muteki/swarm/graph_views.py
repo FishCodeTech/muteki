@@ -18,8 +18,8 @@ from difflib import SequenceMatcher  # noqa: F401
 from pathlib import Path  # noqa: F401
 from typing import Any, Optional  # noqa: F401
 
+from muteki.core.prompt_assembly import estimate_host_tokens
 from muteki.models.solve_graph import Challenge, Evidence, SolveGraph  # noqa: F401
-from muteki.solver.result_codes import is_genuine_giveup  # noqa: F401
 from muteki.swarm.graph_defs import (  # noqa: F401
     EV_FACT_ADDED, EV_HYP_PROPOSED, EV_HYP_REFUTED, EV_DEAD_END,
     EV_INTENT_PROPOSED, EV_INTENT_CLAIMED, EV_INTENT_CONCLUDED,
@@ -41,6 +41,7 @@ from muteki.swarm.graph_defs import (  # noqa: F401
     INTENT_DISPATCH_CLOSED, _INTENT_DISPATCH_STATES,
     _SERVICE_DEFAULT_PORTS, _LANE_RISK_CLASSES, _FACT_ENGINE_PREFIX_RE,
     _normalize_fact_identity, _clean_lane_risk, _clean_lane_host, canonicalize_lane,
+    SEMANTIC_GRAPH_KINDS,
 )
 
 
@@ -62,7 +63,7 @@ class _QueriesViewsMixin:
                 bad = (json.loads(payload) or {}).get("flag")
             except Exception:
                 bad = None
-            if bad:
+            if bad is not None:
                 out.add(bad)
         return out
 
@@ -122,6 +123,147 @@ class _QueriesViewsMixin:
                         "verified": bool(verified), "confidence": conf})
         return out
 
+    def semantic_graph_watermark(self) -> int:
+        """Highest event seq that may trigger a Decide pass.
+
+        Telemetry (heartbeats, worker-session rows, spawn-rejection counters)
+        is excluded by SEMANTIC_GRAPH_KINDS.
+        """
+        kinds = tuple(sorted(SEMANTIC_GRAPH_KINDS))
+        if not kinds:
+            return 0
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(seq) FROM events WHERE challenge_id=? AND kind IN ("
+                + ",".join("?" for _ in kinds) + ")",
+                (self.challenge.id, *kinds),
+            ).fetchone()
+        return int(row[0] or 0) if row else 0
+
+    def open_coverage_keys(self) -> list[str]:
+        """Coverage markers already present in the usable intent history.
+
+        A coverage key means that exact surface has been covered.  Keeping only
+        open rows allowed a completed productive step to be proposed again under
+        a rewritten goal, which defeats the key's purpose.
+        """
+        if not self._column_exists("intents", "coverage_key"):
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT coverage_key FROM intents "
+                "WHERE challenge_id=? AND coverage_key IS NOT NULL "
+                "AND coverage_key<>'' AND dispatch_state!='retired' "
+                "AND status IN ('open','claimed','done') ORDER BY coverage_key",
+                (self.challenge.id,),
+            ).fetchall()
+        return [str(row[0]) for row in rows if row[0]]
+
+    def active_coverage_keys(self) -> list[str]:
+        """Coverage surfaces currently owned by queued or running work."""
+        if not self._column_exists("intents", "coverage_key"):
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT coverage_key FROM intents "
+                "WHERE challenge_id=? AND coverage_key IS NOT NULL "
+                "AND coverage_key<>'' AND dispatch_state='active' "
+                "AND status IN ('open','claimed') "
+                "AND worker_class!='review' "
+                "ORDER BY coverage_key",
+                (self.challenge.id,),
+            ).fetchall()
+        return [str(row[0]) for row in rows if row[0]]
+
+    def equivalent_step_keys(self) -> set[tuple]:
+        """(route_hash, from_facts, coverage_key, expected_observable,
+        stop_condition) for usable historical steps.
+
+        Text components are normalized (strip, whitespace-collapsed,
+        casefolded) so a rewritten goal on the same structural step collapses
+        to one key while a changed step contract does not."""
+        def _norm(value: Any) -> str:
+            return " ".join(str(value or "").split()).casefold()
+
+        keys: set[tuple] = set()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT i.intent_id, i.route_hash, i.status, "
+                "i.to_fact_seq, i.coverage_key, i.expected_observable, "
+                "i.stop_condition FROM intents i "
+                "WHERE i.challenge_id=? AND i.worker_class NOT IN ('review') "
+                "AND i.dispatch_state!='retired' "
+                "AND i.status IN ('open','claimed','done')",
+                (self.challenge.id,),
+            ).fetchall()
+            ids = [str(row[0]) for row in rows]
+            source_rows = []
+            if ids:
+                q = ",".join("?" for _ in ids)
+                source_rows = self._conn.execute(
+                    f"SELECT intent_id, fact_seq FROM intent_sources "
+                    f"WHERE intent_id IN ({q}) ORDER BY fact_seq",
+                    tuple(ids),
+                ).fetchall()
+        sources: dict[str, list[int]] = {}
+        for intent_id, fact_seq in source_rows:
+            sources.setdefault(str(intent_id), []).append(int(fact_seq))
+        for (intent_id, route, _status, _to_fact,
+             coverage_key, expected_observable, stop_condition) in rows:
+            keys.add((
+                _norm(route),
+                tuple(sources.get(str(intent_id), [])),
+                _norm(coverage_key),
+                _norm(expected_observable),
+                _norm(stop_condition),
+            ))
+        return keys
+
+    def equivalent_lane_source_keys(self) -> set[tuple[str, tuple[int, ...]]]:
+        """Exclusive resource attempts already justified by the same facts.
+
+        An exclusive lane is one coherent stage. Rewording its route or stop
+        condition must not create another serial attempt from the identical
+        evidence; a genuinely new fact changes the source tuple and reopens it.
+        Superseded/cancelled queue entries and legacy lane deferrals never ran,
+        so they do not reserve a historical key.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT i.intent_id, i.lane_key FROM intents i "
+                "LEFT JOIN events e ON e.seq=i.result_seq "
+                "WHERE i.challenge_id=? AND i.worker_class!='review' "
+                "AND i.lane_key IS NOT NULL AND i.lane_key<>'' "
+                "AND i.dispatch_state!='retired' "
+                "AND i.status IN ('open','claimed','done') "
+                "AND COALESCE(i.close_reason,'') NOT IN "
+                "('superseded','cancelled','operator_stop','closed_by_solve',"
+                " 'closed_by_goal_met','route_suppressed') "
+                "AND COALESCE(json_extract(e.payload,'$.result'),'') NOT IN "
+                "('lane_deferred','lane_blocked')",
+                (self.challenge.id,),
+            ).fetchall()
+            ids = [str(row[0]) for row in rows]
+            source_rows = []
+            if ids:
+                qmarks = ",".join("?" for _ in ids)
+                source_rows = self._conn.execute(
+                    f"SELECT intent_id, fact_seq FROM intent_sources "
+                    f"WHERE intent_id IN ({qmarks}) ORDER BY fact_seq",
+                    tuple(ids),
+                ).fetchall()
+        sources: dict[str, list[int]] = {}
+        for intent_id, fact_seq in source_rows:
+            sources.setdefault(str(intent_id), []).append(int(fact_seq))
+        return {
+            (
+                self.normalize_lane_key(str(lane_key)),
+                tuple(sorted(set(sources.get(str(intent_id), [])))),
+            )
+            for intent_id, lane_key in rows
+            if str(lane_key or "").strip()
+        }
+
     def events_since(self, after_seq: int, kinds: Optional[list[str]] = None) -> list[dict]:
         after = int(after_seq or 0)
         params: list[Any] = [after]
@@ -158,12 +300,11 @@ class _QueriesViewsMixin:
     def snapshot(self) -> SolveGraph:
         """Materialize (C) the event log into a read-only SolveGraph view.
 
-        Facts in a TERMINAL lifecycle state (rejected/merged/superseded) are
-        dropped — they failed review and must not pollute the planner/worker view
-        or downstream writeups. challenged stays (shown, but de-verified)."""
+        Only active, admitted Facts enter this materialized planning view."""
         g = SolveGraph(challenge=self.challenge)
-        fact_reviews = self._fact_review_map()
-        fact_states = self._fact_state_map()
+        ctf_mode = getattr(self.challenge, "mode", "ctf") == "ctf"
+        fact_reviews = {} if ctf_mode else self._fact_review_map()
+        fact_states = {} if ctf_mode else self._fact_state_map()
         for e in self.events():
             p = e["payload"]
             if e["kind"] == EV_FACT_ADDED:
@@ -174,12 +315,16 @@ class _QueriesViewsMixin:
                 status = fact_reviews.get(seq)
                 verified = bool(e["verified"])
                 confidence = e["confidence"]
-                if status == "challenged":
-                    verified = False
-                    confidence = min(float(confidence or 0.4), 0.4)
-                elif status == "revalidated":
-                    eff = st.get("verified_effective")
-                    verified = bool(e["verified"]) if eff is None else eff
+                effective_verified = st.get("verified_effective")
+                effective_confidence = st.get("confidence_effective")
+                if effective_verified is not None:
+                    verified = bool(effective_verified)
+                if effective_confidence is not None:
+                    confidence = float(effective_confidence)
+                if status == "challenged" or st.get("state") == FACT_STATE_CHALLENGED:
+                    continue
+                if not verified:
+                    continue
                 g.add_evidence(
                     source=p.get("source", ""), fact=p.get("fact", ""),
                     artifact_id=e["artifact_id"],
@@ -262,22 +407,30 @@ class _QueriesViewsMixin:
     def _active_fact_seq_set(self) -> set[int]:
         """Fact seqs still usable as graph evidence.
 
-        Terminal lifecycle states (rejected/merged/superseded) are audit history only:
-        they must not participate in graph reachability, lineage display, or worker
-        neighborhood prompts. Challenged facts remain active candidates, but their
-        effective verified status is downgraded elsewhere.
+        Unadmitted legacy candidates and challenged/terminal Facts are audit
+        history only.  The returned set is the sole default planning boundary.
         """
-        states = self._fact_state_map()
+        states = (
+            {}
+            if getattr(self.challenge, "mode", "ctf") == "ctf"
+            else self._fact_state_map()
+        )
         with self._lock:
             rows = self._conn.execute(
-                "SELECT seq FROM events WHERE challenge_id=? AND kind=?",
+                "SELECT seq,verified FROM events WHERE challenge_id=? AND kind=?",
                 (self.challenge.id, EV_FACT_ADDED),
             ).fetchall()
         out: set[int] = set()
-        for (seq_raw,) in rows:
+        for seq_raw, original_verified in rows:
             seq = int(seq_raw)
             st = states.get(seq, {})
-            if st.get("retired") or st.get("state") in _FACT_TERMINAL_STATES:
+            state = st.get("state", FACT_STATE_UNRESOLVED)
+            if (st.get("retired") or state in _FACT_TERMINAL_STATES
+                    or state == FACT_STATE_CHALLENGED):
+                continue
+            effective = st.get("verified_effective")
+            admitted = bool(original_verified) if effective is None else bool(effective)
+            if not admitted:
                 continue
             out.add(seq)
         return out
@@ -292,8 +445,8 @@ class _QueriesViewsMixin:
         flag, build the ordered VERIFIED-fact trail that led to it:
 
           1. INTENT-LINKED (preferred): the flag_found event carries intent_id →
-             use that intent's source facts (intent_sources) + produced fact
-             (to_fact_seq), in seq order. This is the precise per-flag path.
+             use that intent's source facts (intent_sources) + produced facts
+             (intent_products), in seq order. This is the precise per-flag path.
           2. TEMPORAL FALLBACK (no intent_id): every verified fact with seq < the
              flag's seq (the breadcrumb trail up to that flag's discovery).
 
@@ -306,11 +459,11 @@ class _QueriesViewsMixin:
             if e["kind"] == EV_FLAG_FOUND:
                 p = e["payload"] or {}
                 fl = p.get("flag")
-                if fl:
+                if fl is not None:
                     flag_events.append((fl, int(e["seq"]), str(p.get("intent_id") or "")))
             elif e["kind"] == EV_FLAG_INVALIDATED:
                 bad = (e["payload"] or {}).get("flag")
-                if bad:
+                if bad is not None:
                     invalidated.add(bad)
         if not flag_events:
             return {}
@@ -325,6 +478,7 @@ class _QueriesViewsMixin:
 
         # verified fact seqs in order (origin verified OR revalidated, not retired)
         verified_seqs = [d["fact_seq"] for d in self.verified_evidence()]
+        verified_set = set(verified_seqs)
         out: dict[str, list[str]] = {}
         for flag, fseq, intent_id in flag_events:
             if flag in invalidated:
@@ -337,15 +491,19 @@ class _QueriesViewsMixin:
                         "SELECT fact_seq FROM intent_sources WHERE intent_id=? ORDER BY fact_seq",
                         (intent_id,),
                     ).fetchall()
-                    to_row = self._conn.execute(
-                        "SELECT to_fact_seq FROM intents WHERE intent_id=? AND challenge_id=?",
-                        (intent_id, self.challenge.id),
-                    ).fetchone()
+                    product_rows = self._conn.execute(
+                        "SELECT fact_seq FROM intent_products "
+                        "WHERE intent_id=? ORDER BY fact_seq",
+                        (intent_id,),
+                    ).fetchall()
                 for (s,) in src_rows:
-                    if s is not None and _live_verified(int(s)):
+                    if (s is not None and int(s) in verified_set
+                            and _live_verified(int(s))):
                         chain_seqs.append(int(s))
-                if to_row and to_row[0] is not None and _live_verified(int(to_row[0])):
-                    chain_seqs.append(int(to_row[0]))
+                for (s,) in product_rows:
+                    if (s is not None and int(s) in verified_set
+                            and _live_verified(int(s))):
+                        chain_seqs.append(int(s))
             if not chain_seqs:
                 # temporal fallback: verified facts discovered before this flag
                 chain_seqs = [s for s in verified_seqs if s <= fseq]
@@ -497,24 +655,39 @@ class _QueriesViewsMixin:
         # order by the seq each entity was (last) confirmed at → unlock order
         return sorted(by_entity.values(), key=lambda r: r["seq"])
 
-    def _open_intents_block(self, limit: int = 24) -> str:
+    def _open_intents_block(self, limit: int = 24, *, with_lineage: bool = False) -> str:
         """Render open/claimed intents (not in the SolveGraph snapshot — they live
-        only in the intents table). Empty string when none."""
+        only in the intents table). Empty string when none.
+
+        with_lineage folds each intent's source/product fact seqs into a compact
+        parenthetical — the deduped replacement for the standalone
+        _active_intent_lineage_block section in to_reason_summary."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT goal, status, worker, worker_class, route_hash, branch_id, "
-                "priority, lane_key, risk_class FROM intents "
+                "SELECT intent_id, goal, status, worker, worker_class, route_hash, "
+                "branch_id, priority, lane_key, risk_class, expected_observable, "
+                "stop_condition, coverage_key FROM intents "
                 "WHERE status IN ('open','claimed') AND dispatch_state='active' "
                 "ORDER BY priority DESC, created_seq",
             ).fetchall()
         if not rows:
             return ""
         omitted = max(0, len(rows) - limit)
-        rows = rows[-limit:]
+        rows = rows[:limit]
+        sources: dict[str, list[int]] = {}
+        products: dict[str, list[int]] = {}
+        if with_lineage:
+            ids = {str(r[0]) for r in rows}
+            sources = self._intent_sources_map(ids)
+            products = self._intent_products_map(ids)
         lines = ["\n## Open intents (directions in flight)"]
         if omitted:
-            lines.append(f"  (... {omitted} earlier open intents omitted)")
-        for goal, status, worker, worker_class, route_hash, branch_id, priority, lane_key, risk_class in rows:
+            lines.append(
+                f"  (... {omitted} lower-priority open intents omitted)"
+            )
+        for (intent_id, goal, status, worker, worker_class, route_hash,
+             branch_id, priority, lane_key, risk_class, expected_observable,
+             stop_condition, coverage_key) in rows:
             who = f" [{worker}]" if worker else ""
             meta = []
             if worker_class and worker_class != "code":
@@ -527,14 +700,40 @@ class _QueriesViewsMixin:
                 meta.append(f"lane={lane_key}")
             if risk_class:
                 meta.append(f"risk={risk_class}")
-            if int(priority or 0):
-                meta.append(f"priority={int(priority or 0)}")
+            priority_value = int(priority or 0)
+            priority_label = (
+                "operator" if priority_value >= 100
+                else "high" if priority_value >= 50
+                else "low" if priority_value < 0
+                else "normal"
+            )
+            meta.append(f"priority={priority_label}")
+            if coverage_key:
+                meta.append(f"coverage={str(coverage_key)}")
+            if with_lineage:
+                src = sources.get(str(intent_id), [])
+                prod = products.get(str(intent_id), [])
+                if src:
+                    meta.append("from " + ",".join(f"#{s}" for s in src))
+                if prod:
+                    meta.append("produced " + ",".join(f"#{s}" for s in prod))
             suffix = f" ({', '.join(meta)})" if meta else ""
-            lines.append(f"- ({status}){who} {str(goal)[:160]}{suffix}")
+            lines.append(
+                f"- {intent_id} ({status}){who} {str(goal)}{suffix}"
+            )
+            contract = []
+            if expected_observable:
+                contract.append(f"observe: {str(expected_observable)}")
+            if stop_condition:
+                contract.append(f"stop: {str(stop_condition)}")
+            if contract:
+                lines.append("  " + " | ".join(contract))
         return "\n".join(lines)
 
     def _intent_sources_map(self, intent_ids: Optional[set[str]] = None, *,
                             include_retired: bool = False) -> dict[str, list[int]]:
+        if intent_ids is not None and not intent_ids:
+            return {}
         params: list[Any] = []
         where = ""
         if intent_ids:
@@ -556,6 +755,8 @@ class _QueriesViewsMixin:
 
     def _intent_products_map(self, intent_ids: Optional[set[str]] = None, *,
                              include_retired: bool = False) -> dict[str, list[int]]:
+        if intent_ids is not None and not intent_ids:
+            return {}
         params: list[Any] = []
         where = ""
         if intent_ids:
@@ -588,22 +789,9 @@ class _QueriesViewsMixin:
             for r in rows
         ]
 
-    def _giveup_product_fact_seqs(self) -> set[int]:
-        giveup = self._intent_giveup_map()
-        if not giveup:
-            return set()
-        products = self._intent_products_map(include_retired=True)
-        out: set[int] = set()
-        for iid, seqs in products.items():
-            if giveup.get(iid, False):
-                out.update(seqs)
-        return out
-
     def _active_fact_seqs_by_verified(self, *, verified: bool,
-                                      limit: Optional[int] = None,
-                                      exclude_giveup_products: bool = False) -> list[int]:
+                                      limit: Optional[int] = None) -> list[int]:
         states = self._fact_state_map()
-        blocked = self._giveup_product_fact_seqs() if exclude_giveup_products else set()
         sql = "SELECT seq, verified FROM events WHERE challenge_id=? AND kind=? ORDER BY seq DESC"
         params: list[Any] = [self.challenge.id, EV_FACT_ADDED]
         if limit is not None:
@@ -614,8 +802,6 @@ class _QueriesViewsMixin:
         out: list[int] = []
         for seq_raw, raw_verified in rows:
             seq = int(seq_raw)
-            if seq in blocked:
-                continue
             st = states.get(seq, {})
             state = st.get("state", FACT_STATE_UNRESOLVED)
             if st.get("retired") or state in _FACT_TERMINAL_STATES:
@@ -628,17 +814,12 @@ class _QueriesViewsMixin:
                 out.append(seq)
         return list(reversed(out))
 
-    def _latest_verified_fact_seqs(self, limit: Optional[int] = None, *,
-                                   exclude_giveup_products: bool = False) -> list[int]:
+    def _latest_verified_fact_seqs(self, limit: Optional[int] = None) -> list[int]:
         return self._active_fact_seqs_by_verified(
-            verified=True, limit=limit,
-            exclude_giveup_products=exclude_giveup_products)
+            verified=True, limit=limit)
 
-    def _latest_candidate_fact_seqs(self, limit: Optional[int] = None, *,
-                                    exclude_giveup_products: bool = False) -> list[int]:
-        return self._active_fact_seqs_by_verified(
-            verified=False, limit=limit,
-            exclude_giveup_products=exclude_giveup_products)
+    def _latest_candidate_fact_seqs(self, limit: Optional[int] = None) -> list[int]:
+        return []
 
     def pin_facts(self, *, actor: str, fact_seqs: list[int],
                   reason: str = "") -> list[int]:
@@ -677,11 +858,31 @@ class _QueriesViewsMixin:
             pinned.append(seq)
         return pinned
 
-    def pinned_fact_seqs(self, *, exclude_giveup_products: bool = False) -> list[int]:
+    def reason_compaction_cutoff(
+        self, keep_recent_tokens: int, *, after_seq: int = 0,
+    ) -> int:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT seq, payload FROM events WHERE challenge_id=? "
+                "AND kind IN (?,?) AND seq>? ORDER BY seq DESC",
+                (self.challenge.id, EV_FACT_ADDED, EV_DEAD_END, int(after_seq)),
+            ).fetchall()
+        used = 0
+        for seq, payload in rows:
+            try:
+                body = json.loads(payload) or {}
+            except (json.JSONDecodeError, TypeError):
+                body = {}
+            text = str(body.get("fact") or body.get("reason") or "")
+            used += estimate_host_tokens(text)
+            if used >= max(1, int(keep_recent_tokens)):
+                return max(int(after_seq), int(seq) - 1)
+        return int(after_seq)
+
+    def pinned_fact_seqs(self) -> list[int]:
         if not self._table_exists("fact_pins"):
             return []
         active = self._active_fact_seq_set()
-        blocked = self._giveup_product_fact_seqs() if exclude_giveup_products else set()
         with self._lock:
             rows = self._conn.execute(
                 "SELECT fact_seq FROM fact_pins WHERE challenge_id=? ORDER BY pinned_seq",
@@ -690,12 +891,12 @@ class _QueriesViewsMixin:
         out: list[int] = []
         for (raw_seq,) in rows:
             seq = int(raw_seq)
-            if seq in active and seq not in blocked:
+            if seq in active:
                 out.append(seq)
         return out
 
     def fact_pin_context(self, limit: int = 240) -> str:
-        active = self._active_fact_seq_set() - self._giveup_product_fact_seqs()
+        active = self._active_fact_seq_set()
         if not active:
             return ""
         states = self._fact_state_map()
@@ -725,24 +926,16 @@ class _QueriesViewsMixin:
             return ""
         return "## Fact retention index (model decides pinned_facts)\n" + "\n".join(lines)
 
-    def _intent_giveup_map(self) -> dict[str, bool]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT intent_id, close_reason FROM intents WHERE challenge_id=?",
-                (self.challenge.id,),
-            ).fetchall()
-        return {str(iid): is_genuine_giveup(str(reason or "")) for iid, reason in rows}
-
-    def _reason_relevant_fact_seqs(self) -> set[int]:
+    def _reason_relevant_fact_seqs(self, *, after_seq: int = 0) -> set[int]:
         active = self._active_intent_rows()
         active_ids = {str(i["intent_id"]) for i in active}
         sources = self._intent_sources_map()
         products = self._intent_products_map()
-        giveup = self._intent_giveup_map()
         producer_by_fact: dict[int, set[str]] = {}
         for iid, seqs in products.items():
             for seq in seqs:
                 producer_by_fact.setdefault(seq, set()).add(iid)
+        pinned = set(self.pinned_fact_seqs())
         facts: set[int] = set()
         seen_intents: set[str] = set()
         stack = list(active_ids)
@@ -752,24 +945,41 @@ class _QueriesViewsMixin:
                 continue
             seen_intents.add(iid)
             for seq in sources.get(iid, []):
-                facts.add(seq)
+                if seq > int(after_seq) or seq in pinned:
+                    facts.add(seq)
                 for producer in producer_by_fact.get(seq, set()) - seen_intents:
-                    if not giveup.get(producer, False):
-                        stack.append(producer)
+                    stack.append(producer)
             for seq in products.get(iid, []):
-                facts.add(seq)
-        facts.update(self._latest_verified_fact_seqs(
-            limit=8, exclude_giveup_products=True))
-        facts.update(self.pinned_fact_seqs(exclude_giveup_products=True))
-        facts.update(self._latest_candidate_fact_seqs(
-            limit=16, exclude_giveup_products=True))
+                if seq > int(after_seq) or seq in pinned:
+                    facts.add(seq)
+        # Verified evidence is durable planning state.  Context compaction owns
+        # size control; an arbitrary latest-8 slice can discard the credential or
+        # topology fact needed to continue a long exploit chain.
+        facts.update(self._latest_verified_fact_seqs())
+        facts.update(pinned)
         return facts
 
-    def _summary_for_fact_seqs(self, fact_seqs: set[int],
-                               max_dead_ends: Optional[int] = None) -> str:
+    def _summary_for_fact_seqs(
+        self, fact_seqs: set[int], max_dead_ends: Optional[int] = None,
+        *, after_seq: int = 0,
+    ) -> str:
         c = self.challenge
-        lines = [f"# Challenge: {c.name} [{c.category}] ({c.points} pts)"]
-        fact_states = self._fact_state_map()
+        # A Web Run's name is display metadata chosen by the operator.  It may
+        # contain model names, batch labels, or retest notes, none of which are
+        # challenge evidence.  CTF Decide already receives the actual operator
+        # instruction, target, attachments, and completion contract separately;
+        # exposing the display name here made it invent attack surfaces from the
+        # title (for example treating "Pi Decide" as a target feature).
+        lines = (
+            ["# CTF solve graph"]
+            if getattr(c, "mode", "ctf") == "ctf"
+            else [f"# Challenge: {c.name} [{c.category}] ({c.points} pts)"]
+        )
+        fact_states = (
+            {}
+            if getattr(self.challenge, "mode", "ctf") == "ctf"
+            else self._fact_state_map()
+        )
         want = sorted(fact_seqs)
         if want:
             q = ",".join("?" for _ in want)
@@ -781,29 +991,41 @@ class _QueriesViewsMixin:
                     (EV_FACT_ADDED, *want),
                 ).fetchall()
             verified_lines: list[str] = []
-            candidate_lines: list[str] = []
             for seq, source, fact, verified, confidence in rows:
                 st = fact_states.get(int(seq), {})
                 if st.get("retired") or st.get("state") in _FACT_TERMINAL_STATES:
                     continue
-                line = f"- ({source or 'unknown'}) [#{int(seq)}] {str(fact)[:240]}"
-                if bool(verified):
+                line = f"- ({source or 'unknown'}) [#{int(seq)}] {str(fact)}"
+                effective = st.get("verified_effective")
+                is_verified = bool(verified) if effective is None else bool(effective)
+                if st.get("state") == FACT_STATE_CHALLENGED:
+                    is_verified = False
+                effective_confidence = st.get("confidence_effective")
+                if effective_confidence is None:
+                    effective_confidence = confidence
+                if is_verified:
                     verified_lines.append(line)
-                else:
-                    candidate_lines.append(f"{line} [UNVERIFIED] confidence={float(confidence or 0):.2f}")
             if verified_lines:
                 lines.append("\n## Confirmed evidence")
                 lines.extend(verified_lines)
-            if candidate_lines:
-                lines.append("\n## Candidates / needs verification")
-                lines.extend(candidate_lines)
         with self._lock:
             rows = self._conn.execute(
-                "SELECT json_extract(payload,'$.reason') FROM events "
-                "WHERE kind=? ORDER BY seq",
-                (EV_DEAD_END,),
+                "SELECT seq, json_extract(payload,'$.reason'), "
+                "json_extract(payload,'$.tested_scope'), "
+                "json_extract(payload,'$.observed_result') FROM events "
+                "WHERE challenge_id=? AND kind=? AND seq>? ORDER BY seq",
+                (self.challenge.id, EV_DEAD_END, int(after_seq)),
             ).fetchall()
-        reasons = [str(r[0]) for r in rows if r[0]]
+        reasons: list[str] = []
+        for _seq, reason, tested_scope, observed_result in rows:
+            if not reason:
+                continue
+            detail = str(reason)
+            if tested_scope:
+                detail += f" | tested: {tested_scope}"
+            if observed_result:
+                detail += f" | observed: {observed_result}"
+            reasons.append(detail)
         if max_dead_ends is not None:
             reasons = reasons[-int(max_dead_ends):]
         if reasons:
@@ -831,7 +1053,7 @@ class _QueriesViewsMixin:
                 f"products: {prod_txt}")
         return "\n".join(lines)
 
-    def intent_neighborhood_block(self, intent_id: str, sibling_limit: int = 8) -> str:
+    def intent_neighborhood_block(self, intent_id: str, sibling_limit: int = 10**9) -> str:
         iid = (intent_id or "").strip()
         if not iid:
             return ""
@@ -851,13 +1073,123 @@ class _QueriesViewsMixin:
             ).fetchall()
         lines = ["\n## Intent graph neighborhood"]
         lines.append("Source facts:")
-        for seq in sources[:12]:
-            lines.append(f"- [#{seq}] {texts.get(seq, '')[:240]}")
+        for seq in sources:
+            lines.append(f"- [#{seq}] {texts.get(seq, '')}")
         if rows:
             lines.append("Sibling intents sharing those facts:")
             for sid, goal, status in rows:
-                lines.append(f"- {sid} ({status}): {str(goal)[:180]}")
+                lines.append(f"- {sid} ({status}): {str(goal)}")
         return "\n".join(lines)
+
+    def intent_source_facts(self, intent_id: str) -> list[dict]:
+        """Full source-fact rows for one intent (the ``propose_intent``
+        ``from_fact_seqs`` linkage, materialized in ``intent_sources``):
+        {seq, text, verified, artifact_id, observed_at}. The execute-context
+        expansion of the ``[#seq]`` refs ``intent_neighborhood_block`` renders;
+        terminal/retired facts are excluded (same active-set rule)."""
+        iid = (intent_id or "").strip()
+        if not iid:
+            return []
+        active = self._active_fact_seq_set()
+        states = self._fact_state_map()
+        with self._lock:
+            intent_row = self._conn.execute(
+                "SELECT worker_class FROM intents WHERE challenge_id=? AND intent_id=?",
+                (self.challenge.id, iid),
+            ).fetchone()
+            rows = self._conn.execute(
+                "SELECT e.seq, e.ts, e.artifact_id, e.verified, e.payload "
+                "FROM intent_sources s JOIN events e ON e.seq = s.fact_seq "
+                "WHERE s.intent_id=? AND e.kind=? ORDER BY e.seq",
+                (iid, EV_FACT_ADDED),
+            ).fetchall()
+        verifier_context = bool(intent_row and str(intent_row[0] or "") == "verifier")
+        out: list[dict] = []
+        for seq, ts, event_artifact, raw_verified, payload in rows:
+            fact_seq = int(seq)
+            fact_state = str(states.get(fact_seq, {}).get("state") or FACT_STATE_UNRESOLVED)
+            if (fact_seq not in active
+                    and not (verifier_context and fact_state == FACT_STATE_CHALLENGED)):
+                continue
+            try:
+                p = json.loads(payload) or {}
+            except (json.JSONDecodeError, TypeError):
+                p = {}
+            st = states.get(fact_seq, {})
+            eff = st.get("verified_effective")
+            is_verified = bool(raw_verified) if eff is None else bool(eff)
+            if st.get("state") == FACT_STATE_CHALLENGED:
+                is_verified = False
+            prov = p.get("evidence_provenance")
+            prov = prov if isinstance(prov, dict) else {}
+            artifact_id = str(prov.get("artifact_id") or "") or str(event_artifact or "")
+            out.append({
+                "seq": fact_seq,
+                "text": str(p.get("fact") or ""),
+                "verified": is_verified,
+                "artifact_id": artifact_id,
+                "observed_at": ts,
+            })
+        return out
+
+    def dead_ends_for_context(self, *, intent_id: str = "", coverage_key: str = "",
+                              route_hash: str = "", target_epoch: str = "",
+                              limit: int = 10**9, epoch_wide: bool = False) -> list[dict]:
+        """Scope-filtered dead-end rows for a worker's projected view. A dead
+        end is RELEVANT when its intent_id equals the given one, or its
+        coverage_key/route_hash matches a non-empty given value, or it carries
+        NO intent/route/coverage binding at all and its target_epoch matches
+        (legacy unscoped dead ends stay visible within their epoch). When
+        ``epoch_wide`` is True and ``target_epoch`` is given, EVERY dead end
+        whose payload epoch matches is relevant — bound or unbound (the
+        bootstrap/rush view: the whole epoch's ruled-out ground, not just one
+        step's scope). Newest first, capped at ``limit``. Each row includes the
+        reason, exact tested scope, observed result, and graph bindings."""
+        iid = (intent_id or "").strip()
+        cov = (coverage_key or "").strip()
+        route = (route_hash or "").strip()
+        epoch = (target_epoch or "").strip()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT seq, ts, actor, payload FROM events "
+                "WHERE challenge_id=? AND kind=? ORDER BY seq DESC",
+                (self.challenge.id, EV_DEAD_END),
+            ).fetchall()
+        out: list[dict] = []
+        for seq, ts, actor, payload in rows:
+            try:
+                p = json.loads(payload) or {}
+            except (json.JSONDecodeError, TypeError):
+                p = {}
+            d_intent = str(p.get("intent_id") or "")
+            d_route = str(p.get("route_hash") or "")
+            d_cov = str(p.get("coverage_key") or "")
+            d_epoch = str(p.get("target_epoch") or "")
+            bound = bool(d_intent or d_route or d_cov)
+            relevant = bool(
+                (epoch_wide and epoch and d_epoch == epoch)
+                or (iid and d_intent == iid)
+                or (cov and d_cov and d_cov == cov)
+                or (route and d_route and d_route == route)
+                or (not bound and d_epoch == epoch)
+            )
+            if not relevant:
+                continue
+            out.append({
+                "seq": int(seq),
+                "ts": ts,
+                "reason": str(p.get("reason") or ""),
+                "tested_scope": str(p.get("tested_scope") or ""),
+                "observed_result": str(p.get("observed_result") or ""),
+                "intent_id": d_intent,
+                "route_hash": d_route,
+                "coverage_key": d_cov,
+                "target_epoch": d_epoch,
+                "actor": str(actor or ""),
+            })
+            if len(out) >= int(limit):
+                break
+        return out
 
     def open_goal_texts(self) -> list[str]:
         """Goal texts of every open/claimed intent — the dedup reference set for
@@ -874,17 +1206,14 @@ class _QueriesViewsMixin:
         """Goal texts that can be claimed right now.
 
         This intentionally differs from open_goal_texts(): a live claimed intent is
-        active for dedupe, but it is not dispatchable until its lease expires. Reason's
-        starvation valve needs this narrower view to avoid treating a stale live claim
-        as available work.
+        active for dedupe, while only an explicitly open Intent is dispatchable.
+        Runtime retirement or Coordinator recovery performs the claimed→open
+        transition before this view exposes the work again.
         """
-        now = time.time()
         with self._lock:
             rows = self._conn.execute(
                 "SELECT goal FROM intents WHERE dispatch_state='active' "
-                "AND (status='open' OR (status='claimed' AND lease_until IS NOT NULL "
-                "AND lease_until < ?)) ORDER BY priority DESC, created_seq",
-                (now,),
+                "AND status='open' ORDER BY priority DESC, created_seq",
             ).fetchall()
         return [str(r[0]) for r in rows if r[0]]
 
@@ -899,19 +1228,47 @@ class _QueriesViewsMixin:
             ).fetchall()
         return [str(r[0]) for r in rows if r[0]]
 
+    def active_lane_intent_rows(self) -> list[dict]:
+        """Open/claimed non-review intents that reserve an exclusive lane."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT intent_id, lane_key, status, worker, route_hash, priority "
+                "FROM intents WHERE challenge_id=? "
+                "AND status IN ('open','claimed') AND dispatch_state='active' "
+                "AND lane_key IS NOT NULL AND lane_key<>'' "
+                "AND worker_class!='review' ORDER BY priority DESC, created_seq",
+                (self.challenge.id,),
+            ).fetchall()
+        return [
+            {
+                "intent_id": str(row[0]),
+                "lane_key": str(row[1]),
+                "status": str(row[2]),
+                "worker": str(row[3] or ""),
+                "route_hash": str(row[4] or ""),
+                "priority": int(row[5] or 0),
+            }
+            for row in rows
+        ]
+
     def coverage_intent_rows(self) -> list[dict]:
         """All non-review intents with status/dispatch/result for pentest P2 coverage."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT i.intent_id, i.goal, i.route_hash, i.status, i.dispatch_state, "
-                "i.worker_class, e.payload FROM intents i "
+                "i.worker_class, i.branch_id, i.coverage_key, "
+                "i.expected_observable, i.stop_condition, i.priority, i.worker, "
+                "e.payload FROM intents i "
                 "LEFT JOIN events e ON e.seq = i.result_seq "
                 "WHERE i.challenge_id=? AND i.worker_class NOT IN ('verifier','review') "
                 "ORDER BY i.created_seq",
                 (self.challenge.id,),
             ).fetchall()
         out: list[dict] = []
-        for iid, goal, route, status, dispatch, wc, payload in rows:
+        for (
+            iid, goal, route, status, dispatch, wc, branch_id, coverage_key,
+            expected_observable, stop_condition, priority, worker, payload,
+        ) in rows:
             result = ""
             if payload:
                 try:
@@ -925,6 +1282,12 @@ class _QueriesViewsMixin:
                 "status": status or "",
                 "dispatch_state": dispatch or "",
                 "worker_class": wc or "",
+                "branch_id": branch_id or "",
+                "coverage_key": coverage_key or "",
+                "expected_observable": expected_observable or "",
+                "stop_condition": stop_condition or "",
+                "priority": int(priority or 0),
+                "worker": worker or "",
                 "result": result,
             })
         return out

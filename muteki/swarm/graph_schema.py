@@ -33,6 +33,12 @@ CREATE TABLE IF NOT EXISTS intents (
     lane_deferrals INTEGER NOT NULL DEFAULT 0,
     deferred_against_locked_seq INTEGER,
     priority      INTEGER NOT NULL DEFAULT 0,
+    requested_priority TEXT,
+    priority_reason TEXT,
+    value_claim_json TEXT,
+    novelty_key TEXT,
+    requires_capabilities_json TEXT,
+    required_pocs_json TEXT,
     status        TEXT NOT NULL DEFAULT 'open',  -- open|claimed|done
     worker        TEXT,
     lease_until   REAL,
@@ -56,6 +62,109 @@ CREATE TABLE IF NOT EXISTS intent_products (
     intent_id  TEXT NOT NULL,
     fact_seq   INTEGER NOT NULL,
     PRIMARY KEY (intent_id, fact_seq)
+);
+-- Raw claims and tool evidence.  These rows are audit/search input and never
+-- enter the default Fact-Goal-Step planning frontier directly.
+CREATE TABLE IF NOT EXISTS observations (
+    observation_seq INTEGER PRIMARY KEY,
+    challenge_id TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    intent_id TEXT,
+    target_epoch TEXT NOT NULL,
+    text TEXT NOT NULL,
+    witness TEXT,
+    artifact_id TEXT,
+    provenance_json TEXT,
+    canonical_key TEXT,
+    admitted_fact_seq INTEGER,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fact_evidence (
+    fact_seq INTEGER NOT NULL,
+    observation_seq INTEGER NOT NULL,
+    challenge_id TEXT NOT NULL,
+    PRIMARY KEY (fact_seq, observation_seq)
+);
+-- Explicit executable state used by Decide and the dispatcher.
+CREATE TABLE IF NOT EXISTS capabilities (
+    capability_key TEXT NOT NULL,
+    challenge_id TEXT NOT NULL,
+    target_epoch TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    quality TEXT,
+    sharing TEXT NOT NULL DEFAULT 'run-shared',
+    state TEXT NOT NULL DEFAULT 'active',
+    source_intent TEXT,
+    access_path_id TEXT,
+    evidence_facts_json TEXT,
+    metadata_json TEXT,
+    created_seq INTEGER NOT NULL,
+    updated_seq INTEGER NOT NULL,
+    PRIMARY KEY (challenge_id, target_epoch, capability_key)
+);
+CREATE TABLE IF NOT EXISTS runtime_resources (
+    resource_id TEXT PRIMARY KEY,
+    challenge_id TEXT NOT NULL,
+    target_epoch TEXT NOT NULL,
+    owner_worker TEXT NOT NULL,
+    owner_intent TEXT,
+    backend TEXT NOT NULL,
+    pid INTEGER,
+    container_name TEXT,
+    log_path TEXT,
+    cwd TEXT,
+    env_json TEXT,
+    cleanup_command TEXT,
+    health_json TEXT,
+    state TEXT NOT NULL DEFAULT 'running',
+    created_seq INTEGER NOT NULL,
+    updated_seq INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS access_paths (
+    access_path_id TEXT PRIMARY KEY,
+    challenge_id TEXT NOT NULL,
+    target_epoch TEXT NOT NULL,
+    runtime_resource_id TEXT NOT NULL,
+    owner_worker TEXT NOT NULL,
+    source_intent TEXT,
+    reach_json TEXT NOT NULL,
+    operations_json TEXT NOT NULL,
+    quality TEXT NOT NULL,
+    endpoint TEXT,
+    use_spec_json TEXT NOT NULL,
+    health_json TEXT,
+    dependency_facts_json TEXT,
+    capability_keys_json TEXT,
+    state TEXT NOT NULL DEFAULT 'starting',
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    created_seq INTEGER NOT NULL,
+    updated_seq INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS capability_gaps (
+    gap_id TEXT PRIMARY KEY,
+    challenge_id TEXT NOT NULL,
+    target_epoch TEXT NOT NULL,
+    worker TEXT NOT NULL,
+    intent_id TEXT,
+    description TEXT NOT NULL,
+    required_capabilities_json TEXT,
+    consumers_json TEXT,
+    state TEXT NOT NULL DEFAULT 'open',
+    created_seq INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS value_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    challenge_id TEXT NOT NULL,
+    intent_id TEXT NOT NULL,
+    effect TEXT,
+    requested_priority TEXT,
+    effective_priority INTEGER,
+    achieved INTEGER NOT NULL,
+    capabilities_added_json TEXT,
+    unblocked_count INTEGER NOT NULL DEFAULT 0,
+    elapsed_seconds REAL,
+    detail TEXT,
+    created_seq INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS pocs (
     poc_id        TEXT PRIMARY KEY,
@@ -123,6 +232,15 @@ CREATE TABLE IF NOT EXISTS branches (
     title         TEXT NOT NULL,
     assumption    TEXT NOT NULL,
     prove_or_disprove TEXT,
+    source_intent TEXT,
+    from_facts_json TEXT,
+    expected_observable TEXT,
+    stop_condition TEXT,
+    coverage_key TEXT,
+    route_hash TEXT,
+    lane_key TEXT,
+    risk_class TEXT,
+    resource_key TEXT,
     status        TEXT NOT NULL DEFAULT 'open',
     created_seq   INTEGER NOT NULL,
     resolved_seq  INTEGER
@@ -183,7 +301,8 @@ CREATE TABLE IF NOT EXISTS operator_directives (
     acted_seq      INTEGER,
     superseded_seq INTEGER
 );
--- F: classified HITL requests (need_kind drives auto-resolution vs operator pause).
+-- Durable HITL requests. need_kind is retained for historical rows; every new
+-- NEED_INPUT request waits for the operator.
 CREATE TABLE IF NOT EXISTS hitl_requests (
     request_id       TEXT PRIMARY KEY,
     challenge_id     TEXT NOT NULL,
@@ -229,4 +348,10 @@ CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
 CREATE INDEX IF NOT EXISTS idx_intent_dependencies_parent
     ON intent_dependencies(challenge_id, depends_on_intent_id);
 CREATE INDEX IF NOT EXISTS idx_intent_products_fact_seq ON intent_products(fact_seq);
+CREATE INDEX IF NOT EXISTS idx_observations_challenge
+    ON observations(challenge_id, target_epoch, observation_seq);
+CREATE INDEX IF NOT EXISTS idx_capabilities_active
+    ON capabilities(challenge_id, target_epoch, state, capability_key);
+CREATE INDEX IF NOT EXISTS idx_access_paths_active
+    ON access_paths(challenge_id, target_epoch, state, access_path_id);
 """

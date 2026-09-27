@@ -24,9 +24,11 @@ import weakref
 from typing import Any, Callable, Optional
 
 from muteki.solver.cli_driver import CliResult, StreamStep
+from muteki.solver.cli_launch_check import check_process_launch
 from muteki.solver.control_receiver import (
     ControlError, ControlReceiver, StartWorkerRejected, _SupervisorLink,
 )
+from muteki.solver.worker_resource_limits import WorkerResourceLimits, resolve_worker_resource_limits
 
 # re-export so existing `from control_client import ControlError` keeps working.
 __all__ = [
@@ -40,7 +42,7 @@ __all__ = [
 # baseEnv, so we don't leak the host's full environment into the container.
 _ENV_PREFIXES = (
     "MUTEKI_", "ANTHROPIC_", "CLAUDE_", "CODEX_", "CURSOR_", "OPENAI_",
-    "PI_", "KIMI_", "GROK_", "XAI_", "OPENCODE_", "DEEPSEEK_", "DSH_",
+    "PI_", "KIMI_", "GROK_", "XAI_", "OPENCODE_", "DEEPSEEK_",
     "XDG_",
 )
 _CONTAINER_WORKSPACE = "/home/kali/workspace"
@@ -136,11 +138,11 @@ class _RcpProc:
 
 
 def confirm_run_absent(run_id: str) -> None:
-    """Confirm every retained worker after Docker proves its PID namespace absent.
+    """Confirm retained workers after a proven container exit or scoped supervisor ACK.
 
     This recovers a lost terminal frame without weakening the fence: neither
-    transport return nor Signal ACK calls this; only authoritative run-container
-    absence does.
+    transport return nor Signal ACK calls this. Shared Runs use the supervisor's
+    owner-scoped teardown receipt; isolated Runs use Docker absence proof.
     """
     with _RCP_PROCS_LOCK:
         procs = list(_RCP_PROCS.pop(str(run_id), weakref.WeakSet()))
@@ -163,6 +165,10 @@ def run_cli_streaming_rcp(
     steer_event: "Optional[threading.Event]" = None,
     paused_event: "Optional[threading.Event]" = None,
     stdin_text: Optional[str] = None,
+    resource_limits: Optional[WorkerResourceLimits] = None,
+    owner_run_id: str = "",
+    owner_token: str = "",
+    owner_workspace: str = "",
 ) -> CliResult:
     """Streaming worker run via the rcp supervisor. Mirrors
     container_exec.run_cli_streaming_container (cancel/steer/pause); control routes
@@ -178,14 +184,23 @@ def run_cli_streaming_rcp(
     timeout backstops discount those intervals, matching the supervisor's
     authoritative pause-aware active-time budget.
     """
+    check_process_launch(
+        argv, cwd=container_cwd, env=env, stdin_text=stdin_text, source="rcp")
     link = _resolve_link(run_id)
+    limits = resource_limits or resolve_worker_resource_limits()
     spec = {
         "argv": argv,
         "cwd": container_cwd,
         "env": _filter_env(env),
         "timeout_sec": max(1, int(timeout)),
         "tag": uuid.uuid4().hex[:12],
+        "output_limit_bytes": int(limits.output_limit_bytes),
+        "disk_limit_bytes": int(limits.disk_limit_bytes),
     }
+    if owner_run_id:
+        spec["owner_run_id"] = owner_run_id
+        spec["owner_token"] = owner_token
+        spec["owner_workspace"] = owner_workspace
     if stdin_text is not None:
         # Transport-only field: never duplicate the plaintext into argv/tag/runtime
         # diagnostics.  The authenticated per-run control link hands it directly to
@@ -256,11 +271,12 @@ def run_cli_streaming_rcp(
             # the whole run's worker set; if the link itself died, outer container
             # ownership remains and the run-level teardown is still required.
             try:
-                link.teardown(timeout=5.0)
+                link.teardown(timeout=5.0, owner_run_id=owner_run_id,
+                              owner_token=owner_token)
             except Exception:
                 pass
         raise
-    proc = _RcpProc(link, worker_id, run_id=run_id)
+    proc = _RcpProc(link, worker_id, run_id=owner_run_id or run_id)
     proc_registered = True
     if on_proc is not None:
         try:
@@ -275,9 +291,13 @@ def run_cli_streaming_rcp(
     steered = False
     timed_out = False
     oom_killed = False
+    output_limit = False
+    disk_limit = False
     rc: Optional[int] = None
     out_lines: list[str] = []
     stderr_lines: list[str] = []
+    host_output_budget = int(limits.output_limit_bytes)
+    captured_bytes = 0
 
     termination_lock = threading.Lock()
     termination = {
@@ -372,6 +392,9 @@ def run_cli_streaming_rcp(
                 timed_out = True
                 _request_termination("host_timeout_backstop")
                 continue
+            requested_at, reason, signal_ok = _termination_snapshot()
+            if requested_at is not None and time.monotonic() - requested_at > exit_grace_s and f.get("t") != "exit":
+                raise ControlError(f"worker exit unconfirmed after {reason} (signal_ack={signal_ok})")
             t = f.get("t")
             if t == "stdin":
                 delivered = bool(f.get("ok"))
@@ -381,24 +404,32 @@ def run_cli_streaming_rcp(
                     # typed context callback strands the reservation as unknown; kill
                     # the known child and wait for its normal exit frame.
                     _request_termination("stdin_delivery_failed")
-            elif t == "out":
-                line = f.get("line", "")
-                out_lines.append(line + "\n")
-                try:
-                    steps = driver.parse_stream_steps(line)  # ALL blocks (#18)
-                except Exception:
-                    steps = []
-                for step in steps:
+            elif t in {"out", "err"}:
+                line = str(f.get("line", ""))
+                raw = (line + "\n").encode("utf-8")
+                available = max(0, host_output_budget - captured_bytes)
+                kept = raw[:available]
+                captured_bytes += len(kept)
+                (out_lines if t == "out" else stderr_lines).append(kept.decode("utf-8", errors="replace"))
+                if len(raw) > available and not output_limit:
+                    output_limit = True
+                    _request_termination("output_limit")
+                if t == "out" and len(raw) <= available:
                     try:
-                        on_step(step)
+                        steps = driver.parse_stream_steps(line)
                     except Exception:
-                        pass
-            elif t == "err":
-                stderr_lines.append(f.get("line", "") + "\n")
+                        steps = []
+                    for step in steps:
+                        try:
+                            on_step(step)
+                        except Exception:
+                            pass
             elif t == "exit":
                 proc._confirm_exit()
                 rc = int(f.get("rc", 0))
                 oom_killed = bool(f.get("oom"))
+                output_limit = bool(f.get("output_limit")) or output_limit
+                disk_limit = bool(f.get("disk_limit")) or disk_limit
                 timed_out = bool(f.get("timed_out")) or timed_out
                 break
     finally:
@@ -413,15 +444,31 @@ def run_cli_streaming_rcp(
     elapsed = time.time() - t0
     if oom_killed:
         timed_out = False  # an OOM is never also a timeout
+        output_limit = False
+        disk_limit = False
+    elif output_limit or disk_limit:
+        timed_out = False  # typed over-limit is not a wall-clock timeout
 
-    res = driver.parse("".join(out_lines), "".join(stderr_lines))
+    stdout = "".join(out_lines)
+    stderr = "".join(stderr_lines)
+    res = driver.parse(stdout, stderr)
     res.timed_out = timed_out
     res.oom_killed = oom_killed
+    res.output_limit = output_limit
+    res.disk_limit = disk_limit
     res.cancelled = cancelled
     res.steered = steered
     res.elapsed_s = elapsed
+    from muteki.solver.cli_driver import finalize_cli_result
+    finalize_cli_result(
+        res, driver_name=driver.name, stdout=stdout, stderr=stderr,
+        returncode=rc)
     if oom_killed:
         status = "oom"
+    elif output_limit:
+        status = "output_limit"
+    elif disk_limit:
+        status = "disk_limit"
     elif timed_out:
         status = "timeout"
     elif cancelled:
@@ -437,21 +484,50 @@ def run_cli_streaming_rcp(
         "rc": rc,
         "timed_out": timed_out,
         "oom_killed": oom_killed,
+        "output_limit": output_limit,
+        "disk_limit": disk_limit,
         "cancelled": cancelled,
         "steered": steered,
         "elapsed_s": elapsed,
+        "output_bytes": captured_bytes,
+        "output_limit_bytes": host_output_budget,
     }
     return res
 
 
 def run_cli_rcp(driver, argv: list[str], *, run_id: str, container_cwd: str,
                 timeout: int, env: Optional[dict] = None,
-                stdin_text: Optional[str] = None) -> CliResult:
+                stdin_text: Optional[str] = None,
+                resource_limits: Optional[WorkerResourceLimits] = None,
+                owner_run_id: str = "", owner_token: str = "",
+                owner_workspace: str = "") -> CliResult:
     """Non-streaming worker run — collects the full stream then parses once."""
     return run_cli_streaming_rcp(
         driver, argv, run_id=run_id, container_cwd=container_cwd,
         timeout=timeout, env=env, on_step=lambda _s: None,
-        stdin_text=stdin_text)
+        stdin_text=stdin_text, resource_limits=resource_limits,
+        owner_run_id=owner_run_id, owner_token=owner_token,
+        owner_workspace=owner_workspace)
+
+
+def register_owner(control_run_id: str, owner_run_id: str,
+                   owner_token: str, owner_workspace: str) -> bool:
+    link = ControlReceiver.instance().get_link(control_run_id)
+    return bool(link and link.register_owner(
+        owner_run_id, owner_token, owner_workspace))
+
+
+def teardown_owner(control_run_id: str, owner_run_id: str,
+                   owner_token: str) -> bool:
+    """Require a scoped supervisor ACK before releasing one shared Run."""
+    link = ControlReceiver.instance().get_link(control_run_id)
+    if link is None or not owner_run_id:
+        return False
+    if not link.teardown(timeout=20.0, owner_run_id=owner_run_id,
+                         owner_token=owner_token):
+        return False
+    confirm_run_absent(owner_run_id)
+    return True
 
 
 # ── lifecycle helpers used by container_exec ──────────────────────────────────

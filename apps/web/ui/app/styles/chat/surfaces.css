@@ -1,0 +1,40 @@
+/* Chat workbench: surfaces. Rules are prefixed `.cx-` and never target other pages. */
+
+.cx-preview-progress {
+  transform-origin: left center;
+  animation: cx-progress 1.1s var(--cx-ease-in-out) infinite;
+}
+
+.cx-preview-stage {
+  background:
+    radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--ink) 10%, transparent) 1px, transparent 0) 0 0 / 16px 16px,
+    var(--cx-bg-subtle);
+}
+
+.cx-checker {
+  background:
+    conic-gradient(color-mix(in srgb, var(--ink) 6%, transparent) 25%, transparent 0 50%, color-mix(in srgb, var(--ink) 6%, transparent) 0 75%, transparent 0) 0 0 / 16px 16px,
+    var(--cx-bg);
+}
+
+.cx-doc {
+  font-size: 14px;
+  line-height: 1.75;
+  color: var(--cx-fg);
+}
+
+.cx-terminal-host {
+  background: color-mix(in srgb, var(--ink) 3%, var(--surface));
+}
+.dark .cx-terminal-host {
+  background: color-mix(in srgb, black 30%, var(--surface));
+}
+.cx-terminal-host .xterm,
+.cx-terminal-host .xterm-viewport,
+.cx-terminal-host .xterm-screen {
+  background: transparent !important;
+}
+.cx-terminal-host .xterm-viewport {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--ink) 18%, transparent) transparent;
+}

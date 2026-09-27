@@ -25,7 +25,10 @@ def tracked_files(root: Path) -> list[Path]:
 
 
 def copy_source(root: Path, destination: Path) -> None:
-    excluded_roots = {"dist", ".git", ".venv", "sessions", "node_modules", ".next"}
+    excluded_roots = {
+        "dist", ".git", ".venv", ".apodex", "sessions", "state",
+        "node_modules", ".next",
+    }
     for relative in tracked_files(root):
         if any(part in excluded_roots for part in relative.parts):
             continue

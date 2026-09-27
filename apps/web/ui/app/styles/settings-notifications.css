@@ -1,0 +1,50 @@
+.wnotifications-page .wnotifications-modes {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+}
+.wnotifications-page .wnotifications-modes strong {
+  display: block;
+  font-weight: 650;
+}
+.wnotifications-page .wnotifications-modes em {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-style: normal;
+  font-size: 12px;
+}
+.wnotifications-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+.wnotifications-quiet-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 13px;
+}
+.wnotifications-quiet-range {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 12px;
+}
+.wnotifications-quiet-range label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.wnotifications-quiet-range input[type="time"] {
+  min-height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--bright);
+}

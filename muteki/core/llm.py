@@ -145,7 +145,7 @@ class ModelSpec:
 
     solver_id: str
     model: str
-    temperature: float = 0.4
+    temperature: Optional[float] = None
     max_tokens: int = 8000
     label: str = ""
     role: str = ""  # strategic-prior key; "" = generalist (no preamble)
@@ -222,7 +222,13 @@ class LLMClient:
             )
 
     async def _record_cost(self, model, usage, run_id, challenge_id, solver_id):
-        if self.cost is not None and run_id is not None and usage:
+        from muteki.core.usage import record_context, request_identity
+        from muteki.core.cost import PRICES
+        metered = {**(usage or {}), "source": "http"}
+        if model in PRICES and "prompt_tokens" in usage and "completion_tokens" in usage:
+            metered["estimated_cost"] = PRICES[model].cost(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+        record_context(metered, model=model)
+        if self.cost is not None and run_id is not None:
             await self.cost.record(
                 model=model,
                 input_tokens=usage.get("prompt_tokens", 0),
@@ -230,6 +236,8 @@ class LLMClient:
                 run_id=run_id,
                 challenge_id=challenge_id,
                 solver_id=solver_id,
+                usage=metered, usage_id=request_identity.get(),
+                generation=getattr(self, "usage_generation", None),
             )
 
     async def chat(
@@ -238,9 +246,11 @@ class LLMClient:
         model: str,
         messages: list[dict[str, Any]],
         tools: Optional[list[dict[str, Any]]] = None,
-        temperature: Optional[float] = 0.4,
-        max_tokens: Optional[int] = 8000,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
         stream: bool = True,
+        emit_events: bool = True,
         run_id: Optional[str] = None,
         challenge_id: Optional[str] = None,
         solver_id: Optional[str] = None,
@@ -251,34 +261,51 @@ class LLMClient:
             "stream": stream,
         }
         self._apply_temperature(body, temperature)
-        # max_tokens=None → omit the cap entirely (let the API use the model's own
-        # maximum). Critical for reasoning models (deepseek-v4-pro): tokens go to
-        # reasoning_content FIRST, so a small cap can be fully consumed by thinking
-        # and truncate the actual answer. The Reason planner relies on this.
+        # Omit the field by default. Callers that genuinely require an output cap
+        # opt in explicitly; the provider otherwise applies the model's own limit.
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
+        if reasoning_effort:
+            body["reasoning_effort"] = reasoning_effort
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
 
         coro = (
-            self._chat_stream(body, run_id=run_id, challenge_id=challenge_id, solver_id=solver_id)
+            self._chat_stream(
+                body, run_id=run_id, challenge_id=challenge_id,
+                solver_id=solver_id, emit_events=emit_events,
+            )
             if stream
-            else self._chat_once(body, run_id=run_id, challenge_id=challenge_id, solver_id=solver_id)
+            else self._chat_once(
+                body, run_id=run_id, challenge_id=challenge_id,
+                solver_id=solver_id, emit_events=emit_events,
+            )
         )
         # hard wall-clock guard: a stalled/half-open SSE stream must not wedge the
         # caller forever. On timeout we surface it as a normal error the solver
         # loop can recover from (treated like an empty turn), not a hang.
+        from muteki.core.usage import request_identity
+        from uuid import uuid4
+        usage_token = request_identity.set(uuid4().hex)
         try:
             resp = await asyncio.wait_for(coro, timeout=self.overall_timeout)
         except asyncio.TimeoutError:
+            await self._record_cost(model, {"status": "timeout"}, run_id, challenge_id, solver_id)
             return LLMResponse(
                 content="", reasoning="", tool_calls=[],
                 finish_reason="timeout", model=body["model"],
             )
+        except BaseException:
+            await self._record_cost(model, {"status": "failed"}, run_id, challenge_id, solver_id)
+            raise
+        finally:
+            request_identity.reset(usage_token)
         return resp
 
-    async def _chat_once(self, body, *, run_id, challenge_id, solver_id) -> LLMResponse:
+    async def _chat_once(
+        self, body, *, run_id, challenge_id, solver_id, emit_events: bool = True,
+    ) -> LLMResponse:
         body = {**body, "stream": False}
         if body.get("stream") is True:  # safety
             body["stream"] = False
@@ -300,12 +327,12 @@ class LLMClient:
             )
         reasoning = msg.get("reasoning_content") or ""
         content = msg.get("content") or ""
-        if reasoning:
+        if reasoning and emit_events:
             await self._emit(
                 EventType.REASONING_DELTA,
                 run_id=run_id, challenge_id=challenge_id, solver_id=solver_id, text=reasoning,
             )
-        if content:
+        if content and emit_events:
             await self._emit(
                 EventType.TEXT_MESSAGE_DELTA,
                 run_id=run_id, challenge_id=challenge_id, solver_id=solver_id, text=content,
@@ -320,7 +347,9 @@ class LLMClient:
             model=body["model"],
         )
 
-    async def _chat_stream(self, body, *, run_id, challenge_id, solver_id) -> LLMResponse:
+    async def _chat_stream(
+        self, body, *, run_id, challenge_id, solver_id, emit_events: bool = True,
+    ) -> LLMResponse:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         # tool calls reassembled by index
@@ -357,17 +386,21 @@ class LLMClient:
                 rc = delta.get("reasoning_content")
                 if rc:
                     reasoning_parts.append(rc)
-                    await self._emit(
-                        EventType.REASONING_DELTA,
-                        run_id=run_id, challenge_id=challenge_id, solver_id=solver_id, text=rc,
-                    )
+                    if emit_events:
+                        await self._emit(
+                            EventType.REASONING_DELTA,
+                            run_id=run_id, challenge_id=challenge_id,
+                            solver_id=solver_id, text=rc,
+                        )
                 cc = delta.get("content")
                 if cc:
                     content_parts.append(cc)
-                    await self._emit(
-                        EventType.TEXT_MESSAGE_DELTA,
-                        run_id=run_id, challenge_id=challenge_id, solver_id=solver_id, text=cc,
-                    )
+                    if emit_events:
+                        await self._emit(
+                            EventType.TEXT_MESSAGE_DELTA,
+                            run_id=run_id, challenge_id=challenge_id,
+                            solver_id=solver_id, text=cc,
+                        )
                 for tc in delta.get("tool_calls") or []:
                     idx = tc.get("index", 0)
                     slot = tc_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
@@ -401,7 +434,7 @@ class LLMClient:
         *,
         model: str,
         messages: list[dict[str, Any]],
-        temperature: Optional[float] = 0.3,
+        temperature: Optional[float] = None,
         max_tokens: Optional[int] = 4000,
         run_id: Optional[str] = None,
         challenge_id: Optional[str] = None,

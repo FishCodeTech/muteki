@@ -39,6 +39,7 @@ from muteki.solver.worker_profiles import (
     profile_names,
     worker_identity_event_fields,
 )
+from muteki.solver.ctf_fgs import apply_ctf_decide_frontier
 from muteki.solver.workspace import cleanup_worker_scratch, ensure_workspace
 from muteki.swarm.insight_bus import InsightBus
 from muteki.swarm.stage_policy import StagePolicy
@@ -49,6 +50,7 @@ from muteki.swarm.swarm_support import (
     WorkerBudgetExhausted,
     WorkerSpawnRejected,
     ControlShutdownIncomplete,
+    spawn_reject_should_emit,
     SwarmOutcome,
     _CONTAINER_BLACKBOARD_SKILL,
     _BLACKBOARD_SKILL_LINKS,
@@ -63,6 +65,9 @@ from muteki.swarm.swarm_support import (
 
 
 class _DispatchReasonMixin:
+    def _auto_dispatch_enabled(self) -> bool:
+        return str(getattr(self, "dispatch_mode", "fixed")) == "auto"
+
     async def _apply_worker_cmds(
         self,
         *,
@@ -380,12 +385,11 @@ class _DispatchReasonMixin:
         return head
 
     def _open_intents(self) -> list[dict]:
-        """Intents available to (re)dispatch: never-claimed (status='open') PLUS any
-        claimed intent whose LEASE EXPIRED (its worker died/stalled and never
-        concluded). Closing this lease loop is what lets the swarm recover an intent
-        abandoned by a stuck worker — without it, a worker that hangs holding a claim
-        would orphan that intent forever (claim_intent already honors expired leases,
-        but the coordinator never re-read them, so they were lost)."""
+        """Intents explicitly available for dispatch (status='open').
+
+        A claimed Intent remains owned until runtime retirement releases/reopens it.
+        Wall-clock expiry never transfers a live Worker's ownership.
+        """
         if self.shared_graph is None:
             return []
         state_port = getattr(self, "_search_state_port", None)
@@ -394,70 +398,64 @@ class _DispatchReasonMixin:
         try:
             rows = state_port.query_legacy_candidates(run_id=self.run_id)
             out: list[dict] = []
-            inferred_lanes: list[tuple[str, str, str]] = []
             seen_routes: set[str] = set()
+            ctf_mode = getattr(self.challenge, "mode", "ctf") == "ctf"
             for r in rows:
-                wc = str(r.get("worker_class") or "code")
-                route = str(r.get("route_hash") or "")
+                wc = "code" if ctf_mode else str(r.get("worker_class") or "code")
+                route = "" if ctf_mode else str(r.get("route_hash") or "")
                 if (
+                    not ctf_mode
+                    and
                     route
                     and wc not in {"verifier", "review"}
                     and hasattr(self.shared_graph, "is_route_suppressed")
                     and self.shared_graph.is_route_suppressed(route)
                 ):
                     continue
-                if route and wc not in {"verifier", "review"}:
+                if not ctf_mode and route and wc not in {"verifier", "review"}:
                     if route in seen_routes:
                         continue
                     seen_routes.add(route)
-                lane_key = str(r.get("lane_key") or "")
-                risk_class = str(r.get("risk_class") or "")
-                resource_key = str(r.get("resource_key") or "")
-                # E: dispatch preflight — skip an intent whose declared resource is
-                # currently locked by ANOTHER worker (route around it, don't collide).
-                if resource_key and hasattr(
+                lane_key = "" if ctf_mode else str(r.get("lane_key") or "")
+                risk_class = "" if ctf_mode else str(r.get("risk_class") or "")
+                resource_key = "" if ctf_mode else str(r.get("resource_key") or "")
+                # A lane is itself a stable resource key. Workers may acquire
+                # that resource from inside a turn before a coordinator lane
+                # exists, so check both views here.
+                conflict_resource = resource_key or lane_key
+                if conflict_resource and hasattr(
                     self.shared_graph, "check_resource_conflicts"
                 ):
                     try:
                         conflict = self.shared_graph.check_resource_conflicts(
-                            resource_key=resource_key
+                            resource_key=conflict_resource,
+                            lane_key=lane_key,
                         )
                         if conflict.get("conflict"):
                             continue
                     except Exception:
                         pass
-                if not lane_key:
-                    hint = self._lane_hint_from_text(
-                        str(r.get("goal") or ""), require_control_hint=True
-                    )
-                    lane_key = str(hint.get("lane_key") or "")
-                    if lane_key:
-                        risk_class = str(hint.get("risk_class") or risk_class or "")
-                        inferred_lanes.append(
-                            (
-                                lane_key,
-                                risk_class,
-                                str(r.get("intent_id") or ""),
-                            )
-                        )
                 out.append(
                     {
                         "intent_id": r.get("intent_id"),
                         "goal": r.get("goal"),
                         "worker_class": wc,
                         "route_hash": route,
-                        "branch_id": r.get("branch_id") or "",
+                        "branch_id": "" if ctf_mode else r.get("branch_id") or "",
                         "priority": int(r.get("priority") or 0),
                         "lane_key": lane_key,
                         "risk_class": risk_class,
                         "resource_key": resource_key,
                         "from_facts": list(r.get("from_facts") or []),
-                        "depends_on": list(r.get("depends_on") or []),
+                        "depends_on": [] if ctf_mode else list(r.get("depends_on") or []),
+                        "expected_observable": "" if ctf_mode else str(r.get("expected_observable") or ""),
+                        "stop_condition": "" if ctf_mode else str(r.get("stop_condition") or ""),
+                        "coverage_key": "" if ctf_mode else str(r.get("coverage_key") or ""),
+                        "requires_capabilities": [] if ctf_mode else list(
+                            r.get("requires_capabilities") or []),
+                        "value_claim": {} if ctf_mode else dict(r.get("value_claim") or {}),
+                        "priority_reason": "" if ctf_mode else str(r.get("priority_reason") or ""),
                     }
-                )
-            if inferred_lanes:
-                state_port.apply_legacy_lane_inferences(
-                    run_id=self.run_id, inferences=inferred_lanes
                 )
             return out
         except Exception:
@@ -475,7 +473,7 @@ class _DispatchReasonMixin:
 
     def _reason_backpressure_active(self, open_intents: list[dict]) -> bool:
         return self._ordinary_open_queue_depth(open_intents) >= max(
-            1, 2 * self.max_workers
+            1, 2 * self._ordinary_capacity_limit()
         )
 
     def _active_review_count(self) -> int:
@@ -494,22 +492,40 @@ class _DispatchReasonMixin:
             and t not in self._active_verifier_tasks
         )
 
-    def _ordinary_capacity_available(self, tasks: dict) -> bool:
-        cap = int(self.max_workers)
-        try:
-            from muteki.swarm.solo_depth_verify_v1 import (
-                enabled as _solo_on,
-                max_ordinary_workers as _solo_cap,
-            )
-            if _solo_on():
-                cap = min(cap, int(_solo_cap()))
-        except Exception:
-            pass
-        return self._ordinary_task_count(tasks) < cap
+    def _ordinary_capacity_limit(self) -> int:
+        # max_workers is the one run-wide concurrency ceiling.  Review and
+        # verifier processes consume the same capacity; role-specific limits below
+        # may narrow it further but can never expand it.
+        configured = int(self.max_workers)
+        return max(0, int(self.max_workers))
 
-    def _review_capacity_available(self) -> bool:
-        return self._active_review_count() < int(
-            self.review_policy.get("max_concurrent") or 1
+    def _total_active_count(self, tasks: Optional[dict] = None) -> int:
+        # _live_solvers includes workers constructed before their asyncio task is
+        # installed and completed workers whose account/claims are not retired yet.
+        # Both must continue occupying capacity.  Some verifier paths use a
+        # separate task map, hence the max rather than trusting either view alone.
+        live = len(getattr(self, "_live_solvers", {}) or {})
+        scheduled = len(tasks or {})
+        return max(live, scheduled)
+
+    def _total_free_slots(self, tasks: Optional[dict] = None) -> int:
+        return max(
+            0, self._ordinary_capacity_limit() - self._total_active_count(tasks))
+
+    def _ordinary_free_slots(self, tasks: dict) -> int:
+        return self._total_free_slots(tasks)
+
+    def _ordinary_planning_slots(self, tasks: dict) -> int:
+        return self._ordinary_free_slots(tasks)
+
+    def _ordinary_capacity_available(self, tasks: dict) -> bool:
+        return self._ordinary_free_slots(tasks) > 0
+
+    def _review_capacity_available(self, tasks: Optional[dict] = None) -> bool:
+        return (
+            self._total_free_slots(tasks) > 0
+            and self._active_review_count() < int(
+                self.review_policy.get("max_concurrent") or 1)
         )
 
     def _pending_report_repro_count(self) -> int:
@@ -524,7 +540,9 @@ class _DispatchReasonMixin:
     def _verifier_concurrency_cap(self) -> int:
         """One verifier per pending repro; max_concurrent > 0 is a hard cap.
 
-        0 / unset means auto (match the pending-report queue).
+        0 / unset means auto. Keep automatic verification proportional to the
+        ordinary solve capacity so a burst of challenged facts cannot create
+        more verifier processes than the run can productively feed.
         """
         pending = max(1, self._pending_report_repro_count())
         raw = self.verifier_policy.get("max_concurrent")
@@ -534,22 +552,35 @@ class _DispatchReasonMixin:
             configured = 0
         if configured > 0:
             return max(1, min(configured, pending))
-        return pending
+        auto_cap = max(1, self._ordinary_capacity_limit() // 3)
+        return min(pending, auto_cap)
 
     def _active_verifier_count(self) -> int:
         return len(self._active_verifier_tasks)
 
-    def _verifier_capacity_available(self) -> bool:
-        if not self.verifier_policy.get("enabled", True):
+    def _verifier_capacity_available(self, tasks: Optional[dict] = None) -> bool:
+        # ``verifier.enabled`` is the operator switch for the Pentest report
+        # reproduction pipeline.  CTF fact challenges are part of the
+        # coordinator's evidence-integrity loop: disabling report reproduction
+        # must not strand every Candidate fact behind an unstartable verifier
+        # Intent.
+        if (
+            getattr(self.challenge, "mode", "ctf") != "ctf"
+            and not self.verifier_policy.get("enabled", True)
+        ):
+            return False
+        if self._total_free_slots(tasks) <= 0:
             return False
         if self._verifier_workers_spawned >= int(
                 self.verifier_policy.get("max_verifier_workers") or 24):
             return False
         return self._active_verifier_count() < self._verifier_concurrency_cap()
 
-    def _dispatchable_open_intents(self, open_intents: list[dict]) -> list[dict]:
-        review_free = self._review_capacity_available()
-        verifier_free = self._verifier_capacity_available()
+    def _dispatchable_open_intents(
+        self, open_intents: list[dict], tasks: Optional[dict] = None,
+    ) -> list[dict]:
+        review_free = self._review_capacity_available(tasks)
+        verifier_free = self._verifier_capacity_available(tasks)
         if review_free and verifier_free:
             return open_intents
         out: list[dict] = []
@@ -566,8 +597,8 @@ class _DispatchReasonMixin:
         self, open_intents: list[dict], tasks: dict
     ) -> list[dict]:
         ordinary_free = self._ordinary_capacity_available(tasks)
-        review_free = self._review_capacity_available()
-        verifier_free = self._verifier_capacity_available()
+        review_free = self._review_capacity_available(tasks)
+        verifier_free = self._verifier_capacity_available(tasks)
         out: list[dict] = []
         for it in open_intents:
             wc = str(it.get("worker_class") or "code")
@@ -581,7 +612,77 @@ class _DispatchReasonMixin:
                 out.append(it)
         return out
 
-    async def _run_reason(self) -> int:
+    def _has_dispatchable_open_intents(self, tasks: dict) -> bool:
+        """Whether an open intent can start under the current role policy."""
+        open_intents = self._dispatchable_open_intents(
+            self._open_intents(), tasks)
+        return bool(self._capacity_dispatchable_open_intents(open_intents, tasks))
+
+    def _capture_reason_attempt(self, result: Any, attempt_index: int) -> dict[str, Any]:
+        """Persist one exact planner reply and return event-safe diagnostics."""
+        diagnostics = getattr(result, "diagnostics", None)
+        raw_response = str(getattr(diagnostics, "raw_response", "") or "")
+        artifact_id = ""
+        if raw_response and self.artifacts is not None:
+            try:
+                artifact_id = str(
+                    self.artifacts.put(raw_response, suffix=".reason.txt") or ""
+                )
+            except Exception:
+                artifact_id = ""
+        draft_id = ""
+        draft_receipts: list[dict[str, Any]] = []
+        for note in getattr(result, "audit_notes", []) or []:
+            if not isinstance(note, dict):
+                continue
+            if str(note.get("kind") or "") != "draft_receipts":
+                continue
+            draft_id = str(note.get("draft_id") or "")
+            raw_ops = note.get("operations")
+            if isinstance(raw_ops, list):
+                draft_receipts = [
+                    row for row in raw_ops[:32] if isinstance(row, dict)
+                ]
+            break
+        return {
+            "attempt_index": int(attempt_index),
+            "draft_id": draft_id,
+            "draft_receipts": draft_receipts,
+            "response_status": str(
+                getattr(diagnostics, "response_status", "not_recorded")
+                or "not_recorded"
+            ),
+            "timed_out": bool(getattr(diagnostics, "timed_out", False)),
+            "finish_reason": str(getattr(diagnostics, "finish_reason", "") or ""),
+            "raw_response_artifact_id": artifact_id,
+            "raw_response_sha256": str(
+                getattr(diagnostics, "raw_response_sha256", "") or ""
+            ),
+            "raw_response_chars": int(
+                getattr(diagnostics, "response_chars", 0) or 0
+            ),
+            "parse_status": str(
+                getattr(diagnostics, "parse_status", "not_recorded")
+                or "not_recorded"
+            ),
+            "parse_detail": str(
+                getattr(diagnostics, "parse_detail", "") or ""
+            )[:500],
+            "raw_intent_count": int(
+                getattr(diagnostics, "raw_intent_count", 0) or 0
+            ),
+            "parsed_intent_count": int(
+                getattr(diagnostics, "parsed_intent_count", 0) or 0
+            ),
+            "input_tokens": int(
+                getattr(diagnostics, "input_tokens", 0) or 0
+            ),
+            "output_tokens": int(
+                getattr(diagnostics, "output_tokens", 0) or 0
+            ),
+        }
+
+    async def _run_reason(self, *, max_intents: int | None = None) -> int:
         """Reason phase: pro model reads the board, proposes intents. Returns the
         number of new intents proposed. Advisory — never raises into the loop.
 
@@ -589,18 +690,74 @@ class _DispatchReasonMixin:
         coordinator can act on a course_correct (phase 7: adaptive re-bootstrap)."""
         from muteki.solver.reason import PlannerFailure, PlannerFailureKind
 
-        if self.shared_graph is None or self.llm is None:
+        self._last_reason_attempts = []
+        self._last_dispatch_decisions = []
+        self._last_reason_superseded = []
+        self._last_reason_preemptions = []
+
+        if self.shared_graph is None:
+            unavailable_detail = "shared graph is unavailable"
             self._last_reason = None
             self._last_planner_failure = PlannerFailure(
                 PlannerFailureKind.UNAVAILABLE,
-                "shared graph or planner client is unavailable",
+                unavailable_detail,
             )
+            self._last_reason_attempts = [{
+                "attempt_index": 1,
+                "response_status": "unavailable",
+                "timed_out": False,
+                "finish_reason": "",
+                "raw_response_artifact_id": "",
+                "raw_response_sha256": "",
+                "raw_response_chars": 0,
+                "parse_status": "not_run_unavailable",
+                "parse_detail": unavailable_detail,
+                "raw_intent_count": 0,
+                "parsed_intent_count": 0,
+            }]
+            return 0
+        if (
+            self.llm is None
+            and getattr(self.challenge, "mode", "ctf") != "ctf"
+        ):
+            unavailable_detail = str(
+                getattr(self, "planner_unavailable_detail", "") or
+                "planner client is unavailable"
+            )
+            self._last_reason = None
+            self._last_planner_failure = PlannerFailure(
+                PlannerFailureKind.UNAVAILABLE,
+                unavailable_detail,
+            )
+            self._last_reason_attempts = [{
+                "attempt_index": 1,
+                "response_status": "unavailable",
+                "timed_out": False,
+                "finish_reason": "",
+                "raw_response_artifact_id": "",
+                "raw_response_sha256": "",
+                "raw_response_chars": 0,
+                "parse_status": "not_run_unavailable",
+                "parse_detail": unavailable_detail,
+                "raw_intent_count": 0,
+                "parsed_intent_count": 0,
+            }]
             return 0
         try:
             from muteki.solver.reason import (
+                REASON_KEEP_RECENT_TOKENS,
+                build_reason_prompt,
+                compact_reason_context,
                 dispatch_intents,
+                estimate_reason_messages_tokens,
+                reason_failure_is_context_overflow,
                 run_reason,
             )
+            from muteki.solver.pi_decide import (
+                build_ctf_pi_decide_prompt,
+                run_ctf_pi_reason,
+            )
+            from muteki.core.prompt_assembly import resolve_prompt_budget
 
             # P1.5: un-blind the planner. The default max_evidence=16 hard-capped
             # Reason at the last 16 facts (swarm re-planned against a truncated view
@@ -612,70 +769,388 @@ class _DispatchReasonMixin:
             # already running or already concluded (run-11190 paraphrase churn).
             # [#seq] fact labels survive — they are Reason's `from`-citation
             # mechanism (the {fact_ids} allow-list a plan may cite).
+            compact_summary = ""
+            compact_cutoff_seq = 0
             try:
-                from muteki.swarm.context_firewall_v1 import (
-                    enabled as _cf_on,
-                    fold_reason_context as _cf_fold,
+                epochs = list(self.shared_graph.compact_epochs() or [])
+                latest = next((
+                    row for row in reversed(epochs)
+                    if str(row.get("trigger") or "") == "reason_context"
+                ), None)
+                if latest:
+                    compact_summary = str(latest.get("summary") or "")
+                    compact_cutoff_seq = int(latest.get("cutoff_seq") or 0)
+            except Exception:
+                compact_summary = ""
+                compact_cutoff_seq = 0
+            if getattr(self.challenge, "mode", "ctf") == "ctf":
+                compact_summary = ""
+                compact_cutoff_seq = 0
+
+            def _render_graph_context() -> str:
+                return self.shared_graph.to_reason_summary(
+                    standing_guidance=list(self._standing_guidance),
+                    compact_summary=compact_summary,
+                    compact_cutoff_seq=compact_cutoff_seq,
                 )
-                if _cf_on():
-                    summary = _cf_fold(
-                        self.shared_graph,
-                        list(self._standing_guidance),
-                    )
-                else:
-                    summary = self.shared_graph.to_reason_summary(
-                        standing_guidance=list(self._standing_guidance)
-                    )
+
+            def _render_stable_graph_context() -> tuple[str, int]:
+                """Render against a quiet semantic watermark.
+
+                Graph renderers use several bounded reads.  Re-render when a
+                Worker commits between them so Decide never receives a mixture
+                of the old and new frontier.
+                """
+                rendered = ""
+                watermark_after = 0
+                for _attempt in range(3):
+                    try:
+                        watermark_before = int(
+                            self.shared_graph.semantic_graph_watermark() or 0
+                        )
+                    except Exception:
+                        watermark_before = 0
+                    rendered = _render_graph_context()
+                    try:
+                        watermark_after = int(
+                            self.shared_graph.semantic_graph_watermark() or 0
+                        )
+                    except Exception:
+                        watermark_after = watermark_before
+                    if watermark_before == watermark_after:
+                        break
+                return rendered, watermark_after
+
+            try:
+                summary = _render_graph_context()
             except Exception:
                 summary = self.shared_graph.to_reason_summary(
-                    standing_guidance=list(self._standing_guidance)
+                    standing_guidance=list(self._standing_guidance),
+                    compact_summary=compact_summary,
+                    compact_cutoff_seq=compact_cutoff_seq,
                 )
-            try:
-                fact_index = self.shared_graph.fact_pin_context()
-            except Exception:
-                fact_index = ""
-            # Framework Sense prefix (f02 world-model etc.). Default Swarm: no-op.
-            fw_prefix = getattr(self, "framework_reason_context_prefix", None)
-            if callable(fw_prefix):
+            reason_summary_chars = len(summary)
+
+            # The first Reason pass may run before any worker has written facts.
+            # Give it the operator-visible task directly so CTF planning is based
+            # on the complete challenge brief and pentest planning is based on the
+            # normalized engagement contract produced from the same prose input.
+            challenge = self.challenge
+            contract = getattr(challenge, "task_contract", None)
+            raw_instruction = (
+                str(getattr(contract, "raw_instruction", "") or "").strip()
+                or challenge.description.strip()
+            )
+            if contract is not None:
+                attachments = [
+                    str(item.summary or item.name)
+                    for item in contract.attachments
+                ]
+            else:
+                attachments = [Path(str(item)).name for item in challenge.attachments]
+            task_lines = [
+                "## Operator task",
+                f"mode: {challenge.mode}",
+                f"raw instruction: {raw_instruction}",
+            ]
+            if challenge.target:
+                task_lines.append(f"target: {challenge.target}")
+            if attachments:
+                task_lines.append(f"attachments: {', '.join(attachments)}")
+            if challenge.mode == "pentest":
+                engagement = challenge.engagement
+                task_lines.extend([
+                    f"authorized scope: {challenge.scope or ''}",
+                    f"completion kind: {engagement.completion_kind}",
+                    f"outcome predicate: {engagement.outcome_predicate}",
+                    f"expected qualifying reports: {engagement.expected_findings}",
+                    f"coverage until operator decision: {engagement.collect_until_coverage}",
+                ])
+            elif challenge.multi_flag:
+                task_lines.append(
+                    f"flag completion: collect {challenge.expected_flags or 'unknown'} distinct flags"
+                )
+            task_context = "\n".join(task_lines)
+            summary = f"{task_context}\n\n{summary}"
+            retry_note = getattr(self, "_reason_retry_note", None)
+            retry_note_chars = 0
+            retry_context = ""
+            if isinstance(retry_note, dict) and retry_note.get("retry_index"):
+                rejected = [
+                    f"- {str(item.get('reason') or 'unknown')}: "
+                    f"{str(item.get('goal') or '')}"
+                    for item in list(retry_note.get("rejections") or [])
+                    if isinstance(item, dict)
+                ]
+                retry_context = (
+                    "## Planner retry\n"
+                    f"retry index: {int(retry_note['retry_index'])}\n"
+                    f"previous failure: {str(retry_note.get('failure') or 'empty_plan')}\n"
+                    "The run goal is still incomplete. Propose executable Steps "
+                    "that avoid the rejected ownership, stage, method, and coverage "
+                    "combinations below.\n"
+                    + ("\n".join(rejected) if rejected else "- no detailed rejection")
+                )
+                retry_note_chars = len(retry_context)
+                summary = f"{summary}\n\n{retry_context}"
+            requested = max_intents
+            if requested is None:
+                requested = getattr(
+                    self, "_reason_max_intents_override", None
+                )
+            planning_limit = self._ordinary_capacity_limit()
+            requested_intents = planning_limit if requested is None else int(requested)
+            requested_intents = max(
+                0,
+                min(planning_limit, requested_intents),
+            )
+            ctf_pi_decide = (
+                getattr(self.challenge, "mode", "ctf") == "ctf"
+            )
+
+            def _assemble_summary(graph_body: str) -> str:
+                if ctf_pi_decide:
+                    return graph_body
+                value = f"{task_context}\n\n{graph_body}"
+                if retry_context:
+                    value = f"{value}\n\n{retry_context}"
+                return value
+
+            async def _compact_reason_graph(tokens_before: int) -> bool:
+                nonlocal compact_summary, compact_cutoff_seq, summary, reason_summary_chars
                 try:
-                    extra = str(fw_prefix() or "")
-                    if extra:
-                        summary = f"{extra}\n\n{summary}"
+                    cutoff = self.shared_graph.reason_compaction_cutoff(
+                        REASON_KEEP_RECENT_TOKENS,
+                        after_seq=compact_cutoff_seq,
+                    )
+                    if cutoff <= compact_cutoff_seq:
+                        return False
+                    source = self.shared_graph.to_reason_summary(
+                        standing_guidance=list(self._standing_guidance),
+                        compact_summary="",
+                        compact_cutoff_seq=compact_cutoff_seq,
+                    )
+                    compacted = await compact_reason_context(
+                        llm=self.llm,
+                        model=self.reason_model,
+                        graph_context=source,
+                        previous_summary=compact_summary,
+                        run_id=self.run_id,
+                        challenge_id=self.challenge.id,
+                    )
+                    cited = {
+                        int(value) for value in re.findall(
+                            r"\[#(\d+)\]", compacted.summary)
+                    }
+                    known = {
+                        int(event.get("seq") or 0)
+                        for event in self.shared_graph.events()
+                    }
+                    if not cited.issubset(known):
+                        raise RuntimeError(
+                            "reason context compaction cited unknown graph events")
+                    self.shared_graph.record_reason_context_compaction(
+                        actor="reason",
+                        cutoff_seq=cutoff,
+                        summary=compacted.summary,
+                        tokens_before=tokens_before,
+                    )
+                    compact_summary = compacted.summary
+                    compact_cutoff_seq = cutoff
+                    graph_body = _render_graph_context()
+                    reason_summary_chars = len(graph_body)
+                    summary = _assemble_summary(graph_body)
+                    await self._emit_coord_bb(
+                        "reason_context_compacted",
+                        cutoff_seq=cutoff,
+                        tokens_before=tokens_before,
+                        summary_chars=len(compacted.summary),
+                        input_tokens=compacted.input_tokens,
+                        output_tokens=compacted.output_tokens,
+                    )
+                    return True
+                except Exception as exc:
+                    await self._emit_coord_bb(
+                        "reason_context_compact_failed",
+                        error=f"{type(exc).__name__}: {exc}"[:500],
+                        tokens_before=tokens_before,
+                    )
+                    return False
+
+            graph_body, reason_context_wm = _render_stable_graph_context()
+            self._last_reason_context_wm = reason_context_wm
+            reason_summary_chars = len(graph_body)
+            summary = _assemble_summary(graph_body)
+            reason_budget = (
+                None
+                if ctf_pi_decide
+                else resolve_prompt_budget(self.reason_model, role="reason")
+            )
+            preview_messages = (
+                build_ctf_pi_decide_prompt(
+                    summary, max_intents=requested_intents
+                )
+                if ctf_pi_decide
+                else build_reason_prompt(
+                    summary,
+                    max_intents=requested_intents,
+                    goal=None,
+                    mode=getattr(self.challenge, "mode", "ctf"),
+                    scope=(getattr(self.challenge, "scope", "") or None),
+                )
+            )
+            estimated_reason_tokens = estimate_reason_messages_tokens(preview_messages)
+            compacted_this_pass = False
+            compact_trigger_tokens = (
+                min(
+                    reason_budget.input_budget_tokens,
+                    reason_budget.context_window_tokens - 32_768,
+                )
+                if reason_budget is not None
+                else 0
+            )
+            if (
+                not ctf_pi_decide
+                and estimated_reason_tokens > compact_trigger_tokens
+            ):
+                compacted_this_pass = await _compact_reason_graph(
+                    estimated_reason_tokens)
+
+            reason_args = {
+                "llm": self.llm,
+                "model": self.reason_model,
+                "graph_summary": summary,
+                "max_intents": requested_intents,
+                "run_id": self.run_id,
+                "challenge_id": self.challenge.id,
+                # pentest → judge completion against the operator's engagement goal
+                # (CTF passes mode="ctf" + no goal → prompt remains unchanged).
+                "mode": getattr(self.challenge, "mode", "ctf"),
+                "goal": None,
+                "scope": (getattr(self.challenge, "scope", "") or None),
+            }
+
+            async def _call_reason() -> Any:
+                if not ctf_pi_decide:
+                    return await run_reason(**reason_args)
+                planner_profile = dict(
+                    (getattr(self, "llm_profiles", {}) or {}).get("planner")
+                    or {}
+                )
+                endpoint_id = str(
+                    planner_profile.get("endpoint_id")
+                    or planner_profile.get("credential_id")
+                    or ""
+                ).strip()
+                account_id = (
+                    endpoint_id.split(":", 1)[1]
+                    if endpoint_id.startswith(("endpoint:", "account:"))
+                    else endpoint_id
+                )
+                state_base = Path(
+                    getattr(self, "workspace_root", None)
+                    or getattr(self, "worker_root", None)
+                    or Path.cwd()
+                )
+                return await run_ctf_pi_reason(
+                    graph_summary=str(reason_args["graph_summary"]),
+                    max_intents=int(reason_args["max_intents"]),
+                    model=self.reason_model,
+                    account_root=getattr(
+                        self, "credential_accounts_root", None
+                    ),
+                    account_id=account_id,
+                    state_root=state_base / ".muteki-agent-state" / "reason",
+                    shared_graph=self.shared_graph,
+                )
+            # Context manifest for the assembled Reason prompt. Measurement-only;
+            # a manifest failure must never break planning.
+            try:
+                manifest_messages = (
+                    build_ctf_pi_decide_prompt(
+                        summary,
+                        max_intents=int(reason_args["max_intents"]),
+                    )
+                    if ctf_pi_decide
+                    else build_reason_prompt(
+                        summary,
+                        max_intents=reason_args["max_intents"],
+                        goal=reason_args["goal"],
+                        mode=reason_args["mode"],
+                        scope=reason_args["scope"],
+                            )
+                )
+                section_chars: dict[str, int] = {
+                    "system": sum(
+                        len(str(m.get("content") or ""))
+                        for m in manifest_messages
+                        if m.get("role") == "system"
+                    ),
+                    "reason_summary": reason_summary_chars,
+                }
+                if ctf_pi_decide:
+                    section_chars["workspace_files"] = len(
+                        _ctf_workspace_files()
+                    )
+                else:
+                    section_chars["operator_task"] = len(task_context)
+                if retry_note_chars:
+                    section_chars["planner_retry"] = retry_note_chars
+                if compact_summary:
+                    section_chars["historical_checkpoint"] = len(compact_summary)
+                await self._emit_coord_bb(
+                    "context_manifest",
+                    role="reason",
+                    worker_id="reason",
+                    intent_id="",
+                    sections=list(section_chars),
+                    section_chars=section_chars,
+                    total_chars=sum(
+                        len(str(m.get("content") or ""))
+                        for m in manifest_messages
+                    ),
+                    fact_seqs=[],
+                    intent_ids=[],
+                    artifact_ids=[],
+                    full_board_included=ctf_pi_decide,
+                    estimated_tokens=estimate_reason_messages_tokens(
+                        manifest_messages),
+                    context_window_tokens=(
+                        reason_budget.context_window_tokens
+                        if reason_budget is not None
+                        else 0
+                    ),
+                    compact_cutoff_seq=compact_cutoff_seq,
+                )
+            except Exception:
+                pass
+            result = await _call_reason()
+            self._last_reason_attempts.append(
+                self._capture_reason_attempt(result, 1)
+            )
+            if (not ctf_pi_decide
+                    and reason_failure_is_context_overflow(result)
+                    and not compacted_this_pass
+                    and await _compact_reason_graph(estimated_reason_tokens)):
+                reason_args["graph_summary"] = summary
+                try:
+                    reason_context_wm = int(
+                        self.shared_graph.semantic_graph_watermark() or 0
+                    )
+                    self._last_reason_context_wm = reason_context_wm
                 except Exception:
                     pass
-            # Framework class-side declaration override (env keys are cleared by
-            # A/B harnesses). Default Swarm has neither attribute nor catalog → inert.
-            decl_mode = getattr(self, "reason_declaration_mode", None)
-            decl_catalog = None
-            catalog_fn = getattr(self, "_declaration_target_catalog_v2", None)
-            if callable(catalog_fn) and decl_mode:
-                try:
-                    decl_catalog = catalog_fn()
-                except Exception:
-                    decl_catalog = None
-            result = await run_reason(
-                llm=self.llm,
-                model=self.reason_model,
-                graph_summary=summary,
-                fact_index=fact_index,
-                max_intents=4,
-                run_id=self.run_id,
-                challenge_id=self.challenge.id,
-                # pentest → judge completion against the operator's engagement goal
-                # (CTF passes mode="ctf" + no goal → the prompt is byte-identical).
-                mode=getattr(self.challenge, "mode", "ctf"),
-                goal=(getattr(self.challenge, "goal", "") or None),
-                scope=(getattr(self.challenge, "scope", "") or None),
-                # Production coordination always uses the ordinary prompt. Offline
-                # studies may annotate a frozen copy after this method returns.
-                cognitive_shadow=False,
-                declaration_mode=decl_mode,
-                declaration_target_catalog_v2=decl_catalog,
-            )
+                result = await _call_reason()
+                self._last_reason_attempts.append(
+                    self._capture_reason_attempt(result, 2)
+                )
+            # No identical-prompt auto-retry on timeout/failure: the caller's
+            # failure contract records the failed pass and consumes the
+            # watermark instead of re-firing the same request.
             self._last_reason = result
             try:
                 pins = getattr(result, "pinned_facts", []) or []
-                if pins:
+                if pins and getattr(self.challenge, "mode", "ctf") != "ctf":
                     self.shared_graph.pin_facts(
                         actor="reason",
                         fact_seqs=list(pins),
@@ -683,13 +1158,217 @@ class _DispatchReasonMixin:
                     )
             except Exception:
                 pass
-            proposed = dispatch_intents(self.shared_graph, result, actor="reason")
-            on_proposed = getattr(self, "framework_on_intents_proposed", None)
-            if callable(on_proposed):
+            superseded: list[str] = []
+            ctf_mode = getattr(self.challenge, "mode", "ctf") == "ctf"
+            requested_supersede = list(
+                getattr(result, "supersede_intents", []) or []
+            )
+            claimed_supersede: dict[str, dict[str, Any]] = {}
+            if requested_supersede and not ctf_mode:
                 try:
-                    on_proposed(proposed)
+                    requested_ids = {
+                        str(intent_id or "").strip()
+                        for intent_id in requested_supersede
+                        if str(intent_id or "").strip()
+                    }
+                    lane_rows = {
+                        str(row.get("intent_id") or ""): dict(row)
+                        for row in self.shared_graph.active_lane_intent_rows()
+                    }
+                    active_rows = {
+                        str(row.get("intent_id") or ""): dict(row)
+                        for row in self.shared_graph.coverage_intent_rows()
+                        if (
+                            str(row.get("status") or "")
+                            in {"open", "claimed"}
+                            and str(row.get("dispatch_state") or "") == "active"
+                        )
+                    }
+                    for intent_id in requested_ids:
+                        claim = dict(
+                            self.shared_graph.intent_claim_state(intent_id) or {}
+                        )
+                        if str(claim.get("status") or "") != "claimed":
+                            continue
+                        claimed_supersede[intent_id] = {
+                            **claim,
+                            **active_rows.get(intent_id, {}),
+                            **lane_rows.get(intent_id, {}),
+                            "intent_id": intent_id,
+                        }
+                except Exception:
+                    claimed_supersede = {}
+            reprioritized: list[str] = []
+            raw_priorities = dict(
+                getattr(result, "reprioritize_intents", {}) or {}
+            )
+            if raw_priorities:
+                try:
+                    reprioritized = self.shared_graph.reprioritize_open_intents(
+                        actor="reason",
+                        priorities=raw_priorities,
+                    )
+                except Exception:
+                    reprioritized = []
+                if reprioritized:
+                    await self._emit_coord_bb(
+                        "intent_state_changed",
+                        intent_id=",".join(reprioritized),
+                        priority_changed=True,
+                    )
+            if ctf_mode:
+                try:
+                    apply_ctf_decide_frontier(result, self.shared_graph)
                 except Exception:
                     pass
+            dispatch_decisions: list[dict[str, Any]] = []
+            proposed = dispatch_intents(
+                self.shared_graph,
+                result,
+                actor="reason",
+                decision_log=dispatch_decisions,
+            )
+            if ctf_mode and requested_supersede:
+                try:
+                    superseded = self.shared_graph.supersede_open_intent_ids(
+                        actor="reason",
+                        intent_ids=requested_supersede,
+                        reason=str(
+                            getattr(result, "supersede_why", "") or ""
+                        ),
+                    )
+                except Exception:
+                    superseded = []
+                if superseded:
+                    await self._emit_coord_bb(
+                        "intent_state_changed",
+                        intent_id=",".join(superseded),
+                        dispatch_state="closed",
+                        status="done",
+                        result="superseded",
+                        reason=str(
+                            getattr(result, "supersede_why", "") or ""
+                        )[:1000],
+                    )
+            try:
+                verified_fact_ids = {
+                    int(row.get("fact_seq") or 0)
+                    for row in (self.shared_graph.verified_evidence() or [])
+                    if int(row.get("fact_seq") or 0) > 0
+                }
+            except Exception:
+                verified_fact_ids = set()
+            evidence_backed_replacements = [
+                row for row in proposed
+                if (
+                    str(row.get("priority") or "") == "high"
+                    and any(
+                        int(seq) in verified_fact_ids
+                        for seq in (row.get("from_facts") or [])
+                    )
+                )
+            ]
+            if (
+                not ctf_mode
+                and requested_supersede
+                and evidence_backed_replacements
+            ):
+                try:
+                    superseded = self.shared_graph.supersede_open_intent_ids(
+                        actor="reason",
+                        intent_ids=requested_supersede,
+                        reason=str(getattr(result, "supersede_why", "") or ""),
+                    )
+                except Exception:
+                    superseded = []
+                if superseded:
+                    await self._emit_coord_bb(
+                        "intent_state_changed",
+                        intent_id=",".join(superseded),
+                        dispatch_state="closed",
+                        status="done",
+                        result="superseded",
+                        reason=str(
+                            getattr(result, "supersede_why", "") or ""
+                        )[:1000],
+                    )
+            self._last_reason_superseded = superseded
+            supersede_why = str(
+                getattr(result, "supersede_why", "") or ""
+            ).strip()
+            if claimed_supersede and supersede_why:
+                try:
+                    replacement_by_lane = {
+                        self.shared_graph.normalize_lane_key(
+                            str(row.get("lane_key") or "")
+                        ): row
+                        for row in proposed
+                        if (
+                            row in evidence_backed_replacements
+                            and str(row.get("lane_key") or "").strip()
+                        )
+                    }
+                    replacement_by_intent = {
+                        str(row.get("dup_of") or ""): row
+                        for row in proposed
+                        if (
+                            row in evidence_backed_replacements
+                            and str(row.get("reopen_because") or "").strip()
+                            and str(row.get("dup_of") or "").strip()
+                            and bool(row.get("refreshes_claimed_context"))
+                        )
+                    }
+                except Exception:
+                    replacement_by_lane = {}
+                    replacement_by_intent = {}
+                high_replacements = evidence_backed_replacements
+                preemptions: list[dict[str, Any]] = []
+                for intent_id, old in claimed_supersede.items():
+                    try:
+                        lane_key = self.shared_graph.normalize_lane_key(
+                            str(old.get("lane_key") or "")
+                        )
+                    except Exception:
+                        lane_key = ""
+                    replacement = (
+                        replacement_by_intent.get(intent_id)
+                        or replacement_by_lane.get(lane_key)
+                    )
+                    if replacement is None:
+                        try:
+                            old_sources = {
+                                int(row.get("seq") or 0)
+                                for row in self.shared_graph.intent_source_facts(
+                                    intent_id
+                                )
+                                if int(row.get("seq") or 0) > 0
+                            }
+                        except Exception:
+                            old_sources = set()
+                        replacement = next(
+                            (
+                                row for row in high_replacements
+                                if {
+                                    int(seq)
+                                    for seq in row.get("from_facts", [])
+                                    if int(seq) > 0
+                                } - old_sources
+                            ),
+                            None,
+                        )
+                    if replacement is None:
+                        continue
+                    preemptions.append({
+                        "intent_id": intent_id,
+                        "worker": str(old.get("worker") or ""),
+                        "lane_key": lane_key,
+                        "replacement_intent_id": str(
+                            (replacement or {}).get("intent_id") or ""
+                        ),
+                        "reason": supersede_why[:1000],
+                    })
+                self._last_reason_preemptions = preemptions
+            self._last_dispatch_decisions = dispatch_decisions
             failure = result.planner_failure
             if not proposed and result.intents and failure is None:
                 failure = PlannerFailure(
@@ -698,34 +1377,159 @@ class _DispatchReasonMixin:
                 )
             self._last_planner_failure = failure
             for it in proposed:
-                if self.bus is not None:
-                    await self.bus.emit(
-                        Event(
-                            event_type=EventType.BLACKBOARD_DELTA,
-                            run_id=self.run_id,
-                            challenge_id=self.challenge.id,
-                            payload=blackboard_delta_payload(
-                                "intent_proposed",
-                                actor="reason",
-                                intent_id=it["intent_id"],
-                                goal=it["goal"],
-                                worker_class=it["worker_class"],
-                                from_facts=it.get("from_facts", []),
-                                declares=it.get("declares"),
-                            ),
-                        )
-                    )
-                # zh gist for the (often long, English) Reason goal — reuse the
-                # planner's own llm client; fire-and-forget so planning isn't held up.
+                # Graph projection is the single source of intent_proposed events.
+                # Keep the optional display summary, but do not emit the mutation a
+                # second time on the event bus.
                 self._summarize_intent_async(it["intent_id"], it["goal"])
             return len(proposed)
         except Exception as exc:
             self._last_reason = None
+            self._last_dispatch_decisions = []
             self._last_planner_failure = PlannerFailure(
                 PlannerFailureKind.EXCEPTION,
                 f"{type(exc).__name__}: {exc}"[:500],
             )
+            if not self._last_reason_attempts:
+                self._last_reason_attempts = [{
+                    "attempt_index": 1,
+                    "response_status": "error",
+                    "timed_out": False,
+                    "finish_reason": "exception",
+                    "raw_response_artifact_id": "",
+                    "raw_response_sha256": "",
+                    "raw_response_chars": 0,
+                    "parse_status": "not_run_exception",
+                    "parse_detail": f"{type(exc).__name__}: {exc}"[:500],
+                    "raw_intent_count": 0,
+                    "parsed_intent_count": 0,
+                }]
             return 0
+
+    def _reason_event_fields(self, proposed: int) -> dict[str, Any]:
+        """Stable diagnostics for every Reason pass, including race miss."""
+        result = getattr(self, "_last_reason", None)
+        intents = len(getattr(result, "intents", []) or [])
+        parse_rejections = list(
+            getattr(result, "intent_parse_rejections", []) or []
+        )
+        decisions = [
+            *parse_rejections,
+            *list(getattr(self, "_last_dispatch_decisions", []) or []),
+        ]
+        decisions.sort(key=lambda item: (
+            int(item.get("raw_index", -1)),
+            0 if item.get("stage") == "parse" else 1,
+        ))
+        drop_reasons: dict[str, int] = {}
+        for decision in decisions:
+            if decision.get("outcome") == "accepted":
+                continue
+            code = str(decision.get("reason_code") or "unknown")
+            drop_reasons[code] = drop_reasons.get(code, 0) + 1
+        duplicate_codes = {
+            "declared_duplicate",
+            "equivalent_step",
+            "active_step_stage",
+            "active_branch_stage",
+            "active_coverage_method",
+            "producer_successor_queued",
+            "producer_successor_exists",
+            "repeated_lane_evidence",
+            "active_lane",
+            "active_route",
+            "storage_duplicate",
+        }
+        orphan_codes = {
+            "orphan_no_source",
+        }
+        from muteki.solver.reason import PlannerFailureKind
+        failure = getattr(self, "_last_planner_failure", None)
+        failure_kind = getattr(failure, "kind", "")
+        if hasattr(failure_kind, "value"):
+            failure_kind = failure_kind.value
+        failure_detail = str(getattr(failure, "detail", "") or "")[:300]
+        reason_failed = str(failure_kind or "") in (
+            PlannerFailureKind.EXCEPTION.value,
+            PlannerFailureKind.TIMEOUT.value,
+        )
+        attempts = list(getattr(self, "_last_reason_attempts", []) or [])
+        last_attempt = attempts[-1] if attempts else {}
+        progress_sections = getattr(result, "progress_sections", {}) or {}
+        return {
+            "proposed": int(proposed or 0),
+            "status": "failed" if reason_failed else "ok",
+            "error": (
+                f"{failure_kind}: {failure_detail}"[:300]
+                if reason_failed else ""
+            ),
+            "dropped_total": sum(
+                1 for decision in decisions
+                if decision.get("outcome") != "accepted"
+            ),
+            "dropped_dup": sum(
+                count for code, count in drop_reasons.items()
+                if code in duplicate_codes
+            ),
+            "dropped_orphan": sum(
+                count for code, count in drop_reasons.items()
+                if code in orphan_codes
+            ),
+            "drop_reasons": drop_reasons,
+            "superseded": len(
+                getattr(self, "_last_reason_superseded", []) or []
+            ),
+            "superseded_intent_ids": list(
+                getattr(self, "_last_reason_superseded", []) or []
+            ),
+            "preempt_requested": len(
+                getattr(self, "_last_reason_preemptions", []) or []
+            ),
+            "preempted_intent_ids": [
+                str(item.get("intent_id") or "")
+                for item in (
+                    getattr(self, "_last_reason_preemptions", []) or []
+                )
+            ],
+            "intent_decisions": decisions,
+            "raw_response_status": str(
+                last_attempt.get("response_status") or "not_recorded"
+            ),
+            "raw_response_finish_reason": str(
+                last_attempt.get("finish_reason") or ""
+            ),
+            "raw_response_artifact_id": str(
+                last_attempt.get("raw_response_artifact_id") or ""
+            ),
+            "raw_response_sha256": str(
+                last_attempt.get("raw_response_sha256") or ""
+            ),
+            "raw_response_chars": int(
+                last_attempt.get("raw_response_chars") or 0
+            ),
+            "timed_out": bool(last_attempt.get("timed_out", False)),
+            "timeout_occurred": any(
+                bool(attempt.get("timed_out", False)) for attempt in attempts
+            ),
+            "parse_status": str(
+                last_attempt.get("parse_status") or "not_recorded"
+            ),
+            "parse_detail": str(last_attempt.get("parse_detail") or ""),
+            "raw_intent_count": int(last_attempt.get("raw_intent_count") or 0),
+            "parsed_intent_count": int(
+                last_attempt.get("parsed_intent_count") or intents
+            ),
+            "reason_attempts": attempts,
+            "planner_failure": str(failure_kind or ""),
+            "planner_failure_detail": failure_detail,
+            "progress_summary": str(
+                getattr(result, "progress_summary", "") or ""
+            )[:1600],
+            "progress_sections": {
+                key: [str(item)[:500] for item in progress_sections.get(key, [])[:3]]
+                for key in ("confirmed", "active", "blocked", "next")
+            },
+            "progress_verdict": str(getattr(result, "verdict", "") or ""),
+        }
 
     def _summarize_intent_async(self, intent_id: str, goal: str) -> None:
         """Fire-and-forget a deepseek-flash zh gist for a Reason intent goal."""
@@ -752,16 +1556,30 @@ class _DispatchReasonMixin:
     async def _emit_coord_bb(self, kind: str, **fields) -> None:
         """Coordinator-scoped blackboard delta (shared by the race-scout phase and
         the main loop's local _emit_bb)."""
+        if kind == "worker_spawn_rejected":
+            cap = (
+                int(getattr(self, "max_workers", 0) or 0),
+                int(getattr(self, "_spawned_total", 0) or 0),
+            )
+            if not spawn_reject_should_emit(
+                self,
+                reason=str(fields.get("reason") or ""),
+                phase=str(fields.get("phase") or ""),
+                engine=str(fields.get("engine") or ""),
+                capacity=cap,
+            ):
+                return
         if self.bus is None:
             return
         try:
+            actor = str(fields.pop("actor", "") or "coordinator")
             await self.bus.emit(
                 Event(
                     event_type=EventType.BLACKBOARD_DELTA,
                     run_id=self.run_id,
                     challenge_id=self.challenge.id,
                     payload=blackboard_delta_payload(
-                        kind, actor="coordinator", **fields
+                        kind, actor=actor, **fields
                     ),
                 )
             )

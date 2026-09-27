@@ -2,6 +2,30 @@
 
 All notable public release changes are tracked here.
 
+## 0.4.0 - 2026-09-28
+
+### Added
+
+- Added the goal-driven Web workbench with single-task solving and optional conversation, competition, and extension workspaces. The Coordinator schedules heterogeneous Workers over a shared evidence graph with operator controls.
+- Added structured Agent runtime and credential-account support for the supported CLI engines, with capability and health views in the Web settings.
+- Added the Ubuntu 24.04 single-node installer and release checks for the Web, UI, and Worker images.
+
+### Changed
+
+- The Web UI now opens in single-task mode by default. The Chinese README includes installation paths for macOS, Docker, Ubuntu, and an Ubuntu VM, plus run controls and screenshots.
+- Refined the BTW side-query panel and kept its temporary read-only Worker separate from the main solving slots.
+- Release packages, Compose defaults, and Worker build defaults use `0.4.0`; Git and image tags use `v0.4.0`.
+
+### Removed
+
+- Removed the Textual TUI, F01–F13 research implementations, evaluation and development scripts, embedded test scripts, local run artifacts, and obsolete reports from the current product tree.
+- Removed the optional research Swarm loader and direct-write framework commands from the shipped Web and blackboard paths. Older explicit research `swarm_class` values are no longer supported.
+
+### Upgrade
+
+- The managed updater accepts `muteki upgrade v0.4.0` or `./run.sh upgrade v0.4.0` after the GitHub Release is published. Existing `.env`, `state/`, saved credentials, and sessions remain outside the release bundle.
+- The release includes a versioned application archive, SHA-256 manifest, and multi-architecture container images. Container deployments can use `muteki upgrade v0.4.0 --compose`.
+
 ## 0.3.2 - 2026-08-22
 
 ### Added

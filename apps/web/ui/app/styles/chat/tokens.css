@@ -1,0 +1,340 @@
+/*
+ * Chat workbench design tokens (`--cx-*`).
+ *
+ * Every value derives from the palette-engine brand variables so the user's
+ * scheme, accent and light/dark mode keep flowing through. Names are prefixed
+ * so they never collide with HeroUI's global `--background` / `--accent` set,
+ * which other pages still rely on.
+ */
+:root {
+  --cx-bg: var(--page);
+  --cx-bg-subtle: color-mix(in srgb, var(--ink) 2%, var(--page));
+  --cx-sidebar: color-mix(in srgb, var(--ink) 2.5%, var(--page));
+  --cx-elevated: var(--surface);
+  --cx-overlay: var(--surface);
+  --cx-sunken: color-mix(in srgb, var(--ink) 4%, var(--page));
+  --cx-code: color-mix(in srgb, var(--ink) 3.5%, var(--surface));
+  --cx-hover: color-mix(in srgb, var(--ink) 5.5%, transparent);
+  --cx-active: color-mix(in srgb, var(--ink) 9%, transparent);
+  --cx-selected: color-mix(in srgb, var(--ink) 9%, transparent);
+  --cx-text-selection: color-mix(in srgb, var(--ink) 20%, transparent);
+  --cx-border-subtle: color-mix(in srgb, var(--ink) 6%, transparent);
+  --cx-border: color-mix(in srgb, var(--ink) 10%, transparent);
+  --cx-border-strong: color-mix(in srgb, var(--ink) 18%, transparent);
+  --cx-fg: var(--ink);
+  --cx-fg-2: var(--ink-2);
+  --cx-fg-3: var(--ink-3);
+  /* Informational secondary (sidebar time/count, thinking label, etc.).
+   * Must stay opaque (or nearly): mixing pale --ink-3 with transparency drops
+   * light-theme contrast to ~2.96:1 after compositing; WCAG AA needs 4.5:1.
+   * Visual hierarchy vs --cx-fg-3 uses size/weight/spacing, not alpha. */
+  --cx-fg-4: var(--ink-3);
+  --cx-accent: var(--accent);
+  --cx-accent-fg: var(--on-accent);
+  --cx-accent-soft: color-mix(in srgb, var(--accent) 12%, transparent);
+  --cx-accent-line: color-mix(in srgb, var(--accent) 42%, transparent);
+  --cx-success: var(--green);
+  --cx-success-soft: color-mix(in srgb, var(--green) 12%, transparent);
+  --cx-warning: var(--amber);
+  --cx-warning-soft: color-mix(in srgb, var(--amber) 13%, transparent);
+  --cx-danger: var(--red);
+  --cx-danger-soft: color-mix(in srgb, var(--red) 11%, transparent);
+  --cx-add: var(--green);
+  --cx-add-bg: color-mix(in srgb, var(--green) 11%, transparent);
+  --cx-add-bg-strong: color-mix(in srgb, var(--green) 24%, transparent);
+  --cx-del: var(--red);
+  --cx-del-bg: color-mix(in srgb, var(--red) 10%, transparent);
+  --cx-del-bg-strong: color-mix(in srgb, var(--red) 22%, transparent);
+  --cx-focus: color-mix(in srgb, var(--ink) 60%, var(--page));
+  --cx-field-focus: color-mix(in srgb, var(--ink) 32%, transparent);
+
+  --cx-font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", "Helvetica Neue", Arial, sans-serif;
+  --cx-font-mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+  --cx-shadow-color: 220 40% 8%;
+  --cx-shadow-xs: 0 1px 2px hsl(var(--cx-shadow-color) / 0.05);
+  --cx-shadow-sm: 0 1px 2px hsl(var(--cx-shadow-color) / 0.06), 0 1px 3px hsl(var(--cx-shadow-color) / 0.04);
+  --cx-shadow-md: 0 6px 16px -6px hsl(var(--cx-shadow-color) / 0.12), 0 2px 4px -2px hsl(var(--cx-shadow-color) / 0.06);
+  --cx-shadow-pop: 0 0 0 1px var(--cx-border), 0 18px 44px -14px hsl(var(--cx-shadow-color) / 0.26), 0 6px 14px -6px hsl(var(--cx-shadow-color) / 0.12);
+  --cx-shadow-composer: 0 0 0 1px var(--cx-border), 0 10px 30px -14px hsl(var(--cx-shadow-color) / 0.2), 0 2px 6px -2px hsl(var(--cx-shadow-color) / 0.06);
+  --cx-shadow-composer-focus: 0 0 0 1px var(--cx-border-strong), 0 14px 38px -14px hsl(var(--cx-shadow-color) / 0.26), 0 2px 6px -2px hsl(var(--cx-shadow-color) / 0.08);
+
+  --cx-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --cx-ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --cx-ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+  --cx-dur-fast: 120ms;
+  --cx-dur: 180ms;
+  --cx-dur-slow: 280ms;
+
+  --cx-header-h: 52px;
+  --cx-content-w: 768px;
+}
+
+.dark {
+  --cx-shadow-color: 0 0% 0%;
+  --cx-shadow-sm: 0 1px 2px hsl(0 0% 0% / 0.3);
+  --cx-shadow-md: 0 8px 20px -8px hsl(0 0% 0% / 0.55), 0 2px 4px -2px hsl(0 0% 0% / 0.3);
+  --cx-shadow-pop: 0 0 0 1px var(--cx-border), 0 22px 52px -16px hsl(0 0% 0% / 0.7), 0 6px 16px -6px hsl(0 0% 0% / 0.45);
+  --cx-shadow-composer: 0 0 0 1px var(--cx-border), 0 14px 36px -16px hsl(0 0% 0% / 0.6);
+  --cx-shadow-composer-focus: 0 0 0 1px var(--cx-border-strong), 0 18px 44px -16px hsl(0 0% 0% / 0.7);
+  --cx-overlay: color-mix(in srgb, var(--ink) 4%, var(--surface));
+}
+
+@theme inline {
+  --color-cx-bg: var(--cx-bg);
+  --color-cx-bg-subtle: var(--cx-bg-subtle);
+  --color-cx-sidebar: var(--cx-sidebar);
+  --color-cx-elevated: var(--cx-elevated);
+  --color-cx-overlay: var(--cx-overlay);
+  --color-cx-sunken: var(--cx-sunken);
+  --color-cx-code: var(--cx-code);
+  --color-cx-hover: var(--cx-hover);
+  --color-cx-active: var(--cx-active);
+  --color-cx-selected: var(--cx-selected);
+  --color-cx-border-subtle: var(--cx-border-subtle);
+  --color-cx-border: var(--cx-border);
+  --color-cx-border-strong: var(--cx-border-strong);
+  --color-cx-fg: var(--cx-fg);
+  --color-cx-fg-2: var(--cx-fg-2);
+  --color-cx-fg-3: var(--cx-fg-3);
+  --color-cx-fg-4: var(--cx-fg-4);
+  --color-cx-accent: var(--cx-accent);
+  --color-cx-accent-fg: var(--cx-accent-fg);
+  --color-cx-accent-soft: var(--cx-accent-soft);
+  --color-cx-accent-line: var(--cx-accent-line);
+  --color-cx-focus: var(--cx-focus);
+  --color-cx-success: var(--cx-success);
+  --color-cx-success-soft: var(--cx-success-soft);
+  --color-cx-warning: var(--cx-warning);
+  --color-cx-warning-soft: var(--cx-warning-soft);
+  --color-cx-danger: var(--cx-danger);
+  --color-cx-danger-soft: var(--cx-danger-soft);
+  --color-cx-add: var(--cx-add);
+  --color-cx-add-bg: var(--cx-add-bg);
+  --color-cx-del: var(--cx-del);
+  --color-cx-del-bg: var(--cx-del-bg);
+  --shadow-cx-xs: var(--cx-shadow-xs);
+  --shadow-cx-sm: var(--cx-shadow-sm);
+  --shadow-cx-md: var(--cx-shadow-md);
+  --shadow-cx-pop: var(--cx-shadow-pop);
+  --shadow-cx-composer: var(--cx-shadow-composer);
+  --ease-cx-out: var(--cx-ease-out);
+  --ease-cx-in-out: var(--cx-ease-in-out);
+  --ease-cx-drawer: var(--cx-ease-drawer);
+  --font-cx-sans: var(--cx-font-sans);
+  --font-cx-mono: var(--cx-font-mono);
+}
+
+/* ── Root surface ─────────────────────────────────────────────────────────── */
+.cx-root {
+  font-family: var(--cx-font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--cx-fg);
+  background: var(--cx-bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "cv11", "ss01";
+}
+
+/*
+ * Resets live in the base layer so Tailwind utilities (a later layer) always
+ * win. Unlayered rules would silently override every utility they touch.
+ */
+@layer base {
+  .cx-root *,
+  .cx-portal * {
+    box-sizing: border-box;
+  }
+
+  .cx-root :where(button, input, textarea, select),
+  .cx-portal :where(button, input, textarea, select) {
+    color: inherit;
+  }
+
+  .cx-root :where(h1, h2, h3, h4, p, ul, ol, figure),
+  .cx-portal :where(h1, h2, h3, h4, p, ul, ol, figure) {
+    margin: 0;
+  }
+}
+
+/*
+ * base.css ships unlayered `button { font: inherit }` / `input, select,
+ * textarea { font: inherit }`, which beat font utilities. Reverting to the
+ * layered cascade restores utilities and falls back to preflight's inherit.
+ */
+.cx-root :is(button, input, select, textarea),
+.cx-portal :is(button, input, select, textarea) {
+  font: revert-layer;
+}
+
+.cx-portal {
+  font-family: var(--cx-font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--cx-fg);
+  -webkit-font-smoothing: antialiased;
+}
+
+.cx-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--ink) 16%, transparent) transparent;
+}
+.cx-scroll::-webkit-scrollbar { width: 10px; height: 10px; }
+.cx-scroll::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ink) 16%, transparent) padding-box;
+}
+.cx-scroll::-webkit-scrollbar-thumb:hover { background-color: color-mix(in srgb, var(--ink) 28%, transparent); }
+.cx-scroll::-webkit-scrollbar-track { background: transparent; }
+
+.cx-no-scrollbar { scrollbar-width: none; }
+.cx-no-scrollbar::-webkit-scrollbar { display: none; }
+
+.cx-tabular { font-variant-numeric: tabular-nums; }
+
+/* Edge fades for scroll containers (driven by ScrollArea data attributes). */
+.cx-fade-y {
+  --cx-fade-top: 0px;
+  --cx-fade-bottom: 0px;
+  mask-image: linear-gradient(to bottom, transparent 0, #000 var(--cx-fade-top), #000 calc(100% - var(--cx-fade-bottom)), transparent 100%);
+}
+.cx-fade-y[data-fade-top="true"] { --cx-fade-top: 18px; }
+.cx-fade-y[data-fade-bottom="true"] { --cx-fade-bottom: 18px; }
+.cx-fade-x {
+  --cx-fade-left: 0px;
+  --cx-fade-right: 0px;
+  mask-image: linear-gradient(to right, transparent 0, #000 var(--cx-fade-left), #000 calc(100% - var(--cx-fade-right)), transparent 100%);
+}
+.cx-fade-x[data-fade-left="true"] { --cx-fade-left: 22px; }
+.cx-fade-x[data-fade-right="true"] { --cx-fade-right: 22px; }
+
+/* ── Primitives ───────────────────────────────────────────────────────────── */
+.cx-slider {
+  --cx-slider-pct: 50%;
+  width: 100%;
+  height: 18px;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+.cx-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(to right, var(--cx-fg-3) var(--cx-slider-pct), var(--cx-border-strong) var(--cx-slider-pct));
+}
+.cx-slider::-moz-range-track {
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(to right, var(--cx-fg-3) var(--cx-slider-pct), var(--cx-border-strong) var(--cx-slider-pct));
+}
+.cx-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  margin-top: -6px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 0 1px var(--cx-border-strong), 0 1px 3px hsl(var(--cx-shadow-color) / 0.25);
+  transition: transform var(--cx-dur-fast) var(--cx-ease-out);
+}
+.cx-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border: 0;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 0 1px var(--cx-border-strong), 0 1px 3px hsl(var(--cx-shadow-color) / 0.25);
+}
+.cx-slider:active::-webkit-slider-thumb { transform: scale(1.12); }
+.cx-slider:focus-visible { outline: none; }
+.cx-slider:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 2px var(--cx-bg), 0 0 0 4px var(--cx-focus); }
+.cx-slider:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 2px var(--cx-bg), 0 0 0 4px var(--cx-focus); }
+
+.cx-tk { color: var(--cx-tk, inherit); }
+.dark .cx-tk { color: var(--cx-tk-dark, var(--cx-tk, inherit)); }
+
+.cx-caret {
+  display: inline-block;
+  width: 0.55em;
+  height: 1.05em;
+  margin-left: 1px;
+  vertical-align: -0.15em;
+  border-radius: 1px;
+  background: currentColor;
+  opacity: 0.7;
+  animation: cx-caret 1s steps(1) infinite;
+}
+
+/* ── Motion ───────────────────────────────────────────────────────────────── */
+@keyframes cx-shimmer {
+  0% { background-position: 200% 50%; }
+  100% { background-position: -200% 50%; }
+}
+@keyframes cx-spin { to { transform: rotate(360deg); } }
+@keyframes cx-pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.82); }
+}
+@keyframes cx-breathe {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 40%, transparent); }
+  50% { box-shadow: 0 0 0 4px color-mix(in srgb, currentColor 0%, transparent); }
+}
+@keyframes cx-fade-up {
+  from { opacity: 0; transform: translateY(6px); filter: blur(3px); }
+  to { opacity: 1; transform: none; filter: none; }
+}
+@keyframes cx-fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes cx-progress {
+  0% { transform: translateX(-100%) scaleX(0.3); }
+  50% { transform: translateX(10%) scaleX(0.6); }
+  100% { transform: translateX(110%) scaleX(0.3); }
+}
+@keyframes cx-caret { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+
+.cx-shimmer-text {
+  color: transparent;
+  background: linear-gradient(90deg,
+    var(--cx-fg-3) 0%, var(--cx-fg-3) 38%,
+    var(--cx-fg) 50%,
+    var(--cx-fg-3) 62%, var(--cx-fg-3) 100%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  animation: cx-shimmer 2.4s linear infinite;
+}
+
+.cx-animate-in { animation: cx-fade-up 260ms var(--cx-ease-out) both; }
+.cx-spin { animation: cx-spin 0.9s linear infinite; }
+.cx-pulse-dot { animation: cx-pulse-dot 1.4s ease-in-out infinite; }
+
+.cx-skeleton {
+  border-radius: 6px;
+  background: linear-gradient(90deg, var(--cx-sunken) 0%, var(--cx-hover) 50%, var(--cx-sunken) 100%);
+  background-size: 200% 100%;
+  animation: cx-shimmer 1.6s ease-in-out infinite;
+}
+
+.cx-press {
+  transition-property: color, background-color, border-color, box-shadow, opacity, transform;
+  transition-duration: var(--cx-dur-fast);
+  transition-timing-function: var(--cx-ease-out);
+}
+.cx-press:active:not(:disabled):not([aria-disabled="true"]) { transform: scale(0.97); }
+
+@media (prefers-reduced-motion: reduce) {
+  .cx-root *, .cx-portal * {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+}
+html[data-motion="reduce"] .cx-root *,
+html[data-motion="reduce"] .cx-portal * {
+  animation-duration: 1ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 1ms !important;
+}

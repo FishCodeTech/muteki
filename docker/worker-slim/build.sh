@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Build the SLIM muteki worker image (plain Ubuntu + reverse-connector + 9 agent CLIs).
+# Build the SLIM muteki worker image (plain Ubuntu + reverse-connector + 8 agent CLIs).
+# Local development helper only — formal multi-arch release goes through
+# .github/workflows/release-images.yml (do not docker push GHCR from here).
 # A lightweight alternative to docker/worker/build.sh for FAST testing — same two steps:
 #   1) cross-compile the Go runtime-agent (supervisor) to an architecture-named
 #      file in docker/worker-slim (the docker build context).
@@ -7,12 +9,12 @@
 #
 # Usage: ./docker/worker-slim/build.sh [repo] [version] [arch]
 #   repo:    image repository (default: muteki-worker-slim; e.g. ghcr.io/fishcodetech/muteki-worker-slim)
-#   version: version tag       (default: v0.3.2; GHCR release tags keep the leading v)
+#   version: version tag       (default: v0.4.0; GHCR release tags keep the leading v)
 #   arch:    amd64 | arm64     (default: HOST arch — arm64 on Apple Silicon)
 # Tags built: <repo>:<version> AND <repo>:latest.
 #
-# Unlike the Kali image (pinned amd64 because ghidra/sage are amd64), the slim image
-# has NO arch-locked tooling — the only baked binary we control is the Go runtime_agent
+# Unlike the Kali image whose local build helper targets amd64, the slim image has
+# NO arch-locked tooling — the only baked binary we control is the Go runtime_agent
 # (GOARCH), the engine CLIs are arch-agnostic JS (npm) + an arch-detecting cursor
 # installer. So it builds NATIVELY for the host arch by default: on an Apple-Silicon
 # mac that means arm64, which AVOIDS QEMU emulation entirely (emulated amd64 apt on
@@ -26,7 +28,7 @@
 set -euo pipefail
 
 REPO_IMAGE="${1:-muteki-worker-slim}"
-VERSION="${2:-v0.3.2}"
+VERSION="${2:-v0.4.0}"
 # Default arch = host arch (uname -m → docker/go naming). Override with 3rd arg.
 _host_arch="$(uname -m)"
 case "${_host_arch}" in
@@ -63,13 +65,16 @@ fi
 ls -la "$RUNTIME_AGENT"
 file "$RUNTIME_AGENT" 2>/dev/null || true
 
-echo ">> syncing AGENTS.md + muteki-blackboard skill into docker build context..."
-# AGENTS.md: reuse the trimmed copy the Kali build context already maintains (it is a
-# slimmed prompt, NOT the repo-root AGENTS.md). Keep the two images in lockstep.
-cp "$REPO/docker/worker/AGENTS.md" "$HERE/AGENTS.md"
+echo ">> syncing slim AGENTS.md + muteki-blackboard skill into docker build context..."
+# AGENTS.md: slim keeps its own minimal capability guide (private cwd + shared/
+# handoff). Do not overwrite with the Kali full copy — that would reintroduce
+# full-only tool claims and dangling toolbox expectations.
+if [ ! -f "$HERE/AGENTS.md" ]; then
+  echo "!! missing docker/worker-slim/AGENTS.md" >&2
+  exit 2
+fi
 cp "$REPO/skills/muteki-blackboard/SKILL.md" "$HERE/blackboard.SKILL.md"
 cp "$REPO/skills/muteki-blackboard/blackboard.py" "$HERE/blackboard.py"
-cp "$REPO/muteki/solver/deepseek_harness_worker.py" "$HERE/deepseek_harness_worker.py"
 cp "$REPO/muteki/solver/offline_acp_bridge.py" "$HERE/offline_acp_bridge.py"
 cp "$REPO/muteki/solver/omp_offline_config.yml" "$HERE/omp_offline_config.yml"
 cp "$REPO/muteki/solver/kimi_offline_agent.md" "$HERE/kimi_offline_agent.md"
@@ -129,24 +134,9 @@ docker build --platform "linux/${ARCH}" --load \
   "${build_args[@]}" \
   -t "$TAG" -t "$LATEST" "$HERE"
 
-echo ">> [3/3] verifying all 9 engines..."
-docker run --rm --platform "linux/${ARCH}" --user kali \
-  -e HOME=/home/kali --entrypoint bash "$TAG" -lc '
-    set -e
-    claude --version
-    codex --version
-    /home/kali/.local/bin/cursor-agent --version
-    pi --version
-    /home/kali/.local/bin/omp --version
-    kimi --version
-    /home/kali/.grok/bin/grok --version
-    opencode --version
-    python3 /opt/muteki/deepseek_harness_worker.py --version
-    test -r /opt/muteki/offline_acp_bridge.py
-    test -r /opt/muteki/omp_offline_config.yml
-    test -r /opt/muteki/kimi_offline_agent.md
-    test -r /opt/muteki/grok_offline_agent.md
-    test -x /opt/muteki/runtime_agent
-    test -x /usr/local/bin/blackboard.py
-  '
-echo ">> done: $TAG (+ $LATEST); all 9 engines verified"
+echo ">> [3/3] verifying eight container engines + core paths..."
+DIGEST="$(docker image inspect --format '{{.Id}}' "$TAG")"
+echo ">> image id: $DIGEST"
+"$REPO/scripts/verify_worker_image.sh" --image "$TAG" --variant slim --platform "linux/${ARCH}" \
+  --versions-file "$HERE/.last-engine-versions.txt"
+echo ">> done: $TAG (+ $LATEST); 8 engines verified (local helper only — formal release uses release-images.yml)"

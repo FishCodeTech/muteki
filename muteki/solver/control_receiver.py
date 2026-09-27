@@ -254,11 +254,26 @@ class _SupervisorLink:
     def status(self, worker_id: str, *, timeout: float = 10.0) -> dict:
         return self._request("Status", worker_id=worker_id, timeout=timeout)
 
-    def teardown(self, *, timeout: float = 15.0) -> None:
+    def register_owner(self, owner_run_id: str, owner_token: str,
+                       owner_workspace: str, *, timeout: float = 10.0) -> bool:
         try:
-            self._request("TeardownRun", timeout=timeout)
+            result = self._request("RegisterRun", timeout=timeout,
+                                   owner_run_id=owner_run_id,
+                                   owner_token=owner_token,
+                                   owner_workspace=owner_workspace)
+            return bool(result.get("ok"))
         except ControlError:
-            pass
+            return False
+
+    def teardown(self, *, timeout: float = 15.0, owner_run_id: str = "",
+                 owner_token: str = "") -> bool:
+        try:
+            result = self._request("TeardownRun", timeout=timeout,
+                                   owner_run_id=owner_run_id,
+                                   owner_token=owner_token)
+            return bool(result.get("ok"))
+        except ControlError:
+            return False
 
     def start_worker(
         self, spec: dict, *, timeout: float,
@@ -408,11 +423,25 @@ class ControlReceiver:
         self._started = False
 
     @classmethod
-    def instance(cls) -> "ControlReceiver":
+    def instance(
+        cls, *, host: Optional[str] = None, port: Optional[int] = None
+    ) -> "ControlReceiver":
         with cls._instance_lock:
             if cls._instance is None:
-                cls._instance = ControlReceiver()
+                cls._instance = ControlReceiver(
+                    host=host,
+                    port=DEFAULT_CONTROL_PORT if port is None else int(port),
+                )
                 cls._instance.start()
+            elif (
+                (host is not None and cls._instance.host != host)
+                or (port is not None and cls._instance.port != int(port))
+            ):
+                raise ControlError(
+                    "control receiver already started at "
+                    f"{cls._instance.host}:{cls._instance.port}; requested "
+                    f"{host or cls._instance.host}:{port or cls._instance.port}"
+                )
             return cls._instance
 
     def start(self) -> None:
