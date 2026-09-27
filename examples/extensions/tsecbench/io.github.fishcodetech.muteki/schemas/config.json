@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "base_url_default": {
+      "type": "string",
+      "default": "https://tsecbench.zc.tencent.com",
+      "description": "连接未填 endpoint 时的默认 base URL"
+    },
+    "timeout_seconds": {
+      "type": "number",
+      "default": 30,
+      "minimum": 5
+    },
+    "auth_header": {
+      "type": "string",
+      "default": "BENCHMARK_TOKEN"
+    },
+    "max_instances": {
+      "type": "integer",
+      "default": 3,
+      "minimum": 1,
+      "maximum": 3
+    }
+  }
+}

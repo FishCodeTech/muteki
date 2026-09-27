@@ -27,43 +27,23 @@ if ! command -v uv >/dev/null 2>&1; then
     exit 1; }
 fi
 
-echo "==> [2/3] Sync deps (core + dev test tools; no optional pwn deps)"
-uv sync --extra dev --quiet
+echo "==> [2/3] Sync deps"
+uv sync --quiet
 
 # zbar shared library for pyzbar (QR decoding). macOS finds it via DYLD path;
 # Linux loads libzbar.so from the system linker cache (apt: libzbar0). The export
 # is a harmless no-op off macOS, and we only *warn* on Linux because nothing in the
-# default test path imports pyzbar — a QR challenge is the only thing that needs it.
+# default runtime path imports pyzbar — a QR challenge is the only thing that needs it.
 export DYLD_LIBRARY_PATH="${DYLD_LIBRARY_PATH:-}:/opt/homebrew/lib:/usr/local/lib"
 if [[ "$(uname -s)" == "Linux" ]] && ! ldconfig -p 2>/dev/null | grep -qi 'libzbar'; then
   echo "    (note) libzbar not found — QR-decode helpers need it. Install with:" >&2
   echo "           sudo apt-get install -y libzbar0    # Debian/Ubuntu" >&2
 fi
 
-PYTEST_ARGS=(-q)
-
-# The pwn SDK is optional and depends on pwntools / the muteki-pwn container.
-# Keep the default session bootstrap lean: pwn-specific tests only run when the
-# operator explicitly opts in after installing those tools.
-if [[ "${MUTEKI_RUN_PWN_TESTS:-0}" != "1" ]]; then
-  PYTEST_ARGS+=(--ignore=tests/test_kit_pwn.py)
-fi
-
-echo "==> [3/3] Fast test suite (unit + scripted-loop; pwn optional; live tests skip without API key)"
-# The web entrypoint auto-loads a repo-root .env (dotenv_boot.load_env). If the
-# operator has filled MUTEKI_WEB_PASSWORD there, the web app would start with auth
-# ON and the unauthenticated web-server tests would all 401. Exporting it EMPTY for
-# the test run wins over the file (load_dotenv override=False) and keeps auth off —
-# without an empty var, `env -u` would let .env supply the value again. Scoped to
-# this command only, so it never leaks into a later `./run.sh web`.
-MUTEKI_WEB_PASSWORD= uv run pytest "${PYTEST_ARGS[@]}"
+echo "==> [3/3] Environment ready"
 echo
-echo "OK — suite green. See README.md to get started; AGENTS.md for the dev map."
+echo "OK — setup complete. See README.md to get started; AGENTS.md for the dev map."
 
-# Optional pwn SDK verification:
-#   MUTEKI_RUN_PWN_TESTS=1 ./init.sh
-# Requires pwntools (and dynamic tests may require the muteki-pwn image).
-#
 # To run a real challenge (needs an API key), use the web deck:
 #   ./run.sh web   → create a run, flip the offline toggle for a clean black-box.
 # A solve is real only when the flag appears in actual worker output (the gate).

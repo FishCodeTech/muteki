@@ -1,0 +1,60 @@
+name: muteki-m6-rctf
+
+services:
+  db:
+    image: postgres:18.0@sha256:5d1822a7565aecbf17323dd54754ab8b832963e62b9512f465c2f155db9262dd
+    container_name: muteki-m6-rctf-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rctf
+      POSTGRES_PASSWORD: ${RCTF_DATABASE_PASSWORD}
+      POSTGRES_DB: rctf
+    volumes:
+      - ./data/postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rctf -d rctf"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [database]
+
+  cache:
+    image: redis:8.2.2@sha256:4521b581dbddea6e7d81f8fe95ede93f5648aaa66a9dacd581611bf6fe7527bd
+    container_name: muteki-m6-rctf-cache
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${RCTF_REDIS_PASSWORD}"]
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --pass '${RCTF_REDIS_PASSWORD}' ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [database]
+
+  web:
+    image: ghcr.io/otter-sec/rctf:v2.1.3@sha256:93093d1efc38919732260bf06ae79b4d85ea3e3c254353e58f899132183a4605
+    container_name: muteki-m6-rctf-web
+    restart: unless-stopped
+    stop_grace_period: 45s
+    read_only: true
+    tmpfs: [/tmp]
+    ports:
+      - "127.0.0.1:34102:80"
+    env_file: [.env]
+    volumes:
+      - ./rctf.d:/app/rctf.d:ro
+      - ./data/uploads:/app/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    networks: [public, database]
+
+networks:
+  public:
+    name: muteki-m6-rctf-public
+  database:
+    name: muteki-m6-rctf-database
+    internal: true

@@ -1,0 +1,8 @@
+{
+  "type": "object",
+  "properties": {
+    "greetings": {"type": "integer"}
+  },
+  "required": ["greetings"],
+  "additionalProperties": false
+}

@@ -1,0 +1,171 @@
+/* transitions.dev motion tokens — official scale, plus Muteki theme aliases. */
+:root {
+  --duration-stagger: 40ms;
+  --duration-micro: 80ms;
+  --duration-quick: 150ms;
+  --duration-fast: 250ms;
+  --duration-medium: 350ms;
+  --duration-slow: 400ms;
+  --duration-very-slow: 500ms;
+  --duration-normal: var(--duration-fast);
+  --control-feedback-dur: var(--duration-quick);
+  --control-press-dur: var(--duration-micro);
+
+  --ease-smooth-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out: ease-in-out;
+  --ease-out: ease-out;
+  --ease-linear: linear;
+  --ease-bounce: var(--ease-smooth-out);
+  --ease-bounce-strong: var(--ease-smooth-out);
+
+  --distance-micro: 4px;
+  --distance-small: 6px;
+  --distance-base: 8px;
+  --distance-medium: 12px;
+  --distance-large: 30px;
+
+  --scale-large: 0.96;
+  --scale-medium: 0.97;
+  --scale-small: 0.98;
+  --scale-tiny: 0.99;
+
+  /* Blur tokens exist for recipe compatibility; Muteki recipes keep blur at 0. */
+  --blur-small: 0px;
+  --blur-medium: 0px;
+  --blur-large: 0px;
+
+  --resize-dur: var(--duration-fast);
+  --resize-ease: var(--ease-smooth-out);
+
+  --badge-slide-dur: 260ms;
+  --badge-pop-dur: 200ms;
+  --badge-pop-close-dur: 180ms;
+  --badge-fade-dur: 400ms;
+  --badge-fade-close-dur: 180ms;
+  --badge-blur: 0px;
+  --badge-offset-x: -8.2px;
+  --badge-offset-y: 12.4px;
+  --badge-slide-ease: var(--ease-smooth-out);
+  --badge-pop-ease: var(--ease-bounce);
+  --badge-close-ease: cubic-bezier(0.4, 0, 0.2, 1);
+
+  --dropdown-open-dur: var(--duration-fast);
+  --dropdown-close-dur: var(--duration-quick);
+  --dropdown-pre-scale: var(--scale-medium);
+  --dropdown-closing-scale: var(--scale-tiny);
+  --dropdown-ease: var(--ease-smooth-out);
+
+  --modal-open-dur: var(--duration-fast);
+  --modal-close-dur: var(--duration-quick);
+  --modal-scale: var(--scale-large);
+  --modal-scale-close: var(--scale-large);
+  --modal-ease: var(--ease-smooth-out);
+
+  --panel-open-dur: var(--duration-slow);
+  --panel-close-dur: var(--duration-medium);
+  --panel-translate-y: var(--distance-medium);
+  --panel-translate-x: var(--distance-medium);
+  --panel-blur: 0px;
+  --panel-ease: var(--ease-smooth-out);
+
+  --page-slide-dur: var(--duration-fast);
+  --page-fade-dur: var(--duration-fast);
+  --page-slide-distance: var(--distance-base);
+  --page-blur: 0px;
+  --page-stagger: 0ms;
+  --page-exit-enabled: 1;
+  --page-slide-ease: var(--ease-smooth-out);
+  --page-fade-ease: var(--ease-smooth-out);
+
+  --shake-distance: 6px;
+  --shake-overshoot: 4px;
+  --shake-dur-a: 80ms;
+  --shake-dur-b: 60ms;
+  --shake-ease: var(--ease-smooth-out);
+
+  --pulse-dur: 1000ms;
+  --pulse-count: 1;
+  --pulse-min: 0.5;
+  --reveal-dur: var(--duration-slow);
+  --reveal-blur: 0px;
+  --reveal-ease: var(--ease-in-out);
+
+  --shimmer-dur: 2000ms;
+  --shimmer-base: var(--muted, #7c7c7c);
+  --shimmer-highlight: var(--bright, #f2f2f2);
+  --shimmer-band: 400%;
+  --shimmer-ease: var(--ease-linear);
+
+  --tabs-dur: var(--duration-fast);
+  --tabs-ease: var(--ease-smooth-out);
+  --tabs-text-muted: var(--muted, rgba(15, 15, 15, 0.8));
+  --tabs-text-active: var(--text, #0f0f0f);
+  --tabs-bar-bg: var(--panel2, #f1f1f1);
+  --tabs-pill-bg: var(--panel, #ffffff);
+
+  --tt-in-dur: var(--duration-quick);
+  --tt-out-dur: 50ms;
+  --tt-scale: var(--scale-small);
+  --tt-delay: var(--duration-micro);
+  --tt-in-ease: var(--ease-out);
+  --tt-out-ease: var(--ease-out);
+
+  --stagger-dur: var(--duration-very-slow);
+  --stagger-distance: var(--distance-medium);
+  --stagger-stagger: var(--duration-stagger);
+  --stagger-blur: 0px;
+  --stagger-ease: var(--ease-smooth-out);
+
+  --acc-expand: var(--duration-fast);
+  --acc-collapse: var(--duration-quick);
+  --acc-chevron: var(--duration-fast);
+  --acc-ease: var(--ease-smooth-out);
+
+  --toast-open: var(--duration-slow);
+  --toast-close: var(--duration-medium);
+  --toast-distance: var(--distance-medium);
+  --toast-blur: 0px;
+  --toast-scale: 0.97;
+  --toast-ease: var(--ease-smooth-out);
+
+  --think-hold: 2000ms;
+  --think-swap: 150ms;
+  --think-gap: 50ms;
+  --think-distance: 8px;
+  --think-blur: 0px;
+  --think-shimmer: 2000ms;
+  --think-base: var(--muted, #7c7c7c);
+  --think-highlight: var(--bright, #f2f2f2);
+  --think-ease: var(--ease-in-out);
+
+  --reason-hold: 840ms;
+  --reason-step: 500ms;
+  --reason-lines: 2;
+  --reason-fade: 28px;
+  --reason-ease: var(--ease-smooth-out);
+
+  --stream-gap: 60ms;
+  --stream-fade: 220ms;
+  --stream-blur: 0px;
+  --stream-ease: var(--ease-smooth-out);
+
+  --stack-open: 280ms;
+  --stack-close: 180ms;
+  --stack-rise: 12px;
+  --stack-blur: 0px;
+  --stack-scale: 0.97;
+  --stack-peek: 8px;
+  --stack-spread-gap: 8px;
+  --stack-depth-scale: 0.02;
+  --stack-depth-fade: 0.15;
+  --stack-ease: var(--ease-smooth-out);
+
+  --flag-pulse-dur: 360ms;
+  --flag-pulse-scale: 1.018;
+  --flag-pulse-ease: var(--ease-smooth-out);
+
+  --icon-swap-dur: var(--duration-fast);
+  --icon-swap-blur: var(--blur-small);
+  --icon-swap-start-scale: 0.25;
+  --icon-swap-ease: var(--ease-in-out);
+}

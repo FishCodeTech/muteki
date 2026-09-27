@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -33,7 +34,7 @@ from muteki.models.solve_graph import Challenge
 from muteki.sandbox.manager import SandboxManager
 from muteki.solver.result import ArtifactStore
 from muteki.solver.types import SolverConfig, SolveOutcome
-from muteki.solver.credential_accounts import runtime_env_for_engine
+from muteki.solver.credential_accounts import runtime_env_for_engine, engine_account_id
 from muteki.solver.worker_profiles import (
     base_engine_for_profile,
     coerce_nonneg_int,
@@ -54,6 +55,7 @@ from muteki.swarm.swarm_support import (
     WorkerBudgetExhausted,
     WorkerSpawnRejected,
     RequiredContextUnavailable,
+    ContextCapabilityUnavailable,
     ControlShutdownIncomplete,
     SwarmOutcome,
     _CONTAINER_BLACKBOARD_SKILL,
@@ -68,7 +70,7 @@ from muteki.swarm.swarm_support import (
 )
 
 
-class _RaceHealthMixin:
+class _RaceRunMixin:
     async def run(self) -> SwarmOutcome:
         # Single authoritative teardown for the run's worker container, covering EVERY
         # exit path of every solve mode: the coordinator's race-scout fast-path return,
@@ -94,7 +96,10 @@ class _RaceHealthMixin:
                 try:
                     from muteki.solver.container_exec import teardown_container
                     removed = await asyncio.to_thread(
-                        teardown_container, self.run_id, remove=True)
+                        teardown_container, self.run_id, remove=True,
+                        container_scope=self.worker_container_scope,
+                        bootstrap_root=(str(self.container_bootstrap_root)
+                                        if self.container_bootstrap_root is not None else None))
                 except Exception:
                     removed = False
                 if removed is not True:
@@ -106,7 +111,15 @@ class _RaceHealthMixin:
                     raise ControlShutdownIncomplete(
                         "container teardown could not be proven")
             if not self._shutdown_owners_incomplete():
+                winner_state_dir = str(
+                    getattr(self, "_winner_agent_state_dir", "") or "")
                 for state_dir in list(getattr(self, "_agent_state_dirs", set())):
+                    if winner_state_dir:
+                        try:
+                            if state_dir.resolve() == Path(winner_state_dir).resolve():
+                                continue
+                        except OSError:
+                            pass
                     shutil.rmtree(state_dir, ignore_errors=True)
                 getattr(self, "_agent_state_dirs", set()).clear()
 
@@ -131,7 +144,7 @@ class _RaceHealthMixin:
         return False
 
     async def _run_race(self) -> SwarmOutcome:
-        solvers = self._build_solvers()
+        solvers = self._build_solvers()[:self._ordinary_capacity_limit()]
         hitl_task: Optional[asyncio.Task] = None
         tasks: dict[asyncio.Task[SolveOutcome], Any] = {}
         per_solver: dict[str, SolveOutcome] = {}
@@ -267,7 +280,10 @@ class _RaceHealthMixin:
                 try:
                     from muteki.solver.container_exec import teardown_container
                     removed = await asyncio.to_thread(
-                        teardown_container, self.run_id, remove=True)
+                        teardown_container, self.run_id, remove=True,
+                        container_scope=self.worker_container_scope,
+                        bootstrap_root=(str(self.container_bootstrap_root)
+                                        if self.container_bootstrap_root is not None else None))
                 except Exception:
                     removed = False
                 if removed is not True:
@@ -424,7 +440,6 @@ class _RaceHealthMixin:
         #      sum(probes) to max(probe). Order/side-effects are unchanged: results
         #      are reassembled in roster order and degrade/recover fire exactly as
         #      before.
-        import time
         from concurrent.futures import ThreadPoolExecutor
 
         now = time.monotonic()
@@ -524,15 +539,56 @@ class _RaceHealthMixin:
             kwargs["owner_loop"] = owner_loop
         return await asyncio.to_thread(health_check, **kwargs)
 
+    def _context_scope_applies(
+        self, scope: Any, *, worker_id: str = "", engine: str = "",
+        intent_id: str = "", lane: str = "",
+    ) -> bool:
+        """THE scope-applicability predicate for typed context injection.
+
+        Shared by the scheduling preflight (``_context_requires_secure_prompt``),
+        the real assembly (``_typed_context_for_worker``) and the operator-
+        directive fold in ``_make_cli_worker`` so the preflight can never drift
+        from what a worker prompt actually receives.  An empty worker_id (engine
+        selection runs before the label exists) simply disables worker scopes.
+        """
+        text = str(scope or "global")
+        value = text.split(":", 1)[1] if ":" in text else text
+        return bool(
+            text in ("global", self.challenge.id,
+                     f"challenge:{self.challenge.id}")
+            or (text.startswith("run:") and value == self.run_id)
+            or (worker_id and text.startswith(("solver:", "worker:"))
+                and value == worker_id)
+            or (worker_id and text == worker_id)
+            or (text.startswith("engine:") and value == engine)
+            or (text.startswith("intent:") and value == intent_id)
+            or (intent_id and text == intent_id)
+            or (text.startswith("lane:") and value == lane)
+            or (lane and text == lane)
+        )
+
     def _context_requires_secure_prompt(
         self, *, engine: str = "", worker_id: str = "",
         intent_id: str = "", lane: str = "",
     ) -> bool:
-        """Read-only scheduling preflight for applicable secret context.
+        """Read-only scheduling preflight for injectable secret context.
 
         This deliberately runs before profile/account/budget/intent acquisition.
         It never resolves a secret and never reserves one-shot capacity; it only
         recognizes that the eventual prompt needs the secure stdin transport.
+
+        The requirement mirrors the real assembly in ``_typed_context_for_worker``
+        for THIS engine/intent/lane: same shared scope predicate, and the same
+        per-resource skip conditions — a row without a context_id can never be
+        reserved, empty content is dropped, and a ``secret://`` ref without a
+        resolver is released unmaterialised, so none of those can reach the
+        prompt and none may force the secure transport (the over-rejection that
+        looped spawn/reject).  Legacy standing guidance and operator directives
+        never carry ``secret://`` into a prompt (``_make_cli_worker`` filters
+        them before resolution), so typed context resources are the only secret
+        surface the preflight must predict.  Fail-closed direction preserved: a
+        resource that WILL be injected still forces the transport, and a
+        provider read failure keeps the I-control-* fallback.
         """
         provider = getattr(self, "_context_provider", None)
         if not callable(provider):
@@ -545,32 +601,31 @@ class _RaceHealthMixin:
             # a transient provider read failure, matching its existing contract.
             return str(intent_id or "").startswith("I-control-")
         for resource in resources:
-            scope = str(getattr(resource, "scope", "global") or "global")
-            value = scope.split(":", 1)[1] if ":" in scope else scope
-            applies = bool(
-                scope in ("global", self.challenge.id,
-                          f"challenge:{self.challenge.id}")
-                or (scope.startswith("run:") and value == self.run_id)
-                or (worker_id and scope.startswith(("solver:", "worker:"))
-                    and value == worker_id)
-                or (worker_id and scope == worker_id)
-                or (scope.startswith("engine:") and value == engine)
-                or (scope.startswith("intent:") and value == intent_id)
-                or (intent_id and scope == intent_id)
-                or (scope.startswith("lane:") and value == lane)
-                or (lane and scope == lane)
-            )
-            if not applies:
+            if not self._context_scope_applies(
+                    getattr(resource, "scope", "global") or "global",
+                    worker_id=worker_id, engine=engine,
+                    intent_id=intent_id, lane=lane):
                 continue
+            if not str(getattr(resource, "context_id", "") or ""):
+                continue  # unreservable → assembly skips it
             content = str(getattr(resource, "content", "") or "")
+            if not content:
+                continue  # empty content → assembly drops it post-reservation
             kind = getattr(resource, "kind", "")
             kind_value = str(getattr(kind, "value", kind) or "")
             taint = getattr(resource, "taint", "")
             taint_value = str(getattr(taint, "value", taint) or "")
-            if (content.startswith("secret://")
+            if not (content.startswith("secret://")
                     or kind_value == "secret_ref"
                     or taint_value == "secret_reference"):
-                return True
+                continue
+            if (content.startswith("secret://")
+                    and not callable(getattr(self, "_secret_resolver", None))):
+                # Without a resolver the secret value can never be materialised
+                # into this worker's prompt (assembly releases + skips the row),
+                # so there is nothing for the secure transport to protect.
+                continue
+            return True
         return False
 
     def _secure_prompt_candidate_ready(self, candidate: str, *, role: str) -> bool:
@@ -600,15 +655,31 @@ class _RaceHealthMixin:
         lane: str = "",
         intent: "Optional[dict]" = None,
         avoid_engines: "Optional[list[str]]" = None,
+        exclude_engines: "Optional[list[str]]" = None,
     ) -> str:
         """Heterogeneity-aware engine selection: prefer an engine NOT currently
         running, so each spawned worker covers a different blind spot. Falls back to
         least-loaded when all are running.
 
-        When cognitive_cluster_planner is on, also bias by historical
+        With the experimental engine_pick_bias hook registered (ExperimentalSwarm
+        + the cognitive cluster planner flag), also bias by historical
         fact/barren productivity so complementary engines get complementary work.
         """
         available = self._healthy_role_candidates(healthy, role=role)
+        if not available:
+            if self._role_capability_gap(role):
+                # Standing configuration gap (no profile explicitly serves
+                # review/verifier and the fallback policy is off) — NOT
+                # transient scarcity. The dispatch stage blocks the intent on
+                # this signal instead of re-offering it into a spawn/reject
+                # loop. Generic scarcity below keeps the plain RuntimeError →
+                # requeue behavior.
+                raise ContextCapabilityUnavailable(
+                    f"no eligible worker profile for role={role}: no profile "
+                    "explicitly declares the role and the review/verifier "
+                    "fallback policy is disabled",
+                    missing=[f"{role}_capable_profile"])
+            raise RuntimeError(f"no available worker profile for role={role}")
         secure_available: list[str] = []
         for candidate in available:
             profile = (
@@ -625,8 +696,28 @@ class _RaceHealthMixin:
                 secure_available.append(candidate)
         available = secure_available
         if not available:
-            raise RuntimeError(
-                f"no available worker profile for role={role} and context capability")
+            raise ContextCapabilityUnavailable(
+                f"no available worker profile for role={role} and context capability",
+                missing=["secure_prompt_transport"])
+        excluded = {
+            str(item) for item in (exclude_engines or ()) if str(item)
+        }
+        if excluded:
+            def _excluded(candidate: str) -> bool:
+                profile = getattr(
+                    self, "_profiles_by_name", {}).get(candidate)
+                base = base_engine_for_profile(profile or candidate)
+                return candidate in excluded or base in excluded
+
+            available = [item for item in available if not _excluded(item)]
+            if not available:
+                raise RuntimeError(
+                    f"no available worker profile for role={role} after "
+                    "run-level exclusions")
+        avoided = {str(item) for item in (avoid_engines or ()) if str(item)}
+        untried = [candidate for candidate in available if candidate not in avoided]
+        if untried:
+            available = untried
         # Framework capability profiler (f01+): default Swarm has no hook → inert.
         effect_pick = getattr(self, "_effect_capability_pick_engine", None)
         if callable(effect_pick) and role in {"explore", "bootstrap", "review"}:
@@ -644,30 +735,34 @@ class _RaceHealthMixin:
                     return chosen
             except Exception:
                 pass
-        if getattr(self, "cognitive_cluster_planner", False) and role in {
-            "explore", "bootstrap", "review"
-        }:
-            try:
-                from muteki.swarm.cognitive_cluster_planner import (
-                    ClusterEvidence,
-                    select_engine,
-                )
-
-                evidence = ClusterEvidence.from_graph(self.shared_graph)
-                return select_engine(
-                    available=available,
-                    running=running_engines,
-                    evidence=evidence,
-                    intent=intent or {},
-                    avoid_engines=list(avoid_engines or ()),
-                )
-            except Exception:
-                pass
-        for e in available:
-            if self._running_count_for_candidate(e, running_engines) == 0:
-                return e
-        # all healthy engines already running → least-loaded
-        return min(available, key=lambda e: self._running_count_for_candidate(e, running_engines))
+        # Stage-4b: cognitive-cluster engine bias lives behind the experimental
+        # hook registry; None (or no hook) falls through to the default pick.
+        biased = self._experiment_call(
+            "engine_pick_bias",
+            available,
+            running_engines,
+            role=role,
+            intent=intent,
+            avoid_engines=avoid_engines,
+            default=None,
+        )
+        if biased is not None:
+            return biased
+        # A configured profile is the scheduling unit.  Two profiles may share
+        # one transport (for example pi-main and pi-ollama) while carrying
+        # different accounts/models/endpoints.  Ranking only by base-engine load
+        # makes the earlier profile win every tie until its capacity is full, so
+        # a lower-priority profile can be starved even though it has never run.
+        # Prefer an unused exact profile first; use transport load only as the
+        # secondary diversity signal.  Once every profile is represented, exact
+        # profile load keeps additional seats balanced.
+        return min(
+            available,
+            key=lambda e: (
+                self._running_profile_count_for_candidate(e, running_engines),
+                self._running_count_for_candidate(e, running_engines),
+            ),
+        )
 
     @staticmethod
     def _clean_worker_profiles(value: "Optional[list[dict]]") -> list[dict]:
@@ -712,7 +807,77 @@ class _RaceHealthMixin:
                 self._active_verifier_profile_counts.get(pid, 0)
                 < self._verifier_profile_limit(profile)
             )
+        if self._auto_dispatch_enabled():
+            return True
         return self._active_profile_counts.get(pid, 0) < int(profile.get("max_running") or 1)
+
+    def _worker_session_supervisor(self):
+        """EXEC-01：本 Run 的 Worker Session Supervisor（懒创建，每 Run 一个）。
+
+        绑定 ``run_id`` 与 ``execution_generation``：resolve 继续 Run 时新
+        Swarm 携带新 generation 构造新 supervisor，旧 generation 的事件经
+        fencing 拒绝写入新投影（任务书 7.4）。做题 Worker 固定使用对应
+        引擎的无交互 CLI；Conversation 的结构化 Runtime 不参与调度。
+        """
+        sup = self._ws_supervisor
+        if sup is None:
+            from muteki.swarm.worker_session import WorkerSessionSupervisor
+
+            sup = WorkerSessionSupervisor(
+                run_id=self.run_id,
+                execution_generation=self._execution_generation,
+                shared_graph=self.shared_graph,
+            )
+            self._ws_supervisor = sup
+        return sup
+
+    def _profile_role_eligible(self, profile: dict, role: "Optional[str]") -> bool:
+        """``_profile_allows_role`` plus the review/verifier fallback policy gate.
+
+        A profile that carries review/verifier only through the implicit
+        ordinary-role extension (``implicit_roles`` in normalize_worker_profile)
+        serves that role only when the operator opted into the fallback
+        (review_policy.allow_review_fallback /
+        verifier_policy.allow_verifier_fallback, both default False), so the
+        default path never silently extends an ordinary profile into
+        review/verifier duty.
+        """
+        if not self._profile_allows_role(profile, role):
+            return False
+        if role not in ("review", "verifier"):
+            return True
+        if role not in (profile.get("implicit_roles") or ()):
+            return True  # explicitly declared capability
+        policy = (getattr(self, "review_policy", None) if role == "review"
+                  else getattr(self, "verifier_policy", None))
+        flag = ("allow_review_fallback" if role == "review"
+                else "allow_verifier_fallback")
+        return bool(isinstance(policy, dict) and policy.get(flag, False))
+
+    def _role_capability_gap(self, role: str) -> bool:
+        """True when NO configured profile explicitly serves `role`.
+
+        An empty review/verifier roster is then a standing capability gap
+        (block the intent, log once) rather than transient health/capacity
+        scarcity (requeue).  False when the fallback flag keeps implicit
+        profiles eligible, or when no worker profiles are configured at all
+        (the legacy all-engines roster serves every role)."""
+        if role not in ("review", "verifier"):
+            return False
+        profiles = list(getattr(self, "worker_profiles", []) or [])
+        if not profiles:
+            return False
+        policy = (getattr(self, "review_policy", None) if role == "review"
+                  else getattr(self, "verifier_policy", None))
+        flag = ("allow_review_fallback" if role == "review"
+                else "allow_verifier_fallback")
+        if isinstance(policy, dict) and bool(policy.get(flag, False)):
+            return False
+        return not any(
+            role in (p.get("roles") or ())
+            and role not in (p.get("implicit_roles") or ())
+            for p in profiles
+        )
 
     def _profile_for_engine(
         self,
@@ -731,7 +896,7 @@ class _RaceHealthMixin:
         for off in range(len(profiles)):
             idx = (start + off) % len(profiles)
             p = profiles[idx]
-            if not self._profile_allows_role(p, role):
+            if not self._profile_role_eligible(p, role):
                 continue
             if not self._profile_available(p, role=role):
                 continue
@@ -795,6 +960,15 @@ class _RaceHealthMixin:
             if running_base == base:
                 n += 1
         return n
+
+    def _running_profile_count_for_candidate(
+        self, candidate: str, running_engines: list[str],
+    ) -> int:
+        """Count the exact scheduling profile without collapsing its transport."""
+        profiles = getattr(self, "_profiles_by_name", {})
+        if candidate in profiles:
+            return sum(1 for running in running_engines if running == candidate)
+        return sum(1 for running in running_engines if running == candidate)
 
     def _claim_worker_account(
         self, solver_id: str, engine: str, profile: "Optional[dict]",
@@ -879,7 +1053,6 @@ class _RaceHealthMixin:
         )
         provider = getattr(self, "_context_provider", None)
         reserver = getattr(self, "_context_reserver", None)
-        releaser = getattr(self, "_context_releaser", None)
         if not callable(provider) or not callable(reserver):
             if required_scope:
                 raise RequiredContextUnavailable(
@@ -923,22 +1096,13 @@ class _RaceHealthMixin:
                 required_scope
                 and str(getattr(resource, "scope", "") or "") == required_scope)
             try:
-                scope = str(getattr(resource, "scope", "global") or "global")
-                value = scope.split(":", 1)[1] if ":" in scope else scope
-                applies = bool(
-                    scope in ("global", self.challenge.id,
-                              f"challenge:{self.challenge.id}")
-                    or (scope.startswith("run:") and value == self.run_id)
-                    or (scope.startswith(("solver:", "worker:"))
-                        and value == worker_id)
-                    or scope == worker_id
-                    or (scope.startswith("engine:") and value == engine)
-                    or (scope.startswith("intent:") and value == intent_id)
-                    or (intent_id and scope == intent_id)
-                    or (scope.startswith("lane:") and value == lane)
-                    or (lane and scope == lane)
-                )
-                if not applies:
+                # Shared predicate with the scheduling preflight — a scope
+                # change here must change `_context_requires_secure_prompt`
+                # the same way, so both call `_context_scope_applies`.
+                if not self._context_scope_applies(
+                        getattr(resource, "scope", "global") or "global",
+                        worker_id=worker_id, engine=engine,
+                        intent_id=intent_id, lane=lane):
                     continue
                 context_id = str(getattr(resource, "context_id", "") or "")
                 if not context_id:
@@ -1102,26 +1266,6 @@ class _RaceHealthMixin:
         pressure). Close the un-awaited coroutine and retire every already-acquired
         context/account/intent/lane before propagating the scheduling failure.
         """
-        protocol2 = getattr(self, "protocol2_session", None)
-        if protocol2 is not None:
-            try:
-                return protocol2.schedule_worker(
-                    worker, lambda: self._run_control_worker(worker), name=name)
-            except BaseException as exc:
-                retired = await self._retire_worker_account(
-                    worker,
-                    intent_id=str(
-                        intent_id
-                        or getattr(worker, "intent_id_assigned", "")
-                        or getattr(worker, "_intent_id", "") or ""),
-                    reason="Protocol 2 worker admission/scheduling failed",
-                    lane_key=str(lane_key or ""),
-                )
-                if not retired:
-                    raise ControlShutdownIncomplete(
-                        "Protocol 2 scheduling failed with retained acquisition owner"
-                    ) from exc
-                raise
         coroutine = self._run_control_worker(worker)
         try:
             return asyncio.create_task(coroutine, name=name)
@@ -1233,7 +1377,7 @@ class _RaceHealthMixin:
         )
         prestart = not process_started and not crossed_boundary
         # Stage 1: release pre-delivery context claims durably.  Do not clear the
-        # solver's immutable reservation list or redaction ownership until every
+        # solver's immutable reservation list until every
         # idempotent release confirms its postcondition.
         if not bool(getattr(solver, "_muteki_contexts_released", False)):
             pending = list(getattr(
@@ -1317,7 +1461,16 @@ class _RaceHealthMixin:
                         or status == "done"
                         or (status == "claimed" and owner and owner != sid)
                     )
-                return status == "done" or dispatch in {"closed", "retired"}
+                # A lease-expiry takeover is itself the durable owner fence: once a
+                # different worker owns the claim, this retired runtime has no
+                # authority to terminalize that row.  Requiring only done/closed
+                # here made the old owner retry forever even though the graph had
+                # already transferred ownership correctly.
+                return (
+                    status == "done"
+                    or dispatch in {"closed", "retired"}
+                    or (status == "claimed" and owner and owner != sid)
+                )
 
             before: Optional[dict[str, str]] = None
             if callable(state_reader):
@@ -1382,6 +1535,42 @@ class _RaceHealthMixin:
             or getattr(self, "_shutdown_incomplete_causes", set())
             or getattr(self, "_worker_runtime_incomplete", False)
             or getattr(self, "_context_cleanup_incomplete", False)
+        )
+
+    def _worker_retirement_is_supervised(self, solver: Any) -> bool:
+        """Whether a retained runtime still has a live autonomous reaper.
+
+        This is the boundary between an ordinary bounded-settle miss and a lost
+        runtime owner.  Callers may keep unrelated work running only in the former
+        case; a missing/done reaper remains a fail-closed control failure.
+        """
+        sid = str(getattr(solver, "solver_id", "") or id(solver))
+        owners = getattr(self, "_worker_runtime_owners", {})
+        reapers = getattr(self, "_worker_runtime_reapers", {})
+        task = reapers.get(sid) if isinstance(reapers, dict) else None
+        return bool(
+            isinstance(owners, dict)
+            and sid in owners
+            and task is not None
+            and not task.done()
+        )
+
+    def _only_supervised_worker_retirements_pending(self) -> bool:
+        """True when every incomplete shutdown edge is a live runtime reaper."""
+        causes = set(getattr(self, "_shutdown_incomplete_causes", set()) or set())
+        if causes - {"worker_runtime"}:
+            return False
+        if getattr(self, "_context_cleanup_incomplete", False):
+            return False
+        if any(not task.done() for task in getattr(
+                self, "_control_orphan_tasks", set())):
+            return False
+        owners = getattr(self, "_worker_runtime_owners", {})
+        if not isinstance(owners, dict) or not owners:
+            return False
+        return all(
+            self._worker_retirement_is_supervised(owner[0])
+            for owner in owners.values()
         )
 
     def _mark_shutdown_incomplete(self, cause: str) -> None:
@@ -1491,6 +1680,17 @@ class _RaceHealthMixin:
         """
         if solver is None:
             return True
+        sid = str(getattr(solver, "solver_id", "") or id(solver))
+
+        def _settled() -> bool:
+            owners = getattr(self, "_worker_runtime_owners", {})
+            return bool(
+                getattr(solver, "_muteki_account_retired", False)
+                or (isinstance(owners, dict)
+                    and sid not in owners
+                    and self._worker_runtime_exit_confirmed(solver))
+            )
+
         if self._worker_runtime_exit_confirmed(solver):
             if self._finish_worker_retirement(
                     solver, intent_id=intent_id, reason=reason,
@@ -1518,16 +1718,16 @@ class _RaceHealthMixin:
                 asyncio.shield(existing), timeout=max(0.01, timeout))
         except asyncio.TimeoutError:
             self._mark_shutdown_incomplete("worker_runtime")
-            return False
+            return _settled()
         except asyncio.CancelledError:
             self._mark_shutdown_incomplete("worker_runtime")
-            return False
+            return _settled()
         except Exception:
             self._mark_shutdown_incomplete("worker_runtime")
-            return False
+            return _settled()
         owners = getattr(self, "_worker_runtime_owners", {})
         self._worker_runtime_incomplete = bool(owners)
-        return bool(getattr(solver, "_muteki_account_retired", False))
+        return _settled()
 
     def _gen_suffix(self) -> str:
         """Worker-id / cwd suffix for continued runs: ``-g2`` on the second
@@ -1566,11 +1766,11 @@ class _RaceHealthMixin:
         """Per-worker runtime env: Credential Account plus isolated HOME."""
         agent_state_dir: Path | None = None
         agent_state_container_path: str | None = None
-        if engine in {"pi", "omp", "opencode", "dsh"}:
+        if engine in {"pi", "omp", "opencode"}:
             if self.workspace_root is not None:
                 state_root = self.workspace_root / ".muteki-agent-state"
                 agent_state_dir = state_root / label
-                self._agent_state_dirs.add(state_root)
+                self._agent_state_dirs.add(agent_state_dir)
             else:
                 agent_state_dir = Path(tempfile.mkdtemp(
                     prefix=f"muteki-{engine}-{label}-"))
@@ -1588,6 +1788,8 @@ class _RaceHealthMixin:
             agent_state_container_path=agent_state_container_path,
             model=str((profile or {}).get("model") or ""),
         ).env
+        if getattr(self, "_ctf_tmux_socket", None) is not None:
+            env["MUTEKI_TMUX_SOCKET"] = str(self._ctf_tmux_socket)
         if agent_state_dir is not None and container is not None:
             from muteki.solver.container_exec import _chown_tree_to_worker
             _chown_tree_to_worker(str(agent_state_dir))
@@ -1769,9 +1971,22 @@ class _RaceHealthMixin:
             pass
 
     def _runtime_metadata_for(self, outcome: "Optional[SolveOutcome]" = None) -> dict[str, Any]:
+        if self.worker_backend == "container":
+            requested = self.worker_network
+            effective = (
+                str(getattr(self, "effective_worker_network", "") or "")
+                or requested
+            )
+        else:
+            requested = ""
+            effective = ""
         return {
             "backend": "local" if self._runtime_degraded else self.worker_backend,
-            "network": self.worker_network if self.worker_backend == "container" else "",
+            "network": effective,
+            "network_requested": requested,
+            "effective_network": effective,
+            "container_scope": self.worker_container_scope,
+            "worker_privilege": getattr(self, "worker_privilege", "default"),
             "runtime_degraded": list(self._runtime_degraded),
         }
 
@@ -1795,14 +2010,44 @@ class _RaceHealthMixin:
             return None
         try:
             from muteki.solver.container_exec import ensure_container
-            # Mount the whole run workspace, not only workspace/workers: the shared
-            # graph lives in workspace/graph and the blackboard skill needs it.
+            # Mount the whole Run workspace, not only workspace/workers, so every
+            # worker sees the same inputs, shared artifacts, homes and final output.
+            account_ids = sorted({
+                str(p.get("credential_account") or "").strip()
+                for p in (self.worker_profiles or [])
+                if p.get("enabled", True) and str(p.get("credential_account") or "").strip()
+            })
+            if not self.worker_profiles:
+                account_ids = sorted({engine_account_id(e) for e in self.engines})
+            privilege = getattr(self, "worker_privilege", "default") or "default"
             self._container_handle = ensure_container(
                 self.run_id,
                 str(self.workspace_root or self.worker_root),
                 network=self.worker_network,
+                memory=getattr(self, "worker_memory", None),
+                cpus=getattr(self, "worker_cpus", None),
+                pids_limit=getattr(self, "worker_pids_limit", None),
+                output_limit=getattr(self, "worker_output_limit", None),
+                disk_limit=getattr(self, "worker_disk_limit", None),
                 account_root=(str(self.credential_accounts_root)
                               if self.credential_accounts_root is not None else None),
+                account_ids=account_ids,
+                container_scope=self.worker_container_scope,
+                shared_mount_root=(
+                    str(self.shared_mount_root)
+                    if self.shared_mount_root is not None else None
+                ),
+                account_projection_root=(
+                    str(self.account_projection_root)
+                    if self.account_projection_root is not None else None
+                ),
+                bootstrap_root=(
+                    str(self.container_bootstrap_root)
+                    if self.container_bootstrap_root is not None else None
+                ),
+                vpn_config=(str(self.worker_vpn_config)
+                            if self.worker_vpn_config is not None else None),
+                worker_privilege=privilege,
             )
         except Exception as exc:  # noqa: BLE001
             self._container_unavailable = True
@@ -1819,18 +2064,58 @@ class _RaceHealthMixin:
         return float(getattr(ledger, "usd", 0.0) or 0.0)
 
     def _budget_exhausted(self) -> str | None:
-        if self.max_total_workers is not None and self._spawned_total >= self.max_total_workers:
-            return "worker_budget_exhausted"
         if self.cost_budget_usd is not None and self._current_cost_usd() >= self.cost_budget_usd:
             return "cost_budget_exhausted"
+        if self.max_total_workers is not None and self._spawned_total >= self.max_total_workers:
+            return "worker_budget_exhausted"
         return None
 
     def _reserve_worker_spawn(self) -> None:
         kind = self._budget_exhausted()
         if kind:
-            self._budget_exhausted_kind = kind
+            if kind == "worker_budget_exhausted":
+                self._worker_admission_closed = True
+            else:
+                self._budget_exhausted_kind = kind
             raise WorkerBudgetExhausted(kind)
         self._spawned_total += 1
+
+    def _apply_step_contract(self, worker: Any, intent: Optional[dict] = None) -> None:
+        row = intent or {}
+        facts: list[int] = []
+        for raw in row.get("from_facts") or []:
+            try:
+                seq = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if seq > 0:
+                facts.append(seq)
+        worker.from_facts = facts
+        if getattr(self.challenge, "mode", "ctf") == "ctf":
+            worker.expected_observable = str(row.get("expected_observable") or "")
+            worker.stop_condition = str(row.get("stop_condition") or "")
+            worker.coverage_key = str(row.get("coverage_key") or "")
+            worker.required_pocs = list(row.get("required_pocs") or [])
+            worker.route_hash = ""
+            worker.branch_id = ""
+            worker.risk_class = ""
+            worker.resource_key = ""
+            worker.requires_capabilities = []
+            worker.value_claim = {}
+            return
+        worker.expected_observable = str(row.get("expected_observable") or "")
+        worker.stop_condition = str(row.get("stop_condition") or "")
+        worker.coverage_key = str(row.get("coverage_key") or "")
+        worker.route_hash = str(row.get("route_hash") or "")[:180]
+        worker.branch_id = str(row.get("branch_id") or "")[:180]
+        worker.risk_class = str(row.get("risk_class") or "")[:80]
+        worker.resource_key = str(row.get("resource_key") or "")[:240]
+        worker.requires_capabilities = [
+            str(item).strip().casefold()
+            for item in (row.get("requires_capabilities") or [])
+            if str(item).strip()
+        ][:32]
+        worker.value_claim = dict(row.get("value_claim") or {})
 
     def _make_cli_worker(self, engine: str, *, mode: str, intent_goal: str = "",
                          intent_id: str = "", timeout_override: "Optional[int]" = None,
@@ -1845,7 +2130,7 @@ class _RaceHealthMixin:
         # coordinator loop, since spawn sites only catch WorkerBudgetExhausted).
         role = profile_role or (
             "review" if mode == "review" else
-            "verifier" if mode == "verifier" else
+            "verifier" if mode in {"fact_verifier", "report_reproducer"} else
             "explore" if mode == "explore" else "bootstrap")
         profile = self._profile_for_engine(engine, role=role)
         if self.worker_profiles and profile is None:
@@ -1912,26 +2197,47 @@ class _RaceHealthMixin:
         label += self._gen_suffix()
 
         # explore = narrow single-intent probe; bootstrap = whole-challenge rush.
-        # Both get the SHORT per-turn timeout (explore_timeout, default 720s) so a
-        # stuck worker frees its max_workers slot quickly — this is the only backstop
-        # now that the stall-kill is gone. A timed-out worker still gets one conclude
-        # turn (min(timeout, 600s)) to summarize before dying.
+        # Both get the configured execution timeout so a stuck worker eventually
+        # frees its max_workers slot. Their marker-only conclude pass has its own
+        # bounded timeout; Race overrides both below within one total budget.
         kw = {"timeout": self.explore_timeout} if mode in ("explore", "bootstrap") else {}
-        if mode == "verifier":
+        if mode in {"fact_verifier", "report_reproducer"}:
             kw["timeout"] = int(self.verifier_policy.get("timeout") or 240)
         if mode == "review":
-            kw["timeout"] = int(self.review_policy.get("timeout") or 420)
-        # race-scout: a bootstrap worker gets the SHORT race_timeout (breadth recon,
-        # not deep dig) when the caller overrides it. Explicit override wins.
+            configured_review_timeout = int(
+                self.review_policy.get("timeout") or 420)
+            kw["timeout"] = (
+                min(60, configured_review_timeout)
+                if getattr(self.challenge, "mode", "ctf") == "ctf"
+                else configured_review_timeout
+            )
+        # Race-scout owns one total timeout. Reserve a bounded tail inside that
+        # budget for the marker-only conclude pass; otherwise an execute process
+        # that consumes the full race_timeout is cancelled by the coordinator
+        # before it can publish a structured checkpoint.
         if timeout_override is not None:
-            kw["timeout"] = int(timeout_override)
+            total_timeout = max(1, int(timeout_override))
+            if profile_role == "race" and mode == "bootstrap":
+                conclude_timeout = max(15, min(75, total_timeout // 3))
+                execute_timeout = max(
+                    1, total_timeout - conclude_timeout - 5)
+                kw["timeout"] = execute_timeout
+                kw["conclude_timeout"] = conclude_timeout
+            else:
+                kw["timeout"] = total_timeout
 
         # M-3 (single-shot migration): fold any pending intent-level operator
         # guidance into THIS spawn (workers can't be steered live anymore).
         #  - one-shot hint/redirect text → injected with standing (then consumed).
         #  - a redirect url → handed via hitl_cmd so the worker's _target_override
         #    points at the new target (CliSolver reads hitl_cmd["url"]).
-        pending_next_guidance = list(self._next_worker_guidance)
+        # One-shot global hints steer the next ordinary solve attempt.  Review
+        # and Verifier have their own scoped assignments; letting either consume
+        # this queue drops solve guidance before an Execute worker can receive it.
+        solve_guidance_role = mode in ("bootstrap", "explore")
+        pending_next_guidance = (
+            list(self._next_worker_guidance) if solve_guidance_role else []
+        )
         raw_guidance = list(self._standing_guidance) + pending_next_guidance
         # Framework worker shell injection (f01 declarations etc.). Default: no-op.
         fw_guide = getattr(self, "framework_worker_guidance_for_intent", None)
@@ -1954,20 +2260,10 @@ class _RaceHealthMixin:
         consumed_context_reservations: list[tuple[str, str]] = []
 
         def _scope_applies(scope: str) -> bool:
-            scoped_value = scope.split(":", 1)[1] if ":" in scope else scope
-            return bool(
-                scope in ("global", self.challenge.id,
-                          f"challenge:{self.challenge.id}")
-                or (scope.startswith("run:") and scoped_value == self.run_id)
-                or (scope.startswith(("solver:", "worker:"))
-                    and scoped_value == label)
-                or scope == label
-                or (scope.startswith("engine:") and scoped_value == transport)
-                or (scope.startswith("intent:") and scoped_value == intent_id)
-                or (intent_id and scope == intent_id)
-                or (scope.startswith("lane:") and scoped_value == lane)
-                or (lane and scope == lane)
-            )
+            # Same shared predicate as typed-context injection / preflight.
+            return self._context_scope_applies(
+                scope, worker_id=label, engine=transport,
+                intent_id=intent_id, lane=lane)
 
         (typed_guidance, consumed_context_reservations, typed_endpoint,
          typed_prompt_manifest) = (
@@ -1985,6 +2281,10 @@ class _RaceHealthMixin:
                 for directive in self.shared_graph.operator_directives(active_only=True):
                     scope = str(directive.get("scope") or "global")
                     if not _scope_applies(scope):
+                        continue
+                    if (not directive.get("standing")
+                            and str(directive.get("action") or "") == "hint"
+                            and not solve_guidance_role):
                         continue
                     dtext = str(directive.get("text") or "")
                     if not dtext or dtext.startswith("secret://"):
@@ -2019,7 +2319,7 @@ class _RaceHealthMixin:
                 web_access=self.web_access, kb=self.kb,
                 workdir=workdir,
                 mode=mode, intent_goal=intent_goal, intent_id=intent_id,
-                solver_label=label, **kw,
+                solver_label=label, target_epoch=self._target_epoch, **kw,
             # hand the worker the operator's standing guidance + any one-shot
             # intent-level guidance so its (single) prompt already carries VPS/SSH
             # creds, corrections, etc. (copy: the worker must not mutate the
@@ -2039,6 +2339,9 @@ class _RaceHealthMixin:
                 worker_env=self._runtime_env_for(
                     transport, label, container=container, profile=profile),
                 identity=worker_identity_fields(profile),
+            # EXEC-01: Profile→Adapter 解析与 AgentSession 监督（CLI 路径不变）。
+                session_supervisor=self._worker_session_supervisor(),
+                worker_profile=profile,
             )
         except Exception as exc:
             if not self._release_typed_context_reservations(
@@ -2048,8 +2351,11 @@ class _RaceHealthMixin:
             raise
         worker.engine = transport
         worker.lane = str(lane or "")
-        if profile_role == "race" and mode == "bootstrap":
-            worker._skip_bootstrap_conclude = True
+        # Framework swarms (SwarmF02/SwarmF11/... define framework_id) mark their
+        # workers so the blackboard skill keeps its direct RW framework/teammate
+        # commands. The base Swarm has no framework_id, so ordinary workers get
+        # role-scoped prompt context plus host-drained claim files and no raw DB.
+        worker.blackboard_framework = str(getattr(self, "framework_id", "") or "")
         # Construction is the legacy single-shot delivery boundary: the prompt now
         # contains each matching one-shot directive.  Close those rows so future
         # workers cannot inherit them again.  Status is an auditable delivery receipt,
@@ -2096,8 +2402,6 @@ class _RaceHealthMixin:
         # available for the next real spawn.
         if pending_next_guidance:
             del self._next_worker_guidance[:len(pending_next_guidance)]
-        if profile_role == "race" and mode == "bootstrap":
-            worker._skip_bootstrap_conclude = True
         return worker
 
     def _verified_fact_count(self) -> int:

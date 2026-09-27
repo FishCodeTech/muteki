@@ -1,11 +1,14 @@
 name: release-images
 
 # Build the four Muteki images on native amd64/arm64 GitHub-hosted runners.
-# Each architecture is pushed by digest. A merge job then publishes one tag
-# containing exactly linux/amd64 and linux/arm64.
+# Each architecture is pushed by digest. Worker images run verify + runtime smoke
+# before their digest artifact is uploaded; merge then publishes one tag
+# containing exactly linux/amd64 and linux/arm64. A failed smoke blocks that
+# architecture from the index / latest update.
 #
 # provenance and SBOM descriptors are disabled for these release images so
 # imagetools inspect does not show an extra unknown/unknown entry.
+# workflow_dispatch builds images but must not create a formal GitHub Release.
 on:
   push:
     tags: ["v*"]
@@ -14,7 +17,7 @@ on:
       build_kali_worker:
         description: "Also build the heavy Kali muteki-worker image"
         type: boolean
-        default: true
+        default: false
       tag:
         description: "Leave empty to use the branch or Git tag name. Existing release tags are overwritten only when entered explicitly."
         type: string
@@ -24,13 +27,21 @@ permissions:
   contents: write
   packages: write
 
+# Serialize releases for the same ref; do not cancel an active publication.
+# GitHub keeps only the newest pending run in this group.
+concurrency:
+  group: release-images-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
   GO_VERSION: "1.26"
 
 jobs:
   bundle:
+    if: ${{ github.run_attempt == 1 && github.run_number <= fromJSON(vars.MUTEKI_RELEASE_LAST_RUN_NUMBER || '0') }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -42,6 +53,7 @@ jobs:
           TAG="${{ github.event.inputs.tag }}"
           [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
           TAG="${TAG#refs/tags/}"
+          TAG="${TAG//\//-}"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
       - name: Build application bundle
         run: python scripts/build_release_bundle.py --version "${{ steps.version.outputs.version }}" --repository "${{ github.repository }}"
@@ -52,9 +64,12 @@ jobs:
             dist/muteki-*.tar.gz
             dist/release-manifest.json
           if-no-files-found: error
+          retention-days: 7
 
   images:
     name: ${{ matrix.image }} (${{ matrix.target.arch }})
+    if: ${{ github.run_attempt == 1 && github.run_number <= fromJSON(vars.MUTEKI_RELEASE_LAST_RUN_NUMBER || '0') }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -82,6 +97,7 @@ jobs:
           TAG="${{ github.event.inputs.tag }}"
           [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
           TAG="${TAG#refs/tags/}"
+          TAG="${TAG//\//-}"
           [ -z "$TAG" ] && TAG="latest"
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
           REPOSITORY="${REGISTRY}/${OWNER}/${IMAGE_NAME}"
@@ -119,6 +135,7 @@ jobs:
               {
                 echo "build_args<<EOF"
                 echo "IMAGE_VERSION=$TAG"
+                echo "IMAGE_REVISION=$GITHUB_SHA"
                 echo "EOF"
               } >> "$GITHUB_OUTPUT"
               ;;
@@ -144,10 +161,9 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH="$TARGET_ARCH" \
             go build -C cmd/runtime-agent -trimpath -ldflags="-s -w" \
               -o "$GITHUB_WORKSPACE/$ctx/runtime_agent-$TARGET_ARCH" .
-          cp docker/worker/AGENTS.md "$ctx/AGENTS.md"
+          test -s "$ctx/AGENTS.md" || cp docker/worker/AGENTS.md "$ctx/AGENTS.md"
           cp skills/muteki-blackboard/SKILL.md "$ctx/blackboard.SKILL.md"
           cp skills/muteki-blackboard/blackboard.py "$ctx/blackboard.py"
-          cp muteki/solver/deepseek_harness_worker.py "$ctx/deepseek_harness_worker.py"
           cp muteki/solver/offline_acp_bridge.py "$ctx/offline_acp_bridge.py"
           cp muteki/solver/omp_offline_config.yml "$ctx/omp_offline_config.yml"
           cp muteki/solver/kimi_offline_agent.md "$ctx/kimi_offline_agent.md"
@@ -180,11 +196,63 @@ jobs:
           cache-to: type=gha,scope=${{ matrix.image }}-${{ matrix.target.arch }},mode=max
 
       - name: Export image digest
+        id: digest
         run: |
           mkdir -p "${{ runner.temp }}/digests"
           digest="${{ steps.build.outputs.digest }}"
           test -n "$digest"
           touch "${{ runner.temp }}/digests/${digest#sha256:}"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "ref=${{ steps.image.outputs.repository }}@$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Record image identity
+        run: |
+          set -euo pipefail
+          REF="${{ steps.digest.outputs.ref }}"
+          mkdir -p "${{ runner.temp }}/identity"
+          {
+            echo "{"
+            echo "  \"image\": \"${{ matrix.image }}\","
+            echo "  \"arch\": \"${{ matrix.target.arch }}\","
+            echo "  \"platform\": \"${{ matrix.target.platform }}\","
+            echo "  \"repository\": \"${{ steps.image.outputs.repository }}\","
+            echo "  \"tag\": \"${{ steps.image.outputs.tag }}\","
+            echo "  \"digest\": \"${{ steps.digest.outputs.digest }}\","
+            echo "  \"ref\": \"$REF\","
+            echo "  \"source_revision\": \"$GITHUB_SHA\""
+            echo "}"
+          } > "${{ runner.temp }}/identity/${{ matrix.image }}-${{ matrix.target.arch }}.json"
+          echo "### ${{ matrix.image }} (${{ matrix.target.arch }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "- digest: \`${{ steps.digest.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- revision: \`$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- tag: \`${{ steps.image.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Worker slim verify + runtime smoke
+        if: ${{ matrix.image == 'muteki-worker-slim' }}
+        env:
+          IMAGE_REF: ${{ steps.digest.outputs.ref }}
+          PLATFORM: ${{ matrix.target.platform }}
+        run: |
+          set -euo pipefail
+          # Smoke must pass before this architecture's digest is eligible for merge/latest.
+          # Free disk before pull — build layers can leave the runner full.
+          docker buildx prune -af || true
+          docker system prune -af || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+          docker pull --platform "$PLATFORM" "$IMAGE_REF"
+          ./scripts/verify_worker_image.sh --image "$IMAGE_REF" --variant slim --platform "$PLATFORM" \
+            --versions-file "${{ runner.temp }}/engine-versions-slim.txt"
+          python3 scripts/smoke_worker_release.py --image "$IMAGE_REF" --variant slim --platform "$PLATFORM"
+          {
+            echo "#### Engine versions (${{ matrix.target.arch }})"
+            echo '```'
+            cat "${{ runner.temp }}/engine-versions-slim.txt"
+            echo '```'
+            SIZE="$(docker image inspect --format '{{.Size}}' "$IMAGE_REF")"
+            echo "- pulled size bytes: \`$SIZE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload image digest
         uses: actions/upload-artifact@v4
@@ -194,9 +262,18 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  worker:
-    name: muteki-worker (${{ matrix.target.arch }})
-    if: ${{ github.event_name == 'push' || github.event.inputs.build_kali_worker == 'true' }}
+      - name: Upload image identity
+        uses: actions/upload-artifact@v4
+        with:
+          name: identity-${{ matrix.image }}-${{ matrix.target.arch }}
+          path: ${{ runner.temp }}/identity/*
+          if-no-files-found: error
+          retention-days: 7
+
+  worker-base:
+    name: muteki-worker base (${{ matrix.target.arch }})
+    timeout-minutes: 45
+    if: ${{ github.run_attempt == 1 && github.run_number <= fromJSON(vars.MUTEKI_RELEASE_LAST_RUN_NUMBER || '0') && (github.event_name == 'push' || github.event.inputs.build_kali_worker == 'true') }}
     strategy:
       fail-fast: false
       matrix:
@@ -225,6 +302,81 @@ jobs:
           TAG="${{ github.event.inputs.tag }}"
           [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
           TAG="${TAG#refs/tags/}"
+          TAG="${TAG//\//-}"
+          [ -z "$TAG" ] && TAG="latest"
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          {
+            echo "tag=$TAG"
+            echo "owner=$OWNER"
+            echo "repository=${REGISTRY}/${OWNER}/muteki-worker"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push base by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/worker
+          file: docker/worker/Dockerfile
+          target: worker-base
+          platforms: ${{ matrix.target.platform }}
+          tags: ${{ steps.image.outputs.repository }}
+          outputs: type=image,name=${{ steps.image.outputs.repository }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          sbom: false
+          cache-from: type=registry,ref=${{ steps.image.outputs.repository }}:buildcache-base-${{ matrix.target.arch }}
+          cache-to: type=registry,ref=${{ steps.image.outputs.repository }}:buildcache-base-${{ matrix.target.arch }},mode=max
+
+      - name: Export image digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          test -n "$digest"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-muteki-worker-base-${{ matrix.target.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  worker:
+    name: muteki-worker (${{ matrix.target.arch }})
+    timeout-minutes: 45
+    needs: worker-base
+    if: ${{ github.event_name == 'push' || github.event.inputs.build_kali_worker == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.target.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image build
+        id: image
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag }}"
+          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
+          TAG="${TAG#refs/tags/}"
+          TAG="${TAG//\//-}"
           [ -z "$TAG" ] && TAG="latest"
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
           {
@@ -249,13 +401,35 @@ jobs:
               -o "$GITHUB_WORKSPACE/$ctx/runtime_agent-$TARGET_ARCH" .
           cp skills/muteki-blackboard/SKILL.md "$ctx/blackboard.SKILL.md"
           cp skills/muteki-blackboard/blackboard.py "$ctx/blackboard.py"
-          cp muteki/solver/deepseek_harness_worker.py "$ctx/deepseek_harness_worker.py"
           cp muteki/solver/offline_acp_bridge.py "$ctx/offline_acp_bridge.py"
           cp muteki/solver/omp_offline_config.yml "$ctx/omp_offline_config.yml"
           cp muteki/solver/kimi_offline_agent.md "$ctx/kimi_offline_agent.md"
           cp muteki/solver/grok_offline_agent.md "$ctx/grok_offline_agent.md"
           chmod +x "$ctx/blackboard.py"
           file "$ctx/runtime_agent-$TARGET_ARCH" || true
+
+      - name: Free up disk space
+        run: |
+          sudo swapoff /swapfile || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache /usr/local/share/boost \
+                      /usr/local/.ghcup /usr/share/swift /swapfile || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Download base image digest
+        uses: actions/download-artifact@v4
+        with:
+          name: digests-muteki-worker-base-${{ matrix.target.arch }}
+          path: ${{ runner.temp }}/base-digest
+
+      - name: Resolve base image
+        id: base
+        run: |
+          set -euo pipefail
+          mapfile -t DIGEST_FILES < <(find "${{ runner.temp }}/base-digest" -type f | sort)
+          test "${#DIGEST_FILES[@]}" -eq 1
+          echo "image=${{ steps.image.outputs.repository }}@sha256:$(basename "${DIGEST_FILES[0]}")" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -272,22 +446,75 @@ jobs:
         with:
           context: docker/worker
           file: docker/worker/Dockerfile
+          target: final
           platforms: ${{ matrix.target.platform }}
           tags: ${{ steps.image.outputs.repository }}
           outputs: type=image,name=${{ steps.image.outputs.repository }},push-by-digest=true,name-canonical=true,push=true
           provenance: false
           sbom: false
           build-args: |
+            MUTEKI_WORKER_BASE=${{ steps.base.outputs.image }}
             IMAGE_VERSION=${{ steps.image.outputs.tag }}
+            IMAGE_REVISION=${{ github.sha }}
           cache-from: type=registry,ref=${{ steps.image.outputs.repository }}:buildcache-${{ matrix.target.arch }}
           cache-to: type=registry,ref=${{ steps.image.outputs.repository }}:buildcache-${{ matrix.target.arch }},mode=max
 
       - name: Export image digest
+        id: digest
         run: |
           mkdir -p "${{ runner.temp }}/digests"
           digest="${{ steps.build.outputs.digest }}"
           test -n "$digest"
           touch "${{ runner.temp }}/digests/${digest#sha256:}"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "ref=${{ steps.image.outputs.repository }}@$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Worker full verify + runtime smoke
+        env:
+          IMAGE_REF: ${{ steps.digest.outputs.ref }}
+          PLATFORM: ${{ matrix.target.platform }}
+        run: |
+          set -euo pipefail
+          # Failure here prevents uploading this arch digest → merge cannot publish index/latest.
+          # Free disk before pull — build layers after Kali full build often fill the runner.
+          docker buildx prune -af || true
+          docker system prune -af || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache /usr/local/share/boost \
+                      /usr/local/.ghcup /usr/share/swift || true
+          df -h /
+          docker pull --platform "$PLATFORM" "$IMAGE_REF"
+          ./scripts/verify_worker_image.sh --image "$IMAGE_REF" --variant full --platform "$PLATFORM" \
+            --versions-file "${{ runner.temp }}/engine-versions-full.txt"
+          python3 scripts/smoke_worker_release.py --image "$IMAGE_REF" --variant full --platform "$PLATFORM"
+          mkdir -p "${{ runner.temp }}/identity"
+          SIZE="$(docker image inspect --format '{{.Size}}' "$IMAGE_REF")"
+          {
+            echo "{"
+            echo "  \"image\": \"muteki-worker\","
+            echo "  \"arch\": \"${{ matrix.target.arch }}\","
+            echo "  \"platform\": \"${{ matrix.target.platform }}\","
+            echo "  \"repository\": \"${{ steps.image.outputs.repository }}\","
+            echo "  \"tag\": \"${{ steps.image.outputs.tag }}\","
+            echo "  \"digest\": \"${{ steps.digest.outputs.digest }}\","
+            echo "  \"ref\": \"$IMAGE_REF\","
+            echo "  \"source_revision\": \"$GITHUB_SHA\","
+            echo "  \"size_bytes\": $SIZE"
+            echo "}"
+          } > "${{ runner.temp }}/identity/muteki-worker-${{ matrix.target.arch }}.json"
+          {
+            echo "### muteki-worker (${{ matrix.target.arch }})"
+            echo "- digest: \`${{ steps.digest.outputs.digest }}\`"
+            echo "- revision: \`$GITHUB_SHA\`"
+            echo "- size bytes: \`$SIZE\`"
+            echo "#### Engine versions"
+            echo '```'
+            cat "${{ runner.temp }}/engine-versions-full.txt"
+            echo '```'
+            echo ""
+            echo "Full volume note: compare amd64/arm64 size_bytes and Actions duration against"
+            echo "kali-linux-headless + Sage + offline knowledge trees before splitting optional packs."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload image digest
         uses: actions/upload-artifact@v4
@@ -297,7 +524,16 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      - name: Upload image identity
+        uses: actions/upload-artifact@v4
+        with:
+          name: identity-muteki-worker-${{ matrix.target.arch }}
+          path: ${{ runner.temp }}/identity/*
+          if-no-files-found: error
+          retention-days: 7
+
   merge:
+    timeout-minutes: 10
     name: merge ${{ matrix.image }}
     needs: images
     strategy:
@@ -333,6 +569,7 @@ jobs:
           TAG="${{ github.event.inputs.tag }}"
           [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
           TAG="${TAG#refs/tags/}"
+          TAG="${TAG//\//-}"
           [ -z "$TAG" ] && TAG="latest"
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
           REPOSITORY="${REGISTRY}/${OWNER}/${IMAGE_NAME}"
@@ -345,7 +582,8 @@ jobs:
           done
 
           TAG_ARGS=(-t "${REPOSITORY}:${TAG}")
-          if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+          # Pre-release verification tags publish their own immutable tag only.
+          if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             TAG_ARGS+=(-t "${REPOSITORY}:latest")
           fi
           docker buildx imagetools create "${TAG_ARGS[@]}" "${SOURCES[@]}"
@@ -355,8 +593,27 @@ jobs:
           EXPECTED=$'linux/amd64\nlinux/arm64'
           test "$ACTUAL" = "$EXPECTED"
           printf '%s\n' "$ACTUAL"
+          INDEX_DIGEST="$(docker buildx imagetools inspect "${REPOSITORY}:${TAG}" --format '{{.Manifest.Digest}}' 2>/dev/null ||
+            docker buildx imagetools inspect "${REPOSITORY}:${TAG}" | awk '/Digest:/ {print $2; exit}')"
+          echo "### merge ${IMAGE_NAME}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- tag: \`${REPOSITORY}:${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- index digest: \`${INDEX_DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- platforms: \`linux/amd64 linux/arm64\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- source revision: \`$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p "${{ runner.temp }}/merged"
+          printf '%s\n' "$INDEX_DIGEST" > "${{ runner.temp }}/merged/${IMAGE_NAME}.digest"
+          printf '%s\n' "$TAG" > "${{ runner.temp }}/merged/${IMAGE_NAME}.tag"
+
+      - name: Upload merged index digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-${{ matrix.image }}
+          path: ${{ runner.temp }}/merged/*
+          if-no-files-found: error
+          retention-days: 7
 
   merge-worker:
+    timeout-minutes: 10
     name: merge muteki-worker
     needs: worker
     if: ${{ github.event_name == 'push' || github.event.inputs.build_kali_worker == 'true' }}
@@ -384,6 +641,7 @@ jobs:
           TAG="${{ github.event.inputs.tag }}"
           [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
           TAG="${TAG#refs/tags/}"
+          TAG="${TAG//\//-}"
           [ -z "$TAG" ] && TAG="latest"
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
           REPOSITORY="${REGISTRY}/${OWNER}/muteki-worker"
@@ -396,7 +654,7 @@ jobs:
           done
 
           TAG_ARGS=(-t "${REPOSITORY}:${TAG}")
-          if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+          if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             TAG_ARGS+=(-t "${REPOSITORY}:latest")
           fi
           docker buildx imagetools create "${TAG_ARGS[@]}" "${SOURCES[@]}"
@@ -406,17 +664,76 @@ jobs:
           EXPECTED=$'linux/amd64\nlinux/arm64'
           test "$ACTUAL" = "$EXPECTED"
           printf '%s\n' "$ACTUAL"
+          INDEX_DIGEST="$(docker buildx imagetools inspect "${REPOSITORY}:${TAG}" --format '{{.Manifest.Digest}}' 2>/dev/null ||
+            docker buildx imagetools inspect "${REPOSITORY}:${TAG}" | awk '/Digest:/ {print $2; exit}')"
+          echo "### merge muteki-worker" >> "$GITHUB_STEP_SUMMARY"
+          echo "- tag: \`${REPOSITORY}:${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- index digest: \`${INDEX_DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- platforms: \`linux/amd64 linux/arm64\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- source revision: \`$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p "${{ runner.temp }}/merged"
+          printf '%s\n' "$INDEX_DIGEST" > "${{ runner.temp }}/merged/muteki-worker.digest"
+          printf '%s\n' "$TAG" > "${{ runner.temp }}/merged/muteki-worker.tag"
+
+      - name: Upload merged worker index digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-muteki-worker
+          path: ${{ runner.temp }}/merged/*
+          if-no-files-found: error
+          retention-days: 7
 
   publish:
+    timeout-minutes: 5
     needs: [bundle, merge, merge-worker]
-    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && needs.bundle.result == 'success' && needs.merge.result == 'success' && needs.merge-worker.result == 'success' }}
+    # Tag push only — workflow_dispatch must never create a formal GitHub Release.
+    if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.bundle.result == 'success' && needs.merge.result == 'success' && needs.merge-worker.result == 'success' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: muteki-release-bundle
           path: dist
+      - name: Download merged image digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: merged-*
+          path: dist/image-digests
+          merge-multiple: true
+      - name: Compose release image identity
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib
+          root = pathlib.Path("dist/image-digests")
+          images = {}
+          for digest_file in sorted(root.glob("*.digest")):
+              name = digest_file.stem
+              tag_file = digest_file.with_suffix(".tag")
+              images[name] = {
+                  "tag": tag_file.read_text(encoding="utf-8").strip() if tag_file.exists() else "",
+                  "index_digest": digest_file.read_text(encoding="utf-8").strip(),
+              }
+          payload = {
+              "schema_version": 1,
+              "release_tag": "${{ github.ref_name }}",
+              "source_revision": "${{ github.sha }}",
+              "images": images,
+          }
+          out = pathlib.Path("dist/image-identity.json")
+          out.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+          print(out.read_text(encoding="utf-8"))
+          PY
       - name: Create release with upgrade assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" --verify-tag --generate-notes --title "Muteki ${{ github.ref_name }}"
+        run: |
+          set -euo pipefail
+          # Attach bundle + image-identity so the GitHub Release lines up with GHCR digests.
+          TAG="${{ github.ref_name }}"
+          RELEASE_ARGS=(--repo "${{ github.repository }}" --verify-tag --generate-notes --title "Muteki $TAG")
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            RELEASE_ARGS+=(--prerelease)
+          fi
+          gh release create "$TAG" dist/muteki-*.tar.gz dist/release-manifest.json dist/image-identity.json \
+            "${RELEASE_ARGS[@]}"

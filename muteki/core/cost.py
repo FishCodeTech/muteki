@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Callable, Any
 
 from muteki.core.event_bus import EventBus
 from muteki.core.events import Event, EventType, cost_payload
@@ -93,6 +93,8 @@ class CostController:
     prices: dict[str, ModelPrice] = field(default_factory=lambda: dict(PRICES))
     started_at: float = field(default_factory=time.time)
 
+    usage_sink: Optional[Callable[..., Any]] = None
+
     _global: Ledger = field(default_factory=Ledger)
     _by_challenge: dict[str, Ledger] = field(default_factory=dict)
     _by_solver: dict[str, Ledger] = field(default_factory=dict)
@@ -112,6 +114,8 @@ class CostController:
         self, usd: float, *, run_id: str, solver_id: Optional[str] = None,
         challenge_id: Optional[str] = None,
         input_tokens: int = 0, output_tokens: int = 0,
+        usage: Optional[dict] = None, usage_id: Optional[str] = None,
+        model: str = "", actor_kind: str = "worker", generation: Optional[int] = None, engine: str = "",
     ) -> float:
         """Charge a raw USD amount that did NOT go through our token pricing — e.g.
         a shelled CLI worker which reports its cost in dollars (claude's
@@ -124,6 +128,10 @@ class CostController:
         the ledger's token counters (for the deck's token-usage column) but do NOT
         re-derive the cost — `usd` is authoritative here (the driver already priced
         it). Pass 0 (the default) when the engine reports no token counts."""
+        if self.usage_sink is not None:
+            inserted = self.usage_sink(usage or {"input_tokens": input_tokens, "output_tokens": output_tokens, "reported_cost": usd}, identity=usage_id, model=model, worker_id=solver_id, role=("worker" if actor_kind == "worker" else solver_id or "auxiliary"), actor_kind=actor_kind, generation=generation, engine=engine)
+            if inserted is False:
+                return 0.0
         usd = max(0.0, float(usd))
         inp, outp = max(0, int(input_tokens)), max(0, int(output_tokens))
 
@@ -155,6 +163,7 @@ class CostController:
                 payload = cost_payload("global", self._global.usd, self._global.tokens,
                                        input_tokens=self._global.input_tokens,
                                        output_tokens=self._global.output_tokens)
+            payload["run_total"] = {"usd": self._global.usd, **self.global_tokens()}
             await self.bus.emit(Event(
                 event_type=EventType.COST_UPDATE, run_id=run_id,
                 challenge_id=challenge_id, solver_id=solver_id, payload=payload))
@@ -169,9 +178,15 @@ class CostController:
         run_id: str,
         challenge_id: Optional[str] = None,
         solver_id: Optional[str] = None,
+        usage: Optional[dict] = None, usage_id: Optional[str] = None,
+        actor_kind: str = "auxiliary", generation: Optional[int] = None, engine: str = "",
     ) -> float:
         """Record one LLM call's usage; emit COST_UPDATE; return its USD cost."""
         price = self.price_for(model)
+        if self.usage_sink is not None:
+            inserted = self.usage_sink(usage or {"input_tokens": input_tokens, "output_tokens": output_tokens, "estimated_cost": price.cost(input_tokens, output_tokens)}, identity=usage_id, model=model, worker_id=solver_id, role=("worker" if actor_kind == "worker" else solver_id or "auxiliary"), actor_kind=actor_kind, generation=generation, engine=engine)
+            if inserted is False:
+                return 0.0
         cost = self._global.add(price, input_tokens, output_tokens)
         if challenge_id:
             self._by_challenge.setdefault(challenge_id, Ledger()).add(
@@ -202,6 +217,7 @@ class CostController:
                 payload = cost_payload("global", self._global.usd, self._global.tokens,
                                        input_tokens=self._global.input_tokens,
                                        output_tokens=self._global.output_tokens)
+            payload["run_total"] = {"usd": self._global.usd, **self.global_tokens()}
             await self.bus.emit(
                 Event(
                     event_type=EventType.COST_UPDATE,
@@ -266,8 +282,8 @@ class CostController:
     def solver_usage(self, solver_id: str) -> dict[str, int]:
         """Exact integer counters for a worker settlement receipt.
 
-        Protocol 2 budget accounting must not scrape the presentation-oriented
-        rounded ``snapshot()`` payload.  Micro-dollars keep the durable contract
+        Budget accounting must not scrape the presentation-oriented rounded
+        ``snapshot()`` payload.  Micro-dollars keep the durable contract
         integer-only and deterministic.
         """
         usage = self.solver_usage_or_none(solver_id)
@@ -281,8 +297,8 @@ class CostController:
     def solver_usage_or_none(self, solver_id: str) -> dict[str, int] | None:
         """Return cumulative exact counters, preserving absent telemetry as None.
 
-        Protocol 2 uses this form so a provider that emitted no usage record is
-        accounted as UNKNOWN rather than silently converted into a zero charge.
+        A provider that emitted no usage record is accounted as UNKNOWN rather
+        than silently converted into a zero charge.
         """
         led = self._by_solver.get(solver_id)
         if led is None:

@@ -2,7 +2,7 @@
 
 Both the dispatch precheck (apps/web/drivers.py:_missing_profile_accounts, which
 aborts a /start before any container is created) and the settings-page
-self-check (apps/web/account_test.py + the /api/settings/profiles[/{id}]/health
+self-check (apps/web/account_probe.py + the /api/settings/profiles[/{id}]/health
 endpoints) collapse to thin wrappers over `evaluate_profile_health`. Before this
 module the two paths modelled health differently — the settings page asked "does
 SOME account exist for this engine?" while dispatch asked "does THIS profile bind
@@ -114,24 +114,6 @@ def _requires_account(profile: dict[str, Any], *, backend: str) -> bool:
     )
 
 
-def needs_auth_probe(profile: dict[str, Any], *, backend: str) -> bool:
-    """EXPLICIT INVARIANT (do not collapse to just `_requires_account`).
-
-    Old dispatch probed a profile for independent reasons: it requires an
-    account, it uses a keyed credential mode, OR it uses a custom endpoint
-    (drivers.py:79). A local api_key profile with a present host login still must
-    validate the keyed account it names; a base_url endpoint profile that doesn't
-    strictly require a stored account still must be probed too. The settings page
-    and dispatch both gate the auth layer on this one predicate.
-    """
-    auth = str(profile.get("credential_mode") or profile.get("auth") or "subscription")
-    return (
-        _requires_account(profile, backend=backend)
-        or auth in _KEYED_MODES
-        or profile_uses_endpoint(profile)
-    )
-
-
 def evaluate_profile_health(
     profile: dict[str, Any],
     *,
@@ -212,37 +194,40 @@ def evaluate_profile_health(
                   binding_kind=bk, effective_credential_id=effective_account_id)
 
     # ── layer 3: auth (real one-turn hello, host-local, profile-pinned model) ─
-    if not needs_auth_probe(profile, backend=backend):
-        # e.g. a bare host subscription with a present system login: dispatch
-        # never probed it, so neither do we — returning ok keeps the old
-        # zero-probe fast path (no latency regression on /start).
-        return mk("ok", detail="no auth probe required",
-                  binding_kind=bk, effective_credential_id=effective_account_id)
-
-    # When the WEB process itself runs inside a container (compose deploy), the
-    # host-local auth probe is impossible: the engine CLI binary (claude/codex/
-    # cursor) is NOT installed in the web image — it lives only in the WORKER
-    # image. Shelling it here fails with "binary not found on PATH" and aborts
-    # the whole run on profile_unhealthy before any worker spawns. Binding +
-    # plumbing already proved the credential is present and the worker image
-    # launches; the REAL auth happens when the worker container runs. (Custom
-    # endpoints additionally have their own HTTP probe via account_test.) So
-    # defer auth to the worker instead of false-failing on a missing local CLI.
+    # Web 容器本身不带 Worker CLI，因此调度前只接受此前针对同一凭据和同一
+    # 模型完成的真实容器探针。没有证据时直接阻断，不能把认证推迟到正式
+    # Worker 再碰运气。
     from muteki.core.runtime_env import is_web_container
     if is_web_container():
-        return mk("ok", detail="auth deferred to worker container",
-                  binding_kind=bk, effective_credential_id=effective_account_id)
+        credential_id = (
+            f"account:{effective_account_id}" if effective_account_id
+            else f"system:{engine}"
+        )
+        last_test = store.last_test(credential_id)
+        tested_model = str((last_test or {}).get("model") or "").strip()
+        if last_test and last_test.get("ok") and model and tested_model == model:
+            return mk("ok", detail="真实容器模型测试已通过",
+                      binding_kind=bk,
+                      effective_credential_id=effective_account_id)
+        return mk(
+            "auth_failed", layer="auth",
+            detail=f"模型 {model or '<未指定>'} 尚未完成真实容器测试",
+            binding_kind=bk, effective_credential_id=effective_account_id)
 
     from muteki.solver.cli_driver import driver_for  # lazy: avoid import cycle
 
     # container=False ALWAYS — see module docstring. The probe is a host
     # subprocess; an in-container overlay would point at paths that don't exist
     # on the host.
-    overlay = runtime_env_for_engine(
-        engine, account_root=root, account_id=effective_account_id or None, container=False
-    ).env
-    env = {**os.environ, **overlay}
     try:
+        overlay = runtime_env_for_engine(
+            engine,
+            account_root=root,
+            account_id=effective_account_id or None,
+            container=False,
+            model=model,
+        ).env
+        env = {**os.environ, **overlay}
         # driver_for(<dict>) returns a ProfileDriver/EndpointDriver that pins the
         # profile's model into the hello argv — so a quota-exhausted DEFAULT model
         # can't false-fail a profile that runs on a different model.
@@ -264,11 +249,11 @@ def _probe_container_plumbing(
     """Container plumbing probe: image present + credential mount readable + CLI
     launches. Returns (ok, layer, detail). NEVER spends model quota.
 
-    The docker mechanics are owned by apps.web.account_test._probe_container; this
+    The docker mechanics are owned by apps.web.account_probe._probe_container; this
     delegates to it and maps its dict result into the (ok, layer, detail) tuple
     the kernel works in, so there is still exactly one docker-run implementation.
     """
-    from apps.web.account_test import _probe_container
+    from apps.web.account_probe import _probe_container
 
     res = _probe_container(engine=engine, account_id=account_id, root=root)
     return bool(res.get("ok")), res.get("layer"), str(res.get("detail") or "")

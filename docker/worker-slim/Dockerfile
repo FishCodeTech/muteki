@@ -1,12 +1,16 @@
-# muteki worker image — SLIM build (plain Ubuntu + reverse-connector + 9 engine CLIs).
+# muteki worker image — SLIM build (plain Ubuntu + reverse-connector + 8 engine CLIs).
 # A lightweight alternative to the full Kali image for FAST testing: it ships ONLY
 #   - the in-container Runtime Control Plane supervisor (runtime_agent, PID1/ENTRYPOINT)
-#   - all nine Worker CLIs
+#   - the eight container Worker CLIs (claude, codex, cursor, pi, omp, kimi, grok,
+#     opencode). Devin is host-local; DeepSeek Harness is not baked.
 #   - the muteki-blackboard skill
-# and no full Kali toolchain (no kali-linux-headless, ghidra, sagemath,
-# volatility3 or knowledge base). It pulls/builds in a fraction of the
+# and no full Kali toolchain (no kali-linux-headless, sagemath, volatility3 or
+# knowledge base). It pulls/builds in a fraction of the
 # time and is meant for wiring/integration tests where you only need a worker that
 # can connect back, run an agent, and write the blackboard — not actually solve.
+#
+# Formal builds ship only through .github/workflows/release-images.yml.
+# docker/worker-slim/build.sh is a local development helper, not the release entrypoint.
 #
 # It keeps the EXACT SAME in-container path contract as the Kali image so
 # container_exec.py needs NO change — just point MUTEKI_WORKER_IMAGE at this tag:
@@ -84,7 +88,7 @@ EOF
 #    is the one solvers reach for most; keep it so a slim worker can still do a basic
 #    interaction. Everything heavy (angr/sage/z3/volatility3) is intentionally absent.
 RUN pip3 install --break-system-packages --no-cache-dir \
-      requests pwntools deepseek-harness-sdk==0.1.0rc6
+      requests pwntools
 
 # Ubuntu 24.04 ships Node.js 18, while the pinned Pi CLI requires Node.js
 # 22.19 or newer. Install one architecture-matched runtime ahead of /usr/bin.
@@ -108,10 +112,10 @@ ARG NPM_REGISTRY=""
 RUN if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi && \
     npm install -g \
       @openai/codex@0.146.0 \
-      @anthropic-ai/claude-code@2.1.220 \
+      @anthropic-ai/claude-code@2.1.257 \
       @earendil-works/pi-coding-agent@0.84.1 \
-      @moonshot-ai/kimi-code@0.36.1 \
-      opencode-ai@1.18.18
+      @moonshot-ai/kimi-code@0.40.1 \
+      opencode-ai@1.18.22
 
 # cursor-agent is NOT an npm package — installs via cursor.com/install into the kali
 # user's ~/.local/bin. Run as kali so it lands in kali's HOME (container_exec pins the
@@ -122,7 +126,7 @@ USER kali
 RUN curl -fsSL https://cursor.com/install | bash
 RUN curl -fsSL https://omp.sh/install | sh -s -- --binary --ref v17.3.5 && \
     /home/kali/.local/bin/omp --version
-RUN curl -fsSL https://x.ai/cli/install.sh | bash -s 1.0.4 && \
+RUN curl -fsSL https://x.ai/cli/install.sh | bash -s 1.0.5 && \
     /home/kali/.grok/bin/grok --version
 USER root
 
@@ -130,7 +134,6 @@ USER root
 #    build.sh and release-images.yml name it by the target architecture so one
 #    Dockerfile can build amd64 and arm64 without copying the wrong executable.
 COPY ./runtime_agent-${TARGETARCH} /opt/muteki/runtime_agent
-COPY ./deepseek_harness_worker.py /opt/muteki/deepseek_harness_worker.py
 COPY ./offline_acp_bridge.py /opt/muteki/offline_acp_bridge.py
 COPY ./omp_offline_config.yml /opt/muteki/omp_offline_config.yml
 COPY ./kimi_offline_agent.md /opt/muteki/kimi_offline_agent.md
@@ -156,12 +159,14 @@ RUN mkdir -p /home/kali/workspace && chown kali:kali /home/kali/workspace && \
     mkdir -p /run/muteki/control /run/muteki/accounts && \
     chown -R kali:kali /run/muteki
 
-# Version label so the settings "image version check" (P2 v3) has a fact to read.
-# build.sh passes --build-arg IMAGE_VERSION=<version>.
+# Version/revision labels so the settings "image version check" (P2 v3) and
+# release smoke can pin identity. release-images.yml passes IMAGE_REVISION.
 ARG IMAGE_VERSION=dev
+ARG IMAGE_REVISION=unknown
 LABEL org.opencontainers.image.title="muteki-worker-slim" \
-      org.opencontainers.image.description="Slim Ubuntu muteki worker: reverse-connector + 9 agent CLIs, no full Kali toolchain" \
-      org.opencontainers.image.version="${IMAGE_VERSION}"
+      org.opencontainers.image.description="Slim Ubuntu muteki worker: reverse-connector + 8 container agent CLIs, no full Kali toolchain" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      org.opencontainers.image.revision="${IMAGE_REVISION}"
 
 WORKDIR /home/kali/workspace
 # Supervisor runs as root (PID1) so it can drop workers to the kali uid; the worker

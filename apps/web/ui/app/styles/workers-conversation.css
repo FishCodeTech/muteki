@@ -1,0 +1,685 @@
+/* ============================================================================
+   INTERACTION FEEDBACK & MICRO-POLISH — tactile press states for the
+   interactive controls, a mount-only enter animation for streaming list rows,
+   and a prefers-reduced-motion escape hatch. Lives last so the :active rules
+   win same-specificity ties and the press feels immediate.
+   ============================================================================ */
+
+/* button press: a quick, tasteful settle (≤120ms via the transitions already on
+   these controls). transform + a touch of dim so any control feels "pushed". */
+.newsolve:active:not(:disabled),
+.composer2 .send:active:not(:disabled),
+.icon-btn:active,
+.graph-toolbar button:active,
+.bb-tool-btn:active,
+.websearch-toggle:active,
+.artifact-head .tabs button:active,
+.insp-panel-btn:active:not(:disabled),
+.suggest button:active,
+.suggest-card:active,
+.composer2 .quick button:active,
+.composer2 .attach-btn:active,
+.convo-top .lang-btn:active,
+.mode-seg .tabs__tab:active,
+.evi-sort-btn:active,
+.density-toggle:active,
+.menu .mi:active:not(:disabled) {
+  transform: scale(0.96);
+}
+/* the segmented + ghost controls above flip colours on a .12s ease but had no
+   transform transition, so the press would snap — give them the same short one
+   (transform only; their existing colour transitions are untouched). */
+.mode-seg .tabs__tab,
+.evi-sort-btn,
+.density-toggle,
+.menu .mi {
+  transition: transform var(--tabs-dur) var(--ease-out), color var(--control-feedback-dur) var(--ease-out), background-color var(--control-feedback-dur) var(--ease-out), border-color var(--control-feedback-dur) var(--ease-out);
+}
+/* primary CTAs have no transform transition by default — give them a short one so
+   the press settles instead of snapping (≤120ms, hover filter/opacity unaffected). */
+.newsolve,
+.composer2 .send,
+.insp-panel-btn,
+.thread-item,
+.composer2 .quick button,
+.composer2 .attach-btn,
+.convo-top .lang-btn {
+  transition: transform var(--panel-open-dur) var(--ease-out), opacity var(--control-feedback-dur) var(--ease-out), border-color var(--control-feedback-dur) var(--ease-out), background var(--control-feedback-dur) var(--ease-out);
+}
+.newsolve:active:not(:disabled),
+.composer2 .send:active:not(:disabled) {
+  opacity: .92;
+}
+
+/* consistency sweep: small ghost/secondary controls that flip colour/background/
+   border only on :hover/:focus but had no transition — give them the same fast,
+   calm ease as the rest of the controls (no layout-affecting props, so no reflow).
+   Listed here (not per-rule) so the motion intent lives in one place. */
+.menu .mi,
+.convo-top .rid-open,
+.rail-newfolder,
+.insp-close,
+.insp-copy,
+.worker-kill,
+.wlane-kill,
+.wlane-spawn-btn {
+  transition: color var(--control-feedback-dur) var(--ease-out), background-color var(--control-feedback-dur) var(--ease-out), border-color var(--control-feedback-dur) var(--ease-out);
+}
+
+/* mount-only enter for streaming rows: fade + slide up once on first paint. React
+   reuses keyed nodes across re-renders, so the animation fires on mount and does
+   NOT replay on content updates (no flicker on streaming text). */
+.coord-bubble {
+  transition: transform var(--duration-quick) var(--ease-out), border-color var(--duration-quick) ease, box-shadow var(--duration-quick) ease, background-color var(--duration-quick) ease;
+}
+.coord-bubble:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-sm);
+}
+
+/* accessibility: honour reduced-motion — kill the new transforms + enter animation
+   (existing spinners/keyframes elsewhere keep their own handling). */
+@media (prefers-reduced-motion: reduce) {
+  .activity-feed .act-msg,
+  .wlane,
+  .jump-newest,
+  .drop-overlay,
+  .toast,
+  .artifact-view,
+  .runtime-trace-relations,
+  .runtime-trace-mark,
+  .runtime-trace-fold,
+  .coord-bubble,
+  .welcome,
+  .welcome-hero,
+  .welcome .suggest-label,
+  .welcome .suggest { animation: none; }
+  /* artifact panel: open/close instantly instead of sliding the width */
+  .artifact { transition: none; }
+  /* skeletons: drop the shimmer sweep + spinner, keep a calm static muted block */
+  .skel { animation: none; background-image: none;
+    background: color-mix(in srgb, var(--line) 45%, var(--panel2)); }
+  .skel-spin { animation: none; border-top-color: var(--line2); }
+  /* suggestion cards: keep the hover border cue, drop the lift */
+  .suggest button:hover, .suggest-card:hover { transform: none; }
+  .coord-bubble,
+  .coord-bubble:hover {
+    transform: none !important;
+    opacity: 1 !important;
+    transition: none;
+    box-shadow: none;
+  }
+  .newsolve:active:not(:disabled),
+.composer2 .send:active:not(:disabled),
+.icon-btn:active,
+.graph-toolbar button:active,
+.bb-tool-btn:active,
+.websearch-toggle:active,
+.artifact-head .tabs button:active,
+.insp-panel-btn:active:not(:disabled),
+.thread-item:active,
+.mode-seg .tabs__tab:active,
+.evi-sort-btn:active,
+.density-toggle:active,
+.menu .mi:active:not(:disabled) { transform: none; opacity: 1; }
+}
+
+/* Final cascade for primitives whose legacy definitions live below the main
+   Beautiful UI alignment section. */
+.quiet-meta { margin: 0 20px 10px; gap: 0; overflow: hidden; border: 1px solid var(--line);
+  border-radius: 10px; background: var(--panel); box-shadow: var(--shadow-md); }
+.qm { min-height: 58px; padding: 9px 12px; justify-content: center; gap: 4px;
+  background: transparent; border-right: 1px solid var(--line); }
+.qm:last-child { border-right: 0; }
+.qm .qk { color: var(--dim); font-size: 9px; font-weight: 620; letter-spacing: .07em; }
+.qm .qv { font-family: var(--font-mono); font-size: 14px; font-weight: 620; }
+
+.coord-thread { padding: 12px 20px 16px; background: var(--bg); }
+.coord-wrap { max-width: 920px; gap: 12px; }
+.coord-bubble { max-width: min(88%, 760px); padding: 11px 13px; border-radius: 10px;
+  line-height: 1.55; box-shadow: var(--shadow-md); }
+.coord-bubble.you { background: color-mix(in srgb, var(--accent) 11%, var(--panel));
+  border-color: color-mix(in srgb, var(--accent) 34%, var(--line)); }
+.coord-bubble.coordinator { background: var(--panel); border: 1px solid var(--line); }
+.coord-bubble.system { max-width: min(88%, 760px); border-color: var(--line2);
+  border-radius: 8px; box-shadow: none; background: var(--panel2); }
+.coord-bubble.system.guidance, .coord-bubble.system.insight,
+.coord-bubble.system.status { border-color: var(--line2); color: var(--muted); }
+.coord-bubble.digest, .coord-bubble.answer { background: var(--panel); border: 1px solid var(--line); }
+.coord-bubble.answer { box-shadow: var(--shadow-md); border-color: color-mix(in srgb, var(--green) 32%, var(--line)); }
+.coord-bubble.digest { box-shadow: var(--shadow-md); border-color: color-mix(in srgb, var(--accent) 32%, var(--line)); }
+.coord-bubble .who { color: var(--dim); font-size: 10.5px; }
+
+.insp-tabs { padding: 3px; border-color: var(--line); border-radius: 8px; background: var(--panel2); }
+.insp-tab { border-radius: 6px; color: var(--muted); font-weight: 560; }
+.insp-tab.on { color: var(--text); background: var(--panel); box-shadow: var(--shadow-sm); }
+.insp-sec { padding: 14px; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--panel); box-shadow: var(--shadow-md); }
+.insp-sec-h { color: var(--dim); font-size: 10px; font-weight: 620; letter-spacing: .07em; }
+.insp-run-flag { border-color: var(--line); border-radius: 8px; background: var(--panel2); }
+.insp-chip { border-color: var(--line); border-radius: 6px; background: var(--panel2); }
+.insp-panel-btn { min-height: 44px; border-color: var(--line); border-radius: 8px;
+  background: var(--panel2); box-shadow: none; }
+.insp-panel-btn:hover, .insp-panel-btn.on { color: var(--text); border-color: var(--line2); background: var(--panel3); }
+.iwk { border: 1px solid var(--line); border-radius: 8px; background: var(--panel2); }
+.iwk-clickable:hover { border-color: var(--line2); background: var(--panel3); }
+
+.artifact-body, .artifact-view { background: var(--bg); }
+.artifact-list, .panel-scroll { padding: 16px; }
+.artifact-row { border-color: var(--line); border-radius: 8px; background: var(--panel); box-shadow: var(--shadow-md); }
+.artifact-row::before { display: none; }
+.artifact-badge, .artifact-chip { border-color: var(--line); border-radius: 6px; background: var(--panel2); }
+
+@media (max-width: 760px) {
+  .quiet-meta { margin: 0 10px 8px; overflow-x: auto; }
+  .qm { min-width: 88px; }
+  .coord-thread { padding-inline: 10px; }
+}
+
+/* Conversation timeline: one continuous execution history rather than a stack
+   of unrelated chat cards. The rail carries chronology; typography and node
+   colour carry role hierarchy. Only summaries and final answers keep a panel. */
+.coord-thread { padding: 8px 20px 14px; }
+.coord-wrap { position: relative; max-width: 940px; gap: 0; padding-left: 38px; }
+.coord-wrap::before { content: ""; position: absolute; top: 16px; bottom: 16px; left: 10px; width: 1px; background: var(--line2); }
+.coord-bubble { position: relative; align-self: stretch; max-width: none; min-height: 54px; margin: 0; padding: 11px 10px 13px 14px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; box-shadow: none; line-height: 1.55; }
+.coord-bubble:hover { transform: none; border-color: var(--line2); background: color-mix(in srgb, var(--bright) 2.5%, transparent); box-shadow: none; }
+.coord-bubble .coord-node { position: absolute; z-index: 1; top: 12px; left: -38px; width: 21px; height: 21px; display: grid; place-items: center; color: var(--muted); border: 1px solid var(--line2); border-radius: 7px; background: var(--bg); box-shadow: 0 0 0 4px var(--bg); }
+.coord-bubble .who { min-height: 18px; margin: 0 0 3px; color: var(--muted); font-size: 10px; font-weight: 560; letter-spacing: .01em; }
+.coord-bubble .who .k { color: var(--dim); }
+.coord-bubble .body { color: var(--text); font-size: 12.5px; line-height: 1.6; }
+.coord-bubble.you, .coord-bubble.coordinator, .coord-bubble.system { align-self: stretch; max-width: none; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; box-shadow: none; }
+.coord-bubble.you .coord-node { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); background: color-mix(in srgb, var(--accent) 9%, var(--bg)); }
+.coord-bubble.you .who { color: var(--accent); }
+.coord-bubble.coordinator .coord-node { color: var(--cyan); border-color: color-mix(in srgb, var(--cyan) 38%, var(--line)); }
+.coord-bubble.system { min-height: 43px; padding-block: 9px 10px; color: var(--muted); font-size: 12px; }
+.coord-bubble.system .coord-node { top: 9px; width: 18px; height: 18px; left: -36px; border-radius: 50%; }
+.coord-bubble.system.insight .coord-node { color: var(--violet); border-color: color-mix(in srgb, var(--violet) 42%, var(--line)); }
+.coord-bubble.system.guidance .coord-node { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 42%, var(--line)); }
+.coord-bubble.system.status .coord-node { color: var(--blue); border-color: color-mix(in srgb, var(--blue) 42%, var(--line)); }
+.coord-bubble.digest, .coord-bubble.answer { align-self: stretch; max-width: none; min-height: 0; margin: 12px 0 8px; padding: 13px 15px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); box-shadow: var(--shadow-md); }
+.coord-bubble.digest { border-color: color-mix(in srgb, var(--accent) 36%, var(--line)); }
+.coord-bubble.answer { border-color: color-mix(in srgb, var(--green) 36%, var(--line)); }
+.coord-bubble.digest .coord-node { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.coord-bubble.answer .coord-node { color: var(--green); border-color: color-mix(in srgb, var(--green) 45%, var(--line)); }
+
+/* Compact run summary: the inspector owns the detailed counters and cost data,
+   so the conversation only keeps phase, current result, elapsed time and flow. */
+.coord-sticky-head { padding: 6px 0 4px; }
+.coord-sticky-head .status-hero-shell { margin-bottom: 6px; }
+.status-hero-shell { margin: 8px 20px 6px; }
+.status-hero {
+  min-height: 46px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center;
+  gap: 10px; padding: 6px 7px 6px 10px; border-radius: 9px; box-shadow: none; cursor: default;
+}
+.status-hero:hover { background: var(--panel); box-shadow: none; }
+.status-hero.open { background: var(--panel3); box-shadow: none; }
+.status-hero .sh-status { display: inline-flex; align-items: center; gap: 6px; padding-right: 10px; }
+.status-hero .sh-ico {
+  width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; flex: none;
+  border: 1px solid color-mix(in srgb, var(--sh-c) 30%, var(--line)); border-radius: 7px;
+  background: color-mix(in srgb, var(--sh-c) 8%, var(--panel2));
+}
+.status-hero .sh-phase { font-size: 11px; }
+.status-hero .sh-main { min-width: 0; display: grid; align-items: center; }
+.status-hero .sh-detail,
+.status-hero .sh-detail-flag { font-size: 12px; line-height: 1.35; }
+.status-hero .sh-meta { display: inline-flex; align-items: center; gap: 5px; }
+.status-hero .sh-workers, .status-hero .sh-elapsed { min-height: 26px; padding: 0 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel2); font-size: 10.5px; font-weight: 550; }
+.status-hero .sh-flow { min-height: 28px; padding: 4px 7px; cursor: pointer; }
+
+/* The page-level 对话 / 运行时 switch owns navigation. The inspector is one
+   continuous, scrollable information column with results and launchers first. */
+.run-inspector { overflow-x: hidden; overflow-y: auto; }
+.run-inspector .insp-sec-outcome { order: 1; flex: none; min-height: 0; overflow: visible; }
+.run-inspector .insp-sec-panels { order: 2; flex: none; }
+.run-inspector .insp-sec-workers { order: 3; flex: none; min-height: 0; overflow: visible; }
+.run-inspector .insp-sec-locks { order: 4; flex: none; min-height: 0; overflow: visible; }
+
+/* In-run composer: one command surface with an integrated action rail. */
+.composer2.command-composer { padding: 10px 20px 14px; background: linear-gradient(to top, var(--bg) 82%, transparent); }
+.command-composer .command-wrap { max-width: 940px; padding: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 11px; background: var(--panel); box-shadow: var(--shadow-pop); }
+.command-composer .command-wrap:focus-within { border-color: color-mix(in srgb, var(--accent) 28%, var(--line)); box-shadow: var(--shadow-pop); }
+.command-row { min-height: 50px; display: flex; align-items: center; gap: 10px; padding: 7px 9px 7px 12px; }
+.command-target { flex: none; min-width: 0; display: inline-flex; align-items: center; gap: 6px; padding-right: 11px; color: var(--dim); border-right: 1px solid var(--line); font-size: 10.5px; white-space: nowrap; }
+.command-target select { max-width: 142px; appearance: none; color: var(--text); border: 0; outline: 0; background: transparent; font: 560 11.5px/1.2 var(--font-sans); cursor: pointer; }
+.command-target svg { color: var(--dim); pointer-events: none; }
+.command-input { flex: 1 1 auto; min-width: 0; height: 34px; padding: 0 2px; color: var(--text); border: 0; outline: 0; background: transparent; font: 13px/1.45 var(--font-sans); }
+.command-input::placeholder { color: var(--dim); }
+.command-composer .send { flex: none; width: 34px; height: 34px; display: grid; place-items: center; border-radius: 8px; }
+.command-actionbar { min-height: 39px; display: flex; align-items: center; gap: 12px; padding: 5px 9px; border-top: 1px solid var(--line); background: var(--panel2); }
+.command-actionbar .quick { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 3px; margin: 0; max-width: none; }
+.command-actionbar .quick button { min-height: 28px; display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; border: 0; border-radius: 6px; color: var(--muted); background: transparent; font-size: 10.5px; font-weight: 550; }
+.command-actionbar .quick button:hover { color: var(--bright); background: var(--panel3); }
+.command-actionbar .quick button.primary { color: var(--on-accent, #fff); background: var(--accent); }
+.command-actionbar .quick button.primary:hover { color: var(--on-accent, #fff); background: color-mix(in srgb, var(--accent) 88%, #fff); }
+.command-actionbar .quick button.danger { color: var(--red); background: transparent; }
+.command-actionbar .quick button.danger:hover { color: var(--red); background: color-mix(in srgb, var(--red) 8%, transparent); }
+.command-actionbar .quick .quick-sep { height: 20px; align-self: center; margin: 0 3px; background: var(--line); }
+.command-hint { flex: 0 1 310px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); font-size: 9.5px; text-align: right; }
+.command-composer .markfalse-picker { max-width: none; margin: 0; padding: 7px 9px; border-top: 1px solid var(--line); background: var(--panel2); }
+
+/* The inspector leaves the conversation column intentionally compact on common
+   laptop widths. Keep the status and command controls on one calm line there. */
+@container coordcolumn (min-width: 431px) and (max-width: 680px) {
+  .status-hero { grid-template-columns: auto minmax(0, 1fr) auto; grid-template-rows: auto; gap: 8px; padding-block: 6px; }
+  .status-hero .sh-status, .status-hero .sh-main, .status-hero .sh-meta { grid-column: auto; grid-row: 1; }
+  .status-hero .sh-meta { justify-content: flex-end; }
+  .status-hero .sh-flow { padding-inline: 6px; }
+}
+
+@container coordcolumn (max-width: 430px) {
+  .status-hero { grid-template-columns: auto minmax(0, 1fr); gap: 5px 8px; }
+  .status-hero .sh-status { grid-column: 1; grid-row: 1; }
+  .status-hero .sh-main { grid-column: 2; grid-row: 1; }
+  .status-hero .sh-meta { grid-column: 2; grid-row: 2; justify-content: flex-start; }
+  .status-hero .sh-results-toggle { grid-template-columns: minmax(0, 1fr) max-content 16px; gap: 5px; }
+  .status-hero .sh-results-preview { display: none; }
+}
+
+@media (max-width: 1320px) {
+  .command-hint { display: none; }
+}
+
+@media (max-width: 760px) {
+  .coord-thread { padding-inline: 10px; }
+  .coord-wrap { padding-left: 32px; }
+  .coord-wrap::before { left: 8px; }
+  .coord-bubble .coord-node { left: -32px; }
+  .coord-bubble.system .coord-node { left: -30px; }
+  .composer2.command-composer { padding: 8px 10px 10px; }
+  .command-target { max-width: 120px; }
+  .command-target select { max-width: 86px; }
+  .command-hint { display: none; }
+}
+
+/* ============================================================================
+   QUIET COMMAND DECK
+   One neutral surface system, one selection colour, and semantic colour only
+   at the icon/text level. This final cascade intentionally removes the coloured
+   edge strips and glow-heavy states accumulated by older component variants.
+   ============================================================================ */
+
+.shell button {
+  font-family: var(--font-sans);
+  box-shadow: none;
+  transition: color var(--control-feedback-dur) var(--ease-out), background-color var(--control-feedback-dur) var(--ease-out), border-color var(--control-feedback-dur) var(--ease-out), opacity var(--control-feedback-dur) var(--ease-out);
+}
+
+.rail {
+  border-right-style: solid;
+  border-right-color: var(--line);
+}
+.rail-top { padding-top: 16px; }
+.newsolve {
+  width: calc(100% - 24px);
+  min-height: 42px;
+  justify-content: flex-start;
+  gap: 9px;
+  padding: 6px 9px;
+  color: var(--text);
+  border: 1px solid var(--line);
+  background: var(--panel2);
+  box-shadow: none;
+}
+.newsolve:hover {
+  color: var(--bright);
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--line));
+  background: color-mix(in srgb, var(--accent) 7%, var(--panel2));
+}
+.newsolve-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 26px;
+  height: 26px;
+  color: var(--on-accent);
+  border-radius: 6px;
+  background: var(--accent);
+}
+.rail-search-input {
+  border: 1px solid transparent;
+  background: var(--panel2);
+  box-shadow: none;
+}
+.rail-search-input:focus {
+  border-color: color-mix(in srgb, var(--accent) 52%, var(--line));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 13%, transparent);
+}
+.rail-sec { text-transform: none; letter-spacing: .04em; }
+.rail-folder, .thread { gap: 1px; }
+.thread-item { min-height: 46px; border: 1px solid transparent; }
+.thread-item:hover { border-color: var(--line); background: var(--panel2); }
+.thread-item.active {
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--line));
+  background: color-mix(in srgb, var(--accent) 7%, var(--panel2));
+  box-shadow: none;
+}
+.thread-item.is-draft {
+  min-height: 42px;
+  justify-content: flex-start;
+  gap: 9px;
+  padding: 6px 9px;
+}
+.thread-item.is-draft.active {
+  border-color: color-mix(in srgb, var(--accent) 24%, var(--line));
+  background: color-mix(in srgb, var(--accent) 6%, var(--panel2));
+}
+.thread-item.is-draft .tk {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  color: var(--accent) !important;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.thread-item.is-draft .nm {
+  color: var(--text);
+  font-weight: 650;
+}
+.thread-item::before, .thread-item.active::before { display: none !important; }
+.thread-item .tk { color: var(--muted) !important; }
+.thread-item .sub .st { color: var(--muted); }
+.rail-foot { border-top-style: solid; }
+.rail-foot .dot { width: 6px; height: 6px; box-shadow: none; }
+
+.convo-top {
+  height: 56px;
+  min-height: 56px;
+  max-height: 56px;
+  border-bottom-style: solid;
+  border-bottom-color: var(--line);
+}
+.convo-view-switch { border-color: var(--line); background: var(--panel2); }
+.convo-view-switch .tabs__tab { color: var(--muted); }
+.convo-view-switch .tabs__tab[aria-selected="true"] { color: var(--bright); }
+.icon-btn:hover, .convo-top .lang-btn:hover, .btw-btn:hover {
+  color: var(--text);
+  border-color: var(--line);
+  background: var(--panel2);
+}
+
+.status-hero {
+  --sh-c: var(--muted) !important;
+  border-color: var(--line);
+  background: var(--panel);
+  box-shadow: none !important;
+}
+.status-hero:hover, .status-hero.open { background: var(--panel2); box-shadow: none; }
+.status-hero .sh-ico {
+  color: var(--muted);
+  border-color: var(--line);
+  background: var(--panel2);
+}
+.status-hero .sh-phase { color: var(--text); }
+.status-hero .sh-flow,
+.status-hero .sh-workers,
+.status-hero .sh-elapsed {
+  color: var(--muted);
+  border-color: var(--line);
+  background: transparent;
+}
+.status-hero .sh-dot { background: var(--green); }
+.status-hero .sh-main { overflow: hidden; }
+.status-hero .sh-results-toggle {
+  width: 100%; min-width: 0; min-height: 28px; display: grid;
+  grid-template-columns: max-content minmax(0, 1fr) max-content 16px;
+  align-items: center; gap: 8px; padding: 3px 5px; border: 0; border-radius: 6px;
+  color: var(--text); background: transparent; text-align: left;
+}
+.status-hero .sh-results-toggle:hover { background: var(--panel3); }
+.status-hero .sh-results-toggle:focus-visible { outline: 1px solid var(--line2); outline-offset: 1px; }
+.status-hero .sh-results-count { font-size: 10.5px; font-weight: 650; white-space: nowrap; }
+.status-hero .sh-results-preview {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--muted); font: 10.5px/1.3 var(--font-mono);
+}
+.status-hero .sh-results-more {
+  min-width: 24px; height: 20px; display: inline-flex; align-items: center; justify-content: center;
+  padding: 0 5px; border: 1px solid var(--line); border-radius: 5px;
+  color: var(--muted); background: var(--panel2); font: 650 9px/1 var(--font-mono);
+}
+.status-hero .sh-results-toggle svg { color: var(--dim); transition: transform var(--control-press-dur) var(--ease-out); }
+.status-hero-shell.results-open .sh-results-toggle svg { transform: rotate(180deg); }
+.sh-results-panel {
+  margin-top: 4px; overflow: hidden; border: 1px solid var(--line); border-radius: 9px;
+  background: var(--panel); box-shadow: var(--shadow-md);
+}
+.sh-results-head {
+  min-height: 34px; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 6px 10px; border-bottom: 1px solid var(--line); color: var(--muted);
+  background: var(--panel2); font-size: 10px; font-weight: 600;
+}
+.sh-results-head span { display: inline-flex; align-items: center; gap: 6px; }
+.sh-results-list { max-height: 184px; overflow: auto; }
+.sh-result-row {
+  min-width: 0; display: grid; grid-template-columns: 30px minmax(0, 1fr); align-items: stretch;
+  border-bottom: 1px solid var(--line);
+}
+.sh-result-row:last-child { border-bottom: 0; }
+.sh-result-index {
+  display: grid; place-items: center; color: var(--dim); border-right: 1px solid var(--line);
+  background: var(--panel2); font: 9px/1 var(--font-mono);
+}
+.sh-result-value.copytext {
+  width: 100%; min-height: 38px; justify-content: space-between; align-items: center;
+  padding: 7px 10px; border: 0; color: var(--text); background: transparent;
+  font: 11px/1.4 var(--font-mono); text-align: left;
+}
+.sh-result-value.copytext:hover { background: var(--panel2); }
+.sh-result-value.copytext .copytext-val { overflow-wrap: anywhere; }
+.sh-result-value.copytext .copytext-aff { opacity: .65; }
+
+.coord-wrap::before { background: var(--line); }
+.coord-bubble,
+.coord-bubble.you,
+.coord-bubble.coordinator,
+.coord-bubble.system {
+  border-left: 0 !important;
+  box-shadow: none !important;
+}
+.coord-bubble .coord-node,
+.coord-bubble.you .coord-node,
+.coord-bubble.coordinator .coord-node,
+.coord-bubble.system .coord-node,
+.coord-bubble.system.insight .coord-node,
+.coord-bubble.system.guidance .coord-node,
+.coord-bubble.system.status .coord-node {
+  color: var(--muted);
+  border-color: var(--line2);
+  background: var(--bg);
+  box-shadow: 0 0 0 4px var(--bg);
+}
+.coord-bubble.you .coord-node { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 38%, var(--line)); }
+.coord-bubble.you .who { color: var(--muted); }
+.coord-bubble.digest,
+.coord-bubble.answer,
+.coord-bubble.answer.none {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  box-shadow: none !important;
+}
+.coord-bubble.digest .coord-node { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 38%, var(--line)); }
+.coord-bubble.answer .coord-node { color: var(--green); border-color: color-mix(in srgb, var(--green) 38%, var(--line)); }
+.coord-bubble.answer .coord-digest-title,
+.coord-bubble.digest .coord-digest-title { color: var(--muted); }
+.coord-bubble.progress-brief {
+  align-self: stretch; max-width: none; min-height: 0; margin: 10px 0 8px;
+  padding: 12px 14px 11px; border: 1px solid var(--line); border-radius: 9px;
+  background: var(--panel); box-shadow: none;
+}
+.coord-bubble.progress-brief:hover { border-color: var(--line2); background: var(--panel); }
+.coord-bubble.progress-brief .coord-node {
+  color: var(--accent); border-color: color-mix(in srgb, var(--accent) 38%, var(--line));
+}
+.coord-bubble.progress-brief.kind-blocker .coord-node,
+.coord-bubble.progress-brief.kind-stalled .coord-node {
+  color: var(--amber); border-color: color-mix(in srgb, var(--amber) 42%, var(--line));
+}
+.progress-brief-head {
+  min-height: 20px; display: flex; align-items: center; gap: 8px;
+  color: var(--muted); font-size: 10px; font-weight: 560;
+}
+.progress-brief-head .k { color: var(--dim); }
+.progress-brief-head time { margin-left: auto; color: var(--dim); font: 9.5px/1 var(--font-mono); }
+.progress-brief-kind {
+  padding: 2px 6px; border: 1px solid var(--line); border-radius: 999px;
+  color: var(--muted); background: var(--panel2); font-size: 9px;
+}
+.progress-brief-summary { margin-top: 3px; color: var(--text); font-size: 12.5px; line-height: 1.5; }
+.progress-brief-details { margin-top: 9px; border-top: 1px solid var(--line); }
+.progress-brief-details [data-slot="accordion-item"] { border: 0; }
+.progress-brief-details [data-slot="accordion-trigger"] {
+  min-height: 32px; padding: 0; color: var(--muted); background: transparent;
+  font-size: 10.5px; font-weight: 600;
+}
+.progress-brief-details [data-slot="accordion-trigger"]:hover { color: var(--text); background: transparent; }
+.progress-brief-details [data-slot="accordion-trigger"]:focus-visible {
+  border-radius: 6px; outline: 2px solid var(--blue); outline-offset: 2px;
+}
+.progress-brief-details [data-slot="accordion-indicator"] { width: 14px; height: 14px; color: var(--dim); }
+.progress-brief-details [data-slot="accordion-body"] { padding: 0; }
+.progress-brief-details-body { padding: 0 0 1px; }
+.progress-brief-sections {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 18px;
+}
+.progress-brief-section { min-width: 0; padding: 9px 0 6px; }
+.progress-brief-section h3 {
+  display: flex; align-items: center; gap: 5px; margin: 0 0 5px;
+  color: var(--muted); font-size: 10px; font-weight: 620;
+}
+.progress-brief-section ul { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.progress-brief-section li {
+  min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start; gap: 8px; color: var(--text); font-size: 11.5px; line-height: 1.45;
+}
+.progress-brief-section li > span { min-width: 0; overflow-wrap: anywhere; }
+.progress-brief-section code {
+  max-width: 128px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--dim); font: 9px/1.45 var(--font-mono);
+}
+.progress-brief-details footer {
+  margin-top: 4px; color: var(--dim); font: 9px/1.4 var(--font-mono); text-align: right;
+}
+.coord-bubble.answer .ans-flag,
+.coord-bubble.answer .ans-flag.copytext,
+.coord-bubble.answer .ans-flag.goal.copytext {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 560;
+}
+
+.composer2,
+.composer2.command-composer { background: var(--bg); }
+.command-composer .command-wrap,
+.composer2 .wrap {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  box-shadow: none;
+}
+.command-composer .command-wrap:focus-within,
+.composer2 .wrap:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--line));
+  box-shadow: var(--shadow-pop);
+}
+.command-actionbar { background: var(--panel2); }
+.command-actionbar .quick button,
+.composer2 .quick button { color: var(--muted); background: transparent; border-color: transparent; }
+.command-actionbar .quick button:hover,
+.composer2 .quick button:hover { color: var(--text); border-color: transparent; background: var(--panel3); }
+.command-actionbar .quick button.primary,
+.composer2 .quick button.primary,
+.composer2 .send {
+  color: var(--on-accent, #fff);
+  border-color: var(--accent);
+  background: var(--accent);
+  box-shadow: none;
+}
+.command-actionbar .quick button.danger,
+.composer2 .quick button.danger { color: var(--muted); }
+.command-actionbar .quick button.danger:hover,
+.composer2 .quick button.danger:hover { color: var(--red); background: var(--panel3); }
+
+.run-inspector { background: var(--bg); }
+.insp-sec {
+  border-color: var(--line);
+  border-radius: 8px;
+  background: transparent;
+  box-shadow: none;
+}
+.insp-run-flag,
+.insp-run-flag.copytext,
+.insp-run-flag.goal,
+.insp-run-flag.pending {
+  width: 100%; max-width: 100%; min-width: 0; height: auto;
+  justify-content: flex-start; text-align: left;
+  white-space: normal; overflow-wrap: anywhere; word-break: break-all;
+  color: var(--text);
+  border-color: var(--line);
+  background: var(--panel2);
+  font-size: 12.5px;
+  font-weight: 560;
+}
+.insp-run-flag.copytext:hover,
+.insp-run-flag.goal.copytext:hover { border-color: var(--line2); }
+.insp-flag-false {
+  color: var(--red);
+  border-color: var(--line);
+  background: transparent;
+}
+.insp-flag-false:hover { border-color: color-mix(in srgb, var(--red) 42%, var(--line)); background: var(--panel2); }
+.insp-flag-count, .ans-flag-count { color: var(--muted); }
+.insp-chip,
+.insp-chip.verified,
+.insp-chip.candidates,
+.insp-chip.intents,
+.insp-chip.dead,
+.insp-chip.cost {
+  color: var(--muted);
+  border-color: var(--line);
+  background: transparent;
+}
+.insp-chip.verified svg { color: var(--green); }
+.insp-chip.candidates svg { color: var(--amber); }
+.insp-chip.intents svg { color: var(--accent); }
+.insp-chip.dead svg { color: var(--red); }
+.run-signals-strip-shell {
+  margin: 0 20px 8px;
+  flex: none;
+}
+.run-signals-strip {
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel) 85%, transparent);
+}
+@media (max-width: 768px) {
+  .run-signals-strip-shell {
+    margin: 0 10px 8px;
+    overflow-x: auto;
+  }
+  .run-signals-strip {
+    min-width: 520px;
+  }
+}
+.insp-panel-btn {
+  min-height: 40px;
+  color: var(--muted);
+  border-color: var(--line);
+  border-radius: 7px;
+  background: transparent;
+  box-shadow: none;
+}
+.insp-panel-btn:hover { color: var(--text); border-color: var(--line2); background: var(--panel2); }
+.insp-panel-btn.on {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--line));
+  background: color-mix(in srgb, var(--accent) 8%, var(--panel2));
+}
+.insp-panel-btn:hover .insp-panel-kbd,
+.insp-panel-btn.on .insp-panel-kbd { color: var(--muted); border-color: var(--line2); }
+
+@container coordcolumn (max-width: 430px) {
+  .progress-brief-sections { grid-template-columns: 1fr; }
+  .progress-brief-section code { max-width: 96px; }
+}

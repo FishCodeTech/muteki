@@ -10,6 +10,7 @@ disassembly or memory dump can be tens of thousands of tokens.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import uuid
 from pathlib import Path
@@ -47,6 +48,17 @@ class ArtifactStore:
     def size(self, artifact_id: str) -> int:
         p = self._find(artifact_id)
         return p.stat().st_size if p else 0
+
+    def sha256(self, artifact_id: str) -> Optional[str]:
+        """Digest the persisted artifact bytes used by evidence provenance."""
+        p = self._find(artifact_id)
+        if p is None:
+            return None
+        digest = hashlib.sha256()
+        with p.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
 
 class PeekResult(BaseModel):

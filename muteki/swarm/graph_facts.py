@@ -21,7 +21,8 @@ from typing import Any, Optional  # noqa: F401
 from muteki.models.solve_graph import Challenge, Evidence, SolveGraph  # noqa: F401
 from muteki.solver.result_codes import is_genuine_giveup  # noqa: F401
 from muteki.swarm.graph_defs import (  # noqa: F401
-    EV_FACT_ADDED, EV_HYP_PROPOSED, EV_HYP_REFUTED, EV_DEAD_END,
+    EV_FACT_ADDED, EV_FACT_OBSERVED, EV_FACT_PROMOTED, EV_OBSERVATION_ADDED,
+    EV_HYP_PROPOSED, EV_HYP_REFUTED, EV_DEAD_END,
     EV_INTENT_PROPOSED, EV_INTENT_CLAIMED, EV_INTENT_CONCLUDED,
     EV_FLAG_FOUND, EV_FLAG_INVALIDATED, EV_FLAG_SUBMISSION,
     EV_FLAG_SUBMISSION_DECISION,
@@ -32,6 +33,7 @@ from muteki.swarm.graph_defs import (  # noqa: F401
     EV_COORDINATOR_DIRECTIVE, EV_REVIEW_PROPOSAL, EV_REVIEW_PROPOSAL_DECISION,
     EV_LANE_LOCKED, EV_LANE_RELEASED, EV_INTENT_LANE_DEFERRED, EV_FACT_REJECTED,
     EV_FACT_MERGED, EV_FACT_SUPERSEDED, EV_FACT_PINNED, EV_INTENT_STATE_CHANGED,
+    REVIEW_FACT_MARKERS,
     EV_OPERATOR_DIRECTIVE, EV_OPERATOR_DIRECTIVE_STATUS, EV_HITL_CLASSIFIED,
     EV_RESOURCE_LOCKED, EV_RESOURCE_RELEASED, EV_GRAPH_COMPACTED,
     FACT_STATE_UNRESOLVED, FACT_STATE_CHALLENGED, FACT_STATE_REVALIDATED,
@@ -45,126 +47,791 @@ from muteki.swarm.graph_defs import (  # noqa: F401
 
 
 class _FactsMixin:
+    def ctf_artifact_digest(self, artifact_id: str) -> Optional[str]:
+        """Authorize a tool artifact only when this challenge cites its digest."""
+        if getattr(self.challenge, "mode", "ctf") != "ctf" or not re.fullmatch(
+            r"[0-9a-f]{12}", artifact_id
+        ):
+            return None
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT provenance_json FROM observations WHERE challenge_id=? "
+                "ORDER BY observation_seq DESC",
+                (self.challenge.id,),
+            ).fetchall()
+        for (raw_provenance,) in rows:
+            provenance = json.loads(raw_provenance or "{}")
+            for ref in provenance.get("artifact_refs") or []:
+                if not isinstance(ref, dict):
+                    continue
+                if ref.get("artifact_id") == artifact_id:
+                    digest = str(ref.get("sha256") or "")
+                    return digest if re.fullmatch(r"[0-9a-f]{64}", digest) else None
+        return None
+
+    def migrate_legacy_candidates(self) -> int:
+        """Convert pre-v2 unverified Fact rows into non-semantic Observations.
+
+        The original event remains append-only audit history; ``fact_states``
+        removes it from every active Fact view.
+        """
+        migrated = 0
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT seq,ts,actor,payload,artifact_id,confidence FROM events "
+                "WHERE challenge_id=? AND kind=? AND verified=0 ORDER BY seq",
+                (self.challenge.id, EV_FACT_ADDED),
+            ).fetchall()
+            for legacy_seq, ts, actor, raw_payload, artifact_id, confidence in rows:
+                try:
+                    payload = json.loads(raw_payload or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    payload = {}
+                text = str(payload.get("fact") or "").strip()
+                if not text:
+                    continue
+                dedupe = f"legacy-observation::{self.challenge.id}::{int(legacy_seq)}"
+                obs_payload = {
+                    "source": payload.get("source") or "legacy-fact",
+                    "text": text,
+                    "source_solver": actor,
+                    "intent_id": payload.get("intent_id") or "",
+                    "target_epoch": payload.get("target_epoch") or "legacy",
+                    "witness": payload.get("witness"),
+                    "artifact_id": artifact_id,
+                    "claimed_verified": False,
+                    "admitted": False,
+                    "canonical_key": payload.get("canonical_key")
+                    or _normalize_fact_identity(text),
+                    "legacy_fact_seq": int(legacy_seq),
+                    "evidence_provenance": payload.get("evidence_provenance") or {},
+                }
+                obs_seq = self._append_locked(
+                    EV_OBSERVATION_ADDED, str(actor or "migration"), obs_payload,
+                    artifact_id=artifact_id, verified=False,
+                    confidence=float(confidence or 0.4), dedupe_key=dedupe,
+                )
+                if obs_seq < 0:
+                    found = self._conn.execute(
+                        "SELECT seq FROM events WHERE dedupe_key=?", (dedupe,)
+                    ).fetchone()
+                    obs_seq = int(found[0]) if found else 0
+                if obs_seq > 0:
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO observations (observation_seq,challenge_id,actor,"
+                        "intent_id,target_epoch,text,witness,artifact_id,provenance_json,canonical_key,"
+                        "admitted_fact_seq,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?)",
+                        (obs_seq, self.challenge.id, str(actor or "migration"),
+                         str(payload.get("intent_id") or ""),
+                         str(payload.get("target_epoch") or "legacy"), text,
+                         payload.get("witness"), artifact_id,
+                         json.dumps(payload.get("evidence_provenance") or {}, default=str),
+                         obs_payload["canonical_key"], float(ts or time.time())),
+                    )
+                self._upsert_fact_state(
+                    int(legacy_seq), FACT_STATE_SUPERSEDED,
+                    reason="legacy candidate migrated to Observation",
+                    verified_effective=0, updated_seq=obs_seq or None,
+                )
+                migrated += 1
+            self._conn.commit()
+        return migrated
+
+    def _equivalent_fact_rows(
+        self, fact_identity: str, target_epoch: str,
+    ) -> list[dict[str, Any]]:
+        """Return the active canonical Fact for one normalized epoch identity."""
+        with self._lock:
+            return self._equivalent_fact_rows_locked(fact_identity, target_epoch)
+
+    def _equivalent_fact_rows_locked(
+        self, fact_identity: str, target_epoch: str,
+    ) -> list[dict[str, Any]]:
+        """``_equivalent_fact_rows`` with ``self._lock`` already held."""
+        rows = self._conn.execute(
+            "SELECT e.seq, e.verified, e.payload, fs.state, "
+            "fs.verified_effective FROM events e "
+            "LEFT JOIN fact_states fs ON fs.fact_seq=e.seq "
+            "WHERE e.challenge_id=? AND e.kind=? ORDER BY e.seq",
+            (self.challenge.id, EV_FACT_ADDED),
+        ).fetchall()
+        matches: list[dict[str, Any]] = []
+        for seq, original_verified, raw_payload, state, effective_verified in rows:
+            try:
+                payload = json.loads(str(raw_payload or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            stored_identity = str(payload.get("canonical_key") or "").strip().casefold()
+            if not stored_identity:
+                stored_identity = _normalize_fact_identity(str(payload.get("fact") or ""))
+            if stored_identity != fact_identity:
+                continue
+            row_provenance = payload.get("evidence_provenance")
+            row_epoch = str(
+                payload.get("target_epoch")
+                or (
+                    row_provenance.get("target_epoch")
+                    if isinstance(row_provenance, dict) else ""
+                )
+                or "legacy"
+            )
+            if row_epoch != target_epoch:
+                continue
+            lifecycle = str(state or FACT_STATE_UNRESOLVED)
+            if lifecycle in _FACT_TERMINAL_STATES or lifecycle == FACT_STATE_CHALLENGED:
+                continue
+            verified_now = bool(original_verified)
+            if effective_verified is not None:
+                verified_now = bool(effective_verified)
+            if not verified_now:
+                continue
+            matches.append({
+                "seq": int(seq),
+                "verified": verified_now,
+                "payload": payload,
+            })
+        return matches
+
+    def _valid_fact_provenance(
+        self, *, actor: str, intent_id: str, artifact_id: str,
+        provenance: dict[str, Any],
+    ) -> bool:
+        """Host-side validation for every binding required by Fact promotion."""
+        # tool_call_id / committed_at are pass-through audit fields: carried into
+        # the stored evidence_provenance but deliberately NOT gate inputs — the
+        # verified binding stays worker/intent/epoch/artifact-digest/event-seq.
+        if not provenance or not artifact_id or self.artifacts is None:
+            return False
+        if str(provenance.get("worker_id") or "") != str(actor or ""):
+            return False
+        if str(provenance.get("intent_id") or "") != str(intent_id or ""):
+            return False
+        target_epoch = str(provenance.get("target_epoch") or "")
+        if not target_epoch:
+            return False
+        if str(provenance.get("artifact_id") or "") != artifact_id:
+            return False
+        digest = str(provenance.get("artifact_sha256") or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            return False
+        try:
+            event_seq = int(provenance.get("tool_event_seq") or 0)
+            event_at = float(provenance.get("tool_event_ts") or 0.0)
+            observed_at = float(provenance.get("observed_at") or 0.0)
+            promoted_at = float(provenance.get("promoted_at") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if (event_seq <= 0 or event_at <= 0 or observed_at <= 0
+                or event_at + 1.0 < observed_at or promoted_at < event_at):
+            return False
+        if promoted_at > time.time() + 5.0:
+            return False
+        event_id = str(provenance.get("tool_event_id") or "")
+        if not event_id or event_id.rsplit(":", 1)[-1] != str(event_seq):
+            return False
+        try:
+            persisted_digest = self.artifacts.sha256(artifact_id)
+        except Exception:
+            return False
+        return bool(persisted_digest and persisted_digest == digest)
+
+    def _append_fact_observation_locked(
+        self, *, fact_seq: int, actor: str, source: str, fact: str,
+        artifact_id: Optional[str], verified: bool, confidence: float,
+        witness: Optional[str], verifier: str, intent_id: str,
+        target_epoch: str, provenance: dict[str, Any], observation_seq: int = 0,
+    ) -> int:
+        """Append the fold-observation with ``self._lock`` held and no commit
+        (transactional reuse from ``_add_evidence_locked``)."""
+        payload = {
+            "fact_seq": int(fact_seq),
+            "source": source,
+            "fact": fact,
+            "source_solver": actor,
+            "intent_id": intent_id,
+            "target_epoch": target_epoch,
+            "witness": witness,
+            "verifier": verifier,
+            "verified": bool(verified),
+            "evidence_provenance": provenance,
+            "observation_seq": int(observation_seq or 0),
+        }
+        observation_identity = "\x1f".join((
+            str(fact_seq), str(actor), str(intent_id),
+            str(provenance.get("tool_event_seq") or 0),
+            str(provenance.get("artifact_sha256") or ""),
+            str(int(bool(verified))),
+        ))
+        observation_key = hashlib.sha256(
+            observation_identity.encode("utf-8", errors="replace")
+        ).hexdigest()
+        seq = self._append_locked(
+            EV_FACT_OBSERVED, actor, payload,
+            artifact_id=artifact_id, verified=verified,
+            confidence=confidence,
+            dedupe_key=f"fact-observed::{self.challenge.id}::{observation_key}",
+        )
+        if observation_seq > 0:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO fact_evidence (fact_seq,observation_seq,challenge_id) "
+                "VALUES (?,?,?)",
+                (int(fact_seq), int(observation_seq), self.challenge.id),
+            )
+            self._conn.execute(
+                "UPDATE observations SET admitted_fact_seq=? WHERE observation_seq=? "
+                "AND challenge_id=?",
+                (int(fact_seq), int(observation_seq), self.challenge.id),
+            )
+        return seq
+
+    def _promote_canonical_fact_locked(
+        self, *, fact_seq: int, actor: str, source: str, fact: str,
+        artifact_id: str, confidence: float, witness: Optional[str],
+        verifier: str, intent_id: str, target_epoch: str,
+        provenance: dict[str, Any],
+    ) -> int:
+        """Promote a canonical Fact with ``self._lock`` held and no commit
+        (transactional reuse from ``_add_evidence_locked``)."""
+        payload = {
+            "fact_seq": int(fact_seq),
+            "source": source,
+            "fact": fact,
+            "source_solver": actor,
+            "intent_id": intent_id,
+            "target_epoch": target_epoch,
+            "witness": witness,
+            "verifier": verifier,
+            "evidence_provenance": provenance,
+        }
+        seq = self._append_locked(
+            EV_FACT_PROMOTED, actor, payload,
+            artifact_id=artifact_id, verified=True,
+            confidence=confidence,
+            dedupe_key=(
+                f"fact-promoted::{self.challenge.id}::{fact_seq}::{target_epoch}"
+            ),
+        )
+        update_seq = seq if seq > 0 else None
+        review = self._conn.execute(
+            "SELECT status FROM fact_reviews WHERE challenge_id=? AND fact_seq=?",
+            (self.challenge.id, int(fact_seq)),
+        ).fetchone()
+        if review is not None and str(review[0] or "") == "challenged":
+            self._conn.execute(
+                "UPDATE fact_reviews SET status='revalidated', "
+                "revalidated_seq=COALESCE(?, revalidated_seq), reason=? "
+                "WHERE challenge_id=? AND fact_seq=?",
+                (update_seq, "promoted by bound tool evidence",
+                 self.challenge.id, int(fact_seq)),
+            )
+        lifecycle_state = (
+            FACT_STATE_REVALIDATED
+            if review is not None and str(review[0] or "") == "challenged"
+            else FACT_STATE_UNRESOLVED
+        )
+        self._upsert_fact_state(
+            int(fact_seq),
+            state=lifecycle_state,
+            verified_effective=1,
+            confidence_effective=float(confidence),
+            revalidated_seq=update_seq,
+            reason="promoted by bound tool evidence",
+            updated_seq=update_seq,
+        )
+        return seq
+
     def add_evidence(self, *, actor: str, source: str, fact: str,
                      artifact_id: Optional[str] = None, verified: bool = False,
                      confidence: float = 1.0, witness: Optional[str] = None,
                      verifier: str = "", route_hash: str = "",
-                     intent_id: Optional[str] = None) -> int:
-        route = self.normalize_route_hash(route_hash) if route_hash else ""
-        if not verified:
-            if route:
-                with self._lock:
-                    row = self._conn.execute(
-                        "SELECT COUNT(*) FROM events "
-                        "WHERE challenge_id=? AND kind=? AND actor=? AND verified=0 "
-                        "AND json_extract(payload,'$.route_hash')=?",
-                        (self.challenge.id, EV_FACT_ADDED, actor, route),
-                    ).fetchone()
-                if int(row[0] if row else 0) >= self.CANDIDATE_CAP_PER_SOURCE_ROUTE:
-                    return -1
-            else:
-                # 刀7: route-less candidates used to skip the cap entirely. Bound the
-                # per-actor catch-all bucket (route_hash absent/NULL) too.
-                with self._lock:
-                    row = self._conn.execute(
-                        "SELECT COUNT(*) FROM events "
-                        "WHERE challenge_id=? AND kind=? AND actor=? AND verified=0 "
-                        "AND (json_extract(payload,'$.route_hash') IS NULL "
-                        "     OR json_extract(payload,'$.route_hash')='')",
-                        (self.challenge.id, EV_FACT_ADDED, actor),
-                    ).fetchone()
-                if int(row[0] if row else 0) >= self.CANDIDATE_CAP_PER_SOURCE_NOROUTE:
-                    return -1
-        payload = {"source": source, "fact": fact, "source_solver": actor,
-                   "witness": witness, "verifier": verifier}
-        if route:
-            payload["route_hash"] = route
+                     intent_id: Optional[str] = None,
+                     provenance: Optional[dict[str, Any]] = None,
+                     subject: str = "", predicate: str = "",
+                     object_value: Any = None, scope: str = "",
+                     canonical_key: str = "") -> int:
+        """Store every claim as an Observation and return an admitted Fact id.
+
+        ``0`` means the Observation was retained but evidence admission failed.
+        This is intentionally different from ``-1`` (invalid/rejected request).
+        """
+        with self._lock:
+            try:
+                product_seq = self._add_evidence_locked(
+                    actor=actor, source=source, fact=fact,
+                    artifact_id=artifact_id, verified=verified,
+                    confidence=confidence, witness=witness, verifier=verifier,
+                    route_hash=route_hash, intent_id=intent_id,
+                    provenance=provenance,
+                    subject=subject, predicate=predicate,
+                    object_value=object_value, scope=scope,
+                    canonical_key=canonical_key,
+                )
+            except BaseException:
+                self._conn.rollback()
+                raise
+            self._conn.commit()
+            return product_seq
+
+    @staticmethod
+    def _independent_verifier(*, actor: str, verified: bool, verifier: str,
+                              rows: list[dict[str, Any]]) -> str:
+        """A verified re-observation by a worker other than the canonical
+        producer is an independent check; name that worker as the verifier when
+        the caller did not, so the board can attribute the verification."""
+        if verifier or not verified or not rows:
+            return verifier
+        canonical = next((row for row in rows if row["verified"]), rows[0])
+        producer = str((canonical.get("payload") or {}).get("source_solver") or "")
+        if producer and producer != actor:
+            return actor
+        return verifier
+
+    def _add_evidence_locked(self, *, actor: str, source: str, fact: str,
+                             artifact_id: Optional[str] = None,
+                             verified: bool = False, confidence: float = 1.0,
+                             witness: Optional[str] = None, verifier: str = "",
+                             route_hash: str = "", intent_id: Optional[str] = None,
+                             provenance: Optional[dict[str, Any]] = None,
+                             subject: str = "", predicate: str = "",
+                             object_value: Any = None, scope: str = "",
+                             canonical_key: str = "") -> int:
+        """Observation/Fact admission with one caller-owned transaction."""
         iid = (intent_id or "").strip()
-        if iid:
-            payload["intent_id"] = iid
-        # dedupe on fact IDENTITY (who-said-what), normalized to collapse the
-        # skill/marker double-write: strip the "[engine]" tag, fold whitespace, drop
-        # case; artifact_id is NOT part of identity. So a worker's bare verified skill
-        # fact and its prefixed VERIFIED_FACT marker echo land on ONE key.
-        fact_identity = _normalize_fact_identity(fact)
-        dk = f"fact::{actor}::{fact_identity}"
-        dedupe_key = dk
-        superseded_candidate_seq: int | None = None
-        if verified:
-            with self._lock:
-                row = self._conn.execute(
-                    "SELECT seq, verified FROM events WHERE challenge_id=? AND kind=? "
-                    "AND dedupe_key=? ORDER BY seq LIMIT 1",
-                    (self.challenge.id, EV_FACT_ADDED, dk),
-                ).fetchone()
-            if row and not int(row[1] or 0):
-                superseded_candidate_seq = int(row[0])
-                dedupe_key = f"fact-verified::{actor}::{fact_identity}"
-        seq = self._append(EV_FACT_ADDED, actor, payload,
-                           artifact_id=artifact_id, verified=verified,
-                           confidence=confidence, dedupe_key=dedupe_key)
-        if seq <= 0:
-            # Collided with an existing fact of the same identity. The echo is
-            # dropped; verified-after-candidate is represented by a separate
-            # fact-verified event, never by mutating the original event row.
-            pass
-        elif superseded_candidate_seq is not None:
-            self.supersede_fact(
-                actor=actor,
-                fact_seq=superseded_candidate_seq,
-                reason="verified duplicate supersedes unverified candidate",
-                by_fact_seq=seq,
+        evidence_provenance = dict(provenance or {})
+        target_epoch = str(evidence_provenance.get("target_epoch") or scope or "legacy")
+        if getattr(self.challenge, "mode", "ctf") == "ctf":
+            fact = str(fact or "")
+            if not fact.strip():
+                return -1
+            observation_identity = hashlib.sha256(
+                "\x1f".join((actor, iid, target_epoch, fact,
+                            str(bool(verified)))).encode("utf-8")
+            ).hexdigest()
+            observation_seq = self._append_locked(
+                EV_OBSERVATION_ADDED,
+                actor,
+                {"source": source, "text": fact, "source_solver": actor,
+                 "intent_id": iid, "target_epoch": target_epoch,
+                 "claimed_verified": bool(verified),
+                 "evidence_provenance": evidence_provenance},
+                artifact_id=artifact_id,
+                verified=bool(verified),
+                dedupe_key=f"ctf-observation::{self.challenge.id}::{observation_identity}",
             )
-        product_seq = seq
-        if product_seq <= 0 and iid:
-            with self._lock:
+            if observation_seq < 0:
                 row = self._conn.execute(
-                    "SELECT seq FROM events WHERE challenge_id=? AND kind=? "
-                    "AND dedupe_key IN (?,?) ORDER BY seq DESC LIMIT 1",
-                    (
-                        self.challenge.id,
-                        EV_FACT_ADDED,
-                        dedupe_key,
-                        f"fact-verified::{actor}::{fact_identity}",
-                    ),
+                    "SELECT seq FROM events WHERE challenge_id=? AND dedupe_key=?",
+                    (self.challenge.id,
+                     f"ctf-observation::{self.challenge.id}::{observation_identity}"),
                 ).fetchone()
-            product_seq = int(row[0]) if row else -1
-        if product_seq > 0 and iid:
-            with self._lock:
+                observation_seq = int(row[0]) if row else 0
+            if observation_seq <= 0:
+                raise RuntimeError("CTF Observation append failed")
+            self._conn.execute(
+                "INSERT OR IGNORE INTO observations "
+                "(observation_seq,challenge_id,actor,intent_id,target_epoch,"
+                "text,witness,artifact_id,provenance_json,canonical_key,"
+                "admitted_fact_seq,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?)",
+                (observation_seq, self.challenge.id, actor, iid, target_epoch,
+                 fact, witness, artifact_id,
+                 json.dumps(evidence_provenance, ensure_ascii=False, default=str),
+                 observation_identity, time.time()),
+            )
+            self._last_observation_seq = observation_seq
+            if not verified:
+                return 0
+            payload = {
+                "source": source,
+                "fact": fact,
+                "source_solver": actor,
+                "intent_id": iid,
+                "observation_seq": observation_seq,
+                "evidence_provenance": evidence_provenance,
+            }
+            identity = hashlib.sha256(
+                "\x1f".join((actor, iid, fact)).encode(
+                    "utf-8", errors="replace"
+                )
+            ).hexdigest()
+            dedupe_key = f"ctf-fact::{self.challenge.id}::{identity}"
+            product_seq = self._append_locked(
+                EV_FACT_ADDED,
+                actor,
+                payload,
+                artifact_id=artifact_id,
+                verified=True,
+                confidence=float(confidence or 1.0),
+                dedupe_key=dedupe_key,
+            )
+            if product_seq < 0:
+                row = self._conn.execute(
+                    "SELECT seq FROM events WHERE challenge_id=? AND dedupe_key=?",
+                    (self.challenge.id, dedupe_key),
+                ).fetchone()
+                product_seq = int(row[0]) if row else -1
+            if product_seq > 0 and iid:
                 self._conn.execute(
                     "INSERT OR IGNORE INTO intent_products "
                     "(intent_id, fact_seq) VALUES (?,?)",
                     (iid, product_seq),
                 )
-                self._conn.commit()
-        return seq
+            if product_seq > 0:
+                self._conn.execute(
+                    "UPDATE observations SET admitted_fact_seq=? "
+                    "WHERE challenge_id=? AND observation_seq=?",
+                    (product_seq, self.challenge.id, observation_seq),
+                )
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO fact_evidence "
+                    "(fact_seq,observation_seq,challenge_id) VALUES (?,?,?)",
+                    (product_seq, observation_seq, self.challenge.id),
+                )
+            return product_seq
 
-    def add_dead_end(self, *, actor: str, reason: str) -> int:
-        if self._has_near_duplicate_dead_end(reason):
+        route = self.normalize_route_hash(route_hash) if route_hash else ""
+        claimed_verified = bool(verified)
+        if (verified
+                and getattr(self.challenge, "mode", "ctf") != "ctf"
+                and not self._valid_fact_provenance(
+            actor=actor,
+            intent_id=iid,
+            artifact_id=str(artifact_id or ""),
+            provenance=evidence_provenance,
+        )):
+            # Every promotion must carry one host-checkable tool-event binding.
+            verified = False
+            confidence = min(float(confidence or 0.4), 0.4)
+
+        clean_subject = " ".join(str(subject or "").split())[:1000]
+        clean_predicate = " ".join(str(predicate or "").split()).casefold()[:160]
+        clean_scope = " ".join(str(scope or target_epoch).split())[:300]
+        supplied_key = " ".join(str(canonical_key or "").split()).casefold()[:1000]
+        if supplied_key:
+            fact_identity = supplied_key
+        elif clean_subject and clean_predicate:
+            fact_identity = "structured:" + hashlib.sha256(
+                json.dumps(
+                    [clean_subject.casefold(), clean_predicate, object_value, clean_scope],
+                    ensure_ascii=False, sort_keys=True, default=str,
+                ).encode("utf-8", errors="replace")
+            ).hexdigest()
+        else:
+            fact_identity = _normalize_fact_identity(fact)
+        identity_digest = hashlib.sha256(
+            f"{target_epoch}\x1f{fact_identity}".encode(
+                "utf-8", errors="replace")
+        ).hexdigest()
+
+        observation_payload = {
+            "source": source, "text": fact, "source_solver": actor,
+            "intent_id": iid, "target_epoch": target_epoch, "witness": witness,
+            "artifact_id": artifact_id, "claimed_verified": claimed_verified,
+            "admitted": bool(verified), "canonical_key": fact_identity,
+            "evidence_provenance": evidence_provenance,
+        }
+        observation_identity = "\x1f".join((
+            actor, iid, target_epoch,
+            str(evidence_provenance.get("tool_event_seq") or 0),
+            str(evidence_provenance.get("artifact_sha256") or ""),
+            identity_digest,
+        ))
+        observation_key = hashlib.sha256(
+            observation_identity.encode("utf-8", errors="replace")
+        ).hexdigest()
+        observation_seq = self._append_locked(
+            EV_OBSERVATION_ADDED, actor, observation_payload,
+            artifact_id=artifact_id, verified=verified, confidence=confidence,
+            dedupe_key=f"observation::{self.challenge.id}::{observation_key}",
+        )
+        if observation_seq < 0:
+            row = self._conn.execute(
+                "SELECT seq FROM events WHERE challenge_id=? AND dedupe_key=?",
+                (self.challenge.id, f"observation::{self.challenge.id}::{observation_key}"),
+            ).fetchone()
+            observation_seq = int(row[0]) if row else 0
+        if observation_seq > 0:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO observations (observation_seq,challenge_id,actor,intent_id,"
+                "target_epoch,text,witness,artifact_id,provenance_json,canonical_key,"
+                "admitted_fact_seq,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?)",
+                (observation_seq, self.challenge.id, actor, iid, target_epoch, fact,
+                 witness, artifact_id, json.dumps(evidence_provenance, default=str),
+                 fact_identity, time.time()),
+            )
+        self._last_observation_seq = observation_seq
+        if not verified:
+            return 0
+
+        existing = self._equivalent_fact_rows_locked(fact_identity, target_epoch)
+        verifier = self._independent_verifier(
+            actor=actor, verified=True, verifier=verifier, rows=existing)
+        payload = {"source": source, "fact": fact, "source_solver": actor,
+                   "witness": witness, "verifier": verifier,
+                   "target_epoch": target_epoch, "canonical_key": fact_identity,
+                   "subject": clean_subject, "predicate": clean_predicate,
+                   "object": object_value, "scope": clean_scope}
+        if route:
+            payload["route_hash"] = route
+        if iid:
+            payload["intent_id"] = iid
+        payload["claimed_verified"] = claimed_verified
+        if evidence_provenance:
+            payload["evidence_provenance"] = evidence_provenance
+        # Dedupe on fact identity across the challenge, normalized to collapse the
+        # skill/marker double-write: strip the "[engine]" tag, fold whitespace, drop
+        # case; actor and artifact_id are provenance, not identity. This also keeps
+        # two Workers from adding separate rows for the same observation.
+        payload["fact_identity_sha256"] = identity_digest
+        dk = f"fact-v2::{self.challenge.id}::{identity_digest}"
+        prior_identity = self._conn.execute(
+            "SELECT e.seq,COALESCE(fs.state,?) FROM events e "
+            "LEFT JOIN fact_states fs ON fs.fact_seq=e.seq "
+            "WHERE e.challenge_id=? AND e.dedupe_key=? LIMIT 1",
+            (FACT_STATE_UNRESOLVED, self.challenge.id, dk),
+        ).fetchone()
+        existing_verified = next(
+            (row for row in existing if row["verified"]), None)
+        product_seq = 0
+        if existing_verified is not None:
+            product_seq = int(existing_verified["seq"])
+            self._append_fact_observation_locked(
+                fact_seq=product_seq, actor=actor, source=source, fact=fact,
+                artifact_id=artifact_id, verified=True,
+                confidence=confidence, witness=witness, verifier=verifier,
+                intent_id=iid, target_epoch=target_epoch,
+                provenance=evidence_provenance, observation_seq=observation_seq,
+            )
+        elif prior_identity is not None and str(prior_identity[1]) == FACT_STATE_CHALLENGED:
+            # A fresh, bound observation can resolve a challenged Fact while
+            # retaining its stable fact_seq.  This is the explicit review
+            # lifecycle; normal observations never use fact_promoted.
+            product_seq = int(prior_identity[0])
+            self._append_fact_observation_locked(
+                fact_seq=product_seq, actor=actor, source=source, fact=fact,
+                artifact_id=artifact_id, verified=True, confidence=confidence,
+                witness=witness, verifier=verifier, intent_id=iid,
+                target_epoch=target_epoch, provenance=evidence_provenance,
+                observation_seq=observation_seq,
+            )
+            revalidated_payload = {
+                "fact_seq": product_seq, "status": "revalidated",
+                "reason": "fresh bound tool evidence",
+                "revalidated_by": actor, "observation_seq": observation_seq,
+                "evidence_provenance": evidence_provenance,
+            }
+            revalidated_seq = self._append_locked(
+                EV_FACT_REVALIDATED, actor, revalidated_payload,
+                artifact_id=artifact_id, verified=True, confidence=confidence,
+                dedupe_key=(
+                    f"fact-revalidated-evidence::{self.challenge.id}::"
+                    f"{product_seq}::{observation_seq}"
+                ),
+            )
+            self._conn.execute(
+                "UPDATE fact_reviews SET status='revalidated',revalidated_seq=?,reason=? "
+                "WHERE challenge_id=? AND fact_seq=?",
+                (revalidated_seq if revalidated_seq > 0 else None,
+                 "fresh bound tool evidence", self.challenge.id, product_seq),
+            )
+            self._upsert_fact_state(
+                product_seq, FACT_STATE_REVALIDATED,
+                reason="fresh bound tool evidence", verified_effective=1,
+                confidence_effective=float(confidence),
+                revalidated_seq=revalidated_seq if revalidated_seq > 0 else None,
+                updated_seq=revalidated_seq if revalidated_seq > 0 else None,
+            )
+        else:
+            if prior_identity is not None:
+                # A rejected/merged/superseded historical Fact remains in the
+                # audit log.  Fresh admitted evidence starts a new canonical
+                # version instead of being blocked by the old dedupe row.
+                dk = f"{dk}::reassert::{observation_seq}"
+            seq = self._append_locked(
+                EV_FACT_ADDED, actor, payload,
+                artifact_id=artifact_id, verified=True,
+                confidence=confidence, dedupe_key=dk,
+            )
+            if seq > 0:
+                product_seq = seq
+                self._upsert_fact_state(
+                    product_seq, state=FACT_STATE_UNRESOLVED,
+                    verified_effective=1, confidence_effective=float(confidence),
+                    reason="admitted by bound tool evidence", updated_seq=seq,
+                )
+            else:
+                refreshed = self._equivalent_fact_rows_locked(
+                    fact_identity, target_epoch)
+                verifier = self._independent_verifier(
+                    actor=actor, verified=True, verifier=verifier,
+                    rows=refreshed)
+                preferred = next(
+                    (row for row in refreshed if row["verified"]), None)
+                if preferred is not None:
+                    product_seq = int(preferred["seq"])
+            if product_seq > 0:
+                self._append_fact_observation_locked(
+                    fact_seq=product_seq, actor=actor, source=source, fact=fact,
+                    artifact_id=artifact_id, verified=True, confidence=confidence,
+                    witness=witness, verifier=verifier, intent_id=iid,
+                    target_epoch=target_epoch, provenance=evidence_provenance,
+                    observation_seq=observation_seq,
+                )
+        # A FACT_CHALLENGE verifier may phrase its evidence differently from the
+        # original candidate, so actor/text dedupe cannot close that lifecycle.
+        # Any evidence-backed fact produced by the challenge's dedicated intent
+        # replaces the old candidate.  A verifier that finds no verified result
+        # leaves the challenge open.
+        if product_seq > 0 and iid:
+            challenged = self._conn.execute(
+                "SELECT fact_seq FROM fact_reviews "
+                "WHERE challenge_id=? AND status='challenged' "
+                "AND verification_intent_id=? ORDER BY fact_seq LIMIT 1",
+                (self.challenge.id, iid),
+            ).fetchone()
+            if challenged is not None:
+                challenged_seq = int(challenged[0])
+                if challenged_seq != product_seq:
+                    self._supersede_fact_locked(
+                        actor=actor,
+                        fact_seq=challenged_seq,
+                        reason="verifier evidence supersedes challenged fact",
+                        by_fact_seq=product_seq,
+                    )
+        if product_seq > 0 and iid:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO intent_products "
+                "(intent_id, fact_seq) VALUES (?,?)",
+                (iid, product_seq),
+            )
+        return product_seq
+
+    def add_dead_end(self, *, actor: str, reason: str, intent_id: str = "",
+                     route_hash: str = "", coverage_key: str = "",
+                     target_epoch: str = "", tested_scope: str = "",
+                     observed_result: str = "") -> int:
+        with self._lock:
+            try:
+                seq = self._add_dead_end_locked(
+                    actor=actor, reason=reason, intent_id=intent_id,
+                    route_hash=route_hash, coverage_key=coverage_key,
+                    target_epoch=target_epoch, tested_scope=tested_scope,
+                    observed_result=observed_result,
+                )
+            except BaseException:
+                self._conn.rollback()
+                raise
+            self._conn.commit()
+            return seq
+
+    def _add_dead_end_locked(self, *, actor: str, reason: str,
+                             intent_id: str = "", route_hash: str = "",
+                             coverage_key: str = "",
+                             target_epoch: str = "", tested_scope: str = "",
+                             observed_result: str = "") -> int:
+        """``add_dead_end`` body with ``self._lock`` held and no commit. The
+        payload always carries the intent/route/coverage/epoch binding (empty
+        strings when unscoped) so consumers can scope the dead end by it."""
+        iid = str(intent_id or "").strip()
+        if getattr(self.challenge, "mode", "ctf") == "ctf":
+            reason = str(reason or "").strip()
+            tested = str(tested_scope or "").strip()
+            observed = str(observed_result or "").strip()
+            if not reason or not tested or not observed:
+                return -1
+            digest = hashlib.sha256(
+                "\x1f".join((actor, iid, reason, tested, observed)).encode(
+                    "utf-8", errors="replace"
+                )
+            ).hexdigest()
+            return self._append_locked(
+                EV_DEAD_END,
+                actor,
+                {"reason": reason, "tested_scope": tested,
+                 "observed_result": observed, "intent_id": iid,
+                 "target_epoch": str(target_epoch or "").strip()},
+                dedupe_key=f"ctf-deadend::{self.challenge.id}::{digest}",
+            )
+        route = (
+            self.normalize_route_hash(str(route_hash))
+            if str(route_hash or "").strip() else ""
+        )
+        coverage = " ".join(str(coverage_key or "").split()).casefold()
+        epoch = str(target_epoch or "").strip()
+        tested = str(tested_scope or "").strip()
+        observed = str(observed_result or "").strip()
+        if self._has_near_duplicate_dead_end_locked(
+            reason, intent_id=iid, route_hash=route,
+            coverage_key=coverage, target_epoch=epoch,
+        ):
             return -1
-        return self._append(EV_DEAD_END, actor, {"reason": reason},
-                            dedupe_key=f"deadend::{reason}")
+        payload = {
+            "reason": reason,
+            "tested_scope": tested,
+            "observed_result": observed,
+            "intent_id": iid,
+            "route_hash": route,
+            "coverage_key": coverage,
+            "target_epoch": epoch,
+        }
+        identity = json.dumps(
+            [iid, route, coverage, epoch, self._norm_dead_end_text(reason)],
+            ensure_ascii=False, separators=(",", ":"),
+        )
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        return self._append_locked(EV_DEAD_END, actor, payload,
+                                   dedupe_key=f"deadend::{digest}")
 
     @staticmethod
     def _norm_dead_end_text(text: str) -> str:
-        s = (text or "").strip().lower()
+        s = (text or "").strip().casefold()
         s = re.sub(r"\bthree\b", "3", s)
         s = re.sub(r"\btwo\b", "2", s)
         s = re.sub(r"\bone\b", "1", s)
-        s = re.sub(r"[^a-z0-9]+", " ", s)
+        # Python's Unicode-aware ``\w`` retains Chinese and other non-Latin
+        # evidence text.  ASCII-only normalization made every Chinese reason an
+        # empty identity and collapsed unrelated dead ends in the same scope.
+        s = re.sub(r"[\W_]+", " ", s)
         return re.sub(r"\s+", " ", s).strip()
 
-    def _has_near_duplicate_dead_end(self, reason: str, *, threshold: float = 0.92) -> bool:
+    def _has_near_duplicate_dead_end(
+        self, reason: str, *, intent_id: str = "", route_hash: str = "",
+        coverage_key: str = "", target_epoch: str = "",
+        threshold: float = 0.92,
+    ) -> bool:
+        with self._lock:
+            return self._has_near_duplicate_dead_end_locked(
+                reason, intent_id=intent_id, route_hash=route_hash,
+                coverage_key=coverage_key, target_epoch=target_epoch,
+                threshold=threshold)
+
+    def _has_near_duplicate_dead_end_locked(
+        self, reason: str, *, intent_id: str = "", route_hash: str = "",
+        coverage_key: str = "", target_epoch: str = "",
+        threshold: float = 0.92,
+    ) -> bool:
+        """``_has_near_duplicate_dead_end`` with ``self._lock`` already held."""
         target = self._norm_dead_end_text(reason)
         if not target:
             return False
+        iid = str(intent_id or "").strip()
+        route = (
+            self.normalize_route_hash(str(route_hash))
+            if str(route_hash or "").strip() else ""
+        )
+        coverage = " ".join(str(coverage_key or "").split()).casefold()
+        epoch = str(target_epoch or "").strip()
         target_nums = set(re.findall(r"\b\d+\b", target))
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT json_extract(payload,'$.reason') FROM events "
-                "WHERE challenge_id=? AND kind=? ORDER BY seq DESC LIMIT 200",
-                (self.challenge.id, EV_DEAD_END),
-            ).fetchall()
+        rows = self._conn.execute(
+            "SELECT json_extract(payload,'$.reason') FROM events "
+            "WHERE challenge_id=? AND kind=? "
+            "AND COALESCE(json_extract(payload,'$.intent_id'),'')=? "
+            "AND COALESCE(json_extract(payload,'$.route_hash'),'')=? "
+            "AND COALESCE(json_extract(payload,'$.coverage_key'),'')=? "
+            "AND COALESCE(json_extract(payload,'$.target_epoch'),'')=? "
+            "ORDER BY seq DESC LIMIT 200",
+            (self.challenge.id, EV_DEAD_END, iid, route, coverage, epoch),
+        ).fetchall()
         for (old_reason,) in rows:
             old = self._norm_dead_end_text(str(old_reason or ""))
             if not old:
@@ -178,24 +845,52 @@ class _FactsMixin:
 
     def flag_found(self, *, actor: str, flag: str,
                    artifact_id: Optional[str] = None,
-                   intent_id: Optional[str] = None) -> int:
+                   intent_id: Optional[str] = None,
+                   complete_intent: bool = False) -> int:
+        """Persist a distinct Flag and, when complete, close its Intent atomically."""
         payload = {"flag": flag}
         if intent_id:
             payload["intent_id"] = intent_id
-        return self._append(EV_FLAG_FOUND, actor, payload,
-                            artifact_id=artifact_id, verified=True,
-                            dedupe_key=f"flag::{flag}")
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                seq = self._append_locked(
+                    EV_FLAG_FOUND,
+                    actor,
+                    payload,
+                    artifact_id=artifact_id,
+                    verified=True,
+                    dedupe_key=f"flag::{flag}",
+                )
+                if seq < 0:
+                    self._conn.rollback()
+                    return seq
+                if complete_intent and intent_id:
+                    self._conclude_intent_locked(
+                        actor=actor,
+                        intent_id=str(intent_id),
+                        result="solved",
+                        result_detail=(
+                            "Configured Flag count reached by explicit submission."
+                        ),
+                    )
+                self._conn.commit()
+                return seq
+            except BaseException:
+                self._conn.rollback()
+                raise
 
     def flag_submission(
         self, *, actor: str, submission_id: str, flag: str,
         intent_id: Optional[str] = None,
+        protocol: str = "blackboard-api-v1",
     ) -> int:
         """Record one unverified Worker API request through the host DB owner."""
         payload = {
             "submission_id": str(submission_id),
             "flag": str(flag),
             "intent_id": str(intent_id or ""),
-            "protocol": "blackboard-api-v1",
+            "protocol": str(protocol or "blackboard-api-v1"),
         }
         return self._append(
             EV_FLAG_SUBMISSION,
@@ -222,6 +917,169 @@ class _FactsMixin:
             verified=bool(accepted),
             dedupe_key=f"flag-submission-decision::{submission_id}",
         )
+
+    def resolve_flag_submission(
+        self, *, actor: str, submission_id: str, flag: str,
+        intent_id: Optional[str] = None,
+        protocol: str = "blackboard-api-v1",
+        accepted: bool, code: str, detail: str = "",
+        ensure_submission: bool = True,
+    ) -> dict[str, Any]:
+        """Commit one Flag submission's authoritative terminal state atomically.
+
+        Submission IDs are idempotency keys, not mutable request handles.  A retry
+        must therefore return the original decision rather than recomputing a new
+        verdict against different evidence.  When the decision is accepted, its
+        durable ``flag_found`` projection is written in the same SQLite transaction;
+        a process crash cannot leave an accepted decision stranded without a Flag.
+
+        The returned dictionary contains the canonical decision already stored in
+        the graph.  Callers must project *that* decision to the event bus instead of
+        trusting their tentative verdict.
+        """
+        sid = str(submission_id or "")
+        candidate = str(flag or "")
+        owner = str(actor or "")
+        intent = str(intent_id or "")
+        wire_protocol = str(protocol or "blackboard-api-v1")
+        submit_key = f"flag-submission::{sid}"
+        decision_key = f"flag-submission-decision::{sid}"
+        flag_key = f"flag::{candidate}"
+
+        def _payload(row: Any) -> dict[str, Any]:
+            try:
+                value = json.loads(str(row or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                value = {}
+            return value if isinstance(value, dict) else {}
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                submission_row = self._conn.execute(
+                    "SELECT seq, actor, payload FROM events WHERE dedupe_key=?",
+                    (submit_key,),
+                ).fetchone()
+                submission_seq = 0
+                if submission_row is not None:
+                    submission_seq = int(submission_row[0] or 0)
+                    prior_actor = str(submission_row[1] or "")
+                    prior = _payload(submission_row[2])
+                    prior_flag = str(prior.get("flag") or "")
+                    prior_protocol = str(
+                        prior.get("protocol") or "blackboard-api-v1")
+                    if (prior_actor != owner or prior_flag != candidate
+                            or prior_protocol != wire_protocol):
+                        self._conn.commit()
+                        return {
+                            "submission_seq": submission_seq,
+                            "decision_seq": 0,
+                            "flag_found_seq": 0,
+                            "accepted": False,
+                            "code": "submission_conflict",
+                            "detail": (
+                                "submission id is already bound to a different "
+                                "candidate or owner"
+                            ),
+                            "created": False,
+                        }
+                elif not ensure_submission:
+                    self._conn.commit()
+                    return {
+                        "submission_seq": 0,
+                        "decision_seq": 0,
+                        "flag_found_seq": 0,
+                        "accepted": False,
+                        "code": "submission_missing",
+                        "detail": "submission was not durably recorded",
+                        "created": False,
+                    }
+                else:
+                    payload = {
+                        "submission_id": sid,
+                        "flag": candidate,
+                        "intent_id": intent,
+                        "protocol": wire_protocol,
+                    }
+                    cur = self._conn.execute(
+                        "INSERT INTO events "
+                        "(ts, challenge_id, actor, kind, payload, artifact_id, "
+                        " verified, confidence, dedupe_key) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        (time.time(), self.challenge.id, owner,
+                         EV_FLAG_SUBMISSION, json.dumps(payload, default=str),
+                         None, 0, 1.0, submit_key),
+                    )
+                    submission_seq = int(cur.lastrowid or 0)
+
+                decision_row = self._conn.execute(
+                    "SELECT seq, payload FROM events WHERE dedupe_key=?",
+                    (decision_key,),
+                ).fetchone()
+                created = False
+                if decision_row is None:
+                    canonical_accepted = bool(accepted)
+                    canonical_code = str(code or "rejected")
+                    canonical_detail = str(detail or "")[:240]
+                    decision_payload = {
+                        "submission_id": sid,
+                        "accepted": canonical_accepted,
+                        "code": canonical_code,
+                        "detail": canonical_detail,
+                    }
+                    cur = self._conn.execute(
+                        "INSERT INTO events "
+                        "(ts, challenge_id, actor, kind, payload, artifact_id, "
+                        " verified, confidence, dedupe_key) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        (time.time(), self.challenge.id, owner,
+                         EV_FLAG_SUBMISSION_DECISION,
+                         json.dumps(decision_payload, default=str), None,
+                         int(canonical_accepted), 1.0, decision_key),
+                    )
+                    decision_seq = int(cur.lastrowid or 0)
+                    created = True
+                else:
+                    decision_seq = int(decision_row[0] or 0)
+                    prior = _payload(decision_row[1])
+                    canonical_accepted = bool(prior.get("accepted"))
+                    canonical_code = str(prior.get("code") or "rejected")
+                    canonical_detail = str(prior.get("detail") or "")[:240]
+
+                flag_found_seq = 0
+                if canonical_accepted:
+                    flag_row = self._conn.execute(
+                        "SELECT seq FROM events WHERE dedupe_key=?", (flag_key,)
+                    ).fetchone()
+                    if flag_row is not None:
+                        flag_found_seq = int(flag_row[0] or 0)
+                    else:
+                        flag_payload = {"flag": candidate}
+                        if intent:
+                            flag_payload["intent_id"] = intent
+                        cur = self._conn.execute(
+                            "INSERT INTO events "
+                            "(ts, challenge_id, actor, kind, payload, artifact_id, "
+                            " verified, confidence, dedupe_key) "
+                            "VALUES (?,?,?,?,?,?,?,?,?)",
+                            (time.time(), self.challenge.id, owner, EV_FLAG_FOUND,
+                             json.dumps(flag_payload, default=str), None, 1, 1.0,
+                             flag_key),
+                        )
+                        flag_found_seq = int(cur.lastrowid or 0)
+                self._conn.commit()
+                return {
+                    "submission_seq": submission_seq,
+                    "decision_seq": decision_seq,
+                    "flag_found_seq": flag_found_seq,
+                    "accepted": canonical_accepted,
+                    "code": canonical_code,
+                    "detail": canonical_detail,
+                    "created": created,
+                }
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def finding_found(self, *, actor: str, finding: dict,
                       artifact_id: Optional[str] = None,
@@ -305,7 +1163,8 @@ class _FactsMixin:
                            summary: str, evidence_seqs: Optional[list[int]] = None,
                            intent_ids: Optional[list[str]] = None,
                            route_hash: str = "", branch_id: str = "",
-                           recommended_actions: Optional[list[str]] = None) -> int:
+                           recommended_actions: Optional[list[str]] = None,
+                           worker: str = "") -> int:
         route = self.normalize_route_hash(route_hash) if route_hash else ""
         payload = {
             "finding_id": self.review_finding_identity(kind, summary, route),
@@ -317,37 +1176,30 @@ class _FactsMixin:
             "route_hash": route,
             "branch_id": (branch_id or "").strip(),
             "recommended_actions": [str(x) for x in (recommended_actions or []) if x],
+            # The review worker that raised the finding (actor stays the coordinator
+            # that applied it).
+            "worker": (worker or "").strip(),
         }
         return self._append(EV_REVIEW_FINDING, actor, payload,
                             dedupe_key=f"review::{payload['kind']}::{payload['summary']}::{route}")
 
-    @staticmethod
-    def _review_proposal_tier(marker: str) -> str:
-        m = (marker or "").strip().upper()
-        if m in {"ROUTE_SUPPRESS", "COORDINATOR_DIRECTIVE", "LANE_LOCK", "LANE_UNLOCK"}:
-            return "tier2"
-        return "tier1"
-
-    def add_review_proposal(self, *, actor: str, marker: str, payload: dict,
-                            tier: str = "tier1") -> int:
+    def add_review_proposal(self, *, actor: str, marker: str, payload: dict) -> int:
         marker = (marker or "").strip().upper()
+        if marker not in REVIEW_FACT_MARKERS:
+            raise ValueError(f"marker is outside Review authority: {marker}")
         clean_payload = dict(payload or {})
         route_hash = str(clean_payload.get("route_hash") or "").strip()
         if route_hash:
             clean_payload["route_hash"] = self.normalize_route_hash(route_hash)
-        lane_key = str(clean_payload.get("lane_key") or "").strip()
-        if lane_key:
-            clean_payload["lane_key"] = self.normalize_lane_key(lane_key)
         confidence = clean_payload.get("confidence", 1.0)
         try:
             confidence = float(confidence)
         except (TypeError, ValueError):
             confidence = 1.0
         clean_payload["confidence"] = max(0.0, min(1.0, confidence))
-        clean_tier = tier if tier in {"tier1", "tier2"} else self._review_proposal_tier(marker)
         payload_out = {
             "marker": marker,
-            "tier": clean_tier,
+            "tier": "tier1",
             "payload": clean_payload,
             "status": "pending",
         }
@@ -407,8 +1259,15 @@ class _FactsMixin:
             self._conn.commit()
         self.propose_intent(
             actor=actor, intent_id=intent_id, goal=goal,
-            payload={"worker_class": "verifier", "depends_on": [str(fact_seq)],
-                     "rationale": f"Review challenged fact #{fact_seq}: {reason}"},
+            payload={"worker_class": "verifier",
+                     "rationale": f"Review challenged fact #{fact_seq}: {reason}",
+                     "expected_observable": (
+                         f"Fresh tool output that confirms or contradicts fact #{fact_seq}"
+                     ),
+                     "stop_condition": (
+                         "Stop after the bounded reproduction attempt and record "
+                         "verified evidence or a dead end"
+                     )},
             from_fact_seqs=[fact_seq],
         )
         return {"fact_seq": fact_seq, "verification_intent_id": intent_id,
@@ -559,25 +1418,40 @@ class _FactsMixin:
                        by_fact_seq: Optional[int] = None) -> int:
         """Mark a fact SUPERSEDED — a newer fact replaces it. Retired from the
         active set; kept for audit."""
+        with self._lock:
+            try:
+                seq = self._supersede_fact_locked(
+                    actor=actor, fact_seq=fact_seq, reason=reason,
+                    by_fact_seq=by_fact_seq,
+                )
+            except BaseException:
+                self._conn.rollback()
+                raise
+            self._conn.commit()
+            return seq
+
+    def _supersede_fact_locked(self, *, actor: str, fact_seq: int,
+                               reason: str = "",
+                               by_fact_seq: Optional[int] = None) -> int:
+        """``supersede_fact`` body with ``self._lock`` held and no commit
+        (transactional reuse from ``_add_evidence_locked``)."""
         fact_seq = int(fact_seq)
         payload = {"fact_seq": fact_seq, "status": FACT_STATE_SUPERSEDED,
                    "reason": (reason or "").strip()[:1000], "superseded_by": actor}
         if by_fact_seq is not None:
             payload["by_fact_seq"] = int(by_fact_seq)
-        seq = self._append(EV_FACT_SUPERSEDED, actor, payload,
-                           dedupe_key=f"fact-superseded::{fact_seq}::{payload['reason']}")
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO fact_reviews (fact_seq, challenge_id, status, reason) "
-                "VALUES (?,?,?,?) ON CONFLICT(fact_seq) DO UPDATE SET "
-                " status='superseded', reason=excluded.reason",
-                (fact_seq, self.challenge.id, FACT_STATE_SUPERSEDED, payload["reason"]),
-            )
-            self._upsert_fact_state(
-                fact_seq, FACT_STATE_SUPERSEDED, reason=payload["reason"],
-                superseded_seq=seq if seq > 0 else None, retired_seq=seq if seq > 0 else None,
-                verified_effective=0, updated_seq=seq)
-            self._conn.commit()
+        seq = self._append_locked(EV_FACT_SUPERSEDED, actor, payload,
+                                  dedupe_key=f"fact-superseded::{fact_seq}::{payload['reason']}")
+        self._conn.execute(
+            "INSERT INTO fact_reviews (fact_seq, challenge_id, status, reason) "
+            "VALUES (?,?,?,?) ON CONFLICT(fact_seq) DO UPDATE SET "
+            " status='superseded', reason=excluded.reason",
+            (fact_seq, self.challenge.id, FACT_STATE_SUPERSEDED, payload["reason"]),
+        )
+        self._upsert_fact_state(
+            fact_seq, FACT_STATE_SUPERSEDED, reason=payload["reason"],
+            superseded_seq=seq if seq > 0 else None, retired_seq=seq if seq > 0 else None,
+            verified_effective=0, updated_seq=seq)
         return seq
 
     def review_fact(self, *, actor: str, fact_seq: int, action: str,
@@ -628,10 +1502,36 @@ class _FactsMixin:
         }
 
     def active_candidates(self) -> list[dict]:
-        """Active (non-retired) UNRESOLVED/CHALLENGED candidate facts — the set the
-        planner should still weigh. Excludes verified, rejected, merged, superseded."""
+        """Legacy compatibility surface; candidates no longer exist as Facts."""
+        return []
+
+    def observations(self, *, limit: int = 200, unadmitted_only: bool = False) -> list[dict]:
+        """Bounded raw evidence for audit and explicit verifier retrieval."""
+        where = "challenge_id=?"
+        args: list[Any] = [self.challenge.id]
+        if unadmitted_only:
+            where += " AND admitted_fact_seq IS NULL"
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT observation_seq,actor,intent_id,target_epoch,text,witness,artifact_id,"
+                "canonical_key,admitted_fact_seq,created_at FROM observations "
+                f"WHERE {where} ORDER BY observation_seq DESC LIMIT ?",
+                (*args, int(limit)),
+            ).fetchall()
+        return [{"observation_seq": int(r[0]), "actor": r[1], "intent_id": r[2] or "",
+                 "target_epoch": r[3], "text": r[4], "witness": r[5],
+                 "artifact_id": r[6], "canonical_key": r[7],
+                 "admitted_fact_seq": (int(r[8]) if r[8] is not None else None),
+                 "created_at": float(r[9])} for r in reversed(rows)]
+
+    def verified_evidence(self) -> list[dict]:
+        """Facts that are verified (origin or revalidated) AND not retired."""
         texts = self._fact_text_by_seq()
-        states = self._fact_state_map()
+        states = (
+            {}
+            if getattr(self.challenge, "mode", "ctf") == "ctf"
+            else self._fact_state_map()
+        )
         with self._lock:
             rows = self._conn.execute(
                 "SELECT seq, verified FROM events WHERE challenge_id=? AND kind=? "
@@ -640,6 +1540,40 @@ class _FactsMixin:
             ).fetchall()
         out: list[dict] = []
         for seq, verified in rows:
+            seq = int(seq)
+            st = states.get(seq, {})
+            if (st.get("retired") or st.get("state") in _FACT_TERMINAL_STATES
+                    or st.get("state") == FACT_STATE_CHALLENGED):
+                continue
+            eff = st.get("verified_effective")
+            is_verified = bool(verified) if eff is None else eff
+            if is_verified:
+                out.append({"fact_seq": seq, "fact": texts.get(seq, "")})
+        return out
+
+    def verified_fact_rows(self, *, limit: int = 200) -> list[dict]:
+        """Active verified facts with seq/text/route_hash, newest first, bounded.
+
+        Deterministic input for host-side scans over the verified set (the
+        semantic-duplicate review trigger buckets by route_hash). Unlike
+        verified_evidence() this carries the route bucket; shape kept separate so
+        the long-standing verified_evidence() contract is untouched."""
+        states = (
+            {}
+            if getattr(self.challenge, "mode", "ctf") == "ctf"
+            else self._fact_state_map()
+        )
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT seq, verified, "
+                "json_extract(payload,'$.fact'), "
+                "json_extract(payload,'$.route_hash') "
+                "FROM events WHERE challenge_id=? AND kind=? ORDER BY seq DESC "
+                "LIMIT ?",
+                (self.challenge.id, EV_FACT_ADDED, int(limit)),
+            ).fetchall()
+        out: list[dict] = []
+        for seq, verified, fact, route in rows:
             seq = int(seq)
             st = states.get(seq, {})
             state = st.get("state", FACT_STATE_UNRESOLVED)
@@ -647,29 +1581,10 @@ class _FactsMixin:
                 continue
             eff = st.get("verified_effective")
             is_verified = bool(verified) if eff is None else eff
-            if is_verified and state != FACT_STATE_CHALLENGED:
+            if state == FACT_STATE_CHALLENGED:
+                is_verified = False
+            if not is_verified:
                 continue
-            out.append({"fact_seq": seq, "fact": texts.get(seq, ""), "state": state})
-        return out
-
-    def verified_evidence(self) -> list[dict]:
-        """Facts that are verified (origin or revalidated) AND not retired."""
-        texts = self._fact_text_by_seq()
-        states = self._fact_state_map()
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT seq, verified FROM events WHERE challenge_id=? AND kind=? "
-                "ORDER BY seq",
-                (self.challenge.id, EV_FACT_ADDED),
-            ).fetchall()
-        out: list[dict] = []
-        for seq, verified in rows:
-            seq = int(seq)
-            st = states.get(seq, {})
-            if st.get("retired") or st.get("state") in _FACT_TERMINAL_STATES:
-                continue
-            eff = st.get("verified_effective")
-            is_verified = bool(verified) if eff is None else eff
-            if is_verified:
-                out.append({"fact_seq": seq, "fact": texts.get(seq, "")})
+            out.append({"fact_seq": seq, "fact": str(fact or ""),
+                        "route_hash": str(route or "")})
         return out

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { DeckState, EventType, MutekiEvent, emptyDeck, reduce } from "./events";
+import { deleteRunProjection, loadRunProjection, saveRunProjection } from "./runProjectionCache";
 
 /**
  * API base. Empty string = same-origin: `run.sh web` serves the production
@@ -13,6 +14,18 @@ const CONTROL_CAS_ACTIONS = new Set([
   "pause", "freeze", "resume", "thaw", "stop", "complete",
 ]);
 
+export class RunStartError extends Error {
+  status: number;
+  payload: Record<string, unknown>;
+
+  constructor(message: string, status: number, payload: Record<string, unknown> = {}) {
+    super(message);
+    this.name = "RunStartError";
+    this.status = status;
+    this.payload = payload;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Auth (P3): single-password gate. The operator types a password once; the
 // backend returns a signed session token we keep in localStorage and attach to
@@ -21,7 +34,7 @@ const CONTROL_CAS_ACTIONS = new Set([
 // ---------------------------------------------------------------------------
 const TOKEN_KEY = "muteki_auth_token";
 
-export function getToken(): string {
+function getToken(): string {
   if (typeof window === "undefined") return "";
   try {
     return window.localStorage.getItem(TOKEN_KEY) || "";
@@ -30,7 +43,7 @@ export function getToken(): string {
   }
 }
 
-export function setToken(token: string): void {
+function setToken(token: string): void {
   if (typeof window === "undefined") return;
   try {
     if (token) window.localStorage.setItem(TOKEN_KEY, token);
@@ -116,7 +129,7 @@ export async function authTicket(): Promise<string> {
 
 export type RunStatus = "draft" | "running" | "paused" | "solved" | "finished" | "failed";
 
-export const isDraftRunId = (id: string) => id.startsWith("draft-");
+const isDraftRunId = (id: string) => id.startsWith("draft-");
 
 /** One run as the thread rail lists it (matches RunManager.Run.summary()). */
 export interface RunSummary {
@@ -138,7 +151,7 @@ export interface RunSummary {
   updated_at?: number;
 }
 
-/** An operator-created rail folder (sessions/_folders.json). */
+/** An operator-created rail folder (state/_folders.json). */
 export interface Folder {
   id: string;
   name: string;
@@ -147,8 +160,8 @@ export interface Folder {
 
 /**
  * Subscribe to a run's SSE event stream and fold it into DeckState. Reconnects
- * with Last-Event-ID (the browser EventSource sets this automatically on
- * reconnect, and our backend honors it). The conversation-first deck swaps
+ * with a persisted projection cursor so each new one-time auth ticket resumes
+ * after the latest committed event. The conversation-first deck swaps
  * `runId` when the operator opens a new solve — the stream re-subscribes and the
  * deck resets. Returns the live deck + controls.
  */
@@ -156,11 +169,16 @@ export function useRun(runId: string) {
   const [deck, setDeck] = useState<DeckState>(() => emptyDeck(runId));
   const [connected, setConnected] = useState(false);
   const esRef = useRef<EventSource | null>(null);
+  const deckRef = useRef(deck);
+  const lastSeqRef = useRef(0);
 
   useEffect(() => {
     esRef.current?.close();
     esRef.current = null;
-    setDeck(emptyDeck(runId));
+    const initialDeck = emptyDeck(runId);
+    deckRef.current = initialDeck;
+    lastSeqRef.current = 0;
+    setDeck(initialDeck);
     setConnected(false);
     // runId is briefly "" on first mount (the page mints the real draft id in a
     // post-hydration effect to avoid an SSR/client random-id mismatch). No id →
@@ -171,14 +189,95 @@ export function useRun(runId: string) {
     // exhaust the browser's per-origin connection pool and starve real run streams.
     if (!runId || isDraftRunId(runId)) return;
 
+    let cancelled = false;
+    let replayDeck: DeckState | null = null;
+    let replaySeq = 0;
+    let replayProtocolReady = false;
+    let persistedSeq = 0;
+    let reconnectDelay = 500;
+    let reconnectTimer: number | null = null;
+    let cacheTimer: number | null = null;
+    let renderFrame: number | null = null;
+    let connectionVersion = 0;
+
+    const publishDeck = (next: DeckState, immediate = false) => {
+      deckRef.current = next;
+      if (immediate) {
+        if (renderFrame !== null) window.cancelAnimationFrame(renderFrame);
+        renderFrame = null;
+        setDeck(next);
+        return;
+      }
+      if (renderFrame !== null) return;
+      renderFrame = window.requestAnimationFrame(() => {
+        renderFrame = null;
+        setDeck(deckRef.current);
+      });
+    };
+    const persist = () => {
+      const seq = lastSeqRef.current;
+      if (seq <= 0 || seq === persistedSeq) return;
+      persistedSeq = seq;
+      void saveRunProjection(runId, seq, deckRef.current);
+    };
+    const schedulePersist = (delay = 5000) => {
+      if (cacheTimer !== null) return;
+      cacheTimer = window.setTimeout(() => {
+        cacheTimer = null;
+        persist();
+      }, delay);
+    };
     // every EventType is a named SSE event; one generic handler folds them all
     const handler = (e: MessageEvent) => {
       try {
         const ev = JSON.parse(e.data) as MutekiEvent;
-        setDeck((prev) => reduce(prev, ev));
+        if (!replayProtocolReady) {
+          replayProtocolReady = true;
+          if (lastSeqRef.current > 0) {
+            lastSeqRef.current = 0;
+            replaySeq = 0;
+            persistedSeq = 0;
+            void deleteRunProjection(runId);
+            publishDeck(emptyDeck(runId), true);
+          }
+        }
+        lastSeqRef.current = Math.max(lastSeqRef.current, Number(ev.seq) || 0);
+        publishDeck(reduce(deckRef.current, ev));
+        schedulePersist();
       } catch {
         /* ignore malformed frame */
       }
+    };
+    const replayResetHandler = () => {
+      replayDeck = emptyDeck(runId);
+      replaySeq = 0;
+      replayProtocolReady = false;
+      lastSeqRef.current = 0;
+      persistedSeq = 0;
+      void deleteRunProjection(runId);
+      publishDeck(replayDeck, true);
+    };
+    const replayBatchHandler = (e: MessageEvent) => {
+      try {
+        const frame = JSON.parse(e.data) as { events?: MutekiEvent[]; last_seq?: number };
+        if (!Array.isArray(frame.events)) return;
+        let next = replayDeck ?? deckRef.current;
+        for (const ev of frame.events) next = reduce(next, ev);
+        replayDeck = next;
+        replaySeq = Math.max(replaySeq, Number(frame.last_seq) || 0);
+      } catch {}
+    };
+    const replayCompleteHandler = (e: MessageEvent) => {
+      try {
+        const frame = JSON.parse(e.data) as { last_seq?: number };
+        replaySeq = Math.max(replaySeq, Number(frame.last_seq) || 0);
+      } catch {}
+      if (replayDeck) publishDeck(replayDeck, true);
+      lastSeqRef.current = Math.max(lastSeqRef.current, replaySeq);
+      replayProtocolReady = true;
+      replayDeck = null;
+      replaySeq = lastSeqRef.current;
+      schedulePersist(0);
     };
 
     // EventSource can't send an Authorization header, so when auth is on we mint
@@ -187,24 +286,64 @@ export function useRun(runId: string) {
     // exactly as before. `cancelled` guards the await: if runId changes (or the
     // component unmounts) before the ticket resolves, we must not open a now-
     // orphaned EventSource.
-    let cancelled = false;
-    (async () => {
+    const connect = async () => {
+      const version = ++connectionVersion;
       const ticket = await authTicket();
-      if (cancelled) return;
-      const qs = ticket ? `?ticket=${encodeURIComponent(ticket)}` : "";
-      const es = new EventSource(`${API}/api/runs/${runId}/events${qs}`);
+      if (cancelled || version !== connectionVersion) return;
+      const params = new URLSearchParams({ replay: "batch" });
+      if (lastSeqRef.current > 0) params.set("after", String(lastSeqRef.current));
+      if (ticket) params.set("ticket", ticket);
+      const es = new EventSource(`${API}/api/runs/${runId}/events?${params}`);
       esRef.current = es;
-      es.onopen = () => setConnected(true);
-      es.onerror = () => setConnected(false);
+      replayDeck = null;
+      replaySeq = lastSeqRef.current;
+      replayProtocolReady = false;
+      es.onopen = () => {
+        reconnectDelay = 500;
+        setConnected(true);
+      };
+      es.onerror = () => {
+        if (cancelled || esRef.current !== es) return;
+        es.close();
+        esRef.current = null;
+        replayDeck = null;
+        replaySeq = lastSeqRef.current;
+        setConnected(false);
+        const delay = reconnectDelay;
+        reconnectDelay = Math.min(reconnectDelay * 2, 10_000);
+        reconnectTimer = window.setTimeout(() => {
+          reconnectTimer = null;
+          void connect();
+        }, delay);
+      };
+      es.addEventListener("replay.reset", replayResetHandler as EventListener);
+      es.addEventListener("replay.batch", replayBatchHandler as EventListener);
+      es.addEventListener("replay.complete", replayCompleteHandler as EventListener);
       // listen to all known event names plus the default. Derived directly from
       // the EventType enum (single source of truth) — a hand-copied list silently
       // dropped any newly-added SSE event whose name was forgotten.
       Object.values(EventType).forEach((name) => es.addEventListener(name, handler as EventListener));
       es.onmessage = handler;
+    };
+
+    (async () => {
+      const cached = await loadRunProjection(runId);
+      if (cancelled) return;
+      if (cached) {
+        lastSeqRef.current = cached.seq;
+        persistedSeq = cached.seq;
+        publishDeck(cached.deck, true);
+      }
+      await connect();
     })();
 
     return () => {
       cancelled = true;
+      connectionVersion += 1;
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      if (cacheTimer !== null) window.clearTimeout(cacheTimer);
+      if (renderFrame !== null) window.cancelAnimationFrame(renderFrame);
+      persist();
       esRef.current?.close();
       esRef.current = null;
     };
@@ -223,9 +362,11 @@ export function useRun(runId: string) {
       });
       if (!res.ok) {
         let detail = "";
+        let payload: Record<string, unknown> = {};
         try {
           const body = await res.json();
-          detail = body?.detail ? String(body.detail) : "";
+          payload = body && typeof body === "object" ? body as Record<string, unknown> : {};
+          detail = payload.detail ? String(payload.detail) : "";
         } catch {
           try {
             detail = await res.text();
@@ -233,7 +374,7 @@ export function useRun(runId: string) {
             detail = "";
           }
         }
-        throw new Error(detail || `start failed (${res.status})`);
+        throw new RunStartError(detail || `start failed (${res.status})`, res.status, payload);
       }
       return res.json().catch(() => ({}));
     },
@@ -266,21 +407,16 @@ export function useRun(runId: string) {
       }
       if (action === "directive" && !opts?.preemption) body.preempt_policy = "soft_rebind";
       const m = text.match(/https?:\/\/[^\s"'<>]+/);
-      if ((action === "redirect" || action === "directive") && m) body.url = m[0].replace(/[.,;)]+$/, "");
+      if ((action === "redirect" || action === "directive" || action === "focus") && m) {
+        body.url = m[0].replace(/[.,;)]+$/, "");
+      }
       // Explicit "standing:" / "常驻:" prefix → persistent guidance.
       const sm = text.match(/^\s*(standing|常驻|standing guidance)\s*[:：]\s*(.*)$/i);
       if (sm) { body.standing = true; body.text = sm[2]; }
       if (action === "mark_false" && text.trim()) {
         body.flag = text.trim();
       }
-      // Auto-detect: a hint that hands over a RESOURCE (VPS / SSH / creds / a
-      // reverse-shell host) is almost always meant to apply to ALL workers for the
-      // rest of the run, not just the one turn — mark it standing so late-spawned
-      // workers inherit it too (operators kept forgetting the "standing:" prefix and
-      // the VPS hint never reached new workers). Heuristic, conservative: only fires
-      // on clear resource-handover signals.
-      else if (action === "hint" &&
-               /\b(ssh|vps|反弹|reverse[- ]?shell|root@|端口转发|port[- ]?forward|credential|凭证|账号|密码|password|跳板|中转)\b/i.test(text)) {
+      if (action === "hint") {
         body.standing = true;
       }
       const res = await apiFetch(`/api/runs/${runId}/control`, {
@@ -300,6 +436,17 @@ export function useRun(runId: string) {
     [runId, deck.controlGeneration]
   );
 
+  const requestProgress = useCallback(async () => {
+    const res = await apiFetch(`/api/runs/${runId}/progress`, {
+      method: "POST",
+    });
+    const data: any = await res.json().catch(() => ({}));
+    if (!res.ok || data?.ok === false) {
+      throw new Error(data?.detail || `progress request failed (${res.status})`);
+    }
+    return data as { ok: true; status: "published" | "unchanged"; brief_id?: string | null };
+  }, [runId]);
+
   // "继续做题": relaunch the FULL swarm on a finished run (reuses its workspace so
   // verified facts carry over). Optional `text` folds an operator hint into the
   // re-solve's challenge description.
@@ -316,7 +463,7 @@ export function useRun(runId: string) {
     [runId]
   );
 
-  return { deck, connected, start, sendHitl, resolve };
+  return { deck, connected, start, sendHitl, requestProgress, resolve };
 }
 
 /**
@@ -409,7 +556,7 @@ export async function newRun(): Promise<string> {
  *  folder (folder_id=null → top-level), drag-order. */
 export async function patchRun(
   runId: string,
-  patch: { pinned?: boolean; archived?: boolean; name?: string; folder_id?: string | null; order?: number }
+  patch: { pinned?: boolean; archived?: boolean; name?: string; folder_id?: string | null; order?: number; now?: number }
 ): Promise<boolean> {
   try {
     const r = await apiFetch(`/api/runs/${runId}`, {
@@ -427,6 +574,7 @@ export async function patchRun(
 export async function deleteRun(runId: string): Promise<boolean> {
   try {
     const r = await apiFetch(`/api/runs/${runId}`, { method: "DELETE" });
+    if (r.ok) await deleteRunProjection(runId);
     return r.ok;
   } catch {
     return false;
@@ -472,19 +620,6 @@ export interface EngineHealth {
   bin_env?: string;
 }
 
-/** Run the DEEP self-check (slow — exercises auth). `backend` picks local (host
- *  CLI + auth) vs container (docker run --rm: image + CLI launchable inside the
- *  worker image). On-demand, not polled. */
-export async function getEngineHealth(backend: "local" | "container" = "local"): Promise<EngineHealth[]> {
-  try {
-    const r = await apiFetch(`/api/engines/health?backend=${backend}`);
-    const j = await r.json();
-    return (j.engines ?? []) as EngineHealth[];
-  } catch {
-    return [];
-  }
-}
-
 export function useEngines(pollMs = 300000): EngineStatus[] {
   const [engines, setEngines] = useState<EngineStatus[]>([]);
   const inFlight = useRef(false);
@@ -509,7 +644,7 @@ export function useEngines(pollMs = 300000): EngineStatus[] {
 
 // ── rail folders (FE-session-folder) ────────────────────────────────────────
 
-export async function listFolders(): Promise<Folder[]> {
+async function listFolders(): Promise<Folder[]> {
   try {
     const r = await apiFetch(`/api/folders`);
     const j = await r.json();
@@ -578,10 +713,13 @@ export function useFolders(pollMs = 8000, bump = 0): Folder[] {
 export type LlmTemperatureMode = "default" | "custom" | "omit";
 
 export type LlmProfile = {
+  endpoint_id?: string;
+  /** Read-only migration input from releases before model endpoints were split. */
+  credential_id?: string;
   provider: string;
   model: string;
   base_url?: string;
-  connection?: "default" | "custom_endpoint";
+  connection?: "default" | "custom_endpoint" | "endpoint";
   temperature_mode?: LlmTemperatureMode;
   temperature?: number;
   api_key?: string;
@@ -597,6 +735,14 @@ export interface WorkerSettings {
   max_workers: number;
   worker_backend: "local" | "container";
   worker_network: "bridge" | "host" | "none";
+  /** Docker network actually applied (#171); may differ when MUTEKI_WORKER_NETWORK remaps bridge. */
+  effective_network?: string;
+  network_requested?: string;
+  network_reason?: string;
+  network_error?: string;
+  worker_container_scope: "run" | "shared";
+  worker_privilege?: "default" | "elevated";
+  worker_vpn_enabled: boolean;
   race_scout: boolean;
   race_timeout: number;
   wall_clock_budget: number;
@@ -607,6 +753,7 @@ export interface WorkerSettings {
     prepare: Record<string, unknown>;
     race: { enabled: boolean; timeout: number; engines: string[] };
     coordinator: {
+      dispatch_mode?: "fixed" | "auto";
       wall_clock_budget: number;
       review?: {
         enabled?: boolean;
@@ -616,7 +763,6 @@ export interface WorkerSettings {
         after_fruitless_workers?: number;
         after_duplicate_intents?: number;
         on_course_correct?: boolean;
-        on_reason_dry?: boolean;
         on_candidate_spike?: boolean;
         on_operator_hint?: boolean;
         allow_review_fallback?: boolean;
@@ -651,6 +797,7 @@ export interface WorkerSettings {
     auth: string;
     credential_mode?: string;
     credential_account: string;
+    credential_id?: string;
     api_key_ref?: string;
     base_url?: string;
     wire_api?: string;
@@ -710,6 +857,199 @@ export interface CredentialAccount {
   details: Record<string, unknown>;
 }
 
+export interface GlobalCredentialUsage {
+  kind?: "worker" | "review" | "verifier" | "conversation" | "llm_profile" | string;
+  id?: string;
+  profile_id?: string;
+  label?: string;
+  engine?: string;
+  model?: string;
+  role?: string;
+  enabled?: boolean;
+}
+
+export interface GlobalCredentialLastTest {
+  ok?: boolean;
+  status?: string;
+  detail?: string;
+  tested_at?: number | string;
+  backend?: string;
+  model?: string;
+}
+
+export interface GlobalCredentialModelCatalog {
+  credential_id?: string;
+  engine?: string;
+  environment?: "local" | "container" | string;
+  runtime_instance?: string;
+  source?: string;
+  refresh_status?: "missing" | "fresh" | "stale" | "failed" | string;
+  refreshed_at?: number | null;
+  expires_at?: number | null;
+  error_code?: string;
+  last_error?: string;
+  discovered_models?: Array<{ id?: string; label?: string; provider?: string }>;
+  configured_models?: string[];
+  verified_models?: string[];
+  default_model?: string;
+}
+
+/** Unified, read-only credential inventory consumed by every settings surface.
+ * Mutations continue to use the credential-account endpoints in the dedicated
+ * credential center; Worker/Profile editors only select one of these rows. */
+export interface GlobalCredential {
+  id: string;
+  label: string;
+  engine: string;
+  source: "stored" | "system";
+  account_id?: string;
+  connection: "official" | "custom_endpoint" | "system" | string;
+  credential_format?: "oauth_token" | "auth_json" | "auth_home" | "api_key" | "unknown";
+  provider?: string;
+  base_url?: string;
+  present: boolean;
+  status: string;
+  models: string[];
+  candidate_models?: string[];
+  default_model?: string;
+  model_catalog?: GlobalCredentialModelCatalog;
+  last_test?: GlobalCredentialLastTest | null;
+  usage: GlobalCredentialUsage[];
+}
+
+/** HTTP model connection used directly by Reason/Titler. It deliberately has
+ * no Agent engine field because this path never starts a CLI Agent. */
+export interface ModelEndpoint {
+  id: string;
+  label: string;
+  provider?: string;
+  base_url: string;
+  present: boolean;
+  status: string;
+  models: string[];
+  default_model?: string;
+  catalog?: GlobalCredentialModelCatalog;
+  usage: GlobalCredentialUsage[];
+}
+
+export async function getGlobalCredentials(): Promise<GlobalCredential[]> {
+  try {
+    const response = await apiFetch(`/api/settings/credentials`);
+    if (!response.ok) return [];
+    const payload = await response.json();
+    return Array.isArray(payload.credentials)
+      ? payload.credentials as GlobalCredential[]
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function getModelEndpoints(): Promise<ModelEndpoint[]> {
+  try {
+    const response = await apiFetch(`/api/settings/model-endpoints`);
+    if (!response.ok) return [];
+    const payload = await response.json();
+    return Array.isArray(payload.endpoints)
+      ? payload.endpoints as ModelEndpoint[]
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function createModelEndpoint(body: {
+  id: string;
+  provider?: string;
+  base_url: string;
+  /** Required for create; omit or leave blank when editing to keep the stored key. */
+  api_key?: string;
+  model: string;
+}): Promise<{ ok: boolean; detail: string; endpoint?: ModelEndpoint; updated?: boolean }> {
+  try {
+    const response = await apiFetch(`/api/settings/model-endpoints`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const payload = await response.json().catch(() => ({}));
+    return {
+      ok: response.ok && Boolean(payload.ok),
+      detail: String(payload.detail ?? (response.ok ? "" : `请求失败（HTTP ${response.status}）`)),
+      endpoint: payload.endpoint as ModelEndpoint | undefined,
+      updated: Boolean(payload.updated),
+    };
+  } catch (error) {
+    return { ok: false, detail: String(error) };
+  }
+}
+
+export async function refreshCredentialModels(
+  credentialId: string,
+  body: {
+    engine?: string;
+    connection?: "official" | "custom_endpoint";
+    base_url?: string;
+    secret?: string;
+    backend?: "local" | "container";
+    runtime_instance?: string;
+  } = {},
+): Promise<{ ok: boolean; detail: string; models: string[]; source?: string }> {
+  try {
+    const response = await apiFetch(`/api/settings/credentials/${encodeURIComponent(credentialId)}/models/refresh`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(60_000),
+    });
+    const payload = await response.json().catch(() => ({}));
+    const models = Array.isArray(payload.models)
+      ? payload.models.map((item: unknown) => String(item || "").trim()).filter(Boolean)
+      : [];
+    return {
+      ok: response.ok && Boolean(payload.ok) && models.length > 0,
+      detail: String(payload.detail ?? (response.ok ? "" : `HTTP ${response.status}`)),
+      models,
+      source: typeof payload.source === "string" ? payload.source : undefined,
+    };
+  } catch (error) {
+    const detail = (error as Error)?.name === "TimeoutError"
+      ? "读取模型列表超时（>60s）"
+      : String(error);
+    return { ok: false, detail, models: [] };
+  }
+}
+
+export async function testGlobalCredential(
+  credentialId: string,
+  engine: string,
+  backend: "local" | "container",
+  model = "",
+  runtimeInstance = "default",
+): Promise<WorkerModelTestResult> {
+  try {
+    const response = await apiFetch(`/api/settings/credentials/${encodeURIComponent(credentialId)}/test`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ engine, backend, model, runtime_instance: runtimeInstance }),
+      signal: AbortSignal.timeout(180_000),
+    });
+    const payload = await response.json().catch(() => ({}));
+    return parseWorkerModelTestResult(payload, {
+      ok: response.ok && Boolean(payload.ok),
+      detail: String(payload.detail ?? (response.ok ? "" : `HTTP ${response.status}`)),
+      engine,
+      backend,
+      model,
+    });
+  } catch (error) {
+    const detail = (error as Error)?.name === "TimeoutError"
+      ? "测试超时（>180s），请检查引擎状态后重试"
+      : String(error);
+    return parseWorkerModelTestResult(null, { ok: false, detail, engine, backend, model });
+  }
+}
+
 export type WorkerModelOption = {
   id: string;
   label: string;
@@ -733,7 +1073,7 @@ export interface WorkerModelOptions {
 }
 
 const emptyWorkerModelOptions = (): WorkerModelOptions => ({
-  allow_custom: true,
+  allow_custom: false,
   manual_models: {},
   discovered_models: {},
   models_by_profile: {},
@@ -814,39 +1154,12 @@ export async function getWorkerModelOptions(): Promise<WorkerModelOptions> {
     if (!r.ok) return emptyWorkerModelOptions();
     const j = await r.json();
     return {
-      allow_custom: Boolean(j.allow_custom ?? true),
+      allow_custom: Boolean(j.allow_custom ?? false),
       manual_updated_at: j.manual_updated_at ?? null,
       manual_models: (j.manual_models ?? j.models ?? {}) as WorkerModelOptions["manual_models"],
       discovered_models: (j.discovered_models ?? {}) as WorkerModelOptions["discovered_models"],
       models_by_profile: (j.models_by_profile ?? {}) as WorkerModelOptions["models_by_profile"],
       discovery: (j.discovery ?? {}) as WorkerModelOptions["discovery"],
-      models: (j.models ?? {}) as WorkerModelOptions["models"],
-    };
-  } catch {
-    return emptyWorkerModelOptions();
-  }
-}
-
-export async function discoverWorkerModels(profileId?: string): Promise<WorkerModelOptions> {
-  try {
-    const r = await apiFetch(`/api/settings/worker-models/discover`, {
-      method: "POST",
-      ...(profileId ? {
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ profile_id: profileId }),
-      } : {}),
-    });
-    if (!r.ok) return emptyWorkerModelOptions();
-    const j = await r.json();
-    return {
-      allow_custom: Boolean(j.allow_custom ?? true),
-      manual_updated_at: j.manual_updated_at ?? null,
-      manual_models: (j.manual_models ?? j.models ?? {}) as WorkerModelOptions["manual_models"],
-      discovered_models: (j.discovered_models ?? {}) as WorkerModelOptions["discovered_models"],
-      models_by_profile: (j.models_by_profile ?? {}) as WorkerModelOptions["models_by_profile"],
-      discovery: (j.discovery ?? {}) as WorkerModelOptions["discovery"],
-      discovery_results: (j.discovery_results ?? []) as WorkerModelOptions["discovery_results"],
-      discovery_ok: Boolean(j.discovery_ok),
       models: (j.models ?? {}) as WorkerModelOptions["models"],
     };
   } catch {
@@ -890,6 +1203,7 @@ export type WorkerModelTestLog = {
 };
 
 export type WorkerModelTestResult = {
+  profile_id?: string;
   ok: boolean;
   detail: string;
   model: string;
@@ -901,8 +1215,90 @@ export type WorkerModelTestResult = {
   exit_code?: number | null;
   elapsed_ms?: number;
   layer?: string;
+  tested_at?: number;
   logs: WorkerModelTestLog[];
 };
+
+function parseWorkerModelTestResult(
+  payload: Record<string, unknown> | null | undefined,
+  fallback: {
+    ok?: boolean;
+    detail?: string;
+    model?: string;
+    engine?: string;
+    backend?: "local" | "container";
+  } = {},
+): WorkerModelTestResult {
+  const row = payload && typeof payload === "object" ? payload : {};
+  const detail = String(row.detail ?? fallback.detail ?? "");
+  const ok = Boolean(row.ok ?? fallback.ok);
+  const elapsedMs = typeof row.elapsed_ms === "number" ? row.elapsed_ms : undefined;
+  return {
+    ok,
+    detail,
+    model: String(row.model ?? fallback.model ?? ""),
+    engine: String(row.engine ?? fallback.engine ?? ""),
+    backend: row.backend === "container" || fallback.backend === "container" ? "container" : "local",
+    command: typeof row.command === "string" ? row.command : undefined,
+    stdout: typeof row.stdout === "string" ? row.stdout : undefined,
+    stderr: typeof row.stderr === "string" ? row.stderr : undefined,
+    exit_code: typeof row.exit_code === "number" ? row.exit_code : null,
+    elapsed_ms: elapsedMs,
+    layer: typeof row.layer === "string" ? row.layer : undefined,
+    tested_at: typeof row.tested_at === "number" ? row.tested_at : undefined,
+    logs: Array.isArray(row.logs)
+      ? row.logs.map((item) => {
+          const log = item && typeof item === "object" ? item as Record<string, unknown> : {};
+          return {
+            stream: String(log.stream || "system") as WorkerModelTestLog["stream"],
+            message: String(log.message || ""),
+            elapsed_ms: Number(log.elapsed_ms) || 0,
+          };
+        })
+      : detail
+        ? [{ stream: ok ? "success" as const : "error" as const, message: detail, elapsed_ms: elapsedMs || 0 }]
+        : [],
+  };
+}
+
+export async function getWorkerModelTestResults(): Promise<Record<string, WorkerModelTestResult>> {
+  try {
+    const response = await apiFetch(`/api/settings/worker-model/test-results`);
+    if (!response.ok) return {};
+    const payload = await response.json().catch(() => ({}));
+    const rawResults = payload?.results && typeof payload.results === "object"
+      ? payload.results as Record<string, Record<string, unknown>>
+      : {};
+    return Object.fromEntries(Object.entries(rawResults).map(([profileId, row]) => {
+      const detail = String(row.detail ?? "");
+      return [profileId, {
+        profile_id: profileId,
+        ok: Boolean(row.ok),
+        detail,
+        model: String(row.model ?? ""),
+        engine: String(row.engine ?? ""),
+        backend: row.backend === "container" ? "container" as const : "local" as const,
+        exit_code: typeof row.exit_code === "number" ? row.exit_code : null,
+        elapsed_ms: typeof row.elapsed_ms === "number" ? row.elapsed_ms : undefined,
+        layer: typeof row.layer === "string" ? row.layer : undefined,
+        tested_at: typeof row.tested_at === "number" ? row.tested_at : undefined,
+        logs: Array.isArray(row.logs)
+          ? row.logs.map((item: Record<string, unknown>) => ({
+              stream: String(item.stream || "system") as WorkerModelTestLog["stream"],
+              message: String(item.message || ""),
+              elapsed_ms: Number(item.elapsed_ms) || 0,
+            }))
+          : [{
+              stream: row.ok ? "success" as const : "error" as const,
+              message: detail,
+              elapsed_ms: Number(row.elapsed_ms) || 0,
+            }],
+      } satisfies WorkerModelTestResult];
+    }));
+  } catch {
+    return {};
+  }
+}
 
 export async function testWorkerProfileModel(
   profile: WorkerSettings["worker_profiles"][number],
@@ -933,6 +1329,7 @@ export async function testWorkerProfileModel(
       exit_code: typeof j.exit_code === "number" ? j.exit_code : null,
       elapsed_ms: typeof j.elapsed_ms === "number" ? j.elapsed_ms : undefined,
       layer: typeof j.layer === "string" ? j.layer : undefined,
+      tested_at: typeof j.tested_at === "number" ? j.tested_at : undefined,
       logs: Array.isArray(j.logs)
         ? j.logs.map((item: Record<string, unknown>) => ({
             stream: String(item.stream || "system") as WorkerModelTestLog["stream"],
@@ -994,6 +1391,7 @@ export async function testWorkerProfileModelsBatch(
         exit_code: typeof row.exit_code === "number" ? row.exit_code : null,
         elapsed_ms: typeof row.elapsed_ms === "number" ? row.elapsed_ms : undefined,
         layer: typeof row.layer === "string" ? row.layer : undefined,
+        tested_at: typeof row.tested_at === "number" ? row.tested_at : undefined,
         logs: Array.isArray(row.logs)
           ? row.logs.map((log: Record<string, unknown>) => ({
               stream: String(log.stream || "system") as WorkerModelTestLog["stream"],
@@ -1059,74 +1457,46 @@ export async function fetchProfilesHealth(): Promise<ProfileHealth[]> {
   }
 }
 
-/** DEEP probe for one profile ("测连通"): binding + (container) plumbing + a real
- *  auth hello with the profile's pinned model. A green here matches the dispatch
- *  precheck, so the run won't die on profile_unhealthy. */
-export async function testProfileHealth(profileId: string): Promise<ProfileHealth | null> {
-  try {
-    // A container deep-probe (docker run + real one-turn hello) can take ~60-120s
-    // on a cold cursor/codex start; cap it so "测试中…" can't hang forever (no
-    // client timeout was the reason the button spun indefinitely on a slow probe).
-    const r = await apiFetch(`/api/settings/profiles/${encodeURIComponent(profileId)}/health`, {
-      method: "POST",
-      signal: AbortSignal.timeout(180_000),
-    });
-    if (!r.ok) return null;
-    return (await r.json()) as ProfileHealth;
-  } catch {
-    return null;
-  }
-}
-
 /** Update the default roster. Returns the persisted config, or null on
  *  failure (e.g. 400 for an invalid roster). */
 export async function putWorkerSettings(
   patch: Partial<WorkerSettings>
 ): Promise<WorkerSettings | null> {
-  try {
-    const r = await apiFetch(`/api/settings/workers`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(patch),
-    });
-    if (!r.ok) return null;
-    const j = await r.json();
-    return (j.config ?? null) as WorkerSettings | null;
-  } catch {
-    return null;
+  const r = await apiFetch(`/api/settings/workers`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const raw = j?.detail ?? j?.error?.message ?? `HTTP ${r.status}`;
+    throw new Error(String(raw));
   }
+  return (j.config ?? null) as WorkerSettings | null;
 }
 
-/** Persist the canonical Seat / Credential model. This is kept
- * separate from scheduler policy because the backend validates identity bindings
- * (including container × system-login legality) before projecting them to the
- * legacy worker profiles consumed by live dispatch. */
-export async function putWorkerIdentity(
-  patch: Partial<Pick<WorkerSettings, "seats" | "credentials">>
-): Promise<WorkerSettings | null> {
-  try {
-    const r = await apiFetch(`/api/settings/identity`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(patch),
-    });
-    if (!r.ok) return null;
-    const j = await r.json();
-    return (j.config ?? null) as WorkerSettings | null;
-  } catch {
-    return null;
-  }
+export type OpenVpnStatus = {
+  present: boolean;
+  filename?: string;
+  size?: number;
+  sha256?: string;
+};
+
+export async function getOpenVpnStatus(): Promise<OpenVpnStatus> {
+  const r = await apiFetch(`/api/settings/runtime/openvpn`);
+  if (!r.ok) return { present: false };
+  return (await r.json()) as OpenVpnStatus;
 }
 
-export async function listCredentialAccounts(): Promise<CredentialAccount[]> {
-  try {
-    const r = await apiFetch(`/api/settings/credential-accounts`);
-    if (!r.ok) return [];
-    const j = await r.json();
-    return (j.accounts ?? []) as CredentialAccount[];
-  } catch {
-    return [];
-  }
+export async function uploadOpenVpnConfig(file: File): Promise<OpenVpnStatus> {
+  const r = await apiFetch(`/api/settings/runtime/openvpn`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-openvpn-profile" },
+    body: file,
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(String(j?.detail || `HTTP ${r.status}`));
+  return j as OpenVpnStatus;
 }
 
 export async function putCredentialAccount(
@@ -1140,33 +1510,32 @@ export async function putCredentialAccount(
     base_url?: string;
     provider?: string;
     target_engine?: string;
+    target_model?: string;
+    models?: string[];
   }
 ): Promise<CredentialAccount | null> {
-  try {
-    const r = await apiFetch(`/api/settings/credential-accounts/${encodeURIComponent(accountId)}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) return null;
-    const j = await r.json();
-    return (j.account ?? null) as CredentialAccount | null;
-  } catch {
-    return null;
+  const r = await apiFetch(`/api/settings/credential-accounts/${encodeURIComponent(accountId)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    throw new Error(String(j?.detail ?? j?.error?.message ?? `HTTP ${r.status}`));
   }
+  return (j.account ?? null) as CredentialAccount | null;
 }
 
-export async function deleteCredentialAccount(accountId: string): Promise<boolean> {
-  try {
-    const r = await apiFetch(`/api/settings/credential-accounts/${encodeURIComponent(accountId)}`, {
-      method: "DELETE",
-    });
-    if (!r.ok) return false;
-    const j = await r.json();
-    return Boolean(j.ok);
-  } catch {
-    return false;
+export async function deleteCredentialAccount(accountId: string, detachReferences = false): Promise<boolean> {
+  const suffix = detachReferences ? "?detach_references=true" : "";
+  const r = await apiFetch(`/api/settings/credential-accounts/${encodeURIComponent(accountId)}${suffix}`, {
+    method: "DELETE",
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    throw new Error(String(j?.detail ?? j?.error?.message ?? `HTTP ${r.status}`));
   }
+  return Boolean(j.ok);
 }
 
 /** One-click refresh of a codex account from the HOST's ~/.codex/auth.json (after
@@ -1220,24 +1589,11 @@ export async function importHostWorkerLogin(
 
 export type SystemLoginStatus = "present" | "absent" | "unknown";
 
-/** Host-side login presence per engine (drives the local-mode credentials UI). */
-export async function getSystemLogin(): Promise<Record<string, SystemLoginStatus>> {
-  try {
-    const r = await apiFetch(`/api/settings/system-login`);
-    if (!r.ok) return {};
-    const j = await r.json();
-    return (j.logins ?? {}) as Record<string, SystemLoginStatus>;
-  } catch {
-    return {};
-  }
-}
-
 /** Test the planner/titler endpoint the operator is editing. */
 export async function testLlmEndpoint(
   which: "planner" | "titler",
-  base_url: string,
+  endpoint_id: string,
   model: string,
-  api_key = "",
   temperature_mode: LlmTemperatureMode = "default",
   temperature?: number,
 ): Promise<{ ok: boolean; detail: string; model: string }> {
@@ -1245,41 +1601,16 @@ export async function testLlmEndpoint(
     const r = await apiFetch(`/api/settings/llm/test`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ which, base_url, model, api_key, temperature_mode, temperature }),
+      body: JSON.stringify({ which, endpoint_id, model, temperature_mode, temperature }),
     });
     const j = await r.json().catch(() => ({}));
-    return { ok: !!j.ok, detail: String(j.detail ?? ""), model: String(j.model ?? model) };
+    return {
+      ok: r.ok && !!j.ok,
+      detail: String(j.detail ?? (r.ok ? "" : `请求失败（HTTP ${r.status}）`)),
+      model: String(j.model ?? model),
+    };
   } catch (e) {
     return { ok: false, detail: String(e), model };
-  }
-}
-
-/** Test a registered credential account. local → host probe with the account's
- *  env; container → real `docker run --rm` plumbing test. Never host-fallback. */
-export async function testCredentialAccount(
-  accountId: string,
-  engine: string,
-  backend: "local" | "container"
-): Promise<{ ok: boolean; detail: string; layer?: string }> {
-  try {
-    const r = await apiFetch(
-      `/api/settings/credential-accounts/${encodeURIComponent(accountId)}/test`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ engine, backend }),
-        // cap the wait — a container probe + cold hello can be slow, but the
-        // button must never spin forever (the "测试中…" hang).
-        signal: AbortSignal.timeout(180_000),
-      }
-    );
-    const j = await r.json().catch(() => ({}));
-    return { ok: !!j.ok, detail: String(j.detail ?? ""), layer: j.layer };
-  } catch (e) {
-    const msg = (e as Error)?.name === "TimeoutError"
-      ? "测试超时（>180s）——容器探测或冷启动太慢，请重试或检查引擎状态"
-      : String(e);
-    return { ok: false, detail: msg };
   }
 }
 

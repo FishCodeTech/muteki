@@ -801,7 +801,9 @@ def role_hat_guidance(role: str, *, member_name: str, team_id: str) -> str:
         "msg-check (mailbox+digest), msg-send, task-list, task-claim, task-done, "
         "assert-write, artifact-put, token-wait, heartbeat. "
         "Full-board reads (read-facts/read-routes/...) are not registered in "
-        "teammate mode. Send `heartbeat` ~every 30s while working."
+        "teammate mode. Send `heartbeat` ~every 30s while working. "
+        "Teammate-mode command reference: TEAMMATE.md in the staged blackboard "
+        "skill directory (next to SKILL.md)."
     )
     hats = {
         "recon": (

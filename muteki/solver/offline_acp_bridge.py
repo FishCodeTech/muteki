@@ -81,6 +81,16 @@ def _resolve_model(
         if requested in {row["value"], row["name"]}:
             return row["value"]
 
+    # Cursor's headless CLI persists the automatic selector as ``auto``, while
+    # its ACP session currently advertises the same option as ``Auto``. Keep
+    # exact matching first, then accept this presentation-only case difference
+    # so a conversation's selected model can be reused by background metadata.
+    if agent_label == "cursor":
+        folded = requested.casefold()
+        for row in options:
+            if folded in {row["value"].casefold(), row["name"].casefold()}:
+                return row["value"]
+
     if agent_label != "cursor":
         available = ", ".join(row["name"] or row["value"] for row in options)
         raise AcpError(

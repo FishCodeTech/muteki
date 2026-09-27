@@ -7,7 +7,7 @@
  */
 export type DecisionControlAction = "answer_decision" | "dismiss";
 
-export function newClientCommandId(): string {
+function newClientCommandId(): string {
   const webCrypto = globalThis.crypto;
   if (webCrypto && typeof webCrypto.randomUUID === "function") {
     return webCrypto.randomUUID();

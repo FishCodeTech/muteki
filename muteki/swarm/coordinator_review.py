@@ -13,8 +13,6 @@ import asyncio
 import hashlib
 import json
 import os
-import re
-import time
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +26,7 @@ from muteki.core.event_bus import EventBus
 from muteki.core.runtime_env import is_web_container
 from muteki.core.events import Event, EventType, blackboard_delta_payload
 from muteki.core.llm import LLMClient, ModelSpec
+from muteki.core.prompt_assembly import estimate_host_tokens
 from muteki.models.solve_graph import Challenge
 from muteki.sandbox.manager import SandboxManager
 from muteki.solver.result import ArtifactStore
@@ -44,7 +43,12 @@ from muteki.solver.worker_profiles import (
 from muteki.solver.workspace import cleanup_worker_scratch, ensure_workspace
 from muteki.swarm.insight_bus import InsightBus
 from muteki.swarm.stage_policy import StagePolicy
-from muteki.swarm.shared_graph import SharedGraph, SQLiteSharedGraph, canonicalize_lane
+from muteki.swarm.graph_defs import (
+    EV_FACT_SUPERSEDED,
+    REVIEW_FACT_MARKERS,
+    _normalize_fact_identity,
+)
+from muteki.swarm.shared_graph import SharedGraph, SQLiteSharedGraph
 from muteki.swarm.swarm_support import (
     _STANDING_MAX,
     _PENDING_HELP_MAX,
@@ -65,42 +69,72 @@ from muteki.swarm.swarm_support import (
 
 
 class _ReviewLocksMixin:
+    # Upper bound on evidence/intent references attributed to one finding.
+    _REVIEW_REF_LIMIT = 50
+
     async def _run_race_scout(
         self,
         healthy: list[str],
         *,
         adopt_verifiers: "tuple[dict, dict, dict] | None" = None,
+        adopt_race_workers: "tuple[dict, dict, dict] | None" = None,
     ):
         """Race-scout layer (DESIGN_race_scout_layer.md): ONE round of fresh
-        single-shot bootstrap workers (one per race engine) probing the whole
-        challenge IN PARALLEL. Each runs to its own natural exit (single-shot, short
-        race_timeout) and lands its facts/flag on the shared graph. Returns
-        (winner_id, flag, per_solver). On the FAST PATH winner_id is set (a worker
-        captured the flag and the run is flags-complete); else (None, None,
-        per_solver) → the facts are on the graph and the caller falls through to the
-        coordinator loop, warm. per_solver carries the race workers' outcomes either
-        way.
+        bounded bootstrap workers (one per race engine) probing the whole
+        challenge IN PARALLEL. With ``adopt_race_workers`` the workers are handed to
+        the main coordinator immediately, where they keep their bounded
+        ``race_timeout`` while Reason plans complementary work.  The legacy
+        non-adoption path still waits for natural exit and returns
+        ``(winner_id, flag, per_solver)`` after facts land on the shared graph.
 
         Single-shot + no global-signal reclaim: this never reintroduces the run-7352
         death spiral (red line). One round only — race_rounds>1 is intentionally not
         looped here (it would reintroduce accumulation)."""
+        self._race_scout_handed_off = False
         engines = [
             e for e in (self.race_engines or self.engines)
             if (self._healthy_matches(e, healthy)
                 and self._engine_available_for_role(e, "race"))
         ]
+        race_limit = min(
+            max(0, int(self.start_workers)), self._ordinary_capacity_limit())
+        engines = engines[:race_limit]
         if not engines:
             return None, None, {}
         await self._emit_coord_bb("race_started", engines=list(engines),
                                   timeout=self.race_timeout)
         workers = []
+        worker_engines: dict[int, str] = {}
         tasks: dict[asyncio.Task[Any], Any] = {}
+        task_engines: dict[asyncio.Task[Any], str] = {}
         try:
-            for e in engines:
+            race_directions = (
+                "Independent root campaign A: inspect the complete task and live "
+                "state, form the highest-value falsifiable hypothesis you can justify, "
+                "and pursue its connected chain end-to-end. Publish concrete evidence "
+                "and completed objectives immediately while continuing.",
+                "Independent root campaign B: assess the complete task from fresh "
+                "assumptions, choose a materially different high-value falsifiable "
+                "hypothesis, and pursue its connected chain end-to-end. Publish "
+                "concrete evidence and completed objectives immediately while continuing.",
+            )
+            for index, e in enumerate(engines):
                 try:
-                    workers.append(self._make_cli_worker(
-                        e, mode="bootstrap", timeout_override=self.race_timeout,
-                        profile_role="race"))
+                    direction = (
+                        race_directions[index]
+                        if index < len(race_directions)
+                        else (
+                            f"Race scout lane {index + 1}: choose an uncovered, "
+                            "high-value entry or pivot surface, test it end-to-end, "
+                            "and publish concrete observations immediately."
+                        )
+                    )
+                    worker = self._make_cli_worker(
+                        e, mode="bootstrap", intent_goal=direction,
+                        timeout_override=self.race_timeout,
+                        profile_role="race")
+                    workers.append(worker)
+                    worker_engines[id(worker)] = e
                 except WorkerSpawnRejected as exc:
                     await self._emit_coord_bb("worker_spawn_rejected", reason=str(exc),
                                               engine=str(e), phase="race")
@@ -121,6 +155,27 @@ class _ReviewLocksMixin:
                 task = await self._schedule_control_worker(
                     w, name=f"race-{w.solver_id}")
                 tasks[task] = w
+                task_engines[task] = worker_engines[id(w)]
+            if adopt_race_workers is not None and tasks:
+                await self._emit_coord_bb(
+                    "race_concurrent_handoff",
+                    workers=len(tasks),
+                    detail=(
+                        "race scouts continue under coordinator ownership while "
+                        "Reason plans complementary work"
+                    ),
+                )
+                tasks_d, solvers_d, intents_d = adopt_race_workers
+                for task, worker in tasks.items():
+                    tasks_d[task] = task_engines[task]
+                    solvers_d[task] = worker
+                    intents_d[task] = str(
+                        getattr(worker, "intent_id_assigned", "")
+                        or getattr(worker, "_intent_id", "")
+                        or f"intent:{getattr(worker, 'solver_id', 'cli-race')}"
+                    )
+                self._race_scout_handed_off = True
+                return None, None, {}
         except BaseException:
             # Worker construction is an acquisition transaction. If the Nth build,
             # spawn event, or task creation fails, every earlier reservation/runtime
@@ -146,7 +201,22 @@ class _ReviewLocksMixin:
         op_task = (asyncio.create_task(self._operator_event.wait(), name="race-operator-stop")
                    if self._operator_event is not None else None)
         results_by_worker: dict[Any, Any] = {}
-        race_deadline = time.monotonic() + float(self.race_timeout)
+        # Scheduling a task does not prove that its CLI/remote runtime exists.  Give
+        # that launch boundary a separate bounded window, then start the race budget
+        # from the last observed runtime start.  This prevents the coordinator from
+        # cancelling a Worker before its own identical timeout can harvest partial
+        # output and publish its exit proof (the a03 boundary failure).
+        race_startup_s = max(
+            30.0, min(120.0, max(30.0, float(self.race_timeout) * 0.25)))
+        race_startup_deadline = time.monotonic() + race_startup_s
+        race_deadline: float | None = None
+        # The Worker owns the same execution deadline.  Give its timeout handler a
+        # separate, bounded window to harvest partial output and publish runtime
+        # exit proof; this does not extend the Worker budget or admit new work.
+        race_exit_settle_s = max(
+            10.0, min(30.0, float(self.race_timeout) * 0.05))
+        race_exit_deadline: float | None = None
+        race_draining = False
         verifier_tasks: dict[asyncio.Task[Any], Any] = {}
         verifier_task_solvers: dict[asyncio.Task[Any], Any] = {}
         race_force_end = False
@@ -167,11 +237,64 @@ class _ReviewLocksMixin:
         try:
             pending = set(tasks.keys())
             while pending and not race_force_end:
-                remaining = race_deadline - time.monotonic()
+                now = time.monotonic()
+                if race_deadline is None:
+                    unstarted = [
+                        (task, worker)
+                        for task, worker in tasks.items()
+                        if (task in pending and not task.done()
+                            and not bool(getattr(worker, "_runtime_process_started", False)))
+                    ]
+                    if unstarted and now >= race_startup_deadline:
+                        for task, worker in unstarted:
+                            self._cancel_solver(worker)
+                            task.cancel()
+                        await self._emit_coord_bb(
+                            "race_startup_timeout",
+                            workers=[
+                                str(getattr(worker, "solver_id", "cli-?"))
+                                for _task, worker in unstarted
+                            ],
+                            startup_s=race_startup_s,
+                        )
+                        # Let the already-running Workers keep their full execution
+                        # budget; the cancelled pre-start tasks no longer block the
+                        # runtime-window calculation below.
+                        unstarted = []
+                    if not unstarted:
+                        starts = [
+                            float(getattr(worker, "_runtime_started_at", 0.0) or 0.0)
+                            for task, worker in tasks.items()
+                            if task in pending and not task.done()
+                            and bool(getattr(worker, "_runtime_process_started", False))
+                        ]
+                        race_deadline = max([now, *starts]) + float(self.race_timeout)
+                        race_exit_deadline = race_deadline + race_exit_settle_s
+                        await self._emit_coord_bb(
+                            "race_runtime_window_started",
+                            timeout=self.race_timeout,
+                            startup_s=race_startup_s,
+                        )
+                if race_deadline is not None and not race_draining and now >= race_deadline:
+                    race_draining = True
+                    await self._emit_coord_bb(
+                        "race_exit_settle_started",
+                        settle_s=race_exit_settle_s,
+                        reason=(
+                            "worker deadline reached; accepting only terminal "
+                            "results and runtime exit proof"
+                        ),
+                    )
+                phase_deadline = (
+                    race_exit_deadline if race_draining
+                    else (race_deadline or race_startup_deadline))
+                remaining = phase_deadline - now
                 if remaining <= 0:
-                    await _cancel_pending_race("race wall-clock deadline")
+                    await _cancel_pending_race(
+                        "race runtime-exit settle window elapsed")
                     break
-                if getattr(self.challenge, "mode", "ctf") == "pentest":
+                if (getattr(self.challenge, "mode", "ctf") == "pentest"
+                        and not race_draining):
                     await self._drain_report_pipeline()
                     await self._reap_verifier_tasks(
                         verifier_tasks, verifier_task_solvers,
@@ -233,9 +356,10 @@ class _ReviewLocksMixin:
                         pass
                     if getattr(self.challenge, "mode", "ctf") == "pentest":
                         await self._drain_report_pipeline()
-                        await self._maybe_dispatch_verifiers(
-                            healthy, verifier_tasks, verifier_task_solvers,
-                            emit_bb=self._emit_coord_bb)
+                        if not race_draining:
+                            await self._maybe_dispatch_verifiers(
+                                healthy, verifier_tasks, verifier_task_solvers,
+                                emit_bb=self._emit_coord_bb)
                 if self._flags_complete():
                     await _cancel_pending_race("flags complete")
                     break
@@ -315,8 +439,20 @@ class _ReviewLocksMixin:
                     reason="race-scout worker shutdown",
                 )
             if self._shutdown_owners_incomplete():
-                raise ControlShutdownIncomplete(
-                    "race-scout runtime exit remains unconfirmed")
+                if self._only_supervised_worker_retirements_pending():
+                    await self._emit_coord_bb(
+                        "race_worker_retire_deferred",
+                        workers=sorted(getattr(
+                            self, "_worker_runtime_owners", {}).keys()),
+                        detail=(
+                            "runtime exit proof remains owned by autonomous "
+                            "reapers; coordinator work may continue"
+                        ),
+                    )
+                else:
+                    raise ControlShutdownIncomplete(
+                        "race-scout runtime exit remains unconfirmed and has no "
+                        "complete supervised owner")
 
         winner: "Optional[str]" = None
         flag: "Optional[str]" = None
@@ -510,9 +646,10 @@ class _ReviewLocksMixin:
                 return spawned
             try:
                 w = self._make_cli_worker(
-                    engine, mode="verifier",
+                    engine, mode="report_reproducer",
                     intent_goal=str(row.get("goal") or ""),
                     intent_id=iid)
+                self._apply_step_contract(w, row)
             except WorkerSpawnRejected as exc:
                 await emit_bb("worker_spawn_rejected", reason=str(exc),
                               engine=str(engine), phase="verifier", intent_id=iid)
@@ -526,8 +663,7 @@ class _ReviewLocksMixin:
             won = False
             try:
                 won = self.shared_graph.claim_intent(
-                    worker=w.solver_id, intent_id=iid,
-                    lease_s=float(row.get("timeout") or 240) + 300.0)
+                    worker=w.solver_id, intent_id=iid)
             except Exception:
                 won = False
             if not won:
@@ -550,164 +686,71 @@ class _ReviewLocksMixin:
             spawned = True
         return spawned
 
-    def _queue_review_request(self, *, trigger: str, directive: str) -> None:
+    def _queue_review_request(self, *, trigger: str, directive: str,
+                              fact_seqs: Optional[list[int]] = None) -> None:
         if not self.review_policy.get("enabled", True):
             return
         trigger = (trigger or "review").strip()[:80]
         directive = (directive or "").strip()
         if not directive:
             return
-        item = {"trigger": trigger, "directive": directive}
+        item: dict[str, Any] = {"trigger": trigger, "directive": directive}
+        scoped: list[int] = []
+        for raw in fact_seqs or []:
+            try:
+                seq = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if seq > 0 and seq not in scoped:
+                scoped.append(seq)
+        if scoped:
+            item["fact_seqs"] = scoped
         if item in self._queued_review_requests:
             return
         self._queued_review_requests.append(item)
-        if len(self._queued_review_requests) > 16:
-            self._queued_review_requests = self._queued_review_requests[-16:]
 
-    @staticmethod
-    def _lane_hint_from_text(text: str, *, worker: str = "",
-                             require_control_hint: bool = False) -> dict[str, Any]:
-        text = text or ""
-        low = text.lower()
-        direct = re.search(
-            r"\b(?P<risk>[a-z_][a-z0-9_-]*):tcp:"
-            r"(?P<port>\*|[1-9]\d{0,4})@"
-            r"(?P<host>(?:\d{1,3}\.){3}\d{1,3}|[a-z0-9][a-z0-9.-]{0,252})\b",
-            low,
-        )
-        if direct:
-            lane, confidence, degradation_reason = canonicalize_lane(
-                host=direct.group("host"),
-                port=None if direct.group("port") == "*" else direct.group("port"),
-                service="",
-                risk_class=direct.group("risk"),
-            )
-            risk_class = lane.split(":", 1)[0] if lane else direct.group("risk")
-            return {
-                "lane_key": lane,
-                "risk_class": risk_class,
-                "confidence": confidence,
-                "degradation_reason": degradation_reason,
-                "reason": text[:1000],
-                "owner_worker": worker,
-            }
-        if require_control_hint and not any(k in low for k in (
-            "lane", "destructive", "exclusive", "serialize", "serialized",
-            "sequential", "one request", "single request", "single-request",
-            "rate-limit", "rate sensitive", "rate-sensitive", "holds the",
-            "under the", "同一", "独占", "串行", "序列化",
-        )):
-            return {"lane_key": "", "risk_class": "", "confidence": 0.0,
-                    "degradation_reason": "no_control_hint", "reason": text[:1000],
-                    "owner_worker": worker}
-        host = ""
-        m = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text)
-        if m:
-            host = m.group(0)
-        else:
-            hm = re.search(r"\b([a-z0-9][a-z0-9.-]+\.[a-z]{2,})\b", low)
-            if hm:
-                host = hm.group(1)
-        if require_control_hint and not host:
-            return {"lane_key": "", "risk_class": "", "confidence": 0.0,
-                    "degradation_reason": "no_host", "reason": text[:1000],
-                    "owner_worker": worker}
-        service = ""
-        port: str | int | None = None
-        if any(k in low for k in ("smb", "445", "eternalblue", "ms17", "relay", "responder")):
-            service, port = "smb", 445
-        elif "winrm" in low or "5985" in low:
-            service, port = "winrm", 5985
-        elif "rdp" in low or "3389" in low:
-            service, port = "rdp", 3389
-        elif "http" in low or "web" in low:
-            service = "https" if "https" in low or "443" in low else "http"
-            port = 443 if service == "https" else 80
-        pm = re.search(r"(?<!\d)([1-9]\d{1,4})(?!\d)", low)
-        if pm and not port:
+    def _review_fact_batches(
+        self, fact_seqs: Optional[list[int]], *, since_seq: int,
+    ) -> list[list[int]]:
+        graph = getattr(self, "shared_graph", None)
+        if graph is None:
+            return []
+        wanted: set[int] = set()
+        for value in fact_seqs or []:
             try:
-                p = int(pm.group(1))
-                if 0 < p <= 65535:
-                    port = p
-            except ValueError:
-                port = None
-        risk = "relay_service" if any(k in low for k in ("relay", "responder")) else "destructive"
-        lane, confidence, degradation_reason = canonicalize_lane(
-            host=host, port=port, service=service, risk_class=risk)
-        return {
-            "lane_key": lane,
-            "risk_class": risk,
-            "confidence": confidence,
-            "degradation_reason": degradation_reason,
-            "reason": text[:1000],
-            "owner_worker": worker,
-        }
-
-    @staticmethod
-    def _lane_proposal_from_need(need: str, worker: str = "") -> dict[str, Any]:
-        return _ReviewLocksMixin._lane_hint_from_text(need, worker=worker)
-
-    @staticmethod
-    def _mechanical_need_kind(text: str) -> str:
-        low = (text or "").lower()
-        if any(k in low for k in (
-            "ask operator", "operator decide", "need a decision from",
-            "需要 operator",
-        )):
-            return "operator_directive_needed"
-        if any(k in low for k in (
-            "exclusive", "serialize", "another worker", "same target",
-            "stop hammering", "独占", "序列化", "其他 worker", "其它 worker",
-        )):
-            return "lane_lock_request"
-        if any(k in low for k in (
-            "dead end", "dead-end", "route dead", "route failed",
-            "known dead", "no longer viable", "repeated failures",
-            "走死", "已知失败",
-        )):
-            return "route_dead_end"
-        if any(k in low for k in (
-            "unreachable", "connection refused", "refused", "timed out",
-            "timeout", "expired", "instance", "502", "503", "down",
-            "credential", "vps", "attachment", "token", "runtime",
-            "container", "凭据", "附件",
-        )):
-            return "external_blocker"
-        return "worker_uncertainty"
-
-    @classmethod
-    def _rechecked_need_kind(cls, need_text: str, proposed_kind: str) -> str:
-        valid = {
-            "external_blocker",
-            "operator_directive_needed",
-            "lane_lock_request",
-            "route_dead_end",
-            "worker_uncertainty",
-        }
-        proposed = (proposed_kind or "").strip().lower()
-        if proposed not in valid:
-            return cls._mechanical_need_kind(need_text)
-        if proposed == "external_blocker":
-            return cls._mechanical_need_kind(need_text)
-        return proposed
-
-    async def _consume_lane_release(self, rel: dict, *, emit_bb) -> None:
-        if not rel:
-            return
-        lane = str(rel.get("lane_key") or "")
-        for iid in rel.get("revived", []) or []:
-            try:
-                await emit_bb("lane_revived", intent_id=str(iid), lane_key=lane)
-            except Exception:
-                pass
-        for iid in rel.get("escalated", []) or []:
-            self._queue_review_request(
-                trigger="lane_blocked",
-                directive=(
-                    f"lane {lane} 上 intent {iid} 长期争用；"
-                    "请审查当前路线，提出绕开该资源或重新排序的 NEXT_INTENT。"
-                ),
-            )
+                seq = int(value)
+            except (TypeError, ValueError):
+                continue
+            if seq > 0:
+                wanted.add(seq)
+        try:
+            events = graph.events_since(
+                0 if wanted else int(since_seq), kinds=["fact_added"])
+        except Exception:
+            return [list(wanted)] if wanted else []
+        rows: list[tuple[int, str]] = []
+        for event in events:
+            seq = int(event.get("seq") or 0)
+            if wanted and seq not in wanted:
+                continue
+            payload = event.get("payload") or {}
+            text = str(payload.get("fact") or "") if isinstance(payload, dict) else ""
+            if seq > 0:
+                rows.append((seq, text))
+        batches: list[list[int]] = []
+        current: list[int] = []
+        used = 0
+        for seq, text in rows:
+            tokens = max(1, estimate_host_tokens(text))
+            if current and used + tokens > 180_000:
+                batches.append(current)
+                current = []
+                used = 0
+            current.append(seq)
+            used += tokens
+        if current:
+            batches.append(current)
+        return batches
 
     async def _maybe_start_review(
         self,
@@ -718,12 +761,25 @@ class _ReviewLocksMixin:
         tasks: dict,
         task_solvers: dict,
         emit_bb,
+        fact_seqs: Optional[list[int]] = None,
     ) -> bool:
+        if getattr(self.challenge, "mode", "ctf") == "ctf":
+            return False
         if not self.review_policy.get("enabled", True):
             return False
         if self._flags_complete():
             return False
-        if not self._review_capacity_available():
+        if trigger in {"candidate_spike", "duplicate_intents", "fruitless_workers"}:
+            open_intents = self._dispatchable_open_intents(
+                self._open_intents(), tasks)
+            ready_ordinary = [
+                intent for intent in open_intents
+                if str(intent.get("worker_class") or "code")
+                not in {"review", "verifier"}
+            ]
+            if self._capacity_dispatchable_open_intents(ready_ordinary, tasks):
+                return False
+        if not self._review_capacity_available(tasks):
             return False
         if self._review_workers_spawned >= int(self.review_policy.get("max_review_workers") or 12):
             return False
@@ -731,8 +787,22 @@ class _ReviewLocksMixin:
         cooldown = int(self.review_policy.get("cooldown_events") or 0)
         if (self._last_review_seq > 0
                 and seq <= self._last_review_seq + cooldown
-                and trigger != "course_correct"):
+                and trigger not in {"course_correct", "review_batch"}):
             return False
+        batches = self._review_fact_batches(
+            fact_seqs,
+            since_seq=int(getattr(self, "_last_review_seq", 0) or 0),
+        )
+        if batches:
+            fact_seqs = batches[0]
+            for batch in batches[1:]:
+                item = {
+                    "trigger": "review_batch",
+                    "directive": directive,
+                    "fact_seqs": batch,
+                }
+                if item not in self._queued_review_requests:
+                    self._queued_review_requests.append(item)
         try:
             engine = self._select_review_engine(healthy)
         except RuntimeError as exc:
@@ -740,7 +810,12 @@ class _ReviewLocksMixin:
             return False
         try:
             w = self._make_cli_worker(
-                engine, mode="review", intent_goal=directive)
+                engine, mode="review", intent_goal=directive,
+                timeout_override=(
+                    120
+                    if getattr(self.challenge, "mode", "ctf") == "ctf"
+                    else None
+                ))
         except WorkerSpawnRejected as exc:
             await emit_bb("worker_spawn_rejected", reason=str(exc),
                           engine=str(engine), phase="review")
@@ -751,6 +826,17 @@ class _ReviewLocksMixin:
                           cost_usd=self._current_cost_usd(),
                           cost_budget_usd=self.cost_budget_usd)
             return False
+        # Scope the review prompt's projection: facts since the PREVIOUS review
+        # (self._last_review_seq is only advanced below, after a successful
+        # start), or an explicit fact list when the trigger names specific facts
+        # (evidence_conflict / semantic_duplicate); to_review_projection prefers
+        # the explicit list over since_seq.
+        w._review_scope = {
+            "since_seq": int(getattr(self, "_last_review_seq", 0) or 0),
+            "trigger": trigger,
+            "fact_seqs": list(fact_seqs) if fact_seqs else None,
+        }
+        self._review_scopes_by_worker[w.solver_id] = dict(w._review_scope)
         t = await self._schedule_control_worker(
             w, name=f"review-{engine}")
         tasks[t] = engine
@@ -783,11 +869,131 @@ class _ReviewLocksMixin:
             directive=req.get("directive", ""),
             healthy=healthy, tasks=tasks,
             task_solvers=task_solvers, emit_bb=emit_bb,
+            fact_seqs=req.get("fact_seqs"),
         )
         if started:
             self._queued_review_requests.pop(0)
             return True
         return False
+
+    async def _drain_evidence_conflicts(self) -> None:
+        """Watch for a fact REFUTED WITH EVIDENCE by a non-review worker and queue
+        a scoped review of the fallout.
+
+        Deterministic host-side signal: the only place a fact is retired by fresh
+        verified evidence is the verify-intent supersede in
+        SQLiteSharedGraph._add_evidence_locked ("verifier evidence supersedes
+        challenged candidate") — the actor there is the evidence-producing worker.
+        Review workers have no fact operation in the host-side Skill allowlist,
+        and drain-applied supersedes carry
+        actor="coordinator", so filtering on the exact reason + actor can never
+        self-trigger from the arbiter's own actions."""
+        if self.shared_graph is None:
+            return
+        if not self.review_policy.get("on_evidence_conflict", True):
+            return
+        try:
+            events = self.shared_graph.events()
+        except Exception:
+            return
+        for ev in events:
+            seq = int(ev.get("seq") or 0)
+            if seq <= self._last_evidence_conflict_seq:
+                continue
+            self._last_evidence_conflict_seq = seq
+            if ev.get("kind") != EV_FACT_SUPERSEDED:
+                continue
+            if str(ev.get("actor") or "") == "coordinator":
+                continue
+            p = dict(ev.get("payload") or {})
+            if str(p.get("reason") or "") != (
+                    "verifier evidence supersedes challenged candidate"):
+                continue
+            try:
+                fact_seq = int(p.get("fact_seq") or 0)
+            except (TypeError, ValueError):
+                fact_seq = 0
+            if fact_seq <= 0:
+                continue
+            try:
+                by_seq = int(p.get("by_fact_seq") or 0)
+            except (TypeError, ValueError):
+                by_seq = 0
+            actor = str(ev.get("actor") or "worker")
+            suffix = f" (superseded by #{by_seq})" if by_seq > 0 else ""
+            self._queue_review_request(
+                trigger="evidence_conflict",
+                directive=(
+                    f"Worker {actor} produced verified evidence that refuted fact "
+                    f"#{fact_seq}{suffix}. Audit the intents/routes built on the "
+                    "refuted fact and the replacement's evidence; record the "
+                    "outcome as a REVIEW_FINDING with recommended_actions for the "
+                    "next Reason pass."
+                ),
+                fact_seqs=[fact_seq] + ([by_seq] if by_seq > 0 else []),
+            )
+
+    def _maybe_queue_semantic_duplicate_review(self) -> None:
+        """Deterministic semantic-duplicate detector over ACTIVE VERIFIED facts.
+
+        Bucket by route_hash; within a bucket, two facts are near-duplicates when
+        their stage-1 normalized identities differ (exact dupes already collapse
+        at intake) but their whitespace token sets have Jaccard >= 0.8. A bucket
+        with >= 3 such facts queues one scoped review. Pure host-side string math
+        — no model calls; bounded to the newest 200 verified facts and 50 buckets.
+        Re-scans only when the verified-fact watermark advanced."""
+        if getattr(self.challenge, "mode", "ctf") == "ctf":
+            return
+        if self.shared_graph is None:
+            return
+        if not self.review_policy.get("on_semantic_duplicate", True):
+            return
+        watermark = self._verified_fact_count()
+        if watermark <= self._semantic_dup_fact_watermark:
+            return
+        self._semantic_dup_fact_watermark = watermark
+        try:
+            rows = self.shared_graph.verified_fact_rows(limit=200)
+        except Exception:
+            return
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            identity = _normalize_fact_identity(str(row.get("fact") or ""))
+            tokens = frozenset(identity.split())
+            if not tokens:
+                continue
+            groups.setdefault(str(row.get("route_hash") or ""), []).append(
+                {"seq": int(row.get("fact_seq") or 0),
+                 "identity": identity, "tokens": tokens})
+        flagged: set[int] = set()
+        for members in list(groups.values())[:50]:
+            if len(members) < 3:
+                continue
+            near: set[int] = set()
+            for i in range(len(members)):
+                for j in range(i + 1, len(members)):
+                    a, b = members[i], members[j]
+                    if a["identity"] == b["identity"]:
+                        continue
+                    union = len(a["tokens"] | b["tokens"])
+                    if union and len(a["tokens"] & b["tokens"]) / union >= 0.8:
+                        near.add(a["seq"])
+                        near.add(b["seq"])
+            if len(near) >= 3:
+                flagged.update(near)
+        if len(flagged) < 3:
+            return
+        self._queue_review_request(
+            trigger="semantic_duplicate",
+            directive=(
+                f"{len(flagged)} verified facts on one route are semantic "
+                "near-duplicates (different normalized identity, token Jaccard "
+                ">= 0.8). Retire the redundant copies with FACT_MERGE/FACT_REJECT, "
+                "or record a REVIEW_FINDING explaining why they are genuinely "
+                "distinct findings."
+            ),
+            fact_seqs=sorted(flagged),
+        )
 
     async def _drain_resource_locks(self, *, emit_bb) -> None:
         """E: mirror new resource_locked / resource_released events (workers acquire
@@ -804,11 +1010,15 @@ class _ReviewLocksMixin:
             if seq <= self._last_resource_seq:
                 continue
             kind = ev.get("kind")
-            if kind not in ("resource_locked", "resource_released"):
+            if kind not in ("resource_locked", "resource_released",
+                            "resource_lock_denied"):
                 continue
             self._last_resource_seq = max(self._last_resource_seq, seq)
             p = dict(ev.get("payload") or {})
+            status = {"resource_released": "released",
+                      "resource_lock_denied": "denied"}.get(kind, "active")
             try:
+                # denied: owner_worker is the refused requester, held_by the holder.
                 await emit_bb(
                     "resource_lock_changed",
                     lock_id=p.get("lock_id", ""),
@@ -816,30 +1026,117 @@ class _ReviewLocksMixin:
                     scope=p.get("scope", "activity"),
                     risk_class=p.get("risk_class", ""),
                     owner_worker=p.get("owner_worker") or ev.get("actor", ""),
-                    status=("released" if kind == "resource_released" else "active"))
+                    held_by=p.get("held_by", ""),
+                    status=status)
             except Exception:
                 pass
 
-    async def _drain_review_proposals(self, *, emit_bb, fruitless_workers: int = 0) -> int:
+    def _review_finding_refs(
+        self, *, reviewer: str, route_hash: str,
+        evidence_seqs: list[int], intent_ids: list[str],
+    ) -> tuple[list[int], list[str]]:
+        """Fill the evidence/intent references a REVIEW_FINDING omitted.
+
+        Evidence defaults to the facts the reviewer was scoped to (the explicit
+        fact list, else facts since the previous review), narrowed to the
+        finding's route when one is named. Intents default to the producers of
+        those facts, then to intents on the same route."""
+        seqs = [int(x) for x in evidence_seqs if x > 0]
+        ids = [str(x) for x in intent_ids if x]
+        if seqs and ids:
+            return seqs, ids
+        graph = self.shared_graph
+        scope = self._review_scopes_by_worker.get(reviewer) or {}
+        scoped = {
+            int(x) for x in (scope.get("fact_seqs") or [])
+            if isinstance(x, int) and x > 0
+        }
+        try:
+            if seqs:
+                rows = [e for e in graph.events_since(0, kinds=["fact_added"])
+                        if int(e.get("seq") or 0) in set(seqs)]
+            elif scoped:
+                rows = [e for e in graph.events_since(0, kinds=["fact_added"])
+                        if int(e.get("seq") or 0) in scoped]
+            elif scope:
+                rows = graph.events_since(
+                    int(scope.get("since_seq") or 0), kinds=["fact_added"])
+            else:
+                rows = []
+        except Exception:
+            rows = []
+        if route_hash:
+            on_route = [
+                e for e in rows
+                if str((e.get("payload") or {}).get("route_hash") or "") == route_hash
+            ]
+            if on_route or not seqs:
+                rows = on_route
+        rows = rows[-self._REVIEW_REF_LIMIT:]
+        if not seqs:
+            seqs = [int(e.get("seq") or 0) for e in rows if int(e.get("seq") or 0) > 0]
+        if not ids:
+            for e in rows:
+                iid = str((e.get("payload") or {}).get("intent_id") or "")
+                if iid and iid not in ids:
+                    ids.append(iid)
+        if not ids and route_hash:
+            try:
+                proposed = graph.events_since(0, kinds=["intent_proposed"])
+            except Exception:
+                proposed = []
+            for e in proposed:
+                p = e.get("payload") or {}
+                if str(p.get("route_hash") or "") != route_hash:
+                    continue
+                if str(p.get("worker_class") or "") in {"review", "verifier"}:
+                    continue
+                iid = str(p.get("intent_id") or "")
+                if iid and iid not in ids:
+                    ids.append(iid)
+            ids = ids[-self._REVIEW_REF_LIMIT:]
+        return seqs, ids
+
+    async def _drain_review_proposals(self, *, emit_bb) -> int:
         if self.shared_graph is None:
             return 0
         try:
             events = self.shared_graph.events()
         except Exception:
             return 0
+        if not self._review_cursor_restored:
+            # Restart safety: the in-memory cursor starts at 0, but decisions are
+            # persisted events. Reload them once so a proposal decided before a
+            # coordinator restart never re-executes; the cursor resumes at the
+            # highest decided proposal (deferred proposals below it stay skipped,
+            # matching the advance-past semantics of the live loop).
+            self._review_cursor_restored = True
+            for e in events:
+                if e.get("kind") != "review_proposal_decision":
+                    continue
+                try:
+                    decided_seq = int(
+                        (e.get("payload") or {}).get("proposal_seq") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if decided_seq > 0:
+                    self._decided_proposal_seqs.add(decided_seq)
+            self._last_review_proposal_seq = max(
+                self._decided_proposal_seqs | {0})
         proposals = [
             e for e in events
             if e.get("kind") == "review_proposal"
             and int(e.get("seq") or 0) > self._last_review_proposal_seq
+            and int(e.get("seq") or 0) not in self._decided_proposal_seqs
         ]
         if not proposals:
             return 0
         applied = 0
-        # run-75377: a single review cycle could emit dozens of FACT_CHALLENGE /
-        # NEXT_INTENT, flooding the backlog with new (mostly verify) intents that then
-        # starved solving. Cap the per-cycle fan-out of intent-creating markers; the
-        # rest of the cycle only records REVIEW_FINDING. Eliminate-only markers
-        # (FACT_MERGE/SUPERSEDE/REJECT, REVIEW_FINDING) are NOT counted — they shrink
+        # run-75377: a single review cycle could emit dozens of FACT_CHALLENGEs,
+        # flooding the backlog with new (mostly verify) intents that then starved
+        # solving. Cap the per-cycle fan-out of intent-creating markers; the rest
+        # of the cycle only records REVIEW_FINDING. Eliminate-only markers
+        # (FACT_MERGE/REJECT, REVIEW_FINDING) are NOT counted — they shrink
         # backlog, not grow it. Counter is local so it resets every drain cycle.
         # A configured 0 genuinely disables challenge fan-out for the cycle (0 >= 0 is
         # immediately true, so every challenge-creating marker is recorded-only); don't
@@ -857,100 +1154,14 @@ class _ReviewLocksMixin:
             p = dict(ev.get("payload") or {})
             marker = str(p.get("marker") or "").upper()
             payload = dict(p.get("payload") or {})
-            tier = str(p.get("tier") or "tier1")
             accepted = False
             reason = ""
             applied_seq: Optional[int] = None
             try:
-                if tier == "tier2" and marker == "ROUTE_SUPPRESS":
-                    route = str(payload.get("route_hash") or "")
-                    failures = 0
-                    try:
-                        failures = int(self.shared_graph.genuine_failures_for_route(route))  # type: ignore[attr-defined]
-                    except Exception:
-                        failures = 0
-                    confidence = float(payload.get("confidence", 1.0) or 1.0)
-                    accepted = failures >= 3 and confidence >= 0.80
-                    reason = f"failures={failures}, confidence={confidence:.2f}"
-                    if accepted:
-                        info = self.shared_graph.suppress_route(
-                            actor="coordinator",
-                            route_hash=route,
-                            label=str(payload.get("label") or ""),
-                            reason=str(payload.get("reason") or ""),
-                            until=str(payload.get("until") or "new_evidence"),
-                            matching_intents=[
-                                str(x) for x in payload.get("matching_intents", []) if x
-                            ],
-                        )
-                        applied_seq = int(info.get("seq") or 0) or None
-                        await emit_bb("route_suppressed", **info,
-                                      label=str(payload.get("label") or ""),
-                                      reason=str(payload.get("reason") or ""),
-                                      proposal_seq=seq)
-                elif tier == "tier2" and marker == "LANE_LOCK":
-                    lane = str(payload.get("lane_key") or "")
-                    owner = str(payload.get("owner_worker") or payload.get("worker") or "coordinator")
-                    accepted = bool(lane) and not self.shared_graph.is_lane_held_by_other(  # type: ignore[attr-defined]
-                        lane, owner)
-                    reason = "lane available" if accepted else "lane already held"
-                    if accepted:
-                        info = self.shared_graph.lock_lane(  # type: ignore[attr-defined]
-                            actor="coordinator",
-                            lane_key=lane,
-                            risk_class=str(payload.get("risk_class") or ""),
-                            owner_worker=owner,
-                            owner_intent=str(payload.get("owner_intent") or ""),
-                        )
-                        accepted = bool(info.get("acquired"))
-                        reason = "lane locked" if accepted else "lane already held"
-                        if accepted:
-                            applied_seq = int(info.get("seq") or 0) or None
-                            directive_seq = self.shared_graph.add_coordinator_directive(
-                                actor="coordinator",
-                                action="lane_lock",
-                                directive=(
-                                    f"lane {info.get('lane_key')} is exclusively held by {owner}; "
-                                    "do not start destructive/exclusive work on that resource."
-                                ),
-                                priority="high",
-                            )
-                            await emit_bb("lane_locked", **info,
-                                          proposal_seq=seq,
-                                          directive_seq=directive_seq)
-                elif tier == "tier2" and marker == "LANE_UNLOCK":
-                    lane = str(payload.get("lane_key") or "")
-                    accepted = bool(lane)
-                    reason = "lane released" if accepted else "empty lane_key"
-                    if accepted:
-                        info = self.shared_graph.release_lane(  # type: ignore[attr-defined]
-                            actor="coordinator", lane_key=lane,
-                            by_worker=str(payload.get("owner_worker") or ""),
-                        )
-                        applied_seq = int(info.get("seq") or 0) or None
-                        await emit_bb("lane_released", **info, proposal_seq=seq)
-                        await self._consume_lane_release(info, emit_bb=emit_bb)
-                elif tier == "tier2" and marker == "COORDINATOR_DIRECTIVE":
-                    action = str(payload.get("action") or "").strip() or "note"
-                    accepted = (
-                        action == "rebootstrap"
-                        and self.barren_limit > 0
-                        and fruitless_workers >= self.barren_limit
-                    )
-                    reason = (
-                        f"fruitless_workers={fruitless_workers}, "
-                        f"barren_limit={self.barren_limit}"
-                    )
-                    if accepted:
-                        applied_seq = self.shared_graph.add_coordinator_directive(
-                            actor="coordinator",
-                            action=action,
-                            directive=str(payload.get("directive") or ""),
-                            priority=str(payload.get("priority") or "normal"),
-                            route_hash=str(payload.get("route_hash") or ""),
-                        )
-                        await emit_bb("coordinator_directive", seq=applied_seq,
-                                      proposal_seq=seq, **payload)
+                if marker not in REVIEW_FACT_MARKERS:
+                    # Old proposal events remain visible for audit but cannot act
+                    # under the current fact-only Review authority.
+                    reason = f"marker is outside Review authority: {marker}"
                 else:
                     accepted = True
                     if marker == "REVIEW_FINDING":
@@ -969,6 +1180,11 @@ class _ReviewLocksMixin:
                         recommended_actions = [
                             str(x) for x in payload.get("recommended_actions", []) if x
                         ]
+                        # The proposal's actor is the review worker that raised it.
+                        reviewer = str(ev.get("actor") or "")
+                        evidence_seqs, intent_ids = self._review_finding_refs(
+                            reviewer=reviewer, route_hash=route_hash,
+                            evidence_seqs=evidence_seqs, intent_ids=intent_ids)
                         applied_seq = self.shared_graph.add_review_finding(
                             actor="coordinator",
                             kind=kind,
@@ -979,6 +1195,7 @@ class _ReviewLocksMixin:
                             route_hash=route_hash,
                             branch_id=str(payload.get("branch_id") or ""),
                             recommended_actions=recommended_actions,
+                            worker=reviewer,
                         )
                         finding_id = SQLiteSharedGraph.review_finding_identity(
                             kind, summary, route_hash)
@@ -992,6 +1209,7 @@ class _ReviewLocksMixin:
                                       recommended_actions=recommended_actions,
                                       evidence_seqs=evidence_seqs,
                                       intent_ids=intent_ids,
+                                      worker=reviewer,
                                       proposal_seq=seq)
                     elif marker == "FACT_CHALLENGE":
                         if fanout_used >= challenge_budget:
@@ -1052,107 +1270,11 @@ class _ReviewLocksMixin:
                                           from_fact_seq=from_seq, to_fact_seq=to_seq,
                                           reason=str(payload.get("reason") or ""),
                                           proposal_seq=seq)
-                    elif marker == "FACT_SUPERSEDE":
-                        # A: a newer fact replaces this one → retire the old.
-                        fseq = int(payload.get("fact_seq"))
-                        by_seq = payload.get("by_fact_seq") or payload.get("to_fact_seq")
-                        applied_seq = self.shared_graph.supersede_fact(
-                            actor="coordinator", fact_seq=fseq,
-                            reason=str(payload.get("reason") or ""),
-                            by_fact_seq=int(by_seq) if by_seq is not None else None)
-                        await emit_bb("fact_superseded", seq=applied_seq,
-                                      fact_seq=fseq,
-                                      reason=str(payload.get("reason") or ""),
-                                      proposal_seq=seq)
-                    elif marker == "ROUTE_REOPEN":
-                        info = self.shared_graph.reopen_route(
-                            actor="coordinator",
-                            route_hash=str(payload.get("route_hash") or ""),
-                            reason=str(payload.get("reason") or ""),
-                            intent_goal=str(payload.get("intent_goal") or payload.get("goal") or ""),
-                        )
-                        applied_seq = int(info.get("seq") or 0) or None
-                        await emit_bb("route_reopened", **info,
-                                      reason=str(payload.get("reason") or ""),
-                                      proposal_seq=seq)
-                    elif marker == "BRANCH_SPLIT":
-                        info = self.shared_graph.split_branch(
-                            actor="coordinator",
-                            title=str(payload.get("title") or ""),
-                            branches=list(payload.get("branches") or []),
-                        )
-                        applied_seq = int(info.get("seq") or 0) or None
-                        await emit_bb("branch_split", **info,
-                                      title=str(payload.get("title") or ""),
-                                      proposal_seq=seq)
-                    elif marker == "BRANCH_RESOLVE":
-                        info = self.shared_graph.resolve_branch(  # type: ignore[attr-defined]
-                            actor="coordinator",
-                            branch_id=str(payload.get("branch_id") or ""),
-                            reason=str(payload.get("reason") or ""),
-                            status=str(payload.get("status") or "resolved"),
-                        )
-                        applied_seq = int(info.get("seq") or 0) or None
-                        await emit_bb("branch_resolved", **info, proposal_seq=seq)
-                    elif marker == "NEXT_INTENT":
-                        goal = str(payload.get("goal") or "").strip()
-                        if not goal:
-                            accepted = False
-                            reason = "empty goal"
-                        elif fanout_used >= challenge_budget:
-                            accepted = False
-                            reason = (f"fan-out budget exhausted "
-                                      f"({challenge_budget}/cycle)")
-                            await emit_bb("review_fanout_skipped", marker=marker,
-                                          proposal_seq=seq, budget=challenge_budget)
-                        else:
-                            iid = str(payload.get("id") or payload.get("intent_id") or "")
-                            if not iid:
-                                iid = "I-review-" + hashlib.sha1(
-                                    goal.encode("utf-8", "ignore")
-                                ).hexdigest()[:8]
-                            wc = str(payload.get("worker_class") or "code")
-                            lane_key = str(payload.get("lane_key") or "").strip()
-                            risk_class = str(payload.get("risk_class") or "").strip()
-                            if not lane_key:
-                                lane_hint = self._lane_hint_from_text(
-                                    goal, require_control_hint=True)
-                                lane_key = str(lane_hint.get("lane_key") or "")
-                                if lane_key and not risk_class:
-                                    risk_class = str(lane_hint.get("risk_class") or "")
-                            applied_seq = self.shared_graph.propose_intent(
-                                actor="coordinator", intent_id=iid, goal=goal,
-                                payload={
-                                    "worker_class": wc,
-                                    "route_hash": str(payload.get("route_hash") or ""),
-                                    "branch_id": str(payload.get("branch_id") or ""),
-                                    "lane_key": lane_key,
-                                    "risk_class": risk_class,
-                                    "rationale": str(payload.get("rationale") or "review proposed"),
-                                    "depends_on": [
-                                        str(x) for x in payload.get("depends_on", []) if x
-                                    ],
-                                },
-                                from_fact_seqs=[
-                                    int(x) for x in payload.get("from", [])
-                                    if isinstance(x, int)
-                                ] or None,
-                            )
-                            fanout_used += 1
-                            await emit_bb("intent_proposed", intent_id=iid,
-                                          goal=goal, worker_class=wc,
-                                          route_hash=str(payload.get("route_hash") or ""),
-                                          branch_id=str(payload.get("branch_id") or ""),
-                                          lane_key=lane_key,
-                                          risk_class=risk_class,
-                                          proposal_seq=seq)
-                    else:
-                        accepted = False
-                        reason = f"unsupported marker {marker}"
                 decision = "accepted" if accepted else "deferred"
                 self.shared_graph.decide_review_proposal(  # type: ignore[attr-defined]
                     actor="coordinator", proposal_seq=seq, decision=decision,
                     reason=reason, applied_seq=applied_seq)
+                self._decided_proposal_seqs.add(seq)
                 await emit_bb("review_proposal_decision", proposal_seq=seq,
                               marker=marker, decision=decision, reason=reason,
                               applied_seq=applied_seq)
@@ -1163,60 +1285,10 @@ class _ReviewLocksMixin:
                     self.shared_graph.decide_review_proposal(  # type: ignore[attr-defined]
                         actor="coordinator", proposal_seq=seq,
                         decision="rejected", reason=str(exc)[:500])
+                    self._decided_proposal_seqs.add(seq)
                     await emit_bb("review_proposal_decision", proposal_seq=seq,
                                   marker=marker, decision="rejected",
                                   reason=str(exc)[:500])
                 except Exception:
                     pass
         return applied
-
-    async def _spawn_rebootstrap_from_directive(
-        self,
-        *,
-        healthy: list[str],
-        tasks: dict,
-        task_solvers: dict,
-        running_engines_fn,
-        emit_bb,
-    ) -> bool:
-        if self.shared_graph is None or not self._ordinary_capacity_available(tasks):
-            return False
-        try:
-            directive = self.shared_graph.latest_unconsumed_directive_seq(
-                after_seq=self._last_directive_seq, action="rebootstrap")
-        except Exception:
-            directive = None
-        if not directive:
-            return False
-        text = str(directive.get("directive") or "").strip()
-        self._last_directive_seq = int(directive.get("seq") or self._last_directive_seq)
-        if not text:
-            return False
-        try:
-            engine = self._pick_engine(running_engines_fn(), healthy, role="bootstrap")
-        except RuntimeError as exc:
-            await emit_bb("worker_spawn_rejected", reason=str(exc),
-                          phase="review_directive")
-            return False
-        try:
-            w = self._make_cli_worker(engine, mode="bootstrap", intent_goal=text)
-        except WorkerSpawnRejected as exc:
-            await emit_bb("worker_spawn_rejected", reason=str(exc),
-                          engine=str(engine), phase="review_directive")
-            return False
-        except WorkerBudgetExhausted as exc:
-            await emit_bb(str(exc), spawned_total=self._spawned_total,
-                          max_total_workers=self.max_total_workers,
-                          cost_usd=self._current_cost_usd(),
-                          cost_budget_usd=self.cost_budget_usd)
-            return False
-        t = await self._schedule_control_worker(
-            w, name=f"review-directive-{engine}")
-        tasks[t] = engine
-        task_solvers[t] = w
-        await emit_bb("coordinator_directive", action="rebootstrap",
-                      directive=text[:500], priority=directive.get("priority", "normal"))
-        await emit_bb("worker_spawned", worker=w.solver_id,
-                      phase="review_directive", worker_role="worker",
-                      **worker_identity_event_fields(w))
-        return True

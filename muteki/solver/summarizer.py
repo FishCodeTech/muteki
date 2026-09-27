@@ -26,6 +26,9 @@ from muteki.core.events import (
     Event, EventType, hitl_translated_payload, node_summarized_payload,
 )
 from muteki.core.llm import LLMClient
+from muteki.core.prompt_assembly import (
+    PromptPart, compile_prompt, estimate_host_tokens, resolve_prompt_budget,
+)
 
 SUMMARY_MODEL = "deepseek-v4-flash"
 # Translation of a worker's hand-raise; same cheap/fast tier as the node gist. The
@@ -139,13 +142,21 @@ async def summarize_node(
     try:
         client = llm or LLMClient()
         try:
+            budget = resolve_prompt_budget(SUMMARY_MODEL, role="metadata")
+            user = compile_prompt(
+                "{context}",
+                required_sections=(PromptPart("source", text),),
+                optional_sections=(),
+                input_budget=(
+                    budget.input_budget_tokens - estimate_host_tokens(_SYSTEM)
+                ),
+            ).prompt
             resp = await client.chat(
                 model=SUMMARY_MODEL,
                 messages=[
                     {"role": "system", "content": _SYSTEM},
-                    {"role": "user", "content": text[:2000]},
+                    {"role": "user", "content": user},
                 ],
-                temperature=0.3,
                 # reasoning model (deepseek-v4-flash): most tokens go to the thinking
                 # phase, so 2000 frequently left the ACTUAL one-line answer truncated
                 # → flash "failed" → fell back to a hard-clipped head (the high-
@@ -155,6 +166,7 @@ async def summarize_node(
                 stream=False,
                 run_id=run_id,
                 challenge_id=challenge_id,
+                solver_id="reason",
             )
             summary = _clean(resp.content, text)
         finally:
@@ -212,17 +224,28 @@ async def translate_need(
     try:
         client = llm or LLMClient()
         try:
+            model_name = model or TRANSLATE_MODEL
+            budget = resolve_prompt_budget(model_name, role="metadata")
+            user = compile_prompt(
+                "{context}",
+                required_sections=(PromptPart("source", raw),),
+                optional_sections=(),
+                input_budget=(
+                    budget.input_budget_tokens
+                    - estimate_host_tokens(_TRANSLATE_SYSTEM)
+                ),
+            ).prompt
             resp = await client.chat(
-                model=model or TRANSLATE_MODEL,
+                model=model_name,
                 messages=[
                     {"role": "system", "content": _TRANSLATE_SYSTEM},
-                    {"role": "user", "content": raw[:2000]},
+                    {"role": "user", "content": user},
                 ],
-                temperature=0.2,
                 max_tokens=6000,   # reasoning model: leave room past the thinking phase
                 stream=False,
                 run_id=run_id,
                 challenge_id=challenge_id,
+                solver_id="reason",
             )
             zh = _clean(resp.content, raw)
         finally:

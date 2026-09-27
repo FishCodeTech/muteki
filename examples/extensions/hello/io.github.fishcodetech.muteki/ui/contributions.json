@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "navigation": [
+    {"id": "hello", "title": "Hello Extension", "route": "/extensions/hello"}
+  ],
+  "command_forms": [
+    {
+      "command_type": "ext.org.muteki.examples.hello.greet",
+      "title": "Greet",
+      "description": "向扩展发送 greet 命令；扩展经 event/propose 向宿主提案 greeted 事件。",
+      "fields": [
+        {"name": "name", "type": "string", "label": "称呼", "required": true, "placeholder": "如 muteki"}
+      ]
+    },
+    {
+      "command_type": "ext.org.muteki.examples.hello.security_probe",
+      "title": "隔离验证",
+      "description": "在扩展子进程内尝试文件、网络或子进程操作，返回操作系统隔离结果。",
+      "fields": [
+        {"name": "operation", "type": "string", "label": "操作", "required": true, "enum": ["file", "network", "subprocess"]},
+        {"name": "path", "type": "string", "label": "文件路径"},
+        {"name": "host", "type": "string", "label": "网络主机"},
+        {"name": "port", "type": "integer", "label": "网络端口"}
+      ]
+    }
+  ],
+  "status_labels": {
+    "field": "state",
+    "labels": {
+      "installed": {"text": "已安装", "color": "muted"},
+      "ready": {"text": "就绪", "color": "green"},
+      "degraded": {"text": "降级", "color": "amber"},
+      "unavailable": {"text": "不可用", "color": "red"},
+      "disabled": {"text": "已停用", "color": "muted"}
+    }
+  },
+  "board": {
+    "projection": "summary",
+    "status_field": "active",
+    "columns": [
+      {"id": "active", "title": "已激活", "statuses": ["true"]},
+      {"id": "inactive", "title": "未激活", "statuses": ["false"]}
+    ],
+    "card": {"title_field": "greeting", "subtitle_field": "greetings", "badge_field": "active"}
+  },
+  "artifact_viewers": [
+    {"id": "summary-json", "title": "问候摘要（JSON）", "kind": "json", "projection": "summary"},
+    {"id": "greeting-frame", "title": "问候语（受控 iframe）", "kind": "iframe", "projection": "summary", "field": "greeting"}
+  ]
+}

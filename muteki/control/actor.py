@@ -391,7 +391,10 @@ class ControlActor:
                 state=EffectState.FAILED,
                 scope=command.scope,
                 observed_generation=current.generation,
-                detail=f"durable companion rejected: {type(exc).__name__}",
+                detail=(
+                    f"durable companion rejected: {type(exc).__name__}: "
+                    f"{str(exc)[:200]}"
+                ),
                 metadata={"code": "durable_companion_failure"},
             ))
             await self._emit(failed)
@@ -550,6 +553,17 @@ class ControlActor:
             if not isinstance(raw, dict):
                 raise ValueError("add_context payload.context must be an object")
             requested_kind = ContextKind(str(raw.get("kind") or ContextKind.CLUE.value))
+            content = str(raw.get("content") or "")
+            if (
+                command.scope.kind is ScopeKind.WORKER
+                and targets
+                and requested_kind is not ContextKind.SECRET_REF
+                and not content.startswith("secret://")
+            ):
+                # Plain context for a live Worker is delivered directly into the
+                # same session. It is already durable in the command journal and
+                # does not need a second I-control task.
+                return _DurableCompanion()
             delivery_scope = self._stable_delivery_scope(
                 command.scope, targets, command_id=command.command_id)
             if delivery_scope is None:
@@ -609,6 +623,15 @@ class ControlActor:
                         ContextKind.SECRET_REF if text.startswith("secret://") else
                         ContextKind.OBJECTIVE if command.action is ControlAction.FOCUS else
                         ContextKind.CLUE)
+                if (
+                    command.scope.kind is ScopeKind.WORKER
+                    and targets
+                    and kind is not ContextKind.SECRET_REF
+                ):
+                    # A live, non-secret Worker hint resumes that exact session.
+                    # Creating a parallel ContextResource here made recovery spawn
+                    # an unrelated I-control Worker for the same instruction.
+                    return _DurableCompanion()
                 ttl_s = payload.get("ttl_s")
                 expires_at = (command.created_at + max(0.0, float(ttl_s))
                               if ttl_s is not None else None)

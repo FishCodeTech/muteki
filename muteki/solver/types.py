@@ -16,7 +16,7 @@ from muteki.models.solve_graph import SolveGraph
 class SolverConfig:
     max_steps: int = 12
     code_timeout: float = 90.0
-    temperature: float = 0.4
+    temperature: Optional[float] = None
     max_tokens: int = 8000
     stdout_limit: int = 6000  # chars of stdout shown inline before overflow->artifact
     # P-C: auto-trigger the Reason phase (planner + evidence audit) when the
@@ -58,3 +58,7 @@ class SolveOutcome:
     # Non-secret profile snapshot used to resume the exact winning seat after a
     # settings change or server restart.
     runtime_profile: dict[str, Any] = field(default_factory=dict)
+    # The structured result this worker committed at end-of-life (a
+    # muteki.solver.worker_result.WorkerResult — typed Any here to avoid an
+    # import cycle). None when the worker never reached a commit (respond mode).
+    worker_result: Optional[Any] = None

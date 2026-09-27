@@ -1,0 +1,61 @@
+/* Chat workbench: composer. Rules are prefixed `.cx-` and never target other pages. */
+
+.cx-composer-card {
+  box-shadow: var(--cx-shadow-composer);
+  transition:
+    box-shadow var(--cx-dur) var(--cx-ease-out),
+    background-color var(--cx-dur) var(--cx-ease-out);
+}
+.cx-composer-card:focus-within {
+  box-shadow: var(--cx-shadow-composer);
+}
+.cx-composer-card:has(.cx-prompt-editor:focus) {
+  box-shadow: var(--cx-shadow-composer-focus);
+}
+.cx-composer-card[data-drag-over="true"] {
+  box-shadow: var(--cx-shadow-composer-focus);
+}
+
+/* Inline context refs are built imperatively inside the contenteditable editor. */
+.cx-ref-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  max-width: 260px;
+  margin: 0 1px;
+  padding: 0 7px;
+  vertical-align: -3px;
+  border-radius: 6px;
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 22px;
+  white-space: nowrap;
+  cursor: default;
+  user-select: all;
+  color: var(--cx-accent);
+  background: var(--cx-accent-soft);
+  transition: background-color var(--cx-dur-fast) var(--cx-ease-out);
+}
+.cx-ref-chip:hover { background: color-mix(in srgb, var(--accent) 18%, transparent); }
+.cx-ref-chip.is-stale { color: var(--cx-warning); background: var(--cx-warning-soft); }
+.cx-ref-chip.is-missing { color: var(--cx-danger); background: var(--cx-danger-soft); }
+.cx-ref-chip-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.cx-ref-chip-status { font-size: 10.5px; font-weight: 400; opacity: 0.85; }
+
+.cx-drop-overlay {
+  background-image:
+    linear-gradient(var(--cx-selected), var(--cx-selected));
+  outline: 1.5px dashed var(--cx-focus);
+  outline-offset: -6px;
+}
+
+/* Queue tray sits behind the composer card so the two read as one surface. */
+.cx-queue-tray {
+  box-shadow: 0 0 0 1px var(--cx-border-subtle);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cx-composer-card { transition-duration: 1ms; }
+}
+html[data-motion="reduce"] .cx-composer-card { transition-duration: 1ms; }

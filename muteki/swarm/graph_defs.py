@@ -13,11 +13,17 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from urllib.parse import urlparse
 
 
 # ── event types (C: append-only log) ─────────────────────────────────────────
 EV_FACT_ADDED = "fact_added"
+EV_FACT_OBSERVED = "fact_observed"
+EV_FACT_PROMOTED = "fact_promoted"
+# Raw Worker claims are always retained as observations.  Observation events are
+# deliberately non-semantic: only an admitted Fact may change the planning graph.
+EV_OBSERVATION_ADDED = "observation_added"
 EV_HYP_PROPOSED = "hyp_proposed"
 EV_HYP_REFUTED = "hyp_refuted"
 EV_DEAD_END = "dead_end"
@@ -44,6 +50,7 @@ EV_FACT_REVALIDATED = "fact_revalidated"
 EV_ROUTE_SUPPRESSED = "route_suppressed"
 EV_ROUTE_REOPENED = "route_reopened"
 EV_BRANCH_SPLIT = "branch_split"
+EV_BRANCH_FACTS_BOUND = "branch_facts_bound"
 EV_BRANCH_RESOLVED = "branch_resolved"
 EV_COORDINATOR_DIRECTIVE = "coordinator_directive"
 EV_REVIEW_PROPOSAL = "review_proposal"
@@ -65,8 +72,64 @@ EV_HITL_CLASSIFIED = "hitl_classified"
 # E: unified resource lock (coexists with lane_locks via the adapter).
 EV_RESOURCE_LOCKED = "resource_locked"
 EV_RESOURCE_RELEASED = "resource_released"
+# A request refused because another worker holds the lease; records the requester.
+EV_RESOURCE_LOCK_DENIED = "resource_lock_denied"
 # H: long-run graph compaction.
 EV_GRAPH_COMPACTED = "graph_compacted"
+# Stage-1b: one atomic worker-result commit (observations/dead-ends/PoCs/
+# conclusion) leaves exactly one audit event. Summary/audit record only — it
+# does not advance Decide, so it stays OUT of SEMANTIC_GRAPH_KINDS.
+EV_WORKER_RESULT_COMMITTED = "worker_result_committed"
+# Run-scoped executable state.  Capabilities and access-path health changes are
+# semantic because they change which Steps are useful/executable.  Resource
+# bookkeeping and value receipts remain audit-only.
+EV_CAPABILITY_PUBLISHED = "capability_published"
+EV_CAPABILITY_RETIRED = "capability_retired"
+EV_CAPABILITY_GAP_REPORTED = "capability_gap_reported"
+EV_ACCESS_PATH_PUBLISHED = "access_path_published"
+EV_ACCESS_PATH_STATE_CHANGED = "access_path_state_changed"
+EV_RUNTIME_RESOURCE_REGISTERED = "runtime_resource_registered"
+EV_RUNTIME_RESOURCE_STATE_CHANGED = "runtime_resource_state_changed"
+EV_VALUE_RECEIPT = "value_receipt"
+
+# Worker runtime primitives are supplied by the host for every admitted Step.
+# They are not run-shared attack capabilities and must never strand an Intent
+# behind a capability gap. Remote execution, credentials, pivots, tunnels and
+# other target-derived state remain graph capabilities and are intentionally
+# absent from this set.
+WORKER_RUNTIME_CAPABILITY_KEYS = frozenset({
+    "local-command-execution",
+    "local-shell",
+    "http-client",
+    "target-direct-access",
+    "web-access",
+    "toolbox",
+})
+
+# Semantic graph kinds that may advance Decide. Heartbeats, worker-session
+# telemetry, spawn-rejection counters, and ordinary logs are excluded.
+SEMANTIC_GRAPH_KINDS = frozenset({
+    EV_FACT_ADDED,
+    EV_FACT_CHALLENGED, EV_FACT_REVALIDATED, EV_FACT_REJECTED,
+    EV_FACT_MERGED, EV_FACT_SUPERSEDED, EV_FACT_PINNED,
+    EV_INTENT_PROPOSED, EV_INTENT_CONCLUDED, EV_INTENT_STATE_CHANGED,
+    EV_INTENT_LANE_DEFERRED,
+    EV_DEAD_END,
+    EV_FLAG_FOUND, EV_FLAG_INVALIDATED, EV_FLAG_SUBMISSION_DECISION,
+    EV_FINDING_FOUND, EV_FINDING_INVALIDATED,
+    EV_REPORT_SUBMITTED, EV_REPORT_REJECTED, EV_REPORT_REPRO_DECISION,
+    EV_REPORT_VALUE_DECISION, EV_REPORT_ACCEPTED,
+    EV_POC_SAVED, EV_POC_CLAIMED, EV_POC_CONCLUDED,
+    EV_LANE_LOCKED, EV_LANE_RELEASED, EV_RESOURCE_LOCKED, EV_RESOURCE_RELEASED,
+    EV_GRAPH_COMPACTED,
+    EV_REVIEW_PROPOSAL_DECISION, EV_OPERATOR_DIRECTIVE,
+    EV_OPERATOR_DIRECTIVE_STATUS, EV_COORDINATOR_DIRECTIVE,
+    EV_ROUTE_SUPPRESSED, EV_ROUTE_REOPENED, EV_BRANCH_SPLIT,
+    EV_BRANCH_FACTS_BOUND, EV_BRANCH_RESOLVED,
+    EV_CAPABILITY_PUBLISHED, EV_CAPABILITY_RETIRED,
+    EV_CAPABILITY_GAP_REPORTED,
+    EV_ACCESS_PATH_PUBLISHED, EV_ACCESS_PATH_STATE_CHANGED,
+})
 
 
 # A: fact lifecycle states. unresolved/challenged/revalidated keep the legacy
@@ -88,14 +151,26 @@ _FACT_STATES = {
 # resume  → held back from dispatch (paused/deferred), kept for audit/revival
 # retired → permanently dropped (compacted/stale); never re-dispatched
 # closed  → terminal-by-conclusion (solved/route_suppressed/etc.)
+# blocked → context/capability gap (secure transport, required continuation,
+#           role profile); held back until an operator repair + explicit reopen
 INTENT_DISPATCH_ACTIVE = "active"
 INTENT_DISPATCH_RESUME = "resume"
 INTENT_DISPATCH_RETIRED = "retired"
 INTENT_DISPATCH_CLOSED = "closed"
+INTENT_DISPATCH_BLOCKED = "blocked"
 _INTENT_DISPATCH_STATES = {
     INTENT_DISPATCH_ACTIVE, INTENT_DISPATCH_RESUME,
     INTENT_DISPATCH_RETIRED, INTENT_DISPATCH_CLOSED,
+    INTENT_DISPATCH_BLOCKED,
 }
+
+# Review has fact-audit authority only. Keeping this one contract shared by the
+# prompt parser, graph write boundary, and coordinator drain prevents any layer
+# from silently re-enabling scheduling or operator-control markers.
+REVIEW_FACT_MARKERS = frozenset({
+    "REVIEW_FINDING", "FACT_CHALLENGE", "FACT_REVALIDATION",
+    "FACT_REJECT", "FACT_MERGE",
+})
 
 
 _SERVICE_DEFAULT_PORTS = {
@@ -125,22 +200,25 @@ _LANE_RISK_CLASSES = {
 }
 
 
-# A worker records the SAME finding through two entrances: the blackboard skill
-# (write_fact → bare text, verified) AND its CLI stream's VERIFIED_FACT= marker
-# (_record_fact → "[codex] <text>", often witness-downgraded to a candidate). The
-# old dedupe key `fact::{actor}::{artifact_id}::{text}` treated these as two facts
-# (engine prefix + artifact differ), so one finding became 1 verified + 1 candidate
-# echo — the dominant source of candidate inflation (run-75377: 97 candidates, most
-# of them prefixed marker echoes of 33 bare verified skill facts). The fact's
-# IDENTITY is who-said-what, not which entrance or which artifact carried it: strip
-# the leading "[engine] " tag and normalize whitespace so both entrances collide on
-# one key. artifact_id is provenance, not identity — it is excluded from the key.
+# Fact identity is the normalized observation within one challenge, independent
+# of the Worker or artifact that carried it. Strip the leading "[engine] " tag and
+# normalize whitespace so repeated observations collapse onto one fact.
 _FACT_ENGINE_PREFIX_RE = re.compile(r"^\[[a-z0-9 _.-]{1,40}\]\s*", re.IGNORECASE)
 
 
 def _normalize_fact_identity(fact: str) -> str:
-    s = _FACT_ENGINE_PREFIX_RE.sub("", str(fact or ""))
-    return " ".join(s.split()).lower()
+    # Deterministic, conservative identity normalization: Unicode compatibility
+    # folding, engine-prefix removal, typographic punctuation normalization and
+    # whitespace/case folding.  It collapses formatting variants while leaving
+    # distinct factual wording separate (semantic similarity belongs in Review).
+    s = unicodedata.normalize("NFKC", str(fact or ""))
+    s = _FACT_ENGINE_PREFIX_RE.sub("", s)
+    s = s.translate(str.maketrans({
+        "“": '"', "”": '"', "‘": "'", "’": "'",
+        "—": "-", "–": "-", "：": ":", "，": ",", "。": ".",
+    }))
+    s = " ".join(s.split()).strip(" \t\r\n.,;:!")
+    return s.casefold()
 
 
 def _clean_lane_risk(risk_class: str) -> str:

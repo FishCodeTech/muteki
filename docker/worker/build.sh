@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Build the muteki worker image (ONE generic image — not a per-recipe tag). Two steps:
+# Build the muteki worker image (ONE generic image — not a per-recipe tag).
+# Local development helper only — formal multi-arch release goes through
+# .github/workflows/release-images.yml (do not docker push GHCR from here).
+# Two steps:
 #   1) cross-compile the Go runtime-agent (supervisor) to
 #      docker/worker/runtime_agent-amd64 (the docker build context).
 #   2) docker build the amd64 image, tagging both the version and :latest.
@@ -40,7 +43,6 @@ file "$RUNTIME_AGENT" 2>/dev/null || true
 echo ">> syncing muteki-blackboard skill into docker build context..."
 cp "$REPO/skills/muteki-blackboard/SKILL.md" "$HERE/blackboard.SKILL.md"
 cp "$REPO/skills/muteki-blackboard/blackboard.py" "$HERE/blackboard.py"
-cp "$REPO/muteki/solver/deepseek_harness_worker.py" "$HERE/deepseek_harness_worker.py"
 cp "$REPO/muteki/solver/offline_acp_bridge.py" "$HERE/offline_acp_bridge.py"
 cp "$REPO/muteki/solver/omp_offline_config.yml" "$HERE/omp_offline_config.yml"
 cp "$REPO/muteki/solver/kimi_offline_agent.md" "$HERE/kimi_offline_agent.md"
@@ -101,25 +103,9 @@ docker build --platform linux/amd64 --load \
   "${build_args[@]}" \
   -t "$TAG" -t "$LATEST" "$HERE"
 
-echo ">> [3/3] verifying all 9 engines and the Kali toolchain..."
-docker run --rm --platform linux/amd64 --user kali \
-  -e HOME=/home/kali --entrypoint bash "$TAG" -lc '
-    set -e
-    claude --version
-    codex --version
-    /home/kali/.local/bin/cursor-agent --version
-    pi --version
-    /home/kali/.local/bin/omp --version
-    kimi --version
-    /home/kali/.grok/bin/grok --version
-    opencode --version
-    python3 /opt/muteki/deepseek_harness_worker.py --version
-    test -r /opt/muteki/offline_acp_bridge.py
-    test -r /opt/muteki/omp_offline_config.yml
-    test -r /opt/muteki/kimi_offline_agent.md
-    test -r /opt/muteki/grok_offline_agent.md
-    test -x /opt/muteki/runtime_agent
-    test -x /usr/local/bin/blackboard.py
-    command -v ghidra sage vol radare2 >/dev/null
-  '
-echo ">> done: $TAG (+ $LATEST); all 9 engines verified"
+echo ">> [3/3] verifying eight container engines + core tools..."
+DIGEST="$(docker image inspect --format '{{.Id}}' "$TAG")"
+echo ">> image id: $DIGEST"
+"$REPO/scripts/verify_worker_image.sh" --image "$TAG" --variant full --platform linux/amd64 \
+  --versions-file "$HERE/.last-engine-versions.txt"
+echo ">> done: $TAG (+ $LATEST); 8 engines + core tools verified (local helper only — formal release uses release-images.yml)"

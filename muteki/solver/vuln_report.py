@@ -1,8 +1,8 @@
 """Pentest exploit-report contract: parse, completeness, identity, value codes.
 
 Product success for pentest is an accepted report in the vulnerability-report
-collection. A solver Worker writes a structured file and prints
-``SUBMIT_REPORT=path``. Completeness is host-side. Reproduction and value
+collection. A solver Worker writes a structured file and submits it through the
+Muteki Blackboard Skill. Completeness is host-side. Reproduction and value
 judgment are separate actors. This module has no shell and does not accept a
 finding from the submitter's own output.
 """
@@ -16,7 +16,11 @@ from pathlib import Path
 from typing import Any, Mapping, TypedDict
 from urllib.parse import urlparse
 
-from muteki.solver.gate import finding_in_scope, normalize_finding_class
+from muteki.solver.gate import (
+    finding_in_scope,
+    normalize_finding_class,
+    parse_engagement_scope,
+)
 
 
 REPORT_ID_PREFIX = "I-repro-"
@@ -103,7 +107,7 @@ VALUE_REJECT_DUPLICATE = "duplicate"
 
 _PLACEHOLDER_TEXT = frozenset({
     "", "-", "n/a", "na", "none", "null", "unknown", "todo", "tbd",
-    "placeholder", "xxx", "redacted", "lorem ipsum", "example",
+    "placeholder", "xxx", "lorem ipsum", "example",
     "the attacker", "an attacker", "attacker", "self", "myself",
 })
 
@@ -155,7 +159,11 @@ REPORT_FIELD_HELP = (
     "  impact.who, impact.what, steps (array, >=2 concrete actions),\n"
     "  replay.command (a curl/python command a stranger can run),\n"
     "  witness (unique substring copied from THIS session's command output; "
-    ">= 8 chars).\n"
+    ">= 8 chars), vector (the exact parameter, sink, or upload field).\n"
+    "When the engagement asks for a concrete outcome (command execution, shell "
+    "access, or administrator access), also add goal_evidence with predicate, "
+    "witness, and detail. The witness must be the same reproduced output that "
+    "proves the outcome.\n"
     "finding_class is one of: sqli, xss, rce, idor, ssrf, csrf, lfi, upload, other.\n"
     "title must name the exact parameter or sink, not 'SQLi in login'.\n"
     "steps must name the login URL, the session/cookie, the vulnerable path, "
@@ -173,10 +181,9 @@ REPORT_FIELD_HELP = (
     "(headers, banners, directory listing) are refused.\n"
     "Do not copy the example JSON. Replace every field with this target's "
     "facts. One report per distinct finding_class + resource.\n"
-    "When the file is complete, print ONE line:\n"
-    "  SUBMIT_REPORT=<relative path from your working directory>\n"
-    "FOUND_FINDING= is ignored. A report is not accepted until a different "
-    "Worker reproduces it and a host-side value check passes."
+    "When the file is complete, submit it with the `submit-report` operation "
+    "defined by the `muteki-blackboard` Skill. A report is not accepted until a "
+    "different Worker reproduces it and a host-side value check passes."
 )
 
 _PENTEST_REPORT_BLOCK = (
@@ -194,7 +201,9 @@ _PENTEST_REPORT_BLOCK = (
     '  "steps": ["Log in at the real login URL and save the cookie.", '
     '"Open the vulnerable path, send the exact payload, save the body."],\n'
     '  "replay": {{"command": "curl -c cj -b cj -s .../login.php && curl -s -b cj \'http://in-scope-host/path?...\'"}},\n'
-    '  "witness": "unique data substring from the exploit response"\n'
+    '  "witness": "unique data substring from the exploit response",\n'
+    '  "vector": "ip parameter",\n'
+    '  "goal_evidence": {{"predicate": "command_execution|shell_access|admin_access", "witness": "same reproduced output", "detail": "what access was obtained"}}\n'
     "}}\n"
     "Prefer distinct, high-impact classes on this target: UNION/error SQL "
     "injection that returns other accounts, OS command injection that returns "
@@ -219,14 +228,12 @@ VERIFIER_PROMPT = (
     "with a cookie jar you just created.\n"
     "Run the exploit YOURSELF (curl or python). The witness string MUST appear "
     "in YOUR command stdout/stderr (or a file you just wrote from that output).\n"
-    "Print REPRODUCED= only after the exploit request, never before.\n"
-    "When done, print exactly:\n"
-    "  REPRODUCED=yes\n"
-    "  REPRO_WITNESS=<snippet copied from YOUR output>\n"
-    "or:\n"
-    "  REPRODUCED=no\n"
-    "  REPRO_REASON=<why it failed>\n"
-    "Do not submit a flag. Do not print SUBMIT_REPORT. Stay inside Scope."
+    "Load and follow the project-local `muteki-blackboard` Skill. Submit exactly "
+    "one reproduction decision through its `submit-repro` operation after the "
+    "exploit request. The host validates the witness against this Worker's tool "
+    "events and verifies that the replay command was attempted. Ordinary assistant "
+    "text has no reproduction authority. Do not hunt unrelated vulnerabilities, "
+    "submit a Flag, or submit another report. Stay inside Scope."
 )
 
 VALUE_JUDGE_SYSTEM = (
@@ -253,7 +260,8 @@ def report_identity(report: Mapping[str, Any]) -> str:
     resource = str(report.get("resource_id") or "").strip().lower()
     if resource.endswith("/") and resource.count("/") > 3:
         resource = resource.rstrip("/")
-    return f"{cls}::{resource}"
+    vector = str(report.get("vector") or "").strip().lower()
+    return f"{cls}::{resource}::{vector}"
 
 
 def make_report_id(report: Mapping[str, Any]) -> str:
@@ -316,7 +324,7 @@ def _replay_map(raw: Any) -> dict[str, str]:
         if not command and method and url:
             command = f"{method.upper()} {url}"
             if body:
-                command = f"{command} body={body[:400]}"
+                command = f"{command} body={body}"
         return {
             "command": command,
             "method": method,
@@ -332,8 +340,11 @@ def normalize_report(raw: Mapping[str, Any] | None) -> dict[str, Any]:
     replay = _replay_map(data.get("replay") or data.get("poc") or data.get("request"))
     steps = _steps_list(data.get("steps") or data.get("reproduction") or data.get("repro_steps"))
     cls = normalize_finding_class(_as_text(data.get("finding_class") or data.get("class")))
+    goal_raw = data.get("goal_evidence")
+    goal_evidence = dict(goal_raw) if isinstance(goal_raw, Mapping) else {}
+    title = _as_text(data.get("title") or data.get("name"))
     report = {
-        "title": _as_text(data.get("title") or data.get("name")),
+        "title": title,
         "finding_class": cls,
         "resource_id": _as_text(data.get("resource_id") or data.get("url") or data.get("path")),
         "preconditions": _as_text(data.get("preconditions") or data.get("auth")),
@@ -342,6 +353,16 @@ def normalize_report(raw: Mapping[str, Any] | None) -> dict[str, Any]:
         "steps": steps,
         "replay": replay,
         "witness": _as_text(data.get("witness") or data.get("evidence_snippet")),
+        # Older workers do not yet send vector.  Their concrete title remains a
+        # stable fallback so two findings on one resource are not merged only
+        # because the new field is absent.
+        "vector": _as_text(
+            data.get("vector") or data.get("parameter") or data.get("sink")) or title,
+        "goal_evidence": {
+            "predicate": _as_text(goal_evidence.get("predicate")),
+            "witness": _as_text(goal_evidence.get("witness")),
+            "detail": _as_text(goal_evidence.get("detail")),
+        },
         "narrative": _as_text(data.get("narrative") or data.get("writeup") or data.get("summary")),
         "evidence_paths": [
             _as_text(p) for p in (data.get("evidence_paths") or []) if _as_text(p)
@@ -349,6 +370,44 @@ def normalize_report(raw: Mapping[str, Any] | None) -> dict[str, Any]:
     }
     report["report_id"] = _as_text(data.get("report_id")) or make_report_id(report)
     return report
+
+
+def report_goal_decision(
+    engagement: Any, report: Mapping[str, Any],
+) -> tuple[bool, str, str]:
+    """Host-side goal gate for an independently reproduced, value-accepted report."""
+    expected_class = normalize_finding_class(
+        str(getattr(engagement, "finding_class", "") or ""))
+    actual_class = normalize_finding_class(str(report.get("finding_class") or ""))
+    if expected_class not in {"", "generic"} and actual_class != expected_class:
+        return False, "finding_class_mismatch", (
+            f"expected {expected_class}, got {actual_class or 'unknown'}")
+
+    predicate = str(
+        getattr(engagement, "outcome_predicate", "first_valid_report")
+        or "first_valid_report")
+    if str(getattr(engagement, "completion_kind", "outcome")) != "outcome":
+        return True, "report_qualifies", "report matches the requested class"
+    if predicate == "first_valid_report":
+        return True, "outcome_met", "one independently accepted report"
+    evidence = report.get("goal_evidence")
+    evidence = dict(evidence) if isinstance(evidence, Mapping) else {}
+    claimed = _as_text(evidence.get("predicate"))
+    goal_witness = _as_text(evidence.get("witness"))
+    reproduction = report.get("reproduction")
+    reproduction = dict(reproduction) if isinstance(reproduction, Mapping) else {}
+    repro_witness = _as_text(reproduction.get("witness"))
+    if claimed != predicate:
+        return False, "outcome_mismatch", f"report did not claim {predicate}"
+    if len(repro_witness) < 8:
+        return False, "independent_repro_evidence_missing", (
+            "independent verifier did not persist a usable outcome witness")
+    if len(goal_witness) < 8 or goal_witness not in repro_witness:
+        return False, "goal_evidence_missing", (
+            "goal evidence is not bound to the independent verifier witness")
+    if predicate in {"command_execution", "shell_access"} and actual_class != "rce":
+        return False, "outcome_mismatch", f"{predicate} requires an accepted RCE report"
+    return True, "outcome_met", f"reproduced evidence proves {predicate}"
 
 
 def parse_report_documents(text: str) -> list[dict[str, Any]]:
@@ -456,17 +515,82 @@ def report_looks_template(report: Mapping[str, Any]) -> bool:
     return generic >= 2 and len(steps) <= 3
 
 
+_AUTH_PRECONDITION_PATH = re.compile(
+    r"(?:^|/)(?:login|signin|sign-in|auth(?:enticate|entication)?|"
+    r"session|security|setup|init)(?:[._/-]|$)",
+    re.IGNORECASE,
+)
+
+
+def _url_port(parsed: Any) -> int | None:
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is not None:
+        return int(port)
+    if parsed.scheme.lower() == "https":
+        return 443
+    if parsed.scheme.lower() == "http":
+        return 80
+    return None
+
+
+def _auth_precondition_url_allowed(value: str, *, scope: str, target: str) -> bool:
+    """允许同源且有限的认证/会话前置 URL。
+
+    这条规则仅服务于报告 replay；``resource_id`` 仍由严格 Scope 判断，
+    因此 login/security 页面不会被作为漏洞资源接收。
+    """
+    parsed = urlparse(value or "")
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not parsed.scheme or not host:
+        return False
+    port = _url_port(parsed)
+    if port is None:
+        return False
+    for entry in parse_engagement_scope(scope, target):
+        entry_host = str(entry.host or "").strip().lower().rstrip(".")
+        if entry_host.startswith("*."):
+            root = entry_host[2:]
+            host_ok = host == root or host.endswith("." + root)
+        else:
+            host_ok = host == entry_host
+        if not host_ok:
+            continue
+        expected_port = entry.port
+        if expected_port is None:
+            expected_port = 443 if parsed.scheme.lower() == "https" else 80
+        if port != expected_port:
+            continue
+        path = (parsed.path or "/").rstrip("/") or "/"
+        return path == "/" or bool(_AUTH_PRECONDITION_PATH.search(path))
+    return False
+
+
 def report_in_scope(report: Mapping[str, Any], *, scope: str, target: str) -> bool:
+    """校验漏洞资源与复现命令的授权范围。
+
+    漏洞资源始终必须落在明确 Scope 内。认证、会话或测试级别预置属于
+    复现的前置操作，允许访问同一授权源上狭窄的 login/auth/session/security
+    路径；它们不能成为报告的漏洞资源，也不能被用来访问其他站点。
+    """
+
+    def replay_url_allowed(value: str) -> bool:
+        if finding_in_scope(value, scope=scope, target=target):
+            return True
+        return _auth_precondition_url_allowed(value, scope=scope, target=target)
+
     resource = _as_text(report.get("resource_id"))
     replay = report.get("replay") if isinstance(report.get("replay"), Mapping) else {}
     url = _as_text(replay.get("url") if isinstance(replay, Mapping) else "")
     command = _as_text(replay.get("command") if isinstance(replay, Mapping) else "")
     if not finding_in_scope(resource, scope=scope, target=target):
         return False
-    if url and not finding_in_scope(url, scope=scope, target=target):
+    if url and not replay_url_allowed(url):
         return False
     for token in re.findall(r"https?://[^\s'\"\\]+", command):
-        if not finding_in_scope(token, scope=scope, target=target):
+        if not replay_url_allowed(token):
             return False
     return True
 
@@ -577,15 +701,16 @@ def replay_attempted(report: Mapping[str, Any], commands: list[str]) -> bool:
 
 
 def render_repro_intent_goal(report: Mapping[str, Any]) -> str:
-    body = json.dumps(dict(report), ensure_ascii=False, indent=2)
-    if len(body) > 12000:
-        body = body[:12000] + "\n…"
+    report_id = _as_text(report.get("report_id")) or "unknown-report"
+    finding_class = _as_text(report.get("finding_class")) or "generic"
+    resource = _as_text(report.get("resource_id")) or "the reported resource"
     return (
-        "REPRODUCE this vulnerability report against the live in-scope origin. "
-        "Do not hunt new bugs. Follow the steps and run the replay command yourself.\n\n"
-        f"{body}\n\n"
-        "The witness string MUST appear in YOUR command output. "
-        "Print REPRODUCED=yes and REPRO_WITNESS=<snippet from YOUR output>."
+        f"REPRODUCE {finding_class} vulnerability report `{report_id}` against "
+        f"`{resource}` on the live in-scope "
+        "origin. Read the complete staged `.muteki_report.json` before testing. "
+        "Do not hunt new bugs. Follow the report steps and run the replay command "
+        "yourself. The witness string MUST appear in YOUR command output. Submit "
+        "the reproduction decision through the `muteki-blackboard` Skill."
     )
 
 
@@ -801,6 +926,10 @@ def report_sse_fields(
     data = dict(report or {})
     impact = _impact_map(data.get("impact"))
     replay = _replay_map(data.get("replay"))
+    reproduction = (
+        dict(data.get("reproduction") or {})
+        if isinstance(data.get("reproduction"), Mapping) else {}
+    )
     fields: dict[str, Any] = {
         "report_id": _as_text(data.get("report_id")),
         "title": _as_text(data.get("title")),
@@ -816,7 +945,17 @@ def report_sse_fields(
         "narrative": _as_text(data.get("narrative")),
         "intent_id": _as_text(data.get("intent_id")),
         "submitter": _as_text(data.get("submitter")),
+        "vector": _as_text(data.get("vector")),
+        "goal_code": _as_text(data.get("goal_code")),
+        "goal_detail": _as_text(data.get("goal_detail")),
+        "repro_verifier": _as_text(reproduction.get("verifier")),
+        "repro_command": _as_text(reproduction.get("command")),
+        "repro_target": _as_text(reproduction.get("target")),
+        "repro_response_summary": _as_text(reproduction.get("response_summary")),
+        "repro_evidence": dict(reproduction.get("evidence") or {}),
     }
+    if "goal_qualified" in data:
+        fields["goal_qualified"] = bool(data.get("goal_qualified"))
     if include_markdown:
         fields["markdown"] = _as_text(data.get("markdown")) or render_report_markdown(data)
         path = _as_text(data.get("markdown_path"))

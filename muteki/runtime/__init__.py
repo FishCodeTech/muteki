@@ -1,9 +1,5 @@
-"""Protocol 2 runtime contracts and host composition boundaries."""
+"""Runtime support modules.
 
-from .contracts import (
-    AttemptIdentity,
-    ExecutionScope,
-    LeaseIdentity,
-)
-
-__all__ = ["AttemptIdentity", "ExecutionScope", "LeaseIdentity"]
+Research substrate for muteki.eval/muteki.research; not part of the production
+solver path.
+"""

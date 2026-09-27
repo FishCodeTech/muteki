@@ -1,0 +1,124 @@
+/* transitions.dev #09: icon swap (the recipe's documented DOM hooks). */
+.t-icon-swap {
+  position: relative;
+  display: inline-grid;
+}
+.t-icon-swap .t-icon {
+  grid-area: 1 / 1;
+  transition:
+    opacity   var(--icon-swap-dur) var(--icon-swap-ease),
+    filter    var(--icon-swap-dur) var(--icon-swap-ease),
+    transform var(--icon-swap-dur) var(--icon-swap-ease);
+  will-change: opacity, filter, transform;
+}
+.t-icon-swap[data-state="a"] .t-icon[data-icon="a"],
+.t-icon-swap[data-state="b"] .t-icon[data-icon="b"] {
+  opacity: 1;
+  filter: blur(0);
+  transform: scale(1);
+}
+.t-icon-swap[data-state="a"] .t-icon[data-icon="b"],
+.t-icon-swap[data-state="b"] .t-icon[data-icon="a"] {
+  opacity: 0;
+  filter: blur(var(--icon-swap-blur));
+  transform: scale(var(--icon-swap-start-scale));
+}
+@media (prefers-reduced-motion: reduce) {
+  .t-icon-swap .t-icon { transition: none !important; }
+}
+
+/* HeroUI / React Aria owns mount, focus, dismissal and exit cleanup. Adapt
+   its entering/exiting hooks to recipes #05, #06, #17 and #22. Keep motion on
+   the surface, never scale the positioning container (which spans the viewport). */
+.modal__backdrop, .alert-dialog__backdrop { z-index: 1000; }
+.modal__backdrop[data-entering="true"],
+.alert-dialog__backdrop[data-entering="true"] {
+  animation: ux-backdrop-in var(--modal-open-dur) var(--modal-ease) both;
+}
+.modal__backdrop[data-exiting="true"],
+.alert-dialog__backdrop[data-exiting="true"] {
+  animation: ux-backdrop-out var(--modal-close-dur) var(--modal-ease) both;
+}
+/* React Aria watches the container's animation to retain both lifecycle
+   attributes. This nonvisual clock lets the inner surface finish before cleanup. */
+.modal__container[data-entering="true"],
+.alert-dialog__container[data-entering="true"] {
+  animation: ux-presence var(--modal-open-dur) var(--ease-linear) both;
+}
+.modal__container[data-exiting="true"],
+.alert-dialog__container[data-exiting="true"] {
+  animation: ux-presence var(--modal-close-dur) var(--ease-linear) both;
+}
+@keyframes ux-presence { from { opacity: 1; } to { opacity: 1; } }
+.modal__container[data-entering="true"] .modal__dialog,
+.alert-dialog__container[data-entering="true"] .alert-dialog__dialog {
+  animation: ux-modal-in var(--modal-open-dur) var(--modal-ease) both;
+}
+.modal__container[data-exiting="true"] .modal__dialog,
+.alert-dialog__container[data-exiting="true"] .alert-dialog__dialog {
+  animation: ux-modal-out var(--modal-close-dur) var(--modal-ease) both;
+}
+@keyframes ux-backdrop-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes ux-backdrop-out { from { opacity: 1; } to { opacity: 0; } }
+@keyframes ux-modal-in {
+  from { opacity: 0; transform: scale(var(--modal-scale)); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes ux-modal-out {
+  from { opacity: 1; transform: scale(1); }
+  to { opacity: 0; transform: scale(var(--modal-scale-close)); }
+}
+
+:is(.popover, .dropdown__popover, .select__popover, .combo-box__popover, .tooltip) {
+  --ux-surface-scale: var(--dropdown-pre-scale);
+  --ux-surface-exit-scale: var(--dropdown-closing-scale);
+  --ux-surface-in: var(--dropdown-open-dur);
+  --ux-surface-out: var(--dropdown-close-dur);
+  --ux-surface-ease: var(--dropdown-ease);
+  transform-origin: var(--trigger-anchor-point, center top);
+}
+.tooltip {
+  --ux-surface-scale: var(--tt-scale);
+  --ux-surface-exit-scale: var(--tt-scale);
+  --ux-surface-in: var(--tt-in-dur);
+  --ux-surface-out: var(--tt-out-dur);
+  --ux-surface-ease: var(--tt-in-ease);
+}
+:is(.popover, .dropdown__popover, .select__popover, .combo-box__popover, .tooltip)[data-entering="true"] {
+  animation: ux-surface-in var(--ux-surface-in) var(--ux-surface-ease) both;
+}
+:is(.popover, .dropdown__popover, .select__popover, .combo-box__popover, .tooltip)[data-exiting="true"] {
+  animation: ux-surface-out var(--ux-surface-out) var(--ux-surface-ease) both;
+}
+@keyframes ux-surface-in {
+  from { opacity: 0; transform: scale(var(--ux-surface-scale)); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes ux-surface-out {
+  from { opacity: 1; transform: scale(1); }
+  to { opacity: 0; transform: scale(var(--ux-surface-exit-scale)); }
+}
+.tabs__indicator {
+  transition-duration: var(--tabs-dur);
+  transition-timing-function: var(--tabs-ease);
+}
+.disclosure__content {
+  transition-duration: var(--acc-expand);
+  transition-timing-function: var(--acc-ease);
+}
+.disclosure__content:not([data-expanded="true"]) { transition-duration: var(--acc-collapse); }
+::view-transition-new(.toast-bottom):only-child,
+::view-transition-new(.toast-top):only-child {
+  animation-duration: var(--toast-open);
+  animation-timing-function: var(--toast-ease);
+}
+::view-transition-old(.toast-bottom):only-child,
+::view-transition-old(.toast-top):only-child {
+  animation-duration: var(--toast-close);
+  animation-timing-function: var(--toast-ease);
+}
+
+/* Directional hints stay short; live content is never remounted to replay them. */
+.workspace-home-hero { animation: t-texts-reveal-in var(--stagger-dur) var(--stagger-ease) backwards; }
+.workspace-home-grid { animation: t-texts-reveal-in var(--stagger-dur) var(--stagger-ease) var(--duration-stagger) backwards; }
+.workspace-home-recent { animation: t-texts-reveal-in var(--stagger-dur) var(--stagger-ease) calc(var(--duration-stagger) * 2) backwards; }

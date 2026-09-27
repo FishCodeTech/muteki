@@ -1,0 +1,205 @@
+/* Chat workbench: markdown. Rules are prefixed `.cx-` and never target other pages. */
+
+.cx-prose {
+  --cx-prose-fs: var(--cx-msg-fs, 14px);
+  --cx-prose-lh: 1.72;
+  --cx-prose-gap: 0.85em;
+  min-width: 0;
+  max-width: 100%;
+  font-size: var(--cx-prose-fs);
+  line-height: var(--cx-prose-lh);
+  color: var(--cx-fg);
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+.cx-prose-sm {
+  --cx-prose-fs: calc(var(--cx-msg-fs, 14px) - 1px);
+  --cx-prose-lh: 1.65;
+  --cx-prose-gap: 0.6em;
+  color: var(--cx-fg-2);
+}
+
+/* Blocks are split for streaming; spacing never relies on sibling selectors across them. */
+.cx-prose :where(p, ul, ol, blockquote, .cx-md-table-wrap, .cx-code, .cx-md-img, hr, h1, h2, h3, h4, h5, h6) {
+  margin: var(--cx-prose-gap) 0 0;
+}
+.cx-prose > .cx-md-block:first-child > :first-child,
+.cx-prose li > :first-child,
+.cx-prose blockquote > :first-child { margin-top: 0; }
+
+.cx-prose :where(h1, h2, h3, h4, h5, h6) {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.35;
+  color: var(--cx-fg);
+}
+.cx-prose h1 { font-size: 1.36em; margin-top: 1.5em; }
+.cx-prose h2 { font-size: 1.2em; margin-top: 1.4em; }
+.cx-prose h3 { font-size: 1.07em; margin-top: 1.25em; }
+.cx-prose :where(h4, h5, h6) { font-size: 1em; margin-top: 1.15em; }
+.cx-prose-sm :where(h1, h2, h3, h4, h5, h6) { font-size: 1em; margin-top: 0.9em; }
+
+.cx-prose :where(strong, b) { font-weight: 600; color: var(--cx-fg); }
+.cx-prose em { font-style: italic; }
+.cx-prose del { color: var(--cx-fg-3); }
+
+.cx-prose :where(ul, ol) { padding-left: 1.45em; }
+.cx-prose ul { list-style: disc; }
+.cx-prose ul ul { list-style: circle; }
+.cx-prose ol { list-style: decimal; }
+.cx-prose li { margin: 0.28em 0 0; padding-left: 0.2em; }
+.cx-prose li::marker { color: var(--cx-fg-4); }
+.cx-prose ol > li::marker { font-variant-numeric: tabular-nums; color: var(--cx-fg-3); }
+.cx-prose li > :where(ul, ol) { margin-top: 0.28em; }
+.cx-prose li > p { margin-top: 0.35em; }
+
+.cx-prose li.task-list-item { list-style: none; margin-left: -1.3em; padding-left: 0; }
+.cx-prose .contains-task-list { padding-left: 1.45em; }
+.cx-md-check {
+  display: inline-grid;
+  place-items: center;
+  width: 15px;
+  height: 15px;
+  margin-right: 0.5em;
+  vertical-align: -2px;
+  border-radius: 5px;
+  border: 1px solid var(--cx-border-strong);
+  background: var(--cx-elevated);
+  color: var(--cx-accent-fg);
+}
+.cx-md-check[data-checked="true"] { border-color: var(--cx-accent); background: var(--cx-accent); }
+.cx-prose li.task-list-item:has(.cx-md-check[data-checked="true"]) { color: var(--cx-fg-3); }
+
+.cx-prose blockquote {
+  padding: 0.1em 0 0.1em 1em;
+  border-left: 2px solid var(--cx-border-strong);
+  color: var(--cx-fg-2);
+}
+
+.cx-prose hr {
+  height: 1px;
+  border: 0;
+  margin-top: 1.5em;
+  margin-bottom: 0.6em;
+  background: var(--cx-border);
+}
+
+.cx-md-inline-code {
+  padding: 0.12em 0.38em;
+  border-radius: 6px;
+  background: var(--cx-hover);
+  box-shadow: inset 0 0 0 1px var(--cx-border-subtle);
+  font-family: var(--cx-font-mono);
+  font-size: 0.86em;
+  color: var(--cx-fg);
+  overflow-wrap: anywhere;
+}
+.cx-prose :where(h1, h2, h3, h4) .cx-md-inline-code { font-size: 0.9em; }
+.cx-prose a .cx-md-inline-code { color: inherit; }
+
+.cx-md-link {
+  color: var(--cx-accent);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--cx-accent) 35%, transparent);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+  transition: text-decoration-color var(--cx-dur-fast) var(--cx-ease-out), color var(--cx-dur-fast) var(--cx-ease-out);
+  cursor: pointer;
+}
+.cx-md-link:hover { text-decoration-color: currentColor; }
+.cx-md-ext { display: inline; margin-left: 1px; vertical-align: -1px; opacity: 0.55; }
+.cx-md-link:hover .cx-md-ext { opacity: 0.9; }
+.cx-md-link-blocked { color: var(--cx-fg-3); text-decoration: line-through; cursor: not-allowed; }
+.cx-md-resource-link {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  text-align: inherit;
+}
+.cx-md-resource-icon { display: inline; margin-right: 3px; vertical-align: -1px; opacity: 0.7; }
+.cx-md-preview-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 16px;
+  margin-left: 4px;
+  padding: 0 5px;
+  border-radius: 999px;
+  vertical-align: 1px;
+  background: var(--cx-accent-soft);
+  color: var(--cx-accent);
+  font-size: 10.5px;
+  font-weight: 500;
+  line-height: 1;
+  text-decoration: none;
+}
+
+.cx-md-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--cx-border);
+  border-radius: 10px;
+}
+.cx-md-table-wrap table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+  font-size: 0.93em;
+  line-height: 1.55;
+}
+.cx-md-table-wrap :where(th, td) {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--cx-border-subtle);
+  text-align: left;
+  vertical-align: top;
+}
+.cx-md-table-wrap :where(th, td) + :where(th, td) { border-left: 1px solid var(--cx-border-subtle); }
+.cx-md-table-wrap th {
+  background: var(--cx-bg-subtle);
+  font-weight: 600;
+  color: var(--cx-fg);
+  white-space: nowrap;
+}
+.cx-md-table-wrap td { color: var(--cx-fg-2); }
+.cx-md-table-wrap tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--ink) 1.6%, transparent); }
+.cx-md-table-wrap tbody tr:last-child td { border-bottom: 0; }
+
+.cx-md-img {
+  display: block;
+  max-width: 100%;
+  max-height: 420px;
+  border-radius: 12px;
+  border: 1px solid var(--cx-border-subtle);
+}
+.cx-md-img-alt { color: var(--cx-fg-3); font-style: italic; }
+
+.cx-prose .cx-md-code { margin-top: var(--cx-prose-gap); margin-bottom: 0; }
+.cx-prose-sm .cx-md-code { font-size: 12px; }
+
+/* Streaming caret rides the end of the last inline block without reflowing it. */
+.cx-prose[data-streaming="true"] > .cx-md-block:last-child > :is(p, h1, h2, h3, h4, h5, h6):last-child::after,
+.cx-prose[data-streaming="true"] > .cx-md-block:last-child > :is(ul, ol):last-child > li:last-child:not(:has(> :is(ul, ol, p)))::after,
+.cx-prose[data-streaming="true"] > .cx-md-block:last-child > :is(ul, ol):last-child > li:last-child > p:last-child::after,
+.cx-prose[data-streaming="true"] > .cx-md-block:last-child > blockquote:last-child > p:last-child::after {
+  content: "";
+  display: inline-block;
+  width: 0.5em;
+  height: 1.05em;
+  margin-left: 2px;
+  vertical-align: -0.16em;
+  border-radius: 1.5px;
+  background: currentColor;
+  opacity: 0.55;
+  animation: cx-caret 1s steps(1) infinite;
+}
+
+/* Local KaTeX fonts + MathML; long equations scroll within the message column. */
+.cx-prose .cx-math-inline { display: inline-block; max-width: 100%; overflow-x: auto; vertical-align: middle; }
+.cx-prose .cx-math-display { max-width: 100%; min-width: 0; overflow-x: auto; overflow-y: hidden; margin-top: var(--cx-prose-gap); padding: 0.15em 0.25em; }
+.cx-prose .cx-math-display > .katex-display { margin: 0.55em 0; text-align: center; width: max-content; min-width: 100%; }
+.cx-prose .katex { color: inherit; font-size: 1.06em; text-indent: 0; overflow-wrap: normal; }
+.cx-prose .cx-math-fallback { font-family: var(--cx-font-mono); font-size: 0.9em; white-space: pre-wrap; overflow-wrap: anywhere; }
+.cx-prose .cx-math-fallback[data-math-display] { max-width: 100%; margin-top: var(--cx-prose-gap); padding: 0.45em 0.7em; border: 1px solid var(--cx-border-subtle); border-radius: 8px; background: var(--cx-bg-subtle); }

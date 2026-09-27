@@ -41,7 +41,7 @@ CONTEXT_PACKET_SCHEMA_ID = "muteki.context-packet.v1"
 CONTEXT_PACKET_COMPILER_VERSION = "muteki.context-packet.compiler.v1"
 CONTEXT_POLICY_ID = "muteki.context-policy.receipt-only.v1"
 OMISSION_POLICY_ID = "muteki.context-omission.explicit.v1"
-REDACTION_POLICY_ID = "muteki.context-redaction.c6.v1"
+CONTENT_POLICY_ID = "muteki.context-content.c6.v1"
 NOT_AVAILABLE_H5 = "NOT_AVAILABLE(stage=H5)"
 INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
 PRODUCTION_ENABLED = False
@@ -51,12 +51,6 @@ ACCEPTED_SET_UNCHANGED = True
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _WHITESPACE_RE = re.compile(r"\s+")
-_BRACED_TOKEN_RE = re.compile(r"(?i)\b[A-Za-z][A-Za-z0-9_-]{1,40}\{[^{}\r\n]{1,256}\}")
-_MIXED_BARE_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9])(?=[A-Za-z0-9_-]{12,128}(?![A-Za-z0-9]))"
-    r"(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*[0-9])"
-    r"[A-Za-z0-9_-]{12,128}"
-)
 _PATH_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
 
 _MAX_TEXT_CHARS = 2_048
@@ -221,10 +215,8 @@ def _string_tuple(
     return result
 
 
-def _redact_text(value: str, *, maximum: int) -> tuple[str, bool, int]:
+def _prepare_text(value: str, *, maximum: int) -> tuple[str, bool, int]:
     normalized = _WHITESPACE_RE.sub(" ", _text(value, "source text")).strip()
-    normalized = _BRACED_TOKEN_RE.sub("[REDACTED_TOKEN]", normalized)
-    normalized = _MIXED_BARE_TOKEN_RE.sub("[REDACTED_TOKEN]", normalized)
     if len(normalized) <= maximum:
         return normalized, False, 0
     omitted = len(normalized) - maximum
@@ -278,7 +270,6 @@ class LossyViewKind(str, Enum):
 class OmissionReason(str, Enum):
     IRRELEVANT_TO_DECISION = "irrelevant_to_decision"
     QUARANTINED = "quarantined"
-    REDACTION_POLICY = "redaction_policy"
     SIZE_LIMIT = "size_limit"
     STAGE_UNAVAILABLE = "stage_unavailable"
 
@@ -422,7 +413,7 @@ class ContextPacketBuildRequestV1:
     compiler_version: str = CONTEXT_PACKET_COMPILER_VERSION
     context_policy_id: str = CONTEXT_POLICY_ID
     omission_policy_id: str = OMISSION_POLICY_ID
-    redaction_policy_id: str = REDACTION_POLICY_ID
+    content_policy_id: str = CONTENT_POLICY_ID
 
     def __post_init__(self) -> None:
         for name in ("run_id", "decision_id", "decision_epoch_id", "target_attempt_id"):
@@ -491,8 +482,8 @@ class ContextPacketBuildRequestV1:
             raise ValueError("unsupported context policy")
         if self.omission_policy_id != OMISSION_POLICY_ID:
             raise ValueError("unsupported omission policy")
-        if self.redaction_policy_id != REDACTION_POLICY_ID:
-            raise ValueError("unsupported redaction policy")
+        if self.content_policy_id != CONTENT_POLICY_ID:
+            raise ValueError("unsupported content policy")
 
     def canonical_body(self) -> dict[str, Any]:
         return {
@@ -507,7 +498,7 @@ class ContextPacketBuildRequestV1:
             "expected_prefix_digest": self.expected_prefix_digest,
             "omission_policy_id": self.omission_policy_id,
             "omissions": [item.canonical_body() for item in self.omissions],
-            "redaction_policy_id": self.redaction_policy_id,
+            "content_policy_id": self.content_policy_id,
             "run_id": self.run_id,
             "target_attempt_id": self.target_attempt_id,
         }
@@ -637,7 +628,7 @@ class ContextPacketManifestV1:
     compiler_version: str = CONTEXT_PACKET_COMPILER_VERSION
     context_policy_id: str = CONTEXT_POLICY_ID
     omission_policy_id: str = OMISSION_POLICY_ID
-    redaction_policy_id: str = REDACTION_POLICY_ID
+    content_policy_id: str = CONTENT_POLICY_ID
     schema_id: str = CONTEXT_PACKET_SCHEMA_ID
     accepted_set_change: bool = False
 
@@ -682,8 +673,8 @@ class ContextPacketManifestV1:
             raise ValueError("unsupported context policy")
         if self.omission_policy_id != OMISSION_POLICY_ID:
             raise ValueError("unsupported omission policy")
-        if self.redaction_policy_id != REDACTION_POLICY_ID:
-            raise ValueError("unsupported redaction policy")
+        if self.content_policy_id != CONTENT_POLICY_ID:
+            raise ValueError("unsupported content policy")
         if self.schema_id != CONTEXT_PACKET_SCHEMA_ID:
             raise ValueError("unsupported context packet schema")
         if self.accepted_set_change is not ACCEPTED_SET_CHANGE:
@@ -705,7 +696,7 @@ class ContextPacketManifestV1:
             "omission_policy_id": self.omission_policy_id,
             "omitted_sources": [item.canonical_body() for item in self.omitted_sources],
             "receipt_index_digest": self.receipt_index_digest,
-            "redaction_policy_id": self.redaction_policy_id,
+            "content_policy_id": self.content_policy_id,
             "run_id": self.run_id,
             "schema_id": self.schema_id,
             "section_digests": list(self.section_digests),
@@ -863,7 +854,7 @@ def _lossy_value(
     if binding.view_kind is LossyViewKind.TEXT:
         if type(value) is not str:
             raise TypeError(f"{binding.field_id} must resolve to text")
-        text, truncated, omitted = _redact_text(value, maximum=_MAX_TEXT_CHARS)
+        text, truncated, omitted = _prepare_text(value, maximum=_MAX_TEXT_CHARS)
         return text, truncated, omitted
     if binding.view_kind is LossyViewKind.STRING_LIST:
         if type(value) is not tuple or any(type(item) is not str for item in value):
@@ -872,7 +863,7 @@ def _lossy_value(
         rendered: list[str] = []
         omitted_units = max(0, len(value) - len(visible))
         for item in visible:
-            text, truncated, omitted = _redact_text(item, maximum=_MAX_LIST_ITEM_CHARS)
+            text, truncated, omitted = _prepare_text(item, maximum=_MAX_LIST_ITEM_CHARS)
             rendered.append(text)
             omitted_units += omitted
         return tuple(rendered), omitted_units > 0, omitted_units

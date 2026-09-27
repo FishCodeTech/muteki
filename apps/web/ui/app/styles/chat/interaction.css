@@ -1,0 +1,118 @@
+/* Chat interaction states deliberately live outside Tailwind layers: legacy
+ * global :focus rules are unlayered too. Keep this policy scoped to chat and
+ * its portals, without changing the brand or semantic status colours. */
+.cx-root,
+.cx-portal,
+.workspace-frame[data-conversation-layout="true"] {
+  --focus-ring: var(--cx-focus);
+}
+
+.cx-root :focus:not(:focus-visible),
+.cx-portal :focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* Keyboard focus stays local and neutral; pointer selection uses the
+ * component's background, weight or check mark instead of a coloured ring. */
+.cx-root :focus-visible,
+.cx-portal :focus-visible {
+  outline: 2px solid var(--cx-focus);
+  outline-offset: 2px;
+}
+
+/* Landmarks, scroll panes and overlay shells are focus destinations, not
+ * selected controls. In particular, never outline the entire chat canvas. */
+#conversation-main-content:focus,
+.cx-root :is(.cx-scroll, [data-cx-layer], [data-cx-focus-scope], [role="dialog"], [role="tabpanel"], [role="menu"], [role="listbox"]):focus,
+.cx-portal :is(.cx-scroll, [data-cx-layer], [data-cx-focus-scope], [role="dialog"], [role="tabpanel"], [role="menu"], [role="listbox"]):focus {
+  outline: none;
+}
+
+/* Menus already indicate keyboard/pointer focus with a row background. */
+.cx-root :is([role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"]):focus,
+.cx-portal :is([role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"]):focus {
+  outline: none;
+}
+
+/* Text fields strengthen their existing hairline; no second outline or halo.
+ * Range/checkbox/radio controls keep their distinct keyboard indicator. */
+.cx-root :is(input:where(:not([type="checkbox"], [type="radio"], [type="range"])), textarea, select):focus,
+.cx-portal :is(input:where(:not([type="checkbox"], [type="radio"], [type="range"])), textarea, select):focus {
+  outline: none;
+  border-color: var(--cx-field-focus);
+  box-shadow: none;
+}
+.cx-root [aria-invalid="true"]:focus,
+.cx-portal [aria-invalid="true"]:focus {
+  border-color: var(--cx-danger);
+}
+.cx-root .cx-slider:focus-visible,
+.cx-portal .cx-slider:focus-visible {
+  outline: none;
+}
+
+/* The composer owns the input surface; its contenteditable child must not
+ * inherit the global outline, including when clicked (which is focus-visible). */
+.cx-root .cx-prompt-editor:focus,
+.cx-portal .cx-prompt-editor:focus {
+  outline: none;
+  box-shadow: none;
+}
+
+.cx-root ::selection,
+.cx-portal ::selection {
+  color: var(--cx-fg);
+  background: var(--cx-text-selection);
+}
+
+/* Shared navigation belongs to /chat visually, but keeps its original styling
+ * on the other workspaces. */
+.workspace-frame[data-conversation-layout="true"] .skip-link:focus {
+  outline-color: var(--cx-focus);
+}
+.workspace-frame[data-conversation-layout="true"] .workspace-nav nav > a.active {
+  background: var(--cx-selected);
+}
+.workspace-frame[data-conversation-layout="true"] .workspace-nav nav > a.active::after {
+  background: var(--cx-fg-2);
+}
+.workspace-frame[data-conversation-layout="true"] .workspace-nav nav > a.active svg {
+  color: var(--cx-fg-2);
+}
+
+/* Shared animated controls keep their semantics but use chat's neutral
+ * selection palette. Avoid changing these components in other workspaces. */
+:is(.cx-root, .cx-portal) [role="checkbox"]:is([aria-checked="true"], [aria-checked="mixed"]) {
+  border-color: var(--cx-fg);
+  background: var(--cx-fg);
+  color: var(--cx-bg);
+}
+:is(.cx-root, .cx-portal) input:is([type="checkbox"], [type="radio"]) {
+  accent-color: var(--cx-fg-2);
+}
+:is(.cx-root, .cx-portal) :is([role="checkbox"], [role="radio"]):focus-visible {
+  box-shadow: none;
+}
+:is(.cx-root, .cx-portal) [role="radio"][data-state="checked"] {
+  border-color: var(--cx-fg);
+}
+:is(.cx-root, .cx-portal) [role="radio"][data-state="checked"] > span {
+  background: var(--cx-fg);
+}
+:is(.cx-root, .cx-portal) [data-state="focused"]:has(> input) {
+  border-color: var(--cx-field-focus);
+  box-shadow: none;
+}
+
+.cx-root .conversation-message-highlight {
+  outline: none;
+  background: var(--cx-selected);
+  animation: cx-message-highlight-fade 2.8s ease-out;
+}
+.cx-root :is(.ai-message.is-cite-highlight, .ai-message .is-cite-highlight, [data-message-id].is-cite-highlight) {
+  outline: none;
+}
+@keyframes cx-message-highlight-fade {
+  from { background: var(--cx-text-selection); }
+  to { background: transparent; }
+}

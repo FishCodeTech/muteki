@@ -39,7 +39,6 @@ class PlanningSwarmBase(Swarm):
 
     architecture_name: str = "planning_base"
     executor_timeout_s: int = 240
-    planner_temperature: float = 0.3
     max_plan_rounds: int = 24
     initial_recon: bool = True
     # Short-horizon executors multiply spawn count vs one long bootstrap.
@@ -863,7 +862,6 @@ class PlanningSwarmBase(Swarm):
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                temperature=self.planner_temperature,
                 max_tokens=None,
                 stream=False,
                 run_id=self.run_id,

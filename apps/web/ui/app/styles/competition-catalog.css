@@ -1,0 +1,417 @@
+/* ── Grants & Versions Disclosure ────────────────────────────────────────── */
+.cap-disclosure {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel2);
+  overflow: hidden;
+}
+.cap-disclosure summary {
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.cap-disclosure summary::-webkit-details-marker { display: none; }
+.cap-disclosure summary svg { transition: transform var(--acc-chevron) var(--ease-out); }
+.cap-disclosure[open] summary svg { transform: rotate(180deg); }
+.cap-disclosure-body {
+  border-top: 1px solid var(--line);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.cap-grant-item {
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  font-size: 10px;
+}
+.cap-grant-item-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.cap-grant-item-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  color: var(--bright);
+  font-weight: 600;
+}
+.cap-grant-item-sub {
+  color: var(--dim);
+}
+
+/* ── Tab 2: Services & Protocols (MCP & Skills) ─────────────────────────── */
+.cap-services-container {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.cap-services-block {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.cap-block-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--bright);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.cap-block-desc {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+.cap-services-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.cap-service-card {
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+.cap-service-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.cap-service-card-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.cap-service-card-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line2);
+  background: var(--panel2);
+  color: var(--bright);
+  flex: none;
+}
+.cap-service-card-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--bright);
+}
+.cap-service-card-id {
+  font-size: 10px;
+  color: var(--dim);
+  font-family: var(--font-mono);
+}
+.cap-service-card-props {
+  margin: 0;
+  padding: 10px 12px;
+  display: grid;
+  grid-template-columns: 80px minmax(0, 1fr);
+  gap: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel2);
+  font-size: 10.5px;
+}
+.cap-service-card-props dt {
+  color: var(--muted);
+}
+.cap-service-card-props dd {
+  margin: 0;
+  color: var(--text);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cap-service-card-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.cap-service-lifecycle-note {
+  font-size: 10px;
+  color: var(--dim);
+}
+
+/* ── Tab 3: Adapters Grid ────────────────────────────────────────────────── */
+.cap-adapters-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+.cap-adapter-card {
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+  transition: border-color var(--control-feedback-dur) var(--ease-out);
+}
+.cap-adapter-card:hover {
+  border-color: var(--line2);
+}
+.cap-adapter-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.cap-adapter-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.cap-adapter-brand-logo {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  display: grid;
+  place-items: center;
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  color: var(--bright);
+  flex: none;
+}
+.cap-adapter-titles {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.cap-adapter-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--bright);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cap-adapter-id {
+  font-size: 9.5px;
+  color: var(--dim);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cap-injection-matrix {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.cap-injection-chip {
+  padding: 2px 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--panel2);
+  color: var(--dim);
+  font-size: 9.5px;
+}
+.cap-injection-chip.supported {
+  border-color: color-mix(in srgb, var(--green) 35%, var(--line));
+  background: color-mix(in srgb, var(--green) 7%, var(--panel));
+  color: var(--green);
+}
+.cap-adapter-props {
+  margin: 0;
+  padding: 8px 10px;
+  display: grid;
+  grid-template-columns: 60px minmax(0, 1fr);
+  gap: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel2);
+  font-size: 10px;
+}
+.cap-adapter-props dt { color: var(--muted); }
+.cap-adapter-props dd { margin: 0; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cap-recent-injection {
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border: 1px dashed var(--line);
+  border-radius: 7px;
+  font-size: 10px;
+}
+.cap-recent-injection-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  color: var(--muted);
+}
+.cap-recent-injection-desc {
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Tab 4: Extensions & Catalog ────────────────────────────────────────── */
+.extension-settings-card :where(input, [role="combobox"]) { min-width: 0; }
+@media (max-width: 640px) {
+  .extension-card-heading { align-items: flex-start !important; }
+  .extension-card-heading > span { flex-basis: 100%; line-height: 1.45; }
+  .extension-form-row,
+  .extension-catalog-row { display: grid !important; grid-template-columns: 1fr; align-items: stretch !important; gap: 6px !important; }
+  .extension-form-row > label,
+  .extension-catalog-row > label { margin-top: 4px; }
+  .extension-form-row > :where(input, [role="combobox"]),
+  .extension-catalog-row > :where(input, [role="combobox"]) { width: 100% !important; max-width: none !important; }
+  .extension-actions { justify-content: stretch; }
+  .extension-actions > span { display: none; }
+  .extension-actions > button { flex: 1 1 0; }
+  .extension-installed-heading > span:nth-of-type(2) { display: none; }
+}
+
+.cap-extensions-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.cap-extension-card {
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+.cap-extension-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.cap-extension-id {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--bright);
+}
+.cap-extension-sub {
+  font-size: 10px;
+  color: var(--dim);
+  font-family: var(--font-mono);
+}
+.cap-extension-provides-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.cap-extension-provide-pill {
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--panel2);
+  color: var(--muted);
+  font-size: 9.5px;
+}
+.cap-extension-secrets {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 10px;
+  color: var(--dim);
+}
+
+/* ── Empty & Loading States ──────────────────────────────────────────────── */
+.cap-empty-state {
+  padding: 36px 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  text-align: center;
+  color: var(--muted);
+  border: 1px dashed var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+.cap-empty-state strong {
+  color: var(--text);
+  font-size: 13px;
+}
+.cap-empty-state p {
+  margin: 0;
+  font-size: 11px;
+  max-width: 360px;
+}
+.cap-loading-view {
+  min-height: 45vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: var(--muted);
+}
+.cap-loading-spinner {
+  animation: railspin 0.8s linear infinite;
+  color: var(--blue);
+}
+
+/* ── Responsive Adaptations ──────────────────────────────────────────────── */
+@media (max-width: 1200px) {
+  .cap-stats-deck { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .cap-adapters-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 900px) {
+  .cap-threads-layout { grid-template-columns: 1fr; }
+  .cap-thread-picker,
+  .cap-binding-editor,
+  .cap-thread-list,
+  .cap-thread-card { width: 100%; max-width: 100%; min-width: 0; }
+  .cap-services-grid { grid-template-columns: 1fr; }
+  .cap-extensions-grid { grid-template-columns: 1fr; }
+  .cap-tools-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 640px) {
+  .cap-stats-deck { grid-template-columns: 1fr; }
+  .cap-adapters-grid { grid-template-columns: 1fr; }
+  .cap-topbar { flex-direction: column; align-items: stretch; }
+  .cap-topbar-actions { justify-content: flex-end; }
+}

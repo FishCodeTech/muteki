@@ -1,0 +1,59 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "org.muteki.examples.hello",
+  "version": "1.0.0",
+  "description": "Example Muteki Extension Host plugin with a declarative UI contribution.",
+  "author": {
+    "name": "FishCodeTech",
+    "url": "https://github.com/FishCodeTech"
+  },
+  "homepage": "https://github.com/FishCodeTech/muteki",
+  "repository": "https://github.com/FishCodeTech/muteki",
+  "license": "AGPL-3.0-or-later",
+  "keywords": [
+    "muteki",
+    "agent-plugin",
+    "extension-host",
+    "example"
+  ],
+  "extensions": {
+    "io.github.fishcodetech.muteki": {
+      "manifest_version": 1,
+      "extension_version": "1.0.0",
+      "requires_core": ">=1.0,<2.0",
+      "origin": "community",
+      "entrypoints": {
+        "host": "subprocess",
+        "command": [
+          "python3",
+          "./io.github.fishcodetech.muteki/server.py",
+          "serve"
+        ]
+      },
+      "provides": [
+        {
+          "type": "domain-module",
+          "id": "org.muteki.examples.hello",
+          "api_version": 1
+        }
+      ],
+      "requires": [],
+      "permissions": {
+        "filesystem": [
+          "state-read",
+          "state-write"
+        ],
+        "network": [],
+        "secrets": [
+          "secret://env/HELLO_TOKEN"
+        ],
+        "events_write": [
+          "ext.org.muteki.examples.hello.*"
+        ]
+      },
+      "config_schema": "./io.github.fishcodetech.muteki/schemas/config.json",
+      "state_schema": "./io.github.fishcodetech.muteki/schemas/state.json",
+      "ui": "./io.github.fishcodetech.muteki/ui/contributions.json"
+    }
+  }
+}

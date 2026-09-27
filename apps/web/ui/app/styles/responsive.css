@@ -1,0 +1,231 @@
+/* ============================================================================
+   NARROW-VIEWPORT POLISH (responsive guards) — desktop ≥1200px is untouched;
+   every rule below lives inside a max-width media query. The deck stays a
+   multi-column power tool; these rules only keep it from BREAKING (no h-scroll,
+   no clipped controls, sane stacking, tappable targets) down to ~390px.
+   ============================================================================ */
+
+/* --- top bar (.convo-top): degrade gracefully instead of overflowing. The
+   title flexes + truncates (it already has ellipsis); lower-priority chrome
+   (run-id chip, then category) drops out as width shrinks. The bar is allowed
+   to wrap so nothing is ever clipped off-screen. --- */
+@media (max-width: 860px) {
+  .convo-top { flex-wrap: wrap; row-gap: 8px; height: auto; min-height: 56px; max-height: none; padding-block: 8px; }
+  /* title takes the first row's free space and truncates rather than pushing
+     the action cluster off-edge */
+  .convo-top .title { flex: 1 1 auto; min-width: 0; }
+}
+@media (max-width: 700px) {
+  /* the full sessions/run-NNNN chip is the lowest-priority item — its info is
+     also in the rail + inspector, so hide it first to reclaim a row */
+  .convo-top .rid { display: none; }
+}
+@media (max-width: 560px) {
+  /* below this the category tag + run-state label crowd the engine chip;
+     drop the secondary labels, keep menu/title/engines/conn/settings/lang */
+  .convo-top .cat,
+  .convo-top .runstate,
+  .convo-top .control-receipt { display: none; }
+  .engine-exception { display: none; }
+  .convo-top { gap: 8px; }
+}
+
+/* The rail becomes a drawer before it can squeeze the dispatch composer. */
+@media (max-width: 900px) {
+  .shell { position: relative; }
+  .rail { position: absolute; top: 0; left: 0; bottom: 0; z-index: 45;
+    width: min(300px, 86vw); box-shadow: var(--shadow-pop); }
+  .rail.collapsed { display: none; }
+  .rail-scrim { display: block; position: absolute; inset: 0; z-index: 40;
+    width: 100%; height: 100%; padding: 0; border: 0;
+    background: color-mix(in srgb, var(--bg) 54%, transparent); cursor: pointer; }
+  .rail-close { display: inline-flex; align-items: center; justify-content: center;
+    flex: none; width: 30px; height: 30px; margin-left: auto; padding: 0;
+    border: 1px solid var(--border2); border-radius: 7px;
+    color: var(--dim); background: var(--panel); cursor: pointer; }
+  .rail-close:hover { color: var(--text); border-color: var(--accent); }
+  .rail-resizer { display: none; }
+  .main { min-width: 0; }
+  .composer2 .auto-note { display: none; }
+}
+
+/* --- workspace / inspector: the @media(max-width:1080px) block already stacks
+   the workspace to one column and floats the inspector as a right drawer. On a
+   truly narrow screen make that drawer full-bleed so it never clips. --- */
+@media (max-width: 560px) {
+  .run-inspector { width: 100%; max-width: 100%; }
+  .artifact { position: absolute; top: 0; right: 0; bottom: 0; z-index: 8; max-width: 100%; }
+}
+
+/* --- composer rows wrap instead of overflowing; the send button stays on the
+   right and never gets pushed off. --- */
+@media (max-width: 640px) {
+  .composer2 { padding: 10px 12px 14px; }
+  .composer2 .crow { flex-wrap: wrap; row-gap: 8px; }
+  /* the send button anchors to the end of the row even after a wrap */
+  .composer2 .crow .send { margin-left: auto; }
+  .composer2 .quick { gap: 6px 8px; }
+  /* the visual separator collapses when the danger group wraps to its own line */
+  .composer2 .quick .quick-sep { display: none; }
+  .convo-mainpane:has(.composer-advanced-panel) .welcome { display: none; }
+  .composer-advanced-panel { max-height: min(44vh, 360px); overflow-y: auto; }
+  .advanced-options-grid { grid-template-columns: minmax(0, 1fr); }
+  .advanced-flag-card { grid-template-columns: minmax(0, 1fr) minmax(142px, 45%); }
+  .advanced-metrics-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .advanced-select { font-size: 11px; }
+}
+
+@media (max-width: 420px) {
+  .advanced-flag-card { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* --- horizontal-overflow guard: long unbreakable strings (session ids, flags,
+   URLs) must never widen the whole page. Belt-and-suspenders on the flex
+   shells; min-width:0 lets flex children actually shrink below content size. --- */
+@media (max-width: 1080px) {
+  html, body { overflow-x: hidden; }
+  .shell { max-width: 100vw; }
+  .convo,
+.coord-col,
+.timeline-pane { min-width: 0; }
+}
+
+/* --- touch targets: on coarse pointers bump the smallest icon buttons /
+   menu items to a comfortable ~36px tap area WITHOUT changing desktop sizes
+   (this block only applies to coarse-pointer devices). --- */
+@media (pointer: coarse) {
+  .icon-btn { width: 36px; height: 36px; }
+  .convo-top .lang-btn { min-height: 34px; }
+  .menu .mi { padding: 10px 11px; }
+  .thread-item .dots, .rail-folder-head .dots, .rail-newfolder { min-width: 32px; min-height: 32px; padding: 6px; }
+  .worker-kill { width: 28px; height: 28px; }
+  .composer2 .quick button { padding: 7px 14px; }
+  .composer2 .attach-btn { padding: 8px 12px; }
+  .hitl-opts button { padding: 8px 14px; }
+}
+
+/* A pending HITL request PAUSES the whole swarm, so the card is unmissable: an
+   amber left bar, an alert icon + "needs your decision" heading. The topmost
+   (`.first`) card gets a one-shot attention pulse (reduced-motion-gated). */
+.hitl-card { align-self: stretch; background: color-mix(in srgb, var(--amber) 4%, var(--panel));
+  border: 1px solid color-mix(in srgb, var(--amber) 36%, var(--line2));
+  border-radius: 10px; padding: 11px 12px; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+.hitl-card.first { animation: hitlPulse 1.4s ease-out 2; }
+.hitl-card.sending { opacity: .7; }
+.hitl-card.answered-readonly { border-color: var(--line2); background: var(--panel); }
+.hitl-card.delivery-failed,
+.hitl-card.delivery-unknown { border-color: color-mix(in srgb, var(--red) 40%, var(--line2)); background: color-mix(in srgb, var(--red) 4%, var(--panel)); }
+.hitl-card.delivery-partial,
+.hitl-card.delivery-rejected { border-color: color-mix(in srgb, var(--amber) 36%, var(--line2)); }
+/* F: an auto-resolving (non-blocking) card is informational — muted, no pulse */
+.hitl-card.auto { border-color: var(--line2); background: var(--panel); }
+.hitl-card.auto.first { animation: none; }
+.hitl-card.auto .hitl-ico { color: var(--dim); }
+.hitl-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.hitl-head .hitl-ico { color: var(--amber); display: inline-flex; flex: none; }
+.hitl-head .hitl-title { font-weight: 800; color: var(--bright); letter-spacing: .01em; text-wrap: balance; }
+.hitl-head .hitl-blocking { font-size: 11px; color: var(--amber); font-weight: 600; }
+.hitl-head .hitl-auto { font-size: 11px; color: var(--dim); font-weight: 600; }
+.hitl-card .body { margin: 6px 0 9px; color: var(--bright); }
+.hitl-opts { display: flex; flex-wrap: wrap; gap: 6px; align-items: stretch; }
+.hitl-opts button { background: var(--accent); color: var(--on-accent, #fff); border: 0; border-radius: 6px; padding: 5px 11px; font-weight: 700; cursor: pointer; }
+.hitl-opts button:hover:not(:disabled) { filter: brightness(1.06); }
+.hitl-opts button:disabled { opacity: .5; cursor: default; }
+.hitl-opts .hitl-free { flex: 1; min-width: 140px; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 5px 9px; }
+.hitl-opts .hitl-free:focus { outline: none; border-color: var(--amber); box-shadow: 0 0 0 2px color-mix(in srgb, var(--amber) 30%, transparent); }
+.hitl-opts .hitl-send { background: var(--amber); color: var(--on-accent, #fff); font-weight: 800; }
+.hitl-opts .hitl-dismiss { background: transparent; color: var(--muted); border: 1px solid var(--border); font-weight: 600; border-radius: 6px; padding: 5px 11px; cursor: pointer; }
+.hitl-opts .hitl-dismiss:hover:not(:disabled) { color: var(--text); border-color: var(--muted); background: color-mix(in srgb, var(--muted) 8%, transparent); }
+.hitl-opts .hitl-dismiss:disabled { opacity: .5; cursor: default; }
+.hitl-delivery-state { display: flex; align-items: flex-start; gap: 7px; margin-top: 8px;
+  padding: 8px 9px; border: 1px solid var(--border2); border-radius: 7px;
+  background: color-mix(in srgb, var(--panel2) 72%, transparent); color: var(--muted);
+  font-size: 12px; line-height: 1.45; }
+.hitl-delivery-state svg { flex: none; margin-top: 1px; }
+.hitl-delivery-copy { flex: 1; min-width: 0; }
+.hitl-delivery-retry { flex: none; align-self: center; border: 1px solid currentColor;
+  border-radius: 6px; padding: 4px 8px; background: transparent; color: inherit;
+  font: inherit; font-weight: 700; cursor: pointer; }
+.hitl-delivery-retry:hover:not(:disabled) { background: color-mix(in srgb, currentColor 9%, transparent); }
+.hitl-delivery-retry:disabled { opacity: .5; cursor: default; }
+.hitl-delivery-state.partial,
+.hitl-delivery-state.rejected { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 42%, var(--border)); }
+.hitl-delivery-state.failed,
+.hitl-delivery-state.unknown { color: var(--red); border-color: color-mix(in srgb, var(--red) 42%, var(--border)); }
+.hitl-raw { margin: 2px 0 6px; font-size: 12px; color: var(--muted); }
+.hitl-raw summary { cursor: pointer; user-select: none; }
+.hitl-raw summary:hover { color: var(--text); }
+.hitl-raw > div { margin-top: 4px; padding-left: 10px; border-left: 2px solid var(--border); }
+@keyframes hitlPulse {
+  0%, 100% { box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+  50% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--amber) 36%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) { .hitl-card.first { animation: none; } }
+
+/* ── C35: Conversation narrow-screen polish ───────────────────────────────── */
+
+/* Bug-fix (Medium): right workspace panel overlay. The existing .workspace-surface-panel
+   uses position:relative; we must override that and width to make the fixed overlay
+   work. Use !important-free approach via higher specificity (.conversation-workspace-panel
+   is the same specificity, so we rely on cascade order — this block is appended last). */
+/* #126: core Chat work views as overlays once the header dock is hidden
+   (≤840px). Panels stay closable via their own close control / Esc so users
+   can return to the main conversation. */
+@media (max-width: 840px) {
+  .conversation-workspace-panel.workspace-surface-panel {
+    position: fixed !important;
+    top: env(safe-area-inset-top, 0px); right: 0; bottom: 0;
+    z-index: 48;
+    width: min(90vw, 380px) !important;
+    max-width: 100vw;
+    box-shadow: -4px 0 32px rgba(0,0,0,.28);
+    border-left: 1px solid var(--dsw-alias-border-l1);
+  }
+  .ai-conv-main { min-width: 0; width: 100%; }
+
+  .conversation-bottom-panel {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 48;
+    height: min(42dvh, 320px);
+    box-shadow: 0 -4px 28px rgba(0,0,0,.28);
+  }
+
+  .conversation-output-rail {
+    position: fixed;
+    top: env(safe-area-inset-top, 0px);
+    right: 0;
+    bottom: 0;
+    z-index: 48;
+    width: min(92vw, 360px);
+    max-width: 100vw;
+    min-width: 0;
+    padding: 12px;
+    background: transparent;
+    box-shadow: none;
+    align-items: stretch;
+    justify-content: flex-start;
+  }
+  .conversation-output-rail .conversation-output-card {
+    max-width: none;
+    max-height: calc(100dvh - env(safe-area-inset-top, 0px) - 24px);
+  }
+}
+
+/* Bug-fix (Medium): touch-target selector used .conversation-approval-card which
+   does not exist — the actual component class is .ai-approval-card. */
+@media (max-width: 860px) {
+  .ai-approval-card button,
+  .ai-conv-header button,
+  .harness-session-title-row button { min-height: 44px; min-width: 44px; }
+  /* Widen the send button for thumb reach */
+  .ai-prompt-bar button.ai-prompt-bar-submit { min-width: 48px; min-height: 44px; }
+}
+
+/* 360px floor: ensure nothing clips or scrolls horizontally. */
+@media (max-width: 400px) {
+  .ai-conv-home { padding: 12px; }
+  .conversation-workspace-panel.workspace-surface-panel { width: 100vw !important; }
+}

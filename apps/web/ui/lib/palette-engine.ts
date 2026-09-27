@@ -21,6 +21,8 @@
  * localStorage ("muteki.scheme") and is mirrored to <html data-scheme>.
  */
 
+import { updateBrandHead } from "./brand";
+
 export type ThemeMode = "light" | "dark";
 
 export interface SchemeDef {
@@ -41,8 +43,8 @@ export const SCHEMES: SchemeDef[] = [
   { id: "ember", hue: 53, labelKey: "scheme.ember" },
 ];
 
-export const DEFAULT_SCHEME = "azure";
-export const SCHEME_STORAGE_KEY = "muteki.scheme";
+const DEFAULT_SCHEME = "azure";
+const SCHEME_STORAGE_KEY = "muteki.scheme";
 
 /* ── OKLCH → sRGB ─────────────────────────────────────────────────────────── */
 
@@ -91,7 +93,36 @@ function rgbToHex(rgb: [number, number, number]): string {
   return `#${c(rgb[0])}${c(rgb[1])}${c(rgb[2])}`;
 }
 
-export function oklch(l: number, c: number, h: number): string {
+function addHeroUITokens(out: Record<string, string>, mode: ThemeMode): void {
+  out["--background"] = out["--bg"];
+  out["--foreground"] = out["--text"];
+  out["--surface"] = out["--panel"];
+  out["--surface-foreground"] = out["--text"];
+  out["--surface-secondary"] = out["--panel2"];
+  out["--surface-secondary-foreground"] = out["--text"];
+  out["--surface-tertiary"] = out["--panel3"];
+  out["--surface-tertiary-foreground"] = out["--text"];
+  out["--overlay"] = out["--panel"];
+  out["--overlay-foreground"] = out["--text"];
+  out["--default"] = out["--panel2"];
+  out["--default-foreground"] = out["--text"];
+  out["--accent-foreground"] = out["--on-accent"];
+  out["--field-background"] = out["--panel2"];
+  out["--field-foreground"] = out["--text"];
+  out["--field-placeholder"] = out["--muted"];
+  out["--field-border"] = out["--line"];
+  out["--success"] = out["--green"];
+  out["--success-foreground"] = mode === "light" ? "#ffffff" : "#0b0e12";
+  out["--warning"] = out["--amber"];
+  out["--warning-foreground"] = "#17130a";
+  out["--danger"] = out["--red"];
+  out["--danger-foreground"] = "#ffffff";
+  out["--separator"] = out["--line"];
+  out["--focus"] = out["--blue"];
+  out["--link"] = out["--blue"];
+}
+
+function oklch(l: number, c: number, h: number): string {
   return rgbToHex(clampToGamut(l, c, h));
 }
 
@@ -106,12 +137,12 @@ function hexToLinear(hex: string): [number, number, number] {
   return [f((v >> 16) & 255), f((v >> 8) & 255), f(v & 255)];
 }
 
-export function luminance(hex: string): number {
+function luminance(hex: string): number {
   const [r, g, b] = hexToLinear(hex);
   return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }
 
-export function contrastRatio(a: string, b: string): number {
+function contrastRatio(a: string, b: string): number {
   const la = luminance(a);
   const lb = luminance(b);
   return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
@@ -222,6 +253,7 @@ export const ENGINE_HUE: Record<string, number> = {
   kimi: 240,
   grok: 320,
   opencode: 180,
+  devin: 215,
   dsh: 350,
   reason: 265,
   deepseek: 265,
@@ -305,6 +337,8 @@ export function buildPaletteFromHue(
   for (const [engine, engineHue] of Object.entries(ENGINE_HUE)) {
     out[`--eng-${engine}`] = hueColor(engineHue, mode);
   }
+  // unknown engines: the same quiet slate lib/workers.ts uses for defaultColor.
+  out["--eng-default"] = hueColor(250, mode, 0.18);
 
   // human (operator) bubble — a whisper of the accent hue, not a gray.
   if (mode === "light") {
@@ -314,6 +348,7 @@ export function buildPaletteFromHue(
     out["--human-bg"] = oklch(0.26, 0.03, hue);
     out["--human-border"] = oklch(0.38, 0.05, hue);
   }
+  addHeroUITokens(out, mode);
   return out;
 }
 
@@ -333,7 +368,7 @@ export type SchemeSelection =
   | { kind: "preset"; id: string }
   | { kind: "custom"; hue: number };
 
-export const CUSTOM_SCHEME_ID = "custom";
+const CUSTOM_SCHEME_ID = "custom";
 const HUE_STORAGE_KEY = "muteki.schemeHue";
 
 export function readSavedSelection(): SchemeSelection {
@@ -351,11 +386,6 @@ export function readSavedSelection(): SchemeSelection {
   return { kind: "preset", id: DEFAULT_SCHEME };
 }
 
-export function readSavedScheme(): string {
-  const sel = readSavedSelection();
-  return sel.kind === "preset" ? sel.id : CUSTOM_SCHEME_ID;
-}
-
 export function readSavedTheme(): ThemeMode {
   try {
     if (window.localStorage.getItem("muteki.theme") === "light") return "light";
@@ -366,7 +396,7 @@ export function readSavedTheme(): ThemeMode {
 }
 
 /** Token map for a selection (preset or free hue) in one mode. */
-export function paletteForSelection(sel: SchemeSelection, mode: ThemeMode): Record<string, string> {
+function paletteForSelection(sel: SchemeSelection, mode: ThemeMode): Record<string, string> {
   return sel.kind === "custom" ? buildPaletteFromHue(sel.hue, mode) : buildPalette(sel.id, mode);
 }
 
@@ -381,16 +411,14 @@ export function applySelection(sel: SchemeSelection, mode: ThemeMode): void {
   const root = document.documentElement;
   for (const [token, value] of Object.entries(palette)) root.style.setProperty(token, value);
   root.dataset.theme = mode;
+  root.classList.toggle("dark", mode === "dark");
+  root.classList.toggle("light", mode === "light");
   root.dataset.scheme = sel.kind === "custom" ? CUSTOM_SCHEME_ID : schemeById(sel.id).id;
+  updateBrandHead(palette);
   try {
     window.localStorage.setItem(SCHEME_STORAGE_KEY, root.dataset.scheme);
     if (sel.kind === "custom") window.localStorage.setItem(HUE_STORAGE_KEY, String(Math.round(sel.hue)));
   } catch {
     /* theming still works for this session */
   }
-}
-
-/** Back-compat shorthand: apply a preset scheme id. */
-export function applyScheme(schemeId: string, mode: ThemeMode): void {
-  applySelection({ kind: "preset", id: schemeId }, mode);
 }
