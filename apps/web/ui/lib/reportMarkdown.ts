@@ -84,7 +84,7 @@ export type CvssEstimate = {
   estimated: true;
 };
 
-export const REPRO_INTENT_PREFIX = "I-repro-";
+const REPRO_INTENT_PREFIX = "I-repro-";
 
 export function reproIntentId(reportId: string): string {
   return `${REPRO_INTENT_PREFIX}${reportId}`;

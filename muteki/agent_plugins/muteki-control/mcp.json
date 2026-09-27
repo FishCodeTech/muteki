@@ -1,0 +1,15 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "muteki-control": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "${PLUGIN_ROOT}/mcp/stdio_server.py",
+        "--config",
+        "${PLUGIN_DATA}/connection.json"
+      ],
+      "cwd": "${PLUGIN_ROOT}"
+    }
+  }
+}

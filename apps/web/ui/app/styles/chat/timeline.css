@@ -1,0 +1,42 @@
+/* Chat workbench: timeline. Rules are prefixed `.cx-` and never target other pages. */
+
+.cx-term {
+  background: color-mix(in srgb, var(--ink) 4%, var(--surface));
+}
+.dark .cx-term {
+  background: color-mix(in srgb, black 30%, var(--surface));
+}
+.cx-term-fade {
+  background: linear-gradient(to bottom, transparent, color-mix(in srgb, var(--ink) 4%, var(--surface)));
+}
+.dark .cx-term-fade {
+  background: linear-gradient(to bottom, transparent, color-mix(in srgb, black 30%, var(--surface)));
+}
+
+.ai-message-body.is-cite-highlight {
+  border-radius: 12px;
+  animation: cx-cite-flash 1.6s var(--cx-ease-out);
+}
+@keyframes cx-cite-flash {
+  0%, 40% { background: var(--cx-selected); }
+  100% { background: transparent; }
+}
+
+.cx-message-enter {
+  animation: cx-fade-up 240ms var(--cx-ease-out) both;
+}
+
+/* Soft fade where the timeline scrolls under the pinned composer. */
+.cx-composer-dock {
+  position: relative;
+}
+.cx-composer-dock::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  height: 28px;
+  pointer-events: none;
+  background: linear-gradient(to bottom, transparent, var(--cx-bg));
+}

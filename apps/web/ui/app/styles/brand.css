@@ -1,0 +1,65 @@
+.muteki-logo { display: inline-block; flex: none; vertical-align: middle; }
+.workspace-frame { position: relative; --workspace-collapsed-brand-height: 52px; }
+.workspace-shared-brand-dock { position: absolute; z-index: 97; top: 0; left: 0; width: 180px; height: 48px;
+  display: flex; align-items: center; justify-content: space-between; padding: 0 18px;
+  transition: width var(--resize-dur) var(--ease-smooth-out), height var(--resize-dur) var(--ease-smooth-out),
+  background-color var(--resize-dur) var(--ease-smooth-out), opacity var(--control-feedback-dur) var(--ease-out); }
+.workspace-shared-brand-dock .workspace-nav-brand { display: inline-flex; align-items: center; min-width: 0; }
+.workspace-shared-brand-dock .workspace-nav-brand .muteki-logo { display: block; max-width: none; }
+.workspace-brand-sidebar-toggle { flex: none; width: 32px; height: 32px; display: grid; place-items: center;
+  padding: 0; border: 1px solid transparent; border-radius: 8px; color: var(--muted); background: transparent; cursor: pointer; }
+.workspace-brand-sidebar-toggle:hover { border-color: var(--line); color: var(--bright); background: var(--panel2); }
+.workspace-brand-sidebar-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.workspace-frame[data-conversation-layout="true"] .workspace-nav { grid-template-columns: var(--conv-sidebar-width, 264px) minmax(0, 1fr) 180px;
+  gap: 0; padding-left: 0; transition: grid-template-columns var(--panel-open-dur) var(--ease-smooth-out),
+  height var(--resize-dur) var(--ease-smooth-out), opacity var(--control-feedback-dur) var(--ease-out),
+  transform var(--control-press-dur) var(--ease-smooth-out), border-bottom-width var(--resize-dur) var(--ease-smooth-out), visibility 300ms; }
+.workspace-frame[data-conversation-layout="true"] .workspace-shared-brand-dock { width: var(--conv-sidebar-width, 264px);
+  padding: 0 10px 0 16px; border-right: 1px solid var(--line); }
+.workspace-frame[data-conversation-layout="true"] .workspace-nav nav { margin-left: 12px; }
+.workspace-frame[data-conversation-layout="true"][data-conversation-sidebar-collapsed="true"] .workspace-nav { grid-template-columns: 180px minmax(0, 1fr) 180px; }
+.workspace-frame[data-conversation-layout="true"][data-conversation-sidebar-collapsed="true"] .workspace-shared-brand-dock { width: 180px; }
+.workspace-frame[data-conversation-layout="true"][data-nav-collapsed="true"] .workspace-shared-brand-dock {
+  height: var(--workspace-collapsed-brand-height); background: var(--rail); border-bottom: 1px solid var(--line); }
+.workspace-frame[data-nav-collapsed="true"]:not([data-conversation-layout="true"]) .workspace-shared-brand-dock {
+  opacity: 0; visibility: hidden; pointer-events: none; }
+.workspace-frame[data-conversation-layout="true"][data-nav-collapsed="true"] .workspace-curtain-zone { animation: none; }
+/* When the desktop top bar collapses, the absolute brand dock stays visible.
+   Reserve its height inside the current sidebar, above both New chat and search.
+   Keeping this as a flex spacer also leaves the footer anchored to the bottom. */
+@media (min-width: 841px) {
+  .workspace-frame[data-conversation-layout="true"] .cx-sidebar-nav::before {
+    content: "";
+    flex: none;
+    height: 0;
+    transition: height var(--resize-dur) var(--ease-smooth-out);
+  }
+  .workspace-frame[data-conversation-layout="true"][data-nav-collapsed="true"] .cx-sidebar-nav::before {
+    height: var(--workspace-collapsed-brand-height);
+  }
+}
+.settings-hub-brand { display: inline-flex; align-items: center; margin: 4px 10px 14px; }
+.login-gate-logo { display: block; margin: 0 auto 12px; }
+.wp-brand { display: flex; align-items: center; gap: 14px; padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--line); }
+.wp-brand > span { color: var(--muted); font-size: 12px; }
+@media (max-width: 520px) {
+  .wp-brand { flex-wrap: wrap; }
+}
+@media (max-width: 840px) {
+  .workspace-frame { --workspace-nav-height: 56px; }
+  .workspace-brand-placeholder { width: 78px; }
+  .workspace-frame[data-conversation-layout="true"] .workspace-nav,
+  .workspace-frame[data-conversation-layout="true"][data-conversation-sidebar-collapsed="true"] .workspace-nav {
+    grid-template-columns: auto minmax(0, 1fr) auto; gap: 12px; padding-left: 12px; }
+  .workspace-shared-brand-dock,
+  .workspace-frame[data-conversation-layout="true"] .workspace-shared-brand-dock,
+  .workspace-frame[data-conversation-layout="true"][data-conversation-sidebar-collapsed="true"] .workspace-shared-brand-dock {
+    top: 0; left: 12px; width: 78px; height: 56px; padding: 0; border: 0; }
+  .workspace-shared-brand-dock .workspace-nav-brand { width: 30px; overflow: hidden; }
+  .workspace-frame[data-conversation-layout="true"] .workspace-nav nav { margin-left: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .workspace-shared-brand-dock, .workspace-frame[data-conversation-layout="true"] .workspace-nav,
+  .workspace-frame[data-conversation-layout="true"] .cx-sidebar-nav::before { transition: none; }
+}
+html[data-motion="reduce"] .workspace-frame[data-conversation-layout="true"] .cx-sidebar-nav::before { transition: none; }

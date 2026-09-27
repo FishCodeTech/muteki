@@ -1,0 +1,111 @@
+/* Shared workspace ergonomics; existing palette and page structure stay in use. */
+.workspace-home {
+  align-content: start;
+  padding: clamp(24px, 4vw, 52px) clamp(16px, 5vw, 72px) 32px;
+  gap: clamp(24px, 3vw, 36px);
+  scrollbar-gutter: stable;
+}
+.workspace-home-hero h1 { font-size: clamp(28px, 3.4vw, 42px); line-height: 1.2; }
+.workspace-home-hero p { font-size: 14px; }
+.workspace-home-status { display: flex; font-size: 12px; }
+.workspace-home-card { min-height: 244px; padding: 22px; }
+.workspace-home-card p { font-size: 13px; }
+.workspace-home-points span { font-size: 11px; color: var(--muted); }
+.workspace-home-action { font-size: 13px; }
+.workspace-home-card:focus-visible { border-color: var(--accent); }
+.workspace-home-recent-head h2 { margin: 0; font-size: 15px; font-weight: 600; }
+.workspace-home-recent-list > a { min-height: 68px; padding: 12px 16px; }
+.workspace-home-recent-list strong { font-size: 13px; }
+.workspace-home-recent-list small { color: var(--muted); font-size: 12px; }
+.workspace-home-error { margin: 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 13px; }
+.workspace-home-error > span { min-width: 0; overflow-wrap: anywhere; }
+.workspace-home-empty { font-size: 13px; line-height: 1.7; }
+.workspace-home-placeholder { justify-content: center; gap: 20px; }
+.ux-skeleton-line { width: 100%; height: 14px; border-radius: 5px; }
+.ux-skeleton-line.short { width: 45%; }
+.workspace-mobile-dialog { width: 100%; }
+.settings-mobile-dialog {
+  width: 100%;
+  --dsw-alias-label-primary: var(--bright);
+  --dsw-alias-label-secondary: var(--text);
+  --dsw-alias-label-tertiary: var(--muted);
+  --dsw-alias-label-caption: var(--muted);
+  --dsw-specific-input-major: var(--panel2);
+  --dsw-alias-interactive-bg-hover: var(--panel2);
+  --dsw-alias-state-business-tertiary: var(--accent-tint);
+  --dsw-alias-state-business-primary: var(--accent);
+}
+.settings-mobile-dialog .settings-hub-search { margin-bottom: 16px; }
+.settings-mobile-dialog .settings-hub-group a { min-height: 44px; }
+.settings-mobile-dialog .settings-hub-back { margin-bottom: 16px; }
+.workspace-mobile-links { display: grid; gap: 4px; }
+.workspace-mobile-links > a {
+  min-height: 64px; display: flex; align-items: center; gap: 12px;
+  padding: 12px; border-radius: 10px; text-decoration: none; color: var(--text);
+  transition: background-color var(--control-feedback-dur) var(--ease-out);
+}
+.workspace-mobile-links > a > span { display: grid; flex: 1; gap: 2px; }
+.workspace-mobile-links small { color: var(--muted); font-size: 12px; }
+.workspace-mobile-links > a[aria-current="page"], .workspace-mobile-links > a:hover { background: var(--panel2); color: var(--accent); }
+.workspace-mobile-utilities {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px;
+  padding-top: 16px; margin-top: 12px; border-top: 1px solid var(--line);
+}
+.workspace-mobile-utilities > :is(a, button) {
+  display: flex; align-items: center; justify-content: flex-start; gap: 9px;
+  padding: 10px 12px; min-height: 44px; border-radius: 9px;
+  font-size: 13px; color: var(--text); text-decoration: none; background: var(--panel2);
+}
+.workspace-nav-tools { gap: 6px; }
+.workspace-nav-brand > span:last-child { display: block; }
+.t-icon-swap .t-icon { display: flex; align-items: center; justify-content: center; }
+.settings-hub-nav:focus-within { scroll-margin-block: 12px; }
+.workspace-route-state { width: 100%; height: 100%; min-height: 240px; overflow: auto; display: grid; place-items: center; padding: 24px; background: var(--bg); }
+.workspace-route-card { width: min(100%, 440px); display: grid; gap: 18px; padding: 28px; border: 1px solid var(--line); border-radius: 16px; background: var(--panel); }
+.workspace-route-card h1 { margin: 0; color: var(--bright); font-size: 22px; }
+.workspace-route-card p { margin: 0; color: var(--muted); line-height: 1.7; }
+.workspace-route-actions { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+.workspace-route-actions a { color: var(--accent); padding-block: 10px; text-underline-offset: 4px; }
+.global-search-dialog.modal__dialog { width: min(640px, calc(100vw - 32px)); max-width: calc(100vw - 32px); max-height: calc(100dvh - 80px); }
+.global-search-dialog > div { display: flex; flex-direction: column; min-height: 0; }
+.global-search-dialog .modal__body { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.global-search-list > [role="option"] { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; gap: 12px; min-height: 52px; padding: 8px 10px; }
+.global-search-list > [role="option"]:is([data-focused="true"], :hover) { background: var(--panel2); }
+.global-search-list > [role="option"] > kbd { color: var(--muted); font-size: 11px; }
+
+@media (min-width: 841px) and (max-width: 1100px) {
+  .workspace-home-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .workspace-home-card { padding: 18px; }
+}
+@media (max-width: 840px) {
+  .settings-hub-nav { display: none; }
+  .workspace-home-grid { grid-template-columns: 1fr; }
+  .workspace-home-card { min-height: 206px; padding: 18px; }
+  .workspace-home-hero { gap: 14px; }
+  .workspace-home-status { max-width: 100%; }
+  .workspace-home-recent-list { grid-template-columns: 1fr; }
+  .workspace-home-footer { justify-content: flex-start; flex-wrap: wrap; gap: 8px 16px; }
+  .workspace-home-footer > span { flex-basis: 100%; }
+}
+@media (max-width: 768px) {
+  /* Later desktop sidebar rules previously overrode position:fixed, leaving
+     an invisible 264px flex item beside the mobile conversation. */
+  .ai-conv-shell > .ai-conv-sidebar {
+    position: fixed;
+    inset: var(--workspace-nav-height, 56px) auto 0 0;
+    height: auto;
+    width: min(var(--conv-sidebar-width, 264px), 78vw);
+    max-width: 78vw;
+    visibility: hidden;
+    transform: translateX(-100%);
+    transition: transform var(--panel-close-dur) var(--panel-ease), visibility 0s var(--panel-close-dur);
+  }
+  .ai-conv-shell > .ai-conv-sidebar.open {
+    visibility: visible;
+    transform: translateX(0);
+    transition: transform var(--panel-open-dur) var(--panel-ease), visibility 0s;
+  }
+}
+@media (hover: none) {
+  .workspace-home-card:hover, .workspace-home-card:hover .workspace-home-action svg { transform: none; }
+}

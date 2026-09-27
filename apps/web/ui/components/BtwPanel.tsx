@@ -1,9 +1,15 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Drawer,
+  Spinner,
+} from "@heroui/react";
 import { Icon } from "@/components/Icon";
+import { MessageMarkdown } from "@/components/ai-native/message-markdown";
 import { useT } from "@/lib/i18n";
 import { apiFetch } from "@/lib/useRun";
+import styles from "./BtwPanel.module.css";
 
 /**
  * BTW side-query worker — a right-side drawer for read-only Q&A over a run.
@@ -16,13 +22,8 @@ import { apiFetch } from "@/lib/useRun";
  * Multi-turn: the transcript lives ONLY in this component's local state. It is
  * sent with each request so every turn can cold-start a fresh worker without
  * losing conversational context. Closing the drawer (Esc / backdrop / button)
- * drops the whole transcript — nothing is
- * persisted server-side. Switching runs clears it (different runs' contexts
- * must not mix).
- *
- * Open/close is OWNED by page.tsx (same pattern as CommandPalette) so a single
- * global Esc handler arbitrates layering. This component is a pure modal: it
- * renders nothing when `open` is false.
+ * drops the whole transcript — nothing is persisted server-side. Switching
+ * runs clears it (different runs' contexts must not mix).
  */
 
 export interface BtwPanelProps {
@@ -42,7 +43,7 @@ const QUICK_ASKS = [
 
 // Rough transcript cap (chars). Server also caps; this is the client line of
 // defense so a long conversation doesn't balloon the request body.
-const MAX_TRANSCRIPT_CHARS = 60000;
+const MAX_TRANSCRIPT_CHARS = 200000;
 
 export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
   const t = useT();
@@ -76,21 +77,31 @@ export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
     }
   }, [open]);
 
-  // Esc closes (stopPropagation so it doesn't also close a panel beneath).
-  const onKey = (e: React.KeyboardEvent) => {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      e.stopPropagation();
-      onClose();
+  const handleClear = useCallback(() => {
+    if (streaming && abortRef.current) {
+      abortRef.current.abort();
+      abortRef.current = null;
     }
-  };
+    setTurns([]);
+    setInput("");
+    setError("");
+    setStreaming(false);
+  }, [streaming]);
+
+  const handleStop = useCallback(() => {
+    if (abortRef.current) {
+      abortRef.current.abort();
+      abortRef.current = null;
+    }
+    setStreaming(false);
+  }, []);
 
   const send = useCallback(
     async (question: string) => {
       const q = question.trim();
       if (!q || streaming || !runId) return;
       setError("");
-      // cancel any prior in-flight stream (defensive — limiter cancels server-side too)
+      // cancel any prior in-flight stream
       if (abortRef.current) abortRef.current.abort();
       const ctrl = new AbortController();
       abortRef.current = ctrl;
@@ -125,7 +136,6 @@ export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
           const { done, value } = await reader.read();
           if (done) break;
           buf += dec.decode(value, { stream: true });
-          // sse-starlette emits CRLF CRLF between frames; tolerate both.
           const frames = buf.split(/\r?\n\r?\n/);
           buf = frames.pop() || "";
           for (const frame of frames) {
@@ -159,7 +169,7 @@ export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
         }
       } catch (e: any) {
         if (e?.name === "AbortError") {
-          // silent — operator closed / re-asked
+          // silent — operator closed / aborted
         } else {
           setError(String(e?.message || e).slice(0, 300));
         }
@@ -171,89 +181,85 @@ export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
     [runId, streaming, turns],
   );
 
-  if (!open) return null;
-
   // rough client-side transcript cap so the request body stays bounded
   const transcriptChars = turns.reduce((n, t) => n + t.content.length, 0);
   const overCap = transcriptChars > MAX_TRANSCRIPT_CHARS;
+  const userTurnCount = turns.filter((t) => t.role === "user").length;
 
   return (
-    <div className="modal-backdrop btw-backdrop" onClick={onClose} onKeyDown={onKey}>
-      <div
-        className="btw-drawer"
-        role="dialog"
-        aria-modal="true"
-        aria-label="BTW observer"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="btw-head">
-          <span className="btw-title">
-            <Icon name="eye" size={15} /> {t("btw.title")}
-          </span>
-          <span className="btw-sub" title={runId}>{runId}</span>
-          <span className="btw-spacer" />
-          <button className="btw-x" onClick={onClose} aria-label="close" title="Esc">
-            <Icon name="x" size={15} />
-          </button>
-        </div>
-
-        <div className="btw-quick">
-          {QUICK_ASKS.map((q) => (
-            <button
-              key={q}
-              className="btw-quick-btn"
-              disabled={streaming}
-              onClick={() => send(q)}
-              title={q}
-            >
-              {q}
-            </button>
-          ))}
-        </div>
-
-        <div className="btw-scroll" ref={scrollRef}>
-          {turns.length === 0 && !streaming && (
-            <div className="btw-empty">{t("btw.empty")}</div>
-          )}
-          {turns.map((turn, i) => (
-            <div key={i} className={`btw-msg btw-${turn.role}`}>
-              <div className="btw-msg-role">{turn.role === "user" ? "你" : "观察员"}</div>
-              <div className="btw-msg-body">
-                {turn.content || (turn.role === "assistant" && streaming ? "…" : "")}
+    <Drawer isOpen={open} onOpenChange={(isOpen) => { if (!isOpen) onClose(); }}>
+      <Drawer.Backdrop variant="blur" className="!z-[150] bg-black/40 backdrop-blur-sm">
+        <Drawer.Content placement="right" className="!z-[150]">
+          <Drawer.Dialog aria-label={t("btw.title")} className={styles.dialog}>
+            <Drawer.Header className={styles.header}>
+              <div className={styles.headerMain}>
+                <div className={styles.mark} aria-hidden="true"><Icon name="sparkles" size={18} /></div>
+                <div className={styles.heading}>
+                  <h2>顺嘴问</h2>
+                  <p>针对当前解题的临时问答</p>
+                </div>
+                <div className={styles.headerActions}>
+                  {turns.length > 0 && <button type="button" className={styles.iconButton} disabled={streaming} onClick={handleClear} aria-label="清空对话" title="清空对话"><Icon name="trash" size={16} /></button>}
+                  <button type="button" className={styles.iconButton} onClick={onClose} aria-label="关闭" title="关闭"><Icon name="x" size={17} /></button>
+                </div>
               </div>
-            </div>
-          ))}
-          {error && <div className="btw-error">{error}</div>}
-          {overCap && (
-            <div className="btw-error">transcript 过长，建议关闭抽屉重新开始。</div>
-          )}
-        </div>
+              <div className={styles.contextRow}>
+                <span className={styles.contextDot} aria-hidden="true" />
+                <span className={styles.contextRun} title={runId}>{runId}</span>
+                <span className={styles.contextDivider} aria-hidden="true" />
+                <span>只读旁路</span>
+                <span className={styles.turnCount}>{userTurnCount} 轮</span>
+              </div>
+            </Drawer.Header>
 
-        <div className="btw-input-row">
-          <textarea
-            className="btw-input"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder={t("btw.placeholder")}
-            disabled={streaming}
-            rows={2}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                send(input);
-              }
-            }}
-          />
-          <button
-            className="btw-send"
-            disabled={streaming || !input.trim()}
-            onClick={() => send(input)}
-            title="Enter 发送 / Shift+Enter 换行"
-          >
-            {streaming ? "…" : t("btw.send")}
-          </button>
-        </div>
-      </div>
-    </div>
+            <Drawer.Body className={styles.body}>
+              <div ref={scrollRef} className={styles.scroll} role="log" aria-label="顺嘴问对话" aria-live="polite">
+                {turns.length === 0 && !streaming ? (
+                  <div className={styles.empty}>
+                    <div className={styles.emptyMark} aria-hidden="true"><Icon name="sparkles" size={22} /></div>
+                    <h3>有什么想快速确认的？</h3>
+                    <p>询问进展、证据或下一步。回答来自临时旁路 Worker，关闭面板后不会保留。</p>
+                    <div className={styles.suggestionHeading}>从这些问题开始</div>
+                    <div className={styles.suggestions}>
+                      {QUICK_ASKS.map((q) => <button key={q} type="button" onClick={() => void send(q)} className={styles.suggestion}><span>{q}</span><Icon name="arrowRight" size={15} /></button>)}
+                    </div>
+                  </div>
+                ) : (
+                  <div className={styles.messages}>
+                    {turns.map((turn, i) => <div key={i} className={turn.role === "user" ? styles.userTurn : styles.assistantTurn}>
+                      <div className={styles.turnLabel}>{turn.role === "user" ? "你" : "旁路 Worker"}{turn.role === "assistant" && streaming && i === turns.length - 1 ? <span className={styles.generating}><Spinner size="sm" />生成中</span> : null}</div>
+                      <div className={turn.role === "user" ? styles.userBubble : styles.assistantBubble}>
+                        {turn.role === "user" ? turn.content : turn.content ? <MessageMarkdown text={turn.content} /> : streaming && i === turns.length - 1 ? <span className={styles.pending}>正在读取当前运行状态…</span> : <span className={styles.pending}>（无回复内容）</span>}
+                      </div>
+                    </div>)}
+                    {!streaming && <div className={styles.followUps} aria-label="快捷追问">{QUICK_ASKS.slice(0, 2).map((q) => <button key={q} type="button" onClick={() => void send(q)}>{q}</button>)}</div>}
+                  </div>
+                )}
+                {error && <div className={styles.error} role="alert"><Icon name="alert" size={16} /><span>{error}</span></div>}
+                {overCap && <div className={styles.warning} role="status">对话记录过长，请清空记录后继续提问。</div>}
+              </div>
+            </Drawer.Body>
+
+            <Drawer.Footer className={styles.footer}>
+              <div className={styles.composer}>
+                <textarea
+                  className={styles.textarea}
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  placeholder={t("btw.placeholder") || "顺嘴问一句…"}
+                  disabled={streaming}
+                  rows={2}
+                  onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send(input); } }}
+                />
+                <div className={styles.composerBottom}>
+                  <span>Enter 发送 <span aria-hidden="true">·</span> Shift+Enter 换行</span>
+                  {streaming ? <button type="button" className={styles.stopButton} onClick={handleStop}><Icon name="stop" size={14} />停止</button> : <button type="button" className={styles.sendButton} disabled={!input.trim() || overCap} onClick={() => void send(input)}><span>{t("btw.send") || "发送"}</span><Icon name="send" size={14} /></button>}
+                </div>
+              </div>
+            </Drawer.Footer>
+          </Drawer.Dialog>
+        </Drawer.Content>
+      </Drawer.Backdrop>
+    </Drawer>
   );
 }

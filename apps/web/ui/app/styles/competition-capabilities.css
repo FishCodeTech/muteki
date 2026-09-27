@@ -1,0 +1,583 @@
+/* Capability management: MCP / Skills / Tools / Adapter / Thread grants. */
+.workspace-frame-content > .capability-center { width: 100%; min-height: 100%; }
+.capability-center {
+  width: 100%;
+  max-width: 1480px;
+  margin: 0 auto;
+  padding: clamp(16px, 2vw, 28px);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-sans);
+}
+
+.capability-center :where(button, input, select) { font: inherit; }
+.capability-center button { cursor: pointer; }
+.capability-center button:disabled { cursor: not-allowed; opacity: 0.52; }
+
+/* ── Top Toolbar & Feedback ─────────────────────────────────────────────── */
+.cap-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.cap-topbar-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.cap-topbar-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 650;
+  color: var(--bright);
+  letter-spacing: -0.02em;
+}
+.cap-topbar-desc {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.cap-topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.cap-btn {
+  min-height: 34px;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid var(--line2);
+  border-radius: 8px;
+  background: var(--panel2);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 550;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+.cap-btn:hover:not(:disabled) {
+  border-color: var(--line-strong, var(--line2));
+  background: color-mix(in srgb, var(--bright) 5%, var(--panel2));
+  color: var(--bright);
+}
+.cap-btn.primary {
+  border-color: color-mix(in srgb, var(--blue) 50%, var(--line2));
+  background: color-mix(in srgb, var(--blue) 12%, var(--panel2));
+  color: var(--blue);
+}
+.cap-btn.primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--blue) 22%, var(--panel2));
+}
+.cap-btn.danger {
+  border-color: color-mix(in srgb, var(--red) 45%, var(--line2));
+  background: color-mix(in srgb, var(--red) 10%, var(--panel2));
+  color: var(--red);
+}
+.cap-btn.danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--red) 20%, var(--panel2));
+}
+.cap-btn.sm {
+  min-height: 28px;
+  padding: 0 9px;
+  font-size: 11px;
+  border-radius: 6px;
+}
+
+.cap-feedback {
+  padding: 10px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel2);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.45;
+  animation: fade-in var(--duration-quick) var(--ease-out);
+}
+.cap-feedback-body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.cap-feedback.ok {
+  border-color: color-mix(in srgb, var(--green) 45%, var(--line));
+  background: color-mix(in srgb, var(--green) 8%, var(--panel));
+  color: var(--green);
+}
+.cap-feedback.bad {
+  border-color: color-mix(in srgb, var(--red) 45%, var(--line));
+  background: color-mix(in srgb, var(--red) 8%, var(--panel));
+  color: var(--red);
+}
+.cap-feedback-close {
+  background: transparent;
+  border: none;
+  padding: 2px;
+  color: currentColor;
+  opacity: 0.75;
+  border-radius: 4px;
+  display: flex;
+}
+.cap-feedback-close:hover { opacity: 1; }
+
+.cap-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  border-radius: 5px;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+  background: color-mix(in srgb, var(--muted) 12%, transparent);
+  color: var(--muted);
+}
+.cap-state i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.cap-state.ok {
+  background: color-mix(in srgb, var(--green) 12%, transparent);
+  color: var(--green);
+}
+.cap-state.bad {
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  color: var(--red);
+}
+.cap-state.warn {
+  background: color-mix(in srgb, var(--amber) 12%, transparent);
+  color: var(--amber);
+}
+.cap-state.info {
+  background: color-mix(in srgb, var(--blue) 12%, transparent);
+  color: var(--blue);
+}
+
+/* ── Stats Summary Deck ─────────────────────────────────────────────────── */
+.cap-stats-deck {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+}
+.cap-stat-card {
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  transition: border-color var(--control-feedback-dur) var(--ease-out);
+}
+.cap-stat-card:hover {
+  border-color: var(--line2);
+}
+.cap-stat-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.cap-stat-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 550;
+}
+.cap-stat-value {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  color: var(--bright);
+  font-size: 18px;
+  font-weight: 650;
+  font-family: var(--font-mono);
+}
+.cap-stat-sub {
+  margin: 0;
+  color: var(--dim);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Tab Navigation ─────────────────────────────────────────────────────── */
+.cap-tab-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 8px;
+  overflow-x: auto;
+}
+.cap-tab-btn {
+  min-height: 34px;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 550;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+.cap-tab-btn:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--bright) 4%, transparent);
+}
+.cap-tab-btn.active {
+  color: var(--bright);
+  background: var(--panel2);
+  border-color: var(--line2);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+}
+.cap-tab-count {
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--muted) 15%, transparent);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+}
+.cap-tab-btn.active .cap-tab-count {
+  background: color-mix(in srgb, var(--blue) 15%, transparent);
+  color: var(--blue);
+}
+
+/* ── Tab 1: Thread Binding Workspace ────────────────────────────────────── */
+.cap-threads-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+.cap-thread-picker {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+.cap-thread-picker-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.cap-thread-picker-head span {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--bright);
+}
+.cap-search-input-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.cap-search-input-wrap svg {
+  position: absolute;
+  left: 10px;
+  color: var(--dim);
+  pointer-events: none;
+}
+.cap-search-input {
+  width: 100%;
+  min-height: 32px;
+  padding: 0 10px 0 30px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel2);
+  color: var(--text);
+  font-size: 11px;
+  outline: none;
+  transition: border-color var(--control-feedback-dur) var(--ease-out);
+}
+.cap-search-input:focus {
+  border-color: var(--line2);
+}
+.cap-thread-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 600px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.cap-thread-card {
+  width: 100%;
+  height: auto;
+  min-height: 78px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 5px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel2);
+  color: var(--text);
+  text-align: left;
+  white-space: normal;
+  transition: all 0.15s ease;
+  position: relative;
+}
+.cap-thread-card:hover {
+  border-color: var(--line2);
+  background: color-mix(in srgb, var(--bright) 3%, var(--panel2));
+}
+.cap-thread-card.active {
+  border-color: color-mix(in srgb, var(--blue) 50%, var(--line2));
+  background: color-mix(in srgb, var(--blue) 6%, var(--panel2));
+}
+.cap-thread-card-top {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.cap-thread-card-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--bright);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cap-thread-card-sub {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--muted);
+  font-family: var(--font-mono);
+}
+.cap-thread-card-sub > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cap-thread-card-meta {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 10px;
+  color: var(--dim);
+}
+
+.cap-binding-editor {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+.cap-binding-editor-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+.cap-binding-editor-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.cap-binding-editor-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--bright);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.cap-binding-editor-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.cap-badge {
+  padding: 2px 7px;
+  border-radius: 5px;
+  font-size: 10px;
+  font-weight: 550;
+  border: 1px solid var(--line);
+  background: var(--panel2);
+  color: var(--muted);
+}
+.cap-badge.primary {
+  border-color: color-mix(in srgb, var(--blue) 35%, var(--line));
+  background: color-mix(in srgb, var(--blue) 8%, var(--panel));
+  color: var(--blue);
+}
+.cap-badge.success {
+  border-color: color-mix(in srgb, var(--green) 35%, var(--line));
+  background: color-mix(in srgb, var(--green) 8%, var(--panel));
+  color: var(--green);
+}
+.cap-binding-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.cap-tools-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.cap-target-filters {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.cap-filter-pill {
+  padding: 3px 9px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--panel2);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  transition: all 0.15s ease;
+}
+.cap-filter-pill:hover {
+  color: var(--text);
+  border-color: var(--line2);
+}
+.cap-filter-pill.active {
+  background: color-mix(in srgb, var(--blue) 12%, var(--panel2));
+  border-color: color-mix(in srgb, var(--blue) 45%, var(--line2));
+  color: var(--blue);
+  font-weight: 600;
+}
+
+.cap-tools-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  max-height: 480px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.cap-tool-card {
+  padding: 10px 12px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel2);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+.cap-tool-card:hover {
+  border-color: var(--line2);
+  background: color-mix(in srgb, var(--bright) 2%, var(--panel2));
+}
+.cap-tool-card.selected {
+  border-color: color-mix(in srgb, var(--blue) 45%, var(--line2));
+  background: color-mix(in srgb, var(--blue) 5%, var(--panel2));
+}
+.cap-tool-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+.cap-tool-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.cap-tool-card-name {
+  font-size: 11px;
+  font-weight: 650;
+  color: var(--bright);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cap-tool-card-desc {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+.cap-tool-card-footer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+  flex-wrap: wrap;
+  font-size: 9.5px;
+  color: var(--dim);
+}
+
+.cap-binding-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+.cap-dirty-notice {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.cap-dirty-notice.changed {
+  color: var(--amber);
+  font-weight: 550;
+}

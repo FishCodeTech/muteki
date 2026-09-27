@@ -1,0 +1,48 @@
+/* Include portals, pseudo-elements and legacy keyframes. Tiny finite durations
+   retain final keyframe states and React Aria's exit completion events. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+  ::view-transition-group(*), ::view-transition-old(*), ::view-transition-new(*) {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+  }
+}
+html[data-motion="reduce"] *,
+html[data-motion="reduce"] *::before,
+html[data-motion="reduce"] *::after {
+  animation-duration: 0.01ms !important;
+  animation-delay: 0ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  transition-delay: 0ms !important;
+  scroll-behavior: auto !important;
+}
+html[data-motion="reduce"]::view-transition-group(*),
+html[data-motion="reduce"]::view-transition-old(*),
+html[data-motion="reduce"]::view-transition-new(*) {
+  animation-duration: 0.01ms !important;
+  animation-delay: 0ms !important;
+}
+
+:where(a, button, input, textarea, select, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+:where(button, input, textarea, select)[disabled] { cursor: not-allowed; }
+:where(input, textarea, select) { accent-color: var(--accent); }
+@media (forced-colors: active) {
+  :where(a, button, input, textarea, select, summary, [tabindex]):focus-visible { outline-color: Highlight; }
+  :where([aria-current="page"], [aria-selected="true"]) { outline: 1px solid Highlight; }
+}
+@media (pointer: coarse) {
+  :where(input, textarea, select) { font-size: max(16px, 1em); }
+  :where(.workspace-nav-tools button, .workspace-mobile-links a, .workspace-mobile-utilities a, .workspace-mobile-utilities button, .settings-hub-menu) { min-height: 44px; min-width: 44px; }
+  .harness-folder-actions, .harness-project-toolbar .harness-project-actions { opacity: 1; }
+}

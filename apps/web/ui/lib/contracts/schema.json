@@ -1,0 +1,4488 @@
+{
+  "$defs": {
+    "ActorRef": {
+      "additionalProperties": false,
+      "description": "命令发起方，例如 {\"kind\": \"operator\", \"id\": \"local-user\"}。",
+      "properties": {
+        "binding_id": {
+          "default": "",
+          "title": "Binding Id",
+          "type": "string"
+        },
+        "binding_version": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Binding Version"
+        },
+        "id": {
+          "default": "",
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "default": "system",
+          "title": "Kind",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "thread_id": {
+          "default": "",
+          "title": "Thread Id",
+          "type": "string"
+        }
+      },
+      "title": "ActorRef",
+      "type": "object"
+    },
+    "AgentCapabilities": {
+      "additionalProperties": false,
+      "description": "Adapter probe 得到的 Runtime 能力（任务书 6.5 全量字段）。\n\nRunExecutor 和 Adapter 读取 capability 后决定功能；\n禁止根据 ``adapter.id`` 写隐式功能判断。",
+      "properties": {
+        "access_modes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Access Modes",
+          "type": "array"
+        },
+        "acp_mcp_config": {
+          "default": false,
+          "title": "Acp Mcp Config",
+          "type": "boolean"
+        },
+        "agent_plugin": {
+          "default": false,
+          "title": "Agent Plugin",
+          "type": "boolean"
+        },
+        "approval": {
+          "default": false,
+          "title": "Approval",
+          "type": "boolean"
+        },
+        "capability_source": {
+          "default": "probe",
+          "title": "Capability Source",
+          "type": "string"
+        },
+        "compaction": {
+          "default": false,
+          "title": "Compaction",
+          "type": "boolean"
+        },
+        "fork": {
+          "default": false,
+          "title": "Fork",
+          "type": "boolean"
+        },
+        "image_input": {
+          "default": false,
+          "title": "Image Input",
+          "type": "boolean"
+        },
+        "interrupt": {
+          "default": false,
+          "title": "Interrupt",
+          "type": "boolean"
+        },
+        "mcp": {
+          "default": false,
+          "title": "Mcp",
+          "type": "boolean"
+        },
+        "native_tool_binding": {
+          "default": false,
+          "title": "Native Tool Binding",
+          "type": "boolean"
+        },
+        "permission_modes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Permission Modes",
+          "type": "array"
+        },
+        "plan": {
+          "default": false,
+          "title": "Plan",
+          "type": "boolean"
+        },
+        "protocol_version": {
+          "default": "",
+          "title": "Protocol Version",
+          "type": "string"
+        },
+        "resume": {
+          "default": false,
+          "title": "Resume",
+          "type": "boolean"
+        },
+        "runtime_plugin_binding": {
+          "default": false,
+          "title": "Runtime Plugin Binding",
+          "type": "boolean"
+        },
+        "runtime_version": {
+          "default": "",
+          "title": "Runtime Version",
+          "type": "string"
+        },
+        "sandbox_modes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Sandbox Modes",
+          "type": "array"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "session_persistence": {
+          "default": false,
+          "title": "Session Persistence",
+          "type": "boolean"
+        },
+        "skills": {
+          "default": false,
+          "title": "Skills",
+          "type": "boolean"
+        },
+        "steer": {
+          "default": false,
+          "title": "Steer",
+          "type": "boolean"
+        },
+        "streaming": {
+          "default": false,
+          "title": "Streaming",
+          "type": "boolean"
+        },
+        "structured_http_rpc": {
+          "default": false,
+          "title": "Structured Http Rpc",
+          "type": "boolean"
+        },
+        "structured_output": {
+          "default": false,
+          "title": "Structured Output",
+          "type": "boolean"
+        },
+        "subagents": {
+          "default": false,
+          "title": "Subagents",
+          "type": "boolean"
+        },
+        "supported_efforts": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Supported Efforts",
+          "type": "array"
+        },
+        "supported_models": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Supported Models",
+          "type": "array"
+        },
+        "tool_events": {
+          "default": false,
+          "title": "Tool Events",
+          "type": "boolean"
+        },
+        "transport_kind": {
+          "default": "",
+          "title": "Transport Kind",
+          "type": "string"
+        },
+        "usage_events": {
+          "default": false,
+          "title": "Usage Events",
+          "type": "boolean"
+        },
+        "user_input": {
+          "default": false,
+          "title": "User Input",
+          "type": "boolean"
+        }
+      },
+      "title": "AgentCapabilities",
+      "type": "object"
+    },
+    "AgentEvent": {
+      "additionalProperties": false,
+      "description": "统一 AgentEvent（任务书 6.7）。\n\n未知原生事件可以保存为 Adapter 私有事件放入 payload，\n但不能修改核心状态机。",
+      "properties": {
+        "agent_session_id": {
+          "default": "",
+          "title": "Agent Session Id",
+          "type": "string"
+        },
+        "event_type": {
+          "$ref": "#/$defs/AgentEventType"
+        },
+        "execution_generation": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Execution Generation"
+        },
+        "external_session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "External Session Id"
+        },
+        "native_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Native Type"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "title": "Payload",
+          "type": "object"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Run Id"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "seq": {
+          "default": 0,
+          "title": "Seq",
+          "type": "integer"
+        },
+        "turn_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Turn Id"
+        }
+      },
+      "required": [
+        "event_type"
+      ],
+      "title": "AgentEvent",
+      "type": "object"
+    },
+    "AgentEventType": {
+      "description": "统一 AgentEvent 事件类型（任务书 6.7，含 plan.updated）。",
+      "enum": [
+        "session.started",
+        "session.resumed",
+        "session.closed",
+        "turn.started",
+        "turn.completed",
+        "turn.failed",
+        "message.delta",
+        "message.completed",
+        "reasoning.summary",
+        "tool.started",
+        "tool.progress",
+        "tool.completed",
+        "approval.requested",
+        "approval.resolved",
+        "user_input.requested",
+        "user_input.resolved",
+        "artifact.created",
+        "workspace.changed",
+        "usage.updated",
+        "plan.updated",
+        "agent.updated",
+        "runtime.capabilities_updated",
+        "runtime.warning",
+        "runtime.error",
+        "runtime.exited"
+      ],
+      "title": "AgentEventType",
+      "type": "string"
+    },
+    "AgentInput": {
+      "additionalProperties": false,
+      "description": "发送给 Agent Session 的一次输入（消息、steer、approval 答复等）。",
+      "properties": {
+        "kind": {
+          "default": "message",
+          "title": "Kind",
+          "type": "string"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "title": "Payload",
+          "type": "object"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "text": {
+          "default": "",
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "title": "AgentInput",
+      "type": "object"
+    },
+    "AgentSession": {
+      "additionalProperties": false,
+      "description": "一个外部 Runtime 的可恢复会话映射。",
+      "properties": {
+        "adapter_id": {
+          "default": "",
+          "title": "Adapter Id",
+          "type": "string"
+        },
+        "agent_session_id": {
+          "title": "Agent Session Id",
+          "type": "string"
+        },
+        "closed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Closed At"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "execution_generation": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Execution Generation"
+        },
+        "external_session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "External Session Id"
+        },
+        "resume_handle": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resume Handle"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Run Id"
+        },
+        "runtime_instance_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Runtime Instance Id"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "thread_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Thread Id"
+        }
+      },
+      "title": "AgentSession",
+      "type": "object"
+    },
+    "AgentSessionRef": {
+      "additionalProperties": false,
+      "description": "Adapter 返回的会话引用。",
+      "properties": {
+        "adapter_id": {
+          "default": "",
+          "title": "Adapter Id",
+          "type": "string"
+        },
+        "agent_session_id": {
+          "title": "Agent Session Id",
+          "type": "string"
+        },
+        "external_session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "External Session Id"
+        },
+        "resume_handle": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resume Handle"
+        },
+        "runtime_instance_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Runtime Instance Id"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "agent_session_id"
+      ],
+      "title": "AgentSessionRef",
+      "type": "object"
+    },
+    "AgentSessionSnapshot": {
+      "additionalProperties": false,
+      "description": "Agent Session 当前状态快照。",
+      "properties": {
+        "adapter_id": {
+          "default": "",
+          "title": "Adapter Id",
+          "type": "string"
+        },
+        "agent_session_id": {
+          "title": "Agent Session Id",
+          "type": "string"
+        },
+        "current_turn_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Current Turn Id"
+        },
+        "external_session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "External Session Id"
+        },
+        "last_event_seq": {
+          "default": 0,
+          "title": "Last Event Seq",
+          "type": "integer"
+        },
+        "pending_approval": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pending Approval"
+        },
+        "pending_user_input": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pending User Input"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "state": {
+          "default": "active",
+          "title": "State",
+          "type": "string"
+        },
+        "usage": {
+          "additionalProperties": true,
+          "title": "Usage",
+          "type": "object"
+        }
+      },
+      "required": [
+        "agent_session_id"
+      ],
+      "title": "AgentSessionSnapshot",
+      "type": "object"
+    },
+    "AggregateRef": {
+      "additionalProperties": false,
+      "description": "命令作用的聚合引用，例如 {\"type\": \"run\", \"id\": \"run_...\"}。",
+      "properties": {
+        "id": {
+          "default": "",
+          "title": "Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "type": {
+          "default": "",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "title": "AggregateRef",
+      "type": "object"
+    },
+    "Artifact": {
+      "additionalProperties": false,
+      "description": "内容寻址的不可变输入或输出，身份为 sha256。",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "kind": {
+          "default": "",
+          "title": "Kind",
+          "type": "string"
+        },
+        "media_type": {
+          "default": "",
+          "title": "Media Type",
+          "type": "string"
+        },
+        "name": {
+          "default": "",
+          "title": "Name",
+          "type": "string"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Run Id"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        },
+        "size": {
+          "default": 0,
+          "title": "Size",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sha256"
+      ],
+      "title": "Artifact",
+      "type": "object"
+    },
+    "ArtifactObject": {
+      "additionalProperties": false,
+      "description": "抓取回来的 Artifact 内容（content 为原始字节）。",
+      "properties": {
+        "content": {
+          "default": "",
+          "format": "binary",
+          "title": "Content",
+          "type": "string"
+        },
+        "media_type": {
+          "default": "",
+          "title": "Media Type",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "sha256": {
+          "default": "",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "title": "ArtifactObject",
+      "type": "object"
+    },
+    "BindingContext": {
+      "additionalProperties": false,
+      "description": "一次能力调用经协议入口解析后的绑定上下文。",
+      "properties": {
+        "agent_session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Agent Session Id"
+        },
+        "audience": {
+          "default": "",
+          "title": "Audience",
+          "type": "string"
+        },
+        "binding_id": {
+          "title": "Binding Id",
+          "type": "string"
+        },
+        "binding_version": {
+          "default": 1,
+          "title": "Binding Version",
+          "type": "integer"
+        },
+        "grant_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Grant Id"
+        },
+        "mode": {
+          "$ref": "#/$defs/ThreadMode",
+          "default": "conversation"
+        },
+        "principal_id": {
+          "default": "",
+          "title": "Principal Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "thread_id": {
+          "default": "",
+          "title": "Thread Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "binding_id"
+      ],
+      "title": "BindingContext",
+      "type": "object"
+    },
+    "BoundRunRequest": {
+      "additionalProperties": false,
+      "description": "``RunGateway.ensure_bound_run`` 的幂等请求。\n\n- 相同 ``binding_key`` 返回同一 Run；\n- 相同 ``binding_key`` 对应不同 ``task_revision`` 时返回冲突；\n- 调用方可以通过 ``run_id`` 预先确定 Run 身份；\n- 重试不会生成第二个 workspace、SessionStore 或 SharedGraph。",
+      "properties": {
+        "binding_key": {
+          "title": "Binding Key",
+          "type": "string"
+        },
+        "executor_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Executor Id"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "title": "Payload",
+          "type": "object"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Run Id"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Task Id"
+        },
+        "task_kind": {
+          "default": "",
+          "title": "Task Kind",
+          "type": "string"
+        },
+        "task_revision": {
+          "default": 1,
+          "title": "Task Revision",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "binding_key"
+      ],
+      "title": "BoundRunRequest",
+      "type": "object"
+    },
+    "CapabilityBinding": {
+      "additionalProperties": false,
+      "description": "Thread 级能力授权。mode 与 tool_set 在一个 version 内不可变。",
+      "properties": {
+        "allowed_commands": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Allowed Commands",
+          "type": "array"
+        },
+        "allowed_queries": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Allowed Queries",
+          "type": "array"
+        },
+        "binding_id": {
+          "title": "Binding Id",
+          "type": "string"
+        },
+        "binding_version": {
+          "default": 1,
+          "title": "Binding Version",
+          "type": "integer"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/ThreadMode",
+          "default": "conversation"
+        },
+        "policy_version": {
+          "default": 1,
+          "title": "Policy Version",
+          "type": "integer"
+        },
+        "principal_id": {
+          "default": "",
+          "title": "Principal Id",
+          "type": "string"
+        },
+        "resource_scopes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Resource Scopes",
+          "type": "array"
+        },
+        "revoked_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Revoked At"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "thread_id": {
+          "default": "",
+          "title": "Thread Id",
+          "type": "string"
+        },
+        "tool_set": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Tool Set",
+          "type": "array"
+        }
+      },
+      "title": "CapabilityBinding",
+      "type": "object"
+    },
+    "CapabilityDescriptor": {
+      "additionalProperties": false,
+      "description": "``AgentCapabilityGateway.describe`` 返回的可见能力描述。",
+      "properties": {
+        "allowed_commands": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Allowed Commands",
+          "type": "array"
+        },
+        "allowed_queries": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Allowed Queries",
+          "type": "array"
+        },
+        "binding_id": {
+          "title": "Binding Id",
+          "type": "string"
+        },
+        "binding_version": {
+          "default": 1,
+          "title": "Binding Version",
+          "type": "integer"
+        },
+        "mode": {
+          "$ref": "#/$defs/ThreadMode",
+          "default": "conversation"
+        },
+        "resource_scopes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Resource Scopes",
+          "type": "array"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/$defs/ToolDescription"
+          },
+          "title": "Tools",
+          "type": "array"
+        }
+      },
+      "required": [
+        "binding_id"
+      ],
+      "title": "CapabilityDescriptor",
+      "type": "object"
+    },
+    "CapabilityGrant": {
+      "additionalProperties": false,
+      "description": "CapabilityBinding 面向具体 AgentSession 的短期授权和注入实例。",
+      "properties": {
+        "agent_session_id": {
+          "default": "",
+          "title": "Agent Session Id",
+          "type": "string"
+        },
+        "audience": {
+          "default": "",
+          "title": "Audience",
+          "type": "string"
+        },
+        "binding_id": {
+          "default": "",
+          "title": "Binding Id",
+          "type": "string"
+        },
+        "credential_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Credential Ref"
+        },
+        "expires_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expires At"
+        },
+        "grant_id": {
+          "title": "Grant Id",
+          "type": "string"
+        },
+        "injection_kind": {
+          "$ref": "#/$defs/InjectionKind",
+          "default": "mcp"
+        },
+        "issued_at": {
+          "format": "date-time",
+          "title": "Issued At",
+          "type": "string"
+        },
+        "last_touched_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Touched At"
+        },
+        "revoked_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Revoked At"
+        },
+        "runtime_instance_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Runtime Instance Id"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "title": "CapabilityGrant",
+      "type": "object"
+    },
+    "CapabilityInjectionPlan": {
+      "additionalProperties": false,
+      "description": "Adapter 为一次 Session 启动生成的能力注入计划。\n\n只包含 Gateway endpoint、工具描述、短期 credential reference、audience\n和 Runtime 所需配置；禁止包含平台 Token、SharedGraph 数据库路径或业务\n状态（构造时校验，见 ``_reject_secret_material``）。",
+      "properties": {
+        "audience": {
+          "default": "",
+          "title": "Audience",
+          "type": "string"
+        },
+        "binding_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Binding Id"
+        },
+        "credential_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Credential Ref"
+        },
+        "gateway_endpoint": {
+          "default": "",
+          "title": "Gateway Endpoint",
+          "type": "string"
+        },
+        "grant_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Grant Id"
+        },
+        "injection_kind": {
+          "$ref": "#/$defs/InjectionKind"
+        },
+        "runtime_config": {
+          "additionalProperties": true,
+          "title": "Runtime Config",
+          "type": "object"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "tool_descriptions": {
+          "items": {
+            "$ref": "#/$defs/ToolDescription"
+          },
+          "title": "Tool Descriptions",
+          "type": "array"
+        }
+      },
+      "required": [
+        "injection_kind"
+      ],
+      "title": "CapabilityInjectionPlan",
+      "type": "object"
+    },
+    "CapabilityInvocation": {
+      "additionalProperties": false,
+      "description": "一次能力调用请求，最终归一化为 MutekiCommandAPI 的 command/query。",
+      "properties": {
+        "arguments": {
+          "additionalProperties": true,
+          "title": "Arguments",
+          "type": "object"
+        },
+        "correlation_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Correlation Id"
+        },
+        "invocation_id": {
+          "title": "Invocation Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "tool_name": {
+          "title": "Tool Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool_name"
+      ],
+      "title": "CapabilityInvocation",
+      "type": "object"
+    },
+    "CapabilityResult": {
+      "additionalProperties": false,
+      "description": "一次能力调用的统一结果。\n\n改变状态的调用返回与 Web 相同的 CommandReceipt；只读调用把完整的\n数据放在 ``result``；失败时 ``error`` 为统一错误 envelope。",
+      "properties": {
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorEnvelope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "invocation_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Invocation Id"
+        },
+        "ok": {
+          "default": true,
+          "title": "Ok",
+          "type": "boolean"
+        },
+        "receipt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommandReceipt"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "result": {
+          "default": null,
+          "title": "Result"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "title": "CapabilityResult",
+      "type": "object"
+    },
+    "ClaimReceipt": {
+      "additionalProperties": false,
+      "properties": {
+        "claimant": {
+          "default": "",
+          "title": "Claimant",
+          "type": "string"
+        },
+        "expires_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expires At"
+        },
+        "fencing_token": {
+          "default": 0,
+          "title": "Fencing Token",
+          "type": "integer"
+        },
+        "granted": {
+          "default": false,
+          "title": "Granted",
+          "type": "boolean"
+        },
+        "graph_id": {
+          "default": "",
+          "title": "Graph Id",
+          "type": "string"
+        },
+        "intent_id": {
+          "default": "",
+          "title": "Intent Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "title": "ClaimReceipt",
+      "type": "object"
+    },
+    "ClaimRequest": {
+      "additionalProperties": false,
+      "description": "原子领取一个开放 Intent（或等价工作项）。",
+      "properties": {
+        "claimant": {
+          "default": "",
+          "title": "Claimant",
+          "type": "string"
+        },
+        "graph_id": {
+          "title": "Graph Id",
+          "type": "string"
+        },
+        "intent_id": {
+          "title": "Intent Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "ttl_seconds": {
+          "default": 0,
+          "title": "Ttl Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "graph_id",
+        "intent_id"
+      ],
+      "title": "ClaimRequest",
+      "type": "object"
+    },
+    "CommandEnvelope": {
+      "additionalProperties": false,
+      "description": "typed command 信封（任务书 6.1 JSON）。\n\n处理顺序固定：读取已有 receipt → 校验 expected_version → 产生领域事件\n→ 同一事务写事件、投影、receipt 和 outbox → 提交 → 执行外部副作用。",
+      "properties": {
+        "actor": {
+          "$ref": "#/$defs/ActorRef"
+        },
+        "aggregate_id": {
+          "default": "",
+          "title": "Aggregate Id",
+          "type": "string"
+        },
+        "aggregate_type": {
+          "default": "",
+          "title": "Aggregate Type",
+          "type": "string"
+        },
+        "command_id": {
+          "title": "Command Id",
+          "type": "string"
+        },
+        "command_type": {
+          "default": "",
+          "title": "Command Type",
+          "type": "string"
+        },
+        "expected_version": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expected Version"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "title": "Payload",
+          "type": "object"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "title": "CommandEnvelope",
+      "type": "object"
+    },
+    "CommandReceipt": {
+      "additionalProperties": false,
+      "description": "命令接收回执（任务书 6.2 JSON）。\n\n``accepted`` 只表示命令已持久化；``next`` 列出调用方可以继续使用的\n跟踪方式（receipt / snapshot / events / wait）。",
+      "properties": {
+        "aggregate": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AggregateRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "command_id": {
+          "title": "Command Id",
+          "type": "string"
+        },
+        "deduplicated": {
+          "default": false,
+          "title": "Deduplicated",
+          "type": "boolean"
+        },
+        "effect_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Effect Ids",
+          "type": "array"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorEnvelope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "event_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Event Cursor"
+        },
+        "next": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Next",
+          "type": "array"
+        },
+        "output": {
+          "additionalProperties": true,
+          "title": "Output",
+          "type": "object"
+        },
+        "receipt_id": {
+          "title": "Receipt Id",
+          "type": "string"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Run Id"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/$defs/ReceiptState",
+          "default": "accepted"
+        },
+        "submitted_at": {
+          "format": "date-time",
+          "title": "Submitted At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "command_id"
+      ],
+      "title": "CommandReceipt",
+      "type": "object"
+    },
+    "DomainModuleDescriptor": {
+      "additionalProperties": false,
+      "description": "领域模块声明（任务书 6.8 字段清单）。",
+      "properties": {
+        "api_routes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Api Routes",
+          "type": "array"
+        },
+        "artifact_types": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Artifact Types",
+          "type": "array"
+        },
+        "command_handlers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Command Handlers",
+          "type": "object"
+        },
+        "default_executor": {
+          "default": "",
+          "title": "Default Executor",
+          "type": "string"
+        },
+        "event_namespaces": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Event Namespaces",
+          "type": "array"
+        },
+        "gate_binding": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Gate Binding"
+        },
+        "graph_binding": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Graph Binding"
+        },
+        "id": {
+          "default": "",
+          "title": "Id",
+          "type": "string"
+        },
+        "required_capabilities": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Capabilities",
+          "type": "array"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "task_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Task Kinds",
+          "type": "array"
+        },
+        "ui_contributions": {
+          "additionalProperties": true,
+          "title": "Ui Contributions",
+          "type": "object"
+        },
+        "version": {
+          "default": "",
+          "title": "Version",
+          "type": "string"
+        },
+        "workspace_kind": {
+          "default": "",
+          "title": "Workspace Kind",
+          "type": "string"
+        }
+      },
+      "title": "DomainModuleDescriptor",
+      "type": "object"
+    },
+    "EffectReceipt": {
+      "additionalProperties": false,
+      "description": "命令产生的一项可重试外部效果的持久回执。",
+      "properties": {
+        "acceptance_receipt_id": {
+          "default": "",
+          "title": "Acceptance Receipt Id",
+          "type": "string"
+        },
+        "aggregate": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AggregateRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "attempts": {
+          "default": 0,
+          "title": "Attempts",
+          "type": "integer"
+        },
+        "command_id": {
+          "title": "Command Id",
+          "type": "string"
+        },
+        "completed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Completed At"
+        },
+        "correlation_id": {
+          "default": "",
+          "title": "Correlation Id",
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "destination": {
+          "default": "",
+          "title": "Destination",
+          "type": "string"
+        },
+        "domain": {
+          "default": "",
+          "title": "Domain",
+          "type": "string"
+        },
+        "effect_id": {
+          "title": "Effect Id",
+          "type": "string"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorEnvelope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "idempotency_key": {
+          "default": "",
+          "title": "Idempotency Key",
+          "type": "string"
+        },
+        "max_attempts": {
+          "default": 8,
+          "title": "Max Attempts",
+          "type": "integer"
+        },
+        "object_links": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Object Links",
+          "type": "object"
+        },
+        "outbox_id": {
+          "default": "",
+          "title": "Outbox Id",
+          "type": "string"
+        },
+        "output": {
+          "additionalProperties": true,
+          "title": "Output",
+          "type": "object"
+        },
+        "retry_after": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Retry After"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/$defs/EffectState",
+          "default": "accepted"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "title": "Updated At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "command_id"
+      ],
+      "title": "EffectReceipt",
+      "type": "object"
+    },
+    "EffectState": {
+      "description": "外部效果执行状态；与命令接受状态分开持久化。",
+      "enum": [
+        "accepted",
+        "running",
+        "waiting",
+        "completed",
+        "failed",
+        "cancelled",
+        "dead_letter"
+      ],
+      "title": "EffectState",
+      "type": "string"
+    },
+    "ErrorCategory": {
+      "description": "错误分类，调用方据此决定重试、升级或放弃。",
+      "enum": [
+        "validation",
+        "permission",
+        "not_found",
+        "conflict",
+        "state",
+        "rate_limit",
+        "timeout",
+        "runtime",
+        "platform",
+        "internal"
+      ],
+      "title": "ErrorCategory",
+      "type": "string"
+    },
+    "ErrorEnvelope": {
+      "additionalProperties": false,
+      "description": "统一错误 envelope。",
+      "properties": {
+        "category": {
+          "$ref": "#/$defs/ErrorCategory",
+          "default": "internal"
+        },
+        "code": {
+          "title": "Code",
+          "type": "string"
+        },
+        "correlation_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Correlation Id"
+        },
+        "detail": {
+          "additionalProperties": true,
+          "title": "Detail",
+          "type": "object"
+        },
+        "message": {
+          "title": "Message",
+          "type": "string"
+        },
+        "recovery_hint": {
+          "default": "",
+          "title": "Recovery Hint",
+          "type": "string"
+        },
+        "retryable": {
+          "default": false,
+          "title": "Retryable",
+          "type": "boolean"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "title": "ErrorEnvelope",
+      "type": "object"
+    },
+    "EventEnvelope": {
+      "additionalProperties": false,
+      "description": "新增领域事件的统一 envelope（任务书 6.1 JSON）。",
+      "properties": {
+        "actor_id": {
+          "default": "system",
+          "title": "Actor Id",
+          "type": "string"
+        },
+        "aggregate_id": {
+          "default": "",
+          "title": "Aggregate Id",
+          "type": "string"
+        },
+        "aggregate_type": {
+          "default": "",
+          "title": "Aggregate Type",
+          "type": "string"
+        },
+        "causation_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Causation Id"
+        },
+        "command_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Command Id"
+        },
+        "correlation_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Correlation Id"
+        },
+        "event_id": {
+          "title": "Event Id",
+          "type": "string"
+        },
+        "event_type": {
+          "default": "",
+          "title": "Event Type",
+          "type": "string"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "title": "Payload",
+          "type": "object"
+        },
+        "producer": {
+          "default": "",
+          "title": "Producer",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "stream_seq": {
+          "default": 0,
+          "title": "Stream Seq",
+          "type": "integer"
+        }
+      },
+      "title": "EventEnvelope",
+      "type": "object"
+    },
+    "EventPage": {
+      "additionalProperties": false,
+      "description": "一页事件。next_cursor 仅在还有后续事件时返回。",
+      "properties": {
+        "events": {
+          "items": {
+            "$ref": "#/$defs/EventEnvelope"
+          },
+          "title": "Events",
+          "type": "array"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Next Cursor"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "title": "EventPage",
+      "type": "object"
+    },
+    "EventReadRequest": {
+      "additionalProperties": false,
+      "description": "按 aggregate 流读取事件。cursor 是绑定流与授权范围的不透明值。",
+      "properties": {
+        "after_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "After Cursor"
+        },
+        "aggregate_id": {
+          "title": "Aggregate Id",
+          "type": "string"
+        },
+        "aggregate_type": {
+          "title": "Aggregate Type",
+          "type": "string"
+        },
+        "limit": {
+          "default": 100,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "aggregate_type",
+        "aggregate_id"
+      ],
+      "title": "EventReadRequest",
+      "type": "object"
+    },
+    "ExecutionBinding": {
+      "additionalProperties": false,
+      "description": "Run 使用的执行器、Adapter instance、Profile、Policy 和领域能力。",
+      "properties": {
+        "adapter_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Adapter Id"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "domain_capabilities": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Domain Capabilities",
+          "type": "array"
+        },
+        "execution_binding_id": {
+          "title": "Execution Binding Id",
+          "type": "string"
+        },
+        "executor_id": {
+          "default": "",
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "policy_version": {
+          "default": 1,
+          "title": "Policy Version",
+          "type": "integer"
+        },
+        "profile_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Profile Id"
+        },
+        "revoked_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Revoked At"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Run Id"
+        },
+        "runtime_instance_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Runtime Instance Id"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Task Id"
+        }
+      },
+      "title": "ExecutionBinding",
+      "type": "object"
+    },
+    "ExecutionGeneration": {
+      "additionalProperties": false,
+      "description": "Run 内一次实际执行尝试，身份为 (run_id, generation)。",
+      "properties": {
+        "agent_session_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Agent Session Ids",
+          "type": "array"
+        },
+        "ended_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ended At"
+        },
+        "executor_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Executor Id"
+        },
+        "generation": {
+          "title": "Generation",
+          "type": "integer"
+        },
+        "run_id": {
+          "title": "Run Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "started_at": {
+          "format": "date-time",
+          "title": "Started At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "generation"
+      ],
+      "title": "ExecutionGeneration",
+      "type": "object"
+    },
+    "ExtensionEntrypoint": {
+      "additionalProperties": false,
+      "description": "扩展宿主入口，例如 subprocess + serve 命令。",
+      "properties": {
+        "command": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Command",
+          "type": "array"
+        },
+        "host": {
+          "default": "subprocess",
+          "title": "Host",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "title": "ExtensionEntrypoint",
+      "type": "object"
+    },
+    "ExtensionManifest": {
+      "additionalProperties": false,
+      "description": "从 Agent Plugins 根清单解析出的 Muteki 客户端扩展视图。",
+      "properties": {
+        "author": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Author",
+          "type": "object"
+        },
+        "client_namespace": {
+          "default": "",
+          "title": "Client Namespace",
+          "type": "string"
+        },
+        "config_schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Config Schema"
+        },
+        "description": {
+          "default": "",
+          "title": "Description",
+          "type": "string"
+        },
+        "entrypoints": {
+          "$ref": "#/$defs/ExtensionEntrypoint"
+        },
+        "homepage": {
+          "default": "",
+          "title": "Homepage",
+          "type": "string"
+        },
+        "id": {
+          "default": "",
+          "title": "Id",
+          "type": "string"
+        },
+        "keywords": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Keywords",
+          "type": "array"
+        },
+        "license": {
+          "default": "",
+          "title": "License",
+          "type": "string"
+        },
+        "manifest_version": {
+          "default": 1,
+          "title": "Manifest Version",
+          "type": "integer"
+        },
+        "origin": {
+          "default": "installed",
+          "title": "Origin",
+          "type": "string"
+        },
+        "permissions": {
+          "$ref": "#/$defs/ExtensionPermissions"
+        },
+        "plugin_schema": {
+          "default": "",
+          "title": "Plugin Schema",
+          "type": "string"
+        },
+        "plugin_version": {
+          "default": "",
+          "title": "Plugin Version",
+          "type": "string"
+        },
+        "provides": {
+          "items": {
+            "$ref": "#/$defs/ExtensionProvide"
+          },
+          "title": "Provides",
+          "type": "array"
+        },
+        "repository": {
+          "default": "",
+          "title": "Repository",
+          "type": "string"
+        },
+        "requires": {
+          "items": {
+            "$ref": "#/$defs/ExtensionRequire"
+          },
+          "title": "Requires",
+          "type": "array"
+        },
+        "requires_core": {
+          "default": "",
+          "title": "Requires Core",
+          "type": "string"
+        },
+        "retain_previous_versions": {
+          "default": true,
+          "title": "Retain Previous Versions",
+          "type": "boolean"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "state_schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "State Schema"
+        },
+        "ui": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ui"
+        },
+        "version": {
+          "default": "",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "title": "ExtensionManifest",
+      "type": "object"
+    },
+    "ExtensionPermissions": {
+      "additionalProperties": false,
+      "description": "扩展声明式权限：文件系统、网络、secret 引用与可写事件命名空间。",
+      "properties": {
+        "events_write": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Events Write",
+          "type": "array"
+        },
+        "filesystem": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Filesystem",
+          "type": "array"
+        },
+        "network": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Network",
+          "type": "array"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "secrets": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Secrets",
+          "type": "array"
+        }
+      },
+      "title": "ExtensionPermissions",
+      "type": "object"
+    },
+    "ExtensionProvide": {
+      "additionalProperties": false,
+      "description": "扩展提供的能力，例如 external-agent-adapter / platform-adapter。",
+      "properties": {
+        "api_version": {
+          "default": 1,
+          "title": "Api Version",
+          "type": "integer"
+        },
+        "id": {
+          "default": "",
+          "title": "Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "type": {
+          "default": "",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "title": "ExtensionProvide",
+      "type": "object"
+    },
+    "ExtensionRequire": {
+      "additionalProperties": false,
+      "description": "扩展依赖的平台能力。",
+      "properties": {
+        "capability": {
+          "default": "",
+          "title": "Capability",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "version": {
+          "default": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "title": "ExtensionRequire",
+      "type": "object"
+    },
+    "GraphEvent": {
+      "additionalProperties": false,
+      "description": "写入图服务的一条事件。",
+      "properties": {
+        "actor_id": {
+          "default": "system",
+          "title": "Actor Id",
+          "type": "string"
+        },
+        "event_type": {
+          "default": "",
+          "title": "Event Type",
+          "type": "string"
+        },
+        "graph_id": {
+          "default": "",
+          "title": "Graph Id",
+          "type": "string"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "title": "Payload",
+          "type": "object"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "title": "GraphEvent",
+      "type": "object"
+    },
+    "GraphReceipt": {
+      "additionalProperties": false,
+      "description": "append 的接收回执。",
+      "properties": {
+        "deduplicated": {
+          "default": false,
+          "title": "Deduplicated",
+          "type": "boolean"
+        },
+        "event_id": {
+          "title": "Event Id",
+          "type": "string"
+        },
+        "graph_id": {
+          "default": "",
+          "title": "Graph Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "stream_seq": {
+          "default": 0,
+          "title": "Stream Seq",
+          "type": "integer"
+        }
+      },
+      "title": "GraphReceipt",
+      "type": "object"
+    },
+    "GraphScope": {
+      "additionalProperties": false,
+      "description": "snapshot 的读取范围，例如某条 branch、某类 fact。",
+      "properties": {
+        "graph_id": {
+          "title": "Graph Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "scope": {
+          "additionalProperties": true,
+          "title": "Scope",
+          "type": "object"
+        }
+      },
+      "required": [
+        "graph_id"
+      ],
+      "title": "GraphScope",
+      "type": "object"
+    },
+    "GraphSnapshot": {
+      "additionalProperties": false,
+      "description": "图状态快照（已投影的读取模型）。",
+      "properties": {
+        "graph_id": {
+          "title": "Graph Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "state": {
+          "additionalProperties": true,
+          "title": "State",
+          "type": "object"
+        },
+        "watermark": {
+          "default": 0,
+          "title": "Watermark",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "graph_id"
+      ],
+      "title": "GraphSnapshot",
+      "type": "object"
+    },
+    "InjectionKind": {
+      "description": "``prepare_capability_injection`` 可选的能力注入方式（MCP 优先）。",
+      "enum": [
+        "mcp",
+        "native_tool",
+        "acp_mcp_config",
+        "agent_plugin",
+        "runtime_plugin",
+        "http_jsonrpc",
+        "cli_skill"
+      ],
+      "title": "InjectionKind",
+      "type": "string"
+    },
+    "InstanceLeaseRef": {
+      "additionalProperties": false,
+      "description": "动态实例租约引用。",
+      "properties": {
+        "challenge_key": {
+          "default": "",
+          "title": "Challenge Key",
+          "type": "string"
+        },
+        "connection_id": {
+          "default": "",
+          "title": "Connection Id",
+          "type": "string"
+        },
+        "expires_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expires At"
+        },
+        "fencing_token": {
+          "default": 0,
+          "title": "Fencing Token",
+          "type": "integer"
+        },
+        "lease_id": {
+          "title": "Lease Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "title": "InstanceLeaseRef",
+      "type": "object"
+    },
+    "InstanceResult": {
+      "additionalProperties": false,
+      "properties": {
+        "acquired_at": {
+          "format": "date-time",
+          "title": "Acquired At",
+          "type": "string"
+        },
+        "endpoints": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Endpoints",
+          "type": "object"
+        },
+        "lease": {
+          "$ref": "#/$defs/InstanceLeaseRef"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "title": "InstanceResult",
+      "type": "object"
+    },
+    "LeaseReceipt": {
+      "additionalProperties": false,
+      "properties": {
+        "expires_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expires At"
+        },
+        "fencing_token": {
+          "default": 0,
+          "title": "Fencing Token",
+          "type": "integer"
+        },
+        "granted": {
+          "default": false,
+          "title": "Granted",
+          "type": "boolean"
+        },
+        "graph_id": {
+          "default": "",
+          "title": "Graph Id",
+          "type": "string"
+        },
+        "owner": {
+          "default": "",
+          "title": "Owner",
+          "type": "string"
+        },
+        "resource_key": {
+          "default": "",
+          "title": "Resource Key",
+          "type": "string"
+        },
+        "resource_kind": {
+          "default": "",
+          "title": "Resource Kind",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "title": "LeaseReceipt",
+      "type": "object"
+    },
+    "LeaseRequest": {
+      "additionalProperties": false,
+      "description": "申请一个图内独占资源（端口、监听器、目标会话等）的租约。",
+      "properties": {
+        "graph_id": {
+          "title": "Graph Id",
+          "type": "string"
+        },
+        "owner": {
+          "default": "",
+          "title": "Owner",
+          "type": "string"
+        },
+        "resource_key": {
+          "title": "Resource Key",
+          "type": "string"
+        },
+        "resource_kind": {
+          "title": "Resource Kind",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "ttl_seconds": {
+          "default": 0,
+          "title": "Ttl Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "graph_id",
+        "resource_kind",
+        "resource_key"
+      ],
+      "title": "LeaseRequest",
+      "type": "object"
+    },
+    "OutboxRecord": {
+      "additionalProperties": false,
+      "description": "持久 outbox 记录。\n\n跨 platform.db / competition.db / Run 存储 / SharedGraph 边界的外部\n副作用，通过 outbox 在事务提交后投递；重启后未完成的记录必须恢复。",
+      "properties": {
+        "aggregate_id": {
+          "default": "",
+          "title": "Aggregate Id",
+          "type": "string"
+        },
+        "aggregate_type": {
+          "default": "",
+          "title": "Aggregate Type",
+          "type": "string"
+        },
+        "attempts": {
+          "default": 0,
+          "title": "Attempts",
+          "type": "integer"
+        },
+        "command_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Command Id"
+        },
+        "correlation_id": {
+          "default": "",
+          "title": "Correlation Id",
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "delivered_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Delivered At"
+        },
+        "destination": {
+          "default": "",
+          "title": "Destination",
+          "type": "string"
+        },
+        "effect_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Effect Id"
+        },
+        "event_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Event Id"
+        },
+        "event_type": {
+          "default": "",
+          "title": "Event Type",
+          "type": "string"
+        },
+        "idempotency_key": {
+          "default": "",
+          "title": "Idempotency Key",
+          "type": "string"
+        },
+        "last_error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Error"
+        },
+        "outbox_id": {
+          "title": "Outbox Id",
+          "type": "string"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "title": "Payload",
+          "type": "object"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/$defs/OutboxStatus",
+          "default": "pending"
+        }
+      },
+      "title": "OutboxRecord",
+      "type": "object"
+    },
+    "OutboxStatus": {
+      "enum": [
+        "pending",
+        "processing",
+        "delivered",
+        "failed",
+        "paused",
+        "dead_letter",
+        "cancelled"
+      ],
+      "title": "OutboxStatus",
+      "type": "string"
+    },
+    "PlatformCapabilities": {
+      "additionalProperties": false,
+      "description": "平台能力探测结果。",
+      "properties": {
+        "artifacts": {
+          "default": false,
+          "title": "Artifacts",
+          "type": "boolean"
+        },
+        "detail": {
+          "additionalProperties": true,
+          "title": "Detail",
+          "type": "object"
+        },
+        "dynamic_instances": {
+          "default": false,
+          "title": "Dynamic Instances",
+          "type": "boolean"
+        },
+        "platform_kind": {
+          "default": "",
+          "title": "Platform Kind",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "scoreboard": {
+          "default": false,
+          "title": "Scoreboard",
+          "type": "boolean"
+        },
+        "submit": {
+          "default": false,
+          "title": "Submit",
+          "type": "boolean"
+        },
+        "sync": {
+          "default": false,
+          "title": "Sync",
+          "type": "boolean"
+        }
+      },
+      "title": "PlatformCapabilities",
+      "type": "object"
+    },
+    "PlatformChallengeRef": {
+      "additionalProperties": false,
+      "properties": {
+        "challenge_key": {
+          "default": "",
+          "title": "Challenge Key",
+          "type": "string"
+        },
+        "connection_id": {
+          "default": "",
+          "title": "Connection Id",
+          "type": "string"
+        },
+        "revision": {
+          "default": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "title": "PlatformChallengeRef",
+      "type": "object"
+    },
+    "PlatformConnectionRef": {
+      "additionalProperties": false,
+      "description": "一个比赛平台连接的引用；真实凭据在 SecretStore，不进入本模型。",
+      "properties": {
+        "competition_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Competition Id"
+        },
+        "connection_id": {
+          "title": "Connection Id",
+          "type": "string"
+        },
+        "endpoint": {
+          "default": "",
+          "title": "Endpoint",
+          "type": "string"
+        },
+        "platform_kind": {
+          "default": "",
+          "title": "Platform Kind",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "title": "PlatformConnectionRef",
+      "type": "object"
+    },
+    "ProbeRequest": {
+      "additionalProperties": false,
+      "description": "``ExternalAgentAdapter.probe`` 的探测请求。",
+      "properties": {
+        "include_models": {
+          "default": true,
+          "title": "Include Models",
+          "type": "boolean"
+        },
+        "options": {
+          "additionalProperties": true,
+          "title": "Options",
+          "type": "object"
+        },
+        "runtime_instance_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Runtime Instance Id"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "title": "ProbeRequest",
+      "type": "object"
+    },
+    "Project": {
+      "additionalProperties": false,
+      "description": "相关 Thread、Task、Workspace、设置和知识的长期作用域。",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "description": {
+          "default": "",
+          "title": "Description",
+          "type": "string"
+        },
+        "name": {
+          "default": "",
+          "title": "Name",
+          "type": "string"
+        },
+        "project_id": {
+          "title": "Project Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "settings": {
+          "additionalProperties": true,
+          "title": "Settings",
+          "type": "object"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "title": "Updated At",
+          "type": "string"
+        }
+      },
+      "title": "Project",
+      "type": "object"
+    },
+    "PublicEvent": {
+      "additionalProperties": false,
+      "description": "面向 SSE/WebSocket/AG-UI 的完整公开事件。",
+      "properties": {
+        "actor_id": {
+          "default": "system",
+          "title": "Actor Id",
+          "type": "string"
+        },
+        "aggregate_id": {
+          "default": "",
+          "title": "Aggregate Id",
+          "type": "string"
+        },
+        "aggregate_type": {
+          "default": "",
+          "title": "Aggregate Type",
+          "type": "string"
+        },
+        "causation_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Causation Id"
+        },
+        "command_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Command Id"
+        },
+        "correlation_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Correlation Id"
+        },
+        "event_id": {
+          "default": "",
+          "title": "Event Id",
+          "type": "string"
+        },
+        "event_type": {
+          "default": "",
+          "title": "Event Type",
+          "type": "string"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "title": "Payload",
+          "type": "object"
+        },
+        "producer": {
+          "default": "",
+          "title": "Producer",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "stream_seq": {
+          "default": 0,
+          "title": "Stream Seq",
+          "type": "integer"
+        }
+      },
+      "title": "PublicEvent",
+      "type": "object"
+    },
+    "QueryEnvelope": {
+      "additionalProperties": false,
+      "description": "只读查询信封。查询不产生事件，但走同一授权边界。",
+      "properties": {
+        "actor": {
+          "$ref": "#/$defs/ActorRef"
+        },
+        "aggregate_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Aggregate Id"
+        },
+        "aggregate_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Aggregate Type"
+        },
+        "params": {
+          "additionalProperties": true,
+          "title": "Params",
+          "type": "object"
+        },
+        "query_id": {
+          "title": "Query Id",
+          "type": "string"
+        },
+        "query_type": {
+          "default": "",
+          "title": "Query Type",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "title": "QueryEnvelope",
+      "type": "object"
+    },
+    "QueryResult": {
+      "additionalProperties": false,
+      "description": "查询结果。result 为完整投影数据。",
+      "properties": {
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cursor"
+        },
+        "query_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Query Id"
+        },
+        "query_type": {
+          "default": "",
+          "title": "Query Type",
+          "type": "string"
+        },
+        "result": {
+          "default": null,
+          "title": "Result"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "title": "QueryResult",
+      "type": "object"
+    },
+    "ReceiptState": {
+      "description": "命令回执状态。",
+      "enum": [
+        "accepted",
+        "running",
+        "waiting",
+        "completed",
+        "failed",
+        "conflict",
+        "cancelled"
+      ],
+      "title": "ReceiptState",
+      "type": "string"
+    },
+    "RemoteArtifactRef": {
+      "additionalProperties": false,
+      "description": "远端题目附件引用。",
+      "properties": {
+        "connection_id": {
+          "default": "",
+          "title": "Connection Id",
+          "type": "string"
+        },
+        "remote_id": {
+          "default": "",
+          "title": "Remote Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sha256"
+        },
+        "url": {
+          "default": "",
+          "title": "Url",
+          "type": "string"
+        }
+      },
+      "title": "RemoteArtifactRef",
+      "type": "object"
+    },
+    "ResourceLease": {
+      "additionalProperties": false,
+      "description": "带 owner、scope、TTL 和 fencing token 的资源占用。\n\n身份为 (resource_kind, resource_key)。fencing token 单调递增，\n持有方写共享资源时必须携带，防止过期 lease 的写穿透。",
+      "properties": {
+        "acquired_at": {
+          "format": "date-time",
+          "title": "Acquired At",
+          "type": "string"
+        },
+        "expires_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expires At"
+        },
+        "fencing_token": {
+          "default": 0,
+          "title": "Fencing Token",
+          "type": "integer"
+        },
+        "owner": {
+          "default": "",
+          "title": "Owner",
+          "type": "string"
+        },
+        "released_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Released At"
+        },
+        "resource_key": {
+          "title": "Resource Key",
+          "type": "string"
+        },
+        "resource_kind": {
+          "title": "Resource Kind",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "scope": {
+          "default": "",
+          "title": "Scope",
+          "type": "string"
+        },
+        "ttl_seconds": {
+          "default": 0,
+          "title": "Ttl Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "resource_kind",
+        "resource_key"
+      ],
+      "title": "ResourceLease",
+      "type": "object"
+    },
+    "RunCommand": {
+      "additionalProperties": false,
+      "description": "下发给单个 Run 的控制命令（start/pause/resume/resolve/stop 等）。\n\nRun 控制 journal 与接收/效果回执继续复用 ``muteki.control``，\n这里只是经 RunGateway 进入时的统一信封。",
+      "properties": {
+        "actor_id": {
+          "default": "",
+          "title": "Actor Id",
+          "type": "string"
+        },
+        "command_id": {
+          "title": "Command Id",
+          "type": "string"
+        },
+        "command_type": {
+          "title": "Command Type",
+          "type": "string"
+        },
+        "expected_generation": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expected Generation"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "title": "Payload",
+          "type": "object"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "command_type"
+      ],
+      "title": "RunCommand",
+      "type": "object"
+    },
+    "RunEvent": {
+      "additionalProperties": false,
+      "description": "经 RunGateway 暴露的公开 Run 事件（由现有 Run Event 适配而来）。\n\n不替代 ``muteki.core.events.Event`` 的持久格式，只是领域模块读取\nRun 进度时使用的完整视图。",
+      "properties": {
+        "event_type": {
+          "default": "",
+          "title": "Event Type",
+          "type": "string"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "title": "Payload",
+          "type": "object"
+        },
+        "run_id": {
+          "title": "Run Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "seq": {
+          "default": 0,
+          "title": "Seq",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "title": "RunEvent",
+      "type": "object"
+    },
+    "RunExecutionContext": {
+      "additionalProperties": false,
+      "description": "交给 ``RunExecutor.execute`` 的执行上下文。",
+      "properties": {
+        "execution_binding_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Execution Binding Id"
+        },
+        "generation": {
+          "default": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "title": "Payload",
+          "type": "object"
+        },
+        "run_id": {
+          "title": "Run Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Task Id"
+        },
+        "task_kind": {
+          "default": "",
+          "title": "Task Kind",
+          "type": "string"
+        },
+        "workspace_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Workspace Id"
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "title": "RunExecutionContext",
+      "type": "object"
+    },
+    "RunRef": {
+      "additionalProperties": false,
+      "description": "Run 的稳定引用。Run 是 Task 的稳定工作单元，身份不随重试变化。",
+      "properties": {
+        "binding_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Binding Key"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "executor_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Executor Id"
+        },
+        "run_id": {
+          "title": "Run Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Task Id"
+        },
+        "thread_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Thread Id"
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "title": "RunRef",
+      "type": "object"
+    },
+    "RunResult": {
+      "additionalProperties": false,
+      "description": "``RunExecutor.execute`` 的终态结果。",
+      "properties": {
+        "detail": {
+          "additionalProperties": true,
+          "title": "Detail",
+          "type": "object"
+        },
+        "run_id": {
+          "title": "Run Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "state": {
+          "default": "",
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "title": "RunResult",
+      "type": "object"
+    },
+    "RunSnapshot": {
+      "additionalProperties": false,
+      "description": "Run 当前状态快照，用于查询与恢复展示。",
+      "properties": {
+        "created_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Created At"
+        },
+        "detail": {
+          "additionalProperties": true,
+          "title": "Detail",
+          "type": "object"
+        },
+        "executor_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Executor Id"
+        },
+        "generation": {
+          "default": 0,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "run_id": {
+          "title": "Run Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "state": {
+          "default": "",
+          "title": "State",
+          "type": "string"
+        },
+        "task_kind": {
+          "default": "",
+          "title": "Task Kind",
+          "type": "string"
+        },
+        "updated_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Updated At"
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "title": "RunSnapshot",
+      "type": "object"
+    },
+    "SessionStart": {
+      "additionalProperties": false,
+      "description": "启动（或恢复）一个外部 Agent Session 的请求。",
+      "properties": {
+        "access_mode": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Access Mode"
+        },
+        "agent_session_id": {
+          "title": "Agent Session Id",
+          "type": "string"
+        },
+        "effort": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Effort"
+        },
+        "execution_generation": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Execution Generation"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        },
+        "options": {
+          "additionalProperties": true,
+          "title": "Options",
+          "type": "object"
+        },
+        "permission_mode": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Permission Mode"
+        },
+        "resume_handle": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resume Handle"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Run Id"
+        },
+        "sandbox_mode": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sandbox Mode"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "thread_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Thread Id"
+        },
+        "workspace_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Workspace Id"
+        }
+      },
+      "title": "SessionStart",
+      "type": "object"
+    },
+    "SubmissionRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Artifact Sha256"
+        },
+        "challenge_key": {
+          "default": "",
+          "title": "Challenge Key",
+          "type": "string"
+        },
+        "connection_id": {
+          "default": "",
+          "title": "Connection Id",
+          "type": "string"
+        },
+        "flag": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Flag"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "title": "Payload",
+          "type": "object"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "title": "SubmissionRequest",
+      "type": "object"
+    },
+    "SubmissionResult": {
+      "additionalProperties": false,
+      "properties": {
+        "detail": {
+          "additionalProperties": true,
+          "title": "Detail",
+          "type": "object"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "status": {
+          "default": "pending",
+          "title": "Status",
+          "type": "string"
+        },
+        "submission_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Submission Id"
+        }
+      },
+      "title": "SubmissionResult",
+      "type": "object"
+    },
+    "SyncRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "competition_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Competition Id"
+        },
+        "connection_id": {
+          "default": "",
+          "title": "Connection Id",
+          "type": "string"
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cursor"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "title": "SyncRequest",
+      "type": "object"
+    },
+    "SyncResult": {
+      "additionalProperties": false,
+      "properties": {
+        "connection_id": {
+          "default": "",
+          "title": "Connection Id",
+          "type": "string"
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cursor"
+        },
+        "detail": {
+          "additionalProperties": true,
+          "title": "Detail",
+          "type": "object"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "synced_challenges": {
+          "default": 0,
+          "title": "Synced Challenges",
+          "type": "integer"
+        }
+      },
+      "title": "SyncResult",
+      "type": "object"
+    },
+    "Task": {
+      "additionalProperties": false,
+      "description": "需要完成的目标和领域输入。revision 随输入变化递增。",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "input": {
+          "additionalProperties": true,
+          "title": "Input",
+          "type": "object"
+        },
+        "kind": {
+          "default": "",
+          "title": "Kind",
+          "type": "string"
+        },
+        "project_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Project Id"
+        },
+        "revision": {
+          "default": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "task_id": {
+          "title": "Task Id",
+          "type": "string"
+        },
+        "thread_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Thread Id"
+        },
+        "title": {
+          "default": "",
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "title": "Task",
+      "type": "object"
+    },
+    "Thread": {
+      "additionalProperties": false,
+      "description": "用户与 Muteki 的长期交互流。",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "metadata_revision": {
+          "default": 0,
+          "title": "Metadata Revision",
+          "type": "integer"
+        },
+        "metadata_turn_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Metadata Turn Id"
+        },
+        "mode": {
+          "default": "conversation",
+          "title": "Mode",
+          "type": "string"
+        },
+        "project_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Project Id"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "summary": {
+          "default": "",
+          "title": "Summary",
+          "type": "string"
+        },
+        "thread_id": {
+          "title": "Thread Id",
+          "type": "string"
+        },
+        "title": {
+          "default": "",
+          "title": "Title",
+          "type": "string"
+        },
+        "title_source": {
+          "default": "user",
+          "title": "Title Source",
+          "type": "string"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "title": "Updated At",
+          "type": "string"
+        },
+        "workspace_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Workspace Id"
+        }
+      },
+      "title": "Thread",
+      "type": "object"
+    },
+    "ThreadMode": {
+      "description": "Thread 对话模式，决定 CapabilityBinding 的默认能力集合。",
+      "enum": [
+        "conversation",
+        "single_task",
+        "competition",
+        "management"
+      ],
+      "title": "ThreadMode",
+      "type": "string"
+    },
+    "ToolDescription": {
+      "additionalProperties": false,
+      "description": "注入给 Runtime 的工具描述（名称、说明与 JSON Schema 入参）。",
+      "properties": {
+        "description": {
+          "default": "",
+          "title": "Description",
+          "type": "string"
+        },
+        "input_schema": {
+          "additionalProperties": true,
+          "title": "Input Schema",
+          "type": "object"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "ToolDescription",
+      "type": "object"
+    },
+    "WaitRequest": {
+      "additionalProperties": false,
+      "description": "有界等待：到达服务端上限时返回 timeout 和最新 cursor。",
+      "properties": {
+        "after_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "After Cursor"
+        },
+        "aggregate_id": {
+          "title": "Aggregate Id",
+          "type": "string"
+        },
+        "aggregate_type": {
+          "title": "Aggregate Type",
+          "type": "string"
+        },
+        "limit": {
+          "default": 100,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "timeout_seconds": {
+          "default": 30.0,
+          "title": "Timeout Seconds",
+          "type": "number"
+        }
+      },
+      "required": [
+        "aggregate_type",
+        "aggregate_id"
+      ],
+      "title": "WaitRequest",
+      "type": "object"
+    },
+    "WaitResult": {
+      "additionalProperties": false,
+      "description": "有界 wait 的结果：新事件或 timeout（附带最新 cursor）。",
+      "properties": {
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cursor"
+        },
+        "events": {
+          "items": {
+            "$ref": "#/$defs/EventEnvelope"
+          },
+          "title": "Events",
+          "type": "array"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "state": {
+          "default": "timeout",
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "title": "WaitResult",
+      "type": "object"
+    },
+    "Workspace": {
+      "additionalProperties": false,
+      "description": "文件、命令、容器和 Artifact 的执行边界。",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "kind": {
+          "default": "local",
+          "title": "Kind",
+          "type": "string"
+        },
+        "project_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Project Id"
+        },
+        "root_path": {
+          "default": "",
+          "title": "Root Path",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "settings": {
+          "additionalProperties": true,
+          "title": "Settings",
+          "type": "object"
+        },
+        "workspace_id": {
+          "title": "Workspace Id",
+          "type": "string"
+        }
+      },
+      "title": "Workspace",
+      "type": "object"
+    }
+  }
+}

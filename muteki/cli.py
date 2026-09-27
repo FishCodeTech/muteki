@@ -45,7 +45,7 @@ def _launch(mode: str, arguments: list[str]) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="muteki", description="Project Muteki 本地运行与升级工具")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for mode in ("web", "tui"):
+    for mode in ("web",):
         command = subparsers.add_parser(mode, help=f"启动 {mode.upper()}")
         command.add_argument("arguments", nargs=argparse.REMAINDER)
 
@@ -57,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--root", type=Path)
 
     upgrade = subparsers.add_parser("upgrade", help="检查或安装指定版本")
-    upgrade.add_argument("target", nargs="?", help="目标版本，例如 v0.3.2；省略时使用最新稳定版")
+    upgrade.add_argument("target", nargs="?", help="目标版本，例如 v0.4.0；省略时使用最新稳定版")
     upgrade.add_argument("--check", action="store_true", help="只检查，不下载或切换")
     upgrade.add_argument("--force", action="store_true", help="重新安装相同版本")
     upgrade.add_argument("--json", action="store_true")
@@ -83,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        if args.command in {"web", "tui"}:
+        if args.command == "web":
             return _launch(args.command, list(args.arguments))
         if args.command == "version":
             payload = version_payload()

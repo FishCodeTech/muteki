@@ -7,8 +7,8 @@ import (
 
 // baseEnv is the minimal environment a worker starts with before the host's overlay.
 // We keep it small and deterministic; the host passes the engine-specific vars
-// (MUTEKI_*, ANTHROPIC_*, CLAUDE_*, CODEX_*, CURSOR_*, OPENAI_*, OPENCODE_*,
-// DEEPSEEK_*, DSH_*, HOME) explicitly.
+	// (MUTEKI_*, ANTHROPIC_*, CLAUDE_*, CODEX_*, CURSOR_*, OPENAI_*, OPENCODE_*,
+	// DEEPSEEK_*, HOME) explicitly.
 func baseEnv() map[string]string {
 	env := map[string]string{
 		// cursor-agent installs to ~/.local/bin which is NOT on a non-login PATH —

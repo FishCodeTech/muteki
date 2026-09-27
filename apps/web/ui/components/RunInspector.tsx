@@ -1,19 +1,22 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import type { CSSProperties, MouseEvent as ReactMouseEvent } from "react";
+import { MotionIcon } from "@/components/MotionIcon";
+
+import { useMemo, useState } from "react";
+import type { CSSProperties, MouseEvent as ReactMouseEvent, ReactElement } from "react";
 import {
   DeckState, SolverLane, isReviewWorkerLane, isFactRetired,
-  verifiedFactTexts, candidateFactTexts, openIntentTexts, deadEndTexts, workerIds,
+  workerIds,
   currentGenWorkerIds,
   type BlackboardVulnReport,
+  type PlatformConfirmationStatus,
 } from "@/lib/events";
 import { useLang, useT } from "@/lib/i18n";
-import { workerColor, workerEngine, resumeCommand, toWorkerIdentity, workerDisplayName, formatWorkerSubtitle, actorDisplayTitle, workerGeneration } from "@/lib/workers";
+import { workerColor, workerEngine, workerEngineKey, resumeCommand, toWorkerIdentity, workerDisplayName, formatWorkerSubtitle, workerGeneration } from "@/lib/workers";
 import { Icon, type IconName } from "@/components/Icon";
-import { SelectionGlider } from "@/components/SelectionGlider";
+import { EngineLogo } from "@/components/EngineLogo";
 import { useCopied } from "@/lib/useCopied";
-import { CopyText } from "@/components/CopyText";
+import { Button, ListBox, ListBoxItem, Select } from "@heroui/react";
 import {
   estimateCvss,
   findingClassLabel,
@@ -22,9 +25,10 @@ import {
   type CvssRating,
 } from "@/lib/reportMarkdown";
 import type { ArtifactView } from "@/lib/events";
+import { panelHotkey } from "@/lib/runtimeTabs";
 
 /**
- * The persistent right-column run inspector (the redesign's floating inspector):
+ * The collapsible right-column run inspector (the redesign's floating inspector):
  *   ① flag / outcome + evidence chips
  *   ② child-worker mini rows (engine · status · session · winner · spawn/kill)
  *   ③ a button group that opens the secondary panels (evidence / workers / graph
@@ -36,96 +40,8 @@ import type { ArtifactView } from "@/lib/events";
  */
 
 const SPAWN_ENGINES = [
-  "claude", "codex", "cursor", "pi", "omp", "kimi", "grok", "opencode", "dsh",
+  "claude", "codex", "cursor", "pi", "omp", "kimi", "grok", "opencode", "devin",
 ];
-
-type InspectorSignal = "verified" | "candidates" | "intents" | "dead" | "cost";
-
-type SignalCostRow = {
-  id: string;
-  label: string;
-  engine: string;
-  usd: number;
-  tokens: number;
-};
-
-function compactNumber(value: number): string {
-  if (value < 1000) return String(value);
-  if (value < 1_000_000) return `${(value / 1000).toFixed(1)}k`;
-  return `${(value / 1_000_000).toFixed(2)}m`;
-}
-
-function InspectorSignalDetail({
-  signal,
-  label,
-  count,
-  items,
-  costRows,
-  totalUsd,
-  totalTokens,
-  targetLabel,
-  onClose,
-  onOpenTarget,
-}: {
-  signal: InspectorSignal;
-  label: string;
-  count: number;
-  items: string[];
-  costRows: SignalCostRow[];
-  totalUsd: number;
-  totalTokens: number;
-  targetLabel: string;
-  onClose: () => void;
-  onOpenTarget: () => void;
-}) {
-  const t = useT();
-  const visibleItems = items.slice(0, 4);
-  const visibleCosts = costRows.slice(0, 4);
-  const remaining = signal === "cost"
-    ? Math.max(0, costRows.length - visibleCosts.length)
-    : Math.max(0, items.length - visibleItems.length);
-  const empty = signal === "cost" ? visibleCosts.length === 0 : visibleItems.length === 0;
-
-  return (
-    <div id="inspector-signal-detail" className={`insp-signal-detail ${signal}`}>
-      <div className="insp-signal-detail-head">
-        <span><strong>{label}</strong><b>{count}</b></span>
-        <button type="button" onClick={onClose} aria-label={t("settings.close")} title={t("settings.close")}>
-          <Icon name="x" size={13} />
-        </button>
-      </div>
-      {signal === "cost" && (
-        <div className="insp-cost-total">
-          <span>{t("insp.signal.totalCost")}</span>
-          <b>${totalUsd.toFixed(4)}</b>
-          <small>{compactNumber(totalTokens)} {t("meta.tokens")}</small>
-        </div>
-      )}
-      {empty ? (
-        <div className="insp-signal-empty">{t("insp.signal.empty")}</div>
-      ) : signal === "cost" ? (
-        <div className="insp-cost-list">
-          {visibleCosts.map((row) => (
-            <div className="insp-cost-row" key={row.id}>
-              <span className="insp-cost-agent"><b>{row.label}</b><small>{row.engine}</small></span>
-              <span className="insp-cost-value"><b>${row.usd.toFixed(4)}</b><small>{compactNumber(row.tokens)} {t("meta.tokens")}</small></span>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <ol className="insp-signal-list">
-          {visibleItems.map((item, index) => <li key={`${index}-${item}`}><span>{item}</span></li>)}
-        </ol>
-      )}
-      <div className="insp-signal-detail-foot">
-        <span>{remaining > 0 ? t("insp.signal.more", { n: remaining }) : ""}</span>
-        <button type="button" onClick={onOpenTarget}>
-          {targetLabel}<Icon name="chevronRight" size={13} />
-        </button>
-      </div>
-    </div>
-  );
-}
 
 function reportStatusRank(status: BlackboardVulnReport["status"]): number {
   switch (status) {
@@ -161,6 +77,26 @@ function reportStatusLabel(
       return t("runtime.reports.reproFailed");
     case "rejected":
       return t("runtime.reports.rejected");
+    default: {
+      const _never: never = status;
+      return _never;
+    }
+  }
+}
+
+function platformStatusLabel(
+  status: PlatformConfirmationStatus,
+  t: (key: string) => string,
+): string {
+  switch (status) {
+    case "accepted":
+      return t("insp.run.platformAccepted");
+    case "pending":
+      return t("insp.run.platformPending");
+    case "rejected":
+      return t("insp.run.platformRejected");
+    case "internal":
+      return t("insp.run.platformInternal");
     default: {
       const _never: never = status;
       return _never;
@@ -207,16 +143,16 @@ function ExportCollectionButton({ text }: { text: string }) {
   const t = useT();
   const [copied, copy] = useCopied();
   return (
-    <button
+    <Button
       type="button"
       className={`insp-report-export ${copied ? "copied" : ""}`.trim()}
-      title={t("insp.run.exportCollection")}
+      data-tooltip={t("insp.run.exportCollection")}
       aria-label={t("runtime.reports.copyCollectionAria")}
       onClick={() => copy(text)}
     >
-      <Icon name={copied ? "check" : "copy"} size={13} />
+      <MotionIcon active={copied} from="copy" to="check" size={13} />
       <span>{copied ? t("common.copied") : t("insp.run.exportCollection")}</span>
-    </button>
+    </Button>
   );
 }
 
@@ -240,19 +176,19 @@ function PentestReportDirectory({
         const location = reportLocationLabel(row.resourceId) || row.title;
         const typeLabel = findingClassLabel(row.findingClass);
         return (
-          <button
+          <Button
             type="button"
             className="insp-report-row"
             key={row.id}
             onClick={() => onOpenReport(row.id)}
-            title={t("insp.run.openReport", { title: row.title })}
+            data-tooltip={t("insp.run.openReport", { title: row.title })}
             aria-label={t("insp.run.openReport", { title: `${typeLabel} ${location}` })}
           >
             <span className="insp-report-row-top">
               <span className="insp-report-type">{typeLabel}</span>
               <span
                 className={`artifact-badge ${severityBadgeClass(cvss.rating)}`}
-                title={t("runtime.reports.cvssHint")}
+                data-tooltip={t("runtime.reports.cvssHint")}
               >
                 {cvss.badge}
               </span>
@@ -261,7 +197,7 @@ function PentestReportDirectory({
               </span>
             </span>
             <code className="insp-report-path">{location}</code>
-          </button>
+          </Button>
         );
       })}
       <div className="insp-report-foot">
@@ -287,6 +223,7 @@ function WorkerMiniRow({
   siblings,
   onKill,
   onOpen,
+  onOpenAgent,
 }: {
   lane: SolverLane;
   running: boolean;
@@ -295,10 +232,12 @@ function WorkerMiniRow({
   siblings: ReturnType<typeof toWorkerIdentity>[];
   onKill: (id: string) => void;
   onOpen: (id: string) => void;
+  onOpenAgent?: (id: string) => void;
 }) {
   const t = useT();
   const online = lane.online !== false;
   const engine = workerEngine(lane.solverId, lane.engine);
+  const engineKey = workerEngineKey(lane.solverId, lane.engine);
   const color = workerColor(lane.solverId, lane.engine);
   const display = workerDisplayName(lane.solverId, toWorkerIdentity(lane.solverId, lane), siblings);
   const subtitle = formatWorkerSubtitle(display, t);
@@ -322,7 +261,7 @@ function WorkerMiniRow({
     <div
       className={`iwk iwk-clickable ${online ? "online" : "offline"} ${isWinner ? "winner" : ""} ${productive ? "productive" : ""} ${isReview ? "review-worker" : ""}`}
       style={{ "--wc": color } as CSSProperties}
-      title={`${engine} · ${reason}${runtime ? ` · ${runtime}` : ""}`}
+      data-tooltip={`${engine} · ${reason}${runtime ? ` · ${runtime}` : ""}`}
       role="button"
       tabIndex={0}
       aria-label={t("insp.run.openWorker", { id: display.title })}
@@ -331,11 +270,15 @@ function WorkerMiniRow({
         if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
       }}
     >
-      <span className="iwk-avatar">{display.initial}</span>
+      <span className="iwk-avatar" aria-hidden="true">
+        {engineKey
+          ? <EngineLogo engine={engineKey} size={16} />
+          : display.initial}
+      </span>
       <span className="iwk-meta">
-        <span className="iwk-name" title={display.titleAttr}>{display.title}</span>
+        <span className="iwk-name" data-tooltip={display.titleAttr}>{display.title}</span>
         {workerGeneration(lane.solverId) > 1 && (
-          <span className="iwk-gen" title={lane.solverId}>g{workerGeneration(lane.solverId)}</span>
+          <span className="iwk-gen" data-tooltip={lane.solverId}>g{workerGeneration(lane.solverId)}</span>
         )}
         <span className="iwk-sub">
           <span className="iwk-dot" />
@@ -344,7 +287,7 @@ function WorkerMiniRow({
           {isReview && <span className="worker-role-chip review">{t("worker.role.review")}</span>}
           {runtime && <span className="iwk-runtime">{runtime}</span>}
           {session && (
-            <span className={`iwk-sess ${copied ? "copied" : ""}`} title={t("insp.run.copySession") + ": " + resumeCmd}
+            <span className={`iwk-sess ${copied ? "copied" : ""}`} data-tooltip={t("insp.run.copySession") + ": " + resumeCmd}
               role="button" tabIndex={0} aria-label={t("insp.run.copySession")}
               onClick={copySession}
               onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); copy(resumeCmd); } }}>
@@ -352,7 +295,7 @@ function WorkerMiniRow({
             </span>
           )}
         </span>
-        <span className={`iwk-stat ${idle ? "idle" : ""}`} title={t("insp.run.statTitle")}>
+        <span className={`iwk-stat ${idle ? "idle" : ""}`} data-tooltip={t("insp.run.statTitle")}>
           {idle ? (
             t("insp.run.statIdle")
           ) : (
@@ -368,15 +311,19 @@ function WorkerMiniRow({
       </span>
       {/* I: paused / stalled markers so a held or stuck worker is visible at a glance */}
       {online && lane.paused && (
-        <span className="iwk-paused" title={t("worker.paused")}><Icon name="pause" size={13} /></span>
+        <span className="iwk-paused" data-tooltip={t("worker.paused")}><Icon name="pause" size={13} /></span>
       )}
       {online && !lane.paused && lane.status === "stalled" && (
-        <span className="iwk-stalled" title={t("worker.stalled")}><Icon name="clock" size={13} /></span>
+        <span className="iwk-stalled" data-tooltip={t("worker.stalled")}><Icon name="clock" size={13} /></span>
       )}
-      {isWinner && <span className="iwk-win" title={t("insp.run.winner")}><Icon name="flag" size={14} /></span>}
+      {isWinner && <span className="iwk-win" data-tooltip={t("insp.run.winner")}><Icon name="flag" size={14} /></span>}
+      {onOpenAgent && (
+        <Button className="iwk-collab" data-tooltip={t("collab.action.viewOnMap")} aria-label={t("collab.action.viewOnMap")}
+          onClick={(e) => { e.stopPropagation(); onOpenAgent(lane.solverId); }}><Icon name="network" size={13} /></Button>
+      )}
       {running && online && (
-        <button className="iwk-kill" title={t("worker.killTitle")} aria-label={t("worker.killTitle")}
-          onClick={(e) => { e.stopPropagation(); onKill(lane.solverId); }}><Icon name="x" size={13} /></button>
+        <Button className="iwk-kill" data-tooltip={t("worker.killTitle")} aria-label={t("worker.killTitle")}
+          onClick={(e) => { e.stopPropagation(); onKill(lane.solverId); }}><Icon name="x" size={13} /></Button>
       )}
     </div>
   );
@@ -391,9 +338,11 @@ export function RunInspector({
   onSpawnWorker,
   onKillWorker,
   onOpenWorker,
+  onOpenAgent,
   onWriteup,
   onMarkFalseFlag,
   onOpenReport,
+  onClose,
 }: {
   deck: DeckState;
   running: boolean;
@@ -404,25 +353,19 @@ export function RunInspector({
   onKillWorker: (id: string) => void;
   // open the "Worker 详情" panel focused on a single worker (roster row click).
   onOpenWorker: (id: string) => void;
+  onOpenAgent?: (id: string) => void;
   onWriteup: () => void;
   onMarkFalseFlag: (flag: string) => void;
   onOpenReport: (reportId: string) => void;
+  onClose?: () => void;
 }) {
   const t = useT();
   const { lang } = useLang();
   const [spawnEngine, setSpawnEngine] = useState("");
   const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set());
-  const [activeSignal, setActiveSignal] = useState<InspectorSignal | null>(null);
 
-  const verifiedItems = verifiedFactTexts(deck);
-  const candidateItems = candidateFactTexts(deck);
-  const intentItems = openIntentTexts(deck);
-  const deadItems = deadEndTexts(deck);
-  const verified = verifiedItems.length;
-  const candidates = candidateItems.length;
-  const intents = intentItems.length;
-  const deads = deadItems.length;
   const acceptedReports = (deck.blackboard.vulnReports ?? []).filter((row) => row.status === "accepted");
+  const qualifiedReports = acceptedReports.filter((row) => row.goalQualified !== false);
   const submittedReports = (deck.blackboard.vulnReports ?? []).filter((row) => row.status === "submitted").length;
   const reproducingReports = Math.max(0, deck.verifying ?? 0);
   const directoryReports = (deck.blackboard.vulnReports ?? [])
@@ -430,27 +373,30 @@ export function RunInspector({
     .slice()
     .sort((a, b) => reportStatusRank(a.status) - reportStatusRank(b.status) || a.ts - b.ts);
   const pentest = deck.mode === "pentest";
+  const taskContract = deck.taskContract;
+  const completionContract = !pentest ? "" : deck.completionKind === "coverage"
+    ? t("insp.run.contractCoverage")
+    : deck.completionKind === "count"
+      ? t("insp.run.contractCount").replace("{count}", String(deck.expectedFindings))
+      : deck.outcomePredicate === "shell_access"
+        ? t("insp.run.contractShell")
+        : deck.outcomePredicate === "admin_access"
+          ? t("insp.run.contractAdmin")
+          : deck.outcomePredicate === "command_execution"
+            ? t("insp.run.contractCommand")
+            : t("insp.run.contractReport");
   const reportCollectionTitle = deck.challengeName ? `${deck.challengeName} 漏洞报告集` : "漏洞报告集";
   const workerSiblings = useMemo(
     () => workerIds(deck).map((id) => toWorkerIdentity(id, deck.lanes[id])),
     [deck],
   );
-  const costRows = useMemo<SignalCostRow[]>(() => Object.entries(deck.costBySolver)
-    .map(([id, cost]) => ({
-      id,
-      label: actorDisplayTitle(id, t, toWorkerIdentity(id, deck.lanes[id]), workerSiblings),
-      engine: cost.engine || workerEngine(id, deck.lanes[id]?.engine),
-      usd: cost.usd,
-      tokens: cost.tokensIn + cost.tokensOut,
-    }))
-    .filter((row) => row.usd > 0 || row.tokens > 0)
-    .sort((a, b) => b.usd - a.usd || b.tokens - a.tokens), [deck.costBySolver, deck.lanes, t, workerSiblings]);
   // E: active resource locks held across the swarm (site/account/listener)
   const activeLocks = (deck.resourceLocks ?? []).filter((l) => l.status === "active");
   // H: how many times the graph was compacted this run
   const compactEpochs = deck.compactEpochs ?? 0;
   const degradedEvents = deck.blackboard.events.filter((e) =>
-    e.kind === "runtime_degraded" || e.kind === "worker_backend_degraded");
+    e.kind === "runtime_degraded" || e.kind === "worker_backend_degraded"
+    || e.kind === "engagement_planner_degraded");
   // engines dropped from this run's roster by a dispatch-time health check (e.g.
   // cursor headless auth lapsed). engine → reason; recover events clear it.
   const degradedEngines = Object.entries(deck.degradedEngines || {});
@@ -518,27 +464,23 @@ export function RunInspector({
   const visibleIds = capped ? ids.slice(0, ROSTER_CAP) : ids;
 
   // single-key shortcut advertised in each button's tooltip + aria-label (handler
-  // lives in page.tsx). Mirrors PANEL_KEYS there — keep both maps in sync.
-  const PANEL_HOTKEY: Partial<Record<ArtifactView, string>> = {
-    evidence: "e", workers: "w", graph: "g", timeline: "t", blackboard: "b",
-    findings: "f", credentials: "c", pocs: "p", routes: "r", directives: "d",
-  };
+  // lives in page.tsx); both read lib/runtimeTabs.ts.
   const panelBtn = (view: ArtifactView, key: string, ico: IconName, full = false) => {
     const label = t(`panelbtn.${key}`);
-    const hk = PANEL_HOTKEY[view];
+    const hk = panelHotkey(view);
     const title = hk ? `${label} (${hk})` : label;
     return (
-      <button
-        className={`insp-panel-btn motion-panel-btn ${full ? "full" : ""} ${key === "writeup" ? "writeup" : ""} ${artifactOpen && artifactView === view ? "on" : ""}`}
+      <Button
+        className={`insp-panel-btn ${full ? "full" : ""} ${artifactOpen && artifactView === view ? "on" : ""}`}
         aria-pressed={artifactOpen && artifactView === view}
-        title={title}
+        data-tooltip={title}
         aria-label={title}
         onClick={() => onOpenArtifact(view)}
       >
         <span className="ico"><Icon name={ico} size={15} /></span>
         <span className="insp-panel-label">{label}</span>
         {hk && <kbd className="insp-panel-kbd" aria-hidden="true">{hk}</kbd>}
-      </button>
+      </Button>
     );
   };
   const sectionOpen = (key: string) => !collapsedSections.has(key);
@@ -550,61 +492,45 @@ export function RunInspector({
       return next;
     });
   };
-  useEffect(() => {
-    if (!activeSignal) return;
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setActiveSignal(null);
-    };
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [activeSignal]);
-
-  const signalItems: Record<InspectorSignal, string[]> = {
-    verified: verifiedItems,
-    candidates: candidateItems,
-    intents: intentItems,
-    dead: deadItems,
-    cost: [],
-  };
-  const signalTargets: Record<InspectorSignal, { view: ArtifactView; label: string }> = {
-    verified: { view: "evidence", label: t("insp.signal.openEvidence") },
-    candidates: { view: "evidence", label: t("insp.signal.openEvidence") },
-    intents: { view: "blackboard", label: t("insp.signal.openBlackboard") },
-    dead: { view: "evidence", label: t("insp.signal.openEvidence") },
-    cost: { view: "workers", label: t("insp.signal.openWorkers") },
-  };
-  const signalDefs: Array<{ key: InspectorSignal; icon: IconName; label: string; value: string; count: number }> = [
-    { key: "verified", icon: "check", label: t("meta.verified"), value: String(verified), count: verified },
-    { key: "candidates", icon: "help", label: t("meta.candidates"), value: String(candidates), count: candidates },
-    { key: "intents", icon: "crosshair", label: t("meta.intents"), value: String(intents), count: intents },
-    { key: "dead", icon: "xCircle", label: t("meta.dead"), value: String(deads), count: deads },
-    { key: "cost", icon: "terminal", label: t("meta.cost"), value: `$${deck.usd.toFixed(3)}`, count: costRows.length },
-  ];
-  const activeSignalDef = activeSignal ? signalDefs.find((item) => item.key === activeSignal) : undefined;
-  const activeSignalTarget = activeSignal ? signalTargets[activeSignal] : undefined;
-  const sectionHeader = (key: string, label: string, aside?: JSX.Element) => {
+  const sectionHeader = (key: string, label: string, aside?: ReactElement) => {
     const open = sectionOpen(key);
     return (
       <div className="insp-sec-h">
         <span>{label}</span>
         <span className="insp-sec-actions">
           {aside}
-          <button
+          <Button
             className={`insp-sec-toggle ${open ? "open" : ""}`}
             onClick={() => toggleSection(key)}
             aria-expanded={open}
-            title={t(open ? "insp.run.collapseSection" : "insp.run.expandSection")}
+            data-tooltip={t(open ? "insp.run.collapseSection" : "insp.run.expandSection")}
             aria-label={t(open ? "insp.run.collapseSection" : "insp.run.expandSection")}
           >
             <Icon name="chevronDown" size={13} />
-          </button>
+          </Button>
         </span>
       </div>
     );
   };
 
   return (
-    <aside className={`run-inspector lang-${lang} motion-inspector`} aria-label={t("insp.run.title")}>
+    <aside className={`run-inspector lang-${lang} t-page-slide`} aria-label={t("insp.run.title")}>
+      {onClose && (
+        <div className="insp-dock">
+          <span className="insp-dock-title">{t("insp.run.title")}</span>
+          <Button
+            size="sm"
+            variant="ghost"
+            isIconOnly
+            className="icon-btn insp-dock-close"
+            onPress={onClose}
+            aria-label={t("insp.run.hide")}
+            data-tooltip={t("insp.run.hide")}
+          >
+            <Icon name="panel" size={14} />
+          </Button>
+        </div>
+      )}
       {deck.preparing && (
         <div className="insp-preflight preparing" role="status">
           <Icon name="terminal" size={14} />
@@ -629,7 +555,7 @@ export function RunInspector({
           </div>
         </div>
       )}
-      {deck.outcomeReason === "runtime_failure" && deck.outcomeDetail && (
+      {(deck.outcomeReason === "runtime_failure" || deck.outcomeReason === "no_progress") && deck.outcomeDetail && (
         <div className="insp-preflight failed" role="alert">
           <div className="insp-preflight-title">
             <Icon name="xCircle" size={14} />
@@ -658,28 +584,75 @@ export function RunInspector({
           <b>{reason}</b>
         </div>
       ))}
+      {taskContract && (
+        <section className={`insp-sec insp-task-contract ${sectionOpen("task") ? "" : "collapsed"}`}>
+          {sectionHeader("task", t("insp.run.taskUnderstanding"), (
+            <span className="insp-flag-count">{taskContract.mode.toUpperCase()}</span>
+          ))}
+          {sectionOpen("task") && (
+            <div className="insp-task-grid">
+              <div><span>{t("insp.run.taskGoal")}</span><b>{taskContract.completion.goal || taskContract.rawInstruction}</b></div>
+              {taskContract.executionTarget ? (
+                <div><span>{t("insp.run.taskTarget")}</span><b>{taskContract.executionTarget}</b></div>
+              ) : null}
+              {taskContract.authorizationScope ? (
+                <div><span>{t("insp.run.taskScope")}</span><b>{taskContract.authorizationScope}</b></div>
+              ) : null}
+              {taskContract.mode === "pentest" ? (
+                <>
+                  <div><span>{t("insp.run.taskType")}</span><b>{taskContract.completion.taskType || taskContract.category}</b></div>
+                  <div><span>{t("insp.run.taskQuantity")}</span><b>{taskContract.completion.kind === "coverage" ? t("insp.run.taskCoverage") : String(taskContract.completion.quantity ?? 1)}</b></div>
+                </>
+              ) : (
+                <div><span>{t("insp.run.taskFlagFormat")}</span><b>{taskContract.completion.flagFormatHint || taskContract.completion.flagFormat || t("insp.run.taskDefaultFlag")}</b></div>
+              )}
+              {taskContract.attachments.length > 0 && (
+                <div><span>{t("insp.run.taskAttachments")}</span><b>{taskContract.attachments.map((item) => item.summary || item.name).join("；")}</b></div>
+              )}
+            </div>
+          )}
+        </section>
+      )}
       <section className={`insp-sec insp-sec-outcome ${sectionOpen("outcome") ? "" : "collapsed"}`}>
         {sectionHeader("outcome", t(pentest ? "insp.run.reports" : "insp.run.flag"), pentest ? (
           deck.expectedFindings > 1 ? (
             <span className="insp-flag-count">
-              {acceptedReports.length}/{deck.expectedFindings}
+              {qualifiedReports.length}/{deck.expectedFindings}
               {(submittedReports > 0 || reproducingReports > 0) && (
-                <small>{submittedReports}/{reproducingReports}/{acceptedReports.length}</small>
+                <small>{submittedReports}/{reproducingReports}/{qualifiedReports.length}</small>
               )}
             </span>
-          ) : acceptedReports.length > 0 || submittedReports > 0 || reproducingReports > 0 ? (
+          ) : qualifiedReports.length > 0 || submittedReports > 0 || reproducingReports > 0 ? (
             <span className="insp-flag-count">
-              {acceptedReports.length}
+              {qualifiedReports.length}
               {(submittedReports > 0 || reproducingReports > 0) && (
-                <small>{submittedReports}/{reproducingReports}/{acceptedReports.length}</small>
+                <small>{submittedReports}/{reproducingReports}/{qualifiedReports.length}</small>
               )}
             </span>
           ) : undefined
+        ) : deck.platformConfirmationRequired ? (
+          <span className="insp-flag-count" title={t("insp.run.internalFindings")}>{deck.flags.length}</span>
         ) : deck.expectedFlags > 1 ? (
           <span className="insp-flag-count">{deck.flags.length}/{deck.expectedFlags}</span>
         ) : undefined)}
         {sectionOpen("outcome") && (
           <>
+            {!pentest && deck.platformConfirmationRequired && (
+              <div className="insp-flag-summary" aria-live="polite">
+                <div><span>{t("insp.run.internalFindings")}</span><strong>{deck.flags.length}</strong></div>
+                <div><span>{t("insp.run.platformAccepted")}</span><strong>{(deck.flagConfirmations || []).filter((row) => row.status === "accepted").length}<small>/{Math.max(1, deck.expectedFlags)}</small></strong></div>
+              </div>
+            )}
+            {pentest && (
+              <div className="insp-pending-hint">
+                {t("insp.run.completionContract")}：{completionContract}
+                {acceptedReports.length > 0 && (
+                  <> · {t("insp.run.reportGateProgress")
+                    .replace("{accepted}", String(acceptedReports.length))
+                    .replace("{qualified}", String(qualifiedReports.length))}</>
+                )}
+              </div>
+            )}
             {pentest && directoryReports.length > 0 ? (
               <PentestReportDirectory
                 rows={directoryReports}
@@ -688,77 +661,56 @@ export function RunInspector({
                 onOpenReport={onOpenReport}
               />
             ) : pentest ? (
-              <div className="insp-run-flag pending motion-feedback">
+              <div className="insp-run-flag pending t-flag-target">
                 <span className="insp-pending-row"><Icon name="list" size={13} /> {t("insp.run.pendingReports")}</span>
                 <span className="insp-pending-hint">{t("insp.run.pendingReportsHint")}</span>
               </div>
             ) : deck.flags.length > 0 ? (
               <div className="insp-run-flags">
-                {deck.flags.map((f) => (
+                {deck.platformConfirmationRequired && (
+                  <div className="insp-pending-hint">{t("insp.run.platformHint")}</div>
+                )}
+                {deck.flags.map((f, index) => {
+                  const confirmation = (deck.flagConfirmations || []).find((row) => row.flag === f);
+                  const status = confirmation?.status || "internal";
+                  const statusLabel = platformStatusLabel(status, t);
+                  return (
                   <div className="insp-flag-row" key={f}>
-                    <CopyText value={f} className="insp-run-flag motion-feedback" />
-                    {!running && (
-                      <button
-                        type="button"
-                        className="insp-flag-false"
-                        title={t("quick.markFalseTitle")}
-                        aria-label={t("quick.markFalseTitle")}
-                        onClick={() => onMarkFalseFlag(f)}
-                      >
-                        <Icon name="xCircle" size={15} />
-                      </button>
-                    )}
+                    <div className="insp-flag-row-head">
+                      <span className="insp-flag-index">{String(index + 1).padStart(2, "0")}</span>
+                      {deck.platformConfirmationRequired && (
+                        <span className={`insp-flag-status ${status}`}>{statusLabel}</span>
+                      )}
+                      {!running && (
+                        <Button
+                          type="button"
+                          isIconOnly
+                          variant="ghost"
+                          className="insp-flag-false"
+                          data-tooltip={t("quick.markFalseTitle")}
+                          aria-label={t("quick.markFalseTitle")}
+                          onClick={() => onMarkFalseFlag(f)}
+                        >
+                          <Icon name="xCircle" size={14} />
+                        </Button>
+                      )}
+                    </div>
+                    <Button size="sm" variant="ghost" className="copytext insp-run-flag t-flag-target" aria-label={t("common.copyFlagAria", { flag: f })} onPress={() => void navigator.clipboard.writeText(f)}>
+                      <code>{f}</code><Icon name="copy" size={13} className="insp-flag-copy-icon" />
+                    </Button>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             ) : deck.outcomeReason === "goal_met" ? (
-              <CopyText
-                value={deck.goalWhy || t("insp.run.goalMet")}
-                className="insp-run-flag goal motion-feedback"
-                titleKey="common.copyAnswer"
-                ariaLabelKey="common.copyAnswerAria"
-              />
+              <Button size="sm" variant="outline" className="copytext insp-run-flag goal t-flag-target" aria-label={t("common.copyAnswer")} onPress={() => void navigator.clipboard.writeText(deck.goalWhy || t("insp.run.goalMet"))}>
+                {deck.goalWhy || t("insp.run.goalMet")}
+              </Button>
             ) : (
-              <div className="insp-run-flag pending motion-feedback">
+              <div className="insp-run-flag pending t-flag-target">
                 <span className="insp-pending-row"><Icon name="flag" size={13} /> {t("insp.run.pending")}</span>
                 <span className="insp-pending-hint">{t("insp.run.pendingHint")}</span>
               </div>
-            )}
-            <div className="insp-signals" role="group" aria-label={t("insp.signal.title")}>
-              {signalDefs.map((signal) => {
-                const selected = activeSignal === signal.key;
-                return (
-                  <button
-                    type="button"
-                    className={`insp-signal ${signal.key} ${selected ? "on" : ""}`}
-                    aria-expanded={selected}
-                    aria-controls="inspector-signal-detail"
-                    title={t(selected ? "insp.signal.hide" : "insp.signal.show", { label: signal.label })}
-                    onClick={() => setActiveSignal((current) => current === signal.key ? null : signal.key)}
-                    key={signal.key}
-                  >
-                    <span><Icon name={signal.icon} size={12} />{signal.label}</span>
-                    <b>{signal.value}</b>
-                  </button>
-                );
-              })}
-            </div>
-            {activeSignal && activeSignalDef && activeSignalTarget && (
-              <InspectorSignalDetail
-                signal={activeSignal}
-                label={activeSignalDef.label}
-                count={activeSignalDef.count}
-                items={signalItems[activeSignal]}
-                costRows={costRows}
-                totalUsd={deck.usd}
-                totalTokens={deck.tokensIn + deck.tokensOut}
-                targetLabel={activeSignalTarget.label}
-                onClose={() => setActiveSignal(null)}
-                onOpenTarget={() => {
-                  setActiveSignal(null);
-                  onOpenArtifact(activeSignalTarget.view);
-                }}
-              />
             )}
           </>
         )}
@@ -784,26 +736,26 @@ export function RunInspector({
                   <WorkerMiniRow key={id} lane={laneFor(id)} running={running}
                     isWinner={id === winnerId} facts={verifiedByActor.get(id) || 0}
                     siblings={workerSiblings}
-                    onKill={onKillWorker} onOpen={onOpenWorker} />
+                    onKill={onKillWorker} onOpen={onOpenWorker} onOpenAgent={onOpenAgent} />
                 ))}
                 {ids.length > ROSTER_CAP && (
-                  <button className="iwk-showall" onClick={() => setShowAll((v) => !v)}
+                  <Button className="iwk-showall" onClick={() => setShowAll((v) => !v)}
                     aria-expanded={!capped}>
                     {capped
                       ? t("insp.run.showAll", { n: ids.length })
                       : t("insp.run.showLess")}
-                  </button>
+                  </Button>
                 )}
               </div>
             )}
             {running && (
               <div className="iwk-spawn">
-                <select value={spawnEngine} onChange={(e) => setSpawnEngine(e.target.value)} title={t("workerDock.engine")}>
-                  <option value="">{t("workerDock.auto")}</option>
-                  {SPAWN_ENGINES.map((e) => <option key={e} value={e}>{e}</option>)}
-                </select>
-                <button className="iwk-spawn-btn" onClick={() => onSpawnWorker(spawnEngine || undefined)}
-                  title={t("workerDock.addTitle")}>＋ {t("workerDock.add")}</button>
+                <Select aria-label={t("workerDock.engine")} selectedKey={spawnEngine} onSelectionChange={(key) => setSpawnEngine(String(key ?? ""))}>
+                  <Select.Trigger><Select.Value /></Select.Trigger>
+                  <Select.Popover><ListBox><ListBoxItem id="" textValue={t("workerDock.auto")}>{t("workerDock.auto")}</ListBoxItem>{SPAWN_ENGINES.map((engine) => <ListBoxItem key={engine} id={engine} textValue={engine}>{engine}</ListBoxItem>)}</ListBox></Select.Popover>
+                </Select>
+                <Button className="iwk-spawn-btn" onClick={() => onSpawnWorker(spawnEngine || undefined)}
+                  data-tooltip={t("workerDock.addTitle")}>＋ {t("workerDock.add")}</Button>
               </div>
             )}
           </>
@@ -816,7 +768,7 @@ export function RunInspector({
             <span className="iwk-summary">
               {activeLocks.length > 0 && <span>{activeLocks.length}</span>}
               {compactEpochs > 0 && (
-                <span className="insp-compact-badge" title={t("meta.compactEpochs")}>
+                <span className="insp-compact-badge" data-tooltip={t("meta.compactEpochs")}>
                   {t("insp.compactBadge")} ×{compactEpochs}
                 </span>
               )}
@@ -827,7 +779,7 @@ export function RunInspector({
               {activeLocks.length === 0 ? (
                 <div className="iwk-empty"><span className="iwk-empty-hint">{t("resource.lockActive")} —</span></div>
               ) : activeLocks.map((l) => (
-                <div className="insp-lock-row" key={l.lockId} title={l.resourceKey}>
+                <div className="insp-lock-row" key={l.lockId} data-tooltip={l.resourceKey}>
                   <span className="insp-lock-key">{l.resourceKey}</span>
                   <span className="insp-lock-owner">{t("resource.lockHolder")}: {l.ownerWorker || "?"}</span>
                   {l.riskClass && <span className="insp-lock-risk">{l.riskClass}</span>}
@@ -841,23 +793,45 @@ export function RunInspector({
       <section className={`insp-sec insp-sec-panels ${sectionOpen("panels") ? "" : "collapsed"}`}>
         {sectionHeader("panels", t("insp.run.panels"))}
         {sectionOpen("panels") && (
-          <div className="insp-panels selection-glide-host">
-            <SelectionGlider selectedKey={artifactOpen ? artifactView : ""} selector=".insp-panel-btn.on" className="grid" duration={280} />
-            {panelBtn("evidence", "evidence", "layers")}
-            {panelBtn("workers", "workers", "grid")}
-            {panelBtn("graph", "graph", "network")}
-            {panelBtn("timeline", "timeline", "list")}
-            {panelBtn("blackboard", "blackboard", "board")}
-            {panelBtn("findings", "findings", "alert")}
-            {panelBtn("credentials", "credentials", "lock")}
-            {panelBtn("pocs", "pocs", "terminal")}
-            {panelBtn("routes", "routes", "network")}
-            {panelBtn("directives", "directives", "help")}
-            <button className="insp-panel-btn motion-panel-btn writeup" onClick={onWriteup} disabled={running}
-              title={running ? "" : t("panelbtn.writeup")}>
-              <span className="ico"><Icon name="pencil" size={15} /></span>
-              <span className="insp-panel-label">{t("panelbtn.writeup")}</span>
-            </button>
+          <div className="insp-panels">
+            <div className="insp-panel-group" role="group" aria-label={t("insp.run.panelGroup.observe")}>
+              <span className="insp-panel-group-label">{t("insp.run.panelGroup.observe")}</span>
+              <div className="insp-panel-grid">
+                {panelBtn("timeline", "timeline", "list", true)}
+                {panelBtn("workers", "workers", "grid")}
+                {panelBtn("collaboration", "collaboration", "network")}
+              </div>
+            </div>
+            <div className="insp-panel-group" role="group" aria-label={t("insp.run.panelGroup.investigate")}>
+              <span className="insp-panel-group-label">{t("insp.run.panelGroup.investigate")}</span>
+              <div className="insp-panel-grid">
+                {panelBtn("evidence", "evidence", "layers")}
+                {panelBtn("findings", "findings", "alert")}
+              </div>
+            </div>
+            <div className="insp-panel-group" role="group" aria-label={t("insp.run.panelGroup.assets")}>
+              <span className="insp-panel-group-label">{t("insp.run.panelGroup.assets")}</span>
+              <div className="insp-panel-grid">
+                {panelBtn("credentials", "credentials", "lock")}
+                {panelBtn("pocs", "pocs", "terminal")}
+                {panelBtn("routes", "routes", "network")}
+                {panelBtn("directives", "directives", "help")}
+              </div>
+            </div>
+            <Button
+              className="insp-panel-writeup"
+              onClick={onWriteup}
+              isDisabled={running}
+              data-tooltip={running ? t("insp.run.writeupBusy") : t("insp.run.writeupHint")}
+              aria-label={`${t("panelbtn.writeup")} — ${running ? t("insp.run.writeupBusy") : t("insp.run.writeupHint")}`}
+            >
+              <span className="insp-panel-writeup-icon"><Icon name="pencil" size={15} /></span>
+              <span className="insp-panel-writeup-copy">
+                <strong>{t("panelbtn.writeup")}</strong>
+                <small>{running ? t("insp.run.writeupBusy") : t("insp.run.writeupHint")}</small>
+              </span>
+              <Icon name="chevronRight" size={14} />
+            </Button>
           </div>
         )}
       </section>

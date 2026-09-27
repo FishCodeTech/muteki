@@ -1,31 +1,48 @@
 {
   "name": "muteki-command-deck",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "private": true,
-  "description": "Project Muteki web command deck — a conversation-first frontend over the agent SSE stream with a live fact graph, blackboard, worker dock, and HITL controls.",
+  "type": "module",
+  "description": "Project Muteki web command deck — a conversation-first frontend with a live agent collaboration map, evidence views, worker controls, and HITL operations.",
   "scripts": {
     "dev": "next dev -p 3001",
     "build": "next build",
     "start": "next start -p 3001",
-    "lint": "next lint"
+    "lint": "eslint . --ext .js,.mjs,.ts,.tsx",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@heroui/react": "3.2.4",
+    "@heroui/styles": "3.2.4",
+    "@tanstack/react-virtual": "^3.14.13",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/xterm": "^5.5.0",
     "@xyflow/react": "^12.11.0",
-    "animejs": "^4.5.0",
-    "cytoscape": "^3.30.2",
-    "cytoscape-cola": "^2.5.1",
-    "cytoscape-dagre": "^2.5.0",
-    "next": "^14.2.5",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "clsx": "^2.1.1",
+    "katex": "0.18.9",
+    "lucide-react": "^1.34.0",
+    "motion": "^13.4.4",
+    "next": "15.5.24",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "6.0.0",
+    "shiki": "^4.4.3",
+    "tailwind-merge": "^3.7.0"
   },
   "devDependencies": {
-    "@types/cytoscape": "^3.21.8",
+    "@tailwindcss/postcss": "^4.3.3",
     "@types/node": "^20.14.0",
-    "@types/react": "^18.3.3",
-    "@types/react-dom": "^18.3.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "eslint": "^8.57.1",
+    "eslint-config-next": "^15.5.24",
+    "react-test-renderer": "19.2.8",
+    "tailwindcss": "^4.3.3",
     "typescript": "^5.5.3"
+  },
+  "overrides": {
+    "postcss": "8.5.26"
   }
 }

@@ -109,12 +109,11 @@ def distill(graph: SolveGraph, *, winner: Optional[str] = None,
     """Build a generalizable Template from a solved SolveGraph.
 
     Steps come from confirmed hypotheses (the lines of attack that worked) plus
-    the ordered confirmed evidence facts (the breadcrumb trail), lightly
-    sanitized. The flag value is intentionally excluded.
+    the ordered confirmed evidence facts (the breadcrumb trail), including
+    exact recovered values.
 
     G: when `per_flag_chains` is supplied (multi-flag, from the event log), each
-    flag's own proof path is recorded under a SANITIZED label (flag #1, #2, …) so
-    the template never stores a real flag value yet keeps the paths separable."""
+    flag's own proof path is recorded under its exact value."""
     c = graph.challenge
     kws = _keywords(f"{c.name} {c.description}")
     # category signal words bias the fingerprint
@@ -122,50 +121,40 @@ def distill(graph: SolveGraph, *, winner: Optional[str] = None,
     confirmed = [h for h in graph.hypotheses if h.status is HypothesisStatus.CONFIRMED]
     for h in confirmed:
         steps.append(h.statement.strip())
-    # add the evidence trail (objective facts), minus anything containing a flag.
-    # multi-flag: sanitize EVERY collected flag, not just the first — otherwise a
-    # not-yet-redacted flag leaks into the reusable knowledge template.
+    # add the complete evidence trail (objective facts), including flag values.
     all_flags = [f for f in (graph.flags or ([graph.flag] if graph.flag else [])) if f]
 
-    def _sanitize(fact: str) -> str:
-        for fl in all_flags:
-            if fl in fact:
-                fact = fact.replace(fl, "<FLAG>")
-        return fact
-
     for ev in graph.evidence:
-        fact = _sanitize(ev.fact.strip())
+        fact = ev.fact.strip()
         if fact and fact not in steps:
             steps.append(fact)
     # keep it tight
     steps = steps[:12]
     # P-E: the evidence chain = the ordered VERIFIED fact trail (the proof path),
-    # flag-sanitized. Falls back to all evidence if none are marked verified
+    # Falls back to all evidence if none are marked verified
     # (e.g. a private-graph distill that never went through the gate).
     verified_ev = [ev for ev in graph.evidence if getattr(ev, "verified", False)]
     chain_src = verified_ev if verified_ev else list(graph.evidence)
     chain: list[str] = []
     for ev in chain_src:
-        fact = _sanitize(ev.fact.strip())
+        fact = ev.fact.strip()
         if fact and fact not in chain:
             chain.append(fact)
     # G: per-flag chains — only meaningful for a genuine multi-flag solve (≥2 flags).
-    # Sanitize each chain's fact texts AND relabel the flag key to "flag #N" so a
-    # real flag value never lands in the reusable template.
+    # Preserve each chain's fact texts and exact flag key.
     flag_chains: dict[str, list[str]] = {}
     if per_flag_chains and len(all_flags) >= 2:
         # preserve discovery order: index flags by their position in all_flags
         order = {fl: i for i, fl in enumerate(all_flags)}
         for fl, fchain in sorted(per_flag_chains.items(),
                                  key=lambda kv: order.get(kv[0], 1_000)):
-            label = f"flag #{order.get(fl, len(flag_chains)) + 1}"
-            sanitized = []
+            facts = []
             for fact in fchain:
-                s = _sanitize((fact or "").strip())
-                if s and s not in sanitized:
-                    sanitized.append(s)
-            if sanitized:
-                flag_chains[label] = sanitized[:12]
+                text = (fact or "").strip()
+                if text and text not in facts:
+                    facts.append(text)
+            if facts:
+                flag_chains[fl] = facts[:12]
     return Template(
         name=c.name or c.id,
         category=c.category,

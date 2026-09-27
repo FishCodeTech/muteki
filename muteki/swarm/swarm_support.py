@@ -9,7 +9,6 @@ call sites (`muteki.swarm.swarm._ensure_blackboard_skill_links`,
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -28,26 +27,78 @@ _PENDING_HELP_MAX = 16
 
 
 class WorkerBudgetExhausted(RuntimeError):
+    """A Worker admission was rejected by a configured resource boundary.
+
+    The worker-count boundary closes further admissions and drains active work;
+    cost exhaustion remains a terminal run-level boundary.
+    """
     pass
 
 
 class WorkerSpawnRejected(RuntimeError):
     """A worker spawn was rejected for a recoverable reason (no available profile
     for the engine/role) BEFORE any budget was consumed. Distinct from
-    WorkerBudgetExhausted (a terminal run-level cap) — the coordinator skips this
-    one spawn and keeps going, and crucially the spawn-count budget is NOT charged
+    WorkerBudgetExhausted (an admission/resource boundary) — the coordinator
+    handles its specific budget kind, and crucially the spawn-count budget is NOT charged
     (the worker was never created). Spawn sites catch this and emit
     worker_spawn_rejected instead of crashing the loop on a bare RuntimeError."""
     pass
 
 
 class RequiredContextUnavailable(WorkerSpawnRejected):
-    """An exact operator continuation is temporarily not deliverable.
+    """An exact operator continuation is not deliverable at this spawn.
 
-    The intent must remain open, but it must not head-of-line block unrelated
-    intents while its secret/context dependency is repaired.
+    The intent stays status='open' for audit, but the dispatch stage blocks it
+    (dispatch_state='blocked') so it neither re-enters the spawn/reject loop
+    nor head-of-line blocks unrelated intents while its secret/context
+    dependency is repaired; an explicit reopen re-activates it.
     """
     pass
+
+
+class ContextCapabilityUnavailable(WorkerSpawnRejected):
+    """No healthy candidate can satisfy this intent's context/role capability.
+
+    Raised by engine selection when the eligible pool empties for a STANDING
+    configuration reason — the final prompt would carry a secret reference no
+    candidate can deliver over a secure transport, or review/verifier duty has
+    no explicitly eligible profile and the fallback policy flag is off.
+    ``missing`` names the unmet capabilities (e.g. "secure_prompt_transport").
+    Unlike generic engine scarcity (transient → requeue), the dispatch stage
+    blocks the intent instead of re-offering it.
+    """
+
+    def __init__(self, message: str, *, missing: "Optional[list[str]]" = None):
+        super().__init__(message)
+        self.missing = [str(m) for m in (missing or []) if str(m or "").strip()]
+
+
+def spawn_reject_should_emit(
+    holder: object,
+    *,
+    reason: str,
+    phase: str = "",
+    engine: str = "",
+    capacity: tuple = (),
+) -> bool:
+    """Emit one worker_spawn_rejected event per semantic key and capacity.
+
+    Identical reason/phase/engine under the same capacity fingerprint is counted
+    on ``holder._spawn_reject_repeat`` and does not enter the model blackboard.
+    """
+    current_capacity = tuple(capacity)
+    if getattr(holder, "_spawn_reject_capacity", None) != current_capacity:
+        holder._spawn_reject_capacity = current_capacity
+        holder._spawn_reject_emit_keys = set()
+    key = (str(reason or ""), str(phase or ""), str(engine or ""))
+    seen = getattr(holder, "_spawn_reject_emit_keys", set())
+    if key in seen:
+        holder._spawn_reject_repeat = int(getattr(holder, "_spawn_reject_repeat", 0) or 0) + 1
+        return False
+    seen.add(key)
+    holder._spawn_reject_emit_key = (*key, current_capacity)
+    holder._spawn_reject_repeat = 0
+    return True
 
 
 class ControlShutdownIncomplete(RuntimeError):

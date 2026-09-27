@@ -19,24 +19,20 @@ Design (A+B+C+D):
 - (B) Intent claiming is a single atomic UPDATE guarded by `changes()` — zero
   TOCTOU window (used once the reasoner dispatches intents).
 
-Invariant: the flag-acceptance gate stays a separate, hardcoded `_flag_ok` — it
-is NEVER reachable as a pluggable verifier here.
+Invariant: only an explicit model ``submit-flag`` declaration reaches
+``flag_found``. The graph does not inspect the submitted value.
 """
 
 from __future__ import annotations
 
 import json
-import hashlib
-import re
 import sqlite3
 import threading
 import time
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Optional, Protocol, runtime_checkable
 
-from muteki.models.solve_graph import Challenge, Evidence, SolveGraph
-from muteki.solver.result_codes import is_genuine_giveup
+from muteki.models.solve_graph import Challenge, SolveGraph
 
 
 # Event-type vocabulary, lifecycle-state sets, and the stateless lane/fact helpers
@@ -45,6 +41,9 @@ from muteki.solver.result_codes import is_genuine_giveup
 # unchanged.
 from muteki.swarm.graph_defs import (  # noqa: E402,F401
     EV_FACT_ADDED,
+    EV_FACT_OBSERVED,
+    EV_FACT_PROMOTED,
+    EV_OBSERVATION_ADDED,
     EV_HYP_PROPOSED,
     EV_HYP_REFUTED,
     EV_DEAD_END,
@@ -71,6 +70,7 @@ from muteki.swarm.graph_defs import (  # noqa: E402,F401
     EV_ROUTE_SUPPRESSED,
     EV_ROUTE_REOPENED,
     EV_BRANCH_SPLIT,
+    EV_BRANCH_FACTS_BOUND,
     EV_BRANCH_RESOLVED,
     EV_COORDINATOR_DIRECTIVE,
     EV_REVIEW_PROPOSAL,
@@ -90,6 +90,16 @@ from muteki.swarm.graph_defs import (  # noqa: E402,F401
     EV_RESOURCE_LOCKED,
     EV_RESOURCE_RELEASED,
     EV_GRAPH_COMPACTED,
+    EV_WORKER_RESULT_COMMITTED,
+    EV_CAPABILITY_PUBLISHED,
+    EV_CAPABILITY_RETIRED,
+    EV_CAPABILITY_GAP_REPORTED,
+    EV_ACCESS_PATH_PUBLISHED,
+    EV_ACCESS_PATH_STATE_CHANGED,
+    EV_RUNTIME_RESOURCE_REGISTERED,
+    EV_RUNTIME_RESOURCE_STATE_CHANGED,
+    EV_VALUE_RECEIPT,
+    SEMANTIC_GRAPH_KINDS,
     FACT_STATE_UNRESOLVED,
     FACT_STATE_CHALLENGED,
     FACT_STATE_REVALIDATED,
@@ -102,6 +112,7 @@ from muteki.swarm.graph_defs import (  # noqa: E402,F401
     INTENT_DISPATCH_RESUME,
     INTENT_DISPATCH_RETIRED,
     INTENT_DISPATCH_CLOSED,
+    INTENT_DISPATCH_BLOCKED,
     _INTENT_DISPATCH_STATES,
     _SERVICE_DEFAULT_PORTS,
     _LANE_RISK_CLASSES,
@@ -122,23 +133,40 @@ class SharedGraph(Protocol):
                      artifact_id: Optional[str] = None, verified: bool = False,
                      confidence: float = 1.0, witness: Optional[str] = None,
                      verifier: str = "", route_hash: str = "",
-                     intent_id: Optional[str] = None) -> int: ...
+                     intent_id: Optional[str] = None,
+                     provenance: Optional[dict[str, Any]] = None,
+                     subject: str = "", predicate: str = "",
+                     object_value: Any = None, scope: str = "",
+                     canonical_key: str = "") -> int: ...
 
-    def add_dead_end(self, *, actor: str, reason: str) -> int: ...
+    def add_dead_end(self, *, actor: str, reason: str, intent_id: str = "",
+                     route_hash: str = "", coverage_key: str = "",
+                     target_epoch: str = "", tested_scope: str = "",
+                     observed_result: str = "") -> int: ...
 
     def flag_found(self, *, actor: str, flag: str,
                    artifact_id: Optional[str] = None,
-                   intent_id: Optional[str] = None) -> int: ...
+                   intent_id: Optional[str] = None,
+                   complete_intent: bool = False) -> int: ...
 
     def flag_submission(
         self, *, actor: str, submission_id: str, flag: str,
         intent_id: Optional[str] = None,
+        protocol: str = "blackboard-api-v1",
     ) -> int: ...
 
     def flag_submission_decision(
         self, *, actor: str, submission_id: str, accepted: bool,
         code: str, detail: str = "",
     ) -> int: ...
+
+    def resolve_flag_submission(
+        self, *, actor: str, submission_id: str, flag: str,
+        intent_id: Optional[str] = None,
+        protocol: str = "blackboard-api-v1",
+        accepted: bool, code: str, detail: str = "",
+        ensure_submission: bool = True,
+    ) -> dict[str, Any]: ...
 
     def finding_found(self, *, actor: str, finding: dict,
                       artifact_id: Optional[str] = None,
@@ -150,10 +178,12 @@ class SharedGraph(Protocol):
                        payload: Optional[dict] = None,
                        from_fact_seqs: Optional[list[int]] = None) -> int: ...
 
-    def claim_intent(self, *, worker: str, intent_id: str,
-                     lease_s: float = 300.0) -> bool: ...
+    def start_intent(self, *, actor: str, worker: str, intent_id: str,
+                     goal: str, worker_class: str = "code") -> bool: ...
 
-    def query_legacy_candidates(self, *, now: float) -> list[dict]: ...
+    def claim_intent(self, *, worker: str, intent_id: str) -> bool: ...
+
+    def query_legacy_candidates(self) -> list[dict]: ...
 
     def apply_legacy_lane_inferences(
         self, *, inferences: list[tuple[str, str, str]],
@@ -162,7 +192,14 @@ class SharedGraph(Protocol):
     def release_intent_claim(self, *, worker: str, intent_id: str,
                              reason: str = "") -> bool: ...
 
+    def block_intent_context(self, *, actor: str, intent_id: str,
+                             missing: list[str], reason: str = "") -> bool: ...
+
     def intent_claim_state(self, intent_id: str) -> dict[str, str]: ...
+
+    def claimed_intent_successor(
+        self, *, worker: str, intent_id: str,
+    ) -> dict[str, Any]: ...
 
     def terminalize_intent_claim(
         self, *, worker: str, intent_id: str, reason: str = "",
@@ -184,17 +221,42 @@ class SharedGraph(Protocol):
     def conclude_poc(self, *, actor: str, poc_id: str,
                      status: str = "spent", note: str = "") -> int: ...
 
+    def commit_worker_result(self, *, actor: str, worker_id: str,
+                             intent_id: Optional[str], target_epoch: str = "",
+                             run_id: str = "", status: str,
+                             checkpoint_id: str = "",
+                             result_detail: str = "",
+                             produced_new_info: bool = False,
+                             stop_condition_result: str = "",
+                             handoff_missing: bool = False,
+                             observations: Optional[list[dict]] = None,
+                             dead_ends: Optional[list[dict]] = None,
+                             pocs: Optional[list[dict]] = None,
+                             artifacts: Optional[list[str]] = None,
+                             need_input: Optional[dict] = None,
+                             conclude: bool = True,
+                             successor_intent_id: str = "") -> dict: ...
+
     def supersede_open_intents(self, *, actor: str, match: str,
-                               reason: str = "") -> list[str]: ...
+                               reason: str = "",
+                               exclude_ids: Optional[list[str]] = None) -> list[str]: ...
+
+    def supersede_open_intent_ids(self, *, actor: str,
+                                  intent_ids: list[str],
+                                  reason: str = "") -> list[str]: ...
+
+    def reprioritize_open_intents(self, *, actor: str,
+                                  priorities: dict[str, str]) -> list[str]: ...
 
     def add_review_finding(self, *, actor: str, kind: str, severity: str,
                            summary: str, evidence_seqs: Optional[list[int]] = None,
                            intent_ids: Optional[list[str]] = None,
                            route_hash: str = "", branch_id: str = "",
-                           recommended_actions: Optional[list[str]] = None) -> int: ...
+                           recommended_actions: Optional[list[str]] = None,
+                           worker: str = "") -> int: ...
 
-    def add_review_proposal(self, *, actor: str, marker: str, payload: dict,
-                            tier: str = "tier1") -> int: ...
+    def add_review_proposal(self, *, actor: str, marker: str,
+                            payload: dict) -> int: ...
 
     def decide_review_proposal(self, *, actor: str, proposal_seq: int,
                                decision: str, reason: str = "",
@@ -219,7 +281,35 @@ class SharedGraph(Protocol):
 
     def active_candidates(self) -> list[dict]: ...
 
+    def observations(self, *, limit: int = 200,
+                     unadmitted_only: bool = False) -> list[dict]: ...
+
     def verified_evidence(self) -> list[dict]: ...
+
+    def verified_fact_rows(self, *, limit: int = 200) -> list[dict]: ...
+
+    def publish_capability(self, **kwargs: Any) -> int: ...
+
+    def active_capabilities(self, target_epoch: str = "") -> list[dict[str, Any]]: ...
+
+    def active_capability_keys(self, target_epoch: str = "") -> set[str]: ...
+
+    def report_capability_gap(self, **kwargs: Any) -> Optional[dict[str, Any]]: ...
+
+    def open_capability_gaps(self, target_epoch: str = "") -> list[dict[str, Any]]: ...
+
+    def register_runtime_resource(self, **kwargs: Any) -> int: ...
+
+    def publish_access_path(self, **kwargs: Any) -> int: ...
+
+    def active_access_paths(self, *, target_epoch: str = "",
+                            required_capabilities: Optional[list[str]] = None,
+                            ) -> list[dict[str, Any]]: ...
+
+    def refresh_access_path_health(self, **kwargs: Any) -> list[dict[str, Any]]: ...
+
+    def stop_runtime_resources(self, *, actor: str = "coordinator",
+                               target_epoch: str = "") -> int: ...
 
     def suppress_route(self, *, actor: str, route_hash: str, label: str = "",
                        reason: str = "", until: str = "new_evidence",
@@ -229,7 +319,11 @@ class SharedGraph(Protocol):
                      intent_goal: str = "") -> dict: ...
 
     def split_branch(self, *, actor: str, title: str,
-                     branches: list[dict[str, Any]]) -> dict: ...
+                     branches: list[dict[str, Any]],
+                     parent_id: str = "") -> dict: ...
+
+    def bind_open_branch_facts(self, *, actor: str, source_intent: str,
+                               fact_seqs: list[int]) -> dict: ...
 
     def resolve_branch(self, *, actor: str, branch_id: str, reason: str = "",
                        status: str = "resolved") -> dict: ...
@@ -328,11 +422,20 @@ class SharedGraph(Protocol):
 
     def compact_epochs(self) -> list[dict]: ...
 
+    def record_reason_context_compaction(
+        self, *, actor: str, cutoff_seq: int, summary: str,
+        tokens_before: int,
+    ) -> dict: ...
+
     def revive_resume_intents(self, *, actor: str = "coordinator") -> list[str]: ...
 
     def prior_intent_count(self) -> int: ...
 
     def to_review_summary(self) -> str: ...
+
+    def to_review_projection(self, *, fact_seqs: Optional[list[int]] = None,
+                             since_seq: int = 0, directive: str = "",
+                             limit_facts: int = 60) -> str: ...
 
     def suppressed_routes(self) -> list[dict]: ...
 
@@ -353,10 +456,41 @@ class SharedGraph(Protocol):
     def events(self) -> list[dict]: ...
     def events_since(self, after_seq: int, kinds: Optional[list[str]] = None) -> list[dict]: ...
 
+    def semantic_graph_watermark(self) -> int: ...
+
+    def open_coverage_keys(self) -> list[str]: ...
+
+    def active_coverage_keys(self) -> list[str]: ...
+
+    def active_lane_intent_rows(self) -> list[dict]: ...
+
+    def equivalent_step_keys(self) -> set[tuple]: ...
+
+    def equivalent_lane_source_keys(self) -> set[tuple[str, tuple[int, ...]]]: ...
+
     def to_summary(self, max_evidence: int = 16,
                    max_dead_ends: Optional[int] = None) -> str: ...
 
-    def to_reason_summary(self, standing_guidance: Optional[list[str]] = None) -> str: ...
+    def to_reason_summary(
+        self, standing_guidance: Optional[list[str]] = None, *,
+        include_lineage: bool = False, compact_summary: str = "",
+        compact_cutoff_seq: int = 0,
+    ) -> str: ...
+
+    def to_ctf_graph_yaml(self) -> str: ...
+
+    def reason_compaction_cutoff(
+        self, keep_recent_tokens: int, *, after_seq: int = 0,
+    ) -> int: ...
+
+    def dead_ends_for_context(self, *, intent_id: str = "", coverage_key: str = "",
+                              route_hash: str = "", target_epoch: str = "",
+                              limit: int = 10**9, epoch_wide: bool = False) -> list[dict]: ...
+
+    def dead_ends_context_block(self, *, intent_id: str = "", coverage_key: str = "",
+                                route_hash: str = "", target_epoch: str = "",
+                                limit: int = 10**9, title: str = "",
+                                epoch_wide: bool = False) -> str: ...
 
     def to_board_markdown(self) -> str: ...
 
@@ -367,6 +501,8 @@ class SharedGraph(Protocol):
     def open_route_hashes(self) -> list[str]: ...
 
     def barren_concluded_goal_texts(self) -> list[str]: ...
+
+    def intent_source_facts(self, intent_id: str) -> list[dict]: ...
 
     def pin_facts(self, *, actor: str, fact_seqs: list[int],
                   reason: str = "") -> list[int]: ...
@@ -398,6 +534,7 @@ from muteki.swarm.graph_locks import _LanesLocksMixin  # noqa: E402
 from muteki.swarm.graph_intents import _IntentsPocsMixin  # noqa: E402
 from muteki.swarm.graph_views import _QueriesViewsMixin  # noqa: E402
 from muteki.swarm.graph_render import _RenderMixin  # noqa: E402
+from muteki.swarm.graph_capabilities import _CapabilitiesMixin  # noqa: E402
 
 
 class SQLiteSharedGraph(
@@ -406,6 +543,7 @@ class SQLiteSharedGraph(
     _RoutesDirectivesMixin,
     _LanesLocksMixin,
     _IntentsPocsMixin,
+    _CapabilitiesMixin,
     _QueriesViewsMixin,
     _RenderMixin,
 ):
@@ -461,6 +599,22 @@ class SQLiteSharedGraph(
             "ALTER TABLE intents ADD COLUMN lane_deferrals INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE intents ADD COLUMN deferred_against_locked_seq INTEGER",
             "ALTER TABLE intents ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE intents ADD COLUMN requested_priority TEXT",
+            "ALTER TABLE intents ADD COLUMN priority_reason TEXT",
+            "ALTER TABLE intents ADD COLUMN value_claim_json TEXT",
+            "ALTER TABLE intents ADD COLUMN novelty_key TEXT",
+            "ALTER TABLE intents ADD COLUMN requires_capabilities_json TEXT",
+            "ALTER TABLE intents ADD COLUMN required_pocs_json TEXT",
+        ):
+            try:
+                self._conn.execute(ddl)
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass
+        for ddl in (
+            "ALTER TABLE runtime_resources ADD COLUMN cwd TEXT",
+            "ALTER TABLE runtime_resources ADD COLUMN env_json TEXT",
+            "ALTER TABLE runtime_resources ADD COLUMN cleanup_command TEXT",
         ):
             try:
                 self._conn.execute(ddl)
@@ -495,14 +649,59 @@ class SQLiteSharedGraph(
             # (JSON: effect_types/expected_artifacts/confidence).
             self._conn.execute("ALTER TABLE intents ADD COLUMN declares_json TEXT")
             self._conn.commit()
+        for ddl in (
+            "ALTER TABLE intents ADD COLUMN expected_observable TEXT",
+            "ALTER TABLE intents ADD COLUMN stop_condition TEXT",
+            "ALTER TABLE intents ADD COLUMN coverage_key TEXT",
+        ):
+            try:
+                self._conn.execute(ddl)
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass
+        for ddl in (
+            "ALTER TABLE branches ADD COLUMN source_intent TEXT",
+            "ALTER TABLE branches ADD COLUMN from_facts_json TEXT",
+            "ALTER TABLE branches ADD COLUMN expected_observable TEXT",
+            "ALTER TABLE branches ADD COLUMN stop_condition TEXT",
+            "ALTER TABLE branches ADD COLUMN coverage_key TEXT",
+            "ALTER TABLE branches ADD COLUMN route_hash TEXT",
+            "ALTER TABLE branches ADD COLUMN lane_key TEXT",
+            "ALTER TABLE branches ADD COLUMN risk_class TEXT",
+            "ALTER TABLE branches ADD COLUMN resource_key TEXT",
+        ):
+            try:
+                self._conn.execute(ddl)
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass
         try:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_intents_dispatch "
                 "ON intents(challenge_id, dispatch_state, status, priority, created_seq)"
             )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intents_novelty "
+                "ON intents(challenge_id, novelty_key, dispatch_state, status)"
+            )
             self._conn.commit()
         except sqlite3.OperationalError:
             pass
+        # Old planners could label arbitrary queued work high.  On first open,
+        # remove that inherited scheduling authority unless a structured claim
+        # exists; operator-directed rows retain their explicit priority.
+        self._conn.execute(
+            "UPDATE intents SET requested_priority='high', priority=0, "
+            "priority_reason='legacy_high_missing_value_claim' "
+            "WHERE challenge_id=? AND priority>=50 "
+            "AND COALESCE(value_claim_json,'')='' "
+            "AND COALESCE(directive_id,'')='' "
+            "AND worker_class IN ('code','shell_agent','review')",
+            (self.challenge.id,),
+        )
+        self._conn.commit()
+        self._last_observation_seq = 0
+        self.migrate_legacy_candidates()
 
     def _table_exists(self, name: str) -> bool:
         with self._lock:
@@ -562,23 +761,54 @@ class SQLiteSharedGraph(
             self._conn.close()
 
     # ── append (C: INSERT only) ─────────────────────────────────────────
+    def _append_locked(self, kind: str, actor: str, payload: dict, *,
+                       artifact_id: Optional[str] = None, verified: bool = False,
+                       confidence: float = 1.0,
+                       dedupe_key: Optional[str] = None) -> int:
+        """INSERT one event with ``self._lock`` already held and NO commit — the
+        caller owns the transaction boundary (single-writer paths commit right
+        away via ``_append``; ``commit_worker_result`` batches many writes into
+        one commit). Same IntegrityError→-1 dedupe semantics as ``_append`` but
+        without the rollback, so a dedupe collision inside a larger transaction
+        does not discard the caller's earlier writes."""
+        try:
+            cur = self._conn.execute(
+                "INSERT INTO events "
+                "(ts, challenge_id, actor, kind, payload, artifact_id, "
+                " verified, confidence, dedupe_key) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (time.time(), self.challenge.id, actor, kind,
+                 json.dumps(payload, default=str), artifact_id,
+                 int(verified), float(confidence), dedupe_key),
+            )
+            return int(cur.lastrowid or 0)
+        except sqlite3.IntegrityError:
+            return -1
+
     def _append(self, kind: str, actor: str, payload: dict, *,
                 artifact_id: Optional[str] = None, verified: bool = False,
                 confidence: float = 1.0, dedupe_key: Optional[str] = None) -> int:
         with self._lock:
-            try:
-                cur = self._conn.execute(
-                    "INSERT INTO events "
-                    "(ts, challenge_id, actor, kind, payload, artifact_id, "
-                    " verified, confidence, dedupe_key) "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
-                    (time.time(), self.challenge.id, actor, kind,
-                     json.dumps(payload, default=str), artifact_id,
-                     int(verified), float(confidence), dedupe_key),
-                )
-                self._conn.commit()
-                return int(cur.lastrowid or 0)
-            except sqlite3.IntegrityError:
+            seq = self._append_locked(
+                kind, actor, payload, artifact_id=artifact_id,
+                verified=verified, confidence=confidence, dedupe_key=dedupe_key)
+            if seq < 0:
                 # dedupe_key collision → same event already appended; no-op.
                 self._conn.rollback()
-                return -1
+            else:
+                self._conn.commit()
+            return seq
+
+
+# ── GRAPH-01: GraphService adapter 接线（新增，不改变既有行为） ──────────────
+def open_graph_service(*, db_path: str | Path, challenge: Challenge,
+                       artifacts: Any = None) -> Any:
+    """以 GraphService 接口（ctf.shared_graph.v1）打开本 Challenge 的 SharedGraph。
+
+    薄 Adapter：append/snapshot/claim/lease 映射到 SQLiteSharedGraph 现有 API，
+    历史数据库无迁移即可继续读写；现有 Protocol、SQLiteSharedGraph 与
+    blackboard 行为完全不变。延迟导入避免 graphs → swarm 的循环依赖。
+    """
+    from muteki.graphs.ctf_shared_graph import CtfSharedGraphService
+    return CtfSharedGraphService.open(
+        db_path=db_path, challenge=challenge, artifacts=artifacts)

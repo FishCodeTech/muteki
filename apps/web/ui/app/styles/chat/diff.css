@@ -1,0 +1,278 @@
+/* Chat workbench: diff. Rules are prefixed `.cx-` and never target other pages. */
+
+.cx-diff-list {
+  container-type: inline-size;
+  --cx-diff-num: 5ch;
+  --cx-diff-marker: 18px;
+  background: var(--cx-bg);
+  font-family: var(--cx-font-mono);
+  font-size: 12px;
+  line-height: 20px;
+  color: var(--cx-fg-2);
+  overscroll-behavior: contain;
+}
+.cx-diff-list.is-dragging { user-select: none; cursor: ns-resize; }
+
+.cx-diff-sizer { position: relative; }
+.cx-diff-vrow { position: absolute; top: 0; left: 0; width: 100%; }
+
+/* Header / hunk / notice content stays pinned to the viewport while code scrolls sideways. */
+.cx-diff-sticky-x {
+  position: sticky;
+  left: 0;
+  width: var(--cx-diff-vw, 100%);
+  max-width: 100%;
+}
+.cx-diff-list[data-wrap="false"] .cx-diff-sticky-x { max-width: none; }
+
+.cx-diff-sticky-layer {
+  position: sticky;
+  top: 0;
+  left: 0;
+  z-index: 6;
+  height: 0;
+  overflow: visible;
+}
+
+/* ── File header ─────────────────────────────────────────────────────────── */
+.cx-diff-file-header {
+  height: 36px;
+  border-top: 1px solid var(--cx-border-subtle);
+  border-bottom: 1px solid var(--cx-border-subtle);
+  background: color-mix(in srgb, var(--ink) 2.5%, var(--page));
+  font-family: var(--cx-font-sans);
+  transition: background-color var(--cx-dur) var(--cx-ease-out);
+}
+@container (max-width: 300px) {
+  .cx-diff-file-header .cx-diff-sticky-x {
+    position: relative;
+    left: auto;
+    min-width: 480px;
+  }
+  .cx-diff-file-header .cx-diff-file-actions { opacity: 1; }
+}
+.cx-diff-vrow:first-child .cx-diff-file-header { border-top-color: transparent; }
+.cx-diff-file-header.is-sticky {
+  border-top-color: transparent;
+  box-shadow: 0 6px 12px -10px hsl(var(--cx-shadow-color) / 0.35);
+}
+.cx-diff-file-header.is-flash { animation: cx-diff-flash 1.4s var(--cx-ease-out); }
+@keyframes cx-diff-flash {
+  0%, 35% { background: var(--cx-selected); }
+  100% { background: transparent; }
+}
+
+.cx-diff-file-toggle {
+  display: inline-flex;
+  height: 24px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 4px;
+  border-radius: 6px;
+  color: var(--cx-fg-3);
+  transition: background-color var(--cx-dur-fast) var(--cx-ease-out), color var(--cx-dur-fast);
+}
+.cx-diff-file-toggle:hover { background: var(--cx-hover); color: var(--cx-fg); }
+
+.cx-diff-status {
+  display: inline-grid;
+  width: 16px;
+  height: 16px;
+  place-items: center;
+  border-radius: 4px;
+  font: 600 10px/1 var(--cx-font-sans);
+  flex: none;
+}
+.cx-diff-status-add { color: var(--cx-add); background: var(--cx-add-bg); }
+.cx-diff-status-mod { color: var(--cx-warning); background: var(--cx-warning-soft); }
+.cx-diff-status-del { color: var(--cx-del); background: var(--cx-del-bg); }
+.cx-diff-status-ren { color: var(--cx-accent); background: var(--cx-accent-soft); }
+
+/* ── Hunk / fold / notices ───────────────────────────────────────────────── */
+.cx-diff-hunk {
+  height: 24px;
+  border-top: 1px solid var(--cx-border-subtle);
+  border-bottom: 1px solid var(--cx-border-subtle);
+  background: color-mix(in srgb, var(--accent) 4%, var(--page));
+  font-size: 11.5px;
+  line-height: 22px;
+}
+
+.cx-diff-fold {
+  display: block;
+  width: 100%;
+  height: 28px;
+  border-top: 1px solid var(--cx-border-subtle);
+  border-bottom: 1px solid var(--cx-border-subtle);
+  background: var(--cx-bg-subtle);
+  color: var(--cx-fg-3);
+  font: 500 12px/1 var(--cx-font-sans);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--cx-dur-fast), color var(--cx-dur-fast);
+}
+.cx-diff-fold:hover { background: var(--cx-accent-soft); color: var(--cx-accent); }
+
+.cx-diff-notice {
+  border-bottom: 1px solid var(--cx-border-subtle);
+  background: var(--cx-bg-subtle);
+  color: var(--cx-fg-3);
+  font: 12.5px/1.5 var(--cx-font-sans);
+}
+.cx-diff-notice.is-warning { background: var(--cx-warning-soft); color: var(--cx-fg-2); }
+.cx-diff-notice.is-raw { background: var(--cx-bg); }
+
+.cx-diff-end { height: 10px; }
+
+/* ── Code rows ───────────────────────────────────────────────────────────── */
+.cx-diff-line,
+.cx-diff-half {
+  --tint: transparent;
+  --tint-gutter: transparent;
+  --marker: var(--cx-fg-4);
+  position: relative;
+  display: grid;
+  min-height: 20px;
+  background: var(--tint);
+}
+.cx-diff-line { grid-template-columns: var(--cx-diff-num) var(--cx-diff-num) var(--cx-diff-marker) minmax(0, 1fr); }
+.cx-diff-half { grid-template-columns: var(--cx-diff-num) var(--cx-diff-marker) minmax(0, 1fr); min-width: 0; }
+
+.cx-diff-line.is-add,
+.cx-diff-half.is-add {
+  --tint: var(--cx-add-bg);
+  --tint-gutter: color-mix(in srgb, var(--green) 18%, transparent);
+  --marker: var(--cx-add);
+}
+.cx-diff-line.is-del,
+.cx-diff-half.is-del {
+  --tint: var(--cx-del-bg);
+  --tint-gutter: color-mix(in srgb, var(--red) 16%, transparent);
+  --marker: var(--cx-del);
+}
+
+.cx-diff-num {
+  padding-right: 8px;
+  color: var(--cx-fg-4);
+  font-size: 11px;
+  text-align: right;
+  user-select: none;
+  background: var(--tint-gutter);
+}
+.cx-diff-line.is-add .cx-diff-num,
+.cx-diff-line.is-del .cx-diff-num,
+.cx-diff-half.is-add .cx-diff-num,
+.cx-diff-half.is-del .cx-diff-num { color: color-mix(in srgb, var(--marker) 70%, var(--cx-fg-3)); }
+
+.cx-diff-marker {
+  color: var(--marker);
+  text-align: center;
+  user-select: none;
+}
+
+.cx-diff-code {
+  min-width: 0;
+  padding-right: 20px;
+  white-space: pre;
+  color: var(--cx-fg);
+  tab-size: 4;
+}
+.cx-diff-line.is-ctx .cx-diff-code,
+.cx-diff-half.is-ctx .cx-diff-code { color: var(--cx-fg-2); }
+
+.cx-diff-list[data-wrap="true"] .cx-diff-code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Unified + no-wrap: gutters stay put while long lines scroll sideways. */
+.cx-diff-list[data-mode="unified"][data-wrap="false"] .cx-diff-line > .cx-diff-num,
+.cx-diff-list[data-mode="unified"][data-wrap="false"] .cx-diff-line > .cx-diff-marker {
+  position: sticky;
+  z-index: 1;
+  background: linear-gradient(var(--tint-gutter), var(--tint-gutter)), linear-gradient(var(--tint), var(--tint)), var(--cx-bg);
+}
+.cx-diff-list[data-mode="unified"][data-wrap="false"] .cx-diff-line > .cx-diff-num:nth-child(1) { left: 0; }
+.cx-diff-list[data-mode="unified"][data-wrap="false"] .cx-diff-line > .cx-diff-num:nth-child(2) { left: var(--cx-diff-num); }
+.cx-diff-list[data-mode="unified"][data-wrap="false"] .cx-diff-line > .cx-diff-marker {
+  left: calc(var(--cx-diff-num) * 2);
+  background: linear-gradient(var(--tint), var(--tint)), var(--cx-bg);
+}
+
+.cx-diff-pair {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  min-height: 20px;
+}
+.cx-diff-half + .cx-diff-half { border-left: 1px solid var(--cx-border-subtle); }
+.cx-diff-half.is-empty {
+  background: repeating-linear-gradient(135deg, transparent 0 5px, var(--cx-border-subtle) 5px 6px);
+}
+.cx-diff-list[data-wrap="false"] .cx-diff-half { overflow: hidden; }
+
+.cx-diff-word-add { border-radius: 3px; background: var(--cx-add-bg-strong); }
+.cx-diff-word-del { border-radius: 3px; background: var(--cx-del-bg-strong); }
+
+.cx-diff-eof {
+  display: inline-grid;
+  margin-left: 6px;
+  vertical-align: -1px;
+  color: var(--cx-del);
+  opacity: 0.7;
+}
+
+/* Review selection + annotations */
+.cx-diff-line.is-selected,
+.cx-diff-half.is-selected {
+  background: linear-gradient(var(--cx-selected), var(--cx-selected)), var(--tint);
+}
+.cx-diff-line.is-selected .cx-diff-num,
+.cx-diff-half.is-selected .cx-diff-num { color: var(--cx-fg); }
+.cx-diff-line.is-annotated,
+.cx-diff-half.is-annotated { box-shadow: inset 3px 0 0 var(--cx-fg-3); }
+
+.cx-diff-comment-btn {
+  position: absolute;
+  top: 2px;
+  z-index: 3;
+  display: grid;
+  width: 16px;
+  height: 16px;
+  place-items: center;
+  border-radius: 5px;
+  background: var(--cx-accent);
+  color: var(--cx-accent-fg);
+  box-shadow: 0 1px 3px hsl(var(--cx-shadow-color) / 0.3);
+  opacity: 0;
+  transform: scale(0.8);
+  cursor: pointer;
+  transition: opacity var(--cx-dur-fast) var(--cx-ease-out), transform var(--cx-dur-fast) var(--cx-ease-out);
+}
+.cx-diff-line > .cx-diff-comment-btn { left: calc(var(--cx-diff-num) * 2 - 8px); }
+.cx-diff-half > .cx-diff-comment-btn { left: calc(var(--cx-diff-num) - 8px); }
+.cx-diff-line:hover > .cx-diff-comment-btn,
+.cx-diff-half:hover > .cx-diff-comment-btn,
+.cx-diff-comment-btn:focus-visible { opacity: 1; transform: scale(1); }
+.cx-diff-list.is-dragging .cx-diff-comment-btn { opacity: 0; }
+
+.cx-diff-comment-row {
+  border-top: 1px solid var(--cx-border-subtle);
+  border-bottom: 1px solid var(--cx-border-subtle);
+  background: var(--cx-bg-subtle);
+  font-family: var(--cx-font-sans);
+}
+.cx-diff-comment-card {
+  display: flex;
+  max-width: 680px;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 8px 8px 10px;
+  border: 1px solid var(--cx-border-subtle);
+  border-radius: 10px;
+  background: var(--cx-elevated);
+  box-shadow: var(--cx-shadow-xs);
+}
+.cx-diff-comment-card.is-stale { opacity: 0.7; border-style: dashed; }
+
+/* File tree aside */
+.cx-diff-tree-row[data-active="true"] { background: var(--cx-selected); color: var(--cx-fg); }

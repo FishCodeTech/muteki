@@ -1,5 +1,7 @@
 "use client";
 
+import { Button } from "@heroui/react";
+
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { useEngines, EngineStatus } from "@/lib/useRun";
 import { useT } from "@/lib/i18n";
@@ -108,14 +110,14 @@ export function EngineBar({ degradedEngines }: { degradedEngines?: Record<string
       className={`engine-bar ${barState}${open ? " open" : ""}${dismissed ? " dismissed" : ""}`}
       onMouseLeave={() => setDismissed(false)}
     >
-      <button
+      <Button
         type="button"
         className="engine-chip"
         aria-haspopup="true"
         aria-expanded={open}
         aria-controls={popId}
+        data-tooltip={aria}
         aria-label={aria}
-        title={aria}
         onClick={() => {
           if (open) close();
           else {
@@ -131,7 +133,7 @@ export function EngineBar({ degradedEngines }: { degradedEngines?: Record<string
         </span>
         <span className="engine-count">{summary}</span>
         {exception ? <span className="engine-exception">{exception}</span> : null}
-      </button>
+      </Button>
       <div id={popId} className="engine-pop" role="region" aria-label={t("engines.popoverTitle")}>
         <span className="engine-pop-head">
           <b>{t("engines.popoverTitle")}</b>

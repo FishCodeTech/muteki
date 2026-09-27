@@ -1,9 +1,11 @@
 "use client";
 
+import { MotionIcon } from "@/components/MotionIcon";
+
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import {
-  ChatMessage, DeckState, HitlRequest, SolverCost, SwarmDigest,
+  ChatMessage, DeckState, HitlRequest, ProgressBrief, ProgressBriefItem, SwarmDigest,
   coordinatorThread, hitlDeliveryState, swarmDigest,
 } from "@/lib/events";
 import { getWorkerSettings, checkAuth, SavedFile } from "@/lib/useRun";
@@ -11,22 +13,22 @@ import {
   commandIdForDecision, type DecisionControlAction,
 } from "@/lib/controlClient";
 import { useT, useLang } from "@/lib/i18n";
+import { formatClock, formatElapsed, toEpochMs } from "@/lib/format";
 import { EngineBar } from "@/components/EngineBar";
 import { Icon, type IconName } from "@/components/Icon";
-import { SelectionGlider } from "@/components/SelectionGlider";
 import { RunInspector } from "@/components/RunInspector";
-import { CopyText } from "@/components/CopyText";
+import { RunSignalsStrip } from "@/components/RunSignalsStrip";
 import { NumberField } from "@/components/NumberField";
 import { reportToMarkdown } from "@/lib/reportMarkdown";
 import { useCopied } from "@/lib/useCopied";
-import { InspectorSkeleton, SkelLine } from "@/components/Skeleton";
+import { Accordion, Button, Chip, Input, Label, ListBox, ListBoxItem, Popover, Select, Skeleton, Spinner, Tabs, TextArea } from "@heroui/react";
 import type { ArtifactView } from "@/lib/events";
 
 /**
  * The conversation spine (the redesign's centre column): a ChatGPT/Claude-style
  * thread between the operator and the COORDINATOR (DeepSeek `reason`). It owns
  * the welcome/dispatch state and the dual-mode composer. The worker firehose,
- * fact-graph and blackboard live in the persistent right-column RunInspector
+ * fact-graph and blackboard live in the collapsible right-column RunInspector
  * and the peer runtime workspace. The deck stays a dumb subscriber.
  *
  * i18n: static UI is translated; agent-produced text renders verbatim. Only
@@ -49,6 +51,7 @@ export interface DispatchOpts {
   // worker isolation: when true, the run uses a controlled Docker runtime that
   // can't read the host challenge-source tree. Default false = host subprocess.
   containerMode?: boolean;
+  allowOperatorInput: boolean;
   raceTimeout?: number;
   wallClockBudget?: number;
   maxTotalWorkers?: number;
@@ -63,10 +66,7 @@ export interface ControlCommandOpts {
 
 // RUNNING — steer the live swarm:
 const QUICK_RUNNING: Array<{ key: string; labelKey: string; tipKey: string; icon: IconName }> = [
-  { key: "hint", labelKey: "quick.hint", tipKey: "quick.hint.tip", icon: "help" },
-  { key: "directive", labelKey: "quick.directive", tipKey: "quick.directive.tip", icon: "pencil" },
-  { key: "redirect", labelKey: "quick.redirect", tipKey: "quick.redirect.tip", icon: "network" },
-  { key: "focus", labelKey: "quick.focus", tipKey: "quick.focus.tip", icon: "target" },
+  { key: "directive", labelKey: "quick.directive", tipKey: "quick.directive.tip", icon: "target" },
   { key: "pause", labelKey: "quick.pause", tipKey: "quick.pause.tip", icon: "pause" },
   { key: "freeze", labelKey: "quick.freeze", tipKey: "quick.freeze.tip", icon: "lock" },
   { key: "thaw", labelKey: "quick.thaw", tipKey: "quick.thaw.tip", icon: "play" },
@@ -78,6 +78,7 @@ const INSPECTOR_WIDTH_DEFAULT = 360;
 const INSPECTOR_WIDTH_MIN = 300;
 const INSPECTOR_WIDTH_MAX = 560;
 const INSPECTOR_WIDTH_STORAGE_KEY = "muteki.runInspector.width";
+const INSPECTOR_OPEN_STORAGE_KEY = "muteki.runInspector.open";
 
 function inspectorWidthMax(viewportWidth?: number): number {
   if (!viewportWidth || viewportWidth <= 0) return INSPECTOR_WIDTH_MAX;
@@ -90,12 +91,7 @@ function clampInspectorWidth(width: number, viewportWidth?: number): number {
 }
 
 function clock(ts: number): string {
-  if (!ts) return "";
-  const ms = ts < 1e12 ? ts * 1000 : ts;
-  const d = new Date(ms);
-  if (isNaN(d.getTime())) return "";
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  return formatClock(ts, "");
 }
 
 function fmtSize(n: number): string {
@@ -104,20 +100,15 @@ function fmtSize(n: number): string {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-/** event ts (seconds or ms) → ms. */
-function tsMs(ts: number): number {
-  return ts < 1e12 ? ts * 1000 : ts;
-}
-
-/** Compact elapsed: "M:SS" under an hour, "H:MM:SS" beyond. */
-function fmtDuration(ms: number): string {
-  if (!isFinite(ms) || ms < 0) ms = 0;
-  const total = Math.floor(ms / 1000);
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-  const p = (n: number) => String(n).padStart(2, "0");
-  return h > 0 ? `${h}:${p(m)}:${p(s)}` : `${m}:${p(s)}`;
+function getCategoryColor(category?: string): "default" | "accent" | "warning" | "danger" | "success" {
+  if (!category) return "default";
+  const cat = category.toLowerCase().trim();
+  if (["web", "websec", "api", "cloud"].includes(cat)) return "accent";
+  if (["pwn", "binary", "exp", "exploit", "rev", "reverse"].includes(cat)) return "danger";
+  if (["crypto", "cryptography", "math", "algo"].includes(cat)) return "warning";
+  if (["forensics", "stego", "defense", "incident"].includes(cat)) return "success";
+  if (["misc", "ai", "hardware", "iot", "blockchain", "pentest"].includes(cat)) return "accent";
+  return "default";
 }
 
 /** Live run duration: ticks every second while the run is open, freezes at
@@ -134,8 +125,8 @@ function useElapsed(startedAt?: number, finishedAt?: number, freeze = false): st
     return () => clearInterval(id);
   }, [live]);
   if (startedAt == null) return "";
-  const end = finishedAt != null ? tsMs(finishedAt) : (freezeRef.current ?? now);
-  return fmtDuration(end - tsMs(startedAt));
+  const end = finishedAt != null ? toEpochMs(finishedAt) : (freezeRef.current ?? now);
+  return formatElapsed(end - toEpochMs(startedAt));
 }
 
 function phaseLabel(phase: SwarmDigest["phase"], t: (k: string) => string): string {
@@ -196,16 +187,16 @@ function CoordBubble({
       <div className="who">
         {who} <span className="k">{t(`msg.kind.${m.kind}`)}</span>
         {copyable && (
-          <button
-            type="button"
+          <Button
+            size="sm"
+            variant="ghost"
             className={`coord-copy ${copied ? "copied" : ""}`}
-            onClick={() => copy(text)}
-            title={t("coord.copyMsg")}
+            onPress={() => copy(text)}
             aria-label={t("coord.copyMsgAria")}
           >
-            <Icon name={copied ? "check" : "copy"} size={12} />
+            <MotionIcon active={copied} from="copy" to="check" size={12} />
             <span className="cc-lbl">{copied ? t("common.copied") : t("common.copyShort")}</span>
-          </button>
+          </Button>
         )}
         {clock(m.ts) && <span className="ts">{clock(m.ts)}</span>}
       </div>
@@ -227,17 +218,122 @@ function DigestBubble({ digest, t }: { digest: SwarmDigest; t: (k: string, v?: R
       <span className="coord-node" aria-hidden="true"><Icon name="radio" size={12} /></span>
       <div className="coord-digest-title">{t("coord.digestTitle")}</div>
       <div className="body">
-        {t("coord.digest", {
-          phase: phaseLabel(digest.phase, t),
-          verified: digest.verified, candidates: digest.candidates,
-          intents: digest.openIntents, dead: digest.deadEnds,
-          online: digest.onlineWorkers, total: digest.totalWorkers,
-        })}
+        {digest.mode === "pentest"
+          ? t("coord.digest", {
+              phase: phaseLabel(digest.phase, t),
+              verified: digest.verified, candidates: digest.candidates,
+              intents: digest.openIntents, dead: digest.deadEnds,
+              online: digest.onlineWorkers, total: digest.totalWorkers,
+            })
+          : t("coord.digestCtf", {
+              phase: phaseLabel(digest.phase, t),
+              facts: digest.verified,
+              steps: digest.openSteps,
+              goals: digest.goals,
+              online: digest.onlineWorkers,
+              total: digest.totalWorkers,
+            })}
       </div>
       {digest.latestVerified && (
-        <div className="digest-sub">{t("coord.latestVerified", { fact: digest.latestVerified })}</div>
+        <div className="digest-sub">{t(digest.mode === "pentest" ? "coord.latestVerified" : "coord.latestFact", { fact: digest.latestVerified })}</div>
       )}
     </div>
+  );
+}
+
+function progressItemText(
+  item: ProgressBriefItem | undefined,
+  t: (k: string, v?: Record<string, string | number>) => string,
+): string {
+  if (!item) return "";
+  return item.textKey ? t(item.textKey) : (item.text || "");
+}
+
+function legacyProgressBrief(deck: DeckState, digest: SwarmDigest): ProgressBrief {
+  return {
+    id: `legacy-${deck.runId}`,
+    kind: deck.finished ? "final" : "periodic",
+    phase: digest.phase,
+    mode: digest.mode === "pentest" ? "pentest" : "ctf",
+    trigger: "replay",
+    summaryKey: "progress.summaryUnavailable",
+    sourceFromSeq: 0,
+    sourceToSeq: 0,
+    sections: { confirmed: [], active: [], blocked: [], next: [] },
+  };
+}
+
+function ProgressBriefBubble({
+  brief,
+  ts,
+  t,
+}: {
+  brief: ProgressBrief;
+  ts: number;
+  t: (k: string, v?: Record<string, string | number>) => string;
+}) {
+  const sections: Array<{ key: keyof ProgressBrief["sections"]; icon: IconName }> = [
+    { key: "confirmed", icon: "check" },
+    { key: "active", icon: "radio" },
+    { key: "blocked", icon: "xCircle" },
+    { key: "next", icon: "target" },
+  ];
+  const visible = sections.filter(({ key }) => brief.sections[key].length > 0);
+  const detailCount = visible.reduce((count, { key }) => count + brief.sections[key].length, 0);
+  return (
+    <section
+      className={`coord-bubble progress-brief kind-${brief.kind}`}
+      aria-label={t("progress.title")}
+      data-brief-id={brief.id}
+    >
+      <span className="coord-node" aria-hidden="true">
+        <Icon name={brief.kind === "blocker" || brief.kind === "stalled" ? "alert" : "radio"} size={12} />
+      </span>
+      <header className="progress-brief-head">
+        <span>{t("coord.title")} <span className="k">{t("msg.kind.progress")}</span></span>
+        <span className="progress-brief-kind">{t(`progress.kind.${brief.kind}`)}</span>
+        {clock(ts) && <time>{clock(ts)}</time>}
+      </header>
+      <div className="progress-brief-summary">
+        {brief.summaryKey
+          ? t(brief.summaryKey, brief.summaryVars)
+          : brief.summary || t(`progress.headline.${brief.kind}`)}
+      </div>
+      {visible.length > 0 && (
+        <Accordion hideSeparator className="progress-brief-details">
+          <Accordion.Item id={`progress-details-${brief.id}`}>
+            <Accordion.Heading>
+              <Accordion.Trigger>
+                <span>{t("progress.details", { count: detailCount })}</span>
+                <Accordion.Indicator />
+              </Accordion.Trigger>
+            </Accordion.Heading>
+            <Accordion.Panel>
+              <Accordion.Body className="progress-brief-details-body">
+                <div className="progress-brief-sections">
+                  {visible.map(({ key, icon }) => (
+                    <section className={`progress-brief-section section-${key}`} key={key}>
+                      <h3><Icon name={icon} size={12} /> {t(`progress.section.${key}`)}</h3>
+                      <ul>
+                        {brief.sections[key].map((item, index) => (
+                          <li key={`${key}-${item.ref?.kind ?? "item"}-${item.ref?.id ?? index}`}>
+                            <span>{progressItemText(item, t)}</span>
+                            {item.ref?.id && <code>{item.ref.kind}:{item.ref.id}</code>}
+                          </li>
+                        ))}
+                      </ul>
+                    </section>
+                  ))}
+                </div>
+                {brief.sourceToSeq > 0 && (
+                  <footer>{t("progress.source", { from: brief.sourceFromSeq, to: brief.sourceToSeq })}</footer>
+                )}
+              </Accordion.Body>
+            </Accordion.Panel>
+          </Accordion.Item>
+        </Accordion>
+      )}
+    </section>
   );
 }
 
@@ -262,14 +358,9 @@ function AnswerBubble({ digest, t }: { digest: SwarmDigest; t: (k: string, v?: R
         <div className="body">
           {digest.reports.map((row) => (
             <div key={row.id}>
-              <CopyText
-                value={reportToMarkdown(row)}
-                className="ans-flag"
-                titleKey="runtime.reports.copyMarkdown"
-                ariaLabelKey="runtime.reports.copyMarkdownAria"
-              >
+              <Button size="sm" variant="outline" className="copytext ans-flag" aria-label={t("runtime.reports.copyMarkdown")} onPress={() => void navigator.clipboard.writeText(reportToMarkdown(row))}>
                 {row.title}
-              </CopyText>
+              </Button>
             </div>
           ))}
         </div>
@@ -277,23 +368,18 @@ function AnswerBubble({ digest, t }: { digest: SwarmDigest; t: (k: string, v?: R
         <div className="body">
           {digest.flags.map((f) => (
             <div key={f}>
-              <CopyText value={f} className="ans-flag">{t("coord.answerFlag", { flag: f })}</CopyText>
+              <Button size="sm" variant="outline" className="copytext ans-flag" aria-label={t("common.copyFlag")} onPress={() => void navigator.clipboard.writeText(f)}>{t("coord.answerFlag", { flag: f })}</Button>
             </div>
           ))}
         </div>
       ) : digest.phase === "goal_met" ? (
         <div className="body">
-          <CopyText
-            value={digest.goalWhy || ""}
-            className="ans-flag goal"
-            titleKey="common.copyAnswer"
-            ariaLabelKey="common.copyAnswerAria"
-          >
+          <Button size="sm" variant="outline" className="copytext ans-flag goal" aria-label={t("common.copyAnswer")} onPress={() => void navigator.clipboard.writeText(digest.goalWhy || "")}>
             {t("coord.answerGoal", { why: digest.goalWhy || "" })}
-          </CopyText>
+          </Button>
         </div>
       ) : (
-        <div className="body">{t("coord.answerNone", { verified: digest.verified, dead: digest.deadEnds })}</div>
+        <div className="body">{t(pentest ? "coord.answerNone" : "coord.answerNoneCtf", { verified: digest.verified, dead: digest.deadEnds, facts: digest.verified })}</div>
       )}
     </div>
   );
@@ -329,13 +415,13 @@ function FlowPopover({
 }) {
   const active = activeFlowIndex(digest);
   return (
-    <div className="flow-popover" role="dialog" aria-label={t("flow.title")} onClick={(e) => e.stopPropagation()}>
+    <div className="flow-popover">
       <div className="flow-head">
         <div>
           <div className="flow-title">{t("flow.title")}</div>
           <div className="flow-sub">{t("flow.subtitle")}</div>
         </div>
-        <button className="flow-close" onClick={onClose} title={t("settings.close")} aria-label={t("settings.close")}><Icon name="x" size={14} /></button>
+        <Button size="sm" variant="ghost" isIconOnly className="flow-close" onPress={onClose} aria-label={t("settings.close")}><Icon name="x" size={14} /></Button>
       </div>
       <div className="flow-steps">
         {FLOW_STEPS.map((step, i) => {
@@ -356,19 +442,27 @@ function FlowPopover({
       </div>
       <div className="flow-live">
         <span>{t("flow.now", { phase: phaseLabel(digest.phase, t) })}</span>
-        <span>{t("flow.metrics", {
-          workers: `${digest.onlineWorkers}/${digest.totalWorkers}`,
-          facts: digest.verified,
-          intents: digest.openIntents,
-          dead: digest.deadEnds,
-          hitl: hitlCount,
-        })}</span>
+        <span>{digest.mode === "pentest"
+          ? t("flow.metrics", {
+              workers: `${digest.onlineWorkers}/${digest.totalWorkers}`,
+              facts: digest.verified,
+              intents: digest.openIntents,
+              dead: digest.deadEnds,
+              hitl: hitlCount,
+            })
+          : t("flow.metricsCtf", {
+              workers: `${digest.onlineWorkers}/${digest.totalWorkers}`,
+              facts: digest.verified,
+              steps: digest.openSteps,
+              goals: digest.goals,
+              hitl: hitlCount,
+            })}</span>
       </div>
     </div>
   );
 }
 
-function StatusHero({ digest, hitlCount, t }: { digest: SwarmDigest; hitlCount: number; t: (k: string, v?: Record<string, string | number>) => string }) {
+function StatusHero({ digest, hitlCount, progress, t }: { digest: SwarmDigest; hitlCount: number; progress?: ProgressBrief; t: (k: string, v?: Record<string, string | number>) => string }) {
   const [flowOpen, setFlowOpen] = useState(false);
   const [resultsOpen, setResultsOpen] = useState(false);
   const elapsed = useElapsed(
@@ -380,15 +474,26 @@ function StatusHero({ digest, hitlCount, t }: { digest: SwarmDigest; hitlCount: 
   const singleFlag = digest.flags.length === 1 ? digest.flags[0] : "";
   const hasResultLedger = digest.mode === "pentest"
     ? digest.reports.length > 1 || digest.expectedReports > 1 || (digest.phase === "collecting" && digest.reports.length > 0)
-    : digest.flags.length > 1 || digest.expectedFlags > 1 || (digest.phase === "collecting" && digest.flags.length > 0);
+    : digest.platformConfirmationRequired || digest.flags.length > 1 || digest.expectedFlags > 1 || (digest.phase === "collecting" && digest.flags.length > 0);
   const resultsVisible = resultsOpen && hasResultLedger;
+  const progressDetail = progress?.summary || progressItemText(
+    progress?.sections.active[0]
+      ?? progress?.sections.next[0]
+      ?? progress?.sections.confirmed.at(-1)
+      ?? progress?.sections.blocked[0],
+    t,
+  );
   const resultCount = digest.mode === "pentest"
     ? (digest.expectedReports > 1
       ? t("hero.results.reportProgress", { n: digest.reports.length, total: digest.expectedReports })
       : t("hero.results.reportCount", { n: digest.reports.length }))
-    : (digest.expectedFlags > 1
-      ? t("hero.results.progress", { n: digest.flags.length, total: digest.expectedFlags })
-      : t("hero.results.count", { n: digest.flags.length }));
+    : digest.platformConfirmationRequired
+      ? t("hero.detail.collectingPlatform", {
+          n: digest.flags.length, accepted: digest.platformAccepted, need: digest.expectedFlags,
+        })
+      : (digest.expectedFlags > 1
+        ? t("hero.results.progress", { n: digest.flags.length, total: digest.expectedFlags })
+        : t("hero.results.count", { n: digest.flags.length }));
   // the one detail line that matters most for THIS phase.
   let detail: string;
   if (digest.phase === "solved") {
@@ -400,16 +505,24 @@ function StatusHero({ digest, hitlCount, t }: { digest: SwarmDigest; hitlCount: 
       ? t("hero.detail.reportPipeline", {
           submitted: digest.reportSubmitted,
           reproducing: digest.reportReproducing,
-          accepted: digest.reportAccepted,
+          accepted: digest.reportQualified,
           total: digest.expectedReports,
         })
-      : t("hero.detail.collecting", { n: digest.flags.length, total: digest.expectedFlags });
+      : digest.platformConfirmationRequired
+        ? t("hero.detail.collectingPlatform", {
+            n: digest.flags.length,
+            accepted: digest.platformAccepted,
+            need: digest.expectedFlags,
+          })
+        : t("hero.detail.collecting", { n: digest.flags.length, total: digest.expectedFlags });
   } else if (digest.phase === "paused") {
     detail = hitlCount > 0 ? t("hero.detail.pausedN", { n: hitlCount }) : t("hero.detail.paused");
   } else if (digest.phase === "goal_met") {
     detail = digest.goalWhy || t("hero.detail.goalMet");
   } else if (digest.phase === "finished") {
-    detail = t("hero.detail.finished", { verified: digest.verified, dead: digest.deadEnds });
+    detail = digest.mode === "pentest"
+      ? t("hero.detail.finished", { verified: digest.verified, dead: digest.deadEnds })
+      : t("hero.detail.finishedCtf", { facts: digest.verified, steps: digest.openSteps });
   } else if (digest.phase === "racing") {
     detail = digest.verifyingActive > 0 || digest.raceTotal > 0
       ? t("hero.detail.racingVerify", {
@@ -425,38 +538,31 @@ function StatusHero({ digest, hitlCount, t }: { digest: SwarmDigest; hitlCount: 
       ? t("hero.detail.reportPipeline", {
           submitted: digest.reportSubmitted,
           reproducing: digest.reportReproducing,
-          accepted: digest.reportAccepted,
+          accepted: digest.reportQualified,
           total: digest.expectedReports,
         })
-      : digest.latestVerified
-        ? t("hero.detail.runningFact", { fact: digest.latestVerified })
+      : progressDetail
+        ? progressDetail
+        : digest.latestVerified
+        ? t(digest.mode === "pentest" ? "hero.detail.runningFact" : "hero.detail.runningFactCtf", { fact: digest.latestVerified })
         : digest.onlineWorkers > 0
-          ? t("hero.detail.running", { online: digest.onlineWorkers, total: digest.totalWorkers })
+          ? t(digest.mode === "pentest" ? "hero.detail.running" : "hero.detail.runningCtf", { online: digest.onlineWorkers, total: digest.totalWorkers })
           : t("hero.detail.runningIdle", { total: digest.totalWorkers });
   } else {
     detail = t("hero.detail.draft");
   }
   useEffect(() => {
-    if (!flowOpen && !resultsVisible) return;
+    if (!resultsVisible) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
-      setFlowOpen(false);
       setResultsOpen(false);
     };
-    const onDoc = () => setFlowOpen(false);
     window.addEventListener("keydown", onKey);
-    if (flowOpen) window.addEventListener("click", onDoc);
     return () => {
       window.removeEventListener("keydown", onKey);
-      window.removeEventListener("click", onDoc);
     };
-  }, [flowOpen, resultsVisible]);
+  }, [resultsVisible]);
 
-  const toggleFlow = (e: { stopPropagation: () => void }) => {
-    e.stopPropagation();
-    setResultsOpen(false);
-    setFlowOpen((v) => !v);
-  };
   const toggleResults = () => {
     setFlowOpen(false);
     setResultsOpen((value) => !value);
@@ -492,42 +598,42 @@ function StatusHero({ digest, hitlCount, t }: { digest: SwarmDigest; hitlCount: 
         </span>
         <span className="sh-main">
           {hasResultLedger ? (
-            <button
-              type="button"
+            <Button
+              size="sm"
+              variant="ghost"
               className="sh-results-toggle"
               aria-expanded={resultsVisible}
               aria-controls="status-flag-results"
-              onClick={toggleResults}
-              title={t(resultsVisible ? "hero.results.collapse" : "hero.results.expand")}
+              onPress={toggleResults}
+              aria-label={t(resultsVisible ? "hero.results.collapse" : "hero.results.expand")}
             >
               <span className="sh-results-count">{resultCount}</span>
               {digest.flags[0] && <code className="sh-results-preview">{digest.flags[0]}</code>}
               {digest.flags.length > 1 && <span className="sh-results-more">+{digest.flags.length - 1}</span>}
               <Icon name="chevronDown" size={13} />
-            </button>
+            </Button>
           ) : singleFlag ? (
-            <CopyText value={singleFlag} className="sh-detail sh-detail-flag">{singleFlag}</CopyText>
+            <Button size="sm" variant="outline" className="copytext sh-detail sh-detail-flag" aria-label={t("common.copyFlag")} onPress={() => void navigator.clipboard.writeText(singleFlag)}>{singleFlag}</Button>
           ) : (
-            <span className="sh-detail" title={detail}>{detail}</span>
+            <span className="sh-detail" data-tooltip={detail}>{detail}</span>
           )}
         </span>
         <span className="sh-meta">
           {live && digest.onlineWorkers > 0 && (
-            <span className="sh-workers" title={t("meta.workers")}>
+            <span className="sh-workers" data-tooltip={t("meta.workers")}>
               <Icon name="cpu" size={12} /> {digest.onlineWorkers}/{digest.totalWorkers}
             </span>
           )}
-          {elapsed && <span className="sh-elapsed" title={t("meta.elapsed")}><Icon name="clock" size={12} /> {elapsed}</span>}
-          <button
-            type="button"
+          {elapsed && <span className="sh-elapsed" data-tooltip={t("meta.elapsed")}><Icon name="clock" size={12} /> {elapsed}</span>}
+          <Popover isOpen={flowOpen} onOpenChange={(isOpen) => { setFlowOpen(isOpen); if (isOpen) setResultsOpen(false); }}>
+          <Popover.Trigger
             className="sh-flow"
-            aria-haspopup="dialog"
-            aria-expanded={flowOpen}
             aria-label={t("flow.open")}
-            onClick={toggleFlow}
           >
             <Icon name="list" size={12} /> {t("flow.short")}
-          </button>
+          </Popover.Trigger>
+          <Popover.Content placement="bottom end" className="p-0"><Popover.Dialog aria-label={t("flow.title")}><FlowPopover digest={digest} hitlCount={hitlCount} onClose={() => setFlowOpen(false)} t={t} /></Popover.Dialog></Popover.Content>
+          </Popover>
         </span>
       </div>
       {resultsVisible && (
@@ -541,26 +647,20 @@ function StatusHero({ digest, hitlCount, t }: { digest: SwarmDigest; hitlCount: 
               ? digest.reports.map((row, index) => (
                 <div className="sh-result-row" key={row.id}>
                   <span className="sh-result-index">{String(index + 1).padStart(2, "0")}</span>
-                  <CopyText
-                    value={reportToMarkdown(row)}
-                    className="sh-result-value"
-                    titleKey="runtime.reports.copyMarkdown"
-                    ariaLabelKey="runtime.reports.copyMarkdownAria"
-                  >
+                  <Button size="sm" variant="outline" className="copytext sh-result-value" aria-label={t("runtime.reports.copyMarkdown")} onPress={() => void navigator.clipboard.writeText(reportToMarkdown(row))}>
                     {row.title}
-                  </CopyText>
+                  </Button>
                 </div>
               ))
               : digest.flags.map((flag, index) => (
                 <div className="sh-result-row" key={`${index}-${flag}`}>
                   <span className="sh-result-index">{String(index + 1).padStart(2, "0")}</span>
-                  <CopyText value={flag} className="sh-result-value">{flag}</CopyText>
+                  <Button size="sm" variant="outline" className="copytext sh-result-value" aria-label={t("common.copyFlag")} onPress={() => void navigator.clipboard.writeText(flag)}>{flag}</Button>
                 </div>
               ))}
           </div>
         </section>
       )}
-      {flowOpen && <FlowPopover digest={digest} hitlCount={hitlCount} onClose={() => setFlowOpen(false)} t={t} />}
     </div>
   );
 }
@@ -677,27 +777,28 @@ function HitlCard({
           role="status"
           aria-live="polite"
           data-command-id={activeCommandId}
-          title={durableDelivery.detail}
+          data-tooltip={durableDelivery.detail}
         >
           <Icon name={deliveryPhase === "pending" || deliveryPhase === "observed" ? "clock" : "alert"} size={14} />
           <span className="hitl-delivery-copy">{t(deliveryKey)}</span>
           {retryable && (
-            <button
-              type="button"
+            <Button
+              size="sm"
+              variant="outline"
               className="hitl-delivery-retry"
-              disabled={sending}
-              onClick={retryDelivery}
+              isDisabled={sending}
+              onPress={retryDelivery}
             >
               {sending ? t("hitl.delivery.retrying") : t("hitl.delivery.retry")}
-            </button>
+            </Button>
           )}
         </div>
       )}
       {pauses && !answerRecorded && <div className="hitl-opts">
         {req.options.map((o) => (
-          <button key={o} type="button" disabled={sending} onClick={() => submit(o)}>{o}</button>
+          <Button key={o} size="sm" variant="outline" isDisabled={sending} onPress={() => submit(o)}>{o}</Button>
         ))}
-        <input
+        <Input
           ref={inputRef}
           className="hitl-free"
           value={free}
@@ -707,24 +808,26 @@ function HitlCard({
           onChange={(e) => setFree(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submit(free); } }}
         />
-        <button
-          type="button"
+        <Button
+          size="sm"
+          variant="primary"
           className="hitl-send"
-          disabled={sending || !free.trim()}
-          onClick={() => submit(free)}
+          isDisabled={sending || !free.trim()}
+          onPress={() => submit(free)}
         >
           {sending ? t("hitl.sending") : t("hitl.submit")}
-        </button>
+        </Button>
         {onDismiss && (
-          <button
-            type="button"
+          <Button
+            size="sm"
+            variant="ghost"
             className="hitl-dismiss"
-            disabled={sending}
-            title={t("hitl.dismiss.tip")}
-            onClick={dismiss}
+            isDisabled={sending}
+            aria-label={t("hitl.dismiss.tip")}
+            onPress={dismiss}
           >
             {t("hitl.dismiss")}
-          </button>
+          </Button>
         )}
       </div>}
     </div>
@@ -745,6 +848,8 @@ function CoordinatorThread({
   const t = useT();
   const messages = coordinatorThread(deck);
   const digest = swarmDigest(deck);
+  const hasProgress = messages.some((message) => message.kind === "progress" && message.progressBrief);
+  const legacyBrief = !hasProgress && deck.finished ? legacyProgressBrief(deck, digest) : undefined;
   const hasContent = messages.length > 0 || deck.hitlRequests.length > 0;
   const feedRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
@@ -765,11 +870,14 @@ function CoordinatorThread({
         {!hasContent && !deck.finished && (
           <div className="coord-empty">{t("coord.empty")}</div>
         )}
-        {messages.map((m) => <CoordBubble key={m.id} m={m} t={t} />)}
+        {messages.map((m) => m.kind === "progress" && m.progressBrief
+          ? <ProgressBriefBubble key={m.id} brief={m.progressBrief} ts={m.ts} t={t} />
+          : <CoordBubble key={m.id} m={m} t={t} />)}
         {deck.hitlRequests.map((r, i) => (
           <HitlCard key={r.id} req={r} first={i === 0} onAnswer={onAnswer} onDismiss={onDismiss} />
         ))}
-        {running && <DigestBubble digest={digest} t={t} />}
+        {running && !hasProgress && <DigestBubble digest={digest} t={t} />}
+        {legacyBrief && <ProgressBriefBubble brief={legacyBrief} ts={deck.finishedAt ?? Date.now()} t={t} />}
         {deck.finished && <AnswerBubble digest={digest} t={t} />}
       </div>
     </div>
@@ -787,12 +895,14 @@ function Composer({
   flags,
   onDispatch,
   onCommand,
+  onRequestProgress,
   onResolve,
   attachments,
   onAddFiles,
   onRemoveFile,
   prefill,
   onPrefillConsumed,
+  onOpenBtw,
 }: {
   started: boolean;
   solved: boolean;
@@ -802,22 +912,23 @@ function Composer({
   paused: boolean;
   solvers: string[];
   flags: string[];
-  // Returns false when the dispatch was intercepted before launch (e.g. the
-  // open-ended collect confirm) — the composer keeps the prompt text then.
   onDispatch: (prompt: string, opts: DispatchOpts) => void | boolean | Promise<void | boolean>;
   onCommand: (target: string, action: string, text: string,
               opts?: ControlCommandOpts) => Promise<boolean>;
+  onRequestProgress: () => Promise<boolean>;
   onResolve: (text?: string) => void;
   attachments: SavedFile[];
   onAddFiles: (files: FileList | File[]) => void;
   onRemoveFile: (path: string) => void;
   prefill: ComposerPrefill | null;
   onPrefillConsumed: () => void;
+  onOpenBtw?: () => void;
 }) {
   const t = useT();
   const [text, setText] = useState("");
   const [markFalseOpen, setMarkFalseOpen] = useState(false);
   const [cmdTarget, setCmdTarget] = useState("global");
+  const [progressPending, setProgressPending] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   // the live composer field (dispatch textarea before start, command input after)
   // — Cmd/Ctrl+K focuses whichever is mounted.
@@ -852,6 +963,8 @@ function Composer({
         el.tagName === "INPUT" || el.tagName === "TEXTAREA" ||
         el.tagName === "SELECT" || el.isContentEditable
       );
+      // Collab canvas owns bare "/" for its search field; do not steal focus.
+      if (el?.closest?.(".react-flow, .collab-shell")) return;
       const slash = e.key === "/" && !e.metaKey && !e.ctrlKey && !e.altKey && !typing;
       if (!slash) return;
       const field = dispatchRef.current ?? commandRef.current;
@@ -866,30 +979,30 @@ function Composer({
   const [dragOver, setDragOver] = useState(false);
   const [webSearch, setWebSearch] = useState(true);
   const [mode, setMode] = useState<"ctf" | "pentest">("ctf");
-  const [goal, setGoal] = useState("");
-  const [scope, setScope] = useState("");
   const [collect, setCollect] = useState(false);
   const [collectCount, setCollectCount] = useState("");  // "" = unknown count
   const [flagFormat, setFlagFormat] = useState<"brace" | "token" | "custom">("brace");
   const [flagWrapper, setFlagWrapper] = useState("");
   const [containerMode, setContainerMode] = useState(false);
+  const [allowOperatorInput, setAllowOperatorInput] = useState(false);
   // P2-v3: when the coordinator runs inside a container, local worker mode is
   // rejected server-side — force container mode and lock the toggle.
   const [containerLocked, setContainerLocked] = useState(false);
-  const [raceTimeout, setRaceTimeout] = useState("720");
+  const [raceTimeout, setRaceTimeout] = useState("300");
   const [wallClockBudget, setWallClockBudget] = useState("0");
   const [maxTotalWorkers, setMaxTotalWorkers] = useState("0");
   const [costBudgetUsd, setCostBudgetUsd] = useState("0");
   const [advancedOpen, setAdvancedOpen] = useState(false);
   /** Per-run overrides are sent only after the operator edits advanced fields. */
-  const [advancedTouched, setAdvancedTouched] = useState(false);
+  const [advancedTouched, setAdvancedTouched] = useState<Partial<Record<"raceTimeout" | "wallClockBudget" | "maxTotalWorkers" | "costBudgetUsd", true>>>({});
   useEffect(() => {
     let cancelled = false;
     try {
       const saved = window.localStorage.getItem("muteki.webSearch");
       if (saved === "0") setWebSearch(false);
-      const m = window.localStorage.getItem("muteki.mode");
-      if (m === "pentest") setMode("pentest");
+      if (window.localStorage.getItem("muteki.mode") === "pentest") {
+        window.localStorage.setItem("muteki.mode", "ctf");
+      }
       if (window.localStorage.getItem("muteki.collect") === "1") setCollect(true);
       const savedFlagFormat = window.localStorage.getItem("muteki.flagFormat");
       if (savedFlagFormat === "token" || savedFlagFormat === "custom") setFlagFormat(savedFlagFormat);
@@ -901,6 +1014,9 @@ function Composer({
         getWorkerSettings().then((c) => {
           if (!cancelled && c?.worker_backend === "container") setContainerMode(true);
         });
+      }
+      if (window.localStorage.getItem("muteki.allowOperatorInput") === "1") {
+        setAllowOperatorInput(true);
       }
     } catch { /* ignore */ }
     // P2-v3: ask the backend whether IT runs in a container. If so, container
@@ -937,7 +1053,15 @@ function Composer({
       return nv;
     });
   };
+  const toggleOperatorInput = () => setAllowOperatorInput((value) => {
+    const next = !value;
+    try {
+      window.localStorage.setItem("muteki.allowOperatorInput", next ? "1" : "0");
+    } catch { /* ignore */ }
+    return next;
+  });
   const pickMode = (m: "ctf" | "pentest") => {
+    if (m !== "ctf") return;
     setMode(m);
     try { window.localStorage.setItem("muteki.mode", m); } catch { /* ignore */ }
   };
@@ -945,16 +1069,20 @@ function Composer({
   useEffect(() => {
     if (!prefill || started) return;
     setText(prefill.text);
-    setMode(prefill.mode);
-    setGoal(prefill.goal ?? "");
-    setScope(prefill.scope ?? "");
-    try { window.localStorage.setItem("muteki.mode", prefill.mode); } catch { /* ignore */ }
+    pickMode("ctf");
     window.requestAnimationFrame(() => {
       dispatchRef.current?.focus();
       dispatchRef.current?.setSelectionRange(prefill.text.length, prefill.text.length);
     });
     onPrefillConsumed();
   }, [onPrefillConsumed, prefill, started]);
+
+  // A dispatch that required backend confirmation deliberately kept the prose
+  // in the composer. Once the confirmed Run starts, clear it before the same
+  // field switches into operator-command mode.
+  useEffect(() => {
+    if (started) setText("");
+  }, [started]);
 
   const dispatch = async () => {
     const v = text.trim();
@@ -967,24 +1095,19 @@ function Composer({
       const parsed = parseFloat(raw);
       return Number.isNaN(parsed) ? undefined : parsed;
     };
-    const runCaps = advancedTouched
-      ? {
-          raceTimeout: parseInt(raceTimeout, 10) || undefined,
-          wallClockBudget: optionalInt(wallClockBudget),
-          maxTotalWorkers: optionalInt(maxTotalWorkers),
-          costBudgetUsd: optionalFloat(costBudgetUsd),
-        }
-      : {};
-    const dispatched = await onDispatch(v, mode === "pentest"
-      ? { webSearch, mode, goal: goal.trim(), scope: scope.trim(),
-          collectCount: parseInt(collectCount, 10) || 0, containerMode, ...runCaps }
-      : { webSearch, mode: "ctf", collect, containerMode,
-          flagFormat,
-          flagWrapper: flagFormat === "custom" ? flagWrapper.trim() : undefined,
-          collectCount: collect ? (parseInt(collectCount, 10) || 0) : undefined,
-          ...runCaps });
-    // Intercepted dispatches (open-ended collect confirm) keep the text so
-    // "返回填写数量" does not throw the prompt away.
+    const runCaps = {
+      ...(advancedTouched.raceTimeout ? { raceTimeout: parseInt(raceTimeout, 10) || undefined } : {}),
+      ...(advancedTouched.wallClockBudget ? { wallClockBudget: optionalInt(wallClockBudget) } : {}),
+      ...(advancedTouched.maxTotalWorkers ? { maxTotalWorkers: optionalInt(maxTotalWorkers) } : {}),
+      ...(advancedTouched.costBudgetUsd ? { costBudgetUsd: optionalFloat(costBudgetUsd) } : {}),
+    };
+    const dispatched = await onDispatch(v, {
+      webSearch, mode: "ctf", collect, containerMode, allowOperatorInput,
+      flagFormat,
+      flagWrapper: flagFormat === "custom" ? flagWrapper.trim() : undefined,
+      collectCount: collect ? (parseInt(collectCount, 10) || 0) : undefined,
+      ...runCaps,
+    });
     if (dispatched !== false) setText("");
   };
   const command = (action: string) => {
@@ -994,6 +1117,7 @@ function Composer({
     }
     let a = action, payload = raw;
     if (raw.startsWith("/")) { const [v, ...rest] = raw.slice(1).split(" "); a = v; payload = rest.join(" "); }
+    if (a === "focus" || a === "redirect") a = "directive";
     if (a === "resolve") { onResolve(payload || undefined); setText(""); return; }
     if (a === "mark_false" && !payload && flags.length > 1) {
       setMarkFalseOpen((v) => !v);
@@ -1007,15 +1131,37 @@ function Composer({
     setMarkFalseOpen(false);
     setText("");
   };
+  const requestProgress = async () => {
+    if (progressPending) return;
+    setProgressPending(true);
+    try {
+      await onRequestProgress();
+    } finally {
+      setProgressPending(false);
+    }
+  };
   const runningActions = paused
     ? QUICK_RUNNING.map((action) => action.key === "pause"
       ? { key: "resume", labelKey: "quick.resume", tipKey: "quick.resume.tip", icon: "play" as IconName }
       : action)
     : QUICK_RUNNING;
+  const btwButton = onOpenBtw ? (
+    <Button
+      size="sm"
+      variant="ghost"
+      className="btw-btn"
+      onPress={onOpenBtw}
+      data-tooltip={t("btw.btnTitle")}
+      aria-label={t("btw.btnTitle")}
+    >
+      <Icon name="eye" size={13} />
+      {t("btw.btn")}
+    </Button>
+  ) : null;
 
   if (!started) {
     return (
-      <div className="composer2 motion-run-enter">
+      <div className="composer2 t-page-slide">
         <div
           className={`wrap ${dragOver ? "dragover" : ""}`}
           onDragOver={(e) => {
@@ -1043,22 +1189,23 @@ function Composer({
             </div>
           )}
           <div className="mode-row">
-            <div className="mode-seg" role="tablist" aria-label={t("composer.mode")}>
-              <button
-                type="button" role="tab" aria-selected={mode === "ctf"}
-                className={mode === "ctf" ? "on" : ""}
-                title={t("composer.modeCtfTitle")}
-                onClick={() => pickMode("ctf")}
-              >{t("composer.modeCtf")}</button>
-              <button
-                type="button" role="tab" aria-selected={mode === "pentest"}
-                className={mode === "pentest" ? "on" : ""}
-                title={t("composer.modePentestTitle")}
-                onClick={() => pickMode("pentest")}
-              >{t("composer.modePentest")}</button>
+            <div className="mode-choice">
+              <Tabs selectedKey={mode} onSelectionChange={(key) => { if (key === "ctf") pickMode("ctf"); }}>
+                <Tabs.List className="mode-seg" aria-label={t("composer.mode")}>
+                  <Tabs.Tab id="ctf" aria-label={t("composer.modeCtfTitle")}>{t("composer.modeCtf")}<Tabs.Indicator /></Tabs.Tab>
+                  <Tabs.Tab id="pentest" isDisabled aria-label={t("composer.modePentestUnavailable")}>{t("composer.modePentest")}<Tabs.Indicator /></Tabs.Tab>
+                </Tabs.List>
+              </Tabs>
+              <span
+                className="mode-pentest-hint"
+                data-tooltip={t("composer.modePentestUnavailable")}
+                aria-label={t("composer.modePentestUnavailable")}
+                role="note"
+                tabIndex={0}
+              />
             </div>
           </div>
-          <textarea
+          <TextArea
             ref={dispatchRef}
             data-composer-input
             rows={1}
@@ -1081,36 +1228,19 @@ function Composer({
             }}
             placeholder={t(mode === "pentest" ? "composer.pentestPlaceholder" : "composer.dispatchPlaceholder")}
           />
-          {mode === "pentest" && (
-            <div className="pentest-fields">
-              <input className="pf-input" value={goal} onChange={(e) => setGoal(e.target.value)} placeholder={t("composer.goalPlaceholder")} />
-              <input className="pf-input" value={scope} onChange={(e) => setScope(e.target.value)} placeholder={t("composer.scopePlaceholder")} />
-              <NumberField
-                className="collect-count"
-                min={0}
-                allowEmpty
-                value={collectCount}
-                onChange={setCollectCount}
-                scrubLabel="#"
-                placeholder={t("composer.findingsCountPlaceholder")}
-                title={t("composer.findingsCountTitle")}
-                ariaLabel={t("composer.findingsCountPlaceholder")}
-              />
-            </div>
-          )}
           {attachments.length > 0 && (
             <div className="attach-row">
               {attachments.map((f) => (
                 <span className="attach-chip" key={f.path}>
                   <span className="afn"><Icon name="paperclip" size={13} /> {f.name}</span>
                   <span className="asz">{fmtSize(f.size)}</span>
-                  <button className="arm" onClick={() => onRemoveFile(f.path)} title={t("composer.removeFile")} aria-label={t("composer.removeFile")}><Icon name="x" size={13} /></button>
+                  <Button size="sm" variant="ghost" isIconOnly className="arm" onPress={() => onRemoveFile(f.path)} aria-label={t("composer.removeFile")}><Icon name="x" size={13} /></Button>
                 </span>
               ))}
             </div>
           )}
           <div className="crow">
-            <button type="button" className="attach-btn" onClick={() => fileRef.current?.click()} title={t("composer.attach")} aria-label={t("composer.attach")}><Icon name="paperclip" /></button>
+            <Button size="sm" variant="ghost" isIconOnly className="attach-btn" onPress={() => fileRef.current?.click()} aria-label={t("composer.attach")}><Icon name="paperclip" /></Button>
             <input ref={fileRef} type="file" multiple style={{ display: "none" }}
               onChange={(e) => {
                 // Snapshot to a static array BEFORE resetting value: onAddFiles is
@@ -1121,19 +1251,20 @@ function Composer({
                 e.target.value = "";
                 if (picked.length) onAddFiles(picked);
               }} />
-            <span className="auto-note"><b>▸</b> {t("composer.autoNote")}</span>
+            <span className="auto-note"><b>▸</b> {t(mode === "pentest" ? "composer.pentestAutoNote" : "composer.autoNote")}</span>
             <span className="spacer" />
             {mode === "ctf" && (
-              <button
-                type="button"
+              <Button
+                size="sm"
+                variant="ghost"
                 className={`websearch-toggle ${collect ? "on" : "off"}`}
-                onClick={toggleCollect}
+                onPress={toggleCollect}
                 aria-pressed={collect}
-                title={t("composer.collectTitle")}
+                aria-label={t("composer.collectTitle")}
               >
                 <Icon name={collect ? "target" : "flag"} size={14} />
                 {collect ? t("composer.collectOn") : t("composer.collectOff")}
-              </button>
+              </Button>
             )}
             {mode === "ctf" && collect && (
               <NumberField
@@ -1144,106 +1275,147 @@ function Composer({
                 onChange={setCollectCount}
                 scrubLabel="#"
                 placeholder={t("composer.collectCountPlaceholder")}
-                title={t("composer.collectCountTitle")}
+                data-tooltip={t("composer.collectCountTitle")}
                 ariaLabel={t("composer.collectCountPlaceholder")}
               />
             )}
-            <button
-              type="button"
+            <Button
+              size="sm"
+              variant="ghost"
               className={`websearch-toggle ${webSearch ? "on" : "off"}`}
-              onClick={toggleWeb}
+              onPress={toggleWeb}
               aria-pressed={webSearch}
-              title={t(webSearch ? "composer.webOnTitle" : "composer.webOffTitle")}
+              aria-label={t(webSearch ? "composer.webOnTitle" : "composer.webOffTitle")}
             >
               <Icon name={webSearch ? "globe" : "lock"} size={14} />
               {webSearch ? t("composer.webOn") : t("composer.webOff")}
-            </button>
-            <button
-              type="button"
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
               className={`websearch-toggle ${containerMode ? "on" : "off"}${containerLocked ? " locked" : ""}`}
-              onClick={toggleContainer}
+              onPress={toggleContainer}
               aria-pressed={containerMode}
-              disabled={containerLocked}
-              title={containerLocked
+              isDisabled={containerLocked}
+              aria-label={containerLocked
                 ? t("composer.containerLockedTitle")
                 : t(containerMode ? "composer.containerOnTitle" : "composer.containerOffTitle")}
             >
               <Icon name={containerMode ? "lock" : "globe"} size={14} />
               {containerMode ? t("composer.containerOn") : t("composer.containerOff")}
-            </button>
-            <button
-              type="button"
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
               className={`advanced-toggle ${advancedOpen ? "on" : ""}`}
-              onClick={() => setAdvancedOpen((v) => !v)}
+              onPress={() => setAdvancedOpen((v) => !v)}
               aria-expanded={advancedOpen}
               aria-controls="dispatch-advanced-controls"
-              title={t("composer.advancedTitle")}
+              aria-label={t("composer.advancedTitle")}
             >
               <Icon name="gear" size={14} />
               {t("composer.advanced")}
               <Icon name="chevronDown" size={13} className="advanced-chevron" />
-            </button>
-            <button className="send" onClick={dispatch} disabled={!text.trim()} title={t("composer.dispatchTitle")} aria-label={t("composer.dispatchTitle")}><Icon name="send" size={15} /></button>
+            </Button>
+            <Button size="sm" variant="primary" isIconOnly className="send" onPress={dispatch} isDisabled={!text.trim()} aria-label={t("composer.dispatchTitle")}><Icon name="send" size={15} /></Button>
           </div>
           {advancedOpen && (
-            <div id="dispatch-advanced-controls" className="composer-advanced-panel">
-              {mode === "ctf" && (
-                <label className="advanced-field flag-format-field">
-                  <span>{t("composer.flagFormat")}</span>
-                  <div className="flag-format-controls">
-                    <select
-                      className="advanced-select"
-                      value={flagFormat}
-                      onChange={(e) => {
-                        const v = e.target.value;
-                        pickFlagFormat(v === "token" ? "token" : v === "custom" ? "custom" : "brace");
-                      }}
-                      title={t("composer.flagFormatTitle")}
-                    >
-                      <option value="brace">{t("composer.flagFormatBrace")}</option>
-                      <option value="custom">{t("composer.flagFormatCustom")}</option>
-                      <option value="token">{t("composer.flagFormatToken")}</option>
-                    </select>
-                    {flagFormat === "custom" && (
-                      <input
-                        className="flag-wrapper-input"
-                        value={flagWrapper}
-                        onChange={(e) => updateFlagWrapper(e.target.value)}
-                        placeholder={t("composer.flagWrapperPlaceholder")}
-                        title={t("composer.flagWrapperTitle")}
-                      />
-                    )}
+            <div id="dispatch-advanced-controls" className="composer-advanced-panel" role="region" aria-label={t("composer.advancedTitle")}>
+              <div className="advanced-panel-heading">
+                <strong>{t("composer.advancedRunSettings")}</strong>
+                <span>{t("composer.advancedRunHint")}</span>
+              </div>
+              <div className="advanced-options-grid">
+                <div className="advanced-option-card">
+                  <div className="advanced-option-copy">
+                    <strong>{t("composer.operatorInput")}</strong>
+                    <span>{t("composer.operatorInputHint")}</span>
                   </div>
-                </label>
-              )}
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className={`websearch-toggle ${allowOperatorInput ? "on" : "off"}`}
+                    onPress={toggleOperatorInput}
+                    aria-pressed={allowOperatorInput}
+                    aria-label={t(allowOperatorInput
+                      ? "composer.operatorInputOnTitle"
+                      : "composer.operatorInputOffTitle")}
+                  >
+                    <Icon name={allowOperatorInput ? "help" : "lock"} size={14} />
+                    {t(allowOperatorInput
+                      ? "composer.operatorInputOn"
+                      : "composer.operatorInputOff")}
+                  </Button>
+                </div>
+                {mode === "ctf" && (
+                  <div className="advanced-option-card advanced-flag-card">
+                    <div className="advanced-option-copy">
+                      <strong>{t("composer.flagFormat")}</strong>
+                      <span>{t("composer.flagFormatHint")}</span>
+                    </div>
+                    <div className="flag-format-controls">
+                      <Select
+                        className="advanced-select"
+                        selectedKey={flagFormat}
+                        onSelectionChange={(key) => {
+                          const v = String(key ?? "brace");
+                          pickFlagFormat(v === "token" ? "token" : v === "custom" ? "custom" : "brace");
+                        }}
+                        aria-label={t("composer.flagFormatTitle")}
+                      >
+                        <Select.Trigger><Select.Value /><Select.Indicator /></Select.Trigger>
+                        <Select.Popover><ListBox>
+                          <ListBoxItem id="brace">{t("composer.flagFormatBrace")}</ListBoxItem>
+                          <ListBoxItem id="custom">{t("composer.flagFormatCustom")}</ListBoxItem>
+                          <ListBoxItem id="token">{t("composer.flagFormatToken")}</ListBoxItem>
+                        </ListBox></Select.Popover>
+                      </Select>
+                      {flagFormat === "custom" && (
+                        <Input
+                          className="flag-wrapper-input"
+                          value={flagWrapper}
+                          onChange={(e) => updateFlagWrapper(e.target.value)}
+                          placeholder={t("composer.flagWrapperPlaceholder")}
+                          aria-label={t("composer.flagWrapperTitle")}
+                        />
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div className="advanced-section-heading">
+                <strong>{t("composer.advancedLimits")}</strong>
+                <span>{t("composer.advancedLimitsHint")}</span>
+              </div>
               <div className="advanced-metrics-grid">
-                <label className="advanced-field advanced-metric-field">
+                <div className="advanced-metric-card">
                   <span>{t("composer.raceTimeout")}</span>
                   <NumberField className="collect-count" min={1} value={raceTimeout}
-                    onChange={(v) => { setAdvancedTouched(true); setRaceTimeout(v); }}
-                    suffix="s"
-                    title={t("composer.raceTimeoutTitle")} />
-                </label>
-                <label className="advanced-field advanced-metric-field">
+                    onChange={(v) => { setAdvancedTouched((old) => ({ ...old, raceTimeout: true })); setRaceTimeout(v); }}
+                    ariaLabel={t("composer.raceTimeout")} title={t("composer.raceTimeoutTitle")} suffix="s" />
+                  <small>{t("composer.raceTimeoutHint")}</small>
+                </div>
+                <div className="advanced-metric-card">
                   <span>{t("composer.wallBudget")}</span>
                   <NumberField className="collect-count" min={0} value={wallClockBudget}
-                    onChange={(v) => { setAdvancedTouched(true); setWallClockBudget(v); }}
-                    suffix="s"
-                    title={t("composer.wallBudgetTitle")} />
-                </label>
-                <label className="advanced-field advanced-metric-field">
+                    onChange={(v) => { setAdvancedTouched((old) => ({ ...old, wallClockBudget: true })); setWallClockBudget(v); }}
+                    ariaLabel={t("composer.wallBudget")} title={t("composer.wallBudgetTitle")} suffix="s" />
+                  <small>{t("composer.zeroUnlimited")}</small>
+                </div>
+                <div className="advanced-metric-card">
                   <span>{t("composer.maxTotalWorkers")}</span>
                   <NumberField className="collect-count" min={0} value={maxTotalWorkers}
-                    onChange={(v) => { setAdvancedTouched(true); setMaxTotalWorkers(v); }}
-                    title={t("composer.maxTotalWorkersTitle")} />
-                </label>
-                <label className="advanced-field advanced-metric-field">
+                    onChange={(v) => { setAdvancedTouched((old) => ({ ...old, maxTotalWorkers: true })); setMaxTotalWorkers(v); }}
+                    ariaLabel={t("composer.maxTotalWorkers")} title={t("composer.maxTotalWorkersTitle")} />
+                  <small>{t("composer.zeroUnlimited")}</small>
+                </div>
+                <div className="advanced-metric-card">
                   <span>{t("composer.costBudget")}</span>
                   <NumberField className="collect-count" min={0} step={0.01} value={costBudgetUsd}
-                    onChange={(v) => { setAdvancedTouched(true); setCostBudgetUsd(v); }}
-                    suffix="USD"
-                    title={t("composer.costBudgetTitle")} />
-                </label>
+                    onChange={(v) => { setAdvancedTouched((old) => ({ ...old, costBudgetUsd: true })); setCostBudgetUsd(v); }}
+                    ariaLabel={t("composer.costBudget")} title={t("composer.costBudgetTitle")} suffix="USD" />
+                  <small>{t("composer.zeroUnlimited")}</small>
+                </div>
               </div>
             </div>
           )}
@@ -1270,10 +1442,10 @@ function Composer({
       });
     };
     return (
-      <div className="composer2 command-composer motion-run-enter">
+      <div className="composer2 command-composer t-page-slide">
         <div className="wrap command-wrap">
           <div className="command-row">
-            <input
+            <Input
               ref={commandRef}
               data-composer-input
               className="command-input"
@@ -1285,20 +1457,21 @@ function Composer({
               }}
               placeholder="输入要向解题 Worker 追问的问题"
             />
-            <button className="send" disabled={!text.trim() || followupPending} onClick={ask} title="Ask" aria-label="Ask"><Icon name="send" size={15} /></button>
+            <Button size="sm" variant="primary" isIconOnly className="send" isDisabled={!text.trim() || followupPending} onPress={ask} aria-label="Ask"><Icon name="send" size={15} /></Button>
           </div>
           <div className="command-actionbar">
             <div className="quick">
-              <button className="primary" disabled={followupPending} title={t("quick.resolveTitle")} onClick={() => onResolve()}><Icon name="refresh" size={13} />{t("quick.resolve")}</button>
-              <button disabled={!text.trim() || followupPending} title={t("quick.ask.tip")} onClick={ask}><Icon name="help" size={13} />{t("quick.ask")}</button>
-              <button disabled={followupPending} title={t("quick.writeup.tip")} onClick={() => void onCommand("global", "writeup", "")}><Icon name="pencil" size={13} />{t("quick.writeup")}</button>
+              <Button size="sm" variant="primary" className="primary" isDisabled={followupPending} aria-label={t("quick.resolveTitle")} onPress={() => onResolve()}><Icon name="refresh" size={13} />{t("quick.resolve")}</Button>
+              <Button size="sm" variant="ghost" isDisabled={!text.trim() || followupPending} aria-label={t("quick.ask.tip")} onPress={ask}><Icon name="help" size={13} />{t("quick.ask")}</Button>
+              {btwButton}
+              <Button size="sm" variant="ghost" isDisabled={followupPending} aria-label={t("quick.writeup.tip")} onPress={() => void onCommand("global", "writeup", "")}><Icon name="pencil" size={13} />{t("quick.writeup")}</Button>
               {solved ? (
                 <>
                   <span className="quick-sep" />
-                  <button className="danger" disabled={followupPending} title={t("quick.markFalseTitle")} onClick={() => {
+                  <Button size="sm" variant="danger-soft" className="danger" isDisabled={followupPending} aria-label={t("quick.markFalseTitle")} onPress={() => {
                     if (flags.length === 1) void onCommand("global", "mark_false", flags[0]);
                     else setMarkFalseOpen((value) => !value);
-                  }}><Icon name="alert" size={13} />{t("quick.markFalse")}</button>
+                  }}><Icon name="alert" size={13} />{t("quick.markFalse")}</Button>
                 </>
               ) : null}
             </div>
@@ -1306,7 +1479,7 @@ function Composer({
           </div>
           {solved && markFalseOpen && flags.length > 1 ? (
             <div className="markfalse-picker" role="group" aria-label={t("quick.markFalseTitle")}>{flags.map((flag) => (
-              <button key={flag} type="button" title={flag} onClick={() => { void onCommand("global", "mark_false", flag); setMarkFalseOpen(false); }}>{flag}</button>
+              <Button key={flag} size="sm" variant="danger-soft" aria-label={flag} onPress={() => { void onCommand("global", "mark_false", flag); setMarkFalseOpen(false); }}>{flag}</Button>
             ))}</div>
           ) : null}
         </div>
@@ -1315,17 +1488,18 @@ function Composer({
   }
 
   return (
-    <div className="composer2 command-composer motion-run-enter">
+    <div className="composer2 command-composer t-page-slide">
       <div className="wrap command-wrap">
         <div className="command-row">
-          <label className="command-target">{t("composer.to")}
-            <select value={cmdTarget} onChange={(e) => setCmdTarget(e.target.value)}>
-              <option value="global">{t("composer.allSolvers")}</option>
-              {solvers.map((s) => <option key={s} value={`solver:${s}`}>{s}</option>)}
-            </select>
-            <Icon name="chevronDown" size={12} />
-          </label>
-          <input
+          <Select className="command-target" selectedKey={cmdTarget} onSelectionChange={(key) => setCmdTarget(String(key ?? "global"))} aria-label={t("composer.to")}>
+            <Label>{t("composer.to")}</Label>
+            <Select.Trigger><Select.Value /><Select.Indicator /></Select.Trigger>
+            <Select.Popover><ListBox>
+              <ListBoxItem id="global">{t("composer.allSolvers")}</ListBoxItem>
+              {solvers.map((s) => <ListBoxItem key={s} id={`solver:${s}`}>{s}</ListBoxItem>)}
+            </ListBox></Select.Popover>
+          </Select>
+          <Input
             ref={commandRef}
             data-composer-input
             className="command-input"
@@ -1334,17 +1508,30 @@ function Composer({
             onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); command("hint"); } }}
             placeholder={t("composer.commandPlaceholder")}
           />
-          <button className="send" onClick={() => command("hint")} title={t("composer.send")} aria-label={t("composer.send")}><Icon name="send" size={15} /></button>
+          <Button size="sm" variant="primary" isIconOnly className="send" onPress={() => command("hint")} aria-label={t("composer.send")}><Icon name="send" size={15} /></Button>
         </div>
         <div className="command-actionbar">
           <div className="quick">
+            {running && (
+              <Button
+                size="sm"
+                variant="ghost"
+                isDisabled={progressPending}
+                aria-busy={progressPending}
+                aria-label={t("quick.progress.tip")}
+                onPress={() => void requestProgress()}
+              >
+                <Icon name="radio" size={13} />{t("quick.progress")}
+              </Button>
+            )}
+            {btwButton}
             {running ? (
               <>
                 {runningActions.map((a) => (
-                  <button key={a.key} title={t(a.tipKey)} aria-label={t(a.tipKey)} onClick={() => command(a.key)}><Icon name={a.icon} size={13} />{t(a.labelKey)}</button>
+                  <Button key={a.key} size="sm" variant="ghost" aria-label={t(a.tipKey)} onPress={() => command(a.key)}><Icon name={a.icon} size={13} />{t(a.labelKey)}</Button>
                 ))}
                 <span className="quick-sep" />
-                <button className="danger" onClick={() => command("stop")} title={t("quick.stopTitle")}><Icon name="xCircle" size={13} />{t("quick.stop")}</button>
+                <Button size="sm" variant="danger-soft" className="danger" onPress={() => command("stop")} aria-label={t("quick.stopTitle")}><Icon name="xCircle" size={13} />{t("quick.stop")}</Button>
               </>
             ) : (
               <span className="command-hint">任务正在结束，请等待完成事件</span>
@@ -1355,18 +1542,19 @@ function Composer({
         {solved && markFalseOpen && flags.length > 1 && (
           <div className="markfalse-picker" role="group" aria-label={t("quick.markFalseTitle")}>
             {flags.map((f) => (
-              <button
+              <Button
+                size="sm"
+                variant="danger-soft"
                 key={f}
-                type="button"
-                title={f}
-                onClick={() => {
+                aria-label={f}
+                onPress={() => {
                   onCommand(cmdTarget, "mark_false", f);
                   setMarkFalseOpen(false);
                   setText("");
                 }}
               >
                 {f}
-              </button>
+              </Button>
             ))}
           </div>
         )}
@@ -1378,15 +1566,12 @@ function Composer({
 type ComposerPrefill = {
   mode: "ctf" | "pentest";
   text: string;
-  goal?: string;
-  scope?: string;
 };
 
 /** First-run actions that prefill the real dispatch composer. */
 const WELCOME_EXAMPLES: Array<{ key: string; icon: IconName; mode: "ctf" | "pentest" }> = [
   { key: "ex1", icon: "globe", mode: "ctf" },
   { key: "ex2", icon: "lock", mode: "ctf" },
-  { key: "ex3", icon: "target", mode: "pentest" },
 ];
 
 function Welcome({
@@ -1399,27 +1584,26 @@ function Welcome({
   return (
     <div className="welcome">
       <div className="welcome-hero">
-        <div className="wm">無敵 <em>Muteki</em></div>
+        <h1 className="wm">{t("welcome.title")}</h1>
         <div className="sub">{t("welcome.sub")}</div>
       </div>
       <div className="suggest-label">{t("welcome.examplesLabel")}</div>
       <div className="suggest">
         {WELCOME_EXAMPLES.map((ex) => (
-          <button
-            type="button"
+          <Button
+            variant="ghost"
             className="suggest-card"
             key={ex.key}
-            onClick={() => onChoose({
+            onPress={() => onChoose({
               mode: ex.mode,
               text: t(`welcome.${ex.key}.prompt`),
-              goal: ex.mode === "pentest" ? t("welcome.ex3.goal") : undefined,
             })}
           >
             <span className="s-ico" aria-hidden="true"><Icon name={ex.icon} size={16} /></span>
             <span className="s-cat">{t(`welcome.${ex.key}.cat`)}</span>
             <span className="s-nm">{t(`welcome.${ex.key}.nm`)}</span>
             <span className="s-tg">{t(`welcome.${ex.key}.tg`)}</span>
-          </button>
+          </Button>
         ))}
       </div>
     </div>
@@ -1431,6 +1615,7 @@ export function Conversation({
   running,
   loading,
   onCommand,
+  onRequestProgress,
   onResolve,
   onDispatch,
   attachments,
@@ -1447,6 +1632,8 @@ export function Conversation({
   onSpawnWorker,
   onKillWorker,
   onOpenWorker,
+  onOpenAgent,
+  onOpenKnowledge,
   onOpenWorkspace,
   onOpenReport,
   onHitlAnswered,
@@ -1458,6 +1645,7 @@ export function Conversation({
   loading: boolean;
   onCommand: (target: string, action: string, text: string,
               opts?: ControlCommandOpts) => Promise<boolean>;
+  onRequestProgress: () => Promise<boolean>;
   onResolve: (text?: string) => void;
   // Returns false when the dispatch was intercepted before launch (e.g. the
   // open-ended collect confirm) — the composer keeps the prompt text then.
@@ -1477,6 +1665,8 @@ export function Conversation({
   onKillWorker: (solverId: string) => void;
   // open the "Worker 详情" panel focused on a single worker (roster row click).
   onOpenWorker: (solverId: string) => void;
+  onOpenAgent?: (solverId: string) => void;
+  onOpenKnowledge?: (id: string) => void;
   onOpenWorkspace: () => void;
   onOpenReport: (reportId: string) => void;
   // fired after an operator answers a blocking HITL decision — owner toasts.
@@ -1489,18 +1679,30 @@ export function Conversation({
   const scrollRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const [inspectorWidth, setInspectorWidth] = useState(INSPECTOR_WIDTH_DEFAULT);
+  const [inspectorOpen, setInspectorOpen] = useState(true);
   const [composerPrefill, setComposerPrefill] = useState<ComposerPrefill | null>(null);
   const consumeComposerPrefill = useCallback(() => setComposerPrefill(null), []);
   const [inspectorResizing, setInspectorResizing] = useState(false);
   const inspectorResizeCleanup = useRef<(() => void) | null>(null);
   useEffect(() => {
     const el = scrollRef.current;
-    if (el && stick.current) el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    // A fresh draft renders the welcome panel, not a chronological feed. On
+    // narrow screens that panel is taller than the available viewport; pinning
+    // it to the bottom hid the title and template label on every page load.
+    if (!deck.started) {
+      stick.current = true;
+      el.scrollTop = 0;
+      return;
+    }
+    if (stick.current) el.scrollTop = el.scrollHeight;
   }, [deck.chat, deck.hitlRequests, deck.started, deck.finished]);
   useEffect(() => {
     try {
       const raw = window.localStorage.getItem(INSPECTOR_WIDTH_STORAGE_KEY);
       if (raw) setInspectorWidth(clampInspectorWidth(Number(raw), window.innerWidth));
+      const openRaw = window.localStorage.getItem(INSPECTOR_OPEN_STORAGE_KEY);
+      if (openRaw === "0" || openRaw === "false") setInspectorOpen(false);
     } catch {
       // keep default when storage is unavailable
     }
@@ -1513,6 +1715,13 @@ export function Conversation({
       // ignore storage failures
     }
   }, [inspectorWidth]);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(INSPECTOR_OPEN_STORAGE_KEY, inspectorOpen ? "1" : "0");
+    } catch {
+      // ignore storage failures
+    }
+  }, [inspectorOpen]);
 
   const resizeInspectorTo = useCallback((clientX: number) => {
     const viewport = typeof window !== "undefined" ? window.innerWidth : undefined;
@@ -1569,6 +1778,9 @@ export function Conversation({
 
   const solvers = Object.keys(deck.lanes);
   const digest = swarmDigest(deck);
+  const latestProgress = [...deck.chat].reverse().find(
+    (message) => message.kind === "progress" && message.progressBrief,
+  )?.progressBrief ?? (deck.finished ? legacyProgressBrief(deck, digest) : undefined);
   // F: only blocking (external_blocker) hand-raises pause the swarm — the hero/flow
   // counts must reflect those, not auto-resolving informational cards.
   const blockingHitlCount = deck.hitlRequests.filter((r) => (r.pausesBehavior ?? true)).length;
@@ -1604,71 +1816,175 @@ export function Conversation({
   const liveStatus = lastSystem
     ? (lastSystem.i18nKey ? t(lastSystem.i18nKey, lastSystem.i18nVars) : lastSystem.content)
     : "";
+  const showInspector = deck.started && !artifactOpen && inspectorOpen;
+  const inspectorToggleLabel = t(inspectorOpen ? "insp.run.hide" : "insp.run.show");
 
   return (
     <div
-      className={`convo ${deck.started && !artifactOpen ? "has-inspector" : ""} ${artifactOpen ? "runtime-peer-open" : ""} ${inspectorResizing ? "inspector-resizing" : ""}`}
+      className={`convo ${showInspector ? "has-inspector" : ""} ${artifactOpen ? "runtime-peer-open" : ""} ${inspectorResizing ? "inspector-resizing" : ""}`}
       style={{ "--inspector-width": `${inspectorWidth}px` } as CSSProperties}
     >
       <div className="sr-only" role="status" aria-live="polite" aria-atomic="true" aria-label={t("a11y.status")}>{liveStatus}</div>
-      <div className="convo-top motion-shell-piece">
-        <button className="icon-btn" onClick={onToggleRail} title={t("convo.toggleRuns")} aria-label={t("convo.toggleRuns")}><Icon name="menu" /></button>
-        <span className="title">{deck.started ? deck.challengeName || t("convo.run") : t("convo.newSolve")}</span>
-        {deck.started && deck.category && <span className="cat">{deck.category}</span>}
-        {deck.runId && (
-          <span className="rid" title={`sessions/${deck.runId}`}>
-            sessions/{deck.runId}
-            {deck.started && (
-              <button className="rid-open" onClick={onOpenWorkspace} title={t("convo.openWorkspace")} aria-label={t("convo.openWorkspace")}><Icon name="panel" size={13} /></button>
-            )}
+      <div className="convo-top t-texts-reveal">
+        <Button
+          size="sm"
+          variant="ghost"
+          isIconOnly
+          className="icon-btn"
+          onPress={onToggleRail}
+          aria-label={t("convo.toggleRuns")}
+        >
+          <Icon name="menu" size={15} />
+        </Button>
+        <div className="convo-top-context">
+          <span
+            className="title"
+            data-tooltip={deck.started ? deck.challengeName || t("convo.run") : t("convo.newSolve")}
+            title={deck.started ? deck.challengeName || t("convo.run") : t("convo.newSolve")}
+          >
+            {deck.started ? deck.challengeName || t("convo.run") : t("convo.newSolve")}
           </span>
-        )}
+          {(deck.started && deck.category) || deck.runId ? (
+            <div className="convo-top-meta">
+              {deck.started && deck.category && (
+                <Chip
+                  size="sm"
+                  variant="soft"
+                  color={getCategoryColor(deck.category)}
+                  className="cat uppercase"
+                >
+                  {deck.category}
+                </Chip>
+              )}
+              {deck.runId && (
+                <Chip
+                  size="sm"
+                  variant="secondary"
+                  className="rid"
+                  data-tooltip={`sessions/${deck.runId}`}
+                  title={`sessions/${deck.runId}`}
+                >
+                  <span>sessions/{deck.runId}</span>
+                  {deck.started && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      isIconOnly
+                      className="rid-open"
+                      onPress={onOpenWorkspace}
+                      aria-label={t("convo.openWorkspace")}
+                    >
+                      <Icon name="panel" size={11} />
+                    </Button>
+                  )}
+                </Chip>
+              )}
+            </div>
+          ) : null}
+        </div>
         {deck.started && (
-          <div className="convo-view-switch selection-glide-host" role="tablist" aria-label={t("convo.viewSwitcher")}>
-            <SelectionGlider selectedKey={artifactOpen ? "runtime" : "conversation"} selector='button[aria-selected="true"]' className="compact" duration={240} />
-            <button type="button" role="tab" aria-selected={!artifactOpen} className={!artifactOpen ? "on" : ""} onClick={onShowConversation}>
-              <Icon name="rows" size={13} />
-              <span>{t("convo.viewConversation")}</span>
-            </button>
-            <button type="button" role="tab" aria-selected={artifactOpen} className={artifactOpen ? "on" : ""} onClick={() => onOpenArtifact(artifactView)}>
-              <Icon name="panel" size={13} />
-              <span>{t("convo.viewRuntime")}</span>
-            </button>
+          <div className="convo-top-view">
+            <Tabs
+              selectedKey={artifactOpen ? "runtime" : "conversation"}
+              onSelectionChange={(key) => {
+                if (key === "runtime") onOpenArtifact(artifactView);
+                else if (key === "collaboration") onOpenArtifact("collaboration");
+                else onShowConversation();
+              }}
+            >
+              <Tabs.List className="convo-view-switch" aria-label={t("convo.viewSwitcher")}>
+                <Tabs.Tab id="conversation">
+                  <Icon name="rows" size={13} />
+                  <span>{t("convo.viewConversation")}</span>
+                  <Tabs.Indicator />
+                </Tabs.Tab>
+                <Tabs.Tab id="runtime">
+                  <Icon name="panel" size={13} />
+                  <span>{t("convo.viewRuntime")}</span>
+                  <Tabs.Indicator />
+                </Tabs.Tab>
+                <Tabs.Tab id="collaboration">
+                  <Icon name="network" size={13} />
+                  <span>{t("convo.viewCollaboration")}</span>
+                  <Tabs.Indicator />
+                </Tabs.Tab>
+              </Tabs.List>
+            </Tabs>
           </div>
         )}
-        <span className="spacer" />
-        {onOpenBtw && (
-          <button
-            className="btw-btn"
-            onClick={onOpenBtw}
-            title={t("btw.btnTitle")}
-            aria-label={t("btw.btnTitle")}
-          >
-            {t("btw.btn")}
-          </button>
-        )}
-        {deck.started && (
-          <span className={`runstate ${runStateClass}`}>{runStateLabel}</span>
-        )}
-        {latestControl && (
-          <span
-            className={`control-receipt status-${latestControl.status}`}
-            title={latestControl.detail || `${latestControl.id} · ${latestControl.target}`}
-          >
-            /{latestControl.action} · {t(`control.status.${latestControl.status}`)}
-          </span>
-        )}
-        <EngineBar degradedEngines={deck.degradedEngines} />
-        <span className={`dot ${connState}`} role="img" aria-label={connectionLabel} title={connectionLabel} />
-        <button
-          className="icon-btn"
-          onClick={onToggleTheme}
-          title={t(theme === "dark" ? "theme.toLight" : "theme.toDark")}
-          aria-label={t(theme === "dark" ? "theme.toLight" : "theme.toDark")}
-        >
-          <Icon name={theme === "dark" ? "sun" : "moon"} />
-        </button>
-        <button className="lang-btn" onClick={() => setLang(lang === "zh" ? "en" : "zh")} title={t("lang.toggleTitle")} aria-label={t("lang.toggleTitle")}>{t("lang.toggle")}</button>
+        <div className="convo-top-controls">
+          <div className="convo-top-status">
+            {deck.started && (
+              <Chip
+                size="sm"
+                variant={runStateClass === "live" || runStateClass === "paused" ? "soft" : "secondary"}
+                color={runStateClass === "live" ? "success" : runStateClass === "paused" ? "warning" : "default"}
+                className={`runstate ${runStateClass}`}
+              >
+                <span className={`runstate-dot ${runStateClass}`} aria-hidden="true" />
+                <span>{runStateLabel}</span>
+              </Chip>
+            )}
+            {latestControl && (
+              <Chip
+                size="sm"
+                variant="soft"
+                color={
+                  latestControl.status === "effect_observed"
+                    ? "success"
+                    : latestControl.status === "failed" || latestControl.status === "rejected"
+                    ? "danger"
+                    : latestControl.status === "partial" || latestControl.status === "unknown"
+                    ? "warning"
+                    : "default"
+                }
+                className={`control-receipt status-${latestControl.status}`}
+                data-tooltip={latestControl.detail || `${latestControl.id} · ${latestControl.target}`}
+                title={latestControl.detail || `${latestControl.id} · ${latestControl.target}`}
+              >
+                /{latestControl.action} · {t(`control.status.${latestControl.status}`)}
+              </Chip>
+            )}
+            <EngineBar degradedEngines={deck.degradedEngines} />
+            <span className={`dot ${connState}`} role="img" aria-label={connectionLabel} data-tooltip={connectionLabel} />
+          </div>
+          <div className="convo-top-actions">
+            {deck.started && !artifactOpen && (
+              <Button
+                size="sm"
+                variant="ghost"
+                isIconOnly
+                className="icon-btn convo-inspector-toggle"
+                onPress={() => setInspectorOpen((open) => !open)}
+                aria-label={inspectorToggleLabel}
+                aria-pressed={inspectorOpen}
+                data-active={inspectorOpen ? "true" : "false"}
+                data-tooltip={inspectorToggleLabel}
+              >
+                <Icon name="panel" size={14} />
+              </Button>
+            )}
+            <Button
+              size="sm"
+              variant="ghost"
+              isIconOnly
+              className="icon-btn"
+              onPress={onToggleTheme}
+              aria-label={t(theme === "dark" ? "theme.toLight" : "theme.toDark")}
+            >
+              <Icon name={theme === "dark" ? "sun" : "moon"} size={14} />
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="lang-btn"
+              onPress={() => setLang(lang === "zh" ? "en" : "zh")}
+              aria-label={t("lang.toggleTitle")}
+            >
+              {t("lang.toggle")}
+            </Button>
+          </div>
+        </div>
       </div>
 
       <div className="convo-body">
@@ -1685,27 +2001,36 @@ export function Conversation({
               <Welcome t={t} onChoose={setComposerPrefill} />
             ) : (
               <div className={`workspace ${artifactOpen ? "solo" : ""}`}>
-                <div className="coord-col motion-run-enter">
+                <div className="coord-col t-page-slide">
                   {deck.started && running && !connected && (
                     <div className="conn-banner" role="status" aria-live="polite">
                       <span className="cb-ico" aria-hidden="true"><Icon name="plug" size={14} /></span>
                       <span className="cb-msg">{t("convo.streamLost")}</span>
                     </div>
                   )}
-                  <StatusHero digest={digest} hitlCount={blockingHitlCount} t={t} />
+                  <div className="coord-sticky-head">
+                    <StatusHero digest={digest} hitlCount={blockingHitlCount} progress={latestProgress} t={t} />
+                    {deck.started && (
+                      <RunSignalsStrip
+                        deck={deck}
+                        onOpenArtifact={onOpenArtifact}
+                        onOpenKnowledge={onOpenKnowledge}
+                      />
+                    )}
+                  </div>
                   {loading ? (
                     <div className="coord-thread">
                       <div className="coord-wrap">
                         <div className="coord-loading">
-                          <span className="skel-spin" aria-hidden="true" />
+                          <Spinner size="sm" color="accent" aria-label={t("loading.run")} />
                           <span className="cl-title">{t("loading.run")}</span>
                           <span className="cl-hint">{t("loading.runHint")}</span>
                         </div>
                         <div className="coord-skel" aria-hidden="true">
                           {[68, 82, 54].map((w, i) => (
                             <div className="coord-skel-bubble" key={i}>
-                              <SkelLine w={`${w}%`} h={10} />
-                              <SkelLine w={`${w - 16}%`} h={10} />
+                              <Skeleton className="skel-line t-skeleton" style={{ width: `${w}%`, height: 10 }} />
+                              <Skeleton className="skel-line t-skeleton" style={{ width: `${w - 16}%`, height: 10 }} />
                             </div>
                           ))}
                         </div>
@@ -1745,23 +2070,25 @@ export function Conversation({
             flags={deck.flags}
             onDispatch={onDispatch}
             onCommand={onCommand}
+            onRequestProgress={onRequestProgress}
             onResolve={onResolve}
             attachments={attachments}
             onAddFiles={onAddFiles}
             onRemoveFile={onRemoveFile}
             prefill={composerPrefill}
             onPrefillConsumed={consumeComposerPrefill}
+            onOpenBtw={onOpenBtw}
           />
         </div>
 
-        {deck.started && !artifactOpen && (
+        {showInspector && (
           <div className="inspector-shell conversation-inspector-shell">
             <div
               className="inspector-resizer"
               role="separator"
               tabIndex={0}
               aria-label={t("insp.run.resize")}
-              title={t("insp.run.resize")}
+              data-tooltip={t("insp.run.resize")}
               aria-orientation="vertical"
               aria-valuemin={INSPECTOR_WIDTH_MIN}
               aria-valuemax={INSPECTOR_WIDTH_MAX}
@@ -1771,8 +2098,28 @@ export function Conversation({
               onDoubleClick={() => setInspectorWidth(clampInspectorWidth(INSPECTOR_WIDTH_DEFAULT, window.innerWidth))}
             />
             {loading ? (
-              <aside className="run-inspector motion-inspector" aria-label={t("insp.run.title")} aria-busy="true">
-                  <InspectorSkeleton />
+              <aside className="run-inspector t-page-slide" aria-label={t("insp.run.title")} aria-busy="true">
+                  <div className="insp-skel" aria-hidden="true">
+                    <div className="insp-skel-sec">
+                      <Skeleton className="skel-line t-skeleton" style={{ width: 56, height: 9, marginBottom: 4 }} />
+                      <Skeleton className="skel-box t-skeleton" style={{ width: "100%", height: 42, borderRadius: 9 }} />
+                      <div className="insp-skel-chips">
+                        {Array.from({ length: 5 }).map((_, index) => <Skeleton key={index} className="skel-box t-skeleton" style={{ width: 62 + (index % 3) * 16, height: 22, borderRadius: 999 }} />)}
+                      </div>
+                    </div>
+                    <div className="insp-skel-sec">
+                      <Skeleton className="skel-line t-skeleton" style={{ width: 70, height: 9, marginBottom: 4 }} />
+                      {Array.from({ length: 3 }).map((_, index) => (
+                        <div className="insp-skel-row" key={index}>
+                          <Skeleton className="skel-box t-skeleton" style={{ width: 28, height: 28, borderRadius: 7 }} />
+                          <div className="insp-skel-row-meta">
+                            <Skeleton className="skel-line t-skeleton" style={{ width: `${64 - index * 8}%`, height: 10 }} />
+                            <Skeleton className="skel-line t-skeleton" style={{ width: `${40 + index * 6}%`, height: 8 }} />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
               </aside>
             ) : (
               <RunInspector
@@ -1784,9 +2131,11 @@ export function Conversation({
                 onSpawnWorker={onSpawnWorker}
                 onKillWorker={onKillWorker}
                 onOpenWorker={onOpenWorker}
+                onOpenAgent={onOpenAgent}
                 onWriteup={onWriteup}
                 onMarkFalseFlag={onMarkFalseFlag}
                 onOpenReport={onOpenReport}
+                onClose={() => setInspectorOpen(false)}
               />
             )}
           </div>

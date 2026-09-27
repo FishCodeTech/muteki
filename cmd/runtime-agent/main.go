@@ -15,8 +15,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -34,9 +37,10 @@ const agentVersion = "muteki-runtime-agent/2"
 var startedAt = time.Now()
 
 type supervisor struct {
-	runID     string
-	token     string
-	workspace string
+	runID      string
+	sharedPool bool
+	token      string
+	workspace  string
 
 	// the single reverse connection to the host + a write mutex (all worker streams
 	// multiplex onto it, so writes must be serialized).
@@ -46,12 +50,19 @@ type supervisor struct {
 
 	mu      sync.Mutex
 	workers map[string]*worker
+	owners  map[string]sharedOwner
 	seq     int
+}
+
+type sharedOwner struct {
+	token     string
+	workspace string
 }
 
 func main() {
 	connect := flag.String("connect", "", "host control receiver host:port to dial (e.g. host.docker.internal:9100). Required.")
 	runID := flag.String("run-id", "", "this run's id, sent in the Hello frame")
+	sharedPool := flag.Bool("shared-pool", false, "serve multiple explicitly trusted Runs")
 	tokenPath := flag.String("token", "", "path to the per-run token file (default: /run/muteki/control/token)")
 	tokenInline := flag.String("token-value", "", "the per-run token directly (overrides --token file)")
 	workspace := flag.String("workspace", "/home/kali/workspace", "worker workspace (mount target)")
@@ -66,9 +77,11 @@ func main() {
 	resolveKali()
 
 	s := &supervisor{
-		runID:     *runID,
-		workspace: *workspace,
-		workers:   map[string]*worker{},
+		runID:      *runID,
+		sharedPool: *sharedPool,
+		workspace:  *workspace,
+		workers:    map[string]*worker{},
+		owners:     map[string]sharedOwner{},
 	}
 
 	// Token: inline value wins, else read the file.
@@ -95,8 +108,11 @@ func main() {
 	// Bootstrap the workspace tool-awareness files (坑 A): the host bind-mounts an
 	// (initially empty) workspace over /home/kali/workspace, shadowing anything baked
 	// there. We cp the baked /opt/muteki/{AGENTS,CLAUDE}.md in AFTER the mount so the
-	// CLIs auto-read them. Idempotent — never clobber a worker-modified copy.
-	s.seedWorkspaceDocs()
+	// CLIs auto-read them. Muteki-managed docs carry a version marker and are upgraded
+	// in place; operator-owned files without the marker are never overwritten.
+	if !s.sharedPool {
+		s.seedWorkspaceDocs()
+	}
 
 	// Reap-on-signal: as PID1, handle TERM/INT so `docker stop` is graceful.
 	// Managed workers retain Cmd.Wait as their sole reaper; SIGCHLD only reaps
@@ -194,13 +210,23 @@ func (s *supervisor) dispatch(req *Request) {
 	switch req.Op {
 	case OpStartWorker:
 		s.opStartWorker(req)
+	case OpRegisterRun:
+		s.opRegisterRun(req)
 	case OpSignal:
 		s.opSignal(req)
 	case OpStatus:
 		s.opStatus(req)
 	case OpTeardownRun:
-		s.killAll()
-		s.send(Frame{T: "resp", ReqID: req.ReqID, OK: true})
+		if s.sharedPool {
+			if req.OwnerRunID == "" {
+				s.send(Frame{T: "resp", ReqID: req.ReqID, OK: false})
+			} else {
+				s.send(Frame{T: "resp", ReqID: req.ReqID, OK: s.killOwned(req.OwnerRunID, req.OwnerToken)})
+			}
+		} else {
+			s.killAll()
+			s.send(Frame{T: "resp", ReqID: req.ReqID, OK: true})
+		}
 	case OpHealth:
 		s.opHealth(req)
 	default:
@@ -223,13 +249,32 @@ func (s *supervisor) opStartWorker(req *Request) {
 		s.send(Frame{T: "started", ReqID: req.ReqID, Error: "missing spec"})
 		return
 	}
+	if s.sharedPool {
+		owner := filepath.Clean(req.Spec.OwnerWorkspace)
+		root := filepath.Clean(s.workspace)
+		cwd := filepath.Clean(req.Spec.Cwd)
+		s.mu.Lock()
+		registered, active := s.owners[req.Spec.OwnerRunID]
+		s.mu.Unlock()
+		if req.Spec.OwnerRunID == "" || owner == root ||
+			!pathWithin(owner, root) || !pathWithin(cwd, owner) ||
+			!active || registered.token != req.Spec.OwnerToken || registered.workspace != owner {
+			s.send(Frame{T: "started", ReqID: req.ReqID, Error: "invalid shared Run workspace ownership"})
+			return
+		}
+		s.seedWorkspaceDocsAt(owner)
+	} else {
+		req.Spec.OwnerRunID = s.runID
+	}
 	s.mu.Lock()
 	s.seq++
 	id := "w-" + itoa(s.seq) + "-" + shortRand()
 	s.mu.Unlock()
 
 	// Ensure the tool-awareness docs are in place right before a worker starts.
-	s.seedWorkspaceDocs()
+	if !s.sharedPool {
+		s.seedWorkspaceDocs()
+	}
 
 	w, events, err := startWorker(id, req.Spec)
 	if err != nil {
@@ -256,6 +301,30 @@ func (s *supervisor) opStartWorker(req *Request) {
 		delete(s.workers, id)
 		s.mu.Unlock()
 	}(id, req.ReqID)
+}
+
+func (s *supervisor) opRegisterRun(req *Request) {
+	if !s.sharedPool || req.OwnerRunID == "" || len(req.OwnerToken) < 32 {
+		s.send(Frame{T: "resp", ReqID: req.ReqID, OK: false})
+		return
+	}
+	owner := filepath.Clean(req.OwnerWorkspace)
+	root := filepath.Clean(s.workspace)
+	if owner == root || filepath.Dir(owner) != root || !pathWithin(owner, root) {
+		s.send(Frame{T: "resp", ReqID: req.ReqID, OK: false})
+		return
+	}
+	s.mu.Lock()
+	if s.owners == nil {
+		s.owners = map[string]sharedOwner{}
+	}
+	previous, exists := s.owners[req.OwnerRunID]
+	ok := !exists || (previous.token == req.OwnerToken && previous.workspace == owner)
+	if ok {
+		s.owners[req.OwnerRunID] = sharedOwner{token: req.OwnerToken, workspace: owner}
+	}
+	s.mu.Unlock()
+	s.send(Frame{T: "resp", ReqID: req.ReqID, OK: ok})
 }
 
 func (s *supervisor) opSignal(req *Request) {
@@ -289,7 +358,8 @@ func (s *supervisor) opHealth(req *Request) {
 	s.mu.Unlock()
 	s.send(Frame{
 		T: "resp", ReqID: req.ReqID, OK: true, Version: agentVersion,
-		Workers: n, Uptime: int64(time.Since(startedAt).Seconds()),
+		ScopedTeardown: true,
+		Workers:        n, Uptime: int64(time.Since(startedAt).Seconds()),
 	})
 }
 
@@ -334,28 +404,104 @@ func (s *supervisor) chownWorkspaceRoot() {
 	log.Printf("chowned workspace %s to kali(%d:%d)", s.workspace, kaliUID, kaliGID)
 }
 
+// workspaceDocMarker prefixes Muteki-managed AGENTS.md / CLAUDE.md. Operator-owned
+// files without this marker are never overwritten on image upgrade.
+const workspaceDocMarker = "<!-- muteki-workspace-doc:"
+
+func managedWorkspaceDoc(data []byte) bool {
+	if bytes.HasPrefix(data, []byte(workspaceDocMarker)) {
+		return true
+	}
+	// Exact former baked guides only; ordinary operator notes remain untouched.
+	// The second digest is the guide shipped in the v0.3.2 full/slim images.
+	switch fmt.Sprintf("%x", sha256.Sum256(data)) {
+	case "121761a2406c6e363bab817b9b954582d4485bdca902b21b55827f344ee334ac",
+		"670954408282afece055035a4139f03a3a8b49f7c378dc8c988aeffe812f4b8c":
+		return true
+	default:
+		return false
+	}
+}
+
+// seedManagedWorkspaceDoc writes or upgrades one Muteki-managed workspace doc.
+// Returns: "seeded", "upgraded", "unchanged", "skip-operator", or "skip-missing-src".
+func seedManagedWorkspaceDoc(workspace, name string, srcData []byte) (string, error) {
+	if len(srcData) == 0 {
+		return "skip-missing-src", nil
+	}
+	if !bytes.HasPrefix(srcData, []byte(workspaceDocMarker)) {
+		return "skip-unmanaged-src", nil
+	}
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		return "", err
+	}
+	dst := filepath.Join(workspace, name)
+	if info, err := os.Lstat(dst); err == nil && (!info.Mode().IsRegular()) {
+		return "skip-operator", nil
+	} else if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	existed := false
+	existing, err := os.ReadFile(dst)
+	if err == nil {
+		existed = true
+		if !managedWorkspaceDoc(existing) {
+			return "skip-operator", nil
+		}
+		if bytes.Equal(existing, srcData) {
+			return "unchanged", nil
+		}
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	tmp, err := os.CreateTemp(workspace, ".muteki-workspace-doc-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err = tmp.Write(srcData); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if err = tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	if err = tmp.Close(); err != nil {
+		return "", err
+	}
+	if err = os.Rename(tmp.Name(), dst); err != nil {
+		return "", err
+	}
+	if kaliUID >= 0 {
+		_ = os.Chown(dst, kaliUID, kaliGID)
+	}
+	if existed {
+		return "upgraded", nil
+	}
+	return "seeded", nil
+}
+
 func (s *supervisor) seedWorkspaceDocs() {
+	s.seedWorkspaceDocsAt(s.workspace)
+}
+
+func (s *supervisor) seedWorkspaceDocsAt(workspace string) {
 	for _, name := range []string{"AGENTS.md", "CLAUDE.md"} {
 		src := filepath.Join("/opt/muteki", name)
-		dst := filepath.Join(s.workspace, name)
-		if _, err := os.Stat(dst); err == nil {
-			continue // already present (worker may have edited it) — don't clobber
-		}
 		data, err := os.ReadFile(src)
 		if err != nil {
 			continue
 		}
-		if err := os.MkdirAll(s.workspace, 0o755); err != nil {
+		action, err := seedManagedWorkspaceDoc(workspace, name, data)
+		if err != nil {
+			log.Printf("seed %s: %v", filepath.Join(workspace, name), err)
 			continue
 		}
-		if err := os.WriteFile(dst, data, 0o644); err != nil {
-			log.Printf("seed %s: %v", dst, err)
-			continue
+		switch action {
+		case "seeded", "upgraded":
+			log.Printf("%s %s", action, filepath.Join(workspace, name))
 		}
-		if kaliUID >= 0 {
-			_ = os.Chown(dst, kaliUID, kaliGID)
-		}
-		log.Printf("seeded %s", dst)
 	}
 }
 
@@ -375,6 +521,61 @@ func (s *supervisor) killAll() {
 	for _, w := range ws {
 		w.signal("KILL")
 	}
+}
+
+func pathWithin(child, parent string) bool {
+	rel, err := filepath.Rel(parent, child)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+func (s *supervisor) killOwned(ownerRunID, ownerToken string) bool {
+	s.mu.Lock()
+	registered, active := s.owners[ownerRunID]
+	if active && registered.token != ownerToken {
+		s.mu.Unlock()
+		return false
+	}
+	ws := make([]*worker, 0)
+	for _, w := range s.workers {
+		if w.ownerRunID == ownerRunID {
+			if !active || w.ownerToken != ownerToken {
+				if state, _, _, _, _ := w.status(); state == "running" {
+					s.mu.Unlock()
+					return false
+				}
+				continue
+			}
+			ws = append(ws, w)
+		}
+	}
+	if !active {
+		s.mu.Unlock()
+		return true
+	}
+	s.mu.Unlock()
+	for _, w := range ws {
+		if state, _, _, _, _ := w.status(); state == "running" {
+			_ = w.signal("KILL")
+		}
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		allExited := true
+		for _, w := range ws {
+			if state, _, _, _, _ := w.status(); state == "running" {
+				allExited = false
+				break
+			}
+		}
+		if allExited {
+			s.mu.Lock()
+			delete(s.owners, ownerRunID)
+			s.mu.Unlock()
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
 }
 
 // installSignalHandlers installs the same signal path used by production and

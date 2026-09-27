@@ -1,0 +1,376 @@
+/* Backdrop */
+.t-backdrop {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--duration-quick) var(--ease-out);
+}
+.t-backdrop.is-open {
+  opacity: 1;
+  pointer-events: auto;
+}
+.t-backdrop.is-closing {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Modal #06 */
+.t-modal {
+  transform-origin: center;
+  transform: scale(var(--modal-scale));
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    transform var(--modal-open-dur) var(--modal-ease),
+    opacity var(--modal-open-dur) var(--modal-ease);
+  will-change: transform, opacity;
+}
+.t-modal.is-open {
+  transform: scale(1);
+  opacity: 1;
+  pointer-events: auto;
+}
+.t-modal.is-closing {
+  transform: scale(var(--modal-scale-close));
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    transform var(--modal-close-dur) var(--modal-ease),
+    opacity var(--modal-close-dur) var(--modal-ease);
+}
+
+/* Dropdown #05 */
+.t-dropdown {
+  transform-origin: top left;
+  transform: scale(var(--dropdown-pre-scale));
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    transform var(--dropdown-open-dur) var(--dropdown-ease),
+    opacity var(--dropdown-open-dur) var(--dropdown-ease);
+}
+.t-dropdown[data-origin="top-right"] { transform-origin: top right; }
+.t-dropdown[data-origin="top-center"] { transform-origin: top center; }
+.t-dropdown[data-origin="bottom-left"] { transform-origin: bottom left; }
+.t-dropdown[data-origin="bottom-center"] { transform-origin: bottom center; }
+.t-dropdown[data-origin="bottom-right"] { transform-origin: bottom right; }
+.t-dropdown.is-open {
+  transform: scale(1);
+  opacity: 1;
+  pointer-events: auto;
+}
+.t-dropdown.is-closing {
+  transform: scale(var(--dropdown-closing-scale));
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    transform var(--dropdown-close-dur) var(--dropdown-ease),
+    opacity var(--dropdown-close-dur) var(--dropdown-ease);
+}
+
+/* Panel reveal #07 — transform/opacity only, blur disabled */
+.t-panel-slide {
+  --panel-axis-x: 0px;
+  --panel-axis-y: var(--panel-translate-y);
+  transform: translate(var(--panel-axis-x), var(--panel-axis-y));
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    transform var(--panel-close-dur) var(--panel-ease),
+    opacity var(--panel-close-dur) var(--panel-ease);
+}
+.t-panel-slide[data-axis="x"] {
+  --panel-axis-x: var(--panel-translate-x);
+  --panel-axis-y: 0px;
+}
+.t-panel-slide.is-open,
+.t-panel-slide[data-open="true"] {
+  transform: translate(0, 0);
+  opacity: 1;
+  pointer-events: auto;
+  transition:
+    transform var(--panel-open-dur) var(--panel-ease),
+    opacity var(--panel-open-dur) var(--panel-ease);
+}
+.t-modal.is-open,
+.t-modal.is-closing,
+.t-dropdown.is-open,
+.t-dropdown.is-closing,
+.t-panel-slide.is-open,
+.t-panel-slide.is-closing,
+.t-toast.is-open {
+  will-change: transform, opacity;
+}
+.t-panel-slide.is-closing {
+  transform: translate(var(--panel-axis-x), var(--panel-axis-y));
+  opacity: 0;
+  pointer-events: none;
+  transition-duration: var(--panel-close-dur);
+}
+.ai-details-drawer.t-panel-slide.is-closing {
+  overflow: hidden;
+  border-left-color: transparent;
+}
+
+/* Toast #22 + banner stack #32 */
+.t-toast {
+  opacity: 0;
+  transform: translateY(var(--toast-distance)) scale(var(--toast-scale));
+  transition:
+    opacity var(--toast-close) var(--toast-ease),
+    transform var(--toast-close) var(--toast-ease);
+}
+.t-toast.is-open {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  transition:
+    opacity var(--toast-open) var(--toast-ease),
+    transform var(--toast-open) var(--toast-ease);
+}
+.t-banner-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--stack-spread-gap);
+}
+.t-banner-stack > .t-toast:nth-child(2) {
+  transform: translateY(calc(var(--stack-peek) * -0.35)) scale(calc(1 - var(--stack-depth-scale)));
+}
+.t-banner-stack > .t-toast:nth-child(2).is-open {
+  transform: translateY(calc(var(--stack-peek) * -0.35)) scale(calc(1 - var(--stack-depth-scale)));
+}
+.t-banner-stack > .t-toast:nth-child(n+3) {
+  transform: translateY(calc(var(--stack-peek) * -0.6)) scale(calc(1 - var(--stack-depth-scale) * 2));
+}
+.t-banner-stack > .t-toast:nth-child(n+3).is-open {
+  transform: translateY(calc(var(--stack-peek) * -0.6)) scale(calc(1 - var(--stack-depth-scale) * 2));
+  opacity: calc(1 - var(--stack-depth-fade));
+}
+
+/* Tabs sliding #16 — pill measurement is JS, tween is CSS */
+.t-tabs {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.t-tabs-pill,
+.selection-glider.t-tabs-pill {
+  transition:
+    transform var(--tabs-dur) var(--tabs-ease),
+    opacity var(--duration-quick) var(--tabs-ease);
+}
+.t-tabs-pill.is-animating,
+.selection-glider.t-tabs-pill.is-animating { will-change: transform; }
+
+/* Accordion #21 */
+.t-accordion {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0.96;
+  transition:
+    grid-template-rows var(--acc-collapse) var(--acc-ease),
+    opacity var(--duration-quick) var(--acc-ease);
+}
+.t-accordion.is-open,
+.t-accordion[data-state="open"] {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transition:
+    grid-template-rows var(--acc-expand) var(--acc-ease),
+    opacity var(--duration-quick) var(--acc-ease);
+}
+.t-accordion-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Texts reveal #18 — CSS mount only, safe on SSE remounts */
+.t-texts-reveal {
+  animation: t-texts-reveal-in var(--stagger-dur) var(--stagger-ease) both;
+}
+@keyframes t-texts-reveal-in {
+  from {
+    opacity: 0;
+    transform: translateY(var(--stagger-distance));
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Page side-by-side #08 */
+.t-page-slide {
+  animation: t-page-slide-in var(--page-slide-dur) var(--page-slide-ease) both;
+}
+@keyframes t-page-slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(var(--page-slide-distance));
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Skeleton reveal #14 */
+.t-skeleton {
+  background: color-mix(in srgb, var(--panel2, #222) 80%, var(--border, #333));
+  animation: t-skeleton-pulse var(--pulse-dur) var(--ease-linear) infinite;
+}
+@keyframes t-skeleton-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: var(--pulse-min); }
+}
+.t-skeleton-reveal {
+  animation: t-texts-reveal-in var(--reveal-dur) var(--reveal-ease) both;
+}
+
+/* Shimmer text #15 */
+.t-shimmer-text {
+  background-image: linear-gradient(
+    90deg,
+    var(--shimmer-base) 35%,
+    var(--shimmer-highlight) 50%,
+    var(--shimmer-base) 65%
+  );
+  background-size: var(--shimmer-band) 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: t-shimmer-move var(--shimmer-dur) var(--shimmer-ease) infinite;
+}
+@keyframes t-shimmer-move {
+  0% { background-position: 150%; }
+  100% { background-position: -50%; }
+}
+
+/* Thinking states #28 */
+.t-thinking {
+  color: var(--think-base);
+}
+.t-thinking.is-working {
+  background-image: linear-gradient(
+    90deg,
+    var(--think-base) 35%,
+    var(--think-highlight) 50%,
+    var(--think-base) 65%
+  );
+  background-size: var(--shimmer-band) 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: t-shimmer-move var(--think-shimmer) var(--ease-linear) infinite;
+}
+
+/* Streaming text #30 — word-level enter, no blur */
+.t-stream-word {
+  animation: t-stream-in var(--stream-fade) var(--stream-ease) both;
+}
+@keyframes t-stream-in {
+  from { opacity: 0; transform: translateY(2px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* Notification badge #03 */
+.t-badge {
+  transform: scale(0.82);
+  opacity: 0;
+  transform-origin: center;
+  animation: t-badge-pop var(--badge-pop-dur) var(--badge-pop-ease) both;
+}
+@keyframes t-badge-pop {
+  0% { transform: scale(0.82); opacity: 0; }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+/* Flag pulse — CSS replacement for the anime.js milestone beat */
+.t-flag-pulse {
+  transform-origin: left center;
+  animation: t-flag-pulse-kf var(--flag-pulse-dur) var(--flag-pulse-ease);
+}
+@keyframes t-flag-pulse-kf {
+  0%, 100% { transform: scale(1); }
+  45% { transform: scale(var(--flag-pulse-scale)); }
+}
+
+/* Error shake #12 */
+.t-error-shake,
+.t-error-shake.is-shaking {
+  animation: t-error-shake-kf calc(var(--shake-dur-a) + var(--shake-dur-b) * 3) var(--shake-ease);
+}
+@keyframes t-error-shake-kf {
+  0% { transform: translateX(0); }
+  20% { transform: translateX(calc(var(--shake-distance) * -1)); }
+  40% { transform: translateX(var(--shake-overshoot)); }
+  60% { transform: translateX(calc(var(--shake-distance) * -0.5)); }
+  80% { transform: translateX(var(--shake-overshoot)); }
+  100% { transform: translateX(0); }
+}
+
+/* Tooltip #17 */
+.t-tooltip {
+  opacity: 0;
+  transform: scale(var(--tt-scale));
+  pointer-events: none;
+  transition:
+    opacity var(--tt-out-dur) var(--tt-out-ease),
+    transform var(--tt-out-dur) var(--tt-out-ease);
+}
+.t-tooltip.is-open {
+  opacity: 1;
+  transform: scale(1);
+  pointer-events: auto;
+  transition:
+    opacity var(--tt-in-dur) var(--tt-in-ease) var(--tt-delay),
+    transform var(--tt-in-dur) var(--tt-in-ease) var(--tt-delay);
+}
+
+.t-lift {
+  transition: transform var(--duration-micro) var(--ease-out);
+}
+@media (hover: hover) and (pointer: fine) {
+  .t-lift:hover:not(:disabled):not(:active) {
+    transform: translateY(-1px);
+  }
+  .thread-item:hover:not(:active) {
+    transform: translateX(1px);
+  }
+}
+.coord-bubble:not(.digest):not(.answer) {
+  animation: t-texts-reveal-in var(--stagger-dur) var(--stagger-ease) both;
+}
+.activity-feed .act-msg,
+.wlane {
+  animation: t-texts-reveal-in var(--duration-quick) var(--ease-out) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .t-backdrop,
+  .t-modal,
+  .t-dropdown,
+  .t-panel-slide,
+  .t-toast,
+  .t-tabs-pill,
+  .selection-glider.t-tabs-pill,
+  .t-accordion,
+  .t-tooltip {
+    transition-duration: 0.01ms !important;
+  }
+  .t-texts-reveal,
+  .t-page-slide,
+  .t-skeleton,
+  .t-skeleton-reveal,
+  .t-shimmer-text,
+  .t-thinking.is-working,
+  .t-stream-word,
+  .t-badge,
+  .t-flag-pulse,
+  .t-error-shake,
+  .coord-bubble,
+  .activity-feed .act-msg,
+  .wlane {
+    animation: none !important;
+  }
+}

@@ -50,6 +50,8 @@ class _ReportsMixin:
     def report_repro_decision(
         self, *, actor: str, report_id: str, reproduced: bool,
         detail: str = "", witness: str = "", intent_id: Optional[str] = None,
+        command: str = "", target: str = "", response_summary: str = "",
+        evidence: Optional[dict[str, Any]] = None,
     ) -> int:
         payload = {
             "report_id": str(report_id or ""),
@@ -57,6 +59,10 @@ class _ReportsMixin:
             "detail": str(detail or "")[:800],
             "witness": str(witness or "")[:400],
             "verifier": actor,
+            "command": str(command or "")[:1200],
+            "target": str(target or "")[:500],
+            "response_summary": str(response_summary or "")[:800],
+            "evidence": dict(evidence or {}),
         }
         if intent_id:
             payload["intent_id"] = intent_id
@@ -177,11 +183,27 @@ class _ReportsMixin:
         return out
 
     def pending_report_value_judges(self) -> list[dict[str, Any]]:
-        return [
-            dict(item["report"])
-            for item in self.report_states().values()
-            if item.get("status") == "reproduced"
-        ]
+        out: list[dict[str, Any]] = []
+        for item in self.report_states().values():
+            if item.get("status") != "reproduced":
+                continue
+            row = dict(item.get("report") or {})
+            repro = dict(item.get("repro") or {})
+            # Keep the evidence emitted by the independent verifier beside the
+            # submitted report.  The value judge and goal gate can then reason
+            # about the same persisted receipt.
+            row["reproduction"] = {
+                "verified": True,
+                "witness": str(repro.get("witness") or ""),
+                "detail": str(repro.get("detail") or ""),
+                "verifier": str(repro.get("verifier") or repro.get("_actor") or ""),
+                "command": str(repro.get("command") or ""),
+                "target": str(repro.get("target") or ""),
+                "response_summary": str(repro.get("response_summary") or ""),
+                "evidence": dict(repro.get("evidence") or {}),
+            }
+            out.append(row)
+        return out
 
     def accepted_reports(self) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -189,5 +211,17 @@ class _ReportsMixin:
             if item.get("status") != "accepted":
                 continue
             row = dict(item.get("accepted") or item.get("report") or {})
+            if "reproduction" not in row:
+                repro = dict(item.get("repro") or {})
+                row["reproduction"] = {
+                    "verified": bool(repro),
+                    "witness": str(repro.get("witness") or ""),
+                    "detail": str(repro.get("detail") or ""),
+                    "verifier": str(repro.get("verifier") or repro.get("_actor") or ""),
+                    "command": str(repro.get("command") or ""),
+                    "target": str(repro.get("target") or ""),
+                    "response_summary": str(repro.get("response_summary") or ""),
+                    "evidence": dict(repro.get("evidence") or {}),
+                }
             out.append(row)
         return out
