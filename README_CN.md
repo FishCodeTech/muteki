@@ -23,7 +23,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <strong>简体中文</strong>
+  <a href="README.md">English</a> · <strong>简体中文</strong> · <a href="CHANGELOG.md">版本更新</a>
 </p>
 
 <p align="center">
@@ -90,6 +90,12 @@ tsecbench 托管模式下+deepseek-flash，排名13
 欢迎使用并一同建设升级，遇到的任何问题请随时提issue，欢迎加入交流群。我们共同建设世界最强的ctf agent。（群满了，有需要进群的加我微信）
 
 ![mmqrcode1790533396147](./assets/mmqrcode1790533396147.png)
+
+---
+
+## 版本更新
+
+当前版本为 **0.4.0**。新增功能、行为变化、移除内容及升级说明见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
@@ -309,7 +315,7 @@ MUTEKI_WEB_PASSWORD='请替换为强密码' \
 ```bash
 ./run.sh upgrade --check   # 检查稳定版
 ./run.sh install            # 安装托管版本
-muteki upgrade             # 更新到稳定版
+muteki upgrade v0.4.0      # 更新到本次版本
 muteki rollback            # 回滚到上一个已安装版本
 muteki version             # 查看版本与安装形态
 ```
