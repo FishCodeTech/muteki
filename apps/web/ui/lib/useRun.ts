@@ -134,6 +134,7 @@ const isDraftRunId = (id: string) => id.startsWith("draft-");
 /** One run as the thread rail lists it (matches RunManager.Run.summary()). */
 export interface RunSummary {
   run_id: string;
+  mode?: "ctf" | "pentest";
   name: string;
   category: string;
   started: boolean;

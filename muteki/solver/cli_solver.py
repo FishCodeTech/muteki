@@ -50,7 +50,7 @@ from muteki.solver.cli_workspace import (  # noqa: F401
 from muteki.solver import cli_board_context as _cli_board
 from muteki.solver import cli_control as _cli_control
 from muteki.solver import cli_events as _cli_events
-from muteki.solver import cli_findings_reports as _cli_findings
+from muteki.solver import cli_poc_review as _cli_poc_review
 from muteki.solver import cli_modes as _cli_modes
 from muteki.solver import cli_process as _cli_process
 from muteki.solver import cli_protocol as _cli_protocol
@@ -158,8 +158,6 @@ class CliSolver:
         self._staged_files: list[str] = []  # attachment basenames copied into cwd
         self._task_file_name = ""
         self._task_file_sha256 = ""
-        self._report_file_name = ""
-        self._report_file_sha256 = ""
         # eval hygiene: offline mode denies the agent's web tools so a bench run
         # can't be contaminated by a writeup lookup. Keep web ON for real CTF.
         self.web_access = web_access
@@ -368,8 +366,6 @@ class CliSolver:
         # A re-bootstrapped worker is seeded with the run's already-found flags so
         # its prompt lists them and it hunts only the rest.
         self._already_found: "set[str]" = set(found_flags or [])
-        self._already_found_findings: "set[str]" = set()
-        self._already_submitted_reports: "set[str]" = set()
         # Flags this model submitted through the Blackboard Skill during this Worker.
         self._stream_accepted: "list[str]" = []
         # Full, untruncated tool output remains available for facts, findings, and
@@ -496,7 +492,7 @@ class CliSolver:
                 outcome = await self._run_respond()
             elif self.mode == "review":
                 outcome = await self._run_review()
-            elif self.mode in ("explore", "fact_verifier", "report_reproducer"):
+            elif self.mode in ("explore", "fact_verifier"):
                 outcome = await self._run_explore()
             else:
                 outcome = await self._run_bootstrap()
@@ -655,12 +651,9 @@ CliSolver._ensure_shared_attachment = _cli_workspace._ensure_shared_attachment
 CliSolver._link_existing_shared_artifacts = _cli_workspace._link_existing_shared_artifacts
 CliSolver._link_inherited_pocs = _cli_workspace._link_inherited_pocs
 CliSolver._link_shared_attachment = _cli_workspace._link_shared_attachment
-CliSolver._path_inside = _cli_workspace._path_inside
-CliSolver._resolve_report_path = _cli_workspace._resolve_report_path
 CliSolver._spill_host_path = _cli_workspace._spill_host_path
 CliSolver._stage_attachments = _cli_workspace._stage_attachments
 CliSolver._workdir_path = _cli_workspace._workdir_path
-CliSolver._workdir_roots = _cli_workspace._workdir_roots
 CliSolver._board_context = _cli_board._board_context
 CliSolver._board_markdown = _cli_board._board_markdown
 CliSolver._board_pointer = _cli_board._board_pointer
@@ -732,12 +725,10 @@ CliSolver._ensure_role_contract = _cli_process._ensure_role_contract
 CliSolver._worker_env = _cli_process._worker_env
 CliSolver.runtime_exit_confirmed = _cli_process.runtime_exit_confirmed
 CliSolver.wait_runtime_exit = _cli_process.wait_runtime_exit
-CliSolver._accept_finding = _cli_findings._accept_finding
 CliSolver._accept_flag = _cli_results._accept_flag
-CliSolver._accept_or_reject_report = _cli_findings._accept_or_reject_report
 CliSolver._accept_submitted_flag = _cli_results._accept_submitted_flag
 CliSolver._accepted_flags_for_outcome = _cli_results._accepted_flags_for_outcome
-CliSolver._apply_review_actions = _cli_findings._apply_review_actions
+CliSolver._apply_review_actions = _cli_poc_review._apply_review_actions
 CliSolver._bind_tool_evidence_event = _cli_results._bind_tool_evidence_event
 CliSolver._build_worker_result = _cli_results._build_worker_result
 CliSolver._commit_worker_result = _cli_results._commit_worker_result
@@ -750,24 +741,18 @@ CliSolver._handle_blackboard_request = _cli_results._handle_blackboard_request
 CliSolver._write_blackboard_result = _cli_results._write_blackboard_result
 CliSolver._emit_empty_stderr_diagnostic = _cli_results._emit_empty_stderr_diagnostic
 CliSolver._estimated_cli_result_from_stream = _cli_results._estimated_cli_result_from_stream
-CliSolver._finalize_verifier_repro = _cli_findings._finalize_verifier_repro
 CliSolver._finding_evidence_corpus = _cli_results._finding_evidence_corpus
-CliSolver._finish_pentest_finding = _cli_findings._finish_pentest_finding
 CliSolver._flush_stream_activity_cost = _cli_results._flush_stream_activity_cost
-CliSolver._handle_poc_save = _cli_findings._handle_poc_save
+CliSolver._handle_poc_save = _cli_poc_review._handle_poc_save
 CliSolver._is_solved_claim = _cli_results._is_solved_claim
-CliSolver._mark_claimed_pocs_spent = _cli_findings._mark_claimed_pocs_spent
+CliSolver._mark_claimed_pocs_spent = _cli_poc_review._mark_claimed_pocs_spent
 CliSolver._maybe_broadcast_lockout = _cli_results._maybe_broadcast_lockout
-CliSolver._pentest_findings_ready = _cli_findings._pentest_findings_ready
 CliSolver._persist_raw_tool_output = _cli_results._persist_raw_tool_output
 CliSolver._provenance_corpus = _cli_results._provenance_corpus
 CliSolver._record_artifact_matches = _cli_results._record_artifact_matches
 CliSolver._record_fact = _cli_results._record_fact
-CliSolver._reject_report_payload = _cli_findings._reject_report_payload
 CliSolver._rejected_flags = _cli_results._rejected_flags
 CliSolver._result_text_with_stderr = _cli_results._result_text_with_stderr
 CliSolver._stderr_tail = _cli_results._stderr_tail
 CliSolver._stream_cost = _cli_results._stream_cost
-CliSolver._submit_repro_decision = _cli_findings._submit_repro_decision
-CliSolver._submit_report_path = _cli_findings._submit_report_path
 CliSolver._summarize_async = _cli_results._summarize_async

@@ -1,6 +1,7 @@
 "use client";
 
 import { Fragment, useEffect, useRef } from "react";
+import Link from "next/link";
 import { AnimatePresence, motion } from "motion/react";
 import { cn } from "@/lib/cn";
 import { Icon } from "@/components/Icon";
@@ -52,7 +53,7 @@ function CapabilityRows({
         const active = index === activeIndex;
         const meta = [
           item.status && item.status !== "available" ? item.status : "",
-          level !== "supported" ? level : "",
+          ({ limited: "部分支持", unsupported: "暂不可用", unknown: "待验证", expired: "已过期" } as Record<string, string>)[level] || "",
           disabled && item.reason ? item.reason : "",
         ].filter(Boolean).join(" · ");
         return (
@@ -153,6 +154,7 @@ export function CapabilityMenu({
             <Icon name={triggerIcon(trigger)} size={13} className="text-cx-fg-3" />
             <span className="text-[12px] font-medium text-cx-fg-2">{triggerLabel(trigger)}</span>
             <span className="ml-auto truncate font-cx-mono text-[11px] text-cx-fg-4">{adapterId.replace(/^cli\./, "")}</span>
+            <Link href="/settings/chat-plugins" className="shrink-0 text-[11px] text-cx-fg-3 hover:text-cx-fg" onMouseDown={(e) => e.stopPropagation()}>管理插件</Link>
           </div>
           <div
             ref={listRef}

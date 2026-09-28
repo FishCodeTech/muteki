@@ -630,6 +630,8 @@ def _meta_sink_for(self, run: Run):
             if ch.get("name"):
                 run.name = ch["name"]
             run.category = ch.get("category", run.category) or run.category
+            if ch.get("mode") in {"ctf", "pentest"}:
+                run.mode = ch["mode"]
             if ch.get("expected_flags"):
                 run.expected_flags = int(ch["expected_flags"])
             run.merge_flags(ch.get("initial_flags") or [])

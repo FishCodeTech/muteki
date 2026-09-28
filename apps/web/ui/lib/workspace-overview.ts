@@ -117,9 +117,11 @@ export function useWorkspaceOverview(pollMs = 10000, solveOnly = false): Workspa
       for (const run of runs) {
         rows.push({
           id: run.run_id,
-          kindId: "single-security-task",
+          kindId: run.mode === "pentest" ? "pentest" : "single-security-task",
           title: run.name || run.run_id,
-          href: `/run/${encodeURIComponent(run.run_id)}`,
+          href: run.mode === "pentest"
+            ? `/pentest?run=${encodeURIComponent(run.run_id)}`
+            : `/run/${encodeURIComponent(run.run_id)}`,
           status: run.status,
           updatedAt: timestamp(run.updated_at ?? run.updated),
           running: run.status === "running" || run.status === "paused",

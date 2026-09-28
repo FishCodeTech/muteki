@@ -63,7 +63,6 @@ export type AgentNodeData = {
   observations: number;
   candidates: number;
   deadEnds: number;
-  reports: number;
   locks: number;
   tokens: number;
   usd: number;
@@ -128,7 +127,7 @@ export const NODE_SIGNATURE_FIELDS = [
   "id", "title", "initial", "engineKey", "subtitle", "engine", "color",
   "role", "roleLabel", "statusKind", "statusLabel",
   "intentText", "intentTitle", "latestActivity",
-  "facts", "candidates", "deadEnds", "reports", "locks", "tokens", "usd", "model", "profileLabel",
+  "facts", "candidates", "deadEnds", "locks", "tokens", "usd", "model", "profileLabel",
   "startedAt", "endedAt", "live", "online", "isCurrent", "lastEventAt", "lastProgressAt", "lifecycleSource",
   "selected", "dimmed", "relationEndpoint", "generation",
   "expanded", "manualExpanded", "selectedKnowledgeId", "visibleWorkItemCount",
@@ -388,7 +387,6 @@ export function AgentNodeCard({ data }: NodeProps<AgentFlowNode>) {
                   {data.canvasMode === "ctf" && data.observations > 0 && <span className="warn"><Icon name="help" size={10} />{data.observations}</span>}
                   {data.canvasMode !== "ctf" && data.candidates > 0 && <span className="warn"><Icon name="help" size={10} />{data.candidates}</span>}
                   {data.deadEnds > 0 && <span className="bad"><Icon name="x" size={10} />{data.deadEnds}</span>}
-                  {data.canvasMode !== "ctf" && data.reports > 0 && <span><Icon name="list" size={10} />{data.reports}</span>}
                   {data.canvasMode !== "ctf" && data.locks > 0 && <span className="warn"><Icon name="lock" size={10} />{data.locks}</span>}
                   <ElapsedTime start={data.startedAt} end={data.endedAt} live={data.live} />
                 </div>}

@@ -293,18 +293,6 @@ class _ReviewLocksMixin:
                     await _cancel_pending_race(
                         "race runtime-exit settle window elapsed")
                     break
-                if (getattr(self.challenge, "mode", "ctf") == "pentest"
-                        and not race_draining):
-                    await self._drain_report_pipeline()
-                    await self._reap_verifier_tasks(
-                        verifier_tasks, verifier_task_solvers,
-                        emit_bb=self._emit_coord_bb)
-                    await self._maybe_dispatch_verifiers(
-                        healthy, verifier_tasks, verifier_task_solvers,
-                        emit_bb=self._emit_coord_bb)
-                    if self._pentest_race_submission_quota_met():
-                        await _cancel_pending_race("pentest submission quota met")
-                        break
                 wait_set = set(pending)
                 for vt in list(verifier_tasks.keys()):
                     if not vt.done():
@@ -325,10 +313,6 @@ class _ReviewLocksMixin:
                     op_task = asyncio.create_task(
                         self._operator_event.wait(), name="race-operator-stop")
                     done.discard(op_task)
-                if getattr(self.challenge, "mode", "ctf") == "pentest":
-                    await self._reap_verifier_tasks(
-                        verifier_tasks, verifier_task_solvers,
-                        emit_bb=self._emit_coord_bb)
                 for t in [d for d in done if d in pending]:
                     pending.discard(t)
                     try:
@@ -354,12 +338,6 @@ class _ReviewLocksMixin:
                         )
                     except Exception:
                         pass
-                    if getattr(self.challenge, "mode", "ctf") == "pentest":
-                        await self._drain_report_pipeline()
-                        if not race_draining:
-                            await self._maybe_dispatch_verifiers(
-                                healthy, verifier_tasks, verifier_task_solvers,
-                                emit_bb=self._emit_coord_bb)
                 if self._flags_complete():
                     await _cancel_pending_race("flags complete")
                     break
@@ -497,8 +475,6 @@ class _ReviewLocksMixin:
             # dedups; the flags are already on the shared graph via _accept_flag.
             self._record_flags(*(getattr(res, "flags", None) or
                                  ([res.flag] if getattr(res, "flag", None) else [])))
-            if getattr(self.challenge, "mode", "ctf") == "pentest":
-                await self._drain_report_pipeline()
             if self._flags_complete() and winner is None:
                 winner, flag = sid, self._found_flags[0]
 
@@ -511,9 +487,6 @@ class _ReviewLocksMixin:
                 winner = "race"
                 flag = self._found_flags[0] if self._found_flags else None
 
-        if getattr(self.challenge, "mode", "ctf") == "pentest":
-            await self._drain_report_pipeline()
-            self._sync_findings_from_graph()
 
         await self._emit_coord_bb(
             "race_concluded", solved=winner is not None,
@@ -605,86 +578,6 @@ class _ReviewLocksMixin:
             verifier_tasks.pop(t, None)
             verifier_task_solvers.pop(t, None)
             self._active_verifier_tasks.discard(t)
-            if getattr(self.challenge, "mode", "ctf") == "pentest":
-                await self._drain_report_pipeline()
-
-    async def _maybe_dispatch_verifiers(
-        self,
-        healthy: list[str],
-        verifier_tasks: dict,
-        verifier_task_solvers: dict,
-        *,
-        emit_bb,
-    ) -> bool:
-        spawned = False
-        for _ in range(24):
-            if getattr(self.challenge, "mode", "ctf") != "pentest":
-                return spawned
-            if not self.verifier_policy.get("enabled", True):
-                return spawned
-            if not self._verifier_capacity_available():
-                return spawned
-            claimed_ids = {
-                str(getattr(w, "intent_id_assigned", "")
-                    or getattr(w, "_intent_id", "") or "")
-                for w in verifier_task_solvers.values()
-            }
-            open_rows = [
-                row for row in (self._verifier_dispatch_items() or [])
-                if str(row.get("intent_id") or "").strip()
-                and str(row.get("intent_id") or "") not in claimed_ids
-            ]
-            if not open_rows:
-                return spawned
-            row = open_rows[0]
-            iid = str(row["intent_id"])
-            try:
-                engine = self._select_verifier_engine(healthy)
-            except RuntimeError as exc:
-                await emit_bb("worker_spawn_rejected", reason=str(exc),
-                              phase="verifier", intent_id=iid)
-                return spawned
-            try:
-                w = self._make_cli_worker(
-                    engine, mode="report_reproducer",
-                    intent_goal=str(row.get("goal") or ""),
-                    intent_id=iid)
-                self._apply_step_contract(w, row)
-            except WorkerSpawnRejected as exc:
-                await emit_bb("worker_spawn_rejected", reason=str(exc),
-                              engine=str(engine), phase="verifier", intent_id=iid)
-                return spawned
-            except WorkerBudgetExhausted as exc:
-                await emit_bb(str(exc), spawned_total=self._spawned_total,
-                              max_total_workers=self.max_total_workers,
-                              cost_usd=self._current_cost_usd(),
-                              cost_budget_usd=self.cost_budget_usd)
-                return spawned
-            won = False
-            try:
-                won = self.shared_graph.claim_intent(
-                    worker=w.solver_id, intent_id=iid)
-            except Exception:
-                won = False
-            if not won:
-                await self._retire_worker_account(
-                    w, reason="verifier intent claim not acquired")
-                return spawned
-            t = await self._schedule_control_worker(
-                w, name=f"verifier-{w.solver_id}")
-            verifier_tasks[t] = w
-            verifier_task_solvers[t] = w
-            # Race verifiers count against the verifier concurrency cap too —
-            # keep the add/discard pair balanced with _reap_verifier_tasks and
-            # the boundary handoff in the race finally block.
-            self._active_verifier_tasks.add(t)
-            self._verifier_workers_spawned += 1
-            await emit_bb(
-                "worker_spawned", worker=w.solver_id, phase="verifier",
-                worker_role="verifier", intent_id=iid,
-                **worker_identity_event_fields(w))
-            spawned = True
-        return spawned
 
     def _queue_review_request(self, *, trigger: str, directive: str,
                               fact_seqs: Optional[list[int]] = None) -> None:

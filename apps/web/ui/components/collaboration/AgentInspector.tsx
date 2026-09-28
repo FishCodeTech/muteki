@@ -110,7 +110,6 @@ export type CollaborationRunStats = {
   candidates: number;
   deadEnds: number;
   pocs: number;
-  reports: number;
 };
 
 function CoordinatorOverview({
@@ -179,7 +178,6 @@ function CoordinatorOverview({
               <Metric value={runStats.candidates} label={t("meta.observations")} tone="warn" />
               <Metric value={runStats.deadEnds} label={t("collab.exclusions")} tone="bad" />
               <Metric value={runStats.pocs} label={t("collab.knowledge.poc")} />
-              <Metric value={runStats.reports} label={t("collab.reports")} />
             </>
           )}
         </div>
@@ -239,7 +237,6 @@ function WorkerOverview({
               <Metric value={agent.candidates} label={t("meta.candidates")} tone="warn" />
               <Metric value={agent.deadEnds} label={t("collab.exclusions")} tone="bad" />
               <Metric value={agent.pocs} label={t("collab.knowledge.poc")} />
-              <Metric value={agent.reports} label={t("collab.reports")} />
               <Metric value={agent.reviews} label={t("collab.reviews")} />
             </>
           )}
@@ -527,7 +524,6 @@ export function AgentInspector({
   onKillWorker,
   onOpenFact,
   onOpenPoc,
-  onOpenReport,
   onClosePanel,
   asOf,
 }: {
@@ -557,7 +553,6 @@ export function AgentInspector({
   onKillWorker?: (id: string) => void;
   onOpenFact?: (seq: number) => void;
   onOpenPoc?: (id: string) => void;
-  onOpenReport?: (id: string) => void;
   onClosePanel?: () => void;
   asOf?: number;
 }) {
@@ -694,7 +689,6 @@ export function AgentInspector({
                 onSelectKnowledge={onSelectKnowledge}
                 onOpenFact={onOpenFact}
                 onOpenPoc={onOpenPoc}
-                onOpenReport={onOpenReport}
                 onClose={onCloseKnowledge}
                 mode={canvasMode}
               />

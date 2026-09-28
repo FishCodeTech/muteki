@@ -283,6 +283,16 @@ export function PromptBar({
   const stripRefs = refsFromDocument(resolvedDoc).filter((ref) => !isInlineContextKind(ref.kind));
   const activeCapabilityTrigger = activeToken?.trigger;
   const activeCapabilityQuery = activeToken?.query || "";
+  const [pluginRevision, setPluginRevision] = useState(0);
+  useEffect(() => {
+    const refresh = () => setPluginRevision((n) => n + 1);
+    window.addEventListener("muteki:chat-plugins-changed", refresh);
+    window.addEventListener("focus", refresh);
+    return () => {
+      window.removeEventListener("muteki:chat-plugins-changed", refresh);
+      window.removeEventListener("focus", refresh);
+    };
+  }, []);
   const capabilityAdapterId = capabilityContext?.adapterId || "";
   const capabilityThreadId = capabilityContext?.threadId || "";
   const capabilityWorkspaceId = capabilityContext?.workspaceId || "";
@@ -369,6 +379,8 @@ export function PromptBar({
       controller.abort();
     };
   }, [
+    pluginRevision,
+    capabilityContext?.revision,
     activeCapabilityQuery,
     activeCapabilityTrigger,
     capabilityAdapterId,

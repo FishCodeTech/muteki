@@ -282,6 +282,7 @@ export function EvidenceChain({ deck, focusFactSeq, focusNonce }: { deck: DeckSt
   const { lang } = useLang();
   const zh = lang === "zh";
   const isCtf = canvasModeOf(deck) === "ctf";
+  const isPentest = deck.mode === "pentest";
 
   const [newestFirst, setNewestFirst] = useState(true);
   const [filter, setFilter] = useState<EvidenceFilter>("all");
@@ -311,8 +312,8 @@ export function EvidenceChain({ deck, focusFactSeq, focusNonce }: { deck: DeckSt
   // A: review-retired facts (rejected/merged/superseded) are NOT evidence — they
   // failed review and must not appear in the proof chain.
   const verified = useMemo(
-    () => order(deck.blackboard.facts.filter((f) => f.verified && !isFactRetired(f))),
-    [deck.blackboard.facts, order],
+    () => order(deck.blackboard.facts.filter((f) => f.verified && !isFactRetired(f) && (!isPentest || f.actor !== "origin"))),
+    [deck.blackboard.facts, isPentest, order],
   );
   const observations = useMemo(
     () => order(deck.blackboard.observations
@@ -408,7 +409,7 @@ export function EvidenceChain({ deck, focusFactSeq, focusNonce }: { deck: DeckSt
     ...deck.blackboard.observations.map((observation) => observation.actor),
     ...deck.blackboard.deadEnds.map((d) => d.actor),
     ...deck.blackboard.intents.map((intent) => intent.worker || intent.proposedBy || ""),
-  ].filter(Boolean)).size, [deck.blackboard.facts, deck.blackboard.observations, deck.blackboard.deadEnds, deck.blackboard.intents]);
+  ].filter((actor) => Boolean(actor) && (!isPentest || actor !== "origin"))).size, [deck.blackboard.facts, deck.blackboard.observations, deck.blackboard.deadEnds, deck.blackboard.intents, isPentest]);
   const filterButtons: { key: EvidenceFilter; label: string; n: number }[] = isCtf
     ? [
         { key: "all", label: t("evidence.all"), n: total },
@@ -433,7 +434,7 @@ export function EvidenceChain({ deck, focusFactSeq, focusNonce }: { deck: DeckSt
     <div className="panel-scroll-wrap evidence-panel">
       <div className="evi-toolbar">
         <div className="evi-toolbar-title">
-          <div className="panel-title">{t(isCtf ? "evidence.titleCtf" : "evidence.title")}</div>
+          <div className="panel-title">{t(isCtf ? "evidence.titleCtf" : "evidence.titlePentest")}</div>
           <div className="evi-summary">
             {deck.blackboard.truncated?.facts && <span>{t("runtime.truncated", { n: 200 })}</span>}
             <span>{t("evidence.total", { n: total })}</span>

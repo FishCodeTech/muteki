@@ -24,7 +24,7 @@ export interface WorkspaceKindInfo {
   title: string;
   description: string;
   icon: string;
-  /** 工作区路由，例如 /task、/chat、/competitions */
+  /** 工作区路由，例如 /ctf、/pentest、/chat、/competitions */
   route: string;
   /** 首页创建入口路由 */
   create_entry: string;

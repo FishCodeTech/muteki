@@ -59,14 +59,14 @@ const MODE_TITLE: Record<string, string> = {
   retry: "重新执行本轮",
   edit_resend: "编辑后重发",
   fork: "Fork 对话",
-  native_rewind: "原生回退",
+  native_rewind: "回退聊天历史",
 };
 
 const MODE_OPTIONS: Array<SegmentOption<ImpactMode>> = [
   { value: "retry", label: "重新执行", icon: "retry" },
   { value: "edit_resend", label: "编辑重发", icon: "pencilLine" },
   { value: "fork", label: "Fork", icon: "gitFork" },
-  { value: "native_rewind", label: "原生回退", icon: "undo" },
+  { value: "native_rewind", label: "回退聊天历史", icon: "undo" },
 ];
 
 const MAX_FILES = 8;
@@ -85,7 +85,7 @@ function modeVisual(mode: ImpactMode, filePolicy: string): { icon: IconName; ton
       return { icon: "gitFork", tone: "accent", confirm: "确认 Fork" };
     case "native_rewind":
       // Syncing files rewrites the workspace, which cannot be undone from here.
-      return { icon: "undo", tone: filePolicy === "sync_files" ? "danger" : "warning", confirm: "确认原生回退" };
+      return { icon: "undo", tone: filePolicy === "sync_files" ? "danger" : "warning", confirm: "确认回退" };
     default: {
       const exhaustive: never = mode;
       return exhaustive;
@@ -181,7 +181,7 @@ export function ImpactConfirmModal({
   const attachments = preview.attachments_affected || [];
   const rewindStatus = rewindDisabled
     ? (rewindReason || preview.provider?.reason || "当前 Runtime 未确认支持原生回退")
-    : "Provider 已确认支持原生回退";
+    : (preview.provider?.reason || "同步回退聊天与引擎历史，保留文件");
   const sideEffects = mapExternalSideEffects(preview.external_side_effects);
 
   const openFile = (filePath: string) => {

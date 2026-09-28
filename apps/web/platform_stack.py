@@ -283,7 +283,10 @@ class WebPlatformStack:
             workspace_root=self.root / "workspaces",
             sessions_root=manager.state_root,
         )
-        from apps.web.worker_models import validate_conversation_effort
+        from apps.web.worker_models import CredentialModelCatalogStore, validate_conversation_effort
+        self.conversation.executor.bind_model_success_recorder(
+            CredentialModelCatalogStore(manager.state_root).record_conversation_success,
+        )
         self.conversation.manager.bind_model_effort_validator(
             lambda selection: validate_conversation_effort(manager.state_root, selection)
         )
@@ -296,6 +299,10 @@ class WebPlatformStack:
         from muteki.capability_management import configure as configure_capabilities
         configure_capabilities(
             Path(self.store.db_path).with_name("capability_management.json"))
+        from muteki.conversation.chat_plugins import ChatPluginService
+        self.chat_plugins = ChatPluginService(self.root / "chat-plugins")
+        self.conversation.manager.chat_plugins = self.chat_plugins
+        self.conversation.executor.chat_plugins = self.chat_plugins
         self.conversation.register(self.command_api)
         self.runtime_factory = RuntimeAdapterFactory(
             store=self.store,
@@ -308,6 +315,7 @@ class WebPlatformStack:
             env_ref_resolver=lambda refs: _runtime_env_refs(
                 self.platform_secrets, refs),
             cli_builder=_build_cli_compat_adapter,
+            probe_environment_factory=self.chat_plugins.prepare_environment,
         )
         self.runtime_service.factory = self.runtime_factory
 
@@ -408,9 +416,12 @@ class WebPlatformStack:
             self.competition_store,
             submission_service=self.competition_services.submissions,
         )
-        self.capability_gateway = AgentCapabilityGatewayImpl(
+        from muteki.conversation.chat_plugin_gateway import ChatPluginGateway
+        self.capability_gateway = ChatPluginGateway(
             self.store,
             self.routed_command_api,
+            plugins=self.chat_plugins,
+            selection=self.conversation.manager.runtime_selection,
             binding_service=self.conversation.bindings,
         )
         # Adapter 只在真实 Gateway 就绪后创建。Claude 的 in-process
@@ -488,6 +499,7 @@ class WebPlatformStack:
 
     def routers(self) -> list[Any]:
         from apps.web.usage_api import create_usage_router
+        from apps.web.chat_plugins_api import create_chat_plugins_router
         capability_router = APIRouter(tags=["capabilities"])
 
         async def _capability_http(request: Request) -> Response:
@@ -528,6 +540,7 @@ class WebPlatformStack:
             return await _capability_http(request)
 
         return [
+            create_chat_plugins_router(self.chat_plugins, self.conversation),
             create_usage_router(self.manager, self.competition_store),
             create_registry_router(self.domain_registry, self.routed_command_api),
             create_platform_router(self.routed_command_api),
@@ -833,6 +846,7 @@ class WebPlatformStack:
         await self.extension.shutdown()
         await self.conversation_metadata.shutdown()
         await self.conversation.shutdown()
+        await self.chat_plugins.close()
         self.memory_graph.close()
         for graph in self._competition_graphs.values():
             try:

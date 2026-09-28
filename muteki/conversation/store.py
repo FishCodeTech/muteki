@@ -170,6 +170,20 @@ class ConversationStore:
             )
         return turn
 
+    def commit_history_rewind(self, turns: list[TurnRecord], runs: list[TurnRunRef], state: ThreadState) -> None:
+        """Commit branch visibility, run states and thread state in one transaction."""
+        with self._lock, self._conn:
+            for turn in turns:
+                self._execute("UPDATE conv_turns SET status=?, payload=? WHERE turn_id=?",
+                              (turn.status, self._dump(turn), turn.turn_id))
+                self._execute("DELETE FROM conv_active_turn_claims WHERE thread_id=? AND turn_id=?",
+                              (turn.thread_id, turn.turn_id))
+            for run in runs:
+                self._execute("UPDATE conv_runs SET status=?, payload=? WHERE run_id=?",
+                              (run.status, self._dump(run), run.run_id))
+            self._execute("INSERT OR REPLACE INTO conv_thread_state (thread_id, payload) VALUES (?,?)",
+                          (state.thread_id, self._dump(state)))
+
     def get_turn(self, turn_id: str) -> Optional[TurnRecord]:
         row = self._fetchone(
             "SELECT payload FROM conv_turns WHERE turn_id = ?",

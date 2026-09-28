@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from muteki.solver.vuln_report import report_id_from_intent
 from muteki.solver.worker_profiles import worker_identity_event_fields
 
 async def dispatch_stage(self, state) -> str:
@@ -41,9 +40,6 @@ async def dispatch_stage(self, state) -> str:
             await emit_bb("blocked_context_capability", intent_id=iid,
                           missing=list(missing), reason=reason, phase=phase)
     # ── Phase: Explore — fill free slots with intent workers ─────
-    if getattr(self.challenge, "mode", "ctf") == "pentest":
-        await self._drain_report_pipeline()
-        state.open_intents = self._open_intents()
     # Fixed mode ramps by `explore_spawn_batch` (default 1) per loop iteration.
     # Auto mode drains currently ready, non-conflicting intents only while the
     # run-wide Worker ceiling has free slots.
@@ -53,7 +49,7 @@ async def dispatch_stage(self, state) -> str:
     # until Reason has evaluated the checkpoint against its stop condition;
     # otherwise the next loop immediately starts a replacement Worker even
     # when the checkpoint already proves this branch complete.
-    ctf_mode = getattr(self.challenge, "mode", "ctf") == "ctf"
+    ctf_mode = getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
     checkpoint_replan_ids = (
         set() if ctf_mode else set(state.checkpoint_replan_wm)
     )
@@ -82,11 +78,7 @@ async def dispatch_stage(self, state) -> str:
             worker_mode = "review"
             worker_role = "review"
         elif worker_class == "verifier":
-            worker_mode = (
-                "report_reproducer"
-                if report_id_from_intent(iid)
-                else "fact_verifier"
-            )
+            worker_mode = "fact_verifier"
             worker_role = "verifier"
         else:
             worker_mode = "explore"
@@ -189,14 +181,14 @@ async def dispatch_stage(self, state) -> str:
                 "intent_id": iid,
             }
             if (
-                getattr(self.challenge, "mode", "ctf") == "ctf"
+                getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
                 and worker_mode == "fact_verifier"
             ):
                 worker_kwargs["timeout_override"] = min(
                     int(self.explore_timeout), 120
                 )
             if (
-                getattr(self.challenge, "mode", "ctf") != "ctf"
+                getattr(self.challenge, "mode", "ctf") not in {"ctf", "pentest"}
                 and worker_mode == "explore"
                 and worker_class != "shell_agent"
             ):
@@ -336,11 +328,11 @@ async def dispatch_stage(self, state) -> str:
         if worker_mode == "review":
             self._active_review_tasks.add(t)
             self._review_workers_spawned += 1
-        elif worker_mode in {"fact_verifier", "report_reproducer"}:
+        elif worker_mode == "fact_verifier":
             self._active_verifier_tasks.add(t)
             self._verifier_workers_spawned += 1
         elif (
-            getattr(self.challenge, "mode", "ctf") == "ctf"
+            getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
             and intent_batch == state.ctf_batch_id
             and not state.ctf_batch_sealed
         ):
@@ -356,12 +348,12 @@ async def dispatch_stage(self, state) -> str:
                        worker_role=(
                            "review" if worker_mode == "review"
                            else "verifier" if worker_mode in {
-                               "fact_verifier", "report_reproducer"}
+                               "fact_verifier"}
                            else "worker"),
                        **worker_identity_event_fields(w))
         state.open_intents = self._capacity_dispatchable_open_intents(state.open_intents, state.tasks)
     if (
-        getattr(self.challenge, "mode", "ctf") == "ctf"
+        getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
         and not state.ctf_batch_sealed
         and state.ctf_batch_spawned > 0
     ):

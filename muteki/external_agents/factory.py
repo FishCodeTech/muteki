@@ -197,6 +197,7 @@ class RuntimeAdapterFactory:
         sessions_root: str | Path = "state",
         env_ref_resolver: Optional[Callable[[Mapping[str, str]], dict[str, str]]] = None,
         cli_builder: Optional[Callable[[RuntimeAdapterConfig, dict[str, Any]], Any]] = None,
+        probe_environment_factory: Optional[Callable[[str, str, dict[str, str]], dict[str, str]]] = None,
     ) -> None:
         self.store = store
         self.binding_service = binding_service
@@ -209,6 +210,7 @@ class RuntimeAdapterFactory:
         # Web/WorkerSession 在装配处注入 CLI compatibility builder；结构化
         # Runtime 构造本身不需要 solver 层存在。
         self.cli_builder = cli_builder
+        self.probe_environment_factory = probe_environment_factory
 
     @property
     def supported_adapter_ids(self) -> tuple[str, ...]:
@@ -240,6 +242,14 @@ class RuntimeAdapterFactory:
         return adapter
 
     def create(self, value: RuntimeAdapterConfig | Mapping[str, Any] | Any) -> Any:
+        config = value if isinstance(value, RuntimeAdapterConfig) else RuntimeAdapterConfig.from_value(value)
+        adapter = self._create(config)
+        if self.probe_environment_factory is not None and hasattr(adapter, "probe_with_environment"):
+            adapter.probe_environment_factory = lambda: self.probe_environment_factory(
+                engine_for_adapter(config.adapter_id), f"probe:{config.instance_id}", self._env(config))
+        return adapter
+
+    def _create(self, value: RuntimeAdapterConfig | Mapping[str, Any] | Any) -> Any:
         config = (
             value if isinstance(value, RuntimeAdapterConfig)
             else RuntimeAdapterConfig.from_value(value)

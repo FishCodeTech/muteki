@@ -46,7 +46,7 @@ from muteki.swarm.graph_defs import (  # noqa: F401
 class _IntentsPocsMixin:
     def query_legacy_candidates(self) -> list[dict]:
         """Compatibility read for the narrow Protocol 1 SearchStatePort."""
-        if getattr(self.challenge, "mode", "ctf") == "ctf":
+        if getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}:
             # A newly proved, high-priority exploit Step must not wait behind a
             # normal-priority Review/Verifier row merely because that role was
             # inserted first.  Pentest keeps the report-pipeline-first order.
@@ -324,11 +324,39 @@ class _IntentsPocsMixin:
                        payload: Optional[dict] = None,
                        from_fact_seqs: Optional[list[int]] = None) -> int:
         payload = dict(payload or {})
-        if getattr(self.challenge, "mode", "ctf") == "ctf":
+        if getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}:
             intent_id = str(intent_id or "").strip()
             goal = str(goal or "").strip()
             if not intent_id or not goal:
                 return -1
+            pentest_mode = getattr(self.challenge, "mode", "ctf") == "pentest"
+            value_claim: dict[str, object] = {}
+            if pentest_mode:
+                from muteki.pentest.contract import in_scope_url
+                contract = getattr(self.challenge, "pentest_contract", None)
+                if contract is None:
+                    return -1
+                raw_claim = payload.get("value_claim")
+                if raw_claim is not None and not isinstance(raw_claim, dict):
+                    return -1
+                source_claim = raw_claim or {}
+                asset = str(source_claim.get("asset") or contract.target).strip()
+                try:
+                    auth_version = int(source_claim.get("authorization_version") or contract.version)
+                except (TypeError, ValueError):
+                    return -1
+                risk_tier = str(source_claim.get("risk_tier") or "bounded_validation").strip()
+                if (not in_scope_url(asset, contract)
+                        or auth_version != contract.version
+                        or risk_tier not in {"passive", "bounded_validation"}):
+                    return -1
+                value_claim = {
+                    "asset": asset,
+                    "identity": str(source_claim.get("identity") or "anonymous").strip()[:120],
+                    "risk_tier": risk_tier,
+                    "evidence_requirement": str(source_claim.get("evidence_requirement") or payload.get("expected_observable") or "tool output").strip()[:1000],
+                    "authorization_version": auth_version,
+                }
             expected_observable = str(payload.get("expected_observable") or "").strip()
             stop_condition = str(payload.get("stop_condition") or "").strip()
             coverage_key = str(payload.get("coverage_key") or "").strip()
@@ -337,7 +365,10 @@ class _IntentsPocsMixin:
                 if str(item).strip()
             ))
             worker_class = str(payload.get("worker_class") or "code").strip()
-            if worker_class not in {"code", "shell_agent"}:
+            allowed_classes = {"code", "shell_agent"}
+            if getattr(self.challenge, "mode", "ctf") == "pentest":
+                allowed_classes.add("verifier")
+            if worker_class not in allowed_classes:
                 worker_class = "code"
             raw_priority = payload.get("priority")
             if isinstance(raw_priority, str):
@@ -404,6 +435,7 @@ class _IntentsPocsMixin:
                             "stop_condition": stop_condition,
                             "coverage_key": coverage_key,
                             "required_pocs": required_pocs,
+                            **({"value_claim": value_claim} if pentest_mode else {}),
                         },
                         dedupe_key=f"intent::{intent_id}",
                     )
@@ -414,8 +446,8 @@ class _IntentsPocsMixin:
                         "INSERT OR IGNORE INTO intents "
                         "(intent_id,challenge_id,goal,worker_class,priority,status,"
                         "dispatch_state,created_seq,requested_priority,"
-                        "expected_observable,stop_condition,coverage_key,required_pocs_json) "
-                        "VALUES (?,?,?,?,?,'open','active',?,?,?,?,?,?)",
+                        "expected_observable,stop_condition,coverage_key,required_pocs_json,value_claim_json) "
+                        "VALUES (?,?,?,?,?,'open','active',?,?,?,?,?,?,?)",
                         (
                             intent_id,
                             self.challenge.id,
@@ -428,6 +460,7 @@ class _IntentsPocsMixin:
                             stop_condition or None,
                             coverage_key or None,
                             json.dumps(required_pocs, ensure_ascii=False),
+                            json.dumps(value_claim, ensure_ascii=False, sort_keys=True) if pentest_mode else None,
                         ),
                     )
                     if int(cur.rowcount or 0) != 1:
@@ -525,7 +558,7 @@ class _IntentsPocsMixin:
             if fact_seq > 0 and fact_seq not in source_fact_seqs:
                 source_fact_seqs.append(fact_seq)
         source_fact_seqs.sort()
-        if (getattr(self.challenge, "mode", "ctf") != "ctf"
+        if (getattr(self.challenge, "mode", "ctf") not in {"ctf", "pentest"}
                 and worker_class in {"code", "shell_agent", "review"}
                 and source_fact_seqs
                 and any(seq not in self._active_fact_seq_set()
@@ -1444,7 +1477,7 @@ class _IntentsPocsMixin:
         obs_list = [o for o in (observations or []) if isinstance(o, dict)]
         dead_list = [d for d in (dead_ends or []) if isinstance(d, dict)]
         rejected_dead_ends: list[dict[str, str]] = []
-        if getattr(self.challenge, "mode", "ctf") == "ctf":
+        if getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}:
             bounded_dead_ends: list[dict] = []
             for dead in dead_list:
                 reason = str(dead.get("reason") or "").strip()

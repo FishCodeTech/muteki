@@ -1,0 +1,78 @@
+{
+  "name": "muteki-desktop",
+  "productName": "Muteki",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "description": "Desktop client for an existing local or remote Muteki service",
+  "license": "AGPL-3.0-only",
+  "author": "Muteki contributors",
+  "main": "src/main.cjs",
+  "scripts": {
+    "start": "npm run build && electron .",
+    "test": "node --test test/*.test.cjs",
+    "test:smoke": "node test/smoke.cjs",
+    "pack": "npm run build && electron-builder --dir --publish never",
+    "dist": "npm run build && electron-builder --publish never",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "dev": "vite --host 127.0.0.1"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.1",
+    "electron": "44.4.5",
+    "electron-builder": "26.15.3",
+    "lucide-react": "1.48.0",
+    "playwright-core": "1.63.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "typescript": "7.0.2",
+    "vite": "8.3.1"
+  },
+  "build": {
+    "appId": "tech.fishcode.muteki.desktop",
+    "asar": true,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*.cjs",
+      "renderer-dist/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../../LICENSE",
+        "to": "LICENSE"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "../web/ui/public/icon-512.png",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "icon": "../web/ui/public/favicon.ico",
+      "target": [
+        "nsis"
+      ]
+    },
+    "linux": {
+      "icon": "../web/ui/public/icon-512.png",
+      "category": "Development",
+      "target": [
+        "AppImage",
+        "deb"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

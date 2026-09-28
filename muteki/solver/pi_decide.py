@@ -57,6 +57,10 @@ step:
 
 图操作先记入草稿,最后必须调用 commit 一次性提交(不调用则本轮作废)。操作简单、合法性一眼可辨时直接 commit;仅当批次含判达成、退回或跨多事实等可能被剔除的操作时,先用 preview 复核叠加草稿后的投影(只出 step/goal 结构与事实标题,校验不过的条目会标注、提交时剔除)。"""
 
+PENTEST_PI_DECIDE_SYSTEM = CTF_PI_DECIDE_SYSTEM + """
+
+本任务的授权测试边界见 engagement。公开资料可以帮助推理，但不能替代目标环境的工具证据。你负责判断 Fact 是否已经满足用户原始测试目标；满足时用 satisfy_goal 的 from 引用支撑结论的 Fact，并在 reason 解释。若证据不足，继续规划当前最有信息增益的 Step。是否需要复核、复测或扩大授权范围内的探索，由你依据事实决定。终局报告另由模型从共享图生成，不需要为撰写报告创建 Worker Step。"""
+
 _TOOLS = "open_step,drop_step,change_step_priority,satisfy_goal,preview,commit"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _EXTENSION = Path(__file__).with_name("pi_decide_extension.ts")
@@ -66,11 +70,12 @@ def build_ctf_pi_decide_prompt(
     graph_summary: str,
     *,
     max_intents: int = 4,
+    mode: str = "ctf",
 ) -> list[dict[str, str]]:
     """Build the same two-message prompt used by the Pi subprocess."""
     del max_intents
     return [
-        {"role": "system", "content": CTF_PI_DECIDE_SYSTEM},
+        {"role": "system", "content": PENTEST_PI_DECIDE_SYSTEM if mode == "pentest" else CTF_PI_DECIDE_SYSTEM},
         {"role": "user", "content": str(graph_summary)},
     ]
 
@@ -135,6 +140,7 @@ class DraftSimulation:
     receipts: list[dict[str, Any]] = field(default_factory=list)
     goal_met: bool = False
     complete_why: str = ""
+    goal_evidence_facts: list[int] = field(default_factory=list)
     progress_summary: str = ""
     raw_open_steps: int = 0
     draft_id: str = ""
@@ -297,8 +303,9 @@ def build_decide_preview_graph(
             for row in shared_graph.pocs()
             if str(row.get("status") or "") in {"available", "directional", "wip"}
         ]
+    mode = getattr(getattr(shared_graph, "challenge", None), "mode", "ctf")
     return {
-        "schema": "muteki.ctf-decide-graph.v1",
+        "schema": "muteki.pentest-decide-graph.v1" if mode == "pentest" else "muteki.ctf-decide-graph.v1",
         "max_intents": max(0, int(max_intents)),
         "graph_seq": watermark,
         "fact_id_map": fact_id_map,
@@ -419,6 +426,33 @@ def simulate_draft(
             priority = str(operation.get("priority") or "normal").strip().lower()
             if priority not in {"high", "normal", "low"}:
                 priority = "normal"
+            value_claim: dict[str, Any] = {}
+            contract = getattr(getattr(shared_graph, "challenge", None), "pentest_contract", None)
+            if contract is not None:
+                from muteki.pentest.contract import in_scope_url
+                asset = str(operation.get("asset") or contract.target).strip()
+                try:
+                    version = int(operation.get("authorization_version") or contract.version)
+                except (TypeError, ValueError):
+                    _record(index, op, outcome="dropped", reason_code="invalid_authorization_version", goal=action)
+                    continue
+                risk = str(operation.get("risk_tier") or "bounded_validation").strip()
+                if not in_scope_url(asset, contract):
+                    _record(index, op, outcome="dropped", reason_code="asset_out_of_scope", goal=action)
+                    continue
+                if version != contract.version:
+                    _record(index, op, outcome="dropped", reason_code="authorization_version_mismatch", goal=action)
+                    continue
+                if risk not in {"passive", "bounded_validation"}:
+                    _record(index, op, outcome="dropped", reason_code="risk_not_authorized", goal=action)
+                    continue
+                value_claim = {
+                    "asset": asset,
+                    "identity": str(operation.get("identity") or "anonymous").strip(),
+                    "risk_tier": risk,
+                    "evidence_requirement": str(operation.get("evidence_requirement") or expected).strip(),
+                    "authorization_version": version,
+                }
             intent_id = f"D{len(sim.intents) + 1}"
             sim.intents.append(
                 Intent(
@@ -430,6 +464,7 @@ def simulate_draft(
                     expected_observable=expected,
                     stop_condition=stop,
                     coverage_key=coverage,
+                    value_claim=value_claim,
                     required_pocs=required_pocs,
                 )
             )
@@ -473,6 +508,24 @@ def simulate_draft(
                     reason_code="invalid_priority", intent_id=intent_id,
                 )
         elif op == "satisfy_goal":
+            contract = getattr(getattr(shared_graph, "challenge", None), "pentest_contract", None)
+            if contract is not None:
+                raw_sources = operation.get("from")
+                known_seqs = set((fact_id_map or {}).values())
+                if (not isinstance(raw_sources, list) or not raw_sources
+                        or any(
+                            (str(item) not in (fact_id_map or {}))
+                            and (not str(item).isdigit() or int(item) not in known_seqs)
+                            for item in raw_sources
+                        )):
+                    _record(index, op, outcome="dropped", reason_code="invalid_goal_evidence")
+                    continue
+                sources = _positive_fact_ids(raw_sources, fact_id_map=fact_id_map)
+                from muteki.pentest.judgement import goal_evidence_valid
+                if not goal_evidence_valid(shared_graph.events(), contract, sources):
+                    _record(index, op, outcome="dropped", reason_code="unverified_goal_evidence")
+                    continue
+                sim.goal_evidence_facts = sources
             sim.goal_met = True
             sim.complete_why = str(
                 operation.get("reason") or operation.get("why") or ""
@@ -669,6 +722,7 @@ def _materialise_draft(
         }] if sim.receipts else [],
         verdict=VERDICT_COMPLETE if sim.goal_met else VERDICT_EXPLORE,
         complete_why=sim.complete_why,
+        goal_evidence_facts=sim.goal_evidence_facts,
         progress_summary=sim.progress_summary,
         semantic_dedupe_available=False,
         supersede_intents=sim.supersede,
@@ -699,6 +753,7 @@ async def run_ctf_pi_reason(
     account_id: str,
     state_root: str | Path,
     shared_graph: Any,
+    mode: str = "ctf",
 ) -> ReasonResult:
     """Run one stateless Pi turn and materialise its committed operations."""
     state_dir = Path(state_root).expanduser().resolve()
@@ -740,7 +795,7 @@ async def run_ctf_pi_reason(
 
         provider = str(env.get("MUTEKI_PI_PROVIDER") or "").strip()
         selected_model = str(env.get("MUTEKI_PI_MODEL") or model or "").strip()
-        system_prompt = CTF_PI_DECIDE_SYSTEM
+        system_prompt = PENTEST_PI_DECIDE_SYSTEM if mode == "pentest" else CTF_PI_DECIDE_SYSTEM
         argv = [
             driver.bin,
             "-p",

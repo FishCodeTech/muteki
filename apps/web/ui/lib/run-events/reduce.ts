@@ -41,7 +41,6 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
       capabilityGaps: orEmpty(prev.blackboard.capabilityGaps),
       valueReceipts: orEmpty(prev.blackboard.valueReceipts),
       gatedFindings: orEmpty(prev.blackboard.gatedFindings),
-      vulnReports: orEmpty(prev.blackboard.vulnReports),
       reviewFindings: orEmpty(prev.blackboard.reviewFindings),
       suppressedRoutes: orEmpty(prev.blackboard.suppressedRoutes),
       branches: orEmpty(prev.blackboard.branches),

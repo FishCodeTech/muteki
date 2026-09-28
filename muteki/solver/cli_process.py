@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from muteki.solver.cli_driver import CliResult
-from muteki.solver.cli_prompts import _CTF_WORKER_SYSTEM
+from muteki.solver.cli_prompts import _CTF_WORKER_SYSTEM, _PENTEST_FGS_WORKER_SYSTEM
 from muteki.solver.cli_workspace import _stable_worker_path
 from muteki.solver.worker_profiles import profile_uses_endpoint
 from muteki.solver.worker_skills import (
@@ -104,6 +104,7 @@ def _worker_env(self, cwd: Optional[str] = None) -> dict:
             allow_operator_input=bool(
                 getattr(self.challenge, "allow_operator_input", True)
             ),
+            mode=str(getattr(self.challenge, "mode", "ctf")),
         )
         self._ensure_role_contract(skill_workdir)
 
@@ -206,20 +207,25 @@ def _worker_env(self, cwd: Optional[str] = None) -> dict:
     )
     if (
         self.driver.name == "pi"
-        and env["MUTEKI_CHALLENGE_MODE"] == "ctf"
-        and self.mode == "explore"
+        and env["MUTEKI_CHALLENGE_MODE"] in {"ctf", "pentest"}
+        and self.mode in {"explore", "fact_verifier"}
     ):
-        env["MUTEKI_PI_SYSTEM_PROMPT"] = _CTF_WORKER_SYSTEM
+        env["MUTEKI_PI_SYSTEM_PROMPT"] = (
+            _PENTEST_FGS_WORKER_SYSTEM if env["MUTEKI_CHALLENGE_MODE"] == "pentest"
+            else _CTF_WORKER_SYSTEM
+        )
     if (
         self.driver.name == "omp"
-        and env["MUTEKI_CHALLENGE_MODE"] == "ctf"
-        and self.mode == "explore"
+        and env["MUTEKI_CHALLENGE_MODE"] in {"ctf", "pentest"}
+        and self.mode in {"explore", "fact_verifier"}
     ):
-        env["MUTEKI_OMP_SYSTEM_PROMPT"] = _CTF_WORKER_SYSTEM
+        env["MUTEKI_OMP_SYSTEM_PROMPT"] = (
+            _PENTEST_FGS_WORKER_SYSTEM if env["MUTEKI_CHALLENGE_MODE"] == "pentest"
+            else _CTF_WORKER_SYSTEM
+        )
     env["MUTEKI_BLACKBOARD_ROLE"] = (
         "review" if self.mode == "review"
         else "verifier" if self.mode == "fact_verifier"
-        else "reproducer" if self.mode == "report_reproducer"
         else "solve" if (
             self.mode == "respond"
             and str(self.hitl_cmd.get("action") or "") == "mark_false"
@@ -242,7 +248,7 @@ def _worker_env(self, cwd: Optional[str] = None) -> dict:
         env[proxy_name] = ""
     env["NO_PROXY"] = "*"
     env["no_proxy"] = "*"
-    env["MUTEKI_BLACKBOARD_SCRIPT"] = self._blackboard_script_path()
+    env["MUTEKI_BLACKBOARD_SCRIPT"] = self._blackboard_script_path(cwd)
     if cwd and (self.mode != "respond"
                 or str(self.hitl_cmd.get("action") or "") == "mark_false"):
         mapper = getattr(self.container, "to_container_path", None)

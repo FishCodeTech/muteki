@@ -3,10 +3,6 @@ import {
   POC_CAP,
   capPush,
   markTruncated,
-  patchReportStatus,
-  stringField,
-  upsertVulnReport,
-  vulnReportPatch,
   type BlackboardGatedFinding,
   type BlackboardPoc,
 } from "../types";
@@ -295,114 +291,17 @@ export function reduceBlackboardResults({ ev, s, p, bb, actor, tlabel }: Blackbo
           tlabel(`${actor} rejected finding ${findingClass}: ${String(p.reason ?? "missing evidence").slice(0, 72)}`);
           break;
         }
-        case "report_submitted": {
-          const row = vulnReportPatch(p, actor, ev.ts, "submitted");
-          if (row.id) {
-            upsertVulnReport(bb, row, ev.seq || 0);
-            tlabel(`${actor} submitted report: ${row.title}`);
-            pushChat(s, {
-              role: "system",
-              kind: "insight",
-              content: `Report submitted — ${row.title}`,
-              ts: ev.ts,
-            });
-          }
-          break;
-        }
-        case "report_rejected": {
-          const row = vulnReportPatch(p, actor, ev.ts, "rejected");
-          const reason = row.reason || row.code || "incomplete";
-          if (row.id) upsertVulnReport(bb, { ...row, reason }, ev.seq || 0);
-          tlabel(`${actor} rejected report: ${reason.slice(0, 72)}`);
-          break;
-        }
-        case "report_reproduced": {
-          const id = String(p.report_id ?? "");
-          patchReportStatus(bb, ev, id, "reproduced", {
-            actor,
-            reproVerifier: stringField(p.repro_verifier) || stringField(p.verifier) || actor,
-            reproCommand: stringField(p.command),
-            reproTarget: stringField(p.target),
-            reproResponseSummary: stringField(p.response_summary),
-            reproEvidence: p.evidence && typeof p.evidence === "object"
-              ? p.evidence as Record<string, unknown> : undefined,
-          });
-          tlabel(`${actor} reproduced report ${String(p.title ?? id).slice(0, 72)}`);
-          break;
-        }
-        case "report_repro_failed": {
-          const id = String(p.report_id ?? "");
-          const reason = String(p.reason ?? p.code ?? "not reproducible");
-          patchReportStatus(bb, ev, id, "repro_failed", {
-            code: String(p.code ?? "not_reproducible"),
-            reason,
-            actor,
-            reproVerifier: stringField(p.repro_verifier) || stringField(p.verifier) || actor,
-            reproCommand: stringField(p.command),
-            reproTarget: stringField(p.target),
-            reproResponseSummary: stringField(p.response_summary),
-            reproEvidence: p.evidence && typeof p.evidence === "object"
-              ? p.evidence as Record<string, unknown> : undefined,
-          });
-          tlabel(`${actor} reproduction failed: ${reason.slice(0, 72)}`);
-          break;
-        }
-        case "report_value_rejected": {
-          const id = String(p.report_id ?? "");
-          const reason = String(p.reason ?? p.code ?? "no impact");
-          patchReportStatus(bb, ev, id, "rejected", {
-            code: String(p.code ?? ""),
-            reason,
-            actor,
-          });
-          tlabel(`${actor} value rejected: ${reason.slice(0, 72)}`);
-          break;
-        }
-        case "report_accepted": {
-          const row = vulnReportPatch(p, actor, ev.ts, "accepted");
-          if (row.id) {
-            upsertVulnReport(bb, row, ev.seq || 0);
-            tlabel(`${actor} accepted report: ${row.title}`);
-            pushChat(s, {
-              role: "system",
-              kind: "insight",
-              content: `Report accepted — ${row.title}`,
-              ts: ev.ts,
-            });
-          }
-          break;
-        }
-        case "report_goal_evaluated": {
-          const id = String(p.report_id ?? "");
-          const qualified = p.qualified === true;
-          const reason = String(p.reason ?? p.code ?? "");
-          patchReportStatus(bb, ev, id, "accepted", {
-            goalQualified: qualified,
-            goalCode: String(p.code ?? ""),
-            goalDetail: reason,
-            actor,
-          });
-          tlabel(`${actor} goal gate: ${qualified ? "qualified" : "not qualified"}`);
-          pushChat(s, {
-            role: "system",
-            kind: "insight",
-            content: qualified
-              ? "Goal Gate accepted the independently reproduced report."
-              : `Goal Gate kept the report but did not count it: ${reason || "condition not met"}`,
-            ts: ev.ts,
-          });
-          break;
-        }
         case "goal_complete": {
           // pentest: the engagement goal was judged met (no flag). Mark the run
           // solved-by-goal and stash the rationale for the outcome panel.
           s.solved = true;
           s.outcomeReason = "goal_met";
-          if (p.why) s.goalWhy = String(p.why);
-          tlabel(`goal complete${p.why ? `: ${String(p.why).slice(0, 60)}` : ""}`);
+          const internalWhy = p.why === "model_goal_with_evidence";
+          if (p.why && !internalWhy) s.goalWhy = String(p.why);
+          tlabel("goal complete");
           pushChat(s, { role: "system", kind: "status",
-            content: `Goal met — ${p.why ?? "engagement objective reached"}`,
-            ts: ev.ts, i18nKey: "sys.goalMet", i18nVars: { why: String(p.why ?? "") } });
+            content: internalWhy ? "Goal met — supported by evidence" : `Goal met — ${p.why ?? "engagement objective reached"}`,
+            ts: ev.ts, i18nKey: internalWhy ? "sys.pentestGoalMet" : "sys.goalMet", i18nVars: { why: String(p.why ?? "") } });
           break;
         }
     default:

@@ -144,7 +144,6 @@ type CanvasProps = {
   onSpawnWorker?: (engine?: string) => void;
   onOpenFact?: (seq: number) => void;
   onOpenPoc?: (id: string) => void;
-  onOpenReport?: (id: string) => void;
   focusAgent?: FocusTarget | null;
   focusKnowledge?: FocusTarget | null;
 };
@@ -251,7 +250,7 @@ function useSignedList<T>(candidates: Signed<T>[]): T[] {
   return resolved.list;
 }
 
-function AgentCollaborationInner({ deck, running, onKillWorker, onOpenTimeline, onOpenWorker, onSpawnWorker, onOpenFact, onOpenPoc, onOpenReport, focusAgent, focusKnowledge }: CanvasProps) {
+function AgentCollaborationInner({ deck, running, onKillWorker, onOpenTimeline, onOpenWorker, onSpawnWorker, onOpenFact, onOpenPoc, focusAgent, focusKnowledge }: CanvasProps) {
   const t = useT();
   const restored = useRef(loadCollabView(deck.runId)).current;
   const model = useMemo(() => buildAgentCollaborationModel(deck, "all"), [deck]);
@@ -1046,7 +1045,6 @@ function AgentCollaborationInner({ deck, running, onKillWorker, onOpenTimeline, 
       observations: agent.observations,
       candidates: agent.candidates,
       deadEnds: agent.deadEnds,
-      reports: agent.reports,
       locks: agent.locks,
       tokens: agent.tokens,
       usd: agent.usd,
@@ -1333,16 +1331,14 @@ function AgentCollaborationInner({ deck, running, onKillWorker, onOpenTimeline, 
     let candidates = 0;
     let deadEnds = 0;
     let pocs = 0;
-    let reports = 0;
     for (const item of view.knowledge) {
       if (item.kind === "fact") facts += 1;
       else if (item.kind === "observation") observations += 1;
       else if (item.kind === "candidate") candidates += 1;
       else if (item.kind === "dead_end") deadEnds += 1;
       else if (item.kind === "poc") pocs += 1;
-      else if (item.kind === "report") reports += 1;
     }
-    return { generation: view.currentGeneration, openIntents: view.openIntents.length, facts, observations, candidates, deadEnds, pocs, reports };
+    return { generation: view.currentGeneration, openIntents: view.openIntents.length, facts, observations, candidates, deadEnds, pocs };
   }, [view.currentGeneration, view.knowledge, view.openIntents.length]);
   const toggleKnowledgeKind = useCallback((kind: CollaborationKnowledgeKind) => {
     setKnowledgeKinds((current) => {
@@ -1750,7 +1746,6 @@ function AgentCollaborationInner({ deck, running, onKillWorker, onOpenTimeline, 
             onSelectKnowledge={selectKnowledge}
             onOpenFact={onOpenFact}
             onOpenPoc={onOpenPoc}
-            onOpenReport={onOpenReport}
             onClosePanel={() => setDetailOpen(false)}
           />
         ) : (
@@ -1781,7 +1776,6 @@ function AgentCollaborationInner({ deck, running, onKillWorker, onOpenTimeline, 
             onKillWorker={onKillWorker}
             onOpenFact={onOpenFact}
             onOpenPoc={onOpenPoc}
-            onOpenReport={onOpenReport}
             onClosePanel={() => setDetailOpen(false)}
             asOf={replaying ? asOf : undefined}
           />

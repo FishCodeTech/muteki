@@ -37,6 +37,7 @@ from muteki.platform.contracts.external_agents import (
     SessionStart,
 )
 
+from .probe_environment import subprocess_environment
 from .acp import AcpError, AcpHello, AcpTransport, BaseAcpAdapter
 
 #: 认证方式优先级（核验：authMethods 当前只有 cursor_login）。
@@ -71,7 +72,7 @@ def cursor_is_authenticated(binary: str, env: dict[str, str]) -> bool:
             capture_output=True,
             text=True,
             timeout=10,
-            env={**os.environ, **env},
+            env=subprocess_environment(env),
         )
         payload = json.loads(result.stdout or "{}")
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):

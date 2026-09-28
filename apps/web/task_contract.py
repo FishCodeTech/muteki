@@ -18,6 +18,7 @@ from muteki.models.solve_graph import (
     TaskContract,
 )
 from muteki.solver.gate import normalize_flag_contract
+from muteki.pentest.contract import compile_pentest_prompt
 
 
 def _attachment_contracts(paths: list[Any]) -> list[TaskAttachment]:
@@ -95,22 +96,16 @@ def build_task_contract(body: Mapping[str, Any]) -> TaskContract:
             multi_flag=multi_flag,
         )
     else:
-        goal = str(challenge.get("goal") or root.get("goal") or raw).strip() or raw
-        explicit_count = challenge.get("expected_findings")
-        if explicit_count in (None, ""):
-            explicit_count = root.get("expected_findings")
-        expected = 1
-        if explicit_count not in (None, ""):
-            expected = max(1, int(explicit_count))
+        pentest = compile_pentest_prompt(raw, target=target, scope=scope)
+        target = pentest.target
+        scope = ", ".join(pentest.authorization.scope)
+        goal = pentest.goal
         completion = CompletionContract(
             kind="outcome",
             goal=goal,
-            task_type="generic",
-            quantity=expected,
+            task_type="authorized_pentest",
             expected_flags=1,
-            finding_class="generic",
-            outcome_predicate="first_valid_report",
-            collect_until_coverage=False,
+            outcome_predicate="model_goal_with_evidence",
         )
 
     return TaskContract(
@@ -122,6 +117,7 @@ def build_task_contract(body: Mapping[str, Any]) -> TaskContract:
         execution_target=target or None,
         authorization_scope=scope,
         completion_contract=completion,
+        pentest_contract=pentest if mode == "pentest" else None,
     )
 
 
@@ -157,7 +153,7 @@ def project_contract_into_body(
     out["task_contract"] = contract.model_dump(mode="json")
     if contract.mode == "pentest":
         challenge["goal"] = completion.goal
-        challenge["expected_findings"] = completion.quantity or 1
+        challenge["pentest_contract"] = contract.pentest_contract.model_dump(mode="json") if contract.pentest_contract else None
     else:
         challenge["expected_flags"] = max(1, completion.expected_flags)
         challenge["multi_flag"] = bool(completion.multi_flag)

@@ -66,6 +66,18 @@ async def start_coordinator(
 ) -> SwarmOutcome | None:
     abort_preloop = partial(abort_preloop_acquisitions, self, state)
     try:
+        pentest_contract = getattr(self.challenge, "pentest_contract", None)
+        if pentest_contract is not None and self.shared_graph is not None:
+            self.shared_graph._append(
+                "pentest_contract", "operator",
+                pentest_contract.model_dump(mode="json"),
+                verified=True,
+                dedupe_key=f"pentest-contract::{self.challenge.id}::{pentest_contract.version}",
+            )
+    except BaseException:
+        await abort_preloop()
+        raise
+    try:
         state.healthy = await self._healthy_engines_async()
     except BaseException:
         await abort_preloop()
@@ -110,7 +122,7 @@ async def start_coordinator(
     state.race_missed = False
     state.race_reasoned_wm = -1
     ctf_decide_first = bool(
-        getattr(self.challenge, "mode", "ctf") == "ctf"
+        getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
         and self._auto_dispatch_enabled()
     )
     if self.race_scout and state.cold_start and not ctf_decide_first:
@@ -264,7 +276,7 @@ def initialize_loop_state(self, state: CoordinatorRunState) -> None:
     state.fruitless_workers = 0
     state.prog_fact_ckpt = state.last_fact_count
     state.prog_flag_ckpt = len(self._found_flags)
-    state.prog_report_ckpt = len(getattr(self, "_found_reports", []) or [])
+    state.prog_report_ckpt = 0
     # Race-scout deliberately does not bootstrap again. If its first Decide pass
     # produced no claimable work, keep the coordinator alive by scheduling another
     # planning pass. Goal-incomplete runs never enter an autonomous operator wait.
@@ -302,7 +314,7 @@ async def prepare_main_loop(self, state: CoordinatorRunState) -> None:
 
     if (
         self.shared_graph is not None
-        and getattr(self.challenge, "mode", "ctf") == "ctf"
+        and getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
     ):
         has_origin = any(
             event.get("kind") == EV_FACT_ADDED
@@ -348,37 +360,8 @@ async def prepare_main_loop(self, state: CoordinatorRunState) -> None:
     # Planned cold starts enter through Decide before any broad executor. Auto
     # CTF never creates a special whole-challenge/root Worker: Decide creates
     # the immediate Step frontier and the ordinary dispatcher owns every Worker.
-    # Pentest keeps its existing degraded fallback unchanged.
-    pentest_planned = False
-    if (
-        getattr(self.challenge, "mode", "ctf") == "pentest"
-        and state.cold_start
-        and not state.race_missed
-        and not self._open_intents()
-    ):
-        await emit_bb("reason_start", trigger="pentest_cold_start")
-        pentest_planned = bool(await self._run_reason())
-        await emit_bb(
-            "reason_done",
-            trigger="pentest_cold_start",
-            **self._reason_event_fields(len(self._open_intents())),
-        )
-        if not pentest_planned:
-            planner_failure = getattr(self, "_last_planner_failure", None)
-            await emit_bb(
-                "engagement_planner_degraded",
-                trigger="pentest_cold_start",
-                reason=str(
-                    getattr(planner_failure, "detail", "")
-                    or planner_failure
-                    or "planner returned no usable intents"
-                )[:500],
-                scope_expanded=False,
-                fallback="single bootstrap worker",
-            )
-
     ctf_decide_first = bool(
-        getattr(self.challenge, "mode", "ctf") == "ctf"
+        getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
         and self._auto_dispatch_enabled()
         and state.cold_start
         and not state.race_missed
@@ -425,7 +408,7 @@ async def prepare_main_loop(self, state: CoordinatorRunState) -> None:
     # worker 直到结束前才被 Reason 补起）。续解起步直接覆盖全部健康普通
     # Seat；并发上限仍由 _ordinary_capacity_available(max_workers) 把关。
     # flag 已集齐的重开保持旧行为（少起 Worker，由主循环立刻收尾）。
-    if pentest_planned or ctf_decide_first:
+    if ctf_decide_first:
         initial_workers = 0
     elif state.race_missed:
         initial_workers = 0

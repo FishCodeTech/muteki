@@ -20,6 +20,7 @@ import type { BlackboardReducerContext } from "./blackboard-context";
 function evidenceProvenance(raw: any): FactEvidenceProvenance | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   return {
+    target: raw.target ? String(raw.target) : undefined,
     artifactRefs: Array.isArray(raw.artifact_refs)
       ? raw.artifact_refs
         .filter((ref: any) => ref && typeof ref === "object" && String(ref.artifact_id ?? ""))

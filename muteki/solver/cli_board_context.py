@@ -9,12 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from muteki.core.prompt_assembly import PromptPart, compile_prompt, resolve_prompt_budget
-from muteki.models.solve_graph import engagement_goal_of
 from muteki.solver.context_manifest import ContextManifest
-from muteki.solver.vuln_report import (
-    VERIFIER_PROMPT as _VERIFIER_PROMPT,
-    report_goal_decision,
-)
 from muteki.solver.workspace import (
     ensure_workspace,
     relative_symlink,
@@ -28,8 +23,7 @@ from muteki.solver.cli_prompts import (
     _CTF_FACT_VERIFY_PROMPT,
     _FACT_VERIFY_PROMPT,
     _KB_PROMPT,
-    _PENTEST_EXEC_PROMPT,
-    _PENTEST_EXPLORE_PROMPT,
+    _PENTEST_FGS_EXPLORE_PROMPT,
     _REVIEW_PROMPT,
     without_operator_input_capability,
 )
@@ -57,7 +51,7 @@ def _join_sections(sections: "list[tuple[str, str, dict]]") -> str:
 
 
 def _task_reference_block(self) -> str:
-    if getattr(self.challenge, "mode", "ctf") == "ctf":
+    if getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}:
         instruction = str(
             getattr(
                 getattr(self.challenge, "task_contract", None),
@@ -86,7 +80,7 @@ def _compile_worker_prompt(
 ) -> str:
     if not bool(getattr(self.challenge, "allow_operator_input", True)):
         fixed_template = without_operator_input_capability(fixed_template)
-    if getattr(self.challenge, "mode", "ctf") == "ctf":
+    if getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}:
         if bool(getattr(self.challenge, "allow_operator_input", True)) and role in {
             "worker_bootstrap", "worker_explore",
         }:
@@ -100,7 +94,7 @@ def _compile_worker_prompt(
         )
         self._persist_context_manifest(role, sections, omissions=[])
         return prompt
-    if getattr(self.challenge, "mode", "ctf") != "ctf":
+    if getattr(self.challenge, "mode", "ctf") == "pentest":
         fixed_template += (
             "\n\n## Network activity limits\n"
             "Do not start with scanning or brute force. Read supplied files and existing "
@@ -320,7 +314,7 @@ def _step_contract_block(self) -> str:
     if (not (facts or obs or stop or cov or lane or required_pocs)
             and getattr(self, "mode", "") not in {"explore", "bootstrap"}):
         return ""
-    if getattr(getattr(self, "challenge", None), "mode", "ctf") == "ctf":
+    if getattr(getattr(self, "challenge", None), "mode", "ctf") in {"ctf", "pentest"}:
         lines = ["\n## 当前 Step"]
         if facts:
             lines.append("来源 Fact：" + ", ".join(f"#{n}" for n in facts))
@@ -332,6 +326,15 @@ def _step_contract_block(self) -> str:
             lines.append(f"覆盖问题：{cov}")
         if required_pocs:
             lines.append("所需 PoC 资源：" + ", ".join(required_pocs))
+        if getattr(getattr(self, "challenge", None), "mode", "ctf") == "pentest":
+            claim = dict(getattr(self, "value_claim", {}) or {})
+            lines.extend([
+                f"授权资产：{claim.get('asset') or ''}",
+                f"测试身份：{claim.get('identity') or 'anonymous'}",
+                f"风险等级：{claim.get('risk_tier') or 'bounded_validation'}",
+                f"授权版本：{claim.get('authorization_version') or 1}",
+                f"证据要求：{claim.get('evidence_requirement') or obs}",
+            ])
         lines.append(
             "把本 Step 作为一条连贯因果链执行，不把停止边界当成固定请求清单。"
             "出现可能改变结论的新观察时，先完成最小区分试验；只有预期证据已得到，"
@@ -776,21 +779,10 @@ def _submit_gate_block(self) -> str:
 
 
 def _engagement_goal(self) -> str:
-    """Render the normalized completion contract without duplicating the task."""
+    """Render the operator's objective from the versioned domain contract."""
     c = self.challenge
     if getattr(c, "mode", "ctf") == "pentest":
-        engagement = engagement_goal_of(c)
-        if engagement.completion_kind == "coverage":
-            return "Map every planned in-scope attack surface and submit all qualifying reports."
-        if engagement.completion_kind == "count":
-            return (
-                f"Collect {max(1, int(engagement.expected_findings or 1))} "
-                f"accepted {engagement.finding_class or 'generic'} report(s)."
-            )
-        return (
-            f"Prove {engagement.outcome_predicate or 'first_valid_report'} with "
-            "an independently reproduced, value-accepted report."
-        )
+        return str(getattr(getattr(c, "pentest_contract", None), "goal", "") or c.goal)
     return f"Solve {c.name} [{c.category}]"
 
 
@@ -843,7 +835,7 @@ def _live_blackboard_context(self) -> str:
                 since_seq=int(scope.get("since_seq", 0) or 0),
                 directive=self.intent_goal,
             )
-    if getattr(self.challenge, "mode", "ctf") == "ctf":
+    if getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}:
         return _ctf_shared_state_block(self)
     parts: list[str] = []
     if self.mode == "bootstrap":
@@ -883,7 +875,7 @@ def _build_prompt(self) -> str:
     ))
     if not bool(getattr(self, "web_access", True)):
         sections.append(("offline-boundary", _OFFLINE_BOUNDARY_BLOCK, {}))
-    if getattr(c, "mode", "ctf") == "ctf":
+    if getattr(c, "mode", "ctf") in {"ctf", "pentest"}:
         shared_state = _ctf_shared_state_block(self)
         if shared_state:
             sections.append(("shared-state", shared_state, {}))
@@ -901,10 +893,14 @@ def _build_prompt(self) -> str:
         rejected = self._rejected_flags_block()
         if rejected:
             sections.append(("rejected-flags", rejected, {}))
-        fixed = _EXEC_PROMPT.format(
-            ctx="{context}",
-            kb=_KB_PROMPT if self.kb else "",
-            fmt=self._flag_hint())
+        fixed = (
+            _PENTEST_FGS_EXPLORE_PROMPT.format(
+                ctx="{context}", intent_goal=self.intent_goal or "authorized assessment")
+            if getattr(c, "mode", "ctf") == "pentest"
+            else _EXEC_PROMPT.format(
+                ctx="{context}", kb=_KB_PROMPT if self.kb else "",
+                fmt=self._flag_hint())
+        )
         return _compile_worker_prompt(self, "worker_bootstrap", fixed, sections)
     # Bootstrap gets no source-facts projection (no assigned intent — the
     # legacy neighborhood/step-contract blocks below still render only when a
@@ -954,15 +950,6 @@ def _build_prompt(self) -> str:
     rejected = self._rejected_flags_block()
     if rejected:
         sections.append(("rejected-flags", rejected, {}))
-    # pentest mode → goal-driven prompt (no flag); else the unchanged CTF prompt.
-    if getattr(c, "mode", "ctf") == "pentest":
-        sections.append(("box-mode", self._box_mode_line(), {}))
-        fixed = _PENTEST_EXEC_PROMPT.format(
-            ctx="{context}",
-            kb=_KB_PROMPT if self.kb else "",
-            goal=self._engagement_goal(),
-            scope=self._engagement_scope())
-        return _compile_worker_prompt(self, "worker_bootstrap", fixed, sections)
     fixed = _EXEC_PROMPT.format(
         ctx="{context}",
         kb=_KB_PROMPT if self.kb else "",
@@ -1008,54 +995,19 @@ def _team_context_block(self) -> str:
     """
     n = self._expected_flags()
     if getattr(self.challenge, "mode", "ctf") == "pentest":
-        eg = engagement_goal_of(self.challenge)
-        if eg.completion_kind == "coverage":
-            return (
-                "\n## Completion contract: cover every planned in-scope attack "
-                "surface, submit every complete report, and finish all pending "
-                "reproductions. There is no report quota."
-            )
-        want = max(1, int(eg.expected_findings or 1))
-        got = 0
-        sg = getattr(self, "shared_graph", None)
-        if sg is not None and hasattr(sg, "accepted_reports"):
-            try:
-                got = sum(
-                    1 for report in (sg.accepted_reports() or [])
-                    if report_goal_decision(eg, report)[0]
-                )
-            except Exception:
-                got = 0
-        remaining = max(0, want - got)
-        if eg.completion_kind == "outcome":
-            heading = (
-                f"\n## Completion contract: prove `{eg.outcome_predicate}` with "
-                "one independently reproduced, value-accepted report."
-            )
-        else:
-            heading = (
-                f"\n## Completion contract: {want} goal-qualified accepted "
-                f"report(s) ({got}/{want}, {remaining} remaining)."
-            )
-        block = [heading,
-            "Write a complete JSON report file and submit it through the "
-            "`muteki-blackboard` Skill. A report is accepted only after a "
-            "different Worker reproduces it, a host-side value check passes, "
-            "and the Goal Gate records whether it satisfies this engagement.",
-        ]
-        if got and sg is not None:
-            try:
-                titles = [
-                    str(r.get("title") or r.get("resource_id") or r.get("report_id") or "")
-                    for r in (sg.accepted_reports() or [])
-                ]
-                titles = [t for t in titles if t]
-                if titles:
-                    block.append("Already accepted (do not resubmit the same issue):")
-                    block += [f"  - {t}" for t in titles]
-            except Exception:
-                pass
-        return "\n".join(block)
+        contract = getattr(self.challenge, "pentest_contract", None)
+        if contract is None:
+            return ""
+        graph = getattr(self, "shared_graph", None)
+        if graph is None:
+            return f"\n## Objective\n{contract.goal}"
+        from muteki.pentest.judgement import evaluate
+        decision = evaluate(graph.events(), contract)
+        return (
+            f"\n## Objective\n{contract.goal}\n"
+            f"Goal decision: {decision['objective_status']}; "
+            f"cited evidence Facts: {decision['qualified_findings']}."
+        )
     if n <= 1:
         return ""
     got = self._known_flags()
@@ -1128,7 +1080,8 @@ def _flag_hint(self) -> str:
 
 def _build_explore_prompt(self) -> str:
     c = self.challenge
-    if getattr(c, "mode", "ctf") == "ctf" and self.mode != "fact_verifier":
+    if (getattr(c, "mode", "ctf") in {"ctf", "pentest"}
+            and (self.mode != "fact_verifier" or c.mode == "pentest")):
         graph = _ctf_shared_state_block(self)
         assigned = (
             f"【你负责的 step】{self.intent_id_assigned}\n"
@@ -1208,12 +1161,18 @@ def _build_explore_prompt(self) -> str:
         rejected = self._rejected_flags_block()
         if rejected:
             sections.append(("rejected-flags", rejected, {}))
-        template = _CTF_FACT_VERIFY_PROMPT if self.mode == "fact_verifier" else _EXPLORE_PROMPT
-        fixed = template.format(
-            ctx="{context}",
-            kb=_KB_PROMPT if self.kb else "",
-            intent_goal=self.intent_goal or "general exploration",
-            fmt=self._flag_hint())
+        if getattr(c, "mode", "ctf") == "pentest":
+            assignment = self.intent_goal or "authorized assessment"
+            if self.mode == "fact_verifier":
+                assignment = "独立验证，不复用候选 Worker 的结论。" + assignment
+            fixed = _PENTEST_FGS_EXPLORE_PROMPT.format(
+                ctx="{context}", intent_goal=assignment)
+        else:
+            template = _CTF_FACT_VERIFY_PROMPT if self.mode == "fact_verifier" else _EXPLORE_PROMPT
+            fixed = template.format(
+                ctx="{context}", kb=_KB_PROMPT if self.kb else "",
+                intent_goal=self.intent_goal or "general exploration",
+                fmt=self._flag_hint())
         return _compile_worker_prompt(
             self,
             "verifier" if self.mode == "fact_verifier" else "worker_explore",
@@ -1272,37 +1231,6 @@ def _build_explore_prompt(self) -> str:
             kb=_KB_PROMPT if self.kb else "",
             intent_goal=self.intent_goal or "Verify the assigned fact.")
         return _compile_worker_prompt(self, "verifier", fixed, sections)
-    if self.mode == "report_reproducer":
-        report_name = str(getattr(self, "_report_file_name", "") or "")
-        report_digest = str(getattr(self, "_report_file_sha256", "") or "")
-        if not report_name or not report_digest:
-            raise RuntimeError("complete verifier report was not staged")
-        report_json = (
-            f"Read `./{report_name}` in full before testing. "
-            f"Its SHA-256 is `{report_digest}`."
-        )
-        sections.append((
-            "report-instruction", report_json,
-            {"external_files": [report_name]},
-        ))
-        fixed = _VERIFIER_PROMPT.format(
-            ctx="{context}",
-            goal=self._engagement_goal(),
-            scope=self._engagement_scope(),
-            report_json=(
-                "The complete report file is identified in the required "
-                "context above."
-            ))
-        return _compile_worker_prompt(self, "verifier", fixed, sections)
-    if getattr(c, "mode", "ctf") == "pentest":
-        fixed = _PENTEST_EXPLORE_PROMPT.format(
-            ctx="{context}",
-            kb=_KB_PROMPT if self.kb else "",
-            goal=self._engagement_goal(),
-            scope=self._engagement_scope(),
-            box=self._box_mode_line(),
-            intent_goal=self.intent_goal or "general exploration")
-        return _compile_worker_prompt(self, "worker_explore", fixed, sections)
     fixed = _EXPLORE_PROMPT.format(
         ctx="{context}",
         kb=_KB_PROMPT if self.kb else "",

@@ -301,6 +301,7 @@ def _rehydrate(self) -> None:
         # the rail renders its placeholder instead of leaking the bare id.
         run.name = "" if s.get("name") in (None, "", rid) else s["name"]
         run.category = s.get("category", "") or ""
+        run.mode = "pentest" if s.get("mode") == "pentest" else "ctf"
         run.started = bool(s.get("started"))
         # Historical ghost-run compatibility contract: a dead started run is
         # force-settled on rehydrate so the rail never shows a zombie live run.

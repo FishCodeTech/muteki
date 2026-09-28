@@ -44,6 +44,8 @@ import hashlib
 import json
 import os
 import subprocess
+
+from .probe_environment import subprocess_environment
 import tempfile
 from pathlib import Path
 from typing import Any, AsyncIterator, Mapping, Optional
@@ -567,7 +569,7 @@ def export_protocol_methods(
     try:
         result = subprocess.run(
             [binary, "app-server", "generate-json-schema", "--out", str(out_dir)],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, timeout=timeout, env=subprocess_environment(),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return {}
@@ -599,7 +601,7 @@ def _probe_version(binary: str, *, timeout: float = 15.0) -> str:
     try:
         result = subprocess.run(
             [binary, "--version"], capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout,
+            encoding="utf-8", errors="replace", timeout=timeout, env=subprocess_environment(),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return ""
@@ -952,6 +954,8 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             init_params=init_params)
         try:
             reload_status = "skipped"
+            for plugin in request.options.get("chat_native_plugins", []):
+                await conn.request("plugin/install", plugin, timeout=60)
             if mcp_args:
                 # 新进程已带 -c 覆盖；reload 是核验建议的确定性保险
                 # （对写 config.toml 的路径是必需）。旧版无此方法时容忍。
@@ -965,6 +969,17 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                 "cwd": cwd,
                 "serviceName": "muteki",
             }
+            approvals = request.options.get("chat_hook_approvals") or {}
+            if approvals:
+                catalog = await conn.request("hooks/list", {"cwds": [cwd]})
+                trusted = {}
+                for entry in catalog.get("data", []):
+                    for hook in entry.get("hooks", []):
+                        if (hook.get("command") in approvals.get(hook.get("pluginId"), [])
+                            and hook.get("currentHash") and hook.get("key")):
+                            trusted[hook["key"]] = {"trusted_hash": hook["currentHash"], "enabled": True}
+                if trusted:
+                    thread_params["config"] = {"hooks.state": trusted}
             model = request.model or self._model
             if model:
                 thread_params["model"] = model
@@ -1421,8 +1436,16 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         result = started_result
         if result is None:
             try:
-                result = await conn.request(
-                    M_TURN_START, self._turn_parameters(ctx, input), timeout=60)
+                capability = input.payload.get("runtime_capability") or {}
+                if (capability.get("invocation") or {}).get("method") == "review/start":
+                    from .command_providers import codex_review_target
+                    result = await conn.request("review/start", {
+                        "threadId": thread_id, "delivery": "inline",
+                        "target": codex_review_target(str(capability.get("arguments") or "")),
+                    }, timeout=60)
+                else:
+                    result = await conn.request(
+                        M_TURN_START, self._turn_parameters(ctx, input), timeout=60)
             except (JsonRpcError, asyncio.TimeoutError) as exc:
                 yield self.emit(build_event(
                     AgentEventType.TURN_FAILED, seq,
@@ -2230,16 +2253,84 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         result = await ctx["conn"].request(M_MCP_STATUS, {}, timeout=30)
         return list((result or {}).get("data") or [])
 
+    async def rewind_session(self, session: AgentSessionRef, native_turn_id: str) -> dict[str, Any]:
+        ctx = self._runs.get(session.agent_session_id)
+        if not ctx or not {"thread/revert", "thread/rollback"}.intersection(self._client_request_methods):
+            raise RuntimeError("当前 Codex 未提供历史回退接口")
+        conn = ctx["conn"]
+        if "thread/revert" in self._client_request_methods:
+            await conn.request("thread/revert", {"threadId": ctx["thread_id"], "beforeTurnId": native_turn_id}, timeout=60)
+            ctx["current_turn_id"] = None
+            return {"strategy": "native", "method": "thread/revert"}
+        result = await conn.request("thread/read", {"threadId": ctx["thread_id"], "includeTurns": True})
+        turns = (result.get("thread") or {}).get("turns") or []
+        index = next((i for i, turn in enumerate(turns) if turn.get("id") == native_turn_id), None)
+        if index is None:
+            raise RuntimeError("目标轮次已不在原生会话中，请刷新聊天后重试")
+        await conn.request("thread/rollback", {"threadId": ctx["thread_id"], "numTurns": len(turns) - index}, timeout=60)
+        ctx["current_turn_id"] = None
+        return {"strategy": "native", "removed": len(turns) - index}
+
     async def runtime_operation(
-        self, session: AgentSessionRef, name: str
+        self, session: AgentSessionRef, name: str, arguments: str = ""
     ) -> dict[str, Any]:
-        """调用 Codex App Server 的只读管理 RPC。"""
+        """Invoke operations proven by the installed App Server schema."""
         ctx = self._runs.get(session.agent_session_id)
         if ctx is None or not ctx["conn"].alive:
             raise RuntimeError("session is not active on this adapter")
         normalized = str(name or "").strip().lstrip("/")
+        if normalized == "goal":
+            method = "thread/goal/get" if not arguments else "thread/goal/clear" if arguments in {"off", "clear"} else "thread/goal/set"
+            if method not in self._client_request_methods:
+                raise RuntimeError("当前 Codex 未提供目标接口")
+            params = {"threadId": ctx["thread_id"]}
+            if method.endswith("set"):
+                params["objective"] = arguments
+            return {"status": "completed", "result": await ctx["conn"].request(method, params)}
+        if normalized == "mcp" and arguments == "reload":
+            if M_MCP_RELOAD not in self._client_request_methods:
+                raise RuntimeError("当前 Codex 未提供 MCP 刷新接口")
+            return {"status": "completed", "result": await ctx["conn"].request(M_MCP_RELOAD, {})}
+        if arguments:
+            raise ValueError(f"/{normalized} 不接受此参数")
+        if normalized == "compact":
+            method = "thread/compact/start"
+            if method not in self._client_request_methods:
+                raise RuntimeError("当前 Codex 不支持结构化压缩接口")
+            if ctx.get("current_turn_id"):
+                raise RuntimeError("当前 Codex 正在回复，请结束后再压缩")
+            conn = ctx["conn"]
+            await conn.request(method, {"threadId": ctx["thread_id"]}, timeout=30)
+            # The RPC only acknowledges scheduling. Wait for the actual native
+            # compaction turn, including its terminal status, before succeeding.
+            compact_turn = None
+            async with asyncio.timeout(180):
+                while True:
+                    kind, message = await conn.incoming.get()
+                    if kind == "eof":
+                        raise RuntimeError("Codex 在压缩完成前断开连接")
+                    if kind != "notification":
+                        if kind == "request":
+                            await conn._peer.respond(message["id"], error={"code": -32601, "message": "No interactive requests during compact"})
+                        continue
+                    params = message.get("params") or {}
+                    if params.get("threadId") != ctx["thread_id"]:
+                        continue
+                    event = message.get("method")
+                    if event == "turn/started":
+                        compact_turn = (params.get("turn") or {}).get("id")
+                    if event == "item/started" and (params.get("item") or {}).get("type") == "contextCompaction":
+                        compact_turn = params.get("turnId")
+                    if event == "turn/completed" and compact_turn and (params.get("turn") or {}).get("id") == compact_turn:
+                        status = (params.get("turn") or {}).get("status")
+                        if status != "completed":
+                            raise RuntimeError(f"Codex 压缩未完成：{status}")
+                        return {"status": "completed", "message": "上下文已由 Codex 原生压缩"}
         cwd = str(ctx.get("cwd") or "")
         method_params: dict[str, tuple[str, dict[str, Any]]] = {
+            "status": ("thread/read", {"threadId": ctx["thread_id"], "includeTurns": False}),
+            "usage": ("account/rateLimits/read", {}),
+            "models": (M_MODEL_LIST, {"limit": 100}),
             "skills": (M_SKILLS_LIST, {
                 "cwds": [cwd] if cwd else [], "forceReload": False,
             }),
@@ -2319,6 +2410,12 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                 diagnostics.append(f"skills/list 读取失败：{str(exc)[:160]}")
 
         operations = {
+            "rewind": ("thread/revert" if "thread/revert" in self._client_request_methods else "thread/rollback", "回退 Codex 原生会话与聊天记录；保留工作区文件"),
+            "status": ("thread/read", "查看 Codex 原生会话状态"),
+            "usage": ("account/rateLimits/read", "查看 Codex 账户用量限制"),
+            "models": (M_MODEL_LIST, "查看 Codex 原生模型目录"),
+            "goal": ("thread/goal/get", "查看或设置当前 Codex 会话目标；off 清除"),
+            "compact": ("thread/compact/start", "由 Codex 原生压缩当前上下文，保留对话历史"),
             "skills": (M_SKILLS_LIST, "查看当前 Codex Skill 目录"),
             "hooks": (M_HOOKS_LIST, "查看当前 Codex Hook 与信任状态"),
             "plugins": (M_PLUGIN_LIST, "查看本地与项目插件"),
@@ -2347,6 +2444,12 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                 invocation={"method": method},
             ))
 
+        if "review/start" in self._client_request_methods:
+            items.append(dynamic_command_item(
+                adapter_id=self.id, engine="codex", name="review", description="启动 Codex 原生代码审查",
+                argument_hint="[说明 | --base 分支 | --commit 提交]", channel="app_server_rpc",
+                invocation={"method": "review/start", "wire_text": "/review"},
+            ))
         if M_MCP_STATUS in self._client_request_methods:
             try:
                 statuses = await self.mcp_server_status(session)

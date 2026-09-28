@@ -176,6 +176,7 @@ class AcpTransport:
         self._elicitation_handler = elicitation_handler
         #: 有进行中 session/prompt 的 sessionId 集合——replay 判定的唯一依据。
         self._active_prompts: set[str] = set()
+        self._replaying_sessions: set[str] = set()
         #: 回放事件流水（按到达顺序），供 Adapter 恢复时检阅而不投影。
         self.replay_log: list[dict[str, Any]] = []
         self.hello: Optional[AcpHello] = None
@@ -255,11 +256,13 @@ class AcpTransport:
         if self.hello is not None and not self.hello.load_session:
             raise AcpError("agent does not support session/load "
                            "(agentCapabilities.loadSession is false)")
-        result = check_response("session/load", await self._peer.request(
-            "session/load",
-            {"sessionId": session_id, "cwd": cwd,
-             "mcpServers": list(mcp_servers)},
-            timeout=timeout))
+        self._replaying_sessions.add(session_id)
+        try:
+            result = check_response("session/load", await self._peer.request(
+                "session/load", {"sessionId": session_id, "cwd": cwd,
+                                 "mcpServers": list(mcp_servers)}, timeout=timeout))
+        finally:
+            self._replaying_sessions.discard(session_id)
         self._session_setup[session_id] = result
 
     async def resume_session(
@@ -335,7 +338,7 @@ class AcpTransport:
             params = msg.get("params") or {}
             session_id = str(params.get("sessionId") or "")
             update = params.get("update") or {}
-            replay = session_id not in self._active_prompts
+            replay = session_id in self._replaying_sessions
             if replay:
                 self.stats["replay_updates"] += 1
                 self.replay_log.append(
@@ -519,7 +522,8 @@ def normalize_session_update(
                 "name": name,
                 "description": str(raw.get("description") or "").strip(),
                 "argument_hint": str(
-                    raw.get("inputHint")
+                    (raw.get("input") or {}).get("hint")
+                    or raw.get("inputHint")
                     or raw.get("input_hint")
                     or raw.get("argumentHint")
                     or ""
@@ -842,7 +846,8 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
                 session_id = resume_handle
                 handle["resumed"] = True
             else:
-                session_id = await transport.new_session(cwd, mcp_servers)
+                session_id = await transport.new_session(
+                    cwd, mcp_servers, timeout=120 if self.id == "cursor.acp" else 60)
             # 子类钩子：session 建立后的 Runtime 特有动作（如 Kimi
             # session/set_model）；默认无操作。
             await self._after_session_open(transport, session_id, request)
@@ -876,6 +881,10 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
         handle = self._handle_for(agent_session_id)
         if handle is None:
             return
+        if handle.get("external_session_id") and session_id != handle["external_session_id"]:
+            # Native workflows can announce child sessions on the same ACP
+            # connection. Their command catalogs never replace the parent's.
+            return
         mapped = normalize_session_update(update)
         if str(update.get("sessionUpdate") or "") == "available_commands_update":
             commands = list(mapped[0][2].get("commands") or []) if mapped else []
@@ -906,6 +915,30 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
         if sink is not None:
             for etype, native_kind, payload in mapped:
                 sink.put_nowait(("update", etype, native_kind, payload))
+        elif callable(handle.get("background_handler")):
+            handle["background_handler"](mapped)
+
+    def bind_background_handler(self, session: AgentSessionRef, handler) -> None:
+        handle = self._handle_for(session.agent_session_id)
+        if handle is not None:
+            handle["background_handler"] = handler
+
+    async def runtime_operation(self, session: AgentSessionRef, name: str, arguments: str = "") -> dict[str, Any]:
+        handle = self._handle_for(session.agent_session_id)
+        if not handle or handle.get("current_turn_id"):
+            raise RuntimeError("请等待当前回复结束后切换模式")
+        transport = handle["transport"]
+        sid = handle["external_session_id"]
+        setup = transport.session_setup(sid)
+        available = (setup.get("modes") or {}).get("availableModes") or []
+        mode = next((row for row in available if str(row.get("id")) == name), None)
+        if mode is None:
+            raise RuntimeError("当前 ACP 会话未公布此模式")
+        if arguments:
+            raise ValueError(f"请先执行 /{name} 切换模式，再发送任务")
+        await transport.set_mode(sid, name)
+        transport._session_setup[sid].setdefault("modes", {})["currentModeId"] = name
+        return {"status": "completed", "message": f"当前引擎已切换到 {mode.get('name') or name} 模式"}
 
     async def runtime_capability_snapshot(
         self, session: Optional[AgentSessionRef] = None
@@ -943,6 +976,19 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
                     "protocol": "acp.session/prompt",
                 },
             ))
+        if engine == "grok":
+            for item in items:
+                if item.name == "context":
+                    item.invocation["native_wire_text"] = "/session-info"
+                    item.description = "查看 Grok 原生会话与上下文用量"
+        from .command_providers import operation_item
+        setup = handle["transport"].session_setup(handle["external_session_id"])
+        names = {item.name for item in items}
+        for mode in (setup.get("modes") or {}).get("availableModes") or []:
+            name = str(mode.get("id") or "")
+            if name and name not in names:
+                items.append(operation_item(self.id, engine, name, "session/set_mode",
+                    f"切换到 {mode.get('name') or name} 模式"))
         return base.model_copy(update={
             "revision": int(handle.get("capability_revision") or 0),
             "items": items,
@@ -989,7 +1035,7 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
             return self._permission_option(
                 options, ("allow_once", "allow_always"))
 
-        sink = handle.get("event_sink")
+        sink = self._interaction_sink(handle)
         if sink is None:
             return None
         approval_id = str(
@@ -1028,6 +1074,18 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
             return await future
         finally:
             handle["pending_approvals"].pop(approval_id, None)
+
+    @staticmethod
+    def _interaction_sink(handle: dict[str, Any]):
+        if handle.get("event_sink") is not None:
+            return handle["event_sink"]
+        callback = handle.get("background_handler")
+        if not callable(callback):
+            return None
+        class BackgroundSink:
+            def put_nowait(self, item):
+                callback([item[1:]])
+        return BackgroundSink()
 
     @staticmethod
     def _elicitation_properties(
@@ -1118,7 +1176,7 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
         handle = self._handle_for(agent_session_id)
         if handle is None or str(params.get("mode") or "form") != "form":
             return {"action": "cancel"}
-        sink = handle.get("event_sink")
+        sink = self._interaction_sink(handle)
         if sink is None:
             return {"action": "cancel"}
         request_id = str(params.get("elicitationId") or new_id("elicitation"))
@@ -1477,6 +1535,18 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
                 native_type="acp.prompt.refusal",
                 payload={"stop_reason": stop_reason},
                 **common))
+        elif not "".join(text_parts).strip() and (input.payload.get("runtime_capability") or {}).get("verification") == "verified":
+            capability = input.payload["runtime_capability"]
+            yield self.emit(build_event(
+                AgentEventType.MESSAGE_COMPLETED, seq,
+                external_session_id=external_id, turn_id=turn_id,
+                native_type="acp.command.completed",
+                payload={"text": f"引擎已处理 /{capability.get('name', '')}（未返回文本）", "role": "assistant"},
+                **common))
+            yield self.emit(build_event(
+                AgentEventType.TURN_COMPLETED, seq,
+                external_session_id=external_id, turn_id=turn_id,
+                native_type="acp.prompt.completed", payload={"stop_reason": stop_reason or "end_turn"}, **common))
         elif not "".join(text_parts).strip():
             yield self.emit(build_event(
                 AgentEventType.TURN_FAILED, seq,

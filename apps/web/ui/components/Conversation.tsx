@@ -19,7 +19,6 @@ import { Icon, type IconName } from "@/components/Icon";
 import { RunInspector } from "@/components/RunInspector";
 import { RunSignalsStrip } from "@/components/RunSignalsStrip";
 import { NumberField } from "@/components/NumberField";
-import { reportToMarkdown } from "@/lib/reportMarkdown";
 import { useCopied } from "@/lib/useCopied";
 import { Accordion, Button, Chip, Input, Label, ListBox, ListBoxItem, Popover, Select, Skeleton, Spinner, Tabs, TextArea } from "@heroui/react";
 import type { ArtifactView } from "@/lib/events";
@@ -159,12 +158,17 @@ function activeFlowIndex(digest: SwarmDigest): number {
 function CoordBubble({
   m,
   t,
+  mode,
 }: {
   m: ChatMessage;
   t: (k: string, vars?: Record<string, string | number>) => string;
+  mode: "ctf" | "pentest";
 }) {
   const [copied, copy] = useCopied();
-  const text = m.i18nKey ? t(m.i18nKey, m.i18nVars) : m.content;
+  const text = mode === "pentest" && m.i18nKey === "sys.goalMet"
+    && m.i18nVars?.why === "model_goal_with_evidence"
+    ? t("sys.pentestGoalMet")
+    : m.i18nKey ? t(m.i18nKey, m.i18nVars) : m.content;
   const standbyReply = m.role === "agent" && m.solverId?.endsWith("-standby");
   const who = m.role === "human" ? t("coord.you") : m.role === "system"
     ? (m.kind === "insight" ? "insight" : "system")
@@ -219,10 +223,8 @@ function DigestBubble({ digest, t }: { digest: SwarmDigest; t: (k: string, v?: R
       <div className="coord-digest-title">{t("coord.digestTitle")}</div>
       <div className="body">
         {digest.mode === "pentest"
-          ? t("coord.digest", {
-              phase: phaseLabel(digest.phase, t),
-              verified: digest.verified, candidates: digest.candidates,
-              intents: digest.openIntents, dead: digest.deadEnds,
+          ? t("coord.pentestDigest", {
+              facts: digest.verified, steps: digest.openSteps, goals: digest.goals,
               online: digest.onlineWorkers, total: digest.totalWorkers,
             })
           : t("coord.digestCtf", {
@@ -338,33 +340,20 @@ function ProgressBriefBubble({
 }
 
 function AnswerBubble({ digest, t }: { digest: SwarmDigest; t: (k: string, v?: Record<string, string | number>) => string }) {
-  const pentest = digest.mode === "pentest";
-  const none = pentest
-    ? digest.reports.length === 0 && digest.phase !== "goal_met"
-    : digest.flags.length === 0 && digest.phase !== "goal_met";
-  const multi = pentest ? digest.expectedReports > 1 : digest.expectedFlags > 1;
+  const none = digest.flags.length === 0 && digest.phase !== "goal_met";
+  const multi = digest.expectedFlags > 1;
   return (
     <div className={`coord-bubble answer ${none ? "none" : ""}`}>
       <span className="coord-node" aria-hidden="true"><Icon name={none ? "clock" : "check"} size={12} /></span>
       <div className="coord-digest-title">
         {t("coord.answerTitle")}
-        {multi && (pentest ? digest.reports.length > 0 : digest.flags.length > 0) && (
+        {multi && digest.flags.length > 0 && (
           <span className="ans-flag-count">
-            {pentest ? `${digest.reports.length}/${digest.expectedReports}` : `${digest.flags.length}/${digest.expectedFlags}`}
+            {`${digest.flags.length}/${digest.expectedFlags}`}
           </span>
         )}
       </div>
-      {pentest && digest.reports.length > 0 ? (
-        <div className="body">
-          {digest.reports.map((row) => (
-            <div key={row.id}>
-              <Button size="sm" variant="outline" className="copytext ans-flag" aria-label={t("runtime.reports.copyMarkdown")} onPress={() => void navigator.clipboard.writeText(reportToMarkdown(row))}>
-                {row.title}
-              </Button>
-            </div>
-          ))}
-        </div>
-      ) : !pentest && digest.flags.length > 0 ? (
+      {digest.flags.length > 0 ? (
         <div className="body">
           {digest.flags.map((f) => (
             <div key={f}>
@@ -372,6 +361,8 @@ function AnswerBubble({ digest, t }: { digest: SwarmDigest; t: (k: string, v?: R
             </div>
           ))}
         </div>
+      ) : digest.phase === "goal_met" && digest.mode === "pentest" ? (
+        <div className="body">{t("coord.pentestAnswer")}</div>
       ) : digest.phase === "goal_met" ? (
         <div className="body">
           <Button size="sm" variant="outline" className="copytext ans-flag goal" aria-label={t("common.copyAnswer")} onPress={() => void navigator.clipboard.writeText(digest.goalWhy || "")}>
@@ -379,7 +370,7 @@ function AnswerBubble({ digest, t }: { digest: SwarmDigest; t: (k: string, v?: R
           </Button>
         </div>
       ) : (
-        <div className="body">{t(pentest ? "coord.answerNone" : "coord.answerNoneCtf", { verified: digest.verified, dead: digest.deadEnds, facts: digest.verified })}</div>
+        <div className="body">{t("coord.answerNoneCtf", { facts: digest.verified })}</div>
       )}
     </div>
   );
@@ -472,9 +463,7 @@ function StatusHero({ digest, hitlCount, progress, t }: { digest: SwarmDigest; h
   );
   const live = digest.phase === "running" || digest.phase === "collecting" || digest.phase === "racing";
   const singleFlag = digest.flags.length === 1 ? digest.flags[0] : "";
-  const hasResultLedger = digest.mode === "pentest"
-    ? digest.reports.length > 1 || digest.expectedReports > 1 || (digest.phase === "collecting" && digest.reports.length > 0)
-    : digest.platformConfirmationRequired || digest.flags.length > 1 || digest.expectedFlags > 1 || (digest.phase === "collecting" && digest.flags.length > 0);
+  const hasResultLedger = digest.platformConfirmationRequired || digest.flags.length > 1 || digest.expectedFlags > 1 || (digest.phase === "collecting" && digest.flags.length > 0);
   const resultsVisible = resultsOpen && hasResultLedger;
   const progressDetail = progress?.summary || progressItemText(
     progress?.sections.active[0]
@@ -483,11 +472,7 @@ function StatusHero({ digest, hitlCount, progress, t }: { digest: SwarmDigest; h
       ?? progress?.sections.blocked[0],
     t,
   );
-  const resultCount = digest.mode === "pentest"
-    ? (digest.expectedReports > 1
-      ? t("hero.results.reportProgress", { n: digest.reports.length, total: digest.expectedReports })
-      : t("hero.results.reportCount", { n: digest.reports.length }))
-    : digest.platformConfirmationRequired
+  const resultCount = digest.platformConfirmationRequired
       ? t("hero.detail.collectingPlatform", {
           n: digest.flags.length, accepted: digest.platformAccepted, need: digest.expectedFlags,
         })
@@ -501,14 +486,7 @@ function StatusHero({ digest, hitlCount, progress, t }: { digest: SwarmDigest; h
       ? t("hero.detail.solvedMulti", { n: digest.flags.length, total: digest.expectedFlags })
       : (digest.flags[0] ? t("hero.detail.solved", { flag: digest.flags[0] }) : t("hero.detail.solvedNoFlag"));
   } else if (digest.phase === "collecting") {
-    detail = digest.mode === "pentest"
-      ? t("hero.detail.reportPipeline", {
-          submitted: digest.reportSubmitted,
-          reproducing: digest.reportReproducing,
-          accepted: digest.reportQualified,
-          total: digest.expectedReports,
-        })
-      : digest.platformConfirmationRequired
+    detail = digest.platformConfirmationRequired
         ? t("hero.detail.collectingPlatform", {
             n: digest.flags.length,
             accepted: digest.platformAccepted,
@@ -518,11 +496,11 @@ function StatusHero({ digest, hitlCount, progress, t }: { digest: SwarmDigest; h
   } else if (digest.phase === "paused") {
     detail = hitlCount > 0 ? t("hero.detail.pausedN", { n: hitlCount }) : t("hero.detail.paused");
   } else if (digest.phase === "goal_met") {
-    detail = digest.goalWhy || t("hero.detail.goalMet");
-  } else if (digest.phase === "finished") {
     detail = digest.mode === "pentest"
-      ? t("hero.detail.finished", { verified: digest.verified, dead: digest.deadEnds })
-      : t("hero.detail.finishedCtf", { facts: digest.verified, steps: digest.openSteps });
+      ? t("hero.pentestGoalMet")
+      : digest.goalWhy || t("hero.detail.goalMet");
+  } else if (digest.phase === "finished") {
+    detail = t("hero.detail.finishedCtf", { facts: digest.verified, steps: digest.openSteps });
   } else if (digest.phase === "racing") {
     detail = digest.verifyingActive > 0 || digest.raceTotal > 0
       ? t("hero.detail.racingVerify", {
@@ -533,20 +511,16 @@ function StatusHero({ digest, hitlCount, progress, t }: { digest: SwarmDigest; h
         })
       : t("hero.detail.racing", { online: digest.onlineWorkers, total: digest.totalWorkers });
   } else if (digest.phase === "running") {
-    detail = digest.mode === "pentest"
-      && (digest.reportSubmitted > 0 || digest.reportReproducing > 0 || digest.verifyingActive > 0)
-      ? t("hero.detail.reportPipeline", {
-          submitted: digest.reportSubmitted,
-          reproducing: digest.reportReproducing,
-          accepted: digest.reportQualified,
-          total: digest.expectedReports,
-        })
+    detail = digest.mode === "pentest" && !progressDetail
+      ? digest.onlineWorkers > 0
+        ? t("hero.pentestRunning", { online: digest.onlineWorkers })
+        : t("hero.pentestWaiting")
       : progressDetail
         ? progressDetail
         : digest.latestVerified
-        ? t(digest.mode === "pentest" ? "hero.detail.runningFact" : "hero.detail.runningFactCtf", { fact: digest.latestVerified })
+        ? t("hero.detail.runningFactCtf", { fact: digest.latestVerified })
         : digest.onlineWorkers > 0
-          ? t(digest.mode === "pentest" ? "hero.detail.running" : "hero.detail.runningCtf", { online: digest.onlineWorkers, total: digest.totalWorkers })
+          ? t("hero.detail.runningCtf", { online: digest.onlineWorkers, total: digest.totalWorkers })
           : t("hero.detail.runningIdle", { total: digest.totalWorkers });
   } else {
     detail = t("hero.detail.draft");
@@ -574,7 +548,7 @@ function StatusHero({ digest, hitlCount, progress, t }: { digest: SwarmDigest; h
       >
         <span className="sh-status">
           <span className="sh-ico" aria-hidden="true"><Icon name={PHASE_ICON[digest.phase]} size={15} /></span>
-          <span className="sh-phase">{t(`coord.phase.${digest.phase}`)}</span>
+          <span className="sh-phase">{t(digest.mode === "pentest" ? `coord.pentestPhase.${digest.phase}` : `coord.phase.${digest.phase}`)}</span>
           {(digest.phase === "racing" || digest.verifyingActive > 0) && (
             <span className="sh-phase-pills" aria-label={t("hero.label.progress")}>
               {(digest.phase === "racing" || digest.raceTotal > 0) && (
@@ -625,7 +599,7 @@ function StatusHero({ digest, hitlCount, progress, t }: { digest: SwarmDigest; h
             </span>
           )}
           {elapsed && <span className="sh-elapsed" data-tooltip={t("meta.elapsed")}><Icon name="clock" size={12} /> {elapsed}</span>}
-          <Popover isOpen={flowOpen} onOpenChange={(isOpen) => { setFlowOpen(isOpen); if (isOpen) setResultsOpen(false); }}>
+          {digest.mode !== "pentest" && <Popover isOpen={flowOpen} onOpenChange={(isOpen) => { setFlowOpen(isOpen); if (isOpen) setResultsOpen(false); }}>
           <Popover.Trigger
             className="sh-flow"
             aria-label={t("flow.open")}
@@ -633,26 +607,17 @@ function StatusHero({ digest, hitlCount, progress, t }: { digest: SwarmDigest; h
             <Icon name="list" size={12} /> {t("flow.short")}
           </Popover.Trigger>
           <Popover.Content placement="bottom end" className="p-0"><Popover.Dialog aria-label={t("flow.title")}><FlowPopover digest={digest} hitlCount={hitlCount} onClose={() => setFlowOpen(false)} t={t} /></Popover.Dialog></Popover.Content>
-          </Popover>
+          </Popover>}
         </span>
       </div>
       {resultsVisible && (
-        <section id="status-flag-results" className="sh-results-panel" aria-label={digest.mode === "pentest" ? t("hero.results.reportTitle") : t("hero.results.title")}>
+        <section id="status-flag-results" className="sh-results-panel" aria-label={t("hero.results.title")}>
           <header className="sh-results-head">
-            <span><Icon name={digest.mode === "pentest" ? "list" : "flag"} size={13} /> {digest.mode === "pentest" ? t("hero.results.reportTitle") : t("hero.results.title")}</span>
+            <span><Icon name="flag" size={13} /> {t("hero.results.title")}</span>
             <span>{resultCount}</span>
           </header>
           <div className="sh-results-list">
-            {digest.mode === "pentest"
-              ? digest.reports.map((row, index) => (
-                <div className="sh-result-row" key={row.id}>
-                  <span className="sh-result-index">{String(index + 1).padStart(2, "0")}</span>
-                  <Button size="sm" variant="outline" className="copytext sh-result-value" aria-label={t("runtime.reports.copyMarkdown")} onPress={() => void navigator.clipboard.writeText(reportToMarkdown(row))}>
-                    {row.title}
-                  </Button>
-                </div>
-              ))
-              : digest.flags.map((flag, index) => (
+            {digest.flags.map((flag, index) => (
                 <div className="sh-result-row" key={`${index}-${flag}`}>
                   <span className="sh-result-index">{String(index + 1).padStart(2, "0")}</span>
                   <Button size="sm" variant="outline" className="copytext sh-result-value" aria-label={t("common.copyFlag")} onPress={() => void navigator.clipboard.writeText(flag)}>{flag}</Button>
@@ -872,7 +837,7 @@ function CoordinatorThread({
         )}
         {messages.map((m) => m.kind === "progress" && m.progressBrief
           ? <ProgressBriefBubble key={m.id} brief={m.progressBrief} ts={m.ts} t={t} />
-          : <CoordBubble key={m.id} m={m} t={t} />)}
+          : <CoordBubble key={m.id} m={m} t={t} mode={deck.mode || "ctf"} />)}
         {deck.hitlRequests.map((r, i) => (
           <HitlCard key={r.id} req={r} first={i === 0} onAnswer={onAnswer} onDismiss={onDismiss} />
         ))}
@@ -885,6 +850,7 @@ function CoordinatorThread({
 }
 
 function Composer({
+  workspaceMode,
   started,
   solved,
   running,
@@ -903,7 +869,11 @@ function Composer({
   prefill,
   onPrefillConsumed,
   onOpenBtw,
+  onOpenReport,
+  controlledText,
+  onControlledTextChange,
 }: {
+  workspaceMode: "ctf" | "pentest";
   started: boolean;
   solved: boolean;
   running: boolean;
@@ -923,9 +893,17 @@ function Composer({
   prefill: ComposerPrefill | null;
   onPrefillConsumed: () => void;
   onOpenBtw?: () => void;
+  onOpenReport?: () => void;
+  controlledText?: string;
+  onControlledTextChange?: (value: string) => void;
 }) {
   const t = useT();
-  const [text, setText] = useState("");
+  const [internalText, setInternalText] = useState("");
+  const text = controlledText ?? internalText;
+  const setText = useCallback((value: string) => {
+    setInternalText(value);
+    onControlledTextChange?.(value);
+  }, [onControlledTextChange]);
   const [markFalseOpen, setMarkFalseOpen] = useState(false);
   const [cmdTarget, setCmdTarget] = useState("global");
   const [progressPending, setProgressPending] = useState(false);
@@ -978,12 +956,12 @@ function Composer({
   }, []);
   const [dragOver, setDragOver] = useState(false);
   const [webSearch, setWebSearch] = useState(true);
-  const [mode, setMode] = useState<"ctf" | "pentest">("ctf");
+  const mode = workspaceMode;
   const [collect, setCollect] = useState(false);
   const [collectCount, setCollectCount] = useState("");  // "" = unknown count
   const [flagFormat, setFlagFormat] = useState<"brace" | "token" | "custom">("brace");
   const [flagWrapper, setFlagWrapper] = useState("");
-  const [containerMode, setContainerMode] = useState(false);
+  const [containerMode, setContainerMode] = useState(workspaceMode === "pentest");
   const [allowOperatorInput, setAllowOperatorInput] = useState(false);
   // P2-v3: when the coordinator runs inside a container, local worker mode is
   // rejected server-side — force container mode and lock the toggle.
@@ -1000,9 +978,6 @@ function Composer({
     try {
       const saved = window.localStorage.getItem("muteki.webSearch");
       if (saved === "0") setWebSearch(false);
-      if (window.localStorage.getItem("muteki.mode") === "pentest") {
-        window.localStorage.setItem("muteki.mode", "ctf");
-      }
       if (window.localStorage.getItem("muteki.collect") === "1") setCollect(true);
       const savedFlagFormat = window.localStorage.getItem("muteki.flagFormat");
       if (savedFlagFormat === "token" || savedFlagFormat === "custom") setFlagFormat(savedFlagFormat);
@@ -1060,29 +1035,24 @@ function Composer({
     } catch { /* ignore */ }
     return next;
   });
-  const pickMode = (m: "ctf" | "pentest") => {
-    if (m !== "ctf") return;
-    setMode(m);
-    try { window.localStorage.setItem("muteki.mode", m); } catch { /* ignore */ }
-  };
-
   useEffect(() => {
     if (!prefill || started) return;
     setText(prefill.text);
-    pickMode("ctf");
     window.requestAnimationFrame(() => {
       dispatchRef.current?.focus();
       dispatchRef.current?.setSelectionRange(prefill.text.length, prefill.text.length);
     });
     onPrefillConsumed();
-  }, [onPrefillConsumed, prefill, started]);
+  }, [onPrefillConsumed, prefill, setText, started]);
 
   // A dispatch that required backend confirmation deliberately kept the prose
   // in the composer. Once the confirmed Run starts, clear it before the same
   // field switches into operator-command mode.
+  const wasStarted = useRef(started);
   useEffect(() => {
-    if (started) setText("");
-  }, [started]);
+    if (started && !wasStarted.current) setText("");
+    wasStarted.current = started;
+  }, [started, setText]);
 
   const dispatch = async () => {
     const v = text.trim();
@@ -1102,7 +1072,9 @@ function Composer({
       ...(advancedTouched.costBudgetUsd ? { costBudgetUsd: optionalFloat(costBudgetUsd) } : {}),
     };
     const dispatched = await onDispatch(v, {
-      webSearch, mode: "ctf", collect, containerMode, allowOperatorInput,
+      webSearch: mode === "pentest" ? true : webSearch,
+      mode, collect, containerMode: mode === "pentest" ? true : containerMode,
+      allowOperatorInput: mode === "pentest" ? true : allowOperatorInput,
       flagFormat,
       flagWrapper: flagFormat === "custom" ? flagWrapper.trim() : undefined,
       collectCount: collect ? (parseInt(collectCount, 10) || 0) : undefined,
@@ -1188,23 +1160,6 @@ function Composer({
               <span className="drop-label">{t("composer.dropHint")}</span>
             </div>
           )}
-          <div className="mode-row">
-            <div className="mode-choice">
-              <Tabs selectedKey={mode} onSelectionChange={(key) => { if (key === "ctf") pickMode("ctf"); }}>
-                <Tabs.List className="mode-seg" aria-label={t("composer.mode")}>
-                  <Tabs.Tab id="ctf" aria-label={t("composer.modeCtfTitle")}>{t("composer.modeCtf")}<Tabs.Indicator /></Tabs.Tab>
-                  <Tabs.Tab id="pentest" isDisabled aria-label={t("composer.modePentestUnavailable")}>{t("composer.modePentest")}<Tabs.Indicator /></Tabs.Tab>
-                </Tabs.List>
-              </Tabs>
-              <span
-                className="mode-pentest-hint"
-                data-tooltip={t("composer.modePentestUnavailable")}
-                aria-label={t("composer.modePentestUnavailable")}
-                role="note"
-                tabIndex={0}
-              />
-            </div>
-          </div>
           <TextArea
             ref={dispatchRef}
             data-composer-input
@@ -1279,7 +1234,7 @@ function Composer({
                 ariaLabel={t("composer.collectCountPlaceholder")}
               />
             )}
-            <Button
+            {mode === "ctf" && <Button
               size="sm"
               variant="ghost"
               className={`websearch-toggle ${webSearch ? "on" : "off"}`}
@@ -1289,8 +1244,8 @@ function Composer({
             >
               <Icon name={webSearch ? "globe" : "lock"} size={14} />
               {webSearch ? t("composer.webOn") : t("composer.webOff")}
-            </Button>
-            <Button
+            </Button>}
+            {mode === "ctf" && <Button
               size="sm"
               variant="ghost"
               className={`websearch-toggle ${containerMode ? "on" : "off"}${containerLocked ? " locked" : ""}`}
@@ -1303,7 +1258,7 @@ function Composer({
             >
               <Icon name={containerMode ? "lock" : "globe"} size={14} />
               {containerMode ? t("composer.containerOn") : t("composer.containerOff")}
-            </Button>
+            </Button>}
             <Button
               size="sm"
               variant="ghost"
@@ -1421,7 +1376,7 @@ function Composer({
           )}
         </div>
         <div className="hintline">
-          {t("composer.hintline")}
+          {t(mode === "pentest" ? "composer.pentestHintline" : "composer.hintline")}
           <span className="kbd-hint" aria-label={t("composer.focusHint")}>
             <kbd>{t("composer.focusKey")}</kbd> {t("composer.focusHint")}
           </span>
@@ -1455,17 +1410,18 @@ function Composer({
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ask(); }
               }}
-              placeholder="输入要向解题 Worker 追问的问题"
+              placeholder={mode === "pentest" ? "向测试 Worker 追问，或补充目标背景" : "输入要向解题 Worker 追问的问题"}
             />
             <Button size="sm" variant="primary" isIconOnly className="send" isDisabled={!text.trim() || followupPending} onPress={ask} aria-label="Ask"><Icon name="send" size={15} /></Button>
           </div>
           <div className="command-actionbar">
             <div className="quick">
-              <Button size="sm" variant="primary" className="primary" isDisabled={followupPending} aria-label={t("quick.resolveTitle")} onPress={() => onResolve()}><Icon name="refresh" size={13} />{t("quick.resolve")}</Button>
+              <Button size="sm" variant="primary" className="primary" isDisabled={followupPending} aria-label={mode === "pentest" ? "继续测试" : t("quick.resolveTitle")} onPress={() => onResolve()}><Icon name="refresh" size={13} />{mode === "pentest" ? "继续测试" : t("quick.resolve")}</Button>
               <Button size="sm" variant="ghost" isDisabled={!text.trim() || followupPending} aria-label={t("quick.ask.tip")} onPress={ask}><Icon name="help" size={13} />{t("quick.ask")}</Button>
               {btwButton}
-              <Button size="sm" variant="ghost" isDisabled={followupPending} aria-label={t("quick.writeup.tip")} onPress={() => void onCommand("global", "writeup", "")}><Icon name="pencil" size={13} />{t("quick.writeup")}</Button>
-              {solved ? (
+              {mode === "ctf" && <Button size="sm" variant="ghost" isDisabled={followupPending} aria-label={t("quick.writeup.tip")} onPress={() => void onCommand("global", "writeup", "")}><Icon name="pencil" size={13} />{t("quick.writeup")}</Button>}
+              {mode === "pentest" && onOpenReport && <Button size="sm" variant="ghost" onPress={onOpenReport}><Icon name="rows" size={13} />查看报告</Button>}
+              {mode === "ctf" && solved ? (
                 <>
                   <span className="quick-sep" />
                   <Button size="sm" variant="danger-soft" className="danger" isDisabled={followupPending} aria-label={t("quick.markFalseTitle")} onPress={() => {
@@ -1477,7 +1433,7 @@ function Composer({
             </div>
             <div className="command-hint">{followupPending ? "正在处理后续操作…" : t("composer.finishedHint")}</div>
           </div>
-          {solved && markFalseOpen && flags.length > 1 ? (
+          {mode === "ctf" && solved && markFalseOpen && flags.length > 1 ? (
             <div className="markfalse-picker" role="group" aria-label={t("quick.markFalseTitle")}>{flags.map((flag) => (
               <Button key={flag} size="sm" variant="danger-soft" aria-label={flag} onPress={() => { void onCommand("global", "mark_false", flag); setMarkFalseOpen(false); }}>{flag}</Button>
             ))}</div>
@@ -1495,7 +1451,7 @@ function Composer({
             <Label>{t("composer.to")}</Label>
             <Select.Trigger><Select.Value /><Select.Indicator /></Select.Trigger>
             <Select.Popover><ListBox>
-              <ListBoxItem id="global">{t("composer.allSolvers")}</ListBoxItem>
+              <ListBoxItem id="global">{mode === "pentest" ? "全部 Worker" : t("composer.allSolvers")}</ListBoxItem>
               {solvers.map((s) => <ListBoxItem key={s} id={`solver:${s}`}>{s}</ListBoxItem>)}
             </ListBox></Select.Popover>
           </Select>
@@ -1528,7 +1484,7 @@ function Composer({
             {running ? (
               <>
                 {runningActions.map((a) => (
-                  <Button key={a.key} size="sm" variant="ghost" aria-label={t(a.tipKey)} onPress={() => command(a.key)}><Icon name={a.icon} size={13} />{t(a.labelKey)}</Button>
+                  <Button key={a.key} size="sm" variant="ghost" aria-label={mode === "pentest" && a.key === "directive" ? "将原文作为下一步测试方向，不扩大授权范围" : t(a.tipKey)} onPress={() => command(a.key)}><Icon name={a.icon} size={13} />{t(a.labelKey)}</Button>
                 ))}
                 <span className="quick-sep" />
                 <Button size="sm" variant="danger-soft" className="danger" onPress={() => command("stop")} aria-label={t("quick.stopTitle")}><Icon name="xCircle" size={13} />{t("quick.stop")}</Button>
@@ -1539,7 +1495,7 @@ function Composer({
           </div>
           <div className="command-hint">{running ? t("composer.steerHint") : t("composer.finishedHint")}</div>
         </div>
-        {solved && markFalseOpen && flags.length > 1 && (
+        {mode === "ctf" && solved && markFalseOpen && flags.length > 1 && (
           <div className="markfalse-picker" role="group" aria-label={t("quick.markFalseTitle")}>
             {flags.map((f) => (
               <Button
@@ -1572,37 +1528,47 @@ type ComposerPrefill = {
 const WELCOME_EXAMPLES: Array<{ key: string; icon: IconName; mode: "ctf" | "pentest" }> = [
   { key: "ex1", icon: "globe", mode: "ctf" },
   { key: "ex2", icon: "lock", mode: "ctf" },
+  { key: "ex3", icon: "cpu", mode: "ctf" },
+];
+const PENTEST_WELCOME_EXAMPLES: Array<{ key: string; icon: IconName; mode: "ctf" | "pentest" }> = [
+  { key: "ex1", icon: "target", mode: "pentest" },
+  { key: "ex2", icon: "shield", mode: "pentest" },
+  { key: "ex3", icon: "refresh", mode: "pentest" },
 ];
 
 function Welcome({
   t,
   onChoose,
+  workspaceMode = "ctf",
 }: {
   t: (k: string) => string;
   onChoose: (prefill: ComposerPrefill) => void;
+  workspaceMode?: "ctf" | "pentest";
 }) {
+  const prefix = workspaceMode === "pentest" ? "welcome.pentest" : "welcome";
+  const examples = workspaceMode === "pentest" ? PENTEST_WELCOME_EXAMPLES : WELCOME_EXAMPLES;
   return (
     <div className="welcome">
       <div className="welcome-hero">
-        <h1 className="wm">{t("welcome.title")}</h1>
-        <div className="sub">{t("welcome.sub")}</div>
+        <h1 className="wm">{t(`${prefix}.title`)}</h1>
+        <div className="sub">{t(`${prefix}.sub`)}</div>
       </div>
       <div className="suggest-label">{t("welcome.examplesLabel")}</div>
       <div className="suggest">
-        {WELCOME_EXAMPLES.map((ex) => (
+        {examples.map((ex) => (
           <Button
             variant="ghost"
             className="suggest-card"
             key={ex.key}
             onPress={() => onChoose({
               mode: ex.mode,
-              text: t(`welcome.${ex.key}.prompt`),
+              text: t(`${prefix}.${ex.key}.prompt`),
             })}
           >
             <span className="s-ico" aria-hidden="true"><Icon name={ex.icon} size={16} /></span>
-            <span className="s-cat">{t(`welcome.${ex.key}.cat`)}</span>
-            <span className="s-nm">{t(`welcome.${ex.key}.nm`)}</span>
-            <span className="s-tg">{t(`welcome.${ex.key}.tg`)}</span>
+            <span className="s-cat">{t(`${prefix}.${ex.key}.cat`)}</span>
+            <span className="s-nm">{t(`${prefix}.${ex.key}.nm`)}</span>
+            <span className="s-tg">{t(`${prefix}.${ex.key}.tg`)}</span>
           </Button>
         ))}
       </div>
@@ -1611,6 +1577,7 @@ function Welcome({
 }
 
 export function Conversation({
+  workspaceMode = "ctf",
   deck,
   running,
   loading,
@@ -1635,11 +1602,14 @@ export function Conversation({
   onOpenAgent,
   onOpenKnowledge,
   onOpenWorkspace,
-  onOpenReport,
   onHitlAnswered,
   connected,
   onOpenBtw,
+  reportOpen = false,
+  reportPanel,
+  onOpenReport,
 }: {
+  workspaceMode?: "ctf" | "pentest";
   deck: DeckState;
   running: boolean;
   loading: boolean;
@@ -1668,11 +1638,13 @@ export function Conversation({
   onOpenAgent?: (solverId: string) => void;
   onOpenKnowledge?: (id: string) => void;
   onOpenWorkspace: () => void;
-  onOpenReport: (reportId: string) => void;
   // fired after an operator answers a blocking HITL decision — owner toasts.
   onHitlAnswered?: () => void;
   connected: boolean;
   onOpenBtw?: () => void;
+  reportOpen?: boolean;
+  reportPanel?: ReactNode;
+  onOpenReport?: () => void;
 }) {
   const t = useT();
   const { lang, setLang } = useLang();
@@ -1681,6 +1653,7 @@ export function Conversation({
   const [inspectorWidth, setInspectorWidth] = useState(INSPECTOR_WIDTH_DEFAULT);
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [composerPrefill, setComposerPrefill] = useState<ComposerPrefill | null>(null);
+  const [pentestDraftText, setPentestDraftText] = useState("");
   const consumeComposerPrefill = useCallback(() => setComposerPrefill(null), []);
   const [inspectorResizing, setInspectorResizing] = useState(false);
   const inspectorResizeCleanup = useRef<(() => void) | null>(null);
@@ -1814,14 +1787,42 @@ export function Conversation({
   // few transitions an operator actually needs read aloud.
   const lastSystem = [...deck.chat].reverse().find((m) => m.role === "system");
   const liveStatus = lastSystem
-    ? (lastSystem.i18nKey ? t(lastSystem.i18nKey, lastSystem.i18nVars) : lastSystem.content)
+    ? (workspaceMode === "pentest" && lastSystem.i18nKey === "sys.goalMet"
+        && lastSystem.i18nVars?.why === "model_goal_with_evidence"
+        ? t("sys.pentestGoalMet")
+        : lastSystem.i18nKey ? t(lastSystem.i18nKey, lastSystem.i18nVars) : lastSystem.content)
     : "";
-  const showInspector = deck.started && !artifactOpen && inspectorOpen;
+  const showInspector = deck.started && !artifactOpen && !reportOpen && inspectorOpen;
+  const pentestRuntimeOpen = workspaceMode === "pentest" && artifactOpen && !reportOpen;
   const inspectorToggleLabel = t(inspectorOpen ? "insp.run.hide" : "insp.run.show");
+  const composerElement = <Composer
+    workspaceMode={workspaceMode}
+    started={deck.started}
+    solved={deck.solved}
+    running={running}
+    finished={deck.finished}
+    followupPending={deck.followupPending}
+    paused={digest.phase === "paused"}
+    solvers={solvers}
+    flags={deck.flags}
+    onDispatch={onDispatch}
+    onCommand={onCommand}
+    onRequestProgress={onRequestProgress}
+    onResolve={onResolve}
+    attachments={attachments}
+    onAddFiles={onAddFiles}
+    onRemoveFile={onRemoveFile}
+    prefill={composerPrefill}
+    onPrefillConsumed={consumeComposerPrefill}
+    onOpenBtw={onOpenBtw}
+    onOpenReport={onOpenReport}
+    controlledText={workspaceMode === "pentest" ? pentestDraftText : undefined}
+    onControlledTextChange={workspaceMode === "pentest" ? setPentestDraftText : undefined}
+  />;
 
   return (
     <div
-      className={`convo ${showInspector ? "has-inspector" : ""} ${artifactOpen ? "runtime-peer-open" : ""} ${inspectorResizing ? "inspector-resizing" : ""}`}
+      className={`convo ${showInspector ? "has-inspector" : ""} ${artifactOpen && !reportOpen ? "runtime-peer-open" : ""} ${inspectorResizing ? "inspector-resizing" : ""}`}
       style={{ "--inspector-width": `${inspectorWidth}px` } as CSSProperties}
     >
       <div className="sr-only" role="status" aria-live="polite" aria-atomic="true" aria-label={t("a11y.status")}>{liveStatus}</div>
@@ -1832,21 +1833,21 @@ export function Conversation({
           isIconOnly
           className="icon-btn"
           onPress={onToggleRail}
-          aria-label={t("convo.toggleRuns")}
+          aria-label={workspaceMode === "pentest" ? "切换测试列表" : t("convo.toggleRuns")}
         >
           <Icon name="menu" size={15} />
         </Button>
         <div className="convo-top-context">
           <span
             className="title"
-            data-tooltip={deck.started ? deck.challengeName || t("convo.run") : t("convo.newSolve")}
-            title={deck.started ? deck.challengeName || t("convo.run") : t("convo.newSolve")}
+            data-tooltip={deck.started ? deck.challengeName || t("convo.run") : workspaceMode === "pentest" ? "新测试" : t("convo.newSolve")}
+            title={deck.started ? deck.challengeName || t("convo.run") : workspaceMode === "pentest" ? "新测试" : t("convo.newSolve")}
           >
-            {deck.started ? deck.challengeName || t("convo.run") : t("convo.newSolve")}
+            {deck.started ? deck.challengeName || t("convo.run") : workspaceMode === "pentest" ? "新测试" : t("convo.newSolve")}
           </span>
-          {(deck.started && deck.category) || deck.runId ? (
+          {(deck.started && deck.category && workspaceMode === "ctf") || deck.runId ? (
             <div className="convo-top-meta">
-              {deck.started && deck.category && (
+              {deck.started && deck.category && workspaceMode === "ctf" && (
                 <Chip
                   size="sm"
                   variant="soft"
@@ -1885,10 +1886,11 @@ export function Conversation({
         {deck.started && (
           <div className="convo-top-view">
             <Tabs
-              selectedKey={artifactOpen ? "runtime" : "conversation"}
+              selectedKey={reportOpen ? "report" : artifactOpen ? "runtime" : "conversation"}
               onSelectionChange={(key) => {
                 if (key === "runtime") onOpenArtifact(artifactView);
                 else if (key === "collaboration") onOpenArtifact("collaboration");
+                else if (key === "report") onOpenReport?.();
                 else onShowConversation();
               }}
             >
@@ -1908,6 +1910,11 @@ export function Conversation({
                   <span>{t("convo.viewCollaboration")}</span>
                   <Tabs.Indicator />
                 </Tabs.Tab>
+                {workspaceMode === "pentest" && <Tabs.Tab id="report">
+                  <Icon name="rows" size={13} />
+                  <span>报告</span>
+                  <Tabs.Indicator />
+                </Tabs.Tab>}
               </Tabs.List>
             </Tabs>
           </div>
@@ -1949,7 +1956,7 @@ export function Conversation({
             <span className={`dot ${connState}`} role="img" aria-label={connectionLabel} data-tooltip={connectionLabel} />
           </div>
           <div className="convo-top-actions">
-            {deck.started && !artifactOpen && (
+            {deck.started && !artifactOpen && !reportOpen && (
               <Button
                 size="sm"
                 variant="ghost"
@@ -1989,6 +1996,7 @@ export function Conversation({
 
       <div className="convo-body">
         <div className="convo-mainpane">
+          {reportOpen && reportPanel ? reportPanel : <>
           <div
             className={`convo-scroll ${deck.started ? "has-workspace" : ""}`}
             ref={scrollRef}
@@ -1998,7 +2006,7 @@ export function Conversation({
             }}
           >
             {!deck.started && !loading ? (
-              <Welcome t={t} onChoose={setComposerPrefill} />
+              <Welcome t={t} onChoose={setComposerPrefill} workspaceMode={workspaceMode} />
             ) : (
               <div className={`workspace ${artifactOpen ? "solo" : ""}`}>
                 <div className="coord-col t-page-slide">
@@ -2010,7 +2018,7 @@ export function Conversation({
                   )}
                   <div className="coord-sticky-head">
                     <StatusHero digest={digest} hitlCount={blockingHitlCount} progress={latestProgress} t={t} />
-                    {deck.started && (
+                    {deck.started && workspaceMode !== "pentest" && (
                       <RunSignalsStrip
                         deck={deck}
                         onOpenArtifact={onOpenArtifact}
@@ -2021,10 +2029,10 @@ export function Conversation({
                   {loading ? (
                     <div className="coord-thread">
                       <div className="coord-wrap">
-                        <div className="coord-loading">
-                          <Spinner size="sm" color="accent" aria-label={t("loading.run")} />
-                          <span className="cl-title">{t("loading.run")}</span>
-                          <span className="cl-hint">{t("loading.runHint")}</span>
+                      <div className="coord-loading">
+                          <Spinner size="sm" color="accent" aria-label={workspaceMode === "pentest" ? "正在加载测试" : t("loading.run")} />
+                          <span className="cl-title">{workspaceMode === "pentest" ? "正在加载测试" : t("loading.run")}</span>
+                          <span className="cl-hint">{workspaceMode === "pentest" ? "正在恢复本次测试的实时记录。" : t("loading.runHint")}</span>
                         </div>
                         <div className="coord-skel" aria-hidden="true">
                           {[68, 82, 54].map((w, i) => (
@@ -2059,26 +2067,8 @@ export function Conversation({
             )}
           </div>
 
-          <Composer
-            started={deck.started}
-            solved={deck.solved}
-            running={running}
-            finished={deck.finished}
-            followupPending={deck.followupPending}
-            paused={digest.phase === "paused"}
-            solvers={solvers}
-            flags={deck.flags}
-            onDispatch={onDispatch}
-            onCommand={onCommand}
-            onRequestProgress={onRequestProgress}
-            onResolve={onResolve}
-            attachments={attachments}
-            onAddFiles={onAddFiles}
-            onRemoveFile={onRemoveFile}
-            prefill={composerPrefill}
-            onPrefillConsumed={consumeComposerPrefill}
-            onOpenBtw={onOpenBtw}
-          />
+          {!pentestRuntimeOpen && composerElement}
+          </>}
         </div>
 
         {showInspector && (
@@ -2124,6 +2114,7 @@ export function Conversation({
             ) : (
               <RunInspector
                 deck={deck}
+                onOpenReport={onOpenReport}
                 running={running}
                 artifactOpen={artifactOpen}
                 artifactView={artifactView}
@@ -2134,7 +2125,6 @@ export function Conversation({
                 onOpenAgent={onOpenAgent}
                 onWriteup={onWriteup}
                 onMarkFalseFlag={onMarkFalseFlag}
-                onOpenReport={onOpenReport}
                 onClose={() => setInspectorOpen(false)}
               />
             )}
@@ -2143,6 +2133,7 @@ export function Conversation({
 
         <div className="convo-runtime-peer">
           {runtimePanel}
+          {pentestRuntimeOpen && composerElement}
         </div>
       </div>
     </div>

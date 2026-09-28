@@ -324,6 +324,7 @@ class CredentialModelCatalogStore:
         runtime_instance: str = "default",
         model: str,
         ok: bool,
+        source: str = "manual_test",
     ) -> None:
         selected = str(model or "").strip()
         if not selected:
@@ -341,7 +342,7 @@ class CredentialModelCatalogStore:
                 "configured_models": [],
                 "verified_models": [],
                 "default_model": "",
-                "source": "manual_test",
+                "source": source,
                 "refresh_status": "missing",
                 "refreshed_at": None,
                 "expires_at": None,
@@ -349,6 +350,8 @@ class CredentialModelCatalogStore:
                 "last_error": "",
             })
             verified = [str(item) for item in row.get("verified_models") or []]
+            if ok and selected in verified:
+                return
             if ok and selected not in verified:
                 verified.append(selected)
             if not ok and selected in verified:
@@ -356,6 +359,29 @@ class CredentialModelCatalogStore:
             row["verified_models"] = verified
             catalogs[key] = row
             self._write_unlocked(catalogs)
+
+    def record_conversation_success(self, selection: dict[str, str]) -> None:
+        """A completed chat proves the selected credential/model can be used."""
+        from muteki.external_agents.factory import engine_for_adapter
+        from muteki.solver.credential_accounts import canonical_credential_id
+
+        adapter_id = str(selection.get("adapter_id") or "").strip()
+        engine = engine_for_adapter(adapter_id)
+        credential_id = str(selection.get("credential_id") or "").strip()
+        model = str(selection.get("model") or "").strip()
+        if not engine or not credential_id or not model or model == "default":
+            return
+        self.mark_verified(
+            credential_id=canonical_credential_id(credential_id),
+            engine=engine,
+            # Conversation adapters run on the Web host, independent of the
+            # separate Worker local/container setting.
+            environment="local",
+            runtime_instance=f"{adapter_id}:{selection.get('instance_id') or 'default'}",
+            model=model,
+            ok=True,
+            source="conversation",
+        )
 
     def sync_configuration(
         self,
@@ -1507,6 +1533,7 @@ def probe_worker_model(
             "MUTEKI_WORKER_MODEL": model,
             "MUTEKI_WORKER_REASONING_EFFORT": str(reasoning_effort or "default"),
         }
+        env = _private_model_probe_env(engine, sessions_root, resolved_account_id, env)
         verify_claude_model = engine == "claude" and profile_uses_endpoint(profile)
         if verify_claude_model:
             env["CLAUDE_CONFIG_DIR"] = stack.enter_context(
@@ -2660,6 +2687,18 @@ def _discovery_argv(engine: str, binary: str, *, bundled: bool = False) -> list[
     )
 
 
+def _private_model_probe_env(
+    engine: str, sessions_root: str | Path, account_id: str, env: dict[str, str],
+) -> dict[str, str]:
+    # Model catalogs and minimal model tests can refresh auth or write CLI
+    # preferences too. Keep that discovery traffic out of the operator home.
+    from muteki.conversation.chat_plugins import ChatPluginService, ENGINES
+    if engine not in ENGINES:
+        return env
+    service = ChatPluginService(Path(sessions_root) / "_model_probe_environments")
+    return service.prepare_environment(engine, "model-probe:" + account_id, env)
+
+
 def _run_local_discovery(
     profile: dict[str, Any], sessions_root: str | Path, *, bundled: bool = False,
 ) -> subprocess.CompletedProcess:
@@ -2675,6 +2714,7 @@ def _run_local_discovery(
     binary = str(profile.get("binary_path") or "").strip() or driver_for(profile).bin
     argv = _discovery_argv(engine, binary, bundled=bundled)
     env = {**os.environ, **driver_for(profile).env_extra(), **resolved.env}
+    env = _private_model_probe_env(engine, sessions_root, resolved_account_id, env)
     try:
         if engine == "grok":
             try:

@@ -25,6 +25,7 @@
 @import "./styles/settings-notifications.css";
 @import "./styles/settings-agents.css";
 @import "./styles/task-worker-settings.css";
+@import "./styles/pentest.css";
 @import "./styles/ux.css";
 @import "./styles/brand.css";
 @import "./styles/chat/tokens.css";
@@ -37,3 +38,4 @@
 @import "./styles/chat/surfaces.css";
 @import "./styles/chat/dialogs.css";
 @import "./styles/chat/interaction.css";
+@import "./styles/workspace-rail.css";

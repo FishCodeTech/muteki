@@ -515,6 +515,7 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
                 peer, "get_available_commands", timeout=self._startup_timeout)
             handle["available_commands"] = list(catalog.get("commands") or [])
             handle["capability_revision"] = 1
+            state = await self._cmd(peer, "get_state", timeout=self._startup_timeout)
         except Exception:
             self._rpc.pop(request.agent_session_id, None)
             await peer.close()
@@ -522,9 +523,10 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
 
         session_id = str(state.get("sessionId") or "")
         handle["external_session_id"] = session_id or None
+        handle["resume_handle"] = str(state.get("sessionFile") or request.resume_handle or "") or None
         return {
             "external_session_id": session_id or None,
-            "resume_handle": request.resume_handle or session_id or None,
+            "resume_handle": handle["resume_handle"],
         }
 
     # -- 交互请求自动应答（rpc-ui） ---------------------------------------------------
@@ -595,7 +597,13 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
         sink = handle.get("event_sink")
         if sink is None:
             return
-        if etype == "message_update":
+        if etype == "command_output":
+            text = str(msg.get("text") or "")
+            if text:
+                handle["assistant_text"] = str(handle.get("assistant_text") or "") + text + "\n"
+                handle["saw_assistant_text"] = True
+                sink.put_nowait((AgentEventType.MESSAGE_DELTA, "omp.command_output", {"text": text + "\n"}))
+        elif etype == "message_update":
             usage = msg.get("usage")
             if isinstance(usage, dict) and usage:
                 sink.put_nowait((AgentEventType.USAGE_UPDATED,
@@ -724,23 +732,27 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
             try:
                 # prompt 响应只是 ack（data.agentInvoked）；完成由
                 # agent_end/agent_settled（isTerminal!==false）判定。
-                await self._cmd(peer, "prompt", {"message": input.text},
+                response = await self._cmd(peer, "prompt", {"message": input.text},
                                 timeout=self.conversation_turn_timeout(
                                     handle.get("conversation_thread_id"),
                                     self._prompt_timeout))
+                if response.get("agentInvoked") is False:
+                    queue.put_nowait(("__turn_done__", "omp.command.completed", {"local": True}))
                 return None
             except Exception as exc:  # noqa: BLE001
                 return exc
 
         task = asyncio.ensure_future(run_prompt())
         ack_error: Optional[Exception] = None
+        ack_handled = False
         done_info: dict[str, Any] = {}
         get_task = asyncio.ensure_future(queue.get())
         try:
             while True:
                 done, _pending = await asyncio.wait(
-                    {task, get_task}, return_when=asyncio.FIRST_COMPLETED)
+                    {get_task} if ack_handled else {task, get_task}, return_when=asyncio.FIRST_COMPLETED)
                 if task in done:
+                    ack_handled = True
                     exc = task.result()
                     if isinstance(exc, Exception):
                         ack_error = exc
@@ -800,6 +812,9 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
                 **common))
             return
         assistant_text = str(handle.pop("assistant_text", ""))
+        if done_info.get("local") and not assistant_text.strip():
+            assistant_text = "原生命令已执行完成"
+            saw_assistant_text = True
         if not saw_assistant_text or not assistant_text.strip():
             yield self.emit(build_event(
                 AgentEventType.TURN_FAILED, seq,
@@ -893,6 +908,10 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
         except Exception as exc:  # noqa: BLE001
             return self._receipt(session, False, str(exc))
 
+    async def runtime_operation(self, session: AgentSessionRef, name: str, arguments: str = "") -> dict[str, Any]:
+        from .rpc_commands import rpc_operation
+        return await rpc_operation(self, session, name, arguments)
+
     async def runtime_capability_snapshot(
         self, session: Optional[AgentSessionRef] = None
     ) -> RuntimeCapabilitySnapshot:
@@ -925,11 +944,17 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
             handle.get("capability_revision") or 0
         ) + 1
         items = list(base.items)
+        from .rpc_commands import rpc_operation_items
+        native_names = {str(raw.get("name") or "").lstrip("/") for raw in commands if isinstance(raw, dict)}
+        operations = [item for item in rpc_operation_items(self.id, "omp")
+                      if item.name == "compact" or item.name not in native_names]
+        items.extend(operations)
+        operation_names = {item.name for item in operations}
         for raw in commands:
             if not isinstance(raw, dict):
                 continue
             name = str(raw.get("name") or "").strip().lstrip("/")
-            if not name:
+            if not name or name in operation_names:
                 continue
             source = str(raw.get("source") or "")
             items.append(dynamic_command_item(
@@ -937,6 +962,7 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
                 engine="omp",
                 name=name,
                 description=str(raw.get("description") or ""),
+                argument_hint=str((raw.get("input") or {}).get("hint") or raw.get("argumentHint") or ""),
                 channel="provider_native",
                 kind="skill" if source.casefold() == "skill"
                 or name.startswith("skill:") else "command",
@@ -946,6 +972,12 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
                     "protocol": "omp.rpc.prompt",
                 },
             ))
+            for alias in raw.get("aliases") or []:
+                if alias not in operation_names and alias != name:
+                    items.append(items[-1].model_copy(update={
+                        "id": f"runtime:{self.id}:command:{alias}", "name": str(alias),
+                        "invocation": {**items[-1].invocation, "wire_text": f"/{alias}"},
+                    }))
         base.items = items
         base.revision = int(handle["capability_revision"])
         base.external_session_id = handle.get("external_session_id")

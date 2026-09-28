@@ -11,6 +11,7 @@ export type ComposerTrigger = "/" | "@" | "$";
 export type ComposerCapabilityKind = "command" | "skill" | "mcp" | "plugin" | "file" | "thread" | "message_span" | "tool_excerpt";
 
 export interface ComposerCapabilityContext {
+  revision?: number;
   threadId?: string;
   adapterId: string;
   workspaceId?: string;

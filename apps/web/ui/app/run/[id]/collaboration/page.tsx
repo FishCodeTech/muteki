@@ -20,7 +20,7 @@ import { toWorkerIdentity, workerDisplayName } from "@/lib/workers";
  * the same one the runtime panel used to embed; only the shell around it is new.
  * Cross-page jumps (worker lanes / timeline / evidence / PoC / report) go back
  * to the conversation route with `?view=…&<focus>=…`, which the deck reads on
- * mount (see app/solve/page.tsx).
+ * mount (see components/RunWorkbench.tsx).
  */
 
 const AgentCollaborationCanvas = dynamic(
@@ -132,7 +132,6 @@ function CollaborationPage() {
             onOpenWorker={(id) => go(runtimeHref(runId, "workers", ["worker", id]))}
             onOpenFact={(seq) => go(runtimeHref(runId, "evidence", ["fact", seq]))}
             onOpenPoc={(id) => go(runtimeHref(runId, "pocs", ["poc", id]))}
-            onOpenReport={(id) => go(runtimeHref(runId, "reports", ["report", id]))}
             focusAgent={initialFocus.current.agent}
             focusKnowledge={initialFocus.current.knowledge}
           />

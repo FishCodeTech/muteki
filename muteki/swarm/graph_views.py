@@ -24,8 +24,6 @@ from muteki.swarm.graph_defs import (  # noqa: F401
     EV_FACT_ADDED, EV_HYP_PROPOSED, EV_HYP_REFUTED, EV_DEAD_END,
     EV_INTENT_PROPOSED, EV_INTENT_CLAIMED, EV_INTENT_CONCLUDED,
     EV_FLAG_FOUND, EV_FLAG_INVALIDATED,     EV_FINDING_FOUND, EV_FINDING_INVALIDATED,
-    EV_REPORT_SUBMITTED, EV_REPORT_REJECTED, EV_REPORT_REPRO_DECISION,
-    EV_REPORT_VALUE_DECISION, EV_REPORT_ACCEPTED,
     EV_POC_SAVED, EV_POC_CLAIMED, EV_POC_CONCLUDED,
     EV_REVIEW_FINDING, EV_FACT_CHALLENGED, EV_FACT_REVALIDATED,
     EV_ROUTE_SUPPRESSED, EV_ROUTE_REOPENED, EV_BRANCH_SPLIT, EV_BRANCH_RESOLVED,
@@ -352,8 +350,6 @@ class _QueriesViewsMixin:
                 g.add_finding(p)
             elif e["kind"] == EV_FINDING_INVALIDATED:
                 g.reject_finding(p.get("finding_key") or p)
-            elif e["kind"] == EV_REPORT_ACCEPTED:
-                g.add_vuln_report(p)
         return g
 
     def to_summary(self, max_evidence: int = 16,

@@ -1,14 +1,15 @@
 """内置 DomainModule 描述（任务书 6.8、9.4、11.1，CORE-03）。
 
-三个产品内置模块的描述集中在此注册，不散落 ``if mode == ...`` 接线：
+内置产品模块的描述集中在此注册，不散落 ``if mode == ...`` 接线：
 
 - ``builtin.conversation``：通用对话工作区，executor ``external-agent.single``。
   CONV-01（``muteki.conversation.store``）与 RUNTIME-01
   （``muteki.external_agents.base``）已落地，模块处于 ready。
-- ``builtin.single-security-task``：当前 CTF/Pentest 单题，executor
+- ``builtin.single-security-task``：CTF 工作台，executor
   ``swarm.coordinator``，workspace kind ``single-security-task``，API routes
   引用现有 ``/api/runs`` 外形；依赖组件真实存在，处于 ready。命令/查询
   Handler 接线与创建合同见 ``muteki/single_task/``（SINGLE-01）。
+- ``builtin.pentest``：独立渗透测试工作台，复用 Swarm 内核与运行状态。
 - ``builtin.competition``：比赛工作区。COMP-01～COMP-09 已落地 store /
   scheduler / platforms，模块处于 ready。
 
@@ -96,9 +97,9 @@ def conversation_components() -> list[ModuleComponent]:
 
 
 def single_security_task_descriptor() -> DomainModuleDescriptor:
-    """CTF/Pentest 单题模块（任务书 3.3、9.4，SINGLE-01）。
+    """CTF 单题模块（任务书 3.3、9.4，SINGLE-01）。
 
-    对现有单题页面和 API 做注册式接线：``/api/runs`` 与 ``/run/[id]`` 保持
+    对 CTF 工作台和 API 做注册式接线：``/api/runs`` 与 ``/run/[id]`` 保持
     兼容，单题模块不发送 ``swarm_class``（空 spec 由 drivers 解析为标准
     ``Swarm``）。command_handlers 与 single_task 能力工具一一对应
     （``muteki/single_task/adapter.py`` 的 SINGLE_TASK_TOOL_HANDLERS 是同
@@ -108,7 +109,7 @@ def single_security_task_descriptor() -> DomainModuleDescriptor:
     return DomainModuleDescriptor(
         id="builtin.single-security-task",
         version="1.0.0",
-        task_kinds=["ctf", "pentest"],
+        task_kinds=["ctf"],
         required_capabilities=["run.flag_gate@1", "graph.shared@1", "run.coordinator@1"],
         default_executor="swarm.coordinator",
         command_handlers={
@@ -131,7 +132,7 @@ def single_security_task_descriptor() -> DomainModuleDescriptor:
             "run.spawn_worker": "platform.command_handlers.run",
             "run.cancel_worker": "platform.command_handlers.run",
         },
-        event_namespaces=["run.", "ctf.", "pentest."],
+        event_namespaces=["run.", "ctf."],
         # 与 apps/web/server.py 现有单题路由外形一致（兼容 Adapter，
         # 行为完全不变）；查询类能力 run.snapshot / graph.shared.read /
         # read_events / wait 经 Command API，不走 HTTP。
@@ -154,22 +155,44 @@ def single_security_task_descriptor() -> DomainModuleDescriptor:
         ],
         workspace_kind="single-security-task",
         ui_contributions={
-            "title": "单题任务",
+            "title": "CTF 工作台",
             "description": (
-                "CTF / Pentest 单题求解工作区：创建表单（类型、目标、附件、"
-                "期望 Flag 数）、Swarm Coordinator、SharedGraph、Review、"
-                "Operator、Terminal 与 Worker 管理（现有 Conversation.tsx /"
-                " RunInspector / WorkerOrchestration / SharedGraphPanel /"
-                " Terminal 全部保留）"
+                "CTF 目标驱动解题工作台：用 Prompt 下发目标，"
+                "由 Swarm Coordinator 调度 Worker，共享证据与运行状态。"
             ),
             "icon": "flag",
-            "route": "/task",
-            "create_entry": "/task",
+            "route": "/ctf",
+            "create_entry": "/ctf",
             "aggregate_type": "run",
         },
         artifact_types=["run.artifact", "worker.log", "flag.evidence"],
         graph_binding="ctf.shared_graph.v1",
         gate_binding="ctf.flag_gate",
+    )
+
+
+def pentest_descriptor() -> DomainModuleDescriptor:
+    """Independent prompt-first Pentest workspace on the shared Swarm kernel."""
+    return DomainModuleDescriptor(
+        id="builtin.pentest",
+        version="1.0.0",
+        task_kinds=["pentest"],
+        required_capabilities=["graph.shared@1", "run.coordinator@1"],
+        default_executor="swarm.coordinator",
+        command_handlers={},
+        event_namespaces=["pentest."],
+        api_routes=["/api/runs/{run_id}/pentest-report"],
+        workspace_kind="pentest",
+        ui_contributions={
+            "title": "渗透测试",
+            "description": "用自然语言描述授权目标，自动调度测试并生成证据报告。",
+            "icon": "target",
+            "route": "/pentest",
+            "create_entry": "/pentest",
+            "aggregate_type": "run",
+        },
+        artifact_types=["pentest.report", "pentest.evidence"],
+        graph_binding="ctf.shared_graph.v1",
     )
 
 
@@ -292,6 +315,18 @@ def register_builtin_modules(
         single_security_task_descriptor(), components=single_security_task_components(),
     )
     registry.register(
+        pentest_descriptor(), components=[
+            ModuleComponent(
+                name="pentest.contract",
+                module_path="muteki.pentest.contract",
+            ),
+            ModuleComponent(
+                name="pentest.judgement",
+                module_path="muteki.pentest.judgement",
+            ),
+        ],
+    )
+    registry.register(
         competition_descriptor(), components=competition_components(),
     )
     return registry
@@ -306,6 +341,7 @@ def builtin_registrations(
         for module_id in (
             "builtin.conversation",
             "builtin.single-security-task",
+            "builtin.pentest",
             "builtin.competition",
         )
         if registry.get(module_id) is not None

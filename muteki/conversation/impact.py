@@ -95,7 +95,7 @@ def resolve_rewind_capability(
             level = str(row.get("level") or "unknown")
             return {
                 "rewind_level": level,
-                "invocable": bool(row.get("invocable")) and level == "supported"
+                "invocable": bool(row.get("invocable")) and level in {"supported", "limited"}
                 and not bool(matrix.get("stale")),
                 "reason": str(row.get("reason") or ""),
                 "alternative": str(
@@ -181,7 +181,7 @@ def build_impact_preview(
             ),
             "files": policy_label,
             "provider_session": (
-                "native_rewind" if mode == "native_rewind"
+                ("muteki_text_reconstruct" if rewind.get("rewind_level") == "limited" else "native_rewind") if mode == "native_rewind"
                 else "muteki_text_reconstruct" if mode in {
                     "retry", "edit_resend",
                 }
@@ -193,7 +193,7 @@ def build_impact_preview(
                 if mode in {"retry", "edit_resend"}
                 else "Fork 保留源 Thread；当前与源共享工作区"
                 if mode == "fork"
-                else "仅在 Provider 确认支持时执行原生 rewind"
+                else str(rewind.get("reason") or "同步回退引擎与聊天历史，保留文件和外部操作")
             ),
         },
     }

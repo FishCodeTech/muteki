@@ -9,6 +9,13 @@
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  async redirects() {
+    return [
+      { source: "/task", destination: "/ctf", permanent: true },
+      { source: "/task/workers", destination: "/ctf/workers", permanent: true },
+      { source: "/solve", destination: "/ctf", permanent: true },
+    ];
+  },
   // Allow an isolated production build while the normal `.next` directory is
   // serving an active development session. The default remains unchanged.
   distDir: process.env.MUTEKI_NEXT_DIST_DIR || ".next",

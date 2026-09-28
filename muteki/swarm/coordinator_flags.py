@@ -4,7 +4,6 @@ from muteki.swarm import coordinator_completion as _coord_completion
 from muteki.swarm import coordinator_control as _coord_control
 from muteki.swarm import coordinator_events as _coord_events
 from muteki.swarm import coordinator_finalize as _coord_finalize
-from muteki.swarm import coordinator_reports as _coord_reports
 from muteki.swarm import coordinator_state as _coord_state
 
 
@@ -17,34 +16,17 @@ _FlagsBusMixin._clean_review_policy = _coord_state._clean_review_policy
 _FlagsBusMixin._clean_verifier_policy = _coord_state._clean_verifier_policy
 _FlagsBusMixin._engine_healthcheck_cached = _coord_state._engine_healthcheck_cached
 _FlagsBusMixin._reconcile_blackboard_skill = _coord_state._reconcile_blackboard_skill
-_FlagsBusMixin._coverage_complete = _coord_completion._coverage_complete
-_FlagsBusMixin._engagement = _coord_completion._engagement
-_FlagsBusMixin._expected_findings = _coord_completion._expected_findings
 _FlagsBusMixin._expected_flags = _coord_completion._expected_flags
 _FlagsBusMixin._findings_complete = _coord_completion._findings_complete
 _FlagsBusMixin._flags_complete = _coord_completion._flags_complete
 _FlagsBusMixin._goal_satisfied = _coord_completion._goal_satisfied
 _FlagsBusMixin._multi_flag = _coord_completion._multi_flag
-_FlagsBusMixin._pentest_flag_required = _coord_completion._pentest_flag_required
 _FlagsBusMixin._pentest_product = _coord_completion._pentest_product
-_FlagsBusMixin._persist_accepted_collection = _coord_completion._persist_accepted_collection
 _FlagsBusMixin._qualified_report_count = _coord_completion._qualified_report_count
 _FlagsBusMixin._record_findings = _coord_completion._record_findings
 _FlagsBusMixin._record_flags = _coord_completion._record_flags
-_FlagsBusMixin._salvage_flags_from_evidence = _coord_completion._salvage_flags_from_evidence
 _FlagsBusMixin._sync_findings_from_graph = _coord_completion._sync_findings_from_graph
 _FlagsBusMixin._sync_flags_from_graph = _coord_completion._sync_flags_from_graph
-_FlagsBusMixin._drain_report_pipeline = _coord_reports._drain_report_pipeline
-_FlagsBusMixin._ensure_report_repro_intents = _coord_reports._ensure_report_repro_intents
-_FlagsBusMixin._intent_matches_engagement = _coord_reports._intent_matches_engagement
-_FlagsBusMixin._judge_pending_report_values = _coord_reports._judge_pending_report_values
-_FlagsBusMixin._llm_value_judge = _coord_reports._llm_value_judge
-_FlagsBusMixin._pentest_race_submission_quota_met = _coord_reports._pentest_race_submission_quota_met
-_FlagsBusMixin._record_reports = _coord_reports._record_reports
-_FlagsBusMixin._report_pipeline_pending = _coord_reports._report_pipeline_pending
-_FlagsBusMixin._submitted_report_count = _coord_reports._submitted_report_count
-_FlagsBusMixin._sync_reports_from_graph = _coord_reports._sync_reports_from_graph
-_FlagsBusMixin._verifier_dispatch_items = _coord_reports._verifier_dispatch_items
 _FlagsBusMixin._drain_graph_to_bus = _coord_events._drain_graph_to_bus
 _FlagsBusMixin._emit_bb_bus = _coord_events._emit_bb_bus
 _FlagsBusMixin._emit_finalize_lifecycle_deltas = _coord_events._emit_finalize_lifecycle_deltas

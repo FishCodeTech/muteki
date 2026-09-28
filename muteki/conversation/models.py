@@ -71,6 +71,7 @@ class TurnRecord(ContractModel):
     # Runtime 原生命令/Skill 的服务端解析结果。只保存能力 id、调用通道与
     # 参数；执行前会对当前会话的实时能力目录再次校验。
     runtime_invocation: dict[str, Any] = Field(default_factory=dict)
+    native_turn_id: str = ""
     status: str = TURN_QUEUED
     usage: dict[str, Any] = Field(default_factory=dict)
     error: dict[str, Any] = Field(default_factory=dict)
@@ -229,6 +230,9 @@ class ThreadState(ContractModel):
     status: str = "active"
     running_turn_id: Optional[str] = None
     current_generation: int = 1
+    history_rebuild_pending: bool = False
+    # Durable journal for a crash between provider rewind and branch commit.
+    history_recovery_required: bool = False
     # 当前活跃 AgentSession 及其 Runtime key（切换检测用）
     agent_session_id: Optional[str] = None
     session_runtime_key: str = ""

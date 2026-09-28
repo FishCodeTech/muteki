@@ -6,16 +6,15 @@ export const CTF_CANVAS_KIND_NAMES = [
   "fact", "observation", "dead_end", "step", "poc", "goal", "flag",
 ] as const;
 export const PENTEST_CANVAS_KIND_NAMES = [
-  "intent", "fact", "candidate", "dead_end", "poc", "report",
+  "intent", "fact", "candidate", "dead_end", "poc",
   "review", "finding", "route", "branch", "directive", "flag", "lock",
 ] as const;
 
 export function canvasModeOf(
-  deck: Pick<DeckState, "mode"> & { blackboard?: { vulnReports?: unknown[] } },
+  deck: Pick<DeckState, "mode">,
 ): RunCanvasMode {
   if (deck.mode === "pentest") return "pentest";
-  if (deck.mode === "ctf") return "ctf";
-  return (deck.blackboard?.vulnReports?.length ?? 0) > 0 ? "pentest" : "ctf";
+  return "ctf";
 }
 
 export function isCtfCanvasKindName(kind: string): boolean {

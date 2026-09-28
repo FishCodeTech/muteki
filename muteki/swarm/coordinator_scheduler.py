@@ -47,7 +47,7 @@ from muteki.swarm.swarm_support import SwarmOutcome
 async def worker_maintenance_stage(self, state) -> str:
     now = time.monotonic()
     if (
-        getattr(self.challenge, "mode", "ctf") != "ctf"
+        getattr(self.challenge, "mode", "ctf") not in {"ctf", "pentest"}
         and now - float(
             getattr(self, "_last_access_path_health_at", 0.0) or 0.0
         ) >= 5.0
@@ -169,7 +169,7 @@ async def _run_coordinator(self) -> SwarmOutcome:
                 continue
 
             if (
-                getattr(self.challenge, "mode", "ctf") == "ctf"
+                getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
                 or not state.reason_dispatch_barrier
             ):
                 state.open_intents = self._open_intents()

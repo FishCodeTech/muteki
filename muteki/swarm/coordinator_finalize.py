@@ -72,13 +72,27 @@ async def _finalize_coordinator_run(
             pass
         tmux_socket.unlink(missing_ok=True)
         self._ctf_tmux_socket = None
-    pentest_product = (
-        getattr(self.challenge, "mode", "ctf") == "pentest"
-        and not self._pentest_flag_required()
-    )
+    pentest_product = getattr(self.challenge, "mode", "ctf") == "pentest"
     if pentest_product:
-        self._sync_findings_from_graph()
-        self._sync_reports_from_graph()
+        # A final Worker may publish the decisive Fact exactly as worker
+        # admission closes. Give Decide one evidence-only pass before closing
+        # the graph; no further Worker is admitted or Step dispatched.
+        if self.shared_graph is not None and not self._findings_complete():
+            from muteki.pentest.judgement import evaluate
+            contract = getattr(self.challenge, "pentest_contract", None)
+            have_evidence = bool(
+                contract and evaluate(self.shared_graph.events(), contract)["findings"]
+            )
+            if have_evidence and (self._worker_admission_closed or self._budget_exhausted_kind):
+                await self._run_reason(max_intents=0)
+                rr = getattr(self, "_last_reason", None)
+                if rr is not None and getattr(rr, "verdict", "") == "complete":
+                    committed = self.shared_graph.record_pentest_goal_completion(
+                        fact_seqs=list(getattr(rr, "goal_evidence_facts", None) or []),
+                        reason=str(getattr(rr, "complete_why", "") or ""),
+                    )
+                    if committed > 0 and not self._operator_stop:
+                        terminal_reason = "goal_met"
         solved = bool(goal_complete) or self._findings_complete()
     else:
         solved = winner is not None or goal_complete or self._flags_complete()
@@ -99,6 +113,33 @@ async def _finalize_coordinator_run(
             reason = "no_progress"
         else:
             reason = "runtime_failure"
+    if pentest_product and self.shared_graph is not None:
+        from muteki.pentest.judgement import generate_report
+        contract = getattr(self.challenge, "pentest_contract", None)
+        try:
+            if contract is None or self.llm is None:
+                raise RuntimeError("pentest report model is unavailable")
+            generated = await asyncio.wait_for(
+                generate_report(
+                    self.llm, self.reason_model,
+                    self.shared_graph.events(), contract,
+                    terminal_reason=reason,
+                ),
+                timeout=120.0,
+            )
+            self.shared_graph.record_pentest_report(
+                payload=generated,
+            )
+        except Exception as exc:
+            self.shared_graph.record_pentest_report(
+                payload={
+                    "code": "report_generation_failed",
+                    "error_type": type(exc).__name__,
+                    "detail": str(exc),
+                    "raw_response": str(getattr(exc, "raw_response", "") or ""),
+                },
+                error=True,
+            )
     if self.shared_graph is not None:
         try:
             snap = self.shared_graph.snapshot()
@@ -133,16 +174,17 @@ async def _finalize_coordinator_run(
             self.shared_graph.close()
         except Exception:
             pass
-    if pentest_product:
-        self._sync_findings_from_graph()
-        solved = bool(goal_complete) or self._findings_complete()
-    else:
+    if not pentest_product:
         solved = winner is not None or goal_complete or self._flags_complete()
     if solved and (not terminal_reason or reason == "runtime_failure"):
         if pentest_product:
             reason = "goal_met"
         else:
             reason = "solved" if winner is not None or self._flags_complete() else "goal_met"
+    if pentest_product:
+        # The graph closes before coordinator_outcome returns. Keep the same
+        # terminal decision for the caller as the run.finished event.
+        self._pentest_final_outcome = (solved, reason)
     finish_flag = self._found_flags[0] if self._found_flags else (
         flag if winner is not None else None)
     await self._emit_run_finished(flag=finish_flag, solved=solved,
@@ -384,6 +426,9 @@ async def teardown_coordinator_stage(self, state) -> None:
 async def coordinator_outcome(self, state) -> SwarmOutcome:
     await self._finalize_coordinator_run(
         winner=state.winner, flag=state.flag, goal_complete=state.goal_complete, per_solver=state.per_solver)
+    if getattr(self.challenge, "mode", "ctf") == "pentest":
+        solved, reason = self._pentest_final_outcome
+        return SwarmOutcome(solved, None, None, state.per_solver, reason)
     if state.winner is not None:
         return SwarmOutcome(True, state.flag, state.winner, state.per_solver, "solved",
                             flags=list(self._found_flags))

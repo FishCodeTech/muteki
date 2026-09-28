@@ -136,6 +136,7 @@ class ToolEvidenceRecord:
             "worker_id": self.worker_id,
             "intent_id": self.intent_id,
             "target_epoch": self.target_epoch,
+            "target": self.target,
             "artifact_id": self.artifact_id,
             "artifact_sha256": self.artifact_sha256,
             "observed_at": float(self.observed_at),
@@ -242,28 +243,19 @@ def _record_artifact_matches(self, record: ToolEvidenceRecord) -> bool:
     return bool(digest and digest == record.artifact_sha256)
 
 
-def _matching_fact_evidence(
-    self, fact: str, *, witness: str = "", allowed_evidence: str = "",
-    before_at: Optional[float] = None,
+def _referenced_fact_evidence(
+    self, artifact_id: str,
 ) -> Optional[ToolEvidenceRecord]:
-    """Find one exact attributed tool result that supports ``fact``.
-
-    ``allowed_evidence`` fences the search to the current parser call: a live
-    tool-result call supplies that one raw result, while a final scan supplies
-    the current Worker's captured provenance corpus. An unrelated result cannot
-    authorize a fact merely because it was the most recent tool. A command error
-    remains valid evidence for an objective negative observation when its output
-    actually supports the fact.
-    """
-    if not allowed_evidence:
+    """Resolve a Worker-selected tool observation by stable artifact ID."""
+    if not artifact_id:
         return None
     now = time.time()
     current_intent = _current_intent_id(self)
     started_at = float(getattr(self, "_worker_started_at", 0.0) or 0.0)
     records = list(getattr(self, "_tool_evidence_records", None) or [])
     for record in reversed(records):
-        raw = str(record.output or "")
-        if (not record.attributed or record.event_seq <= 0
+        if (record.artifact_id != artifact_id
+                or not record.attributed or record.event_seq <= 0
                 or record.event_at <= 0
                 or record.worker_id != self.solver_id
                 or record.intent_id != current_intent
@@ -271,19 +263,10 @@ def _matching_fact_evidence(
                 or record.observed_at < started_at
                 or record.observed_at > record.event_at + 1.0
                 or record.event_at > now
-                or (before_at is not None
-                    and record.event_at > float(before_at) + 1.0)
-                or not raw or raw not in allowed_evidence
+                or not record.output
                 or not _record_artifact_matches(self, record)):
             continue
-        body = _fact_evidence_body(raw)
-        if not body:
-            continue
-        if witness and witness not in body:
-            continue
-        if _fact_supported_by_tool_event(
-                self, fact, output=raw, command=record.command):
-            return record
+        return record
     return None
 
 
@@ -415,19 +398,22 @@ async def _accept_submitted_flag(self, flag: str) -> bool:
 def _blackboard_operation_allowed(self, operation: str) -> bool:
     if operation == "context":
         return True
+    if operation == "recent_evidence":
+        return getattr(self.challenge, "mode", "ctf") == "pentest" and self.mode in {"bootstrap", "explore", "fact_verifier"}
     if operation == "need_input" and not bool(
         getattr(self.challenge, "allow_operator_input", True)
     ):
         return False
-    ctf_mode = getattr(self.challenge, "mode", "ctf") == "ctf"
+    ctf_mode = getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
     if ctf_mode:
         if operation == "read_artifact":
             return self.mode in {"bootstrap", "explore", "fact_verifier"}
         if self.mode in {"bootstrap", "explore"}:
-            return operation in {
+            permitted = {
                 "submit_fact", "commit_step", "dead_end", "need_input",
-                "save_poc", "submit_flag",
+                "save_poc",
             }
+            return operation in (permitted | ({"submit_flag"} if self.challenge.mode == "ctf" else set()))
         if self.mode == "fact_verifier":
             return operation in {"submit_fact", "commit_step", "dead_end", "save_poc"}
         if self.mode == "respond" and str(
@@ -452,12 +438,8 @@ def _blackboard_operation_allowed(self, operation: str) -> bool:
             return bool(getattr(self.challenge, "verifier_rate_limited", False))
         if operation == "submit_flag":
             return getattr(self.challenge, "mode", "ctf") == "ctf"
-        if operation == "submit_report":
-            return getattr(self.challenge, "mode", "ctf") == "pentest"
     if self.mode == "fact_verifier":
         return operation in solve | coordination
-    if self.mode == "report_reproducer":
-        return operation in {"submit_repro", "claim_resource", "release_resource"}
     if self.mode == "review":
         return operation in {
             "review_finding", "fact_challenge", "fact_merge",
@@ -486,12 +468,33 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
     shared_graph = getattr(self, "shared_graph", None)
     if operation == "context":
         return {"ok": True, "content": self._live_blackboard_context()}
+    if operation == "recent_evidence":
+        records = []
+        for row in getattr(self, "_tool_evidence_records", None) or []:
+            if (not row.attributed or row.event_seq <= 0
+                    or row.worker_id != self.solver_id
+                    or row.intent_id != _current_intent_id(self)
+                    or not _target_epoch_matches(self, row.target_epoch)):
+                continue
+            if not _record_artifact_matches(self, row):
+                raise ToolArtifactPersistenceError(
+                    f"tool artifact missing or changed: {row.artifact_id}"
+                )
+            records.append({
+                "artifact_id": row.artifact_id,
+                "tool_event_id": f"{self.run_id}:{row.event_seq}",
+                "bytes": self.artifacts.size(row.artifact_id),
+            })
+        return {"ok": True, "content": json.dumps(records, ensure_ascii=False)}
     if operation == "read_artifact":
         artifact_id = str(payload.get("artifact_id") or "")
         expected = (
             shared_graph.ctf_artifact_digest(artifact_id)
             if shared_graph is not None else None
         )
+        if not expected:
+            own = _referenced_fact_evidence(self, artifact_id)
+            expected = own.artifact_sha256 if own is not None else None
         if not expected:
             return {"ok": False, "detail": "artifact is not referenced by this challenge"}
         if self.artifacts.sha256(artifact_id) != expected:
@@ -507,7 +510,13 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
         content = str(payload.get("content") or "")
         if not title or not content.strip():
             return {"ok": False, "detail": "title and content are required"}
-        self._draft_fact = {"title": title, "content": content}
+        evidence_artifact_id = str(payload.get("evidence_artifact_id") or "").strip()
+        if getattr(self.challenge, "mode", "ctf") == "pentest" and not _referenced_fact_evidence(self, evidence_artifact_id):
+            return {"ok": False, "detail": "evidence artifact is missing or not attributed to this Step; call recent-evidence"}
+        self._draft_fact = {
+            "title": title, "content": content,
+            "evidence_artifact_id": evidence_artifact_id,
+        }
         self._accepted_blackboard_requests += 1
         return {
             "ok": True,
@@ -533,12 +542,26 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
 
         intent_id = _current_intent_id(self)
         fact_text = f"{title}\n{content}"
+        provenance = _fact_claim_provenance(
+            self, {"artifact_refs": _ctf_step_artifact_refs(self)}
+        )
+        if getattr(self.challenge, "mode", "ctf") == "pentest":
+            record = _referenced_fact_evidence(
+                self, str(draft.get("evidence_artifact_id") or ""),
+            )
+            if record is None:
+                return {
+                    "ok": False,
+                    "detail": "所选工具证据已失效或不属于当前 Step；请重新查看 recent-evidence",
+                }
+            provenance.update(record.provenance(
+                run_id=str(getattr(self, "run_id", "") or ""),
+                promoted_at=time.time(),
+            ))
         claim = ObservationClaim(
             text=fact_text,
             claim_verified=True,
-            provenance=_fact_claim_provenance(
-                self, {"artifact_refs": _ctf_step_artifact_refs(self)}
-            ),
+            provenance=provenance,
         )
         solved = self._flags_complete_for_worker()
         status = RESULT_SOLVED if solved else RESULT_EXPLORED
@@ -615,7 +638,7 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
         text = str(payload.get("text") or "").strip()
         if not text:
             return {"ok": False, "detail": "fact text is empty"}
-        ctf_mode = getattr(self.challenge, "mode", "ctf") == "ctf"
+        ctf_mode = getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
         if ctf_mode:
             fact_text = text
             claim_artifact_id = ""
@@ -643,7 +666,7 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
             "fact_seq": int(seq or 0),
         }
     if operation == "dead_end":
-        ctf_mode = getattr(self.challenge, "mode", "ctf") == "ctf"
+        ctf_mode = getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
         if ctf_mode:
             reason = str(payload.get("reason") or "").strip()
         else:
@@ -827,20 +850,6 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
             return {"ok": False, "detail": "Flag was empty, duplicate, or rejected"}
         self._accepted_blackboard_requests += 1
         return {"ok": True, "message": "SUBMITTED"}
-    if operation == "submit_report":
-        accepted = await self._submit_report_path(str(payload.get("path") or ""))
-        if accepted:
-            self._accepted_blackboard_requests += 1
-        return {"ok": accepted, "message": "SUBMITTED" if accepted else ""}
-    if operation == "submit_repro":
-        accepted = await self._submit_repro_decision(
-            bool(payload.get("reproduced")),
-            str(payload.get("witness") or ""),
-            str(payload.get("reason") or ""),
-        )
-        if accepted:
-            self._accepted_blackboard_requests += 1
-        return {"ok": accepted, "message": "RECORDED" if accepted else ""}
     if operation == "branch_proposal":
         if shared_graph is None:
             return {"ok": False, "detail": "SharedGraph is unavailable"}
