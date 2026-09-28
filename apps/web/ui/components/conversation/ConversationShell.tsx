@@ -73,8 +73,11 @@ import {
 import {
   projectConvDefaultsPayload,
   readChatDefaultModel,
+  readChatLastSelection,
   readProjectConvDefaults,
+  writeChatLastSelection,
 } from "@/lib/conversationDefaults";
+import { resolveNewConversationSelection } from "@/lib/newConversationSelection";
 import { projectDefaultPersistFeedback } from "@/lib/projectDefaultPersistFeedback";
 import { resolveComposerRuntimeBind } from "@/lib/conversationComposerBind";
 import { upsertConversationThread } from "@/lib/conversationInbox";
@@ -84,6 +87,8 @@ import {
   pushJumpBackFromThread,
   shouldRestoreReadingPosition,
 } from "@/lib/conversationReadingPosition";
+import { fetchComposerCapabilities } from "@/lib/composerCapabilities";
+import { copyToClipboard } from "@/lib/clipboard";
 import type {
   ComposerCapabilityContext,
   ComposerCapabilityRef,
@@ -247,7 +252,7 @@ function resolvePreferredChatSelection(
 ): { credentialId: string; modelId: string } | null {
   const available = credentials.filter(credentialAvailable);
   if (!available.length) return null;
-  const saved = readChatDefaultModel();
+  const saved = readChatLastSelection() || readChatDefaultModel();
   const preferred =
     (saved && available.find((credential) => credential.id === saved.credentialId))
     || available[0];
@@ -350,6 +355,8 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
   // Start true so the persist effect cannot write an empty composer over a
   // stored draft before the hydrate effect runs on first mount / remount.
   const draftHydratingRef = useRef(true);
+  const [hydratedDraftKey, setHydratedDraftKey] = useState("");
+  const appliedNewChatDefaultsRef = useRef("");
   const composerSnapshotRef = useRef({
     draftKey,
     prompt: "",
@@ -392,6 +399,7 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
   // Global settings & credentials
   const [credentialRows, setCredentials] = useState<ConversationCredential[]>([]);
   const [credentialSource, setCredentialSource] = useState<SourceState>(sourceLoading());
+  const credentialLoadSeqRef = useRef(0);
   const [credentialId, setCredentialId] = useState("");
 
   // Runtimes
@@ -540,6 +548,7 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
     });
   }, []);
   const [exportDialogOpen, setExportDialogOpen] = useState(false);
+  const [commandSessionsOpen, setCommandSessionsOpen] = useState(false);
   const [bottomPanelOpen, setBottomPanelOpen] = useState(false);
   const panel = useChatPanel(threadId);
   const rightPanelOpen = Boolean(threadId) && panel.isOpen;
@@ -665,7 +674,6 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const reselectInputRef = useRef<HTMLInputElement | null>(null);
   const reselectIndexRef = useRef<number | null>(null);
-  const previousThreadIdRef = useRef(threadId);
   const pendingProjectIdRef = useRef("");
   const commandBusyRef = useRef(false);
   const applyingHistoryRef = useRef(false);
@@ -710,10 +718,25 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
     return () => window.clearTimeout(timer);
   }, [requestPathInput]);
 
-  const startNewChat = useCallback((nextProjectId = "") => {
+  const startNewChat = useCallback((nextProjectId = "", preserveRuntime = false) => {
+    const nextDraft = String(Date.now());
     pendingProjectIdRef.current = nextProjectId;
+    const current = composerSnapshotRef.current;
+    writeChatLastSelection({
+      credentialId: current.credentialId, modelId: current.model,
+      runtimeKey: current.runtimeKey, effort: current.effort, accessMode: current.accessMode,
+    });
+    if (preserveRuntime) {
+      writeComposerDraft(composerDraftKey("", nextDraft), {
+        prompt: "", promptSegments: [], capabilityRefs: [], attachments: [],
+        credentialId: current.credentialId, runtimeKey: current.runtimeKey,
+        model: current.model, effort: current.effort, accessMode: current.accessMode,
+        projectId: nextProjectId,
+      });
+      flushComposerDraftStore();
+    }
     setMobileSidebarOpen(false);
-    router.push(`/chat?draft=${Date.now()}`);
+    router.push(`/chat?draft=${nextDraft}`);
   }, [router]);
 
   // C34 — Global conversation keyboard shortcuts.
@@ -849,6 +872,8 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
       flushComposerDraftStore();
     }
     draftHydratingRef.current = true;
+    appliedNewChatDefaultsRef.current = "";
+    restoredBindingContextRef.current = null;
     const { draft, attachments: nextAttachments, restoredNeedsReselect } = hydrateComposerDraft(draftKey);
     if (draft) {
       const doc = promptDocumentFromDraft(draft);
@@ -863,7 +888,11 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
       if (draft.accessMode) setAccessMode(draft.accessMode);
       // A saved thread's workspace is immutable in the composer. A local draft
       // may restore text/model choices, but must not override its persisted home.
-      if (!threadId && draft.projectId !== undefined) setProjectId(draft.projectId);
+      if (!threadId) {
+        setProjectId(draft.projectId || "");
+        pendingProjectIdRef.current = "";
+        restoredBindingContextRef.current = { draftKey, projectId: draft.projectId || "" };
+      }
       if (restoredNeedsReselect) {
         setNotice("部分附件无法恢复本地文件，请重新选择后再发送");
       }
@@ -881,8 +910,12 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
           setProjectId("");
         }
         setMode("conversation");
-        setEffort("");
-        setAccessMode("supervised");
+        const recent = readChatLastSelection();
+        setCredentialId(recent?.credentialId || "");
+        setRuntimeKey(recent?.runtimeKey || "");
+        setModel(recent?.modelId || "");
+        setEffort(recent?.effort || "");
+        setAccessMode(recent?.accessMode || "supervised");
         setError("");
         setNotice("");
         setMemory(null);
@@ -894,6 +927,7 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
     historyScratchRef.current = null;
     const release = window.setTimeout(() => {
       draftHydratingRef.current = false;
+      setHydratedDraftKey(draftKey);
     }, 0);
     return () => window.clearTimeout(release);
   }, [draftKey, threadId]);
@@ -1215,9 +1249,11 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
   }, []);
 
   const loadCredentials = useCallback(async (opts?: { fresh?: boolean; silent?: boolean }) => {
+    const requestSeq = ++credentialLoadSeqRef.current;
     if (!opts?.silent) setCredentialSource(sourceLoading());
     try {
       const rows = (await fetchConversationCredentials({ fresh: opts?.fresh })).filter((row) => row.engine !== "dsh");
+      if (requestSeq !== credentialLoadSeqRef.current) return;
       setCredentials(rows);
       setCredentialId((curr) => {
         if (curr && rows.some((r) => r.id === curr)) return curr;
@@ -1225,6 +1261,7 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
       });
       setCredentialSource(sourceOk());
     } catch (exc) {
+      if (requestSeq !== credentialLoadSeqRef.current) return;
       const message = exc instanceof Error ? exc.message : String(exc);
       const httpStatus = (exc as { httpStatus?: number })?.httpStatus ?? parseHttpStatus(message);
       setCredentialSource(sourceError(message, httpStatus));
@@ -1251,6 +1288,16 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
       loadProjects({ silent: opts?.silent }),
     ]);
   }, [loadCredentials, loadProjects, loadRuntimes]);
+
+  // A batch may contain completion followed by usage or the next queued turn.
+  // Refresh from any newly observed completion, not only the final SSE event.
+  const completedModelTurnSeq = conversation.events.findLast(
+    (event) => event.event_type === "core.turn.completed",
+  )?.seq;
+  useEffect(() => {
+    if (completedModelTurnSeq === undefined) return;
+    void loadCredentials({ silent: true });
+  }, [threadId, completedModelTurnSeq, loadCredentials]);
 
   useEffect(() => {
     void loadRuntimes();
@@ -1338,27 +1385,6 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
     viewRuntimeKey,
     viewThreadId,
   ]);
-
-  // The persistent /chat layout keeps the sidebar mounted between routes.
-  // Starting a fresh chat must still reset thread-scoped model/context choices
-  // when the new draft has no stored composer state.
-  useEffect(() => {
-    const previous = previousThreadIdRef.current;
-    previousThreadIdRef.current = threadId;
-    if (!previous || threadId || !credentials.length) return;
-    if (readComposerDraft(draftKey)) return;
-    const preferred = resolvePreferredChatSelection(credentials);
-    if (!preferred) return;
-    setCredentialId(preferred.credentialId);
-    setModel(preferred.modelId);
-    setEffort("");
-    setAccessMode("supervised");
-    if (pendingProjectIdRef.current) {
-      setProjectId(pendingProjectIdRef.current);
-      pendingProjectIdRef.current = "";
-    }
-    setMode("conversation");
-  }, [credentials, draftKey, threadId]);
 
   // Load Memory
   const loadMemory = useCallback(async () => {
@@ -1510,10 +1536,12 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
     return {
       threadId: threadId || undefined,
       adapterId,
+      revision: conversation.view?.runtime_connection?.capability_revision ?? 0,
       workspaceId: (threadId ? conversation.view?.thread.workspace_id : selectedProject?.workspace_id) || undefined,
       projectId: (threadId ? conversation.view?.thread.project_id : selectedProject?.project_id) || undefined,
     };
   }, [
+    conversation.view?.runtime_connection?.capability_revision,
     conversation.view?.thread.project_id,
     conversation.view?.thread.workspace_id,
     selectedProject?.project_id,
@@ -1529,7 +1557,10 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
     accessMode?: string;
   }) => {
     const credential = credentials.find((item) => item.id === params.credentialId);
-    const runtime = credential ? runtimeForEngine(credential.engine, runtimes) : undefined;
+    const runtime = credential
+      ? runtimes.find((row) => row.key === runtimeKey && row.engine === credential.engine && row.enabled !== false)
+        || runtimeForEngine(credential.engine, runtimes)
+      : undefined;
     const engineChanged = Boolean(
       credential
       && selectedCredential
@@ -1540,11 +1571,23 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
     setRuntimeKey(runtime?.key || "");
     if (params.effort !== undefined) setEffort(params.effort);
     if (params.accessMode !== undefined) setAccessMode(params.accessMode);
-    if (engineChanged) setCapabilityRefs([]);
-  }, [credentials, runtimes, selectedCredential]);
+    restoredBindingContextRef.current = { draftKey, projectId };
+    writeChatLastSelection({
+      credentialId: params.credentialId, modelId: params.model,
+      runtimeKey: runtime?.key || "", effort: params.effort ?? effort,
+      accessMode: params.accessMode ?? accessMode,
+    });
+    if (engineChanged) {
+      const next = documentFromPromptAndRefs(plainTextFromDocument(promptDocument), []);
+      setPromptDocument(next);
+      setPrompt(plainTextFromDocument(next));
+      setCapabilityRefs([]);
+    }
+  }, [credentials, runtimes, runtimeKey, selectedCredential, promptDocument, draftKey, projectId, effort, accessMode]);
 
   const handleProjectChange = useCallback((nextProjectId: string) => {
     restoredBindingContextRef.current = null;
+    appliedNewChatDefaultsRef.current = "";
     setProjectId(nextProjectId);
     setCapabilityRefs([]);
     setWorkspaceMode("shared_checkout");
@@ -1560,56 +1603,6 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
     setExistingWorktreePath("");
     if (mode !== "new_worktree") setWorktreeBranch("");
   }, []);
-
-  // C26 fix (High + Medium): apply / reset project-level conversation defaults
-  // whenever projectId or projects list changes in new-thread (no threadId) state.
-  // Covers all code paths: handleProjectChange, pendingProjectIdRef, draft-hydrate,
-  // and leave-thread — so no path silently skips defaults.
-  // Medium fix: when project has no override, reset to resolved user/provider pref
-  // rather than leaving stale values from the previous project.
-  useEffect(() => {
-    if (threadId) return;
-    if (!projects.length && !credentials.length) return;
-    const restoredContext = restoredBindingContextRef.current;
-    if (restoredContext?.draftKey === draftKey && restoredContext.projectId === projectId) return;
-    const project = projects.find((p) => p.project_id === projectId);
-    const projDefaults = readProjectConvDefaults(project?.settings as Record<string, unknown> | undefined);
-    const hasProjectModel = Boolean(projDefaults.credentialId || projDefaults.modelId);
-    if (hasProjectModel) {
-      const cred = credentials.find((c) => c.id === projDefaults.credentialId) || credentials[0];
-      if (cred) {
-        setCredentialId(cred.id);
-        const models = allCredentialModels(cred).map((m) => m.id);
-        const preferredModel =
-          projDefaults.modelId && models.includes(projDefaults.modelId)
-            ? projDefaults.modelId
-            : models[0] || "";
-        setModel(preferredModel);
-      }
-    } else if (projectId) {
-      // Project selected but has no saved defaults → reset to user/provider pref
-      // so stale values from a previously selected project are cleared.
-      const preferred = resolvePreferredChatSelection(credentials);
-      if (preferred) {
-        setCredentialId(preferred.credentialId);
-        setModel(preferred.modelId);
-      }
-    }
-    if (projDefaults.effort !== undefined) {
-      setEffort(projDefaults.effort);
-    } else if (projectId) {
-      setEffort("");
-    }
-    if (projDefaults.accessMode) {
-      setAccessMode(projDefaults.accessMode);
-    } else if (projectId) {
-      setAccessMode("supervised");
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId, projects, threadId]);
-  // ^^ credentials intentionally omitted: credential list changes are handled
-  // by the existing resolvePreferredChatSelection effect; including it here
-  // would fight with user-explicit model selections during a session.
 
   const projectConvDefaults = useMemo(
     () => readProjectConvDefaults(selectedProject?.settings as Record<string, unknown> | undefined),
@@ -1636,6 +1629,7 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
       setError(feedback.error);
       setNotice(feedback.notice);
       if (feedback.applyLocalProjects) {
+        restoredBindingContextRef.current = null;
         setProjects((prev) => prev.map((p) =>
           p.project_id === projectId
             ? {
@@ -1671,6 +1665,7 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
       setError(feedback.error);
       setNotice(feedback.notice);
       if (feedback.applyLocalProjects) {
+        restoredBindingContextRef.current = null;
         setProjects((prev) => prev.map((p) => {
           if (p.project_id !== projectId) return p;
           const next = { ...(p.settings || {}) };
@@ -1697,21 +1692,22 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
   }, [selectedRuntime]);
 
   useEffect(() => {
+    if (draftHydratingRef.current || hydratedDraftKey !== draftKey) return;
     if (!accessModes.length || accessModes.includes(accessMode)) return;
     setAccessMode(
       accessModes.includes("supervised") ? "supervised" : accessModes[0],
     );
-  }, [accessMode, accessModes]);
+  }, [accessMode, accessModes, draftKey, hydratedDraftKey]);
 
   // Sync default runtime & model when credential changes in new-thread mode
   useEffect(() => {
-    if (threadId || !selectedCredential) return;
+    if (threadId || !selectedCredential || draftHydratingRef.current || hydratedDraftKey !== draftKey) return;
     setRuntimeKey((current) => {
       const exact = runtimes.find((row) => row.key === current && row.engine === selectedCredential.engine && row.enabled !== false);
       return exact?.key || runtimeForEngine(selectedCredential.engine, runtimes)?.key || "";
     });
     const modelIds = allCredentialModels(selectedCredential).map((m) => m.id);
-    const saved = readChatDefaultModel();
+    const saved = readChatLastSelection() || readChatDefaultModel();
     setModel((curr) =>
       curr && modelIds.includes(curr)
         ? curr
@@ -1725,7 +1721,32 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
         ? selectedCredential.default_model
         : modelIds[0] || "",
     );
-  }, [runtimes, selectedCredential, threadId]);
+  }, [draftKey, hydratedDraftKey, runtimes, selectedCredential, threadId]);
+
+  // Initialize once per draft/project/default change, after asynchronous catalogs
+  // and draft hydration finish. Background refreshes must not reset the picker.
+  useEffect(() => {
+    if (threadId || hydratedDraftKey !== draftKey || draftHydratingRef.current) return;
+    if (credentialSource.phase !== "ok" || runtimeSource.phase !== "ok") return;
+    if (projectId && projectSource.phase !== "ok") return;
+    const restoredContext = restoredBindingContextRef.current;
+    if (restoredContext?.draftKey === draftKey && restoredContext.projectId === projectId) return;
+    const project = projects.find((p) => p.project_id === projectId);
+    const projDefaults = readProjectConvDefaults(project?.settings as Record<string, unknown> | undefined);
+    const contextKey = JSON.stringify([draftKey, projectId, projDefaults]);
+    if (appliedNewChatDefaultsRef.current === contextKey) return;
+    const selection = resolveNewConversationSelection({
+      credentials: credentialRows, runtimes, project: projDefaults,
+      recent: readChatLastSelection(), configured: readChatDefaultModel(),
+    });
+    if (!selection) return;
+    appliedNewChatDefaultsRef.current = contextKey;
+    setCredentialId(selection.credentialId);
+    setRuntimeKey(selection.runtimeKey);
+    setModel(selection.model);
+    setEffort(selection.effort);
+    setAccessMode(selection.accessMode);
+  }, [credentialRows, credentialSource.phase, draftKey, hydratedDraftKey, projectId, projects, projectSource.phase, runtimes, runtimeSource.phase, threadId]);
 
   const threadMatrix = useMemo(
     () => matrixFromRuntimeConnection(conversation.view?.runtime_connection),
@@ -1913,12 +1934,79 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
     }
   }, [projectCreating, projects, setError, setNotice]);
 
+  const handleClientCommand = async (action: string, args = "") => {
+    const name = action.replace(/^ui:/, "");
+    setPromptDocument(emptyPromptDocument()); setPrompt(""); setCapabilityRefs([]);
+    if (name === "new") { startNewChat(projectId, true); return; }
+    if (name === "help") {
+      const text = `/${args}`;
+      setPrompt(text); setPromptDocument(documentFromPromptAndRefs(text, []));
+      requestAnimationFrame(() => document.querySelector<HTMLElement>("[data-c34-composer]")?.focus());
+      return;
+    }
+    if (["model", "effort", "permissions"].includes(name)) {
+      if (args && name === "model" && selectedCredential && allCredentialModels(selectedCredential).some((m) => m.id === args)) {
+        handleSelectModelParams({ credentialId, model: args }); setNotice(`已选择模型 ${args}`); return;
+      }
+      if (args && name === "effort" && selectedCredential && validModelEffort(allCredentialModels(selectedCredential).find((m) => m.id === model), args)) {
+        setEffort(args); setNotice(`已设置思考强度 ${args}`); return;
+      }
+      setModelPickerOpen(true);
+      if (args) setNotice("请在选择器中确认当前引擎支持的设置");
+      return;
+    }
+    if (["skills", "plugins", "mcp"].includes(name)) {
+      const engine = selectedCredential?.engine || "codex";
+      const params = new URLSearchParams({ engine, source: name === "plugins" ? "managed" : "native", type: name === "skills" ? "skill" : name === "mcp" ? "mcp" : "all" });
+      router.push(`/settings/chat-plugins?${params}`); return;
+    }
+    if (name === "sessions") { setSearchQuery(args); setCommandSessionsOpen(true); return; }
+    if (!threadId || !conversation.view) { setNotice("请先开始一段聊天"); return; }
+    if (name === "rename") {
+      if (args) { await handleRename(threadId, args); return; }
+      setRenameTarget({ ...conversation.view.thread, state: conversation.view.state }); setRenameInput(conversation.view.thread.title); return;
+    }
+    if (name === "fork") { handleFork(threadId); return; }
+    if (name === "export") { setExportDialogOpen(true); return; }
+    if (name === "rewind") {
+      const turn = conversation.view.turns.at(-1);
+      if (turn) handleRewindTurn(turn.turn_id); else setNotice("当前没有可回退的轮次");
+      return;
+    }
+    if (name === "diff") { chatPanel.open(threadId, "diff"); return; }
+    if (name === "details") { setBottomPanelOpen(true); return; }
+    if (name === "copy") {
+      const message = [...conversation.view.messages].reverse().find((m) => m.role === "assistant" && m.text);
+      setNotice(message && await copyToClipboard(message.text) ? "已复制助手回复" : "当前没有可复制的回复"); return;
+    }
+    setDetailsPayload({ type: "tool", title: "聊天状态与用量", output: {
+      runtime: conversation.view.runtime, statistics: conversation.view.statistics, context: conversation.view.context_window,
+    }});
+  };
+
   // Send message or Create Thread + Send (C02: stable idempotent intent)
   const handleSend = async () => {
     const activeContext = activeSendContextRef.current;
     if (activeContext.draftKey !== draftKey) return;
     if (threadId && activeContext.viewThreadId !== threadId) return;
     const text = plainTextFromDocument(promptDocument).trim();
+    if (["/clear", "/new", "/clear-input"].includes(text)) {
+      setPromptDocument(emptyPromptDocument());
+      setPrompt("");
+      setCapabilityRefs([]);
+      if (text !== "/clear-input") startNewChat(projectId, true);
+      return;
+    }
+    const localCommand = /^\/([a-zA-Z][\w:.-]*)(?:\s+([\s\S]*))?$/.exec(text);
+    if (localCommand && composerCapabilityContext) {
+      try {
+        const catalog = await fetchComposerCapabilities(composerCapabilityContext, "/", localCommand[1]);
+        if (activeSendContextRef.current.draftKey !== draftKey) return;
+        const item = catalog.items.find((row) => row.kind === "command" && row.name.toLowerCase() === localCommand[1].toLowerCase());
+        if (item?.action?.startsWith("ui:")) { await handleClientCommand(item.action, localCommand[2] || ""); return; }
+        if (item?.invocable === false) { setError(item.reason || "当前引擎不支持此命令"); return; }
+      } catch (error) { setError(error instanceof Error ? error.message : "命令目录加载失败"); return; }
+    }
     const structuredRefs = wireCapabilityRefs(promptDocument);
     if ((!text && !structuredRefs.length && !attachments.length) || busy) return;
     if (threadId && isThreadArchived(threadId)) {
@@ -1998,6 +2086,10 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
         effort: effort === "default" ? "" : effort,
         access_mode: accessMode,
       };
+      writeChatLastSelection({
+        credentialId: cred.id, modelId: model, runtimeKey: rt.key,
+        effort: runtimePayload.effort, accessMode,
+      });
 
       const intent = await prepareSendIntent(
         draftKey,
@@ -2191,7 +2283,11 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
         // Accepted receipt ≠ Agent completed — always use the recoverable wording.
         const runtimeOperation = String(sendReceipt.output?.runtime_operation || "").trim();
         if (runtimeOperation) {
-          setNotice(`已从 Runtime 读取 /${runtimeOperation} · ${phaseNotice("accepted")}`);
+          const result = sendReceipt.output?.result as { message?: string } | undefined;
+          setNotice(result?.message || `已完成 /${runtimeOperation}`);
+          if (runtimeOperation !== "compact" && sendReceipt.output?.result) {
+            setDetailsPayload({ type: "tool", title: `/${runtimeOperation}`, output: sendReceipt.output.result });
+          }
         } else {
           setNotice(phaseNotice("accepted"));
         }
@@ -2686,7 +2782,7 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
           commandId ? { commandId, idempotencyKey: commandId } : {},
         );
         closeImpact();
-        setNotice("原生回退已应用");
+        setNotice("聊天历史已回退，工作区文件保持原状");
         return;
       }
       if (mode === "edit_resend") {
@@ -3346,8 +3442,8 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
             capabilityRefs={capabilityRefs}
             onCapabilityRefsChange={setCapabilityRefs}
             onComposerCommand={(action) => {
-              if (action !== "new") return;
-              startNewChat();
+              if (action === "new") startNewChat(projectId, true);
+              else if (action.startsWith("ui:")) void handleClientCommand(action);
             }}
             projectHasDefault={Boolean(
               projectId && (projectConvDefaults.credentialId || projectConvDefaults.modelId),
@@ -3574,8 +3670,8 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
                   capabilityRefs={capabilityRefs}
                   onCapabilityRefsChange={setCapabilityRefs}
                   onComposerCommand={(action) => {
-                    if (action !== "new") return;
-                    startNewChat();
+                    if (action === "new") startNewChat(projectId, true);
+                    else if (action.startsWith("ui:")) void handleClientCommand(action);
                   }}
                   {...stashRecallProps}
                   extraControls={
@@ -3752,6 +3848,13 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
             data-autofocus
           />
         </form>
+      </Dialog>
+
+      <Dialog open={commandSessionsOpen} onOpenChange={setCommandSessionsOpen} title="切换聊天" description="仅列出 Muteki 中的聊天，原有聊天记录保持不变。">
+        <TextField label="搜索聊天" value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} />
+        <div className="mt-3 max-h-80 space-y-1 overflow-auto">
+          {threads.filter((thread) => thread.title.toLowerCase().includes(searchQuery.toLowerCase())).map((thread) => <button key={thread.thread_id} type="button" className="block w-full rounded-lg px-3 py-2 text-left text-sm hover:bg-cx-hover" onClick={() => { setCommandSessionsOpen(false); router.push(`/chat/${encodeURIComponent(thread.thread_id)}`); }}>{thread.title || "未命名聊天"}</button>)}
+        </div>
       </Dialog>
 
       <ImpactConfirmModal

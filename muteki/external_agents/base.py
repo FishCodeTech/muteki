@@ -114,6 +114,7 @@ class BaseExternalAgentAdapter:
         self._grants: dict[str, list[str]] = {}
         self._plans: dict[str, CapabilityInjectionPlan] = {}
         self._probe_cache: Optional[CapabilityProbeReport] = None
+        self.probe_environment_factory: Optional[Callable[[], dict[str, str]]] = None
 
     # --  probe -------------------------------------------------------------
 
@@ -125,9 +126,21 @@ class BaseExternalAgentAdapter:
         """最近一次 probe 的完整记录（含字段来源与降级说明）。"""
         return self._probe_cache
 
+    async def probe_with_environment(self, request: ProbeRequest) -> AgentCapabilities:
+        if self.probe_environment_factory is None:
+            return await self.probe(request)
+        import asyncio
+        from .probe_environment import PROBE_ENVIRONMENT
+        environment = await asyncio.to_thread(self.probe_environment_factory)
+        token = PROBE_ENVIRONMENT.set(environment)
+        try:
+            return await self.probe(request)
+        finally:
+            PROBE_ENVIRONMENT.reset(token)
+
     async def _capabilities(self, *, refresh: bool = False) -> AgentCapabilities:
         if self._probe_cache is None or refresh:
-            caps = await self.probe(ProbeRequest(
+            caps = await self.probe_with_environment(ProbeRequest(
                 runtime_instance_id=self.identity.instance_id))
             if self._probe_cache is None:
                 # 子类未维护 report 时包一层，保证调用方总能读到来源标注。
@@ -179,13 +192,20 @@ class BaseExternalAgentAdapter:
         """
         caps = await self._capabilities()
         from muteki.capability_management import enabled as capability_enabled
-        if not capability_enabled("mcp", "muteki-control"):
+        if not capability_enabled("mcp", "muteki-control") and not request.options.get("chat_tools"):
             caps = caps.model_copy(update={
                 "mcp": False,
                 "acp_mcp_config": False,
             })
         kind = select_injection_kind(caps)
         descriptor = self._describe(binding)
+        if request.options.get("thread_mode") == "conversation" and "chat_tools" in request.options:
+            from muteki.platform.contracts.capabilities import ToolDescription
+            tools = descriptor.tools if request.options.get("chat_control_enabled", True) and capability_enabled("mcp", "muteki-control") else []
+            descriptor = descriptor.model_copy(update={"tools": [*tools, *[
+                ToolDescription(name=t["name"], description=t["description"], input_schema=t["input_schema"])
+                for t in request.options["chat_tools"]
+            ]]})
         common = dict(
             binding_id=binding.binding_id,
             grant_id=grant.grant_id,

@@ -46,7 +46,11 @@ export function triggerIcon(trigger: ComposerTrigger): IconName {
 
 export function capabilitySection(trigger: ComposerTrigger, item: ComposerCapabilityItem): string {
   if (trigger === "/") {
-    if (item.kind === "command") return item.scope === "engine" ? `${item.source} 内置功能` : "Muteki";
+    if (item.kind === "command") {
+      if (item.channel === "local_handler" && item.invocable !== false || item.source === "Muteki") return "聊天操作";
+      const labels: Record<string, string> = { claude: "Claude", codex: "Codex", cursor: "Cursor", pi: "Pi", omp: "OMP", kimi: "Kimi", grok: "Grok", opencode: "OpenCode" };
+      return `${labels[item.engine || ""] || item.source} ${item.invocable === false ? "暂不可用" : "原生命令"}`;
+    }
     return "Skill";
   }
   if (trigger === "$") return "Skill";

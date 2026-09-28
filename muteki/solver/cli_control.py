@@ -313,7 +313,7 @@ def _drain_control(self) -> None:
 
 def _maybe_steer_idle_repeat(self) -> None:
     """Soft-correct a worker repeating the same command with unchanged output."""
-    if self.mode in ("review", "fact_verifier", "report_reproducer"):
+    if self.mode in ("review", "fact_verifier"):
         return
     self._stalled_at = None
     cmds = list(getattr(self, "_raw_tool_commands", []) or [])

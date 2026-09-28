@@ -200,11 +200,14 @@ interface ModelRow {
   model: ConversationCredentialModel;
 }
 
-function modelBadges(credential: ConversationCredential, model: ConversationCredentialModel): Array<{ label: string; tone: Tone }> {
-  const badges: Array<{ label: string; tone: Tone }> = [];
+function modelBadges(credential: ConversationCredential, model: ConversationCredentialModel): Array<{ label: string; tone: Tone; detail?: string }> {
+  const badges: Array<{ label: string; tone: Tone; detail?: string }> = [];
   if (credential.default_model === model.id) badges.push({ label: "默认", tone: "accent" });
   if (model.reasoning?.supported || model.reasoning?.levels?.length) badges.push({ label: "推理", tone: "neutral" });
-  if (!credential.models.some((probed) => probed.id === model.id)) badges.push({ label: "未验证", tone: "warning" });
+  if (!credential.models.some((probed) => probed.id === model.id)) badges.push({
+    label: "未验证", tone: "warning",
+    detail: "此凭据下还没有该模型的成功使用记录，仍可选择。成功完成一次聊天后会自动标记为已验证，也可在设置 → Agents 中执行「真实连通测试」。刷新模型列表不会验证模型。",
+  });
   return badges;
 }
 
@@ -296,8 +299,7 @@ export function ConversationModelPicker({
 
   const boundModel = useMemo(() => {
     if (!boundCredential) return null;
-    const models = allCredentialModels(boundCredential);
-    return models.find((item) => item.id === selectedModel) || null;
+    return allCredentialModels(boundCredential).find((item) => item.id === selectedModel) || null;
   }, [boundCredential, selectedModel]);
   const currentModel = useMemo(() => {
     if (!currentCredential) return null;
@@ -346,23 +348,25 @@ export function ConversationModelPicker({
   const showEffort = variant === "conversation" && Boolean(boundCredential);
   const showAccess = variant === "conversation" && accessModes.length > 0;
 
-  useEffect(() => {
-    if (!loading && boundCredential && boundModel) {
-      rememberModelEffort(`${boundCredential.id}:${boundCredential.runtime_instance || ""}`, boundModel, selectedEffort);
-    }
-  }, [boundCredential, boundModel, loading, selectedEffort]);
-
   const choose = (patch: {
     credentialId?: string;
     model?: string;
     effort?: string;
     accessMode?: string;
-  }) => onSelect({
-    credentialId: patch.credentialId ?? currentCredential?.id ?? "",
-    model: patch.model ?? currentModel?.id ?? selectedModel,
-    effort: patch.effort ?? selectedEffort,
-    accessMode: patch.accessMode ?? selectedAccessMode,
-  });
+  }) => {
+    const selection = {
+      credentialId: patch.credentialId ?? currentCredential?.id ?? "",
+      model: patch.model ?? currentModel?.id ?? selectedModel,
+      effort: patch.effort ?? selectedEffort,
+      accessMode: patch.accessMode ?? selectedAccessMode,
+    };
+    const credential = listedCredentials.find((item) => item.id === selection.credentialId);
+    const model = credential && allCredentialModels(credential).find((item) => item.id === selection.model);
+    if (variant === "conversation" && credential && model) {
+      rememberModelEffort(`${credential.id}:${credential.runtime_instance || ""}`, model, selection.effort);
+    }
+    onSelect(selection);
+  };
 
   const toggleFavorite = (credentialId: string, modelId: string, modelLabel?: string) => {
     const key = favoriteKey(credentialId, modelId);
@@ -517,7 +521,9 @@ export function ConversationModelPicker({
               {row.model.label}
             </span>
             {badges.map((badge) => (
-              <Badge key={badge.label} tone={badge.tone} className="h-[18px] px-1.5 text-[10.5px]">{badge.label}</Badge>
+              <Tooltip key={badge.label} content={badge.detail} disabled={!badge.detail}>
+                <span><Badge tone={badge.tone} className="h-[18px] px-1.5 text-[10.5px]">{badge.label}</Badge></span>
+              </Tooltip>
             ))}
           </span>
           <span

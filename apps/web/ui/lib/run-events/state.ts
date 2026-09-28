@@ -27,7 +27,6 @@ export function emptyDeck(runId: string): DeckState {
       pocs: [],
       deadEnds: [],
       gatedFindings: [],
-      vulnReports: [],
       reviewFindings: [],
       suppressedRoutes: [],
       branches: [],

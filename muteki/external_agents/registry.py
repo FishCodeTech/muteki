@@ -113,7 +113,8 @@ class AdapterRegistry:
         if record is None:
             raise KeyError(f"unknown adapter instance: {adapter_id}:{instance_id}")
         req = request or ProbeRequest(runtime_instance_id=instance_id)
-        caps = await record.adapter.probe(req)
+        probe = getattr(record.adapter, "probe_with_environment", record.adapter.probe)
+        caps = await probe(req)
         report = getattr(record.adapter, "probe_report", lambda: None)()
         if report is None:
             report = CapabilityProbeReport(

@@ -846,7 +846,7 @@ function CredentialBindingEditor({
     setDiscoveryResult(await onDiscoverModels(selectedCredential.id, engine));
   };
   const canDiscoverModels = ENGINE_META[engine].modelDiscovery !== false;
-  const credentialCenterHref = "/task/workers?section=credentials";
+  const credentialCenterHref = "/ctf/workers?section=credentials";
 
   return (
     <div className="wbinding-editor">
@@ -2496,7 +2496,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/" }: { defaultReturnTo
     <div className="wsettings-page" data-section={section} onClickCapture={(event) => {
       if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
       const target = event.target;
-      const link = target instanceof Element ? target.closest('a[href="/task/workers?section=credentials"]') : null;
+      const link = target instanceof Element ? target.closest('a[href="/ctf/workers?section=credentials"]') : null;
       if (!link) return;
       event.preventDefault();
       selectSection("credentials");

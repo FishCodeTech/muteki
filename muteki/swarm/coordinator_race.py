@@ -2076,6 +2076,7 @@ class _RaceRunMixin:
         worker.expected_observable = str(row.get("expected_observable") or "")
         worker.stop_condition = str(row.get("stop_condition") or "")
         worker.coverage_key = str(row.get("coverage_key") or "")
+        worker.required_pocs = list(row.get("required_pocs") or [])
         worker.route_hash = str(row.get("route_hash") or "")[:180]
         worker.branch_id = str(row.get("branch_id") or "")[:180]
         worker.risk_class = str(row.get("risk_class") or "")[:80]
@@ -2100,7 +2101,7 @@ class _RaceRunMixin:
         # coordinator loop, since spawn sites only catch WorkerBudgetExhausted).
         role = profile_role or (
             "review" if mode == "review" else
-            "verifier" if mode in {"fact_verifier", "report_reproducer"} else
+            "verifier" if mode == "fact_verifier" else
             "explore" if mode == "explore" else "bootstrap")
         profile = self._profile_for_engine(engine, role=role)
         if self.worker_profiles and profile is None:
@@ -2171,7 +2172,7 @@ class _RaceRunMixin:
         # frees its max_workers slot. Their marker-only conclude pass has its own
         # bounded timeout; Race overrides both below within one total budget.
         kw = {"timeout": self.explore_timeout} if mode in ("explore", "bootstrap") else {}
-        if mode in {"fact_verifier", "report_reproducer"}:
+        if mode == "fact_verifier":
             kw["timeout"] = int(self.verifier_policy.get("timeout") or 240)
         if mode == "review":
             configured_review_timeout = int(

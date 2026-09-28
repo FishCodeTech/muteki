@@ -89,6 +89,7 @@ COMMAND_TYPES = {
     "conversation.turn.send",
     "conversation.turn.retry",
     "conversation.turn.edit_resend",
+    "conversation.turn.native_rewind",
     "conversation.turn.steer",
     "conversation.turn.interrupt",
     "conversation.turn.resume",
@@ -111,9 +112,9 @@ COMMAND_TYPES = {
 }
 
 _RUNTIME_INVOCATION_RE = re.compile(
-    r"^(?P<prefix>[/\$])(?P<name>[A-Za-z][A-Za-z0-9_.:-]*)(?:\s+(?P<args>[\s\S]*))?$"
+    r"^(?P<prefix>[/\$])(?P<name>[^\s/\\]+)(?:\s+(?P<args>[\s\S]*))?$"
 )
-_INTERNAL_COMMANDS = frozenset({"new", "clear"})
+_INTERNAL_COMMANDS = frozenset({"new", "clear", "clear-input"})
 
 
 def _failed(
@@ -173,6 +174,8 @@ class ConversationCommandHandler:
 
     async def plan(self, command: Any, ctx: HandlerContext) -> CommandPlan:
         ct = command.command_type
+        if command.aggregate_id in self._executor._history_mutations:
+            raise _failed(command, "conversation.history.busy", "正在回退聊天历史，请稍后重试", ErrorCategory.STATE)
         try:
             if ct == "conversation.project.create":
                 return self._plan_project_create(command)
@@ -734,57 +737,34 @@ class ConversationCommandHandler:
                 ErrorCategory.VALIDATION,
             )
         file_mode = str(command.payload.get("file_mode") or "keep_files")
-        manager = self._manager
-        idem = command.idempotency_key or command.command_id
-        try:
-            superseded_ids, applied = manager.native_rewind_turn(
-                thread.thread_id,
-                turn_id,
-                command_id=command.command_id,
-                idempotency_key=idem,
-                file_mode=file_mode,
-            )
-        except ConversationError as exc:
-            raise _failed(
-                command,
-                "conversation.turn.rewind_refused",
-                str(exc),
-                ErrorCategory.VALIDATION,
-            ) from exc
+        self._manager.native_rewind_turn(
+            thread.thread_id, turn_id, file_mode=file_mode, dry_run=True,
+            capability_override={"invocable": True},
+            idempotency_key=command.idempotency_key or command.command_id)
 
-        async def _noop() -> SideEffectResult:
-            return SideEffectResult(output={
-                "impact": {
-                    "mode": "native_rewind",
-                    "superseded_turn_ids": superseded_ids,
-                    "workspace_policy": file_mode,
-                    "external_side_effects": "cannot_undo",
-                    "applied": applied,
-                },
-            })
-
-        events = []
-        if applied:
-            events.append(ev.thread_event(
-                thread.thread_id,
-                ev.EV_TURN_REWOUND,
-                {
-                    "turn_id": turn_id,
-                    "superseded_turn_ids": superseded_ids,
-                    "file_mode": file_mode,
-                    "workspace_policy": file_mode,
-                    "external_side_effects": "cannot_undo",
-                },
-                actor_id=command.actor.id,
-                command_id=command.command_id,
-                correlation_id=correlation_id_of(command),
-                idempotency_key=command.idempotency_key,
-            ))
+        async def apply_rewind() -> SideEffectResult:
+            result = await self._executor.rewind_turn(
+                thread.thread_id, turn_id, command_id=command.command_id,
+                idempotency_key=command.idempotency_key or command.command_id,
+                file_mode=file_mode)
+            payload = {"turn_id": turn_id, **result, "file_mode": file_mode,
+                       "workspace_policy": file_mode, "external_side_effects": "cannot_undo"}
+            return SideEffectResult(
+                events=[ev.thread_event(
+                    thread.thread_id, ev.EV_TURN_REWOUND, payload,
+                    actor_id=command.actor.id, command_id=command.command_id,
+                    correlation_id=correlation_id_of(command),
+                    idempotency_key=command.idempotency_key or command.command_id,
+                )] if result["applied"] else [],
+                output={"impact": {"mode": "native_rewind", **payload}})
 
         return CommandPlan(
-            events=events,
+            events=[ev.thread_event(thread.thread_id, ev.EV_RUNTIME_OPERATION_REQUESTED,
+                    {"name": "rewind", "turn_id": turn_id}, actor_id=command.actor.id,
+                    command_id=command.command_id, correlation_id=correlation_id_of(command),
+                    idempotency_key=command.idempotency_key)],
             receipt=_receipt(command, ev.AGGREGATE_THREAD, thread.thread_id),
-            side_effect=_noop,
+            side_effect=apply_rewind,
         )
 
     def _plan_thread_fork(self, command: Any) -> CommandPlan:
@@ -971,6 +951,24 @@ class ConversationCommandHandler:
             )
         runtime_invocation: dict[str, Any] = {}
         invocation_match = _RUNTIME_INVOCATION_RE.fullmatch(text)
+        plugins = getattr(manager, "chat_plugins", None) if thread.mode == "conversation" else None
+        if invocation_match is not None and plugins is not None:
+            from muteki.conversation.composer_capabilities import discover_skills
+            skill_name = invocation_match.group("name")
+            managed_name = skill_name.removeprefix("muteki:")
+            managed = next((row for row in plugins.skill_rows(engine_for_adapter(adapter_id))
+                            if row["name"].casefold() == managed_name.casefold()), None)
+            workspace_for_skill = manager.get_workspace(str(thread.workspace_id)) if thread.workspace_id else None
+            native_names = {row["name"].casefold() for row in discover_skills(
+                engine_for_adapter(adapter_id), workspace_for_skill.root_path if workspace_for_skill else "")}
+            if managed is not None and (skill_name.startswith("muteki:") or skill_name.casefold() not in native_names):
+                managed = {**managed, "arguments": str(invocation_match.group("args") or "")}
+                if managed.get("native_engine"):
+                    text = "/" + managed["native_name"] + (" " + managed["arguments"] if managed["arguments"] else "")
+                    invocation_match = _RUNTIME_INVOCATION_RE.fullmatch(text)
+                else:
+                    capability_refs_payload = [*(capability_refs_payload if isinstance(capability_refs_payload, list) else []), managed]
+                    invocation_match = None
         if invocation_match is not None:
             name = invocation_match.group("name")
             prefix = invocation_match.group("prefix")
@@ -1018,7 +1016,7 @@ class ConversationCommandHandler:
                 if item is not None and item.kind == "operation" and item.resolution == "client":
                     async def _runtime_operation() -> SideEffectResult:
                         result = await executor.runtime_operation(
-                            thread.thread_id, item.name)
+                            thread.thread_id, item.name, arguments)
                         return SideEffectResult(
                             events=[ev.thread_event(
                                 thread.thread_id,
@@ -1069,6 +1067,7 @@ class ConversationCommandHandler:
                 engine=engine_for_adapter(adapter_id),
                 workspace_root=str(workspace.root_path if workspace is not None else ""),
                 extension_service=manager.extension_service,
+                plugin_service=getattr(manager, "chat_plugins", None) if thread.mode == "conversation" else None,
                 threads=manager.list_threads(),
                 message_loader=manager.conv.list_current_messages,
                 message_lookup=manager.conv.get_message,

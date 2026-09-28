@@ -40,7 +40,7 @@ import subprocess
 import sys
 from typing import Any
 
-from fastapi import APIRouter, Body, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import HTTPException, APIRouter, Body, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -507,6 +507,8 @@ def create_conversation_router(
             threads=service.manager.list_threads(body.project_id),
             current_thread_id=body.thread_id,
             runtime_snapshot=runtime_snapshot,
+            plugin_service=(getattr(service.manager, "chat_plugins", None)
+                            if not body.thread_id or thread.mode == "conversation" else None),
         )
         matrix_payload = None
         if body.thread_id:
@@ -1876,43 +1878,29 @@ def create_conversation_router(
 
     @router.post("/api/threads/{thread_id}/compact")
     async def compact_thread(thread_id: str) -> Any:
-        """C27: Request native context compaction for this thread.
-
-        Returns 501 when the active Runtime does not declare compaction support.
-        When supported, emits a ``core.context.window`` event with
-        ``compact_status=running`` and returns ``{"status": "accepted"}``.
-        The adapter is responsible for emitting the completion event
-        (``compact_status=done`` or ``compact_status=failed``) once it finishes.
-        """
+        """Invoke the verified native operation, then publish actual completion."""
+        thread = service.manager.get_thread(thread_id)
+        if thread is None:
+            raise HTTPException(404, "对话不存在")
+        state = service.conv.get_state(thread_id)
+        if state.running_turn_id or service.conv.active_turn_id(thread_id):
+            raise HTTPException(409, "请等待当前回复结束后再压缩")
         try:
-            view = await command_api.query(_query(
-                "conversation.thread.view", "thread", thread_id,
-                thread_id=thread_id, mark_read=False))
-        except CommandAPIError as exc:
-            status = 404 if exc.error.category is ErrorCategory.NOT_FOUND else 400
-            return JSONResponse(_error_body(exc), status_code=status)
-        result = view.result or {}
-        rt_conn = result.get("runtime_connection") or {}
-        caps = rt_conn.get("capabilities") or {}
-        compaction_supported = bool(caps.get("compaction"))
-        if not compaction_supported:
-            return JSONResponse(
-                {
-                    "error": {
-                        "code": "conversation.compact.unsupported",
-                        "message": "当前 Runtime 不支持原生上下文压缩",
-                        "category": "unsupported",
-                    }
-                },
-                status_code=501,
-            )
-        # Emit a context-window event marking compaction as in-progress.
-        service.manager.emit_context_window_event(
-            thread_id,
-            compact_status="running",
-            source="manual_compact",
-        )
-        return {"status": "accepted", "thread_id": thread_id}
+            snapshot = await service.executor.runtime_capabilities(thread_id)
+        except (RuntimeError, LookupError):
+            raise HTTPException(409, "会话尚未就绪，请稍后重试") from None
+        supported = any(item.name == "compact" and item.kind == "operation"
+                        and item.verification == "verified" for item in snapshot.items)
+        if not supported:
+            raise HTTPException(501, "当前 Runtime 不支持结构化上下文压缩，请使用它公布的原生命令")
+        service.manager.emit_context_window_event(thread_id, compact_status="running", source="manual_compact")
+        try:
+            result = await service.executor.runtime_operation(thread_id, "compact")
+        except Exception:
+            service.manager.emit_context_window_event(thread_id, compact_status="failed", source="manual_compact")
+            raise HTTPException(400, "原生压缩未完成，请查看运行时状态后重试") from None
+        service.manager.emit_context_window_event(thread_id, compact_status="done", source="manual_compact")
+        return {"status": result.get("status", "completed"), "thread_id": thread_id, "result": result}
 
     @router.get("/api/threads/{thread_id}/user-input-fixture-capture")
     async def user_input_fixture_capture(thread_id: str) -> Any:

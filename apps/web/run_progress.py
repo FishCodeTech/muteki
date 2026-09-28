@@ -233,26 +233,6 @@ class RunProgressPublisher:
             changed |= self._append_unique(
                 self._confirmed, _item(summary, ref=_ref("finding", ev.seq)))
             urgent = "milestone"
-        elif kind == "report_submitted":
-            report_id = str(p.get("report_id") or ev.seq)
-            changed |= self._put_bounded(
-                self._candidates, f"report:{report_id}",
-                _item(p.get("title") or report_id, ref=_ref("report", report_id)),
-            )
-        elif kind in {"report_reproduced", "report_accepted"}:
-            report_id = str(p.get("report_id") or ev.seq)
-            row = self._candidates.pop(f"report:{report_id}", None) or _item(
-                p.get("title") or report_id, ref=_ref("report", report_id))
-            changed |= self._append_unique(self._confirmed, row)
-            urgent = "milestone" if kind == "report_accepted" else None
-        elif kind in {"report_rejected", "report_repro_failed", "report_value_rejected", "finding_rejected"}:
-            report_id = str(p.get("report_id") or ev.seq)
-            self._candidates.pop(f"report:{report_id}", None)
-            changed |= self._append_unique(
-                self._blocked,
-                _item(p.get("reason") or p.get("detail") or kind,
-                      ref=_ref("report", report_id)),
-            )
         elif kind in {"awaiting_operator", "need_input"}:
             changed |= self._set_phase("paused")
             changed |= self._append_unique(

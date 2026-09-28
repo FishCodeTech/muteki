@@ -16,6 +16,7 @@ import remarkMath from "remark-math";
 import type { PluggableList } from "unified";
 import { remarkChatMath } from "@/lib/chatMath";
 import { ChatMath } from "./ChatMath";
+import { ChatVisualization, parseVisualization } from "./ChatVisualization";
 import { cn } from "@/lib/cn";
 import { Icon } from "@/components/Icon";
 import { languageLabel } from "@/components/chat/ui";
@@ -304,13 +305,17 @@ export function ChatMarkdown({ text, streaming = false, threadId, onResourceLink
       className={cn("cx-prose", size === "sm" && "cx-prose-sm", className)}
       data-streaming={streaming ? "true" : undefined}
     >
-      {blocks.map((block, index) => (
+      {blocks.map((block, index) => {
+        const visual = threadId ? parseVisualization(block) : null;
+        if (visual && threadId) return <ChatVisualization key={index} threadId={threadId} {...visual} streaming={streaming} />;
+        return (
         <MarkdownBlock
           key={index}
           text={block}
           components={tailOpenFence && index === blocks.length - 1 ? tailComponents : components}
         />
-      ))}
+        );
+      })}
     </div>
   );
 }

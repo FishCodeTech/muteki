@@ -77,7 +77,7 @@ export type WorkerConnectionKind = "official" | "custom_endpoint" | "system";
 /** The runtime panel's secondary detail views (the conversation stays primary). */
 export type ArtifactView =
   | "usage" | "collaboration" | "workers" | "timeline" | "evidence"
-  | "findings" | "reports" | "credentials" | "pocs" | "routes" | "directives";
+  | "findings" | "credentials" | "pocs" | "routes" | "directives";
 
 /** Per-solver derived view the deck renders (the "race" lanes). */
 export interface SolverLane {
@@ -370,6 +370,7 @@ export type FactLifecycleState =
   | "rejected" | "merged" | "superseded";
 
 export interface FactEvidenceProvenance {
+  target?: string;
   artifactRefs?: {
     artifactId: string;
     sha256?: string;
@@ -551,56 +552,8 @@ export interface BlackboardGatedFinding {
   actor: string;
   ts: number;
 }
-export type VulnReportStatus =
-  | "submitted"
-  | "repro_failed"
-  | "reproduced"
-  | "accepted"
-  | "rejected";
-export interface ReportHistoryEntry {
-  status: VulnReportStatus;
-  ts: number;
-  actor: string;
-  eventSeq: number;
-  reason?: string;
-}
-export interface BlackboardVulnReport {
-  id: string;
-  title: string;
-  findingClass: string;
-  resourceId: string;
-  impactWho?: string;
-  impactWhat?: string;
-  witness?: string;
-  vector?: string;
-  goalQualified?: boolean;
-  goalCode?: string;
-  goalDetail?: string;
-  reproVerifier?: string;
-  reproCommand?: string;
-  reproTarget?: string;
-  reproResponseSummary?: string;
-  reproEvidence?: Record<string, unknown>;
-  replayCommand?: string;
-  steps?: string[];
-  preconditions?: string;
-  affectedRole?: string;
-  narrative?: string;
-  markdown?: string;
-  status: VulnReportStatus;
-  code?: string;
-  reason?: string;
-  actor: string;
-  ts: number;
-  eventSeq?: number;
-  intentId?: string;
-  submitter?: string;
-  history: ReportHistoryEntry[];
-}
-
 export type BlackboardTruncation = {
   facts?: boolean;
-  reports?: boolean;
   reviews?: boolean;
   pocs?: boolean;
   routes?: boolean;
@@ -613,20 +566,11 @@ export {
   DIRECTIVE_CAP,
   FACT_CAP,
   POC_CAP,
-  REPORT_CAP,
   REVIEW_CAP,
   ROUTE_CAP,
-  applyReportTransition,
-  canAdvanceReportStatus,
   capPush,
   markTruncated,
-  mergeVulnReportFields,
-  patchReportStatus,
-  stringField,
-  stringListField,
-  upsertVulnReport,
-  vulnReportPatch,
-} from "./report-projection";
+} from "./projection-limits";
 
 export interface BlackboardSuppressedRoute {
   routeHash: string;
@@ -740,7 +684,6 @@ export interface BlackboardView {
   pocs: BlackboardPoc[];
   deadEnds: BlackboardDeadEnd[];
   gatedFindings: BlackboardGatedFinding[];
-  vulnReports: BlackboardVulnReport[];
   reviewFindings: BlackboardReviewFinding[];
   suppressedRoutes: BlackboardSuppressedRoute[];
   branches: BlackboardBranch[];

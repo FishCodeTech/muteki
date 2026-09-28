@@ -249,9 +249,8 @@ class StdioJsonlPeer:
         """拉起子进程并启动 stdout reader task。"""
         if self.running:
             return
-        env = None
-        if self.env is not None:
-            env = {**os.environ, **self.env}
+        from .probe_environment import subprocess_environment
+        env = subprocess_environment(self.env)
         self._proc = await asyncio.create_subprocess_exec(
             *self.argv,
             stdin=asyncio.subprocess.PIPE,

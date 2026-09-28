@@ -224,15 +224,8 @@ async def progress_guard_stage(self, state) -> str:
         # Candidate text and activity are useful telemetry, but letting
         # them reset this cursor creates an infinite self-reward loop.
         information_count = self._verified_fact_count()
-        pentest_product = (
-            getattr(self.challenge, "mode", "ctf") == "pentest"
-            and not self._pentest_flag_required()
-        )
-        if pentest_product:
-            grew = len(getattr(self, "_found_reports", []) or []) > state.prog_report_ckpt
-        else:
-            grew = (information_count > state.prog_fact_ckpt
-                    or len(self._found_flags) > state.prog_flag_ckpt)
+        grew = (information_count > state.prog_fact_ckpt
+                or len(self._found_flags) > state.prog_flag_ckpt)
         state.fruitless_workers = (0 if grew
                              else state.fruitless_workers + state.reaped_n)
         if grew:
@@ -243,9 +236,6 @@ async def progress_guard_stage(self, state) -> str:
             state.last_progress_t = time.monotonic()  # H: reset no-progress timer
         state.prog_fact_ckpt = max(state.prog_fact_ckpt, information_count)
         state.prog_flag_ckpt = max(state.prog_flag_ckpt, len(self._found_flags))
-        state.prog_report_ckpt = max(
-            state.prog_report_ckpt,
-            len(getattr(self, "_found_reports", []) or []))
 
     if state.completed_for_review_n:
         self._completed_workers_since_review += state.completed_for_review_n

@@ -211,11 +211,13 @@ export function Switch({
   className?: string;
 }) {
   const track = size === "sm" ? "h-4 w-7" : "h-5 w-9";
+  const labelId = useId();
   const knob = size === "sm" ? "size-3 data-[on=true]:translate-x-3" : "size-4 data-[on=true]:translate-x-4";
   const control = (
     <button
       type="button"
       role="switch"
+      aria-labelledby={label ? labelId : undefined}
       aria-checked={checked}
       disabled={disabled}
       onClick={() => onCheckedChange(!checked)}
@@ -235,7 +237,7 @@ export function Switch({
   return (
     <div className={cn("flex items-center justify-between gap-4", className)}>
       <span className="flex min-w-0 flex-col">
-        <span className="text-[13px] text-cx-fg">{label}</span>
+        <span id={labelId} className="text-[13px] text-cx-fg">{label}</span>
         {description ? <span className="text-[12px] leading-4 text-cx-fg-3">{description}</span> : null}
       </span>
       {control}

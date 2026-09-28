@@ -56,11 +56,6 @@ from muteki.swarm.graph_defs import (  # noqa: E402,F401
     EV_FLAG_SUBMISSION_DECISION,
     EV_FINDING_FOUND,
     EV_FINDING_INVALIDATED,
-    EV_REPORT_SUBMITTED,
-    EV_REPORT_REJECTED,
-    EV_REPORT_REPRO_DECISION,
-    EV_REPORT_VALUE_DECISION,
-    EV_REPORT_ACCEPTED,
     EV_POC_SAVED,
     EV_POC_CLAIMED,
     EV_POC_CONCLUDED,
@@ -528,7 +523,6 @@ from muteki.swarm.graph_schema import SCHEMA as _SCHEMA  # noqa: E402
 # SQLiteSharedGraph's methods are split into responsibility mixins (code-health G1);
 # they are composed back into the class below, so behavior is unchanged.
 from muteki.swarm.graph_facts import _FactsMixin  # noqa: E402
-from muteki.swarm.graph_reports import _ReportsMixin  # noqa: E402
 from muteki.swarm.graph_routes import _RoutesDirectivesMixin  # noqa: E402
 from muteki.swarm.graph_locks import _LanesLocksMixin  # noqa: E402
 from muteki.swarm.graph_intents import _IntentsPocsMixin  # noqa: E402
@@ -539,7 +533,6 @@ from muteki.swarm.graph_capabilities import _CapabilitiesMixin  # noqa: E402
 
 class SQLiteSharedGraph(
     _FactsMixin,
-    _ReportsMixin,
     _RoutesDirectivesMixin,
     _LanesLocksMixin,
     _IntentsPocsMixin,
@@ -798,6 +791,34 @@ class SQLiteSharedGraph(
             else:
                 self._conn.commit()
             return seq
+
+    def record_pentest_goal_completion(
+        self, *, fact_seqs: list[int], reason: str,
+    ) -> int:
+        """Durably commit a Decide verdict only when its cited Facts are grounded."""
+        contract = getattr(self.challenge, "pentest_contract", None)
+        if contract is None:
+            return -1
+        from muteki.pentest.judgement import GOAL_COMPLETED, goal_evidence_valid
+        cited = list(dict.fromkeys(int(seq) for seq in fact_seqs))
+        if not goal_evidence_valid(self.events(), contract, cited):
+            return -1
+        return self._append(
+            GOAL_COMPLETED, "coordinator",
+            {"fact_seqs": cited, "reason": str(reason or "")},
+            verified=True,
+            dedupe_key=f"pentest-goal::{self.challenge.id}",
+        )
+
+    def record_pentest_report(
+        self, *, payload: dict, error: bool = False,
+    ) -> int:
+        from muteki.pentest.judgement import REPORT_FAILED, REPORT_GENERATED
+        kind = REPORT_FAILED if error else REPORT_GENERATED
+        return self._append(
+            kind, "coordinator", dict(payload),
+            verified=not error,
+        )
 
 
 # ── GRAPH-01: GraphService adapter 接线（新增，不改变既有行为） ──────────────

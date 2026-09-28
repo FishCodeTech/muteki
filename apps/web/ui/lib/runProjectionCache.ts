@@ -2,8 +2,9 @@ import type { DeckState } from "./events";
 
 const DATABASE_NAME = "muteki-run-projections";
 const DATABASE_VERSION = 1;
-// Version 5 replays older snapshots to populate per-worker prompt history.
-const SNAPSHOT_VERSION = 5;
+// Rebuild stored projections after the mode-specific event rendering changes,
+// including Pentest Fact target provenance used in the evidence workspace.
+const SNAPSHOT_VERSION = 7;
 const STORE_NAME = "snapshots";
 const MAX_SNAPSHOTS = 6;
 

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from muteki.solver.cli_driver import KB_MCP_NAME
-from muteki.solver.vuln_report import _PENTEST_REPORT_BLOCK
 
 _BLACKBOARD_PROTOCOL = (
     "## Blackboard protocol\n"
@@ -33,6 +32,24 @@ _CTF_WORKER_SYSTEM = """完成交给你的一个 step。根据真实工具反馈
 - 读取最新整图: `python3 "$MUTEKI_BLACKBOARD_SCRIPT" context`
 - 核对图中引用的原始工具输出: `python3 "$MUTEKI_BLACKBOARD_SCRIPT" read-artifact '<artifact ID>'`
 真实输出出现候选 Flag 时立即原样 submit-flag；只有另有确认的新结论才提交 Fact。"""
+
+_PENTEST_FGS_WORKER_SYSTEM = """你是授权渗透测试 Worker，只执行分配的一个有界 Step。
+先读取共享 Fact–Goal–Step 图和授权范围。可联网查阅公开文档、漏洞资料和工具说明，但只对明确授权的目标执行渗透测试；不要把外部资料站点当成测试目标。公开资料只能帮助提出假设，不能替代本次目标的工具证据。不进行破坏性测试、持久化或横向移动。若范围或授权有歧义，立即 request-input。
+依据真实工具输出记录结论。先用 recent-evidence 取得本 Step 的工具 artifact ID；确认的新事实用 submit-fact --evidence 引用一份亲自检查过的输出，再 commit-step。有界阴性结果用 mark-deadend，写清测试范围和实际观察。未完成、不可达或工具故障不能伪装成阴性或 Fact。
+记录受影响资源、测试身份、实际观察与边界；标题用自然语言准确描述事实。是否需要进一步复核由 Coordinator 根据图中证据决定。只执行当前 Step，不扩展到别的资产。"""
+
+_PENTEST_FGS_EXPLORE_PROMPT = (
+    "执行当前授权渗透测试 Step。\n\n{ctx}\n\n"
+    "## 当前方向\n{intent_goal}\n\n"
+    "只在图内授权范围测试。根据真实输出决定下一步；有界阴性结果记录为 dead-end。"
+    "候选漏洞记录证据和影响，确认可复用的新事实才 submit-fact、commit-step。"
+    "不要提交 Flag 或旧版报告 JSON；宿主会依据证据生成报告和裁定。\n\n"
+    "团队操作：`python3 \"$MUTEKI_BLACKBOARD_SCRIPT\" context` 查看图；"
+    "`python3 \"$MUTEKI_BLACKBOARD_SCRIPT\" recent-evidence` 列出本 Step 的工具证据；"
+    "`python3 \"$MUTEKI_BLACKBOARD_SCRIPT\" submit-fact '<标题>' '<证据及边界>' --evidence '<artifact ID>'` 起草事实；"
+    "`python3 \"$MUTEKI_BLACKBOARD_SCRIPT\" commit-step` 定稿；"
+    "`python3 \"$MUTEKI_BLACKBOARD_SCRIPT\" mark-deadend '<原因>' --tested '<范围>' --observed '<结果>'` 记录阴性。"
+)
 
 _CTF_BLACKBOARD_PROTOCOL = (
     "团队操作：`python3 \"$MUTEKI_BLACKBOARD_SCRIPT\" context` 读取最新整图；"
@@ -169,31 +186,6 @@ _RESPOND_WRITEUP_PROMPT = (
     "Keep it tight and technical. Output ONLY the markdown writeup, nothing else."
 )
 
-_RESPOND_PENTEST_WRITEUP_PROMPT = (
-    "Write a concise penetration-testing report in Chinese for the engagement you "
-    "just completed. Base it ONLY on evidence confirmed this session. "
-    "Do not run commands, call tools, search the filesystem, or continue the "
-    "investigation. Synthesize the report from the confirmed session history now. "
-    "Structure it as:\n  ## 范围与目标\n  ## 已确认发现\n  ## 复现步骤\n  ## 影响与修复建议\n"
-    "Do not invent findings, commands, requests, or impact. Output ONLY markdown."
-)
-
-_PENTEST_EXEC_PROMPT = (
-    "You are an expert penetration tester with a FULL shell and common security "
-    "tooling.\n\n"
-    "{ctx}\n"
-    "{kb}\n"
-    "## Engagement goal\n{goal}\n\n"
-    "## Scope / authorization — operate STRICTLY within this\n{scope}\n\n"
-    "Work against the live in-scope target using real requests or commands. Use only "
-    "credentials actually supplied by the operator. Save important evidence in the "
-    "worker workspace and cite it in shared facts and reports. Do not inspect parent "
-    "directories or the Muteki source tree. Attached source files explicitly listed "
-    "in the task may be reviewed; no other local source is in scope.\n\n"
-    f"{_PENTEST_REPORT_BLOCK}"
-    f"{_BLACKBOARD_PROTOCOL}"
-)
-
 _KB_PROMPT = (
     f"\nYou ALSO have a `{KB_MCP_NAME}` knowledge-base tool (a searchable security "
     "knowledge base — e.g. tools, CVEs/PoCs, repos, payload helpers). Call it only "
@@ -201,24 +193,6 @@ _KB_PROMPT = (
     "materially shorten the assigned work. Do not browse it aimlessly or paste large "
     "dumps.\n"
 ) if KB_MCP_NAME else ""
-
-_PENTEST_EXPLORE_PROMPT = (
-    "You are an expert penetration tester with a FULL shell and common security "
-    "tooling.\n\n"
-    "{ctx}\n"
-    "{kb}\n"
-    "## Engagement goal\n{goal}\n\n"
-    "## Scope / authorization — operate STRICTLY within this\n{scope}\n\n"
-    "{box}\n\n"
-    "## Assigned direction\n{intent_goal}\n\n"
-    "Work ONLY on this direction against the live in-scope target. Send real requests "
-    "or commands, save important evidence, and stop when the step contract is "
-    "satisfied or the bounded direction has been conclusively exhausted. Attached "
-    "source files explicitly listed in the task may be reviewed; no other local "
-    "source is in scope.\n\n"
-    f"{_PENTEST_REPORT_BLOCK}"
-    f"{_BLACKBOARD_PROTOCOL}"
-)
 
 _RESPOND_ASK_PROMPT = (
     "The operator has a follow-up about the challenge you just worked. Answer it "
@@ -249,10 +223,9 @@ __all__ = [
     '_CTF_FACT_VERIFY_PROMPT',
     '_REVIEW_PROMPT',
     '_RESPOND_WRITEUP_PROMPT',
-    '_RESPOND_PENTEST_WRITEUP_PROMPT',
-    '_PENTEST_EXEC_PROMPT',
     '_KB_PROMPT',
-    '_PENTEST_EXPLORE_PROMPT',
+    '_PENTEST_FGS_WORKER_SYSTEM',
+    '_PENTEST_FGS_EXPLORE_PROMPT',
     '_RESPOND_ASK_PROMPT',
     '_RESPOND_MARK_FALSE_PROMPT',
     '_CTF_WORKER_SYSTEM',

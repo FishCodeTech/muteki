@@ -186,7 +186,7 @@ export const KnowledgeRow = memo(function KnowledgeRow({ item, actor, selected, 
 
 export function KnowledgeDetail({
   item, actor, proposer, verifier, knowledge = [], intents = [],
-  onSelectKnowledge, onOpenFact, onOpenPoc, onOpenReport, onOpenAgentKnowledge, onClose,
+  onSelectKnowledge, onOpenFact, onOpenPoc, onOpenAgentKnowledge, onClose,
   mode,
 }: {
   item: CollaborationKnowledgeItem;
@@ -198,7 +198,6 @@ export function KnowledgeDetail({
   onSelectKnowledge?: (item: CollaborationKnowledgeItem) => void;
   onOpenFact?: (seq: number) => void;
   onOpenPoc?: (id: string) => void;
-  onOpenReport?: (id: string) => void;
   onOpenAgentKnowledge?: () => void;
   onClose?: () => void;
   mode?: RunCanvasMode;
@@ -206,7 +205,6 @@ export function KnowledgeDetail({
   const t = useT();
   const [copied, copy] = useCopied();
   const pocId = item.kind === "poc" ? item.id.slice(4) : "";
-  const reportId = item.kind === "report" ? item.id.slice(7) : "";
   const factSeq = item.factSeq;
   const copyText = item.kind === "flag" ? item.title : (item.detail || item.title);
   const copyLabel = item.kind === "flag" ? t("common.copyFlag") : t("common.copyShort");
@@ -280,11 +278,6 @@ export function KnowledgeDetail({
         {pocId && onOpenPoc && (
           <Button size="sm" variant="ghost" onClick={() => onOpenPoc(pocId)}>
             <Icon name="terminal" size={12} />{t("collab.action.openPoc")}
-          </Button>
-        )}
-        {reportId && onOpenReport && (
-          <Button size="sm" variant="ghost" onClick={() => onOpenReport(reportId)}>
-            <Icon name="list" size={12} />{t("collab.action.openReport")}
           </Button>
         )}
         {onOpenAgentKnowledge && (

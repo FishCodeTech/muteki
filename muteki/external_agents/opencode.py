@@ -379,10 +379,14 @@ class OpenCodeServerAdapter(BaseExternalAgentAdapter):
         port = port or _pick_free_port()
         base_url = f"http://127.0.0.1:{port}"
         process_cwd = os.path.abspath(cwd or os.getcwd())
+        from .probe_environment import subprocess_environment
+        argv = self._serve_argv(port)
+        if (env or {}).get("MUTEKI_CHAT_PRIVATE_ROOT"):
+            argv = [value for value in argv if value != "--pure"]
         proc = await asyncio.create_subprocess_exec(
-            *self._serve_argv(port),
+            *argv,
             cwd=process_cwd,
-            env={**os.environ, **self._server_env(env), "PWD": process_cwd},
+            env=subprocess_environment({**self._server_env(env), "PWD": process_cwd}),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -1162,6 +1166,32 @@ class OpenCodeServerAdapter(BaseExternalAgentAdapter):
             payload={"finish": (info or {}).get("finish") or "stop"},
             **common))
 
+    async def runtime_operation(self, session: AgentSessionRef, name: str, arguments: str = "") -> dict[str, Any]:
+        handle = self._sessions.get(session.agent_session_id)
+        if not handle or handle.get("current_turn_id"):
+            raise RuntimeError("请等待当前回复结束后再压缩")
+        name = name.strip().lstrip("/")
+        if arguments:
+            raise ValueError(f"/{name} 不接受参数")
+        paths = {"mcp": "/mcp", "agents": "/agent", "status": f"/session/{handle['external_session_id']}"}
+        if name in paths:
+            return {"status": "completed", "result": await handle["client"].get(paths[name])}
+        if name not in {"compact", "summarize"}:
+            raise RuntimeError("未知原生操作")
+        model = str(handle.get("model") or "")
+        provider = str((handle.get("options") or {}).get("env", {}).get("MUTEKI_OPENCODE_PROVIDER") or "")
+        if not provider and "/" in model:
+            provider, model = model.split("/", 1)
+        if not provider or not model:
+            raise RuntimeError("当前模型未提供 OpenCode 压缩所需的 provider/model")
+        result = await handle["client"].post(
+            f"/session/{handle['external_session_id']}/summarize",
+            {"providerID": provider, "modelID": model}, timeout=180,
+        )
+        if result is not True:
+            raise RuntimeError("OpenCode 未确认压缩完成")
+        return {"status": "completed", "message": "上下文已由 OpenCode 原生压缩"}
+
     async def runtime_capability_snapshot(
         self, session: Optional[AgentSessionRef] = None
     ) -> RuntimeCapabilitySnapshot:
@@ -1201,9 +1231,28 @@ class OpenCodeServerAdapter(BaseExternalAgentAdapter):
             handle.get("capability_revision") or 0
         ) + 1
         items: list[RuntimeCapabilityItem] = []
+        model = str(handle.get("model") or "")
+        provider = str((handle.get("options") or {}).get("env", {}).get("MUTEKI_OPENCODE_PROVIDER") or "")
+        if model and (provider or "/" in model):
+            items.append(RuntimeCapabilityItem(
+                id=f"runtime:{self.id}:operation:compact", kind="operation", name="compact",
+                description="由 OpenCode 原生压缩当前上下文", source=self.id, scope="session",
+                engine="opencode", channel="app_server_rpc", resolution="client",
+                origin="verified_static", delivery="guaranteed", verification="verified",
+                action="invoke-runtime-operation", invocation={"method": "session.summarize"},
+            ))
+        from .command_providers import operation_item
+        for name, method, description in (("mcp", "mcp.status", "查看 OpenCode MCP 连接状态"),
+                                          ("agents", "agent.list", "查看 OpenCode 可用 Agent"),
+                                          ("status", "session.get", "查看 OpenCode 会话状态")):
+            items.append(operation_item(self.id, "opencode", name, method, description))
+        compact = next((item for item in items if item.name == "compact"), None)
+        if compact:
+            items.append(compact.model_copy(update={"id": f"runtime:{self.id}:operation:summarize", "name": "summarize"}))
+        operation_names = {item.name for item in items}
         for command in commands:
             name = str(command.get("name") or "").strip().lstrip("/")
-            if not name:
+            if not name or name in operation_names:
                 continue
             description = str(
                 command.get("description") or command.get("template") or ""

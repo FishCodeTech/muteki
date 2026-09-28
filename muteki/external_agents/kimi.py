@@ -202,6 +202,10 @@ class KimiAcpAdapter(BaseAcpAdapter):
                 if item.is_symlink() and not item.exists():
                     continue
                 destination = target / item.name
+                if env.get("MUTEKI_CHAT_PRIVATE_ROOT") and destination.is_symlink():
+                    private = Path(env["MUTEKI_CHAT_PRIVATE_ROOT"]).resolve()
+                    if not destination.resolve().is_relative_to(private):
+                        destination.unlink()
                 if destination.exists() or destination.is_symlink():
                     continue
                 try:
@@ -370,10 +374,11 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
                 "manage_server=False 时必须提供 base_url")
         port = self._port or DEFAULT_SERVER_PORT
         base_url = f"http://127.0.0.1:{port}"
+        from .probe_environment import subprocess_environment
         proc = await asyncio.create_subprocess_exec(
             *self._serve_argv(port),
             cwd=cwd or None,
-            env={**os.environ, **self._server_env(env)},
+            env=subprocess_environment(self._server_env(env)),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )

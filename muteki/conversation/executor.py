@@ -27,7 +27,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from muteki.external_agents.registry import AdapterRegistry
 from muteki.external_agents.interaction_matrix import (
@@ -68,7 +68,7 @@ from .attachment_delivery import (
     resolve_attachments,
     thread_authorized_sha256s,
 )
-from .composer_capabilities import resolve_capability_refs
+from .composer_capabilities import ComposerCapabilityError, resolve_capability_refs
 from .manager import ConversationManager
 from .models import (
     TURN_COMPLETED,
@@ -83,7 +83,6 @@ from .models import (
 )
 from .session_handoff import (
     REASON_RESTART,
-    REASON_RETRY,
     RECOVERY_NATIVE_RESUME,
     RECOVERY_STRUCTURED_HANDOFF,
     SessionHandoffBundle,
@@ -185,9 +184,13 @@ class ExternalAgentSessionExecutor:
         self._tasks: dict[str, asyncio.Task] = {}
         self._stop_fences: dict[str, asyncio.Event] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._runtime_operations: set[str] = set()
+        self._history_mutations: set[str] = set()
         self._queue_locks: dict[str, asyncio.Lock] = {}
         # 本进程内已 start 的 AgentSession（重启后需经 resume_handle 接管）
         self._live: set[str] = set()
+        self._chat_revisions: dict[str, str] = {}
         # Codex 等 Runtime 会在同一轮的多个 item 完成节点重复上报同一份
         # workspace diff。Artifact 本体虽然按摘要去重，事件仍会重复进入界面。
         self._emitted_workspace_artifacts: set[tuple[str, str]] = set()
@@ -199,6 +202,13 @@ class ExternalAgentSessionExecutor:
         self._capability_failures: dict[str, dict[str, Any]] = {}
         # thread_id → pending structured handoff for next AgentInput
         self._pending_handoff: dict[str, SessionHandoffBundle] = {}
+        self._model_success_recorder: Optional[Callable[[dict[str, str]], None]] = None
+
+    def bind_model_success_recorder(
+        self, recorder: Callable[[dict[str, str]], None],
+    ) -> None:
+        """Let the host persist model availability proven by a real chat turn."""
+        self._model_success_recorder = recorder
 
     @staticmethod
     def _selection_snapshot(selection: Any) -> dict[str, str]:
@@ -371,28 +381,37 @@ class ExternalAgentSessionExecutor:
     async def ensure_capability_session(
         self, thread_id: str
     ) -> tuple[Any, AgentSessionRef]:
+        async with self._session_locks.setdefault(thread_id, asyncio.Lock()):
+            return await self._ensure_capability_session(thread_id)
+
+    async def _ensure_capability_session(
+        self, thread_id: str, *, fresh: bool = False
+    ) -> tuple[Any, AgentSessionRef]:
         """为能力目录建立真实 Runtime session，但不产生模型 Turn。"""
         thread = self._manager.get_thread(thread_id)
         if thread is None:
             raise LookupError(f"unknown thread: {thread_id}")
+        await self._recover_history_mutation(thread_id)
         selection = self._manager.runtime_selection(thread_id)
         if not selection.adapter_id:
             raise LookupError(f"thread {thread_id} 未选择 Runtime instance")
         state = self._conv.get_state(thread_id)
         # #122: never close/replace the live turn's session for a capability probe.
         turn_busy = bool(
-            state.running_turn_id or self._conv.active_turn_id(thread_id)
+            state.running_turn_id or self._conv.active_turn_id(thread_id) or thread_id in self._runtime_operations
         )
         record = self._session_record(thread_id)
+        previous_record = record
+        if fresh:
+            record = None
         if turn_busy:
             if record is None or record.closed_at is not None:
                 raise LookupError(
                     f"thread {thread_id} 有执行中的 Turn，但没有可复用的 AgentSession"
                 )
-            adapter = self._adapter_for(
-                selection.adapter_id, selection.instance_id)
             if record.agent_session_id not in self._live:
-                self._live.add(record.agent_session_id)
+                raise LookupError("会话正在建立，请等待能力目录刷新")
+            adapter = self._adapter_for(record.adapter_id, record.runtime_instance_id or "default")
             return adapter, self._ref_from_record(record)
         same_selection = False
         if record is not None:
@@ -407,6 +426,7 @@ class ExternalAgentSessionExecutor:
                     and state.session_runtime_key in {"", old_key}
                 )
             )
+            same_selection = same_selection and self._chat_revision_matches(thread, record)
             if record.closed_at is None and same_selection:
                 adapter = self._adapter_for(
                     selection.adapter_id, selection.instance_id)
@@ -450,6 +470,19 @@ class ExternalAgentSessionExecutor:
             "credential_id": selection.credential_id,
             "capability_discovery": True,
         }
+        plugins = getattr(self, "chat_plugins", None)
+        if plugins is not None and thread.mode == "conversation":
+            if not options["cwd"]:
+                options["cwd"] = str(plugins.visualization_root(thread.thread_id).parent)
+            options["chat_tools"] = await plugins.prepare_tools(engine)
+            options["chat_control_enabled"] = plugins.control_enabled(engine)
+            credential_env = await asyncio.to_thread(
+                plugins.prepare_environment, engine,
+                thread_id + ":" + selection.credential_id,
+                credential_env,
+            )
+        if plugins is not None and thread.mode == "conversation":
+            options.update(await asyncio.to_thread(plugins.native_launch_options, engine, credential_env))
         if credential_env:
             options["env"] = credential_env
         resume = record if record is not None and same_selection else None
@@ -457,7 +490,7 @@ class ExternalAgentSessionExecutor:
             **({"agent_session_id": resume.agent_session_id}
                if resume is not None else {}),
             thread_id=thread_id,
-            execution_generation=state.current_generation,
+            execution_generation=state.current_generation + int(fresh),
             workspace_id=thread.workspace_id,
             resume_handle=resume.resume_handle if resume is not None else None,
             model=selection.model or None,
@@ -468,6 +501,16 @@ class ExternalAgentSessionExecutor:
             options=options,
         ))
         self._live.add(ref.agent_session_id)
+        self._remember_chat_revision(thread, ref)
+        if previous_record is not None and resume is None:
+            self._pending_handoff[thread_id] = build_session_handoff(
+                thread_id=thread_id, messages=self._conv.list_current_messages(thread_id),
+                turns=self._conv.list_turns(thread_id), exclude_turn_id="",
+                kind=RECOVERY_STRUCTURED_HANDOFF, reason="capability_reload",
+                generation=state.current_generation,
+                source_adapter_id=previous_record.adapter_id,
+                source_agent_session_id=previous_record.agent_session_id,
+            )
         self._conv.save_state(state.model_copy(update={
             "agent_session_id": ref.agent_session_id,
             "session_runtime_key": selection.session_key,
@@ -593,6 +636,12 @@ class ExternalAgentSessionExecutor:
         adapter_id: str,
         instance_id: str,
     ) -> RuntimeCapabilitySnapshot:
+        from muteki.external_agents.command_providers import operation_item
+        if snapshot.agent_session_id and not snapshot.stale and not any(
+            item.name == "rewind" and item.kind == "operation" for item in snapshot.items
+        ):
+            snapshot.items.append(operation_item(adapter_id, engine_for_adapter(adapter_id),
+                "rewind", "muteki.history.rebuild", "回退聊天历史并重建引擎上下文；保留工作区文件"))
         record = self._registry.record(adapter_id, instance_id)
         report = record.last_probe if record is not None else None
         return attach_matrix_to_snapshot(snapshot, report)
@@ -692,6 +741,10 @@ class ExternalAgentSessionExecutor:
         失败时写入诊断快照、失败事件与退避状态，避免详情重复读取无限重试
         （#188）。返回是否真正启动了新的后台任务。
         """
+        state = self._conv.get_state(thread_id)
+        record = self._session_record(thread_id)
+        if state.running_turn_id and (record is None or record.agent_session_id not in self._live):
+            return False
         if not self._capability_refresh_allowed(thread_id):
             return False
         runtime_key = self._capability_runtime_key(thread_id)
@@ -743,9 +796,107 @@ class ExternalAgentSessionExecutor:
         task.add_done_callback(_finished)
         return True
 
-    async def runtime_operation(
-        self, thread_id: str, name: str
+    async def _recover_history_mutation(self, thread_id: str) -> None:
+        state = self._conv.get_state(thread_id)
+        if not state.history_recovery_required or thread_id in self._history_mutations:
+            return
+        # An interrupted provider call may have succeeded remotely. Never resume
+        # that uncertain native history; rebuild the last committed branch.
+        records = {r.agent_session_id: r for r in self._store.list(AgentSession, thread_id=thread_id)
+                   if r.closed_at is None}
+        current = self._session_record(thread_id)
+        if current is not None and current.closed_at is None:
+            records[current.agent_session_id] = current
+        for record in records.values():
+            await self._close_record(record, reason="history_recovery")
+        self._conv.save_state(state.model_copy(update={
+            "agent_session_id": None, "session_runtime_key": "",
+            "history_recovery_required": False, "history_rebuild_pending": True,
+            "current_generation": state.current_generation + 1,
+        }))
+        self._pending_handoff.pop(thread_id, None)
+
+    async def rewind_turn(self, thread_id: str, turn_id: str, *, command_id: str,
+                          idempotency_key: str, file_mode: str) -> dict[str, Any]:
+        lock = self._locks.setdefault(thread_id, asyncio.Lock())
+        if lock.locked():
+            raise RuntimeError("请等待当前回复结束后回退")
+        async with lock, self._session_locks.setdefault(thread_id, asyncio.Lock()):
+            await self._recover_history_mutation(thread_id)
+            options = dict(command_id=command_id, idempotency_key=idempotency_key,
+                           file_mode=file_mode, capability_override={"invocable": True})
+            ids, apply = self._manager.native_rewind_turn(thread_id, turn_id, dry_run=True, **options)
+            if not apply:
+                return {"superseded_turn_ids": ids, "applied": False}
+            before = self._conv.get_state(thread_id)
+            old_record = self._session_record(thread_id)
+            target = self._conv.get_turn(turn_id)
+            native_id = target.native_turn_id
+            if not native_id:
+                for event in self._store.read_events("thread", thread_id, limit=10000):
+                    if event.event_type == ev.EV_TURN_STARTED and event.payload.get("turn_id") == turn_id:
+                        native_id = str(event.payload.get("runtime_turn_id") or "")
+            fresh_ref = None
+            strategy = "rebuild"
+            committed = False
+            self._history_mutations.add(thread_id)
+            try:
+                adapter, ref = await self._ensure_capability_session(thread_id)
+                before = self._conv.get_state(thread_id)
+                old_record = self._session_record(thread_id)
+                self._conv.save_state(before.model_copy(update={"history_recovery_required": True}))
+                if (adapter.id == "codex.app_server" and native_id
+                    and target.agent_session_id == ref.agent_session_id
+                    and {"thread/revert", "thread/rollback"}.intersection(getattr(adapter, "_client_request_methods", set()))):
+                    await adapter.rewind_session(ref, native_id)
+                    strategy = "native"
+                else:
+                    adapter, fresh_ref = await self._ensure_capability_session(thread_id, fresh=True)
+                ids, applied = self._manager.native_rewind_turn(
+                    thread_id, turn_id, provider_rewind=lambda **_: True,
+                    rebuild_history=strategy == "rebuild", **options)
+                committed = True
+                if strategy == "rebuild":
+                    state = self._conv.get_state(thread_id).model_copy(update={"history_rebuild_pending": True})
+                    self._conv.save_state(state)
+                    self._pending_handoff[thread_id] = build_session_handoff(
+                        thread_id=thread_id, messages=self._conv.list_current_messages(thread_id),
+                        turns=self._conv.list_turns(thread_id), exclude_turn_id="",
+                        kind=RECOVERY_STRUCTURED_HANDOFF, reason="history_rewind",
+                        generation=state.current_generation,
+                        source_adapter_id=old_record.adapter_id if old_record else "",
+                        source_agent_session_id=old_record.agent_session_id if old_record else "")
+                    if old_record and old_record.agent_session_id != fresh_ref.agent_session_id:
+                        await self._close_record(old_record, reason="history_rewind")
+                        self._conv.save_state(state)
+                else:
+                    self._pending_handoff.pop(thread_id, None)
+                self._capability_cache.pop(thread_id, None)
+                return {"superseded_turn_ids": ids, "applied": applied, "strategy": strategy}
+            except BaseException:
+                # Fresh-session bootstrap failure must leave the old branch usable.
+                if fresh_ref is not None and not committed:
+                    await adapter.close(fresh_ref)
+                    self._live.discard(fresh_ref.agent_session_id)
+                if not committed:
+                    self._conv.save_state(before.model_copy(update={"history_recovery_required": True}))
+                raise
+            finally:
+                self._history_mutations.discard(thread_id)
+
+    async def runtime_operation(self, thread_id: str, name: str, arguments: str = "") -> dict[str, Any]:
+        lock = self._locks.setdefault(thread_id, asyncio.Lock())
+        if lock.locked():
+            raise RuntimeError("请等待当前回复结束后执行原生操作")
+        async with lock:
+            return await self._runtime_operation(thread_id, name, arguments)
+
+    async def _runtime_operation(
+        self, thread_id: str, name: str, arguments: str = ""
     ) -> dict[str, Any]:
+        state = self._conv.get_state(thread_id)
+        if state.running_turn_id or self._conv.active_turn_id(thread_id):
+            raise RuntimeError("请等待当前回复结束后执行原生操作")
         adapter, ref = await self.ensure_capability_session(thread_id)
         snapshot = await adapter.runtime_capability_snapshot(ref)
         snapshot = self._enrich_capability_snapshot(
@@ -767,8 +918,35 @@ class ExternalAgentSessionExecutor:
         if not callable(operation):
             raise RuntimeError(
                 f"{adapter.id} 没有结构化 Runtime operation 通道")
-        result = await operation(ref, name)
-        return result if isinstance(result, dict) else {"result": result}
+        self._runtime_operations.add(thread_id)
+        try:
+            result = await operation(ref, name, arguments) if arguments else await operation(ref, name)
+        finally:
+            self._runtime_operations.discard(thread_id)
+        from muteki.external_agents.command_providers import public_operation_result
+        return public_operation_result(result if isinstance(result, dict) else {"result": result})
+
+    def _chat_revision_matches(self, thread: Thread, record: AgentSession) -> bool:
+        plugins = getattr(self, "chat_plugins", None)
+        if plugins is None or thread.mode != "conversation":
+            return True
+        if engine_for_adapter(record.adapter_id) in {"pi", "omp"} and record.resume_handle and not Path(record.resume_handle).is_absolute():
+            return False
+        if record.agent_session_id not in self._live and not any(
+            turn.agent_session_id == record.agent_session_id and turn.status in {"completed", "interrupted"}
+            for turn in self._conv.list_turns(thread.thread_id)
+        ):
+            # Discovery-only Codex/Cursor sessions may not persist any native
+            # history. After restart, start fresh instead of resuming a phantom.
+            return False
+        previous = self._chat_revisions.get(record.agent_session_id) or plugins.session_revision(record.agent_session_id)
+        return previous == plugins.revision(engine_for_adapter(record.adapter_id))
+
+    def _remember_chat_revision(self, thread: Thread, ref: AgentSessionRef) -> None:
+        plugins = getattr(self, "chat_plugins", None)
+        if plugins is not None and thread.mode == "conversation":
+            self._chat_revisions[ref.agent_session_id] = plugins.revision(engine_for_adapter(ref.adapter_id))
+            plugins.remember_session(ref.agent_session_id, self._chat_revisions[ref.agent_session_id])
 
     async def ensure_session(
         self,
@@ -776,6 +954,12 @@ class ExternalAgentSessionExecutor:
         turn: TurnRecord,
         *,
         force_new: bool = False,
+    ) -> tuple[Any, AgentSessionRef]:
+        async with self._session_locks.setdefault(thread.thread_id, asyncio.Lock()):
+            return await self._ensure_session(thread, turn, force_new=force_new)
+
+    async def _ensure_session(
+        self, thread: Thread, turn: TurnRecord, *, force_new: bool = False,
     ) -> tuple[Any, AgentSessionRef]:
         """取得该 Thread 当前可用的 (adapter, session)；必要时创建 / 恢复 / 切换。
 
@@ -785,6 +969,7 @@ class ExternalAgentSessionExecutor:
         - Runtime 选择变化：关闭旧 Session（撤销 grant），generation+1，
           重新生成注入计划并启动新 Session；普通 message 也会做结构化交接。
         """
+        await self._recover_history_mutation(thread.thread_id)
         selection = self._manager.runtime_selection(thread.thread_id)
         if not selection.adapter_id:
             raise LookupError(
@@ -831,12 +1016,12 @@ class ExternalAgentSessionExecutor:
                     and state.session_runtime_key in {"", old_key}
                 )
             )
+            same_selection = same_selection and self._chat_revision_matches(thread, record)
             if same_selection and (record.closed_at is None or record.resume_handle):
                 adapter = self._adapter_for(selection.adapter_id, selection.instance_id)
                 if record.closed_at is None and record.agent_session_id in self._live:
                     # 本进程内活跃：直接复用。
                     ref = self._ref_from_record(record)
-                    self._pending_handoff.pop(thread.thread_id, None)
                     self._conv.save_turn(turn.model_copy(update={
                         "agent_session_id": ref.agent_session_id,
                         "execution_generation": state.current_generation,
@@ -973,6 +1158,19 @@ class ExternalAgentSessionExecutor:
             "recovery_kind": recovery_kind,
             "recovery_reason": reason,
         }
+        plugins = getattr(self, "chat_plugins", None)
+        if plugins is not None and thread.mode == "conversation":
+            if not options["cwd"]:
+                options["cwd"] = str(plugins.visualization_root(thread.thread_id).parent)
+            options["chat_tools"] = await plugins.prepare_tools(engine)
+            options["chat_control_enabled"] = plugins.control_enabled(engine)
+            credential_env = await asyncio.to_thread(
+                plugins.prepare_environment, engine,
+                thread.thread_id + ":" + selection.credential_id,
+                credential_env,
+            )
+        if plugins is not None and thread.mode == "conversation":
+            options.update(await asyncio.to_thread(plugins.native_launch_options, engine, credential_env))
         if credential_env:
             options["env"] = credential_env
         request = SessionStart(
@@ -991,6 +1189,7 @@ class ExternalAgentSessionExecutor:
         )
         ref = await adapter.start(request)
         self._live.add(ref.agent_session_id)
+        self._remember_chat_revision(thread, ref)
         self._conv.save_turn(turn.model_copy(update={
             "agent_session_id": ref.agent_session_id,
             "execution_generation": state.current_generation,
@@ -1258,8 +1457,9 @@ class ExternalAgentSessionExecutor:
                         "message": f"{type(exc).__name__}: {str(exc)[:300]}",
                     },
                 }, command_id=turn.command_id or None)
-                await self._stop_detached_runtime(
-                    turn.thread_id, reason="turn_executor_error")
+                if not isinstance(exc, ComposerCapabilityError):
+                    await self._stop_detached_runtime(
+                        turn.thread_id, reason="turn_executor_error")
             finally:
                 self._tasks.pop(turn.thread_id, None)
                 current = self._conv.get_turn(turn.turn_id)
@@ -1303,6 +1503,32 @@ class ExternalAgentSessionExecutor:
                 or (turn.kind == "resume" and not resume_supported)
             ),
         )
+        if adapter.id == "grok.acp" and str(turn.runtime_invocation.get("name") or "") == "deep-research":
+            background_started = False
+            def background(updates):
+                nonlocal background_started
+                current = self._conv.get_turn(turn.turn_id)
+                if current is None or current.status == "superseded":
+                    return
+                for kind, native, payload in updates:
+                    if kind in {AgentEventType.MESSAGE_DELTA, AgentEventType.MESSAGE_COMPLETED} and not payload.get("thinking"):
+                        text = str(payload.get("text") or "")
+                        if not text:
+                            continue
+                        if not background_started:
+                            text = "\n\n" + text
+                            background_started = True
+                        self._emit(thread.thread_id, ev.EV_MESSAGE_DELTA, {
+                            "turn_id": turn.turn_id, "agent_session_id": ref.agent_session_id,
+                            "text": text, "role": "assistant", "background": True,
+                        })
+                    elif kind is AgentEventType.RUNTIME_CAPABILITIES_UPDATED:
+                        self._capability_cache.pop(thread.thread_id, None)
+                    else:
+                        self._translate(thread.thread_id, turn, AgentEvent(
+                            event_type=kind, agent_session_id=ref.agent_session_id,
+                            payload=payload, native_type=native))
+            adapter.bind_background_handler(ref, background)
         # #119: 会话已连接后主动刷新能力目录，勿依赖用户打开 / $ @ 命令菜单。
         cached_caps = self._capability_cache.get(thread.thread_id)
         if cached_caps is None or cached_caps.stale:
@@ -1316,6 +1542,13 @@ class ExternalAgentSessionExecutor:
             stream = adapter.resume(ref)
         else:
             pending = self._pending_handoff.pop(thread.thread_id, None)
+            state = self._conv.get_state(thread.thread_id)
+            if state.history_rebuild_pending:
+                pending = build_session_handoff(
+                    thread_id=thread.thread_id, messages=self._conv.list_current_messages(thread.thread_id),
+                    turns=self._conv.list_turns(thread.thread_id), exclude_turn_id=turn.turn_id,
+                    kind=RECOVERY_STRUCTURED_HANDOFF, reason="history_rewind", generation=state.current_generation)
+                self._conv.save_state(state.model_copy(update={"history_rebuild_pending": False}))
             text = turn.text
             if pending is not None and pending.included:
                 # C38: ordinary message (and retry/resume/edit-resend without native resume)
@@ -1353,6 +1586,7 @@ class ExternalAgentSessionExecutor:
                 engine=engine_for_adapter(selection.adapter_id),
                 workspace_root=str(workspace.root_path if workspace is not None else ""),
                 extension_service=self._manager.extension_service,
+                plugin_service=getattr(self, "chat_plugins", None) if thread.mode == "conversation" else None,
                 threads=self._manager.list_threads(),
                 message_loader=self._conv.list_current_messages,
                 message_lookup=self._conv.get_message,
@@ -1371,23 +1605,26 @@ class ExternalAgentSessionExecutor:
                     client_revision is not None
                     and int(client_revision) != int(snapshot.revision)
                 ):
-                    raise RuntimeError(
+                    raise ComposerCapabilityError(
                         "能力目录 revision 已变化，请重新打开命令目录选择")
                 if snapshot.stale:
-                    raise RuntimeError(
+                    raise ComposerCapabilityError(
                         "Runtime 能力目录已经过期，请重新打开命令目录选择")
                 matched = _match_runtime_capability(
                     snapshot, runtime_invocation,
                 )
                 if matched is None:
-                    raise RuntimeError(
+                    raise ComposerCapabilityError(
                         "所选 Runtime 命令已失效，请重新打开命令目录选择")
                 runtime_invocation = matched.model_dump(mode="json")
                 runtime_invocation["arguments"] = str(
                     turn.runtime_invocation.get("arguments") or "")
                 runtime_invocation["revision"] = snapshot.revision
                 if matched.kind == "operation" and matched.resolution == "client":
-                    result = await adapter.runtime_operation(ref, matched.name)
+                    arguments = str(runtime_invocation.get("arguments") or "")
+                    result = await adapter.runtime_operation(ref, matched.name, arguments) if arguments else await adapter.runtime_operation(ref, matched.name)
+                    from muteki.external_agents.command_providers import public_operation_result
+                    result = public_operation_result(result)
                     result_text = json.dumps(
                         result, ensure_ascii=False, indent=2, default=str)
                     self._emit(thread.thread_id, ev.EV_MESSAGE_COMPLETED, {
@@ -1406,6 +1643,12 @@ class ExternalAgentSessionExecutor:
                     "[用户显式添加的参考上下文]\n"
                     f"{capability_context}\n\n[当前用户请求]\n{text}"
                 )
+            plugins = getattr(self, "chat_plugins", None)
+            if plugins is not None and thread.mode == "conversation":
+                skill_context = plugins.skill_catalog_context(engine_for_adapter(selection.adapter_id))
+                text = plugins.visualization_context(thread.thread_id) + "\n" + text
+                if skill_context:
+                    text = skill_context + "\n\n" + text
             attachment_payload: list[dict[str, Any]] = []
             if turn.attachments:
                 try:
@@ -1426,6 +1669,12 @@ class ExternalAgentSessionExecutor:
                     return
                 attachment_payload = attachments_payload(resolved)
                 text = merge_attachment_context(text, resolved)
+            if runtime_invocation and runtime_invocation.get("kind") != "skill":
+                from muteki.external_agents.command_providers import native_prompt
+                text = native_prompt(runtime_invocation, str(runtime_invocation.get("arguments") or ""))
+            elif runtime_invocation and (runtime_invocation.get("invocation") or {}).get("protocol") != "codex.turn/start":
+                from muteki.external_agents.command_providers import native_prompt
+                text = native_prompt(runtime_invocation, str(runtime_invocation.get("arguments") or ""))
             stream = adapter.send(ref, AgentInput(
                 kind="message",
                 text=text,
@@ -1449,8 +1698,20 @@ class ExternalAgentSessionExecutor:
         runtime_error: Optional[dict[str, Any]] = None
         saw_completed_assistant = False
         detach_reason: Optional[str] = None
+        # Freeze the launch selection before consuming events. The picker or a
+        # queued turn can change the thread's current selection during a reply.
+        verification_runtime = (
+            self._runtime_snapshot(thread_id)
+            if turn is not None and self._model_success_recorder is not None
+            and (not turn.runtime_invocation or turn.runtime_invocation.get("kind") == "skill")
+            else None
+        )
+        saw_failed_turn = False
+        model_recorded = False
         try:
             async for event in stream:
+                if event.event_type is AgentEventType.TURN_FAILED:
+                    saw_failed_turn = True
                 if event.event_type is AgentEventType.RUNTIME_ERROR:
                     runtime_error = dict(event.payload)
                 if event.event_type is AgentEventType.RUNTIME_EXITED:
@@ -1495,6 +1756,21 @@ class ExternalAgentSessionExecutor:
                         },
                     }, command_id=(turn.command_id or None) if turn else None)
                     continue
+                if (
+                    event.event_type is AgentEventType.TURN_COMPLETED
+                    and verification_runtime is not None
+                    and not model_recorded and not saw_failed_turn
+                    and not interrupted and runtime_error is None
+                ):
+                    try:
+                        # Persist before publishing completion so the UI's
+                        # subsequent credential fetch already sees verification.
+                        await asyncio.to_thread(
+                            self._model_success_recorder, verification_runtime,
+                        )
+                        model_recorded = True
+                    except Exception:  # noqa: BLE001 — metadata must not fail a successful reply
+                        LOG.warning("could not record model success for turn %s", turn.turn_id, exc_info=True)
                 interrupted = self._translate(thread_id, turn, event) or interrupted
             if interrupted and turn is not None:
                 current = self._conv.get_turn(turn.turn_id)
@@ -1564,6 +1840,10 @@ class ExternalAgentSessionExecutor:
         elif etype is AgentEventType.SESSION_CLOSED:
             out_type, payload = ev.EV_SESSION_CLOSED, {**base, **p}
         elif etype is AgentEventType.TURN_STARTED:
+            if turn is not None and event.turn_id:
+                stored = self._conv.get_turn(turn.turn_id)
+                if stored is not None:
+                    self._conv.save_turn(stored.model_copy(update={"native_turn_id": event.turn_id}))
             # A session can serve multiple turns.  Snapshot the selection on
             # every turn so the UI can label historical replies after a later
             # endpoint or model switch.

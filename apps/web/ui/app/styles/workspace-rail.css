@@ -1,0 +1,100 @@
+/* The web app and desktop shell use the same compact navigation geometry. */
+.workspace-frame {
+  --workspace-rail-width: 56px;
+  --workspace-nav-height: 0px;
+  display: grid;
+  grid-template-columns: var(--workspace-rail-width) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+.workspace-frame-content { position: relative; }
+.workspace-activity-rail {
+  z-index: 98;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  min-height: 0;
+  padding: 9px 0 max(12px, env(safe-area-inset-bottom));
+  border-right: 1px solid var(--line);
+  background: var(--rail);
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+.workspace-activity-rail::-webkit-scrollbar { display: none; }
+.workspace-rail-main, .workspace-rail-bottom, .workspace-rail-links {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+.workspace-rail-bottom { margin-top: auto; }
+.workspace-rail-control {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--muted);
+  text-decoration: none;
+  cursor: pointer;
+  transition: color var(--control-feedback-dur), background-color var(--control-feedback-dur);
+}
+.workspace-rail-control:hover, .workspace-rail-control[aria-current="page"] {
+  color: var(--bright);
+  background: var(--panel2);
+}
+.workspace-rail-control:focus-visible { outline: 2px solid var(--focus-ring, var(--blue)); outline-offset: 2px; }
+.workspace-rail-badge {
+  position: absolute;
+  top: 0;
+  right: -2px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 8px;
+  color: var(--bg);
+  background: var(--blue);
+  font: 600 9px/14px var(--font-sans);
+  text-align: center;
+  pointer-events: none;
+}
+.workspace-rail-divider { width: 22px; height: 1px; margin: 2px 0; background: var(--line); }
+.workspace-rail-sidebar-toggle { display: none; }
+.workspace-frame[data-conversation-sidebar-collapsed="true"] .workspace-rail-sidebar-toggle { display: inline-flex; }
+
+/* A narrower workbench can wrap its controls without overlapping the canvas. */
+@container conversation (max-width: 760px) {
+  .workspace-frame .convo-top { height: auto; max-height: none; padding-block: 8px; row-gap: 8px; }
+}
+
+@media (max-width: 768px) {
+  .workspace-frame { --workspace-rail-width: 48px; }
+  .workspace-rail-control { width: 40px; height: 44px; }
+  .workspace-rail-main, .workspace-rail-bottom, .workspace-rail-links { gap: 4px; }
+  .workspace-rail-sidebar-toggle { display: inline-flex; }
+  .workspace-frame .ai-conv-shell > .ai-conv-sidebar {
+    left: var(--workspace-rail-width);
+    top: env(safe-area-inset-top, 0px);
+    max-width: calc(100vw - var(--workspace-rail-width) - 24px);
+  }
+  .workspace-frame .conversation-mobile-sidebar-backdrop {
+    inset: env(safe-area-inset-top, 0px) 0 0 var(--workspace-rail-width);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workspace-rail-control { transition: none; }
+}
+
+@media print {
+  .workspace-frame { grid-template-columns: minmax(0, 1fr); }
+  .workspace-activity-rail { display: none; }
+}

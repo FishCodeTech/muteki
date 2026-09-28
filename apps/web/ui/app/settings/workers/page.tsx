@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
 
 export default function WorkerSettingsRedirectPage() {
-  redirect("/task/workers");
+  redirect("/ctf/workers");
 }

@@ -17,7 +17,6 @@ export const RUNTIME_TABS: RuntimeTab[] = [
   { view: "usage", key: "panelbtn.usage", group: "observe", icon: "rows" },
   { view: "evidence", key: "panelbtn.evidence", group: "investigate", icon: "layers", hotkey: "e" },
   { view: "findings", key: "panelbtn.findings", group: "investigate", icon: "alert", hotkey: "f" },
-  { view: "reports", key: "panelbtn.reports", group: "assets", icon: "list", hotkey: "o" },
   { view: "credentials", key: "panelbtn.credentials", group: "assets", icon: "lock", hotkey: "c" },
   { view: "pocs", key: "panelbtn.pocs", group: "assets", icon: "terminal", hotkey: "p" },
   { view: "routes", key: "panelbtn.routes", group: "assets", icon: "network", hotkey: "r" },

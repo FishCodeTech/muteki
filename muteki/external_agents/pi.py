@@ -182,7 +182,8 @@ class PiAdapter(BaseExternalAgentAdapter):
     def _rpc_argv(self, *, approve: bool = False,
                   no_session: bool = False,
                   session_dir: Optional[str] = None,
-                  extension_path: Optional[str] = None) -> list[str]:
+                  extension_path: Optional[str] = None,
+                  chat_mode: bool = False) -> list[str]:
         argv = [self._binary, "--mode", "rpc"]
         if no_session:
             argv.append("--no-session")
@@ -194,6 +195,10 @@ class PiAdapter(BaseExternalAgentAdapter):
         # 经显式 ``--extension`` 注入，不依赖项目信任门闩。
         _ = approve
         if extension_path:
+            if chat_mode:
+                # Chat imports the selected engine's own config into a private
+                # home; retain its native Skills and extensions alongside ours.
+                return [*argv, "--extension", extension_path]
             # 禁止项目/用户目录自动发现，显式加载标准包内的客户端扩展。
             # 这样旧的 .pi Skill 或 Extension 不会覆盖本次授权工具集。
             argv += [
@@ -408,6 +413,12 @@ class PiAdapter(BaseExternalAgentAdapter):
                 env[PI_TOOLS_FILE_ENV] = str(tools_file)
 
         async def on_message(msg: dict[str, Any]) -> None:
+            if msg.get("type") == "extension_ui_request" and msg.get("method") in {"select", "confirm", "input", "editor"}:
+                await peer.send({"type": "extension_ui_response", "id": msg.get("id"), "cancelled": True})
+                self._dispatch_event(request.agent_session_id, {
+                    "type": "extension_error", "error": "此扩展请求终端交互，当前 Pi 聊天协议未接入该界面",
+                })
+                return
             self._dispatch_event(request.agent_session_id, msg)
 
         peer = StdioJsonlPeer(
@@ -415,6 +426,7 @@ class PiAdapter(BaseExternalAgentAdapter):
                 approve=approve,
                 no_session=bool(request.options.get("ephemeral")),
                 session_dir=str(request.options.get("session_dir") or ""),
+                chat_mode=request.options.get("thread_mode") == "conversation",
                 extension_path=(
                     str(plugin_extension_path)
                     if plugin_extension_path else None)),
@@ -455,6 +467,7 @@ class PiAdapter(BaseExternalAgentAdapter):
 
         session_id = str(stats.get("sessionId") or state.get("sessionId")
                          or "")
+        resume_handle = str(stats.get("sessionFile") or state.get("sessionFile") or resume_handle or "")
         # 启动环境只应留在当前进程的 env；handle 后续可能被诊断代码读取，
         # 因而不保留 request.options 中的凭据环境副本。
         handle_options = dict(request.options)
@@ -473,7 +486,7 @@ class PiAdapter(BaseExternalAgentAdapter):
             "entries_cursor": None,
             "event_sink": None,
             "current_turn_id": None,
-            "resumed": bool(resume_handle),
+            "resumed": bool(request.resume_handle),
             "model_provider": model_provider,
             "model_id": model_id,
             "capability_revision": 0,
@@ -492,7 +505,7 @@ class PiAdapter(BaseExternalAgentAdapter):
             pass
         return {
             "external_session_id": session_id or None,
-            "resume_handle": resume_handle or session_id or None,
+            "resume_handle": resume_handle or None,
         }
 
     # -- 事件归一化 -------------------------------------------------------------
@@ -507,7 +520,15 @@ class PiAdapter(BaseExternalAgentAdapter):
         if sink is None:
             return
         etype = msg.get("type")
-        if etype == "message_update":
+        if etype == "extension_error":
+            handle["turn_failed"] = str(msg.get("error") or "Pi 扩展执行失败")
+        elif etype == "extension_ui_request" and msg.get("method") == "notify":
+            text = str(msg.get("message") or "")
+            if text:
+                handle["assistant_text"] = str(handle.get("assistant_text") or "") + text + "\n"
+                handle["saw_assistant_text"] = True
+                sink.put_nowait((AgentEventType.MESSAGE_DELTA, "pi.command.notify", {"text": text + "\n"}))
+        elif etype == "message_update":
             # 累计 usage 在事件顶层（§PI 核验）。
             usage = msg.get("usage")
             if isinstance(usage, dict) and usage:
@@ -524,6 +545,13 @@ class PiAdapter(BaseExternalAgentAdapter):
             # 与 CLI PiDriver 一致：只投影 assistant；user/tool 的 message_end
             # 不能写成 MESSAGE_COMPLETED，否则界面会把用户原文当成 Agent 回复。
             message = msg.get("message") or {}
+            if isinstance(message, dict) and message.get("role") == "custom" and message.get("display"):
+                text = _pi_message_text(message)
+                if text:
+                    handle["assistant_text"] = str(handle.get("assistant_text") or "") + text
+                    handle["saw_assistant_text"] = True
+                    sink.put_nowait((AgentEventType.MESSAGE_DELTA, "pi.command.message", {"text": text}))
+                return
             if not isinstance(message, dict) or message.get("role") != "assistant":
                 return
             text = _pi_message_text(message)
@@ -673,6 +701,10 @@ class PiAdapter(BaseExternalAgentAdapter):
                 await self._cmd(peer, "prompt", prompt_params,
                                 timeout=prompt_timeout)
                 handle["prompt_rpc"]["acknowledged"] = True
+                if (input.payload.get("runtime_capability") or {}).get("verification") == "verified":
+                    state = await self._cmd(peer, "get_state", timeout=self._startup_timeout)
+                    if not state.get("isStreaming") and not state.get("isCompacting") and not state.get("pendingMessageCount"):
+                        queue.put_nowait(("__turn_done__", "pi.command.completed", {"local": True}))
                 return None
             except Exception as exc:  # noqa: BLE001
                 handle["prompt_rpc"]["error_type"] = type(exc).__name__
@@ -680,6 +712,7 @@ class PiAdapter(BaseExternalAgentAdapter):
 
         task = asyncio.ensure_future(run_prompt())
         ack_error: Optional[Exception] = None
+        ack_handled = False
         done_info: dict[str, Any] = {}
         get_task = asyncio.ensure_future(queue.get())
         try:
@@ -687,8 +720,9 @@ class PiAdapter(BaseExternalAgentAdapter):
                 # 同时等事件与 prompt ack：ack 失败时不会到达任何事件，
                 # 必须能被 task 完成唤醒，不能死等队列。
                 done, _pending = await asyncio.wait(
-                    {task, get_task}, return_when=asyncio.FIRST_COMPLETED)
+                    {get_task} if ack_handled else {task, get_task}, return_when=asyncio.FIRST_COMPLETED)
                 if task in done:
+                    ack_handled = True
                     exc = task.result()
                     if isinstance(exc, Exception):
                         ack_error = exc
@@ -773,6 +807,9 @@ class PiAdapter(BaseExternalAgentAdapter):
                 **common))
             return
         assistant_text = str(handle.pop("assistant_text", ""))
+        if done_info.get("local") and not assistant_text.strip():
+            assistant_text = "原生命令已处理（未返回文本）"
+            saw_assistant_text = True
         if not saw_assistant_text or not assistant_text.strip():
             yield self.emit(build_event(
                 AgentEventType.TURN_FAILED, seq,
@@ -870,6 +907,10 @@ class PiAdapter(BaseExternalAgentAdapter):
             handle.pop("abort_requested", None)
             return self._receipt(session, False, str(exc))
 
+    async def runtime_operation(self, session: AgentSessionRef, name: str, arguments: str = "") -> dict[str, Any]:
+        from .rpc_commands import rpc_operation
+        return await rpc_operation(self, session, name, arguments)
+
     async def runtime_capability_snapshot(
         self, session: Optional[AgentSessionRef] = None
     ) -> RuntimeCapabilitySnapshot:
@@ -897,11 +938,15 @@ class PiAdapter(BaseExternalAgentAdapter):
             handle.get("capability_revision") or 0
         ) + 1
         items = list(base.items)
+        from .rpc_commands import rpc_operation_items
+        operations = rpc_operation_items(self.id, "pi")
+        items.extend(operations)
+        operation_names = {item.name for item in operations}
         for raw in result.get("commands") or []:
             if not isinstance(raw, dict):
                 continue
             name = str(raw.get("name") or "").strip().lstrip("/")
-            if not name:
+            if not name or name in operation_names:
                 continue
             source = str(raw.get("source") or "")
             items.append(dynamic_command_item(
@@ -909,6 +954,7 @@ class PiAdapter(BaseExternalAgentAdapter):
                 engine="pi",
                 name=name,
                 description=str(raw.get("description") or ""),
+                argument_hint=str((raw.get("input") or {}).get("hint") or raw.get("argumentHint") or ""),
                 channel="provider_native",
                 kind="skill" if source.casefold() == "skill"
                 or name.startswith("skill:") else "command",
@@ -918,6 +964,12 @@ class PiAdapter(BaseExternalAgentAdapter):
                     "protocol": "pi.rpc.prompt",
                 },
             ))
+            for alias in raw.get("aliases") or []:
+                if alias not in operation_names and alias != name:
+                    items.append(items[-1].model_copy(update={
+                        "id": f"runtime:{self.id}:command:{alias}", "name": str(alias),
+                        "invocation": {**items[-1].invocation, "wire_text": f"/{alias}"},
+                    }))
         base.items = items
         base.revision = int(handle["capability_revision"])
         base.external_session_id = handle.get("external_session_id")

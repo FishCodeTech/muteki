@@ -413,7 +413,7 @@ async def _open_planner_llm(
     run: Run,
     mgr: RunManager | None,
 ) -> tuple[Any, Any]:
-    """Open the planner HTTP client used by pentest Reason."""
+    """Open the configured Ark client for a Pentest's final report."""
     planner_profile = llm_profiles.get("planner") or {}
     llm_kwargs: dict[str, Any] = {
         "cost": run.cost,
@@ -469,8 +469,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         from pathlib import Path
 
         from muteki.models.solve_graph import (
-            Challenge, EngagementGoal, TaskContract, apply_expected_findings,
-            parse_engagement_goal,
+            Challenge, TaskContract,
         )
         from muteki.sandbox.manager import SandboxManager
         from muteki.solver.result import ArtifactStore
@@ -528,39 +527,18 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             goal_text = completion.goal if mode == "pentest" else ""
             scope_text = task_contract.authorization_scope
             attachments = [item.path for item in task_contract.attachments]
-        if coordinator and mode == "pentest":
-            llm_cm, llm = await _open_planner_llm(
-                llm_profiles=llm_profiles, run=run, mgr=mgr)
-        if task_contract is not None and mode == "pentest":
-            completion = task_contract.completion_contract
-            engagement = EngagementGoal(
-                raw=completion.goal,
-                finding_class=completion.finding_class or "generic",
-                quantity=(
-                    "recon" if completion.kind == "coverage"
-                    else "collect" if completion.kind == "count"
-                    else "first"
-                ),
-                expected_findings=max(1, int(completion.quantity or 1)),
-                collect_until_coverage=bool(completion.collect_until_coverage),
-                success_predicate="gated_report",
-                completion_kind=(
-                    completion.kind if completion.kind in {"outcome", "count", "coverage"}
-                    else "outcome"
-                ),
-                outcome_predicate=completion.outcome_predicate,
+        # Pentest shares the current Pi Decide execution kernel with CTF.
+        # The retired HTTP/JSON Reason planner is never opened for this mode.
+        pentest_contract = task_contract.pentest_contract if task_contract else None
+        if mode == "pentest" and pentest_contract is None:
+            from muteki.pentest.contract import compile_pentest_prompt
+            pentest_contract = compile_pentest_prompt(
+                prompt_text, target=str(ch.get("target") or ""), scope=scope_text,
             )
-        else:
-            engagement = parse_engagement_goal(goal_text) if mode == "pentest" else None
-        expected_findings_raw = (
-            body.get("expected_findings")
-            if body.get("expected_findings") is not None
-            else ch.get("expected_findings")
-        )
-        if (task_contract is None and engagement is not None
-                and expected_findings_raw not in (None, "")):
-            engagement = apply_expected_findings(
-                engagement, int(expected_findings_raw))
+        if mode == "pentest":
+            llm_cm, llm = await _open_planner_llm(
+                llm_profiles=llm_profiles, run=run, mgr=mgr,
+            )
         expected_flags = int(body.get("expected_flags")
                              or ch.get("expected_flags") or 1)
         multi_flag = bool(body.get("multi_flag")
@@ -600,11 +578,8 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             mode=mode,
             goal=goal_text,
             scope=scope_text,
-            engagement=engagement,
-            pentest_flag_required=bool(body.get("pentest_flag_required")
-                                       if body.get("pentest_flag_required") is not None
-                                       else ch.get("pentest_flag_required", False)),
             task_contract=task_contract,
+            pentest_contract=pentest_contract,
         )
         executor = body.get("executor", "cli")
         cli_race = bool(body.get("cli_race", False))
@@ -653,12 +628,16 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             body.get("worker_container_scope")
             or wc.get("worker_container_scope") or "run"
         ).strip()
+        if mode == "pentest":
+            worker_container_scope = "run"
         if worker_container_scope not in {"run", "shared"}:
             raise RuntimeError("worker_container_scope must be run or shared")
         worker_privilege = str(
             body.get("worker_privilege")
             or wc.get("worker_privilege") or "default"
         ).strip().lower()
+        if mode == "pentest":
+            worker_privilege = "default"
         if worker_privilege not in {"default", "elevated"}:
             raise RuntimeError("worker_privilege must be default or elevated")
         # MNT-09.03 / #170 — resolve cgroup + stream/workdir budgets (not TSec defaults).
@@ -751,6 +730,8 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         ).strip().lower()
         if dispatch_mode not in {"auto", "fixed"}:
             dispatch_mode = "fixed"
+        if mode == "pentest":
+            dispatch_mode = "auto"
         stage_policy["coordinator"]["dispatch_mode"] = dispatch_mode
         race_scout = dispatch_mode == "fixed"
         race_engines = list(engines) if race_scout else []
@@ -781,7 +762,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         # fallback, and the web-container override all owned by the single resolver
         # so the settings health endpoints resolve the SAME effective backend.
         worker_backend = resolve_worker_backend(
-            request_backend=body.get("worker_backend"),
+            request_backend=("container" if mode == "pentest" else body.get("worker_backend")),
             config_backend=wc.get("worker_backend"),
             env_backend=os.environ.get("MUTEKI_WORKER_BACKEND"),
             in_web_container=is_web_container(),
@@ -963,8 +944,8 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         # dedicated pool mount; Coordinator state stays outside that mount.
         worker_root = root / "workers"
 
-        # Planner LLMClient was opened before Challenge construction (dispatch
-        # parse). A missing key leaves llm=None and Reason no-ops.
+        # Pi Decide remains the planner. The HTTP client is only used for the
+        # evidence-grounded report at terminal finalization.
 
         # §16 flywheel store (optional; recall prior + distill on solve)
         from muteki.learning.distill import TemplateStore
@@ -1273,7 +1254,8 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
         import json
         from pathlib import Path
 
-        from muteki.models.solve_graph import Challenge, EngagementGoal, parse_engagement_goal
+        from muteki.models.solve_graph import Challenge
+        from muteki.pentest.contract import PentestContract
         from muteki.solver.cli_driver import driver_for
         from muteki.solver.cli_solver import CliSolver
         from muteki.solver.credential_accounts import account_store_root
@@ -1406,16 +1388,11 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
         mode = ch.get("mode") or "ctf"
         if mode not in ("ctf", "pentest"):
             mode = "ctf"
-        engagement = None
-        if mode == "pentest":
-            raw_eg = ch.get("engagement")
-            if isinstance(raw_eg, dict):
-                try:
-                    engagement = EngagementGoal.model_validate(raw_eg)
-                except Exception:
-                    engagement = parse_engagement_goal(ch.get("goal") or "")
-            else:
-                engagement = parse_engagement_goal(ch.get("goal") or "")
+        pentest_contract = (
+            PentestContract.model_validate(ch["pentest_contract"])
+            if mode == "pentest" and isinstance(ch.get("pentest_contract"), dict)
+            else None
+        )
         standby_flag_contract = normalize_flag_contract(
             ch.get("flag_format", _DEFAULT_BRACE_FLAG_FORMAT),
             ch.get("flag_format_wrapper", ""),
@@ -1445,14 +1422,15 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             mode=mode,
             goal=ch.get("goal") or "",
             scope=ch.get("scope") or "",
-            engagement=engagement,
-            pentest_flag_required=bool(ch.get("pentest_flag_required", False)),
+            pentest_contract=pentest_contract,
         )
 
         wc = mgr.worker_config.resolve(challenge.category) if mgr is not None else {}
         worker_profiles = wc.get("worker_profiles") or []
         worker_network = str(wc.get("worker_network") or "bridge")
         worker_container_scope = str(wc.get("worker_container_scope") or "run")
+        if mode == "pentest":
+            worker_container_scope = "run"
         if root.is_symlink():
             if root.resolve() != mgr.storage.shared_workspace(run.run_id).resolve():
                 raise RuntimeError("Run workspace points outside its shared pool slot")
@@ -1483,7 +1461,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             )
         transport = base_engine_for_profile(profile or winner_engine)
         worker_backend = resolve_worker_backend(
-            request_backend=None,
+            request_backend="container" if mode == "pentest" else None,
             config_backend=wc.get("worker_backend"),
             env_backend=os.environ.get("MUTEKI_WORKER_BACKEND"),
             in_web_container=is_web_container(),

@@ -30,7 +30,6 @@ export function RelationInspector({
   onSelectKnowledge,
   onOpenFact,
   onOpenPoc,
-  onOpenReport,
   onClosePanel,
   canvasMode,
 }: {
@@ -46,7 +45,6 @@ export function RelationInspector({
   onSelectKnowledge: (item: CollaborationKnowledgeItem) => void;
   onOpenFact?: (seq: number) => void;
   onOpenPoc?: (id: string) => void;
-  onOpenReport?: (id: string) => void;
   onClosePanel?: () => void;
   canvasMode?: RunCanvasMode;
 }) {
@@ -127,7 +125,6 @@ export function RelationInspector({
             onSelectKnowledge={onSelectKnowledge}
             onOpenFact={onOpenFact}
             onOpenPoc={onOpenPoc}
-            onOpenReport={onOpenReport}
             onOpenAgentKnowledge={() => onSelectKnowledge(active)}
             mode={canvasMode}
           />

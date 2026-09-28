@@ -6,7 +6,7 @@ import { readMotionPreference, useMotionPreference } from "@/lib/motionPreferenc
 
 /**
  * Applies the persisted color scheme on routes that don't own scheme state
- * (e.g. /task/workers). The main shell (app/page.tsx) manages scheme
+ * (e.g. /ctf/workers). The main shell (app/page.tsx) manages scheme
  * interactively and re-applies on every change; this boot pass only needs to
  * run once per mount so a direct visit to a secondary route still gets the
  * saved scheme instead of the static globals.css fallback.

@@ -29,9 +29,9 @@ class RunSummaryStore:
     Run handles, plus unfinished follow-up lifecycle state used by crash recovery.
     """
 
-    _VERSION = 1
+    _VERSION = 2
     _FIELDS = (
-        "run_id", "name", "category", "started", "finished", "solved",
+        "run_id", "name", "category", "mode", "started", "finished", "solved",
         "flag", "flags", "expected_flags", "multi_flag", "events", "ts",
         "execution_generation", "stream_seq", "terminal_generations",
         "pending_followups",
@@ -100,6 +100,12 @@ class RunSummaryStore:
                 cached = self._clean(store.summary(run_id, bounded=True))
                 self._data[run_id] = cached
                 changed = True
+            elif cached.get("mode") not in {"ctf", "pentest"}:
+                # Older summary indexes omitted mode even when run.preparing
+                # recorded it. Recover that explicit value from the run log so
+                # the CTF and Pentest rails remain disjoint after restart.
+                cached["mode"] = store.summary(run_id, bounded=True)["mode"]
+                changed = True
             rows.append(dict(cached))
         stale_ids = set(self._data).difference(live_ids)
         if stale_ids:
@@ -163,6 +169,7 @@ class RunSummaryStore:
             "run_id": run.run_id,
             "name": run.name or run.run_id,
             "category": run.category,
+            "mode": run.mode,
             "started": run.started,
             "finished": run.finished,
             "solved": solved,

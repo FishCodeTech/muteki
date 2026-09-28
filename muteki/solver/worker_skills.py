@@ -71,6 +71,7 @@ def stage_blackboard_skill(
     engine: str,
     container: bool = False,
     allow_operator_input: bool = True,
+    mode: str = "ctf",
 ) -> list[str]:
     """Expose ``muteki-blackboard`` only inside one Worker's cwd.
 
@@ -92,7 +93,13 @@ def stage_blackboard_skill(
         Path("/opt/muteki/muteki-blackboard") if container else _REPO_SKILL
     )
     relative_target = False
-    if not allow_operator_input:
+    if mode == "pentest" and allow_operator_input:
+        target = root / ".muteki-skills" / "muteki-blackboard"
+        target.mkdir(parents=True, exist_ok=True)
+        for name in ("SKILL.md", "blackboard.py"):
+            shutil.copyfile(_REPO_SKILL / name, target / name)
+        relative_target = True
+    elif not allow_operator_input:
         target = _autonomous_skill_projection(root)
         relative_target = True
     if not container and not target.is_dir():

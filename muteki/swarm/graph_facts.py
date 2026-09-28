@@ -49,7 +49,7 @@ from muteki.swarm.graph_defs import (  # noqa: F401
 class _FactsMixin:
     def ctf_artifact_digest(self, artifact_id: str) -> Optional[str]:
         """Authorize a tool artifact only when this challenge cites its digest."""
-        if getattr(self.challenge, "mode", "ctf") != "ctf" or not re.fullmatch(
+        if getattr(self.challenge, "mode", "ctf") not in {"ctf", "pentest"} or not re.fullmatch(
             r"[0-9a-f]{12}", artifact_id
         ):
             return None
@@ -399,7 +399,9 @@ class _FactsMixin:
         iid = (intent_id or "").strip()
         evidence_provenance = dict(provenance or {})
         target_epoch = str(evidence_provenance.get("target_epoch") or scope or "legacy")
-        if getattr(self.challenge, "mode", "ctf") == "ctf":
+        if (getattr(self.challenge, "mode", "ctf") == "ctf"
+                or (getattr(self.challenge, "mode", "ctf") == "pentest"
+                    and actor == "origin" and source == "origin")):
             fact = str(fact or "")
             if not fact.strip():
                 return -1
@@ -733,7 +735,7 @@ class _FactsMixin:
         payload always carries the intent/route/coverage/epoch binding (empty
         strings when unscoped) so consumers can scope the dead end by it."""
         iid = str(intent_id or "").strip()
-        if getattr(self.challenge, "mode", "ctf") == "ctf":
+        if getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}:
             reason = str(reason or "").strip()
             tested = str(tested_scope or "").strip()
             observed = str(observed_result or "").strip()

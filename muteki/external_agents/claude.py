@@ -39,6 +39,8 @@ import importlib
 import importlib.util
 import inspect
 import subprocess
+
+from .probe_environment import subprocess_environment
 from typing import Any, AsyncIterator, Optional
 
 from muteki.capability_bindings import acp_config, native_tools
@@ -153,7 +155,7 @@ def _cli_version(binary: str, *, timeout: float = 15.0) -> str:
     try:
         result = subprocess.run(
             [binary, "--version"], capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout,
+            encoding="utf-8", errors="replace", timeout=timeout, env=subprocess_environment(),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return ""
@@ -360,6 +362,7 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
                 else ThreadMode(str(binding.mode)),
             )
             descriptor = self._describe(binding)
+            descriptor = descriptor.model_copy(update={"tools": list(plan.tool_descriptions)})
             server = native_tools.build_sdk_mcp_server(
                 descriptor, context, self._gateway,
                 name=str(plan.runtime_config.get(
@@ -409,6 +412,8 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
             kwargs["mcp_servers"] = mcp_servers
         if options.get("allowed_tools"):
             kwargs["allowed_tools"] = list(options["allowed_tools"])
+        if options.get("plugins"):
+            kwargs["plugins"] = list(options["plugins"])
         # Agent SDK 的 ``skills`` 是结构化启用入口：它会把 Skill 工具加入
         # allowed tools，并按 setting sources 让 Runtime 自行发现/按需加载。
         # 不再由 Muteki 读取 SKILL.md 全文塞进用户消息。
@@ -998,6 +1003,20 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
             aggregate=AggregateRef(type="agent_session",
                                    id=session.agent_session_id))
 
+    async def runtime_operation(self, session: AgentSessionRef, name: str, arguments: str = "") -> dict[str, Any]:
+        ctx = self._runs.get(session.agent_session_id)
+        if not ctx or ctx.get("current_turn_id"):
+            raise RuntimeError("请等待当前回复结束后执行命令")
+        if arguments:
+            raise ValueError(f"/{name} 不接受参数")
+        if name == "context":
+            result = await ctx["client"].get_context_usage()
+        elif name == "mcp":
+            result = await ctx["client"].get_mcp_status()
+        else:
+            raise RuntimeError("未知 Claude SDK 操作")
+        return {"status": "completed", "result": _jsonable(result)}
+
     async def runtime_capability_snapshot(
         self, session: Optional[AgentSessionRef] = None
     ) -> RuntimeCapabilitySnapshot:
@@ -1040,6 +1059,13 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
                     "protocol": "claude.sdk.query",
                 },
             ))
+
+        from .command_providers import operation_item
+        for name, method, description in (("context", "get_context_usage", "查看 Claude 原生上下文用量"),
+                                           ("mcp", "get_mcp_status", "查看 Claude MCP 连接状态")):
+            if callable(getattr(ctx["client"], method, None)):
+                items = [item for item in items if item.name != name]
+                items.append(operation_item(self.id, "claude", name, method, description))
 
         reported_mcp = {
             str(item.get("name") or "")

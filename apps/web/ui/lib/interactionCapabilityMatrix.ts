@@ -132,7 +132,7 @@ export function canInvoke(
   const row = rowMap(matrix)[key];
   if (!row) return false;
   if (row.invocable === false) return false;
-  return levelOf(matrix, key) === "supported";
+  return levelOf(matrix, key) === "supported" || (key === "rewind" && row.invocable === true && row.level === "limited");
 }
 
 export function disableCopy(

@@ -9,6 +9,19 @@ export function credentialForRuntime(credential: ConversationCredential, runtime
   const scope = (rows: ConversationCredentialModel[]) => rows.map(model => ({
     ...model, reasoning: models.get(model.id)?.reasoning,
   }));
+  if (credential.verified_models_by_runtime) {
+    const verified = new Set(credential.verified_models_by_runtime[runtimeKey] || []);
+    const rows = new Map([...credential.models, ...credential.candidate_models, ...(catalog || [])]
+      .map(model => [model.id, model]));
+    for (const id of verified) {
+      if (!rows.has(id)) rows.set(id, { id, label: id });
+    }
+    return {
+      ...credential, runtime_instance: runtimeKey,
+      models: scope([...rows.values()].filter(model => verified.has(model.id))),
+      candidate_models: scope([...rows.values()].filter(model => !verified.has(model.id))),
+    };
+  }
   return { ...credential, runtime_instance: runtimeKey, models: scope(credential.models), candidate_models: scope(credential.candidate_models) };
 }
 

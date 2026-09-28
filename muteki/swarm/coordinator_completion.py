@@ -7,15 +7,7 @@ from typing import TYPE_CHECKING, Optional
 if TYPE_CHECKING:
     pass
 
-from muteki.models.solve_graph import (
-    engagement_goal_of, engagement_reports_complete,
-)
-from muteki.solver.gate import finding_key
-from muteki.solver.vuln_report import (
-    persist_report_collection,
-    report_goal_decision,
-    reports_dir_from_graph_db,
-)
+from muteki.models.solve_graph import SolveGraph
 
 def _expected_flags(self) -> int:
     return max(1, getattr(self.challenge, "expected_flags", 1) or 1)
@@ -59,46 +51,34 @@ def _flags_complete(self) -> bool:
     return len(self._found_flags) >= self._expected_flags()
 
 
-def _engagement(self):
-    return engagement_goal_of(self.challenge)
-
-
-def _expected_findings(self) -> int:
-    return max(1, int(self._engagement().expected_findings or 1))
-
-
 def _findings_complete(self) -> bool:
-    """Pentest stop: goal-qualified accepted reports satisfy the contract."""
+    """Host judgment over independently evidenced findings or finite coverage."""
     if getattr(self.challenge, "mode", "ctf") != "pentest":
         return False
-    qualifying = sum(
-        1 for report in (getattr(self, "_found_reports", None) or [])
-        if report_goal_decision(self._engagement(), report)[0]
-    )
-    return engagement_reports_complete(
-        self._engagement(),
-        qualifying,
-    )
+    contract = getattr(self.challenge, "pentest_contract", None)
+    if contract is None or self.shared_graph is None:
+        return False
+    from muteki.pentest.judgement import evaluate
+    return evaluate(self.shared_graph.events(), contract)["objective_status"] == "met"
 
 
 def _qualified_report_count(self) -> int:
-    return sum(
-        1 for report in (getattr(self, "_found_reports", None) or [])
-        if report_goal_decision(self._engagement(), report)[0]
-    )
+    contract = getattr(self.challenge, "pentest_contract", None)
+    if contract is not None and self.shared_graph is not None:
+        from muteki.pentest.judgement import evaluate
+        return int(evaluate(self.shared_graph.events(), contract)["qualified_findings"])
+    return 0
 
 
 def _pentest_product(self) -> bool:
     """Product pentest: success is gated findings, not flags."""
     return (
         getattr(self.challenge, "mode", "ctf") == "pentest"
-        and not self._pentest_flag_required()
     )
 
 
 def _goal_satisfied(self) -> bool:
-    """Stop predicate for the live coordinator: accepted reports on product
-    pentest, flags on CTF and flag-bearing pentest eval."""
+    """Stop predicate for the live coordinator."""
     if self._pentest_product():
         return self._findings_complete()
     return self._flags_complete()
@@ -106,11 +86,11 @@ def _goal_satisfied(self) -> bool:
 
 def _record_findings(self, *findings: dict | None) -> list[dict]:
     fresh: list[dict] = []
-    seen = {finding_key(f) for f in self._found_findings}
+    seen = {SolveGraph._finding_identity(f) for f in self._found_findings}
     for item in findings:
         if not item:
             continue
-        key = finding_key(item)
+        key = SolveGraph._finding_identity(item)
         if not key or key in seen:
             continue
         self._found_findings.append(dict(item))
@@ -170,28 +150,15 @@ async def reconcile_completion_stage(self, state) -> str:
     emit_bb = partial(emit_scheduler_bb, self, state)
     if state.winner is None:
         self._sync_flags_from_graph()
-        pentest_product = (
-            getattr(self.challenge, "mode", "ctf") == "pentest"
-            and not self._pentest_flag_required()
-        )
+        pentest_product = getattr(self.challenge, "mode", "ctf") == "pentest"
         if pentest_product:
-            await self._drain_report_pipeline()
-            self._sync_findings_from_graph()
             if self._findings_complete():
                 state.goal_complete = True
                 await emit_bb(
                     "goal_complete",
-                    why="gated_reports",
-                    reports=len(self._found_reports),
+                    why="model_goal_with_evidence",
+                    reports=0,
                     findings=self._qualified_report_count())
-                for other in state.tasks:
-                    self._cancel_solver(state.task_solvers.get(other))
-                    other.cancel()
-            elif self._coverage_complete():
-                self._coverage_exhausted = True
-                await emit_bb(
-                    "coverage_complete",
-                    findings=len(self._found_findings))
                 for other in state.tasks:
                     self._cancel_solver(state.task_solvers.get(other))
                     other.cancel()
@@ -259,69 +226,11 @@ def _sync_findings_from_graph(self) -> list[dict]:
         return []
     if invalidated:
         self._found_findings = [
-            f for f in self._found_findings if finding_key(f) not in invalidated
+            f for f in self._found_findings if SolveGraph._finding_identity(f) not in invalidated
         ]
     return self._record_findings(*(
-        f for f in graph_findings if finding_key(f) not in invalidated
+        f for f in graph_findings if SolveGraph._finding_identity(f) not in invalidated
     ))
-
-
-def _persist_accepted_collection(self, report: dict) -> None:
-    directory = reports_dir_from_graph_db(
-        getattr(self.shared_graph, "db_path", None) if self.shared_graph is not None else None)
-    if directory is None:
-        return
-    try:
-        rows: list[dict] = []
-        if hasattr(self.shared_graph, "accepted_reports"):
-            rows = [dict(item) for item in (self.shared_graph.accepted_reports() or [])]
-        if not rows:
-            rows = [dict(report)]
-        name = str(getattr(self.challenge, "name", "") or "").strip()
-        title = f"{name} 漏洞报告集" if name else "漏洞报告集"
-        path = persist_report_collection(directory, rows, title=title)
-        report["markdown_path"] = str(path)
-    except Exception:
-        pass
-
-
-def _coverage_complete(self) -> bool:
-    """P2 pentest stop: matching intents are all concluded, none ACTIVE.
-
-    Requires at least one matching intent so a cold start does not fire.
-    Success bit stays false (coverage exhaustion is not goal_met).
-    recon ends on matching-intent exhaustion. collect with
-    collect_until_coverage also ends that way, but only after the report
-    pipeline is empty.
-    """
-    if getattr(self.challenge, "mode", "ctf") != "pentest":
-        return False
-    engagement = self._engagement()
-    quantity = engagement.quantity
-    if quantity == "recon":
-        pass
-    elif quantity == "collect" and engagement.collect_until_coverage:
-        if self._report_pipeline_pending():
-            return False
-    else:
-        return False
-    if self.shared_graph is None or not hasattr(self.shared_graph, "coverage_intent_rows"):
-        return False
-    try:
-        rows = self.shared_graph.coverage_intent_rows()
-    except Exception:
-        return False
-    matching = [r for r in rows if self._intent_matches_engagement(r)]
-    if not matching:
-        return False
-    for row in matching:
-        dispatch = str(row.get("dispatch_state") or "")
-        status = str(row.get("status") or "")
-        if dispatch == "active" and status in {"open", "claimed"}:
-            return False
-        if status not in {"done"} and dispatch not in {"closed", "retired"}:
-            return False
-    return True
 
 
 def _record_flags(self, *flags: Optional[str]) -> list[str]:
@@ -333,30 +242,6 @@ def _record_flags(self, *flags: Optional[str]) -> list[str]:
             self._found_flags.append(f)
             fresh.append(f)
     return fresh
-
-
-def _pentest_flag_required(self) -> bool:
-    """tsec-f03 lesson: a pentest-MODE engagement that is flag-BEARING
-    (tsecbench-style ranges — pentest prompt shape, but there is a flag and
-    a judge) must not end on Reason's complete verdict alone: the brain
-    judges from blackboard facts and can hallucinate a solve, or the flag
-    can sit in evidence without ever passing the worker-side flag gate.
-    Signalled explicitly via Challenge.pentest_flag_required — flag_format
-    always has a non-empty default, so it cannot serve as the signal.
-    Product default is False (eval bypass only; not a product success
-    condition). Product pentest succeeds on accepted findings."""
-    return bool(getattr(self.challenge, "pentest_flag_required", False))
-
-
-async def _salvage_flags_from_evidence(self, complete_why: str = "") -> list[str]:
-    """Compatibility hook retained for older coordinator call sites.
-
-    Verified facts and verdict text are useful planning inputs, but they are
-    not an acceptance channel.  Protocol 1 Flags enter the shared graph only
-    after a Worker explicitly calls the Blackboard Skill's ``submit-flag``
-    command. Returning no values keeps that single entry point intact.
-    """
-    return []
 
 
 def _sync_flags_from_graph(self) -> list[str]:

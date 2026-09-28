@@ -285,10 +285,12 @@ export function userPromptBubble(ch: Record<string, any> | undefined): string {
   const lines: string[] = [];
   const desc = (ch.description || "").trim();
   if (desc) lines.push(desc);
+  // Pentest's single Prompt already contains its goal and target. Its derived
+  // contract lives in the inspector; repeating it here makes the user message
+  // appear to have been rewritten by the host.
+  if (ch.mode === "pentest") return desc;
   const ctx: string[] = [];
   if (ch.target) ctx.push(`target: ${ch.target}`);
-  if (ch.mode === "pentest" && ch.goal) ctx.push(`goal: ${ch.goal}`);
-  if (ch.mode === "pentest" && ch.scope) ctx.push(`scope: ${ch.scope}`);
   const atts: unknown = ch.attachments;
   if (Array.isArray(atts) && atts.length) {
     const names = atts.map((p) => String(p).split("/").pop()).filter(Boolean);

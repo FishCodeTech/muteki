@@ -50,22 +50,21 @@ _CHALLENGE_MODE = (
 )
 
 _SOLVE_COMMANDS = (
-    {"context", "read-artifact", "submit-fact", "commit-step", "mark-deadend", "request-input", "save-poc", "submit-flag"}
-    if _CHALLENGE_MODE == "ctf"
-    else {
-        "context", "write-fact", "mark-deadend", "request-input", "save-poc",
-        "submit-flag", "submit-report",
-    }
+    {"context", "read-artifact", "submit-fact", "commit-step", "mark-deadend", "request-input", "save-poc"}
+    | ({"recent-evidence"} if _CHALLENGE_MODE == "pentest" else set())
+    | ({"submit-flag"} if _CHALLENGE_MODE == "ctf" else set())
+    if _CHALLENGE_MODE in {"ctf", "pentest"}
+    else {"context", "write-fact", "mark-deadend", "request-input", "save-poc", "submit-flag"}
 )
 
 _ROLE_COMMANDS = {
     "solve": _SOLVE_COMMANDS,
     "verifier": (
         {"context", "read-artifact", "submit-fact", "commit-step", "mark-deadend", "save-poc"}
-        if _CHALLENGE_MODE == "ctf"
+        | ({"recent-evidence"} if _CHALLENGE_MODE == "pentest" else set())
+        if _CHALLENGE_MODE in {"ctf", "pentest"}
         else {"context", "write-fact", "mark-deadend", "save-poc"}
     ),
-    "reproducer": {"context", "submit-repro"},
     "review": {
         "context", "review-finding", "challenge-fact", "merge-fact",
         "reject-fact", "revalidate-fact",
@@ -194,10 +193,11 @@ def submit_flag(flag: str) -> None:
     _submit_request("submit_flag", {"flag": str(flag)})
 
 
-def submit_fact(title: str, content: str) -> None:
+def submit_fact(title: str, content: str, evidence: str = "") -> None:
     _submit_request("submit_fact", {
         "title": str(title),
         "content": str(content),
+        "evidence_artifact_id": str(evidence or ""),
     })
 
 
@@ -517,18 +517,6 @@ def save_poc(path: str, entry_command: str, status: str, note: str) -> None:
     })
 
 
-def submit_report(path: str) -> None:
-    _submit_request("submit_report", {"path": path})
-
-
-def submit_repro(result: str, witness: str, reason: str) -> None:
-    _submit_request("submit_repro", {
-        "reproduced": result == "yes",
-        "witness": witness,
-        "reason": reason,
-    })
-
-
 def propose_branch(goal: str, expected_observable: str,
                    stop_condition: str, coverage_key: str,
                    route_hash: str, lane_key: str = "",
@@ -602,6 +590,17 @@ def read_artifact(artifact_id: str) -> None:
         print(str(result.get("detail") or "artifact unavailable"), file=sys.stderr)
         sys.exit(2)
     sys.stdout.write(str(result.get("content") or ""))
+
+
+def recent_evidence() -> None:
+    request_id = _write_request("recent_evidence", {})
+    result = _await_request_result(request_id)
+    if result is None:
+        _request_timeout()
+    if not result.get("ok"):
+        print(str(result.get("detail") or "evidence unavailable"), file=sys.stderr)
+        sys.exit(2)
+    sys.stdout.write(str(result.get("content") or "[]"))
 
 
 def submission_lock(action: str, note: str) -> None:
@@ -785,6 +784,9 @@ def main() -> None:
     if p is not None:
         p.add_argument("title")
         p.add_argument("content")
+        if _CHALLENGE_MODE == "pentest":
+            p.add_argument("--evidence", required=True,
+                           help="artifact ID from recent-evidence supporting this Fact")
     _reg("commit-step")
     p = _reg("mark-deadend")
     if p is not None:
@@ -803,14 +805,6 @@ def main() -> None:
             "--status", choices=("available", "wip", "directional", "spent"),
             default="available")
         p.add_argument("--note", default="")
-    p = _reg("submit-report")
-    if p is not None:
-        p.add_argument("path")
-    p = _reg("submit-repro")
-    if p is not None:
-        p.add_argument("--result", choices=("yes", "no"), required=True)
-        p.add_argument("--witness", default="")
-        p.add_argument("--reason", default="")
     p = _reg("propose-branch")
     if p is not None:
         p.add_argument("goal")
@@ -846,6 +840,7 @@ def main() -> None:
         p.add_argument("fact_seq", type=int)
         p.add_argument("--reason", required=True)
     _reg("context")
+    _reg("recent-evidence")
     p = _reg("read-artifact")
     if p is not None:
         p.add_argument("artifact_id")
@@ -920,7 +915,7 @@ def main() -> None:
     elif args.cmd == "write-fact":
         write_fact(args.text, False)
     elif args.cmd == "submit-fact":
-        submit_fact(args.title, args.content)
+        submit_fact(args.title, args.content, getattr(args, "evidence", ""))
     elif args.cmd == "commit-step":
         commit_step()
     elif args.cmd == "mark-deadend":
@@ -929,10 +924,6 @@ def main() -> None:
         request_input(args.need)
     elif args.cmd == "save-poc":
         save_poc(args.path, args.entry_command, args.status, args.note)
-    elif args.cmd == "submit-report":
-        submit_report(args.path)
-    elif args.cmd == "submit-repro":
-        submit_repro(args.result, args.witness, args.reason)
     elif args.cmd == "propose-branch":
         propose_branch(
             args.goal, args.expected_observable,
@@ -951,6 +942,8 @@ def main() -> None:
         revalidate_fact(args.fact_seq, args.reason)
     elif args.cmd == "context":
         refresh_context()
+    elif args.cmd == "recent-evidence":
+        recent_evidence()
     elif args.cmd == "read-artifact":
         read_artifact(args.artifact_id)
     elif args.cmd == "submission-lock":

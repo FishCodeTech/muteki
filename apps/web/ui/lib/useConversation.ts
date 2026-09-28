@@ -450,6 +450,7 @@ export interface ConversationCredential {
   engine: string;
   runtime_instance?: string;
   model_catalogs?: Record<string, ConversationCredentialModel[]>;
+  verified_models_by_runtime?: Record<string, string[]>;
   source: "stored" | "system";
   account_id?: string;
   connection?: string;
@@ -458,7 +459,7 @@ export interface ConversationCredential {
   present: boolean;
   status: string;
   status_detail?: string;
-  /** Models that passed a real credential test (credential-center probe). */
+  /** Models proven by a successful chat or an explicit credential test. */
   models: ConversationCredentialModel[];
   /** Catalog / declared models not yet proven with this credential. */
   candidate_models: ConversationCredentialModel[];
@@ -1179,6 +1180,11 @@ function normalizeCredential(
           key, credentialModels(value && typeof value === "object"
             ? (value as Record<string, unknown>).discovered_models : []),
         ])) : {},
+    verified_models_by_runtime: row.model_catalogs && typeof row.model_catalogs === "object"
+      ? Object.fromEntries(Object.entries(row.model_catalogs).map(([key, value]) => [
+          key, credentialModels(value && typeof value === "object"
+            ? (value as Record<string, unknown>).verified_models : []).map((model) => model.id),
+        ])) : undefined,
     source,
     ...(accountId ? { account_id: accountId } : {}),
     connection: String(row.connection ?? ""),

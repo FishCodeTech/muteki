@@ -88,9 +88,11 @@ def _defined_by(instance: Any, method: str) -> str:
 def _probe_version_argv(argv: list[str], *, timeout: float = 15.0) -> str:
     """运行 Driver 声明的只读版本命令；失败返回空串。"""
     try:
+        from .probe_environment import subprocess_environment
         result = subprocess.run(
             argv, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=timeout,
+            env=subprocess_environment(),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return ""

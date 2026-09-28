@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import Any, Literal, Mapping, Never, Optional
+from typing import Any, Literal, Mapping, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from muteki.solver.gate import normalize_flag_contract, normalize_flag_format
+from muteki.pentest.contract import PentestContract
 
 Category = Literal["web", "pwn", "reverse", "crypto", "forensics", "misc"]
 
@@ -51,41 +52,6 @@ class Hypothesis(BaseModel):
     status: HypothesisStatus = HypothesisStatus.PROPOSED
     priority: float = 0.5  # parallel-verification ordering (RAG prior may init)
     refuted_reason: Optional[str] = None
-
-
-QuantityKind = Literal["first", "collect", "recon"]
-CompletionKind = Literal["outcome", "count", "coverage"]
-
-
-_GOAL_CN_NUMBERS = {
-    "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
-    "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
-}
-_GOAL_COUNT_RE = re.compile(
-    r"(?<![\d.])(\d+|[一二两三四五六七八九十]+)(?![\d.])"
-    r"(?=[^0-9\n，。；:]{0,40}(?:报告|finding|findings|flag|flags))",
-    re.IGNORECASE,
-)
-
-
-def _goal_count(text: str) -> Optional[int]:
-    match = _GOAL_COUNT_RE.search(text or "")
-    if not match:
-        return None
-    token = match.group(1)
-    if token.isdigit():
-        return max(1, int(token))
-    if token in _GOAL_CN_NUMBERS:
-        return _GOAL_CN_NUMBERS[token]
-    if token.startswith("十") and len(token) == 2 and token[1] in _GOAL_CN_NUMBERS:
-        return 10 + _GOAL_CN_NUMBERS[token[1]]
-    if token.endswith("十") and len(token) == 2 and token[0] in _GOAL_CN_NUMBERS:
-        return _GOAL_CN_NUMBERS[token[0]] * 10
-    if "十" in token and len(token) == 3:
-        left, right = token.split("十", 1)
-        if left in _GOAL_CN_NUMBERS and right in _GOAL_CN_NUMBERS:
-            return _GOAL_CN_NUMBERS[left] * 10 + _GOAL_CN_NUMBERS[right]
-    return None
 
 
 class InstructionSpan(BaseModel):
@@ -126,8 +92,8 @@ class CompletionContract(BaseModel):
     flag_format_hint: str = ""
     expected_flags: int = 1
     multi_flag: bool = False
-    finding_class: str = "generic"
-    outcome_predicate: str = "first_valid_report"
+    finding_class: str = "any"
+    outcome_predicate: str = "verified_objective"
     collect_until_coverage: bool = False
 
 
@@ -146,178 +112,9 @@ class TaskContract(BaseModel):
     execution_target: Optional[str] = None
     authorization_scope: str = ""
     completion_contract: CompletionContract = Field(default_factory=CompletionContract)
+    pentest_contract: Optional[PentestContract] = None
     # Kept so old event dumps still validate; new contracts leave this empty.
     derived_fields: dict[str, DerivedTaskField] = Field(default_factory=dict)
-
-
-class EngagementGoal(BaseModel):
-    """Pentest objective attached to Challenge.goal / Challenge.scope.
-
-    Default: expected_findings=1, finding_class parsed from goal text or generic.
-    success_predicate defaults to gated_report (report collection after
-    independent reproduction and value judgment).
-    """
-    raw: str = ""
-    finding_class: str = "generic"
-    quantity: QuantityKind = "first"
-    expected_findings: int = 1
-    collect_until_coverage: bool = False
-    success_predicate: str = "gated_report"
-    completion_kind: CompletionKind = "outcome"
-    outcome_predicate: str = "first_valid_report"
-
-
-def parse_engagement_goal(raw: str) -> EngagementGoal:
-    """Map operator goal text onto EngagementGoal. Unknown text stays generic."""
-    text = (raw or "").strip()
-    low = text.lower()
-    finding_class = "generic"
-    if any(h in text or h in low for h in (
-        "rce", "远程代码", "命令注入", "command injection", "os command",
-    )):
-        finding_class = "rce"
-    elif any(h in text or h in low for h in (
-        "idor", "越权", "bola", "broken access", "未授权",
-    )):
-        finding_class = "idor"
-    elif any(h in low for h in ("sqli", "sql注入", "sql injection")):
-        finding_class = "sqli"
-    elif any(h in low for h in ("xss", "跨站")):
-        finding_class = "xss"
-    elif "ssrf" in low:
-        finding_class = "ssrf"
-    quantity: QuantityKind = "first"
-    expected = 1
-    until_coverage = False
-    completion_kind: CompletionKind = "outcome"
-    outcome_predicate = "first_valid_report"
-    if any(h in text or h in low for h in (
-        "后台shell", "后台 shell", "getshell", "get shell", "shell access",
-    )):
-        finding_class = "rce"
-        outcome_predicate = "shell_access"
-    elif any(h in text or h in low for h in (
-        "命令执行", "执行命令", "command execution", "command injection", "rce",
-    )):
-        finding_class = "rce"
-        outcome_predicate = "command_execution"
-    elif any(h in text or h in low for h in (
-        "管理后台", "管理员后台", "后台权限", "admin access", "administrator access",
-    )):
-        outcome_predicate = "admin_access"
-    if any(h in text or h in low for h in (
-        "侦察", "recon", "测绘", "全面审计", "完整审计", "覆盖全部", "全面测试",
-    )):
-        quantity = "recon"
-        until_coverage = True
-        completion_kind = "coverage"
-    elif any(h in text or h in low for h in ("收集", "全部", "所有", "collect")):
-        quantity = "collect"
-        requested_count = _goal_count(text)
-        if requested_count is not None:
-            expected = requested_count
-            until_coverage = False
-            completion_kind = "count"
-        else:
-            expected = 1
-            until_coverage = True
-            completion_kind = "coverage"
-    else:
-        requested_count = _goal_count(text)
-        if requested_count is not None:
-            expected = requested_count
-            completion_kind = "count"
-    return EngagementGoal(
-        raw=text,
-        finding_class=finding_class or "generic",
-        quantity=quantity,
-        expected_findings=max(1, expected),
-        collect_until_coverage=until_coverage,
-        success_predicate="gated_report",
-        completion_kind=completion_kind,
-        outcome_predicate=outcome_predicate,
-    )
-
-
-def engagement_goal_of(challenge: "Challenge") -> EngagementGoal:
-    contract = getattr(challenge, "task_contract", None)
-    if contract is not None and contract.mode == "pentest":
-        completion = contract.completion_contract
-        return EngagementGoal(
-            raw=completion.goal,
-            finding_class=completion.finding_class or "generic",
-            quantity=(
-                "recon" if completion.kind == "coverage"
-                else "collect" if completion.kind == "count"
-                else "first"
-            ),
-            expected_findings=max(1, int(completion.quantity or 1)),
-            collect_until_coverage=completion.kind == "coverage",
-            success_predicate="gated_report",
-            completion_kind=(
-                completion.kind
-                if completion.kind in {"outcome", "count", "coverage"}
-                else "outcome"
-            ),
-            outcome_predicate=completion.outcome_predicate,
-        )
-    stored = getattr(challenge, "engagement", None)
-    if stored is not None:
-        return stored
-    if getattr(challenge, "mode", "ctf") != "pentest":
-        return EngagementGoal(raw="", finding_class="", expected_findings=1)
-    return parse_engagement_goal(getattr(challenge, "goal", "") or "")
-
-
-def apply_expected_findings(
-    engagement: EngagementGoal, expected_findings: int,
-) -> EngagementGoal:
-    """Apply the operator's explicit report count from the dispatch form.
-
-    A filled number is a known collection size, including N=1. Open-ended
-    collect is only when the count field is left blank.
-    """
-    want = max(1, int(expected_findings))
-    quantity = engagement.quantity
-    if quantity == "recon":
-        return engagement.model_copy(update={
-            "expected_findings": want,
-            "completion_kind": "count",
-            "quantity": "collect",
-            "collect_until_coverage": False,
-        })
-    if want > 1 or quantity == "collect":
-        quantity = "collect"
-    return engagement.model_copy(update={
-        "expected_findings": want,
-        "quantity": quantity,
-        "collect_until_coverage": False,
-        "completion_kind": "count",
-    })
-
-
-def engagement_reports_complete(
-    engagement: EngagementGoal, n_accepted: int,
-) -> bool:
-    """True when the accepted report collection satisfies the engagement."""
-    if engagement.success_predicate not in {"gated_finding", "gated_report"}:
-        return False
-    if engagement.completion_kind == "coverage":
-        return False
-    got = max(0, int(n_accepted))
-    if engagement.completion_kind == "outcome":
-        return got >= 1
-    q = engagement.quantity
-    if q == "recon":
-        return False
-    if q == "collect":
-        if engagement.collect_until_coverage:
-            return False
-        return got >= max(1, int(engagement.expected_findings or 1))
-    if q == "first":
-        return got >= max(1, int(engagement.expected_findings or 1))
-    _exhaustive: Never = q
-    raise AssertionError(_exhaustive)
 
 
 class Challenge(BaseModel):
@@ -397,26 +194,15 @@ class Challenge(BaseModel):
     # False → every existing CTF path is byte-identical (no gate, free concurrent
     # submission). Opt-in at dispatch time for chained-submit / rate-limited tracks.
     verifier_rate_limited: bool = False
-    # ── engagement mode (Origin/Goal/Hints framing, BE-pentest-mode) ──────────
-    # "ctf" (default): the goal is to recover a Flag — completion follows explicit
-    # model submission. "pentest": the goal is operator-defined (find +
-    # prove vulnerabilities in scope). Product success is gated_report (accepted
-    # reports after independent reproduction and value judgment);
-    # Reason verdict=complete is a planning signal only. mode="ctf" leaves every CTF
-    # code path byte-identical (the pentest branches only fire when mode=="pentest").
+    # Pentest uses the same Fact–Goal–Step kernel with a separate domain contract.
     mode: Literal["ctf", "pentest"] = "ctf"
-    goal: str = ""    # pentest: the engagement objective (drives Reason planning)
-    scope: str = ""   # pentest: in-scope targets / authorization boundary
-    engagement: Optional[EngagementGoal] = None
-    # Eval-only bypass (tsecbench-style ranges: pentest prompt shape, but there IS
-    # a flag and a judge). Product default False — not a product success condition.
-    # When True, Reason complete may end the run only after a provenance-admitted
-    # flag is in the store (salvage from verified evidence is attempted first).
-    pentest_flag_required: bool = False
+    goal: str = ""
+    scope: str = ""
     # Canonical conversational dispatch contract. Older persisted runs do not
     # carry it; their legacy fields remain readable and the UI synthesizes a
     # read-only task-understanding card during replay.
     task_contract: Optional[TaskContract] = None
+    pentest_contract: Optional[PentestContract] = None
 
 
 class SolveGraph(BaseModel):
@@ -439,7 +225,6 @@ class SolveGraph(BaseModel):
     rejected_flags: list[str] = Field(default_factory=list)
     findings: list[dict] = Field(default_factory=list)
     rejected_findings: list[str] = Field(default_factory=list)
-    vuln_reports: list[dict] = Field(default_factory=list)
 
     def add_flag(self, flag: str) -> bool:
         """Record a flag if not already present (dedup, exact-match). Keeps the
@@ -492,21 +277,6 @@ class SolveGraph(BaseModel):
         self.findings = [f for f in self.findings if self._finding_identity(f) != key]
         if key not in self.rejected_findings:
             self.rejected_findings.append(key)
-
-    def add_vuln_report(self, report: dict) -> bool:
-        if not report:
-            return False
-        rid = str(report.get("report_id") or "").strip()
-        if not rid:
-            rid = self._finding_identity(report)
-        if not rid:
-            return False
-        if any(str(item.get("report_id") or "") == rid for item in self.vuln_reports):
-            return False
-        row = dict(report)
-        row["report_id"] = rid
-        self.vuln_reports.append(row)
-        return True
 
     def _next_hid(self) -> str:
         """Derive the next H-id from existing hypotheses (no shared counter)."""

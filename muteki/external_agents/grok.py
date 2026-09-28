@@ -262,6 +262,10 @@ class GrokAcpAdapter(BaseAcpAdapter):
                 if item.is_symlink() and not item.exists():
                     continue
                 destination = target / item.name
+                if env.get("MUTEKI_CHAT_PRIVATE_ROOT") and destination.is_symlink():
+                    private = Path(env["MUTEKI_CHAT_PRIVATE_ROOT"]).resolve()
+                    if not destination.resolve().is_relative_to(private):
+                        destination.unlink()
                 if destination.exists() or destination.is_symlink():
                     continue
                 try:

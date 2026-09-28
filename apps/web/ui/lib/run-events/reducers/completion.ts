@@ -164,8 +164,8 @@ export function reduceCompletion(ev: MutekiEvent, s: DeckState): DeckState | und
       } else if (solvedByPayload) {
         pushChat(s, {
           role: "system", kind: "status",
-          content: `Goal met — ${s.goalWhy ?? "engagement objective reached"}`,
-          ts: ev.ts, i18nKey: "sys.goalMet", i18nVars: { why: s.goalWhy ?? "" },
+          content: s.mode === "pentest" ? "Goal met — supported by evidence" : `Goal met — ${s.goalWhy ?? "engagement objective reached"}`,
+          ts: ev.ts, i18nKey: s.mode === "pentest" ? "sys.pentestGoalMet" : "sys.goalMet", i18nVars: { why: s.goalWhy ?? "" },
         });
       } else if (s.outcomeReason === "runtime_failure") {
         pushChat(s, {

@@ -399,9 +399,14 @@ class _DispatchReasonMixin:
             rows = state_port.query_legacy_candidates(run_id=self.run_id)
             out: list[dict] = []
             seen_routes: set[str] = set()
-            ctf_mode = getattr(self.challenge, "mode", "ctf") == "ctf"
+            ctf_mode = getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
             for r in rows:
-                wc = "code" if ctf_mode else str(r.get("worker_class") or "code")
+                wc = (
+                    str(r.get("worker_class") or "code")
+                    if getattr(self.challenge, "mode", "ctf") == "pentest"
+                    else "code" if ctf_mode
+                    else str(r.get("worker_class") or "code")
+                )
                 route = "" if ctf_mode else str(r.get("route_hash") or "")
                 if (
                     not ctf_mode
@@ -448,12 +453,13 @@ class _DispatchReasonMixin:
                         "resource_key": resource_key,
                         "from_facts": list(r.get("from_facts") or []),
                         "depends_on": [] if ctf_mode else list(r.get("depends_on") or []),
-                        "expected_observable": "" if ctf_mode else str(r.get("expected_observable") or ""),
-                        "stop_condition": "" if ctf_mode else str(r.get("stop_condition") or ""),
-                        "coverage_key": "" if ctf_mode else str(r.get("coverage_key") or ""),
+                        "expected_observable": str(r.get("expected_observable") or "") if not ctf_mode or getattr(self.challenge, "mode", "ctf") == "pentest" else "",
+                        "stop_condition": str(r.get("stop_condition") or "") if not ctf_mode or getattr(self.challenge, "mode", "ctf") == "pentest" else "",
+                        "coverage_key": str(r.get("coverage_key") or "") if not ctf_mode or getattr(self.challenge, "mode", "ctf") == "pentest" else "",
+                        "required_pocs": list(r.get("required_pocs") or []),
                         "requires_capabilities": [] if ctf_mode else list(
                             r.get("requires_capabilities") or []),
-                        "value_claim": {} if ctf_mode else dict(r.get("value_claim") or {}),
+                        "value_claim": {} if getattr(self.challenge, "mode", "ctf") == "ctf" else dict(r.get("value_claim") or {}),
                         "priority_reason": "" if ctf_mode else str(r.get("priority_reason") or ""),
                     }
                 )
@@ -528,23 +534,25 @@ class _DispatchReasonMixin:
                 self.review_policy.get("max_concurrent") or 1)
         )
 
-    def _pending_report_repro_count(self) -> int:
-        if self.shared_graph is None or not hasattr(
-                self.shared_graph, "pending_report_repros"):
+    def _pending_verification_count(self) -> int:
+        if self.shared_graph is None:
             return 0
         try:
-            return len(self.shared_graph.pending_report_repros() or [])
+            return sum(
+                1 for row in self.shared_graph.query_legacy_candidates()
+                if str(row.get("worker_class") or "") == "verifier"
+            )
         except Exception:
             return 0
 
     def _verifier_concurrency_cap(self) -> int:
-        """One verifier per pending repro; max_concurrent > 0 is a hard cap.
+        """One verifier per pending evidence check; max_concurrent is a cap.
 
         0 / unset means auto. Keep automatic verification proportional to the
         ordinary solve capacity so a burst of challenged facts cannot create
         more verifier processes than the run can productively feed.
         """
-        pending = max(1, self._pending_report_repro_count())
+        pending = max(1, self._pending_verification_count())
         raw = self.verifier_policy.get("max_concurrent")
         try:
             configured = int(raw) if raw not in (None, "") else 0
@@ -559,11 +567,8 @@ class _DispatchReasonMixin:
         return len(self._active_verifier_tasks)
 
     def _verifier_capacity_available(self, tasks: Optional[dict] = None) -> bool:
-        # ``verifier.enabled`` is the operator switch for the Pentest report
-        # reproduction pipeline.  CTF fact challenges are part of the
-        # coordinator's evidence-integrity loop: disabling report reproduction
-        # must not strand every Candidate fact behind an unstartable verifier
-        # Intent.
+        # CTF can disable its optional verifier seat. Pentest always enables
+        # independent verification in the domain policy at construction.
         if (
             getattr(self.challenge, "mode", "ctf") != "ctf"
             and not self.verifier_policy.get("enabled", True)
@@ -718,7 +723,7 @@ class _DispatchReasonMixin:
             return 0
         if (
             self.llm is None
-            and getattr(self.challenge, "mode", "ctf") != "ctf"
+            and getattr(self.challenge, "mode", "ctf") not in {"ctf", "pentest"}
         ):
             unavailable_detail = str(
                 getattr(self, "planner_unavailable_detail", "") or
@@ -783,7 +788,7 @@ class _DispatchReasonMixin:
             except Exception:
                 compact_summary = ""
                 compact_cutoff_seq = 0
-            if getattr(self.challenge, "mode", "ctf") == "ctf":
+            if getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}:
                 compact_summary = ""
                 compact_cutoff_seq = 0
 
@@ -858,14 +863,7 @@ class _DispatchReasonMixin:
             if attachments:
                 task_lines.append(f"attachments: {', '.join(attachments)}")
             if challenge.mode == "pentest":
-                engagement = challenge.engagement
-                task_lines.extend([
-                    f"authorized scope: {challenge.scope or ''}",
-                    f"completion kind: {engagement.completion_kind}",
-                    f"outcome predicate: {engagement.outcome_predicate}",
-                    f"expected qualifying reports: {engagement.expected_findings}",
-                    f"coverage until operator decision: {engagement.collect_until_coverage}",
-                ])
+                task_lines.append(f"authorized scope: {challenge.scope or ''}")
             elif challenge.multi_flag:
                 task_lines.append(
                     f"flag completion: collect {challenge.expected_flags or 'unknown'} distinct flags"
@@ -905,7 +903,7 @@ class _DispatchReasonMixin:
                 min(planning_limit, requested_intents),
             )
             ctf_pi_decide = (
-                getattr(self.challenge, "mode", "ctf") == "ctf"
+                getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
             )
 
             def _assemble_summary(graph_body: str) -> str:
@@ -988,7 +986,8 @@ class _DispatchReasonMixin:
             )
             preview_messages = (
                 build_ctf_pi_decide_prompt(
-                    summary, max_intents=requested_intents
+                    summary, max_intents=requested_intents,
+                    mode=getattr(self.challenge, "mode", "ctf"),
                 )
                 if ctf_pi_decide
                 else build_reason_prompt(
@@ -1062,6 +1061,7 @@ class _DispatchReasonMixin:
                     account_id=account_id,
                     state_root=state_base / ".muteki-agent-state" / "reason",
                     shared_graph=self.shared_graph,
+                    mode=getattr(self.challenge, "mode", "ctf"),
                 )
             # Context manifest for the assembled Reason prompt. Measurement-only;
             # a manifest failure must never break planning.
@@ -1070,6 +1070,7 @@ class _DispatchReasonMixin:
                     build_ctf_pi_decide_prompt(
                         summary,
                         max_intents=int(reason_args["max_intents"]),
+                        mode=getattr(self.challenge, "mode", "ctf"),
                     )
                     if ctf_pi_decide
                     else build_reason_prompt(
@@ -1159,7 +1160,7 @@ class _DispatchReasonMixin:
             except Exception:
                 pass
             superseded: list[str] = []
-            ctf_mode = getattr(self.challenge, "mode", "ctf") == "ctf"
+            ctf_mode = getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
             requested_supersede = list(
                 getattr(result, "supersede_intents", []) or []
             )

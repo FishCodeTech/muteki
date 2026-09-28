@@ -9,12 +9,14 @@ import type { WorkspaceKindEntry } from "@/lib/workspace-kinds";
 import { useSolveOnlyMode } from "@/lib/workspaceMode";
 
 function iconOf(workspace: WorkspaceKindEntry): IconName {
+  if (workspace.id === "pentest") return "target";
   if (workspace.icon === "flag") return "crosshair";
   if (workspace.icon === "trophy") return "grid";
   return "terminal";
 }
 
 function actionOf(workspace: WorkspaceKindEntry): string {
+  if (workspace.id === "pentest") return "开始测试";
   if (workspace.aggregateType === "thread") return "开始对话";
   if (workspace.aggregateType === "run") return "下发任务";
   if (workspace.aggregateType === "competition") return "进入比赛";
@@ -22,11 +24,12 @@ function actionOf(workspace: WorkspaceKindEntry): string {
 }
 
 function descriptionOf(workspace: WorkspaceKindEntry): string {
+  if (workspace.id === "pentest") return "用自然语言描述授权目标，由 Coordinator 调度有界测试和证据复核。";
   if (workspace.aggregateType === "thread") {
     return "与外部 Agent 连续协作，查看工具调用、审批、产物和运行记录。";
   }
   if (workspace.aggregateType === "run") {
-    return "提交一道 CTF 题目，由标准 Coordinator 调度 Worker 并汇总可核查结果。渗透功能正在重写。";
+    return "提交一道 CTF 题目，由标准 Coordinator 调度 Worker 并汇总可核查结果。";
   }
   if (workspace.aggregateType === "competition") {
     return "连接比赛平台，同步题目、调度 Run、审核候选并跟踪远端裁定。";
@@ -105,8 +108,8 @@ function HomeContent() {
       </section>
 
       <footer className="workspace-home-footer">
-        {solveOnly ? <><span>做题设置</span><Link href="/task/workers">单题 Worker</Link><Link href="/task/workers?section=credentials">Agent 凭据</Link><Link href="/settings/appearance">显示模式</Link></>
-          : <><span>运行环境与扩展</span><Link href="/settings/agents">Agent Runtime</Link><Link href="/task/workers">单题 Worker</Link><Link href="/settings/extensions">扩展</Link><Link href="/settings/operations">运行诊断</Link></>}
+        {solveOnly ? <><span>做题设置</span><Link href="/ctf/workers">CTF Worker</Link><Link href="/ctf/workers?section=credentials">Agent 凭据</Link><Link href="/settings/appearance">显示模式</Link></>
+          : <><span>运行环境与扩展</span><Link href="/settings/agents">Agent Runtime</Link><Link href="/ctf/workers">CTF Worker</Link><Link href="/settings/extensions">扩展</Link><Link href="/settings/operations">运行诊断</Link></>}
       </footer>
     </main>
   );

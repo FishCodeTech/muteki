@@ -1,14 +1,11 @@
 "use client";
 
-import { MotionIcon } from "@/components/MotionIcon";
-
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { CSSProperties, MouseEvent as ReactMouseEvent, ReactElement } from "react";
 import {
   DeckState, SolverLane, isReviewWorkerLane, isFactRetired,
   workerIds,
   currentGenWorkerIds,
-  type BlackboardVulnReport,
   type PlatformConfirmationStatus,
 } from "@/lib/events";
 import { useLang, useT } from "@/lib/i18n";
@@ -17,13 +14,6 @@ import { Icon, type IconName } from "@/components/Icon";
 import { EngineLogo } from "@/components/EngineLogo";
 import { useCopied } from "@/lib/useCopied";
 import { Button, ListBox, ListBoxItem, Select } from "@heroui/react";
-import {
-  estimateCvss,
-  findingClassLabel,
-  reportLocationLabel,
-  reportsToCollectionMarkdown,
-  type CvssRating,
-} from "@/lib/reportMarkdown";
 import type { ArtifactView } from "@/lib/events";
 import { panelHotkey } from "@/lib/runtimeTabs";
 
@@ -43,47 +33,6 @@ const SPAWN_ENGINES = [
   "claude", "codex", "cursor", "pi", "omp", "kimi", "grok", "opencode", "devin",
 ];
 
-function reportStatusRank(status: BlackboardVulnReport["status"]): number {
-  switch (status) {
-    case "accepted":
-      return 0;
-    case "reproduced":
-      return 1;
-    case "submitted":
-      return 2;
-    case "repro_failed":
-      return 3;
-    case "rejected":
-      return 4;
-    default: {
-      const _never: never = status;
-      return _never;
-    }
-  }
-}
-
-function reportStatusLabel(
-  status: BlackboardVulnReport["status"],
-  t: (key: string) => string,
-): string {
-  switch (status) {
-    case "accepted":
-      return t("runtime.reports.accepted");
-    case "reproduced":
-      return t("runtime.reports.reproduced");
-    case "submitted":
-      return t("runtime.reports.submitted");
-    case "repro_failed":
-      return t("runtime.reports.reproFailed");
-    case "rejected":
-      return t("runtime.reports.rejected");
-    default: {
-      const _never: never = status;
-      return _never;
-    }
-  }
-}
-
 function platformStatusLabel(
   status: PlatformConfirmationStatus,
   t: (key: string) => string,
@@ -102,110 +51,6 @@ function platformStatusLabel(
       return _never;
     }
   }
-}
-
-function reportStatusBadge(status: BlackboardVulnReport["status"]): string {
-  switch (status) {
-    case "accepted":
-      return "ok";
-    case "rejected":
-      return "bad";
-    case "repro_failed":
-      return "sev-warn";
-    case "submitted":
-    case "reproduced":
-      return "";
-    default: {
-      const _never: never = status;
-      return _never;
-    }
-  }
-}
-
-function severityBadgeClass(rating: CvssRating): string {
-  switch (rating) {
-    case "critical":
-      return "sev-critical";
-    case "high":
-      return "sev-high";
-    case "medium":
-      return "sev-medium";
-    case "low":
-      return "sev-low";
-    default: {
-      const _never: never = rating;
-      return _never;
-    }
-  }
-}
-
-function ExportCollectionButton({ text }: { text: string }) {
-  const t = useT();
-  const [copied, copy] = useCopied();
-  return (
-    <Button
-      type="button"
-      className={`insp-report-export ${copied ? "copied" : ""}`.trim()}
-      data-tooltip={t("insp.run.exportCollection")}
-      aria-label={t("runtime.reports.copyCollectionAria")}
-      onClick={() => copy(text)}
-    >
-      <MotionIcon active={copied} from="copy" to="check" size={13} />
-      <span>{copied ? t("common.copied") : t("insp.run.exportCollection")}</span>
-    </Button>
-  );
-}
-
-function PentestReportDirectory({
-  rows,
-  accepted,
-  collectionTitle,
-  onOpenReport,
-}: {
-  rows: BlackboardVulnReport[];
-  accepted: BlackboardVulnReport[];
-  collectionTitle: string;
-  onOpenReport: (id: string) => void;
-}) {
-  const t = useT();
-  const collection = reportsToCollectionMarkdown(accepted, collectionTitle);
-  return (
-    <div className="insp-report-dir">
-      {rows.map((row) => {
-        const cvss = estimateCvss(row);
-        const location = reportLocationLabel(row.resourceId) || row.title;
-        const typeLabel = findingClassLabel(row.findingClass);
-        return (
-          <Button
-            type="button"
-            className="insp-report-row"
-            key={row.id}
-            onClick={() => onOpenReport(row.id)}
-            data-tooltip={t("insp.run.openReport", { title: row.title })}
-            aria-label={t("insp.run.openReport", { title: `${typeLabel} ${location}` })}
-          >
-            <span className="insp-report-row-top">
-              <span className="insp-report-type">{typeLabel}</span>
-              <span
-                className={`artifact-badge ${severityBadgeClass(cvss.rating)}`}
-                data-tooltip={t("runtime.reports.cvssHint")}
-              >
-                {cvss.badge}
-              </span>
-              <span className={`artifact-badge ${reportStatusBadge(row.status)}`}>
-                {reportStatusLabel(row.status, t)}
-              </span>
-            </span>
-            <code className="insp-report-path">{location}</code>
-          </Button>
-        );
-      })}
-      <div className="insp-report-foot">
-        <span className="insp-report-hint">{t("insp.run.reportHint")}</span>
-        {accepted.length > 0 && <ExportCollectionButton text={collection} />}
-      </div>
-    </div>
-  );
 }
 
 function runtimeLabel(lane: SolverLane): string {
@@ -340,8 +185,8 @@ export function RunInspector({
   onOpenWorker,
   onOpenAgent,
   onWriteup,
-  onMarkFalseFlag,
   onOpenReport,
+  onMarkFalseFlag,
   onClose,
 }: {
   deck: DeckState;
@@ -355,37 +200,27 @@ export function RunInspector({
   onOpenWorker: (id: string) => void;
   onOpenAgent?: (id: string) => void;
   onWriteup: () => void;
+  onOpenReport?: () => void;
   onMarkFalseFlag: (flag: string) => void;
-  onOpenReport: (reportId: string) => void;
   onClose?: () => void;
 }) {
   const t = useT();
+  const isPentest = deck.mode === "pentest";
   const { lang } = useLang();
   const [spawnEngine, setSpawnEngine] = useState("");
   const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    if (!isPentest) return;
+    setCollapsedSections((previous) => {
+      if (previous.has("task")) return previous;
+      const next = new Set(previous);
+      next.add("task");
+      return next;
+    });
+  }, [isPentest]);
 
-  const acceptedReports = (deck.blackboard.vulnReports ?? []).filter((row) => row.status === "accepted");
-  const qualifiedReports = acceptedReports.filter((row) => row.goalQualified !== false);
-  const submittedReports = (deck.blackboard.vulnReports ?? []).filter((row) => row.status === "submitted").length;
-  const reproducingReports = Math.max(0, deck.verifying ?? 0);
-  const directoryReports = (deck.blackboard.vulnReports ?? [])
-    .filter((row) => row.status !== "rejected")
-    .slice()
-    .sort((a, b) => reportStatusRank(a.status) - reportStatusRank(b.status) || a.ts - b.ts);
-  const pentest = deck.mode === "pentest";
   const taskContract = deck.taskContract;
-  const completionContract = !pentest ? "" : deck.completionKind === "coverage"
-    ? t("insp.run.contractCoverage")
-    : deck.completionKind === "count"
-      ? t("insp.run.contractCount").replace("{count}", String(deck.expectedFindings))
-      : deck.outcomePredicate === "shell_access"
-        ? t("insp.run.contractShell")
-        : deck.outcomePredicate === "admin_access"
-          ? t("insp.run.contractAdmin")
-          : deck.outcomePredicate === "command_execution"
-            ? t("insp.run.contractCommand")
-            : t("insp.run.contractReport");
-  const reportCollectionTitle = deck.challengeName ? `${deck.challengeName} 漏洞报告集` : "漏洞报告集";
+  const pentestFactCount = deck.blackboard.facts.filter((fact) => fact.verified && fact.actor !== "origin").length;
   const workerSiblings = useMemo(
     () => workerIds(deck).map((id) => toWorkerIdentity(id, deck.lanes[id])),
     [deck],
@@ -598,14 +433,7 @@ export function RunInspector({
               {taskContract.authorizationScope ? (
                 <div><span>{t("insp.run.taskScope")}</span><b>{taskContract.authorizationScope}</b></div>
               ) : null}
-              {taskContract.mode === "pentest" ? (
-                <>
-                  <div><span>{t("insp.run.taskType")}</span><b>{taskContract.completion.taskType || taskContract.category}</b></div>
-                  <div><span>{t("insp.run.taskQuantity")}</span><b>{taskContract.completion.kind === "coverage" ? t("insp.run.taskCoverage") : String(taskContract.completion.quantity ?? 1)}</b></div>
-                </>
-              ) : (
-                <div><span>{t("insp.run.taskFlagFormat")}</span><b>{taskContract.completion.flagFormatHint || taskContract.completion.flagFormat || t("insp.run.taskDefaultFlag")}</b></div>
-              )}
+              {!isPentest && <div><span>{t("insp.run.taskFlagFormat")}</span><b>{taskContract.completion.flagFormatHint || taskContract.completion.flagFormat || t("insp.run.taskDefaultFlag")}</b></div>}
               {taskContract.attachments.length > 0 && (
                 <div><span>{t("insp.run.taskAttachments")}</span><b>{taskContract.attachments.map((item) => item.summary || item.name).join("；")}</b></div>
               )}
@@ -614,58 +442,33 @@ export function RunInspector({
         </section>
       )}
       <section className={`insp-sec insp-sec-outcome ${sectionOpen("outcome") ? "" : "collapsed"}`}>
-        {sectionHeader("outcome", t(pentest ? "insp.run.reports" : "insp.run.flag"), pentest ? (
-          deck.expectedFindings > 1 ? (
-            <span className="insp-flag-count">
-              {qualifiedReports.length}/{deck.expectedFindings}
-              {(submittedReports > 0 || reproducingReports > 0) && (
-                <small>{submittedReports}/{reproducingReports}/{qualifiedReports.length}</small>
-              )}
-            </span>
-          ) : qualifiedReports.length > 0 || submittedReports > 0 || reproducingReports > 0 ? (
-            <span className="insp-flag-count">
-              {qualifiedReports.length}
-              {(submittedReports > 0 || reproducingReports > 0) && (
-                <small>{submittedReports}/{reproducingReports}/{qualifiedReports.length}</small>
-              )}
-            </span>
-          ) : undefined
+        {sectionHeader("outcome", isPentest ? "目标与证据" : t("insp.run.flag"), isPentest ? (
+          <span className="insp-flag-count">{pentestFactCount} Fact</span>
         ) : deck.platformConfirmationRequired ? (
           <span className="insp-flag-count" title={t("insp.run.internalFindings")}>{deck.flags.length}</span>
         ) : deck.expectedFlags > 1 ? (
           <span className="insp-flag-count">{deck.flags.length}/{deck.expectedFlags}</span>
         ) : undefined)}
-        {sectionOpen("outcome") && (
+        {sectionOpen("outcome") && (isPentest ? (
+          <div className="insp-pentest-outcome">
+            <strong className={deck.solved ? "confirmed" : ""}>{deck.solved ? "目标已证实" : deck.finished ? "目标尚未证实" : "正在核对目标"}</strong>
+            <span>授权范围：{taskContract?.authorizationScope || deck.target || "待读取"}</span>
+            <span>真实证据：{pentestFactCount} 条 Fact</span>
+            {onOpenReport && <Button className="insp-panel-writeup" onPress={onOpenReport}>
+              <span className="insp-panel-writeup-icon"><Icon name="rows" size={15} /></span>
+              <span className="insp-panel-writeup-copy"><strong>查看测试报告</strong><small>目标判断、证据与定制内容</small></span>
+              <Icon name="chevronRight" size={14} />
+            </Button>}
+          </div>
+        ) : (
           <>
-            {!pentest && deck.platformConfirmationRequired && (
+            {deck.platformConfirmationRequired && (
               <div className="insp-flag-summary" aria-live="polite">
                 <div><span>{t("insp.run.internalFindings")}</span><strong>{deck.flags.length}</strong></div>
                 <div><span>{t("insp.run.platformAccepted")}</span><strong>{(deck.flagConfirmations || []).filter((row) => row.status === "accepted").length}<small>/{Math.max(1, deck.expectedFlags)}</small></strong></div>
               </div>
             )}
-            {pentest && (
-              <div className="insp-pending-hint">
-                {t("insp.run.completionContract")}：{completionContract}
-                {acceptedReports.length > 0 && (
-                  <> · {t("insp.run.reportGateProgress")
-                    .replace("{accepted}", String(acceptedReports.length))
-                    .replace("{qualified}", String(qualifiedReports.length))}</>
-                )}
-              </div>
-            )}
-            {pentest && directoryReports.length > 0 ? (
-              <PentestReportDirectory
-                rows={directoryReports}
-                accepted={acceptedReports}
-                collectionTitle={reportCollectionTitle}
-                onOpenReport={onOpenReport}
-              />
-            ) : pentest ? (
-              <div className="insp-run-flag pending t-flag-target">
-                <span className="insp-pending-row"><Icon name="list" size={13} /> {t("insp.run.pendingReports")}</span>
-                <span className="insp-pending-hint">{t("insp.run.pendingReportsHint")}</span>
-              </div>
-            ) : deck.flags.length > 0 ? (
+            {deck.flags.length > 0 ? (
               <div className="insp-run-flags">
                 {deck.platformConfirmationRequired && (
                   <div className="insp-pending-hint">{t("insp.run.platformHint")}</div>
@@ -713,7 +516,7 @@ export function RunInspector({
               </div>
             )}
           </>
-        )}
+        ))}
       </section>
 
       <section className={`insp-sec insp-sec-workers ${sectionOpen("workers") ? "" : "collapsed"}`}>
@@ -806,7 +609,7 @@ export function RunInspector({
               <span className="insp-panel-group-label">{t("insp.run.panelGroup.investigate")}</span>
               <div className="insp-panel-grid">
                 {panelBtn("evidence", "evidence", "layers")}
-                {panelBtn("findings", "findings", "alert")}
+                {!isPentest && panelBtn("findings", "findings", "alert")}
               </div>
             </div>
             <div className="insp-panel-group" role="group" aria-label={t("insp.run.panelGroup.assets")}>
@@ -818,7 +621,7 @@ export function RunInspector({
                 {panelBtn("directives", "directives", "help")}
               </div>
             </div>
-            <Button
+            {!isPentest && <Button
               className="insp-panel-writeup"
               onClick={onWriteup}
               isDisabled={running}
@@ -831,7 +634,7 @@ export function RunInspector({
                 <small>{running ? t("insp.run.writeupBusy") : t("insp.run.writeupHint")}</small>
               </span>
               <Icon name="chevronRight" size={14} />
-            </Button>
+            </Button>}
           </div>
         )}
       </section>

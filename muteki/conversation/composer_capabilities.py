@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from hashlib import sha256
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -58,7 +59,8 @@ _USER_SKILL_ROOTS: dict[str, tuple[str, ...]] = {
 
 _COMMANDS: tuple[dict[str, str], ...] = (
     {"name": "new", "description": "新建对话", "action": "new"},
-    {"name": "clear", "description": "清空输入内容与引用", "action": "clear"},
+    {"name": "clear", "description": "开始空白聊天，保留历史记录", "action": "new"},
+    {"name": "clear-input", "description": "清空输入内容与引用", "action": "clear"},
 )
 
 _IGNORED_FILE_DIRS = frozenset({
@@ -111,7 +113,8 @@ def _muteki_control_mcp_row(*, engine: str, injected: bool) -> dict[str, Any]:
             "reason": "",
             "alternative": "",
             "invocable": True,
-            "action": "select-capability",
+            "action": "insert-runtime-invocation" if item.get("native_engine") else "select-capability",
+            **({"invocation": {"wire_text": "/" + item["native_name"]}} if item.get("native_engine") else {}),
         }
     return {
         "id": "mcp:muteki-control",
@@ -227,6 +230,17 @@ def discover_skills(engine: str, workspace_root: str = "") -> list[dict[str, Any
             previous = deduped.get(key)
             if previous is None or item["_priority"] > previous["_priority"]:
                 deduped[key] = item
+
+    # Native plugin manifests belong to their own engine provider.
+    from muteki.conversation.chat_providers import PROVIDERS
+    provider = PROVIDERS.get(normalized)
+    if provider is not None:
+        for package_name, root in provider.plugin_skill_roots():
+            for path in sorted((root / "skills").rglob("SKILL.md"))[:200]:
+                item = _skill_item(path, engine=normalized, source=f"{normalized} 插件", scope="personal", priority=290)
+                if item is not None:
+                    item["name"] = f"{package_name}:{item['name']}"
+                    deduped.setdefault(item["name"].casefold(), item)
 
     # Muteki Control 是随产品交付的 Agent Plugins 1.0.0 包。仅对会实际
     # 注入 Gateway / plugin 的 Runtime 作为可调用 Skill 展示；未接入引擎
@@ -368,6 +382,7 @@ def resolve_composer_catalog(
     threads: Iterable[Any] = (),
     current_thread_id: str = "",
     runtime_snapshot: RuntimeCapabilitySnapshot | None = None,
+    plugin_service: Any = None,
 ) -> list[dict[str, Any]]:
     normalized = str(engine or "").strip().lower()
     if normalized not in SUPPORTED_ENGINES:
@@ -379,15 +394,22 @@ def resolve_composer_catalog(
         if prefix in {"skill", "mcp", "plugin", "file", "thread"}:
             kind_filter, raw_query = prefix, suffix
 
-    snapshot_items = list(runtime_snapshot.items) if runtime_snapshot else []
+    snapshot_items = [item for item in runtime_snapshot.items if not item.engine or item.engine == normalized] if runtime_snapshot else []
     local_skills = {
         str(item.get("name") or "").casefold(): item
         for item in discover_skills(normalized, workspace_root)
     }
 
+    managed_skills = plugin_service.skill_rows(normalized) if plugin_service is not None else []
+    if plugin_service is not None:
+        if not plugin_service.control_enabled(normalized):
+            local_skills = {k: v for k, v in local_skills.items() if v.get("source") != "Muteki Agent Plugin"}
+
     runtime_rows: list[dict[str, Any]] = []
     snapshot_stale = bool(runtime_snapshot and runtime_snapshot.stale)
     for capability in snapshot_items:
+        if capability.engine and capability.engine != normalized:
+            continue
         if capability.kind not in {"command", "operation", "skill"}:
             continue
         if capability.status not in {
@@ -491,10 +513,21 @@ def resolve_composer_catalog(
             "alternative": "",
             "invocable": True,
         }
-        for item in local_skills.values()
-        if str(item.get("name") or "").casefold() not in runtime_skill_names
+        for item in [*local_skills.values(), *managed_skills]
+        if item.get("source") == "Muteki 聊天插件" or str(item.get("name") or "").casefold() not in runtime_skill_names
     ]
 
+    from muteki.external_agents.command_providers import client_commands, unavailable_commands
+    native_names = {row["name"] for row in runtime_rows}
+    client_rows = client_commands(normalized, native_names)
+    matrix = runtime_snapshot.public_matrix() if runtime_snapshot else None
+    rewind = next((row for row in (matrix or {}).get("rows", []) if row.get("key") == "rewind"), {})
+    for row in client_rows:
+        if row["action"] == "ui:rewind" and not rewind.get("invocable"):
+            row.update(invocable=False, support_level="unsupported", action="inspect-runtime-capability",
+                       reason="当前接入尚不能同步回退引擎历史与聊天记录", alternative="可使用 /fork 保留原记录并从选定轮次继续")
+    client_names = {row["name"] for row in client_rows}
+    runtime_rows = [row for row in runtime_rows if row["name"] not in client_names]
     if trigger == "/":
         rows = [
             {
@@ -504,8 +537,10 @@ def resolve_composer_catalog(
             }
             for item in _COMMANDS
         ]
+        rows.extend(client_rows)
         rows.extend(runtime_rows)
         rows.extend(local_skill_rows)
+        rows.extend(unavailable_commands(normalized, native_names | client_names))
     elif trigger == "@":
         rows = _thread_items(threads, current_thread_id=current_thread_id)
         runtime_mcp = [
@@ -526,12 +561,15 @@ def resolve_composer_catalog(
             if capability.kind == "mcp_status"
         ]
         rows.extend(runtime_mcp)
-        if capability_enabled("mcp", "muteki-control"):
+        if capability_enabled("mcp", "muteki-control") and (plugin_service is None or plugin_service.control_enabled(normalized)):
             rows.append(_muteki_control_mcp_row(
                 engine=normalized,
                 injected=engine_receives_capability_gateway(normalized),
             ))
-        rows.extend(_extension_items(extension_service))
+        if plugin_service is not None:
+            rows.extend({"id": f"managed-plugin:{normalized}:{r['id']}", "kind": "plugin", "name": r["name"],
+                         "description": r["description"], "source": "Muteki 聊天插件", "scope": "chat",
+                         "action": "inspect-runtime-status"} for r in plugin_service.enabled(normalized))
         rows.extend(discover_files(workspace_root, query=raw_query, limit=48))
         if raw_query:
             rows = [item for item in rows if _matches(item, raw_query)]
@@ -543,6 +581,7 @@ def resolve_composer_catalog(
         ]
         if (
             capability_enabled("mcp", "muteki-control")
+            and (plugin_service is None or plugin_service.control_enabled(normalized))
             and not engine_receives_capability_gateway(normalized)
             and not any(
                 str(item.get("name") or "").casefold() == "muteki-control"
@@ -578,7 +617,7 @@ def resolve_composer_catalog(
     if kind_filter:
         rows = [item for item in rows if item.get("kind") == kind_filter]
     filtered = [item for item in rows if _matches(item, raw_query)]
-    return [_public_item(item) for item in filtered[:80]]
+    return [_public_item(item) for item in filtered[:1000]]
 
 
 def _cap_snapshot(text: str) -> str:
@@ -907,6 +946,7 @@ def resolve_capability_refs(
     threads: Iterable[Any] = (),
     message_loader: Any = None,
     message_lookup: Any = None,
+    plugin_service: Any = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Validate client refs and build the explicit Agent instruction block.
 
@@ -926,6 +966,7 @@ def resolve_capability_refs(
     catalog: dict[str, dict[str, Any]] = {}
     if (
         capability_enabled("mcp", "muteki-control")
+        and (plugin_service is None or plugin_service.control_enabled(normalized))
         and engine_receives_capability_gateway(normalized)
     ):
         catalog["mcp:muteki-control"] = {
@@ -936,7 +977,12 @@ def resolve_capability_refs(
     for item in _extension_items(extension_service):
         catalog[str(item["id"])] = item
     for item in discover_skills(normalized, workspace_root):
+        if plugin_service is not None and item.get("source") == "Muteki Agent Plugin" and not plugin_service.control_enabled(normalized):
+            continue
         catalog[str(item["id"])] = item
+    if plugin_service is not None:
+        for item in plugin_service.skill_rows(normalized):
+            catalog[str(item["id"])] = item
     for item in _thread_items(threads):
         catalog[str(item["id"])] = item
 
@@ -999,10 +1045,15 @@ def resolve_capability_refs(
         if item is None:
             raise ComposerCapabilityError("所选能力已失效，请按当前 Agent 重新选择")
         seen.add(item_id)
-        selected.append(_public_item(item))
+        public = _public_item(item)
+        if item.get("source") == "Muteki 聊天插件":
+            public["arguments"] = str(raw.get("arguments") or "")
+        selected.append(public)
         kind = str(item["kind"])
         name = str(item["name"])
         if kind == "skill":
+            if item.get("native_engine"):
+                raise ComposerCapabilityError(f"此 Skill 依赖原生执行语义，请通过 /{item['native_name']} 调用")
             skill_path = Path(str(item.get("_path") or ""))
             try:
                 skill_text = skill_path.read_text(encoding="utf-8")
@@ -1010,8 +1061,23 @@ def resolve_capability_refs(
                 raise ComposerCapabilityError(
                     f"Skill {name} 当前不可读取，请重新选择"
                 ) from exc
+            if item.get("source") == "Muteki 聊天插件":
+                import shlex
+                arguments = str(raw.get("arguments") or "")
+                try:
+                    positional = shlex.split(arguments)
+                except ValueError:
+                    positional = arguments.split()
+                def substitute(match):
+                    if match.group(0) == "$ARGUMENTS":
+                        return arguments
+                    index = int(match.group(1) or match.group(2))
+                    return positional[index] if index < len(positional) else match.group(0)
+                skill_text = re.sub(r"\$ARGUMENTS\[(\d+)\]|\$(\d+)\b|\$ARGUMENTS\b", substitute, skill_text)
+            for variable in ("${PLUGIN_ROOT}", "${CLAUDE_PLUGIN_ROOT}", "${CODEX_PLUGIN_ROOT}"):
+                skill_text = skill_text.replace(variable, str(item.get("_package_root") or skill_path.parent))
             instructions.append(
-                f"[用户显式选择的 Agent Skill: {name}]\n{skill_text}"
+                f"[用户显式选择的 Agent Skill: {name}]\n资源根目录：{skill_path.parent}\n{skill_text}"
             )
         elif kind == "file":
             instructions.append(

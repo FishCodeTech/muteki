@@ -318,7 +318,10 @@ def build_interaction_matrix(
                 level = "expired" if has_op else "unknown"
                 source = SOURCE_PROBE if has_op else SOURCE_STATIC
             elif has_op:
-                level = "supported"
+                level = "limited" if any(
+                    item.name == "rewind" and item.invocation.get("method") == "muteki.history.rebuild"
+                    for item in snapshot.items
+                ) else "supported"
                 source = SOURCE_PROBE
             else:
                 level = "unknown"
@@ -326,10 +329,11 @@ def build_interaction_matrix(
             rows.append(InteractionCapabilityRow(
                 key=key,
                 level=level,
-                reason=_reason_for(key, level),
+                reason=("回退会重建引擎会话并传入保留的聊天历史；工作区文件与外部操作保持原状"
+                        if level == "limited" else _reason_for(key, level)),
                 alternative=_alternative_for(key, level),
                 source=source,
-                invocable=level == "supported",
+                invocable=level in {"supported", "limited"},
             ))
             continue
 

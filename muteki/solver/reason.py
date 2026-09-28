@@ -155,6 +155,7 @@ class ReasonResult:
     verdict: str = VERDICT_EXPLORE  # complete | course_correct | explore
     drift: str = ""  # if course_correct: what went wrong + the fix
     complete_why: str = ""  # if complete: why the goal is already met
+    goal_evidence_facts: list[int] = field(default_factory=list)
     progress_summary: str = ""  # operator-facing synthesis from this Reason pass
     progress_sections: dict[str, list[str]] = field(default_factory=dict)
     semantic_dedupe_available: bool = False
@@ -184,211 +185,10 @@ REASON_SYSTEM = """你负责读取完整 Fact-Goal-Step 图并决定下一步，
 - progress.summary 使用简体中文概括当前进展和下一步。
 - 只输出 JSON。"""
 
-# Pentest variant: SAME planner. Success is finding_ok (evidence predicate).
-# verdict=complete is a planning/coverage signal, not goal_met by itself.
-REASON_SYSTEM_PENTEST = """You are the REASON phase of an autonomous \
-penetration-testing / security-audit swarm. You do NOT execute — you read the \
-shared findings-graph and DECIDE the swarm's next move. Become an expert in this \
-target's stack, judge the state honestly, and output STRICT JSON.
-
-First decide a `verdict` (planning signal only — it does NOT accept a report):
-- "complete": every direction that still matters has been proposed; use this so
-  the coordinator can check coverage. A `complete` verdict does NOT mark the
-  engagement successful. Success is the report collection: a Worker submits a
-  complete exploit report through the Blackboard Skill, a different report
-  reproducer confirms it, and a host-side value check rejects self-XSS /
-  attacker-only / informational issues. Planner prose, this complete_why text,
-  and Review summaries are not reports.
-- "course_correct": the run has DRIFTED — workers are repeating, stuck on a dead
-  angle, or chasing unverified assumptions, and the current intents won't reach the
-  goal. Say what went wrong and propose a corrected direction.
-- "explore": still making progress; propose the next high-value directions.
-  Prefer directions that can yield a distinct, independently reproducible report
-  (SQL injection, command injection, stored XSS affecting other users, IDOR).
-  Do not propose reflected self-XSS.
-
-Output JSON:
-{
-  "verdict": "explore",
-  "goal_met": false,
-  "complete_why": "<only if verdict=complete: why the engagement goal is proven>",
-  "drift": "<only if verdict=course_correct: what's going wrong + the correct direction>",
-	  "progress": {
-	    "summary": "<2-4 plain-language sentences: current judgment, key basis, blocker, and next move>",
-	    "confirmed": ["<synthesized confirmed conclusion, cite [#N] when useful>"],
-	    "active": ["<what is being tested and why>"],
-	    "blocked": ["<ruled-out direction or current blocker>"],
-	    "next": ["<highest-value next action and expected result>"]
-	  },
-	  "intents": [
-	    {"id": "I1", "from": [3, 7], "goal": "<one concrete, independent next direction>",
-	     "worker_class": "code", "route_hash": "web:login:sqli", "branch_id": "",
-	     "priority": "high|normal|low",
-	     "lane_key": "", "risk_class": "",
-	     "depends_on": [], "rationale": "<why>", "dup_of": null,
-	     "reopen_because": "",
-	     "expected_observable": "<objective output that proves success or failure>",
-	     "stop_condition": "<when this step is finished — do not expand further>",
-	     "coverage_key": "", "requires_capabilities": [],
-	     "value_claim": {"effect": "terminal|capability_advance|shared_enablement|branch_resolution|coverage",
-	       "capability_before": [], "capability_after": [], "unblocks": [],
-	       "consumer_capabilities": [], "novelty_key": "<stable new-state key>",
-	       "cost_class": "small|medium|large", "risk_class": "read|mutating|exclusive",
-	       "critical_path": false}}
-	  ],
-	  "supersede_intents": ["<exact open or claimed intent id made obsolete by new evidence>"],
-	  "supersede_why": "<cite the new fact(s) that make those queued steps obsolete>",
-	  "pinned_facts": [3, 7],
-	  "audit": ["<finding text you do NOT trust and why>"]
-	}
-
-Rules:
-- `progress` is the operator-facing status report from this Reason pass. Write it
-  in concise Simplified Chinese, keep technical identifiers verbatim, and synthesize
-  the state instead of copying graph rows. Keep each list to at most 3 items.
-- Each intent MUST include a "from" array of fact sequence numbers (the [#N] tags
-  in the evidence list) that motivated this direction. Use the exact numbers.
-- Propose at most {max_intents} INDEPENDENT, NON-OVERLAPPING intents (distinct
-  directions, not minor variations of one). Prefer 1-2 high-value steps unless
-  the board still has several clearly independent attack surfaces. Each should
-  be a clear high-value direction — focus on the core insight, do not
-  over-specify the steps; trust the executor to be the expert.
-- One intent owns one coherent immediate stage. Bundle adjacent file reads,
-  route variants, host probes, or configuration checks that use the same
-  primitive and answer the same question; do not split them into parallel siblings.
-- Fresh operational evidence has first claim on the next step. A credential,
-  secret, key, execution primitive, or reachable service must be consumed directly
-  before unrelated coverage expands. When such evidence is still a tool-backed
-  candidate, use one bounded verify-then-use intent instead of a standalone verifier
-  followed by a later consumer.
-- Advance verified capabilities in order: discovery, read, controlled write,
-  execution, identity/credentials, topology, pivot, objective. As soon as verified
-  facts satisfy the prerequisites for the next capability, the first intent MUST be
-  the smallest bounded promotion step; broad enumeration becomes low priority or is
-  superseded. Do not keep searching for more instances of a capability already proven.
-- Read the trailing "Immediate planning frontier" before choosing work. A concluded
-  discovery intent closes only that exact step; it does not close a newly exposed
-  child capability. When source, configuration, or tool output names a concrete
-  promotion technique, validate that technique before speculative enumeration and
-  give the child step its own route_hash and, when mutating, its required lane_key.
-- `progress.next` and `intents` must agree. Every executable action listed in
-  `progress.next` must have a matching intent in the same response, and the first
-  next action must match the first intent. Before returning, replace any intent that
-  duplicates an open, claimed, or attempted route; never leave the novel action only
-  in progress prose.
-- Use shell_agent for a proven multi-stage chain whose intermediate target state is
-  volatile or expensive to recreate; let it reach the next stable, publishable
-  handoff. Keep independent discovery and one-check experiments as code Workers.
-- For a pivot, an address found in page text or configuration is a clue, not
-  runtime topology. If current interfaces, routes, DNS, or neighbors are not yet
-  established, map them first; target only a verified reachable endpoint afterward.
-- On a cold start with no verified facts, propose at least 3 immediately
-  executable, complementary surface-level steps when max_intents permits it.
-  Use depends_on=[] for every cold-start step: do not queue a future step that
-  waits for another proposed step. Whole-challenge race-scout intents are
-  background scouts, not proof that a concrete surface is already covered.
-- The Coordinator has already admitted the target and configured direct routing.
-  Do not spend an intent solely checking VPN, proxy variables, shell availability,
-  or basic reachability. A worker should report an actual access failure if one occurs.
-- expected_observable is the objective output that would prove the step
-  succeeded or failed. stop_condition says when the worker must conclude
-  instead of expanding the step. coverage_key is an optional surface label;
-  it is one part of the step contract, not a unique identity by itself.
-- Every intent must include a structured value_claim and requires_capabilities.
-  requires_capabilities may contain only exact keys already listed under Active
-  Reusable Capabilities. Local shell, HTTP clients, admitted target routing,
-  VPN/proxy setup, and Toolbox files are host-provided primitives: never list
-  them as requirements. If a missing reusable capability is needed, propose an
-  immediately executable shared_enablement Step with requires_capabilities=[]
-  and declare that new key in capability_after; do not queue its consumer yet.
-  A high request is accepted only when the claim cites active Fact evidence and
-  would complete the goal, add a missing next capability, or establish one
-  reusable capability for at least two downstream consumers. Repeated coverage
-  and already-active capabilities are normal or low priority.
-- When several later intents would repeat an expensive access procedure, open a
-  shared_enablement intent. Describe the required reusable reach and operations;
-  the Worker selects an implementation from ./toolbox and publishes the resulting
-  AccessPath after an actual health check.
-- Set priority="high" only for a step directly unlocked by new verified evidence
-  or required to continue a proven exploit chain. Use "normal" for independent
-  current work and "low" for broad fallback coverage.
-- When new verified evidence makes an existing intent obsolete, list its exact id
-  in supersede_intents and cite the replacing fact in supersede_why. A claimed/running
-  intent may be listed only when the replacement is a high-priority step on the same
-  exclusive lane_key; the Coordinator will stop that exact stale owner before the
-  replacement runs. Never supersede work merely to reword or reprioritize it.
-- Propose at most one new intent for each non-empty lane_key in a Reason pass.
-- An exclusive lane is one coherent stage. Do not retry the same lane_key from
-  the same from-fact set under a rewritten route or goal. Cite at least one new
-  fact sequence when fresh evidence genuinely reopens that resource direction.
-- After a verified credential, execution primitive, or pivot unlocks a concrete
-  chain, supersede queued broad fallback scans that no longer deserve capacity.
-  Only one open/claimed intent may own a coverage_key. reopen_because applies to
-  completed attempts changed by new evidence; it never authorizes duplicate live work.
-- Treat live race-scout assignments as active work when avoiding collisions.
-  In particular, do not duplicate a state-mutating action already owned by a race
-  scout even though its whole-surface assignment has no precise coverage_key.
-- Start with supplied files and existing evidence. Do not require scanning or
-  wordlist enumeration merely to fill coverage gaps. Record what remains
-  unknown instead of automatically expanding the search.
-- Step identity is the exact combination of route_hash, from_facts,
-  coverage_key, expected_observable, and stop_condition. Do not re-propose the
-  same five-field contract. When new verified evidence changes a step, cite its
-  Fact id in from_facts and explain the change in reopen_because.
-- If a proposed intent is the same direction as an existing open/claimed/attempted
-  intent shown in the graph, set dup_of to that existing intent id. Only leave
-  dup_of null for genuinely new directions. Set reopen_because only when new
-  verified evidence materially changes an attempted route.
-- worker_class is "code" by default. Use "shell_agent" ONLY for a long-chain task
-  a single code call can't do. Use "verifier" for a narrow proof task. Use
-  "review" only when the swarm needs arbitration: repeated route loops, conflicting
-  assumptions, challenged findings, or ignored dead-ends.
-- If you know the semantic route, include route_hash as category:surface:technique
-  (for example web:login:sqli, web:jwt:forge, cloud:iam:privilege).
-- For destructive or exclusive work (remote RCE exploit, service-crashing PoC,
-  reverse-shell listener, relay/responder, or an exclusive shell session), include
-  lane_key and risk_class. lane_key is resource-only:
-  risk_class:transport:port@host, such as destructive:tcp:445@172.22.11.45.
-  Log poisoning and writes to a shared upload path are exclusive too; use stable
-  keys such as destructive:http-log:80@host or destructive:http-upload:80@host.
-  Do NOT include the exploit technique in lane_key.
-- Rows under "Observations" are audit input and never support a vulnerability or
-  an ordinary intent. Only active Facts with [#seq] identifiers may appear in
-  from_facts. A useful Observation must first be reproduced with admitted tool
-  evidence so the host creates a Fact.
-- Findings in the graph carry [#seq] labels. Put fact seqs in
-  `pinned_facts` only when the finding/fact is semantically reusable later
-  (credentials, non-English clues, topology constraints, exploit preconditions,
-  scope constraints, or durable discoveries). Do NOT pin routine host:port strings,
-  URLs, headers, or generic key:value text unless the surrounding meaning makes it
-  important.
-- The graph may carry "Open intents (directions in flight)" and "Already attempted
-  (concluded intents)" sections. Do NOT propose an intent that is the SAME
-  DIRECTION as any entry there — a reworded/paraphrased goal is still the same
-  direction. Re-open an attempted direction ONLY when NEW verified evidence
-  materially changes it (name that fact in "rationale"). If every direction you
-  can think of is already listed, output an EMPTY "intents" array (or verdict
-  "course_correct" with a genuinely different angle) — never re-word old goals.
-- If the graph carries a "Flags already captured" section, NEVER propose an intent
-  to re-recover a flag listed there — that direction is DONE. Propose intents only
-  for flags NOT yet captured (or other goal-advancing evidence).
-- Stay within the engagement scope; do not propose out-of-scope actions.
-- Respect Review directives, Challenged facts, Suppressed routes, and Open branches:
-  do not rely on a challenged finding except in verifier work; do not propose a
-  suppressed route unless new evidence/review reopened it; keep incompatible branch
-  assumptions separated with branch_id.
-- Preserve execution topology. Do not assume the operator's Mac, the public VPS,
-  the entry host, and internal pivot hosts can reach the same networks. If the graph
-  or operator standing guidance does not prove where a command must run from, create
-  a verifier intent to establish the execution site/network path before planning
-  lateral movement.
-- Output ONLY the JSON object, nothing else."""
-
-
 REASON_COMPACTION_RESERVE_TOKENS = 16_384
 REASON_KEEP_RECENT_TOKENS = 20_000
 
-REASON_COMPACTION_SYSTEM = """You compact historical state for a long-running CTF or pentest Reason planner.
+REASON_COMPACTION_SYSTEM = """You compact historical state for a long-running CTF Reason planner.
 Return a structured checkpoint that another Reason call can use instead of the older graph rows.
 Do not propose new work, declare completion, or invent evidence. Preserve every cited [#seq], exact
 credential, host, port, path, payload fragment, flag, scope restriction, negation, and unresolved
@@ -471,21 +271,8 @@ def build_reason_prompt(
     mode: str = "ctf",
     scope: Optional[str] = None,
 ) -> list[dict]:
-    # pentest → goal-driven planner (the operator's engagement goal anchors the
-    # `complete` verdict). CTF uses the compact graph-planning contract above.
-    if mode == "pentest":
-        user = f"Engagement goal:\n{goal}\n\n" if (goal or "").strip() else ""
-        if (scope or "").strip():
-            user += f"Engagement scope:\n{scope.strip()}\n\n"
-        user += (
-            f"Shared findings-graph:\n\n{summary}\n\n"
-            "Output the planning JSON."
-        )
-        system = REASON_SYSTEM_PENTEST.replace("{max_intents}", str(max_intents))
-        return [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
+    if mode != "ctf":
+        raise ValueError("legacy JSON Reason supports CTF only")
     system = REASON_SYSTEM.replace("{max_intents}", str(max_intents))
     return [
         {"role": "system", "content": system},
@@ -807,7 +594,7 @@ async def run_reason(
     mode: str = "ctf",
     scope: Optional[str] = None,
 ) -> ReasonResult:
-    """Call the planner and parse CTF or pentest intents and audit."""
+    """Call the legacy CTF JSON planner and parse its intents and audit."""
     messages = build_reason_prompt(
         graph_summary,
         max_intents=max_intents,
@@ -1201,10 +988,8 @@ def dispatch_intents(
         for intent in result.intents:
             _record(intent, outcome="dropped", reason_code="graph_unavailable")
         return proposed
-    ctf_mode = (
-        getattr(getattr(shared_graph, "challenge", None), "mode", "ctf")
-        == "ctf"
-    )
+    graph_mode = getattr(getattr(shared_graph, "challenge", None), "mode", "ctf")
+    ctf_mode = graph_mode in {"ctf", "pentest"}
     if ctf_mode:
         for raw_index, intent in enumerate(result.intents):
             if not all((
@@ -1221,11 +1006,8 @@ def dispatch_intents(
                         "stage": "dispatch",
                     })
                 continue
-            worker_class = (
-                intent.worker_class
-                if intent.worker_class in {"code", "shell_agent"}
-                else "code"
-            )
+            allowed_classes = {"code", "shell_agent", "verifier"} if graph_mode == "pentest" else {"code", "shell_agent"}
+            worker_class = intent.worker_class if intent.worker_class in allowed_classes else "code"
             priority = (
                 intent.priority
                 if intent.priority in {"high", "normal", "low"}
@@ -1244,6 +1026,7 @@ def dispatch_intents(
                     "stop_condition": intent.stop_condition,
                     "coverage_key": intent.coverage_key,
                     "required_pocs": list(intent.required_pocs),
+                    **({"value_claim": dict(intent.value_claim)} if graph_mode == "pentest" else {}),
                 },
                 from_fact_seqs=intent.from_facts or None,
             )
@@ -1268,7 +1051,7 @@ def dispatch_intents(
                 "priority": priority,
                 "requested_priority": priority,
                 "priority_reason": "planner",
-                "value_claim": {},
+                "value_claim": dict(intent.value_claim) if graph_mode == "pentest" else {},
                 "requires_capabilities": [],
                 "dup_of": "",
                 "reopen_because": "",

@@ -8,6 +8,8 @@ import { ConversationChromeContext, type ConversationChrome } from "@/components
 import { Icon, type IconName } from "@/components/Icon";
 import { MotionIcon } from "@/components/MotionIcon";
 import { MutekiLogo } from "@/components/MutekiLogo";
+import { Tooltip } from "@/components/chat/ui/Tooltip";
+import { ChartNoAxesCombined, Home } from "lucide-react";
 import {
   applySelection,
   readSavedSelection,
@@ -44,22 +46,17 @@ export function useSharedWorkspaceOverview(): WorkspaceOverview {
 }
 
 function iconOf(entry: WorkspaceKindEntry): IconName {
+  if (entry.id === "pentest") return "target";
   if (entry.icon === "flag") return "crosshair";
   if (entry.icon === "trophy") return "trophy";
   if (entry.icon === "chat") return "messages";
   return "layers";
 }
 
-function detailOf(entry: WorkspaceKindEntry): string {
-  if (entry.aggregateType === "thread") return "Runtime 会话";
-  if (entry.aggregateType === "run") return "CTF 单题";
-  if (entry.aggregateType === "competition") return "批量调度";
-  return entry.aggregateType || "工作区";
-}
-
 function publicDescriptionOf(entry: WorkspaceKindEntry): string {
+  if (entry.id === "pentest") return "用自然语言启动授权测试并查看证据报告";
   if (entry.aggregateType === "thread") return "与外部 Agent 协作并查看工具、审批和产物";
-  if (entry.aggregateType === "run") return "创建 CTF 单题并交给 Coordinator 调度；渗透功能正在重写";
+  if (entry.aggregateType === "run") return "创建 CTF 单题并交给 Coordinator 调度";
   if (entry.aggregateType === "competition") return "同步比赛题目、调度 Run 并跟踪提交裁定";
   return entry.description;
 }
@@ -92,7 +89,7 @@ function GlobalWorkspacePalette({ overview }: { overview: WorkspaceOverview }) {
   const [bodyHits, setBodyHits] = useState<ConversationSearchHit[]>([]);
   const [bodyHitsLoading, setBodyHitsLoading] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
-  const localRunPalette = pathname.startsWith("/run/") || pathname === "/task" || pathname === "/solve";
+  const localRunPalette = pathname.startsWith("/run/") || pathname === "/ctf" || pathname === "/pentest";
   const onChat = pathname.startsWith("/chat");
 
   useEffect(() => setOpen(false), [pathname]);
@@ -107,8 +104,8 @@ function GlobalWorkspacePalette({ overview }: { overview: WorkspaceOverview }) {
     }));
     if (solveOnly) {
       base.push(
-        { id: "task-workers", label: "单题 Worker 配置", detail: "出战池、运行环境与调度预算", href: "/task/workers", icon: "cpu" },
-        { id: "task-credentials", label: "Agent 凭据", detail: "配置做题 Worker 使用的凭据", href: "/task/workers?section=credentials", icon: "lock" },
+        { id: "task-workers", label: "CTF Worker 配置", detail: "出战池、运行环境与调度预算", href: "/ctf/workers", icon: "cpu" },
+        { id: "task-credentials", label: "Agent 凭据", detail: "配置做题 Worker 使用的凭据", href: "/ctf/workers?section=credentials", icon: "lock" },
         { id: "settings-appearance", label: "显示模式", detail: "开启对话与比赛模式", href: "/settings/appearance", icon: "gear" },
       );
     } else base.push(
@@ -116,7 +113,7 @@ function GlobalWorkspacePalette({ overview }: { overview: WorkspaceOverview }) {
       { id: "settings-hub", label: "打开设置", detail: "设置中心：Agents、能力、运维与扩展", href: "/settings/agents", icon: "gear" },
       { id: "settings-agents", label: "Agents", detail: "九类引擎的登录、模型和接入", href: "/settings/agents", icon: "plug" },
       { id: "settings-capabilities", label: "能力管理", detail: "Conversation Thread 授权与全局 MCP/Skills，不是 Fact 图白名单", href: "/settings/capabilities", icon: "network" },
-      { id: "task-workers", label: "单题 Worker 配置", detail: "出战池、运行环境、调度预算与推理模型", href: "/task/workers", icon: "cpu" },
+      { id: "task-workers", label: "CTF Worker 配置", detail: "出战池、运行环境、调度预算与推理模型", href: "/ctf/workers", icon: "cpu" },
       { id: "settings-appearance", label: "外观配色", detail: "主题、配色引擎与界面语言", href: "/settings/appearance", icon: "droplet" },
       { id: "settings-extensions", label: "扩展设置", detail: "安装、升级与回滚", href: "/settings/extensions", icon: "layers" },
       { id: "competition-credentials", label: "比赛平台凭据", detail: "连接、轮换、撤销与浏览器会话", href: "/competitions?focus=credentials", icon: "lock" },
@@ -307,26 +304,15 @@ function GlobalWorkspacePalette({ overview }: { overview: WorkspaceOverview }) {
   );
 }
 
-function WorkspaceNav({
-  overview,
-  onCurtainCollapse,
-}: {
+function WorkspaceNav({ overview, sidebarToggle }: {
   overview: WorkspaceOverview;
-  onCurtainCollapse: () => void;
+  sidebarToggle: ReactNode;
 }) {
   const pathname = usePathname();
   const solveOnly = useSolveOnlyMode();
   const visibleKinds = overview.kinds.filter((kind) => !solveOnly || kind.aggregateType === "run");
-  const [mobileOpen, setMobileOpen] = useState(false);
   const [theme, setTheme] = useState<ThemeMode>("dark");
 
-  useEffect(() => setMobileOpen(false), [pathname]);
-  useEffect(() => {
-    const desktop = window.matchMedia("(min-width: 841px)");
-    const closeOnDesktop = () => { if (desktop.matches) setMobileOpen(false); };
-    desktop.addEventListener("change", closeOnDesktop);
-    return () => desktop.removeEventListener("change", closeOnDesktop);
-  }, []);
   useEffect(() => {
     setTheme(readSavedTheme());
     const observer = new MutationObserver(() => {
@@ -346,126 +332,59 @@ function WorkspaceNav({
     }
     applySelection(readSavedSelection(), next);
   };
+  const themeLabel = theme === "dark" ? "切换到亮色模式" : "切换到暗色模式";
 
   return (
-    <header
-      className="workspace-nav"
-    >
-      <div className="workspace-brand-placeholder" aria-hidden="true" />
-      <nav id="workspace-navigation" aria-label="工作区">
-        {visibleKinds.map((item, index) => {
-          const matchesRun = item.aggregateType === "run" && pathname.startsWith("/run/");
-          const active = matchesRun || pathname === item.route || pathname.startsWith(`${item.route}/`)
-            || (item.route === "/task" && pathname.startsWith("/solve"));
-          const status = overview.activity[item.id];
-          const attention = (status?.unread ?? 0) + (status?.approvals ?? 0);
-          return (
-            <Link key={item.id} href={item.route} className={active ? "active" : ""} aria-current={active ? "page" : undefined}>
-              <span className="workspace-nav-index" aria-hidden="true">0{index + 1}</span>
-              <Icon name={iconOf(item)} size={15} />
-              <span className="workspace-nav-label">
-                <strong>{item.title}</strong>
-                <small>{status?.running ? `${status.running} 运行中` : detailOf(item)}</small>
-              </span>
-              {attention > 0 ? <b className="workspace-nav-badge" aria-label={`${attention} 项待处理`}>{attention}</b> : null}
-            </Link>
-          );
-        })}
-      </nav>
-      <div className="workspace-nav-actions">
-        <div className="workspace-nav-settings">
-          {!solveOnly ? <Link
-            href="/usage"
-            className={`workspace-nav-usage ${pathname === "/usage" ? "active" : ""}`}
-            aria-current={pathname === "/usage" ? "page" : undefined}
-            title="全局 Token 用量"
-          >
-            <Icon name="rows" size={15} />
-            <span>用量</span>
-          </Link> : null}
-          <Button
-            size="sm"
-            variant="ghost"
-            isIconOnly
-            className="workspace-nav-theme-toggle"
-            aria-label={theme === "dark" ? "切换到亮色模式" : "切换到暗色模式"}
-            onPress={toggleTheme}
-          >
-            <MotionIcon active={theme === "light"} from="sun" to="moon" size={15} />
-          </Button>
-          <Link
-            href={solveOnly ? "/settings/appearance" : "/settings/agents"}
-            className="workspace-nav-settings-gear"
-            aria-label="打开设置"
-            title="设置"
-          >
-            <Icon name="gear" size={15} />
+    <aside className="workspace-activity-rail" aria-label="工作台导航">
+      <div className="workspace-rail-main">
+        <Tooltip content="首页" placement="right">
+          <Link href="/" className="workspace-rail-control" aria-label="首页" aria-current={pathname === "/" ? "page" : undefined}>
+            <Home size={19} aria-hidden="true" />
           </Link>
-          <Button size="sm" variant="ghost" className="workspace-nav-command" onPress={() => {
+        </Tooltip>
+        <nav id="workspace-navigation" className="workspace-rail-links" aria-label="工作区">
+          {visibleKinds.map((item) => {
+            const active = pathname === item.route || pathname.startsWith(`${item.route}/`)
+              || (item.route === "/ctf" && (pathname.startsWith("/run/") || pathname === "/solve"));
+            const status = overview.activity[item.id];
+            const attention = (status?.unread ?? 0) + (status?.approvals ?? 0);
+            return (
+              <Tooltip key={item.id} content={item.title} placement="right">
+                <Link href={item.route} className="workspace-rail-control" aria-label={item.title} aria-current={active ? "page" : undefined}>
+                  <Icon name={iconOf(item)} size={19} />
+                  <strong className="sr-only">{item.title}</strong>
+                  {attention > 0 ? <b className="workspace-rail-badge" data-workspace-badge="" aria-label={`${attention} 项待处理`}>{attention}</b> : null}
+                </Link>
+              </Tooltip>
+            );
+          })}
+        </nav>
+        {!solveOnly ? <Tooltip content="全局用量" placement="right">
+          <Link href="/usage" className="workspace-rail-control" data-workspace-action="usage" aria-label="全局用量" aria-current={pathname === "/usage" ? "page" : undefined}>
+            <ChartNoAxesCombined size={19} aria-hidden="true" />
+          </Link>
+        </Tooltip> : null}
+        <div className="workspace-rail-divider" />
+        <Tooltip content="全局搜索" shortcut={["⌘", "K"]} placement="right">
+          <button type="button" className="workspace-rail-control" data-workspace-action="search" aria-label="打开全局搜索" onClick={() => {
             window.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true }));
-          }} aria-label="打开全局命令"><Icon name="search" size={15} /><span>全局搜索</span><kbd>⌘K</kbd></Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            isIconOnly
-            className="workspace-nav-curtain-toggle"
-            aria-label="收起顶部导航"
-            onPress={onCurtainCollapse}
-          >
-            <Icon name="chevronUp" size={15} />
-          </Button>
-        </div>
-        <div className="workspace-nav-tools">
-          <Button size="sm" variant="ghost" isIconOnly aria-label="打开全局搜索" onPress={() => {
-            window.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true }));
-          }}><Icon name="search" size={17} /></Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            isIconOnly
-            className="workspace-nav-menu"
-            aria-expanded={mobileOpen}
-            aria-controls={mobileOpen ? "mobile-workspace-navigation" : undefined}
-            aria-label={mobileOpen ? "关闭导航菜单" : "打开导航菜单"}
-            onPress={() => setMobileOpen((value) => !value)}
-          >
-            <MotionIcon active={mobileOpen} from="menu" to="x" />
-          </Button>
-        </div>
+          }}><Icon name="search" size={19} /></button>
+        </Tooltip>
+        {sidebarToggle}
       </div>
-      <Modal isOpen={mobileOpen} onOpenChange={setMobileOpen}>
-        <Modal.Backdrop>
-          <Modal.Container placement="top" size="sm">
-            <Modal.Dialog className="workspace-mobile-dialog" aria-label="工作台导航">
-              <Modal.CloseTrigger aria-label="关闭导航菜单" />
-              <Modal.Header><Modal.Heading>工作台导航</Modal.Heading></Modal.Header>
-              <Modal.Body>
-                <nav id="mobile-workspace-navigation" className="workspace-mobile-links" aria-label="工作区">
-                  {visibleKinds.map((item) => (
-                    <Link key={item.id} href={item.route} onClick={() => setMobileOpen(false)}
-                      aria-current={pathname === item.route || pathname.startsWith(`${item.route}/`) || (item.aggregateType === "run" && pathname.startsWith("/run/")) ? "page" : undefined}>
-                      <Icon name={iconOf(item)} size={18} />
-                      <span><strong>{item.title}</strong><small>{detailOf(item)}</small></span>
-                      <Icon name="chevronRight" size={15} />
-                    </Link>
-                  ))}
-                </nav>
-                <div className="workspace-mobile-utilities">
-                  {!solveOnly ? <Link href="/usage" onClick={() => setMobileOpen(false)}><Icon name="rows" size={17} />全局用量</Link> : null}
-                  {solveOnly ? <Link href="/task/workers?section=credentials" onClick={() => setMobileOpen(false)}><Icon name="lock" size={17} />Agent 凭据</Link> : null}
-                  <Link href={solveOnly ? "/settings/appearance" : "/settings/agents"} onClick={() => setMobileOpen(false)}><Icon name="gear" size={17} />设置</Link>
-                  {!solveOnly ? <Link href="/settings/appearance" onClick={() => setMobileOpen(false)}><Icon name="droplet" size={17} />外观与动效</Link> : null}
-                  <Button variant="ghost" onPress={toggleTheme}>
-                    <MotionIcon active={theme === "light"} from="sun" to="moon" size={17} />
-                    {theme === "dark" ? "切换亮色" : "切换暗色"}
-                  </Button>
-                </div>
-              </Modal.Body>
-            </Modal.Dialog>
-          </Modal.Container>
-        </Modal.Backdrop>
-      </Modal>
-    </header>
+      <div className="workspace-rail-bottom">
+        <Tooltip content={themeLabel} placement="right">
+          <button type="button" className="workspace-rail-control" data-workspace-action="theme" aria-label={themeLabel} onClick={toggleTheme}>
+            <MotionIcon active={theme === "light"} from="sun" to="moon" size={19} />
+          </button>
+        </Tooltip>
+        <Tooltip content="设置" placement="right">
+          <Link href={solveOnly ? "/settings/appearance" : "/settings/agents"} className="workspace-rail-control" data-workspace-action="settings" aria-label="打开设置">
+            <Icon name="gear" size={19} />
+          </Link>
+        </Tooltip>
+      </div>
+    </aside>
   );
 }
 
@@ -474,13 +393,10 @@ export function WorkspaceFrame({ children }: { children: ReactNode }) {
   const compactScreen = useMediaQuery("(max-width: 768px)");
   const solveOnly = useSolveOnlyMode();
   const overview = useWorkspaceOverview(10000, solveOnly);
-  const collaborationPage = /^\/run\/[^/]+\/collaboration\/?$/.test(pathname);
-  const [curtainCollapsed, setCurtainCollapsed] = useState(collaborationPage);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [sidebarWidth, setSidebarWidthState] = useState(RAIL_WIDTH_DEFAULT);
   const [sidebarWidthReady, setSidebarWidthReady] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
-  const previousCollaborationPage = useRef(collaborationPage);
 
   useEffect(() => {
     try {
@@ -510,7 +426,6 @@ export function WorkspaceFrame({ children }: { children: ReactNode }) {
   }, [pathname]);
 
   const toggleSidebarCollapsed = useCallback(() => {
-    if (curtainCollapsed && pathname.startsWith("/chat")) setCurtainCollapsed(false);
     setSidebarCollapsed((current) => {
       const next = !current;
       try {
@@ -520,7 +435,7 @@ export function WorkspaceFrame({ children }: { children: ReactNode }) {
       }
       return next;
     });
-  }, [curtainCollapsed, pathname]);
+  }, []);
 
   const setSidebarWidth = useCallback((width: number) => {
     setSidebarWidthState(clampRailWidth(width, window.innerWidth));
@@ -535,32 +450,11 @@ export function WorkspaceFrame({ children }: { children: ReactNode }) {
     setMobileSidebarOpen,
   }), [sidebarCollapsed, toggleSidebarCollapsed, sidebarWidth, setSidebarWidth, mobileSidebarOpen]);
 
-  useEffect(() => {
-    if (previousCollaborationPage.current === collaborationPage) return;
-    previousCollaborationPage.current = collaborationPage;
-    setCurtainCollapsed(collaborationPage);
-  }, [collaborationPage]);
-
-  const collapseCurtain = () => {
-    if (pathname.startsWith("/chat") && sidebarCollapsed) {
-      setSidebarCollapsed(false);
-      try {
-        window.localStorage.setItem(CONVERSATION_SIDEBAR_COLLAPSED_STORAGE_KEY, "0");
-      } catch {
-        // The sidebar remains expanded for this session.
-      }
-    }
-    setCurtainCollapsed(true);
-    window.requestAnimationFrame(() => {
-      document.getElementById(workspaceSkipTargetId(pathname))?.focus({ preventScroll: true });
-    });
-  };
-
-  const expandCurtain = () => {
-    setCurtainCollapsed(false);
-    window.requestAnimationFrame(() => {
-      document.querySelector<HTMLButtonElement>(".workspace-nav-curtain-toggle")?.focus({ preventScroll: true });
-    });
+  const sidebarExpanded = compactScreen ? mobileSidebarOpen : !sidebarCollapsed;
+  const sidebarLabel = sidebarExpanded ? "收起对话导航" : "展开对话导航";
+  const toggleConversationSidebar = () => {
+    if (compactScreen) setMobileSidebarOpen((open) => !open);
+    else toggleSidebarCollapsed();
   };
 
   const skipTargetId = workspaceSkipTargetId(pathname);
@@ -574,55 +468,27 @@ export function WorkspaceFrame({ children }: { children: ReactNode }) {
         data-solve-only={solveOnly ? "true" : undefined}
         data-conversation-layout={pathname.startsWith("/chat") ? "true" : undefined}
         data-conversation-sidebar-collapsed={sidebarCollapsed ? "true" : "false"}
-        data-nav-collapsed={curtainCollapsed ? "true" : "false"}
-        style={{ "--conv-sidebar-width": `${sidebarWidth}px`, "--workspace-nav-height": solveOnly ? "0px" : undefined } as CSSProperties}
+        style={{ "--conv-sidebar-width": `${sidebarWidth}px` } as CSSProperties}
       >
         <a className="skip-link" href={`#${skipTargetId}`}>跳到主要内容</a>
-        {!solveOnly ? <><div className="workspace-shared-brand-dock">
-          <Link href="/" className="workspace-nav-brand" aria-label="返回 Muteki 首页">
-            <MutekiLogo size={30} wordmark decorative />
-          </Link>
-          {pathname.startsWith("/chat") ? (
-            <button
-              type="button"
-              className="workspace-brand-sidebar-toggle"
-              aria-label={compactScreen
-                ? mobileSidebarOpen ? "关闭对话导航" : "打开对话导航"
-                : sidebarCollapsed ? "展开对话导航" : "收起对话导航"}
-              aria-expanded={compactScreen ? mobileSidebarOpen : !sidebarCollapsed}
-              aria-controls="conversation-sidebar"
-              onClick={() => {
-                if (compactScreen) setMobileSidebarOpen((open) => !open);
-                else toggleSidebarCollapsed();
-              }}
-            >
-              {compactScreen ? <MotionIcon active={mobileSidebarOpen} from="panelLeft" to="x" size={17} />
-                : <Icon name="panelLeft" size={17} />}
+        <WorkspaceNav overview={overview} sidebarToggle={pathname.startsWith("/chat") ? (
+          <Tooltip content={sidebarLabel} placement="right">
+            <button type="button" className="workspace-rail-control workspace-rail-sidebar-toggle" data-workspace-action="sidebar"
+              aria-label={sidebarLabel} aria-expanded={sidebarExpanded} aria-controls="conversation-sidebar" onClick={toggleConversationSidebar}>
+              <Icon name="panelLeft" size={19} />
             </button>
-          ) : null}
+          </Tooltip>
+        ) : null} />
+        <div id={frameContentId} tabIndex={frameContentId ? -1 : undefined} className="workspace-frame-content" data-workspace-path={pathname}>
+          {pathname.startsWith("/chat") ? <div className="workspace-shared-brand-dock">
+            <Link href="/" className="workspace-nav-brand" aria-label="返回 Muteki 首页"><MutekiLogo size={30} wordmark decorative /></Link>
+            <button type="button" className="workspace-brand-sidebar-toggle" aria-label={sidebarLabel}
+              aria-expanded={sidebarExpanded} aria-controls="conversation-sidebar" onClick={toggleConversationSidebar}>
+              <Icon name="panelLeft" size={17} />
+            </button>
+          </div> : null}
+          {children}
         </div>
-        <WorkspaceNav
-          overview={overview}
-          onCurtainCollapse={collapseCurtain}
-        />
-        {curtainCollapsed ? (
-          <div className="workspace-curtain-zone">
-            <Button
-              variant="ghost"
-              className="workspace-curtain-trigger"
-              aria-label="展开顶部导航"
-              aria-controls="workspace-navigation"
-              aria-expanded={false}
-              onPress={expandCurtain}
-            >
-              <span className="workspace-curtain-handle" aria-hidden="true">
-                <span className="workspace-curtain-bar" />
-                <Icon name="chevronDown" size={13} />
-              </span>
-            </Button>
-          </div>
-        ) : null}</> : null}
-        <div id={frameContentId} tabIndex={frameContentId ? -1 : undefined} className="workspace-frame-content" data-workspace-path={pathname}>{children}</div>
         <GlobalWorkspacePalette overview={overview} />
       </div>
       </ConversationChromeContext.Provider>

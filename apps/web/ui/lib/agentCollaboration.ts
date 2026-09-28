@@ -78,14 +78,13 @@ export type CollaborationAgentIdentity = Pick<
   "engine" | "profileId" | "profileLabel" | "model" | "accountId" | "endpointHost" | "connection" | "provider"
 >;
 
-/** The six output counters shared by worker cards and the coordinator. */
+/** Output counters shared by worker cards and the coordinator. */
 export interface CollaborationMetrics {
   facts: number;
   observations: number;
   candidates: number;
   deadEnds: number;
   pocs: number;
-  reports: number;
   reviews: number;
 }
 
@@ -241,7 +240,6 @@ const CONTROL_ACTORS = new Set(["reason", "coordinator", "report-value", "dispat
 const OPERATOR_ACTORS = new Set(["operator", "human"]);
 const RELATION_TS_CAP = 50;
 const SPENT_POC = new Set(["spent", "rejected", "quarantined"]);
-const REJECTED_REPORT = new Set(["rejected", "repro_failed"]);
 const EMPTY_INTENTS: BlackboardIntent[] = [];
 const EMPTY_ROWS: CollaborationKnowledgeItem[] = [];
 
@@ -288,7 +286,7 @@ function countKnowledge(metrics: CollaborationMetrics, item: CollaborationKnowle
     case "dead_end": metrics.deadEnds += 1; break;
     case "route": if (item.status === "suppressed") metrics.deadEnds += 1; break;
     case "poc": if (!SPENT_POC.has(item.status || "")) metrics.pocs += 1; break;
-    case "report": if (!REJECTED_REPORT.has(item.status || "")) metrics.reports += 1; break;
+    case "report": break;
     case "review": metrics.reviews += 1; break;
     case "step":
     case "goal":
@@ -308,7 +306,7 @@ function countKnowledge(metrics: CollaborationMetrics, item: CollaborationKnowle
 }
 
 function emptyMetrics(): CollaborationMetrics {
-  return { facts: 0, observations: 0, candidates: 0, deadEnds: 0, pocs: 0, reports: 0, reviews: 0 };
+  return { facts: 0, observations: 0, candidates: 0, deadEnds: 0, pocs: 0, reviews: 0 };
 }
 
 /** The six counters with one exclusion rule set for every agent. */
@@ -586,14 +584,6 @@ function isControlActor(actor: string): boolean {
   return !actor || CONTROL_ACTORS.has(actor);
 }
 
-function reportOwner(intentById: Map<string, BlackboardIntent>, report: BlackboardView["vulnReports"][number]): string | undefined {
-  const submittedBy = report.history.find((entry) => entry.status === "submitted")?.actor;
-  return collaborationAgentId(report.submitter)
-    || collaborationAgentId(report.intentId ? intentById.get(report.intentId)?.worker : undefined)
-    || collaborationAgentId(submittedBy)
-    || collaborationAgentId(report.actor);
-}
-
 /**
  * Map a backend verifier string to one worker: a solver id directly, or a
  * legacy engine name when exactly one worker runs that engine.
@@ -735,20 +725,6 @@ function knowledgeRows(
     ...rowStatus("poc", poc.status),
     intentId: poc.intentId,
     artifactId: poc.artifactId,
-  });
-
-  for (const report of bb.vulnReports) rows.push({
-    id: `report:${report.id}`,
-    kind: "report",
-    title: report.title || report.resourceId || report.id,
-    detail: report.narrative || report.impactWhat || report.reason || report.findingClass,
-    agentId: reportOwner(intentById, report),
-    ts: report.history[report.history.length - 1]?.ts ?? report.ts,
-    appearedTs: report.history[0]?.ts ?? report.ts,
-    tone: report.status === "accepted" || report.status === "reproduced" ? "success" : report.status === "rejected" || report.status === "repro_failed" ? "danger" : "warning",
-    ...rowStatus("report", report.status),
-    intentId: report.intentId,
-    witness: report.witness,
   });
 
   for (const finding of bb.reviewFindings) rows.push({
@@ -1003,7 +979,7 @@ const knowledgeLayerOf = layer((
   for (const fact of bb.facts) if (fact.factSeq) factsBySeq.set(fact.factSeq, fact);
 
   const rawRows = knowledgeRows(bb, roster, intentById, operatorDirectives, lockRequests, startedAt, finishedAt);
-  const rows = canvasModeOf({ mode, blackboard: bb }) === "ctf"
+  const rows = canvasModeOf({ mode }) === "ctf"
     ? projectCtfKnowledgeRows(rawRows, {
         taskContract,
         expectedFlags,
@@ -1159,12 +1135,6 @@ const relationLayerOf = layer((
     const verifier = resolveVerifierAgent(fact.verifier, roster);
     if (verifier) addRelation("verify", verifier, fact.actor, `fact:${fact.factSeq ?? fact.ts}`, fact.promotedTs ?? fact.ts);
   }
-  for (const report of bb.vulnReports) {
-    const verifier = resolveVerifierAgent(report.reproVerifier, roster);
-    const owner = reportOwner(knowledge.intentById, report);
-    if (verifier && owner) addRelation("verify", verifier, owner, `report:${report.id}`, report.history[report.history.length - 1]?.ts ?? report.ts);
-  }
-
   // report: worker → coordinator, one reference per conclusion the worker wrote to the board.
   for (const id of roster.workers) {
     for (const item of knowledge.byAgent.get(id)?.rows || EMPTY_ROWS) {

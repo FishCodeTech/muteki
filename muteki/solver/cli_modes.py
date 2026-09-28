@@ -12,7 +12,6 @@ from muteki.solver.cli_prompts import (
     _CTF_WORKER_REMINDERS,
     _RESPOND_ASK_PROMPT,
     _RESPOND_MARK_FALSE_PROMPT,
-    _RESPOND_PENTEST_WRITEUP_PROMPT,
     _RESPOND_WRITEUP_PROMPT,
     without_operator_input_capability,
 )
@@ -46,7 +45,7 @@ def _any_resource_limit(result: CliResult) -> bool:
 
 def _checkpoint_prompt(self) -> str:
     """Render the forced same-session handoff at the execution lease boundary."""
-    if getattr(self.challenge, "mode", "ctf") == "ctf":
+    if getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}:
         return "\n".join(_CTF_WORKER_REMINDERS)
     return _CHECKPOINT_PROMPT.format(
         intent_goal=(self.intent_goal or self._engagement_goal()),
@@ -170,7 +169,7 @@ async def _run_bootstrap(self) -> SolveOutcome:
             result_text = self._result_text_with_stderr(r)
         except RuntimeError as exc:
             if (
-                getattr(self.challenge, "mode", "ctf") != "ctf"
+                getattr(self.challenge, "mode", "ctf") not in {"ctf", "pentest"}
                 or not self._session_established
             ):
                 raise
@@ -191,7 +190,7 @@ async def _run_bootstrap(self) -> SolveOutcome:
     # second, unscoped context path outside ContextManifest accounting.
     self._remove_unscoped_board_file(wd)
     initial_prompt = self._build_prompt()
-    if getattr(self.challenge, "mode", "ctf") == "ctf":
+    if getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}:
         execute_timeout = max(1, int(self.timeout))
         first_slice = min(600, execute_timeout)
         worker_oom_killed = False
@@ -395,9 +394,6 @@ async def _run_bootstrap(self) -> SolveOutcome:
             f"{self.driver.name} CLI: partial Flag progress",
             session=session, engine=self.driver.name, workdir=str(wd),
             flags=found, worker_result=self._last_worker_result)
-    if self._pentest_findings_ready():
-        return await self._finish_pentest_finding(
-            session=session, wd=wd, steps=1, label="CLI")
 
     if worker_cancelled:
         self._note_worker_stop("cancelled")
@@ -513,7 +509,7 @@ async def _run_explore(self) -> SolveOutcome:
                 or getattr(self, "_pending_pocs", None)
             )
             if (
-                getattr(self.challenge, "mode", "ctf") != "ctf"
+                getattr(self.challenge, "mode", "ctf") not in {"ctf", "pentest"}
                 or not resumable_or_handed_off
             ):
                 raise
@@ -523,7 +519,7 @@ async def _run_explore(self) -> SolveOutcome:
 
     self._remove_unscoped_board_file(wd)
     initial_prompt = self._build_explore_prompt()
-    if getattr(self.challenge, "mode", "ctf") == "ctf":
+    if getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}:
         execute_timeout = max(1, int(self.timeout))
         first_slice = min(600, execute_timeout)
         argv, stdin_text = self._execute_invocation(initial_prompt, session)
@@ -641,7 +637,6 @@ async def _run_explore(self) -> SolveOutcome:
     self._transcript_artifact_id = str(self.artifacts.put(
         all_text, suffix=".txt") or "")
     accepted = self._stream_accepted[0] if self._stream_accepted else None
-    await self._finalize_verifier_repro()
     deadends = list(getattr(self, "_pending_dead_ends", None) or [])
 
     if getattr(self, "_step_committed", False):
@@ -705,9 +700,6 @@ async def _run_explore(self) -> SolveOutcome:
             f"{self.driver.name} explore: partial Flag progress",
             session=session, engine=self.driver.name, workdir=str(wd),
             flags=found, worker_result=self._last_worker_result)
-    if self._pentest_findings_ready():
-        return await self._finish_pentest_finding(
-            session=session, wd=wd, steps=1, label="explore")
 
     if worker_cancelled:
         self._note_worker_stop("cancelled")
@@ -925,11 +917,9 @@ async def _run_respond(self) -> SolveOutcome:
         prompt = _RESPOND_MARK_FALSE_PROMPT.format(
             flag=self.hitl_cmd.get("flag") or "(the reported flag)", note=note)
     elif action == "writeup":
-        prompt = (
-            _RESPOND_PENTEST_WRITEUP_PROMPT
-            if str(getattr(self.challenge, "mode", "ctf")) == "pentest"
-            else _RESPOND_WRITEUP_PROMPT
-        )
+        if str(getattr(self.challenge, "mode", "ctf")) == "pentest":
+            raise RuntimeError("Pentest reports are generated from the shared graph; use the Pentest report endpoint")
+        prompt = _RESPOND_WRITEUP_PROMPT
     else:  # ask / hint / redirect / anything conversational
         question = text or "(no question text)"
         if action == "redirect":

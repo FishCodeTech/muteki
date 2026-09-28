@@ -71,7 +71,8 @@ class _RenderMixin:
                 "SELECT i.intent_id,i.goal,i.priority,i.requested_priority,"
                 "i.status,i.dispatch_state,i.result_detail,i.created_seq,ce.ts,"
                 "re.payload,i.expected_observable,i.stop_condition,"
-                "i.coverage_key,i.requires_capabilities_json,i.required_pocs_json "
+                "i.coverage_key,i.requires_capabilities_json,i.required_pocs_json,"
+                "i.value_claim_json "
                 "FROM intents i "
                 "LEFT JOIN events ce ON ce.seq=i.created_seq "
                 "LEFT JOIN events re ON re.seq=i.result_seq "
@@ -323,17 +324,34 @@ class _RenderMixin:
                 lines.append(f"    createdAt: {finding['created_at']}")
 
         created_at = facts[0]["created_at"] if facts else ""
-        expected_flags = max(
-            1, int(getattr(self.challenge, "expected_flags", 1) or 1)
-        )
-        lines.extend([
-            "goals:",
-            "  - id: goal_final",
-            "    kind: final",
-            "    finding_class: flag",
-            f"    expected: {expected_flags}",
-            "    criterion: 解决这道 CTF 题目，并提交全部 FLAG，多 FLAG 题目要找到全部 FLAG 并有效提交",
-        ])
+        if getattr(self.challenge, "mode", "ctf") == "pentest":
+            pentest = getattr(self.challenge, "pentest_contract", None)
+            policy = getattr(pentest, "authorization", None)
+            lines.extend([
+                "engagement:",
+                "  mode: pentest",
+                f"  contractVersion: {int(getattr(pentest, 'version', 1))}",
+                f"  target: {self._ctf_yaml_scalar(getattr(pentest, 'target', '') or self.challenge.target)}",
+                f"  authorizedScope: {self._ctf_yaml_scalar(', '.join(getattr(policy, 'scope', []) or []))}",
+                "  destructiveActions: forbidden",
+                "  publicResearch: allowed",
+                "goals:",
+                "  - id: goal_final",
+                "    kind: pentest_objective",
+                f"    criterion: {self._ctf_yaml_scalar(getattr(pentest, 'goal', '') or self.challenge.goal)}",
+            ])
+        else:
+            expected_flags = max(
+                1, int(getattr(self.challenge, "expected_flags", 1) or 1)
+            )
+            lines.extend([
+                "goals:",
+                "  - id: goal_final",
+                "    kind: final",
+                "    finding_class: flag",
+                f"    expected: {expected_flags}",
+                "    criterion: 解决这道 CTF 题目，并提交全部 FLAG，多 FLAG 题目要找到全部 FLAG 并有效提交",
+            ])
         if created_at:
             lines.append(f"    createdAt: {created_at}")
         lines.append("steps:" if step_rows else "steps: []")
@@ -342,6 +360,7 @@ class _RenderMixin:
             dispatch_state, result_detail, _created_seq, created_ts,
             raw_result_payload, expected_observable, stop_condition,
             coverage_key, requires_capabilities_json, required_pocs_json,
+            value_claim_json,
         ) in step_rows:
             try:
                 result_payload = json.loads(raw_result_payload or "{}")
@@ -385,6 +404,16 @@ class _RenderMixin:
                 if value:
                     visible, _ = encode_graph_text(value)
                     lines.append(f"    {key}: {self._ctf_yaml_scalar(visible)}")
+            if getattr(self.challenge, "mode", "ctf") == "pentest":
+                claim = json.loads(value_claim_json or "{}")
+                for key, field in (("asset", "asset"), ("identity", "identity"),
+                                   ("riskTier", "risk_tier"),
+                                   ("evidenceRequirement", "evidence_requirement"),
+                                   ("authorizationVersion", "authorization_version")):
+                    value = claim.get(field)
+                    if value:
+                        visible, _ = encode_graph_text(value)
+                        lines.append(f"    {key}: {self._ctf_yaml_scalar(visible)}")
             capabilities = json.loads(requires_capabilities_json or "[]")
             if capabilities:
                 lines.append("    requiresCapabilities:")
@@ -964,7 +993,7 @@ class _RenderMixin:
             "# Historical Reason checkpoint\n" + str(compact_summary).strip()
             if str(compact_summary or "").strip() else ""
         )
-        if getattr(self.challenge, "mode", "ctf") == "ctf":
+        if getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}:
             return self.to_ctf_graph_yaml()
         parts = [checkpoint,
                  self._summary_for_fact_seqs(

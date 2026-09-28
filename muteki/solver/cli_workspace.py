@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import os
 import re
 import shutil
@@ -23,7 +22,6 @@ from muteki.solver.cli_protocol import (
     _REPO_BLACKBOARD_SCRIPT,
     _WORKER_PATH_PREFIX,
 )
-from muteki.solver.vuln_report import report_id_from_intent
 
 def _stable_worker_path(current: str) -> str:
     """Put system tool dirs before host shims without dropping the user's PATH."""
@@ -73,10 +71,16 @@ def sync_deployed_blackboard_skills() -> list[dict]:
     return []
 
 
-def _blackboard_script_path(self) -> str:
+def _blackboard_script_path(self, cwd: str | None = None) -> str:
     # Container: baked into the worker image at /usr/local/bin/blackboard.py
     # (docker/worker/blackboard.py), kept fresh by image rebuilds.
     if self.container is not None:
+        if getattr(self.challenge, "mode", "ctf") == "pentest" and cwd:
+            staged = Path(cwd).resolve() / ".muteki" / "blackboard.py"
+            mapper = getattr(self.container, "to_container_path", None)
+            if staged.is_file() and callable(mapper):
+                return str(mapper(str(staged)))
+            raise FileNotFoundError("Pentest Blackboard tool was not staged")
         return "/usr/local/bin/blackboard.py"
     # Source checkout: run the repo copy DIRECTLY — no deployed copy to drift
     # out of sync (see _repo_blackboard_script). This is the common case for
@@ -132,6 +136,22 @@ def _stage_attachments(self, wd: Path) -> list[str]:
     points at the immutable object, and the cwd entry points at `inputs/by-name`.
     """
     wd = Path(wd).resolve()
+    if getattr(self.challenge, "mode", "ctf") == "pentest":
+        staged_board = wd / ".muteki" / "blackboard.py"
+        staged_board.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(_REPO_BLACKBOARD_SCRIPT, staged_board)
+        staged_board.chmod(0o444)
+    if (getattr(self.challenge, "mode", "ctf") == "pentest"
+            and getattr(self.driver, "name", "") == "pi"):
+        extension = Path(__file__).with_name("pi_pentest_tool_timeout.ts")
+        staged_extension = wd / ".muteki" / extension.name
+        staged_extension.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(extension, staged_extension)
+        staged_extension.chmod(0o444)
+        flags = tuple(getattr(self.driver, "_CONTEXT_FLAGS", ()) or ())
+        extension_arg = str(Path(".muteki") / extension.name)
+        if extension_arg not in flags:
+            self.driver._CONTEXT_FLAGS = (*flags, "--extension", extension_arg)
     root = workspace_root_for_worker(wd)
     ensure_workspace(root, runtime={
         "backend": "container" if getattr(self, "container", None) is not None else "local",
@@ -160,29 +180,6 @@ def _stage_attachments(self, wd: Path) -> list[str]:
     self._task_file_sha256 = hashlib.sha256(
         instruction.encode("utf-8", errors="replace")
     ).hexdigest()
-    self._report_file_name = ""
-    self._report_file_sha256 = ""
-    if getattr(self, "mode", "") == "report_reproducer":
-        report_id = report_id_from_intent(
-            str(getattr(self, "intent_id_assigned", "") or ""))
-        reports = []
-        graph = getattr(self, "shared_graph", None)
-        if graph is not None and hasattr(graph, "pending_report_repros"):
-            reports = list(graph.pending_report_repros() or [])
-        report = next((
-            value for value in reports
-            if str(value.get("report_id") or "") == report_id
-        ), None)
-        if report is None:
-            raise RuntimeError(f"verifier report {report_id or '(unknown)'} is unavailable")
-        report_text = json.dumps(report, ensure_ascii=False, indent=2)
-        report_path = wd / ".muteki_report.json"
-        report_path.write_text(report_text, encoding="utf-8")
-        report_path.chmod(0o444)
-        self._report_file_name = report_path.name
-        self._report_file_sha256 = hashlib.sha256(
-            report_text.encode("utf-8", errors="replace")
-        ).hexdigest()
     staged: list[str] = []
     for src in (self.challenge.attachments or []):
         logical_name = Path(src).name
@@ -361,70 +358,6 @@ def _workdir_path(self) -> "Optional[Path]":
     return None
 
 
-def _workdir_roots(self) -> list[Path]:
-    roots: list[Path] = []
-    seen: set[Path] = set()
-    for raw in (getattr(self, "_current_workdir", None), getattr(self, "_workdir", None)):
-        if not raw:
-            continue
-        try:
-            path = Path(raw).resolve()
-        except OSError:
-            continue
-        if path in seen:
-            continue
-        seen.add(path)
-        roots.append(path)
-    return roots
-
-
-@staticmethod
-def _path_inside(path: Path, root: Path) -> bool:
-    try:
-        path.resolve().relative_to(root.resolve())
-        return True
-    except (ValueError, OSError):
-        return False
-
-
-def _resolve_report_path(self, raw: str) -> "Optional[Path]":
-    text = (raw or "").strip().strip("`\"'")
-    if not text or text.startswith("<") or text.endswith(">"):
-        return None
-    roots = self._workdir_roots()
-    wd = roots[0] if roots else None
-    path = Path(text)
-    candidates: list[Path] = []
-    if path.is_absolute():
-        candidates.append(path)
-    elif wd is not None:
-        candidates.append(wd / path)
-    name = Path(text).name
-    for root in roots:
-        if name:
-            candidates.append(root / name)
-            try:
-                candidates.extend(root.glob(name))
-                candidates.extend(root.glob(f"*/{name}"))
-                candidates.extend(root.glob(f"*/*/{name}"))
-            except OSError:
-                pass
-    seen: set[Path] = set()
-    for cand in candidates:
-        try:
-            resolved = cand.resolve()
-        except OSError:
-            continue
-        if resolved in seen or not resolved.is_file():
-            continue
-        seen.add(resolved)
-        if name and resolved.name != name:
-            continue
-        if roots and not any(self._path_inside(resolved, root) for root in roots):
-            continue
-        return resolved
-    return None
-
 __all__ = [
     '_stable_worker_path',
     '_repo_blackboard_script',
@@ -438,7 +371,4 @@ __all__ = [
     '_link_existing_shared_artifacts',
     '_link_inherited_pocs',
     '_workdir_path',
-    '_workdir_roots',
-    '_path_inside',
-    '_resolve_report_path',
 ]

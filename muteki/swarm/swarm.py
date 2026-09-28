@@ -407,6 +407,9 @@ class Swarm(
         self.verifier_policy = self._clean_verifier_policy(
             self.stage_policy.coordinator.get("verifier")
         )
+        if getattr(self.challenge, "mode", "ctf") == "pentest":
+            self.verifier_policy["enabled"] = True
+            self.verifier_policy["allow_verifier_fallback"] = True
         self._last_review_seq = 0
         self._last_review_proposal_seq = 0
         # Restart-safe review-proposal cursor: decisions are persisted events, so
@@ -878,7 +881,6 @@ class Swarm(
                 complete_intent=False,
             )
         self._found_findings: list[dict] = []
-        self._found_reports: list[dict] = []
         self._coverage_exhausted: bool = False
 
 

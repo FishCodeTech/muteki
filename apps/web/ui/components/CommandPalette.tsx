@@ -31,6 +31,7 @@ export interface Command {
 }
 
 export interface PaletteData {
+  workspaceMode?: "ctf" | "pentest";
   open: boolean;
   onClose: () => void;
   /** the run currently selected (drives `when` for panel/worker commands). */
@@ -46,6 +47,7 @@ export interface PaletteData {
   onOpenSettings: () => void;
   agents?: Array<{ id: string; title: string; engine: string; status?: string }>;
   onOpenAgent?: (id: string) => void;
+  onOpenReport?: () => void;
 }
 
 const MAX_RUNS = 8; // cap the "switch run" matches so the list stays scannable
@@ -96,14 +98,15 @@ export function CommandPalette(props: PaletteData) {
     list.push(
       { id: "workspace-home", section: WORKSPACES, icon: "grid", label: "Muteki 首页", keywords: "home 首页", run: navigate("/") },
       { id: "workspace-chat", section: WORKSPACES, icon: "terminal", label: "对话工作区", keywords: "chat conversation 对话", run: navigate("/chat") },
-      { id: "workspace-task", section: WORKSPACES, icon: "crosshair", label: "单题工作区", keywords: "task solve ctf pentest 单题", run: navigate("/task") },
+      { id: "workspace-task", section: WORKSPACES, icon: "crosshair", label: "CTF 工作区", keywords: "task solve ctf 单题", run: navigate("/ctf") },
+      { id: "workspace-pentest", section: WORKSPACES, icon: "target", label: "渗透测试工作区", keywords: "pentest 授权 渗透", run: navigate("/pentest") },
       { id: "workspace-competition", section: WORKSPACES, icon: "grid", label: "比赛工作区", keywords: "competition contest 比赛", run: navigate("/competitions") },
     );
 
     // — General —
     list.push({
       id: "new-solve", section: GENERAL, icon: "pencil",
-      label: t("palette.cmd.newSolve"), keywords: "new solve dispatch 新建 解题 派发",
+      label: props.workspaceMode === "pentest" ? "新测试" : t("palette.cmd.newSolve"), keywords: props.workspaceMode === "pentest" ? "new pentest test 新建 测试" : "new solve dispatch 新建 解题 派发",
       run: props.onNewSolve,
     });
 
@@ -115,7 +118,7 @@ export function CommandPalette(props: PaletteData) {
         ["workers", "palette.cmd.workers", "cpu", "workers worker 详情"],
         ["collaboration", "palette.cmd.collaboration", "network", "agents collaboration 协作 拓扑 知识"],
         ["timeline", "palette.cmd.timeline", "clock", "timeline activity 活动 时间线"],
-        ["findings", "palette.cmd.findings", "alert", "findings review 审查"],
+        ...(props.workspaceMode === "pentest" ? [] : [["findings", "palette.cmd.findings", "alert", "findings review 审查"]] as Array<[ArtifactView, string, IconName, string]>),
         ["credentials", "palette.cmd.credentials", "lock", "credentials creds 凭据"],
         ["pocs", "palette.cmd.pocs", "terminal", "poc payload 工具"],
         ["routes", "palette.cmd.routes", "network", "routes branches 路线 分支"],
@@ -127,6 +130,9 @@ export function CommandPalette(props: PaletteData) {
           label: t(key), keywords: kw, kbd: panelHotkey(view),
           run: () => props.onOpenArtifact(view),
         });
+      }
+      if (props.workspaceMode === "pentest" && props.onOpenReport) {
+        list.push({ id: "pentest-report", section: PANEL, icon: "rows", label: "测试报告", keywords: "report 报告", run: props.onOpenReport });
       }
       list.push({
         id: "collab-search",
@@ -203,7 +209,7 @@ export function CommandPalette(props: PaletteData) {
     }
     return list;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, props.started, props.running, props.runs, props.activeRunId, props.agents, lang, t]);
+  }, [open, props.started, props.running, props.runs, props.activeRunId, props.agents, props.workspaceMode, props.onOpenReport, lang, t]);
 
   // Fuzzy filter
   const filtered = useMemo<Command[]>(() => {

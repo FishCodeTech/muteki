@@ -43,6 +43,11 @@ def codex_turn_input(
     ``text`` (already merged by the Conversation executor).
     """
     items: list[dict[str, Any]] = [{"type": "text", "text": text}]
+    capability = (payload or {}).get("runtime_capability") or {}
+    if capability.get("kind") == "skill":
+        invocation = capability.get("invocation") or {}
+        if invocation.get("path") and capability.get("name"):
+            items.append({"type": "skill", "name": capability["name"], "path": invocation["path"]})
     for item in _items(payload):
         if str(item.get("delivery") or "") != "native_image":
             continue

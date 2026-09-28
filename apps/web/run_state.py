@@ -113,6 +113,7 @@ class Run:
     # the bus as a sink (the run stays a dumb event source — no extra contract).
     name: str = ""
     category: str = ""
+    mode: str = "ctf"
     started: bool = False
     solved: bool = False
     paused: bool = False
@@ -157,6 +158,7 @@ class Run:
     # IDs stay active until their terminal follow-up event has been emitted.
     active_followups: set[str] = field(default_factory=set)
     termination_reasons: dict[int, str] = field(default_factory=dict)
+    terminal_reason: str = ""
     # One task owns one readiness result for each exact participating profile
     # configuration.  A continuation generation reuses the result; changing the
     # profile/model/account/runtime produces a different key and therefore a new
@@ -227,6 +229,7 @@ class Run:
             # do NOT leak the bare run id as a display name.
             "name": self.custom_name or self.name,
             "category": self.category or "",
+            "mode": self.mode,
             "started": self.started,
             "finished": self.finished,
             "solved": self.solved,

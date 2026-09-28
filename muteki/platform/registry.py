@@ -81,7 +81,7 @@ class WorkspaceKindInfo(ContractModel):
     title: str = ""
     description: str = ""
     icon: str = ""
-    # 工作区路由，例如 /task、/chat、/competitions
+    # 工作区路由，例如 /ctf、/pentest、/chat、/competitions
     route: str = ""
     # 首页创建入口路由
     create_entry: str = ""

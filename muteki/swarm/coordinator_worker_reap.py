@@ -552,29 +552,16 @@ async def _fold_finished_worker(self, state, retired) -> str:
     # standing injection below).
     self._record_flags(*(outcome.flags or
                          ([outcome.flag] if outcome.flag else [])))
-    pentest_product = (
-        getattr(self.challenge, "mode", "ctf") == "pentest"
-        and not self._pentest_flag_required()
-    )
+    pentest_product = getattr(self.challenge, "mode", "ctf") == "pentest"
     if pentest_product:
-        await self._drain_report_pipeline()
         self._sync_findings_from_graph()
         if self._findings_complete():
             state.goal_complete = True
             await emit_bb(
                 "goal_complete",
-                why="gated_reports",
-                reports=len(self._found_reports),
+                why="host_verified_objective",
+                reports=0,
                 findings=self._qualified_report_count())
-            for other in state.tasks:
-                self._cancel_solver(state.task_solvers.get(other))
-                other.cancel()
-            return "break"
-        if self._coverage_complete():
-            self._coverage_exhausted = True
-            await emit_bb(
-                "coverage_complete",
-                findings=len(self._found_findings))
             for other in state.tasks:
                 self._cancel_solver(state.task_solvers.get(other))
                 other.cancel()

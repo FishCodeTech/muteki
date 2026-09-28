@@ -80,6 +80,7 @@ export function RunSignalsStrip({
 }: RunSignalsStripProps) {
   const t = useT();
   const isCtf = canvasModeOf(deck) === "ctf";
+  const isFgs = isCtf || deck.mode === "pentest";
   const [activeSignal, setActiveSignal] = useState<InspectorSignal | null>(null);
 
   const verifiedItems = verifiedFactTexts(deck);
@@ -108,10 +109,9 @@ export function RunSignalsStrip({
   const candidates = candidateItems.length;
   const intents = openIntentItems.length;
   const deads = deadItems.length;
-  const factItems = [
-    ...verifiedFactTexts(deck),
-    ...deadEndTexts(deck),
-  ];
+  const factItems = deck.mode === "pentest"
+    ? deck.blackboard.facts.filter((fact) => fact.verified && fact.actor !== "origin").map((fact) => fact.fact)
+    : [...verifiedFactTexts(deck), ...deadEndTexts(deck)];
   const goalItems = [(deck.taskContract?.completion.goal || "").trim() || t("insp.run.taskGoal")].filter(Boolean);
   const flagItems = deck.flagConfirmations.length
     ? deck.flagConfirmations.map((row) => {
@@ -224,7 +224,7 @@ export function RunSignalsStrip({
     cardTone: string;
     activeCardTone: string;
     tooltip: string;
-  }> = isCtf
+  }> = isFgs
     ? [
         {
           key: "facts",
@@ -250,7 +250,7 @@ export function RunSignalsStrip({
         },
         {
           key: "goals",
-          icon: "flag",
+          icon: deck.mode === "pentest" ? "target" : "flag",
           label: t("meta.goals"),
           value: String(goalItems.length),
           count: goalItems.length,
@@ -259,7 +259,7 @@ export function RunSignalsStrip({
           activeCardTone: "border-accent/60 bg-accent/10 ring-1 ring-accent/30",
           tooltip: `${t("meta.goals")}: ${goalItems.length}`,
         },
-        {
+        ...(isCtf ? [{
           key: "flags",
           icon: "flag",
           label: t("meta.flags"),
@@ -269,7 +269,7 @@ export function RunSignalsStrip({
           cardTone: "hover:border-amber/40 hover:bg-amber/5 border-line/60 bg-panel/80",
           activeCardTone: "border-amber/60 bg-amber/10 ring-1 ring-amber/30",
           tooltip: `${t("meta.flags")}: ${flagItems.length}`,
-        },
+        } as const] : []),
         costSignal,
       ]
     : [

@@ -461,8 +461,8 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
 .welcome .sub { color: var(--dim); font-size: 13px; line-height: 1.75; max-width: 540px; text-wrap: pretty; }
 .suggest-label { font-size: 10px; text-transform: uppercase; letter-spacing: .1em; color: var(--muted);
   font-weight: 700; }
-.suggest { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px;
-  width: 100%; max-width: 420px; margin-top: -8px; }
+.suggest { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px;
+  width: 100%; max-width: 660px; margin-top: -8px; }
 .suggest .suggest-card { width: 100%; height: auto; min-height: 146px;
   align-items: flex-start; justify-content: flex-start; white-space: normal;
   background: var(--panel); border: 1px solid var(--border);
@@ -493,7 +493,7 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
   .welcome { width: 100%; padding-inline: 16px; }
 }
 
-@media (max-width: 500px) {
+@media (max-width: 720px) {
   .suggest { grid-template-columns: 1fr; max-width: 360px; }
   .suggest .suggest-card { min-height: 124px; }
 }

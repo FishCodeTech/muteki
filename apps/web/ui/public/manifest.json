@@ -36,7 +36,7 @@
       "name": "单项任务",
       "short_name": "任务",
       "description": "打开单项安全任务面板",
-      "url": "/task",
+      "url": "/ctf",
       "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
     }
   ],

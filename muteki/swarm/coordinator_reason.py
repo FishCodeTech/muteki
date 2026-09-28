@@ -6,19 +6,12 @@ import asyncio
 import time
 from functools import partial
 
-from muteki.solver.worker_profiles import worker_identity_event_fields
 from muteki.swarm.coordinator_state import (
     emit_scheduler_bb,
-    running_engines as scheduler_running_engines,
-    stop_for_budget as scheduler_stop_for_budget,
 )
 from muteki.swarm.graph_defs import (
     EV_FLAG_FOUND,
     SEMANTIC_GRAPH_KINDS,
-)
-from muteki.swarm.swarm_support import (
-    WorkerBudgetExhausted,
-    WorkerSpawnRejected,
 )
 
 MAX_CONSECUTIVE_PLANNER_FAILURES = 3
@@ -90,7 +83,7 @@ def _is_external_planning_input(
 async def reason_trigger_stage(self, state) -> str:
     """Start one coalesced Decide pass for each changed planning frontier."""
     emit_bb = partial(emit_scheduler_bb, self, state)
-    ctf_mode = getattr(self.challenge, "mode", "ctf") == "ctf"
+    ctf_mode = getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
     planning_limit = self._ordinary_planning_slots(state.tasks)
     state.open_intents = self._open_intents()
     dispatchable = self._dispatchable_open_intents(
@@ -248,7 +241,7 @@ async def reason_execute_stage(self, state) -> str:
     if not state.need_reason or state.reason_task is not None:
         return "proceed"
 
-    ctf_mode = getattr(self.challenge, "mode", "ctf") == "ctf"
+    ctf_mode = getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
     if ctf_mode:
         trigger = (
             "campaign_boundary"
@@ -344,7 +337,7 @@ async def reason_collect_stage(self, state) -> str:
 
     emit_bb = partial(emit_scheduler_bb, self, state)
     from muteki.solver.reason import PlannerFailure, PlannerFailureKind
-    ctf_mode = getattr(self.challenge, "mode", "ctf") == "ctf"
+    ctf_mode = getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
 
     state.reason_task = None
     self._reason_max_intents_override = None
@@ -640,9 +633,7 @@ async def reason_collect_stage(self, state) -> str:
 
 async def reason_result_stage(self, state) -> str:
     emit_bb = partial(emit_scheduler_bb, self, state)
-    running_engines = partial(scheduler_running_engines, state)
-    stop_for_budget = partial(scheduler_stop_for_budget, self, state)
-    ctf_mode = getattr(self.challenge, "mode", "ctf") == "ctf"
+    ctf_mode = getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
     if state.reason_result_ready:
         state.reason_result_ready = False
         decision_wm = max(
@@ -659,7 +650,7 @@ async def reason_result_stage(self, state) -> str:
                 state.checkpoint_replan_wm.pop(intent_id, None)
         state.open_intents = self._open_intents()
         if (
-            getattr(self.challenge, "mode", "ctf") == "ctf"
+            getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
             and state.reason_proposed_n > 0
         ):
             for decision in list(
@@ -762,63 +753,43 @@ async def reason_result_stage(self, state) -> str:
                     task_solvers=state.task_solvers, emit_bb=emit_bb)):
             return "continue"
 
-        # ── pentest stop: P1 gated findings / P2 coverage.
-        # Reason verdict=complete is a planning signal only. Product
-        # success is finding_ok, not the planner's say-so. The eval
-        # bypass (pentest_flag_required) still salvages flags.
+        # Decide interprets the goal; the host checks only cited evidence and
+        # authorization before making that decision durable.
         rr = getattr(self, "_last_reason", None)
         if getattr(self.challenge, "mode", "ctf") == "pentest":
-            await self._drain_report_pipeline()
-            self._sync_findings_from_graph()
             if self._findings_complete():
                 state.goal_complete = True
                 await emit_bb(
                     "goal_complete",
-                    why="gated_reports",
-                    reports=len(self._found_reports),
+                    why="model_goal_with_evidence",
+                    reports=0,
                     findings=self._qualified_report_count())
                 for other in state.tasks:
                     self._cancel_solver(state.task_solvers.get(other))
                     other.cancel()
                 return "break"
-            if self._coverage_complete():
-                self._coverage_exhausted = True
-                await emit_bb(
-                    "coverage_complete",
-                    findings=len(self._found_findings))
-                for other in state.tasks:
-                    self._cancel_solver(state.task_solvers.get(other))
-                    other.cancel()
-                return "break"
             if rr is not None and getattr(rr, "verdict", "") == "complete":
-                complete_why = getattr(rr, "complete_why", "")[:300]
-                if self._pentest_flag_required():
-                    if not self._flags_complete():
-                        salvaged = await self._salvage_flags_from_evidence(
-                            complete_why=complete_why)
-                        if salvaged:
-                            await emit_bb("flag_salvaged",
-                                           flags=[f[:80] for f in salvaged])
-                    if self._flags_complete():
-                        state.goal_complete = True
-                        await emit_bb("goal_complete",
-                                       why=complete_why,
-                                       flags=len(self._found_flags))
-                        for other in state.tasks:
-                            self._cancel_solver(state.task_solvers.get(other))
-                            other.cancel()
-                        return "break"
+                citations = list(getattr(rr, "goal_evidence_facts", None) or [])
+                committed = self.shared_graph.record_pentest_goal_completion(
+                    fact_seqs=citations,
+                    reason=str(getattr(rr, "complete_why", "") or ""),
+                )
+                if committed > 0 or self._findings_complete():
+                    state.goal_complete = True
                     await emit_bb(
-                        "goal_complete_rejected",
-                        why=complete_why,
-                        reason="verdict=complete but no accepted flag in store; "
-                               "continuing until a provenance-admitted flag lands")
-                else:
-                    await emit_bb(
-                        "goal_complete_rejected",
-                        why=complete_why,
-                        reason="verdict=complete is a planning signal; "
-                               "success requires a gated finding")
+                        "goal_complete",
+                        why="model_goal_with_evidence",
+                        fact_seqs=citations,
+                    )
+                    for other in state.tasks:
+                        self._cancel_solver(state.task_solvers.get(other))
+                        other.cancel()
+                    return "break"
+                await emit_bb(
+                    "goal_complete_rejected",
+                    reason="cited Fact provenance or scope is invalid",
+                    fact_seqs=citations,
+                )
         if (getattr(self.challenge, "mode", "ctf") != "pentest"
                 and rr is not None
                 and getattr(rr, "verdict", "") == "complete"
@@ -835,49 +806,4 @@ async def reason_result_stage(self, state) -> str:
                 other.cancel()
             return "break"
 
-        # ── Phase 7: adaptive re-bootstrap ──────────────────────
-        # If Reason says the run DRIFTED (course_correct), a fresh
-        # whole-challenge rush from the corrected direction often
-        # beats stepping through narrow Explores. Spawn ONE bootstrap
-        # worker seeded with the drift, if a slot is free. (Bootstrap is
-        # not a one-time phase: it can re-fire on a course correction.)
-        reason_res = getattr(self, "_last_reason", None)
-        drift = getattr(reason_res, "drift", "") if reason_res else ""
-        verdict = getattr(reason_res, "verdict", "") if reason_res else ""
-        if (
-            getattr(self.challenge, "mode", "ctf") == "pentest"
-            and verdict == "course_correct"
-            and drift
-        ):
-            if (self.review_policy.get("on_course_correct", True)
-                    and await self._maybe_start_review(
-                        trigger="course_correct", directive=drift,
-                        healthy=state.healthy, tasks=state.tasks,
-                        task_solvers=state.task_solvers, emit_bb=emit_bb)):
-                return "continue"
-            if not self._ordinary_capacity_available(state.tasks):
-                return "continue"
-            try:
-                engine = self._pick_engine(running_engines(), state.healthy, role="bootstrap")
-            except RuntimeError as exc:
-                await emit_bb("worker_spawn_rejected", reason=str(exc),
-                               phase="rebootstrap")
-                return "continue"
-            try:
-                w = self._make_cli_worker(
-                    engine, mode="bootstrap", intent_goal=drift)
-            except WorkerSpawnRejected as exc:
-                await emit_bb("worker_spawn_rejected", reason=str(exc),
-                               engine=str(engine), phase="rebootstrap")
-                return "break"
-            except WorkerBudgetExhausted as exc:
-                terminal = await stop_for_budget(str(exc))
-                return "break" if terminal else "continue"
-            t = await self._schedule_control_worker(
-                w, name=f"rebootstrap-{engine}")
-            state.tasks[t] = engine
-            state.task_solvers[t] = w
-            await emit_bb("worker_spawned", worker=w.solver_id,
-                           phase="rebootstrap", worker_role="worker",
-                           **worker_identity_event_fields(w))
     return "proceed"

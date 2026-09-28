@@ -37,7 +37,6 @@ from muteki.platform.contracts.capabilities import (
     ThreadMode,
 )
 from muteki.platform.contracts.graphs import GraphEvent, GraphScope
-from muteki.platform.contracts.events import EventEnvelope
 from muteki.platform.contracts.objects import (
     AgentSession,
     Artifact,
@@ -1599,6 +1598,13 @@ class ConversationManager:
                 except Exception:
                     pass
         normalized = str(mode or "retry").strip()
+        if normalized == "native_rewind" and target.agent_session_id != self._conv.get_state(thread_id).agent_session_id:
+            matrix = dict(connection.get("matrix") or {})
+            rows = [dict(row) for row in matrix.get("rows", [])]
+            for row in rows:
+                if row.get("key") == "rewind" and row.get("invocable"):
+                    row.update(level="limited", reason="目标属于较早的引擎会话；回退将新建会话并传入保留的聊天历史，文件保持原状")
+            connection["matrix"] = {**matrix, "rows": rows}
         if normalized not in {
             "retry", "edit_resend", "fork", "native_rewind",
         }:
@@ -1625,6 +1631,8 @@ class ConversationManager:
         provider_rewind: Optional[Any] = None,
         capability_override: Optional[dict[str, Any]] = None,
         runtime_connection: Optional[dict[str, Any]] = None,
+        dry_run: bool = False,
+        rebuild_history: bool = False,
     ) -> tuple[list[str], bool]:
         """Provider-native rewind with atomic failure semantics (C11).
 
@@ -1691,6 +1699,10 @@ class ConversationManager:
                 "工作区文件同步回退尚未通过能力校验；请改用 keep_files 或 Fork"
             )
 
+        if dry_run:
+            return [item.turn_id for item in self._conv.list_current_turns(thread_id)
+                    if item.seq >= target.seq], True
+
         # Call Provider rewind BEFORE any Muteki supersede.
         rewind_fn = provider_rewind
         if rewind_fn is None and self._adapter_registry is not None:
@@ -1724,23 +1736,23 @@ class ConversationManager:
         ]
         superseded_turn_ids = [turn.turn_id for turn in replaced]
         now = utcnow()
+        updated_turns = []
+        updated_runs = []
         for old_turn in replaced:
-            self._conv.save_turn(old_turn.model_copy(update={
-                "status": TURN_SUPERSEDED,
-                "completed_at": old_turn.completed_at or now,
+            updated_turns.append(old_turn.model_copy(update={
+                "status": TURN_SUPERSEDED, "completed_at": old_turn.completed_at or now,
             }))
-            if old_turn.run_id:
-                old_run = self._conv.get_run(old_turn.run_id)
-                if old_run is not None:
-                    self._conv.save_run(old_run.model_copy(update={
-                        "status": TURN_SUPERSEDED,
-                        "ended_at": old_run.ended_at or now,
-                    }))
-            self._conv.release_active_turn(thread_id, old_turn.turn_id)
-
-        retained_messages = self._conv.list_current_messages(thread_id)
+            old_run = self._conv.get_run(old_turn.run_id) if old_turn.run_id else None
+            if old_run is not None:
+                updated_runs.append(old_run.model_copy(update={
+                    "status": TURN_SUPERSEDED, "ended_at": old_run.ended_at or now,
+                }))
+        retained_messages = [message for message in self._conv.list_current_messages(thread_id)
+                             if message.turn_id not in superseded_turn_ids]
         next_generation = state.current_generation + 1
-        self._conv.save_state(state.model_copy(update={
+        self._conv.commit_history_rewind(updated_turns, updated_runs, state.model_copy(update={
+            "history_recovery_required": False,
+            "history_rebuild_pending": rebuild_history,
             "running_turn_id": None,
             "current_generation": next_generation,
             "pending_approval": None,

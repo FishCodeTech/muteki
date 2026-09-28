@@ -32,7 +32,7 @@ class ArtifactStore:
         if isinstance(content, bytes):
             path.write_bytes(content)
         else:
-            path.write_text(content, encoding="utf-8", errors="replace")
+            path.write_text(content, encoding="utf-8", errors="strict")
         return aid
 
     def _find(self, artifact_id: str) -> Optional[Path]:
@@ -43,7 +43,10 @@ class ArtifactStore:
         p = self._find(artifact_id)
         if p is None:
             return None
-        return p.read_text(encoding="utf-8", errors="replace")
+        # Evidence comparison needs the exact captured line endings. Path.read_text
+        # uses universal-newline translation, which turns HTTP CRLF into LF.
+        with p.open("r", encoding="utf-8", errors="strict", newline="") as handle:
+            return handle.read()
 
     def size(self, artifact_id: str) -> int:
         p = self._find(artifact_id)

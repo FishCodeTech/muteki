@@ -89,6 +89,11 @@ const SETTINGS_NAV_GROUPS: SettingsNavGroup[] = [
     titleKey: "settingsHub.group.extensions",
     items: [
       {
+        id: "chat-plugins", href: "/settings/chat-plugins",
+        labelKey: "settingsHub.chatPlugins", descriptionKey: "settingsHub.chatPluginsDesc",
+        keywords: "聊天 插件 skills mcp plugins", icon: "plug",
+      },
+      {
         id: "extensions",
         href: "/settings/extensions",
         labelKey: "settingsHub.extensions",
@@ -169,7 +174,7 @@ export function SettingsHub({ children }: { children: ReactNode }) {
         <Link href="/" className="settings-hub-brand" aria-label="返回 Muteki 首页">
           <MutekiLogo size={32} wordmark decorative />
         </Link>
-        <Link href={solveOnly ? "/task" : "/chat"} className="settings-hub-back">
+        <Link href={solveOnly ? "/ctf" : "/chat"} className="settings-hub-back">
           <Icon name="chevronRight" size={14} />
           <span>{t("settingsHub.back")}</span>
         </Link>

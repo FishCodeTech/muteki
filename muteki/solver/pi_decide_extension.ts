@@ -85,6 +85,11 @@ export default function (pi: any) {
       coverage_key: Type.String({
         description: "本 Step 覆盖的具体问题，同一问题不重复开并行 Step。",
       }),
+      asset: Type.Optional(Type.String({ description: "Pentest: 本 Step 的完整授权目标 URL。" })),
+      identity: Type.Optional(Type.String({ description: "Pentest: 测试使用的身份或匿名。" })),
+      risk_tier: Type.Optional(Type.String({ description: "Pentest: passive 或 bounded_validation。" })),
+      evidence_requirement: Type.Optional(Type.String({ description: "Pentest: 需要保存的工具证据。" })),
+      authorization_version: Type.Optional(Type.Integer({ minimum: 1 })),
       requires: Type.Optional(Type.Array(Type.String({
         description: "图中已登记的 PoC Resource ID；不需要时省略。",
       }))),
@@ -102,6 +107,8 @@ export default function (pi: any) {
         action: string; from: Array<string | number>; priority?: Priority;
         expected_observable: string; stop_condition: string;
         coverage_key: string; requires?: string[];
+        asset?: string; identity?: string; risk_tier?: string;
+        evidence_requirement?: string; authorization_version?: number;
       },
     ) {
       const count = operations.filter((item) => item.op === "open_step").length;
@@ -139,6 +146,11 @@ export default function (pi: any) {
         expected_observable: args.expected_observable,
         stop_condition: args.stop_condition,
         coverage_key: args.coverage_key,
+        asset: args.asset || "",
+        identity: args.identity || "",
+        risk_tier: args.risk_tier || "",
+        evidence_requirement: args.evidence_requirement || "",
+        authorization_version: args.authorization_version || 0,
         requires: args.requires || [],
         priority: args.priority || "normal",
       });
@@ -201,6 +213,22 @@ export default function (pi: any) {
       _id: string,
       args: { reason: string; from?: Array<string | number> },
     ) {
+      if (args.from) {
+        let refs;
+        try {
+          refs = knownReferences();
+        } catch (error) {
+          return contractError(`graph snapshot unavailable: ${String(error)}`);
+        }
+        const knownSeqs = new Set(refs.facts.values());
+        const unknownFact = args.from.find((value) =>
+          typeof value === "number"
+            ? !knownSeqs.has(value)
+            : !(refs.facts.has(String(value)) || knownSeqs.has(Number(value))));
+        if (unknownFact !== undefined) {
+          return contractError(`unknown Fact reference: ${String(unknownFact)}`);
+        }
+      }
       return add({ op: "satisfy_goal", ...args });
     },
   });

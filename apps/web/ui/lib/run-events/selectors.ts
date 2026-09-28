@@ -1,6 +1,6 @@
 /** Derived deck selectors. Moved from events.ts. */
 import type {
-  BlackboardFact, BlackboardVulnReport, ChatMessage, DeckState,
+  BlackboardFact, ChatMessage, DeckState,
   SolverCost, SolverLane,
 } from "./types";
 
@@ -79,21 +79,6 @@ function raceWorkerCounts(deck: DeckState): { active: number; total: number; fin
   const total = deck.raceTotal ?? raceLanes.length;
   const finished = deck.raceFinished ?? Math.max(0, total - active);
   return { active, total, finished };
-}
-
-function reportPipelineCounts(deck: DeckState): {
-  submitted: number;
-  reproducing: number;
-  accepted: number;
-  qualified: number;
-} {
-  const rows = deck.blackboard.vulnReports ?? [];
-  const submitted = rows.filter((row) => row.status === "submitted").length;
-  const reproducing = Math.max(0, deck.verifying ?? 0);
-  const accepted = rows.filter((row) => row.status === "accepted").length;
-  const qualified = rows.filter((row) =>
-    row.status === "accepted" && row.goalQualified !== false).length;
-  return { submitted, reproducing, accepted, qualified };
 }
 
 /** A chat message belongs to the main (coordinator) thread when it's operator
@@ -247,14 +232,6 @@ export interface SwarmDigest {
   platformRejected: number;
   openSteps: number;
   goals: number;
-  reports: BlackboardVulnReport[];
-  expectedReports: number;
-  /** Pentest report pipeline: submitted → reproducing → accepted. */
-  reportSubmitted: number;
-  reportReproducing: number;
-  reportAccepted: number;
-  /** Accepted reports that also satisfy the task completion contract. */
-  reportQualified: number;
   /** Active race-scout workers (when racing). */
   raceActive: number;
   raceTotal: number;
@@ -276,12 +253,7 @@ export interface SwarmDigest {
   finishedAt?: number;
 }
 
-function qualifiedReports(deck: DeckState): BlackboardVulnReport[] {
-  return (deck.blackboard.vulnReports ?? []).filter((row) =>
-    row.status === "accepted" && row.goalQualified !== false);
-}
-
-/** The digest phase alone: reads run flags and reports, never the chat or lanes. */
+/** The digest phase reads the shared CTF run state. */
 export function swarmPhase(deck: DeckState): SwarmDigest["phase"] {
   const pentest = deck.mode === "pentest";
   const need = Math.max(1, deck.expectedFlags || 1);
@@ -289,7 +261,6 @@ export function swarmPhase(deck: DeckState): SwarmDigest["phase"] {
   const platformRequired = !!deck.platformConfirmationRequired;
   const platformAccepted = (deck.flagConfirmations || []).filter((row) => row.status === "accepted").length;
   const flagComplete = !collectUnknown && (platformRequired ? platformAccepted >= need : deck.flags.length >= need);
-  const reports = qualifiedReports(deck);
   return !deck.started
     ? "draft"
     : (!pentest && flagComplete && deck.outcomeReason !== "runtime_failure"
@@ -302,7 +273,7 @@ export function swarmPhase(deck: DeckState): SwarmDigest["phase"] {
         ? "goal_met"
         : deck.awaitingOperator
           ? "paused"
-          : ((pentest ? reports.length > 0 : deck.flags.length > 0) && !deck.finished)
+          : (deck.flags.length > 0 && !deck.finished)
             ? "collecting"
             : deck.racing && !deck.finished
               ? "racing"
@@ -320,10 +291,7 @@ export function swarmDigest(deck: DeckState): SwarmDigest {
   // generations' finished workers visible but out of the count).
   const curIds = currentGenWorkerIds(deck);
   const online = curIds.filter((id) => (deck.lanes[id]?.online ?? !deck.finished) !== false).length;
-  const reports = qualifiedReports(deck);
-  const pipeline = reportPipelineCounts(deck);
   const raceCounts = raceWorkerCounts(deck);
-  const expectedReports = Math.max(1, deck.expectedFindings || 1);
   const need = Math.max(1, deck.expectedFlags || 1);
   const verifyingActive = deck.verifying ?? 0;
   const verifyingMax = Math.max(1, verifyingActive);
@@ -351,12 +319,6 @@ export function swarmDigest(deck: DeckState): SwarmDigest {
     platformAccepted,
     platformPending,
     platformRejected,
-    reports,
-    expectedReports,
-    reportSubmitted: pipeline.submitted,
-    reportReproducing: pipeline.reproducing,
-    reportAccepted: pipeline.accepted,
-    reportQualified: pipeline.qualified,
     raceActive: raceCounts.active,
     raceTotal: raceCounts.total,
     raceFinished: raceCounts.finished,

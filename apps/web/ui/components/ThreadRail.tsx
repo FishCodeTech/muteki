@@ -50,6 +50,7 @@ export function ThreadRail({
   onResize,
   onOpenSettings,
   onClose,
+  workspaceMode = "ctf",
 }: {
   collapsed: boolean;
   width: number;
@@ -67,9 +68,27 @@ export function ThreadRail({
   onResize: (width: number) => void;
   onOpenSettings: () => void;
   onClose: () => void;
+  workspaceMode?: "ctf" | "pentest";
 }) {
-  const t = useT();
+  const baseT = useT();
   const { lang } = useLang();
+  const t = (key: string, values?: Record<string, string | number>): string => {
+    if (workspaceMode === "pentest") {
+      const labels: Record<string, [string, string]> = {
+        "a11y.nav": ["渗透测试列表导航", "Pentest run navigation"],
+        "rail.navTitle": ["渗透测试", "Pentest runs"],
+        "rail.newSolve": ["新测试", "New test"],
+        "rail.newSolveItem": ["新测试", "New test"],
+        "rail.search": ["搜索测试…", "Search tests…"],
+        "rail.empty": ["暂无测试记录", "No tests yet"],
+        "rail.emptyHint": ["在下方输入目标并开始测试。", "Describe a target to start testing."],
+        "rail.status.solved": ["已证实", "Proven"],
+      };
+      const label = labels[key];
+      if (label) return label[lang === "zh" ? 0 : 1];
+    }
+    return baseT(key, values);
+  };
   const [showArchived, setShowArchived] = useState(false);
   const activeRun = runs.find((r) => r.run_id === activeRunId);
   const activeFinished = !draftActive && !!activeRun?.finished;
@@ -121,10 +140,12 @@ export function ThreadRail({
     resizeCleanup.current?.();
     setResizing(true);
     document.body.classList.add("rail-resizing");
+    const startX = e.clientX;
+    const startWidth = width;
 
     const onMove = (ev: PointerEvent) => {
       ev.preventDefault();
-      resizeTo(ev.clientX);
+      resizeTo(startWidth + ev.clientX - startX);
     };
     const stop = () => {
       setResizing(false);
@@ -139,7 +160,6 @@ export function ThreadRail({
     window.addEventListener("pointerup", stop);
     window.addEventListener("pointercancel", stop);
     resizeCleanup.current = stop;
-    resizeTo(e.clientX);
   };
 
   const onResizeKey = (e: React.KeyboardEvent<HTMLDivElement>) => {
@@ -393,7 +413,7 @@ export function ThreadRail({
             <div className="rail-sec">{t("rail.active")}</div>
             <div className="thread">
               <Button className="thread-item active is-draft t-texts-reveal" onClick={() => onSelect(activeRunId)}>
-                <StatusIcon status="draft" t={t} />
+                <StatusIcon status="draft" t={t} mode={workspaceMode} />
                 <span className="nm">{t("rail.newSolveItem")}</span>
               </Button>
             </div>
@@ -409,7 +429,7 @@ export function ThreadRail({
           </>
         )}
 
-        {folders.map((f) => {
+        {workspaceMode === "ctf" && folders.map((f) => {
           const items = liveRuns.filter((r) => inFolder(r, f.id)).sort(byCreationOrder);
           // While searching, hide folders that contain no match so results aren't
           // buried under empty folder headers. (Drag-and-drop targets are moot mid-search.)
@@ -460,13 +480,13 @@ export function ThreadRail({
 
         <div className={`rail-sec rail-recent-head ${dropZone === "" ? "drop" : ""}`} {...dzProps("")}>
           <span>{t("rail.recent")}</span>
-          <Button className="rail-newfolder" data-tooltip={t("rail.newFolderTitle")} aria-label={t("rail.newFolderTitle")}
+          {workspaceMode === "ctf" && <Button className="rail-newfolder" data-tooltip={t("rail.newFolderTitle")} aria-label={t("rail.newFolderTitle")}
             onClick={async () => {
               const folder = await onAction({ kind: "newFolder" });
               // immediately drop the new folder into inline-rename (auto-focused);
               // blur/Enter commits — type nothing and it just keeps the default name.
               if (folder && typeof folder === "object" && "id" in folder) setRenamingFolder(folder.id);
-            }}><Icon name="folderPlus" size={15} /></Button>
+            }}><Icon name="folderPlus" size={15} /></Button>}
         </div>
         <div className={`thread ${dropZone === "" ? "drop" : ""}`} {...dzProps("")}>
           {ungrouped.length === 0 && !draftActive && !searching && (
@@ -601,7 +621,7 @@ function RailRow({
   t: (k: string, v?: Record<string, string | number>) => string;
   lang: Lang;
 }) {
-  const name = run.name || t("rail.newSolveItem");
+  const name = run.name || (run.mode === "pentest" ? run.run_id : t("rail.newSolveItem"));
   const when = relTime(run.updated_at, lang);
   const cls = [
     "thread-item",
@@ -648,7 +668,7 @@ function RailRow({
       onDragOver={onDragOverRow}
       onDragLeave={onDragLeaveRow}
       onDrop={onDropOnRow}
-      data-tooltip={`${name} · ${run.category || "—"}`}
+      data-tooltip={run.mode === "pentest" ? name : `${name} · ${run.category || "—"}`}
       onClick={() => !renaming && onSelect()}
       onContextMenu={(e) => {
         e.preventDefault();
@@ -667,7 +687,7 @@ function RailRow({
         }
       }}
     >
-      <StatusIcon status={run.status} t={t} />
+      <StatusIcon status={run.status} t={t} mode={run.mode} />
       <div className="nm-wrap">
         {renaming ? (
           <RenameInput initial={run.name} onCommit={onCommitRename} onCancel={onCancelRename} />
@@ -675,7 +695,7 @@ function RailRow({
           <>
             <span className="nm">{name}</span>
             <span className="sub">
-              {run.category && <span className="ct">{run.category}</span>}
+              {run.mode !== "pentest" && run.category && <span className="ct">{run.category}</span>}
               <span className="st">{t(`rail.status.${run.status}`)}</span>
               {when && <span className="when" data-tooltip={absTime(run.updated_at)}>{when}</span>}
             </span>
@@ -912,14 +932,14 @@ function RenameInput({ initial, onCommit, onCancel }: {
 }
 
 /** Status glyph in front of the title — one per lifecycle state. */
-function StatusIcon({ status, t }: { status: RunStatus; t: (k: string) => string }) {
+function StatusIcon({ status, t, mode }: { status: RunStatus; t: (k: string) => string; mode?: "ctf" | "pentest" }) {
   if (status === "running") {
     return <span className="tk spin" aria-label={t("rail.status.running")}><span className="spinner" /></span>;
   }
   const icon: Record<Exclude<RunStatus, "running">, IconName> = {
     draft: "dot",
     paused: "pause",
-    solved: "flag",
+    solved: mode === "pentest" ? "check" : "flag",
     finished: "stop",
     failed: "alert",
   };

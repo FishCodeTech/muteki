@@ -1,0 +1,45 @@
+:root { color-scheme: light; --shell: #f3f3f3; --surface: #fff; --fg: #292929; --muted: #858585; --border: #e7e7e7; --hover: #e9e9e9; --accent: #387bf3; --error: #ae3737; font: 13px -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC", sans-serif; color: var(--fg); background: var(--shell); -webkit-font-smoothing: antialiased; }
+:root[data-theme="dark"] { color-scheme: dark; --shell: #202020; --surface: #17191d; --fg: #e8e8e8; --muted: #a0a0a0; --border: #353535; --hover: #343434; --error: #f59b9b; }
+* { box-sizing: border-box; }
+body { margin: 0; overflow: hidden; }
+button, input { font: inherit; color: inherit; }
+button { border: 0; background: none; cursor: pointer; -webkit-app-region: no-drag; }
+button:disabled { opacity: .35; cursor: default; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+svg { flex-shrink: 0; }
+.desktop-shell { display: grid; grid-template-columns: 56px minmax(0, 1fr); grid-template-rows: 44px minmax(0, 1fr); width: 100vw; height: 100dvh; overflow: hidden; }
+.titlebar { grid-column: 1 / -1; display: flex; align-items: center; gap: 7px; padding: 0 10px; -webkit-app-region: drag; user-select: none; }
+.titlebar.mac { padding-left: 92px; }
+.window-navigation { display: flex; align-items: center; gap: 3px; margin-right: 17px; }
+.titlebar h1 { font-size: 13px; font-weight: 500; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.server-name { color: var(--muted); font-size: 10px; margin-right: 10px; }
+.window-controls { display: flex; }
+.icon-button { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border-radius: 7px; color: var(--muted); }
+.icon-button:hover:not(:disabled) { background: var(--hover); color: var(--fg); }
+.activity-rail { grid-row: 2; grid-column: 1; display: flex; flex-direction: column; justify-content: space-between; align-items: center; padding: 9px 0 12px; gap: 20px; overflow-y: auto; scrollbar-width: none; }
+.rail-main, .rail-bottom { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.activity-rail .icon-button { width: 38px; height: 38px; border-radius: 10px; }
+.activity-rail .icon-button svg { width: 19px; height: 19px; }
+.activity-rail .icon-button[aria-current="page"], .activity-rail .icon-button.active { background: var(--hover); color: var(--fg); }
+.rail-item { position: relative; }
+.nav-badge { position: absolute; top: 1px; right: -1px; min-width: 14px; height: 14px; border-radius: 8px; padding: 0 3px; font-size: 9px; line-height: 14px; background: var(--accent); color: #fff; text-align: center; pointer-events: none; }
+.rail-divider { height: 1px; width: 22px; background: var(--border); margin: 2px 0; }
+.service-surface { grid-row: 2; grid-column: 2; border-radius: 14px 0 0 0; min-width: 0; min-height: 0; background: var(--surface); overflow: hidden; }
+.connection-stage { display: grid; place-items: center; height: 100%; padding: 30px; }
+.connection-panel, .help-panel { width: min(450px, 100%); }
+.eyebrow { margin: 0 0 17px; color: var(--muted); font-size: 11px; letter-spacing: .18em; }
+h2 { margin: 0 0 12px; font-size: 26px; font-weight: 500; letter-spacing: -.5px; }
+.intro { color: var(--muted); margin: 0 0 32px; line-height: 1.8; }
+label { display: block; font-size: 12px; margin-bottom: 10px; }
+input { width: 100%; padding: 13px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.hint { color: var(--muted); line-height: 1.8; font-size: 11px; margin: 10px 0 24px; }
+.connection-actions { display: flex; gap: 9px; margin-top: 22px; }
+.primary, .secondary { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 35px; padding: 9px 14px; border-radius: 7px; font-size: 12px; }
+.primary { background: var(--fg); color: var(--surface); }.secondary { border: 1px solid var(--border); }
+.form-error { color: var(--error); font-size: 12px; line-height: 1.8; }
+.help-panel p { color: var(--muted); line-height: 1.9; font-size: 13px; margin: 18px 0; }
+.help-panel h2 { font-size: 22px; }
+.rail-error { position: fixed; top: 48px; left: 3px; width: 50px; font-size: 10px; color: var(--error); overflow-wrap: anywhere; background: var(--shell); z-index: 4; padding: 7px; border-radius: 5px; }.rail-error button { display: block; padding: 4px; }
+.spin { animation: spin 1.2s linear infinite; }@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+@media (max-width: 1000px) { .server-name { display: none; } }

@@ -211,12 +211,15 @@ class RunGateway:
                 challenge["scope"] = str(challenge["target"]).strip()
         if (task_kind == "pentest.target" or requested_mode == "pentest"
                 or str(body.get("mode") or "").strip().lower() == "pentest"):
-            return self._error_receipt(
-                run_id, command,
-                code="run.start.pentest_temporarily_unavailable",
-                message="渗透功能正在全面重写，预计下版本进行开放。",
-                category=ErrorCategory.VALIDATION,
-            )
+            from apps.web.task_contract import prepare_dispatch_contract
+            try:
+                body, _contract = prepare_dispatch_contract(body)
+                challenge = dict(body.get("challenge") or {})
+            except ValueError as exc:
+                return self._error_receipt(
+                    run_id, command, code="run.start.pentest_contract_invalid",
+                    message=str(exc), category=ErrorCategory.VALIDATION,
+                )
         category = str(challenge.get("category") or "").strip().lower()
         if category in {"web", "pwn", "reverse", "crypto", "forensics", "misc"}:
             challenge["category"] = category
@@ -280,6 +283,10 @@ class RunGateway:
         if run is None:
             return
         challenge = dict(body.get("challenge") or {})
+        run.mode = (
+            "pentest" if str(challenge.get("mode") or body.get("mode") or "") == "pentest"
+            else "ctf"
+        )
         if challenge.get("name"):
             run.name = str(challenge["name"])
         try:

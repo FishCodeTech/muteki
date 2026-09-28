@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -17,7 +18,7 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from apps.web.run_manager import RunManager
@@ -442,6 +443,164 @@ def register(app: FastAPI) -> None:
         return {"run_id": run_id, "started": True,
                 "kind": body.get("kind", "swarm"),
                 "receipt": receipt.model_dump(mode="json")}
+
+    def _pentest_report_source(run_id: str) -> tuple[Any, Path, list[dict[str, Any]], Any]:
+        from muteki.pentest.contract import PentestContract
+
+        mgr: RunManager = app.state.manager
+        run = mgr.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="unknown run")
+        path = mgr.graph_dir(run_id) / "shared_graph.db"
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="pentest graph unavailable")
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            rows = connection.execute(
+                "SELECT seq,ts,actor,kind,payload,verified FROM events "
+                "WHERE challenge_id=? ORDER BY seq", (run_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        events = []
+        contract = None
+        for seq, ts, actor, kind, raw, verified in rows:
+            try:
+                payload = json.loads(raw or "{}")
+            except (ValueError, TypeError):
+                payload = {}
+            if kind == "pentest_contract":
+                contract = PentestContract.model_validate(payload)
+            events.append({
+                "seq": seq, "ts": ts, "actor": actor, "kind": kind,
+                "payload": payload, "verified": bool(verified),
+            })
+        if contract is None:
+            raise HTTPException(status_code=409, detail="run is not a Pentest engagement")
+        return run, path, events, contract
+
+    @app.get("/api/runs/{run_id}/pentest-report")
+    async def pentest_report(run_id: str, report_seq: int | None = None) -> Any:
+        """Read one immutable report version and the version list from the graph."""
+        from muteki.pentest.judgement import report
+
+        run, _path, events, contract = _pentest_report_source(run_id)
+        terminal_reason = str(
+            run.terminal_reason
+            or run.termination_reasons.get(run.execution_generation)
+            or (run.status() if run.finished else "")
+        )
+        try:
+            return report(events, contract, terminal_reason=terminal_reason,
+                          report_seq=report_seq)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    def _pentest_artifact_source(
+        run_id: str, fact_seq: int, artifact_id: str,
+    ) -> tuple[Path, str, int, str]:
+        """Resolve only an artifact cited by an evidenced Fact in this Run."""
+        from muteki.pentest.judgement import _evidenced_facts
+
+        if len(artifact_id) != 12 or any(char not in "0123456789abcdef" for char in artifact_id):
+            raise HTTPException(status_code=404, detail="evidence artifact unavailable")
+        _run, _graph_path, events, contract = _pentest_report_source(run_id)
+        fact = _evidenced_facts(events, contract).get(fact_seq)
+        if fact is None:
+            raise HTTPException(status_code=404, detail="evidenced Fact unavailable")
+        provenance = (fact.get("payload") or {}).get("evidence_provenance") or {}
+        refs = {str(ref.get("artifact_id")): ref
+                for ref in provenance.get("artifact_refs") or [] if isinstance(ref, dict)}
+        ref = refs.get(artifact_id)
+        if ref is None:
+            raise HTTPException(status_code=404, detail="artifact is not cited by this Fact")
+        root = app.state.manager.workspace_dir(run_id) / "arts"
+        matches = list(root.glob(f"{artifact_id}.*"))
+        if len(matches) != 1 or not matches[0].is_file() or matches[0].is_symlink():
+            raise HTTPException(status_code=404, detail="evidence artifact unavailable")
+        path = matches[0]
+        try:
+            path.resolve().relative_to(root.resolve())
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="evidence artifact unavailable") from exc
+        content = path.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        expected = str(ref.get("sha256") or "")
+        if not expected and artifact_id == str(provenance.get("artifact_id") or ""):
+            expected = str(provenance.get("artifact_sha256") or "")
+        if expected and digest != expected:
+            raise HTTPException(status_code=409, detail="evidence artifact digest mismatch")
+        return path, digest, len(content), content.decode("utf-8", errors="replace")
+
+    @app.get("/api/runs/{run_id}/pentest-evidence/{fact_seq}/artifacts/{artifact_id}")
+    async def pentest_evidence_artifact(run_id: str, fact_seq: int, artifact_id: str) -> Any:
+        path, digest, size, content = _pentest_artifact_source(run_id, fact_seq, artifact_id)
+        return JSONResponse({
+            "fact_seq": fact_seq, "artifact_id": artifact_id,
+            "filename": path.name, "sha256": digest, "size": size,
+            "content": content if path.suffix.lower() in {".txt", ".log", ".http", ".json", ".md"} else None,
+        }, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/runs/{run_id}/pentest-evidence/{fact_seq}/artifacts/{artifact_id}/download")
+    async def download_pentest_evidence_artifact(run_id: str, fact_seq: int, artifact_id: str) -> Any:
+        path, _digest, _size, _content = _pentest_artifact_source(run_id, fact_seq, artifact_id)
+        return FileResponse(path, filename=f"evidence-{artifact_id}{path.suffix}",
+                            headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/runs/{run_id}/pentest-report/regenerate")
+    async def regenerate_pentest_report(run_id: str) -> Any:
+        """Retry only the model report, preserving the completed test graph."""
+        from apps.web.llm_credentials import resolve_llm_profile_credential
+        from muteki.core.llm import LLMClient, llm_temperature_kwargs
+        from muteki.models.solve_graph import Challenge
+        from muteki.pentest.judgement import generate_report
+        from muteki.swarm.shared_graph import SQLiteSharedGraph
+
+        run, path, events, contract = _pentest_report_source(run_id)
+        if not run.finished:
+            raise HTTPException(status_code=409, detail="test is still running")
+        mgr: RunManager = app.state.manager
+        profile = dict((mgr.worker_config.get().get("llm_profiles") or {}).get("planner") or {})
+        try:
+            credential = resolve_llm_profile_credential(
+                "planner", profile, sessions_root=mgr.state_root,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=503, detail="planner credential unavailable") from exc
+        if not credential.api_key:
+            raise HTTPException(status_code=503, detail="planner credential unavailable")
+        kwargs: dict[str, Any] = dict(llm_temperature_kwargs(profile))
+        kwargs["api_key"] = credential.api_key
+        if credential.base_url:
+            kwargs["base_url"] = credential.base_url
+        challenge = Challenge(
+            id=run_id, name=run.name or run_id, category=run.category or "web",
+            target=contract.target, mode="pentest", goal=contract.goal,
+            pentest_contract=contract,
+        )
+        graph = SQLiteSharedGraph.open(db_path=path, challenge=challenge)
+        try:
+            try:
+                async with LLMClient(**kwargs) as llm:
+                    generated = await generate_report(
+                        llm, str(profile.get("model") or ""), events, contract,
+                        terminal_reason=run.terminal_reason,
+                    )
+                graph.record_pentest_report(payload=generated)
+            except Exception as exc:
+                graph.record_pentest_report(payload={
+                    "code": "report_generation_failed",
+                    "error_type": type(exc).__name__,
+                    "detail": str(exc),
+                    "raw_response": str(getattr(exc, "raw_response", "") or ""),
+                }, error=True)
+                raise HTTPException(status_code=502, detail={
+                    "code": "report_generation_failed",
+                    "error_type": type(exc).__name__,
+                }) from exc
+        finally:
+            graph.close()
+        return await pentest_report(run_id)
 
     @app.post("/api/dispatch/parse")
     async def dispatch_parse_preflight(request: Request) -> Any:

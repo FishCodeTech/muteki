@@ -395,6 +395,8 @@ def create(self, run_id: str, *, stream_seq: int | None = None) -> Run:
             if ch.get("name"):
                 run.name = ch["name"]
             run.category = ch.get("category", run.category) or run.category
+            if ch.get("mode") in {"ctf", "pentest"}:
+                run.mode = ch["mode"]
             if ch.get("expected_flags"):
                 run.expected_flags = int(ch["expected_flags"])
             run.merge_flags(ch.get("initial_flags") or [])
@@ -414,6 +416,7 @@ def create(self, run_id: str, *, stream_seq: int | None = None) -> Run:
             # visible; false-positive payloads carry the one invalid flag to
             # drop. Legacy false-positive payloads with no flag still clear all.
             run.finished = False
+            run.terminal_reason = ""
             run.solved = False
             run.paused = False
             if ev.payload.get("reason") == "resolve":
@@ -426,6 +429,7 @@ def create(self, run_id: str, *, stream_seq: int | None = None) -> Run:
             run.merge_flags(ev.payload.get("flag"))
         elif ev.event_type is EventType.RUN_FINISHED:
             run.finished = True
+            run.terminal_reason = str(ev.payload.get("reason") or "")
             run.paused = False  # a finished run is never "paused"
             run.awaiting_help = False  # finished → no outstanding ask
             run.help_text = ""

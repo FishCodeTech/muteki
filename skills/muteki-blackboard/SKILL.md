@@ -70,18 +70,22 @@ an exact file version, use `save-poc` so the shared graph can name that resource
 Describe live sessions, listeners, tunnels and proxy endpoints with their actual
 health and reuse instructions only when confirmed.
 
-Pentest Workers submit the completed report file:
+Pentest Workers use the same Fact–Goal–Step loop. Before submitting a Fact,
+list this Step's tool artifacts and inspect the selected original output when
+needed:
 
 ```bash
-python3 "$MUTEKI_BLACKBOARD_SCRIPT" submit-report ./report.json
+python3 "$MUTEKI_BLACKBOARD_SCRIPT" recent-evidence
+python3 "$MUTEKI_BLACKBOARD_SCRIPT" read-artifact '<artifact ID>'
+python3 "$MUTEKI_BLACKBOARD_SCRIPT" submit-fact '<title>' '<content>' --evidence '<artifact ID>'
+python3 "$MUTEKI_BLACKBOARD_SCRIPT" commit-step
 ```
 
-Report reproducers return one result:
-
-```bash
-python3 "$MUTEKI_BLACKBOARD_SCRIPT" submit-repro --result yes \
-  --witness '<observed output>'
-```
+The title describes the observed fact in natural language. The host validates
+the selected artifact, Worker identity, current Step, authorized target, and
+atomic commit; Decide judges whether the Fact satisfies the user's goal.
+Workers may consult public documentation and vulnerability references online;
+those sources guide hypotheses but do not count as evidence from the authorized target.
 
 Review Workers use their review commands only when the assigned role explicitly
 requests a review.
