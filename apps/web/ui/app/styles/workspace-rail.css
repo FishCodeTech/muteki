@@ -95,6 +95,13 @@
 }
 
 @media print {
-  .workspace-frame { grid-template-columns: minmax(0, 1fr); }
-  .workspace-activity-rail { display: none; }
+  /* #26: activity rail out of the way; frame must not stay height-clamped. */
+  .workspace-frame {
+    grid-template-columns: minmax(0, 1fr);
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible !important;
+  }
+  .workspace-activity-rail,
+  .workspace-rail-control { display: none !important; }
 }

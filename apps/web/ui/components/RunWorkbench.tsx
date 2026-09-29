@@ -25,6 +25,7 @@ import { actorDisplayTitle, toWorkerIdentity, workerColor, workerDisplayName, wo
 import { applySelection, readSavedSelection } from "@/lib/palette-engine";
 import { formatClock, formatElapsed, toEpochMs } from "@/lib/format";
 import { PANEL_HOTKEYS, RUNTIME_TABS, type RuntimeGroup } from "@/lib/runtimeTabs";
+import { shouldResetRuntimePanelForRun, shouldRestoreRuntimePanelOpen } from "@/lib/draftRuntimePanel";
 import { collabPagePath, readCollabUrlState } from "@/lib/collabUrlState";
 import { directiveStatusLabel, pocStatusLabel, reviewKindLabel, reviewSeverityLabel } from "@/lib/statusLabels";
 import {
@@ -164,6 +165,7 @@ const RUNTIME_COPY: Record<string, { zh: string; en: string }> = {
   "runtime.ledger.toolPending": { zh: "进行中", en: "Running" },
   "runtime.ledger.toolCallFailed": { zh: "调用失败", en: "Call failed" },
   "runtime.ledger.toolCallOk": { zh: "调用成功", en: "Call succeeded" },
+  "runtime.pentest.process": { zh: "执行过程", en: "Execution steps" },
   "runtime.event.tools": { zh: "工具组", en: "Tools" },
   "runtime.trace.collapse": { zh: "收起运行图谱", en: "Collapse runtime graph" },
   "runtime.trace.expand": { zh: "展开运行图谱", en: "Expand runtime graph" },
@@ -240,7 +242,7 @@ function useRuntimeElapsed(startedAt?: number, finishedAt?: number): string {
   return formatElapsed(end - toEpochMs(startedAt));
 }
 
-function runtimeTabCount(view: ArtifactView, deck: DeckState): number | null {
+function runtimeTabCount(view: ArtifactView, deck: DeckState, runMode: "ctf" | "pentest"): number | null {
   switch (view) {
     case "usage": return null;
     case "timeline": return deck.chat.length;
@@ -254,7 +256,9 @@ function runtimeTabCount(view: ArtifactView, deck: DeckState): number | null {
       : deck.blackboard.facts.length + deck.blackboard.deadEnds.length;
     case "findings": return deck.blackboard.reviewFindings?.length ?? 0;
     case "pocs": return deck.blackboard.pocs.length;
-    case "routes": return (deck.blackboard.suppressedRoutes?.length ?? 0) + (deck.blackboard.branches?.length ?? 0);
+    case "routes": return runMode === "pentest"
+      ? deck.blackboard.intents.length
+      : (deck.blackboard.suppressedRoutes?.length ?? 0) + (deck.blackboard.branches?.length ?? 0);
     case "directives": return (deck.blackboard.directives?.length ?? 0) + deck.operatorDirectives.length;
     case "credentials": return null;
     default: {
@@ -1244,31 +1248,17 @@ function RuntimeArtifactPanel({ runId, open, width, view, deck, running, loading
     if (event.key === "End") { event.preventDefault(); onResize(maxWidth); }
     if (event.key === "Enter") { event.preventDefault(); onResize(defaultWidth); }
   };
+  const runtimeNavigation = <div className="runtime-navigation">
+    <Tabs selectedKey={currentGroup.id} onSelectionChange={(key) => onView(visibleTabs.find((tab) => tab.group === key)?.view ?? "timeline")}>
+      <Tabs.List className="runtime-primary-nav" aria-label={t("runtime.nav.groups")}>{RUNTIME_GROUPS.map((group) => <Tabs.Tab id={group.id} key={group.id}><Icon name={group.icon} size={14} /><span>{t(group.key)}</span><Tabs.Indicator /></Tabs.Tab>)}</Tabs.List>
+    </Tabs>
+    <span className="runtime-nav-divider" aria-hidden="true" />
+    <Tabs selectedKey={view} onSelectionChange={(key) => onView(key as ArtifactView)}>
+      <Tabs.List className="runtime-view-nav" aria-label={t("runtime.nav.views")}>{groupTabs.map((tab) => { const count = runtimeTabCount(tab.view, deck, runMode); return <Tabs.Tab id={tab.view} key={tab.view}><Icon name={tab.icon} size={13} /><span>{t(runMode === "pentest" && tab.view === "routes" ? "runtime.pentest.process" : tab.key)}</span>{count !== null && <b>{count}</b>}<Tabs.Indicator /></Tabs.Tab>; })}</Tabs.List>
+    </Tabs>
+  </div>;
   if (runMode === "pentest" && workspaceActive) {
-    const evidenceCount = deck.blackboard.facts.filter((fact) => fact.verified && fact.actor !== "origin" && !isFactRetired(fact)).length;
-    const startedMs = toEpochMs(deck.startedAt);
-    const finishedMs = toEpochMs(deck.finishedAt);
-    const extraView = !["evidence", "timeline", "workers", "routes"].includes(view);
-    return <div className="artifact workspace-mode pentest-runtime" role="region" aria-label="渗透测试运行时">
-      <div className="pentest-runtime-status">
-        <span className={deck.reason.goalMet || deck.solved ? "complete" : ""}><Icon name={deck.reason.goalMet || deck.solved ? "checkCircle" : "clock"} size={17} />{deck.finished ? "已完成" : "执行中"}</span>
-        <strong>{deck.challengeName && deck.challengeName !== runId ? deck.challengeName : "授权渗透测试"} · {deck.target || "目标待确认"}</strong>
-        <small>用时 {startedMs ? formatElapsed((finishedMs || Date.now()) - startedMs) : "—"}</small>
-        {finishedMs > 0 && <time>{new Date(finishedMs).toLocaleString()}</time>}
-      </div>
-      <div className="pentest-runtime-navigation" role="tablist" aria-label="测试运行时视图">
-        {([
-          ["evidence", `证据链 (${evidenceCount})`],
-          ["timeline", "运行日志"],
-          ["workers", "Worker 输出"],
-          ["routes", "详细过程"],
-        ] as const).map(([id, label]) => <button type="button" role="tab" aria-selected={view === id} key={id} onClick={() => onView(id)}>{label}</button>)}
-        <select aria-label="其它工作视图" value={extraView ? view : ""} onChange={(event) => { if (event.target.value) onView(event.target.value as ArtifactView); }}>
-          <option value="">其它</option>
-          {visibleTabs.filter((tab) => !["evidence", "timeline", "workers", "routes"].includes(tab.view)).map((tab) => <option key={tab.view} value={tab.view}>{t(tab.key)}</option>)}
-        </select>
-      </div>
-      <div className="pentest-runtime-content">
+    const body = <div className="pentest-runtime-content">
         {loading ? <div className="panel-scroll"><PanelLoading rows={4} /></div>
           : view === "evidence" ? <PentestEvidence deck={deck} runId={runId} focusFactSeq={focusFact?.seq} focusNonce={focusFact?.nonce} onOpenReport={onOpenReport} />
           : view === "timeline" ? <RuntimeActivityStream deck={deck} selectedEventId={selectedRuntimeEventId} onSelectEvent={setSelectedRuntimeEventId} focusSpeaker={focusSpeaker} />
@@ -1277,22 +1267,20 @@ function RuntimeArtifactPanel({ runId, open, width, view, deck, running, loading
           : view === "credentials" ? <RuntimeCredentials creds={creds} onOpenFact={onOpenFact} />
           : view === "usage" ? <UsageDashboard runId={runId} />
           : <RuntimeDataView view={view} deck={deck} focusPoc={focusPoc} onAdoptReview={onAdoptReview} />}
-      </div>
+      </div>;
+    return <div className="artifact workspace-mode pentest-runtime" role="region" aria-label="渗透测试运行时">
+      {runtimeNavigation}
+      {view === "timeline" ? <div className="runtime-console">
+        <RuntimeTraceOverview deck={deck} running={running} selectedId={selectedRuntimeEventId} onSelect={setSelectedRuntimeEventId} />
+        {body}
+      </div> : body}
     </div>;
   }
   return <div className={`artifact t-page-slide ${workspaceActive ? "workspace-mode" : ""} ${resizing ? "resizing" : ""}`} style={workspaceActive ? undefined : { width: open ? width : 0, flexBasis: open ? width : 0 }} role="region" aria-label={t("a11y.artifact")}>
     {open && <>
       {!workspaceActive && <div className="artifact-resizer" role="separator" tabIndex={0} aria-label={t("art.resizeCanvas")} aria-valuemin={minWidth} aria-valuemax={maxWidth} aria-valuenow={width} onPointerDown={startResize} onKeyDown={resizeKey} onDoubleClick={() => onResize(defaultWidth)} />}
       {!workspaceActive && <div className="artifact-head runtime-head"><div className="runtime-titlemark"><Icon name={currentTab.icon} size={16} /></div><div className="runtime-heading"><span className="runtime-eyebrow">{t("runtime.title")}</span><div className="runtime-titleline"><strong>{t(currentTab.key)}</strong><span className={`runtime-state ${running ? "live" : deck.finished ? "complete" : "standby"}`}><span className="runtime-state-dot" />{t(running ? "runtime.status.live" : deck.finished ? "runtime.status.complete" : "runtime.status.standby")}</span></div><span className="runtime-context">{deck.challengeName || t("runtime.untitled")} · {deck.runId}</span></div><span className="spacer" /><Button className="x" onClick={onClose} aria-label={t("art.closeCanvas")}><Icon name="x" size={15} /></Button></div>}
-      <div className="runtime-navigation">
-        <Tabs selectedKey={currentGroup.id} onSelectionChange={(key) => onView(visibleTabs.find((tab) => tab.group === key)?.view ?? "timeline")}>
-          <Tabs.List className="runtime-primary-nav" aria-label={t("runtime.nav.groups")}>{RUNTIME_GROUPS.map((group) => <Tabs.Tab id={group.id} key={group.id}><Icon name={group.icon} size={14} /><span>{t(group.key)}</span><Tabs.Indicator /></Tabs.Tab>)}</Tabs.List>
-        </Tabs>
-        <span className="runtime-nav-divider" aria-hidden="true" />
-        <Tabs selectedKey={view} onSelectionChange={(key) => onView(key as ArtifactView)}>
-          <Tabs.List className="runtime-view-nav" aria-label={t("runtime.nav.views")}>{groupTabs.map((tab) => { const count = runtimeTabCount(tab.view, deck); return <Tabs.Tab id={tab.view} key={tab.view}><Icon name={tab.icon} size={13} /><span>{t(tab.key)}</span>{count !== null && <b>{count}</b>}<Tabs.Indicator /></Tabs.Tab>; })}</Tabs.List>
-        </Tabs>
-      </div>
+      {runtimeNavigation}
       {(() => {
         const body = <div className="artifact-body"><div className="artifact-view t-skeleton-reveal" key={loading ? "loading" : view}>
           {loading ? <div className="panel-scroll"><PanelLoading rows={4} /></div>
@@ -1385,10 +1373,20 @@ function Deck({ workspaceMode }: { workspaceMode: "ctf" | "pentest" }) {
   }, [runId, workspaceMode]);
   const { deck, connected, start, sendHitl, requestProgress, resolve } = useRun(runId);
   useEffect(() => {
+    // Cross-mode redirects must keep view/focus handoff params so a remounted
+    // deck can still open the panel the operator asked for (e.g. usage deep
+    // links from the global UsageDashboard). Dropping them lands pentest on
+    // the default evidence tab instead of the requested view.
     if (workspaceMode === "ctf" && deck.started && deck.mode === "pentest" && runId) {
-      router.replace(`/pentest?run=${encodeURIComponent(runId)}`);
+      const params = new URLSearchParams(window.location.search);
+      params.set("run", runId);
+      const query = params.toString();
+      router.replace(`/pentest?${query}`);
     } else if (workspaceMode === "pentest" && deck.started && deck.mode === "ctf" && runId) {
-      router.replace(`/run/${encodeURIComponent(runId)}`);
+      const params = new URLSearchParams(window.location.search);
+      params.delete("run");
+      const query = params.toString();
+      router.replace(`/run/${encodeURIComponent(runId)}${query ? `?${query}` : ""}`);
     }
   }, [deck.started, deck.mode, router, runId, workspaceMode]);
 
@@ -1419,11 +1417,29 @@ function Deck({ workspaceMode }: { workspaceMode: "ctf" | "pentest" }) {
   };
   const [artifactOpen, setArtifactOpen] = useState(() => {
     if (typeof window === "undefined") return false;
-    if (urlRuntimeView()) return true;
-    try { return window.sessionStorage.getItem(ARTIFACT_OPEN_STORAGE_KEY) === "1"; }
-    catch { return false; }
+    // Draft landings (/ctf, /pentest without ?run=) must not inherit a prior
+    // workspace's muteki.artifactOpen — that hides the challenge input with no
+    // conversation/runtime toggle on drafts (FishCodeTech/muteki#18).
+    const concreteRunId = workspaceMode === "pentest"
+      ? (new URLSearchParams(window.location.search).get("run") || "")
+      : runIdFromPath();
+    let sessionOpen = false;
+    try { sessionOpen = window.sessionStorage.getItem(ARTIFACT_OPEN_STORAGE_KEY) === "1"; }
+    catch { /* storage unavailable */ }
+    return shouldRestoreRuntimePanelOpen({
+      concreteRunId,
+      hasUrlRuntimeView: Boolean(urlRuntimeView()),
+      sessionOpen,
+    });
   });
   const [reportOpen, setReportOpen] = useState(false);
+  // Route-direct draft entry (and draft id swaps) close the shared panel the same
+  // way onNewSolve() does, so stale open state cannot survive into the input UI.
+  useEffect(() => {
+    if (!shouldResetRuntimePanelForRun(runId)) return;
+    setArtifactOpen(false);
+    setReportOpen(false);
+  }, [runId]);
   useEffect(() => {
     if (workspaceMode !== "pentest") return;
     const params = new URLSearchParams(window.location.search);
@@ -1479,8 +1495,11 @@ function Deck({ workspaceMode }: { workspaceMode: "ctf" | "pentest" }) {
   const [focusedPoc, setFocusedPoc] = useState<{ id: string; nonce: number } | null>(null);
   const [focusedFact, setFocusedFact] = useState<{ seq: number; nonce: number } | null>(null);
   // Focus seeds handed over by the collaboration page (see urlRuntimeView); the
-  // handoff keys are consumed once and dropped from the URL.
+  // handoff keys are consumed once and dropped from the URL. Wait until the
+  // run mode is known and matches this shell — otherwise a cross-mode replace
+  // remounts without view/worker/speaker/poc/fact and the requested panel is lost.
   useEffect(() => {
+    if (!deck.started || (deck.mode !== "ctf" && deck.mode !== "pentest") || deck.mode !== workspaceMode) return;
     const params = new URLSearchParams(window.location.search);
     if (!params.has("view") || params.get("view") === "collaboration" || params.get("view") === "report") return;
     const nonce = Date.now();
@@ -1491,7 +1510,7 @@ function Deck({ workspaceMode }: { workspaceMode: "ctf" | "pentest" }) {
     for (const key of ["view", "worker", "speaker", "poc", "fact"]) params.delete(key);
     const query = params.toString();
     window.history.replaceState(window.history.state ?? {}, "", `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash}`);
-  }, []);
+  }, [deck.started, deck.mode, workspaceMode]);
   const [winW, setWinW] = useState(typeof window !== "undefined" ? window.innerWidth : 1280);
   const [listBump, setListBump] = useState(0);
   const pushToast = useCallback((input: { msg: string; variant?: "success" | "error" | "info"; undo?: () => void; icon?: IconName }) => {

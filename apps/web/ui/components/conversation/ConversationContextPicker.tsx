@@ -81,7 +81,9 @@ export function ConversationContextPicker({
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [pathDraft, setPathDraft] = useState("");
+  const [pathError, setPathError] = useState("");
   const listId = useId();
+  const pathErrorId = useId();
   const currentProject = projects.find((project) => project.project_id === selectedProjectId);
   const needle = query.trim().toLocaleLowerCase();
   const filteredProjects = useMemo(() => {
@@ -110,15 +112,32 @@ export function ConversationContextPicker({
   const close = () => {
     setOpen(false);
     setQuery("");
+    setPathError("");
   };
 
   const submitPath = async (path = pathDraft) => {
     if (!onCreateFromPath || creatingProject) return;
-    const projectId = await onCreateFromPath(path);
-    if (!projectId) return;
-    onProjectChange(projectId);
-    setPathDraft("");
-    close();
+    const trimmed = path.trim();
+    if (!trimmed) {
+      setPathError("请输入有效的工作目录路径");
+      return;
+    }
+    setPathError("");
+    try {
+      const projectId = await onCreateFromPath(trimmed);
+      if (!projectId) {
+        // Caller swallowed the failure without throwing; keep the draft editable.
+        setPathError("无法添加该工作目录，请检查路径后重试");
+        return;
+      }
+      onProjectChange(projectId);
+      setPathDraft("");
+      setPathError("");
+      close();
+    } catch (exc) {
+      const message = exc instanceof Error ? exc.message : String(exc);
+      setPathError(message);
+    }
   };
 
   const chooseProject = (projectId: string) => {
@@ -174,14 +193,16 @@ export function ConversationContextPicker({
   const hasDirectory = Boolean(currentProject || directoryLabel);
   const triggerLabel = hasDirectory
     ? (directoryLabel || pathBasename(resolvedRoot) || currentProject?.name || "工作目录")
-    : "选择工作目录";
+    : (disabled ? "未绑定工作目录" : "选择工作目录");
   const triggerTitle = currentProject || resolvedRoot
     ? [currentProject?.name, resolvedRoot || directoryTitle].filter(Boolean).join("\n")
-    : "选择本机工作目录";
+    : (disabled
+      ? "当前会话未绑定工作目录；文件/终端需新建已绑定目录的会话"
+      : "选择本机工作目录");
 
   const labelBody = (
     <>
-      <Icon name={hasDirectory ? "folder" : "folderPlus"} size={13} className="shrink-0" />
+      <Icon name={hasDirectory || disabled ? "folder" : "folderPlus"} size={13} className="shrink-0" />
       <span className="min-w-0 truncate">{triggerLabel}</span>
       {modeLabel && hasDirectory ? (
         <span className="shrink-0 text-[11.5px] font-normal text-cx-fg-4">{modeLabel}</span>
@@ -210,7 +231,7 @@ export function ConversationContextPicker({
   return (
     <Popover
       open={open}
-      onOpenChange={(next) => { setOpen(next); if (!next) setQuery(""); }}
+      onOpenChange={(next) => { setOpen(next); if (!next) { setQuery(""); setPathError(""); } }}
       placement="top-start"
       offset={8}
       ariaLabel="选择项目"
@@ -330,9 +351,15 @@ export function ConversationContextPicker({
               <Input
                 id="conversation-directory-path"
                 aria-label="工作目录路径"
+                aria-invalid={pathError ? true : undefined}
+                aria-describedby={pathError ? pathErrorId : undefined}
                 data-testid="conversation-directory-path"
+                invalid={Boolean(pathError)}
                 value={pathDraft}
-                onChange={(event) => setPathDraft(event.target.value)}
+                onChange={(event) => {
+                  setPathDraft(event.target.value);
+                  if (pathError) setPathError("");
+                }}
                 placeholder="/workspace 或 ~/src"
                 autoComplete="off"
                 spellCheck={false}
@@ -343,6 +370,17 @@ export function ConversationContextPicker({
                 添加
               </Button>
             </div>
+            {pathError ? (
+              <p
+                id={pathErrorId}
+                role="alert"
+                aria-live="assertive"
+                data-testid="conversation-directory-path-error"
+                className="text-[12px] leading-4 text-cx-danger"
+              >
+                {pathError}
+              </p>
+            ) : null}
           </form>
         ) : null}
         {onCreateProject ? (

@@ -3,14 +3,22 @@
 import dynamic from "next/dynamic";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Button, Chip, Modal, Tabs, toast } from "@heroui/react";
 
 import { CollaborationSkeleton } from "@/components/collaboration/CollaborationSkeleton";
 import { Icon } from "@/components/Icon";
+import { clearActiveRunWorkspace, publishActiveRunWorkspace } from "@/lib/activeRunWorkspace";
 import { readCollabUrlState } from "@/lib/collabUrlState";
 import { isRunActive, swarmDigest, workerIds } from "@/lib/events";
 import { useT } from "@/lib/i18n";
+import {
+  asRunWorkspaceMode,
+  conversationHref,
+  reportHref,
+  runtimeHref,
+  type RunWorkspaceMode,
+} from "@/lib/runWorkspaceRoutes";
 import { killWorker, spawnWorker, useRun } from "@/lib/useRun";
 import { toWorkerIdentity, workerDisplayName } from "@/lib/workers";
 
@@ -20,7 +28,8 @@ import { toWorkerIdentity, workerDisplayName } from "@/lib/workers";
  * the same one the runtime panel used to embed; only the shell around it is new.
  * Cross-page jumps (worker lanes / timeline / evidence / PoC / report) go back
  * to the conversation route with `?view=…&<focus>=…`, which the deck reads on
- * mount (see components/RunWorkbench.tsx).
+ * mount (see components/RunWorkbench.tsx). Hrefs follow deck.mode so pentest
+ * stays on /pentest?run=… instead of bouncing through /run/<id> + redirect.
  */
 
 const AgentCollaborationCanvas = dynamic(
@@ -29,12 +38,6 @@ const AgentCollaborationCanvas = dynamic(
 );
 
 type FocusTarget = { id: string; nonce: number };
-
-function runtimeHref(runId: string, view: string, focus?: [string, string | number]): string {
-  const params = new URLSearchParams({ view });
-  if (focus) params.set(focus[0], String(focus[1]));
-  return `/run/${encodeURIComponent(runId)}?${params.toString()}`;
-}
 
 export default function Page() {
   return <CollaborationPage />;
@@ -49,6 +52,7 @@ function CollaborationPage() {
   const { deck, connected } = useRun(runId);
   const running = isRunActive(deck);
   const loading = !deck.started;
+  const mode: RunWorkspaceMode = asRunWorkspaceMode(deck.mode) ?? "ctf";
   const [killConfirm, setKillConfirm] = useState<{ id: string; label: string } | null>(null);
   const [killBusy, setKillBusy] = useState(false);
   // A deep link with ?agent= / ?k= is read once so the inspector opens on it
@@ -62,7 +66,18 @@ function CollaborationPage() {
     };
   }
 
+  useEffect(() => {
+    if (!runId || !deck.started) return;
+    publishActiveRunWorkspace(runId, mode);
+    return () => clearActiveRunWorkspace(runId);
+  }, [runId, deck.started, mode]);
+
   const go = useCallback((href: string) => router.push(href), [router]);
+  const toRuntime = useCallback(
+    (view: string, focus?: [string, string | number]) => runtimeHref(runId, mode, view, focus),
+    [runId, mode],
+  );
+  const conversationPath = conversationHref(runId, mode);
   const onSpawnWorker = async (engine?: string) => {
     if (!runId) return;
     const ok = await spawnWorker(runId, engine);
@@ -92,7 +107,7 @@ function CollaborationPage() {
   return (
     <div className="collab-page">
       <div className="collab-page-bar">
-        <Link href={`/run/${encodeURIComponent(runId)}`} className="collab-page-back" aria-label={t("collabPage.back")}>
+        <Link href={conversationPath} className="collab-page-back" aria-label={t("collabPage.back")}>
           <Icon name="chevronLeft" size={15} /><span>{t("collabPage.back")}</span>
         </Link>
         <div className="collab-page-context">
@@ -102,14 +117,18 @@ function CollaborationPage() {
         <Tabs
           selectedKey="collaboration"
           onSelectionChange={(key) => {
-            if (key === "conversation") go(`/run/${encodeURIComponent(runId)}`);
-            else if (key === "runtime") go(runtimeHref(runId, "timeline"));
+            if (key === "conversation") go(conversationPath);
+            else if (key === "runtime") go(toRuntime("timeline"));
+            else if (key === "report" && mode === "pentest") go(reportHref(runId));
           }}
         >
           <Tabs.List className="convo-view-switch" aria-label={t("collabPage.nav")}>
             <Tabs.Tab id="conversation"><Icon name="rows" size={13} /><span>{t("convo.viewConversation")}</span><Tabs.Indicator /></Tabs.Tab>
             <Tabs.Tab id="runtime"><Icon name="panel" size={13} /><span>{t("convo.viewRuntime")}</span><Tabs.Indicator /></Tabs.Tab>
             <Tabs.Tab id="collaboration"><Icon name="network" size={13} /><span>{t("convo.viewCollaboration")}</span><Tabs.Indicator /></Tabs.Tab>
+            {mode === "pentest" ? (
+              <Tabs.Tab id="report"><Icon name="rows" size={13} /><span>报告</span><Tabs.Indicator /></Tabs.Tab>
+            ) : null}
           </Tabs.List>
         </Tabs>
         <div className="collab-page-status">
@@ -128,10 +147,10 @@ function CollaborationPage() {
             running={running}
             onKillWorker={onKillWorker}
             onSpawnWorker={onSpawnWorker}
-            onOpenTimeline={(id) => go(runtimeHref(runId, "timeline", ["speaker", id]))}
-            onOpenWorker={(id) => go(runtimeHref(runId, "workers", ["worker", id]))}
-            onOpenFact={(seq) => go(runtimeHref(runId, "evidence", ["fact", seq]))}
-            onOpenPoc={(id) => go(runtimeHref(runId, "pocs", ["poc", id]))}
+            onOpenTimeline={(id) => go(toRuntime("timeline", ["speaker", id]))}
+            onOpenWorker={(id) => go(toRuntime("workers", ["worker", id]))}
+            onOpenFact={(seq) => go(toRuntime("evidence", ["fact", seq]))}
+            onOpenPoc={(id) => go(toRuntime("pocs", ["poc", id]))}
             focusAgent={initialFocus.current.agent}
             focusKnowledge={initialFocus.current.knowledge}
           />

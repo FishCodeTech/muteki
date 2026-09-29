@@ -43,6 +43,9 @@
   font-size: 12px;
   color: var(--muted);
 }
+.cap-topbar.is-actions-only {
+  justify-content: flex-end;
+}
 .cap-topbar-actions {
   display: flex;
   align-items: center;

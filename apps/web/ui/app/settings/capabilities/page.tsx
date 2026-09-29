@@ -3,5 +3,5 @@
 import { CapabilityManagement } from "@/components/CapabilityManagement";
 
 export default function CapabilityManagementPage() {
-  return <CapabilityManagement />;
+  return <CapabilityManagement hideIntro />;
 }

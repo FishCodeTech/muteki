@@ -7,6 +7,7 @@ import { RELATION_RECENT_WINDOW_MS, type CollaborationRelationKind } from "@/lib
 import { MOTION } from "@/lib/agentCollaborationLayout";
 import { formatClock } from "@/lib/format";
 import { useT } from "@/lib/i18n";
+import type { RunCanvasMode } from "@/lib/swarmProjection";
 import type { LaneStatusKind } from "@/lib/workerLanePresentation";
 
 import { RELATION_KINDS, relationLabel } from "./collaborationPresentation";
@@ -21,7 +22,8 @@ const LEGEND_STATES: Array<{ kind: LaneStatusKind; label: string }> = [
   { kind: "offline", label: "collab.legend.offline" },
 ];
 
-function CanvasLegend({ relationKinds, onToggleRelation }: {
+function CanvasLegend({ relationKinds, onToggleRelation, mode }: {
+  mode?: RunCanvasMode;
   relationKinds: Set<CollaborationRelationKind>;
   onToggleRelation: (kind: CollaborationRelationKind) => void;
 }) {
@@ -45,7 +47,7 @@ function CanvasLegend({ relationKinds, onToggleRelation }: {
       <h4>{t("collab.legend.states")}</h4>
       <div className="collab-legend-states">
         {LEGEND_STATES.map((state) => (
-          <span key={state.kind} className={`collab-agent-state state-${state.kind}`}><i /><span>{t(state.label)}</span></span>
+          <span key={state.kind} className={`collab-agent-state state-${state.kind}`}><i /><span>{t(state.kind === "solved" && mode === "pentest" ? "collab.legend.goalProven" : state.label)}</span></span>
         ))}
       </div>
       <p>{t("collab.legend.engineBar")}</p>
@@ -59,6 +61,7 @@ function CanvasLegend({ relationKinds, onToggleRelation }: {
  * the toolbar button frame the graph identically.
  */
 export function CanvasBar({
+  mode,
   running,
   finished,
   finishedAt,
@@ -76,6 +79,7 @@ export function CanvasBar({
   presenceToasts,
   onPresenceClick,
 }: {
+  mode?: RunCanvasMode;
   running: boolean;
   finished: boolean;
   finishedAt?: number;
@@ -142,7 +146,7 @@ export function CanvasBar({
       >
         <Icon name="info" size={12} />{t("collab.legend")}
       </button>
-      {legendOpen && <CanvasLegend relationKinds={relationKinds} onToggleRelation={onToggleRelation} />}
+      {legendOpen && <CanvasLegend mode={mode} relationKinds={relationKinds} onToggleRelation={onToggleRelation} />}
     </Panel>
   );
 }

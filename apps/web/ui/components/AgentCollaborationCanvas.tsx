@@ -959,7 +959,7 @@ function AgentCollaborationInner({ deck, running, onKillWorker, onOpenTimeline, 
     const role = roleLabel(agent, t);
     const status = replaying && isCollaborationWorker(agent)
       ? (agent.online ? t("collab.online") : t("collab.offline"))
-      : statusLabel(agent, t);
+      : statusLabel(agent, t, canvasMode);
     const absolute = positions[agent.id] || { x: LAYOUT.origin, y: LAYOUT.origin };
     // A card the search filtered out stays on the canvas dimmed but leaves the Tab order.
     const matched = (!matchedAgentIds || matchedAgentIds.has(agent.id)) && present;
@@ -967,7 +967,7 @@ function AgentCollaborationInner({ deck, running, onKillWorker, onOpenTimeline, 
     if (agent.id === COORDINATOR_ID) {
       const coordStatus = replaying
         ? (agent.online ? t("collab.status.coordinating") : t("collab.complete"))
-        : coordinatorStatus(agent, t);
+        : coordinatorStatus(agent, t, canvasMode);
       // Dispatch metrics come straight from the model's coordinator record.
       const coordination = agent.coordination;
       const data: CoordinatorNodeData = {
@@ -1361,7 +1361,7 @@ function AgentCollaborationInner({ deck, running, onKillWorker, onOpenTimeline, 
       ? t("collab.a11y.selectedAgent", {
         name: displayFor(selectedAgent).title,
         role: roleLabel(selectedAgent, t),
-        status: statusLabel(selectedAgent, t),
+        status: statusLabel(selectedAgent, t, canvasMode),
       })
       : t("collab.runOverview");
   const liveStatus = t("collab.a11y.live", {
@@ -1603,6 +1603,7 @@ function AgentCollaborationInner({ deck, running, onKillWorker, onOpenTimeline, 
         >
           <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="var(--line)" />
           <CanvasBar
+            mode={canvasMode}
             running={running}
             finished={deck.finished}
             finishedAt={deck.finishedAt}
@@ -1673,7 +1674,11 @@ function AgentCollaborationInner({ deck, running, onKillWorker, onOpenTimeline, 
         {deck.finished && (
           <div className="collab-run-banner" role="status">
             {t("collab.runBanner", {
-              outcome: t(deck.solved ? "collab.legend.solved" : "collab.unsolved"),
+              outcome: t(
+                deck.mode === "pentest"
+                  ? ((deck.solved || deck.reason.goalMet) ? "collab.legend.goalProven" : "collab.goalUnproven")
+                  : (deck.solved ? "collab.legend.solved" : "collab.unsolved"),
+              ),
               elapsed: formatElapsed(Math.max(0, toEpochMs(deck.finishedAt) - toEpochMs(deck.startedAt))),
               ended: formatClock(deck.finishedAt, "—"),
               n: model.allAgents.length,

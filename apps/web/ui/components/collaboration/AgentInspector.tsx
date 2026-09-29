@@ -604,7 +604,7 @@ export function AgentInspector({
           <small>{unselected ? t("collab.coordinatorSubtitle") : roleLabel(agent, t)}</small>
         </span>
         <span className={`collab-inspector-status state-${agent.statusKind}`}>
-          <i /><span>{statusLabel(agent, t)}</span>
+          <i /><span>{statusLabel(agent, t, canvasMode)}</span>
         </span>
         <Button variant="ghost" isIconOnly className="collab-panel-close" aria-label={t("collab.hideDetails")} onClick={onClosePanel}>
           <Icon name="x" size={14} />

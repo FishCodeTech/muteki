@@ -233,7 +233,7 @@ export function ConversationReadinessBanner({
           <div className="mb-1 flex items-center gap-2">
             <Icon name="sparkles" size={14} className="text-cx-accent" />
             <strong className="text-[13px] font-semibold text-cx-fg">开始之前</strong>
-            <span className="hidden flex-1 truncate text-[12px] text-cx-fg-4 sm:inline">选择执行环境并验证 Agent，工作目录可稍后再选。</span>
+            <span className="hidden flex-1 truncate text-[12px] text-cx-fg-4 sm:inline">选择执行环境并验证 Agent。开始后不能补选目录；文件/终端需新建已绑定目录的会话。</span>
             <Button size="xs" variant="ghost" className="ml-auto text-cx-fg-3" onClick={onDismissGuide} data-testid="conversation-readiness-skip">
               跳过引导
             </Button>
@@ -254,7 +254,7 @@ export function ConversationReadinessBanner({
                 <>
                   {onPickDirectory ? <Button size="xs" variant="secondary" onClick={onPickDirectory}>选择目录</Button> : null}
                   {onEnterPath ? <Button size="xs" variant="ghost" onClick={onEnterPath}>输入路径</Button> : null}
-                  <span className="hidden sm:inline">可选</span>
+                  <span className="hidden sm:inline">开始后不可补选</span>
                 </>
               )}
             </GuideStep>

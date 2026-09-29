@@ -1485,8 +1485,9 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
     if (projectCreating) return null;
     const path = rawPath.trim();
     if (!path) {
-      setDirectoryIssue({ message: "请输入有效的工作目录路径" });
-      return null;
+      // Throw so ConversationContextPicker can show inline field feedback
+      // instead of the outer readiness banner behind the open modal.
+      throw new Error("请输入有效的工作目录路径");
     }
     setProjectCreating(true);
     setError("");
@@ -1516,15 +1517,6 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
       setRecentPaths(rememberRecentPath(rootPath || selectedProject?.root_path || path, [path]));
       setPreferPathInput(false);
       return createdProjectId;
-    } catch (exc) {
-      const message = exc instanceof Error ? exc.message : String(exc);
-      if (isDirectoryInaccessibleMessage(message)) {
-        setDirectoryIssue({ message });
-      } else {
-        setDirectoryIssue({ message });
-        setError(message);
-      }
-      return null;
     } finally {
       setProjectCreating(false);
     }
@@ -3751,6 +3743,26 @@ export function ConversationShell({ threadId = "" }: { threadId?: string }) {
                     </>
                   )}
                 />
+                {!hasWorkspace ? (
+                  <Callout
+                    tone="warning"
+                    className="mt-2"
+                    testId="unbound-workspace-recovery"
+                    role="status"
+                    action={(
+                      <Button
+                        size="xs"
+                        variant="secondary"
+                        data-testid="unbound-workspace-new-chat"
+                        onClick={() => startNewChat()}
+                      >
+                        新建会话
+                      </Button>
+                    )}
+                  >
+                    当前会话未绑定工作目录，文件/终端/变更不可用。运行中的会话不能补绑目录，请新建会话并先选择目录。
+                  </Callout>
+                ) : null}
               </div>
             }
           />

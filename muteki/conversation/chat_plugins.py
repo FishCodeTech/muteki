@@ -23,7 +23,7 @@ from typing import Any
 
 import yaml
 
-from muteki.extensions.installer import ExtensionInstaller, Source, sha256_tree
+from muteki.extensions.installer import ExtensionInstaller, InstallError, Source, sha256_tree
 from muteki.conversation.chat_providers import PROVIDERS, provider_for
 from muteki.conversation.chat_plugin_components import compatibility, inspect_components, install_native_components
 
@@ -31,7 +31,11 @@ ENGINES = ("claude", "codex", "cursor", "pi", "omp", "kimi", "grok", "opencode")
 
 
 class ChatPluginError(ValueError):
-    pass
+    """User-correctable or attributed plugin failure with a stable API code."""
+
+    def __init__(self, message: str, *, code: str = "chat_plugin.invalid") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _contained(root: Path, value: str) -> Path:
@@ -136,24 +140,81 @@ class ChatPluginService:
         native = provider_for(engine).revision() if engine in PROVIDERS else ""
         return sha256(json.dumps([8, values, self.control_enabled(engine), native]).encode()).hexdigest()[:16]
 
+    @staticmethod
+    def _resolve_local_dir(raw: str) -> Path:
+        path = str(raw or "").strip()
+        if not path:
+            raise ChatPluginError("请填写来源目录路径", code="chat_plugin.source_missing")
+        try:
+            origin = Path(path).expanduser().resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise ChatPluginError("来源目录不存在", code="chat_plugin.source_not_found") from exc
+        except NotADirectoryError as exc:
+            raise ChatPluginError("来源路径不是目录", code="chat_plugin.source_not_directory") from exc
+        except OSError as exc:
+            raise ChatPluginError("无法访问来源目录", code="chat_plugin.source_inaccessible") from exc
+        if not origin.is_dir():
+            raise ChatPluginError("来源路径不是目录", code="chat_plugin.source_not_directory")
+        return origin
+
+    @staticmethod
+    def _from_install_error(exc: InstallError) -> ChatPluginError:
+        mapping = {
+            "extension.unpinned_git_ref": (
+                "请提供固定的 Git commit 或 tag，不支持裸分支",
+                "chat_plugin.unpinned_git_ref",
+            ),
+            "extension.git_fetch_failed": (
+                "Git 拉取失败，请检查地址与固定版本",
+                "chat_plugin.git_fetch_failed",
+            ),
+            "extension.source_not_found": (
+                "来源文件或目录不存在",
+                "chat_plugin.source_not_found",
+            ),
+            "extension.invalid_source": (
+                "插件来源无效",
+                "chat_plugin.invalid_source",
+            ),
+        }
+        message, code = mapping.get(
+            getattr(exc, "code", ""),
+            ("插件导入失败，请检查来源", "chat_plugin.install_failed"),
+        )
+        return ChatPluginError(message, code=code)
+
     def install(self, source: dict[str, Any]) -> dict[str, Any]:
         kind = source.get("kind", "local-dir")
         if kind not in {"local-dir", "archive", "git"}:
-            raise ChatPluginError("支持本地目录、压缩包和固定 Git 版本")
+            raise ChatPluginError(
+                "支持本地目录、压缩包和固定 Git 版本",
+                code="chat_plugin.unsupported_source",
+            )
         with tempfile.TemporaryDirectory(dir=self.root, prefix="import-") as work:
             workdir = Path(work)
             if kind == "local-dir":
-                origin = Path(str(source.get("path", ""))).expanduser().resolve(strict=True)
+                origin = self._resolve_local_dir(str(source.get("path", "")))
                 if origin == Path.home() or self.root.is_relative_to(origin):
-                    raise ChatPluginError("请选择具体插件目录")
+                    raise ChatPluginError("请选择具体插件目录", code="chat_plugin.source_too_broad")
                 package = workdir / "package"
-                _copy_package(origin, package)
+                try:
+                    _copy_package(origin, package)
+                except ChatPluginError:
+                    raise
+                except OSError as exc:
+                    raise ChatPluginError(
+                        "无法读取来源目录",
+                        code="chat_plugin.source_inaccessible",
+                    ) from exc
             else:
                 installer = ExtensionInstaller(self.root / "packages")
-                package, _ = installer._fetch(Source(
-                    kind=kind, path=str(source.get("path", "")),
-                    url=str(source.get("url", "")), ref=str(source.get("ref", "")),
-                ), workdir)
+                try:
+                    package, _ = installer._fetch(Source(
+                        kind=kind, path=str(source.get("path", "")),
+                        url=str(source.get("url", "")), ref=str(source.get("ref", "")),
+                    ), workdir)
+                except InstallError as exc:
+                    raise self._from_install_error(exc) from exc
             record = self._inspect(package)
             record.update(engines=list(ENGINES), enabled=True, scope_version=2)
             record["source_kind"] = kind
@@ -182,7 +243,7 @@ class ChatPluginService:
                 manifest = package
                 manifest["name"] = str(package.get("name") or root.name).lstrip("@").replace("/", "-")
         if not manifest and not skill_files:
-            raise ChatPluginError("未找到插件清单或 SKILL.md")
+            raise ChatPluginError("未找到插件清单或 SKILL.md", code="chat_plugin.not_a_plugin")
         name = str(manifest.get("name") or "").strip()
         skills = []
         for path in skill_files[:200]:

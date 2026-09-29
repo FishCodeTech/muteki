@@ -46,8 +46,8 @@ export function roleLabel(agent: CollaborationAgent, t: Translate): string {
   return t("collab.role.explore");
 }
 
-export function coordinatorStatus(agent: CollaborationAgent, t: Translate): string {
-  if (agent.statusKind === "solved") return t("worker.solved");
+export function coordinatorStatus(agent: CollaborationAgent, t: Translate, mode?: RunCanvasMode): string {
+  if (agent.statusKind === "solved") return t(mode === "pentest" ? "collab.legend.goalProven" : "worker.solved");
   if (agent.statusKind === "paused") return t("worker.paused");
   if (agent.statusKind === "error") return t("worker.error");
   if (!agent.online) return t("collab.complete");
@@ -55,11 +55,12 @@ export function coordinatorStatus(agent: CollaborationAgent, t: Translate): stri
   return t("collab.status.coordinating");
 }
 
-export function statusLabel(agent: CollaborationAgent, t: Translate): string {
+export function statusLabel(agent: CollaborationAgent, t: Translate, mode?: RunCanvasMode): string {
   if (agent.role === "source") return t("collab.source.recorded");
   if (agent.role === "decision") return t(agent.online ? "collab.decision.running" : "collab.decision.recorded");
+  if (mode === "pentest" && agent.statusKind === "solved") return t("collab.legend.goalProven");
   return agent.role === "coordinator"
-    ? coordinatorStatus(agent, t)
+    ? coordinatorStatus(agent, t, mode)
     : compactLaneStatus(agent.presentation, agent.online, t);
 }
 

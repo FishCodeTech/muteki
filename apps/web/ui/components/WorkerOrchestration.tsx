@@ -4,6 +4,7 @@ import { MotionPreferences } from "@/components/MotionPreferences";
 import dynamic from "next/dynamic";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { usePathname, useSearchParams } from "next/navigation";
 import type { CSSProperties } from "react";
 import { Alert, Card, Chip, ComboBox, Input, Button, Dropdown, Label, ListBox, ListBoxItem, Radio, RadioGroup, Select, Skeleton, Slider, Switch } from "@heroui/react";
 import { Icon, type IconName } from "@/components/Icon";
@@ -1735,8 +1736,8 @@ export function AppearanceWorkspace({ hideIntro = false }: { hideIntro?: boolean
       </section>
 
       {!solveOnly ? <section className="wappearance-card" aria-labelledby="wappearance-reading" data-testid="c39-appearance-reading">
-        <header><h3 id="wappearance-reading">对话阅读</h3><span>字号 · 密度 · 宽度</span></header>
-        <p>仅影响会话正文阅读，不依赖浏览器整体缩放；偏好保存在本浏览器。</p>
+        <header><h3 id="wappearance-reading">{t("settingsHub.appearance.reading")}</h3><span>{t("settingsHub.appearance.readingMeta")}</span></header>
+        <p>{t("settingsHub.appearance.readingHint")}</p>
         <ConversationReadingPrefsPanel />
       </section> : null}
 
@@ -1845,11 +1846,19 @@ export function WorkerOrchestration({ defaultReturnTo = "/" }: { defaultReturnTo
     setDirty(currentDraftSignature !== baselineDraftRef.current);
   }, [config, currentDraftSignature]);
 
+  const searchParams = useSearchParams();
+  const pathname = usePathname() || "";
+  const returnParam = searchParams.get("return");
   const returnTo = useMemo(() => {
-    if (typeof window === "undefined") return defaultReturnTo;
-    const value = new URLSearchParams(window.location.search).get("return") || defaultReturnTo;
+    const value = returnParam || defaultReturnTo;
     return value.startsWith("/") ? value : defaultReturnTo;
-  }, [defaultReturnTo]);
+  }, [defaultReturnTo, returnParam]);
+  const workspaceLabels = useMemo(() => {
+    const pentest = pathname.startsWith("/pentest") || defaultReturnTo.startsWith("/pentest");
+    return pentest
+      ? { title: "渗透设置", back: "返回渗透" }
+      : { title: "单题设置", back: "返回单题" };
+  }, [defaultReturnTo, pathname]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -2502,7 +2511,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/" }: { defaultReturnTo
       selectSection("credentials");
     }}>
       <aside className="wsettings-nav">
-        <div className="wsettings-nav-title"><span className="single-task-workers-mark"><Icon name="gear" size={18} /></span><strong>单题设置</strong></div>
+        <div className="wsettings-nav-title"><span className="single-task-workers-mark"><Icon name="gear" size={18} /></span><strong>{workspaceLabels.title}</strong></div>
         <nav aria-label="Worker 分区">{navItems.map((item) => (
           <Button
             key={item.id}
@@ -2515,7 +2524,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/" }: { defaultReturnTo
             {item.id === "roster" ? <span className="wsettings-nav-count">{seats.filter(isOrdinarySeat).length}</span> : null}
           </Button>
         ))}</nav>
-        <div className="wsettings-nav-foot"><span>保存后用于下次任务</span>{solveOnly ? <a href="/settings/appearance"><Icon name="gear" size={14} />工作区模式</a> : null}<a href={returnTo}><Icon name="chevronRight" size={14} />返回单题</a></div>
+        <div className="wsettings-nav-foot"><span>保存后用于下次任务</span>{solveOnly ? <a href="/settings/appearance"><Icon name="gear" size={14} />工作区模式</a> : null}<a href={returnTo}><Icon name="chevronRight" size={14} />{workspaceLabels.back}</a></div>
       </aside>
 
       <main className="wsettings-main">

@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { SHELL_URL, normalizeOrigin, parseWebUrl, sameOrigin, allowedNavigation, partitionFor, webPreferences } = require('./policy.cjs');
 const { readPreferences, writePreferences } = require('./preferences.cjs');
-const { WORKSPACE_CSS, READ_CHROME, ACTION_SCRIPTS, navigationScript, normalizeRoute, iconForRoute, activeRoute } = require('./workspace-chrome.cjs');
+const { WORKSPACE_CSS, READ_CHROME, ACTION_SCRIPTS, navigationScript, normalizeRoute, iconForRoute, activeRoute, itemsForSolveOnly } = require('./workspace-chrome.cjs');
 
 app.setName('Muteki');
 if (process.env.MUTEKI_DESKTOP_USER_DATA) app.setPath('userData', path.resolve(process.env.MUTEKI_DESKTOP_USER_DATA));
@@ -24,6 +24,8 @@ const lastRoutes = new Map();
 let window, serviceView, pollTimer;
 let connecting = false, polling = false, externalPrompt = false;
 let connectionGeneration = 0;
+// Last full-mode rail scraped from WorkspaceFrame; used when settings omits the frame.
+let lastFullWorkspaceItems = [];
 
 function emit(patch = {}) {
   Object.assign(state, patch);
@@ -105,13 +107,18 @@ async function syncChrome() {
         catch { return []; }
       });
       if (!items.length && chrome.solveOnly) items = [{ href: '/task', label: '单题', badge: '', icon: 'task' }];
+      // Remember full-mode entries so settings (no WorkspaceFrame) can restore chat/competition.
+      if (!chrome.solveOnly && items.length) lastFullWorkspaceItems = items;
+    } else {
+      // Settings/share skip WorkspaceFrame; still sync the native rail from persisted solveOnly.
+      items = itemsForSolveOnly(chrome.solveOnly, lastFullWorkspaceItems.length ? lastFullWorkspaceItems : state.items);
     }
-    const active = activeRoute(chrome.pathname, items);
+    const active = activeRoute(chrome.pathname, items, chrome.activeHref);
     if (active && !['/', 'settings', '/usage'].includes(active)) lastRoutes.set(`${state.origin}:${active}`, new URL(view.webContents.getURL()).pathname + new URL(view.webContents.getURL()).search);
     const next = {
       items, active, theme: chrome.theme, search: chrome.search, sidebar: chrome.sidebar,
       sidebarCollapsed: chrome.sidebarCollapsed, themeToggle: chrome.themeToggle,
-      settingsHref: normalizeRoute(chrome.settingsHref, state.origin), usage: chrome.hasFrame ? chrome.usage : state.usage,
+      settingsHref: normalizeRoute(chrome.settingsHref, state.origin), usage: chrome.hasFrame ? chrome.usage : !chrome.solveOnly,
       canGoBack: view.webContents.navigationHistory.canGoBack(), canGoForward: view.webContents.navigationHistory.canGoForward(),
       pageTitle: items.find(item => item.href === active)?.label || (active === 'settings' ? '设置' : active === '/usage' ? '全局用量' : active === '/' ? 'Muteki' : '工作台'),
     };
@@ -124,6 +131,7 @@ async function connect(value) {
   if (connecting) throw new Error('正在连接，请稍候。');
   const origin = normalizeOrigin(value), attempt = ++connectionGeneration;
   connecting = true; disposeService();
+  lastFullWorkspaceItems = [];
   emit({ origin, status: 'connecting', message: '', configuring: true, items: [], usage: false, search: false, sidebar: false, themeToggle: false, canGoBack: false, canGoForward: false });
   const view = new WebContentsView({ webPreferences: webPreferences(configureSession(origin)) });
   serviceView = view; window.contentView.addChildView(view); view.setVisible(false); layout(); guardContents(view.webContents, origin);

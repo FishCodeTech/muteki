@@ -36,6 +36,8 @@ import {
   workspaceSkipTargetId,
 } from "@/lib/workspaceSkipTarget";
 import { useSolveOnlyMode } from "@/lib/workspaceMode";
+import { useActiveRunWorkspace } from "@/lib/activeRunWorkspace";
+import { runIdFromPathname } from "@/lib/runWorkspaceRoutes";
 
 const OverviewContext = createContext<WorkspaceOverview | null>(null);
 
@@ -311,6 +313,24 @@ function WorkspaceNav({ overview, sidebarToggle }: {
   const pathname = usePathname();
   const solveOnly = useSolveOnlyMode();
   const visibleKinds = overview.kinds.filter((kind) => !solveOnly || kind.aggregateType === "run");
+  const pathRunId = runIdFromPathname(pathname);
+  const published = useActiveRunWorkspace();
+  const recentKind = pathRunId
+    ? overview.recent.find((item) => item.id === pathRunId)?.kindId
+    : undefined;
+  const onCollaboration = /\/collaboration\/?$/.test(pathname);
+  // Prefer the live deck mode published by /run/<id>/… shells; fall back to overview.recent.
+  // Plain /run/<id> is the CTF shell (pentest redirects to /pentest). Collaboration waits
+  // for deck/recent so a pentest map does not flash the CTF rail.
+  const runWorkspaceMode = pathRunId && published?.runId === pathRunId
+    ? published.mode
+    : recentKind === "pentest"
+      ? "pentest"
+      : recentKind
+        ? "ctf"
+        : pathRunId && !onCollaboration
+          ? "ctf"
+          : null;
   const [theme, setTheme] = useState<ThemeMode>("dark");
 
   useEffect(() => {
@@ -345,7 +365,8 @@ function WorkspaceNav({ overview, sidebarToggle }: {
         <nav id="workspace-navigation" className="workspace-rail-links" aria-label="工作区">
           {visibleKinds.map((item) => {
             const active = pathname === item.route || pathname.startsWith(`${item.route}/`)
-              || (item.route === "/ctf" && (pathname.startsWith("/run/") || pathname === "/solve"));
+              || (item.route === "/ctf" && (pathname === "/solve" || (pathname.startsWith("/run/") && runWorkspaceMode === "ctf")))
+              || (item.route === "/pentest" && pathname.startsWith("/run/") && runWorkspaceMode === "pentest");
             const status = overview.activity[item.id];
             const attention = (status?.unread ?? 0) + (status?.approvals ?? 0);
             return (

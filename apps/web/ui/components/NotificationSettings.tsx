@@ -37,7 +37,7 @@ const MODE_OPTIONS: Array<{ value: NotificationMode; labelKey: string; hintKey: 
   },
 ];
 
-export function NotificationSettings() {
+export function NotificationSettings({ hideIntro = false }: { hideIntro?: boolean }) {
   const t = useT();
   const [prefs, setPrefs] = useState<NotificationPrefs>(() => defaultNotificationPrefs());
   const [permission, setPermission] = useState<NotificationPermission | "unsupported">("default");
@@ -80,12 +80,14 @@ export function NotificationSettings() {
 
   return (
     <div className="wsettings-simple-page wnotifications-page" data-page="notifications">
-      <header className="wsettings-section-head">
-        <div className="wsettings-section-copy">
-          <h2>{t("settingsHub.notifications")}</h2>
-          <p>{t("settingsHub.notificationsDesc")}</p>
-        </div>
-      </header>
+      {hideIntro ? null : (
+        <header className="wsettings-section-head">
+          <div className="wsettings-section-copy">
+            <h2>{t("settingsHub.notifications")}</h2>
+            <p>{t("settingsHub.notificationsDesc")}</p>
+          </div>
+        </header>
+      )}
 
       <section className="wappearance-card wappearance-choice-card" aria-labelledby="wnotifications-mode">
         <header>

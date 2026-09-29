@@ -26,7 +26,13 @@ async function request(path: string, method = "GET", body?: unknown) {
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const data = await response.json();
-  if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : "操作失败，请稍后重试");
+  if (!response.ok) {
+    const detail = data.detail;
+    const message = typeof detail === "string"
+      ? detail
+      : (detail && typeof detail.message === "string" ? detail.message : "操作失败，请稍后重试");
+    throw new Error(message);
+  }
   return data;
 }
 
