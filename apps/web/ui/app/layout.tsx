@@ -41,6 +41,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <link id="muteki-apple-icon" rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180" />
         <link id="muteki-manifest" rel="manifest" href="/manifest.json" />
         <script dangerouslySetInnerHTML={{ __html: 'try{document.documentElement.dataset.motion=localStorage.getItem("muteki.motion")==="reduce"?"reduce":"system"}catch{}' }} />
+        {/* Sync <html lang> from persisted UI locale before hydration (FishCodeTech#22). */}
+        <script dangerouslySetInnerHTML={{ __html: 'try{var l=localStorage.getItem("muteki.lang");var v=l==="en"?"en":"zh-CN";document.documentElement.lang=v;document.documentElement.setAttribute("xml:lang",v)}catch{}' }} />
       </head>
       <body suppressHydrationWarning>
         <SchemeBoot />

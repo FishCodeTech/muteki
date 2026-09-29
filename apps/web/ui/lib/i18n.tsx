@@ -610,6 +610,35 @@ const STRINGS: Dict = {
   "settingsHub.appearance.scheme.teal": { zh: "青", en: "Teal" },
   "settingsHub.appearance.scheme.ember": { zh: "焦橙", en: "Ember" },
 
+  // ---- conversation reading prefs (settings appearance + chat chrome) ----
+  "settingsHub.appearance.reading": { zh: "对话阅读", en: "Conversation reading" },
+  "settingsHub.appearance.readingMeta": { zh: "字号 · 密度 · 宽度", en: "Size · density · width" },
+  "settingsHub.appearance.readingHint": {
+    zh: "仅影响会话正文阅读，不依赖浏览器整体缩放；偏好保存在本浏览器。",
+    en: "Affects conversation body reading only; does not rely on browser zoom. Saved in this browser.",
+  },
+  "readingPrefs.title": { zh: "对话阅读", en: "Conversation reading" },
+  "readingPrefs.aria": { zh: "对话阅读偏好", en: "Conversation reading preferences" },
+  "readingPrefs.hint": {
+    zh: "调整字号、密度与正文宽度；不依赖浏览器整体缩放，偏好保存在本浏览器。",
+    en: "Adjust font size, density, and content width. Independent of browser zoom; saved in this browser.",
+  },
+  "readingPrefs.fontScale": { zh: "正文字号", en: "Body font size" },
+  "readingPrefs.font.sm": { zh: "小", en: "Small" },
+  "readingPrefs.font.md": { zh: "标准", en: "Medium" },
+  "readingPrefs.font.lg": { zh: "大", en: "Large" },
+  "readingPrefs.contentWidth": { zh: "正文宽度", en: "Content width" },
+  "readingPrefs.width.narrow": { zh: "窄", en: "Narrow" },
+  "readingPrefs.width.default": { zh: "默认", en: "Default" },
+  "readingPrefs.width.wide": { zh: "宽", en: "Wide" },
+  "readingPrefs.density": { zh: "紧凑密度", en: "Compact density" },
+  "readingPrefs.densityHint": {
+    zh: "缩小消息与卡片间距，一屏显示更多内容",
+    en: "Tighten message and card spacing to fit more on screen",
+  },
+  "readingPrefs.open": { zh: "阅读偏好", en: "Reading preferences" },
+  "readingPrefs.short": { zh: "阅读", en: "Reading" },
+
   // ---- worker settings (default roster) ----
   "settings.open": { zh: "Worker 设置", en: "Worker settings" },
   "settings.title": { zh: "Worker 设置", en: "Worker settings" },
@@ -1249,6 +1278,7 @@ const STRINGS: Dict = {
   "collab.legend.waiting": { zh: "等待、暂停或静默", en: "Waiting, paused, or silent" },
   "collab.legend.issue": { zh: "停滞或出错", en: "Stalled or failed" },
   "collab.legend.solved": { zh: "已解出", en: "Solved" },
+  "collab.legend.goalProven": { zh: "目标已证实", en: "Goal proven" },
   "collab.legend.offline": { zh: "已退出", en: "Exited" },
   "collab.legend.recent": { zh: "流动的线表示最近 {s} 秒内发生的关系；点击项目可显示或隐藏该类关系。", en: "Flowing lines mark relations from the last {s} seconds; click an item to show or hide that kind." },
   "collab.legend.arrow": { zh: "箭头从发起该动作的一方指向对方。", en: "Arrows point from the party that started the action to the other party." },
@@ -1305,6 +1335,7 @@ const STRINGS: Dict = {
   "collab.standby": { zh: "待命", en: "Standby" },
   "collab.runBanner": { zh: "运行已结束 · {outcome} · 总耗时 {elapsed} · 结束于 {ended} · {n} 个节点", en: "Run ended · {outcome} · elapsed {elapsed} · ended at {ended} · {n} nodes" },
   "collab.unsolved": { zh: "未解出", en: "Unsolved" },
+  "collab.goalUnproven": { zh: "目标尚未证实", en: "Goal not proven" },
   "collab.agents": { zh: "节点", en: "nodes" },
   "collab.relationships": { zh: "关系", en: "relations" },
   "collab.online": { zh: "在线", en: "Online" },
@@ -2002,6 +2033,19 @@ const LangCtx = createContext<{ lang: Lang; setLang: (l: Lang) => void }>({
   setLang: () => {},
 });
 
+/** Map UI lang preference to the HTML document language tag (BCP 47). */
+export function htmlLangFor(lang: Lang): string {
+  return lang === "en" ? "en" : "zh-CN";
+}
+
+/** Keep <html lang> / xml:lang aligned with the active UI locale (a11y / AT / browser translate). */
+export function applyDocumentLang(lang: Lang): void {
+  if (typeof document === "undefined") return;
+  const value = htmlLangFor(lang);
+  document.documentElement.lang = value;
+  document.documentElement.setAttribute("xml:lang", value);
+}
+
 export function I18nProvider({ children }: { children: React.ReactNode }) {
   const [lang, setLangState] = useState<Lang>("zh");
   // hydrate from localStorage after mount (avoids SSR mismatch)
@@ -2009,9 +2053,14 @@ export function I18nProvider({ children }: { children: React.ReactNode }) {
     const saved = (typeof window !== "undefined" && window.localStorage.getItem("muteki.lang")) as Lang | null;
     if (saved === "zh" || saved === "en") setLangState(saved);
   }, []);
+  // Sync document language whenever the UI locale changes (incl. hydrated preference).
+  useEffect(() => {
+    applyDocumentLang(lang);
+  }, [lang]);
   const setLang = (l: Lang) => {
     setLangState(l);
     try { window.localStorage.setItem("muteki.lang", l); } catch { /* ignore */ }
+    applyDocumentLang(l);
   };
   return <LangCtx.Provider value={{ lang, setLang }}>{children}</LangCtx.Provider>;
 }

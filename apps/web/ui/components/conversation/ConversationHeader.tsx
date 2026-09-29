@@ -3,6 +3,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import type { ConversationView } from "@/lib/useConversation";
 import { cn } from "@/lib/cn";
+import { useT } from "@/lib/i18n";
 import { useSharedGitStatus } from "@/lib/threadGitStatusStore";
 import {
   resolveWorkspaceBranchChip,
@@ -184,6 +185,7 @@ export function ConversationHeader({
   busy = false,
   className = "",
 }: ConversationHeaderProps) {
+  const t = useT();
   const [editing, setEditing] = useState(false);
   const titleButtonRef = useRef<HTMLButtonElement>(null);
   const threadId = view?.thread.thread_id;
@@ -284,12 +286,12 @@ export function ConversationHeader({
                 variant="ghost"
                 active={readingPrefsOpen}
                 data-testid="c39-reading-prefs-toggle"
-                aria-label="对话阅读偏好"
-                tooltip="对话阅读偏好"
+                aria-label={t("readingPrefs.aria")}
+                tooltip={t("readingPrefs.aria")}
                 onClick={onOpenReadingPrefs}
                 className="hidden md:inline-flex"
               >
-                阅读
+                {t("readingPrefs.short")}
               </Button>
             ) : null}
             {outputControl}
@@ -332,7 +334,7 @@ export function ConversationHeader({
           <MenuItem icon="info" onSelect={onOpenInfo}>会话信息与记忆</MenuItem>
           {onOpenReadingPrefs ? (
             <MenuItem icon="eye" checked={readingPrefsOpen} onSelect={onOpenReadingPrefs}>
-              <span data-testid="menu-open-reading-prefs">阅读偏好</span>
+              <span data-testid="menu-open-reading-prefs">{t("readingPrefs.open")}</span>
             </MenuItem>
           ) : null}
           {onOpenShortcuts ? <MenuItem icon="keyboard" shortcut="?" onSelect={onOpenShortcuts}>键盘快捷键</MenuItem> : null}

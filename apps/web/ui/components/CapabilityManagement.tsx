@@ -271,7 +271,7 @@ function StatePill({ state }: { state: string }) {
 
 // ── Component ───────────────────────────────────────────────────────────────
 
-export function CapabilityManagement() {
+export function CapabilityManagement({ hideIntro = false }: { hideIntro?: boolean }) {
   const [data, setData] = useState<Overview | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -518,12 +518,14 @@ export function CapabilityManagement() {
 
   return (
     <main className="capability-center">
-      {/* Top Toolbar */}
-      <header className="cap-topbar">
-        <div>
-          <h2 className="cap-topbar-title">能力</h2>
-          <p className="cap-topbar-desc">Conversation Thread 授权与全局 MCP/Skills。这里不是 CTF Fact 图白名单。全局 Blackboard Skill 开关会影响新启动的 Worker。</p>
-        </div>
+      {/* Top Toolbar — page title/intro owned by SettingsHub when hideIntro */}
+      <header className={`cap-topbar${hideIntro ? " is-actions-only" : ""}`}>
+        {hideIntro ? null : (
+          <div>
+            <h2 className="cap-topbar-title">能力</h2>
+            <p className="cap-topbar-desc">Conversation Thread 授权与全局 MCP/Skills。这里不是 CTF Fact 图白名单。全局 Blackboard Skill 开关会影响新启动的 Worker。</p>
+          </div>
+        )}
         <div className="cap-topbar-actions">
           <Button
             type="button"

@@ -8,7 +8,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from muteki.conversation.chat_plugins import ChatPluginService, ENGINES
+from muteki.conversation.chat_plugins import ChatPluginError, ChatPluginService, ENGINES
 
 
 class InstallBody(BaseModel):
@@ -93,8 +93,26 @@ def create_chat_plugins_router(plugins: ChatPluginService, conversation: Any) ->
             result = await asyncio.to_thread(plugins.install, body.source)
             await changed()
             return result
+        except ChatPluginError as exc:
+            raise HTTPException(
+                400,
+                {"code": exc.code, "message": str(exc)},
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                400,
+                {"code": "chat_plugin.invalid", "message": str(exc)},
+            ) from exc
+        except OSError as exc:
+            raise HTTPException(
+                400,
+                {"code": "chat_plugin.source_inaccessible", "message": "无法访问插件来源"},
+            ) from exc
         except Exception as exc:
-            raise HTTPException(400, str(exc) if isinstance(exc, ValueError) else "插件导入失败，请检查来源及固定版本") from exc
+            raise HTTPException(
+                400,
+                {"code": "chat_plugin.install_failed", "message": "插件导入失败，请稍后重试"},
+            ) from exc
 
     @router.post("/mcp")
     async def add_mcp(body: McpBody):

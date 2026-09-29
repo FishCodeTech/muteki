@@ -32,6 +32,7 @@ const READ_CHROME = `(() => {
   if (!frame) { try { solveOnly = localStorage.getItem('muteki.workspace.solveOnly') !== '0'; } catch {} }
   return {
     items, solveOnly, hasFrame: !!frame, pathname: location.pathname,
+    activeHref: links.find(link => link.getAttribute('aria-current') === 'page')?.getAttribute('href') || '',
     theme: document.documentElement.dataset.theme === 'light' ? 'light' : 'dark',
     settingsHref: document.querySelector('[data-workspace-action="settings"], .workspace-nav-settings-gear')?.getAttribute('href') || (solveOnly ? '/settings/appearance' : '/settings/agents'),
     usage: !!document.querySelector('[data-workspace-action="usage"], .workspace-nav-usage'),
@@ -72,11 +73,47 @@ function iconForRoute(href) {
   return 'extension';
 }
 
-function activeRoute(pathname, items) {
+function activeRoute(pathname, items, activeHref = '') {
   if (pathname === '/') return '/';
   if (pathname.startsWith('/settings')) return 'settings';
   if (pathname === '/usage') return '/usage';
-  if (pathname.startsWith('/run/') || pathname.startsWith('/solve')) return items.find(item => item.href === '/ctf')?.href || items.find(item => item.href === '/task')?.href || '/ctf';
+  // Shared run URLs have no mode in their path. Use the Web workspace's
+  // authoritative selection; leave it unselected while run metadata loads.
+  if (pathname.startsWith('/run/')) return items.find(item => item.href === activeHref)?.href || '';
+  if (pathname.startsWith('/solve')) return items.find(item => item.href === '/ctf')?.href || items.find(item => item.href === '/task')?.href || '/ctf';
   return [...items].sort((a, b) => b.href.length - a.href.length).find(item => pathname === item.href || pathname.startsWith(`${item.href}/`))?.href || '';
 }
-module.exports = { WORKSPACE_CSS, READ_CHROME, ACTION_SCRIPTS, navigationScript, normalizeRoute, iconForRoute, activeRoute };
+
+const DEFAULT_WORKSPACE_ITEMS = Object.freeze([
+  Object.freeze({ href: '/chat', label: '对话', badge: '', icon: 'chat' }),
+  Object.freeze({ href: '/ctf', label: 'CTF 工作台', badge: '', icon: 'task' }),
+  Object.freeze({ href: '/pentest', label: '渗透测试', badge: '', icon: 'pentest' }),
+  Object.freeze({ href: '/competitions', label: '比赛', badge: '', icon: 'competition' }),
+]);
+
+function isRunWorkspaceHref(href) {
+  return typeof href === 'string' && (
+    href.startsWith('/ctf') || href.startsWith('/task') || href.startsWith('/solve')
+    || href.startsWith('/pentest') || href.startsWith('/run/')
+  );
+}
+
+// Settings/share omit WorkspaceFrame, so syncChrome cannot scrape #workspace-navigation.
+// Rebuild the effective rail from the persisted solveOnly flag and any last full-mode items.
+function itemsForSolveOnly(solveOnly, preferredItems = []) {
+  const preferred = Array.isArray(preferredItems)
+    ? preferredItems.filter(item => item && typeof item.href === 'string')
+    : [];
+  const clone = item => ({ href: item.href, label: String(item.label || ''), badge: String(item.badge || ''), icon: item.icon || iconForRoute(item.href) });
+  if (!solveOnly) {
+    const hasFullEntries = preferred.some(item => item.href.startsWith('/chat') || item.href.startsWith('/competition'));
+    if (hasFullEntries) return preferred.map(clone);
+    const byHref = new Map(preferred.map(item => [item.href, clone(item)]));
+    return DEFAULT_WORKSPACE_ITEMS.map(item => byHref.get(item.href) || clone(item));
+  }
+  const filtered = preferred.filter(item => isRunWorkspaceHref(item.href)).map(clone);
+  if (filtered.length) return filtered;
+  return DEFAULT_WORKSPACE_ITEMS.filter(item => isRunWorkspaceHref(item.href)).map(clone);
+}
+
+module.exports = { WORKSPACE_CSS, READ_CHROME, ACTION_SCRIPTS, navigationScript, normalizeRoute, iconForRoute, activeRoute, DEFAULT_WORKSPACE_ITEMS, isRunWorkspaceHref, itemsForSolveOnly };

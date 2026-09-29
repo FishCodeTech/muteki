@@ -491,10 +491,11 @@ def register(app: FastAPI) -> None:
             or (run.status() if run.finished else "")
         )
         try:
-            return report(events, contract, terminal_reason=terminal_reason,
+            view = report(events, contract, terminal_reason=terminal_reason,
                           report_seq=report_seq)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return view
 
     def _pentest_artifact_source(
         run_id: str, fact_seq: int, artifact_id: str,

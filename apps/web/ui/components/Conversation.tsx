@@ -2131,10 +2131,7 @@ export function Conversation({
           </div>
         )}
 
-        <div className="convo-runtime-peer">
-          {runtimePanel}
-          {pentestRuntimeOpen && composerElement}
-        </div>
+        <div className="convo-runtime-peer">{runtimePanel}</div>
       </div>
     </div>
   );
