@@ -119,7 +119,7 @@ function QuestionOptions({
           <RadioGroup
             value={answer.selected[0] ?? ""}
             onValueChange={(value) => {
-              onChange({ selected: [value], custom: "" });
+              onChange({ selected: [value], custom: question.allowCustom ? custom : "" });
               onSingleSelect?.();
             }}
             className="gap-0.5"
@@ -144,7 +144,7 @@ function QuestionOptions({
           placeholder={question.customPlaceholder ?? "补充其他回答…"}
           onChange={(value) =>
             onChange({
-              selected: question.multiple ? answer.selected : [],
+              selected: answer.selected,
               custom: value,
             })
           }
@@ -206,6 +206,8 @@ export function ApprovalCard({
   dismissLabel = "关闭",
   approveLabel = "批准",
   submitLabel = "提交回答",
+  rejectLabel = "拒绝",
+  submitDisabled = false,
   result,
   className,
 }: ApprovalCardProps) {
@@ -228,7 +230,7 @@ export function ApprovalCard({
     ? (currentAnswers[question.id] ?? EMPTY_ANSWER)
     : EMPTY_ANSWER;
   const displayTitle = question?.title ?? title;
-  const canContinue = question?.required === false || isAnswered(currentAnswer);
+  const canContinue = (question?.required === false || isAnswered(currentAnswer)) && !question?.validationError;
   const lastStep = currentStep === questions.length - 1;
   const titleKey = question?.id ?? String(status);
   const statusLabel = getStatusLabel(status);
@@ -343,6 +345,7 @@ export function ApprovalCard({
                 type="button"
                 aria-label={dismissLabel}
                 title={dismissLabel}
+                disabled={busy}
                 onClick={onDismiss}
                 className="grid size-5 shrink-0 place-items-center rounded-full text-cx-fg-3 outline-none transition-colors hover:text-cx-fg focus-visible:ring-2 focus-visible:ring-cx-focus"
               >
@@ -386,8 +389,11 @@ export function ApprovalCard({
               </div>
             )}
 
+            {question?.validationError ? <p role="alert" className="mt-2 text-xs text-cx-danger">{question.validationError}</p> : null}
+
             {questionMode ? (
               <div className="mt-4 flex items-center gap-3">
+                {onReject ? <Button variant="ghost" size="sm" disabled={busy} onClick={onReject}>{rejectLabel}</Button> : null}
                 <Button
                   variant="ghost"
                   size="icon"
@@ -405,7 +411,7 @@ export function ApprovalCard({
                 <Button
                   size={lastStep ? "sm" : "icon"}
                   aria-label={lastStep ? "提交回答" : isAnswered(currentAnswer) ? "下一题" : "跳过"}
-                  disabled={busy || !canContinue}
+                  disabled={busy || !canContinue || (lastStep && submitDisabled)}
                   onClick={continueQuestion}
                   className="ml-auto rounded-full"
                 >

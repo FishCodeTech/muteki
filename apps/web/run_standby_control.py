@@ -304,7 +304,13 @@ async def apply_standby_control(
     runtime_wire["_control_context_reservations"] = (
         [reservation] if reservation is not None else [])
     runtime_wire["_control_context_owner"] = reservation_owner
-    accepted = self._ensure_standby(run.run_id, runtime_wire)
+    from apps.web.run_recovery import WorkerRuntimePolicyUnavailable
+    policy_error = None
+    try:
+        accepted = self._ensure_standby(run.run_id, runtime_wire)
+    except WorkerRuntimePolicyUnavailable as exc:
+        accepted = False
+        policy_error = exc
     if not accepted:
         if reservation is not None:
             released = False
@@ -320,9 +326,9 @@ async def apply_standby_control(
                     reservations=[reservation])
         return {
             "state": "unknown",
-            "detail": "standby worker could not be started",
+            "detail": str(policy_error) if policy_error else "standby worker could not be started",
             "target_ids": [],
-            "metadata": {"code": "standby_start_failed"},
+            "metadata": {"code": policy_error.code if policy_error else "standby_start_failed"},
         }
     try:
         delivered = await asyncio.wait_for(

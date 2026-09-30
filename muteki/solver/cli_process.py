@@ -9,13 +9,17 @@ from pathlib import Path
 from typing import Any, Optional
 
 from muteki.solver.cli_driver import CliResult
-from muteki.solver.cli_prompts import _CTF_WORKER_SYSTEM, _PENTEST_FGS_WORKER_SYSTEM
+from muteki.solver.cli_launch_check import (
+    LAUNCH_CODE_ENVIRONMENT, LaunchContractError,
+)
+from muteki.solver.cli_prompts import _CTF_WORKER_SYSTEM, pentest_worker_system
 from muteki.solver.cli_workspace import _stable_worker_path
 from muteki.solver.worker_profiles import profile_uses_endpoint
 from muteki.solver.worker_skills import (
     RoleContractStage,
     instruction_file_gitignored,
     role_contract_filename,
+    stage_agent_browser_skill,
     stage_blackboard_skill,
     stage_role_contract,
 )
@@ -95,18 +99,45 @@ def _worker_env(self, cwd: Optional[str] = None) -> dict:
     # The host-owned invocation runner consumes this environment directly.
     # Merge driver-level model variables here so custom Claude endpoints use
     # the same model selection in both standard and host-owned execution.
+    browser_enabled = getattr(self, "_agent_browser_enabled", None)
+    if browser_enabled is None:
+        from muteki.capability_management import enabled as capability_enabled
+        browser_enabled = bool(
+            getattr(self.challenge, "mode", "ctf") == "pentest"
+            and self.container is not None
+            and capability_enabled("skills", "agent-browser")
+        )
+        self._agent_browser_enabled = browser_enabled
     skill_workdir = cwd or self._workdir
     if skill_workdir:
-        stage_blackboard_skill(
-            skill_workdir,
-            engine=self.driver.name,
-            container=self.container is not None,
-            allow_operator_input=bool(
-                getattr(self.challenge, "allow_operator_input", True)
-            ),
-            mode=str(getattr(self.challenge, "mode", "ctf")),
-        )
-        self._ensure_role_contract(skill_workdir)
+        try:
+            stage_blackboard_skill(
+                skill_workdir,
+                engine=self.driver.name,
+                container=self.container is not None,
+                allow_operator_input=bool(
+                    getattr(self.challenge, "allow_operator_input", True)
+                ),
+                mode=str(getattr(self.challenge, "mode", "ctf")),
+            )
+            stage_agent_browser_skill(
+                skill_workdir, engine=self.driver.name, container=self.container,
+                mode=str(getattr(self.challenge, "mode", "ctf") or "ctf"),
+                enabled=browser_enabled,
+            )
+            plugins = getattr(self, "plugin_service", None)
+            if plugins is not None:
+                plugins.stage_worker(
+                    skill_workdir, engine=self.driver.name,
+                    mode=str(getattr(self.challenge, "mode", "ctf") or "ctf"),
+                    container=self.container,
+                )
+            self._ensure_role_contract(skill_workdir)
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise LaunchContractError(
+                f"Worker environment preparation failed: {type(exc).__name__}: {exc}",
+                code=LAUNCH_CODE_ENVIRONMENT, source="worker_environment",
+            ) from exc
 
     env_extra = getattr(self.driver, "env_extra", None)
     driver_env = env_extra() if callable(env_extra) else {}
@@ -116,6 +147,9 @@ def _worker_env(self, cwd: Optional[str] = None) -> dict:
     }
     env.update(driver_env)
     env.update(self._extra_worker_env)
+    # Managed extension snapshots are immutable inputs. Keep normal Python
+    # imports from creating __pycache__ beside a projected Skill resource.
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     for secret_name in _CONTROL_SECRET_ENV:
         env.pop(secret_name, None)
     for name in list(env):
@@ -205,13 +239,41 @@ def _worker_env(self, cwd: Optional[str] = None) -> dict:
     env["MUTEKI_CHALLENGE_MODE"] = str(
         getattr(self.challenge, "mode", "ctf") or "ctf"
     )
+    if env["MUTEKI_CHALLENGE_MODE"] == "pentest" and self.container is not None:
+        # Pentest Workers in one Run share the run-scoped container and workspace.
+        # A persistent profile survives a continuation generation. Shared
+        # container pools mount several Run workspaces, so derive the profile
+        # from this Run's mapped root instead of the common mount point.
+        from muteki.solver.workspace import workspace_root_for_worker
+        from muteki.solver.browser_coord import (
+            managed_browser_worker_path, stage_browser_command,
+        )
+        run_root = workspace_root_for_worker(skill_workdir)
+        try:
+            stage_browser_command(
+                run_root, container=self.container, run_id=str(self.run_id))
+            env["MUTEKI_BROWSER_RUN_ROOT"] = self.container.to_container_path(str(run_root))
+            env["PATH"] = managed_browser_worker_path(env)
+            env["MUTEKI_AGENT_BROWSER_ENABLED"] = "1" if browser_enabled else "0"
+            if browser_enabled:
+                env["AGENT_BROWSER_SESSION"] = str(self.run_id)
+                env["AGENT_BROWSER_NAMESPACE"] = str(self.run_id)
+                env["AGENT_BROWSER_PROFILE"] = self.container.to_container_path(
+                    str(run_root / ".muteki-browser-profile"))
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise LaunchContractError(
+                f"Worker browser setup failed: {type(exc).__name__}: {exc}",
+                code=LAUNCH_CODE_ENVIRONMENT, source="worker_browser",
+            ) from exc
+        if browser_enabled:
+            env["AGENT_BROWSER_EXECUTABLE_PATH"] = "/usr/bin/chromium"
     if (
         self.driver.name == "pi"
         and env["MUTEKI_CHALLENGE_MODE"] in {"ctf", "pentest"}
         and self.mode in {"explore", "fact_verifier"}
     ):
         env["MUTEKI_PI_SYSTEM_PROMPT"] = (
-            _PENTEST_FGS_WORKER_SYSTEM if env["MUTEKI_CHALLENGE_MODE"] == "pentest"
+            pentest_worker_system(browser_enabled=browser_enabled) if env["MUTEKI_CHALLENGE_MODE"] == "pentest"
             else _CTF_WORKER_SYSTEM
         )
     if (
@@ -220,7 +282,7 @@ def _worker_env(self, cwd: Optional[str] = None) -> dict:
         and self.mode in {"explore", "fact_verifier"}
     ):
         env["MUTEKI_OMP_SYSTEM_PROMPT"] = (
-            _PENTEST_FGS_WORKER_SYSTEM if env["MUTEKI_CHALLENGE_MODE"] == "pentest"
+            pentest_worker_system(browser_enabled=browser_enabled) if env["MUTEKI_CHALLENGE_MODE"] == "pentest"
             else _CTF_WORKER_SYSTEM
         )
     env["MUTEKI_BLACKBOARD_ROLE"] = (
@@ -284,6 +346,19 @@ def _worker_env(self, cwd: Optional[str] = None) -> dict:
             except Exception:
                 pass
         env["MUTEKI_BLACKBOARD_DB"] = db_path
+    plugins = getattr(self, "plugin_service", None)
+    if plugins is not None and skill_workdir:
+        try:
+            plugins.stage_native_worker(
+                skill_workdir, engine=self.driver.name,
+                mode=env["MUTEKI_CHALLENGE_MODE"], env=env,
+                container=self.container,
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise LaunchContractError(
+                f"Worker native extension setup failed: {type(exc).__name__}: {exc}",
+                code=LAUNCH_CODE_ENVIRONMENT, source="worker_extensions",
+            ) from exc
     return env
 
 

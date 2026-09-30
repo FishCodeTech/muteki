@@ -67,6 +67,8 @@ class ProfileDriver(CliDriver):
         self.name = base.name
         self.secure_prompt_transport = bool(
             getattr(base, "secure_prompt_transport", False))
+        self.persistent_stdin_prompt = bool(
+            getattr(base, "persistent_stdin_prompt", False))
         self.offline_web_isolation = bool(
             getattr(base, "offline_web_isolation", False))
         self.HELLO_PROMPT = base.HELLO_PROMPT
@@ -176,6 +178,8 @@ class EndpointDriver(CliDriver):
         self.name = base.name
         self.secure_prompt_transport = bool(
             getattr(base, "secure_prompt_transport", False))
+        self.persistent_stdin_prompt = bool(
+            getattr(base, "persistent_stdin_prompt", False))
         # Endpoint profiles change model transport/authentication, not the CLI's
         # exposed tool set.  Therefore Claude's explicit WebSearch/WebFetch deny
         # and Codex's opt-in-only --search contract remain enforceable.

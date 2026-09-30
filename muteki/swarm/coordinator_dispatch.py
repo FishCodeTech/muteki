@@ -1062,6 +1062,11 @@ class _DispatchReasonMixin:
                     state_root=state_base / ".muteki-agent-state" / "reason",
                     shared_graph=self.shared_graph,
                     mode=getattr(self.challenge, "mode", "ctf"),
+                    cost=self.cost,
+                    run_id=self.run_id,
+                    challenge_id=self.challenge.id,
+                    generation=getattr(self, "_execution_generation", None),
+                    cost_budget_usd=self.cost_budget_usd,
                 )
             # Context manifest for the assembled Reason prompt. Measurement-only;
             # a manifest failure must never break planning.

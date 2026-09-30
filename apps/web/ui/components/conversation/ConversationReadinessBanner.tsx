@@ -15,6 +15,7 @@ export interface ConversationReadinessBannerProps {
   onDismissGuide: () => void;
   onPickDirectory?: () => void;
   onEnterPath?: () => void;
+  directoryControlInComposer?: boolean;
   className?: string;
 }
 
@@ -26,6 +27,8 @@ function kindLabel(kind: ReadinessBlocker["kind"]): string {
       return "配置读取失败";
     case "not_installed":
       return "未安装";
+    case "discovery_unavailable":
+      return "宿主检测已禁用";
     case "not_logged_in":
       return "未登录";
     case "model_unavailable":
@@ -49,6 +52,8 @@ function kindIcon(kind: ReadinessBlocker["kind"]): IconName {
       return "circleAlert";
     case "not_installed":
       return "package";
+    case "discovery_unavailable":
+      return "circleAlert";
     case "not_logged_in":
       return "lock";
     case "model_unavailable":
@@ -162,6 +167,7 @@ export function ConversationReadinessBanner({
   onDismissGuide,
   onPickDirectory,
   onEnterPath,
+  directoryControlInComposer = false,
   className = "",
 }: ConversationReadinessBannerProps) {
   if (readiness.guide === "hidden" && !readiness.blockers.length) return null;
@@ -243,14 +249,14 @@ export function ConversationReadinessBanner({
               {readiness.envReady ? "已选择" : "使用输入框下方的模型选择器"}
             </GuideStep>
             <GuideStep index={2} done={readiness.agentVerified} title="验证 Agent">
-              {readiness.agentVerified ? "已验证" : (
+              {readiness.agentVerified ? "接入环境已验证；具体模型是否成功调用见模型选择器。" : (
                 <Button size="xs" variant="secondary" loading={probing} onClick={onProbe}>
                   {probing ? "验证中…" : "验证 Agent"}
                 </Button>
               )}
             </GuideStep>
             <GuideStep index={3} done={readiness.directorySelected} title="选择工作目录">
-              {readiness.directorySelected ? "已选择" : (
+              {readiness.directorySelected ? "已选择" : directoryControlInComposer ? "通过输入框下方的工作区入口选择目录或输入服务宿主路径。普通聊天无需目录。" : (
                 <>
                   {onPickDirectory ? <Button size="xs" variant="secondary" onClick={onPickDirectory}>选择目录</Button> : null}
                   {onEnterPath ? <Button size="xs" variant="ghost" onClick={onEnterPath}>输入路径</Button> : null}

@@ -43,7 +43,7 @@ with tempfile.TemporaryDirectory(prefix='muteki-components-') as tmp:
   assert not (home/'marker').exists()
   old=env['HOME'];service.update('components-test',enabled=False)
   new=service.prepare_environment('claude','fixture',{})
-  assert old!=new['HOME'],'disabled component reused old native home'
+  assert old==new['HOME'],'disabling a component must preserve the native history home'
   assert service.native_launch_options('claude',new)=={'plugins':[]}
  manifest['muteki']['requires']={'executables':['muteki-no-such-program-fixture']}
  (source/'plugin.json').write_text(json.dumps(manifest));public=service.install({'path':str(source)})

@@ -8,6 +8,8 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 import { Dialog, EmptyState, Kbd, SearchInput, Shortcut, splitShortcut } from "@/components/chat/ui";
+import { desktopChatBridge } from "@/lib/desktopChatBridge";
+import { useLang } from "@/lib/i18n";
 
 interface ShortcutRow {
   /** Alternative bindings, each in `mod+shift+k` form. */
@@ -92,6 +94,44 @@ const KEY_WORDS: Record<string, string> = {
   down: "down ↓",
 };
 
+const ENGLISH: Record<string, string> = {
+  "导航": "Navigation", "新建对话": "New chat", "命令面板（搜索 / 跳转会话）": "Search and switch conversations",
+  "聚焦输入框": "Focus composer", "关闭当前面板 / 返回输入框": "Close panel and return to composer",
+  "输入与发送": "Compose and send", "发送": "Send", "换行": "New line", "提交用户输入表单": "Submit input form",
+  "引用文件或能力": "Mention a file or capability", "命令（输入框开头）": "Command at the start of the composer",
+  "浏览发送历史（输入框为空时）": "Recall sent messages when the composer is empty",
+  "面板": "Panels", "打开 / 关闭工作面板": "Toggle work panel", "变更 (Diff)": "Changes (Diff)",
+  "预览": "Preview", "文件": "Files", "终端": "Terminal", "概览": "Overview", "执行日志": "Execution log",
+  "选择模型": "Select model", "打开此帮助": "Open shortcut help", "面板启动器（启动器可见时）": "Panel launcher (when visible)",
+  "变更": "Changes", "计划": "Plan", "冲突说明": "Shortcut context", "中文输入法 (IME)": "Input method (IME)",
+  "组字期间自动屏蔽 Enter 与所有单键快捷键，确认候选词不会误发送": "Enter and single-key shortcuts are ignored during composition, so confirming a candidate does not send the message.",
+  "终端内": "Inside the terminal", "键盘事件由终端捕获，不会触发全局快捷键；按 Esc 或点击外部即可退出": "The terminal captures keyboard input; click outside to return to the chat controls.",
+  "浏览器快捷键": "Browser shortcuts", "⌘/Ctrl+K、⌘/Ctrl+Shift+N 等优先生效，已避开 ⌘/Ctrl+N（浏览器新窗口）": "Chat uses ⌘/Ctrl+K and ⌘/Ctrl+Shift+N; ⌘/Ctrl+N remains the browser's new-window shortcut.",
+};
+
+function shortcutSections(native: boolean, en: boolean): ShortcutSection[] {
+  const copy = (value: string) => en ? ENGLISH[value] || value : value;
+  const sections: ShortcutSection[] = SHORTCUT_SECTIONS.map(section => ({
+    ...section, title: copy(section.title), rows: section.rows.map(row => ({
+      ...row, description: copy(row.description), label: row.label ? copy(row.label) : undefined,
+    })),
+  }));
+  if (native) {
+    sections.unshift({ title: en ? "Desktop window" : "桌面窗口", rows: [
+      { keys: ["mod+,"], description: en ? "Open settings" : "打开设置" },
+      { keys: ["mod+b"], description: en ? "Toggle conversation sidebar" : "切换会话侧栏" },
+      { keys: ["mod+r"], description: en ? "Save drafts and reload chat; reload a focused preview" : "保存草稿后刷新聊天；预览聚焦时刷新预览" },
+      { keys: ["alt+left", "alt+right"], description: en ? "Navigate workspace history; navigate a focused preview" : "工作台后退 / 前进；预览聚焦时使用预览历史" },
+    ] });
+    sections[sections.length - 1] = { title: en ? "Shortcut context" : "冲突说明", wide: true, rows: [
+      sections[sections.length - 1].rows[0],
+      { label: en ? "Native commands" : "原生命令", description: en ? "Settings, search, sidebar, and reload are handled once by the desktop window, including when a preview or terminal has focus." : "设置、搜索、侧栏和刷新由桌面窗口统一处理；预览或终端聚焦时也只触发一次。" },
+      { label: en ? "Terminal input" : "终端输入", description: en ? "Other keys go to the terminal. Click outside to return to chat; Escape remains terminal input." : "其余按键交给终端。点击外部返回聊天；Esc 保留为终端输入。" },
+    ] };
+  }
+  return sections;
+}
+
 function rowHaystack(section: ShortcutSection, row: ShortcutRow): string {
   const keyText = (row.keys ?? [])
     .flatMap((binding) => binding.split("+").map((part) => `${part} ${KEY_WORDS[part] ?? ""}`))
@@ -123,6 +163,8 @@ export interface ConversationShortcutsHelpProps {
 
 export function ConversationShortcutsHelp({ open, onClose }: ConversationShortcutsHelpProps) {
   const [query, setQuery] = useState("");
+  const { lang } = useLang();
+  const en = lang === "en", native = Boolean(desktopChatBridge());
   const needle = query.trim().toLowerCase();
 
   useEffect(() => {
@@ -130,11 +172,12 @@ export function ConversationShortcutsHelp({ open, onClose }: ConversationShortcu
   }, [open]);
 
   const sections = useMemo(() => {
-    if (!needle) return SHORTCUT_SECTIONS;
-    return SHORTCUT_SECTIONS
+    const all = shortcutSections(native, en);
+    if (!needle) return all;
+    return all
       .map((section) => ({ ...section, rows: section.rows.filter((row) => rowHaystack(section, row).includes(needle)) }))
       .filter((section) => section.rows.length);
-  }, [needle]);
+  }, [needle, native, en]);
 
   return (
     <Dialog
@@ -142,8 +185,8 @@ export function ConversationShortcutsHelp({ open, onClose }: ConversationShortcu
       onOpenChange={(next) => { if (!next) onClose(); }}
       size="lg"
       icon="keyboard"
-      title="键盘快捷键"
-      description="组合键在 macOS 上显示为 ⌘ / ⌥，其他系统为 Ctrl / Alt。"
+      title={en ? "Keyboard shortcuts" : "键盘快捷键"}
+      description={en ? "macOS uses ⌘ / ⌥; other systems use Ctrl / Alt." : "组合键在 macOS 上显示为 ⌘ / ⌥，其他系统为 Ctrl / Alt。"}
       testId="conversation-shortcuts-help"
       bodyClassName="pt-1"
     >
@@ -151,8 +194,8 @@ export function ConversationShortcutsHelp({ open, onClose }: ConversationShortcu
         <SearchInput
           value={query}
           onValueChange={setQuery}
-          placeholder="搜索快捷键或操作…"
-          aria-label="搜索快捷键"
+          placeholder={en ? "Search shortcuts or actions…" : "搜索快捷键或操作…"}
+          aria-label={en ? "Search shortcuts" : "搜索快捷键"}
           data-autofocus
           size="md"
         />
@@ -190,7 +233,7 @@ export function ConversationShortcutsHelp({ open, onClose }: ConversationShortcu
             ))}
           </div>
         ) : (
-          <EmptyState compact icon="search" title="没有匹配的快捷键" description={`未找到与 “${query.trim()}” 相关的操作。`} />
+          <EmptyState compact icon="search" title={en ? "No matching shortcuts" : "没有匹配的快捷键"} description={en ? `No actions match “${query.trim()}”.` : `未找到与 “${query.trim()}” 相关的操作。`} />
         )}
       </div>
     </Dialog>

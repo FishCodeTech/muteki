@@ -25,7 +25,9 @@ Invariant: only an explicit model ``submit-flag`` declaration reaches
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -33,6 +35,10 @@ from pathlib import Path
 from typing import Any, Optional, Protocol, runtime_checkable
 
 from muteki.models.solve_graph import Challenge, SolveGraph
+
+
+class PentestReviewConflict(RuntimeError):
+    """The reviewed evidence changed; retry from a fresh graph snapshot."""
 
 
 # Event-type vocabulary, lifecycle-state sets, and the stateless lane/fact helpers
@@ -169,6 +175,10 @@ class SharedGraph(Protocol):
 
     def finding_invalidated(self, *, actor: str, finding: dict | str) -> int: ...
 
+    def record_pentest_finding_review(self, *, payload: dict) -> int: ...
+
+    def record_pentest_finding_review_failure(self, *, payload: dict) -> int: ...
+
     def propose_intent(self, *, actor: str, intent_id: str, goal: str,
                        payload: Optional[dict] = None,
                        from_fact_seqs: Optional[list[int]] = None) -> int: ...
@@ -228,6 +238,7 @@ class SharedGraph(Protocol):
                              dead_ends: Optional[list[dict]] = None,
                              pocs: Optional[list[dict]] = None,
                              artifacts: Optional[list[str]] = None,
+                             vulnerability_report: Optional[dict] = None,
                              need_input: Optional[dict] = None,
                              conclude: bool = True,
                              successor_intent_id: str = "") -> dict: ...
@@ -799,6 +810,8 @@ class SQLiteSharedGraph(
         contract = getattr(self.challenge, "pentest_contract", None)
         if contract is None:
             return -1
+        if contract.report_goal_mode == "count":
+            return -1
         from muteki.pentest.judgement import GOAL_COMPLETED, goal_evidence_valid
         cited = list(dict.fromkeys(int(seq) for seq in fact_seqs))
         if not goal_evidence_valid(self.events(), contract, cited):
@@ -818,6 +831,254 @@ class SQLiteSharedGraph(
         return self._append(
             kind, "coordinator", dict(payload),
             verified=not error,
+        )
+
+    def record_pentest_finding_review(self, *, payload: dict) -> int:
+        """Commit a model review against the exact evidence it was shown.
+
+        The model decides whether a report is an independent, supported
+        finding. This boundary only validates identity, citations and whether
+        the cited evidence changed while the model was reviewing it.
+        """
+        contract = getattr(self.challenge, "pentest_contract", None)
+        if contract is None or int(getattr(contract, "version", 1)) < 2:
+            raise ValueError("finding review requires a v2 pentest engagement")
+        finding_seq = payload.get("finding_seq")
+        reviewed_at_seq = payload.get("reviewed_at_seq")
+        status = payload.get("status")
+        reason = payload.get("reason")
+        cited = payload.get("fact_seqs")
+        duplicate_of = payload.get("duplicate_of")
+        selected_artifacts = payload.get("selected_artifacts")
+        if (type(finding_seq) is not int or finding_seq <= 0
+                or type(reviewed_at_seq) is not int or reviewed_at_seq < finding_seq
+                or status not in {"accepted", "rejected", "needs_more_evidence"}
+                or not isinstance(reason, str) or not reason.strip()
+                or not isinstance(cited, list) or not cited
+                or any(type(seq) is not int or seq <= 0 for seq in cited)
+                or not isinstance(selected_artifacts, list) or not selected_artifacts
+                or (duplicate_of is not None and
+                    (type(duplicate_of) is not int or duplicate_of <= 0))):
+            raise ValueError("invalid pentest finding review")
+        if duplicate_of is not None and status != "rejected":
+            raise ValueError("only a rejected duplicate may cite duplicate_of")
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT payload,verified FROM events WHERE challenge_id=? "
+                    "AND seq=? AND kind='finding_found'",
+                    (self.challenge.id, finding_seq),
+                ).fetchone()
+                if row is None or not row[1]:
+                    raise ValueError("reviewed finding is unavailable")
+                finding = json.loads(row[0])
+                if finding.get("report_status") != "submitted":
+                    raise ValueError("reviewed finding is not a submitted report")
+                latest = self._conn.execute(
+                    "SELECT MAX(seq) FROM events WHERE challenge_id=?",
+                    (self.challenge.id,),
+                ).fetchone()[0] or 0
+                if reviewed_at_seq > latest:
+                    raise ValueError("review evidence watermark is in the future")
+                from muteki.pentest.judgement import submitted_reports
+                rows = [
+                    {"seq": seq, "ts": ts, "actor": actor, "kind": kind,
+                     "payload": json.loads(raw), "verified": bool(verified)}
+                    for seq, ts, actor, kind, raw, verified in self._conn.execute(
+                        "SELECT seq,ts,actor,kind,payload,verified FROM events "
+                        "WHERE challenge_id=? ORDER BY seq",
+                        (self.challenge.id,),
+                    )
+                ]
+                candidate = next((item for item in submitted_reports(rows, contract)
+                                  if item["id"] == f"finding-{finding_seq}"), None)
+                if candidate is None:
+                    raise PentestReviewConflict("reviewed finding has no live in-scope evidence")
+                fact_seqs = set(candidate["evidence_fact_seqs"])
+                review_scope_fact_seqs = fact_seqs | set(candidate["retired_evidence_fact_seqs"])
+                reviewed_candidate = next((item for item in submitted_reports(
+                    (row for row in rows if row["seq"] <= reviewed_at_seq), contract,
+                ) if item["id"] == f"finding-{finding_seq}"), None)
+                if (reviewed_candidate is None
+                        or set(reviewed_candidate["evidence_fact_seqs"]) != fact_seqs):
+                    raise PentestReviewConflict("finding evidence changed during review")
+                if any(seq not in fact_seqs for seq in cited):
+                    raise ValueError("review cites a Fact outside the finding")
+                if status == "accepted" and set(cited) != fact_seqs:
+                    raise ValueError("accepted review must cite every finding Fact")
+                selected_by_fact: dict[int, dict] = {}
+                for item in selected_artifacts:
+                    if not isinstance(item, dict):
+                        raise ValueError("review selected artifact has invalid shape")
+                    fact_seq = item.get("fact_seq")
+                    artifact_id = item.get("artifact_id")
+                    digest = item.get("sha256")
+                    if (type(fact_seq) is not int or fact_seq in selected_by_fact
+                            or not isinstance(artifact_id, str)
+                            or re.fullmatch(r"[0-9a-f]{12}", artifact_id) is None
+                            or not isinstance(digest, str)
+                            or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
+                        raise ValueError("review selected artifact identity is invalid")
+                    selected_by_fact[fact_seq] = item
+                if set(selected_by_fact) != fact_seqs:
+                    raise ValueError("review must preserve every selected finding artifact")
+                snapshot_root = Path(self.db_path).resolve().parent / "review-artifacts"
+                for fact_seq, item in selected_by_fact.items():
+                    row = self._conn.execute(
+                        "SELECT payload,verified FROM events WHERE challenge_id=? "
+                        "AND seq=? AND kind='fact_added'",
+                        (self.challenge.id, fact_seq),
+                    ).fetchone()
+                    if row is None or not row[1]:
+                        raise PentestReviewConflict("reviewed Fact is unavailable")
+                    provenance = (json.loads(row[0]).get("evidence_provenance") or {})
+                    ref = next((ref for ref in provenance.get("artifact_refs") or []
+                                if isinstance(ref, dict)
+                                and ref.get("artifact_id") == item["artifact_id"]), None)
+                    expected = str((ref or {}).get("sha256") or "")
+                    if not expected and item["artifact_id"] == provenance.get("artifact_id"):
+                        expected = str(provenance.get("artifact_sha256") or "")
+                    if expected != item["sha256"]:
+                        raise PentestReviewConflict("selected artifact provenance changed")
+                    snapshot = snapshot_root / expected
+                    if not snapshot.is_file() or snapshot.is_symlink():
+                        raise PentestReviewConflict("private review evidence snapshot is missing")
+                    checksum = hashlib.sha256()
+                    with snapshot.open("rb") as stream:
+                        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                            checksum.update(chunk)
+                    if checksum.hexdigest() != expected:
+                        raise PentestReviewConflict("private review evidence snapshot changed")
+                changed_during_review = False
+                peer_accepted_during_review = False
+                latest_relevant_seq = finding_seq
+                invalidated = False
+                prior: tuple[int, dict] | None = None
+                for seq, kind, raw in self._conn.execute(
+                    "SELECT seq,kind,payload FROM events WHERE challenge_id=? "
+                    "AND seq>? AND kind IN ('finding_revised','finding_invalidated',"
+                    "'fact_challenged','fact_revalidated','fact_rejected',"
+                    "'fact_merged','fact_superseded','finding_reviewed',"
+                    "'finding_evidence_added') "
+                    "ORDER BY seq",
+                    (self.challenge.id, finding_seq),
+                ):
+                    item = json.loads(raw)
+                    if kind == "finding_reviewed" and item.get("finding_seq") == finding_seq:
+                        prior = (seq, item)
+                        continue
+                    if (kind == "finding_reviewed" and status == "accepted"
+                            and seq > reviewed_at_seq and item.get("status") == "accepted"):
+                        peer_accepted_during_review = True
+                    relevant = (
+                        (kind == "finding_revised" and item.get("finding_seq") == finding_seq)
+                        or (kind == "finding_evidence_added" and item.get("finding_seq") == finding_seq)
+                        or (kind == "finding_invalidated" and
+                            item.get("finding_key") == SolveGraph._finding_identity(finding))
+                        or (kind == "fact_merged" and item.get("from_fact_seq") in review_scope_fact_seqs)
+                        or (kind.startswith("fact_") and item.get("fact_seq") in review_scope_fact_seqs)
+                    )
+                    if relevant:
+                        latest_relevant_seq = seq
+                        if seq > reviewed_at_seq:
+                            changed_during_review = True
+                        if kind == "finding_invalidated":
+                            invalidated = True
+                if invalidated:
+                    raise PentestReviewConflict("reviewed finding has been invalidated")
+                if changed_during_review:
+                    raise PentestReviewConflict("finding evidence changed during review")
+                if peer_accepted_during_review:
+                    raise PentestReviewConflict("accepted report set changed during review")
+                if latest > reviewed_at_seq or duplicate_of is not None or prior is not None:
+                    # The model compared this candidate with the accepted peer
+                    # set in its input snapshot. A peer invalidation, revision,
+                    # or evidence change can reverse the duplicate decision.
+                    from muteki.pentest.judgement import qualified_reports
+                    before = {
+                        item["id"]: item for item in qualified_reports(
+                            (row for row in rows if row["seq"] <= reviewed_at_seq),
+                            contract,
+                        ) if item["id"] != f"finding-{finding_seq}"
+                    }
+                    current = {
+                        item["id"]: item for item in qualified_reports(rows, contract)
+                        if item["id"] != f"finding-{finding_seq}"
+                    }
+                    if before != current:
+                        raise PentestReviewConflict("accepted peer evidence changed during review")
+                    if duplicate_of is not None and f"finding-{duplicate_of}" not in current:
+                        raise PentestReviewConflict("duplicate reference is no longer accepted")
+                    if prior is not None and latest_relevant_seq <= int(prior[1].get("reviewed_at_seq") or 0):
+                        prior_peers = {
+                            item["id"]: item for item in qualified_reports(
+                                (row for row in rows if row["seq"] <= int(prior[1].get("reviewed_at_seq") or 0)),
+                                contract,
+                            ) if item["id"] != f"finding-{finding_seq}"
+                        }
+                        if prior_peers == before:
+                            self._conn.rollback()
+                            return prior[0]
+                seq = self._append_locked(
+                    "finding_reviewed", "coordinator", dict(payload),
+                    verified=True,
+                    dedupe_key=(
+                        f"finding-review::{self.challenge.id}::"
+                        f"{finding_seq}::{reviewed_at_seq}"
+                    ),
+                )
+                if seq < 0:
+                    self._conn.rollback()
+                    raise ValueError("finding review identity conflict")
+                self._conn.commit()
+                return seq
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def record_pentest_finding_review_failure(self, *, payload: dict) -> int:
+        """Keep the full failed model response reachable without accepting it."""
+        return self._append(
+            "finding_review_failed", "coordinator", dict(payload), verified=False,
+        )
+
+    def revise_pentest_finding(
+        self, *, finding_seq: int, changes: dict, reason: str,
+        actor: str = "operator_review",
+    ) -> int:
+        """Append a review correction without replacing the original finding or Fact."""
+        if getattr(self.challenge, "mode", "") != "pentest":
+            raise ValueError("finding revisions require a pentest graph")
+        allowed = {
+            "title", "summary", "observed_impact", "potential_impact",
+            "severity", "severity_rationale", "reproduction_steps",
+            "remediation", "retest_steps",
+        }
+        if not reason.strip() or not changes or set(changes) - allowed:
+            raise ValueError("finding revision needs a reason and permitted content changes")
+        row = self._conn.execute(
+            "SELECT verified FROM events WHERE challenge_id=? AND seq=? AND kind='finding_found'",
+            (self.challenge.id, finding_seq),
+        ).fetchone()
+        if row is None or not row[0]:
+            raise ValueError("original verified finding is unavailable")
+        for key, value in changes.items():
+            if key in {"reproduction_steps", "retest_steps"}:
+                if not isinstance(value, list) or not value or not all(
+                    isinstance(step, str) and step.strip() for step in value
+                ):
+                    raise ValueError(f"{key} must be a nonempty list of steps")
+            elif not isinstance(value, str) or (key != "potential_impact" and not value.strip()):
+                raise ValueError(f"{key} must be nonempty text")
+        if "severity" in changes and changes["severity"] not in {
+            "critical", "high", "medium", "low", "informational", "unrated",
+        }:
+            raise ValueError("invalid severity")
+        return self._append(
+            "finding_revised", actor,
+            {"finding_seq": finding_seq, "changes": changes, "reason": reason.strip()},
+            verified=True,
         )
 
 

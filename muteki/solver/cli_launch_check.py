@@ -13,6 +13,7 @@ from typing import Any, Mapping, Optional
 LAUNCH_CODE_ILLEGAL = "process_input_illegal"
 LAUNCH_CODE_ARGV_SIZE = "process_argv_too_large"
 LAUNCH_CODE_CONTEXT = "shared_context_unready"
+LAUNCH_CODE_ENVIRONMENT = "worker_environment_unavailable"
 
 
 class LaunchContractError(RuntimeError):
@@ -67,6 +68,16 @@ def check_process_launch(
                 field=field,
                 source=source,
             )
+        # Linux rejects an individual argv/env string at MAX_ARG_STRLEN
+        # (128 KiB) even when the aggregate ARG_MAX budget still has room.
+        if _utf8_size(item) + 1 > 128 * 1024:
+            raise LaunchContractError(
+                f"{source}: argv[{index}] is {_utf8_size(item)} bytes; "
+                "exceeds the per-argument launch limit",
+                code=LAUNCH_CODE_ARGV_SIZE,
+                field=f"argv[{index}]",
+                source=source,
+            )
     cwd_field = _nul_field("cwd", cwd)
     if cwd_field:
         raise LaunchContractError(
@@ -83,6 +94,13 @@ def check_process_launch(
                     f"{source}: {field} contains a NUL byte",
                     code=LAUNCH_CODE_ILLEGAL,
                     field=field,
+                    source=source,
+                )
+            if _utf8_size(key) + _utf8_size(value) + 2 > 128 * 1024:
+                raise LaunchContractError(
+                    f"{source}: env.{key} exceeds the per-string launch limit",
+                    code=LAUNCH_CODE_ARGV_SIZE,
+                    field=f"env.{key}",
                     source=source,
                 )
     if stdin_text is not None:
@@ -118,13 +136,10 @@ def launch_failure_code(exc: BaseException) -> str:
         LAUNCH_CODE_ILLEGAL,
         LAUNCH_CODE_ARGV_SIZE,
         LAUNCH_CODE_CONTEXT,
+        LAUNCH_CODE_ENVIRONMENT,
         "provider_config_missing",
         "model_catalog_missing",
+        "worker_spawn_rejected",
     }:
         return code
-    text = str(exc).casefold()
-    if "embedded null byte" in text or "null byte" in text:
-        return LAUNCH_CODE_ILLEGAL
-    if "required shared graph could not be rendered" in text:
-        return LAUNCH_CODE_CONTEXT
     return ""

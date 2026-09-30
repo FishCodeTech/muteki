@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+from hashlib import sha256
+import json
 from pathlib import Path
 from typing import Any, Optional
 
@@ -11,12 +13,23 @@ from muteki.solver.workspace import materialize_shared_artifact, workspace_root_
 
 async def _handle_poc_save(self, path_text: str, entry_command: str,
                            status: str, note: str) -> bool:
-    cwd = (self._current_workdir
-           or (Path(self._workdir).resolve() if self._workdir else None))
+    current = (self._current_workdir
+               or (Path(self._workdir) if self._workdir else None))
+    cwd = Path(current).resolve() if current is not None else None
     if cwd is None:
         return False
     try:
-        src = (cwd / path_text).resolve() if not Path(path_text).is_absolute() else Path(path_text).resolve()
+        if getattr(self, "container", None) is not None:
+            # The CLI reports its container-visible $PWD. Reuse the same exact
+            # cwd mapping as engine spill artifacts, then verify the resolved
+            # host file is still owned by this Worker.
+            mapped = self._spill_host_path(path_text)
+            if mapped is None:
+                raise ValueError("PoC path is outside the container Worker cwd")
+            src = Path(mapped[1]).resolve()
+        else:
+            supplied = Path(path_text)
+            src = (cwd / supplied).resolve() if not supplied.is_absolute() else supplied.resolve()
         src.relative_to(cwd)
     except (OSError, ValueError):
         await self._emit_bb("poc_saved", status="rejected", path=path_text,
@@ -28,7 +41,9 @@ async def _handle_poc_save(self, path_text: str, entry_command: str,
         return False
     marker_key = f"{src}:{entry_command}:{status}:{note}"
     if marker_key in self._published_pocs:
-        return True
+        self._last_saved_poc_id = str(
+            (getattr(self, "_saved_poc_ids_by_marker", None) or {}).get(marker_key) or "")
+        return bool(self._last_saved_poc_id)
     self._published_pocs.add(marker_key)
 
     # The PoC save does blocking filesystem + hashing work (read_text,
@@ -45,23 +60,50 @@ async def _handle_poc_save(self, path_text: str, entry_command: str,
         save_src = src
         try:
             root = workspace_root_for_worker(cwd)
+            browser_evidence = None
+            if save_src.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+                sidecar = save_src.with_name(save_src.name + ".muteki-browser.json")
+                if sidecar.is_file():
+                    value = json.loads(sidecar.read_text(encoding="utf-8"))
+                    if not isinstance(value, dict) or value.get("schema") != "muteki-browser-screenshot-v1":
+                        raise ValueError("浏览器截图元数据格式无效")
+                    digest = sha256()
+                    with save_src.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                    if value.get("image_sha256") != digest.hexdigest():
+                        raise ValueError("浏览器截图元数据与图像不匹配")
+                    browser_evidence = {key: value.get(key) for key in (
+                        "run_id", "worker_id", "tab", "page_url", "captured_at",
+                        "request_ids", "request_scope", "image_sha256", "capture_errors",
+                    )}
             art = materialize_shared_artifact(
                 root, save_src, name=src.name, kind="poc", status=status_,
                 metadata={
                     "entry_command": entry_command,
                     "intent_id": getattr(self, "intent_id_assigned", "") or getattr(self, "_intent_id", ""),
                     "solver_id": self.solver_id,
+                    **({"browser_evidence": browser_evidence} if browser_evidence else {}),
                 },
             )
         except (OSError, FileNotFoundError):
             return None
         return art, status_, local_note
 
-    result = await asyncio.to_thread(_save_blocking)
+    try:
+        result = await asyncio.to_thread(_save_blocking)
+    except (ValueError, TypeError) as exc:
+        await self._emit_bb("poc_saved", status="rejected", path=path_text,
+                            note=str(exc))
+        return False
     if result is None:
         return False
     artifact, clean_status, note = result
     poc_id = f"poc-{artifact['sha256'][:12]}"
+    self._last_saved_poc_id = poc_id
+    saved_ids = dict(getattr(self, "_saved_poc_ids_by_marker", None) or {})
+    saved_ids[marker_key] = poc_id
+    self._saved_poc_ids_by_marker = saved_ids
     intent_id = getattr(self, "intent_id_assigned", "") or getattr(self, "_intent_id", "") or None
     # The artifact/CAS materialization above stays immediate; only the graph
     # row defers into this worker's atomic end-of-life result commit.

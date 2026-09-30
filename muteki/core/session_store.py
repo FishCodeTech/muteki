@@ -428,7 +428,9 @@ class SessionStore:
             if et in {"run.preparing", "run.started"}:
                 summary["started"] = True
                 ch = p.get("challenge") or {}
-                summary["name"] = ch.get("name") or summary["name"]
+                challenge_name = str(ch.get("name") or "")
+                if challenge_name and challenge_name != run_id:
+                    summary["name"] = challenge_name
                 summary["category"] = ch.get("category") or summary["category"]
                 if ch.get("mode") == "pentest":
                     summary["mode"] = "pentest"

@@ -1,4 +1,5 @@
 import type { ConversationCredential, RuntimeInstance } from "./useConversation";
+import { credentialForRuntime, validModelEffort } from "./modelReasoning";
 import { allModelIds, credentialAvailable, pickRuntimeForEngine } from "./conversationReadiness";
 
 export type ComposerLaunchSelection = {
@@ -29,19 +30,18 @@ export function resolveComposerBindingRestore(input: {
   const saved = input.snapshot;
   const credential = input.credentials.find((row) => row.id === saved.credentialId);
   if (!credentialAvailable(credential)) return retain("原接入点已不可用");
-  if (!credential || !saved.model || !allModelIds(credential).includes(saved.model)) {
-    return retain("原模型已不可用");
-  }
+  if (!credential || !saved.model) return retain("原模型已不可用");
   const legacyRuntime = !saved.runtimeKey;
   const key = saved.runtimeKey || pickRuntimeForEngine(credential.engine, input.runtimes)?.key;
   const runtime = input.runtimes.find((row) => row.key === key);
   if (!runtime || runtime.enabled === false || runtime.engine !== credential.engine) {
     return retain("原 Runtime 实例已不可用或与接入点不匹配");
   }
+  const scopedCredential = credentialForRuntime(credential, runtime.key);
+  if (!allModelIds(scopedCredential).includes(saved.model)) return retain("原模型不再属于该 Runtime 的目录");
   const effort = saved.effort ?? "";
-  const model = [...credential.models, ...credential.candidate_models].find((row) => row.id === saved.model);
-  const levels = model?.reasoning?.levels || [];
-  if (effort && (model?.reasoning?.supported === false || (levels.length && !levels.includes(effort)))) {
+  const model = [...scopedCredential.models, ...scopedCredential.candidate_models].find((row) => row.id === saved.model);
+  if (!validModelEffort(model, effort)) {
     return retain("原推理强度不再受该模型支持");
   }
   const accessMode = saved.accessMode || "supervised";

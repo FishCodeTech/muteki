@@ -1,7 +1,10 @@
 @import "tailwindcss";
 @import "@heroui/styles";
-@custom-variant dark (&:is(.dark *));
 @import "@xyflow/react/dist/style.css";
+@custom-variant dark (&:is(.dark *));
+/* These components are shared by both Next and the local desktop renderer. */
+@source "../../components";
+@source "../../lib";
 
 @theme inline {
   --color-page: var(--page);

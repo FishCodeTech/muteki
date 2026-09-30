@@ -25,6 +25,7 @@ import json
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -320,6 +321,7 @@ class CompetitionStore:
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        self._transaction_depth = 0
         cur = self._conn.cursor()
         # 新建库从一开始启用增量回收；已有库会在运维 VACUUM 后采用该模式。
         # 这样后续清理历史事件时可以归还空页，不再永久保留峰值文件体积。
@@ -330,7 +332,55 @@ class CompetitionStore:
         cur.execute("PRAGMA foreign_keys=ON")
         self._conn.commit()
         apply_competition_migrations(self._conn)
+        with self.transaction():
+            self._conn.execute("CREATE TABLE IF NOT EXISTS command_effect_results (command_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
         self.outbox = CompetitionOutboxManager(self)
+
+    @contextmanager
+    def transaction(self):
+        """Serialize a synchronous local commit; nested stores share savepoints."""
+        with self._lock:
+            depth = self._transaction_depth
+            savepoint = f"competition_nested_{depth}"
+            if depth:
+                self._conn.execute(f"SAVEPOINT {savepoint}")
+            else:
+                self._conn.execute("BEGIN IMMEDIATE")
+            self._transaction_depth += 1
+            try:
+                yield
+            except BaseException:
+                if depth:
+                    self._conn.execute(f"ROLLBACK TO {savepoint}")
+                    self._conn.execute(f"RELEASE {savepoint}")
+                else:
+                    self._conn.rollback()
+                raise
+            else:
+                try:
+                    if depth:
+                        self._conn.execute(f"RELEASE {savepoint}")
+                    else:
+                        self._conn.commit()
+                except BaseException:
+                    if depth:
+                        self._conn.execute(f"ROLLBACK TO {savepoint}")
+                        self._conn.execute(f"RELEASE {savepoint}")
+                    else:
+                        self._conn.rollback()
+                    raise
+            finally:
+                self._transaction_depth -= 1
+
+    def save_effect_result(self, command_id: str, payload: dict[str, Any]) -> None:
+        with self.transaction():
+            self._conn.execute("INSERT OR REPLACE INTO command_effect_results VALUES (?, ?)",
+                               (command_id, json.dumps(payload, ensure_ascii=False)))
+
+    def effect_result(self, command_id: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute("SELECT payload FROM command_effect_results WHERE command_id=?", (command_id,)).fetchone()
+        return json.loads(row[0]) if row else None
 
     # -- 生命周期 ---------------------------------------------------------
 
@@ -407,7 +457,7 @@ class CompetitionStore:
             f"DO UPDATE SET {update_clause}"
         )
         try:
-            with self._lock, self._conn:
+            with self.transaction():
                 self._conn.execute(sql, all_values)
         except sqlite3.IntegrityError as exc:
             raise self._unique_error(spec, exc) from exc
@@ -666,7 +716,7 @@ class CompetitionStore:
         now = utcnow().isoformat()
         payload_hash = _hash_command(command)
         try:
-            with self._lock, self._conn:
+            with self.transaction():
                 self._conn.execute(
                     "INSERT INTO competition_commands (command_id, "
                     "idempotency_key, command_type, aggregate_type, "
@@ -789,7 +839,7 @@ class CompetitionStore:
         if effect_ids is not None:
             changes["effect_ids"] = list(dict.fromkeys(effect_ids))
         receipt = receipt.model_copy(update=changes)
-        with self._lock, self._conn:
+        with self.transaction():
             self._conn.execute(
                 "UPDATE competition_receipts SET state = ?, run_id = ?, "
                 "event_cursor = ?, error_json = ?, updated_at = ?, payload = ? "
@@ -856,7 +906,7 @@ class CompetitionStore:
             )
         now = utcnow().isoformat()
         stored: list[EventEnvelope] = []
-        with self._lock, self._conn:
+        with self.transaction():
             heads: dict[tuple[str, str], int] = {}
             checked: set[tuple[str, str]] = set()
             for event in events:
@@ -1071,7 +1121,7 @@ class CompetitionOutboxManager:
             record.command_id or record.event_id or record.outbox_id
         )
         now = utcnow().isoformat()
-        with self._store.lock, self._store.conn:
+        with self._store.transaction():
             existing = self._store.conn.execute(
                 "SELECT payload FROM competition_outbox WHERE idempotency_key = ?",
                 (key,),
@@ -1130,7 +1180,7 @@ class CompetitionOutboxManager:
 
     def mark_processing(self, outbox_id: str) -> OutboxRecord:
         """原子领取 pending/failed 记录并递增实际投递尝试次数。"""
-        with self._store.lock, self._store.conn:
+        with self._store.transaction():
             row = self._store.conn.execute(
                 "SELECT payload FROM competition_outbox WHERE outbox_id = ?",
                 (outbox_id,),
@@ -1179,7 +1229,7 @@ class CompetitionOutboxManager:
             "delivered_at": at or utcnow(),
             "last_error": None,
         })
-        with self._store.lock, self._store.conn:
+        with self._store.transaction():
             self._store.conn.execute(
                 "UPDATE competition_outbox SET status = ?, delivered_at = ?, "
                 "last_error = NULL, updated_at = ?, payload = ? "
@@ -1209,7 +1259,7 @@ class CompetitionOutboxManager:
         next_attempt = (
             datetime.now(timezone.utc) + timedelta(seconds=retry_delay_seconds)
         ).isoformat()
-        with self._store.lock, self._store.conn:
+        with self._store.transaction():
             self._store.conn.execute(
                 "UPDATE competition_outbox SET status = ?, attempts = ?, "
                 "next_attempt_at = ?, last_error = ?, updated_at = ?, "
@@ -1234,7 +1284,7 @@ class CompetitionOutboxManager:
             "status": OutboxStatus.DEAD_LETTER,
             "last_error": str(error),
         })
-        with self._store.lock, self._store.conn:
+        with self._store.transaction():
             self._store.conn.execute(
                 "UPDATE competition_outbox SET status = ?, last_error = ?, "
                 "updated_at = ?, payload = ? WHERE outbox_id = ?",
@@ -1254,7 +1304,7 @@ class CompetitionOutboxManager:
             "status": OutboxStatus.PAUSED,
             "last_error": str(error),
         })
-        with self._store.lock, self._store.conn:
+        with self._store.transaction():
             self._store.conn.execute(
                 "UPDATE competition_outbox SET status = ?, last_error = ?, "
                 "updated_at = ?, payload = ? WHERE outbox_id = ?",
@@ -1285,7 +1335,7 @@ class CompetitionOutboxManager:
             "delivered_at": None,
         })
         now = utcnow().isoformat()
-        with self._store.lock, self._store.conn:
+        with self._store.transaction():
             self._store.conn.execute(
                 "UPDATE competition_outbox SET status = ?, next_attempt_at = ?, "
                 "last_error = NULL, delivered_at = NULL, updated_at = ?, "
@@ -1311,7 +1361,7 @@ class CompetitionOutboxManager:
             "status": OutboxStatus.CANCELLED,
             "last_error": "cancelled by operator before delivery",
         })
-        with self._store.lock, self._store.conn:
+        with self._store.transaction():
             self._store.conn.execute(
                 "UPDATE competition_outbox SET status = ?, last_error = ?, "
                 "updated_at = ?, payload = ? WHERE outbox_id = ?",

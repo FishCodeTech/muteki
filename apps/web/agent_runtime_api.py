@@ -28,6 +28,7 @@ import asyncio
 import json
 import threading
 import time
+import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Optional
@@ -61,12 +62,13 @@ from muteki.external_agents.factory import (
     engine_for_adapter,
     runtime_config_schema,
 )
-from muteki.platform.contracts.external_agents import ACCESS_MODE_VALUES
+from muteki.platform.contracts.external_agents import ACCESS_MODE_VALUES, ProbeRequest
 from muteki.solver.worker_profiles import (
     VALID_BASE_ENGINES,
     normalize_worker_profile,
     parse_runtime_instance_ref,
 )
+from muteki.solver.credential_accounts import host_discovery_enabled, canonical_credential_id
 from muteki.solver.engine_registry import (
     ENGINE_TEMPORARILY_UNSUPPORTED_CODE,
     EngineTemporarilyUnsupportedError,
@@ -417,10 +419,20 @@ class RuntimeInstanceConfigStore:
     def get(self, adapter_id: str, instance_id: str = "default") -> Optional[RuntimeInstanceConfig]:
         return self._instances.get(f"{adapter_id}:{instance_id}")
 
-    def upsert(self, cfg: RuntimeInstanceConfig) -> RuntimeInstanceConfig:
+    def upsert(self, cfg: RuntimeInstanceConfig, *, expected_revision: str | None = None) -> RuntimeInstanceConfig:
         with self._lock:
+            previous = self._instances.get(cfg.key)
+            if expected_revision is not None and (previous.updated_at if previous else "") != expected_revision:
+                raise ValueError("runtime.instance.revision_conflict")
             self._instances[cfg.key] = cfg
-            self._flush()
+            try:
+                self._flush()
+            except BaseException:
+                if previous is None:
+                    self._instances.pop(cfg.key, None)
+                else:
+                    self._instances[cfg.key] = previous
+                raise
         return cfg
 
     def remove(self, adapter_id: str, instance_id: str = "default") -> bool:
@@ -496,6 +508,10 @@ class RuntimeInstanceConfigStore:
 # ---------------------------------------------------------------------------
 
 
+class RuntimeProbeScopeChangedError(RuntimeError):
+    code = "runtime.instance.probe_scope_changed"
+
+
 class AgentRuntimeService:
     """Runtime 设置面板的业务服务（Handler 与 HTTP router 共用）。
 
@@ -522,6 +538,7 @@ class AgentRuntimeService:
         self.sessions_root = Path(sessions_root)
         self.factory = factory
         self._probe_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
+        self._probe_locks: dict[str, asyncio.Lock] = {}
         self._version_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
         self._version_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._version_cache_ttl_s = 300.0
@@ -643,6 +660,7 @@ class AgentRuntimeService:
                     cached_auth = (
                         health.get("auth")
                         if discovered_adapter_id.startswith("cli.")
+                        and host_discovery_enabled()
                         and isinstance(health, dict)
                         and isinstance(health.get("auth"), dict)
                         else None
@@ -656,6 +674,7 @@ class AgentRuntimeService:
             cached_auth = (
                 health.get("auth")
                 if str(row.get("adapter_id") or "").startswith("cli.")
+                and (bool(_account_id_of_ref(str(row.get("credential_ref") or ""))) or host_discovery_enabled())
                 and isinstance(health, dict)
                 and isinstance(health.get("auth"), dict)
                 else None
@@ -695,6 +714,7 @@ class AgentRuntimeService:
         cached_auth = (
             health.get("auth")
             if adapter_id.startswith("cli.")
+            and (bool(_account_id_of_ref(str(view.get("credential_ref") or ""))) or host_discovery_enabled())
             and isinstance(health, dict)
             and isinstance(health.get("auth"), dict)
             else None
@@ -757,6 +777,14 @@ class AgentRuntimeService:
             from muteki.solver.credential_accounts import detect_system_login
 
             host = detect_system_login(engine)
+            if host == "disabled":
+                return {
+                    "status": "unavailable",
+                    "code": "host_discovery_disabled",
+                    "detail": "此服务未提供宿主登录发现；请选择已登记凭据",
+                    "login_command": "",
+                    "account_id": "",
+                }
             if host == "present":
                 return {
                     "status": "ok",
@@ -782,7 +810,7 @@ class AgentRuntimeService:
         except Exception as exc:  # noqa: BLE001 — 检测失败不阻断其他 Runtime
             return {
                 "status": "unknown",
-                "detail": f"认证检测异常：{str(exc)[:120]}",
+                "detail": f"认证检测异常：{str(exc)}",
                 "login_command": login_command,
                 "note": note,
                 "account_id": account_id,
@@ -796,27 +824,44 @@ class AgentRuntimeService:
         instance_id: str,
         *,
         force_version_check: bool = False,
+        credential_id: str = "",
+        environment: str = "local",
     ) -> dict[str, Any]:
-        """复用同一实例正在进行的探测，避免重复启动 CLI。"""
+        """Share only probes with the same Runtime configuration and owner."""
         adapter_id = canonical_adapter_id(adapter_id)
         key = f"{adapter_id}:{instance_id}"
-        existing = self._probe_tasks.get(key)
+        if environment != "local":
+            raise ValueError("Runtime probes execute in the local conversation environment")
+        credential_id = canonical_credential_id(credential_id, engine=engine_of_adapter(adapter_id))
+        if credential_id and adapter_id != "codex.app_server":
+            raise ValueError("Scoped model catalog probing is supported by codex.app_server")
+        cfg = self.store.get(adapter_id, instance_id)
+        configuration = json.loads(json.dumps(cfg.to_dict())) if cfg is not None else None
+        task_key = json.dumps([key, credential_id, environment, configuration], sort_keys=True)
+        existing = self._probe_tasks.get(task_key)
         if existing is not None and not existing.done():
             return await asyncio.shield(existing)
 
         async def _perform() -> dict[str, Any]:
             try:
-                return await self._probe_one_unlocked(
-                    adapter_id,
-                    instance_id,
-                    force_version_check=force_version_check,
-                )
+                # Registered adapters keep their last report on the instance.
+                # Serialize different credential probes so that report cannot
+                # be read back as the other request's result.
+                async with self._probe_locks.setdefault(key, asyncio.Lock()):
+                    return await self._probe_one_unlocked(
+                        adapter_id, instance_id,
+                        force_version_check=force_version_check,
+                        credential_id=credential_id, environment=environment,
+                        configuration=configuration,
+                    )
             except Exception as exc:
+                if credential_id or isinstance(exc, RuntimeProbeScopeChangedError):
+                    raise
                 engine = engine_of_adapter(adapter_id)
                 previous = self.store.health(key) or {}
                 self.store.save_health(key, {
                     "healthy": False,
-                    "detail": f"{type(exc).__name__}: {str(exc)[:200]}",
+                    "detail": f"{type(exc).__name__}: {exc}",
                     "binary_path": "",
                     "runtime_version": "",
                     "probed_at": utcnow().isoformat(),
@@ -831,16 +876,29 @@ class AgentRuntimeService:
                 raise
 
         task = asyncio.create_task(_perform())
-        self._probe_tasks[key] = task
+        self._probe_tasks[task_key] = task
         try:
             return await asyncio.wait_for(
                 asyncio.shield(task), timeout=self._probe_timeout_s,
             )
+        except asyncio.CancelledError:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            raise
         except asyncio.TimeoutError as exc:
             task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
             engine = engine_of_adapter(adapter_id)
             previous = self.store.health(key) or {}
             detail = f"Runtime 探测超过 {self._probe_timeout_s:g} 秒"
+            if credential_id:
+                raise TimeoutError(detail) from exc
             self.store.save_health(key, {
                 "healthy": False,
                 "detail": detail,
@@ -857,8 +915,61 @@ class AgentRuntimeService:
             })
             raise TimeoutError(detail) from exc
         finally:
-            if task.done() and self._probe_tasks.get(key) is task:
-                self._probe_tasks.pop(key, None)
+            if task.done() and self._probe_tasks.get(task_key) is task:
+                self._probe_tasks.pop(task_key, None)
+
+    async def _probe_credential_catalog(
+        self, adapter_id: str, instance_id: str, credential_id: str,
+        configuration: dict[str, Any] | None,
+    ) -> tuple[Any, str]:
+        """Prepare a small temporary native home for the selected credential."""
+        from muteki.conversation.chat_plugins import ChatPluginService
+        from muteki.external_agents.factory import RuntimeAdapterConfig
+        from muteki.external_agents.probe_environment import PROBE_ENVIRONMENT
+        from muteki.solver.credential_accounts import resolve_credential_env
+        from muteki.solver.credential_accounts import (
+            CredentialAccountStore, account_id_from_credential_id, account_store_root,
+        )
+
+        accounts = CredentialAccountStore(account_store_root(self.sessions_root))
+        account_id = account_id_from_credential_id(credential_id)
+        revision = accounts.revision(account_id) if account_id else ""
+
+        base = self.sessions_root / "_runtime_probe_environments"
+        base.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.TemporaryDirectory(prefix="probe-", dir=base) as directory:
+            root = Path(directory)
+
+            def prepare() -> dict[str, str]:
+                resolved = resolve_credential_env(
+                    credential_id, engine="codex", sessions_root=self.sessions_root,
+                    container=False, agent_state_dir=root / "credentials",
+                )
+                cfg = RuntimeAdapterConfig.from_value(configuration or {
+                    "adapter_id": adapter_id, "instance_id": instance_id})
+                configured = self.factory._env(cfg) if self.factory is not None else {}
+                return ChatPluginService(root / "native").prepare_environment(
+                    "codex", f"probe:{adapter_id}:{instance_id}:{credential_id}",
+                    {**configured, **resolved.env}, include_assets=False,
+                )
+
+            preparation = asyncio.create_task(asyncio.to_thread(prepare))
+            try:
+                env = await asyncio.shield(preparation)
+            except asyncio.CancelledError:
+                # to_thread cannot be stopped. Wait for its writes to finish
+                # before removing the temporary credential/home tree.
+                await preparation
+                raise
+            token = PROBE_ENVIRONMENT.set(env)
+            try:
+                report = await self.registry.probe(adapter_id, instance_id, request=ProbeRequest(
+                    runtime_instance_id=instance_id, include_models=True))
+                if account_id and accounts.revision(account_id) != revision:
+                    raise RuntimeProbeScopeChangedError("Credential configuration changed during model catalog probing")
+                return report, revision
+            finally:
+                PROBE_ENVIRONMENT.reset(token)
 
     async def _check_version(
         self,
@@ -914,6 +1025,9 @@ class AgentRuntimeService:
         instance_id: str,
         *,
         force_version_check: bool = False,
+        credential_id: str = "",
+        environment: str = "local",
+        configuration: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """对一个 instance 做 capability probe 并写健康缓存。
 
@@ -927,12 +1041,23 @@ class AgentRuntimeService:
             raise ValueError(f"未知 Runtime adapter：{adapter_id!r}")
         cfg = self.store.get(adapter_id, instance_id)
         key = f"{adapter_id}:{instance_id}"
+        def ensure_configuration() -> None:
+            current = self.store.get(adapter_id, instance_id)
+            if (current.to_dict() if current is not None else None) != configuration:
+                raise RuntimeProbeScopeChangedError("Runtime configuration changed during model catalog probing")
+        if credential_id:
+            ensure_configuration()
 
         caps: Any = None
         report: Any = None
+        credential_revision = ""
         source = "cli_driver"
         if self.registry is not None and self.registry.record(adapter_id, instance_id) is not None:
-            report = await self.registry.probe(adapter_id, instance_id)
+            if credential_id:
+                report, credential_revision = await self._probe_credential_catalog(
+                    adapter_id, instance_id, credential_id, configuration)
+            else:
+                report = await self.registry.probe(adapter_id, instance_id)
             caps = report.capabilities
             source = "registry"
         elif adapter_id.startswith("cli."):
@@ -1015,7 +1140,32 @@ class AgentRuntimeService:
             "auth": auth,
             "source": source,
         }
-        self.store.save_health(key, health)
+        if credential_id:
+            ensure_configuration()
+            from muteki.solver.credential_accounts import (
+                CredentialAccountStore, account_id_from_credential_id, account_store_root,
+            )
+            account_id = account_id_from_credential_id(credential_id)
+            if account_id and CredentialAccountStore(account_store_root(self.sessions_root)).revision(account_id) != credential_revision:
+                raise RuntimeProbeScopeChangedError("Credential configuration changed before model catalog publication")
+            from apps.web.worker_models import CredentialModelCatalogStore
+            result = getattr(report, "model_catalog", None)
+            if not isinstance(result, dict):
+                result = {"ok": False, "models": [], "source": "codex.model/list",
+                          "error_code": "codex.model_catalog.unavailable",
+                          "detail": "Native Runtime did not return a model catalog"}
+            catalogs = CredentialModelCatalogStore(self.sessions_root)
+            previous = catalogs.get(credential_id, engine, environment, key) or {}
+            health["model_catalog"] = catalogs.save_discovery(
+                credential_id=credential_id, engine=engine, environment=environment,
+                runtime_instance=key, result=result,
+                configured_models=list(previous.get("configured_models") or []),
+                default_model=str(previous.get("default_model") or result.get("default_model") or ""),
+            )
+            # Retain the complete native diagnostic in the probe response too.
+            health["model_catalog"]["detail"] = str(result.get("detail") or "")
+        if not credential_id:
+            self.store.save_health(key, health)
         return health
 
     async def probe_all(
@@ -1261,9 +1411,12 @@ class RuntimeInstanceCommandHandler:
         store = self._service.store
 
         async def _save() -> SideEffectResult:
-            store.upsert(cfg)
+            try:
+                store.upsert(cfg, expected_revision=command.payload.get("expected_revision"))
+            except ValueError as exc:
+                raise CommandFailed(make_error("runtime.instance.revision_conflict", "运行配置已被其它视图修改，请刷新后重试。", ErrorCategory.CONFLICT, correlation_id=correlation_id_of(command))) from exc
             self._service.apply_live_config(cfg)
-            return SideEffectResult()
+            return SideEffectResult(output={"instance": cfg.to_dict()})
 
         return CommandPlan(
             events=[_event(command, "core.runtime.instance.upserted", cfg.key, {
@@ -1323,6 +1476,18 @@ class RuntimeInstanceCommandHandler:
                 ErrorCategory.NOT_FOUND,
                 correlation_id=correlation_id_of(command)))
         service = self._service
+        raw_credential = command.payload.get("credential_id", "")
+        environment = command.payload.get("environment", "local")
+        try:
+            if not isinstance(raw_credential, str) or environment != "local":
+                raise ValueError("credential_id must be a string and environment must be local")
+            credential_id = canonical_credential_id(raw_credential, engine=engine_of_adapter(adapter_id))
+            if credential_id and adapter_id != "codex.app_server":
+                raise ValueError("Scoped model catalog probing is supported by codex.app_server")
+        except ValueError as exc:
+            raise CommandFailed(make_error(
+                "runtime.instance.probe_scope_invalid", str(exc), ErrorCategory.VALIDATION,
+                correlation_id=correlation_id_of(command))) from exc
 
         async def _probe() -> SideEffectResult:
             try:
@@ -1330,19 +1495,34 @@ class RuntimeInstanceCommandHandler:
                     adapter_id,
                     instance_id,
                     force_version_check=True,
+                    credential_id=credential_id,
+                    environment=environment,
                 )
             except Exception as exc:  # noqa: BLE001 — 归类为该实例的失败
                 return SideEffectResult(
                     events=[_event(command, "core.runtime.instance.probe_failed", key, {
                         "key": key,
-                        "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                        "error": f"{type(exc).__name__}: {exc}",
                     })],
                     error=make_error(
-                        "core.runtime.instance.probe_failed",
-                        f"{type(exc).__name__}: {str(exc)[:200]}",
-                        ErrorCategory.INTERNAL,
+                        str(getattr(exc, "code", "core.runtime.instance.probe_failed")),
+                        f"{type(exc).__name__}: {exc}",
+                        ErrorCategory.STATE if isinstance(exc, RuntimeProbeScopeChangedError) else ErrorCategory.INTERNAL,
                         correlation_id=correlation_id_of(command),
                         retryable=True),
+                    state=ReceiptState.FAILED,
+                )
+            catalog = health.get("model_catalog") or {}
+            if credential_id and catalog.get("refresh_status") != "fresh":
+                return SideEffectResult(
+                    events=[_event(command, "core.runtime.instance.probe_failed", key, {
+                        "key": key, "credential_id": credential_id, "environment": environment,
+                        "error": str(catalog.get("detail") or catalog.get("last_error") or "Native catalog unavailable"),
+                    })],
+                    error=make_error(
+                        str(catalog.get("error_code") or "codex.model_catalog.request_failed"),
+                        str(catalog.get("detail") or catalog.get("last_error") or "Native catalog unavailable"),
+                        ErrorCategory.RUNTIME, correlation_id=correlation_id_of(command), retryable=True),
                     state=ReceiptState.FAILED,
                 )
             return SideEffectResult(events=[_event(
@@ -1358,6 +1538,8 @@ class RuntimeInstanceCommandHandler:
                     "capability_injection": dict(
                         health.get("capability_injection") or {}),
                     "degradations": list(health.get("degradations") or []),
+                    **({"credential_id": credential_id, "environment": environment,
+                        "model_catalog": catalog} if credential_id else {}),
                 })])
 
         return CommandPlan(
@@ -1906,12 +2088,13 @@ def create_agent_runtime_router(
             {"adapter_id": adapter_id, "instance_id": instance_id}))
 
     @router.post("/api/agent-runtimes/{instance_key}/probe")
-    async def probe_runtime(instance_key: str) -> Any:
+    async def probe_runtime(instance_key: str, body: dict[str, Any] = Body(default={})) -> Any:
         adapter_id, instance_id = _parse_key(instance_key)
         key = f"{adapter_id}:{instance_id}"
         response = await _dispatch(_command(
             "runtime.instance.probe", "runtime", key,
-            {"adapter_id": adapter_id, "instance_id": instance_id}))
+            {"adapter_id": adapter_id, "instance_id": instance_id,
+             "credential_id": body.get("credential_id", ""), "environment": body.get("environment", "local")}))
         body = json.loads(response.body)
         # probe 完成后把最新健康快照一并返回，前端无需二次请求。
         view = service.get_instance(adapter_id, instance_id) if adapter_id else None

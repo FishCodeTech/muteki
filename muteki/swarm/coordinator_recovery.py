@@ -109,6 +109,8 @@ async def idle_stage(self, state) -> str:
     from muteki.swarm.coordinator_state import emit_scheduler_bb
 
     emit_bb = partial(emit_scheduler_bb, self, state)
+    if state.pentest_review_task is not None or state.pentest_review_retry_after:
+        return "continue"
     # An empty queue in a goal-incomplete run schedules another Decide pass.
     # The retry is paced by reason_retry_not_before in reason_trigger_stage;
     # this branch never waits for operator input on its own.
@@ -123,6 +125,28 @@ async def idle_stage(self, state) -> str:
     if (not state.tasks and not state.open_intents
             and state.reason_task is None
             and not state.reason_result_ready):
+        last_reason = getattr(self, "_last_reason", None)
+        clean_empty_plan = bool(
+            last_reason is not None
+            and getattr(last_reason, "planner_failure", None) is None
+            and not getattr(self, "_last_planner_failure", None)
+            and not list(getattr(last_reason, "intents", []) or [])
+        )
+        if (getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
+                and clean_empty_plan
+                and not state.reason_retry_pending
+                and not state.reason_next_trigger
+                and not state.decide_followup_pending):
+            current_wm = int(
+                self.shared_graph.semantic_graph_watermark() or 0
+            ) if self.shared_graph is not None else 0
+            if current_wm <= state.last_consumed_wm:
+                await emit_bb(
+                    "reason_no_progress",
+                    watermark=current_wm,
+                    detail="Decide returned no actionable Step and no new evidence arrived",
+                )
+                return "break"
         # A CTF round with no committed Fact has no new planning input. 12662
         # ends the round here instead of inventing a replacement Worker or an
         # idle Decide pass.

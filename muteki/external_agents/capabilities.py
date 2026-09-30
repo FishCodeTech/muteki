@@ -56,6 +56,9 @@ class CapabilityProbeReport:
     degradations: list[str] = field(default_factory=list)
     detail: str = ""
     healthy_override: bool | None = None
+    # Discovery evidence, not proof that the credential can complete inference.
+    # Only the caller that selected the credential may persist this catalog.
+    model_catalog: dict[str, Any] | None = None
 
     @property
     def healthy(self) -> bool:

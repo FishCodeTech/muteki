@@ -168,12 +168,14 @@ class AcpTransport:
         on_update: Optional[UpdateHandler] = None,
         permission_handler: Optional[PermissionHandler] = None,
         elicitation_handler: Optional[ElicitationHandler] = None,
+        control_delivery_handler: Optional[Callable[[dict[str, Any], dict[str, Any]], None]] = None,
         on_raw_line: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._client_info = {"name": client_name, "version": client_version}
         self._on_update = on_update
         self._permission_handler = permission_handler
         self._elicitation_handler = elicitation_handler
+        self._control_delivery_handler = control_delivery_handler
         #: 有进行中 session/prompt 的 sessionId 集合——replay 判定的唯一依据。
         self._active_prompts: set[str] = set()
         self._replaying_sessions: set[str] = set()
@@ -284,6 +286,26 @@ class AcpTransport:
         """Return the Agent-reported setup state for one ACP session."""
         return dict(self._session_setup.get(session_id) or {})
 
+    async def set_config_option(
+        self, session_id: str, config_id: str, value: str, *,
+        timeout: float = 30.0,
+    ) -> None:
+        result = check_response("session/set_config_option", await self._peer.request(
+            "session/set_config_option",
+            {"sessionId": session_id, "configId": config_id, "value": value},
+            timeout=timeout,
+        ))
+        options = result.get("configOptions")
+        if not isinstance(options, list):
+            raise AcpError("session/set_config_option returned no configOptions")
+        setup = self._session_setup.setdefault(session_id, {})
+        setup["configOptions"] = options
+        option = next((item for item in options if item.get("id") == config_id), None)
+        if option is None or option.get("currentValue") != value:
+            raise AcpError(f"session/set_config_option did not apply {config_id!r}={value!r}")
+        if option.get("category") == "mode" or option.get("id") == "mode":
+            setup.setdefault("modes", {})["currentModeId"] = value
+
     async def set_mode(
         self, session_id: str, mode_id: str, *, timeout: float = 30.0
     ) -> None:
@@ -349,29 +371,41 @@ class AcpTransport:
                 self._on_update(session_id, update, replay)
             return
         if method == "session/request_permission" and "id" in msg:
+            params = {**(msg.get("params") or {}), "__muteki_rpc_request_id": str(msg["id"])}
             option_id: Optional[str] = None
             if self._permission_handler is not None:
-                decision = self._permission_handler(msg.get("params") or {})
+                decision = self._permission_handler(params)
                 option_id = (
                     await decision if inspect.isawaitable(decision) else decision
                 )
             if option_id is None:
-                await self._peer.respond(
-                    msg["id"], result={"outcome": {"outcome": "cancelled"}})
+                await self._respond_control(msg["id"], params, {"outcome": {"outcome": "cancelled"}})
             else:
-                await self._peer.respond(msg["id"], result={
+                await self._respond_control(msg["id"], params, {
                     "outcome": {"outcome": "selected", "optionId": option_id}})
             return
         if method in {"elicitation/create", "session/elicitation"} and "id" in msg:
+            params = {**(msg.get("params") or {}), "__muteki_rpc_request_id": str(msg["id"])}
             result: dict[str, Any] = {"action": "cancel"}
             if self._elicitation_handler is not None:
-                response = self._elicitation_handler(msg.get("params") or {})
+                response = self._elicitation_handler(params)
                 result = (
                     await response if inspect.isawaitable(response) else response
                 )
-            await self._peer.respond(msg["id"], result=result)
+            await self._respond_control(msg["id"], params, result)
             return
         self.stats["unhandled"] += 1
+
+    async def _respond_control(self, request_id: Any, params: dict[str, Any], result: dict[str, Any]) -> None:
+        try:
+            await self._peer.respond(request_id, result=result)
+        except BaseException as exc:
+            if self._control_delivery_handler is not None:
+                self._control_delivery_handler(params, {"ok": False, "detail": f"{type(exc).__name__}: {exc}"})
+            raise
+        else:
+            if self._control_delivery_handler is not None:
+                self._control_delivery_handler(params, {"ok": True})
 
 
 # ---------------------------------------------------------------------------
@@ -804,6 +838,8 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
             "access_mode": access_mode,
             "pending_approvals": {},
             "pending_user_inputs": {},
+            "control_delivery_enabled": True,
+            "control_deliveries": {},
             "available_commands": [],
             "capability_revision": 0,
         }
@@ -816,6 +852,8 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
                 request.agent_session_id, params),
             elicitation_handler=lambda params: self._request_elicitation(
                 request.agent_session_id, params),
+            control_delivery_handler=lambda params, outcome: self._control_delivery_result(
+                request.agent_session_id, params, outcome),
         )
         # 先注册句柄再启动：session/load 的历史回放在 load 响应之前到达，
         # 必须能被 _dispatch_update 找到句柄记入 replay_events。
@@ -1049,6 +1087,7 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
             "future": future,
             "options": options,
             "params": dict(params),
+            "delivery": self._register_control_delivery(handle, params),
         }
         sink.put_nowait(("approval", AgentEventType.APPROVAL_REQUESTED,
                          "acp.request_permission", {
@@ -1066,7 +1105,8 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
                              },
                              "options": [
                                  {"option_id": option.get("optionId"),
-                                  "kind": option.get("kind")}
+                                  "kind": option.get("kind"),
+                                  "name": option.get("name")}
                                  for option in options],
                              "access_mode": access_mode,
                          }))
@@ -1184,6 +1224,7 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
         message = str(params.get("message") or "Agent 请求输入")
         positive_content = self._approval_elicitation_content(params)
+        delivery = self._register_control_delivery(handle, params)
         if positive_content is not None:
             handle["pending_approvals"][request_id] = {
                 "future": future,
@@ -1191,6 +1232,7 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
                 "params": dict(params),
                 "kind": "elicitation",
                 "positive_content": positive_content,
+                "delivery": delivery,
             }
             sink.put_nowait(("approval", AgentEventType.APPROVAL_REQUESTED,
                              "acp.elicitation", {
@@ -1207,6 +1249,7 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
         handle["pending_user_inputs"][request_id] = {
             "future": future,
             "params": dict(params),
+            "delivery": delivery,
         }
         questions = questions_from_schema(
             params.get("requestedSchema") or {},
@@ -1215,12 +1258,13 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
         pending = normalize_pending_user_input({
             "request_id": request_id,
             "user_input_kind": "acp.elicitation",
+            "response_actions": ["submit", "cancel", "decline"],
             "title": message,
             "message": message,
             "question": message,
             "questions": questions,
             "schema": params.get("requestedSchema") or {},
-            "native": params,
+            "native": {key: value for key, value in params.items() if key != "__muteki_rpc_request_id"},
         })
         sink.put_nowait(("user_input", AgentEventType.USER_INPUT_REQUESTED,
                          "acp.elicitation", pending))
@@ -1292,6 +1336,13 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
             )
             if not future.done():
                 future.set_result(result)
+            if handle.get("control_delivery_enabled"):
+                outcome = await self._await_control_delivery(pending.get("delivery"))
+                if not outcome["ok"]:
+                    yield self.emit(build_event(AgentEventType.RUNTIME_ERROR, seq,
+                        payload={"code": "acp.control.delivery_unknown", "delivery_unknown": True,
+                                 "detail": outcome.get("detail")}, **common))
+                    return
             yield self.emit(build_event(
                 AgentEventType.APPROVAL_RESOLVED, seq,
                 native_type="acp.elicitation",
@@ -1306,20 +1357,39 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
             return
         if decision.allowed:
             wanted = (
-                ("allow_always", "allow_once")
+                ("allow_always",)
                 if decision.scope is ApprovalScope.SESSION
-                else ("allow_once", "allow_always")
+                else ("allow_once",)
             )
         else:
             wanted = (
-                ("reject_always", "reject_once")
+                ("reject_always",)
                 if decision.scope is ApprovalScope.SESSION
-                else ("reject_once", "reject_always")
+                else ("reject_once",)
             )
         option_id = self._permission_option(options, wanted)
+        if decision.option_id:
+            offered = next((row for row in options if str(row.get("optionId") or "") == decision.option_id), None)
+            option_id = decision.option_id if offered is not None and offered.get("kind") in wanted else None
+        if option_id is None:
+            yield self.emit(build_event(
+                AgentEventType.RUNTIME_ERROR, seq,
+                native_type="acp.permission.unsupported_scope",
+                payload={"code": "acp.approval.unsupported_scope",
+                         "detail": "The requested permission scope is not offered by this request"},
+                **common,
+            ))
+            return
         future = pending["future"]
         if not future.done():
             future.set_result(option_id)
+        if handle.get("control_delivery_enabled"):
+            outcome = await self._await_control_delivery(pending.get("delivery"))
+            if not outcome["ok"]:
+                yield self.emit(build_event(AgentEventType.RUNTIME_ERROR, seq,
+                    payload={"code": "acp.control.delivery_unknown", "delivery_unknown": True,
+                             "detail": outcome.get("detail")}, **common))
+                return
         yield self.emit(build_event(
             AgentEventType.APPROVAL_RESOLVED, seq,
             native_type="acp.request_permission",
@@ -1328,6 +1398,7 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
                 "decision": decision.choice.value,
                 "scope": decision.scope.value,
                 "option_id": option_id,
+                "native_option": next((dict(row) for row in options if str(row.get("optionId") or "") == option_id), None),
                 "outcome": "selected" if option_id else "cancelled",
             },
             **common,
@@ -1364,9 +1435,9 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
             return
         decision = str(input.payload.get("decision") or "submit").strip().lower()
         structured = dict(input.payload.get("answers") or {})
-        if decision == "cancel":
-            result = {"action": "decline"}
-        elif structured:
+        if decision in {"cancel", "decline"}:
+            result = {"action": decision}
+        elif "answers" in input.payload:
             schema = (
                 (pending.get("params") or {}).get("requestedSchema")
                 if isinstance(pending.get("params"), dict)
@@ -1382,10 +1453,7 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
                 },
                 schema=schema if isinstance(schema, dict) else {},
             )
-            result = (
-                {"action": "accept", "content": content}
-                if content else {"action": "decline"}
-            )
+            result = {"action": "accept", "content": content}
         else:
             content = self._elicitation_content_from_text(
                 pending["params"], input.text)
@@ -1396,6 +1464,13 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
         future = pending["future"]
         if not future.done():
             future.set_result(result)
+        if handle.get("control_delivery_enabled"):
+            outcome = await self._await_control_delivery(pending.get("delivery"))
+            if not outcome["ok"]:
+                yield self.emit(build_event(AgentEventType.RUNTIME_ERROR, seq,
+                    payload={"code": "acp.control.delivery_unknown", "delivery_unknown": True,
+                             "detail": outcome.get("detail")}, **common))
+                return
         yield self.emit(build_event(
             AgentEventType.USER_INPUT_RESOLVED, seq,
             native_type="acp.elicitation",
@@ -1406,6 +1481,29 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
             },
             **common,
         ))
+
+    @staticmethod
+    def _register_control_delivery(handle: dict[str, Any], params: dict[str, Any]) -> Any:
+        if not handle.get("control_delivery_enabled"):
+            return None
+        delivery = asyncio.get_running_loop().create_future()
+        handle.setdefault("control_deliveries", {})[str(params["__muteki_rpc_request_id"])] = delivery
+        return delivery
+
+    def _control_delivery_result(self, sid: str, params: dict[str, Any], outcome: dict[str, Any]) -> None:
+        handle = self._handle_for(sid) or {}
+        delivery = handle.get("control_deliveries", {}).pop(str(params.get("__muteki_rpc_request_id") or ""), None)
+        if delivery is not None and not delivery.done():
+            delivery.set_result(outcome)
+
+    @staticmethod
+    async def _await_control_delivery(delivery: Any) -> dict[str, Any]:
+        if delivery is None:
+            return {"ok": False, "detail": "Native response delivery tracker is missing"}
+        try:
+            return await asyncio.wait_for(asyncio.shield(delivery), timeout=30)
+        except asyncio.TimeoutError:
+            return {"ok": False, "detail": "Native response write confirmation timed out"}
 
     async def _prompt_stream(
         self, session: AgentSessionRef, input: AgentInput
@@ -1661,7 +1759,7 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
         )
 
     async def _teardown(self, session: AgentSessionRef) -> str:
-        handle = self._acp.pop(session.agent_session_id, None)
+        handle = self._acp.get(session.agent_session_id)
         if not handle:
             return EXIT_RESUMABLE if session.resume_handle else "closed"
         for pending in handle.get("pending_approvals", {}).values():
@@ -1679,6 +1777,7 @@ class BaseAcpAdapter(BaseExternalAgentAdapter):
         returncode: Optional[int] = None
         if transport is not None:
             returncode = await transport.close()
+        self._acp.pop(session.agent_session_id, None)
         return classify_exit(
             returncode=returncode,
             cancelled=handle.get("current_turn_id") is not None,

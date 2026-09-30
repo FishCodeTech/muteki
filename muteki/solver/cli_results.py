@@ -69,27 +69,16 @@ class BlackboardReceiptPersistenceError(RuntimeError):
     code = "blackboard_receipt_persistence_failed"
 
 
-def _worker_runtime_failure_code(detail: str) -> str:
-    """Classify deterministic local model-catalog failures only.
-
-    Authentication failures, provider HTTP errors and rate limits remain ordinary
-    engine failures because another account/profile may recover them.  These
-    signatures mean every retry in the same reconstructed runtime will fail before
-    performing any challenge work.
-    """
-    normalized = str(detail or "").casefold()
-    if "unknown provider" in normalized:
-        return "provider_config_missing"
-    if (
-        "no models available" in normalized
-        or "no models configured" in normalized
-        or "model catalog is empty" in normalized
-    ):
-        return "model_catalog_missing"
-    if "embedded null byte" in normalized or "null byte" in normalized:
-        return "process_input_illegal"
-    if "required shared graph could not be rendered" in normalized:
-        return "shared_context_unready"
+def _worker_runtime_failure_code(result: CliResult) -> str:
+    """Use only an explicit runtime error code; stderr is diagnostic data."""
+    status = getattr(result, "runtime_status", None)
+    code = str(status.get("error_code") or "") if isinstance(status, dict) else ""
+    if code in {
+        "provider_config_missing", "model_catalog_missing",
+        "process_input_illegal", "shared_context_unready",
+        "worker_environment_unavailable",
+    }:
+        return code
     return ""
 
 
@@ -398,6 +387,9 @@ async def _accept_submitted_flag(self, flag: str) -> bool:
 def _blackboard_operation_allowed(self, operation: str) -> bool:
     if operation == "context":
         return True
+    if operation in {"mcp_tools", "mcp_schema", "mcp_call"}:
+        return (getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
+                and self.mode in {"bootstrap", "explore", "fact_verifier", "review"})
     if operation == "recent_evidence":
         return getattr(self.challenge, "mode", "ctf") == "pentest" and self.mode in {"bootstrap", "explore", "fact_verifier"}
     if operation == "need_input" and not bool(
@@ -413,9 +405,11 @@ def _blackboard_operation_allowed(self, operation: str) -> bool:
                 "submit_fact", "commit_step", "dead_end", "need_input",
                 "save_poc",
             }
+            if self.challenge.mode == "pentest":
+                permitted.add("submit_report")
             return operation in (permitted | ({"submit_flag"} if self.challenge.mode == "ctf" else set()))
         if self.mode == "fact_verifier":
-            return operation in {"submit_fact", "commit_step", "dead_end", "save_poc"}
+            return operation in {"submit_fact", "submit_report", "commit_step", "dead_end", "save_poc"}
         if self.mode == "respond" and str(
             self.hitl_cmd.get("action") or ""
         ) == "mark_false":
@@ -466,6 +460,40 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
             "detail": f"operation {operation or '(empty)'} is not allowed for {self.mode}",
         }
     shared_graph = getattr(self, "shared_graph", None)
+    if operation in {"mcp_tools", "mcp_schema", "mcp_call"}:
+        service = getattr(self, "plugin_service", None)
+        if service is None:
+            return {"ok": False, "code": "worker_mcp.unavailable",
+                    "detail": "Managed MCP service is unavailable in this execution"}
+        mode = str(getattr(self.challenge, "mode", "ctf") or "ctf")
+        engine = str(self.driver.name)
+        try:
+            tools = await service.prepare_tools(engine, mode, self.run_id)
+            if operation == "mcp_tools":
+                catalog = [{"name": item["name"], "description": item["description"],
+                            "package": item["_package"], "server": item["_server"]}
+                           for item in tools]
+                errors = service.mcp_connection_errors(engine, mode, self.run_id)
+                return {"ok": True, "message": json.dumps(
+                    {"tools": catalog, "connection_errors": errors}, ensure_ascii=False)}
+            name = str(payload.get("name") or "")
+            selected = next((item for item in tools if item["name"] == name), None)
+            if selected is None:
+                return {"ok": False, "code": "worker_mcp.tool_unavailable",
+                        "detail": "MCP tool is not enabled for this Worker mode and engine"}
+            if operation == "mcp_schema":
+                return {"ok": True, "message": json.dumps(selected["input_schema"], ensure_ascii=False)}
+            arguments = payload.get("arguments")
+            if not isinstance(arguments, dict):
+                return {"ok": False, "code": "worker_mcp.invalid_arguments",
+                        "detail": "MCP arguments must be a JSON object"}
+            result = await service.invoke(engine, name, arguments, mode=mode, scope=self.run_id)
+            return {"ok": True, "message": json.dumps(result, ensure_ascii=False)}
+        except asyncio.TimeoutError:
+            return {"ok": False, "code": "worker_mcp.timeout", "detail": "MCP tool timed out"}
+        except Exception as exc:
+            return {"ok": False, "code": "worker_mcp.failed",
+                    "detail": f"MCP {type(exc).__name__}: {exc}"}
     if operation == "context":
         return {"ok": True, "content": self._live_blackboard_context()}
     if operation == "recent_evidence":
@@ -517,19 +545,88 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
             "title": title, "content": content,
             "evidence_artifact_id": evidence_artifact_id,
         }
+        self._draft_report = None
         self._accepted_blackboard_requests += 1
         return {
             "ok": True,
             "message": "已记入草稿。核对无误即调 commit-step 定稿收束。",
         }
+    if operation == "submit_report":
+        from muteki.pentest.contract import in_scope_url
+        item = payload.get("report")
+        if not isinstance(item, dict):
+            return {"ok": False, "detail": "report must be a JSON object"}
+        required = ("title", "finding_class", "resource_id", "identity_a",
+                    "summary", "observed_impact", "severity_rationale", "remediation")
+        missing = [key for key in required if not isinstance(item.get(key), str) or not item[key].strip()]
+        steps = item.get("reproduction_steps")
+        retest = item.get("retest_steps")
+        severity = item.get("severity")
+        if missing:
+            return {"ok": False, "detail": f"required nonempty text fields: {', '.join(missing)}"}
+        if not isinstance(severity, str) or severity not in {
+            "critical", "high", "medium", "low", "informational", "unrated",
+        }:
+            return {"ok": False, "detail": "severity must be critical, high, medium, low, informational, or unrated"}
+        if not isinstance(steps, list) or not steps or not all(
+            isinstance(x, str) and x.strip() for x in steps
+        ):
+            return {"ok": False, "detail": "reproduction_steps must be a nonempty array of nonempty strings"}
+        if not isinstance(retest, list) or not retest or not all(
+            isinstance(x, str) and x.strip() for x in retest
+        ):
+            return {"ok": False, "detail": "retest_steps must be a nonempty array of nonempty strings"}
+        contract = getattr(self.challenge, "pentest_contract", None)
+        if contract is None or not in_scope_url(item["resource_id"], contract):
+            return {"ok": False, "detail": "report resource is outside the authorized scope"}
+        if not getattr(self, "_draft_fact", None):
+            return {"ok": False, "detail": "submit-fact with tool evidence before submit-report"}
+        optional_text = ("identity_b", "preconditions", "potential_impact")
+        for field in optional_text:
+            if field in item and not isinstance(item[field], str):
+                return {"ok": False, "detail": f"{field} must be text"}
+        if "affected_assets" in item and (not isinstance(item["affected_assets"], list)
+                                          or not item["affected_assets"]
+                                          or any(not isinstance(value, str) or not value.strip()
+                                                 for value in item["affected_assets"])):
+            return {"ok": False, "detail": "affected_assets must be a nonempty array of nonempty strings"}
+        screenshot_ids = item.get("screenshot_poc_ids", [])
+        if not isinstance(screenshot_ids, list) or any(not isinstance(x, str) or not x for x in screenshot_ids):
+            return {"ok": False, "detail": "screenshot_poc_ids must be a list of saved PoC IDs"}
+        note = item.get("evidence_note")
+        if note is None and contract.version >= 2:
+            return {"ok": False, "detail": "evidence_note must cite the selected Fact artifact and explain observed/significance"}
+        if note is not None:
+            if not isinstance(note, dict):
+                return {"ok": False, "detail": "evidence_note must be an object"}
+            for field in ("artifact_id", "observed", "significance"):
+                if not isinstance(note.get(field), str) or not note[field].strip():
+                    return {"ok": False, "detail": f"evidence_note.{field} must be nonempty text"}
+            if note["artifact_id"] != self._draft_fact["evidence_artifact_id"]:
+                return {"ok": False, "detail": "evidence_note.artifact_id must match submit-fact --evidence in this Step"}
+        pending_images = {p.poc_id: p for p in getattr(self, "_pending_pocs", None) or []
+                          if p.name.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))}
+        if any(pid not in pending_images for pid in screenshot_ids):
+            return {"ok": False, "detail": "every screenshot must be saved in this Step with save-poc first"}
+        self._draft_report = {key: value for key, value in item.items()
+                              if key in {*required, "identity_b", "severity", "preconditions",
+                                         "potential_impact", "reproduction_steps", "retest_steps", "affected_assets",
+                                         "screenshot_poc_ids", "evidence_note"}}
+        self._accepted_blackboard_requests += 1
+        return {"ok": True, "message": "REPORT_DRAFTED; commit-step will atomically submit it with the cited Fact"}
     if operation == "commit_step":
         if self._worker_result_committed:
             prior = dict(getattr(self, "_last_worker_result_commit", None) or {})
             prior_facts = list(prior.get("facts") or [])
             return {
                 "ok": True,
-                "message": "STEP_COMMITTED",
+                "message": ("STEP_COMMITTED REPORT_EVIDENCE_ADDED"
+                            if int(prior.get("evidence_event_seq") or 0) > 0
+                            else "STEP_COMMITTED REPORT_SUBMITTED"
+                            if int(prior.get("report_seq") or 0) > 0 else "STEP_COMMITTED"),
                 "fact_seq": int(prior_facts[-1]) if prior_facts else 0,
+                "report_seq": int(prior.get("report_seq") or 0),
+                "evidence_event_seq": int(prior.get("evidence_event_seq") or 0),
                 "finish_worker": True,
             }
         draft = dict(getattr(self, "_draft_fact", None) or {})
@@ -578,6 +675,7 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
                 if getattr(self, "_transcript_artifact_id", "") else []
             ),
         )
+        report_proposed = bool(getattr(self, "_draft_report", None))
         commit = shared_graph.commit_worker_result(
             **worker_result.to_commit_kwargs(
                 actor=self.solver_id,
@@ -586,6 +684,7 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
                 target_epoch=str(getattr(self, "_target_epoch", "") or ""),
                 run_id=str(getattr(self, "run_id", "") or ""),
             ),
+            vulnerability_report=(dict(self._draft_report) if getattr(self, "_draft_report", None) else None),
             conclude=True,
         )
         if not isinstance(commit, dict) or not commit.get("concluded"):
@@ -600,6 +699,7 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
         self._worker_result_committed = True
         self._step_committed = True
         self._draft_fact = None
+        self._draft_report = None
         self.graph.add_evidence(
             source=self.driver.name, fact=fact_text, verified=True,
         )
@@ -630,8 +730,14 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
         self._accepted_blackboard_requests += 1
         return {
             "ok": True,
-            "message": "STEP_COMMITTED",
+            "message": ("STEP_COMMITTED REPORT_EVIDENCE_ADDED"
+                        if int(commit.get("evidence_event_seq") or 0) > 0
+                        else "STEP_COMMITTED REPORT_SUBMITTED" if int(commit.get("report_seq") or 0) > 0
+                        else "STEP_COMMITTED REPORT_DUPLICATE" if report_proposed
+                        else "STEP_COMMITTED"),
             "fact_seq": self._last_fact_seq,
+            "report_seq": int(commit.get("report_seq") or 0),
+            "evidence_event_seq": int(commit.get("evidence_event_seq") or 0),
             "finish_worker": True,
         }
     if operation == "fact":
@@ -716,7 +822,9 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
         )
         if accepted:
             self._accepted_blackboard_requests += 1
-        return {"ok": accepted, "message": "SAVED" if accepted else ""}
+        poc_id = str(getattr(self, "_last_saved_poc_id", "") or "") if accepted else ""
+        return {"ok": accepted, "message": f"SAVED {poc_id}" if accepted else "",
+                "poc_id": poc_id}
     if operation == "report_capability_gap":
         if shared_graph is None:
             return {"ok": False, "detail": "SharedGraph is unavailable"}
@@ -1151,10 +1259,10 @@ def _result_text_with_stderr(self, res: CliResult) -> str:
     text = res.text or ""
     if error:
         diagnostic = "\n".join(filter(None, (error, _stderr_tail(res))))
-        runtime_code = _worker_runtime_failure_code(diagnostic)
+        runtime_code = _worker_runtime_failure_code(res)
         if runtime_code:
             raise WorkerRuntimeUnavailable(
-                diagnostic[:2000], code=runtime_code)
+                diagnostic, code=runtime_code)
         raise RuntimeError(error)
     if not text.strip():
         raise RuntimeError(
@@ -1339,13 +1447,12 @@ async def _stream_cost(self, res: CliResult) -> None:
             return
     try:
         reported = None if usd is None else float(usd)
-        # DeepSeek-via-claude.orig often emits usage with total_cost_usd=0 (or
-        # omits it). When dollars are missing/zero but tokens exist, price from
-        # the local table (same path Reason uses) so receipts stay measurable.
+        # A missing/zero native amount does not identify a tariff. An exact
+        # configured model price can produce an estimate; otherwise keep the
+        # tokens without inventing a dollar amount.
         if (reported is None or reported <= 0.0) and (in_tok or out_tok):
-            model = model_name or "deepseek-v4-flash"
             await self.cost.record(
-                model=model,
+                model=model_name,
                 input_tokens=in_tok,
                 output_tokens=out_tok,
                 run_id=self.run_id,

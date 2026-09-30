@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from muteki.solver.worker_profiles import worker_identity_event_fields
+from muteki.swarm.coordinator_worker_reap import _record_worker_dispatch_failure
 
 async def dispatch_stage(self, state) -> str:
     from functools import partial
@@ -16,6 +17,9 @@ async def dispatch_stage(self, state) -> str:
         ControlShutdownIncomplete,
         RequiredContextUnavailable,
         WorkerBudgetExhausted,
+        WorkerProfileExhausted,
+        WorkerRuntimeUnavailable,
+        WorkerPricingUnavailable,
         WorkerSpawnRejected,
     )
 
@@ -152,8 +156,32 @@ async def dispatch_stage(self, state) -> str:
                 running_engines(), state.healthy, role=worker_role,
                 intent_id=iid, lane=intent_lane,
                 intent=intent,
-                avoid_engines=[*failed_engines, *batch_engines],
+                avoid_engines=batch_engines,
+                failed_engines=failed_engines,
                 exclude_engines=excluded_engines)
+        except WorkerProfileExhausted as exc:
+            # The last execution failed after launch and its claim was reopened.
+            # Another identical dispatch on the same failed profile adds no new
+            # evidence. Close this Step with its error record and let Decide use
+            # the durable graph to choose a different action or await correction.
+            if self.shared_graph is None:
+                raise RuntimeError("cannot conclude exhausted Intent without graph") from exc
+            concluded = self.shared_graph.conclude_intent(
+                actor="coordinator", intent_id=iid, result="error",
+                result_detail=str(exc),
+            )
+            if concluded <= 0:
+                raise RuntimeError(
+                    f"failed to conclude exhausted Intent {iid}"
+                ) from exc
+            state.intent_failed_engines.pop(iid, None)
+            state.reason_next_trigger = "intent_profiles_exhausted"
+            await emit_bb(
+                "intent_concluded", intent_id=iid, result="error",
+                reason="intent_profiles_exhausted",
+                failed_profiles=list(exc.profiles),
+            )
+            continue
         except ContextCapabilityUnavailable as exc:
             # The secure-context / role-capability filter emptied the candidate
             # pool for a STANDING config reason. Block the intent once; only
@@ -247,12 +275,44 @@ async def dispatch_stage(self, state) -> str:
                     engine=str(engine), phase=worker_mode,
                     intent_id=iid, deferred=False, retired=True)
             continue
+        except WorkerRuntimeUnavailable as exc:
+            # The selected isolation backend is broken for this Run. Retrying
+            # the same configuration cannot produce a Worker and must not be
+            # misreported as a clean no-progress end.
+            state.runtime_terminal_failure = True
+            await emit_bb(
+                "worker_runtime_unavailable", engine=str(engine),
+                intent_id=iid, detail=str(exc),
+            )
+            for other, active_solver in list(state.task_solvers.items()):
+                if not other.done():
+                    self._cancel_solver(active_solver)
+                    other.cancel()
+            return "break"
+        except WorkerPricingUnavailable as exc:
+            state.runtime_terminal_failure = True
+            self._runtime_failure_code = exc.code
+            self._runtime_failure_phase = "worker_preflight"
+            self._runtime_failure_detail = str(exc)
+            await emit_bb(
+                "worker_spawn_rejected", code=exc.code,
+                reason=str(exc), engine=str(engine), phase=worker_mode,
+            )
+            for other, active_solver in list(state.task_solvers.items()):
+                if not other.done():
+                    self._cancel_solver(active_solver)
+                    other.cancel()
+            return "break"
         except WorkerSpawnRejected as exc:
             # intent not claimed yet (claim happens after build) → just
             # defer this spawn; the intent stays open for a later worker while a
             # different queue item may still use the available capacity now.
             await emit_bb("worker_spawn_rejected", reason=str(exc),
                            engine=str(engine), phase=worker_mode)
+            if await _record_worker_dispatch_failure(
+                self, state, worker="", engine=str(engine), detail=str(exc),
+            ):
+                return "break"
             state.open_intents.append(intent)
             continue
         except WorkerBudgetExhausted as exc:

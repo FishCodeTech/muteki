@@ -12,6 +12,9 @@ Muteki threads with:
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+import heapq
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -38,6 +41,7 @@ class ProviderSessionScan:
     # Import feasibility labels (AC3)
     import_status: str        # "continuable" | "read_only" | "missing_tools"
     missing_fields: list[str] = field(default_factory=list)
+    source_fingerprint: str = ""
     # Messages extracted during scan (kept in-memory for apply phase)
     _messages: list[dict[str, Any]] = field(default_factory=list, repr=False)
 
@@ -87,15 +91,17 @@ def _text_of(content: Any) -> str:
         parts = []
         for block in content:
             if isinstance(block, dict):
-                if block.get("type") == "text":
+                if block.get("type") in {"text", "input_text", "output_text"}:
                     parts.append(str(block.get("text", "")))
                 elif block.get("type") == "tool_use":
-                    parts.append(f"[tool:{block.get('name','')}]")
+                    parts.append(json.dumps(block, ensure_ascii=False))
                 elif block.get("type") == "tool_result":
-                    parts.append(f"[tool_result]")
+                    parts.append(_text_of(block.get("content", "")))
+                else:
+                    parts.append(json.dumps(block, ensure_ascii=False))
             elif isinstance(block, str):
                 parts.append(block)
-        return " ".join(parts)
+        return "\n".join(parts)
     return str(content) if content else ""
 
 
@@ -126,267 +132,202 @@ def _infer_title(messages: list[dict[str, Any]], session_id: str) -> str:
 # Claude scanner  (~/.claude/projects/<encoded-path>/<uuid>.jsonl)
 # ---------------------------------------------------------------------------
 
-def _parse_claude_jsonl(path: Path) -> list[dict[str, Any]]:
-    """Parse a Claude conversation JSONL file.
+class ImportScanBudgetError(ValueError):
+    code = "conversation.import.scan_budget_exceeded"
 
-    Each line can be a bare message dict or a wrapper `{"type":"message", ...}`.
-    Returns a list of normalised message dicts with keys: role, content.
-    """
+
+_MAX_IMPORT_FILE_BYTES = 32 * 1024 * 1024
+_MAX_IMPORT_RECORD_BYTES = 1024 * 1024
+_MAX_IMPORT_RECORDS = 20_000
+_MAX_SCAN_FILES = 10_000
+_MAX_SCAN_BYTES = 64 * 1024 * 1024
+
+
+def _source_fingerprint(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(64 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _records(path: Path):
+    if path.stat().st_size > _MAX_IMPORT_FILE_BYTES:
+        raise ImportScanBudgetError(f"{path.name}: 文件超过 {_MAX_IMPORT_FILE_BYTES} 字节扫描预算，请拆分或明确调整预算。")
+    with path.open("rb") as handle:
+        first = handle.read(1)
+        while first and first.isspace():
+            first = handle.read(1)
+        handle.seek(0)
+        if path.suffix.lower() == ".json" or first == b"[":
+            # Legacy JSON arrays are explicitly bounded; JSONL remains streaming.
+            objs = json.load(handle)
+            if isinstance(objs, dict):
+                objs = [objs]
+            if not isinstance(objs, list):
+                raise ValueError(f"conversation.import.invalid_record: {path.name} requires a JSON object or array")
+            if len(objs) > _MAX_IMPORT_RECORDS:
+                raise ImportScanBudgetError(f"{path.name}: 记录数超过扫描预算")
+            yield from (obj for obj in objs if isinstance(obj, dict))
+            return
+        count = 0
+        while True:
+            raw = handle.readline(_MAX_IMPORT_RECORD_BYTES + 1)
+            if not raw:
+                return
+            count += 1
+            if len(raw) > _MAX_IMPORT_RECORD_BYTES or count > _MAX_IMPORT_RECORDS:
+                raise ImportScanBudgetError(f"{path.name}: 单条记录或记录数超过扫描预算")
+            if not raw.strip():
+                continue
+            try:
+                obj = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeError):
+                raise ValueError(f"conversation.import.invalid_record: {path.name} 记录 {count}")
+            if isinstance(obj, dict):
+                yield obj
+
+
+def _parse_provider(path: Path, provider: str) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return messages
-    for raw in lines:
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            obj = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        # Unwrap envelope: {"type": "message", "message": {...}}
-        if isinstance(obj, dict) and "message" in obj and isinstance(obj["message"], dict):
+    response_messages: list[dict[str, Any]] = []
+    event_messages: list[dict[str, Any]] = []
+    for record in _records(path):
+        obj = record
+        if isinstance(obj.get("message"), dict):
             obj = obj["message"]
-        # Claude uses "human" / "assistant"; normalise to "user" / "assistant"
-        role = obj.get("role", "")
-        if role == "human":
-            role = "user"
-        content = obj.get("content", obj.get("text", ""))
-        if role and content is not None:
-            messages.append({"role": role, "content": content})
-    return messages
-
-
-def scan_claude_sessions(base_path: Path, limit: int = 100) -> list[ProviderSessionScan]:
-    """Scan Claude history under *base_path*, returning preview records."""
-    scans: list[ProviderSessionScan] = []
-    # Support both ~/.claude/projects/<hash>/<uuid>.jsonl and ~/.claude/<uuid>.jsonl
-    patterns = ["**/*.jsonl", "*.jsonl"]
-    seen: set[str] = set()
-    for pattern in patterns:
-        for p in sorted(base_path.glob(pattern), key=lambda f: f.stat().st_mtime, reverse=True):
-            if len(scans) >= limit:
-                break
-            session_id = p.stem
-            if session_id in seen:
+        elif provider == "codex" and obj.get("type") == "response_item" and isinstance(obj.get("payload"), dict):
+            obj = obj["payload"]
+            if obj.get("type") == "function_call_output":
+                response_messages.append({"role": "tool", "content": obj.get("output", "")})
                 continue
-            seen.add(session_id)
-            messages = _parse_claude_jsonl(p)
-            if not messages:
+            if obj.get("type") == "function_call":
+                response_messages.append({"role": "assistant", "content": [obj]})
                 continue
-            has_tools = _has_tool_calls(messages)
-            title = _infer_title(messages, session_id)
-            # Determine continuability: Claude sessions are resumable by session_id
-            # if the original CLI is still available. We label as "read_only" since
-            # we can't guarantee CLI access, but keep "continuable" if resume_handle
-            # can be set.
-            import_status = "missing_tools" if has_tools else "read_only"
-            missing: list[str] = []
-            if has_tools:
-                missing.append("tool_outputs")
-            # Try to extract timestamp from first message metadata
-            created_at = _parse_iso(p.stat().st_mtime)
-            scans.append(ProviderSessionScan(
-                session_id=session_id,
-                adapter_id="claude",
-                source_path=str(p),
-                title=title,
-                message_count=len(messages),
-                created_at=created_at,
-                import_status=import_status,
-                missing_fields=missing,
-                _messages=messages,
-            ))
-    return scans
+            role = str(obj.get("role") or "")
+            if role:
+                response_messages.append({"role": role, "content": obj.get("content", obj.get("text", ""))})
+            continue
+        elif provider == "codex" and obj.get("type") == "event_msg" and isinstance(obj.get("payload"), dict):
+            payload = obj["payload"]
+            role = {"user_message": "user", "agent_message": "assistant"}.get(str(payload.get("type")))
+            if role:
+                event_messages.append({"role": role, "content": payload.get("message", "")})
+            continue
+        role = str(obj.get("role") or "")
+        if role:
+            messages.append({"role": "user" if role == "human" else role,
+                             "content": obj.get("content", obj.get("text", ""))})
+    # response_item is the canonical Codex conversation; event_msg mirrors it.
+    # Older event-only rollouts remain readable without duplicating both formats.
+    return messages + (response_messages if response_messages else event_messages)
 
 
-# ---------------------------------------------------------------------------
-# Codex scanner  (~/.codex/sessions/*.jsonl or ~/.codex/history/*.json)
-# ---------------------------------------------------------------------------
+def _parse_claude_jsonl(path: Path) -> list[dict[str, Any]]:
+    return _parse_provider(path, "claude")
+
 
 def _parse_codex_jsonl(path: Path) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = []
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return messages
-    # Try as single JSON array first
-    text_strip = text.strip()
-    if text_strip.startswith("["):
-        try:
-            objs = json.loads(text_strip)
-            if isinstance(objs, list):
-                for obj in objs:
-                    if isinstance(obj, dict):
-                        # Unwrap envelope: {"type":"message","message":{...}}
-                        if "message" in obj and isinstance(obj["message"], dict):
-                            obj = obj["message"]
-                        role = obj.get("role", "")
-                        content = obj.get("content", obj.get("text", ""))
-                        if role:
-                            messages.append({"role": role, "content": content})
-                return messages
-        except json.JSONDecodeError:
-            pass
-    # Fall back to JSONL
-    for raw in text_strip.splitlines():
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            obj = json.loads(raw)
-            # Unwrap envelope: {"type":"message","message":{...}}
-            if isinstance(obj, dict) and "message" in obj and isinstance(obj["message"], dict):
-                obj = obj["message"]
-            role = obj.get("role", "")
-            content = obj.get("content", obj.get("text", ""))
-            if role:
-                messages.append({"role": role, "content": content})
-        except json.JSONDecodeError:
-            continue
-    return messages
+    return _parse_provider(path, "codex")
 
 
-def scan_codex_sessions(base_path: Path, limit: int = 100) -> list[ProviderSessionScan]:
+def _scan_sessions(base_path: Path, provider: str, limit: int, retain_messages: bool) -> list[ProviderSessionScan]:
+    candidates: list[tuple[float, str, Path]] = []
+    for directory, _dirs, files in os.walk(base_path, followlinks=False):
+        for name in files:
+            path = Path(directory) / name
+            if path.suffix not in ({".jsonl", ".json"} if provider == "codex" else {".jsonl"}) or path.is_symlink():
+                continue
+            stat = path.stat()
+            candidates.append((stat.st_mtime, str(path), path))
+            if len(candidates) > _MAX_SCAN_FILES:
+                raise ImportScanBudgetError("历史文件数量超过扫描预算，请选择更具体的目录。")
     scans: list[ProviderSessionScan] = []
-    patterns = ["**/*.jsonl", "**/*.json", "*.jsonl", "*.json"]
+    total_bytes = 0
     seen: set[str] = set()
-    for pattern in patterns:
-        for p in sorted(base_path.glob(pattern), key=lambda f: f.stat().st_mtime, reverse=True):
-            if len(scans) >= limit:
-                break
-            session_id = p.stem
-            if session_id in seen:
-                continue
-            seen.add(session_id)
-            messages = _parse_codex_jsonl(p)
-            if not messages:
-                continue
-            has_tools = _has_tool_calls(messages)
-            title = _infer_title(messages, session_id)
-            import_status = "missing_tools" if has_tools else "read_only"
-            missing = ["tool_outputs"] if has_tools else []
-            created_at = _parse_iso(p.stat().st_mtime)
-            scans.append(ProviderSessionScan(
-                session_id=session_id,
-                adapter_id="codex",
-                source_path=str(p),
-                title=title,
-                message_count=len(messages),
-                created_at=created_at,
-                import_status=import_status,
-                missing_fields=missing,
-                _messages=messages,
-            ))
+    for _mtime, _name, path in heapq.nlargest(len(candidates), candidates):
+        if len(scans) >= limit:
+            break
+        total_bytes += path.stat().st_size
+        if total_bytes > _MAX_SCAN_BYTES:
+            raise ImportScanBudgetError("本次扫描超过字节预算，请选择更具体的历史目录。")
+        if path.stat().st_size > _MAX_IMPORT_FILE_BYTES:
+            raise ImportScanBudgetError(f"{path.name}: 文件超过扫描预算")
+        fingerprint = _source_fingerprint(path)
+        messages = _parse_provider(path, provider)
+        if not messages:
+            continue
+        if fingerprint != _source_fingerprint(path):
+            raise ValueError(f"conversation.import.source_changed: {path.name}")
+        session_id = path.stem
+        if session_id in seen:
+            raise ValueError(f"conversation.import.source_conflict: 同目录有重复会话 ID {session_id}")
+        seen.add(session_id)
+        scans.append(ProviderSessionScan(session_id=session_id, adapter_id=provider,
+            source_path=str(path), title=_infer_title(messages, session_id),
+            message_count=len(messages), created_at=_parse_iso(path.stat().st_mtime),
+            import_status="read_only", missing_fields=[], source_fingerprint=fingerprint,
+            _messages=messages if retain_messages else []))
     return scans
+
+
+def scan_claude_sessions(base_path: Path, limit: int = 100, *, retain_messages: bool = True) -> list[ProviderSessionScan]:
+    return _scan_sessions(base_path, "claude", limit, retain_messages)
+
+
+def scan_codex_sessions(base_path: Path, limit: int = 100, *, retain_messages: bool = True) -> list[ProviderSessionScan]:
+    return _scan_sessions(base_path, "codex", limit, retain_messages)
 
 
 # ---------------------------------------------------------------------------
 # Importer
 # ---------------------------------------------------------------------------
 
-def _find_existing_thread(store: Any, external_session_id: str) -> Optional[str]:
-    """Return thread_id if this external_session_id was already imported."""
+def _find_existing_thread(store: Any, external_session_id: str, adapter_id: str) -> Optional[str]:
+    from muteki.platform.contracts.objects import AgentSession
+    sessions = store.list(AgentSession, external_session_id=external_session_id)
+    matching = [row for row in sessions if row.adapter_id == adapter_id and row.thread_id]
+    return matching[0].thread_id if matching else None
+
+
+def import_session(manager: Any, scan: ProviderSessionScan, *, project_id: str = "", dry_run: bool = False) -> ImportRecord:
+    """Commit source identity and full history in the same database transaction."""
     try:
-        from muteki.platform.contracts.objects import AgentSession
-        sessions = store.list(AgentSession, external_session_id=external_session_id)
-        if sessions:
-            return sessions[0].thread_id
-    except Exception:
-        pass
-    return None
-
-
-def import_session(
-    manager: Any,
-    scan: ProviderSessionScan,
-    *,
-    project_id: str = "",
-    dry_run: bool = False,
-) -> ImportRecord:
-    """Import a single scanned session.  Idempotent by external_session_id."""
-    try:
-        store = manager._store
-        # AC1: deduplication
-        existing = _find_existing_thread(store, scan.session_id)
-        if existing:
-            return ImportRecord(
-                session_id=scan.session_id, thread_id=existing,
-                skipped=True, error=None)
-
+        store, conv = manager._store, manager.conv
         if dry_run:
-            return ImportRecord(
-                session_id=scan.session_id, thread_id=None,
-                skipped=False, error=None)
-
-        # Create thread
-        thread = manager.create_thread(
-            project_id=project_id,
-            title=scan.title,
-            title_source="user",
-        )
-        thread_id = thread.thread_id
-
-        # Fix (Medium): save AgentSession FIRST as a durable dedup marker.
-        # Even if message-save fails, subsequent re-import sees this record
-        # and skips instead of creating a second orphaned thread.
-        from muteki.platform.contracts.objects import AgentSession
-        agent_session = AgentSession(
-            agent_session_id=new_id("asess"),
-            external_session_id=scan.session_id,
-            adapter_id=scan.adapter_id,
-            thread_id=thread_id,
-            resume_handle=None,
-        )
-        try:
-            store.save(agent_session)
-        except Exception as save_exc:
-            # AgentSession save failed — attempt to clean up the thread to
-            # avoid a truly un-deduplicatable orphan, then surface the error.
-            try:
-                from muteki.platform.contracts.objects import Thread as _T
-                store.delete(_T, thread_id)
-            except Exception:
-                pass
-            raise save_exc
-
-        # Save messages as ConversationMessages.
-        # Fix (High): offset stream_seq from current message count so
-        # a partial-then-resumed import never collides within the thread.
-        conv = manager.conv
-        from muteki.conversation.models import ConversationMessage
-        seq_base = len(conv.list_messages(thread_id))
-        for i, msg in enumerate(scan._messages):
-            role = msg.get("role", "user")
-            text = _text_of(msg.get("content", ""))
-            cm = ConversationMessage(
-                message_id=new_id("msg"),
-                thread_id=thread_id,
-                turn_id=None,
-                role=role if role in ("user", "assistant", "system") else "user",
-                kind="message",
-                text=text,
-                stream_seq=seq_base + i,
-            )
-            conv.save_message(cm)
-
-        # Mark thread with import metadata via last_message_preview (AC3 label).
-        state = conv.get_state(thread_id)
-        state.last_message_preview = (
-            f"[{scan.import_status}] 导入自 {scan.adapter_id} · "
-            f"{scan.message_count} 条消息"
-        )
-        conv.save_state(state)
-
-        _log.info("C33 imported %s → thread %s (%s)", scan.session_id, thread_id, scan.import_status)
-        return ImportRecord(session_id=scan.session_id, thread_id=thread_id,
-                            skipped=False, error=None)
-
+            return ImportRecord(scan.session_id, None, False, None)
+        with store.transaction():
+            existing = _find_existing_thread(store, scan.session_id, scan.adapter_id)
+            existing_messages = conv.list_messages(existing) if existing else []
+            if existing:
+                prefix = existing_messages[:len(scan._messages)]
+                if any(old.text != _text_of(msg.get("content", "")) for old, msg in zip(prefix, scan._messages)):
+                    raise ValueError("conversation.import.source_conflict: 已有导入内容与当前来源不同")
+                if len(existing_messages) >= len(scan._messages):
+                    return ImportRecord(scan.session_id, existing, True, None)
+            thread_id = existing or manager.create_thread(project_id=project_id, title=scan.title, title_source="user").thread_id
+            from muteki.platform.contracts.objects import AgentSession
+            from muteki.conversation.models import ConversationMessage
+            if not existing:
+                store.save(AgentSession(agent_session_id=new_id("asess"), external_session_id=scan.session_id,
+                    adapter_id=scan.adapter_id, thread_id=thread_id, resume_handle=None))
+            # Imported history precedes event-driven messages (positive event seq).
+            # Existing legacy partial imports are rewritten in place on retry.
+            for index, msg in enumerate(scan._messages):
+                role = str(msg.get("role") or "unknown")
+                message_id = existing_messages[index].message_id if index < len(existing_messages) else new_id("msg")
+                cm = ConversationMessage(message_id=message_id, thread_id=thread_id, turn_id=None,
+                    role=role, kind="imported_tool" if role == "tool" else "message" if role in {"user", "assistant", "system"} else "imported_record",
+                    text=_text_of(msg.get("content", "")), stream_seq=index - len(scan._messages),
+                    source_provider=scan.adapter_id, source_role=role, source_content=msg.get("content"))
+                conv.save_message(cm)
+            state = conv.get_state(thread_id)
+            state.last_message_preview = f"导入自 {scan.adapter_id} · {scan.message_count} 条历史消息"
+            conv.save_state(state)
+        return ImportRecord(scan.session_id, thread_id, False, None)
     except Exception as exc:
-        _log.warning("C33 import failed for %s: %s", scan.session_id, exc)
-        return ImportRecord(session_id=scan.session_id, thread_id=None,
-                            skipped=False, error=str(exc))
+        _log.warning("history import failed for %s: %s", scan.session_id, exc)
+        return ImportRecord(scan.session_id, None, False, str(exc))
 
 
 def batch_import(
@@ -422,6 +363,7 @@ def scan_to_dict(scan: ProviderSessionScan) -> dict[str, Any]:
         "created_at": scan.created_at,
         "import_status": scan.import_status,
         "missing_fields": scan.missing_fields,
+        "source_fingerprint": scan.source_fingerprint,
     }
 
 

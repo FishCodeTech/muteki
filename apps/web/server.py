@@ -335,9 +335,17 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         # token 不能替代 grant，也不应在此处抢先拒绝。
         if path == "/api/capability":
             return await call_next(request)
-        # SSE events stream authenticates via one-time ticket query param, not a
-        # header (EventSource can't set headers); let the handler enforce it.
-        if path.endswith("/events"):
+        # Legacy run streams enforce their own ticket check. Do not treat an
+        # arbitrary endpoint named /events as a public route.
+        if request.method == "GET" and re.fullmatch(r"/api/runs/[^/]+/events", path):
+            return await call_next(request)
+        if request.method == "GET" and (
+            path == "/api/threads/inbox/events"
+            or re.fullmatch(r"/api/threads/[^/]+/events", path)
+        ):
+            token = bearer_from_header(request.headers.get("Authorization"))
+            if not (verify_token(cfg, token) or app.state.tickets.redeem(request.query_params.get("ticket"))):
+                return _unauthorized(request)
             return await call_next(request)
         token = bearer_from_header(request.headers.get("Authorization"))
         if not verify_token(cfg, token):

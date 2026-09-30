@@ -36,6 +36,7 @@ class PiLikeDriver(CliDriver):
     """
     name = "pi"
     secure_prompt_transport = True
+    persistent_stdin_prompt = True
     offline_web_isolation = True
 
     # optional pinned model/provider (e.g. "muteki"/"deepseek-v4-flash:0731-cloud");
@@ -135,8 +136,10 @@ class PiLikeDriver(CliDriver):
             return None, None
         inp = (int(usage.get("input") or 0)
                + int(usage.get("cacheRead") or 0)
-               + int(usage.get("cacheWrite") or 0))
-        outp = int(usage.get("output") or 0)
+               + int(usage.get("cacheWrite") or 0)) if any(
+                   key in usage for key in ("input", "cacheRead", "cacheWrite")
+               ) else None
+        outp = int(usage.get("output") or 0) if "output" in usage else None
         return inp, outp
 
     def parse(self, stdout: str, stderr: str) -> CliResult:
@@ -218,14 +221,18 @@ class PiLikeDriver(CliDriver):
             text = agent_end_text
         samples = list(usage_messages.values())
         pairs = [self._usage_tokens(u) for u in samples]
-        inp = sum(v[0] or 0 for v in pairs) if any(v[0] is not None for v in pairs) else None
-        outp = sum(v[1] or 0 for v in pairs) if any(v[1] is not None for v in pairs) else None
+        inp = sum(v[0] or 0 for v in pairs) if pairs and all(v[0] is not None for v in pairs) else None
+        outp = sum(v[1] or 0 for v in pairs) if pairs and all(v[1] is not None for v in pairs) else None
         costs = [(u.get("cost") or {}).get("total") for u in samples]
-        cost = sum(c for c in costs if isinstance(c, (float, int))) if any(isinstance(c, (float, int)) for c in costs) else None
+        total_cost = sum(c for c in costs if isinstance(c, (float, int)))
+        cost = total_cost if total_cost > 0 else None
         final_error = (
             explicit_error if saw_assistant else _structured_cli_error(stdout)
         )
+        # Pi derives usage.cost.total from its local model tariff. It is an
+        # estimate, including when a custom endpoint is used, not a bill receipt.
         return CliResult(text=text, session=session, cost_usd=cost,
+                         cost_estimated=cost is not None,
                          cache_read_tokens=sum(u.get("cacheRead") or 0 for u in samples) if samples else None,
                          cache_write_tokens=sum(u.get("cacheWrite") or 0 for u in samples) if samples else None,
                          input_tokens=inp, output_tokens=outp,

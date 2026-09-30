@@ -36,7 +36,7 @@ class OutboxManager:
         """入队一条副作用。返回 (记录, 是否新插入)；幂等键重复时返回已有记录。"""
         key = self._key_for(record, idempotency_key)
         now = utcnow().isoformat()
-        with self._store.lock, self._store.conn:
+        with self._store.transaction():
             existing = self._store.conn.execute(
                 "SELECT payload FROM outbox WHERE idempotency_key = ?", (key,)
             ).fetchone()
@@ -77,6 +77,14 @@ class OutboxManager:
             ).fetchone()
         return OutboxRecord.model_validate_json(row["payload"]) if row else None
 
+    def for_command(self, command_id: str) -> list[OutboxRecord]:
+        with self._store.lock:
+            rows = self._store.conn.execute(
+                "SELECT payload FROM outbox WHERE command_id = ? ORDER BY created_at, rowid",
+                (command_id,),
+            ).fetchall()
+        return [OutboxRecord.model_validate_json(row["payload"]) for row in rows]
+
     def pending(
         self, *, now: Optional[datetime] = None, limit: int = 100
     ) -> list[OutboxRecord]:
@@ -105,7 +113,7 @@ class OutboxManager:
                 "last_error": None,
             }
         )
-        with self._store.lock, self._store.conn:
+        with self._store.transaction():
             self._store.conn.execute(
                 "UPDATE outbox SET status = ?, delivered_at = ?, last_error = NULL, "
                 "updated_at = ?, payload = ? WHERE outbox_id = ?",
@@ -140,7 +148,7 @@ class OutboxManager:
         next_attempt = (
             datetime.now(timezone.utc) + timedelta(seconds=retry_delay_seconds)
         ).isoformat()
-        with self._store.lock, self._store.conn:
+        with self._store.transaction():
             self._store.conn.execute(
                 "UPDATE outbox SET status = ?, attempts = ?, next_attempt_at = ?, "
                 "last_error = ?, updated_at = ?, payload = ? WHERE outbox_id = ?",

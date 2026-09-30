@@ -46,7 +46,7 @@ export function reduceLifecycle(prev: DeckState, ev: MutekiEvent, s: DeckState):
       s.racing = false;
       s.verifying = 0;
       if (firstStart) { s.startedAt = ev.ts; s.finishedAt = undefined; }
-      s.challengeName = p.challenge?.name ?? s.challengeName;
+      if (p.challenge?.name && p.challenge.name !== s.runId) s.challengeName = p.challenge.name;
       if (typeof p.name_autogen === "boolean") s.challengeNameAutogen = p.name_autogen;
       s.category = p.challenge?.category ?? s.category;
       s.target = p.challenge?.target ?? s.target;
@@ -95,7 +95,7 @@ export function reduceLifecycle(prev: DeckState, ev: MutekiEvent, s: DeckState):
       s.preparing = false;
       s.finished = false;
       if (firstStart) { s.startedAt = ev.ts; s.finishedAt = undefined; }
-      s.challengeName = p.challenge?.name ?? s.challengeName;
+      if (p.challenge?.name && p.challenge.name !== s.runId) s.challengeName = p.challenge.name;
       if (typeof p.name_autogen === "boolean") s.challengeNameAutogen = p.name_autogen;
       s.category = p.challenge?.category ?? s.category;
       s.target = p.challenge?.target ?? s.target;

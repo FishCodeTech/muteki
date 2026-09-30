@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -334,6 +335,7 @@ class PlatformStore:
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        self._transaction_depth = 0
         cur = self._conn.cursor()
         cur.execute("PRAGMA journal_mode=WAL")
         cur.execute("PRAGMA busy_timeout=5000")
@@ -343,6 +345,79 @@ class PlatformStore:
         #: 事件 upcaster 注册表；读取与投影重建时应用，不改写历史正文。
         self.upcasters = UpcasterRegistry()
         apply_migrations(self._conn)
+        with self.transaction():
+            self._conn.execute("CREATE TABLE IF NOT EXISTS command_effect_results (command_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+
+    @contextmanager
+    def transaction(self):
+        """Serialize a synchronous local commit; nested stores share savepoints."""
+        with self._lock:
+            depth = self._transaction_depth
+            savepoint = f"platform_nested_{depth}"
+            if depth:
+                self._conn.execute(f"SAVEPOINT {savepoint}")
+            else:
+                self._conn.execute("BEGIN IMMEDIATE")
+            self._transaction_depth += 1
+            try:
+                yield
+            except BaseException:
+                if depth:
+                    self._conn.execute(f"ROLLBACK TO {savepoint}")
+                    self._conn.execute(f"RELEASE {savepoint}")
+                else:
+                    self._conn.rollback()
+                raise
+            else:
+                try:
+                    if depth:
+                        self._conn.execute(f"RELEASE {savepoint}")
+                    else:
+                        self._conn.commit()
+                except BaseException:
+                    if depth:
+                        self._conn.execute(f"ROLLBACK TO {savepoint}")
+                        self._conn.execute(f"RELEASE {savepoint}")
+                    else:
+                        self._conn.rollback()
+                    raise
+            finally:
+                self._transaction_depth -= 1
+
+    @property
+    def installation_id(self) -> str:
+        """An opaque identity persisted in this installation's actual database."""
+        from uuid import uuid4
+        with self.transaction():
+            self._conn.execute("CREATE TABLE IF NOT EXISTS installation_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            self._conn.execute("INSERT OR IGNORE INTO installation_metadata VALUES ('installation_id', ?)", (str(uuid4()),))
+            return str(self._conn.execute("SELECT value FROM installation_metadata WHERE key='installation_id'").fetchone()[0])
+
+    def save_effect_result(self, command_id: str, payload: dict[str, Any]) -> None:
+        """Journal acknowledged effects before projection/receipt finalization."""
+        with self.transaction():
+            self._conn.execute("INSERT OR REPLACE INTO command_effect_results VALUES (?, ?)",
+                               (command_id, json.dumps(payload, ensure_ascii=False)))
+
+    def effect_result(self, command_id: str) -> Optional[dict[str, Any]]:
+        row = self._fetchone("SELECT payload FROM command_effect_results WHERE command_id=?", (command_id,))
+        return json.loads(row[0]) if row else None
+
+    def artifact_metadata(self, thread_id: str, digest: str) -> Optional[dict[str, Any]]:
+        row = self._fetchone(
+            "SELECT payload FROM domain_events WHERE aggregate_type='thread' "
+            "AND aggregate_id=? AND event_type IN ('core.artifact.attached','core.artifact.created') "
+            "AND json_extract(payload,'$.payload.sha256')=? ORDER BY stream_seq DESC LIMIT 1",
+            (thread_id, digest))
+        return dict(json.loads(row[0])["payload"]) if row else None
+
+    def artifact_digests(self, thread_id: str) -> set[str]:
+        rows = self._fetchall(
+            "SELECT DISTINCT json_extract(payload,'$.payload.sha256') FROM domain_events "
+            "WHERE aggregate_type='thread' AND aggregate_id=? "
+            "AND event_type IN ('core.artifact.attached','core.artifact.created')",
+            (thread_id,))
+        return {str(row[0]) for row in rows if row[0]}
 
     # -- 生命周期 ---------------------------------------------------------
 
@@ -401,7 +476,7 @@ class PlatformStore:
             raise ValueError("command domain is required")
         digest = _hash_command(command)
         now = utcnow().isoformat()
-        with self._lock, self._conn:
+        with self.transaction():
             self._conn.execute(
                 "INSERT OR IGNORE INTO command_ledger_index "
                 "(command_id, domain, command_type, aggregate_type, aggregate_id, "
@@ -435,7 +510,7 @@ class PlatformStore:
             raise ValueError("effect receipt requires outbox_id")
         aggregate = effect.aggregate or AggregateRef()
         now = utcnow().isoformat()
-        with self._lock, self._conn:
+        with self.transaction():
             existing = self._conn.execute(
                 "SELECT payload FROM effect_receipts WHERE outbox_id = ?",
                 (effect.outbox_id,),
@@ -536,7 +611,7 @@ class PlatformStore:
             changes["completed_at"] = None
         effect = effect.model_copy(update=changes)
         aggregate = effect.aggregate or AggregateRef()
-        with self._lock, self._conn:
+        with self.transaction():
             self._conn.execute(
                 "UPDATE effect_receipts SET state = ?, attempts = ?, "
                 "retry_after = ?, aggregate_type = ?, aggregate_id = ?, "
@@ -580,7 +655,7 @@ class PlatformStore:
             f"ON CONFLICT({', '.join(spec.column_of(f) for f in spec.pk)}) "
             f"DO UPDATE SET {update_clause}"
         )
-        with self._lock, self._conn:
+        with self.transaction():
             self._conn.execute(sql, all_values)
         return obj
 
@@ -624,7 +699,7 @@ class PlatformStore:
         if len(pk) != len(spec.pk):
             raise ValueError(f"{spec.table} primary key has {len(spec.pk)} parts")
         where = " AND ".join(f"{spec.column_of(f)} = ?" for f in spec.pk)
-        with self._lock, self._conn:
+        with self.transaction():
             cur = self._conn.execute(
                 f"DELETE FROM {spec.table} WHERE {where}",
                 tuple(_column_value(v) for v in pk),
@@ -641,7 +716,7 @@ class PlatformStore:
 
     def set_domain_module_enabled(self, module_id: str, enabled: bool) -> None:
         """持久化模块启停；描述必须先通过 ``save`` 登记。"""
-        with self._lock, self._conn:
+        with self.transaction():
             cur = self._conn.execute(
                 "UPDATE domain_modules SET enabled = ?, updated_at = ? "
                 "WHERE module_id = ?",
@@ -758,7 +833,7 @@ class PlatformStore:
         """登记 Agent Plugin 的 Muteki 解析视图，并保留每版历史。"""
         now = utcnow().isoformat()
         payload = manifest.model_dump_json()
-        with self._lock, self._conn:
+        with self.transaction():
             self._conn.execute(
                 "INSERT INTO extensions (extension_id, origin, enabled, "
                 "schema_version, created_at, updated_at, payload) "
@@ -822,7 +897,7 @@ class PlatformStore:
         now = utcnow().isoformat()
         payload_hash = _hash_command(command)
         try:
-            with self._lock, self._conn:
+            with self.transaction():
                 self._conn.execute(
                     "INSERT INTO command_receipts (command_id, receipt_id, "
                     "idempotency_key, command_type, aggregate_type, aggregate_id, "
@@ -929,7 +1004,7 @@ class PlatformStore:
         if effect_ids is not None:
             changes["effect_ids"] = list(dict.fromkeys(effect_ids))
         receipt = receipt.model_copy(update=changes)
-        with self._lock, self._conn:
+        with self.transaction():
             self._conn.execute(
                 "UPDATE command_receipts SET state = ?, run_id = ?, "
                 "updated_at = ?, payload = ? WHERE command_id = ?",
@@ -990,7 +1065,7 @@ class PlatformStore:
             )
         now = utcnow().isoformat()
         stored: list[EventEnvelope] = []
-        with self._lock, self._conn:
+        with self.transaction():
             heads: dict[tuple[str, str], int] = {}
             checked: set[tuple[str, str]] = set()
             for event in events:

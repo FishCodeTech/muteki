@@ -51,6 +51,8 @@ export interface ApprovalCardProps {
   busy?: boolean;
   onAllow?: (scopeMode?: "once" | "session") => void;
   onDeny?: () => void;
+  nativeOptions?: Array<{ option_id: string; kind: string; name: string }>;
+  onNativeOption?: (optionId: string, kind: string) => void;
   className?: string;
 }
 
@@ -82,10 +84,22 @@ export function ApprovalCard({
   busy = false,
   onAllow,
   onDeny,
+  nativeOptions,
+  onNativeOption,
   className = "",
 }: ApprovalCardProps) {
   const expired = status === "expired";
-  const approvalStatus: ToolApprovalStatus = expired ? "expired" : busy ? "approving" : "pending";
+  const resolving = status === "resolving";
+  const approvalStatus: ToolApprovalStatus = expired ? "expired" : busy || resolving ? "approving" : "pending";
+  const nativeActions = nativeOptions ? (
+    <>
+      {nativeOptions.length ? nativeOptions.map((option) => {
+        const known = ["allow_once", "allow_always", "reject_once", "reject_always"].includes(option.kind);
+        return <button key={option.option_id} type="button" disabled={busy || resolving || !known || !onNativeOption} onClick={() => onNativeOption?.(option.option_id, option.kind)} className="rounded-xl border border-cx-border bg-cx-bg px-3 py-1.5 text-xs disabled:opacity-50">{option.name || ({allow_once: "允许一次", allow_always: "记住此选择", reject_once: "拒绝一次", reject_always: "记住拒绝选择"} as Record<string, string>)[option.kind] || option.kind}</button>;
+      }) : <span className="text-xs text-cx-fg-3">此请求未提供可用的决定选项。</span>}
+      {nativeOptions.some((option) => option.kind === "allow_always" || option.kind === "reject_always") ? <span className="w-full text-xs text-cx-fg-3">记住选择的范围由 Runtime 决定。</span> : null}
+    </>
+  ) : undefined;
 
   const pathList = files.filter((f) => f.path);
   const diffFiles = useMemo(() => {
@@ -125,11 +139,12 @@ export function ApprovalCard({
         status={approvalStatus}
         parameters={parameters}
         defaultOpen={Boolean(cwd)}
-        disabled={busy}
+        disabled={busy || resolving}
+        actions={nativeActions}
         approveLabel="批准执行"
-        alwaysAllowLabel="本会话始终允许"
+        alwaysAllowLabel="记住此选择（由 Runtime 决定范围）"
         onApprove={onAllow ? () => onAllow("once") : undefined}
-        onAlwaysAllow={onAllow ? () => onAllow("session") : undefined}
+        onAlwaysAllow={undefined}
         onDeny={onDeny}
         footer={expired ? "旧批准不能作用于新请求；请处理仍有效的审批项。" : undefined}
         className={cn(
@@ -201,7 +216,7 @@ export function ApprovalCard({
                       label={meta?.status ? statusLabel(meta.status) : undefined}
                       file={file.path}
                       lines={linesFromPatch(file.raw)}
-                      status="complete"
+                      status="preview"
                       defaultOpen={diffFiles.length <= 3}
                       collapseOnComplete={false}
                       language={languageFromPath(file.path) ?? "text"}

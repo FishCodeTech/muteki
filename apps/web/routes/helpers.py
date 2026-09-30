@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
+import json
 from types import SimpleNamespace
 from typing import Any, Optional
 
@@ -74,6 +76,8 @@ def make_helpers(app: FastAPI) -> SimpleNamespace:
         provider: str = "",
         configured_models: list[str] | None = None,
         default_model: str = "",
+        persist: bool = True,
+        expected_revision: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Run one read-only catalog refresh through the shared single-flight."""
         from apps.web.worker_models import (
@@ -90,7 +94,12 @@ def make_helpers(app: FastAPI) -> SimpleNamespace:
         backend = "container" if environment == "container" else "local"
         selected_runtime = credential_catalog_runtime_key(
             selected_engine, runtime_instance)
-        refresh_key = f"{credential_id}\0{selected_engine}\0{backend}\0{selected_runtime}"
+        request_identity = hashlib.sha256(json.dumps({
+            "connection": connection, "base_url": base_url.rstrip("/"),
+            "secret": secret, "provider": provider,
+            "runtime": platform_stack.runtime_service.get_instance(*selected_runtime.rsplit(":", 1)) or {},
+        }, sort_keys=True, default=str).encode()).hexdigest()
+        refresh_key = f"{credential_id}\0{selected_engine}\0{backend}\0{selected_runtime}\0{request_identity}"
 
         async def _perform() -> dict[str, Any]:
             if connection == "custom_endpoint" or base_url:
@@ -145,6 +154,13 @@ def make_helpers(app: FastAPI) -> SimpleNamespace:
         finally:
             if task.done() and tasks.get(refresh_key) is task:
                 tasks.pop(refresh_key, None)
+        if account_id and expected_revision is not None:
+            current_revision = CredentialAccountStore(account_store_root(mgr.state_root)).revision(account_id)
+            if current_revision != expected_revision:
+                return {"ok": False, "models": [], "error_code": "credential.configuration_changed",
+                        "detail": "凭据配置在刷新期间已改变，请重新刷新。"}, {"discovered_models": []}
+        if not persist:
+            return result, {"discovered_models": result.get("models") or [], "draft": True}
         catalog = CredentialModelCatalogStore(
             app.state.manager.state_root
         ).save_discovery(

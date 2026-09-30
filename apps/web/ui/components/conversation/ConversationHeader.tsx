@@ -238,15 +238,17 @@ export function ConversationHeader({
             onCancel={stopEditing}
           />
         ) : (
-          <h1 className="min-w-0 shrink text-[14px] font-semibold leading-5 tracking-[-0.01em] text-cx-fg">
+          <h1 className="min-w-0 flex-1 text-[14px] font-semibold leading-5 tracking-[-0.01em] text-cx-fg">
             {onRename ? (
-              <Tooltip content="点击重命名" placement="bottom">
+              <Tooltip content={`${title} · 点击重命名`} placement="bottom" className="w-full min-w-0">
                 <button
                   ref={titleButtonRef}
                   type="button"
                   onClick={startEditing}
+                  title={title}
+                  aria-label={`${title}，重命名对话`}
                   className={cn(
-                    "cx-press -mx-1.5 block h-8 max-w-full truncate rounded-lg px-1.5 text-left outline-none",
+                    "cx-press block h-8 w-full truncate rounded-lg px-1.5 text-left outline-none",
                     "hover:bg-cx-hover focus-visible:outline-2 focus-visible:outline-[var(--cx-focus)]",
                   )}
                 >
@@ -254,7 +256,7 @@ export function ConversationHeader({
                 </button>
               </Tooltip>
             ) : (
-              <span className="block truncate">{title}</span>
+              <span className="block truncate" title={title}>{title}</span>
             )}
           </h1>
         )}
@@ -267,11 +269,11 @@ export function ConversationHeader({
         ) : null}
 
         {!editing ? (
-          <span className="flex flex-none items-center gap-1" role="status" aria-live="polite">
+          <span className="flex flex-none items-center gap-1" role="status" aria-live="polite" title="轮次执行状态；会话可继续接收新消息">
             {isArchived ? <Badge tone="warning" icon="archive">已归档</Badge> : null}
             <Badge tone={status.tone} className={cn(status.tone === "neutral" && "bg-transparent text-cx-fg-4")}>
               {status.running ? <Spinner size={11} /> : null}
-              {status.label}
+              {status.running ? "本轮执行中" : view.turns.length ? `上轮${status.label}` : status.label}
             </Badge>
           </span>
         ) : null}

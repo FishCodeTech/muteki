@@ -203,7 +203,7 @@ def evaluate_profile_health(
             f"account:{effective_account_id}" if effective_account_id
             else f"system:{engine}"
         )
-        last_test = store.last_test(credential_id)
+        last_test = store.last_test(credential_id, backend="container", model=model)
         tested_model = str((last_test or {}).get("model") or "").strip()
         if last_test and last_test.get("ok") and model and tested_model == model:
             return mk("ok", detail="真实容器模型测试已通过",

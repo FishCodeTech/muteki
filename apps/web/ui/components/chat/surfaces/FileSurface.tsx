@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { desktopChatBridge } from "@/lib/desktopChatBridge";
 import { Button, CopyButton, EmptyState, IconButton, Skeleton, toast } from "@/components/chat/ui";
 import type { SurfaceProps } from "@/components/chat/panel/types";
 import { chatPanel, type ChatSurface } from "@/lib/chatPanelStore";
@@ -15,6 +16,7 @@ import { TypedResourcePreview, workspacePreviewToProps } from "@/components/conv
 import { formatLineCitation } from "@/components/chat/preview/CodeViewer";
 import { PathBreadcrumb } from "./PathBreadcrumb";
 import { SurfaceToolbar, surfaceJson } from "./shared";
+import { NativeWorkspaceFileActions } from "@/components/NativeWorkspaceFileActions";
 
 type FileSurfaceModel = Extract<ChatSurface, { kind: "file" }>;
 
@@ -35,7 +37,7 @@ function needsBlobPreview(preview: WorkspaceFilePreview | null): boolean {
   return kind === "image" || kind === "pdf";
 }
 
-export function FileSurface({ surface, threadId, active, hasWorkspace, onCiteToComposer }: SurfaceProps<FileSurfaceModel>) {
+export function FileSurface({ surface, threadId, view, active, hasWorkspace, onCiteToComposer }: SurfaceProps<FileSurfaceModel>) {
   const { path, line } = surface;
   const [preview, setPreview] = useState<WorkspaceFilePreview | null>(null);
   const [error, setError] = useState("");
@@ -119,7 +121,9 @@ export function FileSurface({ surface, threadId, active, hasWorkspace, onCiteToC
   const handleOpenRaw = useCallback(async () => {
     setOpeningRaw(true);
     try {
-      const result = await openAuthenticatedWorkspaceRaw(threadId, path);
+      const result = desktopChatBridge()
+        ? await downloadAuthenticatedWorkspaceRaw(threadId, path)
+        : await openAuthenticatedWorkspaceRaw(threadId, path);
       if (!result.ok) {
         toast({ title: result.message, tone: "danger", icon: "circleAlert" });
       }
@@ -154,14 +158,15 @@ export function FileSurface({ surface, threadId, active, hasWorkspace, onCiteToC
           <CopyButton text={path} label="复制路径" size="sm" />
           <IconButton icon="folderTree" label="在文件中显示" onClick={() => chatPanel.revealInFiles(threadId, { kind: "file", path, line })} />
           <IconButton
-            icon="externalLink"
-            label="打开原始文件"
+            icon={desktopChatBridge() ? "download" : "externalLink"}
+            label={desktopChatBridge() ? "下载原文件（保留文件名）" : "打开原始文件"}
             loading={openingRaw}
             data-testid="file-surface-open-raw"
             onClick={() => void handleOpenRaw()}
           />
         </div>
       </SurfaceToolbar>
+      {view.workspace && <NativeWorkspaceFileActions threadId={threadId} workspaceId={view.workspace.workspace_id} serviceRoot={view.workspace.root_path} relativePath={preview?.path || path} />}
       <div className="flex min-h-0 flex-1 flex-col">
         {loading && !preview ? (
           <FileLoadingSkeleton />

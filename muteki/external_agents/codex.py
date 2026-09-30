@@ -436,6 +436,74 @@ class JsonRpcError(RuntimeError):
         self.data = data
 
 
+class ModelCatalogProtocolError(ValueError):
+    code = "codex.model_catalog.protocol_invalid"
+
+    def __init__(self, message: str, pages: list[Any]) -> None:
+        super().__init__(message)
+        self.catalog_pages = pages
+
+
+async def read_model_catalog(conn: Any) -> dict[str, Any]:
+    """Read the native picker catalog completely, including per-model efforts."""
+    models: dict[str, dict[str, Any]] = {}
+    cursor: Optional[str] = None
+    seen_cursors: set[str] = set()
+    pages: list[Any] = []
+    default_model = ""
+    while True:
+        params: dict[str, Any] = {"limit": 50}
+        if cursor is not None:
+            params["cursor"] = cursor
+        try:
+            result = await conn.request(M_MODEL_LIST, params, timeout=30)
+        except (JsonRpcError, asyncio.TimeoutError) as exc:
+            exc.catalog_pages = pages
+            raise
+        pages.append(result)
+        if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+            raise ModelCatalogProtocolError("model/list response must contain a data array", pages)
+        for raw in result["data"]:
+            if not isinstance(raw, dict):
+                raise ModelCatalogProtocolError("model/list model must be an object", pages)
+            model = raw.get("model") or raw.get("id")
+            if not isinstance(model, str) or not model.strip():
+                raise ModelCatalogProtocolError("model/list model identity must be a nonempty string", pages)
+            model = model.strip()
+            label = raw.get("displayName", model)
+            levels = raw.get("supportedReasoningEfforts", [])
+            if not isinstance(label, str) or not isinstance(levels, list):
+                raise ModelCatalogProtocolError(f"model/list metadata is invalid for {model}", pages)
+            efforts: list[str] = []
+            for option in levels:
+                effort = option.get("reasoningEffort") if isinstance(option, dict) else None
+                if not isinstance(effort, str) or not effort:
+                    raise ModelCatalogProtocolError(f"model/list reasoning option is invalid for {model}", pages)
+                if effort not in efforts:
+                    efforts.append(effort)
+            default_effort = raw.get("defaultReasoningEffort", "")
+            if not isinstance(default_effort, str):
+                raise ModelCatalogProtocolError(f"model/list default reasoning is invalid for {model}", pages)
+            models[model] = {"id": model, "label": label or model, "reasoning": {
+                "supported": bool(efforts), "levels": efforts,
+                "default": default_effort if default_effort in efforts else "",
+                "kind": "effort", "source": "codex.model/list",
+            }}
+            if raw.get("isDefault") is True:
+                default_model = model
+        next_cursor = result.get("nextCursor")
+        if next_cursor is None:
+            break
+        if not isinstance(next_cursor, str) or not next_cursor or next_cursor in seen_cursors:
+            raise ModelCatalogProtocolError("model/list pagination cursor is invalid or repeated", pages)
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    return {"ok": True, "models": list(models.values()),
+            "default_model": default_model, "source": "codex.model/list",
+            "evidence": {"method": M_MODEL_LIST, "format": "decoded_rpc_result_pages",
+                         "complete": True, "pages": pages}}
+
+
 class CodexPeer:
     """一条 codex app-server stdio JSON-RPC 连接（``StdioJsonlPeer`` 封装）。
 
@@ -695,6 +763,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         """实测 probe：--version + schema 方法面 + initialize/model/list。"""
         field_sources: dict[str, str] = {}
         degradations: list[str] = []
+        model_catalog: dict[str, Any] | None = None
         version = _probe_version(self._binary)
         probed = bool(version)
 
@@ -714,7 +783,10 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                 adapter_id=self.id, instance_id=self.identity.instance_id,
                 capabilities=caps, binary_path=self._binary,
                 field_sources=field_sources, degradations=degradations,
-                detail="binary 不可用，使用保守默认")
+                detail="binary 不可用，使用保守默认",
+                model_catalog={"ok": False, "models": [], "source": "codex.model/list",
+                               "error_code": "codex.model_catalog.binary_unavailable",
+                               "detail": "Codex binary unavailable"} if request.include_models else None)
             return caps
 
         # schema 方法面发现（版本变化探测的主信号）。
@@ -783,9 +855,11 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         handshake_ok = False
         conn: Optional[CodexPeer] = None
         try:
+            spawn_env = self._spawn_env({})
             conn = await self._spawn_initialized_peer(
-                argv=[self._binary, "app-server", "--listen", "stdio://"],
-                env=self._spawn_env({}), cwd=None,
+                argv=[self._binary, "app-server", "--listen", "stdio://",
+                      *self._provider_spawn_args(spawn_env)],
+                env=spawn_env, cwd=None,
                 init_params={"clientInfo": {
                     "name": "muteki-probe", "title": "Muteki Probe",
                     "version": "0.1.0"}},
@@ -793,26 +867,36 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             handshake_ok = True
             if request.include_models and M_MODEL_LIST in client_req:
                 try:
-                    result = await conn.request(
-                        M_MODEL_LIST, {"limit": 50}, timeout=30)
-                    models = (result or {}).get("data") or []
-                    caps.supported_models = [
-                        str(m.get("model") or m.get("id") or "")
-                        for m in models if isinstance(m, dict)][:50]
-                    caps.supported_models = [m for m in caps.supported_models if m]
-                    efforts: list[str] = []
-                    for m in models:
-                        for e in (m.get("supportedReasoningEfforts") or []):
-                            value = str(e.get("reasoningEffort") or "")
-                            if value and value not in efforts:
-                                efforts.append(value)
-                    caps.supported_efforts = efforts
+                    model_catalog = await read_model_catalog(conn)
+                    caps.supported_models = [row["id"] for row in model_catalog["models"]]
+                    caps.supported_efforts = list(dict.fromkeys(
+                        effort for row in model_catalog["models"]
+                        for effort in row["reasoning"]["levels"]))
                     field_sources["supported_models"] = SOURCE_PROBE
                     field_sources["supported_efforts"] = SOURCE_PROBE
-                except (JsonRpcError, asyncio.TimeoutError) as exc:
-                    degradations.append(f"model/list 失败：{str(exc)[:120]}")
+                except (JsonRpcError, asyncio.TimeoutError, ModelCatalogProtocolError) as exc:
+                    detail = f"model/list 失败：{exc}"
+                    model_catalog = {"ok": False, "models": [], "source": "codex.model/list",
+                                     "error_code": getattr(exc, "code", "codex.model_catalog.request_failed")
+                                     if isinstance(exc, ModelCatalogProtocolError) else "codex.model_catalog.request_failed",
+                                     "detail": detail, "evidence": {
+                                         "method": M_MODEL_LIST, "format": "decoded_rpc_result_pages",
+                                         "complete": False, "pages": getattr(exc, "catalog_pages", []),
+                                         "error": {"type": type(exc).__name__, "message": str(exc),
+                                                   **({"code": exc.code, "data": exc.data}
+                                                      if isinstance(exc, JsonRpcError) else {})},
+                                     }}
+                    degradations.append(detail)
+            elif request.include_models:
+                model_catalog = {"ok": False, "models": [], "source": "codex.model/list",
+                                 "error_code": "codex.model_catalog.unsupported",
+                                 "detail": "Runtime schema does not expose model/list"}
         except (OSError, JsonRpcError, asyncio.TimeoutError) as exc:
-            degradations.append(f"app-server initialize 握手失败：{str(exc)[:120]}")
+            detail = f"app-server initialize 握手失败：{exc}"
+            degradations.append(detail)
+            if request.include_models:
+                model_catalog = {"ok": False, "models": [], "source": "codex.model/list",
+                                 "error_code": "codex.model_catalog.initialize_failed", "detail": detail}
         finally:
             if conn is not None:
                 await conn.close()
@@ -839,7 +923,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             adapter_id=self.id, instance_id=self.identity.instance_id,
             capabilities=caps, binary_path=self._binary,
             field_sources=field_sources, degradations=degradations,
-            detail="" if handshake_ok else "handshake 未通过")
+            detail="" if handshake_ok else "handshake 未通过", model_catalog=model_catalog)
         return caps
 
     # -- 启动（任务书 7.6 步骤 4 的 Runtime 侧动作） ---------------------------
@@ -850,7 +934,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         env.update(extra)
         if self._codex_home:
             env["CODEX_HOME"] = self._codex_home
-        return env
+        return subprocess_environment(env) or env
 
     @staticmethod
     def _provider_spawn_args(env: dict[str, str]) -> list[str]:
@@ -1071,11 +1155,42 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                 "respond_approval", "approval_pending", session=session,
                 detail={"request_id": str(request_id),
                         "detail": "no pending approval with this id"})
+        ctx = self._runs.get(session.agent_session_id) or {}
+        delivery = ctx.get("control_deliveries", {}).get(("approval", str(request_id)))
+        if delivery is None:
+            return self.unsupported_receipt("respond_approval", "control_delivery", session=session)
         future.set_result({"decision": decision})
-        return CommandReceipt(
-            command_id=new_id("cmd"), state=ReceiptState.COMPLETED,
-            aggregate=AggregateRef(type="agent_session",
-                                   id=session.agent_session_id))
+        return await self._confirm_control_delivery(session, delivery)
+
+    async def _confirm_control_delivery(self, session: AgentSessionRef, delivery: asyncio.Future) -> CommandReceipt:
+        from muteki.platform.contracts.errors import ErrorCategory, ErrorEnvelope
+        try:
+            outcome = await asyncio.wait_for(asyncio.shield(delivery), timeout=30)
+        except asyncio.TimeoutError:
+            outcome = {"ok": False, "detail": "Native response write confirmation timed out"}
+        error = None if outcome["ok"] else ErrorEnvelope(
+            code="codex.control.delivery_unknown", message=str(outcome.get("detail") or "Native response delivery was not confirmed"),
+            category=ErrorCategory.RUNTIME, detail={"delivery_unknown": True}, retryable=False,
+            recovery_hint="Inspect or stop the original turn; do not send a new decision")
+        return CommandReceipt(command_id=new_id("cmd"),
+            state=ReceiptState.FAILED if error else ReceiptState.COMPLETED,
+            error=error, aggregate=AggregateRef(type="agent_session", id=session.agent_session_id))
+
+    async def _send_control_response(self, ctx: dict[str, Any], kind: str,
+                                     request_id: Any, response: dict[str, Any]) -> None:
+        key = (kind, str(request_id))
+        delivery = ctx["control_deliveries"][key]
+        try:
+            await ctx["conn"].respond(request_id, response)
+        except BaseException as exc:
+            if not delivery.done():
+                delivery.set_result({"ok": False, "detail": f"{type(exc).__name__}: {exc}"})
+            raise
+        else:
+            if not delivery.done():
+                delivery.set_result({"ok": True})
+        finally:
+            ctx["control_deliveries"].pop(key, None)
 
     async def respond_user_input(
         self,
@@ -1123,6 +1238,9 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             for key, value in answers.items()
             if not str(key).startswith("__")
         }
+        delivery = ctx.get("control_deliveries", {}).get(("user_input", request_key))
+        if method != "agentMessage/async" and delivery is None:
+            return self.unsupported_receipt("respond_user_input", "control_delivery", session=session)
         if method == "agentMessage/async":
             # Async questions are public agentMessage items, not RPC requests.
             # Reply through the documented steer input while the native turn
@@ -1181,8 +1299,8 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                 ctx["async_started_turn"] = {"result": result, "input": continuation}
             future.set_result({"answered": decision != "cancel"})
         elif method == M_MCP_ELICITATION:
-            if decision == "cancel":
-                future.set_result({"action": "decline", "content": {}, "_meta": None})
+            if decision in {"cancel", "decline"}:
+                future.set_result({"action": decision, "_meta": None})
             else:
                 future.set_result({
                     "action": "accept",
@@ -1231,6 +1349,8 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             })
         else:
             future.set_result({"answers": dict(answers)})
+        if delivery is not None:
+            return await self._confirm_control_delivery(session, delivery)
         return CommandReceipt(
             command_id=new_id("cmd"), state=ReceiptState.COMPLETED,
             aggregate=AggregateRef(type="agent_session",
@@ -1245,7 +1365,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         """Map structured answers (or legacy text) onto MCP elicitation fields."""
         schema = params.get("requestedSchema")
         schema_dict = schema if isinstance(schema, dict) else {}
-        if structured:
+        if structured is not None:
             normalized = {
                 str(qid): (
                     value if isinstance(value, dict)
@@ -1295,6 +1415,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                 agent_session_id=session.agent_session_id,
                 external_session_id=session.external_session_id,
                 payload={"code": receipt.error.code if receipt.error else "",
+                         "delivery_unknown": bool(receipt.error and receipt.error.detail.get("delivery_unknown")),
                          "operation": "approval_response"},
             ))
 
@@ -1317,6 +1438,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                 agent_session_id=session.agent_session_id,
                 external_session_id=session.external_session_id,
                 payload={"code": receipt.error.code if receipt.error else "",
+                         "delivery_unknown": bool(receipt.error and receipt.error.detail.get("delivery_unknown")),
                          "operation": "user_input_response"},
             ))
             raise RuntimeError(receipt.error.message if receipt.error else "用户输入未送达 Runtime")
@@ -1623,6 +1745,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             # 统一用 str 键：codex 的 server-request id 可能是 int，
             # 事件 payload 与 respond_approval 入参都是 str 形态。
             ctx["approvals"][str(request_id)] = future
+            ctx.setdefault("control_deliveries", {})[("approval", str(request_id))] = asyncio.get_running_loop().create_future()
             details = {
                 "approval_kind": kind,
                 "command": params.get("command"),
@@ -1660,7 +1783,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                 # 审批超时不悬挂 Runtime：按 decline 应答并如实记录。
                 decision = {"decision": "decline", "_timeout": True}
             ctx["approvals"].pop(str(request_id), None)
-            await conn.respond(request_id, {"decision": decision["decision"]})
+            await self._send_control_response(ctx, "approval", request_id, {"decision": decision["decision"]})
             yield self.emit(build_event(
                 AgentEventType.APPROVAL_RESOLVED, seq, turn_id=turn_id,
                 native_type=f"{method}.resolved",
@@ -1680,6 +1803,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             native_meta = dict(params.get("_meta") or {})
             future = asyncio.get_running_loop().create_future()
             ctx["approvals"][str(request_id)] = future
+            ctx.setdefault("control_deliveries", {})[("approval", str(request_id))] = asyncio.get_running_loop().create_future()
             yield self.emit(build_event(
                 AgentEventType.APPROVAL_REQUESTED, seq, turn_id=turn_id,
                 native_type=method,
@@ -1714,7 +1838,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             }
             if decision["decision"] == "acceptForSession":
                 response["_meta"] = {"persist": "session"}
-            await conn.respond(request_id, response)
+            await self._send_control_response(ctx, "approval", request_id, response)
             yield self.emit(build_event(
                 AgentEventType.APPROVAL_RESOLVED, seq, turn_id=turn_id,
                 native_type=f"{method}.resolved",
@@ -1730,6 +1854,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         if method in USER_INPUT_REQUEST_METHODS:
             future = asyncio.get_running_loop().create_future()
             ctx["user_inputs"][str(request_id)] = future
+            ctx.setdefault("control_deliveries", {})[("user_input", str(request_id))] = asyncio.get_running_loop().create_future()
             ctx["user_input_params"][str(request_id)] = {
                 "method": method,
                 "params": params,
@@ -1738,6 +1863,8 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             pending = normalize_pending_user_input({
                 "request_id": str(request_id),
                 "user_input_kind": USER_INPUT_REQUEST_METHODS[method],
+                "response_actions": (["submit", "cancel", "decline"]
+                                     if method == M_MCP_ELICITATION else ["submit", "cancel"]),
                 "title": params.get("message") or "",
                 "message": params.get("message") or "",
                 "questions": questions,
@@ -1752,10 +1879,10 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                 answers = await asyncio.wait_for(
                     future, timeout=self._approval_timeout_s)
             except asyncio.TimeoutError:
-                answers = {"answers": {}}
+                answers = {"action": "cancel"} if method == M_MCP_ELICITATION else {"answers": {}}
             ctx["user_inputs"].pop(str(request_id), None)
             ctx["user_input_params"].pop(str(request_id), None)
-            await conn.respond(request_id, answers)
+            await self._send_control_response(ctx, "user_input", request_id, answers)
             yield self.emit(build_event(
                 AgentEventType.USER_INPUT_RESOLVED, seq, turn_id=turn_id,
                 native_type=f"{method}.resolved",
@@ -1910,7 +2037,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                       "item/fileChange/outputDelta"):
             return [ev(AgentEventType.TOOL_PROGRESS, {
                 "call_id": str(params.get("itemId") or ""),
-                "chunk": str(params.get("delta") or params.get("output") or "")[:1000],
+                "chunk": str(params.get("delta") or params.get("output") or ""),
             })], False
         if method == "item/started":
             return self._map_item(ev, params, ctx, started=True), False
@@ -2076,7 +2203,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                 return [ev(AgentEventType.TOOL_STARTED, {
                     "tool": tool_name, "call_id": call_id,
                     "input": str(item.get("command")
-                                 or item.get("arguments") or "")[:500],
+                                 or item.get("arguments") or ""),
                 })]
             if item_type == "fileChange":
                 # Refresh cache on completed so late/retry previews stay accurate.
@@ -2085,7 +2212,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                       or item.get("result") or "")
             return [ev(AgentEventType.TOOL_COMPLETED, {
                 "tool": tool_name, "call_id": call_id,
-                "output": str(output)[:2000],
+                "output": str(output),
                 "exit_code": item.get("exitCode"),
                 "status": item.get("status"),
             })]
@@ -2507,13 +2634,14 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         })
 
     async def _teardown(self, session: AgentSessionRef) -> str:
-        ctx = self._runs.pop(session.agent_session_id, None)
-        self._capability_revisions.pop(session.agent_session_id, None)
+        ctx = self._runs.get(session.agent_session_id)
         if not ctx:
             return EXIT_CLOSED
         conn: CodexPeer = ctx["conn"]
         had_turn = ctx.get("current_turn_id") is not None
         returncode = await conn.close()
+        self._runs.pop(session.agent_session_id, None)
+        self._capability_revisions.pop(session.agent_session_id, None)
         if had_turn:
             return classify_exit(cancelled=True)
         if returncode not in (0, -1):

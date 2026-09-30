@@ -12,7 +12,7 @@ _LOCK = threading.RLock()
 _PATH: Path | None = None
 _DEFAULTS = {
     "mcp": {"muteki-control": True},
-    "skills": {"muteki-blackboard": True},
+    "skills": {"muteki-blackboard": True, "agent-browser": True},
 }
 
 
@@ -68,4 +68,3 @@ def set_enabled(kind: str, resource_id: str, value: bool) -> dict[str, Any]:
 def snapshot() -> dict[str, dict[str, bool]]:
     with _LOCK:
         return _state()
-

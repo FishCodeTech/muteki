@@ -1,5 +1,6 @@
 "use client";
 
+import { useLang } from "@/lib/i18n";
 import { useEffect, useId, useMemo, useState } from "react";
 import { cn } from "@/lib/cn";
 import type { ConversationProject } from "@/lib/useConversation";
@@ -18,6 +19,8 @@ import {
 import { Icon } from "../Icon";
 import { pathBasename } from "../chat/composer/format";
 import { stripPillClass } from "../chat/composer/stripPill";
+import { NativePathPicker } from "@/components/NativePathPicker";
+import { desktopChatBridge } from "@/lib/desktopChatBridge";
 
 export interface ConversationContextPickerProps {
   projects: ConversationProject[];
@@ -78,9 +81,11 @@ export function ConversationContextPicker({
   modeLabel,
   className = "",
 }: ConversationContextPickerProps) {
+  const { lang } = useLang();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [pathDraft, setPathDraft] = useState("");
+  const [pickingPath, setPickingPath] = useState(false);
   const [pathError, setPathError] = useState("");
   const listId = useId();
   const pathErrorId = useId();
@@ -231,7 +236,7 @@ export function ConversationContextPicker({
   return (
     <Popover
       open={open}
-      onOpenChange={(next) => { setOpen(next); if (!next) { setQuery(""); setPathError(""); } }}
+      onOpenChange={(next) => { if (pickingPath) return; setOpen(next); if (!next) { setQuery(""); setPathError(""); } }}
       placement="top-start"
       offset={8}
       ariaLabel="选择项目"
@@ -344,7 +349,7 @@ export function ConversationContextPicker({
               void submitPath();
             }}
           >
-            <label className="text-[11.5px] text-cx-fg-3" htmlFor="conversation-directory-path">
+            {desktopChatBridge() ? <NativePathPicker id="conversation-directory-path" label={lang === "en" ? "Workspace path" : "工作目录路径"} kind="directory" value={pathDraft} onChange={path => { setPathDraft(path); setPathError(""); }} onServerPath={path => { void submitPath(path); }} disabled={creatingProject} onBusyChange={setPickingPath} inputTestId="conversation-directory-path" invalid={Boolean(pathError)} describedBy={pathError ? pathErrorId : undefined} placeholder={lang === "en" ? "Workspace directory accessible to the service" : "当前服务可访问的工作目录"} /> : <><label className="text-[11.5px] text-cx-fg-3" htmlFor="conversation-directory-path">
               {preferPathInput ? "系统目录选择器不可用，请输入路径" : "或输入目录路径"}
             </label>
             <div className="flex gap-1.5">
@@ -370,6 +375,7 @@ export function ConversationContextPicker({
                 添加
               </Button>
             </div>
+            </>}
             {pathError ? (
               <p
                 id={pathErrorId}

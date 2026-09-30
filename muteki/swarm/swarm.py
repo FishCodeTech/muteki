@@ -320,6 +320,7 @@ class Swarm(
         # Optional control-plane registry shared with the web RunManager.  It is
         # deliberately a projection of live worker identity, never evidence.
         worker_registry: "Optional[Any]" = None,
+        worker_plugins: "Optional[Any]" = None,
         # Resolve opaque secret:// references only at the final worker injection
         # boundary.  The callback's plaintext result must never enter the graph,
         # command journal, event bus, or coordinator diagnostics.
@@ -350,6 +351,7 @@ class Swarm(
         self.config = config
         self.run_id = run_id or challenge.id
         self.worker_registry = worker_registry
+        self.worker_plugins = worker_plugins
         self._secret_resolver = secret_resolver
         self._context_provider = context_provider
         self._context_binder = context_binder

@@ -22,6 +22,7 @@
 @import "./styles/settings-model-picker.css";
 @import "./styles/settings-workspace.css";
 @import "./styles/settings-hub.css";
+@import "./styles/settings-agent-extensions.css";
 @import "./styles/settings-notifications.css";
 @import "./styles/settings-agents.css";
 @import "./styles/task-worker-settings.css";

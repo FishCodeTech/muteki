@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import shutil
 import signal
@@ -12,7 +13,11 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from muteki.core.cost import CostController
+    from muteki.solver.cli_engines.types import CliResult
 
 from muteki.solver.cli_engines.engines.pi import PiDriver
 from muteki.solver.cli_launch_check import check_process_launch
@@ -59,7 +64,12 @@ step:
 
 PENTEST_PI_DECIDE_SYSTEM = CTF_PI_DECIDE_SYSTEM + """
 
-本任务的授权测试边界见 engagement。公开资料可以帮助推理，但不能替代目标环境的工具证据。你负责判断 Fact 是否已经满足用户原始测试目标；满足时用 satisfy_goal 的 from 引用支撑结论的 Fact，并在 reason 解释。若证据不足，继续规划当前最有信息增益的 Step。是否需要复核、复测或扩大授权范围内的探索，由你依据事实决定。终局报告另由模型从共享图生成，不需要为撰写报告创建 Worker Step。"""
+本任务的授权测试边界见 engagement。公开资料可以帮助推理，但不能替代目标环境的工具证据。你负责判断 Fact 是否已经满足用户原始测试目标；满足时用 satisfy_goal 的 from 引用支撑结论的 Fact，并在 reason 解释。若证据不足，继续规划当前最有信息增益的 Step。是否需要复核、复测或扩大授权范围内的探索，由你依据事实决定。
+
+规划 Pentest Step 时，一条 Step 聚焦一个可独立核验的证据缺口；若指向潜在漏洞，让预期证据足以支持或排除一份独立漏洞报告。避免在一条 Step 中混合多个不同漏洞假设，也不把同一成因拆成多份报告。登录、会话等共用前置证据取得后，通过共享图中的 Fact 及其 sourceArtifacts 复用；后续 Step 的 from 引用相关 Fact，必须精确复用已登记 PoC 时才在 requires 引用 Resource。仅当证据不足、失效或目标上下文变化时再复核这些前置条件。Step 的具体划分和并行方向仍由你根据当前事实、信息增益与授权边界决定。
+
+终局报告另由模型从共享图生成，不需要为撰写报告创建 Worker Step。"""
+PENTEST_PI_DECIDE_SYSTEM += "\n当 engagement.reportGoalMode=count 时，宿主依据有证据且经过审阅的独立报告数量停止；不要用 satisfy_goal 抢先结束。继续规划有信息增益的漏洞验证 Step，直到 reportsAccepted 达到 reportsExpected。报告由 Worker 随每个 Step 实时提交；审阅中的报告仍可在共享图看到。"
 
 _TOOLS = "open_step,drop_step,change_step_priority,satisfy_goal,preview,commit"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -510,6 +520,9 @@ def simulate_draft(
         elif op == "satisfy_goal":
             contract = getattr(getattr(shared_graph, "challenge", None), "pentest_contract", None)
             if contract is not None:
+                if contract.report_goal_mode == "count":
+                    _record(index, op, outcome="dropped", reason_code="report_count_governed_by_host")
+                    continue
                 raw_sources = operation.get("from")
                 known_seqs = set((fact_id_map or {}).values())
                 if (not isinstance(raw_sources, list) or not raw_sources
@@ -744,6 +757,93 @@ def _materialise_draft(
     )
 
 
+async def _record_pi_decide_usage(
+    parsed: CliResult,
+    *,
+    cost: CostController | None,
+    run_id: str,
+    challenge_id: str,
+    model: str,
+    usage_id: str,
+    generation: int | None,
+    status: str,
+) -> None:
+    """Settle one actual Pi CLI invocation, including a failed or partial turn.
+
+    The work directory identifies this invocation. A repeated settlement of the
+    same invocation uses its same identity, while a new CLI launch has a new
+    identity even if its prompt is identical.
+    """
+    if cost is None or not run_id:
+        return
+    usage: dict[str, Any] = {
+        "source": "pi-decide",
+        "status": status,
+        "measurement_scope": "invocation",
+        "input_includes_cache": True,
+    }
+    for key in (
+        "input_tokens", "output_tokens", "cache_read_tokens",
+        "cache_write_tokens", "reasoning_tokens",
+    ):
+        value = getattr(parsed, key, None)
+        if value is not None:
+            usage[key] = value
+    input_tokens = parsed.input_tokens
+    output_tokens = parsed.output_tokens
+    native_cost = parsed.cost_usd
+    if native_cost is not None and math.isfinite(native_cost) and native_cost > 0:
+        # Pi's JSONL cost.total is calculated from its local provider model
+        # configuration; it is an estimate, not a supplier billing receipt.
+        usage["estimated_cost"] = native_cost
+        await cost.add_external_usd(
+            native_cost,
+            run_id=run_id,
+            challenge_id=challenge_id,
+            solver_id="reason",
+            input_tokens=int(input_tokens or 0),
+            output_tokens=int(output_tokens or 0),
+            usage=usage,
+            usage_id=usage_id,
+            model=model,
+            actor_kind="coordinator",
+            generation=generation,
+            engine="pi",
+        )
+    elif input_tokens is not None and output_tokens is not None:
+        await cost.record(
+            model=model,
+            input_tokens=int(input_tokens),
+            output_tokens=int(output_tokens),
+            run_id=run_id,
+            challenge_id=challenge_id,
+            solver_id="reason",
+            usage=usage,
+            usage_id=usage_id,
+            actor_kind="coordinator",
+            generation=generation,
+            engine="pi",
+        )
+    else:
+        # Keep the original partial/missing fields in the usage row, while the
+        # live ledger marks this invocation unpriced. A dollar-budgeted run can
+        # then stop dispatching immediately if coverage becomes incomplete.
+        await cost.record(
+            model=model,
+            input_tokens=int(input_tokens or 0),
+            output_tokens=int(output_tokens or 0),
+            run_id=run_id,
+            challenge_id=challenge_id,
+            solver_id="reason",
+            usage=usage,
+            usage_id=usage_id,
+            actor_kind="coordinator",
+            generation=generation,
+            engine="pi",
+            estimate_cost=False,
+        )
+
+
 async def run_ctf_pi_reason(
     *,
     graph_summary: str,
@@ -754,11 +854,17 @@ async def run_ctf_pi_reason(
     state_root: str | Path,
     shared_graph: Any,
     mode: str = "ctf",
+    cost: CostController | None = None,
+    run_id: str = "",
+    challenge_id: str = "",
+    generation: int | None = None,
+    cost_budget_usd: float | None = None,
 ) -> ReasonResult:
     """Run one stateless Pi turn and materialise its committed operations."""
     state_dir = Path(state_root).expanduser().resolve()
     state_dir.mkdir(parents=True, exist_ok=True)
     work_dir = Path(tempfile.mkdtemp(prefix="decide-", dir=state_dir))
+    usage_id = f"pi-decide:{run_id}:{work_dir.name}"
     try:
         draft_path = work_dir / "draft.json"
         graph_path = work_dir / "graph.json"
@@ -794,7 +900,13 @@ async def run_ctf_pi_reason(
         env["MUTEKI_DECIDE_MAX_STEPS"] = str(max(0, int(max_intents)))
 
         provider = str(env.get("MUTEKI_PI_PROVIDER") or "").strip()
-        selected_model = str(env.get("MUTEKI_PI_MODEL") or model or "").strip()
+        # A positive dollar budget preflights the explicit planner model. An
+        # ambient Pi default must not replace that model after preflight.
+        # Unlimited Runs retain their established environment-first behavior.
+        selected_model = str(
+            (model if cost_budget_usd is not None and cost_budget_usd > 0 else None)
+            or env.get("MUTEKI_PI_MODEL") or model or ""
+        ).strip()
         system_prompt = PENTEST_PI_DECIDE_SYSTEM if mode == "pentest" else CTF_PI_DECIDE_SYSTEM
         argv = [
             driver.bin,
@@ -821,6 +933,35 @@ async def run_ctf_pi_reason(
             stdin_text=str(graph_summary), source="pi-decide")
 
         proc = None
+        communicate_task = None
+
+        async def _stop_and_collect() -> tuple[bytes, bytes]:
+            if proc is not None and proc.returncode is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            if communicate_task is None:
+                return b"", b""
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(communicate_task), timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                if proc is not None and proc.returncode is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(communicate_task), timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    communicate_task.cancel()
+                    await asyncio.gather(communicate_task, return_exceptions=True)
+                    return b"", b""
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -851,29 +992,44 @@ async def run_ctf_pi_reason(
                             pass
                     break
                 if asyncio.get_running_loop().time() >= deadline:
-                    communicate_task.cancel()
                     raise asyncio.TimeoutError
                 await asyncio.sleep(0.05)
             remaining = max(
                 1.0, deadline - asyncio.get_running_loop().time()
             )
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                communicate_task, timeout=remaining
+                asyncio.shield(communicate_task), timeout=remaining
             )
         except asyncio.TimeoutError:
-            if proc is not None and proc.returncode is None:
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                await proc.wait()
+            stdout_bytes, stderr_bytes = await _stop_and_collect()
+            parsed = driver.parse(
+                stdout_bytes.decode("utf-8", errors="replace"),
+                stderr_bytes.decode("utf-8", errors="replace"),
+            )
+            await _record_pi_decide_usage(
+                parsed, cost=cost, run_id=run_id,
+                challenge_id=challenge_id, model=selected_model,
+                usage_id=usage_id, generation=generation, status="timeout",
+            )
             return _failure(
                 PlannerFailureKind.TIMEOUT,
                 "Pi Decide exceeded 300 seconds",
                 status="timeout",
                 timed_out=True,
+                raw_response=parsed.text,
             )
         except Exception as exc:
+            stdout_bytes, stderr_bytes = await _stop_and_collect()
+            if proc is not None:
+                parsed = driver.parse(
+                    stdout_bytes.decode("utf-8", errors="replace"),
+                    stderr_bytes.decode("utf-8", errors="replace"),
+                )
+                await _record_pi_decide_usage(
+                    parsed, cost=cost, run_id=run_id,
+                    challenge_id=challenge_id, model=selected_model,
+                    usage_id=usage_id, generation=generation, status="error",
+                )
             return _failure(
                 PlannerFailureKind.EXCEPTION,
                 f"{type(exc).__name__}: {exc}",
@@ -892,6 +1048,11 @@ async def run_ctf_pi_reason(
         try:
             draft = json.loads(draft_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
+            await _record_pi_decide_usage(
+                parsed, cost=cost, run_id=run_id,
+                challenge_id=challenge_id, model=selected_model,
+                usage_id=usage_id, generation=generation, status="error",
+            )
             if proc is not None and proc.returncode not in (None, 0):
                 return _failure(
                     PlannerFailureKind.UNAVAILABLE,
@@ -908,6 +1069,14 @@ async def run_ctf_pi_reason(
                 raw_response=parsed.text,
             )
 
+        await _record_pi_decide_usage(
+            parsed, cost=cost, run_id=run_id,
+            challenge_id=challenge_id, model=selected_model,
+            usage_id=usage_id, generation=generation,
+            status=("observed" if draft.get("committed")
+                    and isinstance(draft.get("operations"), list)
+                    else "error"),
+        )
         fact_id_map, _facts, _watermark = _fact_catalog(shared_graph)
         result = _materialise_draft(
             draft,

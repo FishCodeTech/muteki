@@ -24,7 +24,7 @@ import urllib.error
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -38,6 +38,7 @@ from muteki.solver.credential_accounts import (
     CredentialAccountStore,
     account_store_root,
     engine_account_id,
+    host_discovery_enabled,
     project_account_root,
     runtime_env_for_engine,
 )
@@ -309,7 +310,10 @@ class CredentialModelCatalogStore:
                         result.get("error_code") or "catalog_request_failed"
                     ).strip()
                 ),
-                "last_error": "" if ok else str(result.get("detail") or "目录请求失败")[:320],
+                "last_error": "" if ok else str(result.get("detail") or "目录请求失败"),
+                **({"discovery_evidence": result.get("evidence") if ok else previous.get("discovery_evidence"),
+                    **({"last_attempt_evidence": result["evidence"]} if not ok and "evidence" in result else {})}
+                   if "evidence" in result or "discovery_evidence" in previous else {}),
             }
             catalogs[key] = row
             self._write_unlocked(catalogs)
@@ -1533,7 +1537,7 @@ def probe_worker_model(
             "MUTEKI_WORKER_MODEL": model,
             "MUTEKI_WORKER_REASONING_EFFORT": str(reasoning_effort or "default"),
         }
-        env = _private_model_probe_env(engine, sessions_root, resolved_account_id, env)
+        env = stack.enter_context(_temporary_model_probe_env(engine, sessions_root, resolved_account_id, env))
         verify_claude_model = engine == "claude" and profile_uses_endpoint(profile)
         if verify_claude_model:
             env["CLAUDE_CONFIG_DIR"] = stack.enter_context(
@@ -2302,6 +2306,22 @@ def _openai_models_url(base_url: str) -> str:
     return f"{root}/models"
 
 
+class _CredentialCatalogRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Credentials stay within the explicitly selected endpoint origin."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        from urllib.parse import urlsplit
+        old, new = urlsplit(req.full_url), urlsplit(newurl)
+        def origin(url):
+            return (url.scheme.lower(), url.hostname, url.port or (443 if url.scheme == "https" else 80))
+        if origin(old) != origin(new) or new.scheme not in {"http", "https"}:
+            raise urllib.error.HTTPError(req.full_url, code, "catalog.redirect_scope_denied", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _credential_catalog_open(request):
+    return urllib.request.build_opener(_CredentialCatalogRedirectHandler()).open(request, timeout=20)
+
+
 def discover_openai_compatible_models(
     *,
     base_url: str,
@@ -2326,7 +2346,7 @@ def discover_openai_compatible_models(
         headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with _credential_catalog_open(request) as response:
             text = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")[:240]
@@ -2413,7 +2433,7 @@ def discover_anthropic_compatible_models(
         headers["x-api-key"] = token
     request = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with _credential_catalog_open(request) as response:
             text = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")[:240]
@@ -2696,7 +2716,17 @@ def _private_model_probe_env(
     if engine not in ENGINES:
         return env
     service = ChatPluginService(Path(sessions_root) / "_model_probe_environments")
-    return service.prepare_environment(engine, "model-probe:" + account_id, env)
+    return service.prepare_environment(engine, "model-probe:" + account_id, env, include_assets=False)
+
+
+@contextmanager
+def _temporary_model_probe_env(engine: str, sessions_root: str | Path, account_id: str, env: dict[str, str]):
+    base = Path(sessions_root) / "_model_probe_environments"
+    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Each concurrent request gets its own small home. Success, failure and
+    # cancellation all release it; model catalogs do not need plugin assets.
+    with tempfile.TemporaryDirectory(prefix="probe-", dir=base) as directory:
+        yield _private_model_probe_env(engine, directory, account_id, env)
 
 
 def _run_local_discovery(
@@ -2705,6 +2735,8 @@ def _run_local_discovery(
     engine = base_engine_for_profile(profile)
     account_id = str(profile.get("credential_account") or "").strip()
     resolved_account_id = account_id if account_id else ""
+    if not resolved_account_id and not host_discovery_enabled():
+        raise ModelDiscoveryError("此服务未提供宿主模型发现；请选择已登记凭据", "host_discovery_disabled")
     resolved = runtime_env_for_engine(
         engine,
         account_root=account_store_root(sessions_root),
@@ -2714,38 +2746,38 @@ def _run_local_discovery(
     binary = str(profile.get("binary_path") or "").strip() or driver_for(profile).bin
     argv = _discovery_argv(engine, binary, bundled=bundled)
     env = {**os.environ, **driver_for(profile).env_extra(), **resolved.env}
-    env = _private_model_probe_env(engine, sessions_root, resolved_account_id, env)
-    try:
-        if engine == "grok":
-            try:
-                return subprocess.CompletedProcess(
-                    argv, 0, json.dumps(asyncio.run(_grok_model_metadata(binary, env))), "",
+    with _temporary_model_probe_env(engine, sessions_root, resolved_account_id, env) as env:
+        try:
+            if engine == "grok":
+                try:
+                    return subprocess.CompletedProcess(
+                        argv, 0, json.dumps(asyncio.run(_grok_model_metadata(binary, env))), "",
+                    )
+                except Exception:
+                    # Older Grok versions can still list names. No effort options
+                    # are invented when the metadata handshake is unavailable.
+                    pass
+            if engine == "pi" and shutil.which("node"):
+                probe = Path(__file__).resolve().parents[2] / "muteki/solver/pi_model_catalog.mjs"
+                metadata = subprocess.run(
+                    [shutil.which("node"), str(probe), shutil.which(binary) or binary],
+                    capture_output=True, text=True, timeout=30, env=env,
                 )
-            except Exception:
-                # Older Grok versions can still list names. No effort options
-                # are invented when the metadata handshake is unavailable.
-                pass
-        if engine == "pi" and shutil.which("node"):
-            probe = Path(__file__).resolve().parents[2] / "muteki/solver/pi_model_catalog.mjs"
-            metadata = subprocess.run(
-                [shutil.which("node"), str(probe), shutil.which(binary) or binary],
-                capture_output=True, text=True, timeout=30, env=env,
+                if metadata.returncode == 0 and metadata.stdout.lstrip().startswith("{"):
+                    return metadata
+            return subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=45,
+                env=env,
             )
-            if metadata.returncode == 0 and metadata.stdout.lstrip().startswith("{"):
-                return metadata
-        return subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=45,
-            env=env,
-        )
-    except FileNotFoundError as exc:
-        raise ModelDiscoveryError("CLI 不存在", "cli_missing") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise ModelDiscoveryError("模型发现超时（>45s）", "timeout") from exc
+        except FileNotFoundError as exc:
+            raise ModelDiscoveryError("CLI 不存在", "cli_missing") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise ModelDiscoveryError("模型发现超时（>45s）", "timeout") from exc
 
 
 async def _grok_model_metadata(binary: str, env: dict[str, str]) -> dict[str, Any]:

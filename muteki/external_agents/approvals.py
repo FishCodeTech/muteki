@@ -44,6 +44,7 @@ class ApprovalDecision:
     choice: ApprovalChoice
     scope: ApprovalScope = ApprovalScope.ONCE
     note: str = ""
+    option_id: str = ""
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "ApprovalDecision":
@@ -65,6 +66,7 @@ class ApprovalDecision:
             choice=choice,
             scope=scope,
             note=str(payload.get("note") or payload.get("message") or ""),
+            option_id=str(payload.get("option_id") or "").strip(),
         )
 
     @property
@@ -77,6 +79,7 @@ class ApprovalDecision:
             "decision": self.choice.value,
             "scope": self.scope.value,
             "note": self.note,
+            **({"option_id": self.option_id} if self.option_id else {}),
         }
 
     def codex_decision(self) -> str:

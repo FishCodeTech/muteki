@@ -1813,7 +1813,7 @@ class WorkerConfigStore:
             # real-test and catalog gates below.
             if binding_unchanged:
                 continue
-            last_test = store.last_test(credential_id)
+            last_test = store.last_test(credential_id, backend=backend, model=model)
             tested_model = str((last_test or {}).get("model") or "").strip()
             if last_test and last_test.get("ok") and tested_model and tested_model not in models:
                 models.append(tested_model)
