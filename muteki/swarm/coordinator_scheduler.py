@@ -92,6 +92,8 @@ async def _run_coordinator(self) -> SwarmOutcome:
     try:
         while (state.tasks or self._has_dispatchable_open_intents(state.tasks)
                or state.reason_task is not None
+               or state.pentest_review_task is not None
+               or bool(state.pentest_review_retry_after)
                or state.reason_result_ready
                or state.reason_next_trigger
                or state.decide_followup_pending

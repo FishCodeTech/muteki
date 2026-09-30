@@ -341,7 +341,7 @@ def is_actionable_approval(row: Optional[Mapping[str, Any]]) -> bool:
     """True when an approval entry can still be decided."""
     if not isinstance(row, Mapping) or not row:
         return False
-    return str(row.get("status") or "pending") == "pending"
+    return str(row.get("status") or "pending") in {"pending", "resolving"}
 
 
 def has_actionable_approvals(
@@ -373,7 +373,7 @@ def primary_approval(
     """
     pending_rows = [
         dict(row) for row in pending_approvals.values()
-        if str(row.get("status") or "pending") == "pending"
+        if str(row.get("status") or "pending") in {"pending", "resolving"}
     ]
     if not pending_rows:
         return None
@@ -392,7 +392,8 @@ def upsert_approval(
     pending_approvals: Mapping[str, Mapping[str, Any]],
     payload: Mapping[str, Any],
 ) -> tuple[dict[str, dict[str, Any]], Optional[dict[str, Any]]]:
-    queue = {str(k): dict(v) for k, v in pending_approvals.items()}
+    queue = {str(k): dict(v) for k, v in pending_approvals.items()
+             if str(v.get("status") or "pending") != "expired"}
     row = normalize_approval_payload(payload, default_status="pending")
     approval_id = str(row["approval_id"])
     existing = queue.get(approval_id)
@@ -416,14 +417,9 @@ def expire_approvals(
     *,
     reason: str,
 ) -> tuple[dict[str, dict[str, Any]], Optional[dict[str, Any]]]:
-    queue: dict[str, dict[str, Any]] = {}
-    for key, value in pending_approvals.items():
-        row = dict(value)
-        if str(row.get("status") or "pending") == "pending":
-            row["status"] = "expired"
-            row["reason"] = reason or row.get("reason") or "请求已过期"
-        queue[str(key)] = row
-    return queue, primary_approval(queue)
+    # The immutable requested + terminal turn events retain the full audit
+    # history. The current control snapshot only carries actionable requests.
+    return {}, None
 
 
 def clear_approvals() -> tuple[dict[str, dict[str, Any]], None]:

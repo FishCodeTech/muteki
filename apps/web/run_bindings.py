@@ -24,6 +24,29 @@ from apps.web.run_state import (  # noqa: F401
 )
 from apps.web.run_progress import RunProgressPublisher
 
+
+def _recorded_run_cost_usd(store: SessionStore, run_id: str) -> float:
+    """Rebuild known cost across legacy generation resets from durable events."""
+    by_generation: dict[int, float] = {}
+    run_cumulative: float | None = None
+    for event in store.iter_matching_events(
+        run_id, event_types=(EventType.COST_UPDATE.value,),
+    ):
+        payload = event.payload or {}
+        total = payload.get("run_total")
+        if not isinstance(total, dict):
+            continue
+        usd = total.get("usd")
+        if isinstance(usd, bool) or not isinstance(usd, (int, float)) or usd < 0:
+            continue
+        if payload.get("run_total_scope") == "run":
+            run_cumulative = float(usd)
+            continue
+        generation = payload.get("execution_generation")
+        generation = generation if type(generation) is int and generation >= 0 else 0
+        by_generation[generation] = float(usd)
+    return run_cumulative if run_cumulative is not None else sum(by_generation.values())
+
 def get(self, run_id: str) -> Optional[Run]:
     return self.runs.get(run_id)
 
@@ -361,6 +384,13 @@ def create(self, run_id: str, *, stream_seq: int | None = None) -> Run:
         run_id=run_id, bus=bus, cost=CostController(bus=bus), store=store,
         created_seq=self._seq,
     )
+    # The Run object may be rebuilt after a server restart while its durable
+    # usage and graph remain. Continue the same run's ledger instead of showing
+    # only the latest execution generation (and resetting its budget gate).
+    run.cost.restore_run_totals(
+        self.usage.run_totals(run_id),
+        event_usd=_recorded_run_cost_usd(store, run_id),
+    )
     def record_usage(raw, **scope):
         generation = scope.pop("generation", None)
         return self.usage.record(raw, run_id=run_id, generation=generation if generation is not None else run.execution_generation,
@@ -392,8 +422,9 @@ def create(self, run_id: str, *, stream_seq: int | None = None) -> Run:
             # Keep name EMPTY when the operator gave none — the rail renders a
             # "new conversation" placeholder, and the background summarizer fills
             # in a ChatGPT-style title via RUN_TITLED. Don't pin it to the run_id.
-            if ch.get("name"):
-                run.name = ch["name"]
+            challenge_name = str(ch.get("name") or "")
+            if challenge_name and challenge_name != run.run_id:
+                run.name = challenge_name
             run.category = ch.get("category", run.category) or run.category
             if ch.get("mode") in {"ctf", "pentest"}:
                 run.mode = ch["mode"]

@@ -208,7 +208,8 @@ async def _drain_control_before_launch(self, run_id: str, run: Run) -> bool:
         return True
 
 
-async def start(self, run_id: str, driver: Driver) -> Run:
+async def start(self, run_id: str, driver: Driver,
+                launch_limits: dict[str, Any] | None = None) -> Run:
     """Admit and launch one fresh execution generation.
 
     Duplicate live starts are conflicts; they never overwrite the only task
@@ -241,6 +242,7 @@ async def start(self, run_id: str, driver: Driver) -> Run:
                     or self._standby_busy(run)):
                 raise StateConflict(
                     f"run {run_id} lifecycle changed before launch")
+            self.persist_run_launch_limits(run_id, launch_limits or {})
             self._fresh_bus(run)
             self._retire_hitl_epoch(run, terminal=False)
             self._retire_worker_command_epoch(run)
@@ -334,9 +336,62 @@ async def _resolve_launching(
         ch = {"name": run.name or run_id, "category": run.category or "web",
               "expected_flags": run.expected_flags,
               "multi_flag": run.multi_flag}
-    merged = {"challenge": ch, **(body or {})}
-    if body and body.get("challenge"):
-        merged["challenge"] = {**ch, **body["challenge"]}
+    from apps.web.run_recovery import WorkerRuntimePolicyUnavailable
+    saved_limits = self.load_run_launch_limits(run_id)
+    saved_mode = ch.get("mode") or "ctf"
+    requested_challenge = (body or {}).get("challenge") or {}
+    if not isinstance(requested_challenge, dict):
+        raise WorkerRuntimePolicyUnavailable(
+            f"Run {run_id} continuation challenge must be an object")
+    for requested_mode in ((body or {}).get("mode"), requested_challenge.get("mode")):
+        if requested_mode is not None and requested_mode != saved_mode:
+            raise WorkerRuntimePolicyUnavailable(
+                f"Run {run_id} cannot change mode during continuation")
+    for key in ("worker_backend", "worker_container_scope"):
+        if body and key in body and body[key] != saved_limits[key]:
+            raise WorkerRuntimePolicyUnavailable(
+                f"Run {run_id} cannot change its saved {key} during continuation")
+    merged = {"challenge": ch, **saved_limits, **(body or {})}
+    if requested_challenge:
+        merged["challenge"] = {**ch, **requested_challenge}
+    if merged["challenge"].get("mode") == "pentest":
+        from apps.web.task_contract import prepare_dispatch_contract
+        requested = dict((body or {}).get("challenge") or {})
+        saved_goal = self.load_run_pentest_goal(run_id)
+        prior_contract = ch.get("pentest_contract")
+        if prior_contract is not None and not isinstance(prior_contract, dict):
+            raise RuntimeError("saved pentest contract is invalid")
+        # A continuation retains the graph's report protocol. Existing v1
+        # findings have no v2 selected-artifact notes; silently promoting this
+        # Run would invalidate its already-submitted reports. New Runs default
+        # to v2 at dispatch, while an old Run remains v1 until a new task.
+        pentest_version = (prior_contract or {}).get("version", 1)
+        if type(pentest_version) is not int or pentest_version not in {1, 2}:
+            raise RuntimeError("saved pentest contract version is invalid")
+        if (run.solved and "report_goal_mode" not in requested
+                and "expected_findings" not in requested):
+            # Only a completed finite goal rolls into automatic exploration.
+            # A failed/interrupted Run still owes its original report count.
+            merged["challenge"]["report_goal_mode"] = "automatic"
+            merged["challenge"]["expected_findings"] = None
+        elif not run.solved and "report_goal_mode" not in requested and "expected_findings" not in requested:
+            previous = saved_goal or dict(ch.get("pentest_contract") or {})
+            if previous.get("report_goal_mode") in {"automatic", "count"}:
+                merged["challenge"]["report_goal_mode"] = previous["report_goal_mode"]
+                merged["challenge"]["expected_findings"] = previous.get("expected_findings")
+        elif "expected_findings" in requested and "report_goal_mode" not in requested:
+            merged["challenge"]["report_goal_mode"] = "count"
+        if merged["challenge"].get("report_goal_mode") == "automatic":
+            merged["challenge"]["expected_findings"] = None
+        merged["challenge"].pop("task_contract", None)
+        merged["challenge"].pop("pentest_contract", None)
+        try:
+            merged, _ = prepare_dispatch_contract(
+                merged, pentest_version=pentest_version,
+            )
+        except ValueError as exc:
+            LOG.error("invalid pentest continuation goal for %s: %s", run_id, exc)
+            return False
     # "继续做题" 跳过 race-scout 竞速层：竞速是"从空图并行单发初探"，只在冷启动有意义。
     # resolve 复用同一个 workspace_dir，shared_graph 已满是 verified facts / dead-ends,
     # 应直接进主协调器循环(规划/派发)在已有证据上续做,而不是再竞速一轮
@@ -349,6 +404,8 @@ async def _resolve_launching(
     from apps.web.drivers import build_driver
     try:
         driver = build_driver(merged, mgr=self)
+    except WorkerRuntimePolicyUnavailable:
+        raise
     except Exception:
         LOG.exception("failed to build resolve driver for %s", run_id)
         return False

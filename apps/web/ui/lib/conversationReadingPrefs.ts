@@ -1,3 +1,4 @@
+import { conversationStorageKey, subscribeConversationStorageScope } from "./conversationStorageScope";
 /**
  * C39: conversation reading preferences (font scale, density, content width).
  * Client-only localStorage — separate from theme (`muteki.theme`) and C10 stash keys.
@@ -36,6 +37,9 @@ const CONTENT_WIDTH_PX: Record<ConversationContentWidth, { chat: string; compose
 type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 
 let storageOverride: StorageLike | null = null;
+let memoryPrefs: ConversationReadingPrefs = { ...DEFAULT_CONVERSATION_READING_PREFS };
+let dirty = false;
+let storageListener = false;
 const listeners = new Set<(prefs: ConversationReadingPrefs) => void>();
 
 function getStorage(): StorageLike | null {
@@ -61,17 +65,19 @@ function normalizePrefs(raw: unknown): ConversationReadingPrefs {
 export function __resetConversationReadingPrefsForTests(storage?: StorageLike | null): void {
   storageOverride = storage === undefined ? null : storage;
   listeners.clear();
+  memoryPrefs = { ...DEFAULT_CONVERSATION_READING_PREFS }; dirty = false;
 }
 
 export function readConversationReadingPrefs(): ConversationReadingPrefs {
+  if (dirty) return { ...memoryPrefs };
   const storage = getStorage();
-  if (!storage) return { ...DEFAULT_CONVERSATION_READING_PREFS };
+  if (!storage) return { ...memoryPrefs };
   try {
-    const raw = storage.getItem(CONVERSATION_READING_PREFS_KEY);
-    if (!raw) return { ...DEFAULT_CONVERSATION_READING_PREFS };
-    return normalizePrefs(JSON.parse(raw));
+    const raw = storage.getItem(conversationStorageKey(CONVERSATION_READING_PREFS_KEY));
+    memoryPrefs = raw ? normalizePrefs(JSON.parse(raw)) : { ...DEFAULT_CONVERSATION_READING_PREFS };
+    return { ...memoryPrefs };
   } catch {
-    return { ...DEFAULT_CONVERSATION_READING_PREFS };
+    return { ...memoryPrefs };
   }
 }
 
@@ -79,10 +85,12 @@ export function writeConversationReadingPrefs(
   patch: Partial<ConversationReadingPrefs>,
 ): ConversationReadingPrefs {
   const next = normalizePrefs({ ...readConversationReadingPrefs(), ...patch });
+  memoryPrefs = next; dirty = true;
   const storage = getStorage();
   if (storage) {
     try {
-      storage.setItem(CONVERSATION_READING_PREFS_KEY, JSON.stringify(next));
+      storage.setItem(conversationStorageKey(CONVERSATION_READING_PREFS_KEY), JSON.stringify(next));
+      dirty = false;
     } catch {
       /* ignore quota */
     }
@@ -95,6 +103,15 @@ export function subscribeConversationReadingPrefs(
   listener: (prefs: ConversationReadingPrefs) => void,
 ): () => void {
   listeners.add(listener);
+  if (typeof window !== "undefined" && !storageListener) {
+    storageListener = true;
+    window.addEventListener("storage", (event) => {
+      if (event.key !== conversationStorageKey(CONVERSATION_READING_PREFS_KEY)) return;
+      try { memoryPrefs = event.newValue ? normalizePrefs(JSON.parse(event.newValue)) : { ...DEFAULT_CONVERSATION_READING_PREFS }; dirty = false; }
+      catch { return; }
+      for (const callback of listeners) callback({ ...memoryPrefs });
+    });
+  }
   return () => {
     listeners.delete(listener);
   };
@@ -132,3 +149,5 @@ export function runtimeIdentityKey(runtime: {
   if (!runtime) return "";
   return `${String(runtime.endpoint || "").trim()}::${String(runtime.model || "").trim()}`;
 }
+
+subscribeConversationStorageScope(() => { memoryPrefs = { ...DEFAULT_CONVERSATION_READING_PREFS }; dirty = false; for (const listener of listeners) listener({ ...memoryPrefs }); });

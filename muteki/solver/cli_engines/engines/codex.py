@@ -7,8 +7,6 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from muteki.core.cost import PRICES, CODEX_CACHED_INPUT_PER_M, _DEFAULT_PRICE
-
 from muteki.solver.cli_engines.base import CliDriver, _secure_help_preflight
 from muteki.solver.cli_engines.types import (
     CliResult, LaunchContext, StreamStep, WORKER_LAUNCH, _structured_cli_error,

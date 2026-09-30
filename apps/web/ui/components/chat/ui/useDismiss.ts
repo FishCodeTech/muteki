@@ -76,7 +76,7 @@ export function useLayer({
     if (!open) return;
     openStack.push(id);
     const onPointerDown = (event: PointerEvent) => {
-      if (!outside) return;
+      if (!outside || openStack[openStack.length - 1] !== id) return;
       const target = event.target as Node | null;
       if (!target || node.contains(target)) return;
       dismissRef.current("outside");
@@ -84,7 +84,7 @@ export function useLayer({
     const onKeyDown = (event: KeyboardEvent) => {
       if (!escape || event.key !== "Escape") return;
       if (openStack[openStack.length - 1] !== id) return;
-      event.stopPropagation();
+      event.stopImmediatePropagation();
       event.preventDefault();
       dismissRef.current("escape");
     };

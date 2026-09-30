@@ -18,6 +18,9 @@ import { remarkChatMath } from "@/lib/chatMath";
 import { ChatMath } from "./ChatMath";
 import { ChatVisualization, parseVisualization } from "./ChatVisualization";
 import { cn } from "@/lib/cn";
+import { useLang } from "@/lib/i18n";
+import { hasCrossBlockReferences, splitMarkdownBlocks } from "@/lib/chatMarkdownBlocks";
+export { splitMarkdownBlocks } from "@/lib/chatMarkdownBlocks";
 import { Icon } from "@/components/Icon";
 import { languageLabel } from "@/components/chat/ui";
 import { CodeBlock } from "@/components/agentui/agents/code-block";
@@ -43,57 +46,6 @@ export interface ChatMarkdownProps {
 
 export const CHAT_REMARK_PLUGINS: PluggableList = [remarkGfm, remarkMath, remarkChatMath];
 const FENCE_RE = /^\s{0,3}(`{3,}|~{3,})/;
-/** Footnotes / reference links need the whole document in one parse. */
-const CROSS_BLOCK_RE = /\[\^[^\]]+\]|^\s{0,3}\[[^\]]+\]:\s+\S/m;
-
-/**
- * Splits markdown at top-level blank lines (never inside fences or before an
- * indented continuation) so streaming only re-parses the growing tail.
- */
-export function splitMarkdownBlocks(text: string): string[] {
-  if (!text) return [];
-  if (CROSS_BLOCK_RE.test(text)) return [text];
-  const lines = text.split("\n");
-  const blocks: string[] = [];
-  let current: string[] = [];
-  let fence: { char: string; size: number } | null = null;
-  let mathFence = 0;
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    const mathMarker = !fence ? /^\s{0,3}(\${2,})(.*)$/.exec(line) : null;
-    if (mathMarker) {
-      const marker = mathMarker[1];
-      if (!mathFence && !mathMarker[2].includes(marker)) mathFence = marker.length;
-      else if (mathFence && marker.length >= mathFence && !mathMarker[2].trim()) mathFence = 0;
-      current.push(line);
-      continue;
-    }
-    const fenceMatch = !mathFence ? FENCE_RE.exec(line) : null;
-    if (fenceMatch) {
-      const marker = fenceMatch[1];
-      if (!fence) fence = { char: marker[0], size: marker.length };
-      else if (marker[0] === fence.char && marker.length >= fence.size && line.trim().replace(/[`~]/g, "") === "") fence = null;
-      current.push(line);
-      continue;
-    }
-    if (!fence && !mathFence && line.trim() === "" && current.length) {
-      let next = index + 1;
-      while (next < lines.length && lines[next].trim() === "") next += 1;
-      const upcoming = lines[next] ?? "";
-      if (/^\s{2,}\S/.test(upcoming) || /^\s*[|]/.test(upcoming)) {
-        current.push(line);
-        continue;
-      }
-      blocks.push(current.join("\n"));
-      current = [];
-      continue;
-    }
-    if (line.trim() === "" && !current.length) continue;
-    current.push(line);
-  }
-  if (current.length) blocks.push(current.join("\n"));
-  return blocks;
-}
 
 function endsInOpenFence(block: string): boolean {
   let fence: { char: string; size: number } | null = null;
@@ -140,6 +92,12 @@ function buildComponents(options: {
     ? (target: ResourceLinkTarget) => resourceLinkRef.current?.(target)
     : undefined;
   return {
+    p({ children, node, ...props }) {
+      return <p {...props} data-md-local-start={node?.position?.start.offset} data-md-local-end={node?.position?.end.offset}>{children}</p>;
+    },
+    li({ children, node, ...props }) {
+      return <li {...props} data-md-local-start={node?.position?.start.offset} data-md-local-end={node?.position?.end.offset}>{children}</li>;
+    },
     span({ children, node, ...props }) {
       const source = node?.properties?.["data-math-source"];
       if (typeof source === "string") return <ChatMath value={String(node?.properties?.["data-chat-math"] || "")} source={source} display={false} />;
@@ -150,7 +108,7 @@ function buildComponents(options: {
       if (typeof source === "string") return <ChatMath value={String(node?.properties?.["data-chat-math"] || "")} source={source} display />;
       return <div {...props}>{children}</div>;
     },
-    pre({ children }) {
+    pre({ children, node }) {
       const child = Children.toArray(children)[0];
       const element = isValidElement(child)
         ? (child as ReactElement<{ className?: string; children?: ReactNode }>)
@@ -160,7 +118,7 @@ function buildComponents(options: {
       const code = textOf(element ? element.props.children : children).replace(/\n$/, "");
       const lang = normalizeLanguage(language) ?? language ?? "text";
       return (
-        <CodeBlock
+        <div data-md-local-start={node?.position?.start.offset} data-md-local-end={node?.position?.end.offset}><CodeBlock
           code={code}
           language={lang}
           languageLabel={languageLabel(language)}
@@ -169,7 +127,7 @@ function buildComponents(options: {
           maxHeight={560}
           wrapToggle
           className="cx-code cx-md-code"
-        />
+        /></div>
       );
     },
     code({ className, children, node: _node, ...props }) {
@@ -268,9 +226,9 @@ function buildComponents(options: {
   };
 }
 
-const MarkdownBlock = memo(function MarkdownBlock({ text, components }: { text: string; components: Components }) {
+const MarkdownBlock = memo(function MarkdownBlock({ text, components, sourceStart }: { text: string; components: Components; sourceStart: number }) {
   return (
-    <div className="cx-md-block">
+    <div className="cx-md-block" data-md-source-start={sourceStart} data-md-source-end={sourceStart + text.length}>
       <ReactMarkdown remarkPlugins={CHAT_REMARK_PLUGINS} components={components} urlTransform={safeMarkdownUrlTransform}>
         {text}
       </ReactMarkdown>
@@ -280,6 +238,7 @@ const MarkdownBlock = memo(function MarkdownBlock({ text, components }: { text: 
 
 /** Chat-only markdown renderer with ChatGPT/Claude-grade prose (`.cx-prose`). */
 export function ChatMarkdown({ text, streaming = false, threadId, onResourceLink, size = "md", className }: ChatMarkdownProps) {
+  const { lang } = useLang();
   const resourceLinkRef = useRef(onResourceLink);
   resourceLinkRef.current = onResourceLink;
   const resourceLinks = Boolean(onResourceLink);
@@ -291,7 +250,9 @@ export function ChatMarkdown({ text, streaming = false, threadId, onResourceLink
     () => buildComponents({ threadId, resourceLinkRef, resourceLinks, streamingTail: true }),
     [threadId, resourceLinks],
   );
-  const blocks = useMemo(() => splitMarkdownBlocks(text), [text]);
+  const crossReferences = useMemo(() => hasCrossBlockReferences(text), [text]);
+  const blocks = useMemo(() => splitMarkdownBlocks(text, !streaming), [text, streaming]);
+  const sourceStarts = useMemo(() => { let offset = 0; return blocks.map(block => { const start = text.indexOf(block, offset); offset = start + block.length; return start; }); }, [blocks, text]);
   const tailOpenFence = streaming && blocks.length > 0 && endsInOpenFence(blocks[blocks.length - 1]);
   if (!text) {
     return streaming ? (
@@ -305,6 +266,7 @@ export function ChatMarkdown({ text, streaming = false, threadId, onResourceLink
       className={cn("cx-prose", size === "sm" && "cx-prose-sm", className)}
       data-streaming={streaming ? "true" : undefined}
     >
+      {streaming && crossReferences ? <p className="text-[11px] text-cx-fg-4" role="status">{lang === "en" ? "Footnotes and cross-paragraph references will be linked when the answer finishes." : "脚注与跨段引用会在回答完成后连接。"}</p> : null}
       {blocks.map((block, index) => {
         const visual = threadId ? parseVisualization(block) : null;
         if (visual && threadId) return <ChatVisualization key={index} threadId={threadId} {...visual} streaming={streaming} />;
@@ -312,6 +274,7 @@ export function ChatMarkdown({ text, streaming = false, threadId, onResourceLink
         <MarkdownBlock
           key={index}
           text={block}
+          sourceStart={sourceStarts[index]}
           components={tailOpenFence && index === blocks.length - 1 ? tailComponents : components}
         />
         );

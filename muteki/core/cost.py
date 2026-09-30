@@ -1,12 +1,11 @@
-"""Cost controller — real-time token/$ accounting per solver / challenge / global.
+"""Cost controller — token usage and known dollar amounts per scope.
 
 Feeds two things:
 - L0 scheduler circuit-breaker (`over_budget(scope)`) — §4.2.
 - The North Star metric `points per dollar-hour` — §12.
 
-Prices are per-model, per-1M-tokens, configurable. The numbers below are
-placeholders for the temporary DeepSeek endpoint; correctness lives in the
-accounting, not the exact rate. Update PRICES when real rates are known.
+Prices are per-model, per-1M-tokens, configurable. Local prices produce
+estimates; an unknown model remains unpriced instead of receiving a fallback.
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ class ModelPrice:
         )
 
 
-# Placeholder price table. Reasoning tokens bill as output tokens.
+# Explicit local estimate table. Reasoning tokens bill as output tokens.
 PRICES: dict[str, ModelPrice] = {
     "deepseek-v4-pro": ModelPrice(input_per_m=0.55, output_per_m=2.19),
     "deepseek-v4-flash": ModelPrice(input_per_m=0.07, output_per_m=0.28),
@@ -46,17 +45,9 @@ PRICES: dict[str, ModelPrice] = {
     "codex": ModelPrice(input_per_m=1.25, output_per_m=10.0),
     "gpt-5": ModelPrice(input_per_m=1.25, output_per_m=10.0),
 }
-# Ollama serves the same models under a ``:cloud`` tag and bills GPU-time, not
-# tokens. Keep the DeepSeek list rates so a serving-stack switch does not silently
-# reprice every run against _DEFAULT_PRICE (~14x on flash) and blow the budget gate.
-PRICES.update(
-    {f"{name}:cloud": price for name, price in list(PRICES.items())}
-)
 # Cached-input rate for codex/GPT-5 (per 1M). cli_driver prices cached tokens at
 # this rate and fresh tokens at the full input rate when computing codex cost.
 CODEX_CACHED_INPUT_PER_M = 0.125
-# Fallback for unknown models so accounting never silently drops to zero.
-_DEFAULT_PRICE = ModelPrice(input_per_m=1.0, output_per_m=3.0)
 
 
 @dataclass
@@ -66,10 +57,14 @@ class Ledger:
     input_tokens: int = 0
     output_tokens: int = 0
     calls: int = 0
+    unpriced_calls: int = 0
 
-    def add(self, price: ModelPrice, input_tokens: int, output_tokens: int) -> float:
-        c = price.cost(input_tokens, output_tokens)
-        self.usd += c
+    def add(self, price: ModelPrice | None, input_tokens: int, output_tokens: int) -> float | None:
+        c = price.cost(input_tokens, output_tokens) if price is not None else None
+        if c is None:
+            self.unpriced_calls += 1
+        else:
+            self.usd += c
         self.input_tokens += input_tokens
         self.output_tokens += output_tokens
         self.tokens += input_tokens + output_tokens
@@ -104,11 +99,32 @@ class CostController:
     )
     _points: int = 0  # solved points, for the North Star metric
 
-    def price_for(self, model: str) -> ModelPrice:
-        found = self.prices.get(model)
-        if found is None and ":" in model:
-            found = self.prices.get(model.split(":", 1)[0])
-        return found if found is not None else _DEFAULT_PRICE
+    def restore_run_totals(
+        self, totals: dict[str, Any], *, event_usd: float | None = None,
+    ) -> None:
+        """Seed the run ledger from durable usage before a recovered Run resumes.
+
+        Usage observations have stable identities, so the caller must do this
+        once when constructing a new controller, before any invocation records
+        more usage. Unknown fields remain unknown in UsageStore; the live ledger
+        uses zero only as its additive starting value.
+        """
+        inp = max(0, int(totals.get("input_tokens") or 0))
+        out = max(0, int(totals.get("output_tokens") or 0))
+        reported = max(0.0, float(totals.get("reported_cost") or 0.0))
+        estimated = max(0.0, float(totals.get("estimated_cost") or 0.0))
+        self._global = Ledger(
+            usd=(reported + estimated if totals.get("unverified_estimates")
+                 else max(reported + estimated, max(0.0, float(event_usd or 0.0)))),
+            tokens=inp + out,
+            input_tokens=inp,
+            output_tokens=out,
+            calls=max(0, int(totals.get("records") or 0)),
+            unpriced_calls=max(0, int(totals.get("unpriced") or 0)),
+        )
+
+    def price_for(self, model: str) -> ModelPrice | None:
+        return self.prices.get(model)
 
     async def add_external_usd(
         self, usd: float, *, run_id: str, solver_id: Optional[str] = None,
@@ -122,14 +138,14 @@ class CostController:
         `total_cost_usd`) or for which the driver already derived an
         API-equivalent dollar cost from tokens (codex). Bumps the global +
         solver/challenge ledgers and emits COST_UPDATE so the deck + budget
-        breaker see real spend.
+        gate see the reported or driver-estimated amount.
 
         `input_tokens`/`output_tokens` are the run's reported usage; they land in
         the ledger's token counters (for the deck's token-usage column) but do NOT
-        re-derive the cost — `usd` is authoritative here (the driver already priced
-        it). Pass 0 (the default) when the engine reports no token counts."""
+        re-derive the cost. Pass 0 (the default) when the engine reports no tokens."""
         if self.usage_sink is not None:
-            inserted = self.usage_sink(usage or {"input_tokens": input_tokens, "output_tokens": output_tokens, "reported_cost": usd}, identity=usage_id, model=model, worker_id=solver_id, role=("worker" if actor_kind == "worker" else solver_id or "auxiliary"), actor_kind=actor_kind, generation=generation, engine=engine)
+            observed_usage = usage or {"input_tokens": input_tokens, "output_tokens": output_tokens, "reported_cost": usd}
+            inserted = self.usage_sink(observed_usage, identity=usage_id, model=model, worker_id=solver_id, role=("worker" if actor_kind == "worker" else solver_id or "auxiliary"), actor_kind=actor_kind, generation=generation, engine=engine, price_source=("driver_estimate" if observed_usage.get("estimated_cost") is not None else None))
             if inserted is False:
                 return 0.0
         usd = max(0.0, float(usd))
@@ -163,7 +179,9 @@ class CostController:
                 payload = cost_payload("global", self._global.usd, self._global.tokens,
                                        input_tokens=self._global.input_tokens,
                                        output_tokens=self._global.output_tokens)
-            payload["run_total"] = {"usd": self._global.usd, **self.global_tokens()}
+            payload["unpriced_calls"] = led.unpriced_calls if (solver_id or challenge_id) else self._global.unpriced_calls
+            payload["run_total"] = {"usd": self._global.usd, "unpriced_calls": self._global.unpriced_calls, **self.global_tokens()}
+            payload["run_total_scope"] = "run"
             await self.bus.emit(Event(
                 event_type=EventType.COST_UPDATE, run_id=run_id,
                 challenge_id=challenge_id, solver_id=solver_id, payload=payload))
@@ -180,11 +198,23 @@ class CostController:
         solver_id: Optional[str] = None,
         usage: Optional[dict] = None, usage_id: Optional[str] = None,
         actor_kind: str = "auxiliary", generation: Optional[int] = None, engine: str = "",
-    ) -> float:
-        """Record one LLM call's usage; emit COST_UPDATE; return its USD cost."""
-        price = self.price_for(model)
+        estimate_cost: bool = True,
+    ) -> float | None:
+        """Record usage; emit COST_UPDATE; return None when the price is unknown."""
+        price = self.price_for(model) if estimate_cost else None
         if self.usage_sink is not None:
-            inserted = self.usage_sink(usage or {"input_tokens": input_tokens, "output_tokens": output_tokens, "estimated_cost": price.cost(input_tokens, output_tokens)}, identity=usage_id, model=model, worker_id=solver_id, role=("worker" if actor_kind == "worker" else solver_id or "auxiliary"), actor_kind=actor_kind, generation=generation, engine=engine)
+            # record() charges the local price table. A CLI can supply reliable
+            # token counts and an explicit native cost of zero; that zero is not
+            # the amount this controller emits. Keep reported token metadata,
+            # but persist the same *estimated* amount as COST_UPDATE.
+            observed_usage = dict(usage or {
+                "input_tokens": input_tokens, "output_tokens": output_tokens,
+            })
+            observed_usage.pop("reported_cost", None)
+            observed_usage.pop("estimated_cost", None)
+            if price is not None:
+                observed_usage["estimated_cost"] = price.cost(input_tokens, output_tokens)
+            inserted = self.usage_sink(observed_usage, identity=usage_id, model=model, worker_id=solver_id, role=("worker" if actor_kind == "worker" else solver_id or "auxiliary"), actor_kind=actor_kind, generation=generation, engine=engine, price_source=("model_price" if price is not None else None))
             if inserted is False:
                 return 0.0
         cost = self._global.add(price, input_tokens, output_tokens)
@@ -217,7 +247,9 @@ class CostController:
                 payload = cost_payload("global", self._global.usd, self._global.tokens,
                                        input_tokens=self._global.input_tokens,
                                        output_tokens=self._global.output_tokens)
-            payload["run_total"] = {"usd": self._global.usd, **self.global_tokens()}
+            payload["unpriced_calls"] = led.unpriced_calls if (solver_id or challenge_id) else self._global.unpriced_calls
+            payload["run_total"] = {"usd": self._global.usd, "unpriced_calls": self._global.unpriced_calls, **self.global_tokens()}
+            payload["run_total_scope"] = "run"
             await self.bus.emit(
                 Event(
                     event_type=EventType.COST_UPDATE,
@@ -356,6 +388,7 @@ class CostController:
             "global_usd": round(self._global.usd, 6),
             "global_tokens": self._global.tokens,
             "calls": self._global.calls,
+            "unpriced_calls": self._global.unpriced_calls,
             "points": self._points,
             "challenges": {
                 k: round(v.usd, 6) for k, v in self._by_challenge.items()

@@ -1,3 +1,4 @@
+import { conversationStorageKey, conversationStorageScope, subscribeConversationStorageScope, subscribeBeforeConversationStorageScope, reportConversationPersistence } from "./conversationStorageScope";
 /**
  * Per-composer-session draft persistence for Conversation.
  *
@@ -8,6 +9,7 @@
  * server-confirmed sha256 refs remain sendable.
  */
 
+import { desktopChatBridge } from "./desktopChatBridge";
 import type { ComposerCapabilityRef } from "./composerCapabilities";
 
 export const COMPOSER_DRAFT_STORAGE_KEY = "muteki:composer-drafts:v2";
@@ -21,6 +23,8 @@ export type ComposerDraftAttachment = {
   mimeType?: string;
   /** Present after the file was uploaded and the server returned sha256. */
   sha256?: string;
+  /** Opaque native cache reference; never a server upload hash or filesystem path. */
+  cacheId?: string;
   /**
    * True when the File handle is gone (e.g. after refresh) and there is no
    * sha256 yet — the operator must pick the file again before send.
@@ -58,21 +62,117 @@ const emptyDraft = (): ComposerDraft => ({
   updatedAt: 0,
 });
 
-/** In-memory File handles keyed by `${draftKey}::${attachmentId}`. */
-const fileBag = new Map<string, File>();
+type AttachmentCacheJob = {
+  file: File; draftKey: string; attachmentId: string;
+  promise: Promise<ComposerPersistenceResult>; status: "pending" | "failed";
+};
 
-let memoryBucket: ComposerDraftBucket = {};
-let memoryDirty = false;
-let persistTimer: ReturnType<typeof setTimeout> | null = null;
+interface DraftMemoryState {
+  bucket: ComposerDraftBucket; dirty: boolean; timer: ReturnType<typeof setTimeout> | null;
+  pendingKeys: Set<string>; baseVersions: Map<string, string | undefined>;
+  files: Map<string, File>; jobs: Map<string, AttachmentCacheJob>;
+  cleanup: Map<string, { id: string; draftId: string }>;
+  cleaned: Set<string>; cleanupPromise: Promise<ComposerPersistenceResult> | null;
+}
+const emptyMemory = (): DraftMemoryState => ({ bucket: {}, dirty: false, timer: null, pendingKeys: new Set(), baseVersions: new Map(), files: new Map(), jobs: new Map(), cleanup: new Map(), cleaned: new Set(), cleanupPromise: null });
+let draftMemory = emptyMemory();
+const scopeMemories = new Map<string, DraftMemoryState>();
 let storageOverride: StorageLike | null = null;
+
+function notifyCache(draftKey: string, attachmentId: string, error?: string) {
+  if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("muteki:attachment-cache", { detail: { draftKey, attachmentId, error } }));
+}
+
+function cacheDraftFile(draftKey: string, attachmentId: string, file: File): void {
+  const state = draftMemory;
+  const bridge = desktopChatBridge();
+  if (!bridge) return;
+  const key = fileBagKey(draftKey, attachmentId);
+  const ownerScope = conversationStorageScope();
+  const previous = state.jobs.get(key);
+  if (previous?.file === file && previous.status !== "failed") return;
+  const job: AttachmentCacheJob = {
+    file, draftKey, attachmentId, promise: Promise.resolve({ persisted: true }), status: "pending",
+  };
+  state.jobs.set(key, job);
+  job.promise = (async (): Promise<ComposerPersistenceResult> => {
+    try {
+      if (!bridge.cacheAttachment) throw new Error("desktop.attachment.cache_unavailable: 本地附件缓存未配置");
+      if (file.size > 256 * 1024 * 1024) throw new Error("desktop.attachment.quota: 单个附件超过 256 MiB，请保留原文件并重新选择");
+      const cached = await bridge.cacheAttachment({ data: await file.arrayBuffer(), name: file.name, type: file.type, lastModified: file.lastModified, draftId: draftKey });
+      if (!cached || typeof cached.id !== "string" || !cached.id) throw new Error("desktop.attachment.invalid_reply: 附件缓存缺少身份");
+      // Late cache replies cannot restore a removed/reselected file or mutate a new draft.
+      const bucket = ownerScope === conversationStorageScope() ? readBucketFromStorage() : { ...state.bucket };
+      const draft = bucket[draftKey];
+      const attachment = draft?.attachments.find((item) => item.id === attachmentId);
+      if (attachment && state.files.get(key) === file && state.jobs.get(key) === job) {
+        bucket[draftKey] = { ...draft, attachments: draft.attachments.map((item) => item.id === attachmentId ? { ...item, cacheId: cached.id } : item) };
+        schedulePersist(bucket, state, ownerScope);
+        notifyCache(draftKey, attachmentId);
+      } else {
+        // This cache was never attached to persisted metadata. Keep cleanup durable.
+        state.cleanup.set(cached.id, { id: cached.id, draftId: draftKey });
+        schedulePersist(bucket, state, ownerScope);
+      }
+      if (state.jobs.get(key) === job) state.jobs.delete(key);
+      return { persisted: true };
+    } catch (error) {
+      const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+      if (ownerScope === conversationStorageScope() && state.files.get(key) === file && state.jobs.get(key) === job) notifyCache(draftKey, attachmentId, message);
+      if (state.jobs.get(key) === job) job.status = "failed";
+      return { persisted: false, error: message };
+    }
+  })();
+}
+
+export async function flushComposerAttachmentCache(draftKey?: string): Promise<ComposerPersistenceResult> {
+  // A quota/permission failure is retryable without making the user reselect identical bytes.
+  for (const [key, job] of draftMemory.jobs) {
+    if (job.status !== "failed" || draftMemory.files.get(key) !== job.file) continue;
+    const ownerDraft = job.draftKey, attachmentId = job.attachmentId;
+    if ((!draftKey || ownerDraft === draftKey) && readComposerDraft(ownerDraft)?.attachments.some((item) => item.id === attachmentId && !item.cacheId)) cacheDraftFile(ownerDraft, attachmentId, job.file);
+  }
+  const states = new Set([...scopeMemories.values(), draftMemory]);
+  const promises: Promise<ComposerPersistenceResult>[] = [];
+  for (const state of states) for (const [key, job] of state.jobs) {
+    if ((!draftKey || job.draftKey === draftKey) && state.files.get(key) === job.file) promises.push(job.promise);
+  }
+  const outcomes = await Promise.all(promises);
+  outcomes.push(flushComposerDraftStore());
+  const cleanups = new Map(scopeMemories); cleanups.set(conversationStorageScope(), draftMemory);
+  for (const [scope, state] of cleanups) if (scope === conversationStorageScope()) outcomes.push(await drainAttachmentCleanup(state, scope));
+  const errors = outcomes.filter((outcome) => !outcome.persisted).map((outcome) => outcome.error || "desktop.attachment.cache_failed");
+  return errors.length ? { persisted: false, error: errors.join("\n") } : { persisted: true };
+}
+
+export async function restoreComposerDraftAttachments(draftKey: string): Promise<ReturnType<typeof hydrateComposerDraft>> {
+  const bridge = desktopChatBridge();
+  const draft = readComposerDraft(draftKey);
+  const ownerScope = conversationStorageScope();
+  if (bridge?.restoreAttachment && draft) {
+    await Promise.all(draft.attachments.map(async (item) => {
+      const key = fileBagKey(draftKey, item.id);
+      if (!item.cacheId || draftMemory.files.has(key) || item.sha256) return;
+      try {
+        const cached = await bridge.restoreAttachment!({ id: item.cacheId, draftId: draftKey });
+        if (ownerScope !== conversationStorageScope()) return;
+        const current = readComposerDraft(draftKey)?.attachments.find((entry) => entry.id === item.id);
+        if (current?.cacheId !== item.cacheId || draftMemory.files.has(key)) return;
+        draftMemory.files.set(key, new File([cached.data], cached.name, { type: cached.type, lastModified: cached.lastModified }));
+        notifyCache(draftKey, item.id);
+      } catch (error) { notifyCache(draftKey, item.id, error instanceof Error ? error.message : String(error)); }
+    }));
+  }
+  return hydrateComposerDraft(draftKey);
+}
 
 function fileBagKey(draftKey: string, attachmentId: string): string {
   return `${draftKey}::${attachmentId}`;
 }
 
-function getStorage(): StorageLike | null {
+function getStorage(ownerScope = conversationStorageScope()): StorageLike | null {
   if (storageOverride) return storageOverride;
-  if (typeof window === "undefined") return null;
+  if (typeof window === "undefined" || !ownerScope) return null;
   try {
     return window.localStorage;
   } catch {
@@ -98,13 +198,49 @@ function parseDraftBucket(raw: string | null): ComposerDraftBucket {
   return next;
 }
 
+function parseCacheCleanup(raw: string | null): Array<{ id: string; draftId: string }> {
+  if (!raw) return [];
+  const row: unknown = JSON.parse(raw);
+  const entries = row && typeof row === "object" ? (row as Record<string, unknown>).cacheCleanup : null;
+  return Array.isArray(entries) ? entries.filter((entry): entry is { id: string; draftId: string } => Boolean(entry && typeof entry.id === "string" && entry.id && typeof entry.draftId === "string" && entry.draftId)) : [];
+}
+
+async function drainAttachmentCleanup(state: DraftMemoryState, ownerScope: string): Promise<ComposerPersistenceResult> {
+  if (state.cleanupPromise) return state.cleanupPromise;
+  if (state.dirty || !state.cleanup.size || ownerScope !== conversationStorageScope()) return { persisted: true };
+  const bridge = desktopChatBridge();
+  if (!bridge?.removeAttachment) return { persisted: false, error: "desktop.attachment.cleanup_unavailable: 本地附件缓存清理未配置" };
+  state.cleanupPromise = (async () => {
+    const errors: string[] = [];
+    for (const [id, entry] of Array.from(state.cleanup)) {
+      if (ownerScope !== conversationStorageScope() || state.dirty) break;
+      // Metadata owns liveness. Re-added references cancel deletion, including other windows.
+      try {
+        const storage = getStorage(ownerScope);
+        if (!storage) throw new Error("draft.storage.unavailable: 无法核对缓存元数据");
+        const persisted = parseDraftBucket(storage.getItem(conversationStorageKey(COMPOSER_DRAFT_STORAGE_KEY, ownerScope)));
+        if (persisted[entry.draftId]?.attachments.some((item) => item.cacheId === id)) { state.cleanup.delete(id); state.cleaned.add(id); continue; }
+        await bridge.removeAttachment!({ id, draftId: entry.draftId });
+        state.cleanup.delete(id); state.cleaned.add(id);
+      } catch (error) { errors.push(error instanceof Error ? `${error.name}: ${error.message}` : String(error)); }
+    }
+    if (state.cleaned.size && !state.dirty) {
+      const result = writeBucketToStorage(state.bucket, state, ownerScope);
+      if (!result.persisted) errors.push(result.error || "附件清理记录保存失败");
+    }
+    if (errors.length) reportConversationPersistence("attachment-cache", errors.join("\n"));
+    return errors.length ? { persisted: false, error: errors.join("\n") } : { persisted: true };
+  })();
+  try { return await state.cleanupPromise; } finally { state.cleanupPromise = null; }
+}
+
 function migrateV1Drafts(storage: StorageLike): ComposerDraftBucket {
   try {
-    const v1 = parseDraftBucket(storage.getItem(COMPOSER_DRAFT_STORAGE_KEY_V1));
+    const v1 = parseDraftBucket(storage.getItem(conversationStorageKey(COMPOSER_DRAFT_STORAGE_KEY_V1)));
     if (!Object.keys(v1).length) return {};
     // Promote v1 → v2 once, then leave v1 in place for older tabs.
     storage.setItem(
-      COMPOSER_DRAFT_STORAGE_KEY,
+      conversationStorageKey(COMPOSER_DRAFT_STORAGE_KEY),
       JSON.stringify({ drafts: v1 }),
     );
     return v1;
@@ -115,57 +251,85 @@ function migrateV1Drafts(storage: StorageLike): ComposerDraftBucket {
 
 function readBucketFromStorage(): ComposerDraftBucket {
   // In-memory bucket may be ahead of the debounced disk write.
-  if (memoryDirty) return { ...memoryBucket };
+  if (draftMemory.dirty) return { ...draftMemory.bucket };
   const storage = getStorage();
-  if (!storage) return { ...memoryBucket };
+  if (!storage) return { ...draftMemory.bucket };
   try {
-    let next = parseDraftBucket(storage.getItem(COMPOSER_DRAFT_STORAGE_KEY));
-    if (!Object.keys(next).length) {
-      next = migrateV1Drafts(storage);
+    const raw = storage.getItem(conversationStorageKey(COMPOSER_DRAFT_STORAGE_KEY));
+    const next = raw === null ? migrateV1Drafts(storage) : parseDraftBucket(raw);
+    draftMemory.bucket = next;
+    for (const entry of parseCacheCleanup(raw)) if (!draftMemory.cleaned.has(entry.id)) draftMemory.cleanup.set(entry.id, entry);
+    void drainAttachmentCleanup(draftMemory, conversationStorageScope());
+    return { ...draftMemory.bucket };
+  } catch {
+    return { ...draftMemory.bucket };
+  }
+}
+
+export type ComposerPersistenceResult = { persisted: boolean; error?: string };
+
+function writeBucketToStorage(bucket: ComposerDraftBucket, state = draftMemory, ownerScope = conversationStorageScope()): ComposerPersistenceResult {
+  state.bucket = { ...bucket };
+  state.dirty = true;
+  const storage = getStorage(ownerScope);
+  if (!storage) return { persisted: false, error: "draft.storage.unavailable: 本地草稿存储不可用" };
+  try {
+    // Merge only keys edited by this renderer into the latest persisted bucket.
+    // A delayed flush must not overwrite drafts saved by another window.
+    const raw = storage.getItem(conversationStorageKey(COMPOSER_DRAFT_STORAGE_KEY, ownerScope));
+    const merged = parseDraftBucket(raw);
+    for (const entry of parseCacheCleanup(raw)) if (!state.cleaned.has(entry.id)) state.cleanup.set(entry.id, entry);
+    for (const key of state.pendingKeys) {
+      if (JSON.stringify(merged[key]) !== state.baseVersions.get(key)) throw new Error(`draft.storage.conflict: 草稿 ${key} 已在另一窗口更新；当前编辑保留在内存，请先暂存或复制后另存`);
+      if (state.bucket[key]) merged[key] = state.bucket[key];
+      else delete merged[key];
     }
-    memoryBucket = next;
-    return { ...memoryBucket };
-  } catch {
-    return { ...memoryBucket };
+    storage.setItem(conversationStorageKey(COMPOSER_DRAFT_STORAGE_KEY, ownerScope), JSON.stringify({ drafts: merged, cacheCleanup: Array.from(state.cleanup.values()) }));
+    state.bucket = merged;
+    state.dirty = false;
+    state.pendingKeys.clear();
+    state.baseVersions.clear();
+    state.cleaned.clear();
+    if (!state.cleanupPromise) void drainAttachmentCleanup(state, ownerScope);
+    return { persisted: true };
+  } catch (error) {
+    return { persisted: false, error: error instanceof Error ? `${error.name}: ${error.message}` : String(error) };
   }
 }
 
-function writeBucketToStorage(bucket: ComposerDraftBucket): void {
-  memoryBucket = { ...bucket };
-  memoryDirty = false;
-  const storage = getStorage();
-  if (!storage) return;
-  try {
-    storage.setItem(
-      COMPOSER_DRAFT_STORAGE_KEY,
-      JSON.stringify({ drafts: memoryBucket }),
-    );
-  } catch {
-    // Quota / private mode — keep memory copy only.
+function schedulePersist(bucket: ComposerDraftBucket, state = draftMemory, ownerScope = conversationStorageScope()): void {
+  for (const key of new Set([...Object.keys(state.bucket), ...Object.keys(bucket)])) {
+    if (JSON.stringify(state.bucket[key]) !== JSON.stringify(bucket[key])) {
+      for (const item of state.bucket[key]?.attachments || []) {
+        if (item.cacheId && !bucket[key]?.attachments.some((next) => next.cacheId === item.cacheId)) state.cleanup.set(item.cacheId, { id: item.cacheId, draftId: key });
+      }
+      if (!state.pendingKeys.has(key)) state.baseVersions.set(key, JSON.stringify(state.bucket[key]));
+      state.pendingKeys.add(key);
+    }
   }
-}
-
-function schedulePersist(bucket: ComposerDraftBucket): void {
-  memoryBucket = { ...bucket };
-  memoryDirty = true;
+  state.bucket = { ...bucket };
+  state.dirty = true;
   if (typeof window === "undefined" && !storageOverride) return;
-  if (persistTimer) clearTimeout(persistTimer);
-  persistTimer = setTimeout(() => {
-    persistTimer = null;
-    writeBucketToStorage(memoryBucket);
+  if (state.timer) clearTimeout(state.timer);
+  state.timer = setTimeout(() => {
+    state.timer = null;
+    const result = writeBucketToStorage(state.bucket, state, ownerScope);
+    if (!result.persisted) reportConversationPersistence("composer", result.error || "草稿保存失败");
   }, PERSIST_DEBOUNCE_MS);
 }
 
 /** Flush pending debounced writes (call on beforeunload / tests). */
-export function flushComposerDraftStore(): void {
-  if (persistTimer) {
-    clearTimeout(persistTimer);
-    persistTimer = null;
+export function flushComposerDraftStore(): ComposerPersistenceResult {
+  const states = new Map(scopeMemories);
+  states.set(conversationStorageScope(), draftMemory);
+  const errors: string[] = [];
+  for (const [scope, state] of states) {
+    if (state.timer) { clearTimeout(state.timer); state.timer = null; }
+    if (!state.dirty) continue;
+    const result = writeBucketToStorage(state.bucket, state, scope);
+    if (!result.persisted) errors.push(result.error || "草稿保存失败");
   }
-  // Avoid clobbering disk when this JS realm never wrote a draft (e.g. empty
-  // module state flushing on unload after an external localStorage update).
-  if (!memoryDirty) return;
-  writeBucketToStorage(memoryBucket);
+  return errors.length ? { persisted: false, error: errors.join("\n") } : { persisted: true };
 }
 
 export function composerDraftKey(threadId: string, draftParam = ""): string {
@@ -260,6 +424,7 @@ function normalizeAttachments(value: unknown): ComposerDraftAttachment[] {
     const sizeRaw = row.size;
     const size = typeof sizeRaw === "number" && Number.isFinite(sizeRaw) ? sizeRaw : undefined;
     const mimeType = String(row.mimeType || "").trim() || undefined;
+    const cacheId = typeof row.cacheId === "string" ? row.cacheId : "";
     const needsReselect = Boolean(row.needsReselect) && !sha256;
     out.push({
       id,
@@ -267,6 +432,7 @@ function normalizeAttachments(value: unknown): ComposerDraftAttachment[] {
       ...(size !== undefined ? { size } : {}),
       ...(mimeType ? { mimeType } : {}),
       ...(sha256 ? { sha256 } : {}),
+      ...(cacheId ? { cacheId } : {}),
       ...(needsReselect ? { needsReselect: true } : {}),
     });
   }
@@ -319,6 +485,7 @@ export type ComposerDraftWriteInput = {
     mimeType?: string;
     type?: string;
     sha256?: string;
+    cacheId?: string;
     needsReselect?: boolean;
     file?: File;
   }>;
@@ -343,17 +510,21 @@ function newAttachmentId(): string {
  * the in-memory bag for same-tab thread switches.
  */
 export function writeComposerDraft(draftKey: string, input: ComposerDraftWriteInput): ComposerDraft | null {
+  if (!storageOverride && !conversationStorageScope()) return null;
   const key = String(draftKey || "").trim();
   if (!key) return null;
 
+  const oldDraft = readComposerDraft(key);
   const attachments: ComposerDraftAttachment[] = input.attachments.map((item) => {
     const id = String(item.id || "").trim() || newAttachmentId();
     const sha256 = String(item.sha256 || "").trim();
     const mimeType = String(item.mimeType || item.type || item.file?.type || "").trim();
+    const oldFile = draftMemory.files.get(fileBagKey(key, id));
+    const cacheId = item.cacheId || ((!item.file || oldFile === item.file) ? oldDraft?.attachments.find((row) => row.id === id)?.cacheId : undefined);
     if (item.file) {
-      fileBag.set(fileBagKey(key, id), item.file);
+      draftMemory.files.set(fileBagKey(key, id), item.file);
     }
-    const hasFile = fileBag.has(fileBagKey(key, id)) || Boolean(item.file);
+    const hasFile = draftMemory.files.has(fileBagKey(key, id)) || Boolean(item.file);
     const needsReselect = !sha256 && !hasFile;
     return {
       id,
@@ -361,15 +532,17 @@ export function writeComposerDraft(draftKey: string, input: ComposerDraftWriteIn
       ...(typeof item.size === "number" ? { size: item.size } : item.file ? { size: item.file.size } : {}),
       ...(mimeType ? { mimeType } : {}),
       ...(sha256 ? { sha256 } : {}),
+      ...(cacheId ? { cacheId } : {}),
       ...(needsReselect ? { needsReselect: true } : {}),
     };
   });
 
   // Drop file-bag entries removed from this draft.
   const keep = new Set(attachments.map((item) => fileBagKey(key, item.id)));
-  for (const bagKey of Array.from(fileBag.keys())) {
+  for (const bagKey of Array.from(draftMemory.files.keys())) {
     if (bagKey.startsWith(`${key}::`) && !keep.has(bagKey)) {
-      fileBag.delete(bagKey);
+      draftMemory.files.delete(bagKey);
+      draftMemory.jobs.delete(bagKey);
     }
   }
 
@@ -402,8 +575,8 @@ export function writeComposerDraft(draftKey: string, input: ComposerDraftWriteIn
   const bucket = readBucketFromStorage();
   if (isComposerDraftEmpty(draft)) {
     delete bucket[key];
-    for (const bagKey of Array.from(fileBag.keys())) {
-      if (bagKey.startsWith(`${key}::`)) fileBag.delete(bagKey);
+    for (const bagKey of Array.from(draftMemory.files.keys())) {
+      if (bagKey.startsWith(`${key}::`)) { draftMemory.files.delete(bagKey); draftMemory.jobs.delete(bagKey); }
     }
     schedulePersist(bucket);
     return null;
@@ -411,6 +584,9 @@ export function writeComposerDraft(draftKey: string, input: ComposerDraftWriteIn
 
   bucket[key] = draft;
   schedulePersist(bucket);
+  for (const [index, item] of input.attachments.entries()) {
+    if (item.file && !attachments[index].cacheId) cacheDraftFile(key, attachments[index].id, item.file);
+  }
   return draft;
 }
 
@@ -419,28 +595,28 @@ export function clearComposerDraft(draftKey: string): void {
   if (!key) return;
   const bucket = readBucketFromStorage();
   delete bucket[key];
-  for (const bagKey of Array.from(fileBag.keys())) {
-    if (bagKey.startsWith(`${key}::`)) fileBag.delete(bagKey);
+  for (const bagKey of Array.from(draftMemory.files.keys())) {
+    if (bagKey.startsWith(`${key}::`)) { draftMemory.files.delete(bagKey); draftMemory.jobs.delete(bagKey); }
   }
   schedulePersist(bucket);
 }
 
 /** Clear every composer draft (logout / auth lock). */
 export function clearAllComposerDrafts(): void {
-  if (persistTimer) {
-    clearTimeout(persistTimer);
-    persistTimer = null;
+  if (draftMemory.timer) {
+    clearTimeout(draftMemory.timer);
+    draftMemory.timer = null;
   }
-  memoryBucket = {};
-  memoryDirty = false;
-  fileBag.clear();
+  draftMemory.files.clear();
+  draftMemory.jobs.clear();
+  schedulePersist({});
+  const result = flushComposerDraftStore();
+  if (!result.persisted) { reportConversationPersistence("composer", result.error || "草稿清空保存失败"); return; }
   const storage = getStorage();
   if (!storage) return;
   try {
-    storage.removeItem(COMPOSER_DRAFT_STORAGE_KEY);
-  } catch {
-    // ignore
-  }
+    storage.removeItem(conversationStorageKey(COMPOSER_DRAFT_STORAGE_KEY_V1));
+  } catch (error) { reportConversationPersistence("composer", error instanceof Error ? error.message : String(error)); }
 }
 
 export type HydratedComposerAttachment = ComposerDraftAttachment & {
@@ -460,7 +636,7 @@ export function hydrateComposerDraft(draftKey: string): {
   }
   let restoredNeedsReselect = false;
   const attachments: HydratedComposerAttachment[] = draft.attachments.map((item) => {
-    const file = fileBag.get(fileBagKey(draftKey, item.id));
+    const file = draftMemory.files.get(fileBagKey(draftKey, item.id));
     if (file) {
       return {
         ...item,
@@ -495,12 +671,24 @@ export function hydrateComposerDraft(draftKey: string): {
 
 /** Test helper: inject storage and reset memory. */
 export function __resetComposerDraftStoreForTests(storage?: StorageLike | null): void {
-  if (persistTimer) {
-    clearTimeout(persistTimer);
-    persistTimer = null;
+  if (draftMemory.timer) {
+    clearTimeout(draftMemory.timer);
+    draftMemory.timer = null;
   }
-  memoryBucket = {};
-  memoryDirty = false;
-  fileBag.clear();
+  draftMemory.bucket = {};
+  draftMemory.dirty = false;
+  draftMemory.pendingKeys.clear();
+  draftMemory.baseVersions.clear();
+  draftMemory.files.clear();
+  draftMemory.jobs.clear();
+  draftMemory.cleanup.clear(); draftMemory.cleaned.clear(); draftMemory.cleanupPromise = null;
   storageOverride = storage === undefined ? null : storage;
 }
+
+subscribeBeforeConversationStorageScope(() => {
+  flushComposerDraftStore();
+  scopeMemories.set(conversationStorageScope(), draftMemory);
+});
+subscribeConversationStorageScope(() => {
+  draftMemory = scopeMemories.get(conversationStorageScope()) || emptyMemory();
+});

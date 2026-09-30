@@ -159,7 +159,7 @@ class ConversationStore:
     # -- Turn ---------------------------------------------------------------
 
     def save_turn(self, turn: TurnRecord) -> TurnRecord:
-        with self._lock, self._conn:
+        with self._store.transaction():
             self._execute(
                 "INSERT INTO conv_turns (turn_id, thread_id, seq, status, "
                 "command_id, idempotency_key, payload) VALUES (?,?,?,?,?,?,?) "
@@ -172,7 +172,7 @@ class ConversationStore:
 
     def commit_history_rewind(self, turns: list[TurnRecord], runs: list[TurnRunRef], state: ThreadState) -> None:
         """Commit branch visibility, run states and thread state in one transaction."""
-        with self._lock, self._conn:
+        with self._store.transaction():
             for turn in turns:
                 self._execute("UPDATE conv_turns SET status=?, payload=? WHERE turn_id=?",
                               (turn.status, self._dump(turn), turn.turn_id))
@@ -225,7 +225,7 @@ class ConversationStore:
         """原子领取 Thread 执行权；终态遗留 claim 会在本次领取前清理。"""
         from muteki.platform.contracts.base import utcnow
 
-        with self._lock, self._conn:
+        with self._store.transaction():
             row = self._fetchone(
                 "SELECT turn_id FROM conv_active_turn_claims WHERE thread_id = ?",
                 (thread_id,),
@@ -253,7 +253,7 @@ class ConversationStore:
                 ) from exc
 
     def release_active_turn(self, thread_id: str, turn_id: str = "") -> bool:
-        with self._lock, self._conn:
+        with self._store.transaction():
             if turn_id:
                 cursor = self._execute(
                     "DELETE FROM conv_active_turn_claims "
@@ -318,7 +318,7 @@ class ConversationStore:
 
     def enqueue_turn(self, item: QueuedTurnRequest) -> tuple[QueuedTurnRequest, bool]:
         """幂等入队；返回（队列项，是否新建）。"""
-        with self._lock, self._conn:
+        with self._store.transaction():
             if item.idempotency_key:
                 row = self._fetchone(
                     "SELECT payload FROM conv_turn_queue WHERE thread_id = ? "
@@ -375,7 +375,7 @@ class ConversationStore:
     def save_queue_item(
         self, item: QueuedTurnRequest, *, bump_revision: bool = True
     ) -> QueuedTurnRequest:
-        with self._lock, self._conn:
+        with self._store.transaction():
             self._execute(
                 "UPDATE conv_turn_queue SET position = ?, status = ?, payload = ? "
                 "WHERE queue_id = ?",
@@ -389,10 +389,13 @@ class ConversationStore:
         runtime: Optional[dict[str, Any]] = None,
         capability_refs: Optional[list[dict[str, Any]]] = None,
         runtime_invocation: Optional[dict[str, Any]] = None,
+        expected_revision: Optional[int] = None,
     ) -> QueuedTurnRequest:
         # Do not let a concurrent promotion/cancellation slip between the state
         # check and save and resurrect a consumed item as a queued draft.
-        with self._lock:
+        with self._store.transaction():
+            if expected_revision is not None and self.get_state(thread_id).queue_revision != expected_revision:
+                raise ValueError("队列版本已改变，请刷新后比较当前正文与编辑草稿")
             item = self.get_queue_item(queue_id)
             if item is None or item.thread_id != thread_id:
                 raise LookupError(f"unknown queue item: {queue_id}")
@@ -421,7 +424,7 @@ class ConversationStore:
     def reorder_queue(
         self, thread_id: str, queue_ids: list[str], *, expected_revision: Optional[int] = None
     ) -> list[QueuedTurnRequest]:
-        with self._lock, self._conn:
+        with self._store.transaction():
             state = self.get_state(thread_id)
             if expected_revision is not None and expected_revision != state.queue_revision:
                 raise ValueError("队列已变化，请刷新后重试")
@@ -472,7 +475,7 @@ class ConversationStore:
         updated = item.model_copy(update={
             "status": "failed", "error": error, "updated_at": utcnow(),
         })
-        with self._lock, self._conn:
+        with self._store.transaction():
             self._execute(
                 "UPDATE conv_turn_queue SET status = ?, payload = ? WHERE queue_id = ?",
                 (updated.status, self._dump(updated), queue_id),
@@ -491,7 +494,7 @@ class ConversationStore:
         )
 
     def resume_queue(self, thread_id: str) -> ThreadState:
-        with self._lock, self._conn:
+        with self._store.transaction():
             for item in self.list_queue(thread_id):
                 if item.status != "failed":
                     continue
@@ -513,7 +516,7 @@ class ConversationStore:
     # -- Run -----------------------------------------------------------------
 
     def save_run(self, run: TurnRunRef) -> TurnRunRef:
-        with self._lock, self._conn:
+        with self._store.transaction():
             self._execute(
                 "INSERT INTO conv_runs (run_id, turn_id, thread_id, generation, "
                 "status, payload) VALUES (?,?,?,?,?,?) "
@@ -548,7 +551,7 @@ class ConversationStore:
     # -- 消息 -------------------------------------------------------------------
 
     def save_message(self, message: ConversationMessage) -> ConversationMessage:
-        with self._lock, self._conn:
+        with self._store.transaction():
             self._execute(
                 "INSERT OR REPLACE INTO conv_messages (message_id, thread_id, "
                 "turn_id, role, stream_seq, payload) VALUES (?,?,?,?,?,?)",
@@ -750,7 +753,7 @@ class ConversationStore:
 
     def backfill_message_fts(self) -> int:
         """Rebuild FTS from conv_messages payloads. Returns indexed row count."""
-        with self._lock, self._conn:
+        with self._store.transaction():
             self._execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS conv_messages_fts USING fts5("
                 " message_id UNINDEXED,"
@@ -823,6 +826,7 @@ class ConversationStore:
         limit: int = 30,
         include_superseded: bool = False,
         thread_ids: Optional[list[str]] = None,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         """Full-text search over projected message bodies (C07).
 
@@ -832,7 +836,7 @@ class ConversationStore:
         q = str(query or "").strip()
         if not q:
             return []
-        page_limit = max(1, min(int(limit), 100))
+        page_limit = max(1, min(int(limit), 101))
         self._ensure_message_fts()
 
         clauses: list[str] = []
@@ -866,13 +870,15 @@ class ConversationStore:
             clauses.append(f"thread_id IN ({placeholders})")
             params.extend(list(thread_ids))
 
-        params.append(page_limit)
+        params.extend([page_limit, max(0, int(offset))])
         where = " AND ".join(clauses)
         rows = self._fetchall(
             "SELECT message_id, thread_id, turn_id, role, stream_seq, text "
             "FROM conv_messages_fts "
             f"WHERE {where} "
-            "ORDER BY stream_seq DESC LIMIT ?",
+            "ORDER BY (SELECT json_extract(m.payload,'$.created_at') FROM conv_messages m "
+            "WHERE m.message_id=conv_messages_fts.message_id) DESC, "
+            "stream_seq DESC, message_id DESC LIMIT ? OFFSET ?",
             params,
         )
 
@@ -915,7 +921,7 @@ class ConversationStore:
     def save_runtime_selection(
         self, selection: ThreadRuntimeSelection
     ) -> ThreadRuntimeSelection:
-        with self._lock, self._conn:
+        with self._store.transaction():
             self._execute(
                 "INSERT OR REPLACE INTO conv_thread_runtime (thread_id, payload) "
                 "VALUES (?,?)", (selection.thread_id, self._dump(selection)))
@@ -942,7 +948,7 @@ class ConversationStore:
         ]
 
     def delete_runtime_selection(self, thread_id: str) -> bool:
-        with self._lock, self._conn:
+        with self._store.transaction():
             cursor = self._execute(
                 "DELETE FROM conv_thread_runtime WHERE thread_id = ?",
                 (thread_id,),
@@ -952,7 +958,7 @@ class ConversationStore:
     # -- Thread 读模型 -------------------------------------------------------------
 
     def save_state(self, state: ThreadState) -> ThreadState:
-        with self._lock, self._conn:
+        with self._store.transaction():
             self._execute(
                 "INSERT OR REPLACE INTO conv_thread_state (thread_id, payload) "
                 "VALUES (?,?)", (state.thread_id, self._dump(state)))
@@ -1020,7 +1026,7 @@ class ConversationStore:
         import json as _json
         from muteki.platform.store import OptimisticConcurrencyError
 
-        with self._lock, self._conn:
+        with self._store.transaction():
             row = self._fetchone(
                 "SELECT version FROM conv_sidebar_prefs WHERE pref_key = ?",
                 (key,),

@@ -1,3 +1,4 @@
+import { conversationStorageKey, conversationStorageScope, subscribeConversationStorageScope, subscribeBeforeConversationStorageScope, reportConversationPersistence } from "./conversationStorageScope";
 /**
  * Per-thread answer drafts for pending Conversation user-input cards (C22).
  *
@@ -24,15 +25,16 @@ type DraftBucket = Record<string, UserInputDraft>;
 type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 
 let memoryBucket: DraftBucket = {};
+const pending = new Map<string, UserInputDraft | null>();
 let storageOverride: StorageLike | null = null;
 
 function draftKey(threadId: string, requestId: string): string {
   return `${threadId}::${requestId}`;
 }
 
-function getStorage(): StorageLike | null {
+function getStorage(ownerScope = conversationStorageScope()): StorageLike | null {
   if (storageOverride) return storageOverride;
-  if (typeof window === "undefined") return null;
+  if (typeof window === "undefined" || !ownerScope) return null;
   try {
     return window.localStorage;
   } catch {
@@ -41,10 +43,11 @@ function getStorage(): StorageLike | null {
 }
 
 function readBucket(): DraftBucket {
+  if (pending.size) return { ...memoryBucket };
   const storage = getStorage();
   if (!storage) return { ...memoryBucket };
   try {
-    const raw = storage.getItem(USER_INPUT_DRAFT_STORAGE_KEY);
+    const raw = storage.getItem(conversationStorageKey(USER_INPUT_DRAFT_STORAGE_KEY));
     if (!raw) return { ...memoryBucket };
     const parsed: unknown = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -79,18 +82,34 @@ function readBucket(): DraftBucket {
   }
 }
 
-function writeBucket(bucket: DraftBucket): void {
-  memoryBucket = { ...bucket };
-  const storage = getStorage();
-  if (!storage) return;
-  try {
-    storage.setItem(
-      USER_INPUT_DRAFT_STORAGE_KEY,
-      JSON.stringify({ drafts: memoryBucket }),
-    );
-  } catch {
-    // Quota / private mode — keep memory copy only.
+function writeBucket(bucket: DraftBucket, journal = pending, ownerScope = conversationStorageScope()): { persisted: boolean; error?: string } {
+  if (journal === pending) for (const key of new Set([...Object.keys(memoryBucket), ...Object.keys(bucket)])) {
+    if (JSON.stringify(memoryBucket[key]) !== JSON.stringify(bucket[key])) pending.set(key, bucket[key] || null);
   }
+  if (journal === pending) memoryBucket = { ...bucket };
+  const storage = getStorage(ownerScope);
+  if (!storage) return { persisted: false, error: "answer.storage.unavailable: 回答草稿存储不可用" };
+  try {
+    const raw = storage.getItem(conversationStorageKey(USER_INPUT_DRAFT_STORAGE_KEY, ownerScope));
+    const parsed = raw ? JSON.parse(raw) : {};
+    const merged: DraftBucket = parsed.drafts && typeof parsed.drafts === "object" ? { ...parsed.drafts } : {};
+    for (const [key, draft] of journal) { if (draft) merged[key] = draft; else delete merged[key]; }
+    storage.setItem(conversationStorageKey(USER_INPUT_DRAFT_STORAGE_KEY, ownerScope), JSON.stringify({ drafts: merged }));
+    if (journal === pending) memoryBucket = merged;
+    journal.clear();
+    return { persisted: true };
+  } catch (error) {
+    const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+    reportConversationPersistence("user-input", message);
+    return { persisted: false, error: message };
+  }
+}
+
+export function flushUserInputDraftStore(): { persisted: boolean; error?: string } {
+  const results = [pending.size ? writeBucket(memoryBucket) : { persisted: true }];
+  for (const [scope, snapshot] of scopedAnswers) if (scope !== conversationStorageScope() && snapshot.edits.size) results.push(writeBucket(snapshot.bucket, snapshot.edits, scope));
+  const errors = results.filter((row) => !row.persisted).map((row) => row.error || "回答草稿保存失败");
+  return errors.length ? { persisted: false, error: errors.join("\n") } : { persisted: true };
 }
 
 export function loadUserInputDraft(
@@ -146,4 +165,15 @@ export function clearUserInputDraft(threadId: string, requestId?: string): void 
 export function _resetUserInputDraftStoreForTests(storage: StorageLike | null = null): void {
   storageOverride = storage;
   memoryBucket = {};
+  pending.clear();
 }
+
+const scopedAnswers = new Map<string, { bucket: DraftBucket; edits: typeof pending }>();
+subscribeBeforeConversationStorageScope(() => {
+  flushUserInputDraftStore();
+  scopedAnswers.set(conversationStorageScope(), { bucket: memoryBucket, edits: new Map(pending) });
+});
+subscribeConversationStorageScope(() => {
+  const old = scopedAnswers.get(conversationStorageScope()); memoryBucket = old?.bucket || {}; pending.clear();
+  for (const [key, value] of old?.edits || []) pending.set(key, value);
+});

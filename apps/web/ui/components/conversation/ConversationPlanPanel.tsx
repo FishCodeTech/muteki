@@ -253,7 +253,7 @@ export function ConversationPlanPanel({
         <EmptyState
           icon="listTodo"
           title={supported ? "等待 Agent 上报计划" : "还没有计划"}
-          description="只展示 Adapter 上报的结构化计划，不会把回复正文里的待办当成真实进度。"
+          description="这里显示当前 Agent 接入上报的结构化计划。回复正文中的待办不会自动计入执行进度。"
         />
       </div>
     );

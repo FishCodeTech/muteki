@@ -1383,7 +1383,7 @@ class OpenCodeServerAdapter(BaseExternalAgentAdapter):
         )
 
     async def _teardown(self, session: AgentSessionRef) -> str:
-        handle = self._sessions.pop(session.agent_session_id, None)
+        handle = self._sessions.get(session.agent_session_id)
         if not handle:
             return "closed"
         stop = handle.get("sse_stop")
@@ -1396,6 +1396,7 @@ class OpenCodeServerAdapter(BaseExternalAgentAdapter):
         if client is not None:
             await client.close()
         returncode = await self._stop_server(handle.get("proc"))
+        self._sessions.pop(session.agent_session_id, None)
         return classify_exit(
             returncode=returncode if handle.get("proc") is not None else None,
             cancelled=handle.get("current_turn_id") is not None,

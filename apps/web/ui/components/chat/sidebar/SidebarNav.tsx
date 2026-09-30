@@ -129,6 +129,11 @@ export function SidebarNav({
   className = "",
   bodyHits = [],
   bodyHitsLoading = false,
+  bodyHitsLoadingMore = false,
+  bodyHitsError = "",
+  bodyHitsHasMore = false,
+  onLoadMoreBodyHits,
+  onRetryBodyHits,
   includeSuperseded = false,
   onIncludeSupersededChange,
   onSelectBodyHit,
@@ -788,6 +793,11 @@ export function SidebarNav({
           <SearchHits
             hits={bodyHits}
             loading={bodyHitsLoading}
+            loadingMore={bodyHitsLoadingMore}
+            error={bodyHitsError}
+            hasMore={bodyHitsHasMore}
+            onLoadMore={onLoadMoreBodyHits}
+            onRetry={onRetryBodyHits}
             activeId={activeId}
             includeSuperseded={includeSuperseded}
             onIncludeSupersededChange={onIncludeSupersededChange}

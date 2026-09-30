@@ -633,6 +633,27 @@ async def reason_collect_stage(self, state) -> str:
 
 async def reason_result_stage(self, state) -> str:
     emit_bb = partial(emit_scheduler_bb, self, state)
+    if (self.cost_budget_usd is not None and self.cost is not None
+            and self.cost.snapshot()["unpriced_calls"]):
+        state.runtime_terminal_failure = True
+        self._runtime_failure_code = "budget_coverage_incomplete"
+        self._runtime_failure_phase = "usage_settlement"
+        self._runtime_failure_detail = (
+            "本 Run 出现未定价或不完整用量，无法继续执行美元预算；请取消美元预算或新建 Run"
+        )
+        await emit_bb(
+            "budget_coverage_incomplete", code="budget_coverage_incomplete",
+            detail=self._runtime_failure_detail,
+        )
+        if state.reason_task is not None and not state.reason_task.done():
+            state.reason_task.cancel()
+        if state.pentest_review_task is not None and not state.pentest_review_task.done():
+            state.pentest_review_task.cancel()
+        for task, solver in list(state.task_solvers.items()):
+            if not task.done():
+                self._cancel_solver(solver)
+                task.cancel()
+        return "break"
     ctf_mode = getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
     if state.reason_result_ready:
         state.reason_result_ready = False
@@ -774,7 +795,7 @@ async def reason_result_stage(self, state) -> str:
                     fact_seqs=citations,
                     reason=str(getattr(rr, "complete_why", "") or ""),
                 )
-                if committed > 0 or self._findings_complete():
+                if self._findings_complete():
                     state.goal_complete = True
                     await emit_bb(
                         "goal_complete",
@@ -785,6 +806,17 @@ async def reason_result_stage(self, state) -> str:
                         self._cancel_solver(state.task_solvers.get(other))
                         other.cancel()
                     return "break"
+                contract = getattr(self.challenge, "pentest_contract", None)
+                if (contract is not None and contract.version >= 2
+                        and contract.report_goal_mode == "automatic"):
+                    from muteki.pentest.judgement import submitted_reports
+                    if any(item.get("review_status") == "pending" for item in
+                           submitted_reports(self.shared_graph.events(), contract)):
+                        await emit_bb(
+                            "goal_completion_deferred",
+                            reason="pending_report_reviews",
+                        )
+                        return "continue"
                 await emit_bb(
                     "goal_complete_rejected",
                     reason="cited Fact provenance or scope is invalid",

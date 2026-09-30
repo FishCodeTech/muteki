@@ -64,6 +64,9 @@ class CliDriver(abc.ABC):
     # Scheduler-visible capability: exact secret context may only select drivers
     # that guarantee stdin transport AND non-persistent CLI state.
     secure_prompt_transport = False
+    # A non-secret prompt may be piped without disabling the CLI's persisted
+    # session. Drivers must opt in only when their print mode supports this.
+    persistent_stdin_prompt = False
     # Scheduler-visible capability: ``web_access=False`` is meaningful only when
     # this transport can make the worker's native web tools unavailable.  Keep
     # this separate from endpoint choice: a Claude CLI pointed at an Anthropic-

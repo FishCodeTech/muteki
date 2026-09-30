@@ -1114,15 +1114,13 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
         })
 
     async def _teardown(self, session: AgentSessionRef) -> str:
-        ctx = self._runs.pop(session.agent_session_id, None)
+        ctx = self._runs.get(session.agent_session_id)
         if not ctx:
             return EXIT_CLOSED
         client = ctx.get("client")
         if client is not None:
-            try:
-                await client.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
+            await client.disconnect()
+        self._runs.pop(session.agent_session_id, None)
         # 留有 session id 的 Session 可经 resume 恢复。
         return EXIT_RESUMABLE if ctx.get("session_id") else EXIT_CLOSED
 

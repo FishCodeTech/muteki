@@ -127,10 +127,13 @@ class BaseExternalAgentAdapter:
         return self._probe_cache
 
     async def probe_with_environment(self, request: ProbeRequest) -> AgentCapabilities:
+        from .probe_environment import PROBE_ENVIRONMENT
+        # Keep an explicitly selected credential's prepared, task-local home.
+        if PROBE_ENVIRONMENT.get() is not None:
+            return await self.probe(request)
         if self.probe_environment_factory is None:
             return await self.probe(request)
         import asyncio
-        from .probe_environment import PROBE_ENVIRONMENT
         environment = await asyncio.to_thread(self.probe_environment_factory)
         token = PROBE_ENVIRONMENT.set(environment)
         try:

@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { Suspense } from "react";
-import { WorkerOrchestration } from "@/components/WorkerOrchestration";
+import { WebWorkerOrchestration } from "@/components/WebWorkerOrchestration";
 
 export const metadata: Metadata = {
   title: "CTF Worker 设置",
@@ -12,7 +12,7 @@ export default function CtfWorkerSettingsPage() {
     <section className="single-task-workers" aria-label="CTF Worker 设置">
       <div className="single-task-workers-body">
         <Suspense fallback={null}>
-          <WorkerOrchestration defaultReturnTo="/ctf" />
+          <WebWorkerOrchestration defaultReturnTo="/ctf" />
         </Suspense>
       </div>
     </section>

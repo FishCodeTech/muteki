@@ -29,7 +29,9 @@ class RunSummaryStore:
     Run handles, plus unfinished follow-up lifecycle state used by crash recovery.
     """
 
-    _VERSION = 2
+    # Rebuild indexes written before placeholder run IDs stopped overriding
+    # generated titles. The JSONL event stream is the title source of truth.
+    _VERSION = 3
     _FIELDS = (
         "run_id", "name", "category", "mode", "started", "finished", "solved",
         "flag", "flags", "expected_flags", "multi_flag", "events", "ts",

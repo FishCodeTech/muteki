@@ -1,3 +1,3 @@
-import { ChatPluginsSettings } from "@/components/conversation/ChatPluginsSettings";
+import { redirect } from "next/navigation";
 
-export default function ChatPluginsPage() { return <ChatPluginsSettings />; }
+export default function ChatPluginsPage() { redirect("/settings/agent-extensions"); }

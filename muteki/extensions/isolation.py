@@ -52,7 +52,14 @@ def _resolve_executable(command: list[str], env: dict[str, str]) -> list[str]:
     if executable is None:
         raise IsolationUnavailable(
             f"extension executable is unavailable: {command[0]!r}")
-    resolved = str(Path(executable).resolve())
+    entry = Path(executable).absolute()
+    resolved = str(entry.resolve())
+    # A virtualenv's python entry is intentionally a link to the base
+    # interpreter. Executing the resolved target loses pyvenv.cfg and its
+    # site-packages, even when the environment itself is readable.
+    if (entry.parent.name in {"bin", "Scripts"}
+            and (entry.parent.parent / "pyvenv.cfg").is_file()):
+        return [str(entry), *command[1:]]
     # pyenv shim 会再次执行宿主 shell。使用解释器报告的真实 executable，
     # 以便 profile 只授权一个确定的运行时根。
     if Path(command[0]).name.startswith("python"):
@@ -137,14 +144,36 @@ def _macos_plan(
     resolved_command = _resolve_executable(command, env)
     executable = Path(resolved_command[0]).resolve()
     runtime_root = executable.parent.parent
+    entry = Path(resolved_command[0])
+    venv_root = (entry.parent.parent if entry.parent.name in {"bin", "Scripts"}
+                 and (entry.parent.parent / "pyvenv.cfg").is_file() else None)
+    trusted_roots = (Path("/usr"), Path("/bin"), Path("/sbin"), Path("/System"),
+                     Path("/Library"), Path("/opt/homebrew"), Path("/usr/local"),
+                     Path.home() / ".pyenv" / "versions")
+    runtime_allowed = (runtime_root.is_relative_to(package_dir.resolve())
+                       or runtime_root.is_relative_to(state_dir.resolve())
+                       or any(runtime_root.is_relative_to(root) for root in trusted_roots))
+    if not runtime_allowed and venv_root is None:
+        raise IsolationUnavailable("MCP executable is outside its package, private state, and supported runtimes")
     read_roots = {
         str(package_dir.resolve()),
         str(state_dir.resolve()),
-        str(runtime_root),
         "/System", "/usr", "/bin", "/sbin", "/Library",
         "/private/var/db/timezone", "/dev",
         *_macos_crypto_read_roots(executable),
     }
+    if runtime_allowed:
+        read_roots.add(str(runtime_root))
+    if venv_root is not None:
+        # Grant the interpreter metadata and installed dependencies, not the
+        # virtualenv's parent project (which may hold unrelated credentials).
+        for relative in ("pyvenv.cfg", "bin", "lib", "lib64", "Lib", "share"):
+            candidate = venv_root / relative
+            if candidate.exists():
+                resolved = candidate.resolve()
+                if not resolved.is_relative_to(venv_root.resolve()):
+                    raise IsolationUnavailable("virtualenv dependency path leaves its environment")
+                read_roots.add(str(resolved))
     if workspace_root is not None and any(
         token in manifest.permissions.filesystem
         for token in ("workspace-read", "workspace-write")
@@ -164,9 +193,12 @@ def _macos_plan(
         "(deny process-fork)",
         "(allow sysctl-read)",
         "(allow mach-lookup)",
-        f"(allow process-exec (subpath {_scheme_string(str(runtime_root))}))",
         "(allow file-read-metadata)",
     ]
+    if runtime_allowed:
+        lines.append(f"(allow process-exec (subpath {_scheme_string(str(runtime_root))}))")
+    if venv_root is not None:
+        lines.append(f"(allow process-exec (subpath {_scheme_string(str((venv_root / 'bin').resolve()))}))")
     for root in sorted(read_roots):
         lines.append(
             f"(allow file-read* (subpath {_scheme_string(root)}))")

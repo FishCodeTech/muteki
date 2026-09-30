@@ -51,7 +51,7 @@ _CHALLENGE_MODE = (
 
 _SOLVE_COMMANDS = (
     {"context", "read-artifact", "submit-fact", "commit-step", "mark-deadend", "request-input", "save-poc"}
-    | ({"recent-evidence"} if _CHALLENGE_MODE == "pentest" else set())
+    | ({"recent-evidence", "submit-report"} if _CHALLENGE_MODE == "pentest" else set())
     | ({"submit-flag"} if _CHALLENGE_MODE == "ctf" else set())
     if _CHALLENGE_MODE in {"ctf", "pentest"}
     else {"context", "write-fact", "mark-deadend", "request-input", "save-poc", "submit-flag"}
@@ -61,7 +61,7 @@ _ROLE_COMMANDS = {
     "solve": _SOLVE_COMMANDS,
     "verifier": (
         {"context", "read-artifact", "submit-fact", "commit-step", "mark-deadend", "save-poc"}
-        | ({"recent-evidence"} if _CHALLENGE_MODE == "pentest" else set())
+        | ({"recent-evidence", "submit-report"} if _CHALLENGE_MODE == "pentest" else set())
         if _CHALLENGE_MODE in {"ctf", "pentest"}
         else {"context", "write-fact", "mark-deadend", "save-poc"}
     ),
@@ -71,6 +71,8 @@ _ROLE_COMMANDS = {
     },
     "respond": {"context"},
 }
+for _commands in (_ROLE_COMMANDS["solve"], _ROLE_COMMANDS["verifier"], _ROLE_COMMANDS["review"]):
+    _commands.update({"mcp-tools", "mcp-schema", "mcp-call"})
 
 
 def _db_path() -> str:
@@ -201,6 +203,19 @@ def submit_fact(title: str, content: str, evidence: str = "") -> None:
     })
 
 
+def submit_report(path: str) -> None:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            report = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        print(f"ERROR: cannot read report JSON file: {exc}", file=sys.stderr)
+        sys.exit(2)
+    if not isinstance(report, dict):
+        print("ERROR: report file must contain one JSON object", file=sys.stderr)
+        sys.exit(2)
+    _submit_request("submit_report", {"report": report})
+
+
 def commit_step() -> None:
     _submit_request("commit_step", {})
 
@@ -262,17 +277,17 @@ def _await_request_result(request_id: str, timeout_s: float = 30.0) -> dict | No
         time.sleep(0.2)
 
 
-def _request_timeout() -> None:
-    print("ERROR: host did not answer the Blackboard request within 30s",
+def _request_timeout(timeout_s: float = 30.0) -> None:
+    print(f"ERROR: host did not answer the Blackboard request within {timeout_s:g}s",
           file=sys.stderr)
     sys.exit(3)
 
 
-def _submit_request(operation: str, payload: dict) -> dict:
+def _submit_request(operation: str, payload: dict, *, timeout_s: float = 30.0) -> dict:
     request_id = _write_request(operation, payload)
-    result = _await_request_result(request_id)
+    result = _await_request_result(request_id, timeout_s=timeout_s)
     if result is None:
-        _request_timeout()
+        _request_timeout(timeout_s)
     message = str(result.get("message") or result.get("detail") or "")
     if not result.get("ok"):
         print(f"REJECTED{(': ' + message) if message else ''}", file=sys.stderr)
@@ -787,7 +802,21 @@ def main() -> None:
         if _CHALLENGE_MODE == "pentest":
             p.add_argument("--evidence", required=True,
                            help="artifact ID from recent-evidence supporting this Fact")
+    p = _reg("submit-report")
+    if p is not None:
+        p.add_argument("json_file", help=(
+            "JSON file containing one vulnerability report; evidence_note must include "
+            "artifact_id from submit-fact --evidence, observed, and significance"
+        ))
     _reg("commit-step")
+    _reg("mcp-tools")
+    p = _reg("mcp-schema")
+    if p is not None:
+        p.add_argument("name")
+    p = _reg("mcp-call")
+    if p is not None:
+        p.add_argument("name")
+        p.add_argument("json_file", help="JSON file containing tool arguments")
     p = _reg("mark-deadend")
     if p is not None:
         p.add_argument("reason")
@@ -916,8 +945,21 @@ def main() -> None:
         write_fact(args.text, False)
     elif args.cmd == "submit-fact":
         submit_fact(args.title, args.content, getattr(args, "evidence", ""))
+    elif args.cmd == "submit-report":
+        submit_report(args.json_file)
     elif args.cmd == "commit-step":
         commit_step()
+    elif args.cmd == "mcp-tools":
+        _submit_request("mcp_tools", {}, timeout_s=120)
+    elif args.cmd == "mcp-schema":
+        _submit_request("mcp_schema", {"name": args.name}, timeout_s=120)
+    elif args.cmd == "mcp-call":
+        with open(args.json_file, "r", encoding="utf-8") as handle:
+            arguments = json.load(handle)
+        if not isinstance(arguments, dict):
+            print("ERROR: MCP arguments file must contain one JSON object", file=sys.stderr)
+            sys.exit(2)
+        _submit_request("mcp_call", {"name": args.name, "arguments": arguments}, timeout_s=120)
     elif args.cmd == "mark-deadend":
         mark_deadend(args.reason, args.tested, args.observed)
     elif args.cmd == "request-input":

@@ -15,6 +15,7 @@ import {
 } from "@/lib/approvalPreview";
 import { Icon } from "@/components/Icon";
 import { useT } from "@/lib/i18n";
+import { userInputAnswerError } from "@/lib/userInputValidation";
 import {
   clearUserInputDraft,
   loadUserInputDraft,
@@ -28,7 +29,7 @@ import {
 
 export type UserInputResolvePayload = {
   request_id: string;
-  decision: "submit" | "cancel";
+  decision: "submit" | "cancel" | "decline";
   answers?: UserInputAnswerMap;
   text?: string;
 };
@@ -43,8 +44,9 @@ export interface ConversationApprovalProps {
     approvalId: string,
     decision: "allow" | "deny",
     scopeMode?: "once" | "session",
+    optionId?: string,
   ) => void;
-  onUserInputResolve: (payload: UserInputResolvePayload) => void;
+  onUserInputResolve: (payload: UserInputResolvePayload) => void | Promise<boolean>;
   className?: string;
 }
 
@@ -62,6 +64,7 @@ type NormalizedQuestion = {
   options: QuestionOption[];
   allow_free_text: boolean;
   placeholder: string;
+  schema?: Record<string, unknown>;
 };
 
 function field(row: Record<string, unknown>, ...keys: string[]): string {
@@ -104,8 +107,8 @@ function normalizeOption(raw: unknown): QuestionOption | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const row = raw as Record<string, unknown>;
   const value = String(row.value ?? row.id ?? row.label ?? row.title ?? "").trim();
-  if (!value) return null;
-  const label = String(row.label ?? row.title ?? value).trim() || value;
+  if (!value && row.value !== "") return null;
+  const label = String(row.label ?? row.title ?? value).trim() || value || "空字符串";
   const recommended = Boolean(row.recommended ?? row.isRecommended ?? row.is_recommended);
   return { value, label, recommended };
 }
@@ -114,7 +117,7 @@ function normalizeQuestions(pending: Record<string, unknown>): NormalizedQuestio
   const raw = pending.questions;
   if (Array.isArray(raw) && raw.length > 0) {
     return raw
-      .map((item, index) => {
+      .map((item, index): NormalizedQuestion | null => {
         if (!item || typeof item !== "object" || Array.isArray(item)) return null;
         const row = item as Record<string, unknown>;
         const options = Array.isArray(row.options)
@@ -125,6 +128,7 @@ function normalizeQuestions(pending: Record<string, unknown>): NormalizedQuestio
           kind: String(row.kind ?? (options.length ? "single_select" : "free_text")),
           prompt: String(row.prompt ?? row.question ?? row.message ?? row.header ?? ""),
           required: row.kind === "header" ? false : row.required !== false,
+          schema: row.schema && typeof row.schema === "object" && !Array.isArray(row.schema) ? row.schema as Record<string, unknown> : undefined,
           options,
           allow_free_text: Boolean(row.allow_free_text ?? (!options.length && row.kind !== "header")),
           placeholder: String(row.placeholder ?? ""),
@@ -168,10 +172,16 @@ export function ConversationApproval({
 }: ConversationApprovalProps) {
   const t = useT();
   const [answers, setAnswers] = useState<UserInputAnswerMap>({});
+  const [hydratedScope, setHydratedScope] = useState("");
+  const [resolvingInput, setResolvingInput] = useState(false);
+  const resolvingInputRef = useRef(false);
+  const [inputResolveError, setInputResolveError] = useState("");
 
   const requestId = typeof pendingInput?.request_id === "string"
     ? pendingInput.request_id
     : "";
+  const answerScope = `${threadId}::${requestId}`;
+  const inputBusy = busy || resolvingInput || pendingInput?.status === "resolving";
   const questions = useMemo(
     () => (pendingInput ? normalizeQuestions(pendingInput) : []),
     [pendingInput],
@@ -181,18 +191,21 @@ export function ConversationApproval({
     : "";
 
   useEffect(() => {
-    if (!pendingInput || !requestId) {
+    if (!requestId) {
       setAnswers({});
+      setHydratedScope(answerScope);
       return;
     }
     const draft = threadId ? loadUserInputDraft(threadId, requestId) : null;
     setAnswers(draft?.answers ?? {});
-  }, [pendingInput, requestId, threadId]);
+    setHydratedScope(answerScope);
+    setInputResolveError("");
+  }, [answerScope, requestId, threadId]);
 
   useEffect(() => {
-    if (!threadId || !requestId) return;
+    if (!threadId || !requestId || hydratedScope !== answerScope) return;
     saveUserInputDraft(threadId, requestId, answers);
-  }, [answers, threadId, requestId]);
+  }, [answers, answerScope, hydratedScope, threadId, requestId]);
 
   const approvalRows = useMemo(
     () => asApprovalRows(pendingApprovals, pendingApproval),
@@ -207,34 +220,11 @@ export function ConversationApproval({
 
   const regionRef = useRef<HTMLDivElement | null>(null);
 
-  // Auto-focus first actionable element when approval/input appears (C34).
-  useEffect(() => {
-    if (pendingApprovalCount || pendingInput) {
-      window.requestAnimationFrame(() => {
-        regionRef.current
-          ?.querySelector<HTMLElement>("[role=radio], [role=checkbox], input, textarea, button:not(:disabled)")
-          ?.focus();
-      });
-    }
-  }, [pendingApprovalCount, pendingInput]);
+  // Incoming approvals must not move a typing user's focus onto a decision.
 
   if (!approvalRows.length && !pendingInput) return null;
 
-  const approvalQueue = approvalRows.length ? (
-      <div className="flex flex-col gap-2.5" data-testid="approval-queue">
-        {approvalRows.length > 1 && (
-          <div className="flex items-center gap-2 text-[12px] font-medium text-cx-fg-3">
-            {pendingApprovalCount > 0 ? (
-              <span className="size-1.5 rounded-full bg-cx-warning cx-pulse-dot" />
-            ) : null}
-            {pendingApprovalCount > 0
-              ? `${pendingApprovalCount} 个操作等待审批${expiredApprovalCount ? ` · ${expiredApprovalCount} 个已过期` : ""}`
-              : expiredApprovalCount === approvalRows.length
-                ? "审批均已过期"
-                : "审批记录"}
-          </div>
-        )}
-        {approvalRows.map((row) => {
+  const approvalCards = approvalRows.map((row) => {
           const preview = buildApprovalPreview(row);
           const approvalId = preview.approvalId;
           const diffFiles = approvalDiffFiles(preview);
@@ -281,20 +271,40 @@ export function ConversationApproval({
               reason={preview.reason || undefined}
               status={preview.status}
               busy={busy}
+              nativeOptions={preview.nativeOptions}
+              onNativeOption={(optionId, kind) => {
+                if (preview.status !== "pending" || busy) return;
+                if (!["allow_once", "allow_always", "reject_once", "reject_always"].includes(kind)
+                  || !preview.nativeOptions?.some((option) => option.option_id === optionId && option.kind === kind)) return;
+                onApprovalDecision(approvalId, kind === "allow_once" || kind === "allow_always" ? "allow" : "deny", kind === "allow_always" || kind === "reject_always" ? "session" : "once", optionId);
+              }}
               onAllow={
-                preview.status === "expired"
+                preview.status !== "pending"
                   ? undefined
                   : (scopeMode) => onApprovalDecision(approvalId, "allow", scopeMode)
               }
               onDeny={
-                preview.status === "expired"
+                preview.status !== "pending"
                   ? undefined
                   : () => onApprovalDecision(approvalId, "deny")
               }
             />
           );
-        })}
+        });
+  const approvalQueue = approvalRows.length ? (
+    <div className="flex flex-col gap-2.5" data-testid="approval-queue">
+      <div className="flex items-center gap-2 text-[12px] font-medium text-cx-fg-3">
+        {pendingApprovalCount > 0 ? <span className="size-1.5 rounded-full bg-cx-warning cx-pulse-dot" /> : null}
+        {pendingApprovalCount > 0 ? `${pendingApprovalCount} 个操作等待审批` : "审批记录"}
       </div>
+      {approvalCards.filter((card) => card.props.status !== "expired")}
+      {expiredApprovalCount > 0 ? (
+        <details className="rounded-xl border border-cx-border px-3 py-2 text-xs text-cx-fg-3" data-testid="expired-approval-history">
+          <summary className="cursor-pointer">{expiredApprovalCount} 个已过期审批记录</summary>
+          <div className="mt-3 flex flex-col gap-2.5">{approvalCards.filter((card) => card.props.status === "expired")}</div>
+        </details>
+      ) : null}
+    </div>
   ) : null;
 
   if (!pendingInput || !requestId) {
@@ -312,7 +322,8 @@ export function ConversationApproval({
 
 
   const interactive = questions.filter((q) => q.kind !== "header");
-  const canSubmit = interactive.every((q) => answerSatisfied(q, answers[q.question_id]));
+  const canSubmit = interactive.every((q) => answerSatisfied(q, answers[q.question_id])
+    && !userInputAnswerError(q, answers[q.question_id]));
 
   const cardQuestions: ApprovalCardQuestion[] = [];
   let sectionHeader = "";
@@ -339,6 +350,7 @@ export function ConversationApproval({
       allowCustom: question.kind === "free_text" || question.allow_free_text || question.kind === "number",
       customPlaceholder: question.placeholder || t("conversation.userInput.placeholder"),
       required: question.required,
+      validationError: answers[question.question_id] ? userInputAnswerError(question, answers[question.question_id]) || undefined : undefined,
       autoAdvance: !question.allow_free_text,
     });
     sectionHeader = "";
@@ -356,23 +368,34 @@ export function ConversationApproval({
     setAnswers(mapped);
   };
 
-  const submit = () => {
-    if (!canSubmit || busy) return;
-    onUserInputResolve({
-      request_id: requestId,
-      decision: "submit",
-      answers,
-    });
-    if (threadId) clearUserInputDraft(threadId, requestId);
+  const resolveInput = async (decision: "submit" | "cancel" | "decline") => {
+    if (inputBusy || resolvingInputRef.current || (decision === "submit" && !canSubmit)) return;
+    const submittedAnswers = answers;
+    resolvingInputRef.current = true;
+    setResolvingInput(true);
+    setInputResolveError("");
+    try {
+      const confirmed = await onUserInputResolve({
+        request_id: requestId, decision,
+        ...(decision === "submit" ? { answers: submittedAnswers } : {}),
+      });
+      if (confirmed === true && threadId) {
+        const current = loadUserInputDraft(threadId, requestId);
+        if (!current || JSON.stringify(current.answers) === JSON.stringify(submittedAnswers)) {
+          clearUserInputDraft(threadId, requestId);
+        }
+      }
+    } catch (error) {
+      setInputResolveError(error instanceof Error ? error.message : String(error));
+    } finally {
+      resolvingInputRef.current = false;
+      setResolvingInput(false);
+    }
   };
-
-  const handleCancel = () => {
-    onUserInputResolve({
-      request_id: requestId,
-      decision: "cancel",
-    });
-    if (threadId) clearUserInputDraft(threadId, requestId);
-  };
+  const submit = () => { void resolveInput("submit"); };
+  const handleCancel = () => { void resolveInput("cancel"); };
+  const canDecline = Array.isArray(pendingInput.response_actions) && pendingInput.response_actions.includes("decline");
+  const handleDecline = () => { void resolveInput("decline"); };
 
   return (
     <div
@@ -389,6 +412,7 @@ export function ConversationApproval({
         data-request-id={requestId}
         onKeyDown={(event) => {
           if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+            if (event.nativeEvent.isComposing) return;
             event.preventDefault();
             event.stopPropagation();
             submit();
@@ -404,21 +428,25 @@ export function ConversationApproval({
           </span>
         </div>
         <QuestionCard
+          key={answerScope}
           title={title || t("conversation.userInput.title")}
           description={cardQuestions.length ? undefined : t("conversation.userInput.title")}
           questions={cardQuestions}
-          status={busy ? "submitting" : "pending"}
+          status={inputBusy ? "submitting" : "pending"}
           answers={cardAnswers}
           onAnswersChange={handleAnswersChange}
           onSubmit={submit}
           onApprove={submit}
-          onReject={handleCancel}
+          onReject={canDecline ? handleDecline : undefined}
+          rejectLabel="明确拒绝"
           onDismiss={handleCancel}
           dismissLabel={t("conversation.userInput.cancel")}
           approveLabel={t("conversation.userInput.submit")}
           submitLabel={t("conversation.userInput.submit")}
+          submitDisabled={!canSubmit}
           className="border border-cx-accent-line bg-cx-elevated shadow-cx-md"
         />
+        {inputResolveError ? <p role="alert" className="mt-2 whitespace-pre-wrap text-[12px] text-cx-danger">{inputResolveError}</p> : null}
       </div>
     </div>
   );

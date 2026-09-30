@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 
 from muteki.solver.types import SolveOutcome
 from muteki.swarm.graph_defs import SEMANTIC_GRAPH_KINDS
+from muteki.swarm.coordinator_worker_reap import _record_worker_dispatch_failure
 
 
 _STALL_RECLAIM_S = 120.0
@@ -482,6 +483,10 @@ async def soft_pause_stage(self, state) -> str:
         # worker finished while paused, seed one bootstrap so the loop
         # lives on instead of falling out of `while tasks:`.
         if not state.tasks:
+            if (getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
+                    and self._auto_dispatch_enabled()):
+                state.reason_next_trigger = "operator_resume"
+                return "continue"
             try:
                 engine = self._pick_engine(running_engines(), state.healthy, role="bootstrap")
             except RuntimeError as exc:
@@ -495,7 +500,12 @@ async def soft_pause_stage(self, state) -> str:
             except WorkerSpawnRejected as exc:
                 await emit_bb("worker_spawn_rejected", reason=str(exc),
                                engine=str(engine), phase="resume_bootstrap")
-                return "break"
+                if await _record_worker_dispatch_failure(
+                    self, state, worker="", engine=str(engine), detail=str(exc),
+                ):
+                    return "break"
+                state.reason_next_trigger = "resume_bootstrap_failed"
+                return "continue"
             except WorkerBudgetExhausted as exc:
                 terminal = await stop_for_budget(str(exc))
                 return "break" if terminal else "continue"
@@ -677,6 +687,10 @@ async def pending_help_stage(self, state) -> str:
                 return "break"
         await emit_bb("operator_resumed")
         if not state.tasks:
+            if (getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
+                    and self._auto_dispatch_enabled()):
+                state.reason_next_trigger = "operator_resume"
+                return "continue"
             try:
                 engine = self._pick_engine(running_engines(), state.healthy, role="bootstrap")
             except RuntimeError as exc:
@@ -690,7 +704,12 @@ async def pending_help_stage(self, state) -> str:
             except WorkerSpawnRejected as exc:
                 await emit_bb("worker_spawn_rejected", reason=str(exc),
                                engine=str(engine), phase="resume_bootstrap")
-                return "break"
+                if await _record_worker_dispatch_failure(
+                    self, state, worker="", engine=str(engine), detail=str(exc),
+                ):
+                    return "break"
+                state.reason_next_trigger = "resume_bootstrap_failed"
+                return "continue"
             except WorkerBudgetExhausted as exc:
                 terminal = await stop_for_budget(str(exc))
                 return "break" if terminal else "continue"

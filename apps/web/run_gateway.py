@@ -237,7 +237,7 @@ class RunGateway:
         from muteki.solver.gate import FlagFormatError
         try:
             driver = build_driver(body, mgr=self._mgr)
-            await self._mgr.start(run_id, driver)
+            await self._mgr.start(run_id, driver, launch_limits=body)
             self._apply_start_metadata(run_id, body)
         except StateConflict as exc:
             return self._error_receipt(
@@ -431,8 +431,17 @@ class RunGateway:
             self, run_id: str, command: RunCommand) -> CommandReceipt:
         """resolve 映射到 RunManager.resolve 的续做执行代（standby/reopen 语义
         与既有代际围栏一致，旧 generation 事件不会写入新 generation）。"""
+        from apps.web.run_recovery import WorkerRuntimePolicyUnavailable
         try:
             ok = await self._mgr.resolve(run_id, dict(command.payload) or None)
+        except WorkerRuntimePolicyUnavailable as exc:
+            LOG.error("resolve Worker runtime policy unavailable for %s", run_id)
+            return self._error_receipt(
+                run_id, command,
+                code=exc.code,
+                message=str(exc),
+                category=ErrorCategory.RUNTIME,
+            )
         except Exception as exc:
             LOG.exception("gateway resolve failed for %s", run_id)
             return self._error_receipt(

@@ -1,6 +1,7 @@
 "use client";
 
 import { createContext, useCallback, useContext, useEffect, useState } from "react";
+import { desktopChatBridge } from "./desktopChatBridge";
 
 /**
  * Lightweight i18n for the command deck — static UI strings only (the agent's
@@ -552,10 +553,10 @@ const STRINGS: Dict = {
   "settingsHub.capabilitiesDesc": { zh: "Conversation Thread 授权与全局 MCP/Skills。不是 Fact 图白名单；全局 Blackboard Skill 会影响新 Worker。", en: "Conversation thread grants and global MCP/Skills. Not the Fact-graph allowlist; the global Blackboard Skill switch affects new workers." },
   "settingsHub.operations": { zh: "运维", en: "Operations" },
   "settingsHub.operationsDesc": { zh: "指标、回执、恢复预览、领域模块与维护清理。", en: "Metrics, receipts, recovery preview, modules, and maintenance." },
-  "settingsHub.chatPlugins": { zh: "聊天插件", en: "Chat plugins" },
-  "settingsHub.chatPluginsDesc": { zh: "安装一次，让 Skills、MCP 和插件在 Muteki 聊天中使用。", en: "Manage isolated skills, MCP servers and chat capabilities per agent." },
-  "settingsHub.extensions": { zh: "扩展", en: "Extensions" },
-  "settingsHub.extensionsDesc": { zh: "安装、启用、升级、回滚与声明式 UI。", en: "Install, enable, upgrade, roll back, and declarative UI." },
+  "settingsHub.chatPlugins": { zh: "Agent 扩展", en: "Agent extensions" },
+  "settingsHub.chatPluginsDesc": { zh: "按聊天、CTF 和渗透测试管理 Skills、插件与 MCP。", en: "Manage skills, plugins and MCP across chat, CTF and pentest workers." },
+  "settingsHub.extensions": { zh: "平台扩展", en: "Platform extensions" },
+  "settingsHub.extensionsDesc": { zh: "管理 Muteki 平台模块及其声明式 UI。", en: "Manage Muteki platform modules and declarative UI." },
   "settingsHub.appearance": { zh: "外观配色", en: "Appearance" },
   "settingsHub.appearanceDesc": { zh: "亮暗模式、配色方案与界面语言。改动保存在本浏览器。", en: "Theme, color scheme, and UI language. Saved in this browser." },
   "settingsHub.notifications": { zh: "通知与待办", en: "Notifications" },
@@ -1222,7 +1223,7 @@ const STRINGS: Dict = {
   "worker.prompt.status.not_sent": { zh: "未发送", en: "Not sent" },
   "worker.prompt.status.unknown": { zh: "发送状态未确认", en: "Delivery unconfirmed" },
   "collab.workspace.tasks": { zh: "任务记录", en: "Tasks" },
-  "collab.workspace.totalCost": { zh: "运行总成本", en: "Total run cost" },
+  "collab.workspace.totalCost": { zh: "运行记账金额", en: "Recorded run amount" },
   "collab.workspace.totalTokens": { zh: "运行总 token", en: "Total run tokens" },
   "collab.role.decision": { zh: "决策模型", en: "Decision model" },
   "collab.role.source": { zh: "输入来源", en: "Input source" },
@@ -2032,6 +2033,7 @@ const LangCtx = createContext<{ lang: Lang; setLang: (l: Lang) => void }>({
   lang: "zh",
   setLang: () => {},
 });
+let unsavedLanguage: Lang | null = null;
 
 /** Map UI lang preference to the HTML document language tag (BCP 47). */
 export function htmlLangFor(lang: Lang): string {
@@ -2047,11 +2049,19 @@ export function applyDocumentLang(lang: Lang): void {
 }
 
 export function I18nProvider({ children }: { children: React.ReactNode }) {
+  const desktop = Boolean(desktopChatBridge());
   const [lang, setLangState] = useState<Lang>("zh");
+  const [storageError, setStorageError] = useState<{ code: string; detail: string } | null>(null);
   // hydrate from localStorage after mount (avoids SSR mismatch)
   useEffect(() => {
-    const saved = (typeof window !== "undefined" && window.localStorage.getItem("muteki.lang")) as Lang | null;
-    if (saved === "zh" || saved === "en") setLangState(saved);
+    try {
+      if (unsavedLanguage) { setLangState(unsavedLanguage); setStorageError({ code: "preferences.language.storage_write_failed", detail: `上次选择仍临时保留在${desktop ? "当前桌面客户端" : "当前浏览器"}，尚未保存。` }); return; }
+      const saved = (typeof window !== "undefined" && window.localStorage.getItem("muteki.lang")) as Lang | null;
+      if (saved === "zh" || saved === "en") setLangState(saved);
+    } catch (error) {
+      console.warn("preferences.language.storage_read_failed", error);
+      setStorageError({ code: "preferences.language.storage_read_failed", detail: error instanceof Error ? `${error.name}: ${error.message}` : String(error) });
+    }
   }, []);
   // Sync document language whenever the UI locale changes (incl. hydrated preference).
   useEffect(() => {
@@ -2059,10 +2069,15 @@ export function I18nProvider({ children }: { children: React.ReactNode }) {
   }, [lang]);
   const setLang = (l: Lang) => {
     setLangState(l);
-    try { window.localStorage.setItem("muteki.lang", l); } catch { /* ignore */ }
+    try { window.localStorage.setItem("muteki.lang", l); unsavedLanguage = null; setStorageError(null); }
+    catch (error) {
+      unsavedLanguage = l;
+      console.warn("preferences.language.storage_write_failed", error);
+      setStorageError({ code: "preferences.language.storage_write_failed", detail: error instanceof Error ? `${error.name}: ${error.message}` : String(error) });
+    }
     applyDocumentLang(l);
   };
-  return <LangCtx.Provider value={{ lang, setLang }}>{children}</LangCtx.Provider>;
+  return <LangCtx.Provider value={{ lang, setLang }}>{children}{storageError ? <div role="status" className="fixed bottom-3 left-1/2 z-[100] max-w-[min(90vw,42rem)] -translate-x-1/2 rounded-xl border border-cx-warning/40 bg-cx-elevated p-3 text-xs text-cx-fg" data-testid="language-storage-warning"><p>{lang === "en" ? `Language preference is temporary in ${desktop ? "this desktop client" : "this browser"}. Local storage is unavailable; conversation remains usable.` : `语言偏好在${desktop ? "当前桌面客户端" : "当前浏览器"}临时生效，本地存储尚未保存；聊天仍可使用。`}</p><details className="mt-1"><summary>{storageError.code}</summary><pre className="max-h-36 overflow-auto whitespace-pre-wrap break-words">{storageError.detail}</pre></details><button type="button" className="mt-2 underline" onClick={() => setLang(lang)}>{lang === "en" ? "Retry saving current language" : "重试保存当前语言"}</button></div> : null}</LangCtx.Provider>;
 }
 
 export function useLang() {

@@ -101,19 +101,19 @@ export function OverviewSurface({ threadId, view, events, tools, onOpenDetails }
         <Card className="p-3">
           <div className="flex items-start gap-3">
             <div className="min-w-0 flex-1">
-              <p className="text-[11.5px] font-medium text-cx-fg-4">会话状态</p>
+              <p className="text-[11.5px] font-medium text-cx-fg-4">{view.state.status === "archived" ? "会话已归档" : view.state.status === "active" ? "会话可继续" : "会话生命周期未上报"} · {view.state.running_turn_id ? "当前轮次" : "最近轮次"}执行状态</p>
               <p className="mt-0.5 truncate text-[15px] font-semibold text-cx-fg">{view.thread.title || "未命名对话"}</p>
             </div>
             <Badge tone={status.tone} dot>{status.label}</Badge>
           </div>
           <dl className="mt-3 grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 text-[12.5px]">
-            <dt className="text-cx-fg-4">模型</dt>
+            <dt className="text-cx-fg-4">当前选择模型</dt>
             <dd className="flex min-w-0 items-center gap-1.5 text-cx-fg-2">
               <span className="truncate font-cx-mono text-[12px]">{model}</span>
               <span className={cn("size-1.5 shrink-0 rounded-full", view.runtime_connection?.connected ? "bg-cx-success" : "bg-cx-fg-4")} />
               <span className="shrink-0 text-cx-fg-4">{view.runtime_connection?.connected ? "已连接" : "未连接"}</span>
             </dd>
-            <dt className="text-cx-fg-4">工作区</dt>
+            <dt className="text-cx-fg-4">服务工作目录</dt>
             <dd className="min-w-0 text-cx-fg-2">
               <span className="block truncate">{workspaceLabel(view)} · {workspaceKindLabel(view)}</span>
               {workspacePath ? (

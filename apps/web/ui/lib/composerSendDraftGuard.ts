@@ -1,3 +1,4 @@
+import { promptDocumentFromDraft } from "./composerContextDoc";
 /**
  * #201 — Guard composer clears after async send so drafts typed during flight
  * are not wiped by the success callback.
@@ -35,8 +36,8 @@ export function fingerprintPromptDocument(doc: {
   nodes?: Record<string, unknown>;
 } | null | undefined): string {
   const segments = doc?.segments ?? [];
-  const nodeIds = Object.keys(doc?.nodes || {}).sort();
-  return JSON.stringify({ segments, nodeIds });
+  const nodes = Object.fromEntries(Object.entries(doc?.nodes || {}).sort(([left], [right]) => left.localeCompare(right)));
+  return JSON.stringify({ segments, nodes });
 }
 
 export function normalizeAttachmentIds(ids: Iterable<string | undefined | null>): string[] {
@@ -121,12 +122,15 @@ export function filterAttachmentsAfterSend<T extends { id?: string }>(
 export function shouldClearDraftStorageAfterSend(
   stored: {
     prompt?: string;
+    promptSegments?: Array<{ type: "text"; text: string } | { type: "ref"; nodeId: string }>;
+    capabilityRefs?: unknown[];
     attachments?: Array<{ id?: string }>;
   } | null | undefined,
   snapshot: SendDraftSnapshot,
 ): boolean {
   if (!stored || !snapshot.draftKey) return false;
   if (String(stored.prompt || "").trim() !== snapshot.promptText) return false;
+  if (fingerprintPromptDocument(promptDocumentFromDraft({ prompt: stored.prompt || "", promptSegments: stored.promptSegments, capabilityRefs: stored.capabilityRefs || [] })) !== snapshot.documentFingerprint) return false;
   const storedIds = normalizeAttachmentIds(
     (stored.attachments || []).map((row) => row.id),
   );

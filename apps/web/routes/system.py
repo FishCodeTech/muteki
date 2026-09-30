@@ -23,6 +23,12 @@ from muteki.version import get_version
 def register(app: FastAPI) -> None:
     platform_stack = app.state.platform_stack
 
+    def identity_scope() -> dict[str, str]:
+        # The browser origin identifies an address, not the data installed
+        # behind it. Bind durable client state to the actual platform database.
+        return {"service_id": platform_stack.store.installation_id,
+                "identity_id": "operator"}
+
     @app.get("/api/health")
     async def health() -> Any:
         return {"version": get_version(), **platform_stack.health()}
@@ -41,11 +47,13 @@ def register(app: FastAPI) -> None:
         cfg: AuthConfig = app.state.auth
         body = await _require_dict_body(request, allow_empty=True)
         if not cfg.enabled:
-            return {"ok": True, "token": "", "auth_required": False}
+            return {"ok": True, "token": "", "auth_required": False,
+                    **identity_scope()}
         if not check_password(cfg, body.get("password")):
             # constant-time compare already done; uniform 401, no "wrong length"
             raise HTTPException(status_code=401, detail="invalid password")
-        return {"ok": True, "token": issue_token(cfg), "auth_required": True}
+        return {"ok": True, "token": issue_token(cfg), "auth_required": True,
+                **identity_scope()}
 
     @app.get("/api/auth/me")
     async def auth_me(request: Request) -> Any:
@@ -57,7 +65,7 @@ def register(app: FastAPI) -> None:
         from muteki.core.runtime_env import is_web_container
         cfg: AuthConfig = app.state.auth
         return {"authenticated": True, "auth_required": cfg.enabled,
-                "in_container": is_web_container()}
+                "in_container": is_web_container(), **identity_scope()}
 
     @app.post("/api/auth/ticket")
     async def auth_ticket(request: Request) -> Any:

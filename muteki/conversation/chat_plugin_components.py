@@ -207,7 +207,7 @@ def compatibility(record: dict, verified_tools: dict[str, set[str]] | None = Non
 
 
 def install_native_components(record: dict, engine: str, home: Path) -> None:
-    """Install supported native components in a new revision-specific chat home."""
+    """Materialize supported native components into the supplied staging home."""
     root = Path(record["root"])
     package = str(record["id"])
     for item in record.get("components", []):

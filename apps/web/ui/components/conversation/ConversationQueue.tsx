@@ -8,12 +8,15 @@ import { Button, IconButton, SPRING_LAYOUT, useReducedMotion } from "@/component
 import type { ConversationQueueItem } from "@/lib/useConversation";
 import { ContextNodeChip } from "./ComposerPromptDocument";
 import { normalizeContextNode } from "@/lib/composerContextDoc";
+import { loadQueueEditDraft, saveQueueEditDraft } from "@/lib/queueEditDraftStore";
+import { conversationStorageScope } from "@/lib/conversationStorageScope";
 import {
   beginQueueEditSave,
   shouldExitQueueEditAfterSave,
 } from "@/lib/queueEditSave";
 
 export interface ConversationQueueProps {
+  threadId: string;
   items: ConversationQueueItem[];
   paused?: boolean;
   pauseReason?: string;
@@ -25,7 +28,8 @@ export interface ConversationQueueProps {
   onDelete: (queueId: string) => void;
   onRebind?: (queueId: string) => void;
   onReorder: (queueIds: string[]) => void;
-  onPause: () => void;
+  onPause: () => boolean | Promise<boolean>;
+  onRestoreAsDraft?: (text: string) => void;
   onResume: () => void;
   onSteer: (queueId: string) => void;
   onJumpToContext?: (payload: {
@@ -45,6 +49,7 @@ function pauseLabel(reason: string): string {
 }
 
 export function ConversationQueue({
+  threadId,
   items,
   paused = false,
   pauseReason = "",
@@ -56,6 +61,7 @@ export function ConversationQueue({
   onRebind,
   onReorder,
   onPause,
+  onRestoreAsDraft,
   onResume,
   onSteer,
   onJumpToContext,
@@ -63,11 +69,44 @@ export function ConversationQueue({
   const [editingId, setEditingId] = useState("");
   const [draft, setDraft] = useState("");
   const [saving, setSaving] = useState(false);
+  const [preparingEdit, setPreparingEdit] = useState(false);
+  const [editError, setEditError] = useState("");
+  const editScope = `${conversationStorageScope()}::${threadId}`;
+  const editScopeRef = useRef(editScope);
+  editScopeRef.current = editScope;
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
   const [draggingId, setDraggingId] = useState("");
   const savingRef = useRef(false);
   const editButtonRefs = useRef(new Map<string, HTMLButtonElement | null>());
   const pendingFocusIdRef = useRef("");
   const reduced = useReducedMotion();
+
+  useEffect(() => {
+    const saved = loadQueueEditDraft(threadId);
+    setEditingId(saved?.queueId || ""); setDraft(saved?.text || "");
+    setEditError(saved ? "已恢复尚未提交的队列编辑；队列确认暂停后才能继续保存" : "");
+    setPreparingEdit(false); setSaving(false); savingRef.current = false;
+  }, [threadId, editScope]);
+
+  const startEdit = useCallback(async (item: ConversationQueueItem) => {
+    if (busy || preparingEdit || item.status === "dispatching") return;
+    const owner = editScope;
+    const ownerScope = conversationStorageScope();
+    setPreparingEdit(true); setEditError("");
+    try {
+      if (!paused && await onPause() !== true) { setEditError("暂停尚未确认，未开放编辑；队列仍可能按原正文派发"); return; }
+      if (editScopeRef.current !== owner || ownerScope !== conversationStorageScope()) return;
+      const latest = itemsRef.current.find((row) => row.queue_id === item.queue_id);
+      if (!latest || !["queued", "failed"].includes(latest.status)) { setEditError("原队列消息已开始派发，不能再编辑；请检查当前轮次"); return; }
+      const saved = loadQueueEditDraft(threadId);
+      const text = saved?.queueId === item.queue_id ? saved.text : latest.text;
+      setDraft(text); setEditingId(item.queue_id);
+      const result = saveQueueEditDraft(threadId, { queueId: item.queue_id, text, updatedAt: Date.now() });
+      if (!result.persisted) setEditError(result.error || "编辑仅保留在当前窗口");
+    } catch (error) { if (editScopeRef.current === owner) setEditError(error instanceof Error ? error.message : String(error)); }
+    finally { if (editScopeRef.current === owner) setPreparingEdit(false); }
+  }, [busy, onPause, paused, preparingEdit, threadId, editScope]);
 
   // Edit button unmounts while editing; restore focus after it remounts on cancel.
   useEffect(() => {
@@ -87,19 +126,27 @@ export function ConversationQueue({
     if (savingRef.current) return;
     const id = editingId;
     if (id) pendingFocusIdRef.current = id;
+    saveQueueEditDraft(threadId, null);
     setEditingId("");
     setDraft("");
-  }, [editingId]);
+    setEditError("");
+  }, [editingId, threadId]);
 
   const saveEdit = useCallback(
     async (queueId: string) => {
+      const current = itemsRef.current.find((item) => item.queue_id === queueId);
+      if (!paused || !current || !["queued", "failed"].includes(current.status)) { setEditError("原消息已开始派发或队列未暂停，修改仍保留为未提交草稿"); return; }
+      const owner = editScope;
+      const ownerScope = conversationStorageScope();
       const start = beginQueueEditSave({ saving: savingRef.current, draft });
       if (!start.ok) return;
       savingRef.current = true;
       setSaving(true);
       try {
         const result = await onUpdate(queueId, start.text);
+        if (editScopeRef.current !== owner || ownerScope !== conversationStorageScope()) return;
         if (shouldExitQueueEditAfterSave(result)) {
+          saveQueueEditDraft(threadId, null);
           setEditingId("");
           setDraft("");
         }
@@ -107,14 +154,13 @@ export function ConversationQueue({
       } catch {
         /* Shell surfaces the error; draft stays for in-place retry. */
       } finally {
-        savingRef.current = false;
-        setSaving(false);
+        if (editScopeRef.current === owner && ownerScope === conversationStorageScope()) { savingRef.current = false; setSaving(false); }
       }
     },
-    [draft, onUpdate],
+    [draft, onUpdate, paused, threadId, editScope],
   );
 
-  if (!items.length) return null;
+  if (!items.length && !editingId && !editError) return null;
   const reorderLocked = items.some((item) => item.status === "dispatching");
 
   const move = (queueId: string, offset: -1 | 1) => {
@@ -150,7 +196,7 @@ export function ConversationQueue({
           {paused ? pauseLabel(pauseReason) : "当前回答结束后按顺序自动发送"}
         </p>
         {paused ? (
-          <Button size="xs" variant="primary" icon="play" disabled={busy} onClick={onResume}>
+          <Button size="xs" variant="primary" icon="play" disabled={busy || Boolean(editingId) || preparingEdit} onClick={onResume}>
             继续发送
           </Button>
         ) : (
@@ -158,6 +204,8 @@ export function ConversationQueue({
         )}
       </header>
 
+      {editError ? <p role="alert" className="mx-3 mb-2 whitespace-pre-wrap break-words text-xs text-cx-warning">{editError}</p> : null}
+      {editingId && !items.some((item) => item.queue_id === editingId) ? <div className="mx-3 mb-3 space-y-2"><p className="text-xs text-cx-warning">原队列消息已经派发或移除，下面的修改尚未发送。</p><textarea aria-label="未提交的队列修改" readOnly value={draft} className="w-full rounded border border-cx-border bg-cx-elevated p-2 text-sm" />{onRestoreAsDraft ? <Button size="xs" onClick={() => { onRestoreAsDraft(draft); cancelEdit(); }}>放入当前输入框</Button> : null}<Button size="xs" variant="ghost" onClick={cancelEdit}>放弃这份修改</Button></div> : null}
       <ol className="m-0 flex list-none flex-col p-0 pb-1">
         <AnimatePresence initial={false}>
           {items.map((item, index) => {
@@ -210,8 +258,8 @@ export function ConversationQueue({
                       rows={2}
                       autoFocus
                       value={draft}
-                      disabled={saving}
-                      onChange={(event) => setDraft(event.target.value)}
+                      disabled={saving || !paused || fixed}
+                      onChange={(event) => { const text = event.target.value; setDraft(text); const result = saveQueueEditDraft(threadId, { queueId: item.queue_id, text, updatedAt: Date.now() }); if (!result.persisted) setEditError(result.error || "编辑保存失败"); }}
                       onKeyDown={(event) => {
                         if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
                           event.preventDefault();
@@ -278,7 +326,7 @@ export function ConversationQueue({
                         size="xs"
                         icon="check"
                         label="保存队列消息"
-                        disabled={busy || saving || !draft.trim()}
+                        disabled={busy || saving || fixed || !paused || !draft.trim()}
                         loading={saving}
                         className="text-cx-accent"
                         onClick={() => {
@@ -306,17 +354,14 @@ export function ConversationQueue({
                         size="xs"
                         icon="pencil"
                         label="编辑"
-                        disabled={busy || fixed}
+                        disabled={busy || fixed || preparingEdit}
                         ref={(node) => {
                           editButtonRefs.current.set(
                             item.queue_id,
                             node as HTMLButtonElement | null,
                           );
                         }}
-                        onClick={() => {
-                          setDraft(item.text);
-                          setEditingId(item.queue_id);
-                        }}
+                        onClick={() => { void startEdit(item); }}
                       />
                       <IconButton size="xs" icon="trash" label="删除" disabled={busy || fixed} className="hover:text-cx-danger" onClick={() => onDelete(item.queue_id)} />
                     </>

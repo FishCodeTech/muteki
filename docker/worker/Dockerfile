@@ -377,9 +377,9 @@ RUN case "$TARGETARCH" in \
     /opt/conda/bin/conda clean -afy && \
     ln -sf /opt/conda/bin/sage /usr/local/bin/sage
 
-# Keep the CLI runtime identical to slim. Kimi Code requires Node.js 22.19+;
-# relying on Kali rolling's current Node version would make this image drift.
-ARG NODE_VERSION="22.19.0"
+# agent-browser requires Node.js 24+; pin the CLI runtime rather than relying
+# on Kali rolling's current Node version.
+ARG NODE_VERSION="24.11.1"
 ARG NODE_MIRROR="https://nodejs.org/dist"
 RUN case "$TARGETARCH" in \
       amd64) node_arch="x64" ;; \
@@ -401,7 +401,8 @@ RUN if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi 
       @anthropic-ai/claude-code@2.1.257 \
       @earendil-works/pi-coding-agent@0.84.1 \
       @moonshot-ai/kimi-code@0.40.1 \
-      opencode-ai@1.18.22
+      opencode-ai@1.18.22 \
+      agent-browser@0.38.1
 
 # cursor-agent is NOT an npm package — it installs via cursor.com/install into
 # ~/.local/bin. Do it as the kali user so it lands in kali's HOME (the worker runs as

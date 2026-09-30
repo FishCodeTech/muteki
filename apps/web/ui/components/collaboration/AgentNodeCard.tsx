@@ -20,7 +20,7 @@ import { useContext, useEffect, useRef, useState, type CSSProperties, type RefOb
 
 import { Icon } from "@/components/Icon";
 import { EngineLogo } from "@/components/EngineLogo";
-import { RECENT_EVENT_WINDOW_MS, recencyOf, isCollaborationWorker, type CollaborationAgentRole, type CollaborationKnowledgeItem, type CollaborationKnowledgeKind, type CollaborationRelationKind } from "@/lib/agentCollaboration";
+import { RECENT_EVENT_WINDOW_MS, recencyOf, isCollaborationWorker, recordedAmount, type CollaborationAgentRole, type CollaborationKnowledgeItem, type CollaborationKnowledgeKind, type CollaborationRelationKind } from "@/lib/agentCollaboration";
 import { LAYOUT, ZOOM } from "@/lib/agentCollaborationLayout";
 import { compactNumber, formatClock, formatElapsed, formatIsoDuration } from "@/lib/format";
 import { useT } from "@/lib/i18n";
@@ -66,6 +66,7 @@ export type AgentNodeData = {
   locks: number;
   tokens: number;
   usd: number;
+  unpricedCalls?: number;
   model: string;
   profileLabel: string;
   /** Lifecycle bounds in epoch ms (0 when unknown); `live` keeps the elapsed clock ticking. */
@@ -127,7 +128,7 @@ export const NODE_SIGNATURE_FIELDS = [
   "id", "title", "initial", "engineKey", "subtitle", "engine", "color",
   "role", "roleLabel", "statusKind", "statusLabel",
   "intentText", "intentTitle", "latestActivity",
-  "facts", "candidates", "deadEnds", "locks", "tokens", "usd", "model", "profileLabel",
+  "facts", "candidates", "deadEnds", "locks", "tokens", "usd", "unpricedCalls", "model", "profileLabel",
   "startedAt", "endedAt", "live", "online", "isCurrent", "lastEventAt", "lastProgressAt", "lifecycleSource",
   "selected", "dimmed", "relationEndpoint", "generation",
   "expanded", "manualExpanded", "selectedKnowledgeId", "visibleWorkItemCount",
@@ -445,7 +446,7 @@ export function AgentNodeCard({ data }: NodeProps<AgentFlowNode>) {
         <span>{t("collab.field.model")} · {data.model || "—"}</span>
         <span>{t("collab.field.profile")} · {data.profileLabel || "—"}</span>
         <span>{t("meta.tokens")} · {compactNumber(data.tokens)}</span>
-        <span>{t("meta.cost")} · ${data.usd.toFixed(4)}</span>
+        <span>记账金额 · {recordedAmount(data.usd, data.tokens, data.unpricedCalls)}</span>
         <span>{timeRange}</span>
       </Tooltip.Content>
     </Tooltip>

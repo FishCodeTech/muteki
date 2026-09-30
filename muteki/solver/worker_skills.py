@@ -25,6 +25,9 @@ from muteki.solver.cli_prompts import (
 _REPO_SKILL = (
     Path(__file__).resolve().parents[2] / "skills" / "muteki-blackboard"
 )
+_REPO_BROWSER_SKILL = (
+    Path(__file__).resolve().parents[2] / "skills" / "muteki-agent-browser"
+)
 
 _OPERATOR_INPUT_SKILL_BLOCK = (
     "Request operator input only for an external resource or environment problem:\n\n"
@@ -63,6 +66,39 @@ def project_skill_roots(engine: str) -> tuple[str, ...]:
     return _PROJECT_SKILL_ROOTS.get(
         str(engine or "").strip().lower(), (".agents/skills",)
     )
+
+
+def stage_agent_browser_skill(
+    workdir: str | Path, *, engine: str, container: object | None, mode: str,
+    enabled: bool,
+) -> list[str]:
+    """Expose a small browser Skill to pentest Workers with the CLI installed.
+
+    The official version-matched core guide remains in the image and is read
+    on demand, rather than copied into every model prompt or workspace.
+    """
+    if mode != "pentest" or container is None or not enabled:
+        return []
+    root = Path(workdir).resolve()
+    target = root / ".muteki-skills" / "agent-browser"
+    target.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(_REPO_BROWSER_SKILL / "SKILL.md", target / "SKILL.md")
+    from muteki.solver.container_exec import _chown_tree_to_worker
+    _chown_tree_to_worker(str(target), image=container.image)
+    staged = []
+    for relative in project_skill_roots(engine):
+        destination = root / relative / "agent-browser"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        link = os.path.relpath(target, start=destination.parent)
+        if destination.is_symlink():
+            if os.readlink(destination) != link:
+                raise RuntimeError(f"Worker agent-browser Skill 路径冲突：{destination}")
+        elif destination.exists():
+            raise RuntimeError(f"Worker agent-browser Skill 路径冲突：{destination}")
+        else:
+            destination.symlink_to(link, target_is_directory=True)
+        staged.append(str(destination))
+    return staged
 
 
 def stage_blackboard_skill(

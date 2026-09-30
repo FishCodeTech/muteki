@@ -120,6 +120,7 @@ class CliSolver:
         target_epoch: Optional[str | int] = None,
         session_supervisor: Optional[Any] = None,
         worker_profile: Optional[dict] = None,
+        plugin_service: Optional[Any] = None,
     ) -> None:
         self.spec = spec
         self.challenge = challenge
@@ -129,6 +130,7 @@ class CliSolver:
         # container backend: a ContainerHandle → run this worker in the run's Kali
         # tool container (consistent toolchain). None → host subprocess.
         self.container = container
+        self.plugin_service = plugin_service
         self._extra_worker_env = dict(worker_env or {})
         self.identity = {
             str(key): str(value)

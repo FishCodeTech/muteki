@@ -89,6 +89,11 @@ class CoordinatorRunState:
     # waits merely because unrelated ordinary Workers remain active.
     reason_duplicate_fact_ckpt: int = -1
     reason_task: asyncio.Task[int] | None = None
+    pentest_review_task: asyncio.Task[dict[str, Any]] | None = None
+    pentest_review_finding_seq: int = 0
+    pentest_review_failures: dict[int, int] = field(default_factory=dict)
+    pentest_review_failure_basis: dict[int, int] = field(default_factory=dict)
+    pentest_review_retry_after: dict[int, float] = field(default_factory=dict)
     reason_started_wm: int = -1
     reason_started_trigger: str = ""
     reason_next_trigger: str = ""
@@ -453,6 +458,7 @@ def _build_solvers(self) -> list:
             # EXEC-01: Profile→Adapter 解析与 AgentSession 监督（CLI 路径不变）。
                 session_supervisor=self._worker_session_supervisor(),
                 worker_profile=profile,
+                plugin_service=self.worker_plugins,
             )
         except Exception as exc:
             rollback_ok = self._release_typed_context_reservations(

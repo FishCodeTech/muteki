@@ -47,6 +47,8 @@ export interface DispatchOpts {
   // optional flag count for collect mode: >0 → stop after collecting that many
   // distinct flags; blank/0 → unknown count, collect until the operator stops.
   collectCount?: number;
+  reportGoalMode?: "automatic" | "count";
+  expectedFindings?: number;
   // worker isolation: when true, the run uses a controlled Docker runtime that
   // can't read the host challenge-source tree. Default false = host subprocess.
   containerMode?: boolean;
@@ -959,6 +961,8 @@ function Composer({
   const mode = workspaceMode;
   const [collect, setCollect] = useState(false);
   const [collectCount, setCollectCount] = useState("");  // "" = unknown count
+  const [reportGoalMode, setReportGoalMode] = useState<"automatic" | "count">("automatic");
+  const [expectedFindings, setExpectedFindings] = useState("10");
   const [flagFormat, setFlagFormat] = useState<"brace" | "token" | "custom">("brace");
   const [flagWrapper, setFlagWrapper] = useState("");
   const [containerMode, setContainerMode] = useState(workspaceMode === "pentest");
@@ -1071,6 +1075,11 @@ function Composer({
       ...(advancedTouched.maxTotalWorkers ? { maxTotalWorkers: optionalInt(maxTotalWorkers) } : {}),
       ...(advancedTouched.costBudgetUsd ? { costBudgetUsd: optionalFloat(costBudgetUsd) } : {}),
     };
+    if (mode === "pentest" && reportGoalMode === "count" &&
+        (!Number.isSafeInteger(Number(expectedFindings)) || Number(expectedFindings) < 1)) {
+      window.alert("请填写大于 0 的报告目标数量");
+      return;
+    }
     const dispatched = await onDispatch(v, {
       webSearch: mode === "pentest" ? true : webSearch,
       mode, collect, containerMode: mode === "pentest" ? true : containerMode,
@@ -1078,6 +1087,8 @@ function Composer({
       flagFormat,
       flagWrapper: flagFormat === "custom" ? flagWrapper.trim() : undefined,
       collectCount: collect ? (parseInt(collectCount, 10) || 0) : undefined,
+      reportGoalMode: mode === "pentest" ? reportGoalMode : undefined,
+      expectedFindings: mode === "pentest" && reportGoalMode === "count" ? Number(expectedFindings) : undefined,
       ...runCaps,
     });
     if (dispatched !== false) setText("");
@@ -1206,8 +1217,22 @@ function Composer({
                 e.target.value = "";
                 if (picked.length) onAddFiles(picked);
               }} />
-            <span className="auto-note"><b>▸</b> {t(mode === "pentest" ? "composer.pentestAutoNote" : "composer.autoNote")}</span>
+            <span className="auto-note"><b>▸</b> {mode === "pentest" && reportGoalMode === "count"
+              ? `逐条提交报告，累计 ${expectedFindings || "?"} 份后结束`
+              : t(mode === "pentest" ? "composer.pentestAutoNote" : "composer.autoNote")}</span>
             <span className="spacer" />
+            {mode === "pentest" && <Button
+              size="sm" variant="ghost"
+              className="websearch-toggle"
+              onPress={() => setReportGoalMode((value) => value === "automatic" ? "count" : "automatic")}
+              aria-label="切换报告完成条件"
+              aria-pressed={reportGoalMode === "count"}
+            ><Icon name="target" size={14} />{reportGoalMode === "count" ? "按报告数结束" : "自动判断结束"}</Button>}
+            {mode === "pentest" && reportGoalMode === "count" && <NumberField
+              className="collect-count" min={1} value={expectedFindings}
+              onChange={setExpectedFindings} scrubLabel="#"
+              ariaLabel="目标报告数量" data-tooltip="提交多少份独立漏洞报告后结束"
+            />}
             {mode === "ctf" && (
               <Button
                 size="sm"
@@ -1376,7 +1401,9 @@ function Composer({
           )}
         </div>
         <div className="hintline">
-          {t(mode === "pentest" ? "composer.pentestHintline" : "composer.hintline")}
+          {mode === "pentest" && reportGoalMode === "count"
+            ? `已设定 ${expectedFindings || "?"} 份独立报告目标 · ⌘↵ 开始测试`
+            : t(mode === "pentest" ? "composer.pentestHintline" : "composer.hintline")}
           <span className="kbd-hint" aria-label={t("composer.focusHint")}>
             <kbd>{t("composer.focusKey")}</kbd> {t("composer.focusHint")}
           </span>
