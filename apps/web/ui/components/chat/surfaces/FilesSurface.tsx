@@ -28,6 +28,7 @@ import { TypedResourcePreview, workspacePreviewToProps } from "@/components/conv
 import { formatLineCitation } from "@/components/chat/preview/CodeViewer";
 import { PathBreadcrumb } from "./PathBreadcrumb";
 import { SurfaceToolbar, fileIconFor, formatBytes, parentPath, surfaceJson } from "./shared";
+import { NativeWorkspaceFileActions } from "@/components/NativeWorkspaceFileActions";
 
 type SearchMode = "browse" | "files" | "content";
 type FileEntry = { name: string; path: string; kind: "directory" | "file"; size?: number | null };
@@ -60,7 +61,7 @@ function ListSkeleton() {
   );
 }
 
-export function FilesSurface({ threadId, hasWorkspace, onCiteToComposer }: SurfaceProps) {
+export function FilesSurface({ threadId, view, hasWorkspace, onCiteToComposer }: SurfaceProps) {
   const [path, setPath] = useState("");
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -449,6 +450,7 @@ export function FilesSurface({ threadId, hasWorkspace, onCiteToComposer }: Surfa
         <span className="shrink-0 rounded-md bg-cx-hover px-1.5 text-[11px] leading-5 text-cx-fg-4" aria-label="文件来自运行环境">运行环境</span>
         <IconButton icon="refresh" label="刷新" loading={loading && entries.length > 0} onClick={() => void loadDir(path)} />
       </SurfaceToolbar>
+      {view.workspace && <NativeWorkspaceFileActions threadId={threadId} workspaceId={view.workspace.workspace_id} serviceRoot={view.workspace.root_path} relativePath={preview?.path || selectedFilePath || undefined} />}
       <div className="flex shrink-0 items-center gap-1.5 border-b border-cx-border-subtle px-2 py-1.5">
         <SearchInput
           value={query}

@@ -145,6 +145,7 @@ export interface CollaborationAgent extends CollaborationMetrics {
   lastProgressAt?: number;
   tokens: number;
   usd: number;
+  unpricedCalls?: number;
   locks: number;
   isAnomaly: boolean;
   /** i18n key when statusReason is oom / timeout / error / budget. */
@@ -1373,16 +1374,25 @@ export function activityCountForAgent(deck: DeckState, agent: CollaborationAgent
 /** Solver ids whose ledger totals belong to the coordinator card. */
 const COORDINATOR_COST_IDS = ["reason", "coordinator", "report-value"];
 
-function coordinatorCost(deck: DeckState): { tokens: number; usd: number } {
+export function recordedAmount(usd: number, tokens: number, unpricedCalls?: number): string {
+  if (unpricedCalls == null) return tokens > 0 || usd > 0 ? "金额口径待核" : "—";
+  if (unpricedCalls && usd === 0) return "未定价";
+  if (unpricedCalls) return `$${usd.toFixed(4)}（部分未定价）`;
+  return `$${usd.toFixed(4)}`;
+}
+
+function coordinatorCost(deck: DeckState): { tokens: number; usd: number; unpricedCalls: number | undefined } {
   let tokens = 0;
   let usd = 0;
+  let unpricedCalls: number | undefined;
   for (const id of COORDINATOR_COST_IDS) {
     const cost = deck.costBySolver[id];
     if (!cost) continue;
     tokens += (cost.tokensIn || 0) + (cost.tokensOut || 0);
     usd += cost.usd || 0;
+    if (cost.unpricedCalls != null) unpricedCalls = (unpricedCalls ?? 0) + cost.unpricedCalls;
   }
-  return { tokens, usd };
+  return { tokens, usd, unpricedCalls };
 }
 
 function buildWorker(
@@ -1482,6 +1492,7 @@ function buildWorker(
     lastProgressAt,
     tokens: lane?.tokensSpent ?? ((cost?.tokensIn || 0) + (cost?.tokensOut || 0)),
     usd: cost?.usd || 0,
+    unpricedCalls: cost?.unpricedCalls,
     ...(agentKnowledge?.metrics || emptyMetrics()),
     locks,
     anomalyReasonKey: reasonKey,
@@ -1541,6 +1552,7 @@ function buildCoordinator(
     lastProgressAt: lastEventAt,
     tokens: cost.tokens,
     usd: cost.usd,
+    unpricedCalls: cost.unpricedCalls,
     ...knowledge.coordinator.metrics,
     locks,
     pendingHitl: 0,
@@ -1607,6 +1619,7 @@ export function buildAgentCollaborationModel(deck: DeckState, scope: Collaborati
     coordination: undefined,
     tokens: (deck.costBySolver.reason?.tokensIn || 0) + (deck.costBySolver.reason?.tokensOut || 0),
     usd: deck.costBySolver.reason?.usd || 0,
+    unpricedCalls: deck.costBySolver.reason?.unpricedCalls,
     latestActivity: lastReason?.label || "",
     firstSeenAt: reasonEvents[0]?.ts ?? rounds[0]?.ts,
     startedAt: reasonEvents[0]?.ts ?? rounds[0]?.ts,

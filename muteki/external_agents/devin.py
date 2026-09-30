@@ -15,13 +15,13 @@ from pathlib import Path
 import shutil
 import subprocess
 import time
-from typing import Any, Mapping, Optional
+from typing import Any, AsyncIterator, Mapping, Optional
 
 from muteki.platform.contracts.external_agents import (
-    AgentCapabilities, ProbeRequest, SessionStart,
+    AgentCapabilities, AgentEvent, AgentInput, AgentSessionRef, ProbeRequest, SessionStart,
 )
 
-from .acp import AcpError, AcpTransport, BaseAcpAdapter, check_response
+from .acp import AcpError, AcpTransport, BaseAcpAdapter
 
 
 def default_devin_binary() -> str:
@@ -160,35 +160,49 @@ class DevinAcpAdapter(BaseAcpAdapter):
     async def _after_session_open(
         self, transport: AcpTransport, session_id: str, request: SessionStart,
     ) -> None:
-        setup = transport.session_setup(session_id)
-        available = {
-            str(mode.get("id")) for mode in
-            (setup.get("modes") or {}).get("availableModes", [])
-        }
         selected = request.permission_mode or {
             "supervised": "ask", "auto-accept-edits": "accept-edits",
             "auto": "smart", "full-access": "bypass",
         }.get(request.access_mode or "supervised", "ask")
-        if selected not in available:
-            raise AcpError(f"Devin does not advertise permission mode {selected!r}")
         if request.sandbox_mode:
             raise AcpError("Devin ACP sandbox selection is not supported")
         if request.effort not in (None, "", "default"):
             raise AcpError("Choose a Devin model variant instead of a separate effort")
-        await transport.set_mode(session_id, selected)
-        # Devin uses ACP configOptions, including on session/load. Applying the
-        # choice here also covers resumed sessions whose old model differs.
-        if request.model:
-            model_option = next((item for item in setup.get("configOptions", [])
-                                 if item.get("category") == "model"
-                                 or item.get("id") == "model"), None)
-            if model_option is None:
-                raise AcpError("Devin did not advertise a model configuration option")
-            response = await transport.peer.request("session/set_config_option", {
-                "sessionId": session_id, "configId": model_option["id"],
-                "value": request.model,
-            }, timeout=30)
-            check_response("session/set_config_option", response)
+        # Config options are authoritative on both new and loaded sessions.
+        # Select the model first: its response may change the available modes.
+        for category, value in (("model", request.model), ("mode", selected)):
+            if not value:
+                continue
+            setup = transport.session_setup(session_id)
+            option = next((item for item in setup.get("configOptions", [])
+                           if item.get("category") == category
+                           or item.get("id") == category), None)
+            if option is None:
+                raise AcpError(f"Devin did not advertise a {category} configuration option")
+            choices = [choice for group in option.get("options", [])
+                       for choice in (group.get("options", []) if "group" in group else [group])]
+            if option.get("type") != "select" or value not in {item.get("value") for item in choices}:
+                raise AcpError(f"Devin does not advertise {category} {value!r}")
+            if option.get("currentValue") != value:
+                await transport.set_config_option(session_id, option["id"], value)
+
+    async def _prompt_stream(
+        self, session: AgentSessionRef, input: AgentInput,
+    ) -> AsyncIterator[AgentEvent]:
+        # Devin 3000.11.3 appends a system mode_transition after the first user
+        # message, even when configuration completed before session/prompt.
+        # Explain the host's presentation contract without filtering output or
+        # changing tool permissions. Native slash commands must remain verbatim.
+        if not input.payload.get("runtime_capability") and not input.text.lstrip().startswith("/"):
+            input = input.model_copy(update={"text": (
+                "The ACP client applies and displays session configuration separately from the conversation. "
+                "Treat runtime mode-transition notices as configuration context, not additional user requests. "
+                "Do not acknowledge those notices unless the user asks about the configuration. "
+                "Answer the user request below and follow its requested output format.\n\n"
+                + input.text
+            )})
+        async for event in super()._prompt_stream(session, input):
+            yield event
 
     def _turn_result_usage(self, result: dict[str, Any]) -> dict[str, Any]:
         usage = result.get("usage") or {}

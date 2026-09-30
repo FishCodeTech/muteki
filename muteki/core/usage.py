@@ -15,10 +15,43 @@ import time
 from typing import Any
 from uuid import uuid4
 
+from muteki.core.cost import PRICES
+
 FIELDS = ('input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens', 'reasoning_tokens')
 DIMS = ('run_id', 'thread_id', 'turn_id', 'competition_id', 'challenge_id', 'worker_id', 'role', 'actor_kind', 'model', 'engine', 'generation', 'workspace_kind')
 request_identity: ContextVar[str | None] = ContextVar('usage_request_identity', default=None)
 _context: ContextVar[tuple | None] = ContextVar('usage_context', default=None)
+_TRUSTED_PRICE_SOURCES = frozenset({'model_price', 'driver_estimate'})
+
+
+def _unverified_estimate(row: dict) -> bool:
+    return (
+        _legacy_pi_amount(row)
+        or ('estimated_cost' in row
+            and row.get('price_source') not in _TRUSTED_PRICE_SOURCES
+            and row.get('model') not in PRICES)
+    )
+
+
+def _legacy_pi_amount(row: dict) -> bool:
+    return (
+        row.get('engine') in {'pi', 'omp'}
+        and row.get('source') == 'cli'
+        and row.get('price_source') not in _TRUSTED_PRICE_SOURCES
+        and 'reported_cost' in row
+    )
+
+
+def _reported_amount(row: dict) -> float | None:
+    value = row.get('reported_cost')
+    if value is None or _legacy_pi_amount(row) or (_unverified_estimate(row) and value == 0):
+        return None
+    return float(value)
+
+
+def _estimated_amount(row: dict) -> float | None:
+    value = row.get('estimated_cost')
+    return None if value is None or _unverified_estimate(row) else float(value)
 
 
 def number(value):
@@ -53,6 +86,7 @@ def normalize(raw: dict) -> dict:
     result = dict(zip(FIELDS, (inp, out, read, write, reasoning)))
     result['quality'] = 'estimated' if raw.get('estimated') else ('reported' if inp is not None and out is not None else 'partial' if inp is not None or out is not None else 'missing')
     result['source'] = str(raw.get('source') or 'runtime')
+    result['input_includes_cache'] = True
     return result
 
 
@@ -257,7 +291,7 @@ class UsageStore:
                 )
         return changed
 
-    def record(self, raw: dict, *, identity: str | None = None, seq: int = 0, at: float | None = None, _db=None, **context):
+    def record(self, raw: dict, *, identity: str | None = None, seq: int = 0, at: float | None = None, _db=None, price_source: str | None = None, **context):
         identity = identity or uuid4().hex
         data = {k: context[k] for k in DIMS if context.get(k) is not None}
         data.update(normalize(raw))
@@ -265,6 +299,8 @@ class UsageStore:
             value = raw.get(key)
             if isinstance(value, (float, int)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
                 data[key] = value
+        if price_source in _TRUSTED_PRICE_SOURCES:
+            data['price_source'] = price_source
         data['status'] = str(raw.get('status') or 'observed')
         data['currency'] = 'USD'
         data['measurement_scope'] = str(raw.get('measurement_scope') or 'invocation')
@@ -355,6 +391,53 @@ class UsageStore:
                 self.record(delta, identity=uid, seq=index, at=stamp, _db=db, **json.loads(scope))
                 previous = current
 
+    def run_totals(self, run_id: str) -> dict[str, int | float | None]:
+        """Read additive durable usage for Run recovery without loading records."""
+        with self.connect() as db:
+            row = db.execute(
+                "WITH classified AS (SELECT "
+                "json_extract(data,'$.input_tokens') AS inp, "
+                "json_extract(data,'$.output_tokens') AS outp, "
+                "json_extract(data,'$.reported_cost') AS reported, "
+                "json_extract(data,'$.estimated_cost') AS estimated, "
+                "CASE WHEN json_extract(data,'$.engine') IN ('pi','omp') "
+                "AND json_extract(data,'$.source')='cli' "
+                "AND COALESCE(json_extract(data,'$.price_source'),'') "
+                "NOT IN ('model_price','driver_estimate') "
+                "AND json_type(data,'$.reported_cost') IS NOT NULL "
+                "THEN 1 ELSE 0 END AS legacy_pi, "
+                "CASE WHEN json_type(data,'$.estimated_cost') IS NOT NULL "
+                "AND COALESCE(json_extract(data,'$.price_source'),'') "
+                "NOT IN ('model_price','driver_estimate') "
+                "AND NOT EXISTS (SELECT 1 FROM json_each(?) "
+                "WHERE value=json_extract(data,'$.model')) "
+                "OR (json_extract(data,'$.engine') IN ('pi','omp') "
+                "AND json_extract(data,'$.source')='cli' "
+                "AND COALESCE(json_extract(data,'$.price_source'),'') "
+                "NOT IN ('model_price','driver_estimate') "
+                "AND json_type(data,'$.reported_cost') IS NOT NULL) "
+                "THEN 1 ELSE 0 END AS unverified "
+                "FROM usage WHERE json_extract(data,'$.run_id')=?) "
+                "SELECT count(*),sum(inp),sum(outp), "
+                "sum(CASE WHEN legacy_pi=1 OR (unverified=1 AND reported=0) "
+                "THEN NULL ELSE reported END), "
+                "sum(CASE WHEN unverified=1 THEN NULL ELSE estimated END), "
+                "sum(CASE WHEN (reported IS NULL OR legacy_pi=1 "
+                "OR (unverified=1 AND reported=0)) "
+                "AND (estimated IS NULL OR unverified=1) THEN 1 ELSE 0 END), "
+                "sum(unverified) FROM classified",
+                (json.dumps(sorted(PRICES)), run_id),
+            ).fetchone()
+        return {
+            "records": int(row[0] or 0),
+            "input_tokens": int(row[1]) if row[1] is not None else None,
+            "output_tokens": int(row[2]) if row[2] is not None else None,
+            "reported_cost": float(row[3]) if row[3] is not None else None,
+            "estimated_cost": float(row[4]) if row[4] is not None else None,
+            "unpriced": int(row[5] or 0),
+            "unverified_estimates": int(row[6] or 0),
+        }
+
     def query(self, *, start: float = 0, end: float | None = None, offset: int = 0, limit: int = 100, **filters):
         with self.connect() as db:
             db.execute('BEGIN')
@@ -384,6 +467,10 @@ class UsageStore:
                 row['workspace_kind'] = 'competition'
             if any(str(row.get(k, '')) != str(v) for k, v in filters.items() if k in DIMS and v is not None and v != ''):
                 continue
+            if _legacy_pi_amount(row):
+                row['cost_status'] = 'legacy_pi_estimate_unverified'
+            elif _unverified_estimate(row):
+                row['cost_status'] = 'legacy_estimate_unverified'
             records.append(row)
         def aggregate(items):
             # Sum only observed fields. Missing stays None so callers can tell
@@ -397,16 +484,22 @@ class UsageStore:
             inp, out = result['input_tokens'], result['output_tokens']
             result['total_tokens'] = (inp + out) if inp is not None and out is not None else None
             result['records'] = len(items)
+            result['input_includes_cache'] = True
             result['quality'] = {
                 q: sum(row.get('quality') == q for row in items)
                 for q in ('reported', 'estimated', 'partial', 'missing')
             }
             result['observed'] = observed
             result['token_coverage'] = _token_coverage(items, inp, out)
-            for key in ('reported_cost', 'estimated_cost'):
-                values = [r[key] for r in items if key in r]
+            for key, amount in (('reported_cost', _reported_amount),
+                                ('estimated_cost', _estimated_amount)):
+                values = [value for r in items if (value := amount(r)) is not None]
                 result[key] = sum(values) if values else None
-            result['unpriced'] = sum('reported_cost' not in r and 'estimated_cost' not in r for r in items)
+            result['unpriced'] = sum(
+                _reported_amount(r) is None and _estimated_amount(r) is None
+                for r in items
+            )
+            result['unverified_estimates'] = sum(_unverified_estimate(r) for r in items)
             return result
         groups = {}
         for dim in ('challenge_id', 'role', 'model', 'engine', 'workspace_kind', 'worker_id'):

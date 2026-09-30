@@ -1,10 +1,11 @@
 /** Host ABI used by installed Visualize skills. No access to the parent DOM. */
 export const VISUALIZATION_BRIDGE = String.raw`
 (() => {
+  const documentNonce = __MUTEKI_DOCUMENT_NONCE__;
   let serial = 0;
   const pending = new Map();
   const tweaks = new Map();
-  const notify = (type, value) => parent.postMessage({type:'muteki:viz:'+type, ...value}, '*');
+  const notify = (type, value) => parent.postMessage({type:'muteki:viz:'+type, documentNonce, ...value}, '*');
   const request = (type, value) => new Promise((resolve, reject) => {
     const id = ++serial;
     const timer = setTimeout(() => {pending.delete(id); reject(new Error('操作未完成'));}, 120000);
@@ -33,6 +34,8 @@ export const VISUALIZATION_BRIDGE = String.raw`
   addEventListener('message', event => {
     if(event.source!==parent) return;
     const data=event.data;
+    if(data?.documentNonce!==documentNonce) return;
+    if(data?.type==='muteki:viz:theme' && ['light','dark'].includes(data.value)) { document.documentElement.style.colorScheme=data.value; changed({theme:data.value,visualizationTheme:data.value}); }
     if(data?.type==='muteki:viz:state') changed({widgetState:data.value});
     if(data?.type==='muteki:viz:result') {
       const value=pending.get(data.id); if(!value) return;
@@ -57,7 +60,7 @@ export const VISUALIZATION_BRIDGE = String.raw`
       if(this.ids.length>=12) return this;
       const id=++serial;this.ids.push(id);
       const safeOptions={label:String(options.label||property),min:options.min,max:options.max,step:options.step,unit:options.unit,
-        options:(options.options||[]).slice(0,12)};
+        options:(options.options||[])};
       tweaks.set(id,{group:this,type,object,property,options:safeOptions,initial:object[property]});
       notify('tweak-add',{control:{id,type,group:this.container?.getAttribute('aria-label')||'设计控件',value:object[property],...safeOptions}});
       return this;
@@ -78,3 +81,5 @@ export const VISUALIZATION_BRIDGE = String.raw`
     event.preventDefault();window.openai.openExternal({href:link.href});
   });
 })();`;
+
+export function visualizationBridge(documentNonce: string): string { return VISUALIZATION_BRIDGE.replace("__MUTEKI_DOCUMENT_NONCE__", JSON.stringify(documentNonce)); }

@@ -41,6 +41,7 @@ export function reduceControl(ev: MutekiEvent, s: DeckState): DeckState | undefi
         usd: typeof p.usd === "number" ? p.usd : 0,
         tokensIn: typeof p.input_tokens === "number" ? p.input_tokens : 0,
         tokensOut: typeof p.output_tokens === "number" ? p.output_tokens : 0,
+        unpricedCalls: typeof p.unpriced_calls === "number" ? p.unpriced_calls : undefined,
       };
       if (p.scope === "solver" && sid) {
         // store this agent's running total, then re-sum across agents for the
@@ -67,9 +68,13 @@ export function reduceControl(ev: MutekiEvent, s: DeckState): DeckState | undefi
         s.tokensOut = Math.max(cu.tokensOut, sum.reduce((a, c) => a + c.tokensOut, 0));
       }
       if (p.run_total && typeof p.run_total === "object") {
-        s.usd = Number(p.run_total.usd ?? 0);
-        s.tokensIn = Number(p.run_total.input_tokens ?? 0);
-        s.tokensOut = Number(p.run_total.output_tokens ?? 0);
+        // Older servers restarted the in-memory run ledger at each execution
+        // generation. Historical event replay must not erase the prior
+        // generation's already-observed per-solver usage.
+        const observed = Object.values(s.costBySolver);
+        s.usd = Math.max(Number(p.run_total.usd ?? 0), observed.reduce((a, c) => a + c.usd, 0));
+        s.tokensIn = Math.max(Number(p.run_total.input_tokens ?? 0), observed.reduce((a, c) => a + c.tokensIn, 0));
+        s.tokensOut = Math.max(Number(p.run_total.output_tokens ?? 0), observed.reduce((a, c) => a + c.tokensOut, 0));
       }
       break;
     }

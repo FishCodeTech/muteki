@@ -1,9 +1,29 @@
 const http = require('node:http');
 
-// A disposable Web app fixture. Desktop tests must retain this page's own
-// sidebar, form, state and handlers while relocating only its global chrome.
+// Disposable service contracts for the local shared chat renderer. No runtime
+// or Provider is installed; this fixture never sends a task or starts a CLI.
 function createFixture() {
   const server = http.createServer((request, response) => {
+    const url = new URL(request.url, 'http://127.0.0.1');
+    if (url.pathname.startsWith('/api/')) {
+      if (url.pathname === '/api/threads/inbox/events') {
+        response.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store' });
+        response.write('event: snapshot\ndata: ' + JSON.stringify({ threads: [], attention: [], inbox_seq: 0, broker_epoch: 'desktop-smoke' }) + '\n\n');
+        return;
+      }
+      const bodies = {
+        '/api/health': { status: 'ready', ready: true },
+        '/api/auth/me': { authenticated: true, auth_required: false, service_id: 'desktop-smoke', identity_id: 'operator', in_container: false },
+        '/api/auth/ticket': { ticket: '' },
+        '/api/threads': { threads: [] }, '/api/projects': { projects: [] },
+        '/api/agent-runtimes': { runtimes: [] }, '/api/sidebar-preferences': { pinned_ids: [], project_order: [] },
+        '/api/settings/credentials': { credentials: [] },
+      };
+      const body = bodies[url.pathname];
+      response.writeHead(body ? 200 : 404, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify(body || { error: { code: 'fixture.operation_unavailable', message: 'This smoke fixture does not implement that operation.' } }));
+      return;
+    }
     response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     response.end(`<!doctype html><html lang="zh-CN" data-theme="light"><head><title>Muteki Web fixture</title><style>
     *{box-sizing:border-box}html,body{height:100%;margin:0;font:14px -apple-system,sans-serif;color:#262626;background:white}body{--rail:#f8f8f8;--line:#e8e8e8}.workspace-frame{height:100%;display:flex;flex-direction:column;--workspace-nav-height:58px;--conv-sidebar-width:270px;--workspace-collapsed-brand-height:52px}.workspace-nav{height:58px;border-bottom:1px solid #eee;display:flex;align-items:center;justify-content:center;gap:22px}nav a{margin-right:25px;color:inherit}.workspace-shared-brand-dock{position:absolute;top:0;left:0;width:270px;height:58px;display:flex;align-items:center;justify-content:space-between;padding:0 20px;font-weight:600;font-size:19px}.workspace-nav-settings{display:flex;gap:8px}.workspace-frame-content{flex:1;min-height:0;display:flex}.cx-sidebar-nav{width:270px;flex-shrink:0;background:#f8f8f8;border-right:1px solid #eee;display:flex;flex-direction:column}.cx-sidebar-nav::before{content:'';height:0;flex:none}.sidebar-body{padding:18px 16px;line-height:2.5}.sidebar-body a{display:block;color:inherit;text-decoration:none;padding-left:12px}.sidebar-body strong{display:block;font-weight:500;margin-top:18px}.business{flex:1;min-width:0;display:flex;flex-direction:column;padding:30px 40px 18px}.business-content{flex:1;overflow:auto;max-width:760px;width:100%;margin:auto}h1{font-size:24px;font-weight:500;margin:15px 0 22px}p{line-height:1.9}button,input,textarea{font:inherit}button{cursor:pointer;border:1px solid #ddd;border-radius:7px;padding:7px 12px;background:white}.composer{max-width:760px;width:100%;margin:24px auto 0;border:1px solid #e5e5e5;border-radius:18px;padding:15px;box-shadow:0 5px 24px #00000008}.composer textarea{width:100%;height:68px;border:0;resize:none;outline:none;background:transparent}.composer footer{display:flex;justify-content:space-between;align-items:center;color:#888;font-size:12px}.composer button{border-radius:20px;background:#377bea;color:white;border:0}dialog{border:1px solid #ddd;border-radius:14px;padding:24px;width:430px}dialog::backdrop{background:#0003}dialog input{width:100%;padding:12px;border:1px solid #ddd;border-radius:7px;margin:10px 0 20px}.mode-card{border:1px solid #eee;border-radius:12px;padding:20px;margin:20px 0}.badge{color:#888}.workspace-nav-badge{font-size:10px;padding:2px 4px;background:#e7f0ff;border-radius:10px}.dark{background:#191b20;color:#e8e8e8}.dark .business,.dark .workspace-frame{background:#191b20;color:#e8e8e8}.dark .cx-sidebar-nav{background:#22242a;color:#eee}.dark button{background:#292d34;color:#eee}.dark textarea{color:#eee}.dark .composer{border-color:#35383e}

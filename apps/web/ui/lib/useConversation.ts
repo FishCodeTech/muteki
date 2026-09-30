@@ -19,6 +19,7 @@ import { countThreadAttention } from "./threadAttention";
 import type { ConversationInboxEvent } from "./threadNotifications";
 import { API, apiFetch } from "./useRun";
 import { recordTaskReceipt } from "./task-center";
+import { conversationStorageScope } from "./conversationStorageScope";
 import { conversationCommandErrorFrom } from "./sendIntentStore";
 
 export type ThreadMode =
@@ -84,7 +85,10 @@ export interface ConversationState {
 export interface ConversationMessage {
   message_id: string;
   turn_id?: string | null;
-  role: "user" | "assistant" | "system";
+  role: "user" | "assistant" | "system" | "tool" | string;
+  source_provider?: string;
+  source_role?: string;
+  source_content?: unknown;
   kind?: "message" | "steer" | string;
   text: string;
   stream_seq?: number;
@@ -121,6 +125,7 @@ export interface ConversationSearchResult {
   count: number;
   hits: ConversationSearchHit[];
   reason?: string;
+  offset?: number; limit?: number; has_more?: boolean; next_offset?: number | null;
 }
 
 export interface ConversationTurn {
@@ -131,6 +136,7 @@ export interface ConversationTurn {
   text: string;
   attachments?: string[];
   capability_refs?: Array<Record<string, unknown>>;
+  runtime_snapshot?: { adapter_id?: string; instance_id?: string; credential_id?: string; model?: string; effort?: string; access_mode?: string } | null;
   retry_of_turn_id?: string | null;
   error?: Record<string, unknown>;
   usage?: Record<string, unknown>;
@@ -373,6 +379,7 @@ export interface ConversationView {
 }
 
 export interface RuntimeAuthView {
+  code?: string;
   status?: string;
   detail?: string;
   login_command?: string;
@@ -459,6 +466,7 @@ export interface ConversationCredential {
   present: boolean;
   status: string;
   status_detail?: string;
+  discovery_code?: string;
   /** Models proven by a successful chat or an explicit credential test. */
   models: ConversationCredentialModel[];
   /** Catalog / declared models not yet proven with this credential. */
@@ -530,7 +538,13 @@ function commandId(): string {
 export type CommandIdOptions = {
   commandId?: string;
   idempotencyKey?: string;
+  signal?: AbortSignal;
 };
+
+function requestSignal(signal?: AbortSignal, timeoutMs = 15_000): AbortSignal {
+  const timeout = AbortSignal.timeout(Math.max(1, timeoutMs));
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
 
 const RECEIPT_TERMINAL_STATES = new Set([
   "completed",
@@ -538,13 +552,17 @@ const RECEIPT_TERMINAL_STATES = new Set([
   "conflict",
   "cancelled",
 ]);
+const receiptOwnerScopes = new WeakMap<CommandReceiptView, string>();
 
-async function receiptOf(res: Response): Promise<CommandReceiptView> {
+async function receiptOf(res: Response, ownerScope: string): Promise<CommandReceiptView> {
   const body = (await res.json().catch(() => ({}))) as {
     receipt?: CommandReceiptView;
     error?: CommandReceiptView["error"];
   };
-  if (body.receipt) return body.receipt;
+  if (body.receipt) {
+    receiptOwnerScopes.set(body.receipt, ownerScope);
+    return body.receipt;
+  }
   throw conversationCommandErrorFrom(
     body.error,
     `请求失败（HTTP ${res.status}）`,
@@ -555,16 +573,33 @@ async function receiptOf(res: Response): Promise<CommandReceiptView> {
 /** Look up a prior acceptance/terminal receipt by stable command_id (C02). */
 export async function fetchCommandReceipt(
   commandId: string,
+  options: { signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<CommandReceiptView | null> {
+  const ownerScope = conversationStorageScope();
   const id = String(commandId || "").trim();
   if (!id) return null;
-  const res = await apiFetch(`/api/receipts/${encodeURIComponent(id)}`);
+  const res = await apiFetch(`/api/receipts/${encodeURIComponent(id)}`, {
+    signal: requestSignal(options.signal, options.timeoutMs),
+  });
   if (res.status === 404) return null;
-  if (!res.ok) return null;
-  const body = (await res.json().catch(() => ({}))) as {
-    receipt?: CommandReceiptView;
-  };
-  return body.receipt || null;
+  const raw = await res.text();
+  let body: { receipt?: CommandReceiptView; error?: CommandReceiptView["error"] };
+  try { body = JSON.parse(raw); }
+  catch {
+    throw conversationCommandErrorFrom({ code: "conversation.receipt.protocol_invalid",
+      category: "protocol", message: "回执服务没有返回有效 JSON", retryable: false,
+      detail: { response_body: raw, command_id: id } }, "回执格式无效", { httpStatus: res.status });
+  }
+  if (!res.ok) throw conversationCommandErrorFrom(body?.error,
+    `查询回执失败（HTTP ${res.status}）`, { httpStatus: res.status });
+  const receipt = body?.receipt;
+  if (!receipt || receipt.command_id !== id || !["accepted", "running", "waiting", ...RECEIPT_TERMINAL_STATES].includes(receipt.state)) {
+    throw conversationCommandErrorFrom({ code: "conversation.receipt.protocol_invalid",
+      category: "protocol", message: "回执响应缺少匹配的命令身份或状态", retryable: false,
+      detail: { response_body: raw, command_id: id } }, "回执格式无效", { httpStatus: res.status });
+  }
+  receiptOwnerScopes.set(receipt, ownerScope);
+  return receipt;
 }
 
 /**
@@ -575,11 +610,15 @@ export async function recoverCommandReceipt(
   commandId: string,
   attempts = 8,
   delayMs = 200,
+  options: { signal?: AbortSignal; ownerScope?: string } = {},
 ): Promise<CommandReceiptView | null> {
+  const ownerScope = options.ownerScope ?? conversationStorageScope();
   const id = String(commandId || "").trim();
   if (!id) return null;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const receipt = await fetchCommandReceipt(id);
+    options.signal?.throwIfAborted();
+    assertReceiptOwnerScope(id, ownerScope);
+    const receipt = await fetchCommandReceipt(id, options);
     if (receipt) return receipt;
     if (attempt + 1 < attempts) {
       await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -588,25 +627,41 @@ export async function recoverCommandReceipt(
   return null;
 }
 
+function assertReceiptOwnerScope(commandId: string, ownerScope: string): void {
+  if (conversationStorageScope() === ownerScope) return;
+  throw conversationCommandErrorFrom({ code: "conversation.receipt.scope_changed", category: "state",
+    message: "工作台身份已改变，请回到原工作台恢复这条命令的回执", retryable: true,
+    detail: { command_id: commandId, owner_scope: ownerScope, outcome_unknown: true } }, "回执所属工作台已改变");
+}
+
 export async function waitForTerminalReceipt(
   initial: CommandReceiptView,
   label: string,
+  options: { signal?: AbortSignal; ownerScope?: string } = {},
 ): Promise<CommandReceiptView> {
+  const ownerScope = options.ownerScope ?? receiptOwnerScopes.get(initial) ?? conversationStorageScope();
+  recordTaskReceipt(initial, label, "conversation", ownerScope);
   if (!initial.command_id || RECEIPT_TERMINAL_STATES.has(initial.state || "")) {
     return initial;
   }
-  for (let attempt = 0; attempt < 40; attempt += 1) {
+  const deadline = Date.now() + 10_000;
+  for (let attempt = 0; attempt < 40 && Date.now() < deadline; attempt += 1) {
+    options.signal?.throwIfAborted();
     await new Promise((resolve) => setTimeout(resolve, 250));
-    const receipt = await fetchCommandReceipt(initial.command_id);
+    if (Date.now() >= deadline) break;
+    assertReceiptOwnerScope(initial.command_id, ownerScope);
+    const receipt = await fetchCommandReceipt(initial.command_id, {
+      signal: options.signal, timeoutMs: deadline - Date.now(),
+    });
     if (!receipt) continue;
-    recordTaskReceipt(receipt, label, "conversation");
+    recordTaskReceipt(receipt, label, "conversation", ownerScope);
     if (RECEIPT_TERMINAL_STATES.has(receipt.state || "")) return receipt;
   }
   return initial;
 }
 
 export async function fetchConversationThreads(): Promise<ConversationThread[]> {
-  const res = await apiFetch("/api/threads", { cache: "no-store" });
+  const res = await apiFetch("/api/threads", { cache: "no-store", signal: requestSignal() });
   if (!res.ok) throw new Error(`加载对话失败（HTTP ${res.status}）`);
   const body = (await res.json()) as { threads?: ConversationThread[] };
   return body.threads ?? [];
@@ -664,6 +719,7 @@ export function collectSupersededTurnIds(
     explicitlySuperseded.map((turn) => turn.turn_id).filter(Boolean),
   );
   for (const turn of turns) {
+    if (turn.status === "superseded" && turn.turn_id) superseded.add(turn.turn_id);
     let cursor = String(turn.retry_of_turn_id || "");
     const seen = new Set<string>();
     while (cursor && !seen.has(cursor)) {
@@ -784,6 +840,19 @@ export function mergeConversationView(
   }
   const prevGen = previous.state?.current_generation ?? 0;
   const nextGen = next.state?.current_generation ?? 0;
+  if (nextGen < prevGen) return previous;
+  const prevWatermark = previous.watermark ?? previous.state?.head_stream_seq ?? 0;
+  const nextWatermark = next.watermark ?? next.state?.head_stream_seq ?? 0;
+  if (nextGen === prevGen && nextWatermark < prevWatermark) {
+    // An older same-branch snapshot may fill history; it cannot replace the
+    // already admitted controls, lifecycle, queue or metadata.
+    const superseded = collectSupersededTurnIds(previous.turns, previous.superseded_turns || []);
+    const cleaned = omitSupersededBranchRows(next.messages, next.turns, superseded);
+    const messages = mergeMessageLists(cleaned.messages, previous.messages);
+    return { ...previous, messages,
+      turns: mergeTurnLists(cleaned.turns, previous.turns),
+      messages_page: deriveMessagesPage(messages, previous.messages_page) };
+  }
   // Around pages intentionally include superseded hits for search landing.
   // Strip them before union-merge so a stale scroll-anchor cannot remix the
   // old branch onto main after generation already advanced (or same-gen tip).
@@ -928,6 +997,7 @@ export async function fetchConversationView(
   try {
     const res = await apiFetch(
       `/api/threads/${encodeURIComponent(threadId)}?${query}`,
+      { signal: requestSignal() },
     );
     if (!res.ok) throwThreadLoadFailure(res.status);
     return (await res.json()) as ConversationView;
@@ -965,7 +1035,7 @@ export async function fetchConversationMessagesPage(
   try {
     const res = await apiFetch(
       `/api/threads/${encodeURIComponent(threadId)}/messages?${query}`,
-      { signal: options.signal },
+      { signal: requestSignal(options.signal) },
     );
     if (!res.ok) {
       const error = new Error(
@@ -1007,6 +1077,7 @@ export async function fetchConversationSearch(
     includeArchived?: boolean;
     includeSuperseded?: boolean;
     limit?: number;
+    offset?: number;
     signal?: AbortSignal;
   } = {},
 ): Promise<ConversationSearchResult> {
@@ -1017,41 +1088,95 @@ export async function fetchConversationSearch(
   const params = new URLSearchParams({
     q,
     limit: String(options.limit ?? 30),
+    offset: String(options.offset ?? 0),
   });
   if (options.projectId) params.set("project_id", options.projectId);
   if (options.includeArchived) params.set("include_archived", "true");
   if (options.includeSuperseded) params.set("include_superseded", "true");
   const res = await apiFetch(`/api/threads/search?${params}`, {
-    signal: options.signal,
+    signal: requestSignal(options.signal),
   });
-  if (!res.ok) throw new Error(`搜索对话失败（HTTP ${res.status}）`);
-  return (await res.json()) as ConversationSearchResult;
+  if (!res.ok) {
+    const raw = await res.text();
+    let serverError: CommandReceiptView["error"];
+    try { serverError = (JSON.parse(raw) as { error?: CommandReceiptView["error"] })?.error; }
+    catch { /* The original non-JSON body remains in the structured diagnostic. */ }
+    throw conversationCommandErrorFrom({ ...serverError,
+      code: serverError?.code || "conversation.search.http_error",
+      category: serverError?.category || "transport",
+      message: serverError?.message || `搜索对话失败（HTTP ${res.status}）：${raw}`,
+      retryable: serverError?.retryable ?? (res.status >= 500 || res.status === 429),
+      detail: { ...serverError?.detail, response_body: raw },
+    }, "搜索对话失败", { httpStatus: res.status });
+  }
+  const body = await res.json() as ConversationSearchResult;
+  if (!body || !Array.isArray(body.hits) || body.hits.some((hit) => (
+    !hit || typeof hit.message_id !== "string" || !hit.message_id
+    || typeof hit.thread_id !== "string" || !hit.thread_id
+    || typeof hit.snippet !== "string" || typeof hit.thread_title !== "string"
+    || typeof hit.role !== "string" || typeof hit.archived !== "boolean"
+    || typeof hit.superseded !== "boolean" || !Number.isSafeInteger(hit.stream_seq)
+  )) || (body.has_more != null && typeof body.has_more !== "boolean")
+    || (body.next_offset != null && (!Number.isSafeInteger(body.next_offset) || body.next_offset < 0))
+    || (body.has_more && (body.next_offset == null || body.next_offset <= (options.offset ?? 0)))) {
+    throw conversationCommandErrorFrom({ code: "conversation.search.protocol_invalid", category: "protocol",
+      message: "conversation.search.protocol_invalid：搜索响应缺少合法命中或分页游标", retryable: false,
+      detail: { response_body: body } }, "搜索响应格式无效");
+  }
+  return body;
 }
 
 export async function fetchTurnProcess(
   threadId: string,
   turnId: string,
-  options: { limit?: number; signal?: AbortSignal } = {},
+  options: { limit?: number; afterSeq?: number; watermark?: number; signal?: AbortSignal } = {},
 ): Promise<{
   turn_id: string;
   events: ConversationEvent[];
   count: number;
   truncated: boolean;
+  has_more: boolean;
+  next_after_seq?: number | null;
+  watermark: number;
 }> {
   const query = new URLSearchParams({
     limit: String(options.limit ?? 2000),
   });
+  if (options.afterSeq != null) query.set("after_seq", String(options.afterSeq));
+  if (options.watermark != null) query.set("watermark", String(options.watermark));
   const res = await apiFetch(
     `/api/threads/${encodeURIComponent(threadId)}/turns/${encodeURIComponent(turnId)}/process?${query}`,
-    { signal: options.signal },
+    { signal: requestSignal(options.signal) },
   );
-  if (!res.ok) throw new Error(`加载回合过程失败（HTTP ${res.status}）`);
-  return (await res.json()) as {
-    turn_id: string;
-    events: ConversationEvent[];
-    count: number;
-    truncated: boolean;
+  if (!res.ok) throw new Error(`加载回合过程失败（HTTP ${res.status}）：${await res.text()}`);
+  const body = await res.json() as {
+    turn_id: string; events: Array<ConversationEvent & { stream_seq?: number }>;
+    count: number; truncated: boolean; has_more: boolean;
+    next_after_seq?: number | null; watermark: number;
   };
+  const after = options.afterSeq ?? 0;
+  if (!body || body.turn_id !== turnId || !Array.isArray(body.events)
+    || !Number.isSafeInteger(body.watermark) || body.watermark < after
+    || (options.watermark != null && body.watermark !== options.watermark)
+    || typeof body.has_more !== "boolean" || typeof body.truncated !== "boolean"
+    || body.has_more !== body.truncated
+    || body.count !== body.events.length
+    || body.events.some(event => !event || !Number.isSafeInteger(event.seq ?? event.stream_seq)
+      || Number(event.seq ?? event.stream_seq) <= after || Number(event.seq ?? event.stream_seq) > body.watermark
+      || typeof event.event_type !== "string" || !event.payload || typeof event.payload !== "object")
+    || body.events.some((event, index) => index > 0
+      && Number(event.seq ?? event.stream_seq) <= Number(body.events[index - 1].seq ?? body.events[index - 1].stream_seq))
+    || (body.has_more && (body.next_after_seq == null || !Number.isSafeInteger(body.next_after_seq)
+      || body.next_after_seq <= after || body.next_after_seq > body.watermark
+      || body.next_after_seq !== Number(body.events.at(-1)?.seq ?? body.events.at(-1)?.stream_seq)))) {
+    throw conversationCommandErrorFrom({ code: "conversation.process.protocol_invalid", category: "protocol",
+      message: "conversation.process.protocol_invalid：回合过程响应身份、事件或后续游标无效", retryable: false,
+      detail: { response_body: body, thread_id: threadId, turn_id: turnId } }, "回合过程响应格式无效");
+  }
+  return { ...body, events: body.events.map(event => ({
+    ...event, seq: Number(event.seq ?? event.stream_seq ?? 0),
+  })) };
+
 }
 
 export async function fetchRuntimeInstances(): Promise<RuntimeInstance[]> {
@@ -1081,18 +1206,25 @@ export async function fetchRuntimeInstances(): Promise<RuntimeInstance[]> {
   return rows;
 }
 
-export async function probeRuntimeInstance(key: string): Promise<void> {
+export async function probeRuntimeInstance(
+  key: string,
+  options: { credentialId?: string; environment?: "local" } = {},
+): Promise<void> {
+  const ownerScope = conversationStorageScope();
   const res = await apiFetch(
     `/api/agent-runtimes/${encodeURIComponent(key)}/probe`,
-    { method: "POST" },
+    { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ credential_id: options.credentialId || "", environment: options.environment || "local" }) },
   );
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({})) as {
-      error?: { message?: string; code?: string };
-    };
-    throw new Error(
-      body.error?.message || body.error?.code || `探测 Runtime 失败（HTTP ${res.status}）`,
-    );
+  const initial = await receiptOf(res, ownerScope);
+  const receipt = await waitForTerminalReceipt(initial, "验证 Agent 与模型目录", { ownerScope });
+  if (receipt.error || ["failed", "conflict", "cancelled"].includes(receipt.state)) {
+    throw conversationCommandErrorFrom(receipt.error, "探测 Runtime 失败", { httpStatus: res.status });
+  }
+  if (receipt.state !== "completed") {
+    throw conversationCommandErrorFrom({ code: "runtime.instance.probe_outcome_unknown", category: "state",
+      message: "Agent 探测仍在进行，请稍后刷新接入状态", retryable: true,
+      detail: { command_id: receipt.command_id, outcome_unknown: true } }, "探测结果待确认");
   }
 }
 
@@ -1193,6 +1325,7 @@ function normalizeCredential(
     present,
     status: String(row.status ?? (present ? "ready" : "missing")),
     ...(statusDetail ? { status_detail: statusDetail } : {}),
+    ...(typeof row.discovery_code === "string" ? { discovery_code: row.discovery_code } : {}),
     models,
     candidate_models: candidateModels,
     default_model: String(row.default_model ?? row.suggested_model ?? ""),
@@ -1308,12 +1441,13 @@ export async function createConversationProject(input: {
   root_path: string;
   description?: string;
 }): Promise<{ projectId: string; workspaceId: string; rootPath?: string; reused?: boolean }> {
+  const ownerScope = conversationStorageScope();
   const res = await apiFetch("/api/projects", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ...input, command_id: commandId() }),
   });
-  const receipt = await receiptOf(res);
+  const receipt = await receiptOf(res, ownerScope);
   if (receipt.error?.code === "conversation.project.directory_already_bound") {
     const projectId = String(receipt.error.detail?.project_id || "").trim();
     const workspaceId = String(receipt.error.detail?.workspace_id || "").trim();
@@ -1326,7 +1460,7 @@ export async function createConversationProject(input: {
       };
     }
   }
-  recordTaskReceipt(receipt, "创建项目", "conversation");
+  recordTaskReceipt(receipt, "创建项目", "conversation", ownerScope);
   if (receipt.error) {
     throw conversationCommandErrorFrom(receipt.error, "创建项目失败", {
       httpStatus: res.status,
@@ -1341,14 +1475,19 @@ export async function createConversationProject(input: {
 export async function updateConversationProjectSettings(
   projectId: string,
   settings: Record<string, string>,
-): Promise<void> {
+): Promise<CommandReceiptView> {
+  const ownerScope = conversationStorageScope();
   const res = await apiFetch(`/api/projects/${encodeURIComponent(projectId)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ settings, command_id: commandId() }),
   });
-  const receipt = await receiptOf(res);
-  recordTaskReceipt(receipt, "更新项目设置", "conversation");
+  const receipt = await receiptOf(res, ownerScope);
+  recordTaskReceipt(receipt, "更新项目设置", "conversation", ownerScope);
+  if (receipt.error || (RECEIPT_TERMINAL_STATES.has(receipt.state || "") && receipt.state !== "completed")) {
+    throw conversationCommandErrorFrom(receipt.error, `更新项目设置未完成（${receipt.state}），原设置仍然有效`, { httpStatus: res.status });
+  }
+  return receipt;
 }
 
 export interface ProjectGitStatus {
@@ -1495,8 +1634,14 @@ export async function bindConversationWorkspace(input: {
   branch?: string;
   base_ref?: string;
   parent_root?: string;
-}): Promise<{ workspaceId: string; rootPath: string; settings: Record<string, unknown> }> {
-  const res = await apiFetch("/api/workspaces", {
+}, options: CommandIdOptions = {}): Promise<{ workspaceId: string; rootPath: string; settings: Record<string, unknown> }> {
+  const ownerScope = conversationStorageScope();
+  const requestId = String(options.commandId || "").trim() || commandId();
+  const idempotencyKey = String(options.idempotencyKey || "").trim() || requestId;
+  let receipt: CommandReceiptView;
+  let httpStatus: number | undefined;
+  try {
+    const res = await apiFetch("/api/workspaces", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -1507,11 +1652,31 @@ export async function bindConversationWorkspace(input: {
       branch: input.branch || "",
       base_ref: input.base_ref || "HEAD",
       parent_root: input.parent_root || "",
-      command_id: commandId(),
+      command_id: requestId,
+      idempotency_key: idempotencyKey,
     }),
-  });
-  const receipt = await receiptOf(res);
-  recordTaskReceipt(receipt, "绑定工作区", "conversation");
+    signal: requestSignal(options.signal),
+    });
+    httpStatus = res.status;
+    receipt = await receiptOf(res, ownerScope);
+  } catch (exc) {
+    if (options.signal?.aborted) throw exc;
+    const recovered = await recoverCommandReceipt(requestId, 8, 200, { ...options, ownerScope });
+    if (!recovered) throw exc;
+    receipt = recovered;
+  }
+  receipt = await waitForTerminalReceipt(receipt, "绑定工作区", { ...options, ownerScope });
+  recordTaskReceipt(receipt, "绑定工作区", "conversation", ownerScope);
+  if (receipt.error || (RECEIPT_TERMINAL_STATES.has(receipt.state) && receipt.state !== "completed")) {
+    throw conversationCommandErrorFrom(receipt.error, "绑定工作区失败", {
+      httpStatus, deduplicated: Boolean(receipt.deduplicated),
+    });
+  }
+  if (receipt.state !== "completed") throw conversationCommandErrorFrom({
+    code: "conversation.workspace.pending", category: "state", retryable: true,
+    message: "工作区绑定尚未确认完成，请继续恢复原命令；不会创建新工作区",
+    detail: { command_id: receipt.command_id, receipt_state: receipt.state, outcome_unknown: true },
+  }, "工作区绑定尚未确认");
   const workspaceId = String(
     receipt.aggregate?.id || receipt.output?.workspace_id || "",
   ).trim();
@@ -1546,6 +1711,7 @@ export async function createConversationThread(
   },
   options: CommandIdOptions = {},
 ): Promise<string> {
+  const ownerScope = conversationStorageScope();
   const requestId = String(options.commandId || "").trim() || commandId();
   const idempotencyKey = String(options.idempotencyKey || "").trim() || requestId;
   let receipt: CommandReceiptView;
@@ -1559,16 +1725,19 @@ export async function createConversationThread(
         command_id: requestId,
         idempotency_key: idempotencyKey,
       }),
+      signal: requestSignal(options.signal),
     });
     httpStatus = res.status;
-    receipt = await receiptOf(res);
+    receipt = await receiptOf(res, ownerScope);
   } catch (exc) {
-    const recovered = await recoverCommandReceipt(requestId);
+    if (options.signal?.aborted) throw exc;
+    const recovered = await recoverCommandReceipt(requestId, 8, 200, { ...options, ownerScope });
     if (!recovered) throw exc;
     receipt = recovered;
   }
-  recordTaskReceipt(receipt, "创建对话", "conversation");
-  if (receipt.error) {
+  receipt = await waitForTerminalReceipt(receipt, "创建对话", { ...options, ownerScope });
+  recordTaskReceipt(receipt, "创建对话", "conversation", ownerScope);
+  if (receipt.error || (RECEIPT_TERMINAL_STATES.has(receipt.state) && receipt.state !== "completed")) {
     throw conversationCommandErrorFrom(
       receipt.error,
       "创建对话失败",
@@ -1578,6 +1747,11 @@ export async function createConversationThread(
       },
     );
   }
+  if (receipt.state !== "completed") throw conversationCommandErrorFrom({
+    code: "conversation.thread.pending", category: "state", retryable: true,
+    message: "对话创建尚未确认完成，请继续恢复原命令；计划中的 ID 暂不能发送",
+    detail: { command_id: receipt.command_id, receipt_state: receipt.state, outcome_unknown: true },
+  }, "对话创建尚未确认");
   if (!receipt.aggregate?.id) throw new Error("Thread 回执缺少 aggregate id");
   return receipt.aggregate.id;
 }
@@ -1588,6 +1762,7 @@ export async function sendConversationCommand(
   payload: Record<string, unknown> = {},
   options: CommandIdOptions = {},
 ): Promise<CommandReceiptView> {
+  const ownerScope = conversationStorageScope();
   const requestId = String(options.commandId || "").trim() || commandId();
   const idempotencyKey = String(options.idempotencyKey || "").trim() || requestId;
   let receipt: CommandReceiptView;
@@ -1604,16 +1779,18 @@ export async function sendConversationCommand(
           idempotency_key: idempotencyKey,
           payload,
         }),
+        signal: requestSignal(options.signal),
       },
     );
     httpStatus = res.status;
-    receipt = await receiptOf(res);
+    receipt = await receiptOf(res, ownerScope);
   } catch (exc) {
-    const recovered = await recoverCommandReceipt(requestId);
+    if (options.signal?.aborted) throw exc;
+    const recovered = await recoverCommandReceipt(requestId, 8, 200, { ...options, ownerScope });
     if (!recovered) throw exc;
     receipt = recovered;
   }
-  recordTaskReceipt(receipt, commandType, "conversation");
+  recordTaskReceipt(receipt, commandType, "conversation", ownerScope);
   if (receipt.error) {
     throw conversationCommandErrorFrom(
       receipt.error,
@@ -1674,6 +1851,7 @@ export async function fetchThreadAudit(
 ): Promise<ConversationView> {
   const res = await apiFetch(
     `/api/threads/${encodeURIComponent(threadId)}?mark_read=false&include_superseded=true`,
+    { signal: requestSignal() },
   );
   if (!res.ok) {
     throw new Error(`加载被替代历史失败（HTTP ${res.status}）`);
@@ -1686,6 +1864,7 @@ export async function uploadConversationFile(
   file: File,
   options: CommandIdOptions = {},
 ): Promise<CommandReceiptView> {
+  const ownerScope = conversationStorageScope();
   const requestId = String(options.commandId || "").trim() || commandId();
   const idempotencyKey = String(options.idempotencyKey || "").trim() || requestId;
   const body = new FormData();
@@ -1696,15 +1875,16 @@ export async function uploadConversationFile(
   try {
     const res = await apiFetch(
       `/api/threads/${encodeURIComponent(threadId)}/uploads`,
-      { method: "POST", body },
+      { method: "POST", body, signal: requestSignal(options.signal, 60_000) },
     );
-    receipt = await receiptOf(res);
+    receipt = await receiptOf(res, ownerScope);
   } catch (exc) {
-    const recovered = await recoverCommandReceipt(requestId);
+    if (options.signal?.aborted) throw exc;
+    const recovered = await recoverCommandReceipt(requestId, 8, 200, { ...options, ownerScope });
     if (!recovered) throw exc;
     receipt = recovered;
   }
-  recordTaskReceipt(receipt, `上传文件：${file.name}`, "conversation");
+  recordTaskReceipt(receipt, `上传文件：${file.name}`, "conversation", ownerScope);
   if (receipt.error) {
     throw conversationCommandErrorFrom(
       receipt.error,
@@ -1736,6 +1916,7 @@ export async function recordConversationMemory(
   content: string,
   kind = "note",
 ): Promise<CommandReceiptView> {
+  const ownerScope = conversationStorageScope();
   const command = commandId();
   const res = await apiFetch(
     `/api/threads/${encodeURIComponent(threadId)}/memory`,
@@ -1751,8 +1932,8 @@ export async function recordConversationMemory(
       }),
     },
   );
-  const receipt = await receiptOf(res);
-  recordTaskReceipt(receipt, "写入长期记忆", "conversation");
+  const receipt = await receiptOf(res, ownerScope);
+  recordTaskReceipt(receipt, "写入长期记忆", "conversation", ownerScope);
   return receipt;
 }
 
@@ -1760,6 +1941,7 @@ export async function deleteConversationMemory(
   threadId: string,
   memoryId: string,
 ): Promise<CommandReceiptView> {
+  const ownerScope = conversationStorageScope();
   const command = commandId();
   const res = await apiFetch(
     `/api/threads/${encodeURIComponent(threadId)}/memory/${encodeURIComponent(memoryId)}`,
@@ -1774,14 +1956,15 @@ export async function deleteConversationMemory(
       }),
     },
   );
-  const receipt = await receiptOf(res);
-  recordTaskReceipt(receipt, "删除长期记忆", "conversation");
+  const receipt = await receiptOf(res, ownerScope);
+  recordTaskReceipt(receipt, "删除长期记忆", "conversation", ownerScope);
   return receipt;
 }
 
 // -- C33: Provider session import helpers ------------------------------------
 
 export interface ProviderSessionScan {
+  source_fingerprint: string;
   session_id: string;
   adapter_id: string;
   source_path: string;
@@ -1814,13 +1997,17 @@ export async function fetchImportScan(params: {
   if (params.path) q.set("path", params.path);
   if (params.limit) q.set("limit", String(params.limit));
   const res = await apiFetch(`/api/import/scan?${q.toString()}`);
-  if (!res.ok) throw new Error(`import scan failed: ${res.status}`);
+  if (!res.ok) {
+    const payload = await res.json();
+    throw new Error(payload.error?.message || payload.detail?.message || payload.detail || `扫描失败（HTTP ${res.status}）`);
+  }
   return res.json() as Promise<ImportScanResult>;
 }
 
 export async function applyImport(params: {
   adapter_id: "claude" | "codex";
   source_path: string;
+  source_versions?: Record<string, string>;
   sessions: string[];
   project_id?: string;
   dry_run?: boolean;
@@ -1883,20 +2070,32 @@ export function useConversationThreads(options?: {
   const onInboxEventRef = useRef(options?.onInboxEvent);
   onInboxEventRef.current = options?.onInboxEvent;
   const activeThreadId = options?.activeThreadId || "";
+  const listRequestRef = useRef(0);
+  const inboxRevisionRef = useRef(0);
+  const listMountedRef = useRef(true);
 
   const refresh = useCallback(async () => {
+    const request = ++listRequestRef.current;
+    const inboxRevision = inboxRevisionRef.current;
+    const isCurrent = () => listMountedRef.current
+      && request === listRequestRef.current && inboxRevision === inboxRevisionRef.current;
     try {
-      setThreads(await fetchConversationThreads());
+      const rows = await fetchConversationThreads();
+      if (!isCurrent()) return;
+      setThreads(rows);
       setError("");
     } catch (exc) {
+      if (!isCurrent()) return;
       setError(exc instanceof Error ? exc.message : String(exc));
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
+    listMountedRef.current = true;
     void refresh();
+    return () => { listMountedRef.current = false; listRequestRef.current += 1; };
   }, [refresh]);
 
   useEffect(() => {
@@ -1938,6 +2137,7 @@ export function useConversationThreads(options?: {
       if (streamRef.current.appliedSeq > 0) {
         query.set("after", String(streamRef.current.appliedSeq));
       }
+      if (streamRef.current.brokerEpoch) query.set("broker_epoch", streamRef.current.brokerEpoch);
       if (ticket) query.set("ticket", ticket);
 
       const nextEs = new EventSource(
@@ -1968,13 +2168,18 @@ export function useConversationThreads(options?: {
           const payload = JSON.parse((raw as MessageEvent).data) as {
             threads?: ConversationThread[];
             inbox_seq?: number;
+            broker_epoch?: string;
           };
+          const epoch = String(payload.broker_epoch || "");
+          const inboxSeq = Number(payload.inbox_seq || 0);
+          if (epoch === streamRef.current.brokerEpoch && inboxSeq < streamRef.current.appliedSeq) return;
+          inboxRevisionRef.current += 1;
           if (Array.isArray(payload.threads)) {
             setThreads(payload.threads);
             setLoading(false);
             setError("");
           }
-          const inboxSeq = Number(payload.inbox_seq || 0);
+          if (epoch && epoch !== streamRef.current.brokerEpoch) streamRef.current = { ...emptyConversationInboxState(), brokerEpoch: epoch };
           if (inboxSeq > 0) {
             streamRef.current = {
               ...streamRef.current,
@@ -1994,10 +2199,12 @@ export function useConversationThreads(options?: {
           const result = acceptConversationInboxEvent(streamRef.current, event);
           if (!result.accepted) return;
           streamRef.current = result.state;
+          inboxRevisionRef.current += 1;
           if (event.thread && event.thread.thread_id) {
             setThreads((current) => upsertConversationThread(current, event.thread as ConversationThread));
           }
-          onInboxEventRef.current?.(event);
+          try { onInboxEventRef.current?.(event); }
+          catch (error) { setError(`待办已更新，但通知处理失败：${error instanceof Error ? error.message : String(error)}`); }
         } catch {
           setError("对话 inbox 事件无法解析");
         }
@@ -2031,6 +2238,7 @@ export function useConversation(threadId: string) {
   const [view, setView] = useState<ConversationView | null>(null);
   const [events, setEvents] = useState<ConversationEvent[]>([]);
   const [liveText, setLiveText] = useState("");
+  const [liveTextRuns, setLiveTextRuns] = useState<import("./conversationStreamReducer").ConversationLiveTextRun[]>([]);
   const [connected, setConnected] = useState(false);
   const [streamStatus, setStreamStatus] = useState<ConversationStreamStatus>(
     threadId ? "connecting" : "idle",
@@ -2038,6 +2246,10 @@ export function useConversation(threadId: string) {
   const [loading, setLoading] = useState(Boolean(threadId));
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [error, setError] = useState("");
+  const [auditLanding, setAuditLanding] = useState<{
+    threadId: string; messageId: string;
+    messages: ConversationMessage[]; turns: ConversationTurn[];
+  } | null>(null);
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const olderAbortRef = useRef<AbortController | null>(null);
   const pendingAroundRef = useRef<{
@@ -2048,6 +2260,7 @@ export function useConversation(threadId: string) {
     messages_page: ConversationMessagesPage;
   } | null>(null);
   const aroundEpochRef = useRef(0);
+  const refreshRequestRef = useRef(0);
   const activeThreadIdRef = useRef(threadId);
   activeThreadIdRef.current = threadId;
 
@@ -2100,20 +2313,22 @@ export function useConversation(threadId: string) {
 
   const refresh = useCallback(async () => {
     if (!threadId) return;
+    const request = ++refreshRequestRef.current;
     const requestedThreadId = threadId;
+    const isCurrent = () => activeThreadIdRef.current === requestedThreadId && request === refreshRequestRef.current;
     setError("");
     try {
       const nextView = await fetchConversationView(requestedThreadId);
-      if (activeThreadIdRef.current !== requestedThreadId) return;
+      if (!isCurrent()) return;
       setView((previous) => consumePendingAround(
         mergeConversationView(previous, nextView),
       ));
       setError("");
     } catch (exc) {
-      if (activeThreadIdRef.current !== requestedThreadId) return;
+      if (!isCurrent()) return;
       setError(exc instanceof Error ? exc.message : String(exc));
     } finally {
-      if (activeThreadIdRef.current === requestedThreadId) {
+      if (isCurrent()) {
         setLoading(false);
       }
     }
@@ -2130,6 +2345,7 @@ export function useConversation(threadId: string) {
     const oldest = current.messages_page.oldest_stream_seq;
     if (oldest == null) return false;
     const requestedThreadId = threadId;
+    const epoch = aroundEpochRef.current;
     olderAbortRef.current?.abort();
     const controller = new AbortController();
     olderAbortRef.current = controller;
@@ -2141,9 +2357,9 @@ export function useConversation(threadId: string) {
         limit: current.messages_page.limit || 50,
         signal: controller.signal,
       });
-      if (activeThreadIdRef.current !== requestedThreadId) return false;
+      if (activeThreadIdRef.current !== requestedThreadId || aroundEpochRef.current !== epoch || controller.signal.aborted) return false;
       setView((previous) => {
-        if (!previous || previous.thread.thread_id !== requestedThreadId) {
+        if (!previous || previous.thread.thread_id !== requestedThreadId || aroundEpochRef.current !== epoch) {
           return previous;
         }
         const superseded = collectSupersededTurnIds([
@@ -2186,15 +2402,14 @@ export function useConversation(threadId: string) {
     } catch (exc) {
       if (controller.signal.aborted) return false;
       if (activeThreadIdRef.current !== requestedThreadId) return false;
+      if (aroundEpochRef.current !== epoch) return false;
       setError(exc instanceof Error ? exc.message : String(exc));
       return false;
     } finally {
       if (olderAbortRef.current === controller) {
         olderAbortRef.current = null;
-      }
-      loadingOlderRef.current = false;
-      if (activeThreadIdRef.current === requestedThreadId) {
-        setLoadingOlder(false);
+        loadingOlderRef.current = false;
+        if (activeThreadIdRef.current === requestedThreadId) setLoadingOlder(false);
       }
     }
   }, [threadId]);
@@ -2206,11 +2421,16 @@ export function useConversation(threadId: string) {
     // change. Navigating to the new-chat route still clears thread state.
     olderAbortRef.current?.abort();
     olderAbortRef.current = null;
+    loadingOlderRef.current = false;
     pendingAroundRef.current = null;
+    aroundEpochRef.current += 1;
+    refreshRequestRef.current += 1;
+    setAuditLanding(null);
     setLoadingOlder(false);
     setView((current) => (threadId ? current : null));
     setEvents([]);
     setLiveText("");
+    setLiveTextRuns([]);
     setConnected(false);
     setStreamStatus(threadId ? "connecting" : "idle");
     setError("");
@@ -2228,6 +2448,7 @@ export function useConversation(threadId: string) {
       streamRef.current = next;
       setEvents(next.events as ConversationEvent[]);
       setLiveText(next.liveText);
+      setLiveTextRuns(next.liveTextRuns);
     };
 
     const isCurrentThread = () => (
@@ -2332,6 +2553,7 @@ export function useConversation(threadId: string) {
 
     return () => {
       cancelled = true;
+      refreshRequestRef.current += 1;
       connectionVersion += 1;
       if (reconnectTimer !== null) clearTimeout(reconnectTimer);
       es?.close();
@@ -2347,8 +2569,8 @@ export function useConversation(threadId: string) {
 
   const jumpToLatestMessages = useCallback(async () => {
     if (!threadId) return false;
-    aroundEpochRef.current += 1;
-    const epoch = aroundEpochRef.current;
+    const epoch = ++aroundEpochRef.current;
+    olderAbortRef.current?.abort();
     pendingAroundRef.current = null;
     const current = viewRef.current;
     const requestedThreadId = threadId;
@@ -2388,15 +2610,18 @@ export function useConversation(threadId: string) {
       return true;
     } catch (exc) {
       if (activeThreadIdRef.current !== requestedThreadId) return false;
+      if (aroundEpochRef.current !== epoch) return false;
       setError(exc instanceof Error ? exc.message : String(exc));
       return false;
     }
   }, [threadId]);
 
-  const ensureMessageVisible = useCallback(async (messageId: string): Promise<"ok" | "missing" | "cancelled"> => {
+  const ensureMessageVisible = useCallback(async (messageId: string): Promise<"ok" | "missing" | "cancelled" | "superseded"> => {
     const target = String(messageId || "").trim();
     if (!threadId || !target) return "missing";
-    const epoch = aroundEpochRef.current;
+    const epoch = ++aroundEpochRef.current;
+    olderAbortRef.current?.abort();
+    pendingAroundRef.current = null;
     const isLive = (): boolean => (
       aroundEpochRef.current === epoch
       && activeThreadIdRef.current === threadId
@@ -2444,7 +2669,11 @@ export function useConversation(threadId: string) {
           requestedThreadId,
           target,
         });
-        return "missing";
+        if (!isLive()) return "cancelled";
+        setAuditLanding({ threadId: requestedThreadId, messageId: target,
+          messages: page.messages.filter((message) => superseded.has(String(message.turn_id || ""))),
+          turns: page.turns.filter((turn) => superseded.has(turn.turn_id)) });
+        return "superseded";
       }
 
       const pending = {
@@ -2566,11 +2795,13 @@ export function useConversation(threadId: string) {
     view,
     events,
     liveText,
+    liveTextRuns,
     connected,
     streamStatus,
     loading,
     loadingOlder,
     error,
+    auditLanding,
     refresh,
     loadOlderMessages,
     jumpToLatestMessages,

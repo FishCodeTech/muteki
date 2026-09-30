@@ -18,6 +18,27 @@ export function sameSidebarPreferences(
     && left.group_mode === right.group_mode;
 }
 
+/** Merge explicit membership changes; a reorder cannot resurrect a remotely removed ID. */
+export function rebaseSidebarList(base: string[], local: string[], remote: string[]): string[] {
+  if (sameList(base, local)) return [...remote];
+  const old = new Set(base);
+  const current = new Set(local);
+  const removed = new Set(base.filter((id) => !current.has(id)));
+  const added = local.filter((id) => !old.has(id));
+  const result = [...new Set(remote.filter((id) => !removed.has(id)))];
+  for (const id of added) if (!result.includes(id)) result.push(id);
+  const oldCommon = base.filter((id) => current.has(id));
+  const localCommon = local.filter((id) => old.has(id));
+  if (!sameList(oldCommon, localCommon)) {
+    const visible = new Set(result);
+    const ordered = local.filter((id) => visible.has(id));
+    const orderedSet = new Set(ordered);
+    let index = 0;
+    return result.map((id) => orderedSet.has(id) ? ordered[index++] : id);
+  }
+  return result;
+}
+
 /** Apply only fields changed locally since `base`, preserving unrelated remote edits. */
 export function rebaseSidebarPreferences(
   base: PreferenceValues,
@@ -26,12 +47,9 @@ export function rebaseSidebarPreferences(
 ): SidebarPreferences {
   return {
     version: remote.version,
-    pinned_ids: sameList(base.pinned_ids, local.pinned_ids)
-      ? remote.pinned_ids : local.pinned_ids,
-    thread_order: sameList(base.thread_order, local.thread_order)
-      ? remote.thread_order : local.thread_order,
-    project_order: sameList(base.project_order, local.project_order)
-      ? remote.project_order : local.project_order,
+    pinned_ids: rebaseSidebarList(base.pinned_ids, local.pinned_ids, remote.pinned_ids),
+    thread_order: rebaseSidebarList(base.thread_order, local.thread_order, remote.thread_order),
+    project_order: rebaseSidebarList(base.project_order, local.project_order, remote.project_order),
     sort_mode: base.sort_mode === local.sort_mode ? remote.sort_mode : local.sort_mode,
     pinned_sort_mode: base.pinned_sort_mode === local.pinned_sort_mode
       ? remote.pinned_sort_mode : local.pinned_sort_mode,

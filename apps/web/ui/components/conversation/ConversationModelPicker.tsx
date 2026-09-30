@@ -2,6 +2,7 @@
 
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { cn } from "@/lib/cn";
+import { useLang } from "@/lib/i18n";
 import {
   favoriteToggleAnnouncement,
   isFavoriteToggleKey,
@@ -37,6 +38,7 @@ import {
   isConversationWorkerEngine,
   type ConversationCredential,
   type ConversationCredentialModel,
+  type RuntimeInstance,
 } from "@/lib/useConversation";
 
 export interface ConversationModelPickerProps {
@@ -46,6 +48,9 @@ export interface ConversationModelPickerProps {
   selectedEffort: string;
   selectedAccessMode?: string;
   accessModes?: string[];
+  runtimes?: RuntimeInstance[];
+  runtimeKey?: string;
+  onRuntimeChange?: (key: string) => void;
   loading?: boolean;
   error?: string;
   onRetry?: () => void;
@@ -245,8 +250,10 @@ function PickerSkeleton() {
 export function ConversationModelPicker({
   credentials, selectedCredentialId, selectedModel, selectedEffort,
   selectedAccessMode = "supervised", accessModes = [], loading = false, error = "", onRetry, variant = "conversation",
+  runtimes, runtimeKey = "", onRuntimeChange,
   onSelect, className = "", open: openProp, onOpenChange,
 }: ConversationModelPickerProps) {
+  const { lang } = useLang();
   const [open, setOpen] = useControllableOpen(openProp, false, onOpenChange);
   const [query, setQuery] = useState("");
   const [favorites, setFavorites] = useState<FavoriteModel[]>([]);
@@ -271,6 +278,14 @@ export function ConversationModelPicker({
     () => listedCredentials.find((item) => item.id === selectedCredentialId),
     [listedCredentials, selectedCredentialId],
   );
+  const runtimeCandidates = useMemo(
+    () => boundCredential ? (runtimes || []).filter(runtime => runtime.engine === boundCredential.engine) : [],
+    [boundCredential, runtimes],
+  );
+  const showRuntime = variant === "conversation" && (runtimes !== undefined || onRuntimeChange !== undefined);
+  const runtimeDisabled = !onRuntimeChange || !boundCredential || boundCredential.present === false
+    || !runtimeCandidates.some(runtime => runtime.enabled !== false);
+  const selectedRuntime = runtimeCandidates.find(runtime => runtime.key === runtimeKey);
   const browseCredential = useMemo(
     () => boundCredential || availableCredentials[0] || listedCredentials[0],
     [availableCredentials, boundCredential, listedCredentials],
@@ -280,10 +295,9 @@ export function ConversationModelPicker({
 
   useEffect(() => {
     if (loading) return;
-    const allowedCredentialIds = new Set(listedCredentials.map((credential) => credential.id));
-    const next = readFavoriteModels().filter((item) => allowedCredentialIds.has(item.credentialId));
-    persistFavoriteModels(next);
-    setFavorites(next);
+    // A transient/failed catalog is not evidence that a saved account or model
+    // was deleted. Only an explicit favorite toggle removes persisted entries.
+    setFavorites(readFavoriteModels());
   }, [listedCredentials, loading]);
 
   useEffect(() => {
@@ -534,6 +548,7 @@ export function ConversationModelPicker({
           >
             {favoritesMode ? `${engineLabel(row.credential.engine)} · ${row.credential.label}` : row.model.id}
           </span>
+          <span className="block truncate text-[10.5px] text-cx-fg-4" title={row.credential.runtime_instance || (lang === "en" ? "Model capability scope was not reported" : "未上报模型能力范围")}>{lang === "en" ? "Model capability Runtime: " : "模型能力来源 Runtime："}{row.credential.runtime_instance || (lang === "en" ? "Not reported" : "未上报")}</span>
         </span>
         <button
           type="button"
@@ -713,9 +728,52 @@ export function ConversationModelPicker({
     </div>
   );
 
-  const footer = !loading && !error && (showEffort || showAccess) ? (
+  const footer = showRuntime || (!loading && !error && (showEffort || showAccess)) ? (
     <div className="flex flex-col gap-2 border-t border-cx-border-subtle bg-cx-bg-subtle px-3 py-2.5">
-      {showEffort ? (
+      {showRuntime ? (
+        <div className="flex flex-col gap-1">
+          <div className="flex items-center gap-3">
+            <span className="w-14 shrink-0 text-[11.5px] font-medium text-cx-fg-3">Runtime</span>
+            <Select
+              size="sm"
+              ariaLabel={lang === "en" ? "Conversation Runtime" : "会话 Runtime"}
+              value={selectedRuntime?.key || null}
+              disabled={runtimeDisabled}
+              placeholder={!boundCredential || boundCredential.present === false
+                ? (lang === "en" ? "Select a credential first" : "请先选择凭据")
+                : !runtimeCandidates.length ? (lang === "en" ? "No Runtime for this Agent" : "此 Agent 没有 Runtime")
+                  : runtimeKey && !selectedRuntime ? (lang === "en" ? "Current Runtime unavailable; select again" : "当前 Runtime 不可用，请重新选择")
+                    : (lang === "en" ? "Select Runtime" : "选择 Runtime")}
+              onChange={key => {
+                if (runtimeDisabled || key === runtimeKey) return;
+                const runtime = runtimeCandidates.find(row => row.key === key && row.enabled !== false);
+                if (runtime) onRuntimeChange?.(runtime.key);
+              }}
+              placement="top-start"
+              className="min-w-0 flex-1"
+              popoverClassName="w-[min(420px,calc(100vw-24px))]"
+              options={runtimeCandidates.map(runtime => ({
+                value: runtime.key,
+                label: `${runtime.adapter_id} · ${runtime.instance_id}`,
+                description: [
+                  runtime.enabled === false ? (lang === "en" ? "Disabled" : "已停用") : "",
+                  runtime.health?.healthy === true ? (lang === "en" ? "Reported healthy" : "上报状态正常")
+                    : runtime.health?.healthy === false ? (lang === "en" ? "Reported unhealthy" : "上报状态异常")
+                      : (lang === "en" ? "Not probed" : "未探测"),
+                  runtime.health?.detail || "",
+                ].filter(Boolean).join(" · "),
+                disabled: runtime.enabled === false,
+              }))}
+            />
+          </div>
+          <p className="pl-[68px] text-[10.5px] text-cx-fg-4">{boundCredential
+            ? `${lang === "en" ? "Current credential" : "当前凭据"}: ${boundCredential.label} · ${engineLabel(boundCredential.engine)}`
+            : (lang === "en" ? "No credential selected" : "尚未选择凭据")}</p>
+          {runtimeCandidates.length && !runtimeCandidates.some(runtime => runtime.enabled !== false)
+            ? <p className="pl-[68px] text-[10.5px] text-cx-fg-4">{lang === "en" ? "All Runtime instances for this Agent are disabled" : "此 Agent 的 Runtime 均已停用"}</p> : null}
+        </div>
+      ) : null}
+      {!loading && !error && showEffort ? (
         <div className="flex items-center gap-3">
           <span className="flex w-14 shrink-0 items-center gap-1 text-[11.5px] font-medium text-cx-fg-3">
             <Icon name="brain" size={12} />
@@ -731,7 +789,7 @@ export function ConversationModelPicker({
           />
         </div>
       ) : null}
-      {showAccess ? (
+      {!loading && !error && showAccess ? (
         <div className="flex items-center gap-3">
           <span className="flex w-14 shrink-0 items-center gap-1 text-[11.5px] font-medium text-cx-fg-3">
             <Icon name="shield" size={12} />

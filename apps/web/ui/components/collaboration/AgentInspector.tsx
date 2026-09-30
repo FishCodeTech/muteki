@@ -13,6 +13,7 @@ import {
   COORDINATOR_ID,
   isCollaborationWorker,
   OPERATOR_ID,
+  recordedAmount,
   unattributedUsd,
   type CollaborationAgent,
   type CollaborationKnowledgeItem,
@@ -188,7 +189,13 @@ function CoordinatorOverview({
           <dt>{t("collab.field.phase")}</dt><dd>{phaseText}</dd>
           <LifecycleRows agent={agent} t={t} />
           <dt>{t("collab.workspace.totalTokens")}</dt><dd>{compactNumber(deck.tokensIn + deck.tokensOut)}</dd>
-          <dt>{t("collab.workspace.totalCost")}</dt><dd>${deck.usd.toFixed(4)}</dd>
+          <dt>{t("collab.workspace.totalCost")}</dt><dd>{recordedAmount(
+            deck.usd,
+            deck.tokensIn + deck.tokensOut,
+            Object.values(deck.costBySolver).some(cost => cost.unpricedCalls != null)
+              ? Object.values(deck.costBySolver).reduce((total, cost) => total + (cost.unpricedCalls ?? 0), 0)
+              : undefined,
+          )}</dd>
           <dt>{t("collab.unattributedCost")}</dt><dd>${unattributedUsd(deck).toFixed(4)}</dd>
         </dl>
       </section>
@@ -256,7 +263,7 @@ function WorkerOverview({
           <dt>{t("collab.field.spawnedBy")}</dt><dd>{spawnedBy || "—"}</dd>
           <dt>{t("collab.field.lastEvent")}</dt><dd title={fullDate(agent.lastEventAt)}>{formatClock(agent.lastEventAt, "—")}</dd>
           <dt>{t("meta.tokens")}</dt><dd>{compactNumber(agent.tokens)}</dd>
-          <dt>{t("meta.cost")}</dt><dd>${agent.usd.toFixed(4)}</dd>
+          <dt>记账金额</dt><dd>{recordedAmount(agent.usd, agent.tokens, agent.unpricedCalls)}</dd>
         </dl>
       </section>
     </>
@@ -658,7 +665,7 @@ export function AgentInspector({
               <dt>{t("collab.workspace.rounds")}</dt><dd>{deck.blackboard.reasonRuns.length}</dd>
               <dt>{t("collab.workspace.tasks")}</dt><dd>{deck.blackboard.reasonRuns.reduce((sum, run) => sum + run.proposed, 0)}</dd>
               <dt>{t("meta.tokens")}</dt><dd>{deck.costBySolver.reason ? compactNumber(agent.tokens) : "—"}</dd>
-              <dt>{t("meta.cost")}</dt><dd>{deck.costBySolver.reason ? `$${agent.usd.toFixed(4)}` : "—"}</dd>
+              <dt>记账金额</dt><dd>{deck.costBySolver.reason ? recordedAmount(agent.usd, agent.tokens, agent.unpricedCalls) : "—"}</dd>
             </dl>
             <div className="collab-detail-actions">
               <Button size="sm" variant="ghost" onClick={() => onTab("decisions")}><Icon name="rows" size={14} />{t("collab.tab.decisions")} · {deck.blackboard.reasonRuns.length}</Button>

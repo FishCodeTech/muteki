@@ -94,6 +94,23 @@ async def _finalize_coordinator_run(
                     if committed > 0 and not self._operator_stop:
                         terminal_reason = "goal_met"
         solved = bool(goal_complete) or self._findings_complete()
+        if (not solved and self.shared_graph is not None
+                and not self._operator_stop and not self._budget_exhausted_kind):
+            from muteki.pentest.judgement import submitted_reports
+            contract = getattr(self.challenge, "pentest_contract", None)
+            if contract is not None and contract.version >= 2:
+                blocked = [
+                    item for item in submitted_reports(self.shared_graph.events(), contract)
+                    if item.get("review_status") == "pending"
+                    and (item.get("review_error") or {}).get("blocked") is True
+                ]
+                if blocked:
+                    self._runtime_failure_code = "pentest_review_unavailable"
+                    self._runtime_failure_phase = "pentest_review"
+                    self._runtime_failure_detail = (
+                        "Coordinator review could not complete for submitted reports: "
+                        + ", ".join(item["id"] for item in blocked)
+                    )
     else:
         solved = winner is not None or goal_complete or self._flags_complete()
     reason = (terminal_reason or "").strip()
@@ -124,6 +141,8 @@ async def _finalize_coordinator_run(
                     self.llm, self.reason_model,
                     self.shared_graph.events(), contract,
                     terminal_reason=reason,
+                    run_id=self.run_id,
+                    challenge_id=self.challenge.id,
                 ),
                 timeout=120.0,
             )
@@ -305,6 +324,12 @@ async def teardown_coordinator_stage(self, state) -> None:
     from muteki.swarm.coordinator_state import emit_scheduler_bb
 
     emit_bb = partial(emit_scheduler_bb, self, state)
+    review_task = state.pentest_review_task
+    if review_task is not None:
+        if not review_task.done():
+            review_task.cancel()
+        await asyncio.gather(review_task, return_exceptions=True)
+        state.pentest_review_task = None
     reason_task = state.reason_task
     if reason_task is not None:
         was_running = not reason_task.done()

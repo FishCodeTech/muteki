@@ -103,7 +103,7 @@ function SurfaceTab({
   const ref = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     if (active) ref.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
-  }, [active]);
+  }, [active, surface.id, threadId]);
   return (
     <>
       <div
@@ -119,6 +119,7 @@ function SurfaceTab({
         onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; }}
         onDrop={(event) => { event.preventDefault(); onDrop(surface.id); }}
         onClick={() => chatPanel.activate(threadId, surface.id)}
+        onFocus={() => ref.current?.scrollIntoView({ block: "nearest", inline: "nearest" })}
         onAuxClick={(event) => { if (event.button === 1) { event.preventDefault(); onClose(surface.id); } }}
         onContextMenu={ctx.onContextMenu}
         className={cn(
@@ -242,6 +243,7 @@ export interface RightPanelProps extends Omit<SurfaceContext, "active"> {
 
 export function RightPanel({ sheet, sidebarWidth, ...ctx }: RightPanelProps) {
   const { threadId, hasWorkspace } = ctx;
+  const ownsView = ctx.view.thread.thread_id === threadId;
   const panel = useChatPanel(threadId);
   const width = useChatPanelWidth();
   const [dragging, setDragging] = useState(false);
@@ -262,7 +264,7 @@ export function RightPanel({ sheet, sidebarWidth, ...ctx }: RightPanelProps) {
 
   // Letter shortcuts while the launcher is showing and focus is not in a field.
   useEffect(() => {
-    if (!panel.isOpen || !showLauncher) return;
+    if (!ownsView || !panel.isOpen || !showLauncher) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       const target = event.target as HTMLElement | null;
@@ -274,7 +276,7 @@ export function RightPanel({ sheet, sidebarWidth, ...ctx }: RightPanelProps) {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [panel.isOpen, showLauncher, threadId, hasWorkspace]);
+  }, [panel.isOpen, showLauncher, threadId, hasWorkspace, ownsView]);
 
   const tabIds = panel.surfaces.map((surface) => surface.id);
   const tablistSelection =
@@ -339,7 +341,7 @@ export function RightPanel({ sheet, sidebarWidth, ...ctx }: RightPanelProps) {
   const header = (
     <div className="flex h-11 shrink-0 items-center gap-1 border-b border-cx-border-subtle pl-2 pr-1.5">
       <ScrollArea axis="x" className="flex min-w-0 flex-1 items-center">
-        <div role="tablist" aria-label="已打开的工作视图" className="flex items-center gap-1 py-1" onKeyDown={onSurfaceTabListKeyDown}>
+        <div role="tablist" aria-label="已打开的工作视图" className="flex min-w-max items-center gap-1 py-1" onKeyDown={onSurfaceTabListKeyDown}>
           {panel.surfaces.map((surface) => (
             <SurfaceTab
               key={surface.id}
@@ -352,10 +354,10 @@ export function RightPanel({ sheet, sidebarWidth, ...ctx }: RightPanelProps) {
               onDrop={(id) => { if (dragId.current) chatPanel.reorder(threadId, dragId.current, id); dragId.current = null; }}
             />
           ))}
-          <AddSurfaceMenu threadId={threadId} hasWorkspace={hasWorkspace} />
         </div>
       </ScrollArea>
       <div className="flex shrink-0 items-center gap-0.5 pl-1">
+        {ownsView ? <AddSurfaceMenu threadId={threadId} hasWorkspace={hasWorkspace} /> : <span role="status" className="text-[12px] text-cx-fg-3">等待当前对话</span>}
         {!sheet ? (
           <IconButton
             icon={panel.maximized ? "minimize" : "maximize"}
@@ -371,8 +373,9 @@ export function RightPanel({ sheet, sidebarWidth, ...ctx }: RightPanelProps) {
 
   const body = (
     <div ref={bodyRef} className="@container/panel relative min-h-0 flex-1">
-      {showLauncher ? <Launcher threadId={threadId} hasWorkspace={hasWorkspace} /> : null}
-      {panel.surfaces.map((surface) => {
+      {!ownsView ? <div role="status" className="p-4 text-[13px] text-cx-fg-3">正在等待当前对话的数据；请在加载失败后重试，旧对话的内容和操作已隐藏。</div> : null}
+      {ownsView && showLauncher ? <Launcher threadId={threadId} hasWorkspace={hasWorkspace} /> : null}
+      {(ownsView ? panel.surfaces : []).map((surface) => {
         const active = !showLauncher && surface.id === panel.activeId;
         return (
           <div

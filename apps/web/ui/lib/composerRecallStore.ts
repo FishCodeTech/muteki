@@ -1,3 +1,4 @@
+import { conversationStorageKey, conversationStorageScope, subscribeConversationStorageScope, subscribeBeforeConversationStorageScope, reportConversationPersistence } from "./conversationStorageScope";
 /**
  * C10: per-session sent-prompt history and named composer stashes.
  *
@@ -12,7 +13,6 @@ export const COMPOSER_HISTORY_STORAGE_KEY = "muteki:composer-prompt-history:v1";
 export const COMPOSER_STASH_STORAGE_KEY = "muteki:composer-prompt-stash:v1";
 
 const MAX_HISTORY_PER_SESSION = 50;
-const MAX_STASHES = 40;
 const PERSIST_DEBOUNCE_MS = 200;
 
 export type RecallPromptSegment =
@@ -90,13 +90,15 @@ type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 const historyFile = { bucket: {} as Record<string, ComposerHistoryEntry[]>, dirty: false };
 const stashFile = { items: [] as ComposerStashEntry[], dirty: false };
 const stashFileBag = new Map<string, File>();
+const pendingHistory = new Map<string, ComposerHistoryEntry[]>();
+const pendingStashes = new Map<string, ComposerStashEntry | null>();
 
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let storageOverride: StorageLike | null = null;
 
-function getStorage(): StorageLike | null {
+function getStorage(ownerScope = conversationStorageScope()): StorageLike | null {
   if (storageOverride) return storageOverride;
-  if (typeof window === "undefined") return null;
+  if (typeof window === "undefined" || !ownerScope) return null;
   try {
     return window.localStorage;
   } catch {
@@ -302,7 +304,7 @@ function readHistoryBucket(): Record<string, ComposerHistoryEntry[]> {
   const storage = getStorage();
   if (!storage) return historyFile.bucket;
   try {
-    const raw = storage.getItem(COMPOSER_HISTORY_STORAGE_KEY);
+    const raw = storage.getItem(conversationStorageKey(COMPOSER_HISTORY_STORAGE_KEY));
     if (!raw) {
       historyFile.bucket = {};
       return historyFile.bucket;
@@ -335,7 +337,7 @@ function readStashes(): ComposerStashEntry[] {
   const storage = getStorage();
   if (!storage) return stashFile.items;
   try {
-    const raw = storage.getItem(COMPOSER_STASH_STORAGE_KEY);
+    const raw = storage.getItem(conversationStorageKey(COMPOSER_STASH_STORAGE_KEY));
     if (!raw) {
       stashFile.items = [];
       return stashFile.items;
@@ -354,34 +356,42 @@ function readStashes(): ComposerStashEntry[] {
   }
 }
 
-function flushNow(): void {
-  const storage = getStorage();
-  if (historyFile.dirty) {
-    historyFile.dirty = false;
-    if (storage) {
-      try {
-        storage.setItem(
-          COMPOSER_HISTORY_STORAGE_KEY,
-          JSON.stringify({ sessions: historyFile.bucket }),
-        );
-      } catch {
-        // quota / private mode
+function flushNow(ownerScope = conversationStorageScope(), memory = { history: historyFile, stash: stashFile, historyEdits: pendingHistory, stashEdits: pendingStashes }): { persisted: boolean; error?: string } {
+  if (!memory.history.dirty && !memory.stash.dirty) return { persisted: true };
+  const storage = getStorage(ownerScope);
+  if (!storage) return { persisted: false, error: "recall.storage.unavailable: 历史与暂存存储不可用" };
+  const errors: string[] = [];
+  if (memory.history.dirty) {
+    try {
+      const raw = storage.getItem(conversationStorageKey(COMPOSER_HISTORY_STORAGE_KEY, ownerScope));
+      const parsed = raw ? JSON.parse(raw) : {};
+      const sessions = parsed.sessions && typeof parsed.sessions === "object" ? parsed.sessions : {};
+      for (const [key, edits] of memory.historyEdits) {
+        const existing = Array.isArray(sessions[key]) ? sessions[key].map(normalizeHistoryEntry).filter(Boolean) as ComposerHistoryEntry[] : [];
+        sessions[key] = [...new Map([...edits, ...existing].map((entry) => [entry.id, entry])).values()]
+          .sort((a, b) => b.sentAt - a.sentAt).slice(0, MAX_HISTORY_PER_SESSION);
       }
-    }
+      storage.setItem(conversationStorageKey(COMPOSER_HISTORY_STORAGE_KEY, ownerScope), JSON.stringify({ sessions }));
+      memory.history.bucket = sessions;
+      memory.history.dirty = false;
+      memory.historyEdits.clear();
+    } catch (error) { errors.push(error instanceof Error ? `${error.name}: ${error.message}` : String(error)); }
   }
-  if (stashFile.dirty) {
-    stashFile.dirty = false;
-    if (storage) {
-      try {
-        storage.setItem(
-          COMPOSER_STASH_STORAGE_KEY,
-          JSON.stringify({ stashes: stashFile.items }),
-        );
-      } catch {
-        // quota / private mode
-      }
-    }
+  if (memory.stash.dirty) {
+    try {
+      const raw = storage.getItem(conversationStorageKey(COMPOSER_STASH_STORAGE_KEY, ownerScope));
+      const parsed = raw ? JSON.parse(raw) : {};
+      const existing = Array.isArray(parsed.stashes) ? parsed.stashes.map(normalizeStashEntry).filter(Boolean) as ComposerStashEntry[] : [];
+      const merged = new Map(existing.map((entry) => [entry.id, entry]));
+      for (const [id, entry] of memory.stashEdits) { if (entry) merged.set(id, entry); else merged.delete(id); }
+      const stashes = [...merged.values()].sort((a, b) => b.createdAt - a.createdAt);
+      storage.setItem(conversationStorageKey(COMPOSER_STASH_STORAGE_KEY, ownerScope), JSON.stringify({ stashes }));
+      memory.stash.items = stashes;
+      memory.stash.dirty = false;
+      memory.stashEdits.clear();
+    } catch (error) { errors.push(error instanceof Error ? `${error.name}: ${error.message}` : String(error)); }
   }
+  return errors.length ? { persisted: false, error: errors.join("\n") } : { persisted: true };
 }
 
 function schedulePersist(): void {
@@ -389,16 +399,20 @@ function schedulePersist(): void {
   if (persistTimer) clearTimeout(persistTimer);
   persistTimer = setTimeout(() => {
     persistTimer = null;
-    flushNow();
+    const result = flushNow();
+    if (!result.persisted) reportConversationPersistence("recall", result.error || "历史与暂存保存失败");
   }, PERSIST_DEBOUNCE_MS);
 }
 
-export function flushComposerRecallStore(): void {
+export function flushComposerRecallStore(): { persisted: boolean; error?: string } {
   if (persistTimer) {
     clearTimeout(persistTimer);
     persistTimer = null;
   }
-  flushNow();
+  const results = [flushNow()];
+  for (const [scope, snapshot] of scopedRecall) if (scope !== conversationStorageScope()) results.push(flushNow(scope, snapshot));
+  const errors = results.filter((row) => !row.persisted).map((row) => row.error || "历史与暂存保存失败");
+  return errors.length ? { persisted: false, error: errors.join("\n") } : { persisted: true };
 }
 
 export function listPromptHistory(sessionKey: string): ComposerHistoryEntry[] {
@@ -450,6 +464,7 @@ export function recordSentPrompt(
   bucket[key] = current.slice(0, MAX_HISTORY_PER_SESSION);
   historyFile.bucket = { ...bucket };
   historyFile.dirty = true;
+  pendingHistory.set(key, [entry, ...(pendingHistory.get(key) || [])]);
   schedulePersist();
   return entry;
 }
@@ -493,14 +508,8 @@ export function saveComposerStash(input: {
 
   const items = readStashes();
   items.unshift(entry);
-  const kept = items.slice(0, MAX_STASHES);
-  const keptIds = new Set(kept.map((item) => item.id));
-  // Bugbot Low: drop File bag entries for stashes trimmed by MAX_STASHES.
-  for (const key of Array.from(stashFileBag.keys())) {
-    const stashId = key.split("::", 2)[0];
-    if (!keptIds.has(stashId)) stashFileBag.delete(key);
-  }
-  stashFile.items = kept;
+  stashFile.items = items;
+  pendingStashes.set(id, entry);
   stashFile.dirty = true;
   schedulePersist();
   return entry;
@@ -514,6 +523,7 @@ export function deleteComposerStash(stashId: string): void {
     if (key.startsWith(`${id}::`)) stashFileBag.delete(key);
   }
   stashFile.dirty = true;
+  pendingStashes.set(id, null);
   schedulePersist();
 }
 
@@ -603,11 +613,13 @@ export function clearAllComposerRecall(): void {
   stashFile.items = [];
   stashFile.dirty = false;
   stashFileBag.clear();
+  pendingHistory.clear();
+  pendingStashes.clear();
   const storage = getStorage();
   if (!storage) return;
   try {
-    storage.removeItem(COMPOSER_HISTORY_STORAGE_KEY);
-    storage.removeItem(COMPOSER_STASH_STORAGE_KEY);
+    storage.removeItem(conversationStorageKey(COMPOSER_HISTORY_STORAGE_KEY));
+    storage.removeItem(conversationStorageKey(COMPOSER_STASH_STORAGE_KEY));
   } catch {
     // ignore
   }
@@ -623,6 +635,8 @@ export function __resetComposerRecallStoreForTests(storage?: StorageLike | null)
   stashFile.items = [];
   stashFile.dirty = false;
   stashFileBag.clear();
+  pendingHistory.clear();
+  pendingStashes.clear();
   storageOverride = storage === undefined ? null : storage;
 }
 
@@ -630,3 +644,18 @@ export function __resetComposerRecallStoreForTests(storage?: StorageLike | null)
 export function __stashFileBagSizeForTests(): number {
   return stashFileBag.size;
 }
+
+const scopedRecall = new Map<string, { history: typeof historyFile; stash: typeof stashFile; historyEdits: typeof pendingHistory; stashEdits: typeof pendingStashes; files: typeof stashFileBag }>();
+subscribeBeforeConversationStorageScope(() => {
+  flushComposerRecallStore();
+  scopedRecall.set(conversationStorageScope(), { history: { ...historyFile }, stash: { ...stashFile }, historyEdits: new Map(pendingHistory), stashEdits: new Map(pendingStashes), files: new Map(stashFileBag) });
+});
+subscribeConversationStorageScope(() => {
+  const old = scopedRecall.get(conversationStorageScope());
+  historyFile.bucket = old?.history.bucket || {}; historyFile.dirty = old?.history.dirty || false;
+  stashFile.items = old?.stash.items || []; stashFile.dirty = old?.stash.dirty || false;
+  pendingHistory.clear(); pendingStashes.clear(); stashFileBag.clear();
+  for (const [key, value] of old?.historyEdits || []) pendingHistory.set(key, value);
+  for (const [key, value] of old?.stashEdits || []) pendingStashes.set(key, value);
+  for (const [key, value] of old?.files || []) stashFileBag.set(key, value);
+});

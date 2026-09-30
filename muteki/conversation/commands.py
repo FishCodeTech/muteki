@@ -46,6 +46,7 @@ from muteki.solver.engine_registry import (
 from muteki.external_agents.factory import engine_for_adapter
 from muteki.external_agents.approvals import ApprovalDecision
 from muteki.external_agents.user_input_schema import (
+    UserInputValidationError,
     c22_fixture_questions,
     expand_legacy_text_answers,
     flatten_answers_text,
@@ -826,16 +827,18 @@ class ConversationCommandHandler:
         already_archived = state.status == "archived"
 
         async def _archive() -> SideEffectResult:
-            if already_archived:
-                return SideEffectResult()
             await executor.close_thread(thread.thread_id)
             if manager.conv.list_queue(thread.thread_id):
                 manager.conv.pause_queue(thread.thread_id, "thread_archived")
             manager.archive_thread(thread.thread_id)
-            return SideEffectResult()
+            return SideEffectResult(events=[ev.thread_event(
+                thread.thread_id, ev.EV_THREAD_ARCHIVED,
+                {"thread_id": thread.thread_id, "noop": already_archived},
+                actor_id=command.actor.id, command_id=command.command_id,
+                correlation_id=correlation_id_of(command))])
 
         return CommandPlan(
-            events=[ev.thread_event(thread.thread_id, ev.EV_THREAD_ARCHIVED, {
+            events=[ev.thread_event(thread.thread_id, "core.thread.archive_requested", {
                 "thread_id": thread.thread_id,
                 "noop": already_archived,
             }, actor_id=command.actor.id,
@@ -1085,7 +1088,7 @@ class ConversationCommandHandler:
         idem = command.idempotency_key or command.command_id
         runtime = selection.model_dump(mode="json")
         runtime.update(runtime_override)
-        item, created = manager.conv.enqueue_turn(QueuedTurnRequest(
+        item = QueuedTurnRequest(
             thread_id=thread.thread_id,
             command_id=command.command_id,
             idempotency_key=idem,
@@ -1099,7 +1102,18 @@ class ConversationCommandHandler:
             capability_refs=capability_refs,
             runtime_invocation=runtime_invocation,
             runtime=runtime,
-        ))
+        )
+        created = True
+
+        def _enqueue() -> None:
+            nonlocal item, created
+            item, created = manager.conv.enqueue_turn(item)
+            event = plan.events[0]
+            plan.events[0] = event.model_copy(update={"payload": {
+                **event.payload, "queue_id": item.queue_id,
+                "position": item.position, "deduplicated": not created,
+                "queue_revision": manager.conv.get_state(thread.thread_id).queue_revision,
+            }})
 
         async def _start() -> SideEffectResult:
             await executor.start_next_queued(thread.thread_id)
@@ -1108,7 +1122,7 @@ class ConversationCommandHandler:
                 "queued": True,
             })
 
-        return CommandPlan(
+        plan = CommandPlan(
             events=[ev.thread_event(thread.thread_id, ev.EV_QUEUE_ADDED, {
                 "queue_id": item.queue_id,
                 "position": item.position,
@@ -1125,7 +1139,9 @@ class ConversationCommandHandler:
                 idempotency_key=command.idempotency_key)],
             receipt=_receipt(command, ev.AGGREGATE_THREAD, thread.thread_id),
             side_effect=_start,
+            local_commit=_enqueue,
         )
+        return plan
 
     def _plan_turn_steer(self, command: Any) -> CommandPlan:
         thread = self._require_thread(command)
@@ -1291,30 +1307,32 @@ class ConversationCommandHandler:
                     "arguments": str(match.group("args") or ""),
                     "pending_resolution": True,
                 }
-        try:
-            item = self._manager.conv.update_queue_item(
-                thread.thread_id, item.queue_id, text=text, runtime=runtime,
-                capability_refs=capability_refs, runtime_invocation=invocation,
-            )
-        except ValueError as exc:
-            raise _failed(
-                command, "conversation.queue.update_conflict", str(exc),
-                ErrorCategory.CONFLICT,
-            ) from exc
-        return CommandPlan(
-            events=[ev.thread_event(thread.thread_id, ev.EV_QUEUE_UPDATED, {
-                "queue_id": item.queue_id,
-                "text": item.text,
-                "runtime": item.runtime,
-                "capability_refs": item.capability_refs,
-                "runtime_invocation": item.runtime_invocation,
-                "queue_revision": self._manager.conv.get_state(
-                    thread.thread_id).queue_revision,
-            }, actor_id=command.actor.id, command_id=command.command_id,
-                correlation_id=correlation_id_of(command),
-                idempotency_key=command.idempotency_key)],
-            receipt=_receipt(command, ev.AGGREGATE_THREAD, thread.thread_id),
-        )
+        expected = command.payload.get("expected_revision")
+        if expected is not None and (isinstance(expected, bool) or not isinstance(expected, int) or expected < 0):
+            raise _failed(command, "conversation.queue.revision_invalid",
+                          "expected_revision 必须是非负整数", ErrorCategory.VALIDATION)
+        event = ev.thread_event(thread.thread_id, ev.EV_QUEUE_UPDATED, {
+            "queue_id": item.queue_id,
+        }, actor_id=command.actor.id, command_id=command.command_id,
+            correlation_id=correlation_id_of(command), idempotency_key=command.idempotency_key)
+
+        def _update() -> None:
+            try:
+                updated = self._manager.conv.update_queue_item(
+                    thread.thread_id, item.queue_id, text=text, runtime=runtime,
+                    capability_refs=capability_refs, runtime_invocation=invocation,
+                    expected_revision=expected,
+                )
+            except (LookupError, ValueError) as exc:
+                raise _failed(command, "conversation.queue.update_conflict", str(exc),
+                              ErrorCategory.CONFLICT) from exc
+            event.payload.update({"text": updated.text, "runtime": updated.runtime,
+                "capability_refs": updated.capability_refs,
+                "runtime_invocation": updated.runtime_invocation,
+                "queue_revision": self._manager.conv.get_state(thread.thread_id).queue_revision})
+
+        return CommandPlan(events=[event],
+            receipt=_receipt(command, ev.AGGREGATE_THREAD, thread.thread_id), local_commit=_update)
 
     def _plan_queue_delete(self, command: Any) -> CommandPlan:
         thread = self._require_thread(command)
@@ -1708,8 +1726,26 @@ class ConversationCommandHandler:
                 command, "conversation.approval.expired",
                 f"approval {approval.approval_id} 已过期，不能再决定",
                 ErrorCategory.STATE)
+        if pending.get("status") == "resolving":
+            raise _failed(command, "conversation.approval.resolving",
+                          "该审批正在投递，请恢复原决定的回执", ErrorCategory.CONFLICT)
         executor = self._executor
         decision_payload = approval.to_payload()
+        if approval.option_id:
+            offered = next((row for row in pending.get("options", [])
+                            if str(row.get("option_id") or row.get("optionId") or "") == approval.option_id), None)
+            expected_kind = ("allow" if approval.allowed else "reject") + (
+                "_always" if approval.scope.value == "session" else "_once")
+            if offered is None or offered.get("kind") != expected_kind:
+                raise _failed(command, "conversation.approval.option_invalid",
+                              "该原生选项不属于当前请求或授权范围不匹配", ErrorCategory.VALIDATION)
+
+        def _claim() -> None:
+            current = self._manager.conv.get_state(thread.thread_id)
+            row = lookup_approval(hydrate_approvals(current.pending_approvals, current.pending_approval), approval.approval_id)
+            if row is None or str(row.get("status") or "pending") != "pending":
+                raise _failed(command, "conversation.approval.resolving",
+                              "审批已失效或正在投递，请刷新原回执", ErrorCategory.CONFLICT)
 
         async def _resolve() -> SideEffectResult:
             # #122: deliver to the original Runtime session BEFORE consuming the
@@ -1723,6 +1759,7 @@ class ConversationCommandHandler:
                     approval.choice.value,
                     note=approval.note,
                     scope=approval.scope.value,
+                    **({"option_id": approval.option_id} if approval.option_id else {}),
                 )
             except LookupError as exc:
                 return SideEffectResult(
@@ -1739,11 +1776,12 @@ class ConversationCommandHandler:
             except ControlDeliveryError as exc:
                 return SideEffectResult(
                     error=make_error(
-                        "conversation.approval.delivery_failed", str(exc),
+                        "conversation.approval.delivery_unknown" if exc.delivery_unknown else "conversation.approval.delivery_failed", str(exc),
                         ErrorCategory.RUNTIME,
                         correlation_id=correlation_id_of(command),
-                        retryable=True,
-                    ).model_copy(update={"detail": {"runtime_code": exc.runtime_code}}),
+                        retryable=not exc.delivery_unknown,
+                    ).model_copy(update={"detail": {"runtime_code": exc.runtime_code,
+                                                   "delivery_unknown": exc.delivery_unknown}}),
                     state=ReceiptState.FAILED,
                 )
             except Exception as exc:  # noqa: BLE001 — typed failed receipt
@@ -1775,6 +1813,9 @@ class ConversationCommandHandler:
                 idempotency_key=command.idempotency_key)],
             receipt=_receipt(command, ev.AGGREGATE_THREAD, thread.thread_id),
             side_effect=_resolve,
+            local_commit=_claim,
+            failure_events=[ev.thread_event(thread.thread_id, "core.approval.delivery_failed",
+                {"approval_id": approval.approval_id}, command_id=command.command_id)],
         )
 
     def _plan_user_input_resolve(self, command: Any) -> CommandPlan:
@@ -1793,6 +1834,9 @@ class ConversationCommandHandler:
             raise _failed(command, "conversation.user_input.mismatch",
                           f"待处理 user input 为 {pending['request_id']}",
                           ErrorCategory.CONFLICT)
+        if pending.get("status") == "resolving":
+            raise _failed(command, "conversation.user_input.resolving",
+                          "该回答正在投递，请恢复原命令回执", ErrorCategory.CONFLICT)
         answers: dict[str, Any] = {}
         if isinstance(raw_answers, dict) and raw_answers:
             answers = dict(raw_answers)
@@ -1801,14 +1845,16 @@ class ConversationCommandHandler:
         try:
             validated = validate_user_input_answers(
                 pending, answers, decision=decision)
-        except ValueError as exc:
-            message = str(exc)
-            code, _, detail = message.partition("|")
-            if not detail:
-                code, detail = "conversation.user_input.invalid", message
-            raise _failed(command, code, detail, ErrorCategory.VALIDATION) from exc
+        except UserInputValidationError as exc:
+            raise _failed(command, exc.code, exc.message, ErrorCategory.VALIDATION) from exc
         flat_text = text or flatten_answers_text(validated)
         executor = self._executor
+
+        def _claim() -> None:
+            current = self._manager.conv.get_state(thread.thread_id).pending_user_input or {}
+            if current.get("request_id") != request_id or current.get("status") == "resolving":
+                raise _failed(command, "conversation.user_input.resolving",
+                              "问题已失效或正在投递，请刷新原回执", ErrorCategory.CONFLICT)
 
         resolved_event = ev.thread_event(thread.thread_id, ev.EV_USER_INPUT_RESOLVED, {
             "request_id": request_id,
@@ -1821,10 +1867,18 @@ class ConversationCommandHandler:
             idempotency_key=command.idempotency_key)
 
         async def _resolve() -> SideEffectResult:
-            await executor.resolve_user_input(
-                thread.thread_id, request_id, flat_text,
-                answers=validated, decision=decision,
-            )
+            try:
+                await executor.resolve_user_input(
+                    thread.thread_id, request_id, flat_text,
+                    answers=validated, decision=decision,
+                )
+            except ControlDeliveryError as exc:
+                return SideEffectResult(error=make_error(
+                    "conversation.user_input.delivery_unknown" if exc.delivery_unknown else "conversation.user_input.delivery_failed",
+                    str(exc), ErrorCategory.RUNTIME, retryable=not exc.delivery_unknown,
+                    correlation_id=correlation_id_of(command)).model_copy(update={"detail": {
+                        "runtime_code": exc.runtime_code, "delivery_unknown": exc.delivery_unknown}}),
+                    state=ReceiptState.FAILED)
             return SideEffectResult(events=[resolved_event])
 
         return CommandPlan(
@@ -1836,6 +1890,9 @@ class ConversationCommandHandler:
                 idempotency_key=command.idempotency_key)],
             receipt=_receipt(command, ev.AGGREGATE_THREAD, thread.thread_id),
             side_effect=_resolve,
+            local_commit=_claim,
+            failure_events=[ev.thread_event(thread.thread_id, "core.user_input.delivery_failed",
+                {"request_id": request_id}, command_id=command.command_id)],
         )
 
     def _plan_user_input_inject(self, command: Any) -> CommandPlan:
@@ -2426,6 +2483,8 @@ class ConversationTurnProcessQueryHandler:
                 thread_id,
                 turn_id,
                 limit=int(limit) if limit not in (None, "") else 2000,
+                after_seq=int(query.params.get("after_seq") or 0),
+                watermark=int(query.params["watermark"]) if query.params.get("watermark") is not None else None,
             )
         except ConversationError as exc:
             raise CommandFailed(make_error(
@@ -2460,6 +2519,7 @@ class ConversationThreadSearchQueryHandler:
                 include_archived=include_archived,
                 include_superseded=include_superseded,
                 limit=int(limit) if limit not in (None, "") else 30,
+                offset=max(0, int(query.params.get("offset") or 0)),
             )
         except ConversationError as exc:
             raise CommandFailed(make_error(

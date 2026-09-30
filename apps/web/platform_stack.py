@@ -301,6 +301,7 @@ class WebPlatformStack:
             Path(self.store.db_path).with_name("capability_management.json"))
         from muteki.conversation.chat_plugins import ChatPluginService
         self.chat_plugins = ChatPluginService(self.root / "chat-plugins")
+        self.manager.chat_plugins = self.chat_plugins
         self.conversation.manager.chat_plugins = self.chat_plugins
         self.conversation.executor.chat_plugins = self.chat_plugins
         self.conversation.register(self.command_api)
@@ -315,7 +316,10 @@ class WebPlatformStack:
             env_ref_resolver=lambda refs: _runtime_env_refs(
                 self.platform_secrets, refs),
             cli_builder=_build_cli_compat_adapter,
-            probe_environment_factory=self.chat_plugins.prepare_environment,
+            # Runtime health checks need private configuration, not a full copy
+            # of every native skill/plugin/IDE asset for each registered engine.
+            probe_environment_factory=lambda engine, identity, env: self.chat_plugins.prepare_environment(
+                engine, identity, env, include_assets=False),
         )
         self.runtime_service.factory = self.runtime_factory
 
@@ -541,6 +545,8 @@ class WebPlatformStack:
 
         return [
             create_chat_plugins_router(self.chat_plugins, self.conversation),
+            create_chat_plugins_router(self.chat_plugins, self.conversation,
+                                       prefix="/api/agent-extensions"),
             create_usage_router(self.manager, self.competition_store),
             create_registry_router(self.domain_registry, self.routed_command_api),
             create_platform_router(self.routed_command_api),

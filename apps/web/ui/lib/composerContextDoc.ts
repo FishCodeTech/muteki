@@ -10,7 +10,6 @@
 export const COMPOSER_CONTEXT_SCHEMA = 2 as const;
 export const COMPOSER_CONTEXT_CLIPBOARD_MIME = "application/x-muteki-composer-context+json";
 export const COMPOSER_CONTEXT_MARKER_RE = /⟦ref:([A-Za-z0-9_-]+)⟧/g;
-const MAX_SNAPSHOT_CHARS = 4000;
 
 export type ComposerContextStatus = "ok" | "stale" | "missing" | "forbidden";
 
@@ -80,11 +79,8 @@ export function newContextNodeId(): string {
   return `ctx_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
-export function capSnapshotText(text: string, max = MAX_SNAPSHOT_CHARS): string {
-  const value = String(text || "");
-  if (value.length <= max) return value;
-  return `${value.slice(0, max)}\n…`;
-}
+/** Selected context remains complete; the UI may summarize it separately. */
+export function capSnapshotText(text: string): string { return String(text || ""); }
 
 export function isInlineContextKind(kind: string): boolean {
   return kind === "file" || kind === "message_span" || kind === "tool_excerpt";

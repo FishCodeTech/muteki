@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  classifyThreadNotice,
   createNoticeAutoDismissController,
   shouldScheduleNoticeAutoClear,
   type ThreadNoticeKind,
@@ -81,57 +80,52 @@ export type ThreadNoticeControls = {
  */
 export function useThreadScopedNotice(
   scopeKey: string,
-): [string, (value: string) => void, ThreadNoticeControls] {
-  const [store, setStore] = useState<ThreadTransientStore>({});
-  const value = readThreadScopedString(store, scopeKey);
+): [string, (value: string, kind?: ThreadNoticeKind) => void, ThreadNoticeControls] {
+  const [store, setStore] = useState<Record<string, { text: string; kind: ThreadNoticeKind }>>({});
+  const currentNotice = store[scopeKey];
+  const value = currentNotice?.text ?? "";
   const scopeRef = useRef(scopeKey);
   scopeRef.current = scopeKey;
   const timerScopeRef = useRef(scopeKey);
-
   const controllerRef = useRef<ReturnType<typeof createNoticeAutoDismissController> | null>(null);
   if (controllerRef.current == null) {
     controllerRef.current = createNoticeAutoDismissController(() => {
       const key = timerScopeRef.current;
       setStore((prev) => {
-        const current = readThreadScopedString(prev, key);
-        if (!shouldScheduleNoticeAutoClear(current)) return prev;
-        return writeThreadScopedString(prev, key, "");
+        const current = prev[key];
+        if (!current || !shouldScheduleNoticeAutoClear(current.text, current.kind)) return prev;
+        const next = { ...prev };
+        delete next[key];
+        return next;
       });
     });
   }
-
-  const setValue = useCallback((next: string) => {
-    setStore((prev) => writeThreadScopedString(prev, scopeKey, next));
-    // An async completion owned by a hidden thread only updates its stored copy.
+  const setValue = useCallback((text: string, kind: ThreadNoticeKind = "sticky") => {
+    setStore((prev) => {
+      if (!text) {
+        if (!(scopeKey in prev)) return prev;
+        const next = { ...prev };
+        delete next[scopeKey];
+        return next;
+      }
+      if (prev[scopeKey]?.text === text && prev[scopeKey]?.kind === kind) return prev;
+      return { ...prev, [scopeKey]: { text, kind } };
+    });
+    // A late completion for a hidden thread changes only that thread's notice.
     if (scopeRef.current === scopeKey) {
       timerScopeRef.current = scopeKey;
-      controllerRef.current?.onNoticeChange(next);
+      controllerRef.current?.onNoticeChange(text, kind);
     }
   }, [scopeKey]);
 
-  // Switching threads: cancel prior timer; if the newly visible scope already
-  // holds a success notice, restart its short dismiss window.
   useEffect(() => {
-    const ctrl = controllerRef.current;
-    if (!ctrl) return;
-    const current = readThreadScopedString(store, scopeKey);
     timerScopeRef.current = scopeKey;
-    ctrl.onNoticeChange(current);
-    // Only re-arm on scope change — not on every store write (setValue arms).
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional
+    controllerRef.current?.onNoticeChange(currentNotice?.text ?? "", currentNotice?.kind ?? "sticky");
+    // setValue manages visible updates; navigation starts a fresh visible window.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scopeKey]);
-
-  useEffect(() => () => {
-    controllerRef.current?.dispose();
-  }, []);
-
-  const pauseAutoDismiss = useCallback(() => {
-    controllerRef.current?.pause();
-  }, []);
-  const resumeAutoDismiss = useCallback(() => {
-    controllerRef.current?.resume();
-  }, []);
-
-  const kind = classifyThreadNotice(value);
-  return [value, setValue, { kind, pauseAutoDismiss, resumeAutoDismiss }];
+  useEffect(() => () => { controllerRef.current?.dispose(); }, []);
+  const pauseAutoDismiss = useCallback(() => { controllerRef.current?.pause(); }, []);
+  const resumeAutoDismiss = useCallback(() => { controllerRef.current?.resume(); }, []);
+  return [value, setValue, { kind: currentNotice?.kind ?? "sticky", pauseAutoDismiss, resumeAutoDismiss }];
 }

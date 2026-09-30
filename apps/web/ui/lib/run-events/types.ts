@@ -134,6 +134,7 @@ export interface SolverCost {
   usd: number;
   tokensIn: number;
   tokensOut: number;
+  unpricedCalls?: number;
   engine?: string; // "claude" | "codex" | "cursor" | "deepseek" (best-effort)
 }
 

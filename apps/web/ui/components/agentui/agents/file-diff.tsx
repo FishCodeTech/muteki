@@ -28,7 +28,7 @@ import { AgentDisclosure } from "@/components/agentui/agents/agent-disclosure";
 import { SPRING_PRESS, SPRING_SWAP } from "@/components/agentui/lib/ease";
 import { cn } from "@/lib/cn";
 
-export type FileDiffStatus = "streaming" | "complete";
+export type FileDiffStatus = "preview" | "streaming" | "complete";
 export type FileDiffLineType = "added" | "removed" | "context";
 
 export interface FileDiffLine {
@@ -193,7 +193,9 @@ export function FileDiff({
           <ChangeCount value={deletions} type="removed" />
         </span>
         <span className="grid size-4 shrink-0 place-items-center text-cx-fg-3/60">
-          {streaming ? (
+          {status === "preview" ? (
+            <FileCode2 aria-label="改动预览" className="size-3.5" />
+          ) : streaming ? (
             <LoaderCircle
               aria-label="正在应用改动"
               className={cn("size-3.5", !reduce && "animate-spin")}

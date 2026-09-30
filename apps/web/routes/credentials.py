@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from typing import Any
 
 from fastapi import (
@@ -101,6 +102,7 @@ def register(app: FastAPI) -> None:
                 usage=usage,
                 catalogs=catalogs,
                 engines=SUPPORTED_ENGINE_IDS,
+                environment=catalog_environment,
             )
             runtime_keys = _catalog_runtime_keys_by_engine(transport_kind="")
             for row in rows:
@@ -212,6 +214,8 @@ def register(app: FastAPI) -> None:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         account_id = account_id_from_credential_id(stable_id)
+        store = CredentialAccountStore(account_store_root(app.state.manager.state_root))
+        revision = store.revision(account_id) if account_id else None
         system_engine = engine_from_system_credential_id(stable_id)
         if system_engine:
             ensure_engine_supported(system_engine)
@@ -303,8 +307,12 @@ def register(app: FastAPI) -> None:
             raise HTTPException(status_code=400, detail="unknown credential id")
         store = CredentialAccountStore(
             account_store_root(app.state.manager.state_root))
+        if account_id and store.revision(account_id) != revision:
+            raise HTTPException(status_code=409, detail={"code": "credential.configuration_changed", "message": "配置在测试期间已改变，结果不代表当前配置。"})
         last_test = store.save_test_status(
-            stable_id, result, backend=backend)
+            stable_id, result, backend=backend,
+            runtime_instance=str(body.get("runtime_instance") or "default"),
+            expected_revision=revision)
         from apps.web.worker_models import CredentialModelCatalogStore
 
         CredentialModelCatalogStore(
@@ -352,9 +360,17 @@ def register(app: FastAPI) -> None:
                 or ""
             ).strip().lower()
         ensure_engine_supported(engine or system_engine)
-        if not base_url:
-            base_url = str(details.get("base_url_value") or "").strip()
-        if not secret:
+        registered_engine = str(details.get("target_engine") or (account.engine if account else system_engine) or "")
+        if registered_engine and engine and registered_engine != engine:
+            raise HTTPException(status_code=409, detail={"code": "credential.engine_mismatch", "message": "凭据所属引擎与当前模型刷新目标不一致。"})
+        saved_url = str(details.get("base_url_value") or "").strip()
+        selected_url = base_url if "base_url" in body else saved_url
+        saved_connection = "custom_endpoint" if saved_url else "official"
+        draft = bool(secret) or selected_url.rstrip("/") != saved_url.rstrip("/") or connection != saved_connection
+        if draft and connection == "custom_endpoint" and not secret:
+            raise HTTPException(status_code=409, detail={"code": "credential.draft_secret_required", "message": "端点已改变，请为当前草稿明确提供密钥；不会向新端点复用旧密钥。"})
+        base_url = selected_url
+        if not secret and not draft:
             secret = str(details.get("secret_value") or "").strip()
 
         if not (system_engine or account_id):
@@ -384,6 +400,8 @@ def register(app: FastAPI) -> None:
             provider=provider,
             configured_models=configured_models,
             default_model=default_model,
+            persist=not draft,
+            expected_revision=store.revision(account_id) if account_id else None,
         )
         models = [
             str(item.get("id") if isinstance(item, dict) else item).strip()
@@ -442,6 +460,8 @@ def register(app: FastAPI) -> None:
             account = store.upsert_secret(
                 account_id=account_id,
                 engine=storage_engine,
+                create_only=body.get("create_only") is True,
+                expected_revision=body.get("expected_revision"),
                 secret=(body.get("secret") if body.get("secret") is not None else None),
                 codex_auth_json=(
                     body.get("codex_auth_json")
@@ -458,6 +478,8 @@ def register(app: FastAPI) -> None:
                 models=body.get("models"),
                 clear_base_url=connection == "official",
             )
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail={"code": str(exc), "message": "凭据已存在或已被其它视图修改，请刷新后重试。"}) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         from apps.web.worker_models import CredentialModelCatalogStore
@@ -483,70 +505,60 @@ def register(app: FastAPI) -> None:
         return {"ok": True, "account": account}
 
     @app.delete("/api/settings/credential-accounts/{account_id}")
-    async def delete_credential_account(
-        account_id: str,
-        detach_references: bool = False,
-    ) -> Any:
+    async def delete_credential_account(account_id: str, detach_references: bool = False) -> Any:
         try:
             stable_id = account_credential_id(account_id)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         all_usages = _credential_usage_index().get(stable_id) or []
-        usages = [
-            item for item in all_usages
-            if item.get("enabled", True) is not False
-        ]
-        used_by = [
-            str(item.get("label") or item.get("id") or item.get("kind") or "引用")
-            for item in usages
-        ]
-        if used_by and not detach_references:
-            raise HTTPException(
-                status_code=409,
-                detail=f"账号仍被 {len(used_by)} 处配置使用：{'、'.join(used_by[:4])}",
-            )
-
-        if detach_references and all_usages:
-            usage_ids = {
-                str(item.get("id") or "") for item in all_usages
-            }
-
-            # 一次写入完成 Worker、规划与标题引用清理。删除属于已有配置
-            # 的收尾操作，不重新校验其他历史 Worker 的模型测试状态。
-            app.state.manager.worker_config.detach_credential_references(
-                stable_id)
-
-            # 对话本体、消息和产物继续保留；运行选择回到对应 CLI 的系统登录。
-            from muteki.external_agents.factory import engine_for_adapter
-
-            conversation = app.state.platform_stack.conversation
-            for selection in conversation.conv.list_runtime_selections():
-                if selection.thread_id not in usage_ids:
-                    continue
-                engine = engine_for_adapter(selection.adapter_id)
-                replacement = system_credential_id(engine) if engine else ""
-                conversation.manager.save_runtime_selection(
-                    selection.thread_id,
-                    {"credential_id": replacement},
-                    validate_credential=False,
-                )
-
-            # 旧 Runtime 引用已退出当前所有权模型，统一清除兼容字段。
-            if any(item.get("kind") == "runtime_legacy" for item in all_usages):
-                app.state.platform_stack.runtime_store.clear_legacy_identity_fields()
-
+        usages = [item for item in all_usages if item.get("enabled", True) is not False]
+        if usages and not detach_references:
+            raise HTTPException(status_code=409, detail={"code": "credential.account.in_use", "message": "账号仍被配置引用", "references": usages})
         store = CredentialAccountStore(account_store_root(app.state.manager.state_root))
-        deleted = store.delete(account_id)
-        if deleted:
-            from apps.web.worker_models import CredentialModelCatalogStore
-
-            CredentialModelCatalogStore(
-                app.state.manager.state_root
-            ).purge_credential(stable_id)
-        return {
-            "ok": deleted,
-            "detached": len(all_usages) if detach_references else 0,
-        }
+        worker = app.state.manager.worker_config
+        runtime_store = app.state.platform_stack.runtime_store
+        conversation = app.state.platform_stack.conversation
+        worker_before = copy.deepcopy(worker._data)
+        runtime_before = copy.deepcopy(runtime_store._instances)
+        health_before = copy.deepcopy(runtime_store._health)
+        try:
+            with store.deletion_transaction(account_id), conversation.manager._store.transaction():
+                if detach_references and all_usages:
+                    usage_ids = {str(item.get("id") or "") for item in all_usages}
+                    worker.detach_credential_references(stable_id)
+                    from muteki.external_agents.factory import engine_for_adapter
+                    for selection in conversation.conv.list_runtime_selections():
+                        if selection.thread_id in usage_ids:
+                            engine = engine_for_adapter(selection.adapter_id)
+                            conversation.manager.save_runtime_selection(selection.thread_id,
+                                {"credential_id": system_credential_id(engine) if engine else ""},
+                                validate_credential=False)
+                    if any(item.get("kind") == "runtime_legacy" for item in all_usages):
+                        runtime_store.clear_legacy_identity_fields()
+        except BaseException as exc:
+            rollback_errors = []
+            try:
+                if worker._data != worker_before:
+                    worker._data = worker_before
+                    worker._flush()
+            except Exception as rollback:
+                rollback_errors.append({"scope": "worker_settings", "error": str(rollback)})
+            try:
+                with runtime_store._lock:
+                    if runtime_store._instances != runtime_before or runtime_store._health != health_before:
+                        runtime_store._instances = runtime_before
+                        runtime_store._health = health_before
+                        runtime_store._flush()
+            except Exception as rollback:
+                rollback_errors.append({"scope": "runtime_settings", "error": str(rollback)})
+            if rollback_errors:
+                raise HTTPException(status_code=500, detail={"code": "credential.delete.rollback_failed", "message": "删除未完成，部分引用需要恢复。", "cause": str(exc), "recovery": rollback_errors}) from exc
+            if isinstance(exc, FileNotFoundError):
+                raise HTTPException(status_code=404, detail={"code": "credential.account.not_found", "message": "账号不存在，引用没有改变。"}) from exc
+            raise HTTPException(status_code=500, detail={"code": "credential.delete.failed", "message": "删除失败，账号与引用已恢复。", "cause": str(exc)}) from exc
+        from apps.web.worker_models import CredentialModelCatalogStore
+        CredentialModelCatalogStore(app.state.manager.state_root).purge_credential(stable_id)
+        return {"ok": True, "detached": len(all_usages) if detach_references else 0}
 
     @app.post("/api/settings/credential-accounts/{account_id}/import-host-codex")
     async def import_host_codex(account_id: str) -> Any:
@@ -610,6 +622,7 @@ def register(app: FastAPI) -> None:
             backend = "local"
         store = CredentialAccountStore(
             account_store_root(app.state.manager.state_root))
+        revision = store.revision(account_id)
         account = store.inspect(account_id)
         account_engine = str(
             ((account.details or {}).get("target_engine") if account else "")
@@ -645,7 +658,8 @@ def register(app: FastAPI) -> None:
                     cfg.get("worker_network") or "bridge")},
             )
         last_test = store.save_test_status(
-            account_credential_id(account_id), result, backend=backend)
+            account_credential_id(account_id), result, backend=backend,
+            runtime_instance=str(body.get("runtime_instance") or "default"), expected_revision=revision)
         from apps.web.worker_models import CredentialModelCatalogStore
 
         CredentialModelCatalogStore(

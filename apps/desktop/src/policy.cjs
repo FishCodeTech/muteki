@@ -63,4 +63,17 @@ function webPreferences(partition) {
   };
 }
 
-module.exports = { DEFAULT_ORIGIN, SHELL_URL, parseWebUrl, normalizeOrigin, sameOrigin, allowedNavigation, partitionFor, webPreferences };
+function normalizeDesktopRoute(value) {
+  const invalid = () => Object.assign(new Error('此导航地址不可用。'), { code: 'desktop.route_invalid', source: 'desktop', retryable: false });
+  if (typeof value !== 'string') throw invalid();
+  let url;
+  try { url = new URL(value, SHELL_URL); } catch { throw invalid(); }
+  if (url.protocol !== 'muteki-desktop:' || url.host !== 'app' || url.username || url.password || url.hash
+      || !/^\/(chat(?:\/[^/]+)?|settings(?:\/[a-z-]+)?|ctf(?:\/.*)?|pentest(?:\/.*)?|competitions(?:\/.*)?|task(?:\/.*)?|usage)?$/.test(url.pathname)) throw invalid();
+  if (url.pathname.startsWith('/chat/')) {
+    try { decodeURIComponent(url.pathname.split('/')[2]); } catch { throw invalid(); }
+  }
+  return url.pathname + url.search;
+}
+
+module.exports = { DEFAULT_ORIGIN, SHELL_URL, parseWebUrl, normalizeOrigin, normalizeDesktopRoute, sameOrigin, allowedNavigation, partitionFor, webPreferences };

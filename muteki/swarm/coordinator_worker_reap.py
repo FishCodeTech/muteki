@@ -5,6 +5,88 @@ from __future__ import annotations
 from muteki.solver.cli_launch_check import launch_failure_code
 
 
+_MAX_CONSECUTIVE_WORKER_DISPATCH_FAILURES = 5
+
+
+async def _observe_started_workers(self, state=None, solvers=()) -> None:
+    """A real process-start receipt, rather than task creation, clears the streak."""
+    from muteki.swarm.coordinator_state import emit_scheduler_bb
+
+    scheduled = tuple(state.task_solvers.values()) if state is not None else ()
+    for solver in (*scheduled, *tuple(solvers)):
+        sid = str(getattr(solver, "solver_id", "") or "")
+        if (not sid or bool(getattr(solver, "_muteki_worker_start_observed", False))
+                or bool(getattr(solver, "_remote_start_uncertain", False))
+                or not bool(getattr(solver, "_runtime_process_started", False))):
+            continue
+        solver._muteki_worker_start_observed = True
+        previous = int(getattr(self, "_consecutive_worker_dispatch_failures", 0))
+        self._consecutive_worker_dispatch_failures = 0
+        if previous:
+            fields = {"worker": sid, "previous_consecutive_failures": previous}
+            if state is None:
+                await self._emit_coord_bb("worker_dispatch_recovered", **fields)
+            else:
+                await emit_scheduler_bb(
+                    self, state, "worker_dispatch_recovered", **fields,
+                )
+
+
+async def _record_worker_dispatch_failure(
+    self, state=None, *, worker: str, engine: str, detail: str,
+    solver=None, active_solvers=None,
+) -> bool:
+    """Count rejected/prestart dispatches; a running Worker failure is separate."""
+    from muteki.swarm.coordinator_state import emit_scheduler_bb
+
+    if (solver is not None
+            and bool(getattr(solver, "_muteki_worker_dispatch_failure_recorded", False))):
+        return bool(getattr(self, "_worker_dispatch_failure_limit_reached", False))
+    active = (state.task_solvers if state is not None else active_solvers) or {}
+    await _observe_started_workers(self, state, active.values())
+    if solver is not None:
+        solver._muteki_worker_dispatch_failure_recorded = True
+    streak = int(getattr(self, "_consecutive_worker_dispatch_failures", 0)) + 1
+    self._consecutive_worker_dispatch_failures = streak
+    fields = {
+        "worker": worker, "engine": engine,
+        "consecutive_failures": streak,
+        "stop_after": _MAX_CONSECUTIVE_WORKER_DISPATCH_FAILURES,
+        "detail": detail,
+    }
+    if state is None:
+        await self._emit_coord_bb("worker_dispatch_failed", **fields)
+    else:
+        await emit_scheduler_bb(self, state, "worker_dispatch_failed", **fields)
+    if streak < _MAX_CONSECUTIVE_WORKER_DISPATCH_FAILURES:
+        return False
+    if state is not None:
+        state.runtime_terminal_failure = True
+    self._worker_dispatch_failure_limit_reached = True
+    self._runtime_failure_code = "consecutive_worker_dispatch_failures"
+    self._runtime_failure_phase = "worker_start"
+    self._runtime_failure_detail = (
+        f"{streak} consecutive Worker dispatches failed before process start; "
+        f"last failure: {detail}"
+    )
+    for other, active_solver in list(active.items()):
+        if not other.done():
+            self._cancel_solver(active_solver)
+            other.cancel()
+    limit_fields = {
+        "consecutive_failures": streak,
+        "stop_after": _MAX_CONSECUTIVE_WORKER_DISPATCH_FAILURES,
+        "detail": detail,
+    }
+    if state is None:
+        await self._emit_coord_bb("worker_dispatch_failure_limit", **limit_fields)
+    else:
+        await emit_scheduler_bb(
+            self, state, "worker_dispatch_failure_limit", **limit_fields,
+        )
+    return True
+
+
 def _mark_ctf_batch_reaped(
     state, *, batch_id: int, is_review_task: bool, is_verifier_task: bool,
 ) -> None:
@@ -288,6 +370,7 @@ async def _fold_finished_worker(self, state, retired) -> str:
             state.force_reason_after_fruitless_interrupt = True
         return "proceed"
     except Exception as e:
+        await _observe_started_workers(self, state, (solver,))
         state.per_solver[sid] = SolveOutcome(
             False, None, 0, None, f"error: {e}")
         runtime_unavailable = isinstance(e, WorkerRuntimeUnavailable)
@@ -362,6 +445,12 @@ async def _fold_finished_worker(self, state, retired) -> str:
                     other.cancel()
             raise ControlShutdownIncomplete(
                 "remote worker start outcome is uncertain")
+        dispatch_failure_limit = False
+        if not bool(getattr(solver, "_runtime_process_started", True)):
+            dispatch_failure_limit = await _record_worker_dispatch_failure(
+                self, state, worker=sid, engine=str(engine), detail=str(e),
+                solver=solver,
+            )
         if runtime_unavailable:
             # A missing provider/model catalog is a deterministic runtime setup
             # failure. Reopening the semantic Intent cannot change it; with one
@@ -398,6 +487,23 @@ async def _fold_finished_worker(self, state, retired) -> str:
             _mark_ctf_batch_reaped(
                 state,
                 batch_id=ctf_batch_id,
+                is_review_task=is_review_task,
+                is_verifier_task=is_verifier_task,
+            )
+            state.reaped_n += 1
+            return "break"
+        if dispatch_failure_limit:
+            await emit_bb(
+                "worker_finished", worker=sid,
+                result="dispatch_failure_limit",
+                retire_deferred=retire_deferred,
+            )
+            self._active_review_tasks.discard(t)
+            self._active_verifier_tasks.discard(t)
+            if not is_review_task and not is_verifier_task:
+                state.completed_for_review_n += 1
+            _mark_ctf_batch_reaped(
+                state, batch_id=ctf_batch_id,
                 is_review_task=is_review_task,
                 is_verifier_task=is_verifier_task,
             )
@@ -581,6 +687,7 @@ async def _fold_finished_worker(self, state, retired) -> str:
 
 
 async def reap_workers_stage(self, state) -> None:
+    await _observe_started_workers(self, state)
     for task in state.done:
         retired = await _retire_finished_worker(self, state, task)
         if retired is None:

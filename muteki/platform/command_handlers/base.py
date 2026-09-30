@@ -135,6 +135,10 @@ class CommandPlan:
     side_effect: Optional[Callable[[], Awaitable[SideEffectResult]]] = None
     #: 非空则为该副作用写 outbox 记录（幂等键 = command_id），投递后回写状态
     outbox_destination: str = ""
+    #: Synchronous local state changes committed with the receipt and events.
+    local_commit: Optional[Callable[[], None]] = None
+    #: Request-state restoration after a confirmed failed delivery.
+    failure_events: list["EventEnvelope"] = field(default_factory=list)
 
 
 class CommandHandler(Protocol):

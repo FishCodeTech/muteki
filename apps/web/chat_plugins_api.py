@@ -1,4 +1,4 @@
-"""Authenticated management of conversation-scoped plugins."""
+"""Authenticated management of chat and Worker Agent extensions."""
 from __future__ import annotations
 
 import asyncio
@@ -8,11 +8,12 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from muteki.conversation.chat_plugins import ChatPluginError, ChatPluginService, ENGINES
+from muteki.conversation.chat_plugins import ChatPluginError, ChatPluginService, ENGINES, MODES
 
 
 class InstallBody(BaseModel):
     source: dict[str, Any]
+    modes: list[str] | None = None
 
 
 class UpdateBody(BaseModel):
@@ -20,15 +21,18 @@ class UpdateBody(BaseModel):
     rollback: bool = False
     native_hooks: bool | None = None
     digest: str = ""
+    modes: list[str] | None = None
 
 
 class McpBody(BaseModel):
     name: str
     servers: dict[str, Any]
+    modes: list[str] | None = None
 
 
-def create_chat_plugins_router(plugins: ChatPluginService, conversation: Any) -> APIRouter:
-    router = APIRouter(prefix="/api/chat-plugins", tags=["chat-plugins"])
+def create_chat_plugins_router(plugins: ChatPluginService, conversation: Any,
+                               *, prefix: str = "/api/chat-plugins") -> APIRouter:
+    router = APIRouter(prefix=prefix, tags=["agent-extensions"])
 
     async def changed():
         await plugins.invalidate()
@@ -40,18 +44,31 @@ def create_chat_plugins_router(plugins: ChatPluginService, conversation: Any) ->
                 conversation.executor._emit_capabilities_updated(thread.thread_id, snapshot)
 
     @router.get("")
-    async def listing(engine: str = "codex"):
+    async def listing(engine: str = "codex", mode: str = "chat", run_id: str = ""):
         if engine not in ENGINES:
             raise HTTPException(400, "未知 Agent")
+        if mode not in MODES:
+            raise HTTPException(400, "未知使用场景")
+        if run_id and (len(run_id) > 100 or not run_id.startswith("run-")
+                       or not all(char.isalnum() or char in "-_" for char in run_id)):
+            raise HTTPException(400, "Run ID 无效")
         from muteki.conversation.composer_capabilities import discover_skills
         from muteki.conversation.chat_providers import provider_for
+        from muteki.capability_management import enabled as capability_enabled
+        from muteki.solver.credential_accounts import host_discovery_enabled
         native = [{k: v for k, v in row.items() if not k.startswith("_")}
                   for row in await asyncio.to_thread(discover_skills, engine)
                   if row.get("source") != "Muteki Agent Plugin"]
-        return {"engines": list(ENGINES), "engine": engine, "revision": plugins.revision(engine),
+        return {"engines": list(ENGINES), "modes": list(MODES), "engine": engine, "revision": plugins.revision(engine),
+                "host_discovery_enabled": host_discovery_enabled(),
                 "packages": [plugins.public(r) for r in plugins.records()], "native_skills": native,
+                "builtin_skills": [{"id": "agent-browser", "modes": ["pentest"],
+                                    "enabled": capability_enabled("skills", "agent-browser"),
+                                    "scope": "new_workers"}],
                 "native_mcp": provider_for(engine).native_mcp(), "transport": provider_for(engine).transport,
-                "control_enabled": plugins.control_enabled(engine)}
+                "control_enabled": plugins.control_enabled(engine),
+                "runtime_scope": run_id if mode != "chat" else "",
+                "runtime_mcp": plugins.runtime_mcp_health(engine, mode, run_id if mode != "chat" else "")}
 
     @router.get("/visualizations/{thread_id}")
     async def visualization(thread_id: str, path: str):
@@ -90,7 +107,7 @@ def create_chat_plugins_router(plugins: ChatPluginService, conversation: Any) ->
     @router.post("/install")
     async def install(body: InstallBody):
         try:
-            result = await asyncio.to_thread(plugins.install, body.source)
+            result = await asyncio.to_thread(plugins.install, body.source, body.modes)
             await changed()
             return result
         except ChatPluginError as exc:
@@ -117,16 +134,18 @@ def create_chat_plugins_router(plugins: ChatPluginService, conversation: Any) ->
     @router.post("/mcp")
     async def add_mcp(body: McpBody):
         try:
-            result = await asyncio.to_thread(plugins.add_mcp, body.name, body.servers)
+            result = await asyncio.to_thread(plugins.add_mcp, body.name, body.servers, body.modes)
             await changed()
             return result
+        except ChatPluginError as exc:
+            raise HTTPException(400, {"code": exc.code, "message": str(exc)}) from exc
         except Exception as exc:
             raise HTTPException(400, "MCP 配置无效，请检查名称、command/URL 与参数") from exc
 
     @router.patch("/packages/{package_id}")
     async def update(package_id: str, body: UpdateBody):
         try:
-            result = plugins.update(package_id, body.enabled, body.rollback, body.native_hooks, body.digest)
+            result = plugins.update(package_id, body.enabled, body.rollback, body.native_hooks, body.digest, body.modes)
             await changed()
             return result
         except ValueError as exc:

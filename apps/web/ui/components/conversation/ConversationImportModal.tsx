@@ -1,5 +1,6 @@
 "use client";
 
+import { useLang } from "@/lib/i18n";
 /* ─────────────────────────────────────────────────────────
  * CONVERSATION IMPORT MODAL — C33 Provider session import.
  * Scan → Preview → Apply flow for Claude / Codex history.
@@ -13,13 +14,14 @@ import {
   type ImportApplyResult,
 } from "@/lib/useConversation";
 import type { ConversationProject } from "@/lib/useConversation";
+import { NativePathPicker } from "@/components/NativePathPicker";
 
 type AdapterId = "claude" | "codex";
 type Step = "config" | "preview" | "result";
 
 const STATUS_LABEL: Record<string, string> = {
   continuable: "可续聊",
-  read_only: "只读导入",
+  read_only: "历史副本",
   missing_tools: "缺少工具记录",
 };
 
@@ -40,14 +42,18 @@ export function ConversationImportModal({
   onClose,
   onImportDone,
 }: ConversationImportModalProps) {
+  const { lang } = useLang();
   const [step, setStep] = useState<Step>("config");
   const [adapter, setAdapter] = useState<AdapterId>("claude");
   const [customPath, setCustomPath] = useState("");
   const [projectId, setProjectId] = useState("");
   const [scanning, setScanning] = useState(false);
+  const [pickingPath, setPickingPath] = useState(false);
   const [scanError, setScanError] = useState("");
   const [scans, setScans] = useState<ProviderSessionScan[]>([]);
   const [basePath, setBasePath] = useState("");
+  const [scanAdapter, setScanAdapter] = useState<AdapterId>("claude");
+  const scanGeneration = useRef(0);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [applying, setApplying] = useState(false);
   const [result, setResult] = useState<ImportApplyResult | null>(null);
@@ -64,10 +70,13 @@ export function ConversationImportModal({
   }, [onClose]);
 
   const doScan = useCallback(async () => {
+    const generation = ++scanGeneration.current;
     setScanning(true);
     setScanError("");
     try {
       const res = await fetchImportScan({ adapter, path: customPath || undefined, limit: 100 });
+      if (generation !== scanGeneration.current) return;
+      setScanAdapter(adapter);
       setBasePath(res.base_path);
       if (!res.exists) {
         setScanError(`路径不存在: ${res.base_path}`);
@@ -97,9 +106,10 @@ export function ConversationImportModal({
     setApplyError("");
     try {
       const res = await applyImport({
-        adapter_id: adapter,
+        adapter_id: scanAdapter,
         source_path: basePath,
         sessions: [...selected],
+        source_versions: Object.fromEntries(scans.filter((scan) => selected.has(scan.session_id)).map((scan) => [scan.session_id, scan.source_fingerprint])),
         project_id: projectId || undefined,
       });
       setResult(res);
@@ -110,7 +120,7 @@ export function ConversationImportModal({
     } finally {
       setApplying(false);
     }
-  }, [adapter, basePath, selected, projectId, onImportDone]);
+  }, [scanAdapter, scans, basePath, selected, projectId, onImportDone]);
 
   return (
     <div
@@ -130,7 +140,7 @@ export function ConversationImportModal({
         <div className="flex items-center justify-between border-b border-line px-5 py-3">
           <div>
             <h2 className="text-[14px] font-semibold text-ink">导入 Provider 历史会话</h2>
-            <p className="text-[12px] text-ink-3">C33 · 从本地 Claude / Codex 目录读取并导入</p>
+            <p className="text-[12px] text-ink-3">从当前服务宿主的 Claude / Codex 目录读取并导入</p>
           </div>
           <button
             type="button"
@@ -156,7 +166,8 @@ export function ConversationImportModal({
                     <button
                       key={a}
                       type="button"
-                      onClick={() => setAdapter(a)}
+                      disabled={scanning || applying || pickingPath}
+                      onClick={() => { setAdapter(a); setScans([]); setSelected(new Set()); }}
                       className={`flex-1 rounded-control border px-3 py-2 text-[12.5px] font-medium transition-colors
                         ${adapter === a
                           ? "border-accent bg-accent/10 text-accent"
@@ -171,16 +182,15 @@ export function ConversationImportModal({
 
               {/* Custom path */}
               <div>
-                <label htmlFor="import-path" className="block text-[12px] font-medium text-ink-2 mb-1.5">
-                  历史目录路径 <span className="text-ink-3">（留空使用默认 ~/{adapter === "claude" ? ".claude" : ".codex"}）</span>
-                </label>
-                <input
+                <NativePathPicker
                   id="import-path"
-                  type="text"
+                  label={lang === "en" ? "History directory path" : "历史目录路径"}
+                  kind="directory"
+                  disabled={scanning || applying}
                   value={customPath}
-                  onChange={(e) => setCustomPath(e.target.value)}
-                  placeholder={`默认: ~/${adapter === "claude" ? ".claude" : ".codex"}`}
-                  className="w-full rounded-control border border-line bg-inset px-3 py-2 text-[12.5px] text-ink outline-none focus:border-cx-border-strong"
+                  onChange={(path) => { setCustomPath(path); setScans([]); setSelected(new Set()); }}
+                  onBusyChange={setPickingPath}
+                  placeholder={lang === "en" ? "Service host history directory; default requires host discovery" : "服务宿主历史目录；留空需服务允许宿主发现"}
                 />
               </div>
 
@@ -310,7 +320,7 @@ export function ConversationImportModal({
                 </details>
               )}
               <p className="text-[12.5px] text-ink-2">
-                原始 Provider 文件未被修改。已导入的会话标注了续聊状态，可在对话列表中查看。
+                原始历史文件未被修改。导入内容是历史副本，不会恢复原应用的运行会话，可在对话列表中查看。
               </p>
             </div>
           )}
@@ -330,7 +340,7 @@ export function ConversationImportModal({
               <button
                 type="button"
                 onClick={doScan}
-                disabled={scanning}
+                disabled={scanning || pickingPath}
                 className="h-8 rounded-control bg-accent px-4 text-[12px] font-semibold text-white shadow-btn disabled:opacity-50"
               >
                 {scanning ? "扫描中…" : "扫描历史"}

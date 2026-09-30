@@ -207,7 +207,7 @@ class ConversationProjection:
             text = str(p.get("text") or "")
             update["last_turn_seq"] = max(
                 state.last_turn_seq, int(p.get("seq") or 0))
-            if turn_id and text:
+            if turn_id and (text or p.get("attachments") or p.get("capability_refs")):
                 msg_id = _user_message_id(turn_id)
                 existed = self._conv.get_message(msg_id) is not None
                 self._conv.save_message(ConversationMessage(
@@ -281,6 +281,11 @@ class ConversationProjection:
         elif etype == ev.EV_TURN_STARTED:
             update["running_turn_id"] = str(p.get("turn_id") or "") or None
             update["last_error"] = {}
+            turn = self._conv.get_turn(str(p.get("turn_id") or ""))
+            if turn is not None and isinstance(p.get("runtime"), dict):
+                runtime = {key: str(value) for key, value in p["runtime"].items() if key in
+                           {"adapter_id", "instance_id", "credential_id", "model", "effort", "access_mode"} and value is not None}
+                self._conv.save_turn(turn.model_copy(update={"runtime_snapshot": runtime}))
         elif etype in (ev.EV_TURN_COMPLETED, ev.EV_TURN_FAILED,
                        ev.EV_TURN_INTERRUPTED):
             incoming_turn = str(p.get("turn_id") or "")
@@ -347,6 +352,14 @@ class ConversationProjection:
                     },
                     "last_change_summary": "进入等待决策（审批）",
                 })
+        elif etype in {"core.approval.resolve_requested", "core.approval.delivery_failed"}:
+            resolve_id = str(p.get("approval_id") or "")
+            queue = hydrate_approvals(state.pending_approvals, state.pending_approval)
+            row = queue.get(resolve_id)
+            if row is not None and (etype == "core.approval.resolve_requested" or row.get("command_id") == event.command_id):
+                row = {**row, "status": "resolving" if etype == "core.approval.resolve_requested" else "pending",
+                       "command_id": event.command_id}
+                update.update(_queue_update(state, payload=row))
         elif etype == ev.EV_APPROVAL_RESOLVED:
             resolve_id = str(
                 p.get("approval_id") or p.get("request_id") or ""
@@ -393,6 +406,13 @@ class ConversationProjection:
                     },
                     "last_change_summary": "进入等待决策（用户输入）",
                 })
+        elif etype in {"core.user_input.responding", "core.user_input.delivery_failed"}:
+            pending = dict(state.pending_user_input or {})
+            if pending.get("request_id") == p.get("request_id") and (
+                    etype == "core.user_input.responding" or pending.get("command_id") == event.command_id):
+                update["pending_user_input"] = {**pending,
+                    "status": "resolving" if etype == "core.user_input.responding" else "pending",
+                    "command_id": event.command_id}
         elif etype == ev.EV_USER_INPUT_RESOLVED:
             pending_id = str((state.pending_user_input or {}).get("request_id") or "")
             if pending_id and pending_id != str(p.get("request_id") or ""):

@@ -64,6 +64,9 @@ def _filter_env(env: Optional[dict]) -> dict[str, str]:
             continue
         if k.startswith(_ENV_PREFIXES):
             out[k] = str(v)
+    if out.get("MUTEKI_CHALLENGE_MODE") == "pentest":
+        from muteki.solver.browser_coord import managed_browser_worker_path
+        out["PATH"] = managed_browser_worker_path(out)
     return out
 
 

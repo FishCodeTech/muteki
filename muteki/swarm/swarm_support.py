@@ -45,6 +45,38 @@ class WorkerSpawnRejected(RuntimeError):
     pass
 
 
+class WorkerPricingUnavailable(WorkerSpawnRejected):
+    """A USD budget cannot meter the selected Worker's model."""
+
+    code = "pricing_unavailable"
+
+
+class WorkerProfileExhausted(RuntimeError):
+    """Every eligible profile already failed while executing this exact Intent."""
+
+    code = "intent_profiles_exhausted"
+
+    def __init__(self, intent_id: str, profiles: list[str]) -> None:
+        self.intent_id = str(intent_id)
+        self.profiles = tuple(str(item) for item in profiles)
+        super().__init__(
+            f"Intent {self.intent_id} has no untried Worker profile; "
+            f"failed profiles: {', '.join(self.profiles)}"
+        )
+
+
+class WorkerDispatchFailureLimit(RuntimeError):
+    """The Run hit its consecutive Worker prestart failure boundary."""
+
+    code = "consecutive_worker_dispatch_failures"
+
+
+class WorkerRuntimeUnavailable(RuntimeError):
+    """The selected isolated Worker runtime cannot be started."""
+
+    code = "worker_runtime_unavailable"
+
+
 class RequiredContextUnavailable(WorkerSpawnRejected):
     """An exact operator continuation is not deliverable at this spawn.
 

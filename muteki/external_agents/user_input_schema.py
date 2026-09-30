@@ -7,7 +7,20 @@ answers for ``conversation.user_input.resolve``.
 
 from __future__ import annotations
 
+from datetime import date, datetime
+import math
+import re
 from typing import Any, Optional
+from urllib.parse import urlsplit
+
+
+class UserInputValidationError(ValueError):
+    """Correctable request-boundary error, with a stable typed code."""
+
+    def __init__(self, code: str, message: str):
+        self.code = code
+        self.message = message
+        super().__init__(f"{code}|{message}")
 
 QUESTION_KINDS = frozenset({
     "header",
@@ -53,14 +66,10 @@ def _normalize_option(raw: Any) -> Optional[dict[str, Any]]:
         return {"value": text, "label": text, "recommended": False}
     if not isinstance(raw, dict):
         return None
-    value = _as_str(
-        raw.get("value")
-        or raw.get("id")
-        or raw.get("label")
-        or raw.get("title")
-        or raw.get("name")
-    )
-    if not value:
+    value = _wire_value(raw["value"]) if "value" in raw and raw["value"] is not None else next((_as_str(raw[key]) for key in
+                  ("value", "id", "label", "title", "name")
+                  if key in raw and raw[key] is not None and _as_str(raw[key])), "")
+    if not value and "value" not in raw:
         return None
     label = _as_str(
         raw.get("label") or raw.get("title") or raw.get("name") or value,
@@ -188,7 +197,12 @@ def normalize_question(raw: Any, *, index: int = 0) -> Optional[dict[str, Any]]:
         prompt = header_text or question_id
     if not prompt:
         prompt = question_id
-    return {
+    if kind == "boolean":
+        kind = "single_select"
+        options = [{"value": "true", "label": "True", "recommended": False},
+                   {"value": "false", "label": "False", "recommended": False}]
+        allow_free_text = False
+    normalized = {
         "question_id": question_id,
         "kind": kind,
         "prompt": prompt,
@@ -197,6 +211,10 @@ def normalize_question(raw: Any, *, index: int = 0) -> Optional[dict[str, Any]]:
         "allow_free_text": allow_free_text if kind != "header" else False,
         "placeholder": _as_str(raw.get("placeholder")),
     }
+    for key in ("schema_type", "schema"):
+        if key in raw:
+            normalized[key] = raw[key]
+    return normalized
 
 
 def questions_from_codex_params(params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -224,6 +242,10 @@ def questions_from_schema(
     """Map JSON Schema ``requestedSchema`` properties → questions[]."""
     row = _as_dict(schema)
     properties = row.get("properties")
+    if isinstance(properties, dict) and not properties:
+        return [{"question_id": "__title__", "kind": "header", "prompt": title,
+                 "required": False, "options": [], "allow_free_text": False,
+                 "placeholder": ""}] if title else []
     if not isinstance(properties, dict) or not properties:
         if title:
             return [{
@@ -245,19 +267,30 @@ def questions_from_schema(
     for index, (key, prop) in enumerate(properties.items()):
         if not isinstance(prop, dict):
             continue
-        enum_values = prop.get("enum") if isinstance(prop.get("enum"), list) else []
-        options = [
-            opt for opt in (_normalize_option(item) for item in enum_values)
-            if opt is not None
-        ]
         prop_type = _as_str(prop.get("type"), "string").lower()
         multi = prop_type == "array"
+        option_schema = _as_dict(prop.get("items")) if multi else prop
+        enum_values = option_schema.get("enum")
+        options = []
+        if isinstance(enum_values, list):
+            options = [{"value": _wire_value(value), "label": _wire_value(value) or "Empty value",
+                        "recommended": False} for value in enum_values]
+        else:
+            alternatives = option_schema.get("anyOf" if multi else "oneOf")
+            if isinstance(alternatives, list):
+                options = [{"value": _wire_value(item["const"]),
+                            "label": _as_str(item.get("title"), _wire_value(item["const"])),
+                            "recommended": False}
+                           for item in alternatives if isinstance(item, dict) and "const" in item]
+        if prop_type == "boolean":
+            options = [{"value": "true", "label": "True", "recommended": False},
+                       {"value": "false", "label": "False", "recommended": False}]
         kind = _kind_from_flags(
             has_options=bool(options),
             multi=multi,
             free_text=not options,
             header=False,
-            schema_type=prop_type,
+            schema_type="string" if prop_type == "boolean" else prop_type,
         )
         prompt = _as_str(
             prop.get("title") or prop.get("description") or key,
@@ -267,13 +300,14 @@ def questions_from_schema(
             "question_id": str(key),
             "kind": kind,
             "prompt": prompt,
-            "required": str(key) in required_keys if required_keys else True,
+            "required": str(key) in required_keys,
             "options": options,
             "allow_free_text": kind == "free_text" or (
                 bool(options) and _bool(prop.get("allow_free_text"), False)
             ),
             "placeholder": _as_str(prop.get("placeholder")),
             "schema_type": prop_type,
+            "schema": dict(prop),
         })
         _ = index
     if title and out and out[0]["kind"] != "header":
@@ -308,7 +342,7 @@ def normalize_pending_user_input(payload: dict[str, Any]) -> dict[str, Any]:
     if not questions:
         native = _as_dict(pending.get("native"))
         schema = pending.get("schema") or native.get("requestedSchema")
-        if isinstance(schema, dict) and schema.get("properties"):
+        if isinstance(schema, dict) and "properties" in schema:
             questions = questions_from_schema(
                 schema,
                 title=_as_str(
@@ -376,10 +410,10 @@ def _answer_values(entry: Any) -> tuple[list[str], str]:
         values_raw = entry.get("answers")
     values: list[str] = []
     if isinstance(values_raw, list):
-        values = [_as_str(item) for item in values_raw if _as_str(item)]
+        values = [_wire_value(item) for item in values_raw if item is not None]
     elif values_raw is not None and _as_str(values_raw):
         values = [_as_str(values_raw)]
-    text = _as_str(entry.get("text"))
+    text = str(entry["text"]) if entry.get("text") is not None else ""
     return values, text
 
 
@@ -415,13 +449,14 @@ def validate_user_input_answers(
     Raises ``ValueError`` with a stable ``code|message`` prefix on failure.
     """
     decision_norm = (decision or "submit").strip().lower()
-    if decision_norm == "cancel":
+    if decision_norm == "decline" and "decline" not in pending.get("response_actions", []):
+        raise UserInputValidationError("conversation.user_input.invalid_decision",
+                                       "this request does not support an explicit decline")
+    if decision_norm in {"cancel", "decline"}:
         return {}
     if decision_norm != "submit":
-        raise ValueError(
-            "conversation.user_input.invalid_decision|"
-            f"unsupported decision: {decision_norm}"
-        )
+        raise UserInputValidationError("conversation.user_input.invalid_decision",
+                                       f"unsupported decision: {decision_norm}")
 
     normalized_pending = normalize_pending_user_input(pending)
     questions = [
@@ -440,19 +475,30 @@ def validate_user_input_answers(
         if not key:
             continue
         if key not in by_id:
-            raise ValueError(
-                "conversation.user_input.unknown_question|"
-                f"unknown question_id: {key}"
-            )
+            raise UserInputValidationError("conversation.user_input.unknown_question",
+                                           f"unknown question_id: {key}")
         question = by_id[key]
         if question.get("kind") == "header":
-            raise ValueError(
-                "conversation.user_input.header_answered|"
-                f"header question cannot be answered: {key}"
-            )
+            raise UserInputValidationError("conversation.user_input.header_answered",
+                                           f"header question cannot be answered: {key}")
         values, text = _answer_values(entry)
-        if not values and text:
-            values = [text]
+        if values or text:
+            options = {_wire_value(option.get("value")) for option in question.get("options", [])}
+            if options and any(value not in options for value in values):
+                raise UserInputValidationError("conversation.user_input.option",
+                                               f"invalid option for {key}")
+            if (question.get("kind") == "single_select"
+                    or question.get("schema_type") in {"string", "number", "integer", "boolean"}) and len(values) > 1:
+                raise UserInputValidationError("conversation.user_input.cardinality",
+                                               f"select one option for {key}")
+            if text and text not in values and options and not question.get("allow_free_text"):
+                raise UserInputValidationError("conversation.user_input.free_text",
+                                               f"free text is not supported for {key}")
+            schema = question.get("schema")
+            if not isinstance(schema, dict):
+                schema = {"type": question["schema_type"]} if question.get("schema_type") else {}
+            if schema:
+                _validate_schema_value(_content_value(values, text, schema), schema, key)
         cleaned[key] = {"values": values, "text": text}
 
     for question in questions:
@@ -461,12 +507,10 @@ def validate_user_input_answers(
             continue
         entry = cleaned.get(qid) or {}
         values = list(entry.get("values") or [])
-        text = _as_str(entry.get("text"))
+        text = str(entry["text"]) if entry.get("text") is not None else ""
         if not values and not text:
-            raise ValueError(
-                "conversation.user_input.required|"
-                f"required question unanswered: {qid}"
-            )
+            raise UserInputValidationError("conversation.user_input.required",
+                                           f"required question unanswered: {qid}")
     return cleaned
 
 
@@ -475,8 +519,10 @@ def flatten_answers_text(answers: dict[str, dict[str, Any]]) -> str:
     parts: list[str] = []
     for qid, entry in answers.items():
         values = [str(v) for v in (entry.get("values") or []) if str(v).strip()]
-        text = _as_str(entry.get("text"))
-        body = ", ".join(values) if values else text
+        text = str(entry["text"]) if entry.get("text") is not None else ""
+        body = ", ".join(values)
+        if text and text not in values:
+            body = f"{body}\n{text}" if body else text
         if body:
             parts.append(f"{qid}: {body}" if len(answers) > 1 else body)
     return "\n".join(parts)
@@ -486,14 +532,14 @@ def answers_for_codex_tool(
     answers: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     """Codex tool user-input response shape."""
-    return {
-        "answers": {
-            qid: {"answers": list(entry.get("values") or (
-                [entry["text"]] if entry.get("text") else []
-            ))}
-            for qid, entry in answers.items()
-        }
-    }
+    result = {}
+    for qid, entry in answers.items():
+        values = list(entry.get("values") or [])
+        text = str(entry["text"]) if entry.get("text") is not None else ""
+        if text and text not in values:
+            values.append(text)
+        result[qid] = {"answers": values}
+    return {"answers": result}
 
 
 def content_for_elicitation(
@@ -512,21 +558,167 @@ def content_for_elicitation(
         if qid.startswith("__"):
             continue
         values = list(entry.get("values") or [])
-        text = _as_str(entry.get("text"))
+        text = str(entry["text"]) if entry.get("text") is not None else ""
         prop = properties.get(qid) if isinstance(properties.get(qid), dict) else {}
-        prop_type = _as_str(prop.get("type"), "").lower()
-        if prop_type == "boolean":
-            raw = (values[0] if values else text).strip().lower()
-            content[qid] = raw in {"1", "true", "yes", "y", "on", "是", "允许", "同意"}
-        elif prop_type == "integer":
-            content[qid] = int(values[0] if values else text)
-        elif prop_type == "number":
-            content[qid] = float(values[0] if values else text)
-        elif prop_type == "array" or len(values) > 1:
-            content[qid] = values if values else ([text] if text else [])
-        else:
-            content[qid] = values[0] if values else text
+        if not values and not text:
+            continue
+        value = _content_value(values, text, prop)
+        _validate_schema_value(value, prop, qid)
+        content[qid] = value
     return content
+
+
+def _wire_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _content_value(values: list[str], text: str, schema: dict[str, Any]) -> Any:
+    raw = values[0] if values else text
+    kind = schema.get("type")
+    if not isinstance(kind, (str, type(None))):
+        raise UserInputValidationError("conversation.user_input.unsupported_schema",
+                                       "input schema requires a single primitive type")
+    try:
+        if kind == "boolean":
+            if raw not in {"true", "false"}:
+                raise ValueError("expected true or false")
+            return raw == "true"
+        if kind == "integer":
+            return int(raw)
+        if kind == "number":
+            value = float(raw)
+            if not math.isfinite(value):
+                raise ValueError("expected a finite number")
+            return value
+        if kind == "array":
+            items = values if values else ([text] if text else [])
+            item_schema = schema.get("items")
+            if item_schema is not None and not isinstance(item_schema, dict):
+                raise UserInputValidationError("conversation.user_input.unsupported_schema",
+                                               "array items must use one property schema")
+            return [_content_value([item], "", item_schema or {}) for item in items]
+        if kind not in {None, "string"}:
+            raise UserInputValidationError("conversation.user_input.unsupported_schema",
+                                           f"unsupported input schema type: {kind}")
+        if kind is None:
+            choices = schema.get("enum", [])
+            if "const" in schema:
+                choices = [schema["const"]]
+            alternatives = schema.get("oneOf") or schema.get("anyOf") or []
+            if alternatives:
+                choices = [item["const"] for item in alternatives
+                           if isinstance(item, dict) and "const" in item]
+            matches = [item for item in choices if _wire_value(item) == raw]
+            if matches:
+                if any(type(item) is not type(matches[0]) for item in matches):
+                    raise UserInputValidationError("conversation.user_input.unsupported_schema",
+                                                   "input options have ambiguous wire values")
+                return matches[0]
+        return raw
+    except UserInputValidationError:
+        raise
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise UserInputValidationError("conversation.user_input.type",
+                                       f"expected {kind}") from exc
+
+
+def _validate_schema_value(value: Any, schema: dict[str, Any], qid: str) -> None:
+    def invalid(message: str):
+        raise UserInputValidationError("conversation.user_input.constraint", f"{qid}: {message}")
+    annotations = {"$schema", "$id", "title", "description", "default", "examples",
+                   "deprecated", "readOnly", "writeOnly"}
+    supported = {"type", "enum", "const", "oneOf", "anyOf", "minLength", "maxLength",
+                 "pattern", "format", "minimum", "maximum", "exclusiveMinimum",
+                 "exclusiveMaximum", "multipleOf", "minItems", "maxItems", "uniqueItems", "items"}
+    unknown = [key for key in schema if key not in supported | annotations and not key.startswith("x-")]
+    if unknown:
+        raise UserInputValidationError("conversation.user_input.unsupported_schema",
+                                       f"{qid}: unsupported schema keywords: {', '.join(unknown)}")
+    for key in ("minLength", "maxLength", "minItems", "maxItems"):
+        if key in schema and (isinstance(schema[key], bool)
+                              or not isinstance(schema[key], int) or schema[key] < 0):
+            raise UserInputValidationError("conversation.user_input.unsupported_schema",
+                                           f"{qid}: {key} must be a non-negative integer")
+    for key in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"):
+        if key in schema and (isinstance(schema[key], bool)
+                              or not isinstance(schema[key], (int, float))
+                              or not math.isfinite(schema[key])):
+            raise UserInputValidationError("conversation.user_input.unsupported_schema",
+                                           f"{qid}: {key} must be a finite number")
+    if "multipleOf" in schema and schema["multipleOf"] <= 0:
+        raise UserInputValidationError("conversation.user_input.unsupported_schema",
+                                       f"{qid}: multipleOf must be positive")
+    if "enum" in schema and not isinstance(schema["enum"], list):
+        raise UserInputValidationError("conversation.user_input.unsupported_schema",
+                                       f"{qid}: enum must be an array")
+    if "const" in schema and value != schema["const"]:
+        invalid("value differs from the required constant")
+    if "enum" in schema and value not in schema["enum"]:
+        invalid("value is outside the allowed options")
+    alternatives = schema.get("oneOf") or schema.get("anyOf")
+    if alternatives is not None:
+        if not isinstance(alternatives, list) or any(not isinstance(item, dict) or "const" not in item for item in alternatives):
+            raise UserInputValidationError("conversation.user_input.unsupported_schema",
+                                           f"{qid}: only const alternatives are supported")
+        if value not in [item["const"] for item in alternatives]:
+            invalid("value is outside the allowed options")
+    if isinstance(value, str):
+        if len(value) < schema.get("minLength", 0):
+            invalid("text is too short")
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            invalid("text is too long")
+        if "pattern" in schema:
+            try:
+                matched = re.search(schema["pattern"], value)
+            except (TypeError, re.error) as exc:
+                raise UserInputValidationError("conversation.user_input.unsupported_schema",
+                                               f"{qid}: invalid pattern") from exc
+            if not matched:
+                invalid("text does not match the requested pattern")
+        fmt = schema.get("format")
+        try:
+            if fmt == "date":
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                    invalid("date must use YYYY-MM-DD")
+                date.fromisoformat(value)
+            elif fmt == "date-time":
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})", value):
+                    invalid("date-time must use RFC 3339")
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00").replace("z", "+00:00"))
+                if parsed.tzinfo is None:
+                    invalid("date-time requires an explicit timezone")
+            elif fmt == "email" and not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value):
+                invalid("invalid email address")
+            elif fmt in {"uri", "url"} and not urlsplit(value).scheme:
+                invalid("invalid absolute URI")
+            elif fmt not in {None, "date", "date-time", "email", "uri", "url"}:
+                raise UserInputValidationError("conversation.user_input.unsupported_schema",
+                                               f"{qid}: unsupported format {fmt}")
+        except ValueError as exc:
+            if isinstance(exc, UserInputValidationError):
+                raise
+            invalid(f"invalid {fmt}")
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        if "multipleOf" in schema:
+            from fractions import Fraction
+            if (Fraction(str(value)) / Fraction(str(schema["multipleOf"]))).denominator != 1:
+                invalid("number violates multipleOf")
+        for key, bad in (("minimum", lambda bound: value < bound),
+                         ("maximum", lambda bound: value > bound),
+                         ("exclusiveMinimum", lambda bound: value <= bound),
+                         ("exclusiveMaximum", lambda bound: value >= bound)):
+            if key in schema and bad(schema[key]):
+                invalid(f"number violates {key}")
+    elif isinstance(value, list):
+        if len(value) < schema.get("minItems", 0) or ("maxItems" in schema and len(value) > schema["maxItems"]):
+            invalid("number of selected options is outside the requested range")
+        if schema.get("uniqueItems") and len(set(value)) != len(value):
+            invalid("selected options must be unique")
+        items = _as_dict(schema.get("items"))
+        for item in value:
+            _validate_schema_value(item, items, qid)
 
 
 def c22_fixture_questions() -> list[dict[str, Any]]:

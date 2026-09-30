@@ -13,6 +13,8 @@ but the persistent path is account-scoped instead of mounting a host home dir.
 from __future__ import annotations
 
 import json
+import tempfile
+from contextlib import contextmanager
 import os
 import re
 import shutil
@@ -28,6 +30,24 @@ from muteki.solver.engine_registry import (
     EngineTemporarilyUnsupportedError,
     canonical_engine_id,
 )
+
+_ACCOUNT_WRITE_LOCK = threading.RLock()
+
+
+def host_discovery_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """Explicit service policy for automatic operator-home login discovery."""
+    if os.environ.get("MUTEKI_HOST_DISCOVERY") == "0":
+        return False
+    return env is None or env.get("MUTEKI_HOST_DISCOVERY") != "0"
+
+
+class HostDiscoveryDisabledError(ValueError):
+    code = "host_discovery_disabled"
+
+
+class CredentialTestRevisionError(ValueError):
+    code = "credential.test.configuration_changed"
+
 
 CONTAINER_ACCOUNTS_ROOT = "/run/muteki/accounts"
 
@@ -224,10 +244,70 @@ class CredentialAccountStore:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self._guard_depth = 0
+        self._recover_staged_updates()
         try:
             self.root.chmod(0o700)
         except OSError:
             pass
+
+    @contextmanager
+    def _account_guard(self):
+        """Serialize writers and recovery across threads and service processes."""
+        with _ACCOUNT_WRITE_LOCK:
+            if self._guard_depth:
+                self._guard_depth += 1
+                try:
+                    yield
+                finally:
+                    self._guard_depth -= 1
+                return
+            lock_path = self.root.parent / f".{self.root.name}.lock"
+            with lock_path.open("a+b") as handle:
+                if os.name == "nt":
+                    import msvcrt
+                    if not handle.tell():
+                        handle.write(b"0"); handle.flush()
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                self._guard_depth = 1
+                try:
+                    yield
+                finally:
+                    self._guard_depth = 0
+                    if os.name == "nt":
+                        handle.seek(0); msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _recover_staged_updates(self) -> None:
+        with self._account_guard():
+            for staging_root in self.root.parent.glob(".credential-stage-*"):
+                journal = staging_root / "transaction.json"
+                if not journal.is_file():
+                    continue
+                record = json.loads(journal.read_text(encoding="utf-8"))
+                if record.get("store_root") != str(self.root.resolve()):
+                    continue
+                account_id = str(record.get("account_id") or "")
+                if not valid_account_id(account_id):
+                    raise ValueError("credential.account.recovery_invalid")
+                if record.get("phase") not in {"staging", "prepared", "committed"}:
+                    raise ValueError("credential.account.recovery_phase_invalid")
+                live, backup = self.root / account_id, staging_root / "previous"
+                if record.get("phase") != "committed":
+                    if backup.exists():
+                        if live.exists():
+                            shutil.rmtree(live)
+                        backup.rename(live)
+                    elif record.get("had_previous") and not live.exists():
+                        raise OSError("credential.account.recovery_material_missing")
+                    elif not record.get("had_previous") and live.exists() and not (staging_root / "accounts" / account_id).exists():
+                        shutil.rmtree(live)
+                shutil.rmtree(staging_root)
 
     def list(self) -> list[dict[str, Any]]:
         accounts: list[CredentialAccount] = []
@@ -258,52 +338,67 @@ class CredentialAccountStore:
             if isinstance(value, dict)
         }
 
-    def save_test_status(
-        self,
-        credential_id: str,
-        result: Mapping[str, Any],
-        *,
-        backend: str = "local",
-    ) -> dict[str, Any]:
-        """Persist the complete result from an explicit credential test."""
-        stable_id = canonical_credential_id(credential_id)
-        detail = str(result.get("detail") or "")
-        row = {
-            "ok": bool(result.get("ok")),
-            "detail": detail[:240],
-            "layer": str(result.get("layer") or ""),
-            "backend": "container" if backend == "container" else "local",
-            "tested_at": time.time(),
-            "model": str(result.get("model") or "").strip(),
-        }
-        statuses = self._read_test_statuses()
-        statuses[stable_id] = row
-        path = self._test_status_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(statuses, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        tmp.replace(path)
-        return dict(row)
+    def _test_runtime_key(self, credential_id: str, runtime_instance: str) -> str:
+        if ":" in runtime_instance:
+            return runtime_instance
+        engine = engine_from_system_credential_id(credential_id)
+        account_id = account_id_from_credential_id(credential_id)
+        if account_id:
+            account = self.inspect(account_id)
+            if account is not None:
+                engine = str(self._public(account).get("worker_engine") or "")
+        return f"cli.{engine}:{runtime_instance or 'default'}" if engine else runtime_instance
 
-    def last_test(self, credential_id: str) -> dict[str, Any] | None:
-        """Return the last explicit test for a global credential id."""
+    def save_test_status(self, credential_id: str, result: Mapping[str, Any], *,
+                         backend: str = "local", runtime_instance: str = "default",
+                         expected_revision: str | None = None) -> dict[str, Any]:
+        with _ACCOUNT_WRITE_LOCK:
+            stable_id = canonical_credential_id(credential_id)
+            account_id = account_id_from_credential_id(stable_id)
+            revision = self.revision(account_id) if account_id else ""
+            if expected_revision is not None and revision != expected_revision:
+                raise CredentialTestRevisionError("credential.test.configuration_changed")
+            runtime_key = self._test_runtime_key(stable_id, runtime_instance)
+            row = {"ok": bool(result.get("ok")), "detail": str(result.get("detail") or ""),
+                   "layer": str(result.get("layer") or ""),
+                   "backend": "container" if backend == "container" else "local",
+                   "runtime_instance": runtime_key, "configuration_revision": revision,
+                   "tested_at": time.time(), "model": str(result.get("model") or "").strip()}
+            statuses = self._read_test_statuses()
+            statuses[f"{stable_id}\0{row['backend']}\0{runtime_key}\0{row['model']}"] = row
+            self._atomic_write(self._test_status_path, json.dumps(statuses, ensure_ascii=False, indent=2))
+            return dict(row)
+
+    def last_test(self, credential_id: str, *, backend: str = "local",
+                  runtime_instance: str = "default", model: str | None = None) -> dict[str, Any] | None:
         try:
             stable_id = canonical_credential_id(credential_id)
         except ValueError:
             return None
-        row = self._read_test_statuses().get(stable_id)
-        return dict(row) if isinstance(row, dict) else None
+        runtime_key = self._test_runtime_key(stable_id, runtime_instance)
+        account_id = account_id_from_credential_id(stable_id)
+        revision = self.revision(account_id) if account_id else ""
+        rows = [row for key, row in self._read_test_statuses().items()
+                if (key == stable_id or key.startswith(stable_id + "\0"))
+                and row.get("backend", "local") == backend
+                and self._test_runtime_key(stable_id, str(row.get("runtime_instance") or "default")) == runtime_key
+                and (model is None or row.get("model") == model)
+                and (not row.get("configuration_revision") or row["configuration_revision"] == revision)]
+        return dict(max(rows, key=lambda row: float(row.get("tested_at") or 0))) if rows else None
 
     def invalidate_test_status(self, credential_id: str) -> None:
+        with _ACCOUNT_WRITE_LOCK:
+            self._invalidate_test_status(credential_id)
+
+    def _invalidate_test_status(self, credential_id: str) -> None:
         """Remove stale model evidence after credential metadata changes."""
         stable_id = canonical_credential_id(credential_id)
         statuses = self._read_test_statuses()
-        if stable_id not in statuses:
+        keys = [key for key in statuses if key == stable_id or key.startswith(stable_id + "\0")]
+        if not keys:
             return
-        statuses.pop(stable_id, None)
+        for key in keys:
+            statuses.pop(key, None)
         path = self._test_status_path
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".json.tmp")
@@ -319,6 +414,7 @@ class CredentialAccountStore:
         usage: Mapping[str, list[dict[str, Any]]] | None = None,
         catalogs: Mapping[str, Mapping[str, Any]] | None = None,
         engines: tuple[str, ...] = SUPPORTED_CREDENTIAL_ENGINES,
+        environment: str = "local",
     ) -> list[dict[str, Any]]:
         """Project Worker-engine accounts and host logins into the credential API.
 
@@ -381,7 +477,7 @@ class CredentialAccountStore:
             if engine not in SUPPORTED_CREDENTIAL_ENGINES:
                 continue
             present = bool(account.get("present"))
-            last_test = self.last_test(stable_id)
+            last_test = self.last_test(stable_id, backend=environment, runtime_instance=str((catalogs.get(stable_id) or {}).get("runtime_instance") or "default"), model=str(account.get("default_model") or "") or None)
             status = "untested" if present else "missing"
             if last_test is not None:
                 status = "ready" if last_test.get("ok") else "failed"
@@ -413,6 +509,7 @@ class CredentialAccountStore:
             default_model = str(account.get("default_model") or "").strip()
             row = {
                 "id": stable_id,
+                "revision": account.get("revision", ""),
                 "label": account_id,
                 "engine": engine,
                 "source": "stored",
@@ -442,13 +539,15 @@ class CredentialAccountStore:
             stable_id = system_credential_id(engine)
             detected = detect_system_login(engine)
             present = detected == "present"
-            last_test = self.last_test(stable_id)
+            last_test = self.last_test(stable_id, backend=environment, runtime_instance=str((catalogs.get(stable_id) or {}).get("runtime_instance") or "default"))
             status = (
                 "untested" if present else "missing" if detected == "absent"
                 else "unknown"
             )
             if last_test is not None:
                 status = "ready" if last_test.get("ok") else "failed"
+            if detected == "disabled":
+                status = "unavailable"
             system_usage = list(usage.get(stable_id) or [])
             catalog = dict(catalogs.get(stable_id) or {})
             candidate_models = catalog_models(stable_id)
@@ -482,6 +581,9 @@ class CredentialAccountStore:
                 "model_catalog": catalog,
                 "usage": system_usage,
             }
+            if detected == "disabled":
+                row["status_detail"] = "此服务未提供宿主登录发现"
+                row["discovery_code"] = "host_discovery_disabled"
             if last_test is not None:
                 row["last_test"] = last_test
             rows.append(row)
@@ -594,7 +696,84 @@ class CredentialAccountStore:
             details={},
         )
 
-    def upsert_secret(
+    def revision(self, account_id: str) -> str:
+        base = self.root / account_id
+        marker = base / "REVISION"
+        if marker.exists():
+            return marker.read_text(encoding="utf-8").strip()
+        # Legacy records get a metadata revision without reading secret bytes.
+        return str(self._updated_at(base) or "")
+
+    def upsert_secret(self, *, account_id: str, engine: str,
+                      create_only: bool = False, expected_revision: str | None = None,
+                      **fields: Any) -> dict[str, Any]:
+        return self._stage_account_update(account_id,
+            lambda staged: staged._write_secret(account_id=account_id, engine=engine, **fields),
+            create_only=create_only, expected_revision=expected_revision)
+
+    def _stage_account_update(self, account_id: str, writer: Any, *,
+                              create_only: bool = False, expected_revision: str | None = None) -> dict[str, Any]:
+        """Stage the complete replacement before touching a working account."""
+        if not valid_account_id(account_id):
+            raise ValueError("invalid account id")
+        with self._account_guard():
+            live = self.root / account_id
+            if create_only and live.exists():
+                raise FileExistsError("credential.account.already_exists")
+            if expected_revision is not None and self.revision(account_id) != expected_revision:
+                raise FileExistsError("credential.account.revision_conflict")
+            staging_root = Path(tempfile.mkdtemp(prefix=".credential-stage-", dir=self.root.parent))
+            backup = staging_root / "previous"
+            committed = False
+            installed = False
+            try:
+                journal = staging_root / "transaction.json"
+                transaction = {"store_root": str(self.root.resolve()), "account_id": account_id,
+                               "had_previous": live.exists(), "phase": "staging"}
+                self._atomic_write(journal, json.dumps(transaction))
+                staging = CredentialAccountStore(staging_root / "accounts")
+                if live.exists():
+                    shutil.copytree(live, staging.root / account_id)
+                # Preserve injected I/O failures in synthetic validation too.
+                staging._atomic_write = self._atomic_write
+                written = writer(staging)
+                prepared = staging.root / account_id
+                self._atomic_write(prepared / "REVISION", os.urandom(16).hex())
+                transaction["phase"] = "prepared"
+                self._atomic_write(journal, json.dumps(transaction))
+                if live.exists():
+                    live.rename(backup)
+                try:
+                    prepared.rename(live)
+                    installed = True
+                except BaseException:
+                    if backup.exists():
+                        backup.rename(live)
+                    raise
+                self.invalidate_test_status(account_credential_id(account_id))
+                account = self.inspect(account_id)
+                if account is None:
+                    raise OSError("credential.account.commit_unreadable")
+                transaction["phase"] = "committed"
+                self._atomic_write(journal, json.dumps(transaction))
+                committed = True
+                result = self._public(account)
+                if isinstance(written, dict) and written.get("suggested_model"):
+                    result["suggested_model"] = written["suggested_model"]
+                return result
+            except BaseException:
+                if backup.exists():
+                    if live.exists():
+                        shutil.rmtree(live)
+                    backup.rename(live)
+                elif installed and live.exists():
+                    shutil.rmtree(live)
+                raise
+            finally:
+                if committed or not backup.exists():
+                    shutil.rmtree(staging_root, ignore_errors=True)
+
+    def _write_secret(
         self,
         *,
         account_id: str,
@@ -758,6 +937,9 @@ class CredentialAccountStore:
         return self._public(acct)
 
     def import_host_codex_auth(self, account_id: str) -> dict[str, Any]:
+        return self._stage_account_update(account_id, lambda staged: staged._write_host_codex_auth(account_id))
+
+    def _write_host_codex_auth(self, account_id: str) -> dict[str, Any]:
         """Refresh a codex account from the HOST's ~/.codex/{auth.json,config.toml}.
 
         `codex login` refreshes the host's ~/.codex/auth.json, but container
@@ -803,6 +985,9 @@ class CredentialAccountStore:
         return result
 
     def import_host_login(self, account_id: str, engine: str) -> dict[str, Any]:
+        return self._stage_account_update(account_id, lambda staged: staged._write_host_login(account_id, engine))
+
+    def _write_host_login(self, account_id: str, engine: str) -> dict[str, Any]:
         """Import the minimal host login state used by Claude, Kimi, or Grok."""
         engine = str(engine or "").strip().lower()
         if engine not in {"claude", "kimi", "grok"}:
@@ -906,6 +1091,38 @@ class CredentialAccountStore:
         self._clear_account_material(base)
         return base
 
+    @contextmanager
+    def deletion_transaction(self, account_id: str):
+        """Delete material first and retain a private rollback copy until references commit."""
+        if not valid_account_id(account_id):
+            raise ValueError("invalid account id")
+        with self._account_guard():
+            live = self.root / account_id
+            if not live.exists():
+                raise FileNotFoundError("credential.account.not_found")
+            backup_root = Path(tempfile.mkdtemp(prefix=".credential-stage-", dir=self.root.parent))
+            backup = backup_root / "previous"
+            committed = False
+            try:
+                journal = backup_root / "transaction.json"
+                transaction = {"store_root": str(self.root.resolve()), "account_id": account_id,
+                               "had_previous": True, "phase": "prepared"}
+                self._atomic_write(journal, json.dumps(transaction))
+                live.rename(backup)
+                yield
+                transaction["phase"] = "committed"
+                self._atomic_write(journal, json.dumps(transaction))
+                committed = True
+            except BaseException:
+                if backup.exists():
+                    if live.exists():
+                        shutil.rmtree(live)
+                    backup.rename(live)
+                raise
+            finally:
+                if committed or not backup.exists():
+                    shutil.rmtree(backup_root, ignore_errors=True)
+
     def delete(self, account_id: str) -> bool:
         if not valid_account_id(account_id):
             return False
@@ -993,6 +1210,7 @@ class CredentialAccountStore:
         }.get(acct.mode, "unknown")
         return {
             "account_id": acct.account_id,
+            "revision": self.revision(acct.account_id),
             "engine": acct.engine,
             "worker_engine": worker_engine,
             "connection": connection,
@@ -1118,7 +1336,10 @@ class CredentialAccountStore:
     def _atomic_write(path: Path, text: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f".{path.name}.{int(time.time() * 1000)}.{os.getpid()}.{os.urandom(4).hex()}.tmp")
-        tmp.write_text(text, encoding="utf-8")
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
         try:
             tmp.chmod(0o600)
         except OSError:
@@ -1200,6 +1421,8 @@ def runtime_env_for_engine(
         account_id = engine_account_id(e, source)
     elif account_id != "" and not valid_account_id(account_id):
         account_id = engine_account_id(e, source)
+    if not account_id and not container and not host_discovery_enabled(env):
+        raise HostDiscoveryDisabledError("此服务未提供宿主登录发现；请选择已登记凭据")
     root = Path(account_root).expanduser().resolve() if account_root is not None else None
     base = root / account_id if root is not None and account_id else None
     out: dict[str, str] = {}
@@ -1608,7 +1831,7 @@ def detect_system_login(
 ) -> str:
     """Is there a usable HOST-side login for this engine? (DESIGN §2.3 補強B)
 
-    READ-ONLY, never raises. Returns "present" / "absent" / "unknown". This only
+    READ-ONLY, never raises. Returns "present" / "absent" / "unknown" / "disabled". This only
     drives the local-mode credentials UI: in local mode a worker inherits the
     host HOME+env, so an unregistered account silently falls back to the host's
     existing CLI login. Container mode does NOT use this (host login isn't
@@ -1623,6 +1846,8 @@ def detect_system_login(
     at worker/conversation launch so a just-logged-out host is not treated as
     still present.
     """
+    if not host_discovery_enabled(env):
+        return "disabled"
     e = (engine or "").strip().lower()
     # env={} means "no env tokens" (an explicit empty mapping), NOT "use the
     # host env" — `env or os.environ` would silently fall back to the real
@@ -1772,6 +1997,8 @@ def resolve_credential_env(
         if container:
             raise ValueError("system credentials are unavailable in container workers")
         detected = detect_system_login(system_engine, fresh=True)
+        if detected == "disabled":
+            raise HostDiscoveryDisabledError("此服务未提供宿主登录发现；请选择已登记凭据")
         if detected == "absent":
             raise ValueError(f"宿主 {system_engine} 登录态不可用")
         return RuntimeCredentialEnv(account_id="", env={})

@@ -31,6 +31,7 @@ export interface NavItem {
 export interface NavSection {
   id?: string;
   title: string;
+  subtitle?: string;
   items: NavItem[];
   /** `time` = recency bucket (今天 / 昨天 / …); `section` = plain list. */
   kind?: "section" | "folder" | "pinned" | "activity" | "archived" | "time";
@@ -79,6 +80,11 @@ export interface SidebarNavProps {
   className?: string;
   bodyHits?: SidebarBodyHit[];
   bodyHitsLoading?: boolean;
+  bodyHitsLoadingMore?: boolean;
+  bodyHitsError?: string;
+  bodyHitsHasMore?: boolean;
+  onLoadMoreBodyHits?: () => void;
+  onRetryBodyHits?: () => void;
   includeSuperseded?: boolean;
   onIncludeSupersededChange?: (value: boolean) => void;
   onSelectBodyHit?: (hit: { threadId: string; messageId: string }) => void;

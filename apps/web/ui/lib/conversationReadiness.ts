@@ -18,6 +18,7 @@ export type BlockerKind =
   | "connecting"
   | "config_read_failed"
   | "not_installed"
+  | "discovery_unavailable"
   | "not_logged_in"
   | "model_unavailable"
   | "directory_inaccessible"
@@ -73,12 +74,14 @@ export interface ReadinessCredential {
   present?: boolean;
   status: string;
   status_detail?: string;
+  discovery_code?: string;
   models?: Array<{ id: string }>;
   candidate_models?: Array<{ id: string }>;
   default_model?: string;
 }
 
 export interface ReadinessRuntimeAuth {
+  code?: string;
   status?: string;
   detail?: string;
   login_command?: string;
@@ -206,7 +209,7 @@ export function credentialAvailable(credential: ReadinessCredential | undefined)
 }
 
 export function credentialLoginMissing(credential: ReadinessCredential | undefined): boolean {
-  if (!credential) return false;
+  if (!credential || credential.discovery_code === "host_discovery_disabled") return false;
   const status = String(credential.status || "").toLowerCase();
   return credential.present === false || status === "missing" || status === "absent";
 }
@@ -433,8 +436,15 @@ export function classifyConversationReadiness(
       });
     }
 
+    const discoveryDisabled = credential?.discovery_code === "host_discovery_disabled"
+      || ((runtime?.health?.auth || runtime?.auth)?.code === "host_discovery_disabled"
+        && credential?.source !== "stored");
+    if (discoveryDisabled) {
+      blockers.push({ kind: "discovery_unavailable", source: "selection", recovery: "open_agents", engine,
+        message: "此服务已关闭宿主登录发现，尚未检测当前接入点的登录状态。请在 Agents 中手动配置并选择已登记凭据；桌面客户端的登录文件不会自动同步至服务。" });
+    }
     const alreadyInstalled = blockers.some((row) => row.kind === "not_installed");
-    if (!alreadyInstalled && (credentialLoginMissing(credential) || runtimeAuthMissing(runtime))) {
+    if (!alreadyInstalled && !discoveryDisabled && (credentialLoginMissing(credential) || runtimeAuthMissing(runtime))) {
       const guidance = loginGuidance(engine, runtime);
       const commandLine = guidance.command
         ? `在宿主终端执行 ${guidance.command}，完成后返回此页将自动检查`
@@ -452,6 +462,7 @@ export function classifyConversationReadiness(
 
     if (
       !alreadyInstalled
+      && !discoveryDisabled
       && !blockers.some((row) => row.kind === "not_logged_in")
     ) {
       if (!credentials.length) {
@@ -465,9 +476,11 @@ export function classifyConversationReadiness(
         blockers.push({
           kind: "model_unavailable",
           source: "selection",
-          recovery: "open_agents",
+          recovery: runtime?.adapter_id === "codex.app_server" ? "probe" : "open_agents",
           engine,
-          message: "当前接入点没有可用模型，请前往 Agents 补充模型或测连通",
+          message: runtime?.adapter_id === "codex.app_server"
+            ? "尚未读取当前凭据的原生模型目录，请验证 Agent 后选择模型"
+            : "当前接入点没有可用模型，请前往 Agents 补充模型或测连通",
         });
       } else if (runtime && !isRuntimeUnprobed(runtime) && runtime.health?.healthy === false) {
         blockers.push({

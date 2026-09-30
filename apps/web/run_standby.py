@@ -504,7 +504,7 @@ def _ensure_standby(self, run_id: str, cmd: dict[str, Any]) -> bool:
             if not wanted or event_id == wanted:
                 followup_terminal = True
 
-        async def _emit_followup_failed(detail: str) -> None:
+        async def _emit_followup_failed(detail: str, *, code: str = "standby_failed") -> None:
             nonlocal followup_terminal
             if followup_terminal:
                 return
@@ -518,6 +518,7 @@ def _ensure_standby(self, run_id: str, cmd: dict[str, Any]) -> bool:
                         "followup_id": cmd.get("followup_id"),
                         "kind": action,
                         "detail": detail,
+                        "code": code,
                     },
                 ))
                 followup_terminal = True
@@ -536,13 +537,16 @@ def _ensure_standby(self, run_id: str, cmd: dict[str, Any]) -> bool:
                 await _emit_followup_failed("后续操作已取消")
             raise
         except Exception as exc:
+            from apps.web.run_recovery import WorkerRuntimePolicyUnavailable
             detail = _safe_exception_detail("standby worker failed", exc)
+            failure_code = (exc.code if isinstance(exc, WorkerRuntimePolicyUnavailable)
+                            else "standby_failed")
             # Do not log the traceback here: exception messages from worker
             # boundaries may contain materialised operator secrets.
             LOG.error("standby worker failed for %s action=%s error_type=%s",
                       run_id, cmd.get("action"), type(exc).__name__)
             try:
-                await _emit_followup_failed(detail)
+                await _emit_followup_failed(detail, code=failure_code)
                 if action == "mark_false":
                     # ``mark_false`` reopens the run before launching this
                     # one-shot worker.  If that worker fails, close the reopened
@@ -557,7 +561,7 @@ def _ensure_standby(self, run_id: str, cmd: dict[str, Any]) -> bool:
                             "flag": run.flag,
                             "flags": list(run.flags),
                             "reason": "standby_failed",
-                            "failure_code": "standby_failed",
+                            "failure_code": failure_code,
                             "failure_phase": "runtime",
                             "error_id": _runtime_error_id(
                                 run_id, run.execution_generation, detail),

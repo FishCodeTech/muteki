@@ -163,6 +163,8 @@ class InboxBroker:
     """In-process inbox cursor + ring buffer for SSE resume."""
 
     def __init__(self, *, maxlen: int = 2000) -> None:
+        self.epoch = uuid4().hex
+        self._seeded = False
         self._seq = 0
         self._events: deque[InboxEvent] = deque(maxlen=maxlen)
         self._fingerprints: dict[str, str] = {}
@@ -183,6 +185,10 @@ class InboxBroker:
 
     def seed_rows(self, rows: Iterable[dict[str, Any]]) -> None:
         """Set fingerprints without emitting (used for SSE snapshot bootstrap)."""
+        if self._seeded:
+            self.sync_rows(rows)
+            return
+        self._seeded = True
         seen: set[str] = set()
         for row in rows:
             thread_id = str(row["summary"]["thread_id"])
@@ -191,6 +197,10 @@ class InboxBroker:
         for thread_id in list(self._fingerprints):
             if thread_id not in seen:
                 self._fingerprints.pop(thread_id, None)
+
+    def covers_cursor(self, cursor: int) -> bool:
+        return cursor <= self._seq and (
+            not self._events or cursor >= self._events[0].seq - 1)
 
     def sync_rows(self, rows: Iterable[dict[str, Any]]) -> list[InboxEvent]:
         """Diff attention rows against last fingerprints; append new inbox events."""

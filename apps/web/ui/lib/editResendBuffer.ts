@@ -1,3 +1,4 @@
+import { conversationStorageKey } from "./conversationStorageScope";
 /**
  * Ephemeral edit buffer for C11 edit-resend.
  * Keyed by threadId+turnId so it does not clobber the active composer draft (#12).
@@ -13,7 +14,7 @@ export type EditResendBuffer = {
 const memory = new Map<string, EditResendBuffer>();
 
 function keyOf(threadId: string, turnId: string): string {
-  return `${threadId}::${turnId}`;
+  return conversationStorageKey(`${threadId}::${turnId}`);
 }
 
 export function readEditBuffer(threadId: string, turnId: string): EditResendBuffer | null {

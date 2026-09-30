@@ -85,6 +85,12 @@ class ComposerCapabilityError(ValueError):
     """A composer reference is stale, unavailable, or outside its scope."""
 
 
+def _section_failure(errors: list[dict[str, Any]] | None, section: str, exc: Exception) -> None:
+    if errors is not None:
+        errors.append({"section": section, "code": "conversation.composer.section_failed",
+                       "message": str(exc), "exception_type": type(exc).__name__})
+
+
 def engine_receives_capability_gateway(engine: str) -> bool:
     """True when the selected engine's adapter may inject Muteki control tools."""
     normalized = str(engine or "").strip().lower()
@@ -113,8 +119,7 @@ def _muteki_control_mcp_row(*, engine: str, injected: bool) -> dict[str, Any]:
             "reason": "",
             "alternative": "",
             "invocable": True,
-            "action": "insert-runtime-invocation" if item.get("native_engine") else "select-capability",
-            **({"invocation": {"wire_text": "/" + item["native_name"]}} if item.get("native_engine") else {}),
+            "action": "select-capability",
         }
     return {
         "id": "mcp:muteki-control",
@@ -141,10 +146,11 @@ def _opaque_id(kind: str, identity: str) -> str:
     return f"{kind}:{digest}"
 
 
-def _frontmatter(path: Path) -> tuple[dict[str, Any], str]:
+def _frontmatter(path: Path, errors: list[dict[str, Any]] | None = None) -> tuple[dict[str, Any], str]:
     try:
         raw = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
+    except (OSError, UnicodeError) as exc:
+        _section_failure(errors, "skills", exc)
         return {}, ""
     if not raw.startswith("---"):
         return {}, raw
@@ -154,19 +160,25 @@ def _frontmatter(path: Path) -> tuple[dict[str, Any], str]:
         return {}, raw
     try:
         parsed = yaml.safe_load("\n".join(lines[1:end])) or {}
-    except yaml.YAMLError:
+    except yaml.YAMLError as exc:
+        _section_failure(errors, "skills", exc)
         parsed = {}
     return (parsed if isinstance(parsed, dict) else {}), "\n".join(lines[end + 1:])
 
 
-def _skill_item(path: Path, *, engine: str, source: str, scope: str, priority: int) -> dict[str, Any] | None:
+def _skill_item(path: Path, *, engine: str, source: str, scope: str, priority: int,
+                errors: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
     try:
         if not path.is_file() or path.stat().st_size > _MAX_SKILL_FILE_BYTES:
             return None
         resolved = path.resolve()
-    except OSError:
+    except OSError as exc:
+        _section_failure(errors, "skills", exc)
         return None
-    meta, body = _frontmatter(resolved)
+    error_count = len(errors) if errors is not None else 0
+    meta, body = _frontmatter(resolved, errors)
+    if errors is not None and len(errors) > error_count:
+        return None
     if meta.get("enabled") is False or meta.get("user-invocable") is False or meta.get("user_invocable") is False:
         return None
     name = str(meta.get("name") or resolved.parent.name).strip()
@@ -195,13 +207,15 @@ def _skill_roots(engine: str, workspace_root: str = "") -> Iterable[tuple[Path, 
         for relative in project_skill_roots(engine):
             common = relative == ".agents/skills"
             yield workspace / relative, "当前项目", "project", 350 if common else 400
-    home = Path.home()
-    for relative in _USER_SKILL_ROOTS.get(engine, ()):
-        common = relative == ".agents/skills"
-        yield home / relative, "通用 Agent" if common else engine, "personal", 250 if common else 300
+    if os.environ.get("MUTEKI_HOST_DISCOVERY", "1") != "0":
+        home = Path.home()
+        for relative in _USER_SKILL_ROOTS.get(engine, ()):
+            common = relative == ".agents/skills"
+            yield home / relative, "通用 Agent" if common else engine, "personal", 250 if common else 300
 
 
-def discover_skills(engine: str, workspace_root: str = "") -> list[dict[str, Any]]:
+def discover_skills(engine: str, workspace_root: str = "", *,
+                    errors: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """Return user-invocable skills visible to one selected engine."""
     normalized = str(engine or "").strip().lower()
     if normalized not in SUPPORTED_ENGINES:
@@ -211,18 +225,21 @@ def discover_skills(engine: str, workspace_root: str = "") -> list[dict[str, Any
     for root, source, scope, priority in _skill_roots(normalized, workspace_root):
         try:
             resolved_root = root.resolve()
-        except OSError:
+        except OSError as exc:
+            _section_failure(errors, "skills", exc)
             continue
         if resolved_root in visited or not resolved_root.is_dir():
             continue
         visited.add(resolved_root)
         try:
             manifests = sorted(resolved_root.rglob("SKILL.md"))[:800]
-        except OSError:
+        except OSError as exc:
+            _section_failure(errors, "skills", exc)
             continue
         for manifest in manifests:
             item = _skill_item(
                 manifest, engine=normalized, source=source, scope=scope, priority=priority,
+                errors=errors,
             )
             if item is None:
                 continue
@@ -234,10 +251,10 @@ def discover_skills(engine: str, workspace_root: str = "") -> list[dict[str, Any
     # Native plugin manifests belong to their own engine provider.
     from muteki.conversation.chat_providers import PROVIDERS
     provider = PROVIDERS.get(normalized)
-    if provider is not None:
+    if provider is not None and os.environ.get("MUTEKI_HOST_DISCOVERY", "1") != "0":
         for package_name, root in provider.plugin_skill_roots():
             for path in sorted((root / "skills").rglob("SKILL.md"))[:200]:
-                item = _skill_item(path, engine=normalized, source=f"{normalized} 插件", scope="personal", priority=290)
+                item = _skill_item(path, engine=normalized, source=f"{normalized} 插件", scope="personal", priority=290, errors=errors)
                 if item is not None:
                     item["name"] = f"{package_name}:{item['name']}"
                     deduped.setdefault(item["name"].casefold(), item)
@@ -252,6 +269,7 @@ def discover_skills(engine: str, workspace_root: str = "") -> list[dict[str, Any
             source="Muteki Agent Plugin",
             scope="thread",
             priority=600,
+            errors=errors,
         )
         if plugin_skill is not None:
             deduped[plugin_skill["name"].casefold()] = plugin_skill
@@ -264,18 +282,21 @@ def discover_files(
     *,
     query: str = "",
     limit: int = 80,
+    errors: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     if not workspace_root:
         return []
     try:
         root = Path(workspace_root).expanduser().resolve(strict=True)
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError) as exc:
+        _section_failure(errors, "files", exc)
         return []
     if not root.is_dir():
         return []
     rows: list[dict[str, Any]] = []
     needle = str(query or "").casefold().strip()
-    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+    for directory, dirnames, filenames in os.walk(root, followlinks=False,
+            onerror=lambda exc: _section_failure(errors, "files", exc)):
         directory_path = Path(directory)
         dirnames[:] = sorted(
             name for name in dirnames
@@ -383,7 +404,19 @@ def resolve_composer_catalog(
     current_thread_id: str = "",
     runtime_snapshot: RuntimeCapabilitySnapshot | None = None,
     plugin_service: Any = None,
+    section_errors: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    def read_section(section: str, loader: Any, default: Any):
+        try:
+            return loader()
+        except Exception as exc:
+            if section_errors is None:
+                raise
+            section_errors.append({"section": section,
+                "code": "conversation.composer.section_failed", "message": str(exc),
+                "exception_type": type(exc).__name__})
+            return default
+
     normalized = str(engine or "").strip().lower()
     if normalized not in SUPPORTED_ENGINES:
         return []
@@ -397,12 +430,13 @@ def resolve_composer_catalog(
     snapshot_items = [item for item in runtime_snapshot.items if not item.engine or item.engine == normalized] if runtime_snapshot else []
     local_skills = {
         str(item.get("name") or "").casefold(): item
-        for item in discover_skills(normalized, workspace_root)
+        for item in read_section("skills", lambda: discover_skills(normalized, workspace_root, errors=section_errors), [])
     }
 
-    managed_skills = plugin_service.skill_rows(normalized) if plugin_service is not None else []
+    managed_skills = read_section("managed_skills", lambda: plugin_service.skill_rows(normalized), []) if plugin_service is not None else []
+    control_enabled = read_section("plugins", lambda: plugin_service.control_enabled(normalized), False) if plugin_service is not None else True
     if plugin_service is not None:
-        if not plugin_service.control_enabled(normalized):
+        if not control_enabled:
             local_skills = {k: v for k, v in local_skills.items() if v.get("source") != "Muteki Agent Plugin"}
 
     runtime_rows: list[dict[str, Any]] = []
@@ -561,7 +595,7 @@ def resolve_composer_catalog(
             if capability.kind == "mcp_status"
         ]
         rows.extend(runtime_mcp)
-        if capability_enabled("mcp", "muteki-control") and (plugin_service is None or plugin_service.control_enabled(normalized)):
+        if read_section("mcp", lambda: capability_enabled("mcp", "muteki-control"), False) and control_enabled:
             rows.append(_muteki_control_mcp_row(
                 engine=normalized,
                 injected=engine_receives_capability_gateway(normalized),
@@ -569,8 +603,8 @@ def resolve_composer_catalog(
         if plugin_service is not None:
             rows.extend({"id": f"managed-plugin:{normalized}:{r['id']}", "kind": "plugin", "name": r["name"],
                          "description": r["description"], "source": "Muteki 聊天插件", "scope": "chat",
-                         "action": "inspect-runtime-status"} for r in plugin_service.enabled(normalized))
-        rows.extend(discover_files(workspace_root, query=raw_query, limit=48))
+                         "action": "inspect-runtime-status"} for r in read_section("plugins", lambda: plugin_service.enabled(normalized), []))
+        rows.extend(read_section("files", lambda: discover_files(workspace_root, query=raw_query, limit=48, errors=section_errors), []))
         if raw_query:
             rows = [item for item in rows if _matches(item, raw_query)]
         raw_query = ""
@@ -580,8 +614,8 @@ def resolve_composer_catalog(
             if item.get("kind") == "skill"
         ]
         if (
-            capability_enabled("mcp", "muteki-control")
-            and (plugin_service is None or plugin_service.control_enabled(normalized))
+            read_section("mcp", lambda: capability_enabled("mcp", "muteki-control"), False)
+            and control_enabled
             and not engine_receives_capability_gateway(normalized)
             and not any(
                 str(item.get("name") or "").casefold() == "muteki-control"
@@ -964,8 +998,10 @@ def resolve_capability_refs(
         raise ComposerCapabilityError("当前 Agent 不支持能力引用")
 
     catalog: dict[str, dict[str, Any]] = {}
+    requested_kinds = {str(raw.get("kind") or str(raw.get("id") or raw.get("legacy_capability_id") or "").partition(":")[0])
+                       for raw in refs if isinstance(raw, dict) and not _is_structured_ref(raw)}
     if (
-        capability_enabled("mcp", "muteki-control")
+        "mcp" in requested_kinds and capability_enabled("mcp", "muteki-control")
         and (plugin_service is None or plugin_service.control_enabled(normalized))
         and engine_receives_capability_gateway(normalized)
     ):
@@ -974,16 +1010,16 @@ def resolve_capability_refs(
             "description": "当前会话由 Muteki 注入的 MCP 能力入口",
             "source": "Muteki", "scope": "thread",
         }
-    for item in _extension_items(extension_service):
+    for item in (_extension_items(extension_service) if "plugin" in requested_kinds else []):
         catalog[str(item["id"])] = item
-    for item in discover_skills(normalized, workspace_root):
+    for item in (discover_skills(normalized, workspace_root) if "skill" in requested_kinds else []):
         if plugin_service is not None and item.get("source") == "Muteki Agent Plugin" and not plugin_service.control_enabled(normalized):
             continue
         catalog[str(item["id"])] = item
-    if plugin_service is not None:
+    if plugin_service is not None and "skill" in requested_kinds:
         for item in plugin_service.skill_rows(normalized):
             catalog[str(item["id"])] = item
-    for item in _thread_items(threads):
+    for item in (_thread_items(threads) if "thread" in requested_kinds else []):
         catalog[str(item["id"])] = item
 
     selected: list[dict[str, Any]] = []

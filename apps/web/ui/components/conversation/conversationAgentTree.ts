@@ -303,7 +303,7 @@ export function buildConversationAgentTree(
     unsupported: false,
     unsupportedReason: agents.length
       ? null
-      : "当前轨迹没有委派 Agent 事件；普通工具请看终端日志。",
+      : "当前轨迹没有委派 Agent 事件；普通工具活动请查看 Agent 执行日志。",
     toolActivitySummary: summarizeToolActivity(tools),
     source: agents.length ? "derived" : "none",
     revision: 0,

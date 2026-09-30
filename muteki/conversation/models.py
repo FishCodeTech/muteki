@@ -71,6 +71,7 @@ class TurnRecord(ContractModel):
     # Runtime 原生命令/Skill 的服务端解析结果。只保存能力 id、调用通道与
     # 参数；执行前会对当前会话的实时能力目录再次校验。
     runtime_invocation: dict[str, Any] = Field(default_factory=dict)
+    runtime_snapshot: Optional[dict[str, str]] = None
     native_turn_id: str = ""
     status: str = TURN_QUEUED
     usage: dict[str, Any] = Field(default_factory=dict)
@@ -144,6 +145,9 @@ class ConversationMessage(ContractModel):
     # 单独标注，且不会为它再渲染一份助手回复。
     kind: str = "message"
     text: str = ""
+    source_provider: Optional[str] = None
+    source_role: Optional[str] = None
+    source_content: Any = None
     # 对应线程事件流中的 stream_seq（排序与未读判定用）
     stream_seq: int = 0
     created_at: datetime = Field(default_factory=utcnow)

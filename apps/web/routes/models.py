@@ -19,6 +19,7 @@ from muteki.solver.engine_registry import (
 )
 from muteki.solver.credential_accounts import (
     CredentialAccountStore,
+    CredentialTestRevisionError,
     account_id_from_credential_id,
     account_store_root,
     canonical_credential_id,
@@ -140,6 +141,10 @@ def register(app: FastAPI) -> None:
             in_web_container=is_web_container(),
         )
         runtime = {"network": str(cfg.get("worker_network") or "bridge")}
+        credential_id = str(profile.get("credential_id") or "").strip()
+        accounts = CredentialAccountStore(account_store_root(app.state.manager.state_root))
+        account_id = account_id_from_credential_id(credential_id) if credential_id else ""
+        revision = accounts.revision(account_id) if account_id else None
         result = await asyncio.to_thread(
             probe_worker_model,
             profile=profile,
@@ -151,9 +156,10 @@ def register(app: FastAPI) -> None:
         )
         credential_id = str(profile.get("credential_id") or "").strip()
         if credential_id:
-            CredentialAccountStore(
-                account_store_root(app.state.manager.state_root)
-            ).save_test_status(credential_id, result, backend=backend)
+            try:
+                accounts.save_test_status(credential_id, result, backend=backend, expected_revision=revision)
+            except CredentialTestRevisionError as exc:
+                raise HTTPException(status_code=409, detail={"code": exc.code, "message": "账号配置已变化，请重新测试"}) from exc
         saved = WorkerModelTestStore(
             app.state.manager.state_root
         ).save_result(
@@ -215,6 +221,16 @@ def register(app: FastAPI) -> None:
             in_web_container=is_web_container(),
         )
         runtime = {"network": str(cfg.get("worker_network") or "bridge")}
+        accounts = CredentialAccountStore(account_store_root(app.state.manager.state_root))
+        revisions = {}
+        for item in items:
+            profile = item.get("profile") if isinstance(item, dict) else None
+            if not isinstance(profile, dict):
+                continue
+            credential_id = str(profile.get("credential_id") or "")
+            account_id = account_id_from_credential_id(credential_id)
+            if account_id:
+                revisions[credential_id] = accounts.revision(account_id)
         payload = await asyncio.to_thread(
             probe_worker_models_batch,
             items=[item for item in items if isinstance(item, dict)],
@@ -251,9 +267,10 @@ def register(app: FastAPI) -> None:
                 continue
             credential_id = str(profile.get("credential_id") or "").strip()
             if credential_id:
-                CredentialAccountStore(
-                    account_store_root(app.state.manager.state_root)
-                ).save_test_status(credential_id, result, backend=backend)
+                try:
+                    accounts.save_test_status(credential_id, result, backend=backend, expected_revision=revisions.get(credential_id))
+                except CredentialTestRevisionError as exc:
+                    raise HTTPException(status_code=409, detail={"code": exc.code, "message": "账号配置已变化，请重新测试", "credential_id": credential_id}) from exc
             saved = store.save_result(
                 profile_id=profile_id,
                 profile=profile,

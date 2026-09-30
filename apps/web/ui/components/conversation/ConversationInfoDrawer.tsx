@@ -21,6 +21,7 @@ import {
 } from "@/components/chat/ui";
 import { DialogSection, MetaList, MetaRow, MetricTile } from "@/components/chat/dialogs/parts";
 import { apiFetch } from "@/lib/useRun";
+import { useSharedGitStatus } from "@/lib/threadGitStatusStore";
 import type {
   ConversationView,
   ConversationMemorySnapshot,
@@ -101,6 +102,9 @@ export function ConversationInfoDrawer({
   const [quotaError, setQuotaError] = useState("");
   const [quotaLoading, setQuotaLoading] = useState(false);
   const [quotaRefreshing, setQuotaRefreshing] = useState<string | null>(null);
+  const [showOtherQuota, setShowOtherQuota] = useState(false);
+  const git = useSharedGitStatus(view?.thread.thread_id, view?.thread.project_id || view?.workspace?.project_id || undefined);
+  useEffect(() => { setShowOtherQuota(false); }, [view?.thread.thread_id, view?.runtime.credential_id]);
 
   const loadQuota = async () => {
     if (quotaLoading) return;
@@ -194,8 +198,14 @@ export function ConversationInfoDrawer({
     if (promptValid && completionValid) return (promptTokens! + completionTokens!).toLocaleString();
     return "数据不完整";
   })();
-  const rawCost = usage.estimated_cost ?? usage.reported_cost ?? usage.cost_usd ?? usage.total_cost_usd;
-  const costUsd = rawCost == null ? null : Number(rawCost);
+  const reportedCost = usage.reported_cost ?? usage.cost_usd ?? usage.total_cost_usd;
+  const estimatedCost = usage.estimated_cost;
+  const costUsd = reportedCost == null && estimatedCost == null
+    ? null
+    : Number(reportedCost ?? 0) + Number(estimatedCost ?? 0);
+  const costLabel = estimatedCost != null
+    ? (reportedCost != null ? "金额（含估算）" : "估算金额")
+    : reportedCost != null ? "上报金额" : "金额";
 
   const contextWindow = activeView.context_window ?? null;
   const rtCaps = (activeView.runtime_connection?.capabilities ?? {}) as Record<string, unknown>;
@@ -211,9 +221,9 @@ export function ConversationInfoDrawer({
         <MetricTile label="累计 Token" value={totalLabel} tone={tokenCoverage === "complete" ? undefined : "neutral"} />
         <MetricTile label="轮次" value={(activeView.statistics?.turn_count ?? activeView.turns.length).toLocaleString()} />
         <MetricTile
-          label="估算费用"
-          value={costUsd == null || Number.isNaN(costUsd) ? "未定价" : `$${costUsd.toFixed(4)}`}
-          tone={costUsd == null ? "neutral" : "success"}
+          label={costLabel}
+          value={costUsd == null || !Number.isFinite(costUsd) ? "未定价" : `$${costUsd.toFixed(4)}`}
+          tone={costUsd == null || !Number.isFinite(costUsd) ? "neutral" : "success"}
         />
       </div>
 
@@ -229,9 +239,10 @@ export function ConversationInfoDrawer({
       <DialogSection title="会话" icon="messages">
         <MetaList>
           <MetaRow label="标题">{activeView.thread.title || "未命名对话"}</MetaRow>
-          <MetaRow label="状态">
-            <Badge tone={statusTone(activeView.state.status)} dot>{activeView.state.status}</Badge>
+          <MetaRow label="会话生命周期">
+            <Badge tone={activeView.state.status === "archived" ? "warning" : "neutral"} dot>{activeView.state.status === "active" ? "可继续" : activeView.state.status === "archived" ? "已归档" : activeView.state.status || "未上报"}</Badge>
           </MetaRow>
+          <MetaRow label="最近轮次执行状态">{activeView.turns.at(-1)?.status || "尚无轮次"}</MetaRow>
           <MetaRow label="模式" mono>{activeView.thread.mode}</MetaRow>
           <MetaRow label="创建时间">{formatDateTime(activeView.thread.created_at)}</MetaRow>
           {activeView.thread.updated_at ? <MetaRow label="最近更新">{formatDateTime(activeView.thread.updated_at)}</MetaRow> : null}
@@ -245,7 +256,7 @@ export function ConversationInfoDrawer({
         </MetaList>
       </DialogSection>
 
-      <DialogSection title="Agent Runtime" icon="cpu">
+      <DialogSection title="当前接入选择" icon="cpu">
         <MetaList>
           <MetaRow label="模型">{activeView.runtime.model || "默认模型"}</MetaRow>
           {activeView.runtime.effort ? <MetaRow label="推理强度" mono>{activeView.runtime.effort}</MetaRow> : null}
@@ -256,11 +267,23 @@ export function ConversationInfoDrawer({
         </MetaList>
       </DialogSection>
 
+      {activeView.turns.at(-1) && <DialogSection title="最近轮次接入快照" icon="history"><MetaList>
+        <MetaRow label="轮次" mono>{activeView.turns.at(-1)?.turn_id}</MetaRow>
+        {activeView.turns.at(-1)?.runtime_snapshot ? <>
+          <MetaRow label="模型">{activeView.turns.at(-1)?.runtime_snapshot?.model || "默认模型"}</MetaRow>
+          <MetaRow label="Adapter" mono>{activeView.turns.at(-1)?.runtime_snapshot?.adapter_id || "未上报"}</MetaRow>
+          <MetaRow label="实例" mono>{activeView.turns.at(-1)?.runtime_snapshot?.instance_id || "未上报"}</MetaRow>
+          <MetaRow label="凭据引用" mono>{activeView.turns.at(-1)?.runtime_snapshot?.credential_id || "未上报"}</MetaRow>
+        </> : <MetaRow label="快照来源">此历史轮次未保存接入快照</MetaRow>}
+      </MetaList></DialogSection>}
+
       {activeView.workspace ? (
         <DialogSection title="工作区" icon="folder">
           <MetaList>
-            <MetaRow label="路径" mono copy={workspacePath}>{workspacePath || "—"}</MetaRow>
+            <MetaRow label="服务工作目录" mono copy={workspacePath}>{workspacePath || "—"}</MetaRow>
             <MetaRow label="类型" mono>{activeView.workspace.kind}</MetaRow>
+            <MetaRow label="服务 Git 工作树根目录" mono>{git.status?.is_repo ? git.status.root_path || "未上报" : git.error ? git.error : git.loading ? "读取中" : "未识别为 Git 工作树"}</MetaRow>
+            {git.status?.is_repo && git.status.root_path && git.status.root_path !== workspacePath ? <MetaRow label="范围">Git 改动与 PR 使用所属工作树范围，可包含工作目录上层的文件。</MetaRow> : null}
           </MetaList>
         </DialogSection>
       ) : null}
@@ -425,9 +448,9 @@ export function ConversationInfoDrawer({
           <MetricTile label="Completion Tokens" value={formatToken(completionTokens, completionValid)} />
           <MetricTile label="累计 Token" value={totalLabel} />
           <MetricTile
-            label="估算费用 (USD)"
-            value={costUsd == null || Number.isNaN(costUsd) ? "未定价" : `$${costUsd.toFixed(4)}`}
-            tone={costUsd == null ? "neutral" : "success"}
+            label={`${costLabel} (USD)`}
+            value={costUsd == null || !Number.isFinite(costUsd) ? "未定价" : `$${costUsd.toFixed(4)}`}
+            tone={costUsd == null || !Number.isFinite(costUsd) ? "neutral" : "success"}
           />
         </div>
       </DialogSection>
@@ -473,12 +496,12 @@ export function ConversationInfoDrawer({
         ) : null}
         {quotaData && quotaData.length > 0 ? (
           <ul className="flex flex-col gap-1.5">
-            {quotaData.map((entry) => {
+            {[...quotaData].filter(entry => showOtherQuota || entry.credential_id === credential).sort((a, b) => Number(b.credential_id === credential) - Number(a.credential_id === credential)).map((entry) => {
               const status = quotaStatus(entry);
               return (
                 <li key={entry.credential_id} className="rounded-xl border border-cx-border-subtle bg-cx-elevated px-3 py-2">
                   <div className="flex items-center gap-2">
-                    <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-cx-fg">{entry.label}</span>
+                    <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-cx-fg">{entry.label}{entry.credential_id === credential ? " · 当前选择" : ""}</span>
                     <span className="font-cx-mono text-[11px] text-cx-fg-4">{entry.engine}</span>
                     <Badge tone={status.tone}>{status.label}</Badge>
                     {entry.quota_type === "subscription" ? (
@@ -509,6 +532,8 @@ export function ConversationInfoDrawer({
             })}
           </ul>
         ) : null}
+        {quotaData && !quotaData.some(entry => entry.credential_id === credential) ? <p className="text-[12px] text-cx-fg-4">当前选择的凭据尚未上报额度。</p> : null}
+        {quotaData?.some(entry => entry.credential_id !== credential) ? <Button size="sm" variant="ghost" onClick={() => setShowOtherQuota(value => !value)}>{showOtherQuota ? "收起其他账号" : `查看其他账号（${quotaData.filter(entry => entry.credential_id !== credential).length}）`}</Button> : null}
       </DialogSection>
     </div>
   );
