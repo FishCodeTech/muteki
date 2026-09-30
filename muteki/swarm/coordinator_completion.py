@@ -58,8 +58,13 @@ def _findings_complete(self) -> bool:
     contract = getattr(self.challenge, "pentest_contract", None)
     if contract is None or self.shared_graph is None:
         return False
-    from muteki.pentest.judgement import evaluate
-    return evaluate(self.shared_graph.events(), contract)["objective_status"] == "met"
+    from muteki.pentest.judgement import evaluate, submitted_reports
+    events = self.shared_graph.events()
+    if (contract.version >= 2 and contract.report_goal_mode == "automatic"
+            and any(item.get("review_status") == "pending"
+                    for item in submitted_reports(events, contract))):
+        return False
+    return evaluate(events, contract)["objective_status"] == "met"
 
 
 def _qualified_report_count(self) -> int:
@@ -122,6 +127,8 @@ async def wait_for_workers_stage(self, state) -> None:
     waitables = set(state.tasks.keys())
     if state.reason_task is not None:
         waitables.add(state.reason_task)
+    if state.pentest_review_task is not None:
+        waitables.add(state.pentest_review_task)
     if waitables:
         finished, _pending = await asyncio.wait(
             waitables, timeout=self.config_poll_interval(),
@@ -145,9 +152,13 @@ async def wait_for_workers_stage(self, state) -> None:
 
 async def reconcile_completion_stage(self, state) -> str:
     from functools import partial
+    from muteki.swarm.coordinator_pentest_review import review_pentest_submissions_stage
     from muteki.swarm.coordinator_state import emit_scheduler_bb
 
     emit_bb = partial(emit_scheduler_bb, self, state)
+    review_action = await review_pentest_submissions_stage(self, state)
+    if review_action != "proceed":
+        return review_action
     if state.winner is None:
         self._sync_flags_from_graph()
         pentest_product = getattr(self.challenge, "mode", "ctf") == "pentest"

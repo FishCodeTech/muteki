@@ -1842,11 +1842,12 @@ function Deck({ workspaceMode }: { workspaceMode: "ctf" | "pentest" }) {
     };
     if (opts?.mode === "pentest") {
       challenge.mode = "pentest";
+      challenge.report_goal_mode = opts.reportGoalMode || "automatic";
+      if (opts.reportGoalMode === "count") {
+        challenge.expected_findings = opts.expectedFindings;
+      }
       if (opts.goal) challenge.goal = opts.goal;
       if (opts.scope) challenge.scope = opts.scope;
-      if (opts.collectCount && opts.collectCount > 0) {
-        challenge.expected_findings = opts.collectCount;
-      }
     } else {
       if (opts?.flagFormat === "brace") {
         // Send the human sample explicitly.  The shared backend contract turns
@@ -2166,7 +2167,7 @@ function Deck({ workspaceMode }: { workspaceMode: "ctf" | "pentest" }) {
           onShowConversation={() => { setArtifactOpen(false); setReportOpen(false); }}
           reportOpen={reportOpen}
           reportPanel={workspaceMode === "pentest" && !isDraft(runId)
-            ? <PentestReport key={runId} runId={runId} startedAt={deck.startedAt} finishedAt={deck.finishedAt} onOpenFact={openFact} />
+            ? <PentestReport key={runId} runId={runId} runTitle={deck.challengeName} startedAt={deck.startedAt} finishedAt={deck.finishedAt} onOpenFact={openFact} />
             : undefined}
           onOpenReport={workspaceMode === "pentest" ? openReport : undefined}
           runtimePanel={(

@@ -1,4 +1,5 @@
 /** Browser preference for the default chat credential + model. */
+import { conversationStorageKey, conversationStorageScope } from "./conversationStorageScope";
 
 export type ChatDefaultModel = {
   credentialId: string;
@@ -16,9 +17,9 @@ export type ChatLastSelection = ChatDefaultModel & {
 const CHAT_LAST_SELECTION_KEY = "muteki.conversation.last-selection.v1";
 
 export function readChatLastSelection(): ChatLastSelection | null {
-  if (typeof window === "undefined") return null;
+  if (typeof window === "undefined" || !conversationStorageScope()) return null;
   try {
-    const value = JSON.parse(window.localStorage.getItem(CHAT_LAST_SELECTION_KEY) || "null");
+    const value = JSON.parse(window.localStorage.getItem(conversationStorageKey(CHAT_LAST_SELECTION_KEY)) || "null");
     if (!value || typeof value !== "object") return null;
     if (typeof value.credentialId !== "string" || !value.credentialId.trim()
       || typeof value.modelId !== "string" || !value.modelId.trim()) return null;
@@ -36,18 +37,18 @@ export function readChatLastSelection(): ChatLastSelection | null {
 
 /** Save explicit selections, never passive thread hydration or catalog refreshes. */
 export function writeChatLastSelection(value: ChatLastSelection): void {
-  if (typeof window === "undefined" || !value.credentialId || !value.modelId) return;
+  if (typeof window === "undefined" || !conversationStorageScope() || !value.credentialId || !value.modelId) return;
   try {
-    window.localStorage.setItem(CHAT_LAST_SELECTION_KEY, JSON.stringify(value));
+    window.localStorage.setItem(conversationStorageKey(CHAT_LAST_SELECTION_KEY), JSON.stringify(value));
   } catch {
     // Optional browser preferences must not block the composer.
   }
 }
 
 export function readChatDefaultModel(): ChatDefaultModel | null {
-  if (typeof window === "undefined") return null;
+  if (typeof window === "undefined" || !conversationStorageScope()) return null;
   try {
-    const raw = window.localStorage.getItem(CHAT_DEFAULT_MODEL_KEY);
+    const raw = window.localStorage.getItem(conversationStorageKey(CHAT_DEFAULT_MODEL_KEY));
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<ChatDefaultModel>;
     const credentialId = String(parsed?.credentialId ?? "").trim();
@@ -59,22 +60,23 @@ export function readChatDefaultModel(): ChatDefaultModel | null {
   }
 }
 
-export function writeChatDefaultModel(value: ChatDefaultModel | null): void {
-  if (typeof window === "undefined") return;
+export function writeChatDefaultModel(value: ChatDefaultModel | null): boolean {
+  if (typeof window === "undefined" || !conversationStorageScope()) return false;
   try {
     if (!value?.credentialId || !value?.modelId) {
-      window.localStorage.removeItem(CHAT_DEFAULT_MODEL_KEY);
-      return;
+      window.localStorage.removeItem(conversationStorageKey(CHAT_DEFAULT_MODEL_KEY));
+      return true;
     }
     window.localStorage.setItem(
-      CHAT_DEFAULT_MODEL_KEY,
+      conversationStorageKey(CHAT_DEFAULT_MODEL_KEY),
       JSON.stringify({
         credentialId: value.credentialId.trim(),
         modelId: value.modelId.trim(),
       }),
     );
+    return true;
   } catch {
-    // Non-blocking: private mode / quota.
+    return false;
   }
 }
 

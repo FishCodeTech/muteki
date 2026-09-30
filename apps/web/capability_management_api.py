@@ -405,10 +405,12 @@ def create_capability_management_router(
         mcp_enabled = capability_resource_enabled("mcp", "muteki-control")
         blackboard_enabled = capability_resource_enabled(
             "skills", "muteki-blackboard")
+        browser_enabled = capability_resource_enabled("skills", "agent-browser")
         repo_root = Path(__file__).parents[2]
         agent_plugin_root = (
             repo_root / "muteki" / "agent_plugins" / "muteki-control")
         blackboard_source = repo_root / "skills" / "muteki-blackboard"
+        browser_source = repo_root / "skills" / "muteki-agent-browser"
         legacy_copies = [
             {
                 "path": str(path),
@@ -475,6 +477,24 @@ def create_capability_management_router(
                             for engine in VALID_BASE_ENGINES
                         },
                         "legacy_copies": legacy_copies,
+                        "lifecycle": "new_workers",
+                    },
+                    {
+                        "id": "agent-browser",
+                        "name": "agent-browser",
+                        "enabled": browser_enabled,
+                        "mutable": True,
+                        "health": (
+                            "ready" if browser_enabled and (browser_source / "SKILL.md").is_file()
+                            else "disabled" if not browser_enabled else "missing"
+                        ),
+                        "source": str(browser_source),
+                        "scope": "pentest_worker_workspace",
+                        "engines": {
+                            engine: list(project_skill_roots(engine))
+                            for engine in VALID_BASE_ENGINES
+                        },
+                        "legacy_copies": [],
                         "lifecycle": "new_workers",
                     },
                     {

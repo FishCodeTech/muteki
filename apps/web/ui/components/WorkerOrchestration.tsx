@@ -1,11 +1,9 @@
 "use client";
 
 import { MotionPreferences } from "@/components/MotionPreferences";
-import dynamic from "next/dynamic";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { usePathname, useSearchParams } from "next/navigation";
-import type { CSSProperties } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties, ComponentProps } from "react";
 import { Alert, Card, Chip, ComboBox, Input, Button, Dropdown, Label, ListBox, ListBoxItem, Radio, RadioGroup, Select, Skeleton, Slider, Switch } from "@heroui/react";
 import { Icon, type IconName } from "@/components/Icon";
 import { EngineLogo } from "@/components/EngineLogo";
@@ -56,10 +54,14 @@ import { useLang, useT } from "@/lib/i18n";
 import { ConversationReadingPrefsPanel } from "./conversation/ConversationReadingPrefsPanel";
 import { useSolveOnlyMode, setSolveOnlyMode } from "@/lib/workspaceMode";
 
-const TaskCredentialManager = dynamic(
-  () => import("@/components/ProviderManager").then((module) => module.ProviderManager),
-  { ssr: false },
+const LazyTaskCredentialManager = lazy(
+  () => import("@/components/ProviderManager").then((module) => ({ default: module.ProviderManager })),
 );
+function TaskCredentialManager(props: ComponentProps<typeof LazyTaskCredentialManager>) {
+  const [client, setClient] = useState(false);
+  useEffect(() => { setClient(true); }, []);
+  return client ? <Suspense fallback={<div role="status">正在加载凭据设置…</div>}><LazyTaskCredentialManager {...props} /></Suspense> : null;
+}
 
 type Seat = NonNullable<WorkerSettings["seats"]>[number];
 type Credential = NonNullable<WorkerSettings["credentials"]>[number];
@@ -1391,7 +1393,7 @@ function SchedulingWorkspace({ config, raceTimeout, dispatchMode, startWorkers, 
           <Card.Content className="wscheduling-fields">
             <div className="wscheduling-field"><label><span>累计启动上限</span><NumberField ariaLabel="累计启动上限" min={0} value={maxTotal} onChange={(next) => onChange({ maxTotal: Math.max(0, Number(next) || 0) })} /></label><small>到限后等待已启动 Worker 完成</small></div>
             <div className="wscheduling-field"><label><span>最长运行时间</span><NumberField ariaLabel="最长运行时间" min={0} suffix="秒" value={wallClock} onChange={(next) => onChange({ wallClock: Math.max(0, Number(next) || 0) })} /></label><small>到限后结束剩余任务</small></div>
-            <div className="wscheduling-field"><label><span>成本预算</span><NumberField ariaLabel="成本预算" min={0} step={0.1} suffix="USD" value={costBudget} onChange={(next) => onChange({ costBudget: Math.max(0, Number(next) || 0) })} /></label><small>按已记账成本计算，到限后停止 Worker</small></div>
+            <div className="wscheduling-field"><label><span>成本预算</span><NumberField ariaLabel="成本预算" min={0} step={0.1} suffix="USD" value={costBudget} onChange={(next) => onChange({ costBudget: Math.max(0, Number(next) || 0) })} /></label><small>按已知金额；到限仅限制后续启动</small></div>
           </Card.Content>
         </Card>
         {Object.keys(config.overrides || {}).length ? <p className="wsettings-inline-note"><Icon name="alert" size={13} />已保留 {Object.keys(config.overrides).length} 个题型专属配置</p> : null}
@@ -1642,7 +1644,7 @@ const APPEARANCE_TOKENS = ["--blue", "--green", "--amber", "--cyan", "--pink", "
  * 保证 ≥ WCAG AA。所有改动即时应用到当前页面并持久化到本浏览器，
  * 主工作台下次加载（或切换亮暗模式）时沿用。
  */
-export function AppearanceWorkspace({ hideIntro = false }: { hideIntro?: boolean }) {
+export function AppearanceWorkspace({ hideIntro = false, clientContext = "web" }: { hideIntro?: boolean; clientContext?: "web" | "desktop" }) {
   const { lang, setLang } = useLang();
   const t = useT();
   const solveOnly = useSolveOnlyMode();
@@ -1664,8 +1666,8 @@ export function AppearanceWorkspace({ hideIntro = false }: { hideIntro?: boolean
     <div className="wsettings-simple-page wappearance-page">
       {hideIntro ? null : (
         <header className="wsettings-section-head"><div className="wsettings-section-copy">
-          <h2>外观配色</h2>
-          <p>配色引擎以主色色相为输入自动生成全套强调色：绿/琥珀/红/金等语义色固定不变，青/紫/品红/粉等装饰色与主色冲突时自动避让，主色对比度始终不低于 WCAG AA（4.5:1）。改动即时生效并保存在本浏览器。</p>
+          <h2>{lang === "zh" ? "外观配色" : "Appearance"}</h2>
+          <p>{lang === "zh" ? `主色生成全套强调色，语义色保持固定。改动即时生效并保存在${clientContext === "desktop" ? "当前桌面客户端" : "本浏览器"}。` : `The accent color generates the palette while semantic colors stay consistent. Changes apply immediately and are saved in ${clientContext === "desktop" ? "this desktop client" : "this browser"}.`}</p>
         </div></header>
       )}
 
@@ -1687,15 +1689,15 @@ export function AppearanceWorkspace({ hideIntro = false }: { hideIntro?: boolean
         </RadioGroup>
       </section>
 
-      <section className="wappearance-card wappearance-choice-card" aria-labelledby="wappearance-workspaces">
+      {clientContext === "web" ? <section className="wappearance-card wappearance-choice-card" aria-labelledby="wappearance-workspaces">
         <header><h3 id="wappearance-workspaces">{lang === "zh" ? "工作区模式" : "Workspace mode"}</h3><span>{solveOnly ? (lang === "zh" ? "仅做题" : "Solve only") : (lang === "zh" ? "全部工作区" : "All workspaces")}</span></header>
         <p>{lang === "zh" ? "默认只显示做题模式。开启此项后，首页、导航和搜索会加入对话与比赛工作区。" : "Only the solve workspace is shown by default. Turn this on to add chat and competition workspaces to the home page, navigation, and search."}</p>
         <Switch isSelected={!solveOnly} onChange={(enabled) => setSolveOnlyMode(!enabled)} aria-label={lang === "zh" ? "显示对话和比赛模式" : "Show chat and competition modes"}>
           <Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control>{lang === "zh" ? "显示对话和比赛模式" : "Show chat and competition modes"}</Switch.Content>
         </Switch>
-      </section>
+      </section> : null}
 
-      <MotionPreferences />
+      <MotionPreferences clientContext={clientContext} />
 
       <section className="wappearance-card" aria-labelledby="wappearance-presets">
         <header><h3 id="wappearance-presets">{t("settingsHub.appearance.presets")}</h3><span>{sel.kind === "preset" ? schemeName(sel.id) : t("settingsHub.appearance.custom")}</span></header>
@@ -1735,10 +1737,10 @@ export function AppearanceWorkspace({ hideIntro = false }: { hideIntro?: boolean
         </div>
       </section>
 
-      {!solveOnly ? <section className="wappearance-card" aria-labelledby="wappearance-reading" data-testid="c39-appearance-reading">
+      {clientContext === "desktop" || !solveOnly ? <section className="wappearance-card" aria-labelledby="wappearance-reading" data-testid="c39-appearance-reading">
         <header><h3 id="wappearance-reading">{t("settingsHub.appearance.reading")}</h3><span>{t("settingsHub.appearance.readingMeta")}</span></header>
-        <p>{t("settingsHub.appearance.readingHint")}</p>
-        <ConversationReadingPrefsPanel />
+        <p>{clientContext === "desktop" ? (lang === "zh" ? "仅影响聊天正文的字号、密度与宽度，偏好保存在当前桌面客户端。" : "Adjust the chat text size, density and width. Preferences are saved in this desktop client.") : t("settingsHub.appearance.readingHint")}</p>
+        <ConversationReadingPrefsPanel hideIntro={clientContext === "desktop"} />
       </section> : null}
 
       <section className="wappearance-card" aria-labelledby="wappearance-preview">
@@ -1768,7 +1770,7 @@ export function AppearanceWorkspace({ hideIntro = false }: { hideIntro?: boolean
   );
 }
 
-export function WorkerOrchestration({ defaultReturnTo = "/" }: { defaultReturnTo?: string }) {
+export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { defaultReturnTo?: string; navigation: { pathname: string; searchParams: URLSearchParams } }) {
   const solveOnly = useSolveOnlyMode();
   const [config, setConfig] = useState<WorkerSettings | null>(null);
   const [seats, setSeats] = useState<Seat[]>([]);
@@ -1846,8 +1848,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/" }: { defaultReturnTo
     setDirty(currentDraftSignature !== baselineDraftRef.current);
   }, [config, currentDraftSignature]);
 
-  const searchParams = useSearchParams();
-  const pathname = usePathname() || "";
+  const { searchParams, pathname } = navigation;
   const returnParam = searchParams.get("return");
   const returnTo = useMemo(() => {
     const value = returnParam || defaultReturnTo;

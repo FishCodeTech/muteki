@@ -66,6 +66,7 @@ class ControlError(RuntimeError):
 
 class StartWorkerRejected(ControlError):
     """Supervisor definitively proved the requested child was never spawned."""
+    code = "worker_spawn_rejected"
 
 
 class _PendingReply:
@@ -428,11 +429,14 @@ class ControlReceiver:
     ) -> "ControlReceiver":
         with cls._instance_lock:
             if cls._instance is None:
-                cls._instance = ControlReceiver(
+                candidate = ControlReceiver(
                     host=host,
                     port=DEFAULT_CONTROL_PORT if port is None else int(port),
                 )
-                cls._instance.start()
+                # A transient bind conflict must not poison this process-wide
+                # singleton. Keep it unpublished until the listener exists.
+                candidate.start()
+                cls._instance = candidate
             elif (
                 (host is not None and cls._instance.host != host)
                 or (port is not None and cls._instance.port != int(port))
@@ -442,6 +446,8 @@ class ControlReceiver:
                     f"{cls._instance.host}:{cls._instance.port}; requested "
                     f"{host or cls._instance.host}:{port or cls._instance.port}"
                 )
+            elif not cls._instance._started:
+                cls._instance.start()
             return cls._instance
 
     def start(self) -> None:

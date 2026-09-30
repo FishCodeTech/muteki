@@ -113,6 +113,8 @@ class TaskContract(BaseModel):
     authorization_scope: str = ""
     completion_contract: CompletionContract = Field(default_factory=CompletionContract)
     pentest_contract: Optional[PentestContract] = None
+    report_goal_mode: Literal["automatic", "count"] = "automatic"
+    expected_findings: Optional[int] = None
     # Kept so old event dumps still validate; new contracts leave this empty.
     derived_fields: dict[str, DerivedTaskField] = Field(default_factory=dict)
 

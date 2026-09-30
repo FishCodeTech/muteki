@@ -14,7 +14,8 @@
     "test:smoke": "node test/smoke.cjs",
     "pack": "npm run build && electron-builder --dir --publish never",
     "dist": "npm run build && electron-builder --publish never",
-    "build": "vite build",
+    "build": "npm run build:native && vite build",
+    "build:native": "node scripts/build-native.cjs",
     "typecheck": "tsc --noEmit",
     "dev": "vite --host 127.0.0.1"
   },
@@ -29,7 +30,24 @@
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "typescript": "7.0.2",
-    "vite": "8.3.1"
+    "vite": "8.3.1",
+    "@types/node": "^20.14.0",
+    "@heroui/react": "3.2.4",
+    "@heroui/styles": "3.2.4",
+    "@tanstack/react-virtual": "^3.14.13",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "@xyflow/react": "^12.11.0",
+    "clsx": "^2.1.1",
+    "katex": "0.18.9",
+    "motion": "^13.4.4",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "6.0.0",
+    "shiki": "^4.4.3",
+    "tailwind-merge": "^3.7.0",
+    "@tailwindcss/postcss": "^4.3.3",
+    "tailwindcss": "^4.3.3"
   },
   "build": {
     "appId": "tech.fishcode.muteki.desktop",
@@ -54,7 +72,12 @@
       "target": [
         "dmg",
         "zip"
-      ]
+      ],
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Muteki uses the microphone only when you start voice input.",
+        "NSSpeechRecognitionUsageDescription": "Muteki uses macOS speech recognition to add your spoken words to the current draft."
+      },
+      "extraResources": [{ "from": "native/build/macos-speech.node", "to": "native/macos-speech.node" }]
     },
     "win": {
       "icon": "../web/ui/public/favicon.ico",
@@ -73,6 +96,14 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
-    }
+    },
+    "protocols": [
+      {
+        "name": "Muteki chat",
+        "schemes": [
+          "muteki"
+        ]
+      }
+    ]
   }
 }

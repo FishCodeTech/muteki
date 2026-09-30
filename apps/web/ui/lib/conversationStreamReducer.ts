@@ -17,7 +17,14 @@ export interface ConversationStreamEvent {
 export interface ConversationStreamState {
   events: ConversationStreamEvent[];
   liveText: string;
+  liveTextRuns: ConversationLiveTextRun[];
   appliedSeq: number;
+}
+
+export interface ConversationLiveTextRun {
+  start: number;
+  end: number;
+  phase: "commentary" | "final_answer" | "unknown";
 }
 
 export interface ConversationStreamResult {
@@ -51,7 +58,7 @@ const TURN_SUPERSESSION_EVENT_TYPES = new Set([
 ]);
 
 export function emptyConversationStreamState(): ConversationStreamState {
-  return { events: [], liveText: "", appliedSeq: 0 };
+  return { events: [], liveText: "", liveTextRuns: [], appliedSeq: 0 };
 }
 
 function isDuplicate(
@@ -120,13 +127,25 @@ export function acceptConversationStreamEvent(
   }
 
   let liveText = appendLiveDelta(state.liveText, event);
+  let liveTextRuns = state.liveTextRuns || [];
+  if (liveText.length > state.liveText.length) {
+    const rawPhase = String(event.payload.phase || event.payload.message_phase || event.payload.channel || "").toLowerCase();
+    const phase: ConversationLiveTextRun["phase"] = rawPhase === "commentary" ? "commentary"
+      : rawPhase === "final_answer" || rawPhase === "final" ? "final_answer" : "unknown";
+    const last = liveTextRuns.at(-1);
+    liveTextRuns = last?.phase === phase && last.end === state.liveText.length
+      ? [...liveTextRuns.slice(0, -1), { ...last, end: liveText.length }]
+      : [...liveTextRuns, { start: state.liveText.length, end: liveText.length, phase }];
+  }
   if (LIVE_TEXT_CLEAR_TYPES.has(event.event_type)) {
     liveText = "";
+    liveTextRuns = [];
   }
 
   const next: ConversationStreamState = {
     events: nextEvents(state.events, event),
     liveText,
+    liveTextRuns,
     appliedSeq: Math.max(state.appliedSeq, seq),
   };
 

@@ -60,7 +60,9 @@ def _flag_contract_inputs(
     return raw_format, wrapper
 
 
-def build_task_contract(body: Mapping[str, Any]) -> TaskContract:
+def build_task_contract(
+    body: Mapping[str, Any], *, pentest_version: int = 2,
+) -> TaskContract:
     """Finalize a contract from explicit operator fields only."""
     root = dict(body or {})
     challenge = dict(root.get("challenge") or {})
@@ -96,14 +98,25 @@ def build_task_contract(body: Mapping[str, Any]) -> TaskContract:
             multi_flag=multi_flag,
         )
     else:
-        pentest = compile_pentest_prompt(raw, target=target, scope=scope)
+        report_goal_mode = challenge.get("report_goal_mode", root.get("report_goal_mode", "automatic"))
+        raw_count = challenge.get("expected_findings", root.get("expected_findings"))
+        if raw_count is not None and (type(raw_count) is not int or raw_count < 1):
+            raise ValueError("expected_findings 必须是正整数")
+        pentest = compile_pentest_prompt(
+            raw, target=target, scope=scope,
+            report_goal_mode=report_goal_mode,
+            expected_findings=raw_count,
+            version=pentest_version,
+        )
         target = pentest.target
         scope = ", ".join(pentest.authorization.scope)
         goal = pentest.goal
         completion = CompletionContract(
-            kind="outcome",
+            kind="count" if pentest.report_goal_mode == "count" else "outcome",
             goal=goal,
             task_type="authorized_pentest",
+            quantity=pentest.expected_findings,
+            finding_class="vulnerability_report",
             expected_flags=1,
             outcome_predicate="model_goal_with_evidence",
         )
@@ -154,6 +167,8 @@ def project_contract_into_body(
     if contract.mode == "pentest":
         challenge["goal"] = completion.goal
         challenge["pentest_contract"] = contract.pentest_contract.model_dump(mode="json") if contract.pentest_contract else None
+        challenge["report_goal_mode"] = contract.pentest_contract.report_goal_mode if contract.pentest_contract else "automatic"
+        challenge["expected_findings"] = contract.pentest_contract.expected_findings if contract.pentest_contract else None
     else:
         challenge["expected_flags"] = max(1, completion.expected_flags)
         challenge["multi_flag"] = bool(completion.multi_flag)
@@ -169,6 +184,7 @@ def project_contract_into_body(
 
 def prepare_dispatch_contract(
     body: Mapping[str, Any],
+    *, pentest_version: int = 2,
 ) -> tuple[dict[str, Any], TaskContract]:
     """Freeze the raw instruction. Planner labeling is not part of this gate."""
     root = dict(body or {})
@@ -179,5 +195,5 @@ def prepare_dispatch_contract(
     if mode == "ctf":
         raw_flag_format, raw_flag_wrapper = _flag_contract_inputs(root, challenge)
         normalize_flag_contract(raw_flag_format, raw_flag_wrapper)
-    contract = build_task_contract(root)
+    contract = build_task_contract(root, pentest_version=pentest_version)
     return project_contract_into_body(root, contract), contract

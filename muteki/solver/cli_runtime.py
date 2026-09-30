@@ -455,6 +455,12 @@ def _execute_invocation(
     argv = self.driver.build_execute(
         prompt, session, web_access=self.web_access,
         kb_access=self.kb, stream=True)
+    if (getattr(self.driver, "persistent_stdin_prompt", False)
+            and len(prompt.encode("utf-8")) >= 64 * 1024):
+        if not argv or argv[-1] != prompt:
+            raise SecurePromptUnsupported(
+                f"{self.driver.name} persistent stdin prompt contract changed")
+        return PromptArgv(argv[:-1], prompt, session, "execute"), prompt
     return PromptArgv(argv, prompt, session, "execute"), None
 
 
@@ -475,6 +481,12 @@ def _resume_invocation(
     argv = self.driver.build_resume(
         prompt, session, web_access=self.web_access,
         kb_access=self.kb, stream=True)
+    if (getattr(self.driver, "persistent_stdin_prompt", False)
+            and len(prompt.encode("utf-8")) >= 64 * 1024):
+        if not argv or argv[-1] != prompt:
+            raise SecurePromptUnsupported(
+                f"{self.driver.name} persistent stdin resume contract changed")
+        return PromptArgv(argv[:-1], prompt, session, "resume"), prompt
     return PromptArgv(argv, prompt, session, "resume"), None
 
 

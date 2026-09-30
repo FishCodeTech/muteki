@@ -1,33 +1,41 @@
-"""Conversation-only packages and per-engine capability providers.
+"""Managed Agent packages and per-engine capability providers.
 
-Packages are immutable snapshots. Enabling a package never installs it into an
-operator's agent directories, a project, an Extension Host, or a Worker.
+Packages are immutable snapshots. Worker-selected components are projected into
+run-scoped workspaces without modifying the operator's Agent directories.
 """
 from __future__ import annotations
 
 import asyncio
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, closing
 import ctypes
+import errno
+from datetime import datetime, timezone
 from hashlib import sha256
 import json
+import logging
 import os
 from pathlib import Path
 import re
 import shlex
 import shutil
 import sqlite3
+import stat
 import tempfile
 import threading
+import time
 import sys
 from typing import Any
 
 import yaml
 
-from muteki.extensions.installer import ExtensionInstaller, InstallError, Source, sha256_tree
+from muteki.extensions.installer import ExtensionInstaller, InstallError, Source, sha256_file, sha256_tree
+from muteki.extensions.isolation import IsolationUnavailable
 from muteki.conversation.chat_providers import PROVIDERS, provider_for
 from muteki.conversation.chat_plugin_components import compatibility, inspect_components, install_native_components
 
 ENGINES = ("claude", "codex", "cursor", "pi", "omp", "kimi", "grok", "opencode")
+MODES = ("chat", "ctf", "pentest")
+_log = logging.getLogger(__name__)
 
 
 class ChatPluginError(ValueError):
@@ -54,6 +62,9 @@ def _snapshot_copy(source: str | Path, target: str | Path) -> str:
         clone.restype = ctypes.c_int
         if clone(os.fsencode(source), os.fsencode(target), 0) == 0:
             return str(target)
+        error = ctypes.get_errno()
+        if error not in {errno.ENOTSUP, errno.EXDEV, errno.ENOSYS}:
+            raise OSError(error, os.strerror(error), str(source))
     return shutil.copy2(source, target)
 
 
@@ -73,6 +84,15 @@ def _copy_package(source: Path, target: Path) -> None:
     shutil.copytree(source, target, copy_function=_snapshot_copy, ignore=shutil.ignore_patterns(".git", "__pycache__"))
 
 
+def _checked_tree_digest(root: Path) -> str:
+    """Hash a snapshot only after rejecting links that could leave its tree."""
+    if not root.is_dir() or root.is_symlink():
+        raise ChatPluginError("扩展快照目录缺失或已被替换", code="chat_plugin.snapshot_invalid")
+    if any(path.is_symlink() for path in root.rglob("*")):
+        raise ChatPluginError("扩展快照含有符号链接", code="chat_plugin.snapshot_invalid")
+    return sha256_tree(root)
+
+
 class ChatPluginService:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
@@ -82,6 +102,9 @@ class ChatPluginService:
         self._lock = threading.RLock()
         self._workers: dict[str, McpWorker] = {}
         self._tools: dict[str, list[dict[str, Any]]] = {}
+        self._mcp_connection_errors: dict[str, list[dict[str, str]]] = {}
+        self._mcp_server_tools: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        self._mcp_health: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._verified_tools: dict[str, set[str]] = {}
         self._diagnostics: dict[str, str] = {}
         self._prepare_locks: dict[str, asyncio.Lock] = {}
@@ -90,6 +113,9 @@ class ChatPluginService:
             conn.execute("CREATE TABLE IF NOT EXISTS policy (id TEXT PRIMARY KEY, value TEXT NOT NULL)")
         self.db.chmod(0o600)
         for record in self.records():
+            if record.get("mode_scope_version") != 1:
+                record.update(modes=["chat"], mode_scope_version=1)
+                self.save(record)
             if record.get("scope_version") != 2:
                 record.update(enabled=bool(record.get("engines")), engines=list(ENGINES), scope_version=2)
                 self.save(record)
@@ -131,14 +157,150 @@ class ChatPluginService:
         with self.connect() as conn:
             conn.execute("INSERT OR REPLACE INTO policy VALUES (?, ?)", ("session:" + session_id, revision))
 
-    def enabled(self, engine: str) -> list[dict[str, Any]]:
+    def enabled(self, engine: str, mode: str = "chat") -> list[dict[str, Any]]:
+        if mode not in MODES:
+            raise ChatPluginError("未知使用场景")
         return [r for r in self.records() if r.get("enabled", True)
-                and compatibility(r, check_tools=False)[engine]["status"] != "blocked"]
+                and mode in r.get("modes", ["chat"])
+                and (compatibility(r, check_tools=False)[engine]["status"] != "blocked"
+                     if mode == "chat"
+                     else engine in r.get("declared_engines", ENGINES)
+                     and bool(any(not skill.get("requires_native") or engine == "claude"
+                                  for skill in r.get("skills", [])) or r.get("mcp") or any(
+                         component.get("kind") in {"extensions", "agents"}
+                         and engine in {"pi", "omp", "opencode"}
+                         and engine in component.get("engines", [])
+                         for component in r.get("components", []))))]
 
-    def revision(self, engine: str) -> str:
-        values = [(r["id"], r["digest"], r.get("hooks_approved_digest", "")) for r in self.enabled(engine)]
-        native = provider_for(engine).revision() if engine in PROVIDERS else ""
-        return sha256(json.dumps([8, values, self.control_enabled(engine), native]).encode()).hexdigest()[:16]
+    def revision(self, engine: str, mode: str = "chat") -> str:
+        values = [(r["id"], r["digest"], r.get("hooks_approved_digest", "")) for r in self.enabled(engine, mode)]
+        native = (provider_for(engine).revision()
+                  if mode == "chat" and engine in PROVIDERS
+                  and os.environ.get("MUTEKI_HOST_DISCOVERY", "1") != "0" else "")
+        return sha256(json.dumps([9, mode, values, self.control_enabled(engine) if mode == "chat" else False, native]).encode()).hexdigest()[:16]
+
+    @staticmethod
+    def validate_modes(modes: Any) -> list[str]:
+        if not isinstance(modes, list) or not modes or any(mode not in MODES for mode in modes):
+            raise ChatPluginError("请至少选择一个有效使用场景：聊天、CTF 或渗透测试")
+        return [mode for mode in MODES if mode in modes]
+
+    @staticmethod
+    def _strip_worker_mcp_config(root: Path, record: dict[str, Any]) -> None:
+        """Keep host-owned MCP declarations out of a Worker-visible package."""
+        if not record.get("mcp"):
+            return
+        manifests = (
+            "plugin.json", ".codex-plugin/plugin.json",
+            ".claude-plugin/plugin.json", ".cursor-plugin/plugin.json", "package.json",
+        )
+        component_paths = {str(item.get("path") or "") for item in (
+            list(record.get("skills", [])) + list(record.get("components", [])))
+            if isinstance(item, dict)}
+        remove: set[Path] = set()
+        manifest_paths = {root / name for name in manifests}
+        for name in manifests:
+            path = root / name
+            if not path.exists():
+                continue
+            if path.is_symlink() or not path.is_file():
+                raise ChatPluginError("Worker 扩展清单无效", code="chat_plugin.snapshot_invalid")
+            try:
+                manifest = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise ChatPluginError("Worker 扩展清单无法解析", code="chat_plugin.snapshot_invalid") from exc
+            if not isinstance(manifest, dict):
+                raise ChatPluginError("Worker 扩展清单无效", code="chat_plugin.snapshot_invalid")
+            declaration = manifest.pop("mcpServers", None)
+            if declaration is None:
+                continue
+            for value in declaration if isinstance(declaration, list) else [declaration]:
+                if isinstance(value, str):
+                    referenced = _contained(root, value)
+                    if not referenced.is_file() or referenced.is_symlink():
+                        raise ChatPluginError("Worker MCP 声明文件无效", code="chat_plugin.snapshot_invalid")
+                    remove.add(referenced)
+            path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        # MCP clients also discover conventional declaration files without an
+        # explicit manifest reference. Remove them at every package depth while
+        # retaining all other relative assets and native import dependencies.
+        remove.update(path for path in root.rglob("*")
+                      if path.name in {"mcp.json", ".mcp.json"})
+        for path in remove:
+            if (path in manifest_paths or path.is_symlink() or not path.is_file()
+                    or path.relative_to(root).as_posix() in component_paths):
+                raise ChatPluginError(
+                    "MCP 配置文件与 Worker 组件或清单重叠，请将配置拆到独立文件",
+                    code="chat_plugin.snapshot_invalid",
+                )
+            path.unlink()
+        # A package may duplicate an MCP header or environment value in a
+        # README or executable asset. Such bytes cannot be projected safely;
+        # fail instead of treating a stripped manifest as proof of secrecy.
+        private_values = {value.encode("utf-8") for config in record["mcp"].values()
+                          if isinstance(config, dict)
+                          for field in ("env", "headers")
+                          for value in (config.get(field) or {}).values()
+                          if isinstance(value, str) and value}
+        if private_values:
+            for path in root.rglob("*"):
+                if not path.is_file():
+                    continue
+                content = path.read_bytes()
+                if any(value in content for value in private_values):
+                    raise ChatPluginError(
+                        "MCP 配置值仍出现在 Worker 资源中；请拆分包或移除重复凭据",
+                        code="chat_plugin.snapshot_contains_mcp_secret",
+                    )
+
+    @staticmethod
+    def _require_run_snapshots_safe(shared: Path) -> None:
+        """Reject older mixed snapshots still mounted after a package is disabled."""
+        if not shared.exists():
+            return
+        if shared.is_symlink() or not shared.is_dir():
+            raise ChatPluginError("Run 扩展快照目录无效", code="chat_plugin.snapshot_invalid")
+        manifests = (
+            "plugin.json", ".codex-plugin/plugin.json",
+            ".claude-plugin/plugin.json", ".cursor-plugin/plugin.json", "package.json",
+        )
+        for snapshot in shared.glob("*/*"):
+            if snapshot.is_symlink() or not snapshot.is_dir():
+                raise ChatPluginError("Run 扩展快照目录无效", code="chat_plugin.snapshot_invalid")
+            candidates = [(snapshot / name, False) for name in manifests]
+            candidates.extend((path, True) for path in snapshot.rglob("*")
+                              if path.name in {"mcp.json", ".mcp.json"})
+            for path, standalone in candidates:
+                if not path.exists() and not path.is_symlink():
+                    continue
+                if path.is_symlink() or not path.is_file():
+                    raise ChatPluginError("Run 扩展快照配置无效", code="chat_plugin.snapshot_invalid")
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as exc:
+                    raise ChatPluginError("Run 扩展快照配置无效", code="chat_plugin.snapshot_invalid") from exc
+                declaration = data.get("mcpServers", data if standalone else None) if isinstance(data, dict) else None
+                if declaration:
+                    raise ChatPluginError(
+                        "Run 中留有包含 MCP 配置的旧扩展快照；请新建 Run，避免凭据进入 Worker 工作区",
+                        code="chat_plugin.worker_mcp_mixed_package",
+                    )
+
+    @classmethod
+    def validate_record_modes(cls, record: dict[str, Any], modes: Any) -> list[str]:
+        selected = cls.validate_modes(modes)
+        if any(mode != "chat" for mode in selected):
+            engines = set(record.get("declared_engines", ENGINES))
+            portable = bool(engines) and (bool(record.get("mcp")) or any(
+                not skill.get("requires_native") or "claude" in engines
+                for skill in record.get("skills", [])))
+            native = any(item.get("kind") in {"extensions", "agents"}
+                         and engines.intersection({"pi", "omp", "opencode"})
+                             .intersection(item.get("engines", []))
+                         for item in record.get("components", []))
+            if not portable and not native:
+                raise ChatPluginError("此包没有可投放给 Worker 的 Skill、MCP 或兼容原生插件")
+        return selected
 
     @staticmethod
     def _resolve_local_dir(raw: str) -> Path:
@@ -183,7 +345,7 @@ class ChatPluginService:
         )
         return ChatPluginError(message, code=code)
 
-    def install(self, source: dict[str, Any]) -> dict[str, Any]:
+    def install(self, source: dict[str, Any], modes: list[str] | None = None) -> dict[str, Any]:
         kind = source.get("kind", "local-dir")
         if kind not in {"local-dir", "archive", "git"}:
             raise ChatPluginError(
@@ -215,16 +377,24 @@ class ChatPluginService:
                     ), workdir)
                 except InstallError as exc:
                     raise self._from_install_error(exc) from exc
-            record = self._inspect(package)
-            record.update(engines=list(ENGINES), enabled=True, scope_version=2)
+            # The same normalized bytes are inspected, named by digest, and
+            # installed. Archive sources can contain ignored cache files.
+            normalized = workdir / "normalized"
+            _copy_package(package, normalized)
+            record = self._inspect(normalized)
+            previous = self.get(record["id"])
+            record.update(engines=list(ENGINES), enabled=True, scope_version=2,
+                          modes=self.validate_record_modes(record, modes if modes is not None else previous.get("modes", ["chat"])),
+                          mode_scope_version=1)
             record["source_kind"] = kind
-            record["digest"] = sha256_tree(package)
+            record["digest"] = sha256_tree(normalized)
             target = self.root / "packages" / record["id"] / record["digest"]
             target.parent.mkdir(parents=True, exist_ok=True)
-            if not target.exists():
-                _copy_package(package, target)
+            if not target.exists() and not target.is_symlink():
+                _copy_package(normalized, target)
+            if _checked_tree_digest(target) != record["digest"]:
+                raise ChatPluginError("已安装扩展包内容发生变化", code="chat_plugin.package_modified")
             record["root"] = str(target)
-            previous = self.get(record["id"])
             record["previous"] = ({k: v for k, v in previous.items() if k != "previous"} if previous else None)
             self.save(record)
         return self.public(record)
@@ -276,7 +446,7 @@ class ChatPluginService:
                 value = json.loads(path.read_text())
             if not isinstance(value, dict): raise ChatPluginError("MCP 声明必须为对象或包内 JSON 路径")
             mcp.update(value.get("mcpServers", value))
-        self._validate_mcp(mcp)
+        self._validate_mcp(mcp, root=root)
         components = inspect_components(root, manifest)
         for item in components["components"]:
             if item["kind"] == "commands":
@@ -303,7 +473,7 @@ class ChatPluginService:
                 "skills": skills, "mcp": mcp, "native_components": unsupported, "component_schema_version": 4, **components}
 
     @staticmethod
-    def _validate_mcp(servers: Any) -> None:
+    def _validate_mcp(servers: Any, *, root: Path | None = None) -> None:
         if not isinstance(servers, dict) or len(servers) > 20:
             raise ChatPluginError("MCP 配置必须是最多 20 个服务的 mcpServers 对象")
         for name, cfg in servers.items():
@@ -320,8 +490,39 @@ class ChatPluginService:
                     raise ChatPluginError(f"MCP {key} 必须是字符串映射")
             if "network" in cfg and (not isinstance(cfg["network"], list) or not all(isinstance(v, str) for v in cfg["network"])):
                 raise ChatPluginError("MCP network 必须是数组")
+            for index, argument in enumerate([cfg.get("command") or "", *(cfg.get("args") or [])]):
+                # An executable may live in a declared runtime (for example a
+                # Python virtualenv); path arguments must stay in the immutable
+                # package or the MCP's private writable state. The macOS
+                # sandbox cannot read an arbitrary absolute script path.
+                value = argument.split("=", 1)[1] if "=" in argument else argument
+                token = next((token for token in ("${PLUGIN_ROOT}", "${CLAUDE_PLUGIN_ROOT}",
+                                                  "${CODEX_PLUGIN_ROOT}", "${PLUGIN_DATA}")
+                              if value.startswith(token)), "")
+                if token:
+                    suffix = value[len(token):]
+                    if suffix and not suffix.startswith("/"):
+                        raise ChatPluginError("MCP 路径模板后必须是 / 或结束", code="chat_plugin.mcp_path_invalid")
+                    base = root if token != "${PLUGIN_DATA}" else Path("/muteki-plugin-data")
+                    if base is not None:
+                        target = (base / suffix.lstrip("/")).resolve()
+                        if not target.is_relative_to(base.resolve()):
+                            raise ChatPluginError("MCP 路径不得越过扩展包或私有数据目录", code="chat_plugin.mcp_path_invalid")
+                        if root is not None and token != "${PLUGIN_DATA}" and not target.exists():
+                            raise ChatPluginError(
+                                "MCP 包内资源不存在；请导入包含脚本和资源的扩展包，并以 ${PLUGIN_ROOT}/... 引用",
+                                code="chat_plugin.mcp_resource_missing",
+                            )
+                elif index > 0 and value.startswith("/"):
+                    raise ChatPluginError(
+                        "MCP 参数引用包外绝对路径；请将脚本和资源导入同一扩展包，并以 ${PLUGIN_ROOT}/... 引用",
+                        code="chat_plugin.mcp_path_outside_package",
+                    )
+                elif "${" in value:
+                    raise ChatPluginError("MCP 路径模板无效，仅支持 ${PLUGIN_ROOT} 或 ${PLUGIN_DATA}",
+                                          code="chat_plugin.mcp_path_invalid")
 
-    def add_mcp(self, name: str, servers: dict[str, Any]) -> dict[str, Any]:
+    def add_mcp(self, name: str, servers: dict[str, Any], modes: list[str] | None = None) -> dict[str, Any]:
         self._validate_mcp(servers)
         if not servers:
             raise ChatPluginError("请至少配置一个 MCP 服务")
@@ -329,19 +530,23 @@ class ChatPluginService:
         with tempfile.TemporaryDirectory(dir=self.root) as temp:
             root = Path(temp)
             (root / "plugin.json").write_text(json.dumps({"name": name, "version": "local", "mcpServers": servers}))
-            return self.install({"kind": "local-dir", "path": temp})
+            return self.install({"kind": "local-dir", "path": temp}, modes=modes)
 
     def update(self, package_id: str, enabled: bool | None = None, rollback: bool = False,
-               native_hooks: bool | None = None, digest: str = "") -> dict[str, Any]:
+               native_hooks: bool | None = None, digest: str = "",
+               modes: list[str] | None = None) -> dict[str, Any]:
         record = self.get(package_id)
         if not record:
             raise ChatPluginError("插件不存在")
         if rollback:
             if not record.get("previous"):
                 raise ChatPluginError("没有可回滚的版本")
-            record = {**record["previous"], "engines": list(ENGINES), "enabled": record["enabled"], "scope_version": 2, "previous": None}
+            record = {**record["previous"], "engines": list(ENGINES), "enabled": record["enabled"], "scope_version": 2,
+                      "modes": list(record.get("modes", ["chat"])), "mode_scope_version": 1, "previous": None}
         if enabled is not None:
             record["enabled"] = enabled
+        if modes is not None:
+            record["modes"] = self.validate_record_modes(record, modes)
         if native_hooks is not None:
             if native_hooks and digest != record["digest"]:
                 raise ChatPluginError("插件版本已变化，请重新查看此版本的 hooks 后启用")
@@ -355,7 +560,28 @@ class ChatPluginService:
             conn.execute("DELETE FROM packages WHERE id=?", (package_id,))
 
     def public(self, record: dict[str, Any]) -> dict[str, Any]:
+        worker_compatibility = {}
+        for engine in ENGINES:
+            components = []
+            if any((not skill.get("requires_native") or engine == "claude")
+                   and (not skill.get("hooks") or record.get("hooks_approved_digest") == record.get("digest"))
+                   for skill in record.get("skills", [])):
+                components.append("Skill")
+            if record.get("mcp"):
+                components.append("MCP")
+            if engine in {"pi", "omp", "opencode"} and any(
+                item.get("kind") in {"extensions", "agents"}
+                and engine in item.get("engines", []) for item in record.get("components", [])
+            ):
+                components.append("原生插件")
+            worker_compatibility[engine] = {
+                "status": "available" if components and engine in record.get("declared_engines", ENGINES)
+                          else "unavailable",
+                "components": components if engine in record.get("declared_engines", ENGINES) else [],
+            }
         return {k: record.get(k) for k in ("id", "name", "version", "description", "enabled", "engines", "digest", "skills", "native_components")} | {
+            "modes": list(record.get("modes", ["chat"])),
+            "worker_compatibility": worker_compatibility,
             "mcp_servers": list(record.get("mcp", {})), "origin": "managed",
             "can_rollback": bool(record.get("previous")),
             "diagnostics": [self._diagnostics.get(record["id"], "")] if self._diagnostics.get(record["id"]) else [],
@@ -386,6 +612,240 @@ class ChatPluginService:
                                  "_priority": 500})
         return rows
 
+    def stage_worker(self, workdir: str | Path, *, engine: str, mode: str,
+                     container: Any = None) -> list[str]:
+        """Project selected portable Skills into one run-scoped Worker workspace.
+
+        Package bytes are copied once per Run. Relative skill links work in the
+        container mount as well as locally, without exposing host Agent homes.
+        Native executable components remain governed by their engine ABI; this
+        projection exposes only Skills and the separate host-owned MCP bridge.
+        """
+        if mode not in {"ctf", "pentest"}:
+            return []
+        from muteki.solver.worker_skills import project_skill_roots
+        from muteki.solver.workspace import workspace_root_for_worker
+
+        cwd = Path(workdir).resolve()
+        run_root = workspace_root_for_worker(cwd)
+        shared = run_root / ".muteki-extensions" / "packages"
+        staged: list[str] = []
+        with self._lock:
+            self._require_run_snapshots_safe(shared)
+            records = self.enabled(engine, mode)
+            for record in records:
+                skills = [skill for skill in record.get("skills", [])
+                          if (not skill.get("requires_native") or engine == "claude")
+                          and (not skill.get("hooks") or
+                               record.get("hooks_approved_digest") == record.get("digest"))]
+                native = any(component.get("kind") in {"extensions", "agents"}
+                             and engine in component.get("engines", [])
+                             for component in record.get("components", []))
+                if not skills and not native:
+                    continue
+                target = shared / record["id"] / record["digest"]
+                self._stage_worker_snapshot(record, target)
+                for skill in skills:
+                    name = f"muteki-{record['id']}-{skill['name']}"
+                    source = (_contained(target, str(skill["path"]))
+                              if Path(str(skill["path"])).name == "SKILL.md"
+                              else target / ".muteki-worker-skills" / name / "SKILL.md")
+                    if not source.is_file():
+                        raise ChatPluginError(f"Worker Skill 缺失：{name}")
+                    for relative in project_skill_roots(engine):
+                        destination = cwd / relative / name
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        relative_target = os.path.relpath(source.parent, destination.parent)
+                        if destination.is_symlink() and os.readlink(destination) == relative_target:
+                            continue
+                        if destination.is_symlink():
+                            old_target = (destination.parent / os.readlink(destination)).resolve()
+                            if old_target.is_relative_to(shared.resolve()):
+                                destination.unlink()
+                        if destination.exists() or destination.is_symlink():
+                            raise ChatPluginError(f"Worker Skill 目录已存在：{destination}")
+                        destination.symlink_to(relative_target, target_is_directory=True)
+                    staged.append(name)
+        return staged
+
+    def _stage_worker_snapshot(self, record: dict[str, Any], target: Path) -> bool:
+        """Recheck Run-visible bytes against a manifest outside the Worker mount."""
+        if (not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}", str(record.get("id") or ""))
+                or not re.fullmatch(r"[0-9a-f]{64}", str(record.get("digest") or ""))):
+            raise ChatPluginError("扩展包身份或版本摘要无效", code="chat_plugin.snapshot_invalid")
+        manifest = self.root / "stage-digests" / record["id"] / record["digest"]
+        expected = manifest.read_text(encoding="ascii").strip() if manifest.is_file() else ""
+        if expected and not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise ChatPluginError("扩展快照校验记录损坏", code="chat_plugin.snapshot_invalid")
+        if target.exists() or target.is_symlink():
+            current = _checked_tree_digest(target)
+            if expected:
+                if current == expected:
+                    self._freeze_worker_snapshot(target)
+                    return False
+        source = Path(str(record.get("root") or ""))
+        if not source.resolve().is_relative_to((self.root / "packages").resolve()):
+            raise ChatPluginError("已安装扩展包路径不在私有目录", code="chat_plugin.snapshot_invalid")
+        if _checked_tree_digest(source) != record["digest"]:
+            raise ChatPluginError("已安装扩展包内容发生变化", code="chat_plugin.package_modified")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + ".staging-" + os.urandom(4).hex())
+        try:
+            _copy_package(source, temporary)
+            self._strip_worker_mcp_config(temporary, record)
+            for skill in record.get("skills", []):
+                file = _contained(temporary, str(skill["path"]))
+                from .chat_plugin_components import frontmatter
+                front, body = frontmatter(file)
+                front["name"] = f"muteki-{record['id']}-{skill['name']}"
+                content = "---\n" + yaml.safe_dump(front, allow_unicode=True) + "---\n" + body
+                if file.name == "SKILL.md":
+                    file.write_text(content, encoding="utf-8")
+                else:
+                    generated = (temporary / ".muteki-worker-skills" /
+                                 f"muteki-{record['id']}-{skill['name']}" / "SKILL.md")
+                    generated.parent.mkdir(parents=True, exist_ok=True)
+                    generated.write_text(content, encoding="utf-8")
+            projected = _checked_tree_digest(temporary)
+            if expected and projected != expected:
+                raise ChatPluginError("扩展快照与已登记版本不一致", code="chat_plugin.snapshot_invalid")
+            if target.exists():
+                if current != projected:
+                    difference = self._snapshot_difference(temporary, target)
+                    raise ChatPluginError(
+                        f"Run 扩展快照内容发生变化：{record['id']}/{difference}",
+                        code="chat_plugin.snapshot_modified",
+                    )
+                materialized = False
+            else:
+                temporary.rename(target)
+                materialized = True
+            self._freeze_worker_snapshot(target)
+            if not expected:
+                manifest.parent.mkdir(parents=True, exist_ok=True)
+                pending = manifest.with_name(manifest.name + "." + os.urandom(4).hex())
+                try:
+                    pending.write_text(projected, encoding="ascii")
+                    pending.chmod(0o600)
+                    pending.replace(manifest)
+                finally:
+                    pending.unlink(missing_ok=True)
+            return materialized
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+
+    @staticmethod
+    def _snapshot_difference(expected: Path, actual: Path) -> str:
+        expected_files = {path.relative_to(expected).as_posix(): path
+                          for path in expected.rglob("*") if path.is_file()}
+        actual_files = {path.relative_to(actual).as_posix(): path
+                        for path in actual.rglob("*") if path.is_file()}
+        for relative in sorted(expected_files.keys() | actual_files.keys()):
+            if relative not in expected_files:
+                return f"{relative}（新增文件）"
+            if relative not in actual_files:
+                return f"{relative}（文件缺失）"
+            if sha256_file(expected_files[relative]) != sha256_file(actual_files[relative]):
+                return f"{relative}（内容变化）"
+        return "文件清单与内容摘要不一致"
+
+    @staticmethod
+    def _freeze_worker_snapshot(root: Path) -> None:
+        # Python and other runtimes commonly create caches beside source files.
+        # Keep the projected source tree read-only; writable state belongs in
+        # each Worker's workspace or the MCP's private PLUGIN_DATA directory.
+        for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+            if path.is_symlink():
+                raise ChatPluginError("扩展快照含有符号链接", code="chat_plugin.snapshot_invalid")
+            mode = 0o555 if path.is_dir() else 0o444 | (stat.S_IMODE(path.stat().st_mode) & 0o111)
+            path.chmod(mode)
+        root.chmod(0o555)
+
+    def stage_native_worker(self, workdir: str | Path, *, engine: str, mode: str,
+                            env: dict[str, str], container: Any = None) -> list[str]:
+        """Place ABI-specific Pi/OMP/OpenCode components in the private Worker home."""
+        if mode not in {"ctf", "pentest"} or engine not in {"pi", "omp", "opencode"}:
+            return []
+        from muteki.solver.workspace import workspace_root_for_worker
+
+        records = [record for record in self.enabled(engine, mode)
+                   if any(engine in item.get("engines", []) and item.get("kind") in {"extensions", "agents"}
+                          for item in record.get("components", []))]
+        if not records:
+            return []
+
+        cwd = Path(workdir).resolve()
+        run_root = workspace_root_for_worker(cwd)
+        shared = run_root / ".muteki-extensions" / "packages"
+
+        def host_path(runtime: str) -> Path:
+            path = Path(runtime)
+            if container is None:
+                result = path.resolve()
+            else:
+                from muteki.solver.container_exec import CONTAINER_WORKSPACE
+                from muteki.solver.credential_accounts import CONTAINER_ACCOUNTS_ROOT
+                if path.is_relative_to(CONTAINER_WORKSPACE):
+                    result = (Path(container.host_workspace) /
+                              path.relative_to(CONTAINER_WORKSPACE)).resolve()
+                elif path.is_relative_to(CONTAINER_ACCOUNTS_ROOT) and container.account_root:
+                    # Managed Pi/OMP identities use a private, writable Run
+                    # projection outside the Worker workspace. Never write to
+                    # the operator's source account store.
+                    result = (Path(container.account_root) /
+                              path.relative_to(CONTAINER_ACCOUNTS_ROOT)).resolve()
+                    if not result.is_relative_to(Path(container.account_root).resolve()):
+                        raise ChatPluginError("Worker 原生扩展目录越过当前 Run 的账户投影")
+                else:
+                    raise ChatPluginError("Worker 扩展目录未挂载进容器")
+            if not result.is_relative_to(run_root) and not (
+                container is not None and container.account_root
+                and result.is_relative_to(Path(container.account_root).resolve())
+            ):
+                raise ChatPluginError("Worker 原生扩展只能写入当前 Run 的私有目录")
+            return result
+
+        runtime_home = (env.get("PI_CODING_AGENT_DIR", "") if engine in {"pi", "omp"}
+                        else env.get("XDG_CONFIG_HOME", ""))
+        if not runtime_home:
+            raise ChatPluginError(f"{engine} Worker 缺少原生扩展目录")
+        home = host_path(runtime_home)
+        if engine == "opencode":
+            home /= "opencode"
+        delivered: list[str] = []
+        with self._lock:
+            self._require_run_snapshots_safe(shared)
+            for record in records:
+                package = shared / record["id"] / record["digest"]
+                self._stage_worker_snapshot(record, package)
+                for item in record.get("components", []):
+                    if engine not in item.get("engines", []) or item.get("kind") not in {"extensions", "agents"}:
+                        continue
+                    entry = _contained(package, str(item["path"]))
+                    if not entry.is_file():
+                        raise ChatPluginError(f"Worker 原生组件缺失：{record['id']}/{item['name']}")
+                    if item["kind"] == "agents":
+                        destination = home / "agents" / f"muteki-{record['id']}-{item['name']}.md"
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        _snapshot_copy(entry, destination) if not destination.exists() else None
+                    else:
+                        directory = home / ("plugins" if engine == "opencode" else "extensions")
+                        directory.mkdir(parents=True, exist_ok=True)
+                        suffix = sha256(str(item["path"]).encode()).hexdigest()[:8]
+                        destination = directory / f"muteki-{record['id']}-{item['name']}-{suffix}.js"
+                        runtime_entry = (str(container.to_container_path(str(entry)))
+                                         if container is not None else str(entry))
+                        export = ("export *" if engine == "opencode" else "export { default }")
+                        content = f"{export} from {json.dumps(Path(runtime_entry).as_uri())};\n"
+                        if not destination.exists() or destination.read_text() != content:
+                            destination.write_text(content, encoding="utf-8")
+                    delivered.append(f"{record['id']}:{item['name']}")
+        if container is not None and delivered:
+            from muteki.solver.container_exec import _chown_tree_to_worker
+            _chown_tree_to_worker(str(home), image=container.image)
+        return delivered
+
     def skill_catalog_context(self, engine: str) -> str:
         rows = [row for row in self.skill_rows(engine, include_automatic=True) if not row.get("native_engine")]
         if not rows:
@@ -397,7 +857,7 @@ class ChatPluginService:
                 + json.dumps(catalog, ensure_ascii=False))
 
     def descriptor_tools(self, engine: str) -> list[dict[str, Any]]:
-        return list(self._tools.get(engine + ":" + self.revision(engine), []))
+        return list(self._tools.get(f"chat:{engine}::{self.revision(engine)}", []))
 
     def visualization_root(self, thread_id: str) -> Path:
         root = self.root / "workspaces" / sha256(thread_id.encode()).hexdigest()[:24] / "visualizations"
@@ -535,90 +995,65 @@ class ChatPluginService:
         return {"chat_native_plugins": [{"pluginName": p["name"], "marketplacePath": str(marketplace)} for p in packages],
                 "chat_hook_approvals": approved_hooks}
 
-    def prepare_environment(self, engine: str, identity: str, supplied: dict[str, str]) -> dict[str, str]:
-        """Import only this engine's native config into a private chat home.
-
-        The plugin cache is copied once per engine, shared only among Muteki chat
-        sessions. Credentials override the native snapshot, never the reverse.
-        """
+    def prepare_environment(
+        self, engine: str, identity: str, supplied: dict[str, str], *,
+        previous_revision: str | None = None, include_assets: bool = True,
+    ) -> dict[str, str]:
+        """Reuse one private home per identity and incrementally refresh imports."""
         if engine not in PROVIDERS:
             return supplied
+        from .native_environment import NativeEnvironmentError, environment_home, synchronize
         provider = provider_for(engine)
-        root = self.root / "sessions" / sha256(f"v3:{engine}:{identity}:{self.revision(engine)}".encode()).hexdigest()[:24]
-        home = root / "home"
-        target = home / provider.home_relative
-        source = provider.native_root()
-        root.mkdir(parents=True, exist_ok=True)
-        root.chmod(0o700)
-        with self._lock:
-            if not (root / ".ready").exists():
+        host_discovery = os.environ.get("MUTEKI_HOST_DISCOVERY", "1") != "0"
+        source = provider.native_root() if host_discovery else None
+        names = (*provider.configuration_names, *provider.credential_names,
+                 *(provider.asset_names if include_assets else ()))
+        try:
+            with self._lock, environment_home(self.root, engine, identity, previous_revision) as root:
+                home = root / "home"
+                target = home / provider.home_relative
                 target.mkdir(parents=True, exist_ok=True)
-                names = ("config.toml", "settings.json", "settings.yaml", "settings.yml", "models.json", "models.yml",
-                         "auth.json", ".credentials.json", "credentials.json", "mcp.json", "cli-config.json",
-                         "agent-cli-state.json", "acp-config.json", "opencode.json", "opencode.jsonc",
-                         "skills", "skills-cursor", "commands", "agents", "extensions", "prompts",
-                         "credentials", "oauth", "device_id")
-                def copy(src: Path, dest: Path) -> None:
-                    if not src.exists():
-                        return
-                    if src.is_dir():
-                        shutil.copytree(src, dest, copy_function=_snapshot_copy, dirs_exist_ok=True, symlinks=False, ignore_dangling_symlinks=True,
-                                        ignore=shutil.ignore_patterns(".git", "logs", "__pycache__"))
-                    elif src.is_file():
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(src, dest)
-                        dest.chmod(0o600)
-                for name in names:
-                    copy(source / name, target / name)
-                if (source / "plugins").is_dir():
-                    cache = self.root / "native-cache" / engine / provider.revision() / "plugins"
-                    if not cache.exists():
-                        staging = cache.with_name("plugins-staging")
-                        copy(source / "plugins", staging)
-                        staging.rename(cache)
-                    if not (target / "plugins").exists():
-                        # Registry paths and mutable plugin state are session-local.
-                        # APFS clones share bytes, never directory identity or writes.
-                        copy(cache, target / "plugins")
-                # Common skills are shared by the native engines themselves.
-                copy(Path.home() / ".agents" / "skills", home / ".agents" / "skills")
-                if engine == "claude":
-                    copy(Path.home() / ".claude.json", home / ".claude.json")
-                if engine == "opencode":
-                    copy(Path.home() / ".local/share/opencode/auth.json", root / "data/opencode/auth.json")
-                credential_root = Path(supplied.get(provider.home_variable) or str(source)).expanduser()
-                if engine == "opencode":
-                    credential_root = credential_root / "opencode" if provider.home_variable in supplied else source
-                if credential_root.resolve() != source.resolve():
-                    for name in names:
-                        copy(credential_root / name, target / name)
-                # Registry/config paths into the imported engine home must point
-                # at its Muteki copy. External user paths stay read-only inputs.
-                for path in target.rglob("*"):
-                    if path.is_file() and path.suffix in {".json", ".toml", ".yaml", ".yml", ".jsonc"} and path.stat().st_size < 2_000_000:
-                        try:
-                            value = path.read_text()
-                            replaced = value.replace(str(source), str(target))
-                            if replaced != value:
-                                path.write_text(replaced)
-                        except (OSError, UnicodeError):
-                            pass
-                for record in self.enabled(engine):
-                    install_native_components(record, engine, target)
-                (root / ".ready").touch()
-            # Account material may be refreshed without changing its identity.
-            # Re-copy only generated account configuration into the private home.
-            account_root = supplied.get(provider.home_variable)
-            if account_root:
-                account_source = Path(account_root).expanduser()
-                if engine == "opencode":
-                    account_source = account_source / "opencode"
-                if account_source.resolve() != source.resolve():
-                    for name in ("auth.json", ".credentials.json", "config.toml", "models.json", "models.yml", "settings.json"):
-                        src = account_source / name
-                        if src.is_file():
-                            shutil.copy2(src, target / name)
-                            (target / name).chmod(0o600)
+                imports = [(source / name, Path("home") / provider.home_relative / name) for name in names] if source is not None else []
+                if include_assets and host_discovery:
+                    imports.append((Path.home() / ".agents/skills", Path("home/.agents/skills")))
+                if engine == "claude" and host_discovery:
+                    imports.append((Path.home() / ".claude.json", Path("home/.claude.json")))
+                if engine == "opencode" and host_discovery:
+                    imports.append((Path.home() / ".local/share/opencode/auth.json", Path("data/opencode/auth.json")))
+                account = supplied.get(provider.home_variable)
+                if account:
+                    account_source = Path(account).expanduser()
+                    if engine == "opencode":
+                        account_source /= "opencode"
+                    if source is None or account_source.resolve() != source.resolve():
+                        # Generated accounts override configuration/auth only;
+                        # never import a second copy of all host capability assets.
+                        overrides = [(account_source / name, Path("home") / provider.home_relative / name)
+                                     for name in (*provider.configuration_names, *provider.credential_names)
+                                     if (account_source / name).exists()]
+                        replaced = {destination for _, destination in overrides}
+                        imports = [(src, dst) for src, dst in imports if dst not in replaced] + overrides
+                revision = self.revision(engine) if include_assets else "probe"
+                ready = root / ".ready"
+                # Stage generated components as tracked imports too, so disabling
+                # a package removes only its generated files, not native history.
+                with tempfile.TemporaryDirectory(prefix=".components-", dir=root) as stage:
+                    if include_assets:
+                        for record in self.enabled(engine):
+                            install_native_components(record, engine, Path(stage))
+                    imports.append((Path(stage), Path("home") / provider.home_relative))
+                    remappings = ((str(source), str(target)),) if source is not None else ()
+                    synchronize(root, imports, _snapshot_copy, remappings)
+                if ready.exists() and ready.read_text() != revision:
+                    native_packages = root / "native-packages"
+                    if native_packages.is_symlink():
+                        raise NativeEnvironmentError("Native package directory is a symlink")
+                    if native_packages.exists():
+                        shutil.rmtree(native_packages)
+                ready.write_text(revision)
+        except (NativeEnvironmentError, OSError, sqlite3.Error, ValueError) as exc:
+            raise ChatPluginError(f"Native environment preparation failed: {exc}",
+                                  code="chat_plugin.environment_prepare_failed") from exc
         env = dict(supplied)
         env.update({"HOME": str(home), "USERPROFILE": str(home), provider.home_variable: str(target),
                     "XDG_DATA_HOME": str(root / "data"), "XDG_CACHE_HOME": str(root / "cache"),
@@ -637,69 +1072,204 @@ class ChatPluginService:
             env["OPENCODE_CONFIG_DIR"] = str(target)
         return env
 
-    async def prepare_tools(self, engine: str) -> list[dict[str, Any]]:
-        async with self._prepare_locks.setdefault(engine, asyncio.Lock()):
-            return await self._prepare_tools(engine)
+    def release_thread_assets(self, thread_id: str) -> int:
+        """Called after successful close when archiving a chat. Keep its history."""
+        from .native_environment import environment_home, evict_imports
+        index = self.root / "environments.sqlite3"
+        if not index.exists():
+            return 0
+        with closing(sqlite3.connect(index, timeout=60)) as conn:
+            prefix = thread_id + ":"
+            rows = conn.execute("SELECT engine, owner FROM homes WHERE substr(owner,1,?)=?",
+                                (len(prefix), prefix)).fetchall()
+        removed = 0
+        for engine, identity in rows:
+            provider = provider_for(engine)
+            prefixes = tuple((Path("home") / provider.home_relative / name).as_posix()
+                             for name in provider.asset_names) + ("home/.agents/skills",)
+            with self._lock, environment_home(self.root, engine, identity) as root:
+                removed += evict_imports(root, prefixes)
+        return removed
 
-    async def _prepare_tools(self, engine: str) -> list[dict[str, Any]]:
-        key = engine + ":" + self.revision(engine)
-        if key in self._tools:
-            return self._tools[key]
+
+    async def prepare_tools(self, engine: str, mode: str = "chat", scope: str = "") -> list[dict[str, Any]]:
+        cache_key = f"{mode}:{engine}:{scope}:{self.revision(engine, mode)}"
+        async with self._prepare_locks.setdefault(cache_key, asyncio.Lock()):
+            return await self._prepare_tools(engine, mode, scope)
+
+    async def _discover_mcp_server(self, engine: str, mode: str, scope: str,
+                                   record: dict[str, Any], server: str,
+                                   config: dict[str, Any]) -> list[dict[str, Any]]:
+        worker = self.worker(engine, record, server, config, scope=scope if mode != "chat" else "")
+        await worker.wait_ready()
+        result = await worker.request("list_tools", {}) if "tools" in worker.capabilities else None
+        label = re.sub(r"[^a-zA-Z0-9_]", "_", record["id"])[:8]
+        prefix = (("chat_" if mode == "chat" else "work_") + label + "_"
+                  + sha256(f"{mode}:{engine}:{record['id']}:{record['digest']}:{server}".encode()).hexdigest()[:8] + "_")
         tools = []
-        for record in self.enabled(engine):
+        for tool in result.tools if result else []:
+            suffix = re.sub(r"[^a-zA-Z0-9_-]", "_", tool.name)[:12] + "_" + sha256(tool.name.encode()).hexdigest()[:6]
+            tools.append({"name": prefix + suffix, "description": f"[Muteki {record['name']} / {server}] {tool.description or tool.name}",
+                          "input_schema": tool.inputSchema, "_package": record["id"], "_server": server,
+                          "_tool": tool.name, "_digest": record["digest"]})
+        for capability, methods in {"resources": ("list_resources", "list_resource_templates", "read_resource"),
+                                    "prompts": ("list_prompts", "get_prompt")}.items():
+            if capability not in worker.capabilities:
+                continue
+            for method in methods:
+                schema = {"type": "object", "properties": {}, "additionalProperties": False}
+                if method == "read_resource":
+                    schema.update(properties={"uri": {"type": "string"}}, required=["uri"])
+                elif method == "get_prompt":
+                    schema.update(properties={"name": {"type": "string"}, "arguments": {"type": "object", "additionalProperties": {"type": "string"}}}, required=["name"])
+                else:
+                    schema["properties"] = {"cursor": {"type": "string"}}
+                tools.append({"name": prefix + method, "description": f"[Muteki {record['name']} / {server}] MCP {method}",
+                              "input_schema": schema, "_package": record["id"], "_server": server,
+                              "_tool": method, "_method": method, "_digest": record["digest"]})
+        return tools
+
+    async def _prepare_tools(self, engine: str, mode: str = "chat", scope: str = "") -> list[dict[str, Any]]:
+        key = f"{mode}:{engine}:{scope}:{self.revision(engine, mode)}"
+        selected = [(record, server, config) for record in self.enabled(engine, mode)
+                    for server, config in record["mcp"].items() if not config.get("disabled")]
+        server_tools: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        failures: list[dict[str, str]] = []
+        pending: dict[asyncio.Task, tuple[dict[str, Any], str, tuple[str, str, str]]] = {}
+        async def discover(record: dict[str, Any], server: str, config: dict[str, Any]):
+            return await self._discover_mcp_server(engine, mode, scope, record, server, config)
+
+        def failed(record: dict[str, Any], server: str, cause: str, cause_code: str) -> None:
+            # Never expose transport text: headers and environment may contain credentials.
+            if mode == "chat":
+                self._diagnostics[record["id"]] = f"MCP {server} 连接失败，请检查配置与运行环境"
+            failures.append({"package": record["id"], "server": server,
+                             "code": "worker_mcp.connection_failed", "cause": cause,
+                             "cause_code": cause_code})
+
+        now = time.monotonic()
+        for record, server, config in selected:
+            identity = (key, record["id"], server)
+            health = self._mcp_health.get(identity, {})
+            worker_key = f"{record['id']}:{record['digest']}:{server}" + (f"|{scope}" if mode != "chat" and scope else "")
+            worker = self._workers.get(worker_key)
+            if health.get("status") == "connected" and worker is not None and not worker.task.done():
+                server_tools[identity] = self._mcp_server_tools.get(identity, [])
+            elif health.get("status") == "failed" and now < float(health.get("retry_after", 0)):
+                failed(record, server, str(health.get("cause") or "ConnectionError"),
+                       str(health.get("cause_code") or "worker_mcp.connection_failed"))
+            else:
+                task = asyncio.create_task(discover(record, server, config))
+                pending[task] = (record, server, identity)
+        if pending:
+            # All servers are probed concurrently, with one deadline for the
+            # catalog. A broken endpoint cannot serialize startup or hold it
+            # for 25 seconds per server. It is retried on a later catalog read.
+            done, waiting = await asyncio.wait(pending, timeout=12)
+            for task in waiting:
+                task.cancel()
+            if waiting:
+                await asyncio.gather(*waiting, return_exceptions=True)
+            for task in done:
+                record, server, identity = pending[task]
+                try:
+                    result = task.result()
+                except Exception as exc:
+                    cause = type(exc).__name__
+                    cause_code = (exc.code if isinstance(exc, ChatPluginError)
+                                  else "worker_mcp.connection_failed")
+                    self._mcp_health[identity] = {"status": "failed", "cause": cause,
+                                                  "cause_code": cause_code,
+                                                  "retry_after": time.monotonic() + 15,
+                                                  "observed_at": datetime.now(timezone.utc).isoformat()}
+                    failed(record, server, cause, cause_code)
+                else:
+                    self._mcp_server_tools[identity] = result
+                    self._mcp_health[identity] = {"status": "connected",
+                                                  "observed_at": datetime.now(timezone.utc).isoformat()}
+                    server_tools[identity] = result
+            for task in waiting:
+                record, server, identity = pending[task]
+                self._mcp_health[identity] = {"status": "failed", "cause": "TimeoutError",
+                                              "cause_code": "worker_mcp.startup_timeout",
+                                              "retry_after": time.monotonic() + 15,
+                                              "observed_at": datetime.now(timezone.utc).isoformat()}
+                failed(record, server, "TimeoutError", "worker_mcp.startup_timeout")
+        tools = [tool for record, server, _ in selected
+                 for tool in server_tools.get((key, record["id"], server), [])]
+        self._tools[key] = tools
+        self._mcp_connection_errors[key] = failures
+        if mode == "chat":
+            failed_packages = {item["package"] for item in failures}
+            for record, _, _ in selected:
+                if record["id"] not in failed_packages:
+                    self._diagnostics.pop(record["id"], None)
+            self._verified_tools[engine] = {name for tool in tools for name in
+                (tool["name"], tool["_tool"], f"mcp__{tool['_server']}__{tool['_tool']}", f"{tool['_server']}.{tool['_tool']}")}
+        return tools
+
+    def runtime_mcp_health(self, engine: str, mode: str, scope: str) -> list[dict[str, Any]]:
+        """Observed Run connections; a configured server is not a live connection."""
+        key = f"{mode}:{engine}:{scope}:{self.revision(engine, mode)}"
+        rows = []
+        for record in self.enabled(engine, mode):
             for server, config in record["mcp"].items():
                 if config.get("disabled"):
                     continue
-                label = re.sub(r"[^a-zA-Z0-9_]", "_", record["id"])[:8]
-                prefix = "chat_" + label + "_" + sha256(f"{engine}:{record['id']}:{record['digest']}:{server}".encode()).hexdigest()[:8] + "_"
-                try:
-                    worker = self.worker(engine, record, server, config)
-                    await worker.wait_ready()
-                    result = await worker.request("list_tools", {}) if "tools" in worker.capabilities else None
-                    for tool in result.tools if result else []:
-                        suffix = re.sub(r"[^a-zA-Z0-9_-]", "_", tool.name)[:12] + "_" + sha256(tool.name.encode()).hexdigest()[:6]
-                        tools.append({"name": prefix + suffix, "description": f"[Muteki {record['name']} / {server}] {tool.description or tool.name}",
-                                      "input_schema": tool.inputSchema, "_package": record["id"], "_server": server,
-                                      "_tool": tool.name, "_digest": record["digest"]})
-                    for capability, methods in {"resources": ("list_resources", "list_resource_templates", "read_resource"),
-                                                "prompts": ("list_prompts", "get_prompt")}.items():
-                        if capability not in worker.capabilities:
-                            continue
-                        for method in methods:
-                            schema = {"type": "object", "properties": {}, "additionalProperties": False}
-                            if method == "read_resource":
-                                schema.update(properties={"uri": {"type": "string"}}, required=["uri"])
-                            elif method == "get_prompt":
-                                schema.update(properties={"name": {"type": "string"}, "arguments": {"type": "object", "additionalProperties": {"type": "string"}}}, required=["name"])
-                            else:
-                                schema["properties"] = {"cursor": {"type": "string"}}
-                            tools.append({"name": prefix + method, "description": f"[Muteki {record['name']} / {server}] MCP {method}",
-                                          "input_schema": schema, "_package": record["id"], "_server": server,
-                                          "_tool": method, "_method": method, "_digest": record["digest"]})
-                    self._diagnostics.pop(record["id"], None)
-                except Exception:
-                    # Raw transport errors can include env/header credentials.
-                    self._diagnostics[record["id"]] = f"MCP {server} 连接失败，请检查配置与运行环境"
-        self._tools[key] = tools
-        self._verified_tools[engine] = {name for tool in tools for name in
-            (tool["name"], tool["_tool"], f"mcp__{tool['_server']}__{tool['_tool']}", f"{tool['_server']}.{tool['_tool']}")}
-        return tools
+                identity = (key, record["id"], server)
+                health = self._mcp_health.get(identity, {})
+                worker_key = f"{record['id']}:{record['digest']}:{server}" + (f"|{scope}" if mode != "chat" and scope else "")
+                worker = self._workers.get(worker_key)
+                status = str(health.get("status") or "not_checked")
+                if status == "connected" and (worker is None or worker.task.done()):
+                    status = "disconnected"
+                rows.append({"package_id": record["id"], "server": server, "status": status,
+                             "observed_at": health.get("observed_at")})
+        return rows
 
     async def invalidate(self) -> None:
         self._tools.clear()
+        self._mcp_connection_errors.clear()
+        self._mcp_server_tools.clear()
+        self._mcp_health.clear()
+        self._prepare_locks.clear()
         self._verified_tools.clear()
         active = {f"{r['id']}:{r['digest']}:{server}"
                   for r in self.records() if r.get("enabled", True) for server in r["mcp"]}
-        removed = [self._workers.pop(key) for key in list(self._workers) if key not in active]
+        removed = [self._workers.pop(key) for key in list(self._workers)
+                   if key.split("|", 1)[0] not in active]
         for worker in removed:
             worker.task.cancel()
         await asyncio.gather(*(w.task for w in removed), return_exceptions=True)
         self._diagnostics.clear()
 
-    def worker(self, engine: str, record: dict[str, Any], server: str, config: dict[str, Any]) -> McpWorker:
-        # Managed installations are global to Muteki chat. Reuse one connection
-        # and private data directory; engine-scoped descriptors still gate calls.
-        key = f"{record['id']}:{record['digest']}:{server}"
+    async def release_scope(self, scope: str) -> None:
+        """Stop MCP processes owned by a finished Run."""
+        if not scope:
+            return
+        for cache in (self._tools, self._prepare_locks, self._mcp_connection_errors):
+            for key in list(cache):
+                if len(parts := key.split(":", 3)) == 4 and parts[2] == scope:
+                    cache.pop(key, None)
+        for cache in (self._mcp_server_tools, self._mcp_health):
+            for identity in list(cache):
+                if len(parts := identity[0].split(":", 3)) == 4 and parts[2] == scope:
+                    cache.pop(identity, None)
+        removed = [self._workers.pop(key) for key in list(self._workers)
+                   if key.endswith("|" + scope)]
+        for worker in removed:
+            worker.task.cancel()
+        await asyncio.gather(*(worker.task for worker in removed), return_exceptions=True)
+
+    def mcp_connection_errors(self, engine: str, mode: str, scope: str) -> list[dict[str, str]]:
+        key = f"{mode}:{engine}:{scope}:{self.revision(engine, mode)}"
+        return list(self._mcp_connection_errors.get(key, []))
+
+    def worker(self, engine: str, record: dict[str, Any], server: str, config: dict[str, Any],
+               *, scope: str = "") -> McpWorker:
+        # Chat keeps its existing connection. Worker MCP processes are scoped to
+        # one Run so mutable server state cannot cross engagement boundaries.
+        key = f"{record['id']}:{record['digest']}:{server}" + (f"|{scope}" if scope else "")
         worker = self._workers.get(key)
         if worker is None or worker.task.done():
             state = self.root / "mcp-state" / sha256(key.encode()).hexdigest()[:24]
@@ -707,14 +1277,17 @@ class ChatPluginService:
             self._workers[key] = worker
         return worker
 
-    async def invoke(self, engine: str, name: str, arguments: dict[str, Any]) -> Any:
-        tool = next((t for t in await self.prepare_tools(engine) if t["name"] == name), None)
+    async def invoke(self, engine: str, name: str, arguments: dict[str, Any],
+                     *, mode: str = "chat", scope: str = "") -> Any:
+        tool = next((t for t in await self.prepare_tools(engine, mode, scope) if t["name"] == name), None)
         if not tool:
             raise ChatPluginError("当前 Agent 未启用该工具，或插件已停用")
         record = self.get(tool["_package"])
-        if not record or not record.get("enabled", True) or engine not in record["engines"] or record["digest"] != tool["_digest"]:
-            raise ChatPluginError("插件版本已变化，请重新加载聊天能力")
-        result = await self.worker(engine, record, tool["_server"], record["mcp"][tool["_server"]]).request(
+        if (not record or not record.get("enabled", True) or mode not in record.get("modes", ["chat"])
+                or engine not in record["engines"] or record["digest"] != tool["_digest"]):
+            raise ChatPluginError("插件版本或使用范围已变化，请重新读取工具目录")
+        result = await self.worker(engine, record, tool["_server"], record["mcp"][tool["_server"]],
+                                   scope=scope if mode != "chat" else "").request(
             tool.get("_method", "call_tool"), arguments if tool.get("_method") else {"name": tool["_tool"], "arguments": arguments})
         return result.model_dump(mode="json", by_alias=True)
 
@@ -740,7 +1313,7 @@ class McpWorker:
         except asyncio.TimeoutError:
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
-            raise ChatPluginError("MCP 启动超时") from None
+            raise ChatPluginError("MCP 启动超时", code="worker_mcp.startup_timeout") from None
 
     async def request(self, method: str, params: dict[str, Any]) -> Any:
         await self.wait_ready()
@@ -749,12 +1322,14 @@ class McpWorker:
         return await asyncio.wait_for(future, 90)
 
     async def run(self, config: dict[str, Any], package: Path, state: Path) -> None:
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
-        from mcp.client.sse import sse_client
-        from mcp.client.streamable_http import streamablehttp_client
         current = None
+        stage = "import"
         try:
+            from mcp import ClientSession, StdioServerParameters
+            from mcp.client.stdio import stdio_client
+            from mcp.client.sse import sse_client
+            from mcp.client.streamable_http import streamablehttp_client
+            stage = "state"
             state.mkdir(parents=True, exist_ok=True)
             state.chmod(0o700)
             def render(value: str) -> str:
@@ -767,19 +1342,28 @@ class McpWorker:
                     env.update({k: render(str(v)) for k, v in config.get("env", {}).items()})
                     env.update({"HOME": str(state), "TMPDIR": str(state), "XDG_CONFIG_HOME": str(state / "config"), "XDG_CACHE_HOME": str(state / "cache")})
                     argv = [render(config["command"]), *[render(v) for v in config.get("args", [])]]
+                    stage = "isolation"
                     command = isolated_mcp_command(argv, package, state, env, bool(config.get("network")))
-                    errlog = stack.enter_context(open(os.devnull, "w"))
+                    # Preserve the complete server/sandbox stderr in a private
+                    # artifact. It may contain credentials, so only a typed
+                    # reason is returned to Workers and the management UI.
+                    fd = os.open(state / "mcp-stderr.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                    errlog = stack.enter_context(os.fdopen(fd, "w", encoding="utf-8"))
+                    stage = "connect"
                     read, write = await stack.enter_async_context(stdio_client(StdioServerParameters(
                         command=command[0], args=command[1:], env=env, cwd=str(state)), errlog=errlog))
                 else:
+                    stage = "connect"
                     if str(config.get("type") or config.get("transport") or "").lower() == "sse":
                         read, write = await stack.enter_async_context(sse_client(config["url"], headers=config.get("headers")))
                     else:
                         read, write, _ = await stack.enter_async_context(streamablehttp_client(config["url"], headers=config.get("headers")))
                 session = await stack.enter_async_context(ClientSession(read, write))
+                stage = "initialize"
                 initialized = await session.initialize()
                 self.capabilities = initialized.capabilities.model_dump(exclude_none=True)
                 self.ready.set_result(True)
+                stage = "running"
                 while True:
                     method, params, current = await self.queue.get()
                     if current.cancelled():
@@ -788,16 +1372,30 @@ class McpWorker:
                         value = await getattr(session, method)(**params)
                         if not current.done():
                             current.set_result(value)
-                    except Exception:
+                    except Exception as exc:
+                        _log.warning("MCP request failed state=%s error_type=%s", state.name, type(exc).__name__)
                         if not current.done():
-                            current.set_exception(ChatPluginError("MCP 工具请求失败"))
-        except BaseException:
+                            current.set_exception(ChatPluginError("MCP 工具请求失败", code="worker_mcp.request_failed"))
+        except BaseException as exc:
+            if not isinstance(exc, asyncio.CancelledError):
+                _log.warning("MCP process failed state=%s stage=%s error_type=%s stderr=%s",
+                             state.name, stage, type(exc).__name__, state / "mcp-stderr.log")
             if not self.ready.done():
-                self.ready.set_exception(ChatPluginError("MCP 服务启动失败"))
+                if isinstance(exc, asyncio.CancelledError):
+                    code = "worker_mcp.cancelled"
+                elif stage == "isolation" and isinstance(exc, IsolationUnavailable):
+                    code = "worker_mcp.isolation_unavailable"
+                else:
+                    code = {"import": "worker_mcp.sdk_unavailable",
+                            "state": "worker_mcp.state_unavailable",
+                            "isolation": "worker_mcp.isolation_failed",
+                            "connect": "worker_mcp.launch_failed",
+                            "initialize": "worker_mcp.protocol_failed"}.get(stage, "worker_mcp.disconnected")
+                self.ready.set_exception(ChatPluginError("MCP 服务启动失败", code=code))
         finally:
             if current is not None and not current.done():
-                current.set_exception(ChatPluginError("MCP 服务已停止"))
+                current.set_exception(ChatPluginError("MCP 服务已停止", code="worker_mcp.disconnected"))
             while not self.queue.empty():
                 _, _, future = self.queue.get_nowait()
                 if not future.done():
-                    future.set_exception(ChatPluginError("MCP 服务已停止"))
+                    future.set_exception(ChatPluginError("MCP 服务已停止", code="worker_mcp.disconnected"))

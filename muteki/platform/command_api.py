@@ -34,6 +34,7 @@ from muteki.platform.command_handlers.base import (
     HandlerRegistry,
     PolicyDenied,
     QueryHandler,
+    SideEffectResult,
     correlation_id_of,
     make_error,
 )
@@ -55,6 +56,8 @@ from muteki.platform.contracts.commands import (
     WaitResult,
 )
 from muteki.platform.contracts.errors import ErrorCategory
+from muteki.platform.contracts.errors import ErrorEnvelope
+from muteki.platform.contracts.events import EventEnvelope
 from muteki.platform.contracts.receipts import (
     AggregateRef,
     CommandReceipt,
@@ -101,6 +104,7 @@ class MutekiCommandApiImpl:
         self._max_wait_seconds = float(max_wait_seconds)
         self._services = dict(services or {})
         self._outbox = OutboxManager(store)
+        self._acknowledged_effects: dict[str, dict[str, Any]] = {}
 
     @classmethod
     def with_builtin_handlers(
@@ -193,6 +197,10 @@ class MutekiCommandApiImpl:
                            ErrorCategory.CONFLICT, correlation_id=correlation_id,
                            recovery_hint="use a new command_id for changed content"))
         if prior is not None:
+            if prior.state is ReceiptState.ACCEPTED:
+                result = self._store.effect_result(prior.command_id) or self._acknowledged_effects.get(prior.command_id)
+                if result is not None:
+                    return self._finish_effect(prior.command_id, result, prior.event_cursor, prior.run_id)
             return prior
 
         # 3. Handler plan（无副作用地产生事件与 accepted 回执）
@@ -214,33 +222,40 @@ class MutekiCommandApiImpl:
                            ErrorCategory.INTERNAL, correlation_id=correlation_id))
 
         # 4. 持久化 accepted 回执（并发竞态下的第二次去重）
-        stored = self._store.record_command(command, plan.receipt)
-        if stored.deduplicated:
-            return stored
-
-        # 5. 带 expected_version 追加领域事件（乐观并发统一判定）
+        scope = self._scope_of(command.actor, binding)
+        run_id = plan.receipt.run_id
         try:
-            events = self._store.append_events(
-                plan.events, expected_version=command.expected_version)
+            with self._store.transaction():
+                stored = self._store.record_command(command, plan.receipt)
+                if stored.deduplicated:
+                    return stored
+                if plan.local_commit is not None:
+                    plan.local_commit()
+                events = self._store.append_events(
+                    plan.events, expected_version=command.expected_version)
+                last = events[-1]
+                cursor = self._cursor(
+                    last.aggregate_type, last.aggregate_id, last.stream_seq, scope)
+                if plan.side_effect is None:
+                    return self._store.update_receipt_state(
+                        command.command_id, ReceiptState.COMPLETED,
+                        event_cursor=cursor, run_id=run_id)
         except OptimisticConcurrencyError as exc:
             error = make_error(
                 "command.version_conflict", str(exc), ErrorCategory.CONFLICT,
                 correlation_id=correlation_id,
                 recovery_hint="refresh snapshot and retry with the current version")
-            return self._store.update_receipt_state(
-                command.command_id, ReceiptState.CONFLICT, error=error)
-
-        scope = self._scope_of(command.actor, binding)
-        last = events[-1]
-        cursor = self._cursor(
-            last.aggregate_type, last.aggregate_id, last.stream_seq, scope)
-        run_id = plan.receipt.run_id
+            return self._persist_terminal(command, ReceiptState.CONFLICT, error)
+        except CommandFailed as exc:
+            return self._persist_terminal(command, exc.state, exc.error)
+        except Exception as exc:
+            LOG.exception("command local commit failed: %s", command.command_type)
+            return self._persist_terminal(
+                command, ReceiptState.FAILED,
+                make_error("command.local_commit_failed", f"{type(exc).__name__}: {exc}",
+                           ErrorCategory.INTERNAL, correlation_id=correlation_id))
 
         # 6. 事务提交后的外部副作用（可写 outbox 供重启恢复）
-        if plan.side_effect is None:
-            return self._store.update_receipt_state(
-                command.command_id, ReceiptState.COMPLETED,
-                event_cursor=cursor, run_id=run_id)
         outbox_record: Optional[OutboxRecord] = None
         if plan.outbox_destination:
             outbox_record, _ = self._outbox.enqueue(OutboxRecord(
@@ -261,22 +276,60 @@ class MutekiCommandApiImpl:
                 "command.side_effect_failed", f"{type(exc).__name__}: {exc}",
                 ErrorCategory.INTERNAL, correlation_id=correlation_id,
                 retryable=True)
-            return self._store.update_receipt_state(
-                command.command_id, ReceiptState.FAILED, error=error,
-                event_cursor=cursor, run_id=run_id)
+            result = SideEffectResult(error=error, state=ReceiptState.FAILED)
 
-        # 7. 副作用结果事件 + 终态回执
-        if result.events:
-            self._store.append_events(result.events)
-        if outbox_record is not None:
-            if result.error is None:
-                self._outbox.mark_delivered(outbox_record.outbox_id)
+        # Journal the confirmed result before applying the read model. Recovery
+        # replays this result, never the already acknowledged external effect.
+        effect_events = result.events + (plan.failure_events if result.error and not result.error.detail.get("delivery_unknown") else [])
+        effect = {"events": [event.model_dump(mode="json") for event in effect_events],
+                  "state": result.state.value,
+                  "error": result.error.model_dump(mode="json") if result.error else None,
+                  "output": result.output, "event_cursor": cursor, "run_id": run_id,
+                  "outbox_id": outbox_record.outbox_id if outbox_record else None}
+        self._acknowledged_effects[command.command_id] = effect
+        try:
+            self._store.save_effect_result(command.command_id, effect)
+            receipt = self._finish_effect(command.command_id, effect, cursor, run_id)
+        except Exception as exc:
+            LOG.exception("acknowledged command result needs recovery: %s", command.command_id)
+            return stored.model_copy(update={"error": make_error(
+                "command.result_pending", f"{type(exc).__name__}: {exc}",
+                ErrorCategory.STATE, correlation_id=correlation_id, retryable=True,
+                recovery_hint="Recover this command_id; do not send a new control decision").model_copy(update={"detail": {
+                    "outcome_unknown": True, "effect_acknowledged": True,
+                    "command_id": command.command_id,
+                }}),
+                "event_cursor": cursor, "run_id": run_id})
+        return receipt
+
+    def _finish_effect(self, command_id: str, effect: dict[str, Any],
+                       cursor: Optional[str], run_id: Optional[str]) -> CommandReceipt:
+        with self._store.transaction():
+            current = self._store.get_receipt(command_id)
+            if current is not None and current.state is not ReceiptState.ACCEPTED:
+                receipt = current.model_copy(update={"deduplicated": True})
             else:
-                self._outbox.mark_failed(
-                    outbox_record.outbox_id, result.error.message)
-        return self._store.update_receipt_state(
-            command.command_id, result.state, error=result.error,
-            event_cursor=cursor, run_id=run_id, output=result.output)
+                events = [EventEnvelope.model_validate(row) for row in effect["events"]]
+                if events:
+                    self._store.append_events(events)
+                receipt = self._store.update_receipt_state(
+                    command_id, ReceiptState(effect["state"]),
+                    error=ErrorEnvelope.model_validate(effect["error"]) if effect["error"] else None,
+                    event_cursor=effect.get("event_cursor") or cursor,
+                    run_id=effect.get("run_id") or run_id, output=effect["output"])
+            # Complete the delivery journal in the same transaction on both
+            # normal finalization and replay of an acknowledged effect.
+            records = ([self._outbox.get(effect["outbox_id"])] if effect.get("outbox_id")
+                       else self._outbox.for_command(command_id) if "outbox_id" not in effect else [])
+            for record in records:
+                if record is None:
+                    continue
+                if effect["error"] is None:
+                    self._outbox.mark_delivered(record.outbox_id)
+                elif record.status.value in {"pending", "processing"}:
+                    self._outbox.mark_failed(record.outbox_id, effect["error"]["message"])
+        self._acknowledged_effects.pop(command_id, None)
+        return receipt
 
     def _persist_terminal(
         self, command: CommandEnvelope, state: ReceiptState, error: Any
@@ -310,6 +363,11 @@ class MutekiCommandApiImpl:
                 f"no receipt for command {command_id!r}",
                 ErrorCategory.NOT_FOUND,
                 correlation_id=command_id))
+        if receipt.state is ReceiptState.ACCEPTED:
+            effect = self._store.effect_result(command_id) or self._acknowledged_effects.get(command_id)
+            if effect is not None:
+                self._store.save_effect_result(command_id, effect)
+                return self._finish_effect(command_id, effect, receipt.event_cursor, receipt.run_id)
         return receipt
 
     # -- query --------------------------------------------------------------------

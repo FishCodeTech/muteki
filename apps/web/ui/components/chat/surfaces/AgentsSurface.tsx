@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo } from "react";
-import { useRouter } from "next/navigation";
+import { useConversationNavigation } from "@/components/conversation/ConversationNavigation";
 import { cn } from "@/lib/cn";
 import { Icon } from "@/components/Icon";
 import { Button, EmptyState, ScrollArea, Spinner, StatusDot, type Tone } from "@/components/chat/ui";
@@ -14,7 +14,7 @@ import {
   isShellLikeTool,
   type ConversationAgentNodeView,
 } from "@/components/conversation/conversationAgentTree";
-import { SurfaceToolbar } from "./shared";
+import { SurfaceToolbar, openExecutionLog } from "./shared";
 
 function agentTone(status: string): Tone {
   if (status === "running") return "running";
@@ -25,7 +25,7 @@ function agentTone(status: string): Tone {
 }
 
 export function AgentsSurface({ view, events, tools, onOpenDetails }: SurfaceProps) {
-  const router = useRouter();
+  const { router } = useConversationNavigation();
   const tree = useMemo(() => buildConversationAgentTree(events, view), [events, view]);
   const shellCount = tools.filter(isShellLikeTool).length;
 
@@ -147,7 +147,7 @@ export function AgentsSurface({ view, events, tools, onOpenDetails }: SurfacePro
               </span>
             )}
             action={shellCount > 0 ? (
-              <span className="text-[12px] text-cx-fg-4" data-testid="agents-shell-note">已忽略 {shellCount} 条 shell/命令工具（见执行日志）</span>
+              <Button size="sm" variant="ghost" onClick={openExecutionLog} data-testid="agents-shell-note">查看 {shellCount} 条命令工具的 Agent 执行日志</Button>
             ) : undefined}
           />
         </div>

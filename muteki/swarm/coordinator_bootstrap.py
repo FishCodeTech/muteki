@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import time
 from functools import partial
 
@@ -14,10 +16,13 @@ from muteki.swarm.coordinator_state import (
     running_engines as scheduler_running_engines,
     stop_for_budget as scheduler_stop_for_budget,
 )
+from muteki.swarm.coordinator_worker_reap import _record_worker_dispatch_failure
 from muteki.swarm.swarm_support import (
     ControlShutdownIncomplete,
     SwarmOutcome,
     WorkerBudgetExhausted,
+    WorkerDispatchFailureLimit,
+    WorkerRuntimeUnavailable,
     WorkerSpawnRejected,
 )
 
@@ -68,29 +73,79 @@ async def start_coordinator(
     try:
         pentest_contract = getattr(self.challenge, "pentest_contract", None)
         if pentest_contract is not None and self.shared_graph is not None:
+            payload = pentest_contract.model_dump(mode="json")
+            contract_digest = hashlib.sha256(json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()[:16]
             self.shared_graph._append(
                 "pentest_contract", "operator",
-                pentest_contract.model_dump(mode="json"),
+                payload,
                 verified=True,
-                dedupe_key=f"pentest-contract::{self.challenge.id}::{pentest_contract.version}",
+                # A resumed Run may return to an earlier contract.  Deduping
+                # only by its content leaves the intervening contract as the
+                # latest graph event, so reports read the wrong goal.
+                dedupe_key=(
+                    f"pentest-contract::{self.challenge.id}::"
+                    f"g{self._execution_generation}::{pentest_contract.version}::{contract_digest}"
+                ),
             )
     except BaseException:
         await abort_preloop()
         raise
+    async def fail_budget_preflight(code: str, detail: str) -> SwarmOutcome:
+        self._runtime_failure_code = code
+        self._runtime_failure_phase = "worker_preflight"
+        self._runtime_failure_detail = detail
+        await self._emit_coord_bb(code, code=code, detail=detail)
+        if state.hitl_task is not None:
+            state.hitl_task.cancel()
+            await asyncio.gather(state.hitl_task, return_exceptions=True)
+        await self._finalize_coordinator_run(
+            winner=None, flag=None, goal_complete=False,
+            per_solver=state.per_solver,
+        )
+        return SwarmOutcome(False, None, None, state.per_solver, "runtime_failure")
+
+    if (self.cost_budget_usd is not None and self.cost is not None
+            and self.cost.snapshot()["unpriced_calls"]):
+        return await fail_budget_preflight(
+            "budget_coverage_incomplete",
+            "该 Run 已有未定价用量，无法执行完整美元预算；请取消美元预算或新建 Run"
+        )
+    if self.cost_budget_usd is not None:
+        metered_models = [("planner", self.reason_model)]
+        if self.llm is not None:
+            metered_models.append(("titler", self.titler_model))
+        unpriced_models = [
+            f"{role}: {model}"
+            for role, model in metered_models
+            if self.cost is None or self.cost.price_for(model) is None
+        ]
+        if unpriced_models:
+            return await fail_budget_preflight(
+                "pricing_unavailable",
+                "美元预算所需模型未定价（" + ", ".join(unpriced_models)
+                + "）；请在服务端价格表添加精确单价，或取消美元预算",
+            )
     try:
         state.healthy = await self._healthy_engines_async()
     except BaseException:
         await abort_preloop()
         raise
     if not state.healthy:
+        if getattr(self, "_pricing_blocked_all", False):
+            return await fail_budget_preflight(
+                "pricing_unavailable",
+                "; ".join(getattr(self, "_pricing_unavailable_profiles", {}).values()),
+            )
+        if state.hitl_task is not None:
+            state.hitl_task.cancel()
+            await asyncio.gather(state.hitl_task, return_exceptions=True)
         await self._emit_coord_bb(
             "health_unavailable",
             reason="NoEligibleEngine",
             configured_engines=list(self.engines),
         )
-        if state.hitl_task is not None:
-            state.hitl_task.cancel()
-            await asyncio.gather(state.hitl_task, return_exceptions=True)
         await self._finalize_coordinator_run(
             winner=None, flag=None, goal_complete=False,
             per_solver=state.per_solver,
@@ -134,6 +189,11 @@ async def start_coordinator(
                 state.healthy,
                 adopt_verifiers=(state.tasks, state.task_solvers, state.task_intents),
                 adopt_race_workers=(state.tasks, state.task_solvers, state.task_intents),
+            )
+        except (WorkerDispatchFailureLimit, WorkerRuntimeUnavailable):
+            await abort_preloop()
+            return SwarmOutcome(
+                False, None, None, state.per_solver, "runtime_failure",
             )
         except BaseException:
             await abort_preloop()
@@ -302,15 +362,12 @@ async def prepare_main_loop(self, state: CoordinatorRunState) -> None:
     # A prior non-solved finalize parked this run's in-flight intents in
     # dispatch_state='resume'. No-op on a fresh run.
     if self.shared_graph is not None:
-        try:
-            revived = self.shared_graph.revive_resume_intents(
-                actor="coordinator")
-            if revived:
-                await emit_bb(
-                    "intent_state_changed", intent_id=",".join(revived),
-                    dispatch_state="active")
-        except Exception:
-            pass
+        revived = self.shared_graph.revive_resume_intents(
+            actor="coordinator")
+        if revived:
+            await emit_bb(
+                "intent_state_changed", intent_id=",".join(revived),
+                dispatch_state="active")
 
     if (
         self.shared_graph is not None
@@ -357,14 +414,17 @@ async def prepare_main_loop(self, state: CoordinatorRunState) -> None:
                     fact=origin_fact,
                 )
 
-    # Planned cold starts enter through Decide before any broad executor. Auto
-    # CTF never creates a special whole-challenge/root Worker: Decide creates
-    # the immediate Step frontier and the ordinary dispatcher owns every Worker.
-    ctf_decide_first = bool(
+    # Auto CTF/pentest dispatches concrete Steps. On a resumed graph, dispatch
+    # revived Steps directly; if none remain, let Decide plan from the carried
+    # evidence before admitting another Worker. Cold-start parallelism is still
+    # supplied by the ordinary Step frontier and its available seats.
+    planned_auto_run = bool(
         getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
         and self._auto_dispatch_enabled()
-        and state.cold_start
         and not state.race_missed
+    )
+    ctf_decide_first = bool(
+        planned_auto_run
         and not self._open_intents()
     )
     ctf_planned = False
@@ -372,7 +432,7 @@ async def prepare_main_loop(self, state: CoordinatorRunState) -> None:
         requested_intents = self._ordinary_capacity_limit()
         await emit_bb(
             "reason_start",
-            trigger="ctf_cold_start",
+            trigger=("ctf_cold_start" if state.cold_start else "ctf_resume"),
             requested_intents=requested_intents,
         )
         previous_override = getattr(self, "_reason_max_intents_override", None)
@@ -383,32 +443,34 @@ async def prepare_main_loop(self, state: CoordinatorRunState) -> None:
             self._reason_max_intents_override = previous_override
         await emit_bb(
             "reason_done",
-            trigger="ctf_cold_start",
+            trigger=("ctf_cold_start" if state.cold_start else "ctf_resume"),
             **self._reason_event_fields(len(self._open_intents())),
         )
-        try:
-            decided_wm = int(
-                self.shared_graph.semantic_graph_watermark() or 0
-            )
-        except Exception:
-            decided_wm = 0
+        decided_wm = int(
+            self.shared_graph.semantic_graph_watermark() or 0
+        )
         state.last_decided_wm = decided_wm
         state.last_consumed_wm = decided_wm
         state.reason_fact_ckpt = self._verified_fact_count()
         state.reason_open_intent_ckpt = len(self._open_intents())
         if not ctf_planned:
-            # Keep the normal bounded planner retry alive. There is deliberately
-            # no broad bootstrap fallback in auto CTF mode.
-            state.reason_next_trigger = "ctf_cold_start_retry"
+            # Retry transport/invalid-plan failures. A valid empty plan with
+            # unchanged evidence is handled as no progress by idle_stage; an
+            # identical immediate Decide cannot create new information.
+            if getattr(self, "_last_planner_failure", None) is not None:
+                state.reason_next_trigger = (
+                    "ctf_cold_start_retry" if state.cold_start
+                    else "ctf_resume_retry"
+                )
+    elif planned_auto_run and not state.cold_start:
+        # A warm graph may contain Steps waiting on stale dependencies. Reason
+        # reads the carried evidence while any ready Steps dispatch in parallel.
+        state.reason_next_trigger = "ctf_resume"
 
-    # ── Phase: Bootstrap — start_workers heterogeneous rush workers ──
-    # 续解（resolve/reopen，非冷启动）没有 race-scout 阶段：若仍按
-    # start_workers 只起一个 bootstrap，「拉起完整蜂群续解」就名不副实
-    # （run-1987554：start_workers=1 导致单 worker 独跑 22 分钟，第二个
-    # worker 直到结束前才被 Reason 补起）。续解起步直接覆盖全部健康普通
-    # Seat；并发上限仍由 _ordinary_capacity_available(max_workers) 把关。
-    # flag 已集齐的重开保持旧行为（少起 Worker，由主循环立刻收尾）。
-    if ctf_decide_first:
+    # Fixed dispatch retains its original bootstrap admission. Auto CTF and
+    # pentest use only the concrete Step frontier on both cold and warm starts;
+    # resuming a populated graph no longer starts broad duplicate campaigns.
+    if planned_auto_run:
         initial_workers = 0
     elif state.race_missed:
         initial_workers = 0
@@ -432,6 +494,12 @@ async def prepare_main_loop(self, state: CoordinatorRunState) -> None:
             await emit_bb(
                 "worker_spawn_rejected", reason=str(exc),
                 engine=str(engine), phase="bootstrap")
+            if await _record_worker_dispatch_failure(
+                self, state, worker="", engine=str(engine), detail=str(exc),
+            ):
+                break
+            state.reason_retry_pending = True
+            state.reason_retry_not_before = time.monotonic()
             break
         except WorkerBudgetExhausted as exc:
             await stop_for_budget(str(exc))

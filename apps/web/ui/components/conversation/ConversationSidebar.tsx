@@ -6,7 +6,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { SidebarNav, queryLooksSearchable, type NavItem, type NavSection } from "../ai-native/sidebar-nav";
-import { ResizeHandle, toast } from "@/components/chat/ui";
+import { ResizeHandle } from "@/components/chat/ui";
 import { TIME_BUCKETS, parseTimestamp, timeBucketLabel, timeBucketOf, type TimeBucket } from "@/components/chat/sidebar/time";
 import type {
   ConversationThread,
@@ -24,6 +24,8 @@ import {
 } from "@/lib/railSizing";
 import { threadHasAttention, threadNeedsAction } from "@/lib/threadAttention";
 import { useMediaQuery } from "@/lib/useMediaQuery";
+import { conversationStorageKey, conversationStorageScope, subscribeConversationStorageScope } from "@/lib/conversationStorageScope";
+import { mergeSidebarSearchHits, sidebarSearchFailure } from "@/lib/sidebarSearch";
 import { rebaseSidebarPreferences, sameSidebarPreferences } from "@/lib/sidebarPreferenceMerge";
 
 const PINNED_THREADS_KEY = "muteki.sidebar.pinned-threads.v1";
@@ -32,8 +34,9 @@ const PROJECT_ORDER_KEY = "muteki.sidebar.project-order.v1";
 const PROJECT_THREAD_PREVIEW_LIMIT = 5;
 
 function readStringList(key: string): string[] {
+  if (!conversationStorageScope()) return [];
   try {
-    const saved = JSON.parse(localStorage.getItem(key) || "[]");
+    const saved = JSON.parse(localStorage.getItem(conversationStorageKey(key)) || "[]");
     return Array.isArray(saved)
       ? saved.filter((id): id is string => typeof id === "string")
       : [];
@@ -43,8 +46,9 @@ function readStringList(key: string): string[] {
 }
 
 function persistStringList(key: string, ids: string[]): void {
+  if (!conversationStorageScope()) return;
   try {
-    localStorage.setItem(key, JSON.stringify(ids));
+    localStorage.setItem(conversationStorageKey(key), JSON.stringify(ids));
   } catch {
     // Sidebar preferences are optional when storage is unavailable.
   }
@@ -146,10 +150,19 @@ export function ConversationSidebar({
   const [resizing, setResizing] = useState(false);
   const [bodyHits, setBodyHits] = useState<ConversationSearchHit[]>([]);
   const [bodyHitsLoading, setBodyHitsLoading] = useState(false);
+  const [bodyHitsLoadingMore, setBodyHitsLoadingMore] = useState(false);
+  const [bodyHitsError, setBodyHitsError] = useState("");
+  const [bodyHitsNextOffset, setBodyHitsNextOffset] = useState<number | null>(null);
+  const [searchAttempt, setSearchAttempt] = useState(0);
+  const [preferenceScope, setPreferenceScope] = useState(conversationStorageScope);
+  const [preferencesReady, setPreferencesReady] = useState(false);
+  const [preferencesError, setPreferencesError] = useState("");
+  const searchPageRef = useRef<{ query: string; includeSuperseded: boolean; offset: number | null }>({ query: "", includeSuperseded: false, offset: null });
   const [includeSuperseded, setIncludeSuperseded] = useState(false);
   const [maxWidth, setMaxWidth] = useState(RAIL_WIDTH_MAX);
   const [dayStamp, setDayStamp] = useState(() => new Date().toDateString());
   const searchAbortRef = useRef<AbortController | null>(null);
+  const searchMoreRequestRef = useRef<AbortController | null>(null);
 
   // Server snapshot is the merge base; state changes made while it loads must
   // never be written back as if the user changed them.
@@ -159,6 +172,7 @@ export function ConversationSidebar({
     sort_mode: "updated", pinned_sort_mode: "manual", group_mode: "project",
   });
   const failedPreferencesRef = useRef<SidebarPreferences | null>(null);
+  const initialPreferencesRef = useRef(latestPreferencesRef.current);
   const syncInProgressRef = useRef(false);
   const prefsReadyRef = useRef<boolean>(false);
   const serverLoadInProgressRef = useRef<boolean>(false);
@@ -176,52 +190,61 @@ export function ConversationSidebar({
     persistStringList(PROJECT_ORDER_KEY, prefs.project_order);
   }, []);
 
-  useEffect(() => {
-    // 1. Immediately apply localStorage (instant visual feedback before server responds).
-    const localPinned = readStringList(PINNED_THREADS_KEY);
-    const localThreadOrder = readStringList(THREAD_ORDER_KEY);
-    const localProjectOrder = readStringList(PROJECT_ORDER_KEY);
-    setPinnedIds(localPinned);
-    setThreadOrder(localThreadOrder);
-    if (localThreadOrder.length) setSortMode("manual");
-    setProjectOrder(localProjectOrder);
-
-    // 2. Fetch from server and apply authoritative preferences.
-    serverLoadInProgressRef.current = true;
-    fetchSidebarPreferences()
-      .then(async (remote: SidebarPreferences) => {
-        serverSnapshotRef.current = remote;
-        if (remote.version > 0) {
-          applyPreferences(remote);
-        } else if (localPinned.length || localThreadOrder.length || localProjectOrder.length) {
-          // Server is empty — migrate from localStorage.
-          const migrated: SidebarPreferences = {
-            version: 0,
-            pinned_ids: localPinned,
-            thread_order: localThreadOrder,
-            project_order: localProjectOrder,
-            sort_mode: localThreadOrder.length ? "manual" : "updated",
-            pinned_sort_mode: "manual",
-            group_mode: "project",
-          };
-          const { prefs } = await saveSidebarPreferences(migrated);
-          serverSnapshotRef.current = prefs;
-          applyPreferences(prefs);
-        }
-      })
-      .catch(() => { /* Server unavailable — localStorage is the fallback. */ })
-      .finally(() => {
-        serverLoadInProgressRef.current = false;
-        prefsReadyRef.current = true;
-      });
+  const updatePreferences = useCallback((update: (current: SidebarPreferences) => SidebarPreferences) => {
+    applyPreferences(update(latestPreferencesRef.current));
   }, [applyPreferences]);
+
+  useEffect(() => subscribeConversationStorageScope(() => {
+    setPreferenceScope(conversationStorageScope());
+  }), []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const ownsScope = () => !cancelled && conversationStorageScope() === preferenceScope;
+    const local: SidebarPreferences = {
+      version: 0, pinned_ids: readStringList(PINNED_THREADS_KEY),
+      thread_order: readStringList(THREAD_ORDER_KEY), project_order: readStringList(PROJECT_ORDER_KEY),
+      sort_mode: "updated", pinned_sort_mode: "manual", group_mode: "project",
+    };
+    if (local.thread_order.length) local.sort_mode = "manual";
+    initialPreferencesRef.current = local;
+    setPreferencesError("");
+    serverSnapshotRef.current = null;
+    failedPreferencesRef.current = null;
+    prefsReadyRef.current = false;
+    setPreferencesReady(false);
+    applyPreferences(local);
+    serverLoadInProgressRef.current = true;
+    if (!preferenceScope) {
+      serverLoadInProgressRef.current = false;
+      return () => { cancelled = true; };
+    }
+    void fetchSidebarPreferences().then((remote) => {
+      if (!ownsScope()) return;
+      serverSnapshotRef.current = remote;
+      // First-load remote preferences form the authority; keep changes the user
+      // made since the local snapshot, rather than replaying stale local state.
+      const initial = remote.version === 0 ? { ...local, version: remote.version } : remote;
+      applyPreferences(rebaseSidebarPreferences(local, latestPreferencesRef.current, initial));
+    }).catch((error) => {
+      if (!ownsScope()) return;
+      setPreferencesError(`侧栏偏好读取失败：${error instanceof Error ? error.message : String(error)}。当前修改仍在此窗口，尚未同步到服务。`);
+    }).finally(() => {
+      if (!ownsScope()) return;
+      serverLoadInProgressRef.current = false;
+      prefsReadyRef.current = true;
+      setPreferencesReady(true);
+    });
+    return () => { cancelled = true; };
+  }, [applyPreferences, preferenceScope]);
 
   // Rebase only fields changed in this tab, so a concurrent tab's unrelated
   // edits survive. Serialize writes and preserve edits made during a request.
   const syncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const flushPreferences = useCallback(async () => {
-    if (syncInProgressRef.current) return;
+    if (syncInProgressRef.current || !preferenceScope || conversationStorageScope() !== preferenceScope) return;
     syncInProgressRef.current = true;
+    setPreferencesError("");
     try {
       for (let attempt = 0; attempt < 3; attempt += 1) {
         const base = serverSnapshotRef.current;
@@ -231,6 +254,7 @@ export function ConversationSidebar({
           return;
         }
         const remote = await fetchSidebarPreferences();
+        if (conversationStorageScope() !== preferenceScope) return;
         const merged = rebaseSidebarPreferences(base, local, remote);
         if (sameSidebarPreferences(merged, remote)) {
           serverSnapshotRef.current = remote;
@@ -240,6 +264,7 @@ export function ConversationSidebar({
           continue;
         }
         const { ok, prefs } = await saveSidebarPreferences(merged);
+        if (conversationStorageScope() !== preferenceScope) return;
         serverSnapshotRef.current = prefs;
         const next = rebaseSidebarPreferences(
           ok ? local : base, latestPreferencesRef.current, prefs,
@@ -251,14 +276,38 @@ export function ConversationSidebar({
         }
       }
       failedPreferencesRef.current = latestPreferencesRef.current;
-      toast({ title: "侧栏偏好尚未保存，请再试一次", tone: "warning" });
-    } catch {
+      setPreferencesError("侧栏偏好尚未保存，请重试。当前操作仍保留在此窗口。");
+    } catch (error) {
+      if (conversationStorageScope() !== preferenceScope) return;
       failedPreferencesRef.current = latestPreferencesRef.current;
-      toast({ title: "侧栏偏好保存失败，请检查连接后重试", tone: "warning" });
+      setPreferencesError(`侧栏偏好保存失败：${error instanceof Error ? error.message : String(error)}。请检查连接后重试。`);
     } finally {
       syncInProgressRef.current = false;
     }
-  }, [applyPreferences]);
+  }, [applyPreferences, preferenceScope]);
+
+  const retryPreferences = useCallback(async () => {
+    if (!preferenceScope || conversationStorageScope() !== preferenceScope || serverLoadInProgressRef.current) return;
+    failedPreferencesRef.current = null;
+    if (serverSnapshotRef.current) { await flushPreferences(); return; }
+    serverLoadInProgressRef.current = true;
+    setPreferencesError("");
+    try {
+      const remote = await fetchSidebarPreferences();
+      if (conversationStorageScope() !== preferenceScope) return;
+      serverSnapshotRef.current = remote;
+      const base = initialPreferencesRef.current;
+      const initial = remote.version === 0 ? { ...base, version: remote.version } : remote;
+      applyPreferences(rebaseSidebarPreferences(base, latestPreferencesRef.current, initial));
+    } catch (error) {
+      if (conversationStorageScope() === preferenceScope) setPreferencesError(`侧栏偏好重试失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      if (conversationStorageScope() === preferenceScope) {
+        serverLoadInProgressRef.current = false;
+        setPreferencesReady(true);
+      }
+    }
+  }, [applyPreferences, flushPreferences, preferenceScope]);
 
   const currentPreferences = useMemo<SidebarPreferences>(() => ({
     version: 0, pinned_ids: pinnedIds, thread_order: threadOrder,
@@ -275,7 +324,7 @@ export function ConversationSidebar({
     if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
     syncTimerRef.current = setTimeout(() => { void flushPreferences(); }, 400);
     return () => { if (syncTimerRef.current) clearTimeout(syncTimerRef.current); };
-  }, [currentPreferences, flushPreferences]);
+  }, [currentPreferences, flushPreferences, preferencesReady]);
 
   useEffect(() => {
     const measure = () => setMaxWidth(railWidthMax(window.innerWidth));
@@ -294,8 +343,13 @@ export function ConversationSidebar({
   useEffect(() => {
     searchAbortRef.current?.abort();
     searchAbortRef.current = null;
-    if (!queryLooksSearchable(searchQuery)) {
-      setBodyHits([]);
+    setBodyHits([]);
+    setBodyHitsError("");
+    setBodyHitsNextOffset(null);
+    setBodyHitsLoadingMore(false);
+    searchMoreRequestRef.current = null;
+    searchPageRef.current = { query: searchQuery.trim(), includeSuperseded, offset: null };
+    if (!queryLooksSearchable(searchQuery) || !preferenceScope) {
       setBodyHitsLoading(false);
       return;
     }
@@ -303,26 +357,47 @@ export function ConversationSidebar({
     searchAbortRef.current = controller;
     setBodyHitsLoading(true);
     const timer = window.setTimeout(() => {
-      void fetchConversationSearch(searchQuery, {
-        includeArchived: false,
-        includeSuperseded,
-        limit: 20,
-        signal: controller.signal,
-      }).then((result) => {
-        if (controller.signal.aborted) return;
-        setBodyHits(result.hits || []);
-        setBodyHitsLoading(false);
-      }).catch(() => {
-        if (controller.signal.aborted) return;
-        setBodyHits([]);
-        setBodyHitsLoading(false);
+      void fetchConversationSearch(searchQuery, { includeArchived: false, includeSuperseded,
+        limit: 20, offset: 0, signal: controller.signal }).then((result) => {
+        if (controller.signal.aborted || searchAbortRef.current !== controller
+          || conversationStorageScope() !== preferenceScope) return;
+        setBodyHits(mergeSidebarSearchHits([], result.hits));
+        const offset = result.has_more ? result.next_offset ?? null : null;
+        searchPageRef.current.offset = offset;
+        setBodyHitsNextOffset(offset);
+      }).catch((error) => {
+        if (controller.signal.aborted || searchAbortRef.current !== controller) return;
+        setBodyHitsError(sidebarSearchFailure(error));
+      }).finally(() => {
+        if (!controller.signal.aborted && searchAbortRef.current === controller) setBodyHitsLoading(false);
       });
     }, 250);
-    return () => {
-      window.clearTimeout(timer);
-      controller.abort();
-    };
-  }, [searchQuery, includeSuperseded]);
+    return () => { window.clearTimeout(timer); controller.abort(); };
+  }, [searchQuery, includeSuperseded, searchAttempt, preferenceScope]);
+
+  const loadMoreSearchHits = useCallback(async () => {
+    const controller = searchAbortRef.current;
+    const snapshot = { ...searchPageRef.current };
+    if (!controller || controller.signal.aborted || snapshot.offset == null || searchMoreRequestRef.current === controller) return;
+    searchMoreRequestRef.current = controller;
+    setBodyHitsLoadingMore(true);
+    setBodyHitsError("");
+    try {
+      const result = await fetchConversationSearch(snapshot.query, { includeArchived: false,
+        includeSuperseded: snapshot.includeSuperseded, limit: 20, offset: snapshot.offset, signal: controller.signal });
+      if (controller.signal.aborted || searchAbortRef.current !== controller
+        || conversationStorageScope() !== preferenceScope) return;
+      setBodyHits((previous) => mergeSidebarSearchHits(previous, result.hits));
+      const offset = result.has_more ? result.next_offset ?? null : null;
+      searchPageRef.current.offset = offset;
+      setBodyHitsNextOffset(offset);
+    } catch (error) {
+      if (!controller.signal.aborted && searchAbortRef.current === controller) setBodyHitsError(sidebarSearchFailure(error));
+    } finally {
+      if (searchMoreRequestRef.current === controller) searchMoreRequestRef.current = null;
+      if (!controller.signal.aborted && searchAbortRef.current === controller) setBodyHitsLoadingMore(false);
+    }
+  }, [preferenceScope]);
 
   const resizeTo = useCallback((next: number) => {
     const viewport = typeof window !== "undefined" ? window.innerWidth : undefined;
@@ -335,49 +410,30 @@ export function ConversationSidebar({
   }, []);
 
   const togglePinned = useCallback((threadId: string) => {
-    setPinnedIds((current) => {
-      const next = current.includes(threadId)
-        ? current.filter((id) => id !== threadId)
-        : [...current, threadId];
-      persistStringList(PINNED_THREADS_KEY, next);
-      return next;
-    });
-  }, []);
+    updatePreferences((current) => ({ ...current, pinned_ids: current.pinned_ids.includes(threadId)
+      ? current.pinned_ids.filter((id) => id !== threadId) : [...current.pinned_ids, threadId] }));
+  }, [updatePreferences]);
 
   const moveThread = useCallback((sourceId: string, targetId: string, visibleIds: string[]) => {
-    setSortMode("manual");
-    setThreadOrder((current) => {
-      const base = sortMode === "manual" ? mergeOrder(current, visibleIds) : [...visibleIds];
-      const next = moveBefore(base, sourceId, targetId);
-      persistStringList(THREAD_ORDER_KEY, next);
-      return next;
-    });
-  }, [sortMode]);
+    updatePreferences((current) => ({ ...current, sort_mode: "manual", thread_order: moveBefore(
+      current.sort_mode === "manual" ? mergeOrder(current.thread_order, visibleIds) : [...visibleIds], sourceId, targetId) }));
+  }, [updatePreferences]);
 
   const movePinnedThread = useCallback((sourceId: string, targetId: string, visibleIds: string[]) => {
-    setPinnedSortMode("manual");
-    setPinnedIds((current) => {
-      const base = pinnedSortMode === "manual" ? mergeOrder(current, visibleIds) : [...visibleIds];
-      const next = moveBefore(base, sourceId, targetId);
-      persistStringList(PINNED_THREADS_KEY, next);
-      return next;
-    });
-  }, [pinnedSortMode]);
+    updatePreferences((current) => ({ ...current, pinned_sort_mode: "manual", pinned_ids: moveBefore(
+      current.pinned_sort_mode === "manual" ? mergeOrder(current.pinned_ids, visibleIds) : [...visibleIds], sourceId, targetId) }));
+  }, [updatePreferences]);
 
-  const orderedProjects = useMemo(() => (
-    orderByIds(projects, projectOrder, (project) => project.project_id)
-  ), [projects, projectOrder]);
-
+  const orderedProjects = useMemo(() => orderByIds(projects, projectOrder, (project) => project.project_id), [projects, projectOrder]);
   const moveProject = useCallback((sourceSectionId: string, targetSectionId: string) => {
     const sourceId = sourceSectionId.replace(/^project:/, "");
     const targetId = targetSectionId.replace(/^project:/, "");
     const visibleIds = orderedProjects.map((project) => project.project_id);
-    setProjectOrder((current) => {
-      const next = moveBefore(mergeOrder(current, visibleIds), sourceId, targetId);
-      persistStringList(PROJECT_ORDER_KEY, next);
-      return next;
-    });
-  }, [orderedProjects]);
+    updatePreferences((current) => ({ ...current, project_order: moveBefore(mergeOrder(current.project_order, visibleIds), sourceId, targetId) }));
+  }, [orderedProjects, updatePreferences]);
+  const changePinnedSortMode = useCallback((next: SidebarPreferences["pinned_sort_mode"]) => updatePreferences((current) => ({ ...current, pinned_sort_mode: next })), [updatePreferences]);
+  const changeSortMode = useCallback((next: SidebarPreferences["sort_mode"]) => updatePreferences((current) => ({ ...current, sort_mode: next })), [updatePreferences]);
+  const changeGroupMode = useCallback((next: SidebarPreferences["group_mode"]) => updatePreferences((current) => ({ ...current, group_mode: next })), [updatePreferences]);
 
   // Archived conversations are managed from Settings instead of this rail.
   const activeThreads = useMemo(() => {
@@ -479,7 +535,7 @@ export function ConversationSidebar({
 
     if (groupMode === "list") {
       return [
-        { id: "pinned", title: "置顶", kind: "pinned", items: toItems(pinned, movePinnedThread, pinned.map((thread) => thread.thread_id)), sortMode: pinnedSortMode, onSortChange: setPinnedSortMode, onReorderItems: (sourceId, targetId) => movePinnedThread(sourceId, targetId, pinned.map((thread) => thread.thread_id)) },
+        { id: "pinned", title: "置顶", kind: "pinned", items: toItems(pinned, movePinnedThread, pinned.map((thread) => thread.thread_id)), sortMode: pinnedSortMode, onSortChange: changePinnedSortMode, onReorderItems: (sourceId, targetId) => movePinnedThread(sourceId, targetId, pinned.map((thread) => thread.thread_id)) },
         ...chronological("all", "全部对话", ordinary),
       ];
     }
@@ -490,7 +546,7 @@ export function ConversationSidebar({
       kind: "pinned",
       items: toItems(pinned, movePinnedThread, pinned.map((thread) => thread.thread_id)),
       sortMode: pinnedSortMode,
-      onSortChange: setPinnedSortMode,
+      onSortChange: changePinnedSortMode,
       onReorderItems: (sourceId, targetId) => movePinnedThread(sourceId, targetId, pinned.map((thread) => thread.thread_id)),
     });
 
@@ -500,6 +556,7 @@ export function ConversationSidebar({
       result.push({
         id: `project:${project.project_id}`,
         title: project.name,
+        subtitle: project.root_path || "服务工作目录未配置",
         kind: "folder",
         previewLimit: PROJECT_THREAD_PREVIEW_LIMIT,
         emptyLabel: "暂无对话",
@@ -531,7 +588,7 @@ export function ConversationSidebar({
 
     return result;
     // dayStamp re-buckets 今天/昨天 when the date rolls over.
-  }, [activeThreads, activeThreadId, groupMode, sortMode, searchQuery, dayStamp, orderedProjects, onRenameThread, onForkThread, onArchiveThread, onArchiveProjectThreads, onNewChatForProject, pinnedIds, pinnedSortMode, togglePinned, moveThread, movePinnedThread, moveProject]);
+  }, [activeThreads, activeThreadId, groupMode, sortMode, searchQuery, dayStamp, orderedProjects, onRenameThread, onForkThread, onArchiveThread, onArchiveProjectThreads, onNewChatForProject, pinnedIds, pinnedSortMode, togglePinned, moveThread, movePinnedThread, moveProject, changePinnedSortMode]);
 
   const activitySections: NavSection[] = useMemo(() => {
     const projectNames = new Map(projects.map((project) => [project.project_id, project.name]));
@@ -608,6 +665,10 @@ export function ConversationSidebar({
       aria-hidden={drawerHidden || undefined}
       inert={drawerHidden ? true : undefined}
     >
+      {preferencesError ? <div role="alert" className="mx-2 mt-2 rounded-lg border border-cx-border p-2 text-[11.5px] text-cx-warning">
+        <details><summary>侧栏偏好尚未同步</summary><p className="mt-1 whitespace-pre-wrap break-words">{preferencesError}</p></details>
+        <button type="button" className="mt-1 rounded px-2 py-1 text-cx-accent focus-visible:outline-2" onClick={() => void retryPreferences()}>重试保存</button>
+      </div> : null}
       <SidebarNav
         sections={sections}
         activitySections={activitySections}
@@ -621,9 +682,9 @@ export function ConversationSidebar({
         searchQuery={searchQuery}
         onSearchChange={onSearchChange}
         sortMode={sortMode}
-        onSortChange={setSortMode}
+        onSortChange={changeSortMode}
         groupMode={groupMode}
-        onGroupChange={setGroupMode}
+        onGroupChange={changeGroupMode}
         collapsed={false}
         bodyHits={bodyHits.map((hit) => ({
           threadId: hit.thread_id,
@@ -635,6 +696,14 @@ export function ConversationSidebar({
           superseded: hit.superseded,
         }))}
         bodyHitsLoading={bodyHitsLoading}
+        bodyHitsLoadingMore={bodyHitsLoadingMore}
+        bodyHitsError={bodyHitsError}
+        bodyHitsHasMore={bodyHitsNextOffset != null}
+        onLoadMoreBodyHits={() => void loadMoreSearchHits()}
+        onRetryBodyHits={() => {
+          if (bodyHits.length && bodyHitsNextOffset != null) void loadMoreSearchHits();
+          else setSearchAttempt((attempt) => attempt + 1);
+        }}
         includeSuperseded={includeSuperseded}
         onIncludeSupersededChange={setIncludeSuperseded}
         onSelectBodyHit={(hit) => {

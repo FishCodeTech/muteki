@@ -1,3 +1,4 @@
+import { conversationStorageKey, conversationStorageScope, subscribeConversationStorageScope, subscribeBeforeConversationStorageScope } from "./conversationStorageScope";
 /**
  * Persistent send / create / retry intent for Conversation (C02).
  *
@@ -37,6 +38,10 @@ export type SendIntent = {
   /** Project/workspace choices frozen for thread creation, separate from runtime. */
   threadContext?: Record<string, unknown>;
   createCommandId?: string;
+  bindCommandId?: string;
+  boundWorkspaceId?: string;
+  boundBranch?: string;
+  pendingCommandId?: string;
   threadId?: string;
   uploads: SendUploadIntent[];
   sendCommandId: string;
@@ -71,7 +76,7 @@ let storageOverride: StorageLike | null = null;
 
 function getStorage(): StorageLike | null {
   if (storageOverride) return storageOverride;
-  if (typeof window === "undefined") return null;
+  if (typeof window === "undefined" || !conversationStorageScope()) return null;
   try {
     return window.localStorage;
   } catch {
@@ -98,7 +103,7 @@ function readBucket(): IntentBucket {
     };
   }
   try {
-    const raw = storage.getItem(SEND_INTENT_STORAGE_KEY);
+    const raw = storage.getItem(conversationStorageKey(SEND_INTENT_STORAGE_KEY));
     if (!raw) {
       memoryBucket = emptyBucket();
       return emptyBucket();
@@ -153,7 +158,7 @@ function writeBucket(bucket: IntentBucket): void {
     return;
   }
   try {
-    storage.setItem(SEND_INTENT_STORAGE_KEY, JSON.stringify(memoryBucket));
+    storage.setItem(conversationStorageKey(SEND_INTENT_STORAGE_KEY), JSON.stringify(memoryBucket));
     // Only clear dirty after a successful persist.
     memoryDirty = false;
   } catch {
@@ -234,6 +239,10 @@ function normalizeSendIntent(value: unknown): SendIntent | null {
     ...(runtime ? { runtime } : {}),
     ...(threadContext ? { threadContext } : {}),
     ...(createCommandId ? { createCommandId } : {}),
+    ...(typeof row.bindCommandId === "string" ? { bindCommandId: row.bindCommandId } : {}),
+    ...(typeof row.boundWorkspaceId === "string" ? { boundWorkspaceId: row.boundWorkspaceId } : {}),
+    ...(typeof row.boundBranch === "string" ? { boundBranch: row.boundBranch } : {}),
+    ...(typeof row.pendingCommandId === "string" ? { pendingCommandId: row.pendingCommandId } : {}),
     ...(threadId ? { threadId } : {}),
     uploads,
     sendCommandId,
@@ -374,6 +383,7 @@ type RecoverableSendReceipt = {
   state?: string;
   error?: unknown;
   aggregate?: { id?: string };
+  output?: Record<string, unknown>;
 };
 
 /** Resolve an old uncertain command before semantic edits replace its identity. */
@@ -390,22 +400,19 @@ export async function prepareSendIntent(
   if (existing && !sendIntentMatchesPayload(existing, text, attachmentIds, capabilityRefs, runtime, threadContext)) {
     const pending = existing.phase === "unknown" ? existing.pendingPhase : existing.phase;
     if (pending === "sending" || pending === "creating_thread") {
-      const commandId = pending === "creating_thread" ? existing.createCommandId : existing.sendCommandId;
-      let receipt: RecoverableSendReceipt | null = null;
-      try { receipt = commandId ? await recover(commandId) : null; } catch { /* keep original identity */ }
-      if (!receipt) {
-        throw new Error("上一条请求的结果尚未确认，草稿已保留。请恢复连接后再次发送，系统会先查询原请求回执");
-      }
+      const commandId = existing.pendingCommandId || (pending === "creating_thread" ? existing.createCommandId : existing.sendCommandId);
+      const receipt = commandId ? await recover(commandId) : null;
+      if (!receipt) throw new ConversationCommandError({ code: "conversation.send.pending", category: "state", retryable: false, message: "原请求尚无可确认回执，草稿与原命令身份已保留；可核对原请求或显式归档待核对记录后开始新的发送", detail: { command_id: commandId, outcome_unknown: true } });
       const rejected = Boolean(receipt.error) || ["failed", "rejected", "conflict", "cancelled"].includes(receipt.state || "");
-      const createdThread = pending === "creating_thread" && !rejected ? receipt.aggregate?.id : undefined;
-      if (pending === "creating_thread" && !rejected && !createdThread) {
-        throw new Error("创建对话的回执尚未包含对话标识，草稿已保留，请稍后重试");
-      }
+      if (!rejected && receipt.state !== "completed") throw new ConversationCommandError({ code: "conversation.send.pending", category: "state", retryable: false, message: `原请求仍为 ${receipt.state || "unknown"}，不能把计划中的资源当作已保存结果`, detail: { command_id: commandId, receipt_state: receipt.state, outcome_unknown: true } });
+      const binding = pending === "creating_thread" && Boolean(existing.bindCommandId && commandId === existing.bindCommandId);
+      const resourceId = !rejected ? (binding ? String(receipt.output?.workspace_id || receipt.aggregate?.id || "") : receipt.aggregate?.id) : undefined;
+      if (pending === "creating_thread" && !rejected && !resourceId) throw new ConversationCommandError({ code: "conversation.send.invalid_receipt", category: "protocol", retryable: false, message: "完成回执缺少已保存资源标识，草稿与原命令身份已保留", detail: { command_id: commandId, outcome_unknown: true } });
       updateSendIntent(draftKey, {
-        phase: rejected ? "failed" : pending === "creating_thread" ? "uploading" : "accepted",
-        pendingPhase: undefined,
+        phase: rejected ? "failed" : binding ? "creating_thread" : pending === "creating_thread" ? "uploading" : "accepted",
+        pendingPhase: undefined, pendingCommandId: undefined,
         lastReceiptState: receipt.state,
-        ...(createdThread ? { threadId: createdThread } : {}),
+        ...(resourceId ? binding ? { boundWorkspaceId: resourceId } : { threadId: resourceId } : {}),
       });
     }
   }
@@ -449,7 +456,8 @@ export function ensureSendIntent(
     && existingAttachmentFingerprint === attachmentFingerprint
     && existingRuntimeFingerprint === runtimeFingerprint
     && sameThreadContext
-    && existing.phase !== "accepted",
+    && existing.phase !== "accepted"
+    && !["failed", "rejected", "conflict", "cancelled"].includes(existing.lastReceiptState || ""),
   );
   if (existing?.phase === "unknown" && !reusable) {
     throw new Error("原请求结果尚未确认，必须先恢复回执再更改发送身份");
@@ -508,6 +516,7 @@ export function ensureSendIntent(
     // A failed draft may already have created an unbound/different-project
     // thread. Changing its directory must create a new correctly bound thread.
     ...(sameThreadContext && existing?.threadId ? { threadId: existing.threadId } : {}),
+    ...(sameThreadContext && existing?.boundWorkspaceId ? { boundWorkspaceId: existing.boundWorkspaceId, boundBranch: existing.boundBranch } : {}),
     uploads,
     sendCommandId,
     clientMessageId: newStableId("msg"),
@@ -716,6 +725,7 @@ function readStructured(exc: unknown): {
   httpStatus: number | undefined;
   deduplicated: boolean;
   message: string;
+  detail?: Record<string, unknown>;
 } {
   const raw = exc instanceof Error ? exc.message : String(exc || "");
   const row = (exc && typeof exc === "object") ? exc as Record<string, unknown> : {};
@@ -731,6 +741,7 @@ function readStructured(exc: unknown): {
     httpStatus,
     deduplicated: Boolean(row.deduplicated),
     message: raw,
+    detail: row.detail && typeof row.detail === "object" ? row.detail as Record<string, unknown> : undefined,
   };
 }
 
@@ -803,6 +814,8 @@ export function classifySendFailure(exc: unknown): SendFailureKind {
   const lower = raw.toLowerCase();
   const httpStatus = info.httpStatus;
 
+  if (info.detail?.outcome_unknown === true || info.detail?.delivery_unknown === true) return "unknown";
+  if (exc && typeof exc === "object" && ["AbortError", "TimeoutError"].includes(String((exc as { name?: string }).name))) return "connection";
   if (info.category === "validation") return "validation";
   if (
     info.category === "permission"
@@ -943,4 +956,30 @@ export function __resetSendIntentStoreForTests(storage?: StorageLike | null): vo
   memoryBucket = emptyBucket();
   memoryDirty = false;
   storageOverride = storage === undefined ? null : storage;
+}
+
+const scopedIntents = new Map<string, { bucket: IntentBucket; dirty: boolean }>();
+subscribeBeforeConversationStorageScope(() => {
+  if (memoryDirty) writeBucket(memoryBucket);
+  scopedIntents.set(conversationStorageScope(), { bucket: memoryBucket, dirty: memoryDirty });
+});
+subscribeConversationStorageScope(() => {
+  const old = scopedIntents.get(conversationStorageScope()); memoryBucket = old?.bucket || emptyBucket(); memoryDirty = old?.dirty || false;
+});
+
+export function flushSendIntentStore(): { persisted: boolean; error?: string } {
+  const states = new Map(scopedIntents);
+  states.set(conversationStorageScope(), { bucket: memoryBucket, dirty: memoryDirty });
+  const errors: string[] = [];
+  for (const [scope, state] of states) {
+    if (!state.dirty) continue;
+    try {
+      const storage = storageOverride || (typeof window !== "undefined" && scope ? window.localStorage : null);
+      if (!storage) throw new Error("send-intent.storage_unavailable: 请求身份仅保留在当前窗口");
+      storage.setItem(conversationStorageKey(SEND_INTENT_STORAGE_KEY, scope), JSON.stringify(state.bucket));
+      state.dirty = false;
+      if (scope === conversationStorageScope()) memoryDirty = false;
+    } catch (error) { errors.push(error instanceof Error ? `${error.name}: ${error.message}` : String(error)); }
+  }
+  return errors.length ? { persisted: false, error: errors.join("\n") } : { persisted: true };
 }

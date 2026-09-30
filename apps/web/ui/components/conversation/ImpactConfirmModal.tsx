@@ -176,7 +176,7 @@ export function ImpactConfirmModal({
   const fileList = Array.isArray(files) ? files : [];
   const visual = knownMode ? modeVisual(knownMode, filePolicy) : { icon: "retry" as IconName, tone: "default" as const, confirm: "确认" };
   const threadId = threadIdProp || (preview as { thread_id?: string }).thread_id || "";
-  const confirmDisabled = loading || (mode === "native_rewind" && rewindDisabled);
+  const confirmDisabled = loading || !knownMode || (mode === "edit_resend" && !editedText?.trim()) || (mode === "native_rewind" && rewindDisabled);
   const showRewind = mode === "native_rewind" || Boolean(onSwitchMode);
   const attachments = preview.attachments_affected || [];
   const rewindStatus = rewindDisabled

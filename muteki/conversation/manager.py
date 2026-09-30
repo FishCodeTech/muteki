@@ -399,9 +399,13 @@ def _conversation_statistics(
         "cache_write_tokens", "cacheWriteTokens", "cache_write",
     )
     billed_input = input_tokens
-    # Codex 的 input_tokens 已包含 cached_input_tokens；其他 Runtime 单独上报的
-    # cache read/write 字段需要计入计费输入。
-    if codex_cache is None and input_tokens is not None:
+    # Canonical ledger input already includes cache. Only native disjoint
+    # bucket names may add cache, and an explicit normalized marker wins.
+    separate_cache = any(key in usage for key in (
+        "cache_read_input_tokens", "cacheReadInputTokens", "cacheRead",
+        "cache_creation_input_tokens", "cacheCreationInputTokens",
+    ))
+    if separate_cache and not usage.get("input_includes_cache") and codex_cache is None and input_tokens is not None:
         billed_input = input_tokens + (cache_read or 0) + (cache_write or 0)
 
     llm_duration_ms = 0.0
@@ -2326,6 +2330,7 @@ class ConversationManager:
         include_archived: bool = False,
         include_superseded: bool = False,
         limit: int = 30,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """Full-text search across Conversation message bodies (C07)."""
         q = str(query or "").strip()
@@ -2351,14 +2356,17 @@ class ConversationManager:
                 "archived": archived,
             }
 
+        page_limit = max(1, min(int(limit), 100))
+        page_offset = max(0, int(offset))
         raw_hits = self._conv.search_messages(
             q,
-            limit=max(1, min(int(limit), 100)),
+            limit=page_limit + 1,
             include_superseded=include_superseded,
             thread_ids=visible_ids,
+            offset=page_offset,
         )
         hits: list[dict[str, Any]] = []
-        for hit in raw_hits:
+        for hit in raw_hits[:page_limit]:
             meta = thread_meta.get(hit["thread_id"]) or {}
             hits.append({
                 "thread_id": hit["thread_id"],
@@ -2373,7 +2381,10 @@ class ConversationManager:
                 "superseded": bool(hit.get("superseded")),
                 "snippet": hit.get("snippet") or "",
             })
-        return {"query": q, "count": len(hits), "hits": hits}
+        has_more = len(raw_hits) > page_limit
+        return {"query": q, "count": len(hits), "hits": hits,
+                "offset": page_offset, "limit": page_limit, "has_more": has_more,
+                "next_offset": page_offset + len(hits) if has_more else None}
 
     def turn_process(
         self,
@@ -2381,6 +2392,8 @@ class ConversationManager:
         turn_id: str,
         *,
         limit: int = TURN_PROCESS_EVENT_LIMIT,
+        after_seq: int = 0,
+        watermark: Optional[int] = None,
     ) -> dict[str, Any]:
         """On-demand process/tool events for one turn (not full thread log)."""
         from muteki.platform.contracts.events import EventEnvelope
@@ -2395,18 +2408,21 @@ class ConversationManager:
             raise ConversationError(f"turn superseded: {turn_id}")
         fetch_limit = max(1, min(int(limit), TURN_PROCESS_EVENT_LIMIT))
         with self._store.lock:
+            current_head = self._store.stream_head("thread", thread_id)
+            snapshot_head = current_head if watermark is None else max(0, min(int(watermark), current_head))
             rows = self._store.conn.execute(
                 "SELECT payload FROM domain_events "
                 "WHERE aggregate_type = ? AND aggregate_id = ? "
                 "AND json_extract(payload, '$.payload.turn_id') = ? "
+                "AND stream_seq > ? AND stream_seq <= ? "
                 "ORDER BY stream_seq LIMIT ?",
-                ("thread", thread_id, turn_id, fetch_limit),
+                ("thread", thread_id, turn_id, max(0, int(after_seq)), snapshot_head, fetch_limit + 1),
             ).fetchall()
         events = [
             EventEnvelope.model_validate_json(row["payload"]).model_dump(
                 mode="json"
             )
-            for row in rows
+            for row in rows[:fetch_limit]
         ]
         return {
             "thread_id": thread_id,
@@ -2414,8 +2430,126 @@ class ConversationManager:
             "turn": turn.model_dump(mode="json"),
             "events": events,
             "count": len(events),
-            "truncated": len(events) >= fetch_limit,
+            "truncated": len(rows) > fetch_limit,
+            "has_more": len(rows) > fetch_limit,
+            "after_seq": max(0, int(after_seq)),
+            "next_after_seq": events[-1]["stream_seq"] if len(rows) > fetch_limit else None,
+            "watermark": snapshot_head,
         }
+
+    def export_snapshot(self, thread_id: str) -> dict[str, Any]:
+        """Read one consistent, complete current-branch snapshot without a UI cap."""
+        from muteki.platform.contracts.events import EventEnvelope
+        from . import events as ev
+        with self._store.transaction():
+            thread = self.get_thread(thread_id)
+            if thread is None:
+                raise ConversationError(f"unknown thread: {thread_id}")
+            watermark = self._store.stream_head("thread", thread_id)
+            all_turns = self._conv.list_turns(thread_id)
+            turns = [turn for turn in all_turns if turn.status != TURN_SUPERSEDED]
+            superseded_turn_ids = {turn.turn_id for turn in all_turns if turn.status == TURN_SUPERSEDED}
+            messages: list[dict[str, Any]] = []
+            cursor = self._store.conn.execute(
+                "SELECT m.payload FROM conv_messages m WHERE m.thread_id=? "
+                "AND (m.turn_id IS NULL OR m.turn_id='' OR m.turn_id NOT IN "
+                "(SELECT turn_id FROM conv_turns WHERE thread_id=? AND status=?)) "
+                "ORDER BY m.stream_seq,m.rowid", (thread_id, thread_id, TURN_SUPERSEDED))
+            while rows := cursor.fetchmany(1000):
+                messages.extend(ConversationMessage.model_validate_json(row["payload"]).model_dump(mode="json") for row in rows)
+            artifacts: list[dict[str, Any]] = []
+            tools: dict[tuple[str, str], dict[str, Any]] = {}
+            cursor = self._store.conn.execute(
+                "SELECT payload FROM domain_events WHERE aggregate_type='thread' AND aggregate_id=? "
+                "AND stream_seq<=? AND event_type IN ('core.tool.started','core.tool.invoked',"
+                "'core.tool.progress','core.tool.completed','core.tool.failed') ORDER BY stream_seq",
+                (thread_id, watermark))
+            while rows := cursor.fetchmany(1000):
+                for row in rows:
+                    event = EventEnvelope.model_validate_json(row["payload"])
+                    payload = event.payload
+                    turn_id = str(payload.get("turn_id") or "")
+                    if turn_id in superseded_turn_ids:
+                        continue
+                    call_id = str(payload.get("tool_call_id") or payload.get("call_id")
+                                  or payload.get("invocation_id") or payload.get("id") or event.event_id)
+                    key = (turn_id, call_id)
+                    tool = tools.setdefault(key, {"tool_id": call_id, "turn_id": turn_id or None,
+                        "name": "unknown", "status": "running", "output": "",
+                        "output_complete": False, "source_events": []})
+                    name = payload.get("tool_name") or payload.get("name") or payload.get("tool")
+                    if name:
+                        tool["name"] = str(name)
+                    for field in ("arguments", "input", "args"):
+                        if field in payload:
+                            tool["arguments"] = payload[field]
+                            break
+                    supplied_output = next((payload[field] for field in ("output", "result")
+                                            if field in payload and payload[field] is not None), None)
+                    if supplied_output is not None:
+                        tool["output"] = supplied_output
+                        tool["output_complete"] = event.event_type in {"core.tool.completed", "core.tool.failed"}
+                    elif isinstance(payload.get("chunk"), str):
+                        if not isinstance(tool["output"], str):
+                            raise ValueError("tool progress mixes structured output and text chunks")
+                        tool["output"] += payload["chunk"]
+                    if "summary" in payload:
+                        tool["summary"] = payload["summary"]
+                    if "error" in payload:
+                        tool["error"] = payload["error"]
+                    outcome = str(payload.get("status") or payload.get("result_status") or payload.get("outcome") or "").lower()
+                    exit_code = payload.get("exit_code", payload.get("exitCode"))
+                    if outcome in {"declined", "denied", "rejected"}:
+                        tool["status"] = "declined"
+                    elif outcome in {"cancelled", "canceled", "aborted", "interrupted"}:
+                        tool["status"] = "cancelled"
+                    elif (outcome in {"failed", "error"} or event.event_type == "core.tool.failed"
+                          or bool(payload.get("error")) or payload.get("is_error") is True
+                          or payload.get("isError") is True or (exit_code is not None and exit_code != 0)):
+                        tool["status"] = "failed"
+                    elif tool["status"] == "declined":
+                        pass
+                    elif event.event_type == "core.tool.completed" or outcome in {"completed", "success", "ok", "succeeded"}:
+                        tool["status"] = "completed"
+                    tool["source_events"].append({"event_id": event.event_id, "stream_seq": event.stream_seq,
+                                                  "event_type": event.event_type})
+            tool_rows = [{**tool, "output_summary": tool.get("summary", tool["output"])} for tool in tools.values()]
+            runtime_sources: dict[str, list[dict[str, Any]]] = {}
+            cursor = self._store.conn.execute(
+                "SELECT payload FROM domain_events WHERE aggregate_type='thread' AND aggregate_id=? "
+                "AND stream_seq<=? AND event_type=? ORDER BY stream_seq",
+                (thread_id, watermark, ev.EV_TURN_STARTED))
+            while rows := cursor.fetchmany(1000):
+                for row in rows:
+                    event = EventEnvelope.model_validate_json(row["payload"])
+                    turn_id = str(event.payload.get("turn_id") or "")
+                    if turn_id and isinstance(event.payload.get("runtime"), dict):
+                        runtime_sources.setdefault(turn_id, []).append({"event_id": event.event_id,
+                            "stream_seq": event.stream_seq, "runtime": event.payload["runtime"]})
+            cursor = self._store.conn.execute(
+                "SELECT payload FROM domain_events WHERE aggregate_type='thread' AND aggregate_id=? "
+                "AND stream_seq<=? AND event_type IN ('core.artifact.attached','core.artifact.created') "
+                "ORDER BY stream_seq", (thread_id, watermark))
+            while rows := cursor.fetchmany(1000):
+                for row in rows:
+                    event = EventEnvelope.model_validate_json(row["payload"])
+                    turn_id = str(event.payload.get("turn_id") or "")
+                    if turn_id in superseded_turn_ids:
+                        continue
+                    artifacts.append({**event.payload, "event_id": event.event_id,
+                                      "stream_seq": event.stream_seq, "turn_id": turn_id or None})
+            turn_rows = []
+            for turn in turns:
+                receipt = self._store.get_receipt(turn.command_id) if turn.command_id else None
+                turn_rows.append({**turn.model_dump(mode="json"),
+                    "runtime_sources": runtime_sources.get(turn.turn_id, []),
+                    "receipt_source": ({"command_id": receipt.command_id, "state": receipt.state.value,
+                                        "event_cursor": receipt.event_cursor} if receipt is not None else None)})
+            return {"thread": thread.model_dump(mode="json"),
+                    "runtime": self.runtime_selection(thread_id).model_dump(mode="json"),
+                    "turns": turn_rows,
+                    "messages": messages, "artifacts": artifacts, "tools": tool_rows,
+                    "watermark": watermark, "complete": True, "message_count": len(messages)}
 
 
 

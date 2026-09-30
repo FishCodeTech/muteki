@@ -89,9 +89,9 @@ const SETTINGS_NAV_GROUPS: SettingsNavGroup[] = [
     titleKey: "settingsHub.group.extensions",
     items: [
       {
-        id: "chat-plugins", href: "/settings/chat-plugins",
+        id: "agent-extensions", href: "/settings/agent-extensions",
         labelKey: "settingsHub.chatPlugins", descriptionKey: "settingsHub.chatPluginsDesc",
-        keywords: "聊天 插件 skills mcp plugins", icon: "plug",
+        keywords: "聊天 CTF 渗透 Worker 插件 skills mcp plugins", icon: "plug",
       },
       {
         id: "extensions",

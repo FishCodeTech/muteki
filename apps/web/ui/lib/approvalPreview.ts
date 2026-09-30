@@ -26,6 +26,7 @@ export type ApprovalPreview = {
   scope: string;
   expires: string;
   status: string;
+  nativeOptions?: Array<{ option_id: string; kind: string; name: string }>;
   args: string;
   /** Aggregated unified diff (top-level or joined from files). */
   diff: string;
@@ -364,6 +365,11 @@ export function buildApprovalPreview(row: Record<string, unknown>): ApprovalPrev
     scope: firstString(row, "permission_scope", "scope", "permissions"),
     expires: firstString(row, "expires_at", "expires", "ttl_seconds"),
     status: firstString(row, "status") || "pending",
+    nativeOptions: Array.isArray(row.options) ? row.options.flatMap((value) => {
+      const option = asRecord(value);
+      if (!option || typeof option.option_id !== "string" || typeof option.kind !== "string") return [];
+      return [{ option_id: option.option_id, kind: option.kind, name: typeof option.name === "string" ? option.name : "" }];
+    }) : undefined,
     args: !command ? args : "",
     diff,
     files,

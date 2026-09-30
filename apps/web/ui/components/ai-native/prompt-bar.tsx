@@ -23,11 +23,13 @@ import {
 } from "@/components/chat/ui";
 import {
   fetchComposerCapabilities,
+  ComposerCapabilityError,
   type ComposerCapabilityContext,
   type ComposerCapabilityItem,
   type ComposerCapabilityRef,
   type ComposerRuntimeState,
   type ComposerTrigger,
+  type ComposerCapabilitySectionError,
 } from "@/lib/composerCapabilities";
 import {
   applyCatalogCapability,
@@ -63,6 +65,7 @@ export interface PromptBarAttachment {
   file?: File;
   type?: string;
   sha256?: string;
+  cacheId?: string;
   /** Restored from storage without a File handle or upload hash. */
   needsReselect?: boolean;
   /** Per-file upload lifecycle state. */
@@ -114,7 +117,7 @@ export interface PromptBarProps {
   /** C09 structured prompt document. When set, drives the inline editor. */
   promptDocument?: PromptDocument;
   onPromptDocumentChange?: (doc: PromptDocument) => void;
-  onComposerCommand?: (action: string) => void;
+  onComposerCommand?: (action: string, sourceDocument?: PromptDocument) => void;
   capabilityBanner?: string;
   onDismissCapabilityBanner?: () => void;
   onRetryAttachment?: (index: number) => void;
@@ -268,9 +271,13 @@ export function PromptBar({
   const capabilityMenuId = useId();
   const reduced = useReducedMotion();
   const [activeToken, setActiveToken] = useState<ActiveComposerToken | null>(null);
-  const [capabilityItems, setCapabilityItems] = useState<ComposerCapabilityItem[]>([]);
+  const [catalogItems, setCapabilityItems] = useState<ComposerCapabilityItem[]>([]);
   const [capabilityLoading, setCapabilityLoading] = useState(false);
   const [capabilityError, setCapabilityError] = useState("");
+  const [capabilityErrorDiagnostic, setCapabilityErrorDiagnostic] = useState("");
+  const [capabilityResultKey, setCapabilityResultKey] = useState("");
+  const [capabilityRetry, setCapabilityRetry] = useState(0);
+  const [capabilitySectionErrors, setCapabilitySectionErrors] = useState<ComposerCapabilitySectionError[]>([]);
   const [capabilityRuntime, setCapabilityRuntime] = useState<ComposerRuntimeState | null>(null);
   const [activeCapabilityIndex, setActiveCapabilityIndex] = useState(0);
   const [composing, setComposing] = useState(false);
@@ -297,6 +304,11 @@ export function PromptBar({
   const capabilityThreadId = capabilityContext?.threadId || "";
   const capabilityWorkspaceId = capabilityContext?.workspaceId || "";
   const capabilityProjectId = capabilityContext?.projectId || "";
+  const capabilityQueryKey = JSON.stringify([
+    capabilityAdapterId, capabilityThreadId, capabilityWorkspaceId, capabilityProjectId,
+    activeCapabilityTrigger, activeCapabilityQuery, capabilityContext?.revision, pluginRevision,
+  ]);
+  const capabilityItems = capabilityResultKey === capabilityQueryKey ? catalogItems : [];
   const capabilityMenuOpen = Boolean(activeToken && capabilityAdapterId);
 
   const editorElement = useCallback(
@@ -341,6 +353,12 @@ export function PromptBar({
   }, [editorElement, useStructuredDoc]);
 
   useEffect(() => {
+    setCapabilityItems([]);
+    setCapabilityResultKey("");
+    setCapabilityError("");
+    setCapabilityErrorDiagnostic("");
+    setCapabilitySectionErrors([]);
+    setCapabilityRuntime(null);
     if (!activeCapabilityTrigger || !capabilityAdapterId) {
       setCapabilityItems([]);
       setCapabilityLoading(false);
@@ -349,6 +367,7 @@ export function PromptBar({
       return;
     }
     const controller = new AbortController();
+    setCapabilityLoading(true);
     const timer = window.setTimeout(() => {
       setCapabilityLoading(true);
       setCapabilityError("");
@@ -362,14 +381,18 @@ export function PromptBar({
         activeCapabilityTrigger,
         activeCapabilityQuery,
         controller.signal,
-      ).then(({ items, runtime }) => {
+      ).then(({ items, runtime, sectionErrors }) => {
+        if (controller.signal.aborted) return;
         setCapabilityItems(items);
+        setCapabilityResultKey(capabilityQueryKey);
         setCapabilityRuntime(runtime);
+        setCapabilitySectionErrors(sectionErrors);
         setActiveCapabilityIndex(0);
       }).catch((error: unknown) => {
         if (controller.signal.aborted) return;
         setCapabilityItems([]);
         setCapabilityError(error instanceof Error ? error.message : String(error));
+        setCapabilityErrorDiagnostic(error instanceof ComposerCapabilityError ? error.diagnostic : String(error));
       }).finally(() => {
         if (!controller.signal.aborted) setCapabilityLoading(false);
       });
@@ -387,6 +410,8 @@ export function PromptBar({
     capabilityProjectId,
     capabilityThreadId,
     capabilityWorkspaceId,
+    capabilityQueryKey,
+    capabilityRetry,
   ]);
 
   const hasBody = useStructuredDoc
@@ -445,6 +470,7 @@ export function PromptBar({
   };
 
   const selectCapabilityItem = (item: ComposerCapabilityItem) => {
+    if (capabilityResultKey !== capabilityQueryKey || capabilityLoading) return;
     if (capabilityDisabled(item)) {
       setCapabilityError(
         [item.reason, item.alternative].filter(Boolean).join("；")
@@ -477,7 +503,7 @@ export function PromptBar({
         setActiveToken(null);
       } else {
         setActiveToken(null);
-        onComposerCommand?.(action);
+        onComposerCommand?.(action, resolvedDoc);
       }
       return;
     }
@@ -628,6 +654,9 @@ export function PromptBar({
           items={capabilityItems}
           loading={capabilityLoading}
           error={capabilityError}
+          errorDiagnostic={capabilityErrorDiagnostic}
+          onRetry={() => setCapabilityRetry((revision) => revision + 1)}
+          sectionErrors={capabilitySectionErrors}
           runtime={capabilityRuntime}
           activeIndex={activeCapabilityIndex}
           onActiveIndexChange={setActiveCapabilityIndex}
@@ -648,7 +677,7 @@ export function PromptBar({
             setDragOver(false);
           }}
           onDrop={(event) => {
-            if (!onAddFiles) return;
+            if (!onAddFiles || !dataTransferHasFiles(event.dataTransfer)) return;
             event.preventDefault();
             setDragOver(false);
             ingestFiles(filesFromDataTransfer(event.dataTransfer));

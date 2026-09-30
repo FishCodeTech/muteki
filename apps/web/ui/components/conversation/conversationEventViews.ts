@@ -1,5 +1,6 @@
 import type { ConversationEvent } from "@/lib/useConversation";
 import type { ToolItem } from "../ai-native/tool-chips";
+import type { ConversationLiveTextRun } from "@/lib/conversationStreamReducer";
 
 export interface ConversationToolRecord extends ToolItem {
   turnId?: string;
@@ -60,6 +61,28 @@ export type ConversationTurnSegment =
       phase: ConversationMessagePhase;
     }
   | { kind: "tools"; turnId: string; tools: ConversationToolRecord[] };
+
+/** Restore admitted text outside the live event window without guessing its phase. */
+export function restoreConversationStreamPrefix(
+  segments: ConversationTurnSegment[], fullText: string,
+  runs: ConversationLiveTextRun[], turnId: string,
+): ConversationTurnSegment[] {
+  const eventText = segments.filter(segment => segment.kind === "text").map(segment => segment.text).join("");
+  if (fullText.length <= eventText.length || !fullText.endsWith(eventText)) return segments;
+  const prefixEnd = fullText.length - eventText.length;
+  const prefix: ConversationTurnSegment[] = [];
+  let covered = 0;
+  for (const run of runs) {
+    if (run.start >= prefixEnd) break;
+    if (run.start !== covered || run.end <= run.start) break;
+    const end = Math.min(run.end, prefixEnd);
+    prefix.push({ kind: "text", turnId, text: fullText.slice(run.start, end), phase: run.phase });
+    covered = end;
+    if (covered === prefixEnd) break;
+  }
+  if (covered < prefixEnd) prefix.push({ kind: "text", turnId, text: fullText.slice(covered, prefixEnd), phase: "unknown" });
+  return [...prefix, ...segments];
+}
 
 export interface ConversationTurnPresentation {
   activity: ConversationTurnSegment[];
@@ -575,6 +598,7 @@ function mergeConversationTool(
   // Prefer payload outcome (declined/failed/…) over bare lifecycle "completed" (#220).
   // Late progress must not revive running; prior declined/cancelled survive.
   const status = resolveToolOutcomeStatus(payload, type, previous);
+  const suppliedOutput = payload.output ?? payload.result ?? payload.summary;
   return {
     id: conversationToolKey(payload, turnId),
     name: provisionalName || previous?.name || "未知工具",
@@ -585,9 +609,9 @@ function mergeConversationTool(
       previous?.argsSummary ||
       "",
     outputSummary:
-      serializeEventValue(payload.output || payload.result || payload.summary) ||
-      previous?.outputSummary ||
-      "",
+      suppliedOutput != null ? serializeEventValue(suppliedOutput)
+        : typeof payload.chunk === "string" ? `${previous?.outputSummary || ""}${payload.chunk}`
+        : previous?.outputSummary || "",
     error: toolOutcomeError(status, payload, previous, failedHint),
     turnId: turnId || previous?.turnId,
     // Keep the first observed start; late progress/replay must not move it (#218).

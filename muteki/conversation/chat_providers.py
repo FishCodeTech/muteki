@@ -6,7 +6,6 @@ commands: a TUI command is never promoted to a callable chat capability here.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -30,6 +29,8 @@ class ChatEngineProvider:
         return Path(value).expanduser() if value else Path.home() / self.home_relative
 
     def native_mcp(self) -> list[dict[str, Any]]:
+        if os.environ.get("MUTEKI_HOST_DISCOVERY", "1") == "0":
+            return []
         rows: dict[str, dict[str, Any]] = {}
         paths = [self.native_root() / filename for filename in self.mcp_files]
         if self.engine == "claude":
@@ -53,24 +54,35 @@ class ChatEngineProvider:
         # often contain secrets. Runtime connection status is a separate fact.
         return list(rows.values())
 
+    @property
+    def configuration_names(self) -> tuple[str, ...]:
+        return ("config.toml", "settings.json", "settings.yaml", "settings.yml", "models.json", "models.yml",
+                "mcp.json", "cli-config.json", "agent-cli-state.json", "acp-config.json", "opencode.json", "opencode.jsonc")
+
+    @property
+    def credential_names(self) -> tuple[str, ...]:
+        return ("auth.json", ".credentials.json", "credentials.json", "credentials", "oauth", "device_id")
+
+    @property
+    def asset_names(self) -> tuple[str, ...]:
+        # Cursor's extensions directory contains desktop IDE extensions, not
+        # Agent CLI capabilities. Only engines with native extensions import it.
+        names = ("skills", "skills-cursor", "commands", "agents", "prompts", "plugins")
+        return (*names, "extensions") if self.engine in {"pi", "omp", "opencode"} else names
+
     def revision(self) -> str:
+        if os.environ.get("MUTEKI_HOST_DISCOVERY", "1") == "0":
+            return "host-discovery-disabled"
+        from .native_environment import content_revision
         root = self.native_root()
-        paths = [root / name for name in ("config.toml", "settings.json", "mcp.json", "auth.json", ".credentials.json",
-                                         "models.json", "settings.yml", "models.yml", "cli-config.json", "plugins", "skills")]
-        for name in ("credentials", "oauth"):
-            if (root / name).is_dir():
-                paths.extend((root / name).glob("*"))
-        stamps = []
-        for path in paths:
-            try:
-                stat = path.stat()
-                stamps.append((str(path), stat.st_mtime_ns, stat.st_size))
-            except OSError:
-                pass
-        return sha256(json.dumps(stamps).encode()).hexdigest()[:16]
+        # Authentication rotation must not invalidate capability snapshots.
+        return content_revision([(name, root / name) for name in (*self.configuration_names, *self.asset_names)]
+                                + [("common-skills", Path.home() / ".agents/skills")])
 
     def plugin_skill_roots(self) -> list[tuple[str, Path]]:
         """Only enabled native plugins, never another engine's cache."""
+        if os.environ.get("MUTEKI_HOST_DISCOVERY", "1") == "0":
+            return []
         root = self.native_root()
         packages: list[tuple[str, Path]] = []
         try:

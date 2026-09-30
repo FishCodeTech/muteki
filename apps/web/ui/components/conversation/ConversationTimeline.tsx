@@ -35,6 +35,7 @@ import {
   conversationErrorMessage,
   EMPTY_TURN_RUNTIME,
   presentConversationTurn,
+  restoreConversationStreamPrefix,
   resolveConversationLiveActivity,
   resolveConversationTurnDurationMs,
   type ConversationTurnRuntime,
@@ -68,6 +69,7 @@ export interface ConversationTimelineProps {
   credentials?: ConversationCredential[];
   events?: ConversationEvent[];
   liveText?: string;
+  liveTextRuns?: import("@/lib/conversationStreamReducer").ConversationLiveTextRun[];
   running?: boolean;
   connected?: boolean;
   streamStatus?: ConversationStreamStatus;
@@ -86,8 +88,8 @@ export interface ConversationTimelineProps {
   }) => void;
   onOpenAttachment?: (attachment: MessageAttachmentChip) => void;
   onResourceLink?: (target: ResourceLinkTarget) => void;
-  onApprovalDecision: (approvalId: string, decision: "allow" | "deny", scopeMode?: "once" | "session") => void;
-  onUserInputResolve: (payload: UserInputResolvePayload) => void;
+  onApprovalDecision: (approvalId: string, decision: "allow" | "deny", scopeMode?: "once" | "session", optionId?: string) => void;
+  onUserInputResolve: (payload: UserInputResolvePayload) => void | Promise<boolean>;
   threadId?: string;
   onRetryTurn?: (turnId: string) => void;
   onEditTurn?: (turnId: string, text: string) => void;
@@ -127,7 +129,7 @@ export interface ConversationTimelineProps {
   highlightedMessageId?: string;
   /** When true (C07 `?message=` present), skip C08 restore for this visit. */
   suppressRestore?: boolean;
-  onEnsureMessageVisible?: (messageId: string) => Promise<"ok" | "missing" | "cancelled">;
+  onEnsureMessageVisible?: (messageId: string) => Promise<"ok" | "missing" | "cancelled" | "superseded">;
   /** Cross-thread jump-back: open thread without `?message=` so C08 restore applies. */
   onOpenThread?: (threadId: string) => void;
 }
@@ -288,6 +290,7 @@ export function ConversationTimeline({
   credentials = [],
   events = [],
   liveText = "",
+  liveTextRuns = [],
   running = false,
   connected = true,
   streamStatus = "connected",
@@ -333,7 +336,10 @@ export function ConversationTimeline({
   const streamRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
   const loadingOlderRef = useRef(false);
-  const pendingAnchorRef = useRef<{ height: number; top: number } | null>(null);
+  const pendingAnchorRef = useRef<{ height: number; top: number; threadId: string; firstMessageId?: string; succeeded: boolean } | null>(null);
+  const scrollRequestRef = useRef(0);
+  const [anchorCommit, setAnchorCommit] = useState(0);
+  const activeThreadRef = useRef(view.thread.thread_id); activeThreadRef.current = view.thread.thread_id;
   const highlightScrollDoneRef = useRef("");
   const restoreDoneRef = useRef("");
   const restoringAnchorRef = useRef(false);
@@ -346,6 +352,12 @@ export function ConversationTimeline({
   const [hydratedEventsByTurn, setHydratedEventsByTurn] = useState<
     Record<string, ConversationEvent[]>
   >({});
+  const hydratedRef = useRef(hydratedEventsByTurn); hydratedRef.current = hydratedEventsByTurn;
+  const [processByTurn, setProcessByTurn] = useState<Record<string, {
+    loading: boolean; error: string; hasMore: boolean; nextAfterSeq?: number | null; watermark?: number;
+  }>>({});
+  const processRef = useRef(processByTurn); processRef.current = processByTurn;
+  const processRequestsRef = useRef(new Map<string, AbortController>());
   const [expandByTurn, setExpandByTurn] = useState<TurnExpandState>({});
 
   useEffect(() => {
@@ -356,6 +368,12 @@ export function ConversationTimeline({
 
   useEffect(() => {
     setHydratedEventsByTurn({});
+    setProcessByTurn({});
+    for (const controller of processRequestsRef.current.values()) controller.abort();
+    processRequestsRef.current.clear();
+    scrollRequestRef.current += 1;
+    pendingAnchorRef.current = null;
+    loadingOlderRef.current = false;
     const threadKey = view.thread.thread_id;
     setExpandByTurn(readExpandState(threadKey));
     restoreDoneRef.current = "";
@@ -363,6 +381,12 @@ export function ConversationTimeline({
     anchorRequestRef.current += 1;
     lastAnchorRef.current = null;
     setDismissedFailureKey("");
+    return () => {
+      for (const controller of processRequestsRef.current.values()) controller.abort();
+      processRequestsRef.current.clear();
+      scrollRequestRef.current += 1;
+      pendingAnchorRef.current = null;
+    };
   }, [view.thread.thread_id]);
 
   useEffect(() => {
@@ -462,16 +486,26 @@ export function ConversationTimeline({
       pendingAnchorRef.current = {
         height: element.scrollHeight,
         top: element.scrollTop,
+        threadId: view.thread.thread_id,
+        firstMessageId: view.messages[0]?.message_id,
+        succeeded: false,
       };
-      void Promise.resolve(onLoadOlder()).finally(() => {
-        loadingOlderRef.current = false;
-      });
+      const anchor = pendingAnchorRef.current;
+      const request = scrollRequestRef.current;
+      void Promise.resolve(onLoadOlder()).then((loaded) => {
+        if (pendingAnchorRef.current !== anchor) return;
+        if (!loaded || activeThreadRef.current !== anchor.threadId || scrollRequestRef.current !== request) pendingAnchorRef.current = null;
+        else { anchor.succeeded = true; setAnchorCommit(value => value + 1); }
+      }).catch(() => { if (pendingAnchorRef.current === anchor) pendingAnchorRef.current = null; })
+        .finally(() => { if (activeThreadRef.current === anchor.threadId && scrollRequestRef.current === request) loadingOlderRef.current = false; });
     }
   }, [
     highlightedMessageId,
     onLoadOlder,
     persistCurrentAnchor,
     view.messages_page?.has_more_before,
+    view.thread.thread_id,
+    view.messages,
   ]);
 
   useEffect(() => {
@@ -482,22 +516,28 @@ export function ConversationTimeline({
   useEffect(() => {
     const anchor = pendingAnchorRef.current;
     const element = streamRef.current;
-    if (!anchor || !element) return;
+    if (!anchor || !element || !anchor.succeeded || anchor.threadId !== view.thread.thread_id) return;
+    if (anchor.firstMessageId === view.messages[0]?.message_id) { pendingAnchorRef.current = null; return; }
     pendingAnchorRef.current = null;
     const frame = requestAnimationFrame(() => {
       element.scrollTop = anchor.top + (element.scrollHeight - anchor.height);
       persistCurrentAnchor(element, false);
     });
     return () => cancelAnimationFrame(frame);
-  }, [persistCurrentAnchor, view.messages.length]);
+  }, [persistCurrentAnchor, view.messages.length, loadingOlder, view.thread.thread_id, anchorCommit]);
 
   const jumpToLatest = useCallback(() => {
-    stickToBottomRef.current = true;
-    setShowJumpToLatest(false);
+    const request = ++scrollRequestRef.current;
+    const threadId = view.thread.thread_id;
     // Instant scrollTop jumps (not smooth) — avoids racing follow/re-anchor.
     // Tip replace changes row count/heights; scroll after layout commits.
-    void Promise.resolve(onJumpToLatest?.()).finally(() => {
+    void Promise.resolve(onJumpToLatest?.() ?? true).then((loaded) => {
+      if (!loaded || request !== scrollRequestRef.current || activeThreadRef.current !== threadId) return;
+      pendingAnchorRef.current = null;
+      stickToBottomRef.current = true;
+      setShowJumpToLatest(false);
       const scrollTip = () => {
+        if (request !== scrollRequestRef.current || activeThreadRef.current !== threadId) return;
         const element = streamRef.current;
         if (!element) return;
         element.scrollTop = element.scrollHeight;
@@ -509,8 +549,8 @@ export function ConversationTimeline({
       });
       window.setTimeout(scrollTip, 50);
       window.setTimeout(scrollTip, 200);
-    });
-  }, [onJumpToLatest, persistCurrentAnchor]);
+    }).catch(() => { if (request === scrollRequestRef.current) setShowJumpToLatest(true); });
+  }, [onJumpToLatest, persistCurrentAnchor, view.thread.thread_id]);
 
 
   useEffect(() => {
@@ -601,18 +641,40 @@ export function ConversationTimeline({
     [foldEvents],
   );
 
-  const ensureTurnProcess = useCallback(async (turnId: string) => {
-    if (!turnId || hydratedEventsByTurn[turnId]) return;
+  const ensureTurnProcess = useCallback(async (turnId: string, more = false) => {
+    const previous = processRef.current[turnId];
+    if (!turnId || processRequestsRef.current.has(turnId)) return;
+    if (!more && hydratedRef.current[turnId] && !previous?.error) return;
+    if (more && previous && !previous.hasMore && !previous.error) return;
+    const threadId = view.thread.thread_id;
+    const controller = new AbortController(); processRequestsRef.current.set(turnId, controller);
+    setProcessByTurn(current => ({ ...current, [turnId]: { ...current[turnId], loading: true, error: "", hasMore: previous?.hasMore ?? false } }));
     try {
-      const detail = await fetchTurnProcess(view.thread.thread_id, turnId);
+      const detail = await fetchTurnProcess(threadId, turnId, { signal: controller.signal,
+        ...(more ? { afterSeq: previous?.nextAfterSeq ?? 0, watermark: previous?.watermark } : {}) });
+      if (controller.signal.aborted || activeThreadRef.current !== threadId) return;
       setHydratedEventsByTurn((current) => ({
         ...current,
-        [turnId]: detail.events || [],
+        [turnId]: Array.from(new Map([...(more ? current[turnId] || [] : []), ...detail.events].map(event => [event.event_id || `${event.seq}:${event.event_type}`, event])).values()).sort((a,b) => a.seq - b.seq),
       }));
-    } catch {
-      // Leave segments empty; persisted assistant text still renders.
+      const hasMore = Boolean(detail.has_more ?? detail.truncated);
+      setProcessByTurn(current => ({ ...current, [turnId]: { loading: false,
+        error: hasMore && detail.next_after_seq == null ? "过程仍不完整，服务未提供后续游标；请重试加载。" : "",
+        hasMore, nextAfterSeq: detail.next_after_seq, watermark: detail.watermark } }));
+    } catch (error) {
+      if (controller.signal.aborted || activeThreadRef.current !== threadId) return;
+      setProcessByTurn(current => ({ ...current, [turnId]: { ...current[turnId], loading: false,
+        hasMore: current[turnId]?.hasMore ?? false, error: error instanceof Error ? error.message : String(error) } }));
+    } finally {
+      if (processRequestsRef.current.get(turnId) === controller) processRequestsRef.current.delete(turnId);
     }
-  }, [hydratedEventsByTurn, view.thread.thread_id]);
+  }, [view.thread.thread_id]);
+
+  useEffect(() => {
+    for (const [turnId, state] of Object.entries(expandByTurn)) {
+      if (state.processOpen && !processByTurn[turnId]) void ensureTurnProcess(turnId);
+    }
+  }, [expandByTurn, processByTurn, ensureTurnProcess]);
 
   const turnById = useMemo(
     () => new Map(view.turns.map((turn) => [turn.turn_id, turn])),
@@ -624,7 +686,7 @@ export function ConversationTimeline({
     Object.entries(rawPendingApprovals).filter(([, row]) => {
       if (!row || typeof row !== "object") return false;
       const status = String((row as Record<string, unknown>).status || "pending");
-      return status === "pending" || status === "expired";
+      return status === "pending" || status === "resolving" || status === "expired";
     }),
   ) as Record<string, Record<string, unknown>>;
   const rawPendingApproval = view.state.pending_approval;
@@ -859,6 +921,12 @@ export function ConversationTimeline({
   const resolveTurnRuntime = (turnId: string): ConversationTurnRuntime => {
     const recorded = runtimeByTurn[turnId];
     if (recorded) return recorded;
+    const snapshot = view.turns.find((turn) => turn.turn_id === turnId)?.runtime_snapshot;
+    if (snapshot) return {
+      adapterId: snapshot.adapter_id || "", instanceId: snapshot.instance_id || "default",
+      credentialId: snapshot.credential_id || "", model: snapshot.model || "",
+      effort: snapshot.effort || "", accessMode: snapshot.access_mode || "",
+    };
     if (turnId && turnId === view.state.running_turn_id) return liveSelectorRuntime();
     return EMPTY_TURN_RUNTIME;
   };
@@ -928,6 +996,7 @@ export function ConversationTimeline({
       fallbackText
       && (!hasText || (isSettled && fallbackText !== eventText)),
     );
+    const streamingText = isStreaming && turnId === view.state.running_turn_id ? liveText : "";
     // The event window is intentionally bounded. Once a turn settles, the
     // persisted assistant message is authoritative when replayed events are
     // incomplete, so a refresh cannot replace the beginning with a suffix.
@@ -941,7 +1010,7 @@ export function ConversationTimeline({
           phase: turnStatus === "completed" ? "final_answer" : "unknown",
           },
         ]
-      : segments;
+      : restoreConversationStreamPrefix(segments, streamingText, liveTextRuns, turnId);
     const presentation = presentConversationTurn(display, turnStatus);
     const turnRuntime = resolveTurnRuntime(turnId);
     const runtimeIdentity = resolveAssistantRuntimeIdentity(turnRuntime, credentials);
@@ -978,6 +1047,18 @@ export function ConversationTimeline({
           runtime={runtimeIdentity}
           collapsed={collapseIdentity}
         />
+        {expandByTurn[turnId]?.processOpen && processByTurn[turnId] ? (
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-[12px] text-cx-fg-3" role="status">
+            {processByTurn[turnId].loading ? <><Spinner size={12} />正在读取过程…</> : null}
+            {processByTurn[turnId].error ? <span className="whitespace-pre-wrap text-cx-danger">{processByTurn[turnId].error}</span> : null}
+            {processByTurn[turnId].hasMore ? <span>已读取 {hydratedEventsByTurn[turnId]?.length || 0} 条，过程尚未完整</span> : null}
+            {!processByTurn[turnId].loading && (processByTurn[turnId].hasMore || processByTurn[turnId].error) ? (
+              <Button size="xs" variant="ghost" onClick={() => void ensureTurnProcess(turnId, Boolean(processByTurn[turnId].nextAfterSeq))}>
+                {processByTurn[turnId].error ? "重试读取过程" : "加载后续过程"}
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
         <ConversationTurnProcess
           turnId={turnId}
           status={turnStatus}
@@ -1088,6 +1169,16 @@ export function ConversationTimeline({
       highlightScrollDoneRef.current = "";
       return;
     }
+    scrollRequestRef.current += 1;
+    pendingAnchorRef.current = null;
+    if (showSuperseded && supersededMessages.some(message => message.message_id === target)) {
+      stickToBottomRef.current = false;
+      setShowJumpToLatest(true);
+      const frame = requestAnimationFrame(() => {
+        streamRef.current?.querySelector<HTMLElement>(`[data-audit-message-id="${CSS.escape(target)}"]`)?.scrollIntoView({ block: "center", behavior: "auto" });
+      });
+      return () => cancelAnimationFrame(frame);
+    }
     const index = timelineRowIndexForMessageId(timelineRows, target);
     if (index < 0) {
       // Around-page may still be loading; allow a later retry once messages land.
@@ -1129,7 +1220,7 @@ export function ConversationTimeline({
       window.clearTimeout(retry);
       window.clearTimeout(retry2);
     };
-  }, [highlightedMessageId, rowVirtualizer, timelineRows, view.messages]);
+  }, [highlightedMessageId, rowVirtualizer, timelineRows, view.messages, showSuperseded, supersededMessages]);
 
   const scrollToMessageAnchor = useCallback(async (
     messageId: string,
@@ -1339,13 +1430,16 @@ export function ConversationTimeline({
             </h3>
             <div className="flex flex-col gap-3">
               {supersededMessages.map((msg) => (
+                <div key={`sup-${msg.message_id}`} data-audit-message-id={msg.message_id} className={highlightedMessageId === msg.message_id ? "conversation-message-highlight" : undefined}>
                 <ConversationMessage
-                  key={`sup-${msg.message_id}`}
-                  role={msg.role === "assistant" ? "assistant" : "user"}
+                  role={msg.role}
+                  sourceProvider={msg.source_provider}
+                  sourceContent={msg.source_content}
                   text={msg.text}
                   superseded
                   showActions={false}
                 />
+                </div>
               ))}
               {!supersededMessages.length && supersededTurns.map((turn) => (
                 <div key={turn.turn_id} className="font-cx-mono text-[12px] text-cx-fg-3">
@@ -1460,6 +1554,8 @@ export function ConversationTimeline({
                   />
                 </>
               );
+            } else if (msg.role !== "user") {
+              body = <>{orphanRows}<ConversationMessage role={msg.source_role || msg.role} sourceProvider={msg.source_provider} sourceContent={msg.source_content} messageId={msg.message_id} turnId={msg.turn_id || undefined} text={msg.text} createdAt={msg.created_at} showActions={false} /></>;
             } else {
               const turnId = msg.turn_id || "";
               const assistantMsg = assistantMessagesByTurn.get(turnId);

@@ -100,9 +100,13 @@ LOG = logging.getLogger(__name__)
 class ControlDeliveryError(RuntimeError):
     """A control response failed; retain its pending public request."""
 
-    def __init__(self, runtime_code: str):
-        super().__init__("操作未送达原会话，待处理请求已保留。请刷新后重试，或取消本轮。")
+    def __init__(self, runtime_code: str, *, delivery_unknown: bool = False):
+        super().__init__(
+            "操作的投递结果无法确认，原决定已保留。请恢复原回执，或取消本轮。"
+            if delivery_unknown else
+            "操作未送达原会话，待处理请求已保留。请刷新后重试，或取消本轮。")
         self.runtime_code = runtime_code
+        self.delivery_unknown = delivery_unknown
 
 # #188: capability refresh failure backoff (seconds).
 _CAPABILITY_REFRESH_BACKOFF_BASE_S = 2.0
@@ -281,12 +285,15 @@ class ExternalAgentSessionExecutor:
         """Resolve Turn attachment digests into staged Adapter payload entries."""
         caps = await adapter.capabilities()
         image_input = bool(getattr(caps, "image_input", False))
-        authorized = thread_authorized_sha256s(
-            self._store.read_events("thread", thread.thread_id, limit=10_000)
-        )
+        authorized = self._store.artifact_digests(thread.thread_id)
 
         def get_artifact(sha256: str) -> Optional[Artifact]:
-            return self._store.get(Artifact, sha256)
+            artifact = self._store.get(Artifact, sha256)
+            metadata = self._store.artifact_metadata(thread.thread_id, sha256)
+            if artifact is not None and metadata is not None:
+                artifact = artifact.model_copy(update={key: metadata[key] for key in
+                    ("name", "media_type", "kind") if key in metadata})
+            return artifact
 
         stage_root = ""
         if not str(workspace_root or "").strip():
@@ -480,6 +487,8 @@ class ExternalAgentSessionExecutor:
                 plugins.prepare_environment, engine,
                 thread_id + ":" + selection.credential_id,
                 credential_env,
+                previous_revision=(plugins.session_revision(previous_record.agent_session_id)
+                                   if previous_record is not None and previous_record.adapter_id == selection.adapter_id else None),
             )
         if plugins is not None and thread.mode == "conversation":
             options.update(await asyncio.to_thread(plugins.native_launch_options, engine, credential_env))
@@ -1168,6 +1177,8 @@ class ExternalAgentSessionExecutor:
                 plugins.prepare_environment, engine,
                 thread.thread_id + ":" + selection.credential_id,
                 credential_env,
+                previous_revision=(plugins.session_revision(previous_agent_session_id)
+                                   if previous_agent_session_id and previous_adapter_id == selection.adapter_id else None),
             )
         if plugins is not None and thread.mode == "conversation":
             options.update(await asyncio.to_thread(plugins.native_launch_options, engine, credential_env))
@@ -1270,10 +1281,14 @@ class ExternalAgentSessionExecutor:
     ) -> bool:
         """关闭 Thread 的活跃 Session，并返回是否实际关闭。"""
         record = self._session_record(thread_id)
+        closed = False
         if record is not None and record.closed_at is None:
-            await self._close_record(record, reason=reason)
-            return True
-        return False
+            await self._close_record(record, reason=reason, strict=reason == "thread_archived")
+            closed = True
+        plugins = getattr(self, "chat_plugins", None)
+        if plugins is not None and reason == "thread_archived":
+            await asyncio.to_thread(plugins.release_thread_assets, thread_id)
+        return closed
 
     async def _stop_detached_runtime(
         self, thread_id: str, *, reason: str
@@ -1732,9 +1747,11 @@ class ExternalAgentSessionExecutor:
                     # publishing a successful resolved event would lose it.
                     payload = dict(event.payload or {})
                     raise ControlDeliveryError(str(
-                        payload.get("code") or event.event_type.value))
+                        payload.get("code") or event.event_type.value),
+                        delivery_unknown=bool(payload.get("delivery_unknown")))
                 if (require_control_delivery
-                        and event.event_type is AgentEventType.APPROVAL_RESOLVED):
+                        and event.event_type in {AgentEventType.APPROVAL_RESOLVED,
+                                                AgentEventType.USER_INPUT_RESOLVED}):
                     # The command publishes resolution after the complete
                     # response stream succeeds. Other runtime streams still
                     # translate autonomous resolution normally.
@@ -1986,8 +2003,9 @@ class ExternalAgentSessionExecutor:
             # Web 的 approval.resolve 命令，也必须进入投影以清除待处理状态。
             out_type, payload = ev.EV_APPROVAL_RESOLVED, {**base, **p}
         elif etype is AgentEventType.USER_INPUT_RESOLVED:
-            # 用户输入结果由 user_input.resolve 命令落事件。
-            return False
+            # Native timeout/cancellation is authoritative too. The matching
+            # request ID protects a newer question from a late acknowledgement.
+            out_type, payload = ev.EV_USER_INPUT_RESOLVED, {**base, **p}
         else:
             # 未知 / 私有事件进入诊断事件流，不改变错误状态。
             out_type, payload = ev.EV_RUNTIME_EVENT, {
@@ -2186,7 +2204,7 @@ class ExternalAgentSessionExecutor:
 
     async def resolve_approval(
         self, thread_id: str, approval_id: str, decision: str, note: str = "",
-        scope: str = "once",
+        scope: str = "once", option_id: str = "",
     ) -> None:
         """approval 答复送回 Runtime，并翻译其后续事件。"""
         adapter, ref = self._ref_for(thread_id)
@@ -2195,6 +2213,7 @@ class ExternalAgentSessionExecutor:
             "decision": decision,
             "scope": scope,
             "note": note,
+            "option_id": option_id,
         })
         stream = adapter.send(ref, AgentInput(
             kind="approval_response",

@@ -8,6 +8,12 @@ import type {
 import { apiFetch } from "./useRun";
 
 export type ComposerTrigger = "/" | "@" | "$";
+export interface ComposerCapabilitySectionError {
+  section: string;
+  code?: string;
+  message: string;
+  [key: string]: unknown;
+}
 export type ComposerCapabilityKind = "command" | "skill" | "mcp" | "plugin" | "file" | "thread" | "message_span" | "tool_excerpt";
 
 export interface ComposerCapabilityContext {
@@ -83,12 +89,30 @@ export type ComposerCapabilityRef = Omit<
   context_schema?: 2;
 };
 
+export class ComposerCapabilityError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly rawBody: string,
+    readonly details: Record<string, unknown> = {},
+    readonly correlationId: string = "",
+  ) {
+    super(message);
+    this.name = "ComposerCapabilityError";
+  }
+
+  get diagnostic(): string {
+    return JSON.stringify({ status: this.status, correlationId: this.correlationId, ...this.details }, null, 2)
+      + "\n\n完整响应正文：\n" + this.rawBody;
+  }
+}
+
 export async function fetchComposerCapabilities(
   context: ComposerCapabilityContext,
   trigger: ComposerTrigger,
   query: string,
   signal?: AbortSignal,
-): Promise<{ engine: string; items: ComposerCapabilityItem[]; runtime: ComposerRuntimeState }> {
+): Promise<{ engine: string; items: ComposerCapabilityItem[]; runtime: ComposerRuntimeState; sectionErrors: ComposerCapabilitySectionError[] }> {
   const response = await apiFetch("/api/conversation/composer-capabilities", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -102,18 +126,40 @@ export async function fetchComposerCapabilities(
     }),
     signal,
   });
-  const body = await response.json().catch(() => ({})) as {
+  const rawBody = await response.text();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawBody);
+  } catch {
+    throw new ComposerCapabilityError(
+      `能力目录返回无法解析的响应（HTTP ${response.status}）`, response.status, rawBody,
+      { code: "capability_response_invalid_json" }, response.headers.get("x-request-id") || "",
+    );
+  }
+  const body = (parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {}) as {
     engine?: string;
     items?: ComposerCapabilityItem[];
     runtime?: Partial<ComposerRuntimeState>;
-    error?: { message?: string; code?: string };
+    error?: { message?: string; code?: string; [key: string]: unknown };
+    section_errors?: ComposerCapabilitySectionError[];
   };
   if (!response.ok) {
-    throw new Error(body.error?.message || body.error?.code || `能力目录加载失败（HTTP ${response.status}）`);
+    throw new ComposerCapabilityError(
+      body.error?.message || body.error?.code || `能力目录加载失败（HTTP ${response.status}）`,
+      response.status, rawBody, body.error || {}, response.headers.get("x-request-id") || "",
+    );
+  }
+  if (!Array.isArray(body.items)) {
+    throw new ComposerCapabilityError(
+      "能力目录响应缺少候选列表", response.status, rawBody,
+      { code: "capability_response_invalid_shape" }, response.headers.get("x-request-id") || "",
+    );
   }
   return {
     engine: body.engine || "",
     items: Array.isArray(body.items) ? body.items : [],
+    sectionErrors: Array.isArray(body.section_errors) ? body.section_errors.filter((error) =>
+      error && typeof error.section === "string" && typeof error.message === "string") : [],
     runtime: {
       adapter_id: String(body.runtime?.adapter_id || context.adapterId),
       revision: Number(body.runtime?.revision || 0),

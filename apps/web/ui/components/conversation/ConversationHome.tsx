@@ -13,6 +13,7 @@ import { ComposerContextStrip } from "./ComposerContextStrip";
 import type {
   ConversationCredential,
   ConversationProject,
+  RuntimeInstance,
   WorkspaceBindMode,
 } from "@/lib/useConversation";
 import type {
@@ -36,6 +37,9 @@ export interface ConversationHomeProps {
   selectedEffort: string;
   selectedAccessMode: string;
   accessModes?: string[];
+  runtimes?: RuntimeInstance[];
+  runtimeKey?: string;
+  onRuntimeChange?: (key: string) => void;
   onSelectModelParams: (params: {
     credentialId: string;
     model: string;
@@ -78,7 +82,7 @@ export interface ConversationHomeProps {
   capabilityContext?: ComposerCapabilityContext;
   capabilityRefs?: ComposerCapabilityRef[];
   onCapabilityRefsChange?: (refs: ComposerCapabilityRef[]) => void;
-  onComposerCommand?: (action: string) => void;
+  onComposerCommand?: (action: string, sourceDocument?: PromptDocument) => void;
   projectHasDefault?: boolean;
   savingProjectDefault?: boolean;
   onSetProjectDefault?: () => void;
@@ -94,10 +98,10 @@ export interface ConversationHomeProps {
   onModelPickerOpenChange?: (open: boolean) => void;
 }
 
-const SUGGESTIONS: Array<{ icon: IconName; label: string; prompt: string }> = [
-  { icon: "gitCompare", label: "审查当前改动", prompt: "审查当前工作区的未提交改动，指出潜在问题并给出修改建议。" },
-  { icon: "book", label: "解释这个项目", prompt: "阅读这个项目，概述它的架构、关键模块和运行方式。" },
-  { icon: "wrench", label: "修复失败的测试", prompt: "运行测试，定位失败原因并修复，完成后再次验证。" },
+const SUGGESTIONS: Array<{ icon: IconName; label: string; prompt: string; workspace?: boolean }> = [
+  { icon: "gitCompare", label: "审查当前改动", prompt: "审查当前工作区的未提交改动，指出潜在问题并给出修改建议。", workspace: true },
+  { icon: "book", label: "解释这个项目", prompt: "阅读这个项目，概述它的架构、关键模块和运行方式。", workspace: true },
+  { icon: "wrench", label: "修复失败的测试", prompt: "运行测试，定位失败原因并修复，完成后再次验证。", workspace: true },
   { icon: "listTodo", label: "起草实现方案", prompt: "为下面的需求起草一个分步骤的实现方案，并说明取舍：\n\n" },
 ];
 
@@ -122,6 +126,9 @@ export function ConversationHome({
   selectedEffort,
   selectedAccessMode,
   accessModes = [],
+  runtimes,
+  runtimeKey,
+  onRuntimeChange,
   onSelectModelParams,
   projects,
   selectedProjectId,
@@ -201,7 +208,7 @@ export function ConversationHome({
             <Icon name="sparkles" size={20} />
           </span>
           <h1 className="text-[28px] font-semibold leading-9 tracking-[-0.02em] text-cx-fg">{hello}，想让 Agent 做点什么？</h1>
-          <p className="text-[14px] text-cx-fg-3">描述任务，Agent 会在你的工作区里规划、执行并汇报每一步。</p>
+          <p className="text-[14px] text-cx-fg-3">{selectedProjectId ? "描述任务，Agent 可使用已选择的工作区执行并汇报。" : "描述任务即可开始普通聊天。读取文件、审查代码和终端操作需要先选择工作目录。"}</p>
         </motion.div>
 
         {readiness && onRetryReadiness && onProbeAgent && onDismissGuide ? (
@@ -211,8 +218,7 @@ export function ConversationHome({
             onRetry={onRetryReadiness}
             onProbe={onProbeAgent}
             onDismissGuide={onDismissGuide}
-            onPickDirectory={onCreateProject ? () => { void onCreateProject(); } : undefined}
-            onEnterPath={onRequestPathInput}
+            directoryControlInComposer
           />
         ) : null}
 
@@ -250,6 +256,9 @@ export function ConversationHome({
                   selectedEffort={selectedEffort}
                   selectedAccessMode={selectedAccessMode}
                   accessModes={accessModes}
+                  runtimes={runtimes}
+                  runtimeKey={runtimeKey}
+                  onRuntimeChange={onRuntimeChange}
                   loading={credentialsLoading}
                   error={credentialsError}
                   onRetry={onRetryCredentials}
@@ -341,8 +350,10 @@ export function ConversationHome({
               key={item.label}
               type="button"
               tabIndex={composerEmpty ? 0 : -1}
+              disabled={Boolean(item.workspace && !selectedProjectId)}
+              title={item.workspace && !selectedProjectId ? "请先通过输入框下方的工作区入口选择目录。" : undefined}
               onClick={() => applySuggestion(item.prompt)}
-              className="cx-press inline-flex h-8 items-center gap-1.5 rounded-full border border-cx-border px-3 text-[12.5px] text-cx-fg-2 hover:border-cx-border-strong hover:bg-cx-hover hover:text-cx-fg"
+              className="cx-press inline-flex h-8 items-center gap-1.5 rounded-full border border-cx-border px-3 text-[12.5px] text-cx-fg-2 hover:border-cx-border-strong hover:bg-cx-hover hover:text-cx-fg disabled:opacity-50"
             >
               <Icon name={item.icon} size={13} className="text-cx-fg-4" />
               {item.label}

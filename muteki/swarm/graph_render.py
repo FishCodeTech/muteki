@@ -84,6 +84,11 @@ class _RenderMixin:
                 "WHERE challenge_id=? AND kind=? ORDER BY seq",
                 (self.challenge.id, EV_FINDING_FOUND),
             ).fetchall()
+            finding_review_rows = self._conn.execute(
+                "SELECT payload FROM events WHERE challenge_id=? "
+                "AND kind='finding_reviewed' AND verified=1 ORDER BY seq",
+                (self.challenge.id,),
+            ).fetchall() if getattr(self.challenge, "mode", "ctf") == "pentest" else []
             observation_rows = self._conn.execute(
                 "SELECT observation_seq,intent_id,text,witness,artifact_id,"
                 "admitted_fact_seq,created_at,target_epoch,provenance_json "
@@ -202,12 +207,25 @@ class _RenderMixin:
                     lines.append(
                         f"      - id: {self._ctf_yaml_scalar(ref.get('artifact_id'))}"
                     )
-                    for key, field in (("sha256", "sha256"), ("command", "command")):
-                        if ref.get(field):
-                            visible, _ = encode_graph_text(ref[field])
+                    if getattr(self.challenge, "mode", "ctf") == "pentest":
+                        # Canonical provenance still retains every exact command
+                        # and tool output. The pentest graph can accumulate
+                        # hundreds of these references; its projection carries
+                        # stable IDs instead of replaying command text in every
+                        # later Worker prompt. Keep the CTF projection unchanged.
+                        if ref.get("sha256"):
                             lines.append(
-                                f"        {key}: {self._ctf_yaml_scalar(visible)}"
+                                f"        sha256: {self._ctf_yaml_scalar(ref['sha256'])}"
                             )
+                        if ref.get("tool_event_seq") is not None:
+                            lines.append(f"        toolEventSeq: {int(ref['tool_event_seq'])}")
+                    else:
+                        for key, field in (("sha256", "sha256"), ("command", "command")):
+                            if ref.get(field):
+                                visible, _ = encode_graph_text(ref[field])
+                                lines.append(
+                                    f"        {key}: {self._ctf_yaml_scalar(visible)}"
+                                )
                     if ref.get("size") is not None:
                         lines.append(f"        bytes: {int(ref['size'])}")
             if fact["created_at"]:
@@ -283,29 +301,36 @@ class _RenderMixin:
             if artifact_id:
                 lines.append(f"    artifact: {self._ctf_yaml_scalar(artifact_id)}")
 
+        finding_reviews: dict[int, dict[str, Any]] = {}
+        for (raw_review,) in finding_review_rows:
+            review = json.loads(raw_review or "{}")
+            seq = review.get("finding_seq")
+            if type(seq) is int and seq > 0:
+                finding_reviews[seq] = review
         findings: list[dict[str, Any]] = []
         next_finding_index = 0
-        for _seq, ts, raw_payload in finding_rows:
+        for finding_seq, ts, raw_payload in finding_rows:
             try:
                 payload = json.loads(raw_payload or "{}")
             except (TypeError, ValueError, json.JSONDecodeError):
                 payload = {}
             finding_class = str(payload.get("finding_class") or "").strip().lower()
-            if finding_class not in {"product", "flag"}:
+            if finding_class not in {"product", "flag"} and payload.get("report_status") != "submitted":
                 continue
             next_finding_index += 1
             from_fact_seq = 0
             try:
-                from_fact_seq = int(payload.get("from_fact") or 0)
+                from_fact_seq = int(payload.get("from_fact") or (payload.get("fact_seqs") or [0])[0])
             except (TypeError, ValueError):
                 from_fact_seq = 0
             findings.append({
                 "id": f"finding_{next_finding_index:03d}",
-                "class": finding_class,
+                "class": "vulnerability_report" if payload.get("report_status") == "submitted" else finding_class,
                 "title": str(payload.get("title") or "").strip(),
                 "from_fact": fact_ids.get(from_fact_seq, ""),
                 "from_step": str(payload.get("from_step") or payload.get("intent_id") or ""),
                 "created_at": self._ctf_created_at(ts),
+                "review": finding_reviews.get(int(finding_seq)),
             })
         lines.append("findings:" if findings else "findings: []")
         for finding in findings:
@@ -322,17 +347,32 @@ class _RenderMixin:
                 )
             if finding["created_at"]:
                 lines.append(f"    createdAt: {finding['created_at']}")
+            if finding["review"] is not None:
+                lines.append(
+                    f"    reviewStatus: {self._ctf_yaml_scalar(finding['review'].get('status'))}"
+                )
+                if finding["review"].get("reason"):
+                    lines.append(
+                        f"    reviewReason: {self._ctf_yaml_scalar(finding['review']['reason'])}"
+                    )
 
         created_at = facts[0]["created_at"] if facts else ""
         if getattr(self.challenge, "mode", "ctf") == "pentest":
             pentest = getattr(self.challenge, "pentest_contract", None)
             policy = getattr(pentest, "authorization", None)
+            from muteki.pentest.judgement import qualified_reports, submitted_reports
+            report_count = len(submitted_reports(self.events(), pentest)) if pentest else 0
+            accepted_count = len(qualified_reports(self.events(), pentest)) if pentest else 0
             lines.extend([
                 "engagement:",
                 "  mode: pentest",
                 f"  contractVersion: {int(getattr(pentest, 'version', 1))}",
                 f"  target: {self._ctf_yaml_scalar(getattr(pentest, 'target', '') or self.challenge.target)}",
                 f"  authorizedScope: {self._ctf_yaml_scalar(', '.join(getattr(policy, 'scope', []) or []))}",
+                f"  reportGoalMode: {self._ctf_yaml_scalar(getattr(pentest, 'report_goal_mode', 'automatic'))}",
+                f"  reportsSubmitted: {report_count}",
+                f"  reportsAccepted: {accepted_count}",
+                f"  reportsExpected: {int(getattr(pentest, 'expected_findings', 0) or 0)}",
                 "  destructiveActions: forbidden",
                 "  publicResearch: allowed",
                 "goals:",

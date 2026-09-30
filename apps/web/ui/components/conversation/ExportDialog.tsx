@@ -8,12 +8,13 @@
  * the download. A separate dialog creates scoped, expiring read-only shares.
  */
 
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/cn";
 import { Icon, type IconName } from "@/components/Icon";
-import { Button, Callout, Checkbox, Dialog } from "@/components/chat/ui";
+import { Button, Callout, Checkbox, Dialog, toast } from "@/components/chat/ui";
 import type { ConversationView } from "@/lib/useConversation";
-import { apiFetch } from "@/lib/useRun";
+import { apiFetch, currentAuthScope } from "@/lib/useRun";
+import { conversationExportFilename, conversationExportMetadata } from "@/lib/conversationExport";
 import { ShareDialog } from "./ShareDialog";
 
 export interface ExportDialogProps {
@@ -30,14 +31,14 @@ const FORMATS: Array<{ value: ExportFormat; label: string; ext: string; icon: Ic
     label: "Markdown",
     ext: ".md",
     icon: "book",
-    description: "人类可读格式，含标题、轮次正文和附件索引。",
+    description: "当前分支的阅读快照，含完整正文、工具摘要和附件关联索引。",
   },
   {
     value: "jsonl",
     label: "JSONL",
     ext: ".jsonl",
     icon: "braces",
-    description: "结构化换行 JSON，每行一条记录，便于程序处理。",
+    description: "JSONL v2：完整消息、轮次、工具与来源关联。二进制附件另行下载。",
   },
 ];
 
@@ -56,8 +57,14 @@ export function ExportDialog({ open, onClose, view }: ExportDialogProps) {
   const turnCount = stats?.turn_count ?? view.turns.length;
   const artifactCount = view.artifacts?.length ?? 0;
   const watermark = view.watermark;
+  const controller = useRef<AbortController | null>(null);
+  const current = useRef({ threadId, open }); current.current = { threadId, open };
+  useEffect(() => { setError(""); setBusy(false); setShareOpen(false); return () => { controller.current?.abort(); controller.current = null; }; }, [threadId, open]);
 
   const handleDownload = async () => {
+    if (controller.current) return;
+    const request = new AbortController(); controller.current = request;
+    const authScope = currentAuthScope();
     setError("");
     setBusy(true);
     try {
@@ -69,37 +76,40 @@ export function ExportDialog({ open, onClose, view }: ExportDialogProps) {
       // apiFetch carries Bearer/ticket auth when MUTEKI_WEB_PASSWORD is set; raw fetch omits it.
       const res = await apiFetch(
         `/api/threads/${encodeURIComponent(threadId)}/export?${params}`,
+        { signal: request.signal },
       );
       if (!res.ok) {
         const body = await res.json().catch(() => ({})) as Record<string, unknown>;
         const err = body.error as Record<string, unknown> | undefined;
         throw new Error((err?.message as string) || `导出失败（HTTP ${res.status}）`);
       }
+      const metadata = conversationExportMetadata(res.headers);
+      if (excludePaths && metadata.path_redaction !== "lexical_best_effort") throw new Error("服务未确认路径脱敏，请重试并检查服务版本。");
       const blob = await res.blob();
-      const ext = format === "jsonl" ? "jsonl" : "md";
-      // Strip only filesystem-unsafe chars so CJK titles survive; the server also sends filename*.
-      const safeTitle = title.replace(/[<>:"/\\|?*\x00-\x1f]/g, "").trim().slice(0, 80) || "export";
-      const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
-      const filename = `${safeTitle.replace(/\s+/g, "-")}-${date}.${ext}`;
+      if (!blob.size) throw new Error("导出文件为空，未保存。");
+      if (request.signal.aborted || current.current.threadId !== threadId || !current.current.open || currentAuthScope() !== authScope) throw new Error("会话或服务范围已改变，旧导出未保存。");
+      const filename = conversationExportFilename({ contentDisposition: res.headers.get("Content-Disposition"), title, format, excludePaths, date: new Date() });
       const objUrl = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = objUrl;
       a.download = filename;
       a.click();
-      URL.revokeObjectURL(objUrl);
+      window.setTimeout(() => URL.revokeObjectURL(objUrl), 60_000);
+      toast({ title: `已导出当前分支完整快照：${metadata.message_count} 条消息、${metadata.turn_count} 轮、${metadata.tool_count} 条工具记录，水位 #${metadata.watermark}`, tone: "success", icon: "download" });
       onClose();
     } catch (exc) {
-      setError(exc instanceof Error ? exc.message : "导出失败");
+      if (current.current.threadId === threadId && current.current.open && !request.signal.aborted) setError(exc instanceof Error ? exc.message : "导出失败");
     } finally {
       setBusy(false);
+      if (controller.current === request) controller.current = null;
     }
   };
 
   const counts: Array<[string, string]> = [
     ["轮次", String(turnCount)],
-    ["消息", String(msgCount)],
-    ["附件", String(artifactCount)],
-    ["水位", `#${watermark}`],
+    ["已加载消息", String(msgCount)],
+    ["已加载附件", String(artifactCount)],
+    ["当前视图水位", `#${watermark}`],
   ];
 
   return (
@@ -111,7 +121,7 @@ export function ExportDialog({ open, onClose, view }: ExportDialogProps) {
       icon="download"
       tone="accent"
       title="导出会话"
-      description={`快照以当前水位 #${watermark} 为基准，导出期间内容保持一致。`}
+      description="导出当前分支的完整历史。服务在请求时生成一致快照；以下是当前加载视图，完整数量和水位会在下载响应中校验。"
       dismissable={!busy}
       testId="conversation-export-dialog"
       footer={(
@@ -151,6 +161,7 @@ export function ExportDialog({ open, onClose, view }: ExportDialogProps) {
                   type="button"
                   role="radio"
                   aria-checked={selected}
+                  disabled={busy}
                   onClick={() => setFormat(option.value)}
                   onKeyDown={(event) => {
                     if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
@@ -204,17 +215,20 @@ export function ExportDialog({ open, onClose, view }: ExportDialogProps) {
           <h3 className="text-[12.5px] font-semibold text-cx-fg-2">脱敏选项</h3>
           <Checkbox
             checked={excludeTools}
+            disabled={busy}
             onCheckedChange={setExcludeTools}
             label="排除工具调用参数"
-            description="保留工具名称和摘要，移除调用参数。"
+            description="保留工具名称、结果摘要与来源事件；移除调用参数。"
           />
           <Checkbox
             checked={excludePaths}
+            disabled={busy}
             onCheckedChange={setExcludePaths}
             label="脱敏绝对路径"
-            description="绝对路径替换为 <path>。"
+            description="按词法规则尽力替换路径；存在歧义，分享前请检查内容。"
           />
         </section>
+        <p className="text-[12px] text-cx-fg-4">完整范围指当前分支的消息与关联记录。二进制附件仅保留名称、哈希和来源索引，需另行下载。</p>
 
         {error ? <Callout tone="danger" role="alert" title="导出失败">{error}</Callout> : null}
       </div>

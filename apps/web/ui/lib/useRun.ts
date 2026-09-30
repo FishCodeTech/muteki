@@ -3,13 +3,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { DeckState, EventType, MutekiEvent, emptyDeck, reduce } from "./events";
 import { deleteRunProjection, loadRunProjection, saveRunProjection } from "./runProjectionCache";
+import { setConversationStorageScope } from "./conversationStorageScope";
 
 /**
  * API base. Empty string = same-origin: `run.sh web` serves the production
  * Next UI and proxies /api to the FastAPI backend. NEXT_PUBLIC_MUTEKI_API is
  * still available for manual experiments that intentionally bypass that proxy.
  */
-export const API = process.env.NEXT_PUBLIC_MUTEKI_API || "";
+const WEB_API = process.env.NEXT_PUBLIC_MUTEKI_API || "";
+export let API = WEB_API;
 const CONTROL_CAS_ACTIONS = new Set([
   "pause", "freeze", "resume", "thaw", "stop", "complete",
 ]);
@@ -33,82 +35,158 @@ export class RunStartError extends Error {
 // (which can't carry a header) use a one-time ticket minted via apiFetch.
 // ---------------------------------------------------------------------------
 const TOKEN_KEY = "muteki_auth_token";
+let serviceOrigin = API || (typeof window !== "undefined" ? window.location.origin : "");
+let tokenScope = "";
+function tokenStorageKey(): string { return `${TOKEN_KEY}:${serviceOrigin}:${tokenScope}`; }
+function scopeStorageKey(): string { return `muteki_auth_scope:${serviceOrigin}`; }
+if (typeof window !== "undefined") {
+  try { tokenScope = window.localStorage.getItem(scopeStorageKey()) || ""; } catch { /* metadata is revalidated */ }
+}
+let memoryToken: string | undefined;
+let authGeneration = 0;
+let authScope = "";
+let authPersistenceWarning = "";
+function updateAuthScope(scope: string): void {
+  authScope = scope;
+  setConversationStorageScope(scope);
+}
+
+export function currentAuthGeneration(): number { return authGeneration; }
+export function currentAuthScope(): string { return authScope; }
+export function currentAuthPersistenceWarning(): string { return authPersistenceWarning; }
 
 function getToken(): string {
+  if (memoryToken !== undefined) return memoryToken;
   if (typeof window === "undefined") return "";
-  try {
-    return window.localStorage.getItem(TOKEN_KEY) || "";
-  } catch {
-    return "";
-  }
+  try { memoryToken = window.localStorage.getItem(tokenStorageKey()) || ""; }
+  catch { memoryToken = ""; }
+  return memoryToken;
 }
 
 function setToken(token: string): void {
+  memoryToken = token;
+  authGeneration += 1;
+  authPersistenceWarning = "";
   if (typeof window === "undefined") return;
   try {
-    if (token) window.localStorage.setItem(TOKEN_KEY, token);
-    else window.localStorage.removeItem(TOKEN_KEY);
+    if (token) window.localStorage.setItem(tokenStorageKey(), token);
+    else window.localStorage.removeItem(tokenStorageKey());
   } catch {
-    /* storage disabled — auth simply won't persist */
+    authPersistenceWarning = token
+      ? "登录仅保存在当前窗口，存储不可写；重新打开后需要再次登录。"
+      : "登录存储不可写；请在关闭窗口后检查本地存储。";
   }
 }
 
-// When a request comes back 401 the token is stale/missing; clear it and notify
-// the app shell so it can show the login gate. The shell subscribes via
-// onAuthRequired(); we keep it a tiny pub-sub to avoid threading a context
-// through every standalone fetch helper.
-type AuthListener = () => void;
+// A response may revoke only the authentication generation that issued it.
+type AuthListener = (reason?: "expired" | "service_changed" | "peer_changed") => void;
 const authListeners = new Set<AuthListener>();
 export function onAuthRequired(fn: AuthListener): () => void {
   authListeners.add(fn);
   return () => authListeners.delete(fn);
 }
 function fireAuthRequired(): void {
+  updateAuthScope("");
   setToken("");
-  authListeners.forEach((fn) => {
-    try {
-      fn();
-    } catch {
-      /* ignore listener errors */
-    }
+  authListeners.forEach((fn) => { try { fn("expired"); } catch { /* listeners are independent */ } });
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (event) => {
+    if (event.key !== tokenStorageKey()) return;
+    memoryToken = event.newValue || "";
+    updateAuthScope("");
+    authGeneration += 1;
+    // Revalidate on a different view's login/logout; cached auth is no longer authoritative.
+    authListeners.forEach((fn) => { try { fn("peer_changed"); } catch { /* independent listener */ } });
   });
 }
 
-/**
- * Authenticated fetch. Prepends the API base, attaches the bearer token, and
- * routes 401s to the login gate. `path` is the API-relative path (e.g.
- * "/api/runs"); callers pass the same path they used to build by hand.
- */
+export function resetAuthForServiceChange(origin: string, transportOrigin?: string): void {
+  const nextApi = transportOrigin ?? WEB_API;
+  if (serviceOrigin === origin && API === nextApi) return;
+  API = nextApi;
+  serviceOrigin = origin;
+  tokenScope = "";
+  if (typeof window !== "undefined") {
+    try { tokenScope = window.localStorage.getItem(scopeStorageKey()) || ""; } catch { /* verified metadata follows */ }
+  }
+  memoryToken = undefined;
+  updateAuthScope("");
+  authGeneration += 1;
+  authListeners.forEach((fn) => { try { fn("service_changed"); } catch { /* independent listener */ } });
+}
+
 export async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   const headers = new Headers(init?.headers || {});
   const token = getToken();
+  const generation = authGeneration;
   if (token) headers.set("Authorization", `Bearer ${token}`);
   const res = await fetch(`${API}${path}`, { ...init, headers });
-  if (res.status === 401) fireAuthRequired();
+  if (res.status === 401 && generation === authGeneration && token === getToken()) fireAuthRequired();
   return res;
 }
 
-/** POST the operator password; on success store the returned session token. */
 export async function login(password: string): Promise<{ ok: boolean; authRequired: boolean }> {
+  const generation = authGeneration;
   const res = await fetch(`${API}/api/auth/login`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
+    method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ password }),
+    signal: AbortSignal.timeout(15_000),
   });
-  if (!res.ok) return { ok: false, authRequired: true };
-  const data = await res.json().catch(() => ({} as any));
-  if (data?.token) setToken(String(data.token));
-  return { ok: true, authRequired: Boolean(data?.auth_required) };
+  if (res.status === 401) return { ok: false, authRequired: true };
+  if (!res.ok) throw new Error(`登录服务不可用（HTTP ${res.status}），请稍后重试。`);
+  const data = await res.json() as Record<string, unknown>;
+  if (data.ok !== true || typeof data.auth_required !== "boolean"
+      || typeof data.service_id !== "string" || !data.service_id
+      || typeof data.identity_id !== "string" || !data.identity_id
+      || (data.auth_required && (typeof data.token !== "string" || !data.token.trim()))) {
+    throw new Error("登录服务返回了无效响应，请重试。");
+  }
+  if (generation !== authGeneration) throw new Error("登录状态已改变，请重新确认当前连接。");
+  tokenScope = `${data.service_id}:${data.identity_id}`;
+  updateAuthScope("");
+  if (typeof window !== "undefined") {
+    try { window.localStorage.setItem(scopeStorageKey(), tokenScope); } catch { /* session metadata remains in memory */ }
+  }
+  setToken(data.auth_required ? String(data.token) : "");
+  return { ok: true, authRequired: data.auth_required };
 }
 
-/** True if the current token is accepted (or auth is disabled). */
 export async function checkAuth(): Promise<{ authenticated: boolean; authRequired: boolean; inContainer: boolean }> {
-  const res = await apiFetch("/api/auth/me");
-  if (res.status === 401) return { authenticated: false, authRequired: true, inContainer: false };
-  const data = await res.json().catch(() => ({} as any));
-  // in_container (P2-v3): the coordinator runs in a container → the deck must
-  // force container mode and disable the "local" worker-isolation toggle.
-  return { authenticated: true, authRequired: Boolean(data?.auth_required), inContainer: Boolean(data?.in_container) };
+  const generation = authGeneration;
+  try {
+    const res = await apiFetch("/api/auth/me", { signal: AbortSignal.timeout(15_000) });
+    if (res.status === 401) return { authenticated: false, authRequired: true, inContainer: false };
+    if (!res.ok) throw new Error(`认证校验失败（HTTP ${res.status}）`);
+    const data = await res.json() as Record<string, unknown>;
+    if (data.authenticated !== true || typeof data.auth_required !== "boolean"
+        || typeof data.service_id !== "string" || !data.service_id
+        || typeof data.identity_id !== "string" || !data.identity_id) {
+      throw new Error("认证服务返回了无效响应，请重试。");
+    }
+    if (generation !== authGeneration) throw new Error("认证状态已改变，请重新校验。");
+    if (typeof data.service_id === "string" && typeof data.identity_id === "string") {
+      const nextScope = `${data.service_id}:${data.identity_id}`;
+      if (tokenScope && tokenScope !== nextScope && data.auth_required) {
+        tokenScope = nextScope;
+        fireAuthRequired();
+        throw new Error("服务身份已改变，请登录当前服务；原服务草稿已隔离保留。");
+      }
+      const token = getToken();
+      tokenScope = nextScope;
+      updateAuthScope(nextScope);
+      if (typeof window !== "undefined") {
+        try { window.localStorage.setItem(scopeStorageKey(), tokenScope); } catch { /* session scope remains authoritative */ }
+        if (token) setToken(token);
+        window.dispatchEvent(new CustomEvent("muteki:auth-scope", { detail: authScope }));
+      }
+    }
+    return { authenticated: true, authRequired: data.auth_required, inContainer: data.in_container === true };
+  } catch (error) {
+    if (generation === authGeneration) updateAuthScope("");
+    throw error;
+  }
 }
 
 /**
@@ -844,6 +922,7 @@ export interface WorkerSettings {
 
 export interface CredentialAccount {
   account_id: string;
+  revision?: string;
   engine: string;
   worker_engine?: string;
   connection?: "official" | "custom_endpoint";
@@ -899,7 +978,10 @@ export interface GlobalCredentialModelCatalog {
  * Mutations continue to use the credential-account endpoints in the dedicated
  * credential center; Worker/Profile editors only select one of these rows. */
 export interface GlobalCredential {
+  status_detail?: string;
+  discovery_code?: string;
   id: string;
+  revision?: string;
   label: string;
   engine: string;
   source: "stored" | "system";
@@ -933,17 +1015,13 @@ export interface ModelEndpoint {
   usage: GlobalCredentialUsage[];
 }
 
-export async function getGlobalCredentials(): Promise<GlobalCredential[]> {
-  try {
-    const response = await apiFetch(`/api/settings/credentials`);
-    if (!response.ok) return [];
-    const payload = await response.json();
-    return Array.isArray(payload.credentials)
-      ? payload.credentials as GlobalCredential[]
-      : [];
-  } catch {
-    return [];
-  }
+export async function getGlobalCredentials(environment?: "local" | "container"): Promise<GlobalCredential[]> {
+  const query = environment ? `?environment=${environment}` : "";
+  const response = await apiFetch(`/api/settings/credentials${query}`);
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error?.message || payload.detail?.message || payload.detail || `凭据目录读取失败（HTTP ${response.status}）`);
+  if (!Array.isArray(payload.credentials)) throw new Error("凭据目录响应无效，请重试。");
+  return payload.credentials as GlobalCredential[];
 }
 
 export async function getModelEndpoints(): Promise<ModelEndpoint[]> {
@@ -1504,6 +1582,8 @@ export async function putCredentialAccount(
   accountId: string,
   body: {
     engine: string;
+    create_only?: boolean;
+    expected_revision?: string;
     worker_engine?: string;
     connection?: "official" | "custom_endpoint";
     secret?: string;
@@ -1522,9 +1602,10 @@ export async function putCredentialAccount(
   });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) {
-    throw new Error(String(j?.detail ?? j?.error?.message ?? `HTTP ${r.status}`));
+    throw new Error(String(j?.detail?.message ?? j?.detail ?? j?.error?.message ?? `HTTP ${r.status}`));
   }
-  return (j.account ?? null) as CredentialAccount | null;
+  if (j.ok !== true || !j.account) throw new Error("服务未确认凭据保存成功。");
+  return j.account as CredentialAccount;
 }
 
 export async function deleteCredentialAccount(accountId: string, detachReferences = false): Promise<boolean> {

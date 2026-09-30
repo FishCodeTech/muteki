@@ -49,11 +49,18 @@ from muteki.solver.workspace import cleanup_worker_scratch, ensure_workspace
 from muteki.swarm.insight_bus import InsightBus
 from muteki.swarm.stage_policy import StagePolicy
 from muteki.swarm.shared_graph import SharedGraph, SQLiteSharedGraph, canonicalize_lane
+from muteki.swarm.coordinator_worker_reap import (
+    _observe_started_workers,
+    _record_worker_dispatch_failure,
+)
 from muteki.swarm.swarm_support import (
     _STANDING_MAX,
     _PENDING_HELP_MAX,
     WorkerBudgetExhausted,
     WorkerSpawnRejected,
+    WorkerPricingUnavailable,
+    WorkerProfileExhausted,
+    WorkerRuntimeUnavailable,
     RequiredContextUnavailable,
     ContextCapabilityUnavailable,
     ControlShutdownIncomplete,
@@ -150,6 +157,7 @@ class _RaceRunMixin:
         per_solver: dict[str, SolveOutcome] = {}
         winner: Optional[str] = None
         flag: Optional[str] = None
+        dispatch_limit_reached = False
 
         try:
             if self.hitl_inbox is not None:
@@ -190,6 +198,7 @@ class _RaceRunMixin:
                 done, pending = await asyncio.wait(
                     pending, return_when=asyncio.FIRST_COMPLETED
                 )
+                await _observe_started_workers(self, solvers=tasks.values())
                 for t in done:
                     s = tasks[t]
                     try:
@@ -207,6 +216,14 @@ class _RaceRunMixin:
                                 other.cancel()
                             raise ControlShutdownIncomplete(
                                 "remote worker start outcome is uncertain")
+                        if not bool(getattr(s, "_runtime_process_started", True)):
+                            dispatch_limit_reached = await _record_worker_dispatch_failure(
+                                self, worker=str(s.solver_id),
+                                engine=str(getattr(getattr(s, "driver", None), "name", "") or ""),
+                                detail=str(e), solver=s, active_solvers=tasks,
+                            )
+                            if dispatch_limit_reached:
+                                break
                         continue
                     per_solver[s.solver_id] = outcome
                     # multi-flag: fold every flag this solver produced into the
@@ -228,6 +245,8 @@ class _RaceRunMixin:
                         for other in pending:
                             self._cancel_solver(tasks.get(other))
                             other.cancel()
+                if dispatch_limit_reached:
+                    break
                 # split-brain reconcile (BUG②): a sibling cancelled right after it
                 # accepted a flag is reaped as CancelledError above and never tallies
                 # its flag — fold the authoritative graph snapshot in so completion
@@ -330,8 +349,12 @@ class _RaceRunMixin:
                 self.shared_graph.close()
             except Exception:
                 pass
-        await self._emit_run_finished(flag=None, solved=False)
-        return SwarmOutcome(False, None, None, per_solver, "no solver found a flag")
+        terminal_reason = "runtime_failure" if dispatch_limit_reached else "finished"
+        await self._emit_run_finished(flag=None, solved=False, reason=terminal_reason)
+        return SwarmOutcome(
+            False, None, None, per_solver,
+            "runtime_failure" if dispatch_limit_reached else "no solver found a flag",
+        )
 
     # ════════════════════════════════════════════════════════════════════════
     # Coordinator: evidence-driven plan / dispatch loop
@@ -448,6 +471,21 @@ class _RaceRunMixin:
         # never spend a probe on a role-unavailable engine; that's a config decision,
         # not a fault). Preserve roster order for deterministic output.
         candidates = [e for e in self.engines if self._engine_available_for_role(e, role)]
+        if self.cost_budget_usd is not None and self._startup_health_snapshot is None:
+            priced: list[str] = []
+            unpriced: dict[str, str] = {}
+            for candidate in candidates:
+                profile = self._profile_for_engine(candidate, role=role, advance=False)
+                model = str((profile or {}).get("model") or "")
+                if self.cost is not None and self.cost.price_for(model) is not None:
+                    priced.append(candidate)
+                    continue
+                reason = f"pricing_unavailable: 模型 {model or '未指定'} 未配置美元单价；请在服务端价格表添加精确单价，或取消美元预算"
+                unpriced[candidate] = reason
+                self._note_engine_degraded(candidate, reason, role=role, owner_loop=owner_loop)
+            self._pricing_unavailable_profiles = unpriced
+            self._pricing_blocked_all = bool(candidates) and not priced
+            candidates = priced
 
         if getattr(self, "_startup_health_snapshot", None) is not None:
             engines: list[str] = []
@@ -656,6 +694,7 @@ class _RaceRunMixin:
         intent: "Optional[dict]" = None,
         avoid_engines: "Optional[list[str]]" = None,
         exclude_engines: "Optional[list[str]]" = None,
+        failed_engines: "Optional[list[str]]" = None,
     ) -> str:
         """Heterogeneity-aware engine selection: prefer an engine NOT currently
         running, so each spawned worker covers a different blind spot. Falls back to
@@ -711,9 +750,22 @@ class _RaceRunMixin:
 
             available = [item for item in available if not _excluded(item)]
             if not available:
+                if intent_id:
+                    raise ContextCapabilityUnavailable(
+                        f"no eligible worker profile for Intent {intent_id} "
+                        f"after run-level exclusions",
+                        missing=["eligible_worker_profile"],
+                    )
                 raise RuntimeError(
                     f"no available worker profile for role={role} after "
                     "run-level exclusions")
+        failed = {str(item) for item in (failed_engines or ()) if str(item)}
+        if failed:
+            eligible = [candidate for candidate in available
+                        if candidate not in failed]
+            if not eligible:
+                raise WorkerProfileExhausted(intent_id, sorted(failed))
+            available = eligible
         avoided = {str(item) for item in (avoid_engines or ()) if str(item)}
         untried = [candidate for candidate in available if candidate not in avoided]
         if untried:
@@ -1805,8 +1857,10 @@ class _RaceRunMixin:
         if (os.environ.get("MUTEKI_ALLOW_CONTAINER_LOCAL_FALLBACK") or ""
                 ).strip().lower() in {"1", "true", "yes", "on"}:
             return
+        self._runtime_failure_code = WorkerRuntimeUnavailable.code
+        self._runtime_failure_phase = "worker_runtime_setup"
         if is_web_container():
-            raise RuntimeError(
+            detail = (
                 f"container worker backend is unavailable for {engine!r} and this "
                 f"coordinator runs inside the web container — refusing to fall back "
                 f"to a host-native (local) worker (it would run with no tools / wrong "
@@ -1814,15 +1868,18 @@ class _RaceRunMixin:
                 f"mount, the worker image is pulled, and MUTEKI_CONTROL_BIND/"
                 f"MUTEKI_CONTROL_HOST + the compose network are set."
             )
-        raise RuntimeError(
-            f"container worker backend is unavailable for {engine!r} — refusing "
-            f"to silently run a host-native (local) worker (it would execute "
-            f"with host credentials, host filesystem and host docker access "
-            f"while the run reports backend 'container'). Fix the container "
-            f"backend (docker socket reachable, worker image pulled, control "
-            f"receiver up) or explicitly opt into the legacy local fallback "
-            f"with MUTEKI_ALLOW_CONTAINER_LOCAL_FALLBACK=1."
-        )
+        else:
+            detail = (
+                f"container worker backend is unavailable for {engine!r} — refusing "
+                f"to silently run a host-native (local) worker (it would execute "
+                f"with host credentials, host filesystem and host docker access "
+                f"while the run reports backend 'container'). Fix the container "
+                f"backend (docker socket reachable, worker image pulled, control "
+                f"receiver up) or explicitly opt into the legacy local fallback "
+                f"with MUTEKI_ALLOW_CONTAINER_LOCAL_FALLBACK=1."
+            )
+        self._runtime_failure_detail = detail
+        raise WorkerRuntimeUnavailable(detail)
 
     def _schedule_engine_health_event(
         self,
@@ -2107,6 +2164,11 @@ class _RaceRunMixin:
         if self.worker_profiles and profile is None:
             raise WorkerSpawnRejected(
                 f"no available worker profile for {engine} role={role}")
+        if self.cost_budget_usd is not None:
+            model = str((profile or {}).get("model") or "")
+            if self.cost is None or self.cost.price_for(model) is None:
+                raise WorkerPricingUnavailable(
+                    f"模型 {model or '未指定'} 未配置美元单价；请在服务端价格表添加精确单价，或取消美元预算")
         if role == "review" and profile is not None:
             review_effort = str(
                 self.review_policy.get("reasoning_effort") or "inherit"
@@ -2304,6 +2366,7 @@ class _RaceRunMixin:
             # EXEC-01: Profile→Adapter 解析与 AgentSession 监督（CLI 路径不变）。
                 session_supervisor=self._worker_session_supervisor(),
                 worker_profile=profile,
+                plugin_service=self.worker_plugins,
             )
         except Exception as exc:
             if not self._release_typed_context_reservations(

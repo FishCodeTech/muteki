@@ -70,11 +70,12 @@ export interface ToolApprovalProps {
   disabled?: boolean;
   /** Footer note shown instead of actions when the request is no longer pending. */
   footer?: ReactNode;
+  actions?: ReactNode;
   className?: string;
 }
 
 function getStatusCopy(status: ToolApprovalStatus) {
-  if (status === "approving") return "批准中";
+  if (status === "approving") return "决定投递中";
   if (status === "approved") return "已批准";
   if (status === "denied") return "已拒绝";
   if (status === "running") return "执行中";
@@ -137,6 +138,7 @@ export function ToolApproval({
   denyLabel = "拒绝",
   disabled = false,
   footer,
+  actions,
   className,
 }: ToolApprovalProps) {
   const reduce = useReducedMotion() ?? false;
@@ -266,6 +268,7 @@ export function ToolApproval({
             transition={{ duration: reduce ? 0.12 : 0.22, ease: EASE_OUT }}
             className="flex flex-wrap items-center gap-2 border-t border-cx-border/60 px-4 py-3"
           >
+            {actions ?? (<>
             <motion.button
               type="button"
               onClick={onApprove}
@@ -298,6 +301,7 @@ export function ToolApproval({
                 {denyLabel}
               </button>
             ) : null}
+            </>)}
           </motion.div>
         ) : footer ? (
           <div className="border-t border-cx-border/60 px-4 py-3 text-xs text-cx-fg-3">{footer}</div>

@@ -101,6 +101,214 @@ def _winner_continuation_path(self, run_id: str) -> Path:
     )
 
 
+_RUN_LAUNCH_LIMITS = (
+    "wall_clock_budget", "max_total_workers", "cost_budget_usd",
+    "token_budget", "tool_call_budget", "max_workers", "start_workers",
+)
+
+
+class WorkerRuntimePolicyUnavailable(RuntimeError):
+    """A prior Run's Worker isolation cannot be proven for continuation."""
+
+    code = "worker_runtime_policy_unavailable"
+    phase = "worker_runtime_recovery"
+
+
+def _shared_workspace_link(self, run_id: str) -> bool:
+    workspace = self.storage.workspace(run_id)
+    if not workspace.is_symlink():
+        return False
+    try:
+        target = workspace.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise WorkerRuntimePolicyUnavailable(
+            f"Run shared-container workspace is unavailable: {run_id}") from exc
+    if target != self.storage.shared_workspace(run_id).resolve():
+        raise WorkerRuntimePolicyUnavailable(
+            f"Run workspace points outside its shared pool slot: {run_id}")
+    return True
+
+
+def _trusted_worker_runtime_history(self, run_id: str) -> dict[str, str]:
+    """Read backend receipts from coordinator-owned records, never workspace files."""
+    run = self.runs.get(run_id)
+    store = run.store if run is not None else SessionStore(root=self.event_root)
+    backends: set[str] = set()
+    container_scopes: set[str] = set()
+    try:
+        for event in store.iter_matching_events(
+            run_id, event_types=(EventType.RUN_FINISHED.value,),
+        ):
+            payload = event.payload or {}
+            backend = payload.get("backend")
+            if backend not in {"local", "container"}:
+                continue  # Web-synthesized terminals have no Worker backend receipt.
+            degraded = payload.get("runtime_degraded")
+            if (backend == "local" and isinstance(degraded, list)
+                    and any(isinstance(item, dict)
+                            and item.get("requested_backend") == "container"
+                            for item in degraded)):
+                backend = "container"
+            backends.add(backend)
+            if backend == "container":
+                scope = payload.get("container_scope")
+                if scope in {"run", "shared"}:
+                    container_scopes.add(scope)
+    except OSError as exc:
+        raise WorkerRuntimePolicyUnavailable(
+            f"Run Worker runtime receipts are unreadable: {run_id}") from exc
+    winner = self.load_winner_continuation(run_id)
+    winner_backend = winner.get("backend")
+    if winner_backend in {"local", "container"}:
+        backends.add(winner_backend)
+    if not backends:
+        return {}
+    is_shared = _shared_workspace_link(self, run_id)
+    if "shared" in container_scopes and not is_shared:
+        raise WorkerRuntimePolicyUnavailable(
+            f"Run shared-container workspace is missing: {run_id}")
+    if is_shared and "run" in container_scopes:
+        raise WorkerRuntimePolicyUnavailable(
+            f"Run Worker runtime receipts conflict with its workspace: {run_id}")
+    # A Run may have several generations. Once one used a container, a later
+    # follow-up must never execute against the same Worker data on the host.
+    backend = "container" if "container" in backends or is_shared else "local"
+    return {
+        "worker_backend": backend,
+        "worker_container_scope": "shared" if is_shared else "run",
+    }
+
+
+def persist_run_launch_limits(self, run_id: str, body: dict[str, Any]) -> None:
+    """Keep launch bounds and the selected Worker isolation across generations."""
+    is_shared = _shared_workspace_link(self, run_id)
+    directory = self.coordinator_control_dir(run_id)
+    path = directory / "run-launch-limits.json"
+    temporary = directory / f".run-launch-limits-{os.getpid()}-{time.time_ns()}.tmp"
+    values = {key: body[key] for key in _RUN_LAUNCH_LIMITS if key in body}
+    challenge = body.get("challenge") or {}
+    from apps.web.worker_config import resolve_worker_backend
+    from muteki.core.runtime_env import is_web_container
+    from apps.web.dispatch_parse import explicit_category
+    category = explicit_category(challenge.get("category"))
+    config = self.worker_config.resolve(category or None)
+    contract = body.get("task_contract") or challenge.get("task_contract") or {}
+    mode = (contract.get("mode") if isinstance(contract, dict) else None)
+    mode = mode or challenge.get("mode") or body.get("mode") or "ctf"
+    runtime_backend = resolve_worker_backend(
+        request_backend=("container" if mode == "pentest"
+                         else body.get("worker_backend")),
+        config_backend=config.get("worker_backend"),
+        env_backend=os.environ.get("MUTEKI_WORKER_BACKEND"),
+        in_web_container=is_web_container(),
+    )
+    runtime_scope = str(body.get("worker_container_scope")
+                        or config.get("worker_container_scope") or "run")
+    if mode == "pentest" or runtime_backend == "local":
+        runtime_scope = "run"
+    if runtime_scope not in {"run", "shared"}:
+        raise RuntimeError("invalid Worker container scope")
+    prior_payload = _load_run_launch_policy(self, run_id)
+    prior_history = _trusted_worker_runtime_history(self, run_id)
+    if prior_payload or prior_history or is_shared:
+        previous = load_run_launch_limits(self, run_id)
+        if (runtime_backend != previous["worker_backend"]
+                or runtime_scope != previous["worker_container_scope"]):
+            raise WorkerRuntimePolicyUnavailable(
+                f"Run Worker isolation change is forbidden: {run_id}")
+    pentest_contract = challenge.get("pentest_contract") or {}
+    goal_mode = challenge.get("report_goal_mode", pentest_contract.get("report_goal_mode"))
+    count = challenge.get("expected_findings", pentest_contract.get("expected_findings"))
+    goal = ({"report_goal_mode": goal_mode, "expected_findings": count}
+            if mode == "pentest" and goal_mode in {"automatic", "count"}
+            else {})
+    try:
+        temporary.write_text(json.dumps({"version": 1, "limits": values,
+                                         "worker_runtime": {
+                                             "worker_backend": runtime_backend,
+                                             "worker_container_scope": runtime_scope,
+                                         },
+                                         "pentest_goal": goal},
+                                        ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def load_run_launch_limits(self, run_id: str) -> dict[str, Any]:
+    is_shared = _shared_workspace_link(self, run_id)
+    payload = _load_run_launch_policy(self, run_id)
+    values = payload.get("limits", {})
+    if any(key not in _RUN_LAUNCH_LIMITS or not isinstance(value, (int, float))
+           or isinstance(value, bool) for key, value in values.items()):
+        raise RuntimeError(f"Run launch limits contain invalid values: {run_id}")
+    result = dict(values)
+    runtime = payload.get("worker_runtime")
+    history = _trusted_worker_runtime_history(self, run_id)
+    if runtime is not None:
+        if (not isinstance(runtime, dict)
+                or runtime.get("worker_backend") not in {"local", "container"}
+                or runtime.get("worker_container_scope") not in {"run", "shared"}):
+            raise WorkerRuntimePolicyUnavailable(
+                f"Run Worker runtime policy is invalid: {run_id}")
+        runtime = dict(runtime)
+        if runtime["worker_backend"] == "local":
+            # Older policy snapshots preserved an unused shared-scope setting
+            # even though no shared workspace was mounted for a local Worker.
+            runtime["worker_container_scope"] = "run"
+        if (history.get("worker_backend") == "container"
+                and runtime["worker_backend"] != "container"):
+            raise WorkerRuntimePolicyUnavailable(
+                f"Run Worker runtime policy conflicts with container history: {run_id}")
+        if (is_shared and (runtime["worker_backend"] != "container"
+                           or runtime["worker_container_scope"] != "shared")):
+            raise WorkerRuntimePolicyUnavailable(
+                f"Run Worker runtime policy conflicts with shared workspace: {run_id}")
+        if (history.get("worker_backend") == "container"
+                and runtime["worker_container_scope"]
+                != history["worker_container_scope"]):
+            raise WorkerRuntimePolicyUnavailable(
+                f"Run Worker container scope conflicts with history: {run_id}")
+        result.update(runtime)
+    elif is_shared:
+        # Older shared-container Runs predate the persisted runtime policy.
+        # Their workspace link is the concrete isolation choice; never resume
+        # one as a host-local Worker because the global default changed.
+        result.update({"worker_backend": "container", "worker_container_scope": "shared"})
+    elif history:
+        result.update(history)
+    else:
+        raise WorkerRuntimePolicyUnavailable(
+            f"Run Worker runtime policy has no trusted receipt: {run_id}")
+    return result
+
+
+def load_run_pentest_goal(self, run_id: str) -> dict[str, Any]:
+    payload = _load_run_launch_policy(self, run_id)
+    goal = payload.get("pentest_goal") or {}
+    if not isinstance(goal, dict):
+        raise RuntimeError(f"Run pentest goal is invalid: {run_id}")
+    mode = goal.get("report_goal_mode")
+    count = goal.get("expected_findings")
+    if mode not in {None, "automatic", "count"} or (mode == "count" and
+            (not isinstance(count, int) or isinstance(count, bool) or count <= 0)):
+        raise RuntimeError(f"Run pentest goal is invalid: {run_id}")
+    return dict(goal)
+
+
+def _load_run_launch_policy(self, run_id: str) -> dict[str, Any]:
+    path = self.coordinator_control_dir(run_id) / "run-launch-limits.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    if (not isinstance(payload, dict) or payload.get("version") != 1
+            or not isinstance(payload.get("limits"), dict)):
+        raise RuntimeError(f"Run launch limits are invalid: {run_id}")
+    return payload
+
+
 def persist_winner_continuation(
     self, run_id: str, payload: dict[str, Any],
 ) -> None:

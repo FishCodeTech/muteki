@@ -60,7 +60,11 @@ from muteki.solver.cli_driver import (
     CliDriver, CliResult, SecurePromptUnsupported, StreamStep,
     finalize_cli_result,
 )
-from muteki.solver.cli_launch_check import check_process_launch
+from muteki.solver.cli_launch_check import (
+    LAUNCH_CODE_ENVIRONMENT,
+    LaunchContractError,
+    check_process_launch,
+)
 from muteki.solver.credential_accounts import CONTAINER_ACCOUNTS_ROOT
 
 # Tool-only worker image. Real credentials are injected from Credential Accounts
@@ -579,7 +583,9 @@ class ContainerHandle:
             )
         except ValueError:
             rel = ".."
-        if rel == "." or rel.startswith(".."):
+        if rel == ".":
+            return CONTAINER_WORKSPACE
+        if rel == ".." or rel.startswith(".." + os.sep):
             if self.account_root:
                 try:
                     arel = os.path.relpath(
@@ -590,9 +596,14 @@ class ContainerHandle:
                     arel = ".."
                 if arel == ".":
                     return CONTAINER_ACCOUNTS_ROOT
-                if not arel.startswith(".."):
+                if arel != ".." and not arel.startswith(".." + os.sep):
                     return f"{CONTAINER_ACCOUNTS_ROOT}/{arel}"
-            raise ValueError("host path is outside the container's declared mounts")
+            raise LaunchContractError(
+                "host path is outside the container's declared mounts",
+                code=LAUNCH_CODE_ENVIRONMENT,
+                field="host_path",
+                source="container_mount",
+            )
         return f"{CONTAINER_WORKSPACE}/{rel}"
 
 
@@ -1757,6 +1768,9 @@ class _DockerExecBackend:
                     "PI_", "KIMI_", "GROK_", "XAI_", "OPENCODE_", "DEEPSEEK_", "XDG_"
                 )):
                     cmd += ["-e", f"{k}={v}"]
+            if env.get("MUTEKI_CHALLENGE_MODE") == "pentest":
+                from muteki.solver.browser_coord import managed_browser_worker_path
+                cmd += ["-e", f"PATH={managed_browser_worker_path(env)}"]
         cmd.append(handle.container)
         prelude = [
             'if [ -r "$CLAUDE_CODE_OAUTH_TOKEN_FILE" ]; then '

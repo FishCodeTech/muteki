@@ -9,17 +9,20 @@ import type { ConversationThread } from "./useConversation";
 
 export type ConversationInboxStreamState = {
   appliedSeq: number;
+  brokerEpoch: string;
   seenEventIds: Set<string>;
 };
 
 export function emptyConversationInboxState(): ConversationInboxStreamState {
-  return { appliedSeq: 0, seenEventIds: new Set() };
+  return { appliedSeq: 0, brokerEpoch: "", seenEventIds: new Set() };
 }
 
 export function acceptConversationInboxEvent(
   state: ConversationInboxStreamState,
   event: ConversationInboxEvent,
 ): { accepted: boolean; state: ConversationInboxStreamState } {
+  const epoch = String(event.broker_epoch || "");
+  if (epoch && epoch !== state.brokerEpoch) state = { ...emptyConversationInboxState(), brokerEpoch: epoch };
   const seq = Number(event.seq || 0);
   const eventId = String(event.event_id || "");
   if (eventId && state.seenEventIds.has(eventId)) {
@@ -41,6 +44,7 @@ export function acceptConversationInboxEvent(
     accepted: true,
     state: {
       appliedSeq: Math.max(state.appliedSeq, seq),
+      brokerEpoch: epoch || state.brokerEpoch,
       seenEventIds,
     },
   };

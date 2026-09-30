@@ -12,6 +12,7 @@ import { Button, Callout, EmptyState, IconButton, Spinner, StatusDot } from "@/c
 import { API, apiFetch, authTicket } from "@/lib/useRun";
 import { acceptTerminalAttachAttempt } from "@/lib/terminalAttachGeneration";
 import { terminalWebSocketUrl } from "@/lib/terminalWebSocketUrl";
+import { desktopChatBridge, nativeTerminalSocket, type TerminalSocket } from "@/lib/desktopChatBridge";
 import { chatPanel } from "@/lib/chatPanelStore";
 import { extractLocalUrls, isLocalPreviewUrl } from "@/lib/previewUrlDetect";
 
@@ -163,7 +164,7 @@ export function ConversationInteractiveTerminal({
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<XtermTerminal | null>(null);
   const fitRef = useRef<{ fit: () => void; dispose?: () => void } | null>(null);
-  const socketRef = useRef<WebSocket | null>(null);
+  const socketRef = useRef<TerminalSocket | null>(null);
   const activeIdRef = useRef(activeId);
   const sessionRef = useRef(session);
   const disposedRef = useRef(false);
@@ -171,6 +172,11 @@ export function ConversationInteractiveTerminal({
   const connectionRef = useRef(connection);
   /** Bumped on each attach/unmount so overlapping authTicket awaits cannot keep two sockets. */
   const attachGenRef = useRef(0);
+  const createTabBusyRef = useRef(false);
+  const [creatingTab, setCreatingTab] = useState(false);
+  const [initializingSession, setInitializingSession] = useState(true);
+  const initializedContextRef = useRef("");
+  const contextKey = `${threadId}\0${rootPath}`;
 
   useEffect(() => {
     activeIdRef.current = activeId;
@@ -235,7 +241,10 @@ export function ConversationInteractiveTerminal({
       try {
         const ticket = await authTicket();
         if (!acceptTerminalAttachAttempt(gen, attachGenRef.current, disposedRef.current)) return;
-        const socket = new WebSocket(terminalWebSocketUrl(threadId, sessionId, ticket, window.location.href, API));
+        const bridge = desktopChatBridge();
+        const socket = bridge
+          ? nativeTerminalSocket(bridge, threadId, `/api/threads/${encodeURIComponent(threadId)}/workspace/terminal/sessions/${encodeURIComponent(sessionId)}/stream?ticket=${encodeURIComponent(ticket)}`)
+          : new WebSocket(terminalWebSocketUrl(threadId, sessionId, ticket, window.location.href, API));
         if (!acceptTerminalAttachAttempt(gen, attachGenRef.current, disposedRef.current)) {
           try { socket.close(); } catch { /* ignore */ }
           return;
@@ -295,7 +304,7 @@ export function ConversationInteractiveTerminal({
         socket.onclose = () => {
           disconnected("终端连接已断开。历史输出已保留，可重新连接当前会话。");
         };
-        socket.onerror = () => disconnected("终端连接失败，请重新连接。");
+        socket.onerror = (event) => disconnected(event instanceof ErrorEvent && event.message ? event.message : "终端连接失败，请重新连接。");
         socket.onopen = () => {
           if (!ownsSocket()) return;
           updateConnection("connected");
@@ -347,6 +356,10 @@ export function ConversationInteractiveTerminal({
 
   useEffect(() => {
     contextGenRef.current += 1;
+    const initializationContext = contextGenRef.current;
+    initializedContextRef.current = "";
+    setInitializingSession(true);
+    createTabBusyRef.current = false; setCreatingTab(false);
     disposedRef.current = false;
     activeIdRef.current = "";
     sessionRef.current = null;
@@ -446,6 +459,8 @@ export function ConversationInteractiveTerminal({
         if (!cancelled && !disposedRef.current) {
           setError(exc instanceof Error ? exc.message : String(exc));
         }
+      } finally {
+        if (!cancelled && !disposedRef.current && initializationContext === contextGenRef.current) { initializedContextRef.current = contextKey; setInitializingSession(false); }
       }
     })();
 
@@ -480,6 +495,9 @@ export function ConversationInteractiveTerminal({
   };
 
   const createTab = async () => {
+    if (createTabBusyRef.current || initializingSession || initializedContextRef.current !== contextKey) return;
+    createTabBusyRef.current = true;
+    setCreatingTab(true);
     const context = contextGenRef.current;
     setError("");
     try {
@@ -502,6 +520,8 @@ export function ConversationInteractiveTerminal({
       if (context === contextGenRef.current && !disposedRef.current) {
         setError(exc instanceof Error ? exc.message : String(exc));
       }
+    } finally {
+      if (context === contextGenRef.current) { createTabBusyRef.current = false; setCreatingTab(false); }
     }
   };
 
@@ -544,6 +564,7 @@ export function ConversationInteractiveTerminal({
       const socket = socketRef.current;
       if (socket && socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ type: "interrupt" }));
+        return;
       }
       await surfaceJson(
         `/api/threads/${threadId}/workspace/terminal/sessions/${activeId}/interrupt`,
@@ -604,7 +625,7 @@ export function ConversationInteractiveTerminal({
               </button>
             );
           })}
-          <IconButton size="xs" icon="plus" label="新建终端会话" onClick={() => void createTab()} />
+          <IconButton size="xs" icon="plus" label="新建终端会话" disabled={creatingTab || initializingSession || initializedContextRef.current !== contextKey} onClick={() => void createTab()} />
         </div>
         <Button size="xs" variant="ghost" icon="quote" disabled={!hasSelection || !onCiteToComposer} onClick={citeSelection} aria-label="加入对话">
           引用

@@ -3,6 +3,8 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { cn } from "@/lib/cn";
 import { prefersReducedMotion } from "@/lib/usePrefersReducedMotion";
+import { messageRangeOffsets, sourceCodePointOffsets } from "@/lib/messageSelectionOffsets";
+import { useLang } from "@/lib/i18n";
 import { StreamingText } from "../ai-native/streaming-text";
 import { Icon, type IconName } from "../Icon";
 import { ContextNodeChip } from "./ComposerPromptDocument";
@@ -31,7 +33,9 @@ export interface MessageAttachmentChip {
 }
 
 export interface ConversationMessageProps {
-  role: "user" | "assistant" | "system";
+  role: string;
+  sourceProvider?: string;
+  sourceContent?: unknown;
   text: string;
   messageId?: string;
   turnId?: string;
@@ -151,6 +155,8 @@ function isFresh(createdAt?: string): boolean {
 
 export function ConversationMessage({
   role,
+  sourceProvider,
+  sourceContent,
   text,
   messageId = "",
   turnId,
@@ -180,6 +186,7 @@ export function ConversationMessage({
   pinActions = false,
   actionMeta,
 }: ConversationMessageProps) {
+  const { lang } = useLang();
   const bodyRef = useRef<HTMLDivElement>(null);
   const [animateIn] = useState(() => role === "user" && isFresh(createdAt));
   const [citeMenu, setCiteMenu] = useState<{
@@ -190,6 +197,7 @@ export function ConversationMessage({
     end: number;
     messageId: string;
   } | null>(null);
+  const [citeError, setCiteError] = useState("");
 
   const nodes = contextRefs
     .map((item) => normalizeContextNode(item))
@@ -212,28 +220,22 @@ export function ConversationMessage({
       setCiteMenu(null);
       return;
     }
-    let start = text.indexOf(selected);
-    if (start < 0) {
-      const visible = bodyRef.current.innerText || text;
-      start = visible.indexOf(selected);
-      if (start < 0) start = visible.indexOf(trimmed);
-      if (start < 0) {
-        setCiteMenu(null);
-        return;
-      }
-    }
     const range = selection.getRangeAt(0);
+    const offsets = messageRangeOffsets(bodyRef.current, range, text);
+    if (!offsets) { setCiteMenu(null); setCiteError(lang === "en" ? "This selection cannot be located exactly in the source. Select one paragraph or code block." : "此选区无法在原文中精确定位，请选择单段正文或代码。"); return; }
+    const persistedOffsets = sourceCodePointOffsets(text, offsets);
+    setCiteError("");
     const rect = range.getBoundingClientRect();
     const host = bodyRef.current.getBoundingClientRect();
     setCiteMenu({
       top: Math.max(-36, rect.top - host.top - 40),
       left: Math.max(0, Math.min(rect.left - host.left + rect.width / 2 - 64, Math.max(0, host.width - 132))),
       text: selected,
-      start,
-      end: start + selected.length,
+      start: persistedOffsets.startOffset,
+      end: persistedOffsets.endOffset,
       messageId: assistantMessageId,
     });
-  }, [assistantMessageId, onCiteSelection, role, text]);
+  }, [assistantMessageId, onCiteSelection, role, text, lang]);
 
   useEffect(() => {
     if (!citeMenu) return;
@@ -254,6 +256,15 @@ export function ConversationMessage({
     }, 1600);
     return () => window.clearTimeout(timer);
   }, [highlightRange, role]);
+
+  if (role !== "user" && role !== "assistant") {
+    const sourceLabel = label || (role === "tool" ? "工具记录" : `原始角色：${role || "unknown"}`);
+    return <section className={cn("rounded-lg border border-cx-border-subtle bg-cx-bg-subtle px-3 py-2 text-cx-fg-3", className)} data-message-id={messageId || undefined} aria-label={sourceLabel}>
+      <p className="mb-1 text-xs font-medium">{sourceLabel}{sourceProvider ? ` · ${sourceProvider}` : ""}{superseded ? " · 已替代" : ""}</p>
+      <pre className="whitespace-pre-wrap break-words font-cx-mono text-xs">{text}</pre>
+      {sourceContent !== undefined ? <details className="mt-2"><summary className="cursor-pointer text-xs">原始内容块</summary><pre className="whitespace-pre-wrap break-words font-cx-mono text-xs">{JSON.stringify(sourceContent, null, 2)}</pre></details> : null}
+    </section>;
+  }
 
   if (role === "user") {
     const time = formatMessageTime(createdAt);
@@ -357,9 +368,10 @@ export function ConversationMessage({
             }}
           >
             <Icon name="quote" size={13} />
-            引用到输入框
+            {lang === "en" ? "Quote in composer" : "引用到输入框"}
           </button>
         ) : null}
+        {citeError ? <p role="status" className="text-[11px] text-cx-fg-4">{citeError}</p> : null}
         <StreamingText
           text={text}
           isStreaming={isStreaming}

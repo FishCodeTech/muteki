@@ -293,6 +293,13 @@ export function ComposerPromptDocument({
   const [composing, setComposing] = useState(false);
   const lastExternal = useRef("");
 
+  const publishCaret = (next: PromptDocument, offset: number, compositionActive = composing) => {
+    onCaretMarkedOffsetChange?.(offset);
+    if (!compositionActive) {
+      onActiveTokenQuery?.(tokenAtMarked(flattenPromptDocument(next), offset));
+    }
+  };
+
   const applyDocument = (next: PromptDocument): PromptDocument => {
     const cleaned = pruneUnreachableInlineNodes(next);
     const root = rootRef.current;
@@ -381,7 +388,7 @@ export function ComposerPromptDocument({
     };
   });
 
-  const emitFromDom = () => {
+  const emitFromDom = (compositionActive = composing) => {
     const root = rootRef.current;
     if (!root) return;
     const next = readDocumentFromDom(root, knownNodesRef.current);
@@ -389,10 +396,7 @@ export function ComposerPromptDocument({
     knownNodesRef.current = next.nodes;
     onDocumentChange(next);
     const offset = markedOffsetBeforeCaret(root);
-    onCaretMarkedOffsetChange?.(offset);
-    if (!composing) {
-      onActiveTokenQuery?.(tokenAtMarked(flattenPromptDocument(next), offset));
-    }
+    publishCaret(next, offset, compositionActive);
   };
 
   const empty = !plainTextFromDocument(doc).trim()
@@ -426,7 +430,7 @@ export function ComposerPromptDocument({
         className="cx-prompt-editor cx-scroll max-h-[288px] min-h-6 w-full overflow-y-auto whitespace-pre-wrap break-words bg-transparent px-1 text-[14px] leading-6 text-cx-fg caret-cx-accent outline-none"
         onInput={() => {
           if (composing) return;
-          emitFromDom();
+          emitFromDom(false);
         }}
         onKeyDown={(event) => {
           // Chip deletion is handled by the native keydown/beforeinput listeners
@@ -450,7 +454,7 @@ export function ComposerPromptDocument({
         onCompositionEnd={() => {
           setComposing(false);
           onComposingChange?.(false);
-          emitFromDom();
+          emitFromDom(false);
         }}
         onCopy={(event) => {
           const root = rootRef.current;
@@ -495,7 +499,7 @@ export function ComposerPromptDocument({
                 const applied = applyDocument(mergeClipboardIntoDocument(base, pasted, selection.start));
                 const caret = Math.min(selection.start + flattenPromptDocument(pasted).length, flattenPromptDocument(applied).length);
                 placeCaretAtMarkedOffset(root, caret);
-                onCaretMarkedOffsetChange?.(caret);
+                publishCaret(applied, caret);
                 return;
               }
             }
@@ -510,7 +514,7 @@ export function ComposerPromptDocument({
             const applied = applyDocument(insertPlainTextAtMarkedRange(current, normalized, selection.start, selection.end));
             const caret = Math.min(selection.start + normalized.length, flattenPromptDocument(applied).length);
             placeCaretAtMarkedOffset(root, caret);
-            onCaretMarkedOffsetChange?.(caret);
+            publishCaret(applied, caret);
           };
           if (plan.files.length) {
             event.preventDefault();
@@ -560,7 +564,7 @@ export function ComposerPromptDocument({
               flattenPromptDocument(next).length,
             );
             placeCaretAtMarkedOffset(root, caret);
-            onCaretMarkedOffsetChange?.(caret);
+            publishCaret(next, caret);
             return;
           }
           const pasted = parseClipboardPayload(mime || plain);
@@ -579,7 +583,7 @@ export function ComposerPromptDocument({
             flattenPromptDocument(applied).length,
           );
           placeCaretAtMarkedOffset(root, caret);
-          onCaretMarkedOffsetChange?.(caret);
+          publishCaret(applied, caret);
         }}
       />
     </div>

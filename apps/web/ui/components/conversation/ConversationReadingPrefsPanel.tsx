@@ -42,9 +42,11 @@ function PrefRow({
 export function ConversationReadingPrefsPanel({
   className = "",
   compact = false,
+  hideIntro = false,
 }: {
   className?: string;
   compact?: boolean;
+  hideIntro?: boolean;
 }) {
   const t = useT();
   const [prefs, setPrefs] = useState<ConversationReadingPrefs>(() => readConversationReadingPrefs());
@@ -64,7 +66,7 @@ export function ConversationReadingPrefsPanel({
       data-testid="c39-reading-prefs"
       aria-label={t("readingPrefs.aria")}
     >
-      {!compact ? (
+      {!compact && !hideIntro ? (
         <header className="flex flex-col gap-1">
           <h3 className="text-[14px] font-semibold text-cx-fg">{t("readingPrefs.title")}</h3>
           <p className="text-[12.5px] leading-5 text-cx-fg-3">{t("readingPrefs.hint")}</p>

@@ -1,7 +1,7 @@
 "use client";
 
 import { Fragment, useEffect, useRef } from "react";
-import Link from "next/link";
+import { ConversationRouteLink as Link } from "@/components/conversation/ConversationNavigation";
 import { AnimatePresence, motion } from "motion/react";
 import { cn } from "@/lib/cn";
 import { Icon } from "@/components/Icon";
@@ -10,6 +10,7 @@ import type {
   ComposerCapabilityItem,
   ComposerRuntimeState,
   ComposerTrigger,
+  ComposerCapabilitySectionError,
 } from "@/lib/composerCapabilities";
 import {
   capabilityDisabled,
@@ -27,6 +28,9 @@ export interface CapabilityMenuProps {
   items: ComposerCapabilityItem[];
   loading: boolean;
   error: string;
+  errorDiagnostic?: string;
+  onRetry?: () => void;
+  sectionErrors?: ComposerCapabilitySectionError[];
   runtime: ComposerRuntimeState | null;
   activeIndex: number;
   onActiveIndexChange: (index: number) => void;
@@ -124,6 +128,9 @@ export function CapabilityMenu({
   items,
   loading,
   error,
+  errorDiagnostic,
+  onRetry,
+  sectionErrors = [],
   runtime,
   activeIndex,
   onActiveIndexChange,
@@ -154,7 +161,7 @@ export function CapabilityMenu({
             <Icon name={triggerIcon(trigger)} size={13} className="text-cx-fg-3" />
             <span className="text-[12px] font-medium text-cx-fg-2">{triggerLabel(trigger)}</span>
             <span className="ml-auto truncate font-cx-mono text-[11px] text-cx-fg-4">{adapterId.replace(/^cli\./, "")}</span>
-            <Link href="/settings/chat-plugins" className="shrink-0 text-[11px] text-cx-fg-3 hover:text-cx-fg" onMouseDown={(e) => e.stopPropagation()}>管理插件</Link>
+            <Link href="/settings/agent-extensions" className="shrink-0 text-[11px] text-cx-fg-3 hover:text-cx-fg" onMouseDown={(e) => e.stopPropagation()}>管理扩展</Link>
           </div>
           <div
             ref={listRef}
@@ -164,6 +171,12 @@ export function CapabilityMenu({
             aria-busy={loading || undefined}
             className="cx-scroll min-h-0 max-h-[320px] flex-1 overflow-y-auto overscroll-contain p-1"
           >
+            {sectionErrors.length ? (
+              <div role="status" className="space-y-2 border-b border-cx-border-subtle px-2.5 py-2 text-[12px] text-cx-warning">
+                {sectionErrors.map((entry, index) => <details key={`${entry.section}:${index}`}><summary>{entry.section}：{entry.message}</summary><pre className="mt-1 whitespace-pre-wrap break-words font-cx-mono text-[11px]">{JSON.stringify(entry, null, 2)}</pre></details>)}
+                {onRetry ? <button type="button" disabled={loading} className="rounded-md border border-cx-border px-2 py-1 text-cx-fg" onClick={onRetry}>重试失败来源</button> : null}
+              </div>
+            ) : null}
             {loading && !items.length ? (
               <div role="status" aria-label="正在读取当前 Agent 的能力" className="flex flex-col gap-1 p-1">
                 {[0, 1, 2].map((row) => (
@@ -179,7 +192,12 @@ export function CapabilityMenu({
             ) : error ? (
               <div role="status" className="flex items-start gap-2 px-2.5 py-3 text-[12.5px] leading-5 text-cx-danger">
                 <Icon name="circleAlert" size={14} className="mt-[3px] shrink-0" />
-                <span className="min-w-0">{error}</span>
+                <div className="min-w-0 flex-1 space-y-2">
+                  <p>{error}</p>
+                  {trigger === "@" ? <p className="text-cx-fg-3">引用目录尚未确认；文件面板可独立浏览工作目录。</p> : null}
+                  {onRetry ? <button type="button" className="rounded-md border border-cx-border px-2 py-1 text-cx-fg" disabled={loading} onClick={onRetry}>重试能力目录</button> : null}
+                  {errorDiagnostic ? <details className="text-cx-fg-3"><summary className="cursor-pointer">查看完整诊断</summary><pre className="mt-2 whitespace-pre-wrap break-words font-cx-mono text-[11px]">{errorDiagnostic}</pre></details> : null}
+                </div>
               </div>
             ) : items.length ? (
               <CapabilityRows

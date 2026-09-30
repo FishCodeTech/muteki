@@ -197,6 +197,8 @@ async def _startup_readiness(
     sessions_root: Path,
     cached_results: dict[str, tuple[bool, dict[str, Any] | None]],
     effective_network: str = "",
+    cost_budget_usd: float | None = None,
+    price_for: Callable[[str], Any] | None = None,
 ) -> tuple[dict[str, bool], list[dict[str, Any]]]:
     """Send one real CLI model request for every participating Worker profile."""
     from apps.web.worker_models import ProbeProcessOwner, probe_worker_model
@@ -213,6 +215,24 @@ async def _startup_readiness(
             worker_backend=worker_backend,
             in_web_container=is_web_container(),
         )
+        model = str(profile.get("model") or "")
+        if cost_budget_usd and (price_for is None or price_for(model) is None):
+            detail = f"模型 {model or '未指定'} 未配置美元单价；请在服务端价格表添加精确单价，或取消美元预算"
+            return profile_id, False, {
+                "error_id": _preflight_error_id(profile_id, "pricing_unavailable", model),
+                "profile_id": profile_id,
+                "engine": base_engine_for_profile(profile),
+                "model": model,
+                "backend": backend,
+                "network": worker_network if backend == "container" else "",
+                "effective_network": (
+                    (effective_network or worker_network) if backend == "container" else ""
+                ),
+                "stage": "preflight",
+                "layer": "pricing",
+                "code": "pricing_unavailable",
+                "detail": detail,
+            }
         cache_key = _profile_readiness_key(
             profile, runtime=runtime, backend=backend)
         cached = cached_results.get(cache_key)
@@ -534,6 +554,8 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             from muteki.pentest.contract import compile_pentest_prompt
             pentest_contract = compile_pentest_prompt(
                 prompt_text, target=str(ch.get("target") or ""), scope=scope_text,
+                report_goal_mode=str(ch.get("report_goal_mode") or "automatic"),
+                expected_findings=ch.get("expected_findings"),
             )
         if mode == "pentest":
             llm_cm, llm = await _open_planner_llm(
@@ -580,6 +602,8 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             scope=scope_text,
             task_contract=task_contract,
             pentest_contract=pentest_contract,
+            report_goal_mode=(pentest_contract.report_goal_mode if pentest_contract else "automatic"),
+            expected_findings=(pentest_contract.expected_findings if pentest_contract else None),
         )
         executor = body.get("executor", "cli")
         cli_race = bool(body.get("cli_race", False))
@@ -599,6 +623,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         # 可核验的原生离线开关，因此明确拒绝；其他引擎使用 CLI 原生 deny
         # 参数、只读配置覆盖或本地工具 allowlist。
         wc = mgr.worker_config.resolve(roster_category or None) if mgr is not None else {}
+        runtime_policy = mgr.load_run_launch_limits(run.run_id) if mgr is not None else {}
         engines = body.get("engines") or wc.get("engines") or ["cursor", "claude", "codex", "pi", "omp"]
         worker_profiles = body.get("worker_profiles") or wc.get("worker_profiles") or []
         worker_network = str(
@@ -625,11 +650,25 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                     + names
                 )
         worker_container_scope = str(
-            body.get("worker_container_scope")
+            runtime_policy.get("worker_container_scope")
+            or body.get("worker_container_scope")
             or wc.get("worker_container_scope") or "run"
         ).strip()
         if mode == "pentest":
+            if (runtime_policy.get("worker_backend") not in {None, "container"}
+                    or runtime_policy.get("worker_container_scope") not in {None, "run"}):
+                from apps.web.run_recovery import WorkerRuntimePolicyUnavailable
+                raise WorkerRuntimePolicyUnavailable(
+                    "Pentest Run isolation conflicts with its saved runtime policy")
             worker_container_scope = "run"
+        elif (body.get("worker_container_scope") is not None
+              and runtime_policy.get("worker_backend") == "container"
+              and runtime_policy.get("worker_container_scope")
+              and str(body["worker_container_scope"]).strip()
+              != runtime_policy["worker_container_scope"]):
+            from apps.web.run_recovery import WorkerRuntimePolicyUnavailable
+            raise WorkerRuntimePolicyUnavailable(
+                "Run Worker container scope differs from its saved isolation policy")
         if worker_container_scope not in {"run", "shared"}:
             raise RuntimeError("worker_container_scope must be run or shared")
         worker_privilege = str(
@@ -717,6 +756,9 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         if "cost_budget_usd" in body:
             stage_policy.setdefault("budgets", {})["cost_budget_usd"] = float(
                 body["cost_budget_usd"] or 0.0)
+        effective_cost_budget_usd = cost_budget_usd or float(
+            stage_policy.get("budgets", {}).get("cost_budget_usd") or 0.0
+        ) or None
         stage_policy.setdefault("coordinator", {})
         stage_policy["coordinator"]["token_budget"] = token_budget
         stage_policy["coordinator"]["tool_call_budget"] = tool_call_budget
@@ -762,11 +804,22 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         # fallback, and the web-container override all owned by the single resolver
         # so the settings health endpoints resolve the SAME effective backend.
         worker_backend = resolve_worker_backend(
-            request_backend=("container" if mode == "pentest" else body.get("worker_backend")),
+            request_backend=("container" if mode == "pentest"
+                             else runtime_policy.get("worker_backend")
+                             or body.get("worker_backend")),
             config_backend=wc.get("worker_backend"),
             env_backend=os.environ.get("MUTEKI_WORKER_BACKEND"),
             in_web_container=is_web_container(),
         )
+        if (mode != "pentest" and body.get("worker_backend") is not None
+                and runtime_policy.get("worker_backend")
+                and resolve_worker_backend(
+                    request_backend=body["worker_backend"],
+                    in_web_container=is_web_container(),
+                ) != runtime_policy["worker_backend"]):
+            from apps.web.run_recovery import WorkerRuntimePolicyUnavailable
+            raise WorkerRuntimePolicyUnavailable(
+                "Run Worker backend differs from its saved isolation policy")
         effective_worker_network = ""
         if worker_backend == "container":
             from muteki.solver.container_exec import (
@@ -834,6 +887,71 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                     ],
                 },
             ))
+            if effective_cost_budget_usd and run.cost.snapshot()["unpriced_calls"]:
+                await run.bus.emit(Event(
+                    event_type=EventType.RUN_FINISHED,
+                    run_id=run.run_id,
+                    challenge_id=challenge.id,
+                    payload={
+                        "flag": None, "flags": [],
+                        "expected_flags": challenge.expected_flags,
+                        "multi_flag": challenge.multi_flag,
+                        "solved": False, "reason": "preflight_failed",
+                        "failure_code": "budget_coverage_incomplete",
+                        "failure_phase": "preflight",
+                        "detail": "该 Run 已有未定价用量，无法执行完整美元预算；请取消美元预算或新建 Run",
+                    },
+                ))
+                if llm_cm is not None:
+                    await llm_cm.__aexit__(None, None, None)
+                return
+            if effective_cost_budget_usd:
+                planner_model = str(
+                    (llm_profiles.get("planner") or {}).get("model")
+                    or "deepseek-v4-pro"
+                )
+                metered_models = ([ ("planner", planner_model) ]
+                                  if coordinator or llm is not None else [])
+                if llm is not None:
+                    metered_models.append((
+                        "titler",
+                        str((llm_profiles.get("titler") or {}).get("model")
+                            or (llm_profiles.get("planner") or {}).get("model")
+                            or "deepseek-v4-flash"),
+                    ))
+                pricing_failures = [
+                    {
+                        "profile_id": f"llm:{role}",
+                        "engine": "llm" if llm is not None else "pi",
+                        "model": model,
+                        "stage": "preflight",
+                        "layer": "pricing",
+                        "code": "pricing_unavailable",
+                        "detail": f"模型 {model} 未配置美元单价；请在服务端价格表添加精确单价，或取消美元预算",
+                        "error_id": _preflight_error_id(role, "pricing_unavailable", model),
+                    }
+                    for role, model in metered_models
+                    if run.cost.price_for(model) is None
+                ]
+                if pricing_failures:
+                    await run.bus.emit(Event(
+                        event_type=EventType.RUN_FINISHED,
+                        run_id=run.run_id,
+                        challenge_id=challenge.id,
+                        payload={
+                            "flag": None, "flags": [],
+                            "expected_flags": challenge.expected_flags,
+                            "multi_flag": challenge.multi_flag,
+                            "solved": False, "reason": "preflight_failed",
+                            "failure_code": "pricing_unavailable",
+                            "failure_phase": "preflight",
+                            "detail": "美元预算所需的模型单价未配置",
+                            "profile_failures": pricing_failures,
+                        },
+                    ))
+                    if llm_cm is not None:
+                        await llm_cm.__aexit__(None, None, None)
+                    return
             if unknown_profile_refs:
                 startup_health_snapshot = {}
                 preflight_failures = [
@@ -864,6 +982,8 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                     sessions_root=mgr.state_root,
                     cached_results=run.profile_readiness,
                     effective_network=effective_worker_network,
+                    cost_budget_usd=effective_cost_budget_usd,
+                    price_for=run.cost.price_for,
                 )
                 mgr.persist_profile_readiness(run)
             # A stale optional profile must not make a task unusable when another
@@ -903,7 +1023,12 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                         "multi_flag": challenge.multi_flag,
                         "solved": False,
                         "reason": "preflight_failed",
-                        "failure_code": "profile_unhealthy",
+                        "failure_code": (
+                            "pricing_unavailable"
+                            if all(failure.get("code") == "pricing_unavailable"
+                                   for failure in preflight_failures)
+                            else "profile_unhealthy"
+                        ),
                         "failure_phase": "preflight",
                         "error_id": _preflight_error_id(
                             run.run_id,
@@ -929,6 +1054,8 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             if worker_backend == "container" and worker_container_scope == "shared":
                 mgr.prepare_shared_workspace(run.run_id)
             root = mgr.workspace_dir(run.run_id)
+            if root.is_symlink() and worker_backend != "container":
+                raise RuntimeError("shared-container Run cannot resume as a host-local Worker")
         else:
             root = Path(tempfile.mkdtemp(prefix="muteki-web-"))
         # sbx is the sandbox root — sandbox.shutdown_all() rmtree's it at run end,
@@ -1033,6 +1160,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                 account_store_root(mgr.state_root) if mgr is not None else None
             ),
             worker_registry=worker_registry,
+            worker_plugins=getattr(mgr, "chat_plugins", None) if mgr is not None else None,
             secret_resolver=secret_resolver,
             context_provider=context_provider,
             context_binder=context_binder,
@@ -1080,6 +1208,8 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                     if llm_cm is not None and not cleanup_state["llm"]:
                         await llm_cm.__aexit__(None, None, None)
                         cleanup_state["llm"] = True
+                    if mgr is not None and getattr(mgr, "chat_plugins", None) is not None:
+                        await mgr.chat_plugins.release_scope(run.run_id)
                     # settle_control_shutdown emits the delayed truthful terminal
                     # event only after the orphan owner has left and graph/container
                     # teardown is safe.
@@ -1116,6 +1246,11 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                 if llm_cm is not None:
                     try:
                         await llm_cm.__aexit__(None, None, None)
+                    except BaseException as cleanup_exc:
+                        cleanup_failures.append(cleanup_exc)
+                if mgr is not None and getattr(mgr, "chat_plugins", None) is not None:
+                    try:
+                        await mgr.chat_plugins.release_scope(run.run_id)
                     except BaseException as cleanup_exc:
                         cleanup_failures.append(cleanup_exc)
                 if cleanup_failures:
@@ -1423,13 +1558,23 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             goal=ch.get("goal") or "",
             scope=ch.get("scope") or "",
             pentest_contract=pentest_contract,
+            report_goal_mode=(pentest_contract.report_goal_mode if pentest_contract else "automatic"),
+            expected_findings=(pentest_contract.expected_findings if pentest_contract else None),
         )
 
         wc = mgr.worker_config.resolve(challenge.category) if mgr is not None else {}
+        runtime_policy = mgr.load_run_launch_limits(run.run_id) if mgr is not None else {}
         worker_profiles = wc.get("worker_profiles") or []
         worker_network = str(wc.get("worker_network") or "bridge")
-        worker_container_scope = str(wc.get("worker_container_scope") or "run")
+        worker_container_scope = str(
+            runtime_policy.get("worker_container_scope")
+            or wc.get("worker_container_scope") or "run")
         if mode == "pentest":
+            if (runtime_policy.get("worker_backend") not in {None, "container"}
+                    or runtime_policy.get("worker_container_scope") not in {None, "run"}):
+                from apps.web.run_recovery import WorkerRuntimePolicyUnavailable
+                raise WorkerRuntimePolicyUnavailable(
+                    "Pentest Run isolation conflicts with its saved runtime policy")
             worker_container_scope = "run"
         if root.is_symlink():
             if root.resolve() != mgr.storage.shared_workspace(run.run_id).resolve():
@@ -1461,7 +1606,8 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             )
         transport = base_engine_for_profile(profile or winner_engine)
         worker_backend = resolve_worker_backend(
-            request_backend="container" if mode == "pentest" else None,
+            request_backend=("container" if mode == "pentest"
+                             else runtime_policy.get("worker_backend")),
             config_backend=wc.get("worker_backend"),
             env_backend=os.environ.get("MUTEKI_WORKER_BACKEND"),
             in_web_container=is_web_container(),
@@ -1476,6 +1622,8 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
         if backend == "container" and worker_container_scope == "shared":
             mgr.prepare_shared_workspace(run.run_id)
         root = mgr.workspace_dir(run.run_id)
+        if root.is_symlink() and backend != "container":
+            raise RuntimeError("shared-container Run cannot resume as a host-local Worker")
         graph_dir = mgr.graph_dir(run.run_id)
         arts = ArtifactStore(root=root / "arts")
         worker_root = root / "workers"
@@ -1769,6 +1917,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
                 1, int(getattr(run, "execution_generation", 1) or 1)),
             session_supervisor=session_supervisor,
             worker_profile=profile or {"engine": transport},
+            plugin_service=getattr(mgr, "chat_plugins", None) if mgr is not None else None,
         )
         worker._control_secret_values = list(materialized_secret_values)
         if context_reservations and control_journal is not None:

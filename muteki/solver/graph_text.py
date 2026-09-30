@@ -17,6 +17,8 @@ _PASSTHROUGH_CONTROLS = frozenset({"\n", "\t", "\r"})
 class ContextRenderError(RuntimeError):
     """Required shared-graph context could not be produced."""
 
+    code = "shared_context_unready"
+
 
 def encode_graph_text(text: Any) -> tuple[str, int]:
     """Return (visible text, encoded-control count).

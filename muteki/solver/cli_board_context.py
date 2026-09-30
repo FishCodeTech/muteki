@@ -835,7 +835,22 @@ def _live_blackboard_context(self) -> str:
                 since_seq=int(scope.get("since_seq", 0) or 0),
                 directive=self.intent_goal,
             )
-    if getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}:
+    if getattr(self.challenge, "mode", "ctf") == "ctf":
+        return _ctf_shared_state_block(self)
+    if getattr(self.challenge, "mode", "ctf") == "pentest" and self.mode != "bootstrap":
+        source_facts, _source_meta = self._source_facts_block()
+        parts = (
+            _task_reference_block(self),
+            self._intent_neighborhood_context(),
+            source_facts,
+            self._step_contract_block(),
+            self._dead_ends_scoped_block(),
+            self._poc_prompt_block(),
+            self._standing_block(),
+            self._team_context_block(),
+        )
+        return "\n".join(part for part in parts if part and part.strip())
+    if getattr(self.challenge, "mode", "ctf") == "pentest":
         return _ctf_shared_state_block(self)
     parts: list[str] = []
     if self.mode == "bootstrap":
@@ -1006,7 +1021,9 @@ def _team_context_block(self) -> str:
         return (
             f"\n## Objective\n{contract.goal}\n"
             f"Goal decision: {decision['objective_status']}; "
-            f"cited evidence Facts: {decision['qualified_findings']}."
+            f"submitted evidence-backed reports: {decision['qualified_findings']}"
+            + (f"/{contract.expected_findings}." if contract.report_goal_mode == "count"
+               else "; automatic completion.")
         )
     if n <= 1:
         return ""
@@ -1080,8 +1097,7 @@ def _flag_hint(self) -> str:
 
 def _build_explore_prompt(self) -> str:
     c = self.challenge
-    if (getattr(c, "mode", "ctf") in {"ctf", "pentest"}
-            and (self.mode != "fact_verifier" or c.mode == "pentest")):
+    if getattr(c, "mode", "ctf") == "ctf" and self.mode != "fact_verifier":
         graph = _ctf_shared_state_block(self)
         assigned = (
             f"【你负责的 step】{self.intent_id_assigned}\n"
@@ -1221,6 +1237,10 @@ def _build_explore_prompt(self) -> str:
     if rejected:
         sections.append(("rejected-flags", rejected, {}))
     if self.mode == "fact_verifier":
+        if getattr(c, "mode", "ctf") == "pentest":
+            fixed = _PENTEST_FGS_EXPLORE_PROMPT.format(
+                ctx="{context}", intent_goal=self.intent_goal or "Verify the assigned fact.")
+            return _compile_worker_prompt(self, "verifier", fixed, sections)
         template = (
             _CTF_FACT_VERIFY_PROMPT
             if getattr(c, "mode", "ctf") == "ctf"
@@ -1231,6 +1251,10 @@ def _build_explore_prompt(self) -> str:
             kb=_KB_PROMPT if self.kb else "",
             intent_goal=self.intent_goal or "Verify the assigned fact.")
         return _compile_worker_prompt(self, "verifier", fixed, sections)
+    if getattr(c, "mode", "ctf") == "pentest":
+        fixed = _PENTEST_FGS_EXPLORE_PROMPT.format(
+            ctx="{context}", intent_goal=self.intent_goal or "authorized assessment")
+        return _compile_worker_prompt(self, "worker_explore", fixed, sections)
     fixed = _EXPLORE_PROMPT.format(
         ctx="{context}",
         kb=_KB_PROMPT if self.kb else "",

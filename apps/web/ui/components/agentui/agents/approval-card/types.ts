@@ -26,6 +26,7 @@ export interface ApprovalCardQuestion {
   customPlaceholder?: string;
   /** Optional questions can be skipped without an answer. Defaults to true. */
   required?: boolean;
+  validationError?: string;
 }
 
 export interface ApprovalCardAnswer {
@@ -56,6 +57,8 @@ export interface ApprovalCardProps {
   dismissLabel?: string;
   approveLabel?: ReactNode;
   submitLabel?: ReactNode;
+  rejectLabel?: ReactNode;
+  submitDisabled?: boolean;
   result?: ReactNode;
   className?: string;
 }

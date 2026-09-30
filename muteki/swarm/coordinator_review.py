@@ -49,11 +49,16 @@ from muteki.swarm.graph_defs import (
     _normalize_fact_identity,
 )
 from muteki.swarm.shared_graph import SharedGraph, SQLiteSharedGraph
+from muteki.swarm.coordinator_worker_reap import (
+    _observe_started_workers,
+    _record_worker_dispatch_failure,
+)
 from muteki.swarm.swarm_support import (
     _STANDING_MAX,
     _PENDING_HELP_MAX,
     WorkerBudgetExhausted,
     WorkerSpawnRejected,
+    WorkerDispatchFailureLimit,
     ControlShutdownIncomplete,
     SwarmOutcome,
     _CONTAINER_BLACKBOARD_SKILL,
@@ -138,6 +143,11 @@ class _ReviewLocksMixin:
                 except WorkerSpawnRejected as exc:
                     await self._emit_coord_bb("worker_spawn_rejected", reason=str(exc),
                                               engine=str(e), phase="race")
+                    if await _record_worker_dispatch_failure(
+                        self, worker="", engine=str(e), detail=str(exc),
+                        active_solvers=tasks,
+                    ):
+                        raise WorkerDispatchFailureLimit(str(exc)) from exc
                     continue
                 except WorkerBudgetExhausted as exc:
                     await self._emit_coord_bb(
@@ -237,6 +247,7 @@ class _ReviewLocksMixin:
         try:
             pending = set(tasks.keys())
             while pending and not race_force_end:
+                await _observe_started_workers(self, solvers=tasks.values())
                 now = time.monotonic()
                 if race_deadline is None:
                     unstarted = [
@@ -303,6 +314,7 @@ class _ReviewLocksMixin:
                 done, _ = await asyncio.wait(
                     wait_set, timeout=wait_timeout,
                     return_when=asyncio.FIRST_COMPLETED)
+                await _observe_started_workers(self, solvers=tasks.values())
                 if op_task is not None and op_task in done:
                     if self._operator_stop:
                         for t, w in tasks.items():
@@ -322,6 +334,18 @@ class _ReviewLocksMixin:
                     finished_n = len(tasks) - len(pending)
                     w = tasks[t]
                     res = results_by_worker[w]
+                    if (isinstance(res, Exception)
+                            and not bool(getattr(w, "_runtime_process_started", True))
+                            and not bool(getattr(w, "_remote_start_uncertain", False))):
+                        reached = await _record_worker_dispatch_failure(
+                            self, worker=str(getattr(w, "solver_id", "") or ""),
+                            engine=str(task_engines.get(t) or ""),
+                            detail=str(res), solver=w, active_solvers=tasks,
+                        )
+                        if reached:
+                            await _cancel_pending_race(
+                                "five consecutive Worker dispatch failures")
+                            raise WorkerDispatchFailureLimit(str(res)) from res
                     result_label = (
                         "cancelled" if isinstance(res, asyncio.CancelledError)
                         else ("error" if isinstance(res, BaseException)
@@ -712,6 +736,11 @@ class _ReviewLocksMixin:
         except WorkerSpawnRejected as exc:
             await emit_bb("worker_spawn_rejected", reason=str(exc),
                           engine=str(engine), phase="review")
+            if await _record_worker_dispatch_failure(
+                self, worker="", engine=str(engine), detail=str(exc),
+                active_solvers=task_solvers,
+            ):
+                raise WorkerDispatchFailureLimit(str(exc)) from exc
             return False
         except WorkerBudgetExhausted as exc:
             await emit_bb(str(exc), spawned_total=self._spawned_total,

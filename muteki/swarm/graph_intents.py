@@ -31,7 +31,8 @@ from muteki.swarm.graph_defs import (  # noqa: F401
     EV_FACT_MERGED, EV_FACT_SUPERSEDED, EV_FACT_PINNED, EV_INTENT_STATE_CHANGED,
     EV_OPERATOR_DIRECTIVE, EV_OPERATOR_DIRECTIVE_STATUS, EV_HITL_CLASSIFIED,
     EV_RESOURCE_LOCKED, EV_RESOURCE_RELEASED, EV_GRAPH_COMPACTED,
-    EV_WORKER_RESULT_COMMITTED, EV_VALUE_RECEIPT,
+    EV_WORKER_RESULT_COMMITTED, EV_VALUE_RECEIPT, EV_FINDING_FOUND,
+    EV_FINDING_INVALIDATED,
     FACT_STATE_UNRESOLVED, FACT_STATE_CHALLENGED, FACT_STATE_REVALIDATED,
     FACT_STATE_REJECTED, FACT_STATE_MERGED, FACT_STATE_SUPERSEDED,
     _FACT_TERMINAL_STATES, _FACT_STATES,
@@ -281,25 +282,36 @@ class _IntentsPocsMixin:
         """J: flip dispatch_state='resume' intents back to 'active' (e.g. a standby
         run continues, or operator resumes). Only re-activates rows still status=open."""
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT intent_id FROM intents WHERE challenge_id=? "
-                "AND dispatch_state='resume' AND status='open'",
-                (self.challenge.id,),
-            ).fetchall()
-            revived = [str(r[0]) for r in rows]
-            if revived:
+            try:
+                rows = self._conn.execute(
+                    "SELECT intent_id FROM intents WHERE challenge_id=? "
+                    "AND dispatch_state='resume' AND status='open'",
+                    (self.challenge.id,),
+                ).fetchall()
+                revived = [str(r[0]) for r in rows]
+                if not revived:
+                    return []
                 q = ",".join("?" for _ in revived)
-                self._conn.execute(
+                changed = self._conn.execute(
                     f"UPDATE intents SET dispatch_state='active', stop_reason=NULL "
-                    f"WHERE challenge_id=? AND intent_id IN ({q})",
+                    f"WHERE challenge_id=? AND intent_id IN ({q}) "
+                    "AND dispatch_state='resume' AND status='open'",
                     (self.challenge.id, *revived),
+                ).rowcount
+                if changed != len(revived):
+                    raise RuntimeError("resume intent transition changed unexpectedly")
+                seq = self._append_locked(
+                    EV_INTENT_STATE_CHANGED, actor,
+                    {"intent_id": ",".join(revived),
+                     "dispatch_state": INTENT_DISPATCH_ACTIVE},
                 )
+                if seq <= 0:
+                    raise RuntimeError("resume intent event was not recorded")
                 self._conn.commit()
-        if revived:
-            self._append(EV_INTENT_STATE_CHANGED, actor,
-                         {"intent_id": ",".join(revived),
-                          "dispatch_state": INTENT_DISPATCH_ACTIVE})
-        return revived
+                return revived
+            except BaseException:
+                self._conn.rollback()
+                raise
 
     def prior_intent_count(self) -> int:
         """How many intents this challenge's graph has EVER held (any status).
@@ -1025,22 +1037,28 @@ class _IntentsPocsMixin:
         if not iid:
             return False
         with self._lock:
-            cur = self._conn.execute(
-                "UPDATE intents SET status='open', dispatch_state='active', "
-                "close_reason=NULL, worker=NULL, lease_until=NULL "
-                "WHERE intent_id=? AND challenge_id=? "
-                "AND (status='done' OR dispatch_state='blocked')",
-                (iid, self.challenge.id),
-            )
-            self._conn.commit()
-            n = int(cur.rowcount or 0)
-        if n == 1:
-            self._append(
-                EV_INTENT_STATE_CHANGED, actor,
-                {"intent_id": iid, "status": "open",
-                 "reason": str(reason or "retry")[:500]},
-            )
-        return n == 1
+            try:
+                cur = self._conn.execute(
+                    "UPDATE intents SET status='open', dispatch_state='active', "
+                    "close_reason=NULL, worker=NULL, lease_until=NULL "
+                    "WHERE intent_id=? AND challenge_id=? "
+                    "AND (status='done' OR dispatch_state='blocked')",
+                    (iid, self.challenge.id),
+                )
+                changed = int(cur.rowcount or 0)
+                if changed == 1:
+                    seq = self._append_locked(
+                        EV_INTENT_STATE_CHANGED, actor,
+                        {"intent_id": iid, "status": "open",
+                         "reason": str(reason or "retry")},
+                    )
+                    if seq <= 0:
+                        raise RuntimeError("intent reopen event was not recorded")
+                self._conn.commit()
+                return changed == 1
+            except BaseException:
+                self._conn.rollback()
+                raise
 
     def terminalize_intent_claim(
         self, *, worker: str, intent_id: str, reason: str = "",
@@ -1455,6 +1473,7 @@ class _IntentsPocsMixin:
                              dead_ends: Optional[list[dict]] = None,
                              pocs: Optional[list[dict]] = None,
                              artifacts: Optional[list[str]] = None,
+                             vulnerability_report: Optional[dict] = None,
                              need_input: Optional[dict] = None,
                              conclude: bool = True,
                              successor_intent_id: str = "") -> dict:
@@ -1527,6 +1546,9 @@ class _IntentsPocsMixin:
             observation_ids = [int(x) for x in prior.get("observation_seqs", [])]
             dead_end_ids = [int(x) for x in prior.get("dead_end_seqs", [])]
             poc_ids = [int(x) for x in prior.get("poc_seqs", [])]
+            report_seq = int(prior.get("report_seq") or 0)
+            evidence_event_seq = int(prior.get("evidence_event_seq") or 0)
+            revision_event_seq = int(prior.get("revision_event_seq") or 0)
             conclude_seq: Optional[int] = None
             concluded = False
             if iid:
@@ -1558,6 +1580,9 @@ class _IntentsPocsMixin:
                 "dead_end_rejections": list(
                     prior.get("dead_end_rejections") or []),
                 "pocs": poc_ids,
+                "report_seq": report_seq,
+                "evidence_event_seq": evidence_event_seq,
+                "revision_event_seq": revision_event_seq,
                 "concluded": concluded,
                 "result": str(prior.get("final_result") or prior.get("status") or ""),
                 "successor_intent_id": str(
@@ -1658,6 +1683,165 @@ class _IntentsPocsMixin:
                     )
                     if seq > 0:
                         poc_seqs.append(int(seq))
+                report_seq = 0
+                evidence_event_seq = 0
+                revision_event_seq = 0
+                if vulnerability_report is not None:
+                    if getattr(self.challenge, "mode", "ctf") != "pentest" or not fact_seqs:
+                        raise ValueError("vulnerability report requires a verified pentest Fact")
+                    from muteki.pentest.contract import in_scope_url
+                    from muteki.models.solve_graph import SolveGraph
+                    contract = getattr(self.challenge, "pentest_contract", None)
+                    item = dict(vulnerability_report)
+                    resource = str(item.get("resource_id") or "")
+                    if contract is None or not in_scope_url(resource, contract):
+                        raise ValueError("vulnerability report resource is outside the authorized scope")
+                    screenshot_ids = list(dict.fromkeys(item.pop("screenshot_poc_ids", []) or []))
+                    available_images = {str(p.get("poc_id") or ""): p for p in poc_list
+                                        if str(p.get("name") or "").lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+                                        and p.get("artifact_id")}
+                    if any(pid not in available_images for pid in screenshot_ids):
+                        raise ValueError("report screenshot must reference an image saved in this Step")
+                    item["screenshots"] = [
+                        {"poc_id": pid, "artifact_id": str(available_images[pid]["artifact_id"]),
+                         "name": str(available_images[pid]["name"])}
+                        for pid in screenshot_ids
+                    ]
+                    item["fact_seqs"] = list(fact_seqs)
+                    item["intent_id"] = iid
+                    item["report_status"] = "submitted"
+                    identity = SolveGraph._finding_identity(item)
+                    existing = self._conn.execute(
+                        "SELECT seq,payload FROM events WHERE challenge_id=? "
+                        "AND kind=? AND dedupe_key=?",
+                        (self.challenge.id, EV_FINDING_FOUND,
+                         f"finding::{identity}"),
+                    ).fetchone()
+                    if existing is None:
+                        report_seq = self._append_locked(
+                            EV_FINDING_FOUND, worker_id, item, verified=True,
+                            dedupe_key=f"finding::{identity}",
+                        )
+                        if report_seq < 0:
+                            raise RuntimeError("finding identity changed during commit")
+                    elif int(getattr(contract, "version", 1)) < 2:
+                        # Historical contracts retain their original exact-key
+                        # duplicate behavior. A v1 duplicate is not a new report.
+                        report_seq = 0
+                    else:
+                        report_seq = int(existing[0])
+                        original = json.loads(existing[1])
+                        if not in_scope_url(str(original.get("resource_id") or ""), contract):
+                            raise ValueError("original report is outside the authorized scope")
+                        invalidated = self._conn.execute(
+                            "SELECT payload FROM events WHERE challenge_id=? "
+                            "AND kind=?",
+                            (self.challenge.id, EV_FINDING_INVALIDATED),
+                        ).fetchall()
+                        if any(
+                            (json.loads(raw).get("finding_key") == identity)
+                            for (raw,) in invalidated
+                        ):
+                            raise ValueError("original report was invalidated")
+                        already_cited = {
+                            seq for seq in (original.get("fact_seqs") or [])
+                            if type(seq) is int
+                        }
+                        for (raw,) in self._conn.execute(
+                            "SELECT payload FROM events WHERE challenge_id=? "
+                            "AND kind='finding_evidence_added'",
+                            (self.challenge.id,),
+                        ):
+                            previous = json.loads(raw)
+                            if previous.get("finding_seq") == report_seq:
+                                already_cited.update(
+                                    seq for seq in previous.get("fact_seqs") or []
+                                    if type(seq) is int
+                                )
+                        new_refs = [seq for seq in fact_seqs if seq not in already_cited]
+                        if new_refs:
+                            note = item.get("evidence_note")
+                            if (not isinstance(note, dict)
+                                    or not all(isinstance(note.get(key), str)
+                                               and note[key].strip()
+                                               for key in ("artifact_id", "observed", "significance"))):
+                                raise ValueError("supplemental evidence needs a selected artifact and explanation")
+                            selected = note["artifact_id"]
+                            for fact_seq in new_refs:
+                                fact_row = self._conn.execute(
+                                    "SELECT payload,actor FROM events WHERE challenge_id=? "
+                                    "AND seq=? AND kind='fact_added' AND verified=1",
+                                    (self.challenge.id, fact_seq),
+                                ).fetchone()
+                                if fact_row is None or fact_row[1] != worker_id:
+                                    raise ValueError("supplemental Fact is not from this Worker result")
+                                fact_payload = json.loads(fact_row[0])
+                                provenance = fact_payload.get("evidence_provenance") or {}
+                                if not in_scope_url(str(provenance.get("target") or ""), contract):
+                                    raise ValueError("supplemental Fact is outside scope")
+                                if not any(
+                                    isinstance(ref, dict) and ref.get("artifact_id") == selected
+                                    and ref.get("sha256")
+                                    for ref in provenance.get("artifact_refs") or []
+                                ):
+                                    raise ValueError("selected supplemental artifact is not cited by its Fact")
+                            evidence_event_seq = self._append_locked(
+                                "finding_evidence_added", worker_id,
+                                {
+                                    "finding_seq": report_seq,
+                                    "fact_seqs": new_refs,
+                                    "evidence_notes": [
+                                        {"fact_seq": seq,
+                                         "artifact_id": selected,
+                                         "observed": note["observed"].strip(),
+                                         "significance": note["significance"].strip()}
+                                        for seq in new_refs
+                                    ],
+                                    "screenshots": item["screenshots"],
+                                    "intent_id": iid,
+                                },
+                                verified=True,
+                                dedupe_key=f"finding-evidence::{report_seq}::{commit_id}",
+                            )
+                            if evidence_event_seq < 0:
+                                raise RuntimeError("supplemental evidence identity changed during commit")
+                            revisable = (
+                                "title", "summary", "affected_assets", "preconditions",
+                                "observed_impact", "potential_impact", "severity",
+                                "severity_rationale", "reproduction_steps",
+                                "remediation", "retest_steps",
+                            )
+                            current = dict(original)
+                            for (raw,) in self._conn.execute(
+                                "SELECT payload FROM events WHERE challenge_id=? "
+                                "AND kind='finding_revised' ORDER BY seq",
+                                (self.challenge.id,),
+                            ):
+                                revision = json.loads(raw)
+                                if (revision.get("finding_seq") == report_seq
+                                        and isinstance(revision.get("changes"), dict)):
+                                    current.update(revision["changes"])
+                            changes = {
+                                key: item[key] for key in revisable
+                                if key in item and item[key] != current.get(key)
+                            }
+                            if changes:
+                                revision_event_seq = self._append_locked(
+                                    "finding_revised", worker_id,
+                                    {"finding_seq": report_seq,
+                                     "changes": changes,
+                                     "reason": "Worker updated the report while adding target evidence",
+                                     "source_fact_seqs": new_refs,
+                                     "intent_id": iid},
+                                    verified=True,
+                                    dedupe_key=f"finding-revision::{report_seq}::{commit_id}",
+                                )
+                                if revision_event_seq < 0:
+                                    raise RuntimeError("report revision identity changed during commit")
+                        else:
+                            # An identical claim with no new evidence is neither
+                            # a new report nor a meaningful supplement.
+                            report_seq = 0
                 payload = {
                     "commit_id": commit_id,
                     "worker_id": worker_id,
@@ -1686,6 +1870,9 @@ class _IntentsPocsMixin:
                     "dead_end_seqs": dead_end_seqs,
                     "dead_end_rejections": rejected_dead_ends[:20],
                     "poc_seqs": poc_seqs,
+                    "report_seq": report_seq,
+                    "evidence_event_seq": evidence_event_seq,
+                    "revision_event_seq": revision_event_seq,
                     "artifact_ids": artifact_refs,
                     "successor_intent_id": next_iid,
                     "successor_claimed": False,
@@ -1782,6 +1969,9 @@ class _IntentsPocsMixin:
             "dead_ends": dead_end_seqs,
             "dead_end_rejections": rejected_dead_ends,
             "pocs": poc_seqs,
+            "report_seq": report_seq,
+            "evidence_event_seq": evidence_event_seq,
+            "revision_event_seq": revision_event_seq,
             "concluded": concluded,
             "result": final_result,
             "successor_intent_id": next_iid,

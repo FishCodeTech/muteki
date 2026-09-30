@@ -2,6 +2,7 @@
 
 import type { KeyboardEvent, MouseEvent, PointerEvent, ReactNode, RefObject } from "react";
 import { motion } from "motion/react";
+import { useLang } from "@/lib/i18n";
 import { cn } from "@/lib/cn";
 import { Icon } from "@/components/Icon";
 import { Skeleton, Spinner, StatusDot, SPRING_LAYOUT, FADE_FAST } from "@/components/chat/ui";
@@ -304,7 +305,8 @@ export function FolderHeader({
         aria-expanded={!collapsed}
         aria-controls={controlsId}
         aria-keyshortcuts="Shift+F10"
-        title={section.title}
+        title={[section.title, section.subtitle].filter(Boolean).join(" · ")}
+        aria-label={[section.title, section.subtitle].filter(Boolean).join(" · ")}
         onClick={() => {
           if (didDragRef.current) return;
           onToggle();
@@ -315,13 +317,16 @@ export function FolderHeader({
         onPointerUp={drag?.onPointerUp}
         onPointerCancel={drag?.onPointerCancel}
         className={cn(
-          "flex h-8 w-full min-w-0 select-none items-center gap-2 rounded-lg pl-2.5 pr-[62px] text-left text-[13.5px] leading-5 text-cx-fg-2 outline-none",
+          "flex min-h-8 w-full min-w-0 select-none items-center gap-2 rounded-lg pl-2.5 pr-[62px] text-left text-[13.5px] leading-5 text-cx-fg-2 outline-none",
           "cx-press hover:bg-cx-hover hover:text-cx-fg group-data-[menu-open=true]/folder:bg-cx-hover",
           "focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-[var(--cx-focus)]",
         )}
       >
         <Icon name={collapsed ? "folder" : "folderOpen"} size={15} className="shrink-0 text-cx-fg-3" />
-        <span className="cx-sb-fade min-w-0 flex-1 overflow-hidden whitespace-nowrap">{section.title}</span>
+        <span className="min-w-0 flex-1 py-1">
+          <span className="block truncate">{section.title}</span>
+          {section.subtitle ? <span className="block truncate text-[10.5px] leading-4 text-cx-fg-4">{section.subtitle}</span> : null}
+        </span>
       </button>
       <div className="pointer-events-none absolute inset-y-0 right-1 flex items-center gap-0.5">
         {section.running ? (
@@ -400,6 +405,11 @@ function renderSnippet(snippet: string): ReactNode[] {
 export function SearchHits({
   hits,
   loading,
+  loadingMore,
+  error,
+  hasMore,
+  onLoadMore,
+  onRetry,
   activeId,
   includeSuperseded,
   onIncludeSupersededChange,
@@ -407,11 +417,18 @@ export function SearchHits({
 }: {
   hits: SidebarBodyHit[];
   loading: boolean;
+  loadingMore: boolean;
+  error: string;
+  hasMore: boolean;
+  onLoadMore?: () => void;
+  onRetry?: () => void;
   activeId?: string;
   includeSuperseded: boolean;
   onIncludeSupersededChange?: (value: boolean) => void;
   onSelect: (hit: SidebarBodyHit) => void;
 }) {
+  const { lang } = useLang();
+  const english = lang === "en";
   return (
     <section aria-label="消息正文命中" className="mb-2">
       <div className="flex h-8 items-center justify-between gap-2 pl-2.5 pr-1">
@@ -466,9 +483,16 @@ export function SearchHits({
             </button>
           ))}
         </div>
-      ) : (
-        <p className="px-2.5 py-1.5 text-[12.5px] text-cx-fg-4">没有匹配的消息正文</p>
-      )}
+      ) : !error ? (
+        <p className="px-2.5 py-1.5 text-[12.5px] text-cx-fg-4">{english ? "No matching message text" : "没有匹配的消息正文"}</p>
+      ) : null}
+      {error ? <div role="alert" className="mx-2.5 my-2 rounded-md border border-cx-border p-2 text-[12px] text-cx-warning">
+        <p>{english ? "Message search did not finish." : "正文搜索未完成。"}</p>
+        <details><summary>{english ? "Error details" : "错误详情"}</summary><pre className="mt-1 whitespace-pre-wrap break-all font-cx-mono text-[11px]">{error}</pre></details>
+        {onRetry ? <button type="button" onClick={onRetry} disabled={loading || loadingMore} className="mt-1 rounded px-2 py-1 text-cx-accent focus-visible:outline-2">{english ? "Retry" : "重试"}</button> : null}
+      </div> : null}
+      {!loading && hits.length ? <p role="status" className="px-2.5 pt-1 text-[11px] text-cx-fg-4">{english ? `${hits.length} loaded${hasMore ? "; more results available" : "; all results loaded"}` : `已加载 ${hits.length} 条${hasMore ? "，还有更多结果" : "，已加载全部结果"}`}</p> : null}
+      {!error && hasMore && onLoadMore ? <button type="button" onClick={onLoadMore} disabled={loadingMore} className="mx-2.5 mt-1 rounded-md px-2 py-1 text-[12px] text-cx-accent hover:bg-cx-hover focus-visible:outline-2">{loadingMore ? (english ? "Loading…" : "加载中…") : (english ? "Load more results" : "加载更多结果")}</button> : null}
     </section>
   );
 }

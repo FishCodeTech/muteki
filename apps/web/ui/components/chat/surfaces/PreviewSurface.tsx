@@ -29,6 +29,9 @@ import {
   shouldPollSpaLocation,
 } from "@/lib/previewNavOwnership";
 import { buildWorkspaceBrowserProxyPath, unwrapWorkspaceBrowserProxyHref } from "@/lib/workspaceBrowserProxy";
+import { desktopChatBridge, type DesktopPreviewEvent } from "@/lib/desktopChatBridge";
+import { NativePreview } from "@/components/chat/preview/NativePreview";
+import { useLang } from "@/lib/i18n";
 import { AddressBar } from "@/components/chat/preview/AddressBar";
 import { PreviewStart } from "@/components/chat/preview/PreviewStart";
 import {
@@ -165,7 +168,17 @@ function DeviceMenu({ settings, onChange }: { settings: DeviceSettings; onChange
 }
 
 export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: SurfaceProps<PreviewSurfaceModel>) {
+  const nativePreview = Boolean(desktopChatBridge());
+  const { lang } = useLang();
+  const environmentHint = nativePreview
+    ? lang === "en"
+      ? "localhost refers to this desktop client. The service host may be remote or inside a container; use an address reachable from this device to access it."
+      : "localhost 指向桌面客户端所在设备。服务宿主可能在远程或容器中；访问服务宿主时，请使用当前设备可以访问的地址。"
+    : ENV_HINT;
   const initialUrl = surface.url ?? "";
+  const [nativeError, setNativeError] = useState("");
+  const [nativeHistory, setNativeHistory] = useState({ back: false, forward: false });
+  const nativeIdRef = useRef("");
   const [url, setUrl] = useState(initialUrl);
   const [draft, setDraft] = useState(initialUrl);
   const [iframeSrc, setIframeSrc] = useState(() => (initialUrl ? mountSrc(initialUrl) : ""));
@@ -259,7 +272,7 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
     const frame = iframeRef.current;
     // Readable (same-origin/proxied) frames navigate in place: no remount and
     // no extra entry in the top-level joint session history.
-    if (!replacePending && frameIsReadable(frame)) {
+    if (!nativePreview && !replacePending && frameIsReadable(frame)) {
       try {
         if (kind === "reload") {
           // Only reload when the readable doc already matches the target.
@@ -284,7 +297,7 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
     iframeRef.current = null;
     setIframeSrc(src);
     setFrameKey((value) => value + 1);
-  }, []);
+  }, [nativePreview]);
 
   const commit = useCallback((next: string, kind: NavKind) => {
     const replacePending = pendingTargetRef.current !== null;
@@ -311,12 +324,17 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
   }, [commit, threadId]);
 
   const traverse = useCallback((delta: -1 | 1) => {
+    if (nativePreview) {
+      const bridge = desktopChatBridge();
+      if (nativeIdRef.current && bridge?.previewAction) void bridge.previewAction({ id: nativeIdRef.current, action: delta < 0 ? "back" : "forward" }).catch((error) => setNativeError(String(error)));
+      return;
+    }
     const index = history.index + delta;
     const target = history.entries[index];
     if (!target) return;
     setHistory({ entries: history.entries, index });
     commit(target, "traverse");
-  }, [commit, history]);
+  }, [commit, history, nativePreview]);
 
   const reload = useCallback(() => {
     // #208: after timeout, retry the failed target with replace — never reload old readable A.
@@ -349,6 +367,7 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
 
   const stop = useCallback(() => {
     clearTimers();
+    if (nativePreview && nativeIdRef.current) void desktopChatBridge()?.previewAction?.({ id: nativeIdRef.current, action: "stop" }).catch((error) => setNativeError(String(error)));
     try {
       iframeRef.current?.contentWindow?.stop();
     } catch {
@@ -357,7 +376,7 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
     setSlow(false);
     // Mid-nav stop: keep pending target / address; do not mark committed (#208).
     setLoadState("loaded_uncertain");
-  }, [clearTimers]);
+  }, [clearTimers, nativePreview]);
 
   const navigateRef = useRef(navigate);
   navigateRef.current = navigate;
@@ -370,6 +389,31 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
   }, [request, surface.id, threadId]);
 
   /** Pull location/title from a readable frame. A null `kind` means an in-page navigation (pushes history). */
+  const handleNativePreviewEvent = useCallback((event: DesktopPreviewEvent) => {
+    if (event.threadId !== threadId) return;
+    if (event.id) nativeIdRef.current = event.id;
+    setNativeHistory({ back: Boolean(event.canGoBack), forward: Boolean(event.canGoForward) });
+    if (event.status === "error") {
+      clearTimers(); setSlow(false); setLoadState("timeout");
+      setNativeError(event.message || "desktop.preview.load_failed");
+      return;
+    }
+    if (event.status === "loading") { beginLoad(); return; }
+    if (event.status !== "loaded" && event.status !== "navigated") return;
+    const next = normalizePreviewUrl(event.url);
+    if (!next) return;
+    clearTimers(); setSlow(false); setNativeError(""); setLoadState("loaded"); setTrackable(true);
+    if (draftRef.current === urlRef.current) setDraft(next);
+    const kind = navKindRef.current;
+    navKindRef.current = null;
+    setUrl(next);
+    setHistory((current) => kind ? replaceEntry(current, next) : pushEntry(current, next));
+    committedDocUrlRef.current = next;
+    pendingTargetRef.current = null; failedTargetRef.current = null; navCommittedRef.current = true;
+    setFailedTarget(null);
+    chatPanel.updatePreview(threadId, surface.id, { url: next, title: event.title });
+  }, [beginLoad, clearTimers, surface.id, threadId]);
+
   const syncFromFrame = useCallback((frame: HTMLIFrameElement, kind: NavKind | null) => {
     const loc = readIframeLocation(frame);
     if (loc.kind !== "known") return false;
@@ -454,7 +498,7 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
   // SPA route changes (pushState) fire no load event; poll only after current nav commits (#208).
   useEffect(() => {
     if (
-      !shouldPollSpaLocation({
+      nativePreview || !shouldPollSpaLocation({
         active,
         trackable,
         hasUrl: Boolean(url),
@@ -499,7 +543,7 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
       if (title && title !== surface.title) chatPanel.updatePreview(threadId, surface.id, { title });
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [active, loadState, surface.id, surface.title, syncFromFrame, threadId, trackable, url]);
+  }, [active, loadState, surface.id, surface.title, syncFromFrame, threadId, trackable, url, nativePreview]);
 
   useEffect(() => {
     if (!active) return;
@@ -558,8 +602,8 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
   return (
     <div className="flex min-h-0 flex-1 flex-col" data-testid="preview-surface">
       <div className="relative flex h-10 shrink-0 items-center gap-0.5 border-b border-cx-border-subtle px-1.5">
-        <IconButton icon="arrowLeft" label="后退" disabled={history.index <= 0} onClick={() => traverse(-1)} />
-        <IconButton icon="arrowRight" label="前进" disabled={history.index >= history.entries.length - 1} onClick={() => traverse(1)} />
+        <IconButton icon="arrowLeft" label="后退" disabled={nativePreview ? !nativeHistory.back : history.index <= 0} onClick={() => traverse(-1)} />
+        <IconButton icon="arrowRight" label="前进" disabled={nativePreview ? !nativeHistory.forward : history.index >= history.entries.length - 1} onClick={() => traverse(1)} />
         {loading ? (
           <IconButton icon="x" label="停止加载" onClick={stop} />
         ) : (
@@ -588,7 +632,7 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
       {showEnvNotice ? (
         <div role="note" className="flex shrink-0 items-start gap-2 border-b border-cx-border-subtle bg-cx-bg-subtle py-1.5 pl-3 pr-1.5 text-[11.5px] leading-[18px] text-cx-fg-3">
           <Icon name="info" size={12} className="mt-[3px] shrink-0 text-cx-fg-4" />
-          <span className="min-w-0 flex-1">{ENV_HINT}</span>
+          <span className="min-w-0 flex-1">{environmentHint}</span>
           <button
             type="button"
             aria-label="不再提示"
@@ -613,7 +657,7 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
             style={frameStyle}
           >
             <div style={canvasStyle}>
-              <iframe
+              {nativePreview ? <NativePreview surfaceId={surface.id} threadId={threadId} url={url} active={active && loadState !== "timeout"} revision={frameKey} onEvent={handleNativePreviewEvent} /> : <iframe
                 ref={iframeRef}
                 key={frameKey}
                 data-nav-generation={navGenerationRef.current}
@@ -622,7 +666,7 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
                 sandbox="allow-forms allow-modals allow-popups allow-same-origin allow-scripts"
                 onLoad={handleLoad}
                 className="block h-full w-full border-0 bg-white"
-              />
+              />}
             </div>
           </div>
           {size ? (
@@ -653,6 +697,7 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
               </span>
               <p className="text-[14px] font-medium text-cx-fg">加载超时或无法连接</p>
               <p className="mt-1 text-[12.5px] leading-5 text-cx-fg-3">目标服务可能尚未启动、地址有误，或拒绝在面板中嵌入。</p>
+              {nativeError ? <pre className="mt-2 max-h-40 w-full overflow-auto whitespace-pre-wrap break-words text-left text-xs">{nativeError}</pre> : null}
               <div className="mt-4 flex items-center gap-2">
                 <Button size="sm" variant="secondary" icon="refresh" onClick={reload}>重试</Button>
                 <Button size="sm" variant="ghost" icon="externalLink" onClick={() => openExternal(errorRecoveryUrl)}>在浏览器中打开</Button>
