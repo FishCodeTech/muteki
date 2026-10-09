@@ -31,10 +31,16 @@ import yaml
 from muteki.extensions.installer import ExtensionInstaller, InstallError, Source, sha256_file, sha256_tree
 from muteki.extensions.isolation import IsolationUnavailable
 from muteki.conversation.chat_providers import PROVIDERS, provider_for
-from muteki.conversation.chat_plugin_components import compatibility, inspect_components, install_native_components
+from muteki.conversation.chat_plugin_components import ENGINES, compatibility, inspect_components, install_native_components
+from muteki.external_agents.descriptors import engines_where, find_descriptor, get_descriptor
 
-ENGINES = ("claude", "codex", "cursor", "pi", "omp", "kimi", "grok", "opencode")
 MODES = ("chat", "ctf", "pentest")
+# Skills marked ``requires_native`` run only on engines with their own skill
+# semantics; Worker-home native components need a declared native home.
+NATIVE_SKILL_ENGINES = frozenset(engines_where(lambda d: d.components.native_skill_semantics))
+WORKER_COMPONENT_ENGINES = frozenset(engines_where(lambda d: bool(d.environment.worker_component_home_env)))
+EXTENSION_ENGINES = frozenset(engines_where(lambda d: d.components.extension_abi))
+VISUALIZE_PACKAGE = Path(__file__).resolve().parents[1] / "agent_plugins" / "muteki-visualize"
 _log = logging.getLogger(__name__)
 
 
@@ -66,6 +72,59 @@ def _snapshot_copy(source: str | Path, target: str | Path) -> str:
         if error not in {errno.ENOTSUP, errno.EXDEV, errno.ENOSYS}:
             raise OSError(error, os.strerror(error), str(source))
     return shutil.copy2(source, target)
+
+
+def _sync_omp_databases(source: Path, target: Path, root: Path) -> None:
+    """Import native credentials/catalogs, never host history, leases or settings.
+
+    Read through SQLite so committed WAL contents belong to the snapshot.
+    Refresh only when the host rows change; native private refreshes survive
+    ordinary launches. Transactions update only the selected tables.
+    """
+    from .native_environment import NativeEnvironmentError
+    manifest = root / ".omp-state-imports.json"
+    previous = json.loads(manifest.read_text()) if manifest.exists() else {}
+    current = dict(previous)
+    for filename, names in {
+        "agent.db": ("auth_credentials", "auth_schema_version"),
+        "models.db": ("model_cache",),
+    }.items():
+        origin = source / filename
+        if not origin.is_file():
+            continue
+        snapshot = []
+        with closing(sqlite3.connect(origin.as_uri() + "?mode=ro", uri=True)) as conn:
+            conn.execute("BEGIN")
+            for name in names:
+                schema = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone()
+                if schema is None:
+                    continue
+                columns = [row[1] for row in conn.execute(f'PRAGMA table_info("{name}")')]
+                rows = conn.execute(f'SELECT * FROM "{name}" ORDER BY rowid').fetchall()
+                snapshot.append((name, schema[0], columns, rows))
+        digest = sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()
+        destination = target / filename
+        if destination.is_symlink():
+            raise NativeEnvironmentError(f"OMP native database is a symlink: {destination}")
+        if previous.get(filename) == digest and destination.is_file():
+            continue
+        with closing(sqlite3.connect(destination, timeout=30)) as conn, conn:
+            for name, schema, columns, rows in snapshot:
+                conn.execute(schema.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1))
+                existing = [row[1] for row in conn.execute(f'PRAGMA table_info("{name}")')]
+                if existing != columns:
+                    raise NativeEnvironmentError(f"OMP native database schema differs: {filename}:{name}")
+                conn.execute(f'DELETE FROM "{name}"')
+                conn.executemany(f'INSERT INTO "{name}" VALUES ({",".join("?" for _ in columns)})', rows)
+        destination.chmod(0o600)
+        current[filename] = digest
+    fd, temporary = tempfile.mkstemp(prefix=".omp-state-", dir=root)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(current, stream)
+        os.replace(temporary, manifest)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def _copy_package(source: Path, target: Path) -> None:
@@ -119,9 +178,9 @@ class ChatPluginService:
             if record.get("scope_version") != 2:
                 record.update(enabled=bool(record.get("engines")), engines=list(ENGINES), scope_version=2)
                 self.save(record)
-            if record.get("component_schema_version") != 4:
+            if record.get("component_schema_version") != 5:
                 inspected = self._inspect(Path(record["root"]))
-                record.update({key: inspected[key] for key in ("components", "requirements", "declared_engines", "skills", "environment", "component_schema_version")})
+                record.update({key: inspected[key] for key in ("components", "requirements", "declared_engines", "skills", "environment", "allowed_modes", "component_schema_version")})
                 self.save(record)
 
     def connect(self) -> sqlite3.Connection:
@@ -160,15 +219,18 @@ class ChatPluginService:
     def enabled(self, engine: str, mode: str = "chat") -> list[dict[str, Any]]:
         if mode not in MODES:
             raise ChatPluginError("未知使用场景")
+        if mode != "chat" and (engine not in PROVIDERS or not PROVIDERS[engine].managed_environment):
+            return []  # Chat-skill support does not enable new Worker transports.
         return [r for r in self.records() if r.get("enabled", True)
                 and mode in r.get("modes", ["chat"])
+                and mode in r.get("allowed_modes", MODES)
                 and (compatibility(r, check_tools=False)[engine]["status"] != "blocked"
                      if mode == "chat"
                      else engine in r.get("declared_engines", ENGINES)
-                     and bool(any(not skill.get("requires_native") or engine == "claude"
+                     and bool(any(not skill.get("requires_native") or engine in NATIVE_SKILL_ENGINES
                                   for skill in r.get("skills", [])) or r.get("mcp") or any(
                          component.get("kind") in {"extensions", "agents"}
-                         and engine in {"pi", "omp", "opencode"}
+                         and engine in WORKER_COMPONENT_ENGINES
                          and engine in component.get("engines", [])
                          for component in r.get("components", []))))]
 
@@ -289,13 +351,15 @@ class ChatPluginService:
     @classmethod
     def validate_record_modes(cls, record: dict[str, Any], modes: Any) -> list[str]:
         selected = cls.validate_modes(modes)
+        if any(mode not in record.get("allowed_modes", MODES) for mode in selected):
+            raise ChatPluginError("此插件不支持所选场景", code="chat_plugin.mode_unsupported")
         if any(mode != "chat" for mode in selected):
             engines = set(record.get("declared_engines", ENGINES))
             portable = bool(engines) and (bool(record.get("mcp")) or any(
-                not skill.get("requires_native") or "claude" in engines
+                not skill.get("requires_native") or bool(engines & NATIVE_SKILL_ENGINES)
                 for skill in record.get("skills", [])))
             native = any(item.get("kind") in {"extensions", "agents"}
-                         and engines.intersection({"pi", "omp", "opencode"})
+                         and engines.intersection(WORKER_COMPONENT_ENGINES)
                              .intersection(item.get("engines", []))
                          for item in record.get("components", []))
             if not portable and not native:
@@ -399,6 +463,10 @@ class ChatPluginService:
             self.save(record)
         return self.public(record)
 
+    def install_visualize(self) -> dict[str, Any]:
+        """Install the independent, chat-only package through normal lifecycle controls."""
+        return self.install({"path": str(VISUALIZE_PACKAGE)}, modes=["chat"])
+
     def _inspect(self, root: Path) -> dict[str, Any]:
         manifest: dict[str, Any] = {}
         for relative in ("plugin.json", ".codex-plugin/plugin.json", ".claude-plugin/plugin.json", ".cursor-plugin/plugin.json"):
@@ -409,7 +477,7 @@ class ChatPluginService:
         skill_files = sorted(root.rglob("SKILL.md"))
         if not manifest and (root / "package.json").is_file():
             package = json.loads((root / "package.json").read_text())
-            if any(key in package for key in ("pi", "omp", "opencode")):
+            if any(key in package for key in EXTENSION_ENGINES):
                 manifest = package
                 manifest["name"] = str(package.get("name") or root.name).lstrip("@").replace("/", "-")
         if not manifest and not skill_files:
@@ -457,20 +525,20 @@ class ChatPluginService:
                                     ("context", "agent", "hooks", "allowed-tools", "disallowed-tools", "model", "disable-model-invocation"))
                                     or "!`" in _contained(root, item["path"]).read_text())})
                 if skills[-1]["requires_native"]:
-                    item["engines"] = ["claude"]
+                    item["engines"] = sorted(NATIVE_SKILL_ENGINES)
         for skill in skills:
             if skill.get("hooks"):
                 config = skill["hooks"]
                 if not isinstance(config, dict):
                     raise ChatPluginError("Skill hooks 必须为事件对象")
                 components["components"].append({"kind": "skill_hooks", "name": skill["name"],
-                    "config": {"hooks": config}, "engines": ["claude"], "delivery": "native_hooks"})
+                    "config": {"hooks": config}, "engines": sorted(NATIVE_SKILL_ENGINES), "delivery": "native_hooks"})
         if not skills and not mcp and not components["components"]:
             raise ChatPluginError("未找到可导入的 Skill 或 MCP；此插件可能依赖原客户端")
         unsupported = [key for key in ("hooks", "agents", "commands", "extensions") if manifest.get(key) or (root / key).is_dir()]
         return {"id": name, "name": name, "version": str(manifest.get("version") or "local"),
                 "description": str(manifest.get("description") or (skills[0]["description"] if skills else "MCP")),
-                "skills": skills, "mcp": mcp, "native_components": unsupported, "component_schema_version": 4, **components}
+                "skills": skills, "mcp": mcp, "native_components": unsupported, "component_schema_version": 5, **components}
 
     @staticmethod
     def _validate_mcp(servers: Any, *, root: Path | None = None) -> None:
@@ -563,17 +631,19 @@ class ChatPluginService:
         worker_compatibility = {}
         for engine in ENGINES:
             components = []
-            if any((not skill.get("requires_native") or engine == "claude")
+            if any((not skill.get("requires_native") or engine in NATIVE_SKILL_ENGINES)
                    and (not skill.get("hooks") or record.get("hooks_approved_digest") == record.get("digest"))
                    for skill in record.get("skills", [])):
                 components.append("Skill")
             if record.get("mcp"):
                 components.append("MCP")
-            if engine in {"pi", "omp", "opencode"} and any(
+            if engine in WORKER_COMPONENT_ENGINES and any(
                 item.get("kind") in {"extensions", "agents"}
                 and engine in item.get("engines", []) for item in record.get("components", [])
             ):
                 components.append("原生插件")
+            if not any(mode != "chat" for mode in record.get("allowed_modes", MODES)) or not PROVIDERS[engine].managed_environment:
+                components = []
             worker_compatibility[engine] = {
                 "status": "available" if components and engine in record.get("declared_engines", ENGINES)
                           else "unavailable",
@@ -581,6 +651,7 @@ class ChatPluginService:
             }
         return {k: record.get(k) for k in ("id", "name", "version", "description", "enabled", "engines", "digest", "skills", "native_components")} | {
             "modes": list(record.get("modes", ["chat"])),
+            "allowed_modes": list(record.get("allowed_modes", MODES)),
             "worker_compatibility": worker_compatibility,
             "mcp_servers": list(record.get("mcp", {})), "origin": "managed",
             "can_rollback": bool(record.get("previous")),
@@ -599,7 +670,7 @@ class ChatPluginService:
             for skill in record["skills"]:
                 if skill.get("hooks") and record.get("hooks_approved_digest") != record["digest"]:
                     continue
-                if skill.get("requires_native") and engine != "claude":
+                if skill.get("requires_native") and engine not in NATIVE_SKILL_ENGINES:
                     continue
                 if skill["invocable"] or include_automatic:
                     rows.append({"id": f"managed:{engine}:{record['id']}:{record['digest'][:12]}:{skill['name']}",
@@ -607,7 +678,7 @@ class ChatPluginService:
                                  "description": skill["description"], "source": "Muteki 聊天插件", "scope": "chat",
                                  "engine": engine, "_path": str(_contained(Path(record["root"]), skill["path"])),
                                  "_package_root": record["root"], "component_kind": skill.get("component_kind", "skill"),
-                                 "native_engine": "claude" if skill.get("requires_native") else "",
+                                 "native_engine": engine if skill.get("requires_native") else "",
                                  "native_name": f"muteki-{record['id']}:{skill['name']}" if skill.get("requires_native") else "",
                                  "_priority": 500})
         return rows
@@ -635,7 +706,7 @@ class ChatPluginService:
             records = self.enabled(engine, mode)
             for record in records:
                 skills = [skill for skill in record.get("skills", [])
-                          if (not skill.get("requires_native") or engine == "claude")
+                          if (not skill.get("requires_native") or engine in NATIVE_SKILL_ENGINES)
                           and (not skill.get("hooks") or
                                record.get("hooks_approved_digest") == record.get("digest"))]
                 native = any(component.get("kind") in {"extensions", "agents"}
@@ -765,8 +836,9 @@ class ChatPluginService:
     def stage_native_worker(self, workdir: str | Path, *, engine: str, mode: str,
                             env: dict[str, str], container: Any = None) -> list[str]:
         """Place ABI-specific Pi/OMP/OpenCode components in the private Worker home."""
-        if mode not in {"ctf", "pentest"} or engine not in {"pi", "omp", "opencode"}:
+        if mode not in {"ctf", "pentest"} or engine not in WORKER_COMPONENT_ENGINES:
             return []
+        descriptor = get_descriptor(engine)
         from muteki.solver.workspace import workspace_root_for_worker
 
         records = [record for record in self.enabled(engine, mode)
@@ -806,13 +878,12 @@ class ChatPluginService:
                 raise ChatPluginError("Worker 原生扩展只能写入当前 Run 的私有目录")
             return result
 
-        runtime_home = (env.get("PI_CODING_AGENT_DIR", "") if engine in {"pi", "omp"}
-                        else env.get("XDG_CONFIG_HOME", ""))
+        runtime_home = env.get(descriptor.environment.worker_component_home_env, "")
         if not runtime_home:
             raise ChatPluginError(f"{engine} Worker 缺少原生扩展目录")
         home = host_path(runtime_home)
-        if engine == "opencode":
-            home /= "opencode"
+        if descriptor.environment.worker_component_home_subdir:
+            home /= descriptor.environment.worker_component_home_subdir
         delivered: list[str] = []
         with self._lock:
             self._require_run_snapshots_safe(shared)
@@ -830,13 +901,14 @@ class ChatPluginService:
                         destination.parent.mkdir(parents=True, exist_ok=True)
                         _snapshot_copy(entry, destination) if not destination.exists() else None
                     else:
-                        directory = home / ("plugins" if engine == "opencode" else "extensions")
+                        directory = home / descriptor.components.extension_dir
                         directory.mkdir(parents=True, exist_ok=True)
                         suffix = sha256(str(item["path"]).encode()).hexdigest()[:8]
                         destination = directory / f"muteki-{record['id']}-{item['name']}-{suffix}.js"
                         runtime_entry = (str(container.to_container_path(str(entry)))
                                          if container is not None else str(entry))
-                        export = ("export *" if engine == "opencode" else "export { default }")
+                        export = ("export *" if descriptor.components.extension_export == "star"
+                                  else "export { default }")
                         content = f"{export} from {json.dumps(Path(runtime_entry).as_uri())};\n"
                         if not destination.exists() or destination.read_text() != content:
                             destination.write_text(content, encoding="utf-8")
@@ -864,16 +936,40 @@ class ChatPluginService:
         root.mkdir(parents=True, exist_ok=True)
         return root
 
+    def _visualization_snapshot(self, thread_id: str, message_id: str, reference: Any, engine: str) -> dict[str, Any]:
+        from .visualizations import snapshot
+        root = self.root / "visualizations" / sha256(thread_id.encode()).hexdigest()
+        return snapshot(root, self.visualization_root(thread_id), message_id, reference,
+                        lambda: self.visualization_assets(engine))
+
+    def publish_visualizations(self, thread_id: str, messages: list[Any], engine: str) -> None:
+        from .visualizations import references
+        for message in messages:
+            if message.role == "assistant":
+                for reference in references(message.text or ""):
+                    self._visualization_snapshot(thread_id, message.message_id, reference, engine)
+
+    def visualization_document(self, thread_id: str, messages: list[Any], engine: str,
+                               path: str, message_id: str = "") -> dict[str, Any]:
+        from .visualizations import VisualizationError, references
+        matches = [(message, reference) for message in messages
+                   if message.role == "assistant" and (not message_id or message.message_id == message_id)
+                   for reference in references(message.text or "") if reference.path == path]
+        if len({message.message_id for message, _ in matches}) != 1:
+            raise VisualizationError("visualization.not_attached", "图形未附着到当前消息，或来源消息不唯一")
+        message, reference = matches[0]
+        result = self._visualization_snapshot(thread_id, message.message_id, reference, engine)
+        if "error" in result:
+            raise VisualizationError(result["error"]["code"], result["error"]["message"])
+        return result
+
     def visualization_context(self, thread_id: str) -> str:
         root = self.visualization_root(thread_id)
-        return ("[Muteki 聊天展示接口]\n若当前任务与已启用 Skill 需要在聊天展示 HTML 交互图，"
-                f"请将 HTML 片段保存到本次对话的可写目录 {root}，并在回复中单独一行输出 "
-                'visualize{"path":"绝对路径.html"}。使用普通 HTML/CSS/JS，'
-                '也支持纯文本标记 muteki-visualize {"path":"绝对路径.html"}（单独一行，跨引擎建议使用此格式）。'
-                "不要使用网络 API。支持主题变量、基础样式类、Lucide、图形本地交互和 widgetState。"
-                "支持 Tweak 设计控件、sendFollowUpMessage（用户确认后发送）、openExternal（用户确认后打开）。"
-                "使用 Visualize Skill 时，会载入该插件自带的样式、日历、选项卡、提示与设计轮播。"
-                "未使用交互图时忽略此接口。\n")
+        return ("[Muteki 聊天展示接口]\n需要结构图或交互图时，直接输出 muteki-visualize 围栏，"
+                "块内放完整 HTML 片段；宿主保存并内联渲染，无需文件写权限或控制工具。"
+                "不要使用网络 API。主题与交互细节按已启用的 visualize Skill 读取。"
+                f"文件交付与本地图片目录为 {root}；文件交付时单独一行输出 "
+                'muteki-visualize {"path":"绝对路径.html"}。\n')
 
     def visualization_assets(self, engine: str) -> dict[str, str]:
         from .composer_capabilities import discover_skills
@@ -908,8 +1004,11 @@ class ChatPluginService:
         return commands
 
     def native_launch_options(self, engine: str, env: dict[str, str]) -> dict[str, Any]:
-        if engine not in {"claude", "codex"}:
+        descriptor = find_descriptor(engine)
+        packaging = descriptor.components.native_plugin_packages if descriptor is not None else "none"
+        if packaging == "none":
             return {}
+        claude_packages = packaging == "claude_local_plugins"
         private = Path(env["MUTEKI_CHAT_PRIVATE_ROOT"])
         packages = []
         approved_hooks = {}
@@ -917,7 +1016,7 @@ class ChatPluginService:
             hooks_allowed = record.get("hooks_approved_digest") == record["digest"]
             items = [c for c in record.get("components", []) if engine in c["engines"] and c["kind"] in {"hooks", "agents"}
                      and (c["kind"] != "hooks" or hooks_allowed)]
-            if engine == "claude" and any(s.get("requires_native") for s in record.get("skills", [])):
+            if engine in NATIVE_SKILL_ENGINES and any(s.get("requires_native") for s in record.get("skills", [])):
                 items.append({"kind": "skills"})
             if compatibility(record, self._verified_tools)[engine]["status"] == "blocked":
                 continue
@@ -928,7 +1027,7 @@ class ChatPluginService:
                 _copy_package(Path(record["root"]), target)
                 native = {"name": record["id"], "version": str(record.get("version") or "1.0.0"),
                           "description": record.get("description", ""), "hooks": {"hooks": {}}}
-                if engine == "claude":
+                if claude_packages:
                     native["name"] = "muteki-" + record["id"]
                     native["skills"] = sorted({"./" + str(Path(s["path"]).parent)
                                                for s in record.get("skills", []) if s.get("component_kind") != "command"})
@@ -963,10 +1062,10 @@ class ChatPluginService:
                     front, body = frontmatter(file)
                     wrap(front["hooks"])
                     file.write_text("---\n" + yaml.safe_dump(front, allow_unicode=True) + "---\n" + body)
-                if engine == "claude":
+                if claude_packages:
                     native["skills"] = [p for p in native["skills"] if (target / p / "SKILL.md").is_file()]
                     native["commands"] = [p for p in native["commands"] if (target / p).is_file()]
-                if engine == "claude" and any(c["kind"] == "agents" for c in items):
+                if claude_packages and any(c["kind"] == "agents" for c in items):
                     native["agents"] = ["./" + c["path"] for c in items if c["kind"] == "agents"]
                 # Native-only envelope: MCP stays behind the authorized Muteki gateway.
                 (target / "plugin.json").unlink(missing_ok=True)
@@ -983,7 +1082,7 @@ class ChatPluginService:
             if hooks_allowed:
                 native_manifest = json.loads((target / ".codex-plugin/plugin.json").read_text())
                 approved_hooks[record["id"] + "@muteki-chat"] = self.hook_commands({"components": [{"kind": "hooks", "config": native_manifest.get("hooks")} ]})
-        if engine == "claude":
+        if claude_packages:
             return {"plugins": [{"type": "local", "path": p["path"]} for p in packages]}
         marketplace = private / "native-packages" / ".agents" / "plugins" / "marketplace.json"
         if packages:
@@ -1000,10 +1099,11 @@ class ChatPluginService:
         previous_revision: str | None = None, include_assets: bool = True,
     ) -> dict[str, str]:
         """Reuse one private home per identity and incrementally refresh imports."""
-        if engine not in PROVIDERS:
+        if engine not in PROVIDERS or not PROVIDERS[engine].managed_environment:
             return supplied
         from .native_environment import NativeEnvironmentError, environment_home, synchronize
         provider = provider_for(engine)
+        environment = provider.descriptor.environment
         host_discovery = os.environ.get("MUTEKI_HOST_DISCOVERY", "1") != "0"
         source = provider.native_root() if host_discovery else None
         names = (*provider.configuration_names, *provider.credential_names,
@@ -1016,15 +1116,14 @@ class ChatPluginService:
                 imports = [(source / name, Path("home") / provider.home_relative / name) for name in names] if source is not None else []
                 if include_assets and host_discovery:
                     imports.append((Path.home() / ".agents/skills", Path("home/.agents/skills")))
-                if engine == "claude" and host_discovery:
-                    imports.append((Path.home() / ".claude.json", Path("home/.claude.json")))
-                if engine == "opencode" and host_discovery:
-                    imports.append((Path.home() / ".local/share/opencode/auth.json", Path("data/opencode/auth.json")))
+                if host_discovery:
+                    imports.extend((Path.home() / item.host_relative, Path(item.target))
+                                   for item in environment.extra_imports)
                 account = supplied.get(provider.home_variable)
                 if account:
                     account_source = Path(account).expanduser()
-                    if engine == "opencode":
-                        account_source /= "opencode"
+                    if environment.home_env_is_parent:
+                        account_source /= engine
                     if source is None or account_source.resolve() != source.resolve():
                         # Generated accounts override configuration/auth only;
                         # never import a second copy of all host capability assets.
@@ -1044,6 +1143,9 @@ class ChatPluginService:
                     imports.append((Path(stage), Path("home") / provider.home_relative))
                     remappings = ((str(source), str(target)),) if source is not None else ()
                     synchronize(root, imports, _snapshot_copy, remappings)
+                if (engine == "omp" and source is not None
+                        and (not account or Path(account).expanduser().resolve() == source.resolve())):
+                    _sync_omp_databases(source, target, root)
                 if ready.exists() and ready.read_text() != revision:
                     native_packages = root / "native-packages"
                     if native_packages.is_symlink():
@@ -1058,19 +1160,54 @@ class ChatPluginService:
         env.update({"HOME": str(home), "USERPROFILE": str(home), provider.home_variable: str(target),
                     "XDG_DATA_HOME": str(root / "data"), "XDG_CACHE_HOME": str(root / "cache"),
                     "XDG_CONFIG_HOME": str(home / ".config"), "MUTEKI_CHAT_PRIVATE_ROOT": str(root)})
-        if engine == "cursor":
-            env["CURSOR_DATA_DIR"] = str(root / "data")
-            # Cursor persists even explicitly supplied API keys/tokens to the
-            # macOS keychain by default. A private chat home has no login
-            # keychain, so this can open a system dialog on every startup.
-            # Managed credentials are re-injected on each launch; keep them
-            # only in memory. Preserve native login when no credential is given.
-            if any(env.get(key, os.environ.get(key, "")).strip()
-                   for key in ("CURSOR_API_KEY", "CURSOR_AUTH_TOKEN")):
-                env["AGENT_CLI_CREDENTIAL_STORE"] = "memory"
-        if engine == "opencode":
-            env["OPENCODE_CONFIG_DIR"] = str(target)
+        for name, location in environment.private_env.items():
+            env[name] = str(target if location == "home_target" else root / "data")
+        # Cursor persists even explicitly supplied API keys/tokens to the
+        # macOS keychain by default. A private chat home has no login
+        # keychain, so this can open a system dialog on every startup.
+        # Managed credentials are re-injected on each launch; keep them
+        # only in memory. Preserve native login when no credential is given.
+        if environment.memory_credential_store_env and any(
+                env.get(key, os.environ.get(key, "")).strip()
+                for key in environment.memory_credential_store_when):
+            env[environment.memory_credential_store_env] = "memory"
         return env
+
+    def prepare_codex_fork_history(
+        self, source_identity: str, supplied: dict[str, str], *, previous_revision: str | None = None,
+    ) -> None:
+        """T3's shared history/private auth overlay, within managed chat homes.
+
+        The target keeps its own auth, provider config, models and assets.
+        Only native history/SQLite state is shared; user homes are unchanged.
+        Conflicting existing target state is an explicit error.
+        """
+        from .native_environment import environment_home
+        target = Path(supplied["CODEX_HOME"]).resolve()
+        managed = (self.root / "sessions").resolve()
+        if not target.is_relative_to(managed):
+            raise ChatPluginError("Codex fork requires a managed target home", code="conversation.fork.home_invalid")
+        with self._lock, environment_home(self.root, "codex", source_identity, previous_revision) as root:
+            source = root / "home" / provider_for("codex").home_relative
+            if not source.is_dir() or not (source / "sessions").exists():
+                raise ChatPluginError("Native Codex fork history is missing", code="conversation.fork.history_missing")
+            entries = {"sessions", "archived_sessions", "sqlite", "shell_snapshots", "worktrees"}
+            entries.update(path.name for path in source.iterdir()
+                           if path.name.endswith((".sqlite", ".sqlite-wal", ".sqlite-shm")))
+            # Sidecars must address the same store even when currently absent.
+            for name in list(entries):
+                if name.endswith(".sqlite"):
+                    entries.update({name + "-wal", name + "-shm"})
+            for name in sorted(entries):
+                original, link = source / name, target / name
+                resolved = original.resolve()
+                if not resolved.is_relative_to(managed):
+                    raise ChatPluginError("Native history escapes managed homes", code="conversation.fork.home_invalid")
+                if link.is_symlink() and link.resolve() == resolved:
+                    continue
+                if link.exists() or link.is_symlink():
+                    raise ChatPluginError(f"Target native history already exists: {name}", code="conversation.fork.home_conflict")
+                link.symlink_to(resolved, target_is_directory=name in {"sessions", "archived_sessions", "sqlite", "shell_snapshots", "worktrees"})
 
     def release_thread_assets(self, thread_id: str) -> int:
         """Called after successful close when archiving a chat. Keep its history."""
@@ -1093,6 +1230,8 @@ class ChatPluginService:
 
 
     async def prepare_tools(self, engine: str, mode: str = "chat", scope: str = "") -> list[dict[str, Any]]:
+        if mode == "chat" and engine in PROVIDERS and not PROVIDERS[engine].gateway_tools:
+            return []  # Portable skills work without claiming MCP injection.
         cache_key = f"{mode}:{engine}:{scope}:{self.revision(engine, mode)}"
         async with self._prepare_locks.setdefault(cache_key, asyncio.Lock()):
             return await self._prepare_tools(engine, mode, scope)

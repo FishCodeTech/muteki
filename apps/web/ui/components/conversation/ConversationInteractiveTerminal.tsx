@@ -633,7 +633,7 @@ export function ConversationInteractiveTerminal({
         <IconButton size="sm" icon="stopCircle" label="发送 Ctrl+C" disabled={!activeId || connection !== "connected" || !running} onClick={() => void interrupt()} aria-label="中断" />
         <IconButton size="sm" icon="trash" label="关闭会话" className="hover:text-cx-danger" disabled={!activeId} onClick={() => void closeActive()} aria-label="关闭会话" />
       </div>
-      <div className="flex h-7 shrink-0 items-center gap-2 border-b border-cx-border-subtle bg-cx-bg-subtle px-3 text-[11.5px] text-cx-fg-3" role="status">
+      <div className="flex h-7 shrink-0 items-center gap-2 border-b border-cx-border-subtle bg-cx-bg-subtle px-3 text-[12px] text-cx-fg-3" role="status">
         {connection === "connecting" ? <Spinner size={11} /> : <StatusDot tone={disconnected ? "warning" : connection === "connected" && running ? "success" : session?.workspace_diverged ? "warning" : "neutral"} />}
         <span className="shrink-0">{connection === "connecting" ? "连接中…" : connection === "connected" ? "已连接" : connection === "closed" ? "连接已结束" : activeId ? "连接已断开" : "未连接"}</span>
         {session ? <span className="shrink-0">{connection === "connected" || connection === "closed" ? "进程" : "上次进程状态"}：{statusLabel(session)}</span> : null}

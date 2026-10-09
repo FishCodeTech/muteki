@@ -248,13 +248,14 @@ export function CommandPalette(props: PaletteData) {
   }, [filtered]);
 
   return (
-    <Modal
+    <Modal.Backdrop
       isOpen={open}
       onOpenChange={(isOpen) => {
         if (!isOpen) onClose();
       }}
+      variant="opaque"
+      isDismissable
     >
-      <Modal.Backdrop variant="opaque" isDismissable>
         <Modal.Container
           size="lg"
           placement="top"
@@ -375,7 +376,6 @@ export function CommandPalette(props: PaletteData) {
             </Modal.Footer>
           </Modal.Dialog>
         </Modal.Container>
-      </Modal.Backdrop>
-    </Modal>
+    </Modal.Backdrop>
   );
 }

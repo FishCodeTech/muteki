@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -21,22 +22,43 @@ class GitWorkspaceError(RuntimeError):
         self.code = code
 
 
-def _run_git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+def _noninteractive_git_env() -> dict[str, str]:
+    env = dict(os.environ)
+    # The service has no operator TTY: credential/askpass prompts would block
+    # until the timeout instead of failing with git's real message.
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "never"
+    env.setdefault("GIT_EDITOR", "true")
+    return env
+
+
+def _run_git(
+    root: Path,
+    *args: str,
+    check: bool = True,
+    timeout: float = 30,
+    code: str = "conversation.git.error",
+) -> subprocess.CompletedProcess[str]:
     try:
         completed = subprocess.run(
             ["git", "-C", str(root), *args],
             check=False,
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             text=True,
-            timeout=30,
+            timeout=timeout,
+            env=_noninteractive_git_env(),
         )
     except FileNotFoundError as exc:
         raise GitWorkspaceError("本机未找到 git 可执行文件") from exc
     except subprocess.TimeoutExpired as exc:
-        raise GitWorkspaceError("git 命令超时") from exc
+        raise GitWorkspaceError(
+            f"git {args[0] if args else ''} 超时（{int(timeout)} 秒）",
+            code="conversation.git.timeout",
+        ) from exc
     if check and completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "").strip() or f"exit {completed.returncode}"
-        raise GitWorkspaceError(detail)
+        raise GitWorkspaceError(detail, code=code)
     return completed
 
 
@@ -133,7 +155,8 @@ def inspect_git_workspace(root_path: str) -> dict[str, Any]:
         branches.append(name)
 
     dirty_probe = _run_git(root, "status", "--porcelain", check=False)
-    dirty = bool((dirty_probe.stdout or "").strip())
+    changed_files = [line for line in (dirty_probe.stdout or "").splitlines() if line.strip()]
+    dirty = bool(changed_files)
     common = resolve_git_common_dir(str(root))
 
     return {
@@ -144,8 +167,243 @@ def inspect_git_workspace(root_path: str) -> dict[str, Any]:
         "detached_sha": current if detached else None,
         "branches": branches,
         "dirty": dirty,
+        "changed_file_count": len(changed_files),
         "git_common_dir": str(common) if common is not None else None,
+        **_sync_status(root),
     }
+
+
+def _sync_status(root: Path) -> dict[str, Any]:
+    """HEAD 与上游的同步关系；ahead/behind 基于最近一次 fetch 的远端引用。"""
+    remotes_probe = _run_git(root, "remote", check=False)
+    remotes = [line.strip() for line in (remotes_probe.stdout or "").splitlines() if line.strip()]
+    head_probe = _run_git(root, "log", "-1", "--format=%H%x00%s", check=False)
+    head_sha, _, head_subject = (head_probe.stdout or "").strip().partition("\x00")
+    upstream_probe = _run_git(
+        root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False,
+    )
+    upstream = (upstream_probe.stdout or "").strip() if upstream_probe.returncode == 0 else ""
+    ahead: int | None = None
+    behind: int | None = None
+    if upstream:
+        counts = _run_git(root, "rev-list", "--left-right", "--count", "@{upstream}...HEAD", check=False)
+        parts = (counts.stdout or "").split()
+        if counts.returncode == 0 and len(parts) == 2:
+            behind, ahead = int(parts[0]), int(parts[1])
+    return {
+        "remotes": remotes,
+        "upstream": upstream or None,
+        "ahead": ahead,
+        "behind": behind,
+        "head_sha": head_sha or None,
+        "head_subject": head_subject if head_sha else None,
+    }
+
+
+def _require_repo(root_path: str) -> Path:
+    root = resolve_git_root(root_path)
+    if root is None:
+        raise GitWorkspaceError("当前工作目录不是 Git 仓库", code="conversation.git.not_repo")
+    return root
+
+
+def _require_branch(root: Path) -> str:
+    head = _run_git(root, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+    branch = (head.stdout or "").strip()
+    if head.returncode != 0 or not branch:
+        raise GitWorkspaceError(
+            "当前处于 detached HEAD，请先切换到分支",
+            code="conversation.git.detached_head",
+        )
+    return branch
+
+
+def _workspace_pathspecs(root: Path, paths: list[str]) -> list[str]:
+    specs: list[str] = []
+    for raw in paths:
+        value = str(raw or "").strip()
+        if not value or "\0" in value:
+            raise GitWorkspaceError("路径不能为空", code="conversation.git.invalid_path")
+        candidate = Path(value)
+        absolute = candidate if candidate.is_absolute() else root / candidate
+        resolved = Path(os.path.normpath(absolute))
+        try:
+            relative = resolved.relative_to(root)
+        except ValueError as exc:
+            raise GitWorkspaceError(
+                f"路径不在工作区内：{value}", code="conversation.git.path_outside",
+            ) from exc
+        rel = relative.as_posix()
+        if not rel or rel == ".":
+            raise GitWorkspaceError(f"路径无效：{value}", code="conversation.git.invalid_path")
+        # Literal pathspec: user file names must not be interpreted as globs or magic.
+        specs.append(f":(literal){rel}")
+    return specs
+
+
+def commit_git_changes(
+    root_path: str,
+    *,
+    message: str,
+    paths: list[str] | None = None,
+    amend: bool = False,
+) -> dict[str, Any]:
+    """暂存（全部或指定路径）并提交；无可提交内容时抛 nothing_to_commit。"""
+    text = str(message or "").strip()
+    if not text:
+        raise GitWorkspaceError("提交信息不能为空", code="conversation.git.empty_message")
+    root = _require_repo(root_path)
+    branch = _require_branch(root)
+    specs = _workspace_pathspecs(root, paths) if paths else []
+
+    if specs:
+        _run_git(root, "add", "-A", "--", *specs, code="conversation.git.stage_failed")
+    else:
+        _run_git(root, "add", "-A", code="conversation.git.stage_failed")
+
+    if not amend:
+        staged = _run_git(
+            root, "diff", "--cached", "--quiet", *(["--", *specs] if specs else []), check=False,
+        )
+        if staged.returncode == 0:
+            raise GitWorkspaceError("没有可提交的改动", code="conversation.git.nothing_to_commit")
+        if staged.returncode != 1:
+            detail = (staged.stderr or "").strip() or f"exit {staged.returncode}"
+            raise GitWorkspaceError(detail, code="conversation.git.stage_failed")
+
+    commit_args = ["commit", "--quiet", "-m", text]
+    if amend:
+        commit_args.insert(1, "--amend")
+    if specs:
+        # --only commits just these paths even if other changes are already staged.
+        commit_args += ["--only", "--", *specs]
+    _run_git(root, *commit_args, timeout=120, code="conversation.git.commit_failed")
+
+    head = _run_git(root, "log", "-1", "--format=%H%x00%s")
+    sha, _, summary = (head.stdout or "").strip().partition("\x00")
+    return {
+        "sha": sha,
+        "short_sha": sha[:7],
+        "summary": summary,
+        "branch": branch,
+        "amend": amend,
+        "status": inspect_git_workspace(str(root)),
+    }
+
+
+def _default_push_remote(root: Path) -> str:
+    probe = _run_git(root, "remote", check=False)
+    remotes = [line.strip() for line in (probe.stdout or "").splitlines() if line.strip()]
+    if not remotes:
+        raise GitWorkspaceError("仓库没有配置远端", code="conversation.git.no_remote")
+    return "origin" if "origin" in remotes else remotes[0]
+
+
+def _upstream(root: Path) -> str:
+    probe = _run_git(
+        root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False,
+    )
+    return (probe.stdout or "").strip() if probe.returncode == 0 else ""
+
+
+def _output_text(completed: subprocess.CompletedProcess[str]) -> str:
+    return "\n".join(
+        part.strip() for part in (completed.stdout or "", completed.stderr or "") if part.strip()
+    )
+
+
+def push_git_branch(
+    root_path: str,
+    *,
+    set_upstream: bool | None = None,
+    timeout: float = 120,
+) -> dict[str, Any]:
+    """推送当前分支；无上游时（或 set_upstream=True）推到默认远端并设置上游。"""
+    root = _require_repo(root_path)
+    branch = _validate_branch_name(_require_branch(root))
+    upstream = _upstream(root)
+    if not upstream and set_upstream is False:
+        raise GitWorkspaceError(
+            f"分支 {branch} 没有上游，需要设置上游后推送",
+            code="conversation.git.no_upstream",
+        )
+    use_upstream = bool(set_upstream) or not upstream
+    if use_upstream:
+        remote = upstream.split("/", 1)[0] if upstream and set_upstream else _default_push_remote(root)
+        args = ["push", "--porcelain", "--set-upstream", remote, f"refs/heads/{branch}:refs/heads/{branch}"]
+    else:
+        remote = upstream.split("/", 1)[0]
+        args = ["push", "--porcelain"]
+    completed = _run_git(root, *args, check=False, timeout=timeout)
+    output = _output_text(completed)
+    if completed.returncode != 0:
+        raise GitWorkspaceError(output or f"git push exit {completed.returncode}", code="conversation.git.push_failed")
+    return {
+        "branch": branch,
+        "remote": remote,
+        "set_upstream": use_upstream,
+        "output": output,
+        "status": inspect_git_workspace(str(root)),
+    }
+
+
+def _operation_in_progress(root: Path) -> str:
+    for marker, label in (("rebase-merge", "rebase"), ("rebase-apply", "rebase"), ("MERGE_HEAD", "merge")):
+        probe = _run_git(root, "rev-parse", "--git-path", marker, check=False)
+        location = (probe.stdout or "").strip()
+        if probe.returncode == 0 and location and (root / location).exists():
+            return label
+    return ""
+
+
+def pull_git_branch(
+    root_path: str,
+    *,
+    rebase: bool = False,
+    timeout: float = 120,
+) -> dict[str, Any]:
+    """拉取上游；默认 --ff-only，rebase=True 时使用 --rebase。"""
+    root = _require_repo(root_path)
+    branch = _require_branch(root)
+    upstream = _upstream(root)
+    if not upstream:
+        raise GitWorkspaceError(
+            f"分支 {branch} 没有上游，无法拉取",
+            code="conversation.git.no_upstream",
+        )
+    mode = "--rebase" if rebase else "--ff-only"
+    completed = _run_git(root, "pull", mode, check=False, timeout=timeout)
+    output = _output_text(completed)
+    if completed.returncode != 0:
+        in_progress = _operation_in_progress(root)
+        if in_progress:
+            raise GitWorkspaceError(
+                output or f"git pull exit {completed.returncode}",
+                code="conversation.git.pull_conflict",
+            )
+        raise GitWorkspaceError(output or f"git pull exit {completed.returncode}", code="conversation.git.pull_failed")
+    return {
+        "branch": branch,
+        "upstream": upstream,
+        "rebase": rebase,
+        "output": output,
+        "status": inspect_git_workspace(str(root)),
+    }
+
+
+def upstream_remote_branch(root_path: str) -> dict[str, str]:
+    """当前分支的上游远端名与远端分支名（未设置上游时为空）。"""
+    root = _require_repo(root_path)
+    branch = _require_branch(root)
+    upstream = _upstream(root)
+    if not upstream:
+        return {"branch": branch, "remote": "", "remote_branch": ""}
+    remote_probe = _run_git(root, "config", "--get", f"branch.{branch}.remote", check=False)
+    merge_probe = _run_git(root, "config", "--get", f"branch.{branch}.merge", check=False)
+    remote = (remote_probe.stdout or "").strip()
+    merge = (merge_probe.stdout or "").strip()
+    remote_branch = merge[len("refs/heads/"):] if merge.startswith("refs/heads/") else merge
+    return {"branch": branch, "remote": remote, "remote_branch": remote_branch}
 
 
 def checkout_git_branch(
@@ -319,7 +577,7 @@ def same_git_repo(left: str, right: str) -> bool:
 import re as _re
 
 
-def detect_github_remote(root_path: str) -> dict[str, Any]:
+def detect_github_remote(root_path: str, remote: str = "origin") -> dict[str, Any]:
     """C15: Detect GitHub remote and parse owner/repo from the workspace.
 
     Returns a dict with keys:
@@ -338,7 +596,7 @@ def detect_github_remote(root_path: str) -> dict[str, Any]:
     if git_root is None:
         raise GitWorkspaceError("当前目录不是 Git 仓库", code="conversation.git.not_repo")
 
-    result = _run_git(root, "remote", "get-url", "origin", check=False)
+    result = _run_git(root, "remote", "get-url", "--", remote, check=False)
     if result.returncode != 0:
         return {"remote_url": "", "owner": "", "repo": "", "github": False}
 

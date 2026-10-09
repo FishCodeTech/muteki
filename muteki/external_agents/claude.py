@@ -39,6 +39,7 @@ import importlib
 import importlib.util
 import inspect
 import subprocess
+import uuid as uuid_module
 
 from .probe_environment import subprocess_environment
 from typing import Any, AsyncIterator, Optional
@@ -59,13 +60,25 @@ from muteki.platform.contracts.external_agents import (
     AgentEventType,
     AgentInput,
     AgentSessionRef,
+    ApprovalResponseInput,
+    MessageInput,
     ProbeRequest,
     SessionStart,
+    SteerInput,
+    UserInputResponseInput,
 )
+from muteki.platform.contracts.protocols import RuntimeOperationAdapter
 from muteki.platform.contracts.receipts import AggregateRef, CommandReceipt, ReceiptState
 
 from .base import BaseExternalAgentAdapter
-from .approvals import ApprovalDecision, ApprovalRequest
+from .claude_transport import owned_claude_transport
+from .approvals import (
+    ApprovalChoice,
+    ApprovalDecision,
+    ApprovalScope,
+    ApprovalTarget,
+    SessionApprovalGrants,
+)
 from .attachment_input import claude_query_prompt
 from .capabilities import (
     CapabilityProbeReport,
@@ -81,6 +94,31 @@ from .runtime_capabilities import (
     dynamic_command_item,
 )
 from .sessions import EXIT_CLOSED, EXIT_RESUMABLE
+from muteki.platform.contracts.agent_events import (
+    AgentNodePayload,
+    AgentUpdatedPayload,
+    ApprovalRequestedPayload,
+    ApprovalResolvedPayload,
+    FailureCategory,
+    MessageCompletedPayload,
+    MessageDeltaPayload,
+    PlanPayload,
+    RateLimitState,
+    ReasoningPayload,
+    RuntimeCapabilitiesPayload,
+    RuntimeErrorPayload,
+    RuntimeWarningPayload,
+    SessionPayload,
+    ToolPayload,
+    TurnCompletedPayload,
+    TurnFailedPayload,
+    TurnStartedPayload,
+    UsagePayload,
+    UserInputRequestedPayload,
+    UserInputResolvedPayload,
+    dump_payload,
+)
+from .user_input_schema import normalize_question
 
 #: 默认 CLI 路径与 MCP server 名。
 DEFAULT_CLAUDE_CLI = "claude"
@@ -91,7 +129,8 @@ PERMISSION_MODES = (
     "default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto")
 
 
-def _permission_mode_for(request: SessionStart, fallback: str) -> str:
+def _base_permission_mode(request: SessionStart, fallback: str) -> str:
+    """Permission mode of the session outside plan turns."""
     if not request.access_mode:
         return str(request.permission_mode or fallback)
     try:
@@ -105,6 +144,83 @@ def _permission_mode_for(request: SessionStart, fallback: str) -> str:
         AccessMode.AUTO: "auto",
         AccessMode.FULL_ACCESS: "bypassPermissions",
     }[mode]
+
+
+def _permission_mode_for(request: SessionStart, fallback: str) -> str:
+    if request.interaction_mode == "plan":
+        return "plan"
+    return _base_permission_mode(request, fallback)
+
+
+#: Tool names the SDK routes through ``can_use_tool`` for interaction that
+#: only the operator can answer, regardless of the permission mode.
+ASK_USER_QUESTION_TOOL = "AskUserQuestion"
+EXIT_PLAN_MODE_TOOL = "ExitPlanMode"
+
+
+def _ask_user_questions(
+    tool_input: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """AskUserQuestion input -> normalized questions plus id -> question text.
+
+    The SDK keys the answers it hands back to the model by question text, so
+    the text is kept to translate Muteki's ``question_id`` answers.
+    """
+    raw = tool_input.get("questions")
+    questions: list[dict[str, Any]] = []
+    texts: dict[str, str] = {}
+    if not isinstance(raw, list):
+        return questions, texts
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("question") or "").strip()
+        if not text:
+            continue
+        options = [
+            {"value": str(opt.get("label") or ""),
+             "label": str(opt.get("label") or ""),
+             "description": str(opt.get("description") or "")}
+            if isinstance(opt, dict) else {"value": str(opt), "label": str(opt)}
+            for opt in (item.get("options") or [])
+        ]
+        qid = f"q{index}"
+        normalized = normalize_question({
+            "question_id": qid,
+            "header": str(item.get("header") or ""),
+            "question": text,
+            "options": [opt for opt in options if opt["value"]],
+            "multi": bool(item.get("multiSelect")),
+            # The CLI always offers an "Other" free-text answer.
+            "allow_free_text": True,
+        }, index=index)
+        if normalized is not None:
+            questions.append(normalized)
+            texts[qid] = text
+    return questions, texts
+
+
+def _ask_user_answers(
+    texts: dict[str, str], answers: dict[str, Any],
+) -> dict[str, str]:
+    """Muteki ``{question_id: {values, text}}`` -> SDK ``{question: "a, b"}``."""
+    out: dict[str, str] = {}
+    for qid, entry in answers.items():
+        text = texts.get(str(qid))
+        if text is None:
+            continue
+        if isinstance(entry, dict):
+            parts = [str(v) for v in (entry.get("values") or []) if str(v)]
+            free = entry.get("text")
+            if free is not None and str(free) and str(free) not in parts:
+                parts.append(str(free))
+        elif isinstance(entry, list):
+            parts = [str(v) for v in entry if str(v)]
+        else:
+            parts = [str(entry)] if str(entry) else []
+        out[text] = ", ".join(parts)
+    return out
+
 
 #: Headless CLI 兼容降级路径说明（实现位于 solver 层，本包不反向依赖）。
 HEADLESS_FALLBACK = (
@@ -126,6 +242,34 @@ def _import_sdk() -> Any:
             "claude_agent_sdk 未安装：pip install claude-agent-sdk；"
             f"或走 Headless CLI 降级路径 {HEADLESS_FALLBACK}"
         ) from exc
+
+
+def claude_extra_args(launch_args: "tuple[str, ...] | list[str]") -> dict[str, Optional[str]]:
+    """Convert configured CLI arguments to Agent SDK ``extra_args``.
+
+    Raises ValueError for arguments the SDK cannot forward (positionals or
+    short flags), so the settings write fails instead of silently dropping them.
+    """
+    out: dict[str, Optional[str]] = {}
+    items = list(launch_args)
+    index = 0
+    while index < len(items):
+        token = items[index]
+        if not token.startswith("--") or token == "--":
+            raise ValueError(
+                f"Claude 启动参数只支持 --flag [值] 形式：{token!r}")
+        name, sep, value = token[2:].partition("=")
+        if not name:
+            raise ValueError(f"Claude 启动参数缺少名称：{token!r}")
+        if sep:
+            out[name] = value
+        elif index + 1 < len(items) and not items[index + 1].startswith("-"):
+            out[name] = items[index + 1]
+            index += 1
+        else:
+            out[name] = None
+        index += 1
+    return out
 
 
 def _sdk_option_is_supported(sdk: Any, field_name: str) -> bool:
@@ -151,6 +295,17 @@ def _sdk_option_is_supported(sdk: Any, field_name: str) -> bool:
         return False
 
 
+def _sdk_plan_mode_supported(sdk: Any) -> bool:
+    """True when the SDK ``PermissionMode`` literal includes ``plan``.
+
+    This is the type's value set, not a reading of a later error string. A
+    control-request failure after a supported mode is sent stays a provider
+    error.
+    """
+    values = getattr(getattr(sdk, "PermissionMode", None), "__args__", None)
+    return isinstance(values, tuple) and "plan" in values
+
+
 def _cli_version(binary: str, *, timeout: float = 15.0) -> str:
     try:
         result = subprocess.run(
@@ -160,7 +315,7 @@ def _cli_version(binary: str, *, timeout: float = 15.0) -> str:
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return ""
     lines = (result.stdout or result.stderr or "").strip().splitlines()
-    return lines[0].strip()[:120] if result.returncode == 0 and lines else ""
+    return lines[0].strip() if result.returncode == 0 and lines else ""
 
 
 def _jsonable(value: Any) -> Any:
@@ -177,10 +332,128 @@ def _jsonable(value: Any) -> Any:
         return [_jsonable(v) for v in value]
     if hasattr(value, "__dict__"):
         return _jsonable(vars(value))
-    return repr(value)[:500]
+    return repr(value)
 
 
-class ClaudeSDKAdapter(BaseExternalAgentAdapter):
+_TASK_MESSAGES = frozenset({
+    "TaskStartedMessage", "TaskProgressMessage",
+    "TaskNotificationMessage", "TaskUpdatedMessage",
+})
+
+# Claude Code renamed the delegation tool from ``Task`` to ``Agent``; both
+# spawn a subagent whose messages carry ``parent_tool_use_id`` = this call.
+_DELEGATION_TOOLS = frozenset({"task", "agent"})
+
+
+def _is_delegation_tool(name: str) -> bool:
+    return name.strip().lower() in _DELEGATION_TOOLS
+
+
+#: Claude Code ``TaskType`` values that are subagents. task_started also
+#: reports shells, workflows, monitors and teammates; those are not nodes.
+_AGENT_TASK_TYPES = frozenset({"local_agent", "remote_agent"})
+
+
+def _is_agent_task_type(task_type: str) -> bool:
+    return task_type in _AGENT_TASK_TYPES
+
+
+def _tool_result_text(content: Any) -> str:
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                parts.append(str(part.get("text") or ""))
+            else:
+                parts.append(str(getattr(part, "text", "") or ""))
+        return "".join(parts)
+    return "" if content is None else str(content)
+
+
+def _agent_patch(
+    ev: Any, ctx: dict[str, Any], agent_id: str, update: dict[str, Any],
+) -> list[AgentEvent]:
+    nodes = ctx.setdefault("agent_nodes", {})
+    previous = nodes.get(agent_id)
+    if previous is None:
+        # Narration or progress for an agent we never saw spawn (e.g. resumed
+        # mid-flight) still deserves a node instead of leaking into the parent.
+        previous = {"agent_id": agent_id, "title": agent_id,
+                    "call_id": agent_id, "status": "running"}
+    node = {**previous, **{k: v for k, v in update.items() if v is not None}}
+    for key, value in update.items():
+        if value is None and key in ("result", "error"):
+            node[key] = None
+    if node == previous and agent_id in nodes:
+        return []
+    nodes[agent_id] = node
+    return [ev(AgentEventType.AGENT_UPDATED,
+               dump_payload(AgentUpdatedPayload(
+                   agents=[AgentNodePayload(**node)], patch=True)))]
+
+
+def _agent_from_tool_use(
+    ev: Any, ctx: dict[str, Any], block: Any, *,
+    parent: Optional[str], model: str,
+) -> list[AgentEvent]:
+    call_id = str(getattr(block, "id", "") or "")
+    if not call_id:
+        return []
+    raw = getattr(block, "input", None)
+    args = raw if isinstance(raw, dict) else {}
+    role = str(args.get("subagent_type") or "").strip()
+    title = str(args.get("description") or "").strip() or role or "Agent"
+    return _agent_patch(ev, ctx, call_id, {
+        "agent_id": call_id,
+        "parent_id": parent,
+        "title": title,
+        "role": role or None,
+        "model": str(args.get("model") or "").strip() or None,
+        "call_id": call_id,
+        "status": "running",
+        "request": str(args.get("prompt") or "").strip() or None,
+        "result": None,
+        "error": None,
+    })
+
+
+def _agent_from_tool_result(
+    ev: Any, ctx: dict[str, Any], call_id: str, block: Any,
+    meta: Optional[dict[str, Any]],
+) -> list[AgentEvent]:
+    meta = meta or {}
+    native_status = str(meta.get("status") or "").lower()
+    if "launch" in native_status or native_status in {"running", "pending"}:
+        # Background agents return immediately; completion arrives later as a
+        # task notification.
+        update: dict[str, Any] = {"status": "running"}
+    else:
+        failed = bool(getattr(block, "is_error", False)) or native_status in {
+            "failed", "error"}
+        text = _tool_result_text(meta.get("content")) or _tool_result_text(
+            getattr(block, "content", None))
+        update = {"status": "failed" if failed else "completed"}
+        if text:
+            update["error" if failed else "result"] = text
+    if meta.get("agentId"):
+        update["session_ref"] = str(meta["agentId"])
+    for key, native in (("duration_ms", "totalDurationMs"),
+                        ("total_tokens", "totalTokens"),
+                        ("tool_uses", "totalToolUseCount")):
+        if meta.get(native) is not None:
+            update[key] = meta.get(native)
+    return _agent_patch(ev, ctx, call_id, update)
+
+
+class ClaudeRewindError(RuntimeError):
+    """Native rewind or fork cannot be served; ``code`` is stable."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(f"{code}: {message}")
+
+
+class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
     """Claude Agent SDK（ClaudeSDKClient 交互模式）的结构化 Adapter。
 
     构造参数（除基类外）：
@@ -192,6 +465,8 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
     - ``approval_timeout_s``：can_use_tool 等待审批答复的超时，超时按
       deny 应答（不悬挂 Runtime）。
     """
+
+    context_compaction_events = True
 
     def __init__(
         self,
@@ -243,6 +518,7 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
         degradations: list[str] = []
         version = _cli_version(self._cli_path)
         sdk_ok = _sdk_available()
+        sdk_mod = _import_sdk() if sdk_ok else None
         probed = bool(version) and sdk_ok
 
         caps = conservative_capabilities(
@@ -265,14 +541,21 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
             return bool(value and probed)
 
         # SDK 交互客户端的方法面（§CLAUDE-1/2/3/4/5/6/7/8 已核验）。
-        caps.streaming = report("streaming", True)
+        caps.streaming = report("streaming", _sdk_option_is_supported(
+            sdk_mod, "include_partial_messages") if sdk_mod is not None else False)
         caps.resume = report("resume", True)
         caps.session_persistence = report("session_persistence", True)
         caps.steer = report("steer", True)        # streaming input / client.query
         caps.interrupt = report("interrupt", True)  # ClaudeSDKClient.interrupt
         caps.approval = report("approval", True)    # can_use_tool
         caps.user_input = report("user_input", True)
-        caps.fork = report("fork", True)            # fork_session
+        # fork_thread calls the module-level ``fork_session``.
+        caps.fork = report("fork", callable(getattr(sdk_mod, "fork_session", None)))
+        # permission_mode "plan", switched per turn via set_permission_mode.
+        plan_supported = (
+            _sdk_plan_mode_supported(sdk_mod) if sdk_mod is not None else False)
+        caps.plan_mode = report("plan_mode", plan_supported)
+        caps.plan = report("plan", plan_supported)
         caps.mcp = report("mcp", True)              # mcp_servers
         caps.native_tool_binding = report("native_tool_binding", True)
         caps.structured_output = report("structured_output", True)
@@ -295,6 +578,14 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
             "allowed_tools/permission_mode/settings 放行的调用不触发回调；"
             "全程工具门控需经 options.hooks 配置 PreToolUse hook，"
             "且 hook 返回 allow 会跳过 can_use_tool")
+        degradations.append(
+            "can_use_tool 始终安装：AskUserQuestion 与 ExitPlanMode 只经该回调"
+            "到达宿主，安装不随普通工具是否需要审批而变化；T3 nightly 同样"
+            "始终安装该回调。普通工具是否需要审批仍由权限模式和规则判定。")
+        if sdk_mod is not None and not plan_supported:
+            degradations.append(
+                "SDK PermissionMode 不含 plan：interaction_mode 为 plan 的回合"
+                "以 UNSUPPORTED / plan_mode_unsupported 失败，不向 CLI 发送该模式")
         degradations.append(
             "Native Tool 即 in-process MCP server（§CLAUDE-10）："
             "server→client 的 sampling/elicitation/roots/logging/progress "
@@ -381,56 +672,83 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
     ) -> dict[str, Any]:
         options = request.options
         permission_mode = _permission_mode_for(request, self._permission_mode)
+        base_mode = _base_permission_mode(request, self._permission_mode)
+        # An SDK whose PermissionMode omits plan must not be launched in it.
+        # The plan turn then fails with plan_mode_unsupported.
+        if (
+            permission_mode == "plan"
+            and sdk is not None
+            and not _sdk_plan_mode_supported(sdk)
+        ):
+            permission_mode = base_mode
         kwargs: dict[str, Any] = {
-            "cwd": str(options.get("cwd") or self._default_cwd or "."),
+            "cwd": options.cwd or self._default_cwd or ".",
             "cli_path": self._cli_path,
             "permission_mode": permission_mode,
+            # Always installed: AskUserQuestion and ExitPlanMode only reach the
+            # operator through this callback, whatever the permission mode.
+            # Ordinary tools are asked about only when the mode needs approval.
             "can_use_tool": self._make_can_use_tool(request.agent_session_id),
         }
-        if (
-            permission_mode == "bypassPermissions"
-            and sdk is not None
-            and _sdk_option_is_supported(
-                sdk, "allow_dangerously_skip_permissions")
-        ):
-            # 当前 SDK 通过 permission_mode 本身实现完全访问。仅在旧 SDK
-            # 明确声明该补充字段时传入，避免版本更新后因未知参数启动失败。
-            kwargs["allow_dangerously_skip_permissions"] = True
+        extra_args: dict[str, Optional[str]] = {}
+        if base_mode == "bypassPermissions":
+            # A session that starts in plan mode (or enters it per turn) can
+            # only return to bypassPermissions when the CLI was launched with
+            # the allow flag.
+            if sdk is not None and _sdk_option_is_supported(
+                    sdk, "allow_dangerously_skip_permissions"):
+                kwargs["allow_dangerously_skip_permissions"] = True
+            else:
+                extra_args["allow-dangerously-skip-permissions"] = None
+        if sdk is None or _sdk_option_is_supported(sdk, "include_partial_messages"):
+            kwargs["include_partial_messages"] = True
         model = request.model or self._model
         if model:
             kwargs["model"] = model
+        settings: dict[str, Any] = {}
         if request.effort in {"off", "on"}:
-            kwargs["settings"] = json.dumps({"alwaysThinkingEnabled": request.effort == "on"})
-        elif request.effort and request.effort != "default":
+            settings["alwaysThinkingEnabled"] = request.effort == "on"
+        if request.effort != "off":
+            # Opus 4.7+ omits thinking text unless summaries are requested.
+            if sdk is None or _sdk_option_is_supported(sdk, "thinking"):
+                kwargs["thinking"] = {"type": "adaptive", "display": "summarized"}
+            settings["showThinkingSummaries"] = True
+        if settings:
+            kwargs["settings"] = json.dumps(settings)
+        if request.effort and request.effort not in {"off", "on", "default"}:
             # This is a model-scoped native option, validated by Conversation.
             # Older SDKs can forward the same CLI flag through extra_args.
             if sdk is not None and _sdk_option_is_supported(sdk, "effort"):
                 kwargs["effort"] = request.effort
             else:
-                kwargs["extra_args"] = {"effort": request.effort}
+                extra_args["effort"] = request.effort
+        if self.launch_args:
+            # The SDK builds the CLI argv itself and only forwards `--flag [value]` pairs.
+            extra_args = {**claude_extra_args(self.launch_args), **extra_args}
+        if extra_args:
+            kwargs["extra_args"] = extra_args
         if mcp_servers:
             kwargs["mcp_servers"] = mcp_servers
-        if options.get("allowed_tools"):
-            kwargs["allowed_tools"] = list(options["allowed_tools"])
-        if options.get("plugins"):
-            kwargs["plugins"] = list(options["plugins"])
+        if options.allowed_tools:
+            kwargs["allowed_tools"] = list(options.allowed_tools)
+        if options.plugins:
+            kwargs["plugins"] = list(options.plugins)
         # Agent SDK 的 ``skills`` 是结构化启用入口：它会把 Skill 工具加入
         # allowed tools，并按 setting sources 让 Runtime 自行发现/按需加载。
         # 不再由 Muteki 读取 SKILL.md 全文塞进用户消息。
-        kwargs["skills"] = options.get("skills", "all")
-        if options.get("hooks"):
+        kwargs["skills"] = options.skills
+        if options.hooks:
             # PreToolUse 等 hook 透传（§CLAUDE-3：全程工具门控通道）。
-            kwargs["hooks"] = dict(options["hooks"])
-        if options.get("max_turns"):
-            kwargs["max_turns"] = int(options["max_turns"])
-        if options.get("env"):
-            kwargs["env"] = {**self._default_env,
-                             **{k: str(v) for k, v in options["env"].items()}}
+            kwargs["hooks"] = dict(options.hooks)
+        if options.max_turns:
+            kwargs["max_turns"] = options.max_turns
+        if options.env:
+            kwargs["env"] = {**self._default_env, **options.env}
         elif self._default_env:
             kwargs["env"] = dict(self._default_env)
         if resume:
             kwargs["resume"] = resume
-        if options.get("fork_session"):
+        if options.fork_session:
             kwargs["fork_session"] = True
         return kwargs
 
@@ -445,32 +763,57 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
         mcp_servers = self._build_mcp_servers(request, plan, bearer_token)
         kwargs = self._options_kwargs(
             request, mcp_servers, resume=request.resume_handle, sdk=sdk)
-        client = sdk.ClaudeSDKClient(options=sdk.ClaudeAgentOptions(**kwargs))
+        sdk_options = sdk.ClaudeAgentOptions(**kwargs)
+        client = sdk.ClaudeSDKClient(
+            options=sdk_options, transport=owned_claude_transport(sdk_options, session_id=sid))
         try:
             await client.connect()
-        except Exception:
+            server_info = await client.get_server_info() or {}
+            commands = (
+                server_info.get("commands")
+                or server_info.get("slash_commands")
+                or []
+            )
+            mcp_servers: list[dict[str, Any]] = []
+            try:
+                mcp_status = await client.get_mcp_status()
+                mcp_servers = list(mcp_status.get("mcpServers") or [])
+            except Exception:  # noqa: BLE001 — 状态查询失败进入诊断，不伪造成功
+                mcp_servers = []
+        except BaseException:
+            await client.disconnect()
             raise
-        server_info = await client.get_server_info() or {}
-        commands = (
-            server_info.get("commands")
-            or server_info.get("slash_commands")
-            or []
-        )
-        mcp_servers: list[dict[str, Any]] = []
-        try:
-            mcp_status = await client.get_mcp_status()
-            mcp_servers = list(mcp_status.get("mcpServers") or [])
-        except Exception:  # noqa: BLE001 — 状态查询失败进入诊断，不伪造成功
-            mcp_servers = []
+        # Fork and truncation targets apply to this connect only; a later
+        # reconnect resumes the session id the CLI reports, plainly.
+        reconnect_kwargs = {
+            key: value for key, value in kwargs.items()
+            if key not in {"fork_session", "resume_session_at", "resume"}}
         self._runs[sid] = {
             "client": client,
-            "options_kwargs": kwargs,
+            "options_kwargs": reconnect_kwargs,
             "mcp_injected": bool(mcp_servers),
             "mcp_kind": (plan.injection_kind.value if plan else ""),
             "turns": 0,
             "approvals": {},       # request_id -> asyncio.Future
+            "user_inputs": {},     # request_id -> asyncio.Future
+            "approval_requests": {},   # request_id -> approval.requested payload
+            "approval_grants": SessionApprovalGrants(
+                AccessMode(request.access_mode)
+                if request.access_mode else AccessMode.SUPERVISED),
             "event_queue": asyncio.Queue(),
             "session_id": request.resume_handle,
+            "base_permission_mode": _base_permission_mode(
+                request, self._permission_mode),
+            "applied_permission_mode": kwargs["permission_mode"],
+            "plan_mode_supported": _sdk_plan_mode_supported(sdk),
+            # Per completed turn: (turn_id, uuid of the last root assistant
+            # message). Native rewind truncates the transcript at these uuids,
+            # so a resumed session (older turns unknown) cannot rewind natively.
+            "turn_log": [],
+            "turn_last_uuid": None,
+            "rewind_known": not request.resume_handle,
+            "streamed_kinds": {},
+            "stream_message_id": "",
             "init_native": {
                 **dict(server_info),
                 "slash_commands": list(commands),
@@ -501,28 +844,73 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
                     behavior="deny", message="session context lost")
             seq = self.sequencer_for(agent_session_id)
             record = self._tracker.get(agent_session_id)
-            request_id = new_id("appr")
             tool_use_id = str(getattr(context, "tool_use_id", "") or "")
-            common = dict(
-                agent_session_id=agent_session_id,
-                external_session_id=ctx.get("session_id"),
-                run_id=record.run_id if record else None,
-                execution_generation=(
-                    record.execution_generation if record else None),
-                turn_id=ctx.get("current_turn_id"),
+
+            def common() -> dict[str, Any]:
+                return dict(
+                    agent_session_id=agent_session_id,
+                    external_session_id=ctx.get("session_id"),
+                    run_id=record.run_id if record else None,
+                    execution_generation=(
+                        record.execution_generation if record else None),
+                    turn_id=ctx.get("current_turn_id"),
+                )
+
+            if tool_name == ASK_USER_QUESTION_TOOL:
+                return await self._ask_user_question(
+                    sdk, ctx, seq, common(), input, tool_use_id)
+            if tool_name == EXIT_PLAN_MODE_TOOL:
+                return await self._exit_plan_mode(
+                    sdk, ctx, seq, common(), input, tool_use_id)
+            if ctx.get("applied_permission_mode") == "bypassPermissions":
+                return sdk.PermissionResultAllow(behavior="allow")
+
+            request_id = new_id("appr")
+            approval_kind = (
+                "file_change"
+                if tool_name in {"Edit", "Write", "NotebookEdit"}
+                else "command_execution"
+                if tool_name in {"Bash", "Shell"} else "tool")
+            cwd = str(ctx["options_kwargs"].get("cwd") or "")
+            target_fields: dict[str, Any] = {}
+            if approval_kind == "command_execution":
+                command = str(input.get("command") or "").strip()
+                if command:
+                    target_fields["command"] = command
+            elif approval_kind == "file_change":
+                path = str(input.get("file_path")
+                           or input.get("notebook_path") or "").strip()
+                if path:
+                    target_fields["paths"] = [path]
+            payload = ApprovalRequestedPayload(
+                approval_id=request_id,
+                approval_kind=approval_kind,
+                title=tool_name,
+                tool_name=tool_name,
+                tool_call_id=tool_use_id or None,
+                cwd=cwd or None,
+                input=input,
+                **target_fields,
             )
+            request_dump = dump_payload(payload)
+            grants: SessionApprovalGrants = ctx["approval_grants"]
+            # Native plan mode ignores allow rules for workspace writes. A
+            # cached Muteki session grant must not bypass that fresh decision.
+            if (ctx.get("applied_permission_mode") != "plan"
+                    and grants.covers(request_dump, cwd=cwd)):
+                # A session grant covers the same tool kind and exact target
+                # only, and is answered one-shot so Claude keeps no broader rule.
+                return sdk.PermissionResultAllow(behavior="allow")
+            can_remember = ApprovalTarget.from_payload(
+                request_dump, cwd=cwd) is not None
+            payload = payload.model_copy(update={
+                "scopes": ["once", "session"] if can_remember else ["once"]})
             requested = build_event(
                 AgentEventType.APPROVAL_REQUESTED, seq,
                 native_type="claude.control.can_use_tool",
-                payload=ApprovalRequest(
-                    approval_id=request_id,
-                    details={
-                        "tool": tool_name,
-                        "tool_use_id": tool_use_id,
-                        "input": input,
-                    },
-                ).to_payload(),
-                **common)
+                payload=payload,
+                **common())
+            ctx["approval_requests"][request_id] = dump_payload(payload)
             await ctx["event_queue"].put(("event", requested))
             future: asyncio.Future = asyncio.get_running_loop().create_future()
             ctx["approvals"][request_id] = future
@@ -532,17 +920,22 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
             except asyncio.TimeoutError:
                 verdict = {"allow": False, "message": "approval timeout",
                            "_timeout": True}
-            ctx["approvals"].pop(request_id, None)
+            finally:
+                ctx["approvals"].pop(request_id, None)
+                ctx["approval_requests"].pop(request_id, None)
             resolved = build_event(
                 AgentEventType.APPROVAL_RESOLVED, seq,
                 native_type="claude.control.can_use_tool.resolved",
-                payload={
-                    "approval_id": request_id,
-                    "tool": tool_name,
-                    "decision": "allow" if verdict.get("allow") else "deny",
-                    "auto_denied": bool(verdict.get("_timeout")),
-                },
-                **common)
+                payload=ApprovalResolvedPayload(
+                    approval_id=request_id,
+                    decision="allow" if verdict.get("allow") else "deny",
+                    automatic=bool(verdict.get("_timeout")),
+                    native={
+                        "tool": tool_name,
+                        "auto_denied": bool(verdict.get("_timeout")),
+                    },
+                ),
+                **common())
             await ctx["event_queue"].put(("event", resolved))
             if verdict.get("allow"):
                 kwargs: dict[str, Any] = {"behavior": "allow"}
@@ -555,6 +948,152 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
 
         return can_use_tool
 
+    async def _exit_plan_mode(
+        self, sdk: Any, ctx: dict[str, Any], seq: Any,
+        common: dict[str, Any], tool_input: dict[str, Any], tool_use_id: str,
+    ) -> Any:
+        """ExitPlanMode -> plan approval. Allow leaves plan mode; deny stays.
+
+        ``plan_markdown`` is the tool's plan text with nothing removed.
+        An empty plan is a normal tool approval, not ``plan_exit``.
+        """
+        raw_plan = tool_input.get("plan")
+        plan_text = raw_plan if isinstance(raw_plan, str) else ""
+        has_plan = bool(plan_text.strip())
+        title = ""
+        if plan_text.strip():
+            title = next(
+                (line.lstrip("#").strip() for line in plan_text.splitlines()
+                 if line.lstrip("#").strip()), "")
+            await ctx["event_queue"].put(("event", build_event(
+                AgentEventType.PLAN_UPDATED, seq,
+                native_type="claude.control.exit_plan_mode",
+                payload=PlanPayload(
+                    title=title or None, explanation=plan_text,
+                    phase="proposed",
+                    native={"tool": EXIT_PLAN_MODE_TOOL,
+                            "tool_call_id": tool_use_id,
+                            "markdown": plan_text}),
+                **common)))
+        request_id = new_id("appr")
+        payload = ApprovalRequestedPayload(
+            approval_id=request_id,
+            approval_kind="plan_exit" if has_plan else "tool",
+            title=title or EXIT_PLAN_MODE_TOOL,
+            tool_name=EXIT_PLAN_MODE_TOOL,
+            tool_call_id=tool_use_id or None,
+            scopes=["once"],
+            plan_markdown=plan_text if has_plan else None,
+            input=tool_input,
+        )
+        ctx["approval_requests"][request_id] = dump_payload(payload)
+        await ctx["event_queue"].put(("event", build_event(
+            AgentEventType.APPROVAL_REQUESTED, seq,
+            native_type="claude.control.exit_plan_mode",
+            payload=payload,
+            **common)))
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        ctx["approvals"][request_id] = future
+        try:
+            verdict = await asyncio.wait_for(
+                future, timeout=self._approval_timeout_s)
+        except asyncio.TimeoutError:
+            verdict = {"allow": False, "message": "approval timeout",
+                       "_timeout": True}
+        finally:
+            ctx["approvals"].pop(request_id, None)
+            ctx["approval_requests"].pop(request_id, None)
+        allowed = bool(verdict.get("allow"))
+        await ctx["event_queue"].put(("event", build_event(
+            AgentEventType.APPROVAL_RESOLVED, seq,
+            native_type="claude.control.exit_plan_mode.resolved",
+            payload=ApprovalResolvedPayload(
+                approval_id=request_id,
+                decision="allow" if allowed else "deny",
+                automatic=bool(verdict.get("_timeout")),
+                native={
+                    "tool": EXIT_PLAN_MODE_TOOL,
+                    "auto_denied": bool(verdict.get("_timeout")),
+                },
+            ),
+            **common)))
+        if allowed:
+            return sdk.PermissionResultAllow(behavior="allow")
+        message = str(verdict.get("message") or "").strip() or (
+            "The user declined this plan. Stay in plan mode and revise it.")
+        return sdk.PermissionResultDeny(behavior="deny", message=message)
+
+    async def _ask_user_question(
+        self, sdk: Any, ctx: dict[str, Any], seq: Any,
+        common: dict[str, Any], tool_input: dict[str, Any], tool_use_id: str,
+    ) -> Any:
+        """AskUserQuestion -> USER_INPUT_REQUESTED; the chosen answers go back
+        to the tool as ``updated_input.answers`` keyed by question text."""
+        questions, texts = _ask_user_questions(tool_input)
+        request_id = new_id("uinp")
+        await ctx["event_queue"].put(("event", build_event(
+            AgentEventType.USER_INPUT_REQUESTED, seq,
+            native_type="claude.control.ask_user_question",
+            payload=UserInputRequestedPayload(
+                request_id=request_id,
+                user_input_kind="claude.ask_user_question",
+                questions=questions,
+                response_actions=["submit", "cancel"],
+                tool_call_id=tool_use_id or None,
+                native={"input": _jsonable(tool_input)}),
+            **common)))
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        ctx["user_inputs"][request_id] = future
+        try:
+            reply = await asyncio.wait_for(
+                future, timeout=self._approval_timeout_s)
+        except asyncio.TimeoutError:
+            reply = {"decision": "cancel", "_timeout": True}
+        finally:
+            ctx["user_inputs"].pop(request_id, None)
+        raw_answers = dict(reply.get("answers") or {})
+        if reply.get("text") and not raw_answers and texts:
+            # Free text answers the first question.
+            raw_answers = {next(iter(texts)): {
+                "values": [], "text": str(reply["text"])}}
+        answers = _ask_user_answers(texts, raw_answers)
+        answered = reply.get("decision") == "submit" and bool(answers)
+        outcome = ("answered" if answered
+                   else "timeout" if reply.get("_timeout") else "cancelled")
+        await ctx["event_queue"].put(("event", build_event(
+            AgentEventType.USER_INPUT_RESOLVED, seq,
+            native_type="claude.control.ask_user_question.resolved",
+            payload=UserInputResolvedPayload(
+                request_id=request_id, outcome=outcome,
+                answers=raw_answers if answered else None),
+            **common)))
+        if not answered:
+            return sdk.PermissionResultDeny(
+                behavior="deny", message="User declined to answer questions.")
+        return sdk.PermissionResultAllow(
+            behavior="allow",
+            updated_input={"questions": tool_input.get("questions"),
+                           "answers": answers})
+
+    async def respond_user_input(
+        self, session: AgentSessionRef, request_id: str,
+        answers: dict[str, Any], *, decision: str = "submit", text: str = "",
+    ) -> CommandReceipt:
+        """答复一次 AskUserQuestion（Operator / 调度层入口）。"""
+        ctx = self._runs.get(session.agent_session_id) or {}
+        future = (ctx.get("user_inputs") or {}).get(request_id)
+        if future is None or future.done():
+            return self.unsupported_receipt(
+                "respond_user_input", "user_input_pending", session=session,
+                detail={"request_id": request_id,
+                        "detail": "no pending user input with this id"})
+        future.set_result({"decision": decision, "answers": dict(answers),
+                           "text": text})
+        return CommandReceipt(
+            command_id=new_id("cmd"), state=ReceiptState.COMPLETED,
+            aggregate=AggregateRef(type="agent_session",
+                                   id=session.agent_session_id))
+
     async def respond_approval(
         self,
         session: AgentSessionRef,
@@ -563,6 +1102,7 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
         *,
         message: str = "",
         updated_input: Optional[dict[str, Any]] = None,
+        scope: str = "once",
     ) -> CommandReceipt:
         """答复一次 can_use_tool 审批（Operator / 调度层入口）。"""
         ctx = self._runs.get(session.agent_session_id) or {}
@@ -572,6 +1112,15 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
                 "respond_approval", "approval_pending", session=session,
                 detail={"request_id": request_id,
                         "detail": "no pending approval with this id"})
+        request = ctx["approval_requests"].get(request_id)
+        if request is not None:
+            ctx["approval_grants"].remember(
+                request,
+                ApprovalDecision(
+                    approval_id=request_id,
+                    choice=ApprovalChoice.ALLOW if allow else ApprovalChoice.DENY,
+                    scope=ApprovalScope(scope)),
+                cwd=str(ctx["options_kwargs"].get("cwd") or ""))
         future.set_result({
             "allow": bool(allow), "message": message,
             "updated_input": updated_input})
@@ -585,28 +1134,61 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
     def send(
         self, session: AgentSessionRef, input: AgentInput
     ) -> AsyncIterator[AgentEvent]:
-        if input.kind == "approval_response":
+        if isinstance(input, ApprovalResponseInput):
             return self._approval_response_stream(session, input)
-        return self._turn_stream(session, input)
+        if isinstance(input, UserInputResponseInput):
+            return self._user_input_response_stream(session, input)
+        if isinstance(input, MessageInput):
+            return self._turn_stream(session, input)
+        return self.unsupported_input_stream(session, input)
 
-    async def _approval_response_stream(
-        self, session: AgentSessionRef, input: AgentInput
+    async def _user_input_response_stream(
+        self, session: AgentSessionRef, input: UserInputResponseInput
     ) -> AsyncIterator[AgentEvent]:
-        approval = ApprovalDecision.from_payload(input.payload)
-        receipt = await self.respond_approval(
-            session,
-            approval.approval_id,
-            approval.allowed,
-            message=approval.note,
-            updated_input=input.payload.get("updated_input"))
+        receipt = await self.respond_user_input(
+            session, input.payload.request_id, dict(input.payload.answers),
+            decision=input.payload.decision, text=input.text)
         if receipt.state is ReceiptState.FAILED:
             yield self.emit(build_event(
                 AgentEventType.RUNTIME_ERROR,
                 self.sequencer_for(session.agent_session_id),
                 agent_session_id=session.agent_session_id,
                 external_session_id=session.external_session_id,
-                payload={"code": receipt.error.code if receipt.error else "",
-                         "operation": "approval_response"},
+                payload=RuntimeErrorPayload(
+                    error=self.failure(
+                        FailureCategory.UNKNOWN, "user_input.stale",
+                        message="no pending user input with this id",
+                        native_code=(
+                            receipt.error.code if receipt.error else "")),
+                    native={"operation": "user_input_response",
+                            "request_id": input.payload.request_id}),
+            ))
+
+    async def _approval_response_stream(
+        self, session: AgentSessionRef, input: ApprovalResponseInput
+    ) -> AsyncIterator[AgentEvent]:
+        approval = ApprovalDecision.from_payload(input.payload.model_dump())
+        receipt = await self.respond_approval(
+            session,
+            approval.approval_id,
+            approval.allowed,
+            message=approval.note,
+            updated_input=input.payload.updated_input,
+            scope=approval.scope.value)
+        if receipt.state is ReceiptState.FAILED:
+            yield self.emit(build_event(
+                AgentEventType.RUNTIME_ERROR,
+                self.sequencer_for(session.agent_session_id),
+                agent_session_id=session.agent_session_id,
+                external_session_id=session.external_session_id,
+                payload=RuntimeErrorPayload(
+                    error=self.failure(
+                        FailureCategory.UNKNOWN, "approval.stale",
+                        message="no pending approval with this id",
+                        native_code=(
+                            receipt.error.code if receipt.error else "")),
+                    native={"operation": "approval_response",
+                            "request_id": approval.approval_id}),
             ))
 
     def resume(self, session: AgentSessionRef) -> AsyncIterator[AgentEvent]:
@@ -616,8 +1198,7 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
             return self._unsupported_stream(session, "resume", "resume")
         return self._turn_stream(
             session,
-            AgentInput(kind="message",
-                       text="Continue from where you left off."),
+            MessageInput(text="Continue from where you left off."),
             resumed=True)
 
     async def _reconnect(self, sid: str, *, resume: Optional[str]) -> Any:
@@ -633,15 +1214,18 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
         kwargs = dict(ctx["options_kwargs"])
         if resume:
             kwargs["resume"] = resume
-        client = sdk.ClaudeSDKClient(options=sdk.ClaudeAgentOptions(**kwargs))
+        sdk_options = sdk.ClaudeAgentOptions(**kwargs)
+        client = sdk.ClaudeSDKClient(
+            options=sdk_options, transport=owned_claude_transport(sdk_options, session_id=sid))
         await client.connect()
         ctx["client"] = client
+        ctx["applied_permission_mode"] = kwargs["permission_mode"]
         return client
 
     async def _turn_stream(
         self,
         session: AgentSessionRef,
-        input: AgentInput,
+        input: MessageInput,
         *,
         resumed: bool = False,
     ) -> AsyncIterator[AgentEvent]:
@@ -654,8 +1238,9 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
                 AgentEventType.RUNTIME_ERROR, seq,
                 agent_session_id=sid,
                 external_session_id=session.external_session_id,
-                payload={"code": "external_agent.session.unknown",
-                         "detail": "session was not started by this adapter"},
+                payload=RuntimeErrorPayload(error=self.failure(
+                    FailureCategory.UNKNOWN, "session.unknown",
+                    message="session was not started by this adapter")),
             ))
             return
         record = self._tracker.get(sid)
@@ -667,34 +1252,38 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
                 record.execution_generation if record else None),
         )
 
-        if resumed:
+        if resumed or ctx.pop("needs_reconnect", False):
             # resume 语义由 reconnect 的 options.resume 承载。
             await self._reconnect(sid, resume=ctx.get("session_id"))
             yield self.emit(build_event(
                 AgentEventType.SESSION_RESUMED, seq,
                 native_type="claude.sdk.resume",
-                payload={"transport": "sdk"},
+                payload=SessionPayload(transport="sdk"),
                 **common))
         elif ctx["turns"] == 0:
             yield self.emit(build_event(
                 AgentEventType.SESSION_STARTED, seq,
                 native_type="claude.sdk.connect",
-                payload={
-                    "transport": "sdk",
-                    "adapter_id": self.id,
-                    "instance_id": self.identity.instance_id,
-                    "mcp_injected": ctx["mcp_injected"],
-                    "mcp_kind": ctx["mcp_kind"],
-                },
+                payload=SessionPayload(
+                    transport="sdk",
+                    adapter_id=self.id,
+                    instance_id=self.identity.instance_id,
+                    native={
+                        "mcp_injected": ctx["mcp_injected"],
+                        "mcp_kind": ctx["mcp_kind"],
+                    }),
                 **common))
 
         turn_id = new_id("turn")
         ctx["current_turn_id"] = turn_id
         ctx["assistant_text_parts"] = []
+        ctx["turn_last_uuid"] = None
+        ctx["streamed_kinds"] = {}
+        ctx["stream_message_id"] = ""
         yield self.emit(build_event(
             AgentEventType.TURN_STARTED, seq, turn_id=turn_id,
             native_type="claude.sdk.query",
-            payload={"kind": input.kind},
+            payload=TurnStartedPayload(kind=input.kind),
             **common))
 
         # 审批事件（can_use_tool 回调）与 SDK 消息共用 per-session 队列，
@@ -713,14 +1302,49 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
             except Exception as exc:  # noqa: BLE001
                 await queue.put(("error", exc))
 
+        # The turn's interaction mode is authoritative: Claude can also switch
+        # itself into plan mode (EnterPlanMode), so the mode is re-asserted
+        # whenever it differs from what this turn needs.
+        desired_mode = (
+            "plan" if input.payload.interaction_mode == "plan"
+            else ctx["base_permission_mode"])
+        if desired_mode == "plan" and not ctx.get("plan_mode_supported"):
+            yield self.emit(build_event(
+                AgentEventType.TURN_FAILED, seq, turn_id=turn_id,
+                native_type="claude.sdk.plan_mode_unsupported",
+                payload=TurnFailedPayload(error=self.failure(
+                    FailureCategory.UNSUPPORTED, "plan_mode_unsupported",
+                    message="Claude Agent SDK PermissionMode does not include plan")),
+                **common))
+            ctx["current_turn_id"] = None
+            return
+        if desired_mode != ctx["applied_permission_mode"]:
+            try:
+                await ctx["client"].set_permission_mode(desired_mode)
+                ctx["applied_permission_mode"] = desired_mode
+            except Exception as exc:  # noqa: BLE001
+                yield self.emit(build_event(
+                    AgentEventType.TURN_FAILED, seq, turn_id=turn_id,
+                    native_type="claude.sdk.set_permission_mode.error",
+                    payload=TurnFailedPayload(error=self.exception_failure(
+                        exc, FailureCategory.PROVIDER,
+                        "permission_mode_switch",
+                        message=("Claude could not switch permission mode "
+                                 f"to {desired_mode!r}"))),
+                    **common))
+                ctx["current_turn_id"] = None
+                return
+
         try:
-            prompt = await claude_query_prompt(input.text, input.payload)
+            prompt = await claude_query_prompt(input.text, input.payload.attachments)
             await ctx["client"].query(prompt)
         except Exception as exc:  # noqa: BLE001
             yield self.emit(build_event(
                 AgentEventType.TURN_FAILED, seq, turn_id=turn_id,
                 native_type="claude.sdk.query.error",
-                payload={"error": str(exc)[:300]},
+                payload=TurnFailedPayload(error=self.exception_failure(
+                    exc, FailureCategory.TRANSPORT, "query_error",
+                    message=f"Claude SDK query failed: {exc}")),
                 **common))
             ctx["current_turn_id"] = None
             return
@@ -731,29 +1355,54 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
             queue.get_nowait()
         pump_task = asyncio.ensure_future(pump())
 
-        done = False
-        while not done:
-            kind, item = await queue.get()
-            if kind == "event":
-                # can_use_tool 回调产生的审批事件（已带序号，直接投影）。
-                yield self.emit(item)
-                continue
-            if kind == "done":
-                break
-            if kind == "error":
-                yield self.emit(build_event(
-                    AgentEventType.TURN_FAILED, seq, turn_id=turn_id,
-                    native_type="claude.sdk.stream.error",
-                    payload={"error": str(item)[:300]},
-                    **common))
-                break
-            events, _terminal = self._map_message(
-                item, ctx, seq, common, turn_id)
-            for event in events:
-                yield self.emit(event)
-        await asyncio.wait([pump_task], timeout=5)
-        ctx["turns"] += 1
-        ctx["current_turn_id"] = None
+        terminal_seen = False
+        try:
+            while True:
+                kind, item = await queue.get()
+                if kind == "event":
+                    # can_use_tool 回调产生的审批事件（已带序号，直接投影）。
+                    yield self.emit(item)
+                    continue
+                if kind == "done":
+                    if not terminal_seen:
+                        # The CLI closed its stream before a ResultMessage.
+                        yield self.emit(build_event(
+                            AgentEventType.TURN_FAILED, seq, turn_id=turn_id,
+                            native_type="claude.sdk.stream.ended",
+                            payload=TurnFailedPayload(error=self.failure(
+                                FailureCategory.TRANSPORT,
+                                "stream_ended_without_terminal",
+                                message="Claude SDK stream ended without a "
+                                        "result message")),
+                            **common))
+                    break
+                if kind == "error":
+                    yield self.emit(build_event(
+                        AgentEventType.TURN_FAILED, seq, turn_id=turn_id,
+                        native_type="claude.sdk.stream.error",
+                        payload=TurnFailedPayload(error=self.exception_failure(
+                            item, FailureCategory.PROVIDER, "stream_error",
+                            message=f"Claude SDK stream failed: {item}")),
+                        **common))
+                    break
+                events, terminal = self._map_message(
+                    item, ctx, seq, common, turn_id)
+                terminal_seen = terminal_seen or terminal
+                for event in events:
+                    yield self.emit(event)
+            await pump_task
+            ctx["turn_log"].append((turn_id, ctx.get("turn_last_uuid")))
+            ctx["turns"] += 1
+        finally:
+            try:
+                if not pump_task.done() or not terminal_seen:
+                    pump_task.cancel()
+                    await asyncio.gather(pump_task, return_exceptions=True)
+                    # An abandoned response cannot be consumed by the next query.
+                    ctx["needs_reconnect"] = True
+                    await ctx["client"].disconnect()
+            finally:
+                ctx["current_turn_id"] = None
 
     # -- SDK 消息 → 统一 AgentEvent 映射 -------------------------------------------
 
@@ -781,6 +1430,13 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
         if name == "SystemMessage":
             subtype = str(getattr(message, "subtype", "") or "")
             data = getattr(message, "data", None) or {}
+            reported_mode = data.get("permissionMode")
+            if subtype in {"status", "init"} and isinstance(reported_mode, str) and reported_mode:
+                # Claude can change its own mode (EnterPlanMode); trust what it reports.
+                ctx["applied_permission_mode"] = reported_mode
+            if subtype == "compact_boundary":
+                self._context_compacted(common["agent_session_id"])
+                return [], False
             if subtype == "init":
                 session_id = str(data.get("session_id") or "")
                 ctx["init_native"] = data
@@ -803,66 +1459,171 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
                     failed.append(str(err))
                 events: list[AgentEvent] = [ev(
                     AgentEventType.RUNTIME_CAPABILITIES_UPDATED,
-                    {
-                        "revision": ctx["capability_revision"],
-                        "commands": list(data.get("slash_commands") or []),
-                        "adapter_id": self.id,
-                    },
+                    dump_payload(RuntimeCapabilitiesPayload(
+                        revision=ctx["capability_revision"],
+                        reason="claude.system.init",
+                        native={
+                            "adapter_id": self.id,
+                            "commands": list(data.get("slash_commands") or []),
+                        },
+                    )),
                     native="claude.system.init",
                 )]
                 if failed:
-                    events.append(ev(AgentEventType.RUNTIME_WARNING, {
-                        "warning": "mcp server not connected",
-                        "servers": [str(f) for f in failed],
-                        "native": data,
-                    }, native="claude.system.init"))
+                    events.append(ev(AgentEventType.RUNTIME_WARNING,
+                                     dump_payload(RuntimeWarningPayload(
+                                         kind="degraded",
+                                         message="mcp server not connected",
+                                         code="claude.mcp.unconnected",
+                                         native={
+                                             "servers": [str(f) for f in failed],
+                                             "data": _jsonable(data),
+                                         },
+                                     )),
+                                     native="claude.system.init"))
                 return events, False
             return [], False
+        if name in _TASK_MESSAGES:
+            return self._map_task_message(ev, ctx, message, name), False
         if name == "AssistantMessage":
             events: list[AgentEvent] = []
+            parent = str(getattr(message, "parent_tool_use_id", "") or "")
+            if not parent and getattr(message, "uuid", None):
+                ctx["turn_last_uuid"] = str(message.uuid)
+            streamed = ctx.get("streamed_kinds", {}).get(
+                str(getattr(message, "message_id", "") or ""), set())
             for block in (getattr(message, "content", None) or []):
-                mapped = self._map_block(ev, block)
+                block_name = type(block).__name__
+                if not parent and (
+                    (block_name == "TextBlock" and "text" in streamed)
+                    or (block_name == "ThinkingBlock" and "thinking" in streamed)
+                ):
+                    # Already delivered token by token through StreamEvents.
+                    continue
+                if parent:
+                    # Subagent narration belongs to its agent card, never to
+                    # the parent's assistant answer.
+                    if block_name == "TextBlock":
+                        text = str(getattr(block, "text", "") or "").strip()
+                        if text:
+                            events.extend(_agent_patch(ev, ctx, parent, {
+                                "activity": text,
+                            }))
+                        continue
+                    if block_name == "ThinkingBlock":
+                        continue
+                mapped = self._map_block(ev, block, agent_id=parent or None)
                 events.extend(mapped)
-                if type(block).__name__ == "TextBlock":
+                if block_name == "ToolUseBlock" and _is_delegation_tool(
+                        str(getattr(block, "name", "") or "")):
+                    events.extend(_agent_from_tool_use(
+                        ev, ctx, block, parent=parent or None,
+                        model=str(getattr(message, "model", "") or "")))
+                if block_name == "TextBlock" and not parent:
                     text = str(getattr(block, "text", "") or "")
                     if text:
                         ctx["assistant_text_parts"].append(text)
             return events, False
         if name == "UserMessage":
-            # SDK 的 UserMessage 是输入回显/工具结果载体，不属于助手正文。
-            return [], False
+            # UserMessage 是输入回显/工具结果载体，不属于助手正文；只取出
+            # ToolResultBlock 作为工具完成事件。
+            content = getattr(message, "content", None)
+            if not isinstance(content, list):
+                return [], False
+            parent = str(getattr(message, "parent_tool_use_id", "") or "")
+            result_meta = getattr(message, "tool_use_result", None)
+            events = []
+            for block in content:
+                if type(block).__name__ != "ToolResultBlock":
+                    continue
+                events.extend(self._map_block(
+                    ev, block, agent_id=parent or None))
+                call_id = str(getattr(block, "tool_use_id", "") or "")
+                if call_id in (ctx.get("agent_nodes") or {}):
+                    events.extend(_agent_from_tool_result(
+                        ev, ctx, call_id, block,
+                        result_meta if isinstance(result_meta, dict) else None))
+            return events, False
         if name == "StreamEvent":
-            # --include-partial-messages 的部分增量。
-            event = getattr(message, "event", None) or {}
-            delta = (event.get("delta") or {}) if isinstance(event, dict) else {}
-            text = str(delta.get("text") or "")
-            if text:
+            # include_partial_messages: raw Anthropic stream events.
+            if getattr(message, "parent_tool_use_id", None):
+                return [], False
+            event = getattr(message, "event", None)
+            if not isinstance(event, dict):
+                return [], False
+            kind = event.get("type")
+            if kind == "message_start":
+                ctx["stream_message_id"] = str(
+                    (event.get("message") or {}).get("id") or "")
+                return [], False
+            if kind != "content_block_delta":
+                return [], False
+            delta = event.get("delta") or {}
+            message_id = str(ctx.get("stream_message_id") or "")
+            delta_type = delta.get("type")
+            if delta_type == "text_delta":
+                text = str(delta.get("text") or "")
+                if not text:
+                    return [], False
+                ctx["streamed_kinds"].setdefault(message_id, set()).add("text")
                 ctx["assistant_text_parts"].append(text)
-            return ([ev(AgentEventType.MESSAGE_DELTA, {"text": text},
-                        native="claude.stream_event")] if text else []), False
+                return [ev(AgentEventType.MESSAGE_DELTA,
+                           dump_payload(MessageDeltaPayload(text=text)),
+                           native="claude.stream_event")], False
+            if delta_type == "thinking_delta":
+                text = str(delta.get("thinking") or "")
+                if not text:
+                    return [], False
+                ctx["streamed_kinds"].setdefault(
+                    message_id, set()).add("thinking")
+                return [ev(AgentEventType.REASONING_SUMMARY,
+                           dump_payload(ReasoningPayload(
+                               text=text, channel="thinking", partial=True,
+                               item_id=f"{message_id}:{event.get('index')}"
+                               if message_id else None)),
+                           native="claude.stream_event")], False
+            return [], False
         if name == "RateLimitEvent":
-            return [ev(AgentEventType.RUNTIME_WARNING, {
-                "warning": "rate limit",
-                "native": _jsonable(
-                    getattr(message, "rate_limit_info", None) or {}),
-            })], False
+            info = getattr(message, "rate_limit_info", None)
+            status = str(getattr(info, "status", "") or "")
+            resets_at = getattr(info, "resets_at", None)
+            return [ev(AgentEventType.RUNTIME_WARNING,
+                       dump_payload(RuntimeWarningPayload(
+                           kind="rate_limit",
+                           message=f"Claude rate limit status: {status or 'unknown'}",
+                           rate_limit=RateLimitState(
+                               limited=status == "rejected",
+                               warning=status == "allowed_warning",
+                               resets_at=float(resets_at)
+                               if isinstance(resets_at, (int, float)) else None,
+                               kind=str(getattr(info, "rate_limit_type", "") or "")
+                               or None,
+                               utilization=getattr(info, "utilization", None),
+                           ),
+                           native=_jsonable(info or {}),
+                       )))], False
         if name == "HookEventMessage":
             # hook 进度/回执属已知信息类消息：不进核心状态机，不产生事件。
             return [], False
         if name == "ResultMessage":
+            from muteki.core.usage import sum_token_buckets
             usage = getattr(message, "usage", None) or {}
-            events = [ev(AgentEventType.USAGE_UPDATED, {
-                "usage": {
-                    "input_tokens": usage.get("input_tokens"),
-                    "output_tokens": usage.get("output_tokens"),
-                    "cache_read_input_tokens":
-                        usage.get("cache_read_input_tokens"),
-                    "reported_cost": getattr(message, "total_cost_usd", None),
-                    "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
-                    "num_turns": getattr(message, "num_turns", None),
-                    "duration_ms": getattr(message, "duration_ms", None),
-                },
-            })]
+            events = [ev(AgentEventType.USAGE_UPDATED,
+                         dump_payload(UsagePayload(
+                             scope="turn",
+                             input_tokens=sum_token_buckets(
+                                 usage.get("input_tokens"), usage.get("cache_read_input_tokens"),
+                                 usage.get("cache_creation_input_tokens")),
+                             output_tokens=usage.get("output_tokens"),
+                             cached_input_tokens=
+                                 usage.get("cache_read_input_tokens"),
+                             cache_write_tokens=
+                                 usage.get("cache_creation_input_tokens"),
+                             cost_usd=getattr(message, "total_cost_usd", None),
+                             step_count=getattr(message, "num_turns", None),
+                             llm_duration_ms=
+                                 getattr(message, "duration_ms", None),
+                         )))]
             is_error = bool(getattr(message, "is_error", False))
             terminal_reason = str(
                 getattr(message, "terminal_reason", "") or "")
@@ -875,65 +1636,165 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
                 result_text = "".join(ctx.get("assistant_text_parts") or [])
             if result_text and not is_error and not terminal_failure:
                 events.append(ev(AgentEventType.MESSAGE_COMPLETED,
-                                 {"text": result_text}))
+                                 dump_payload(MessageCompletedPayload(
+                                     text=result_text))))
             if is_error or terminal_failure:
-                events.append(ev(AgentEventType.TURN_FAILED, {
-                    "reason": ("interrupted"
-                               if "abort" in terminal_reason
-                               else (terminal_reason or "error")),
-                    "terminal_reason": terminal_reason,
-                    "subtype": str(getattr(message, "subtype", "") or ""),
-                    "result": result_text[:1000],
-                }))
-            elif not result_text.strip():
-                events.append(ev(AgentEventType.TURN_FAILED, {
-                    "reason": "empty_assistant",
-                    "error": {
-                        "code": "claude.empty_assistant",
-                        "message": "Claude turn ended without assistant text",
-                    },
-                }))
+                interrupted = "abort" in terminal_reason
+                events.append(ev(AgentEventType.TURN_FAILED,
+                                 dump_payload(TurnFailedPayload(
+                                     error=self.failure(
+                                         FailureCategory.CANCELLED
+                                         if interrupted
+                                         else FailureCategory.PROVIDER,
+                                         ("interrupted" if interrupted
+                                          else (terminal_reason or "error")),
+                                         message=(result_text
+                                                  or terminal_reason
+                                                  or "Claude turn failed")),
+                                     native={
+                                         "terminal_reason": terminal_reason,
+                                         "subtype": str(getattr(
+                                             message, "subtype", "") or ""),
+                                         "result": result_text,
+                                     }))))
             else:
-                events.append(ev(AgentEventType.TURN_COMPLETED, {
-                    "subtype": str(getattr(message, "subtype", "") or ""),
-                    "duration_ms": getattr(message, "duration_ms", None),
-                }))
+                if not result_text.strip():
+                    events.append(ev(AgentEventType.RUNTIME_WARNING,
+                                     dump_payload(RuntimeWarningPayload(
+                                         kind="degraded", code="external_agent.empty_assistant",
+                                         message="Claude turn ended without assistant text"))))
+                events.append(ev(AgentEventType.TURN_COMPLETED,
+                                 dump_payload(TurnCompletedPayload(
+                                     stop_reason=terminal_reason or None,
+                                     duration_ms=getattr(
+                                         message, "duration_ms", None),
+                                     native={
+                                         "subtype": str(getattr(
+                                             message, "subtype", "") or ""),
+                                     }))))
             return events, True
         # 未知 SDK 消息：RUNTIME_WARNING + native 保留，不改核心状态机。
-        return [ev(AgentEventType.RUNTIME_WARNING, {
-            "warning": "unmapped sdk message",
-            "native": {"repr": repr(message)[:500]},
-        })], False
+        return [ev(AgentEventType.RUNTIME_WARNING,
+                   dump_payload(RuntimeWarningPayload(
+                       kind="protocol",
+                       message="unmapped sdk message",
+                       code=f"claude.unmapped.{name}",
+                       native={"repr": repr(message)},
+                   )))], False
 
     @staticmethod
-    def _map_block(ev: Any, block: Any) -> list[AgentEvent]:
-        """content block 映射（TextBlock/ThinkingBlock/ToolUseBlock/ToolResultBlock）。"""
+    def _map_block(
+        ev: Any, block: Any, *, agent_id: Optional[str] = None,
+    ) -> list[AgentEvent]:
+        """content block 映射（TextBlock/ThinkingBlock/ToolUseBlock/ToolResultBlock）。
+
+        ``agent_id`` 是 SDK ``parent_tool_use_id``：子智能体内部的工具调用
+        归属到该子智能体，而不是父会话的直接工具。
+        """
         name = type(block).__name__
         if name == "TextBlock":
             text = str(getattr(block, "text", "") or "")
-            return [ev(AgentEventType.MESSAGE_DELTA, {"text": text})] if text else []
+            return ([ev(AgentEventType.MESSAGE_DELTA,
+                        dump_payload(MessageDeltaPayload(text=text)))]
+                    if text else [])
         if name == "ThinkingBlock":
-            # Claude ThinkingBlock is raw reasoning. The SDK does not label it
-            # as a public reasoning summary, so it stays inside the adapter.
-            return []
+            # Claude ThinkingBlock is raw chain-of-thought: channel=thinking,
+            # never merged into the assistant message text.
+            thinking = str(getattr(block, "thinking", "") or "")
+            return ([ev(AgentEventType.REASONING_SUMMARY,
+                        dump_payload(ReasoningPayload(
+                            text=thinking, channel="thinking")))]
+                    if thinking else [])
         if name == "ToolUseBlock":
-            return [ev(AgentEventType.TOOL_STARTED, {
-                "tool": str(getattr(block, "name", "") or ""),
-                "call_id": str(getattr(block, "id", "") or ""),
-                "input": getattr(block, "input", None) or {},
-            })]
+            tool = str(getattr(block, "name", "") or "")
+            return [ev(AgentEventType.TOOL_STARTED,
+                       dump_payload(ToolPayload(
+                           tool_call_id=str(getattr(block, "id", "") or ""),
+                           name=tool,
+                           input=getattr(block, "input", None) or {},
+                           status="running",
+                           kind="agent" if _is_delegation_tool(tool) else None,
+                           agent_id=agent_id,
+                       )))]
         if name == "ToolResultBlock":
-            content = getattr(block, "content", None)
-            if isinstance(content, list):
-                output = "".join(
-                    str(getattr(part, "text", "") or "") for part in content)
-            else:
-                output = str(content or "")
-            return [ev(AgentEventType.TOOL_COMPLETED, {
-                "call_id": str(getattr(block, "tool_use_id", "") or ""),
-                "output": output[:2000],
-                "is_error": bool(getattr(block, "is_error", False)),
-            })]
+            is_error = bool(getattr(block, "is_error", False))
+            output = _tool_result_text(getattr(block, "content", None))
+            return [ev(AgentEventType.TOOL_COMPLETED,
+                       dump_payload(ToolPayload(
+                           tool_call_id=str(getattr(block, "tool_use_id", "") or ""),
+                           output=output,
+                           status="failed" if is_error else "completed",
+                           error=(output or "tool failed") if is_error else None,
+                           agent_id=agent_id,
+                       )))]
+        return []
+
+    def _map_task_message(
+        self, ev: Any, ctx: dict[str, Any], message: Any, name: str,
+    ) -> list[AgentEvent]:
+        """Task* 系统消息 → 子智能体生命周期（只处理 Agent 类任务）。"""
+        task_id = str(getattr(message, "task_id", "") or "")
+        tool_use_id = str(getattr(message, "tool_use_id", "") or "")
+        tasks = ctx.setdefault("agent_tasks", {})
+        nodes = ctx.setdefault("agent_nodes", {})
+        agent_id = tasks.get(task_id) or (
+            tool_use_id if tool_use_id in nodes else "")
+        if name == "TaskStartedMessage":
+            task_type = str(getattr(message, "task_type", "") or "")
+            if not agent_id and not _is_agent_task_type(task_type):
+                return []
+            agent_id = agent_id or tool_use_id or task_id
+            tasks[task_id] = agent_id
+            update: dict[str, Any] = {"status": "running"}
+            description = str(getattr(message, "description", "") or "").strip()
+            if description and not (nodes.get(agent_id) or {}).get("title"):
+                update["title"] = description
+            if tool_use_id:
+                update["call_id"] = tool_use_id
+            update["session_ref"] = task_id
+            return _agent_patch(ev, ctx, agent_id, update)
+        if not agent_id:
+            return []
+        if name == "TaskProgressMessage":
+            usage = getattr(message, "usage", None) or {}
+            update = {
+                "status": "running",
+                "tool_uses": usage.get("tool_uses"),
+                "total_tokens": usage.get("total_tokens"),
+                "duration_ms": usage.get("duration_ms"),
+            }
+            last_tool = str(getattr(message, "last_tool_name", "") or "")
+            if last_tool:
+                update["activity"] = last_tool
+            return _agent_patch(ev, ctx, agent_id, update)
+        if name == "TaskNotificationMessage":
+            status = {"completed": "completed", "failed": "failed",
+                      "stopped": "cancelled"}.get(
+                str(getattr(message, "status", "") or ""), "completed")
+            usage = getattr(message, "usage", None) or {}
+            summary = str(getattr(message, "summary", "") or "")
+            update = {"status": status}
+            field = "error" if status == "failed" else "result"
+            # The tool result (when present) is the full answer; the summary
+            # is only a fallback for background agents.
+            if summary and not (nodes.get(agent_id) or {}).get(field):
+                update[field] = summary
+            for key in ("tool_uses", "total_tokens", "duration_ms"):
+                if usage.get(key) is not None:
+                    update[key] = usage.get(key)
+            return _agent_patch(ev, ctx, agent_id, update)
+        if name == "TaskUpdatedMessage":
+            raw = str(getattr(message, "status", "") or "")
+            status = {"pending": "pending", "running": "running",
+                      "paused": "pending", "completed": "completed",
+                      "failed": "failed", "killed": "cancelled"}.get(raw)
+            if not status:
+                return []
+            patch = getattr(message, "patch", None) or {}
+            update = {"status": status}
+            if status == "failed" and patch.get("error"):
+                update["error"] = str(patch.get("error"))
+            return _agent_patch(ev, ctx, agent_id, update)
         return []
 
     # -- 控制面 ---------------------------------------------------------------------
@@ -942,22 +1803,26 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
         self, session: AgentSessionRef, input: AgentInput
     ) -> CommandReceipt:
         """steer：交互客户端在 turn 进行中追加消息（SDK 排队）。"""
+        if not isinstance(input, SteerInput):
+            return self.unsupported_receipt(
+                "steer", "steer", session=session, detail={"input_kind": input.kind})
         ctx = self._runs.get(session.agent_session_id)
         if ctx is None:
             return self.unsupported_receipt("steer", "steer", session=session)
         try:
-            prompt = await claude_query_prompt(input.text, input.payload)
+            prompt = await claude_query_prompt(input.text, input.payload.attachments)
             await ctx["client"].query(prompt)
         except Exception as exc:  # noqa: BLE001
             return self.unsupported_receipt(
                 "steer", "steer_rejected", session=session,
-                detail={"error": str(exc)[:200]})
+                detail={"error": str(exc)})
         return CommandReceipt(
             command_id=new_id("cmd"), state=ReceiptState.COMPLETED,
             aggregate=AggregateRef(type="agent_session",
                                    id=session.agent_session_id))
 
     async def interrupt(self, session: AgentSessionRef) -> CommandReceipt:
+        self._mark_turn_interrupted(session.agent_session_id)
         """interrupt：SDK 控制请求；turn 以 terminal_reason=aborted_* 结束。"""
         ctx = self._runs.get(session.agent_session_id)
         if ctx is None:
@@ -968,7 +1833,7 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
         except Exception as exc:  # noqa: BLE001
             return self.unsupported_receipt(
                 "interrupt", "interrupt_rejected", session=session,
-                detail={"error": str(exc)[:200]})
+                detail={"error": str(exc)})
         return CommandReceipt(
             command_id=new_id("cmd"), state=ReceiptState.COMPLETED,
             aggregate=AggregateRef(type="agent_session",
@@ -1002,6 +1867,106 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
             command_id=new_id("cmd"), state=ReceiptState.COMPLETED,
             aggregate=AggregateRef(type="agent_session",
                                    id=session.agent_session_id))
+
+    @staticmethod
+    def _log_index(ctx: dict[str, Any], native_turn_id: str) -> int:
+        index = next((i for i, (turn_id, _uuid) in enumerate(ctx["turn_log"])
+                      if turn_id == native_turn_id), None)
+        if index is None:
+            raise ClaudeRewindError(
+                "claude.rewind.turn_unknown",
+                f"turn {native_turn_id!r} is not in this session's transcript log")
+        return index
+
+    @staticmethod
+    def _uuid_before(ctx: dict[str, Any], index: int) -> Optional[str]:
+        """Last root assistant message uuid of the turns before ``index``."""
+        for _turn_id, uuid in reversed(ctx["turn_log"][:index]):
+            if uuid:
+                return uuid
+        return None
+
+    def supports_native_rewind(self, session: AgentSessionRef) -> bool:
+        ctx = self._runs.get(session.agent_session_id)
+        return bool(
+            ctx and ctx.get("rewind_known") and ctx.get("session_id")
+            and ctx["turn_log"] and not ctx.get("current_turn_id")
+            and _sdk_option_is_supported(_import_sdk(), "resume_session_at"))
+
+    async def rewind_session(
+        self, session: AgentSessionRef, native_turn_id: str
+    ) -> dict[str, Any]:
+        """Drop ``native_turn_id`` and everything after it.
+
+        Resumes the same session truncated at the previous turn's last
+        assistant message (``resume_session_at``); with no earlier message the
+        session restarts under a fresh session id.
+        """
+        ctx = self._runs.get(session.agent_session_id)
+        if not ctx or not self.supports_native_rewind(session):
+            raise ClaudeRewindError(
+                "claude.rewind.unavailable",
+                "this Claude session cannot rewind natively")
+        index = self._log_index(ctx, native_turn_id)
+        resume_at = self._uuid_before(ctx, index)
+        sdk = _import_sdk()
+        old = ctx["client"]
+        kwargs = dict(ctx["options_kwargs"])
+        if resume_at:
+            kwargs["resume"] = ctx["session_id"]
+            kwargs["resume_session_at"] = resume_at
+        else:
+            kwargs["session_id"] = str(uuid_module.uuid4())
+        try:
+            await old.disconnect()
+        except Exception:  # noqa: BLE001 — the replacement client is what matters
+            pass
+        sdk_options = sdk.ClaudeAgentOptions(**kwargs)
+        client = sdk.ClaudeSDKClient(
+            options=sdk_options, transport=owned_claude_transport(sdk_options, session_id=session.agent_session_id))
+        await client.connect()
+        ctx["client"] = client
+        ctx["applied_permission_mode"] = kwargs["permission_mode"]
+        del ctx["turn_log"][index:]
+        if not resume_at:
+            ctx["session_id"] = kwargs["session_id"]
+            self._tracker.activate(
+                session.agent_session_id,
+                external_session_id=kwargs["session_id"],
+                resume_handle=kwargs["session_id"])
+        return {"strategy": "native",
+                "method": "resume_session_at" if resume_at else "new_session",
+                "removed_from_turn": native_turn_id}
+
+    async def fork_thread(
+        self, session: AgentSessionRef, native_turn_id: str = ""
+    ) -> dict[str, Any]:
+        """Copy the transcript (up to ``native_turn_id`` when given) into a new
+        session; start it with ``SessionStart(resume_handle=session_id)``."""
+        ctx = self._runs.get(session.agent_session_id)
+        if ctx is None or not ctx.get("session_id"):
+            raise ClaudeRewindError(
+                "claude.fork.session_unknown",
+                "the Claude session has no transcript yet")
+        up_to: Optional[str] = None
+        if native_turn_id:
+            if not ctx.get("rewind_known"):
+                raise ClaudeRewindError(
+                    "claude.fork.turn_unmapped",
+                    "turn uuids are unknown for a resumed Claude session")
+            index = self._log_index(ctx, native_turn_id)
+            up_to = ctx["turn_log"][index][1]
+            if not up_to:
+                raise ClaudeRewindError(
+                    "claude.fork.turn_unmapped",
+                    f"turn {native_turn_id!r} produced no assistant message")
+        sdk = _import_sdk()
+        result = await asyncio.to_thread(
+            sdk.fork_session, ctx["session_id"],
+            directory=ctx["options_kwargs"].get("cwd"),
+            up_to_message_id=up_to)
+        return {"thread_id": str(result.session_id),
+                "root_session_id": str(ctx["session_id"])}
 
     async def runtime_operation(self, session: AgentSessionRef, name: str, arguments: str = "") -> dict[str, Any]:
         ctx = self._runs.get(session.agent_session_id)
@@ -1117,6 +2082,12 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
         ctx = self._runs.get(session.agent_session_id)
         if not ctx:
             return EXIT_CLOSED
+        for request_id, future in tuple(ctx.get("approvals", {}).items()):
+            if not future.done():
+                future.set_result({"allow": False, "message": "session closed"})
+        for request_id, future in tuple(ctx.get("user_inputs", {}).items()):
+            if not future.done():
+                future.set_result({"decision": "cancel", "answers": {}})
         client = ctx.get("client")
         if client is not None:
             await client.disconnect()
@@ -1126,6 +2097,7 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter):
 
 
 __all__ = [
+    "ClaudeRewindError",
     "ClaudeSDKAdapter",
     "DEFAULT_CLAUDE_CLI",
     "HEADLESS_FALLBACK",

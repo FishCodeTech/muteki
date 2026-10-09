@@ -9,6 +9,11 @@ import tempfile
 import httpx
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from muteki.conversation.chat_plugins import ChatPluginService, ENGINES
+from muteki.conversation.chat_providers import PROVIDERS
+
+# Engines without Gateway delivery must report no injected tools rather than claim them.
+GATEWAY_ENGINES=[e for e in ENGINES if e not in PROVIDERS or PROVIDERS[e].gateway_tools]
+NO_GATEWAY_ENGINES=[e for e in ENGINES if e not in GATEWAY_ENGINES]
 
 SERVER='''import sys
 from mcp.server.fastmcp import FastMCP
@@ -38,7 +43,9 @@ async def check():
       except httpx.HTTPError:await asyncio.sleep(.1)
      else:raise RuntimeError('fixture server startup failed')
     service.add_mcp('transport-check',{'check':{'url':f'http://127.0.0.1:{port}{suffix}','type':transport}})
-    for engine in ENGINES:
+    for engine in NO_GATEWAY_ENGINES:
+     assert await service.prepare_tools(engine)==[],engine
+    for engine in GATEWAY_ENGINES:
      tools=await service.prepare_tools(engine)
      echo=next(t for t in tools if t['_tool']=='echo')
      result=await service.invoke(engine,echo['name'],{'text':engine})
@@ -49,7 +56,8 @@ async def check():
      prompt=next(t for t in tools if t.get('_method')=='get_prompt')
      result=await service.invoke(engine,prompt['name'],{'name':'greeting','arguments':{'name':engine}})
      assert result['messages'][0]['content']['text']=='Hello '+engine
-    print('PASS:',transport,'tools, resources and prompts across 8 providers',flush=True)
+    print('PASS:',transport,f'tools, resources and prompts across {len(GATEWAY_ENGINES)} providers;',
+          f'no Gateway tools claimed for {", ".join(NO_GATEWAY_ENGINES) or "none"}',flush=True)
    finally:
     await service.close();proc.terminate();await proc.wait()
 if __name__=='__main__':asyncio.run(check())

@@ -1,40 +1,22 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { apiFetch } from "@/lib/useRun";
 import { desktopChatBridge } from "@/lib/desktopChatBridge";
 import { visualizationSelectionText } from "@/lib/visualizationFollowup";
 import { conversationStorageKey, conversationStorageScope } from "@/lib/conversationStorageScope";
 import { Button, Dialog } from "@/components/chat/ui";
-import { visualizationBridge } from "./visualizationBridge";
+import { buildVisualizationDocument } from "./visualizationDocument";
+import { useVisualizationTheme } from "./useVisualizationTheme";
+import { useCopy } from "@/components/chat/ui";
 
 type TweakControl = { id: number; type: "slider" | "color" | "toggle" | "select"; group: string; label: string; value: string | number | boolean; initial?: string | number | boolean; min?: number; max?: number; step?: number; unit?: string; options?: (string | { label: string; value: string })[] };
 type Followup = { id: number; prompt: string; title: string; modelContent?: unknown; documentNonce: string; threadId: string; path: string; scope: string };
 
 
-const CDN = "https://cdnjs.cloudflare.com https://esm.sh https://cdn.jsdelivr.net https://unpkg.com";
-const CSP = `default-src 'none'; script-src 'unsafe-inline' ${CDN}; style-src 'unsafe-inline' ${CDN} https://fonts.googleapis.com https://fonts.bunny.net; font-src https://fonts.gstatic.com https://fonts.bunny.net; img-src data: blob: ${CDN}; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'`;
-const STYLE = `
-:root { color-scheme: light dark; --background: light-dark(#fff,#18191b); --foreground: light-dark(#25262a,#e7e7e9);
---card: light-dark(#f6f6f7,#24252a); --card-foreground: var(--foreground); --muted: var(--card); --muted-foreground: light-dark(#64656b,#acadb3);
---popover: var(--card); --popover-foreground: var(--foreground); --primary: var(--foreground); --primary-foreground: var(--background);
---secondary: var(--card); --secondary-foreground: var(--foreground); --accent: var(--card); --accent-foreground: var(--foreground);
---border: light-dark(#dddde1,#3e3f45); --input: var(--border); --ring: #709be9; --destructive: #d95c5c;
---viz-series-1:#729bdb; --viz-series-2:#62ae97; --viz-series-3:#d5a354; --viz-series-4:#b18dd7; --viz-series-5:#d5839b; --viz-series-6:#76baca;
---blue:var(--viz-series-1); --green:var(--viz-series-2); --orange:var(--viz-series-3); --purple:var(--viz-series-4); --red:var(--destructive); --yellow:#d6c26e; --font-size-base:14px; }
-* { box-sizing:border-box } body { margin:0; padding:12px 0; background:transparent; color:var(--foreground); font:14px/1.5 system-ui,sans-serif; overflow-wrap:anywhere }
-svg,canvas,img { max-width:100% } h1,h2,h3 { font-size:16px; font-weight:500 } .card { padding:14px; background:var(--card); border-radius:10px }
-.viz-row,.viz-controls { display:flex; align-items:center; flex-wrap:wrap; gap:12px } .viz-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(180px,100%),1fr)); gap:12px }
-.text-muted { color:var(--muted-foreground) } .text-small { font-size:12px } .text-destructive { color:var(--destructive) } .text-end{text-align:right} .text-center{text-align:center} .text-nowrap{white-space:nowrap} .tabular-nums{font-variant-numeric:tabular-nums}
-.btn,.form-control,.form-select { font:inherit; color:var(--foreground); background:var(--card); border:1px solid var(--border); border-radius:7px; padding:6px 10px; max-width:100% }
-.btn{cursor:pointer} .btn-primary { background:var(--primary);color:var(--primary-foreground) } .btn-ghost { background:transparent;border-color:transparent } .btn-block{width:100%}
-.form-label { display:block; font-size:12px } .form-range { max-width:100% } .form-check { display:flex; align-items:center; gap:7px } .nav{display:flex;gap:6px;flex-wrap:wrap}
-.nav-link{font:inherit;color:var(--foreground);background:transparent;border:0;padding:7px 12px;border-radius:7px;cursor:pointer} .nav-link.active{background:var(--card)}
-.table { width:100%;border-collapse:collapse } .table td,.table th{padding:8px;text-align:start;border-bottom:1px solid var(--border)} .table-responsive{overflow:auto}
-.sr-only{position:absolute;width:1px;height:1px;padding:0;overflow:hidden;clip:rect(0,0,0,0)} hr{border:0;border-top:1px solid var(--border)}
-`;
-
-export function parseVisualization(text: string): { path: string; title?: string } | null {
+export function parseVisualization(text: string): { path: string; title?: string; inlineHtml?: string } | null {
+  const inline = /^(`{3,}|~{3,})muteki-visualize[ \t]*\r?\n([\s\S]*?)\r?\n\1[ \t]*$/.exec(text.trim());
+  if (inline) return { path: "inline", inlineHtml: inline[2].trim() };
   const match = /^(?:visualize(\{[^\n]*\})|(?:muteki-visualize|visualize)\s+(\{[^\n]*\}))$/.exec(text.trim());
   if (!match) return null;
   try {
@@ -43,7 +25,9 @@ export function parseVisualization(text: string): { path: string; title?: string
   } catch { return null; }
 }
 
-export function ChatVisualization({ threadId, path, title, streaming }: { threadId: string; path: string; title?: string; streaming: boolean }) {
+type VisualizationProps = { threadId: string; messageId?: string; path: string; title?: string; inlineHtml?: string; streaming: boolean; expanded?: boolean };
+
+export function ChatVisualization({ threadId, messageId, path, title, inlineHtml, streaming, expanded = false }: VisualizationProps) {
   const frame = useRef<HTMLIFrameElement>(null);
   const [documentNonce, setDocumentNonce] = useState("");
   const [contentRevision, setContentRevision] = useState("");
@@ -53,15 +37,13 @@ export function ChatVisualization({ threadId, path, title, streaming }: { thread
   const scope = conversationStorageScope();
   const currentDocument = useRef({ documentNonce, threadId, path, scope });
   currentDocument.current = { documentNonce, threadId, path, scope };
-  const [theme, setTheme] = useState("dark");
-  useEffect(() => {
-    const sync = () => setTheme(document.documentElement.dataset.theme === "light" ? "light" : "dark");
-    sync();
-    const observer = new MutationObserver(sync);
-    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
-    return () => observer.disconnect();
-  }, []);
+  const theme = useVisualizationTheme();
   const [html, setHtml] = useState<string | null>(null);
+  const [documentTitle, setDocumentTitle] = useState(title || "交互图");
+  const [expandedOpen, setExpandedOpen] = useState(false);
+  const [sourceOpen, setSourceOpen] = useState(false);
+  const [downloadUrl, setDownloadUrl] = useState("");
+  const { copy, copied } = useCopy();
   const [error, setError] = useState("");
   const [assets, setAssets] = useState<Record<string, string>>({});
   const [controls, setControls] = useState<TweakControl[]>([]);
@@ -76,14 +58,21 @@ export function ChatVisualization({ threadId, path, title, streaming }: { thread
     try { setSelectionText(visualizationSelectionText(followup?.modelContent)); setSelectionError(""); }
     catch (failure) { setSelectionText(""); setSelectionError(failure instanceof Error ? failure.message : String(failure)); }
   }, [followup]);
-  const reply = (id: number, ok: boolean, error = "") => frame.current?.contentWindow?.postMessage({ type: "muteki:viz:result", documentNonce, id, ok, error }, "*");
+  const reply = useCallback((id: number, ok: boolean, error = "") => frame.current?.contentWindow?.postMessage({ type: "muteki:viz:result", documentNonce, id, ok, error }, "*"), [documentNonce]);
   const [height, setHeight] = useState(360);
-  const key = conversationStorageKey(`muteki:visualization:${threadId}:${path}:${contentRevision}`);
+  const key = conversationStorageKey(`muteki:visualization:${threadId}:${messageId || ""}:${path}:${contentRevision}`);
+  const legacyKey = conversationStorageKey(`muteki:visualization:${threadId}:${path}:${contentRevision}`);
   useEffect(() => {
-    setHtml(null); setError(""); setControls([]); setFollowup(null); setExternal(""); setTweakOpen(false); setOriginalPreview(false); setDocumentNonce(""); setContentRevision(""); setNativeUrl(""); setNativeError("");
+    setHtml(null); setError(""); setControls([]); setFollowup(null); setExternal(""); setTweakOpen(false); setOriginalPreview(false); setDocumentNonce(""); setContentRevision(""); setNativeUrl(""); setNativeError(""); setDocumentTitle(title || "交互图");
     if (streaming) return;
+    if (inlineHtml !== undefined && new TextEncoder().encode(inlineHtml).length > 1_000_000) {
+      setError("visualization.too_large: 图形超过 1 MB，未截断或渲染"); return;
+    }
     const abort = new AbortController();
-    apiFetch(`/api/chat-plugins/visualizations/${encodeURIComponent(threadId)}?path=${encodeURIComponent(path)}`, { signal: abort.signal })
+    const documentPath = inlineHtml === undefined ? Promise.resolve(path)
+      : crypto.subtle.digest("SHA-256", new TextEncoder().encode(inlineHtml)).then((digest) =>
+        "inline:" + Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, "0")).join(""));
+    documentPath.then((value) => apiFetch(`/api/chat-plugins/visualizations/${encodeURIComponent(threadId)}?path=${encodeURIComponent(value)}${messageId ? `&message_id=${encodeURIComponent(messageId)}` : ""}`, { signal: abort.signal }))
       .then(async (r) => { const body = await r.text(); if (!r.ok) throw new Error(`图形暂不可用（HTTP ${r.status}）：${body}`); try { return JSON.parse(body); } catch { throw new Error(`visualization.protocol.invalid_json: ${body}`); } })
       .then(async (v) => {
         if (typeof v.html !== "string" || (v.assets !== undefined && (!v.assets || typeof v.assets !== "object" || Object.values(v.assets).some((value) => typeof value !== "string")))) throw new Error("visualization.protocol.invalid_document: 缺少完整图形正文或资源");
@@ -91,25 +80,27 @@ export function ChatVisualization({ threadId, path, title, streaming }: { thread
         if (!abort.signal.aborted) {
           setContentRevision(Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, "0")).join(""));
           setDocumentNonce(crypto.randomUUID()); setHtml(v.html); setAssets(v.assets || {});
+          setDocumentTitle(title || v.title || "交互图");
         }
       })
       .catch((e) => { if (!abort.signal.aborted) setError(String(e.message)); });
     return () => abort.abort();
-  }, [threadId, path, streaming, scope]);
+  }, [threadId, messageId, path, title, inlineHtml, streaming, scope]);
   useEffect(() => {
     const receive = (event: MessageEvent) => {
       if (event.source !== frame.current?.contentWindow || !documentNonce) return;
       const msg = event.data;
       if (msg?.documentNonce !== documentNonce) return;
-      if (msg?.type === "muteki:viz:resize" && Number.isFinite(msg.height)) setHeight(Math.min(2400, Math.max(120, msg.height)));
+      if (msg?.type === "muteki:viz:resize" && Number.isFinite(msg.height)) setHeight(Math.min(2000, Math.max(80, Math.ceil(msg.height))));
       if (msg?.type === "muteki:viz:ready") {
-        try { frame.current?.contentWindow?.postMessage({ type: "muteki:viz:state", documentNonce, value: JSON.parse(localStorage.getItem(key) || "null") }, "*"); } catch { /* Storage is optional. */ }
+        try { frame.current?.contentWindow?.postMessage({ type: "muteki:viz:state", documentNonce, value: JSON.parse(localStorage.getItem(key) || localStorage.getItem(legacyKey) || "null") }, "*"); } catch { /* Storage is optional. */ }
       }
       if (msg?.type === "muteki:viz:state-write") {
         try {
           const encoded = JSON.stringify(msg.value);
           if (!msg.value || Array.isArray(msg.value) || new TextEncoder().encode(encoded).length > 16384) throw new Error("状态过大或格式无效");
           localStorage.setItem(key, encoded); reply(msg.id, true);
+          window.dispatchEvent(new CustomEvent("muteki:visualization-state", { detail: { key, value: msg.value, documentNonce } }));
         } catch { reply(msg.id, false, "无法保存交互状态"); }
       }
       if (msg?.type === "muteki:viz:tweak-add" && msg.control && Number.isFinite(msg.control.id)
@@ -132,23 +123,31 @@ export function ChatVisualization({ threadId, path, title, streaming }: { thread
         });
       }
       if (msg?.type === "muteki:viz:external" && typeof msg.href === "string") {
+        if (document.activeElement !== frame.current || !navigator.userActivation?.isActive) return;
         try { const url = new URL(msg.href); if (["http:", "https:"].includes(url.protocol) && !url.username && !url.password) setExternal(url.href); } catch { /* Reject non-web destinations. */ }
       }
     };
+    const syncState = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      if (detail?.key === key && detail.documentNonce !== documentNonce) {
+        frame.current?.contentWindow?.postMessage({ type: "muteki:viz:state", documentNonce, value: detail.value }, "*");
+      }
+    };
     window.addEventListener("message", receive);
-    return () => window.removeEventListener("message", receive);
-  }, [key, documentNonce, threadId, path, scope]);
+    window.addEventListener("muteki:visualization-state", syncState);
+    return () => { window.removeEventListener("message", receive); window.removeEventListener("muteki:visualization-state", syncState); };
+  }, [key, legacyKey, documentNonce, threadId, path, scope, reply]);
+  const themeReady = theme !== null;
   const srcDocument = useMemo(() => {
-    if (html === null) return "";
-    const script = (source: string) => "<script>" + source.replaceAll("</script", "<\\/script") + "</script>";
-    const content = assets["visualize.html"]?.replace("<!--__INLINE_VISUALIZATION_FRAGMENT__-->", html) || html;
-    return `<!doctype html><html style="color-scheme:${theme}"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${CSP}"><meta name="referrer" content="no-referrer"><style>${STYLE} ${assets["visualize.css"] || ""} :root{color-scheme:${theme}}</style><script id="codex-visualization-lucide" src="https://cdn.jsdelivr.net/npm/lucide@0.468.0/dist/umd/lucide.min.js"></script>${script(visualizationBridge(documentNonce))}${assets["calendar.js"] ? script(assets["calendar.js"]) : ""}</head><body>${content}</body></html>`;
-  // Freeze a document until its content changes; theme updates use the bridge.
+    if (html === null || theme === null) return "";
+    return buildVisualizationDocument(html, assets, theme, documentNonce);
+  // Theme changes update the existing frame, preserving scripts and selections.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [html, assets, documentNonce]);
-  useEffect(() => {
-    frame.current?.contentWindow?.postMessage({ type: "muteki:viz:theme", documentNonce, value: theme }, "*");
+  }, [html, assets, documentNonce, themeReady]);
+  const postTheme = useCallback(() => {
+    if (theme) frame.current?.contentWindow?.postMessage({ type: "muteki:viz:theme", documentNonce, value: theme.appearance, variables: theme.variables }, "*");
   }, [theme, documentNonce]);
+  useEffect(postTheme, [postTheme]);
   useEffect(() => {
     if (!native || !srcDocument || !documentNonce) return;
     const bridge = desktopChatBridge();
@@ -186,12 +185,29 @@ export function ChatVisualization({ threadId, path, title, streaming }: { thread
     } catch (failure) { reply(followup.id, false, String(failure)); setError(failure instanceof Error ? failure.message : String(failure)); }
     finally { setSending(false); }
   };
+  useEffect(() => {
+    if (html === null || !theme) { setDownloadUrl(""); return; }
+    const document = buildVisualizationDocument(html, assets, theme, contentRevision, true);
+    const url = URL.createObjectURL(new Blob([document], { type: "text/html;charset=utf-8" }));
+    setDownloadUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [html, assets, theme, contentRevision]);
   if (error && html === null) return <p role="alert" className="whitespace-pre-wrap break-words text-xs text-cx-fg-3">{error}</p>;
   if (html === null) return <p className="text-xs text-cx-fg-3">正在准备交互图…</p>;
-  return <div>
-    {controls.length > 0 && <div className="mb-2 flex justify-end"><Button variant="ghost" size="sm" onClick={() => setTweakOpen(true)}>调整设计</Button></div>}
+  return <div className={expanded ? "flex min-h-0 flex-1 flex-col" : "my-3 min-w-0"} data-testid="chat-visualization-document">
+    <div className="mb-2 flex flex-wrap items-center justify-end gap-1 not-prose" role="toolbar" aria-label="图形操作">
+      {controls.length > 0 && <Button variant="ghost" size="sm" onClick={() => setTweakOpen(true)}>调整设计</Button>}
+      <Button variant="ghost" size="sm" onClick={() => setSourceOpen(!sourceOpen)}>{sourceOpen ? "预览" : "源码"}</Button>
+      {sourceOpen && <Button variant="ghost" size="sm" onClick={() => void copy(html)}>{copied ? "已复制" : "复制源码"}</Button>}
+      {downloadUrl && <a href={downloadUrl} download={(documentTitle.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "-").trim() || "visualization") + ".html"} className="rounded-md px-3 py-1.5 text-xs font-medium text-cx-fg-2 hover:bg-cx-hover hover:text-cx-fg">下载</a>}
+      {!expanded && <Button variant="ghost" size="sm" onClick={() => setExpandedOpen(true)}>展开</Button>}
+    </div>
     {error || nativeError ? <p role="alert" className="mb-2 whitespace-pre-wrap break-words text-xs text-cx-warning">{error || nativeError}</p> : null}
-    {native && !nativeUrl ? <p className="text-xs text-cx-fg-3">正在准备隔离的桌面图形文档…</p> : <iframe key={documentNonce} ref={frame} title={title || "交互图"} sandbox="allow-scripts" referrerPolicy="no-referrer" src={native ? nativeUrl : undefined} srcDoc={native ? undefined : srcDocument} className="w-full border-0" style={{ height }} data-testid="chat-visualization" />}
+    {sourceOpen && <pre tabIndex={0} aria-label="图形源码" className="min-h-0 max-h-[65vh] overflow-auto rounded-lg bg-cx-sunken p-3 font-cx-mono text-xs text-cx-fg">{html}</pre>}
+    {native && !nativeUrl ? <p className="text-xs text-cx-fg-3">正在准备隔离的桌面图形文档…</p> : <iframe key={documentNonce} ref={frame} title={documentTitle} sandbox="allow-scripts" referrerPolicy="no-referrer" loading="lazy" onLoad={postTheme} src={native ? nativeUrl : undefined} srcDoc={native ? undefined : srcDocument} className={sourceOpen ? "hidden" : "w-full min-h-0 border-0"} style={{ height: expanded ? "100%" : height, flex: expanded ? 1 : undefined, colorScheme: theme?.appearance }} data-testid="chat-visualization" />}
+    {!expanded && <Dialog open={expandedOpen} onOpenChange={setExpandedOpen} title={documentTitle} size="full" bodyClassName="flex min-h-0 flex-1 flex-col !p-3" testId="visualization-expanded">
+      <ChatVisualization threadId={threadId} messageId={messageId} path={path} title={title} inlineHtml={inlineHtml} streaming={false} expanded />
+    </Dialog>}
     <Dialog open={tweakOpen} onOpenChange={(open) => { if (!open && originalPreview) previewOriginal(false); setTweakOpen(open); }} title="调整设计" footer={<>
       <Button variant="ghost" onClick={() => { previewOriginal(false); controls.forEach((c) => updateControl(c, c.initial ?? c.value, true)); }}>重置</Button>
       <Button variant="ghost" onClick={() => previewOriginal(!originalPreview)}>{originalPreview ? "查看修改" : "查看原始"}</Button>

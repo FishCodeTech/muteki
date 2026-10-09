@@ -14,16 +14,22 @@ import re
 from typing import Any
 from urllib.parse import quote
 
+import time
+
 import httpx
 
 from muteki.platform.contracts.base import utcnow
+
+from .capabilities import ProbeCommandResult, run_probe_command
+
+#: Release metadata changes slowly; one lookup per install per five minutes.
+VERSION_CHECK_TTL_S = 300.0
 
 
 _NPM_PACKAGES = {
     "claude": "@anthropic-ai/claude-code",
     "codex": "@openai/codex",
     "pi": "@earendil-works/pi-coding-agent",
-    "opencode": "opencode-ai",
 }
 
 _CURSOR_VERSION_RE = re.compile(r"\b\d{4}\.\d{2}\.\d{2}-[0-9a-z]+\b", re.I)
@@ -98,29 +104,31 @@ async def _http_text(url: str) -> str:
         )
         if value and value.lower().startswith(("http://", "https://"))
     ), None)
-    attempts = [http_proxy, None] if http_proxy else [None]
-    last_error: Exception | None = None
-    for proxy in attempts:
-        try:
-            async with httpx.AsyncClient(
-                timeout=timeout,
-                follow_redirects=True,
-                headers=headers,
-                proxy=proxy,
-                trust_env=False,
-            ) as client:
-                response = await client.get(url)
-                response.raise_for_status()
-                return response.text
-        except httpx.TransportError as exc:
-            last_error = exc
-    raise last_error or RuntimeError("版本元数据请求失败")
+    async with httpx.AsyncClient(
+        timeout=timeout, follow_redirects=True, headers=headers,
+        proxy=http_proxy, trust_env=False,
+    ) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+        return response.text
 
 
-async def _npm_latest(package: str) -> str:
+async def _npm_latest(package: str, *, major: int | None = None) -> str:
     payload = json.loads(await _http_text(
         f"https://registry.npmjs.org/{quote(package, safe='')}/latest"))
-    return str(payload.get("version") or "").strip()
+    latest = str(payload.get("version") or "").strip()
+    if major is None or latest.split(".", 1)[0] == str(major):
+        return latest
+    # T3's OpenCode updates stay on the installed major, including when a
+    # package's latest tag has moved to the next runtime generation.
+    metadata = json.loads(await _http_text(
+        f"https://registry.npmjs.org/{quote(package, safe='')}"))
+    versions = metadata.get("versions") if isinstance(metadata, dict) else None
+    candidates = [value for value in versions or {}
+                  if re.fullmatch(r"\d+\.\d+\.\d+", value) and value.split(".", 1)[0] == str(major)]
+    if not candidates:
+        raise ValueError(f"No stable {package} release for installed major {major}")
+    return max(candidates, key=lambda value: tuple(int(part) for part in value.split(".")))
 
 
 async def _run_check_only(binary: str, *args: str) -> str:
@@ -129,26 +137,26 @@ async def _run_check_only(binary: str, *args: str) -> str:
         raise ValueError("版本子进程只允许厂商的只读检查参数")
     env = dict(os.environ)
     env.update({"NO_COLOR": "1", "TERM": "dumb", "CI": "1", "OMP_SKIP_SETUP": "1"})
-    process = await asyncio.create_subprocess_exec(
-        binary,
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=12.0)
-    except TimeoutError:
-        process.kill()
-        await process.communicate()
-        raise TimeoutError("版本检查超时") from None
-    output = (stdout or stderr or b"").decode("utf-8", errors="replace").strip()
-    if process.returncode != 0:
-        raise RuntimeError(output[-200:] or f"版本检查退出码 {process.returncode}")
-    return output
+    result = await run_probe_command([binary, *args], timeout=12.0, env=env)
+    if not result.ok:
+        raise VersionCheckCommandError(result)
+    return (result.stdout or result.stderr).strip()
 
 
-async def _latest_for(engine: str, binary_path: str) -> tuple[str, str]:
+class VersionCheckCommandError(RuntimeError):
+    """The vendor ``update --check`` command failed; carries the full result."""
+
+    def __init__(self, result: ProbeCommandResult) -> None:
+        self.result = result
+        self.code = result.error_code.value if result.error_code else ""
+        super().__init__(result.describe())
+
+
+async def _latest_for(engine: str, binary_path: str, version: str = "") -> tuple[str, str]:
+    if engine == "opencode":
+        major = int(version.split(".", 1)[0])
+        package = "opencode-ai" if major == 1 else "@opencode/cli"
+        return await _npm_latest(package, major=major), f"npm:{package}"
     if engine in _NPM_PACKAGES:
         package = _NPM_PACKAGES[engine]
         return await _npm_latest(package), f"npm:{package}"
@@ -195,7 +203,7 @@ async def check_cli_version(
         base["detail"] = "尚未找到本机 CLI"
         return base
     try:
-        latest_raw, source = await _latest_for(engine, binary_path)
+        latest_raw, source = await _latest_for(engine, binary_path, installed)
         latest = installed_version(engine, latest_raw)
         if not latest:
             raise ValueError("发布元数据中没有可识别的版本号")
@@ -213,8 +221,57 @@ async def check_cli_version(
             base.update({"status": "current", "detail": "已是最新版本"})
     except Exception as exc:  # noqa: BLE001 — 版本源故障不影响 CLI 健康状态
         base["detail"] = "最新版本未获取"
-        base["error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+        base["error"] = f"{type(exc).__name__}: {exc}"
+        base["error_code"] = getattr(exc, "code", "version_check.request_failed" if isinstance(exc, httpx.HTTPError)
+                                         else "version_check.metadata_invalid")
     return base
 
 
-__all__ = ["check_cli_version", "compare_versions", "installed_version"]
+_VERSION_RESULTS: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
+_VERSION_FLIGHTS: dict[tuple[str, str, str], "asyncio.Task[dict[str, Any]]"] = {}
+
+
+async def cached_check_cli_version(
+    engine: str,
+    binary_path: str,
+    runtime_version: str,
+    *,
+    force: bool = False,
+    ttl_s: float = VERSION_CHECK_TTL_S,
+) -> dict[str, Any]:
+    """``check_cli_version`` with a per-install TTL and single-flight.
+
+    Keyed by engine + binary path + installed version, so an upgrade is
+    checked again immediately.  ``force`` skips a fresh result.
+    """
+    key = (engine, binary_path, runtime_version)
+    cached = _VERSION_RESULTS.get(key)
+    if cached is not None and not force and time.monotonic() - cached[0] < ttl_s:
+        return dict(cached[1])
+    loop = asyncio.get_running_loop()
+    task = _VERSION_FLIGHTS.get(key)
+    if task is None or task.get_loop() is not loop:
+        async def perform() -> dict[str, Any]:
+            result = await check_cli_version(engine, binary_path, runtime_version)
+            _VERSION_RESULTS[key] = (time.monotonic(), dict(result))
+            return result
+
+        task = loop.create_task(perform())
+        _VERSION_FLIGHTS[key] = task
+
+        def forget(done: "asyncio.Task[dict[str, Any]]") -> None:
+            if _VERSION_FLIGHTS.get(key) is done:
+                _VERSION_FLIGHTS.pop(key, None)
+
+        task.add_done_callback(forget)
+    return dict(await asyncio.shield(task))
+
+
+__all__ = [
+    "VERSION_CHECK_TTL_S",
+    "VersionCheckCommandError",
+    "cached_check_cli_version",
+    "check_cli_version",
+    "compare_versions",
+    "installed_version",
+]

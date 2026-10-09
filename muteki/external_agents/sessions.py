@@ -78,6 +78,12 @@ class SessionTracker:
         self._generations: dict[str, int] = {}
         self._exit_classifications: dict[str, str] = {}
 
+    def attach_store(self, store: Any) -> None:
+        """Persist future records to ``store`` unless one is already attached."""
+        with self._lock:
+            if self._store is None:
+                self._store = store
+
     # -- 生命周期 ---------------------------------------------------------
 
     def create(

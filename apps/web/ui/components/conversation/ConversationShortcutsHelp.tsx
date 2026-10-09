@@ -10,6 +10,8 @@ import React, { useEffect, useMemo, useState } from "react";
 import { Dialog, EmptyState, Kbd, SearchInput, Shortcut, splitShortcut } from "@/components/chat/ui";
 import { desktopChatBridge } from "@/lib/desktopChatBridge";
 import { useLang } from "@/lib/i18n";
+import { useChatPreferences, type SendKey } from "@/lib/chatPreferences";
+import { useShortcutBindings, type ShortcutActionId } from "@/lib/shortcutBindings";
 
 interface ShortcutRow {
   /** Alternative bindings, each in `mod+shift+k` form. */
@@ -17,6 +19,8 @@ interface ShortcutRow {
   /** Plain-text context label (used by the conflict notes instead of key caps). */
   label?: string;
   description: string;
+  /** Keys come from the user's bindings / send-key preference instead of `keys`. */
+  action?: ShortcutActionId | "send" | "newline";
 }
 
 interface ShortcutSection {
@@ -29,17 +33,30 @@ const SHORTCUT_SECTIONS: ShortcutSection[] = [
   {
     title: "导航",
     rows: [
-      { keys: ["mod+shift+n"], description: "新建对话" },
-      { keys: ["mod+k"], description: "命令面板（搜索 / 跳转会话）" },
-      { keys: ["/"], description: "聚焦输入框" },
+      { action: "newChat", keys: ["mod+shift+n"], description: "新建对话" },
+      { action: "search", keys: ["mod+k"], description: "命令面板（搜索 / 跳转会话）" },
+      { action: "focusComposer", keys: ["/"], description: "聚焦输入框" },
       { keys: ["esc"], description: "关闭当前面板 / 返回输入框" },
+    ],
+  },
+  {
+    title: "侧栏",
+    rows: [
+      { action: "toggleSidebar", keys: ["mod+b"], description: "切换会话侧栏" },
+      { keys: ["mod+1"], description: "跳到第 1–9 个对话（按住 ⌘ 显示编号）" },
+      { keys: ["mod+shift+[", "mod+shift+]"], description: "上一个 / 下一个对话" },
+      { keys: ["mod+shift+s"], description: "归置 / 移回当前对话" },
+      { keys: ["mod+shift+p"], description: "置顶 / 取消置顶当前对话" },
+      { keys: ["mod+z"], description: "撤销刚才的归置、稍后提醒或置顶" },
+      { label: "⌘ / Shift + 点击", description: "多选对话，右键批量操作" },
+      { label: "双击标题", description: "重命名对话" },
     ],
   },
   {
     title: "输入与发送",
     rows: [
-      { keys: ["enter"], description: "发送" },
-      { keys: ["shift+enter"], description: "换行" },
+      { action: "send", keys: ["enter"], description: "发送" },
+      { action: "newline", keys: ["shift+enter"], description: "换行" },
       { keys: ["mod+enter"], description: "提交用户输入表单" },
       { keys: ["@"], description: "引用文件或能力" },
       { keys: ["/"], description: "命令（输入框开头）" },
@@ -49,15 +66,18 @@ const SHORTCUT_SECTIONS: ShortcutSection[] = [
   {
     title: "面板",
     rows: [
-      { keys: ["mod+alt+b"], description: "打开 / 关闭工作面板" },
-      { keys: ["mod+alt+d"], description: "变更 (Diff)" },
-      { keys: ["mod+alt+p"], description: "预览" },
-      { keys: ["mod+alt+f"], description: "文件" },
-      { keys: ["mod+alt+t"], description: "终端" },
-      { keys: ["mod+alt+o"], description: "概览" },
-      { keys: ["mod+j"], description: "执行日志" },
-      { keys: ["mod+shift+m"], description: "选择模型" },
-      { keys: ["?"], description: "打开此帮助" },
+      { action: "togglePanel", keys: ["mod+alt+b"], description: "打开 / 关闭工作面板" },
+      { action: "panelDiff", keys: ["mod+alt+d"], description: "变更 (Diff)" },
+      { action: "panelPreview", keys: ["mod+alt+p"], description: "预览" },
+      { action: "panelFiles", keys: ["mod+alt+f"], description: "文件" },
+      { action: "panelTerminal", keys: ["mod+alt+t"], description: "终端" },
+      { action: "panelOverview", keys: ["mod+alt+o"], description: "概览" },
+      { action: "toggleLog", keys: ["mod+j"], description: "执行日志" },
+      { action: "modelPicker", keys: ["mod+shift+m"], description: "选择模型" },
+      { action: "effortPicker", keys: ["mod+shift+e"], description: "思考强度" },
+      { action: "accessPicker", keys: ["mod+shift+a"], description: "Agent 操作权限" },
+      { action: "interactionMode", keys: ["shift+tab"], description: "切换规划模式（输入框聚焦时）" },
+      { action: "help", keys: ["?"], description: "打开此帮助" },
     ],
   },
   {
@@ -71,6 +91,16 @@ const SHORTCUT_SECTIONS: ShortcutSection[] = [
       { keys: ["p"], description: "计划" },
       { keys: ["a"], description: "Agents" },
       { keys: ["r"], description: "Pull request" },
+    ],
+  },
+  {
+    title: "阅读与审批",
+    rows: [
+      { keys: ["alt+up", "alt+down"], description: "上一轮 / 下一轮" },
+      { label: "右侧小地图", description: "悬停预览提问，点击跳到该轮，按住拖动快速滚动" },
+      { keys: ["y"], description: "批准（审批卡聚焦时）" },
+      { keys: ["a"], description: "记住此选择（Runtime 提供时）" },
+      { keys: ["n"], description: "拒绝（审批卡聚焦时）" },
     ],
   },
   {
@@ -95,31 +125,47 @@ const KEY_WORDS: Record<string, string> = {
 };
 
 const ENGLISH: Record<string, string> = {
-  "导航": "Navigation", "新建对话": "New chat", "命令面板（搜索 / 跳转会话）": "Search and switch conversations",
-  "聚焦输入框": "Focus composer", "关闭当前面板 / 返回输入框": "Close panel and return to composer",
+  "导航": "Navigation", "侧栏": "Sidebar", "跳到第 1–9 个对话（按住 ⌘ 显示编号）": "Jump to conversation 1–9 (hold ⌘ to show numbers)",
+  "上一个 / 下一个对话": "Previous / next conversation", "归置 / 移回当前对话": "Settle / unsettle the current conversation",
+  "置顶 / 取消置顶当前对话": "Pin / unpin the current conversation", "撤销刚才的归置、稍后提醒或置顶": "Undo the last settle, snooze, or pin",
+  "⌘ / Shift + 点击": "⌘ / Shift + click", "多选对话，右键批量操作": "Select several conversations; right-click for bulk actions",
+  "双击标题": "Double-click a title", "重命名对话": "Rename the conversation", "新建对话": "New chat", "命令面板（搜索 / 跳转会话）": "Search and switch conversations",
+  "聚焦输入框": "Focus composer", "切换会话侧栏": "Toggle conversation sidebar", "关闭当前面板 / 返回输入框": "Close panel and return to composer",
   "输入与发送": "Compose and send", "发送": "Send", "换行": "New line", "提交用户输入表单": "Submit input form",
   "引用文件或能力": "Mention a file or capability", "命令（输入框开头）": "Command at the start of the composer",
   "浏览发送历史（输入框为空时）": "Recall sent messages when the composer is empty",
   "面板": "Panels", "打开 / 关闭工作面板": "Toggle work panel", "变更 (Diff)": "Changes (Diff)",
   "预览": "Preview", "文件": "Files", "终端": "Terminal", "概览": "Overview", "执行日志": "Execution log",
-  "选择模型": "Select model", "打开此帮助": "Open shortcut help", "面板启动器（启动器可见时）": "Panel launcher (when visible)",
+  "选择模型": "Select model", "打开此帮助": "Open shortcut help",
+  "切换规划模式（输入框聚焦时）": "Toggle plan mode (while the composer is focused)",
+  "面板启动器（启动器可见时）": "Panel launcher (when visible)",
+  "阅读与审批": "Reading and approvals", "上一轮 / 下一轮": "Previous / next turn",
+  "右侧小地图": "Minimap", "悬停预览提问，点击跳到该轮，按住拖动快速滚动": "Hover to preview a prompt, click to jump to its turn, drag to scrub",
+  "批准（审批卡聚焦时）": "Approve (approval card focused)", "记住此选择（Runtime 提供时）": "Remember this choice (when the runtime offers it)",
+  "拒绝（审批卡聚焦时）": "Deny (approval card focused)",
   "变更": "Changes", "计划": "Plan", "冲突说明": "Shortcut context", "中文输入法 (IME)": "Input method (IME)",
   "组字期间自动屏蔽 Enter 与所有单键快捷键，确认候选词不会误发送": "Enter and single-key shortcuts are ignored during composition, so confirming a candidate does not send the message.",
   "终端内": "Inside the terminal", "键盘事件由终端捕获，不会触发全局快捷键；按 Esc 或点击外部即可退出": "The terminal captures keyboard input; click outside to return to the chat controls.",
   "浏览器快捷键": "Browser shortcuts", "⌘/Ctrl+K、⌘/Ctrl+Shift+N 等优先生效，已避开 ⌘/Ctrl+N（浏览器新窗口）": "Chat uses ⌘/Ctrl+K and ⌘/Ctrl+Shift+N; ⌘/Ctrl+N remains the browser's new-window shortcut.",
 };
 
-function shortcutSections(native: boolean, en: boolean): ShortcutSection[] {
+function rowKeys(row: ShortcutRow, bindings: Record<ShortcutActionId, string>, sendKey: SendKey): string[] | undefined {
+  if (row.action === "send") return [sendKey === "mod-enter" ? "mod+enter" : "enter"];
+  if (row.action === "newline") return sendKey === "mod-enter" ? ["enter", "shift+enter"] : ["shift+enter"];
+  if (row.action) return [bindings[row.action]];
+  return row.keys;
+}
+
+function shortcutSections(native: boolean, en: boolean, bindings: Record<ShortcutActionId, string>, sendKey: SendKey): ShortcutSection[] {
   const copy = (value: string) => en ? ENGLISH[value] || value : value;
   const sections: ShortcutSection[] = SHORTCUT_SECTIONS.map(section => ({
     ...section, title: copy(section.title), rows: section.rows.map(row => ({
-      ...row, description: copy(row.description), label: row.label ? copy(row.label) : undefined,
+      ...row, keys: rowKeys(row, bindings, sendKey), description: copy(row.description), label: row.label ? copy(row.label) : undefined,
     })),
   }));
   if (native) {
     sections.unshift({ title: en ? "Desktop window" : "桌面窗口", rows: [
       { keys: ["mod+,"], description: en ? "Open settings" : "打开设置" },
-      { keys: ["mod+b"], description: en ? "Toggle conversation sidebar" : "切换会话侧栏" },
       { keys: ["mod+r"], description: en ? "Save drafts and reload chat; reload a focused preview" : "保存草稿后刷新聊天；预览聚焦时刷新预览" },
       { keys: ["alt+left", "alt+right"], description: en ? "Navigate workspace history; navigate a focused preview" : "工作台后退 / 前进；预览聚焦时使用预览历史" },
     ] });
@@ -142,14 +188,14 @@ function rowHaystack(section: ShortcutSection, row: ShortcutRow): string {
 
 function RowKeys({ row }: { row: ShortcutRow }) {
   if (row.label) {
-    return <Kbd tone="subtle" className="h-5 px-1.5 text-[11.5px]">{row.label}</Kbd>;
+    return <Kbd tone="subtle" className="h-5 px-1.5 text-[12px]">{row.label}</Kbd>;
   }
   return (
     <span className="flex shrink-0 items-center gap-1">
       {(row.keys ?? []).map((binding, index) => (
         <React.Fragment key={binding}>
-          {index > 0 ? <span className="text-[11px] text-cx-fg-4">/</span> : null}
-          <Shortcut keys={binding} className="gap-[3px] [&>kbd]:h-5 [&>kbd]:min-w-5 [&>kbd]:text-[11px]" />
+          {index > 0 ? <span className="text-[12px] text-cx-fg-4">/</span> : null}
+          <Shortcut keys={binding} className="gap-[3px] [&>kbd]:h-5 [&>kbd]:min-w-5 [&>kbd]:text-[12px]" />
         </React.Fragment>
       ))}
     </span>
@@ -161,23 +207,57 @@ export interface ConversationShortcutsHelpProps {
   onClose: () => void;
 }
 
-export function ConversationShortcutsHelp({ open, onClose }: ConversationShortcutsHelpProps) {
-  const [query, setQuery] = useState("");
+/** The shortcut reference without dialog chrome, for hosts that show it as a page. */
+export function ConversationShortcutsList({ query = "", columns = 2 }: { query?: string; columns?: 1 | 2 }) {
   const { lang } = useLang();
   const en = lang === "en", native = Boolean(desktopChatBridge());
+  const bindings = useShortcutBindings();
+  const { sendKey } = useChatPreferences();
   const needle = query.trim().toLowerCase();
-
-  useEffect(() => {
-    if (open) setQuery("");
-  }, [open]);
-
   const sections = useMemo(() => {
-    const all = shortcutSections(native, en);
+    const all = shortcutSections(native, en, bindings, sendKey);
     if (!needle) return all;
     return all
       .map((section) => ({ ...section, rows: section.rows.filter((row) => rowHaystack(section, row).includes(needle)) }))
       .filter((section) => section.rows.length);
-  }, [needle, native, en]);
+  }, [needle, native, en, bindings, sendKey]);
+  if (!sections.length) {
+    return <EmptyState compact icon="search" title={en ? "No matching shortcuts" : "没有匹配的快捷键"} description={en ? `No actions match “${query.trim()}”.` : `未找到与 “${query.trim()}” 相关的操作。`} />;
+  }
+  return (
+    <div className={columns === 2 ? "grid grid-cols-1 gap-x-8 gap-y-5 sm:grid-cols-2" : "flex flex-col gap-6"}>
+      {sections.map((section) => (
+        <section key={section.title} aria-label={section.title} className={section.wide && columns === 2 ? "sm:col-span-2" : undefined}>
+          <h3 className="mb-1 text-[12px] font-semibold text-cx-fg-3">{section.title}</h3>
+          <dl className="flex flex-col">
+            {section.rows.map((row) => (
+              row.label ? (
+                <div key={row.label} className="flex items-start gap-3 border-b border-cx-border-subtle py-2 last:border-b-0">
+                  <dt className="w-[132px] shrink-0 pt-px"><RowKeys row={row} /></dt>
+                  <dd className="min-w-0 flex-1 text-[13px] leading-5 text-cx-fg-2">{row.description}</dd>
+                </div>
+              ) : (
+                <div key={`${row.description}-${(row.keys ?? []).join(",")}`} className="flex min-h-8 items-center justify-between gap-4 border-b border-cx-border-subtle py-1 last:border-b-0">
+                  <dt className="min-w-0 text-[13px] leading-5 text-cx-fg-2">{row.description}</dt>
+                  <dd className="shrink-0"><RowKeys row={row} /></dd>
+                </div>
+              )
+            ))}
+          </dl>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+export function ConversationShortcutsHelp({ open, onClose }: ConversationShortcutsHelpProps) {
+  const [query, setQuery] = useState("");
+  const { lang } = useLang();
+  const en = lang === "en";
+
+  useEffect(() => {
+    if (open) setQuery("");
+  }, [open]);
 
   return (
     <Dialog
@@ -199,42 +279,7 @@ export function ConversationShortcutsHelp({ open, onClose }: ConversationShortcu
           data-autofocus
           size="md"
         />
-        {sections.length ? (
-          <div className="grid grid-cols-1 gap-x-8 gap-y-5 sm:grid-cols-2">
-            {sections.map((section) => (
-              <section key={section.title} aria-label={section.title} className={section.wide ? "sm:col-span-2" : undefined}>
-                <h3 className="mb-1 text-[12px] font-semibold text-cx-fg-3">{section.title}</h3>
-                <dl className="flex flex-col">
-                  {section.rows.map((row) => (
-                    row.label ? (
-                      <div
-                        key={row.label}
-                        className="flex items-start gap-3 border-b border-cx-border-subtle py-2 last:border-b-0"
-                      >
-                        <dt className="w-[132px] shrink-0 pt-px">
-                          <RowKeys row={row} />
-                        </dt>
-                        <dd className="min-w-0 flex-1 text-[13px] leading-5 text-cx-fg-2">{row.description}</dd>
-                      </div>
-                    ) : (
-                      <div
-                        key={`${row.description}-${(row.keys ?? []).join(",")}`}
-                        className="flex min-h-8 items-center justify-between gap-4 border-b border-cx-border-subtle py-1 last:border-b-0"
-                      >
-                        <dt className="min-w-0 text-[13px] leading-5 text-cx-fg-2">{row.description}</dt>
-                        <dd className="shrink-0">
-                          <RowKeys row={row} />
-                        </dd>
-                      </div>
-                    )
-                  ))}
-                </dl>
-              </section>
-            ))}
-          </div>
-        ) : (
-          <EmptyState compact icon="search" title={en ? "No matching shortcuts" : "没有匹配的快捷键"} description={en ? `No actions match “${query.trim()}”.` : `未找到与 “${query.trim()}” 相关的操作。`} />
-        )}
+        <ConversationShortcutsList query={query} />
       </div>
     </Dialog>
   );

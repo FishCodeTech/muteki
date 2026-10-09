@@ -361,6 +361,12 @@ export const chatPanel = {
     chatPanel.open(threadId, { id: `preview:${randomId()}`, kind: "preview", url: url ?? null });
   },
 
+  /** Current panel state outside React (imperative callers such as provider browser requests). */
+  thread(threadId: string): ThreadPanelState {
+    hydrate();
+    return state.threads[threadId] ?? EMPTY_THREAD;
+  },
+
   updatePreview(threadId: string, surfaceId: string, patch: { url?: string | null; title?: string }) {
     updateThread(threadId, (current) => ({
       ...current,

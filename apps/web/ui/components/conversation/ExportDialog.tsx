@@ -144,14 +144,14 @@ export function ExportDialog({ open, onClose, view }: ExportDialogProps) {
         <dl className="grid grid-cols-4 overflow-hidden rounded-xl border border-cx-border-subtle bg-cx-bg-subtle">
           {counts.map(([label, value]) => (
             <div key={label} className="flex flex-col gap-0.5 border-r border-cx-border-subtle px-3 py-2.5 last:border-r-0">
-              <dt className="text-[11.5px] text-cx-fg-4">{label}</dt>
+              <dt className="text-[12px] text-cx-fg-4">{label}</dt>
               <dd className="cx-tabular truncate font-cx-mono text-[14px] font-semibold text-cx-fg">{value}</dd>
             </div>
           ))}
         </dl>
 
         <section className="flex flex-col gap-2">
-          <h3 className="text-[12.5px] font-semibold text-cx-fg-2">导出格式</h3>
+          <h3 className="text-[13px] font-semibold text-cx-fg-2">导出格式</h3>
           <div role="radiogroup" aria-label="导出格式" className="grid grid-cols-2 gap-2">
             {FORMATS.map((option) => {
               const selected = option.value === format;
@@ -190,9 +190,9 @@ export function ExportDialog({ open, onClose, view }: ExportDialogProps) {
                     >
                       <Icon name={option.icon} size={14} />
                     </span>
-                    <span className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-cx-fg">
+                    <span className="min-w-0 flex-1 truncate text-[14px] font-semibold text-cx-fg">
                       {option.label}
-                      <span className="ml-1.5 font-cx-mono text-[11.5px] font-normal text-cx-fg-4">{option.ext}</span>
+                      <span className="ml-1.5 font-cx-mono text-[12px] font-normal text-cx-fg-4">{option.ext}</span>
                     </span>
                     <span
                       aria-hidden
@@ -212,7 +212,7 @@ export function ExportDialog({ open, onClose, view }: ExportDialogProps) {
         </section>
 
         <section className="flex flex-col gap-3">
-          <h3 className="text-[12.5px] font-semibold text-cx-fg-2">脱敏选项</h3>
+          <h3 className="text-[13px] font-semibold text-cx-fg-2">脱敏选项</h3>
           <Checkbox
             checked={excludeTools}
             disabled={busy}

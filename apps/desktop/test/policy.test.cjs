@@ -60,3 +60,68 @@ test('validates encoded chat routes before they reach the renderer', () => {
     assert.throws(() => normalizeDesktopRoute(route), error => error.code === 'desktop.route_invalid');
   }
 });
+
+test('shared settings declarations are covered by desktop path and method policy', () => {
+  const registry = require('../../web/ui/components/settings/registry.json');
+  const { allowedApiPath, allowedApiRequest } = require('../src/transport.cjs');
+  assert.equal(registry.defaultPage, 'appearance');
+  for (const page of Object.values(registry.pages)) for (const operation of page.requiredApis) {
+    const paths = operation.match === 'prefix' ? [operation.path, operation.path + '/fixture'] : [operation.path];
+    for (const target of paths) {
+      assert.equal(allowedApiPath(target), true, target);
+      for (const method of operation.methods) assert.equal(allowedApiRequest(target, method), true, `${page.id}: ${method} ${target}`);
+    }
+  }
+  assert.equal(allowedApiRequest('/api/runs', 'GET'), true);
+  for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) assert.equal(allowedApiRequest('/api/runs', method), false);
+  for (const target of ['/api/runs/run-example', '/api/runs/run-example/control', '/api/runs-extra', '/api/domain-modules-extra', '/api/capability-management-extra']) {
+    for (const method of ['GET', 'POST', 'DELETE']) assert.equal(allowedApiRequest(target, method), false, `${method} ${target}`);
+  }
+});
+
+test('anchor targets are transient while path and query remain durable', () => {
+  const { desktopNavigationTarget } = require('../src/policy.cjs');
+  for (const route of ['/settings/agents?engine=codex#setting-usage-cursor-account', '/usage#limits', '/ctf#progress']) {
+    const { pathname, search, hash } = new URL(route, 'muteki-desktop://app');
+    assert.deepEqual(desktopNavigationTarget(route), {route: pathname + search, hash});
+    assert.equal(normalizeDesktopRoute(route), pathname + search);
+  }
+  assert.throws(() => desktopNavigationTarget('https://other.example/settings/agents#setting-agents-models'));
+});
+
+test('preflight does not authorize a runs mutation', async () => {
+  const { forwardService } = require('../src/transport.cjs');
+  const scope = {origin: 'http://127.0.0.1:18193', host: 'service-policy', requests: new Set(), closed: false};
+  const preflight = method => forwardService(new Request('muteki-desktop://service-policy/api/runs', {
+    method: 'OPTIONS', headers: {'Access-Control-Request-Method': method},
+  }), scope, () => {});
+  const read = await preflight('GET');
+  assert.equal(read.status, 204);
+  assert.equal(read.headers.get('Access-Control-Allow-Methods'), 'GET');
+  assert.equal((await preflight('DELETE')).status, 403);
+});
+
+test('desktop environment identity persists and runtime inheritance is explicit', () => {
+  const { desktopEnvironment, serviceEnvironment } = require('../src/environment.cjs');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'muteki-environment-'));
+  try {
+    const options = {appData: root, root: path.join(root, 'stable'), packaged: true, channel: 'stable'};
+    const first = desktopEnvironment(options), second = desktopEnvironment(options);
+    assert.equal(first.id, second.id);
+    assert.notEqual(first.generation, second.generation);
+    assert.throws(() => desktopEnvironment({...options, channel: 'candidate'}));
+    const env = serviceEnvironment(first, {PYTHONPATH: '/checkout', NODE_OPTIONS: '--inspect', MUTEKI_STATE_ROOT: '/wrong', OPENAI_API_KEY: 'fixture', LANG: 'en_US.UTF-8'});
+    for (const name of ['PYTHONPATH', 'NODE_OPTIONS', 'OPENAI_API_KEY']) assert.equal(env[name], undefined);
+    assert.equal(env.MUTEKI_STATE_ROOT, first.paths.state);
+    assert.equal(env.MUTEKI_HOST_DISCOVERY, '0');
+    assert.equal(env.HOME, first.paths.home);
+    assert.equal(env.LANG, 'en_US.UTF-8');
+  } finally { fs.rmSync(root, {recursive: true, force: true}); }
+});
+
+test('managed partitions follow environment identity across port changes', () => {
+  const { partitionFor } = require('../src/policy.cjs');
+  assert.equal(partitionFor('http://127.0.0.1:41001', 'stable-id'), partitionFor('http://127.0.0.1:42001', 'stable-id'));
+  assert.notEqual(partitionFor('http://127.0.0.1:41001', 'stable-id'), partitionFor('http://127.0.0.1:41001', 'dev-id'));
+  assert.notEqual(partitionFor('http://127.0.0.1:41001'), partitionFor('http://127.0.0.1:42001'));
+});

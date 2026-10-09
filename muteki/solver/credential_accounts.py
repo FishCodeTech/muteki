@@ -12,7 +12,9 @@ but the persistent path is account-scoped instead of mounting a host home dir.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import tempfile
 from contextlib import contextmanager
 import os
@@ -22,8 +24,15 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional, Iterable
+from typing import Any, Callable, Mapping, Optional, Iterable
 
+from muteki.external_agents.descriptors import (
+    CredentialEnvResolver,
+    LoginStatusProbe,
+    all_descriptors,
+    find_descriptor,
+    get_descriptor,
+)
 from muteki.solver.engine_registry import (
     KNOWN_ENGINE_IDS,
     SUPPORTED_ENGINE_IDS,
@@ -31,7 +40,15 @@ from muteki.solver.engine_registry import (
     canonical_engine_id,
 )
 
+_LOG = logging.getLogger(__name__)
 _ACCOUNT_WRITE_LOCK = threading.RLock()
+# Protected by the RLock: nesting belongs to the lock path, not a Store instance.
+_ACCOUNT_GUARD_DEPTHS: dict[str, int] = {}
+_ACCOUNT_LOCK_TIMEOUT_SECONDS = 5.0
+
+
+class CredentialAccountLockTimeoutError(TimeoutError):
+    code = "credential.account.lock_timeout"
 
 
 def host_discovery_enabled(env: Mapping[str, str] | None = None) -> bool:
@@ -55,6 +72,13 @@ KNOWN_CREDENTIAL_ENGINES = KNOWN_ENGINE_IDS
 SUPPORTED_CREDENTIAL_ENGINES = SUPPORTED_ENGINE_IDS
 ACCOUNT_CREDENTIAL_PREFIX = "account:"
 SYSTEM_CREDENTIAL_PREFIX = "system:"
+# Engines whose minimal host login can be copied into a stored account by
+# ``import_host_login``. Codex has its own ``import_host_codex_auth`` flow.
+HOST_LOGIN_IMPORT_ENGINES: tuple[str, ...] = tuple(
+    descriptor.engine for descriptor in all_descriptors()
+    if descriptor.login.host_login_import
+    in {"claude_settings_env", "kimi_home_copy", "grok_home_copy"}
+)
 
 # Pi 的 OpenAI-compatible provider 使用受管会话自己的显式请求策略。
 # 该配置写入 PI_CODING_AGENT_DIR，不依赖宿主 Pi 的全局设置，也不影响
@@ -78,43 +102,9 @@ _OFFICIAL_BASE_URLS: dict[str, str] = {}
 # ``system:<engine>`` deliberately skips this reset so its host login remains
 # available.
 _CREDENTIAL_ENV_KEYS: dict[str, tuple[str, ...]] = {
-    "claude": (
-        "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN_FILE",
-        "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_FILE",
-        "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN_FILE",
-        "ANTHROPIC_BASE_URL",
-    ),
-    "codex": (
-        "OPENAI_API_KEY", "OPENAI_API_KEY_FILE", "OPENAI_BASE_URL",
-        "CODEX_HOME",
-    ),
-    "cursor": (
-        "CURSOR_API_KEY", "CURSOR_API_KEY_FILE", "CURSOR_AUTH_TOKEN",
-        "CURSOR_AUTH_TOKEN_FILE", "CURSOR_ENDPOINT",
-    ),
-    "pi": (
-        "OPENAI_API_KEY", "OPENAI_API_KEY_FILE", "OPENAI_BASE_URL",
-        "PI_CODING_AGENT_DIR", "MUTEKI_PI_PROVIDER", "MUTEKI_PI_MODEL",
-    ),
-    "omp": (
-        "OPENAI_API_KEY", "OPENAI_API_KEY_FILE", "OPENAI_BASE_URL",
-        "PI_CODING_AGENT_DIR", "MUTEKI_OMP_PROVIDER", "MUTEKI_OMP_MODEL",
-    ),
-    "kimi": (
-        "KIMI_MODEL_API_KEY", "KIMI_MODEL_API_KEY_FILE",
-        "KIMI_MODEL_BASE_URL", "KIMI_MODEL_NAME",
-        "KIMI_MODEL_PROVIDER_TYPE", "KIMI_MODEL_MAX_CONTEXT_SIZE",
-        "KIMI_MODEL_MAX_OUTPUT_SIZE", "KIMI_CODE_HOME",
-    ),
-    "grok": (
-        "XAI_API_KEY", "XAI_API_KEY_FILE", "GROK_MODELS_BASE_URL",
-        "GROK_HOME",
-    ),
-    "opencode": (
-        "OPENAI_API_KEY", "OPENAI_API_KEY_FILE", "OPENAI_BASE_URL",
-        "OPENCODE_API_KEY", "OPENCODE_API_KEY_FILE",
-        "OPENCODE_CONFIG_CONTENT", "MUTEKI_OPENCODE_PROVIDER",
-    ),
+    descriptor.engine: descriptor.credentials.env_keys
+    for descriptor in all_descriptors()
+    if descriptor.credentials.env_keys
 }
 
 
@@ -244,25 +234,97 @@ class CredentialAccountStore:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
-        self._guard_depth = 0
+        self._shared_conflicts: set[str] = set()
         self._recover_staged_updates()
+        self._sync_shared_credentials()
         try:
             self.root.chmod(0o700)
         except OSError:
             pass
 
+    def _shared_store(self):
+        shared = os.environ.get("MUTEKI_SHARED_CREDENTIALS_ROOT")
+        state = os.environ.get("MUTEKI_STATE_ROOT")
+        if not shared or not state or self.root.resolve() != account_store_root(state).resolve():
+            return None
+        from muteki.solver.shared_credentials import SharedCredentialStore
+        return SharedCredentialStore(shared)
+
+    def _sync_shared_credentials(self) -> None:
+        vault = self._shared_store()
+        if vault is None:
+            return
+        from muteki.solver.shared_credentials import FILES, MARKER
+        snapshot = vault.read()["accounts"]
+        with self._account_guard():
+            if _ACCOUNT_GUARD_DEPTHS[str(self._account_lock_path())] > 1:
+                # A nested reader must not project credentials into a live deletion.
+                return
+            for account_id, record in snapshot.items():
+                if not valid_account_id(account_id):
+                    raise ValueError("credential.shared.account_id_invalid")
+                # The owner keeps its existing private account and model settings.
+                if record["owner"] == os.environ.get("MUTEKI_ENVIRONMENT_ID"):
+                    continue
+                base = self.root / account_id
+                marker = base / MARKER
+                if base.exists() and not marker.exists():
+                    self._shared_conflicts.add(account_id)
+                    continue
+                if marker.exists() and json.loads(marker.read_text())["revision"] == record["revision"]:
+                    continue
+                def project(staged, account_id=account_id, record=record):
+                    target = staged.root / account_id
+                    target.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    for name in FILES:
+                        file = target / name
+                        if name in record["files"]:
+                            staged._atomic_write(file, record["files"][name])
+                        else:
+                            file.unlink(missing_ok=True)
+                    staged._atomic_write(target / MARKER, json.dumps({"revision": record["revision"], "owner": record["owner"]}))
+                self._stage_account_update(account_id, project, shared_projection=True)
+            for marker in self.root.glob(f"*/{MARKER}"):
+                if marker.parent.name not in snapshot:
+                    # Revocation removes only credential material. Native history,
+                    # model choices and other environment data are retained.
+                    for name in FILES:
+                        (marker.parent / name).unlink(missing_ok=True)
+                    self._atomic_write(marker, json.dumps({"revision": "revoked"}))
+
+    def _publish_shared_credential(self, account_id: str) -> None:
+        vault = self._shared_store()
+        if vault is None or os.environ.get("MUTEKI_ENVIRONMENT_CHANNEL") != "stable":
+            return
+        from muteki.solver.shared_credentials import FILES
+        base = self.root / account_id
+        account = self.inspect(account_id)
+        files = {name: (base / name).read_text() for name in FILES if (base / name).is_file()} if account and account.mode in {"api_key", "custom_endpoint"} else None
+        vault.publish(account_id, files, os.environ["MUTEKI_ENVIRONMENT_ID"])
+
+    def _assert_local_credential(self, account_id: str) -> None:
+        from muteki.solver.shared_credentials import MARKER
+        if (self.root / account_id / MARKER).exists():
+            raise ValueError("共享凭据由日常版管理；模型选择保存在当前环境，请在日常版修改或删除认证材料。")
+
+    def _account_lock_path(self) -> Path:
+        root = self.root.resolve()
+        return root.parent / f".{root.name}.lock"
+
     @contextmanager
     def _account_guard(self):
-        """Serialize writers and recovery across threads and service processes."""
+        """Serialize processes and allow same-thread nesting across Store instances."""
+        lock_path = self._account_lock_path()
+        lock_key = str(lock_path)
         with _ACCOUNT_WRITE_LOCK:
-            if self._guard_depth:
-                self._guard_depth += 1
+            depth = _ACCOUNT_GUARD_DEPTHS.get(lock_key, 0)
+            if depth:
+                _ACCOUNT_GUARD_DEPTHS[lock_key] = depth + 1
                 try:
                     yield
                 finally:
-                    self._guard_depth -= 1
+                    _ACCOUNT_GUARD_DEPTHS[lock_key] = depth
                 return
-            lock_path = self.root.parent / f".{self.root.name}.lock"
             with lock_path.open("a+b") as handle:
                 if os.name == "nt":
                     import msvcrt
@@ -272,12 +334,21 @@ class CredentialAccountStore:
                     msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
                 else:
                     import fcntl
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-                self._guard_depth = 1
+                    deadline = time.monotonic() + _ACCOUNT_LOCK_TIMEOUT_SECONDS
+                    while True:
+                        try:
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError as exc:
+                            if time.monotonic() >= deadline:
+                                raise CredentialAccountLockTimeoutError(
+                                    "credential.account.lock_timeout") from exc
+                            time.sleep(0.05)
+                _ACCOUNT_GUARD_DEPTHS[lock_key] = 1
                 try:
                     yield
                 finally:
-                    self._guard_depth = 0
+                    del _ACCOUNT_GUARD_DEPTHS[lock_key]
                     if os.name == "nt":
                         handle.seek(0); msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
                     else:
@@ -285,6 +356,9 @@ class CredentialAccountStore:
 
     def _recover_staged_updates(self) -> None:
         with self._account_guard():
+            if _ACCOUNT_GUARD_DEPTHS[str(self._account_lock_path())] > 1:
+                # A live outer transaction owns its journal; it is not a crash.
+                return
             for staging_root in self.root.parent.glob(".credential-stage-*"):
                 journal = staging_root / "transaction.json"
                 if not journal.is_file():
@@ -387,8 +461,10 @@ class CredentialAccountStore:
         return dict(max(rows, key=lambda row: float(row.get("tested_at") or 0))) if rows else None
 
     def invalidate_test_status(self, credential_id: str) -> None:
+        """Called after every committed credential change."""
         with _ACCOUNT_WRITE_LOCK:
             self._invalidate_test_status(credential_id)
+        _invalidate_runtime_probes()
 
     def _invalidate_test_status(self, credential_id: str) -> None:
         """Remove stale model evidence after credential metadata changes."""
@@ -526,6 +602,7 @@ class CredentialAccountStore:
                 "default_model": default_model,
                 "model_catalog": catalog,
                 "usage": account_usage,
+                **({"sharing": account["sharing"]} if account.get("sharing") else {}),
             }
             if unavailable_detail:
                 row["status_detail"] = unavailable_detail
@@ -551,10 +628,9 @@ class CredentialAccountStore:
             system_usage = list(usage.get(stable_id) or [])
             catalog = dict(catalogs.get(stable_id) or {})
             candidate_models = catalog_models(stable_id)
-            if engine == "devin" and present:
-                from muteki.external_agents.devin import devin_model_ids
-
-                candidate_models = devin_model_ids()
+            # Catalog discovery belongs to explicit refresh/probe operations.
+            # Listing credentials only projects the saved catalog, including
+            # its last error, so one provider cannot block the global list.
             verified_model = str(
                 (last_test or {}).get("model") or "").strip()
             models = [
@@ -707,15 +783,41 @@ class CredentialAccountStore:
     def upsert_secret(self, *, account_id: str, engine: str,
                       create_only: bool = False, expected_revision: str | None = None,
                       **fields: Any) -> dict[str, Any]:
-        return self._stage_account_update(account_id,
+        if not valid_account_id(account_id):
+            raise ValueError("invalid account id")
+        from muteki.solver.shared_credentials import MARKER
+        if (self.root / account_id / MARKER).exists():
+            base = self.root / account_id
+            if create_only or fields.get("secret") or fields.get("codex_auth_json") or (fields.get("base_url") or "") != self._read_base_url(base) or (fields.get("provider") or "") != self._read_provider(base):
+                self._assert_local_credential(account_id)
+            def save_local_models(staged):
+                target = staged.root / account_id
+                if fields.get("models") is not None:
+                    models = fields["models"]
+                    if not isinstance(models, list) or not all(isinstance(model, str) for model in models):
+                        raise ValueError("models must be a list of strings")
+                    staged._atomic_write(target / "MODELS.json", json.dumps(models))
+                if fields.get("target_model") is not None:
+                    staged._atomic_write(target / "DEFAULT_MODEL", str(fields["target_model"]).strip())
+            return self._stage_account_update(account_id, save_local_models, expected_revision=expected_revision, shared_projection=True)
+        self._assert_local_credential(account_id)
+        result = self._stage_account_update(account_id,
             lambda staged: staged._write_secret(account_id=account_id, engine=engine, **fields),
             create_only=create_only, expected_revision=expected_revision)
+        try:
+            self._publish_shared_credential(account_id)
+        except (OSError, ValueError) as exc:
+            from muteki.solver.shared_credentials import SharedCredentialError
+            raise SharedCredentialError(f"本环境凭据已保存，但共享同步未完成，请重试保存：{exc}") from exc
+        return result
 
     def _stage_account_update(self, account_id: str, writer: Any, *,
-                              create_only: bool = False, expected_revision: str | None = None) -> dict[str, Any]:
+                              create_only: bool = False, expected_revision: str | None = None, shared_projection: bool = False) -> dict[str, Any]:
         """Stage the complete replacement before touching a working account."""
         if not valid_account_id(account_id):
             raise ValueError("invalid account id")
+        if not shared_projection:
+            self._assert_local_credential(account_id)
         with self._account_guard():
             live = self.root / account_id
             if create_only and live.exists():
@@ -858,19 +960,20 @@ class CredentialAccountStore:
             self.invalidate_test_status(account_credential_id(account_id))
             return self._public(refreshed)
 
-        if engine == "claude":
+        layout = "API_KEY" if engine == "api" else get_descriptor(engine).credentials.secret_file
+        if layout == "CLAUDE_CODE_OAUTH_TOKEN":
             value = str(secret or "").strip() or prior.get("CLAUDE_CODE_OAUTH_TOKEN", "")
             if not value:
                 raise ValueError("CLAUDE_CODE_OAUTH_TOKEN is required")
             base = self._replace_account(account_id)
             self._atomic_write(base / "CLAUDE_CODE_OAUTH_TOKEN", value + "\n")
-        elif engine == "cursor":
+        elif layout == "CURSOR_API_KEY":
             value = str(secret or "").strip() or prior.get("CURSOR_API_KEY", "")
             if not value:
                 raise ValueError("CURSOR_API_KEY is required")
             base = self._replace_account(account_id)
             self._atomic_write(base / "CURSOR_API_KEY", value + "\n")
-        elif engine in {"api", "pi", "omp", "kimi", "grok", "opencode"}:
+        elif layout == "API_KEY":
             value = str(secret or "").strip() or prior.get("API_KEY", "")
             if not value:
                 raise ValueError("API_KEY is required")
@@ -904,7 +1007,7 @@ class CredentialAccountStore:
             provider_name = str(provider or "").strip() or prior.get("PROVIDER", "")
             if provider_name:
                 self._atomic_write(base / "PROVIDER", provider_name + "\n")
-        else:
+        elif layout == "CODEX_AUTH_HOME":
             value = str(codex_auth_json or secret or "").strip() or prior.get("codex_auth_json", "")
             if not value:
                 raise ValueError("codex auth.json content is required")
@@ -915,6 +1018,10 @@ class CredentialAccountStore:
             codex_home.mkdir(parents=True, exist_ok=True)
             self._chmod_private_dir(codex_home)
             self._atomic_write(codex_home / "auth.json", value + "\n")
+        else:
+            raise ValueError(
+                f"{engine} has no stored official credential; use its host CLI "
+                "login or a custom endpoint")
 
         if requested_models:
             self._atomic_write(
@@ -988,14 +1095,16 @@ class CredentialAccountStore:
         return self._stage_account_update(account_id, lambda staged: staged._write_host_login(account_id, engine))
 
     def _write_host_login(self, account_id: str, engine: str) -> dict[str, Any]:
-        """Import the minimal host login state used by Claude, Kimi, or Grok."""
+        """Import the minimal host login state declared by the engine descriptor."""
         engine = str(engine or "").strip().lower()
-        if engine not in {"claude", "kimi", "grok"}:
-            raise ValueError("host login import supports claude, kimi, or grok")
+        if engine not in HOST_LOGIN_IMPORT_ENGINES:
+            raise ValueError(
+                "host login import supports " + ", ".join(HOST_LOGIN_IMPORT_ENGINES))
         if not valid_account_id(account_id):
             raise ValueError("account_id must be 1-64 chars: letters, digits, _, ., -")
+        kind = get_descriptor(engine).login.host_login_import
 
-        if engine == "claude":
+        if kind == "claude_settings_env":
             import json
 
             settings_path = Path.home() / ".claude" / "settings.json"
@@ -1038,7 +1147,7 @@ class CredentialAccountStore:
                 account["suggested_model"] = suggested_model
             return account
 
-        if engine == "kimi":
+        if kind == "kimi_home_copy":
             source_root = Path.home() / ".kimi-code"
             required = source_root / "credentials" / "kimi-code.json"
             if not required.exists():
@@ -1096,6 +1205,7 @@ class CredentialAccountStore:
         """Delete material first and retain a private rollback copy until references commit."""
         if not valid_account_id(account_id):
             raise ValueError("invalid account id")
+        self._assert_local_credential(account_id)
         with self._account_guard():
             live = self.root / account_id
             if not live.exists():
@@ -1110,6 +1220,7 @@ class CredentialAccountStore:
                 self._atomic_write(journal, json.dumps(transaction))
                 live.rename(backup)
                 yield
+                self._publish_shared_credential(account_id)
                 transaction["phase"] = "committed"
                 self._atomic_write(journal, json.dumps(transaction))
                 committed = True
@@ -1122,14 +1233,17 @@ class CredentialAccountStore:
             finally:
                 if committed or not backup.exists():
                     shutil.rmtree(backup_root, ignore_errors=True)
+            _invalidate_runtime_probes()
 
     def delete(self, account_id: str) -> bool:
         if not valid_account_id(account_id):
             return False
+        self._assert_local_credential(account_id)
         base = self.root / account_id
         if not base.exists():
             return False
-        shutil.rmtree(base)
+        with self.deletion_transaction(account_id):
+            pass
         return True
 
     def delete_engine_accounts(self, engine: str) -> list[str]:
@@ -1184,6 +1298,15 @@ class CredentialAccountStore:
 
     def _public(self, acct: CredentialAccount) -> dict[str, Any]:
         details = dict(acct.details or {})
+        from muteki.solver.shared_credentials import MARKER
+        readonly = (self.root / acct.account_id / MARKER).exists()
+        shared_mode = self._shared_store() is not None
+        shared = readonly or (shared_mode and os.environ.get("MUTEKI_ENVIRONMENT_CHANNEL") == "stable" and acct.mode in {"api_key", "custom_endpoint"})
+        sharing = ({"scope": "shared" if shared else "environment", "readonly": readonly,
+                    "reason": "认证材料由日常版管理，模型设置仅保存在当前环境。" if readonly else
+                    "认证材料与开发环境共享，模型与运行记录保持隔离。" if shared else
+                    "当前环境存在同名私有凭据，未覆盖为共享凭据。" if acct.account_id in self._shared_conflicts else
+                    "此认证方式尚未验证跨环境共享，认证材料仅保存在当前环境。"} if shared_mode else None)
         # inspect() retains this value for local runtime injection. Public account
         # metadata only needs presence and format, so never send the stored secret
         # back to the browser.
@@ -1191,10 +1314,7 @@ class CredentialAccountStore:
         base_url = str(details.get("base_url_value") or "").strip()
         target_engine = str(details.get("target_engine") or "").strip().lower()
         worker_engine = target_engine or (
-            acct.engine if acct.engine in {
-                "claude", "codex", "cursor", "pi", "omp", "kimi", "grok",
-                "opencode", "devin", "dsh"
-            } else ""
+            acct.engine if acct.engine in KNOWN_CREDENTIAL_ENGINES else ""
         )
         connection = (
             "custom_endpoint"
@@ -1224,6 +1344,7 @@ class CredentialAccountStore:
             "writable_state": acct.writable_state,
             "updated_at": acct.updated_at,
             "details": details,
+            **({"sharing": sharing} if sharing else {}),
         }
 
     @staticmethod
@@ -1236,10 +1357,7 @@ class CredentialAccountStore:
             marker = mp.read_text(encoding="utf-8").strip().lower()
         except OSError:
             return ""
-        return marker if marker in {
-            "claude", "codex", "cursor", "pi", "omp", "kimi", "grok",
-            "opencode", "devin", "dsh"
-        } else ""
+        return marker if marker in KNOWN_CREDENTIAL_ENGINES else ""
 
     @staticmethod
     def _read_base_url(base: Path) -> str:
@@ -1393,6 +1511,457 @@ class CredentialAccountStore:
                 shutil.rmtree(agent_dir, ignore_errors=True)
 
 
+def _claude_credential_env(
+    out: dict[str, str],
+    *,
+    engine: str,
+    base: Optional[Path],
+    account_id: str,
+    container: bool,
+    source: Mapping[str, str],
+    model: str | None,
+    agent_state_dir: str | Path | None,
+    agent_state_container_path: str | None,
+) -> None:
+    if base is not None and (base / "API_KEY").exists():
+        _add_secret_file_or_env(
+            out,
+            base=base,
+            filename="API_KEY",
+            env_name="ANTHROPIC_API_KEY",
+            container=container,
+            container_path=_container_secret_path(account_id, "API_KEY"),
+            source=source,
+        )
+        _add_secret_file_or_env(
+            out,
+            base=base,
+            filename="API_KEY",
+            env_name="ANTHROPIC_AUTH_TOKEN",
+            container=container,
+            container_path=_container_secret_path(account_id, "API_KEY"),
+            source=source,
+        )
+        _add_base_url(out, base=base, env_name="ANTHROPIC_BASE_URL")
+    else:
+        _add_secret_file_or_env(
+            out,
+            base=base,
+            filename="CLAUDE_CODE_OAUTH_TOKEN",
+            env_name="CLAUDE_CODE_OAUTH_TOKEN",
+            container=container,
+            container_path=_container_secret_path(account_id, "CLAUDE_CODE_OAUTH_TOKEN"),
+            source=source,
+        )
+
+
+def _codex_credential_env(
+    out: dict[str, str],
+    *,
+    engine: str,
+    base: Optional[Path],
+    account_id: str,
+    container: bool,
+    source: Mapping[str, str],
+    model: str | None,
+    agent_state_dir: str | Path | None,
+    agent_state_container_path: str | None,
+) -> None:
+    if base is not None and (base / "API_KEY").exists():
+        _add_secret_file_or_env(
+            out,
+            base=base,
+            filename="API_KEY",
+            env_name="OPENAI_API_KEY",
+            container=container,
+            container_path=_container_secret_path(account_id, "API_KEY"),
+            source=source,
+        )
+        _add_base_url(out, base=base, env_name="OPENAI_BASE_URL")
+    codex_home = base / "codex-home" if base is not None else None
+    if "OPENAI_API_KEY" not in out and "OPENAI_API_KEY_FILE" not in out and codex_home is not None and codex_home.exists():
+        out["CODEX_HOME"] = (
+            f"{CONTAINER_ACCOUNTS_ROOT}/{account_id}/codex-home"
+            if container else str(codex_home.resolve())
+        )
+    elif source.get("CODEX_HOME"):
+        out["CODEX_HOME"] = str(source["CODEX_HOME"])
+
+
+def _cursor_credential_env(
+    out: dict[str, str],
+    *,
+    engine: str,
+    base: Optional[Path],
+    account_id: str,
+    container: bool,
+    source: Mapping[str, str],
+    model: str | None,
+    agent_state_dir: str | Path | None,
+    agent_state_container_path: str | None,
+) -> None:
+    if base is not None and (base / "API_KEY").exists():
+        _add_secret_file_or_env(
+            out,
+            base=base,
+            filename="API_KEY",
+            env_name="CURSOR_API_KEY",
+            container=container,
+            container_path=_container_secret_path(account_id, "API_KEY"),
+            source=source,
+        )
+        _add_base_url(out, base=base, env_name="CURSOR_ENDPOINT")
+    else:
+        _add_secret_file_or_env(
+            out,
+            base=base,
+            filename="CURSOR_API_KEY",
+            env_name="CURSOR_API_KEY",
+            container=container,
+            container_path=_container_secret_path(account_id, "CURSOR_API_KEY"),
+            source=source,
+        )
+
+
+def _kimi_credential_env(
+    out: dict[str, str],
+    *,
+    engine: str,
+    base: Optional[Path],
+    account_id: str,
+    container: bool,
+    source: Mapping[str, str],
+    model: str | None,
+    agent_state_dir: str | Path | None,
+    agent_state_container_path: str | None,
+) -> None:
+    has_key = base is not None and (base / "API_KEY").exists()
+    if has_key:
+        _add_secret_file_or_env(
+            out,
+            base=base,
+            filename="API_KEY",
+            env_name="KIMI_MODEL_API_KEY",
+            container=container,
+            container_path=_container_secret_path(account_id, "API_KEY"),
+            source=source,
+        )
+        _add_base_url(out, base=base, env_name="KIMI_MODEL_BASE_URL")
+        selected_model = str(
+            model or source.get("KIMI_MODEL_NAME") or "kimi-for-coding"
+        ).strip()
+        # OAuth profiles use configured aliases such as
+        # ``kimi-code/kimi-for-coding``. KIMI_MODEL_NAME is the literal model
+        # id sent to the API, so remove only the built-in alias namespace.
+        out["KIMI_MODEL_NAME"] = selected_model.removeprefix("kimi-code/")
+        base_url = CredentialAccountStore._read_base_url(base)
+        provider_type = str(
+            source.get("KIMI_MODEL_PROVIDER_TYPE")
+            or ("openai" if base_url else "kimi")
+        )
+        out["KIMI_MODEL_PROVIDER_TYPE"] = provider_type
+        if provider_type == "openai":
+            # Kimi Code synthesizes custom OpenAI-compatible models with a
+            # 256K context window unless told otherwise.  Its derived output
+            # request can then exceed the 64K completion ceiling used by
+            # common DeepSeek endpoints.  The documented runtime override
+            # keeps custom providers at the conventional 128K window while
+            # still allowing an explicit deployment value to win.
+            out["KIMI_MODEL_MAX_CONTEXT_SIZE"] = str(
+                source.get("KIMI_MODEL_MAX_CONTEXT_SIZE") or 131072
+            )
+            out["KIMI_MODEL_MAX_OUTPUT_SIZE"] = str(
+                source.get("KIMI_MODEL_MAX_OUTPUT_SIZE") or 65536
+            )
+    kimi_home = base / "kimi-home" if base is not None else None
+    if not has_key and kimi_home is not None and kimi_home.exists():
+        out["KIMI_CODE_HOME"] = (
+            f"{CONTAINER_ACCOUNTS_ROOT}/{account_id}/kimi-home"
+            if container else str(kimi_home.resolve())
+        )
+    elif not has_key and source.get("KIMI_CODE_HOME"):
+        out["KIMI_CODE_HOME"] = str(source["KIMI_CODE_HOME"])
+
+
+def _grok_credential_env(
+    out: dict[str, str],
+    *,
+    engine: str,
+    base: Optional[Path],
+    account_id: str,
+    container: bool,
+    source: Mapping[str, str],
+    model: str | None,
+    agent_state_dir: str | Path | None,
+    agent_state_container_path: str | None,
+) -> None:
+    has_key = base is not None and (base / "API_KEY").exists()
+    if has_key:
+        _add_secret_file_or_env(
+            out,
+            base=base,
+            filename="API_KEY",
+            env_name="XAI_API_KEY",
+            container=container,
+            container_path=_container_secret_path(account_id, "API_KEY"),
+            source=source,
+        )
+        _add_base_url(out, base=base, env_name="GROK_MODELS_BASE_URL")
+    grok_home = base / "grok-home" if base is not None else None
+    if not has_key and grok_home is not None and grok_home.exists():
+        out["GROK_HOME"] = (
+            f"{CONTAINER_ACCOUNTS_ROOT}/{account_id}/grok-home"
+            if container else str(grok_home.resolve())
+        )
+    elif not has_key and source.get("GROK_HOME"):
+        out["GROK_HOME"] = str(source["GROK_HOME"])
+
+
+def _opencode_credential_env(
+    out: dict[str, str],
+    *,
+    engine: str,
+    base: Optional[Path],
+    account_id: str,
+    container: bool,
+    source: Mapping[str, str],
+    model: str | None,
+    agent_state_dir: str | Path | None,
+    agent_state_container_path: str | None,
+) -> None:
+    has_key = base is not None and (base / "API_KEY").exists()
+    if has_key:
+        _add_secret_file_or_env(
+            out,
+            base=base,
+            filename="API_KEY",
+            env_name="OPENAI_API_KEY",
+            container=container,
+            container_path=_container_secret_path(account_id, "API_KEY"),
+            source=source,
+        )
+        _add_secret_file_or_env(
+            out,
+            base=base,
+            filename="API_KEY",
+            env_name="OPENCODE_API_KEY",
+            container=container,
+            container_path=_container_secret_path(account_id, "API_KEY"),
+            source=source,
+        )
+        _add_base_url(out, base=base, env_name="OPENAI_BASE_URL")
+        base_url = CredentialAccountStore._read_base_url(base)
+        selected_model = str(model or "").strip()
+        # 候选目录只供显式模型测试。运行时配置只包含本轮已经由调用方
+        # 校验并选择的模型，避免手写坏 ID 被注入 OpenCode provider。
+        configured_models = [selected_model] if selected_model else []
+        if base_url and configured_models:
+            # OpenCode requires custom OpenAI-compatible endpoints to be
+            # declared as a provider with explicit models.  The inline
+            # config contains only public endpoint/model metadata; the API
+            # key is resolved by OpenCode from the subprocess environment.
+            provider_id = "muteki"
+            provider_name = (
+                CredentialAccountStore._read_provider(base)
+                or "Muteki 凭据中心"
+            )
+            out["OPENCODE_CONFIG_CONTENT"] = json.dumps({
+                "$schema": "https://opencode.ai/config.json",
+                "provider": {
+                    provider_id: {
+                        "npm": "@ai-sdk/openai-compatible",
+                        "name": provider_name,
+                        "options": {
+                            "baseURL": base_url,
+                            "apiKey": "{env:OPENCODE_API_KEY}",
+                        },
+                        "models": {
+                            model_id: {"name": model_id}
+                            for model_id in configured_models
+                        },
+                    },
+                },
+            }, ensure_ascii=False, separators=(",", ":"))
+            # The selected credential owns the provider namespace.  Model
+            # ids may themselves contain '/', so the adapter must not split
+            # them as OpenCode's provider/model shorthand.
+            out["MUTEKI_OPENCODE_PROVIDER"] = provider_id
+    elif source.get("OPENCODE_API_KEY"):
+        out["OPENCODE_API_KEY"] = str(source["OPENCODE_API_KEY"])
+    if agent_state_dir is not None:
+        state_root = Path(agent_state_dir).expanduser().resolve()
+        for dirname in ("data", "config", "cache"):
+            (state_root / dirname).mkdir(parents=True, exist_ok=True)
+        runtime_root = (
+            str(agent_state_container_path)
+            if container and agent_state_container_path else str(state_root)
+        )
+        out.update({
+            "XDG_DATA_HOME": f"{runtime_root}/data",
+            "XDG_CONFIG_HOME": f"{runtime_root}/config",
+            "XDG_CACHE_HOME": f"{runtime_root}/cache",
+        })
+
+
+def _pi_like_credential_env(
+    out: dict[str, str],
+    *,
+    engine: str,
+    base: Optional[Path],
+    account_id: str,
+    container: bool,
+    source: Mapping[str, str],
+    model: str | None,
+    agent_state_dir: str | Path | None,
+    agent_state_container_path: str | None,
+    pi_models_json: bool,
+    model_input: list[str] | None = None,
+) -> None:
+    # pi/omp reach a custom OpenAI-compatible provider through a generated
+    # provider config in their agent config dir (pi: models.json; omp:
+    # models.yml — hand-written YAML, no pyyaml dependency), selected via
+    # PI_CODING_AGENT_DIR (both CLIs honor it). The account's API_KEY is
+    # embedded in that file, so the dir is projected as a WRITABLE state dir
+    # (same posture as codex-home). Pi 的 provider 配置已经包含凭据，
+    # 因而不把 OPENAI_API_KEY 传给 Pi 进程及其 shell 子进程；OMP 仍需
+    # 原生环境变量兼容其端点选择。
+    agent_dirname = f"{engine}-agent"
+    prefix = get_descriptor(engine).cli.provider_env_prefix
+    provider_env = f"{prefix}_PROVIDER"
+    model_env = f"{prefix}_MODEL"
+    has_key = base is not None and (base / "API_KEY").exists()
+    base_url = CredentialAccountStore._read_base_url(base) if has_key else ""
+    if has_key and base_url:
+        try:
+            api_key = (base / "API_KEY").read_text(encoding="utf-8").strip()
+        except OSError:
+            api_key = ""
+        selected_model = str(model or "").strip()
+        model_file = base / "MODEL"
+        if not selected_model and model_file.exists():
+            try:
+                selected_model = model_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                selected_model = ""
+        if not selected_model:
+            raise ValueError(
+                f"{engine} 自定义端点必须指定已经通过真实测试的模型 ID")
+        agent_dir = (
+            Path(agent_state_dir).expanduser().resolve()
+            if agent_state_dir is not None
+            else base / agent_dirname
+        )
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        CredentialAccountStore._chmod_private_dir(agent_dir)
+        if pi_models_json:
+            config_text = json.dumps({
+                "providers": {"muteki": {
+                    "baseUrl": base_url,
+                    "api": "openai-completions",
+                    "apiKey": api_key,
+                    "models": [{
+                        "id": selected_model,
+                        **({"input": model_input} if model_input is not None else {}),
+                        "contextWindow": 128000,
+                        "maxTokens": 8192,
+                    }],
+                }},
+            }, indent=2) + "\n"
+            config_name = "models.json"
+            # Pi RPC 由自己的 SettingsManager 决定 Provider 请求的
+            # timeout，而不是 Muteki Adapter 的 prompt timeout。显式
+            # 固定为 5 分钟（与 Pi 当前默认一致）并保持单次请求，使
+            # 受管 profile 不受宿主全局设置变化影响；连接失败则立即
+            # 交给健康检查判为不可用，不在同一轮重复提交请求。
+            settings_text = json.dumps({
+                "httpIdleTimeoutMs": _PI_PROVIDER_REQUEST_TIMEOUT_MS,
+                "retry": {
+                    "provider": {
+                        "timeoutMs": _PI_PROVIDER_REQUEST_TIMEOUT_MS,
+                        "maxRetries": _PI_PROVIDER_MAX_RETRIES,
+                    },
+                },
+            }, indent=2) + "\n"
+            CredentialAccountStore._atomic_write(
+                agent_dir / "settings.json", settings_text)
+        else:
+            config_text = _omp_models_yml(
+                base_url, api_key, selected_model)
+            config_name = "models.yml"
+        CredentialAccountStore._atomic_write(agent_dir / config_name, config_text)
+        out["PI_CODING_AGENT_DIR"] = (
+            str(agent_state_container_path)
+            if container and agent_state_container_path
+            else f"{CONTAINER_ACCOUNTS_ROOT}/{account_id}/{agent_dirname}"
+            if container else str(agent_dir.resolve())
+        )
+        out[provider_env] = "muteki"
+        if selected_model:
+            out[model_env] = selected_model
+        if not pi_models_json:
+            out["OPENAI_BASE_URL"] = base_url
+    # 自建 Pi provider 从私有 models.json 读取凭据。省略该环境变量可
+    # 避免 Worker 的本地工具意外将 API Key 写入命令输出或运行事件。
+    needs_native_key_fallback = not (pi_models_json and has_key and base_url)
+    if has_key and needs_native_key_fallback:
+        _add_secret_file_or_env(
+            out,
+            base=base,
+            filename="API_KEY",
+            env_name="OPENAI_API_KEY",
+            container=container,
+            container_path=_container_secret_path(account_id, "API_KEY"),
+            source=source,
+        )
+
+
+def _pi_credential_env(out: dict[str, str], **kwargs: Any) -> None:
+    _pi_like_credential_env(out, pi_models_json=True, **kwargs)
+
+
+def _omp_credential_env(out: dict[str, str], **kwargs: Any) -> None:
+    _pi_like_credential_env(out, pi_models_json=False, **kwargs)
+
+
+def _host_only_credential_env(out: dict[str, str], **_: Any) -> None:
+    """Engines that run only on the host CLI login get no account variables."""
+
+
+def _droid_credential_env(
+    out: dict[str, str],
+    *,
+    base: Optional[Path],
+    account_id: str,
+    container: bool,
+    source: Mapping[str, str],
+    **_: Any,
+) -> None:
+    """FACTORY_API_KEY from the account file. Host keychain login is not copied."""
+    _add_secret_file_or_env(
+        out,
+        base=base,
+        filename="API_KEY",
+        env_name="FACTORY_API_KEY",
+        container=container,
+        container_path=_container_secret_path(account_id, "API_KEY"),
+        source=source,
+    )
+
+
+_CREDENTIAL_ENV_RESOLVERS: dict[CredentialEnvResolver, Callable[..., None]] = {
+    "claude": _claude_credential_env,
+    "codex": _codex_credential_env,
+    "cursor": _cursor_credential_env,
+    "kimi": _kimi_credential_env,
+    "grok": _grok_credential_env,
+    "opencode": _opencode_credential_env,
+    "pi": _pi_credential_env,
+    "omp": _omp_credential_env,
+    "devin_host_only": _host_only_credential_env,
+    "droid": _droid_credential_env,
+}
+
+
 def runtime_env_for_engine(
     engine: str,
     *,
@@ -1403,6 +1972,7 @@ def runtime_env_for_engine(
     agent_state_dir: str | Path | None = None,
     agent_state_container_path: str | None = None,
     model: str | None = None,
+    model_input: list[str] | None = None,
 ) -> RuntimeCredentialEnv:
     """Resolve credential env for one engine.
 
@@ -1427,315 +1997,20 @@ def runtime_env_for_engine(
     base = root / account_id if root is not None and account_id else None
     out: dict[str, str] = {}
 
-    if e == "claude":
-        if base is not None and (base / "API_KEY").exists():
-            _add_secret_file_or_env(
-                out,
-                base=base,
-                filename="API_KEY",
-                env_name="ANTHROPIC_API_KEY",
-                container=container,
-                container_path=_container_secret_path(account_id, "API_KEY"),
-                source=source,
-            )
-            _add_secret_file_or_env(
-                out,
-                base=base,
-                filename="API_KEY",
-                env_name="ANTHROPIC_AUTH_TOKEN",
-                container=container,
-                container_path=_container_secret_path(account_id, "API_KEY"),
-                source=source,
-            )
-            _add_base_url(out, base=base, env_name="ANTHROPIC_BASE_URL")
-        else:
-            _add_secret_file_or_env(
-                out,
-                base=base,
-                filename="CLAUDE_CODE_OAUTH_TOKEN",
-                env_name="CLAUDE_CODE_OAUTH_TOKEN",
-                container=container,
-                container_path=_container_secret_path(account_id, "CLAUDE_CODE_OAUTH_TOKEN"),
-                source=source,
-            )
-    elif e == "codex":
-        if base is not None and (base / "API_KEY").exists():
-            _add_secret_file_or_env(
-                out,
-                base=base,
-                filename="API_KEY",
-                env_name="OPENAI_API_KEY",
-                container=container,
-                container_path=_container_secret_path(account_id, "API_KEY"),
-                source=source,
-            )
-            _add_base_url(out, base=base, env_name="OPENAI_BASE_URL")
-        codex_home = base / "codex-home" if base is not None else None
-        if "OPENAI_API_KEY" not in out and "OPENAI_API_KEY_FILE" not in out and codex_home is not None and codex_home.exists():
-            out["CODEX_HOME"] = (
-                f"{CONTAINER_ACCOUNTS_ROOT}/{account_id}/codex-home"
-                if container else str(codex_home.resolve())
-            )
-        elif source.get("CODEX_HOME"):
-            out["CODEX_HOME"] = str(source["CODEX_HOME"])
-    elif e == "cursor":
-        if base is not None and (base / "API_KEY").exists():
-            _add_secret_file_or_env(
-                out,
-                base=base,
-                filename="API_KEY",
-                env_name="CURSOR_API_KEY",
-                container=container,
-                container_path=_container_secret_path(account_id, "API_KEY"),
-                source=source,
-            )
-            _add_base_url(out, base=base, env_name="CURSOR_ENDPOINT")
-        else:
-            _add_secret_file_or_env(
-                out,
-                base=base,
-                filename="CURSOR_API_KEY",
-                env_name="CURSOR_API_KEY",
-                container=container,
-                container_path=_container_secret_path(account_id, "CURSOR_API_KEY"),
-                source=source,
-            )
-    elif e == "kimi":
-        has_key = base is not None and (base / "API_KEY").exists()
-        if has_key:
-            _add_secret_file_or_env(
-                out,
-                base=base,
-                filename="API_KEY",
-                env_name="KIMI_MODEL_API_KEY",
-                container=container,
-                container_path=_container_secret_path(account_id, "API_KEY"),
-                source=source,
-            )
-            _add_base_url(out, base=base, env_name="KIMI_MODEL_BASE_URL")
-            selected_model = str(
-                model or source.get("KIMI_MODEL_NAME") or "kimi-for-coding"
-            ).strip()
-            # OAuth profiles use configured aliases such as
-            # ``kimi-code/kimi-for-coding``. KIMI_MODEL_NAME is the literal model
-            # id sent to the API, so remove only the built-in alias namespace.
-            out["KIMI_MODEL_NAME"] = selected_model.removeprefix("kimi-code/")
-            base_url = CredentialAccountStore._read_base_url(base)
-            provider_type = str(
-                source.get("KIMI_MODEL_PROVIDER_TYPE")
-                or ("openai" if base_url else "kimi")
-            )
-            out["KIMI_MODEL_PROVIDER_TYPE"] = provider_type
-            if provider_type == "openai":
-                # Kimi Code synthesizes custom OpenAI-compatible models with a
-                # 256K context window unless told otherwise.  Its derived output
-                # request can then exceed the 64K completion ceiling used by
-                # common DeepSeek endpoints.  The documented runtime override
-                # keeps custom providers at the conventional 128K window while
-                # still allowing an explicit deployment value to win.
-                out["KIMI_MODEL_MAX_CONTEXT_SIZE"] = str(
-                    source.get("KIMI_MODEL_MAX_CONTEXT_SIZE") or 131072
-                )
-                out["KIMI_MODEL_MAX_OUTPUT_SIZE"] = str(
-                    source.get("KIMI_MODEL_MAX_OUTPUT_SIZE") or 65536
-                )
-        kimi_home = base / "kimi-home" if base is not None else None
-        if not has_key and kimi_home is not None and kimi_home.exists():
-            out["KIMI_CODE_HOME"] = (
-                f"{CONTAINER_ACCOUNTS_ROOT}/{account_id}/kimi-home"
-                if container else str(kimi_home.resolve())
-            )
-        elif not has_key and source.get("KIMI_CODE_HOME"):
-            out["KIMI_CODE_HOME"] = str(source["KIMI_CODE_HOME"])
-    elif e == "grok":
-        has_key = base is not None and (base / "API_KEY").exists()
-        if has_key:
-            _add_secret_file_or_env(
-                out,
-                base=base,
-                filename="API_KEY",
-                env_name="XAI_API_KEY",
-                container=container,
-                container_path=_container_secret_path(account_id, "API_KEY"),
-                source=source,
-            )
-            _add_base_url(out, base=base, env_name="GROK_MODELS_BASE_URL")
-        grok_home = base / "grok-home" if base is not None else None
-        if not has_key and grok_home is not None and grok_home.exists():
-            out["GROK_HOME"] = (
-                f"{CONTAINER_ACCOUNTS_ROOT}/{account_id}/grok-home"
-                if container else str(grok_home.resolve())
-            )
-        elif not has_key and source.get("GROK_HOME"):
-            out["GROK_HOME"] = str(source["GROK_HOME"])
-    elif e == "opencode":
-        has_key = base is not None and (base / "API_KEY").exists()
-        if has_key:
-            _add_secret_file_or_env(
-                out,
-                base=base,
-                filename="API_KEY",
-                env_name="OPENAI_API_KEY",
-                container=container,
-                container_path=_container_secret_path(account_id, "API_KEY"),
-                source=source,
-            )
-            _add_secret_file_or_env(
-                out,
-                base=base,
-                filename="API_KEY",
-                env_name="OPENCODE_API_KEY",
-                container=container,
-                container_path=_container_secret_path(account_id, "API_KEY"),
-                source=source,
-            )
-            _add_base_url(out, base=base, env_name="OPENAI_BASE_URL")
-            base_url = CredentialAccountStore._read_base_url(base)
-            selected_model = str(model or "").strip()
-            # 候选目录只供显式模型测试。运行时配置只包含本轮已经由调用方
-            # 校验并选择的模型，避免手写坏 ID 被注入 OpenCode provider。
-            configured_models = [selected_model] if selected_model else []
-            if base_url and configured_models:
-                # OpenCode requires custom OpenAI-compatible endpoints to be
-                # declared as a provider with explicit models.  The inline
-                # config contains only public endpoint/model metadata; the API
-                # key is resolved by OpenCode from the subprocess environment.
-                provider_id = "muteki"
-                provider_name = (
-                    CredentialAccountStore._read_provider(base)
-                    or "Muteki 凭据中心"
-                )
-                out["OPENCODE_CONFIG_CONTENT"] = json.dumps({
-                    "$schema": "https://opencode.ai/config.json",
-                    "provider": {
-                        provider_id: {
-                            "npm": "@ai-sdk/openai-compatible",
-                            "name": provider_name,
-                            "options": {
-                                "baseURL": base_url,
-                                "apiKey": "{env:OPENCODE_API_KEY}",
-                            },
-                            "models": {
-                                model_id: {"name": model_id}
-                                for model_id in configured_models
-                            },
-                        },
-                    },
-                }, ensure_ascii=False, separators=(",", ":"))
-                # The selected credential owns the provider namespace.  Model
-                # ids may themselves contain '/', so the adapter must not split
-                # them as OpenCode's provider/model shorthand.
-                out["MUTEKI_OPENCODE_PROVIDER"] = provider_id
-        elif source.get("OPENCODE_API_KEY"):
-            out["OPENCODE_API_KEY"] = str(source["OPENCODE_API_KEY"])
-        if agent_state_dir is not None:
-            state_root = Path(agent_state_dir).expanduser().resolve()
-            for dirname in ("data", "config", "cache"):
-                (state_root / dirname).mkdir(parents=True, exist_ok=True)
-            runtime_root = (
-                str(agent_state_container_path)
-                if container and agent_state_container_path else str(state_root)
-            )
-            out.update({
-                "XDG_DATA_HOME": f"{runtime_root}/data",
-                "XDG_CONFIG_HOME": f"{runtime_root}/config",
-                "XDG_CACHE_HOME": f"{runtime_root}/cache",
-            })
-    elif e in ("pi", "omp"):
-        # pi/omp reach a custom OpenAI-compatible provider through a generated
-        # provider config in their agent config dir (pi: models.json; omp:
-        # models.yml — hand-written YAML, no pyyaml dependency), selected via
-        # PI_CODING_AGENT_DIR (both CLIs honor it). The account's API_KEY is
-        # embedded in that file, so the dir is projected as a WRITABLE state dir
-        # (same posture as codex-home). Pi 的 provider 配置已经包含凭据，
-        # 因而不把 OPENAI_API_KEY 传给 Pi 进程及其 shell 子进程；OMP 仍需
-        # 原生环境变量兼容其端点选择。
-        agent_dirname = "pi-agent" if e == "pi" else "omp-agent"
-        provider_env = "MUTEKI_PI_PROVIDER" if e == "pi" else "MUTEKI_OMP_PROVIDER"
-        model_env = "MUTEKI_PI_MODEL" if e == "pi" else "MUTEKI_OMP_MODEL"
-        has_key = base is not None and (base / "API_KEY").exists()
-        base_url = CredentialAccountStore._read_base_url(base) if has_key else ""
-        if has_key and base_url:
-            try:
-                api_key = (base / "API_KEY").read_text(encoding="utf-8").strip()
-            except OSError:
-                api_key = ""
-            selected_model = str(model or "").strip()
-            model_file = base / "MODEL"
-            if not selected_model and model_file.exists():
-                try:
-                    selected_model = model_file.read_text(encoding="utf-8").strip()
-                except OSError:
-                    selected_model = ""
-            if not selected_model:
-                raise ValueError(
-                    f"{e} 自定义端点必须指定已经通过真实测试的模型 ID")
-            agent_dir = (
-                Path(agent_state_dir).expanduser().resolve()
-                if agent_state_dir is not None
-                else base / agent_dirname
-            )
-            agent_dir.mkdir(parents=True, exist_ok=True)
-            CredentialAccountStore._chmod_private_dir(agent_dir)
-            if e == "pi":
-                config_text = json.dumps({
-                    "providers": {"muteki": {
-                        "baseUrl": base_url,
-                        "api": "openai-completions",
-                        "apiKey": api_key,
-                        "models": [{
-                            "id": selected_model,
-                            "contextWindow": 128000,
-                            "maxTokens": 8192,
-                        }],
-                    }},
-                }, indent=2) + "\n"
-                config_name = "models.json"
-                # Pi RPC 由自己的 SettingsManager 决定 Provider 请求的
-                # timeout，而不是 Muteki Adapter 的 prompt timeout。显式
-                # 固定为 5 分钟（与 Pi 当前默认一致）并保持单次请求，使
-                # 受管 profile 不受宿主全局设置变化影响；连接失败则立即
-                # 交给健康检查判为不可用，不在同一轮重复提交请求。
-                settings_text = json.dumps({
-                    "httpIdleTimeoutMs": _PI_PROVIDER_REQUEST_TIMEOUT_MS,
-                    "retry": {
-                        "provider": {
-                            "timeoutMs": _PI_PROVIDER_REQUEST_TIMEOUT_MS,
-                            "maxRetries": _PI_PROVIDER_MAX_RETRIES,
-                        },
-                    },
-                }, indent=2) + "\n"
-                CredentialAccountStore._atomic_write(
-                    agent_dir / "settings.json", settings_text)
-            else:
-                config_text = _omp_models_yml(
-                    base_url, api_key, selected_model)
-                config_name = "models.yml"
-            CredentialAccountStore._atomic_write(agent_dir / config_name, config_text)
-            out["PI_CODING_AGENT_DIR"] = (
-                str(agent_state_container_path)
-                if container and agent_state_container_path
-                else f"{CONTAINER_ACCOUNTS_ROOT}/{account_id}/{agent_dirname}"
-                if container else str(agent_dir.resolve())
-            )
-            out[provider_env] = "muteki"
-            if selected_model:
-                out[model_env] = selected_model
-            if e == "omp":
-                out["OPENAI_BASE_URL"] = base_url
-        # 自建 Pi provider 从私有 models.json 读取凭据。省略该环境变量可
-        # 避免 Worker 的本地工具意外将 API Key 写入命令输出或运行事件。
-        needs_native_key_fallback = not (e == "pi" and has_key and base_url)
-        if has_key and needs_native_key_fallback:
-            _add_secret_file_or_env(
-                out,
-                base=base,
-                filename="API_KEY",
-                env_name="OPENAI_API_KEY",
-                container=container,
-                container_path=_container_secret_path(account_id, "API_KEY"),
-                source=source,
-            )
+    descriptor = find_descriptor(e)
+    if descriptor is not None:
+        _CREDENTIAL_ENV_RESOLVERS[descriptor.credentials.env_resolver](
+            out,
+            engine=e,
+            base=base,
+            account_id=account_id,
+            container=container,
+            source=source,
+            model=model,
+            **({"model_input": model_input} if e == "pi" else {}),
+            agent_state_dir=agent_state_dir,
+            agent_state_container_path=agent_state_container_path,
+        )
 
     return RuntimeCredentialEnv(account_id=account_id, env=out)
 
@@ -1807,11 +2082,22 @@ def _add_base_url(out: dict[str, str], *, base: Optional[Path], env_name: str) -
         out[env_name] = value
 
 
+def _invalidate_runtime_probes() -> None:
+    # Runtime probes (auth state, model catalogs, version checks) run with the
+    # credential environment, so any committed change makes them stale.
+    from muteki.external_agents.probe_cache import invalidate_for_credential_change
+
+    invalidate_for_credential_change()
+
+
 # Host-env login presence is cached briefly so the settings page does not
 # re-read keychain/files on every navigation. Launch paths pass fresh=True.
 _HOST_LOGIN_CACHE: dict[str, tuple[float, str]] = {}
 _HOST_LOGIN_CACHE_TTL_S = 30.0
 _HOST_LOGIN_LOCK = threading.Lock()
+# Last observed status per engine, kept across cache expiry so a host
+# login/logout is detected as a change and invalidates runtime probes.
+_HOST_LOGIN_STATUS: dict[str, str] = {}
 
 
 def invalidate_system_login_cache(engine: str | None = None) -> None:
@@ -1864,100 +2150,156 @@ def detect_system_login(
     status = _detect_system_login_uncached(e, env)
     if cache_key:
         with _HOST_LOGIN_LOCK:
+            previous = _HOST_LOGIN_STATUS.get(cache_key)
+            _HOST_LOGIN_STATUS[cache_key] = status
             _HOST_LOGIN_CACHE[cache_key] = (time.monotonic(), status)
+        if previous is not None and previous != status:
+            _invalidate_runtime_probes()
     return status
+
+
+async def detect_system_login_async(
+    engine: str,
+    env: Mapping[str, str] | None = None,
+    *,
+    fresh: bool = False,
+) -> str:
+    """``detect_system_login`` off the event loop (keychain reads spawn ``security``)."""
+    return await asyncio.to_thread(detect_system_login, engine, env, fresh=fresh)
+
+
+def _login_status_droid(source: Mapping[str, str], env: Mapping[str, str] | None) -> str:
+    del env
+    if source.get("FACTORY_API_KEY"):
+        return "present"
+    try:
+        path = Path.home() / ".factory" / "auth.v2.loginkeychain"
+        return "present" if path.is_file() else "absent"
+    except OSError as exc:
+        return _login_status_unknown("droid_login", exc)
+
+
+def _login_status_devin_cli(source: Mapping[str, str], env: Mapping[str, str] | None) -> str:
+    from muteki.external_agents.devin import devin_login_status
+
+    return devin_login_status(env=env)
+
+
+def _login_status_unknown(probe: str, exc: BaseException) -> str:
+    _LOG.warning("host login probe %s could not determine status: %s: %s",
+                 probe, type(exc).__name__, exc)
+    return "unknown"
+
+
+def _login_status_claude_oauth(source: Mapping[str, str], env: Mapping[str, str] | None) -> str:
+    # Settings/listing only reads env, keychain, and the credentials file.
+    # Never spawn `claude` here — a settings page load is not a login probe.
+    if (source.get("CLAUDE_CODE_OAUTH_TOKEN") or source.get("ANTHROPIC_AUTH_TOKEN")
+            or source.get("ANTHROPIC_API_KEY")):
+        return "present"
+    try:
+        from muteki.solver.cli_driver import _claude_oauth  # lazy: avoid cycle
+        return "present" if _claude_oauth() is not None else "absent"
+    except Exception as exc:  # noqa: BLE001 — status contract; attribution logged
+        return _login_status_unknown("claude_oauth", exc)
+
+
+def _login_status_codex_auth_json(source: Mapping[str, str], env: Mapping[str, str] | None) -> str:
+    if source.get("OPENAI_API_KEY"):
+        return "present"
+    try:
+        # An explicit CODEX_HOME is authoritative — don't also fall back to
+        # ~/.codex (that would let a host login mask an empty CODEX_HOME).
+        codex_home = source.get("CODEX_HOME")
+        root = Path(codex_home) if codex_home else (Path.home() / ".codex")
+        return "present" if (root / "auth.json").exists() else "absent"
+    except (OSError, RuntimeError) as exc:
+        return _login_status_unknown("codex_auth_json", exc)
+
+
+def _login_status_cursor_session(source: Mapping[str, str], env: Mapping[str, str] | None) -> str:
+    if source.get("CURSOR_API_KEY"):
+        return "present"
+    try:
+        from muteki.solver.cli_driver import _cursor_session_cookie  # lazy
+        return "present" if _cursor_session_cookie() is not None else "absent"
+    except Exception as exc:  # noqa: BLE001 — status contract; attribution logged
+        return _login_status_unknown("cursor_session", exc)
+
+
+def _login_status_pi_agent_files(source: Mapping[str, str], env: Mapping[str, str] | None) -> str:
+    try:
+        root = Path.home() / ".pi" / "agent"
+        return ("present"
+                if (root / "auth.json").exists() or (root / "models.json").exists()
+                else "absent")
+    except (OSError, RuntimeError) as exc:
+        return _login_status_unknown("pi_agent_files", exc)
+
+
+def _login_status_omp_agent_dir(source: Mapping[str, str], env: Mapping[str, str] | None) -> str:
+    try:
+        return "present" if (Path.home() / ".omp" / "agent").exists() else "absent"
+    except (OSError, RuntimeError) as exc:
+        return _login_status_unknown("omp_agent_dir", exc)
+
+
+def _login_status_kimi_credentials(source: Mapping[str, str], env: Mapping[str, str] | None) -> str:
+    if source.get("KIMI_MODEL_API_KEY") and source.get("KIMI_MODEL_NAME"):
+        return "present"
+    try:
+        root = Path.home() / ".kimi-code"
+        return (
+            "present"
+            if (root / "credentials" / "kimi-code.json").exists()
+            else "absent"
+        )
+    except (OSError, RuntimeError) as exc:
+        return _login_status_unknown("kimi_credentials", exc)
+
+
+def _login_status_grok_auth_json(source: Mapping[str, str], env: Mapping[str, str] | None) -> str:
+    if source.get("XAI_API_KEY"):
+        return "present"
+    try:
+        root = Path.home() / ".grok"
+        return "present" if (root / "auth.json").exists() else "absent"
+    except (OSError, RuntimeError) as exc:
+        return _login_status_unknown("grok_auth_json", exc)
+
+
+def _login_status_opencode_auth(source: Mapping[str, str], env: Mapping[str, str] | None) -> str:
+    if source.get("OPENCODE_API_KEY") or source.get("OPENAI_API_KEY"):
+        return "present"
+    try:
+        return ("present" if (Path.home() / ".local" / "share" / "opencode" / "auth.json").exists()
+                else "absent")
+    except (OSError, RuntimeError) as exc:
+        return _login_status_unknown("opencode_auth", exc)
+
+
+_LOGIN_STATUS_PROBES: dict[LoginStatusProbe, Callable[[Mapping[str, str], Mapping[str, str] | None], str]] = {
+    "devin_cli": _login_status_devin_cli,
+    "droid_login": _login_status_droid,
+    "claude_oauth": _login_status_claude_oauth,
+    "codex_auth_json": _login_status_codex_auth_json,
+    "cursor_session": _login_status_cursor_session,
+    "pi_agent_files": _login_status_pi_agent_files,
+    "omp_agent_dir": _login_status_omp_agent_dir,
+    "kimi_credentials": _login_status_kimi_credentials,
+    "grok_auth_json": _login_status_grok_auth_json,
+    "opencode_auth": _login_status_opencode_auth,
+}
 
 
 def _detect_system_login_uncached(
     e: str, env: Mapping[str, str] | None,
 ) -> str:
+    descriptor = find_descriptor(e)
+    if descriptor is None:
+        return "unknown"
     source = env if env is not None else os.environ
-
-    if e == "devin":
-        from muteki.external_agents.devin import devin_login_status
-
-        return devin_login_status(env=env)
-
-    if e == "claude":
-        # Settings/listing only reads env, keychain, and the credentials file.
-        # Never spawn `claude` here — a settings page load is not a login probe.
-        if (source.get("CLAUDE_CODE_OAUTH_TOKEN") or source.get("ANTHROPIC_AUTH_TOKEN")
-                or source.get("ANTHROPIC_API_KEY")):
-            return "present"
-        try:
-            from muteki.solver.cli_driver import _claude_oauth  # lazy: avoid cycle
-            return "present" if _claude_oauth() is not None else "absent"
-        except Exception:
-            return "unknown"
-
-    if e == "codex":
-        if source.get("OPENAI_API_KEY"):
-            return "present"
-        try:
-            # An explicit CODEX_HOME is authoritative — don't also fall back to
-            # ~/.codex (that would let a host login mask an empty CODEX_HOME).
-            codex_home = source.get("CODEX_HOME")
-            root = Path(codex_home) if codex_home else (Path.home() / ".codex")
-            return "present" if (root / "auth.json").exists() else "absent"
-        except Exception:
-            return "unknown"
-
-    if e == "cursor":
-        if source.get("CURSOR_API_KEY"):
-            return "present"
-        try:
-            from muteki.solver.cli_driver import _cursor_session_cookie  # lazy
-            return "present" if _cursor_session_cookie() is not None else "absent"
-        except Exception:
-            return "unknown"
-
-    if e == "pi":
-        try:
-            root = Path.home() / ".pi" / "agent"
-            return ("present"
-                    if (root / "auth.json").exists() or (root / "models.json").exists()
-                    else "absent")
-        except Exception:
-            return "unknown"
-
-    if e == "omp":
-        try:
-            return "present" if (Path.home() / ".omp" / "agent").exists() else "absent"
-        except Exception:
-            return "unknown"
-
-    if e == "kimi":
-        if source.get("KIMI_MODEL_API_KEY") and source.get("KIMI_MODEL_NAME"):
-            return "present"
-        try:
-            root = Path.home() / ".kimi-code"
-            return (
-                "present"
-                if (root / "credentials" / "kimi-code.json").exists()
-                else "absent"
-            )
-        except Exception:
-            return "unknown"
-
-    if e == "grok":
-        if source.get("XAI_API_KEY"):
-            return "present"
-        try:
-            root = Path.home() / ".grok"
-            return "present" if (root / "auth.json").exists() else "absent"
-        except Exception:
-            return "unknown"
-
-    if e == "opencode":
-        if source.get("OPENCODE_API_KEY") or source.get("OPENAI_API_KEY"):
-            return "present"
-        try:
-            return ("present" if (Path.home() / ".local" / "share" / "opencode" / "auth.json").exists()
-                    else "absent")
-        except Exception:
-            return "unknown"
-
-    return "unknown"
+    return _LOGIN_STATUS_PROBES[descriptor.login.status_probe](source, env)
 
 
 def resolve_credential_env(
@@ -1967,6 +2309,7 @@ def resolve_credential_env(
     sessions_root: str | Path,
     container: bool = False,
     model: str = "",
+    model_input: list[str] | None = None,
     agent_state_dir: str | Path | None = None,
     agent_state_container_path: str | None = None,
 ) -> RuntimeCredentialEnv:
@@ -1977,12 +2320,13 @@ def resolve_credential_env(
     overlay so the child inherits the host CLI login in the normal way.
     """
     selected_engine = str(engine or "").strip().lower()
-    if selected_engine == "devin":
-        stable_id = canonical_credential_id(credential_id, engine="devin")
-        if container or stable_id not in {"", "system:devin"}:
-            raise ValueError("Devin CLI 仅支持本机系统登录凭据")
-        if detect_system_login("devin", fresh=True) != "present":
-            raise ValueError("请先在本机执行 devin auth login")
+    descriptor = find_descriptor(selected_engine)
+    if descriptor is not None and descriptor.login.system_login_only:
+        stable_id = canonical_credential_id(credential_id, engine=selected_engine)
+        if container or stable_id not in {"", system_credential_id(selected_engine)}:
+            raise ValueError(f"{descriptor.identity.display_name} 仅支持本机系统登录凭据")
+        if detect_system_login(selected_engine, fresh=True) != "present":
+            raise ValueError(f"请先在本机执行 {descriptor.login.guidance_command}")
         return RuntimeCredentialEnv(account_id="", env={})
     if selected_engine not in SUPPORTED_CREDENTIAL_ENGINES:
         raise ValueError(f"unknown credential engine: {selected_engine!r}")
@@ -2023,6 +2367,7 @@ def resolve_credential_env(
         agent_state_dir=agent_state_dir,
         agent_state_container_path=agent_state_container_path,
         model=model,
+        model_input=model_input,
     )
     return RuntimeCredentialEnv(
         account_id=resolved.account_id,

@@ -196,7 +196,7 @@ export function MessageHeader({ className, ...props }: MessageHeaderProps) {
     <div
       data-slot="message-header"
       className={cn(
-        "flex items-center gap-1.5 px-1 text-[11px] leading-none text-cx-fg-3",
+        "flex items-center gap-1.5 px-1 text-[12px] leading-none text-cx-fg-3",
         from === "user" ? "justify-end" : "justify-start",
         className,
       )}
@@ -212,7 +212,7 @@ export function MessageFooter({ className, ...props }: MessageFooterProps) {
     <div
       data-slot="message-footer"
       className={cn(
-        "flex min-h-5 items-center gap-1 px-1 text-[11px] text-cx-fg-3",
+        "flex min-h-5 items-center gap-1 px-1 text-[12px] text-cx-fg-3",
         from === "user" ? "justify-end" : "justify-start",
         className,
       )}

@@ -200,6 +200,15 @@ class CapabilityInvocation(ContractModel):
     invocation_id: str = Field(default_factory=lambda: new_id("inv"))
     arguments: dict[str, Any] = Field(default_factory=dict)
     correlation_id: Optional[str] = None
+    # The calling runtime's current model metadata; None means unreported.
+    image_input: Optional[bool] = None
+
+
+class CapabilityImage(ContractModel):
+    """随工具结果交给模型的图片（base64）；其落盘路径与 SHA-256 在 ``result`` 中。"""
+
+    mime_type: str
+    data: str
 
 
 class CapabilityResult(ContractModel):
@@ -207,6 +216,7 @@ class CapabilityResult(ContractModel):
 
     改变状态的调用返回与 Web 相同的 CommandReceipt；只读调用把完整的
     数据放在 ``result``；失败时 ``error`` 为统一错误 envelope。
+    ``images`` 由各协议入口转成原生图片内容块，不进入 JSON 文本。
     """
 
     ok: bool = True
@@ -214,3 +224,4 @@ class CapabilityResult(ContractModel):
     receipt: Optional[CommandReceipt] = None
     result: Any = None
     error: Optional[ErrorEnvelope] = None
+    images: list[CapabilityImage] = Field(default_factory=list)

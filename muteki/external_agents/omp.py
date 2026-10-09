@@ -37,6 +37,20 @@
   代理到 Gateway 的 HTTP/JSON-RPC Bridge（``muteki.invoke``，bearer
   现场签发），``host_tool_result`` 回写；其余 Runtime（MCP 配置入口等）
   未核验不声明。
+- 子智能体（原生 ``task`` 工具，本机 17.2.12 实测）：RPC 侧先
+  ``set_subagent_subscription {level:"events"}`` 订阅，之后 stdout 出
+  ``subagent_lifecycle``（started/completed/failed/aborted，带
+  ``parentToolCallId`` 与 ``sessionFile``）、``subagent_progress``
+  （``progress`` 为完整 AgentProgress：status/description/lastIntent/
+  toolCount/tokens/durationMs/resolvedModel）、``subagent_event``
+  （``payload.event`` 为子会话 AgentSessionEvent，含子工具调用与
+  ``yield`` 结果提交）；``tool_execution_end`` 的
+  ``result.details`` 为 TaskToolDetails（``results[]``/``progress[]``/
+  ``async.state``）。异步派单时 task 调用立即返回且
+  ``details.async.state=="running"``，子智能体终态只由 lifecycle 帧判定。
+  ACP 侧无 subagent 帧，子智能体信号在 task ``tool_call`` 的 ``rawInput``
+  （``task``/``tasks`` 参数，OMP 内置工具中唯一）与 ``tool_call_update``
+  的 ``rawOutput.details``（TaskToolDetails）中。
 
 兼容路径：本机 OMP 的 CLI 一次性路径若启用，由
 ``muteki.solver.cli_driver`` 的对应 Driver + ``CliDriverAdapter``
@@ -57,6 +71,24 @@ from typing import Any, AsyncIterator, Optional
 import httpx
 
 from muteki.capability_bindings.http_jsonrpc import METHOD_INVOKE
+from muteki.platform.contracts.agent_events import (
+    AgentNodePayload,
+    AgentUpdatedPayload,
+    FailureCategory,
+    MessageCompletedPayload,
+    MessageDeltaPayload,
+    RuntimeCapabilitiesPayload,
+    RuntimeErrorPayload,
+    SessionPayload,
+    ToolPayload,
+    TurnCompletedPayload,
+    TurnFailedPayload,
+    TurnStartedPayload,
+    UsagePayload,
+    UserInputRequestedPayload,
+    UserInputResolvedPayload,
+    dump_payload,
+)
 from muteki.platform.contracts.base import new_id
 from muteki.platform.contracts.capabilities import (
     CapabilityInjectionPlan,
@@ -69,9 +101,12 @@ from muteki.platform.contracts.external_agents import (
     AgentEventType,
     AgentInput,
     AgentSessionRef,
+    MessageInput,
     ProbeRequest,
     SessionStart,
+    SteerInput,
 )
+from muteki.platform.contracts.protocols import RuntimeOperationAdapter
 from muteki.platform.contracts.receipts import (
     AggregateRef,
     CommandReceipt,
@@ -81,6 +116,7 @@ from muteki.platform.contracts.receipts import (
 from .acp import BaseAcpAdapter
 from .base import BaseExternalAgentAdapter
 from .capabilities import (
+    AccessModeUnsupportedError,
     BOOL_CAPABILITY_FIELDS,
     CapabilityProbeReport,
     SOURCE_PROBE,
@@ -121,10 +157,203 @@ def _omp_message_text(message: dict[str, Any]) -> str:
     return "".join(out)
 
 
-class OmpRpcAdapter(BaseExternalAgentAdapter):
+#: OMP 原生委派工具名。源码（src/tools/builtin-names.ts、task/executor.ts）
+#: 与本机 17.2.12 实测确认：它是唯一使用 ``task``/``tasks`` 参数的内置工具。
+_OMP_TASK_TOOL = "task"
+
+#: 子智能体提交结构化结果的内置工具（task/yield-assembly.ts）。
+_OMP_YIELD_TOOL = "yield"
+
+#: SubagentLifecycle/AgentProgress 原生状态 → 统一 node 状态。
+_OMP_AGENT_STATUS = {
+    "pending": "pending",
+    "started": "running",
+    "running": "running",
+    "completed": "completed",
+    "failed": "failed",
+    "aborted": "cancelled",
+}
+
+_OMP_TERMINAL_STATUS = {"completed", "failed", "cancelled"}
+
+
+def _omp_task_items(args: Any) -> list[dict[str, Any]]:
+    """task 工具参数 → 委派条目（批量 ``tasks[]`` 或单条扁平形态）。"""
+    if not isinstance(args, dict):
+        return []
+    items = args.get("tasks")
+    if isinstance(items, list):
+        return [item for item in items if isinstance(item, dict)]
+    if isinstance(args.get("task"), str):
+        return [args]
+    return []
+
+
+def _omp_result_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _omp_content_text(result: Any) -> str:
+    """tool result.content 的 text 块拼接。"""
+    if not isinstance(result, dict):
+        return ""
+    out: list[str] = []
+    for block in result.get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            out.append(str(block.get("text") or ""))
+    return "".join(out)
+
+
+def _omp_task_details(raw_output: Any) -> Optional[dict[str, Any]]:
+    """tool_execution_end/update 的 result/partialResult → TaskToolDetails。
+
+    ``projectAgentsDir`` 与 ``totalDurationMs`` 是 TaskToolDetails 的固有
+    键（src/task/types.ts），用来把 task 工具的 details 与其他工具的
+    ``results`` 字段区分开。
+    """
+    if not isinstance(raw_output, dict):
+        return None
+    details = raw_output.get("details")
+    if not isinstance(details, dict):
+        return None
+    if "projectAgentsDir" not in details and "totalDurationMs" not in details:
+        return None
+    if not ("results" in details or "progress" in details or "async" in details):
+        return None
+    return details
+
+
+def _omp_progress_update(
+    progress: dict[str, Any], existing: Optional[dict[str, Any]]
+) -> dict[str, Any]:
+    """AgentProgress（RPC subagent_progress / ACP details.progress[]）→ node patch。"""
+    update: dict[str, Any] = {}
+    mapped = _OMP_AGENT_STATUS.get(str(progress.get("status") or ""))
+    if mapped:
+        previous = str((existing or {}).get("status") or "")
+        # 终态不被迟到的 running/pending 重开；已进入 running 不回退 pending。
+        if previous in _OMP_TERMINAL_STATUS and mapped in ("pending", "running"):
+            pass
+        elif previous == "running" and mapped == "pending":
+            pass
+        else:
+            update["status"] = mapped
+    description = str(progress.get("description") or "").strip()
+    if description:
+        update["title"] = description
+    model = str(progress.get("resolvedModel") or "").strip()
+    if not model:
+        override = progress.get("modelOverride")
+        if isinstance(override, list) and override:
+            model = str(override[0])
+        elif isinstance(override, str):
+            model = override.strip()
+    if model:
+        update["model"] = model
+    activity = (str(progress.get("lastIntent") or "").strip()
+                or str(progress.get("currentTool") or "").strip())
+    if activity:
+        update["activity"] = activity
+    for key, native in (("tool_uses", "toolCount"),
+                        ("total_tokens", "tokens"),
+                        ("duration_ms", "durationMs")):
+        if progress.get(native) is not None:
+            update[key] = progress.get(native)
+    retry_failure = progress.get("retryFailure")
+    if isinstance(retry_failure, dict) and retry_failure.get("errorMessage"):
+        # 子智能体放弃重试的终局错误；lifecycle failed 不带错误正文。
+        update["error"] = str(retry_failure["errorMessage"])
+    if mapped == "completed":
+        yield_data = (progress.get("extractedToolData") or {}).get("yield")
+        if isinstance(yield_data, list) and yield_data:
+            last = yield_data[-1]
+            payload = (last.get("data")
+                       if isinstance(last, dict) and "data" in last else last)
+            text = _omp_result_text(payload)
+            if text:
+                update["result"] = text
+    return update
+
+
+def _omp_result_update(
+    agent_id: str,
+    entry: dict[str, Any],
+    progress: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """SingleResult（TaskToolDetails.results[]，同步路径）→ node patch。"""
+    update: dict[str, Any] = {"agent_id": agent_id}
+    aborted = bool(entry.get("aborted"))
+    failed = bool(entry.get("error")) or entry.get("exitCode") not in (None, 0)
+    if aborted:
+        update["status"] = "cancelled"
+    elif failed:
+        update["status"] = "failed"
+    else:
+        update["status"] = "completed"
+    output = str(entry.get("output") or "")
+    if update["status"] == "completed":
+        if output:
+            update["result"] = output
+    elif update["status"] == "failed":
+        error = str(entry.get("error") or "") or output
+        if error:
+            update["error"] = error
+    assignment = str(entry.get("assignment") or entry.get("task") or "").strip()
+    if assignment:
+        update["request"] = assignment
+    if entry.get("description"):
+        update["title"] = str(entry["description"])
+    if entry.get("agent"):
+        update["role"] = str(entry["agent"])
+    if entry.get("resolvedModel"):
+        update["model"] = str(entry["resolvedModel"])
+    if entry.get("tokens") is not None:
+        update["total_tokens"] = entry.get("tokens")
+    if entry.get("durationMs") is not None:
+        update["duration_ms"] = entry.get("durationMs")
+    if isinstance(progress, dict) and progress.get("toolCount") is not None:
+        update["tool_uses"] = progress.get("toolCount")
+    return update
+
+
+def _omp_usage_payload(usage: dict[str, Any], usage_id: str) -> dict[str, Any]:
+    """OMP (Pi 系血缘) usage → normalized contract; ``input`` 不含缓存，
+    归一化 ``input_tokens`` 补回 cacheRead/cacheWrite。"""
+    def _num(value: Any) -> Optional[int]:
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+    cost = usage.get("cost")
+    buckets = {key: _num(usage.get(key))
+               for key in ("input", "output", "cacheRead", "cacheWrite", "totalTokens")}
+    input_tokens = None
+    if any(buckets[key] is not None for key in ("input", "cacheRead", "cacheWrite")):
+        input_tokens = (buckets["input"] or 0) + (buckets["cacheRead"] or 0) \
+            + (buckets["cacheWrite"] or 0)
+    return dump_payload(UsagePayload(
+        scope="message",
+        usage_id=usage_id,
+        input_tokens=input_tokens,
+        output_tokens=buckets["output"],
+        cached_input_tokens=buckets["cacheRead"],
+        cache_write_tokens=buckets["cacheWrite"],
+        total_tokens=buckets["totalTokens"],
+        cost_usd=(
+            value if isinstance(cost, dict)
+            and isinstance((value := cost.get("total")), (int, float))
+            and not isinstance(value, bool) else None
+        ),
+        native=dict(usage),
+    ))
+
+
+class OmpRpcAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
     """OMP 的 NDJSON RPC 结构化 Adapter（``--mode rpc`` / ``rpc-ui``）。"""
 
     adapter_id = "omp.rpc"
+    context_compaction_events = True
 
     def __init__(
         self,
@@ -159,7 +388,7 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
         no_session: bool = False,
         session_dir: Optional[str] = None,
     ) -> list[str]:
-        argv = [self._binary, "--mode", "rpc-ui" if self._rpc_ui else "rpc"]
+        argv = self._with_launch_args([self._binary, "--mode", "rpc-ui" if self._rpc_ui else "rpc"])
         if cwd:
             argv += ["--cwd", cwd]
         if provider:
@@ -198,7 +427,7 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
         resp = await peer.request(command, params, timeout=timeout)
         if not resp.get("success"):
             raise RuntimeError(
-                f"omp rpc {command} failed: {str(resp.get('error'))[:200]}")
+                f"omp rpc {command} failed: {resp.get('error')}")
         data = resp.get("data")
         return data if isinstance(data, dict) else {}
 
@@ -251,6 +480,16 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
                 v2_negotiated = await self._negotiate_v2(peer, ready)
                 state = await self._cmd(peer, "get_state",
                                         timeout=self._startup_timeout)
+                try:
+                    await self._cmd(peer, "set_subagent_subscription",
+                                    {"level": "events"},
+                                    timeout=self._startup_timeout)
+                    caps.subagents = True
+                except (RuntimeError, asyncio.TimeoutError,
+                        PeerClosedError) as exc:
+                    degradations.append(
+                        "subagents：set_subagent_subscription 实测失败："
+                        f"{exc}；task 子智能体事件不可用")
                 if request.include_models:
                     try:
                         models = await self._cmd(
@@ -265,7 +504,7 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
                         pass
             except (OSError, asyncio.TimeoutError, PeerClosedError,
                     RuntimeError) as exc:
-                detail = f"omp rpc 探测失败：{str(exc)[:160]}"
+                detail = f"omp rpc 探测失败：{exc}"
                 ready, state = {}, {}
             finally:
                 await peer.close()
@@ -295,16 +534,21 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
         caps.interrupt = True       # abort 命令
         caps.steer = True           # steer 命令（fork 血缘，实测于 mock）
         caps.resume = True          # --resume / switch_session（fork 血缘）
+        caps.resume_continues_turn = False
         caps.session_persistence = True
         caps.user_input = self._rpc_ui  # extension_ui_request 子协议
         caps.structured_http_rpc = True  # set_host_tools 反向工具（§OMP-10）
+        # RPC command "compact" {customInstructions?}（rpc-mode.ts），
+        # runtime 快照以 verified operation 暴露。
+        caps.compaction = True
         for field_name in BOOL_CAPABILITY_FIELDS:
             field_sources[field_name] = SOURCE_PROBE
         if not self._rpc_ui:
             field_sources["user_input"] = SOURCE_STATIC
             degradations.append(
-                "user_input：extension_ui_request 子协议仅 --mode rpc-ui "
-                "下出站；本实例为 rpc 模式，未声明")
+                "user_input：--mode rpc 也会出 extension_ui_request"
+                "（setWidget，以及 always-ask 时的 select），但本实例把它们"
+                "应答成 cancelled，不声明 user_input")
         versions = ready.get("supportedProtocolVersions") or []
         if 2 in versions and not v2_negotiated:
             degradations.append(
@@ -313,9 +557,19 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
             degradations.append(
                 f"对端仅支持 RPC v1（物理帧上限 "
                 f"{ready.get('maxFrameBytes', '?')} 字节）")
+        # 17.2.12 实测（/tmp 隔离，协议 v2）：不传 --approval-mode 时
+        # 工具直接执行，没有审批帧。--approval-mode always-ask 时进程会
+        # 发出 extension_ui_request method=select（Approve/Deny），宿主
+        # 回 extension_ui_response value=Approve 即可放行。本适配器不把
+        # Conversation access mode 映射成该 flag，_auto_answer_ui 又把
+        # extension_ui 应答成 cancelled，所以 access mode 不被遵守。
+        # 不在运行时改走 omp.acp。
         degradations.append(
-            "approval：RPC 无非阻塞带内审批，工具审批策略由启动参数固化，"
-            "未静默关闭")
+            "[omp.rpc.access_mode_not_honored] Conversation access mode "
+            "不被遵守：启动参数不含 --approval-mode，未设置时工具按默认 "
+            "策略直接执行；always-ask 的带内审批是 extension_ui select，"
+            "本适配器不传该 flag，并把 extension_ui 应答成 cancelled。"
+            "不会自动改走 omp.acp")
         self._probe_cache = CapabilityProbeReport(
             adapter_id=self.identity.adapter_id,
             instance_id=self.identity.instance_id,
@@ -385,13 +639,15 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
                 resp.raise_for_status()
                 result_payload = resp.json()
         except Exception as exc:  # noqa: BLE001
-            result_payload = {"error": {"message": str(exc)[:200]}}
+            result_payload = {"error": {"message": str(exc)}}
 
         rpc_error = result_payload.get("error")
         gateway_result = result_payload.get("result", result_payload)
         is_error = bool(rpc_error)
         if isinstance(gateway_result, dict) and gateway_result.get("ok") is False:
             is_error = True
+        images = (gateway_result.pop("images", None) or []
+                  if isinstance(gateway_result, dict) else [])
         visible_result = (
             {"error": rpc_error} if rpc_error is not None else gateway_result
         )
@@ -400,7 +656,7 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
                 "type": "text",
                 "text": json.dumps(
                     visible_result, ensure_ascii=False, default=str),
-            }],
+            }, *(image for image in images if isinstance(image, dict))],
             "details": visible_result,
         }
         try:
@@ -414,12 +670,14 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
         sink = handle.get("event_sink")
         if sink is not None:
             sink.put_nowait((AgentEventType.TOOL_COMPLETED,
-                             "omp.host_tool_call", {
-                                 "call_id": str(call_id or ""),
-                                 "tool": tool_name,
-                                 "host_tool": True,
-                                 "is_error": is_error,
-                             }))
+                             "omp.host_tool_call",
+                             dump_payload(ToolPayload(
+                                 tool_call_id=str(call_id or ""),
+                                 name=tool_name,
+                                 kind="mcp",
+                                 status="failed" if is_error else "completed",
+                                 native={"host_tool": True},
+                             ))))
 
     # -- 启动 / 接管 -------------------------------------------------------------
 
@@ -429,17 +687,21 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
         plan: Optional[CapabilityInjectionPlan],
         bearer_token: Optional[str],
     ) -> dict[str, Any]:
-        cwd = str(request.options.get("cwd") or os.getcwd())
         options = request.options
-        process_env = {
-            **self._default_env,
-            **{k: str(v) for k, v in (options.get("env") or {}).items()},
-        }
+        if options.is_conversation:
+            raise AccessModeUnsupportedError(
+                self.adapter_id, request.access_mode or "supervised", (),
+                "OMP rpc_v2 不能执行 Muteki 对话的权限审批；请显式选择 ACP 接入方式。")
+        cwd = options.cwd or os.getcwd()
+        # access_mode 不映射到 --approval-mode，也不把本次启动改成 omp acp。
+        # supervised 因此不会在这个进程里变成可应答的审批；见 probe
+        # degradation omp.rpc.access_mode_not_honored。
+        process_env = {**self._default_env, **options.env}
         provider, model = self._resolve_provider_model(request, process_env)
         handle: dict[str, Any] = {
             "conversation_thread_id": request.thread_id,
             "cwd": cwd,
-            "options": dict(options),
+            "options": options,
             "turns": 0,
             "external_session_id": None,
             "resume_handle": request.resume_handle,
@@ -451,6 +713,15 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
             "host_tool_tasks": set(),
             "available_commands": [],
             "capability_revision": 0,
+            # 子智能体状态跨 turn 保持：异步 task 的 settle 帧可能晚于父 turn
+            # 结束到达，agent_dirty 记录待下一 turn 开头补播的 node。
+            "agent_nodes": {},
+            "agent_dirty": set(),
+            "agent_results": {},
+            "agent_last_text": {},
+            "agent_errors": {},
+            "tool_call_args": {},
+            "usage_message_index": 0,
         }
         ready_fut: asyncio.Future = asyncio.get_running_loop().create_future()
 
@@ -477,18 +748,18 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
                 cwd=cwd,
                 provider=provider or None,
                 model=model or None,
-                role=str(options.get("role") or "") or None,
-                add_dirs=[str(p) for p in (options.get("add_dirs") or [])],
-                no_session=bool(options.get("ephemeral")),
-                session_dir=str(options.get("session_dir") or "") or None,
+                role=options.role or None,
+                add_dirs=list(options.add_dirs),
+                no_session=options.ephemeral,
+                session_dir=options.session_dir or None,
             ),
             cwd=cwd, label="omp.rpc",
             env=process_env,
             request_envelope=_omp_envelope, on_message=on_message)
         handle["peer"] = peer
         self._rpc[request.agent_session_id] = handle
-        await peer.start()
         try:
+            await peer.start()
             # 必须先消费 ready 帧再发命令（§OMP-2）。
             ready = await asyncio.wait_for(
                 ready_fut, timeout=self._startup_timeout)
@@ -509,6 +780,11 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
                 await self._cmd(peer, "set_thinking_level",
                                 {"level": request.effort},
                                 timeout=self._startup_timeout)
+            # 订阅子智能体帧（probe 已实测该命令；失败则显式终止启动，
+            # 不与 caps.subagents 产生口径差）。
+            await self._cmd(peer, "set_subagent_subscription",
+                            {"level": "events"},
+                            timeout=self._startup_timeout)
             handle["host_tools"] = await self._inject_host_tools(
                 peer, handle, plan, bearer_token)
             catalog = await self._cmd(
@@ -516,7 +792,7 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
             handle["available_commands"] = list(catalog.get("commands") or [])
             handle["capability_revision"] = 1
             state = await self._cmd(peer, "get_state", timeout=self._startup_timeout)
-        except Exception:
+        except BaseException:
             self._rpc.pop(request.agent_session_id, None)
             await peer.close()
             raise
@@ -536,17 +812,19 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
 
         对话类请求带 timeout（超时自动以默认值 resolve），但无人值守
         Worker 立即应答可避免空等；先出 USER_INPUT_REQUESTED 事件，
-        不静默吞掉。
+        不静默吞掉。``--approval-mode always-ask`` 的工具审批也走这条
+        select；cancelled 不会把它交给用户，本适配器也不据此改传输。
         """
         request_id = msg.get("id")
         method = str(msg.get("method") or "")
         sink = handle.get("event_sink")
         if sink is not None:
             sink.put_nowait((AgentEventType.USER_INPUT_REQUESTED,
-                             "omp.extension_ui_request", {
-                                 "request_id": str(request_id or ""),
-                                 "ui_method": method,
-                             }))
+                             "omp.extension_ui_request",
+                             dump_payload(UserInputRequestedPayload(
+                                 request_id=str(request_id or ""),
+                                 native={"ui_method": method},
+                             ))))
 
         async def respond() -> None:
             try:
@@ -558,10 +836,11 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
                 pass
             if sink is not None:
                 sink.put_nowait((AgentEventType.USER_INPUT_RESOLVED,
-                                 "omp.extension_ui_response", {
-                                     "request_id": str(request_id or ""),
-                                     "resolution": "cancelled",
-                                 }))
+                                 "omp.extension_ui_response",
+                                 dump_payload(UserInputResolvedPayload(
+                                     request_id=str(request_id or ""),
+                                     outcome="cancelled",
+                                 ))))
         asyncio.ensure_future(respond())
 
     # -- 事件归一化 -------------------------------------------------------------
@@ -577,6 +856,10 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
         if handle is None:
             return
         etype = msg.get("type")
+        if etype in {"compaction_end", "auto_compaction_end"}:
+            if isinstance(msg.get("result"), dict) and not msg.get("aborted") and not msg.get("errorMessage") and not msg.get("skipped"):
+                self._context_compacted(agent_session_id)
+            return
         if etype == "available_commands_update":
             handle["available_commands"] = list(msg.get("commands") or [])
             handle["capability_revision"] = int(
@@ -587,12 +870,24 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
                 sink.put_nowait((
                     AgentEventType.RUNTIME_CAPABILITIES_UPDATED,
                     "omp.available_commands_update",
-                    {
-                        "revision": handle["capability_revision"],
-                        "adapter_id": self.id,
-                        "commands": list(handle["available_commands"]),
-                    },
+                    dump_payload(RuntimeCapabilitiesPayload(
+                        revision=handle["capability_revision"],
+                        reason="commands_changed",
+                        native={
+                            "adapter_id": self.id,
+                            "commands": list(handle["available_commands"]),
+                        },
+                    )),
                 ))
+            return
+        if etype == "subagent_lifecycle":
+            self._on_subagent_lifecycle(handle, msg.get("payload"))
+            return
+        if etype == "subagent_progress":
+            self._on_subagent_progress(handle, msg.get("payload"))
+            return
+        if etype == "subagent_event":
+            self._on_subagent_event(handle, msg.get("payload"))
             return
         sink = handle.get("event_sink")
         if sink is None:
@@ -602,18 +897,21 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
             if text:
                 handle["assistant_text"] = str(handle.get("assistant_text") or "") + text + "\n"
                 handle["saw_assistant_text"] = True
-                sink.put_nowait((AgentEventType.MESSAGE_DELTA, "omp.command_output", {"text": text + "\n"}))
+                sink.put_nowait((AgentEventType.MESSAGE_DELTA, "omp.command_output", dump_payload(
+                    MessageDeltaPayload(text=text + "\n", native={"command_output": True}))))
         elif etype == "message_update":
             usage = msg.get("usage")
             if isinstance(usage, dict) and usage:
                 sink.put_nowait((AgentEventType.USAGE_UPDATED,
-                                 "omp.message_update", {"usage": usage}))
+                                 "omp.message_update",
+                                 _omp_usage_payload(usage, str(handle.get("usage_message_index", 0)))))
             delta = msg.get("assistantMessageEvent") or {}
             if delta.get("type") == "text_delta" and delta.get("delta"):
                 sink.put_nowait((AgentEventType.MESSAGE_DELTA,
                                  "omp.text_delta",
-                                 {"text": str(delta["delta"]),
-                                  "content_index": delta.get("contentIndex")}))
+                                 dump_payload(MessageDeltaPayload(
+                                     text=str(delta["delta"]),
+                                     native={"content_index": delta.get("contentIndex")}))))
                 handle["saw_assistant_text"] = True
         elif etype == "message_end":
             message = msg.get("message") or {}
@@ -623,37 +921,59 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
             usage = message.get("usage")
             if isinstance(usage, dict) and usage:
                 sink.put_nowait((AgentEventType.USAGE_UPDATED,
-                                 "omp.message_end", {"usage": usage}))
+                                 "omp.message_end",
+                                 _omp_usage_payload(usage, str(handle.get("usage_message_index", 0)))))
+            # 消息水位单调递增，无 usage 的消息也占位，避免两条消息的
+            # usage 落到同一个 ledger identity 互相覆盖。
+            handle["usage_message_index"] = int(handle.get("usage_message_index", 0)) + 1
             error_message = str(message.get("errorMessage") or "").strip()
             stop_reason = str(message.get("stopReason") or "").strip()
             if error_message or stop_reason == "error":
                 detail = error_message or f"stopReason={stop_reason or 'error'}"
                 handle["turn_failed"] = detail
                 sink.put_nowait((AgentEventType.RUNTIME_ERROR,
-                                 "omp.message_end", {
-                                     "code": "omp.assistant_error",
-                                     "detail": detail,
-                                     "error": detail,
-                                     "stop_reason": stop_reason,
-                                 }))
+                                 "omp.message_end",
+                                 dump_payload(RuntimeErrorPayload(
+                                     error=self.failure(
+                                         FailureCategory.PROVIDER,
+                                         "assistant_error",
+                                         message=detail, detail=detail,
+                                         native_code=stop_reason or None)))))
                 return
             if text:
                 handle["assistant_text"] = text
                 handle["saw_assistant_text"] = True
         elif etype == "tool_execution_start":
+            tool = str(msg.get("toolName") or "")
+            call_id = str(msg.get("toolCallId") or "")
+            if tool == _OMP_TASK_TOOL and isinstance(msg.get("args"), dict):
+                # lifecycle 帧只带 parentToolCallId；task 原文按调用 id 暂存，
+                # turn 开始时清空。
+                handle["tool_call_args"][call_id] = msg["args"]
             sink.put_nowait((AgentEventType.TOOL_STARTED,
-                             "omp.tool_execution_start", {
-                                 "call_id": str(msg.get("toolCallId") or ""),
-                                 "tool": str(msg.get("toolName") or ""),
-                                 "input": msg.get("args"),
-                             }))
+                             "omp.tool_execution_start",
+                             dump_payload(ToolPayload(
+                                 tool_call_id=call_id,
+                                 name=tool,
+                                 input=msg.get("args"),
+                                 status="running",
+                                 kind="agent" if tool == _OMP_TASK_TOOL else None,
+                             ))))
         elif etype == "tool_execution_end":
+            call_id = str(msg.get("toolCallId") or "")
+            tool = str(msg.get("toolName") or "")
+            is_error = bool(msg.get("isError"))
             sink.put_nowait((AgentEventType.TOOL_COMPLETED,
-                             "omp.tool_execution_end", {
-                                 "call_id": str(msg.get("toolCallId") or ""),
-                                 "output": msg.get("result"),
-                                 "is_error": bool(msg.get("isError")),
-                             }))
+                             "omp.tool_execution_end",
+                             dump_payload(ToolPayload(
+                                 tool_call_id=call_id,
+                                 output=msg.get("result"),
+                                 status="failed" if is_error else "completed",
+                                 kind="agent" if tool == _OMP_TASK_TOOL else None,
+                             ))))
+            if tool == _OMP_TASK_TOOL:
+                self._on_task_call_end(handle, call_id, msg.get("result"),
+                                       is_error)
         elif etype in ("agent_end", "agent_settled"):
             # isTerminal 字段可选，缺省视为终止（§OMP-8）。
             if msg.get("isTerminal") is False:
@@ -668,18 +988,366 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
                     isinstance(msg.get("data"), dict)
                     and msg["data"].get("agentInvoked") is False):
                 sink.put_nowait(("__turn_done__", etype,
-                                 {"local": True}))
+                                 {"local": True, "prompt_result": msg}))
         # turn_start/compaction_*/queue_update 等其余事件不改变核心状态机。
+
+    # -- 子智能体（原生 task 工具） --------------------------------------------
+
+    def _agent_patch(self, handle: dict[str, Any], agent_id: str,
+                     update: dict[str, Any], native_type: str) -> None:
+        """按 key 合并子智能体 node 并广播 AGENT_UPDATED 补丁。
+
+        turn 外到达的 settle 帧没有 sink：node 状态照更新，agent_id 记入
+        agent_dirty，由下一 turn 开头补播最新快照（不丢终态）。
+        """
+        nodes = handle.setdefault("agent_nodes", {})
+        previous = nodes.get(agent_id)
+        if previous is None:
+            # 恢复后先见到进展后见到 started，也要有 node。
+            previous = {"agent_id": agent_id, "title": agent_id,
+                        "status": "running"}
+        node = {**previous, **{k: v for k, v in update.items() if v is not None}}
+        for key, value in update.items():
+            if value is None and key in ("result", "error"):
+                node[key] = None
+        if node == previous and agent_id in nodes:
+            return
+        nodes[agent_id] = node
+        sink = handle.get("event_sink")
+        if sink is not None:
+            sink.put_nowait((AgentEventType.AGENT_UPDATED, native_type,
+                             dump_payload(AgentUpdatedPayload(
+                                 agents=[AgentNodePayload(**node)],
+                                 patch=True))))
+        else:
+            handle.setdefault("agent_dirty", set()).add(agent_id)
+
+    @staticmethod
+    def _task_item_for(handle: dict[str, Any], call_id: str,
+                       payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """lifecycle.started → task 调用参数里的对应条目（显式 name 与
+        子智能体 id 一致；匿名条目按批次 index 对齐，实测于 17.2.12）。"""
+        args = (handle.get("tool_call_args") or {}).get(call_id)
+        items = _omp_task_items(args)
+        if not items:
+            return None
+        agent_id = str(payload.get("id") or "")
+        for item in items:
+            if item.get("name") and str(item["name"]) == agent_id:
+                return item
+        index = payload.get("index")
+        if isinstance(index, int) and not isinstance(index, bool) \
+                and 0 <= index < len(items):
+            return items[index]
+        return items[0] if len(items) == 1 else None
+
+    def _on_subagent_lifecycle(self, handle: dict[str, Any], payload: Any
+                               ) -> None:
+        if not isinstance(payload, dict):
+            return
+        agent_id = str(payload.get("id") or "")
+        status = str(payload.get("status") or "")
+        mapped = _OMP_AGENT_STATUS.get(status)
+        if not agent_id or not mapped:
+            return
+        update: dict[str, Any] = {"agent_id": agent_id, "status": mapped}
+        call_id = str(payload.get("parentToolCallId") or "")
+        if call_id:
+            update["call_id"] = call_id
+        description = str(payload.get("description") or "").strip()
+        if description:
+            update["title"] = description
+        if payload.get("agent"):
+            update["role"] = str(payload["agent"])
+        if payload.get("sessionFile"):
+            update["session_ref"] = str(payload["sessionFile"])
+        if status == "started":
+            update["result"] = None
+            update["error"] = None
+            item = self._task_item_for(handle, call_id, payload)
+            if item is not None:
+                if not description and item.get("name"):
+                    update["title"] = str(item["name"])
+                if item.get("task"):
+                    update["request"] = str(item["task"])
+        elif mapped == "completed":
+            result = handle["agent_results"].pop(agent_id, None) \
+                or handle["agent_last_text"].pop(agent_id, None)
+            if result:
+                update["result"] = result
+            handle["agent_errors"].pop(agent_id, None)
+        elif mapped == "failed":
+            error = handle["agent_errors"].pop(agent_id, None)
+            if error:
+                update["error"] = error
+            handle["agent_results"].pop(agent_id, None)
+            handle["agent_last_text"].pop(agent_id, None)
+        else:
+            for key in ("agent_results", "agent_last_text", "agent_errors"):
+                handle[key].pop(agent_id, None)
+        self._agent_patch(handle, agent_id, update,
+                          f"omp.subagent_lifecycle.{status}")
+
+    def _on_subagent_progress(self, handle: dict[str, Any], payload: Any
+                              ) -> None:
+        if not isinstance(payload, dict):
+            return
+        progress = payload.get("progress")
+        if not isinstance(progress, dict):
+            return
+        agent_id = str(progress.get("id") or "")
+        if not agent_id:
+            return
+        existing = (handle.get("agent_nodes") or {}).get(agent_id)
+        update = _omp_progress_update(progress, existing)
+        update["agent_id"] = agent_id
+        call_id = str(payload.get("parentToolCallId") or "")
+        if call_id:
+            update["call_id"] = call_id
+        # assignment 是委派原文；task 字段带 executor 的包装前缀。
+        assignment = str(payload.get("assignment") or "").strip()
+        if assignment:
+            update["request"] = assignment
+        elif payload.get("task"):
+            update["request"] = str(payload["task"])
+        if payload.get("agent"):
+            update["role"] = str(payload["agent"])
+        if payload.get("sessionFile"):
+            update["session_ref"] = str(payload["sessionFile"])
+        self._agent_patch(handle, agent_id, update, "omp.subagent_progress")
+
+    def _on_subagent_event(self, handle: dict[str, Any], payload: Any) -> None:
+        """子会话内部事件：工具事件带 agent_id 照常发；文本只进 node。"""
+        if not isinstance(payload, dict):
+            return
+        agent_id = str(payload.get("id") or "")
+        event = payload.get("event")
+        if not agent_id or not isinstance(event, dict):
+            return
+        etype = event.get("type")
+        sink = handle.get("event_sink")
+        if etype == "tool_execution_start":
+            tool = str(event.get("toolName") or "")
+            call_id = str(event.get("toolCallId") or "")
+            args = event.get("args")
+            if tool == _OMP_TASK_TOOL:
+                # 嵌套委派：孙智能体运行在子进程内，父进程收不到它们的
+                # lifecycle 帧，node 以这次嵌套 task 调用本身为粒度。
+                items = _omp_task_items(args)
+                nested: dict[str, Any] = {
+                    "agent_id": f"{agent_id}/{call_id}",
+                    "parent_id": agent_id,
+                    "call_id": call_id,
+                    "status": "running",
+                    "result": None,
+                    "error": None,
+                }
+                if len(items) == 1:
+                    item = items[0]
+                    if item.get("name"):
+                        nested["title"] = str(item["name"])
+                    if item.get("agent"):
+                        nested["role"] = str(item["agent"])
+                    if item.get("task"):
+                        nested["request"] = str(item["task"])
+                self._agent_patch(handle, nested["agent_id"], nested,
+                                  "omp.subagent_event.tool_execution_start")
+            elif tool == _OMP_YIELD_TOOL and isinstance(args, dict) \
+                    and args.get("result") is not None:
+                handle["agent_results"][agent_id] = _omp_result_text(
+                    args["result"])
+            if sink is not None:
+                sink.put_nowait((AgentEventType.TOOL_STARTED,
+                                 "omp.subagent_event.tool_execution_start",
+                                 dump_payload(ToolPayload(
+                                     tool_call_id=call_id,
+                                     name=tool,
+                                     input=args,
+                                     status="running",
+                                     agent_id=agent_id,
+                                     kind="agent" if tool == _OMP_TASK_TOOL else None,
+                                 ))))
+            return
+        if etype == "tool_execution_update":
+            if sink is not None:
+                sink.put_nowait((AgentEventType.TOOL_PROGRESS,
+                                 "omp.subagent_event.tool_execution_update",
+                                 dump_payload(ToolPayload(
+                                     tool_call_id=str(event.get("toolCallId") or ""),
+                                     output=event.get("partialResult"),
+                                     status="running",
+                                     agent_id=agent_id,
+                                 ))))
+            return
+        if etype == "tool_execution_end":
+            tool = str(event.get("toolName") or "")
+            call_id = str(event.get("toolCallId") or "")
+            result = event.get("result")
+            if sink is not None:
+                sink.put_nowait((AgentEventType.TOOL_COMPLETED,
+                                 "omp.subagent_event.tool_execution_end",
+                                 dump_payload(ToolPayload(
+                                     tool_call_id=call_id,
+                                     output=result,
+                                     status="failed" if event.get("isError") else "completed",
+                                     agent_id=agent_id,
+                                 ))))
+            if tool == _OMP_YIELD_TOOL \
+                    and agent_id not in handle["agent_results"]:
+                details = result.get("details") if isinstance(result, dict) else None
+                if details:
+                    handle["agent_results"][agent_id] = _omp_result_text(details)
+            elif tool == _OMP_TASK_TOOL:
+                self._on_nested_task_end(handle, agent_id, call_id, result,
+                                         bool(event.get("isError")))
+            return
+        if etype == "message_end":
+            message = event.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                return
+            error_message = str(message.get("errorMessage") or "").strip()
+            if error_message:
+                handle["agent_errors"][agent_id] = error_message
+            text = _omp_message_text(message)
+            if text:
+                handle["agent_last_text"][agent_id] = text
+                self._agent_patch(handle, agent_id, {"activity": text},
+                                  "omp.subagent_event.message_end")
+
+    def _on_nested_task_end(self, handle: dict[str, Any], agent_id: str,
+                            call_id: str, result: Any, is_error: bool) -> None:
+        nested_id = f"{agent_id}/{call_id}"
+        if is_error:
+            self._agent_patch(handle, nested_id, {
+                "status": "failed",
+                "error": _omp_content_text(result) or None,
+            }, "omp.subagent_event.tool_execution_end")
+            return
+        details = _omp_task_details(result)
+        if details is None:
+            self._agent_patch(handle, nested_id, {
+                "status": "completed",
+                "result": _omp_content_text(result) or None,
+            }, "omp.subagent_event.tool_execution_end")
+            return
+        async_state = details.get("async")
+        if isinstance(async_state, dict) and async_state.get("state") == "running" \
+                and not details.get("results"):
+            # 嵌套异步委派在子进程内交付，本进程没有后续帧；node 保持 running。
+            return
+        progress = {
+            str(p.get("id")): p
+            for p in details.get("progress") or []
+            if isinstance(p, dict) and p.get("id")
+        }
+        results = [r for r in details.get("results") or []
+                   if isinstance(r, dict)]
+        if results:
+            # 嵌套 node 以调用为粒度：任一条目失败即 failed，输出完整拼接。
+            failed = [r for r in results
+                      if r.get("error") or r.get("exitCode") not in (None, 0)
+                      or r.get("aborted")]
+            outputs = [str(r.get("output") or "") for r in results
+                       if r.get("output")]
+            update: dict[str, Any] = {
+                "status": "failed" if failed else "completed",
+            }
+            if failed:
+                update["error"] = str(failed[0].get("error") or "") \
+                    or (outputs[0] if outputs else None)
+            elif outputs:
+                update["result"] = "\n\n".join(outputs)
+            total_tokens = sum(int(r.get("tokens") or 0) for r in results)
+            if total_tokens:
+                update["total_tokens"] = total_tokens
+            if details.get("totalDurationMs") is not None:
+                update["duration_ms"] = details.get("totalDurationMs")
+            tool_uses = sum(int((progress.get(str(r.get("id"))) or {}).get(
+                "toolCount") or 0) for r in results)
+            if tool_uses:
+                update["tool_uses"] = tool_uses
+        else:
+            update = {"status": "completed"}
+            text = _omp_content_text(result)
+            if text:
+                update["result"] = text
+        self._agent_patch(handle, nested_id, update,
+                          "omp.subagent_event.tool_execution_end")
+
+    def _on_task_call_end(self, handle: dict[str, Any], call_id: str,
+                          result: Any, is_error: bool) -> None:
+        """父会话 task 调用收尾：同步批次从 details.results 落锤各 node。
+
+        异步派单（details.async.state=="running"）时 results 为空，node
+        终态由 subagent_lifecycle 帧驱动，这里不动。
+        """
+        details = _omp_task_details(result)
+        if details is None:
+            if is_error:
+                self._fail_call_nodes(
+                    handle, call_id,
+                    _omp_content_text(result) or "task 调用失败")
+            return
+        progress = {
+            str(p.get("id")): p
+            for p in details.get("progress") or []
+            if isinstance(p, dict) and p.get("id")
+        }
+        settled: set[str] = set()
+        for entry in details.get("results") or []:
+            if not isinstance(entry, dict):
+                continue
+            rid = str(entry.get("id") or "")
+            if not rid:
+                continue
+            settled.add(rid)
+            self._apply_task_result(handle, call_id, entry, progress.get(rid))
+        async_state = details.get("async")
+        if isinstance(async_state, dict) and async_state.get("state") == "failed":
+            for rid in progress:
+                if rid not in settled:
+                    self._agent_patch(handle, rid, {"status": "failed"},
+                                      "omp.tool_execution_end.task")
+        if is_error and not settled:
+            self._fail_call_nodes(
+                handle, call_id,
+                _omp_content_text(result) or "task 调用失败")
+
+    def _apply_task_result(self, handle: dict[str, Any], call_id: str,
+                           entry: dict[str, Any],
+                           progress: Optional[dict[str, Any]]) -> None:
+        rid = str(entry.get("id") or "")
+        update = _omp_result_update(rid, entry, progress)
+        update["call_id"] = call_id
+        stored = handle["agent_results"].pop(rid, None)
+        if stored and update.get("status") == "completed":
+            # yield 提交的结构化结果优先于渲染后的 output 文本。
+            update["result"] = stored
+        handle["agent_last_text"].pop(rid, None)
+        handle["agent_errors"].pop(rid, None)
+        self._agent_patch(handle, rid, update, "omp.tool_execution_end.task")
+
+    def _fail_call_nodes(self, handle: dict[str, Any], call_id: str,
+                         error: str) -> None:
+        nodes = handle.get("agent_nodes") or {}
+        for agent_id, node in list(nodes.items()):
+            if node.get("call_id") == call_id \
+                    and node.get("status") in ("pending", "running"):
+                self._agent_patch(handle, agent_id, {
+                    "status": "failed", "error": error or None,
+                }, "omp.tool_execution_end.task")
 
     # -- turn 流 --------------------------------------------------------------
 
     def send(
         self, session: AgentSessionRef, input: AgentInput
     ) -> AsyncIterator[AgentEvent]:
-        return self._turn_stream(session, input)
+        if isinstance(input, MessageInput):
+            return self._turn_stream(session, input)
+        return self.unsupported_input_stream(session, input)
 
     async def _turn_stream(
-        self, session: AgentSessionRef, input: AgentInput
+        self, session: AgentSessionRef, input: MessageInput
     ) -> AsyncIterator[AgentEvent]:
         sid = session.agent_session_id
         seq = self.sequencer_for(sid)
@@ -705,28 +1373,45 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
                 else AgentEventType.SESSION_STARTED, seq,
                 external_session_id=external_id,
                 native_type="omp.session.start",
-                payload={"transport": "rpc-ui" if self._rpc_ui else "rpc",
-                         "adapter_id": self.id,
-                         "instance_id": self.identity.instance_id,
-                         "cwd": handle["cwd"],
-                         "host_tools": handle.get("host_tools", 0),
-                         "protocol_version": (handle.get("ready") or {}).get(
-                             "protocolVersion")},
+                payload=SessionPayload(
+                    transport="rpc-ui" if self._rpc_ui else "rpc",
+                    adapter_id=self.id,
+                    instance_id=self.identity.instance_id,
+                    cwd=handle["cwd"],
+                    native={
+                        "host_tools": handle.get("host_tools", 0),
+                        "protocol_version": (handle.get("ready") or {}).get(
+                            "protocolVersion"),
+                    }),
                 **common))
         turn_id = new_id("turn")
         handle["current_turn_id"] = turn_id
         handle["turn_failed"] = None
         handle["saw_assistant_text"] = False
         handle["assistant_text"] = ""
+        handle["tool_call_args"] = {}
         yield self.emit(build_event(
             AgentEventType.TURN_STARTED, seq,
             external_session_id=external_id, turn_id=turn_id,
             native_type="omp.prompt.start",
-            payload={"kind": input.kind},
+            payload=TurnStartedPayload(kind=input.kind),
             **common))
 
         queue: asyncio.Queue = asyncio.Queue()
         handle["event_sink"] = queue
+        # 上一 turn 结束后才 settle 的子智能体：补播最新 node 快照。
+        dirty = handle.get("agent_dirty") or set()
+        if dirty:
+            handle["agent_dirty"] = set()
+            nodes = handle.get("agent_nodes") or {}
+            agents = [dict(nodes[a]) for a in sorted(dirty) if a in nodes]
+            if agents:
+                queue.put_nowait((AgentEventType.AGENT_UPDATED,
+                                  "omp.subagent.flush",
+                                  dump_payload(AgentUpdatedPayload(
+                                      agents=[AgentNodePayload(**node)
+                                              for node in agents],
+                                      patch=True))))
 
         async def run_prompt() -> Optional[Exception]:
             try:
@@ -737,7 +1422,10 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
                                     handle.get("conversation_thread_id"),
                                     self._prompt_timeout))
                 if response.get("agentInvoked") is False:
-                    queue.put_nowait(("__turn_done__", "omp.command.completed", {"local": True}))
+                    queue.put_nowait(("__turn_done__", "omp.command.completed", {
+                        "local": True,
+                        "prompt_response": response,
+                    }))
                 return None
             except Exception as exc:  # noqa: BLE001
                 return exc
@@ -795,7 +1483,9 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
                 AgentEventType.TURN_FAILED, seq,
                 external_session_id=external_id, turn_id=turn_id,
                 native_type="omp.prompt.error",
-                payload={"error": str(ack_error)[:300]},
+                payload=TurnFailedPayload(error=self.exception_failure(
+                    ack_error, FailureCategory.TRANSPORT, "prompt_error",
+                    message=f"OMP prompt failed: {ack_error}")),
                 **common))
             return
         if turn_failed:
@@ -803,43 +1493,18 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
                 AgentEventType.TURN_FAILED, seq,
                 external_session_id=external_id, turn_id=turn_id,
                 native_type="omp.assistant_error",
-                payload={
-                    "error": {
-                        "code": "omp.assistant_error",
-                        "message": str(turn_failed)[:500],
-                    },
-                },
+                payload=TurnFailedPayload(error=self.failure(
+                    FailureCategory.PROVIDER, "assistant_error",
+                    message=str(turn_failed), detail=str(turn_failed))),
                 **common))
             return
         assistant_text = str(handle.pop("assistant_text", ""))
-        if done_info.get("local") and not assistant_text.strip():
-            assistant_text = "原生命令已执行完成"
-            saw_assistant_text = True
-        if not saw_assistant_text or not assistant_text.strip():
-            yield self.emit(build_event(
-                AgentEventType.TURN_FAILED, seq,
-                external_session_id=external_id, turn_id=turn_id,
-                native_type="omp.empty_assistant",
-                payload={
-                    "error": {
-                        "code": "omp.empty_assistant",
-                        "message": "OMP turn ended without assistant text",
-                    },
-                },
-                **common))
-            return
-        yield self.emit(build_event(
-            AgentEventType.MESSAGE_COMPLETED, seq,
-            external_session_id=external_id, turn_id=turn_id,
-            native_type="omp.message.completed",
-            payload={"text": assistant_text, "role": "assistant"},
-            **common))
-        yield self.emit(build_event(
-            AgentEventType.TURN_COMPLETED, seq,
-            external_session_id=external_id, turn_id=turn_id,
+        for event in self.completed_turn_events(
+            seq, text=assistant_text,
+            common={**common, "external_session_id": external_id, "turn_id": turn_id},
             native_type="omp.agent_end",
-            payload=done_info,
-            **common))
+            payload=TurnCompletedPayload(native=dict(done_info))):
+            yield event
 
     def resume(self, session: AgentSessionRef) -> AsyncIterator[AgentEvent]:
         return self._resume_stream(session)
@@ -860,8 +1525,9 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
             AgentEventType.SESSION_RESUMED, seq,
             external_session_id=handle.get("external_session_id"),
             native_type="omp.session.resumed",
-            payload={"transport": "rpc-ui" if self._rpc_ui else "rpc",
-                     "resume_handle": handle.get("resume_handle")},
+            payload=SessionPayload(
+                transport="rpc-ui" if self._rpc_ui else "rpc",
+                native={"resume_handle": handle.get("resume_handle")}),
             agent_session_id=sid,
             run_id=record.run_id if record else None,
             execution_generation=(
@@ -881,11 +1547,14 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
             )
         return self.unsupported_receipt(
             "command", "rpc_failed", session=session,
-            detail={"detail": detail[:200]})
+            detail={"detail": detail})
 
     async def steer(
         self, session: AgentSessionRef, input: AgentInput
     ) -> CommandReceipt:
+        if not isinstance(input, SteerInput):
+            return self.unsupported_receipt(
+                "steer", "steer", session=session, detail={"input_kind": input.kind})
         handle = self._rpc.get(session.agent_session_id)
         if handle is None:
             return self.unsupported_receipt("steer", "no_active_session",
@@ -898,6 +1567,7 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
             return self._receipt(session, False, str(exc))
 
     async def interrupt(self, session: AgentSessionRef) -> CommandReceipt:
+        self._mark_turn_interrupted(session.agent_session_id)
         handle = self._rpc.get(session.agent_session_id)
         if handle is None:
             return self.unsupported_receipt("interrupt", "no_active_session",
@@ -910,7 +1580,12 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
 
     async def runtime_operation(self, session: AgentSessionRef, name: str, arguments: str = "") -> dict[str, Any]:
         from .rpc_commands import rpc_operation
-        return await rpc_operation(self, session, name, arguments)
+        handle = self._rpc.get(session.agent_session_id)
+        if not handle or handle.get("current_turn_id"):
+            raise RuntimeError("请等待当前回复结束后执行命令")
+        return await rpc_operation(
+            self._cmd, handle["peer"], adapter_id=self.id, engine=self.engine,
+            name=name, arguments=arguments)
 
     async def runtime_capability_snapshot(
         self, session: Optional[AgentSessionRef] = None
@@ -938,7 +1613,7 @@ class OmpRpcAdapter(BaseExternalAgentAdapter):
             base.stale = True
             base.diagnostics.append(
                 "OMP get_available_commands 读取失败："
-                f"{type(exc).__name__}: {str(exc)[:160]}"
+                f"{type(exc).__name__}: {exc}"
             )
         handle["capability_revision"] = int(
             handle.get("capability_revision") or 0
@@ -1008,6 +1683,12 @@ class OmpAcpAdapter(BaseAcpAdapter):
     """
 
     adapter_id = "omp.acp"
+    unsupported_access_mode_reasons = {
+        AccessMode.AUTO.value: (
+            "OMP --approval-mode offers only always-ask, write and yolo; "
+            "there is no native auto policy"
+        ),
+    }
 
     def __init__(self, *, binary: Optional[str] = None,
                  **kwargs: Any) -> None:
@@ -1020,16 +1701,20 @@ class OmpAcpAdapter(BaseAcpAdapter):
     def _agent_argv_for_request(self, request: SessionStart) -> list[str]:
         mode = request.access_mode or AccessMode.SUPERVISED.value
         argv = [self._binary]
-        # OMP owns these modes.  ``auto`` intentionally passes no flag so the
-        # user's own OMP default/config remains authoritative.
         if mode == AccessMode.SUPERVISED.value:
             argv += ["--approval-mode", "always-ask"]
         elif mode == AccessMode.AUTO_ACCEPT_EDITS.value:
             argv += ["--approval-mode", "write"]
         elif mode == AccessMode.FULL_ACCESS.value:
             argv += ["--approval-mode", "yolo"]
-        if request.model:
-            argv += ["--model", str(request.model)]
+        else:
+            raise ValueError(f"omp.acp has no native approval mode for {mode!r}")
+        env = {**os.environ, **self._env_extra, **dict(request.options.env)}
+        provider, model = OmpRpcAdapter._resolve_provider_model(request, env)
+        if provider:
+            argv += ["--provider", provider]
+        if model:
+            argv += ["--model", model]
         argv.append("acp")
         return argv
 
@@ -1058,8 +1743,160 @@ class OmpAcpAdapter(BaseAcpAdapter):
                 options, ("allow_once", "allow_always"))
         return await super()._request_permission(agent_session_id, params)
 
+    # -- 子智能体（task 工具，经 ACP tool_call 的 rawInput/rawOutput 识别） ------
+    #
+    # ACP 模式没有 RPC 的 subagent_* 帧；结构信号只有两处（本机 17.2.12
+    # 实测）：task 调用的 rawInput 带 task/tasks 参数（OMP 内置工具中唯
+    # 一），tool_call_update 的 rawOutput.details 是 TaskToolDetails。
+    # 异步派单时工具调用以 completed 提前收尾（仅表示派单被接受），子智能体
+    # 的真实进展由后续 in_progress 更新的 details.progress/async.state 携带。
+
+    def _delegation_info(self, update: dict[str, Any]) -> Optional[dict[str, Any]]:
+        items = _omp_task_items(update.get("rawInput"))
+        if not items:
+            return None
+        first = items[0]
+        desc: dict[str, Any] = {
+            "title": str(first.get("name") or update.get("title") or "task"),
+            "request": str(first.get("task") or "") or None,
+            "role": str(first.get("agent") or "") or None,
+        }
+        if len(items) == 1 and first.get("name"):
+            # 显式 name 即子智能体 id（实测 lifecycle/progress 的 id 一致）；
+            # 匿名/批量条目的真实 id 由 progress 帧公布后再建 node。
+            desc["agent_id"] = str(first["name"])
+        return desc
+
+    def _delegation_result(
+        self, handle: dict[str, Any], update: dict[str, Any],
+        desc: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        details = _omp_task_details(update.get("rawOutput"))
+        if details is None:
+            return None
+        async_state = details.get("async")
+        if isinstance(async_state, dict) and async_state.get("state") == "running" \
+                and not details.get("results"):
+            if str(update.get("status") or "") == "completed":
+                # 异步派单回执：completed 只表示 spawn 被接受，不能把 node
+                # 落锤；同时清掉基类会写入的派单回执文本（非子智能体结果）。
+                return {"status": "running", "result": None}
+            return None
+        # 同步收尾：_tool_meta_nodes 已按 results[] 写好 node，这里防止基类
+        # 用整段 content 文本覆盖 per-item 的 result/error。
+        target = str(desc.get("agent_id") or "")
+        node = (handle.get("agent_nodes") or {}).get(target) or {}
+        link: dict[str, Any] = {}
+        if node.get("result"):
+            link["result"] = node["result"]
+        if node.get("error"):
+            link["error"] = node["error"]
+        return link or None
+
+    def _tool_meta_nodes(
+        self, handle: dict[str, Any], update: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        details = _omp_task_details(update.get("rawOutput"))
+        if details is None:
+            return []
+        status = str(update.get("status") or "")
+        async_state = details.get("async")
+        results = [r for r in details.get("results") or []
+                   if isinstance(r, dict)]
+        if status in ("completed", "failed") and not results and (
+                isinstance(async_state, dict)
+                and async_state.get("state") == "running"):
+            # 异步派单回执不是子智能体进展；让 tool 行正常收尾。
+            return []
+        nodes = handle.get("agent_nodes") or {}
+        patches: list[dict[str, Any]] = []
+        progress: dict[str, dict[str, Any]] = {}
+        for entry in details.get("progress") or []:
+            if isinstance(entry, dict) and entry.get("id"):
+                progress[str(entry["id"])] = entry
+        for agent_id, entry in progress.items():
+            patch = _omp_progress_update(entry, nodes.get(agent_id))
+            patch["agent_id"] = agent_id
+            assignment = str(
+                entry.get("assignment") or entry.get("task") or "").strip()
+            if assignment:
+                patch["request"] = assignment
+            if entry.get("agent"):
+                patch["role"] = str(entry["agent"])
+            patches.append(patch)
+        for entry in results:
+            rid = str(entry.get("id") or "")
+            if rid:
+                patches.append(
+                    _omp_result_update(rid, entry, progress.get(rid)))
+        return patches
+
+    def _dispatch_update(
+        self, agent_session_id: str, session_id: str,
+        update: dict[str, Any], replay: bool,
+    ) -> None:
+        super()._dispatch_update(agent_session_id, session_id, update, replay)
+        if replay:
+            return
+        handle = self._handle_for(agent_session_id)
+        if handle is None:
+            return
+        if str(update.get("sessionUpdate") or "") != "tool_call_update":
+            return
+        if str(update.get("status") or "") not in ("completed", "failed"):
+            return
+        # hub wait/jobs 的 settle 快照是异步子智能体结果的正式投递通道
+        # （§OMP task 异步契约）；只回填 node 缺失的字段，不覆盖 yield 结果。
+        events: list[tuple[Any, str, dict[str, Any]]] = []
+        for patch in self._hub_job_patches(handle, update):
+            agent = str(patch.pop("agent_id", "") or "")
+            if agent:
+                event = self._patch_agent_node(handle, agent, patch)
+                if event is not None:
+                    events.append(event)
+        self._emit_handle_events(handle, events)
+
+    @staticmethod
+    def _hub_job_patches(
+        handle: dict[str, Any], update: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        raw_output = update.get("rawOutput")
+        details = raw_output.get("details") if isinstance(raw_output, dict) else None
+        jobs = details.get("jobs") if isinstance(details, dict) else None
+        if not isinstance(jobs, list):
+            return []
+        nodes = handle.get("agent_nodes") or {}
+        patches: list[dict[str, Any]] = []
+        for job in jobs:
+            if not isinstance(job, dict) or job.get("type") != "task":
+                continue
+            agent_id = str(job.get("id") or "")
+            if not agent_id:
+                continue
+            mapped = _OMP_AGENT_STATUS.get(str(job.get("status") or ""))
+            if mapped not in _OMP_TERMINAL_STATUS:
+                continue
+            node = nodes.get(agent_id) or {}
+            patch: dict[str, Any] = {"agent_id": agent_id}
+            if node.get("status") not in _OMP_TERMINAL_STATUS:
+                patch["status"] = mapped
+            text = str(job.get("resultText") or "")
+            field = "result" if mapped == "completed" else "error"
+            if text and not node.get(field):
+                patch[field] = text
+            if job.get("durationMs") is not None and node.get("duration_ms") is None:
+                patch["duration_ms"] = job.get("durationMs")
+            if job.get("resolvedModel") and not node.get("model"):
+                patch["model"] = str(job["resolvedModel"])
+            if len(patch) > 1:
+                patches.append(patch)
+        return patches
+
     def _probe_extra_caps(self, caps: AgentCapabilities, hello: Any) -> None:
         caps.supported_models = []  # ACP v1 无模型枚举方法，保持空（static）
+        # 原生 task 子智能体：经 tool_call rawInput/rawOutput 的
+        # TaskToolDetails 映射（本机 17.2.12 ACP 实测）。
+        caps.subagents = True
 
 
 __all__ = [

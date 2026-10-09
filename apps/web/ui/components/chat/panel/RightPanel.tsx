@@ -123,7 +123,7 @@ function SurfaceTab({
         onAuxClick={(event) => { if (event.button === 1) { event.preventDefault(); onClose(surface.id); } }}
         onContextMenu={ctx.onContextMenu}
         className={cn(
-          "group/tab relative flex h-7 max-w-[180px] shrink-0 cursor-default select-none items-center gap-1.5 rounded-lg pl-2 pr-1 text-[12.5px] font-medium outline-none transition-colors duration-150",
+          "group/tab relative flex h-7 max-w-[180px] shrink-0 cursor-default select-none items-center gap-1.5 rounded-lg pl-2 pr-1 text-[13px] font-medium outline-none transition-colors duration-150",
           active
             ? "bg-cx-elevated text-cx-fg shadow-[0_0_0_1px_var(--cx-border),0_1px_2px_hsl(var(--cx-shadow-color)/0.06)]"
             : "text-cx-fg-3 hover:bg-cx-hover hover:text-cx-fg",
@@ -202,7 +202,7 @@ function Launcher({ threadId, hasWorkspace }: { threadId: string; hasWorkspace: 
     <div className="cx-scroll flex h-full flex-col overflow-y-auto px-5 pb-6 pt-8">
       <div className="mb-5">
         <h2 className="text-[15px] font-semibold tracking-[-0.01em] text-cx-fg">打开工作视图</h2>
-        <p className="mt-1 text-[12.5px] text-cx-fg-3">在右侧面板并排查看变更、预览、文件和终端。按字母键快速打开。</p>
+        <p className="mt-1 text-[13px] text-cx-fg-3">在右侧面板并排查看变更、预览、文件和终端。按字母键快速打开。</p>
       </div>
       <div className="grid grid-cols-1 gap-1.5 @[440px]/panel:grid-cols-2">
         {LAUNCHER.map((item) => {

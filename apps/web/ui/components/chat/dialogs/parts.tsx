@@ -27,7 +27,7 @@ export function DialogSection({
     <section className={cn("cx-dialog-section", className)} data-testid={testId}>
       <header className="flex min-h-7 items-center gap-2">
         {icon ? <Icon name={icon} size={14} className="shrink-0 text-cx-fg-4" /> : null}
-        <h3 className="min-w-0 flex-1 truncate text-[12.5px] font-semibold text-cx-fg-2">{title}</h3>
+        <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold text-cx-fg-2">{title}</h3>
         {meta ? <span className="shrink-0 text-[12px] text-cx-fg-4">{meta}</span> : null}
         {actions ? <div className="flex shrink-0 items-center gap-0.5">{actions}</div> : null}
       </header>
@@ -61,10 +61,10 @@ export function MetaRow({
 }) {
   return (
     <div className="group/meta flex min-h-9 items-center gap-3 border-b border-cx-border-subtle px-3 py-1.5 last:border-b-0">
-      <dt className="w-[88px] shrink-0 text-[12.5px] text-cx-fg-3">{label}</dt>
+      <dt className="w-[88px] shrink-0 text-[13px] text-cx-fg-3">{label}</dt>
       <dd
         className={cn(
-          "min-w-0 flex-1 truncate text-[12.5px] text-cx-fg",
+          "min-w-0 flex-1 truncate text-[13px] text-cx-fg",
           mono && "font-cx-mono text-[12px] text-cx-fg-2",
         )}
         title={title ?? (typeof children === "string" ? children : undefined)}
@@ -104,7 +104,7 @@ export function MetricTile({
     <div className="flex min-w-0 flex-col gap-1 rounded-xl border border-cx-border-subtle bg-cx-elevated px-3 py-2.5">
       <span className="truncate text-[12px] text-cx-fg-3">{label}</span>
       <span className={cn("cx-tabular truncate text-[18px] font-semibold leading-6 tracking-[-0.01em]", valueTone[tone])}>{value}</span>
-      {hint ? <span className="truncate text-[11.5px] text-cx-fg-4">{hint}</span> : null}
+      {hint ? <span className="truncate text-[12px] text-cx-fg-4">{hint}</span> : null}
     </div>
   );
 }

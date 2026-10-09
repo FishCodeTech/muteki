@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -62,6 +61,7 @@ def create_chat_plugins_router(plugins: ChatPluginService, conversation: Any,
         return {"engines": list(ENGINES), "modes": list(MODES), "engine": engine, "revision": plugins.revision(engine),
                 "host_discovery_enabled": host_discovery_enabled(),
                 "packages": [plugins.public(r) for r in plugins.records()], "native_skills": native,
+                "bundled_plugins": [{"id": "muteki-visualize", "name": "Muteki Visualize", "modes": ["chat"]}],
                 "builtin_skills": [{"id": "agent-browser", "modes": ["pentest"],
                                     "enabled": capability_enabled("skills", "agent-browser"),
                                     "scope": "new_workers"}],
@@ -71,38 +71,32 @@ def create_chat_plugins_router(plugins: ChatPluginService, conversation: Any,
                 "runtime_mcp": plugins.runtime_mcp_health(engine, mode, run_id if mode != "chat" else "")}
 
     @router.get("/visualizations/{thread_id}")
-    async def visualization(thread_id: str, path: str):
+    async def visualization(thread_id: str, path: str, message_id: str = ""):
+        from muteki.conversation.visualizations import VisualizationError
+        from muteki.external_agents.factory import engine_for_adapter
         thread = conversation.manager.get_thread(thread_id)
         if thread is None or thread.mode != "conversation":
             raise HTTPException(404, "对话不存在")
-        root = plugins.visualization_root(thread_id)
         try:
-            target = Path(path).resolve(strict=True)
-            if not target.is_relative_to(root) or target.suffix.lower() != ".html" or target.stat().st_size > 1_000_000:
-                raise ValueError("invalid visualization")
-            # An arbitrary path is not a file-reading API. The assistant must
-            # have attached this exact path in this conversation's output.
-            import json
-            import re
-            attached = False
-            for message in conversation.conv.list_current_messages(thread_id):
-                if message.role != "assistant":
-                    continue
-                for marked, plain in re.findall(r"(?:visualize(\{[^\n]*?\})|^\s*(?:muteki-visualize|visualize)[ \t]+(\{[^\n]*\})[ \t]*$)", message.text or "", re.MULTILINE):
-                    raw = marked or plain
-                    try:
-                        if Path(json.loads(raw).get("path", "")).resolve() == target:
-                            attached = True
-                    except (ValueError, TypeError):
-                        continue
-            if not attached:
-                raise ValueError("not attached")
-            from muteki.external_agents.factory import engine_for_adapter
             engine = engine_for_adapter(conversation.manager.runtime_selection(thread_id).adapter_id)
-            return {"html": await asyncio.to_thread(target.read_text, encoding="utf-8"),
-                    "assets": await asyncio.to_thread(plugins.visualization_assets, engine)}
-        except (OSError, ValueError):
-            raise HTTPException(404, "图形文件尚未生成或不属于当前对话") from None
+            return await asyncio.to_thread(
+                plugins.visualization_document, thread_id,
+                conversation.conv.list_current_messages(thread_id), engine, path, message_id,
+            )
+        except VisualizationError as exc:
+            raise HTTPException(404 if exc.code == "visualization.not_attached" else 422,
+                                {"code": exc.code, "message": str(exc)}) from exc
+        except (OSError, ValueError) as exc:
+            raise HTTPException(500, {"code": "visualization.store_failed", "message": str(exc)}) from exc
+
+    @router.post("/bundled/muteki-visualize")
+    async def install_visualize():
+        try:
+            result = await asyncio.to_thread(plugins.install_visualize)
+            await changed()
+            return result
+        except ChatPluginError as exc:
+            raise HTTPException(400, {"code": exc.code, "message": str(exc)}) from exc
 
     @router.post("/install")
     async def install(body: InstallBody):

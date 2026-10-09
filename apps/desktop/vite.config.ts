@@ -16,7 +16,10 @@ function packageRoot(name: string) {
 export default defineConfig({
   root: 'renderer',
   base: '/',
-  plugins: [react(), {
+  plugins: [react(), {name: 'desktop-no-next-runtime', resolveId(source) {
+    if (source === 'next' || source.startsWith('next/')) throw new Error(`Shared desktop code cannot import ${source}; use the host navigation adapter.`);
+    return null;
+  }}, {
     name: 'desktop-shared-dependencies',
     async resolveId(source, importer) {
       const name = source.startsWith('@') ? source.split('/').slice(0, 2).join('/') : source.split('/')[0];
@@ -27,7 +30,7 @@ export default defineConfig({
     },
   }],
   publicDir: path.join(ui, 'public'),
-  define: { 'process.env.NEXT_PUBLIC_MUTEKI_API': JSON.stringify(''), 'process.env.NODE_ENV': JSON.stringify('production') },
+  define: { 'process.env.NEXT_PUBLIC_MUTEKI_UI_BUILD': JSON.stringify(require('../web/ui/build-info.cjs').uiBuildId()), 'process.env.NEXT_PUBLIC_MUTEKI_API': JSON.stringify(''), 'process.env.NODE_ENV': JSON.stringify('production') },
   resolve: { alias: [{ find: '@', replacement: ui }, { find: 'react', replacement: packageRoot('react') }, { find: 'react-dom', replacement: packageRoot('react-dom') }], dedupe: ['react', 'react-dom'] },
   css: { postcss: { plugins: [require('@tailwindcss/postcss')({ base: path.resolve('.') })] } },
   build: { outDir: '../renderer-dist', emptyOutDir: true, target: 'chrome140' },

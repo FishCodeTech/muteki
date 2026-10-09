@@ -23,7 +23,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <strong>简体中文</strong> · <a href="CHANGELOG.md">版本更新</a>
+  <a href="README.md">English</a> · <strong>简体中文</strong> · <a href="CHANGELOG.md">版本更新</a> · <a href="docs/development.md">开发版编译与更新</a>
 </p>
 
 <p align="center">
@@ -95,13 +95,17 @@ tsecbench 托管模式下+deepseek-flash，排名13
 
 ## 版本更新
 
-当前版本为 **0.4.0**。新增功能、行为变化、移除内容及升级说明见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本为 **0.4.1**。新增功能、行为变化、移除内容及升级说明见 [CHANGELOG.md](CHANGELOG.md)。
+
+[0.4.1 发布页](https://github.com/FishCodeTech/muteki/releases/tag/v0.4.1) 提供 Apple 芯片和 Intel Mac 的 macOS 客户端，内置本地服务，也可连接远程 Muteki 服务。本次暂不提供 Windows、Linux 桌面安装包，Web 和容器部署继续支持。
+
+本次 macOS 安装包使用临时签名，尚未公证。桌面更新请手动安装；应用内候选版本更新流程需要稳定的 Developer ID 签名。
 
 ---
 
 ## 快速开始
 
-> **当前优先体验：CTF 单题模式。** 首页默认只显示“单题任务”；对话、比赛及自定义插件仍在测试中，按下文步骤开启。Web 页面的“渗透”模式正在重写，当前不可选。
+> **从 CTF 或渗透测试工作区开始。** 首页默认显示这两个工作区。对话和比赛工作区可按下文说明，在外观设置中开启。
 
 ### 1. 准备环境并启动
 
@@ -315,7 +319,7 @@ MUTEKI_WEB_PASSWORD='请替换为强密码' \
 ```bash
 ./run.sh upgrade --check   # 检查稳定版
 ./run.sh install            # 安装托管版本
-muteki upgrade v0.4.0      # 更新到本次版本
+muteki upgrade v0.4.1      # 更新到本次版本
 muteki rollback            # 回滚到上一个已安装版本
 muteki version             # 查看版本与安装形态
 ```

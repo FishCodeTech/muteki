@@ -17,12 +17,18 @@ Conversation 私有的读模型与记录：
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from muteki.platform.contracts.base import ContractModel, new_id, utcnow
 from muteki.platform.contracts.external_agents import AccessMode
+
+#: 后台 Runtime 能力刷新失败的稳定错误码（不属于任何 Turn）。
+CAPABILITY_REFRESH_FAILED_CODE = "conversation.runtime.capability_refresh_failed"
+
+#: Per-thread / per-turn interaction mode (mirrors ``SessionStart.interaction_mode``).
+InteractionMode = Literal["default", "plan"]
 
 #: Turn 状态机。
 TURN_QUEUED = "queued"
@@ -30,6 +36,7 @@ TURN_RUNNING = "running"
 TURN_COMPLETED = "completed"
 TURN_FAILED = "failed"
 TURN_INTERRUPTED = "interrupted"
+TURN_CANCELLED = "cancelled"
 TURN_SUPERSEDED = "superseded"
 
 #: Turn 种类。
@@ -41,6 +48,10 @@ TURN_KIND_NATIVE_REWIND = "native_rewind"
 
 #: 对话执行器 id（任务书 9.1：builtin.conversation 的 default_executor）。
 EXECUTOR_ID = "external-agent.single"
+
+#: Agent node origins shared by native delegation trees and Muteki subagents.
+SUBAGENT_ORIGIN_NATIVE = "provider_native"
+SUBAGENT_ORIGIN_APP = "app_owned"
 
 
 class TurnRecord(ContractModel):
@@ -73,6 +84,11 @@ class TurnRecord(ContractModel):
     runtime_invocation: dict[str, Any] = Field(default_factory=dict)
     runtime_snapshot: Optional[dict[str, str]] = None
     native_turn_id: str = ""
+    # Planning mode this turn was sent with; retry/edit-resend replay it.
+    interaction_mode: InteractionMode = "default"
+    # Set by the terminal turn event: reusable | needs_restart | closed. Says
+    # whether the next turn can reuse the native session; empty while running.
+    thread_disposition: str = ""
     status: str = TURN_QUEUED
     usage: dict[str, Any] = Field(default_factory=dict)
     error: dict[str, Any] = Field(default_factory=dict)
@@ -111,7 +127,11 @@ class ThreadRuntimeSelection(ContractModel):
     credential_id: str = ""
     model: str = ""
     effort: str = ""
+    service_tier: str = ""
     access_mode: str = AccessMode.SUPERVISED.value
+    # Preference only: plan mode is applied per turn, so it is not part of
+    # ``session_key`` unless the adapter cannot switch it per turn.
+    interaction_mode: InteractionMode = "default"
     # Legacy fields are retained for reading existing Thread payloads.  New
     # selections persist only access_mode.
     permission_mode: str = ""
@@ -126,11 +146,14 @@ class ThreadRuntimeSelection(ContractModel):
     @property
     def session_key(self) -> str:
         """Launch-time identity; model options must reach a new native session."""
+        # The tier segment is appended only when set so sessions recorded
+        # before service tiers existed keep matching their launch identity.
         return (f"{self.runtime_key}|{self.credential_id}"
                 f"|model={self.model}|effort={self.effort}"
                 f"|access_mode={self.access_mode}"
                 f"|permission_mode={self.permission_mode}"
-                f"|sandbox_mode={self.sandbox_mode}")
+                f"|sandbox_mode={self.sandbox_mode}"
+                + (f"|service_tier={self.service_tier}" if self.service_tier else ""))
 
 
 class ConversationMessage(ContractModel):
@@ -190,6 +213,9 @@ class ThreadPlanSnapshot(ContractModel):
     pending_amendment: Optional[dict[str, Any]] = None
     last_change_summary: Optional[str] = None
     unsupported_reason: Optional[str] = None
+    # Proposed plan body a plan-mode turn produced (engine-reported text, not
+    # parsed into tasks); shown by the plan follow-up card.
+    markdown: Optional[str] = None
     updated_at: datetime = Field(default_factory=utcnow)
 
 
@@ -199,16 +225,72 @@ class ConversationAgentNode(ContractModel):
     agent_id: str = ""
     parent_id: Optional[str] = None
     title: str = ""
+    nickname: Optional[str] = None
+    role: Optional[str] = None
     model: Optional[str] = None
     turn_id: Optional[str] = None
     message_id: Optional[str] = None
+    # Delegation tool call that spawned (or last resumed) this agent.
     call_id: Optional[str] = None
+    # Native child session / thread id when the runtime exposes one.
+    session_ref: Optional[str] = None
     # pending | running | completed | failed | cancelled
     status: str = "pending"
     request: Optional[str] = None
     result: Optional[str] = None
     error: Optional[str] = None
+    # Latest runtime-reported activity line (e.g. last tool name).
+    activity: Optional[str] = None
+    tool_uses: Optional[int] = None
+    total_tokens: Optional[int] = None
+    duration_ms: Optional[int] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
     updated_at: datetime = Field(default_factory=utcnow)
+    # provider_native: reported by the Runtime (``core.agent.updated``).
+    # app_owned: spawned by Muteki as a separate conversation Thread; the
+    # fields below are only populated for that origin.
+    origin: str = SUBAGENT_ORIGIN_NATIVE
+    # Child conversation Thread (also the stable subagent id).
+    thread_id: Optional[str] = None
+    # Latest Turn of the child Thread; ``message_id`` then references the
+    # child's final assistant message for that Turn (full text lives there).
+    child_turn_id: Optional[str] = None
+    depth: Optional[int] = None
+    adapter_id: Optional[str] = None
+    access_mode: Optional[str] = None
+    # shared | worktree
+    isolation: Optional[str] = None
+    workspace_id: Optional[str] = None
+    worktree_path: Optional[str] = None
+    # active | removed | retained
+    worktree_state: Optional[str] = None
+    # Durable progress of the spawn side effects, so startup recovery resumes
+    # from the last confirmed step: planned | workspace_ready | activated |
+    # dispatched | skipped (cancelled before the first Turn) | failed.
+    # None on nodes recorded before progress tracking; those are never resumed.
+    spawn_state: Optional[str] = None
+    cancel_requested: bool = False
+    error_code: Optional[str] = None
+    # Principal the child Binding is issued for; recovery re-activates with it.
+    principal_id: Optional[str] = None
+
+
+class ThreadLineage(ContractModel):
+    """Ancestry of a Muteki-spawned (app_owned) subagent Thread."""
+
+    origin: str = SUBAGENT_ORIGIN_APP
+    subagent_id: str = ""
+    parent_thread_id: str = ""
+    # Parent Turn that issued the spawn; None when spawned outside a Turn.
+    parent_turn_id: Optional[str] = None
+    root_thread_id: str = ""
+    # root Thread = 0, its children = 1, grandchildren = 2.
+    depth: int = 1
+    isolation: str = "shared"
+    workspace_id: Optional[str] = None
+    worktree_path: Optional[str] = None
+    spawned_at: datetime = Field(default_factory=utcnow)
 
 
 class ThreadAgentTreeSnapshot(ContractModel):
@@ -237,6 +319,9 @@ class ThreadState(ContractModel):
     history_rebuild_pending: bool = False
     # Durable journal for a crash between provider rewind and branch commit.
     history_recovery_required: bool = False
+    # Deferred native fork, created on the target connection with its own
+    # credentials/MCP. Contains provider references, never credentials.
+    native_fork: Optional[dict[str, str]] = None
     # 当前活跃 AgentSession 及其 Runtime key（切换检测用）
     agent_session_id: Optional[str] = None
     session_runtime_key: str = ""
@@ -249,6 +334,11 @@ class ThreadState(ContractModel):
     plan: Optional[ThreadPlanSnapshot] = None
     # C21: delegated Agent ownership tree (not ordinary shell/tool rows).
     agents: Optional[ThreadAgentTreeSnapshot] = None
+    # Set only on Threads spawned by ``conversation.subagent.spawn``.
+    lineage: Optional[ThreadLineage] = None
+    # Direct app_owned children of this Thread (grandchildren live on the
+    # child Thread's own state).
+    subagents: list[ConversationAgentNode] = Field(default_factory=list)
     last_turn_seq: int = 0
     message_count: int = 0
     usage: dict[str, Any] = Field(default_factory=dict)
@@ -258,8 +348,11 @@ class ThreadState(ContractModel):
     context_window: Optional[dict[str, Any]] = None
     last_error: dict[str, Any] = Field(default_factory=dict)
     last_message_preview: str = ""
-    # 已投影的线程流水位与用户已读水位；head > read 即未读
+    # head：已投影的线程流水位；attention：最后一条需要用户查看的事件
+    # （正文、回合结果、审批等；会话生命周期、能力探测、用量这类后台
+    # 记账不算）；read：用户已读水位。attention > read 即未读。
     head_stream_seq: int = 0
+    attention_stream_seq: int = 0
     read_stream_seq: int = 0
     last_active_at: datetime = Field(default_factory=utcnow)
     archived_at: Optional[datetime] = None
@@ -270,10 +363,36 @@ class ThreadState(ContractModel):
     queue_pause_reason: str = ""
     queue_revision: int = 0
     queue_failed_item_id: Optional[str] = None
+    # Pending automatic resume after a provider quota reset:
+    # {turn_id, resets_at, resume_at, kind, scheduled_at}. Cleared by any new Turn.
+    quota_resume: Optional[dict[str, Any]] = None
+    # Latest structured rate-limit hold the engine reported in a Turn:
+    # {turn_id, resets_at, kind, handled}. ``handled`` flips once any schedule
+    # decision (auto, user, or cancel) was made, so a cancelled schedule is not
+    # recreated by the server-side auto pass.
+    quota_hold: Optional[dict[str, Any]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_attention_seq(cls, data: Any) -> Any:
+        # Rows persisted before attention_stream_seq existed derived unread
+        # from head_stream_seq; seeding from it keeps their unread state.
+        if not isinstance(data, dict) or "attention_stream_seq" in data:
+            return data
+        legacy = {**data, "attention_stream_seq": data.get("head_stream_seq", 0)}
+        # Those rows also recorded background capability-probe failures as
+        # the Thread's last_error; the probe result lives in the capability
+        # snapshot, so it is not a failure of the Thread.
+        last_error = legacy.get("last_error")
+        if (isinstance(last_error, dict)
+                and last_error.get("code") == CAPABILITY_REFRESH_FAILED_CODE
+                and not last_error.get("turn_id")):
+            legacy["last_error"] = {}
+        return legacy
 
     @property
     def unread(self) -> bool:
-        return self.head_stream_seq > self.read_stream_seq
+        return self.attention_stream_seq > self.read_stream_seq
 
 
 class QueuedTurnRequest(ContractModel):
@@ -304,9 +423,13 @@ class QueuedTurnRequest(ContractModel):
 
 __all__ = [
     "EXECUTOR_ID",
+    "SUBAGENT_ORIGIN_APP",
+    "SUBAGENT_ORIGIN_NATIVE",
+    "ThreadLineage",
     "TURN_COMPLETED",
     "TURN_FAILED",
     "TURN_INTERRUPTED",
+    "TURN_CANCELLED",
     "TURN_KIND_MESSAGE",
     "TURN_KIND_RETRY",
     "TURN_KIND_EDIT_RESEND",

@@ -359,12 +359,12 @@ export function FilesSurface({ threadId, view, hasWorkspace, onCiteToComposer }:
         />
         <span className="flex min-w-0 flex-1 flex-col">
           <span className="truncate text-[13px]"><Highlight text={entry.name} query={mode === "browse" ? query : mode === "files" ? query : ""} /></span>
-          {subtitle ? <span className="truncate font-cx-mono text-[11px] text-cx-fg-4">{subtitle}</span> : null}
+          {subtitle ? <span className="truncate font-cx-mono text-[12px] text-cx-fg-4">{subtitle}</span> : null}
         </span>
         {entry.kind === "directory" ? (
           <Icon name="chevronRight" size={13} className="shrink-0 text-cx-fg-4" />
         ) : (
-          <span className="cx-tabular shrink-0 text-[11.5px] text-cx-fg-4">{formatBytes(entry.size)}</span>
+          <span className="cx-tabular shrink-0 text-[12px] text-cx-fg-4">{formatBytes(entry.size)}</span>
         )}
       </button>
     );
@@ -399,7 +399,7 @@ export function FilesSurface({ threadId, view, hasWorkspace, onCiteToComposer }:
       </div>
     )
   ) : searching ? (
-    <div className="flex items-center justify-center gap-2 py-10 text-[12.5px] text-cx-fg-3"><Spinner size={13} />正在搜索…</div>
+    <div className="flex items-center justify-center gap-2 py-10 text-[13px] text-cx-fg-3"><Spinner size={13} />正在搜索…</div>
   ) : searchError ? (
     <div className="p-3"><Callout tone="danger">{searchError}</Callout></div>
   ) : !query.trim() ? (
@@ -447,7 +447,7 @@ export function FilesSurface({ threadId, view, hasWorkspace, onCiteToComposer }:
     <div ref={surfaceRef} className="flex min-h-0 flex-1 flex-col" data-testid="workspace-files-surface">
       <SurfaceToolbar className="pl-1.5">
         <PathBreadcrumb path={path} onSelect={(dir) => { setMode("browse"); setQuery(""); void loadDir(dir); }} />
-        <span className="shrink-0 rounded-md bg-cx-hover px-1.5 text-[11px] leading-5 text-cx-fg-4" aria-label="文件来自运行环境">运行环境</span>
+        <span className="shrink-0 rounded-md bg-cx-hover px-1.5 text-[12px] leading-5 text-cx-fg-4" aria-label="文件来自运行环境">运行环境</span>
         <IconButton icon="refresh" label="刷新" loading={loading && entries.length > 0} onClick={() => void loadDir(path)} />
       </SurfaceToolbar>
       {view.workspace && <NativeWorkspaceFileActions threadId={threadId} workspaceId={view.workspace.workspace_id} serviceRoot={view.workspace.root_path} relativePath={preview?.path || selectedFilePath || undefined} />}
@@ -472,11 +472,11 @@ export function FilesSurface({ threadId, view, hasWorkspace, onCiteToComposer }:
         />
       </div>
       {mode === "files" && ignoredDirs.length ? (
-        <p className="shrink-0 truncate border-b border-cx-border-subtle px-3 py-1 text-[11.5px] text-cx-fg-4" title={`已忽略：${ignoredDirs.join(", ")}`}>
+        <p className="shrink-0 truncate border-b border-cx-border-subtle px-3 py-1 text-[12px] text-cx-fg-4" title={`已忽略：${ignoredDirs.join(", ")}`}>
           已忽略 {ignoredDirs.length} 个目录（node_modules 等）{truncated ? " · 结果已截断" : ""}
         </p>
       ) : truncated ? (
-        <p className="shrink-0 border-b border-cx-border-subtle px-3 py-1 text-[11.5px] text-cx-fg-4">结果已截断，请缩小搜索范围</p>
+        <p className="shrink-0 border-b border-cx-border-subtle px-3 py-1 text-[12px] text-cx-fg-4">结果已截断，请缩小搜索范围</p>
       ) : null}
 
       <div className="flex min-h-0 flex-1 flex-col @[720px]/panel:flex-row">
@@ -492,7 +492,7 @@ export function FilesSurface({ threadId, view, hasWorkspace, onCiteToComposer }:
         </ScrollArea>
         {!showPreview ? (
           <div className="flex h-10 shrink-0 items-center gap-1.5 border-t border-cx-border-subtle px-2 @[720px]/panel:hidden" data-testid="workspace-file-selection-actions">
-            <span className="min-w-0 flex-1 truncate text-[11.5px] text-cx-fg-3" title={selectedFilePath || undefined}>
+            <span className="min-w-0 flex-1 truncate text-[12px] text-cx-fg-3" title={selectedFilePath || undefined}>
               {selectedFilePath.split("/").at(-1) || "双击文件可独立打开"}
             </span>
             <Button size="xs" variant="ghost" disabled={!selectedFilePath} aria-label="预览选中文件" onClick={() => void openFile(selectedFilePath)}>预览</Button>

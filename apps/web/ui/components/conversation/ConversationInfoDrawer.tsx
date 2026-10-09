@@ -22,6 +22,7 @@ import {
 import { DialogSection, MetaList, MetaRow, MetricTile } from "@/components/chat/dialogs/parts";
 import { apiFetch } from "@/lib/useRun";
 import { useSharedGitStatus } from "@/lib/threadGitStatusStore";
+import { capabilitiesFor, readyCatalog, useProviderDescriptors } from "@/lib/providerDescriptors";
 import type {
   ConversationView,
   ConversationMemorySnapshot,
@@ -150,6 +151,7 @@ export function ConversationInfoDrawer({
     if (!open) setConfirmDeleteId(null);
   }, [open]);
 
+  const descriptors = readyCatalog(useProviderDescriptors());
   const activeView = view ?? retainedView;
   if (!activeView) return null;
 
@@ -208,8 +210,9 @@ export function ConversationInfoDrawer({
     : reportedCost != null ? "上报金额" : "金额";
 
   const contextWindow = activeView.context_window ?? null;
-  const rtCaps = (activeView.runtime_connection?.capabilities ?? {}) as Record<string, unknown>;
-  const compactionSupported = Boolean(rtCaps.compaction);
+  const compactionSupported = capabilitiesFor(
+    descriptors, `${activeView.runtime.adapter_id}:${activeView.runtime.instance_id}`,
+  )?.compaction === true;
   const statsItems = conversationStatsSummaryItems(activeView.statistics, activeView.context_window);
   const memories = memory?.memories ?? [];
   const workspacePath = activeView.workspace?.root_path || "";
@@ -229,7 +232,7 @@ export function ConversationInfoDrawer({
 
       {statsItems.length ? (
         <div
-          className="cx-tabular rounded-xl bg-cx-bg-subtle px-3 py-2 font-cx-mono text-[11.5px] leading-5 text-cx-fg-3"
+          className="cx-tabular rounded-xl bg-cx-bg-subtle px-3 py-2 font-cx-mono text-[12px] leading-5 text-cx-fg-3"
           data-testid="c39-info-stats"
         >
           {statsItems.join("  ·  ")}
@@ -260,6 +263,7 @@ export function ConversationInfoDrawer({
         <MetaList>
           <MetaRow label="模型">{activeView.runtime.model || "默认模型"}</MetaRow>
           {activeView.runtime.effort ? <MetaRow label="推理强度" mono>{activeView.runtime.effort}</MetaRow> : null}
+          {activeView.runtime.service_tier ? <MetaRow label="速度档位" mono>{activeView.runtime.service_tier}</MetaRow> : null}
           {activeView.runtime.access_mode ? <MetaRow label="访问模式" mono>{activeView.runtime.access_mode}</MetaRow> : null}
           <MetaRow label="Adapter" mono>{activeView.runtime.adapter_id}</MetaRow>
           <MetaRow label="实例 ID" mono copy={activeView.runtime.instance_id}>{activeView.runtime.instance_id}</MetaRow>
@@ -297,14 +301,14 @@ export function ConversationInfoDrawer({
           activeView.binding.tool_set?.length ? (
             <div className="flex flex-wrap gap-1">
               {activeView.binding.tool_set.map((tool) => (
-                <Badge key={tool} className="font-cx-mono text-[11px]">{tool}</Badge>
+                <Badge key={tool} className="font-cx-mono text-[12px]">{tool}</Badge>
               ))}
             </div>
           ) : (
-            <p className="text-[12.5px] text-cx-fg-4">未授权工具</p>
+            <p className="text-[13px] text-cx-fg-4">未授权工具</p>
           )
         ) : (
-          <p className="text-[12.5px] text-cx-fg-4">当前没有激活的 CapabilityBinding</p>
+          <p className="text-[13px] text-cx-fg-4">当前没有激活的 CapabilityBinding</p>
         )}
         {activeView.grants && activeView.grants.length > 0 ? (
           <MetaList className="mt-2">
@@ -345,7 +349,7 @@ export function ConversationInfoDrawer({
             className="min-h-[64px] bg-cx-elevated"
           />
           <div className="flex items-center justify-between gap-3">
-            <Checkbox checked={consent} onCheckedChange={setConsent} label="同意持久化存储" className="text-[12.5px]" />
+            <Checkbox checked={consent} onCheckedChange={setConsent} label="同意持久化存储" className="text-[13px]" />
             <Button
               type="submit"
               size="sm"
@@ -381,8 +385,8 @@ export function ConversationInfoDrawer({
                 >
                   <div className="min-w-0 flex-1">
                     <p className="whitespace-pre-wrap break-words text-[13px] leading-5 text-cx-fg">{item.content}</p>
-                    <div className="mt-1.5 flex items-center gap-1.5 text-[11.5px] text-cx-fg-4">
-                      <Badge className="h-[18px] text-[11px]">{item.kind}</Badge>
+                    <div className="mt-1.5 flex items-center gap-1.5 text-[12px] text-cx-fg-4">
+                      <Badge className="h-[18px] text-[12px]">{item.kind}</Badge>
                       <span className="cx-tabular">{new Date(item.created_at).toLocaleDateString("zh-CN")}</span>
                     </div>
                   </div>
@@ -492,7 +496,7 @@ export function ConversationInfoDrawer({
           )
         ) : null}
         {quotaData && quotaData.length === 0 ? (
-          <p className="text-[12.5px] text-cx-fg-4">暂无已配置凭据账号。</p>
+          <p className="text-[13px] text-cx-fg-4">暂无已配置凭据账号。</p>
         ) : null}
         {quotaData && quotaData.length > 0 ? (
           <ul className="flex flex-col gap-1.5">
@@ -502,7 +506,7 @@ export function ConversationInfoDrawer({
                 <li key={entry.credential_id} className="rounded-xl border border-cx-border-subtle bg-cx-elevated px-3 py-2">
                   <div className="flex items-center gap-2">
                     <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-cx-fg">{entry.label}{entry.credential_id === credential ? " · 当前选择" : ""}</span>
-                    <span className="font-cx-mono text-[11px] text-cx-fg-4">{entry.engine}</span>
+                    <span className="font-cx-mono text-[12px] text-cx-fg-4">{entry.engine}</span>
                     <Badge tone={status.tone}>{status.label}</Badge>
                     {entry.quota_type === "subscription" ? (
                       <IconButton

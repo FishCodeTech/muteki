@@ -311,6 +311,51 @@ export function toolEditStat(tool: PresentableTool, kind = toolKind(tool)): Tool
   return path ? { additions: 0, deletions: 0, paths: [path] } : null;
 }
 
+function readPath(tool: PresentableTool): string {
+  return firstOf(parseToolArgs(tool.argsSummary), PATH_KEYS);
+}
+
+const SUMMARY_PHRASE: Record<Exclude<ToolKind, "think">, (count: number) => string> = {
+  read: (n) => `读取 ${n} 个文件`,
+  edit: (n) => `编辑 ${n} 个文件`,
+  command: (n) => `运行 ${n} 条命令`,
+  search: (n) => `搜索 ${n} 次`,
+  list: (n) => `查看 ${n} 个目录`,
+  browser: (n) => `访问网页 ${n} 次`,
+  mcp: (n) => `调用 ${n} 次 MCP 工具`,
+  agent: (n) => `委派 ${n} 个子 Agent`,
+  other: (n) => `使用 ${n} 次其他工具`,
+};
+
+/**
+ * "读取 3 个文件，运行 2 条命令" in first-seen order. Reads and edits count
+ * distinct paths when the arguments name them.
+ */
+export function summarizeTools(tools: PresentableTool[], maxPhrases = 3): string {
+  const order: Exclude<ToolKind, "think">[] = [];
+  const counts = new Map<Exclude<ToolKind, "think">, number>();
+  const paths = new Map<"read" | "edit", Set<string>>([["read", new Set()], ["edit", new Set()]]);
+  for (const tool of tools) {
+    const kind = toolKind(tool);
+    if (kind === "think") continue;
+    if (!counts.has(kind)) order.push(kind);
+    if (kind === "read" || kind === "edit") {
+      const named = kind === "read" ? [readPath(tool)].filter(Boolean) : toolEditStat(tool, kind)?.paths ?? [];
+      const seen = paths.get(kind)!;
+      if (named.length) {
+        const before = seen.size;
+        named.forEach((path) => seen.add(path));
+        counts.set(kind, (counts.get(kind) ?? 0) + (seen.size - before));
+        continue;
+      }
+    }
+    counts.set(kind, (counts.get(kind) ?? 0) + 1);
+  }
+  const phrases = order.filter((kind) => (counts.get(kind) ?? 0) > 0).map((kind) => SUMMARY_PHRASE[kind](counts.get(kind) ?? 0));
+  if (phrases.length <= maxPhrases) return phrases.join("，");
+  return `${phrases.slice(0, maxPhrases).join("，")}等`;
+}
+
 export interface ToolEditLine {
   id: string;
   type: "added" | "removed" | "context";

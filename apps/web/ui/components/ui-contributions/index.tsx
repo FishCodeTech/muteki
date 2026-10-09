@@ -1,6 +1,6 @@
 "use client";
 
-import type { CSSProperties, ReactNode } from "react";
+import type { ReactNode } from "react";
 import type {
   ArtifactViewerContribution,
   BoardContribution,
@@ -8,7 +8,6 @@ import type {
   NavigationContribution,
   StatusLabelContribution,
 } from "./types";
-import { STATUS_COLORS } from "./types";
 import { FieldListForm } from "./SchemaForm";
 
 /**
@@ -20,8 +19,7 @@ import { FieldListForm } from "./SchemaForm";
  * 复杂界面只能以这种受控方式或独立页面（导航路由）出现。
  */
 
-const muted: CSSProperties = { color: "var(--muted)", fontSize: 12 };
-const mono: CSSProperties = { fontFamily: "var(--font-mono)", fontSize: 11 };
+const TONES: Record<string, string> = { green: "success", amber: "warning", red: "danger" };
 
 export function StatusLabel({
   value,
@@ -34,46 +32,17 @@ export function StatusLabel({
 }) {
   const spec = contribution?.labels?.[value];
   if (!spec) return <>{fallback ?? value}</>;
-  const color = STATUS_COLORS[spec.color ?? "muted"] ?? "var(--muted)";
-  return (
-    <span
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        height: 20,
-        padding: "0 7px",
-        borderRadius: 999,
-        border: `1px solid color-mix(in srgb, ${color} 34%, var(--line))`,
-        background: `color-mix(in srgb, ${color} 9%, transparent)`,
-        color,
-        fontSize: 10.5,
-        fontWeight: 700,
-      }}
-    >
-      {spec.text ?? value}
-    </span>
-  );
+  return <span className="cx-uic-chip" data-tone={TONES[spec.color ?? "muted"] ?? "neutral"}>{spec.text ?? value}</span>;
 }
 
 export function NavigationItems({ items }: { items: NavigationContribution[] }) {
   if (!items.length) return null;
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-      <span style={muted}>扩展贡献的导航：</span>
+    <div className="cx-uic-nav">
+      <span className="cx-uic-label">扩展贡献的导航</span>
       {items.map((item) => (
-        <a
-          key={item.id}
-          href={item.route}
-          style={{
-            ...muted,
-            color: "var(--blue)",
-            textDecoration: "none",
-            border: "1px solid var(--line2)",
-            borderRadius: 8,
-            padding: "4px 10px",
-          }}
-        >
-          {item.title}（{item.route}）
+        <a key={item.id} href={item.route} className="cx-uic-nav-link">
+          {item.title}<code>{item.route}</code>
         </a>
       ))}
     </div>
@@ -92,20 +61,12 @@ export function CommandFormView({
   result?: unknown;
 }) {
   return (
-    <div
-      style={{
-        border: "1px dashed var(--line2)",
-        borderRadius: 10,
-        padding: 10,
-        display: "grid",
-        gap: 6,
-      }}
-    >
-      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-        <strong style={{ color: "var(--bright)", fontSize: 12.5 }}>{form.title}</strong>
-        <span style={{ ...mono, color: "var(--dim)" }}>{form.command_type}</span>
+    <div className="cx-uic-block">
+      <div className="cx-uic-block-head">
+        <strong>{form.title}</strong>
+        {form.command_type ? <code>{form.command_type}</code> : null}
       </div>
-      {form.description ? <div style={muted}>{form.description}</div> : null}
+      {form.description ? <p className="cx-uic-muted">{form.description}</p> : null}
       <FieldListForm
         fields={form.fields}
         submitLabel="执行"
@@ -113,20 +74,7 @@ export function CommandFormView({
         onSubmit={(params) => onInvoke(form.command_type, params)}
       />
       {result !== undefined ? (
-        <pre
-          style={{
-            ...mono,
-            margin: 0,
-            padding: 8,
-            borderRadius: 8,
-            background: "var(--panel)",
-            color: "var(--text)",
-            whiteSpace: "pre-wrap",
-            wordBreak: "break-all",
-          }}
-        >
-          {typeof result === "string" ? result : JSON.stringify(result, null, 2)}
-        </pre>
+        <pre className="cx-uic-pre">{typeof result === "string" ? result : JSON.stringify(result, null, 2)}</pre>
       ) : null}
     </div>
   );
@@ -154,47 +102,22 @@ export function BoardView({
 }) {
   const items = itemsOf(board, data);
   return (
-    <div style={{ display: "flex", gap: 10, alignItems: "flex-start", flexWrap: "wrap" }}>
+    <div className="cx-uic-board">
       {board.columns.map((col) => {
         const columnItems = items.filter((item) =>
           col.statuses.includes(String(item[board.status_field] ?? "")),
         );
         return (
-          <div
-            key={col.id}
-            style={{
-              minWidth: 180,
-              flex: 1,
-              border: "1px solid var(--line)",
-              borderRadius: 10,
-              background: "var(--panel)",
-              padding: 10,
-              display: "grid",
-              gap: 8,
-              alignContent: "start",
-            }}
-          >
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <strong style={{ color: "var(--bright)", fontSize: 12 }}>{col.title}</strong>
-              <span style={muted}>{columnItems.length}</span>
+          <div key={col.id} className="cx-uic-board-col">
+            <div className="cx-uic-block-head">
+              <strong>{col.title}</strong>
+              <span className="cx-uic-muted">{columnItems.length}</span>
             </div>
             {columnItems.length ? (
               columnItems.map((item, index) => (
-                <div
-                  key={index}
-                  style={{
-                    border: "1px solid var(--line2)",
-                    borderRadius: 8,
-                    background: "var(--panel2)",
-                    padding: "8px 10px",
-                    display: "grid",
-                    gap: 4,
-                  }}
-                >
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                    <strong style={{ ...mono, color: "var(--bright)", fontSize: 12 }}>
-                      {String(item[board.card.title_field] ?? "（无标题）")}
-                    </strong>
+                <div key={index} className="cx-uic-board-card">
+                  <div className="cx-uic-block-head">
+                    <code className="cx-uic-strong-code">{String(item[board.card.title_field] ?? "（无标题）")}</code>
                     {board.card.badge_field ? (
                       <StatusLabel
                         value={String(item[board.card.badge_field] ?? "")}
@@ -204,12 +127,12 @@ export function BoardView({
                     ) : null}
                   </div>
                   {board.card.subtitle_field ? (
-                    <span style={muted}>{String(item[board.card.subtitle_field] ?? "")}</span>
+                    <span className="cx-uic-muted">{String(item[board.card.subtitle_field] ?? "")}</span>
                   ) : null}
                 </div>
               ))
             ) : (
-              <span style={muted}>暂无条目</span>
+              <span className="cx-uic-muted">暂无条目</span>
             )}
           </div>
         );
@@ -236,54 +159,26 @@ export function ArtifactViewerView({
   const text =
     typeof content === "string" ? content : JSON.stringify(content, null, 2);
   return (
-    <div
-      style={{
-        border: "1px solid var(--line)",
-        borderRadius: 10,
-        background: "var(--panel)",
-        padding: 10,
-        display: "grid",
-        gap: 6,
-      }}
-    >
-      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <strong style={{ color: "var(--bright)", fontSize: 12 }}>{viewer.title}</strong>
-        <span style={{ ...mono, color: "var(--dim)" }}>
+    <div className="cx-uic-block">
+      <div className="cx-uic-block-head">
+        <strong>{viewer.title}</strong>
+        <code>
           {viewer.kind}
           {viewer.projection ? ` · projection:${viewer.projection}` : ""}
-        </span>
+        </code>
       </div>
       {viewer.kind === "iframe" ? (
         // 受控沙箱：无 allow-scripts，内容只来自公开 API 的 projection 数据。
         <iframe
           title={viewer.title}
           sandbox=""
-          style={{
-            width: "100%",
-            minHeight: 120,
-            border: "1px solid var(--line2)",
-            borderRadius: 8,
-            background: "var(--panel2)",
-          }}
-          srcDoc={`<pre style="font:12px/1.5 monospace;color:#c8d0e0;padding:8px;white-space:pre-wrap;">${text
+          className="cx-uic-frame"
+          srcDoc={`<pre style="margin:0;font:12px/1.5 monospace;color:#7c8594;padding:8px;white-space:pre-wrap;">${text
             .replace(/&/g, "&amp;")
             .replace(/</g, "&lt;")}</pre>`}
         />
       ) : (
-        <pre
-          style={{
-            ...mono,
-            margin: 0,
-            padding: 8,
-            borderRadius: 8,
-            background: "var(--panel2)",
-            color: "var(--text)",
-            whiteSpace: "pre-wrap",
-            wordBreak: "break-all",
-          }}
-        >
-          {viewer.kind === "json" ? text : text}
-        </pre>
+        <pre className="cx-uic-pre">{text}</pre>
       )}
     </div>
   );

@@ -150,6 +150,11 @@ def _macos_plan(
     trusted_roots = (Path("/usr"), Path("/bin"), Path("/sbin"), Path("/System"),
                      Path("/Library"), Path("/opt/homebrew"), Path("/usr/local"),
                      Path.home() / ".pyenv" / "versions")
+    # ``/bin/sh``'s grandparent is ``/``; clamp to the trusted root that holds the
+    # executable so a system binary is allowed without granting the whole disk.
+    trusted_root = next((root for root in trusted_roots if executable.is_relative_to(root)), None)
+    if trusted_root is not None and not runtime_root.is_relative_to(trusted_root):
+        runtime_root = trusted_root
     runtime_allowed = (runtime_root.is_relative_to(package_dir.resolve())
                        or runtime_root.is_relative_to(state_dir.resolve())
                        or any(runtime_root.is_relative_to(root) for root in trusted_roots))

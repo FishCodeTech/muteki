@@ -11,13 +11,22 @@ from muteki.solver.worker_profiles import (
     profile_uses_endpoint,
 )
 
+from muteki.external_agents.descriptors import CliSpec, find_descriptor
 from muteki.solver.cli_engines.base import CliDriver
 from muteki.solver.cli_engines.types import CliResult  # noqa: F401
+
+_NO_CLI_SPEC = CliSpec()
+
+
+def _cli_spec(engine: str) -> CliSpec:
+    descriptor = find_descriptor(engine)
+    return descriptor.cli if descriptor is not None else _NO_CLI_SPEC
+
 
 def _insert_before_prompt(argv: list[str], extra: list[str], *, engine: str = "") -> list[str]:
     if not extra:
         return argv
-    if engine in {"kimi", "grok", "devin"}:
+    if _cli_spec(engine).options_before_prompt_flag:
         for flag in ("-p", "--prompt", "--single"):
             if flag in argv:
                 idx = argv.index(flag)
@@ -37,18 +46,6 @@ def _insert_model_arg(argv: list[str], model: str, *, engine: str = "") -> list[
     return _insert_before_prompt(argv, ["--model", model], engine=engine)
 
 
-_ENGINE_REASONING_EFFORTS: dict[str, set[str]] = {
-    "claude": {"low", "medium", "high", "xhigh", "max"},
-    "codex": {"none", "minimal", "low", "medium", "high", "xhigh", "max"},
-    "cursor": {"low", "medium", "high", "xhigh", "max"},
-    "pi": {"none", "minimal", "low", "medium", "high", "xhigh", "max"},
-    "omp": {"none", "minimal", "low", "medium", "high", "xhigh", "max"},
-    "kimi": {"low", "medium", "high", "xhigh", "max"},
-    "grok": {"low", "medium", "high", "xhigh"},
-    "opencode": {"none", "minimal", "low", "medium", "high", "xhigh", "max"},
-}
-
-
 def apply_reasoning_effort(
     argv: list[str], *, engine: str, reasoning_effort: str, native: bool = False,
 ) -> list[str]:
@@ -56,19 +53,21 @@ def apply_reasoning_effort(
     effort = str(reasoning_effort or "default").strip() if native else normalize_reasoning_effort(reasoning_effort, "default")
     if effort == "default":
         return argv
+    spec = _cli_spec(engine)
     if native:
-        if engine not in _ENGINE_REASONING_EFFORTS or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", effort):
+        if not spec.reasoning_efforts or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", effort):
             raise ValueError("Unsupported native reasoning option")
-    elif effort not in _ENGINE_REASONING_EFFORTS.get(engine, set()):
+    elif effort not in spec.reasoning_efforts:
         return argv
-    if engine == "claude" and effort in {"off", "on"}:
+    style = spec.effort_style
+    if style == "claude_settings_or_flag" and effort in {"off", "on"}:
         settings = {"alwaysThinkingEnabled": effort == "on"}
         if "--settings" in argv:
             index = argv.index("--settings") + 1
             current = json.loads(argv[index])
             return [*argv[:index], json.dumps({**current, **settings}), *argv[index + 1:]]
         return _insert_before_prompt(argv, ["--settings", json.dumps(settings)], engine=engine)
-    if engine == "codex":
+    if style == "codex_config":
         if any("model_reasoning_effort=" in str(arg) for arg in argv):
             return argv
         flag = f'model_reasoning_effort="{effort}"'
@@ -78,7 +77,7 @@ def apply_reasoning_effort(
         except ValueError:
             return [argv[0], "-c", flag, *argv[1:]] if argv else ["-c", flag]
         return [*argv[:idx + 1], "-c", flag, *argv[idx + 1:]]
-    if engine == "cursor":
+    if style == "cursor_model_variant":
         if "--model" in argv:
             idx = argv.index("--model") + 1
         elif "-m" in argv:
@@ -101,20 +100,20 @@ def apply_reasoning_effort(
         if fast:
             model += "-fast"
         return [*argv[:idx], model, *argv[idx + 1:]]
-    if engine in {"pi", "omp"}:
+    if style == "thinking_flag":
         if "--thinking" in argv:
             return argv
         value = "off" if effort == "none" else effort
         return _insert_before_prompt(argv, ["--thinking", value], engine=engine)
-    if engine == "grok":
+    if style == "reasoning_effort_flag":
         if "--reasoning-effort" in argv or "--effort" in argv:
             return argv
         return _insert_before_prompt(
             argv, ["--reasoning-effort", effort], engine=engine)
-    if engine == "kimi":
+    if style == "environment":
         # Kimi Code accepts the override through KIMI_MODEL_THINKING_EFFORT.
         return argv
-    if engine == "opencode":
+    if style == "variant_flag":
         if "--variant" in argv:
             return argv
         return _insert_before_prompt(argv, ["--variant", effort], engine=engine)
@@ -135,8 +134,10 @@ def apply_runtime_argv(
     """
     out = list(argv)
     engine = driver.name
+    spec = _cli_spec(engine)
+    hooks = spec.runtime_argv
     model = str(env.get("MUTEKI_WORKER_MODEL") or "").strip()
-    if engine == "opencode":
+    if "opencode_config_merge" in hooks:
         # OpenCode 的调用级 policy config 原本通过 argv 中的 env 前缀覆盖了
         # Credential Account 提供的 custom provider，导致有效 Key/端点丢失。
         # 在最终 argv 冻结前合并二者；provider 配置只引用环境变量名，Key
@@ -175,7 +176,7 @@ def apply_runtime_argv(
                     if index + 1 < len(out):
                         out[index + 1] = model
                     break
-    if engine == "kimi" and str(env.get("KIMI_MODEL_NAME") or "").strip():
+    if "kimi_env_provider_model" in hooks and str(env.get("KIMI_MODEL_NAME") or "").strip():
         # KIMI_MODEL_* synthesizes an in-memory provider/model. An explicit
         # --model from the normal OAuth profile has higher priority and would
         # bypass that provider, so remove it for the direct API-key channel.
@@ -193,19 +194,19 @@ def apply_runtime_argv(
         model = ""
     env_extra = getattr(driver, "env_extra", None)
     driver_env = env_extra() if callable(env_extra) else {}
-    claude_model_from_env = (
-        engine == "claude" and bool(driver_env.get("ANTHROPIC_MODEL"))
+    model_from_env = (
+        bool(spec.model_env_var) and bool(driver_env.get(spec.model_env_var))
     )
-    if model and not claude_model_from_env:
+    if model and not model_from_env:
         out = _insert_model_arg(out, model, engine=engine)
 
-    if engine == "cursor":
+    if "cursor_endpoint" in hooks:
         endpoint = str(env.get("CURSOR_ENDPOINT") or "").strip()
         if endpoint and "--endpoint" not in out:
             out = _insert_before_prompt(
                 out, ["--endpoint", endpoint], engine=engine)
 
-    if engine == "codex":
+    if "codex_provider_flags" in hooks:
         from muteki.solver.cli_engines.codex_provider import (
             argv_has_model_provider,
             codex_provider_spawn_args,
@@ -219,8 +220,8 @@ def apply_runtime_argv(
                 str(k): str(v) for k, v in env.items() if v is not None
             }))
 
-    if engine in {"pi", "omp"}:
-        prefix = "MUTEKI_PI" if engine == "pi" else "MUTEKI_OMP"
+    if "pi_like_provider" in hooks:
+        prefix = spec.provider_env_prefix
         system_prompt = str(env.get(f"{prefix}_SYSTEM_PROMPT") or "").strip()
         if system_prompt:
             if "--system-prompt" in out:

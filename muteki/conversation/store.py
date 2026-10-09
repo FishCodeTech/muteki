@@ -972,6 +972,13 @@ class ConversationStore:
             return ThreadState(thread_id=thread_id)
         return ThreadState.model_validate_json(row["payload"])
 
+    def legacy_attention_thread_ids(self) -> list[str]:
+        """读模型里还没有 attention_stream_seq 字段的 Thread。"""
+        rows = self._fetchall(
+            "SELECT thread_id FROM conv_thread_state "
+            "WHERE json_extract(payload, '$.attention_stream_seq') IS NULL")
+        return [str(r["thread_id"]) for r in rows]
+
     def list_states(self) -> list[ThreadState]:
         rows = self._fetchall(
             "SELECT payload FROM conv_thread_state")

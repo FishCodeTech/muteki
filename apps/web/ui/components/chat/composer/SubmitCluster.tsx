@@ -2,6 +2,7 @@
 
 import { AnimatePresence, motion } from "motion/react";
 import { cn } from "@/lib/cn";
+import { useChatPreferences } from "@/lib/chatPreferences";
 import { Icon } from "@/components/Icon";
 import { IconButton, SPRING_SWAP, Tooltip, useReducedMotion } from "@/components/chat/ui";
 
@@ -12,6 +13,8 @@ export interface SubmitClusterProps {
   hasDraft: boolean;
   canSend: boolean;
   canSteer: boolean;
+  /** The send button and send key steer the current answer; the secondary button queues instead. */
+  steerPrimary?: boolean;
   steerDisabledReason: string;
   steerAlternative: string;
   onSubmit: () => void;
@@ -27,13 +30,16 @@ export function SubmitCluster({
   hasDraft,
   canSend,
   canSteer,
+  steerPrimary = false,
   steerDisabledReason,
   steerAlternative,
   onSubmit,
   onSteer,
   onStop,
 }: SubmitClusterProps) {
+  const primarySteers = Boolean(running && steerPrimary && canSteer && onSteer);
   const reduced = useReducedMotion();
+  const sendShortcut = useChatPreferences().sendKey === "mod-enter" ? "mod+enter" : "enter";
   const showStop = running && !hasDraft;
   const swap = reduced
     ? { initial: { opacity: 0 }, animate: { opacity: 1 }, exit: { opacity: 0, transition: { duration: 0.06 } } }
@@ -64,7 +70,24 @@ export function SubmitCluster({
               onClick={onStop}
               className="rounded-full"
             />
-            {canSteer && onSteer ? (
+            {primarySteers ? (
+              <Tooltip content="加入后续队列（不引导当前回答）">
+                <button
+                  type="button"
+                  aria-label="加入后续消息"
+                  data-tooltip="加入后续消息"
+                  disabled={!canSend}
+                  onClick={onSubmit}
+                  className={cn(
+                    "cx-press inline-flex h-8 items-center gap-1.5 rounded-full bg-cx-accent-soft px-3 text-[13px] font-medium text-cx-accent",
+                    "hover:bg-[color-mix(in_srgb,var(--accent)_18%,transparent)] disabled:pointer-events-none disabled:opacity-45",
+                    "outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--cx-focus)]",
+                  )}
+                >
+                  排队
+                </button>
+              </Tooltip>
+            ) : canSteer && onSteer ? (
               <Tooltip content="立即引导当前回答（不排队）">
                 <button
                   type="button"
@@ -73,12 +96,11 @@ export function SubmitCluster({
                   disabled={!canSend}
                   onClick={onSteer}
                   className={cn(
-                    "cx-press inline-flex h-8 items-center gap-1.5 rounded-full bg-cx-accent-soft px-3 text-[12.5px] font-medium text-cx-accent",
+                    "cx-press inline-flex h-8 items-center gap-1.5 rounded-full bg-cx-accent-soft px-3 text-[13px] font-medium text-cx-accent",
                     "hover:bg-[color-mix(in_srgb,var(--accent)_18%,transparent)] disabled:pointer-events-none disabled:opacity-45",
                     "outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--cx-focus)]",
                   )}
                 >
-                  <Icon name="target" size={13} />
                   引导
                 </button>
               </Tooltip>
@@ -92,9 +114,8 @@ export function SubmitCluster({
                   data-capability-key="steer"
                   data-support-level="unsupported"
                   onClick={(event) => event.preventDefault()}
-                  className="inline-flex h-8 cursor-not-allowed items-center gap-1.5 rounded-full px-3 text-[12.5px] font-medium text-cx-fg-4"
+                  className="inline-flex h-8 cursor-not-allowed items-center gap-1.5 rounded-full px-3 text-[13px] font-medium text-cx-fg-4"
                 >
-                  <Icon name="target" size={13} />
                   引导
                 </button>
               </Tooltip>
@@ -120,14 +141,14 @@ export function SubmitCluster({
               </motion.button>
             </Tooltip>
           ) : (
-            <Tooltip key="send" content={running ? "加入后续队列" : "发送"} shortcut="enter">
+            <Tooltip key="send" content={primarySteers ? "引导当前回答" : running ? "加入后续队列" : "发送"} shortcut={sendShortcut}>
               <motion.button
                 type="button"
-                aria-label={running ? "加入后续消息" : "发送消息"}
-                data-tooltip={running ? "加入后续消息" : undefined}
-                data-kind="send"
+                aria-label={primarySteers ? "引导当前回答" : running ? "加入后续消息" : "发送消息"}
+                data-tooltip={primarySteers ? "引导当前回答" : running ? "加入后续消息" : undefined}
+                data-kind={primarySteers ? "steer" : "send"}
                 disabled={!canSend}
-                onClick={onSubmit}
+                onClick={primarySteers ? onSteer : onSubmit}
                 {...swap}
                 whileTap={reduced || !canSend ? undefined : { scale: 0.92 }}
                 className={cn(

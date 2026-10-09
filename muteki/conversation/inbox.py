@@ -76,7 +76,14 @@ def attention_fingerprint(
     pending_kind: str,
     pending_id: Optional[str],
     title: str,
+    pending_thread_id: Optional[str] = None,
+    attention_owner_id: Optional[str] = None,
+    subagent_attention: Iterable[dict[str, Any]] = (),
 ) -> str:
+    delegated = ",".join(
+        f"{row['thread_id']}:{row['pending_kind']}:{row.get('pending_id') or ''}:{row.get('title') or ''}"
+        for row in subagent_attention
+    )
     return "|".join(
         (
             thread_id,
@@ -87,20 +94,52 @@ def attention_fingerprint(
             str(pending_kind or PENDING_NONE),
             str(pending_id or ""),
             str(title or ""),
+            str(pending_thread_id or ""),
+            str(attention_owner_id or ""),
+            delegated,
         )
     )
 
 
-def build_attention_summary(thread: Any, state: Any) -> dict[str, Any]:
-    """Build one ThreadAttentionSummary (+ list row) from Thread + ThreadState."""
+#: Pending kinds that block a subagent until a human acts, so they surface on
+#: the root Thread. Unread/failed children are reported to their parent Agent
+#: through the subagent result instead.
+_DELEGATED_PENDING_KINDS = (PENDING_APPROVAL, PENDING_USER_INPUT)
+
+
+def build_attention_summary(
+    thread: Any,
+    state: Any,
+    *,
+    attention_owner_id: Optional[str] = None,
+    subagent_attention: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    """Build one ThreadAttentionSummary (+ list row) from Thread + ThreadState.
+
+    ``attention_owner_id`` names the Thread whose row carries this Thread's
+    attention: a subagent child whose root is listed points at the root and
+    must not raise attention on its own. ``subagent_attention`` lists the
+    blocking pending items of a root's descendants; when the root itself has
+    nothing pending, the first one becomes the root's ``pending_kind`` with
+    ``pending_thread_id`` pointing at the child.
+    """
+    thread_id = str(thread.thread_id)
     pending_kind, pending_id = _pending_fields(state)
+    pending_thread_id: Optional[str] = thread_id if pending_kind != PENDING_NONE else None
+    delegated = list(subagent_attention or [])
+    if pending_kind == PENDING_NONE and delegated:
+        first = delegated[0]
+        pending_kind = str(first["pending_kind"])
+        pending_id = first.get("pending_id")
+        pending_thread_id = str(first["thread_id"])
+    owner = attention_owner_id or thread_id
     unread = bool(getattr(state, "unread", False))
     running = bool(getattr(state, "running_turn_id", None))
-    revision = int(getattr(state, "head_stream_seq", 0) or 0)
+    revision = int(getattr(state, "attention_stream_seq", 0) or 0)
     status = str(getattr(state, "status", "") or "active")
     title = str(getattr(thread, "title", "") or "")
     fingerprint = attention_fingerprint(
-        thread_id=str(thread.thread_id),
+        thread_id=thread_id,
         revision=revision,
         status=status,
         running=running,
@@ -108,6 +147,9 @@ def build_attention_summary(thread: Any, state: Any) -> dict[str, Any]:
         pending_kind=pending_kind,
         pending_id=pending_id,
         title=title,
+        pending_thread_id=pending_thread_id,
+        attention_owner_id=owner,
+        subagent_attention=delegated,
     )
     thread_row = {
         **thread.model_dump(mode="json"),
@@ -117,13 +159,16 @@ def build_attention_summary(thread: Any, state: Any) -> dict[str, Any]:
         },
     }
     summary = {
-        "thread_id": str(thread.thread_id),
+        "thread_id": thread_id,
         "revision": revision,
         "status": status,
         "running": running,
         "unread": unread,
         "pending_kind": pending_kind,
         "pending_id": pending_id,
+        "pending_thread_id": pending_thread_id,
+        "attention_owner_id": owner,
+        "subagent_attention": delegated,
         "title": title,
         "preview": str(getattr(thread, "summary", "") or ""),
         "updated_at": str(getattr(thread, "updated_at", "") or ""),
@@ -235,6 +280,9 @@ class InboxBroker:
                 "unread": False,
                 "pending_kind": PENDING_NONE,
                 "pending_id": None,
+                "pending_thread_id": None,
+                "attention_owner_id": thread_id,
+                "subagent_attention": [],
                 "title": "",
                 "preview": "",
                 "updated_at": "",
@@ -285,9 +333,47 @@ class InboxBroker:
 
 
 def collect_attention_rows(manager: Any, project_id: str = "") -> list[dict[str, Any]]:
+    """One attention row per listed Thread.
+
+    Subagent children keep their rows (the list doubles as the client's
+    Thread list) but hand their attention to the listed root Thread, whose
+    row carries every blocking pending item of its active descendants.
+    """
     threads = manager.list_threads(project_id)
+    states = {thread.thread_id: manager.conv.get_state(thread.thread_id) for thread in threads}
+    owners: dict[str, str] = {}
+    delegated: dict[str, list[dict[str, Any]]] = {}
+    for thread in threads:
+        state = states[thread.thread_id]
+        lineage = getattr(state, "lineage", None)
+        root_id = str(getattr(lineage, "root_thread_id", "") or "") if lineage is not None else ""
+        # A child whose root is not listed (or already archived, so no longer
+        # shown) keeps its own attention so it is never dropped.
+        if (not root_id or root_id == thread.thread_id or root_id not in states
+                or str(getattr(states[root_id], "status", "") or "") == "archived"):
+            continue
+        owners[thread.thread_id] = root_id
+        if str(getattr(state, "status", "") or "") == "archived":
+            continue
+        pending_kind, pending_id = _pending_fields(state)
+        if pending_kind not in _DELEGATED_PENDING_KINDS:
+            continue
+        delegated.setdefault(root_id, []).append({
+            "thread_id": thread.thread_id,
+            "parent_thread_id": str(lineage.parent_thread_id or "") or None,
+            "depth": int(lineage.depth),
+            "title": str(thread.title or ""),
+            "pending_kind": pending_kind,
+            "pending_id": pending_id,
+        })
     rows: list[dict[str, Any]] = []
     for thread in threads:
-        state = manager.conv.get_state(thread.thread_id)
-        rows.append(build_attention_summary(thread, state))
+        items = sorted(
+            delegated.get(thread.thread_id, []),
+            key=lambda row: _DELEGATED_PENDING_KINDS.index(row["pending_kind"]))
+        rows.append(build_attention_summary(
+            thread, states[thread.thread_id],
+            attention_owner_id=owners.get(thread.thread_id),
+            subagent_attention=items,
+        ))
     return rows

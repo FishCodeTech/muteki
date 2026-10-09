@@ -80,7 +80,7 @@
   height: 16px;
   place-items: center;
   border-radius: 4px;
-  font: 600 10px/1 var(--cx-font-sans);
+  font: 600 12px/1 var(--cx-font-sans);
   flex: none;
 }
 .cx-diff-status-add { color: var(--cx-add); background: var(--cx-add-bg); }
@@ -94,7 +94,7 @@
   border-top: 1px solid var(--cx-border-subtle);
   border-bottom: 1px solid var(--cx-border-subtle);
   background: color-mix(in srgb, var(--accent) 4%, var(--page));
-  font-size: 11.5px;
+  font-size: 12px;
   line-height: 22px;
 }
 
@@ -117,7 +117,7 @@
   border-bottom: 1px solid var(--cx-border-subtle);
   background: var(--cx-bg-subtle);
   color: var(--cx-fg-3);
-  font: 12.5px/1.5 var(--cx-font-sans);
+  font: 13px/1.5 var(--cx-font-sans);
 }
 .cx-diff-notice.is-warning { background: var(--cx-warning-soft); color: var(--cx-fg-2); }
 .cx-diff-notice.is-raw { background: var(--cx-bg); }
@@ -154,7 +154,7 @@
 .cx-diff-num {
   padding-right: 8px;
   color: var(--cx-fg-4);
-  font-size: 11px;
+  font-size: 12px;
   text-align: right;
   user-select: none;
   background: var(--tint-gutter);

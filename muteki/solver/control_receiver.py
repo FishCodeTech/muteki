@@ -456,6 +456,7 @@ class ControlReceiver:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((self.host, self.port))
+        self.port = int(srv.getsockname()[1])
         srv.listen(64)
         self._srv = srv
         self._started = True

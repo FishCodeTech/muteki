@@ -14,8 +14,10 @@ dispatch 固定顺序（任务书 6.1）：
    7. 写副作用结果事件并落终态回执。
 
 崩溃恢复：步骤 4–6 之间崩溃会留下 accepted 回执，由 CORE-02 的
-``Reconciler``（pending_receipts / outbox.pending）列出给调用方回放；
-Run 侧副作用自身经控制 journal 的 command_id 幂等去重。
+``Reconciler``（pending_receipts / outbox.pending）列出；领域恢复（如
+``conversation.receipt_recovery``）用 ``finalize_accepted`` 按已提交状态落
+终态，``effect_in_flight`` 排除本进程仍在执行的副作用。Run 侧副作用自身经
+控制 journal 的 command_id 幂等去重。
 """
 
 from __future__ import annotations
@@ -23,12 +25,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import threading
 from typing import Any, Optional
 
 from muteki.platform.command_handlers.base import (
     CommandAPIError,
     CommandFailed,
     CommandHandler,
+    CommandPlan,
     CommandPolicy,
     HandlerContext,
     HandlerRegistry,
@@ -105,6 +109,23 @@ class MutekiCommandApiImpl:
         self._services = dict(services or {})
         self._outbox = OutboxManager(store)
         self._acknowledged_effects: dict[str, dict[str, Any]] = {}
+        #: command_ids whose side effect is executing in this process.
+        self._effects_in_flight: set[str] = set()
+        self._admission_lock = threading.RLock()
+        self._admission_closed = False
+        self._dispatches_in_flight = 0
+
+    def pause_admission(self) -> bool:
+        """Close idle command admission before a managed installation switch."""
+        with self._admission_lock:
+            if self._dispatches_in_flight or self._effects_in_flight:
+                return False
+            self._admission_closed = True
+            return True
+
+    def resume_admission(self) -> None:
+        with self._admission_lock:
+            self._admission_closed = False
 
     @classmethod
     def with_builtin_handlers(
@@ -144,6 +165,7 @@ class MutekiCommandApiImpl:
             binding=binding,
             correlation_id=correlation_id,
             services=self._services,
+            cursor_key=self._cursor_key,
         )
 
     @staticmethod
@@ -179,6 +201,18 @@ class MutekiCommandApiImpl:
     # -- dispatch ---------------------------------------------------------------
 
     async def dispatch(self, command: CommandEnvelope) -> CommandReceipt:
+        with self._admission_lock:
+            if self._admission_closed:
+                return self._transient_receipt(command, ReceiptState.FAILED,
+                    make_error("command.maintenance", "工作台正在切换版本，暂不接受新命令。", ErrorCategory.CONFLICT))
+            self._dispatches_in_flight += 1
+        try:
+            return await self._dispatch(command)
+        finally:
+            with self._admission_lock:
+                self._dispatches_in_flight -= 1
+
+    async def _dispatch(self, command: CommandEnvelope) -> CommandReceipt:
         correlation_id = correlation_id_of(command)
 
         # 1. 权限判定（唯一实现处：CommandPolicy）
@@ -256,6 +290,21 @@ class MutekiCommandApiImpl:
                            ErrorCategory.INTERNAL, correlation_id=correlation_id))
 
         # 6. 事务提交后的外部副作用（可写 outbox 供重启恢复）
+        self._effects_in_flight.add(command.command_id)
+        try:
+            return await self._run_side_effect(
+                command, plan, stored, last, cursor, run_id, correlation_id)
+        finally:
+            self._effects_in_flight.discard(command.command_id)
+
+    def effect_in_flight(self, command_id: str) -> bool:
+        """True while this process is still executing the command's side effect."""
+        return command_id in self._effects_in_flight
+
+    async def _run_side_effect(
+        self, command: CommandEnvelope, plan: CommandPlan, stored: CommandReceipt,
+        last: EventEnvelope, cursor: str, run_id: Optional[str], correlation_id: str,
+    ) -> CommandReceipt:
         outbox_record: Optional[OutboxRecord] = None
         if plan.outbox_destination:
             outbox_record, _ = self._outbox.enqueue(OutboxRecord(
@@ -369,6 +418,47 @@ class MutekiCommandApiImpl:
                 self._store.save_effect_result(command_id, effect)
                 return self._finish_effect(command_id, effect, receipt.event_cursor, receipt.run_id)
         return receipt
+
+    def finalize_accepted(
+        self, command_id: str, result: SideEffectResult
+    ) -> CommandReceipt:
+        """Finalize an ACCEPTED receipt whose side effect a domain recovery
+        path finished after the dispatching process died.
+
+        Goes through the same effect journal as ``dispatch``: a result that
+        was journaled before the crash wins over ``result`` (it is what the
+        effect actually produced), and a receipt that is already terminal is
+        returned unchanged with ``deduplicated=True``. Calling it again is a
+        no-op.
+        """
+        receipt = self._store.get_receipt(command_id)
+        if receipt is None:
+            raise CommandAPIError(make_error(
+                "command.receipt_not_found",
+                f"no receipt for command {command_id!r}",
+                ErrorCategory.NOT_FOUND,
+                correlation_id=command_id))
+        if receipt.state is not ReceiptState.ACCEPTED:
+            return receipt.model_copy(update={"deduplicated": True})
+        if command_id in self._effects_in_flight:
+            raise CommandAPIError(make_error(
+                "command.effect_in_flight",
+                f"command {command_id!r} side effect is still running in this process",
+                ErrorCategory.STATE,
+                correlation_id=command_id,
+                recovery_hint="wait for the running dispatch to finalize the receipt"))
+        effect = (self._store.effect_result(command_id)
+                  or self._acknowledged_effects.get(command_id))
+        if effect is None:
+            # No "outbox_id" key: _finish_effect then settles whatever outbox
+            # records the original dispatch enqueued for this command.
+            effect = {"events": [event.model_dump(mode="json") for event in result.events],
+                      "state": result.state.value,
+                      "error": result.error.model_dump(mode="json") if result.error else None,
+                      "output": result.output, "event_cursor": receipt.event_cursor,
+                      "run_id": receipt.run_id}
+        self._store.save_effect_result(command_id, effect)
+        return self._finish_effect(command_id, effect, receipt.event_cursor, receipt.run_id)
 
     # -- query --------------------------------------------------------------------
 

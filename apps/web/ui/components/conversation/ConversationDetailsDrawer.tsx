@@ -6,6 +6,7 @@
  * ───────────────────────────────────────────────────────── */
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { readChatPreferences, useChatPreferences } from "@/lib/chatPreferences";
 import type { IconName } from "@/components/Icon";
 import {
   Badge,
@@ -180,10 +181,18 @@ export function ConversationDetailsDrawer({
   const [artifactLoading, setArtifactLoading] = useState(false);
   const [artifactError, setArtifactError] = useState("");
   const [retainedPayload, setRetainedPayload] = useState(incomingPayload);
-  const [diffViewMode, setDiffViewMode] = useState<DiffViewMode>("unified");
-  const [diffWrap, setDiffWrap] = useState(false);
+  const [diffViewMode, setDiffViewMode] = useState<DiffViewMode>(() => readChatPreferences().diffView);
+  const [diffWrap, setDiffWrap] = useState(() => readChatPreferences().diffWrap);
   const [diffContextLines, setDiffContextLines] = useState(999);
   const [diffSelectedKey, setDiffSelectedKey] = useState("");
+  const prefs = useChatPreferences();
+  const appliedPrefsRef = useRef(prefs);
+  useEffect(() => {
+    const previous = appliedPrefsRef.current;
+    appliedPrefsRef.current = prefs;
+    if (previous.diffView !== prefs.diffView) setDiffViewMode(prefs.diffView);
+    if (previous.diffWrap !== prefs.diffWrap) setDiffWrap(prefs.diffWrap);
+  }, [prefs]);
   const { copied, copy } = useCopy();
   const payload = incomingPayload ?? retainedPayload;
 
@@ -377,10 +386,10 @@ export function ConversationDetailsDrawer({
         <span className="flex min-w-0 items-center gap-2">
           <span className="truncate">{payload.title}</span>
           {payload.status ? (
-            <Badge tone={tone} dot className="font-cx-mono text-[11px]">{statusLabel(payload.status)}</Badge>
+            <Badge tone={tone} dot className="font-cx-mono text-[12px]">{statusLabel(payload.status)}</Badge>
           ) : null}
         </span>
-        <span className="truncate font-cx-mono text-[11.5px] font-normal text-cx-fg-3">
+        <span className="truncate font-cx-mono text-[12px] font-normal text-cx-fg-3">
           {payload.subtitle || payload.toolName || visual.label}
         </span>
       </span>
@@ -428,7 +437,7 @@ export function ConversationDetailsDrawer({
       title="变更"
       icon="fileDiff"
       meta={payload.diff.add != null || payload.diff.del != null ? (
-        <span className="cx-tabular font-cx-mono text-[11.5px]">
+        <span className="cx-tabular font-cx-mono text-[12px]">
           <span className="text-cx-add">+{payload.diff.add ?? 0}</span>{" "}
           <span className="text-cx-del">−{payload.diff.del ?? 0}</span>
         </span>
@@ -499,7 +508,7 @@ export function ConversationDetailsDrawer({
             <div className="flex flex-col gap-2">
               {errorText ? (
                 <Callout tone="danger" role="alert">
-                  <span className="whitespace-pre-wrap break-words font-cx-mono text-[12.5px]">{errorText}</span>
+                  <span className="whitespace-pre-wrap break-words font-cx-mono text-[13px]">{errorText}</span>
                 </Callout>
               ) : null}
               {errorBlock?.code && (!errorText || errorBlock.code.trim() !== errorText.trim()) ? (
@@ -519,7 +528,7 @@ export function ConversationDetailsDrawer({
                 ) : null}
               </div>
             ) : (
-              <p className="rounded-xl border border-dashed border-cx-border px-3 py-3 text-[12.5px] text-cx-fg-4">无结构化输入参数</p>
+              <p className="rounded-xl border border-dashed border-cx-border px-3 py-3 text-[13px] text-cx-fg-4">无结构化输入参数</p>
             )}
           </DialogSection>
         ) : null}

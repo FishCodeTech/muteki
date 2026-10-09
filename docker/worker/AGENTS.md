@@ -16,7 +16,7 @@
 实际存在的路径，不要假设 slim 具备 full 的全部链接。
 
 两个镜像均提供 shell、Python 3、pwntools、curl、wget、git、jq、ripgrep，以及 Claude
-Code、Codex、Cursor、Pi、OMP、Kimi Code、Grok Build、OpenCode 八个 Worker CLI。
+Code、Codex、Cursor、Pi、OMP、Kimi Code、Grok Build、OpenCode、Droid 九个 Worker CLI。
 当前任务由其中一个 CLI 执行。
 
 Kali full 还提供完整的 `kali-linux-headless` 工具集。下列为构建时强制安装的核心入口

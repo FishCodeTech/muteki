@@ -32,8 +32,8 @@ export interface ThinkingProps {
   activeLabel?: string;
   doneLabel?: string;
   defaultExpanded?: boolean;
-  /** Omit the leading glyph when a parent rail already draws a marker. */
-  hideIcon?: boolean;
+  /** Parent already draws a timeline rail; skip the nested left border. */
+  bare?: boolean;
   className?: string;
 }
 
@@ -58,7 +58,7 @@ export function Thinking({
   activeLabel = "正在思考…",
   doneLabel,
   defaultExpanded,
-  hideIcon = false,
+  bare = false,
   className = "",
 }: ThinkingProps) {
   const [manualExpanded, setManualExpanded] = useState<boolean | null>(null);
@@ -78,7 +78,6 @@ export function Thinking({
         onClick={() => setManualExpanded((current) => !(current ?? defaultExpanded ?? working))}
         className="cx-press group -ml-1.5 inline-flex h-7 w-fit items-center gap-1.5 rounded-lg px-1.5 text-[13px] text-cx-fg-3 hover:bg-cx-hover hover:text-cx-fg-2 disabled:pointer-events-none"
       >
-        {hideIcon ? null : <Icon name="brain" size={14} className={working ? "text-cx-accent" : "text-cx-fg-4"} />}
         {working ? <ShimmerText className="font-medium">{activeLabel}</ShimmerText> : <span className="font-medium">{resolvedDoneLabel}</span>}
         {hasContent ? (
           <Icon name="chevronRight" size={12} className={cn("text-cx-fg-4 transition-transform duration-150 ease-cx-out", expanded && "rotate-90")} />
@@ -87,7 +86,7 @@ export function Thinking({
 
       {hasContent ? (
         <Collapse open={expanded}>
-          <div id={disclosureId} className="mb-1 ml-[6px] mt-1 border-l border-cx-border pl-3.5">
+          <div id={disclosureId} className={cn("mb-1 mt-1", !bare && "ml-[6px] border-l border-cx-border pl-3.5")}>
             {summary ? <ChatMarkdown text={summary} streaming={working} size="sm" className="text-cx-fg-3" /> : null}
             {rows.length ? (
               <ul className="m-0 flex list-none flex-col gap-0.5 px-0 pb-0 pt-1.5">
@@ -95,11 +94,11 @@ export function Thinking({
                   const content = (
                     <>
                       <RowStatus status={row.status} />
-                      <span className="min-w-0 truncate text-[12.5px] font-medium text-cx-fg-2">{row.primary}</span>
+                      <span className="min-w-0 truncate text-[13px] font-medium text-cx-fg-2">{row.primary}</span>
                       {row.secondary ? (
                         <span className={cn("min-w-0 truncate text-[12px] text-cx-fg-4", row.mono && "font-cx-mono")}>{row.secondary}</span>
                       ) : null}
-                      {row.add !== undefined ? <DiffStat additions={row.add} deletions={row.del ?? 0} className="ml-auto shrink-0 text-[11px]" /> : null}
+                      {row.add !== undefined ? <DiffStat additions={row.add} deletions={row.del ?? 0} className="ml-auto shrink-0 text-[12px]" /> : null}
                     </>
                   );
                   const rowClass = "flex h-7 w-full min-w-0 items-center gap-2 rounded-md px-1.5 text-left transition-colors hover:bg-cx-hover";

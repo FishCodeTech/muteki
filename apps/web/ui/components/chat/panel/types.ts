@@ -15,6 +15,8 @@ export interface SurfaceContext {
   hasWorkspace: boolean;
   onOpenDetails: (payload: DrawerDetailPayload) => void;
   onCiteToComposer?: (excerpt: string) => void;
+  /** Adds text plus files to the composer; `send` submits right after. */
+  onAttachToComposer?: (input: { text: string; files: File[]; send: boolean }) => void;
   onDiffAnnotationSend?: (annotations: DiffLineAnnotation[]) => void;
 }
 

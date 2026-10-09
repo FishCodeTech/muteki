@@ -43,7 +43,9 @@ def source_files(path: Path, relative: Path = Path(), ancestors: frozenset[Path]
         raise NativeEnvironmentError(f"Native configuration contains a symlink cycle: {path}")
     if path.is_dir():
         for child in sorted(path.iterdir()):
-            if child.name not in {".git", "__pycache__", "logs", ".DS_Store"}:
+            # Factory rewrites sync_stamp.json; Claude plugin caches maintain
+            # .in_use/<pid> leases. Neither changes the imported capabilities.
+            if child.name not in {".git", "__pycache__", "logs", ".DS_Store", "sync_stamp.json", ".in_use"}:
                 yield from source_files(child, relative / child.name, ancestors | {real})
     elif path.is_file():
         yield relative, path
@@ -51,11 +53,28 @@ def source_files(path: Path, relative: Path = Path(), ancestors: frozenset[Path]
         raise NativeEnvironmentError(f"Native configuration is not a regular file: {path}")
 
 
-def content_revision(paths: list[tuple[str, Path]]) -> str:
+def content_revision(
+    paths: list[tuple[str, Path]], *,
+    json_exclude: dict[str, frozenset[str]] | None = None,
+) -> str:
     digest = sha256()
     for label, path in paths:
         for relative, source in source_files(path):
-            digest.update(json.dumps([label, relative.as_posix(), file_digest(source)]).encode())
+            excluded = (json_exclude or {}).get(label)
+            if excluded and source == path:
+                try:
+                    value = json.loads(source.read_text())
+                except (OSError, ValueError) as exc:
+                    raise NativeEnvironmentError(f"Cannot read native configuration {source}: {exc}") from exc
+                if not isinstance(value, dict):
+                    raise NativeEnvironmentError(f"Native configuration must be a JSON object: {source}")
+                fingerprint = sha256(json.dumps(
+                    {key: value[key] for key in value if key not in excluded},
+                    sort_keys=True, separators=(",", ":"),
+                ).encode()).hexdigest()
+            else:
+                fingerprint = file_digest(source)
+            digest.update(json.dumps([label, relative.as_posix(), fingerprint]).encode())
     return digest.hexdigest()[:16]
 
 

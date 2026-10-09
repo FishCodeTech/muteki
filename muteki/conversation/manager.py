@@ -46,12 +46,17 @@ from muteki.platform.contracts.objects import (
     Workspace,
 )
 from muteki.platform.store import PlatformStore
+from muteki.external_agents.capabilities import (
+    AccessModeUnsupportedError,
+    require_access_mode,
+)
+from muteki.external_agents.descriptors import (
+    find_descriptor_for_adapter,
+    resolve_capabilities,
+)
 from muteki.external_agents.factory import engine_for_adapter
 from muteki.external_agents.interaction_matrix import build_matrix_from_probe
 from muteki.external_agents.runtime_capabilities import RuntimeCapabilitySnapshot
-from muteki.external_agents.c24_cu_fixtures import (
-    apply_cu_fixture_to_runtime_connection,
-)
 from muteki.solver.credential_accounts import (
     CredentialAccountStore,
     account_id_from_credential_id,
@@ -66,16 +71,20 @@ from muteki.solver.engine_registry import (
     ensure_engine_supported,
 )
 
+from .approval_queue import approval_response_capability
+from .checkpoints import CheckpointError, checkpoint_status, restore_checkpoint
 from .impact import build_impact_preview, resolve_rewind_capability
 from .models import (
     TURN_COMPLETED,
     TURN_FAILED,
     TURN_INTERRUPTED,
+    TURN_CANCELLED,
     TURN_KIND_EDIT_RESEND,
     TURN_KIND_RETRY,
     TURN_SUPERSEDED,
     ConversationMessage,
     ThreadRuntimeSelection,
+    ThreadState,
     TurnRecord,
     TurnRunRef,
 )
@@ -166,8 +175,8 @@ def _usage_token_coverage(usage: dict[str, Any] | None) -> str:
                 continue
         return False
 
-    has_in = _has("input_tokens", "inputTokens", "prompt_tokens", "promptTokens", "input")
-    has_out = _has("output_tokens", "outputTokens", "completion_tokens", "completionTokens", "output")
+    has_in = _has("input_tokens")
+    has_out = _has("output_tokens")
     if not has_in and not has_out:
         return "missing"
     if not has_in or not has_out:
@@ -201,14 +210,8 @@ def _lightweight_statistics(
         "turn_count": len(turns),
         "step_count": 0,
     }
-    input_tokens = number(
-        usage, "input_tokens", "inputTokens", "prompt_tokens",
-        "promptTokens", "input",
-    )
-    output_tokens = number(
-        usage, "output_tokens", "outputTokens", "completion_tokens",
-        "completionTokens", "output",
-    )
+    input_tokens = number(usage, "input_tokens")
+    output_tokens = number(usage, "output_tokens")
     coverage = _usage_token_coverage(usage)
     # Missing coverage must not publish coerced zeros as definitive consumption.
     if coverage != "missing":
@@ -276,7 +279,7 @@ def _conversation_statistics(
             "core.turn.interrupted",
         ) and turn_id:
             turn_finished[turn_id] = event.occurred_at
-            duration = number(payload, "duration_ms", "elapsed_ms")
+            duration = number(payload, "duration_ms")
             if duration is not None:
                 reported_turn_duration[turn_id] = duration
         elif (
@@ -312,7 +315,7 @@ def _conversation_statistics(
         elif event_type == "core.tool.completed":
             call_id = str(payload.get("call_id") or "")
             key = (turn_id, call_id) if call_id else None
-            reported = number(payload, "duration_ms", "elapsed_ms", "tool_duration_ms")
+            reported = number(payload, "duration_ms")
             previous_end = tool_finished.get(key) if key else None
             if key and (previous_end is None or event.occurred_at < previous_end[0]):
                 tool_finished[key] = (event.occurred_at, reported)
@@ -356,9 +359,7 @@ def _conversation_statistics(
     step_count = 0
     for turn in turns:
         turn_usage = latest_turn_usage.get(turn.turn_id, {})
-        reported_steps = number(
-            turn_usage, "step_count", "steps", "num_turns", "numTurns",
-        )
+        reported_steps = number(turn_usage, "step_count")
         step_count += int(
             reported_steps
             if reported_steps is not None
@@ -378,62 +379,20 @@ def _conversation_statistics(
                 0.0, (finished - started).total_seconds() * 1000,
             )
 
+    # Ledger totals and core.usage.updated payloads both use the canonical
+    # names of ``muteki.core.usage``; input already includes cached input.
     usage = dict(usage or {})
-    input_tokens = number(
-        usage, "input_tokens", "inputTokens", "prompt_tokens",
-        "promptTokens", "input",
-    )
-    output_tokens = number(
-        usage, "output_tokens", "outputTokens", "completion_tokens",
-        "completionTokens", "output",
-    )
-    codex_cache = number(usage, "cached_input_tokens", "cachedInputTokens")
-    cache_read = codex_cache
-    if cache_read is None:
-        cache_read = number(
-            usage, "cache_read_input_tokens", "cacheReadInputTokens",
-            "cache_read_tokens", "cacheReadTokens", "cache_read",
-        )
-    cache_write = number(
-        usage, "cache_creation_input_tokens", "cacheCreationInputTokens",
-        "cache_write_tokens", "cacheWriteTokens", "cache_write",
-    )
-    billed_input = input_tokens
-    # Canonical ledger input already includes cache. Only native disjoint
-    # bucket names may add cache, and an explicit normalized marker wins.
-    separate_cache = any(key in usage for key in (
-        "cache_read_input_tokens", "cacheReadInputTokens", "cacheRead",
-        "cache_creation_input_tokens", "cacheCreationInputTokens",
-    ))
-    if separate_cache and not usage.get("input_includes_cache") and codex_cache is None and input_tokens is not None:
-        billed_input = input_tokens + (cache_read or 0) + (cache_write or 0)
+    billed_input = number(usage, "input_tokens")
+    output_tokens = number(usage, "output_tokens")
+    cache_read = number(usage, "cache_read_tokens")
 
     llm_duration_ms = 0.0
     has_llm_duration = False
     for turn_usage in latest_turn_usage.values():
-        duration = number(
-            turn_usage, "llm_duration_ms", "llmDurationMs",
-            "model_duration_ms", "modelDurationMs",
-        )
+        duration = number(turn_usage, "llm_duration_ms")
         if duration is not None:
             llm_duration_ms += duration
             has_llm_duration = True
-
-    tokens_per_second = number(
-        usage, "tokens_per_second", "tokensPerSecond", "tokens_per_s",
-        "output_tokens_per_second", "throughput",
-    )
-    if tokens_per_second is None:
-        samples = [
-            value
-            for turn_usage in latest_turn_usage.values()
-            if (value := number(
-                turn_usage, "tokens_per_second", "tokensPerSecond",
-                "tokens_per_s", "output_tokens_per_second", "throughput",
-            )) is not None
-        ]
-        if samples:
-            tokens_per_second = sum(samples) / len(samples)
 
     result: dict[str, Any] = {
         "turn_count": len(turns),
@@ -459,8 +418,6 @@ def _conversation_statistics(
         result["tool_wall_duration_ms"] = round(tool_wall_ms)
     if ttft_samples:
         result["average_ttft_ms"] = round(sum(ttft_samples) / len(ttft_samples))
-    if tokens_per_second is not None:
-        result["tokens_per_second"] = round(tokens_per_second, 1)
     coverage = _usage_token_coverage(usage)
     if coverage != "missing":
         if billed_input is not None:
@@ -475,8 +432,35 @@ def _conversation_statistics(
     return result
 
 
+CONVERSATION_INVALID_CODE = "conversation.invalid"
+THREAD_NOT_FOUND_CODE = "conversation.thread.not_found"
+TURN_NOT_FOUND_CODE = "conversation.turn.not_found"
+
+
 class ConversationError(ValueError):
     """Conversation 输入 / 状态错误（未知对象、模式非法等）。"""
+
+    def __init__(
+        self, message: str, *, code: str = CONVERSATION_INVALID_CODE,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+#: Stable machine code for a plan request the resolved capabilities cannot honor.
+INTERACTION_MODE_UNSUPPORTED_CODE = "conversation.interaction_mode_unsupported"
+#: Stable machine code for an interaction mode outside ``INTERACTION_MODE_VALUES``.
+INTERACTION_MODE_INVALID_CODE = "conversation.interaction_mode_invalid"
+INTERACTION_MODE_VALUES = ("default", "plan")
+
+
+class InteractionModeError(ConversationError):
+    """Typed interaction-mode rejection; ``code`` and ``detail`` are stable."""
+
+    def __init__(self, code: str, message: str, detail: Optional[dict[str, Any]] = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.detail = dict(detail or {})
 
 
 class ConversationManager:
@@ -510,9 +494,9 @@ class ConversationManager:
             sessions_root or Path(store.db_path).parent.parent
         ).expanduser().resolve()
         self._capability_snapshot_provider: Any = None
-        self._capability_cache_writer: Any = None
         self._capability_refresh_trigger: Any = None
         self._capability_failure_provider: Any = None
+        self._session_liveness: Any = None
         self._model_effort_validator: Any = None
         # C22 fixture captures: thread_id -> active pending + last capture
         self._user_input_fixtures: dict[str, dict[str, Any]] = {}
@@ -525,10 +509,6 @@ class ConversationManager:
     def bind_model_effort_validator(self, validator: Any) -> None:
         self._model_effort_validator = validator
 
-    def bind_capability_cache_writer(self, writer: Any) -> None:
-        """CU fixture / refresh paths may write the shared capability cache."""
-        self._capability_cache_writer = writer
-
     def bind_capability_refresh_trigger(self, trigger: Any) -> None:
         """Thread 视图在目录缺失/过期时主动后台刷新（#119）。"""
         self._capability_refresh_trigger = trigger
@@ -536,6 +516,14 @@ class ConversationManager:
     def bind_capability_failure_provider(self, provider: Any) -> None:
         """Expose capability refresh failure snapshot to thread views (#188)."""
         self._capability_failure_provider = provider
+
+    def bind_session_liveness(self, provider: Any) -> None:
+        """Whether an agent session is attached in this process.
+
+        Read models use it to mark approvals unanswerable after a restart.
+        ``provider(agent_session_id) -> bool``.
+        """
+        self._session_liveness = provider
 
     def emit_context_window_event(
         self,
@@ -983,15 +971,25 @@ class ConversationManager:
         principal_id: str = "local-user",
         *,
         runtime: Optional[dict[str, Any]] = None,
+        selection: Optional[ThreadRuntimeSelection] = None,
     ) -> Thread:
         """落库 Thread、按模式签发 CapabilityBinding、保存 Runtime 选择。"""
         # Validate and materialize the selection before creating any Thread or
         # Binding rows. A bad/missing credential must fail atomically at creation,
         # rather than leaving a Thread that only fails on its first Turn.
-        selection = (
-            self._build_runtime_selection(thread.thread_id, runtime)
-            if runtime else None
-        )
+        if selection is None and runtime:
+            selection = self._build_runtime_selection(thread.thread_id, runtime)
+        if selection is not None and thread.workspace_id:
+            workspace = self.get_workspace(thread.workspace_id)
+            if workspace is not None:
+                availability = self.access_mode_availability(
+                    selection.adapter_id, selection.instance_id, workspace.root_path)
+                if availability["access_modes"] and selection.access_mode not in availability["access_modes"]:
+                    exc = AccessModeUnsupportedError(
+                        selection.adapter_id, selection.access_mode,
+                        availability["access_modes"],
+                        availability["access_mode_notes"].get(selection.access_mode, ""))
+                    raise ConversationError(str(exc), code=exc.code)
         self._store.save(thread)
         # 按模式生成 Thread 级 CapabilityBinding（CAP-01 唯一签发入口）。
         self._bindings.issue_binding(thread.thread_id, principal_id, thread.mode)
@@ -1030,11 +1028,13 @@ class ConversationManager:
         current = self._conv.get_runtime_selection(thread_id)
         base = current.model_dump() if current is not None else {}
         merged = {**base, **{k: v for k, v in runtime.items() if v is not None}}
-        if runtime.get("effort") is None and any(
+        launch_changed = any(
             key in runtime and runtime[key] is not None and runtime[key] != base.get(key)
             for key in ("adapter_id", "instance_id", "credential_id", "model")
-        ):
-            merged["effort"] = ""
+        )
+        for model_option in ("effort", "service_tier"):
+            if runtime.get(model_option) is None and launch_changed:
+                merged[model_option] = ""
         adapter_id = str(merged.get("adapter_id") or "").strip()
         engine = engine_for_adapter(adapter_id) if adapter_id else ""
         try:
@@ -1066,14 +1066,32 @@ class ConversationManager:
         ).strip()
         if access_mode not in ACCESS_MODE_VALUES:
             raise ConversationError(f"未知 Agent 访问模式：{access_mode!r}")
+        instance_id = str(merged.get("instance_id") or "default")
+        if adapter_id:
+            self._require_supported_access_mode(adapter_id, instance_id, access_mode)
+            thread = self.get_thread(thread_id)
+            workspace = self.get_workspace(thread.workspace_id) if thread and thread.workspace_id else None
+            if workspace is not None:
+                availability = self.access_mode_availability(adapter_id, instance_id, workspace.root_path)
+                if availability["access_modes"] and access_mode not in availability["access_modes"]:
+                    exc = AccessModeUnsupportedError(adapter_id, access_mode, availability["access_modes"], availability["access_mode_notes"].get(access_mode, ""))
+                    raise ConversationError(str(exc), code=exc.code)
+        interaction_mode = self._resolve_interaction_mode(
+            adapter_id, instance_id, merged.get("interaction_mode"),
+            explicit=runtime.get("interaction_mode") is not None,
+            runtime_changed=launch_changed,
+        )
         selection = ThreadRuntimeSelection(
             thread_id=thread_id,
             adapter_id=adapter_id,
-            instance_id=str(merged.get("instance_id") or "default"),
+            instance_id=instance_id,
             credential_id=credential_id,
             model=model,
             effort="" if merged.get("effort") == "default" else str(merged.get("effort") or ""),
+            service_tier=("" if merged.get("service_tier") == "default"
+                          else str(merged.get("service_tier") or "").strip()),
             access_mode=access_mode,
+            interaction_mode=interaction_mode,
             permission_mode=str(merged.get("permission_mode") or ""),
             sandbox_mode=str(merged.get("sandbox_mode") or ""),
             updated_at=utcnow(),
@@ -1084,6 +1102,116 @@ class ConversationManager:
             except ValueError as exc:
                 raise ConversationError(str(exc)) from exc
         return selection
+
+    def _resolved_capabilities(
+        self, adapter_id: str, instance_id: str,
+    ) -> Optional[Any]:
+        """Declared descriptor capabilities overlaid with the cached probe."""
+        descriptor = find_descriptor_for_adapter(adapter_id)
+        if descriptor is None:
+            return None
+        record = (self._adapter_registry.record(adapter_id, instance_id)
+                  if self._adapter_registry is not None else None)
+        report = record.last_probe if record is not None else None
+        caps, _sources = resolve_capabilities(
+            descriptor,
+            report.capabilities if report is not None else None,
+            adapter_id=adapter_id,
+            probe_sources=dict(report.field_sources) if report is not None else None,
+        )
+        return caps
+
+    def require_interaction_mode(
+        self, adapter_id: str, instance_id: str, interaction_mode: str,
+    ) -> None:
+        """Reject ``plan`` when the resolved capabilities lack ``plan_mode``.
+
+        A runtime without a descriptor has no declared support, so it cannot
+        be asked to plan either.
+        """
+        if interaction_mode not in INTERACTION_MODE_VALUES:
+            raise InteractionModeError(
+                INTERACTION_MODE_INVALID_CODE,
+                f"未知交互模式：{interaction_mode!r}",
+                {"interaction_mode": interaction_mode,
+                 "allowed": list(INTERACTION_MODE_VALUES)})
+        if interaction_mode == "default":
+            return
+        caps = self._resolved_capabilities(adapter_id, instance_id)
+        if caps is not None and caps.plan_mode:
+            return
+        engine = engine_for_adapter(adapter_id) if adapter_id else ""
+        raise InteractionModeError(
+            INTERACTION_MODE_UNSUPPORTED_CODE,
+            f"当前 Runtime（{adapter_id or '未选择'}）不支持规划模式",
+            {"interaction_mode": interaction_mode, "adapter_id": adapter_id,
+             "instance_id": instance_id, "engine": engine,
+             "plan_mode": bool(caps.plan_mode) if caps is not None else False,
+             "descriptor_known": caps is not None})
+
+    def carry_interaction_mode(
+        self, adapter_id: str, instance_id: str, previous: str,
+    ) -> str:
+        """Mode a thread keeps when it switches to another runtime."""
+        return self._resolve_interaction_mode(
+            adapter_id, instance_id, previous, explicit=False, runtime_changed=True)
+
+    def _resolve_interaction_mode(
+        self, adapter_id: str, instance_id: str, raw: Any, *,
+        explicit: bool, runtime_changed: bool,
+    ) -> str:
+        """Normalize the thread's interaction-mode preference.
+
+        A preference merely inherited across a runtime switch falls back to
+        ``default`` when the new runtime cannot plan; an explicit request is
+        validated and rejected instead.
+        """
+        mode = str(raw or "default").strip() or "default"
+        try:
+            self.require_interaction_mode(adapter_id, instance_id, mode)
+        except InteractionModeError as exc:
+            if (exc.code == INTERACTION_MODE_UNSUPPORTED_CODE
+                    and not explicit and runtime_changed):
+                return "default"
+            raise
+        return mode
+
+    def _require_supported_access_mode(
+        self, adapter_id: str, instance_id: str, access_mode: str
+    ) -> None:
+        """Reject a mode the runtime's resolved capabilities do not honor.
+
+        Uses the same declared-baseline-plus-probe resolution as the
+        interaction matrix. An empty ``access_modes`` list means the runtime
+        exposes no access-mode control, matching the composer's rule.
+        """
+        caps = self._resolved_capabilities(adapter_id, instance_id)
+        if caps is None:
+            return
+        if not caps.access_modes:
+            return
+        try:
+            require_access_mode(adapter_id, access_mode, caps.access_modes)
+        except AccessModeUnsupportedError as exc:
+            raise ConversationError(str(exc), code=exc.code) from exc
+
+    def access_mode_availability(
+        self, adapter_id: str, instance_id: str = "default", cwd: str = "",
+    ) -> dict[str, Any]:
+        """Workspace-scoped permissions, from the same policy as session launch."""
+        caps = self._resolved_capabilities(adapter_id, instance_id)
+        modes = list(caps.access_modes) if caps is not None else []
+        descriptor = find_descriptor_for_adapter(adapter_id)
+        adapter_descriptor = descriptor.adapter(adapter_id) if descriptor is not None else None
+        notes = dict(adapter_descriptor.access_mode_notes) if adapter_descriptor is not None else {}
+        if engine_for_adapter(adapter_id) == "kimi" and cwd:
+            from muteki.external_agents.kimi import _require_kimi_supervised_enforceable
+            try:
+                _require_kimi_supervised_enforceable(adapter_id, "supervised", cwd)
+            except AccessModeUnsupportedError as exc:
+                modes = [mode for mode in modes if mode != "supervised"]
+                notes["supervised"] = str(exc)
+        return {"access_modes": modes, "access_mode_notes": notes}
 
     def _validate_credential_binding(
         self, *, credential_id: str, engine: str, model: str
@@ -1138,7 +1266,7 @@ class ConversationManager:
         （CAP-01：新版本 + 撤销旧版本及其全部 Grant）。"""
         thread = self.get_thread(thread_id)
         if thread is None:
-            raise ConversationError(f"unknown thread: {thread_id}")
+            raise ConversationError(f"unknown thread: {thread_id}", code=THREAD_NOT_FOUND_CODE)
         try:
             ThreadMode(str(mode))
         except ValueError as exc:
@@ -1150,7 +1278,7 @@ class ConversationManager:
         """更新 Thread 标题；标题属于对象本体，事件用于 SSE 和审计。"""
         thread = self.get_thread(thread_id)
         if thread is None:
-            raise ConversationError(f"unknown thread: {thread_id}")
+            raise ConversationError(f"unknown thread: {thread_id}", code=THREAD_NOT_FOUND_CODE)
         title = str(title or "").strip()
         if not title:
             raise ConversationError("thread title cannot be empty")
@@ -1165,7 +1293,7 @@ class ConversationManager:
         """为异步标题/摘要生成预留一个单调版本。"""
         thread = self.get_thread(thread_id)
         if thread is None:
-            raise ConversationError(f"unknown thread: {thread_id}")
+            raise ConversationError(f"unknown thread: {thread_id}", code=THREAD_NOT_FOUND_CODE)
         turn_id = str(turn_id or "").strip()
         if not turn_id:
             raise ConversationError("metadata turn_id cannot be empty")
@@ -1219,7 +1347,7 @@ class ConversationManager:
         """归档：撤销该 Thread 的 CapabilityBinding（联动撤销全部 Grant）。"""
         thread = self.get_thread(thread_id)
         if thread is None:
-            raise ConversationError(f"unknown thread: {thread_id}")
+            raise ConversationError(f"unknown thread: {thread_id}", code=THREAD_NOT_FOUND_CODE)
         for binding in self._store.list(CapabilityBinding, thread_id=thread_id):
             if binding.revoked_at is None:
                 self._bindings.revoke_binding(binding.binding_id, binding.binding_version)
@@ -1240,7 +1368,7 @@ class ConversationManager:
         """
         source = self.get_thread(source_thread_id)
         if source is None:
-            raise ConversationError(f"unknown thread: {source_thread_id}")
+            raise ConversationError(f"unknown thread: {source_thread_id}", code=THREAD_NOT_FOUND_CODE)
         self.activate_thread(forked, principal_id)
         selection = self._conv.get_runtime_selection(source_thread_id)
         if selection is not None:
@@ -1255,6 +1383,22 @@ class ConversationManager:
             cutoff_seq = source_turn.seq
 
         current_turns = self._conv.list_current_turns(source_thread_id)
+        boundary = (self._conv.get_turn(from_turn_id) if from_turn_id else
+                    next((item for item in reversed(current_turns) if item.native_turn_id), None))
+        if (selection is not None and selection.adapter_id == "codex.app_server"
+                and boundary is not None and boundary.native_turn_id and boundary.agent_session_id):
+            native_session = self._store.get(AgentSession, boundary.agent_session_id)
+            if native_session is not None and native_session.adapter_id == selection.adapter_id and native_session.resume_handle:
+                snapshot = boundary.runtime_snapshot or {}
+                state = self._conv.get_state(forked.thread_id)
+                self._conv.save_state(state.model_copy(update={"native_fork": {
+                    "adapter_id": native_session.adapter_id,
+                    "source_thread_id": source_thread_id,
+                    "source_agent_session_id": native_session.agent_session_id,
+                    "source_credential_id": str(snapshot.get("credential_id", selection.credential_id)),
+                    "native_thread_id": native_session.resume_handle,
+                    "native_turn_id": boundary.native_turn_id,
+                }}))
         source_turns = {
             item.turn_id: item.seq
             for item in current_turns
@@ -1344,7 +1488,7 @@ class ConversationManager:
         """fork Thread 的同步便捷路径（命令 Handler 之外使用）。"""
         source = self.get_thread(source_thread_id)
         if source is None:
-            raise ConversationError(f"unknown thread: {source_thread_id}")
+            raise ConversationError(f"unknown thread: {source_thread_id}", code=THREAD_NOT_FOUND_CODE)
         forked = Thread(
             project_id=source.project_id,
             workspace_id=source.workspace_id,
@@ -1370,8 +1514,13 @@ class ConversationManager:
         capability_refs: Optional[list[dict[str, Any]]] = None,
         runtime_invocation: Optional[dict[str, Any]] = None,
         retry_of_turn_id: Optional[str] = None,
+        interaction_mode: Optional[str] = None,
     ) -> tuple[TurnRecord, TurnRunRef, Task, bool]:
         """创建 Turn + Task + Run（幂等）。
+
+        ``interaction_mode`` defaults to the thread's current preference;
+        retry/edit-resend pass the original turn's mode so the replay is
+        faithful.
 
         返回 (turn, run, task, created)；同 ``(thread_id, idempotency_key)``
         重复请求返回既有 Turn（``created=False``），不重复创建。
@@ -1388,6 +1537,10 @@ class ConversationManager:
         if state.status == "archived":
             raise ConversationError(
                 "已归档的对话不能发送消息，请先取消归档")
+        selection = self.runtime_selection(thread_id)
+        turn_mode = str(interaction_mode or selection.interaction_mode or "default")
+        self.require_interaction_mode(
+            selection.adapter_id, selection.instance_id or "default", turn_mode)
         seq = self._conv.next_turn_seq(thread_id)
         task = Task(
             thread_id=thread_id,
@@ -1413,6 +1566,7 @@ class ConversationManager:
             attachments=list(attachments or []),
             capability_refs=list(capability_refs or []),
             runtime_invocation=dict(runtime_invocation or {}),
+            interaction_mode=turn_mode,  # type: ignore[arg-type]
         )
         run = TurnRunRef(
             turn_id=turn.turn_id,
@@ -1439,6 +1593,8 @@ class ConversationManager:
         command_id: str = "",
         idempotency_key: Optional[str] = None,
         text: Optional[str] = None,
+        restore_files: bool = False,
+        interaction_mode: Optional[str] = None,
     ) -> tuple[TurnRecord, TurnRunRef, Task, list[str], bool]:
         """Replace ``turn_id`` and every later turn on the active branch.
 
@@ -1452,7 +1608,7 @@ class ConversationManager:
         """
         thread = self.get_thread(thread_id)
         if thread is None:
-            raise ConversationError(f"unknown thread: {thread_id}")
+            raise ConversationError(f"unknown thread: {thread_id}", code=THREAD_NOT_FOUND_CODE)
         state = self._conv.get_state(thread_id)
         if state.status == "archived":
             raise ConversationError("archived thread cannot retry turns")
@@ -1477,13 +1633,31 @@ class ConversationManager:
             or target.thread_id != thread_id
             or target.status == TURN_SUPERSEDED
         ):
-            raise ConversationError(f"turn {turn_id} 不在当前对话分支中")
+            raise ConversationError(f"turn {turn_id} 不在当前对话分支中", code=TURN_NOT_FOUND_CODE)
         if target.status not in {
-            TURN_COMPLETED, TURN_FAILED, TURN_INTERRUPTED,
+            TURN_COMPLETED, TURN_FAILED, TURN_INTERRUPTED, TURN_CANCELLED,
         }:
             raise ConversationError(
                 f"turn {turn_id} 当前状态为 {target.status}，还不能重试"
             )
+
+        # Validate before anything is superseded: the replay must be sendable.
+        # An explicit mode (composer toggle) replaces the original turn's mode;
+        # otherwise the replay stays faithful to that turn.
+        selection = self.runtime_selection(thread_id)
+        explicit_mode = str(interaction_mode or "").strip()
+        replay_mode = explicit_mode or target.interaction_mode
+        self.require_interaction_mode(
+            selection.adapter_id, selection.instance_id or "default",
+            replay_mode)
+        if explicit_mode and explicit_mode != selection.interaction_mode:
+            self.save_runtime_selection(
+                thread_id, {"interaction_mode": replay_mode},
+                validate_credential=False)
+
+        if restore_files:
+            # Files first: a failed restore leaves the conversation untouched.
+            restore_checkpoint(self._thread_workspace_root(thread), thread_id, target.turn_id)
 
         replaced = [
             turn for turn in self._conv.list_current_turns(thread_id)
@@ -1536,6 +1710,7 @@ class ConversationManager:
             capability_refs=list(target.capability_refs),
             runtime_invocation=dict(target.runtime_invocation),
             retry_of_turn_id=target.turn_id,
+            interaction_mode=replay_mode,
         )
         return turn, run, task, superseded_turn_ids, created
 
@@ -1552,14 +1727,14 @@ class ConversationManager:
         """Dry-run ImpactPreview for Retry / Edit-resend / Fork / native rewind."""
         thread = self.get_thread(thread_id)
         if thread is None:
-            raise ConversationError(f"unknown thread: {thread_id}")
+            raise ConversationError(f"unknown thread: {thread_id}", code=THREAD_NOT_FOUND_CODE)
         target = self._conv.get_turn(turn_id)
         if (
             target is None
             or target.thread_id != thread_id
             or target.status == TURN_SUPERSEDED
         ):
-            raise ConversationError(f"turn {turn_id} 不在当前对话分支中")
+            raise ConversationError(f"turn {turn_id} 不在当前对话分支中", code=TURN_NOT_FOUND_CODE)
         current_turns = self._conv.list_current_turns(thread_id)
         workspace = (
             self.get_workspace(str(thread.workspace_id or ""))
@@ -1613,7 +1788,7 @@ class ConversationManager:
             "retry", "edit_resend", "fork", "native_rewind",
         }:
             raise ConversationError(f"unknown impact mode: {normalized}")
-        return build_impact_preview(
+        preview = build_impact_preview(
             mode=normalized,  # type: ignore[arg-type]
             target=target,
             current_turns=current_turns,
@@ -1623,6 +1798,19 @@ class ConversationManager:
             runtime_connection=connection,
             edited_text=str(text or ""),
         )
+        if normalized in {"retry", "edit_resend"}:
+            try:
+                preview["checkpoint"] = checkpoint_status(root, thread_id, target.turn_id)
+            except CheckpointError as exc:
+                preview["checkpoint"] = {"available": False, "reason": "error", "error": str(exc), "changes": []}
+        return preview
+
+    def _thread_workspace_root(self, thread: Any) -> str:
+        workspace = (
+            self.get_workspace(str(thread.workspace_id or ""))
+            if thread.workspace_id else None
+        )
+        return str(workspace.root_path or "").strip() if workspace else ""
 
     def native_rewind_turn(
         self,
@@ -1650,7 +1838,7 @@ class ConversationManager:
         """
         thread = self.get_thread(thread_id)
         if thread is None:
-            raise ConversationError(f"unknown thread: {thread_id}")
+            raise ConversationError(f"unknown thread: {thread_id}", code=THREAD_NOT_FOUND_CODE)
         state = self._conv.get_state(thread_id)
         if state.status == "archived":
             raise ConversationError("archived thread cannot rewind turns")
@@ -1673,9 +1861,9 @@ class ConversationManager:
             or target.thread_id != thread_id
             or target.status == TURN_SUPERSEDED
         ):
-            raise ConversationError(f"turn {turn_id} 不在当前对话分支中")
+            raise ConversationError(f"turn {turn_id} 不在当前对话分支中", code=TURN_NOT_FOUND_CODE)
         if target.status not in {
-            TURN_COMPLETED, TURN_FAILED, TURN_INTERRUPTED,
+            TURN_COMPLETED, TURN_FAILED, TURN_INTERRUPTED, TURN_CANCELLED,
         }:
             raise ConversationError(
                 f"turn {turn_id} 当前状态为 {target.status}，还不能回退"
@@ -1708,15 +1896,12 @@ class ConversationManager:
                     if item.seq >= target.seq], True
 
         # Call Provider rewind BEFORE any Muteki supersede.
+        # The executor performs the native rewind (NativeRewindAdapter) or a
+        # history rebuild and passes the outcome in as ``provider_rewind``.
         rewind_fn = provider_rewind
-        if rewind_fn is None and self._adapter_registry is not None:
-            selection = self.runtime_selection(thread_id)
-            adapter = self._adapter_registry.get(
-                selection.adapter_id, selection.instance_id)
-            rewind_fn = getattr(adapter, "rewind_session", None) if adapter else None
         if rewind_fn is None:
             raise ConversationError(
-                "当前 Runtime 未暴露 rewind_session；请改用 Fork 或 Retry"
+                "native rewind requires the executor to supply provider_rewind"
             )
         try:
             result = rewind_fn(thread_id=thread_id, turn_id=turn_id)
@@ -1881,7 +2066,7 @@ class ConversationManager:
     ) -> dict[str, Any]:
         """读取单个 Thread 的长期记忆，并提供限定范围的文本检索。"""
         if self.get_thread(thread_id) is None:
-            raise ConversationError(f"unknown thread: {thread_id}")
+            raise ConversationError(f"unknown thread: {thread_id}", code=THREAD_NOT_FOUND_CODE)
         if self._memory_graph is None:
             raise ConversationError("未绑定 memory.timeline.v1 GraphService")
         snapshot = await self._memory_graph.snapshot(GraphScope(
@@ -1909,6 +2094,34 @@ class ConversationManager:
 
     # -- 视图 ----------------------------------------------------------------------
 
+    def _with_response_capability(
+        self, view: dict[str, Any], state: ThreadState, session: Optional[AgentSession],
+    ) -> dict[str, Any]:
+        """Refresh each adapter-issued approval's answerability against the live session record."""
+        is_open = session is not None and session.closed_at is None
+        session_id = session.agent_session_id if session is not None else ""
+        generation = state.current_generation
+        if session is not None and session.execution_generation is not None:
+            generation = session.execution_generation
+        session_live = None
+        if is_open and self._session_liveness is not None:
+            session_live = bool(self._session_liveness(session_id))
+
+        def refreshed(row: Any) -> Any:
+            if not isinstance(row, dict) or not isinstance(
+                    row.get("response_capability"), dict):
+                return row
+            return {**row, "response_capability": approval_response_capability(
+                row, current_session_id=session_id, session_open=is_open,
+                current_generation=generation, session_live=session_live)}
+
+        rows = view.get("pending_approvals")
+        if isinstance(rows, dict):
+            view["pending_approvals"] = {key: refreshed(row) for key, row in rows.items()}
+        if view.get("pending_approval"):
+            view["pending_approval"] = refreshed(view["pending_approval"])
+        return view
+
     def thread_view(
         self,
         thread_id: str,
@@ -1923,7 +2136,7 @@ class ConversationManager:
         """Thread 页面快照：元数据 + 消息页（默认页大小，非整段历史）。"""
         thread = self.get_thread(thread_id)
         if thread is None:
-            raise ConversationError(f"unknown thread: {thread_id}")
+            raise ConversationError(f"unknown thread: {thread_id}", code=THREAD_NOT_FOUND_CODE)
         state = (self._projection.mark_read(thread_id) if mark_read
                  else self._conv.get_state(thread_id))
         selection = self.runtime_selection(thread_id)
@@ -1954,6 +2167,7 @@ class ConversationManager:
             "capability_stale": True,
             "matrix": None,
             "matrix_diagnostics": [],
+            "background_turn_id": None,
         }
         snapshot = None
         if self._adapter_registry is not None:
@@ -2005,8 +2219,15 @@ class ConversationManager:
                 runtime_connection["matrix_diagnostics"] = list(
                     matrix.diagnostics)
             if session is not None and adapter is not None:
-                plan = getattr(adapter, "injection_plan", lambda _id: None)(
-                    session.agent_session_id)
+                from muteki.platform.contracts.protocols import NativeContinuationAdapter
+                from muteki.platform.contracts.external_agents import AgentSessionRef
+                if session.closed_at is None and isinstance(adapter, NativeContinuationAdapter):
+                    runtime_connection["background_turn_id"] = adapter.background_turn_id(AgentSessionRef(
+                        agent_session_id=session.agent_session_id, adapter_id=session.adapter_id,
+                        runtime_instance_id=session.runtime_instance_id,
+                        external_session_id=session.external_session_id,
+                        resume_handle=session.resume_handle))
+                plan = adapter.injection_plan(session.agent_session_id)
                 runtime_connection.update({
                     "connected": bool(
                         session.external_session_id and session.closed_at is None),
@@ -2025,16 +2246,6 @@ class ConversationManager:
                         else "" if session.external_session_id
                         else "configuration exists but Runtime is not connected"),
                 })
-        fixture_snapshot = apply_cu_fixture_to_runtime_connection(
-            thread.title or "", runtime_connection,
-        )
-        if fixture_snapshot is not None and callable(
-            self._capability_snapshot_provider
-        ):
-            # Keep executor cache aligned so composer menus share revision.
-            cache = getattr(self, "_capability_cache_writer", None)
-            if callable(cache):
-                cache(thread_id, fixture_snapshot)
         # #119: 已配置 Runtime 且尚未拿到会话目录时主动刷新，勿依赖命令菜单。
         # #188: 失败快照存在时也触发；真正是否重试由 executor 退避门闩决定，
         # 避免详情重复读取无限重启同一失败。成功但 stale 的目录不在此重刷，
@@ -2097,7 +2308,7 @@ class ConversationManager:
         all_turns = turns
         active_turn_ids = {turn.turn_id for turn in all_turns}
         for turn in all_turns:
-            if turn.status in (TURN_INTERRUPTED, TURN_FAILED):
+            if turn.status in (TURN_INTERRUPTED, TURN_FAILED, TURN_CANCELLED):
                 self._projection.ensure_assistant_from_deltas(
                     thread_id, turn.turn_id)
 
@@ -2181,11 +2392,11 @@ class ConversationManager:
                 if workspace is not None else None
             ),
             "runtime": selection.model_dump(mode="json"),
-            "state": {
+            "state": self._with_response_capability({
                 **state.model_dump(mode="json"),
                 "unread": state.unread,
                 "usage": visible_usage,
-            },
+            }, state, session),
             "binding": binding.model_dump(mode="json") if binding else None,
             "grants": [grant.model_dump(mode="json") for grant in grants],
             "agent_session": (
@@ -2230,7 +2441,7 @@ class ConversationManager:
         """Paged current-branch messages for history scroll / expand."""
         thread = self.get_thread(thread_id)
         if thread is None:
-            raise ConversationError(f"unknown thread: {thread_id}")
+            raise ConversationError(f"unknown thread: {thread_id}", code=THREAD_NOT_FOUND_CODE)
         page_limit = _parse_messages_limit(
             limit if limit is not None else DEFAULT_MESSAGES_PAGE_LIMIT
         )
@@ -2400,10 +2611,10 @@ class ConversationManager:
 
         thread = self.get_thread(thread_id)
         if thread is None:
-            raise ConversationError(f"unknown thread: {thread_id}")
+            raise ConversationError(f"unknown thread: {thread_id}", code=THREAD_NOT_FOUND_CODE)
         turn = self._conv.get_turn(turn_id)
         if turn is None or turn.thread_id != thread_id:
-            raise ConversationError(f"unknown turn: {turn_id}")
+            raise ConversationError(f"unknown turn: {turn_id}", code=TURN_NOT_FOUND_CODE)
         if turn.status == TURN_SUPERSEDED:
             raise ConversationError(f"turn superseded: {turn_id}")
         fetch_limit = max(1, min(int(limit), TURN_PROCESS_EVENT_LIMIT))
@@ -2444,7 +2655,7 @@ class ConversationManager:
         with self._store.transaction():
             thread = self.get_thread(thread_id)
             if thread is None:
-                raise ConversationError(f"unknown thread: {thread_id}")
+                raise ConversationError(f"unknown thread: {thread_id}", code=THREAD_NOT_FOUND_CODE)
             watermark = self._store.stream_head("thread", thread_id)
             all_turns = self._conv.list_turns(thread_id)
             turns = [turn for turn in all_turns if turn.status != TURN_SUPERSEDED]

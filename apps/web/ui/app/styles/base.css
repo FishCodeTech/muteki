@@ -451,20 +451,23 @@ html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); c
   font: 14px/1.5 var(--font-sans);
   -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
 
-.login-gate { position: fixed; inset: 0; z-index: 9999; display: grid; place-items: center; background: var(--bg); color: var(--text); }
-.login-gate-checking { color: var(--muted); font-size: 14px; }
-.login-gate-card { display: flex; flex-direction: column; gap: 14px; width: 320px; padding: 28px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow-pop); }
-.login-gate-copy { text-align: center; }
-.login-gate-title { color: var(--bright); font-size: 17px; font-weight: 700; }
-.login-gate-sub { margin-top: 4px; color: var(--muted); font-size: 13px; }
-.login-gate-input { padding: 10px 12px; border: 1px solid var(--line2); border-radius: 9px; outline: none; color: var(--bright); background: var(--bg); font: inherit; font-size: 14px; caret-color: var(--accent); }
-.login-gate-input::placeholder { color: var(--muted); opacity: 1; }
-.login-gate-input:focus { border-color: var(--focus-ring); box-shadow: none; }
-.login-gate-input.error { border-color: var(--red); }
-.login-gate-error { font-size: 12.5px; color: var(--red); }
-.login-gate-submit { align-self: flex-end; padding: 10px 12px; border: 0; border-radius: 9px; background: var(--accent); color: var(--on-accent, #fff); font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; }
-.login-gate-submit:disabled { opacity: .7; cursor: default; }
-.login-gate-submit:not(:disabled):hover { filter: brightness(1.06); }
+.login-gate { position: fixed; inset: 0; z-index: 9999; display: grid; align-items: center; justify-items: center; overflow-y: auto; padding: 32px 20px; background: var(--cx-bg); color: var(--cx-fg); }
+.login-gate-card { width: min(400px, 100%); min-width: 0; border: 1px solid var(--cx-border); border-radius: 16px; background: var(--cx-elevated); box-shadow: var(--cx-shadow-xs); overflow: hidden; }
+.login-gate-copy { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; padding: 28px 28px 0; }
+.login-gate-copy .muteki-logo { margin-bottom: 16px; }
+.login-gate-copy h1 { margin: 0; font-size: 22px; line-height: 1.45; font-weight: 600; letter-spacing: -.02em; color: var(--cx-fg); }
+.login-gate-copy p { margin: 0; font-size: 14px; line-height: 1.6; color: var(--cx-fg-3); }
+.login-gate-form { display: flex; flex-direction: column; gap: 18px; padding: 24px 28px 28px; }
+.login-gate-error { margin: -8px 0 0; font-size: 13px; line-height: 1.6; color: var(--cx-danger); overflow-wrap: anywhere; }
+.login-gate-notice { margin: 0; padding: 10px 12px; border-radius: 8px; background: var(--cx-bg-subtle); color: var(--cx-fg-2); font-size: 13px; line-height: 1.6; }
+.login-gate-checking { display: flex; align-items: center; gap: 10px; padding: 32px 28px; color: var(--cx-fg-3); font-size: 14px; }
+.login-gate-unavailable { display: flex; flex-direction: column; gap: 20px; padding: 24px 28px 28px; }
+.login-gate-unavailable .login-gate-error { margin: 0; }
+.login-gate-service { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 28px; border-top: 1px solid var(--cx-border-subtle); background: var(--cx-bg-subtle); }
+.login-gate-service > div { display: flex; flex-direction: column; min-width: 0; gap: 2px; color: var(--cx-fg-3); font-size: 12px; line-height: 1.5; }
+.login-gate-service > div > span:last-child { color: var(--cx-fg-2); overflow-wrap: anywhere; }
+@media (max-width: 420px) { .login-gate { padding: 20px 16px; } .login-gate-copy { padding: 24px 24px 0; } .login-gate-form, .login-gate-unavailable { padding-left: 24px; padding-right: 24px; } .login-gate-service { padding-left: 24px; padding-right: 24px; } }
+
 
 /* ── accessibility helpers (additive — no visual change in normal flow) ──────
    .sr-only hides content visually while keeping it in the accessibility tree

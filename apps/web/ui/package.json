@@ -1,6 +1,6 @@
 {
   "name": "muteki-command-deck",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "type": "module",
   "description": "Project Muteki web command deck — a conversation-first frontend with a live agent collaboration map, evidence views, worker controls, and HITL operations.",

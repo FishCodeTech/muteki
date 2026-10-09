@@ -1,6 +1,7 @@
 "use client";
 
 import { createContext, useCallback, useContext, useEffect, useState } from "react";
+import { readUiPreference, writeUiPreferences, subscribeUiPreferences } from "./uiPreferences";
 import { desktopChatBridge } from "./desktopChatBridge";
 
 /**
@@ -2063,13 +2064,14 @@ export function I18nProvider({ children }: { children: React.ReactNode }) {
       setStorageError({ code: "preferences.language.storage_read_failed", detail: error instanceof Error ? `${error.name}: ${error.message}` : String(error) });
     }
   }, []);
+  useEffect(() => subscribeUiPreferences(() => setLangState(readUiPreference("language", "zh"))), []);
   // Sync document language whenever the UI locale changes (incl. hydrated preference).
   useEffect(() => {
     applyDocumentLang(lang);
   }, [lang]);
   const setLang = (l: Lang) => {
     setLangState(l);
-    try { window.localStorage.setItem("muteki.lang", l); unsavedLanguage = null; setStorageError(null); }
+    try { if (!writeUiPreferences({language: l})) return; unsavedLanguage = null; setStorageError(null); }
     catch (error) {
       unsavedLanguage = l;
       console.warn("preferences.language.storage_write_failed", error);

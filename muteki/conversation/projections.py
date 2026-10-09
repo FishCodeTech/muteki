@@ -26,11 +26,15 @@ from .models import (
     TURN_COMPLETED,
     TURN_FAILED,
     TURN_INTERRUPTED,
+    TURN_CANCELLED,
     TURN_QUEUED,
     TURN_RUNNING,
     TURN_SUPERSEDED,
+    SUBAGENT_ORIGIN_APP,
+    ConversationAgentNode,
     ConversationMessage,
     ThreadAgentTreeSnapshot,
+    ThreadLineage,
     ThreadPlanSnapshot,
     ThreadState,
 )
@@ -46,13 +50,14 @@ def _queue_update(
     resolve_id: str | None = None,
     expire_reason: str | None = None,
     clear: bool = False,
+    preserve_background: bool = False,
 ) -> dict[str, Any]:
     """Sync pending_approvals map + compat pending_approval singleton."""
     queue = hydrate_approvals(state.pending_approvals, state.pending_approval)
     if clear:
         queue, primary = clear_approvals()
     elif expire_reason is not None:
-        queue, primary = expire_approvals(queue, reason=expire_reason)
+        queue, primary = expire_approvals(queue, reason=expire_reason, preserve_background=preserve_background)
     elif resolve_id is not None:
         queue, primary = remove_approval(queue, resolve_id)
     elif payload is not None:
@@ -136,6 +141,96 @@ def _extract_context_window(
     }
 
 
+#: Thread 流中的后台记账与导航元数据：会推进 head，但不会让已读 Thread
+#: 重新变成未读。打开 Thread 会触发能力探测，探测产生的会话开关、能力
+#: 快照和用量事件若计入未读，Thread 会在用户刚读完后立刻再次未读。
+_QUIET_EVENT_TYPES = frozenset({
+    ev.EV_THREAD_CREATED,
+    ev.EV_THREAD_METADATA_UPDATED,
+    ev.EV_THREAD_RENAME_REQUESTED,
+    ev.EV_THREAD_RENAMED,
+    ev.EV_THREAD_ARCHIVED,
+    ev.EV_THREAD_UNARCHIVED,
+    ev.EV_RUNTIME_SWITCHED,
+    ev.EV_SESSION_STARTED,
+    ev.EV_SESSION_RESUMED,
+    ev.EV_SESSION_CLOSED,
+    ev.EV_RUNTIME_CAPABILITIES_UPDATED,
+    ev.EV_USAGE_UPDATED,
+    ev.EV_CONTEXT_WINDOW,
+    # Subagent bookkeeping is consumed by the parent Agent through
+    # muteki_subagent_status; the child Thread carries its own unread state.
+    ev.EV_THREAD_LINEAGE_SET,
+    ev.EV_SUBAGENT_SPAWNED,
+    ev.EV_SUBAGENT_UPDATED,
+    ev.EV_SUBAGENT_CANCEL_REQUESTED,
+})
+
+#: Fields of ``core.subagent.updated`` that patch the projected node.
+_SUBAGENT_PATCH_FIELDS = (
+    "status", "child_turn_id", "message_id", "error_code", "error",
+    "worktree_state", "spawn_state", "started_at", "completed_at",
+)
+
+
+def _upsert_subagent_node(
+    nodes: list[ConversationAgentNode],
+    event_type: str,
+    payload: dict[str, Any],
+    at: Any,
+) -> list[ConversationAgentNode]:
+    """Idempotent upsert of one app_owned node keyed by ``subagent_id``."""
+    subagent_id = str(payload.get("subagent_id") or "").strip()
+    if not subagent_id:
+        return list(nodes)
+    rows = list(nodes)
+    index = next(
+        (i for i, node in enumerate(rows) if node.agent_id == subagent_id), None)
+    if event_type == ev.EV_SUBAGENT_SPAWNED:
+        node = ConversationAgentNode.model_validate({
+            **dict(payload.get("node") or {}),
+            "agent_id": subagent_id,
+            "origin": SUBAGENT_ORIGIN_APP,
+            "updated_at": at,
+        })
+        if index is None:
+            rows.append(node)
+        else:
+            rows[index] = node
+        return rows
+    if index is None:
+        return rows
+    current = rows[index]
+    patch: dict[str, Any] = {"updated_at": at}
+    if event_type == ev.EV_SUBAGENT_CANCEL_REQUESTED:
+        patch["cancel_requested"] = True
+    else:
+        patch.update({
+            key: payload[key] for key in _SUBAGENT_PATCH_FIELDS if key in payload
+        })
+    rows[index] = ConversationAgentNode.model_validate(
+        {**current.model_dump(), **patch})
+    return rows
+
+#: 只有发生在 Turn 内时才需要用户查看的事件。
+_TURN_SCOPED_ATTENTION_TYPES = frozenset({
+    ev.EV_RUNTIME_ERROR,
+    ev.EV_RUNTIME_WARNING,
+    ev.EV_SESSION_ERROR,
+})
+
+
+def _is_turn_scoped(payload: dict[str, Any]) -> bool:
+    return bool(str(payload.get("turn_id") or "").strip())
+
+
+def _needs_reader_attention(event_type: str, payload: dict[str, Any]) -> bool:
+    if event_type in _QUIET_EVENT_TYPES:
+        return False
+    if event_type in _TURN_SCOPED_ATTENTION_TYPES:
+        return _is_turn_scoped(payload)
+    return True
+
 
 def _thread_turn_still_active(
     conv: ConversationStore,
@@ -176,21 +271,15 @@ class ConversationProjection:
             return
         thread_id = event.aggregate_id
         state = self._conv.get_state(thread_id)
+        p = event.payload
+        etype = event.event_type
         update: dict[str, Any] = {
             "head_stream_seq": max(state.head_stream_seq, event.stream_seq),
             "last_active_at": utcnow(),
         }
-        p = event.payload
-        etype = event.event_type
-
-        # 标题/摘要属于导航元数据：自动生成或操作者手动重命名都不应
-        # 仅因元数据变化把已读 Thread 重新标为未读。
-        if etype in (
-            ev.EV_THREAD_METADATA_UPDATED,
-            ev.EV_THREAD_RENAME_REQUESTED,
-            ev.EV_THREAD_RENAMED,
-        ):
-            update["head_stream_seq"] = state.head_stream_seq
+        if _needs_reader_attention(etype, p):
+            update["attention_stream_seq"] = max(
+                state.attention_stream_seq, event.stream_seq)
 
         if etype == ev.EV_THREAD_CREATED:
             update["status"] = "active"
@@ -198,6 +287,13 @@ class ConversationProjection:
             update["status"] = "archived"
             update["archived_at"] = event.occurred_at
             update["running_turn_id"] = None
+            update["quota_resume"] = None
+            update["quota_hold"] = None
+        elif etype == ev.EV_THREAD_QUOTA_RESUME_SET:
+            schedule = p.get("schedule")
+            update["quota_resume"] = dict(schedule) if isinstance(schedule, dict) else None
+            if state.quota_hold:
+                update["quota_hold"] = {**state.quota_hold, "handled": True}
         elif etype == ev.EV_THREAD_UNARCHIVED:
             # Visibility restore only - do not resume queue or open a session.
             update["status"] = "active"
@@ -205,6 +301,8 @@ class ConversationProjection:
         elif etype == ev.EV_TURN_REQUESTED:
             turn_id = str(p.get("turn_id") or "")
             text = str(p.get("text") or "")
+            update["quota_resume"] = None
+            update["quota_hold"] = None
             update["last_turn_seq"] = max(
                 state.last_turn_seq, int(p.get("seq") or 0))
             if turn_id and (text or p.get("attachments") or p.get("capability_refs")):
@@ -284,7 +382,7 @@ class ConversationProjection:
             turn = self._conv.get_turn(str(p.get("turn_id") or ""))
             if turn is not None and isinstance(p.get("runtime"), dict):
                 runtime = {key: str(value) for key, value in p["runtime"].items() if key in
-                           {"adapter_id", "instance_id", "credential_id", "model", "effort", "access_mode"} and value is not None}
+                           {"adapter_id", "instance_id", "credential_id", "model", "effort", "service_tier", "access_mode", "permission_mode", "sandbox_mode", "interaction_mode"} and value is not None}
                 self._conv.save_turn(turn.model_copy(update={"runtime_snapshot": runtime}))
         elif etype in (ev.EV_TURN_COMPLETED, ev.EV_TURN_FAILED,
                        ev.EV_TURN_INTERRUPTED):
@@ -296,12 +394,18 @@ class ConversationProjection:
             ):
                 update["running_turn_id"] = None
             # Turn 结束后把未决审批标为 expired，避免误点旧请求。
+            preserve_background = etype == ev.EV_TURN_COMPLETED and p.get("phase") != "process_restart"
             update.update(_queue_update(
-                state, expire_reason="回合已结束，待审请求已过期"))
-            update["pending_user_input"] = None
+                state, preserve_background=preserve_background, expire_reason=(
+                    "runtime_restarted" if p.get("phase") == "process_restart"
+                    else "回合已结束，待审请求已过期")))
+            if not (preserve_background and ((state.pending_user_input or {}).get("native") or {}).get("background")):
+                update["pending_user_input"] = None
             if etype == ev.EV_TURN_FAILED:
                 update["last_error"] = _error_payload(p.get("error") or p)
-            elif etype == ev.EV_TURN_COMPLETED:
+            elif (etype == ev.EV_TURN_COMPLETED
+                  or (etype == ev.EV_TURN_INTERRUPTED
+                      and p.get("status") == TURN_CANCELLED)):
                 update["last_error"] = {}
         elif etype == ev.EV_MESSAGE_COMPLETED:
             turn_id = str(p.get("turn_id") or "")
@@ -454,7 +558,8 @@ class ConversationProjection:
                 )
         elif etype == ev.EV_AGENT_UPDATED:
             patch = bool(p.get("patch") or p.get("delta"))
-            update["agents"] = upsert_agent_tree(state.agents, dict(p), patch=patch)
+            update["agents"] = upsert_agent_tree(
+                state.agents, dict(p), patch=patch, at=event.occurred_at)
         elif etype == ev.EV_AGENT_CLEARED:
             reason = str(p.get("unsupported_reason") or p.get("reason") or "")
             if p.get("unsupported") or str(p.get("phase") or "") == "unsupported":
@@ -472,6 +577,16 @@ class ConversationProjection:
                         p.get("tool_activity_summary") or ""
                     ).strip() or None,
                 )
+        elif etype == ev.EV_THREAD_LINEAGE_SET:
+            update["lineage"] = ThreadLineage.model_validate(
+                {**dict(p.get("lineage") or {}), "spawned_at": event.occurred_at})
+        elif etype in (
+            ev.EV_SUBAGENT_SPAWNED,
+            ev.EV_SUBAGENT_UPDATED,
+            ev.EV_SUBAGENT_CANCEL_REQUESTED,
+        ):
+            update["subagents"] = _upsert_subagent_node(
+                state.subagents, etype, p, event.occurred_at)
         elif etype == ev.EV_USAGE_UPDATED:
             raw = dict(p.get("usage") or {})
             runtime = p.get("runtime") or {}
@@ -514,7 +629,29 @@ class ConversationProjection:
                 "source": str(p.get("source") or "event"),
             }
         elif etype in (ev.EV_RUNTIME_ERROR, ev.EV_SESSION_ERROR):
-            update["last_error"] = dict(p)
+            # Errors outside a Turn (e.g. background capability probes) stay in
+            # the event stream and the capability snapshot; they are not a
+            # failed result of this Thread.
+            if _is_turn_scoped(p):
+                update["last_error"] = dict(p)
+        elif etype == ev.EV_RUNTIME_WARNING and isinstance(p.get("rate_limit"), dict):
+            limit = p["rate_limit"]
+            turn_id = str(p.get("turn_id") or "")
+            resets_at = limit.get("resets_at")
+            if (
+                turn_id
+                and limit.get("limited") is True
+                and isinstance(resets_at, (int, float))
+                and not isinstance(resets_at, bool)
+            ):
+                update["quota_hold"] = {
+                    "turn_id": turn_id,
+                    "resets_at": float(resets_at),
+                    "kind": str(limit.get("kind") or ""),
+                    "handled": False,
+                }
+            elif state.quota_hold and state.quota_hold.get("turn_id") == turn_id:
+                update["quota_hold"] = None
         elif etype in (ev.EV_SESSION_STARTED, ev.EV_SESSION_RESUMED):
             update["agent_session_id"] = str(p.get("agent_session_id") or "") or None
         elif etype == ev.EV_SESSION_CLOSED:
@@ -594,24 +731,30 @@ class ConversationProjection:
                     ev.EV_TURN_FAILED: TURN_FAILED,
                     ev.EV_TURN_INTERRUPTED: TURN_INTERRUPTED,
                 }[etype]
+                if (etype == ev.EV_TURN_INTERRUPTED
+                        and p.get("status") == TURN_CANCELLED):
+                    status = TURN_CANCELLED
                 turn_update: dict[str, Any] = {"status": status}
-                if status in (TURN_COMPLETED, TURN_FAILED, TURN_INTERRUPTED):
+                if status in (TURN_COMPLETED, TURN_FAILED, TURN_INTERRUPTED, TURN_CANCELLED):
                     turn_update["completed_at"] = event.occurred_at
-                if etype == ev.EV_TURN_FAILED:
+                if etype == ev.EV_TURN_FAILED or status == TURN_CANCELLED:
                     turn_update["error"] = _error_payload(p.get("error") or p)
+                if (status != TURN_RUNNING
+                        and str(p.get("thread_disposition") or "")):
+                    turn_update["thread_disposition"] = str(p["thread_disposition"])
                 self._conv.save_turn(turn.model_copy(update=turn_update))
                 if turn.run_id:
                     run = self._conv.get_run(turn.run_id)
                     if run is not None:
                         run_update: dict[str, Any] = {"status": status}
                         if status in (
-                            TURN_COMPLETED, TURN_FAILED, TURN_INTERRUPTED,
+                            TURN_COMPLETED, TURN_FAILED, TURN_INTERRUPTED, TURN_CANCELLED,
                         ):
                             run_update["ended_at"] = event.occurred_at
                         self._conv.save_run(run.model_copy(update=run_update))
-                if status in (TURN_COMPLETED, TURN_FAILED, TURN_INTERRUPTED):
+                if status in (TURN_COMPLETED, TURN_FAILED, TURN_INTERRUPTED, TURN_CANCELLED):
                     self._conv.release_active_turn(thread_id, turn_id)
-                if status in (TURN_FAILED, TURN_INTERRUPTED):
+                if status in (TURN_FAILED, TURN_INTERRUPTED, TURN_CANCELLED):
                     self.ensure_assistant_from_deltas(thread_id, turn_id)
 
     def _save_assistant_message(
@@ -701,8 +844,33 @@ class ConversationProjection:
             self.apply(event)
         return len(events)
 
+    def backfill_attention(self, thread_id: str) -> ThreadState:
+        """为旧读模型按事件流算出 attention 水位（只看已投影的事件）。"""
+        state = self._conv.get_state(thread_id)
+        attention = 0
+        after = 0
+        while after < state.head_stream_seq:
+            page = self._store.read_events(
+                ev.AGGREGATE_THREAD, thread_id, after_seq=after, limit=1000)
+            if not page:
+                break
+            for event in page:
+                if event.stream_seq > state.head_stream_seq:
+                    break
+                if _needs_reader_attention(event.event_type, event.payload):
+                    attention = event.stream_seq
+            after = page[-1].stream_seq
+        return self._conv.save_state(state.model_copy(
+            update={"attention_stream_seq": attention}))
+
     def rebuild_all(self) -> int:
         """重启后重建所有 Thread 读模型（只追落后水位的事件）。"""
+        # Legacy rows seed attention from head, which counted background
+        # events as unread; only rows that currently look unread need the
+        # exact value.
+        for thread_id in self._conv.legacy_attention_thread_ids():
+            if self._conv.get_state(thread_id).unread:
+                self.backfill_attention(thread_id)
         total = 0
         for state in self._conv.list_states():
             total += self.rebuild_thread(state.thread_id)

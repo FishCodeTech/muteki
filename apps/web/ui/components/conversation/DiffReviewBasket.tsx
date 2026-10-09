@@ -47,7 +47,7 @@ function AnnotationRow({
     >
       <Icon name="messageCircle" size={13} className="mt-[3px] shrink-0 text-cx-accent" />
       <div className="min-w-0 flex-1">
-        <div className="flex min-w-0 items-center gap-1.5 text-[11.5px] text-cx-fg-4">
+        <div className="flex min-w-0 items-center gap-1.5 text-[12px] text-cx-fg-4">
           <code className="min-w-0 truncate font-cx-mono text-cx-fg-3">{annotation.path}</code>
           <span className="shrink-0">[{sideLabel}] {annotationRangeLabel(annotation)}</span>
           {annotation.stale ? (
@@ -65,7 +65,7 @@ function AnnotationRow({
                 if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) commitEdit();
                 if (e.key === "Escape") { e.stopPropagation(); setDraft(annotation.comment); setEditing(false); }
               }}
-              className="w-full resize-none rounded-lg border border-cx-border-strong bg-cx-elevated px-2 py-1.5 text-[12.5px] leading-5 text-cx-fg outline-none"
+              className="w-full resize-none rounded-lg border border-cx-border-strong bg-cx-elevated px-2 py-1.5 text-[13px] leading-5 text-cx-fg outline-none"
             />
             <div className="flex justify-end gap-1.5">
               <Button size="xs" variant="ghost" onClick={() => { setDraft(annotation.comment); setEditing(false); }}>取消</Button>
@@ -73,7 +73,7 @@ function AnnotationRow({
             </div>
           </div>
         ) : (
-          <p className="mt-0.5 cursor-text whitespace-pre-wrap break-words text-[12.5px] leading-5 text-cx-fg" onClick={() => setEditing(true)}>
+          <p className="mt-0.5 cursor-text whitespace-pre-wrap break-words text-[13px] leading-5 text-cx-fg" onClick={() => setEditing(true)}>
             {annotation.comment}
           </p>
         )}
@@ -104,7 +104,7 @@ export function DiffReviewBasket({ annotations, onUpdate, onDelete, onSendAll }:
         >
           <Icon name="chevronRight" size={13} className={cn("text-cx-fg-4 transition-transform duration-150", open && "rotate-90")} />
           评审意见
-          <span className="cx-tabular rounded-full bg-cx-accent-soft px-1.5 text-[11.5px] text-cx-accent">{annotations.length}</span>
+          <span className="cx-tabular rounded-full bg-cx-accent-soft px-1.5 text-[12px] text-cx-accent">{annotations.length}</span>
         </button>
         {hasStale ? <span className="min-w-0 truncate text-[12px] text-cx-warning">含已过期评论，请删除后再发送</span> : null}
         <Button

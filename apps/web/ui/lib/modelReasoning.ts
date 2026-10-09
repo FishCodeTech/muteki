@@ -1,15 +1,28 @@
-import type { ConversationCredential, ConversationCredentialModel } from "./useConversation";
+import type { ConversationCredential, ConversationCredentialModel, ConversationServiceTier } from "./useConversation";
 
 const MEMORY_KEY = "muteki.chat.model-efforts.v1";
-const KNOWN_ORDER = ["off", "none", "on", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+const KNOWN_ORDER = ["off", "none", "on", "minimal", "low", "medium", "high", "xhigh", "extra-high", "max", "ultra"];
 
-export function credentialForRuntime(credential: ConversationCredential, runtimeKey: string): ConversationCredential {
+/**
+ * Project a credential's models onto one Runtime. ``scopedCatalog`` (see
+ * providerDescriptors.runtimeScopesModelCatalog) means the runtime reads its
+ * own credential-scoped catalog, so credential-level model lists do not apply.
+ */
+export function credentialForRuntime(
+  credential: ConversationCredential,
+  runtimeKey: string,
+  scopedCatalog: boolean,
+): ConversationCredential {
   const catalog = credential.model_catalogs?.[runtimeKey];
   const models = new Map((catalog || []).map(model => [model.id, model]));
-  const scope = (rows: ConversationCredentialModel[]) => rows.map(model => ({
-    ...model, reasoning: models.get(model.id)?.reasoning,
-  }));
-  if (runtimeKey.startsWith("codex.app_server:")) {
+  const scope = (rows: ConversationCredentialModel[]) => rows.map(model => {
+    const metadata = models.get(model.id);
+    return {
+      ...model, reasoning: metadata?.reasoning,
+      service_tiers: metadata?.service_tiers, default_service_tier: metadata?.default_service_tier,
+    };
+  });
+  if (scopedCatalog) {
     const verified = new Set(credential.verified_models_by_runtime?.[runtimeKey] || []);
     const rows = new Map((catalog || []).map(model => [model.id, model]));
     for (const id of verified) if (!rows.has(id)) rows.set(id, { id, label: id });
@@ -51,6 +64,28 @@ export function modelEffortLevels(model: ConversationCredentialModel | null | un
 
 export function validModelEffort(model: ConversationCredentialModel | null | undefined, effort: string): boolean {
   return !effort || effort === "default" || modelEffortLevels(model).includes(effort);
+}
+
+export function modelServiceTiers(model: ConversationCredentialModel | null | undefined): ConversationServiceTier[] {
+  return model?.service_tiers || [];
+}
+
+/** The tier only applies to models whose catalog declares it; others run at standard speed. */
+export function effectiveServiceTier(model: ConversationCredentialModel | null | undefined, tier: string): string {
+  return tier && modelServiceTiers(model).some(row => row.id === tier) ? tier : "";
+}
+
+const SERVICE_TIER_KEY = "muteki.chat.service-tier.v1";
+
+export function readPreferredServiceTier(): string {
+  try { return localStorage.getItem(SERVICE_TIER_KEY) || ""; } catch { return ""; }
+}
+
+export function rememberServiceTier(tier: string): void {
+  try {
+    if (tier) localStorage.setItem(SERVICE_TIER_KEY, tier);
+    else localStorage.removeItem(SERVICE_TIER_KEY);
+  } catch { /* Optional preference storage must not block the composer. */ }
 }
 
 function readMemory(): Record<string, string> {

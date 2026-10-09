@@ -234,6 +234,14 @@ def snapshot_from_payload(
     if not last_change and normalized:
         last_change = f"更新 {len(normalized)} 个计划步骤"
 
+    native = payload.get("native")
+    markdown = str(
+        (native.get("markdown") if isinstance(native, dict) else "")
+        or payload.get("explanation")
+        or prev.markdown
+        or ""
+    ).strip()
+
     return ThreadPlanSnapshot(
         revision=revision,
         phase=phase,
@@ -249,6 +257,7 @@ def snapshot_from_payload(
         pending_amendment=pending_amendment,
         last_change_summary=last_change or None,
         unsupported_reason=unsupported_reason or None,
+        markdown=markdown or None,
         updated_at=utcnow(),
     )
 

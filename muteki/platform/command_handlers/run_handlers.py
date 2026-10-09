@@ -475,7 +475,9 @@ class RunQueryHandler:
             except (TypeError, ValueError):
                 limit = 500
             total = len(rows)
-            rows = rows[:limit]
+            from .pagination import page_items
+            rows, continuation = page_items(rows, params, limit, ctx, query.query_type,
+                                             lambda row: str(row.get("run_id") or ""))
             return QueryResult(
                 query_id=query.query_id,
                 query_type=query.query_type,
@@ -483,6 +485,7 @@ class RunQueryHandler:
                     "runs": rows,
                     "total": total,
                     "returned": len(rows),
+                    **continuation,
                 },
             )
 

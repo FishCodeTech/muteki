@@ -22,6 +22,8 @@ export type ContributionField = {
 /** 命令表单：渲染成一组输入 + 提交按钮，提交即调用扩展业务命令。 */
 export type CommandFormContribution = {
   command_type: string;
+  /** Some manifests identify hint-only forms by `id` instead of a command type. */
+  id?: string;
   title: string;
   description?: string;
   fields: ContributionField[];

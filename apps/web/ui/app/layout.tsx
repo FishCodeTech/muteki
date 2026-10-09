@@ -34,8 +34,9 @@ export const viewport: Viewport = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="zh-CN" data-theme="dark" className="dark" suppressHydrationWarning>
+    <html data-muteki-ui-build={process.env.NEXT_PUBLIC_MUTEKI_UI_BUILD || "development"} data-muteki-appearance-contract="1" lang="zh-CN" data-theme="dark" className="dark" suppressHydrationWarning>
       <head>
+        <script dangerouslySetInnerHTML={{ __html: `try{if(/(?:^|\\s)MutekiDesktop\\/[\\w.+-]+(?:\\s|$)/.test(navigator.userAgent)){var a=JSON.parse(localStorage.getItem("muteki.desktop.appearanceOverride")||"null");if(a&&(a.resolvedTheme==="light"||a.resolvedTheme==="dark")){var r=document.documentElement;r.dataset.theme=a.resolvedTheme;r.classList.toggle("dark",a.resolvedTheme==="dark");r.classList.toggle("light",a.resolvedTheme==="light")}}}catch{}` }} />
         {/* Stable head links are recolored by the palette engine. */}
         <link id="muteki-favicon" rel="icon" href="/favicon.svg" type="image/svg+xml" sizes="any" />
         <link id="muteki-apple-icon" rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180" />

@@ -27,7 +27,9 @@
   flex-direction: column;
   gap: 6px;
   max-height: 240px;
+  overflow-x: hidden;
   overflow-y: auto;
+  overflow-wrap: anywhere;
 }
 .cap-grant-item {
   padding: 8px 10px;

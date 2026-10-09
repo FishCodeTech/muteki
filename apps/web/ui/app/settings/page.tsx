@@ -1,5 +1,3 @@
 import { redirect } from "next/navigation";
-
-export default function SettingsIndexPage() {
-  redirect("/settings/agents");
-}
+import { DEFAULT_SETTINGS_PAGE } from "@/components/settings/catalog";
+export default function SettingsPage() { redirect(`/settings/${DEFAULT_SETTINGS_PAGE}`); }

@@ -47,6 +47,8 @@ export type ComposerDraft = {
   model?: string;
   effort?: string;
   accessMode?: string;
+  /** Per-thread interaction-mode preference: "default" | "plan". */
+  interactionMode?: string;
   projectId?: string;
   updatedAt: number;
 };
@@ -350,6 +352,7 @@ export function isComposerDraftEmpty(draft: ComposerDraft | null | undefined): b
   // Model / project selection alone is still a meaningful unsent draft.
   if (draft.credentialId || draft.model || draft.effort || draft.projectId) return false;
   if (draft.accessMode && draft.accessMode !== "supervised") return false;
+  if (draft.interactionMode && draft.interactionMode !== "default") return false;
   return true;
 }
 
@@ -463,6 +466,8 @@ export function normalizeComposerDraft(value: unknown): ComposerDraft | null {
   if (model) draft.model = model;
   if (row.effort !== undefined) draft.effort = effort;
   if (accessMode) draft.accessMode = accessMode;
+  const interactionMode = String(row.interactionMode || "").trim();
+  if (interactionMode) draft.interactionMode = interactionMode;
   if (projectId) draft.projectId = projectId;
   return draft;
 }
@@ -495,6 +500,8 @@ export type ComposerDraftWriteInput = {
   model?: string;
   effort?: string;
   accessMode?: string;
+  /** Per-thread interaction-mode preference: "default" | "plan". */
+  interactionMode?: string;
   projectId?: string;
 };
 
@@ -570,6 +577,8 @@ export function writeComposerDraft(draftKey: string, input: ComposerDraftWriteIn
   if (model) draft.model = model;
   if (input.effort !== undefined) draft.effort = effort;
   if (accessMode) draft.accessMode = accessMode;
+  const interactionMode = String(input.interactionMode || "").trim();
+  if (interactionMode) draft.interactionMode = interactionMode;
   if (projectId) draft.projectId = projectId;
 
   const bucket = readBucketFromStorage();

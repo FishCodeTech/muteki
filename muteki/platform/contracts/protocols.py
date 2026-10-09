@@ -6,7 +6,7 @@ Store、SharedGraph 数据库或 Result Gate，只能经以下接口进入平台
 
 from __future__ import annotations
 
-from typing import Any, AsyncIterator, Optional, Protocol, runtime_checkable
+from typing import Any, AsyncIterator, Callable, Optional, Protocol, runtime_checkable
 
 from .capabilities import (
     BindingContext,
@@ -29,6 +29,7 @@ from .commands import (
 from .external_agents import (
     AgentCapabilities,
     AgentEvent,
+    AgentEventType,
     AgentInput,
     AgentSessionRef,
     AgentSessionSnapshot,
@@ -148,6 +149,83 @@ class ExternalAgentAdapter(Protocol):
     async def interrupt(self, session: AgentSessionRef) -> CommandReceipt: ...
     async def snapshot(self, session: AgentSessionRef) -> AgentSessionSnapshot: ...
     async def close(self, session: AgentSessionRef) -> None: ...
+
+
+# -- Optional adapter capabilities ----------------------------------------------
+#
+# Adapters declare these by inheriting the Protocol; consumers dispatch with
+# ``isinstance`` instead of probing attribute names. Whether a declared
+# operation is usable for a given session is still decided by the adapter's
+# runtime capability snapshot.
+
+#: Callback for runtime updates that arrive outside an active turn stream.
+BackgroundUpdate = tuple[AgentEventType, str, dict[str, Any]]
+
+
+@runtime_checkable
+class RuntimeOperationAdapter(Protocol):
+    """Runs a verified client-resolved runtime operation (``/compact`` etc.)."""
+
+    async def runtime_operation(
+        self, session: AgentSessionRef, name: str, arguments: str = ""
+    ) -> dict[str, Any]: ...
+
+
+@runtime_checkable
+class NativeRewindAdapter(Protocol):
+    """Rolls the native thread back to before a given native turn."""
+
+    def supports_native_rewind(self, session: AgentSessionRef) -> bool: ...
+    async def rewind_session(
+        self, session: AgentSessionRef, native_turn_id: str
+    ) -> dict[str, Any]: ...
+
+
+@runtime_checkable
+class BackgroundUpdateAdapter(Protocol):
+    """Delivers runtime updates that arrive after the turn stream ended."""
+
+    def bind_background_handler(
+        self,
+        session: AgentSessionRef,
+        handler: Callable[[list[BackgroundUpdate]], None],
+    ) -> None: ...
+
+
+@runtime_checkable
+class NativeContinuationAdapter(Protocol):
+    """A native background execution offers a turn without another prompt.
+
+    Mirrors T3's continuationRequests / dispatchIfCurrent / runWake port.
+    Updates retain the conversation turn that started their background work.
+    """
+
+    def bind_continuations(
+        self, session: AgentSessionRef, turn_id: str,
+        updates: Callable[[str, list[BackgroundUpdate]], None],
+        offer: Callable[[], None],
+    ) -> None: ...
+
+    def pending_continuation(self, session: AgentSessionRef) -> tuple[str, str] | None: ...
+
+    def background_turn_id(self, session: AgentSessionRef) -> str | None: ...
+
+    def run_continuation(
+        self, session: AgentSessionRef, wake_id: str,
+    ) -> AsyncIterator[AgentEvent]: ...
+
+
+@runtime_checkable
+class ProbingAdapter(Protocol):
+    """What the Adapter Registry needs from an adapter to key and run probes."""
+
+    id: str
+    identity: Any
+    launch_args: tuple[str, ...]
+
+    def probe_binary(self) -> str: ...
+    def probe_report(self) -> Any: ...
+    async def probe_with_environment(self, request: ProbeRequest) -> AgentCapabilities: ...
 
 
 @runtime_checkable

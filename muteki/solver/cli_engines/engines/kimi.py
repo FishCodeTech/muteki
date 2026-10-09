@@ -32,8 +32,10 @@ class KimiCodeDriver(CliDriver):
     def _permission_flags(self, launch: LaunchContext) -> list[str]:
         mode = self.validate_launch_context(launch)
         if not launch.interactive:
-            # Kimi 0.38 的 -p prompt mode 本身是无人值守模式，并拒绝与
-            # --auto/--yolo 组合；真实 Worker 工具回合用于验收该行为。
+            # Kimi 2.1.1 rejects combining -p with --auto and with --yolo
+            # ("Cannot combine --prompt with --auto/--yolo"). Print mode
+            # itself runs tools without asking; a file write completed with
+            # only -p. --auto is Never Ask and is not available on this path.
             return []
         flag = {"yolo": "--yolo", "auto": "--auto", "plan": "--plan"}.get(mode)
         return [flag] if flag else []

@@ -108,6 +108,15 @@ export function EngineLogo({ engine, size = 18, className, title }: EngineLogoPr
     );
   }
 
+  if (normalized === "droid" || normalized === "droid-cli" || normalized === "factory-droid") {
+    return (
+      <svg {...logoProps("droid", size, className, title)} viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+        {title ? <title>{title}</title> : null}
+        <path fill="currentColor" d="M4 4h16v4H4V4Zm0 6h10v4H4v-4Zm0 6h16v4H4v-4Z" />
+      </svg>
+    );
+  }
+
   if (normalized === "dsh" || normalized === "deepseek-harness" || normalized === "deepseek") {
     return (
       <svg {...logoProps("dsh", size, className, title)} viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">

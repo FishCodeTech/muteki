@@ -121,14 +121,14 @@ export function MessageActionBar({
         align === "end" ? "flex-row-reverse self-end" : "self-start",
         pinned
           ? "opacity-100"
-          : "opacity-0 group-hover/msg:opacity-100 group-focus-within/msg:opacity-100 [@media(hover:none)]:opacity-100",
+          : "opacity-0 group-hover/msg:opacity-100 group-focus-within/msg:opacity-100 has-[[aria-expanded=true]]:opacity-100 [@media(hover:none)]:opacity-100",
         className,
       )}
       data-pinned={pinned || undefined}
     >
       <div className={cn("flex items-center gap-0.5", align === "end" && "flex-row-reverse")}>{children}</div>
       {meta ? (
-        <span className={cn("cx-tabular select-none px-1.5 text-[11.5px] text-cx-fg-4", align === "end" ? "mr-0.5" : "ml-0.5")}>
+        <span className={cn("cx-tabular select-none px-1.5 text-[12px] text-cx-fg-4", align === "end" ? "mr-0.5" : "ml-0.5")}>
           {meta}
         </span>
       ) : null}

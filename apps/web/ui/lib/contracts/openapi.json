@@ -179,6 +179,12 @@
             "title": "Adapter Id",
             "type": "string"
           },
+          "instance_id": {
+            "default": "",
+            "maxLength": 120,
+            "title": "Instance Id",
+            "type": "string"
+          },
           "project_id": {
             "default": "",
             "maxLength": 160,
@@ -362,6 +368,51 @@
           "account_key"
         ],
         "title": "CreatePlatformConnectionBody",
+        "type": "object"
+      },
+      "CustomAccent": {
+        "additionalProperties": false,
+        "properties": {
+          "hue": {
+            "exclusiveMaximum": 360.0,
+            "minimum": 0.0,
+            "title": "Hue",
+            "type": "number"
+          },
+          "kind": {
+            "const": "custom",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "hue"
+        ],
+        "title": "CustomAccent",
+        "type": "object"
+      },
+      "DefaultModel": {
+        "additionalProperties": false,
+        "properties": {
+          "credentialId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Credentialid",
+            "type": "string"
+          },
+          "modelId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Modelid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "credentialId",
+          "modelId"
+        ],
+        "title": "DefaultModel",
         "type": "object"
       },
       "DomainModuleDescriptor": {
@@ -649,6 +700,34 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "InstallBody": {
+        "properties": {
+          "modes": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Modes"
+          },
+          "source": {
+            "additionalProperties": true,
+            "title": "Source",
+            "type": "object"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "title": "InstallBody",
+        "type": "object"
+      },
       "InstallRequest": {
         "properties": {
           "confirmations": {
@@ -730,6 +809,39 @@
           "confirm"
         ],
         "title": "MaintenanceApplyBody",
+        "type": "object"
+      },
+      "McpBody": {
+        "properties": {
+          "modes": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Modes"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "servers": {
+            "additionalProperties": true,
+            "title": "Servers",
+            "type": "object"
+          }
+        },
+        "required": [
+          "name",
+          "servers"
+        ],
+        "title": "McpBody",
         "type": "object"
       },
       "MemoryDeleteBody": {
@@ -925,6 +1037,32 @@
         "title": "PlatformSecretWriteBody",
         "type": "object"
       },
+      "PresetAccent": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "enum": [
+              "azure",
+              "violet",
+              "teal",
+              "ember"
+            ],
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "preset",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "id"
+        ],
+        "title": "PresetAccent",
+        "type": "object"
+      },
       "PreviewRequest": {
         "properties": {
           "extension_id": {
@@ -1098,6 +1236,266 @@
         "title": "ThreadGitCheckoutBody",
         "type": "object"
       },
+      "ThreadGitCommitBody": {
+        "description": "暂存并提交 Thread 工作区改动；paths 为空时提交全部改动。",
+        "properties": {
+          "amend": {
+            "default": false,
+            "title": "Amend",
+            "type": "boolean"
+          },
+          "message": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Message",
+            "type": "string"
+          },
+          "paths": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 2000,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Paths"
+          }
+        },
+        "title": "ThreadGitCommitBody",
+        "type": "object"
+      },
+      "ThreadGitPullBody": {
+        "properties": {
+          "rebase": {
+            "default": false,
+            "title": "Rebase",
+            "type": "boolean"
+          }
+        },
+        "title": "ThreadGitPullBody",
+        "type": "object"
+      },
+      "ThreadGitPushBody": {
+        "description": "None 表示仅在分支没有上游时自动设置上游。",
+        "properties": {
+          "set_upstream": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Set Upstream"
+          }
+        },
+        "title": "ThreadGitPushBody",
+        "type": "object"
+      },
+      "ThreadPullRequestCreateBody": {
+        "properties": {
+          "base": {
+            "default": "",
+            "maxLength": 255,
+            "title": "Base",
+            "type": "string"
+          },
+          "body": {
+            "default": "",
+            "maxLength": 65000,
+            "title": "Body",
+            "type": "string"
+          },
+          "draft": {
+            "default": false,
+            "title": "Draft",
+            "type": "boolean"
+          },
+          "push_first": {
+            "default": false,
+            "title": "Push First",
+            "type": "boolean"
+          },
+          "title": {
+            "default": "",
+            "maxLength": 1000,
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "title": "ThreadPullRequestCreateBody",
+        "type": "object"
+      },
+      "UiPreferencesWrite": {
+        "additionalProperties": false,
+        "properties": {
+          "values": {
+            "$ref": "#/components/schemas/UiValues"
+          },
+          "version": {
+            "minimum": 0.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "values"
+        ],
+        "title": "UiPreferencesWrite",
+        "type": "object"
+      },
+      "UiValues": {
+        "additionalProperties": false,
+        "properties": {
+          "accent": {
+            "default": {
+              "id": "azure",
+              "kind": "preset"
+            },
+            "discriminator": {
+              "mapping": {
+                "custom": "#/components/schemas/CustomAccent",
+                "preset": "#/components/schemas/PresetAccent"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PresetAccent"
+              },
+              {
+                "$ref": "#/components/schemas/CustomAccent"
+              }
+            ],
+            "title": "Accent"
+          },
+          "defaultAccessMode": {
+            "default": "",
+            "enum": [
+              "",
+              "supervised",
+              "auto-accept-edits",
+              "auto",
+              "full-access"
+            ],
+            "title": "Defaultaccessmode",
+            "type": "string"
+          },
+          "defaultModel": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DefaultModel"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "diffCollapseUnchanged": {
+            "default": true,
+            "title": "Diffcollapseunchanged",
+            "type": "boolean"
+          },
+          "diffView": {
+            "default": "unified",
+            "enum": [
+              "unified",
+              "split"
+            ],
+            "title": "Diffview",
+            "type": "string"
+          },
+          "diffWrap": {
+            "default": false,
+            "title": "Diffwrap",
+            "type": "boolean"
+          },
+          "hiddenModels": {
+            "items": {
+              "maxLength": 2048,
+              "type": "string"
+            },
+            "maxItems": 512,
+            "title": "Hiddenmodels",
+            "type": "array"
+          },
+          "language": {
+            "default": "zh",
+            "enum": [
+              "zh",
+              "en"
+            ],
+            "title": "Language",
+            "type": "string"
+          },
+          "readingContentWidth": {
+            "default": "default",
+            "enum": [
+              "narrow",
+              "default",
+              "wide"
+            ],
+            "title": "Readingcontentwidth",
+            "type": "string"
+          },
+          "readingDensity": {
+            "default": "comfortable",
+            "enum": [
+              "comfortable",
+              "compact"
+            ],
+            "title": "Readingdensity",
+            "type": "string"
+          },
+          "readingFontScale": {
+            "default": "md",
+            "enum": [
+              "sm",
+              "md",
+              "lg"
+            ],
+            "title": "Readingfontscale",
+            "type": "string"
+          },
+          "runningSend": {
+            "default": "queue",
+            "enum": [
+              "queue",
+              "steer"
+            ],
+            "title": "Runningsend",
+            "type": "string"
+          },
+          "sendKey": {
+            "default": "enter",
+            "enum": [
+              "enter",
+              "mod-enter"
+            ],
+            "title": "Sendkey",
+            "type": "string"
+          },
+          "theme": {
+            "default": "system",
+            "enum": [
+              "system",
+              "light",
+              "dark"
+            ],
+            "title": "Theme",
+            "type": "string"
+          }
+        },
+        "title": "UiValues",
+        "type": "object"
+      },
       "UninstallRequest": {
         "properties": {
           "confirm": {
@@ -1122,6 +1520,58 @@
           }
         },
         "title": "UninstallRequest",
+        "type": "object"
+      },
+      "UpdateBody": {
+        "properties": {
+          "digest": {
+            "default": "",
+            "title": "Digest",
+            "type": "string"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "modes": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Modes"
+          },
+          "native_hooks": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Native Hooks"
+          },
+          "rollback": {
+            "default": false,
+            "title": "Rollback",
+            "type": "boolean"
+          }
+        },
+        "title": "UpdateBody",
         "type": "object"
       },
       "UpgradeRequest": {
@@ -1319,6 +1769,394 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/agent-extensions": {
+      "get": {
+        "operationId": "listing_api_agent_extensions_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "engine",
+            "required": false,
+            "schema": {
+              "default": "codex",
+              "title": "Engine",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "mode",
+            "required": false,
+            "schema": {
+              "default": "chat",
+              "title": "Mode",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "run_id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Listing",
+        "tags": [
+          "agent-extensions"
+        ]
+      }
+    },
+    "/api/agent-extensions/bundled/muteki-visualize": {
+      "post": {
+        "operationId": "install_visualize_api_agent_extensions_bundled_muteki_visualize_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Install Visualize",
+        "tags": [
+          "agent-extensions"
+        ]
+      }
+    },
+    "/api/agent-extensions/check/{package_id}": {
+      "post": {
+        "operationId": "check_api_agent_extensions_check__package_id__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "package_id",
+            "required": true,
+            "schema": {
+              "title": "Package Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Check",
+        "tags": [
+          "agent-extensions"
+        ]
+      }
+    },
+    "/api/agent-extensions/control": {
+      "put": {
+        "operationId": "control_api_agent_extensions_control_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": {
+                  "type": "boolean"
+                },
+                "title": "Body",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Control",
+        "tags": [
+          "agent-extensions"
+        ]
+      }
+    },
+    "/api/agent-extensions/install": {
+      "post": {
+        "operationId": "install_api_agent_extensions_install_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstallBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Install",
+        "tags": [
+          "agent-extensions"
+        ]
+      }
+    },
+    "/api/agent-extensions/mcp": {
+      "post": {
+        "operationId": "add_mcp_api_agent_extensions_mcp_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Add Mcp",
+        "tags": [
+          "agent-extensions"
+        ]
+      }
+    },
+    "/api/agent-extensions/packages/{package_id}": {
+      "delete": {
+        "operationId": "uninstall_api_agent_extensions_packages__package_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "package_id",
+            "required": true,
+            "schema": {
+              "title": "Package Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Uninstall",
+        "tags": [
+          "agent-extensions"
+        ]
+      },
+      "patch": {
+        "operationId": "update_api_agent_extensions_packages__package_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "package_id",
+            "required": true,
+            "schema": {
+              "title": "Package Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update",
+        "tags": [
+          "agent-extensions"
+        ]
+      }
+    },
+    "/api/agent-extensions/visualizations/{thread_id}": {
+      "get": {
+        "operationId": "visualization_api_agent_extensions_visualizations__thread_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "title": "Path",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "message_id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Message Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Visualization",
+        "tags": [
+          "agent-extensions"
+        ]
+      }
+    },
     "/api/agent-runtimes": {
       "get": {
         "operationId": "list_runtimes_api_agent_runtimes_get",
@@ -1418,6 +2256,49 @@
           }
         },
         "summary": "Upsert Runtime",
+        "tags": [
+          "agent-runtimes"
+        ]
+      }
+    },
+    "/api/agent-runtimes/descriptors": {
+      "get": {
+        "operationId": "list_provider_descriptors_api_agent_runtimes_descriptors_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "engine",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Engine",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response List Provider Descriptors Api Agent Runtimes Descriptors Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Provider Descriptors",
         "tags": [
           "agent-runtimes"
         ]
@@ -1846,6 +2727,18 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "default": {},
+                "title": "Body",
+                "type": "object"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {
@@ -1892,6 +2785,24 @@
         "summary": "Auth Login"
       }
     },
+    "/api/auth/logout": {
+      "post": {
+        "operationId": "auth_logout_api_auth_logout_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Auth Logout Api Auth Logout Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Auth Logout"
+      }
+    },
     "/api/auth/me": {
       "get": {
         "operationId": "auth_me_api_auth_me_get",
@@ -1908,6 +2819,24 @@
           }
         },
         "summary": "Auth Me"
+      }
+    },
+    "/api/auth/status": {
+      "get": {
+        "operationId": "auth_status_api_auth_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Auth Status Api Auth Status Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Auth Status"
       }
     },
     "/api/auth/ticket": {
@@ -2150,6 +3079,394 @@
         "summary": "Revoke Binding Group",
         "tags": [
           "capability-management"
+        ]
+      }
+    },
+    "/api/chat-plugins": {
+      "get": {
+        "operationId": "listing_api_chat_plugins_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "engine",
+            "required": false,
+            "schema": {
+              "default": "codex",
+              "title": "Engine",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "mode",
+            "required": false,
+            "schema": {
+              "default": "chat",
+              "title": "Mode",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "run_id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Listing",
+        "tags": [
+          "agent-extensions"
+        ]
+      }
+    },
+    "/api/chat-plugins/bundled/muteki-visualize": {
+      "post": {
+        "operationId": "install_visualize_api_chat_plugins_bundled_muteki_visualize_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Install Visualize",
+        "tags": [
+          "agent-extensions"
+        ]
+      }
+    },
+    "/api/chat-plugins/check/{package_id}": {
+      "post": {
+        "operationId": "check_api_chat_plugins_check__package_id__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "package_id",
+            "required": true,
+            "schema": {
+              "title": "Package Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Check",
+        "tags": [
+          "agent-extensions"
+        ]
+      }
+    },
+    "/api/chat-plugins/control": {
+      "put": {
+        "operationId": "control_api_chat_plugins_control_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": {
+                  "type": "boolean"
+                },
+                "title": "Body",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Control",
+        "tags": [
+          "agent-extensions"
+        ]
+      }
+    },
+    "/api/chat-plugins/install": {
+      "post": {
+        "operationId": "install_api_chat_plugins_install_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstallBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Install",
+        "tags": [
+          "agent-extensions"
+        ]
+      }
+    },
+    "/api/chat-plugins/mcp": {
+      "post": {
+        "operationId": "add_mcp_api_chat_plugins_mcp_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Add Mcp",
+        "tags": [
+          "agent-extensions"
+        ]
+      }
+    },
+    "/api/chat-plugins/packages/{package_id}": {
+      "delete": {
+        "operationId": "uninstall_api_chat_plugins_packages__package_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "package_id",
+            "required": true,
+            "schema": {
+              "title": "Package Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Uninstall",
+        "tags": [
+          "agent-extensions"
+        ]
+      },
+      "patch": {
+        "operationId": "update_api_chat_plugins_packages__package_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "package_id",
+            "required": true,
+            "schema": {
+              "title": "Package Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update",
+        "tags": [
+          "agent-extensions"
+        ]
+      }
+    },
+    "/api/chat-plugins/visualizations/{thread_id}": {
+      "get": {
+        "operationId": "visualization_api_chat_plugins_visualizations__thread_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "title": "Path",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "message_id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Message Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Visualization",
+        "tags": [
+          "agent-extensions"
         ]
       }
     },
@@ -2829,6 +4146,138 @@
         "tags": [
           "conversation"
         ]
+      }
+    },
+    "/api/conversation/preferences": {
+      "get": {
+        "operationId": "get_conversation_preferences_api_conversation_preferences_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "thread_id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Thread Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Get Conversation Preferences Api Conversation Preferences Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Conversation Preferences",
+        "tags": [
+          "conversation"
+        ]
+      },
+      "put": {
+        "operationId": "put_conversation_preferences_api_conversation_preferences_put",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "thread_id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Thread Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Body",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Put Conversation Preferences Api Conversation Preferences Put"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Conversation Preferences",
+        "tags": [
+          "conversation"
+        ]
+      }
+    },
+    "/api/desktop/activity": {
+      "get": {
+        "operationId": "desktop_activity_api_desktop_activity_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Desktop Activity Api Desktop Activity Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Desktop Activity"
+      }
+    },
+    "/api/desktop/drain": {
+      "post": {
+        "operationId": "desktop_drain_api_desktop_drain_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Desktop Drain Api Desktop Drain Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Desktop Drain"
       }
     },
     "/api/directories/select": {
@@ -5931,6 +7380,496 @@
         "summary": "Open Run Workspace"
       }
     },
+    "/api/runs/{run_id}/pentest-evidence/{fact_seq}/artifacts/{artifact_id}": {
+      "get": {
+        "operationId": "pentest_evidence_artifact_api_runs__run_id__pentest_evidence__fact_seq__artifacts__artifact_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "fact_seq",
+            "required": true,
+            "schema": {
+              "title": "Fact Seq",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "artifact_id",
+            "required": true,
+            "schema": {
+              "title": "Artifact Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "report_seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Report Seq"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Pentest Evidence Artifact Api Runs  Run Id  Pentest Evidence  Fact Seq  Artifacts  Artifact Id  Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pentest Evidence Artifact"
+      }
+    },
+    "/api/runs/{run_id}/pentest-evidence/{fact_seq}/artifacts/{artifact_id}/download": {
+      "get": {
+        "operationId": "download_pentest_evidence_artifact_api_runs__run_id__pentest_evidence__fact_seq__artifacts__artifact_id__download_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "fact_seq",
+            "required": true,
+            "schema": {
+              "title": "Fact Seq",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "artifact_id",
+            "required": true,
+            "schema": {
+              "title": "Artifact Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "report_seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Report Seq"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Download Pentest Evidence Artifact Api Runs  Run Id  Pentest Evidence  Fact Seq  Artifacts  Artifact Id  Download Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Download Pentest Evidence Artifact"
+      }
+    },
+    "/api/runs/{run_id}/pentest-evidence/{fact_seq}/artifacts/{artifact_id}/view": {
+      "get": {
+        "operationId": "view_pentest_image_api_runs__run_id__pentest_evidence__fact_seq__artifacts__artifact_id__view_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "fact_seq",
+            "required": true,
+            "schema": {
+              "title": "Fact Seq",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "artifact_id",
+            "required": true,
+            "schema": {
+              "title": "Artifact Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "report_seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Report Seq"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response View Pentest Image Api Runs  Run Id  Pentest Evidence  Fact Seq  Artifacts  Artifact Id  View Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "View Pentest Image"
+      }
+    },
+    "/api/runs/{run_id}/pentest-report": {
+      "get": {
+        "description": "Read one immutable report version and the version list from the graph.",
+        "operationId": "pentest_report_api_runs__run_id__pentest_report_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "report_seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Report Seq"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Pentest Report Api Runs  Run Id  Pentest Report Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pentest Report"
+      }
+    },
+    "/api/runs/{run_id}/pentest-report-images/{poc_id}": {
+      "get": {
+        "operationId": "pentest_report_image_api_runs__run_id__pentest_report_images__poc_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "poc_id",
+            "required": true,
+            "schema": {
+              "title": "Poc Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "report_seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Report Seq"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Pentest Report Image Api Runs  Run Id  Pentest Report Images  Poc Id  Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pentest Report Image"
+      }
+    },
+    "/api/runs/{run_id}/pentest-report.md": {
+      "get": {
+        "description": "Export the selected report version without rewriting its evidence.",
+        "operationId": "pentest_report_markdown_api_runs__run_id__pentest_report_md_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "report_seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Report Seq"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Pentest Report Markdown Api Runs  Run Id  Pentest Report Md Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pentest Report Markdown"
+      }
+    },
+    "/api/runs/{run_id}/pentest-report.zip": {
+      "get": {
+        "operationId": "pentest_report_bundle_api_runs__run_id__pentest_report_zip_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "report_seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Report Seq"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Pentest Report Bundle Api Runs  Run Id  Pentest Report Zip Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pentest Report Bundle"
+      }
+    },
+    "/api/runs/{run_id}/pentest-report/regenerate": {
+      "post": {
+        "description": "Retry only the model report, preserving the completed test graph.",
+        "operationId": "regenerate_pentest_report_api_runs__run_id__pentest_report_regenerate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Regenerate Pentest Report Api Runs  Run Id  Pentest Report Regenerate Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Regenerate Pentest Report"
+      }
+    },
     "/api/runs/{run_id}/progress": {
       "post": {
         "description": "Publish the latest progress projection without steering the swarm.",
@@ -6175,22 +8114,38 @@
         "summary": "Spawn Worker"
       }
     },
-    "/api/settings/agent-engines": {
+    "/api/settings/access": {
       "get": {
-        "operationId": "list_agent_engines_api_settings_agent_engines_get",
+        "operationId": "access_settings_api_settings_access_get",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "title": "Response List Agent Engines Api Settings Agent Engines Get"
+                  "title": "Response Access Settings Api Settings Access Get"
                 }
               }
             },
             "description": "Successful Response"
           }
         },
-        "summary": "List Agent Engines"
+        "summary": "Access Settings"
+      },
+      "put": {
+        "operationId": "update_access_settings_api_settings_access_put",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Update Access Settings Api Settings Access Put"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Update Access Settings"
       }
     },
     "/api/settings/credential-accounts": {
@@ -6338,7 +8293,7 @@
     },
     "/api/settings/credential-accounts/{account_id}/import-host-login": {
       "post": {
-        "description": "Copy a minimal Claude, Kimi Code, or Grok host login into an account.\n\nContainer workers receive the account projection, so they can authenticate\nwithout mounting the operator's complete home directory.",
+        "description": "Copy a minimal host login (HOST_LOGIN_IMPORT_ENGINES) into an account.\n\nContainer workers receive the account projection, so they can authenticate\nwithout mounting the operator's complete home directory.",
         "operationId": "import_host_login_api_settings_credential_accounts__account_id__import_host_login_post",
         "parameters": [
           {
@@ -6418,6 +8373,18 @@
     "/api/settings/credential-models/refresh-stale": {
       "post": {
         "operationId": "refresh_stale_credential_models_api_settings_credential_models_refresh_stale_post",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "environment",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Environment",
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -6428,6 +8395,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "Refresh Stale Credential Models"
@@ -6814,6 +8791,66 @@
         "summary": "Rollback System Update"
       }
     },
+    "/api/settings/ui": {
+      "get": {
+        "operationId": "get_ui_preferences_api_settings_ui_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Get Ui Preferences Api Settings Ui Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Ui Preferences",
+        "tags": [
+          "conversation"
+        ]
+      },
+      "put": {
+        "operationId": "put_ui_preferences_api_settings_ui_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UiPreferencesWrite"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Put Ui Preferences Api Settings Ui Put"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Ui Preferences",
+        "tags": [
+          "conversation"
+        ]
+      }
+    },
     "/api/settings/worker-image": {
       "get": {
         "operationId": "get_worker_image_api_settings_worker_image_get",
@@ -7154,6 +9191,16 @@
               "title": "Project Id",
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "broker_epoch",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Broker Epoch",
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -7235,6 +9282,16 @@
             "schema": {
               "default": 30,
               "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "Offset",
               "type": "integer"
             }
           }
@@ -7442,6 +9499,70 @@
         ]
       }
     },
+    "/api/threads/{thread_id}/browser/{request_id}": {
+      "post": {
+        "description": "客户端回传右侧浏览器请求的执行结果。",
+        "operationId": "browser_result_api_threads__thread_id__browser__request_id__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "title": "Request Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Body",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Browser Result Api Threads  Thread Id  Browser  Request Id  Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Browser Result",
+        "tags": [
+          "conversation"
+        ]
+      }
+    },
     "/api/threads/{thread_id}/commands": {
       "post": {
         "operationId": "post_command_api_threads__thread_id__commands_post",
@@ -7498,7 +9619,7 @@
     },
     "/api/threads/{thread_id}/compact": {
       "post": {
-        "description": "C27: Request native context compaction for this thread.\n\nReturns 501 when the active Runtime does not declare compaction support.\nWhen supported, emits a ``core.context.window`` event with\n``compact_status=running`` and returns ``{\"status\": \"accepted\"}``.\nThe adapter is responsible for emitting the completion event\n(``compact_status=done`` or ``compact_status=failed``) once it finishes.",
+        "description": "Invoke the verified native operation, then publish actual completion.",
         "operationId": "compact_thread_api_threads__thread_id__compact_post",
         "parameters": [
           {
@@ -7571,6 +9692,16 @@
               "default": true,
               "title": "Snapshot",
               "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "browser_host",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Browser Host",
+              "type": "string"
             }
           }
         ],
@@ -7766,6 +9897,232 @@
           }
         },
         "summary": "Thread Git Checkout",
+        "tags": [
+          "conversation"
+        ]
+      }
+    },
+    "/api/threads/{thread_id}/git/commit": {
+      "post": {
+        "description": "暂存并提交 Thread 工作区改动（全部或指定工作区内路径）。",
+        "operationId": "thread_git_commit_api_threads__thread_id__git_commit_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ThreadGitCommitBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Thread Git Commit Api Threads  Thread Id  Git Commit Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Thread Git Commit",
+        "tags": [
+          "conversation"
+        ]
+      }
+    },
+    "/api/threads/{thread_id}/git/pull": {
+      "post": {
+        "description": "拉取上游；默认仅快进（--ff-only），rebase=true 时使用 --rebase。",
+        "operationId": "thread_git_pull_api_threads__thread_id__git_pull_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ThreadGitPullBody"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Thread Git Pull Api Threads  Thread Id  Git Pull Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Thread Git Pull",
+        "tags": [
+          "conversation"
+        ]
+      }
+    },
+    "/api/threads/{thread_id}/git/pull-request": {
+      "post": {
+        "description": "为 Thread 工作区当前分支创建 GitHub PR（使用操作员的 GitHub token）。",
+        "operationId": "thread_create_pull_request_api_threads__thread_id__git_pull_request_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ThreadPullRequestCreateBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Thread Create Pull Request Api Threads  Thread Id  Git Pull Request Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Thread Create Pull Request",
+        "tags": [
+          "conversation"
+        ]
+      }
+    },
+    "/api/threads/{thread_id}/git/push": {
+      "post": {
+        "description": "推送当前分支；分支没有上游时自动设置上游。",
+        "operationId": "thread_git_push_api_threads__thread_id__git_push_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ThreadGitPushBody"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Thread Git Push Api Threads  Thread Id  Git Push Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Thread Git Push",
         "tags": [
           "conversation"
         ]
@@ -8421,6 +10778,32 @@
               "default": 2000,
               "title": "Limit",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after_seq",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "After Seq",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "watermark",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Watermark"
             }
           }
         ],
@@ -9292,6 +11675,22 @@
           },
           {
             "in": "query",
+            "name": "engine",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Engine"
+            }
+          },
+          {
+            "in": "query",
             "name": "role",
             "required": false,
             "schema": {
@@ -9389,6 +11788,68 @@
         ]
       }
     },
+    "/api/usage/cursor-account": {
+      "get": {
+        "description": "Monthly limits and usage history of this host's Cursor CLI login.\n\nReads the macOS Keychain only after the user enables it in settings.",
+        "operationId": "cursor_account_usage_api_usage_cursor_account_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "default": 30,
+              "title": "Days",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tz",
+            "required": false,
+            "schema": {
+              "default": "UTC",
+              "title": "Tz",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Refresh",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cursor Account Usage",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
     "/api/usage/import-history": {
       "post": {
         "operationId": "import_history_api_usage_import_history_post",
@@ -9408,9 +11869,51 @@
         ]
       }
     },
+    "/api/usage/limits": {
+      "get": {
+        "description": "Read actual account windows without creating a model turn.",
+        "operationId": "usage_limits_api_usage_limits_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Refresh",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Usage Limits",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
     "/api/usage/quota": {
       "get": {
-        "description": "List subscription quota entries for all registered credentials.\n\nEach entry reports the cached quota state for one credential account.\nThe default state is ``unknown`` — the quota source for most CLI engines\ncannot be read without a live authenticated request, so Muteki stores only\nwhat the engine has explicitly reported via response headers or a prior\nmanual snapshot. Duplicate accounts (same credential_id) are collapsed:\nthe most-recently-updated entry wins.\n\nRefresh semantics (acceptance criterion 3): this endpoint is read-only.\nUse POST /api/usage/quota/{credential_id}/refresh to explicitly re-read\na credential's quota without starting an agent or consuming any tokens.",
+        "description": "Compatibility view for conversation drawers, backed by live multi-window probes.",
         "operationId": "get_quota_api_usage_quota_get",
         "responses": {
           "200": {
@@ -9430,52 +11933,8 @@
         ]
       }
     },
-    "/api/usage/quota/{credential_id}": {
-      "put": {
-        "description": "Internal endpoint to store a quota snapshot reported by the runtime.\n\nOnly accepts fields: status, remaining, total, window_seconds, reset_at.\nCalled by the runtime adapter when an engine returns usage/rate-limit\nheaders; never called by the frontend directly.",
-        "operationId": "update_quota_api_usage_quota__credential_id__put",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "credential_id",
-            "required": true,
-            "schema": {
-              "title": "Credential Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "title": "Response Update Quota Api Usage Quota  Credential Id  Put"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Update Quota",
-        "tags": [
-          "usage"
-        ]
-      }
-    },
     "/api/usage/quota/{credential_id}/refresh": {
       "post": {
-        "description": "Re-read quota for a specific credential without starting an agent.\n\nFor CLI-based engines the live quota is not available without a billed\nrequest; this endpoint clears the unknown_reason and resets the timestamp\nso the UI knows a refresh was attempted. Explicit quota values must be\nreported by the engine runtime and stored via the internal quota update\npath — manual edits are not accepted here.",
         "operationId": "refresh_quota_api_usage_quota__credential_id__refresh_post",
         "parameters": [
           {
@@ -9511,6 +11970,297 @@
           }
         },
         "summary": "Refresh Quota",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/api/usage/settings": {
+      "get": {
+        "operationId": "usage_settings_api_usage_settings_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Usage Settings",
+        "tags": [
+          "usage"
+        ]
+      },
+      "put": {
+        "operationId": "update_usage_settings_api_usage_settings_put",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Update Usage Settings",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/api/usage/summary": {
+      "get": {
+        "description": "One priced overview for one selected source scope, never overlapping sums.",
+        "operationId": "usage_summary_api_usage_summary_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "default": "history",
+              "enum": [
+                "history",
+                "muteki"
+              ],
+              "title": "Scope",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "default": "30",
+              "title": "Days",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tz",
+            "required": false,
+            "schema": {
+              "default": "UTC",
+              "title": "Tz",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Refresh",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "start",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start"
+            }
+          },
+          {
+            "in": "query",
+            "name": "end",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End"
+            }
+          },
+          {
+            "in": "query",
+            "name": "engine",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Engine"
+            }
+          },
+          {
+            "in": "query",
+            "name": "run_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Run Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "thread_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Thread Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "competition_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Competition Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "challenge_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Challenge Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "model",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Model"
+            }
+          },
+          {
+            "in": "query",
+            "name": "role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Role"
+            }
+          },
+          {
+            "in": "query",
+            "name": "workspace_kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Workspace Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "generation",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Generation"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Usage Summary",
         "tags": [
           "usage"
         ]

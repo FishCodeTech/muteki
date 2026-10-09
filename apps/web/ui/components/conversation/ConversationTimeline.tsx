@@ -1,9 +1,10 @@
 "use client";
 
+import { ConversationRouteLink } from "@/components/conversation/ConversationNavigation";
 import React, { useCallback, useRef, useEffect, useMemo, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { cn } from "@/lib/cn";
-import { Button, Callout, IconButton, Spinner, Tooltip, useReducedMotion } from "@/components/chat/ui";
+import { Badge, Button, Callout, IconButton, Spinner, Tooltip, toast, useReducedMotion } from "@/components/chat/ui";
 import { formatMessageTime } from "@/components/chat/timeline/MessageActions";
 import { ChangedFilesCard } from "@/components/chat/timeline/ChangedFilesCard";
 import { formatTurnDuration } from "@/components/chat/timeline/toolPresentation";
@@ -14,8 +15,12 @@ import { Chat } from "../ai-native/chat";
 import { ConversationMessage, type MessageAttachmentChip } from "./ConversationMessage";
 import type { ResourceLinkTarget } from "@/lib/resourcePreview";
 import { ConversationTurnProcess } from "./ConversationTurnProcess";
+import { buildConversationAgentTree, type ConversationAgentNodeView } from "./conversationAgentTree";
 import { ConversationApproval, type UserInputResolvePayload } from "./ConversationApproval";
 import { ConversationProposedPlanCard } from "./ConversationPlanPanel";
+import { ConversationMinimap, type MinimapMarker } from "./ConversationMinimap";
+import { ConversationSummaryCard } from "./ConversationSummaryCard";
+import { collectConversationSources } from "./conversationSources";
 import { ContextCards } from "../ai-native/context-cards";
 import { LoadingState } from "../ai-native/loading-state";
 import { Icon } from "../Icon";
@@ -26,7 +31,7 @@ import type {
   ConversationMessage as ConversationMessageRecord,
   ConversationStreamStatus,
 } from "@/lib/useConversation";
-import { allCredentialModels, fetchTurnProcess } from "@/lib/useConversation";
+import { allCredentialModels, fetchTurnProcess, sendConversationCommand } from "@/lib/useConversation";
 import type { DrawerDetailPayload } from "./ConversationDetailsDrawer";
 import {
   buildConversationTurnFold,
@@ -88,7 +93,7 @@ export interface ConversationTimelineProps {
   }) => void;
   onOpenAttachment?: (attachment: MessageAttachmentChip) => void;
   onResourceLink?: (target: ResourceLinkTarget) => void;
-  onApprovalDecision: (approvalId: string, decision: "allow" | "deny", scopeMode?: "once" | "session", optionId?: string) => void;
+  onApprovalDecision: (approvalId: string, decision: "allow" | "deny", scopeMode?: "once" | "session", optionId?: string, note?: string) => void;
   onUserInputResolve: (payload: UserInputResolvePayload) => void | Promise<boolean>;
   threadId?: string;
   onRetryTurn?: (turnId: string) => void;
@@ -125,6 +130,10 @@ export interface ConversationTimelineProps {
   commandError?: string;
   onDismissCommandError?: () => void;
   footer?: React.ReactNode;
+  /** Whether the footer composer currently uses its compact resting layout. */
+  composerCompact?: boolean;
+  /** Scrolling up into history compacts the composer; returning to the latest message restores it. */
+  onComposerCompactChange?: (compact: boolean) => void;
   className?: string;
   highlightedMessageId?: string;
   /** When true (C07 `?message=` present), skip C08 restore for this visit. */
@@ -176,7 +185,7 @@ function ConversationFailurePanel({
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-3">
-            <h2 className="pt-1 text-[13.5px] font-semibold leading-5 text-cx-fg">{title}</h2>
+            <h2 className="pt-1 text-[14px] font-semibold leading-5 text-cx-fg">{title}</h2>
             <IconButton icon="x" label="关闭错误提示" noTooltip size="sm" className="-mr-1.5 -mt-0.5" onClick={onDismiss} />
           </div>
           <p className="cx-scroll mt-1 max-h-28 overflow-y-auto whitespace-pre-wrap break-words pr-2 font-cx-mono text-[12px] leading-5 text-cx-fg-3">
@@ -187,13 +196,13 @@ function ConversationFailurePanel({
       {(credentialFailure || onContinue) ? (
         <div className="flex flex-wrap items-center justify-end gap-2 border-t border-cx-border-subtle bg-cx-bg-subtle px-4 py-2.5">
           {credentialFailure ? (
-            <a
+            <ConversationRouteLink
               href="/settings/agents"
-              className="cx-press inline-flex h-7 items-center gap-1.5 rounded-lg border border-cx-border bg-cx-elevated px-2.5 text-[12.5px] font-medium text-cx-fg-2 hover:border-cx-border-strong hover:text-cx-fg"
+              className="cx-press inline-flex h-7 items-center gap-1.5 rounded-lg border border-cx-border bg-cx-elevated px-2.5 text-[13px] font-medium text-cx-fg-2 hover:border-cx-border-strong hover:text-cx-fg"
             >
               <Icon name="plug" size={13} />
               检查 Agent 接入
-            </a>
+            </ConversationRouteLink>
           ) : null}
           {onContinue ? (
             <Button variant="primary" size="sm" icon="play" onClick={onContinue} disabled={busy}>
@@ -259,12 +268,9 @@ function AssistantIdentity({
 
   return (
     <div
-      className="mb-1.5 flex min-w-0 items-center gap-2 text-[12px] leading-5"
+      className="mb-2 flex min-w-0 items-center gap-2 text-[13px] leading-5"
       data-testid="c39-identity-full"
     >
-      <span className="grid size-5 shrink-0 place-items-center rounded-md bg-cx-accent-soft text-cx-accent">
-        <Icon name="sparkles" size={12} />
-      </span>
       {runtimeText ? (
         <Tooltip content={`运行接入点与模型：${runtimeText}`}>
           <span className="inline-flex min-w-0 items-center gap-1.5 text-cx-fg-3" aria-label={`运行接入点与模型：${runtimeText}`}>
@@ -272,7 +278,7 @@ function AssistantIdentity({
             {runtime?.model ? (
               <>
                 <span aria-hidden="true" className="text-cx-fg-4">/</span>
-                <span className="max-w-[220px] truncate font-cx-mono text-[11.5px]">{runtime.model}</span>
+                <span className="max-w-[220px] truncate font-cx-mono text-[12px]">{runtime.model}</span>
               </>
             ) : null}
           </span>
@@ -280,10 +286,35 @@ function AssistantIdentity({
       ) : (
         <span className="font-medium text-cx-fg-2">Agent</span>
       )}
-      {time ? <time dateTime={createdAt} className="cx-tabular text-[11.5px] text-cx-fg-4">{time}</time> : null}
+      {time ? <time dateTime={createdAt} className="cx-tabular text-[12px] text-cx-fg-4">{time}</time> : null}
     </div>
   );
 }
+
+function turnIsPlan(turn: { interaction_mode?: string; runtime_snapshot?: { interaction_mode?: string } | null } | undefined): boolean {
+  if (!turn) return false;
+  const mode = turn.interaction_mode || turn.runtime_snapshot?.interaction_mode;
+  return mode === "plan";
+}
+
+function PlanTurnBadge({ turnId, align }: { turnId?: string; align: "start" | "end" }) {
+  return (
+    <span
+      data-testid="plan-turn-badge"
+      data-turn-id={turnId || undefined}
+      className={cn("mb-1 flex", align === "end" ? "justify-end" : "justify-start")}
+    >
+      <Badge tone="accent" icon="listChecks">规划</Badge>
+    </span>
+  );
+}
+
+// Compacting grows the stream viewport by roughly the composer's height
+// change (112px → 44px), which moves the bottom edge toward the reader. The compact
+// distance must clear that delta plus the 96px near-bottom band, otherwise the
+// resize itself would land the reader back at the latest message and expand.
+const COMPOSER_COMPACT_DISTANCE_PX = 200;
+const COMPOSER_EXPAND_DISTANCE_PX = 8;
 
 export function ConversationTimeline({
   view,
@@ -327,6 +358,8 @@ export function ConversationTimeline({
   commandError = "",
   onDismissCommandError,
   footer,
+  composerCompact = false,
+  onComposerCompactChange,
   className = "",
   highlightedMessageId = "",
   suppressRestore = false,
@@ -334,6 +367,11 @@ export function ConversationTimeline({
   onOpenThread,
 }: ConversationTimelineProps) {
   const streamRef = useRef<HTMLDivElement>(null);
+  const composerCompactRef = useRef(composerCompact); composerCompactRef.current = composerCompact;
+  const onComposerCompactChangeRef = useRef(onComposerCompactChange); onComposerCompactChangeRef.current = onComposerCompactChange;
+  const lastScrollTopRef = useRef(0);
+  const highlightedMessageIdRef = useRef(highlightedMessageId); highlightedMessageIdRef.current = highlightedMessageId;
+  const virtualListRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
   const loadingOlderRef = useRef(false);
   const pendingAnchorRef = useRef<{ height: number; top: number; threadId: string; firstMessageId?: string; succeeded: boolean } | null>(null);
@@ -462,12 +500,31 @@ export function ConversationTimeline({
     applyReadingOffset(element, saved.messageId, saved.offsetPx || 0);
   }, [highlightedMessageId, suppressRestore, view.thread.thread_id]);
 
+  const updateReaderPosition = useCallback((element: HTMLElement) => {
+    const nearBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 96;
+    setShowJumpToLatest(!nearBottom);
+    return nearBottom;
+  }, []);
+
   const handleStreamScroll = useCallback((event: React.UIEvent<HTMLDivElement>) => {
     const element = event.currentTarget;
+    const nearBottom = updateReaderPosition(element);
+    const previousTop = lastScrollTopRef.current;
+    lastScrollTopRef.current = element.scrollTop;
+    const onCompactChange = onComposerCompactChangeRef.current;
+    if (onCompactChange) {
+      // Direction matters: viewport resizes and clamping move scrollTop without
+      // the reader asking for it, so only an upward scroll compacts and only a
+      // downward arrival at the end expands.
+      const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
+      if (!composerCompactRef.current && element.scrollTop < previousTop - 1 && distance > COMPOSER_COMPACT_DISTANCE_PX) {
+        onCompactChange(true);
+      } else if (composerCompactRef.current && element.scrollTop > previousTop && distance <= COMPOSER_EXPAND_DISTANCE_PX) {
+        onCompactChange(false);
+      }
+    }
     if (restoringAnchorRef.current) return;
-    const nearBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 96;
     stickToBottomRef.current = nearBottom;
-    setShowJumpToLatest(!nearBottom);
     if (!String(highlightedMessageId || "").trim()) {
       persistCurrentAnchor(element, nearBottom);
     }
@@ -503,6 +560,7 @@ export function ConversationTimeline({
     highlightedMessageId,
     onLoadOlder,
     persistCurrentAnchor,
+    updateReaderPosition,
     view.messages_page?.has_more_before,
     view.thread.thread_id,
     view.messages,
@@ -536,6 +594,7 @@ export function ConversationTimeline({
       pendingAnchorRef.current = null;
       stickToBottomRef.current = true;
       setShowJumpToLatest(false);
+      onComposerCompactChangeRef.current?.(false);
       const scrollTip = () => {
         if (request !== scrollRequestRef.current || activeThreadRef.current !== threadId) return;
         const element = streamRef.current;
@@ -608,12 +667,41 @@ export function ConversationTimeline({
     if (!element || typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(() => {
       reapplySavedAnchor();
+      // The viewport shrinks frame by frame while the composer expands or
+      // grows with its draft; keep the latest message pinned instead of
+      // letting it slide under the composer.
+      if (
+        stickToBottomRef.current
+        && !restoringAnchorRef.current
+        && !loadingOlderRef.current
+        && !String(highlightedMessageIdRef.current || "").trim()
+      ) {
+        element.scrollTop = element.scrollHeight;
+      }
+      updateReaderPosition(element);
+      if (composerCompactRef.current && element.scrollHeight - element.clientHeight <= COMPOSER_EXPAND_DISTANCE_PX) {
+        onComposerCompactChangeRef.current?.(false);
+      }
     });
     const content = element.firstElementChild;
     if (content) observer.observe(content);
     observer.observe(element);
     return () => observer.disconnect();
-  }, [reapplySavedAnchor, view.thread.thread_id]);
+  }, [reapplySavedAnchor, updateReaderPosition, view.thread.thread_id]);
+
+  // Already resting at the end produces no scroll event, so a downward wheel
+  // there is the reader's request to return to the latest message.
+  useEffect(() => {
+    const element = streamRef.current;
+    if (!element) return;
+    const handleWheel = (event: WheelEvent) => {
+      if (!composerCompactRef.current || event.deltaY <= 0) return;
+      if (element.scrollHeight - element.scrollTop - element.clientHeight > COMPOSER_EXPAND_DISTANCE_PX) return;
+      onComposerCompactChangeRef.current?.(false);
+    };
+    element.addEventListener("wheel", handleWheel, { passive: true });
+    return () => element.removeEventListener("wheel", handleWheel);
+  }, [view.thread.thread_id]);
 
   const foldEvents = useMemo(() => {
     const byKey = new Map<string, ConversationEvent>();
@@ -631,6 +719,21 @@ export function ConversationTimeline({
   }, [events, hydratedEventsByTurn]);
 
   const turnFold = useMemo(() => buildConversationTurnFold(foldEvents), [foldEvents]);
+  const agentTree = useMemo(() => buildConversationAgentTree(foldEvents, view), [foldEvents, view]);
+  const agentRootsByTurn = useMemo(() => {
+    const map = new Map<string, ConversationAgentNodeView[]>();
+    for (const root of agentTree.roots) {
+      if (!root.turnId) continue;
+      const list = map.get(root.turnId) || [];
+      list.push(root);
+      map.set(root.turnId, list);
+    }
+    return map;
+  }, [agentTree]);
+  const conversationSources = useMemo(
+    () => collectConversationSources(foldEvents, view.messages),
+    [foldEvents, view.messages],
+  );
   const runtimeByTurn = useMemo(
     // Do not pass view.runtime: current selection must not rewrite history (#132).
     () => buildConversationTurnRuntimeMap(foldEvents),
@@ -701,6 +804,16 @@ export function ConversationTimeline({
       ? rawPendingInput
       : null;
 
+  const pendingApprovalTotal = new Set([
+    ...Object.entries(pendingApprovals)
+      .filter(([, row]) => String(row.status || "pending") === "pending")
+      .map(([id]) => id),
+    ...(pendingApproval && String(pendingApproval.status || "pending") === "pending" ? [String(pendingApproval.approval_id)] : []),
+  ]).size;
+  const attentionLabel = pendingApprovalTotal
+    ? `${pendingApprovalTotal} 个操作等待审批`
+    : pendingInput ? "Agent 等待你的回复" : "";
+
   // Artifacts & Diffs list
   const artifacts = useMemo(() => view.artifacts || [], [view.artifacts]);
   const diffArtifacts = useMemo(() => {
@@ -737,10 +850,13 @@ export function ConversationTimeline({
   const lastTurn = view.turns.at(-1);
   const lastTurnTerminal = String(lastTurn?.status || "").toLowerCase();
   const isLastTurnFailed = lastTurnTerminal === "failed";
-  const isLastTurnInterrupted = ["interrupted", "aborted", "cancelled", "canceled"].includes(lastTurnTerminal);
+  const isLastTurnInterrupted = ["interrupted", "aborted"].includes(lastTurnTerminal);
+  const isLastTurnCancelled = ["cancelled", "canceled"].includes(lastTurnTerminal);
   const failureMessage = conversationErrorMessage(lastTurn?.error)
     || conversationErrorMessage(view.state.last_error)
-    || (isLastTurnInterrupted
+    || (isLastTurnCancelled
+      ? "本轮已取消，已有消息和工作记录已保留。可以发送新消息或重试。"
+      : isLastTurnInterrupted
       ? "本轮已停止，已有消息和工作记录已保留。可以继续执行。"
       : "Runtime 未返回具体错误信息");
   const assistantMessagesByTurn = useMemo(() => {
@@ -783,7 +899,7 @@ export function ConversationTimeline({
   }, [regularArtifacts, onOpenDrawer, view.thread.thread_id]);
 
   const isCredentialFailure = /credential|auth|token|凭据|认证/i.test(failureMessage);
-  const failureKey = (isLastTurnFailed || isLastTurnInterrupted)
+  const failureKey = (isLastTurnFailed || isLastTurnInterrupted || isLastTurnCancelled)
     ? `${lastTurn?.turn_id}:${lastTurn?.status}:${failureMessage}`
     : "";
   const showRuntimeFailure = Boolean(
@@ -794,16 +910,18 @@ export function ConversationTimeline({
     <ConversationFailurePanel
       title={commandError
         ? "操作未完成"
-        : isLastTurnInterrupted
+        : isLastTurnCancelled
+          ? "已取消"
+          : isLastTurnInterrupted
           ? "已中断"
           : isLastTurnFailed
             ? "执行失败"
             : "执行已暂停"}
       detail={panelDetail}
-      interrupted={!commandError && isLastTurnInterrupted}
+      interrupted={!commandError && (isLastTurnInterrupted || isLastTurnCancelled)}
       credentialFailure={isCredentialFailure || /credential|auth|token|凭据|认证/i.test(commandError)}
       busy={busy}
-      onContinue={showRuntimeFailure ? onContinueTurn : undefined}
+      onContinue={showRuntimeFailure && !isLastTurnCancelled ? onContinueTurn : undefined}
       onDismiss={() => {
         if (failureKey) setDismissedFailureKey(failureKey);
         onDismissCommandError?.();
@@ -855,7 +973,7 @@ export function ConversationTimeline({
       ...view.turns
         .filter((turn) => (
           assistantMessagesByTurn.has(turn.turn_id)
-          || ["failed", "interrupted"].includes(turn.status)
+          || ["failed", "interrupted", "cancelled"].includes(turn.status)
         ))
         .map((turn) => turn.turn_id),
       ...(running && view.state.running_turn_id ? [view.state.running_turn_id] : []),
@@ -980,6 +1098,7 @@ export function ConversationTimeline({
     createdAt?: string,
     isStreaming = false,
     collapseIdentity = false,
+    showPlanBadge = false,
   ) => {
     const turnStatus = turnStatusById.get(turnId) || (isStreaming ? "running" : "");
     const segments = settleTurnSegmentsAgainstStatus(
@@ -1042,6 +1161,7 @@ export function ConversationTimeline({
 
     return (
       <div className="assistant flex w-full flex-col">
+        {showPlanBadge ? <PlanTurnBadge turnId={turnId} align="start" /> : null}
         <AssistantIdentity
           createdAt={createdAt}
           runtime={runtimeIdentity}
@@ -1063,6 +1183,7 @@ export function ConversationTimeline({
           turnId={turnId}
           status={turnStatus}
           segments={presentation.activity}
+          answerText={presentation.answerText}
           running={isStreaming}
           workingLabel={workingLabel}
           timing={timingByTurn[turnId]}
@@ -1094,6 +1215,10 @@ export function ConversationTimeline({
           })()}
           onOpenDrawer={onOpenDrawer}
           threadId={threadId}
+          agentRoots={agentRootsByTurn.get(turnId)}
+          agentTools={turnFold.agentToolsByTurn[turnId]}
+          onOpenThread={onOpenThread}
+          onCancelSubagent={handleCancelSubagent}
           onOpenToolDiff={(targetTurnId, filePath) => {
             if (threadId) chatPanel.openDiff(threadId, { kind: "turn", turnId: targetTurnId, filePath });
             else onOpenDiffBaseline?.({ kind: "turn", turnId: targetTurnId });
@@ -1274,9 +1399,10 @@ export function ConversationTimeline({
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       if (isCurrent()) {
         restoringAnchorRef.current = false;
+        if (streamRef.current) updateReaderPosition(streamRef.current);
       }
     }
-  }, [onEnsureMessageVisible, rowVirtualizer, view.thread.thread_id]);
+  }, [onEnsureMessageVisible, rowVirtualizer, updateReaderPosition, view.thread.thread_id]);
 
   useEffect(() => {
     const threadKey = view.thread.thread_id;
@@ -1351,8 +1477,53 @@ export function ConversationTimeline({
     return () => window.removeEventListener("keydown", onKey);
   }, [goToNeighborTurn, returnToPreviousReading]);
 
+  // getTotalSize() refreshes measurementsCache for the current row count.
+  rowVirtualizer.getTotalSize();
+  const rowMeasurements = rowVirtualizer.measurementsCache;
+  const minimapMarkers: MinimapMarker[] = [];
+  timelineRows.forEach((row, index) => {
+    if (row.kind !== "message" || row.role !== "user") return;
+    const msg = view.messages[row.messageIndex];
+    if (!msg || msg.kind === "steer") return;
+    const status = String(turnStatusById.get(row.turnId) || "").toLowerCase();
+    minimapMarkers.push({
+      key: row.key,
+      messageId: row.messageId,
+      start: rowMeasurements[index]?.start ?? 0,
+      seq: turnById.get(row.turnId)?.seq,
+      label: msg.text.replace(/\s+/g, " ").trim(),
+      tone: running && row.turnId && row.turnId === view.state.running_turn_id
+        ? "running"
+        : status === "failed"
+          ? "danger"
+          : ["interrupted", "aborted", "cancelled", "canceled"].includes(status) ? "muted" : "default",
+    });
+  });
+
   const turnNavAvailable = userTurnMessageIds(view.messages).length > 1;
-  const showReaderOverlay = showJumpToLatest || hasJumpBack || turnNavAvailable;
+  // Floating reading controls belong to history browsing. Having multiple
+  // turns or a saved return position must not keep them over the latest reply.
+  const showReaderOverlay = showJumpToLatest || Boolean(view.messages_page?.has_more_after);
+
+  // Muteki subagent Thread: lineage banner ("由 <parent> 派生 · 深度 N").
+  const lineage = view.lineage ?? view.state?.lineage ?? null;
+  const lineageParentTitle = (view.lineage && view.lineage.parent_title) || "父会话";
+
+  const handleCancelSubagent = useCallback(async (subagentId: string) => {
+    try {
+      await sendConversationCommand(view.thread.thread_id, "conversation.subagent.cancel", {
+        subagent_id: subagentId,
+        reason: "user_cancelled",
+      });
+      toast({ title: "已请求取消子代理", tone: "neutral", duration: 2400 });
+    } catch (error) {
+      toast({
+        title: "取消子代理失败",
+        description: error instanceof Error ? error.message : String(error),
+        tone: "danger",
+      });
+    }
+  }, [view.thread.thread_id]);
 
   return (
     <Chat
@@ -1368,14 +1539,39 @@ export function ConversationTimeline({
         <ReaderOverlay
           turnNavAvailable={turnNavAvailable}
           hasJumpBack={hasJumpBack}
-          showJumpToLatest={showJumpToLatest}
+          showJumpToLatest={showReaderOverlay}
           running={running}
+          attentionLabel={attentionLabel}
           onPrev={() => void goToNeighborTurn(-1)}
           onNext={() => void goToNeighborTurn(1)}
           onJumpBack={returnToPreviousReading}
-          onJumpToLatest={jumpToLatest}
+          onJumpToLatest={() => {
+            jumpToLatest();
+            if (!pendingApprovalTotal) return;
+            // Opt-in focus: the reader asked to go to the approvals, so Y/N work immediately.
+            window.setTimeout(() => {
+              streamRef.current
+                ?.querySelector<HTMLElement>('[data-approval-keyboard="true"]')
+                ?.focus({ preventScroll: true });
+            }, 260);
+          }}
         />
       ) : null}
+      streamAside={contentLoading || contentError ? null : (
+        <>
+          <ConversationMinimap
+            streamRef={streamRef}
+            listRef={virtualListRef}
+            markers={minimapMarkers}
+            onJump={(messageId) => void scrollToMessageAnchor(messageId, 0, { highlight: true })}
+          />
+          <ConversationSummaryCard
+            threadId={view.thread.thread_id}
+            agents={agentTree.agents}
+            sources={conversationSources}
+          />
+        </>
+      )}
       streamBusy={contentLoading}
       streamState={contentLoading ? (
         <div role="status" aria-live="polite">
@@ -1403,6 +1599,27 @@ export function ConversationTimeline({
         {liveStatus ? (
           <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
             {liveStatus}
+          </div>
+        ) : null}
+        {lineage ? (
+          <div
+            className="-mb-3 flex min-w-0 items-center gap-1.5 rounded-lg border border-cx-border bg-cx-bg-subtle px-2.5 py-1.5 text-[12px] text-cx-fg-3"
+            data-testid="subagent-lineage-banner"
+            data-lineage-depth={lineage.depth}
+          >
+            <Icon name="bot" size={13} className="shrink-0 text-cx-fg-4" />
+            <span className="min-w-0 truncate">
+              由 <span className="font-medium text-cx-fg-2">{lineageParentTitle}</span> 派生 · 深度 {lineage.depth}
+            </span>
+            {onOpenThread ? (
+              <button
+                type="button"
+                className="ml-auto shrink-0 rounded px-1.5 py-0.5 text-cx-accent hover:bg-cx-hover"
+                onClick={() => onOpenThread(lineage.parent_thread_id)}
+              >
+                查看父会话
+              </button>
+            ) : null}
           </div>
         ) : null}
         {onToggleSuperseded ? (
@@ -1458,6 +1675,7 @@ export function ConversationTimeline({
         {/* Virtualized messages feed — only the viewport (+ overscan) mounts.
             count / keys / measure / deep-link all use timelineRows (#211). */}
         <div
+          ref={virtualListRef}
           className="relative w-full"
           style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
           data-virtualized-timeline="true"
@@ -1499,6 +1717,7 @@ export function ConversationTimeline({
                     assistantMsg?.created_at,
                     Boolean(running && turnId === view.state.running_turn_id),
                     collapseIdentity,
+                    turnIsPlan(turnById.get(turnId)),
                   )}
                 </div>
               );
@@ -1525,6 +1744,7 @@ export function ConversationTimeline({
                   assistantMessagesByTurn.get(turnId)?.created_at,
                   Boolean(running && turnId === view.state.running_turn_id),
                   collapseIdentity,
+                  turnIsPlan(turnById.get(turnId)),
                 )}
               </React.Fragment>
               );
@@ -1569,6 +1789,8 @@ export function ConversationTimeline({
               body = (
                 <>
                   {orphanRows}
+                  <div className="flex w-full flex-col">
+                  {turnIsPlan(turnById.get(turnId)) ? <PlanTurnBadge turnId={turnId} align="end" /> : null}
                   <ConversationMessage
                     role={msg.kind === "steer" ? "user" : msg.role}
                     messageId={msg.message_id}
@@ -1592,6 +1814,7 @@ export function ConversationTimeline({
                     }
                     actionsDisabled={busy || running}
                   />
+                  </div>
                   {isLastPromptForTurn && (assistantMsg || hasSegments || isRunningTurn || isSettledTurn)
                     ? renderAssistantTurn(
                       turnId,
@@ -1667,6 +1890,7 @@ function ReaderOverlay({
   hasJumpBack,
   showJumpToLatest,
   running,
+  attentionLabel,
   onPrev,
   onNext,
   onJumpBack,
@@ -1676,6 +1900,8 @@ function ReaderOverlay({
   hasJumpBack: boolean;
   showJumpToLatest: boolean;
   running: boolean;
+  /** Pending approval / input sits at the end of the transcript; say so on the pill. */
+  attentionLabel: string;
   onPrev: () => void;
   onNext: () => void;
   onJumpBack: () => void;
@@ -1697,12 +1923,15 @@ function ReaderOverlay({
             <button
               type="button"
               onClick={onJumpToLatest}
-              className="cx-press relative inline-flex h-7 items-center gap-1.5 rounded-full px-3 text-[12.5px] font-medium text-cx-fg-2 hover:bg-cx-hover hover:text-cx-fg"
+              className={cn(
+                "cx-press relative inline-flex h-7 items-center gap-1.5 rounded-full px-3 text-[13px] font-medium hover:bg-cx-hover",
+                attentionLabel ? "text-cx-warning" : "text-cx-fg-2 hover:text-cx-fg",
+              )}
               data-testid="c08-jump-latest"
             >
-              <Icon name="arrowDown" size={13} />
-              回到最新
-              {running ? <span className="size-1.5 rounded-full bg-cx-accent cx-pulse-dot" aria-hidden /> : null}
+              <Icon name={attentionLabel ? "shieldAlert" : "arrowDown"} size={13} />
+              {attentionLabel || "回到最新"}
+              {running && !attentionLabel ? <span className="size-1.5 rounded-full bg-cx-accent cx-pulse-dot" aria-hidden /> : null}
             </button>
           </motion.div>
         ) : null}

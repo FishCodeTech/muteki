@@ -77,7 +77,7 @@ export function ComposerBranchPicker({
       value: branch,
       label: branch,
       icon: "gitBranch",
-      trailing: branch === status?.current_branch ? <span className="text-[11px] text-cx-fg-4">当前</span> : undefined,
+      trailing: branch === status?.current_branch ? <span className="text-[12px] text-cx-fg-4">当前</span> : undefined,
     }));
     if (canCreate) {
       rows.push({ value: `\u0000create:${trimmedQuery}`, label: `创建并切换到 ${trimmedQuery}`, textValue: trimmedQuery, icon: "plus" });

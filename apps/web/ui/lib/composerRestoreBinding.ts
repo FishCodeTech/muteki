@@ -1,6 +1,7 @@
 import type { ConversationCredential, RuntimeInstance } from "./useConversation";
 import { credentialForRuntime, validModelEffort } from "./modelReasoning";
 import { allModelIds, credentialAvailable, pickRuntimeForEngine } from "./conversationReadiness";
+import { runtimeScopesModelCatalog, type ProviderDescriptorCatalog } from "./providerDescriptors";
 
 export type ComposerLaunchSelection = {
   credentialId: string;
@@ -23,6 +24,7 @@ export function resolveComposerBindingRestore(input: {
   current: ComposerLaunchSelection;
   credentials: ConversationCredential[];
   runtimes: RuntimeInstance[];
+  descriptors: ProviderDescriptorCatalog | null;
 }): ComposerBindingRestore {
   const retain = (reason: string): ComposerBindingRestore => ({
     restored: false, selection: input.current, reason, legacyRuntime: false,
@@ -37,7 +39,8 @@ export function resolveComposerBindingRestore(input: {
   if (!runtime || runtime.enabled === false || runtime.engine !== credential.engine) {
     return retain("原 Runtime 实例已不可用或与接入点不匹配");
   }
-  const scopedCredential = credentialForRuntime(credential, runtime.key);
+  const scopedCredential = credentialForRuntime(
+    credential, runtime.key, runtimeScopesModelCatalog(input.descriptors, runtime.key));
   if (!allModelIds(scopedCredential).includes(saved.model)) return retain("原模型不再属于该 Runtime 的目录");
   const effort = saved.effort ?? "";
   const model = [...scopedCredential.models, ...scopedCredential.candidate_models].find((row) => row.id === saved.model);

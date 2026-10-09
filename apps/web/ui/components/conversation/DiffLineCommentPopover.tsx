@@ -68,7 +68,7 @@ export function DiffLineCommentPopover({
         <div className="flex items-center gap-2 border-b border-cx-border-subtle py-1.5 pl-3 pr-1.5">
           <div className="flex min-w-0 flex-1 items-baseline gap-2">
             <code className="min-w-0 truncate font-cx-mono text-[12px] text-cx-fg">{path}</code>
-            <span className="shrink-0 text-[11.5px] text-cx-fg-4">
+            <span className="shrink-0 text-[12px] text-cx-fg-4">
               {sideLabel(side)} · {annotationRangeLabel({ lineNumber, endLineNumber: range })}
             </span>
           </div>
@@ -76,7 +76,7 @@ export function DiffLineCommentPopover({
         </div>
         {snapshot ? (
           <pre
-            className="cx-scroll m-0 max-h-[92px] overflow-auto border-b border-cx-border-subtle bg-cx-code px-3 py-2 font-cx-mono text-[11.5px] leading-[18px] text-cx-fg-2"
+            className="cx-scroll m-0 max-h-[92px] overflow-auto border-b border-cx-border-subtle bg-cx-code px-3 py-2 font-cx-mono text-[12px] leading-[18px] text-cx-fg-2"
             data-testid="diff-comment-popover-snapshot"
           >
             {snapshotLines.slice(0, 12).join("\n")}
@@ -101,7 +101,7 @@ export function DiffLineCommentPopover({
             }}
           />
           <div className="mt-2 flex items-center gap-2">
-            <span className="flex items-center gap-1 text-[11.5px] text-cx-fg-4">
+            <span className="flex items-center gap-1 text-[12px] text-cx-fg-4">
               <Shortcut keys="mod+enter" tone="subtle" />
               添加
             </span>

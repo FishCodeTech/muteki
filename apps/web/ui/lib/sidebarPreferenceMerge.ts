@@ -6,6 +6,13 @@ function sameList(left: string[], right: string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
+type TimeMap = Record<string, number>;
+
+function sameTimeMap(left: TimeMap, right: TimeMap): boolean {
+  const keys = Object.keys(left);
+  return keys.length === Object.keys(right).length && keys.every((key) => left[key] === right[key]);
+}
+
 export function sameSidebarPreferences(
   left: PreferenceValues,
   right: PreferenceValues,
@@ -15,7 +22,20 @@ export function sameSidebarPreferences(
     && sameList(left.project_order, right.project_order)
     && left.sort_mode === right.sort_mode
     && left.pinned_sort_mode === right.pinned_sort_mode
-    && left.group_mode === right.group_mode;
+    && left.group_mode === right.group_mode
+    && sameTimeMap(left.settled_at, right.settled_at)
+    && sameTimeMap(left.snoozed_until, right.snoozed_until);
+}
+
+/** Apply per-key additions, changes and removals made locally since `base`. */
+export function rebaseTimeMap(base: TimeMap, local: TimeMap, remote: TimeMap): TimeMap {
+  const result: TimeMap = { ...remote };
+  for (const key of new Set([...Object.keys(base), ...Object.keys(local)])) {
+    if (base[key] === local[key]) continue;
+    if (local[key] === undefined) delete result[key];
+    else result[key] = local[key];
+  }
+  return result;
 }
 
 /** Merge explicit membership changes; a reorder cannot resurrect a remotely removed ID. */
@@ -54,5 +74,7 @@ export function rebaseSidebarPreferences(
     pinned_sort_mode: base.pinned_sort_mode === local.pinned_sort_mode
       ? remote.pinned_sort_mode : local.pinned_sort_mode,
     group_mode: base.group_mode === local.group_mode ? remote.group_mode : local.group_mode,
+    settled_at: rebaseTimeMap(base.settled_at, local.settled_at, remote.settled_at),
+    snoozed_until: rebaseTimeMap(base.snoozed_until, local.snoozed_until, remote.snoozed_until),
   };
 }

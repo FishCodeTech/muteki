@@ -11,6 +11,7 @@
  * - Top: Compact title and three workspace display controls
  * ───────────────────────────────────────────────────────── */
 
+import { ConversationRouteLink } from "@/components/conversation/ConversationNavigation";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button, Callout, Dialog, IconButton, Popover, TextField, Toaster, toast } from "@/components/chat/ui";
 import { RightPanel } from "@/components/chat/panel/RightPanel";
@@ -180,9 +181,7 @@ import {
   updateSendIntent,
 } from "@/lib/sendIntentStore";
 import {
-  dispatchThreadNotification,
   unlockNotificationAudio,
-  type ConversationInboxEvent,
 } from "@/lib/threadNotifications";
 import {
   useThreadScopedNotice,
@@ -199,6 +198,7 @@ import type { PromptBarAttachment } from "../ai-native/prompt-bar";
 
 import { ConversationSidebar } from "./ConversationSidebar";
 import { ConversationHeader } from "./ConversationHeader";
+import { ConversationThreadDetails, useThreadDetailsState } from "./ConversationThreadDetails";
 import { ConversationHome } from "./ConversationHome";
 import { ConversationTimeline } from "./ConversationTimeline";
 import { ConversationQueue } from "./ConversationQueue";
@@ -208,6 +208,7 @@ import { ConversationSearchDialog } from "./ConversationSearchDialog";
 import { ExportDialog } from "./ExportDialog";
 import {
   ImpactConfirmModal,
+  type ImpactFileMode,
   type ImpactMode,
   type ImpactPreview,
 } from "./ImpactConfirmModal";
@@ -215,7 +216,8 @@ import { useConversationChrome } from "@/components/conversationChrome";
 import { ConversationNavigationContext, type ConversationNavigation } from "./ConversationNavigation";
 export type { ConversationNavigation } from "./ConversationNavigation";
 import { ConversationModelPicker } from "./ConversationModelPicker";
-import { credentialForRuntime, validModelEffort } from "@/lib/modelReasoning";
+import { ConversationComposerModes } from "./ConversationComposerModes";
+import { credentialForRuntime, effectiveServiceTier, readPreferredServiceTier, validModelEffort } from "@/lib/modelReasoning";
 import { ComposerContextStrip } from "./ComposerContextStrip";
 import { ComposerStashModal } from "./ComposerStashModal";
 import { ConversationReadinessBanner } from "./ConversationReadinessBanner";
@@ -242,6 +244,13 @@ import {
 } from "@/lib/mobileSidebarFocus";
 import { ConversationShortcutsHelp } from "./ConversationShortcutsHelp";
 import { desktopChatBridge } from "@/lib/desktopChatBridge";
+import {
+  capabilitiesFor, descriptorForEngine, loadProviderDescriptors, readyCatalog, runtimeScopesModelCatalog,
+  useProviderDescriptors, type ProviderDescriptorCatalog,
+} from "@/lib/providerDescriptors";
+import { normalizeInteractionMode, planModeSupportForRuntime, type InteractionMode } from "@/lib/planModeAvailability";
+import { saveThreadInteractionMode } from "@/lib/conversationServerPreferences";
+import { handledByDesktopMenu, isMacPlatform, matchesBinding, readShortcutBindings, useDesktopMenuAcceleratorSync, type ShortcutActionId } from "@/lib/shortcutBindings";
 import { conversationStorageScope, subscribeConversationStorageScope } from "@/lib/conversationStorageScope";
 import { beginConversationControl, clearConversationControl, listConversationControls, subscribeConversationControls, updateConversationControl, type ControlIntent } from "@/lib/conversationControlState";
 import { archiveUnconfirmedSend, listArchivedSendIntents, type ArchivedSendIntent } from "@/lib/unconfirmedSendArchive";
@@ -252,10 +261,11 @@ import { flushUserInputDraftStore } from "@/lib/userInputDraftStore";
 import { useSpeechInput } from "@/lib/useSpeechInput";
 import type { ResourceLinkTarget } from "@/lib/resourcePreview";
 import type { MessageAttachmentChip } from "./ConversationMessage";
+import { ThreadEditorProvider } from "./threadEditorContext";
+import { ConversationQuotaResume } from "./ConversationQuotaResume";
 
 function credentialAvailable(credential: ConversationCredential): boolean {
-  return credential.engine !== "dsh"
-    && credential.present !== false
+  return credential.present !== false
     && !["missing", "absent", "failed", "invalid", "error", "unavailable"].includes(
       credential.status.toLowerCase(),
     );
@@ -298,9 +308,12 @@ function runtimeUsable(runtime: RuntimeInstance | undefined): boolean {
 function runtimeForEngine(
   engine: string,
   runtimes: RuntimeInstance[],
+  descriptors: ProviderDescriptorCatalog | null,
 ): RuntimeInstance | undefined {
-  if (engine === "codex" && desktopChatBridge()) {
-    const native = runtimes.filter((row) => row.adapter_id === "codex.app_server" && row.enabled !== false);
+  // The desktop chat prefers the engine's default (structured) adapter over its CLI path.
+  const defaultAdapter = desktopChatBridge() ? descriptorForEngine(descriptors, engine)?.identity.default_adapter_id : "";
+  if (defaultAdapter) {
+    const native = runtimes.filter((row) => row.adapter_id === defaultAdapter && row.enabled !== false);
     if (native.length) return pickRuntimeForEngine(engine, native) as RuntimeInstance | undefined;
   }
   return pickRuntimeForEngine(engine, runtimes) as RuntimeInstance | undefined;
@@ -346,22 +359,11 @@ function composerRefs(doc: PromptDocument): ComposerCapabilityRef[] {
 
 export function ConversationShell({ threadId = "", navigation }: { threadId?: string; navigation: ConversationNavigation }) {
   const { router, pathname, searchParams } = navigation;
-  const handleInboxEvent = useCallback((event: ConversationInboxEvent) => {
-    const delivery = dispatchThreadNotification(event, {
-      activeThreadId: threadId,
-      onOpenThread: (id) => {
-        router.push(`/chat/${encodeURIComponent(id)}`);
-      },
-    });
-    if (desktopChatBridge()) console.info("muteki.notification.dispatch", JSON.stringify({
-      threadId: event.summary.thread_id, eventId: event.event_id, activeThreadId: threadId, ...delivery,
-    }));
-  }, [router, threadId]);
-  const { threads, refresh: refreshList, attentionCount } = useConversationThreads({
+  const { threads, refresh: refreshList, markThreadsRead } = useConversationThreads({
     activeThreadId: threadId,
-    onInboxEvent: handleInboxEvent,
   });
   const conversation = useConversation(threadId);
+  const [unboundNoticeDismissed, setUnboundNoticeDismissed] = useState<ReadonlySet<string>>(() => new Set());
   const draftParam = searchParams.get("draft") || "";
   const draftKey = composerDraftKey(threadId, draftParam);
   // Retry awaits a configuration refresh. Keep the active route/view current
@@ -387,6 +389,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     model: "",
     effort: "",
     accessMode: "supervised",
+    interactionMode: "default" as InteractionMode,
     projectId: "",
   });
 
@@ -425,18 +428,29 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   const [runtimes, setRuntimes] = useState<RuntimeInstance[]>([]);
   const [runtimeSource, setRuntimeSource] = useState<SourceState>(sourceLoading());
   const [runtimeKey, setRuntimeKey] = useState("");
+  const descriptorState = useProviderDescriptors();
+  const descriptors = readyCatalog(descriptorState);
+  const descriptorSource = useMemo<SourceState>(() => (
+    descriptorState.status === "ready" ? sourceOk()
+      : descriptorState.status === "error" ? sourceError(descriptorState.message, descriptorState.httpStatus)
+        : sourceLoading()
+  ), [descriptorState]);
   const credentials = useMemo(() => credentialRows.map(credential => {
     const selected = runtimes.find(runtime => runtime.key === runtimeKey && runtime.engine === credential.engine && runtime.enabled !== false);
-    const runtime = selected || runtimeForEngine(credential.engine, runtimes);
-    return credentialForRuntime(credential, runtime?.key || "");
-  }), [credentialRows, credentialId, runtimes, runtimeKey]);
+    const runtime = selected || runtimeForEngine(credential.engine, runtimes, descriptors);
+    return credentialForRuntime(credential, runtime?.key || "", runtimeScopesModelCatalog(descriptors, runtime?.key));
+  }), [credentialRows, credentialId, descriptors, runtimes, runtimeKey]);
   const restoredBindingContextRef = useRef<{ draftKey: string; projectId: string } | null>(null);
   const [probing, setProbing] = useState(false);
 
   // Model & settings selection
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState("");
+  // Speed tier is a sticky preference; it only applies to models that declare it.
+  const [serviceTier, setServiceTier] = useState("");
+  useEffect(() => { setServiceTier(readPreferredServiceTier()); }, []);
   const [accessMode, setAccessMode] = useState("supervised");
+  const [interactionMode, setInteractionMode] = useState<InteractionMode>("default");
 
   // Projects & workspace
   const [projects, setProjects] = useState<ConversationProject[]>([]);
@@ -642,8 +656,20 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     return () => mq.removeEventListener("change", sync);
   }, []);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  // Keyed by thread scope so switching threads always starts expanded.
+  const [compactComposerScope, setCompactComposerScope] = useState("");
+  const composerCompact = compactComposerScope === commandScope;
+  const handleComposerCompactChange = useCallback((compact: boolean) => {
+    setCompactComposerScope(compact ? commandScope : "");
+  }, [commandScope]);
+  // The model picker shortcut anchors to a toolbar control the compact layout hides.
+  useEffect(() => {
+    if (modelPickerOpen) setCompactComposerScope("");
+  }, [modelPickerOpen]);
   const panelControlsRef = useRef<HTMLDivElement | null>(null);
+  const detailsButtonRef = useRef<HTMLButtonElement | null>(null);
   const mainRef = useRef<HTMLElement | null>(null);
+  const threadDetails = useThreadDetailsState(mainRef);
   const [mainLeft, setMainLeft] = useState(0);
   useEffect(() => {
     const shell = shellRef.current;
@@ -685,6 +711,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   const [impactPreview, setImpactPreview] = useState<ImpactPreview | null>(null);
   const [impactLoading, setImpactLoading] = useState(false);
   const [impactEditedText, setImpactEditedText] = useState("");
+  const [impactFileMode, setImpactFileMode] = useState<ImpactFileMode>("keep_files");
   const [impactCommandId, setImpactCommandId] = useState("");
   /** Frozen fork source across preview/confirm (Pane #209). */
   const [impactForkSource, setImpactForkSource] = useState<ForkSourceFreeze | null>(null);
@@ -703,6 +730,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   const [attachments, setAttachments] = useState<PromptBarAttachment[]>([]);
   const {
     sidebarCollapsed,
+    toggleSidebarCollapsed,
     sidebarWidth,
     setSidebarWidth,
     mobileSidebarOpen,
@@ -820,13 +848,15 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         prompt: "", promptSegments: [], capabilityRefs: [], attachments: [],
         credentialId: current.credentialId, runtimeKey: current.runtimeKey,
         model: current.model, effort: current.effort, accessMode: current.accessMode,
-        projectId: nextProjectId,
+        interactionMode: current.interactionMode, projectId: nextProjectId,
       });
       flushComposerDraftStore();
     }
     setMobileSidebarOpen(false);
     router.push(`/chat?draft=${nextDraft}`);
   }, [router]);
+
+  useDesktopMenuAcceleratorSync();
 
   // C34 — Global conversation keyboard shortcuts.
   // Guard: skip when focus is inside a text input, contenteditable, or the xterm terminal.
@@ -845,36 +875,50 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     const handler = (e: KeyboardEvent) => {
       if (e.isComposing) return;
       const mod = e.metaKey || e.ctrlKey;
-      if (mod && e.shiftKey && e.key === "N") {
+      const mac = isMacPlatform();
+      const desktop = Boolean(desktopChatBridge());
+      const bindings = readShortcutBindings();
+      const hit = (id: ShortcutActionId) => matchesBinding(e, bindings[id], mac);
+      if (hit("newChat") && !handledByDesktopMenu("newChat", desktop)) {
         e.preventDefault();
         startNewChat();
         return;
       }
-      if (mod && e.shiftKey && !e.altKey && e.code === "KeyM") {
+      // On the web the workspace rail owns the search palette shortcut.
+      if (desktop && hit("search") && !handledByDesktopMenu("search", desktop)) {
+        e.preventDefault();
+        setCommandSessionsOpen(true);
+        return;
+      }
+      if (hit("toggleSidebar") && !handledByDesktopMenu("toggleSidebar", desktop)) {
+        e.preventDefault();
+        toggleSidebarCollapsed();
+        return;
+      }
+      if (hit("modelPicker")) {
         e.preventDefault();
         setModelPickerOpen((open) => !open);
         return;
       }
-      if (mod && !e.shiftKey && !e.altKey && e.code === "KeyJ" && threadId) {
+      if (hit("toggleLog") && threadId) {
         e.preventDefault();
         setBottomPanelOpen((open) => !open);
         return;
       }
-      // Option/Alt changes e.key on macOS, so panel shortcuts match on e.code.
-      if (mod && e.altKey && !e.shiftKey && threadId) {
-        const surfaces: Record<string, () => void> = {
-          KeyB: () => chatPanel.toggle(threadId),
-          KeyD: () => chatPanel.toggle(threadId, "diff"),
-          KeyP: () => {
+      if (threadId) {
+        const surfaces: Array<[ShortcutActionId, () => void]> = [
+          ["togglePanel", () => chatPanel.toggle(threadId)],
+          ["panelDiff", () => chatPanel.toggle(threadId, "diff")],
+          ["panelPreview", () => {
             const current = panel.surfaces.find((item) => item.id === panel.activeId);
             if (panel.isOpen && current?.kind === "preview") chatPanel.close(threadId);
             else chatPanel.openPreview(threadId);
-          },
-          KeyF: () => chatPanel.toggle(threadId, "files"),
-          KeyT: () => chatPanel.toggle(threadId, "terminal"),
-          KeyO: () => chatPanel.toggle(threadId, "overview"),
-        };
-        const action = surfaces[e.code];
+          }],
+          ["panelFiles", () => chatPanel.toggle(threadId, "files")],
+          ["panelTerminal", () => chatPanel.toggle(threadId, "terminal")],
+          ["panelOverview", () => chatPanel.toggle(threadId, "overview")],
+        ];
+        const action = surfaces.find(([id]) => hit(id))?.[1];
         if (action) {
           e.preventDefault();
           setDetailsPayload(null);
@@ -898,19 +942,19 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         focusComposer();
         return;
       }
-      if (e.key === "/" && !mod && !e.altKey) {
+      if (hit("focusComposer")) {
         e.preventDefault();
         focusComposer();
         return;
       }
-      if (e.key === "?" && !mod && !e.altKey) {
+      if (hit("help")) {
         e.preventDefault();
         setShortcutsHelpOpen((v) => !v);
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [startNewChat, shortcutsHelpOpen, detailsPayload, infoDrawerOpen, readingPrefsOpen, rightPanelOpen, bottomPanelOpen, mobileSidebarOpen, threadId, panel]);
+  }, [startNewChat, shortcutsHelpOpen, detailsPayload, infoDrawerOpen, readingPrefsOpen, rightPanelOpen, bottomPanelOpen, mobileSidebarOpen, threadId, panel, toggleSidebarCollapsed]);
 
   // #134: the dialog restores focus to its opener on the next frame; land on the
   // composer one frame later so closing help always returns to typing.
@@ -1009,12 +1053,13 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         model: previous.model,
         effort: previous.effort,
         accessMode: previous.accessMode,
+        interactionMode: previous.interactionMode,
         projectId: previous.projectId,
       });
       flushComposerDraftStore();
     }
     if (composerStorageScopeRef.current !== storageScope) {
-      setCredentialId(""); setRuntimeKey(""); setModel(""); setEffort(""); setAccessMode("supervised"); setProjectId("");
+      setCredentialId(""); setRuntimeKey(""); setModel(""); setEffort(""); setAccessMode("supervised"); setInteractionMode("default"); setProjectId("");
       pendingProjectIdRef.current = "";
     }
     composerStorageScopeRef.current = storageScope;
@@ -1023,7 +1068,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     restoredBindingContextRef.current = null;
     // A newly opened thread must not persist the previous thread's selection
     // while its view is loading. Missing draft fields are empty, not inherited.
-    setCredentialId(""); setRuntimeKey(""); setModel(""); setEffort(""); setAccessMode("supervised");
+    setCredentialId(""); setRuntimeKey(""); setModel(""); setEffort(""); setAccessMode("supervised"); setInteractionMode("default");
     const { draft, attachments: nextAttachments, restoredNeedsReselect } = hydrateComposerDraft(draftKey);
     if (draft) {
       const doc = promptDocumentFromDraft(draft);
@@ -1036,6 +1081,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       if (draft.model) setModel(draft.model);
       if (draft.effort !== undefined) setEffort(draft.effort);
       if (draft.accessMode) setAccessMode(draft.accessMode);
+      if (draft.interactionMode) setInteractionMode(normalizeInteractionMode(draft.interactionMode));
       // A saved thread's workspace is immutable in the composer. A local draft
       // may restore text/model choices, but must not override its persisted home.
       if (!threadId) {
@@ -1066,6 +1112,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         setModel(recent?.modelId || "");
         setEffort(recent?.effort || "");
         setAccessMode("supervised");
+        setInteractionMode("default");
         setError("");
         setNotice("");
         setMemory(null);
@@ -1105,6 +1152,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       model,
       effort,
       accessMode,
+      interactionMode,
       projectId,
     };
     if (draftHydratingRef.current || !storageScope || composerStorageScopeRef.current !== conversationStorageScope()) return;
@@ -1118,10 +1166,12 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       model,
       effort,
       accessMode,
+      interactionMode,
       projectId,
     });
   }, [
     accessMode,
+    interactionMode,
     attachments,
     capabilityRefs,
     credentialId,
@@ -1295,6 +1345,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       current: { credentialId, runtimeKey, model, effort, accessMode },
       credentials: credentialRows,
       runtimes,
+      descriptors,
     });
     // An explicit restore outranks project defaults for this draft/project.
     restoredBindingContextRef.current = { draftKey, projectId: !threadId && projectStillThere ? targetProject : projectId };
@@ -1318,7 +1369,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     setNotice(`已恢复暂存「${restored.entry.name}」；${bindingNotice}${warnings.length ? `；${warnings.join("；")}` : ""}`);
     setStashOpen(false);
     applyingHistoryRef.current = false;
-  }, [threadId, draftKey, projectId, projects, credentialRows, runtimes, credentialId, runtimeKey, model, effort, accessMode, setNotice]);
+  }, [threadId, draftKey, projectId, projects, credentialRows, runtimes, descriptors, credentialId, runtimeKey, model, effort, accessMode, setNotice]);
 
   const handleStashRestore = useCallback((stashId: string) => {
     if (!composerRecallBodyEmpty({ prompt, promptSegments: promptDocument.segments, capabilityRefs, attachments })) {
@@ -1429,7 +1480,9 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     setRuntimes([]); setCredentials([]); setProjects([]);
     setRuntimeSource(sourceLoading()); setCredentialSource(sourceLoading()); setProjectSource(sourceLoading());
   }, [storageScope]);
-  useEffect(() => { ++projectLoadSeqRef.current; ++probeGenerationRef.current; setProjectCreating(false); setPendingSendQuery(false); setProbing(false); }, [commandScope]);
+  // The project list is shared by every draft, so a list load still in flight stays
+  // valid; draft-owned project creation checks its owner draft on its own.
+  useEffect(() => { ++probeGenerationRef.current; setProjectCreating(false); setPendingSendQuery(false); setProbing(false); }, [commandScope]);
   const loadRuntimes = useCallback(async (opts?: { silent?: boolean }) => {
     const requestSeq = ++runtimeLoadSeqRef.current;
     const ownerScope = conversationStorageScope();
@@ -1437,7 +1490,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     try {
       const rows = await fetchRuntimeInstances();
       if (requestSeq !== runtimeLoadSeqRef.current || ownerScope !== conversationStorageScope()) return;
-      setRuntimes(rows.filter((row) => row.enabled !== false && row.adapter_id !== "cli.dsh" && row.adapter_id !== "deepseek.harness"));
+      setRuntimes(rows.filter((row) => row.enabled !== false));
       setRuntimeSource(sourceOk());
     } catch (exc) {
       if (requestSeq !== runtimeLoadSeqRef.current || ownerScope !== conversationStorageScope()) return;
@@ -1452,7 +1505,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     const ownerScope = conversationStorageScope();
     if (!opts?.silent) setCredentialSource(sourceLoading());
     try {
-      const rows = (await fetchConversationCredentials({ fresh: opts?.fresh })).filter((row) => row.engine !== "dsh");
+      const rows = await fetchConversationCredentials({ fresh: opts?.fresh });
       if (requestSeq !== credentialLoadSeqRef.current || ownerScope !== conversationStorageScope()) return;
       setCredentials(rows);
       setCredentialId((curr) => {
@@ -1486,12 +1539,14 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   }, []);
 
   const reloadReadiness = useCallback(async (opts?: { fresh?: boolean; silent?: boolean }) => {
+    // A failed descriptor load is retried here; its error stays in the shared store.
+    if (descriptorState.status === "error") await loadProviderDescriptors({ fresh: true }).catch(() => undefined);
     await Promise.all([
       loadCredentials({ fresh: opts?.fresh, silent: opts?.silent }),
       loadRuntimes({ silent: opts?.silent }),
       loadProjects({ silent: opts?.silent }),
     ]);
-  }, [loadCredentials, loadProjects, loadRuntimes]);
+  }, [descriptorState.status, loadCredentials, loadProjects, loadRuntimes]);
 
   // A batch may contain completion followed by usage or the next queued turn.
   // Refresh from any newly observed completion, not only the final SSE event.
@@ -1537,6 +1592,50 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     };
   }, [probing, reloadReadiness]);
 
+  const planModeSupport = useMemo(
+    () => planModeSupportForRuntime({
+      catalogReady: descriptorState.status === "ready",
+      runtimeKey,
+      planMode: capabilitiesFor(descriptors, runtimeKey)?.plan_mode,
+    }),
+    [descriptorState.status, descriptors, runtimeKey],
+  );
+  const commitInteractionMode = useCallback((mode: InteractionMode) => {
+    setInteractionMode(mode);
+    const snap = composerSnapshotRef.current;
+    composerSnapshotRef.current = { ...snap, interactionMode: mode };
+    if (draftHydratingRef.current || !snap.draftKey) return;
+    writeComposerDraft(snap.draftKey, {
+      prompt: snap.prompt,
+      promptSegments: snap.promptDocument.segments,
+      capabilityRefs: snap.capabilityRefs,
+      attachments: snap.attachments,
+      credentialId: snap.credentialId,
+      runtimeKey: snap.runtimeKey,
+      model: snap.model,
+      effort: snap.effort,
+      accessMode: snap.accessMode,
+      interactionMode: mode,
+      projectId: snap.projectId,
+    });
+  }, []);
+  const handleInteractionModeChange = useCallback((mode: InteractionMode) => {
+    if (mode === "plan" && !planModeSupport.available) return;
+    const previous = interactionMode;
+    commitInteractionMode(mode);
+    if (!threadId || mode === previous) return;
+    // The server validates plan mode against the thread's stored runtime. When the picker already
+    // points elsewhere, the mode is persisted with the next send together with that runtime.
+    const stored = conversation.view?.runtime;
+    const storedKey = stored?.adapter_id ? `${stored.adapter_id}:${stored.instance_id}` : "";
+    if (mode === "plan" && storedKey !== runtimeKey) return;
+    // The server keeps the preference per thread, so a reload or another window sees the same mode.
+    void saveThreadInteractionMode(threadId, mode).catch((failure) => {
+      commitInteractionMode(previous);
+      setError(failure instanceof Error ? failure.message : String(failure));
+    });
+  }, [commitInteractionMode, conversation.view?.runtime, interactionMode, planModeSupport.available, runtimeKey, setError, threadId]);
+
   // Sync composer controls from the persisted thread runtime.
   // Depend on the concrete runtime fields, not the whole view object: SSE
   // snapshots and refresh() replace `conversation.view` often, and re-applying
@@ -1549,7 +1648,10 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   const viewCredentialId = viewRuntime?.credential_id || viewRuntime?.credential_ref || "";
   const viewModel = viewRuntime?.model || "";
   const viewEffort = viewRuntime?.effort || "";
+  const viewBound = Boolean(viewRuntime?.adapter_id);
+  const viewServiceTier = viewRuntime?.service_tier || "";
   const viewAccessMode = viewRuntime?.access_mode || "supervised";
+  const viewInteractionMode = viewRuntime?.interaction_mode || "";
   const viewMode = conversation.view?.thread.mode;
   const viewProjectId = conversation.view?.thread.project_id || "";
   useEffect(() => {
@@ -1573,6 +1675,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     setCredentialId(bind.credentialId);
     setModel(bind.modelId);
     setEffort(stored?.effort ?? viewEffort);
+    if (viewBound) setServiceTier(viewServiceTier);
     setAccessMode(stored?.accessMode || viewAccessMode);
     if (viewMode) setMode(viewMode);
     setProjectId(viewProjectId);
@@ -1581,14 +1684,26 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     credentials,
     runtimes,
     viewAccessMode,
+    viewInteractionMode,
+    descriptorState.status,
+    descriptors,
+    viewBound,
     viewCredentialId,
     viewEffort,
+    viewServiceTier,
     viewMode,
     viewModel,
     viewProjectId,
     viewRuntimeKey,
     viewThreadId,
   ]);
+
+  // Follow actual server preference changes without resetting an optimistic
+  // toggle every time the credential/runtime catalogs refresh.
+  useEffect(() => {
+    if (!viewBound || !viewThreadId || viewThreadId !== threadId) return;
+    setInteractionMode(normalizeInteractionMode(viewInteractionMode));
+  }, [threadId, viewBound, viewThreadId, viewRuntimeKey, viewInteractionMode]);
 
   // Memory reads and forms belong to the initiating conversation.
   const memoryRequestSeqRef = useRef(0);
@@ -1632,10 +1747,12 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       credentials: credentialSource,
       runtimes: runtimeSource,
       projects: projectSource,
+      descriptors: descriptorSource,
     },
     credentials,
     runtimes,
     projects,
+    descriptors,
     selected: {
       credentialId,
       runtimeKey,
@@ -1650,6 +1767,8 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     credentialId,
     credentialSource,
     credentials,
+    descriptorSource,
+    descriptors,
     directoryIssue,
     guideDismissed,
     model,
@@ -1674,7 +1793,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
 
   const handleProbeAgent = useCallback(async () => {
     const target = selectedRuntime
-      || (selectedCredential ? runtimeForEngine(selectedCredential.engine, runtimes) : undefined);
+      || (selectedCredential ? runtimeForEngine(selectedCredential.engine, runtimes, descriptors) : undefined);
     if (!target?.key || probing) return;
     const generation = ++probeGenerationRef.current;
     const ownerScope = conversationStorageScope();
@@ -1684,10 +1803,14 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     setProbing(true);
     setError("");
     try {
-      await probeRuntimeInstance(target.key, target.adapter_id === "codex.app_server"
+      await probeRuntimeInstance(target.key, runtimeScopesModelCatalog(descriptors, target.key)
         ? { credentialId: ownerCredential, environment: "local" } : {});
       if (!isCurrent()) return;
-      await Promise.all([loadRuntimes({ silent: true }), loadCredentials({ silent: true })]);
+      await Promise.all([
+        loadRuntimes({ silent: true }), loadCredentials({ silent: true }),
+        // Resolved instance capabilities include the new probe.
+        loadProviderDescriptors({ fresh: true }).catch(() => undefined),
+      ]);
     } catch (exc) {
       if (!isCurrent()) return;
       setError(exc instanceof Error ? exc.message : String(exc));
@@ -1695,7 +1818,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     } finally {
       if (generation === probeGenerationRef.current) setProbing(false);
     }
-  }, [loadCredentials, loadRuntimes, probing, runtimes, selectedCredential, selectedRuntime, runtimeKey, setError]);
+  }, [descriptors, loadCredentials, loadRuntimes, probing, runtimes, selectedCredential, selectedRuntime, runtimeKey, setError]);
 
   const handleCreateProjectFromPath = useCallback(async (rawPath: string): Promise<string | null> => {
     if (projectCreating) return null;
@@ -1750,6 +1873,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     return {
       threadId: threadId || undefined,
       adapterId,
+      instanceId: selectedRuntime?.instance_id || "default",
       revision: conversation.view?.runtime_connection?.capability_revision ?? 0,
       workspaceId: (threadId ? conversation.view?.thread.workspace_id : selectedProject?.workspace_id) || undefined,
       projectId: (threadId ? conversation.view?.thread.project_id : selectedProject?.project_id) || undefined,
@@ -1761,6 +1885,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     selectedProject?.project_id,
     selectedProject?.workspace_id,
     selectedRuntime?.adapter_id,
+    selectedRuntime?.instance_id,
     threadId,
   ]);
 
@@ -1777,12 +1902,13 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     credentialId: string;
     model: string;
     effort?: string;
+    serviceTier?: string;
     accessMode?: string;
   }) => {
     const credential = credentials.find((item) => item.id === params.credentialId);
     const runtime = credential
       ? runtimes.find((row) => row.key === runtimeKey && row.engine === credential.engine && row.enabled !== false)
-        || runtimeForEngine(credential.engine, runtimes)
+        || runtimeForEngine(credential.engine, runtimes, descriptors)
       : undefined;
     const engineChanged = Boolean(
       credential
@@ -1793,6 +1919,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     setModel(params.model);
     setRuntimeKey(runtime?.key || "");
     if (params.effort !== undefined) setEffort(params.effort);
+    if (params.serviceTier !== undefined) setServiceTier(params.serviceTier);
     if (params.accessMode !== undefined) setAccessMode(params.accessMode);
     restoredBindingContextRef.current = { draftKey, projectId };
     writeChatLastSelection({
@@ -1804,7 +1931,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       invalidateComposerReferences("Agent 引擎已改变，请在当前引擎重新选择引用");
       setNotice("原引用与快照已保留，但未验证新引擎能使用；发送前请重新选择或明确移除引用", "warning");
     }
-  }, [credentials, runtimes, runtimeKey, selectedCredential, invalidateComposerReferences, draftKey, projectId, effort, accessMode, setNotice]);
+  }, [credentials, descriptors, runtimes, runtimeKey, selectedCredential, invalidateComposerReferences, draftKey, projectId, effort, accessMode, setNotice]);
 
   const runtimePickerOwnerRef = useRef({ storageScope, draftKey, credentialId });
   runtimePickerOwnerRef.current = { storageScope, draftKey, credentialId };
@@ -1815,7 +1942,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     const credential = credentialRows.find((row) => row.id === credentialId);
     const runtime = runtimes.find((row) => row.key === nextKey && row.enabled !== false && row.engine === credential?.engine);
     if (!credential || !runtime || nextKey === runtimeKey) return;
-    const scoped = credentialForRuntime(credential, nextKey);
+    const scoped = credentialForRuntime(credential, nextKey, runtimeScopesModelCatalog(descriptors, nextKey));
     const selectedModel = allCredentialModels(scoped).find((row) => row.id === model);
     const nextModel = selectedModel?.id || "";
     const nextEffort = validModelEffort(selectedModel, effort) ? effort : "";
@@ -1827,7 +1954,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       effort: nextEffort, accessMode });
     invalidateComposerReferences("Runtime 已改变，请在当前 Runtime 重新选择引用");
     setNotice("已选择 Runtime；下一次发送使用此接入，已有会话记录和草稿已保留");
-  }, [storageScope, draftKey, credentialId, credentialRows, runtimes, runtimeKey, model, effort,
+  }, [storageScope, draftKey, credentialId, credentialRows, runtimes, descriptors, runtimeKey, model, effort,
     projectId, accessMode, invalidateComposerReferences, setNotice]);
 
   const handleProjectChange = useCallback((nextProjectId: string) => {
@@ -1935,26 +2062,32 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     }
   }, [projectId, savingProjectDefault, setError, setNotice]);
 
-  const accessModes = useMemo(() => {
-    const raw = selectedRuntime?.access_modes
-      || selectedRuntime?.health?.capabilities?.access_modes;
-    return Array.isArray(raw) ? raw.map(String).filter(Boolean) : [];
-  }, [selectedRuntime]);
-
+  const [workspaceAccess, setWorkspaceAccess] = useState<{
+    context: ComposerCapabilityContext; modes: string[]; notes: Record<string, string>; error?: string;
+  } | null>(null);
   useEffect(() => {
-    if (draftHydratingRef.current || hydratedDraftKey !== draftKey) return;
-    if (!accessModes.length || accessModes.includes(accessMode)) return;
-    setAccessMode(
-      accessModes.includes("supervised") ? "supervised" : accessModes[0],
-    );
-  }, [accessMode, accessModes, draftKey, hydratedDraftKey]);
+    if (!composerCapabilityContext) return;
+    const controller = new AbortController();
+    void fetchComposerCapabilities(composerCapabilityContext, "/", "", controller.signal).then((catalog) => {
+      if (!controller.signal.aborted) setWorkspaceAccess({ context: composerCapabilityContext, modes: catalog.accessModes, notes: catalog.accessModeNotes });
+    }).catch((failure) => {
+      if (!controller.signal.aborted) setWorkspaceAccess({ context: composerCapabilityContext, modes: [], notes: {}, error: failure instanceof Error ? failure.message : String(failure) });
+    });
+    return () => controller.abort();
+  }, [composerCapabilityContext, storageScope]);
+  const currentWorkspaceAccess = workspaceAccess?.context === composerCapabilityContext ? workspaceAccess : null;
+  const accessModes = currentWorkspaceAccess?.modes || [];
+  const accessModeReason = currentWorkspaceAccess?.notes[accessMode] || "已保存的权限模式在当前工作区不可用，请明确选择其他模式。";
+  const accessModeIssue = !currentWorkspaceAccess
+    ? "正在确认当前工作区可用的权限模式，请稍后发送。"
+    : currentWorkspaceAccess.error || (accessModes.length > 0 && !accessModes.includes(accessMode) ? accessModeReason : "");
 
   // Sync default runtime & model when credential changes in new-thread mode
   useEffect(() => {
     if (threadId || !selectedCredential || draftHydratingRef.current || hydratedDraftKey !== draftKey) return;
     setRuntimeKey((current) => {
       const exact = runtimes.find((row) => row.key === current && row.engine === selectedCredential.engine && row.enabled !== false);
-      return exact?.key || runtimeForEngine(selectedCredential.engine, runtimes)?.key || "";
+      return exact?.key || runtimeForEngine(selectedCredential.engine, runtimes, descriptors)?.key || "";
     });
     const modelIds = allCredentialModels(selectedCredential).map((m) => m.id);
     const saved = readChatLastSelection() || readChatDefaultModel();
@@ -1971,13 +2104,13 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         ? selectedCredential.default_model
         : modelIds[0] || "",
     );
-  }, [draftKey, hydratedDraftKey, runtimes, selectedCredential, threadId]);
+  }, [descriptors, draftKey, hydratedDraftKey, runtimes, selectedCredential, threadId]);
 
   // Initialize once per draft/project/default change, after asynchronous catalogs
   // and draft hydration finish. Background refreshes must not reset the picker.
   useEffect(() => {
     if (threadId || hydratedDraftKey !== draftKey || draftHydratingRef.current) return;
-    if (credentialSource.phase !== "ok" || runtimeSource.phase !== "ok") return;
+    if (credentialSource.phase !== "ok" || runtimeSource.phase !== "ok" || !descriptors) return;
     if (projectId && projectSource.phase !== "ok") return;
     const restoredContext = restoredBindingContextRef.current;
     if (restoredContext?.draftKey === draftKey && restoredContext.projectId === projectId) return;
@@ -1988,7 +2121,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     const selection = resolveNewConversationSelection({
       credentials: credentialRows, runtimes, project: projDefaults,
       recent: readChatLastSelection(), configured: readChatDefaultModel(),
-      preferNativeCodex: Boolean(desktopChatBridge()),
+      descriptors, preferDefaultAdapter: Boolean(desktopChatBridge()),
     });
     if (!selection) return;
     appliedNewChatDefaultsRef.current = contextKey;
@@ -1997,7 +2130,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     setModel(selection.model);
     setEffort(selection.effort);
     setAccessMode(selection.accessMode);
-  }, [credentialRows, credentialSource.phase, draftKey, hydratedDraftKey, projectId, projects, projectSource.phase, runtimes, runtimeSource.phase, threadId]);
+  }, [credentialRows, credentialSource.phase, descriptors, draftKey, hydratedDraftKey, projectId, projects, projectSource.phase, runtimes, runtimeSource.phase, threadId]);
 
   const threadMatrix = useMemo(
     () => matrixFromRuntimeConnection(conversation.view?.runtime_connection),
@@ -2040,6 +2173,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   ]);
 
   const running = Boolean(conversation.view?.state.running_turn_id);
+  const backgroundTurnId = String(conversation.view?.runtime_connection?.background_turn_id || "");
   const steerEnabled = canInvoke(threadMatrix, "steer");
   const canSteer = Boolean(running && steerEnabled);
   const steerDisable = disableCopy(threadMatrix, "steer");
@@ -2297,6 +2431,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
 
   // Send message or Create Thread + Send (C02: stable idempotent intent)
   const handleSend = async () => {
+    if (accessModeIssue) { setError(accessModeIssue); return; }
     const ownerScope = conversationStorageScope();
     const ensureOwner = () => { if (conversationStorageScope() !== ownerScope) throw new Error("conversation.scope_changed: 服务身份已改变，原发送身份保留在原范围"); };
     const activeContext = activeSendContextRef.current;
@@ -2365,21 +2500,17 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       if (selectedRuntime && selectedRuntime.engine !== cred.engine) {
         throw new Error("模型接入点与 Runtime 引擎不一致，请重新选择模型后发送");
       }
-      let rt = selectedRuntime || runtimeForEngine(cred.engine, runtimes);
+      let rt = selectedRuntime || runtimeForEngine(cred.engine, runtimes, descriptors);
       if (!rt) {
         throw new Error(`${cred.engine} 没有可用的 Agent 接入；请前往设置检查 Runtime`);
       }
       if (!runtimeUsable(rt) && isRuntimeUnprobed(rt)) {
         setProbing(true);
         try {
-          await probeRuntimeInstance(rt.key, rt.adapter_id === "codex.app_server"
+          await probeRuntimeInstance(rt.key, runtimeScopesModelCatalog(descriptors, rt.key)
             ? { credentialId: cred.id, environment: "local" } : {});
           const rows = await fetchRuntimeInstances();
-          const filtered = rows.filter((row) => (
-            row.enabled !== false
-            && row.adapter_id !== "cli.dsh"
-            && row.adapter_id !== "deepseek.harness"
-          ));
+          const filtered = rows.filter((row) => row.enabled !== false);
           setRuntimes(filtered);
           setRuntimeSource(sourceOk());
           rt = filtered.find((row) => row.key === rt!.key) || rt;
@@ -2403,8 +2534,18 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         // Empty is an explicit reset. Omitting the field retains the previous
         // thread setting when the backend merges runtime selections.
         effort: effort === "default" ? "" : effort,
+        service_tier: effectiveServiceTier(allCredentialModels(cred).find((item) => item.id === model), serviceTier),
         access_mode: accessMode,
+        interaction_mode: interactionMode,
       };
+      const sendPlanSupport = planModeSupportForRuntime({
+        catalogReady: descriptorState.status === "ready",
+        runtimeKey: rt.key,
+        planMode: capabilitiesFor(descriptors, rt.key)?.plan_mode,
+      });
+      if (interactionMode === "plan" && sendPlanSupport.known && !sendPlanSupport.available) {
+        throw new Error(sendPlanSupport.reason);
+      }
       writeChatLastSelection({
         credentialId: cred.id, modelId: model, runtimeKey: rt.key,
         effort: runtimePayload.effort, accessMode,
@@ -2676,6 +2817,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
               model: live.model,
               effort: live.effort,
               accessMode: live.accessMode,
+              interactionMode: live.interactionMode,
               projectId: live.projectId,
             });
             flushComposerDraftStore();
@@ -2836,12 +2978,17 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         || !allCredentialModels(cred).some((row) => row.id === model)) {
         throw new Error("请先在输入框选择可用且匹配的接入点和模型，再重新绑定失败消息");
       }
+      if (interactionMode === "plan" && planModeSupport.known && !planModeSupport.available) {
+        throw new Error(planModeSupport.reason);
+      }
       await sendConversationCommand(threadId, "conversation.queue.update", {
         queue_id: queueId,
         text: item.text,
         runtime: {
           adapter_id: rt.adapter_id, instance_id: rt.instance_id,
           credential_id: cred.id, model, effort, access_mode: accessMode,
+          interaction_mode: interactionMode,
+          service_tier: effectiveServiceTier(allCredentialModels(cred).find((row) => row.id === model), serviceTier),
         },
       });
       setNotice("已按当前模型重新绑定队列消息，正文、附件和引用已保留；点击继续发送");
@@ -2905,7 +3052,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   // Stop / Interrupt turn
   const handleStop = () => {
     const targetThreadId = threadId;
-    const expectedTurnId = conversation.view?.state.running_turn_id || "";
+    const expectedTurnId = conversation.view?.state.running_turn_id || backgroundTurnId;
     if (
       !targetThreadId
       || !expectedTurnId
@@ -2934,8 +3081,11 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       // that choice into the continuation so the server creates a fresh
       // Runtime session when needed, instead of replaying the old supervised
       // session and asking for each already-authorized tool again.
+      if (interactionMode === "plan" && planModeSupport.known && !planModeSupport.available) {
+        throw new Error(planModeSupport.reason);
+      }
       await sendConversationCommand(threadId, "conversation.thread.resume", {
-        runtime: { access_mode: accessMode },
+        runtime: { access_mode: accessMode, interaction_mode: interactionMode },
       });
       setNotice("已恢复执行");
     });
@@ -3105,6 +3255,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     setImpactOpen(false);
     setImpactPreview(null);
     setImpactEditedText("");
+    setImpactFileMode("keep_files");
     setImpactCommandId("");
     setImpactForkSource(null);
   };
@@ -3116,6 +3267,8 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     const mode = String(impactPreview.mode || "retry") as ImpactMode;
     const turnId = impactPreview.target_turn_id;
     const commandId = impactCommandId || undefined;
+    const fileMode: ImpactFileMode = impactPreview.checkpoint?.available ? impactFileMode : "keep_files";
+    const filesNote = fileMode === "restore_files" ? "文件已回退到该轮开始前" : "文件保持原状";
     const commandThreadId = impactCommandThreadId({
       mode,
       currentThreadId: threadId,
@@ -3164,13 +3317,13 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         const receipt = await sendConversationCommand(
           owner.threadId,
           "conversation.turn.edit_resend",
-          { turn_id: turnId, text },
+          { turn_id: turnId, text, file_mode: fileMode, interaction_mode: interactionMode },
           commandId ? { commandId, idempotencyKey: commandId } : {},
         );
         if (!confirmReceipt(receipt.state)) return;
         clearEditBuffer(threadId, turnId);
         closeImpact();
-        setNotice("已编辑重发（文件保持原状）", "success");
+        setNotice(`已编辑重发（${filesNote}）`, "success");
         return;
       }
       const retryIntent = ensureRetryIntent(threadId, turnId);
@@ -3180,7 +3333,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         const receipt = await sendConversationCommand(
           threadId,
           "conversation.turn.retry",
-          { turn_id: turnId },
+          { turn_id: turnId, file_mode: fileMode, interaction_mode: interactionMode },
           {
             commandId: commandId || retryIntent.commandId,
             idempotencyKey: commandId || retryIntent.commandId,
@@ -3195,7 +3348,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         if (!confirmReceipt(receipt.state)) return;
         clearRetryIntent(threadId, turnId);
         closeImpact();
-        setNotice("已从所选轮次之前重新执行（文件保持原状）", "success");
+        setNotice(`已从所选轮次之前重新执行（${filesNote}）`, "success");
       } catch (exc) {
         if (!isCurrent()) return;
         const message = exc instanceof Error ? exc.message : String(exc);
@@ -3364,6 +3517,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     decision: "allow" | "deny",
     scopeMode?: "once" | "session",
     optionId?: string,
+    note?: string,
   ) => {
     if (!threadId || !approvalId) return;
     const state = conversation.view?.state;
@@ -3373,18 +3527,31 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       setError("该审批已过期或正在投递，请刷新当前会话");
       return;
     }
+    const isPlanExit = String(pending.approval_kind || pending.kind || "").toLowerCase().replace(/-/g, "_") === "plan_exit";
 
     void execute(async () => {
-      const payload = {
+      const payload: Record<string, unknown> = {
         approval_id: approvalId,
         decision,
-        scope: scopeMode === "session" ? "session" : "once",
+        scope: isPlanExit ? "once" : (scopeMode === "session" ? "session" : "once"),
         ...(optionId ? { option_id: optionId } : {}),
       };
+      if (isPlanExit && decision === "deny") payload.note = note ?? "";
       const intent = beginConversationControl(threadId, approvalId, "approval", payload);
       if (!intent) { setNotice("该审批正在确认，请恢复原回执；未再次投递决定", "warning"); return; }
-      const receipt = await sendControlIntent(intent);
-      setNotice(receipt.state === "completed" ? (decision === "allow" ? "已允许操作" : "已拒绝操作") : "审批决定已受理，等待确认", receipt.state === "completed" ? "success" : "accepted", receipt.command_id);
+      const leavingPlan = isPlanExit && decision === "allow";
+      if (leavingPlan) commitInteractionMode("default");
+      try {
+        const receipt = await sendControlIntent(intent);
+        const done = receipt.state === "completed";
+        const summary = isPlanExit
+          ? (decision === "allow" ? "已开始实施，规划模式已关闭" : "已继续规划")
+          : (decision === "allow" ? "已允许操作" : "已拒绝操作");
+        setNotice(done ? summary : "审批决定已受理，等待确认", done ? "success" : "accepted", receipt.command_id);
+      } catch (failure) {
+        if (leavingPlan) commitInteractionMode("plan");
+        throw failure;
+      }
     });
   };
 
@@ -3481,6 +3648,24 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         uploadStatus: "pending" as const,
       })),
     ]);
+  };
+
+  // Composer sends read render-scoped state, so "send now" waits for the
+  // render that contains the inserted text and files.
+  const handleSendRef = useRef(handleSend);
+  handleSendRef.current = handleSend;
+  const [attachSendNonce, setAttachSendNonce] = useState(0);
+  useEffect(() => {
+    if (attachSendNonce) void handleSendRef.current();
+  }, [attachSendNonce]);
+
+  const appendComposerText = (excerpt: string) => {
+    setPrompt((current) => (current.trim() ? `${current.trimEnd()}\n\n${excerpt}` : excerpt));
+    setPromptDocument((current) => {
+      const currentText = flattenPromptDocument(current).trimEnd();
+      const next = currentText ? `${currentText}\n\n${excerpt}` : excerpt;
+      return documentFromPromptAndRefs(next, refsFromDocument(current));
+    });
   };
 
   const handleRetryAttachment = (index: number) => {
@@ -3585,11 +3770,13 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   const panelControls = conversation.view && threadId ? (
     <div ref={panelControlsRef} className="flex items-center gap-0.5" data-testid="conversation-panel-controls">
       <IconButton
-        icon="panelBottom"
-        label="执行日志"
-        shortcut="mod+j"
-        active={bottomPanelOpen}
-        onClick={() => setBottomPanelOpen((open) => !open)}
+        ref={detailsButtonRef}
+        icon="alignJustify"
+        label={threadDetails.visible ? "隐藏对话详情" : "显示对话详情"}
+        active={threadDetails.visible}
+        aria-expanded={threadDetails.visible}
+        data-testid="thread-details-toggle"
+        onClick={threadDetails.toggle}
       />
       <IconButton
         icon="gitCompare"
@@ -3612,6 +3799,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
 
   return (
     <ConversationNavigationContext.Provider value={navigation}>
+    <ThreadEditorProvider view={conversation.view}>
     <>
     <div
       ref={shellRef}
@@ -3642,7 +3830,6 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         threads={sidebarThreads}
         projects={projects}
         activeThreadId={threadId}
-        attentionCount={attentionCount}
         onSelectThread={(id) => {
           setMobileSidebarOpen(false);
           router.push(`/chat/${encodeURIComponent(id)}`);
@@ -3660,6 +3847,9 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
           setRenameTarget(t);
           setRenameInput(t.title);
         }}
+        onRenameThreadTitle={(id, title) => {
+          if (title.trim() && title.trim() !== threads.find((item) => item.thread_id === id)?.title) handleRename(id, title);
+        }}
         onForkThread={(t) => handleFork(t.thread_id, t.state.running_turn_id || undefined)}
         onArchiveThread={(t) => handleArchive(t.thread_id)}
         onArchiveProjectThreads={handleArchiveProjectThreads}
@@ -3669,6 +3859,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
           setMobileSidebarOpen(false);
           router.push(buildThreadMessageHref(nextThreadId, messageId));
         }}
+        onMarkThreadsRead={markThreadsRead}
         collapsed={sidebarCollapsed}
         width={sidebarWidth}
         onWidthChange={setSidebarWidth}
@@ -3703,6 +3894,20 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
               view={conversation.view}
               projectName={activeProjectName}
               panelControls={panelControls}
+              bottomPanelOpen={bottomPanelOpen}
+              onToggleBottomPanel={() => setBottomPanelOpen((open) => !open)}
+              sidebarToggle={sidebarCollapsed ? (
+                <IconButton
+                  icon="panelLeft"
+                  label="展开对话导航"
+                  aria-expanded={false}
+                  aria-controls="conversation-sidebar"
+                  onClick={toggleSidebarCollapsed}
+                  className="max-md:hidden"
+                />
+              ) : undefined}
+              onOpenPendingSend={openPendingSend}
+              onNewInProject={() => startNewChat(conversation.view?.thread.project_id || undefined)}
               onOpenInfo={() => setInfoDrawerOpen(true)}
               onOpenReadingPrefs={() => setReadingPrefsOpen((v) => !v)}
               readingPrefsOpen={readingPrefsOpen}
@@ -3712,6 +3917,13 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
               onRename={(newT) => handleRename(threadId, newT)}
               onArchive={() => handleArchive(threadId)}
               busy={interactionBusy}
+            />
+            <ConversationThreadDetails
+              view={conversation.view}
+              projectName={activeProjectName}
+              state={threadDetails}
+              anchorRef={detailsButtonRef}
+              onOpenInfo={() => setInfoDrawerOpen(true)}
             />
             <Popover
               open={readingPrefsOpen}
@@ -3775,13 +3987,13 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
               >
                 <span className="break-words">{error}</span>
                 {/credential|auth|token|凭据|认证/i.test(error) ? (
-                  <a
+                  <ConversationRouteLink
                     href="/settings/agents"
                     className="mt-1 flex w-fit items-center gap-1.5 text-cx-fg-2 hover:text-cx-fg hover:underline"
                   >
                     <Icon name="plug" size={13} />
                     检查 Agent 接入
-                  </a>
+                  </ConversationRouteLink>
                 ) : null}
               </Callout>
             ) : (
@@ -3821,7 +4033,11 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
           </div>
         ) : null}
 
-        <div className="flex justify-center p-2"><Button size="sm" variant="ghost" onClick={openPendingSend}>{readSendIntent(draftKey)?.phase === "unknown" ? "处理上次未确认的请求" : "查看待核对发送记录"}</Button></div>
+        {readSendIntent(draftKey)?.phase === "unknown" ? (
+          <div className="flex justify-center px-4 pt-3">
+            <Button size="sm" variant="soft" icon="circleAlert" onClick={openPendingSend}>处理上次未确认的请求</Button>
+          </div>
+        ) : null}
         {pendingControls.length ? <div className="mx-4 mb-2 rounded-xl border border-cx-warning/30 bg-cx-warning-soft p-3 text-xs"><p>控制动作正在确认。卡片保留原命令身份，核对回执不会再投递决定或回答。</p>{pendingControls.map((intent) => <div key={intent.commandId} className="mt-2 flex items-center gap-2"><span className="min-w-0 break-all">{intent.kind === "approval" ? "审批" : "回答"} · {intent.state}</span><Button size="sm" variant="secondary" disabled={busy} onClick={() => void recoverControlIntent(intent)}>核对原回执</Button><details><summary>原请求</summary><pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words">{JSON.stringify(intent, null, 2)}</pre></details></div>)}</div> : null}
         {/* Main Content Area: Landing Home / first-load error / Message Timeline */}
         {!threadId ? (
@@ -3836,8 +4052,14 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
             selectedCredentialId={credentialId}
             selectedModel={model}
             selectedEffort={effort}
+            selectedServiceTier={serviceTier}
             selectedAccessMode={accessMode}
             accessModes={accessModes}
+                        accessModeReason={accessModeReason}
+            interactionMode={interactionMode}
+            planModeAvailable={planModeSupport.available}
+            planModeReason={planModeSupport.reason}
+            onInteractionModeChange={handleInteractionModeChange}
             onSelectModelParams={handleSelectModelParams}
             runtimes={runtimes}
             runtimeKey={runtimeKey}
@@ -3907,10 +4129,10 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
             </span>
             <div className="flex flex-col gap-2">
               <h2 className="text-[15px] font-semibold text-cx-fg">无法打开对话</h2>
-              <p className="text-[12.5px] leading-relaxed text-cx-fg-2">
+              <p className="text-[13px] leading-relaxed text-cx-fg-2">
                 {conversation.error || "加载对话失败，请重试。"}
               </p>
-              <p className="font-mono text-[11px] text-cx-fg-4 break-all">{threadId}</p>
+              <p className="font-mono text-[12px] text-cx-fg-4 break-all">{threadId}</p>
             </div>
             <div className="flex flex-wrap items-center justify-center gap-2">
               <Button
@@ -3944,7 +4166,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
             <div
               role="alert"
               data-testid="thread-session-error-banner"
-              className="flex items-center justify-between gap-3 border-b border-cx-danger/30 bg-cx-danger-soft px-4 py-2 text-[12.5px] text-cx-danger animate-fade-in"
+              className="flex items-center justify-between gap-3 border-b border-cx-danger/30 bg-cx-danger-soft px-4 py-2 text-[13px] text-cx-danger animate-fade-in"
             >
               <span className="min-w-0">{sessionSyncError}</span>
               <div className="flex shrink-0 items-center gap-1">
@@ -4026,6 +4248,8 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
             onOpenThread={(nextThreadId) => {
               router.push(`/chat/${encodeURIComponent(nextThreadId)}`);
             }}
+            composerCompact={composerCompact}
+            onComposerCompactChange={handleComposerCompactChange}
             footer={
               <div className="w-full">
                 {readinessForBanner.blockers.length ? (
@@ -4037,6 +4261,16 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
                     onDismissGuide={handleDismissGuide}
                   />
                 ) : null}
+            <ConversationQuotaResume
+              view={conversation.view}
+              events={conversation.events}
+              busy={interactionBusy}
+              onResume={handleResume}
+              onSchedule={async ({ enabled, turnId, resetsAt, kind }) => {
+                await sendConversationCommand(conversation.view!.thread.thread_id, "conversation.thread.quota_resume",
+                  enabled ? { enabled, turn_id: turnId, resets_at: resetsAt, kind } : { enabled });
+              }}
+            />
             <ConversationQueue
               key={commandScope}
                   threadId={conversation.view.thread.thread_id}
@@ -4075,6 +4309,12 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
                     )}
                   >
                     对话已归档，发送已禁用；草稿仍保留。
+                  </Callout>
+                ) : null}
+                {!running && backgroundTurnId ? (
+                  <Callout role="status" tone="warning" icon="clock" className="mb-2" testId="native-background-work"
+                    action={<Button size="xs" variant="secondary" onClick={handleStop} disabled={interactionBusy}>停止后台任务</Button>}>
+                    子任务仍在后台运行，完成后会自动续接回复。
                   </Callout>
                 ) : null}
                 <PromptBar
@@ -4119,6 +4359,8 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
                     else if (action.startsWith("ui:")) void handleClientCommand(action, "", sourceDocument);
                   }}
                   {...stashRecallProps}
+                  compact={composerCompact}
+                  onRequestExpand={() => handleComposerCompactChange(false)}
                   extraControls={
                     <div className="flex min-w-0 flex-1 items-center gap-1">
                       <ConversationModelPicker
@@ -4126,8 +4368,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
                         selectedCredentialId={credentialId}
                         selectedModel={model}
                         selectedEffort={effort}
-                        selectedAccessMode={accessMode}
-                        accessModes={accessModes}
+                        selectedServiceTier={serviceTier}
                         loading={credentialSource.phase === "loading"}
                         error={credentialsErrorText}
                         onRetry={() => void reloadReadiness({ fresh: true })}
@@ -4137,6 +4378,22 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
                         onRuntimeChange={handleRuntimeChange}
                         open={modelPickerOpen}
                         onOpenChange={setModelPickerOpen}
+                      />
+                    </div>
+                  }
+                  contextMeter={
+                    <div className="flex min-w-0 items-center gap-0.5">
+                      <ConversationComposerModes
+                        selectedCredentialId={credentialId}
+                        selectedModel={model}
+                        selectedAccessMode={accessMode}
+                        accessModes={accessModes}
+                        accessModeReason={accessModeReason}
+                        interactionMode={interactionMode}
+                        planModeAvailable={planModeSupport.available}
+                        planModeReason={planModeSupport.reason}
+                        onInteractionModeChange={handleInteractionModeChange}
+                        onSelect={handleSelectModelParams}
                       />
                       {/* C36: speech-to-text mic button */}
                       {(
@@ -4154,7 +4411,6 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
                           }
                           onClick={() => speech.state === "listening" && desktopChatBridge() ? void speech.finish() : ["listening", "requesting", "processing"].includes(speech.state) ? speech.cancel() : void speech.start()}
                           className={cn(
-                            "ml-auto",
                             speech.state === "listening" && "bg-cx-danger-soft text-cx-danger hover:text-cx-danger animate-pulse",
                             speech.state === "error" && "text-cx-warning hover:text-cx-warning",
                           )}
@@ -4198,30 +4454,32 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
                         variant="ring"
                         threadId={threadId}
                         contextWindow={conversation.view.context_window}
-                        compactionSupported={Boolean(conversation.view.runtime_connection?.capabilities?.compaction)}
+                        compactionSupported={capabilitiesFor(descriptors, viewRuntimeKey)?.compaction === true}
                         onRefresh={() => void conversation.refresh()}
                       />
                     </>
                   )}
                 />
-                {!hasWorkspace ? (
+                {!hasWorkspace && !unboundNoticeDismissed.has(threadId) ? (
                   <Callout
                     tone="warning"
                     className="mt-2"
                     testId="unbound-workspace-recovery"
                     role="status"
+                    onDismiss={() => setUnboundNoticeDismissed((current) => new Set(current).add(threadId))}
                     action={(
                       <Button
                         size="xs"
                         variant="secondary"
                         data-testid="unbound-workspace-new-chat"
+                        title="已开始的会话不能补绑目录，请新建会话并先选择目录"
                         onClick={() => startNewChat()}
                       >
                         新建会话
                       </Button>
                     )}
                   >
-                    当前会话未绑定工作目录，文件/终端/变更不可用。运行中的会话不能补绑目录，请新建会话并先选择目录。
+                    未绑定工作目录，文件、终端和变更不可用。
                   </Callout>
                 ) : null}
               </div>
@@ -4250,13 +4508,14 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
           sidebarWidth={mainLeft}
           onOpenDetails={openDetails}
           onCiteToComposer={(excerpt) => {
-            setPrompt((current) => (current.trim() ? `${current.trimEnd()}\n\n${excerpt}` : excerpt));
-            setPromptDocument((current) => {
-              const currentText = flattenPromptDocument(current).trimEnd();
-              const next = currentText ? `${currentText}\n\n${excerpt}` : excerpt;
-              return documentFromPromptAndRefs(next, refsFromDocument(current));
-            });
+            appendComposerText(excerpt);
             toast({ title: "已引用到输入框", tone: "success", duration: 1800 });
+          }}
+          onAttachToComposer={({ text, files, send }) => {
+            appendComposerText(text);
+            if (files.length) handleAddFiles(files);
+            if (send) setAttachSendNonce((value) => value + 1);
+            else toast({ title: "已加入输入框", tone: "success", duration: 1800 });
           }}
           onDiffAnnotationSend={handleDiffAnnotationSend}
         />
@@ -4350,6 +4609,8 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         preview={impactPreview}
         loading={impactLoading || busy}
         editedText={impactEditedText}
+        fileMode={impactFileMode}
+        onFileModeChange={setImpactFileMode}
         onEditedTextChange={(text) => { setImpactEditedText(text); const owner = impactOwnerRef.current; if (owner?.scope === conversationStorageScope()) writeEditBuffer(owner.threadId, owner.turnId, text); }}
         rewindDisabled={rewindDisabled}
         rewindReason={rewindReason}
@@ -4392,14 +4653,14 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
                 {lines.length ? (
                   <ul className="mt-1 flex flex-col gap-0.5">
                     {lines.map((line) => (
-                      <li key={line} className="flex items-center gap-2 text-[12.5px] text-cx-fg-3">
+                      <li key={line} className="flex items-center gap-2 text-[13px] text-cx-fg-3">
                         <span className="size-1 shrink-0 rounded-full bg-cx-warning" />
                         {line}
                       </li>
                     ))}
                   </ul>
                 ) : (
-                  <p className="mt-0.5 text-[12.5px] text-cx-fg-3">空闲，可安全归档</p>
+                  <p className="mt-0.5 text-[13px] text-cx-fg-3">空闲，可安全归档</p>
                 )}
               </li>
             );
@@ -4426,12 +4687,12 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         <div className="grid gap-2">
           <div className="rounded-xl border border-cx-border-subtle px-3 py-2.5">
             <p className="text-[13px] font-medium text-cx-fg">保留为文本</p>
-            <p className="text-[12.5px] text-cx-fg-3">全部内容插入输入框，保留完整换行。</p>
+            <p className="text-[13px] text-cx-fg-3">全部内容插入输入框，保留完整换行。</p>
           </div>
           <details className="rounded-xl border border-cx-border-subtle p-3"><summary>查看完整粘贴内容</summary><pre className="mt-2 max-h-64 select-text overflow-auto whitespace-pre-wrap break-words text-xs">{largePasteText}</pre><Button size="sm" variant="secondary" onClick={() => { if (largePasteText !== null) void copyToClipboard(largePasteText).then((copied) => copied ? setNotice("完整粘贴内容已复制", "success") : setError("复制失败，请展开完整正文后手动选择复制")); }}>复制全部内容</Button></details>
           <div className="rounded-xl border border-cx-accent-line bg-cx-accent-soft px-3 py-2.5">
             <p className="text-[13px] font-medium text-cx-fg">转为附件（推荐）</p>
-            <p className="text-[12.5px] text-cx-fg-3">完整内容保存为 .txt 附件，原文不截断。</p>
+            <p className="text-[13px] text-cx-fg-3">完整内容保存为 .txt 附件，原文不截断。</p>
           </div>
         </div>
       </Dialog>
@@ -4463,6 +4724,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     />
     <Toaster />
     </>
+    </ThreadEditorProvider>
     </ConversationNavigationContext.Provider>
   );
 }

@@ -1,8 +1,7 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import { Button, Checkbox, Input, ListBox, ListBoxItem, Select } from "@heroui/react";
-import type { CSSProperties } from "react";
 import type { ContributionField, JsonSchemaSubset } from "./types";
 
 /**
@@ -16,19 +15,6 @@ import type { ContributionField, JsonSchemaSubset } from "./types";
  *
  * 都只渲染宿主内置控件（input/select/checkbox），不执行扩展提供的任何代码。
  */
-
-const row: CSSProperties = { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" };
-const muted: CSSProperties = { color: "var(--muted)", fontSize: 12 };
-const input: CSSProperties = {
-  height: 30,
-  padding: "0 10px",
-  border: "1px solid var(--line2)",
-  borderRadius: 8,
-  background: "var(--panel2)",
-  color: "var(--bright)",
-  fontSize: 12,
-  minWidth: 0,
-};
 
 function coerce(raw: string, type: string | undefined): unknown {
   if (type === "integer") {
@@ -62,29 +48,27 @@ function FieldEditor({
   value: unknown;
   onChange: (value: unknown) => void;
 }) {
+  const id = useId();
+  const caption = <>{label}{required ? " *" : ""}</>;
   if (type === "boolean") {
     return (
-      <div style={muted}>
+      <div className="cx-uic-field is-check">
         <Checkbox isSelected={value === true} onChange={onChange}>
-          <Checkbox.Content><Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>{label}{required ? " *" : ""}</Checkbox.Content>
+          <Checkbox.Content><Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>{caption}</Checkbox.Content>
         </Checkbox>
       </div>
     );
   }
   if (Array.isArray(enumValues) && enumValues.length) {
     return (
-      <>
-        <label style={muted}>
-          {label}
-          {required ? " *" : ""}
-        </label>
+      <div className="cx-uic-field">
+        <span className="cx-uic-field-label" id={id}>{caption}</span>
         <Select
-          aria-label={label}
+          aria-labelledby={id}
           selectedKey={value === undefined || value === null ? "" : String(value)}
           onSelectionChange={(key) => onChange(String(key ?? "") === "" ? undefined : coerce(String(key), type))}
-          style={input}
         >
-          <Select.Trigger><Select.Value /></Select.Trigger>
+          <Select.Trigger><Select.Value /><Select.Indicator /></Select.Trigger>
           <Select.Popover><ListBox>
             <ListBoxItem id="">（未设置）</ListBoxItem>
             {enumValues.map((v) => (
@@ -92,22 +76,19 @@ function FieldEditor({
             ))}
           </ListBox></Select.Popover>
         </Select>
-      </>
+      </div>
     );
   }
   return (
-    <>
-      <label style={muted}>
-        {label}
-        {required ? " *" : ""}
-      </label>
+    <div className="cx-uic-field">
+      <label className="cx-uic-field-label" htmlFor={id}>{caption}</label>
       <Input
-        style={{ ...input, flex: 1 }}
+        id={id}
         placeholder={placeholder ?? name}
         value={value === undefined || value === null ? "" : String(value)}
         onChange={(e) => onChange(e.target.value === "" ? undefined : coerce(e.target.value, type))}
       />
-    </>
+    </div>
   );
 }
 
@@ -130,14 +111,15 @@ export function SchemaForm({
     [schema],
   );
   if (!properties.length) {
-    return <div style={muted}>该扩展未声明可配置项。</div>;
+    return <p className="cx-uic-muted">该扩展未声明可配置项。</p>;
   }
   const required = new Set(schema.required ?? []);
   return (
-    <div style={{ display: "grid", gap: 8 }}>
-      {properties.map(([name, sub]) => (
-        <div key={name} style={row}>
+    <div className="cx-uic-form">
+      <div className="cx-uic-fields">
+        {properties.map(([name, sub]) => (
           <FieldEditor
+            key={name}
             name={name}
             label={name}
             type={typeof sub.type === "string" ? sub.type : undefined}
@@ -153,25 +135,10 @@ export function SchemaForm({
               })
             }
           />
-        </div>
-      ))}
-      <div style={row}>
-        <Button
-          type="button"
-          style={{
-            height: 30,
-            padding: "0 12px",
-            border: "1px solid color-mix(in srgb, var(--blue) 50%, var(--line2))",
-            borderRadius: 8,
-            background: "color-mix(in srgb, var(--blue) 14%, var(--panel))",
-            color: "var(--bright)",
-            fontSize: 12,
-            fontWeight: 650,
-            cursor: "pointer",
-          }}
-          isDisabled={busy}
-          onClick={() => onSubmit(values)}
-        >
+        ))}
+      </div>
+      <div className="cx-uic-actions">
+        <Button type="button" className="cx-uic-submit" isDisabled={busy} onClick={() => onSubmit(values)}>
           {busy ? "提交中…" : submitLabel}
         </Button>
       </div>
@@ -201,8 +168,8 @@ export function FieldListForm({
     (f) => f.required && (values[f.name] === undefined || values[f.name] === ""),
   );
   return (
-    <div style={{ display: "grid", gap: 8 }}>
-      <div style={row}>
+    <div className="cx-uic-form">
+      <div className="cx-uic-fields">
         {fields.map((f) => (
           <FieldEditor
             key={f.name}
@@ -223,22 +190,9 @@ export function FieldListForm({
             }
           />
         ))}
-        <Button
-          type="button"
-          style={{
-            height: 30,
-            padding: "0 12px",
-            border: "1px solid color-mix(in srgb, var(--blue) 50%, var(--line2))",
-            borderRadius: 8,
-            background: "color-mix(in srgb, var(--blue) 14%, var(--panel))",
-            color: "var(--bright)",
-            fontSize: 12,
-            fontWeight: 650,
-            cursor: "pointer",
-          }}
-          isDisabled={busy || missing}
-          onClick={() => onSubmit(values)}
-        >
+      </div>
+      <div className="cx-uic-actions">
+        <Button type="button" className="cx-uic-submit" isDisabled={busy || missing} onClick={() => onSubmit(values)}>
           {busy ? "执行中…" : submitLabel}
         </Button>
       </div>

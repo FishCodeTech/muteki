@@ -21,12 +21,18 @@ from __future__ import annotations
 
 from typing import Any
 
+from muteki.extensions.host import ExtensionProcessError
 from muteki.extensions.installer import Source
 from muteki.extensions.manifest import (
     SchemaValidationError,
     validate_against_schema,
 )
 from muteki.extensions.permissions import PermissionChecker, PermissionDenied
+from muteki.extensions.protocol import (
+    ExtensionRpcError,
+    ExtensionUnavailable,
+    ProtocolError,
+)
 from muteki.extensions.registry import (
     ExtensionError,
     ExtensionService,
@@ -48,6 +54,15 @@ from muteki.platform.contracts.receipts import (
     CommandReceipt,
     ReceiptState,
 )
+
+#: 查询路径上 ExtensionError.code → 错误分类（未列出的按状态错误处理）。
+_QUERY_ERROR_CATEGORIES = {
+    "extension.not_found": ErrorCategory.NOT_FOUND,
+    "extension.not_running": ErrorCategory.STATE,
+}
+
+#: JSON-RPC 标准错误码中属于请求本身有误的部分（method / params）。
+_RPC_REQUEST_ERROR_CODES = frozenset({-32601, -32602})
 
 #: 生命周期事件生产者（内置领域模块命名风格）。
 PRODUCER = "builtin.extensions"
@@ -373,18 +388,42 @@ class ExtensionQueryHandler:
                 "extension.id_required",
                 f"{qt} requires params.extension_id",
                 ErrorCategory.VALIDATION, correlation_id=query.query_id))
-        elif qt == "extension.get":
-            record = self._service.get_record(ext_id)
-            result = (record.model_dump(mode="json") if record is not None else None)
-        elif qt == "extension.health":
-            result = await self._service.health(ext_id)
-        elif qt == "extension.projection":
-            result = await self._service.read_projection(
-                ext_id, str(params.get("name") or ""))
-        else:  # extension.logs
-            result = {"lines": self._service.logs(
-                ext_id, limit=int(params.get("limit") or 200))}
+        else:
+            try:
+                result = await self._read(qt, ext_id, params)
+            except ExtensionError as exc:
+                raise CommandFailed(make_error(
+                    exc.code, exc.message, _QUERY_ERROR_CATEGORIES.get(
+                        exc.code, ErrorCategory.STATE),
+                    correlation_id=query.query_id)) from exc
+            except ExtensionRpcError as exc:
+                # The extension rejected or failed the read; report its own
+                # message instead of surfacing an unhandled 500.
+                raise CommandFailed(make_error(
+                    "extension.rpc_error",
+                    f"{ext_id} {qt}: {exc.message}",
+                    ErrorCategory.VALIDATION
+                    if exc.code in _RPC_REQUEST_ERROR_CODES
+                    else ErrorCategory.RUNTIME,
+                    correlation_id=query.query_id)) from exc
+            except (ExtensionProcessError, ExtensionUnavailable, ProtocolError) as exc:
+                raise CommandFailed(make_error(
+                    "extension.process_unavailable", f"{ext_id} {qt}: {exc}",
+                    ErrorCategory.RUNTIME, correlation_id=query.query_id,
+                    retryable=True)) from exc
         return QueryResult(query_id=query.query_id, query_type=qt, result=result)
+
+    async def _read(self, qt: str, ext_id: str, params: dict[str, Any]) -> Any:
+        if qt == "extension.get":
+            record = self._service.get_record(ext_id)
+            return record.model_dump(mode="json") if record is not None else None
+        if qt == "extension.health":
+            return await self._service.health(ext_id)
+        if qt == "extension.projection":
+            return await self._service.read_projection(
+                ext_id, str(params.get("name") or ""))
+        return {"lines": self._service.logs(
+            ext_id, limit=int(params.get("limit") or 200))}
 
 
 def register_extension_handlers(api: Any, service: ExtensionService) -> None:
