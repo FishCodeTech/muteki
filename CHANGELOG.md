@@ -22,6 +22,7 @@ All notable public release changes are tracked here.
 - Fixed the Web interface freezing while deleting an Agent credential and detaching its conversation and Worker references, as reported with Ubuntu container deployments ([#199](https://github.com/FishCodeTech/muteki/issues/199)).
 - Fixed desktop notification ownership, permission persistence, foreground read tracking, and controlled overlay interactions.
 - Fixed Worker settings navigation, stale draft runtime panels, local directory error feedback, and findings counts for older penetration-testing reports.
+- Kept a compatible ONNX Runtime version for Intel macOS so the bundled Python environment installs and loads Magika correctly; other platforms retain their existing runtime version.
 
 ### Upgrade
 
