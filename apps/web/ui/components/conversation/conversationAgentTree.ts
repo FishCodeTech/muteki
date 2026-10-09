@@ -21,20 +21,44 @@ export type ConversationAgentStatus =
   | "completed"
   | "failed"
   | "cancelled"
-  | "declined";
+  | "declined"
+  | "interrupted";
 
 export interface ConversationAgentNodeView {
   agentId: string;
   parentId?: string | null;
   title: string;
+  nickname?: string | null;
+  role?: string | null;
   model?: string | null;
   turnId?: string | null;
   messageId?: string | null;
   callId?: string | null;
+  sessionRef?: string | null;
   status: ConversationAgentStatus | string;
   request?: string | null;
   result?: string | null;
   error?: string | null;
+  activity?: string | null;
+  toolUses?: number | null;
+  totalTokens?: number | null;
+  durationMs?: number | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  /** provider_native (default) | app_owned (Muteki subagent Thread). */
+  origin?: string;
+  /** app_owned: the child conversation Thread; open it to inspect the run. */
+  childThreadId?: string | null;
+  /** app_owned: lineage depth (direct children of the viewed Thread are 1). */
+  lineageDepth?: number | null;
+  adapterId?: string | null;
+  accessMode?: string | null;
+  isolation?: string | null;
+  worktreePath?: string | null;
+  worktreeState?: string | null;
+  spawnState?: string | null;
+  cancelRequested?: boolean;
+  errorCode?: string | null;
   depth: number;
   children: ConversationAgentNodeView[];
 }
@@ -87,8 +111,15 @@ export function isShellLikeTool(record: ConversationToolRecord): boolean {
 }
 
 export function isDelegationTool(record: ConversationToolRecord): boolean {
+  if (record.isAgent) return true;
   if (isShellLikeTool(record)) return false;
   const name = normalizeToolName(record.name || "");
+  // Muteki task CRUD is resource access. Only its worker-spawn tool delegates.
+  // MCP adapters may prefix the tool with a server namespace separated by __.
+  const toolName = name.split("__").at(-1) || name;
+  if (toolName.startsWith("muteki_")) {
+    return toolName === "muteki_spawn_run_worker";
+  }
   if (
     DELEGATION_NAME_MARKERS.some(
       (marker) =>
@@ -100,8 +131,7 @@ export function isDelegationTool(record: ConversationToolRecord): boolean {
   ) {
     return true;
   }
-  if (record.parentId && record.isAgent) return true;
-  return Boolean(record.isAgent);
+  return false;
 }
 
 function parseArgsRecord(value: string): Record<string, unknown> {
@@ -182,6 +212,8 @@ export function agentsFromTools(
       request: requestFromTool(tool) || null,
       result: tool.error || tool.outputSummary || null,
       error: tool.error || null,
+      durationMs: tool.durationMs || null,
+      startedAt: tool.occurredAt || null,
       depth: 0,
       children: [] as ConversationAgentNodeView[],
     };
@@ -231,14 +263,23 @@ function snapshotToTree(
     agentId: agent.agent_id,
     parentId: agent.parent_id ?? null,
     title: agent.title || agent.agent_id,
+    nickname: agent.nickname,
+    role: agent.role,
     model: agent.model,
     turnId: agent.turn_id,
     messageId: agent.message_id,
     callId: agent.call_id,
+    sessionRef: agent.session_ref,
     status: agent.status,
     request: agent.request,
     result: agent.result || agent.error,
     error: agent.error,
+    activity: agent.activity,
+    toolUses: agent.tool_uses,
+    totalTokens: agent.total_tokens,
+    durationMs: agent.duration_ms,
+    startedAt: agent.started_at,
+    completedAt: agent.completed_at,
     depth: 0,
     children: [] as ConversationAgentNodeView[],
   }));
@@ -272,9 +313,47 @@ export function summarizeToolActivity(
   return parts.join(" · ");
 }
 
+/** app_owned subagent Threads (ThreadState.subagents) as tree roots. */
+function appOwnedSubagentRoots(view?: ConversationView | null): ConversationAgentNodeView[] {
+  const nodes = view?.state?.subagents || [];
+  return nodes.map((node) => ({
+    agentId: node.agent_id,
+    parentId: null,
+    title: node.title || node.agent_id,
+    nickname: node.nickname,
+    role: node.role,
+    model: node.model,
+    turnId: node.turn_id,
+    messageId: node.message_id,
+    callId: node.call_id,
+    sessionRef: node.session_ref,
+    status: node.status,
+    request: node.request,
+    result: node.result || node.error,
+    error: node.error,
+    startedAt: node.started_at,
+    completedAt: node.completed_at,
+    origin: node.origin || "app_owned",
+    childThreadId: node.thread_id || node.agent_id,
+    lineageDepth: node.depth ?? null,
+    adapterId: node.adapter_id,
+    accessMode: node.access_mode,
+    isolation: node.isolation,
+    worktreePath: node.worktree_path,
+    worktreeState: node.worktree_state,
+    spawnState: node.spawn_state,
+    cancelRequested: Boolean(node.cancel_requested),
+    errorCode: node.error_code,
+    depth: 0,
+    children: [] as ConversationAgentNodeView[],
+  }));
+}
+
 /**
  * Prefer durable ThreadState.agents when present; otherwise derive from
  * delegation tool events. Never invent agent counts from ordinary tools.
+ * Muteki-owned subagent Threads (ThreadState.subagents) always merge in as
+ * additional roots alongside the provider-native tree.
  */
 export function buildConversationAgentTree(
   events: ConversationEvent[],
@@ -284,6 +363,7 @@ export function buildConversationAgentTree(
   const turnStatusById = Object.fromEntries(
     (view?.turns || []).map((turn) => [turn.turn_id, turn.status]),
   );
+  const appRoots = appOwnedSubagentRoots(view);
 
   if (snapshot && (snapshot.agents?.length || snapshot.unsupported)) {
     const tree = snapshotToTree(snapshot);
@@ -291,11 +371,15 @@ export function buildConversationAgentTree(
       const tools = collectConversationTools(events, turnStatusById);
       tree.toolActivitySummary = summarizeToolActivity(tools);
     }
+    if (appRoots.length) {
+      tree.roots = [...tree.roots, ...appRoots];
+      tree.agents = [...tree.agents, ...appRoots];
+    }
     return tree;
   }
 
   const tools = collectConversationTools(events, turnStatusById);
-  const roots = agentsFromTools(tools);
+  const roots = [...agentsFromTools(tools), ...appRoots];
   const agents = flattenAgents(roots);
   return {
     agents,
@@ -324,7 +408,96 @@ export function agentStatusLabel(status: string): string {
       return "已取消";
     case "declined":
       return "已拒绝";
+    case "interrupted":
+      return "已中断";
     default:
       return status || "未知";
   }
+}
+
+export function agentOriginLabel(agent: ConversationAgentNodeView): string {
+  return agent.origin === "app_owned" ? "Muteki" : "引擎";
+}
+
+export function worktreeStateLabel(state?: string | null): string {
+  switch (state) {
+    case "active":
+      return "worktree 使用中";
+    case "removed":
+      return "worktree 已清理";
+    case "retained":
+      return "worktree 已保留（有未提交改动）";
+    default:
+      return state || "";
+  }
+}
+
+export function agentDisplayName(agent: ConversationAgentNodeView): string {
+  return (agent.nickname || agent.title || agent.role || agent.agentId).trim();
+}
+
+const AGENT_TERMINAL = new Set(["completed", "failed", "cancelled", "declined", "interrupted"]);
+
+export function isAgentTerminal(status: string): boolean {
+  return AGENT_TERMINAL.has(status);
+}
+
+export interface AgentStatusCounts {
+  total: number;
+  running: number;
+  pending: number;
+  completed: number;
+  failed: number;
+  cancelled: number;
+}
+
+export function countAgentStatuses(agents: ConversationAgentNodeView[]): AgentStatusCounts {
+  const counts: AgentStatusCounts = { total: agents.length, running: 0, pending: 0, completed: 0, failed: 0, cancelled: 0 };
+  for (const agent of agents) {
+    const status = String(agent.status);
+    if (status === "running") counts.running += 1;
+    else if (status === "pending") counts.pending += 1;
+    else if (status === "completed") counts.completed += 1;
+    else if (status === "failed") counts.failed += 1;
+    else counts.cancelled += 1;
+  }
+  return counts;
+}
+
+/** "2 个运行中 · 11 个完成" — only non-zero buckets, active first. */
+export function formatAgentCounts(counts: AgentStatusCounts): string {
+  const parts: string[] = [];
+  if (counts.running) parts.push(`${counts.running} 个运行中`);
+  if (counts.pending) parts.push(`${counts.pending} 个等待中`);
+  if (counts.completed) parts.push(`${counts.completed} 个完成`);
+  if (counts.failed) parts.push(`${counts.failed} 个异常`);
+  if (counts.cancelled) parts.push(`${counts.cancelled} 个已停止`);
+  return parts.join(" · ");
+}
+
+/** Wall time for one agent: runtime-reported duration wins over timestamps. */
+export function agentDurationMs(agent: ConversationAgentNodeView, nowMs = Date.now()): number | null {
+  if (agent.durationMs != null && agent.durationMs > 0 && isAgentTerminal(String(agent.status))) {
+    return agent.durationMs;
+  }
+  const start = agent.startedAt ? Date.parse(agent.startedAt) : NaN;
+  if (!Number.isFinite(start)) return agent.durationMs ?? null;
+  const end = agent.completedAt ? Date.parse(agent.completedAt) : NaN;
+  if (Number.isFinite(end)) return Math.max(0, end - start);
+  return isAgentTerminal(String(agent.status)) ? agent.durationMs ?? null : Math.max(0, nowMs - start);
+}
+
+const AVATAR_HUES = [262, 200, 160, 28, 340, 120, 45, 300];
+
+/** Stable per-agent hue so the same subagent keeps its colour everywhere. */
+export function agentAvatarHue(agent: ConversationAgentNodeView): number {
+  const key = agent.nickname || agent.role || agent.agentId;
+  let hash = 0;
+  for (let i = 0; i < key.length; i += 1) hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
+  return AVATAR_HUES[hash % AVATAR_HUES.length]!;
+}
+
+export function agentInitial(agent: ConversationAgentNodeView): string {
+  const name = agentDisplayName(agent).replace(/^[^\p{L}\p{N}]+/u, "");
+  return (Array.from(name)[0] || "A").toUpperCase();
 }

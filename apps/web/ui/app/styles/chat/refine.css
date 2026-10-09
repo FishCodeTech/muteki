@@ -1,0 +1,23 @@
+/* /chat-only refinements. Every rule is scoped to the conversation layout so
+ * the other workspaces keep their existing rail and typography. */
+
+/* The global icon rail duplicates what the conversation sidebar footer menu
+ * already offers on desktop. Narrow screens keep it as the only entry point. */
+@media (min-width: 769px) {
+  .workspace-frame[data-conversation-layout="true"] {
+    --workspace-rail-width: 0px;
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .workspace-frame[data-conversation-layout="true"] > .workspace-activity-rail {
+    display: none;
+  }
+}
+
+/* The app-wide -0.006em tracking tightens every glyph by ~0.08px at body
+ * size, which reads as cramped for CJK and mixed text. Reading surfaces use
+ * the font's own spacing. */
+.workspace-frame[data-conversation-layout="true"],
+.ai-conv-shell,
+.cx-portal {
+  letter-spacing: 0;
+}

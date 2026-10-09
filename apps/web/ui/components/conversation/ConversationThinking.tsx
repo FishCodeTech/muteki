@@ -11,7 +11,7 @@ export interface ConversationThinkingProps {
   rows?: ThinkingRow[];
   activeLabel?: string;
   className?: string;
-  /** Rendered inside an activity rail that already draws the brain marker. */
+  /** Rendered inside an activity rail that already draws its own marker. */
   bare?: boolean;
 }
 
@@ -34,7 +34,7 @@ export function ConversationThinking({
         summary={summary}
         rows={rows}
         activeLabel={activeLabel}
-        hideIcon={bare}
+        bare={bare}
       />
     </div>
   );

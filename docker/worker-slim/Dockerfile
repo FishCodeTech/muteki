@@ -130,6 +130,23 @@ RUN curl -fsSL https://x.ai/cli/install.sh | bash -s 1.0.5 && \
     /home/kali/.grok/bin/grok --version
 USER root
 
+ARG DROID_VERSION=0.234.0
+ARG DROID_SHA256_AMD64=d3a22164b64ee9d134ed7b068833ceb38c090631d7b257ae03b3b72d9e84d257
+ARG DROID_SHA256_ARM64=9fb422a6733293120df8d8c34b1062d9acc997e6cac4c2740eb453f046f0161c
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+      amd64) droid_arch="x64"; droid_sha="$DROID_SHA256_AMD64" ;; \
+      arm64) droid_arch="arm64"; droid_sha="$DROID_SHA256_ARM64" ;; \
+      *) echo "unsupported Droid architecture: $TARGETARCH" >&2; exit 2 ;; \
+    esac && \
+    curl -fsSL --retry 8 --retry-all-errors \
+      -o /tmp/droid \
+      "https://downloads.factory.ai/factory-cli/releases/${DROID_VERSION}/linux/${droid_arch}/droid" && \
+    echo "${droid_sha}  /tmp/droid" | sha256sum -c - && \
+    install -m 0755 /tmp/droid /usr/local/bin/droid && \
+    rm -f /tmp/droid && \
+    droid --version
+
 # 5) Runtime Agent (Go supervisor) — cross-compiled static binary, COPY'd in.
 #    build.sh and release-images.yml name it by the target architecture so one
 #    Dockerfile can build amd64 and arm64 without copying the wrong executable.

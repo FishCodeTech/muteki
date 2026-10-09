@@ -1,14 +1,17 @@
-"""Command policy for the eight chat transports.
+"""Command policy for the chat transports.
 
 Native catalogs remain authoritative for executable prompts. Client commands
 reuse Muteki's existing controls; terminal commands never become model prompts.
 Protocol operations are supplied by each adapter after opening its session.
+The per-engine catalog comes from the provider descriptors; engines without a
+declared catalog get no client or terminal-only rows.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
 
+from .descriptors import all_descriptors
 from .runtime_capabilities import RuntimeCapabilityItem
 
 
@@ -19,30 +22,14 @@ class CommandProvider:
     terminal_only: tuple[str, ...]
 
 
-_COMMON = {
-    "undo": "rewind", "rewind": "rewind",
-    "help": "help", "model": "model", "rename": "rename",
-    "resume": "sessions", "fork": "fork", "export": "export",
-    "status": "status", "permissions": "permissions",
-    "skills": "skills", "plugins": "plugins", "mcp": "mcp",
-}
-PROVIDERS = {
-    "claude": CommandProvider("claude", {**_COMMON, "effort": "effort", "cost": "status", "copy": "copy", "rewind": "rewind"},
-                              ("vim", "terminal-setup", "theme", "keybindings", "voice", "exit", "quit", "login", "logout")),
-    "codex": CommandProvider("codex", {**_COMMON, "approvals": "permissions", "diff": "diff", "undo": "rewind"},
-                             ("theme", "statusline", "terminal-setup", "quit", "exit", "logout", "login")),
-    "cursor": CommandProvider("cursor", {**_COMMON, "new-chat": "new", "newchat": "new", "rewind": "rewind", "about": "status", "copy": "copy"},
-                              ("vim", "line-numbers", "show-thinking", "status-indicators", "setup-terminal", "quit", "exit", "open", "cursor", "update", "login", "logout", "summarize", "compress", "shell", "sh", "run", "feedback", "config", "sandbox", "max-mode", "goal", "debug")),
-    "pi": CommandProvider("pi", {**_COMMON, "name": "rename", "thinking": "effort", "clone": "fork", "copy": "copy"},
-                          ("settings", "hotkeys", "scoped-models", "trust", "login", "logout", "quit", "share", "bug", "reload", "changelog", "import")),
-    "omp": CommandProvider("omp", {**_COMMON, "models": "model", "thinking": "effort", "branch": "fork", "copy": "copy"},
-                           ("settings", "hotkeys", "login", "logout", "quit", "theme")),
-    "kimi": CommandProvider("kimi", {**_COMMON, "sessions": "sessions", "branch": "fork", "reset": "new", "yolo": "permissions"},
-                            ("login", "logout", "provider", "theme", "editor", "quit", "exit", "update", "setup")),
-    "grok": CommandProvider("grok", {**_COMMON, "always-approve": "permissions"},
-                            ("login", "logout", "quit", "exit", "theme")),
-    "opencode": CommandProvider("opencode", {**_COMMON, "models": "model", "sessions": "sessions", "continue": "sessions", "undo": "rewind", "details": "details"},
-                                ("connect", "editor", "exit", "quit", "q", "theme", "themes")),
+PROVIDERS: dict[str, CommandProvider] = {
+    descriptor.engine: CommandProvider(
+        descriptor.engine,
+        dict(descriptor.commands.client_aliases),
+        tuple(descriptor.commands.terminal_only or ()),
+    )
+    for descriptor in all_descriptors()
+    if descriptor.commands.defined
 }
 _DESCRIPTIONS = {
     "skills": "查看当前引擎的 Skills", "plugins": "管理 Muteki 聊天扩展", "mcp": "查看当前引擎的 MCP",

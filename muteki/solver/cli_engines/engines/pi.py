@@ -358,7 +358,9 @@ class PiDriver(PiLikeDriver):
 
     def _permission_flags(self, launch: LaunchContext) -> list[str]:
         self.validate_launch_context(launch)
-        # Do not pass --approve: unsupported on pi 0.73.1 (chat send path).
-        # Project skills/extensions, when needed, are loaded via explicit
-        # --extension / --skill rather than project-trust override.
+        # Pi has no per-tool approval switch. -p already runs the full tool
+        # set. --approve trusts project-local files for that worker run.
+        # Chat does not use this driver.
+        if not launch.interactive:
+            return ["--approve"]
         return []

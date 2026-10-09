@@ -16,11 +16,16 @@ import {
   upsertConversationThread,
 } from "./conversationInbox";
 import { countThreadAttention } from "./threadAttention";
-import type { ConversationInboxEvent } from "./threadNotifications";
+import { readNotificationInboxCursor, writeNotificationInboxCursor, recoverNotificationInboxSnapshot, emptyNotificationInboxCursor } from "./notificationInboxCursor";
+import type { ConversationInboxEvent, ThreadAttentionSummary } from "./threadNotifications";
 import { API, apiFetch } from "./useRun";
+import { apiRequestUrl, currentAuthGeneration, currentAuthScope, currentServiceOrigin } from "./serviceAuth";
+import { desktopChatBridge, type DesktopNativeState } from "./desktopChatBridge";
+import { browserControlHost, handleBrowserRequest } from "./browserControl";
 import { recordTaskReceipt } from "./task-center";
-import { conversationStorageScope } from "./conversationStorageScope";
+import { conversationStorageScope, subscribeConversationStorageScope } from "./conversationStorageScope";
 import { conversationCommandErrorFrom } from "./sendIntentStore";
+import { descriptorForAdapter, isKnownEngine, loadProviderDescriptors } from "./providerDescriptors";
 
 export type ThreadMode =
   | "conversation"
@@ -69,10 +74,15 @@ export interface ConversationState {
   pending_user_input?: Record<string, unknown> | null;
   plan?: ThreadPlanSnapshot | null;
   agents?: ThreadAgentTreeSnapshot | null;
+  /** Set only on Threads spawned by conversation.subagent.spawn. */
+  lineage?: ThreadLineage | null;
+  /** Direct app_owned subagent children of this Thread. */
+  subagents?: ConversationAgentNode[];
   usage?: Record<string, unknown>;
   last_error?: Record<string, unknown>;
   unread?: boolean;
   head_stream_seq?: number;
+  attention_stream_seq?: number;
   read_stream_seq?: number;
   current_generation?: number;
   queue_count?: number;
@@ -80,6 +90,10 @@ export interface ConversationState {
   queue_pause_reason?: string;
   queue_revision?: number;
   queue_failed_item_id?: string | null;
+  /** Server-side resume scheduled for after a provider quota reset (Unix seconds). */
+  quota_resume?: { turn_id: string; resets_at: number; resume_at: number; kind?: string; scheduled_at?: number } | null;
+  /** Latest engine rate-limit hold; `handled` once a schedule decision was made for it. */
+  quota_hold?: { turn_id: string; resets_at: number; kind?: string; handled?: boolean } | null;
 }
 
 export interface ConversationMessage {
@@ -136,7 +150,11 @@ export interface ConversationTurn {
   text: string;
   attachments?: string[];
   capability_refs?: Array<Record<string, unknown>>;
-  runtime_snapshot?: { adapter_id?: string; instance_id?: string; credential_id?: string; model?: string; effort?: string; access_mode?: string } | null;
+  runtime_snapshot?: { adapter_id?: string; instance_id?: string; credential_id?: string; model?: string; effort?: string; service_tier?: string; access_mode?: string; interaction_mode?: string } | null;
+  /** "plan" turns were sent in planning mode. */
+  interaction_mode?: string;
+  /** Terminal verdict about the native session: reusable | needs_restart | closed. */
+  thread_disposition?: string;
   retry_of_turn_id?: string | null;
   error?: Record<string, unknown>;
   usage?: Record<string, unknown>;
@@ -202,6 +220,8 @@ export interface ThreadPlanSnapshot {
   pending_amendment?: Record<string, unknown> | null;
   last_change_summary?: string | null;
   unsupported_reason?: string | null;
+  /** Engine-reported plan body for a proposed plan (plan-mode turns). */
+  markdown?: string | null;
   updated_at?: string;
 }
 
@@ -209,15 +229,59 @@ export interface ConversationAgentNode {
   agent_id: string;
   parent_id?: string | null;
   title: string;
+  nickname?: string | null;
+  role?: string | null;
   model?: string | null;
   turn_id?: string | null;
   message_id?: string | null;
   call_id?: string | null;
+  session_ref?: string | null;
   status: string;
   request?: string | null;
   result?: string | null;
   error?: string | null;
+  activity?: string | null;
+  tool_uses?: number | null;
+  total_tokens?: number | null;
+  duration_ms?: number | null;
+  started_at?: string | null;
+  completed_at?: string | null;
   updated_at?: string;
+  /** provider_native: reported by the Runtime; app_owned: a Muteki subagent Thread. */
+  origin?: "provider_native" | "app_owned" | string;
+  /** app_owned: the child conversation Thread (also the stable subagent id). */
+  thread_id?: string | null;
+  child_turn_id?: string | null;
+  /** app_owned: lineage depth (root Thread = 0, its children = 1). */
+  depth?: number | null;
+  adapter_id?: string | null;
+  access_mode?: string | null;
+  /** shared | worktree */
+  isolation?: string | null;
+  workspace_id?: string | null;
+  worktree_path?: string | null;
+  /** active | removed | retained */
+  worktree_state?: string | null;
+  /** planned | workspace_ready | activated | dispatched | skipped | failed */
+  spawn_state?: string | null;
+  cancel_requested?: boolean;
+  error_code?: string | null;
+  principal_id?: string | null;
+}
+
+/** Ancestry of a Muteki-spawned (app_owned) subagent Thread. */
+export interface ThreadLineage {
+  origin?: string;
+  subagent_id?: string;
+  parent_thread_id: string;
+  parent_turn_id?: string | null;
+  root_thread_id: string;
+  /** root Thread = 0, its children = 1, grandchildren = 2. */
+  depth: number;
+  isolation?: string;
+  workspace_id?: string | null;
+  worktree_path?: string | null;
+  spawned_at?: string;
 }
 
 export interface ThreadAgentTreeSnapshot {
@@ -275,6 +339,8 @@ export interface ContextWindowState {
 
 export interface ConversationView {
   thread: Omit<ConversationThread, "state">;
+  /** Present on app_owned subagent Threads; parent_title is resolved by the API. */
+  lineage?: (ThreadLineage & { parent_title?: string | null }) | null;
   workspace?: {
     workspace_id: string;
     project_id?: string | null;
@@ -290,7 +356,10 @@ export interface ConversationView {
     credential_ref?: string;
     model?: string;
     effort?: string;
+    service_tier?: string;
     access_mode?: string;
+    /** Per-thread interaction-mode preference: default | plan. */
+    interaction_mode?: string;
     /** Legacy fields are returned only for historical threads. */
     permission_mode?: string;
     sandbox_mode?: string;
@@ -346,6 +415,7 @@ export interface ConversationView {
     capability_last_error?: string;
     capability_refresh_attempts?: number;
     capability_retry_after_seconds?: number;
+    background_turn_id?: string | null;
   };
   rewind_capability?: {
     rewind_level?: string;
@@ -426,6 +496,15 @@ export interface ConversationCredentialModel {
     kind?: string;
     source?: string;
   };
+  /** Provider-declared speed tiers (Codex model/list ``serviceTiers``). */
+  service_tiers?: ConversationServiceTier[];
+  default_service_tier?: string;
+}
+
+export interface ConversationServiceTier {
+  id: string;
+  name: string;
+  description: string;
 }
 
 /**
@@ -436,20 +515,9 @@ export interface ConversationCredentialModel {
  * accounts use ``account:<account_id>``.  Secret material is intentionally not
  * part of this browser contract.
  *
- * Conversation only selects Worker CLI engines. HTTP ``api`` endpoints and
- * empty ``unknown`` account dirs are not Agents.
+ * Conversation only selects engines with a provider descriptor. HTTP ``api``
+ * endpoints and empty ``unknown`` account dirs are not Agents.
  */
-export const CONVERSATION_WORKER_ENGINES = [
-  "codex", "claude", "cursor", "grok", "opencode", "pi", "kimi", "omp", "devin",
-] as const;
-
-export type ConversationWorkerEngine = (typeof CONVERSATION_WORKER_ENGINES)[number];
-
-const CONVERSATION_WORKER_ENGINE_SET = new Set<string>(CONVERSATION_WORKER_ENGINES);
-
-export function isConversationWorkerEngine(engine: string): boolean {
-  return CONVERSATION_WORKER_ENGINE_SET.has(engine);
-}
 
 export interface ConversationCredential {
   id: string;
@@ -987,7 +1055,7 @@ export function mergeConversationView(
 
 export async function fetchConversationView(
   threadId: string,
-  markRead = true,
+  markRead = false,
   messagesLimit = 50,
 ): Promise<ConversationView> {
   const query = new URLSearchParams({
@@ -1004,6 +1072,31 @@ export async function fetchConversationView(
   } catch (exc) {
     rethrowNetworkLoadFailure(exc);
   }
+}
+
+/** Advance the read watermark to the current stream head. */
+export async function markConversationThreadRead(threadId: string, signal?: AbortSignal): Promise<void> {
+  const query = new URLSearchParams({ mark_read: "true", messages_limit: "1" });
+  const res = await apiFetch(
+    `/api/threads/${encodeURIComponent(threadId)}?${query}`,
+    { keepalive: !signal, signal: signal ? requestSignal(signal) : undefined },
+  );
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+}
+
+function isConversationForeground(): boolean {
+  return typeof document !== "undefined"
+    && document.visibilityState === "visible"
+    && document.hasFocus();
+}
+
+function nativeThreadVisible(state: DesktopNativeState | null, threadId: string): boolean {
+  const owner = currentAuthScope();
+  return Boolean(owner && owner === conversationStorageScope()
+    && state && Number.isSafeInteger(state.connectionVersion) && (state.connectionVersion || 0) > 0
+    && state.transportOrigin === API && `${state.serviceId}:${state.identityId}` === owner
+    && Array.isArray(state.notificationVisibleThreadIds)
+    && state.notificationVisibleThreadIds.includes(threadId));
 }
 
 export async function fetchConversationMessagesPage(
@@ -1190,11 +1283,15 @@ export async function fetchRuntimeInstances(): Promise<RuntimeInstance[]> {
   }
   const body = (await res.json()) as { instances?: RuntimeInstance[] };
   const rows = body.instances ?? [];
-  // Conversation-only local engines have no Worker settings page to run their
-  // first health check. Probe a newly discovered Devin once before selection.
-  const unprobed = rows.filter((row) => (
-    row.adapter_id === "devin.acp" && row.enabled !== false && !row.health
-  ));
+  const descriptors = await loadProviderDescriptors();
+  // Host-login-only engines have no stored credential account to test from
+  // Agents settings; probe a newly discovered default adapter once before selection.
+  const unprobed = rows.filter((row) => {
+    const descriptor = descriptorForAdapter(descriptors, row.adapter_id);
+    return Boolean(descriptor?.login.system_login_only)
+      && descriptor?.identity.default_adapter_id === row.adapter_id
+      && row.enabled !== false && !row.health;
+  });
   if (unprobed.length) {
     await Promise.all(unprobed.map((row) => apiFetch(
       `/api/agent-runtimes/${encodeURIComponent(`${row.adapter_id}:${row.instance_id}`)}/probe`,
@@ -1243,6 +1340,13 @@ function credentialModels(value: unknown): ConversationCredentialModel[] {
     const reasoning = rawReasoning && typeof rawReasoning === "object"
       ? rawReasoning as Record<string, unknown>
       : null;
+    const serviceTiers = Array.isArray(record?.service_tiers)
+      ? record.service_tiers.flatMap((tier): ConversationServiceTier[] => {
+        const row = tier && typeof tier === "object" ? tier as Record<string, unknown> : null;
+        const tierId = String(row?.id ?? "").trim();
+        return tierId ? [{ id: tierId, name: String(row?.name || tierId), description: String(row?.description ?? "") }] : [];
+      })
+      : [];
     rows.push({
       id,
       label: String(record?.label ?? record?.name ?? id),
@@ -1256,6 +1360,10 @@ function credentialModels(value: unknown): ConversationCredentialModel[] {
           kind: String(reasoning.kind ?? "effort"),
           source: String(reasoning.source ?? ""),
         },
+      } : {}),
+      ...(serviceTiers.length ? {
+        service_tiers: serviceTiers,
+        default_service_tier: String(record?.default_service_tier ?? ""),
       } : {}),
     });
   }
@@ -1290,7 +1398,10 @@ function normalizeCredential(
   const discovered = new Map(credentialModels(catalog?.discovered_models).map(model => [model.id, model]));
   const enrichModels = (value: unknown) => credentialModels(value).map(model => {
     const metadata = discovered.get(model.id);
-    return metadata ? { ...model, reasoning: metadata.reasoning } : model;
+    return metadata ? {
+      ...model, reasoning: metadata.reasoning,
+      service_tiers: metadata.service_tiers, default_service_tier: metadata.default_service_tier,
+    } : model;
   });
   const models = enrichModels(row.models ?? row.available_models);
   const verifiedIds = new Set(models.map((item) => item.id));
@@ -1393,10 +1504,11 @@ export async function fetchConversationCredentials(options?: {
     throw error;
   }
   const body = (await canonical.json()) as { credentials?: unknown[] };
+  const descriptors = await loadProviderDescriptors();
   return (body.credentials ?? [])
     .map((item) => normalizeCredential(item))
     .filter((item): item is ConversationCredential => (
-      item !== null && isConversationWorkerEngine(item.engine)
+      item !== null && isKnownEngine(descriptors, item.engine)
     ));
 }
 
@@ -1508,6 +1620,15 @@ export interface ProjectGitStatus {
   occupant_thread_ids?: string[];
   branch_switch_blocked?: boolean;
   git_common_dir?: string | null;
+  changed_file_count?: number;
+  remotes?: string[];
+  /** e.g. "origin/main"; null when the branch has no upstream. */
+  upstream?: string | null;
+  /** Relative to the last fetched upstream ref; null without an upstream. */
+  ahead?: number | null;
+  behind?: number | null;
+  head_sha?: string | null;
+  head_subject?: string | null;
 }
 
 export type WorkspaceBindMode = "shared_checkout" | "existing_worktree" | "new_worktree";
@@ -1521,7 +1642,7 @@ export interface GitWorktreeRow {
   occupant_thread_ids?: string[];
 }
 
-function parseGitStatus(body: any, fallback: Partial<ProjectGitStatus> = {}): ProjectGitStatus {
+export function parseGitStatus(body: any, fallback: Partial<ProjectGitStatus> = {}): ProjectGitStatus {
   return {
     project_id: body.project_id ? String(body.project_id) : fallback.project_id,
     thread_id: body.thread_id ? String(body.thread_id) : fallback.thread_id,
@@ -1542,6 +1663,13 @@ function parseGitStatus(body: any, fallback: Partial<ProjectGitStatus> = {}): Pr
       : [],
     branch_switch_blocked: Boolean(body.branch_switch_blocked),
     git_common_dir: body.git_common_dir ? String(body.git_common_dir) : null,
+    changed_file_count: Number(body.changed_file_count || 0),
+    remotes: Array.isArray(body.remotes) ? body.remotes.map(String) : [],
+    upstream: body.upstream ? String(body.upstream) : null,
+    ahead: typeof body.ahead === "number" ? body.ahead : null,
+    behind: typeof body.behind === "number" ? body.behind : null,
+    head_sha: body.head_sha ? String(body.head_sha) : null,
+    head_subject: body.head_subject ? String(body.head_subject) : null,
   };
 }
 
@@ -1703,7 +1831,9 @@ export async function createConversationThread(
       credential_ref?: string;
       model?: string;
       effort?: string;
+      service_tier?: string;
       access_mode?: string;
+      interaction_mode?: string;
       /** Historical payload compatibility only. */
       permission_mode?: string;
       sandbox_mode?: string;
@@ -2032,12 +2162,45 @@ export interface SidebarPreferences {
   sort_mode: "updated" | "priority" | "manual";
   pinned_sort_mode: "updated" | "priority" | "manual";
   group_mode: "project" | "list";
+  /** Thread id → epoch ms when the user settled it (moved out of the active list). */
+  settled_at: Record<string, number>;
+  /** Thread id → epoch ms when a snoozed thread returns to the list. */
+  snoozed_until: Record<string, number>;
+}
+
+function normalizeTimeMap(value: unknown): Record<string, number> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const result: Record<string, number> = {};
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) result[key] = raw;
+  }
+  return result;
+}
+
+/** Older payloads predate the settle / snooze maps. */
+export function normalizeSidebarPreferences(raw: unknown): SidebarPreferences {
+  const data = (raw && typeof raw === "object" ? raw : {}) as Partial<SidebarPreferences>;
+  const list = (value: unknown) => (Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : []);
+  const mode = (value: unknown, fallback: SidebarPreferences["sort_mode"]) => (
+    value === "updated" || value === "priority" || value === "manual" ? value : fallback
+  );
+  return {
+    version: typeof data.version === "number" ? data.version : 0,
+    pinned_ids: list(data.pinned_ids),
+    thread_order: list(data.thread_order),
+    project_order: list(data.project_order),
+    sort_mode: mode(data.sort_mode, "updated"),
+    pinned_sort_mode: mode(data.pinned_sort_mode, "manual"),
+    group_mode: data.group_mode === "list" ? "list" : "project",
+    settled_at: normalizeTimeMap(data.settled_at),
+    snoozed_until: normalizeTimeMap(data.snoozed_until),
+  };
 }
 
 export async function fetchSidebarPreferences(): Promise<SidebarPreferences> {
   const res = await apiFetch("/api/sidebar-preferences");
   if (!res.ok) throw new Error(`sidebar-preferences GET failed: ${res.status}`);
-  return res.json() as Promise<SidebarPreferences>;
+  return normalizeSidebarPreferences(await res.json());
 }
 
 export async function saveSidebarPreferences(
@@ -2048,8 +2211,7 @@ export async function saveSidebarPreferences(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(prefs),
   });
-  const data = (await res.json()) as SidebarPreferences;
-  return { ok: res.ok, prefs: data };
+  return { ok: res.ok, prefs: normalizeSidebarPreferences(await res.json()) };
 }
 
 export type ConversationStreamStatus =
@@ -2060,13 +2222,22 @@ export type ConversationStreamStatus =
   | "auth_required";
 
 export function useConversationThreads(options?: {
+  enabled?: boolean;
+  cursorStorageKey?: string;
+  admissionScopeKey?: string;
+  canAdmitInboxEvent?: (cursorKey: string, admissionScopeKey: string) => boolean;
   activeThreadId?: string;
-  onInboxEvent?: (event: ConversationInboxEvent) => void;
+  onInboxEvent?: (event: ConversationInboxEvent) => void | boolean | Promise<void | boolean>;
 }) {
   const [threads, setThreads] = useState<ConversationThread[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const enabled = options?.enabled !== false;
+  const cursorStorageKey = options?.cursorStorageKey || "";
+  const admissionScopeKey = options?.admissionScopeKey || "";
   const [inboxStatus, setInboxStatus] = useState<ConversationStreamStatus>("idle");
+  const canAdmitRef = useRef(options?.canAdmitInboxEvent);
+  canAdmitRef.current = options?.canAdmitInboxEvent;
   const onInboxEventRef = useRef(options?.onInboxEvent);
   onInboxEventRef.current = options?.onInboxEvent;
   const activeThreadId = options?.activeThreadId || "";
@@ -2094,17 +2265,25 @@ export function useConversationThreads(options?: {
 
   useEffect(() => {
     listMountedRef.current = true;
-    void refresh();
+    if (enabled) void refresh();
     return () => { listMountedRef.current = false; listRequestRef.current += 1; };
-  }, [refresh]);
+  }, [refresh, enabled]);
 
   useEffect(() => {
+    if (!enabled) return;
     let cancelled = false;
     let es: EventSource | null = null;
     let reconnectDelay = 500;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let connectionVersion = 0;
-    const streamRef = { current: emptyConversationInboxState() };
+    let saved = emptyNotificationInboxCursor();
+    try { if (cursorStorageKey) saved = readNotificationInboxCursor(cursorStorageKey); }
+    catch (error) { setError(`通知游标读取失败：${String(error)}`); return; }
+    const summaries = { ...saved.summaries };
+    const streamRef = { current: { ...emptyConversationInboxState(), appliedSeq: saved.seq, brokerEpoch: saved.epoch } };
+    let processing: Promise<void> = Promise.resolve();
+    let admissionBlocked = false;
+    const saveCursor = () => { if (cursorStorageKey) writeNotificationInboxCursor(cursorStorageKey, streamRef.current, summaries); };
 
     const mintTicket = async (): Promise<
       { status: "ok"; ticket: string } | { status: "auth_required" } | { status: "empty" }
@@ -2121,8 +2300,16 @@ export function useConversationThreads(options?: {
       }
     };
 
+    const blockAdmission = (nextEs: EventSource, error: unknown) => {
+      admissionBlocked = true;
+      setError(`通知交付未完成，游标未提交：${String(error)}`);
+      nextEs.close(); if (es === nextEs) es = null;
+      setInboxStatus("reconnecting");
+      if (!cancelled && canAdmitRef.current?.(cursorStorageKey, admissionScopeKey) !== false) reconnectTimer = setTimeout(() => { reconnectTimer = null; void connect(true); }, 1000);
+    };
     const connect = async (isReconnect: boolean) => {
       const version = ++connectionVersion;
+      admissionBlocked = false;
       if (!cancelled) {
         setInboxStatus(isReconnect ? "reconnecting" : "connecting");
       }
@@ -2133,7 +2320,7 @@ export function useConversationThreads(options?: {
         return;
       }
       const ticket = ticketResult.status === "ok" ? ticketResult.ticket : "";
-      const query = new URLSearchParams({ snapshot: "true" });
+      const query = new URLSearchParams({ snapshot: streamRef.current.brokerEpoch ? "false" : "true" });
       if (streamRef.current.appliedSeq > 0) {
         query.set("after", String(streamRef.current.appliedSeq));
       }
@@ -2141,7 +2328,7 @@ export function useConversationThreads(options?: {
       if (ticket) query.set("ticket", ticket);
 
       const nextEs = new EventSource(
-        `${API}/api/threads/inbox/events?${query}`,
+        apiRequestUrl(`/api/threads/inbox/events?${query}`),
       );
       es = nextEs;
 
@@ -2163,14 +2350,18 @@ export function useConversationThreads(options?: {
         }, delay);
       };
       nextEs.addEventListener("snapshot", (raw) => {
-        if (cancelled || es !== nextEs) return;
+        if (cancelled || admissionBlocked || es !== nextEs || canAdmitRef.current?.(cursorStorageKey, admissionScopeKey) === false) return;
+        processing = processing.then(async () => {
+        if (cancelled || admissionBlocked || es !== nextEs || canAdmitRef.current?.(cursorStorageKey, admissionScopeKey) === false) return;
         try {
           const payload = JSON.parse((raw as MessageEvent).data) as {
             threads?: ConversationThread[];
             inbox_seq?: number;
             broker_epoch?: string;
+            summaries?: ThreadAttentionSummary[];
           };
           const epoch = String(payload.broker_epoch || "");
+          const previous = { seq: streamRef.current.appliedSeq, epoch: streamRef.current.brokerEpoch, summaries: { ...summaries } };
           const inboxSeq = Number(payload.inbox_seq || 0);
           if (epoch === streamRef.current.brokerEpoch && inboxSeq < streamRef.current.appliedSeq) return;
           inboxRevisionRef.current += 1;
@@ -2179,35 +2370,55 @@ export function useConversationThreads(options?: {
             setLoading(false);
             setError("");
           }
+          if (cursorStorageKey && payload.summaries) {
+            for (const event of recoverNotificationInboxSnapshot(previous, epoch, inboxSeq, payload.summaries, payload.threads || [])) {
+              if (await onInboxEventRef.current?.(event) === false) throw new Error("notification.admission_incomplete: Snapshot attention was not handed to its owner.");
+            }
+            if (cancelled || canAdmitRef.current?.(cursorStorageKey, admissionScopeKey) === false) return;
           if (epoch && epoch !== streamRef.current.brokerEpoch) streamRef.current = { ...emptyConversationInboxState(), brokerEpoch: epoch };
+            for (const key of Object.keys(summaries)) delete summaries[key];
+            for (const summary of payload.summaries) summaries[summary.thread_id] = summary;
+          }
+          if (!cursorStorageKey && epoch && epoch !== streamRef.current.brokerEpoch) streamRef.current = { ...emptyConversationInboxState(), brokerEpoch: epoch };
           if (inboxSeq > 0) {
             streamRef.current = {
               ...streamRef.current,
               appliedSeq: Math.max(streamRef.current.appliedSeq, inboxSeq),
             };
           }
-        } catch {
-          setError("对话 inbox snapshot 无法解析");
+          if (!cancelled && canAdmitRef.current?.(cursorStorageKey, admissionScopeKey) !== false) saveCursor();
+        } catch (error) {
+          blockAdmission(nextEs, error);
         }
+        });
       });
       nextEs.addEventListener("event", (raw) => {
-        if (cancelled || es !== nextEs) return;
+        if (cancelled || admissionBlocked || es !== nextEs || canAdmitRef.current?.(cursorStorageKey, admissionScopeKey) === false) return;
+        processing = processing.then(async () => {
+        if (cancelled || admissionBlocked || es !== nextEs || canAdmitRef.current?.(cursorStorageKey, admissionScopeKey) === false) return;
         try {
           const event = JSON.parse(
             (raw as MessageEvent).data,
           ) as ConversationInboxEvent & { thread?: ConversationThread };
           const result = acceptConversationInboxEvent(streamRef.current, event);
           if (!result.accepted) return;
-          streamRef.current = result.state;
+
           inboxRevisionRef.current += 1;
           if (event.thread && event.thread.thread_id) {
             setThreads((current) => upsertConversationThread(current, event.thread as ConversationThread));
           }
-          try { onInboxEventRef.current?.(event); }
-          catch (error) { setError(`待办已更新，但通知处理失败：${error instanceof Error ? error.message : String(error)}`); }
+          try {
+            if (await onInboxEventRef.current?.(event) === false) throw new Error("notification.admission_incomplete: Inbox event was not handed to its owner.");
+            if (cancelled || admissionBlocked || es !== nextEs || canAdmitRef.current?.(cursorStorageKey, admissionScopeKey) === false) return;
+            streamRef.current = result.state;
+            summaries[event.summary.thread_id] = event.summary;
+            saveCursor();
+          }
+          catch (error) { if (cursorStorageKey) blockAdmission(nextEs, error); else setError(`待办已更新，但通知处理失败：${error instanceof Error ? error.message : String(error)}`); }
         } catch {
           setError("对话 inbox 事件无法解析");
         }
+        });
       });
     };
 
@@ -2220,7 +2431,24 @@ export function useConversationThreads(options?: {
       es?.close();
       es = null;
     };
-  }, []);
+  }, [enabled, cursorStorageKey, admissionScopeKey]);
+
+  const markThreadsRead = useCallback((threadIds: string[]) => {
+    const ids = new Set(threadIds);
+    if (!ids.size) return;
+    setThreads((current) => current.map((thread) => (
+      ids.has(thread.thread_id) && thread.state.unread
+        ? { ...thread, state: { ...thread.state, unread: false, read_stream_seq: thread.state.head_stream_seq } }
+        : thread
+    )));
+    void Promise.allSettled([...ids].map((id) => markConversationThreadRead(id))).then((results) => {
+      const failed = results.filter((result) => result.status === "rejected").length;
+      if (failed) {
+        setError(`${failed} 个对话的已读状态未同步`);
+        void refresh();
+      }
+    });
+  }, [refresh]);
 
   const attentionCount = countThreadAttention(threads, activeThreadId);
 
@@ -2231,6 +2459,7 @@ export function useConversationThreads(options?: {
     refresh,
     attentionCount,
     inboxStatus,
+    markThreadsRead,
   };
 }
 
@@ -2261,6 +2490,9 @@ export function useConversation(threadId: string) {
   } | null>(null);
   const aroundEpochRef = useRef(0);
   const refreshRequestRef = useRef(0);
+  const readMarkAbortRef = useRef<AbortController | null>(null);
+  const nativeReadRef = useRef<{ bridge: ReturnType<typeof desktopChatBridge>; state: DesktopNativeState | null; authGeneration: number }>({ bridge: undefined, state: null, authGeneration: -1 });
+  const nativeStateReloadRef = useRef<(() => void) | null>(null);
   const activeThreadIdRef = useRef(threadId);
   activeThreadIdRef.current = threadId;
 
@@ -2313,26 +2545,129 @@ export function useConversation(threadId: string) {
 
   const refresh = useCallback(async () => {
     if (!threadId) return;
+    readMarkAbortRef.current?.abort();
+    readMarkAbortRef.current = null;
     const request = ++refreshRequestRef.current;
     const requestedThreadId = threadId;
-    const isCurrent = () => activeThreadIdRef.current === requestedThreadId && request === refreshRequestRef.current;
+    const ownerGeneration = currentAuthGeneration();
+    const ownerAuthScope = currentAuthScope();
+    const ownerStorageScope = conversationStorageScope();
+    const ownerServiceOrigin = currentServiceOrigin();
+    const ownerTransportOrigin = API;
+    const isCurrent = () => activeThreadIdRef.current === requestedThreadId
+      && request === refreshRequestRef.current
+      && ownerGeneration === currentAuthGeneration()
+      && ownerAuthScope === currentAuthScope()
+      && ownerStorageScope === conversationStorageScope()
+      && ownerServiceOrigin === currentServiceOrigin()
+      && ownerTransportOrigin === API;
+    let markController: AbortController | null = null;
     setError("");
     try {
-      const nextView = await fetchConversationView(requestedThreadId);
+      // A view refresh must never advance the read watermark by itself: the
+      // window may lose focus while the request is in flight.
+      const nextView = await fetchConversationView(requestedThreadId, false);
       if (!isCurrent()) return;
       setView((previous) => consumePendingAround(
         mergeConversationView(previous, nextView),
       ));
       setError("");
+      const bridge = desktopChatBridge();
+      if (bridge && nativeReadRef.current.bridge === bridge && nativeReadRef.current.authGeneration !== ownerGeneration) {
+        nativeStateReloadRef.current?.();
+      }
+      if (isConversationForeground() && (!bridge || (nativeReadRef.current.bridge === bridge
+        && nativeReadRef.current.authGeneration === ownerGeneration
+        && nativeThreadVisible(nativeReadRef.current.state, requestedThreadId)))) {
+        markController = new AbortController();
+        readMarkAbortRef.current = markController;
+        await markConversationThreadRead(requestedThreadId, markController.signal);
+      }
     } catch (exc) {
-      if (!isCurrent()) return;
+      if (!isCurrent() || markController?.signal.aborted) return;
       setError(exc instanceof Error ? exc.message : String(exc));
     } finally {
+      if (readMarkAbortRef.current === markController) readMarkAbortRef.current = null;
       if (isCurrent()) {
         setLoading(false);
       }
     }
   }, [threadId]);
+
+  useEffect(() => {
+    if (!threadId) return;
+    const bridge = desktopChatBridge();
+    let cancelled = false;
+    let nativeRevision = 0;
+    let pendingNativeRead: { revision: number; generation: number } | null = null;
+    nativeReadRef.current = { bridge, state: null, authGeneration: currentAuthGeneration() };
+    const abortReadMark = () => {
+      readMarkAbortRef.current?.abort();
+      readMarkAbortRef.current = null;
+    };
+    const acceptNativeState = (state: DesktopNativeState | null) => {
+      if (cancelled) return;
+      const prior = nativeReadRef.current;
+      if (state && prior.bridge === bridge && prior.authGeneration === currentAuthGeneration()
+        && prior.state?.transportOrigin === state.transportOrigin
+        && prior.state?.serviceId === state.serviceId && prior.state?.identityId === state.identityId
+        && Number.isSafeInteger(prior.state?.connectionVersion) && Number.isSafeInteger(state.connectionVersion)
+        && (state.connectionVersion || 0) < (prior.state?.connectionVersion || 0)) return;
+      nativeRevision += 1;
+      const wasVisible = prior.bridge === bridge && prior.authGeneration === currentAuthGeneration()
+        && nativeThreadVisible(prior.state, threadId);
+      nativeReadRef.current = { bridge, state, authGeneration: currentAuthGeneration() };
+      const nowVisible = nativeThreadVisible(state, threadId);
+      if (!nowVisible) abortReadMark();
+      else if (!wasVisible && isConversationForeground()) void refresh();
+    };
+    const readNativeState = () => {
+      if (!bridge) return;
+      if (!bridge.getState || !bridge.onState) {
+        setError("桌面前台状态接口不可用，已暂停自动标记已读。");
+        return;
+      }
+      const revision = nativeRevision;
+      const generation = currentAuthGeneration();
+      if (pendingNativeRead?.revision === revision && pendingNativeRead.generation === generation) return;
+      const pending = { revision, generation };
+      pendingNativeRead = pending;
+      void bridge.getState().then((state) => {
+        if (!cancelled && revision === nativeRevision && generation === currentAuthGeneration()) acceptNativeState(state);
+      }).catch((exc) => {
+        if (!cancelled && revision === nativeRevision && generation === currentAuthGeneration()) {
+          setError(`桌面前台状态获取失败：${exc instanceof Error ? exc.message : String(exc)}`);
+        }
+      }).finally(() => {
+        if (pendingNativeRead === pending) pendingNativeRead = null;
+      });
+    };
+    nativeStateReloadRef.current = readNativeState;
+    const refreshOnFocus = () => {
+      if (isConversationForeground()) void refresh();
+      else abortReadMark();
+    };
+    window.addEventListener("focus", refreshOnFocus);
+    window.addEventListener("blur", abortReadMark);
+    document.addEventListener("visibilitychange", refreshOnFocus);
+    const unsubscribeNative = bridge?.onState?.(acceptNativeState);
+    const unsubscribeScope = subscribeConversationStorageScope(() => {
+      acceptNativeState(null);
+      readNativeState();
+    });
+    readNativeState();
+    return () => {
+      cancelled = true;
+      abortReadMark();
+      nativeReadRef.current = { bridge: undefined, state: null, authGeneration: -1 };
+      if (nativeStateReloadRef.current === readNativeState) nativeStateReloadRef.current = null;
+      window.removeEventListener("focus", refreshOnFocus);
+      window.removeEventListener("blur", abortReadMark);
+      document.removeEventListener("visibilitychange", refreshOnFocus);
+      unsubscribeNative?.();
+      unsubscribeScope();
+    };
+  }, [refresh, threadId]);
 
   const viewRef = useRef<ConversationView | null>(null);
   viewRef.current = view;
@@ -2444,16 +2779,32 @@ export function useConversation(threadId: string) {
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let connectionVersion = 0;
     const streamRef = { current: emptyConversationStreamState() };
-    const publishStream = (next: ReturnType<typeof emptyConversationStreamState>) => {
-      streamRef.current = next;
-      setEvents(next.events as ConversationEvent[]);
-      setLiveText(next.liveText);
-      setLiveTextRuns(next.liveTextRuns);
-    };
+    let publishFrame: number | null = null;
 
     const isCurrentThread = () => (
       !cancelled && activeThreadIdRef.current === threadId
     );
+
+    // streamRef stays authoritative on every event; React only needs the latest
+    // snapshot once per frame, so a burst of text deltas costs one render.
+    const flushStream = () => {
+      publishFrame = null;
+      if (!isCurrentThread()) return;
+      const next = streamRef.current;
+      setEvents(next.events as ConversationEvent[]);
+      setLiveText(next.liveText);
+      setLiveTextRuns(next.liveTextRuns);
+    };
+    const publishStream = (next: ReturnType<typeof emptyConversationStreamState>) => {
+      streamRef.current = next;
+      // Hidden tabs do not run animation frames, but their state must still advance.
+      if (document.hidden) {
+        if (publishFrame !== null) cancelAnimationFrame(publishFrame);
+        flushStream();
+        return;
+      }
+      if (publishFrame === null) publishFrame = requestAnimationFrame(flushStream);
+    };
 
     const mintTicket = async (): Promise<
       { status: "ok"; ticket: string } | { status: "auth_required" } | { status: "empty" }
@@ -2488,7 +2839,7 @@ export function useConversation(threadId: string) {
 
       // snapshot keeps the Thread view fresh; after=appliedSeq skips already
       // admitted events so reconnect cannot replay deltas into liveText.
-      const query = new URLSearchParams({ snapshot: "true" });
+      const query = new URLSearchParams({ snapshot: "true", browser_host: browserControlHost() });
       if (streamRef.current.appliedSeq > 0) {
         query.set("after", String(streamRef.current.appliedSeq));
       }
@@ -2497,6 +2848,10 @@ export function useConversation(threadId: string) {
       const nextEs = new EventSource(
         `${API}/api/threads/${encodeURIComponent(threadId)}/events?${query}`,
       );
+      nextEs.addEventListener("browser_request", (raw) => {
+        if (!isCurrentThread() || es !== nextEs) return;
+        handleBrowserRequest(threadId, (raw as MessageEvent).data);
+      });
       es = nextEs;
 
       nextEs.onopen = () => {
@@ -2554,8 +2909,12 @@ export function useConversation(threadId: string) {
     return () => {
       cancelled = true;
       refreshRequestRef.current += 1;
+      readMarkAbortRef.current?.abort();
+      readMarkAbortRef.current = null;
       connectionVersion += 1;
       if (reconnectTimer !== null) clearTimeout(reconnectTimer);
+      if (publishFrame !== null) cancelAnimationFrame(publishFrame);
+      publishFrame = null;
       es?.close();
       es = null;
       if (refreshTimer.current) clearTimeout(refreshTimer.current);

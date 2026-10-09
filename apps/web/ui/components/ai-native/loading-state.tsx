@@ -54,9 +54,9 @@ export function LoadingState({
       {variant === "Dots" ? <Dots /> : <Spinner size={15} className="text-cx-fg-3" />}
       <ShimmerText className="text-[13px] font-medium">{label}</ShimmerText>
       {elapsedSeconds !== undefined ? (
-        <span className="cx-tabular font-cx-mono text-[11.5px] text-cx-fg-4">{formatElapsed(elapsedSeconds * 1000)}</span>
+        <span className="cx-tabular font-cx-mono text-[12px] text-cx-fg-4">{formatElapsed(elapsedSeconds * 1000)}</span>
       ) : showTimer ? (
-        <ElapsedTimer startMs={startMs} format={formatElapsed} className="font-cx-mono text-[11.5px] text-cx-fg-4" />
+        <ElapsedTimer startMs={startMs} format={formatElapsed} className="font-cx-mono text-[12px] text-cx-fg-4" />
       ) : null}
     </div>
   );

@@ -22,6 +22,7 @@ ENGINE_DISPLAY_NAMES: dict[str, str] = {
     "grok": "Grok",
     "opencode": "OpenCode",
     "devin": "Devin CLI",
+    "droid": "Droid",
 }
 
 

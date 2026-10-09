@@ -196,15 +196,14 @@ def persist_run_launch_limits(self, run_id: str, body: dict[str, Any]) -> None:
     mode = (contract.get("mode") if isinstance(contract, dict) else None)
     mode = mode or challenge.get("mode") or body.get("mode") or "ctf"
     runtime_backend = resolve_worker_backend(
-        request_backend=("container" if mode == "pentest"
-                         else body.get("worker_backend")),
+        request_backend=body.get("worker_backend"),
         config_backend=config.get("worker_backend"),
         env_backend=os.environ.get("MUTEKI_WORKER_BACKEND"),
         in_web_container=is_web_container(),
     )
     runtime_scope = str(body.get("worker_container_scope")
                         or config.get("worker_container_scope") or "run")
-    if mode == "pentest" or runtime_backend == "local":
+    if runtime_backend == "local":
         runtime_scope = "run"
     if runtime_scope not in {"run", "shared"}:
         raise RuntimeError("invalid Worker container scope")

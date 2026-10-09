@@ -97,7 +97,7 @@ export function CodeViewer({
         <pre
           aria-label="文件内容"
           className={cn(
-            "m-0 py-2 font-cx-mono text-[12.5px] leading-5 text-cx-fg-2",
+            "m-0 py-2 font-cx-mono text-[13px] leading-5 text-cx-fg-2",
             wrap ? "whitespace-pre-wrap break-words" : "min-w-max whitespace-pre",
           )}
         >
@@ -147,7 +147,7 @@ export function CodeViewer({
       {selection && onCiteLines ? (
         <div className="pointer-events-none absolute inset-x-0 bottom-3 flex justify-center px-3">
           <div className="cx-animate-in pointer-events-auto flex items-center gap-1 rounded-full bg-cx-overlay p-1 pl-3 shadow-cx-pop">
-            <span className="cx-tabular mr-1 font-cx-mono text-[11.5px] text-cx-fg-3">{rangeLabel}</span>
+            <span className="cx-tabular mr-1 font-cx-mono text-[12px] text-cx-fg-3">{rangeLabel}</span>
             <Button size="xs" variant="primary" icon="quote" className="rounded-full" onClick={cite} aria-label={`引用 ${rangeLabel}`}>
               引用 {rangeLabel}
             </Button>

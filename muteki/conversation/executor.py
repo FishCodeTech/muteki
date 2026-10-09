@@ -26,24 +26,47 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from muteki.external_agents.base import BaseExternalAgentAdapter
 from muteki.external_agents.registry import AdapterRegistry
 from muteki.external_agents.interaction_matrix import (
+    HISTORY_REBUILD_METHOD,
     attach_matrix_to_snapshot,
     build_matrix_from_probe,
 )
 from muteki.external_agents.runtime_capabilities import RuntimeCapabilitySnapshot
 from muteki.external_agents.sessions import EXIT_INTERRUPTED
 from muteki.external_agents.user_input_schema import normalize_pending_user_input
+from muteki.platform.contracts.agent_events import (
+    AgentEventContractError,
+    AgentFailure,
+    FailureCategory,
+    agent_failure,
+    dump_payload,
+    parse_payload,
+    redact_secrets,
+)
+from muteki.platform.contracts.capabilities import ToolDescription
 from muteki.platform.contracts.errors import ErrorCategory, ErrorEnvelope
 from muteki.platform.contracts.external_agents import (
     AgentEvent,
     AgentEventType,
-    AgentInput,
     AgentSessionRef,
+    ApprovalResponseInput,
+    MessageInput,
     SessionStart,
+    SteerInput,
+    UserInputResponseInput,
+)
+from muteki.platform.contracts.protocols import (
+    BackgroundUpdateAdapter,
+    NativeContinuationAdapter,
+    NativeRewindAdapter,
+    RuntimeOperationAdapter,
 )
 from muteki.platform.contracts.objects import AgentSession, Artifact, Task, Thread
 from muteki.platform.contracts.receipts import (
@@ -58,8 +81,10 @@ from muteki.solver.credential_accounts import resolve_credential_env
 
 from . import events as ev
 from muteki.conversation.approval_queue import (
+    approval_response_capability,
     has_actionable_approvals,
     normalize_approval_payload,
+    stamp_response_capability,
 )
 from .attachment_delivery import (
     AttachmentDeliveryError,
@@ -68,12 +93,16 @@ from .attachment_delivery import (
     resolve_attachments,
     thread_authorized_sha256s,
 )
+from .checkpoints import CheckpointError, capture_checkpoint
 from .composer_capabilities import ComposerCapabilityError, resolve_capability_refs
-from .manager import ConversationManager
+from .manager import ConversationManager, ConversationError
 from .models import (
+    ThreadRuntimeSelection,
+    CAPABILITY_REFRESH_FAILED_CODE,
     TURN_COMPLETED,
     TURN_FAILED,
     TURN_INTERRUPTED,
+    TURN_CANCELLED,
     TURN_KIND_EDIT_RESEND,
     TURN_KIND_RETRY,
     TURN_QUEUED,
@@ -97,15 +126,27 @@ from .store import ConversationStore
 LOG = logging.getLogger(__name__)
 
 
+def _chat_tool_descriptions(tools: list[dict[str, Any]]) -> list[ToolDescription]:
+    """Launch-time view of chat plugin tools; routing keys stay with the plugin service."""
+    return [
+        ToolDescription(name=tool["name"], description=tool["description"],
+                        input_schema=tool["input_schema"])
+        for tool in tools
+    ]
+
+
 class ControlDeliveryError(RuntimeError):
     """A control response failed; retain its pending public request."""
 
-    def __init__(self, runtime_code: str, *, delivery_unknown: bool = False):
+    def __init__(self, runtime_code: str, *, delivery_unknown: bool = False,
+                 reason: str = ""):
         super().__init__(
             "操作的投递结果无法确认，原决定已保留。请恢复原回执，或取消本轮。"
             if delivery_unknown else
             "操作未送达原会话，待处理请求已保留。请刷新后重试，或取消本轮。")
         self.runtime_code = runtime_code
+        # AgentFailure.reason (engine-specific suffix) of the rejection.
+        self.runtime_reason = reason
         self.delivery_unknown = delivery_unknown
 
 # #188: capability refresh failure backoff (seconds).
@@ -114,13 +155,40 @@ _CAPABILITY_REFRESH_BACKOFF_MAX_S = 60.0
 
 #: 这些失败表示 Runtime 已正常结束本轮，Session 可以留给下一轮。
 #: 其余失败（超时、传输断开、执行器异常）必须关掉 Session，否则
-#: 八个引擎都会在 Muteki 停听后继续调 Capability。
-_KEEP_SESSION_TURN_REASONS = frozenset({
+#: 八个引擎都会在 Muteki 停听后继续调 Capability。取消（operator
+#: interrupt）同样保留 Session。
+_KEEP_SESSION_FAILURE_REASONS = frozenset({
     "empty_assistant",
     "refusal",
-    EXIT_INTERRUPTED,
-    "interrupted",
+    # pi/omp native-command turns ended unconfirmed without assistant text;
+    # the session itself is healthy (旧事件以 reason=empty_assistant 保留会话)。
+    "native_command.unconfirmed",
 })
+
+#: AgentFailure.reason of an executor-side contract violation.
+_CONTRACT_VIOLATION_REASON = "event_contract"
+
+
+def _contract_failure(exc: AgentEventContractError, engine: str) -> AgentFailure:
+    return agent_failure(
+        FailureCategory.VALIDATION, _CONTRACT_VIOLATION_REASON,
+        engine=engine or "unknown",
+        message=f"Runtime adapter emitted an invalid {exc.event_type} event",
+        detail=exc.message, native_code=exc.code,
+    )
+
+
+def _public_failure(failure: AgentFailure) -> dict[str, Any]:
+    return dump_payload(failure)
+
+
+def _summary_line(text: str) -> str:
+    """First non-empty line as the display summary; callers keep the full
+    text in ``detail`` next to it."""
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip()
+    return text.strip()
 
 
 def _match_runtime_capability(
@@ -167,6 +235,29 @@ def _continuation_prompt(
 
 
 
+_TERMINAL_TURN_EVENTS = frozenset({
+    ev.EV_TURN_COMPLETED, ev.EV_TURN_FAILED, ev.EV_TURN_INTERRUPTED,
+})
+
+#: What a terminal turn event says about the thread's native session.
+DISPOSITION_REUSABLE = "reusable"
+DISPOSITION_NEEDS_RESTART = "needs_restart"
+DISPOSITION_CLOSED = "closed"
+
+FENCED_EVENT_CODE = "conversation.event.fenced"
+
+
+@dataclass
+class _StreamFence:
+    """Identity an event stream is allowed to speak for."""
+
+    session_id: str
+    generation: Optional[int]
+    run_id: str = ""
+    reported: set = field(default_factory=set)
+    dropped: int = 0
+
+
 class ExternalAgentSessionExecutor:
     """Thread ↔ 外部 Agent Runtime Session 的执行桥。"""
 
@@ -186,6 +277,10 @@ class ExternalAgentSessionExecutor:
         self._sessions_root = Path(sessions_root)
         # thread_id → 正在执行的 Turn 任务 / 顺序锁
         self._tasks: dict[str, asyncio.Task] = {}
+        self._continuation_sources: dict[str, tuple[Any, AgentSessionRef]] = {}
+        self._continuation_tasks: dict[str, asyncio.Task] = {}
+        self._native_wake_turns: dict[str, tuple[str, str]] = {}
+        self._shutting_down = False
         self._stop_fences: dict[str, asyncio.Event] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._session_locks: dict[str, asyncio.Lock] = {}
@@ -195,6 +290,7 @@ class ExternalAgentSessionExecutor:
         # 本进程内已 start 的 AgentSession（重启后需经 resume_handle 接管）
         self._live: set[str] = set()
         self._chat_revisions: dict[str, str] = {}
+        self._chat_contexts: dict[str, str] = {}
         # Codex 等 Runtime 会在同一轮的多个 item 完成节点重复上报同一份
         # workspace diff。Artifact 本体虽然按摘要去重，事件仍会重复进入界面。
         self._emitted_workspace_artifacts: set[tuple[str, str]] = set()
@@ -207,6 +303,19 @@ class ExternalAgentSessionExecutor:
         # thread_id → pending structured handoff for next AgentInput
         self._pending_handoff: dict[str, SessionHandoffBundle] = {}
         self._model_success_recorder: Optional[Callable[[dict[str, str]], None]] = None
+        # agent_session_id → interaction mode the native session was launched in
+        self._session_modes: dict[str, str] = {}
+        # Sessions closed or replaced by this process; late events from them
+        # must not drive the thread's current turn (execution-generation fence).
+        self._closed_sessions: set[str] = set()
+        # thread_id → what the next terminal turn event tells clients about
+        # the session ("reusable" unless a detach/close was decided).
+        self._disposition_hints: dict[str, str] = {}
+        manager.bind_session_liveness(self.session_is_live)
+
+    def session_is_live(self, agent_session_id: str) -> bool:
+        """True when this process still has the native session attached."""
+        return bool(agent_session_id) and agent_session_id in self._live
 
     def bind_model_success_recorder(
         self, recorder: Callable[[dict[str, str]], None],
@@ -223,6 +332,7 @@ class ExternalAgentSessionExecutor:
             "credential_id": str(getattr(selection, "credential_id", "") or ""),
             "model": str(getattr(selection, "model", "") or ""),
             "effort": str(getattr(selection, "effort", "") or ""),
+            "service_tier": str(getattr(selection, "service_tier", "") or ""),
             "access_mode": str(
                 getattr(selection, "access_mode", "") or ""
             ),
@@ -230,6 +340,9 @@ class ExternalAgentSessionExecutor:
                 getattr(selection, "permission_mode", "") or ""
             ),
             "sandbox_mode": str(getattr(selection, "sandbox_mode", "") or ""),
+            "interaction_mode": str(
+                getattr(selection, "interaction_mode", "") or "default"
+            ),
         }
 
     def _runtime_snapshot(self, thread_id: str) -> dict[str, str]:
@@ -248,25 +361,27 @@ class ExternalAgentSessionExecutor:
         command_id: Optional[str] = None,
     ) -> None:
         """向 Thread 聚合流追加事件；投影由 ConversationService 挂钩应用。"""
+        if event_type in _TERMINAL_TURN_EVENTS and "thread_disposition" not in payload:
+            payload = {
+                **payload,
+                "thread_disposition": (
+                    self._disposition_hints.get(thread_id) or DISPOSITION_REUSABLE),
+            }
         event = ev.thread_event(
             thread_id, event_type, payload, command_id=command_id)
         self._store.append_events(event)
 
     # -- Session 生命周期 ----------------------------------------------------------
 
-    def _bind_runtime(self, adapter: Any) -> None:
+    def _bind_runtime(self, adapter: BaseExternalAgentAdapter) -> None:
         """使用 Adapter 前补齐 PlatformStore 与 BindingService。
 
         Adapter 可能先构造再注册，SessionTracker 若没有 store，
         AgentSession 不会写入 platform.db，审批、恢复和重启都找不到会话。
         """
-        tracker = getattr(adapter, "_tracker", None)
-        if tracker is not None and getattr(tracker, "_store", None) is None:
-            tracker._store = self._store
-        if getattr(adapter, "_binding_service", None) is None:
-            adapter._binding_service = self._manager.bindings
+        adapter.attach_platform(store=self._store, binding_service=self._manager.bindings)
 
-    def _adapter_for(self, adapter_id: str, instance_id: str) -> Any:
+    def _adapter_for(self, adapter_id: str, instance_id: str) -> BaseExternalAgentAdapter:
         adapter = self._registry.get(adapter_id, instance_id)
         if adapter is None:
             raise LookupError(
@@ -315,21 +430,21 @@ class ExternalAgentSessionExecutor:
         )
 
     def _open_session_for_thread(self, thread_id: str) -> Optional[AgentSession]:
-        """Recover an unclosed AgentSession when ThreadState lost its pointer (#122)."""
+        """Recover an unclosed AgentSession when ThreadState lost its pointer (#122).
+
+        Only sessions of the currently selected adapter instance are eligible;
+        a session owned by another runtime is never rebound to this thread.
+        """
         selection = self._manager.runtime_selection(thread_id)
-        open_rows = [
-            item for item in self._store.list(AgentSession, thread_id=thread_id)
-            if item.closed_at is None
+        selected_instance = selection.instance_id or "default"
+        candidates = [
+            row for row in self._store.list(AgentSession, thread_id=thread_id)
+            if row.closed_at is None
+            and row.adapter_id == selection.adapter_id
+            and (row.runtime_instance_id or "default") == selected_instance
         ]
-        if not open_rows:
+        if not candidates:
             return None
-        matching = [
-            row for row in open_rows
-            if row.adapter_id == selection.adapter_id
-            and (row.runtime_instance_id or "default")
-            == (selection.instance_id or "default")
-        ]
-        candidates = matching or open_rows
         state = self._conv.get_state(thread_id)
         if state.running_turn_id:
             turn = self._conv.get_turn(state.running_turn_id)
@@ -355,14 +470,9 @@ class ExternalAgentSessionExecutor:
                 selection = self._manager.runtime_selection(thread_id)
                 adapter = self._registry.get(
                     selection.adapter_id, selection.instance_id or "default")
-                tracker = (
-                    getattr(adapter, "_tracker", None)
-                    if adapter is not None else None
-                )
-                getter = getattr(tracker, "get", None)
-                if getter is not None:
-                    record = getter(state.agent_session_id)
-            if record is not None and record.closed_at is None:
+                if adapter is not None:
+                    record = adapter.session_record(state.agent_session_id)
+            if record is not None and (record.closed_at is None or record.resume_handle):
                 return record
         # #122: ThreadState may have lost agent_session_id while the Runtime
         # session (and turn claim) are still live — rebind from store.
@@ -409,6 +519,21 @@ class ExternalAgentSessionExecutor:
         )
         record = self._session_record(thread_id)
         previous_record = record
+        # A catalog refresh must not replace the history that the user is
+        # about to resume after a crash. Return the adapter's disconnected
+        # snapshot; the explicit continuation owns reopening this handle.
+        current_turns = self._conv.list_current_turns(thread_id)
+        last_turn = current_turns[-1] if current_turns else None
+        if (
+            not turn_busy and record is not None and record.resume_handle
+            and record.agent_session_id not in self._live
+            and state.session_runtime_key == selection.session_key
+            and last_turn is not None
+            and last_turn.agent_session_id == record.agent_session_id
+            and last_turn.status in {TURN_INTERRUPTED, TURN_FAILED, TURN_CANCELLED}
+        ):
+            adapter = self._adapter_for(selection.adapter_id, selection.instance_id)
+            return adapter, self._ref_from_record(record)
         if fresh:
             record = None
         if turn_busy:
@@ -421,6 +546,8 @@ class ExternalAgentSessionExecutor:
             adapter = self._adapter_for(record.adapter_id, record.runtime_instance_id or "default")
             return adapter, self._ref_from_record(record)
         same_selection = False
+        restart_reason = ""
+        mode_from = ""
         if record is not None:
             old_key = (
                 f"{record.adapter_id}:"
@@ -438,7 +565,26 @@ class ExternalAgentSessionExecutor:
                 adapter = self._adapter_for(
                     selection.adapter_id, selection.instance_id)
                 if record.agent_session_id in self._live:
-                    return adapter, self._ref_from_record(record)
+                    launched = self._launched_interaction_mode(
+                        record, selection.interaction_mode)
+                    if (
+                        launched != selection.interaction_mode
+                        and not await self._plan_mode_per_turn(adapter)
+                    ):
+                        await self._close_record(
+                            record, reason="interaction_mode_change")
+                        state = state.model_copy(update={
+                            "agent_session_id": None,
+                            "session_runtime_key": "",
+                            "current_generation": state.current_generation + 1,
+                        })
+                        self._conv.save_state(state)
+                        restart_reason = "interaction_mode_change"
+                        mode_from = launched
+                        record = None
+                        same_selection = False
+                    else:
+                        return adapter, self._ref_from_record(record)
             elif record.closed_at is None:
                 await self._close_record(record, reason="runtime_switch")
                 state = state.model_copy(update={
@@ -447,6 +593,7 @@ class ExternalAgentSessionExecutor:
                     "current_generation": state.current_generation + 1,
                 })
                 self._conv.save_state(state)
+                restart_reason = "settings_mismatch"
                 record = None
 
         adapter = self._adapter_for(selection.adapter_id, selection.instance_id)
@@ -457,12 +604,14 @@ class ExternalAgentSessionExecutor:
         engine = engine_for_adapter(selection.adapter_id)
         credential_env: dict[str, str] = {}
         if selection.credential_id:
+            from apps.web.worker_models import conversation_model_input
             credential_env = resolve_credential_env(
                 selection.credential_id,
                 engine=engine,
                 sessions_root=self._sessions_root,
                 container=False,
                 model=selection.model,
+                model_input=conversation_model_input(self._sessions_root, selection),
                 agent_state_dir=(
                     self._sessions_root / "_conversation_agent_state" / thread_id
                 ),
@@ -474,14 +623,12 @@ class ExternalAgentSessionExecutor:
                 str(Path(workspace.root_path).expanduser().resolve())
                 if workspace and workspace.root_path else ""
             ),
-            "credential_id": selection.credential_id,
-            "capability_discovery": True,
         }
         plugins = getattr(self, "chat_plugins", None)
         if plugins is not None and thread.mode == "conversation":
             if not options["cwd"]:
                 options["cwd"] = str(plugins.visualization_root(thread.thread_id).parent)
-            options["chat_tools"] = await plugins.prepare_tools(engine)
+            options["chat_tools"] = _chat_tool_descriptions(await plugins.prepare_tools(engine))
             options["chat_control_enabled"] = plugins.control_enabled(engine)
             credential_env = await asyncio.to_thread(
                 plugins.prepare_environment, engine,
@@ -492,24 +639,30 @@ class ExternalAgentSessionExecutor:
             )
         if plugins is not None and thread.mode == "conversation":
             options.update(await asyncio.to_thread(plugins.native_launch_options, engine, credential_env))
+        await self._prepare_native_fork(state, selection, options, credential_env)
         if credential_env:
             options["env"] = credential_env
         resume = record if record is not None and same_selection else None
+        started_generation = state.current_generation + int(fresh)
         ref = await adapter.start(SessionStart(
             **({"agent_session_id": resume.agent_session_id}
                if resume is not None else {}),
             thread_id=thread_id,
-            execution_generation=state.current_generation + int(fresh),
+            execution_generation=started_generation,
             workspace_id=thread.workspace_id,
             resume_handle=resume.resume_handle if resume is not None else None,
             model=selection.model or None,
             effort=selection.effort or None,
+            service_tier=getattr(selection, "service_tier", "") or None,
             access_mode=selection.access_mode or None,
             permission_mode=selection.permission_mode or None,
             sandbox_mode=selection.sandbox_mode or None,
+            interaction_mode=selection.interaction_mode,
             options=options,
         ))
         self._live.add(ref.agent_session_id)
+        self._session_modes[ref.agent_session_id] = selection.interaction_mode
+        self._closed_sessions.discard(ref.agent_session_id)
         self._remember_chat_revision(thread, ref)
         if previous_record is not None and resume is None:
             self._pending_handoff[thread_id] = build_session_handoff(
@@ -520,10 +673,40 @@ class ExternalAgentSessionExecutor:
                 source_adapter_id=previous_record.adapter_id,
                 source_agent_session_id=previous_record.agent_session_id,
             )
-        self._conv.save_state(state.model_copy(update={
+        # adapter.start awaits a subprocess; archive or projections may have
+        # changed ThreadState meanwhile, so never write back the stale copy.
+        current = self._conv.get_state(thread_id)
+        if current.status == "archived":
+            started = self._store.get(AgentSession, ref.agent_session_id)
+            if started is not None:
+                if started.closed_at is None:
+                    await self._close_record(started, reason="thread_archived")
+            else:
+                await adapter.close(ref)
+            self._live.discard(ref.agent_session_id)
+            self._chat_contexts.pop(ref.agent_session_id, None)
+            raise LookupError(f"thread {thread_id} 已归档，能力会话已关闭")
+        self._conv.save_state(current.model_copy(update={
             "agent_session_id": ref.agent_session_id,
             "session_runtime_key": selection.session_key,
+            "native_fork": None,
         }))
+        if restart_reason:
+            switched: dict[str, Any] = {
+                "generation": started_generation,
+                "reason": restart_reason,
+                "recovery_reason": restart_reason,
+                "runtime_key": selection.session_key,
+                "adapter_runtime_key": selection.runtime_key,
+                "agent_session_id": ref.agent_session_id,
+                "adapter_id": ref.adapter_id,
+                "instance_id": ref.runtime_instance_id or "default",
+                "runtime": self._selection_snapshot(selection),
+            }
+            if mode_from:
+                switched["interaction_mode_from"] = mode_from
+                switched["interaction_mode_to"] = selection.interaction_mode
+            self._emit(thread_id, ev.EV_RUNTIME_SWITCHED, switched)
         return adapter, ref
 
     async def runtime_capabilities(
@@ -533,7 +716,7 @@ class ExternalAgentSessionExecutor:
         snapshot = await adapter.runtime_capability_snapshot(ref)
         snapshot = self._enrich_capability_snapshot(
             thread_id, snapshot, adapter_id=adapter.id,
-            instance_id=getattr(adapter.identity, "instance_id", "default"),
+            instance_id=adapter.identity.instance_id,
         )
         self._capability_cache[thread_id] = snapshot
         self._capability_failures.pop(thread_id, None)
@@ -650,7 +833,7 @@ class ExternalAgentSessionExecutor:
             item.name == "rewind" and item.kind == "operation" for item in snapshot.items
         ):
             snapshot.items.append(operation_item(adapter_id, engine_for_adapter(adapter_id),
-                "rewind", "muteki.history.rebuild", "回退聊天历史并重建引擎上下文；保留工作区文件"))
+                "rewind", HISTORY_REBUILD_METHOD, "回退聊天历史并重建引擎上下文；保留工作区文件"))
         record = self._registry.record(adapter_id, instance_id)
         report = record.last_probe if record is not None else None
         return attach_matrix_to_snapshot(snapshot, report)
@@ -679,7 +862,7 @@ class ExternalAgentSessionExecutor:
             _CAPABILITY_REFRESH_BACKOFF_MAX_S,
             _CAPABILITY_REFRESH_BACKOFF_BASE_S * (2 ** max(0, attempts - 1)),
         )
-        error = f"{type(exc).__name__}: {str(exc)[:300]}"
+        error = redact_secrets(f"{type(exc).__name__}: {exc}")
         self._capability_failures[thread_id] = {
             "runtime_key": self._capability_runtime_key(thread_id),
             "error": error,
@@ -751,6 +934,8 @@ class ExternalAgentSessionExecutor:
         （#188）。返回是否真正启动了新的后台任务。
         """
         state = self._conv.get_state(thread_id)
+        if state.status == "archived":
+            return False
         record = self._session_record(thread_id)
         if state.running_turn_id and (record is None or record.agent_session_id not in self._live):
             return False
@@ -769,6 +954,8 @@ class ExternalAgentSessionExecutor:
             except Exception as exc:  # noqa: BLE001 — 失败快照 + 事件可见
                 if self._capability_runtime_key(thread_id) != runtime_key:
                     return
+                if self._conv.get_state(thread_id).status == "archived":
+                    return
                 LOG.exception("runtime capability refresh failed: %s", thread_id)
                 try:
                     snapshot = self._record_capability_refresh_failure(
@@ -776,8 +963,8 @@ class ExternalAgentSessionExecutor:
                     )
                     failure = self._capability_failures.get(thread_id) or {}
                     self._emit(thread_id, ev.EV_RUNTIME_ERROR, {
-                        "code": "conversation.runtime.capability_refresh_failed",
-                        "detail": str(failure.get("error") or exc)[:320],
+                        "code": CAPABILITY_REFRESH_FAILED_CODE,
+                        "detail": str(failure.get("error") or redact_secrets(str(exc))),
                         "attempts": int(failure.get("attempts") or 0),
                         "backoff_seconds": float(
                             failure.get("backoff_seconds") or 0.0
@@ -854,9 +1041,9 @@ class ExternalAgentSessionExecutor:
                 before = self._conv.get_state(thread_id)
                 old_record = self._session_record(thread_id)
                 self._conv.save_state(before.model_copy(update={"history_recovery_required": True}))
-                if (adapter.id == "codex.app_server" and native_id
+                if (isinstance(adapter, NativeRewindAdapter) and native_id
                     and target.agent_session_id == ref.agent_session_id
-                    and {"thread/revert", "thread/rollback"}.intersection(getattr(adapter, "_client_request_methods", set()))):
+                    and adapter.supports_native_rewind(ref)):
                     await adapter.rewind_session(ref, native_id)
                     strategy = "native"
                 else:
@@ -887,6 +1074,7 @@ class ExternalAgentSessionExecutor:
                 if fresh_ref is not None and not committed:
                     await adapter.close(fresh_ref)
                     self._live.discard(fresh_ref.agent_session_id)
+                    self._chat_contexts.pop(fresh_ref.agent_session_id, None)
                 if not committed:
                     self._conv.save_state(before.model_copy(update={"history_recovery_required": True}))
                 raise
@@ -910,7 +1098,7 @@ class ExternalAgentSessionExecutor:
         snapshot = await adapter.runtime_capability_snapshot(ref)
         snapshot = self._enrich_capability_snapshot(
             thread_id, snapshot, adapter_id=adapter.id,
-            instance_id=getattr(adapter.identity, "instance_id", "default"),
+            instance_id=adapter.identity.instance_id,
         )
         self._capability_cache[thread_id] = snapshot
         verified = next((
@@ -923,26 +1111,27 @@ class ExternalAgentSessionExecutor:
         ), None)
         if verified is None:
             raise RuntimeError(f"Runtime operation 已失效：{name}")
-        operation = getattr(adapter, "runtime_operation", None)
-        if not callable(operation):
+        if not isinstance(adapter, RuntimeOperationAdapter):
             raise RuntimeError(
                 f"{adapter.id} 没有结构化 Runtime operation 通道")
         self._runtime_operations.add(thread_id)
         try:
-            result = await operation(ref, name, arguments) if arguments else await operation(ref, name)
+            if verified.name == "compact":
+                self._chat_contexts.pop(ref.agent_session_id, None)
+            result = await adapter.runtime_operation(ref, name, arguments)
         finally:
             self._runtime_operations.discard(thread_id)
         from muteki.external_agents.command_providers import public_operation_result
-        return public_operation_result(result if isinstance(result, dict) else {"result": result})
+        return public_operation_result(result)
 
     def _chat_revision_matches(self, thread: Thread, record: AgentSession) -> bool:
         plugins = getattr(self, "chat_plugins", None)
         if plugins is None or thread.mode != "conversation":
             return True
-        if engine_for_adapter(record.adapter_id) in {"pi", "omp"} and record.resume_handle and not Path(record.resume_handle).is_absolute():
+        if record.resume_handle and not self._resume_handle_usable(record):
             return False
         if record.agent_session_id not in self._live and not any(
-            turn.agent_session_id == record.agent_session_id and turn.status in {"completed", "interrupted"}
+            turn.agent_session_id == record.agent_session_id and turn.status in {TURN_COMPLETED, TURN_INTERRUPTED, TURN_CANCELLED}
             for turn in self._conv.list_turns(thread.thread_id)
         ):
             # Discovery-only Codex/Cursor sessions may not persist any native
@@ -951,11 +1140,55 @@ class ExternalAgentSessionExecutor:
         previous = self._chat_revisions.get(record.agent_session_id) or plugins.session_revision(record.agent_session_id)
         return previous == plugins.revision(engine_for_adapter(record.adapter_id))
 
+    def _resume_handle_usable(self, record: AgentSession) -> bool:
+        """Ask the owning adapter whether the stored handle can still resume.
+
+        Adapters without ``resume_handle_usable`` accept any stored handle.
+        """
+        adapter = self._registry.get(
+            record.adapter_id, record.runtime_instance_id or "default")
+        check = getattr(adapter, "resume_handle_usable", None)
+        return bool(check(record.resume_handle)) if callable(check) else True
+
     def _remember_chat_revision(self, thread: Thread, ref: AgentSessionRef) -> None:
         plugins = getattr(self, "chat_plugins", None)
         if plugins is not None and thread.mode == "conversation":
             self._chat_revisions[ref.agent_session_id] = plugins.revision(engine_for_adapter(ref.adapter_id))
             plugins.remember_session(ref.agent_session_id, self._chat_revisions[ref.agent_session_id])
+
+    @staticmethod
+    async def _resume_continues_turn(adapter: Any) -> bool:
+        """Whether ``adapter.resume`` itself continues the interrupted turn."""
+        caps = await adapter.capabilities()
+        return bool(getattr(caps, "resume_continues_turn", True))
+
+    def _launched_interaction_mode(self, record: AgentSession, fallback: str) -> str:
+        """Mode the native session was actually started in.
+
+        The in-process map is authoritative. After it is missing, the last
+        turn bound to the session is the persisted record; otherwise ``fallback``
+        (the mode about to be sent) so a session with no history is not restarted.
+        """
+        remembered = self._session_modes.get(record.agent_session_id)
+        if remembered:
+            return remembered
+        thread_id = str(record.thread_id or "")
+        if thread_id:
+            prior = [
+                item for item in self._conv.list_turns(thread_id)
+                if item.agent_session_id == record.agent_session_id
+                and item.interaction_mode
+            ]
+            if prior:
+                prior.sort(key=lambda item: (item.seq, item.turn_id))
+                return prior[-1].interaction_mode
+        return fallback or "default"
+
+    @staticmethod
+    async def _plan_mode_per_turn(adapter: Any) -> bool:
+        """Whether the adapter honours ``MessagePayload.interaction_mode`` on a live session."""
+        caps = await adapter.capabilities()
+        return bool(caps.plan_mode_per_turn)
 
     async def ensure_session(
         self,
@@ -985,6 +1218,20 @@ class ExternalAgentSessionExecutor:
                 f"thread {thread.thread_id} 未选择 Runtime instance")
         record = self._session_record(thread.thread_id)
         state = self._conv.get_state(thread.thread_id)
+        if turn.kind == "resume":
+            # Continue the session that executed the last turn, rather than a
+            # newer discovery-only session. This also repairs a stale pointer
+            # left by a capability refresh from an earlier server version.
+            prior = next((item for item in reversed(self._conv.list_current_turns(thread.thread_id))
+                          if item.turn_id != turn.turn_id), None)
+            if prior is not None and prior.agent_session_id and prior.runtime_snapshot:
+                prior_selection = ThreadRuntimeSelection.model_validate({
+                    key: value for key, value in prior.runtime_snapshot.items()
+                    if key in ThreadRuntimeSelection.model_fields})
+                prior_record = self._store.get(AgentSession, prior.agent_session_id)
+                if (prior_selection.session_key == selection.session_key
+                        and prior_record is not None and prior_record.resume_handle):
+                    record = prior_record
         previous_session_key = str(state.session_runtime_key or "")
         previous_runtime_key = ""
         previous_adapter_id = ""
@@ -1025,9 +1272,48 @@ class ExternalAgentSessionExecutor:
                     and state.session_runtime_key in {"", old_key}
                 )
             )
-            same_selection = same_selection and self._chat_revision_matches(thread, record)
+            # Reopen an explicitly resumed native conversation with the
+            # current launch options. An extension/cache revision change must
+            # not silently turn "continue" into a new native conversation.
+            if turn.kind != "resume" or not record.resume_handle:
+                same_selection = same_selection and self._chat_revision_matches(thread, record)
             if same_selection and (record.closed_at is None or record.resume_handle):
                 adapter = self._adapter_for(selection.adapter_id, selection.instance_id)
+                launched_mode = self._launched_interaction_mode(
+                    record, turn.interaction_mode)
+                if (
+                    record.closed_at is None
+                    and record.agent_session_id in self._live
+                    and launched_mode != turn.interaction_mode
+                    and not await self._plan_mode_per_turn(adapter)
+                ):
+                    # The adapter fixes plan/default at launch, so a mode
+                    # change needs a new native session; keep the native
+                    # conversation when a resume handle exists.
+                    await self._close_record(
+                        record, reason="interaction_mode_change")
+                    mode_change = (launched_mode, turn.interaction_mode)
+                    if record.resume_handle:
+                        return await self._start(
+                            adapter, thread, turn, state,
+                            agent_session_id=record.agent_session_id,
+                            resume_handle=record.resume_handle,
+                            previous_session_key=previous_session_key,
+                            previous_runtime_key=previous_runtime_key,
+                            previous_adapter_id=previous_adapter_id,
+                            previous_agent_session_id=previous_agent_session_id,
+                            mode_change=mode_change,
+                        )
+                    state = state.model_copy(update={
+                        "current_generation": state.current_generation + 1})
+                    return await self._start(
+                        adapter, thread, turn, state, switched=True,
+                        previous_session_key=previous_session_key,
+                        previous_runtime_key=previous_runtime_key,
+                        previous_adapter_id=previous_adapter_id,
+                        previous_agent_session_id=previous_agent_session_id,
+                        mode_change=mode_change,
+                    )
                 if record.closed_at is None and record.agent_session_id in self._live:
                     # 本进程内活跃：直接复用。
                     ref = self._ref_from_record(record)
@@ -1078,6 +1364,7 @@ class ExternalAgentSessionExecutor:
         previous_runtime_key: str = "",
         previous_adapter_id: str = "",
         previous_agent_session_id: str = "",
+        mode_change: Optional[tuple[str, str]] = None,
     ) -> tuple[Any, AgentSessionRef]:
         selection = self._manager.runtime_selection(thread.thread_id)
         workspace = (
@@ -1086,12 +1373,14 @@ class ExternalAgentSessionExecutor:
         engine = engine_for_adapter(selection.adapter_id)
         credential_env: dict[str, str] = {}
         if selection.credential_id:
+            from apps.web.worker_models import conversation_model_input
             credential_env = resolve_credential_env(
                 selection.credential_id,
                 engine=engine,
                 sessions_root=self._sessions_root,
                 container=False,
                 model=selection.model,
+                model_input=conversation_model_input(self._sessions_root, selection),
                 agent_state_dir=(
                     self._sessions_root / "_conversation_agent_state"
                     / thread.thread_id
@@ -1106,11 +1395,13 @@ class ExternalAgentSessionExecutor:
             new_session_key=selection.session_key,
             previous_runtime_key=previous_runtime_key,
             new_runtime_key=selection.runtime_key,
+            interaction_mode_changed=mode_change is not None,
         )
         messages = self._conv.list_current_messages(thread.thread_id)
         turns = self._conv.list_turns(thread.thread_id)
+        native_fork = bool(state.native_fork and state.native_fork.get("adapter_id") == selection.adapter_id)
         native_resume = bool(resume_handle) and not switched and not force_new
-        if native_resume:
+        if native_resume or native_fork:
             recovery_kind = RECOVERY_NATIVE_RESUME
             handoff = build_session_handoff(
                 thread_id=thread.thread_id,
@@ -1162,16 +1453,12 @@ class ExternalAgentSessionExecutor:
                 if workspace and workspace.root_path else ""
             ),
             "resume_prompt": resume_prompt,
-            "credential_id": selection.credential_id,
-            "handoff": handoff.to_dict() if handoff is not None else {},
-            "recovery_kind": recovery_kind,
-            "recovery_reason": reason,
         }
         plugins = getattr(self, "chat_plugins", None)
         if plugins is not None and thread.mode == "conversation":
             if not options["cwd"]:
                 options["cwd"] = str(plugins.visualization_root(thread.thread_id).parent)
-            options["chat_tools"] = await plugins.prepare_tools(engine)
+            options["chat_tools"] = _chat_tool_descriptions(await plugins.prepare_tools(engine))
             options["chat_control_enabled"] = plugins.control_enabled(engine)
             credential_env = await asyncio.to_thread(
                 plugins.prepare_environment, engine,
@@ -1182,6 +1469,7 @@ class ExternalAgentSessionExecutor:
             )
         if plugins is not None and thread.mode == "conversation":
             options.update(await asyncio.to_thread(plugins.native_launch_options, engine, credential_env))
+        await self._prepare_native_fork(state, selection, options, credential_env)
         if credential_env:
             options["env"] = credential_env
         request = SessionStart(
@@ -1193,13 +1481,17 @@ class ExternalAgentSessionExecutor:
             resume_handle=resume_handle,
             model=selection.model or None,
             effort=selection.effort or None,
+            service_tier=getattr(selection, "service_tier", "") or None,
             access_mode=selection.access_mode or None,
             permission_mode=selection.permission_mode or None,
             sandbox_mode=selection.sandbox_mode or None,
+            interaction_mode=turn.interaction_mode,
             options=options,
         )
         ref = await adapter.start(request)
         self._live.add(ref.agent_session_id)
+        self._session_modes[ref.agent_session_id] = turn.interaction_mode
+        self._closed_sessions.discard(ref.agent_session_id)
         self._remember_chat_revision(thread, ref)
         self._conv.save_turn(turn.model_copy(update={
             "agent_session_id": ref.agent_session_id,
@@ -1223,30 +1515,53 @@ class ExternalAgentSessionExecutor:
             "instance_id": ref.runtime_instance_id or "default",
             "model": selection.model,
             "effort": selection.effort,
+            "service_tier": selection.service_tier,
             "access_mode": selection.access_mode,
             "permission_mode": selection.permission_mode,
             "runtime": self._selection_snapshot(selection),
             "recovery_kind": recovery_kind,
             "recovery_reason": reason,
         }
+        if mode_change is not None:
+            event_payload["interaction_mode_from"] = mode_change[0]
+            event_payload["interaction_mode_to"] = mode_change[1]
         if handoff is not None:
             event_payload.update(handoff.to_event_payload())
         # Always persist state for the new session.
-        self._conv.save_state(state.model_copy(update={
+        self._conv.save_state(self._conv.get_state(thread.thread_id).model_copy(update={
             "agent_session_id": ref.agent_session_id,
             "session_runtime_key": selection.session_key,
             "current_generation": state.current_generation,
+            "native_fork": None,
         }))
-        if switched or force_new or (
+        if switched or force_new or mode_change is not None or (
             handoff is not None and handoff.included and not native_resume
         ):
             self._emit(thread.thread_id, ev.EV_RUNTIME_SWITCHED, event_payload)
         return adapter, ref
 
+    async def _prepare_native_fork(
+        self, state: ThreadState, selection: ThreadRuntimeSelection,
+        options: dict[str, Any], credential_env: dict[str, str],
+    ) -> None:
+        source = state.native_fork
+        if not source or source["adapter_id"] != selection.adapter_id:
+            return
+        plugins = getattr(self, "chat_plugins", None)
+        if plugins is not None:
+            await asyncio.to_thread(
+                plugins.prepare_codex_fork_history,
+                source["source_thread_id"] + ":" + source["source_credential_id"], credential_env,
+                previous_revision=plugins.session_revision(source["source_agent_session_id"]),
+            )
+        options.update(fork_from=source["native_thread_id"], fork_last_turn_id=source["native_turn_id"])
+        self._pending_handoff.pop(state.thread_id, None)
+
     async def _close_record(
         self, record: AgentSession, *, reason: str, strict: bool = False,
     ) -> None:
         """关闭一个活跃 Session：Adapter close（联动撤 grant）+ 事件。"""
+        self._continuation_sources.pop(record.thread_id or "", None)
         adapter = self._registry.get(
             record.adapter_id, record.runtime_instance_id or "default")
         if adapter is not None:
@@ -1266,6 +1581,9 @@ class ExternalAgentSessionExecutor:
         elif strict:
             raise RuntimeError("Runtime 已确认中断，但无法找到接入点以关闭其资源")
         self._live.discard(record.agent_session_id)
+        self._chat_contexts.pop(record.agent_session_id, None)
+        self._session_modes.pop(record.agent_session_id, None)
+        self._closed_sessions.add(record.agent_session_id)
         if record.thread_id:
             self._capability_cache.pop(record.thread_id, None)
             self._capability_failures.pop(record.thread_id, None)
@@ -1305,10 +1623,11 @@ class ExternalAgentSessionExecutor:
                 "stop detached conversation runtime failed: %s", thread_id)
 
     @staticmethod
-    def _turn_failure_keeps_session(payload: dict[str, Any]) -> bool:
-        reason = str(
-            payload.get("reason") or payload.get("stop_reason") or "")
-        return reason in _KEEP_SESSION_TURN_REASONS
+    def _turn_failure_keeps_session(failure: AgentFailure) -> bool:
+        return (
+            failure.category is FailureCategory.CANCELLED
+            or failure.reason in _KEEP_SESSION_FAILURE_REASONS
+        )
 
     async def reload_thread_capabilities(self, thread_id: str) -> dict[str, bool]:
         """Binding 变化后终止旧 Turn/Session，让下一轮签发新版 Grant。"""
@@ -1335,6 +1654,58 @@ class ExternalAgentSessionExecutor:
         return len(records)
 
     # -- Turn 执行 ------------------------------------------------------------------
+
+    def _offer_continuation(self, thread_id: str) -> None:
+        """T3 offerWake: dispatch only while the native wake is still current."""
+        if self._shutting_down:
+            return
+        task = self._continuation_tasks.get(thread_id)
+        if task is not None and not task.done():
+            return
+        task = asyncio.create_task(self._start_continuation(thread_id))
+        self._continuation_tasks[thread_id] = task
+        task.add_done_callback(lambda _task: self._continuation_tasks.pop(thread_id, None))
+
+    async def _start_continuation(self, thread_id: str) -> bool:
+        lock = self._queue_locks.setdefault(thread_id, asyncio.Lock())
+        async with lock:
+            source = self._continuation_sources.get(thread_id)
+            if source is None or self._shutting_down:
+                return False
+            adapter, ref = source
+            record = self._session_record(thread_id)
+            state = self._conv.get_state(thread_id)
+            task = self._tasks.get(thread_id)
+            if (record is None or record.closed_at is not None
+                    or record.agent_session_id != ref.agent_session_id
+                    or ref.agent_session_id in self._closed_sessions
+                    or thread_id in self._stop_fences or state.status != "active"
+                    or (task is not None and not task.done())
+                    or self._conv.active_turn_id(thread_id)):
+                return False
+            pending = adapter.pending_continuation(ref)
+            if pending is None:
+                return False
+            wake_id, detail = pending
+            try:
+                turn, _run, _task, _created = self._manager.request_turn(
+                    thread_id, kind="continuation", text="",
+                    idempotency_key=f"native-wake:{ref.agent_session_id}:{wake_id}")
+                self._native_wake_turns[turn.turn_id] = (ref.agent_session_id, wake_id)
+                self._emit(thread_id, ev.EV_TURN_REQUESTED, {
+                    "turn_id": turn.turn_id, "run_id": turn.run_id, "task_id": turn.task_id,
+                    "seq": turn.seq, "kind": "continuation", "text": "",
+                    "detail": detail, "interaction_mode": turn.interaction_mode,
+                })
+                self.start_turn(turn.turn_id)
+                return True
+            except Exception as exc:
+                LOG.exception("native continuation dispatch failed: %s", thread_id)
+                self._emit(thread_id, ev.EV_RUNTIME_ERROR, {
+                    "code": "conversation.continuation.dispatch_failed",
+                    "message": "后台续接回合启动失败", "detail": redact_secrets(str(exc)),
+                })
+                return False
 
     def start_turn(self, turn_id: str) -> None:
         """启动一个 Turn 的后台执行任务（异步命令模式的副作用）。"""
@@ -1419,6 +1790,7 @@ class ExternalAgentSessionExecutor:
                             "attachments": list(turn.attachments),
                             "capability_refs": list(turn.capability_refs),
                             "runtime_invocation": dict(turn.runtime_invocation),
+                            "interaction_mode": turn.interaction_mode,
                         },
                         actor_id=item.actor_id,
                         command_id=item.command_id or None,
@@ -1429,9 +1801,14 @@ class ExternalAgentSessionExecutor:
                 return True
             except Exception as exc:  # noqa: BLE001 — 队列发送失败必须持久化
                 LOG.exception("queue promotion failed: %s", item.queue_id)
+                full = redact_secrets(f"{type(exc).__name__}: {exc}")
+                detail = getattr(exc, "detail", "")
+                if detail:
+                    full += "\n" + redact_secrets(str(detail))
                 error = {
                     "code": "conversation.queue.dispatch_failed",
-                    "message": f"{type(exc).__name__}: {str(exc)[:300]}",
+                    "message": _summary_line(full),
+                    "detail": full,
                 }
                 self._conv.mark_queue_failed(item.queue_id, error)
                 self._emit(thread_id, ev.EV_QUEUE_DISPATCH_FAILED, {
@@ -1460,16 +1837,24 @@ class ExternalAgentSessionExecutor:
                 raise
             except Exception as exc:  # noqa: BLE001 — 边界可见，不静默
                 LOG.exception("turn failed: %s", turn.turn_id)
+                full = redact_secrets(f"{type(exc).__name__}: {exc}")
+                detail = getattr(exc, "detail", "")
+                if detail:
+                    full += "\n" + redact_secrets(str(detail))
+                native_code = getattr(exc, "code", None)
+                code = native_code if isinstance(native_code, str) and native_code else "conversation.turn.executor_error"
                 self._emit(turn.thread_id, ev.EV_RUNTIME_ERROR, {
                     "turn_id": turn.turn_id,
-                    "code": "conversation.turn.executor_error",
-                    "detail": f"{type(exc).__name__}: {str(exc)[:300]}",
+                    "code": code,
+                    "message": _summary_line(full),
+                    "detail": full,
                 })
                 self._emit(turn.thread_id, ev.EV_TURN_FAILED, {
                     "turn_id": turn.turn_id,
                     "error": {
-                        "code": "conversation.turn.executor_error",
-                        "message": f"{type(exc).__name__}: {str(exc)[:300]}",
+                        "code": code,
+                        "message": _summary_line(full),
+                        "detail": full,
                     },
                 }, command_id=turn.command_id or None)
                 if not isinstance(exc, ComposerCapabilityError):
@@ -1478,16 +1863,26 @@ class ExternalAgentSessionExecutor:
             finally:
                 self._tasks.pop(turn.thread_id, None)
                 current = self._conv.get_turn(turn.turn_id)
+                computer = getattr(self, "computer_control", None)
+                if computer is not None and (
+                    asyncio.current_task().cancelling()
+                    or (current is not None and current.status in {
+                        TURN_COMPLETED, TURN_FAILED, TURN_INTERRUPTED, TURN_CANCELLED,
+                    })
+                ):
+                    await computer.finish_turn(turn.thread_id, turn.turn_id)
                 if current is not None and current.status == TURN_COMPLETED:
-                    await self.start_next_queued(turn.thread_id)
+                    if not await self.start_next_queued(turn.thread_id):
+                        await self._start_continuation(turn.thread_id)
                 elif (
                     current is not None
-                    and current.status in {TURN_FAILED, TURN_INTERRUPTED}
+                    and current.status in {TURN_FAILED, TURN_INTERRUPTED, TURN_CANCELLED}
                     and self._conv.list_queue(turn.thread_id)
                 ):
                     reason = (
                         "turn_interrupted"
                         if current.status == TURN_INTERRUPTED
+                        else "turn_cancelled" if current.status == TURN_CANCELLED
                         else "turn_failed"
                     )
                     state = self._conv.pause_queue(turn.thread_id, reason)
@@ -1497,10 +1892,32 @@ class ExternalAgentSessionExecutor:
                         "queue_revision": state.queue_revision,
                     }, command_id=turn.command_id or None)
 
+    async def _capture_turn_checkpoint(self, thread: Thread, turn: TurnRecord) -> None:
+        workspace = (
+            self._manager.get_workspace(str(thread.workspace_id or ""))
+            if thread.workspace_id else None
+        )
+        root = str(workspace.root_path or "") if workspace is not None else ""
+        if not root:
+            return
+        try:
+            await asyncio.to_thread(capture_checkpoint, root, thread.thread_id, turn.turn_id)
+        except CheckpointError as exc:
+            # The turn still runs; only "restore files" for this turn is lost.
+            LOG.warning("turn checkpoint failed thread=%s turn=%s: %s", thread.thread_id, turn.turn_id, exc)
+            self._emit(thread.thread_id, ev.EV_RUNTIME_WARNING, {
+                "turn_id": turn.turn_id,
+                "severity": "warning",
+                "code": exc.code,
+                "message": f"未能保存本轮开始前的文件检查点，之后无法回退这一轮的文件：{exc}",
+            }, command_id=turn.command_id or None)
+
     async def _run_turn(self, turn: TurnRecord) -> None:
         thread = self._manager.get_thread(turn.thread_id)
         if thread is None:
             raise LookupError(f"unknown thread: {turn.thread_id}")
+        self._disposition_hints.pop(turn.thread_id, None)
+        await self._capture_turn_checkpoint(thread, turn)
         resume_supported = True
         if turn.kind == "resume":
             selection = self._manager.runtime_selection(thread.thread_id)
@@ -1518,7 +1935,29 @@ class ExternalAgentSessionExecutor:
                 or (turn.kind == "resume" and not resume_supported)
             ),
         )
-        if adapter.id == "grok.acp" and str(turn.runtime_invocation.get("name") or "") == "deep-research":
+        if isinstance(adapter, NativeContinuationAdapter):
+            self._continuation_sources[thread.thread_id] = (adapter, ref)
+
+            def native_background(origin_turn_id, updates):
+                if ref.agent_session_id in self._closed_sessions:
+                    return
+                record = self._session_record(thread.thread_id)
+                if record is None or record.agent_session_id != ref.agent_session_id or record.closed_at is not None:
+                    return
+                origin = self._conv.get_turn(origin_turn_id)
+                if origin is None or origin.status == "superseded":
+                    return
+                for kind, native, payload in updates:
+                    self._translate(thread.thread_id, origin, AgentEvent(
+                        event_type=kind, agent_session_id=ref.agent_session_id,
+                        execution_generation=record.execution_generation,
+                        payload=payload, native_type=native))
+
+            adapter.bind_continuations(ref, turn.turn_id, native_background,
+                                       lambda: self._offer_continuation(thread.thread_id))
+        if turn.runtime_invocation and isinstance(adapter, BackgroundUpdateAdapter):
+            # A runtime command can keep producing output after the turn
+            # stream ends; any adapter with a background channel gets a sink.
             background_started = False
             def background(updates):
                 nonlocal background_started
@@ -1526,9 +1965,22 @@ class ExternalAgentSessionExecutor:
                 if current is None or current.status == "superseded":
                     return
                 for kind, native, payload in updates:
-                    if kind in {AgentEventType.MESSAGE_DELTA, AgentEventType.MESSAGE_COMPLETED} and not payload.get("thinking"):
-                        text = str(payload.get("text") or "")
-                        if not text:
+                    try:
+                        model = parse_payload(kind, payload)
+                    except AgentEventContractError as exc:
+                        LOG.error("background runtime event rejected: %s", exc)
+                        failure = _contract_failure(exc, engine_for_adapter(adapter.id))
+                        self._emit(thread.thread_id, ev.EV_RUNTIME_ERROR, {
+                            "turn_id": turn.turn_id, "agent_session_id": ref.agent_session_id,
+                            "code": failure.code, "category": failure.category.value,
+                            "reason": failure.reason, "message": failure.message,
+                            "detail": failure.detail, "error": _public_failure(failure),
+                            "background": True,
+                        })
+                        continue
+                    if kind in {AgentEventType.MESSAGE_DELTA, AgentEventType.MESSAGE_COMPLETED}:
+                        text = model.text
+                        if not text or model.role != "assistant":
                             continue
                         if not background_started:
                             text = "\n\n" + text
@@ -1542,16 +1994,23 @@ class ExternalAgentSessionExecutor:
                     else:
                         self._translate(thread.thread_id, turn, AgentEvent(
                             event_type=kind, agent_session_id=ref.agent_session_id,
-                            payload=payload, native_type=native))
+                            payload=payload, native_type=native), model)
             adapter.bind_background_handler(ref, background)
         # #119: 会话已连接后主动刷新能力目录，勿依赖用户打开 / $ @ 命令菜单。
         cached_caps = self._capability_cache.get(thread.thread_id)
         if cached_caps is None or cached_caps.stale:
             self.refresh_runtime_capabilities(thread.thread_id)
-        # Devin session/load restores history during ensure_session; it does
-        # not run another turn. Send the current continuation prompt below.
-        if (turn.kind == "resume" and resume_supported
-                and adapter.id != "devin.acp"):
+        application_context_delivery = None
+        # Adapters whose session/load restores history during ensure_session
+        # do not run another turn on resume; send the continuation prompt.
+        if turn.kind == "continuation":
+            pending = self._native_wake_turns.pop(turn.turn_id, None)
+            if (not isinstance(adapter, NativeContinuationAdapter) or pending is None
+                    or pending[0] != ref.agent_session_id):
+                raise ConversationError("后台续接所属会话已失效", code="conversation.continuation.stale")
+            stream = adapter.run_continuation(ref, pending[1])
+        elif (turn.kind == "resume" and resume_supported
+                and await self._resume_continues_turn(adapter)):
             # Native resume path: do not also dump structured handoff into send.
             self._pending_handoff.pop(thread.thread_id, None)
             stream = adapter.resume(ref)
@@ -1611,8 +2070,7 @@ class ExternalAgentSessionExecutor:
                 snapshot = await adapter.runtime_capability_snapshot(ref)
                 snapshot = self._enrich_capability_snapshot(
                     thread.thread_id, snapshot, adapter_id=adapter.id,
-                    instance_id=getattr(
-                        adapter.identity, "instance_id", "default"),
+                    instance_id=adapter.identity.instance_id,
                 )
                 self._capability_cache[thread.thread_id] = snapshot
                 client_revision = runtime_invocation.get("revision")
@@ -1635,6 +2093,8 @@ class ExternalAgentSessionExecutor:
                 runtime_invocation["arguments"] = str(
                     turn.runtime_invocation.get("arguments") or "")
                 runtime_invocation["revision"] = snapshot.revision
+                if matched.name == "compact":
+                    self._chat_contexts.pop(ref.agent_session_id, None)
                 if matched.kind == "operation" and matched.resolution == "client":
                     arguments = str(runtime_invocation.get("arguments") or "")
                     result = await adapter.runtime_operation(ref, matched.name, arguments) if arguments else await adapter.runtime_operation(ref, matched.name)
@@ -1660,10 +2120,18 @@ class ExternalAgentSessionExecutor:
                 )
             plugins = getattr(self, "chat_plugins", None)
             if plugins is not None and thread.mode == "conversation":
+                from .computer_control import chat_context as computer_chat_context
                 skill_context = plugins.skill_catalog_context(engine_for_adapter(selection.adapter_id))
-                text = plugins.visualization_context(thread.thread_id) + "\n" + text
-                if skill_context:
-                    text = skill_context + "\n\n" + text
+                context = "\n\n".join(part for part in (
+                    computer_chat_context(selection.access_mode, gateway_available=(
+                        adapter.injection_plan(ref.agent_session_id) is not None)), skill_context,
+                    plugins.visualization_context(thread.thread_id)) if part)
+                revision = f"{adapter.context_revision(ref)}:" + sha256(context.encode()).hexdigest()
+                cacheable = adapter.context_compaction_events
+                if not cacheable or self._chat_contexts.get(ref.agent_session_id) != revision:
+                    text = context + "\n\n" + text
+                    if cacheable:
+                        application_context_delivery = (ref.agent_session_id, revision)
             attachment_payload: list[dict[str, Any]] = []
             if turn.attachments:
                 try:
@@ -1687,11 +2155,12 @@ class ExternalAgentSessionExecutor:
             if runtime_invocation and runtime_invocation.get("kind") != "skill":
                 from muteki.external_agents.command_providers import native_prompt
                 text = native_prompt(runtime_invocation, str(runtime_invocation.get("arguments") or ""))
+                application_context_delivery = None
             elif runtime_invocation and (runtime_invocation.get("invocation") or {}).get("protocol") != "codex.turn/start":
                 from muteki.external_agents.command_providers import native_prompt
                 text = native_prompt(runtime_invocation, str(runtime_invocation.get("arguments") or ""))
-            stream = adapter.send(ref, AgentInput(
-                kind="message",
+                application_context_delivery = None
+            stream = adapter.send(ref, MessageInput(
                 text=text,
                 payload={
                     "attachments": attachment_payload,
@@ -1700,13 +2169,16 @@ class ExternalAgentSessionExecutor:
                     "runtime_command_arguments": str(
                         runtime_invocation.get("arguments") or ""
                     ),
+                    "interaction_mode": turn.interaction_mode,
                 },
             ))
-        await self._consume(thread.thread_id, turn, stream)
+        await self._consume(thread.thread_id, turn, stream,
+                            application_context_delivery=application_context_delivery)
 
     async def _consume(
         self, thread_id: str, turn: Optional[TurnRecord], stream: Any,
         *, require_control_delivery: bool = False,
+        application_context_delivery: Optional[tuple[str, str]] = None,
     ) -> None:
         """消费 Adapter 事件流并翻译为 Thread Public Event。"""
         interrupted = False
@@ -1723,20 +2195,54 @@ class ExternalAgentSessionExecutor:
         )
         saw_failed_turn = False
         model_recorded = False
+        fence = self._open_fence(thread_id, turn)
         try:
             async for event in stream:
+                if fence is not None and self._fence_violation(thread_id, turn, fence, event):
+                    continue
+                try:
+                    model = parse_payload(event.event_type, event.payload)
+                except AgentEventContractError as exc:
+                    # A malformed adapter frame is a Runtime bug: surface it
+                    # as a typed failure and end the turn instead of guessing
+                    # what the engine meant.
+                    LOG.error("runtime event rejected thread=%s: %s", thread_id, exc)
+                    failure = _contract_failure(exc, engine_for_adapter(
+                        self._manager.runtime_selection(thread_id).adapter_id))
+                    turn_ref = turn.turn_id if turn else event.turn_id
+                    if require_control_delivery:
+                        raise ControlDeliveryError(failure.code) from exc
+                    self._disposition_hints[thread_id] = DISPOSITION_NEEDS_RESTART
+                    self._emit(thread_id, ev.EV_RUNTIME_ERROR, {
+                        "agent_session_id": event.agent_session_id,
+                        **({"turn_id": turn_ref} if turn_ref else {}),
+                        "code": failure.code, "category": failure.category.value,
+                        "reason": failure.reason, "message": failure.message,
+                        "detail": failure.detail, "error": _public_failure(failure),
+                    })
+                    if turn_ref:
+                        self._emit(thread_id, ev.EV_TURN_FAILED, {
+                            "agent_session_id": event.agent_session_id,
+                            "turn_id": turn_ref,
+                            "reason": failure.reason,
+                            "error": _public_failure(failure),
+                        }, command_id=(turn.command_id or None) if turn else None)
+                    saw_failed_turn = True
+                    detach_reason = "event_contract"
+                    return
+                if application_context_delivery is not None and event.event_type is AgentEventType.TURN_STARTED:
+                    session_id, revision = application_context_delivery
+                    self._chat_contexts[session_id] = revision
                 if event.event_type is AgentEventType.TURN_FAILED:
                     saw_failed_turn = True
+                    if not self._turn_failure_keeps_session(model.error):
+                        detach_reason = "turn_failed"
+                        self._disposition_hints[thread_id] = DISPOSITION_NEEDS_RESTART
                 if event.event_type is AgentEventType.RUNTIME_ERROR:
-                    runtime_error = dict(event.payload)
+                    runtime_error = _public_failure(model.error)
                 if event.event_type is AgentEventType.RUNTIME_EXITED:
                     detach_reason = "runtime_exited"
-                if (
-                    event.event_type is AgentEventType.TURN_FAILED
-                    and not self._turn_failure_keeps_session(
-                        dict(event.payload or {}))
-                ):
-                    detach_reason = "turn_failed"
+                    self._disposition_hints[thread_id] = DISPOSITION_NEEDS_RESTART
                 if require_control_delivery and event.event_type in {
                     AgentEventType.RUNTIME_ERROR,
                     AgentEventType.TURN_FAILED,
@@ -1745,10 +2251,12 @@ class ExternalAgentSessionExecutor:
                     # Control streams may report rejection as an event and end
                     # normally. Let the command handler retain the pending item;
                     # publishing a successful resolved event would lose it.
-                    payload = dict(event.payload or {})
-                    raise ControlDeliveryError(str(
-                        payload.get("code") or event.event_type.value),
-                        delivery_unknown=bool(payload.get("delivery_unknown")))
+                    failure = getattr(model, "error", None)
+                    raise ControlDeliveryError(
+                        failure.code if failure is not None else event.event_type.value,
+                        delivery_unknown=bool(failure is not None and failure.delivery_unknown),
+                        reason=failure.reason if failure is not None else "",
+                    )
                 if (require_control_delivery
                         and event.event_type in {AgentEventType.APPROVAL_RESOLVED,
                                                 AgentEventType.USER_INPUT_RESOLVED}):
@@ -1757,25 +2265,13 @@ class ExternalAgentSessionExecutor:
                     # translate autonomous resolution normally.
                     continue
                 if event.event_type is AgentEventType.MESSAGE_COMPLETED:
-                    payload = dict(event.payload or {})
-                    role = str(payload.get("role") or "assistant").lower()
                     saw_completed_assistant = (
-                        role in {"assistant", "agent"}
-                        and bool(str(payload.get("text") or "").strip())
+                        model.role == "assistant" and bool(model.text.strip())
                     ) or saw_completed_assistant
-                if (event.event_type is AgentEventType.TURN_COMPLETED
-                        and not saw_completed_assistant):
-                    self._emit(thread_id, ev.EV_TURN_FAILED, {
-                        "turn_id": turn.turn_id if turn else event.turn_id,
-                        "error": {
-                            "code": "conversation.empty_assistant",
-                            "message": "Runtime completed without assistant text",
-                        },
-                    }, command_id=(turn.command_id or None) if turn else None)
-                    continue
                 if (
                     event.event_type is AgentEventType.TURN_COMPLETED
                     and verification_runtime is not None
+                    and saw_completed_assistant
                     and not model_recorded and not saw_failed_turn
                     and not interrupted and runtime_error is None
                 ):
@@ -1788,7 +2284,20 @@ class ExternalAgentSessionExecutor:
                         model_recorded = True
                     except Exception:  # noqa: BLE001 — metadata must not fail a successful reply
                         LOG.warning("could not record model success for turn %s", turn.turn_id, exc_info=True)
-                interrupted = self._translate(thread_id, turn, event) or interrupted
+                if event.event_type is AgentEventType.TURN_COMPLETED:
+                    plugins = getattr(self, "chat_plugins", None)
+                    thread = self._manager.get_thread(thread_id) if plugins is not None else None
+                    if thread is not None and thread.mode == "conversation":
+                        messages = [message for message in self._conv.list_current_messages(thread_id)
+                                    if message.turn_id == (turn.turn_id if turn else event.turn_id)]
+                        try:
+                            await asyncio.to_thread(
+                                plugins.publish_visualizations, thread_id, messages,
+                                engine_for_adapter(self._manager.runtime_selection(thread_id).adapter_id),
+                            )
+                        except Exception:  # A failed visual stays a visible local error, never discards the reply.
+                            LOG.warning("could not publish visual replies for thread %s", thread_id, exc_info=True)
+                interrupted = self._translate(thread_id, turn, event, model) or interrupted
             if interrupted and turn is not None:
                 current = self._conv.get_turn(turn.turn_id)
                 if current is not None and current.status == TURN_RUNNING:
@@ -1813,6 +2322,7 @@ class ExternalAgentSessionExecutor:
                     "code": "conversation.turn.stream_ended",
                     "detail": "runtime event stream ended without a terminal turn event",
                 }
+                self._disposition_hints[thread_id] = DISPOSITION_NEEDS_RESTART
                 self._emit(thread_id, ev.EV_TURN_FAILED, {
                     "turn_id": turn.turn_id,
                     "error": error,
@@ -1822,16 +2332,111 @@ class ExternalAgentSessionExecutor:
             detach_reason = "consume_cancelled"
             raise
         finally:
+            if application_context_delivery is not None and (saw_failed_turn or runtime_error or interrupted or detach_reason):
+                self._chat_contexts.pop(application_context_delivery[0], None)
             if detach_reason:
                 await self._stop_detached_runtime(
                     thread_id, reason=f"conversation_runtime_detached:{detach_reason}")
+            computer = getattr(self, "computer_control", None)
+            current = self._conv.get_turn(turn.turn_id) if turn is not None else None
+            if computer is not None and current is not None and current.status in {
+                TURN_COMPLETED, TURN_FAILED, TURN_INTERRUPTED, TURN_CANCELLED,
+            }:
+                await computer.finish_turn(thread_id, turn.turn_id)
+
+    def _open_fence(
+        self, thread_id: str, turn: Optional[TurnRecord],
+    ) -> Optional[_StreamFence]:
+        """Bind a stream to the session its turn (or the thread) is running on."""
+        session_id = ""
+        if turn is not None:
+            stored = self._conv.get_turn(turn.turn_id)
+            session_id = str(
+                (stored.agent_session_id if stored is not None else "")
+                or turn.agent_session_id or "")
+        if not session_id:
+            session_id = str(
+                getattr(self._conv.get_state(thread_id), "agent_session_id", "") or "")
+        if not session_id:
+            return None
+        record = self._store.get(AgentSession, session_id)
+        run_id = ""
+        if turn is not None and turn.run_id:
+            run_id = str(turn.run_id)
+        elif record is not None and record.run_id:
+            run_id = str(record.run_id)
+        return _StreamFence(
+            session_id=session_id,
+            generation=record.execution_generation if record is not None else None,
+            run_id=run_id,
+        )
+
+    def _fence_violation(
+        self, thread_id: str, turn: Optional[TurnRecord],
+        fence: _StreamFence, event: AgentEvent,
+    ) -> str:
+        """Drop events that belong to another session, run, or generation.
+
+        Returns the reason ("" when the event is the stream's own); one typed
+        warning per reason is published so the drop stays observable.
+        """
+        reason = ""
+        if event.agent_session_id and event.agent_session_id != fence.session_id:
+            reason = "foreign_session"
+        elif fence.session_id in self._closed_sessions:
+            reason = "session_replaced"
+        elif (event.execution_generation is not None
+              and fence.generation is not None
+              and event.execution_generation != fence.generation):
+            reason = "stale_generation"
+        elif event.run_id:
+            event_run = str(event.run_id)
+            session_run = ""
+            bound = self._store.get(AgentSession, fence.session_id)
+            if bound is not None and bound.run_id:
+                session_run = str(bound.run_id)
+            if event_run not in {fence.run_id, session_run}:
+                owned = self._conv.get_run(event_run)
+                if owned is None or owned.thread_id != thread_id:
+                    reason = "foreign_run"
+        if not reason:
+            return ""
+        fence.dropped += 1
+        if reason not in fence.reported:
+            fence.reported.add(reason)
+            LOG.warning(
+                "fenced runtime event thread=%s reason=%s session=%s expected=%s",
+                thread_id, reason, event.agent_session_id, fence.session_id)
+            self._emit(thread_id, ev.EV_RUNTIME_WARNING, {
+                "code": FENCED_EVENT_CODE,
+                "reason": reason,
+                "severity": "warning",
+                "message": "dropped a runtime event that does not belong to the current session",
+                "agent_session_id": event.agent_session_id or fence.session_id,
+                "expected_agent_session_id": fence.session_id,
+                "event_execution_generation": event.execution_generation,
+                "expected_execution_generation": fence.generation,
+                "event_run_id": event.run_id,
+                "expected_run_id": fence.run_id,
+                "event_type": event.event_type.value,
+                **({"turn_id": turn.turn_id} if turn is not None else {}),
+            }, command_id=(turn.command_id or None) if turn else None)
+        return reason
 
     # -- AgentEvent → Thread 事件 ------------------------------------------------
 
     def _translate(
-        self, thread_id: str, turn: Optional[TurnRecord], event: AgentEvent
+        self, thread_id: str, turn: Optional[TurnRecord], event: AgentEvent,
+        model: Any = None,
     ) -> bool:
-        """翻译一条统一 AgentEvent。返回本次是否观察到 interrupt 分类。"""
+        """翻译一条统一 AgentEvent。返回本次是否观察到 interrupt 分类。
+
+        ``model`` is the payload already validated by ``parse_payload``; the
+        Thread event is built only from its normalized fields, so adapter
+        payloads can never override executor-owned keys.
+        """
+        if model is None:
+            model = parse_payload(event.event_type, event.payload)
         turn_id = (turn.turn_id if turn is not None else None) or event.turn_id
         base: dict[str, Any] = {
             "agent_session_id": event.agent_session_id,
@@ -1842,20 +2447,26 @@ class ExternalAgentSessionExecutor:
             # Runtime 内部的 turn id 仅作排障信息保留，不驱动 TurnRecord。
             base["runtime_turn_id"] = event.turn_id
         etype = event.event_type
-        p = event.payload
+        fields = dump_payload(model)
+        native = fields.pop("native", None)
+        if native:
+            base["native"] = native
         out_type: Optional[str] = None
         payload: dict[str, Any] = {}
 
-        if etype is AgentEventType.SESSION_STARTED:
-            out_type, payload = ev.EV_SESSION_STARTED, {
-                **base, **p, "runtime": self._runtime_snapshot(thread_id),
+        def public(values: dict[str, Any], **extra: Any) -> dict[str, Any]:
+            return {
+                **{key: value for key, value in values.items() if value is not None},
+                **extra,
+                **base,
             }
-        elif etype is AgentEventType.SESSION_RESUMED:
-            out_type, payload = ev.EV_SESSION_RESUMED, {
-                **base, **p, "runtime": self._runtime_snapshot(thread_id),
-            }
+
+        if etype in (AgentEventType.SESSION_STARTED, AgentEventType.SESSION_RESUMED):
+            out_type = (ev.EV_SESSION_STARTED if etype is AgentEventType.SESSION_STARTED
+                        else ev.EV_SESSION_RESUMED)
+            payload = public(fields, runtime=self._runtime_snapshot(thread_id))
         elif etype is AgentEventType.SESSION_CLOSED:
-            out_type, payload = ev.EV_SESSION_CLOSED, {**base, **p}
+            out_type, payload = ev.EV_SESSION_CLOSED, public(fields)
         elif etype is AgentEventType.TURN_STARTED:
             if turn is not None and event.turn_id:
                 stored = self._conv.get_turn(turn.turn_id)
@@ -1864,92 +2475,115 @@ class ExternalAgentSessionExecutor:
             # A session can serve multiple turns.  Snapshot the selection on
             # every turn so the UI can label historical replies after a later
             # endpoint or model switch.
-            out_type, payload = ev.EV_TURN_STARTED, {
-                **base, **p, "runtime": self._runtime_snapshot(thread_id),
-            }
+            out_type, payload = ev.EV_TURN_STARTED, public(
+                fields, runtime=self._runtime_snapshot(thread_id))
         elif etype is AgentEventType.MESSAGE_DELTA:
-            role = str(p.get("role") or "assistant").lower()
-            if role not in {"assistant", "agent"}:
+            if model.role != "assistant" or not model.text:
                 return False
-            if p.get("thinking") is True:
-                text = str(p.get("reasoning_summary") or p.get("text") or "")
-                if not text:
-                    return False
-                out_type, payload = ev.EV_REASONING_SUMMARY, {
-                    **base,
-                    "reasoning_summary": text,
-                    "partial": True,
-                }
-            else:
-                out_type, payload = ev.EV_MESSAGE_DELTA, {
-                    **base, **p, "role": "assistant"}
+            out_type, payload = ev.EV_MESSAGE_DELTA, public(fields, role="assistant")
         elif etype is AgentEventType.MESSAGE_COMPLETED:
-            role = str(p.get("role") or "assistant").lower()
-            text = str(p.get("text") or "")
-            if role not in {"assistant", "agent"} or not text.strip():
+            if model.role != "assistant" or not model.text.strip():
                 return False
-            out_type, payload = ev.EV_MESSAGE_COMPLETED, {
-                **base, **p, "text": text, "role": "assistant"}
+            out_type, payload = ev.EV_MESSAGE_COMPLETED, public(fields, role="assistant")
         elif etype is AgentEventType.REASONING_SUMMARY:
             # Runtime-provided reasoning is a dedicated public stream so the UI
             # can place it inside the turn's expandable work process.
-            out_type, payload = ev.EV_REASONING_SUMMARY, {**base, **p}
-        elif etype is AgentEventType.TOOL_STARTED:
-            out_type, payload = ev.EV_TOOL_STARTED, {**base, **p}
-        elif etype is AgentEventType.TOOL_PROGRESS:
-            # Progress/output deltas are not lifecycle starts (#218).
-            out_type, payload = ev.EV_TOOL_PROGRESS, {**base, **p}
-        elif etype is AgentEventType.TOOL_COMPLETED:
-            out_type, payload = ev.EV_TOOL_COMPLETED, {**base, **p}
+            out_type, payload = ev.EV_REASONING_SUMMARY, public(
+                fields, reasoning_summary=model.text, partial=model.partial)
+        elif etype in (AgentEventType.TOOL_STARTED, AgentEventType.TOOL_PROGRESS,
+                       AgentEventType.TOOL_COMPLETED):
+            out_type = {
+                AgentEventType.TOOL_STARTED: ev.EV_TOOL_STARTED,
+                # Progress/output deltas are not lifecycle starts (#218).
+                AgentEventType.TOOL_PROGRESS: ev.EV_TOOL_PROGRESS,
+                AgentEventType.TOOL_COMPLETED: ev.EV_TOOL_COMPLETED,
+            }[etype]
+            parent = fields.pop("parent_tool_call_id", None)
+            extra: dict[str, Any] = {"call_id": model.tool_call_id}
+            if model.name:
+                extra["tool"] = model.name
+            if parent:
+                extra["parent_tool_use_id"] = parent
+            if model.kind == "agent":
+                extra["is_agent"] = True
+            if model.status == "failed" or model.error:
+                extra["is_error"] = True
+            payload = public(fields, **extra)
         elif etype is AgentEventType.APPROVAL_REQUESTED:
-            request = ApprovalRequest.from_payload(p)
+            approval = dict(fields)
+            unified_diff = approval.pop("unified_diff", None)
+            if unified_diff:
+                approval["diff"] = unified_diff
+            if model.files:
+                approval["files"] = [
+                    {key: value for key, value in {
+                        "path": item.path, "kind": item.change,
+                        "old_path": item.old_path, "diff": item.unified_diff,
+                    }.items() if value is not None}
+                    for item in model.files
+                ]
+            if native:
+                approval["native"] = native
+            request = ApprovalRequest.from_payload(approval)
             normalized = normalize_approval_payload(request.to_payload())
-            out_type, payload = ev.EV_APPROVAL_REQUESTED, {
-                **base, **normalized}
+            normalized.update(base)
+            normalized = stamp_response_capability(
+                normalized,
+                agent_session_id=event.agent_session_id,
+                generation=event.execution_generation)
+            out_type, payload = ev.EV_APPROVAL_REQUESTED, normalized
+        elif etype is AgentEventType.APPROVAL_RESOLVED:
+            # ACP 等 Runtime 可以按会话策略自动完成审批；这类结果没有经过
+            # Web 的 approval.resolve 命令，也必须进入投影以清除待处理状态。
+            out_type, payload = ev.EV_APPROVAL_RESOLVED, public(fields)
         elif etype is AgentEventType.USER_INPUT_REQUESTED:
-            out_type, payload = ev.EV_USER_INPUT_REQUESTED, {
-                **base, **normalize_pending_user_input({**p}),
-            }
+            pending = dict(fields)
+            schema = pending.pop("requested_schema", None)
+            if schema is not None:
+                pending["schema"] = schema
+            if native:
+                pending["native"] = native
+            normalized = normalize_pending_user_input(pending)
+            normalized.update(base)
+            out_type, payload = ev.EV_USER_INPUT_REQUESTED, normalized
+        elif etype is AgentEventType.USER_INPUT_RESOLVED:
+            # Native timeout/cancellation is authoritative too. The matching
+            # request ID protects a newer question from a late acknowledgement.
+            out_type, payload = ev.EV_USER_INPUT_RESOLVED, public(fields)
         elif etype is AgentEventType.USAGE_UPDATED:
-            out_type, payload = ev.EV_USAGE_UPDATED, {**base, **p, "usage_native_type": event.native_type, "runtime": self._runtime_snapshot(thread_id)}
+            out_type, payload = ev.EV_USAGE_UPDATED, self._usage_payload(
+                thread_id, model, base, event.native_type)
         elif etype is AgentEventType.PLAN_UPDATED:
-            out_type, payload = ev.EV_PLAN_UPDATED, {
-                **base,
-                **p,
-                "source": str(p.get("source") or "adapter"),
-                "native_type": event.native_type,
-            }
+            out_type, payload = ev.EV_PLAN_UPDATED, public(
+                fields, source="adapter", native_type=event.native_type)
         elif etype is AgentEventType.AGENT_UPDATED:
-            agents = [{**node, "turn_id": turn_id} for node in p.get("agents", [])
-                      if isinstance(node, dict)]
-            out_type, payload = ev.EV_AGENT_UPDATED, {
-                **base, **p, "agents": agents,
-                "source": "adapter", "native_type": event.native_type,
-            }
+            agents = [{**node, "turn_id": turn_id} for node in fields.pop("agents")]
+            out_type, payload = ev.EV_AGENT_UPDATED, public(
+                fields, agents=agents, source="adapter",
+                native_type=event.native_type)
         elif etype is AgentEventType.RUNTIME_CAPABILITIES_UPDATED:
-            out_type, payload = ev.EV_RUNTIME_CAPABILITIES_UPDATED, {
-                **base, **p,
-            }
+            out_type, payload = ev.EV_RUNTIME_CAPABILITIES_UPDATED, public(fields)
             # Runtime 已报告目录变化：同步拉会话级快照，避免 matrix 仍停在 revision 0。
             self.refresh_runtime_capabilities(thread_id)
         elif etype is AgentEventType.RUNTIME_WARNING:
-            out_type, payload = ev.EV_RUNTIME_WARNING, {
-                **base, "severity": "warning", **p}
+            out_type, payload = ev.EV_RUNTIME_WARNING, public(
+                fields, severity="warning")
         elif etype is AgentEventType.RUNTIME_ERROR:
-            out_type, payload = ev.EV_RUNTIME_ERROR, {**base, **p}
+            failure: AgentFailure = model.error
+            out_type, payload = ev.EV_RUNTIME_ERROR, public(
+                {}, code=failure.code, category=failure.category.value,
+                reason=failure.reason, message=failure.message,
+                detail=failure.detail, retryable=failure.retryable,
+                delivery_unknown=failure.delivery_unknown,
+                error=_public_failure(failure))
         elif etype is AgentEventType.ARTIFACT_CREATED:
-            saved = self._save_agent_artifact(thread_id, turn, p)
-            out_type, payload = ev.EV_ARTIFACT_CREATED, {
-                **base, **p, **saved,
-            }
+            saved = self._save_agent_artifact(thread_id, turn, fields)
+            out_type, payload = ev.EV_ARTIFACT_CREATED, public(
+                {key: value for key, value in fields.items()
+                 if key != "content_base64"}, **saved)
         elif etype is AgentEventType.WORKSPACE_CHANGED:
-            diff = str(
-                p.get("diff")
-                or (p.get("native") or {}).get("diff")
-                or (p.get("native") or {}).get("unifiedDiff")
-                or (p.get("native") or {}).get("patch")
-                or ""
-            )
+            diff = model.unified_diff or "\n".join(
+                item.unified_diff for item in model.files if item.unified_diff)
             if diff:
                 artifact = self._manager.attach_artifact(
                     thread_id,
@@ -1979,45 +2613,79 @@ class ExternalAgentSessionExecutor:
                             else None
                         ),
                     }, command_id=(turn.command_id or None) if turn else None)
-            out_type, payload = ev.EV_WORKSPACE_CHANGED, {
-                **base,
-                "diff": diff,
-                "has_diff": bool(diff),
-            }
+            out_type, payload = ev.EV_WORKSPACE_CHANGED, public(
+                {"files": fields.get("files")}, diff=diff, has_diff=bool(diff))
         elif etype is AgentEventType.TURN_COMPLETED:
-            out_type, payload = ev.EV_TURN_COMPLETED, {**base, **p}
+            out_type, payload = ev.EV_TURN_COMPLETED, public(fields)
         elif etype is AgentEventType.TURN_FAILED:
-            reason = str(p.get("reason") or "")
-            if reason == EXIT_INTERRUPTED:
-                out_type = ev.EV_TURN_INTERRUPTED
-            else:
-                out_type = ev.EV_TURN_FAILED
-            payload = {**base, **p}
+            failure = model.error
+            out_type = (ev.EV_TURN_INTERRUPTED
+                        if failure.category is FailureCategory.CANCELLED
+                        else ev.EV_TURN_FAILED)
+            payload = public({}, reason=failure.reason,
+                             error=_public_failure(failure))
+            if failure.category is FailureCategory.CANCELLED:
+                # Retain the terminal event family for existing SSE clients;
+                # its typed status distinguishes refusal from our interrupt.
+                payload["status"] = (
+                    TURN_INTERRUPTED if failure.reason == "interrupted"
+                    else TURN_CANCELLED)
         elif etype is AgentEventType.RUNTIME_EXITED:
             self._emit(
-                thread_id, ev.EV_RUNTIME_EXITED, {**base, **p},
+                thread_id, ev.EV_RUNTIME_EXITED, public(fields),
                 command_id=(turn.command_id or None) if turn else None)
-            return str(p.get("classification") or "") == EXIT_INTERRUPTED
-        elif etype is AgentEventType.APPROVAL_RESOLVED:
-            # ACP 等 Runtime 可以按会话策略自动完成审批；这类结果没有经过
-            # Web 的 approval.resolve 命令，也必须进入投影以清除待处理状态。
-            out_type, payload = ev.EV_APPROVAL_RESOLVED, {**base, **p}
-        elif etype is AgentEventType.USER_INPUT_RESOLVED:
-            # Native timeout/cancellation is authoritative too. The matching
-            # request ID protects a newer question from a late acknowledgement.
-            out_type, payload = ev.EV_USER_INPUT_RESOLVED, {**base, **p}
-        else:
-            # 未知 / 私有事件进入诊断事件流，不改变错误状态。
-            out_type, payload = ev.EV_RUNTIME_EVENT, {
-                **base, "severity": "info",
-                "native_type": event.native_type or str(etype),
-                "native": p,
-            }
+            return model.classification == EXIT_INTERRUPTED
 
         if out_type is not None:
             self._emit(thread_id, out_type, payload,
                        command_id=(turn.command_id or None) if turn else None)
         return False
+
+    def _usage_payload(
+        self, thread_id: str, model: Any, base: dict[str, Any],
+        native_type: Optional[str],
+    ) -> dict[str, Any]:
+        """Normalized usage -> ``core.usage.updated``.
+
+        ``usage`` uses the ledger's canonical names (``core.usage.normalize``)
+        with ``input_includes_cache`` set, so no consumer guesses aliases.
+        ``usage_native_type`` keeps the two values projections branch on
+        (session cumulative / context-only) until they read ``usage_scope``.
+        """
+        usage = {
+            key: value for key, value in {
+                "input_tokens": model.input_tokens,
+                "output_tokens": model.output_tokens,
+                "cache_read_tokens": model.cached_input_tokens,
+                "cache_write_tokens": model.cache_write_tokens,
+                "reasoning_tokens": model.reasoning_tokens,
+                "total_tokens": model.total_tokens,
+                "model_context_window": model.context_window,
+                "context_used": model.context_used_tokens,
+                "reported_cost": model.cost_usd,
+                "step_count": model.step_count,
+                "llm_duration_ms": model.llm_duration_ms,
+            }.items() if value is not None
+        }
+        usage["input_includes_cache"] = True
+        # Version the canonical inclusive buckets so replay of pre-normalization
+        # events can be repaired without adding cache/reasoning twice.
+        usage["token_schema_version"] = 2
+        compat_native = {
+            "session_cumulative": "thread/tokenUsage/updated",
+            "context_only": "acp.usage_update",
+        }.get(model.scope, native_type)
+        payload: dict[str, Any] = {
+            "usage": usage,
+            "usage_scope": model.scope,
+            "usage_native_type": compat_native,
+            "runtime": self._runtime_snapshot(thread_id),
+        }
+        if model.usage_id:
+            # Ledger identity is thread-scoped; adapter ids are session-scoped.
+            payload["usage_id"] = f"{base['agent_session_id']}:{model.usage_id}"
+        payload.update(base)
+        return payload
 
     def _save_agent_artifact(
         self, thread_id: str, turn: Optional[TurnRecord], payload: dict[str, Any]
@@ -2078,7 +2746,7 @@ class ExternalAgentSessionExecutor:
         matrix_payload = self.interaction_matrix_for(
             thread_id,
             adapter_id=adapter.id,
-            instance_id=getattr(adapter.identity, "instance_id", "default"),
+            instance_id=adapter.identity.instance_id,
         )
         rows = {
             str(item.get("key")): item
@@ -2150,8 +2818,7 @@ class ExternalAgentSessionExecutor:
                     },
                 ),
             )
-        return await adapter.steer(ref, AgentInput(
-            kind="steer",
+        return await adapter.steer(ref, SteerInput(
             text=text,
             payload={
                 "expected_turn_id": expected_turn_id,
@@ -2159,6 +2826,12 @@ class ExternalAgentSessionExecutor:
                 "capability_revision": current_revision,
             },
         ))
+
+    def background_turn_id(self, thread_id: str) -> str | None:
+        source = self._continuation_sources.get(thread_id)
+        if source is None or source[1].agent_session_id in self._closed_sessions:
+            return None
+        return source[0].background_turn_id(source[1])
 
     async def interrupt(self, thread_id: str) -> CommandReceipt:
         """中断当前 Turn：转发给 Adapter，并等到 Turn 任务收尾。"""
@@ -2175,8 +2848,21 @@ class ExternalAgentSessionExecutor:
     async def _interrupt_and_release(self, thread_id: str) -> CommandReceipt:
         adapter, ref = self._ref_for(thread_id)
         task = self._tasks.get(thread_id)
-        receipt = await adapter.interrupt(ref)
+        computer = getattr(self, "computer_control", None)
+        turn_id = self._conv.get_state(thread_id).running_turn_id
+        # The runtime is released after the stream drains, so the interrupted
+        # event already reports the closed session.
+        self._disposition_hints[thread_id] = DISPOSITION_CLOSED
+        # Deliver cancellation to both owned runtimes. Starting the adapter's
+        # request first lets its native events classify aborted tools correctly.
+        interrupt_task = asyncio.create_task(adapter.interrupt(ref))
+        try:
+            if computer is not None and turn_id:
+                await computer.abort_turn(thread_id, turn_id)
+        finally:
+            receipt = await interrupt_task
         if receipt.error is not None or receipt.state is not ReceiptState.COMPLETED:
+            self._disposition_hints.pop(thread_id, None)
             return receipt
         if task is not None and not task.done():
             try:
@@ -2202,6 +2888,25 @@ class ExternalAgentSessionExecutor:
             await self._close_record(record, reason="operator_stopped", strict=True)
         return receipt
 
+    def approval_response_capability(
+        self, thread_id: str, row: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Whether the runtime that issued ``row`` can still receive the answer."""
+        state = self._conv.get_state(thread_id)
+        record = self._session_record(thread_id)
+        is_open = record is not None and record.closed_at is None
+        session_id = record.agent_session_id if record is not None else ""
+        generation = state.current_generation
+        if record is not None and record.execution_generation is not None:
+            generation = record.execution_generation
+        return approval_response_capability(
+            row,
+            current_session_id=session_id,
+            session_open=is_open,
+            current_generation=generation,
+            session_live=(session_id in self._live) if is_open else None,
+        )
+
     async def resolve_approval(
         self, thread_id: str, approval_id: str, decision: str, note: str = "",
         scope: str = "once", option_id: str = "",
@@ -2215,8 +2920,7 @@ class ExternalAgentSessionExecutor:
             "note": note,
             "option_id": option_id,
         })
-        stream = adapter.send(ref, AgentInput(
-            kind="approval_response",
+        stream = adapter.send(ref, ApprovalResponseInput(
             payload=approval.to_payload(),
         ))
         await self._consume(thread_id, None, stream, require_control_delivery=True)
@@ -2242,8 +2946,7 @@ class ExternalAgentSessionExecutor:
         ):
             return
         adapter, ref = self._ref_for(thread_id)
-        stream = adapter.send(ref, AgentInput(
-            kind="user_input_response",
+        stream = adapter.send(ref, UserInputResponseInput(
             payload={
                 "request_id": request_id,
                 "decision": decision_norm,
@@ -2257,7 +2960,9 @@ class ExternalAgentSessionExecutor:
 
     async def shutdown(self) -> None:
         """进程退出前：先 interrupt 在途 Turn，再取消任务（Session 记录保留）。"""
-        running = list(self._tasks)
+        self._shutting_down = True
+        running = set(self._tasks) | {thread_id for thread_id in self._continuation_sources
+                                      if self.background_turn_id(thread_id)}
         for thread_id in running:
             try:
                 await self.interrupt(thread_id)
@@ -2266,6 +2971,7 @@ class ExternalAgentSessionExecutor:
         tasks = [
             *self._tasks.values(),
             *self._capability_tasks.values(),
+            *self._continuation_tasks.values(),
         ]
         for task in tasks:
             task.cancel()
@@ -2276,6 +2982,9 @@ class ExternalAgentSessionExecutor:
                 pass
         self._tasks.clear()
         self._capability_tasks.clear()
+        self._continuation_tasks.clear()
+        self._continuation_sources.clear()
+        self._native_wake_turns.clear()
 
 
 __all__ = ["ExternalAgentSessionExecutor"]

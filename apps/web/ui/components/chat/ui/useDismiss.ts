@@ -84,6 +84,8 @@ export function useLayer({
     const onKeyDown = (event: KeyboardEvent) => {
       if (!escape || event.key !== "Escape") return;
       if (openStack[openStack.length - 1] !== id) return;
+      // A search field with text clears itself on the first Escape; the layer closes on the next one.
+      if (event.target instanceof Element && event.target.closest("[data-escape-clears]")) return;
       event.stopImmediatePropagation();
       event.preventDefault();
       dismissRef.current("escape");

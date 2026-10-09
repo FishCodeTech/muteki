@@ -172,10 +172,10 @@ function FileCard({
         )}
       </span>
       <span className="flex min-w-0 flex-1 flex-col">
-        <span className="truncate text-[12.5px] font-medium leading-5 text-cx-fg">{attachment.name}</span>
+        <span className="truncate text-[13px] font-medium leading-5 text-cx-fg">{attachment.name}</span>
         <span
           className={cn(
-            "cx-tabular truncate text-[11.5px] leading-4",
+            "cx-tabular truncate text-[12px] leading-4",
             needsPick ? "text-cx-warning" : failed ? "text-cx-danger" : "text-cx-fg-3",
           )}
         >
@@ -223,7 +223,7 @@ export function CapabilityRefPill({
       title={title}
       data-ref-status={tone}
       className={cn(
-        "cx-ref-pill group inline-flex h-7 max-w-[240px] items-center gap-1.5 rounded-full pl-2 text-[12.5px] font-medium",
+        "cx-ref-pill group inline-flex h-7 max-w-[240px] items-center gap-1.5 rounded-full pl-2 text-[13px] font-medium",
         onRemove ? "pr-1" : "pr-2.5",
         tone === "ok" && "bg-cx-accent-soft text-cx-accent",
         tone === "stale" && "bg-cx-warning-soft text-cx-warning",
@@ -232,7 +232,7 @@ export function CapabilityRefPill({
     >
       <Icon name={capabilityIcon(kind)} size={12} className="shrink-0" />
       <span className="min-w-0 truncate">{label}</span>
-      {badge ? <span className="shrink-0 text-[10.5px] font-normal opacity-85">{badge}</span> : null}
+      {badge ? <span className="shrink-0 text-[12px] font-normal opacity-85">{badge}</span> : null}
       {onRemove ? (
         <button
           type="button"
@@ -316,7 +316,7 @@ export function AttachmentTray({
               type="button"
               onClick={contextPill.onClick}
               title={contextPill.tooltip}
-              className="cx-press inline-flex h-7 max-w-[220px] items-center gap-1.5 rounded-full bg-cx-hover px-2.5 text-[12.5px] font-medium text-cx-fg-2 hover:bg-cx-active hover:text-cx-fg"
+              className="cx-press inline-flex h-7 max-w-[220px] items-center gap-1.5 rounded-full bg-cx-hover px-2.5 text-[13px] font-medium text-cx-fg-2 hover:bg-cx-active hover:text-cx-fg"
             >
               <span className="size-1.5 shrink-0 rounded-full bg-cx-accent" />
               <span className="truncate">{contextPill.label}</span>

@@ -74,7 +74,7 @@ export function ComposerStashModal({
               </span>
               <div className="min-w-0 flex-1">
                 <strong className="block truncate text-[13px] font-medium text-cx-fg">{item.name}</strong>
-                <span className="block truncate text-[11.5px] text-cx-fg-4">
+                <span className="block truncate text-[12px] text-cx-fg-4">
                   {item.projectId ? `项目 ${item.projectId.slice(0, 12)}` : "未绑定项目"}
                   {item.snapshot.attachments.length ? ` · ${item.snapshot.attachments.length} 个附件` : ""}
                   {item.snapshot.capabilityRefs.length ? ` · ${item.snapshot.capabilityRefs.length} 处引用` : ""}

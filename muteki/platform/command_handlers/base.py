@@ -99,6 +99,7 @@ class HandlerContext:
         binding: Optional[CapabilityBinding] = None,
         correlation_id: str = "",
         services: Optional[dict[str, Any]] = None,
+        cursor_key: Optional[bytes] = None,
     ) -> None:
         self.store = store
         self.run_gateway = run_gateway
@@ -106,6 +107,7 @@ class HandlerContext:
         self.binding = binding
         self.correlation_id = correlation_id
         self.services = services or {}
+        self.cursor_key = cursor_key
 
 
 @dataclass

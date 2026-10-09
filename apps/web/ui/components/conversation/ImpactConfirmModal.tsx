@@ -24,6 +24,21 @@ import { mapExternalSideEffects } from "@/lib/externalSideEffects";
 
 export type ImpactMode = "retry" | "edit_resend" | "fork" | "native_rewind";
 
+export type ImpactFileMode = "keep_files" | "restore_files";
+
+export type ImpactCheckpointChange = {
+  path: string;
+  status: string;
+  action: "restore" | "delete" | string;
+};
+
+export type ImpactCheckpoint = {
+  available: boolean;
+  reason?: string;
+  error?: string;
+  changes: ImpactCheckpointChange[];
+};
+
 export type ImpactPreview = {
   mode: ImpactMode | string;
   target_turn_id: string;
@@ -53,11 +68,24 @@ export type ImpactPreview = {
     conversation?: string;
     provider_session?: string;
   };
+  /** Muteki-owned git snapshot taken when the target turn started. */
+  checkpoint?: ImpactCheckpoint;
 };
+
+const CHECKPOINT_REASON: Record<string, string> = {
+  not_git: "工作区不是 Git 仓库，无法回退文件",
+  missing: "该轮次开始时没有记录文件快照（早于此功能或快照失败）",
+  error: "读取文件快照失败",
+};
+
+const FILE_MODE_OPTIONS: Array<SegmentOption<ImpactFileMode>> = [
+  { value: "keep_files", label: "保留文件", icon: "folder" },
+  { value: "restore_files", label: "回退文件", icon: "undo" },
+];
 
 const MODE_TITLE: Record<string, string> = {
   retry: "重新执行本轮",
-  edit_resend: "编辑后重发",
+  edit_resend: "从此处编辑",
   fork: "Fork 对话",
   native_rewind: "回退聊天历史",
 };
@@ -113,6 +141,9 @@ type Props = {
   onSwitchMode?: (mode: ImpactMode) => void;
   /** Enables opening touched files in the diff panel; falls back to `preview.thread_id`. */
   threadId?: string;
+  /** Retry / edit-resend only: whether to restore the workspace to the target turn's checkpoint. */
+  fileMode?: ImpactFileMode;
+  onFileModeChange?: (mode: ImpactFileMode) => void;
 };
 
 function ImpactRow({
@@ -158,6 +189,8 @@ export function ImpactConfirmModal({
   onCancel,
   onSwitchMode,
   threadId: threadIdProp,
+  fileMode = "keep_files",
+  onFileModeChange,
 }: Props) {
   const [retained, setRetained] = useState(incomingPreview);
   useEffect(() => {
@@ -174,7 +207,17 @@ export function ImpactConfirmModal({
   const filePolicy = preview.workspace?.policy || "keep_files";
   const files = preview.workspace?.files_touched_since_target;
   const fileList = Array.isArray(files) ? files : [];
-  const visual = knownMode ? modeVisual(knownMode, filePolicy) : { icon: "retry" as IconName, tone: "default" as const, confirm: "确认" };
+  const supportsFileMode = mode === "retry" || mode === "edit_resend";
+  const checkpoint = supportsFileMode ? preview.checkpoint : undefined;
+  const checkpointChanges = checkpoint?.available ? checkpoint.changes : [];
+  const restoring = supportsFileMode && fileMode === "restore_files" && Boolean(checkpoint?.available);
+  const checkpointUnavailableReason = checkpoint && !checkpoint.available
+    ? `${CHECKPOINT_REASON[checkpoint.reason || ""] || "无法回退文件"}${checkpoint.error ? `：${checkpoint.error}` : ""}`
+    : "";
+  const baseVisual = knownMode ? modeVisual(knownMode, filePolicy) : { icon: "retry" as IconName, tone: "default" as const, confirm: "确认" };
+  const visual = restoring
+    ? { ...baseVisual, tone: "danger" as const, confirm: mode === "edit_resend" ? "回退文件并重发" : "回退文件并重新执行" }
+    : baseVisual;
   const threadId = threadIdProp || (preview as { thread_id?: string }).thread_id || "";
   const confirmDisabled = loading || !knownMode || (mode === "edit_resend" && !editedText?.trim()) || (mode === "native_rewind" && rewindDisabled);
   const showRewind = mode === "native_rewind" || Boolean(onSwitchMode);
@@ -198,8 +241,10 @@ export function ImpactConfirmModal({
       icon={visual.icon}
       tone={visual.tone}
       title={MODE_TITLE[mode] || mode}
-      description={preview.guarantees?.honest_label
-        || "明确区分文本重建、Fork 与 Provider 原生回退；默认保留工作区文件。"}
+      description={restoring
+        ? "重建对话文本历史，并按 Muteki 在该轮开始时记录的快照回退工作区文件；Provider 会话不做原生 rewind。"
+        : preview.guarantees?.honest_label
+          || "明确区分文本重建、Fork 与 Provider 原生回退；默认保留工作区文件。"}
       dismissable={!loading}
       testId="c11-impact-modal"
       footer={(
@@ -258,8 +303,35 @@ export function ImpactConfirmModal({
           />
         ) : null}
 
+        {supportsFileMode && checkpoint && onFileModeChange ? (
+          <section className="flex flex-col gap-1.5" data-testid="c11-file-mode">
+            <h3 className="text-[13px] font-semibold text-cx-fg-2">工作区文件</h3>
+            <SegmentedControl<ImpactFileMode>
+              value={restoring ? "restore_files" : "keep_files"}
+              onChange={(next) => onFileModeChange(next)}
+              ariaLabel="工作区文件处理方式"
+              size="md"
+              className="w-full [&>button]:flex-1"
+              options={FILE_MODE_OPTIONS.map((option) => (
+                option.value === "restore_files"
+                  ? { ...option, disabled: loading || !checkpoint.available }
+                  : { ...option, disabled: loading }
+              ))}
+            />
+            <p className="text-[12px] leading-[18px] text-cx-fg-3" data-testid="c11-file-mode-hint">
+              {!checkpoint.available
+                ? checkpointUnavailableReason
+                : restoring
+                  ? `将把工作区文件还原到第 ${preview.target_seq ?? "?"} 轮开始前的状态，再开始新一轮。`
+                  : checkpointChanges.length
+                    ? `该轮次开始后共有 ${checkpointChanges.length} 个文件发生变化，可选择回退。`
+                    : "该轮次开始后工作区文件没有变化。"}
+            </p>
+          </section>
+        ) : null}
+
         <section className="flex flex-col gap-2">
-          <h3 className="text-[12.5px] font-semibold text-cx-fg-2">影响范围</h3>
+          <h3 className="text-[13px] font-semibold text-cx-fg-2">影响范围</h3>
           <ul className="divide-y divide-cx-border-subtle overflow-hidden rounded-xl border border-cx-border-subtle bg-cx-elevated">
             {mode === "fork" ? (
               <ImpactRow icon="gitFork" tone="success">
@@ -280,8 +352,15 @@ export function ImpactConfirmModal({
             {attachments.length ? (
               <ImpactRow icon="paperclip">附件：{attachments.map((a) => a.name).join("、")}</ImpactRow>
             ) : null}
-            <ImpactRow icon="folder" testId="c11-files-policy" tone={filePolicy === "sync_files" ? "danger" : "neutral"}>
-              {filePolicy === "keep_files" || filePolicy === "fork_shares_workspace"
+            <ImpactRow
+              icon="folder"
+              testId="c11-files-policy"
+              tone={filePolicy === "sync_files" || restoring ? "danger" : "neutral"}
+              hint={restoring ? "Git 暂存区、提交历史和被忽略的文件不受影响。" : undefined}
+            >
+              {restoring
+                ? `回退 ${checkpointChanges.length} 个文件到该轮次开始前的状态`
+                : filePolicy === "keep_files" || filePolicy === "fork_shares_workspace"
                 ? "工作区文件保持原状（不会自动还原）"
                 : filePolicy === "sync_files"
                   ? "将尝试同步还原文件（仅当能力已验证）"
@@ -314,14 +393,50 @@ export function ImpactConfirmModal({
           </ul>
         </section>
 
-        {fileList.length || files === "unknown" ? (
+        {restoring ? (
           <section className="flex flex-col gap-2">
-            <h3 className="flex items-center gap-2 text-[12.5px] font-semibold text-cx-fg-2">
+            <h3 className="flex items-center gap-2 text-[13px] font-semibold text-cx-fg-2">
+              将回退的文件
+              {checkpointChanges.length ? <Badge>{checkpointChanges.length}</Badge> : null}
+            </h3>
+            {checkpointChanges.length ? (
+              <ul className="overflow-hidden rounded-xl border border-cx-border-subtle bg-cx-elevated py-1" data-testid="c11-restore-list">
+                {checkpointChanges.slice(0, MAX_FILES).map((change) => {
+                  const name = change.path.split("/").pop() || change.path;
+                  const dir = change.path.slice(0, change.path.length - name.length);
+                  const removing = change.action === "delete";
+                  return (
+                    <li key={change.path} className="flex h-8 items-center gap-2 px-3">
+                      <Icon name={removing ? "trash" : "undo"} size={13} className={cn("shrink-0", removing ? "text-cx-danger" : "text-cx-fg-4")} />
+                      <span className="min-w-0 flex-1 truncate font-cx-mono text-[12px]">
+                        <span className="text-cx-fg-4">{dir}</span>
+                        <span className="text-cx-fg">{name}</span>
+                      </span>
+                      <span className={cn("shrink-0 text-[11px]", removing ? "text-cx-danger" : "text-cx-fg-3")}>
+                        {removing ? "删除" : "还原"}
+                      </span>
+                    </li>
+                  );
+                })}
+                {checkpointChanges.length > MAX_FILES ? (
+                  <li className="px-3 py-1.5 text-[12px] text-cx-fg-4">另有 {checkpointChanges.length - MAX_FILES} 个文件</li>
+                ) : null}
+              </ul>
+            ) : (
+              <p className="text-[13px] text-cx-fg-3">没有需要回退的文件。</p>
+            )}
+            <Callout tone="danger" title="回退会覆盖当前文件内容">
+              这些文件的当前内容（包括你在该轮之后手动做的未提交修改）会被替换或删除，且无法从这里撤销。
+            </Callout>
+          </section>
+        ) : fileList.length || files === "unknown" ? (
+          <section className="flex flex-col gap-2">
+            <h3 className="flex items-center gap-2 text-[13px] font-semibold text-cx-fg-2">
               自目标轮次以来变更的文件
               {fileList.length ? <Badge>{fileList.length}</Badge> : null}
             </h3>
             {files === "unknown" ? (
-              <p className="text-[12.5px] text-cx-fg-3">无法确定变更文件（Runtime 未上报）。</p>
+              <p className="text-[13px] text-cx-fg-3">无法确定变更文件（Runtime 未上报）。</p>
             ) : (
               <ul className="overflow-hidden rounded-xl border border-cx-border-subtle bg-cx-elevated py-1" data-testid="c11-files-list">
                 {fileList.slice(0, MAX_FILES).map((file) => {
@@ -362,7 +477,7 @@ export function ImpactConfirmModal({
           </section>
         ) : null}
 
-        {preview.workspace?.dirty ? (
+        {preview.workspace?.dirty && !restoring ? (
           <Callout tone="warning" title="工作区当前有未提交改动">
             {filePolicy === "sync_files"
               ? "同步还原可能覆盖这些改动，请先确认或提交。"

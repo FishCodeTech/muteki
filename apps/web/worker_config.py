@@ -23,6 +23,8 @@ from urllib.parse import urlsplit
 
 from muteki.core.llm import normalize_llm_temperature
 from muteki.core.runtime_env import is_web_container
+from muteki.solver.credential_accounts import CredentialAccountLockTimeoutError
+from muteki.solver.shared_credentials import SharedCredentialError
 from muteki.solver.engine_registry import canonical_engine_id
 from muteki.solver.worker_profiles import (
     VALID_BASE_ENGINES,
@@ -584,13 +586,15 @@ class WorkerConfigStore:
     def _account_modes(self) -> dict[str, str]:
         """Map account_id → on-disk credential mode, so migration binds an empty
         profile to its real default account as engine_key (not host-inherit).
-        Never raises — a missing/locked secrets store just yields {}."""
+        Lock contention must remain explicit instead of looking like no accounts."""
         try:
             from muteki.solver.credential_accounts import (
                 CredentialAccountStore, account_store_root,
             )
             store = CredentialAccountStore(account_store_root(self._root))
             return {a["account_id"]: str(a.get("mode") or "") for a in store.list()}
+        except (CredentialAccountLockTimeoutError, SharedCredentialError):
+            raise
         except Exception:  # noqa: BLE001
             return {}
 
@@ -629,6 +633,8 @@ class WorkerConfigStore:
                     ).strip().lower(),
                 }
             return out
+        except (CredentialAccountLockTimeoutError, SharedCredentialError):
+            raise
         except Exception:  # noqa: BLE001
             return {}
 

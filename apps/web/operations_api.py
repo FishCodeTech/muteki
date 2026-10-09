@@ -24,7 +24,10 @@ from muteki.competition.models import (
     PlatformSubmission,
     SyncCursor,
 )
+from muteki.platform.command_handlers.base import CommandAPIError
+from muteki.platform.contracts.errors import ErrorCategory
 from muteki.platform.contracts.objects import AgentSession
+from muteki.platform.reconciler import unfinished_receipts_by_command_type
 
 def _age_seconds(value: str | None) -> float:
     if not value:
@@ -136,6 +139,8 @@ class ProductObservability:
             "platform": {
                 "event_watermark": platform.event_watermark,
                 "pending_receipts": platform.pending_receipts,
+                "pending_receipts_by_type": unfinished_receipts_by_command_type(
+                    self.stack.store),
                 "projection_lag_max": max(watermark_lags, default=0),
                 "outbox": self._outbox_summary(platform_conn, "outbox"),
                 "effects": dict(Counter(item.state.value for item in effects)),
@@ -192,10 +197,14 @@ class ProductObservability:
                     "detail": f"最早未完成 outbox 已等待 {int(outbox['oldest_pending_seconds'])} 秒",
                 })
             if data[domain]["pending_receipts"]:
+                by_type = data[domain].get("pending_receipts_by_type") or {}
+                breakdown = "，".join(f"{name} {count}" for name, count in by_type.items())
                 alerts.append({
                     "code": f"{domain}.receipt.pending",
                     "severity": "warning",
-                    "detail": f"存在 {data[domain]['pending_receipts']} 个未完成回执",
+                    "detail": f"存在 {data[domain]['pending_receipts']} 个未完成回执"
+                              + (f"（{breakdown}）" if breakdown else ""),
+                    **({"by_type": dict(by_type)} if by_type else {}),
                 })
         if data["platform"]["projection_lag_max"]:
             alerts.append({
@@ -326,6 +335,8 @@ class ProductObservability:
                 "event_watermark": platform.event_watermark,
                 "stream_gap_count": int(event_gaps),
                 "pending_receipts": platform.pending_receipts,
+                "pending_receipts_by_type": unfinished_receipts_by_command_type(
+                    self.stack.store),
                 "pending_outbox": platform.pending_outbox,
                 "projection_watermarks": platform.projection_watermarks,
             },
@@ -467,11 +478,15 @@ def create_operations_router(observability: ProductObservability) -> APIRouter:
     async def receipt(command_id: str) -> Any:
         try:
             return await observability.receipt_trace(command_id)
-        except Exception as exc:
+        except CommandAPIError as exc:
+            # Only a missing receipt is a 404; storage or decoding failures
+            # must surface as real errors rather than "not found".
+            if exc.error.category is not ErrorCategory.NOT_FOUND:
+                raise
             return Response(
                 content=json.dumps({"error": {
-                    "code": "operations.receipt.not_found",
-                    "message": str(exc),
+                    "code": exc.error.code,
+                    "message": exc.error.message,
                 }}, ensure_ascii=False),
                 status_code=404,
                 media_type="application/json",

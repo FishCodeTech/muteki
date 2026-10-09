@@ -1,0 +1,981 @@
+{
+  "schemaVersion": 1,
+  "defaultPage": "appearance",
+  "groups": {
+    "general": [
+      "通用",
+      "General"
+    ],
+    "agent": [
+      "Agent",
+      "Agent"
+    ],
+    "data": [
+      "数据",
+      "Data"
+    ],
+    "system": [
+      "系统",
+      "System"
+    ]
+  },
+  "pages": {
+    "appearance": {
+      "id": "appearance",
+      "icon": "sun",
+      "label": [
+        "外观",
+        "Appearance"
+      ],
+      "description": [
+        "语言、主题、主色与对话阅读偏好。改动立即生效。",
+        "Language, theme, accent and reading preferences. Changes apply immediately."
+      ],
+      "keywords": "语言 主题 亮色 暗色 跟随系统 主色 配色 颜色 字号 字体 代码字体 宽度 紧凑 动画 工作区模式 language theme dark light system accent color font mono width compact motion",
+      "group": "general",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "requiredApis": [
+        {
+          "path": "/api/settings/ui",
+          "match": "exact",
+          "methods": [
+            "GET",
+            "PUT"
+          ]
+        }
+      ],
+      "requiredFeatures": [
+        "settings.appearance"
+      ]
+    },
+    "chat": {
+      "id": "chat",
+      "icon": "messages",
+      "label": [
+        "对话",
+        "Chat"
+      ],
+      "description": [
+        "发送方式、新对话默认权限、编辑器与 Diff 偏好。",
+        "Sending, default permissions, editor and diff preferences."
+      ],
+      "keywords": "对话 发送 回车 换行 排队 引导 权限 访问模式 diff 合并 分栏 换行 折叠 标题 chat send enter queue steer permission access diff title",
+      "group": "general",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "requiredApis": [
+        {
+          "path": "/api/settings/ui",
+          "match": "exact",
+          "methods": [
+            "GET",
+            "PUT"
+          ]
+        },
+        {
+          "path": "/api/conversation/preferences",
+          "match": "exact",
+          "methods": [
+            "GET",
+            "PUT"
+          ]
+        },
+        {
+          "path": "/api/settings/workers",
+          "match": "prefix",
+          "methods": [
+            "GET"
+          ]
+        }
+      ],
+      "requiredFeatures": [
+        "settings.chat"
+      ]
+    },
+    "notifications": {
+      "id": "notifications",
+      "icon": "bell",
+      "label": [
+        "通知",
+        "Notifications"
+      ],
+      "description": [
+        "后台会话完成、需要审批或等待输入时如何提醒你。侧栏活动视图始终实时更新。",
+        "How you are alerted when a background chat finishes, needs approval, or waits for input. The sidebar activity view always updates live."
+      ],
+      "keywords": "提醒 系统通知 声音 权限 免打扰 静默 待办 notification sound permission quiet hours",
+      "group": "general",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "requiredApis": [],
+      "requiredFeatures": [
+        "settings.notifications"
+      ]
+    },
+    "shortcuts": {
+      "id": "shortcuts",
+      "icon": "keyboard",
+      "label": [
+        "键盘快捷键",
+        "Keyboard shortcuts"
+      ],
+      "description": [
+        "自定义常用快捷键，并查看全部组合键。macOS 显示为 ⌘ / ⌥，其他系统为 Ctrl / Alt。",
+        "Rebind common shortcuts and browse all key combinations. macOS uses ⌘ / ⌥; other systems use Ctrl / Alt."
+      ],
+      "keywords": "快捷键 按键 热键 改键 自定义 shortcut hotkey keys keyboard rebind",
+      "group": "general",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "requiredApis": [],
+      "requiredFeatures": [
+        "settings.shortcuts"
+      ]
+    },
+    "agents": {
+      "id": "agents",
+      "icon": "bot",
+      "label": [
+        "Agents 和接入点",
+        "Agents and providers"
+      ],
+      "description": [
+        "管理 Agent 引擎、凭据、模型与新对话默认模型。配置保存在当前连接的服务中。",
+        "Manage Agent engines, credentials, models and the default model for new chats. Settings are stored on the connected service."
+      ],
+      "keywords": "agent provider runtime adapter 引擎 登录 凭据 模型 默认模型 接入点 API key claude codex cursor",
+      "wide": true,
+      "group": "agent",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "requiredApis": [
+        {
+          "path": "/api/agent-runtimes",
+          "match": "prefix",
+          "methods": [
+            "GET"
+          ]
+        },
+        {
+          "path": "/api/settings/credential-accounts",
+          "match": "prefix",
+          "methods": [
+            "GET",
+            "POST",
+            "PUT",
+            "DELETE"
+          ]
+        },
+        {
+          "path": "/api/settings/credentials",
+          "match": "prefix",
+          "methods": [
+            "GET",
+            "POST",
+            "PUT",
+            "DELETE"
+          ]
+        },
+        {
+          "path": "/api/settings/credential-models",
+          "match": "prefix",
+          "methods": [
+            "GET",
+            "POST"
+          ]
+        },
+        {
+          "path": "/api/settings/workers",
+          "match": "prefix",
+          "methods": [
+            "GET",
+            "PUT"
+          ]
+        },
+        {
+          "path": "/api/settings/ui",
+          "match": "exact",
+          "methods": [
+            "GET",
+            "PUT"
+          ]
+        },
+        {
+          "path": "/api/usage",
+          "match": "prefix",
+          "methods": [
+            "GET",
+            "PUT",
+            "POST"
+          ]
+        }
+      ],
+      "requiredFeatures": [
+        "settings.agents"
+      ]
+    },
+    "agent-extensions": {
+      "id": "agent-extensions",
+      "icon": "plug",
+      "label": [
+        "Agent 扩展",
+        "Agent extensions"
+      ],
+      "description": [
+        "管理 Agent 可用的插件包、Skill 和 MCP。扩展属于当前服务宿主。",
+        "Manage packages, skills and MCP available to Agents. Extensions belong to the connected service host."
+      ],
+      "keywords": "聊天 CTF 渗透 Worker 插件 技能 skills mcp plugins package extension",
+      "group": "agent",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "requiredApis": [
+        {
+          "path": "/api/agent-extensions",
+          "match": "prefix",
+          "methods": [
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE"
+          ]
+        },
+        {
+          "path": "/api/capability-management",
+          "match": "prefix",
+          "methods": [
+            "GET",
+            "PUT"
+          ]
+        },
+        {
+          "path": "/api/runs",
+          "match": "exact",
+          "methods": [
+            "GET"
+          ]
+        }
+      ],
+      "requiredFeatures": [
+        "settings.agent-extensions"
+      ]
+    },
+    "capabilities": {
+      "id": "capabilities",
+      "icon": "network",
+      "label": [
+        "能力",
+        "Capabilities"
+      ],
+      "description": [
+        "对话授权与全局 MCP / Skills。全局 Blackboard Skill 开关会影响新 Worker。",
+        "Conversation grants and global MCP / Skills. The global Blackboard Skill switch affects new workers."
+      ],
+      "keywords": "能力 mcp skill tool adapter binding grant 授权",
+      "wide": true,
+      "group": "agent",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "requiredApis": [
+        {
+          "path": "/api/capability-management",
+          "match": "prefix",
+          "methods": [
+            "GET",
+            "POST",
+            "PUT"
+          ]
+        }
+      ],
+      "requiredFeatures": [
+        "settings.capabilities"
+      ]
+    },
+    "archives": {
+      "id": "archives",
+      "icon": "archive",
+      "label": [
+        "归档",
+        "Archives"
+      ],
+      "description": [
+        "查找、查看和恢复已归档对话。恢复不会自动继续执行。",
+        "Find, open and restore archived conversations. Restoring does not resume execution."
+      ],
+      "keywords": "对话 归档 历史 搜索 恢复 archive conversation restore",
+      "group": "data",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "requiredApis": [
+        {
+          "path": "/api/threads",
+          "match": "prefix",
+          "methods": [
+            "GET"
+          ]
+        },
+        {
+          "path": "/api/projects",
+          "match": "prefix",
+          "methods": [
+            "GET"
+          ]
+        },
+        {
+          "path": "/api/commands",
+          "match": "prefix",
+          "methods": [
+            "POST"
+          ]
+        },
+        {
+          "path": "/api/receipts",
+          "match": "prefix",
+          "methods": [
+            "GET"
+          ]
+        }
+      ],
+      "requiredFeatures": [
+        "settings.archives"
+      ]
+    },
+    "import": {
+      "id": "import",
+      "icon": "download",
+      "label": [
+        "导入历史会话",
+        "Import history"
+      ],
+      "description": [
+        "从服务宿主的 Claude 或 Codex 历史记录导入对话。",
+        "Import Claude or Codex history stored on the service host."
+      ],
+      "keywords": "导入 历史会话 claude codex provider import",
+      "group": "data",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "requiredApis": [
+        {
+          "path": "/api/import",
+          "match": "prefix",
+          "methods": [
+            "GET",
+            "POST"
+          ]
+        },
+        {
+          "path": "/api/projects",
+          "match": "prefix",
+          "methods": [
+            "GET"
+          ]
+        }
+      ],
+      "requiredFeatures": [
+        "settings.import"
+      ]
+    },
+    "access": {
+      "id": "access",
+      "icon": "lock",
+      "label": [
+        "访问与登录",
+        "Access and sign-in"
+      ],
+      "description": [
+        "管理当前服务的访问密码和登录会话，适用于网页端与桌面端。",
+        "Manage the connected service password and sessions for Web and desktop."
+      ],
+      "keywords": "密码 访问 登录 认证 安全 环境变量 password access login authentication security environment",
+      "group": "system",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "requiredApis": [
+        {
+          "path": "/api/settings/access",
+          "match": "exact",
+          "methods": [
+            "GET",
+            "PUT"
+          ]
+        },
+        {
+          "path": "/api/auth/me",
+          "match": "exact",
+          "methods": [
+            "GET"
+          ]
+        },
+        {
+          "path": "/api/auth/logout",
+          "match": "exact",
+          "methods": [
+            "POST"
+          ]
+        }
+      ],
+      "requiredFeatures": [
+        "settings.access"
+      ]
+    },
+    "extensions": {
+      "id": "extensions",
+      "icon": "layers",
+      "label": [
+        "平台扩展",
+        "Platform extensions"
+      ],
+      "description": [
+        "管理 Muteki 平台模块及其声明式界面，支持安装、升级与回滚。",
+        "Manage Muteki platform modules and their declarative UI, including install, upgrade and rollback."
+      ],
+      "keywords": "扩展 模块 extension 安装 升级 回滚 catalog module",
+      "wide": true,
+      "group": "system",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "requiredApis": [
+        {
+          "path": "/api/extensions",
+          "match": "prefix",
+          "methods": [
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE"
+          ]
+        }
+      ],
+      "requiredFeatures": [
+        "settings.extensions"
+      ]
+    },
+    "operations": {
+      "id": "operations",
+      "icon": "activity",
+      "label": [
+        "运维",
+        "Operations"
+      ],
+      "description": [
+        "指标、回执、恢复预览、领域模块与维护清理。",
+        "Metrics, receipts, recovery preview, modules and maintenance."
+      ],
+      "keywords": "运维 operations 诊断 回执 维护 模块 指标 metrics receipts",
+      "wide": true,
+      "group": "system",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "requiredApis": [
+        {
+          "path": "/api/operations",
+          "match": "prefix",
+          "methods": [
+            "GET",
+            "POST"
+          ]
+        },
+        {
+          "path": "/api/domain-modules",
+          "match": "prefix",
+          "methods": [
+            "GET",
+            "POST"
+          ]
+        }
+      ],
+      "requiredFeatures": [
+        "settings.operations"
+      ]
+    },
+    "desktop": {
+      "id": "desktop",
+      "icon": "monitor",
+      "label": [
+        "桌面与连接",
+        "Desktop and connection"
+      ],
+      "description": [
+        "服务连接与这台电脑提供的本机能力。",
+        "The service connection and the native capabilities this computer provides."
+      ],
+      "keywords": "服务 连接 地址 本机能力 预览 终端 麦克风 service connection native capability preview terminal microphone",
+      "group": "system",
+      "platforms": [
+        "desktop"
+      ],
+      "requiredApis": [],
+      "requiredFeatures": []
+    }
+  },
+  "aliases": {
+    "secrets": "/competitions?focus=credentials",
+    "credentials": "/competitions?focus=credentials",
+    "workers": "/ctf/workers",
+    "chat-plugins": "/settings/agent-extensions"
+  },
+  "items": [
+    {
+      "page": "access",
+      "anchor": "access-password",
+      "section": [
+        "访问密码",
+        "Access password"
+      ],
+      "label": [
+        "设置或修改密码",
+        "Set or change password"
+      ],
+      "keywords": "密码 登录 验证 认证 password access login authentication",
+      "storage": "service"
+    },
+    {
+      "page": "access",
+      "anchor": "access-status",
+      "section": [
+        "当前服务",
+        "Connected service"
+      ],
+      "label": [
+        "配置来源与环境变量",
+        "Source and environment"
+      ],
+      "keywords": "环境变量 密码 恢复 优先 source environment password restore",
+      "storage": "service"
+    },
+    {
+      "page": "access",
+      "anchor": "access-session",
+      "section": [
+        "当前登录",
+        "Current session"
+      ],
+      "label": [
+        "退出登录与有效期",
+        "Sign out and duration"
+      ],
+      "keywords": "退出 登出 会话 有效期 登录 sign out logout session expiry",
+      "storage": "service"
+    },
+    {
+      "page": "appearance",
+      "anchor": "appearance-language",
+      "section": [
+        "界面",
+        "Interface"
+      ],
+      "label": [
+        "界面语言",
+        "Language"
+      ],
+      "keywords": "语言 中文 英文 language english chinese",
+      "storage": "ui"
+    },
+    {
+      "page": "appearance",
+      "anchor": "appearance-theme",
+      "section": [
+        "界面",
+        "Interface"
+      ],
+      "label": [
+        "主题（亮色 / 暗色 / 跟随系统）",
+        "Theme (light / dark / system)"
+      ],
+      "keywords": "主题 亮色 暗色 深色 浅色 跟随系统 自动 theme dark light system auto appearance",
+      "storage": "ui"
+    },
+    {
+      "page": "appearance",
+      "anchor": "appearance-ui-font",
+      "section": [
+        "界面",
+        "Interface"
+      ],
+      "label": [
+        "界面字号",
+        "Interface text size"
+      ],
+      "keywords": "字号 字体大小 界面 font size ui",
+      "storage": "device"
+    },
+    {
+      "page": "appearance",
+      "anchor": "appearance-interface-font",
+      "section": [
+        "界面",
+        "Interface"
+      ],
+      "label": [
+        "界面字体",
+        "Interface font"
+      ],
+      "keywords": "界面字体 字体 字族 正文 font family typeface ui inter",
+      "storage": "device"
+    },
+    {
+      "page": "appearance",
+      "anchor": "appearance-code-font",
+      "section": [
+        "界面",
+        "Interface"
+      ],
+      "label": [
+        "代码字体",
+        "Code font"
+      ],
+      "keywords": "代码字体 等宽 字体 mono monospace code font jetbrains",
+      "storage": "device"
+    },
+    {
+      "page": "appearance",
+      "anchor": "appearance-motion",
+      "section": [
+        "界面",
+        "Interface"
+      ],
+      "label": [
+        "减少动态效果",
+        "Reduce motion"
+      ],
+      "keywords": "动画 动效 过渡 motion animation",
+      "storage": "device"
+    },
+    {
+      "page": "appearance",
+      "anchor": "appearance-accent",
+      "section": [
+        "主色",
+        "Accent color"
+      ],
+      "label": [
+        "主色与自定义色相",
+        "Accent and custom hue"
+      ],
+      "keywords": "主色 配色 颜色 色相 accent color hue scheme",
+      "storage": "ui"
+    },
+    {
+      "page": "appearance",
+      "anchor": "appearance-reading",
+      "section": [
+        "对话阅读",
+        "Reading"
+      ],
+      "label": [
+        "正文字号、内容宽度与紧凑排版",
+        "Text size, content width and compact layout"
+      ],
+      "keywords": "正文 字号 宽度 紧凑 间距 reading width compact density",
+      "storage": "ui"
+    },
+    {
+      "page": "chat",
+      "anchor": "chat-send-key",
+      "section": [
+        "输入与发送",
+        "Compose and send"
+      ],
+      "label": [
+        "发送键",
+        "Send key"
+      ],
+      "keywords": "发送 回车 换行 enter shift ctrl cmd send newline",
+      "storage": "ui"
+    },
+    {
+      "page": "chat",
+      "anchor": "chat-running-send",
+      "section": [
+        "输入与发送",
+        "Compose and send"
+      ],
+      "label": [
+        "运行中追加消息的默认方式",
+        "Default when sending during a run"
+      ],
+      "keywords": "运行中 排队 队列 引导 追加 后续 queue steer follow-up running",
+      "storage": "ui"
+    },
+    {
+      "page": "chat",
+      "anchor": "chat-quota-resume",
+      "section": [
+        "输入与发送",
+        "Compose and send"
+      ],
+      "label": [
+        "额度重置后自动继续",
+        "Continue after quota reset"
+      ],
+      "keywords": "额度 配额 限额 重置 自动继续 恢复 quota rate limit reset resume continue usage limit",
+      "storage": "service"
+    },
+    {
+      "page": "chat",
+      "anchor": "chat-access-mode",
+      "section": [
+        "新对话",
+        "New chats"
+      ],
+      "label": [
+        "新对话默认权限模式",
+        "Default permission mode"
+      ],
+      "keywords": "权限 访问 监督 完全访问 自动 permission access mode supervised full-access",
+      "storage": "ui"
+    },
+    {
+      "page": "chat",
+      "anchor": "chat-title-model",
+      "section": [
+        "新对话",
+        "New chats"
+      ],
+      "label": [
+        "标题生成模型",
+        "Title generation model"
+      ],
+      "keywords": "标题 摘要 titler 生成 模型 title summary model",
+      "storage": "service"
+    },
+    {
+      "page": "chat",
+      "anchor": "chat-editor",
+      "section": [
+        "工作区",
+        "Workspace"
+      ],
+      "label": [
+        "在编辑器中打开（VS Code / Cursor / Zed）",
+        "Open in editor (VS Code / Cursor / Zed)"
+      ],
+      "keywords": "编辑器 打开 vscode code cursor zed windsurf editor ide open",
+      "storage": "device"
+    },
+    {
+      "page": "chat",
+      "anchor": "chat-diff",
+      "section": [
+        "变更 (Diff)",
+        "Changes (Diff)"
+      ],
+      "label": [
+        "Diff 默认视图、换行与折叠",
+        "Diff layout, wrap and folding"
+      ],
+      "keywords": "diff 变更 合并 分栏 换行 折叠 未变更 unified split wrap collapse",
+      "storage": "ui"
+    },
+    {
+      "page": "notifications",
+      "anchor": "notifications-style",
+      "section": [
+        "提醒方式",
+        "Alert style"
+      ],
+      "label": [
+        "提醒方式与声音",
+        "Alert style and sound"
+      ],
+      "keywords": "提醒 通知 声音 系统通知 sound alert",
+      "storage": "device"
+    },
+    {
+      "page": "notifications",
+      "anchor": "notifications-permission",
+      "section": [
+        "系统权限",
+        "Permission"
+      ],
+      "label": [
+        "通知授权",
+        "Notification permission"
+      ],
+      "keywords": "权限 授权 permission",
+      "storage": "device"
+    },
+    {
+      "page": "notifications",
+      "anchor": "notifications-quiet",
+      "section": [
+        "静默时段",
+        "Quiet hours"
+      ],
+      "label": [
+        "静默时段",
+        "Quiet hours"
+      ],
+      "keywords": "静默 免打扰 quiet hours dnd",
+      "storage": "device"
+    },
+    {
+      "page": "shortcuts",
+      "anchor": "shortcuts-rebind",
+      "section": [
+        "自定义快捷键",
+        "Custom shortcuts"
+      ],
+      "label": [
+        "自定义快捷键",
+        "Custom shortcuts"
+      ],
+      "keywords": "快捷键 改键 绑定 重置 冲突 shortcut rebind binding reset keymap",
+      "storage": "device"
+    },
+    {
+      "page": "shortcuts",
+      "anchor": "shortcuts-list",
+      "section": [
+        "全部快捷键",
+        "All shortcuts"
+      ],
+      "label": [
+        "全部快捷键列表",
+        "All shortcuts"
+      ],
+      "keywords": "快捷键 列表 帮助 shortcut list help",
+      "storage": "device"
+    },
+    {
+      "page": "agents",
+      "anchor": "agents-credentials",
+      "section": [
+        "Agent 引擎",
+        "Agent engine"
+      ],
+      "label": [
+        "凭据与登录",
+        "Credentials and login"
+      ],
+      "keywords": "凭据 登录 账号 api key token credential login",
+      "storage": "service"
+    },
+    {
+      "page": "agents",
+      "anchor": "agents-runtime",
+      "section": [
+        "Agent 引擎",
+        "Agent engine"
+      ],
+      "label": [
+        "运行配置、二进制路径与环境变量",
+        "Runtime, binary path and environment"
+      ],
+      "keywords": "运行配置 二进制 端点 环境变量 env 传输 runtime binary endpoint environment transport",
+      "storage": "service"
+    },
+    {
+      "page": "agents",
+      "anchor": "agents-models",
+      "section": [
+        "Agent 引擎",
+        "Agent engine"
+      ],
+      "label": [
+        "模型显隐与默认模型",
+        "Hidden and default models"
+      ],
+      "keywords": "模型 默认模型 隐藏 model default hidden",
+      "storage": "ui"
+    },
+    {
+      "page": "agents",
+      "anchor": "usage-cursor-account",
+      "section": [
+        "用量来源",
+        "Usage providers"
+      ],
+      "label": [
+        "Cursor 账号用量（macOS 钥匙串）",
+        "Cursor account usage (macOS Keychain)"
+      ],
+      "keywords": "用量 额度 费用 钥匙串 授权 cursor usage limits cost tokens keychain permission",
+      "storage": "service"
+    },
+    {
+      "page": "desktop",
+      "anchor": "desktop-connection",
+      "section": [
+        "服务连接",
+        "Service connection"
+      ],
+      "label": [
+        "服务连接与工作台",
+        "Service connection"
+      ],
+      "keywords": "服务 连接 地址 工作台 service connection workspace",
+      "storage": "device"
+    },
+    {
+      "page": "desktop",
+      "anchor": "desktop-capabilities",
+      "section": [
+        "本机能力",
+        "Native capabilities"
+      ],
+      "label": [
+        "本机能力",
+        "Native capabilities"
+      ],
+      "keywords": "本机 能力 预览 终端 麦克风 native capability",
+      "storage": "device"
+    },
+    {
+      "page": "appearance",
+      "anchor": "appearance-workspaces",
+      "section": [
+        "界面",
+        "Interface"
+      ],
+      "label": [
+        "显示对话和比赛工作区",
+        "Show chat and competition workspaces"
+      ],
+      "keywords": "工作区 模式 solveOnly workspace mode",
+      "storage": "device"
+    },
+    {
+      "page": "agents",
+      "anchor": "agents-default-model",
+      "section": [
+        "模型",
+        "Models"
+      ],
+      "label": [
+        "新对话默认模型",
+        "Default model for new chats"
+      ],
+      "keywords": "默认 隐藏 模型 default hidden model",
+      "storage": "ui"
+    }
+  ]
+}

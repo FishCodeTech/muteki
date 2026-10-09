@@ -82,11 +82,11 @@ export function ToolChips({
                 key={diff.sha256 || diff.file}
                 type="button"
                 onClick={() => onSelectDiff?.(diff)}
-                className="cx-press inline-flex h-7 max-w-full items-center gap-1.5 rounded-lg border border-cx-border bg-cx-elevated px-2 font-cx-mono text-[11.5px] text-cx-fg-2 hover:border-cx-border-strong hover:text-cx-fg"
+                className="cx-press inline-flex h-7 max-w-full items-center gap-1.5 rounded-lg border border-cx-border bg-cx-elevated px-2 font-cx-mono text-[12px] text-cx-fg-2 hover:border-cx-border-strong hover:text-cx-fg"
               >
                 <Icon name="file" size={12} className="shrink-0 text-cx-fg-4" />
                 <span className="min-w-0 truncate">{diff.file}</span>
-                <DiffStat additions={diff.add} deletions={diff.del} className="text-[11px]" />
+                <DiffStat additions={diff.add} deletions={diff.del} className="text-[12px]" />
               </button>
             ))}
           </div>

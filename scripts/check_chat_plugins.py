@@ -19,6 +19,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from muteki.conversation.chat_plugins import ChatPluginError, ChatPluginService, ENGINES
+from muteki.conversation.chat_providers import provider_for
 from muteki.conversation.composer_capabilities import ComposerCapabilityError, discover_skills, resolve_capability_refs
 
 SERVER = '''import json,sys
@@ -72,6 +73,9 @@ async def check() -> None:
                     raise AssertionError("Native Codex skill crossed into Kimi")
                 for engine in ENGINES:
                     env = service.prepare_environment(engine, "test", {})
+                    if not provider_for(engine).managed_environment:
+                        assert env == {}, "Unmanaged runtimes must preserve their native session home"
+                        continue
                     assert Path(env["HOME"]).is_relative_to(service.root)
                     (Path(env["HOME"]) / "runtime-state").write_text("test")
                 assert not (native_home / "runtime-state").exists()
@@ -131,6 +135,9 @@ async def check() -> None:
                 assert result["content"][0]["text"] == "MCP_OK"
                 for engine in ENGINES:
                     descriptions = await service.prepare_tools(engine)
+                    if not provider_for(engine).gateway_tools:
+                        assert not descriptions, "Portable skills must not claim unsupported Gateway injection"
+                        continue
                     assert len(descriptions) == 1 and len(descriptions[0]["name"]) <= 43
                     delivered = await service.invoke(engine, descriptions[0]["name"], {"text": engine})
                     assert delivered["content"][0]["text"] == engine
@@ -180,6 +187,9 @@ async def check() -> None:
                 service.install({"path":str(resources)})
                 for engine in ENGINES:
                     tools = await service.prepare_tools(engine)
+                    if not provider_for(engine).gateway_tools:
+                        assert not tools
+                        continue
                     assert len(tools) == 5
                     reader = next(tool for tool in tools if tool.get("_method") == "read_resource")
                     result = await service.invoke(engine, reader["name"], {"uri":"test://resource"})
@@ -187,7 +197,22 @@ async def check() -> None:
                     prompt = next(tool for tool in tools if tool.get("_method") == "get_prompt")
                     result = await service.invoke(engine, prompt["name"], {"name":"greet"})
                     assert result["messages"][0]["content"]["text"] == "PROMPT_OK"
-            print("PASS: shared installation, 8 engine projections, native ownership, private homes, MCP call/revocation, rollback, source integrity, uninstall")
+            visual = service.install_visualize()
+            assert visual["mcp_servers"] == [] and visual["allowed_modes"] == ["chat"]
+            service.set_control(False)
+            for engine in ENGINES:
+                assert any(row["name"] == "muteki-visualize:visualize" for row in service.skill_rows(engine))
+                assert visual["compatibility"][engine]["status"] == "supported"
+                assert not service.enabled(engine, "pentest")
+            try:
+                service.update("muteki-visualize", modes=["ctf"])
+            except ChatPluginError as exc:
+                assert exc.code == "chat_plugin.mode_unsupported"
+            else:
+                raise AssertionError("Chat-only visualization plugin was enabled for Workers")
+            service.update("muteki-visualize", enabled=False)
+            assert all(not any(row["name"] == "muteki-visualize:visualize" for row in service.skill_rows(engine)) for engine in ENGINES)
+            print(f"PASS: {len(ENGINES)} skill projections, supported Gateway transports, independent chat-only visualization, lifecycle and isolation")
         finally:
             await service.close()
 

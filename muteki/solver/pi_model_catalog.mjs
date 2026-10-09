@@ -24,5 +24,6 @@ console.log(JSON.stringify({ models: models.map(model => ({
   id: model.id,
   label: `${model.name || model.id} (${model.provider})`,
   provider: model.provider,
+  input: model.input,
   levels: model.reasoning ? getSupportedThinkingLevels(model) : [],
 })) }));

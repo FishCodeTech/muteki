@@ -8,6 +8,7 @@
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { readChatPreferences, useChatPreferences } from "@/lib/chatPreferences";
 import { cn } from "@/lib/cn";
 import { Icon } from "@/components/Icon";
 import {
@@ -58,6 +59,21 @@ type StagingFilter = "all" | "staged" | "unstaged" | "untracked";
 
 const TREE_KEY = "muteki.chat.diff.tree";
 const viewKey = (threadId: string) => `muteki:diff-view:${threadId}`;
+
+/**
+ * A thread's own layout choice is stored with the default it overrode
+ * (`split@unified`), so changing the global default later takes precedence.
+ * Bare values predate the setting, when the default was always unified.
+ */
+function readThreadViewMode(threadId: string, fallback: DiffViewMode): DiffViewMode {
+  try {
+    const [mode, base = "unified"] = (window.localStorage.getItem(viewKey(threadId)) || "").split("@");
+    if ((mode === "split" || mode === "unified") && base === fallback) return mode;
+  } catch {
+    // storage unavailable
+  }
+  return fallback;
+}
 
 function readBool(key: string, fallback: boolean): boolean {
   try {
@@ -151,7 +167,7 @@ function TreeRows({
           >
             <StatusLetter status={node.file.meta.status} />
             <span className="min-w-0 flex-1 truncate font-cx-mono">{node.name}</span>
-            <DiffStat additions={additions} deletions={deletions} className="shrink-0 text-[10.5px]" />
+            <DiffStat additions={additions} deletions={deletions} className="shrink-0 text-[12px]" />
           </button>
         );
       })}
@@ -182,9 +198,9 @@ export function ConversationDiffSurface({
   const [loading, setLoading] = useState(true);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState("");
-  const [viewMode, setViewMode] = useState<DiffViewMode>("unified");
-  const [wrap, setWrap] = useState(false);
-  const [contextLines, setContextLines] = useState(3);
+  const [viewMode, setViewMode] = useState<DiffViewMode>(() => readChatPreferences().diffView);
+  const [wrap, setWrap] = useState(() => readChatPreferences().diffWrap);
+  const [contextLines, setContextLines] = useState(() => (readChatPreferences().diffCollapseUnchanged ? 3 : 999));
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => new Set());
   const [stagingFilter, setStagingFilter] = useState<StagingFilter>("all");
   const [treeOpen, setTreeOpen] = useState(false);
@@ -206,18 +222,30 @@ export function ConversationDiffSurface({
   }, [threadId]);
 
   useEffect(() => {
-    try {
-      const raw = window.localStorage.getItem(viewKey(threadId));
-      if (raw === "split" || raw === "unified") setViewMode(raw);
-    } catch {
-      // storage unavailable
-    }
+    setViewMode(readThreadViewMode(threadId, readChatPreferences().diffView));
     setTreeOpen(readBool(TREE_KEY, false));
   }, [threadId]);
 
+  // Settings changes apply to the open diff immediately, replacing local toggles.
+  const prefs = useChatPreferences();
+  const appliedPrefsRef = useRef(prefs);
+  useEffect(() => {
+    const previous = appliedPrefsRef.current;
+    appliedPrefsRef.current = prefs;
+    if (previous.diffView !== prefs.diffView) setViewMode(readThreadViewMode(threadId, prefs.diffView));
+    if (previous.diffWrap !== prefs.diffWrap) setWrap(prefs.diffWrap);
+    if (previous.diffCollapseUnchanged !== prefs.diffCollapseUnchanged) {
+      setContextLines(prefs.diffCollapseUnchanged ? 3 : 999);
+    }
+  }, [prefs, threadId]);
+
   const changeViewMode = (mode: DiffViewMode) => {
     setViewMode(mode);
-    try { window.localStorage.setItem(viewKey(threadId), mode); } catch { /* ignore */ }
+    const base = readChatPreferences().diffView;
+    try {
+      if (mode === base) window.localStorage.removeItem(viewKey(threadId));
+      else window.localStorage.setItem(viewKey(threadId), `${mode}@${base}`);
+    } catch { /* ignore */ }
   };
   const toggleTree = () => {
     setTreeOpen((open) => {
@@ -409,7 +437,7 @@ export function ConversationDiffSurface({
             <button
               type="button"
               data-testid="diff-baseline-picker"
-              className="cx-press flex h-7 min-w-0 items-center gap-1.5 rounded-lg px-2 text-[12.5px] font-medium text-cx-fg hover:bg-cx-hover data-[state=open]:bg-cx-active"
+              className="cx-press flex h-7 min-w-0 items-center gap-1.5 rounded-lg px-2 text-[13px] font-medium text-cx-fg hover:bg-cx-hover data-[state=open]:bg-cx-active"
             >
               <Icon name={kind === "worktree" ? "gitBranch" : "history"} size={13} className="shrink-0 text-cx-fg-3" />
               <span className="truncate">{scopeLabel}</span>
@@ -447,7 +475,7 @@ export function ConversationDiffSurface({
           ) : null}
         </Menu>
         {scopeDetail ? (
-          <span className="hidden min-w-0 truncate font-cx-mono text-[11.5px] text-cx-fg-4 @[480px]/panel:inline" data-testid="diff-baseline-identity">
+          <span className="hidden min-w-0 truncate font-cx-mono text-[12px] text-cx-fg-4 @[480px]/panel:inline" data-testid="diff-baseline-identity">
             {scopeDetail}
           </span>
         ) : null}
@@ -550,7 +578,7 @@ export function ConversationDiffSurface({
         </div>
         {treeOpen && visibleFiles.length ? (
           <aside className="flex w-[min(15rem,38%)] shrink-0 flex-col border-l border-cx-border-subtle bg-cx-bg-subtle" aria-label="变更文件">
-            <div className="flex h-8 shrink-0 items-center gap-1.5 px-3 text-[11.5px] font-medium text-cx-fg-3">
+            <div className="flex h-8 shrink-0 items-center gap-1.5 px-3 text-[12px] font-medium text-cx-fg-3">
               <span className="flex-1">{visibleFiles.length} 个文件</span>
               <Tooltip content="折叠全部目录">
                 <button

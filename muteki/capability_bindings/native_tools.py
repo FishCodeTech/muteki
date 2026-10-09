@@ -32,7 +32,7 @@ from muteki.platform.contracts.capabilities import (
 )
 from muteki.platform.contracts.protocols import AgentCapabilityGateway
 
-from .http_jsonrpc import capability_result_payload
+from .http_jsonrpc import capability_image_blocks, capability_result_payload
 
 #: 进程内 server 在 mcp_servers 字典中的默认键名。
 DEFAULT_SERVER_NAME = "muteki-control"
@@ -83,7 +83,7 @@ def _make_handler(
             "content": [{
                 "type": "text",
                 "text": json.dumps(payload, ensure_ascii=False),
-            }],
+            }, *capability_image_blocks(result)],
             "isError": not result.ok,
         }
 

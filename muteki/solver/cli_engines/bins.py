@@ -33,6 +33,7 @@ _ENV_OVERRIDE = {
     "grok": "MUTEKI_GROK_BIN",
     "opencode": "MUTEKI_OPENCODE_BIN",
     "devin": "MUTEKI_DEVIN_BIN",
+    "droid": "MUTEKI_DROID_BIN",
 }
 
 # The on-disk binary basename for an engine, when it differs from the engine
@@ -93,6 +94,11 @@ _KNOWN_GOOD = {
         "~/.local/bin/devin",
         "/opt/homebrew/bin/devin",
         "/usr/local/bin/devin",
+    ],
+    "droid": [
+        "~/.local/bin/droid",
+        "/usr/local/bin/droid",
+        "/opt/homebrew/bin/droid",
     ],
 }
 

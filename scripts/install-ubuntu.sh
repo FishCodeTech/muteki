@@ -143,6 +143,7 @@ check_local_engines() {
   check_engine kimi kimi || failed=1
   check_engine grok grok || failed=1
   check_engine opencode opencode || failed=1
+  check_engine droid droid || failed=1
   return "$failed"
 }
 
@@ -228,6 +229,26 @@ if [ "$backend" = local ] || [ "$backend" = both ]; then
   install_npm_engine pi '@earendil-works/pi-coding-agent@0.84.1'
   install_npm_engine kimi '@moonshot-ai/kimi-code@0.40.1'
   install_npm_engine opencode 'opencode-ai@1.18.22'
+
+  install_droid() {
+    if command -v droid >/dev/null 2>&1 && timeout 30 droid --version >/dev/null 2>&1; then
+      return 0
+    fi
+    note "installing droid 0.234.0"
+    local arch sha url temporary
+    case "$(uname -m)" in
+      x86_64) arch="x64"; sha="d3a22164b64ee9d134ed7b068833ceb38c090631d7b257ae03b3b72d9e84d257" ;;
+      aarch64|arm64) arch="arm64"; sha="9fb422a6733293120df8d8c34b1062d9acc997e6cac4c2740eb453f046f0161c" ;;
+      *) die "unsupported Droid architecture: $(uname -m)" ;;
+    esac
+    url="https://downloads.factory.ai/factory-cli/releases/0.234.0/linux/${arch}/droid"
+    temporary="$(mktemp)"
+    curl -fsSL "$url" -o "$temporary"
+    echo "${sha}  ${temporary}" | sha256sum -c -
+    install -m 0755 "$temporary" "$HOME/.local/bin/droid"
+    rm -f "$temporary"
+  }
+  install_droid
 
   install_script_engine() {
     local binary="$1" url="$2" interpreter="$3"

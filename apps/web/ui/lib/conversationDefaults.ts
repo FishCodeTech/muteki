@@ -1,3 +1,4 @@
+import { readUiPreference, writeUiPreferences } from "./uiPreferences";
 /** Browser preference for the default chat credential + model. */
 import { conversationStorageKey, conversationStorageScope } from "./conversationStorageScope";
 
@@ -6,7 +7,6 @@ export type ChatDefaultModel = {
   modelId: string;
 };
 
-const CHAT_DEFAULT_MODEL_KEY = "muteki.conversation.default-model.v1";
 
 export type ChatLastSelection = ChatDefaultModel & {
   runtimeKey: string;
@@ -46,38 +46,10 @@ export function writeChatLastSelection(value: ChatLastSelection): void {
 }
 
 export function readChatDefaultModel(): ChatDefaultModel | null {
-  if (typeof window === "undefined" || !conversationStorageScope()) return null;
-  try {
-    const raw = window.localStorage.getItem(conversationStorageKey(CHAT_DEFAULT_MODEL_KEY));
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<ChatDefaultModel>;
-    const credentialId = String(parsed?.credentialId ?? "").trim();
-    const modelId = String(parsed?.modelId ?? "").trim();
-    if (!credentialId || !modelId) return null;
-    return { credentialId, modelId };
-  } catch {
-    return null;
-  }
+  return readUiPreference("defaultModel", null);
 }
-
 export function writeChatDefaultModel(value: ChatDefaultModel | null): boolean {
-  if (typeof window === "undefined" || !conversationStorageScope()) return false;
-  try {
-    if (!value?.credentialId || !value?.modelId) {
-      window.localStorage.removeItem(conversationStorageKey(CHAT_DEFAULT_MODEL_KEY));
-      return true;
-    }
-    window.localStorage.setItem(
-      conversationStorageKey(CHAT_DEFAULT_MODEL_KEY),
-      JSON.stringify({
-        credentialId: value.credentialId.trim(),
-        modelId: value.modelId.trim(),
-      }),
-    );
-    return true;
-  } catch {
-    return false;
-  }
+  return writeUiPreferences({defaultModel: value});
 }
 
 /**

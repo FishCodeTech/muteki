@@ -19,6 +19,8 @@ AgentSession 业务状态：Binding 与 Grant 读取自 PlatformStore，业务�
 from __future__ import annotations
 
 import logging
+import json
+from time import perf_counter
 from typing import Any, Callable, Optional
 
 from muteki.platform.capability_bindings import CapabilityBindingService
@@ -52,6 +54,7 @@ from muteki.platform.contracts.commands import (
 )
 from muteki.platform.contracts.errors import ErrorCategory, ErrorEnvelope
 from muteki.platform.contracts.graphs import GraphScope
+from muteki.platform.contracts.events import EventEnvelope
 from muteki.platform.contracts.objects import (
     AgentSession,
     Project,
@@ -112,12 +115,64 @@ class AgentCapabilityGatewayImpl:
     async def invoke(
         self, context: BindingContext, invocation: CapabilityInvocation
     ) -> CapabilityResult:
+        started = perf_counter()
+        result = await self._invoke(context, invocation)
+        duration_ms = (perf_counter() - started) * 1000
+        try:
+            binding = self._bindings.get_binding(context.binding_id)
+            if binding is not None:
+                from muteki.capability_bindings.http_jsonrpc import capability_result_payload
+                self._store.append_events(EventEnvelope(
+                    aggregate_type="capability", aggregate_id=binding.binding_id,
+                    event_type="core.capability.invoked", producer="builtin.capability",
+                    actor_id=context.principal_id,
+                    correlation_id=invocation.invocation_id,
+                    payload={"tool": invocation.tool_name, "invocation_id": invocation.invocation_id,
+                             "thread_id": binding.thread_id, "agent_session_id": context.agent_session_id,
+                             "binding_version": context.binding_version, "ok": result.ok,
+                             "receipt_state": result.receipt.state.value if result.receipt is not None else None,
+                             "error_code": result.error.code if result.error is not None else None,
+                             "duration_ms": round(duration_ms, 3),
+                             "input_bytes": len(json.dumps(invocation.arguments, ensure_ascii=False,
+                                                          separators=(",", ":")).encode()),
+                             "result_bytes": len(json.dumps(capability_result_payload(result), ensure_ascii=False,
+                                                           separators=(",", ":")).encode())},
+                ))
+        except Exception:
+            # A completed action must not be retried because telemetry failed.
+            # Keep the business result intact and make the recording failure visible.
+            LOG.exception("capability telemetry persistence failed: invocation=%s", invocation.invocation_id)
+        return result
+
+    async def _invoke(
+        self, context: BindingContext, invocation: CapabilityInvocation
+    ) -> CapabilityResult:
         correlation_id = (
             str(invocation.correlation_id or "").strip() or invocation.invocation_id
         )
         try:
             binding, _grant = self._authorize(context, correlation_id)
             spec = self._require_tool(binding, invocation.tool_name, correlation_id)
+            errors = self._catalog.validation_errors(spec.name, invocation.arguments)
+            if errors:
+                required = spec.input_schema.get("required", [])
+                if spec.aggregate_arg in required and spec.aggregate_arg not in invocation.arguments:
+                    self._require_aggregate_arg(spec, invocation.arguments, correlation_id)
+                raise CommandAPIError(ErrorEnvelope(
+                    code="capability.arguments_invalid",
+                    message=f"{spec.name} 参数不符合工具 Schema：" + "; ".join(
+                        ".".join(str(part) for part in error["path"]) + " (" + error["rule"] + ")"
+                        for error in errors),
+                    category=ErrorCategory.VALIDATION,
+                    correlation_id=correlation_id,
+                    recovery_hint="根据 detail.validation_errors 修正参数后重试同一工具；不要猜测 ID 或把校验失败当作空结果。",
+                    detail={"validation_errors": errors},
+                ))
+            if spec.target_kind is ToolTargetKind.QUERY:
+                defaults = {name: schema["default"] for name, schema in spec.input_schema.get("properties", {}).items()
+                            if "default" in schema}
+                if defaults:
+                    invocation = invocation.model_copy(update={"arguments": {**defaults, **invocation.arguments}})
             return await self._dispatch_to_command_api(
                 binding, spec, invocation, correlation_id)
         except CommandAPIError as exc:
@@ -236,7 +291,8 @@ class AgentCapabilityGatewayImpl:
                 "capability.tool_unknown",
                 f"unknown capability tool {tool_name!r}",
                 ErrorCategory.VALIDATION,
-                correlation_id=correlation_id))
+                correlation_id=correlation_id,
+                recovery_hint="刷新当前会话的工具目录，使用目录中的准确工具名。"))
         if spec.name not in effective_tool_set(binding.mode, binding.tool_set):
             raise CommandAPIError(make_error(
                 "capability.tool_not_allowed",
@@ -274,10 +330,12 @@ class AgentCapabilityGatewayImpl:
                 error=receipt.error,
             )
         if spec.target_kind is ToolTargetKind.QUERY:
-            aggregate_id = (
-                self._require_aggregate_arg(spec, args, correlation_id)
-                if spec.aggregate_arg else ""
-            )
+            if spec.aggregate_from_caller_thread:
+                aggregate_id = binding.thread_id
+            elif spec.aggregate_arg:
+                aggregate_id = self._require_aggregate_arg(spec, args, correlation_id)
+            else:
+                aggregate_id = ""
             result = await self._api.query(QueryEnvelope(
                 query_type=str(spec.query_type or ""),
                 aggregate_type=spec.aggregate_type or None,
@@ -357,7 +415,10 @@ class AgentCapabilityGatewayImpl:
         fields: dict[str, Any] = {
             "command_type": str(spec.command_type or ""),
             "aggregate_type": spec.aggregate_type,
-            "aggregate_id": self._aggregate_arg(spec, args),
+            "aggregate_id": (
+                str(actor.thread_id or "") if spec.aggregate_from_caller_thread
+                else self._aggregate_arg(spec, args)
+            ),
             "actor": actor,
             "payload": payload,
         }
@@ -380,11 +441,15 @@ class AgentCapabilityGatewayImpl:
     ) -> str:
         value = self._aggregate_arg(spec, args)
         if not value:
-            raise CommandAPIError(make_error(
-                "capability.argument_required",
-                f"{spec.name} requires arguments.{spec.aggregate_arg}",
-                ErrorCategory.VALIDATION,
-                correlation_id=correlation_id))
+            raise CommandAPIError(ErrorEnvelope(
+                code="capability.argument_required",
+                message=f"{spec.name} requires arguments.{spec.aggregate_arg}",
+                category=ErrorCategory.VALIDATION,
+                correlation_id=correlation_id,
+                recovery_hint=f"从列表查询或创建回执取得真实资源 ID，填入 arguments.{spec.aggregate_arg} 后重试。",
+                detail={"validation_errors": [{"path": ["arguments", spec.aggregate_arg],
+                                               "rule": "nonempty_reference", "expected": "existing resource ID"}]},
+            ))
         return value
 
     @staticmethod
@@ -456,7 +521,9 @@ class ThreadListQueryHandler:
             reverse=True,
         )
         total = len(threads)
-        selected = threads[:limit]
+        from .command_handlers.pagination import page_items
+        selected, continuation = page_items(threads, params, limit, ctx, query.query_type,
+                                             lambda thread: thread.thread_id)
         return QueryResult(
             query_id=query.query_id,
             query_type=query.query_type,
@@ -464,6 +531,7 @@ class ThreadListQueryHandler:
                 "threads": [t.model_dump(mode="json") for t in selected],
                 "total": total,
                 "returned": len(selected),
+                **continuation,
             },
         )
 
@@ -503,6 +571,19 @@ class SharedGraphReadQueryHandler:
                 correlation_id=query.query_id))
         snapshot = await graph.snapshot(GraphScope(graph_id=graph.id))
         state = dict(snapshot.state)
+        available_sections = sorted(state)
+        sections = query.params.get("sections")
+        if sections is not None:
+            if (not isinstance(sections, list) or not sections
+                    or any(not isinstance(section, str) or section not in state for section in sections)):
+                raise CommandFailed(ErrorEnvelope(
+                    code="graph.sections_invalid", category=ErrorCategory.VALIDATION,
+                    message="sections 必须是 available_sections 中的区块名称列表",
+                    correlation_id=query.query_id,
+                    recovery_hint="从 detail.available_sections 选择需要的区块。",
+                    detail={"available_sections": available_sections},
+                ))
+            state = {section: state[section] for section in sections}
         return QueryResult(
             query_id=query.query_id,
             query_type=query.query_type,
@@ -510,6 +591,7 @@ class SharedGraphReadQueryHandler:
                 "graph_id": snapshot.graph_id,
                 "watermark": snapshot.watermark,
                 "state": state,
+                "available_sections": available_sections,
             },
         )
 

@@ -21,7 +21,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
-from apps.web.auth import bearer_from_header, verify_token
+from apps.web.auth import request_token, verify_token
 from muteki.conversation.workspace_surfaces import content_disposition_header
 
 MAX_MESSAGES = 500
@@ -292,7 +292,7 @@ def create_conversation_shares_router(*, service: Any) -> APIRouter:
 
     def read_scope(share_id: str, request: Request):
         cfg = request.app.state.auth
-        authenticated = cfg.enabled and verify_token(cfg, bearer_from_header(request.headers.get("Authorization")))
+        authenticated = cfg.enabled and verify_token(cfg, request_token(cfg, request))
         token = request.headers.get("X-Muteki-Share-Token", "")
         if len(token) != 43:
             raise HTTPException(404, "分享不存在或链接不完整")

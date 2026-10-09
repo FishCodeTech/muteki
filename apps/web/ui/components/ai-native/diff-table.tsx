@@ -77,7 +77,7 @@ export function DiffTable({ title = "文件改动对比", files = [], onSelectFi
               <span className="min-w-0 flex-1 truncate font-cx-mono text-[12px] font-medium text-cx-fg" title={file.path}>
                 {file.path}
               </span>
-              <DiffStat additions={additions} deletions={deletions} className="shrink-0 text-[11px]" />
+              <DiffStat additions={additions} deletions={deletions} className="shrink-0 text-[12px]" />
               {file.raw ? <CopyButton text={file.raw} label="复制 Diff" /> : null}
               {onSelectFile ? (
                 <Button size="xs" variant="ghost" onClick={() => onSelectFile(file)}>
@@ -86,14 +86,14 @@ export function DiffTable({ title = "文件改动对比", files = [], onSelectFi
               ) : null}
             </div>
             {rows.length ? (
-              <div className="cx-scroll max-h-72 overflow-auto font-cx-mono text-[11.5px] leading-[1.6]">
+              <div className="cx-scroll max-h-72 overflow-auto font-cx-mono text-[12px] leading-[1.6]">
                 <table className="w-full border-collapse">
                   <tbody>
                     {rows.map((row, rowIdx) => {
                       if (row.type === "hunk") {
                         return (
                           <tr key={rowIdx} className="bg-cx-accent-soft/60 text-cx-fg-3">
-                            <td colSpan={3} className="px-3 py-0.5 text-[11px]">{row.content}</td>
+                            <td colSpan={3} className="px-3 py-0.5 text-[12px]">{row.content}</td>
                           </tr>
                         );
                       }
@@ -101,8 +101,8 @@ export function DiffTable({ title = "文件改动对比", files = [], onSelectFi
                       const isDel = row.type === "del";
                       return (
                         <tr key={rowIdx} className={cn(isAdd ? "bg-cx-add-bg" : isDel ? "bg-cx-del-bg" : "text-cx-fg-2")}>
-                          <td className="w-10 select-none px-2 text-right text-[10.5px] text-cx-fg-4">{row.oldLine ?? ""}</td>
-                          <td className="w-10 select-none px-2 text-right text-[10.5px] text-cx-fg-4">{row.newLine ?? ""}</td>
+                          <td className="w-10 select-none px-2 text-right text-[12px] text-cx-fg-4">{row.oldLine ?? ""}</td>
+                          <td className="w-10 select-none px-2 text-right text-[12px] text-cx-fg-4">{row.newLine ?? ""}</td>
                           <td className="whitespace-pre pr-3 text-cx-fg">
                             <span className={cn("inline-block w-4 select-none", isAdd ? "text-cx-add" : isDel ? "text-cx-del" : "text-transparent")}>
                               {isAdd ? "+" : isDel ? "−" : " "}

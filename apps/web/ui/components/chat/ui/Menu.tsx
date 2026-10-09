@@ -69,7 +69,7 @@ export function Menu({ trigger, open, onOpenChange, anchorPoint, placement = "bo
     >
       {({ close }) => (
         <MenuContext.Provider value={{ close }}>
-          <div className="cx-scroll flex min-h-0 flex-col overflow-y-auto">{children}</div>
+          <div className="cx-scroll flex min-h-0 flex-col overflow-y-auto overflow-x-hidden">{children}</div>
         </MenuContext.Provider>
       )}
     </Popover>
@@ -144,6 +144,11 @@ export function MenuLabel({ children, action }: { children: ReactNode; action?: 
   );
 }
 
+/** Lets `MenuItem` / `MenuSub` close a menu that is rendered by a bare `Popover`. */
+export function MenuScope({ close, children }: { close: () => void; children: ReactNode }) {
+  return <MenuContext.Provider value={{ close }}>{children}</MenuContext.Provider>;
+}
+
 /** Nested menu opened on hover or ArrowRight. */
 export function MenuSub({ label, icon, children, disabled }: { label: ReactNode; icon?: IconName; children: ReactNode; disabled?: boolean }) {
   const [open, setOpen] = useState(false);
@@ -186,7 +191,7 @@ export function MenuSub({ label, icon, children, disabled }: { label: ReactNode;
       )}
     >
       <MenuContext.Provider value={{ close: closeAll }}>
-        <div className="cx-scroll flex max-h-[360px] flex-col overflow-y-auto">{children}</div>
+        <div className="cx-scroll flex max-h-[360px] flex-col overflow-y-auto overflow-x-hidden">{children}</div>
       </MenuContext.Provider>
     </Popover>
   );

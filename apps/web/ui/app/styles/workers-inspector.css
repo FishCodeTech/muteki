@@ -353,6 +353,8 @@
 .wroster-check-all:disabled { opacity: .56; cursor: not-allowed; transform: none; }
 .wroster-check-all.running svg { animation: railspin .75s linear infinite; }
 .wroster-addbar { display: flex; align-items: center; justify-content: flex-end; gap: 6px; white-space: nowrap; }
+.wroster-descriptor-error { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.wroster-descriptor-error > .wruntime-note { flex: 1; min-width: 0; }
 .wroster-addbar > span { margin-right: 2px; color: var(--dim); font-size: var(--ws-fs-micro); }
 .wroster-primary-engines { display: flex; align-items: center; gap: 5px; }
 .wroster-primary-engines button {

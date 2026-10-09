@@ -1,34 +1,16 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { cn } from "@/lib/cn";
 import { Icon } from "@/components/Icon";
 import { Badge, Button, EmptyState, IconButton, ScrollArea, Skeleton, type Tone } from "@/components/chat/ui";
 import type { SurfaceProps } from "@/components/chat/panel/types";
-import { apiFetch } from "@/lib/useRun";
+import { useSharedGitStatus } from "@/lib/threadGitStatusStore";
+import { useThreadPullRequests, type ThreadPullRequestListing } from "@/lib/threadGitActions";
+import { CreatePullRequestDialog } from "@/components/conversation/ThreadGitActions";
 import { SurfaceToolbar, relativeTime } from "./shared";
 
-interface PrRecord {
-  number: number;
-  title: string;
-  state: "open" | "closed" | "draft" | string;
-  html_url: string;
-  user_login: string;
-  created_at: string;
-  updated_at: string;
-  base_ref: string;
-  head_ref: string;
-}
-
-interface PrResult {
-  state: "no_workspace" | "no_git" | "no_remote" | "not_github" | "error" | "no_pr" | "ok";
-  branch: string | null;
-  remote_url: string;
-  owner: string;
-  repo: string;
-  error?: string;
-  pull_requests: PrRecord[];
-}
+type PrResult = ThreadPullRequestListing;
 
 const STATE_LABEL: Record<string, string> = { open: "开放", closed: "已关闭", draft: "草稿", merged: "已合并" };
 const STATE_TONE: Record<string, Tone> = { open: "success", closed: "danger", draft: "neutral", merged: "accent" };
@@ -43,33 +25,23 @@ const EMPTY_COPY: Record<PrResult["state"], { title: string; detail: string }> =
   ok: { title: "", detail: "" },
 };
 
-export function PullRequestSurface({ threadId, active }: SurfaceProps) {
-  const [result, setResult] = useState<PrResult | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError("");
-    try {
-      const response = await apiFetch(`/api/threads/${encodeURIComponent(threadId)}/pull-requests`);
-      setResult(await response.json() as PrResult);
-    } catch (exc) {
-      setError(exc instanceof Error ? exc.message : "加载失败");
-    } finally {
-      setLoading(false);
-    }
-  }, [threadId]);
+export function PullRequestSurface({ threadId, view, active }: SurfaceProps) {
+  const prs = useThreadPullRequests(threadId, false);
+  const { result, loading, error } = prs;
+  const projectId = view?.thread.project_id || view?.workspace?.project_id || undefined;
+  const git = useSharedGitStatus(threadId, projectId);
+  const [createOpen, setCreateOpen] = useState(false);
+  const load = prs.refresh;
 
   useEffect(() => {
-    if (active && !result && !error) void load();
-  }, [active, result, error, load]);
+    if (active && !result && !error && !loading) void load();
+  }, [active, result, error, loading, load]);
 
   const header = result && (result.owner || result.branch) ? (
     <SurfaceToolbar className="px-3">
       <Icon name="gitPullRequest" size={14} className="text-cx-fg-3" />
-      <span className="min-w-0 truncate text-[12.5px] font-medium text-cx-fg">{result.owner}/{result.repo}</span>
-      {result.branch ? <span className="min-w-0 truncate font-cx-mono text-[11.5px] text-cx-fg-4">· {result.branch}</span> : null}
+      <span className="min-w-0 truncate text-[13px] font-medium text-cx-fg">{result.owner}/{result.repo}</span>
+      {result.branch ? <span className="min-w-0 truncate font-cx-mono text-[12px] text-cx-fg-4">· {result.branch}</span> : null}
       <span className="flex-1" />
       <IconButton icon="refresh" label="刷新" loading={loading} onClick={() => void load()} />
     </SurfaceToolbar>
@@ -108,8 +80,14 @@ export function PullRequestSurface({ threadId, active }: SurfaceProps) {
           icon="gitPullRequest"
           title={copy.title}
           description={result?.error || copy.detail}
-          action={state !== "no_workspace" ? <Button size="sm" variant="ghost" icon="refresh" onClick={() => void load()}>重新检测</Button> : undefined}
+          action={state === "no_pr" && git.status?.current_branch ? (
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="secondary" icon="gitPullRequest" onClick={() => setCreateOpen(true)}>创建 PR…</Button>
+              <Button size="sm" variant="ghost" icon="refresh" onClick={() => void load()}>重新检测</Button>
+            </div>
+          ) : state !== "no_workspace" ? <Button size="sm" variant="ghost" icon="refresh" onClick={() => void load()}>重新检测</Button> : undefined}
         />
+        <CreatePullRequestDialog open={createOpen} onOpenChange={setCreateOpen} threadId={threadId} status={git.status} />
       </div>
     );
   }
@@ -132,8 +110,8 @@ export function PullRequestSurface({ threadId, active }: SurfaceProps) {
                   <Badge tone={STATE_TONE[pr.state] ?? "neutral"} dot>{STATE_LABEL[pr.state] ?? pr.state}</Badge>
                   <Icon name="externalLink" size={12} className="ml-auto text-cx-fg-4 opacity-0 transition-opacity group-hover:opacity-100" />
                 </span>
-                <span className="text-[13.5px] font-medium leading-5 text-cx-fg">{pr.title}</span>
-                <span className={cn("flex flex-wrap items-center gap-x-2 text-[11.5px] text-cx-fg-4")}>
+                <span className="text-[14px] font-medium leading-5 text-cx-fg">{pr.title}</span>
+                <span className={cn("flex flex-wrap items-center gap-x-2 text-[12px] text-cx-fg-4")}>
                   <span>{pr.user_login}</span>
                   {pr.created_at ? <span>{relativeTime(pr.created_at)}</span> : null}
                   {pr.base_ref ? <span className="font-cx-mono">{pr.head_ref} → {pr.base_ref}</span> : null}

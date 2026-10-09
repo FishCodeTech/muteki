@@ -47,7 +47,7 @@ function Row({
       </span>
       <span className="flex min-w-0 flex-1 flex-col text-left">
         <span className="truncate text-[13px] font-medium text-cx-fg">{title}</span>
-        {subtitle ? <span className="truncate text-[11.5px] text-cx-fg-4">{subtitle}</span> : null}
+        {subtitle ? <span className="truncate text-[12px] text-cx-fg-4">{subtitle}</span> : null}
       </span>
       {trailing ?? (onClick ? <Icon name="chevronRight" size={14} className="shrink-0 text-cx-fg-4" /> : null)}
     </>
@@ -101,12 +101,12 @@ export function OverviewSurface({ threadId, view, events, tools, onOpenDetails }
         <Card className="p-3">
           <div className="flex items-start gap-3">
             <div className="min-w-0 flex-1">
-              <p className="text-[11.5px] font-medium text-cx-fg-4">{view.state.status === "archived" ? "会话已归档" : view.state.status === "active" ? "会话可继续" : "会话生命周期未上报"} · {view.state.running_turn_id ? "当前轮次" : "最近轮次"}执行状态</p>
+              <p className="text-[12px] font-medium text-cx-fg-4">{view.state.status === "archived" ? "会话已归档" : view.state.status === "active" ? "会话可继续" : "会话生命周期未上报"} · {view.state.running_turn_id ? "当前轮次" : "最近轮次"}执行状态</p>
               <p className="mt-0.5 truncate text-[15px] font-semibold text-cx-fg">{view.thread.title || "未命名对话"}</p>
             </div>
             <Badge tone={status.tone} dot>{status.label}</Badge>
           </div>
-          <dl className="mt-3 grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 text-[12.5px]">
+          <dl className="mt-3 grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 text-[13px]">
             <dt className="text-cx-fg-4">当前选择模型</dt>
             <dd className="flex min-w-0 items-center gap-1.5 text-cx-fg-2">
               <span className="truncate font-cx-mono text-[12px]">{model}</span>
@@ -118,7 +118,7 @@ export function OverviewSurface({ threadId, view, events, tools, onOpenDetails }
               <span className="block truncate">{workspaceLabel(view)} · {workspaceKindLabel(view)}</span>
               {workspacePath ? (
                 <span className="mt-0.5 flex min-w-0 items-center gap-1">
-                  <code className="min-w-0 truncate font-cx-mono text-[11.5px] text-cx-fg-4" title={workspacePath}>{workspacePath}</code>
+                  <code className="min-w-0 truncate font-cx-mono text-[12px] text-cx-fg-4" title={workspacePath}>{workspacePath}</code>
                   <CopyButton text={workspacePath} label="复制路径" />
                 </span>
               ) : null}
@@ -156,7 +156,7 @@ export function OverviewSurface({ threadId, view, events, tools, onOpenDetails }
             title="后台进程"
             count={runningTools.length}
             action={tools.length ? (
-              <button type="button" onClick={openExecutionLog} className="text-[11.5px] font-medium text-cx-accent hover:underline">执行日志</button>
+              <button type="button" onClick={openExecutionLog} className="text-[12px] font-medium text-cx-accent hover:underline">执行日志</button>
             ) : undefined}
           />
           <Card>

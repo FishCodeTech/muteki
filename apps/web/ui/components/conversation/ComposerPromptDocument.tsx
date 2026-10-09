@@ -407,7 +407,7 @@ export function ComposerPromptDocument({
       {empty ? (
         <div
           aria-hidden="true"
-          className="pointer-events-none absolute inset-x-0 top-0 select-none truncate px-1 text-[14px] leading-6 text-cx-fg-4"
+          className="pointer-events-none absolute inset-x-0 top-0 select-none truncate px-1 text-[length:var(--cx-msg-fs,15px)] leading-[1.6] text-cx-fg-4"
         >
           {placeholder}
         </div>
@@ -427,7 +427,7 @@ export function ComposerPromptDocument({
         suppressContentEditableWarning
         data-composer-prompt-document="1"
         aria-placeholder={placeholder || undefined}
-        className="cx-prompt-editor cx-scroll max-h-[288px] min-h-6 w-full overflow-y-auto whitespace-pre-wrap break-words bg-transparent px-1 text-[14px] leading-6 text-cx-fg caret-cx-accent outline-none"
+        className="cx-prompt-editor cx-scroll max-h-[288px] min-h-[48px] w-full overflow-y-auto whitespace-pre-wrap break-words bg-transparent px-1 text-[length:var(--cx-msg-fs,15px)] leading-[1.6] text-cx-fg caret-cx-accent outline-none"
         onInput={() => {
           if (composing) return;
           emitFromDom(false);
@@ -628,7 +628,7 @@ export function ContextNodeChip({
       >
         @{node.snapshot.label || node.name}
       </button>
-      {badge ? <span className="shrink-0 text-[10.5px] font-normal opacity-85">{badge}</span> : null}
+      {badge ? <span className="shrink-0 text-[12px] font-normal opacity-85">{badge}</span> : null}
       {onRemove ? (
         <button
           type="button"

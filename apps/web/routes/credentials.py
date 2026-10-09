@@ -10,6 +10,8 @@ from fastapi import (
     HTTPException,
     Request,
 )
+from fastapi.responses import JSONResponse
+from muteki.solver.shared_credentials import SharedCredentialError
 
 from apps.web.routes.common import (
     _require_dict_body,
@@ -19,7 +21,9 @@ from muteki.solver.engine_registry import (
     ensure_engine_supported,
 )
 from muteki.solver.credential_accounts import (
+    HOST_LOGIN_IMPORT_ENGINES,
     CredentialAccountStore,
+    CredentialAccountLockTimeoutError,
     account_credential_id,
     account_id_from_credential_id,
     account_store_root,
@@ -31,6 +35,18 @@ from muteki.solver.credential_accounts import (
 )
 
 def register(app: FastAPI) -> None:
+    @app.exception_handler(SharedCredentialError)
+    async def shared_credential_error(_request: Request, exc: SharedCredentialError) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"error": {"code": exc.code, "message": str(exc)}})
+    @app.exception_handler(CredentialAccountLockTimeoutError)
+    async def credential_lock_timeout_response(
+        request: Request, exc: CredentialAccountLockTimeoutError,
+    ) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"detail": {
+            "code": exc.code,
+            "message": "凭据正在由其它操作更新，请稍后重试。",
+        }})
+
     h = app.state.route_helpers
     _catalog_runtime_keys_by_engine = h._catalog_runtime_keys_by_engine
     _primary_catalog_runtime_key = h._primary_catalog_runtime_key
@@ -40,8 +56,10 @@ def register(app: FastAPI) -> None:
     _credential_usage_index = h._credential_usage_index
 
     @app.post("/api/settings/credential-models/refresh-stale")
-    async def refresh_stale_credential_models() -> Any:
-        return await _refresh_stale_credential_catalogs()
+    async def refresh_stale_credential_models(environment: str = "") -> Any:
+        if environment not in {"", "local", "container"}:
+            raise HTTPException(status_code=422, detail="environment 必须是 local 或 container")
+        return await _refresh_stale_credential_catalogs(environment=environment)
 
     @app.get("/api/settings/credentials")
     async def list_credentials(
@@ -64,13 +82,13 @@ def register(app: FastAPI) -> None:
                 detail="environment 必须是 local 或 container",
             )
         state_root = app.state.manager.state_root
-        cfg = app.state.manager.worker_config.get()
+        cfg = await asyncio.to_thread(app.state.manager.worker_config.get)
         catalog_environment = requested_environment or backend_for_profile(
             worker_backend=str(cfg.get("worker_backend") or ""),
             in_web_container=is_web_container(),
         )
 
-        usage = _credential_usage_index()
+        usage = await asyncio.to_thread(_credential_usage_index)
 
         def _payload() -> dict[str, Any]:
             store = CredentialAccountStore(account_store_root(state_root))
@@ -186,6 +204,8 @@ def register(app: FastAPI) -> None:
                 target_model=model,
                 models=[model],
             )
+        except SharedCredentialError:
+            raise
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         from apps.web.llm_credentials import list_model_endpoints, model_endpoint_id
@@ -211,6 +231,8 @@ def register(app: FastAPI) -> None:
         backend = "container" if backend == "container" else "local"
         try:
             stable_id = canonical_credential_id(credential_id)
+        except SharedCredentialError:
+            raise
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         account_id = account_id_from_credential_id(stable_id)
@@ -333,6 +355,8 @@ def register(app: FastAPI) -> None:
         _reject_temporarily_disabled_engine(body)
         try:
             stable_id = canonical_credential_id(credential_id)
+        except SharedCredentialError:
+            raise
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         account_id = account_id_from_credential_id(stable_id)
@@ -480,6 +504,8 @@ def register(app: FastAPI) -> None:
             )
         except FileExistsError as exc:
             raise HTTPException(status_code=409, detail={"code": str(exc), "message": "凭据已存在或已被其它视图修改，请刷新后重试。"}) from exc
+        except SharedCredentialError:
+            raise
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         from apps.web.worker_models import CredentialModelCatalogStore
@@ -505,9 +531,11 @@ def register(app: FastAPI) -> None:
         return {"ok": True, "account": account}
 
     @app.delete("/api/settings/credential-accounts/{account_id}")
-    async def delete_credential_account(account_id: str, detach_references: bool = False) -> Any:
+    def delete_credential_account(account_id: str, detach_references: bool = False) -> Any:
         try:
             stable_id = account_credential_id(account_id)
+        except SharedCredentialError:
+            raise
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         all_usages = _credential_usage_index().get(stable_id) or []
@@ -553,6 +581,9 @@ def register(app: FastAPI) -> None:
                 rollback_errors.append({"scope": "runtime_settings", "error": str(rollback)})
             if rollback_errors:
                 raise HTTPException(status_code=500, detail={"code": "credential.delete.rollback_failed", "message": "删除未完成，部分引用需要恢复。", "cause": str(exc), "recovery": rollback_errors}) from exc
+            if isinstance(exc, (CredentialAccountLockTimeoutError, SharedCredentialError)):
+                # Rollback is complete; the application handler returns the typed 503.
+                raise
             if isinstance(exc, FileNotFoundError):
                 raise HTTPException(status_code=404, detail={"code": "credential.account.not_found", "message": "账号不存在，引用没有改变。"}) from exc
             raise HTTPException(status_code=500, detail={"code": "credential.delete.failed", "message": "删除失败，账号与引用已恢复。", "cause": str(exc)}) from exc
@@ -578,13 +609,15 @@ def register(app: FastAPI) -> None:
         store = CredentialAccountStore(account_store_root(app.state.manager.state_root))
         try:
             account = await asyncio.to_thread(store.import_host_codex_auth, account_id)
+        except SharedCredentialError:
+            raise
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         return {"ok": True, "account": account}
 
     @app.post("/api/settings/credential-accounts/{account_id}/import-host-login")
     async def import_host_login(account_id: str, request: Request) -> Any:
-        """Copy a minimal Claude, Kimi Code, or Grok host login into an account.
+        """Copy a minimal host login (HOST_LOGIN_IMPORT_ENGINES) into an account.
 
         Container workers receive the account projection, so they can authenticate
         without mounting the operator's complete home directory.
@@ -598,11 +631,16 @@ def register(app: FastAPI) -> None:
             )
         body = await _require_dict_body(request)
         engine = str(body.get("engine") or "").strip().lower()
-        if engine not in {"claude", "kimi", "grok"}:
-            raise HTTPException(status_code=400, detail="engine must be claude, kimi, or grok")
+        if engine not in HOST_LOGIN_IMPORT_ENGINES:
+            raise HTTPException(
+                status_code=400,
+                detail="engine must be one of: " + ", ".join(HOST_LOGIN_IMPORT_ENGINES),
+            )
         store = CredentialAccountStore(account_store_root(app.state.manager.state_root))
         try:
             account = await asyncio.to_thread(store.import_host_login, account_id, engine)
+        except SharedCredentialError:
+            raise
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         return {"ok": True, "account": account}

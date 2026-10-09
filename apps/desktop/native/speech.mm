@@ -3,6 +3,7 @@
 #include <string>
 #import <AVFoundation/AVFoundation.h>
 #import <Speech/Speech.h>
+#import <UserNotifications/UserNotifications.h>
 
 // Node-API keeps this module independent of Electron's Node/V8 ABI. All Cocoa
 // state belongs to the main queue; only the TSFN crosses into JavaScript.
@@ -188,8 +189,44 @@ static napi_value Start(napi_env env, napi_callback_info info) {
 static napi_value Finish(napi_env, napi_callback_info) { [activeSession endAudio]; return nullptr; }
 static napi_value Cancel(napi_env, napi_callback_info) { [activeSession finish:@{@"type": @"cancelled"}]; return nullptr; }
 static void Cleanup(void *) { [activeSession finish:@{@"type": @"cancelled"}]; }
+static napi_value NotificationSettings(napi_env env, napi_callback_info info) {
+  size_t argc = 1; napi_value args[1], resource; napi_valuetype type;
+  napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+  if (argc != 1 || napi_typeof(env, args[0], &type) != napi_ok || type != napi_function) {
+    napi_throw_type_error(env, nullptr, "notificationSettings requires a callback"); return nullptr;
+  }
+  napi_create_string_utf8(env, "Muteki notification settings", NAPI_AUTO_LENGTH, &resource);
+  napi_threadsafe_function callback;
+  if (napi_create_threadsafe_function(env, args[0], nullptr, resource, 0, 1, nullptr, nullptr, nullptr, Deliver, &callback) != napi_ok) {
+    napi_throw_error(env, "desktop.notification_status_bridge_failed", "Cannot create notification settings callback"); return nullptr;
+  }
+  auto deliver = ^(NSDictionary *result) {
+    NSData *bytes = [NSJSONSerialization dataWithJSONObject:result options:0 error:nil];
+    auto *json = new std::string(static_cast<const char *>(bytes.bytes), bytes.length);
+    if (napi_call_threadsafe_function(callback, json, napi_tsfn_nonblocking) != napi_ok) delete json;
+    napi_release_threadsafe_function(callback, napi_tsfn_release);
+  };
+  @try {
+    // Read only. Never call requestAuthorization or schedule a notification.
+    [UNUserNotificationCenter.currentNotificationCenter getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *settings) {
+      NSString *status;
+      switch (settings.authorizationStatus) {
+        case UNAuthorizationStatusNotDetermined: status = @"notDetermined"; break;
+        case UNAuthorizationStatusDenied: status = @"denied"; break;
+        case UNAuthorizationStatusAuthorized: status = @"authorized"; break;
+        case UNAuthorizationStatusProvisional: status = @"provisional"; break;
+        default: status = @"unknown"; break;
+      }
+      deliver(@{@"authorizationStatus": status, @"authorizationStatusRaw": @(settings.authorizationStatus),
+        @"alertSettingRaw": @(settings.alertSetting), @"soundSettingRaw": @(settings.soundSetting), @"notificationCenterSettingRaw": @(settings.notificationCenterSetting), @"lockScreenSettingRaw": @(settings.lockScreenSetting), @"alertStyleRaw": @(settings.alertStyle)});
+    }];
+  } @catch (NSException *exception) {
+    deliver(@{@"error": @{@"code": @"desktop.notification_status_failed", @"message": exception.reason ?: exception.description, @"nativeName": exception.name}});
+  }
+  return nullptr;
+}
 static napi_value Init(napi_env env, napi_value exports) {
-  napi_property_descriptor methods[] = {{"start", nullptr, Start, nullptr, nullptr, nullptr, napi_default, nullptr}, {"finish", nullptr, Finish, nullptr, nullptr, nullptr, napi_default, nullptr}, {"cancel", nullptr, Cancel, nullptr, nullptr, nullptr, napi_default, nullptr}};
-  napi_define_properties(env, exports, 3, methods); napi_add_env_cleanup_hook(env, Cleanup, nullptr); return exports;
+  napi_property_descriptor methods[] = {{"start", nullptr, Start, nullptr, nullptr, nullptr, napi_default, nullptr}, {"finish", nullptr, Finish, nullptr, nullptr, nullptr, napi_default, nullptr}, {"cancel", nullptr, Cancel, nullptr, nullptr, nullptr, napi_default, nullptr}, {"notificationSettings", nullptr, NotificationSettings, nullptr, nullptr, nullptr, napi_default, nullptr}};
+  napi_define_properties(env, exports, 4, methods); napi_add_env_cleanup_hook(env, Cleanup, nullptr); return exports;
 }
 NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)

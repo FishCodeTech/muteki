@@ -66,8 +66,6 @@
 .single-task-workers .wsettings-top-actions button { padding-inline: 16px; }
 .single-task-workers .wsettings-content { background: var(--bg); }
 .single-task-workers .wsettings-credentials { height: 100%; min-height: 0; overflow-y: auto; }
-.single-task-workers .wsettings-credentials .agent-registry { width: min(1180px, 100%); min-height: 0; }
-.single-task-workers .wsettings-credentials .agent-registry-overview { margin-top: 4px; }
 .single-task-workers .wsettings-orchestration {
   display: grid; height: 100%; min-height: 0;
   grid-template-columns: minmax(300px, 344px) minmax(0, 1fr);
@@ -216,8 +214,10 @@
   .single-task-workers .wsettings-nav-title { padding: 0; }
   .single-task-workers .wsettings-nav-title strong { white-space: nowrap; font-size: 13px; }
   .single-task-workers .single-task-workers-mark { display: none; }
-  .single-task-workers .wsettings-nav nav { flex-direction: row; flex: 1; overflow-x: auto; gap: 4px; }
-  .single-task-workers .wsettings-nav nav button { width: auto; min-width: max-content; min-height: 38px; padding-inline: 10px; gap: 7px; }
+  /* A fixed grid keeps all six sections visible; the scrolling strip clipped the last tabs with no affordance. */
+  .single-task-workers .wsettings-nav nav { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); flex: 1; min-width: 0; overflow: visible; gap: 4px; }
+  .single-task-workers .wsettings-nav nav button { width: auto; min-width: 0; min-height: 38px; padding-inline: 6px; gap: 7px; }
+  .single-task-workers .wsettings-nav nav button > span:not(.wsettings-nav-count) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .single-task-workers .wsettings-nav nav button:last-child { margin: 0; }
   .single-task-workers .wsettings-nav-count { display: none; }
   .single-task-workers .wsettings-nav-foot { margin: 0; padding: 0; border: 0; flex: none; }
@@ -226,9 +226,13 @@
   .single-task-workers .wsettings-main { min-height: 0; }
   .single-task-workers .wruntime-summary-list { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
+/* Section tabs drop icons where the grid columns are too narrow for icon + label. Icon sets an inline display. */
+@media (min-width: 721px) and (max-width: 960px), (max-width: 620px) {
+  .single-task-workers .wsettings-nav nav button svg { display: none !important; }
+}
 @media (max-width: 720px) {
   .single-task-workers .wsettings-nav { flex-wrap: wrap; gap: 8px; padding: 12px 14px 8px; }
-  .single-task-workers .wsettings-nav nav { flex-basis: 100%; order: 2; padding-bottom: 2px; }
+  .single-task-workers .wsettings-nav nav { flex-basis: 100%; order: 2; padding-bottom: 2px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .single-task-workers .wsettings-nav-foot { margin-left: auto; }
   .single-task-workers .wsettings-nav-foot a { min-height: 28px; }
   .single-task-workers .wsettings-nav nav button { min-height: 42px; }

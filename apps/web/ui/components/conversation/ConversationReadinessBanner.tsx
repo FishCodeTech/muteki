@@ -6,6 +6,7 @@ import { copyToClipboard } from "@/lib/clipboard";
 import type { ConversationReadiness, ReadinessBlocker } from "@/lib/conversationReadiness";
 import { Icon, type IconName } from "../Icon";
 import { Button, Spinner } from "@/components/chat/ui";
+import { ConversationRouteLink } from "./ConversationNavigation";
 
 export interface ConversationReadinessBannerProps {
   readiness: ConversationReadiness;
@@ -107,13 +108,13 @@ function BlockerActions({
         </Button>
       ) : null}
       {blocker.recovery === "open_agents" || blocker.kind === "not_installed" || blocker.kind === "not_logged_in" || blocker.kind === "model_unavailable" ? (
-        <a
-          className="cx-press inline-flex h-6 items-center gap-1 rounded-md px-2 text-[12px] font-medium text-cx-accent hover:bg-cx-accent-soft"
+        <ConversationRouteLink
+          className="cx-press inline-flex h-6 items-center gap-1 rounded-md px-2 text-[12px] font-medium text-cx-accent no-underline hover:bg-cx-accent-soft"
           href="/settings/agents"
         >
           前往 Agents
           <Icon name="arrowUpRight" size={12} />
-        </a>
+        </ConversationRouteLink>
       ) : null}
       {blocker.recovery === "pick_directory" && onPickDirectory ? (
         <Button size="xs" variant="secondary" icon="folderOpen" onClick={onPickDirectory}>选择目录</Button>
@@ -144,17 +145,17 @@ function GuideStep({
   children: React.ReactNode;
 }) {
   return (
-    <li data-done={done ? "true" : "false"} className="flex min-h-9 items-center gap-3">
+    <li data-done={done ? "true" : "false"} className="flex min-h-9 items-center gap-3 py-1">
       <span
         className={cn(
-          "grid size-5 shrink-0 place-items-center rounded-full text-[11px] font-semibold transition-colors",
+          "grid size-5 shrink-0 place-items-center rounded-full text-[12px] font-semibold transition-colors",
           done ? "bg-cx-success text-white" : "border border-cx-border-strong text-cx-fg-3",
         )}
       >
         {done ? <Icon name="check" size={11} /> : index}
       </span>
-      <span className={cn("flex-1 text-[13px]", done ? "text-cx-fg-3" : "font-medium text-cx-fg")}>{title}</span>
-      <span className="flex items-center gap-1.5 text-[12px] text-cx-fg-4">{children}</span>
+      <span className={cn("shrink-0 whitespace-nowrap text-[13px]", done ? "text-cx-fg-3" : "font-medium text-cx-fg")}>{title}</span>
+      <span className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-1.5 text-right text-[12px] text-cx-fg-4">{children}</span>
     </li>
   );
 }
@@ -170,10 +171,14 @@ export function ConversationReadinessBanner({
   directoryControlInComposer = false,
   className = "",
 }: ConversationReadinessBannerProps) {
+  const [dismissed, setDismissed] = useState<ReadonlySet<string>>(() => new Set());
   if (readiness.guide === "hidden" && !readiness.blockers.length) return null;
 
+  // A changed message is new information, so it reappears after dismissal.
+  const blockerKey = (row: ReadinessBlocker) => `${row.kind}:${row.source || ""}:${row.message}`;
   const sendBlockers = readiness.blockers.filter((row) => (
-    row.kind !== "connecting" || row.recovery === "probe" || row.message.includes("尚未验证")
+    (row.kind !== "connecting" || row.recovery === "probe" || row.message.includes("尚未验证"))
+    && !dismissed.has(blockerKey(row))
   ));
   const connecting = readiness.blockers.some((row) => row.kind === "connecting" && row.message === "正在连接…");
   const showChecklist = readiness.guide === "first_run";
@@ -187,7 +192,7 @@ export function ConversationReadinessBanner({
       data-can-send={readiness.canSend ? "true" : "false"}
     >
       {connecting ? (
-        <div className="is-connecting flex items-center gap-2 px-1 text-[12.5px] text-cx-fg-3" data-kind="connecting">
+        <div className="is-connecting flex items-center gap-2 px-1 text-[13px] text-cx-fg-3" data-kind="connecting">
           <Spinner size={12} />
           <span>正在连接 Agent…</span>
         </div>
@@ -199,11 +204,9 @@ export function ConversationReadinessBanner({
           <div
             key={`${blocker.kind}:${blocker.source || ""}:${index}`}
             className={cn(
-              "flex flex-col gap-2 rounded-xl border px-3 py-2.5 sm:flex-row sm:items-center",
+              "flex flex-col gap-2 rounded-xl border border-cx-border px-3 py-2.5 sm:flex-row sm:items-start",
               `is-${blocker.kind}`,
-              soft
-                ? "border-cx-border bg-cx-bg-subtle"
-                : "border-[color-mix(in_srgb,var(--amber)_32%,transparent)] bg-cx-warning-soft",
+              soft ? "bg-cx-bg-subtle" : "bg-cx-elevated shadow-cx-xs",
             )}
             data-kind={blocker.kind}
           >
@@ -215,21 +218,32 @@ export function ConversationReadinessBanner({
                   <span className="text-cx-fg-2">{blocker.message}</span>
                 </p>
                 {blocker.loginCommand ? (
-                  <code className="mt-1.5 block break-all rounded-lg bg-cx-code px-2 py-1 font-cx-mono text-[12px] text-cx-fg">
+                  <code className="mt-1.5 inline-block max-w-full break-all rounded-md bg-cx-code px-2 py-0.5 font-cx-mono text-[12px] text-cx-fg">
                     {blocker.loginCommand}
                   </code>
                 ) : null}
                 {blocker.loginNote ? <small className="mt-1 block text-[12px] text-cx-fg-3">{blocker.loginNote}</small> : null}
               </div>
             </div>
-            <BlockerActions
-              blocker={blocker}
-              probing={probing}
-              onRetry={onRetry}
-              onProbe={onProbe}
-              onPickDirectory={onPickDirectory}
-              onEnterPath={onEnterPath}
-            />
+            <div className="flex shrink-0 items-center gap-1 sm:pt-px">
+              <BlockerActions
+                blocker={blocker}
+                probing={probing}
+                onRetry={onRetry}
+                onProbe={onProbe}
+                onPickDirectory={onPickDirectory}
+                onEnterPath={onEnterPath}
+              />
+              <button
+                type="button"
+                aria-label="关闭提示"
+                title="关闭提示"
+                onClick={() => setDismissed((current) => new Set(current).add(blockerKey(blocker)))}
+                className="cx-press grid size-6 shrink-0 place-items-center rounded-md text-cx-fg-3 outline-none hover:bg-cx-hover hover:text-cx-fg focus-visible:outline-2 focus-visible:outline-[var(--cx-focus)]"
+              >
+                <Icon name="x" size={13} />
+              </button>
+            </div>
           </div>
         );
       })}
@@ -237,7 +251,6 @@ export function ConversationReadinessBanner({
       {showChecklist ? (
         <div className="rounded-2xl border border-cx-border bg-cx-elevated px-4 pb-2 pt-3 shadow-cx-xs" data-testid="conversation-readiness-guide">
           <div className="mb-1 flex items-center gap-2">
-            <Icon name="sparkles" size={14} className="text-cx-accent" />
             <strong className="text-[13px] font-semibold text-cx-fg">开始之前</strong>
             <span className="hidden flex-1 truncate text-[12px] text-cx-fg-4 sm:inline">选择执行环境并验证 Agent。开始后不能补选目录；文件/终端需新建已绑定目录的会话。</span>
             <Button size="xs" variant="ghost" className="ml-auto text-cx-fg-3" onClick={onDismissGuide} data-testid="conversation-readiness-skip">

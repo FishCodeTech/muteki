@@ -4,7 +4,6 @@
 """
 from muteki.solver.cli_engines.adapter import CliDriverAdapter, cli_adapter_for
 from muteki.solver.cli_engines.argv import (
-    _ENGINE_REASONING_EFFORTS,
     _claude_endpoint_model_env,
     _endpoint_api_model,
     _insert_before_prompt,
@@ -140,7 +139,6 @@ __all__ = [
     "_secure_help_preflight",
     "_insert_before_prompt",
     "_insert_model_arg",
-    "_ENGINE_REASONING_EFFORTS",
     "_claude_endpoint_model_env",
     "_endpoint_api_model",
     "_HEALTH_TTL",

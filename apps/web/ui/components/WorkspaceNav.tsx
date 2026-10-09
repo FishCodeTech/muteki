@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type CSSProperties, type Dispatch, type ReactNode, type SetStateAction } from "react";
 import { Button, Input, ListBox, ListBoxItem, Modal } from "@heroui/react";
 import { ConversationChromeContext, type ConversationChrome } from "@/components/conversationChrome";
 import { Icon, type IconName } from "@/components/Icon";
@@ -11,11 +11,11 @@ import { MutekiLogo } from "@/components/MutekiLogo";
 import { Tooltip } from "@/components/chat/ui/Tooltip";
 import { ChartNoAxesCombined, Home } from "lucide-react";
 import {
-  applySelection,
-  readSavedSelection,
   readSavedTheme,
   type ThemeMode,
 } from "@/lib/palette-engine";
+import { setThemePreference } from "@/lib/themePreference";
+import { isMacPlatform, matchesBinding, shortcutBinding } from "@/lib/shortcutBindings";
 import { useWorkspaceOverview, type WorkspaceOverview } from "@/lib/workspace-overview";
 import type { WorkspaceKindEntry } from "@/lib/workspace-kinds";
 import {
@@ -82,11 +82,10 @@ export function recentStateLabel(state: string, kindId?: string, running?: boole
   return labels[state] || state || "可恢复";
 }
 
-function GlobalWorkspacePalette({ overview }: { overview: WorkspaceOverview }) {
+function GlobalWorkspacePalette({ overview, open, setOpen }: { overview: WorkspaceOverview; open: boolean; setOpen: Dispatch<SetStateAction<boolean>> }) {
   const pathname = usePathname();
   const router = useRouter();
   const solveOnly = useSolveOnlyMode();
-  const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [bodyHits, setBodyHits] = useState<ConversationSearchHit[]>([]);
   const [bodyHitsLoading, setBodyHitsLoading] = useState(false);
@@ -94,7 +93,7 @@ function GlobalWorkspacePalette({ overview }: { overview: WorkspaceOverview }) {
   const localRunPalette = pathname.startsWith("/run/") || pathname === "/ctf" || pathname === "/pentest";
   const onChat = pathname.startsWith("/chat");
 
-  useEffect(() => setOpen(false), [pathname]);
+  useEffect(() => setOpen(false), [pathname, setOpen]);
 
   const commands = useMemo(() => {
     const base: Array<{ id: string; label: string; detail: string; href: string; icon: IconName }> = overview.kinds.filter((kind) => !solveOnly || kind.aggregateType === "run").map((kind) => ({
@@ -112,7 +111,7 @@ function GlobalWorkspacePalette({ overview }: { overview: WorkspaceOverview }) {
       );
     } else base.push(
       { id: "usage", label: "全局用量", detail: "对话、任务与比赛 Token 统计", href: "/usage", icon: "rows" },
-      { id: "settings-hub", label: "打开设置", detail: "设置中心：Agents、能力、运维与扩展", href: "/settings/agents", icon: "gear" },
+      { id: "settings-hub", label: "打开设置", detail: "设置中心：Agents、能力、运维与扩展", href: "/settings", icon: "gear" },
       { id: "settings-agents", label: "Agents", detail: "九类引擎的登录、模型和接入", href: "/settings/agents", icon: "plug" },
       { id: "settings-capabilities", label: "能力管理", detail: "Conversation Thread 授权与全局 MCP/Skills，不是 Fact 图白名单", href: "/settings/capabilities", icon: "network" },
       { id: "task-workers", label: "CTF Worker 配置", detail: "出战池、运行环境、调度预算与推理模型", href: "/ctf/workers", icon: "cpu" },
@@ -175,9 +174,8 @@ function GlobalWorkspacePalette({ overview }: { overview: WorkspaceOverview }) {
   }, [open, onChat, query]);
 
   useEffect(() => {
-    if (localRunPalette) return;
     const onKey = (event: KeyboardEvent) => {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+      if (!localRunPalette && matchesBinding(event, shortcutBinding("search"), isMacPlatform())) {
         event.preventDefault();
         setOpen((value) => !value);
         return;
@@ -201,7 +199,7 @@ function GlobalWorkspacePalette({ overview }: { overview: WorkspaceOverview }) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [bodyHits, bodyHitsReady, filtered, localRunPalette, open, router]);
+  }, [bodyHits, bodyHitsReady, filtered, localRunPalette, open, router, setOpen]);
 
   useEffect(() => {
     if (!open) return;
@@ -216,7 +214,7 @@ function GlobalWorkspacePalette({ overview }: { overview: WorkspaceOverview }) {
     };
   }, [open]);
 
-  if (localRunPalette) return null;
+  if (localRunPalette && !open) return null;
   const choose = (id: string) => {
     if (id.startsWith("conv-hit:")) {
       const hit = bodyHits.find((item) => `conv-hit:${item.thread_id}:${item.message_id}` === id);
@@ -232,8 +230,7 @@ function GlobalWorkspacePalette({ overview }: { overview: WorkspaceOverview }) {
   };
 
   return (
-    <Modal isOpen={open} onOpenChange={setOpen}>
-      <Modal.Backdrop className="global-search-backdrop">
+    <Modal.Backdrop isOpen={open} onOpenChange={setOpen} className="global-search-backdrop">
       <Modal.Container size="lg" placement="top">
       <Modal.Dialog
         className="global-search-dialog p-0"
@@ -301,14 +298,14 @@ function GlobalWorkspacePalette({ overview }: { overview: WorkspaceOverview }) {
         </div>
       </Modal.Dialog>
       </Modal.Container>
-      </Modal.Backdrop>
-    </Modal>
+    </Modal.Backdrop>
   );
 }
 
-function WorkspaceNav({ overview, sidebarToggle }: {
+function WorkspaceNav({ overview, sidebarToggle, onOpenSearch }: {
   overview: WorkspaceOverview;
   sidebarToggle: ReactNode;
+  onOpenSearch: () => void;
 }) {
   const pathname = usePathname();
   const solveOnly = useSolveOnlyMode();
@@ -345,12 +342,7 @@ function WorkspaceNav({ overview, sidebarToggle }: {
   const toggleTheme = () => {
     const next: ThemeMode = theme === "dark" ? "light" : "dark";
     setTheme(next);
-    try {
-      window.localStorage.setItem("muteki.theme", next);
-    } catch {
-      /* session-only theming */
-    }
-    applySelection(readSavedSelection(), next);
+    setThemePreference(next);
   };
   const themeLabel = theme === "dark" ? "切换到亮色模式" : "切换到暗色模式";
 
@@ -386,10 +378,8 @@ function WorkspaceNav({ overview, sidebarToggle }: {
           </Link>
         </Tooltip> : null}
         <div className="workspace-rail-divider" />
-        <Tooltip content="全局搜索" shortcut={["⌘", "K"]} placement="right">
-          <button type="button" className="workspace-rail-control" data-workspace-action="search" aria-label="打开全局搜索" onClick={() => {
-            window.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true }));
-          }}><Icon name="search" size={19} /></button>
+        <Tooltip content="全局搜索" placement="right">
+          <button type="button" className="workspace-rail-control" data-workspace-action="search" aria-label="打开全局搜索" onClick={onOpenSearch}><Icon name="search" size={19} /></button>
         </Tooltip>
         {sidebarToggle}
       </div>
@@ -400,7 +390,7 @@ function WorkspaceNav({ overview, sidebarToggle }: {
           </button>
         </Tooltip>
         <Tooltip content="设置" placement="right">
-          <Link href={solveOnly ? "/settings/appearance" : "/settings/agents"} className="workspace-rail-control" data-workspace-action="settings" aria-label="打开设置">
+          <Link href="/settings" className="workspace-rail-control" data-workspace-action="settings" aria-label="打开设置">
             <Icon name="gear" size={19} />
           </Link>
         </Tooltip>
@@ -411,9 +401,12 @@ function WorkspaceNav({ overview, sidebarToggle }: {
 
 export function WorkspaceFrame({ children }: { children: ReactNode }) {
   const pathname = usePathname();
+  const [searchOpen, setSearchOpen] = useState(false);
   const compactScreen = useMediaQuery("(max-width: 768px)");
   const solveOnly = useSolveOnlyMode();
-  const overview = useWorkspaceOverview(10000, solveOnly);
+  // /chat already receives thread changes over its inbox stream, so the
+  // cross-workspace overview only needs a slow refresh there.
+  const overview = useWorkspaceOverview(pathname.startsWith("/chat") ? 60000 : 10000, solveOnly);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [sidebarWidth, setSidebarWidthState] = useState(RAIL_WIDTH_DEFAULT);
   const [sidebarWidthReady, setSidebarWidthReady] = useState(false);
@@ -492,7 +485,7 @@ export function WorkspaceFrame({ children }: { children: ReactNode }) {
         style={{ "--conv-sidebar-width": `${sidebarWidth}px` } as CSSProperties}
       >
         <a className="skip-link" href={`#${skipTargetId}`}>跳到主要内容</a>
-        <WorkspaceNav overview={overview} sidebarToggle={pathname.startsWith("/chat") ? (
+        <WorkspaceNav overview={overview} onOpenSearch={() => setSearchOpen(true)} sidebarToggle={pathname.startsWith("/chat") ? (
           <Tooltip content={sidebarLabel} placement="right">
             <button type="button" className="workspace-rail-control workspace-rail-sidebar-toggle" data-workspace-action="sidebar"
               aria-label={sidebarLabel} aria-expanded={sidebarExpanded} aria-controls="conversation-sidebar" onClick={toggleConversationSidebar}>
@@ -510,7 +503,7 @@ export function WorkspaceFrame({ children }: { children: ReactNode }) {
           </div> : null}
           {children}
         </div>
-        <GlobalWorkspacePalette overview={overview} />
+        <GlobalWorkspacePalette overview={overview} open={searchOpen} setOpen={setSearchOpen} />
       </div>
       </ConversationChromeContext.Provider>
     </OverviewContext.Provider>

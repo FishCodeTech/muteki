@@ -484,18 +484,6 @@
   display: flex;
   flex-direction: column;
 }
-.settings-hub[data-page="agents"] .settings-hub-body.is-flush {
-  overflow-x: hidden;
-  overflow-y: auto;
-  overscroll-behavior-y: contain;
-  scrollbar-gutter: stable;
-}
-.settings-hub[data-page="agents"] .provider-manager.agent-registry {
-  width: 100%;
-  max-width: 100%;
-  min-width: 0;
-  padding: 18px 36px 56px;
-}
 .settings-hub-body.is-flush > * {
   flex: 1 1 auto;
   min-height: 0;
@@ -522,51 +510,6 @@
 .settings-hub .operations-settings { padding: 0 0 8px; }
 .settings-hub .operations-settings-toolbar { width: 100%; margin: 0 0 4px; }
 .settings-hub .wappearance-page { background: transparent; padding: 8px 0 36px; }
-
-.settings-data-page { width: min(100%, 940px); margin: 0 auto; padding-top: 10px; }
-.settings-data-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 22px; }
-.settings-data-search { flex: 1; min-width: 0; height: 40px; display: flex; align-items: center; gap: 9px;
-  padding: 0 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--muted); }
-.settings-data-search:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 13%, transparent); }
-.settings-data-search input { flex: 1; min-width: 0; height: 100%; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; font-size: 13px; }
-.settings-data-search input::placeholder { color: var(--dim); }
-.settings-data-primary, .settings-data-secondary { display: inline-flex; align-items: center; justify-content: center; gap: 7px;
-  min-height: 34px; padding: 0 12px; border-radius: 8px; font: inherit; font-size: 12px; font-weight: 600;
-  text-decoration: none; white-space: nowrap; cursor: pointer; }
-.settings-data-primary { border: 1px solid var(--accent); background: var(--accent); color: var(--on-accent, #fff); }
-.settings-data-primary:hover:not(:disabled) { filter: brightness(1.07); }
-.settings-data-secondary { border: 1px solid var(--line); background: var(--panel); color: var(--text); }
-.settings-data-secondary:hover:not(:disabled) { background: var(--panel2); }
-.settings-data-primary:disabled, .settings-data-secondary:disabled { opacity: .55; cursor: wait; }
-.settings-data-list-head { display: flex; align-items: center; gap: 8px; padding: 0 2px 12px;
-  color: var(--bright); font-size: 13px; font-weight: 650; }
-.settings-data-list-head span:last-child { display: inline-grid; min-width: 21px; min-height: 21px; place-items: center;
-  padding: 0 5px; border-radius: 7px; background: var(--panel2); color: var(--muted); font-size: 11px; }
-.settings-data-feedback:empty { display: none; }
-.settings-data-feedback p { margin: 0 0 12px; color: var(--green); font-size: 12px; }
-.settings-data-feedback .is-error { color: var(--red); }
-.settings-data-empty { padding: 34px 18px; border: 1px dashed var(--line); border-radius: 12px;
-  color: var(--muted); background: var(--panel); text-align: center; font-size: 13px; }
-.settings-archive-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
-.settings-archive-row { display: flex; align-items: center; justify-content: space-between; gap: 22px;
-  min-width: 0; padding: 14px 16px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel); }
-.settings-archive-info { min-width: 0; display: grid; gap: 5px; }
-.settings-archive-info strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--bright); font-size: 13px; }
-.settings-archive-info span { color: var(--dim); font-size: 11px; }
-.settings-archive-info p { overflow: hidden; margin: 1px 0 0; color: var(--muted); font-size: 12px;
-  text-overflow: ellipsis; white-space: nowrap; }
-.settings-archive-actions { flex: none; display: flex; gap: 8px; }
-.settings-import-card { display: flex; align-items: flex-start; gap: 16px; padding: 22px;
-  border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
-.settings-import-icon { flex: none; width: 40px; height: 40px; display: grid; place-items: center;
-  border-radius: 10px; background: color-mix(in srgb, var(--accent) 10%, var(--panel)); color: var(--accent); }
-.settings-import-card h2 { margin: 0 0 8px; color: var(--bright); font-size: 15px; }
-.settings-import-card p { max-width: 600px; margin: 0 0 18px; color: var(--muted); font-size: 13px; line-height: 1.6; }
-@media (max-width: 640px) {
-  .settings-data-toolbar, .settings-archive-row { align-items: stretch; flex-direction: column; }
-  .settings-archive-actions { flex-wrap: wrap; }
-  .settings-archive-actions > * { flex: 1; }
-}
 
 :is(.settings-hub, .single-task-workers-body) .wsettings-page,
 :is(.settings-hub, .single-task-workers-body) .wsettings-skeleton {
@@ -796,9 +739,6 @@
   .settings-hub-pagehead,
   .settings-hub-body { padding-inline: 16px; }
   .settings-hub-body.is-flush { padding: 0; }
-  .settings-hub[data-page="agents"] .provider-manager.agent-registry {
-    padding-inline: 16px;
-  }
   .settings-hub-pagehead { padding-top: 16px; }
   .settings-hub-pagehead h1 { font-size: 22px; }
 }

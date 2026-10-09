@@ -14,7 +14,18 @@ from typing import Any
 
 import yaml
 
-ENGINES = ("claude", "codex", "cursor", "pi", "omp", "kimi", "grok", "opencode")
+from muteki.external_agents.descriptors import engines_where, get_descriptor
+from muteki.solver.engine_registry import SUPPORTED_ENGINE_IDS
+from .chat_providers import PROVIDERS
+
+ENGINES = SUPPORTED_ENGINE_IDS
+# Native component ABIs declared by the provider descriptors.
+_NATIVE_SKILL_ENGINES = engines_where(lambda d: d.components.native_skill_semantics)
+_PLUGIN_AGENT_ENGINES = engines_where(lambda d: d.components.native_agents == "plugin_package")
+_NATIVE_AGENT_ENGINES = engines_where(lambda d: d.components.native_agents != "none")
+_HOOK_ENGINES = engines_where(lambda d: d.components.native_hooks == "all")
+_COMMAND_HOOK_ENGINES = engines_where(lambda d: d.components.native_hooks != "none")
+_EXTENSION_ENGINES = engines_where(lambda d: d.components.extension_abi)
 
 
 def resource(root: Path, relative: str) -> Path:
@@ -37,12 +48,18 @@ def frontmatter(path: Path) -> tuple[dict, str]:
 
 def inspect_components(root: Path, manifest: dict) -> dict[str, Any]:
     root = root.resolve()
-    meta = manifest.get("muteki") or {}
+    namespaces = manifest.get("extensions")
+    native_meta = namespaces.get("io.github.fishcodetech.muteki") if isinstance(namespaces, dict) else None
+    meta = native_meta if native_meta is not None else manifest.get("muteki") or {}
     if not isinstance(meta, dict):
         raise ValueError("muteki 插件元数据必须为对象")
     declared_engines = meta.get("engines", list(ENGINES))
     if not isinstance(declared_engines, list) or any(e not in ENGINES for e in declared_engines):
         raise ValueError("插件引擎声明无效")
+    allowed_modes = meta.get("modes", ["chat", "ctf", "pentest"])
+    if (not isinstance(allowed_modes, list) or not allowed_modes
+            or any(not isinstance(mode, str) or mode not in {"chat", "ctf", "pentest"} for mode in allowed_modes)):
+        raise ValueError("插件使用场景声明无效")
     components = []
     # Markdown commands are prompt templates, not arbitrary executable code.
     for kind in ("commands", "agents"):
@@ -77,10 +94,10 @@ def inspect_components(root: Path, manifest: dict) -> dict[str, Any]:
                     raise ValueError("插件组件名称无效")
                 components.append({"kind": kind, "name": name, "path": str(file.relative_to(root)),
                     "description": str(config.get("description") or name), "metadata": config,
-                    "engines": list(ENGINES) if kind == "commands" else ["claude"],
+                    "engines": list(ENGINES) if kind == "commands" else list(_PLUGIN_AGENT_ENGINES),
                     "delivery": "prompt_template" if kind == "commands" else "native_agent"})
     # Each native agent path belongs only to its explicitly declared engine.
-    for engine in ("claude", "omp", "opencode"):
+    for engine in _NATIVE_AGENT_ENGINES:
         spec = manifest.get(engine)
         if not isinstance(spec, dict) or "agents" not in spec:
             continue
@@ -114,12 +131,13 @@ def inspect_components(root: Path, manifest: dict) -> dict[str, Any]:
         hooks = {"hooks": merged}
         commands_only = all(h.get("type") == "command" for entries in merged.values() for row in entries for h in row.get("hooks", []))
         components.append({"kind": "hooks", "name": "hooks", "config": hooks,
-                           "engines": ["claude", "codex"] if commands_only else ["claude"], "delivery": "native_hooks"})
+                           "engines": list(_COMMAND_HOOK_ENGINES if commands_only else _HOOK_ENGINES),
+                           "delivery": "native_hooks"})
     extensions = meta.get("extensions") or {}
     if not isinstance(extensions, dict):
         raise ValueError("muteki.extensions 必须按引擎声明入口")
     extensions = dict(extensions)
-    for engine in ("pi", "omp", "opencode"):
+    for engine in _EXTENSION_ENGINES:
         package_spec = manifest.get(engine)
         if isinstance(package_spec, dict) and isinstance(package_spec.get("extensions"), list):
             dependencies = {**(manifest.get("dependencies") if isinstance(manifest.get("dependencies"), dict) else {}),
@@ -128,7 +146,7 @@ def inspect_components(root: Path, manifest: dict) -> dict[str, Any]:
             extensions.setdefault(native_engine, package_spec["extensions"])
     if not extensions and (root / "extensions").is_dir():
         # No inference between Pi, OMP and OpenCode executable plugin ABIs.
-        candidates = [e for e in declared_engines if e in {"pi", "omp", "opencode"}]
+        candidates = [e for e in declared_engines if e in _EXTENSION_ENGINES]
         if len(candidates) == 1:
             extensions = {candidates[0]: [str(p.relative_to(root)) for p in (root / "extensions").glob("*")
                                           if p.suffix in {".js", ".ts", ".mjs"}]}
@@ -138,7 +156,7 @@ def inspect_components(root: Path, manifest: dict) -> dict[str, Any]:
     if not isinstance(extensions, dict):
         raise ValueError("muteki.extensions 必须按引擎声明入口")
     for engine, paths in extensions.items():
-        if engine not in {"pi", "omp", "opencode"} or not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+        if engine not in _EXTENSION_ENGINES or not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
             raise ValueError("可执行扩展支持 Pi、OMP、OpenCode 的原生入口")
         for path in paths:
             file = resource(root, path)
@@ -159,7 +177,7 @@ def inspect_components(root: Path, manifest: dict) -> dict[str, Any]:
     if not isinstance(environment, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in environment.items()):
         raise ValueError("插件环境变量必须为字符串映射")
     return {"components": components, "requirements": requirements, "declared_engines": declared_engines,
-            "environment": environment}
+            "environment": environment, "allowed_modes": list(dict.fromkeys(allowed_modes))}
 
 
 def compatibility(record: dict, verified_tools: dict[str, set[str]] | None = None, *, check_tools: bool = True) -> dict[str, Any]:
@@ -183,14 +201,17 @@ def compatibility(record: dict, verified_tools: dict[str, set[str]] | None = Non
                 reasons.append("当前会话尚未确认所需工具：" + "、".join(absent))
         available = []
         unavailable = []
-        if any((not skill.get("requires_native") or engine == "claude") and
+        if any((not skill.get("requires_native") or engine in _NATIVE_SKILL_ENGINES) and
                (not skill.get("hooks") or record.get("hooks_approved_digest") == record.get("digest"))
                for skill in record.get("skills", [])):
             available.append("skills")
-        if engine != "claude" and any(skill.get("requires_native") for skill in record.get("skills", [])):
+        if engine not in _NATIVE_SKILL_ENGINES and any(skill.get("requires_native") for skill in record.get("skills", [])):
             unavailable.append("Claude 专属 Skill 语义")
         if record.get("mcp"):
-            available.append("mcp")
+            if engine in PROVIDERS and PROVIDERS[engine].gateway_tools:
+                available.append("mcp")
+            else:
+                unavailable.append("聊天 Gateway 工具尚未接入")
         for component in record.get("components", []):
             needs_approval = component["kind"] in {"hooks", "skill_hooks"} or component.get("metadata", {}).get("hooks")
             approved = not needs_approval or record.get("hooks_approved_digest") == record.get("digest")
@@ -210,19 +231,20 @@ def install_native_components(record: dict, engine: str, home: Path) -> None:
     """Materialize supported native components into the supplied staging home."""
     root = Path(record["root"])
     package = str(record["id"])
+    components = get_descriptor(engine).components
     for item in record.get("components", []):
         if engine not in item["engines"]:
             continue
-        if item["kind"] == "agents" and engine in {"omp", "opencode"}:
+        if item["kind"] == "agents" and components.native_agents == "home_agents_dir":
             target = home / "agents" / f"{package}-{item['name']}.md"
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(resource(root, item["path"]), target)
         elif item["kind"] == "extensions":
             # Preserve relative imports inside an immutable package directory.
-            directory = home / ("plugins" if engine == "opencode" else "extensions")
+            directory = home / components.extension_dir
             directory.mkdir(parents=True, exist_ok=True)
             entry = resource(root, item["path"])
             suffix = sha256(item["path"].encode()).hexdigest()[:8]
             target = directory / f"muteki-{package}-{item['name']}-{suffix}.js"
-            target.write_text(f"export {{default}} from {json.dumps(entry.as_uri())};\n" if engine != "opencode"
-                              else f"export * from {json.dumps(entry.as_uri())};\n")
+            target.write_text(f"export * from {json.dumps(entry.as_uri())};\n" if components.extension_export == "star"
+                              else f"export {{default}} from {json.dumps(entry.as_uri())};\n")

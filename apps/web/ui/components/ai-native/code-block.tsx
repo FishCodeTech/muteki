@@ -58,7 +58,7 @@ export function CodeBlock({
               {filename}
             </span>
           ) : (
-            <span className="font-mono text-[11px] uppercase tracking-wider text-ink-3">
+            <span className="font-mono text-[12px] uppercase tracking-wider text-ink-3">
               {language}
             </span>
           )}
@@ -68,7 +68,7 @@ export function CodeBlock({
           type="button"
           aria-label="复制代码"
           onClick={copy}
-          className={`flex h-6 items-center gap-1 rounded-chip px-2 text-[11px] font-medium transition-colors hover:bg-hover ${
+          className={`flex h-6 items-center gap-1 rounded-chip px-2 text-[12px] font-medium transition-colors hover:bg-hover ${
             copied ? "text-green" : "text-ink-3 hover:text-ink"
           }`}
         >
@@ -98,7 +98,7 @@ export function CodeBlock({
               data-preview-line={lineNo}
             >
               {showLineNumbers && (
-                <span className="w-8 shrink-0 select-none text-right font-mono text-[10.5px] text-ink-3/60 pr-3">
+                <span className="w-8 shrink-0 select-none text-right font-mono text-[12px] text-ink-3/60 pr-3">
                   {lineNo}
                 </span>
               )}

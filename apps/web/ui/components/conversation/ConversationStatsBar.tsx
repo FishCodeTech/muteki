@@ -90,7 +90,7 @@ function StatsChipList({
   className?: string;
 }) {
   return (
-    <div className={cn("cx-tabular flex items-center font-cx-mono text-[11px] text-cx-fg-4", className)}>
+    <div className={cn("cx-tabular flex items-center font-cx-mono text-[12px] text-cx-fg-4", className)}>
       {items.map((item, index) => (
         <React.Fragment key={`${index}-${item}`}>
           {index > 0 ? <span aria-hidden="true" className="mx-1.5 shrink-0 text-cx-border-strong">·</span> : null}
@@ -141,7 +141,7 @@ function InlineStats({ statistics, items }: { statistics: ConversationStatistics
         role="note"
         aria-label={`会话统计：${items.join("，")}`}
         data-testid="c39-stats-inline"
-        className="cx-tabular inline-flex h-7 shrink-0 cursor-default items-center gap-1.5 rounded-full px-2 font-cx-mono text-[11px] text-cx-fg-4 outline-none hover:bg-cx-hover hover:text-cx-fg-3 focus-visible:outline-2 focus-visible:outline-[var(--cx-focus)]"
+        className="cx-tabular inline-flex h-7 shrink-0 cursor-default items-center gap-1.5 rounded-full px-2 font-cx-mono text-[12px] text-cx-fg-4 outline-none hover:bg-cx-hover hover:text-cx-fg-3 focus-visible:outline-2 focus-visible:outline-[var(--cx-focus)]"
       >
         {parts.map((part, index) => (
           <React.Fragment key={part}>
@@ -218,7 +218,7 @@ export function ConversationStatsBar({
               data-testid="c39-stats-more"
             >
               统计
-              {ctxChip ? <span className="cx-tabular font-cx-mono text-[11px] text-cx-fg-4">{ctxChip.label}</span> : null}
+              {ctxChip ? <span className="cx-tabular font-cx-mono text-[12px] text-cx-fg-4">{ctxChip.label}</span> : null}
             </button>
           )}
         >

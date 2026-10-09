@@ -304,6 +304,7 @@ export interface CapabilityInvocation {
   invocation_id?: string;
   arguments?: Record<string, unknown>;
   correlation_id?: string | null;
+  image_input?: boolean | null;
 }
 
 /** 一次能力调用的统一结果。 */
@@ -314,6 +315,14 @@ export interface CapabilityResult {
   receipt?: CommandReceipt | null;
   result?: unknown;
   error?: ErrorEnvelope | null;
+  images?: CapabilityImage[];
+}
+
+/** 随工具结果交给模型的图片（base64）；其落盘路径与 SHA-256 在 result 中。 */
+export interface CapabilityImage {
+  schema_version?: number;
+  mime_type: string;
+  data: string;
 }
 
 /** Adapter probe 得到的 Runtime 能力（任务书 6.5 全量字段）。 */
@@ -321,6 +330,7 @@ export interface AgentCapabilities {
   schema_version?: number;
   streaming?: boolean;
   resume?: boolean;
+  resume_continues_turn?: boolean;
   steer?: boolean;
   interrupt?: boolean;
   approval?: boolean;
@@ -339,6 +349,8 @@ export interface AgentCapabilities {
   usage_events?: boolean;
   session_persistence?: boolean;
   plan?: boolean;
+  plan_mode?: boolean;
+  plan_mode_per_turn?: boolean;
   image_input?: boolean;
   supported_models?: string[];
   supported_efforts?: string[];
@@ -360,6 +372,42 @@ export interface ProbeRequest {
   options?: Record<string, unknown>;
 }
 
+/** Every launch option an adapter may read from SessionStart.options. */
+export interface SessionOptions {
+  schema_version?: number;
+  principal_id?: string | null;
+  thread_mode?: ThreadMode | null;
+  resource_scopes?: string[] | null;
+  audience?: string | null;
+  cwd?: string;
+  env?: Record<string, unknown>;
+  chat_tools?: ToolDescription[] | null;
+  chat_control_enabled?: boolean;
+  resume_prompt?: string;
+  plugins?: Record<string, unknown>[];
+  skills?: "all" | string[] | null;
+  hooks?: Record<string, unknown>;
+  allowed_tools?: string[];
+  max_turns?: number | null;
+  fork_session?: boolean;
+  chat_native_plugins?: Record<string, unknown>[];
+  chat_hook_approvals?: Record<string, unknown>;
+  fork_from?: string;
+  fork_last_turn_id?: string;
+  role?: string;
+  add_dirs?: string[];
+  ephemeral?: boolean;
+  session_dir?: string;
+  title?: string | null;
+  timeout_s?: number | null;
+  web_access?: boolean;
+  kb_access?: boolean;
+  prompt_via_stdin?: boolean;
+  solver_id?: string;
+  worker_mode?: string;
+  engine?: string;
+}
+
 /** 启动（或恢复）一个外部 Agent Session 的请求。 */
 export interface SessionStart {
   schema_version?: number;
@@ -371,10 +419,12 @@ export interface SessionStart {
   resume_handle?: string | null;
   model?: string | null;
   effort?: string | null;
+  service_tier?: string | null;
   access_mode?: string | null;
+  interaction_mode?: "default" | "plan";
   permission_mode?: string | null;
   sandbox_mode?: string | null;
-  options?: Record<string, unknown>;
+  options?: SessionOptions;
 }
 
 /** Adapter 返回的会话引用。 */
@@ -387,12 +437,86 @@ export interface AgentSessionRef {
   resume_handle?: string | null;
 }
 
-/** 发送给 Agent Session 的一次输入（消息、steer、approval 答复等）。 */
-export interface AgentInput {
+/** A resolved, authorized attachment ready for adapter delivery. */
+export interface AttachmentRef {
   schema_version?: number;
-  kind?: string;
+  sha256: string;
+  name?: string;
+  media_type?: string;
+  size?: number;
+  cas_path?: string;
+  path?: string;
+  workspace_path?: string;
+  delivery?: "native_image" | "workspace_file";
+  content_base64?: string;
+}
+
+/** Structured side data of an ordinary user message. */
+export interface MessagePayload {
+  schema_version?: number;
+  attachments?: AttachmentRef[];
+  capability_context?: string;
+  runtime_capability?: Record<string, unknown>;
+  runtime_command_arguments?: string;
+  client_user_message_id?: string;
+  interaction_mode?: "default" | "plan";
+}
+
+export interface SteerPayload {
+  schema_version?: number;
+  expected_turn_id?: string;
+  client_user_message_id?: string;
+  capability_revision?: number | null;
+  attachments?: AttachmentRef[];
+}
+
+export interface ApprovalResponsePayload {
+  schema_version?: number;
+  approval_id: string;
+  decision: "allow" | "deny";
+  scope?: "once" | "session";
+  note?: string;
+  option_id?: string;
+  updated_input?: Record<string, unknown> | null;
+}
+
+export interface UserInputResponsePayload {
+  schema_version?: number;
+  request_id: string;
+  decision?: "submit" | "decline" | "cancel";
+  answers?: Record<string, unknown>;
+}
+
+/** An ordinary user message that starts a new turn. */
+export interface MessageInput {
+  schema_version?: number;
+  kind?: "message";
   text?: string;
-  payload?: Record<string, unknown>;
+  payload?: MessagePayload;
+}
+
+/** Extra guidance appended to the running turn. */
+export interface SteerInput {
+  schema_version?: number;
+  kind?: "steer";
+  text?: string;
+  payload?: SteerPayload;
+}
+
+/** Operator verdict for a pending approval request. */
+export interface ApprovalResponseInput {
+  schema_version?: number;
+  kind?: "approval_response";
+  text?: string;
+  payload: ApprovalResponsePayload;
+}
+
+/** Operator answers for a pending user-input request. */
+export interface UserInputResponseInput {
+  schema_version?: number;
+  kind?: "user_input_response";
+  text?: string;
+  payload: UserInputResponsePayload;
 }
 
 /** 统一 AgentEvent（任务书 6.7）。 */

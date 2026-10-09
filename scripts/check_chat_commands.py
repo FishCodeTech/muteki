@@ -34,7 +34,9 @@ async def check():
     grok = GrokAcpAdapter()
     delivered = []
     handle = {"external_session_id": "parent", "available_commands": [], "capability_revision": 0,
-              "event_sink": None, "background_handler": delivered.extend, "replay_events": []}
+              "event_sink": None, "background_handler": delivered.extend, "replay_events": [],
+              "agent_nodes": {}, "subagent_sessions": {}, "delegation_calls": {},
+              "child_messages": {}, "subagent_tool_calls": {}}
     grok._acp["fixture"] = handle
     grok._dispatch_update("fixture", "parent", {"sessionUpdate": "available_commands_update", "availableCommands": [{"name": "workflow", "description": "test"}]}, False)
     grok._dispatch_update("fixture", "child", {"sessionUpdate": "available_commands_update", "availableCommands": []}, False)
@@ -84,15 +86,15 @@ async def check():
         return {"checked": True}
     session = AgentSessionRef(agent_session_id="test")
     for engine in ["pi", "omp"]:
-        adapter = SimpleNamespace(id=f"{engine}.rpc", _rpc={"test": {"peer": object()}}, _cmd=command)
-        for item in rpc_operation_items(adapter.id, engine):
+        operation = dict(adapter_id=f"{engine}.rpc", engine=engine)
+        for item in rpc_operation_items(operation["adapter_id"], engine):
             args = "on" if item.name == "autoretry" else ""
-            await rpc_operation(adapter, session, item.name, args)
-        await rpc_operation(adapter, session, "compact", "retain exact instructions")
+            await rpc_operation(command, object(), **operation, name=item.name, arguments=args)
+        await rpc_operation(command, object(), **operation, name="compact", arguments="retain exact instructions")
         assert calls[-1] == ("compact", {"customInstructions": "retain exact instructions"})
         before = len(calls)
         try:
-            await rpc_operation(adapter, session, "autoretry", "invalid")
+            await rpc_operation(command, object(), **operation, name="autoretry", arguments="invalid")
         except ValueError:
             pass
         else:
@@ -115,9 +117,16 @@ async def check():
     assert not any(event.event_type.value == "turn.failed" for event in events)
     # Pi acknowledges local extension handlers without an agent_end event.
     # Native get_state disambiguates local completion from a streaming prompt.
+    class LivePeer:
+        async def wait_exit(self):
+            await asyncio.Event().wait()
+
+        def stderr_text(self):
+            return ""
+
     for fails in [False, True]:
         pi = PiAdapter()
-        pi._rpc["test"] = {"peer": object(), "turns": 1}
+        pi._rpc["test"] = {"peer": LivePeer(), "turns": 1}
         async def pi_command(peer, method, params=None, **kwargs):
             if method == "prompt":
                 pi._dispatch_event("test", {"type": "extension_error", "error": "TEST_FAILURE"} if fails else {

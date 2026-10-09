@@ -64,6 +64,7 @@ from .http_jsonrpc import (
     METHOD_NOT_FOUND,
     PARSE_ERROR,
     BridgeResponse,
+    capability_image_blocks,
     capability_result_payload,
     category_to_jsonrpc_code,
     envelope_data,
@@ -422,10 +423,23 @@ class MutekiControlMcpServer:
         if not isinstance(arguments, dict):
             return BridgeResponse.json(200, jsonrpc_error(
                 request_id, INVALID_PARAMS, "params.arguments must be an object"))
+        meta = params.get("_meta") or {}
+        model = meta.get("muteki/modelCapabilities") if isinstance(meta, dict) else None
+        image_input = model.get("imageInput") if isinstance(model, dict) else None
+        if image_input is not None and not isinstance(image_input, bool):
+            return BridgeResponse.json(200, jsonrpc_error(
+                request_id, INVALID_PARAMS, "modelCapabilities.imageInput must be a boolean"))
         result = await self._gateway.invoke(
-            context, CapabilityInvocation(tool_name=name, arguments=arguments))
+            context, CapabilityInvocation(tool_name=name, arguments=arguments, image_input=image_input))
         payload = capability_result_payload(result)
+        if image_input is None and isinstance(result.result, dict):
+            image_input = result.result.get("model_image_input")
+        if image_input is False and result.images:
+            payload["image_delivery"] = {"supported": False, "image_count": len(result.images),
+                "message": "当前模型不支持图片输入。截图证据已保存；请依据辅助功能树操作，不能声称已目视核验。"}
         text = json.dumps(payload, ensure_ascii=False)
+        content = [{"type": "text", "text": text},
+                   *(capability_image_blocks(result) if image_input is not False else [])]
         # 业务失败（含 Grant 过期 / 权限拒绝 / 命令失败）统一走 isError 工具
         # 结果，structuredContent 内嵌与 Web / 其他入口相同的错误 envelope；
         # JSON-RPC error 只保留给协议层违规。两个时代同此约定。
@@ -434,13 +448,13 @@ class MutekiControlMcpServer:
             # 2025-06-18 起存在，更早的客户端会忽略未知字段，附带上可让
             # 2025-11-25 客户端直接取结构化 receipt。
             return BridgeResponse.json(200, jsonrpc_result(request_id, {
-                "content": [{"type": "text", "text": text}],
+                "content": content,
                 "structuredContent": payload,
                 "isError": not result.ok,
             }))
         return BridgeResponse.json(200, jsonrpc_result(request_id, {
             "resultType": "complete",
-            "content": [{"type": "text", "text": text}],
+            "content": content,
             "structuredContent": payload,
             "isError": not result.ok,
             "_meta": self._result_meta(),

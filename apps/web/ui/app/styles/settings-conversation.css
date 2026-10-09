@@ -21,8 +21,8 @@
   --dsw-alias-button-floating-hover: var(--panel3);
   --dsw-specific-sidebar-fill: var(--rail);
   --dsw-specific-input-major: var(--panel);
-  --dsh-chat-content-width: 748px;
-  --dsh-composer-card-max-width: 780px;
+  --dsh-chat-content-width: 768px;
+  --dsh-composer-card-max-width: 752px;
   --dsh-composer-side-clearance: 16px;
   width: 100%;
   height: 100%;
@@ -683,7 +683,8 @@ html, body {
 
 /* ── C39 conversation reading prefs ─────────────────────────────────────── */
 .ai-conv-shell {
-  --conv-fs-body: 13.5px;
+  --conv-fs-body: 15px;
+  --cx-msg-fs: var(--conv-fs-body);
 }
 .ai-conv-shell .ai-message-body,
 .ai-conv-shell .ai-stream-body,

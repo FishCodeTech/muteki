@@ -15,7 +15,7 @@
 proxychains4、tmux、SecLists 等 full 专用链接。
 
 提供 shell、Python 3、pwntools、curl、wget、git、jq、ripgrep、openssh-client，以及
-Claude Code、Codex、Cursor、Pi、OMP、Kimi Code、Grok Build、OpenCode 八个 Worker CLI。
+Claude Code、Codex、Cursor、Pi、OMP、Kimi Code、Grok Build、OpenCode、Droid 九个 Worker CLI。
 当前任务由其中一个 CLI 执行。
 
 需要某项能力时，先执行 `command -v <command>` 和 `<command> --help`；确认确实缺失后，

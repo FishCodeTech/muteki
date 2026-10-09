@@ -12,6 +12,7 @@ import {
   MenuLabel,
   MenuSeparator,
   Spinner,
+  toast,
 } from "@/components/chat/ui";
 import type { SurfaceProps } from "@/components/chat/panel/types";
 import { chatPanel, usePreviewRequest, type ChatSurface } from "@/lib/chatPanelStore";
@@ -29,7 +30,9 @@ import {
   shouldPollSpaLocation,
 } from "@/lib/previewNavOwnership";
 import { buildWorkspaceBrowserProxyPath, unwrapWorkspaceBrowserProxyHref } from "@/lib/workspaceBrowserProxy";
-import { desktopChatBridge, type DesktopPreviewEvent } from "@/lib/desktopChatBridge";
+import { desktopChatBridge, type DesktopPickedElement, type DesktopPreviewEvent } from "@/lib/desktopChatBridge";
+import { ElementPickingBar, ElementPickStrip, formatPickedElement, screenshotFile } from "@/components/chat/preview/ElementPickStrip";
+import { BrowserMenu, readBrowserPrefs, writeBrowserPrefs, type PreviewBrowserPrefs } from "@/components/chat/preview/BrowserMenu";
 import { NativePreview } from "@/components/chat/preview/NativePreview";
 import { useLang } from "@/lib/i18n";
 import { AddressBar } from "@/components/chat/preview/AddressBar";
@@ -167,7 +170,7 @@ function DeviceMenu({ settings, onChange }: { settings: DeviceSettings; onChange
   );
 }
 
-export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: SurfaceProps<PreviewSurfaceModel>) {
+export function PreviewSurface({ surface, threadId, active, onCiteToComposer, onAttachToComposer }: SurfaceProps<PreviewSurfaceModel>) {
   const nativePreview = Boolean(desktopChatBridge());
   const { lang } = useLang();
   const environmentHint = nativePreview
@@ -192,6 +195,13 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
   const [stage, setStage] = useState({ width: 0, height: 0 });
   const [envDismissed, setEnvDismissed] = useState(true);
   const [failedTarget, setFailedTarget] = useState<string | null>(null);
+  const [picking, setPicking] = useState(false);
+  const [picked, setPicked] = useState<DesktopPickedElement | null>(null);
+  const [browserPrefs, setBrowserPrefs] = useState<PreviewBrowserPrefs>(readBrowserPrefs);
+  const browserPrefsRef = useRef(browserPrefs);
+  browserPrefsRef.current = browserPrefs;
+  // What the current native view already has, so loads only re-send what differs.
+  const appliedPageRef = useRef<{ id: string; scheme: string }>({ id: "", scheme: "system" });
 
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const addressRef = useRef<HTMLInputElement | null>(null);
@@ -388,6 +398,21 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
     navigateRef.current(request.url);
   }, [request, surface.id, threadId]);
 
+  const applyPagePrefs = useCallback((force: boolean) => {
+    const bridge = desktopChatBridge();
+    const id = nativeIdRef.current;
+    if (!id || !bridge?.previewAction) return;
+    const prefs = browserPrefsRef.current;
+    if (appliedPageRef.current.id !== id) appliedPageRef.current = { id, scheme: "system" };
+    const fail = (error: unknown) => toast({ title: "浏览器设置未生效", description: error instanceof Error ? error.message : String(error), tone: "danger" });
+    // Chromium keeps zoom per host, so a cross-site navigation needs it again.
+    if (force || prefs.pageZoom !== 1) void bridge.previewAction({ id, action: "zoom", factor: prefs.pageZoom }).catch(fail);
+    if (force || appliedPageRef.current.scheme !== prefs.scheme) {
+      appliedPageRef.current.scheme = prefs.scheme;
+      void bridge.previewAction({ id, action: "color-scheme", scheme: prefs.scheme }).catch(fail);
+    }
+  }, []);
+
   /** Pull location/title from a readable frame. A null `kind` means an in-page navigation (pushes history). */
   const handleNativePreviewEvent = useCallback((event: DesktopPreviewEvent) => {
     if (event.threadId !== threadId) return;
@@ -403,6 +428,7 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
     const next = normalizePreviewUrl(event.url);
     if (!next) return;
     clearTimers(); setSlow(false); setNativeError(""); setLoadState("loaded"); setTrackable(true);
+    if (event.status === "loaded") applyPagePrefs(false);
     if (draftRef.current === urlRef.current) setDraft(next);
     const kind = navKindRef.current;
     navKindRef.current = null;
@@ -412,7 +438,7 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
     pendingTargetRef.current = null; failedTargetRef.current = null; navCommittedRef.current = true;
     setFailedTarget(null);
     chatPanel.updatePreview(threadId, surface.id, { url: next, title: event.title });
-  }, [beginLoad, clearTimers, surface.id, threadId]);
+  }, [applyPagePrefs, beginLoad, clearTimers, surface.id, threadId]);
 
   const syncFromFrame = useCallback((frame: HTMLIFrameElement, kind: NavKind | null) => {
     const loc = readIframeLocation(frame);
@@ -579,6 +605,74 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
     onCiteToComposer(actionCopy.citeLine(url, new Date().toLocaleString()));
   };
 
+  const cancelPick = useCallback(() => {
+    const bridge = desktopChatBridge();
+    if (nativeIdRef.current && bridge?.previewAction) {
+      void bridge.previewAction({ id: nativeIdRef.current, action: "pick-cancel" }).catch((error) => setNativeError(String(error)));
+    }
+    setPicking(false);
+  }, []);
+
+  const startPick = useCallback(async () => {
+    const bridge = desktopChatBridge();
+    if (!nativeIdRef.current || !bridge?.previewAction) return;
+    setPicked(null);
+    setPicking(true);
+    try {
+      const element = await bridge.previewAction({ id: nativeIdRef.current, action: "pick" });
+      if (element) setPicked(element);
+    } catch (error) {
+      toast({ title: "无法选取元素", description: error instanceof Error ? error.message : String(error), tone: "danger" });
+    } finally {
+      setPicking(false);
+    }
+  }, []);
+
+  // Navigating or hiding the panel ends a pick in progress.
+  useEffect(() => {
+    if (!active && picking) cancelPick();
+  }, [active, cancelPick, picking]);
+  useEffect(() => { setPicked(null); }, [url]);
+
+  const submitPick = (note: string, send: boolean) => {
+    if (!picked || !onAttachToComposer) return;
+    const file = screenshotFile(picked);
+    onAttachToComposer({ text: formatPickedElement(picked, note, file?.name ?? null), files: file ? [file] : [], send });
+    setPicked(null);
+  };
+
+  const browserAction = (action: "reload-hard" | "devtools" | "clear-data") => {
+    const bridge = desktopChatBridge();
+    if (!nativeIdRef.current || !bridge?.previewAction) return;
+    if (action === "clear-data" && !window.confirm("清除此服务所有预览的登录状态、Cookie 和缓存？")) return;
+    void bridge.previewAction({ id: nativeIdRef.current, action })
+      .then(() => { if (action === "clear-data") toast({ title: "已清除浏览数据", tone: "success" }); })
+      .catch((error) => toast({ title: "浏览器操作失败", description: error instanceof Error ? error.message : String(error), tone: "danger" }));
+  };
+
+  const changeBrowserPrefs = (next: PreviewBrowserPrefs) => {
+    const previous = browserPrefsRef.current;
+    setBrowserPrefs(next);
+    browserPrefsRef.current = next;
+    writeBrowserPrefs(next);
+    if (next.pageZoom !== previous.pageZoom || next.scheme !== previous.scheme) applyPagePrefs(true);
+  };
+
+  const screenshotToComposer = async () => {
+    const bridge = desktopChatBridge();
+    if (!nativeIdRef.current || !bridge?.previewAction || !onAttachToComposer) return;
+    try {
+      const shot = await bridge.previewAction({ id: nativeIdRef.current, action: "screenshot" });
+      const binary = atob(shot.data);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+      const file = new File([bytes], `page-${Date.now()}.png`, { type: "image/png" });
+      onAttachToComposer({ text: `页面截图：${shot.title ? `${shot.title} — ` : ""}${shot.url}（附件 ${file.name}，${shot.width}×${shot.height}）`, files: [file], send: false });
+    } catch (error) {
+      toast({ title: "截图失败", description: error instanceof Error ? error.message : String(error), tone: "danger" });
+    }
+  };
+
   if (!url) {
     return <PreviewStart threadId={threadId} active={active} inputRef={startInputRef} onNavigate={navigate} />;
   }
@@ -619,9 +713,30 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
             onSubmit={(value) => { if (value.trim()) navigate(value); else setDraft(url); }}
           />
         </div>
+        {nativePreview && onAttachToComposer ? (
+          <IconButton
+            icon="mousePointer"
+            label={picking ? "取消选取元素" : "选取页面元素"}
+            tooltip={picking ? "取消选取（Esc）" : "选取页面元素，连同截图加入输入框"}
+            disabled={!picking && loadState !== "loaded"}
+            aria-pressed={picking}
+            className={picking ? "text-cx-accent" : undefined}
+            onClick={() => (picking ? cancelPick() : void startPick())}
+          />
+        ) : null}
         {onCiteToComposer ? <IconButton icon="quote" label="引用到输入框" tooltip={actionCopy.citeAriaLabel} onClick={cite} /> : null}
         <IconButton icon="externalLink" label="在浏览器中打开" onClick={() => openExternal(errorRecoveryUrl)} />
         <DeviceMenu settings={device} onChange={updateDevice} />
+        {nativePreview ? (
+          <BrowserMenu
+            prefs={browserPrefs}
+            onChange={changeBrowserPrefs}
+            onHardReload={() => browserAction("reload-hard")}
+            onDevTools={() => browserAction("devtools")}
+            onClearData={() => browserAction("clear-data")}
+            onScreenshot={onAttachToComposer ? () => void screenshotToComposer() : undefined}
+          />
+        ) : null}
         {loading ? (
           <div className="pointer-events-none absolute inset-x-0 -bottom-px h-[2px] overflow-hidden" aria-hidden>
             <div className="cx-preview-progress h-full w-full bg-cx-accent" />
@@ -629,8 +744,18 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
         ) : null}
       </div>
 
+      {picking ? <ElementPickingBar onCancel={cancelPick} /> : null}
+      {picked ? (
+        <ElementPickStrip
+          element={picked}
+          onDiscard={() => setPicked(null)}
+          onRepick={() => void startPick()}
+          onSubmit={submitPick}
+        />
+      ) : null}
+
       {showEnvNotice ? (
-        <div role="note" className="flex shrink-0 items-start gap-2 border-b border-cx-border-subtle bg-cx-bg-subtle py-1.5 pl-3 pr-1.5 text-[11.5px] leading-[18px] text-cx-fg-3">
+        <div role="note" className="flex shrink-0 items-start gap-2 border-b border-cx-border-subtle bg-cx-bg-subtle py-1.5 pl-3 pr-1.5 text-[12px] leading-[18px] text-cx-fg-3">
           <Icon name="info" size={12} className="mt-[3px] shrink-0 text-cx-fg-4" />
           <span className="min-w-0 flex-1">{environmentHint}</span>
           <button
@@ -657,7 +782,7 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
             style={frameStyle}
           >
             <div style={canvasStyle}>
-              {nativePreview ? <NativePreview surfaceId={surface.id} threadId={threadId} url={url} active={active && loadState !== "timeout"} revision={frameKey} onEvent={handleNativePreviewEvent} /> : <iframe
+              {nativePreview ? <NativePreview surfaceId={surface.id} threadId={threadId} url={url} active={active && loadState !== "timeout"} revision={frameKey} persistent={browserPrefs.persistent} onEvent={handleNativePreviewEvent} /> : <iframe
                 ref={iframeRef}
                 key={frameKey}
                 data-nav-generation={navGenerationRef.current}
@@ -670,7 +795,7 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
             </div>
           </div>
           {size ? (
-            <p className="cx-tabular select-none text-[11.5px] text-cx-fg-4">
+            <p className="cx-tabular select-none text-[12px] text-cx-fg-4">
               {size.width} × {size.height} · {Math.round(scale * 100)}%
             </p>
           ) : null}
@@ -696,7 +821,7 @@ export function PreviewSurface({ surface, threadId, active, onCiteToComposer }: 
                 <Icon name="alert" size={20} />
               </span>
               <p className="text-[14px] font-medium text-cx-fg">加载超时或无法连接</p>
-              <p className="mt-1 text-[12.5px] leading-5 text-cx-fg-3">目标服务可能尚未启动、地址有误，或拒绝在面板中嵌入。</p>
+              <p className="mt-1 text-[13px] leading-5 text-cx-fg-3">目标服务可能尚未启动、地址有误，或拒绝在面板中嵌入。</p>
               {nativeError ? <pre className="mt-2 max-h-40 w-full overflow-auto whitespace-pre-wrap break-words text-left text-xs">{nativeError}</pre> : null}
               <div className="mt-4 flex items-center gap-2">
                 <Button size="sm" variant="secondary" icon="refresh" onClick={reload}>重试</Button>

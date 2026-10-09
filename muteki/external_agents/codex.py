@@ -21,11 +21,9 @@
   委派活动走 collabAgentToolCall / subAgentActivity。
 - token 用量走独立通知 ``thread/tokenUsage/updated``（``turn/completed``
   的 ``turn`` 里**没有** usage 字段，README 描述有误导，以源码为准）。
-- MCP 注入：``thread/start`` **不接受** ``mcpServers``；按核验结论在 spawn
-  时传 ``-c mcp_servers.<name>.url`` / ``-c mcp_servers.<name>.bearer_token_env_var``，
-  bearer token 只经子进程环境变量进入（不落 argv、不落盘），随后
-  ``config/mcpServer/reload`` 让配置确定性生效（新进程本就是新配置，
-  reload 是幂等保险）。可选 ``codex_home`` 实现 CODEX_HOME 隔离。
+- MCP 注入按 T3 nightly：``thread/start|resume|fork`` 的 ``config.mcp_servers``
+  携带每个目标线程的 URL 与内存 Authorization header；不在 app-server argv
+  或全局环境中投递会话 token。``mcpServerStatus/list`` 按 threadId 分页查询。
 - capability discovery：probe 用 ``generate-json-schema`` 导出当版
   schema，按 ClientRequest / ServerRequest / ServerNotification 的方法
   清单逐项判定能力，版本升级后方法面变化会如实反映；schema 导出失败时
@@ -42,8 +40,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import subprocess
+import tomllib
 
 from .probe_environment import subprocess_environment
 import tempfile
@@ -60,15 +60,21 @@ from muteki.platform.contracts.external_agents import (
     AgentEvent,
     AgentEventType,
     AgentInput,
+    ApprovalResponseInput,
+    MessageInput,
+    SteerInput,
+    UserInputResponseInput,
     AgentSessionRef,
     ProbeRequest,
     SessionStart,
 )
+from muteki.platform.contracts.protocols import NativeRewindAdapter, RuntimeOperationAdapter
 from muteki.platform.contracts.receipts import AggregateRef, CommandReceipt, ReceiptState
 
-from .base import BaseExternalAgentAdapter
-from .approvals import ApprovalDecision, ApprovalRequest
+from .base import BaseExternalAgentAdapter, TurnLimits, TurnRunner
+from .approvals import ApprovalDecision
 from .attachment_input import codex_turn_input
+from .command_providers import codex_review_target
 from .capabilities import (
     BOOL_CAPABILITY_FIELDS,
     CapabilityProbeReport,
@@ -78,6 +84,33 @@ from .capabilities import (
     conservative_capabilities,
 )
 from .events import build_event
+from muteki.platform.contracts.agent_events import (
+    AgentNodePayload,
+    AgentUpdatedPayload,
+    ApprovalRequestedPayload,
+    ApprovalResolvedPayload,
+    FailureCategory,
+    MessageCompletedPayload,
+    MessageDeltaPayload,
+    PlanPayload,
+    PlanTaskPayload,
+    RateLimitState,
+    ReasoningPayload,
+    RuntimeErrorPayload,
+    RuntimeExitedPayload,
+    RuntimeWarningPayload,
+    SessionPayload,
+    ToolPayload,
+    TurnCompletedPayload,
+    TurnFailedPayload,
+    TurnStartedPayload,
+    UsagePayload,
+    UserInputRequestedPayload,
+    UserInputResolvedPayload,
+    WorkspaceChangedPayload,
+    WorkspaceFileChange,
+    dump_payload,
+)
 from .rpc import PeerClosedError, StdioJsonlPeer
 from .runtime_capabilities import (
     RuntimeCapabilityItem,
@@ -88,7 +121,7 @@ from .sessions import EXIT_CLOSED, EXIT_FAILED, classify_exit
 from .user_input_schema import (
     answers_for_codex_tool,
     content_for_elicitation,
-    normalize_pending_user_input,
+    normalize_question,
     questions_from_codex_params,
 )
 
@@ -100,11 +133,14 @@ MCP_SERVER_NAME = acp_config.DEFAULT_SERVER_NAME
 #: 变量名进 ``-c mcp_servers.<name>.bearer_token_env_var``，token 本体不进 argv）。
 MCP_TOKEN_ENV = "MUTEKI_CAPABILITY_TOKEN"
 
+_LOG = logging.getLogger(__name__)
+
 #: probe / 注入用的稳定 wire 方法名（实测 0.147.0 schema 复核）。
 M_INITIALIZE = "initialize"
 M_INITIALIZED = "initialized"
 M_THREAD_START = "thread/start"
 M_THREAD_RESUME = "thread/resume"
+M_THREAD_UNSUBSCRIBE = "thread/unsubscribe"
 M_THREAD_FORK = "thread/fork"
 M_TURN_START = "turn/start"
 M_TURN_STEER = "turn/steer"
@@ -117,6 +153,30 @@ M_HOOKS_LIST = "hooks/list"
 M_PLUGIN_LIST = "plugin/list"
 M_APP_LIST = "app/list"
 M_MCP_ELICITATION = "mcpServer/elicitation/request"
+
+# Measured on codex-cli 0.160.1 with a temporary CODEX_HOME. The user's
+# ~/.codex was not read or written.
+# - `codex features list` reports collaboration_modes as removed/true.
+# - `codex app-server generate-json-schema` writes v2/TurnStartParams.json.
+#   Its properties omit collaborationMode; definitions still contain
+#   CollaborationMode (mode plan|default, settings.model required).
+# - stdio app-server: turn/start with collaborationMode and no experimentalApi
+#   returns JSON-RPC -32600. The same request after
+#   capabilities.experimentalApi is accepted and returns an inProgress turn.
+# - `codex --strict-config -c tools.update_plan.enabled=true app-server`
+#   accepts the key. `tools.definitely_not_real` is rejected as an unknown
+#   configuration field. Thread config in the schema is additionalProperties.
+_PLAN_MODE_DEGRADATION = (
+    "codex-cli 0.160.1（临时 CODEX_HOME，未改 ~/.codex）："
+    "features list 里 collaboration_modes 为 removed；"
+    "generate-json-schema 的 v2/TurnStartParams.properties 省略 collaborationMode，"
+    "definitions 仍有 CollaborationMode。"
+    "stdio 实测未声明 experimentalApi 时 turn/start.collaborationMode 返回 JSON-RPC -32600，"
+    "声明 experimentalApi 后请求被接受并得到 inProgress turn。"
+    "tools.update_plan.enabled 被 --strict-config 接受，"
+    "未知键 tools.definitely_not_real 被拒绝。"
+)
+_THREAD_UPDATE_PLAN_CONFIG = {"tools.update_plan.enabled": True}
 
 #: 审批类 server-request（响应 ``{"decision": ...}``）。
 APPROVAL_REQUEST_METHODS = {
@@ -236,6 +296,27 @@ def _compose_file_change_diff(files: list[Mapping[str, Any]]) -> str:
         else:
             chunks.append(diff)
     return "\n".join(chunks)
+
+
+def _mcp_result_text(result: Any) -> Any:
+    """MCP tool result → display text; image blocks become a size marker.
+
+    The model already received the image; tools that return one also return
+    its saved path and SHA-256 in the text block, so the event log keeps the
+    reference instead of a base64 copy.
+    """
+    if not isinstance(result, Mapping) or not isinstance(result.get("content"), list):
+        return result
+    parts: list[str] = []
+    for block in result["content"]:
+        if not isinstance(block, Mapping):
+            continue
+        if block.get("type") == "text":
+            parts.append(str(block.get("text") or ""))
+        elif block.get("type") == "image":
+            size = len(str(block.get("data") or "")) * 3 // 4
+            parts.append(f"[image {block.get('mimeType') or 'unknown'} ~{size} bytes]")
+    return "\n".join(parts)
 
 
 def _cache_file_change_item(ctx: dict[str, Any], item: Mapping[str, Any]) -> None:
@@ -363,6 +444,50 @@ def _access_config(access_mode: str) -> dict[str, Any]:
     }
 
 
+def _codex_rate_limit(params: dict[str, Any]) -> dict[str, Any]:
+    """Normalize ``account/rateLimits/updated`` (RateLimitSnapshot).
+
+    ``rateLimitReachedType`` or a window at 100% means the account is
+    limited; ``resets_at`` is the latest reset among the exhausted windows.
+    """
+    snapshot = params.get("rateLimits") if isinstance(
+        params.get("rateLimits"), dict) else {}
+    windows = [w for w in (snapshot.get("primary"), snapshot.get("secondary"))
+               if isinstance(w, dict)]
+    exhausted = [w for w in windows if int(w.get("usedPercent") or 0) >= 100]
+    reached = snapshot.get("rateLimitReachedType")
+    limited = bool(reached) or bool(exhausted)
+    resets = [int(w["resetsAt"]) for w in (exhausted or windows)
+              if isinstance(w.get("resetsAt"), (int, float))]
+    peak = max((int(w.get("usedPercent") or 0) for w in windows), default=0)
+    return {
+        "limited": limited,
+        "warning": not limited and peak >= 90,
+        "resets_at": max(resets) if limited and resets else None,
+        "kind": reached or snapshot.get("limitName") or None,
+        "utilization": peak / 100 if windows else None,
+    }
+
+
+_FILE_CHANGE_KINDS = {
+    "add": "add", "added": "add", "create": "add", "created": "add",
+    "modify": "modify", "modified": "modify", "update": "modify",
+    "updated": "modify", "edit": "modify",
+    "delete": "delete", "deleted": "delete", "remove": "delete",
+    "rename": "rename", "renamed": "rename", "move": "rename",
+}
+
+
+def _codex_approval_outcome(decision: str) -> str:
+    """Codex native decision verbs → contract outcome literals."""
+    return {
+        "accept": "allow", "acceptForSession": "allow", "approve": "allow",
+        "allow": "allow",
+        "decline": "deny", "deny": "deny", "reject": "deny",
+        "cancel": "cancelled", "cancelled": "cancelled",
+    }.get(str(decision or ""), "deny")
+
+
 def _codex_plan_payload(params: dict[str, Any], *, patch: bool) -> dict[str, Any]:
     """Normalize Codex turn/plan/updated and item/plan/delta into PLAN_UPDATED."""
     plan = params.get("plan")
@@ -404,18 +529,36 @@ def _codex_plan_payload(params: dict[str, Any], *, patch: bool) -> dict[str, Any
         if isinstance(row, dict)
     ):
         phase = "executing"
-    payload: dict[str, Any] = {
-        "tasks": tasks,
-        "phase": phase,
-        "patch": patch,
-        "source": "adapter",
-    }
-    if title:
-        payload["title"] = title
-    turn_id = str(params.get("turnId") or params.get("turn_id") or "")
-    if turn_id:
-        payload["turn_id"] = turn_id
-    return payload
+    def _task(row: Any, index: int) -> Optional[PlanTaskPayload]:
+        if not isinstance(row, dict):
+            if str(row or "").strip():
+                return PlanTaskPayload(
+                    task_id=f"task-{index}", title=str(row).strip())
+            return None
+        title = str(
+            row.get("step") or row.get("title") or row.get("content")
+            or row.get("name") or "").strip()
+        if not title:
+            return None
+        status = {
+            "inprogress": "in_progress", "in_progress": "in_progress",
+            "running": "in_progress", "active": "in_progress",
+            "completed": "completed", "complete": "completed",
+            "done": "completed", "cancelled": "cancelled",
+            "canceled": "cancelled", "blocked": "blocked",
+        }.get(str(row.get("status") or "").strip().lower(), "pending")
+        return PlanTaskPayload(
+            task_id=str(row.get("id") or row.get("task_id") or f"task-{index}"),
+            title=title, status=status)
+
+    return dump_payload(PlanPayload(
+        tasks=[task for index, row in enumerate(tasks)
+               if (task := _task(row, index)) is not None],
+        title=title or None,
+        phase=phase,
+        patch=patch,
+        native=params,
+    ))
 
 
 #: capability discovery 需要的 schema 文件 → 方法清单键。
@@ -434,6 +577,20 @@ class JsonRpcError(RuntimeError):
         self.code = code
         self.message = message
         self.data = data
+
+
+class CodexPeerClosedError(JsonRpcError):
+    """app-server 进程在请求未完成时退出；``reason``/``exit_code`` 来自 ``PeerClosedError``。"""
+
+    def __init__(self, message: str, *, reason: str,
+                 exit_code: Optional[int]) -> None:
+        super().__init__(-32099, message)
+        self.reason = reason
+        self.exit_code = exit_code
+
+
+class _PlanModeUnavailable(Exception):
+    """Plan turn blocked before ``turn/start`` (no collaborationMode sent)."""
 
 
 class ModelCatalogProtocolError(ValueError):
@@ -484,11 +641,30 @@ async def read_model_catalog(conn: Any) -> dict[str, Any]:
             default_effort = raw.get("defaultReasoningEffort", "")
             if not isinstance(default_effort, str):
                 raise ModelCatalogProtocolError(f"model/list default reasoning is invalid for {model}", pages)
+            raw_tiers = raw.get("serviceTiers") or []
+            if not isinstance(raw_tiers, list):
+                raise ModelCatalogProtocolError(f"model/list service tiers are invalid for {model}", pages)
+            service_tiers: list[dict[str, str]] = []
+            for tier in raw_tiers:
+                tier_id = tier.get("id") if isinstance(tier, dict) else None
+                if not isinstance(tier_id, str) or not tier_id.strip():
+                    raise ModelCatalogProtocolError(f"model/list service tier is invalid for {model}", pages)
+                if any(row["id"] == tier_id.strip() for row in service_tiers):
+                    continue
+                service_tiers.append({
+                    "id": tier_id.strip(),
+                    "name": str(tier.get("name") or tier_id).strip(),
+                    "description": str(tier.get("description") or "").strip(),
+                })
+            default_tier = raw.get("defaultServiceTier")
             models[model] = {"id": model, "label": label or model, "reasoning": {
                 "supported": bool(efforts), "levels": efforts,
                 "default": default_effort if default_effort in efforts else "",
                 "kind": "effort", "source": "codex.model/list",
-            }}
+            }, "service_tiers": service_tiers,
+                "default_service_tier": (
+                    default_tier if isinstance(default_tier, str)
+                    and any(row["id"] == default_tier for row in service_tiers) else "")}
             if raw.get("isDefault") is True:
                 default_model = model
         next_cursor = result.get("nextCursor")
@@ -510,14 +686,100 @@ class CodexPeer:
     - ``request`` 把 error 响应转为 ``JsonRpcError``；
     - 入站非响应消息按是否带 ``id`` 分为服务器 request / 通知，统一进
       ``incoming`` 队列；reader EOF（进程退出）时放入 ``("eof", None)``；
-    - stderr 后台排空（app-server 日志走 stderr，pipe 不消费会撑满阻塞）。
+    - stderr 由 ``StdioJsonlPeer`` 唯一的 reader 排空（app-server 日志走
+      stderr，pipe 不消费会撑满阻塞）；退出详情读取其保留的尾部。
     """
 
     def __init__(self, peer: StdioJsonlPeer) -> None:
         self._peer = peer
+        self._eof_watch: Optional[asyncio.Future] = None
         self.incoming: "asyncio.Queue[tuple[str, Any]]" = asyncio.Queue()
-        self._stderr_task: Optional[asyncio.Task] = None
-        self._stderr_tail = bytearray()
+        self._thread_queues: dict[str, asyncio.Queue[tuple[str, Any]]] = {}
+        self._thread_parents: dict[str, str] = {}
+        self._claimed_threads: set[str] = set()
+        self._released_threads: set[str] = set()
+        self._closed = False
+        self.launch_signature: Any = None
+
+    def queue_for(self, thread_id: str) -> asyncio.Queue[tuple[str, Any]]:
+        self._claimed_threads.add(thread_id)
+        self._released_threads.discard(thread_id)
+        return self._queue_for(thread_id)
+
+    def _queue_for(self, thread_id: str) -> asyncio.Queue[tuple[str, Any]]:
+        if thread_id not in self._thread_queues:
+            queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+            self._thread_queues[thread_id] = queue
+            if self._closed:
+                queue.put_nowait(("eof", None))
+        return self._thread_queues[thread_id]
+
+    def _thread_owner(self, thread_id: str) -> Optional[str]:
+        # A resumed/forked Muteki root owns its own stream. Native subagents
+        # belong to their nearest loaded ancestor, as in T3's Codex adapter.
+        seen: set[str] = set()
+        while thread_id not in self._claimed_threads:
+            if thread_id in seen or thread_id in self._released_threads:
+                return None
+            seen.add(thread_id)
+            parent = self._thread_parents.get(thread_id)
+            if not parent:
+                return thread_id
+            thread_id = parent
+        return thread_id
+
+    def release_thread(self, thread_id: str) -> None:
+        owned = [key for key in self._thread_queues
+                 if self._thread_owner(key) == thread_id]
+        self._claimed_threads.discard(thread_id)
+        self._released_threads.add(thread_id)
+        for key in owned:
+            self._thread_queues.pop(key, None)
+
+    def bind_subagent(self, thread_id: str, parent: str) -> None:
+        if not thread_id or not parent or thread_id == parent:
+            return
+        self._thread_parents[thread_id] = parent
+        owner = self._thread_owner(thread_id)
+        if owner and owner != thread_id:
+            pending = self._thread_queues.pop(thread_id, None)
+            if pending is not None:
+                target = self._queue_for(owner)
+                while not pending.empty():
+                    target.put_nowait(pending.get_nowait())
+
+    async def _dispatch(self, kind: str, msg: dict[str, Any]) -> None:
+        params = msg.get("params") or {}
+        thread = params.get("thread") or {}
+        thread_id = str(params.get("threadId") or thread.get("id") or "")
+        parent = str(thread.get("parentThreadId") or "")
+        if msg.get("method") == "thread/started" and thread_id and parent:
+            # The native 0.160.1 schema reserves parentThreadId for subagents;
+            # thread/fork instead reports forkedFromId.
+            self.bind_subagent(thread_id, parent)
+        if thread_id:
+            owner = self._thread_owner(thread_id)
+            if owner is None:
+                if kind == "request":
+                    await self._peer.respond(msg["id"], error={"code": -32602,
+                        "message": "codex.request_owner_closed: thread has been released"})
+                return
+            await self._queue_for(owner).put((kind, msg))
+            return
+        if kind == "request" and len(self._claimed_threads) > 1:
+            await self._peer.respond(msg["id"], error={"code": -32602, "message": "codex.request_thread_missing: interactive request has no threadId"})
+            return
+        if self._thread_queues:
+            for queue in self._thread_queues.values():
+                await queue.put((kind, msg))
+        else:
+            await self.incoming.put((kind, msg))
+
+    def _end_queues(self) -> None:
+        self._closed = True
+        self.incoming.put_nowait(("eof", None))
+        for queue in self._thread_queues.values():
+            queue.put_nowait(("eof", None))
 
     @classmethod
     async def spawn(
@@ -532,38 +794,23 @@ class CodexPeer:
         async def on_message(msg: dict[str, Any]) -> None:
             conn = holder["self"]
             kind = "request" if "id" in msg else "notification"
-            await conn.incoming.put((kind, msg))
+            await conn._dispatch(kind, msg)
 
         peer = StdioJsonlPeer(
             argv, env=env, cwd=cwd, label="codex-app-server",
-            on_message=on_message)
+            on_message=on_message, stderr_tail_bytes=16384)
         conn = cls(peer)
         holder["self"] = conn
         await peer.start()
-        # EOF 通知：reader task 结束（含进程退出）时唤醒 turn 消费循环。
-        if peer._reader_task is not None:
-            peer._reader_task.add_done_callback(
-                lambda _task: conn.incoming.put_nowait(("eof", None)))
-        conn._stderr_task = asyncio.ensure_future(conn._drain_stderr())
+        # EOF 通知：stdout 关闭（含进程退出）时唤醒 turn 消费循环。
+        eof_watch = asyncio.ensure_future(peer.wait_closed())
+        eof_watch.add_done_callback(lambda _task: conn._end_queues())
+        conn._eof_watch = eof_watch
         return conn
 
-    async def _drain_stderr(self) -> None:
-        proc = self._peer._proc
-        if proc is None or proc.stderr is None:
-            return
-        try:
-            while chunk := await proc.stderr.read(65536):
-                self._stderr_tail.extend(chunk)
-                if len(self._stderr_tail) > 16384:
-                    del self._stderr_tail[:-16384]
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            pass
-
     def _exit_detail(self) -> str:
-        proc = self._peer._proc
-        returncode = proc.returncode if proc is not None else None
-        stderr = bytes(self._stderr_tail).decode(
-            "utf-8", errors="replace").strip()
+        returncode = self._peer.diagnostics()["returncode"]
+        stderr = self._peer.stderr_text()
         details = [f"returncode={returncode}"]
         if stderr:
             details.append(f"stderr={stderr}")
@@ -576,8 +823,9 @@ class CodexPeer:
         try:
             response = await self._peer.request(method, params, timeout=timeout)
         except PeerClosedError as exc:
-            raise JsonRpcError(
-                -32099, f"{exc}; {self._exit_detail()}") from exc
+            raise CodexPeerClosedError(
+                f"{exc}; {self._exit_detail()}", reason=exc.reason,
+                exit_code=exc.exit_code) from exc
         if "error" in response:
             err = response.get("error") or {}
             raise JsonRpcError(
@@ -597,9 +845,15 @@ class CodexPeer:
         return self._peer.running
 
     async def close(self) -> int:
-        if self._stderr_task is not None:
-            self._stderr_task.cancel()
         return await self._peer.close()
+
+    def stderr_text(self) -> str:
+        """Complete app-server stderr for ``TurnRunner(diagnostics=...)``."""
+        return self._peer.stderr_text()
+
+    async def wait_exit(self) -> Optional[int]:
+        """Process exit code for ``TurnRunner(exit_watch=...)``."""
+        return await self._peer.wait_exit()
 
 
 # ---------------------------------------------------------------------------
@@ -662,7 +916,27 @@ def export_protocol_methods(
         }
     except (OSError, ValueError, TypeError):
         methods["item_types"] = set()
+    # turn/start 参数字段也是能力面。0.160.1 把该文件放在 v2/ 下，且
+    # properties 省略 collaborationMode（见 ``_PLAN_MODE_DEGRADATION``）。
+    turn_doc = _turn_start_schema(out_dir)
+    methods["turn_params"] = set((turn_doc.get("properties") or {}).keys())
+    methods["schema_definitions"] = set((turn_doc.get("definitions") or {}).keys())
     return methods if any(methods.values()) else {}
+
+
+def _turn_start_schema(out_dir: Path) -> dict[str, Any]:
+    """Load TurnStartParams from the root or the v2 schema directory."""
+    for relative in ("TurnStartParams.json", "v2/TurnStartParams.json"):
+        path = out_dir / relative
+        if not path.is_file():
+            continue
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(doc, dict):
+            return doc
+    return {}
 
 
 def _probe_version(binary: str, *, timeout: float = 15.0) -> str:
@@ -674,7 +948,7 @@ def _probe_version(binary: str, *, timeout: float = 15.0) -> str:
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return ""
     lines = (result.stdout or result.stderr or "").strip().splitlines()
-    return lines[0].strip()[:120] if result.returncode == 0 and lines else ""
+    return lines[0].strip() if result.returncode == 0 and lines else ""
 
 
 # ---------------------------------------------------------------------------
@@ -682,7 +956,7 @@ def _probe_version(binary: str, *, timeout: float = 15.0) -> str:
 # ---------------------------------------------------------------------------
 
 
-class CodexAppServerAdapter(BaseExternalAgentAdapter):
+class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationAdapter):
     """Codex app-server（stdio JSON-RPC）的结构化 ExternalAgentAdapter。
 
     构造参数（除基类外）：
@@ -698,10 +972,12 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
     - ``schema_probe``：probe 时是否导出 JSON schema 做能力发现。
     """
 
+    context_compaction_events = True
+
     def __init__(
         self,
         *,
-        binary: str = DEFAULT_CODEX_BIN,
+        binary: Optional[str] = None,
         instance_id: str = "default",
         store: Any = None,
         binding_service: Any = None,
@@ -727,7 +1003,9 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             gateway_endpoint=gateway_endpoint,
             descriptor_provider=descriptor_provider,
         )
-        self._binary = binary
+        from muteki.solver.cli_engines.bins import resolve_engine_bin
+
+        self._binary = binary or resolve_engine_bin("codex")
         self._codex_home = codex_home
         self._default_cwd = default_cwd
         self._default_env = dict(default_env or {})
@@ -743,6 +1021,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         self._runs: dict[str, dict[str, Any]] = {}
         self._client_request_methods: set[str] = set()
         self._capability_revisions: dict[str, int] = {}
+        self._fork_connections: dict[str, CodexPeer] = {}
 
     async def _ensure_protocol_methods(self) -> None:
         if self._client_request_methods or not self._schema_probe:
@@ -842,6 +1121,31 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         # turn/start UserInput includes text | image | localImage (app-server).
         caps.image_input = mark(
             "image_input", M_TURN_START in client_req, schema_ok)
+        # The /compact runtime operation calls thread/compact/start.
+        caps.compaction = mark(
+            "compaction", "thread/compact/start" in client_req, schema_ok)
+        # Plan mode follows the 0.160.1 runtime gate, not the omitted schema
+        # property. See ``_PLAN_MODE_DEGRADATION``. CollaborationMode in the
+        # schema definitions is the installed binary's signal that the field
+        # still exists; experimentalApi is what the server actually checks.
+        collab_in_schema = "collaborationMode" in methods.get("turn_params", set())
+        collab_known = collab_in_schema or (
+            "CollaborationMode" in methods.get("schema_definitions", set()))
+        caps.plan_mode = mark(
+            "plan_mode", collab_known and self._experimental_api, schema_ok)
+        if collab_known and not self._experimental_api:
+            field_sources["plan_mode"] = SOURCE_REPORTED
+            degradations.append(
+                _PLAN_MODE_DEGRADATION
+                + " 当前实例未开 experimentalApi，plan_mode 置 False。")
+        elif caps.plan_mode and not collab_in_schema:
+            degradations.append(
+                _PLAN_MODE_DEGRADATION
+                + " schema 未列出字段，按 experimentalApi 实测启用 plan_mode。")
+        elif schema_ok and not collab_known:
+            degradations.append(
+                "generate-json-schema 未提供 collaborationMode 或 CollaborationMode，"
+                "plan_mode 保持 False，不把规划模式当作可用。")
 
         if schema_ok and not self._experimental_api and caps.user_input:
             # requestUserInput 属 experimental 面：未开 experimentalApi 时
@@ -857,8 +1161,9 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         try:
             spawn_env = self._spawn_env({})
             conn = await self._spawn_initialized_peer(
-                argv=[self._binary, "app-server", "--listen", "stdio://",
-                      *self._provider_spawn_args(spawn_env)],
+                argv=self._with_launch_args([
+                    self._binary, "app-server", "--listen", "stdio://",
+                    *self._provider_spawn_args(spawn_env)]),
                 env=spawn_env, cwd=None,
                 init_params={"clientInfo": {
                     "name": "muteki-probe", "title": "Muteki Probe",
@@ -951,33 +1256,38 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         )
         return codex_provider_spawn_args(env)
 
-    def _mcp_spawn_args(
-        self, plan: Optional[CapabilityInjectionPlan]
-    ) -> list[str]:
-        """按注入计划生成 spawn 级 MCP 覆盖参数。
+    def _mcp_thread_config(
+        self, plan: Optional[CapabilityInjectionPlan],
+        bearer_token: Optional[str],
+    ) -> dict[str, Any]:
+        """Materialize target-thread MCP overrides, as T3's thread runtime params.
 
-        核验结论（§CODEX-2 / §T3）：``thread/start`` 不接受 mcpServers；
-        走 spawn 时 ``-c mcp_servers.<name>.url/bearer_token_env_var`` +
-        子进程环境变量携带 token 本体。
+        Credentials belong to the target thread's grant, not to the shared
+        app-server environment. Never mutate the persisted injection plan.
         """
         if plan is None or plan.injection_kind is not InjectionKind.MCP:
-            return []
+            return {}
         endpoint = plan.gateway_endpoint
         if not endpoint:
-            return []
-        return [
-            "-c", f'mcp_servers.{MCP_SERVER_NAME}.url="{endpoint}"',
-            "-c", f'mcp_servers.{MCP_SERVER_NAME}.bearer_token_env_var="{MCP_TOKEN_ENV}"',
-        ]
+            return {}
+        if not bearer_token:
+            error = ValueError("Codex thread MCP configuration requires its capability grant")
+            error.code = "codex.mcp.token_missing"
+            raise error
+        return {MCP_SERVER_NAME: {
+            "url": endpoint,
+            "http_headers": {"Authorization": f"Bearer {bearer_token}"},
+        }}
 
     @staticmethod
     def _retryable_initialize_error(exc: BaseException) -> bool:
-        """Codex 本地状态库初始化竞争只影响本次子进程启动。"""
-        detail = str(exc).casefold()
-        return (
-            "failed to initialize sqlite state runtime" in detail
-            or "failed to initialize state runtime" in detail
-        )
+        """握手完成前子进程自行退出（本地状态库初始化竞争的表现）。
+
+        只按类型化的退出原因判定，不匹配 stderr 文本；重试有界，
+        耗尽后原始错误（含完整退出详情）原样抛出。
+        """
+        return (isinstance(exc, CodexPeerClosedError)
+                and exc.reason in ("stdout_eof", "not_running"))
 
     async def _spawn_initialized_peer(
         self,
@@ -996,10 +1306,11 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                 await conn.request(M_INITIALIZE, init_params, timeout=30)
                 await conn.notify(M_INITIALIZED)
                 return conn
-            except (OSError, JsonRpcError, asyncio.TimeoutError) as exc:
+            except BaseException as exc:
                 if conn is not None:
                     await conn.close()
-                if (attempt + 1 >= attempts
+                if (not isinstance(exc, (OSError, JsonRpcError, asyncio.TimeoutError))
+                        or attempt + 1 >= attempts
                         or not self._retryable_initialize_error(exc)):
                     raise
                 await asyncio.sleep(0.25 * (2 ** attempt))
@@ -1013,47 +1324,63 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
     ) -> dict[str, Any]:
         sid = request.agent_session_id
         await self._ensure_protocol_methods()
-        cwd = str(request.options.get("cwd") or self._default_cwd or os.getcwd())
-        extra_env = {k: str(v)
-                     for k, v in (request.options.get("env") or {}).items()}
-        spawn_env = self._spawn_env(extra_env)
+        options = request.options
+        cwd = options.cwd or self._default_cwd or os.getcwd()
+        spawn_env = self._spawn_env(dict(options.env))
         provider_args = self._provider_spawn_args(spawn_env)
-        mcp_args = self._mcp_spawn_args(plan)
-        if mcp_args and bearer_token:
-            # token 本体只进子进程环境变量（Secret materialization）。
-            spawn_env[MCP_TOKEN_ENV] = bearer_token
+        thread_mcp = self._mcp_thread_config(plan, bearer_token)
 
         init_params: dict[str, Any] = {"clientInfo": {
             "name": "muteki", "title": "Muteki ExternalAgentAdapter",
             "version": "runtime-02"}}
         if self._experimental_api:
             init_params["capabilities"] = {"experimentalApi": True}
-        conn = await self._spawn_initialized_peer(
-            # -c 覆盖属于 app-server 子命令参数（T3 同名机制核验）。
-            # provider_args 必须在 mcp_args 之前：自定义 endpoint 的
-            # model_provider 绑定与 MCP 注入同属 spawn 级 -c 覆盖。
-            argv=[self._binary, "app-server", *provider_args, *mcp_args,
-                  "--listen", "stdio://"],
-            env=spawn_env, cwd=cwd,
-            init_params=init_params)
+        spawn_argv = self._with_launch_args([
+            self._binary, "app-server", *provider_args, "--listen", "stdio://"])
+        fork_connection = self._fork_connections.get(request.resume_handle or "")
+        launch_signature = (spawn_argv, spawn_env, options.chat_native_plugins)
+        shared = (fork_connection is not None and fork_connection.alive
+                  and fork_connection.launch_signature == launch_signature)
+        if shared:
+            conn = fork_connection
+        else:
+            if fork_connection is not None and fork_connection.alive:
+                # T3 unloads the native thread before another provider
+                # connection adopts it. Codex permits only one active writer.
+                await fork_connection.request(
+                    "thread/unsubscribe", {"threadId": request.resume_handle},
+                    timeout=30)
+                fork_connection.release_thread(str(request.resume_handle))
+            conn = await self._spawn_initialized_peer(
+                # Provider credentials belong to this app-server. A changed
+                # binding resumes the exact native fork on the requested
+                # connection; failure never creates a new conversation.
+                argv=spawn_argv, env=spawn_env, cwd=cwd, init_params=init_params)
+            conn.launch_signature = launch_signature
         try:
-            reload_status = "skipped"
-            for plugin in request.options.get("chat_native_plugins", []):
+            reload_status = "thread-config" if thread_mcp else "no-injection"
+            for plugin in ([] if shared else options.chat_native_plugins):
                 await conn.request("plugin/install", plugin, timeout=60)
-            if mcp_args:
-                # 新进程已带 -c 覆盖；reload 是核验建议的确定性保险
-                # （对写 config.toml 的路径是必需）。旧版无此方法时容忍。
-                try:
-                    await conn.request(M_MCP_RELOAD, timeout=30)
-                    reload_status = "reloaded"
-                except JsonRpcError as exc:
-                    reload_status = f"reload unavailable: {exc.code}"
 
             thread_params: dict[str, Any] = {
                 "cwd": cwd,
                 "serviceName": "muteki",
             }
-            approvals = request.options.get("chat_hook_approvals") or {}
+            thread_config = dict(_THREAD_UPDATE_PLAN_CONFIG)
+            if options.is_conversation:
+                # Desktop ownership belongs to Muteki's gateway. Imported Codex
+                # plugins must not expose a second CUA session to the model.
+                home = Path(spawn_env.get("CODEX_HOME") or Path.home() / ".codex")
+                config_file = home / "config.toml"
+                if config_file.is_file():
+                    native_cua = tomllib.loads(config_file.read_text(encoding="utf-8")).get("mcp_servers", {}).get("cua_repl")
+                    if isinstance(native_cua, dict):
+                        # Codex validates transport even for disabled servers.
+                        thread_mcp["cua_repl"] = {**native_cua, "enabled": False}
+                thread_config['plugins."unified-computer-use@openai-bundled".enabled'] = False
+            if thread_mcp:
+                thread_config["mcp_servers"] = thread_mcp
+            approvals = options.chat_hook_approvals
             if approvals:
                 catalog = await conn.request("hooks/list", {"cwds": [cwd]})
                 trusted = {}
@@ -1063,10 +1390,13 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                             and hook.get("currentHash") and hook.get("key")):
                             trusted[hook["key"]] = {"trusted_hash": hook["currentHash"], "enabled": True}
                 if trusted:
-                    thread_params["config"] = {"hooks.state": trusted}
+                    thread_config["hooks.state"] = trusted
+            thread_params["config"] = thread_config
             model = request.model or self._model
             if model:
                 thread_params["model"] = model
+            if request.service_tier:
+                thread_params["serviceTier"] = request.service_tier
             access_config: Optional[dict[str, Any]] = None
             if request.access_mode:
                 access_config = _access_config(str(request.access_mode))
@@ -1084,34 +1414,54 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                 if sandbox:
                     thread_params["sandbox"] = sandbox
 
-            fork_from = str(request.options.get("fork_from") or "")
+            # ThreadResumeParams and ThreadForkParams (0.160.1 schema) have no
+            # serviceName; they carry the same access, model and cwd fields.
+            existing_thread_params = {
+                key: value for key, value in thread_params.items()
+                if key != "serviceName"}
+            fork_from = options.fork_from
             if fork_from:
                 result = await conn.request(
-                    M_THREAD_FORK, {"threadId": fork_from}, timeout=60)
+                    M_THREAD_FORK,
+                    {"threadId": fork_from, "excludeTurns": True,
+                     **({"lastTurnId": options.fork_last_turn_id} if options.fork_last_turn_id else {}),
+                     **existing_thread_params},
+                    timeout=60)
             elif request.resume_handle:
                 result = await conn.request(
                     M_THREAD_RESUME,
-                    {"threadId": request.resume_handle, **thread_params},
+                    # The Conversation owns history; replaying every turn on
+                    # resume would only cost latency and memory.
+                    {"threadId": request.resume_handle, "excludeTurns": True,
+                     **existing_thread_params},
                     timeout=60)
             else:
                 result = await conn.request(M_THREAD_START, thread_params, timeout=60)
-        except Exception:
-            await conn.close()
+        except BaseException:
+            if not shared:
+                await conn.close()
             raise
 
         thread = (result or {}).get("thread") or {}
         thread_id = str(thread.get("id") or "")
         if not thread_id:
-            await conn.close()
+            if not shared:
+                await conn.close()
             raise RuntimeError("thread/start 响应缺少 thread.id")
         self._runs[sid] = {
             "conn": conn,
+            "incoming": conn.queue_for(thread_id),
             "conversation_thread_id": request.thread_id,
             "thread_id": thread_id,
             # fork 后 sessionId 保持根线程 id，单独记录（核验 §CODEX 末节）。
             "root_session_id": str(thread.get("sessionId") or thread_id),
             "cwd": cwd,
+            "model": str((result or {}).get("model") or model or ""),
             "effort": request.effort or self._effort,
+            "collaboration_mode": str(
+                ((result or {}).get("collaborationMode") or {}).get("mode")
+                or "default"),
+            "service_tier": request.service_tier or "",
             "access_config": access_config,
             "turns": 0,
             "current_turn_id": None,
@@ -1119,14 +1469,13 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             "file_change_items": {},  # item_id -> {files,diff,path,paths}
             "user_inputs": {},    # request_id -> asyncio.Future
             "user_input_params": {},  # request_id -> 原生 request 上下文
-            "mcp_reload": reload_status if mcp_args else "no-injection",
-            "mcp_injected": bool(mcp_args),
+            "mcp_reload": reload_status,
+            "mcp_injected": bool(thread_mcp),
             "thread_started_native": None,
-            "resume_prompt": str(
-                request.options.get("resume_prompt")
-                or "Continue from where you left off."
-            ),
+            "resume_prompt": options.resume_prompt or "Continue from where you left off.",
         }
+        if request.resume_handle:
+            self._fork_connections.pop(request.resume_handle, None)
         return {"external_session_id": thread_id, "resume_handle": thread_id}
 
     # -- 审批 / 用户输入应答 -----------------------------------------------------
@@ -1265,18 +1614,18 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                 try:
                     await ctx["conn"].request(M_TURN_STEER, {
                         "threadId": ctx["thread_id"], "expectedTurnId": current_turn,
-                        "input": codex_turn_input(reply, {}),
+                        "input": codex_turn_input(reply),
                     }, timeout=30)
-                except JsonRpcError as exc:
-                    # A completion can race the steer. Only the explicit
-                    # no-active-turn condition permits starting a continuation.
-                    if "no active turn" not in exc.message.lower():
+                except JsonRpcError:
+                    # A completion can race the steer. Only a thread with no
+                    # in-progress turn permits starting a continuation.
+                    if await self._thread_has_active_turn(ctx):
                         raise
                     needs_continuation = True
             if future.done():
                 raise RuntimeError("问题已取消或过期，回答未再提交")
             if needs_continuation:
-                continuation = AgentInput(kind="message", text=reply,
+                continuation = MessageInput(text=reply,
                     payload={"client_user_message_id": f"muteki-input-{request_key}"})
                 # Do not consume the question until the native runtime has
                 # acknowledged turn/start. Failure leaves its Future pending,
@@ -1362,50 +1711,45 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         text: str,
         structured: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        """Map structured answers (or legacy text) onto MCP elicitation fields."""
+        """Map structured answers (or legacy text) onto MCP elicitation fields.
+
+        Legacy text goes to the first schema property and is converted with
+        the schema's own wire types; invalid values raise
+        ``UserInputValidationError``.
+        """
         schema = params.get("requestedSchema")
         schema_dict = schema if isinstance(schema, dict) else {}
-        if structured is not None:
-            normalized = {
-                str(qid): (
-                    value if isinstance(value, dict)
-                    else {"values": [str(value)], "text": str(value)}
-                )
-                for qid, value in structured.items()
-            }
-            return content_for_elicitation(normalized, schema=schema_dict)
-        properties = schema_dict.get("properties") if schema_dict else None
-        if not isinstance(properties, dict) or not properties:
-            return {}
-        key, raw_spec = next(iter(properties.items()))
-        spec = raw_spec if isinstance(raw_spec, dict) else {}
-        value: Any = text
-        field_type = str(spec.get("type") or "string")
-        if field_type == "boolean":
-            value = text.strip().lower() in {
-                "1", "true", "yes", "on", "是", "允许",
-            }
-        elif field_type == "integer":
-            value = int(text)
-        elif field_type == "number":
-            value = float(text)
-        return {str(key): value}
+        normalized = {
+            str(qid): (
+                value if isinstance(value, dict)
+                else {"values": [str(value)], "text": str(value)}
+            )
+            for qid, value in (structured or {}).items()
+        }
+        if not normalized and text:
+            properties = schema_dict.get("properties")
+            if not isinstance(properties, dict) or not properties:
+                return {}
+            normalized = {str(next(iter(properties))): {"values": [], "text": text}}
+        return content_for_elicitation(normalized, schema=schema_dict)
 
     # -- turn 流 ----------------------------------------------------------------
 
     def send(
         self, session: AgentSessionRef, input: AgentInput
     ) -> AsyncIterator[AgentEvent]:
-        if input.kind == "approval_response":
+        if isinstance(input, ApprovalResponseInput):
             return self._approval_response_stream(session, input)
-        if input.kind == "user_input_response":
+        if isinstance(input, UserInputResponseInput):
             return self._user_input_response_stream(session, input)
-        return self._turn_stream(session, input)
+        if isinstance(input, MessageInput):
+            return self._turn_stream(session, input)
+        return self.unsupported_input_stream(session, input)
 
     async def _approval_response_stream(
-        self, session: AgentSessionRef, input: AgentInput
+        self, session: AgentSessionRef, input: ApprovalResponseInput
     ) -> AsyncIterator[AgentEvent]:
-        approval = ApprovalDecision.from_payload(input.payload)
+        approval = ApprovalDecision.from_payload(input.payload.model_dump())
         receipt = await self.respond_approval(
             session, approval.approval_id, approval.codex_decision())
         if receipt.state is ReceiptState.FAILED:
@@ -1414,32 +1758,39 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                 self.sequencer_for(session.agent_session_id),
                 agent_session_id=session.agent_session_id,
                 external_session_id=session.external_session_id,
-                payload={"code": receipt.error.code if receipt.error else "",
-                         "delivery_unknown": bool(receipt.error and receipt.error.detail.get("delivery_unknown")),
-                         "operation": "approval_response"},
+                payload=RuntimeErrorPayload(error=self.failure(
+                    FailureCategory.UNKNOWN, "control.delivery_failed",
+                    message=(receipt.error.message if receipt.error
+                             else "approval response was not delivered"),
+                    native_code=(receipt.error.code if receipt.error else ""),
+                    delivery_unknown=bool(
+                        receipt.error
+                        and receipt.error.detail.get("delivery_unknown")))),
             ))
 
     async def _user_input_response_stream(
-        self, session: AgentSessionRef, input: AgentInput
+        self, session: AgentSessionRef, input: UserInputResponseInput
     ) -> AsyncIterator[AgentEvent]:
-        answers = dict(input.payload.get("answers") or {})
-        if not answers and input.text:
-            answers = {"__text__": input.text}
-        decision = str(input.payload.get("decision") or "submit")
-        answers["__decision__"] = decision
+        answers = dict(input.payload.answers)
+        answers["__decision__"] = input.payload.decision
         if input.text and "__text__" not in answers:
             answers["__text__"] = input.text
         receipt = await self.respond_user_input(
-            session, input.payload.get("request_id"), answers)
+            session, input.payload.request_id, answers)
         if receipt.state is ReceiptState.FAILED:
             yield self.emit(build_event(
                 AgentEventType.RUNTIME_ERROR,
                 self.sequencer_for(session.agent_session_id),
                 agent_session_id=session.agent_session_id,
                 external_session_id=session.external_session_id,
-                payload={"code": receipt.error.code if receipt.error else "",
-                         "delivery_unknown": bool(receipt.error and receipt.error.detail.get("delivery_unknown")),
-                         "operation": "user_input_response"},
+                payload=RuntimeErrorPayload(error=self.failure(
+                    FailureCategory.UNKNOWN, "control.delivery_failed",
+                    message=(receipt.error.message if receipt.error
+                             else "user input response was not delivered"),
+                    native_code=(receipt.error.code if receipt.error else ""),
+                    delivery_unknown=bool(
+                        receipt.error
+                        and receipt.error.detail.get("delivery_unknown")))),
             ))
             raise RuntimeError(receipt.error.message if receipt.error else "用户输入未送达 Runtime")
         else:
@@ -1453,7 +1804,8 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                         agent_session_id=session.agent_session_id,
                         external_session_id=session.external_session_id,
                         turn_id=ctx.get("current_turn_id"),
-                        native_type="agentMessage/async", payload=native["pending"],
+                        native_type="agentMessage/async",
+                        payload=native["pending"],
                     ))
                     break
 
@@ -1470,18 +1822,54 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             ctx.get("resume_prompt") or "Continue from where you left off."
         )
         return self._turn_stream(
-            session, AgentInput(kind="message", text=prompt), resumed=True)
+            session, MessageInput(text=prompt), resumed=True)
 
     @staticmethod
-    def _turn_parameters(ctx: dict[str, Any], input: AgentInput) -> dict[str, Any]:
+    def _collaboration_mode(
+        ctx: dict[str, Any], input: MessageInput,
+    ) -> Optional[dict[str, Any]]:
+        """Per-turn ``collaborationMode`` (T3 ``buildCodexTurnStartParams``).
+
+        ``plan`` is sent on plan turns; the first turn after a plan turn sends
+        an explicit ``default`` so the thread leaves plan mode. Threads that
+        never planned omit the field.
+        """
+        wanted = input.payload.interaction_mode
+        # Ordinary turns omit the field. A plan turn sends mode=plan. The
+        # first turn after a plan turn sends an explicit default so the
+        # thread leaves plan mode.
+        if wanted != "plan" and not (
+                wanted == "default" and ctx.get("collaboration_mode") == "plan"):
+            return None
+        settings: dict[str, Any] = {"model": ctx["model"]}
+        if ctx.get("effort"):
+            settings["reasoning_effort"] = ctx["effort"]
+        return {"mode": wanted, "settings": settings}
+
+    @staticmethod
+    def _turn_parameters(ctx: dict[str, Any], input: MessageInput) -> dict[str, Any]:
         params: dict[str, Any] = {
             "threadId": ctx["thread_id"],
-            "input": codex_turn_input(input.text, input.payload),
+            "input": codex_turn_input(
+                input.text, input.payload.attachments, input.payload.runtime_capability),
         }
+        # Detailed reasoning summaries are what the Conversation reasoning
+        # block renders; the app-server default ("auto") often emits none.
+        params["summary"] = "detailed"
+        params["cwd"] = ctx["cwd"]
+        if ctx.get("model"):
+            params["model"] = ctx["model"]
         if ctx.get("effort"):
             params["effort"] = ctx["effort"]
-        if input.payload.get("client_user_message_id"):
-            params["clientUserMessageId"] = str(input.payload["client_user_message_id"])
+        collaboration = CodexAppServerAdapter._collaboration_mode(ctx, input)
+        if collaboration is not None:
+            params["collaborationMode"] = collaboration
+        if ctx.get("service_tier"):
+            # A forked thread is not started with thread params, so the turn
+            # carries the tier as well.
+            params["serviceTier"] = ctx["service_tier"]
+        if input.payload.client_user_message_id:
+            params["clientUserMessageId"] = input.payload.client_user_message_id
         access = ctx.get("access_config")
         if access:
             params.update({"approvalPolicy": access["approvalPolicy"],
@@ -1489,13 +1877,30 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                            "sandboxPolicy": access["sandboxPolicy"]})
         return params
 
+    def _plan_mode_block(self, ctx: dict[str, Any]) -> str:
+        """Why a plan turn cannot be sent, or ``""`` when it can.
+
+        0.160.1 accepts ``collaborationMode`` only after experimentalApi is
+        declared and the thread has a model. A probe that did not find
+        CollaborationMode keeps plan_mode false and blocks the turn here.
+        """
+        if not self._experimental_api:
+            return "experimentalApi"
+        if not ctx.get("model"):
+            return "a resolved model"
+        report = self._probe_cache
+        if report is not None and not report.capabilities.plan_mode:
+            return "collaborationMode support on this Codex build"
+        return ""
+
     async def _turn_stream(
         self,
         session: AgentSessionRef,
-        input: AgentInput,
+        input: MessageInput,
         *,
         resumed: bool = False,
         started_result: Optional[dict[str, Any]] = None,
+        supervise: bool = True,
     ) -> AsyncIterator[AgentEvent]:
         sid = session.agent_session_id
         seq = self.sequencer_for(sid)
@@ -1505,8 +1910,9 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                 AgentEventType.RUNTIME_ERROR, seq,
                 agent_session_id=sid,
                 external_session_id=session.external_session_id,
-                payload={"code": "external_agent.session.unknown",
-                         "detail": "session was not started by this adapter"},
+                payload=RuntimeErrorPayload(error=self.failure(
+                    FailureCategory.UNKNOWN, "session.unknown",
+                    message="session was not started by this adapter")),
             ))
             return
         if input.text.strip():
@@ -1527,52 +1933,125 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             yield self.emit(build_event(
                 AgentEventType.SESSION_STARTED, seq,
                 native_type="codex.thread/started",
-                payload={
-                    "transport": "app-server",
-                    "adapter_id": self.id,
-                    "instance_id": self.identity.instance_id,
-                    "cwd": ctx["cwd"],
-                    "root_session_id": ctx["root_session_id"],
-                    "mcp_injected": ctx["mcp_injected"],
-                    "mcp_reload": ctx["mcp_reload"],
-                },
+                payload=SessionPayload(
+                    transport="app-server",
+                    adapter_id=self.id,
+                    instance_id=self.identity.instance_id,
+                    cwd=ctx["cwd"],
+                    native={
+                        "root_session_id": ctx["root_session_id"],
+                        "mcp_injected": ctx["mcp_injected"],
+                        "mcp_reload": ctx["mcp_reload"],
+                    }),
                 **common))
         elif resumed:
             yield self.emit(build_event(
                 AgentEventType.SESSION_RESUMED, seq,
                 native_type="codex.resume",
-                payload={"transport": "app-server"},
+                payload=SessionPayload(transport="app-server"),
                 **common))
 
         if ctx["turns"] == 0 and self._probe_cache and not self._probe_cache.capabilities.subagents:
             yield self.emit(build_event(
                 AgentEventType.AGENT_UPDATED, seq,
                 native_type="codex.capabilities",
-                payload={"agents": [], "unsupported": True, "adapter_id": self.id,
-                         "unsupported_reason": "当前 Codex 协议未确认委派 Agent 事件能力"},
+                payload=AgentUpdatedPayload(
+                    unsupported=True,
+                    unsupported_reason="当前 Codex 协议未确认委派 Agent 事件能力"),
                 **common))
 
         # A user-input continuation may already be acknowledged by the reply
         # request. Its existing consumer takes ownership without starting twice.
         conn: CodexPeer = ctx["conn"]
         result = started_result
+        turn_timeout = self.conversation_turn_timeout(
+            ctx.get("conversation_thread_id"), self._turn_timeout_s)
+
+        async def _on_abort(_failure: Any) -> None:
+            await self.interrupt(session)
+
+        runner: Optional[TurnRunner] = None
+        if supervise:
+            # turn id is filled in after turn/start accepts the input.
+            runner = TurnRunner(
+                self, session, turn_id=None,
+                limits=TurnLimits(idle_s=turn_timeout, overall_s=turn_timeout),
+                exit_watch=conn.wait_exit,
+                on_abort=_on_abort,
+                diagnostics=conn.stderr_text,
+                auto_ack=False,
+                run_id=common.get("run_id"),
+                execution_generation=common.get("execution_generation"),
+            )
+            if started_result is not None:
+                runner.mark_sent()
+                runner.ack()
         if result is None:
             try:
-                capability = input.payload.get("runtime_capability") or {}
+                capability = input.payload.runtime_capability
                 if (capability.get("invocation") or {}).get("method") == "review/start":
-                    from .command_providers import codex_review_target
+                    if runner is not None:
+                        runner.mark_sent()
                     result = await conn.request("review/start", {
                         "threadId": thread_id, "delivery": "inline",
                         "target": codex_review_target(str(capability.get("arguments") or "")),
                     }, timeout=60)
                 else:
+                    blocked = (
+                        self._plan_mode_block(ctx)
+                        if input.payload.interaction_mode == "plan" else "")
+                    if blocked:
+                        raise _PlanModeUnavailable(blocked)
+                    if runner is not None:
+                        runner.mark_sent()
                     result = await conn.request(
                         M_TURN_START, self._turn_parameters(ctx, input), timeout=60)
+                    ctx["collaboration_mode"] = input.payload.interaction_mode
+                if runner is not None:
+                    runner.ack()
+            except _PlanModeUnavailable as exc:
+                yield self.emit(build_event(
+                    AgentEventType.TURN_FAILED, seq,
+                    native_type="codex.turn/start.plan_mode",
+                    payload=TurnFailedPayload(error=self.failure(
+                        FailureCategory.UNSUPPORTED, "plan_mode_unsupported",
+                        message=f"Codex plan mode is unavailable: {exc}")),
+                    **common))
+                return
+            except CodexPeerClosedError as exc:
+                detail = f"reason={exc.reason}; exit_code={exc.exit_code}"
+                stderr = conn.stderr_text()
+                if stderr:
+                    detail = f"{detail}\n{stderr}"
+                failure = self.failure(
+                    FailureCategory.RUNTIME_EXITED, "runtime_exited",
+                    message="Codex app-server exited before the turn started",
+                    detail=detail,
+                    delivery_unknown=bool(runner and runner.delivery_unknown),
+                )
+                yield self.emit(build_event(
+                    AgentEventType.TURN_FAILED, seq,
+                    native_type="codex.turn/start.exited",
+                    payload=TurnFailedPayload(error=failure),
+                    **common))
+                yield self.emit(build_event(
+                    AgentEventType.RUNTIME_EXITED, seq,
+                    native_type="codex.process.exit",
+                    payload=RuntimeExitedPayload(
+                        classification=EXIT_FAILED,
+                        exit_code=exc.exit_code,
+                        error=failure),
+                    **common))
+                return
             except (JsonRpcError, asyncio.TimeoutError) as exc:
                 yield self.emit(build_event(
                     AgentEventType.TURN_FAILED, seq,
                     native_type="codex.turn/start.error",
-                    payload={"error": str(exc)[:300]},
+                    payload=TurnFailedPayload(error=self.exception_failure(
+                        exc, FailureCategory.TRANSPORT, "turn_start",
+                        message=f"Codex turn/start failed: {exc}",
+                        delivery_unknown=bool(
+                            runner and runner.delivery_unknown))),
                     **common))
                 return
         turn = (result or {}).get("turn") or {}
@@ -1584,45 +2063,48 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         ctx["assistant_legacy_final_text"] = ""
         ctx["agent_message_phases"] = {}
         ctx["reasoning_summaries"] = {}
+        ctx["plan_delta_text"] = ""
+        ctx["turn_is_plan"] = input.payload.interaction_mode == "plan"
         yield self.emit(build_event(
             AgentEventType.TURN_STARTED, seq, turn_id=turn_id,
             native_type="codex.turn/start",
-            payload={"kind": input.kind},
+            payload=TurnStartedPayload(kind=input.kind),
             **common))
 
-        done = False
-        turn_timeout = self.conversation_turn_timeout(
-            ctx.get("conversation_thread_id"), self._turn_timeout_s)
-        while not done:
-            try:
-                if turn_timeout is None:
-                    kind, msg = await conn.incoming.get()
-                else:
-                    kind, msg = await asyncio.wait_for(
-                        conn.incoming.get(), timeout=turn_timeout)
-            except asyncio.TimeoutError:
-                yield self.emit(build_event(
-                    AgentEventType.TURN_FAILED, seq, turn_id=turn_id,
-                    native_type="codex.turn.timeout",
-                    payload={"reason": "turn timeout",
-                             "timeout_s": turn_timeout},
-                    **common))
-                break
+        if runner is not None:
+            runner.set_turn_id(turn_id)
+            event_stream = runner.stream(self._iterate_turn_events(
+                session, ctx, seq, common, turn_id))
+        else:
+            event_stream = self._iterate_turn_events(
+                session, ctx, seq, common, turn_id)
+        async for event in event_stream:
+            yield event
+        holds = int(ctx.get("_continuation_holds") or 0)
+        if holds:
+            ctx["_continuation_holds"] = holds - 1
+        else:
+            ctx["turns"] += 1
+        ctx["current_turn_id"] = None
+
+    async def _iterate_turn_events(
+        self,
+        session: AgentSessionRef,
+        ctx: dict[str, Any],
+        seq: Any,
+        common: dict[str, Any],
+        turn_id: str,
+    ) -> AsyncIterator[AgentEvent]:
+        """Yield one turn's events. Exit and idle limits belong to TurnRunner.
+
+        Stdout EOF ends the source without a terminal event so the runner can
+        emit ``external_agent.runtime_exited`` from the process exit code.
+        """
+        conn: CodexPeer = ctx["conn"]
+        while True:
+            kind, msg = await ctx["incoming"].get()
             if kind == "eof":
-                classification = classify_exit(
-                    returncode=None, error="app-server stdout EOF",
-                    resume_handle=thread_id)
-                yield self.emit(build_event(
-                    AgentEventType.TURN_FAILED, seq, turn_id=turn_id,
-                    native_type="codex.process.eof",
-                    payload={"reason": "app-server exited mid-turn"},
-                    **common))
-                yield self.emit(build_event(
-                    AgentEventType.RUNTIME_EXITED, seq, turn_id=turn_id,
-                    native_type="codex.process.exit",
-                    payload={"classification": classification},
-                    **common))
-                break
+                return
             if kind == "request":
                 async for event in self._handle_server_request(
                         msg, ctx, seq, common, turn_id):
@@ -1646,34 +2128,43 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                             yield self.emit(build_event(
                                 AgentEventType.TURN_FAILED, seq, turn_id=turn_id,
                                 native_type="codex.async_input.timeout",
-                                payload={"reason": "等待用户输入超时", "code": "codex.user_input.timeout"},
+                                payload=TurnFailedPayload(error=self.failure(
+                                    FailureCategory.TIMEOUT, "user_input.timeout",
+                                    message="等待用户输入超时")),
                                 **common))
-                            break
+                            return
                     if ctx.pop("async_interrupted", False):
                         yield self.emit(build_event(
                             AgentEventType.TURN_FAILED, seq, turn_id=turn_id,
                             native_type="codex.async_input.interrupted",
-                            payload={"reason": "interrupted", "status": "interrupted"},
+                            payload=TurnFailedPayload(error=self.failure(
+                                FailureCategory.CANCELLED, "interrupted",
+                                message="Codex async user input interrupted")),
                             **common))
-                        break
+                        return
                     continuation = ctx.pop("async_started_turn", None)
                     if continuation:
+                        # Count this native turn before the nested stream so
+                        # its turns==0 session events are not emitted again.
+                        # The hold makes that nested stream the one that does
+                        # not also count it.
                         ctx["turns"] += 1
+                        ctx["_continuation_holds"] = ctx.get("_continuation_holds", 0) + 1
                         async for event in self._turn_stream(
                             session, continuation["input"], resumed=True,
                             started_result=continuation["result"],
+                            supervise=False,
                         ):
                             yield event
                         return
-            # notification
             events, done = self._map_notification(
                 msg, ctx, seq, common, turn_id)
             for event in events:
                 if event.event_type is AgentEventType.AGENT_UPDATED:
                     await self._hydrate_agent_nodes(ctx, event.payload.get("agents", []))
                 yield self.emit(event)
-        ctx["turns"] += 1
-        ctx["current_turn_id"] = None
+            if done:
+                return
 
     async def _hydrate_agent_nodes(
         self, ctx: dict[str, Any], nodes: list[dict[str, Any]]
@@ -1687,6 +2178,11 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         hydrated = ctx.setdefault("agent_hydrated", set())
         for node in nodes:
             agent_id = node["agent_id"]
+            # Current Codex can omit thread/started for a native child. Its
+            # delegation/activity frame still supplies a confirmed child id.
+            # Bind before reading metadata so a child's approval never waits
+            # in an unclaimed queue while the parent waits for that child.
+            conn.bind_subagent(agent_id, str(node.get("parent_id") or ctx["thread_id"]))
             terminal = node.get("status") in {"completed", "failed", "cancelled"}
             key = (agent_id, node.get("status"), ctx.get("agent_activity", {}).get(agent_id))
             if key in hydrated:
@@ -1699,6 +2195,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                     child = (result or {}).get("thread") or {}
                     parent = str(child.get("parentThreadId") or "")
                     if parent:
+                        conn.bind_subagent(agent_id, parent)
                         node["parent_id"] = None if parent == ctx["thread_id"] else parent
                     if child.get("preview") and "request" not in node:
                         node["request"] = str(child["preview"])
@@ -1738,6 +2235,8 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         request_id = msg.get("id")
         params = msg.get("params") or {}
         conn: CodexPeer = ctx["conn"]
+        source_thread = str(params.get("threadId") or "")
+        agent_id = source_thread if source_thread in (ctx.get("agent_nodes") or {}) else None
 
         if method in APPROVAL_REQUEST_METHODS:
             kind = APPROVAL_REQUEST_METHODS[method]
@@ -1746,34 +2245,49 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             # 事件 payload 与 respond_approval 入参都是 str 形态。
             ctx["approvals"][str(request_id)] = future
             ctx.setdefault("control_deliveries", {})[("approval", str(request_id))] = asyncio.get_running_loop().create_future()
-            details = {
-                "approval_kind": kind,
-                "command": params.get("command"),
-                "cwd": params.get("cwd") or params.get("workdir"),
-                "reason": params.get("reason"),
-                "diff": (
-                    params.get("diff")
-                    or params.get("patch")
-                    or params.get("unifiedDiff")
-                    or params.get("unified_diff")
-                ),
-                "files": params.get("files") or params.get("changes"),
-                "native": params,
-            }
+            preview: dict[str, Any] = {}
             if kind == "file_change":
                 # Join item/started preview (path + Diff) — approval params alone
                 # do not carry them on current Codex app-server wire format.
-                details.update(_file_change_preview_from_ctx(params, ctx))
+                preview = _file_change_preview_from_ctx(params, ctx)
+            files = [
+                WorkspaceFileChange(
+                    path=str(row["path"]),
+                    change=_FILE_CHANGE_KINDS.get(
+                        str(row.get("status") or "").lower()),
+                    unified_diff=(
+                        str(row["diff"]) if row.get("diff") else None),
+                )
+                for row in (preview.get("files")
+                            or _normalize_file_change_entries(
+                                params.get("files") or params.get("changes")))
+                if row.get("path")
+            ]
             yield self.emit(build_event(
                 AgentEventType.APPROVAL_REQUESTED, seq, turn_id=turn_id,
                 native_type=method,
-                payload=ApprovalRequest(
+                payload=ApprovalRequestedPayload(
+                    agent_id=agent_id,
                     approval_id=str(request_id),
-                    details={
-                        key: value for key, value in details.items()
-                        if value not in (None, "", [], {})
-                    },
-                ).to_payload(),
+                    approval_kind=kind,
+                    command=(
+                        str(params["command"])
+                        if params.get("command") is not None else None),
+                    cwd=str(
+                        preview.get("cwd")
+                        or params.get("cwd") or params.get("workdir") or ""
+                    ) or None,
+                    reason=(
+                        str(params["reason"])
+                        if params.get("reason") is not None else None),
+                    unified_diff=(
+                        str(preview["diff"]) if preview.get("diff") else (
+                            str(params["diff"]) if params.get("diff") else None)),
+                    files=files,
+                    path=(str(preview["path"]) if preview.get("path") else None),
+                    paths=[str(p) for p in (preview.get("paths") or [])],
+                    native={"params": params, "item_id": preview.get("item_id")},
+                ),
                 **common))
             decision: dict[str, Any]
             try:
@@ -1787,12 +2301,13 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             yield self.emit(build_event(
                 AgentEventType.APPROVAL_RESOLVED, seq, turn_id=turn_id,
                 native_type=f"{method}.resolved",
-                payload={
-                    "approval_id": str(request_id),
-                    "approval_kind": kind,
-                    "decision": decision["decision"],
-                    "auto_declined": bool(decision.get("_timeout")),
-                },
+                payload=ApprovalResolvedPayload(
+                    approval_id=str(request_id),
+                    decision=_codex_approval_outcome(decision["decision"]),
+                    automatic=bool(decision.get("_timeout")),
+                    native={"approval_kind": kind,
+                            "native_decision": decision["decision"]},
+                ),
                 **common))
             return
 
@@ -1807,22 +2322,24 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             yield self.emit(build_event(
                 AgentEventType.APPROVAL_REQUESTED, seq, turn_id=turn_id,
                 native_type=method,
-                payload=ApprovalRequest(
+                payload=ApprovalRequestedPayload(
+                    agent_id=agent_id,
                     approval_id=str(request_id),
-                    details={
-                        "approval_kind": "mcp_tool_call",
-                        "action": (
-                            native_meta.get("tool_title")
-                            or f"{params.get('serverName') or 'MCP'} 工具调用"
-                        ),
-                        "message": params.get("message"),
-                        "reason": params.get("message"),
-                        "arguments": native_meta.get("tool_params"),
+                    approval_kind="mcp_tool_call",
+                    title=str(
+                        native_meta.get("tool_title")
+                        or f"{params.get('serverName') or 'MCP'} 工具调用"),
+                    reason=(
+                        str(params["message"])
+                        if params.get("message") is not None else None),
+                    input=native_meta.get("tool_params"),
+                    scopes=(["session"] if native_meta.get("persist") else []),
+                    native={
+                        "params": params,
                         "tool_description": native_meta.get("tool_description"),
                         "permission_scope": native_meta.get("persist"),
-                        "native": params,
                     },
-                ).to_payload(),
+                ),
                 **common))
             try:
                 decision = await asyncio.wait_for(
@@ -1842,12 +2359,15 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             yield self.emit(build_event(
                 AgentEventType.APPROVAL_RESOLVED, seq, turn_id=turn_id,
                 native_type=f"{method}.resolved",
-                payload={
-                    "approval_id": str(request_id),
-                    "approval_kind": "mcp_tool_call",
-                    "decision": decision["decision"],
-                    "auto_declined": bool(decision.get("_timeout")),
-                },
+                payload=ApprovalResolvedPayload(
+                    approval_id=str(request_id),
+                    decision=_codex_approval_outcome(decision["decision"]),
+                    scope=("session" if decision["decision"] == "acceptForSession"
+                           else None),
+                    automatic=bool(decision.get("_timeout")),
+                    native={"approval_kind": "mcp_tool_call",
+                            "native_decision": decision["decision"]},
+                ),
                 **common))
             return
 
@@ -1860,16 +2380,18 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                 "params": params,
             }
             questions = questions_from_codex_params(params)
-            pending = normalize_pending_user_input({
-                "request_id": str(request_id),
-                "user_input_kind": USER_INPUT_REQUEST_METHODS[method],
-                "response_actions": (["submit", "cancel", "decline"]
-                                     if method == M_MCP_ELICITATION else ["submit", "cancel"]),
-                "title": params.get("message") or "",
-                "message": params.get("message") or "",
-                "questions": questions,
-                "native": params,
-            })
+            pending = dump_payload(UserInputRequestedPayload(
+                agent_id=agent_id,
+                request_id=str(request_id),
+                user_input_kind=USER_INPUT_REQUEST_METHODS[method],
+                response_actions=(["submit", "cancel", "decline"]
+                                  if method == M_MCP_ELICITATION
+                                  else ["submit", "cancel"]),
+                title=str(params.get("message") or "") or None,
+                message=str(params.get("message") or "") or None,
+                questions=questions,
+                native=params,
+            ))
             yield self.emit(build_event(
                 AgentEventType.USER_INPUT_REQUESTED, seq, turn_id=turn_id,
                 native_type=method,
@@ -1883,14 +2405,16 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             ctx["user_inputs"].pop(str(request_id), None)
             ctx["user_input_params"].pop(str(request_id), None)
             await self._send_control_response(ctx, "user_input", request_id, answers)
+            answered = bool(
+                answers.get("answers") or answers.get("action") == "accept")
             yield self.emit(build_event(
                 AgentEventType.USER_INPUT_RESOLVED, seq, turn_id=turn_id,
                 native_type=f"{method}.resolved",
-                payload={"request_id": str(request_id),
-                         "answered": bool(
-                             answers.get("answers")
-                             or answers.get("action") == "accept"
-                         )},
+                payload=UserInputResolvedPayload(
+                    request_id=str(request_id),
+                    outcome=("answered" if answered else "cancelled"),
+                    native={"answered": answered},
+                ),
                 **common))
             return
 
@@ -1903,8 +2427,11 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         yield self.emit(build_event(
             AgentEventType.RUNTIME_WARNING, seq, turn_id=turn_id,
             native_type=method,
-            payload={"warning": "unsupported server request",
-                     "native": params},
+            payload=RuntimeWarningPayload(
+                kind="protocol",
+                message=f"unsupported server request {method}",
+                code="codex.server_request.unsupported",
+                native={"params": params}),
             **common))
 
     # -- 原生通知 → 统一 AgentEvent 映射 -----------------------------------------
@@ -1925,12 +2452,11 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         method = str(msg.get("method") or "")
         params = msg.get("params") or {}
         source_thread = str(params.get("threadId") or "")
-        if source_thread and source_thread != str(ctx.get("thread_id") or ""):
-            # Native notifications may cover several subscribed threads. Only
-            # this session's root stream belongs to its public conversation;
-            # delegated summaries are fetched explicitly by confirmed child ID.
-            return [], False
         msg_turn_id = str(params.get("turnId") or "") or turn_id
+        if source_thread in (ctx.get("agent_nodes") or {}):
+            # Native child turn ids are private; public activity belongs to
+            # the parent turn while keeping the source ids in native fields.
+            msg_turn_id = turn_id
 
         def ev(event_type: AgentEventType, payload: dict[str, Any],
                *, tid: Optional[str] = None) -> AgentEvent:
@@ -1938,7 +2464,25 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                 event_type, seq, turn_id=tid or msg_turn_id,
                 native_type=method, payload=payload, **common)
 
+        if source_thread and source_thread != str(ctx.get("thread_id") or ""):
+            # Native notifications may cover several subscribed threads. Only
+            # this session's root stream belongs to its public conversation;
+            # a confirmed child thread contributes tool activity to its agent
+            # node and nothing else (its answer/turn state stay private).
+            if source_thread in (ctx.get("agent_nodes") or {}):
+                return self._map_child_notification(
+                    ev, method, params, ctx, source_thread), False
+            return [], False
+
+        if method == "thread/compacted":
+            self._context_compacted(common["agent_session_id"])
+            return [], False
         if method == "thread/started":
+            thread = params.get("thread") or {}
+            child_id = str(thread.get("id") or "")
+            if (thread.get("parentThreadId") and child_id
+                    and child_id != str(ctx.get("thread_id") or "")):
+                return self._child_thread_started(ev, ctx, thread), False
             # thread 身份已在 _launch 回填；保留 native 供排障。
             ctx["thread_started_native"] = params
             return [], False
@@ -1958,46 +2502,61 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                     text = str(ctx.get("assistant_legacy_final_text") or "")
                 if not text:
                     text = "".join(ctx.get("assistant_unknown_deltas") or [])
+                if not text.strip() and ctx.get("turn_is_plan"):
+                    # collaborationMode=plan：计划本体就是本 turn 的答复。
+                    text = str(ctx.get("plan_delta_text") or "")
                 if not text.strip():
-                    return [ev(AgentEventType.TURN_FAILED, {
-                        "status": status,
-                        "reason": "empty_assistant",
-                        "error": {
-                            "code": "codex.empty_assistant",
-                            "message": "Codex turn ended without assistant text",
-                        },
-                    }, tid=turn_id)], True
+                    return [
+                        ev(AgentEventType.RUNTIME_WARNING,
+                           dump_payload(RuntimeWarningPayload(
+                               kind="degraded", code="external_agent.empty_assistant",
+                               message="Codex turn ended without assistant text"))),
+                        ev(AgentEventType.TURN_COMPLETED,
+                           dump_payload(TurnCompletedPayload(
+                               stop_reason=status, duration_ms=turn.get("durationMs")))),
+                    ], True
                 return [
-                    ev(AgentEventType.MESSAGE_COMPLETED, {
-                        "text": text,
-                        "role": "assistant",
-                        "phase": "final_answer",
-                    }, tid=turn_id),
-                    ev(AgentEventType.TURN_COMPLETED, {
-                    "status": status,
-                    "duration_ms": turn.get("durationMs"),
-                    "item_count": len(turn.get("items") or []),
-                    }, tid=turn_id),
+                    ev(AgentEventType.MESSAGE_COMPLETED,
+                       dump_payload(MessageCompletedPayload(
+                           text=text, phase="final_answer")),
+                       tid=turn_id),
+                    ev(AgentEventType.TURN_COMPLETED,
+                       dump_payload(TurnCompletedPayload(
+                           stop_reason=status or None,
+                           duration_ms=turn.get("durationMs"),
+                           native={"item_count": len(turn.get("items") or [])})),
+                       tid=turn_id),
                 ], True
             # interrupted / failed：如实记 turn.failed，不伪造完成。
-            return [ev(AgentEventType.TURN_FAILED, {
-                "status": status or "unknown",
-                "reason": "interrupted" if status == "interrupted" else "failed",
-                "error": turn.get("error"),
-            }, tid=turn_id)], True
+            native_error = turn.get("error")
+            return [ev(AgentEventType.TURN_FAILED,
+                       dump_payload(TurnFailedPayload(
+                           error=self.failure(
+                               FailureCategory.CANCELLED
+                               if status == "interrupted"
+                               else FailureCategory.PROVIDER,
+                               "interrupted" if status == "interrupted"
+                               else "turn_failed",
+                               message=str(
+                                   native_error
+                                   or f"Codex turn {status or 'unknown'}")),
+                           native={"status": status or "unknown",
+                                   "error": native_error})),
+                       tid=turn_id)], True
         if method == "thread/tokenUsage/updated":
             usage = params.get("tokenUsage") or {}
             total = usage.get("total") or {}
-            return [ev(AgentEventType.USAGE_UPDATED, {
-                "usage": {
-                    "input_tokens": total.get("inputTokens"),
-                    "output_tokens": total.get("outputTokens"),
-                    "cached_input_tokens": total.get("cachedInputTokens"),
-                    "reasoning_output_tokens": total.get("reasoningOutputTokens"),
-                    "total_tokens": total.get("totalTokens"),
-                    "model_context_window": usage.get("modelContextWindow"),
-                },
-            })], False
+            return [ev(AgentEventType.USAGE_UPDATED,
+                       dump_payload(UsagePayload(
+                           scope="session_cumulative",
+                           input_tokens=total.get("inputTokens"),
+                           output_tokens=total.get("outputTokens"),
+                           cached_input_tokens=total.get("cachedInputTokens"),
+                           reasoning_tokens=total.get("reasoningOutputTokens"),
+                           total_tokens=total.get("totalTokens"),
+                           context_window=usage.get("modelContextWindow"),
+                           native=params,
+                       )))], False
         if method == "item/agentMessage/delta":
             text = str(params.get("delta") or "")
             if not text:
@@ -2010,12 +2569,13 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                 ctx.setdefault("assistant_final_deltas", []).append(text)
             elif not phase:
                 ctx.setdefault("assistant_unknown_deltas", []).append(text)
-            payload = {"text": text, "role": "assistant"}
-            if phase in {"commentary", "final_answer"}:
-                payload["phase"] = phase
-            if item_id:
-                payload["item_id"] = item_id
-            return [ev(AgentEventType.MESSAGE_DELTA, payload)], False
+            return [ev(AgentEventType.MESSAGE_DELTA,
+                       dump_payload(MessageDeltaPayload(
+                           text=text,
+                           phase=(phase if phase in {"commentary", "final_answer"}
+                                  else None),
+                           message_id=item_id or None,
+                       )))], False
         if method == "item/reasoning/summaryTextDelta":
             text = str(params.get("delta") or "")
             if not text:
@@ -2023,11 +2583,10 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             item_id = str(params.get("itemId") or "")
             summaries = ctx.setdefault("reasoning_summaries", {})
             summaries[item_id] = f"{summaries.get(item_id, '')}{text}"
-            return [ev(AgentEventType.REASONING_SUMMARY, {
-                "text": text,
-                "item_id": item_id,
-                "delta": True,
-            })], False
+            return [ev(AgentEventType.REASONING_SUMMARY,
+                       dump_payload(ReasoningPayload(
+                           text=text, channel="summary", partial=True,
+                           item_id=item_id or None)))], False
         if method == "item/reasoning/textDelta":
             # This notification contains raw reasoning text. The product only
             # exposes summaryTextDelta / the completed item's summary field.
@@ -2035,13 +2594,17 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         if method in ("item/commandExecution/outputDelta",
                       "item/mcpToolCall/progress",
                       "item/fileChange/outputDelta"):
-            return [ev(AgentEventType.TOOL_PROGRESS, {
-                "call_id": str(params.get("itemId") or ""),
-                "chunk": str(params.get("delta") or params.get("output") or ""),
-            })], False
+            return [ev(AgentEventType.TOOL_PROGRESS,
+                       dump_payload(ToolPayload(
+                           tool_call_id=str(params.get("itemId") or ""),
+                           chunk=str(params.get("delta")
+                                     or params.get("output") or ""),
+                       )))], False
         if method == "item/started":
             return self._map_item(ev, params, ctx, started=True), False
         if method == "item/completed":
+            if (params.get("item") or {}).get("type") == "contextCompaction":
+                self._context_compacted(common["agent_session_id"])
             return self._map_item(ev, params, ctx, started=False), False
         if method == "turn/diff/updated":
             diff = str(
@@ -2050,31 +2613,40 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                 or params.get("patch")
                 or ""
             )
-            return [ev(AgentEventType.WORKSPACE_CHANGED, {
-                "diff": diff,
-                "native": params,
-            })], False
+            return [ev(AgentEventType.WORKSPACE_CHANGED,
+                       dump_payload(WorkspaceChangedPayload(
+                           unified_diff=diff or None, native=params)))], False
         if method == "mcpServer/startupStatus/updated":
             status = str(params.get("status") or "")
             if status.lower() in ("failed", "error"):
-                return [ev(AgentEventType.RUNTIME_WARNING, {
-                    "warning": "mcp server startup failed",
-                    "server": params.get("name"), "native": params})], False
+                return [ev(AgentEventType.RUNTIME_WARNING,
+                           dump_payload(RuntimeWarningPayload(
+                               kind="degraded",
+                               message="mcp server startup failed",
+                               code="codex.mcp.startup_failed",
+                               native={"server": params.get("name"),
+                                       "params": params},
+                           )))], False
             return [], False
         if method == "account/rateLimits/updated":
             return [ev(AgentEventType.RUNTIME_WARNING,
-                       {"warning": "rate limits updated",
-                        "native": params})], False
+                       dump_payload(RuntimeWarningPayload(
+                           kind="rate_limit",
+                           message="Codex account rate limits updated",
+                           rate_limit=RateLimitState(**_codex_rate_limit(params)),
+                           native=params,
+                       )))], False
         if method == "turn/plan/updated":
-            return [ev(AgentEventType.PLAN_UPDATED, {
-                **_codex_plan_payload(params, patch=False),
-                "native": params,
-            })], False
+            return [ev(AgentEventType.PLAN_UPDATED,
+                       _codex_plan_payload(params, patch=False))], False
         if method == "item/plan/delta":
-            return [ev(AgentEventType.PLAN_UPDATED, {
-                **_codex_plan_payload(params, patch=True),
-                "native": params,
-            })], False
+            # Plan-mode turns end with the plan item, not an agentMessage;
+            # keep the accumulated text for the completion fallback.
+            ctx["plan_delta_text"] = (
+                str(ctx.get("plan_delta_text") or "")
+                + str(params.get("delta") or ""))
+            return [ev(AgentEventType.PLAN_UPDATED,
+                       _codex_plan_payload(params, patch=True))], False
         if method in ("thread/status/changed", "serverRequest/resolved",
                       "remoteControl/status/changed", "model/rerouted",
                       "thread/name/updated",
@@ -2083,8 +2655,81 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             return [], False
         # 未知原生通知：RUNTIME_WARNING + native 保留，不改核心状态机。
         return [ev(AgentEventType.RUNTIME_WARNING,
-                   {"warning": "unmapped native notification",
-                    "native": params})], False
+                   dump_payload(RuntimeWarningPayload(
+                       kind="protocol",
+                       message=f"unmapped native notification {method}",
+                       code="codex.notification.unmapped",
+                       native={"params": params},
+                   )))], False
+
+    @staticmethod
+    def _child_thread_started(
+        ev: Any, ctx: dict[str, Any], thread: dict[str, Any],
+    ) -> list[AgentEvent]:
+        nodes = ctx.setdefault("agent_nodes", {})
+        child_id = str(thread.get("id") or "")
+        root_id = str(ctx.get("thread_id") or "")
+        parent = str(thread.get("parentThreadId") or "")
+        previous = nodes.get(child_id, {})
+        node = {**previous, "agent_id": child_id, "session_ref": child_id}
+        node.setdefault("title", child_id)
+        node.setdefault("status", "pending")
+        if "parent_id" not in node:
+            node["parent_id"] = None if parent == root_id else parent
+        for key, native in (("nickname", "agentNickname"),
+                            ("role", "agentRole"), ("model", "model")):
+            if thread.get(native):
+                node[key] = str(thread[native])
+        if node == previous:
+            return []
+        nodes[child_id] = node
+        return [ev(AgentEventType.AGENT_UPDATED,
+                   dump_payload(AgentUpdatedPayload(
+                       agents=[AgentNodePayload(**node)], patch=True)))]
+
+    @classmethod
+    def _map_child_notification(
+        cls, ev: Any, method: str, params: dict[str, Any],
+        ctx: dict[str, Any], child_id: str,
+    ) -> list[AgentEvent]:
+        if method in ("item/commandExecution/outputDelta",
+                      "item/mcpToolCall/progress",
+                      "item/fileChange/outputDelta"):
+            return [ev(AgentEventType.TOOL_PROGRESS,
+                       dump_payload(ToolPayload(
+                           tool_call_id=str(params.get("itemId") or ""),
+                           chunk=str(params.get("delta")
+                                     or params.get("output") or ""),
+                           agent_id=child_id,
+                       )))]
+        if method not in ("item/started", "item/completed"):
+            return []
+        item = params.get("item") or {}
+        item_type = str(item.get("type") or "")
+        if item_type == "agentMessage":
+            text = str(item.get("text") or "").strip()
+            if method != "item/completed" or not text:
+                return []
+            nodes = ctx.setdefault("agent_nodes", {})
+            node = {**nodes.get(child_id, {}), "activity": text}
+            nodes[child_id] = node
+            return [ev(AgentEventType.AGENT_UPDATED,
+                       dump_payload(AgentUpdatedPayload(
+                           agents=[AgentNodePayload(**node)], patch=True)))]
+        if item_type not in ("commandExecution", "mcpToolCall", "fileChange",
+                             "dynamicToolCall", "collabToolCall",
+                             "collabAgentToolCall", "subAgentActivity"):
+            return []
+        events = cls._map_item(
+            ev, params, ctx, started=method == "item/started")
+        for event in events:
+            event.payload.setdefault("native", {}).update({
+                "child_thread_id": child_id, "child_turn_id": params.get("turnId"),
+            })
+            if event.event_type in (AgentEventType.TOOL_STARTED,
+                                    AgentEventType.TOOL_COMPLETED):
+                event.payload["agent_id"] = child_id
+        return events
 
     @staticmethod
     def _map_item(
@@ -2128,8 +2773,9 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                             "title": previous.get("title") or agent_id,
                             "call_id": call_id if new_work else previous.get("call_id") or call_id}
                     if new_work:
-                        node.pop("result", None)
-                        node.pop("error", None)
+                        # Explicit None: agent-tree patches merge by key.
+                        node["result"] = None
+                        node["error"] = None
                         if previous:
                             node["request"] = None  # metadata.preview is the first task, not this followup
                         node["status"] = "pending"
@@ -2168,8 +2814,9 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                     node = {**previous, "agent_id": agent_id, "title": path,
                             "call_id": call_id if new_work else previous.get("call_id") or call_id}
                     if new_work:
-                        node.pop("result", None)
-                        node.pop("error", None)
+                        # Explicit None: agent-tree patches merge by key.
+                        node["result"] = None
+                        node["error"] = None
                         if previous:
                             node["request"] = None
                     if "parent_id" not in node:
@@ -2187,9 +2834,10 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                         ctx.setdefault("agent_activity", {})[agent_id] = call_id
                         nodes[agent_id] = node
                         changed.append(node)
-            return [ev(AgentEventType.AGENT_UPDATED, {
-                "agents": changed, "patch": True, "adapter_id": "codex.app_server",
-            })] if changed else []
+            return [ev(AgentEventType.AGENT_UPDATED,
+                       dump_payload(AgentUpdatedPayload(
+                           agents=[AgentNodePayload(**node) for node in changed],
+                           patch=True)))] if changed else []
         if item_type in ("commandExecution", "mcpToolCall", "fileChange",
                          "dynamicToolCall", "collabToolCall"):
             tool_name = {
@@ -2200,31 +2848,57 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             if started:
                 if item_type == "fileChange":
                     _cache_file_change_item(ctx, item if isinstance(item, dict) else {})
-                return [ev(AgentEventType.TOOL_STARTED, {
-                    "tool": tool_name, "call_id": call_id,
-                    "input": str(item.get("command")
-                                 or item.get("arguments") or ""),
-                })]
+                return [ev(AgentEventType.TOOL_STARTED,
+                           dump_payload(ToolPayload(
+                               tool_call_id=call_id,
+                               name=tool_name,
+                               input=str(item.get("command")
+                                         or item.get("arguments") or ""),
+                               status="running",
+                               kind=("mcp" if item_type == "mcpToolCall"
+                                     else "command"
+                                     if item_type == "commandExecution"
+                                     else "file_change"
+                                     if item_type == "fileChange" else None),
+                               native=({"mcp_server": str(item["server"])}
+                                       if item_type == "mcpToolCall"
+                                       and item.get("server") else {}),
+                           )))]
             if item_type == "fileChange":
                 # Refresh cache on completed so late/retry previews stay accurate.
                 _cache_file_change_item(ctx, item if isinstance(item, dict) else {})
             output = (item.get("aggregatedOutput") or item.get("output")
-                      or item.get("result") or "")
-            return [ev(AgentEventType.TOOL_COMPLETED, {
-                "tool": tool_name, "call_id": call_id,
-                "output": str(output),
-                "exit_code": item.get("exitCode"),
-                "status": item.get("status"),
-            })]
+                      or _mcp_result_text(item.get("result")) or "")
+            return [ev(AgentEventType.TOOL_COMPLETED,
+                       dump_payload(ToolPayload(
+                           tool_call_id=call_id,
+                           name=tool_name,
+                           output=str(output),
+                           exit_code=(item.get("exitCode")
+                                      if isinstance(item.get("exitCode"), int)
+                                      else None),
+                           status=("failed"
+                                   if str(item.get("status") or "") == "failed"
+                                   else "completed"),
+                           native={"native_status": item.get("status")},
+                       )))]
         if item_type == "agentMessage" and item.get("delivery") == "async" and item.get("questions"):
             if started or not call_id or call_id in ctx.setdefault("async_question_ids", set()):
                 return []
             ctx["async_question_ids"].add(call_id)
-            pending = normalize_pending_user_input({
-                "request_id": call_id, "user_input_kind": "codex_async",
-                "asynchronous": True, "message": str(item.get("text") or ""),
-                "questions": item["questions"],
-            })
+            pending = dump_payload(UserInputRequestedPayload(
+                request_id=call_id,
+                user_input_kind="codex_async",
+                message=str(item.get("text") or "") or None,
+                questions=[
+                    normalized
+                    for i, raw in enumerate(item["questions"])
+                    if (normalized := normalize_question(raw, index=i))
+                    is not None
+                ] if isinstance(item["questions"], list) else [],
+                response_actions=["submit", "cancel"],
+                native={"asynchronous": True},
+            ))
             futures = ctx.setdefault("user_inputs", {})
             queued = any(not future.done() for future in futures.values())
             futures[call_id] = asyncio.get_running_loop().create_future()
@@ -2254,16 +2928,15 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         if item_type == "reasoning" and not started:
             summary = "\n".join(
                 str(part) for part in (item.get("summary") or []) if str(part)
-            )[:2000]
+            )
             streamed = str(
                 (ctx.get("reasoning_summaries") or {}).get(call_id) or ""
             )
             if summary and not streamed:
-                return [ev(AgentEventType.REASONING_SUMMARY, {
-                    "text": summary,
-                    "item_id": call_id,
-                    "delta": False,
-                })]
+                return [ev(AgentEventType.REASONING_SUMMARY,
+                           dump_payload(ReasoningPayload(
+                               text=summary, channel="summary",
+                               item_id=call_id or None)))]
             return []
         return []
 
@@ -2273,6 +2946,9 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         self, session: AgentSessionRef, input: AgentInput
     ) -> CommandReceipt:
         """turn/steer：向进行中的 turn 追加输入（不产生新 turn/started）。"""
+        if not isinstance(input, SteerInput):
+            return self.unsupported_receipt(
+                "steer", "steer", session=session, detail={"input_kind": input.kind})
         ctx = self._runs.get(session.agent_session_id)
         if ctx is None or not ctx["conn"].alive:
             return self.unsupported_receipt("steer", "steer", session=session)
@@ -2286,11 +2962,9 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             # turn/steer 的前置条件是 Codex App Server 的原生 turn id。
             # Conversation Turn id 只在 Muteki 聚合内使用，不能传到这里。
             "expectedTurnId": str(turn_id),
-            "input": codex_turn_input(input.text, input.payload),
+            "input": codex_turn_input(input.text, input.payload.attachments),
         }
-        client_message_id = str(
-            input.payload.get("client_user_message_id") or ""
-        ).strip()
+        client_message_id = input.payload.client_user_message_id.strip()
         if client_message_id:
             params["clientUserMessageId"] = client_message_id
         try:
@@ -2298,13 +2972,14 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         except JsonRpcError as exc:
             return self.unsupported_receipt(
                 "steer", "steer_rejected", session=session,
-                detail={"code": exc.code, "message": exc.message[:200]})
+                detail={"code": exc.code, "message": exc.message})
         return CommandReceipt(
             command_id=new_id("cmd"), state=ReceiptState.COMPLETED,
             aggregate=AggregateRef(type="agent_session",
                                    id=session.agent_session_id))
 
     async def interrupt(self, session: AgentSessionRef) -> CommandReceipt:
+        self._mark_turn_interrupted(session.agent_session_id)
         """turn/interrupt：turn 以 status=interrupted 结束（真实事件）。"""
         ctx = self._runs.get(session.agent_session_id)
         if ctx is None or not ctx["conn"].alive:
@@ -2331,7 +3006,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         except JsonRpcError as exc:
             return self.unsupported_receipt(
                 "interrupt", "interrupt_rejected", session=session,
-                detail={"code": exc.code, "message": exc.message[:200]})
+                detail={"code": exc.code, "message": exc.message})
 
         # app-server 的 server request 与普通 notification 共用同一条消费
         # 协程。Turn 停在审批或用户输入时，turn/interrupt 虽然已经成功，
@@ -2359,14 +3034,34 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             aggregate=AggregateRef(type="agent_session",
                                    id=session.agent_session_id))
 
-    async def fork_thread(self, session: AgentSessionRef) -> dict[str, Any]:
-        """thread/fork：从当前 thread 分叉（fork 后 sessionId 保持根 id）。"""
+    async def fork_thread(
+        self, session: AgentSessionRef, *, target_request: Optional[SessionStart] = None,
+    ) -> dict[str, Any]:
+        """Create the fork on its target connection, as T3 does.
+
+        Without a target, the native fork remains on this shared app-server.
+        Supplying a target binds its own provider environment, cwd and MCP
+        grant before ``thread/fork``; an existing writer is never migrated.
+        """
         ctx = self._runs.get(session.agent_session_id)
         if ctx is None or not ctx["conn"].alive:
             raise RuntimeError("session is not active on this adapter")
+        if target_request is not None:
+            target = target_request.model_copy(update={
+                "resume_handle": None,
+                "options": target_request.options.model_copy(update={"fork_from": ctx["thread_id"]}),
+            })
+            ref = await self.start(target)
+            fork_ctx = self._runs[ref.agent_session_id]
+            return {"thread_id": fork_ctx["thread_id"], "root_session_id": fork_ctx["root_session_id"],
+                    "agent_session_id": ref.agent_session_id, "session_ref": ref.model_dump(mode="json")}
         result = await ctx["conn"].request(
-            M_THREAD_FORK, {"threadId": ctx["thread_id"]}, timeout=60)
+            M_THREAD_FORK,
+            {"threadId": ctx["thread_id"], "excludeTurns": True}, timeout=60)
         thread = (result or {}).get("thread") or {}
+        fork_id = str(thread.get("id") or "")
+        if fork_id:
+            self._fork_connections[fork_id] = ctx["conn"]
         return {
             "thread_id": str(thread.get("id") or ""),
             "root_session_id": str(thread.get("sessionId") or ""),
@@ -2377,12 +3072,36 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
         ctx = self._runs.get(session.agent_session_id)
         if ctx is None or not ctx["conn"].alive:
             raise RuntimeError("session is not active on this adapter")
-        result = await ctx["conn"].request(M_MCP_STATUS, {}, timeout=30)
-        return list((result or {}).get("data") or [])
+        rows: list[dict[str, Any]] = []
+        cursor = None
+        seen: set[str] = set()
+        while True:
+            result = await ctx["conn"].request(M_MCP_STATUS, {
+                "threadId": ctx["thread_id"], **({"cursor": cursor} if cursor else {}),
+            }, timeout=30)
+            rows.extend(list((result or {}).get("data") or []))
+            cursor = (result or {}).get("nextCursor")
+            if not cursor:
+                return rows
+            if cursor in seen:
+                error = RuntimeError("Codex MCP inventory repeated its pagination cursor")
+                error.code = "codex.mcp.cursor_invalid"
+                raise error
+            seen.add(cursor)
+
+    async def _thread_has_active_turn(self, ctx: dict[str, Any]) -> bool:
+        result = await ctx["conn"].request(
+            "thread/read", {"threadId": ctx["thread_id"], "includeTurns": True}, timeout=30)
+        turns = ((result or {}).get("thread") or {}).get("turns") or []
+        return any(turn.get("status") == "inProgress" for turn in turns)
+
+    def supports_native_rewind(self, session: AgentSessionRef) -> bool:
+        return (session.agent_session_id in self._runs
+                and bool({"thread/revert", "thread/rollback"}.intersection(self._client_request_methods)))
 
     async def rewind_session(self, session: AgentSessionRef, native_turn_id: str) -> dict[str, Any]:
         ctx = self._runs.get(session.agent_session_id)
-        if not ctx or not {"thread/revert", "thread/rollback"}.intersection(self._client_request_methods):
+        if not ctx or not self.supports_native_rewind(session):
             raise RuntimeError("当前 Codex 未提供历史回退接口")
         conn = ctx["conn"]
         if "thread/revert" in self._client_request_methods:
@@ -2433,7 +3152,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             compact_turn = None
             async with asyncio.timeout(180):
                 while True:
-                    kind, message = await conn.incoming.get()
+                    kind, message = await ctx["incoming"].get()
                     if kind == "eof":
                         raise RuntimeError("Codex 在压缩完成前断开连接")
                     if kind != "notification":
@@ -2534,7 +3253,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                             },
                         ))
             except (JsonRpcError, asyncio.TimeoutError) as exc:
-                diagnostics.append(f"skills/list 读取失败：{str(exc)[:160]}")
+                diagnostics.append(f"skills/list 读取失败：{exc}")
 
         operations = {
             "rewind": ("thread/revert" if "thread/revert" in self._client_request_methods else "thread/rollback", "回退 Codex 原生会话与聊天记录；保留工作区文件"),
@@ -2623,7 +3342,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
                     ))
             except (JsonRpcError, asyncio.TimeoutError) as exc:
                 diagnostics.append(
-                    f"mcpServerStatus/list 读取失败：{str(exc)[:160]}")
+                    f"mcpServerStatus/list 读取失败：{exc}")
 
         revision = self._capability_revisions.get(session.agent_session_id, 0) + 1
         self._capability_revisions[session.agent_session_id] = revision
@@ -2639,8 +3358,22 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter):
             return EXIT_CLOSED
         conn: CodexPeer = ctx["conn"]
         had_turn = ctx.get("current_turn_id") is not None
-        returncode = await conn.close()
+        if conn.alive:
+            try:
+                await conn.request(
+                    M_THREAD_UNSUBSCRIBE, {"threadId": ctx["thread_id"]},
+                    timeout=10)
+            except (JsonRpcError, asyncio.TimeoutError) as exc:
+                # Closing the process below ends the subscription anyway.
+                _LOG.warning("codex thread/unsubscribe failed: %s: %s",
+                             type(exc).__name__, exc)
         self._runs.pop(session.agent_session_id, None)
+        conn.release_thread(ctx["thread_id"])
+        if any(run["conn"] is conn for run in self._runs.values()):
+            returncode = 0
+        else:
+            returncode = await conn.close()
+            self._fork_connections = {key: peer for key, peer in self._fork_connections.items() if peer is not conn}
         self._capability_revisions.pop(session.agent_session_id, None)
         if had_turn:
             return classify_exit(cancelled=True)

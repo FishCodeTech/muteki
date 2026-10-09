@@ -11,8 +11,9 @@
   请求关联、反向请求应答）。
 - ``acp``：ACP v1 transport 与 ``BaseAcpAdapter``（replay/live 区分、
   mcpServers 注入、request_permission 审批策略）。
-- ``cursor`` / ``grok`` / ``pi_acp``：RUNTIME-03 的结构化 Adapter
-  （Cursor、Grok 默认走 ACP；Pi ACP 仅保留为显式兼容入口）。
+- ``cursor`` / ``cursor_sdk`` / ``grok`` / ``pi_acp``：RUNTIME-03 的结构化 Adapter
+  （Grok 默认走 ACP；Pi ACP 仅保留为显式兼容入口）。
+  Cursor chat 默认是 ``cursor.sdk``；``cursor.acp`` 保留为显式变体。
 - ``codex``：Codex app-server stdio JSON-RPC 结构化 Adapter（RUNTIME-02）。
 - ``claude``：Claude Agent SDK 结构化 Adapter（RUNTIME-02）。
 - ``opencode`` / ``kimi`` / ``omp``：RUNTIME-04
@@ -45,7 +46,9 @@ from .capabilities import (
 from .claude import ClaudeSDKAdapter
 from .codex import CodexAppServerAdapter
 from .cursor import CursorAcpAdapter
+from .cursor_sdk import CursorSdkAdapter
 from .devin import DevinAcpAdapter
+from .droid_acp import DroidAcpAdapter
 from .events import EventSequencer, build_event
 from .factory import (
     DEFAULT_ADAPTER_BY_ENGINE,
@@ -76,6 +79,23 @@ from .sessions import (
     classify_exit,
 )
 
+
+class ExternalAgentDependencyError(RuntimeError):
+    code = "droid.sdk_missing"
+
+
+def __getattr__(name: str):
+    if name != "DroidRpcAdapter":
+        raise AttributeError(name)
+    try:
+        from .droid import DroidRpcAdapter
+    except ModuleNotFoundError as exc:
+        if exc.name == "droid_sdk" or (exc.name or "").startswith("droid_sdk."):
+            raise ExternalAgentDependencyError("Droid RPC requires droid-sdk==0.5.0; install the project's declared dependencies") from exc
+        raise
+    globals()[name] = DroidRpcAdapter
+    return DroidRpcAdapter
+
 __all__ = [
     "ACP_PROTOCOL_VERSION",
     "AdapterIdentity",
@@ -90,7 +110,10 @@ __all__ = [
     "ClaudeSDKAdapter",
     "CodexAppServerAdapter",
     "CursorAcpAdapter",
+    "CursorSdkAdapter",
     "DevinAcpAdapter",
+    "DroidAcpAdapter",
+    "DroidRpcAdapter",
     "EXIT_CLOSED",
     "EXIT_FAILED",
     "EXIT_INTERRUPTED",

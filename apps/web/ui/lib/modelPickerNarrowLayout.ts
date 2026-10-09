@@ -1,36 +1,24 @@
 /**
  * #200 — narrow model-picker layout math (redesign Agent UI).
- * At ≤480px the endpoint/agent rail stacks above the model list so long
- * gpt-5.3-codex-* ids stay distinguishable; desktop dual-pane unchanged.
+ * At ≤480px model rows wrap long gpt-5.3-codex-* ids instead of truncating
+ * them and drop the ⌘1–9 hints, so near-identical ids stay distinguishable.
  */
 
 export const NARROW_MODEL_PICKER_MAX_PX = 480;
 export const NARROW_MODEL_PICKER_MQ = `(max-width: ${NARROW_MODEL_PICKER_MAX_PX}px)`;
 
-/** Redesign left rail width (credentials + favorites). */
-export const MODEL_PICKER_RAIL_WIDTH_PX = 172;
-
 /**
  * Popover width from ConversationModelPicker:
- * `w-[min(480px,calc(100vw-16px))]`.
+ * `w-[min(400px,calc(100vw-16px))]`. Agent tabs sit above the list, so the
+ * model column spans the whole popover.
  */
 export function modelPickerPopoverWidth(viewportPx: number): number {
-  return Math.min(480, Math.max(0, viewportPx - 16));
+  return Math.min(400, Math.max(0, viewportPx - 16));
 }
 
-/**
- * Approximate model-list column width (px).
- * Before #200, ≤480 kept the side-by-side 172px rail; after, stacked rail
- * frees the full popover width for the model column.
- */
-export function modelPickerModelColumnWidth(
-  viewportPx: number,
-  opts: { narrowStacked?: boolean } = {},
-): number {
-  const popover = modelPickerPopoverWidth(viewportPx);
-  const narrowStacked = opts.narrowStacked ?? viewportPx <= NARROW_MODEL_PICKER_MAX_PX;
-  if (narrowStacked) return Math.max(0, popover);
-  return Math.max(0, popover - MODEL_PICKER_RAIL_WIDTH_PX);
+/** Approximate model-list column width (px). */
+export function modelPickerModelColumnWidth(viewportPx: number): number {
+  return modelPickerPopoverWidth(viewportPx);
 }
 
 /** True when two ids that share a long prefix stay distinguishable at this width. */

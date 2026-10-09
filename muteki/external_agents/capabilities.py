@@ -15,10 +15,16 @@ probe 原则：
 
 from __future__ import annotations
 
+import asyncio
+import errno
+import os
+import signal
 import subprocess
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import Any
+from enum import Enum
+from typing import Any, Mapping, Sequence
 
 from muteki.platform.contracts.base import utcnow
 from muteki.platform.contracts.capabilities import InjectionKind
@@ -35,8 +41,57 @@ BOOL_CAPABILITY_FIELDS = (
     "fork", "structured_output", "subagents", "skills", "mcp",
     "native_tool_binding", "acp_mcp_config", "agent_plugin",
     "structured_http_rpc", "tool_events", "usage_events",
-    "session_persistence", "plan", "image_input",
+    "session_persistence", "plan", "plan_mode", "image_input", "compaction",
 )
+
+
+class AccessModeUnsupportedError(ValueError):
+    """A session requested an access mode the adapter cannot honor natively.
+
+    Raised at launch instead of silently substituting another mode, so the
+    caller sees which modes this adapter actually enforces.
+    """
+
+    code = "external_agent.access_mode_unsupported"
+
+    def __init__(
+        self,
+        adapter_id: str,
+        access_mode: str,
+        supported: "tuple[str, ...] | list[str]",
+        reason: str = "",
+    ) -> None:
+        self.adapter_id = adapter_id
+        self.access_mode = access_mode
+        self.supported = tuple(supported)
+        self.reason = reason
+        message = (
+            f"[{self.code}] {adapter_id} does not support access mode "
+            f"{access_mode!r}; supported: {', '.join(self.supported) or 'none'}"
+        )
+        if reason:
+            message = f"{message}. {reason}"
+        super().__init__(message)
+
+
+def require_access_mode(
+    adapter_id: str,
+    access_mode: "str | None",
+    supported: "tuple[str, ...] | list[str]",
+    *,
+    reasons: "dict[str, str] | None" = None,
+) -> None:
+    """Raise ``AccessModeUnsupportedError`` unless ``access_mode`` is honored.
+
+    ``None``/empty means the caller did not choose a Conversation access mode
+    (Worker launches); adapters keep their unattended behavior for it.
+    """
+    if not access_mode or access_mode in supported:
+        return
+    raise AccessModeUnsupportedError(
+        adapter_id, access_mode, supported,
+        (reasons or {}).get(access_mode, ""),
+    )
 
 
 @dataclass
@@ -88,8 +143,195 @@ def _defined_by(instance: Any, method: str) -> str:
     return ""
 
 
+#: Upper bound for one read-only probe command (``--version``, login status).
+PROBE_COMMAND_TIMEOUT_S = 15.0
+
+
+class ProbeCommandErrorCode(str, Enum):
+    """Stable codes for a failed probe command; callers branch on these."""
+
+    NOT_INSTALLED = "probe.command.not_installed"
+    LAUNCH_FAILED = "probe.command.launch_failed"
+    TIMEOUT = "probe.command.timeout"
+    NONZERO_EXIT = "probe.command.nonzero_exit"
+    EMPTY_OUTPUT = "probe.command.empty_output"
+
+
+@dataclass(frozen=True)
+class ProbeCommandResult:
+    """Complete record of one probe command, including full stdout/stderr."""
+
+    argv: tuple[str, ...]
+    returncode: int | None
+    stdout: str
+    stderr: str
+    elapsed_s: float
+    error_code: ProbeCommandErrorCode | None = None
+    error_detail: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.error_code is None
+
+    @property
+    def version(self) -> str:
+        """First non-empty output line of a successful version command.
+
+        This parses the version token; the complete output stays on
+        ``stdout``/``stderr``.
+        """
+        if self.returncode != 0:
+            return ""
+        for stream in (self.stdout, self.stderr):
+            for line in stream.splitlines():
+                if line.strip():
+                    return line.strip()
+        return ""
+
+    def describe(self) -> str:
+        """Human-readable failure with the full captured output."""
+        if self.ok:
+            return ""
+        parts = [f"[{self.error_code.value}] {' '.join(self.argv)}: {self.error_detail}"]
+        if self.stdout.strip():
+            parts.append(f"stdout:\n{self.stdout.strip()}")
+        if self.stderr.strip():
+            parts.append(f"stderr:\n{self.stderr.strip()}")
+        return "\n".join(parts)
+
+
+def _kill_probe_group(proc: "asyncio.subprocess.Process") -> None:
+    # The child is unreaped (returncode is None), so its pid and process
+    # group cannot have been reused; npm/node shims leave grandchildren in it.
+    if proc.returncode is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+
+
+#: After killing a timed-out probe group, how long to wait for its pipes.
+_PROBE_PIPE_DRAIN_S = 5.0
+
+
+async def _drain_after_kill(
+    communicate: "asyncio.Future[tuple[bytes, bytes]]",
+) -> tuple[bytes, bytes, str]:
+    done, _ = await asyncio.wait({communicate}, timeout=_PROBE_PIPE_DRAIN_S)
+    if done:
+        stdout_b, stderr_b = communicate.result()
+        return stdout_b, stderr_b, ""
+    # A descendant that left the process group still holds the pipes.
+    communicate.cancel()
+    return b"", b"", (
+        f"; output pipes still open {_PROBE_PIPE_DRAIN_S:g}s after the kill "
+        "(a descendant left the process group), captured output unavailable")
+
+
+async def run_probe_command(
+    argv: Sequence[str],
+    *,
+    timeout: float = PROBE_COMMAND_TIMEOUT_S,
+    env: Mapping[str, str] | None = None,
+    cwd: str | None = None,
+) -> ProbeCommandResult:
+    """Run one read-only probe command without blocking the event loop.
+
+    ``env=None`` uses the probe environment of the current task
+    (``probe_environment.subprocess_environment``); an explicit mapping is
+    passed to the child unchanged.  The child runs in its own session so a
+    timeout kills the whole process group.  Failures are returned as typed
+    results, never raised.
+    """
+    command = tuple(str(item) for item in argv)
+    started = time.monotonic()
+    if not command or not command[0]:
+        return ProbeCommandResult(
+            argv=command, returncode=None, stdout="", stderr="", elapsed_s=0.0,
+            error_code=ProbeCommandErrorCode.NOT_INSTALLED,
+            error_detail="no executable configured")
+    if env is None:
+        from .probe_environment import subprocess_environment
+        child_env: dict[str, str] | None = subprocess_environment()
+    else:
+        child_env = dict(env)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=child_env,
+            cwd=cwd or None,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        missing = isinstance(exc, FileNotFoundError) or exc.errno == errno.ENOENT
+        return ProbeCommandResult(
+            argv=command, returncode=None, stdout="", stderr="",
+            elapsed_s=time.monotonic() - started,
+            error_code=(ProbeCommandErrorCode.NOT_INSTALLED if missing
+                        else ProbeCommandErrorCode.LAUNCH_FAILED),
+            error_detail=f"{type(exc).__name__}: {exc}")
+    communicate = asyncio.ensure_future(proc.communicate())
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(
+            asyncio.shield(communicate), timeout=timeout)
+    except asyncio.TimeoutError:
+        _kill_probe_group(proc)
+        stdout_b, stderr_b, drain_note = await _drain_after_kill(communicate)
+        await proc.wait()
+        return ProbeCommandResult(
+            argv=command, returncode=proc.returncode,
+            stdout=stdout_b.decode("utf-8", errors="replace"),
+            stderr=stderr_b.decode("utf-8", errors="replace"),
+            elapsed_s=time.monotonic() - started,
+            error_code=ProbeCommandErrorCode.TIMEOUT,
+            error_detail=f"exceeded {timeout:g}s; process group killed{drain_note}")
+    except asyncio.CancelledError:
+        _kill_probe_group(proc)
+        await asyncio.shield(_drain_after_kill(communicate))
+        raise
+    stdout = stdout_b.decode("utf-8", errors="replace")
+    stderr = stderr_b.decode("utf-8", errors="replace")
+    elapsed = time.monotonic() - started
+    if proc.returncode != 0:
+        return ProbeCommandResult(
+            argv=command, returncode=proc.returncode, stdout=stdout,
+            stderr=stderr, elapsed_s=elapsed,
+            error_code=ProbeCommandErrorCode.NONZERO_EXIT,
+            error_detail=f"exit code {proc.returncode}")
+    return ProbeCommandResult(
+        argv=command, returncode=proc.returncode, stdout=stdout,
+        stderr=stderr, elapsed_s=elapsed)
+
+
+async def probe_version(
+    argv: str | Sequence[str],
+    *,
+    timeout: float = PROBE_COMMAND_TIMEOUT_S,
+    env: Mapping[str, str] | None = None,
+) -> ProbeCommandResult:
+    """Run ``<binary> --version`` (a bare string) or a declared version argv.
+
+    A zero exit without any output is ``EMPTY_OUTPUT``: the binary ran but
+    reported no version, which is not a healthy probe.
+    """
+    command = [argv, "--version"] if isinstance(argv, str) else list(argv)
+    result = await run_probe_command(command, timeout=timeout, env=env)
+    if result.ok and not result.version:
+        return replace(
+            result, error_code=ProbeCommandErrorCode.EMPTY_OUTPUT,
+            error_detail="command exited 0 without printing a version")
+    return result
+
+
 def _probe_version_argv(argv: list[str], *, timeout: float = 15.0) -> str:
-    """运行 Driver 声明的只读版本命令；失败返回空串。"""
+    """Synchronous version probe kept for adapters not yet on ``probe_version``.
+
+    It blocks the calling thread; async code should await ``probe_version``.
+    """
     try:
         from .probe_environment import subprocess_environment
         result = subprocess.run(
@@ -100,7 +342,7 @@ def _probe_version_argv(argv: list[str], *, timeout: float = 15.0) -> str:
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return ""
     text = (result.stdout or result.stderr or "").strip().splitlines()
-    return text[0].strip()[:120] if result.returncode == 0 and text else ""
+    return text[0].strip() if result.returncode == 0 and text else ""
 
 
 def _probe_version(binary: str, *, timeout: float = 15.0) -> str:
@@ -114,7 +356,26 @@ def probe_cli_driver(
     adapter_id: str = "",
     instance_id: str = "default",
     include_models: bool = False,
-    version_timeout: float = 15.0,
+    version_timeout: float = PROBE_COMMAND_TIMEOUT_S,
+) -> CapabilityProbeReport:
+    """Synchronous boundary for thread callers; runs ``probe_cli_driver_async``.
+
+    Raises ``RuntimeError`` when called on a running event loop; async code
+    awaits ``probe_cli_driver_async`` directly.
+    """
+    return asyncio.run(probe_cli_driver_async(
+        driver, adapter_id=adapter_id, instance_id=instance_id,
+        include_models=include_models, version_timeout=version_timeout,
+    ))
+
+
+async def probe_cli_driver_async(
+    driver: Any,
+    *,
+    adapter_id: str = "",
+    instance_id: str = "default",
+    include_models: bool = False,
+    version_timeout: float = PROBE_COMMAND_TIMEOUT_S,
 ) -> CapabilityProbeReport:
     """对现有 ``CliDriver`` 做行为级 capability probe（CLI 兼容路径）。
 
@@ -145,17 +406,18 @@ def probe_cli_driver(
     try:
         binary = str(driver.bin)
     except Exception as exc:  # noqa: BLE001
-        degradations.append(f"binary 解析失败：{str(exc)[:120]}")
+        degradations.append(f"binary 解析失败：{exc}")
 
     version_argv = (
         list(driver.version_argv())
         if binary and callable(getattr(driver, "version_argv", None))
         else [binary, "--version"] if binary else []
     )
-    version = (
-        _probe_version_argv(version_argv, timeout=version_timeout)
-        if version_argv else ""
+    version_result = (
+        await probe_version(version_argv, timeout=version_timeout)
+        if version_argv else None
     )
+    version = version_result.version if version_result is not None and version_result.ok else ""
     probed = bool(binary and version)
 
     def mark(field_name: str, value: bool, source: str) -> bool:
@@ -198,8 +460,10 @@ def probe_cli_driver(
         try:
             argv = driver.build_resume("muteki-probe", sentinel)
             resume_ok = any(sentinel in str(arg) for arg in argv)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — recorded as a degradation
             resume_ok = False
+            degradations.append(
+                f"resume argv 构造失败（{type(exc).__name__}: {exc}），resume 未声明")
     caps.resume = mark("resume", resume_ok,
                        SOURCE_PROBE if probed else SOURCE_STATIC)
     caps.session_persistence = mark(
@@ -235,6 +499,12 @@ def probe_cli_driver(
     if not include_models:
         field_sources["supported_models"] = SOURCE_STATIC
 
+    if probed:
+        detail = ""
+    elif version_result is not None:
+        detail = f"--version 失败，使用保守默认：{version_result.describe()}"
+    else:
+        detail = "binary 不可用，使用保守默认"
     return CapabilityProbeReport(
         adapter_id=adapter_id,
         instance_id=instance_id,
@@ -242,7 +512,7 @@ def probe_cli_driver(
         binary_path=binary,
         field_sources=field_sources,
         degradations=degradations,
-        detail="" if probed else "binary 不可用或 --version 失败，使用保守默认",
+        detail=detail,
     )
 
 
@@ -302,13 +572,21 @@ def describe_injection_path(caps: AgentCapabilities) -> dict[str, str]:
 
 
 __all__ = [
+    "AccessModeUnsupportedError",
     "BOOL_CAPABILITY_FIELDS",
     "CapabilityProbeReport",
+    "PROBE_COMMAND_TIMEOUT_S",
+    "ProbeCommandErrorCode",
+    "ProbeCommandResult",
     "SOURCE_PROBE",
     "SOURCE_REPORTED",
     "SOURCE_STATIC",
     "conservative_capabilities",
     "describe_injection_path",
     "probe_cli_driver",
+    "probe_cli_driver_async",
+    "probe_version",
+    "run_probe_command",
+    "require_access_mode",
     "select_injection_kind",
 ]

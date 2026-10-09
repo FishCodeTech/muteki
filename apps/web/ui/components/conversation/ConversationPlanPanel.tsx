@@ -3,7 +3,7 @@
 import { useMemo, useState } from "react";
 import { cn } from "@/lib/cn";
 import { Icon } from "../Icon";
-import { Badge, Button, EmptyState, Input, type Tone } from "@/components/chat/ui";
+import { Badge, Button, CopyButton, EmptyState, Input, type Tone } from "@/components/chat/ui";
 import { TodoList, TodoStatusIcon, type TodoItem, type TodoItemStatus } from "@/components/agentui/agents/todo-list";
 import {
   sendConversationCommand,
@@ -19,6 +19,12 @@ import {
   levelOf,
   matrixFromRuntimeConnection,
 } from "@/lib/interactionCapabilityMatrix";
+import {
+  capabilitiesFor,
+  readyCatalog,
+  useProviderDescriptors,
+  type ProviderDescriptorCatalog,
+} from "@/lib/providerDescriptors";
 
 const PHASE_LABEL: Record<string, string> = {
   proposed: "计划建议",
@@ -41,14 +47,14 @@ export function planPhaseLabel(phase?: string | null): string {
   return PHASE_LABEL[String(phase || "")] || "无计划";
 }
 
-export function planSupportsProvider(view: ConversationView): boolean {
+export function planSupportsProvider(view: ConversationView, catalog: ProviderDescriptorCatalog | null): boolean {
   const matrix = matrixFromRuntimeConnection(view.runtime_connection);
   if (matrix) {
     const level = levelOf(matrix, "plan");
     if (level === "unsupported" || level === "expired") return false;
     if (isDefiniteSupport(matrix, "plan")) return true;
   }
-  return view.runtime_connection?.capabilities?.plan === true;
+  return capabilitiesFor(catalog, `${view.runtime.adapter_id}:${view.runtime.instance_id}`)?.plan === true;
 }
 
 export function planUnsupportedCopy(view: ConversationView): string {
@@ -128,6 +134,11 @@ const PHASE_TONE: Record<string, Tone> = {
   completed: "success",
 };
 
+function planMarkdown(title: string, tasks: PlanTask[]): string {
+  const mark = (status: string) => (status === "completed" ? "x" : status === "cancelled" ? "-" : " ");
+  return [`# ${title}`, "", ...tasks.map((task) => `- [${mark(String(task.status))}] ${task.title}`)].join("\n");
+}
+
 function PlanProgress({ done, total }: { done: number; total: number }) {
   const pct = total ? Math.round((done / total) * 100) : 0;
   return (
@@ -135,7 +146,7 @@ function PlanProgress({ done, total }: { done: number; total: number }) {
       <div className="h-1 flex-1 overflow-hidden rounded-full bg-cx-hover">
         <div className="h-full rounded-full bg-cx-accent transition-[width] duration-500 ease-cx-out" style={{ width: `${pct}%` }} />
       </div>
-      <span className="cx-tabular shrink-0 text-[11.5px] text-cx-fg-3">{done}/{total}</span>
+      <span className="cx-tabular shrink-0 text-[12px] text-cx-fg-3">{done}/{total}</span>
     </div>
   );
 }
@@ -179,9 +190,12 @@ export function ConversationProposedPlanCard({
         maxHeight={248}
         className="bg-cx-elevated shadow-cx-sm"
       />
-      {phaseCopy || onOpenPlan ? (
+      {phaseCopy || onOpenPlan || plan.tasks.length ? (
         <div className="flex items-center gap-2 px-1">
-          {phaseCopy ? <p className="min-w-0 flex-1 text-[12.5px] leading-5 text-cx-fg-3">{phaseCopy}</p> : <span className="flex-1" />}
+          {phaseCopy ? <p className="min-w-0 flex-1 text-[13px] leading-5 text-cx-fg-3">{phaseCopy}</p> : <span className="flex-1" />}
+          {plan.tasks.length ? (
+            <CopyButton text={() => planMarkdown(plan.title || "执行计划", plan.tasks)} label="复制计划（Markdown）" className="shrink-0" />
+          ) : null}
           {onOpenPlan ? (
             <Button size="xs" variant="ghost" iconRight="panelRightOpen" onClick={onOpenPlan} className="shrink-0 text-cx-fg-3">
               在面板中查看
@@ -202,8 +216,9 @@ export function ConversationPlanPanel({
   tools: ConversationToolRecord[];
   onOpenDetails: (payload: DrawerDetailPayload) => void;
 }) {
+  const descriptors = readyCatalog(useProviderDescriptors());
   const plan = resolveThreadPlan(view);
-  const supported = planSupportsProvider(view);
+  const supported = planSupportsProvider(view, descriptors);
   const [amendment, setAmendment] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -272,15 +287,15 @@ export function ConversationPlanPanel({
         {counts.total ? <PlanProgress done={counts.done} total={counts.total} /> : null}
       </header>
       {plan.last_change_summary ? (
-        <p className="rounded-xl bg-cx-bg-subtle px-3 py-2 text-[12.5px] leading-5 text-cx-fg-2">{plan.last_change_summary}</p>
+        <p className="rounded-xl bg-cx-bg-subtle px-3 py-2 text-[13px] leading-5 text-cx-fg-2">{plan.last_change_summary}</p>
       ) : null}
       {plan.phase === "awaiting_decision" ? (
-        <p className="rounded-xl bg-cx-warning-soft px-3 py-2 text-[12.5px] leading-5 text-cx-fg" role="status">
+        <p className="rounded-xl bg-cx-warning-soft px-3 py-2 text-[13px] leading-5 text-cx-fg" role="status">
           {String(plan.awaiting?.summary || "等待用户输入或审批")}
         </p>
       ) : null}
       {pendingAmendment && typeof pendingAmendment === "object" ? (
-        <p className="rounded-xl border border-dashed border-cx-border-strong px-3 py-2 text-[12.5px] text-cx-fg-3" role="status">
+        <p className="rounded-xl border border-dashed border-cx-border-strong px-3 py-2 text-[13px] text-cx-fg-3" role="status">
           修改尚未获 Runtime 确认：{String((pendingAmendment as { text?: string }).text || "")}
         </p>
       ) : null}
@@ -301,15 +316,15 @@ export function ConversationPlanPanel({
                   <strong className={cn("min-w-0 flex-1 text-[13px] font-medium leading-5", status === "completed" ? "text-cx-fg-3" : "text-cx-fg")}>
                     {task.title}
                   </strong>
-                  <span className="shrink-0 text-[11.5px] leading-5 text-cx-fg-4">{TASK_LABEL[status] || status}</span>
+                  <span className="shrink-0 text-[12px] leading-5 text-cx-fg-4">{TASK_LABEL[status] || status}</span>
                 </div>
                 <div className="mt-0.5 flex items-center gap-2">
-                  <code className="font-cx-mono text-[11px] text-cx-fg-4">{task.task_id}</code>
+                  <code className="font-cx-mono text-[12px] text-cx-fg-4">{task.task_id}</code>
                   {evidenceTool ? (
                     <button
                       type="button"
                       onClick={() => onOpenDetails(toolPayload(evidenceTool))}
-                      className="inline-flex items-center gap-1 text-[11.5px] font-medium text-cx-accent opacity-80 hover:opacity-100"
+                      className="inline-flex items-center gap-1 text-[12px] font-medium text-cx-accent opacity-80 hover:opacity-100"
                     >
                       <Icon name="terminal" size={11} />
                       查看工具日志

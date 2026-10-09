@@ -10,7 +10,7 @@ const ConversationInteractiveTerminal = lazy(
 
 function TerminalLoading() {
   return (
-      <div className="flex flex-1 items-center justify-center gap-2 text-[12.5px] text-cx-fg-3">
+      <div className="flex flex-1 items-center justify-center gap-2 text-[13px] text-cx-fg-3">
         <Spinner size={13} />
         正在启动终端…
       </div>

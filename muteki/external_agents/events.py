@@ -13,8 +13,11 @@
 from __future__ import annotations
 
 import threading
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
+from pydantic import BaseModel
+
+from muteki.platform.contracts.agent_events import dump_payload
 from muteki.platform.contracts.external_agents import (
     AgentEvent,
     AgentEventType,
@@ -52,14 +55,16 @@ def build_event(
     execution_generation: Optional[int] = None,
     turn_id: Optional[str] = None,
     native_type: Optional[str] = None,
-    payload: Optional[dict[str, Any]] = None,
+    payload: Union[BaseModel, dict[str, Any], None] = None,
 ) -> AgentEvent:
     """构造一条统一 AgentEvent：分配序号并保留完整 payload。
 
-    ``native_type`` 保留原生事件类型名；原生负载由调用方放入
-    ``payload["native"]``，未知原生事件只能以私有
-    payload 形式存在，不能扩展核心事件类型集合。
+    ``payload`` 是 ``muteki.platform.contracts.agent_events`` 中该事件类型的
+    payload 模型（或其 dump）；``native_type`` 保留原生事件类型名，引擎
+    私有字段只放 ``payload["native"]``。执行器在边界按契约统一校验。
     """
+    if isinstance(payload, BaseModel):
+        payload = dump_payload(payload)
     return AgentEvent(
         event_type=event_type,
         agent_session_id=agent_session_id,

@@ -323,6 +323,21 @@ CREATE INDEX IF NOT EXISTS idx_effect_receipts_state
 """
 
 
+#: v3 数据修复：旧版 Run / 平台设置 HTTP 入口绕过全局命令路由直接
+#: dispatch，回执写进了 platform.db 却没有登记 command_ledger_index，按
+#: command_id 查回执时找不到领域。platform.db 的 command_receipts 只存
+#: platform 领域的回执，因此按原内容摘要补登记为 platform；已登记的
+#: command_id（含 competition）保持不变。
+_SCHEMA_V3 = """
+INSERT OR IGNORE INTO command_ledger_index
+    (command_id, domain, command_type, aggregate_type, aggregate_id,
+     payload_hash, created_at, updated_at)
+SELECT command_id, 'platform', command_type, aggregate_type, aggregate_id,
+       payload_hash, created_at, updated_at
+FROM command_receipts
+"""
+
+
 @dataclass(frozen=True)
 class Migration:
     """一次单调递增的 schema 迁移。"""
@@ -340,6 +355,7 @@ class Migration:
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, name="core_schema", ddl=_SCHEMA_V1),
     Migration(version=2, name="global_command_and_effect_receipts", ddl=_SCHEMA_V2),
+    Migration(version=3, name="backfill_platform_command_index", ddl=_SCHEMA_V3),
 )
 
 _HISTORY_DDL = """

@@ -16,14 +16,14 @@
 #   ./run.sh web --control-root /tmp/muteki-a/control  override coordinator control state
 #   ./run.sh web --control-port 9299           isolate reverse control receiver
 #   ./run.sh web --host 0.0.0.0               bind address (default 127.0.0.1).
-#                                             Non-loopback REQUIRES MUTEKI_WEB_PASSWORD
+#                                             Non-loopback requires an access password
 #                                             (the backend refuses to start otherwise).
 #   ./run.sh web --ui-host 0.0.0.0            expose only the UI; keep the API on --host.
-#                                             Also requires MUTEKI_WEB_PASSWORD.
+#                                             Use Settings or MUTEKI_WEB_PASSWORD.
 #   MUTEKI_UI_DEV_BUNDLER=webpack ./run.sh web --dev
 #                                             use the legacy Webpack dev bundler.
 #
-# Auth: set MUTEKI_WEB_PASSWORD to require a login password for the web deck.
+# Auth: use Settings > Access and sign-in, or set MUTEKI_WEB_PASSWORD.
 # When set, open http://localhost:3001 and enter it. Leave unset only for a
 # loopback-only (127.0.0.1) single-operator setup.
 #
@@ -113,11 +113,13 @@ run_web() {
     esac
   done
   ui_host="${ui_host:-$host}"
+  export MUTEKI_UI_PORT="$ui_port"
+  export MUTEKI_UI_HOST="$ui_host"
   case "$ui_host" in
     127.0.0.1|localhost|::1) ;;
     *)
-      if [ -z "${MUTEKI_WEB_PASSWORD:-}" ]; then
-        echo "ERROR: exposing the UI on $ui_host requires MUTEKI_WEB_PASSWORD." >&2
+      if ! MUTEKI_WEB_BIND="$ui_host" uv run --no-sync python -c 'import sys; from muteki.core.dotenv_boot import load_env; load_env(); from apps.web.auth import AuthConfig; AuthConfig.from_env(sys.argv[1]).fail_fast_check()' "${state_root:-${MUTEKI_STATE_ROOT:-state}}"; then
+        echo "ERROR: exposing the UI requires an access password from Settings or MUTEKI_WEB_PASSWORD." >&2
         return 1
       fi
       ;;
@@ -333,6 +335,9 @@ run_web() {
       --reload-dir apps/web
       --reload-dir muteki
       --reload-exclude "$ui_dir"
+      # SSE clients stay connected across edits; bound their drain so reload
+      # reaches lifespan shutdown instead of leaving a non-serving listener.
+      --timeout-graceful-shutdown 5
     )
   fi
   # Detach from the launching PTY so a revoked terminal cannot silently drop

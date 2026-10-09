@@ -72,6 +72,12 @@ class StorageLayout:
             runtime_root=state / "runtime",
         )
         layout.validate()
+        environment_root = os.environ.get("MUTEKI_ENVIRONMENT_ROOT")
+        if environment_root:
+            root = _absolute(environment_root)
+            for name, directory in (("state", state), ("sessions", sessions), ("control", control), ("graph", graph)):
+                if directory == root or not _contains(directory, root):
+                    raise ValueError(f"{name} must be inside the selected desktop environment")
         return layout
 
     def validate(self) -> None:

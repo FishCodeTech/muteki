@@ -104,8 +104,8 @@ function AttachmentChip({ attachment, onOpen }: { attachment: MessageAttachmentC
         <Icon name={attachmentIcon(attachment)} size={14} />
       </span>
       <span className="flex min-w-0 flex-col text-left">
-        <span className="max-w-[180px] truncate text-[12.5px] font-medium leading-4 text-cx-fg">{attachment.name}</span>
-        {size ? <span className="text-[11px] leading-4 text-cx-fg-4">{size}</span> : null}
+        <span className="max-w-[180px] truncate text-[13px] font-medium leading-4 text-cx-fg">{attachment.name}</span>
+        {size ? <span className="text-[12px] leading-4 text-cx-fg-4">{size}</span> : null}
       </span>
     </>
   );
@@ -296,7 +296,7 @@ export function ConversationMessage({
               )}
             >
               {label || superseded ? (
-                <div className="mb-1 text-[11px] font-medium text-cx-accent">{superseded ? "已替代" : label}</div>
+                <div className="mb-1 text-[12px] font-medium text-cx-accent">{superseded ? "已替代" : label}</div>
               ) : null}
               {nodes.length > 0 ? (
                 <div className="mb-2 flex flex-wrap gap-1">
@@ -324,7 +324,7 @@ export function ConversationMessage({
             <MessageActionBar align="end" meta={time || undefined} className="-mr-1">
               <CopyMessageButton text={text} label="复制消息" />
               {onEdit ? (
-                <MessageActionButton icon="edit" label="编辑并重发" onClick={onEdit} disabled={actionsDisabled} testId="c11-edit-user" />
+                <MessageActionButton icon="edit" label="从此处编辑" onClick={onEdit} disabled={actionsDisabled} testId="c11-edit-user" />
               ) : null}
             </MessageActionBar>
           ) : null}
@@ -351,7 +351,7 @@ export function ConversationMessage({
           <button
             type="button"
             data-cite-to-composer="1"
-            className="cx-animate-in absolute z-20 inline-flex h-8 items-center gap-1.5 rounded-lg bg-[color-mix(in_srgb,var(--ink)_92%,var(--page))] px-2.5 text-[12.5px] font-medium text-[var(--page)] shadow-cx-md"
+            className="cx-animate-in absolute z-20 inline-flex h-8 items-center gap-1.5 rounded-lg bg-[color-mix(in_srgb,var(--ink)_92%,var(--page))] px-2.5 text-[13px] font-medium text-[var(--page)] shadow-cx-md"
             style={{ top: citeMenu.top, left: citeMenu.left }}
             onMouseDown={(event) => event.preventDefault()}
             onClick={() => {
@@ -371,7 +371,7 @@ export function ConversationMessage({
             {lang === "en" ? "Quote in composer" : "引用到输入框"}
           </button>
         ) : null}
-        {citeError ? <p role="status" className="text-[11px] text-cx-fg-4">{citeError}</p> : null}
+        {citeError ? <p role="status" className="text-[12px] text-cx-fg-4">{citeError}</p> : null}
         <StreamingText
           text={text}
           isStreaming={isStreaming}

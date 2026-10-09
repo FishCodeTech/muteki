@@ -191,7 +191,7 @@ export function ConversationQueue({
     >
       <header className="flex h-9 items-center gap-2 pl-3 pr-1.5">
         <Icon name="rows" size={13} className="shrink-0 text-cx-fg-4" />
-        <h2 className="shrink-0 text-[12.5px] font-medium text-cx-fg-2">排队 {items.length} 条</h2>
+        <h2 className="shrink-0 text-[13px] font-medium text-cx-fg-2">排队 {items.length} 条</h2>
         <p className={cn("min-w-0 flex-1 truncate text-[12px]", paused ? "text-cx-warning" : "text-cx-fg-4")}>
           {paused ? pauseLabel(pauseReason) : "当前回答结束后按顺序自动发送"}
         </p>
@@ -248,7 +248,7 @@ export function ConversationQueue({
                   aria-hidden="true"
                 >
                   <Icon name="gripVertical" size={12} className="hidden group-hover:block" />
-                  <span className="cx-tabular text-[11px] group-hover:hidden">{index + 1}</span>
+                  <span className="cx-tabular text-[12px] group-hover:hidden">{index + 1}</span>
                 </span>
 
                 <div className="min-w-0 flex-1">
@@ -278,7 +278,7 @@ export function ConversationQueue({
                     </p>
                   )}
                   {(fixed || item.status === "failed" || item.attachments.length || item.capability_refs.length) ? (
-                    <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11.5px] text-cx-fg-4">
+                    <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[12px] text-cx-fg-4">
                       {fixed ? <span className="text-cx-accent">正在发送…</span> : null}
                       {item.status === "failed" ? (
                         <span role="status" className="basis-full break-words text-cx-danger">
