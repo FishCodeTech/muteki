@@ -19,8 +19,10 @@ Turn 或重复交付消息。
 
 from __future__ import annotations
 
+import math
 import os
 import re
+import time
 from typing import Any, Optional
 
 from muteki.platform.command_handlers.base import (
@@ -58,6 +60,7 @@ from muteki.platform.contracts.base import new_id
 from muteki.platform.contracts.objects import Project
 
 from . import events as ev
+from .checkpoints import CheckpointError
 from .composer_capabilities import (
     ComposerCapabilityError,
     resolve_capability_refs,
@@ -67,7 +70,13 @@ from .executor import (
     ExternalAgentSessionExecutor,
     _match_runtime_capability,
 )
-from .manager import ConversationError, ConversationManager
+from .manager import (
+    THREAD_NOT_FOUND_CODE,
+    TURN_NOT_FOUND_CODE,
+    ConversationError,
+    ConversationManager,
+    InteractionModeError,
+)
 from .models import (
     TURN_KIND_MESSAGE,
     TURN_RUNNING,
@@ -84,6 +93,7 @@ COMMAND_TYPES = {
     "conversation.thread.create",
     "conversation.thread.rename",
     "conversation.thread.resume",
+    "conversation.thread.quota_resume",
     "conversation.thread.fork",
     "conversation.thread.archive",
     "conversation.thread.unarchive",
@@ -116,6 +126,10 @@ _RUNTIME_INVOCATION_RE = re.compile(
     r"^(?P<prefix>[/\$])(?P<name>[^\s/\\]+)(?:\s+(?P<args>[\s\S]*))?$"
 )
 _INTERNAL_COMMANDS = frozenset({"new", "clear", "clear-input"})
+#: Providers report the reset to the second; retrying right at it often still fails.
+QUOTA_RESUME_GRACE_S = 20.0
+QUOTA_RESUME_MAX_AHEAD_S = 8 * 24 * 3600.0
+QUOTA_RESUME_MAX_PAST_S = 24 * 3600.0
 
 
 def _failed(
@@ -136,6 +150,26 @@ def _failed(
         error,
         state=state,
     )
+
+
+def _explicit_interaction_mode(payload: dict[str, Any]) -> Optional[str]:
+    """Mode the caller set on this command, top-level or inside ``runtime``."""
+    if payload.get("interaction_mode") is not None:
+        return str(payload.get("interaction_mode") or "")
+    runtime = payload.get("runtime")
+    if isinstance(runtime, dict) and runtime.get("interaction_mode") is not None:
+        return str(runtime.get("interaction_mode") or "")
+    return None
+
+
+def _conversation_failure(command: Any, exc: ConversationError, default_code: str) -> CommandFailed:
+    """Map a manager error; typed codes keep their own identity."""
+    if isinstance(exc, InteractionModeError):
+        return _failed(command, exc.code, str(exc), ErrorCategory.VALIDATION,
+                       detail=exc.detail)
+    if exc.code in {THREAD_NOT_FOUND_CODE, TURN_NOT_FOUND_CODE}:
+        return _failed(command, exc.code, str(exc), ErrorCategory.NOT_FOUND)
+    return _failed(command, default_code, str(exc), ErrorCategory.VALIDATION)
 
 
 def _receipt(command: Any, aggregate_type: str, aggregate_id: str,
@@ -192,6 +226,8 @@ class ConversationCommandHandler:
                 return self._plan_thread_rename(command)
             if ct in ("conversation.thread.resume", "conversation.turn.resume"):
                 return self._plan_thread_resume(command)
+            if ct == "conversation.thread.quota_resume":
+                return self._plan_thread_quota_resume(command)
             if ct == "conversation.thread.fork":
                 return self._plan_thread_fork(command)
             if ct == "conversation.thread.archive":
@@ -242,8 +278,7 @@ class ConversationCommandHandler:
                 return self._plan_agents_inject(command)
             return self._plan_plan_amend(command)
         except ConversationError as exc:
-            raise _failed(command, "conversation.invalid", str(exc),
-                          ErrorCategory.VALIDATION) from exc
+            raise _conversation_failure(command, exc, "conversation.invalid") from exc
 
     # -- Project / Workspace -------------------------------------------------------
 
@@ -542,9 +577,17 @@ class ConversationCommandHandler:
         _reject_paused_runtime(command, runtime)
         principal = str(payload.get("principal_id") or command.actor.id or "local-user")
         manager = self._manager
+        # thread.created is committed before the side effect runs, so an invalid
+        # selection must be rejected here or it leaves a projected Thread behind.
+        selection = None
+        if runtime:
+            try:
+                selection = manager._build_runtime_selection(thread.thread_id, runtime)
+            except ConversationError as exc:
+                raise _conversation_failure(command, exc, "conversation.thread.runtime_invalid") from exc
 
         async def _save() -> SideEffectResult:
-            manager.activate_thread(thread, principal, runtime=runtime or None)
+            manager.activate_thread(thread, principal, selection=selection)
             return SideEffectResult()
 
         return CommandPlan(
@@ -593,16 +636,25 @@ class ConversationCommandHandler:
         # 等待审批的旧 Turn 不会被本命令修改。
         runtime_override = dict(command.payload.get("runtime") or {})
         _reject_paused_runtime(command, runtime_override)
+        resume_selection = None
+        if runtime_override:
+            try:
+                resume_selection = self._manager._build_runtime_selection(
+                    thread.thread_id, runtime_override)
+            except ConversationError as exc:
+                raise _conversation_failure(command, exc, "conversation.thread.runtime_invalid") from exc
         turn, run, _task, created = self._manager.request_turn(
             thread.thread_id, text=text, kind="resume",
             command_id=command.command_id,
-            idempotency_key=command.idempotency_key)
+            idempotency_key=command.idempotency_key,
+            interaction_mode=(
+                resume_selection.interaction_mode
+                if resume_selection is not None else None))
         executor = self._executor
 
         async def _start() -> SideEffectResult:
-            if runtime_override:
-                self._manager.save_runtime_selection(
-                    thread.thread_id, runtime_override)
+            if resume_selection is not None:
+                self._manager.conv.save_runtime_selection(resume_selection)
             if created:
                 executor.start_turn(turn.turn_id)
             return SideEffectResult()
@@ -624,6 +676,7 @@ class ConversationCommandHandler:
                     "seq": turn.seq,
                     "kind": turn.kind,
                     "text": turn.text,
+                    "interaction_mode": turn.interaction_mode,
                 }, actor_id=command.actor.id,
                     command_id=command.command_id,
                     correlation_id=correlation_id_of(command),
@@ -632,6 +685,59 @@ class ConversationCommandHandler:
             receipt=_receipt(command, ev.AGGREGATE_THREAD, thread.thread_id,
                              run_id=turn.run_id),
             side_effect=_start,
+        )
+
+    def _plan_thread_quota_resume(self, command: Any) -> CommandPlan:
+        """Schedule (or cancel) a server-side resume once the provider quota resets."""
+        thread = self._require_thread(command)
+        state = self._manager.conv.get_state(thread.thread_id)
+        enabled = command.payload.get("enabled")
+        if not isinstance(enabled, bool):
+            raise _failed(command, "conversation.quota_resume.enabled_required",
+                          "payload.enabled 必须是布尔值", ErrorCategory.VALIDATION)
+        schedule: Optional[dict[str, Any]] = None
+        if enabled:
+            if state.status == "archived":
+                raise _failed(command, "conversation.thread.archived",
+                              "已归档的对话不能自动继续", ErrorCategory.STATE)
+            current_turns = self._manager.conv.list_current_turns(thread.thread_id)
+            last_turn = current_turns[-1] if current_turns else None
+            if last_turn is None or last_turn.status != "failed":
+                raise _failed(command, "conversation.quota_resume.not_failed",
+                              "只有因额度失败的最新 Turn 可以安排自动继续",
+                              ErrorCategory.STATE)
+            requested_turn = str(command.payload.get("turn_id") or "")
+            if requested_turn and requested_turn != last_turn.turn_id:
+                raise _failed(command, "conversation.quota_resume.turn_changed",
+                              "最新 Turn 已变化，请刷新后重试", ErrorCategory.CONFLICT)
+            resets_at = command.payload.get("resets_at")
+            now = time.time()
+            if (
+                isinstance(resets_at, bool)
+                or not isinstance(resets_at, (int, float))
+                or not math.isfinite(resets_at)
+                or not now - QUOTA_RESUME_MAX_PAST_S <= resets_at <= now + QUOTA_RESUME_MAX_AHEAD_S
+            ):
+                raise _failed(command, "conversation.quota_resume.resets_at_invalid",
+                              "resets_at 必须是过去 1 天到未来 8 天内的 Unix 秒级时间戳",
+                              ErrorCategory.VALIDATION)
+            schedule = {
+                "turn_id": last_turn.turn_id,
+                "resets_at": float(resets_at),
+                "resume_at": float(resets_at) + QUOTA_RESUME_GRACE_S,
+                "kind": str(command.payload.get("kind") or ""),
+                "scheduled_at": now,
+            }
+        return CommandPlan(
+            events=[ev.thread_event(thread.thread_id, ev.EV_THREAD_QUOTA_RESUME_SET, {
+                "thread_id": thread.thread_id,
+                "schedule": schedule,
+                "reason": str(command.payload.get("reason") or ("scheduled" if enabled else "cancelled")),
+            }, actor_id=command.actor.id,
+                command_id=command.command_id,
+                correlation_id=correlation_id_of(command),
+                idempotency_key=command.idempotency_key)],
+            receipt=_receipt(command, ev.AGGREGATE_THREAD, thread.thread_id),
         )
 
     def _plan_turn_retry(self, command: Any) -> CommandPlan:
@@ -648,13 +754,26 @@ class ConversationCommandHandler:
         executor = self._executor
         idem = command.idempotency_key or command.command_id
         text = command.payload.get("text")
-        turn, run, _task, superseded_ids, created = manager.retry_turn(
-            thread.thread_id,
-            turn_id,
-            command_id=command.command_id,
-            idempotency_key=idem,
-            text=None if text is None else str(text),
-        )
+        file_mode = str(command.payload.get("file_mode") or "keep_files")
+        if file_mode not in {"keep_files", "restore_files"}:
+            raise _failed(
+                command,
+                "conversation.turn.invalid_file_mode",
+                "file_mode 只能是 keep_files 或 restore_files",
+                ErrorCategory.VALIDATION,
+            )
+        try:
+            turn, run, _task, superseded_ids, created = manager.retry_turn(
+                thread.thread_id,
+                turn_id,
+                command_id=command.command_id,
+                idempotency_key=idem,
+                text=None if text is None else str(text),
+                restore_files=file_mode == "restore_files",
+                interaction_mode=_explicit_interaction_mode(command.payload),
+            )
+        except CheckpointError as exc:
+            raise _failed(command, exc.code, str(exc), ErrorCategory.STATE) from exc
         is_edit = turn.kind == "edit_resend"
 
         async def _start() -> SideEffectResult:
@@ -664,7 +783,7 @@ class ConversationCommandHandler:
                 "impact": {
                     "mode": "edit_resend" if is_edit else "retry",
                     "superseded_turn_ids": superseded_ids,
-                    "workspace_policy": "keep_files",
+                    "workspace_policy": file_mode,
                     "external_side_effects": "cannot_undo",
                 },
             })
@@ -682,7 +801,7 @@ class ConversationCommandHandler:
                         "superseded_turn_ids": superseded_ids,
                         "generation": run.generation,
                         "edited": is_edit,
-                        "workspace_policy": "keep_files",
+                        "workspace_policy": file_mode,
                         "external_side_effects": "cannot_undo",
                     },
                     actor_id=command.actor.id,
@@ -699,6 +818,7 @@ class ConversationCommandHandler:
                     "retry_of_turn_id": turn.retry_of_turn_id,
                     "text": turn.text,
                     "attachments": list(turn.attachments),
+                    "interaction_mode": turn.interaction_mode,
                 }, actor_id=command.actor.id,
                     command_id=command.command_id,
                     correlation_id=correlation_id_of(command),
@@ -932,6 +1052,12 @@ class ConversationCommandHandler:
                 ErrorCategory.VALIDATION,
             )
         runtime_override = dict(command.payload.get("runtime") or {})
+        if (
+            "interaction_mode" not in runtime_override
+            and command.payload.get("interaction_mode") is not None
+        ):
+            runtime_override["interaction_mode"] = command.payload.get(
+                "interaction_mode")
         _reject_paused_runtime(command, runtime_override)
         manager = self._manager
         executor = self._executor
@@ -939,7 +1065,7 @@ class ConversationCommandHandler:
         adapter_id = str(runtime_override.get("adapter_id") or selection.adapter_id or "")
         launch_identity_fields = (
             "adapter_id", "instance_id", "credential_id", "access_mode",
-            "permission_mode", "sandbox_mode", "model", "effort",
+            "permission_mode", "sandbox_mode", "model", "effort", "service_tier",
         )
         runtime_switch_pending = any(
             key in runtime_override
@@ -1088,6 +1214,26 @@ class ConversationCommandHandler:
         idem = command.idempotency_key or command.command_id
         runtime = selection.model_dump(mode="json")
         runtime.update(runtime_override)
+        if (
+            "interaction_mode" not in runtime_override
+            and (runtime.get("adapter_id") != selection.adapter_id
+                 or runtime.get("instance_id") != selection.instance_id)
+        ):
+            # The stored preference follows a runtime switch only if the new
+            # runtime can plan.
+            runtime["interaction_mode"] = manager.carry_interaction_mode(
+                str(runtime.get("adapter_id") or ""),
+                str(runtime.get("instance_id") or "default"),
+                selection.interaction_mode)
+        if runtime_override or selection.interaction_mode != "default":
+            # Structural check only: credential login state is re-validated when
+            # the queue item is promoted, which may be much later. A stored plan
+            # preference is re-checked here against the capabilities of today.
+            try:
+                manager._build_runtime_selection(
+                    thread.thread_id, runtime, validate_credential=False)
+            except ConversationError as exc:
+                raise _conversation_failure(command, exc, "conversation.turn.runtime_invalid") from exc
         item = QueuedTurnRequest(
             thread_id=thread.thread_id,
             command_id=command.command_id,
@@ -1143,6 +1289,28 @@ class ConversationCommandHandler:
         )
         return plan
 
+    def _require_steer_interaction_mode(
+        self, command: Any, thread_id: str, running_turn_id: str, requested: Any,
+    ) -> None:
+        """A steer continues the running turn, so it cannot change that turn's mode."""
+        if requested is None or str(requested).strip() == "":
+            return
+        mode = str(requested).strip()
+        selection = self._manager.runtime_selection(thread_id)
+        try:
+            self._manager.require_interaction_mode(
+                selection.adapter_id, selection.instance_id or "default", mode)
+        except InteractionModeError as exc:
+            raise _conversation_failure(command, exc, "conversation.invalid") from exc
+        running = self._manager.conv.get_turn(running_turn_id)
+        turn_mode = running.interaction_mode if running is not None else "default"
+        if mode != turn_mode:
+            raise _failed(
+                command, "conversation.turn.interaction_mode_mismatch",
+                "执行中的 Turn 使用的交互模式不同；请作为下一轮消息发送",
+                ErrorCategory.CONFLICT,
+                detail={"turn_interaction_mode": turn_mode, "requested": mode})
+
     def _plan_turn_steer(self, command: Any) -> CommandPlan:
         thread = self._require_thread(command)
         text = str(command.payload.get("text") or "").strip()
@@ -1169,6 +1337,9 @@ class ConversationCommandHandler:
                 "执行中的 Turn 已变化，请刷新后重新引导",
                 ErrorCategory.CONFLICT,
             )
+        self._require_steer_interaction_mode(
+            command, thread.thread_id, state.running_turn_id,
+            command.payload.get("interaction_mode"))
         client_message_id = str(
             command.payload.get("client_message_id") or command.command_id
         )
@@ -1265,8 +1436,7 @@ class ConversationCommandHandler:
                 runtime = self._manager._build_runtime_selection(
                     thread.thread_id, raw_runtime).model_dump(mode="json")
             except ConversationError as exc:
-                raise _failed(command, "conversation.queue.runtime_invalid", str(exc),
-                              ErrorCategory.VALIDATION) from exc
+                raise _conversation_failure(command, exc, "conversation.queue.runtime_invalid") from exc
         capability_refs = None
         if runtime is not None:
             workspace = (
@@ -1442,6 +1612,9 @@ class ConversationCommandHandler:
                 "执行中的 Turn 已变化，请刷新后重新引导",
                 ErrorCategory.CONFLICT,
             )
+        self._require_steer_interaction_mode(
+            command, thread.thread_id, state.running_turn_id,
+            (item.runtime or {}).get("interaction_mode"))
         if item.attachments or item.capability_refs:
             raise _failed(
                 command, "conversation.queue.steer_text_only",
@@ -1502,7 +1675,8 @@ class ConversationCommandHandler:
     def _plan_turn_interrupt(self, command: Any) -> CommandPlan:
         thread = self._require_thread(command)
         state = self._manager.conv.get_state(thread.thread_id)
-        if not state.running_turn_id:
+        target_turn_id = state.running_turn_id or self._executor.background_turn_id(thread.thread_id)
+        if not target_turn_id:
             raise _failed(command, "conversation.turn.not_running",
                           "当前没有执行中的 Turn 可以 interrupt",
                           ErrorCategory.STATE)
@@ -1515,7 +1689,7 @@ class ConversationCommandHandler:
                 "中断请求必须携带当前执行中的 expected_turn_id",
                 ErrorCategory.VALIDATION,
             )
-        if expected_turn_id != state.running_turn_id:
+        if expected_turn_id != target_turn_id:
             raise _failed(
                 command,
                 "conversation.turn.expected_mismatch",
@@ -1523,7 +1697,6 @@ class ConversationCommandHandler:
                 ErrorCategory.CONFLICT,
                 state=ReceiptState.CONFLICT,
             )
-        target_turn_id = state.running_turn_id
         executor = self._executor
         manager = self._manager
 
@@ -1731,6 +1904,19 @@ class ConversationCommandHandler:
                           "该审批正在投递，请恢复原决定的回执", ErrorCategory.CONFLICT)
         executor = self._executor
         decision_payload = approval.to_payload()
+        is_plan_exit = str(pending.get("approval_kind") or "") == "plan_exit"
+        if is_plan_exit and approval.scope.value == "session":
+            raise _failed(command, "conversation.approval.scope_invalid",
+                          "计划确认只能单次决定", ErrorCategory.VALIDATION)
+        if isinstance(pending.get("response_capability"), dict):
+            capability = executor.approval_response_capability(
+                thread.thread_id, pending)
+            if not capability.get("answerable", True):
+                raise _failed(
+                    command, "conversation.approval.unanswerable",
+                    "该审批所属的 Runtime 会话已不可用，无法再答复："
+                    f"{capability.get('reason') or 'unknown'}",
+                    ErrorCategory.STATE, detail=capability)
         if approval.option_id:
             offered = next((row for row in pending.get("options", [])
                             if str(row.get("option_id") or row.get("optionId") or "") == approval.option_id), None)
@@ -1796,6 +1982,11 @@ class ConversationCommandHandler:
                     ),
                     state=ReceiptState.FAILED,
                 )
+            if is_plan_exit and approval.allowed:
+                # Approving the plan leaves plan mode so the next turn can edit.
+                self._manager.save_runtime_selection(
+                    thread.thread_id, {"interaction_mode": "default"},
+                    validate_credential=False)
             return SideEffectResult(events=[ev.thread_event(
                 thread.thread_id, ev.EV_APPROVAL_RESOLVED,
                 decision_payload, actor_id=command.actor.id,
@@ -2404,14 +2595,12 @@ class ConversationThreadViewQueryHandler:
                 include_superseded=bool(query.params.get("include_superseded")),
             )
         except ConversationError as exc:
+            not_found = exc.code in {THREAD_NOT_FOUND_CODE, TURN_NOT_FOUND_CODE}
             category = (
-                ErrorCategory.NOT_FOUND
-                if "unknown" in str(exc).lower()
-                else ErrorCategory.VALIDATION
+                ErrorCategory.NOT_FOUND if not_found else ErrorCategory.VALIDATION
             )
             raise CommandFailed(make_error(
-                "conversation.thread.not_found" if category is ErrorCategory.NOT_FOUND
-                else "conversation.thread.view_invalid",
+                exc.code if not_found else "conversation.thread.view_invalid",
                 str(exc),
                 category, correlation_id=query.query_id)) from exc
         return QueryResult(

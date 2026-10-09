@@ -133,7 +133,7 @@ function ModeToggle({ mode, onChange }: { mode: ViewMode; onChange: (mode: ViewM
       data-testid={testId}
       onClick={() => onChange(value)}
       className={cn(
-        "inline-flex h-5 items-center rounded-md px-2 text-[11.5px] font-medium transition-colors duration-150",
+        "inline-flex h-5 items-center rounded-md px-2 text-[12px] font-medium transition-colors duration-150",
         mode === value
           ? "bg-cx-elevated text-cx-fg shadow-[0_1px_2px_hsl(var(--cx-shadow-color)/0.12),0_0_0_1px_var(--cx-border-subtle)]"
           : "text-cx-fg-3 hover:text-cx-fg",
@@ -174,8 +174,8 @@ function Placeholder({
         <Icon name={icon} size={20} />
       </span>
       <div className="flex max-w-[340px] flex-col gap-1">
-        <p className="text-[13.5px] font-medium text-cx-fg">{title}</p>
-        {message ? <p className="text-[12.5px] leading-5 text-cx-fg-3">{message}</p> : null}
+        <p className="text-[14px] font-medium text-cx-fg">{title}</p>
+        {message ? <p className="text-[13px] leading-5 text-cx-fg-3">{message}</p> : null}
       </div>
       {action ? <div className="mt-1">{action}</div> : null}
     </div>
@@ -258,7 +258,7 @@ export function TypedResourcePreview({
 
   const toolbar = (
     <div className="flex h-9 shrink-0 items-center gap-2 border-b border-cx-border-subtle pl-3 pr-1.5" data-testid="typed-preview-toolbar">
-      <span className="flex min-w-0 flex-1 items-center gap-2 text-[11.5px]">
+      <span className="flex min-w-0 flex-1 items-center gap-2 text-[12px]">
         <span className="inline-flex shrink-0 items-center gap-1.5 font-medium text-cx-fg-2">
           <Icon name={kindIcon(kind)} size={13} className="text-cx-fg-3" />
           {kindLabel(kind, language)}

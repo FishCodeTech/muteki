@@ -118,6 +118,16 @@
           "title": "Plan",
           "type": "boolean"
         },
+        "plan_mode": {
+          "default": false,
+          "title": "Plan Mode",
+          "type": "boolean"
+        },
+        "plan_mode_per_turn": {
+          "default": true,
+          "title": "Plan Mode Per Turn",
+          "type": "boolean"
+        },
         "protocol_version": {
           "default": "",
           "title": "Protocol Version",
@@ -126,6 +136,11 @@
         "resume": {
           "default": false,
           "title": "Resume",
+          "type": "boolean"
+        },
+        "resume_continues_turn": {
+          "default": true,
+          "title": "Resume Continues Turn",
           "type": "boolean"
         },
         "runtime_plugin_binding": {
@@ -353,34 +368,6 @@
       ],
       "title": "AgentEventType",
       "type": "string"
-    },
-    "AgentInput": {
-      "additionalProperties": false,
-      "description": "发送给 Agent Session 的一次输入（消息、steer、approval 答复等）。",
-      "properties": {
-        "kind": {
-          "default": "message",
-          "title": "Kind",
-          "type": "string"
-        },
-        "payload": {
-          "additionalProperties": true,
-          "title": "Payload",
-          "type": "object"
-        },
-        "schema_version": {
-          "default": 1,
-          "title": "Schema Version",
-          "type": "integer"
-        },
-        "text": {
-          "default": "",
-          "title": "Text",
-          "type": "string"
-        }
-      },
-      "title": "AgentInput",
-      "type": "object"
     },
     "AgentSession": {
       "additionalProperties": false,
@@ -668,6 +655,97 @@
       "title": "AggregateRef",
       "type": "object"
     },
+    "ApprovalResponseInput": {
+      "additionalProperties": false,
+      "description": "Operator verdict for a pending approval request.",
+      "properties": {
+        "kind": {
+          "const": "approval_response",
+          "default": "approval_response",
+          "title": "Kind",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/ApprovalResponsePayload"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "text": {
+          "default": "",
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "payload"
+      ],
+      "title": "ApprovalResponseInput",
+      "type": "object"
+    },
+    "ApprovalResponsePayload": {
+      "additionalProperties": false,
+      "properties": {
+        "approval_id": {
+          "minLength": 1,
+          "title": "Approval Id",
+          "type": "string"
+        },
+        "decision": {
+          "enum": [
+            "allow",
+            "deny"
+          ],
+          "title": "Decision",
+          "type": "string"
+        },
+        "note": {
+          "default": "",
+          "title": "Note",
+          "type": "string"
+        },
+        "option_id": {
+          "default": "",
+          "title": "Option Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "scope": {
+          "default": "once",
+          "enum": [
+            "once",
+            "session"
+          ],
+          "title": "Scope",
+          "type": "string"
+        },
+        "updated_input": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Updated Input"
+        }
+      },
+      "required": [
+        "approval_id",
+        "decision"
+      ],
+      "title": "ApprovalResponsePayload",
+      "type": "object"
+    },
     "Artifact": {
       "additionalProperties": false,
       "description": "内容寻址的不可变输入或输出，身份为 sha256。",
@@ -752,6 +830,70 @@
         }
       },
       "title": "ArtifactObject",
+      "type": "object"
+    },
+    "AttachmentRef": {
+      "additionalProperties": false,
+      "description": "A resolved, authorized attachment ready for adapter delivery.",
+      "properties": {
+        "cas_path": {
+          "default": "",
+          "title": "Cas Path",
+          "type": "string"
+        },
+        "content_base64": {
+          "default": "",
+          "title": "Content Base64",
+          "type": "string"
+        },
+        "delivery": {
+          "default": "workspace_file",
+          "enum": [
+            "native_image",
+            "workspace_file"
+          ],
+          "title": "Delivery",
+          "type": "string"
+        },
+        "media_type": {
+          "default": "",
+          "title": "Media Type",
+          "type": "string"
+        },
+        "name": {
+          "default": "",
+          "title": "Name",
+          "type": "string"
+        },
+        "path": {
+          "default": "",
+          "title": "Path",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        },
+        "size": {
+          "default": 0,
+          "title": "Size",
+          "type": "integer"
+        },
+        "workspace_path": {
+          "default": "",
+          "title": "Workspace Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sha256"
+      ],
+      "title": "AttachmentRef",
       "type": "object"
     },
     "BindingContext": {
@@ -1141,6 +1283,31 @@
       "title": "CapabilityGrant",
       "type": "object"
     },
+    "CapabilityImage": {
+      "additionalProperties": false,
+      "description": "随工具结果交给模型的图片（base64）；其落盘路径与 SHA-256 在 ``result`` 中。",
+      "properties": {
+        "data": {
+          "title": "Data",
+          "type": "string"
+        },
+        "mime_type": {
+          "title": "Mime Type",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "mime_type",
+        "data"
+      ],
+      "title": "CapabilityImage",
+      "type": "object"
+    },
     "CapabilityInjectionPlan": {
       "additionalProperties": false,
       "description": "Adapter 为一次 Session 启动生成的能力注入计划。\n\n只包含 Gateway endpoint、工具描述、短期 credential reference、audience\n和 Runtime 所需配置；禁止包含平台 Token、SharedGraph 数据库路径或业务\n状态（构造时校验，见 ``_reject_secret_material``）。",
@@ -1239,6 +1406,18 @@
           "default": null,
           "title": "Correlation Id"
         },
+        "image_input": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Image Input"
+        },
         "invocation_id": {
           "title": "Invocation Id",
           "type": "string"
@@ -1261,7 +1440,7 @@
     },
     "CapabilityResult": {
       "additionalProperties": false,
-      "description": "一次能力调用的统一结果。\n\n改变状态的调用返回与 Web 相同的 CommandReceipt；只读调用把完整的\n数据放在 ``result``；失败时 ``error`` 为统一错误 envelope。",
+      "description": "一次能力调用的统一结果。\n\n改变状态的调用返回与 Web 相同的 CommandReceipt；只读调用把完整的\n数据放在 ``result``；失败时 ``error`` 为统一错误 envelope。\n``images`` 由各协议入口转成原生图片内容块，不进入 JSON 文本。",
       "properties": {
         "error": {
           "anyOf": [
@@ -1273,6 +1452,13 @@
             }
           ],
           "default": null
+        },
+        "images": {
+          "items": {
+            "$ref": "#/$defs/CapabilityImage"
+          },
+          "title": "Images",
+          "type": "array"
         },
         "invocation_id": {
           "anyOf": [
@@ -2832,6 +3018,82 @@
       "title": "LeaseRequest",
       "type": "object"
     },
+    "MessageInput": {
+      "additionalProperties": false,
+      "description": "An ordinary user message that starts a new turn.",
+      "properties": {
+        "kind": {
+          "const": "message",
+          "default": "message",
+          "title": "Kind",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/MessagePayload"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "text": {
+          "default": "",
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "title": "MessageInput",
+      "type": "object"
+    },
+    "MessagePayload": {
+      "additionalProperties": false,
+      "description": "Structured side data of an ordinary user message.",
+      "properties": {
+        "attachments": {
+          "items": {
+            "$ref": "#/$defs/AttachmentRef"
+          },
+          "title": "Attachments",
+          "type": "array"
+        },
+        "capability_context": {
+          "default": "",
+          "title": "Capability Context",
+          "type": "string"
+        },
+        "client_user_message_id": {
+          "default": "",
+          "title": "Client User Message Id",
+          "type": "string"
+        },
+        "interaction_mode": {
+          "default": "default",
+          "enum": [
+            "default",
+            "plan"
+          ],
+          "title": "Interaction Mode",
+          "type": "string"
+        },
+        "runtime_capability": {
+          "additionalProperties": true,
+          "title": "Runtime Capability",
+          "type": "object"
+        },
+        "runtime_command_arguments": {
+          "default": "",
+          "title": "Runtime Command Arguments",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "title": "MessagePayload",
+      "type": "object"
+    },
     "OutboxRecord": {
       "additionalProperties": false,
       "description": "持久 outbox 记录。\n\n跨 platform.db / competition.db / Run 存储 / SharedGraph 边界的外部\n副作用，通过 outbox 在事务提交后投递；重启后未完成的记录必须恢复。",
@@ -3837,6 +4099,263 @@
       "title": "RunSnapshot",
       "type": "object"
     },
+    "SessionOptions": {
+      "additionalProperties": false,
+      "description": "Every launch option an adapter may read from ``SessionStart.options``.\n\nFields are grouped by owner. Adapters read only the fields they support;\nunknown keys raise :class:`SessionOptionsError` instead of being ignored.",
+      "properties": {
+        "add_dirs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Add Dirs",
+          "type": "array"
+        },
+        "allowed_tools": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Allowed Tools",
+          "type": "array"
+        },
+        "audience": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Audience"
+        },
+        "chat_control_enabled": {
+          "default": true,
+          "title": "Chat Control Enabled",
+          "type": "boolean"
+        },
+        "chat_hook_approvals": {
+          "additionalProperties": true,
+          "title": "Chat Hook Approvals",
+          "type": "object"
+        },
+        "chat_native_plugins": {
+          "items": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "title": "Chat Native Plugins",
+          "type": "array"
+        },
+        "chat_tools": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/ToolDescription"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Chat Tools"
+        },
+        "cwd": {
+          "default": "",
+          "title": "Cwd",
+          "type": "string"
+        },
+        "engine": {
+          "default": "",
+          "title": "Engine",
+          "type": "string"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Env",
+          "type": "object"
+        },
+        "ephemeral": {
+          "default": false,
+          "title": "Ephemeral",
+          "type": "boolean"
+        },
+        "fork_from": {
+          "default": "",
+          "title": "Fork From",
+          "type": "string"
+        },
+        "fork_last_turn_id": {
+          "default": "",
+          "title": "Fork Last Turn Id",
+          "type": "string"
+        },
+        "fork_session": {
+          "default": false,
+          "title": "Fork Session",
+          "type": "boolean"
+        },
+        "hooks": {
+          "additionalProperties": true,
+          "title": "Hooks",
+          "type": "object"
+        },
+        "kb_access": {
+          "default": true,
+          "title": "Kb Access",
+          "type": "boolean"
+        },
+        "max_turns": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Turns"
+        },
+        "plugins": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Plugins",
+          "type": "array"
+        },
+        "principal_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Principal Id"
+        },
+        "prompt_via_stdin": {
+          "default": false,
+          "title": "Prompt Via Stdin",
+          "type": "boolean"
+        },
+        "resource_scopes": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resource Scopes"
+        },
+        "resume_prompt": {
+          "default": "",
+          "title": "Resume Prompt",
+          "type": "string"
+        },
+        "role": {
+          "default": "",
+          "title": "Role",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "session_dir": {
+          "default": "",
+          "title": "Session Dir",
+          "type": "string"
+        },
+        "skills": {
+          "anyOf": [
+            {
+              "const": "all",
+              "type": "string"
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "all",
+          "title": "Skills"
+        },
+        "solver_id": {
+          "default": "",
+          "title": "Solver Id",
+          "type": "string"
+        },
+        "thread_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThreadMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "timeout_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timeout S"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "web_access": {
+          "default": true,
+          "title": "Web Access",
+          "type": "boolean"
+        },
+        "worker_mode": {
+          "default": "",
+          "title": "Worker Mode",
+          "type": "string"
+        }
+      },
+      "title": "SessionOptions",
+      "type": "object"
+    },
     "SessionStart": {
       "additionalProperties": false,
       "description": "启动（或恢复）一个外部 Agent Session 的请求。",
@@ -3881,6 +4400,15 @@
           "default": null,
           "title": "Execution Generation"
         },
+        "interaction_mode": {
+          "default": "default",
+          "enum": [
+            "default",
+            "plan"
+          ],
+          "title": "Interaction Mode",
+          "type": "string"
+        },
         "model": {
           "anyOf": [
             {
@@ -3894,9 +4422,7 @@
           "title": "Model"
         },
         "options": {
-          "additionalProperties": true,
-          "title": "Options",
-          "type": "object"
+          "$ref": "#/$defs/SessionOptions"
         },
         "permission_mode": {
           "anyOf": [
@@ -3951,6 +4477,18 @@
           "title": "Schema Version",
           "type": "integer"
         },
+        "service_tier": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Service Tier"
+        },
         "thread_id": {
           "anyOf": [
             {
@@ -3977,6 +4515,74 @@
         }
       },
       "title": "SessionStart",
+      "type": "object"
+    },
+    "SteerInput": {
+      "additionalProperties": false,
+      "description": "Extra guidance appended to the running turn.",
+      "properties": {
+        "kind": {
+          "const": "steer",
+          "default": "steer",
+          "title": "Kind",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/SteerPayload"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "text": {
+          "default": "",
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "title": "SteerInput",
+      "type": "object"
+    },
+    "SteerPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "attachments": {
+          "items": {
+            "$ref": "#/$defs/AttachmentRef"
+          },
+          "title": "Attachments",
+          "type": "array"
+        },
+        "capability_revision": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Capability Revision"
+        },
+        "client_user_message_id": {
+          "default": "",
+          "title": "Client User Message Id",
+          "type": "string"
+        },
+        "expected_turn_id": {
+          "default": "",
+          "title": "Expected Turn Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "title": "SteerPayload",
       "type": "object"
     },
     "SubmissionRequest": {
@@ -4349,6 +4955,71 @@
         "name"
       ],
       "title": "ToolDescription",
+      "type": "object"
+    },
+    "UserInputResponseInput": {
+      "additionalProperties": false,
+      "description": "Operator answers for a pending user-input request.",
+      "properties": {
+        "kind": {
+          "const": "user_input_response",
+          "default": "user_input_response",
+          "title": "Kind",
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/UserInputResponsePayload"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "text": {
+          "default": "",
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "payload"
+      ],
+      "title": "UserInputResponseInput",
+      "type": "object"
+    },
+    "UserInputResponsePayload": {
+      "additionalProperties": false,
+      "properties": {
+        "answers": {
+          "additionalProperties": true,
+          "title": "Answers",
+          "type": "object"
+        },
+        "decision": {
+          "default": "submit",
+          "enum": [
+            "submit",
+            "decline",
+            "cancel"
+          ],
+          "title": "Decision",
+          "type": "string"
+        },
+        "request_id": {
+          "minLength": 1,
+          "title": "Request Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "request_id"
+      ],
+      "title": "UserInputResponsePayload",
       "type": "object"
     },
     "WaitRequest": {

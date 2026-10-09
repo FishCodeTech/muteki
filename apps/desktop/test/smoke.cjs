@@ -29,7 +29,9 @@ const { createFixture } = require('./fixture.cjs');
     assert.equal(result.preferences.sandbox, true);
     assert.equal(result.preferences.contextIsolation, true);
     assert.equal(result.preferences.nodeIntegration, false);
-    assert.ok(result.preferences.preload);
+    // Electron 44 no longer includes `preload` in getLastWebPreferences.
+    // Verify the actual contextBridge installed by our preload instead.
+    assert.equal(await page.evaluate(() => typeof window.mutekiDesktop?.getState), 'function');
     assert.equal(result.views, 0);
     assert.equal(result.remoteChat, false);
     assert.deepEqual(errors, []);

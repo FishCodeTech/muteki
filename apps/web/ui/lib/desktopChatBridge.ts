@@ -14,7 +14,7 @@ export interface DesktopPreviewEvent {
 export type NativeCapabilityId = "pathSelection" | "workspaceFileActions" | "preview" | "attachmentCache" | "terminal" | "microphone" | "notifications" | "deepLinks";
 export interface NativeCapability { supported: boolean; host: "desktop-client" | "service"; code?: string; reason?: string }
 export interface NativeCapabilityManifest { version: 1; host: "desktop-client"; entries: Record<NativeCapabilityId, NativeCapability> }
-export interface DesktopNativeState { connectionVersion?: number; serviceId?: string; identityId?: string; origin?: string; transportOrigin?: string; capabilities?: unknown }
+export interface DesktopNativeState { notificationOwner?: boolean; notificationWorkspaceKey?: string; notificationVisibleThreadIds?: string[]; route?: string; environment?: { id: string }; connectionVersion?: number; serviceId?: string; identityId?: string; origin?: string; transportOrigin?: string; desktopVersion?: string; serviceVersion?: string; remoteUiBuild?: string; remoteAppearanceContract?: string; capabilities?: unknown }
 export interface DesktopSpeechInput extends DesktopNotificationScope { id: string; scopeKey: string; locale: string }
 export interface DesktopSpeechEvent extends DesktopNotificationScope {
   id: string; scopeKey: string; type: "requesting" | "listening" | "partial" | "processing" | "result" | "error" | "cancelled";
@@ -23,22 +23,63 @@ export interface DesktopSpeechEvent extends DesktopNotificationScope {
 export interface DesktopNotificationScope { connectionVersion: number; serviceId: string; identityId: string }
 export type DesktopNotificationStage = "submitted" | "awaiting_show" | "shown" | "failed" | "outcome_unknown" | "clicked" | "closed";
 export interface DesktopNotificationEvent extends DesktopNotificationScope {
-  id: string; threadId: string; eventId: string; dedupeKey: string; seq: number;
+  id: string; threadId: string; eventId: string; requestedEventId?: string; dedupeKey: string; seq: number;
   status: DesktopNotificationStage; shown: boolean; code?: string; message?: string;
   history: Array<{ status: DesktopNotificationStage; at: string; code?: string; message?: string }>;
 }
 export interface DesktopNotificationInput extends DesktopNotificationScope {
-  threadId: string; eventId: string; dedupeKey: string; title: string; body: string;
+  threadId: string; eventId: string; dedupeKey: string; title: string; body: string; wantSound?: boolean;
 }
 export interface DesktopNotificationStatus extends DesktopNotificationScope {
   permission: NotificationPermission | "unsupported"; workspacePermission: NotificationPermission;
-  host: "desktop-client"; systemPermission: "unknown"; code: string;
+  host: "desktop-client"; systemPermission: "unknown" | "default" | "granted" | "denied" | "provisional" | "ephemeral"; code: string;
+  systemNotificationSettings?: { authorizationStatus: string; authorizationStatusRaw: number; alertSettingRaw?: number; soundSettingRaw?: number };
+  systemPermissionError?: { code: string; message: string; detail?: string };
   delivery?: DesktopNotificationEvent;
 }
 export interface DesktopSelectedPath { id: string; path: string; name: string; host: "desktop-client"; serverMapped: false }
+export interface DesktopEditorOpenResult { opener: "code" | "cursor" | "system"; label: string; path: string }
 export interface DesktopWorkspaceGrant {
   grantId: string; threadId: string; workspaceId: string; clientRoot: string; serviceRoot: string;
   host: "desktop-client"; mapping: "user-selected";
+}
+
+/** Provider-driven operation on the thread's native preview (see apps/desktop main.cjs). */
+export type DesktopBrowserControlInput = { threadId: string; timeoutMs: number } & DesktopBrowserAction;
+export type DesktopBrowserAction = (
+  | { action: "wait"; url?: string; selector?: string; text?: string; gone?: boolean }
+  | { action: "navigate"; url: string }
+  | { action: "history"; direction: "back" | "forward" | "reload" }
+  | { action: "read"; mode: "text" | "html" | "elements"; selector?: string | null; offset: number; limit: number }
+  | { action: "click"; ref?: number; selector?: string; text?: string; point?: { x: number; y: number } }
+  | { action: "type"; ref?: number; selector?: string; text: string; clear: boolean; submit: boolean }
+  | { action: "screenshot" }
+  | { action: "press"; ref?: number; selector?: string; key: string; modifiers: string[]; repeat: number }
+  | { action: "scroll"; ref?: number; selector?: string; direction?: "up" | "down" | "left" | "right"; amount?: number; to?: "top" | "bottom" }
+  | { action: "evaluate"; expression: string }
+  | { action: "logs"; kind: "console" | "network"; level?: string | null; failed_only: boolean; offset: number; limit: number }
+);
+
+/** Element the user picked in the native preview (desktop picker). */
+export interface DesktopPickedElement {
+  url: string;
+  title: string;
+  tag: string;
+  selector: string;
+  id: string | null;
+  classes: string[];
+  text: string;
+  attributes: Record<string, string>;
+  styles: Record<string, string>;
+  html: string;
+  html_length: number;
+  html_truncated: boolean;
+  rect: { x: number; y: number; width: number; height: number };
+  viewport: { width: number; height: number };
+  device_pixel_ratio: number;
+  screenshot: { mime: "image/png"; data: string; width: number; height: number } | null;
+  screenshot_clipped: boolean;
+  screenshot_error?: string | null;
 }
 
 export interface DesktopChatBridge {
@@ -51,15 +92,27 @@ export interface DesktopChatBridge {
   openPath?: (input: { id: string; action: "reveal" | "open" }) => Promise<unknown>;
   selectWorkspaceRoot?: (input: { threadId: string; workspaceId: string; serviceId: string; identityId: string; serviceRoot: string }) => Promise<DesktopWorkspaceGrant | null>;
   openWorkspaceFile?: (input: { grantId: string; threadId: string; workspaceId: string; serviceId: string; identityId: string; relativePath: string; action: "reveal" | "open" }) => Promise<unknown>;
-  openPreview?: (input: { surfaceId: string; url: string; rect: { x: number; y: number; width: number; height: number }; threadId: string; reload?: boolean }) => Promise<{ id: string }>;
+  /** Opens the mapped client directory (or a file inside it) in VS Code / Cursor, else the system default app. */
+  openWorkspaceInEditor?: (input: { grantId: string; threadId: string; workspaceId: string; serviceId: string; identityId: string; relativePath?: string; line?: number; editor?: string }) => Promise<DesktopEditorOpenResult>;
+  /** Replaces the menu accelerators for `new-chat`, `search` and `sidebar`; "" removes one. */
+  setMenuAccelerators?: (input: Record<string, string>) => Promise<Record<string, string>>;
+  openPreview?: (input: { surfaceId: string; url: string; rect: { x: number; y: number; width: number; height: number }; threadId: string; reload?: boolean; persistent?: boolean }) => Promise<{ id: string }>;
   closePreview?: (input: { id?: string; surfaceId?: string; hide?: boolean }) => Promise<unknown>;
   onPreview?: (callback: (event: DesktopPreviewEvent) => void) => () => void;
-  previewAction?: (input: { id: string; action: "back" | "forward" | "reload" | "stop" }) => Promise<unknown>;
+  previewAction?: {
+    (input: { id: string; action: "pick" }): Promise<DesktopPickedElement | null>;
+    (input: { id: string; action: "screenshot" }): Promise<{ mime: "image/png"; data: string; width: number; height: number; url: string; title: string }>;
+    (input: { id: string; action: "zoom"; factor: number }): Promise<unknown>;
+    (input: { id: string; action: "color-scheme"; scheme: "system" | "light" | "dark" }): Promise<unknown>;
+    (input: { id: string; action: "back" | "forward" | "reload" | "stop" | "pick-cancel" | "reload-hard" | "devtools" | "clear-data" }): Promise<unknown>;
+  };
+  browserControl?: (input: DesktopBrowserControlInput) => Promise<Record<string, unknown>>;
   requestMicrophone?: () => Promise<{ granted: boolean; status?: string; code?: string }>;
   startSpeech?: (input: DesktopSpeechInput) => Promise<{ id: string }>;
   finishSpeech?: (input: { id: string }) => Promise<unknown>;
   cancelSpeech?: (input: { id: string }) => Promise<unknown>;
   onSpeech?: (callback: (event: DesktopSpeechEvent) => void) => () => void;
+  playNotificationSound?: (input: DesktopNotificationScope & { threadId: string; eventId: string; dedupeKey: string }) => Promise<DesktopNotificationScope & { threadId: string; eventId: string; dedupeKey: string; status: "sound-requested" | "already-requested" | "suppressed"; host: "desktop-client" }>;
   notificationStatus?: (input: DesktopNotificationScope) => Promise<DesktopNotificationStatus>;
   requestNotifications?: (input: DesktopNotificationScope) => Promise<DesktopNotificationStatus>;
   sendNotification?: (input: DesktopNotificationInput) => Promise<DesktopNotificationEvent>;

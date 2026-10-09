@@ -46,6 +46,7 @@ ENGINE_DESCRIPTORS: tuple[EngineDescriptor, ...] = (
     EngineDescriptor("kimi", "Kimi Code", "supported"),
     EngineDescriptor("omp", "OMP", "supported"),
     EngineDescriptor("devin", "Devin CLI", "supported"),
+    EngineDescriptor("droid", "Droid", "supported"),
     EngineDescriptor(
         "dsh",
         "DeepSeek Harness",

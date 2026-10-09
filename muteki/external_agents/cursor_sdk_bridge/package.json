@@ -1,0 +1,13 @@
+{
+  "name": "muteki-cursor-sdk-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Stdio JSON-lines bridge between Muteki and the local @cursor/sdk runtime.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "@cursor/sdk": "1.0.36"
+  }
+}

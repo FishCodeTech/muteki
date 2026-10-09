@@ -127,6 +127,7 @@ export function SearchInput({ value, onValueChange, shortcutHint, size = "sm", c
       size={size}
       icon="search"
       value={value}
+      data-escape-clears={value ? "" : undefined}
       onChange={(event) => onValueChange(event.target.value)}
       onKeyDown={(event) => {
         if (event.key === "Escape" && value) {
@@ -197,6 +198,7 @@ export function Switch({
   checked,
   onCheckedChange,
   label,
+  ariaLabel,
   description,
   disabled,
   size = "md",
@@ -205,6 +207,8 @@ export function Switch({
   checked: boolean;
   onCheckedChange: (checked: boolean) => void;
   label?: ReactNode;
+  /** Accessible name when the visible label lives outside the switch (e.g. a settings row title). */
+  ariaLabel?: string;
   description?: ReactNode;
   disabled?: boolean;
   size?: "sm" | "md";
@@ -218,6 +222,7 @@ export function Switch({
       type="button"
       role="switch"
       aria-labelledby={label ? labelId : undefined}
+      aria-label={label ? undefined : ariaLabel}
       aria-checked={checked}
       disabled={disabled}
       onClick={() => onCheckedChange(!checked)}

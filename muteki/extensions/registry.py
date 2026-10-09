@@ -860,6 +860,12 @@ class ExtensionService:
                 "name": name,
             }
         process = self._require_process(extension_id)
+        if not name:
+            # "Default projection" is the first one the extension declared in
+            # capabilities/list; extensions are not required to accept "".
+            declared = process.capabilities.get("projections") or []
+            if isinstance(declared, list) and declared:
+                name = str(declared[0])
         result = await process.read_projection(name)
         return {"status": "ok", **result}
 

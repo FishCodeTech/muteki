@@ -15,7 +15,7 @@ from typing import Any, Optional
 
 from muteki.platform.contracts.external_agents import SessionStart
 
-from .acp import AcpTransport, BaseAcpAdapter, check_response
+from .acp import AcpError, AcpTransport, BaseAcpAdapter
 
 
 PI_ACP_PACKAGE = "@automatalabs/pi-acp@0.6.1"
@@ -26,6 +26,15 @@ class PiAcpAdapter(BaseAcpAdapter):
     """Structured Pi runtime using the maintained open-source ACP bridge."""
 
     adapter_id = "pi.acp"
+    # The bridge asks through ACP before every tool call, so supervised,
+    # auto-accept-edits (edit kinds allowed by the shared callback) and
+    # full-access are enforced here; Pi has no native auto policy.
+    unsupported_access_mode_reasons = {
+        "auto": (
+            "the pi-acp bridge asks before every tool call and Pi has no "
+            "native auto policy"
+        ),
+    }
 
     def __init__(
         self,
@@ -90,39 +99,33 @@ class PiAcpAdapter(BaseAcpAdapter):
     async def _after_session_open(
         self, transport: AcpTransport, session_id: str, request: SessionStart
     ) -> None:
-        session_env = {
-            str(key): str(value)
-            for key, value in (request.options.get("env") or {}).items()
-        }
+        session_env = dict(request.options.env)
         model_id = str(
             request.model or session_env.get("MUTEKI_PI_MODEL") or ""
         ).strip()
         provider = str(session_env.get("MUTEKI_PI_PROVIDER") or "").strip()
         model_value = (
-            f"{provider}/{model_id}" if provider and model_id else model_id
+            f"{provider}/{model_id}"
+            if provider and model_id and "/" not in model_id else model_id
         )
-        if model_value and "/" in model_value:
-            response = await transport.peer.request(
-                "session/set_config_option",
-                {
-                    "sessionId": session_id,
-                    "configId": "model",
-                    "value": model_value,
-                },
-                timeout=30.0,
-            )
-            check_response("session/set_config_option(model)", response)
+        if model_value:
+            if "/" not in model_value:
+                # Resolve an unqualified ID only when the Agent's own catalog
+                # identifies one provider. Never silently keep Pi's default.
+                options = transport.session_setup(session_id).get("configOptions", [])
+                selector = next((item for item in options if item.get("id") == "model"), {})
+                choices = [choice for group in selector.get("options", [])
+                           for choice in (group.get("options", []) if "group" in group else [group])]
+                matches = {str(choice["value"]) for choice in choices
+                           if str(choice.get("value", "")).split("/", 1)[-1] == model_value}
+                if len(matches) != 1:
+                    raise AcpError(
+                        f"Pi ACP cannot uniquely resolve model {model_value!r}; "
+                        "specify provider/model or MUTEKI_PI_PROVIDER")
+                model_value = matches.pop()
+            await transport.set_config_option(session_id, "model", model_value)
         if request.effort:
-            response = await transport.peer.request(
-                "session/set_config_option",
-                {
-                    "sessionId": session_id,
-                    "configId": "thinkingLevel",
-                    "value": str(request.effort),
-                },
-                timeout=30.0,
-            )
-            check_response("session/set_config_option(thinkingLevel)", response)
+            await transport.set_config_option(session_id, "thinkingLevel", str(request.effort))
 
 
 __all__ = ["PI_ACP_PACKAGE", "PiAcpAdapter"]

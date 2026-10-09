@@ -60,6 +60,64 @@ def number(value):
     return int(value) if math.isfinite(value) and 0 <= value <= 2**53 - 1 else None
 
 
+def sum_token_buckets(*values: Any) -> int | None:
+    """Add disjoint observed buckets without turning wholly missing usage into zero."""
+    observed = [n for value in values if (n := number(value)) is not None]
+    return sum(observed) if observed else None
+
+
+def usage_engine(value: Any) -> str:
+    """Group runtime transport identifiers under their product engine."""
+    from muteki.solver.engine_registry import KNOWN_ENGINE_IDS, canonical_engine_id
+    text = str(value or '').strip().lower().split(':', 1)[0]
+    if not text:
+        return 'unknown'
+    canonical = canonical_engine_id(text)
+    if canonical:
+        return canonical
+    prefix = text.split('.', 1)[0]
+    return prefix if prefix in KNOWN_ENGINE_IDS else text
+
+
+def _repair_runtime_observation(raw: dict, engine: str) -> dict:
+    """Repair only the old adapters whose disjoint-bucket contract is known.
+
+    New runtime events are versioned before persistence. This also handles
+    replayed old events, so rebuilding a projection cannot undo the migration.
+    CLI and historical snapshots already used inclusive inputs and stay intact.
+    """
+    result = dict(raw)
+    if ((number(raw.get('token_schema_version')) or 0) < 2
+            and raw.get('source', 'runtime') == 'runtime'
+            and engine in {'claude.sdk', 'claude.agent_sdk', 'opencode.server'}):
+        result['input_tokens'] = sum_token_buckets(
+            raw.get('input_tokens'), raw.get('cache_read_tokens'), raw.get('cache_write_tokens'))
+        if engine == 'opencode.server':
+            result['output_tokens'] = sum_token_buckets(raw.get('output_tokens'), raw.get('reasoning_tokens'))
+        result['input_includes_cache'] = True
+        result['normalization_repair'] = 'runtime_disjoint_v2'
+    if ((number(raw.get('token_schema_version')) or 0) < 2
+            and raw.get('source', 'runtime') == 'runtime'
+            and engine == 'droid.rpc'
+            and any(raw.get(key) is not None for key in FIELDS[2:])):
+        # The old SDK flattened both cumulative notifications and per-turn
+        # terminal values into the same payload. Their scope cannot be recovered
+        # from durable events. Keep the observation, but do not invent a delta.
+        result['historical_observation'] = {
+            key: raw[key] for key in (*FIELDS, 'reported_cost', 'estimated_cost')
+            if isinstance(raw.get(key), (int, float)) and not isinstance(raw[key], bool)
+        }
+        for key in (*FIELDS, 'reported_cost', 'estimated_cost'):
+            result[key] = None
+        result['measurement_scope'] = 'historical_scope_unknown'
+        result['normalization_repair'] = 'droid_historical_scope_unknown'
+        result['quality'] = 'missing'
+    # OpenCode's zero is the placeholder for an unknown model rate.
+    if usage_engine(engine) == 'opencode' and result.get('reported_cost') == 0:
+        result.pop('reported_cost', None)
+    return result
+
+
 def normalize(raw: dict) -> dict:
     def pick(*keys):
         for key in keys:
@@ -87,6 +145,11 @@ def normalize(raw: dict) -> dict:
     result['quality'] = 'estimated' if raw.get('estimated') else ('reported' if inp is not None and out is not None else 'partial' if inp is not None or out is not None else 'missing')
     result['source'] = str(raw.get('source') or 'runtime')
     result['input_includes_cache'] = True
+    result['token_schema_version'] = 2
+    if raw.get('normalization_repair'):
+        result['normalization_repair'] = raw['normalization_repair']
+    if isinstance(raw.get('historical_observation'), dict):
+        result['historical_observation'] = raw['historical_observation']
     return result
 
 
@@ -157,6 +220,30 @@ class UsageStore:
                 )
         self._repair_unknown_counter_resets()
         self._repair_worker_attribution()
+        self._repair_runtime_buckets()
+
+    def _repair_runtime_buckets(self):
+        """Idempotently repair pre-v2 runtime records, never legacy CLI totals."""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute("SELECT 1 FROM usage_meta WHERE key='runtime_buckets_v3'").fetchone():
+                return
+            rows = db.execute("""
+                SELECT id,data FROM usage
+                WHERE json_extract(data, '$.engine') IN ('claude.sdk','claude.agent_sdk','opencode.server','opencode','cli.opencode','droid.rpc')
+            """).fetchall()
+            changed = 0
+            for identity, encoded in rows:
+                previous = json.loads(encoded)
+                repaired = _repair_runtime_observation(previous, previous.get('engine', ''))
+                if repaired != previous:
+                    repaired['token_schema_version'] = 2
+                    db.execute('UPDATE usage SET data=?,updated=? WHERE id=?',
+                               (json.dumps(repaired, ensure_ascii=False), time.time(), identity))
+                    changed += 1
+            if changed:
+                db.execute("UPDATE usage_meta SET value=value+? WHERE key='revision'", (changed,))
+            db.execute("INSERT INTO usage_meta VALUES ('runtime_buckets_v3',1)")
 
     def _repair_unknown_counter_resets(self):
         """One-time repair for reset intervals written by the older policy."""
@@ -293,6 +380,7 @@ class UsageStore:
 
     def record(self, raw: dict, *, identity: str | None = None, seq: int = 0, at: float | None = None, _db=None, price_source: str | None = None, **context):
         identity = identity or uuid4().hex
+        raw = _repair_runtime_observation(raw, str(context.get('engine') or ''))
         data = {k: context[k] for k in DIMS if context.get(k) is not None}
         data.update(normalize(raw))
         for key in ('reported_cost', 'estimated_cost'):
@@ -309,7 +397,7 @@ class UsageStore:
             if _db is None:
                 db.execute('BEGIN IMMEDIATE')
             old = db.execute('SELECT seq,at,data FROM usage WHERE id=?', (identity,)).fetchone()
-            if old and data['quality'] == 'missing':
+            if old and data['quality'] == 'missing' and data['measurement_scope'] != 'historical_scope_unknown':
                 previous = json.loads(old[2])
                 if previous['quality'] != 'missing':
                     data = {**previous, 'status': data['status']}
@@ -465,7 +553,9 @@ class UsageStore:
                 if challenge_id:
                     row['challenge_id'] = challenge_id
                 row['workspace_kind'] = 'competition'
-            if any(str(row.get(k, '')) != str(v) for k, v in filters.items() if k in DIMS and v is not None and v != ''):
+            if filters.get('engine') and usage_engine(row.get('engine')) != usage_engine(filters['engine']):
+                continue
+            if any(str(row.get(k, '')) != str(v) for k, v in filters.items() if k in DIMS and k != 'engine' and v is not None and v != ''):
                 continue
             if _legacy_pi_amount(row):
                 row['cost_status'] = 'legacy_pi_estimate_unverified'
@@ -500,12 +590,15 @@ class UsageStore:
                 for r in items
             )
             result['unverified_estimates'] = sum(_unverified_estimate(r) for r in items)
+            result['historical_scope_unknown'] = sum(
+                r.get('measurement_scope') == 'historical_scope_unknown' for r in items)
             return result
         groups = {}
         for dim in ('challenge_id', 'role', 'model', 'engine', 'workspace_kind', 'worker_id'):
             buckets = {}
             for row in records:
-                buckets.setdefault(str(row.get(dim) or '未上报'), []).append(row)
+                name = usage_engine(row.get(dim)) if dim == 'engine' else row.get(dim)
+                buckets.setdefault(str(name or '未上报'), []).append(row)
             groups[dim] = [dict(name=k, **aggregate(v)) for k,v in buckets.items()]
         buckets = {}
         for row in records:

@@ -187,8 +187,12 @@ export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
   const userTurnCount = turns.filter((t) => t.role === "user").length;
 
   return (
-    <Drawer isOpen={open} onOpenChange={(isOpen) => { if (!isOpen) onClose(); }}>
-      <Drawer.Backdrop variant="blur" className="!z-[150] bg-black/40 backdrop-blur-sm">
+    <Drawer.Backdrop
+      isOpen={open}
+      onOpenChange={(isOpen) => { if (!isOpen) onClose(); }}
+      variant="blur"
+      className="!z-[150] bg-black/40 backdrop-blur-sm"
+    >
         <Drawer.Content placement="right" className="!z-[150]">
           <Drawer.Dialog aria-label={t("btw.title")} className={styles.dialog}>
             <Drawer.Header className={styles.header}>
@@ -259,7 +263,6 @@ export function BtwPanel({ open, onClose, runId }: BtwPanelProps) {
             </Drawer.Footer>
           </Drawer.Dialog>
         </Drawer.Content>
-      </Drawer.Backdrop>
-    </Drawer>
+    </Drawer.Backdrop>
   );
 }

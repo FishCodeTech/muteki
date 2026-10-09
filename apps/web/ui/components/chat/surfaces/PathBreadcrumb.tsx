@@ -33,7 +33,7 @@ export function PathBreadcrumb({
         onClick={() => onSelect?.(target)}
         title={target || rootLabel}
         className={cn(
-          "inline-flex h-6 max-w-[200px] shrink-0 items-center truncate rounded-md px-1.5 text-[12.5px] outline-none transition-colors",
+          "inline-flex h-6 max-w-[200px] shrink-0 items-center truncate rounded-md px-1.5 text-[13px] outline-none transition-colors",
           current ? "font-medium text-cx-fg" : "text-cx-fg-3",
           clickable && "hover:bg-cx-hover hover:text-cx-fg focus-visible:bg-cx-hover",
           !clickable && "cursor-default",

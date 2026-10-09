@@ -57,7 +57,7 @@ export function LocalUrlChips({
         >
           <Icon name="globe" size={13} className="shrink-0 text-cx-accent" />
           <span className="text-cx-fg-3 group-hover:text-cx-fg-2">在预览中打开</span>
-          <span className="min-w-0 truncate font-cx-mono text-[11.5px]">{previewUrlLabel(url)}</span>
+          <span className="min-w-0 truncate font-cx-mono text-[12px]">{previewUrlLabel(url)}</span>
           <Icon name="arrowUpRight" size={12} className="shrink-0 text-cx-fg-4 group-hover:text-cx-fg-3" />
         </button>
       ))}

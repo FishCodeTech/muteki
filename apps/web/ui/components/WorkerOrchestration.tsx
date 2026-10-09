@@ -1,13 +1,11 @@
 "use client";
 
-import { MotionPreferences } from "@/components/MotionPreferences";
-
+import { ConversationRouteLink } from "@/components/conversation/ConversationNavigation";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, ComponentProps } from "react";
-import { Alert, Card, Chip, ComboBox, Input, Button, Dropdown, Label, ListBox, ListBoxItem, Radio, RadioGroup, Select, Skeleton, Slider, Switch } from "@heroui/react";
+import type { ComponentProps } from "react";
+import { Alert, Card, Chip, ComboBox, Input, Button, Dropdown, Label, ListBox, ListBoxItem, Radio, RadioGroup, Select, Skeleton, Switch } from "@heroui/react";
 import { Icon, type IconName } from "@/components/Icon";
 import { EngineLogo } from "@/components/EngineLogo";
-import { MutekiLogo } from "@/components/MutekiLogo";
 import { ModelTestTerminal } from "@/components/ModelTestTerminal";
 import { NumberField } from "@/components/NumberField";
 import { PlatformUpdate } from "@/components/PlatformUpdate";
@@ -40,19 +38,11 @@ import {
   testWorkerProfileModel,
   testWorkerProfileModelsBatch,
 } from "@/lib/useRun";
+import { useSolveOnlyMode } from "@/lib/workspaceMode";
 import {
-  SCHEMES,
-  buildPalette,
-  buildPaletteFromHue,
-  applySelection,
-  readSavedSelection,
-  readSavedTheme,
-  type SchemeSelection,
-  type ThemeMode,
-} from "@/lib/palette-engine";
-import { useLang, useT } from "@/lib/i18n";
-import { ConversationReadingPrefsPanel } from "./conversation/ConversationReadingPrefsPanel";
-import { useSolveOnlyMode, setSolveOnlyMode } from "@/lib/workspaceMode";
+  descriptorForEngine, engineDisplayName, loadProviderDescriptors, providerEngines, readyCatalog, useProviderDescriptors,
+  type ProviderDescriptorCatalog, type ProviderWorkerProfileSpec,
+} from "@/lib/providerDescriptors";
 
 const LazyTaskCredentialManager = lazy(
   () => import("@/components/ProviderManager").then((module) => ({ default: module.ProviderManager })),
@@ -72,7 +62,7 @@ const WORKER_SECTIONS: SettingsSection[] = ["roster", "credentials", "runtime", 
 function isWorkerSection(value: string): value is SettingsSection {
   return WORKER_SECTIONS.includes(value as SettingsSection);
 }
-type Engine = "claude" | "codex" | "cursor" | "pi" | "omp" | "kimi" | "grok" | "opencode" | "devin";
+type Engine = string;
 type SaveState = "idle" | "saving" | "saved" | "error";
 type AccountConnection = "official" | "custom_endpoint";
 type LlmProfileName = "planner" | "titler";
@@ -112,20 +102,7 @@ function llmTemperatureMode(profile: LlmProfile): LlmTemperatureMode {
 type ModelDiscoveryOutcome = { ok: boolean; detail: string };
 type BatchCheckState = { running: boolean; completed: number; total: number };
 
-const ENGINES: Engine[] = ["pi", "claude", "codex", "cursor", "omp", "opencode", "kimi", "grok", "devin"];
 const ORDINARY_ROLES = ["race", "bootstrap", "explore", "respond"];
-const ENGINE_META: Record<Engine, { label: string; wireApi: string; protocol: string; transport: string; localOnly?: boolean; modelDiscovery?: boolean }> = {
-  pi: { label: "Pi", wireApi: "", protocol: "OpenAI 兼容接口", transport: "pi" },
-  claude: { label: "Claude Code", wireApi: "", protocol: "Anthropic Messages", transport: "claude_code", modelDiscovery: false },
-  codex: { label: "Codex", wireApi: "responses", protocol: "OpenAI Responses", transport: "codex_cli" },
-  cursor: { label: "Cursor", wireApi: "", protocol: "Cursor CLI 接口", transport: "cursor_agent" },
-  omp: { label: "OMP", wireApi: "", protocol: "OpenAI 兼容接口", transport: "omp" },
-  kimi: { label: "Kimi Code", wireApi: "", protocol: "Kimi Code CLI", transport: "kimi_code" },
-  grok: { label: "Grok", wireApi: "", protocol: "Grok Build CLI", transport: "grok_build" },
-  opencode: { label: "OpenCode", wireApi: "chat_completions", protocol: "OpenAI 兼容接口", transport: "opencode_cli" },
-  devin: { label: "Devin CLI", wireApi: "", protocol: "Devin CLI", transport: "devin_cli", localOnly: true },
-};
-
 const EFFORT_LABELS: Record<string, string> = {
   default: "跟随模型默认",
   inherit: "继承 Worker 设置",
@@ -137,17 +114,34 @@ const EFFORT_LABELS: Record<string, string> = {
   xhigh: "XHigh",
   max: "Max",
 };
-const ENGINE_EFFORT_LEVELS: Record<Engine, string[]> = {
-  claude: ["low", "medium", "high", "xhigh", "max"],
-  codex: ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-  cursor: ["low", "medium", "high", "xhigh", "max"],
-  pi: ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-  omp: ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-  kimi: ["low", "high", "max"],
-  grok: ["low", "medium", "high", "xhigh"],
-  opencode: ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-  devin: [],
-};
+type Catalog = ProviderDescriptorCatalog | null;
+
+function workerEngines(catalog: Catalog): Engine[] {
+  return providerEngines(catalog);
+}
+
+function workerProfileSpec(catalog: Catalog, engine: Engine): ProviderWorkerProfileSpec | undefined {
+  return descriptorForEngine(catalog, engine)?.worker;
+}
+
+function engineProtocolLabel(catalog: Catalog, engine: Engine): string {
+  return workerProfileSpec(catalog, engine)?.protocol_label ?? "";
+}
+
+// The service normalizes an empty wire_api to the same engine default, so a
+// draft built before descriptors load still saves an equivalent endpoint.
+function endpointWireApi(catalog: Catalog, engine: Engine): string {
+  return workerProfileSpec(catalog, engine)?.endpoint_wire_api ?? "";
+}
+
+/** Host-login-only engines cannot hand a login to a container Worker. */
+function engineLocalOnly(catalog: Catalog, engine: Engine): boolean {
+  return descriptorForEngine(catalog, engine)?.login.system_login_only === true;
+}
+
+function engineEffortLevels(catalog: Catalog, engine: Engine): string[] {
+  return descriptorForEngine(catalog, engine)?.cli.reasoning_efforts ?? [];
+}
 
 /** CTF + auto dispatch hard-caps ordinary concurrency in Swarm.__init__. */
 const CTF_AUTO_CONCURRENCY = 3;
@@ -182,35 +176,34 @@ const DEFAULT_VERIFIER: VerifierPolicy = {
 };
 
 function engineOf(value: string): Engine {
-  return ENGINES.includes(value as Engine) ? value as Engine : "claude";
+  return String(value || "").trim().toLowerCase() || "claude";
 }
 
 function effortDefinition(
-  engine: Engine,
+  engineLevels: string[],
   model: string,
   options: WorkerModelOptions["models"][string],
 ): { levels: string[]; defaultLevel: string; supported: boolean } {
   const selected = options.find((item) => item.id === model);
   if (selected?.reasoning) {
-    const levels = selected.reasoning.levels.filter((level) => ENGINE_EFFORT_LEVELS[engine].includes(level));
+    const levels = selected.reasoning.levels.filter((level) => engineLevels.includes(level));
     return {
       levels,
       defaultLevel: selected.reasoning.default || "",
       supported: selected.reasoning.supported && levels.length > 0,
     };
   }
-  const levels = ENGINE_EFFORT_LEVELS[engine];
-  return { levels, defaultLevel: "", supported: levels.length > 0 };
+  return { levels: engineLevels, defaultLevel: "", supported: engineLevels.length > 0 };
 }
 
 function normalizeEffortForModel(
   value: string | undefined,
-  engine: Engine,
+  engineLevels: string[],
   model: string,
   options: WorkerModelOptions["models"][string],
 ): string {
   const effort = String(value || "default").toLowerCase();
-  const definition = effortDefinition(engine, model, options);
+  const definition = effortDefinition(engineLevels, model, options);
   return effort === "default" || definition.levels.includes(effort) ? effort : "default";
 }
 
@@ -273,7 +266,7 @@ function globalCredentialForLegacy(
   )) || null;
 }
 
-function syncCredentialFromGlobal(credential: Credential, availableCredentials: GlobalCredential[]): Credential {
+function syncCredentialFromGlobal(credential: Credential, availableCredentials: GlobalCredential[], catalog: Catalog): Credential {
   const selected = globalCredentialForLegacy(credential, availableCredentials);
   if (!selected) return credential;
   const engine = engineOf(selected.engine);
@@ -286,16 +279,16 @@ function syncCredentialFromGlobal(credential: Credential, availableCredentials: 
     secret_ref: selected.source === "system" ? "" : globalCredentialKey(selected),
     target_engine: connection === "custom_endpoint" ? engine : undefined,
     endpoint: connection === "custom_endpoint"
-      ? { base_url: selected.base_url || "", wire_api: ENGINE_META[engine].wireApi }
+      ? { base_url: selected.base_url || "", wire_api: endpointWireApi(catalog, engine) }
       : undefined,
   };
 }
 
-function syncCredentialsFromGlobal(credentials: Credential[], availableCredentials: GlobalCredential[]): Credential[] {
-  return credentials.map((credential) => syncCredentialFromGlobal(credential, availableCredentials));
+function syncCredentialsFromGlobal(credentials: Credential[], availableCredentials: GlobalCredential[], catalog: Catalog): Credential[] {
+  return credentials.map((credential) => syncCredentialFromGlobal(credential, availableCredentials, catalog));
 }
 
-function legacyIdentity(config: WorkerSettings): {
+function legacyIdentity(config: WorkerSettings, catalog: Catalog): {
   seats: Seat[];
   credentials: Credential[];
 } {
@@ -318,7 +311,7 @@ function legacyIdentity(config: WorkerSettings): {
     const id = `cred_legacy_${engine}_${index}`;
     credentials.push({
       id,
-      label: account || `${ENGINE_META[engine].label} 系统登录`,
+      label: account || `${engineDisplayName(catalog, engine)} 系统登录`,
       engine,
       kind: profile.base_url ? "custom_endpoint" : account ? "engine_key" : "system_inherit",
       secret_ref: account,
@@ -389,6 +382,7 @@ function SelfCheckStatus({
 }
 
 function buildModelTestProfile({
+  worker,
   id,
   label,
   engine,
@@ -398,6 +392,7 @@ function buildModelTestProfile({
   model,
   reasoningEffort,
 }: {
+  worker: ProviderWorkerProfileSpec;
   id: string;
   label: string;
   engine: Engine;
@@ -408,21 +403,19 @@ function buildModelTestProfile({
   reasoningEffort?: string;
 }): WorkerSettings["worker_profiles"][number] {
   const custom = connection === "custom_endpoint";
-  const transport = ENGINE_META[engine].transport;
+  const credentialMode = custom ? "api_key" : worker.official_credential_mode;
   return {
     id,
     name: label,
     engine,
-    transport,
-    auth: custom || ["cursor", "pi", "omp", "opencode"].includes(engine)
-      ? "api_key" : "subscription",
-    credential_mode: custom || ["cursor", "pi", "omp", "opencode"].includes(engine)
-      ? "api_key" : "subscription",
+    transport: worker.transport,
+    auth: credentialMode,
+    credential_mode: credentialMode,
     credential_account: accountId === "__system__" ? "" : accountId,
     credential_id: accountId === "__system__" ? `system:${engine}` : `account:${accountId}`,
     api_key_ref: "",
     base_url: custom ? String(baseUrl || "") : "",
-    wire_api: ENGINE_META[engine].wireApi,
+    wire_api: worker.endpoint_wire_api,
     roles: [...ORDINARY_ROLES, "review"],
     race: true,
     max_running: 1,
@@ -449,10 +442,11 @@ function ReasoningEffortSelect({
   onChange: (value: string) => void;
   inherit?: boolean;
 }) {
-  const definition = effortDefinition(engine, model, options);
+  const engineLevels = engineEffortLevels(readyCatalog(useProviderDescriptors()), engine);
+  const definition = effortDefinition(engineLevels, model, options);
   const selected = inherit
     ? (value === "inherit" || definition.levels.includes(value) ? value : "inherit")
-    : normalizeEffortForModel(value, engine, model, options);
+    : normalizeEffortForModel(value, engineLevels, model, options);
   const defaultLabel = definition.defaultLevel
     ? `跟随模型默认（${EFFORT_LABELS[definition.defaultLevel] || definition.defaultLevel}）`
     : "跟随模型默认";
@@ -505,6 +499,7 @@ function WorkerCard({
   onToggleEnabled: () => void;
   onOpenMenu: (point: { x: number; y: number }) => void;
 }) {
+  const descriptors = readyCatalog(useProviderDescriptors());
   const engine = engineOf(seat.engine);
   const account = credentialKey(credential) === "__system__"
     ? "系统登录"
@@ -526,7 +521,7 @@ function WorkerCard({
     >
       <div className="wroster-card-head">
         <span className="wroster-order" title="拖动调整优先级">{String(order).padStart(2, "0")}</span>
-        <span className="wroster-engine"><EngineLogo engine={engine} size={18} data-tooltip={ENGINE_META[engine].label} /></span>
+        <span className="wroster-engine"><EngineLogo engine={engine} size={18} data-tooltip={engineDisplayName(descriptors, engine)} /></span>
         <Button
           type="button"
           className="wroster-title"
@@ -541,7 +536,7 @@ function WorkerCard({
             event.stopPropagation();
             onOpenMenu({ x: event.clientX, y: event.clientY });
           }}
-        ><strong>{seat.label}</strong><small>{ENGINE_META[engine].label}</small></Button>
+        ><strong>{seat.label}</strong><small>{engineDisplayName(descriptors, engine)}</small></Button>
         <span
           className="wroster-card-quick-toggle"
           data-tooltip={seat.enabled ? `停用 ${seat.label}` : `启用 ${seat.label}`}
@@ -620,6 +615,8 @@ function RosterWorkspace({
   onTest: (seat: Seat) => void;
   onDelete: (id: string) => void;
 }) {
+  const descriptorState = useProviderDescriptors();
+  const descriptors = readyCatalog(descriptorState);
   const ordinary = seats.filter(isOrdinarySeat);
   const reviewSeat = seats.find((seat) => seat.id === review.engine);
   const verifierSeat = seats.find((seat) => seat.id === verifier.engine);
@@ -660,16 +657,21 @@ function RosterWorkspace({
             <Dropdown.Trigger className="wroster-add-trigger"><Icon name="plus" size={14} /><span>添加 Worker</span><Icon name="chevronDown" size={12} /></Dropdown.Trigger>
             <Dropdown.Popover placement="bottom start" className="wroster-add-menu">
               <Dropdown.Menu aria-label="添加 Worker 引擎" onAction={(key) => onAdd(key as Engine)}>
-                {ENGINES.map((engine) => {
-                  const meta = ENGINE_META[engine];
-                  const unavailable = Boolean(meta.localOnly && backend !== "local");
-                  return <Dropdown.Item key={engine} id={engine} textValue={meta.label} isDisabled={unavailable}><span className="wroster-add-logo"><EngineLogo engine={engine} size={17} data-tooltip={meta.label} /></span><span className="wroster-add-copy"><strong>{meta.label}</strong><small>{unavailable ? "当前仅支持本地运行" : meta.localOnly ? "仅支持本地运行" : meta.protocol}</small></span><Icon name="plus" size={14} /></Dropdown.Item>;
+                {workerEngines(descriptors).map((engine) => {
+                  const label = engineDisplayName(descriptors, engine);
+                  const localOnly = engineLocalOnly(descriptors, engine);
+                  const unavailable = localOnly && backend !== "local";
+                  return <Dropdown.Item key={engine} id={engine} textValue={label} isDisabled={unavailable}><span className="wroster-add-logo"><EngineLogo engine={engine} size={17} data-tooltip={label} /></span><span className="wroster-add-copy"><strong>{label}</strong><small>{unavailable ? "当前仅支持本地运行" : localOnly ? "仅支持本地运行" : engineProtocolLabel(descriptors, engine)}</small></span><Icon name="plus" size={14} /></Dropdown.Item>;
                 })}
               </Dropdown.Menu>
             </Dropdown.Popover>
           </Dropdown>
           <span className="wroster-check-summary" aria-live="polite">{checkSummary}</span>
         </div>
+        {descriptorState.status === "error" ? <div className="wroster-descriptor-error">
+          <RuntimeNote icon="alert" status="warning" title="引擎描述读取失败" detail={`无法添加 Worker 或读取推理强度：${descriptorState.message}`} />
+          <Button type="button" size="sm" variant="secondary" onPress={() => void loadProviderDescriptors({ fresh: true }).catch(() => undefined)}><Icon name="refresh" size={13} />重试</Button>
+        </div> : null}
       </header>
 
       <div
@@ -800,6 +802,7 @@ function CredentialBindingEditor({
   onDiscoverModels: (credentialId: string, engine: Engine) => Promise<ModelDiscoveryOutcome>;
   discoveringModels: boolean;
 }) {
+  const descriptors = readyCatalog(useProviderDescriptors());
   const [discoveryResult, setDiscoveryResult] = useState<ModelDiscoveryOutcome | null>(null);
   const matchingCredentials = availableCredentials.filter((item) => (
     item.engine === engine && (item.source === "stored" || backend === "local")
@@ -848,7 +851,7 @@ function CredentialBindingEditor({
     setDiscoveryResult(null);
     setDiscoveryResult(await onDiscoverModels(selectedCredential.id, engine));
   };
-  const canDiscoverModels = ENGINE_META[engine].modelDiscovery !== false;
+  const canDiscoverModels = descriptorForEngine(descriptors, engine)?.models.method === "cli";
   const credentialCenterHref = "/ctf/workers?section=credentials";
 
   return (
@@ -858,11 +861,11 @@ function CredentialBindingEditor({
       </Select></label>
 
       {selectedCredential ? <div className={`wbinding-summary${selectedCredential.source === "system" ? " system" : ""}`}>
-        <div><span>服务地址</span><strong>{selectedCredential.base_url || "默认服务地址"}</strong><small>{ENGINE_META[engine].protocol}</small></div>
+        <div><span>服务地址</span><strong>{selectedCredential.base_url || "默认服务地址"}</strong><small>{engineProtocolLabel(descriptors, engine)}</small></div>
         <div><span>状态</span><strong>{globalCredentialUsable(selectedCredential) ? "可用" : "不可用"}</strong></div>
       </div> : <div className="wbinding-missing">
         <Icon name="lock" size={14} />
-        <span><strong>{selectableCredentials.length ? "请选择一个凭据" : `尚无可用于 ${ENGINE_META[engine].label} 的凭据`}</strong><small>可在本页的 Agent 凭据分区维护 Token、Key、Base URL 和宿主登录。</small></span>
+        <span><strong>{selectableCredentials.length ? "请选择一个凭据" : `尚无可用于 ${engineDisplayName(descriptors, engine)} 的凭据`}</strong><small>可在本页的 Agent 凭据分区维护 Token、Key、Base URL 和宿主登录。</small></span>
         <a href={credentialCenterHref}>设置凭据</a>
       </div>}
 
@@ -871,7 +874,7 @@ function CredentialBindingEditor({
           <span>Worker 模型</span>
           <div className="wbinding-model-tools">
             {!selectedCredential ? <small>绑定凭据后选择模型</small> : null}
-            <Button size="sm" variant="ghost" className={discoveringModels ? "loading" : !canDiscoverModels ? "unsupported" : ""} isDisabled={discoveringModels || !canDiscoverModels || !globalCredentialUsable(selectedCredential)} onPress={refreshModels} aria-label={canDiscoverModels ? `从 ${ENGINE_META[engine].label} CLI 读取可用模型` : `${ENGINE_META[engine].label} CLI 不提供模型列表命令`}><Icon name="refresh" size={11} />{discoveringModels ? "刷新中…" : canDiscoverModels ? "刷新模型" : "不支持刷新"}</Button>
+            <Button size="sm" variant="ghost" className={discoveringModels ? "loading" : !canDiscoverModels ? "unsupported" : ""} isDisabled={discoveringModels || !canDiscoverModels || !globalCredentialUsable(selectedCredential)} onPress={refreshModels} aria-label={canDiscoverModels ? `从 ${engineDisplayName(descriptors, engine)} CLI 读取可用模型` : `${engineDisplayName(descriptors, engine)} CLI 不提供模型列表命令`}><Icon name="refresh" size={11} />{discoveringModels ? "刷新中…" : canDiscoverModels ? "刷新模型" : "不支持刷新"}</Button>
           </div>
         </div>
         <div className="wbinding-model-field">
@@ -946,6 +949,7 @@ function SeatInspector({
   onDelete: () => void;
   onTest: () => void;
 }) {
+  const descriptors = readyCatalog(useProviderDescriptors());
   if (!seat) return <aside className="wset-inspector empty"><Icon name="grid" size={24} /><strong>选择一个 Worker</strong><span>添加或选择 Worker 以编辑配置</span></aside>;
   const engine = engineOf(seat.engine);
   const credential = credentials.find((item) => item.id === seat.credential_id);
@@ -962,18 +966,18 @@ function SeatInspector({
       <header className="wset-inspector-head">
         <span>Worker 配置</span>
         <strong>{seat.label}</strong>
-        <p>{ENGINE_META[engine].label} · {accountKey === "__system__" ? "系统登录" : accountKey || "未绑定"} · {seat.model || "默认模型"} · {effortSummary(seat.reasoning_effort, effortDefinition(engine, seat.model || "", modelOptions).defaultLevel)}</p>
+        <p>{engineDisplayName(descriptors, engine)} · {accountKey === "__system__" ? "系统登录" : accountKey || "未绑定"} · {seat.model || "默认模型"} · {effortSummary(seat.reasoning_effort, effortDefinition(engineEffortLevels(descriptors, engine), seat.model || "", modelOptions).defaultLevel)}</p>
       </header>
       <div className="wset-inspector-scroll">
         <section className="wset-form-section">
           <h3>基本信息</h3>
           <label><span>名称</span><Input value={seat.label} onChange={(event) => onUpdate({ label: event.target.value })} /></label>
-          <label><span>Worker 程序</span><Select aria-label="Worker 程序" selectedKey={engine} onSelectionChange={(key) => onEngine(engineOf(String(key)))}><Select.Trigger><Select.Value /></Select.Trigger><Select.Popover><ListBox>{ENGINES.map((item) => <ListBoxItem key={item} id={item} isDisabled={Boolean(ENGINE_META[item].localOnly && backend !== "local")}>{ENGINE_META[item].label}{ENGINE_META[item].localOnly ? "（本地）" : ""}</ListBoxItem>)}</ListBox></Select.Popover></Select></label>
+          <label><span>Worker 程序</span><Select aria-label="Worker 程序" selectedKey={engine} onSelectionChange={(key) => onEngine(engineOf(String(key)))}><Select.Trigger><Select.Value /></Select.Trigger><Select.Popover><ListBox>{workerEngines(descriptors).map((item) => <ListBoxItem key={item} id={item} isDisabled={engineLocalOnly(descriptors, item) && backend !== "local"}>{engineDisplayName(descriptors, item)}{engineLocalOnly(descriptors, item) ? "（本地）" : ""}</ListBoxItem>)}</ListBox></Select.Popover></Select></label>
         </section>
 
         <section className="wset-form-section">
           <h3>模型与连接</h3>
-          <CredentialBindingEditor engine={engine} accountKey={accountKey} model={seat.model || ""} availableCredentials={availableCredentials} backend={backend} onBind={onAccount} onModelChange={(model) => { if (model !== (seat.model || "")) onUpdate({ model, reasoning_effort: normalizeEffortForModel(seat.reasoning_effort, engine, model, modelOptions) }); }} onDiscoverModels={onDiscoverModels} discoveringModels={discoveringModels} />
+          <CredentialBindingEditor engine={engine} accountKey={accountKey} model={seat.model || ""} availableCredentials={availableCredentials} backend={backend} onBind={onAccount} onModelChange={(model) => { if (model !== (seat.model || "")) onUpdate({ model, reasoning_effort: normalizeEffortForModel(seat.reasoning_effort, engineEffortLevels(descriptors, engine), model, modelOptions) }); }} onDiscoverModels={onDiscoverModels} discoveringModels={discoveringModels} />
           <ReasoningEffortSelect engine={engine} model={seat.model || ""} options={modelOptions} value={seat.reasoning_effort || "default"} onChange={(reasoning_effort) => onUpdate({ reasoning_effort })} />
         </section>
 
@@ -1035,6 +1039,7 @@ function ReviewInspector({
   testing: boolean;
   testResult: WorkerModelTestResult | null;
 }) {
+  const descriptors = readyCatalog(useProviderDescriptors());
   const options = seats.filter((seat) => canServeChannel(seat, "review"));
   const selected = options.find((seat) => seat.id === review.engine);
   const credential = credentials.find((item) => item.id === selected?.credential_id);
@@ -1048,7 +1053,7 @@ function ReviewInspector({
       <header className="wset-inspector-head">
         <span>Review Worker</span>
         <strong>{selected?.label || "尚未指定"}</strong>
-        <p>{selected ? `${ENGINE_META[engineOf(selected.engine)].label} · ${credential?.secret_ref || "系统登录"} · ${selected.model || "默认模型"} · ${effortSummary(selected.reasoning_effort)}` : "为独立审查通道指定一个 Worker 配置。"}</p>
+        <p>{selected ? `${engineDisplayName(descriptors, engineOf(selected.engine))} · ${credential?.secret_ref || "系统登录"} · ${selected.model || "默认模型"} · ${effortSummary(selected.reasoning_effort)}` : "为独立审查通道指定一个 Worker 配置。"}</p>
       </header>
       <div className="wset-inspector-scroll">
       <section className="wset-form-section">
@@ -1066,8 +1071,8 @@ function ReviewInspector({
         <section className="wset-form-section">
           <h3>独立 Review 运行绑定</h3>
           <label><span>名称</span><Input value={selected.label} onChange={(event) => onSeatUpdate(selected.id, { label: event.target.value })} /></label>
-          <label><span>Worker 程序</span><Select aria-label="Review Worker 程序" selectedKey={selectedEngine} onSelectionChange={(key) => onSeatEngine(selected.id, engineOf(String(key)))}><Select.Trigger><Select.Value /></Select.Trigger><Select.Popover><ListBox>{ENGINES.map((item) => <ListBoxItem key={item} id={item} isDisabled={Boolean(ENGINE_META[item].localOnly && backend !== "local")}>{ENGINE_META[item].label}{ENGINE_META[item].localOnly ? "（本地）" : ""}</ListBoxItem>)}</ListBox></Select.Popover></Select></label>
-          <CredentialBindingEditor engine={selectedEngine} accountKey={selectedAccount} model={selected.model || ""} availableCredentials={availableCredentials} backend={backend} onBind={(key, globalCredential) => onSeatAccount(selected.id, key, globalCredential)} onModelChange={(model) => { if (model !== (selected.model || "")) onSeatUpdate(selected.id, { model, reasoning_effort: normalizeEffortForModel(selected.reasoning_effort, selectedEngine, model, modelOptions) }); }} onDiscoverModels={onDiscoverModels} discoveringModels={discoveringModels} />
+          <label><span>Worker 程序</span><Select aria-label="Review Worker 程序" selectedKey={selectedEngine} onSelectionChange={(key) => onSeatEngine(selected.id, engineOf(String(key)))}><Select.Trigger><Select.Value /></Select.Trigger><Select.Popover><ListBox>{workerEngines(descriptors).map((item) => <ListBoxItem key={item} id={item} isDisabled={engineLocalOnly(descriptors, item) && backend !== "local"}>{engineDisplayName(descriptors, item)}{engineLocalOnly(descriptors, item) ? "（本地）" : ""}</ListBoxItem>)}</ListBox></Select.Popover></Select></label>
+          <CredentialBindingEditor engine={selectedEngine} accountKey={selectedAccount} model={selected.model || ""} availableCredentials={availableCredentials} backend={backend} onBind={(key, globalCredential) => onSeatAccount(selected.id, key, globalCredential)} onModelChange={(model) => { if (model !== (selected.model || "")) onSeatUpdate(selected.id, { model, reasoning_effort: normalizeEffortForModel(selected.reasoning_effort, engineEffortLevels(descriptors, selectedEngine), model, modelOptions) }); }} onDiscoverModels={onDiscoverModels} discoveringModels={discoveringModels} />
           <ReasoningEffortSelect engine={selectedEngine} model={selected.model || ""} options={modelOptions} value={selected.reasoning_effort || "default"} onChange={(reasoning_effort) => onSeatUpdate(selected.id, { reasoning_effort })} />
           <div className="wset-switch-row"><span><b>启用 Review Worker</b><small>停用后保留连接和模型配置</small></span><Switch size="sm" aria-label="启用 Review Worker" isSelected={selected.enabled} onChange={(enabled) => onSeatUpdate(selected.id, { enabled })}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></div>
         </section>
@@ -1144,6 +1149,7 @@ function VerifierInspector({
   testing: boolean;
   testResult: WorkerModelTestResult | null;
 }) {
+  const descriptors = readyCatalog(useProviderDescriptors());
   const options = seats.filter((seat) => canServeChannel(seat, "verifier"));
   const selected = options.find((seat) => seat.id === verifier.engine);
   const credential = credentials.find((item) => item.id === selected?.credential_id);
@@ -1160,7 +1166,7 @@ function VerifierInspector({
       <header className="wset-inspector-head">
         <span>Verifier Worker</span>
         <strong>{selected?.label || "尚未指定"}</strong>
-        <p>{selected ? `${ENGINE_META[engineOf(selected.engine)].label} · ${credential?.secret_ref || "系统登录"} · ${selected.model || "默认模型"} · ${effortSummary(selected.reasoning_effort)}` : "为独立复现验证通道指定一个 Worker 配置。"}</p>
+        <p>{selected ? `${engineDisplayName(descriptors, engineOf(selected.engine))} · ${credential?.secret_ref || "系统登录"} · ${selected.model || "默认模型"} · ${effortSummary(selected.reasoning_effort)}` : "为独立复现验证通道指定一个 Worker 配置。"}</p>
       </header>
       <div className="wset-inspector-scroll">
       <section className="wset-form-section">
@@ -1179,8 +1185,8 @@ function VerifierInspector({
         <section className="wset-form-section">
           <h3>独立 Verifier 运行绑定</h3>
           <label><span>名称</span><Input value={selected.label} onChange={(event) => onSeatUpdate(selected.id, { label: event.target.value })} /></label>
-          <label><span>Worker 程序</span><Select aria-label="Verifier Worker 程序" selectedKey={selectedEngine} onSelectionChange={(key) => onSeatEngine(selected.id, engineOf(String(key)))}><Select.Trigger><Select.Value /></Select.Trigger><Select.Popover><ListBox>{ENGINES.map((item) => <ListBoxItem key={item} id={item} isDisabled={Boolean(ENGINE_META[item].localOnly && backend !== "local")}>{ENGINE_META[item].label}{ENGINE_META[item].localOnly ? "（本地）" : ""}</ListBoxItem>)}</ListBox></Select.Popover></Select></label>
-          <CredentialBindingEditor engine={selectedEngine} accountKey={selectedAccount} model={selected.model || ""} availableCredentials={availableCredentials} backend={backend} onBind={(key, globalCredential) => onSeatAccount(selected.id, key, globalCredential)} onModelChange={(model) => { if (model !== (selected.model || "")) onSeatUpdate(selected.id, { model, reasoning_effort: normalizeEffortForModel(selected.reasoning_effort, selectedEngine, model, modelOptions) }); }} onDiscoverModels={onDiscoverModels} discoveringModels={discoveringModels} />
+          <label><span>Worker 程序</span><Select aria-label="Verifier Worker 程序" selectedKey={selectedEngine} onSelectionChange={(key) => onSeatEngine(selected.id, engineOf(String(key)))}><Select.Trigger><Select.Value /></Select.Trigger><Select.Popover><ListBox>{workerEngines(descriptors).map((item) => <ListBoxItem key={item} id={item} isDisabled={engineLocalOnly(descriptors, item) && backend !== "local"}>{engineDisplayName(descriptors, item)}{engineLocalOnly(descriptors, item) ? "（本地）" : ""}</ListBoxItem>)}</ListBox></Select.Popover></Select></label>
+          <CredentialBindingEditor engine={selectedEngine} accountKey={selectedAccount} model={selected.model || ""} availableCredentials={availableCredentials} backend={backend} onBind={(key, globalCredential) => onSeatAccount(selected.id, key, globalCredential)} onModelChange={(model) => { if (model !== (selected.model || "")) onSeatUpdate(selected.id, { model, reasoning_effort: normalizeEffortForModel(selected.reasoning_effort, engineEffortLevels(descriptors, selectedEngine), model, modelOptions) }); }} onDiscoverModels={onDiscoverModels} discoveringModels={discoveringModels} />
           <ReasoningEffortSelect engine={selectedEngine} model={selected.model || ""} options={modelOptions} value={selected.reasoning_effort || "default"} onChange={(reasoning_effort) => onSeatUpdate(selected.id, { reasoning_effort })} />
           <div className="wset-switch-row"><span><b>启用 Verifier Worker</b><small>停用后保留连接和模型配置</small></span><Switch size="sm" aria-label="启用 Verifier Worker" isSelected={selected.enabled} onChange={(enabled) => onSeatUpdate(selected.id, { enabled })}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></div>
         </section>
@@ -1623,7 +1629,7 @@ function ModelsWorkspace({ value, endpoints, onChange, onEndpointSaved }: { valu
             </Button>
           ))}
         </nav>
-        <a className="wmodels-center-link" href="/settings/agents"><Icon name="lock" size={13} />管理模型端点<Icon name="arrowUpRight" size={13} /></a>
+        <ConversationRouteLink className="wmodels-center-link" href="/settings/agents"><Icon name="lock" size={13} />管理模型端点<Icon name="arrowUpRight" size={13} /></ConversationRouteLink>
       </aside>
       <div className="wmodels-profile-content">
         {(["planner", "titler"] as const).map((which) => (
@@ -1636,142 +1642,9 @@ function ModelsWorkspace({ value, endpoints, onChange, onEndpointSaved }: { valu
   );
 }
 
-const APPEARANCE_TOKENS = ["--blue", "--green", "--amber", "--cyan", "--pink", "--violet", "--magenta", "--red", "--gold"];
-
-/**
- * 外观配色 — palette-engine 的控制台。预设方案是四个命名主色；自定义滑杆把
- * 任意 OKLCH 色相喂给引擎，语义色保持固定、装饰色自动避让、对比度由引擎
- * 保证 ≥ WCAG AA。所有改动即时应用到当前页面并持久化到本浏览器，
- * 主工作台下次加载（或切换亮暗模式）时沿用。
- */
-export function AppearanceWorkspace({ hideIntro = false, clientContext = "web" }: { hideIntro?: boolean; clientContext?: "web" | "desktop" }) {
-  const { lang, setLang } = useLang();
-  const t = useT();
-  const solveOnly = useSolveOnlyMode();
-  const [mode, setMode] = useState<ThemeMode>(() => (typeof window === "undefined" ? "dark" : readSavedTheme()));
-  const [sel, setSel] = useState<SchemeSelection>(() => (typeof window === "undefined" ? { kind: "preset", id: "azure" } : readSavedSelection()));
-
-  useEffect(() => {
-    document.documentElement.dataset.theme = mode;
-    try { window.localStorage.setItem("muteki.theme", mode); } catch { /* session-only theming */ }
-    applySelection(sel, mode);
-  }, [sel, mode]);
-
-  const hue = Math.round(sel.kind === "custom" ? sel.hue : (SCHEMES.find((s) => s.id === sel.id)?.hue ?? 268));
-  const palette = sel.kind === "custom" ? buildPaletteFromHue(sel.hue, mode) : buildPalette(sel.id, mode);
-  const previewVars = palette as CSSProperties;
-  const schemeName = (id: string) => t(`settingsHub.appearance.scheme.${id}`);
-
-  return (
-    <div className="wsettings-simple-page wappearance-page">
-      {hideIntro ? null : (
-        <header className="wsettings-section-head"><div className="wsettings-section-copy">
-          <h2>{lang === "zh" ? "外观配色" : "Appearance"}</h2>
-          <p>{lang === "zh" ? `主色生成全套强调色，语义色保持固定。改动即时生效并保存在${clientContext === "desktop" ? "当前桌面客户端" : "本浏览器"}。` : `The accent color generates the palette while semantic colors stay consistent. Changes apply immediately and are saved in ${clientContext === "desktop" ? "this desktop client" : "this browser"}.`}</p>
-        </div></header>
-      )}
-
-      <section className="wappearance-card wappearance-choice-card" aria-labelledby="wappearance-language">
-        <header><h3 id="wappearance-language">{t("settingsHub.language")}</h3><span>{lang === "zh" ? t("settingsHub.languageZh") : t("settingsHub.languageEn")}</span></header>
-        <p>{t("settingsHub.languageHint")}</p>
-        <RadioGroup orientation="horizontal" value={lang} onChange={(value) => setLang(value as "zh" | "en")} className="wappearance-modes" aria-label={t("settingsHub.language")}>
-          <Radio value="zh" className={lang === "zh" ? "on" : ""}><Radio.Content><Radio.Control><Radio.Indicator /></Radio.Control>{t("settingsHub.languageZh")}</Radio.Content></Radio>
-          <Radio value="en" className={lang === "en" ? "on" : ""}><Radio.Content><Radio.Control><Radio.Indicator /></Radio.Control>{t("settingsHub.languageEn")}</Radio.Content></Radio>
-        </RadioGroup>
-      </section>
-
-      <section className="wappearance-card wappearance-choice-card" aria-labelledby="wappearance-mode">
-        <header><h3 id="wappearance-mode">{t("settingsHub.appearance.mode")}</h3><span>{mode === "light" ? t("settingsHub.appearance.light") : t("settingsHub.appearance.dark")}</span></header>
-        <p>{t("settingsHub.appearance.modeHint")}</p>
-        <RadioGroup orientation="horizontal" value={mode} onChange={(value) => setMode(value as ThemeMode)} className="wappearance-modes" aria-label={t("settingsHub.appearance.mode")}>
-          <Radio value="light" className={mode === "light" ? "on" : ""}><Radio.Content><Radio.Control><Radio.Indicator /></Radio.Control><Icon name="sun" size={14} />{t("settingsHub.appearance.light")}</Radio.Content></Radio>
-          <Radio value="dark" className={mode === "dark" ? "on" : ""}><Radio.Content><Radio.Control><Radio.Indicator /></Radio.Control><Icon name="moon" size={14} />{t("settingsHub.appearance.dark")}</Radio.Content></Radio>
-        </RadioGroup>
-      </section>
-
-      {clientContext === "web" ? <section className="wappearance-card wappearance-choice-card" aria-labelledby="wappearance-workspaces">
-        <header><h3 id="wappearance-workspaces">{lang === "zh" ? "工作区模式" : "Workspace mode"}</h3><span>{solveOnly ? (lang === "zh" ? "仅做题" : "Solve only") : (lang === "zh" ? "全部工作区" : "All workspaces")}</span></header>
-        <p>{lang === "zh" ? "默认只显示做题模式。开启此项后，首页、导航和搜索会加入对话与比赛工作区。" : "Only the solve workspace is shown by default. Turn this on to add chat and competition workspaces to the home page, navigation, and search."}</p>
-        <Switch isSelected={!solveOnly} onChange={(enabled) => setSolveOnlyMode(!enabled)} aria-label={lang === "zh" ? "显示对话和比赛模式" : "Show chat and competition modes"}>
-          <Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control>{lang === "zh" ? "显示对话和比赛模式" : "Show chat and competition modes"}</Switch.Content>
-        </Switch>
-      </section> : null}
-
-      <MotionPreferences clientContext={clientContext} />
-
-      <section className="wappearance-card" aria-labelledby="wappearance-presets">
-        <header><h3 id="wappearance-presets">{t("settingsHub.appearance.presets")}</h3><span>{sel.kind === "preset" ? schemeName(sel.id) : t("settingsHub.appearance.custom")}</span></header>
-        <div className="wappearance-presets">
-          {SCHEMES.map((s) => {
-            const p = buildPalette(s.id, mode);
-            const on = sel.kind === "preset" && sel.id === s.id;
-            return (
-              <Button key={s.id} type="button" className={`wappearance-preset${on ? " on" : ""}`} onClick={() => setSel({ kind: "preset", id: s.id })} aria-pressed={on}>
-                <i style={{ background: p["--accent"] }} />
-                <strong>{schemeName(s.id)}</strong>
-                <code>{p["--accent"]}</code>
-              </Button>
-            );
-          })}
-        </div>
-      </section>
-
-      <section className="wappearance-card wappearance-custom-card" aria-labelledby="wappearance-custom">
-        <header><h3 id="wappearance-custom">{t("settingsHub.appearance.customColor")}</h3><span>{sel.kind === "custom" ? `${t("settingsHub.appearance.hue")} ${hue}° · ${palette["--accent"]}` : t("settingsHub.appearance.dragHint")}</span></header>
-        <Slider
-          className="wappearance-hue"
-          minValue={0}
-          maxValue={359}
-          value={hue}
-          onChange={(value) => setSel({ kind: "custom", hue: Number(value) })}
-          aria-label={t("settingsHub.appearance.hue")}
-        >
-          <Slider.Track className="wappearance-hue-track">
-            <Slider.Thumb className="wappearance-hue-thumb" />
-          </Slider.Track>
-        </Slider>
-        <div className="wappearance-family">
-          {APPEARANCE_TOKENS.map((token) => (
-            <span key={token} className="wappearance-swatch"><i style={{ background: palette[token] }} /><em>{token.slice(2)}</em><code>{palette[token]}</code></span>
-          ))}
-        </div>
-      </section>
-
-      {clientContext === "desktop" || !solveOnly ? <section className="wappearance-card" aria-labelledby="wappearance-reading" data-testid="c39-appearance-reading">
-        <header><h3 id="wappearance-reading">{t("settingsHub.appearance.reading")}</h3><span>{t("settingsHub.appearance.readingMeta")}</span></header>
-        <p>{clientContext === "desktop" ? (lang === "zh" ? "仅影响聊天正文的字号、密度与宽度，偏好保存在当前桌面客户端。" : "Adjust the chat text size, density and width. Preferences are saved in this desktop client.") : t("settingsHub.appearance.readingHint")}</p>
-        <ConversationReadingPrefsPanel hideIntro={clientContext === "desktop"} />
-      </section> : null}
-
-      <section className="wappearance-card" aria-labelledby="wappearance-preview">
-        <header><h3 id="wappearance-preview">{t("settingsHub.appearance.preview")}</h3><span>{mode === "light" ? t("settingsHub.appearance.lightMode") : t("settingsHub.appearance.darkMode")}</span></header>
-        <div className="wappearance-preview" style={previewVars}>
-          <div className="wp-brand"><MutekiLogo size={48} wordmark /><span>{lang === "zh" ? "品牌标识随主色变化" : "Brand follows the accent color"}</span></div>
-          <div className="wp-chips">
-            <span style={{ ["--c" as string]: "var(--blue)" }}>control</span>
-            <span style={{ ["--c" as string]: "var(--green)" }}>worker</span>
-            <span style={{ ["--c" as string]: "var(--amber)" }}>tool</span>
-            <span style={{ ["--c" as string]: "var(--violet)" }}>evidence</span>
-            <span style={{ ["--c" as string]: "var(--pink)" }}>review</span>
-            <span style={{ ["--c" as string]: "var(--red)" }}>error</span>
-            <span style={{ ["--c" as string]: "var(--gold)" }}>★ flag</span>
-          </div>
-          <div className="wp-ledger">
-            <div><time>12:03:41</time><b style={{ color: "var(--blue)" }}>coordinator</b><span>dispatch intent #42 → worker-claude-1</span></div>
-            <div><time>12:04:12</time><b style={{ color: "var(--green)" }}>flag</b><span>flag{"{a7f3…}"} verified from stdout</span></div>
-          </div>
-          <div className="wp-foot">
-            <span className="wp-primary" aria-hidden="true">＋ New Solve</span>
-            <span className="wp-live"><i />LIVE · 3 workers</span>
-          </div>
-        </div>
-      </section>
-    </div>
-  );
-}
-
 export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { defaultReturnTo?: string; navigation: { pathname: string; searchParams: URLSearchParams } }) {
   const solveOnly = useSolveOnlyMode();
+  const descriptors = readyCatalog(useProviderDescriptors());
   const [config, setConfig] = useState<WorkerSettings | null>(null);
   const [seats, setSeats] = useState<Seat[]>([]);
   const [credentials, setCredentials] = useState<Credential[]>([]);
@@ -1909,18 +1782,18 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
       }
       return {
         ok: false,
-        detail: result.detail || `${ENGINE_META[engine].label} 未返回当前凭据可用的模型。`,
+        detail: result.detail || `${engineDisplayName(descriptors, engine)} 未返回当前凭据可用的模型。`,
       };
     } finally {
       setDiscoveringModels(false);
     }
-  }, [availableCredentials, backend, showFeedback]);
+  }, [availableCredentials, backend, descriptors, showFeedback]);
 
   useEffect(() => {
     let alive = true;
-    Promise.all([getWorkerSettings(), getGlobalCredentials(), getModelEndpoints(), getWorkerModelOptions(), fetchProfilesHealth(), getWorkerModelTestResults(), getWorkerImageStatus(), getOpenVpnStatus(), checkAuth()]).then(([cfg, globalRows, endpointRows, modelRows, healthRows, modelTestRows, workerImage, openVpn, authState]) => {
+    Promise.all([getWorkerSettings(), getGlobalCredentials(), getModelEndpoints(), getWorkerModelOptions(), fetchProfilesHealth(), getWorkerModelTestResults(), getWorkerImageStatus(), getOpenVpnStatus(), checkAuth(), loadProviderDescriptors().catch(() => null)]).then(([cfg, globalRows, endpointRows, modelRows, healthRows, modelTestRows, workerImage, openVpn, authState, catalog]) => {
       if (!alive || !cfg) return;
-      const identity = legacyIdentity(cfg);
+      const identity = legacyIdentity(cfg, catalog);
       const ordinary = identity.seats.filter(isOrdinarySeat);
       const loadedReview = { ...DEFAULT_REVIEW, ...(cfg.stage_policy.coordinator.review || {}) };
       const loadedVerifier = { ...DEFAULT_VERIFIER, ...(cfg.stage_policy.coordinator.verifier || {}) };
@@ -1944,7 +1817,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
       });
       setConfig(cfg);
       setSeats(identity.seats);
-      setCredentials(syncCredentialsFromGlobal(identity.credentials, globalRows));
+      setCredentials(syncCredentialsFromGlobal(identity.credentials, globalRows, catalog));
       setAvailableCredentials(globalRows);
       setModelEndpoints(endpointRows);
       setModels(modelRows);
@@ -1989,22 +1862,22 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
     const connection = selected?.connection === "custom_endpoint" ? "custom_endpoint" : "official";
     if (existing) {
       if (selected) {
-        setCredentials((current) => current.map((credential) => credential.id === existing.id ? syncCredentialFromGlobal(credential, [selected]) : credential));
+        setCredentials((current) => current.map((credential) => credential.id === existing.id ? syncCredentialFromGlobal(credential, [selected], descriptors) : credential));
       }
       return existing.id;
     }
     const next: Credential = {
       id: selected.id,
-      label: selected?.label || (key === "__system__" ? `${ENGINE_META[engine].label} 系统登录` : key || "未配置模型服务"),
+      label: selected?.label || (key === "__system__" ? `${engineDisplayName(descriptors, engine)} 系统登录` : key || "未配置模型服务"),
       engine,
       kind: key === "__system__" ? "system_inherit" : connection === "custom_endpoint" ? "custom_endpoint" : "engine_key",
       secret_ref: key === "__system__" ? "" : key,
       target_engine: connection === "custom_endpoint" ? engine : undefined,
-      endpoint: connection === "custom_endpoint" ? { base_url: selected?.base_url || "", wire_api: ENGINE_META[engine].wireApi } : undefined,
+      endpoint: connection === "custom_endpoint" ? { base_url: selected?.base_url || "", wire_api: endpointWireApi(descriptors, engine) } : undefined,
     };
     setCredentials((current) => [...current, next]);
     return next.id;
-  }, [availableCredentials, credentials]);
+  }, [availableCredentials, credentials, descriptors]);
 
   const updateSeat = useCallback((id: string, patch: Partial<Seat>) => {
     const seat = seats.find((item) => item.id === id);
@@ -2046,7 +1919,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
     const selected = resolvedCredential || availableCredentials.find((item) => globalCredentialKey(item) === key && item.engine === seat.engine);
     if (!globalCredentialUsable(selected)) {
       updateSeat(id, { credential_id: "", model: "" });
-      showFeedback(`${ENGINE_META[engineOf(seat.engine)].label} 没有可用凭据，请在 Agent 凭据分区完成配置`);
+      showFeedback(`${engineDisplayName(descriptors, engineOf(seat.engine))} 没有可用凭据，请在 Agent 凭据分区完成配置`);
       return;
     }
     const engine = selected ? engineOf(selected.engine) : engineOf(seat.engine);
@@ -2056,34 +1929,34 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
       model: engine === seat.engine ? seat.model : "",
       reasoning_effort: engine === seat.engine ? seat.reasoning_effort || "default" : "default",
     });
-  }, [availableCredentials, ensureCredential, seats, showFeedback, updateSeat]);
+  }, [availableCredentials, descriptors, ensureCredential, seats, showFeedback, updateSeat]);
 
   const changeEngine = useCallback((id: string, engine: Engine) => {
     const matching = availableCredentials.find((credential) => credential.engine === engine && globalCredentialUsable(credential) && (credential.source === "stored" || backend === "local"));
     if (!matching) {
       updateSeat(id, { engine, credential_id: "", model: "", reasoning_effort: "default" });
-      showFeedback(`${ENGINE_META[engine].label} 没有可用凭据，请在 Agent 凭据分区完成配置`);
+      showFeedback(`${engineDisplayName(descriptors, engine)} 没有可用凭据，请在 Agent 凭据分区完成配置`);
       return;
     }
     updateSeat(id, { engine, credential_id: ensureCredential(engine, globalCredentialKey(matching), matching), model: matching.default_model || "", reasoning_effort: "default" });
-  }, [availableCredentials, backend, ensureCredential, showFeedback, updateSeat]);
+  }, [availableCredentials, backend, descriptors, ensureCredential, showFeedback, updateSeat]);
 
   const addSeat = useCallback((engine: Engine) => {
     const matching = availableCredentials.find((credential) => credential.engine === engine && globalCredentialUsable(credential) && (credential.source === "stored" || backend === "local"));
     if (!matching) {
-      showFeedback(`${ENGINE_META[engine].label} 没有可用凭据；请先在 Agent 凭据分区完成配置，再添加 Worker`);
+      showFeedback(`${engineDisplayName(descriptors, engine)} 没有可用凭据；请先在 Agent 凭据分区完成配置，再添加 Worker`);
       return;
     }
     const id = randomId("seat", engine);
     const sameEngineCount = ordinarySeats.filter((seat) => seat.engine === engine).length;
-    const next: Seat = { id, label: `${ENGINE_META[engine].label} Worker ${sameEngineCount + 1}`, engine, credential_id: ensureCredential(engine, globalCredentialKey(matching), matching), model: matching.default_model || "", reasoning_effort: "default", roles: [...ORDINARY_ROLES, "review"], race: true, capacity: { max_running: 1, max_review_running: 0 }, priority: ordinarySeats.length * 10 + 10, enabled: true };
+    const next: Seat = { id, label: `${engineDisplayName(descriptors, engine)} Worker ${sameEngineCount + 1}`, engine, credential_id: ensureCredential(engine, globalCredentialKey(matching), matching), model: matching.default_model || "", reasoning_effort: "default", roles: [...ORDINARY_ROLES, "review"], race: true, capacity: { max_running: 1, max_review_running: 0 }, priority: ordinarySeats.length * 10 + 10, enabled: true };
     setSeats((current) => [...current, next]);
     setSelectedId(id);
     setInspector("seat");
     setMobileInspectorOpen(true);
     markDirty();
-    showFeedback(`已添加 ${ENGINE_META[engine].label} Worker`);
-  }, [availableCredentials, backend, ensureCredential, markDirty, ordinarySeats, showFeedback]);
+    showFeedback(`已添加 ${engineDisplayName(descriptors, engine)} Worker`);
+  }, [availableCredentials, backend, descriptors, ensureCredential, markDirty, ordinarySeats, showFeedback]);
 
   const duplicateSeat = useCallback((id: string) => { const source = seats.find((seat) => seat.id === id); if (!source) return; const next = { ...source, id: randomId("seat", engineOf(source.engine)), label: `${source.label} 副本`, capacity: { ...source.capacity }, roles: [...source.roles], priority: seats.length * 10 + 10 }; setSeats((current) => [...current, next]); setSelectedId(next.id); markDirty(); }, [markDirty, seats]);
   const deleteSeat = useCallback((id: string) => {
@@ -2152,14 +2025,14 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
     }));
     markDirty();
   }, [markDirty]);
-  const createDedicatedReview = useCallback(() => { const source = seats.find((seat) => seat.id === review.engine) || ordinarySeats[0]; if (!source) { showFeedback("请先添加一个 Worker"); return; } const next: Seat = { ...source, id: randomId("seat", engineOf(source.engine)), label: `${ENGINE_META[engineOf(source.engine)].label} Review`, roles: ["review"], race: false, capacity: { max_running: 1, max_review_running: 1 }, priority: seats.length * 10 + 10, enabled: true }; setSeats((current) => [...current, next]); setReview((current) => ({ ...current, engine: next.id, enabled: true, max_concurrent: 1 })); markDirty(); showFeedback("已创建独立 Review 配置"); }, [markDirty, ordinarySeats, review.engine, seats, showFeedback]);
+  const createDedicatedReview = useCallback(() => { const source = seats.find((seat) => seat.id === review.engine) || ordinarySeats[0]; if (!source) { showFeedback("请先添加一个 Worker"); return; } const next: Seat = { ...source, id: randomId("seat", engineOf(source.engine)), label: `${engineDisplayName(descriptors, engineOf(source.engine))} Review`, roles: ["review"], race: false, capacity: { max_running: 1, max_review_running: 1 }, priority: seats.length * 10 + 10, enabled: true }; setSeats((current) => [...current, next]); setReview((current) => ({ ...current, engine: next.id, enabled: true, max_concurrent: 1 })); markDirty(); showFeedback("已创建独立 Review 配置"); }, [descriptors, markDirty, ordinarySeats, review.engine, seats, showFeedback]);
   const createDedicatedVerifier = useCallback(() => {
     const source = seats.find((seat) => seat.id === verifier.engine) || ordinarySeats[0];
     if (!source) { showFeedback("请先添加一个 Worker"); return; }
     const next: Seat = {
       ...source,
       id: randomId("seat", engineOf(source.engine)),
-      label: `${ENGINE_META[engineOf(source.engine)].label} Verifier`,
+      label: `${engineDisplayName(descriptors, engineOf(source.engine))} Verifier`,
       roles: ["verifier"],
       race: false,
       capacity: { max_running: 1, max_review_running: 0 },
@@ -2170,7 +2043,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
     setVerifier((current) => ({ ...current, engine: next.id, enabled: true, max_concurrent: Math.max(0, current.max_concurrent ?? 0) }));
     markDirty();
     showFeedback("已创建独立 Verifier 配置");
-  }, [markDirty, ordinarySeats, seats, showFeedback, verifier.engine]);
+  }, [descriptors, markDirty, ordinarySeats, seats, showFeedback, verifier.engine]);
 
   const testSeat = useCallback(async (seat: Seat, quiet = false): Promise<WorkerModelTestResult> => {
     const credential = credentials.find((item) => item.id === seat.credential_id);
@@ -2183,8 +2056,19 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
     setTestingIds((current) => { const next = new Set(current); next.add(seat.id); return next; });
     setTestResults((current) => { const next = { ...current }; delete next[seat.id]; return next; });
     const accountId = credential?.kind === "system_inherit" ? "__system__" : credential?.secret_ref || "";
+    const worker = workerProfileSpec(descriptors, seat.engine);
     try {
-      const probed: WorkerModelTestResult = connection === "custom_endpoint" && !seat.model?.trim()
+      const probed: WorkerModelTestResult = !worker
+        ? {
+            ok: false,
+            detail: `引擎描述未加载或不包含 ${seat.engine}，无法构造 Worker 配置`,
+            model: seat.model || "",
+            engine: seat.engine,
+            backend,
+            layer: "config",
+            logs: [{ stream: "error", message: "请重新加载引擎描述后再检查", elapsed_ms: 0 }],
+          }
+        : connection === "custom_endpoint" && !seat.model?.trim()
         ? {
             ok: false,
             detail: "自定义 API 缺少模型 ID，无法发起真实模型请求",
@@ -2195,6 +2079,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
             logs: [{ stream: "error", message: "请先填写服务实际支持的模型 ID", elapsed_ms: 0 }],
           }
         : await testWorkerProfileModel(buildModelTestProfile({
+            worker,
             id: seat.id,
             label: seat.label,
             engine: engineOf(seat.engine),
@@ -2234,7 +2119,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
     } finally {
       setTestingIds((current) => { const next = new Set(current); next.delete(seat.id); return next; });
     }
-  }, [availableCredentials, backend, credentials, showFeedback]);
+  }, [availableCredentials, backend, credentials, descriptors, showFeedback]);
 
   const testAllSeats = useCallback(async () => {
     const targets = seats.filter((seat) => seat.enabled && (
@@ -2243,9 +2128,12 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
       || (verifier.enabled && verifier.engine === seat.id)
     ));
     if (!targets.length) { showFeedback("当前没有可检查的启用 Worker"); return; }
-    setBatchCheck({ running: true, completed: 0, total: targets.length });
     if (backend === "container") {
-      const requests = targets.map((seat) => {
+      const workers = targets.map((seat) => workerProfileSpec(descriptors, seat.engine));
+      const missing = targets.find((_, index) => !workers[index]);
+      if (missing) { showFeedback(`引擎描述未加载或不包含 ${missing.engine}，无法检查 ${missing.label}`); return; }
+      setBatchCheck({ running: true, completed: 0, total: targets.length });
+      const requests = targets.map((seat, index) => {
         const credential = credentials.find((item) => item.id === seat.credential_id);
         const selectedGlobalCredential = globalCredentialForLegacy(credential, availableCredentials);
         const connection = credential?.kind === "system_inherit"
@@ -2255,6 +2143,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
             : "official";
         const accountId = credential?.kind === "system_inherit" ? "__system__" : credential?.secret_ref || "";
         const profile = buildModelTestProfile({
+          worker: workers[index] as ProviderWorkerProfileSpec,
           id: seat.id,
           label: seat.label,
           engine: engineOf(seat.engine),
@@ -2322,6 +2211,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
       }
       return;
     }
+    setBatchCheck({ running: true, completed: 0, total: targets.length });
     const results = await Promise.all(targets.map(async (seat) => {
       const result = await testSeat(seat, true);
       setBatchCheck((current) => ({ ...current, completed: current.completed + 1 }));
@@ -2330,7 +2220,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
     const passed = results.filter((result) => result.ok).length;
     setBatchCheck({ running: false, completed: targets.length, total: targets.length });
     showFeedback(`一键检查完成：${passed}/${targets.length} 个 Worker 通过真实模型请求`);
-  }, [availableCredentials, backend, credentials, review.enabled, review.engine, verifier.enabled, verifier.engine, seats, showFeedback, testSeat]);
+  }, [availableCredentials, backend, credentials, descriptors, review.enabled, review.engine, verifier.enabled, verifier.engine, seats, showFeedback, testSeat]);
 
   const save = async () => {
     if (!config) return;
@@ -2409,7 +2299,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
       return;
     }
     if (!saved) { setSaveState("error"); showFeedback("保存失败：服务未返回生效配置"); return; }
-    const savedIdentity = legacyIdentity(saved);
+    const savedIdentity = legacyIdentity(saved, descriptors);
     const savedDraft: WorkerDraftSnapshot = {
       seats: savedIdentity.seats,
       review: { ...DEFAULT_REVIEW, ...(saved.stage_policy.coordinator.review || {}) },
@@ -2432,7 +2322,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
     baselineDraftRef.current = workerDraftSignature(savedDraft);
     if (!editedWhileSaving) {
       setSeats(savedDraft.seats);
-      setCredentials(syncCredentialsFromGlobal(savedIdentity.credentials, availableCredentials));
+      setCredentials(syncCredentialsFromGlobal(savedIdentity.credentials, availableCredentials, descriptors));
       setReview(savedDraft.review);
       setVerifier(savedDraft.verifier);
       setBackend(savedDraft.backend);
@@ -2467,7 +2357,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
   const refreshCredentials = (action?: "save" | "import" | "create" | "delete") => {
     void getGlobalCredentials().then((rows) => {
       setAvailableCredentials(rows);
-      setCredentials((current) => syncCredentialsFromGlobal(current, rows));
+      setCredentials((current) => syncCredentialsFromGlobal(current, rows, descriptors));
     }).catch((error) => showFeedback(`刷新凭据失败：${error instanceof Error ? error.message : String(error)}`));
     if (action === "delete" && !dirty) setReloadRevision((current) => current + 1);
   };
@@ -2525,7 +2415,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
             {item.id === "roster" ? <span className="wsettings-nav-count">{seats.filter(isOrdinarySeat).length}</span> : null}
           </Button>
         ))}</nav>
-        <div className="wsettings-nav-foot"><span>保存后用于下次任务</span>{solveOnly ? <a href="/settings/appearance"><Icon name="gear" size={14} />工作区模式</a> : null}<a href={returnTo}><Icon name="chevronRight" size={14} />{workspaceLabels.back}</a></div>
+        <div className="wsettings-nav-foot"><span>保存后用于下次任务</span>{solveOnly ? <ConversationRouteLink href="/settings/appearance"><Icon name="gear" size={14} />工作区模式</ConversationRouteLink> : null}<a href={returnTo}><Icon name="chevronRight" size={14} />{workspaceLabels.back}</a></div>
       </aside>
 
       <main className="wsettings-main">

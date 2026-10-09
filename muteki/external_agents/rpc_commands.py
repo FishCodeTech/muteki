@@ -1,7 +1,7 @@
 """Native non-prompt commands shared by the Pi and OMP RPC protocols."""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from .command_providers import operation_item
 
@@ -24,11 +24,21 @@ def rpc_operation_items(adapter_id: str, engine: str):
             for name, (method, description, hint) in operations.items()]
 
 
-async def rpc_operation(adapter, session, name: str, arguments: str = "") -> dict[str, Any]:
-    handle = adapter._rpc.get(session.agent_session_id)
-    if not handle or handle.get("current_turn_id"):
-        raise RuntimeError("请等待当前回复结束后执行命令")
-    operations = {item.name: item for item in rpc_operation_items(adapter.id, adapter.id.split(".")[0])}
+async def rpc_operation(
+    command: Callable[..., Awaitable[dict[str, Any]]],
+    peer: Any,
+    *,
+    adapter_id: str,
+    engine: str,
+    name: str,
+    arguments: str = "",
+) -> dict[str, Any]:
+    """Run one verified RPC operation through the adapter's own command channel.
+
+    The caller owns session lookup and the busy-turn check; native errors
+    (including Pi's "Nothing to compact") propagate unchanged.
+    """
+    operations = {item.name: item for item in rpc_operation_items(adapter_id, engine)}
     item = operations.get(name.strip().lstrip("/"))
     if item is None:
         raise RuntimeError("当前引擎未提供此原生操作")
@@ -45,10 +55,5 @@ async def rpc_operation(adapter, session, name: str, arguments: str = "") -> dic
             raise ValueError(f"/{name} 需要 on 或 off")
     elif arguments:
         raise ValueError(f"/{name} 不接受参数")
-    try:
-        result = await adapter._cmd(handle["peer"], method, params, timeout=180 if method == "compact" else 30)
-    except RuntimeError as exc:
-        if method == "compact" and "nothing to compact" in str(exc).casefold():
-            return {"status": "not_needed", "message": "当前上下文较短，无需压缩"}
-        raise
+    result = await command(peer, method, params, timeout=180 if method == "compact" else 30)
     return {"status": "completed", "message": "上下文已由引擎原生压缩" if method == "compact" else f"已完成 /{name}", "result": result}

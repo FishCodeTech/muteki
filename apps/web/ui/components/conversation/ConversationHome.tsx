@@ -9,6 +9,7 @@ import { Icon, type IconName } from "../Icon";
 import { Tooltip, useReducedMotion } from "@/components/chat/ui";
 import { PromptBar, type PromptBarAttachment } from "../ai-native/prompt-bar";
 import { ConversationModelPicker } from "./ConversationModelPicker";
+import { ConversationComposerModes } from "./ConversationComposerModes";
 import { ComposerContextStrip } from "./ComposerContextStrip";
 import type {
   ConversationCredential,
@@ -35,8 +36,14 @@ export interface ConversationHomeProps {
   selectedCredentialId: string;
   selectedModel: string;
   selectedEffort: string;
+  selectedServiceTier: string;
   selectedAccessMode: string;
   accessModes?: string[];
+  accessModeReason?: string;
+  interactionMode?: "default" | "plan";
+  planModeAvailable?: boolean;
+  planModeReason?: string;
+  onInteractionModeChange?: (mode: "default" | "plan") => void;
   runtimes?: RuntimeInstance[];
   runtimeKey?: string;
   onRuntimeChange?: (key: string) => void;
@@ -44,6 +51,7 @@ export interface ConversationHomeProps {
     credentialId: string;
     model: string;
     effort?: string;
+    serviceTier?: string;
     accessMode?: string;
   }) => void;
   projects: ConversationProject[];
@@ -124,8 +132,14 @@ export function ConversationHome({
   selectedCredentialId,
   selectedModel,
   selectedEffort,
+  selectedServiceTier,
   selectedAccessMode,
   accessModes = [],
+  accessModeReason = "",
+  interactionMode = "default",
+  planModeAvailable = false,
+  planModeReason = "",
+  onInteractionModeChange,
   runtimes,
   runtimeKey,
   onRuntimeChange,
@@ -202,12 +216,9 @@ export function ConversationHome({
 
   return (
     <div className={cn("cx-scroll flex min-h-0 flex-1 flex-col items-center overflow-y-auto px-4", className)}>
-      <div className="flex w-full max-w-[760px] flex-1 flex-col items-center justify-center gap-6 pb-[12vh] pt-10">
+      <div className="flex w-full max-w-[var(--dsh-composer-card-max-width,752px)] flex-1 flex-col items-center justify-center gap-8 pb-[12vh] pt-10">
         <motion.div className="flex flex-col items-center gap-2 text-center" {...reveal(0)}>
-          <span className="mb-1 grid size-11 place-items-center rounded-2xl bg-cx-accent-soft text-cx-accent shadow-[inset_0_0_0_1px_var(--cx-accent-line)]">
-            <Icon name="sparkles" size={20} />
-          </span>
-          <h1 className="text-[28px] font-semibold leading-9 tracking-[-0.02em] text-cx-fg">{hello}，想让 Agent 做点什么？</h1>
+          <h1 className="text-[28px] font-semibold leading-9 text-cx-fg">{hello}，想让 Agent 做点什么？</h1>
           <p className="text-[14px] text-cx-fg-3">{selectedProjectId ? "描述任务，Agent 可使用已选择的工作区执行并汇报。" : "描述任务即可开始普通聊天。读取文件、审查代码和终端操作需要先选择工作目录。"}</p>
         </motion.div>
 
@@ -247,15 +258,28 @@ export function ConversationHome({
             onStashShortcut={onStashShortcut}
             onOpenStashPanel={onOpenStashPanel}
             stashCount={stashCount}
+            contextMeter={
+              <ConversationComposerModes
+                selectedCredentialId={selectedCredentialId}
+                selectedModel={selectedModel}
+                selectedAccessMode={selectedAccessMode}
+                accessModes={accessModes}
+                accessModeReason={accessModeReason}
+                interactionMode={interactionMode}
+                planModeAvailable={planModeAvailable}
+                planModeReason={planModeReason}
+                onInteractionModeChange={onInteractionModeChange}
+                onSelect={onSelectModelParams}
+              />
+            }
             extraControls={
-              <div className="flex items-center gap-1.5">
+              <div className="flex min-w-0 items-center gap-1.5">
                 <ConversationModelPicker
                   credentials={credentials}
                   selectedCredentialId={selectedCredentialId}
                   selectedModel={selectedModel}
                   selectedEffort={selectedEffort}
-                  selectedAccessMode={selectedAccessMode}
-                  accessModes={accessModes}
+                  selectedServiceTier={selectedServiceTier}
                   runtimes={runtimes}
                   runtimeKey={runtimeKey}
                   onRuntimeChange={onRuntimeChange}
@@ -271,7 +295,7 @@ export function ConversationHome({
                     {projectHasDefault ? (
                       <>
                         <Tooltip content="当前模型参数来自项目默认设置">
-                          <span className="inline-flex h-6 items-center gap-1 rounded-md bg-cx-accent-soft px-1.5 text-[11.5px] font-medium text-cx-accent">
+                          <span className="inline-flex h-6 items-center gap-1 rounded-md bg-cx-accent-soft px-1.5 text-[12px] font-medium text-cx-accent">
                             <Icon name="bookmark" size={11} />
                             项目默认
                           </span>
@@ -279,7 +303,7 @@ export function ConversationHome({
                         <Tooltip content="用当前选择覆盖项目默认">
                           <button
                             type="button"
-                            className="h-6 rounded-md px-1.5 text-[11.5px] text-cx-fg-3 hover:bg-cx-hover hover:text-cx-fg disabled:opacity-50"
+                            className="h-6 rounded-md px-1.5 text-[12px] text-cx-fg-3 hover:bg-cx-hover hover:text-cx-fg disabled:opacity-50"
                             onClick={onSetProjectDefault}
                             disabled={savingProjectDefault}
                           >
@@ -289,7 +313,7 @@ export function ConversationHome({
                         <Tooltip content="清除项目默认，恢复用户或 Provider 默认">
                           <button
                             type="button"
-                            className="is-clear h-6 rounded-md px-1.5 text-[11.5px] text-cx-fg-3 hover:bg-cx-hover hover:text-cx-fg disabled:opacity-50"
+                            className="is-clear h-6 rounded-md px-1.5 text-[12px] text-cx-fg-3 hover:bg-cx-hover hover:text-cx-fg disabled:opacity-50"
                             onClick={onClearProjectDefault}
                             disabled={savingProjectDefault}
                           >
@@ -301,7 +325,7 @@ export function ConversationHome({
                       <Tooltip content="将当前模型、推理参数和权限设为该项目新对话的默认值">
                         <button
                           type="button"
-                          className="inline-flex h-6 items-center gap-1 rounded-md px-1.5 text-[11.5px] text-cx-fg-3 hover:bg-cx-hover hover:text-cx-fg disabled:opacity-50"
+                          className="inline-flex h-6 items-center gap-1 rounded-md px-1.5 text-[12px] text-cx-fg-3 hover:bg-cx-hover hover:text-cx-fg disabled:opacity-50"
                           onClick={onSetProjectDefault}
                           disabled={savingProjectDefault}
                         >
@@ -353,7 +377,7 @@ export function ConversationHome({
               disabled={Boolean(item.workspace && !selectedProjectId)}
               title={item.workspace && !selectedProjectId ? "请先通过输入框下方的工作区入口选择目录。" : undefined}
               onClick={() => applySuggestion(item.prompt)}
-              className="cx-press inline-flex h-8 items-center gap-1.5 rounded-full border border-cx-border px-3 text-[12.5px] text-cx-fg-2 hover:border-cx-border-strong hover:bg-cx-hover hover:text-cx-fg disabled:opacity-50"
+              className="cx-press inline-flex h-8 items-center gap-1.5 rounded-full border border-cx-border px-3 text-[13px] text-cx-fg-2 hover:border-cx-border-strong hover:bg-cx-hover hover:text-cx-fg disabled:opacity-50"
             >
               <Icon name={item.icon} size={13} className="text-cx-fg-4" />
               {item.label}

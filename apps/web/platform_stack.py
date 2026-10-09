@@ -54,6 +54,15 @@ from muteki.extensions.registry import ExtensionService
 from muteki.external_agents.factory import (
     RuntimeAdapterFactory,
 )
+from muteki.external_agents.process_supervisor import (
+    ProcessIdentityError,
+    ProcessLedgerError,
+    configure_process_ledger,
+    default_ledger_path,
+    default_process_ledger,
+    reap_orphans,
+    terminate_owned,
+)
 from muteki.external_agents.registry import AdapterRegistry
 from muteki.platform.command_api import MutekiCommandApiImpl
 from muteki.platform.command_handlers.base import CommandAPIError
@@ -420,12 +429,24 @@ class WebPlatformStack:
             self.competition_store,
             submission_service=self.competition_services.submissions,
         )
+        from muteki.conversation.browser_control import BrowserControlBroker
         from muteki.conversation.chat_plugin_gateway import ChatPluginGateway
+        from muteki.conversation.computer_control import ComputerControlBroker
+        from apps.web.worker_models import conversation_model_input
+        self.browser_control = BrowserControlBroker(self.root / "browser-captures")
+        self.computer_control = ComputerControlBroker(self.root / "computer-use")
+        self.conversation.executor.computer_control = self.computer_control
         self.capability_gateway = ChatPluginGateway(
             self.store,
             self.routed_command_api,
             plugins=self.chat_plugins,
             selection=self.conversation.manager.runtime_selection,
+            browser=self.browser_control,
+            computer=self.computer_control,
+            model_input=lambda thread_id: conversation_model_input(
+                self.root.parent, self.conversation.manager.runtime_selection(thread_id)),
+            current_turn=lambda thread_id: self.conversation.manager.conv.get_turn(
+                self.conversation.manager.conv.get_state(thread_id).running_turn_id),
             binding_service=self.conversation.bindings,
         )
         # Adapter 只在真实 Gateway 就绪后创建。Claude 的 in-process
@@ -567,11 +588,10 @@ class WebPlatformStack:
             create_conversation_router(
                 command_api=self.routed_command_api,
                 service=self.conversation,
-                runtime_service=self.runtime_service,
                 register_handlers=False,
-                include_runtime_routes=False,
                 sse_metrics=self.observability,
                 extension_service=self.extension,
+                browser_control=self.browser_control,
             ),
             create_competition_router(
                 command_api=self.routed_command_api,
@@ -582,6 +602,51 @@ class WebPlatformStack:
             ),
             create_extension_router(self.extension, self.routed_command_api),
         ]
+
+    async def _recover_process_ledger(self, report: "StartupRecoveryReport") -> None:
+        ledger = configure_process_ledger(default_ledger_path(self.manager.state_root))
+        try:
+            reaped = await reap_orphans(ledger)
+        except (ProcessLedgerError, ProcessIdentityError, OSError) as exc:
+            detail = f"{type(exc).__name__}: {exc}"
+            LOG.error("process ledger recovery failed: %s", detail)
+            # An unreadable ledger would make every later spawn fail on
+            # ``ledger.add``; children stay process-group supervised but are
+            # not recorded until the file is repaired.
+            configure_process_ledger(None)
+            report.add(
+                "runtime.process_ledger", "degraded",
+                detail=detail,
+                impact=("orphaned Runtime processes from earlier server instances were not "
+                        "reaped and new Runtime processes are not recorded for restart reaping"),
+                evidence={"ledger_path": str(ledger.path) if ledger is not None else ""},
+            )
+            return
+        summary = reaped.to_dict()
+        if reaped.reaped or reaped.failed:
+            LOG.warning("process ledger recovery: %s", json.dumps(summary, ensure_ascii=False))
+        report.add(
+            "runtime.process_ledger",
+            "degraded" if reaped.failed else "ready",
+            detail=(f"reaped {len(reaped.reaped)}, dropped {len(reaped.dropped)} stale, "
+                    f"kept {len(reaped.kept_live_owner)} owned by live servers, "
+                    f"failed {len(reaped.failed)}"),
+            impact=("some orphaned Runtime process groups could not be stopped"
+                    if reaped.failed else ""),
+            evidence=summary,
+        )
+
+    async def _terminate_runtime_processes(self) -> None:
+        """Stop Runtime process trees this server still owns (idle sessions too)."""
+        if default_process_ledger() is None:
+            return
+        try:
+            report = await terminate_owned()
+        except (ProcessLedgerError, ProcessIdentityError, OSError) as exc:
+            LOG.error("runtime process shutdown failed: %s: %s", type(exc).__name__, exc)
+            return
+        if report.reaped or report.failed:
+            LOG.warning("runtime process shutdown: %s", json.dumps(report.to_dict(), ensure_ascii=False))
 
     async def recover(self) -> None:
         report = StartupRecoveryReport()
@@ -596,9 +661,11 @@ class WebPlatformStack:
             evidence={
                 "event_watermark": platform.event_watermark,
                 "unfinished_receipts": len(platform.unfinished_receipts),
+                "unfinished_by_command_type": platform.unfinished_by_command_type,
                 "pending_outbox": len(platform.pending_outbox),
             },
         )
+        await self._recover_process_ledger(report)
         try:
             conversation = await self.conversation.recover()
         except Exception as exc:
@@ -852,7 +919,9 @@ class WebPlatformStack:
         await self.extension.shutdown()
         await self.conversation_metadata.shutdown()
         await self.conversation.shutdown()
+        await self._terminate_runtime_processes()
         await self.chat_plugins.close()
+        await self.computer_control.close()
         self.memory_graph.close()
         for graph in self._competition_graphs.values():
             try:

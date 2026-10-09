@@ -26,8 +26,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
-import time
 import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -60,9 +60,36 @@ from muteki.external_agents.factory import (
     DEFAULT_STRUCTURED_ADAPTER_BY_ENGINE,
     canonical_adapter_id as _canonical_adapter_id,
     engine_for_adapter,
+    normalize_launch_args,
     runtime_config_schema,
 )
-from muteki.platform.contracts.external_agents import ACCESS_MODE_VALUES, ProbeRequest
+from muteki.platform.contracts.external_agents import ProbeRequest
+from muteki.external_agents.capabilities import (
+    CapabilityProbeReport,
+    describe_injection_path,
+)
+from muteki.external_agents.probe_cache import (
+    BinaryIdentity,
+    ProbeCache,
+    ProbeEntry,
+    ProbeKey,
+    config_hash,
+    credential_scope,
+    driver_binary,
+    probe_cache,
+)
+from muteki.external_agents.descriptors import (
+    DESCRIPTOR_SCHEMA_VERSION,
+    UnknownProviderError,
+    all_descriptors,
+    descriptor_for_adapter,
+    find_adapter_descriptor,
+    find_descriptor,
+    find_descriptor_for_adapter,
+    get_descriptor,
+    public_descriptor,
+    resolve_capabilities,
+)
 from muteki.solver.worker_profiles import (
     VALID_BASE_ENGINES,
     normalize_worker_profile,
@@ -101,50 +128,36 @@ def canonical_adapter_id(adapter_id: str) -> str:
 
 
 def engine_of_adapter(adapter_id: str) -> str:
-    """adapter_id → 九类基础引擎名；无法识别时返回空串。"""
-    engine = engine_for_adapter(adapter_id)
-    return engine if engine in {*VALID_BASE_ENGINES, "devin"} else ""
+    """adapter_id → 有 Provider Descriptor 的基础引擎名；无法识别时返回空串。"""
+    descriptor = find_descriptor(engine_for_adapter(adapter_id))
+    return descriptor.engine if descriptor is not None else ""
 
 
-#: 九类 Runtime 的登录指引（任务书 3.1.6：缺失/未认证显示准确诊断与登录命令）。
-#: 与 muteki.solver.credential_accounts.detect_system_login 的检测口径一一对应。
+def _host_login_only(adapter_id: str) -> bool:
+    descriptor = find_descriptor(engine_of_adapter(adapter_id))
+    return descriptor is not None and descriptor.login.system_login_only
+
+
+def _require_scoped_model_catalog_probe(adapter_id: str) -> None:
+    adapter = find_adapter_descriptor(adapter_id)
+    if adapter is None or not adapter.scoped_model_catalog_probe:
+        supported = ", ".join(
+            item.adapter_id for descriptor in all_descriptors()
+            for item in descriptor.adapters if item.scoped_model_catalog_probe
+        )
+        raise ValueError(f"Scoped model catalog probing is supported by {supported}")
+
+
+_LOG = logging.getLogger(__name__)
+
+#: Runtime 登录指引（任务书 3.1.6：缺失/未认证显示准确诊断与登录命令），来自
+#: Provider Descriptor；与 credential_accounts.detect_system_login 的检测口径一致。
 LOGIN_GUIDANCE: dict[str, dict[str, str]] = {
-    "devin": {
-        "command": "devin auth login",
-        "note": "聊天使用本机 Devin CLI 登录；也支持 WINDSURF_API_KEY。",
-    },
-    "claude": {
-        "command": "claude（进入后执行 /login）",
-        "note": "macOS 登录态保存在 Keychain；也可在统一凭据中心导入宿主登录。",
-    },
-    "codex": {
-        "command": "codex login",
-        "note": "登录后可在统一凭据中心从宿主 ~/.codex/auth.json 导入。",
-    },
-    "cursor": {
-        "command": "cursor-agent login 或设置 CURSOR_API_KEY",
-        "note": "headless 模式只读取 CURSOR_API_KEY。",
-    },
-    "pi": {
-        "command": "pi（完成登录后写入 ~/.pi/agent）",
-        "note": "",
-    },
-    "omp": {
-        "command": "omp（完成登录后写入 ~/.omp/agent）",
-        "note": "",
-    },
-    "kimi": {
-        "command": "kimi（进入后执行 /login，写入 ~/.kimi-code）",
-        "note": "",
-    },
-    "grok": {
-        "command": "grok login",
-        "note": "",
-    },
-    "opencode": {
-        "command": "opencode auth login",
-        "note": "",
-    },
+    descriptor.engine: {
+        "command": descriptor.login.guidance_command,
+        "note": descriptor.login.guidance_note,
+    }
+    for descriptor in all_descriptors()
 }
 
 #: 环境引用值的合法前缀：只允许引用，不允许内联真实值。
@@ -244,6 +257,7 @@ class RuntimeInstanceConfig:
     default_model: str = ""
     enabled: bool = True
     transport: dict[str, Any] = field(default_factory=dict)
+    launch_args: list[str] = field(default_factory=list)
     created_at: str = ""
     updated_at: str = ""
 
@@ -273,6 +287,7 @@ class RuntimeInstanceConfig:
             "env_refs": dict(self.env_refs),
             "enabled": self.enabled,
             "transport": dict(self.transport),
+            "launch_args": list(self.launch_args),
             "config_schema": runtime_config_schema(self.adapter_id),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -333,6 +348,7 @@ class RuntimeInstanceConfig:
             default_model=default_model,
             enabled=bool(_pick("enabled", True)),
             transport=dict(_pick("transport", {}) or {}),
+            launch_args=list(normalize_launch_args(_pick("launch_args", []), adapter_id)),
             created_at=str(base.get("created_at") or now),
             updated_at=now,
         )
@@ -351,6 +367,7 @@ class RuntimeInstanceConfig:
             default_model=str(data.get("default_model") or ""),
             enabled=bool(data.get("enabled", True)),
             transport=dict(data.get("transport") or {}),
+            launch_args=[str(item) for item in data.get("launch_args") or []],
             created_at=str(data.get("created_at") or ""),
             updated_at=str(data.get("updated_at") or ""),
         )
@@ -376,14 +393,18 @@ class RuntimeInstanceConfigStore:
             return
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError) as exc:
+            _LOG.error("runtime instance store %s unreadable: %s: %s",
+                       self.path, type(exc).__name__, exc)
             return
         for item in raw.get("instances") or []:
             if not isinstance(item, dict):
                 continue
             try:
                 cfg = RuntimeInstanceConfig.from_dict(item)
-            except Exception:  # noqa: BLE001 — 单条损坏不拖垮其余
+            except Exception as exc:  # noqa: BLE001 — 单条损坏不拖垮其余
+                _LOG.error("runtime instance store %s: skipped invalid instance %r: %s: %s",
+                           self.path, item.get("adapter_id"), type(exc).__name__, exc)
                 continue
             if cfg.adapter_id and cfg.instance_id:
                 self._instances[cfg.key] = cfg
@@ -512,6 +533,40 @@ class RuntimeProbeScopeChangedError(RuntimeError):
     code = "runtime.instance.probe_scope_changed"
 
 
+def _health_from_entry(entry: ProbeEntry) -> dict[str, Any]:
+    """Capability part of a health snapshot, derived from one cache entry."""
+    probed_at = entry.probed_at.isoformat()
+    if not entry.ok or entry.report is None:
+        error = entry.error
+        return {
+            "healthy": False,
+            "detail": error.describe() if error is not None else "probe returned no report",
+            "error_code": error.code if error is not None else "",
+            "binary_path": "",
+            "runtime_version": "",
+            "probed_at": probed_at,
+            "capabilities": {},
+            "capability_injection": {},
+            "field_sources": {},
+            "degradations": [],
+            "source": "probe_error",
+        }
+    report: CapabilityProbeReport = entry.report
+    caps = report.capabilities
+    return {
+        "healthy": report.healthy,
+        "detail": report.detail,
+        "binary_path": report.binary_path,
+        "runtime_version": str(caps.runtime_version or ""),
+        "probed_at": probed_at,
+        "capabilities": caps.model_dump(mode="json"),
+        "capability_injection": describe_injection_path(caps),
+        "field_sources": dict(report.field_sources),
+        "degradations": list(report.degradations),
+        "source": "probe_cache",
+    }
+
+
 class AgentRuntimeService:
     """Runtime 设置面板的业务服务（Handler 与 HTTP router 共用）。
 
@@ -537,15 +592,34 @@ class AgentRuntimeService:
         self.worker_config = worker_config
         self.sessions_root = Path(sessions_root)
         self.factory = factory
-        self._probe_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
-        self._probe_locks: dict[str, asyncio.Lock] = {}
-        self._version_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
-        self._version_cache: dict[str, tuple[float, dict[str, Any]]] = {}
-        self._version_cache_ttl_s = 300.0
+        self.probe_cache: ProbeCache = (
+            registry.cache if registry is not None else probe_cache())
+        self._unsubscribe_probe = self.probe_cache.subscribe(self._on_probe_entry)
         self._probe_timeout_s = max(1.0, float(probe_timeout_s))
+
+    def _on_probe_entry(self, entry: ProbeEntry) -> None:
+        """Mirror every stored instance-scope probe into the persisted health.
+
+        Probes started outside this service (Conversation resume checks) then
+        reach the descriptor/list views too; ``probe_one`` later adds auth and
+        version-check fields to the same snapshot.
+        """
+        if entry.key.scope:
+            return
+        key = entry.key.instance_key
+        adapter_id, instance_id = entry.key.adapter_id, entry.key.instance_id
+        if self.store.get(adapter_id, instance_id) is None and not (
+            instance_id == "default" and engine_of_adapter(adapter_id)
+        ):
+            return
+        previous = self.store.health(key) or {}
+        kept = {name: previous[name] for name in (
+            "auth", "version_check", "binary_source", "binary_env") if name in previous}
+        self.store.save_health(key, {**kept, **_health_from_entry(entry)})
 
     def apply_live_config(self, cfg: RuntimeInstanceConfig) -> None:
         """把设置页变更同步到当前进程的共享 AdapterRegistry。"""
+        self.probe_cache.invalidate(cfg.adapter_id, cfg.instance_id)
         if self.registry is None or self.factory is None:
             return
         self.registry.unregister(cfg.adapter_id, cfg.instance_id)
@@ -553,6 +627,7 @@ class AgentRuntimeService:
             self.factory.register(self.registry, cfg)
 
     def remove_live_config(self, adapter_id: str, instance_id: str) -> None:
+        self.probe_cache.invalidate(adapter_id, instance_id)
         if self.registry is not None:
             self.registry.unregister(adapter_id, instance_id)
             if (
@@ -578,12 +653,10 @@ class AgentRuntimeService:
 
             driver = DRIVERS.get(engine)
             binary = str(driver.bin) if driver is not None else ""
-        except Exception:  # noqa: BLE001 — binary 解析失败只影响展示
+        except Exception as exc:  # noqa: BLE001 — binary 解析失败只影响展示
+            _LOG.warning("%s binary resolution failed: %s: %s",
+                         adapter_id, type(exc).__name__, exc)
             binary = ""
-        if adapter_id == "devin.acp":
-            from muteki.external_agents.devin import default_devin_binary
-
-            binary = default_devin_binary()
         structured = not adapter_id.startswith("cli.")
         return {
             "adapter_id": adapter_id,
@@ -600,8 +673,8 @@ class AgentRuntimeService:
             "env_refs": {},
             "enabled": True,
             "transport": {},
+            "launch_args": [],
             "transport_kind": "structured" if structured else "cli",
-            "access_modes": list(ACCESS_MODE_VALUES) if structured else [],
             "default_for_engine": (
                 DEFAULT_ADAPTER_BY_ENGINE.get(engine) == adapter_id
             ),
@@ -647,7 +720,12 @@ class AgentRuntimeService:
                     if engine in DEFAULT_CLI_ADAPTER_BY_ENGINE
                 ]
             elif transport_kind == "structured":
-                adapter_ids = list(DEFAULT_STRUCTURED_ADAPTER_BY_ENGINE.values())
+                adapter_ids = [
+                    adapter.adapter_id for descriptor in all_descriptors()
+                    for adapter in descriptor.adapters
+                    if adapter.role == "default"
+                    or (adapter.role == "variant" and adapter.capabilities.access_modes)
+                ]
             else:
                 adapter_ids = list(DEFAULT_STRUCTURED_ADAPTER_BY_ENGINE.values()) + [
                     f"cli.{engine}" for engine in VALID_BASE_ENGINES]
@@ -681,6 +759,7 @@ class AgentRuntimeService:
             )
             row.setdefault("auth", cached_auth or self._auth_view(
                 row["engine"], str(row.get("credential_ref") or "")))
+            row["access_modes"] = _resolved_access_modes(row)
         return out
 
     def _instance_view(self, cfg: RuntimeInstanceConfig, *, discovered: bool) -> dict[str, Any]:
@@ -689,9 +768,6 @@ class AgentRuntimeService:
         view["configured"] = not discovered
         view["transport_kind"] = (
             "cli" if cfg.adapter_id.startswith("cli.") else "structured"
-        )
-        view["access_modes"] = (
-            [] if cfg.adapter_id.startswith("cli.") else list(ACCESS_MODE_VALUES)
         )
         view["default_for_engine"] = (
             cfg.instance_id == "default"
@@ -721,6 +797,7 @@ class AgentRuntimeService:
         )
         view["auth"] = cached_auth or self._auth_view(
             view["engine"], str(view.get("credential_ref") or ""))
+        view["access_modes"] = _resolved_access_modes(view)
         return view
 
     # -- 认证状态与登录指引 --------------------------------------------------------
@@ -826,103 +903,81 @@ class AgentRuntimeService:
         force_version_check: bool = False,
         credential_id: str = "",
         environment: str = "local",
+        refresh: bool = False,
     ) -> dict[str, Any]:
-        """Share only probes with the same Runtime configuration and owner."""
+        """Probe one instance through the shared ``ProbeCache`` and publish health.
+
+        ``refresh=True`` bypasses a fresh cache entry; concurrent callers of
+        the same Runtime configuration and credential scope share one probe.
+        """
         adapter_id = canonical_adapter_id(adapter_id)
         key = f"{adapter_id}:{instance_id}"
         if environment != "local":
             raise ValueError("Runtime probes execute in the local conversation environment")
         credential_id = canonical_credential_id(credential_id, engine=engine_of_adapter(adapter_id))
-        if credential_id and adapter_id != "codex.app_server":
-            raise ValueError("Scoped model catalog probing is supported by codex.app_server")
+        if credential_id:
+            _require_scoped_model_catalog_probe(adapter_id)
         cfg = self.store.get(adapter_id, instance_id)
         configuration = json.loads(json.dumps(cfg.to_dict())) if cfg is not None else None
-        task_key = json.dumps([key, credential_id, environment, configuration], sort_keys=True)
-        existing = self._probe_tasks.get(task_key)
-        if existing is not None and not existing.done():
-            return await asyncio.shield(existing)
-
-        async def _perform() -> dict[str, Any]:
-            try:
-                # Registered adapters keep their last report on the instance.
-                # Serialize different credential probes so that report cannot
-                # be read back as the other request's result.
-                async with self._probe_locks.setdefault(key, asyncio.Lock()):
-                    return await self._probe_one_unlocked(
-                        adapter_id, instance_id,
-                        force_version_check=force_version_check,
-                        credential_id=credential_id, environment=environment,
-                        configuration=configuration,
-                    )
-            except Exception as exc:
-                if credential_id or isinstance(exc, RuntimeProbeScopeChangedError):
-                    raise
-                engine = engine_of_adapter(adapter_id)
-                previous = self.store.health(key) or {}
-                self.store.save_health(key, {
-                    "healthy": False,
-                    "detail": f"{type(exc).__name__}: {exc}",
-                    "binary_path": "",
-                    "runtime_version": "",
-                    "probed_at": utcnow().isoformat(),
-                    "capabilities": {},
-                    "capability_injection": {},
-                    "field_sources": {},
-                    "degradations": [],
-                    "auth": self._auth_view(engine, "") if engine else {},
-                    "source": "probe_error",
-                    "version_check": dict(previous.get("version_check") or {}),
-                })
-                raise
-
-        task = asyncio.create_task(_perform())
-        self._probe_tasks[task_key] = task
         try:
             return await asyncio.wait_for(
-                asyncio.shield(task), timeout=self._probe_timeout_s,
+                self._probe_one_unlocked(
+                    adapter_id, instance_id,
+                    force_version_check=force_version_check,
+                    credential_id=credential_id, environment=environment,
+                    configuration=configuration, refresh=refresh,
+                ),
+                timeout=self._probe_timeout_s,
             )
-        except asyncio.CancelledError:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            raise
         except asyncio.TimeoutError as exc:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            engine = engine_of_adapter(adapter_id)
-            previous = self.store.health(key) or {}
             detail = f"Runtime 探测超过 {self._probe_timeout_s:g} 秒"
             if credential_id:
                 raise TimeoutError(detail) from exc
-            self.store.save_health(key, {
-                "healthy": False,
-                "detail": detail,
-                "binary_path": "",
-                "runtime_version": "",
-                "probed_at": utcnow().isoformat(),
-                "capabilities": {},
-                "capability_injection": {},
-                "field_sources": {},
-                "degradations": [detail],
-                "auth": self._auth_view(engine, "") if engine else {},
-                "source": "probe_timeout",
-                "version_check": dict(previous.get("version_check") or {}),
-            })
+            await self._save_probe_failure(key, adapter_id, detail, source="probe_timeout")
             raise TimeoutError(detail) from exc
-        finally:
-            if task.done() and self._probe_tasks.get(task_key) is task:
-                self._probe_tasks.pop(task_key, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if credential_id or isinstance(exc, RuntimeProbeScopeChangedError):
+                raise
+            await self._save_probe_failure(
+                key, adapter_id, f"{type(exc).__name__}: {exc}", source="probe_error",
+                code=str(getattr(exc, "code", "") or ""))
+            raise
+
+    async def _save_probe_failure(
+        self, key: str, adapter_id: str, detail: str, *, source: str, code: str = "",
+    ) -> None:
+        engine = engine_of_adapter(adapter_id)
+        previous = self.store.health(key) or {}
+        auth = await asyncio.to_thread(self._auth_view, engine, "") if engine else {}
+        self.store.save_health(key, {
+            "healthy": False,
+            "detail": detail,
+            **({"error_code": code} if code else {}),
+            "binary_path": "",
+            "runtime_version": "",
+            "probed_at": utcnow().isoformat(),
+            "capabilities": {},
+            "capability_injection": {},
+            "field_sources": {},
+            "degradations": [detail] if source == "probe_timeout" else [],
+            "auth": auth,
+            "source": source,
+            "version_check": dict(previous.get("version_check") or {}),
+        })
 
     async def _probe_credential_catalog(
         self, adapter_id: str, instance_id: str, credential_id: str,
-        configuration: dict[str, Any] | None,
+        configuration: dict[str, Any] | None, *, refresh: bool,
     ) -> tuple[Any, str]:
-        """Prepare a small temporary native home for the selected credential."""
+        """Probe in a small temporary native home for the selected credential.
+
+        The cache scope carries the credential id and revision, so a changed
+        credential never reads another revision's catalog.  The temporary
+        home lives inside the shared probe task; joined callers do not depend
+        on the first caller's directory.
+        """
         from muteki.conversation.chat_plugins import ChatPluginService
         from muteki.external_agents.factory import RuntimeAdapterConfig
         from muteki.external_agents.probe_environment import PROBE_ENVIRONMENT
@@ -931,45 +986,54 @@ class AgentRuntimeService:
             CredentialAccountStore, account_id_from_credential_id, account_store_root,
         )
 
+        _require_scoped_model_catalog_probe(adapter_id)
+        engine = engine_of_adapter(adapter_id)
         accounts = CredentialAccountStore(account_store_root(self.sessions_root))
         account_id = account_id_from_credential_id(credential_id)
         revision = accounts.revision(account_id) if account_id else ""
+        request = ProbeRequest(runtime_instance_id=instance_id, include_models=True)
 
-        base = self.sessions_root / "_runtime_probe_environments"
-        base.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with tempfile.TemporaryDirectory(prefix="probe-", dir=base) as directory:
-            root = Path(directory)
+        async def run() -> CapabilityProbeReport:
+            base = self.sessions_root / "_runtime_probe_environments"
+            base.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with tempfile.TemporaryDirectory(prefix="probe-", dir=base) as directory:
+                root = Path(directory)
 
-            def prepare() -> dict[str, str]:
-                resolved = resolve_credential_env(
-                    credential_id, engine="codex", sessions_root=self.sessions_root,
-                    container=False, agent_state_dir=root / "credentials",
-                )
-                cfg = RuntimeAdapterConfig.from_value(configuration or {
-                    "adapter_id": adapter_id, "instance_id": instance_id})
-                configured = self.factory._env(cfg) if self.factory is not None else {}
-                return ChatPluginService(root / "native").prepare_environment(
-                    "codex", f"probe:{adapter_id}:{instance_id}:{credential_id}",
-                    {**configured, **resolved.env}, include_assets=False,
-                )
+                def prepare() -> dict[str, str]:
+                    resolved = resolve_credential_env(
+                        credential_id, engine=engine, sessions_root=self.sessions_root,
+                        container=False, agent_state_dir=root / "credentials",
+                    )
+                    cfg = RuntimeAdapterConfig.from_value(configuration or {
+                        "adapter_id": adapter_id, "instance_id": instance_id})
+                    configured = self.factory._env(cfg) if self.factory is not None else {}
+                    return ChatPluginService(root / "native").prepare_environment(
+                        engine, f"probe:{adapter_id}:{instance_id}:{credential_id}",
+                        {**configured, **resolved.env}, include_assets=False,
+                    )
 
-            preparation = asyncio.create_task(asyncio.to_thread(prepare))
-            try:
-                env = await asyncio.shield(preparation)
-            except asyncio.CancelledError:
-                # to_thread cannot be stopped. Wait for its writes to finish
-                # before removing the temporary credential/home tree.
-                await preparation
-                raise
-            token = PROBE_ENVIRONMENT.set(env)
-            try:
-                report = await self.registry.probe(adapter_id, instance_id, request=ProbeRequest(
-                    runtime_instance_id=instance_id, include_models=True))
-                if account_id and accounts.revision(account_id) != revision:
-                    raise RuntimeProbeScopeChangedError("Credential configuration changed during model catalog probing")
-                return report, revision
-            finally:
-                PROBE_ENVIRONMENT.reset(token)
+                preparation = asyncio.create_task(asyncio.to_thread(prepare))
+                try:
+                    env = await asyncio.shield(preparation)
+                except asyncio.CancelledError:
+                    # to_thread cannot be stopped. Wait for its writes to finish
+                    # before removing the temporary credential/home tree.
+                    await preparation
+                    raise
+                token = PROBE_ENVIRONMENT.set(env)
+                try:
+                    return await self.registry.run_probe(adapter_id, instance_id, request)
+                finally:
+                    PROBE_ENVIRONMENT.reset(token)
+
+        key = self.registry.probe_key(
+            adapter_id, instance_id, request=request,
+            scope=credential_scope(credential_id, revision))
+        entry = await self.probe_cache.get(key, run, refresh=refresh)
+        report = entry.require_report()
+        if account_id and accounts.revision(account_id) != revision:
+            raise RuntimeProbeScopeChangedError("Credential configuration changed during model catalog probing")
+        return report, revision
 
     async def _check_version(
         self,
@@ -980,44 +1044,32 @@ class AgentRuntimeService:
         runtime_version: str,
         force: bool,
     ) -> dict[str, Any]:
-        """读取发布版本并做五分钟缓存；失败时保留同版本的上次成功结果。"""
-        cache_key = f"{engine}\0{binary_path}\0{runtime_version}"
-        cached = self._version_cache.get(cache_key)
-        now = time.monotonic()
-        if cached and not force and now - cached[0] < self._version_cache_ttl_s:
-            return dict(cached[1])
-        existing = self._version_tasks.get(cache_key)
-        if existing is not None and not existing.done():
-            return await asyncio.shield(existing)
+        """读取发布版本（version_check 内 TTL + single-flight）；源失败时保留同版本的上次成功结果。"""
+        from muteki.external_agents.version_check import cached_check_cli_version
 
-        async def _perform() -> dict[str, Any]:
-            from muteki.external_agents.version_check import check_cli_version
-
-            result = await check_cli_version(engine, binary_path, runtime_version)
-            if result.get("status") == "unknown":
-                previous = dict((self.store.health(key) or {}).get("version_check") or {})
-                same_install = (
-                    previous.get("installed_version")
-                    and previous.get("installed_version") == result.get("installed_version")
-                )
-                if same_install and previous.get("latest_version"):
-                    result = {
-                        **previous,
-                        "stale": True,
-                        "attempted_at": result.get("checked_at"),
-                        "detail": "版本源暂时不可用，沿用上次检查结果",
-                        "error": result.get("error", ""),
-                    }
-            self._version_cache[cache_key] = (time.monotonic(), dict(result))
+        result = await cached_check_cli_version(
+            engine, binary_path, runtime_version, force=force)
+        if result.get("status") != "unknown":
             return result
-
-        task = asyncio.create_task(_perform())
-        self._version_tasks[cache_key] = task
-        try:
-            return await asyncio.shield(task)
-        finally:
-            if task.done() and self._version_tasks.get(cache_key) is task:
-                self._version_tasks.pop(cache_key, None)
+        previous = dict((self.store.health(key) or {}).get("version_check") or {})
+        same_install = (
+            previous.get("installed_version")
+            and previous.get("installed_version") == result.get("installed_version")
+        )
+        if engine == "opencode" and result.get("installed_version"):
+            major = str(result["installed_version"]).split(".", 1)[0]
+            same_install = same_install and previous.get("source") == (
+                "npm:opencode-ai" if major == "1" else "npm:@opencode/cli")
+        if same_install and previous.get("latest_version"):
+            return {
+                **previous,
+                "stale": True,
+                "attempted_at": result.get("checked_at"),
+                "detail": "版本源暂时不可用，沿用上次检查结果",
+                "error": result.get("error", ""),
+                "error_code": result.get("error_code", ""),
+            }
+        return result
 
     async def _probe_one_unlocked(
         self,
@@ -1028,13 +1080,14 @@ class AgentRuntimeService:
         credential_id: str = "",
         environment: str = "local",
         configuration: dict[str, Any] | None = None,
+        refresh: bool = False,
     ) -> dict[str, Any]:
         """对一个 instance 做 capability probe 并写健康缓存。
 
         优先使用 AdapterRegistry 中已注册的实例（RUNTIME-01）；否则对该
         引擎的 CLI 兼容路径做本机实测（binary + --version + 覆写检测）。
-        probe 失败抛出异常，由调用方归类为该实例的失败事件——不影响其他
-        实例。
+        两条路径都经共享 ``ProbeCache``。probe 失败抛出 typed 异常，由调用方
+        归类为该实例的失败事件——不影响其他实例。
         """
         engine = engine_of_adapter(adapter_id)
         if not engine:
@@ -1052,28 +1105,40 @@ class AgentRuntimeService:
         report: Any = None
         credential_revision = ""
         source = "cli_driver"
+        probed_at = utcnow()
+        probe_cached = False
         if self.registry is not None and self.registry.record(adapter_id, instance_id) is not None:
             if credential_id:
                 report, credential_revision = await self._probe_credential_catalog(
-                    adapter_id, instance_id, credential_id, configuration)
+                    adapter_id, instance_id, credential_id, configuration, refresh=refresh)
             else:
-                report = await self.registry.probe(adapter_id, instance_id)
+                entry = await self.registry.probe_entry(
+                    adapter_id, instance_id, refresh=refresh)
+                report = entry.require_report()
+                probed_at, probe_cached = entry.probed_at, entry.cached
             caps = report.capabilities
             source = "registry"
         elif adapter_id.startswith("cli."):
-            from muteki.external_agents.capabilities import probe_cli_driver
+            from muteki.external_agents.capabilities import probe_cli_driver_async
             from muteki.solver.cli_driver import DRIVERS
 
             driver = DRIVERS.get(engine)
             if driver is None:
                 raise ValueError(f"引擎 {engine!r} 没有可用的 CLI Driver")
-            report = await asyncio.to_thread(
-                probe_cli_driver,
-                driver,
-                adapter_id=adapter_id,
-                instance_id=instance_id,
-                include_models=True,
+            probe_key = ProbeKey(
+                adapter_id=adapter_id, instance_id=instance_id,
+                binary=BinaryIdentity.of(driver_binary(driver)),
+                config_hash=config_hash(configuration),
             )
+            entry = await self.probe_cache.get(
+                probe_key,
+                lambda: probe_cli_driver_async(
+                    driver, adapter_id=adapter_id, instance_id=instance_id,
+                    include_models=True),
+                refresh=refresh,
+            )
+            report = entry.require_report()
+            probed_at, probe_cached = entry.probed_at, entry.cached
             caps = report.capabilities
         else:
             raise LookupError(
@@ -1086,22 +1151,24 @@ class AgentRuntimeService:
         overridden = str(cfg.binary_path if cfg else "").strip()
         if overridden:
             binary_path = overridden
-            from muteki.external_agents.capabilities import _probe_version
+            from muteki.external_agents.capabilities import probe_version
 
-            version = _probe_version(overridden)
-            if not version:
+            adapter = (self.registry.get(adapter_id, instance_id)
+                       if self.registry is not None and self.registry.record(adapter_id, instance_id) is not None else None)
+            version_argv = getattr(adapter, "probe_version_argv", None)
+            override = await probe_version(version_argv() if callable(version_argv) else overridden)
+            if not override.ok:
                 healthy = False
-                detail = f"实例配置的 binary 不可运行：{overridden}"
+                detail = f"实例配置的 binary 不可运行：{override.describe()}"
             elif not caps.runtime_version:
-                caps = caps.model_copy(update={"runtime_version": version})
+                caps = caps.model_copy(update={"runtime_version": override.version})
 
         auth = await asyncio.to_thread(
             self._auth_view,
             engine,
             str(cfg.credential_ref if cfg else ""),
-            detect_host=adapter_id.startswith("cli.") or adapter_id == "devin.acp",
+            detect_host=adapter_id.startswith("cli.") or _host_login_only(adapter_id),
         )
-        from muteki.external_agents.capabilities import describe_injection_path
         binary_source = ""
         binary_env = ""
         if adapter_id.startswith("cli."):
@@ -1113,8 +1180,8 @@ class AgentRuntimeService:
 
                 binary_source = resolve_engine_bin_source(engine)
                 binary_env = str(_ENV_OVERRIDE.get(engine) or "")
-            except Exception:  # noqa: BLE001 — 仅影响诊断元数据
-                pass
+            except Exception as exc:  # noqa: BLE001 — 仅影响诊断元数据，原因写入该字段
+                binary_source = f"unresolved: {type(exc).__name__}: {exc}"
 
         runtime_version = str(getattr(caps, "runtime_version", "") or "")
         version_check = await self._check_version(
@@ -1132,7 +1199,8 @@ class AgentRuntimeService:
             "binary_env": binary_env,
             "runtime_version": runtime_version,
             "version_check": version_check,
-            "probed_at": utcnow().isoformat(),
+            "probed_at": probed_at.isoformat(),
+            "probe_cached": probe_cached,
             "capabilities": caps.model_dump(mode="json") if hasattr(caps, "model_dump") else {},
             "capability_injection": describe_injection_path(caps),
             "field_sources": dict(getattr(report, "field_sources", {}) or {}),
@@ -1174,10 +1242,12 @@ class AgentRuntimeService:
         *,
         transport_kind: str = "",
         force_version_check: bool = False,
+        refresh: bool = False,
     ) -> dict[str, Any]:
         """批量 probe（配置实例 + 该范围引擎的默认发现实例）。
 
-        单实例失败被隔离进结果条目，不中断其余实例。
+        单实例失败被隔离进结果条目，不中断其余实例。``refresh=False``
+        时 TTL 内的缓存结果直接复用。
         """
         views = self.list_instances(
             adapter_id,
@@ -1199,16 +1269,19 @@ class AgentRuntimeService:
                         view["adapter_id"],
                         view["instance_id"],
                         force_version_check=force_version_check,
+                        refresh=refresh,
                     )
                     entry["ok"] = True
                     entry["healthy"] = bool(health.get("healthy"))
                     entry["detail"] = str(health.get("detail") or "")
+                    entry["probe_cached"] = bool(health.get("probe_cached"))
                     entry["version_check"] = dict(
                         health.get("version_check") or {})
                 except Exception as exc:  # noqa: BLE001 — 故障隔离
                     entry["ok"] = False
                     entry["healthy"] = False
-                    entry["detail"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+                    entry["error_code"] = str(getattr(exc, "code", "") or "")
+                    entry["detail"] = f"{type(exc).__name__}: {exc}"
             return entry
 
         results = list(await asyncio.gather(*(probe(view) for view in views)))
@@ -1227,7 +1300,9 @@ class AgentRuntimeService:
             return []
         try:
             cfg = self.worker_config.get()
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — profiles only add discovered views
+            _LOG.error("worker config unreadable; worker profiles omitted: %s: %s",
+                       type(exc).__name__, exc)
             return []
         return [p for p in cfg.get("worker_profiles") or [] if isinstance(p, dict)]
 
@@ -1482,8 +1557,8 @@ class RuntimeInstanceCommandHandler:
             if not isinstance(raw_credential, str) or environment != "local":
                 raise ValueError("credential_id must be a string and environment must be local")
             credential_id = canonical_credential_id(raw_credential, engine=engine_of_adapter(adapter_id))
-            if credential_id and adapter_id != "codex.app_server":
-                raise ValueError("Scoped model catalog probing is supported by codex.app_server")
+            if credential_id:
+                _require_scoped_model_catalog_probe(adapter_id)
         except ValueError as exc:
             raise CommandFailed(make_error(
                 "runtime.instance.probe_scope_invalid", str(exc), ErrorCategory.VALIDATION,
@@ -1491,12 +1566,15 @@ class RuntimeInstanceCommandHandler:
 
         async def _probe() -> SideEffectResult:
             try:
+                # An explicit probe command is the refresh action: it never
+                # answers from a fresh cache entry.
                 health = await service.probe_one(
                     adapter_id,
                     instance_id,
                     force_version_check=True,
                     credential_id=credential_id,
                     environment=environment,
+                    refresh=True,
                 )
             except Exception as exc:  # noqa: BLE001 — 归类为该实例的失败
                 return SideEffectResult(
@@ -1581,6 +1659,7 @@ class RuntimeInstanceCommandHandler:
                 adapter_id or None,
                 transport_kind=transport_kind,
                 force_version_check=True,
+                refresh=True,
             )
             failed = [r for r in summary["results"] if not r["ok"]]
             return SideEffectResult(
@@ -1908,6 +1987,92 @@ class RuntimeInstanceQueryHandler:
         )
 
 
+def _instance_capabilities(view: dict[str, Any]) -> dict[str, Any]:
+    """Declared capabilities of one instance overlaid with its cached probe.
+
+    Reads only the cached health snapshot; never starts a probe.
+    """
+    from pydantic import ValidationError
+    from muteki.platform.contracts.external_agents import AgentCapabilities
+
+    adapter_id = str(view.get("adapter_id") or "")
+    descriptor = descriptor_for_adapter(adapter_id)
+    health = view.get("health") if isinstance(view.get("health"), dict) else {}
+    snapshot = health.get("capabilities") if isinstance(health, dict) else None
+    probe: AgentCapabilities | None = None
+    snapshot_error: dict[str, str] | None = None
+    if isinstance(snapshot, dict) and snapshot:
+        try:
+            probe = AgentCapabilities.model_validate(snapshot)
+        except ValidationError as exc:
+            snapshot_error = {
+                "code": "provider.capability_snapshot_invalid",
+                "message": str(exc),
+            }
+    field_sources = health.get("field_sources") if isinstance(health, dict) else None
+    caps, sources = resolve_capabilities(
+        descriptor, probe, adapter_id=adapter_id,
+        probe_sources=field_sources if isinstance(field_sources, dict) else None,
+    )
+    adapter = descriptor.adapter(adapter_id)
+    row: dict[str, Any] = {
+        "key": str(view.get("key") or ""),
+        "adapter_id": adapter_id,
+        "engine": descriptor.engine,
+        "role": adapter.role,
+        "configured": bool(view.get("configured")),
+        "probed_at": str((health or {}).get("probed_at") or ""),
+        "capabilities": caps.model_dump(mode="json"),
+        "capability_sources": sources,
+        "native_rewind": adapter.native_rewind,
+        "capability_gateway": adapter.capability_gateway,
+        "access_mode_notes": dict(adapter.access_mode_notes),
+    }
+    if snapshot_error is not None:
+        row["capability_snapshot_error"] = snapshot_error
+    return row
+
+
+def _resolved_access_modes(view: dict[str, Any]) -> list[str]:
+    """Access modes the adapter enforces (declared ∩ cached probe).
+
+    A stored instance whose adapter no longer has a descriptor keeps ``[]``;
+    ``_instance_capabilities`` stays strict for the descriptor query.
+    """
+    if find_descriptor_for_adapter(str(view.get("adapter_id") or "")) is None:
+        return []
+    return list(_instance_capabilities(view)["capabilities"]["access_modes"])
+
+
+class ProviderDescriptorQueryHandler:
+    """Provider descriptors plus per-instance resolved capabilities."""
+
+    query_types = {"runtime.descriptor.list"}
+
+    def __init__(self, service: AgentRuntimeService) -> None:
+        self._service = service
+
+    async def handle(self, query: Any, ctx: HandlerContext) -> QueryResult:
+        engine = str(query.params.get("engine") or "").strip().lower()
+        descriptors = (get_descriptor(engine),) if engine else all_descriptors()
+        engines = {item.engine for item in descriptors}
+        instances = [
+            _instance_capabilities(view)
+            for view in self._service.list_instances(include_discovered=True)
+            if engine_of_adapter(str(view.get("adapter_id") or "")) in engines
+        ]
+        return QueryResult(
+            query_id=query.query_id,
+            query_type=query.query_type,
+            result={
+                "schema_version": DESCRIPTOR_SCHEMA_VERSION,
+                "descriptors": [public_descriptor(item) for item in descriptors],
+                "instances": instances,
+                "count": len(descriptors),
+            },
+        )
+
+
 class WorkerProfileQueryHandler:
     """Worker Profile 只读查询（含 Runtime instance 确定映射）。"""
 
@@ -1945,6 +2110,8 @@ def register_agent_runtime_handlers(
         api.register_query(RuntimeInstanceQueryHandler(service))
     if "worker_profile.list" not in known_queries:
         api.register_query(WorkerProfileQueryHandler(service))
+    if "runtime.descriptor.list" not in known_queries:
+        api.register_query(ProviderDescriptorQueryHandler(service))
 
 
 # ---------------------------------------------------------------------------
@@ -2051,6 +2218,19 @@ def create_agent_runtime_router(
     @router.get("/api/agent-runtimes/profiles")
     async def list_worker_profiles() -> Any:
         result = await command_api.query(_query("worker_profile.list"))
+        return result.result
+
+    @router.get("/api/agent-runtimes/descriptors")
+    async def list_provider_descriptors(engine: str = "") -> Any:
+        selected = str(engine or "").strip().lower()
+        if selected and find_descriptor(selected) is None:
+            error = ErrorEnvelope(
+                code=UnknownProviderError.code,
+                message=f"no provider descriptor for engine {selected!r}",
+                category=ErrorCategory.NOT_FOUND,
+            )
+            return JSONResponse({"error": error.model_dump(mode="json")}, status_code=404)
+        result = await command_api.query(_query("runtime.descriptor.list", engine=selected))
         return result.result
 
     @router.get("/api/agent-runtimes/{instance_key}")
@@ -2192,6 +2372,7 @@ def create_agent_runtime_router(
 __all__ = [
     "AgentRuntimeService",
     "LOGIN_GUIDANCE",
+    "ProviderDescriptorQueryHandler",
     "OPERATOR",
     "PRODUCER",
     "RuntimeInstanceCommandHandler",

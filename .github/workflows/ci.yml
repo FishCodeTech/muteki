@@ -44,6 +44,8 @@ jobs:
               - '.github/actions/**'
             web:
               - 'apps/web/ui/**'
+              - 'apps/desktop/**'
+              - 'scripts/check_conversation_selection.cjs'
               - '.github/workflows/ci.yml'
               - '.github/actions/**'
 
@@ -86,6 +88,12 @@ jobs:
         if: ${{ !cancelled() && steps.node.outcome == 'success' }}
         working-directory: apps/web/ui
         run: npm ci
+
+      - name: Check shared settings and client preferences
+        if: ${{ !cancelled() && steps.ui-deps.outcome == 'success' }}
+        run: |
+          node --test apps/desktop/test/policy.test.cjs
+          node scripts/check_conversation_selection.cjs
 
       - name: Check TypeScript
         id: typecheck

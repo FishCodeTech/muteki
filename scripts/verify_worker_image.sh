@@ -53,6 +53,7 @@ ENGINE_CHECKS=(
   "kimi:kimi"
   "grok:/home/kali/.grok/bin/grok"
   "opencode:opencode"
+  "droid:droid"
 )
 
 CORE_BOTH=(
@@ -123,11 +124,11 @@ run_verify() {
     versions+=("${name}=${out//$'\n'/ }")
   done
   local engine_count="${#ENGINE_CHECKS[@]}"
-  if [[ "$engine_count" -ne 8 ]]; then
-    echo "FAIL: expected 8 engines, got ${engine_count}" >&2
+  if [[ "$engine_count" -ne 9 ]]; then
+    echo "FAIL: expected 9 engines, got ${engine_count}" >&2
     exit 1
   fi
-  echo "OK: all 8 container engines started"
+  echo "OK: all 9 container engines started"
 
   local path
   for path in "${CORE_BOTH[@]}"; do

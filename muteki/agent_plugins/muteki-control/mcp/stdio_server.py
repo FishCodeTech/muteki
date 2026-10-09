@@ -27,6 +27,8 @@ PROTOCOL_VERSIONS = (
 )
 METHOD_DESCRIBE = "muteki.describe"
 METHOD_INVOKE = "muteki.invoke"
+# The default bounded wait is 30 s. Leave time for the response and transport.
+GATEWAY_TIMEOUT_SECONDS = 45.0
 
 
 class BridgeError(RuntimeError):
@@ -74,7 +76,7 @@ def _gateway_call(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=GATEWAY_TIMEOUT_SECONDS) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")
@@ -152,11 +154,12 @@ def _handle(request: dict[str, Any], config_path: Path) -> Optional[dict[str, An
         })
         if not isinstance(payload, dict):
             payload = {"ok": True, "result": payload}
+        images = payload.pop("images", None) or []
         return _response(request_id, {
             "content": [{
                 "type": "text",
                 "text": json.dumps(payload, ensure_ascii=False),
-            }],
+            }, *(image for image in images if isinstance(image, dict))],
             "structuredContent": payload,
             "isError": not bool(payload.get("ok", True)),
         })

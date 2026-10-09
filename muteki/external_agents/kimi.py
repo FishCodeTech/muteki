@@ -60,12 +60,31 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shutil
+import socket
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
 import httpx
 
+from muteki.platform.contracts.agent_events import (
+    AgentNodePayload,
+    AgentUpdatedPayload,
+    ApprovalRequestedPayload,
+    ApprovalResolvedPayload,
+    FailureCategory,
+    MessageCompletedPayload,
+    MessageDeltaPayload,
+    ReasoningPayload,
+    RuntimeErrorPayload,
+    RuntimeWarningPayload,
+    SessionPayload,
+    ToolPayload,
+    TurnCompletedPayload,
+    TurnFailedPayload,
+    TurnStartedPayload,
+    UsagePayload,
+    dump_payload,
+)
 from muteki.platform.contracts.base import new_id
 from muteki.platform.contracts.external_agents import (
     AccessMode,
@@ -74,8 +93,11 @@ from muteki.platform.contracts.external_agents import (
     AgentEventType,
     AgentInput,
     AgentSessionRef,
+    ApprovalResponseInput,
+    MessageInput,
     ProbeRequest,
     SessionStart,
+    SteerInput,
 )
 from muteki.platform.contracts.receipts import (
     AggregateRef,
@@ -84,40 +106,82 @@ from muteki.platform.contracts.receipts import (
 )
 
 from .acp import AcpHello, AcpTransport, BaseAcpAdapter, check_response
+from .approvals import ApprovalDecision, ApprovalScope
 from .base import BaseExternalAgentAdapter
 from .capabilities import (
+    AccessModeUnsupportedError,
     BOOL_CAPABILITY_FIELDS,
     CapabilityProbeReport,
     SOURCE_PROBE,
     SOURCE_STATIC,
     conservative_capabilities,
+    require_access_mode,
     _probe_version,
 )
 from .events import build_event
+from .probe_environment import subprocess_environment
+from .process_supervisor import SupervisedProcess, spawn_supervised
+from .rpc import ProcessOutputLog
 from .sessions import classify_exit
+
+#: Stable codes. Callers branch on these, not on the message text.
+KIMI_LOCAL_SERVER_UNAVAILABLE = "kimi.local_server.unavailable"
+KIMI_LOCAL_SERVER_LAUNCH_FAILED = "kimi.local_server.launch_failed"
 
 
 def default_kimi_binary() -> str:
     return os.environ.get("MUTEKI_KIMI_BIN", "kimi")
 
 
-def _kimi_supervised_config(text: str) -> str:
-    """Add Kimi-native ask rules without changing the user's config.
+def _kimi_git_worktree_root(cwd: str) -> Optional[Path]:
+    """Mirror Kimi's ``findGitWorkTree``: nearest ``.git`` dir or gitdir file."""
+    try:
+        current = Path(cwd).expanduser().resolve()
+    except OSError:
+        return None
+    for directory in (current, *current.parents):
+        marker = directory / ".git"
+        try:
+            if marker.is_dir():
+                return directory
+            if marker.is_file():
+                first = marker.read_text(
+                    encoding="utf-8", errors="replace"
+                ).lstrip("\ufeff").lstrip().splitlines()
+                if first and first[0].strip().startswith("gitdir:"):
+                    return directory
+        except OSError:
+            continue
+    return None
 
-    Kimi's manual mode intentionally auto-approves Write/Edit inside a Git
-    worktree.  Explicit user rules run before that built-in policy, so these
-    rules make Muteki's supervised promise exact while leaving Kimi's mode
-    engine and permission UI in control.
-    """
-    suffix = "" if not text or text.endswith(("\n", "\r")) else "\n"
-    rules = "".join(
-        "\n[[permission.rules]]\n"
-        "decision = \"ask\"\n"
-        f"pattern = \"{tool}\"\n"
-        "reason = \"Muteki supervised mode\"\n"
-        for tool in ("Write", "Edit", "Bash")
+
+_KIMI_SUPERVISED_WORKTREE_REASON = (
+    "Kimi's manual mode auto-approves Write/Edit inside a Git worktree "
+    "(native git-cwd-write-approve policy), and Kimi (verified on 2.1.1) does "
+    "not apply [[permission.rules]] ask rules that could override it, so "
+    "supervised approval cannot be enforced here; choose auto-accept-edits, "
+    "auto or full-access, or use a working directory outside Git"
+)
+
+
+def _require_kimi_supervised_enforceable(
+    adapter_id: str, access_mode: Optional[str], cwd: str
+) -> None:
+    if access_mode != AccessMode.SUPERVISED.value:
+        return
+    root = _kimi_git_worktree_root(cwd)
+    if root is None:
+        return
+    raise AccessModeUnsupportedError(
+        adapter_id,
+        access_mode,
+        (
+            AccessMode.AUTO_ACCEPT_EDITS.value,
+            AccessMode.AUTO.value,
+            AccessMode.FULL_ACCESS.value,
+        ),
+        f"{_KIMI_SUPERVISED_WORKTREE_REASON} (Git worktree: {root})",
     )
-    return f"{text}{suffix}{rules}"
 
 
 class KimiAcpAdapter(BaseAcpAdapter):
@@ -130,24 +194,24 @@ class KimiAcpAdapter(BaseAcpAdapter):
     """
 
     adapter_id = "kimi.acp"
+    # supervised/auto/full-access select Kimi's default/auto/yolo modes;
+    # auto-accept-edits keeps ``default`` and the shared ACP callback allows
+    # the ``edit`` kind Kimi reports for Write/Edit.
+    supported_access_modes = (
+        AccessMode.SUPERVISED.value,
+        AccessMode.AUTO_ACCEPT_EDITS.value,
+        AccessMode.AUTO.value,
+        AccessMode.FULL_ACCESS.value,
+    )
 
     def __init__(
         self,
         *,
         binary: Optional[str] = None,
-        runtime_root: Optional[str | Path] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self._binary = binary or default_kimi_binary()
-        self._runtime_root = Path(
-            runtime_root
-            or os.environ.get("MUTEKI_KIMI_RUNTIME_ROOT")
-            or (
-                Path(os.environ.get("MUTEKI_STATE_ROOT") or "state")
-                / "_kimi_acp_runtime"
-            )
-        ).expanduser().resolve()
 
     def _agent_argv(self) -> list[str]:
         return [self._binary, "acp"]
@@ -170,74 +234,17 @@ class KimiAcpAdapter(BaseAcpAdapter):
             return super()._select_auth_method(auth_methods)
         return None
 
+    def _validate_access_mode(self, request: SessionStart, cwd: str) -> None:
+        super()._validate_access_mode(request, cwd)
+        _require_kimi_supervised_enforceable(self.id, request.access_mode, cwd)
+
     def _prepare_session_environment(
         self, request: SessionStart, env: dict[str, str], cwd: str
     ) -> dict[str, str]:
         del cwd
         if request.effort and request.effort != "default":
             env = {**env, "KIMI_MODEL_THINKING_EFFORT": str(request.effort)}
-        mode = request.access_mode or AccessMode.SUPERVISED.value
-        if mode != AccessMode.SUPERVISED.value:
-            return env
-
-        prepared = dict(env)
-        source = Path(
-            prepared.get("KIMI_CODE_HOME")
-            or os.environ.get("KIMI_CODE_HOME")
-            or (Path.home() / ".kimi-code")
-        ).expanduser().resolve()
-        target = self._runtime_root / request.agent_session_id
-        target.mkdir(parents=True, exist_ok=True)
-        try:
-            target.chmod(0o700)
-        except OSError:
-            pass
-
-        # Reuse Kimi's auth, models, plugins and persistent data.  Only the
-        # config is private, so Muteki never rewrites the user's Kimi setup.
-        if source.is_dir() and source != target:
-            for item in source.iterdir():
-                if item.name == "config.toml":
-                    continue
-                if item.is_symlink() and not item.exists():
-                    continue
-                destination = target / item.name
-                if env.get("MUTEKI_CHAT_PRIVATE_ROOT") and destination.is_symlink():
-                    private = Path(env["MUTEKI_CHAT_PRIVATE_ROOT"]).resolve()
-                    if not destination.resolve().is_relative_to(private):
-                        destination.unlink()
-                if destination.exists() or destination.is_symlink():
-                    continue
-                try:
-                    destination.symlink_to(
-                        item, target_is_directory=item.is_dir()
-                    )
-                except OSError:
-                    if item.is_file():
-                        shutil.copy2(item, destination)
-
-        try:
-            config_text = (source / "config.toml").read_text(
-                encoding="utf-8"
-            )
-        except OSError:
-            config_text = ""
-        target_config = target / "config.toml"
-        target_config.write_text(
-            _kimi_supervised_config(config_text), encoding="utf-8"
-        )
-        try:
-            target_config.chmod(0o600)
-        except OSError:
-            pass
-        prepared["KIMI_CODE_HOME"] = str(target)
-        # Kimi 0.38's default agent-core-v2 ACP path validates permission
-        # rules but does not load them into the session permission service.
-        # Its maintained SDK/ACP adapter path does load the same native rules.
-        # Keep this scoped to Muteki supervised sessions until the v2 path
-        # applies its documented permission config as well.
-        prepared["KIMI_CODE_LEGACY_FLAG"] = "1"
-        return prepared
+        return env
 
     async def _after_session_open(
         self, transport: AcpTransport, session_id: str, request: SessionStart
@@ -245,7 +252,8 @@ class KimiAcpAdapter(BaseAcpAdapter):
         access_mode = request.access_mode or AccessMode.SUPERVISED.value
         native_mode = {
             AccessMode.SUPERVISED.value: "default",
-            # Kimi has no edit-only mode; retain its manual-approval mode.
+            # Kimi has no edit-only mode: its manual mode asks, and the shared
+            # ACP permission callback allows the ``edit`` kind.
             AccessMode.AUTO_ACCEPT_EDITS.value: "default",
             AccessMode.AUTO.value: "auto",
             AccessMode.FULL_ACCESS.value: "yolo",
@@ -263,7 +271,7 @@ class KimiAcpAdapter(BaseAcpAdapter):
 
     async def list_sessions(self) -> list[dict[str, Any]]:
         """真实 ``session/list``（短连接：initialize → list → 关闭）。"""
-        transport = AcpTransport(self._agent_argv())
+        transport = AcpTransport(self._with_launch_args(self._agent_argv()))
         await transport.start()
         try:
             hello = await transport.initialize(timeout=self._startup_timeout)
@@ -285,31 +293,133 @@ class KimiAcpAdapter(BaseAcpAdapter):
 # Kimi Local Server（experimental）
 # ---------------------------------------------------------------------------
 
-#: Local Server 默认端口（占用时 kimi 自动 +1 重试，实例注册在
-#: ``~/.kimi-code/server/instances/``）。
+#: ``kimi web`` 自身的默认端口。端口被占用时 kimi 会静默换到下一个端口
+#: （2.1.1 实测），所以自管 server 不用它，见 ``_free_local_port``。
 DEFAULT_SERVER_PORT = 58627
+
+
+def _free_local_port() -> int:
+    """A currently unused loopback port for a Muteki-owned ``kimi web``."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
 #: bearer token 的默认持久化位置（kimi web 首启生成，0600）。
 DEFAULT_TOKEN_FILE = Path.home() / ".kimi-code" / "server.token"
 
 
 class KimiLocalServerError(RuntimeError):
-    """Kimi Local Server 调用失败（传输错误或业务 code 非成功）。"""
+    """Kimi Local Server 调用失败（传输错误或业务 code 非成功）。
+
+    ``code`` 是稳定机器码（例如 ``kimi.local_server.unavailable``）。
+    启动失败必须带 code；本适配器不因此改走 ``kimi.acp``。
+    """
+
+    def __init__(self, message: str, *, code: str = "") -> None:
+        self.code = code
+        super().__init__(f"[{code}] {message}" if code else message)
 
 
-def resolve_server_token(explicit: str = "") -> str:
+def resolve_server_token(explicit: str = "", *, home: str = "") -> str:
     """bearer token 引用解析：显式参数 > 环境变量 > 实例 token 文件。
 
-    返回 token 本体。
+    ``home`` 是该 kimi 进程的 ``KIMI_CODE_HOME``：``kimi web`` 把 token 写在
+    它自己的 home 下，不是固定的 ``~/.kimi-code``。返回 token 本体。
     """
     if explicit:
         return explicit
     from_env = os.environ.get("KIMI_CODE_SERVER_TOKEN", "").strip()
     if from_env:
         return from_env
+    token_file = (
+        Path(home).expanduser() / "server.token" if home else DEFAULT_TOKEN_FILE)
     try:
-        return DEFAULT_TOKEN_FILE.read_text(encoding="utf-8").strip()
+        return token_file.read_text(encoding="utf-8").strip()
     except OSError:
         return ""
+
+
+#: Conversation access mode -> Kimi ``permission_mode`` sent with each prompt.
+#: auto-accept-edits keeps ``manual`` and Muteki answers Write/Edit approvals.
+_KIMI_SERVER_PERMISSION_MODES = {
+    AccessMode.SUPERVISED.value: "manual",
+    AccessMode.AUTO_ACCEPT_EDITS.value: "manual",
+    AccessMode.AUTO.value: "auto",
+    AccessMode.FULL_ACCESS.value: "yolo",
+}
+#: Kimi tool names whose approvals auto-accept-edits answers (the same tools
+#: Kimi's ACP server reports with the ``edit`` kind).
+_KIMI_EDIT_TOOLS = frozenset({"Write", "Edit"})
+#: Kimi Local Server envelope codes for approvals that are no longer pending.
+_KIMI_APPROVAL_GONE_CODES = {40404, 40902}
+
+
+def _openapi_request_properties(
+    openapi: dict[str, Any], path_suffix: str, method: str = "post"
+) -> Optional[set[str]]:
+    """Property names of a JSON request body in this instance's OpenAPI.
+
+    Returns ``None`` when the operation or its schema cannot be located, so
+    callers can refuse instead of guessing that a field is accepted.
+    """
+    paths = openapi.get("paths") if isinstance(openapi.get("paths"), dict) else {}
+    operation = next((
+        item.get(method) for path, item in paths.items()
+        if str(path).endswith(path_suffix) and isinstance(item, dict)
+        and isinstance(item.get(method), dict)
+    ), None)
+    if operation is None:
+        return None
+    content = ((operation.get("requestBody") or {}).get("content") or {})
+    schema = (content.get("application/json") or {}).get("schema")
+    components = (openapi.get("components") or {}).get("schemas") or {}
+
+    def collect(node: Any, depth: int = 0) -> Optional[set[str]]:
+        if not isinstance(node, dict) or depth > 8:
+            return None
+        ref = node.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/components/schemas/"):
+            return collect(components.get(ref.rsplit("/", 1)[-1]), depth + 1)
+        names: set[str] = set()
+        found = False
+        if isinstance(node.get("properties"), dict):
+            names.update(str(key) for key in node["properties"])
+            found = True
+        for key in ("allOf", "anyOf", "oneOf"):
+            for child in node.get(key) or []:
+                nested = collect(child, depth + 1)
+                if nested is not None:
+                    names.update(nested)
+                    found = True
+        return names if found else None
+
+    return collect(schema)
+
+
+def _kimi_usage_payload(usage: dict[str, Any]) -> dict[str, Any]:
+    """Kimi Local Server usage → normalized contract.
+
+    实测字段（0.38.0）：``inputOther`` / ``output`` / ``inputCacheRead`` /
+    ``inputCacheCreation``，input 与其他桶互斥，归一化 ``input_tokens``
+    补回缓存桶。
+    """
+    def _num(value: Any) -> Optional[int]:
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+    other = _num(usage.get("inputOther"))
+    read = _num(usage.get("inputCacheRead"))
+    write = _num(usage.get("inputCacheCreation"))
+    input_tokens = None
+    if any(value is not None for value in (other, read, write)):
+        input_tokens = (other or 0) + (read or 0) + (write or 0)
+    return dump_payload(UsagePayload(
+        scope="turn",
+        input_tokens=input_tokens,
+        output_tokens=_num(usage.get("output")),
+        cached_input_tokens=read,
+        cache_write_tokens=write,
+        native=dict(usage),
+    ))
 
 
 class KimiLocalServerAdapter(BaseExternalAgentAdapter):
@@ -338,10 +448,14 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
         manage_server: bool = True,
         startup_timeout: float = 30.0,
         prompt_timeout: float = 600.0,
+        log_root: Optional[str | Path] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(self.adapter_id, **kwargs)
         self._binary = binary or default_kimi_binary()
+        self._log_root = Path(log_root) if log_root is not None else None
+        self._server_outputs: dict[int, ProcessOutputLog] = {}
+        self._supervised: dict[int, SupervisedProcess] = {}
         self._attach_url = base_url
         self._token = token
         self._extra_env = dict(extra_env or {})
@@ -355,7 +469,7 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
 
     def _serve_argv(self, port: int) -> list[str]:
         """自管 server 进程命令行（子类/测试可覆盖指向 mock server）。"""
-        return [self._binary, "web", "--no-open"]
+        return [self._binary, "web", "--no-open", "--port", str(port)]
 
     def _server_env(
         self, session_env: Optional[dict[str, str]] = None
@@ -366,58 +480,107 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
         self, cwd: str, *, env: Optional[dict[str, str]] = None
     ) -> "tuple[Optional[asyncio.subprocess.Process], str, str]":
         """返回 (进程, base_url, token)。attach 模式不拉起进程。"""
-        token = resolve_server_token(self._token)
+        server_env = self._server_env(env)
+        token = resolve_server_token(
+            self._token, home=server_env.get("KIMI_CODE_HOME", ""))
         if self._attach_url:
             return None, self._attach_url.rstrip("/"), token
         if not self._manage_server:
             raise KimiLocalServerError(
-                "manage_server=False 时必须提供 base_url")
-        port = self._port or DEFAULT_SERVER_PORT
+                "manage_server=False 时必须提供 base_url",
+                code=KIMI_LOCAL_SERVER_LAUNCH_FAILED,
+            )
+        port = self._port or _free_local_port()
         base_url = f"http://127.0.0.1:{port}"
-        from .probe_environment import subprocess_environment
-        proc = await asyncio.create_subprocess_exec(
-            *self._serve_argv(port),
-            cwd=cwd or None,
-            env=subprocess_environment(self._server_env(env)),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        # 首启会生成 token 文件，等服务可用后再解析一次。
-        deadline = asyncio.get_running_loop().time() + self._startup_timeout
-        while True:
-            if proc.returncode is not None:
-                raise KimiLocalServerError(
-                    f"kimi web 提前退出（code={proc.returncode}）")
-            try:
-                async with httpx.AsyncClient(
-                        base_url=base_url, timeout=5.0,
-                        trust_env=False) as probe_client:
-                    resp = await probe_client.get("/api/v1/healthz")
-                    if resp.status_code < 400:
-                        break
-            except httpx.HTTPError:
-                pass
-            if asyncio.get_running_loop().time() > deadline:
-                raise KimiLocalServerError("kimi web 启动超时（healthz 不可达）")
-            await asyncio.sleep(0.3)
+        output = ProcessOutputLog.create(
+            self._log_root, label=f"kimi-web-{port}")
+        try:
+            supervised = await spawn_supervised(
+                self._with_launch_args(self._serve_argv(port)),
+                adapter_id=self.adapter_id,
+                label=f"kimi-web-{port}",
+                cwd=cwd or None,
+                env=subprocess_environment(server_env),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception as exc:
+            await output.close()
+            raise KimiLocalServerError(
+                f"kimi web 无法启动：{exc}",
+                code=KIMI_LOCAL_SERVER_LAUNCH_FAILED,
+            ) from exc
+        except BaseException:
+            await output.close()
+            raise
+        proc = supervised.process
+        self._supervised[proc.pid] = supervised
+        output.attach(proc)
+        self._server_outputs[proc.pid] = output
+        try:
+            # 首启会生成 token 文件，等服务可用后再解析一次。
+            deadline = asyncio.get_running_loop().time() + self._startup_timeout
+            while True:
+                if proc.returncode is not None:
+                    raise KimiLocalServerError(
+                        f"kimi web 提前退出（code={proc.returncode}）；"
+                        f"{output.detail()}",
+                        code=KIMI_LOCAL_SERVER_LAUNCH_FAILED,
+                    )
+                try:
+                    async with httpx.AsyncClient(
+                            base_url=base_url, timeout=5.0,
+                            trust_env=False) as probe_client:
+                        resp = await probe_client.get("/api/v1/healthz")
+                        if resp.status_code < 400:
+                            break
+                except httpx.HTTPError:
+                    pass
+                if asyncio.get_running_loop().time() > deadline:
+                    raise KimiLocalServerError(
+                        "kimi web 的 HTTP API 没有在超时内就绪（healthz 不可达）；"
+                        f"{output.detail()}",
+                        code=KIMI_LOCAL_SERVER_UNAVAILABLE,
+                    )
+                await asyncio.sleep(0.3)
+        except BaseException:
+            await self._stop_server(proc)
+            raise
         if not token:
-            token = resolve_server_token("")
+            token = resolve_server_token(
+                "", home=server_env.get("KIMI_CODE_HOME", ""))
         return proc, base_url, token
 
-    @staticmethod
-    async def _stop_server(proc: Optional[asyncio.subprocess.Process]) -> int:
+    def server_output_detail(
+        self, proc: Optional[asyncio.subprocess.Process]
+    ) -> str:
+        output = self._server_outputs.get(proc.pid) if proc is not None else None
+        return output.detail() if output is not None else ""
+
+    async def _stop_server(
+        self, proc: Optional[asyncio.subprocess.Process]
+    ) -> int:
         if proc is None:
             return -1
-        if proc.returncode is None:
-            try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=5.0)
-            except (asyncio.TimeoutError, ProcessLookupError):
+        supervised = self._supervised.pop(proc.pid, None)
+        try:
+            if supervised is not None:
+                await supervised.terminate()
+            elif proc.returncode is None:
                 try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                await proc.wait()
+                    proc.terminate()
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except (asyncio.TimeoutError, ProcessLookupError):
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    await proc.wait()
+        finally:
+            output = self._server_outputs.pop(proc.pid, None)
+            if output is not None:
+                await output.close()
         return int(proc.returncode if proc.returncode is not None else -1)
 
     def _client(self, base_url: str, token: str) -> httpx.AsyncClient:
@@ -437,7 +600,7 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
         code = payload.get("code")
         if code not in (None, 0, "0"):
             raise KimiLocalServerError(
-                f"{what} 失败：code={code} msg={str(payload.get('msg'))[:160]}")
+                f"{what} 失败：code={code} msg={payload.get('msg')}")
         return payload.get("data")
 
     async def _read_specs(
@@ -493,7 +656,7 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
                     await client.aclose()
             except (OSError, KimiLocalServerError, asyncio.TimeoutError,
                     httpx.HTTPError) as exc:
-                detail = f"kimi web 探测失败：{str(exc)[:160]}"
+                detail = f"kimi web 探测失败：{exc}"
             finally:
                 if proc is not None:
                     await self._stop_server(proc)
@@ -527,28 +690,44 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
             ws_available = False
 
         caps.capability_source = SOURCE_PROBE
-        caps.protocol_version = str(openapi.get("openapi") or "")[:40]
+        caps.protocol_version = str(openapi.get("openapi") or "")
         if isinstance(meta, dict) and meta.get("version"):
-            caps.runtime_version = str(meta["version"])[:120]
+            caps.runtime_version = str(meta["version"])
         caps.resume = has("/api/v1/sessions")
+        caps.resume_continues_turn = False
         caps.session_persistence = caps.resume
         caps.interrupt = ws_available
         caps.streaming = ws_available
         caps.tool_events = ws_available
         caps.usage_events = ws_available
         caps.approval = ws_available and any("approvals" in p for p in paths)
+        prompt_fields = _openapi_request_properties(
+            openapi, "/sessions/{session_id}/prompts") or set()
+        # Every mode needs the per-prompt native permission_mode; supervised
+        # is additionally refused at launch inside a Git worktree.
+        caps.access_modes = (
+            list(_KIMI_SERVER_PERMISSION_MODES)
+            if caps.approval and "permission_mode" in prompt_fields else []
+        )
         caps.user_input = ws_available and any("questions" in p for p in paths)
         caps.steer = ws_available and any(
             p.endswith("/prompts:steer")
             or ("/prompts/{" in p and p.endswith(":steer"))
             for p in paths
         )
+        # Agent 工具派生的子智能体与主 agent 共用 WS 流（帧上 agentId 区分，
+        # subagent.spawned/completed 给出生命周期；0.38 实测）。
+        caps.subagents = ws_available
         for field_name in BOOL_CAPABILITY_FIELDS:
             field_sources[field_name] = SOURCE_PROBE
         if not ws_available:
             degradations.append(
                 "websockets 包不可用：WS 事件流/中断/审批未启用，send 将"
                 "返回 unsupported（experimental 接口不伪造完成事件）")
+        if not caps.access_modes:
+            degradations.append(
+                "该实例 OpenAPI 未声明 prompt permission_mode 或审批端点："
+                "Conversation access mode 无法映射，会话启动时将拒绝")
         degradations.append(
             "experimental 接口：端点与字段以该实例 /openapi.json + "
             "/asyncapi.json 实测为准，任何版本都可能变化")
@@ -572,11 +751,12 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
         plan: Optional[Any],
         bearer_token: Optional[str],
     ) -> dict[str, Any]:
-        cwd = str(request.options.get("cwd") or os.getcwd())
-        session_env = {
-            str(key): str(value)
-            for key, value in dict(request.options.get("env") or {}).items()
-        }
+        cwd = request.options.cwd or os.getcwd()
+        access_mode = str(request.access_mode or "").strip() or None
+        require_access_mode(
+            self.id, access_mode, tuple(_KIMI_SERVER_PERMISSION_MODES))
+        _require_kimi_supervised_enforceable(self.id, access_mode, cwd)
+        session_env = dict(request.options.env)
         proc, base_url, token = await self._start_server(cwd, env=session_env)
         client = self._client(base_url, token)
         try:
@@ -588,7 +768,19 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
                     p.startswith("/api/v1/sessions") for p in paths):
                 raise KimiLocalServerError(
                     "该实例 OpenAPI 无 /api/v1/sessions：版本不兼容，"
-                    "拒绝按猜测路径启动会话")
+                    "拒绝按猜测路径启动会话",
+                    code=KIMI_LOCAL_SERVER_UNAVAILABLE,
+                )
+            if access_mode is not None:
+                prompt_fields = _openapi_request_properties(
+                    openapi, "/sessions/{session_id}/prompts")
+                if prompt_fields is None or "permission_mode" not in prompt_fields:
+                    raise AccessModeUnsupportedError(
+                        self.id, access_mode, (),
+                        "this Kimi Local Server's OpenAPI does not declare "
+                        "permission_mode on POST /sessions/{session_id}/prompts, "
+                        "so the native permission mode cannot be selected",
+                    )
 
             resume_handle = request.resume_handle
             if resume_handle:
@@ -608,7 +800,7 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
                 if not session_id:
                     raise KimiLocalServerError(
                         "POST /api/v1/sessions 未返回 session id")
-        except Exception:
+        except BaseException:
             await client.aclose()
             if proc is not None:
                 await self._stop_server(proc)
@@ -621,7 +813,7 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
             "base_url": base_url,
             "token": token,
             "cwd": cwd,
-            "options": dict(request.options),
+            "options": request.options,
             "turns": 0,
             "external_session_id": session_id,
             "model": request.model,
@@ -634,6 +826,15 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
             "cursor": {"seq": 0, "epoch": ""},
             "asyncapi": bool(asyncapi),
             "openapi_paths": dict(paths),
+            # None: Worker launch without a Conversation access mode; Kimi's
+            # approvals keep being answered unattended as before.
+            "access_mode": access_mode,
+            "permission_mode": (
+                _KIMI_SERVER_PERMISSION_MODES[access_mode]
+                if access_mode is not None else None
+            ),
+            # approval_id -> {"native": request, "agent_id": ..., "responding": bool}
+            "pending_approvals": {},
         }
         self._sessions[request.agent_session_id] = handle
         return {"external_session_id": session_id,
@@ -720,7 +921,15 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
                                 sink.put_nowait((
                                     AgentEventType.RUNTIME_WARNING,
                                     "kimi.ws.resync_required",
-                                    {"reason": payload.get("reason")}))
+                                    dump_payload(RuntimeWarningPayload(
+                                        kind="protocol",
+                                        message=(
+                                            "Kimi WS cursor invalidated; "
+                                            "resubscribed at the reported "
+                                            "watermark"),
+                                        code="kimi.ws.resync_required",
+                                        native={"reason": payload.get("reason")},
+                                    ))))
                             await self._ws_subscribe(ws, handle)
                             continue
                         await self._handle_ws_frame(agent_session_id, frame)
@@ -777,6 +986,15 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
         data = frame.get("payload") if isinstance(frame.get("payload"), dict) \
             else (frame.get("data") if isinstance(frame.get("data"), dict)
                   else frame)
+        # 同一 session 的 WS 流同时承载主 agent（agentId=main）与子智能体
+        # （agent-N）的事件；子智能体的 turn/usage 不能推进主回合。
+        owner = str(data.get("agentId") or data.get("agent_id") or "")
+        if owner and owner != "main":
+            self._handle_subagent_frame(handle, sink, ftype, owner, data)
+            return
+        if ftype.startswith("subagent."):
+            self._handle_subagent_lifecycle(handle, sink, ftype, data)
+            return
         if ftype == "turn.started":
             return
         if ftype == "turn.ended":
@@ -789,46 +1007,50 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
             text = str(data.get("delta") or data.get("text") or "")
             if text:
                 sink.put_nowait((AgentEventType.MESSAGE_DELTA,
-                                 f"kimi.{ftype}", {"text": text}))
+                                 f"kimi.{ftype}",
+                                 dump_payload(MessageDeltaPayload(text=text))))
         elif ftype == "thinking.delta":
             text = str(data.get("delta") or data.get("text") or "")
             if text:
-                sink.put_nowait((AgentEventType.MESSAGE_DELTA,
+                sink.put_nowait((AgentEventType.REASONING_SUMMARY,
                                  "kimi.thinking.delta",
-                                 {"text": text, "thinking": True}))
+                                 dump_payload(ReasoningPayload(
+                                     text=text, channel="thinking",
+                                     partial=True))))
         elif ftype == "tool.call.started":
+            payload = self._tool_started_payload(data)
+            display = data.get("display") if isinstance(
+                data.get("display"), dict) else {}
+            is_agent_call = display.get("kind") == "agent_call"
+            if is_agent_call:
+                args = payload.get("input") if isinstance(
+                    payload.get("input"), dict) else {}
+                handle.setdefault("agent_call_requests", {})[
+                    payload["call_id"]] = str(
+                        args.get("prompt") or display.get("prompt") or "")
             sink.put_nowait((AgentEventType.TOOL_STARTED,
-                             "kimi.tool.call.started", {
-                                 "call_id": str(data.get("toolCallId")
-                                                or data.get("call_id")
-                                                or data.get("id") or ""),
-                                 "tool": str(data.get("name")
-                                             or data.get("tool") or ""),
-                                 "input": data.get("args")
-                                 or data.get("arguments"),
-                             }))
+                             "kimi.tool.call.started",
+                             dump_payload(ToolPayload(
+                                 tool_call_id=payload["call_id"],
+                                 name=payload.get("tool") or None,
+                                 input=payload.get("input"),
+                                 status="running",
+                                 kind="agent" if is_agent_call else None,
+                             ))))
         elif ftype == "tool.result":
+            raw = self._tool_result_payload(data)
             sink.put_nowait((AgentEventType.TOOL_COMPLETED,
-                             "kimi.tool.result", {
-                                 "call_id": str(data.get("toolCallId")
-                                                or data.get("call_id")
-                                                or data.get("id") or ""),
-                                 "output": data.get("output")
-                                 or data.get("content"),
-                                 "is_error": bool(data.get("is_error")),
-                             }))
+                             "kimi.tool.result",
+                             dump_payload(ToolPayload(
+                                 tool_call_id=raw["call_id"],
+                                 output=raw.get("output"),
+                                 status="failed" if raw.get("is_error")
+                                 else "completed",
+                             ))))
         elif ftype == "event.approval.requested":
-            approval_id = str(data.get("approval_id") or data.get("id") or "")
-            sink.put_nowait((AgentEventType.APPROVAL_REQUESTED,
-                             "kimi.approval.requested", {
-                                 "approval_id": approval_id,
-                                 "tool": data.get("tool_name"),
-                                 "action": data.get("action"),
-                                 "native": data,
-                             }))
-            if approval_id:
-                asyncio.ensure_future(
-                    self._reply_approval(handle, approval_id))
+            self._emit_approval(handle, sink, data, None)
+        elif ftype == "event.approval.resolved":
+            self._handle_approval_resolved(handle, sink, data, None)
         elif ftype in ("usage", "turn.step.completed"):
             # 0.38.0 实测 usage 在 turn.step.completed
             # （{inputOther, output, inputCacheRead, inputCacheCreation}）。
@@ -836,36 +1058,409 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
                 else data
             if isinstance(usage, dict) and usage:
                 sink.put_nowait((AgentEventType.USAGE_UPDATED,
-                                 f"kimi.{ftype}", {"usage": usage}))
-        # 其余事件（subagent.*/task.*/compaction.*/tool.call.delta/
+                                 f"kimi.{ftype}", _kimi_usage_payload(usage)))
+        # 其余事件（task.*/compaction.*/tool.call.delta/
         # agent.status.updated 等）不改变核心状态机。
 
-    async def _reply_approval(
-        self, handle: dict[str, Any], approval_id: str
+    # -- 子智能体 -------------------------------------------------------------
+
+    @staticmethod
+    def _tool_started_payload(data: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "call_id": str(data.get("toolCallId") or data.get("call_id")
+                           or data.get("id") or ""),
+            "tool": str(data.get("name") or data.get("tool") or ""),
+            "input": data.get("args") or data.get("arguments"),
+        }
+
+    @staticmethod
+    def _tool_result_payload(data: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "call_id": str(data.get("toolCallId") or data.get("call_id")
+                           or data.get("id") or ""),
+            "output": data.get("output") or data.get("content"),
+            "is_error": bool(data.get("is_error")),
+        }
+
+    def _emit_approval(
+        self, handle: dict[str, Any], sink: Any, data: dict[str, Any],
+        agent_id: Optional[str],
     ) -> None:
-        """无人值守默认批准（decision 枚举为 approved|rejected|cancelled，
-        0.38.0 实测）；结果事件在 WS 侧已发 REQUESTED。"""
+        """Route a Kimi approval by the session's access mode.
+
+        Kimi's own ``permission_mode`` already decided that this call needs
+        approval.  full-access and Worker sessions (no access mode) answer it
+        unattended, auto-accept-edits answers Write/Edit, and everything else
+        becomes a Conversation approval card answered via ``send``.
+        """
+        approval_id = str(data.get("approval_id") or data.get("id") or "")
+        tool_name = str(data.get("tool_name") or "")
+        access_mode = handle.get("access_mode")
+        if not approval_id:
+            sink.put_nowait((AgentEventType.RUNTIME_ERROR,
+                             "kimi.approval.invalid",
+                             dump_payload(RuntimeErrorPayload(
+                                 error=self.failure(
+                                     FailureCategory.VALIDATION,
+                                     "approval.missing_id",
+                                     message="Kimi approval request has no approval_id"),
+                                 native={"data": data}))))
+            return
+        policy = ""
+        if access_mode is None:
+            policy = "unattended"
+        elif access_mode == AccessMode.FULL_ACCESS.value:
+            policy = AccessMode.FULL_ACCESS.value
+        elif (access_mode == AccessMode.AUTO_ACCEPT_EDITS.value
+              and tool_name in _KIMI_EDIT_TOOLS):
+            policy = AccessMode.AUTO_ACCEPT_EDITS.value
+        if policy:
+            asyncio.ensure_future(self._auto_approve(
+                handle, sink, approval_id, tool_name, agent_id, policy))
+            return
+        handle["pending_approvals"][approval_id] = {
+            "native": dict(data),
+            "agent_id": agent_id,
+            "responding": False,
+        }
+        approval_kind = (
+            "file_change" if tool_name in _KIMI_EDIT_TOOLS
+            else "command_execution" if tool_name in {"Bash", "Shell"}
+            else "tool"
+        )
+        sink.put_nowait((AgentEventType.APPROVAL_REQUESTED,
+                         "kimi.approval.requested",
+                         dump_payload(ApprovalRequestedPayload(
+                             approval_id=approval_id,
+                             agent_id=agent_id,
+                             approval_kind=approval_kind,
+                             title=str(
+                                 data.get("action") or tool_name
+                                 or "Kimi operation"),
+                             tool_name=tool_name or None,
+                             native={"access_mode": access_mode, "data": data},
+                         ))))
+
+    def _handle_approval_resolved(
+        self, handle: dict[str, Any], sink: Any, data: dict[str, Any],
+        agent_id: Optional[str],
+    ) -> None:
+        """Kimi resolved a pending approval itself (expiry, another client)."""
+        approval_id = str(data.get("approval_id") or "")
+        pending = handle["pending_approvals"].get(approval_id)
+        # Resolutions Muteki sent are reported by the sending path.
+        if pending is None or pending.get("responding"):
+            return
+        handle["pending_approvals"].pop(approval_id, None)
+        native_decision = str(data.get("decision") or "")
+        sink.put_nowait((AgentEventType.APPROVAL_RESOLVED,
+                         "kimi.approval.resolved",
+                         dump_payload(ApprovalResolvedPayload(
+                             approval_id=approval_id,
+                             agent_id=agent_id,
+                             decision=(
+                                 "allow" if native_decision == "approved"
+                                 else "deny"),
+                             scope=(
+                                 str(data["scope"])
+                                 if data.get("scope") is not None else None),
+                             automatic=True,
+                             native={"native_decision": native_decision,
+                                     "data": data},
+                         ))))
+
+    def _agent_patch(
+        self, handle: dict[str, Any], sink: Any, agent_id: str,
+        update: dict[str, Any],
+    ) -> None:
+        nodes = handle.setdefault("agent_nodes", {})
+        previous = nodes.get(agent_id) or {
+            "agent_id": agent_id, "title": agent_id, "status": "running"}
+        node = {**previous, **{k: v for k, v in update.items()
+                               if v is not None}}
+        if node == previous and agent_id in nodes:
+            return
+        nodes[agent_id] = node
+        sink.put_nowait((AgentEventType.AGENT_UPDATED,
+                         "kimi.subagent.updated",
+                         dump_payload(AgentUpdatedPayload(
+                             agents=[AgentNodePayload(**node)], patch=True))))
+
+    def _flush_agent_text(
+        self, handle: dict[str, Any], sink: Any, agent_id: str
+    ) -> None:
+        buffers = handle.setdefault("agent_text", {})
+        text = str(buffers.get(agent_id) or "").strip()
+        if text:
+            self._agent_patch(handle, sink, agent_id, {"activity": text})
+
+    def _handle_subagent_lifecycle(
+        self, handle: dict[str, Any], sink: Any, ftype: str,
+        data: dict[str, Any],
+    ) -> None:
+        """主 agent 侧的 ``subagent.*`` 生命周期帧（0.38 实测字段）。"""
+        agent_id = str(data.get("subagentId") or "")
+        if not agent_id:
+            return
+        if ftype == "subagent.spawned":
+            call_id = str(data.get("parentToolCallId") or "")
+            parent = str(data.get("parentAgentId") or "")
+            self._agent_patch(handle, sink, agent_id, {
+                "status": "running",
+                "title": str(data.get("description") or "").strip() or None,
+                "role": str(data.get("subagentName") or "").strip() or None,
+                "model": str(data.get("model") or "").strip() or None,
+                "call_id": call_id or None,
+                "parent_id": parent if parent and parent != "main" else None,
+                "request": (handle.get("agent_call_requests") or {}).get(
+                    call_id) or None,
+                "session_ref": agent_id,
+            })
+            handle.setdefault("agent_spawned_at", {})[agent_id] = data.get(
+                "time")
+        elif ftype == "subagent.started":
+            self._agent_patch(handle, sink, agent_id, {"status": "running"})
+        elif ftype in ("subagent.completed", "subagent.failed",
+                       "subagent.cancelled"):
+            self._flush_agent_text(handle, sink, agent_id)
+            usage = data.get("usage") if isinstance(
+                data.get("usage"), dict) else {}
+            total = sum(int(usage.get(key) or 0) for key in (
+                "inputOther", "output", "inputCacheRead",
+                "inputCacheCreation"))
+            started = (handle.get("agent_spawned_at") or {}).get(agent_id)
+            ended = data.get("time")
+            duration = (int(ended) - int(started)
+                        if isinstance(started, int) and isinstance(ended, int)
+                        else None)
+            node = (handle.get("agent_nodes") or {}).get(agent_id) or {}
+            error = data.get("error")
+            if isinstance(error, dict):
+                error = error.get("message") or error.get("code")
+            status = {"subagent.completed": "completed",
+                      "subagent.failed": "failed",
+                      "subagent.cancelled": "cancelled"}[ftype]
+            self._agent_patch(handle, sink, agent_id, {
+                "status": status,
+                "result": str(data.get("resultSummary") or "").strip()
+                or None,
+                "error": str(error) if error else None,
+                "total_tokens": total or None,
+                "tool_uses": node.get("tool_uses"),
+                "duration_ms": duration,
+            })
+
+    def _handle_subagent_frame(
+        self, handle: dict[str, Any], sink: Any, ftype: str, agent_id: str,
+        data: dict[str, Any],
+    ) -> None:
+        """子智能体自身的事件：工具/审批带 agent_id，文本汇成节点活动。"""
+        if ftype == "tool.call.started":
+            self._flush_agent_text(handle, sink, agent_id)
+            handle.setdefault("agent_text", {})[agent_id] = ""
+            payload = self._tool_started_payload(data)
+            sink.put_nowait((AgentEventType.TOOL_STARTED,
+                             "kimi.tool.call.started",
+                             dump_payload(ToolPayload(
+                                 tool_call_id=payload["call_id"],
+                                 name=payload.get("tool") or None,
+                                 input=payload.get("input"),
+                                 status="running",
+                                 agent_id=agent_id,
+                             ))))
+            node = (handle.get("agent_nodes") or {}).get(agent_id) or {}
+            self._agent_patch(handle, sink, agent_id, {
+                "tool_uses": int(node.get("tool_uses") or 0) + 1})
+        elif ftype == "tool.result":
+            payload = self._tool_result_payload(data)
+            sink.put_nowait((AgentEventType.TOOL_COMPLETED,
+                             "kimi.tool.result",
+                             dump_payload(ToolPayload(
+                                 tool_call_id=payload["call_id"],
+                                 output=payload.get("output"),
+                                 status="failed" if payload.get("is_error")
+                                 else "completed",
+                                 agent_id=agent_id,
+                             ))))
+        elif ftype == "event.approval.requested":
+            self._emit_approval(handle, sink, data, agent_id)
+        elif ftype == "event.approval.resolved":
+            self._handle_approval_resolved(handle, sink, data, agent_id)
+        elif ftype in ("assistant.delta", "assistant.message"):
+            text = str(data.get("delta") or data.get("text") or "")
+            if text:
+                buffers = handle.setdefault("agent_text", {})
+                buffers[agent_id] = (
+                    text if ftype == "assistant.message"
+                    else str(buffers.get(agent_id) or "") + text)
+        elif ftype in ("turn.step.completed", "turn.ended"):
+            self._flush_agent_text(handle, sink, agent_id)
+        # 子智能体的 thinking/usage/status 帧不进入主回合；用量在
+        # subagent.completed 汇总。
+
+    async def _post_approval_decision(
+        self, handle: dict[str, Any], approval_id: str, body: dict[str, Any]
+    ) -> "tuple[Optional[Any], Optional[dict[str, Any]]]":
+        """POST one decision; returns ``(native_code, None)`` or ``(None, failure)``.
+
+        ``native_code`` is the envelope ``code`` (0 on success).  Transport or
+        malformed-response failures return a typed :class:`AgentFailure`.
+        """
         client: httpx.AsyncClient = handle["client"]
         session_id = handle["external_session_id"]
-        sink = handle.get("event_sink")
         try:
-            await client.post(
+            resp = await client.post(
                 f"/api/v1/sessions/{session_id}/approvals/{approval_id}",
-                json={"decision": "approved"})
-            resolved = {"approval_id": approval_id, "decision": "approved"}
-        except Exception as exc:  # noqa: BLE001
-            resolved = {"approval_id": approval_id, "decision": "failed",
-                        "detail": str(exc)[:200]}
-        if sink is not None:
-            sink.put_nowait((AgentEventType.APPROVAL_RESOLVED,
-                             "kimi.approval.resolved", resolved))
+                json=body)
+            envelope = resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            return None, self.exception_failure(
+                exc, FailureCategory.TRANSPORT, "approval.reply_failed",
+                message=f"Kimi approval reply failed: {exc}")
+        if not isinstance(envelope, dict) or "code" not in envelope:
+            return None, self.failure(
+                FailureCategory.TRANSPORT, "approval.reply_failed",
+                message=f"unexpected response (HTTP {resp.status_code})",
+                detail=json.dumps(envelope, ensure_ascii=False, default=str))
+        return envelope.get("code"), (
+            None if envelope.get("code") in (0, "0") else self.failure(
+                FailureCategory.UNKNOWN, "approval.reply_rejected",
+                message=str(envelope.get("msg") or "Kimi rejected the decision"),
+                native_code=str(envelope.get("code")),
+            ))
+
+    async def _auto_approve(
+        self, handle: dict[str, Any], sink: Any, approval_id: str,
+        tool_name: str, agent_id: Optional[str], policy: str,
+    ) -> None:
+        """Answer an approval the session's access mode allows without a user."""
+        _code, error = await self._post_approval_decision(
+            handle, approval_id, {"decision": "approved"})
+        if error is not None:
+            sink.put_nowait((AgentEventType.RUNTIME_ERROR,
+                             "kimi.approval.auto_reply_failed",
+                             dump_payload(RuntimeErrorPayload(
+                                 error=error,
+                                 native={
+                                     "approval_id": approval_id,
+                                     "tool": tool_name,
+                                     "policy": policy,
+                                 }))))
+            return
+        sink.put_nowait((AgentEventType.APPROVAL_RESOLVED,
+                         "kimi.approval.auto_approved",
+                         dump_payload(ApprovalResolvedPayload(
+                             approval_id=approval_id,
+                             agent_id=agent_id,
+                             decision="allow",
+                             scope="once",
+                             automatic=True,
+                             native={"resolved_by": policy,
+                                     "tool": tool_name,
+                                     "native_decision": "approved"},
+                         ))))
+
+    async def _approval_response_stream(
+        self, session: AgentSessionRef, input: ApprovalResponseInput
+    ) -> AsyncIterator[AgentEvent]:
+        sid = session.agent_session_id
+        seq = self.sequencer_for(sid)
+        handle = self._sessions.get(sid)
+        common = dict(
+            agent_session_id=sid,
+            external_session_id=(handle or {}).get("external_session_id")
+            or session.external_session_id,
+            turn_id=(handle or {}).get("current_turn_id"),
+        )
+        try:
+            decision = ApprovalDecision.from_payload(input.payload.model_dump())
+        except ValueError as exc:
+            yield self.emit(build_event(
+                AgentEventType.RUNTIME_ERROR, seq,
+                native_type="kimi.approval.invalid",
+                payload=RuntimeErrorPayload(error=self.exception_failure(
+                    exc, FailureCategory.VALIDATION, "approval.invalid",
+                    message=f"Invalid approval response: {exc}")),
+                **common))
+            return
+        pending = (
+            (handle.get("pending_approvals") or {}).get(decision.approval_id)
+            if handle is not None and handle.get("client") is not None
+            else None
+        )
+        if pending is None:
+            yield self.emit(build_event(
+                AgentEventType.RUNTIME_ERROR, seq,
+                native_type="kimi.approval.stale",
+                payload=RuntimeErrorPayload(
+                    error=self.failure(
+                        FailureCategory.UNKNOWN, "approval.stale",
+                        message="Kimi approval is no longer pending"),
+                    native={"approval_id": decision.approval_id}),
+                **common))
+            return
+        if pending.get("responding"):
+            yield self.emit(build_event(
+                AgentEventType.RUNTIME_ERROR, seq,
+                native_type="kimi.approval.in_flight",
+                payload=RuntimeErrorPayload(
+                    error=self.failure(
+                        FailureCategory.UNKNOWN, "approval.in_flight",
+                        message="a decision for this approval is already being sent"),
+                    native={"approval_id": decision.approval_id}),
+                **common))
+            return
+        body: dict[str, Any] = {
+            "decision": "approved" if decision.allowed else "rejected",
+        }
+        if decision.allowed and decision.scope is ApprovalScope.SESSION:
+            body["scope"] = "session"
+        if decision.note:
+            body["feedback"] = decision.note
+        pending["responding"] = True
+        native_code, error = await self._post_approval_decision(
+            handle, decision.approval_id, body)
+        if error is not None:
+            if native_code in _KIMI_APPROVAL_GONE_CODES:
+                handle["pending_approvals"].pop(decision.approval_id, None)
+                error = self.failure(
+                    FailureCategory.UNKNOWN, "approval.stale",
+                    message="Kimi approval is no longer pending",
+                    detail=error.detail, native_code=error.native_code)
+            else:
+                pending["responding"] = False
+            yield self.emit(build_event(
+                AgentEventType.RUNTIME_ERROR, seq,
+                native_type="kimi.approval.reply_failed",
+                payload=RuntimeErrorPayload(
+                    error=error,
+                    native={"approval_id": decision.approval_id}),
+                **common))
+            return
+        handle["pending_approvals"].pop(decision.approval_id, None)
+        yield self.emit(build_event(
+            AgentEventType.APPROVAL_RESOLVED, seq,
+            native_type="kimi.approval.replied",
+            payload=ApprovalResolvedPayload(
+                approval_id=decision.approval_id,
+                agent_id=(
+                    str(pending["agent_id"]) if pending.get("agent_id") else None),
+                decision="allow" if decision.allowed else "deny",
+                scope=decision.scope.value,
+                native={"native_decision": body["decision"]},
+            ),
+            **common))
 
     # -- turn 流 --------------------------------------------------------------
 
     def send(
         self, session: AgentSessionRef, input: AgentInput
     ) -> AsyncIterator[AgentEvent]:
-        return self._turn_stream(session, input)
+        if isinstance(input, ApprovalResponseInput):
+            return self._approval_response_stream(session, input)
+        if isinstance(input, MessageInput):
+            return self._turn_stream(session, input)
+        return self.unsupported_input_stream(session, input)
 
     async def _ensure_ws(self, handle: dict[str, Any]) -> bool:
         if handle.get("ws_task") is not None:
@@ -889,7 +1484,7 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
         return True
 
     async def _turn_stream(
-        self, session: AgentSessionRef, input: AgentInput
+        self, session: AgentSessionRef, input: MessageInput
     ) -> AsyncIterator[AgentEvent]:
         sid = session.agent_session_id
         seq = self.sequencer_for(sid)
@@ -915,11 +1510,12 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
                 else AgentEventType.SESSION_STARTED, seq,
                 external_session_id=external_id,
                 native_type="kimi.local.session.start",
-                payload={"transport": "http+ws",
-                         "adapter_id": self.id,
-                         "instance_id": self.identity.instance_id,
-                         "cwd": handle["cwd"],
-                         "experimental": True},
+                payload=SessionPayload(
+                    transport="http+ws",
+                    adapter_id=self.id,
+                    instance_id=self.identity.instance_id,
+                    cwd=handle["cwd"],
+                    native={"experimental": True}),
                 **common))
 
         if not await self._ensure_ws(handle):
@@ -927,9 +1523,10 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
                 AgentEventType.RUNTIME_ERROR, seq,
                 external_session_id=external_id,
                 native_type="kimi.ws.unavailable",
-                payload={"code": "external_agent.kimi.ws_unavailable",
-                         "detail": "websockets 不可用，experimental Local "
-                                   "Server 事件流未启用（不伪造完成事件）"},
+                payload=RuntimeErrorPayload(error=self.failure(
+                    FailureCategory.UNSUPPORTED, "ws_unavailable",
+                    message="websockets 不可用，experimental Local "
+                            "Server 事件流未启用（不伪造完成事件）")),
                 **common))
             return
 
@@ -939,7 +1536,7 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
             AgentEventType.TURN_STARTED, seq,
             external_session_id=external_id, turn_id=turn_id,
             native_type="kimi.prompt.start",
-            payload={"kind": input.kind},
+            payload=TurnStartedPayload(kind=input.kind),
             **common))
 
         queue: asyncio.Queue = asyncio.Queue()
@@ -958,6 +1555,8 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
                 model = handle.get("model")
                 if model:
                     body["model"] = str(model)
+                if handle.get("permission_mode"):
+                    body["permission_mode"] = handle["permission_mode"]
                 resp = await client.post(
                     f"/api/v1/sessions/{external_id}/prompts",
                     json=body,
@@ -1002,7 +1601,7 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
                                 None, 0, "0"):
                             submit_error = KimiLocalServerError(
                                 f"prompt 提交被拒：code={body.get('code')} "
-                                f"msg={str(body.get('msg'))[:160]}")
+                                f"msg={body.get('msg')}")
                             break
                 if get_task in done:
                     etype, native_type, payload = get_task.result()
@@ -1011,7 +1610,6 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
                         done_info = dict(payload)
                         break
                     if (etype is AgentEventType.MESSAGE_DELTA
-                            and not payload.get("thinking")
                             and str(payload.get("text") or "").strip()):
                         handle["saw_assistant_text"] = True
                         handle["assistant_text_parts"].append(
@@ -1031,11 +1629,23 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
         handle["current_prompt_id"] = None
 
         if submit_error is not None:
+            server_exit: dict[str, Any] = {}
+            server_proc = handle.get("proc")
+            if server_proc is not None and server_proc.returncode is not None:
+                server_exit = {
+                    "returncode": server_proc.returncode,
+                    "output": self.server_output_detail(server_proc),
+                }
             yield self.emit(build_event(
                 AgentEventType.TURN_FAILED, seq,
                 external_session_id=external_id, turn_id=turn_id,
                 native_type="kimi.prompt.error",
-                payload={"error": str(submit_error)[:300]},
+                payload=TurnFailedPayload(
+                    error=self.exception_failure(
+                        submit_error, FailureCategory.TRANSPORT,
+                        "prompt_error",
+                        message=f"Kimi prompt failed: {submit_error}"),
+                    native={"server_exit": server_exit} if server_exit else {}),
                 **common))
             return
         stop_reason = str(done_info.get("stop_reason") or "end_turn")
@@ -1045,7 +1655,11 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
                 AgentEventType.TURN_FAILED, seq,
                 external_session_id=external_id, turn_id=turn_id,
                 native_type="kimi.prompt.aborted",
-                payload={"reason": "interrupted", "stop_reason": stop_reason},
+                payload=TurnFailedPayload(
+                    error=self.failure(
+                        FailureCategory.CANCELLED, "interrupted",
+                        message=f"Kimi turn {stop_reason}"),
+                    native={"stop_reason": stop_reason}),
                 **common))
             return
         if stop_reason in ("failed", "error"):
@@ -1054,38 +1668,22 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
                 AgentEventType.TURN_FAILED, seq,
                 external_session_id=external_id, turn_id=turn_id,
                 native_type="kimi.turn.failed",
-                payload={"reason": "failed", "stop_reason": stop_reason,
-                         "error": done_error},
+                payload=TurnFailedPayload(
+                    error=self.failure(
+                        FailureCategory.PROVIDER, "turn_failed",
+                        message=str(done_error or f"stopReason={stop_reason}"),
+                        detail=str(done_error or "")),
+                    native={"stop_reason": stop_reason}),
                 **common))
             return
-        if not handle.pop("saw_assistant_text", False):
-            yield self.emit(build_event(
-                AgentEventType.TURN_FAILED, seq,
-                external_session_id=external_id, turn_id=turn_id,
-                native_type="kimi.empty_assistant",
-                payload={
-                    "reason": "empty_assistant",
-                    "error": {
-                        "code": "kimi.empty_assistant",
-                        "message": "Kimi turn ended without assistant text",
-                    },
-                    "stop_reason": stop_reason,
-                },
-                **common))
-            return
+        handle.pop("saw_assistant_text", False)
         final_text = "".join(handle.pop("assistant_text_parts", []))
-        yield self.emit(build_event(
-            AgentEventType.MESSAGE_COMPLETED, seq,
-            external_session_id=external_id, turn_id=turn_id,
-            native_type="kimi.message.completed",
-            payload={"text": final_text, "role": "assistant"},
-            **common))
-        yield self.emit(build_event(
-            AgentEventType.TURN_COMPLETED, seq,
-            external_session_id=external_id, turn_id=turn_id,
+        for event in self.completed_turn_events(
+            seq, text=final_text,
+            common={**common, "external_session_id": external_id, "turn_id": turn_id},
             native_type="kimi.turn.ended",
-            payload={"stop_reason": stop_reason},
-            **common))
+            payload=TurnCompletedPayload(stop_reason=stop_reason)):
+            yield event
 
     def resume(self, session: AgentSessionRef) -> AsyncIterator[AgentEvent]:
         return self._resume_stream(session)
@@ -1108,9 +1706,10 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
             AgentEventType.SESSION_RESUMED, seq,
             external_session_id=handle.get("external_session_id"),
             native_type="kimi.local.session.resumed",
-            payload={"transport": "http+ws",
-                     "cursor": dict(handle.get("cursor") or {}),
-                     "experimental": True},
+            payload=SessionPayload(
+                transport="http+ws",
+                native={"cursor": dict(handle.get("cursor") or {}),
+                        "experimental": True}),
             agent_session_id=sid,
             run_id=record.run_id if record else None,
             execution_generation=(
@@ -1143,43 +1742,61 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
         self, session: AgentSessionRef, input: AgentInput
     ) -> CommandReceipt:
         """用 Kimi 原生 prompt queue + ``:steer`` 注入当前回合。"""
+        if not isinstance(input, SteerInput):
+            return self.unsupported_receipt(
+                "steer", "steer", session=session, detail={"input_kind": input.kind})
         handle = self._sessions.get(session.agent_session_id)
         client = (handle or {}).get("client")
         external_id = (handle or {}).get("external_session_id") \
             or session.external_session_id
         paths = (handle or {}).get("openapi_paths") or {}
-        steer_path = f"/api/v1/sessions/{external_id}/prompts/{{prompt_id}}:steer"
-        steer_available = any(
-            str(path).endswith("/prompts:steer")
-            or ("/prompts/{" in str(path) and str(path).endswith(":steer"))
-            for path in paths
+        declared = [str(path) for path in paths]
+        # 2.1.1 OpenAPI is POST /prompts:steer with {prompt_ids}. The older
+        # /prompts/{prompt_id}:steer shape is used only when that is what
+        # this instance actually declares.
+        session_steer = any(path.endswith("/prompts:steer") for path in declared)
+        id_steer = any(
+            "/prompts/{" in path and path.endswith(":steer") for path in declared
         )
-        if client is None or not external_id or not steer_available:
+        if client is None or not external_id or not (session_steer or id_steer):
             return self.unsupported_receipt(
                 "steer", "steer", session=session,
-                detail={"detail": "该 Kimi Local Server 实例未声明 prompt steer"},
+                detail={"detail": "该 Kimi Local Server 实例未声明 prompt steer",
+                        "code": KIMI_LOCAL_SERVER_UNAVAILABLE},
             )
         # Kimi 的 prompt id 是服务端资源标识，独立于前端消息幂等 id。
         # 统一使用本地生成的 prompt id，避免把不同客户端的 id 格式带进协议。
         prompt_id = new_id("prompt")
         try:
+            steer_body: dict[str, Any] = {
+                "prompt_id": prompt_id,
+                "content": [{"type": "text", "text": input.text}],
+            }
+            if (handle or {}).get("permission_mode"):
+                steer_body["permission_mode"] = handle["permission_mode"]
             submitted = await self._unwrap((await client.post(
                 f"/api/v1/sessions/{external_id}/prompts",
-                json={
-                    "prompt_id": prompt_id,
-                    "content": [{"type": "text", "text": input.text}],
-                },
+                json=steer_body,
             )).json(), "steer prompt submit")
             actual_prompt_id = str(
                 (submitted or {}).get("prompt_id") or prompt_id
             )
-            await self._unwrap((await client.post(
-                steer_path.format(prompt_id=actual_prompt_id), json={}
-            )).json(), "steer prompt")
+            if session_steer:
+                steer_body_ids = {"prompt_ids": [actual_prompt_id]}
+                await self._unwrap((await client.post(
+                    f"/api/v1/sessions/{external_id}/prompts:steer",
+                    json=steer_body_ids,
+                )).json(), "steer prompt")
+            else:
+                await self._unwrap((await client.post(
+                    f"/api/v1/sessions/{external_id}/prompts/"
+                    f"{actual_prompt_id}:steer",
+                    json={},
+                )).json(), "steer prompt")
         except Exception as exc:  # noqa: BLE001
             return self.unsupported_receipt(
                 "steer", "steer_rejected", session=session,
-                detail={"detail": str(exc)[:200]},
+                detail={"detail": str(exc)},
             )
         return CommandReceipt(
             command_id=new_id("cmd"),
@@ -1190,11 +1807,13 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
         )
 
     async def interrupt(self, session: AgentSessionRef) -> CommandReceipt:
-        """中断当前 prompt：``POST .../prompts/{prompt_id}:abort``。
+        self._mark_turn_interrupted(session.agent_session_id)
+        """中断当前 prompt。
 
-        0.38.0 实测 OpenAPI 无 ``/sessions/{id}:abort``（仅 :archive）；
-        prompt 级 abort 端点描述为 "Abort a running prompt"。无 prompt_id
-        （turn 间隙）时兜底旧 ``:abort`` 路径（向后兼容文档形态）。
+        2.1.1 把 abort 声明成 ``POST /prompts/{tail}``（tail 取
+        ``{prompt_id}:abort``）。规格里没有这条、也没有独立 ``:abort``
+        路径时返回 ``kimi.local_server.unavailable``，不向猜测地址发
+        请求，也不改走 ``kimi.acp``。
         """
         handle = self._sessions.get(session.agent_session_id)
         client = (handle or {}).get("client")
@@ -1204,18 +1823,40 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
             return self.unsupported_receipt(
                 "interrupt", "no_active_session", session=session)
         prompt_id = (handle or {}).get("current_prompt_id")
+        declared = [
+            str(path) for path in ((handle or {}).get("openapi_paths") or {})
+        ]
+        # 2.1.1 declares abort as POST /prompts/{tail} ("Abort a running
+        # prompt"), not a session-level :abort route. Call the tail form
+        # only when the spec lists it; do not post an undeclared fallback.
+        prompt_abort = any(
+            path.endswith("/prompts/{tail}")
+            or ("/prompts/" in path and path.endswith(":abort"))
+            for path in declared
+        )
+        session_abort = any(
+            path.endswith(":abort") and "/prompts/" not in path
+            for path in declared
+        )
+        if prompt_id and prompt_abort:
+            abort_path = (
+                f"/api/v1/sessions/{external_id}/prompts/{prompt_id}:abort"
+            )
+        elif session_abort:
+            abort_path = f"/api/v1/sessions/{external_id}:abort"
+        else:
+            return self.unsupported_receipt(
+                "interrupt", "abort_unavailable", session=session,
+                detail={"code": KIMI_LOCAL_SERVER_UNAVAILABLE,
+                        "detail": "OpenAPI has no prompt abort route"},
+            )
         try:
-            if prompt_id:
-                resp = await client.post(
-                    f"/api/v1/sessions/{external_id}/prompts/"
-                    f"{prompt_id}:abort")
-                await self._unwrap(resp.json(), "abort")
-            else:
-                await client.post(f"/api/v1/sessions/{external_id}:abort")
+            resp = await client.post(abort_path)
+            await self._unwrap(resp.json(), "abort")
         except Exception as exc:  # noqa: BLE001
             return self.unsupported_receipt(
                 "interrupt", "abort_failed", session=session,
-                detail={"detail": str(exc)[:200]})
+                detail={"detail": str(exc)})
         return CommandReceipt(
             command_id=new_id("cmd"),
             state=ReceiptState.COMPLETED,

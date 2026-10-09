@@ -9,11 +9,6 @@
 
 import { ENGINE_HUE, currentMode, hueColor } from "./palette-engine";
 
-/** Engine ids the operator can pick when adding a worker to a live run. */
-export const SPAWN_ENGINES = [
-  "claude", "codex", "cursor", "pi", "omp", "kimi", "grok", "opencode", "devin",
-] as const;
-
 // neutral slate for unknown workers — a whisper of chroma, deliberately quiet.
 const defaultColor = (): string => hueColor(250, currentMode(), 0.18);
 
@@ -35,6 +30,7 @@ export function workerEngine(id: string, engine?: string): string {
   if (s === "grok_cli" || s === "grok") return "Grok";
   if (s === "opencode_cli" || s === "opencode") return "OpenCode";
   if (s === "devin_cli" || s === "devin") return "Devin CLI";
+  if (s === "droid" || s === "droid_cli" || s === "factory_droid") return "Droid";
   if (s === "dsh_sdk_worker" || s === "dsh" || s === "deepseek_harness") return "DeepSeek Harness";
   if (s === "pi" || s === "omp" || s === "oh_my_pi" || s === "oh-my-pi" || s === "ohmypi") {
     return s === "pi" ? "Pi" : "Oh My Pi";
@@ -48,6 +44,7 @@ export function workerEngine(id: string, engine?: string): string {
   if (s.includes("kimi")) return "Kimi Code";
   if (s.includes("grok")) return "Grok";
   if (s.includes("opencode")) return "OpenCode";
+  if (s.includes("droid")) return "Droid";
   if (s.includes("devin")) return "Devin CLI";
   if (s.includes("dsh") || s.includes("deepseek-harness")) return "DeepSeek Harness";
   if (s.includes("deepseek") || s === "reason") return "DeepSeek";

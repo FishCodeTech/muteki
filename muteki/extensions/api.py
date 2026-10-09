@@ -22,6 +22,12 @@ from muteki.platform.contracts.commands import ActorRef, CommandEnvelope, QueryE
 from muteki.platform.contracts.errors import ErrorCategory, ErrorEnvelope
 from muteki.platform.contracts.receipts import ReceiptState
 
+_QUERY_ERROR_STATUS = {
+    ErrorCategory.NOT_FOUND: 404,
+    ErrorCategory.STATE: 409,
+    ErrorCategory.RUNTIME: 502,
+}
+
 #: 本地单操作员默认身份（与 apps/web 现有默认一致）。
 DEFAULT_ACTOR = ActorRef(kind="operator", id="local-user")
 
@@ -124,7 +130,8 @@ def create_extension_router(
             ))
         except CommandAPIError as exc:
             return JSONResponse(
-                {"error": exc.error.model_dump(mode="json")}, status_code=400
+                {"error": exc.error.model_dump(mode="json")},
+                status_code=_QUERY_ERROR_STATUS.get(exc.error.category, 400),
             )
         return result.result
 

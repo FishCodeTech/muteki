@@ -254,7 +254,7 @@ export function ChangedFilesCard({
             <Skeleton className="h-3 w-1/3" />
           </div>
         ) : error ? (
-          <div className="flex items-center gap-2 px-2 py-1 text-[12.5px] text-cx-fg-3" role="alert">
+          <div className="flex items-center gap-2 px-2 py-1 text-[13px] text-cx-fg-3" role="alert">
             <Icon name="circleAlert" size={14} className="shrink-0 text-cx-danger" />
             <span className="min-w-0 flex-1 truncate" title={error}>{error}</span>
             <Button size="xs" variant="ghost" icon="retry" onClick={() => setAttempt((value) => value + 1)}>
@@ -280,7 +280,7 @@ export function ChangedFilesCard({
                         return next;
                       })}
                       style={indent}
-                      className="flex h-7 w-full items-center gap-1.5 rounded-md pr-2 text-left text-[12.5px] text-cx-fg-3 transition-colors hover:bg-cx-hover hover:text-cx-fg-2"
+                      className="flex h-7 w-full items-center gap-1.5 rounded-md pr-2 text-left text-[13px] text-cx-fg-3 transition-colors hover:bg-cx-hover hover:text-cx-fg-2"
                     >
                       <Icon
                         name="chevronRight"
@@ -289,7 +289,7 @@ export function ChangedFilesCard({
                       />
                       <Icon name={isOpen ? "folderOpen" : "folder"} size={13} className="shrink-0 text-cx-fg-4" />
                       <span className="min-w-0 truncate">{row.name}</span>
-                      {!isOpen ? <span className="cx-tabular text-[11px] text-cx-fg-4">{row.fileCount}</span> : null}
+                      {!isOpen ? <span className="cx-tabular text-[12px] text-cx-fg-4">{row.fileCount}</span> : null}
                     </button>
                   </li>
                 );
@@ -305,19 +305,19 @@ export function ChangedFilesCard({
                     className="flex h-7 min-w-0 flex-1 items-center gap-2 rounded-md pr-2 text-left transition-colors hover:bg-cx-hover"
                   >
                     <span
-                      className={cn("w-3 shrink-0 text-center font-cx-mono text-[11px] font-semibold", meta.className)}
+                      className={cn("w-3 shrink-0 text-center font-cx-mono text-[12px] font-semibold", meta.className)}
                       title={meta.label}
                       aria-label={meta.label}
                     >
                       {meta.letter}
                     </span>
-                    <span className={cn("min-w-0 flex-1 truncate text-[12.5px]", row.file.status === "D" ? "text-cx-fg-3 line-through decoration-cx-fg-4" : "text-cx-fg")}>
+                    <span className={cn("min-w-0 flex-1 truncate text-[13px]", row.file.status === "D" ? "text-cx-fg-3 line-through decoration-cx-fg-4" : "text-cx-fg")}>
                       {row.name}
                     </span>
                     {row.file.binary ? (
-                      <span className="shrink-0 text-[11px] text-cx-fg-4">二进制</span>
+                      <span className="shrink-0 text-[12px] text-cx-fg-4">二进制</span>
                     ) : (
-                      <DiffStat additions={row.file.additions} deletions={row.file.deletions} className="shrink-0 text-[11px]" />
+                      <DiffStat additions={row.file.additions} deletions={row.file.deletions} className="shrink-0 text-[12px]" />
                     )}
                   </button>
                   {isHtml(row.file.path) && row.file.status !== "D" && threadId ? (

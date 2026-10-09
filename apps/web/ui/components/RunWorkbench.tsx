@@ -1,5 +1,6 @@
 "use client";
 
+import { setThemePreference, subscribeThemePreference } from "@/lib/themePreference";
 import { UsageDashboard } from "@/components/UsageDashboard";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
@@ -22,7 +23,7 @@ import { PentestEvidence } from "@/components/PentestEvidence";
 import { PentestReport } from "@/components/PentestReport";
 import { Input, Button, Modal, Skeleton, Slider, Tabs, toast } from "@heroui/react";
 import { actorDisplayTitle, toWorkerIdentity, workerColor, workerDisplayName, workerEngine } from "@/lib/workers";
-import { applySelection, readSavedSelection } from "@/lib/palette-engine";
+import { applySelection, readSavedTheme, readSavedSelection } from "@/lib/palette-engine";
 import { formatClock, formatElapsed, toEpochMs } from "@/lib/format";
 import { PANEL_HOTKEYS, RUNTIME_TABS, type RuntimeGroup } from "@/lib/runtimeTabs";
 import { shouldResetRuntimePanelForRun, shouldRestoreRuntimePanelOpen } from "@/lib/draftRuntimePanel";
@@ -1551,26 +1552,10 @@ function Deck({ workspaceMode }: { workspaceMode: "ctf" | "pentest" }) {
   const toastFail = () => pushToast({ msg: t("toast.actionFailed"), variant: "error" });
 
   useEffect(() => {
-    try {
-      const saved = window.localStorage.getItem("muteki.theme");
-      if (saved === "dark" || saved === "light") {
-        setTheme(saved);
-      } else if (window.matchMedia?.("(prefers-color-scheme: dark)").matches) setTheme("dark");
-    } catch {
-      // keep the default dark theme when storage/media is unavailable
-    }
-    setThemeReady(true);
+    const update = () => setTheme(readSavedTheme());
+    update(); setThemeReady(true);
+    return subscribeThemePreference(update);
   }, []);
-
-  useEffect(() => {
-    if (!themeReady) return;
-    document.documentElement.dataset.theme = theme;
-    try {
-      window.localStorage.setItem("muteki.theme", theme);
-    } catch {
-      // theming should still work for this session
-    }
-  }, [theme, themeReady]);
 
   // Color scheme: the picker lives on the settings page; here we only
   // re-apply the saved selection whenever the light/dark mode flips, so the
@@ -1580,7 +1565,7 @@ function Deck({ workspaceMode }: { workspaceMode: "ctf" | "pentest" }) {
     applySelection(readSavedSelection(), theme);
   }, [theme, themeReady]);
 
-  const toggleTheme = () => setTheme((cur) => (cur === "dark" ? "light" : "dark"));
+  const toggleTheme = () => setThemePreference(theme === "dark" ? "light" : "dark");
 
   // The run list becomes an overlay drawer below 640px. Start that drawer
   // closed on a narrow viewport so a direct visit exposes the task composer
@@ -1870,7 +1855,7 @@ function Deck({ workspaceMode }: { workspaceMode: "ctf" | "pentest" }) {
     // worker isolation toggle → backend's worker_backend ("container" runs each
     // worker in a Docker container that can't read the host bench tree; default
     // "local" = host subprocess).
-    const worker_backend = opts?.mode === "pentest" || opts?.containerMode ? "container" : "local";
+    const worker_backend = opts?.containerMode ? "container" : "local";
     const runOverrides: Record<string, unknown> = {};
     if (opts?.raceTimeout) runOverrides.race_timeout = opts.raceTimeout;
     if (opts?.wallClockBudget != null) runOverrides.wall_clock_budget = opts.wallClockBudget;
@@ -2235,20 +2220,20 @@ function Deck({ workspaceMode }: { workspaceMode: "ctf" | "pentest" }) {
         onClose={() => setBtwOpen(false)}
         runId={runId}
       />
-      <Modal isOpen={Boolean(railDeleteConfirm)} onOpenChange={(open) => !open && setRailDeleteConfirm(null)}>
-        <Modal.Backdrop isDismissable={!railDeleteBusy}><Modal.Container><Modal.Dialog>
+      <Modal.Backdrop isOpen={Boolean(railDeleteConfirm)} onOpenChange={(open) => !open && setRailDeleteConfirm(null)} isDismissable={!railDeleteBusy}>
+        <Modal.Container><Modal.Dialog>
           <Modal.Header className="flex flex-col gap-1"><Modal.Heading>{railDeleteConfirm?.kind === "folder" ? t("rail.folderDelete") : t("rail.menu.delete")}</Modal.Heading><small className="font-normal text-muted">{railDeleteConfirm?.kind === "folder" ? t("rail.confirmDeleteFolder") : t("rail.confirmDelete")}</small></Modal.Header>
           <Modal.Body>{railDeleteConfirm ? <div className="action-dialog-summary"><span><strong>{railDeleteConfirm.label}</strong></span><code>{railDeleteConfirm.id}</code></div> : null}</Modal.Body>
           <Modal.Footer><Button variant="ghost" onPress={() => setRailDeleteConfirm(null)} isDisabled={railDeleteBusy}>{t("dialog.cancel")}</Button><Button variant="danger" isPending={railDeleteBusy} onPress={() => void confirmRailDelete()}>{t("rail.menu.delete")}</Button></Modal.Footer>
-        </Modal.Dialog></Modal.Container></Modal.Backdrop>
-      </Modal>
-      <Modal isOpen={Boolean(killConfirm)} onOpenChange={(open) => !open && setKillConfirm(null)}>
-        <Modal.Backdrop isDismissable={!killConfirmBusy}><Modal.Container><Modal.Dialog>
+        </Modal.Dialog></Modal.Container>
+      </Modal.Backdrop>
+      <Modal.Backdrop isOpen={Boolean(killConfirm)} onOpenChange={(open) => !open && setKillConfirm(null)} isDismissable={!killConfirmBusy}>
+        <Modal.Container><Modal.Dialog>
           <Modal.Header className="flex flex-col gap-1"><Modal.Heading>{t("worker.confirmKillTitle")}</Modal.Heading><small className="font-normal text-muted">{t("worker.confirmKill")}</small></Modal.Header>
           <Modal.Body>{killConfirm ? <div className="action-dialog-summary"><span><strong>{killConfirm.label}</strong></span><code>{killConfirm.id}</code></div> : null}</Modal.Body>
           <Modal.Footer><Button variant="ghost" onPress={() => setKillConfirm(null)} isDisabled={killConfirmBusy}>{t("dialog.cancel")}</Button><Button variant="danger" isPending={killConfirmBusy} onPress={() => void confirmKillWorker()}>{t("worker.killTitle")}</Button></Modal.Footer>
-        </Modal.Dialog></Modal.Container></Modal.Backdrop>
-      </Modal>
+        </Modal.Dialog></Modal.Container>
+      </Modal.Backdrop>
     </div>
   );
 }

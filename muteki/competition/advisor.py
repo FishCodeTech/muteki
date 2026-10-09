@@ -39,8 +39,8 @@ from muteki.external_agents.base import BaseExternalAgentAdapter
 from muteki.platform.contracts.base import ContractModel, new_id, utcnow
 from muteki.platform.contracts.external_agents import (
     AgentEventType,
-    AgentInput,
     AgentSessionRef,
+    MessageInput,
     SessionStart,
 )
 
@@ -110,7 +110,7 @@ class ExternalAgentSessionExecutor:
                 "ExternalAgentSessionExecutor requires a "
                 "BaseExternalAgentAdapter (RUNTIME-01)"
             )
-        if getattr(adapter, "_binding_service", None) is not None:
+        if adapter.has_binding_service:
             raise ValueError(
                 "advisor adapter must not carry a binding_service: "
                 "the advisor has no platform write capability"
@@ -156,8 +156,8 @@ class ExternalAgentSessionExecutor:
         chunks: list[str] = []
         events = 0
         error = ""
-        stream = self._adapter.send(session, AgentInput(
-            kind="message", text=text, payload=payload))
+        stream = self._adapter.send(session, MessageInput(
+            text=text, payload=payload))
         async for event in stream:
             events += 1
             if event.event_type is AgentEventType.MESSAGE_COMPLETED:

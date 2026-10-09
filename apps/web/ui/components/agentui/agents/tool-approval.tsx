@@ -71,6 +71,8 @@ export interface ToolApprovalProps {
   /** Footer note shown instead of actions when the request is no longer pending. */
   footer?: ReactNode;
   actions?: ReactNode;
+  /** Trailing content in the pending action row (e.g. keyboard hints). */
+  actionsAside?: ReactNode;
   className?: string;
 }
 
@@ -139,6 +141,7 @@ export function ToolApproval({
   disabled = false,
   footer,
   actions,
+  actionsAside,
   className,
 }: ToolApprovalProps) {
   const reduce = useReducedMotion() ?? false;
@@ -207,7 +210,7 @@ export function ToolApproval({
             </div>
             <span
               className={cn(
-                "shrink-0 rounded-full border px-2 py-0.5 text-[11px] font-medium transition-colors",
+                "shrink-0 rounded-full border px-2 py-0.5 text-[12px] font-medium transition-colors",
                 getStatusBadgeClass(status),
               )}
             >
@@ -302,6 +305,7 @@ export function ToolApproval({
               </button>
             ) : null}
             </>)}
+            {actionsAside}
           </motion.div>
         ) : footer ? (
           <div className="border-t border-cx-border/60 px-4 py-3 text-xs text-cx-fg-3">{footer}</div>

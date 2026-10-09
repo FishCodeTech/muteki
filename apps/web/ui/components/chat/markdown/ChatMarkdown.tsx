@@ -39,6 +39,7 @@ export interface ChatMarkdownProps {
   streaming?: boolean;
   /** Enables in-app preview for localhost links. */
   threadId?: string;
+  messageId?: string;
   onResourceLink?: (target: ResourceLinkTarget) => void;
   size?: "md" | "sm";
   className?: string;
@@ -237,7 +238,7 @@ const MarkdownBlock = memo(function MarkdownBlock({ text, components, sourceStar
 });
 
 /** Chat-only markdown renderer with ChatGPT/Claude-grade prose (`.cx-prose`). */
-export function ChatMarkdown({ text, streaming = false, threadId, onResourceLink, size = "md", className }: ChatMarkdownProps) {
+export function ChatMarkdown({ text, streaming = false, threadId, messageId, onResourceLink, size = "md", className }: ChatMarkdownProps) {
   const { lang } = useLang();
   const resourceLinkRef = useRef(onResourceLink);
   resourceLinkRef.current = onResourceLink;
@@ -266,10 +267,10 @@ export function ChatMarkdown({ text, streaming = false, threadId, onResourceLink
       className={cn("cx-prose", size === "sm" && "cx-prose-sm", className)}
       data-streaming={streaming ? "true" : undefined}
     >
-      {streaming && crossReferences ? <p className="text-[11px] text-cx-fg-4" role="status">{lang === "en" ? "Footnotes and cross-paragraph references will be linked when the answer finishes." : "脚注与跨段引用会在回答完成后连接。"}</p> : null}
+      {streaming && crossReferences ? <p className="text-[12px] text-cx-fg-4" role="status">{lang === "en" ? "Footnotes and cross-paragraph references will be linked when the answer finishes." : "脚注与跨段引用会在回答完成后连接。"}</p> : null}
       {blocks.map((block, index) => {
         const visual = threadId ? parseVisualization(block) : null;
-        if (visual && threadId) return <ChatVisualization key={index} threadId={threadId} {...visual} streaming={streaming} />;
+        if (visual && threadId) return <ChatVisualization key={index} threadId={threadId} messageId={messageId} {...visual} streaming={streaming} />;
         return (
         <MarkdownBlock
           key={index}

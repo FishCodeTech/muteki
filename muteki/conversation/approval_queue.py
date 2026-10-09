@@ -56,6 +56,9 @@ def _infer_kind(payload: Mapping[str, Any]) -> str:
         "mcp_tool_call": "mcp_tool_call",
         "mcp": "mcp_tool_call",
         "tool": "tool",
+        "plan_exit": "plan_exit",
+        "exit_plan_mode": "plan_exit",
+        "exitplanmode": "plan_exit",
     }
     if raw in aliases:
         return aliases[raw]
@@ -266,6 +269,8 @@ def normalize_approval_payload(
             title = "文件变更"
         elif kind == "mcp_tool_call":
             title = "MCP 工具调用"
+        elif kind == "plan_exit":
+            title = "计划已就绪"
         else:
             title = "Runtime 操作"
 
@@ -416,14 +421,90 @@ def expire_approvals(
     pending_approvals: Mapping[str, Mapping[str, Any]],
     *,
     reason: str,
+    preserve_background: bool = False,
 ) -> tuple[dict[str, dict[str, Any]], Optional[dict[str, Any]]]:
-    # The immutable requested + terminal turn events retain the full audit
-    # history. The current control snapshot only carries actionable requests.
-    return {}, None
+    # Keep the last requests visible, without retaining actionable badges or
+    # permission to answer them. A later approval/turn replaces these rows.
+    code = (UNANSWERABLE_RUNTIME_RESTARTED if reason == "runtime_restarted"
+            else UNANSWERABLE_TURN_ENDED)
+    queue = {
+        str(key): dict(row) if preserve_background and (row.get("native") or {}).get("background") is True else {
+            **dict(row), "status": "expired", "expired_reason": reason,
+            "response_capability": {
+                **dict(row.get("response_capability") or {}),
+                "answerable": False, "reason": code,
+            },
+        }
+        for key, row in pending_approvals.items()
+    }
+    return queue, primary_approval(queue)
 
 
 def clear_approvals() -> tuple[dict[str, dict[str, Any]], None]:
     return {}, None
+
+
+#: Why an approval can no longer be answered; stable codes the UI maps to copy.
+UNANSWERABLE_SESSION_CLOSED = "session_closed"
+UNANSWERABLE_SESSION_REPLACED = "session_replaced"
+UNANSWERABLE_STALE_GENERATION = "stale_generation"
+UNANSWERABLE_RUNTIME_RESTARTED = "runtime_restarted"
+UNANSWERABLE_TURN_ENDED = "turn_ended"
+
+
+def stamp_response_capability(
+    row: Mapping[str, Any],
+    *,
+    agent_session_id: str,
+    generation: Optional[int],
+) -> dict[str, Any]:
+    """Bind a fresh approval to the session/generation that issued it."""
+    return {
+        **dict(row),
+        "response_capability": {
+            "answerable": True,
+            "agent_session_id": agent_session_id,
+            "generation": generation,
+        },
+    }
+
+
+def approval_response_capability(
+    row: Mapping[str, Any],
+    *,
+    current_session_id: str,
+    session_open: bool,
+    current_generation: int,
+    session_live: Optional[bool] = None,
+) -> dict[str, Any]:
+    """Whether ``row`` can still be answered by the thread's current session.
+
+    ``session_live`` is only known in-process (the executor); read models pass
+    ``None`` and get the persisted-state verdict.
+    """
+    stamped = row.get("response_capability")
+    bound = stamped if isinstance(stamped, Mapping) else {}
+    issuer = str(bound.get("agent_session_id") or row.get("agent_session_id") or "")
+    generation = bound.get("generation")
+    reason = str(bound.get("reason") or "") if row.get("status") == "expired" else ""
+    if reason:
+        pass
+    elif issuer and issuer != current_session_id:
+        reason = UNANSWERABLE_SESSION_REPLACED
+    elif generation is not None and int(generation) != int(current_generation):
+        reason = UNANSWERABLE_STALE_GENERATION
+    elif not session_open:
+        reason = UNANSWERABLE_SESSION_CLOSED
+    elif session_live is False:
+        reason = UNANSWERABLE_RUNTIME_RESTARTED
+    result: dict[str, Any] = {
+        "answerable": not reason,
+        "agent_session_id": issuer or current_session_id,
+        "generation": generation,
+    }
+    if reason:
+        result["reason"] = reason
+    return result
 
 
 def lookup_approval(
@@ -435,6 +516,11 @@ def lookup_approval(
 
 
 __all__ = [
+    "UNANSWERABLE_RUNTIME_RESTARTED",
+    "UNANSWERABLE_SESSION_CLOSED",
+    "UNANSWERABLE_SESSION_REPLACED",
+    "UNANSWERABLE_STALE_GENERATION",
+    "approval_response_capability",
     "clear_approvals",
     "expire_approvals",
     "has_actionable_approvals",
@@ -444,5 +530,6 @@ __all__ = [
     "normalize_approval_payload",
     "primary_approval",
     "remove_approval",
+    "stamp_response_capability",
     "upsert_approval",
 ]

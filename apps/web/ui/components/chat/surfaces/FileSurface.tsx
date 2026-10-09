@@ -16,6 +16,7 @@ import { TypedResourcePreview, workspacePreviewToProps } from "@/components/conv
 import { formatLineCitation } from "@/components/chat/preview/CodeViewer";
 import { PathBreadcrumb } from "./PathBreadcrumb";
 import { SurfaceToolbar, surfaceJson } from "./shared";
+import { useThreadEditor } from "@/components/conversation/threadEditorContext";
 import { NativeWorkspaceFileActions } from "@/components/NativeWorkspaceFileActions";
 
 type FileSurfaceModel = Extract<ChatSurface, { kind: "file" }>;
@@ -39,6 +40,7 @@ function needsBlobPreview(preview: WorkspaceFilePreview | null): boolean {
 
 export function FileSurface({ surface, threadId, view, active, hasWorkspace, onCiteToComposer }: SurfaceProps<FileSurfaceModel>) {
   const { path, line } = surface;
+  const editor = useThreadEditor();
   const [preview, setPreview] = useState<WorkspaceFilePreview | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -157,6 +159,14 @@ export function FileSurface({ surface, threadId, view, active, hasWorkspace, onC
           <IconButton icon="refresh" label="重新读取" loading={loading && Boolean(preview)} onClick={() => void load()} />
           <CopyButton text={path} label="复制路径" size="sm" />
           <IconButton icon="folderTree" label="在文件中显示" onClick={() => chatPanel.revealInFiles(threadId, { kind: "file", path, line })} />
+          {editor ? (
+            <IconButton
+              icon="code"
+              label={line ? `在编辑器中打开（第 ${line} 行）` : "在编辑器中打开"}
+              loading={editor.busy}
+              onClick={() => void editor.open(preview?.path || path, line || undefined)}
+            />
+          ) : null}
           <IconButton
             icon={desktopChatBridge() ? "download" : "externalLink"}
             label={desktopChatBridge() ? "下载原文件（保留文件名）" : "打开原始文件"}

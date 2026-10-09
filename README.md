@@ -23,7 +23,7 @@
 </p>
 
 <p align="center">
-  <strong>English</strong> · <a href="README_CN.md">简体中文</a> · <a href="CHANGELOG.md">Changelog</a>
+  <strong>English</strong> · <a href="README_CN.md">简体中文</a> · <a href="CHANGELOG.md">Changelog</a> · <a href="docs/development.md">Dev build guide</a>
 </p>
 
 <p align="center">
@@ -74,13 +74,17 @@ After a month of engineering work, tuning, and fixes, Muteki is open source with
 
 ## Release notes
 
-The current version is **0.4.0**. See [CHANGELOG.md](CHANGELOG.md) for new features, behavior changes, removals, and upgrade notes.
+The current version is **0.4.1**. See [CHANGELOG.md](CHANGELOG.md) for new features, behavior changes, removals, and upgrade notes.
+
+The [0.4.1 release](https://github.com/FishCodeTech/muteki/releases/tag/v0.4.1) includes a macOS desktop app for Apple silicon and Intel, with a bundled local service and support for remote Muteki services. Windows and Linux desktop packages are not included in this release. Web and container deployments remain available.
+
+The macOS packages are ad-hoc signed and are not notarized. Install desktop updates manually; the in-app signed-candidate update flow requires a stable Developer ID signature.
 
 ---
 
 ## Quick start
 
-> **Start with the single-challenge CTF workspace.** The home page shows this workspace by default. Conversation, competitions, and custom extensions are still being tested and can be enabled as described below. The Web pentest mode is being reworked and is currently unavailable.
+> **Start with the CTF or penetration-testing workspace.** Both appear on the home page by default. Conversation and competition workspaces are optional and can be enabled in appearance settings as described below.
 
 ### 1. Prepare the environment and start the Web app
 
@@ -291,7 +295,7 @@ The UI remains at `http://localhost:3001` by default. `MUTEKI_HOST_DATA_ROOT` mu
 ```bash
 ./run.sh upgrade --check   # Check the latest stable release
 ./run.sh install            # Set up a managed installation
-muteki upgrade v0.4.0       # Install this release
+muteki upgrade v0.4.1       # Install this release
 muteki rollback             # Return to the previous installed release
 muteki version              # Show version and installation kind
 ```

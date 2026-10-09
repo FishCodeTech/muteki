@@ -19,13 +19,15 @@ from muteki.external_agents.sessions import (
     classify_exit,
 )
 from muteki.platform.contracts.base import new_id
-from muteki.platform.contracts.capabilities import InjectionKind
+from muteki.platform.contracts.capabilities import InjectionKind, ThreadMode
 from muteki.platform.contracts.external_agents import (
     AgentEvent,
     AgentEventType,
     AgentInput,
     AgentSessionRef,
+    MessageInput,
     ProbeRequest,
+    SessionOptions,
     SessionStart,
 )
 from muteki.platform.contracts.receipts import (
@@ -162,9 +164,10 @@ class CliDriverAdapter(BaseExternalAgentAdapter):
     # -- 启动（任务书 7.6 步骤 4 的 Runtime 侧动作） --------------------------
 
     async def _launch(self, request: SessionStart, plan, bearer_token) -> dict:
-        cwd = str(request.options.get("cwd") or self._default_cwd or os.getcwd())
+        options = request.options
+        cwd = str(options.cwd or self._default_cwd or os.getcwd())
         env = dict(self._default_env)
-        env.update({k: str(v) for k, v in (request.options.get("env") or {}).items()})
+        env.update(options.env)
         if self._driver.name == "kimi" and request.effort and request.effort != "default":
             env["KIMI_MODEL_THINKING_EFFORT"] = str(request.effort)
         capability_prompt = ""
@@ -192,15 +195,15 @@ class CliDriverAdapter(BaseExternalAgentAdapter):
         self._runs[request.agent_session_id] = {
             "cwd": cwd,
             "env": env,
-            "options": dict(request.options),
+            "options": options,
             "model": str(request.model or "").strip(),
             "effort": str(request.effort or "default").strip(),
             "permission_mode": str(request.permission_mode or "").strip(),
             "sandbox_mode": str(request.sandbox_mode or "").strip(),
             "timeout_s": (
                 0
-                if str(request.options.get("thread_mode") or "") == "conversation"
-                else int(request.options.get("timeout_s") or self._timeout_s)
+                if options.is_conversation
+                else int(options.timeout_s or self._timeout_s)
             ),
             "turns": 0,
             "cancel_event": None,
@@ -217,7 +220,9 @@ class CliDriverAdapter(BaseExternalAgentAdapter):
         self, session: AgentSessionRef, input: AgentInput
     ):
         """启动一个 turn 进程并流出统一 AgentEvent（AsyncIterator）。"""
-        return self._turn_stream(session, input)
+        if isinstance(input, MessageInput):
+            return self._turn_stream(session, input)
+        return self.unsupported_input_stream(session, input)
 
     def resume(self, session: AgentSessionRef):
         caps = self._probe_cache.capabilities if self._probe_cache else None
@@ -226,10 +231,9 @@ class CliDriverAdapter(BaseExternalAgentAdapter):
             (ctx or {}).get("external_session_id"))
         if (caps is not None and not caps.resume) or not external_id:
             return self._unsupported_stream(session, "resume", "resume")
-        prompt = str(ctx.get("options", {}).get("resume_prompt")
-                     or "Continue from where you left off.")
+        prompt = ctx["options"].resume_prompt or "Continue from where you left off."
         return self._turn_stream(
-            session, AgentInput(kind="message", text=prompt), force_resume=True)
+            session, MessageInput(text=prompt), force_resume=True)
 
     def _step_events(
         self, step: StreamStep, seq, *, common: dict, turn_id: str,
@@ -284,7 +288,7 @@ class CliDriverAdapter(BaseExternalAgentAdapter):
         return events, external_id
 
     async def _turn_stream(
-        self, session: AgentSessionRef, input: AgentInput, *,
+        self, session: AgentSessionRef, input: MessageInput, *,
         force_resume: bool = False,
     ):
         sid = session.agent_session_id
@@ -335,24 +339,24 @@ class CliDriverAdapter(BaseExternalAgentAdapter):
             payload={"kind": input.kind},
             **common))
 
-        web_access = bool(ctx["options"].get("web_access", True))
-        kb_access = bool(ctx["options"].get("kb_access", True))
+        options: SessionOptions = ctx["options"]
+        web_access = options.web_access
+        kb_access = options.kb_access
         use_resume = bool(external_id) and (force_resume or ctx["turns"] > 0)
         prompt_text = input.text
         capability_sections = [
             str(ctx.get("capability_prompt") or "").strip(),
-            str(input.payload.get("capability_context") or "").strip(),
+            input.payload.capability_context.strip(),
         ]
         capability_context = "\n\n".join(
             section for section in capability_sections if section
         )
         if capability_context:
             prompt_text = f"{capability_context}\n\n[当前用户请求]\n{input.text}"
-        thread_mode = str(ctx["options"].get("thread_mode") or "").strip()
         purpose = {
-            "conversation": LaunchPurpose.CONVERSATION,
-            "management": LaunchPurpose.MANAGEMENT,
-        }.get(thread_mode, LaunchPurpose.WORKER)
+            ThreadMode.CONVERSATION: LaunchPurpose.CONVERSATION,
+            ThreadMode.MANAGEMENT: LaunchPurpose.MANAGEMENT,
+        }.get(options.thread_mode, LaunchPurpose.WORKER)
         launch = LaunchContext(
             purpose=purpose,
             permission_mode=str(ctx.get("permission_mode") or "").strip(),
@@ -360,7 +364,7 @@ class CliDriverAdapter(BaseExternalAgentAdapter):
         )
         stdin_text: Optional[str] = None
         try:
-            if ctx["options"].get("prompt_via_stdin"):
+            if options.prompt_via_stdin:
                 # Secret 级 prompt 只走 stdin 管道，不进 argv（进程表可读）。
                 argv = self._driver.build_execute_stdin(
                     prompt_text, external_id if use_resume else None,
@@ -573,7 +577,8 @@ class CliDriverAdapter(BaseExternalAgentAdapter):
         self, session: AgentSessionRef, input: AgentInput
     ) -> CommandReceipt:
         # CLI 一次性进程无带内 steer 通道（turn 级 steer 需结构化传输）。
-        return self.unsupported_receipt("steer", "steer", session=session)
+        return self.unsupported_receipt(
+            "steer", "steer", session=session, detail={"input_kind": input.kind})
 
     async def _teardown(self, session: AgentSessionRef) -> str:
         ctx = self._runs.pop(session.agent_session_id, None)

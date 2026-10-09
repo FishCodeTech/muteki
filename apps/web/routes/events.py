@@ -17,6 +17,7 @@ from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 from apps.web.auth import (
     AuthConfig,
     bearer_from_header,
+    request_token,
     verify_token,
 )
 from apps.web.run_manager import RunManager
@@ -60,9 +61,9 @@ def register(app: FastAPI) -> None:
         # an unauthenticated open can't spawn empty run handles.
         cfg: AuthConfig = app.state.auth
         if cfg.enabled:
-            tok = bearer_from_header(request.headers.get("Authorization"))
+            tok = request_token(cfg, request)
             authed = verify_token(cfg, tok) or app.state.tickets.redeem(
-                request.query_params.get("ticket"))
+                request.query_params.get("ticket"), scope=request.scope)
             if not authed:
                 raise HTTPException(status_code=401, detail="unauthorized")
         manager: RunManager = app.state.manager
@@ -236,7 +237,7 @@ def register(app: FastAPI) -> None:
         # (close 4401) on failure so we never expose an authenticated socket.
         cfg: AuthConfig = app.state.auth
         if cfg.enabled:
-            authed = app.state.tickets.redeem(ws.query_params.get("ticket")) or \
+            authed = app.state.tickets.redeem(ws.query_params.get("ticket"), scope=ws.scope) or \
                 verify_token(cfg, ws.query_params.get("token"))
             if not authed:
                 await ws.close(code=4401)

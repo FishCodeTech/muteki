@@ -4,14 +4,16 @@ import { useEffect, useRef } from "react";
 import { desktopChatBridge, type DesktopPreviewEvent } from "@/lib/desktopChatBridge";
 
 /** Native preview has an isolated browser process; it never shares the chat document. */
-export function NativePreview({ surfaceId, threadId, url, active, revision, onEvent }: {
+export function NativePreview({ surfaceId, threadId, url, active, revision, persistent = false, onEvent }: {
   surfaceId: string; threadId: string; url: string; active: boolean; revision: number;
+  /** Use the service-wide persistent browser profile instead of a throwaway session. */
+  persistent?: boolean;
   onEvent: (event: DesktopPreviewEvent) => void;
 }) {
   const element = useRef<HTMLDivElement>(null);
   const currentId = useRef("");
-  const latest = useRef({ url, active, revision, onEvent });
-  latest.current = { url, active, revision, onEvent };
+  const latest = useRef({ url, active, revision, persistent, onEvent });
+  latest.current = { url, active, revision, persistent, onEvent };
   const updateRef = useRef<() => void>(() => {});
 
   useEffect(() => {
@@ -54,7 +56,7 @@ export function NativePreview({ surfaceId, threadId, url, active, revision, onEv
       opening = true;
       const reload = state.revision !== lastRevision;
       lastRevision = state.revision;
-      void bridge.openPreview!({ surfaceId, threadId, url: state.url, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, reload }).then((opened) => {
+      void bridge.openPreview!({ surfaceId, threadId, url: state.url, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, reload, persistent: state.persistent }).then((opened) => {
         if (!opened || typeof opened.id !== "string" || !opened.id) throw new Error("desktop.preview.invalid_reply: 预览缺少身份");
         if (disposed) { void bridge.closePreview!({ id: opened.id, surfaceId }).catch((error) => console.error("desktop.preview.cleanup_failed", error)); return; }
         if (generation !== requestGeneration) {
@@ -99,6 +101,6 @@ export function NativePreview({ surfaceId, threadId, url, active, revision, onEv
     };
   }, [surfaceId, threadId]);
 
-  useEffect(() => { updateRef.current(); }, [url, active, revision]);
+  useEffect(() => { updateRef.current(); }, [url, active, revision, persistent]);
   return <div ref={element} className="h-full w-full bg-white" role="region" aria-label="隔离的桌面网页预览" />;
 }

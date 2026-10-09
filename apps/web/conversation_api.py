@@ -13,8 +13,6 @@
     GET  /api/threads/{thread_id}/events      （SSE：snapshot + watermark + after）
     POST /api/threads/{thread_id}/commands    （conversation.* 命令统一入口）
     POST /api/threads/{thread_id}/uploads     （multipart 上传 → artifact.attach）
-    GET  /api/agent-runtimes                  （委托 RUNTIME-05 AgentRuntimeService）
-    POST /api/agent-runtimes/{instance_id}/probe
 
 约束：
 
@@ -23,9 +21,7 @@
 - SSE 用 snapshot + watermark + ``after`` sequence 恢复，事件来自
   PlatformStore 的 Thread 聚合流（Public Event 白名单字段），不直接读取
   Adapter 私有事件；
-- 最后两个 agent-runtimes 端点委托 RUNTIME-05 的 ``AgentRuntimeService``；
-  与 ``agent_runtime_api`` router 同路径，INTEG-01 挂载时二选一
-  （``include_runtime_routes=False`` 可关闭本 router 内的这两条）。
+- Agent Runtime 端点由 ``agent_runtime_api`` router 提供。
 """
 
 from __future__ import annotations
@@ -44,6 +40,7 @@ from typing import Any
 from fastapi import HTTPException, APIRouter, Body, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
+from apps.web.ui_preferences import UiPreferencesWrite
 
 from muteki.platform.command_handlers.base import CommandAPIError
 from muteki.platform.contracts.commands import (
@@ -60,12 +57,15 @@ from muteki.conversation.composer_capabilities import (
     resolve_composer_catalog,
 )
 from muteki.conversation.inbox import InboxBroker, collect_attention_rows
-from muteki.conversation.manager import ConversationError
-from muteki.conversation.module import ConversationService
-from muteki.external_agents.c24_cu_fixtures import (
-    build_cu_fixture,
-    fixture_id_from_title,
+from muteki.conversation.manager import (
+    INTERACTION_MODE_INVALID_CODE,
+    THREAD_NOT_FOUND_CODE,
+    TURN_NOT_FOUND_CODE,
+    ConversationError,
+    InteractionModeError,
 )
+from muteki.conversation.module import CONVERSATION_PREFS_KEY, ConversationService
+from muteki.external_agents.descriptors import all_descriptors, find_descriptor
 from muteki.external_agents.factory import engine_for_adapter
 
 #: Web 传输入口的本地操作员身份（单操作员产品默认，与 RUNTIME-05 一致）。
@@ -91,6 +91,64 @@ def _github_pr_api_token() -> str:
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return result.stdout.strip() if result.returncode == 0 else ""
+
+
+class GitHubAPIError(RuntimeError):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _github_api_json(
+    method: str,
+    url: str,
+    token: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    timeout: float = 15,
+) -> Any:
+    """Call the GitHub REST API; HTTP failures carry GitHub's own message."""
+    import urllib.error
+    import urllib.request
+
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "muteki/c15",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode() or "null")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode(errors="replace")
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = None
+        parts: list[str] = []
+        if isinstance(parsed, dict):
+            if parsed.get("message"):
+                parts.append(str(parsed["message"]))
+            for item in parsed.get("errors") or []:
+                if isinstance(item, dict):
+                    detail = item.get("message") or " ".join(
+                        str(item[key]) for key in ("resource", "field", "code") if item.get(key)
+                    )
+                    if detail:
+                        parts.append(str(detail))
+                elif item:
+                    parts.append(str(item))
+        elif raw.strip():
+            parts.append(raw.strip())
+        message = "; ".join(parts) or (exc.reason and str(exc.reason)) or ""
+        raise GitHubAPIError(exc.code, f"GitHub API HTTP {exc.code}: {message}".rstrip(": ")) from exc
 
 #: /commands 入口允许的命令命名空间（其余命令走各自领域 API）。
 ALLOWED_COMMAND_PREFIX = "conversation."
@@ -187,6 +245,7 @@ class ComposerCapabilitiesBody(BaseModel):
 
     thread_id: str = ""
     adapter_id: str = Field(default="", max_length=120)
+    instance_id: str = Field(default="", max_length=120)
     workspace_id: str = Field(default="", max_length=160)
     project_id: str = Field(default="", max_length=160)
     trigger: str = Field(pattern=r"^[/@$]$")
@@ -205,6 +264,32 @@ class ThreadGitCheckoutBody(BaseModel):
 
     branch: str = Field(min_length=1, max_length=200)
     create: bool = False
+
+
+class ThreadGitCommitBody(BaseModel):
+    """暂存并提交 Thread 工作区改动；paths 为空时提交全部改动。"""
+
+    message: str = Field(default="", max_length=20_000)
+    paths: list[str] | None = Field(default=None, max_length=2_000)
+    amend: bool = False
+
+
+class ThreadGitPushBody(BaseModel):
+    """None 表示仅在分支没有上游时自动设置上游。"""
+
+    set_upstream: bool | None = None
+
+
+class ThreadGitPullBody(BaseModel):
+    rebase: bool = False
+
+
+class ThreadPullRequestCreateBody(BaseModel):
+    title: str = Field(default="", max_length=1_000)
+    body: str = Field(default="", max_length=65_000)
+    base: str = Field(default="", max_length=255)
+    draft: bool = False
+    push_first: bool = False
 
 
 class WorkspaceDeleteWorktreeBody(BaseModel):
@@ -317,22 +402,42 @@ def _composer_runtime_payload(
     }
 
 
+def _session_import_source(engine: str) -> tuple[Any, Path] | None:
+    """Scanner and default host directory for a provider session import."""
+    from muteki.conversation.provider_import import scan_claude_sessions, scan_codex_sessions
+
+    descriptor = find_descriptor(engine)
+    if descriptor is None or descriptor.session_import == "none":
+        return None
+    scanner = {
+        "claude_projects": scan_claude_sessions,
+        "codex_sessions": scan_codex_sessions,
+    }[descriptor.session_import]
+    return scanner, Path.home() / descriptor.environment.home_relative
+
+
+def _session_import_invalid_message() -> str:
+    names = " 或 ".join(
+        item.identity.display_name for item in all_descriptors()
+        if item.session_import != "none"
+    )
+    return f"请选择 {names} 历史来源。"
+
+
 def create_conversation_router(
     *,
     command_api: Any,
     service: ConversationService,
-    runtime_service: Any = None,
     actor: ActorRef = OPERATOR,
     register_handlers: bool = True,
-    include_runtime_routes: bool = True,
     sse_metrics: Any = None,
     extension_service: Any = None,
+    browser_control: Any = None,
 ) -> Any:
     """构造 Conversation API router。
 
     ``register_handlers`` 为 True 时把 CONV-01 Handler 注册到该 Command
-    API（幂等）。``runtime_service`` 为 RUNTIME-05 的
-    ``AgentRuntimeService``；缺省时 agent-runtimes 两端点返回 503。
+    API（幂等）。
     """
     if register_handlers:
         service.register(command_api)
@@ -398,6 +503,7 @@ def create_conversation_router(
         *,
         status_code: int,
         recovery_hint: str = "",
+        detail: dict[str, Any] | None = None,
     ) -> JSONResponse:
         error = ErrorEnvelope(
             code=code,
@@ -405,6 +511,8 @@ def create_conversation_router(
             category=category,
             recovery_hint=recovery_hint,
         )
+        if detail:
+            error = error.model_copy(update={"detail": dict(detail)})
         return JSONResponse(
             {"error": error.model_dump(mode="json")},
             status_code=status_code,
@@ -430,16 +538,7 @@ def create_conversation_router(
             selection = service.manager.runtime_selection(thread.thread_id)
             adapter_id = adapter_id or selection.adapter_id
             workspace_id = str(thread.workspace_id or "")
-            fixture_key = fixture_id_from_title(thread.title or "")
-            if fixture_key:
-                runtime_snapshot, matrix_from_fixture, _caps = build_cu_fixture(
-                    fixture_key
-                )
-                service.executor._capability_cache[thread.thread_id] = runtime_snapshot
-                runtime_diagnostics.append(
-                    f"C24 CU fixture active: {fixture_key}"
-                )
-            elif adapter_id == selection.adapter_id:
+            if adapter_id == selection.adapter_id:
                 runtime_snapshot = service.executor.cached_runtime_capabilities(
                     thread.thread_id)
                 sel_iid = selection.instance_id or "default"
@@ -523,26 +622,19 @@ def create_conversation_router(
         matrix_payload = None
         try:
             if body.thread_id:
-                thread_for_matrix = service.manager.get_thread(body.thread_id)
-                fixture_key = fixture_id_from_title(
-                    thread_for_matrix.title if thread_for_matrix else ""
+                # Matrix identity must follow the requested Runtime, not a
+                # stale thread-scoped snapshot from another Provider/instance.
+                sel = service.manager.runtime_selection(body.thread_id)
+                matrix_iid = (
+                    (sel.instance_id or "default")
+                    if adapter_id == (sel.adapter_id or "")
+                    else "default"
                 )
-                if fixture_key and runtime_snapshot is not None:
-                    matrix_payload = runtime_snapshot.public_matrix()
-                else:
-                    # Matrix identity must follow the requested Runtime, not a
-                    # stale thread-scoped snapshot from another Provider/instance.
-                    sel = service.manager.runtime_selection(body.thread_id)
-                    matrix_iid = (
-                        (sel.instance_id or "default")
-                        if adapter_id == (sel.adapter_id or "")
-                        else "default"
-                    )
-                    matrix_payload = service.executor.interaction_matrix_for(
-                        body.thread_id,
-                        adapter_id=adapter_id,
-                        instance_id=matrix_iid,
-                    )
+                matrix_payload = service.executor.interaction_matrix_for(
+                    body.thread_id,
+                    adapter_id=adapter_id,
+                    instance_id=matrix_iid,
+                )
             elif runtime_snapshot is not None and runtime_snapshot.matrix is not None:
                 matrix_payload = runtime_snapshot.public_matrix()
         except Exception as exc:
@@ -552,6 +644,12 @@ def create_conversation_router(
         return {
             "engine": engine,
             "trigger": body.trigger,
+            **service.manager.access_mode_availability(
+                adapter_id,
+                body.instance_id or ((selection.instance_id or "default")
+                                     if body.thread_id and adapter_id == selection.adapter_id else "default"),
+                str(workspace.root_path) if workspace is not None else "",
+            ),
             "items": items,
             "count": len(items),
             "partial": bool(section_errors),
@@ -916,7 +1014,17 @@ def create_conversation_router(
         except CommandAPIError as exc:
             status = 404 if exc.error.category is ErrorCategory.NOT_FOUND else 400
             return JSONResponse(_error_body(exc), status_code=status)
-        return result.result
+        view = result.result
+        # Subagent Threads surface a lineage banner; resolve the parent title
+        # here so the UI does not need a second lookup.
+        lineage = (view.get("state") or {}).get("lineage")
+        if lineage:
+            parent = service.manager.get_thread(str(lineage.get("parent_thread_id") or ""))
+            view["lineage"] = {
+                **lineage,
+                "parent_title": (parent.title if parent is not None else "") or None,
+            }
+        return view
 
     @router.get("/api/threads/{thread_id}/impact-preview")
     async def impact_preview(
@@ -935,12 +1043,12 @@ def create_conversation_router(
                 file_mode=file_mode,
             )
         except ConversationError as exc:
-            status = 404 if "unknown" in str(exc).lower() or "不在" in str(exc) else 400
+            not_found = exc.code in {THREAD_NOT_FOUND_CODE, TURN_NOT_FOUND_CODE}
             return _error_response(
-                "conversation.impact.preview_failed",
+                exc.code if not_found else "conversation.impact.preview_failed",
                 str(exc),
-                ErrorCategory.VALIDATION,
-                status_code=status,
+                ErrorCategory.NOT_FOUND if not_found else ErrorCategory.VALIDATION,
+                status_code=404 if not_found else 400,
             )
 
     @router.get("/api/threads/{thread_id}/messages")
@@ -971,7 +1079,7 @@ def create_conversation_router(
         turn_id: str,
         limit: int = 2000,
         after_seq: int = 0,
-        watermark: Optional[int] = None,
+        watermark: int | None = None,
     ) -> Any:
         try:
             result = await command_api.query(_query(
@@ -1214,6 +1322,272 @@ def create_conversation_router(
             **_occupancy_payload(root, exclude_thread_id=thread_id),
         }
 
+    _GIT_WRITE_ERRORS: dict[str, tuple[ErrorCategory, int]] = {
+        "conversation.git.empty_message": (ErrorCategory.VALIDATION, 400),
+        "conversation.git.invalid_path": (ErrorCategory.VALIDATION, 400),
+        "conversation.git.path_outside": (ErrorCategory.VALIDATION, 400),
+        "conversation.git.invalid_branch": (ErrorCategory.VALIDATION, 400),
+        "conversation.git.stage_failed": (ErrorCategory.VALIDATION, 400),
+        "conversation.git.commit_failed": (ErrorCategory.VALIDATION, 400),
+        "conversation.git.not_repo": (ErrorCategory.STATE, 409),
+        "conversation.git.detached_head": (ErrorCategory.STATE, 409),
+        "conversation.git.no_remote": (ErrorCategory.STATE, 409),
+        "conversation.git.no_upstream": (ErrorCategory.STATE, 409),
+        "conversation.git.nothing_to_commit": (ErrorCategory.CONFLICT, 409),
+        "conversation.git.push_failed": (ErrorCategory.CONFLICT, 409),
+        "conversation.git.pull_failed": (ErrorCategory.CONFLICT, 409),
+        "conversation.git.pull_conflict": (ErrorCategory.CONFLICT, 409),
+        "conversation.git.timeout": (ErrorCategory.TIMEOUT, 504),
+    }
+    _GIT_WRITE_HINTS: dict[str, str] = {
+        "conversation.git.pull_conflict": "在终端中解决冲突后继续（git rebase --continue / git merge --continue），或中止该操作",
+        "conversation.git.timeout": "检查网络与凭据配置（服务端不会弹出凭据输入）",
+    }
+
+    def _git_write_error(exc: Any) -> JSONResponse:
+        code = str(getattr(exc, "code", "") or "conversation.git.error")
+        category, status_code = _GIT_WRITE_ERRORS.get(code, (ErrorCategory.VALIDATION, 400))
+        return _error_response(
+            code,
+            str(exc),
+            category,
+            status_code=status_code,
+            recovery_hint=_GIT_WRITE_HINTS.get(code, ""),
+        )
+
+    def _thread_git_write_root(thread_id: str) -> tuple[str, Any] | JSONResponse:
+        """与 git/checkout 相同的归属检查：Thread 存在、已绑定工作区、根目录未被其他活动会话占用。"""
+        thread, workspace = _thread_workspace(thread_id)
+        if thread is None:
+            return _error_response(
+                "conversation.thread.not_found",
+                f"unknown thread: {thread_id}",
+                ErrorCategory.NOT_FOUND,
+                status_code=404,
+            )
+        root = str(workspace.root_path or "").strip() if workspace is not None else ""
+        if not root:
+            return _error_response(
+                "conversation.workspace.not_found",
+                "会话尚未绑定工作目录",
+                ErrorCategory.NOT_FOUND,
+                status_code=404,
+            )
+        occupancy = _occupancy_payload(root, exclude_thread_id=thread_id)
+        if occupancy["occupied"]:
+            return _error_response(
+                "conversation.git.root_occupied",
+                "工作区正被其他活动会话使用，拒绝执行 Git 写操作以免影响对方",
+                ErrorCategory.CONFLICT,
+                status_code=409,
+                recovery_hint="为当前会话新建独立 worktree",
+            )
+        return root, workspace
+
+    def _git_status_payload(thread_id: str, workspace: Any, root: str, status: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "thread_id": thread_id,
+            "workspace_id": workspace.workspace_id if workspace else None,
+            **status,
+            **_occupancy_payload(root, exclude_thread_id=thread_id),
+        }
+
+    @router.post("/api/threads/{thread_id}/git/commit")
+    async def thread_git_commit(thread_id: str, body: ThreadGitCommitBody) -> Any:
+        """暂存并提交 Thread 工作区改动（全部或指定工作区内路径）。"""
+        from muteki.conversation.git_workspace import GitWorkspaceError, commit_git_changes
+
+        resolved = _thread_git_write_root(thread_id)
+        if isinstance(resolved, JSONResponse):
+            return resolved
+        root, workspace = resolved
+        try:
+            result = await asyncio.to_thread(
+                commit_git_changes,
+                root,
+                message=body.message,
+                paths=body.paths,
+                amend=body.amend,
+            )
+        except GitWorkspaceError as exc:
+            return _git_write_error(exc)
+        status = result.pop("status")
+        return {**result, "git": _git_status_payload(thread_id, workspace, root, status)}
+
+    @router.post("/api/threads/{thread_id}/git/push")
+    async def thread_git_push(thread_id: str, body: ThreadGitPushBody | None = None) -> Any:
+        """推送当前分支；分支没有上游时自动设置上游。"""
+        from muteki.conversation.git_workspace import GitWorkspaceError, push_git_branch
+
+        resolved = _thread_git_write_root(thread_id)
+        if isinstance(resolved, JSONResponse):
+            return resolved
+        root, workspace = resolved
+        try:
+            options = body or ThreadGitPushBody()
+            result = await asyncio.to_thread(push_git_branch, root, set_upstream=options.set_upstream)
+        except GitWorkspaceError as exc:
+            return _git_write_error(exc)
+        status = result.pop("status")
+        return {
+            **result,
+            "ahead": status.get("ahead"),
+            "behind": status.get("behind"),
+            "upstream": status.get("upstream"),
+            "git": _git_status_payload(thread_id, workspace, root, status),
+        }
+
+    @router.post("/api/threads/{thread_id}/git/pull")
+    async def thread_git_pull(thread_id: str, body: ThreadGitPullBody | None = None) -> Any:
+        """拉取上游；默认仅快进（--ff-only），rebase=true 时使用 --rebase。"""
+        from muteki.conversation.git_workspace import GitWorkspaceError, pull_git_branch
+
+        resolved = _thread_git_write_root(thread_id)
+        if isinstance(resolved, JSONResponse):
+            return resolved
+        root, workspace = resolved
+        try:
+            options = body or ThreadGitPullBody()
+            result = await asyncio.to_thread(pull_git_branch, root, rebase=options.rebase)
+        except GitWorkspaceError as exc:
+            return _git_write_error(exc)
+        status = result.pop("status")
+        return {
+            **result,
+            "ahead": status.get("ahead"),
+            "behind": status.get("behind"),
+            "git": _git_status_payload(thread_id, workspace, root, status),
+        }
+
+    @router.post("/api/threads/{thread_id}/git/pull-request")
+    async def thread_create_pull_request(thread_id: str, body: ThreadPullRequestCreateBody) -> Any:
+        """为 Thread 工作区当前分支创建 GitHub PR（使用操作员的 GitHub token）。"""
+        from muteki.conversation.git_workspace import (
+            GitWorkspaceError,
+            detect_github_remote,
+            inspect_git_workspace,
+            push_git_branch,
+            upstream_remote_branch,
+        )
+
+        title = body.title.strip()
+        if not title:
+            return _error_response(
+                "conversation.github.empty_title",
+                "PR 标题不能为空",
+                ErrorCategory.VALIDATION,
+                status_code=400,
+            )
+        resolved = _thread_git_write_root(thread_id)
+        if isinstance(resolved, JSONResponse):
+            return resolved
+        root, _workspace = resolved
+
+        try:
+            origin = await asyncio.to_thread(detect_github_remote, root)
+        except GitWorkspaceError as exc:
+            return _git_write_error(exc)
+        if not origin["remote_url"]:
+            return _error_response(
+                "conversation.git.no_remote", "仓库未配置远端 origin", ErrorCategory.STATE, status_code=409,
+            )
+        if not origin["github"]:
+            return _error_response(
+                "conversation.github.not_github",
+                f"远端 origin 不是 GitHub 仓库：{origin['remote_url']}",
+                ErrorCategory.STATE,
+                status_code=409,
+            )
+        token = await asyncio.to_thread(_github_pr_api_token)
+        if not token:
+            return _error_response(
+                "conversation.github.token_missing",
+                "未配置 GitHub token",
+                ErrorCategory.PERMISSION,
+                status_code=403,
+                recovery_hint="设置 MUTEKI_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN，或在服务端运行 gh auth login",
+            )
+
+        pushed_now = False
+        try:
+            status = await asyncio.to_thread(inspect_git_workspace, root)
+            needs_push = not status.get("upstream") or bool(status.get("ahead"))
+            if needs_push:
+                if not body.push_first:
+                    return _error_response(
+                        "conversation.git.push_required",
+                        "分支尚未推送到远端（或有未推送的提交），请先推送再创建 PR",
+                        ErrorCategory.STATE,
+                        status_code=409,
+                        recovery_hint="先推送，或以 push_first=true 重新请求",
+                    )
+                await asyncio.to_thread(push_git_branch, root)
+                pushed_now = True
+            tracking = await asyncio.to_thread(upstream_remote_branch, root)
+            head_remote = tracking["remote"] or "origin"
+            head_info = (
+                origin if head_remote == "origin"
+                else await asyncio.to_thread(detect_github_remote, root, head_remote)
+            )
+        except GitWorkspaceError as exc:
+            return _git_write_error(exc)
+
+        owner, repo = origin["owner"], origin["repo"]
+        remote_branch = tracking["remote_branch"] or tracking["branch"]
+        if head_info.get("github") and head_info["owner"] and head_info["owner"] != owner:
+            head = f"{head_info['owner']}:{remote_branch}"
+        else:
+            head = remote_branch
+
+        api = f"https://api.github.com/repos/{owner}/{repo}"
+        try:
+            base = body.base.strip()
+            if not base:
+                repo_info = await asyncio.to_thread(_github_api_json, "GET", api, token)
+                base = str((repo_info or {}).get("default_branch") or "").strip()
+                if not base:
+                    return _error_response(
+                        "conversation.github.base_unknown",
+                        "无法确定仓库默认分支，请指定 base",
+                        ErrorCategory.VALIDATION,
+                        status_code=400,
+                    )
+            created = await asyncio.to_thread(
+                _github_api_json,
+                "POST",
+                f"{api}/pulls",
+                token,
+                {"title": title, "head": head, "base": base, "body": body.body, "draft": body.draft},
+            )
+        except GitHubAPIError as exc:
+            if exc.status == 422:
+                category, status_code, code = ErrorCategory.CONFLICT, 409, "conversation.github.pr_rejected"
+            elif exc.status in (401, 403, 404):
+                category, status_code, code = ErrorCategory.PERMISSION, 403, "conversation.github.forbidden"
+            else:
+                category, status_code, code = ErrorCategory.RUNTIME, 502, "conversation.github.api_failed"
+            return _error_response(code, str(exc), category, status_code=status_code)
+        except Exception as exc:
+            return _error_response(
+                "conversation.github.api_failed",
+                f"GitHub API 请求失败：{exc}",
+                ErrorCategory.RUNTIME,
+                status_code=502,
+            )
+
+        created = created if isinstance(created, dict) else {}
+        return {
+            "number": created.get("number"),
+            "url": created.get("html_url", ""),
+            "state": "draft" if created.get("draft") else created.get("state", ""),
+            "title": created.get("title", title),
+            "base": base,
+            "head": head,
+            "owner": owner,
+            "repo": repo,
+            "pushed": pushed_now,
+        }
+
     def _surface_error(message: str, status_code: int = 400) -> JSONResponse:
         return _error_response(
             "conversation.workspace.surface_failed",
@@ -1441,7 +1815,7 @@ def create_conversation_router(
         cfg: AuthConfig = websocket.app.state.auth
         if cfg.enabled:
             ticket_store = websocket.app.state.tickets
-            authed = ticket_store.redeem(websocket.query_params.get("ticket")) or verify_token(
+            authed = ticket_store.redeem(websocket.query_params.get("ticket"), scope=websocket.scope) or verify_token(
                 cfg,
                 websocket.query_params.get("token")
                 or bearer_from_header(websocket.headers.get("Authorization")),
@@ -1603,7 +1977,7 @@ def create_conversation_router(
     @router.get("/api/threads/{thread_id}/events")
     async def thread_events(
         thread_id: str, request: Request, after: int = 0,
-        snapshot: bool = True,
+        snapshot: bool = True, browser_host: str = "",
     ) -> Any:
         """Thread 事件流（SSE）。
 
@@ -1651,23 +2025,36 @@ def create_conversation_router(
             # Last-Event-ID 后跳过本轮已产生的工具/正文事件。
             # 客户端应在重连时传入 after=<已应用水位>；snapshot 仍可刷新视图。
             cursor = max(0, int(after) if snapshot else resume_after)
-            while True:
-                if await request.is_disconnected():
-                    return
-                page = store.public_events_for(
-                    conv_events.AGGREGATE_THREAD, thread_id,
-                    after_seq=cursor, limit=SSE_PAGE_LIMIT)
-                sent = False
-                for seq, event in page:
-                    cursor = max(cursor, seq)
-                    payload = event.model_dump(mode="json")
-                    payload["seq"] = seq
-                    yield _frame("event", payload, seq)
-                    sent = True
-                if not sent:
-                    # 心跳注释行，保持连接并便于代理保活。
-                    yield b": heartbeat\n\n"
-                    await asyncio.sleep(SSE_POLL_SECONDS)
+            # 右侧浏览器请求不入事件日志：无 id 行，不影响 Last-Event-ID 水位。
+            browser = (browser_control.subscribe(thread_id, browser_host)
+                       if browser_control is not None and browser_host in {"desktop", "web"} else None)
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        return
+                    sent = False
+                    for item in browser.drain() if browser else ():
+                        yield _frame("browser_request", item)
+                        sent = True
+                    page = store.public_events_for(
+                        conv_events.AGGREGATE_THREAD, thread_id,
+                        after_seq=cursor, limit=SSE_PAGE_LIMIT)
+                    for seq, event in page:
+                        cursor = max(cursor, seq)
+                        payload = event.model_dump(mode="json")
+                        payload["seq"] = seq
+                        yield _frame("event", payload, seq)
+                        sent = True
+                    if not sent:
+                        # 心跳注释行，保持连接并便于代理保活。
+                        yield b": heartbeat\n\n"
+                        if browser:
+                            await browser.wait(SSE_POLL_SECONDS)
+                        else:
+                            await asyncio.sleep(SSE_POLL_SECONDS)
+            finally:
+                if browser:
+                    browser_control.unsubscribe(browser)
 
         async def _stream():
             if sse_metrics is not None:
@@ -1685,6 +2072,18 @@ def create_conversation_router(
             headers={"Cache-Control": "no-cache",
                      "X-Accel-Buffering": "no"},
         )
+
+    @router.post("/api/threads/{thread_id}/browser/{request_id}")
+    async def browser_result(thread_id: str, request_id: str, body: dict[str, Any] = Body(...)) -> Any:
+        """客户端回传右侧浏览器请求的执行结果。"""
+        if browser_control is None or not browser_control.resolve(thread_id, request_id, body):
+            return _error_response(
+                "chat.browser.request_unknown",
+                "浏览器请求不存在、已超时或已有结果",
+                ErrorCategory.NOT_FOUND,
+                status_code=404,
+            )
+        return {"accepted": True}
 
     # -- 命令统一入口（conversation.*） ---------------------------------------------
 
@@ -2054,21 +2453,17 @@ def create_conversation_router(
         limit: int = 100,
     ) -> Any:
         from pathlib import Path as _Path
-        from muteki.conversation.provider_import import (
-            scan_claude_sessions, scan_codex_sessions, scan_to_dict,
-        )
-        if adapter not in {"claude", "codex"}:
-            return _error_response("conversation.import.provider_invalid", "请选择 Claude 或 Codex 历史来源。", ErrorCategory.VALIDATION, status_code=400)
+        from muteki.conversation.provider_import import scan_to_dict
+        source = _session_import_source(adapter)
+        if source is None:
+            return _error_response("conversation.import.provider_invalid", _session_import_invalid_message(), ErrorCategory.VALIDATION, status_code=400)
+        scanner, default_base = source
         if not path and os.environ.get("MUTEKI_HOST_DISCOVERY", "1").strip() == "0":
             return _error_response("conversation.import.host_discovery_disabled", "服务宿主自动发现已禁用，请明确选择历史文件目录。", ErrorCategory.VALIDATION, status_code=409)
-        base = _Path(path).expanduser() if path else (
-            _Path.home() / ".claude" if adapter == "claude"
-            else _Path.home() / ".codex"
-        )
+        base = _Path(path).expanduser() if path else default_base
         if not base.exists():
             return JSONResponse({"scans": [], "base_path": str(base), "exists": False})
         limit = max(1, min(limit, 500))
-        scanner = scan_claude_sessions if adapter == "claude" else scan_codex_sessions
         try:
             scans = await asyncio.to_thread(scanner, base, limit=limit, retain_messages=False)
         except ValueError as exc:
@@ -2082,12 +2477,12 @@ def create_conversation_router(
     @router.post("/api/import/apply")
     async def import_apply(body: dict[str, Any] = Body(...)) -> Any:
         from pathlib import Path as _Path
-        from muteki.conversation.provider_import import (
-            scan_claude_sessions, scan_codex_sessions, batch_import,
-        )
+        from muteki.conversation.provider_import import batch_import
         adapter_id = str(body.get("adapter_id") or "claude")
-        if adapter_id not in {"claude", "codex"}:
-            return _error_response("conversation.import.provider_invalid", "请选择 Claude 或 Codex 历史来源。", ErrorCategory.VALIDATION, status_code=400)
+        source = _session_import_source(adapter_id)
+        if source is None:
+            return _error_response("conversation.import.provider_invalid", _session_import_invalid_message(), ErrorCategory.VALIDATION, status_code=400)
+        scanner, default_base = source
         source_path = str(body.get("source_path") or "")
         if not source_path and os.environ.get("MUTEKI_HOST_DISCOVERY", "1").strip() == "0":
             return _error_response("conversation.import.host_discovery_disabled", "服务宿主自动发现已禁用，请明确选择历史文件目录。", ErrorCategory.VALIDATION, status_code=409)
@@ -2097,14 +2492,10 @@ def create_conversation_router(
         project_id = str(body.get("project_id") or "")
         dry_run = bool(body.get("dry_run", False))
 
-        base = _Path(source_path).expanduser() if source_path else (
-            _Path.home() / ".claude" if adapter_id == "claude"
-            else _Path.home() / ".codex"
-        )
+        base = _Path(source_path).expanduser() if source_path else default_base
         if not base.exists():
             return JSONResponse({"error": f"path not found: {base}"}, status_code=404)
 
-        scanner = scan_claude_sessions if adapter_id == "claude" else scan_codex_sessions
         try:
             all_scans = await asyncio.to_thread(scanner, base, limit=500)
         except ValueError as exc:
@@ -2131,6 +2522,24 @@ def create_conversation_router(
             "total": result.total,
         })
 
+    # UI preferences are shared by the service's operator (not a per-login user).
+    @router.get("/api/settings/ui")
+    async def get_ui_preferences() -> Any:
+        return JSONResponse(service.conv.get_sidebar_prefs("ui") or {"version": 0, "values": {}},
+                            headers={"Cache-Control": "no-store"})
+
+    @router.put("/api/settings/ui")
+    async def put_ui_preferences(body: UiPreferencesWrite) -> Any:
+        from muteki.platform.store import OptimisticConcurrencyError
+        try:
+            saved = service.conv.save_sidebar_prefs(
+                {"values": body.values.model_dump(exclude_unset=True)},
+                key="ui", expected_version=body.version)
+        except OptimisticConcurrencyError:
+            return JSONResponse(service.conv.get_sidebar_prefs("ui") or {"version": 0, "values": {}},
+                                status_code=409, headers={"Cache-Control": "no-store"})
+        return JSONResponse(saved, headers={"Cache-Control": "no-store"})
+
     # -- Sidebar 偏好（C30）--------------------------------------------------
 
     @router.get("/api/sidebar-preferences")
@@ -2153,62 +2562,135 @@ def create_conversation_router(
             return JSONResponse(current, status_code=409)
         return JSONResponse(saved)
 
-    # -- Agent Runtime（委托 RUNTIME-05 的 service） ---------------------------------
+    # -- Conversation preferences the service acts on without an open window ----
 
-    if include_runtime_routes:
+    def _preference_body(
+        prefs: dict[str, Any],
+        *,
+        thread_id: str = "",
+        interaction_mode: str = "",
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "version": int(prefs.get("version") or 0),
+            "auto_resume_on_quota_reset": prefs.get("auto_resume_on_quota_reset") is True,
+        }
+        if thread_id:
+            body["thread_id"] = thread_id
+            body["interaction_mode"] = interaction_mode or "default"
+        return body
 
-        @router.get("/api/agent-runtimes")
-        async def list_agent_runtimes(adapter_id: str = "") -> Any:
-            if runtime_service is None:
+    @router.get("/api/conversation/preferences")
+    async def get_conversation_preferences(thread_id: str = "") -> Any:
+        prefs = service.conv.get_sidebar_prefs(CONVERSATION_PREFS_KEY) or {"version": 0}
+        thread_id = str(thread_id or "").strip()
+        mode = ""
+        if thread_id:
+            if service.manager.get_thread(thread_id) is None:
                 return _error_response(
-                    "conversation.runtime.unavailable",
-                    "AgentRuntimeService 未装配",
-                    ErrorCategory.RUNTIME,
-                    status_code=503,
-                )
-            instances = runtime_service.list_instances(adapter_id or None)
-            return {"instances": instances, "count": len(instances)}
-
-        @router.post("/api/agent-runtimes/{instance_id}/probe")
-        async def probe_agent_runtime(instance_id: str) -> Any:
-            if runtime_service is None:
-                return _error_response(
-                    "conversation.runtime.unavailable",
-                    "AgentRuntimeService 未装配",
-                    ErrorCategory.RUNTIME,
-                    status_code=503,
-                )
-            # instance_id 形如 ``cli.kimi:default`` 或 bare instance id。
-            from apps.web.agent_runtime_api import canonical_adapter_id
-            from muteki.solver.worker_profiles import parse_runtime_instance_ref
-
-            ref = parse_runtime_instance_ref(instance_id)
-            if ref is not None:
-                adapter_id, iid = ref
-            else:
-                adapter_id, iid = "", instance_id
-                matches = [c for c in runtime_service.store.list()
-                           if c.instance_id == iid]
-                if len(matches) == 1:
-                    adapter_id = matches[0].adapter_id
-            adapter_id = canonical_adapter_id(adapter_id)
-            if not adapter_id:
-                return _error_response(
-                    "conversation.runtime.unknown",
-                    f"unknown runtime instance: {instance_id}",
+                    THREAD_NOT_FOUND_CODE,
+                    f"unknown thread: {thread_id}",
                     ErrorCategory.NOT_FOUND,
                     status_code=404,
                 )
-            try:
-                health = await runtime_service.probe_one(adapter_id, iid)
-            except Exception as exc:  # noqa: BLE001 — 单实例故障隔离
+            mode = service.manager.runtime_selection(thread_id).interaction_mode
+        return JSONResponse(_preference_body(
+            prefs, thread_id=thread_id, interaction_mode=mode))
+
+    @router.put("/api/conversation/preferences")
+    async def put_conversation_preferences(
+        body: dict[str, Any] = Body(...),
+        thread_id: str = "",
+    ) -> Any:
+        has_mode = "interaction_mode" in body
+        has_resume = "auto_resume_on_quota_reset" in body
+        thread_id = str(body.get("thread_id") or thread_id or "").strip()
+        if not has_mode:
+            value = body.get("auto_resume_on_quota_reset")
+            if not isinstance(value, bool):
                 return _error_response(
-                    "conversation.runtime.probe_failed",
-                    f"{type(exc).__name__}: {str(exc)[:200]}",
-                    ErrorCategory.RUNTIME,
-                    status_code=502,
+                    "conversation.preferences.invalid",
+                    "auto_resume_on_quota_reset 必须是布尔值",
+                    ErrorCategory.VALIDATION,
+                    status_code=400,
                 )
-            return {"instance": f"{adapter_id}:{iid}", "health": health}
+            from muteki.platform.store import OptimisticConcurrencyError
+            expected = body.get("version")
+            if expected is not None and (type(expected) is not int or expected < 0):
+                raise HTTPException(422, "version must be a non-negative integer")
+            try:
+                saved = service.conv.save_sidebar_prefs(
+                    {"auto_resume_on_quota_reset": value}, key=CONVERSATION_PREFS_KEY,
+                    expected_version=expected)
+            except OptimisticConcurrencyError:
+                return JSONResponse(_preference_body(service.conv.get_sidebar_prefs(CONVERSATION_PREFS_KEY) or {}), status_code=409)
+            return JSONResponse({
+                "version": saved["version"],
+                "auto_resume_on_quota_reset": saved["auto_resume_on_quota_reset"],
+            })
+        if has_resume and not isinstance(body.get("auto_resume_on_quota_reset"), bool):
+            return _error_response(
+                "conversation.preferences.invalid",
+                "auto_resume_on_quota_reset 必须是布尔值",
+                ErrorCategory.VALIDATION,
+                status_code=400,
+            )
+        if not thread_id:
+            return _error_response(
+                "conversation.preferences.invalid",
+                "interaction_mode 按会话保存，需要 thread_id",
+                ErrorCategory.VALIDATION,
+                status_code=400,
+            )
+        if service.manager.get_thread(thread_id) is None:
+            return _error_response(
+                THREAD_NOT_FOUND_CODE,
+                f"unknown thread: {thread_id}",
+                ErrorCategory.NOT_FOUND,
+                status_code=404,
+            )
+        raw_mode = body.get("interaction_mode")
+        if not isinstance(raw_mode, str):
+            return _error_response(
+                INTERACTION_MODE_INVALID_CODE,
+                "interaction_mode 必须是 default 或 plan",
+                ErrorCategory.VALIDATION,
+                status_code=400,
+                detail={"interaction_mode": raw_mode, "allowed": ["default", "plan"]},
+            )
+        try:
+            selection = service.manager.save_runtime_selection(
+                thread_id,
+                {"interaction_mode": raw_mode},
+                validate_credential=False,
+            )
+        except InteractionModeError as exc:
+            return _error_response(
+                exc.code,
+                str(exc),
+                ErrorCategory.VALIDATION,
+                status_code=400,
+                detail=exc.detail,
+            )
+        except ConversationError as exc:
+            not_found = exc.code in {THREAD_NOT_FOUND_CODE, TURN_NOT_FOUND_CODE}
+            return _error_response(
+                exc.code if not_found else "conversation.preferences.invalid",
+                str(exc),
+                ErrorCategory.NOT_FOUND if not_found else ErrorCategory.VALIDATION,
+                status_code=404 if not_found else 400,
+            )
+        if has_resume:
+            saved = service.conv.save_sidebar_prefs(
+                {"auto_resume_on_quota_reset": body["auto_resume_on_quota_reset"]},
+                key=CONVERSATION_PREFS_KEY)
+        else:
+            saved = service.conv.get_sidebar_prefs(CONVERSATION_PREFS_KEY) or {
+                "version": 0, "auto_resume_on_quota_reset": False}
+        return JSONResponse(_preference_body(
+            saved,
+            thread_id=thread_id,
+            interaction_mode=selection.interaction_mode,
+        ))
 
     return router
 

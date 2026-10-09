@@ -1,0 +1,11 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "muteki-visualize",
+  "version": "1.1.0",
+  "description": "在 Muteki 聊天中用结构图和交互界面帮助理解、比较和探索信息。",
+  "author": { "name": "FishCodeTech" },
+  "license": "AGPL-3.0-or-later",
+  "extensions": {
+    "io.github.fishcodetech.muteki": { "modes": ["chat"] }
+  }
+}

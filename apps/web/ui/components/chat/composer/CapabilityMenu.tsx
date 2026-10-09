@@ -63,7 +63,7 @@ function CapabilityRows({
         return (
           <Fragment key={item.id}>
             {section !== previous ? (
-              <div role="presentation" className="px-2.5 pb-1 pt-2.5 text-[11px] font-medium text-cx-fg-4 first:pt-1.5">
+              <div role="presentation" className="px-2.5 pb-1 pt-2.5 text-[12px] font-medium text-cx-fg-4 first:pt-1.5">
                 {section}
               </div>
             ) : null}
@@ -100,7 +100,7 @@ function CapabilityRows({
                 <span className="flex min-w-0 items-baseline gap-2">
                   <span className="truncate text-[13px] font-medium leading-5 text-cx-fg">{capabilityLabel(item)}</span>
                   {item.argument_hint ? (
-                    <span className="truncate font-cx-mono text-[11px] text-cx-fg-4">{item.argument_hint}</span>
+                    <span className="truncate font-cx-mono text-[12px] text-cx-fg-4">{item.argument_hint}</span>
                   ) : null}
                 </span>
                 {item.description || meta ? (
@@ -111,7 +111,7 @@ function CapabilityRows({
                   </span>
                 ) : null}
               </span>
-              <span className="ml-2 max-w-[120px] shrink-0 truncate text-[11px] text-cx-fg-4">{item.source}</span>
+              <span className="ml-2 max-w-[120px] shrink-0 truncate text-[12px] text-cx-fg-4">{item.source}</span>
             </div>
           </Fragment>
         );
@@ -160,8 +160,8 @@ export function CapabilityMenu({
           <div className="flex h-9 shrink-0 items-center gap-2 border-b border-cx-border-subtle px-3">
             <Icon name={triggerIcon(trigger)} size={13} className="text-cx-fg-3" />
             <span className="text-[12px] font-medium text-cx-fg-2">{triggerLabel(trigger)}</span>
-            <span className="ml-auto truncate font-cx-mono text-[11px] text-cx-fg-4">{adapterId.replace(/^cli\./, "")}</span>
-            <Link href="/settings/agent-extensions" className="shrink-0 text-[11px] text-cx-fg-3 hover:text-cx-fg" onMouseDown={(e) => e.stopPropagation()}>管理扩展</Link>
+            <span className="ml-auto truncate font-cx-mono text-[12px] text-cx-fg-4">{adapterId.replace(/^cli\./, "")}</span>
+            <Link href="/settings/agent-extensions" className="shrink-0 text-[12px] text-cx-fg-3 hover:text-cx-fg" onMouseDown={(e) => e.stopPropagation()}>管理扩展</Link>
           </div>
           <div
             ref={listRef}
@@ -173,7 +173,7 @@ export function CapabilityMenu({
           >
             {sectionErrors.length ? (
               <div role="status" className="space-y-2 border-b border-cx-border-subtle px-2.5 py-2 text-[12px] text-cx-warning">
-                {sectionErrors.map((entry, index) => <details key={`${entry.section}:${index}`}><summary>{entry.section}：{entry.message}</summary><pre className="mt-1 whitespace-pre-wrap break-words font-cx-mono text-[11px]">{JSON.stringify(entry, null, 2)}</pre></details>)}
+                {sectionErrors.map((entry, index) => <details key={`${entry.section}:${index}`}><summary>{entry.section}：{entry.message}</summary><pre className="mt-1 whitespace-pre-wrap break-words font-cx-mono text-[12px]">{JSON.stringify(entry, null, 2)}</pre></details>)}
                 {onRetry ? <button type="button" disabled={loading} className="rounded-md border border-cx-border px-2 py-1 text-cx-fg" onClick={onRetry}>重试失败来源</button> : null}
               </div>
             ) : null}
@@ -190,13 +190,13 @@ export function CapabilityMenu({
                 ))}
               </div>
             ) : error ? (
-              <div role="status" className="flex items-start gap-2 px-2.5 py-3 text-[12.5px] leading-5 text-cx-danger">
+              <div role="status" className="flex items-start gap-2 px-2.5 py-3 text-[13px] leading-5 text-cx-danger">
                 <Icon name="circleAlert" size={14} className="mt-[3px] shrink-0" />
                 <div className="min-w-0 flex-1 space-y-2">
                   <p>{error}</p>
                   {trigger === "@" ? <p className="text-cx-fg-3">引用目录尚未确认；文件面板可独立浏览工作目录。</p> : null}
                   {onRetry ? <button type="button" className="rounded-md border border-cx-border px-2 py-1 text-cx-fg" disabled={loading} onClick={onRetry}>重试能力目录</button> : null}
-                  {errorDiagnostic ? <details className="text-cx-fg-3"><summary className="cursor-pointer">查看完整诊断</summary><pre className="mt-2 whitespace-pre-wrap break-words font-cx-mono text-[11px]">{errorDiagnostic}</pre></details> : null}
+                  {errorDiagnostic ? <details className="text-cx-fg-3"><summary className="cursor-pointer">查看完整诊断</summary><pre className="mt-2 whitespace-pre-wrap break-words font-cx-mono text-[12px]">{errorDiagnostic}</pre></details> : null}
                 </div>
               </div>
             ) : items.length ? (
@@ -211,11 +211,11 @@ export function CapabilityMenu({
             ) : (
               <div role="status" className="flex flex-col items-center gap-1.5 px-4 py-6 text-center">
                 <Icon name="search" size={16} className="text-cx-fg-4" />
-                <span className="text-[12.5px] text-cx-fg-3">{runtime?.diagnostics[0] || "当前 Agent 没有匹配项"}</span>
+                <span className="text-[13px] text-cx-fg-3">{runtime?.diagnostics[0] || "当前 Agent 没有匹配项"}</span>
               </div>
             )}
           </div>
-          <div className="flex h-8 shrink-0 items-center gap-3 border-t border-cx-border-subtle px-3 text-[11px] text-cx-fg-4">
+          <div className="flex h-8 shrink-0 items-center gap-3 border-t border-cx-border-subtle px-3 text-[12px] text-cx-fg-4">
             {runtime?.refresh_status === "failed" ? (
               <span role="status" data-capability-refresh="failed" className="flex min-w-0 items-center gap-1.5 text-cx-danger">
                 <Icon name="circleAlert" size={12} />

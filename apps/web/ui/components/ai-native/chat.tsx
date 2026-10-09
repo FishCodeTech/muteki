@@ -24,6 +24,8 @@ export interface ChatProps {
   header?: React.ReactNode;
   footer?: React.ReactNode;
   streamOverlay?: React.ReactNode;
+  /** Absolutely positioned against the stream viewport (e.g. a minimap rail). */
+  streamAside?: React.ReactNode;
   streamState?: React.ReactNode;
   streamBusy?: boolean;
   streamRef?: React.Ref<HTMLDivElement>;
@@ -37,6 +39,7 @@ export function Chat({
   header,
   footer,
   streamOverlay,
+  streamAside,
   streamState,
   streamBusy = false,
   streamRef,
@@ -59,6 +62,7 @@ export function Chat({
             {emptyState ? emptyState : children}
           </div>
         </div>
+        {streamAside}
         {streamOverlay ? (
           <div className="pointer-events-none absolute inset-x-0 bottom-4 z-10 flex justify-center px-5 sm:px-6">
             {streamOverlay}

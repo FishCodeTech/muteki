@@ -306,6 +306,19 @@ wheels = [
 ]
 
 [[package]]
+name = "droid-sdk"
+version = "0.5.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/be/2d/8d0a7ff41df37e233949e888ce39e3eb157d36e1da74b4e12ac0726f126c/droid_sdk-0.5.0.tar.gz", hash = "sha256:51c7d04f8893fb10f7c50e10c789c0173a41bab36bd6de12f7b395fd8e205f44", size = 219440, upload-time = "2026-09-24T17:54:44.319Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/22/8c/e061de6d511667aa22c0d87209f8357b26564953d7d544abad5c41dfe77d/droid_sdk-0.5.0-py3-none-any.whl", hash = "sha256:b8fd0635b6ddf423491d6c952960af9d99c733065f7f8f7277acb901d585868a", size = 144741, upload-time = "2026-09-24T17:54:42.669Z" },
+]
+
+[[package]]
 name = "fastapi"
 version = "0.136.3"
 source = { registry = "https://pypi.org/simple" }
@@ -706,16 +719,18 @@ wheels = [
 
 [[package]]
 name = "project-muteki"
-version = "0.4.0"
+version = "0.4.1"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
     { name = "beautifulsoup4" },
     { name = "capstone" },
     { name = "claude-agent-sdk" },
+    { name = "droid-sdk" },
     { name = "fastapi" },
     { name = "gmpy2" },
     { name = "httpx" },
+    { name = "jsonschema" },
     { name = "lief" },
     { name = "magika" },
     { name = "mcp" },
@@ -746,9 +761,11 @@ requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.12" },
     { name = "capstone", specifier = ">=5.0.9" },
     { name = "claude-agent-sdk", specifier = ">=0.1.0" },
+    { name = "droid-sdk", specifier = "==0.5.0" },
     { name = "fastapi", specifier = ">=0.110" },
     { name = "gmpy2", specifier = ">=2.3.0" },
     { name = "httpx", specifier = ">=0.27" },
+    { name = "jsonschema", specifier = ">=4.23" },
     { name = "lief", specifier = ">=0.17.6" },
     { name = "magika", specifier = ">=1.0.3" },
     { name = "mcp", specifier = ">=1.10,<2" },

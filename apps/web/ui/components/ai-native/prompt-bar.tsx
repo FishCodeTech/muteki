@@ -13,6 +13,8 @@
 import React, { useCallback, useEffect, useId, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { cn } from "@/lib/cn";
+import { isSendChord, useChatPreferences, type SendKey } from "@/lib/chatPreferences";
+import { isMacPlatform } from "@/lib/shortcutBindings";
 import { Icon } from "../Icon";
 import {
   Callout,
@@ -133,6 +135,10 @@ export interface PromptBarProps {
   onStashShortcut?: () => void;
   onOpenStashPanel?: () => void;
   stashCount?: number;
+  /** Single-row resting layout used while the reader browses history. */
+  compact?: boolean;
+  /** Double-clicking the compact composer asks the host to restore the full layout. */
+  onRequestExpand?: () => void;
 }
 
 interface ActiveComposerToken {
@@ -140,6 +146,16 @@ interface ActiveComposerToken {
   query: string;
   start: number;
   end: number;
+}
+
+/** Host placeholders name the default keys; rewrite them for the configured send key and running default. */
+function adaptSendPlaceholder(text: string, sendKey: SendKey, steerPrimary: boolean): string {
+  let out = steerPrimary ? text.replace("加入后续队列", "引导当前回答") : text;
+  if (sendKey === "mod-enter") {
+    const mod = isMacPlatform() ? "⌘" : "Ctrl";
+    out = out.replace("Shift+Enter 换行", "Enter 换行").replace(/(^|[^+])Enter (发送|加入|引导)/, `$1${mod}+Enter $2`);
+  }
+  return out;
 }
 
 const LEGACY_LINE_PX = 24;
@@ -172,14 +188,14 @@ function LegacyModelControls({
     value: model.id,
     label: model.label,
     section: model.group,
-    trailing: model.engine ? <span className="font-cx-mono text-[11px] text-cx-fg-4">{model.engine}</span> : undefined,
+    trailing: model.engine ? <span className="font-cx-mono text-[12px] text-cx-fg-4">{model.engine}</span> : undefined,
   }));
   const levels = current?.reasoningLevels || [];
   const effortOptions: ListOption[] = [
     { value: "", label: "推理：默认", textValue: "默认" },
     ...levels.map((level) => ({ value: level, label: `推理：${level}`, textValue: level })),
   ];
-  const pill = "cx-press inline-flex h-8 min-w-0 items-center gap-1.5 rounded-full px-2.5 text-[12.5px] font-medium text-cx-fg-2 hover:bg-cx-hover hover:text-cx-fg data-[state=open]:bg-cx-active data-[state=open]:text-cx-fg";
+  const pill = "cx-press inline-flex h-8 min-w-0 items-center gap-1.5 rounded-full px-2.5 text-[13px] font-medium text-cx-fg-2 hover:bg-cx-hover hover:text-cx-fg data-[state=open]:bg-cx-active data-[state=open]:text-cx-fg";
   return (
     <>
       {models.length > 0 && onSelectModel ? (
@@ -210,7 +226,6 @@ function LegacyModelControls({
           popoverClassName="w-[200px]"
           trigger={(
             <button type="button" aria-label="推理强度" className={pill}>
-              <Icon name="brain" size={13} className="text-cx-fg-3" />
               <span className="truncate">{effort || current?.defaultEffort || "默认"}</span>
               <Icon name="chevronDown" size={12} className="text-cx-fg-4" />
             </button>
@@ -264,8 +279,12 @@ export function PromptBar({
   onStashShortcut,
   onOpenStashPanel,
   stashCount = 0,
+  compact = false,
+  onRequestExpand,
 }: PromptBarProps) {
   const rootRef = useRef<HTMLDivElement>(null);
+  const cardRef = useRef<HTMLDivElement>(null);
+  const submitSlotRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const lastCaretRef = useRef<EditorCaret | null>(null);
   const capabilityMenuId = useId();
@@ -281,6 +300,7 @@ export function PromptBar({
   const [capabilityRuntime, setCapabilityRuntime] = useState<ComposerRuntimeState | null>(null);
   const [activeCapabilityIndex, setActiveCapabilityIndex] = useState(0);
   const [composing, setComposing] = useState(false);
+  const chatPrefs = useChatPreferences();
   const [dragOver, setDragOver] = useState(false);
   const [pasteHint, setPasteHint] = useState<string | null>(null);
   const [caretMarkedOffset, setCaretMarkedOffset] = useState(0);
@@ -299,6 +319,18 @@ export function PromptBar({
       window.removeEventListener("muteki:chat-plugins-changed", refresh);
       window.removeEventListener("focus", refresh);
     };
+  }, []);
+  // The compact row reserves room for the submit cluster, whose width changes
+  // while a reply runs (stop / queue / steer buttons).
+  useEffect(() => {
+    const card = cardRef.current;
+    const slot = submitSlotRef.current;
+    if (!card || !slot || typeof ResizeObserver === "undefined") return;
+    const publish = () => card.style.setProperty("--cx-composer-submit-w", `${Math.ceil(slot.getBoundingClientRect().width)}px`);
+    publish();
+    const observer = new ResizeObserver(publish);
+    observer.observe(slot);
+    return () => observer.disconnect();
   }, []);
   const capabilityAdapterId = capabilityContext?.adapterId || "";
   const capabilityThreadId = capabilityContext?.threadId || "";
@@ -419,6 +451,11 @@ export function PromptBar({
     : Boolean(value.trim());
   const hasDraft = hasBody || attachments.length > 0;
   const canSend = hasDraft && !busy && !submitDisabled;
+  // Steering takes plain text only; drafts with attachments or references always queue.
+  const steerAvailable = Boolean(running && canSteer && onSteer && attachments.length === 0
+    && !(useStructuredDoc ? refsFromDocument(resolvedDoc).length : capabilityRefs.length));
+  const steerPrimary = steerAvailable && chatPrefs.runningSend === "steer";
+  const shownPlaceholder = adaptSendPlaceholder(placeholder, chatPrefs.sendKey, steerPrimary);
   const chipStripRefs = useStructuredDoc ? stripRefs : capabilityRefs;
   const showTray = Boolean(contextPill || attachments.length > 0 || chipStripRefs.length > 0);
 
@@ -571,6 +608,7 @@ export function PromptBar({
     }
     if (
       (e.metaKey || e.ctrlKey)
+      && !e.shiftKey
       && (e.key === "s" || e.key === "S")
       && !e.nativeEvent.isComposing
       && !composing
@@ -605,10 +643,21 @@ export function PromptBar({
       if (item) selectCapabilityItem(item);
       return;
     }
-    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && !composing) {
-      e.preventDefault();
-      if (canSend) {
-        onSubmit();
+    if (e.key === "Enter" && !e.nativeEvent.isComposing && !composing) {
+      if (isSendChord(e, chatPrefs.sendKey)) {
+        e.preventDefault();
+        if (!canSend) return;
+        // Alt/Option flips the configured running default for this one send.
+        const steer = e.altKey ? !steerPrimary && steerAvailable : steerPrimary;
+        if (steer) onSteer?.();
+        else onSubmit();
+        return;
+      }
+      if (chatPrefs.sendKey === "mod-enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey
+        && e.currentTarget instanceof HTMLElement && e.currentTarget.isContentEditable) {
+        // Plain Enter becomes a line break, matching what Shift+Enter inserts in the editor.
+        e.preventDefault();
+        document.execCommand("insertLineBreak");
       }
     }
   };
@@ -623,6 +672,7 @@ export function PromptBar({
       className={cn("cx-composer relative z-[1] w-full", className)}
       data-testid="conversation-prompt-bar"
       data-history-browsing={historyBrowsing ? "true" : "false"}
+      data-compact={compact ? "true" : "false"}
     >
       <AnimatePresence initial={false}>
         {capabilityBanner ? (
@@ -638,7 +688,7 @@ export function PromptBar({
               tone="accent"
               role="status"
               onDismiss={onDismissCapabilityBanner}
-              className="px-3 py-2 text-[12.5px] leading-5"
+              className="px-3 py-2 text-[13px] leading-5"
             >
               {capabilityBanner}
             </Callout>
@@ -664,8 +714,15 @@ export function PromptBar({
         />
 
         <div
+          ref={cardRef}
           className="cx-composer-card relative flex flex-col rounded-[22px] bg-cx-elevated"
           data-drag-over={dragOver ? "true" : undefined}
+          data-compact={compact ? "true" : undefined}
+          onDoubleClick={(event) => {
+            if (!compact || !onRequestExpand) return;
+            if ((event.target as Element | null)?.closest("button, a, [role='button'], [role='menuitem']")) return;
+            onRequestExpand();
+          }}
           onDragOver={(event) => {
             if (!onAddFiles || !dataTransferHasFiles(event.dataTransfer)) return;
             event.preventDefault();
@@ -717,7 +774,7 @@ export function PromptBar({
                 role="status"
                 testId="composer-paste-hint"
                 onDismiss={() => setPasteHint(null)}
-                className="px-3 py-2 text-[12.5px] leading-5"
+                className="px-3 py-2 text-[13px] leading-5"
               >
                 {pasteHint}
               </Callout>
@@ -742,7 +799,8 @@ export function PromptBar({
           ) : null}
 
           <div
-            className={cn("cursor-text px-3.5", showTray || pasteHint || (historyBrowsing && historyStatus) ? "pt-2" : "pt-3.5")}
+            className="cx-composer-body cursor-text"
+            data-after-chrome={showTray || pasteHint || (historyBrowsing && historyStatus) ? "true" : undefined}
             onMouseDown={(event) => {
               if (event.target !== event.currentTarget) return;
               event.preventDefault();
@@ -760,7 +818,7 @@ export function PromptBar({
                 onLargePaste={onLargePaste}
                 onAddFiles={onAddFiles ? (files) => ingestFiles(files) : undefined}
                 onPasteHint={showPasteHint}
-                placeholder={placeholder}
+                placeholder={shownPlaceholder}
                 aria-label={composerLabel}
                 data-c34-composer="true"
                 aria-controls={capabilityMenuOpen ? capabilityMenuId : undefined}
@@ -852,7 +910,7 @@ export function PromptBar({
                     }
                   }
                 }}
-                placeholder={placeholder}
+                placeholder={shownPlaceholder}
                 rows={1}
                 role="combobox"
                 aria-label={composerLabel}
@@ -861,57 +919,51 @@ export function PromptBar({
                 aria-expanded={capabilityMenuOpen}
                 aria-controls={capabilityMenuOpen ? capabilityMenuId : undefined}
                 aria-activedescendant={activeDescendant}
-                className="cx-prompt-editor cx-scroll block w-full resize-none bg-transparent px-1 text-[14px] leading-6 text-cx-fg caret-cx-accent outline-none placeholder:text-cx-fg-4"
+                className="cx-prompt-editor cx-scroll block w-full resize-none bg-transparent px-1 text-[length:var(--cx-msg-fs,15px)] leading-[1.6] text-cx-fg caret-cx-accent outline-none placeholder:text-cx-fg-4"
                 style={{ maxHeight: LEGACY_LINE_PX * LEGACY_MAX_LINES }}
                 data-c34-composer="true"
               />
             )}
           </div>
 
-          <div className="flex items-center gap-1 px-2.5 pb-2.5 pt-2">
+          <div className="cx-composer-toolbar relative z-[1] flex items-center gap-1.5 px-3">
             <div className="flex min-w-0 flex-1 items-center gap-0.5">
-              <ComposerAddMenu
-                onAddAttachment={onAddAttachment}
-                onInsertTrigger={capabilityAdapterId ? insertTrigger : undefined}
-                onOpenStash={onOpenStashPanel ?? onStashShortcut}
-                stashCount={stashCount}
-              />
-              {onOpenStashPanel ? (
-                <IconButton
-                  icon="archive"
-                  label="打开草稿暂存"
-                  tooltip="草稿暂存"
-                  shortcut="mod+s"
-                  size="md"
-                  data-testid="composer-stash-button"
-                  onClick={onOpenStashPanel}
-                  className="rounded-full"
-                  badge={stashCount > 0 ? <span data-testid="composer-stash-count">{stashCount}</span> : undefined}
+              <div className="cx-composer-add flex shrink-0">
+                <ComposerAddMenu
+                  onAddAttachment={onAddAttachment}
+                  onInsertTrigger={capabilityAdapterId ? insertTrigger : undefined}
+                  onOpenStash={onOpenStashPanel ?? onStashShortcut}
+                  stashCount={stashCount}
                 />
-              ) : null}
-              <LegacyModelControls
-                models={models}
-                selectedModel={selectedModel}
-                onSelectModel={onSelectModel}
-                effort={effort}
-                onSelectEffort={onSelectEffort}
-              />
-              {extraControls}
+              </div>
+              <div className="cx-composer-tools flex min-w-0 flex-1 items-center gap-0.5" inert={compact}>
+                <LegacyModelControls
+                  models={models}
+                  selectedModel={selectedModel}
+                  onSelectModel={onSelectModel}
+                  effort={effort}
+                  onSelectEffort={onSelectEffort}
+                />
+                {extraControls}
+              </div>
             </div>
             <div className="flex shrink-0 items-center gap-1.5">
-              {contextMeter}
-              <SubmitCluster
-                running={running}
-                busy={busy}
-                hasDraft={hasDraft}
-                canSend={canSend}
-                canSteer={canSteer}
-                steerDisabledReason={steerDisabledReason}
-                steerAlternative={steerAlternative}
-                onSubmit={onSubmit}
-                onSteer={onSteer}
-                onStop={onStop}
-              />
+              {contextMeter ? <div className="cx-composer-tools flex min-w-0 items-center" inert={compact}>{contextMeter}</div> : null}
+              <div ref={submitSlotRef} className="cx-composer-submit flex shrink-0">
+                <SubmitCluster
+                  running={running}
+                  busy={busy}
+                  hasDraft={hasDraft}
+                  canSend={canSend}
+                  canSteer={canSteer}
+                  steerPrimary={steerPrimary}
+                  steerDisabledReason={steerDisabledReason}
+                  steerAlternative={steerAlternative}
+                  onSubmit={onSubmit}
+                  onSteer={onSteer}
+                  onStop={onStop}
+                />
+              </div>
             </div>
           </div>
         </div>

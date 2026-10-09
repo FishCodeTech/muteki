@@ -24,6 +24,18 @@ def event(kind: Event, **payload) -> AgentEvent:
     return AgentEvent(event_type=kind, payload=payload, agent_session_id="test-session")
 
 
+def failure(**overrides: object) -> dict[str, object]:
+    """AgentFailure required by turn.failed and runtime.error."""
+    body: dict[str, object] = {
+        "category": "provider",
+        "reason": "fixture",
+        "engine": "grok",
+        "message": "fixture failure",
+    }
+    body.update(overrides)
+    return body
+
+
 async def check() -> None:
     with tempfile.TemporaryDirectory(prefix="muteki-model-verification-") as temp:
         catalog = CredentialModelCatalogStore(temp)
@@ -36,11 +48,11 @@ async def check() -> None:
             ("empty", [event(Event.TURN_COMPLETED)], False),
             ("whitespace", [event(Event.MESSAGE_COMPLETED, text="  "), event(Event.TURN_COMPLETED)], False),
             ("user-only", [event(Event.MESSAGE_COMPLETED, role="user", text="Hello"), event(Event.TURN_COMPLETED)], False),
-            ("failed", [event(Event.MESSAGE_COMPLETED, text="Partial"), event(Event.TURN_FAILED)], False),
-            ("interrupted", [event(Event.MESSAGE_COMPLETED, text="Partial"), event(Event.TURN_FAILED, reason="interrupted")], False),
+            ("failed", [event(Event.MESSAGE_COMPLETED, text="Partial"), event(Event.TURN_FAILED, error=failure())], False),
+            ("interrupted", [event(Event.MESSAGE_COMPLETED, text="Partial"), event(Event.TURN_FAILED, error=failure(category="cancelled", reason="interrupted"))], False),
             ("stream-ended", [event(Event.MESSAGE_COMPLETED, text="Partial")], False),
-            ("runtime-error", [event(Event.RUNTIME_ERROR, code="test"), event(Event.MESSAGE_COMPLETED, text="Partial"), event(Event.TURN_COMPLETED)], False),
-            ("failed-then-completed", [event(Event.MESSAGE_COMPLETED, text="Partial"), event(Event.TURN_FAILED), event(Event.TURN_COMPLETED)], False),
+            ("runtime-error", [event(Event.RUNTIME_ERROR, error=failure(reason="test")), event(Event.MESSAGE_COMPLETED, text="Partial"), event(Event.TURN_COMPLETED)], False),
+            ("failed-then-completed", [event(Event.MESSAGE_COMPLETED, text="Partial"), event(Event.TURN_FAILED, error=failure()), event(Event.TURN_COMPLETED)], False),
         ]
         for name, events, expected in cases:
             turn = TurnRecord(thread_id="test", status="running")
@@ -55,8 +67,15 @@ async def check() -> None:
                     assert "grok-4.7" in catalog.get("system:grok", "grok", "local", "grok.acp:other")["verified_models"]
             executor = ExternalAgentSessionExecutor(
                 SimpleNamespace(append_events=append_events),
-                SimpleNamespace(get_turn=lambda _: turn, get_state=lambda _: state),
-                SimpleNamespace(runtime_selection=lambda _: selection),
+                SimpleNamespace(
+                    get_turn=lambda _: turn,
+                    get_state=lambda _: state,
+                    bind_session_liveness=lambda _callback: None,
+                ),
+                SimpleNamespace(
+                    runtime_selection=lambda _: selection,
+                    bind_session_liveness=lambda _callback: None,
+                ),
                 None, sessions_root=temp,
             )
             executor._stop_detached_runtime = AsyncMock()
@@ -68,7 +87,7 @@ async def check() -> None:
             await executor._consume("test", turn, stream())
             assert recorder.call_count == int(expected), name
             if name == "empty":
-                assert emitted[-1].event_type == ev.EV_TURN_FAILED
+                assert emitted[-1].event_type == ev.EV_TURN_COMPLETED
 
         # A later picker change must never verify the newly selected model/account.
         current_selection = selection

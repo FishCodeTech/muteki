@@ -42,10 +42,25 @@ export interface ThreadAttentionSummary {
   unread: boolean;
   pending_kind: ThreadPendingKind;
   pending_id?: string | null;
+  /** Thread that owns pending_kind: this Thread, or a subagent descendant. */
+  pending_thread_id?: string | null;
+  /** Thread whose row carries this Thread's attention (the root for subagent children). */
+  attention_owner_id?: string;
+  /** Blocking pending items of active subagent descendants, surfaced on the root. */
+  subagent_attention?: SubagentAttention[];
   title?: string;
   preview?: string;
   updated_at?: string;
   fingerprint?: string;
+}
+
+export interface SubagentAttention {
+  thread_id: string;
+  parent_thread_id?: string | null;
+  depth?: number;
+  title?: string;
+  pending_kind: ThreadPendingKind;
+  pending_id?: string | null;
 }
 
 export interface ConversationInboxEvent {
@@ -54,6 +69,7 @@ export interface ConversationInboxEvent {
   seq: number;
   kind: "attention.updated" | "attention.cleared" | string;
   summary: ThreadAttentionSummary;
+  thread?: { state?: { read_stream_seq?: number } };
 }
 
 export const NOTIFICATION_PREFS_KEY = "muteki.notifications.v1";
@@ -82,7 +98,7 @@ export interface NotificationDeliveryDiagnostic {
 }
 let deliveryDiagnostic: NotificationDeliveryDiagnostic | null = null;
 const deliveryListeners = new Set<(diagnostic: NotificationDeliveryDiagnostic | null) => void>();
-const pendingDesktop = new Map<string, { owner: string; transport: string; epoch: number; input?: DesktopNotificationScope; id?: string; outcomeUnknown?: boolean }>();
+const pendingDesktop = new Map<string, { owner: string; transport: string; epoch: number; input?: DesktopNotificationScope; id?: string; outcomeUnknown?: boolean; admitted?: boolean; shown?: boolean }>();
 const soundPlayed = new Set<string>();
 let nativeState: DesktopNativeState | null = null;
 let nativeEpoch = 0, lastNativeSeq = 0;
@@ -128,10 +144,17 @@ function acceptNativeDelivery(value: DesktopNotificationEvent): void {
   if (pending?.input && pending.input.connectionVersion === value.connectionVersion && pending.input.serviceId === value.serviceId
     && pending.input.identityId === value.identityId && (!pending.id || pending.id === value.id)) {
     pending.id = value.id;
+    if (value.status !== "outcome_unknown") pending.admitted = true;
+    if (value.shown) pending.shown = true;
     if (pending.outcomeUnknown && (value.status === "submitted" || value.status === "awaiting_show")) return;
     if (value.status === "outcome_unknown") pending.outcomeUnknown = true;
     if (value.shown) { rememberNotificationDedupe(value.dedupeKey); pendingDesktop.delete(value.dedupeKey); }
-    else if (value.status === "failed") pendingDesktop.delete(value.dedupeKey);
+    else if (value.status === "failed" || value.status === "closed") {
+      // A closed receipt is final. Known policy suppression handles the episode,
+      // but never asserts that a notification was displayed or delivered.
+      if (value.status === "closed" && ["desktop.notifications_system_denied", "desktop.notifications_workspace_denied", "desktop.notifications_unsupported", "desktop.notification_thread_visible"].includes(value.code || "")) rememberNotificationDedupe(value.dedupeKey);
+      pendingDesktop.delete(value.dedupeKey);
+    }
   }
   publishDelivery({ ...value, host: "desktop-client", history: value.history.map(item => ({ ...item })) });
 }
@@ -166,47 +189,60 @@ function subscribeNativeNotifications(): void {
     catch (error) { reportNativeDeliveryError(value, error); }
   });
 }
-function queueDesktopNotification(event: ConversationInboxEvent, dedupeKey: string, audioPlayed: boolean): void {
+function queueDesktopNotification(event: ConversationInboxEvent, dedupeKey: string, audioPlayed: boolean, wantSound = false): Promise<boolean> {
   subscribeNativeNotifications();
   const bridge = desktopChatBridge(), owner = conversationStorageScope(), transport = API, epoch = nativeEpoch;
-  const pending = { owner, transport, epoch } as { owner: string; transport: string; epoch: number; input?: DesktopNotificationScope; id?: string; outcomeUnknown?: boolean };
+  const pending = { owner, transport, epoch } as { owner: string; transport: string; epoch: number; input?: DesktopNotificationScope; id?: string; outcomeUnknown?: boolean; admitted?: boolean; shown?: boolean };
   pendingDesktop.set(dedupeKey, pending);
   const initial: NotificationDeliveryDiagnostic = { host: "desktop-client", status: "submitting", threadId: event.summary.thread_id,
     eventId: event.event_id, dedupeKey, shown: false,
     ...(nativeState?.transportOrigin === transport ? { connectionVersion: nativeState.connectionVersion, serviceId: nativeState.serviceId, identityId: nativeState.identityId } : {}),
     history: [{ status: "submitting", at: new Date().toISOString() }] };
   publishDelivery(initial);
-  const current = () => pendingDesktop.get(dedupeKey) === pending && owner === conversationStorageScope() && API === transport && epoch === nativeEpoch;
-  void (async () => {
+  const sameScope = () => owner === conversationStorageScope() && API === transport && epoch === nativeEpoch;
+  const current = () => pendingDesktop.get(dedupeKey) === pending && sameScope();
+  const admitted = (async () => {
     try {
       if (!owner || !bridge?.getState || !bridge.sendNotification || !bridge.onNotification || !bridge.onState) throw new Error("desktop.notifications_unavailable: Native notification delivery is unavailable.");
       const state = await bridge.getState();
-      if (!current()) return;
+      if (!current()) return false;
       if (state.transportOrigin !== transport || owner !== `${state.serviceId}:${state.identityId}` || !state.connectionVersion) throw new Error("desktop.notification_scope_changed: Notification workspace changed.");
       acceptNativeState(state);
-      if (!current()) return;
+      if (!current()) return false;
       pending.input = { connectionVersion: state.connectionVersion, serviceId: state.serviceId!, identityId: state.identityId! };
       const reply = await bridge.sendNotification({ ...pending.input, threadId: event.summary.thread_id, eventId: event.event_id, dedupeKey,
-        title: event.summary.title || "Muteki 会话", body: notificationBody(event.summary) });
-      if (!current()) return;
-      if (!validNativeDelivery(reply) || reply.eventId !== event.event_id || reply.dedupeKey !== dedupeKey || reply.threadId !== event.summary.thread_id
+        title: event.summary.title || "Muteki 会话", body: notificationBody(event.summary), wantSound });
+      if (!sameScope()) return false;
+      if (!validNativeDelivery(reply) || (reply.eventId !== event.event_id && reply.requestedEventId !== event.event_id) || reply.dedupeKey !== dedupeKey || reply.threadId !== event.summary.thread_id
         || reply.connectionVersion !== pending.input.connectionVersion || reply.serviceId !== pending.input.serviceId || reply.identityId !== pending.input.identityId
         || (pending.id && pending.id !== reply.id)) throw Object.assign(new Error(`desktop.notification_reply_invalid: ${JSON.stringify(reply)}`), { code: "desktop.notification_reply_invalid" });
       pending.id = reply.id; acceptNativeDelivery(reply);
+      return true;
     } catch (error) {
-      if (!current()) return;
+      if (!sameScope()) return false;
       const code = (error as { code?: string })?.code || "desktop.notification_send_failed";
-      const uncertain = code === "desktop.notification_reply_invalid";
+      const policy = code === 'desktop.notifications_workspace_denied' || code === 'desktop.notifications_unsupported';
+      if (policy) {
+        rememberNotificationDedupe(dedupeKey);
+        pendingDesktop.delete(dedupeKey);
+        const message = error instanceof Error ? error.message : String(error);
+        publishDelivery({ ...initial, ...pending.input, status: 'closed', code, message, history: [...initial.history, { status: 'closed', at: new Date().toISOString(), code, message }] });
+        console.info('muteki.notification.suppressed', JSON.stringify({ code, threadId: event.summary.thread_id, eventId: event.event_id }));
+        return true;
+      }
+      const uncertain = code === "desktop.notification_reply_invalid" && !pending.admitted;
       if (uncertain) pending.outcomeUnknown = true;
       else pendingDesktop.delete(dedupeKey);
       const message = error instanceof Error ? error.stack || error.message : String(error);
       const status = uncertain ? "outcome_unknown" : "failed";
-      publishDelivery({ ...initial, ...pending.input, status, code, message,
+      publishDelivery({ ...initial, ...pending.input, status, shown: pending.shown || false, code, message,
         history: [...initial.history, { status, at: new Date().toISOString(), code, message }] });
+      return pending.admitted === true;
     }
   })();
   // A sound cue is independent evidence; it is never an OS display receipt.
   if (audioPlayed) soundPlayed.add(dedupeKey);
+  return admitted;
 }
 
 function normalizePrefs(parsed: Partial<NotificationPrefs>): NotificationPrefs {
@@ -306,6 +342,12 @@ export function notificationDedupeKey(event: ConversationInboxEvent): string {
   if (kind !== "none" && pendingId) {
     return `${summary.thread_id}|${kind}|${pendingId}`;
   }
+  // Unread and failure attention last until the user reads the thread, so one
+  // read watermark is one episode: later events in it must not notify again.
+  const readSeq = event.thread?.state?.read_stream_seq;
+  if ((kind === "failed" || (kind === "none" && summary.unread)) && typeof readSeq === "number") {
+    return `${summary.thread_id}|${kind === "failed" ? "failed" : "unread"}|read:${readSeq}`;
+  }
   if (kind !== "none") {
     return `${summary.thread_id}|${kind}|rev:${summary.revision}`;
   }
@@ -379,6 +421,10 @@ export function shouldNotifyInboxEvent(
     return { notify: false, reason: "cleared", dedupeKey };
   }
   const summary = event.summary;
+  if (summary.attention_owner_id && summary.attention_owner_id !== summary.thread_id) {
+    // A subagent child: its root Thread's row carries this attention.
+    return { notify: false, reason: "delegated-to-root", dedupeKey };
+  }
   const interesting =
     summary.pending_kind === "approval"
     || summary.pending_kind === "user_input"
@@ -395,11 +441,10 @@ export function shouldNotifyInboxEvent(
   }
   if (
     shouldSuppressForActiveThread(
-      summary.thread_id,
+      summary.pending_thread_id || summary.thread_id,
       options.activeThreadId || "",
-      options.visibilityState || (
-        typeof document !== "undefined" ? document.visibilityState : "visible"
-      ),
+      !desktopChatBridge() && typeof document !== "undefined" && !document.hasFocus() ? "hidden"
+        : options.visibilityState || (typeof document !== "undefined" ? document.visibilityState : "visible"),
     )
   ) {
     return { notify: false, reason: "active-thread", dedupeKey };
@@ -446,12 +491,40 @@ function playCue(kind: "complete" | "input"): boolean {
   } catch { return false; }
 }
 
+export function subagentPendingLabel(item: Pick<SubagentAttention, "title" | "pending_kind">): string {
+  const action = item.pending_kind === "approval" ? "等待审批" : "等待你的输入";
+  return `子代理 ${item.title || "未命名子代理"} ${action}`;
+}
+
 function notificationBody(summary: ThreadAttentionSummary): string {
+  if (summary.pending_thread_id && summary.pending_thread_id !== summary.thread_id) {
+    const child = summary.subagent_attention?.find((item) => item.thread_id === summary.pending_thread_id);
+    if (child) return subagentPendingLabel(child);
+  }
   if (summary.pending_kind === "approval") return "需要审批";
   if (summary.pending_kind === "user_input") return "等待你的输入";
   if (summary.pending_kind === "failed") return "回合失败";
   if (summary.unread) return "有新消息";
   return summary.preview || "会话状态已更新";
+}
+
+async function requestDesktopSound(event: ConversationInboxEvent, dedupeKey: string): Promise<boolean> {
+  const bridge = desktopChatBridge(), owner = conversationStorageScope(), transport = API;
+  try {
+    if (!bridge?.getState || !bridge.playNotificationSound) throw new Error('desktop.notification_sound_unavailable: Native notification sound is unavailable.');
+    const state = await bridge.getState();
+    if (owner !== conversationStorageScope() || API !== transport || state.transportOrigin !== transport || owner !== `${state.serviceId}:${state.identityId}` || !state.connectionVersion) return false;
+    const input = { connectionVersion: state.connectionVersion, serviceId: state.serviceId!, identityId: state.identityId!, threadId: event.summary.thread_id, eventId: event.event_id, dedupeKey };
+    const reply = await bridge.playNotificationSound(input);
+    if (reply.connectionVersion !== input.connectionVersion || reply.serviceId !== input.serviceId || reply.identityId !== input.identityId || reply.dedupeKey !== dedupeKey || reply.threadId !== input.threadId || reply.eventId !== input.eventId || !['sound-requested', 'already-requested', 'suppressed'].includes(reply.status)) throw new Error(`desktop.notification_sound_reply_invalid: ${JSON.stringify(reply)}`);
+    rememberNotificationDedupe(dedupeKey);
+    return true;
+  } catch (error) {
+    const policy = (error as {code?: string})?.code === 'desktop.notifications_workspace_denied';
+    if (policy) { rememberNotificationDedupe(dedupeKey); console.info('muteki.notification.suppressed', JSON.stringify({ code: 'desktop.notifications_workspace_denied', threadId: event.summary.thread_id })); }
+    else console.error('muteki.notification.sound', error instanceof Error ? error.stack || error.message : String(error));
+    return policy;
+  }
 }
 
 export function dispatchThreadNotification(
@@ -462,7 +535,7 @@ export function dispatchThreadNotification(
     visibilityState?: DocumentVisibilityState;
     onOpenThread?: (threadId: string) => void;
   } = {},
-): { notified: boolean; reason: string } {
+): { notified: boolean; reason: string; admitted?: Promise<boolean> } {
   const decision = shouldNotifyInboxEvent(event, options);
   if (!decision.notify) {
     return { notified: false, reason: decision.reason };
@@ -474,6 +547,11 @@ export function dispatchThreadNotification(
   const wantSound =
     prefs.mode === "sound" || prefs.mode === "notifications-and-sound";
 
+  if (desktopChatBridge()) {
+    if (wantDesktop) return { notified: false, reason: "desktop-submitting", admitted: queueDesktopNotification(event, decision.dedupeKey, false, wantSound) };
+    if (wantSound) return { notified: false, reason: "desktop-sound-requesting", admitted: requestDesktopSound(event, decision.dedupeKey) };
+  }
+
   let delivered = false;
   if (wantSound) {
     delivered = !soundPlayed.has(decision.dedupeKey) && playCue(
@@ -481,11 +559,6 @@ export function dispatchThreadNotification(
         ? "input"
         : "complete",
     );
-  }
-
-  if (wantDesktop && desktopChatBridge()) {
-    queueDesktopNotification(event, decision.dedupeKey, delivered);
-    return { notified: false, reason: "desktop-submitting" };
   }
 
   if (
@@ -519,7 +592,9 @@ export interface NotificationPermissionStatus {
   permission: NotificationPermission | "unsupported";
   host: "desktop-client" | "browser";
   workspacePermission?: NotificationPermission;
-  systemPermission?: "unknown";
+  systemPermission?: "unknown" | "default" | "granted" | "denied" | "provisional" | "ephemeral";
+  systemNotificationSettings?: { authorizationStatus: string; authorizationStatusRaw: number; alertSettingRaw?: number; soundSettingRaw?: number };
+  systemPermissionError?: { code: string; message: string; detail?: string };
   code?: string;
 }
 
@@ -545,7 +620,7 @@ async function desktopNotificationPermission(request: boolean): Promise<DesktopN
     || input.serviceId !== current.serviceId || input.identityId !== current.identityId) {
     throw new Error("desktop.notification_scope_changed: 通知所属工作台已改变 / Notification workspace changed");
   }
-  if (!result || result.host !== "desktop-client" || result.systemPermission !== "unknown"
+  if (!result || result.host !== "desktop-client" || !["unknown", "default", "granted", "denied", "provisional", "ephemeral"].includes(result.systemPermission)
     || result.connectionVersion !== input.connectionVersion || result.serviceId !== input.serviceId || result.identityId !== input.identityId
     || !["default", "granted", "denied", "unsupported"].includes(result.permission)
     || !["default", "granted", "denied"].includes(result.workspacePermission) || typeof result.code !== "string"

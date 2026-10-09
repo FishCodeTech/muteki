@@ -129,7 +129,7 @@
 /* ── Root surface ─────────────────────────────────────────────────────────── */
 .cx-root {
   font-family: var(--cx-font-sans);
-  font-size: 14px;
+  font-size: var(--cx-ui-fs, 14px);
   line-height: 1.5;
   color: var(--cx-fg);
   background: var(--cx-bg);
@@ -172,7 +172,7 @@
 
 .cx-portal {
   font-family: var(--cx-font-sans);
-  font-size: 14px;
+  font-size: var(--cx-ui-fs, 14px);
   line-height: 1.5;
   color: var(--cx-fg);
   -webkit-font-smoothing: antialiased;

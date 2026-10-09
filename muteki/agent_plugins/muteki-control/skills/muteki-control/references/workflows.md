@@ -14,6 +14,10 @@ database or filesystem access.
 - `muteki_get_command_receipt`: verify an accepted command reached a terminal
   state.
 
+List tools return `next_cursor` and `has_more`. Continue only when more records
+are needed, passing `next_cursor` as `cursor` with the same filters. Read one
+task's complete input with `muteki_get_task` after obtaining its ID.
+
 ## Task and run lifecycle
 
 - `muteki_create_task`: create the durable unit of work.
@@ -25,11 +29,13 @@ database or filesystem access.
   explicitly overrides those fields. CTF challenge categories are normalized
   to the product's lowercase category values.
 - `muteki_wait_run`: wait for bounded progress or completion.
-- `muteki_resolve_run`: calculate the final run result.
+- `muteki_resolve_run`: continue an ended, incomplete run in its next execution
+  generation, preserving its run ID and workspace.
 - `muteki_get_run_snapshot`: read projected run state.
 - `muteki_read_run_events`: read durable execution evidence.
 - `muteki_read_shared_graph`: read facts, routes, branches, intents, flags, and
-  review state.
+  review state; use `sections` from `available_sections` to select complete
+  relevant blocks.
 
 ## Active run control
 

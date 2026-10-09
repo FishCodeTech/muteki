@@ -19,6 +19,7 @@ from enum import Enum
 from typing import Any, Optional
 
 from pydantic import Field
+from jsonschema import Draft202012Validator
 
 from muteki.platform.contracts.base import ContractModel
 from muteki.platform.contracts.capabilities import ThreadMode, ToolDescription
@@ -53,6 +54,9 @@ class CapabilityToolSpec(ContractModel):
     # 归一化为命令时注入的默认 payload 键（调用方显式传值优先）。用于声明
     # 语义固定的工具，例如 muteki_dispatch_challenge 固定创建 ctf.challenge。
     payload_defaults: dict[str, Any] = Field(default_factory=dict)
+    # The aggregate is the Thread owning the calling Binding, never a model
+    # supplied id; such tools only ever act on the caller's own Thread scope.
+    aggregate_from_caller_thread: bool = False
 
     def describe(self) -> ToolDescription:
         """协议入口注入用的工具描述。"""
@@ -122,8 +126,11 @@ _TOOL_SPECS: tuple[CapabilityToolSpec, ...] = (
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 200,
+                    "default": 50,
                     "description": "可选：最多返回条数，默认 50，最大 200",
                 },
+                "cursor": {"type": "string", "maxLength": 8192,
+                           "description": "续读时传上一页 next_cursor，并沿用原筛选条件。"},
             },
         },
     ),
@@ -163,8 +170,11 @@ _TOOL_SPECS: tuple[CapabilityToolSpec, ...] = (
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 2000,
-                    "description": "可选：最多返回条数，默认 500，最大 2000",
+                    "default": 50,
+                    "description": "每页条数，默认 50，最大 2000；仅在需要批量数据时显式增大。",
                 },
+                "cursor": {"type": "string", "maxLength": 8192,
+                           "description": "续读时传上一页 next_cursor，并沿用原筛选条件。"},
             },
         },
     ),
@@ -217,8 +227,11 @@ _TOOL_SPECS: tuple[CapabilityToolSpec, ...] = (
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 2000,
-                    "description": "可选：最多返回条数，默认 500，最大 2000",
+                    "default": 50,
+                    "description": "每页条数，默认 50，最大 2000；仅在需要批量数据时显式增大。",
                 },
+                "cursor": {"type": "string", "maxLength": 8192,
+                           "description": "续读时传上一页 next_cursor，并沿用原筛选条件。"},
             },
         },
     ),
@@ -481,12 +494,20 @@ _TOOL_SPECS: tuple[CapabilityToolSpec, ...] = (
     ),
     CapabilityToolSpec(
         name="muteki_read_shared_graph",
-        description="读取 Run 的 SharedGraph 只读状态视图（fact/intent/route/branch/review/directive/flag）。",
+        description="读取 Run 的 SharedGraph 只读状态视图。可用 sections 选择需要的完整区块；返回 available_sections 与 watermark。",
         target_kind=ToolTargetKind.QUERY,
         query_type="graph.shared.read",
         aggregate_type="run",
         aggregate_arg="run_id",
-        input_schema=_props(run_id=("目标 Run id", True)),
+        input_schema={
+            "type": "object", "required": ["run_id"],
+            "properties": {
+                "run_id": {"type": "string", "description": "目标 Run id"},
+                "sections": {"type": "array", "minItems": 1, "uniqueItems": True,
+                             "items": {"type": "string", "minLength": 1},
+                             "description": "可选：按 available_sections 中的名称选择完整区块；省略时读取完整状态。"},
+            },
+        },
     ),
     CapabilityToolSpec(
         name="muteki_pause_run",
@@ -607,6 +628,98 @@ _TOOL_SPECS: tuple[CapabilityToolSpec, ...] = (
             run_id=("目标 Run id", True),
             worker_id=("Worker id", True),
         ),
+    ),
+    # -- 对话子 Agent（Muteki 自管；子对话是独立 Thread） -------------------------
+    CapabilityToolSpec(
+        name="muteki_spawn_subagent",
+        description=(
+            "创建一个由 Muteki 管理的子 Agent：新建一个与当前对话关联的子对话"
+            "并把 prompt 作为它的第一条消息发出。子 Agent 看不到当前对话历史，"
+            "prompt 必须自包含目标、已知事实、约束和期望的产出。默认继承当前"
+            "对话的引擎、凭据、模型、effort 与访问模式；访问模式不能高于当前"
+            "对话。isolation=worktree 时在 Muteki 托管目录为子 Agent 新建 Git "
+            "worktree（基于当前 HEAD，不含未提交改动）。wait=true 时最多等待 "
+            "timeout_seconds，返回最终回复全文；超时返回 wait.outcome=pending，"
+            "之后用 muteki_subagent_status 查询。层级上限与每个根对话的并发上限"
+            "超出时返回带稳定 code 的错误。"
+        ),
+        target_kind=ToolTargetKind.COMMAND,
+        command_type="conversation.subagent.spawn",
+        aggregate_type="thread",
+        aggregate_from_caller_thread=True,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "minLength": 1,
+                           "description": "子 Agent 的完整任务说明（自包含）"},
+                "title": {"type": "string", "description": "可选：子对话标题"},
+                "engine": {"type": "string",
+                           "description": "可选：引擎 id（如 codex / claude）；省略时继承当前对话"},
+                "adapter_id": {"type": "string",
+                               "description": "可选：精确 Runtime adapter id；与 engine 二选一"},
+                "instance_id": {"type": "string", "description": "可选：Runtime instance id"},
+                "credential_id": {"type": "string",
+                                  "description": "可选：全局凭据 id；换引擎时省略则使用该引擎的系统登录"},
+                "model": {"type": "string", "description": "可选：模型；换引擎时必须给出"},
+                "effort": {"type": "string", "description": "可选：推理强度"},
+                "access_mode": {
+                    "type": "string",
+                    "enum": ["supervised", "auto-accept-edits", "auto", "full-access"],
+                    "description": "可选：访问模式，不能高于当前对话",
+                },
+                "isolation": {"type": "string", "enum": ["shared", "worktree"],
+                              "default": "shared",
+                              "description": "shared 共用当前工作区；worktree 使用独立 Git worktree"},
+                "wait": {"type": "boolean", "default": False,
+                         "description": "是否等待子 Agent 完成"},
+                "timeout_seconds": {"type": "number", "exclusiveMinimum": 0,
+                                    "description": "wait=true 时的最长等待秒数；省略用服务默认值"},
+                "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 200,
+                                    "description": "可选：重试同一次创建时复用，避免重复创建"},
+            },
+            "required": ["prompt"],
+            "additionalProperties": False,
+        },
+    ),
+    CapabilityToolSpec(
+        name="muteki_subagent_status",
+        description=(
+            "查询当前对话创建的子 Agent。给出 subagent_id 时返回该子 Agent 的"
+            "状态与最终回复全文（可用 wait_seconds 有界等待其结束）；省略时列出"
+            "当前对话的全部直接子 Agent，最终回复以 message_id 引用给出。"
+        ),
+        target_kind=ToolTargetKind.QUERY,
+        query_type="conversation.subagent.status",
+        aggregate_type="thread",
+        aggregate_from_caller_thread=True,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "subagent_id": {"type": "string", "minLength": 1,
+                                "description": "可选：muteki_spawn_subagent 返回的 subagent_id"},
+                "wait_seconds": {"type": "number", "minimum": 0,
+                                 "description": "可选：与 subagent_id 同用，最多等待其结束的秒数"},
+            },
+            "additionalProperties": False,
+        },
+    ),
+    CapabilityToolSpec(
+        name="muteki_subagent_cancel",
+        description="取消当前对话创建的一个子 Agent，并级联取消它创建的所有后代子 Agent。",
+        target_kind=ToolTargetKind.COMMAND,
+        command_type="conversation.subagent.cancel",
+        aggregate_type="thread",
+        aggregate_from_caller_thread=True,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "subagent_id": {"type": "string", "minLength": 1,
+                                "description": "要取消的 subagent_id"},
+                "reason": {"type": "string", "description": "可选：取消原因"},
+            },
+            "required": ["subagent_id"],
+            "additionalProperties": False,
+        },
     ),
     # -- 比赛模式（command_type 的 Handler 由 COMP-09 注册） --------------------
     CapabilityToolSpec(
@@ -905,10 +1018,19 @@ class CapabilityCatalog:
 
     def __init__(self, specs: tuple[CapabilityToolSpec, ...] = _TOOL_SPECS) -> None:
         self._by_name: dict[str, CapabilityToolSpec] = {}
+        self._validators: dict[str, Draft202012Validator] = {}
         for spec in specs:
             if spec.name in self._by_name:
                 raise ValueError(f"duplicate capability tool: {spec.name}")
             self._by_name[spec.name] = spec
+            Draft202012Validator.check_schema(spec.input_schema)
+            self._validators[spec.name] = Draft202012Validator(spec.input_schema)
+
+    def validation_errors(self, name: str, arguments: dict[str, Any]) -> list[dict[str, Any]]:
+        """Report structural errors without echoing argument values or secrets."""
+        return [{"path": ["arguments", *error.absolute_path], "rule": error.validator,
+                 "expected": error.validator_value}
+                for error in self._validators[name].iter_errors(arguments)]
 
     def get(self, name: str) -> Optional[CapabilityToolSpec]:
         return self._by_name.get(name)
@@ -980,10 +1102,17 @@ _SINGLE_TASK_TOOLS: tuple[str, ...] = (
     "muteki_cancel_run_worker",
 )
 
+#: Muteki 自管子 Agent：子 Agent 本身是 conversation Thread，所以只在对话模式提供。
+_SUBAGENT_TOOLS: tuple[str, ...] = (
+    "muteki_spawn_subagent",
+    "muteki_subagent_status",
+    "muteki_subagent_cancel",
+)
+
 #: conversation：普通聊天也可以直接下发和控制一个单题任务。这样 Agent 不必
-#: 切换到单题页面、读取 sessions 或绕过能力网关；能力范围与 single_task
-#: 完全相同，故意不带任何比赛平台或全局管理工具。
-_CONVERSATION_TOOLS: tuple[str, ...] = _SINGLE_TASK_TOOLS
+#: 切换到单题页面、读取 sessions 或绕过能力网关；在 single_task 范围之外只
+#: 增加子 Agent 工具，故意不带任何比赛平台或全局管理工具。
+_CONVERSATION_TOOLS: tuple[str, ...] = (*_SINGLE_TASK_TOOLS, *_SUBAGENT_TOOLS)
 
 #: 2026-08-29 之前 conversation 的产品默认工具。仅用于把当时由产品自动
 #: 签发的 Binding 迁移到新的对话控制集合；它不代表用户手工自定义的工具集。
@@ -1049,6 +1178,8 @@ _LEGACY_MODE_TOOL_TEMPLATES: dict[ThreadMode, tuple[tuple[str, ...], ...]] = {
             "muteki_get_command_receipt",
         ),
         _PREVIOUS_CONVERSATION_TOOLS,
+        # Product default before subagent tools existed.
+        _SINGLE_TASK_TOOLS,
     ),
     ThreadMode.SINGLE_TASK: ((
         "muteki_list_projects",
@@ -1165,6 +1296,9 @@ def resource_scopes_for_tool_set(
     seen = set(scopes)
     for name in tool_set:
         spec = catalog.get(str(name or "").strip())
+        if spec is not None and spec.aggregate_from_caller_thread:
+            # Covered by the Thread's own scope; a wildcard would widen it.
+            continue
         aggregate_type = str(spec.aggregate_type if spec is not None else "").strip()
         if not aggregate_type:
             continue

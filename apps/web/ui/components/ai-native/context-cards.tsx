@@ -35,7 +35,7 @@ export function ContextCards({ title = "上下文条目", chunks = [], totalCoun
   return (
     <section className={cn("flex w-full flex-col gap-2", className)} aria-label={title}>
       <div className="flex items-center gap-2 px-0.5">
-        <span className="text-[12.5px] font-medium text-cx-fg-2">{title}</span>
+        <span className="text-[13px] font-medium text-cx-fg-2">{title}</span>
         <span className="cx-tabular text-[12px] text-cx-fg-4">{totalCount ?? chunks.length}</span>
       </div>
       <div className="grid gap-2 sm:grid-cols-2">
@@ -49,14 +49,14 @@ export function ContextCards({ title = "上下文条目", chunks = [], totalCoun
                 <span className="flex min-w-0 items-center gap-1.5">
                   <span className="min-w-0 truncate text-[13px] font-medium text-cx-fg">{chunk.title}</span>
                   {chunk.badge ? (
-                    <span className="shrink-0 rounded-[5px] bg-cx-hover px-1 font-cx-mono text-[10px] font-medium uppercase text-cx-fg-3">
+                    <span className="shrink-0 rounded-[5px] bg-cx-hover px-1 font-cx-mono text-[12px] font-medium uppercase text-cx-fg-3">
                       {chunk.badge}
                     </span>
                   ) : null}
                 </span>
                 <span className="min-w-0 truncate text-[12px] text-cx-fg-3">{chunk.body}</span>
               </span>
-              <span className="flex shrink-0 flex-col items-end gap-0.5 text-[11px] text-cx-fg-4">
+              <span className="flex shrink-0 flex-col items-end gap-0.5 text-[12px] text-cx-fg-4">
                 {chunk.chars ? <span className="cx-tabular">{chunk.chars}</span> : null}
                 {chunk.source ? <span className="font-cx-mono">{chunk.source}</span> : null}
               </span>

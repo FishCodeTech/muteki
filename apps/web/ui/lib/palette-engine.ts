@@ -1,3 +1,5 @@
+import { readUiPreference, hasLoadedUiPreferences } from "./uiPreferences";
+import { readAppearanceOverride } from "./desktopEnvironment";
 /**
  * palette-engine.ts — scheme-driven color engine for the command deck.
  *
@@ -254,6 +256,7 @@ export const ENGINE_HUE: Record<string, number> = {
   grok: 320,
   opencode: 180,
   devin: 215,
+  droid: 28,
   dsh: 350,
   reason: 265,
   deepseek: 265,
@@ -372,6 +375,9 @@ const CUSTOM_SCHEME_ID = "custom";
 const HUE_STORAGE_KEY = "muteki.schemeHue";
 
 export function readSavedSelection(): SchemeSelection {
+  const override = readAppearanceOverride(); if (override) return override.selection;
+  const shared = readUiPreference("accent", {kind: "preset", id: DEFAULT_SCHEME});
+  if (hasLoadedUiPreferences()) return shared;
   try {
     const saved = window.localStorage.getItem(SCHEME_STORAGE_KEY);
     if (saved === CUSTOM_SCHEME_ID) {
@@ -387,12 +393,11 @@ export function readSavedSelection(): SchemeSelection {
 }
 
 export function readSavedTheme(): ThemeMode {
-  try {
-    if (window.localStorage.getItem("muteki.theme") === "light") return "light";
-  } catch {
-    /* keep dark */
-  }
-  return "dark";
+  const override = readAppearanceOverride(); if (override) return override.resolvedTheme;
+  let legacy: "light" | "dark" | "system" = "system";
+  try { const value = localStorage.getItem("muteki.themePreference") || localStorage.getItem("muteki.theme"); if (value === "light" || value === "dark" || value === "system") legacy = value; } catch { /* use the system theme before connecting */ }
+  const preference = readUiPreference("theme", hasLoadedUiPreferences() ? "system" : legacy);
+  return preference === "system" ? (typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark") : preference;
 }
 
 /** Token map for a selection (preset or free hue) in one mode. */
@@ -415,10 +420,5 @@ export function applySelection(sel: SchemeSelection, mode: ThemeMode): void {
   root.classList.toggle("light", mode === "light");
   root.dataset.scheme = sel.kind === "custom" ? CUSTOM_SCHEME_ID : schemeById(sel.id).id;
   updateBrandHead(palette);
-  try {
-    window.localStorage.setItem(SCHEME_STORAGE_KEY, root.dataset.scheme);
-    if (sel.kind === "custom") window.localStorage.setItem(HUE_STORAGE_KEY, String(Math.round(sel.hue)));
-  } catch {
-    /* theming still works for this session */
-  }
+
 }

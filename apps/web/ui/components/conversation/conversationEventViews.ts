@@ -7,6 +7,8 @@ export interface ConversationToolRecord extends ToolItem {
   occurredAt?: string;
   parentId?: string | null;
   isAgent?: boolean;
+  /** Subagent that owns this call; such tools render inside its agent card. */
+  agentId?: string | null;
   model?: string | null;
   messageId?: string | null;
 }
@@ -31,17 +33,19 @@ export function conversationErrorMessage(value: unknown): string {
   }
   if (typeof value === "object") {
     const row = value as Record<string, unknown>;
-    for (const key of ["message", "detail", "errorMessage", "error", "reason"]) {
+    for (const key of ["message", "detail", "errorMessage", "error"]) {
       const text = conversationErrorMessage(row[key]);
       if (text) return text;
     }
     const code = String(row.code || "").trim();
     const operation = String(row.operation || "").trim();
     const capability = String(row.capability || "").trim();
-    if (code === "external_agent.capability.unsupported") {
+    if (code === "external_agent.capability.unsupported" || row.reason === "capability.unsupported") {
       const label = capability || operation || "所需功能";
       return `当前 Agent 接入不支持 ${label}；Muteki 将使用已保存的对话历史重新建立会话`;
     }
+    const reason = conversationErrorMessage(row.reason);
+    if (reason) return reason;
     if (code) {
       const context = [operation && `操作：${operation}`, capability && `能力：${capability}`]
         .filter(Boolean)
@@ -53,7 +57,7 @@ export function conversationErrorMessage(value: unknown): string {
 }
 
 export type ConversationTurnSegment =
-  | { kind: "thinking"; turnId: string; text: string; durationMs?: number }
+  | { kind: "thinking"; turnId: string; text: string; durationMs?: number; itemId?: string; partial?: boolean }
   | {
       kind: "text";
       turnId: string;
@@ -97,6 +101,8 @@ export interface ConversationLiveActivity {
 export interface ConversationTurnFoldState {
   segmentsByTurn: Record<string, ConversationTurnSegment[]>;
   textFromDeltas: Record<string, boolean>;
+  /** turnId → subagent id → that subagent's own tool calls, in arrival order. */
+  agentToolsByTurn: Record<string, Record<string, ConversationToolRecord[]>>;
 }
 
 export interface ConversationTurnRuntime {
@@ -367,12 +373,12 @@ function conversationToolKey(
 }
 
 /** Map a finished turn onto open tool records (events may lag or omit tool end). */
-export type ConversationTurnTerminalStatus = "completed" | "failed" | "interrupted";
+export type ConversationTurnTerminalStatus = "completed" | "failed" | "interrupted" | "cancelled";
 
-function turnTerminalFromEventType(type: string): ConversationTurnTerminalStatus | null {
+function turnTerminalFromEventType(type: string, status?: unknown): ConversationTurnTerminalStatus | null {
   if (type === "core.turn.completed") return "completed";
   if (type === "core.turn.failed") return "failed";
-  if (type === "core.turn.interrupted") return "interrupted";
+  if (type === "core.turn.interrupted") return status === "cancelled" ? "cancelled" : "interrupted";
   return null;
 }
 
@@ -481,12 +487,11 @@ export function normalizeTurnTerminalStatus(
   const status = String(turnStatus || "").trim().toLowerCase();
   if (status === "completed") return "completed";
   if (status === "failed") return "failed";
-  // Pi/Codex stop may surface as aborted/cancelled; treat like interrupted.
+  if (status === "cancelled" || status === "canceled") return "cancelled";
+  // Native abort is an interrupt; durable refusal status is cancelled.
   if (
     status === "interrupted"
     || status === "aborted"
-    || status === "cancelled"
-    || status === "canceled"
   ) {
     return "interrupted";
   }
@@ -503,16 +508,17 @@ export function settleConversationToolForTurn(
     return tool.error ? tool : { ...tool, error: "已拒绝 · 未执行" };
   }
   // Interrupted/aborted: open tools and late tool.failed → 已取消/已中断, not 执行失败.
-  if (normalized === "interrupted") {
+  if (normalized === "interrupted" || normalized === "cancelled") {
+    const label = normalized === "cancelled" ? "已取消" : "已中断";
     if (tool.status === "cancelled") {
-      return tool.error ? tool : { ...tool, error: "已中断" };
+      return tool.error ? tool : { ...tool, error: label };
     }
     if (isOpenToolStatus(tool.status) || tool.status === "failed") {
       return {
         ...tool,
         status: "cancelled",
         // Prefer interrupt copy over late kill/failed noise for chips (#133).
-        error: tool.status === "failed" ? "已中断" : (tool.error || "已中断"),
+        error: tool.status === "failed" ? label : (tool.error || label),
       };
     }
     return tool;
@@ -618,6 +624,7 @@ function mergeConversationTool(
     occurredAt: previous?.occurredAt || event.occurred_at,
     parentId,
     isAgent: explicitAgent || previous?.isAgent || false,
+    agentId: String(payload.agent_id || "").trim() || previous?.agentId || null,
     model: String(payload.model || previous?.model || "").trim() || previous?.model || null,
     messageId: String(payload.message_id || previous?.messageId || "").trim()
       || previous?.messageId
@@ -786,6 +793,9 @@ function runningToolActivity(record: ConversationToolRecord): string {
   if (name.includes("read") || name.includes("open_file") || name.includes("view_file")) {
     return path ? `正在读取 ${path}` : "正在读取文件";
   }
+  if (name.includes("web") && name.includes("search")) {
+    return query ? `正在联网搜索“${query}”` : "正在联网搜索";
+  }
   if (name.includes("search") || name.includes("grep") || name.includes("find")) {
     return query ? `正在搜索“${query}”` : "正在搜索工作区";
   }
@@ -800,6 +810,7 @@ function runningToolActivity(record: ConversationToolRecord): string {
 function completedToolActivity(label: string): string {
   const exact: Record<string, string> = {
     "正在搜索工作区": "已完成工作区搜索",
+    "正在联网搜索": "已完成联网搜索",
     "正在检查工作区变更": "已完成工作区变更检查",
     "正在运行命令": "命令已完成",
     "正在运行项目检查": "项目检查已完成",
@@ -835,6 +846,7 @@ function completedToolActivity(label: string): string {
     ["正在列出", "已列出"],
     ["正在读取", "已读取"],
     ["正在搜索", "已完成搜索"],
+    ["正在联网搜索", "已完成联网搜索"],
     ["正在检查", "已完成检查"],
     ["正在运行", "已完成运行"],
     ["正在更新", "已更新"],
@@ -892,7 +904,7 @@ export function resolveConversationLiveActivity(
 }
 
 function emptyTurnFoldState(): ConversationTurnFoldState {
-  return { segmentsByTurn: {}, textFromDeltas: {} };
+  return { segmentsByTurn: {}, textFromDeltas: {}, agentToolsByTurn: {} };
 }
 
 function applyConversationEventToFold(
@@ -921,10 +933,36 @@ function applyConversationEventToFold(
           ([turnId]) => !superseded.has(turnId),
         ),
       ),
+      agentToolsByTurn: Object.fromEntries(
+        Object.entries(state.agentToolsByTurn).filter(
+          ([turnId]) => !superseded.has(turnId),
+        ),
+      ),
     };
   }
   const turnId = String(payload.turn_id || "");
   if (!turnId) return state;
+
+  const ownerAgentId = String(payload.agent_id || "").trim();
+  if (ownerAgentId && isConversationToolEvent(type)) {
+    // Subagent calls stay out of the parent's segments so they neither split
+    // the parent's text nor drive its live "working" label.
+    const byAgent = state.agentToolsByTurn[turnId] || {};
+    const list = byAgent[ownerAgentId] || [];
+    const key = conversationToolKey(payload, turnId);
+    const index = list.findIndex((tool) => tool.id === key);
+    const record = mergeConversationTool(event, index >= 0 ? list[index] : undefined);
+    const nextList = index >= 0
+      ? list.map((tool, i) => (i === index ? record : tool))
+      : [...list, record];
+    return {
+      ...state,
+      agentToolsByTurn: {
+        ...state.agentToolsByTurn,
+        [turnId]: { ...byAgent, [ownerAgentId]: nextList },
+      },
+    };
+  }
 
   const segments = state.segmentsByTurn[turnId] || [];
   let nextSegments = segments;
@@ -950,9 +988,22 @@ function applyConversationEventToFold(
     changed = true;
   } else if (type === "core.reasoning.summary") {
     const text = String(payload.reasoning_summary || payload.text || "");
-    const durationMs = payload.duration_ms ? Number(payload.duration_ms) : undefined;
+    const durationMs = payload.duration_ms != null ? Number(payload.duration_ms) : undefined;
     if (!text && durationMs == null) return state;
-    nextSegments = appendTurnText(segments, turnId, "thinking", text, durationMs);
+    const itemId = String(payload.item_id || "");
+    if (itemId) {
+      const index = segments.findIndex(segment => segment.kind === "thinking" && segment.turnId === turnId && segment.itemId === itemId);
+      const existing = index >= 0 ? segments[index] : undefined;
+      const segment: ConversationTurnSegment = {
+        kind: "thinking", turnId, itemId, partial: payload.partial === true,
+        text: existing?.kind === "thinking" && payload.partial === true ? existing.text + text : text,
+        ...(existing?.kind === "thinking" && existing.durationMs != null ? { durationMs: existing.durationMs } : {}),
+        ...(durationMs != null ? { durationMs } : {}),
+      };
+      nextSegments = index < 0 ? [...segments, segment] : segments.map((value, at) => at === index ? segment : value);
+    } else {
+      nextSegments = appendTurnText(segments, turnId, "thinking", text, durationMs);
+    }
     textFromDeltas = false;
     changed = true;
   } else if (isConversationToolEvent(type)) {
@@ -961,7 +1012,7 @@ function applyConversationEventToFold(
     textFromDeltas = false;
     changed = true;
   } else if (TURN_FINISH_EVENT_TYPES.has(type)) {
-    const terminal = turnTerminalFromEventType(type);
+    const terminal = turnTerminalFromEventType(type, payload.status);
     if (terminal) {
       nextSegments = settleTurnSegmentsAgainstStatus(segments, terminal);
       if (nextSegments !== segments) {
@@ -999,6 +1050,7 @@ function applyConversationEventToFold(
 
   if (!changed) return state;
   return {
+    ...state,
     segmentsByTurn: { ...state.segmentsByTurn, [turnId]: nextSegments },
     textFromDeltas: { ...state.textFromDeltas, [turnId]: textFromDeltas },
   };
@@ -1037,7 +1089,7 @@ export function presentConversationTurn(
     }
   } else if (
     !explicitAnswerIndexes.size
-    && (status === "failed" || status === "interrupted")
+    && (status === "failed" || status === "interrupted" || status === "cancelled")
   ) {
     segments.forEach((segment, index) => {
       if (segment.kind === "text") {
@@ -1090,7 +1142,7 @@ export function collectConversationTools(
       continue;
     }
 
-    const finish = turnTerminalFromEventType(type);
+    const finish = turnTerminalFromEventType(type, payload.status);
     if (finish && turnId) {
       turnTerminal.set(turnId, finish);
       for (const [key, tool] of tools) {

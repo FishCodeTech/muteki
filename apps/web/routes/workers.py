@@ -17,9 +17,6 @@ from fastapi import (
 from apps.web.routes.common import (
     _require_dict_body,
 )
-from muteki.solver.engine_registry import (
-    descriptor_payload,
-)
 from muteki.solver.credential_accounts import (
     account_store_root,
 )
@@ -34,10 +31,6 @@ def register(app: FastAPI) -> None:
     _engine_cache_ttl_s = h._engine_cache_ttl_s
     _engine_refresh_lock = h._engine_refresh_lock
     _invalidate_engine_cache = h._invalidate_engine_cache
-
-    @app.get("/api/settings/agent-engines")
-    async def list_agent_engines() -> Any:
-        return descriptor_payload()
 
     @app.get("/api/engines")
     async def engines() -> Any:

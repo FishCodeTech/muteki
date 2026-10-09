@@ -11,22 +11,36 @@ class DesktopError extends Error {
 // an arbitrary network destination, redirect its credentials, or proxy a URL.
 const API_PATHS = [
   /^\/api\/(health|readiness|workspace-kinds|engines|agent-runtimes)(\/|$)/,
-  /^\/api\/auth\/(login|me|ticket)$/,
+  /^\/api\/auth\/(login|me|ticket|status|logout)$/,
   /^\/api\/(threads|projects|workspaces|import|sidebar-preferences|receipts|usage)(\/|$)/,
   /^\/api\/directories\/select$/,
   /^\/api\/settings\/(credentials|credential-accounts|model-endpoints|workers|worker-model|worker-models|worker-image|profiles|runtime|llm|extensions|agent-extensions|conversation|notifications|capabilities|operations)(\/|$)/,
   /^\/api\/(conversation|agent-runtime|capabilities|extensions|platform-extensions|operations)(\/|$)/,
   /^\/api\/(agent-extensions|chat-plugins|conversation-shares|commands|queries|effects)(\/|$)/,
-  /^\/api\/settings\/(agent-engines|credential-models|identity|system-login|system-update)(\/|$)/,
+  /^\/api\/settings\/(credential-models|identity|system-login|system-update|access)(\/|$)/,
   /^\/api\/events\/(read|wait)$/,
 ];
+const METHOD_RULES = [
+  { path: '/api/runs', match: 'exact', methods: ['GET'] },
+  { path: '/api/capability-management', match: 'prefix', methods: ['GET', 'POST', 'PUT'] },
+  { path: '/api/domain-modules', match: 'prefix', methods: ['GET', 'POST'] },
+  { path: '/api/settings/ui', match: 'exact', methods: ['GET', 'PUT'] },
+];
+function pathMatches(rule, pathname) {
+  return pathname === rule.path || (rule.match === 'prefix' && pathname.startsWith(rule.path + '/'));
+}
 const METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
 const REQUEST_HEADERS = new Set(['accept', 'authorization', 'content-type', 'last-event-id', 'idempotency-key']);
 const RESPONSE_DROP = new Set(['connection', 'keep-alive', 'transfer-encoding', 'set-cookie', 'content-encoding', 'content-length']);
 
 function allowedApiPath(pathname) {
   return !/%2f|%5c/i.test(pathname) && !pathname.includes('\\')
-    && API_PATHS.some(pattern => pattern.test(pathname));
+    && (API_PATHS.some(pattern => pattern.test(pathname)) || METHOD_RULES.some(rule => pathMatches(rule, pathname)));
+}
+function allowedApiRequest(pathname, method) {
+  if (!allowedApiPath(pathname) || !METHODS.has(method) || method === 'OPTIONS') return false;
+  const rule = METHOD_RULES.find(rule => pathMatches(rule, pathname));
+  return rule ? rule.methods.includes(method) : true;
 }
 function transportError(error) {
   return { code: error.code || 'desktop.operation_failed', message: error.message,
@@ -50,7 +64,12 @@ async function probeService(value, signal) {
   if (!health || typeof health !== 'object' || (!['ok', 'ready'].includes(health.status) && !(health.status === 'degraded' && health.ready === true))) {
     throw new DesktopError('desktop.service_not_ready', '工作台尚未就绪，请等待后重试。', { retryable: true, source: 'service' });
   }
-  return { origin, health };
+  const authResponse = await fetch(`${origin}/api/auth/status`, { signal, redirect: 'error' });
+  const auth = authResponse.ok ? await authResponse.json() : null;
+  if (auth?.session_protocol !== 2 || typeof auth.service_id !== 'string' || !auth.service_id) {
+    throw new DesktopError('desktop.auth_protocol', '服务登录协议不兼容，请更新服务后重试。', { source: 'service' });
+  }
+  return { origin, health, auth };
 }
 
 async function forwardService(request, scope, onIdentity) {
@@ -58,16 +77,23 @@ async function forwardService(request, scope, onIdentity) {
   if (!scope || incoming.host !== scope.host || scope.closed) {
     return errorResponse(new DesktopError('desktop.connection_changed', '服务连接已改变，请在当前工作台重试。'), 409);
   }
-  if (!METHODS.has(request.method) || !allowedApiPath(incoming.pathname)) {
+  const preflight = request.method === 'OPTIONS';
+  const requestedMethod = preflight ? request.headers.get('Access-Control-Request-Method') : request.method;
+  if (!allowedApiPath(incoming.pathname) || (requestedMethod && !allowedApiRequest(incoming.pathname, requestedMethod)) || (!preflight && !requestedMethod)) {
     return errorResponse(new DesktopError('desktop.operation_unavailable', '此服务操作不属于桌面聊天接口。'), 403);
   }
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: {
     'Access-Control-Allow-Origin': 'muteki-desktop://app',
-    'Access-Control-Allow-Methods': [...METHODS].join(', '),
+    'Access-Control-Allow-Methods': [...METHODS].filter(method => allowedApiRequest(incoming.pathname, method)).join(', '),
     'Access-Control-Allow-Headers': [...REQUEST_HEADERS].join(', '),
   } });
   const headers = new Headers();
   for (const [key, value] of request.headers) if (REQUEST_HEADERS.has(key.toLowerCase())) headers.set(key, value);
+  const authSnapshot = scope.auth?.snapshot();
+  if (scope.auth) {
+    headers.delete('authorization');
+    if (authSnapshot.token) headers.set('Authorization', `Bearer ${authSnapshot.token}`);
+  }
   headers.set('Accept-Encoding', 'identity');
   const target = new URL(incoming.pathname + incoming.search, scope.origin);
   const abort = new AbortController(); scope.requests.add(abort);
@@ -75,22 +101,48 @@ async function forwardService(request, scope, onIdentity) {
   request.signal.addEventListener('abort', cancelled, { once: true });
   if (request.signal.aborted) cancelled();
   try {
-    const body = ['GET', 'HEAD'].includes(request.method) ? undefined : request.body;
+    let body = ['GET', 'HEAD'].includes(request.method) ? undefined : request.body;
+    let remember = true;
+    if (scope.auth && incoming.pathname === '/api/auth/login' && request.method === 'POST') {
+      const text = await request.text();
+      if (text.length > 8192) throw new DesktopError('desktop.auth_input', '登录请求过大。');
+      const input = JSON.parse(text);
+      remember = input.remember !== false;
+      body = JSON.stringify({ password: input.password, remember, client: 'desktop' });
+    }
     const upstream = await fetch(target, { method: request.method, headers, body,
       ...(body ? { duplex: 'half' } : {}), signal: abort.signal, redirect: 'manual' });
     if (scope.closed) throw new DesktopError('desktop.connection_changed', '服务连接已改变，请在当前工作台重试。');
     if (upstream.status >= 300 && upstream.status < 400) {
       throw new DesktopError('desktop.api_redirect', '工作台 API 返回重定向；桌面没有向重定向目标投递登录身份。', { source: 'service' });
     }
+    let authData;
     if (upstream.ok && ['/api/auth/me', '/api/auth/login'].includes(incoming.pathname)) {
-      const data = await upstream.clone().json();
-      if (typeof data.service_id === 'string' && typeof data.identity_id === 'string') onIdentity(scope, data);
+      authData = await upstream.clone().json();
+      if (typeof authData.service_id === 'string' && typeof authData.identity_id === 'string') onIdentity(scope, authData);
+      if (scope.auth && !scope.closed) {
+        if (authData.service_id !== scope.auth.serviceId) throw new DesktopError('desktop.service_identity_changed', '服务身份已改变，请重新连接当前工作台。');
+        if (incoming.pathname === '/api/auth/login') {
+          if (authSnapshot.revision !== scope.auth.revision) throw new DesktopError('desktop.auth_changed', '登录已由另一个窗口更新，请重新校验。');
+          scope.auth.accept(authData, remember, scope);
+        }
+        delete authData.token;
+        authData.persistence_warning = scope.auth.persistenceWarning;
+      }
+    }
+    if (scope.auth && (upstream.status === 401 || (upstream.ok && incoming.pathname === '/api/auth/logout')
+        || (upstream.ok && incoming.pathname === '/api/settings/access' && request.method === 'PUT'))) {
+      scope.auth.clear(authSnapshot, scope);
     }
     if (scope.closed) throw new DesktopError('desktop.connection_changed', '服务连接已经改变，请在当前工作台重新确认身份。');
     const responseHeaders = new Headers();
     for (const [key, value] of upstream.headers) if (!RESPONSE_DROP.has(key.toLowerCase())) responseHeaders.set(key, value);
     responseHeaders.set('Access-Control-Allow-Origin', 'muteki-desktop://app');
     responseHeaders.set('X-Content-Type-Options', 'nosniff');
+    if (scope.auth && authData) {
+      scope.requests.delete(abort); request.signal.removeEventListener('abort', cancelled);
+      return Response.json(authData, { status: upstream.status, headers: responseHeaders });
+    }
     // Preserve streaming and complete response bodies. Scope cancellation owns
     // the underlying request until the stream closes, not just until headers.
     const reader = upstream.body?.getReader();
@@ -121,4 +173,4 @@ function closeScope(scope) {
   for (const controller of scope.requests) controller.abort(new DesktopError('desktop.connection_changed', '服务连接已改变。'));
   scope.requests.clear();
 }
-module.exports = { DesktopError, transportError, errorResponse, allowedApiPath, probeService, forwardService, closeScope };
+module.exports = { DesktopError, transportError, errorResponse, allowedApiPath, allowedApiRequest, probeService, forwardService, closeScope };

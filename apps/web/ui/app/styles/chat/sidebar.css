@@ -26,7 +26,7 @@
   background: transparent;
   box-shadow: none;
   color: var(--cx-fg);
-  font-size: 13.5px;
+  font-size: 14px;
   font-weight: 500;
   line-height: 20px;
   cursor: pointer;
@@ -64,13 +64,19 @@
 }
 .ai-conv-sidebar.cx-sidebar .cx-sb-new kbd {
   color: var(--cx-fg-3);
-  font: 500 10.5px/1 var(--cx-font-sans);
+  font: 500 12px/1 var(--cx-font-sans);
 }
 
 /* Right-edge fade for truncated row titles (no ellipsis, like ChatGPT). */
 .cx-sb-fade {
   -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 20px), transparent);
   mask-image: linear-gradient(to right, #000 calc(100% - 20px), transparent);
+}
+
+/* Set on <html> while a sidebar row or folder is being dragged. */
+html[data-cx-sidebar-dragging],
+html[data-cx-sidebar-dragging] * {
+  cursor: grabbing !important;
 }
 
 @media (hover: none) {

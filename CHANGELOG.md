@@ -2,6 +2,33 @@
 
 All notable public release changes are tracked here.
 
+## 0.4.1 - 2026-10-09
+
+### Added
+
+- Added macOS desktop packages for Apple silicon and Intel, with an isolated local workspace, bundled Python/Node/Web runtime, and remote service connections.
+- Added shared settings for Web and desktop, including Agent accounts, model visibility, permissions, keyboard shortcuts, notifications, and appearance preferences.
+- Added provider usage and limit views, a usage ledger, notification inbox, conversation checkpoints, subagent activity, and scoped browser and computer-control tools.
+
+### Changed
+
+- Updated the CTF and penetration-testing workspaces with shared navigation, Worker extensions, evidence-backed reports, and clearer report printing and export.
+- Improved Agent compatibility, model discovery, session recovery, approvals, and process cleanup across supported runtimes.
+- Refined conversation navigation, drag-and-drop ordering, message rendering, previews, and context controls. The default Web view continues to show CTF and penetration testing; conversation and competition workspaces remain optional.
+- Release versions and default image tags now use `0.4.1` / `v0.4.1`. Container images continue to support Linux amd64 and arm64; desktop packages in this release are macOS only.
+
+### Fixed
+
+- Fixed the Web interface freezing while deleting an Agent credential and detaching its conversation and Worker references, as reported with Ubuntu container deployments ([#199](https://github.com/FishCodeTech/muteki/issues/199)).
+- Fixed desktop notification ownership, permission persistence, foreground read tracking, and controlled overlay interactions.
+- Fixed Worker settings navigation, stale draft runtime panels, local directory error feedback, and findings counts for older penetration-testing reports.
+
+### Upgrade
+
+- Use `muteki upgrade v0.4.1` or `./run.sh upgrade v0.4.1` for a managed Web installation, and add `--compose` for a container deployment. Existing `.env`, `state/`, credentials, and sessions remain outside the release bundle.
+- Download the macOS `.dmg` or `.zip` matching your Mac from the release page. Windows and Linux desktop packages are deferred.
+- The macOS packages are ad-hoc signed and are not notarized. Install desktop updates manually; the signed-candidate update flow requires a stable Developer ID signature.
+
 ## 0.4.0 - 2026-09-28
 
 ### Added

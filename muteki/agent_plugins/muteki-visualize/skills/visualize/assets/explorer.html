@@ -1,0 +1,49 @@
+<div id="muteki-explorer-example">
+  <div class="viz-controls">
+    <label class="form-label" for="muteki-explorer-selection">示例：观察范围
+      <select class="form-select" id="muteki-explorer-selection">
+        <option value="overview">整体关系</option>
+        <option value="detail">选中部分</option>
+      </select>
+    </label>
+    <button class="btn" type="button" id="muteki-explorer-followup">基于当前选择继续分析</button>
+  </div>
+  <p id="muteki-explorer-content" aria-live="polite">示例内容：显示全部关系。生成时替换为真实数据。</p>
+  <p id="muteki-explorer-error" class="text-destructive" role="alert" hidden></p>
+</div>
+<script>
+(() => {
+  const root = document.getElementById('muteki-explorer-example');
+  const select = root.querySelector('select');
+  const content = root.querySelector('#muteki-explorer-content');
+  const error = root.querySelector('#muteki-explorer-error');
+  const api = window.muteki.visualize;
+  const showError = failure => {
+    error.textContent = String(failure.message || failure);
+    error.hidden = false;
+  };
+  const render = () => {
+    content.textContent = select.value === 'detail'
+      ? '示例内容：只显示选中部分。生成时替换为真实数据。'
+      : '示例内容：显示全部关系。生成时替换为真实数据。';
+  };
+  const restore = state => {
+    const value = state?.modelContent?.scope;
+    if (value === 'overview' || value === 'detail') select.value = value;
+    render();
+  };
+  restore(api.widgetState);
+  window.addEventListener('muteki:visualization-context', event => {
+    if ('widgetState' in event.detail.globals) restore(event.detail.globals.widgetState);
+  });
+  select.addEventListener('change', () => {
+    error.hidden = true;
+    render();
+    api.setWidgetState({modelContent: {scope: select.value}, privateContent: null}).catch(showError);
+  });
+  root.querySelector('button').addEventListener('click', () => {
+    const label = select.selectedOptions[0].textContent;
+    api.requestFollowUp({prompt: `请基于图形中当前选择的“${label}”继续分析。`, title: '将选择放入输入框'}).catch(showError);
+  });
+})();
+</script>

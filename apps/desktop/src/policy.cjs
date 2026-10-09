@@ -44,8 +44,9 @@ function allowedNavigation(value, origin, { preview = false } = {}) {
   }
 }
 
-function partitionFor(origin) {
-  return `persist:muteki-${createHash('sha256').update(normalizeOrigin(origin)).digest('hex')}`;
+function partitionFor(origin, environmentId) {
+  const identity = environmentId ? `environment:${environmentId}` : normalizeOrigin(origin);
+  return `persist:muteki-${createHash('sha256').update(identity).digest('hex')}`;
 }
 
 function webPreferences(partition) {
@@ -68,12 +69,19 @@ function normalizeDesktopRoute(value) {
   if (typeof value !== 'string') throw invalid();
   let url;
   try { url = new URL(value, SHELL_URL); } catch { throw invalid(); }
-  if (url.protocol !== 'muteki-desktop:' || url.host !== 'app' || url.username || url.password || url.hash
-      || !/^\/(chat(?:\/[^/]+)?|settings(?:\/[a-z-]+)?|ctf(?:\/.*)?|pentest(?:\/.*)?|competitions(?:\/.*)?|task(?:\/.*)?|usage)?$/.test(url.pathname)) throw invalid();
+  if (url.protocol !== 'muteki-desktop:' || url.host !== 'app' || url.username || url.password
+      || !/^\/(chat(?:\/[^/]+)?|settings(?:\/[a-z-]+)?|ctf(?:\/.*)?|pentest(?:\/.*)?|competitions(?:\/.*)?|run\/[^/]+|task(?:\/.*)?|usage)?$/.test(url.pathname)) throw invalid();
   if (url.pathname.startsWith('/chat/')) {
     try { decodeURIComponent(url.pathname.split('/')[2]); } catch { throw invalid(); }
   }
   return url.pathname + url.search;
 }
 
-module.exports = { DEFAULT_ORIGIN, SHELL_URL, parseWebUrl, normalizeOrigin, normalizeDesktopRoute, sameOrigin, allowedNavigation, partitionFor, webPreferences };
+/** A hash is a transient location target, never part of shell history or saved routes. */
+function desktopNavigationTarget(value) {
+  const route = normalizeDesktopRoute(value);
+  const hash = new URL(value, SHELL_URL).hash;
+  return { route, hash };
+}
+
+module.exports = { DEFAULT_ORIGIN, SHELL_URL, parseWebUrl, normalizeOrigin, normalizeDesktopRoute, desktopNavigationTarget, sameOrigin, allowedNavigation, partitionFor, webPreferences };

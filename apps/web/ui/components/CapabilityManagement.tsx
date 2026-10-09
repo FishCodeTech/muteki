@@ -5,6 +5,7 @@ import { Button, Checkbox, ListBox, ListBoxItem, Modal, Select } from "@heroui/r
 import { EngineLogo } from "@/components/EngineLogo";
 import { Icon } from "@/components/Icon";
 import { apiFetch } from "@/lib/useRun";
+import { engineDisplayName, readyCatalog, useProviderDescriptors } from "@/lib/providerDescriptors";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -177,19 +178,6 @@ type TabKey = "threads" | "services" | "adapters" | "catalog";
 
 // ── Constants & Helpers ─────────────────────────────────────────────────────
 
-const ENGINE_NAMES: Record<string, string> = {
-  claude: "Claude Code",
-  codex: "Codex",
-  cursor: "Cursor",
-  pi: "Pi",
-  omp: "OMP",
-  kimi: "Kimi Code",
-  grok: "Grok",
-  opencode: "OpenCode",
-  devin: "Devin CLI",
-  dsh: "DeepSeek Harness",
-};
-
 const MODE_NAMES: Record<string, string> = {
   conversation: "通用对话",
   single_task: "单题模式",
@@ -272,6 +260,7 @@ function StatePill({ state }: { state: string }) {
 // ── Component ───────────────────────────────────────────────────────────────
 
 export function CapabilityManagement({ hideIntro = false }: { hideIntro?: boolean }) {
+  const descriptors = readyCatalog(useProviderDescriptors());
   const [data, setData] = useState<Overview | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -570,7 +559,7 @@ export function CapabilityManagement({ hideIntro = false }: { hideIntro?: boolea
           </div>
           <div className="cap-stat-value">
             {data?.mcp.servers.length || 0}
-            <small style={{ fontSize: 11, color: "var(--muted)", fontWeight: "normal" }}>
+            <small className="cap-stat-unit">
               个服务
             </small>
           </div>
@@ -587,7 +576,7 @@ export function CapabilityManagement({ hideIntro = false }: { hideIntro?: boolea
           </div>
           <div className="cap-stat-value">
             {data?.skills.items.length || 0}
-            <small style={{ fontSize: 11, color: "var(--muted)", fontWeight: "normal" }}>
+            <small className="cap-stat-unit">
               个能力项
             </small>
           </div>
@@ -610,7 +599,7 @@ export function CapabilityManagement({ hideIntro = false }: { hideIntro?: boolea
           </div>
           <div className="cap-stat-value">
             {stats.totalAdapters}
-            <small style={{ fontSize: 11, color: "var(--muted)", fontWeight: "normal" }}>
+            <small className="cap-stat-unit">
               类引擎
             </small>
           </div>
@@ -627,7 +616,7 @@ export function CapabilityManagement({ hideIntro = false }: { hideIntro?: boolea
           </div>
           <div className="cap-stat-value">
             {stats.totalTools}
-            <small style={{ fontSize: 11, color: "var(--muted)", fontWeight: "normal" }}>
+            <small className="cap-stat-unit">
               个工具
             </small>
           </div>
@@ -644,7 +633,7 @@ export function CapabilityManagement({ hideIntro = false }: { hideIntro?: boolea
           </div>
           <div className="cap-stat-value">
             {stats.totalThreads}
-            <small style={{ fontSize: 11, color: "var(--muted)", fontWeight: "normal" }}>
+            <small className="cap-stat-unit">
               个会话
             </small>
           </div>
@@ -773,7 +762,7 @@ export function CapabilityManagement({ hideIntro = false }: { hideIntro?: boolea
                     )}
                   </h3>
                   <div className="cap-binding-editor-badges">
-                    <span style={{ fontSize: 11, color: "var(--muted)", fontFamily: "var(--font-mono)" }}>
+                    <span className="cap-binding-editor-ids">
                       Principal: {selectedRow.principal_id} · Thread ID: {selectedRow.thread.thread_id}
                     </span>
                   </div>
@@ -846,7 +835,6 @@ export function CapabilityManagement({ hideIntro = false }: { hideIntro?: boolea
                     <Icon name="search" size={12} />
                     <input
                       className="cap-search-input"
-                      style={{ minHeight: 28, fontSize: 10.5 }}
                       value={toolSearch}
                       onChange={(e) => setToolSearch(e.target.value)}
                       placeholder="搜索工具名或描述…"
@@ -1120,7 +1108,7 @@ export function CapabilityManagement({ hideIntro = false }: { hideIntro?: boolea
                     {Object.keys(skill.engines).length > 0 && (
                       <>
                         <dt>适配引擎</dt>
-                        <dd>{Object.keys(skill.engines).map((e) => ENGINE_NAMES[e] || e).join(", ")}</dd>
+                        <dd>{Object.keys(skill.engines).map((e) => engineDisplayName(descriptors, e)).join(", ")}</dd>
                       </>
                     )}
                   </dl>
@@ -1161,12 +1149,12 @@ export function CapabilityManagement({ hideIntro = false }: { hideIntro?: boolea
                     <EngineLogo
                       engine={adapter.engine}
                       size={20}
-                      data-tooltip={ENGINE_NAMES[adapter.engine] || adapter.engine}
+                      data-tooltip={engineDisplayName(descriptors, adapter.engine)}
                     />
                   </span>
                   <div className="cap-adapter-titles">
                     <h4 className="cap-adapter-title">
-                      {ENGINE_NAMES[adapter.engine] || adapter.engine}
+                      {engineDisplayName(descriptors, adapter.engine)}
                     </h4>
                     <span className="cap-adapter-id">
                       {adapter.adapter_id}:{adapter.instance_id}
@@ -1461,7 +1449,7 @@ export function CapabilityManagement({ hideIntro = false }: { hideIntro?: boolea
       {/* Revoke Whole Binding Group Confirmation Modal */}
       <Modal isOpen={revokeOpen} onOpenChange={setRevokeOpen}>
         <Modal.Backdrop isDismissable={!saving}>
-          <Modal.Container><Modal.Dialog>
+          <Modal.Container><Modal.Dialog className="cx-settings-dialog">
           <Modal.Header className="flex flex-col gap-1">
             <Modal.Heading>撤销当前 Thread 的整组能力？</Modal.Heading>
             {selectedRow ? <small className="font-normal text-foreground-500">{selectedRow.thread.title} · Principal: {selectedRow.principal_id}</small> : null}

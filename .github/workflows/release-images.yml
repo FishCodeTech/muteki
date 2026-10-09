@@ -55,6 +55,11 @@ jobs:
           TAG="${TAG#refs/tags/}"
           TAG="${TAG//\//-}"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Check settings interface policy before release
+        run: node --test apps/desktop/test/policy.test.cjs
       - name: Build application bundle
         run: python scripts/build_release_bundle.py --version "${{ steps.version.outputs.version }}" --repository "${{ github.repository }}"
       - uses: actions/upload-artifact@v4
@@ -68,6 +73,7 @@ jobs:
 
   images:
     name: ${{ matrix.image }} (${{ matrix.target.arch }})
+    needs: bundle
     if: ${{ github.run_attempt == 1 && github.run_number <= fromJSON(vars.MUTEKI_RELEASE_LAST_RUN_NUMBER || '0') }}
     timeout-minutes: 30
     strategy:
@@ -267,6 +273,131 @@ jobs:
         with:
           name: identity-${{ matrix.image }}-${{ matrix.target.arch }}
           path: ${{ runner.temp }}/identity/*
+          if-no-files-found: error
+          retention-days: 7
+
+  desktop-macos:
+    name: Muteki Desktop macOS (${{ matrix.target.arch }})
+    needs: bundle
+    if: ${{ github.run_attempt == 1 && github.run_number <= fromJSON(vars.MUTEKI_RELEASE_LAST_RUN_NUMBER || '0') }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - arch: arm64
+            runner: macos-15
+          - arch: x64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.target.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.21.0"
+          cache: npm
+          cache-dependency-path: |
+            apps/desktop/package-lock.json
+            apps/web/ui/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.13"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Verify runner architecture
+        env:
+          EXPECTED_ARCH: ${{ matrix.target.arch }}
+        run: |
+          set -euo pipefail
+          case "$EXPECTED_ARCH:$(uname -m)" in
+            arm64:arm64|x64:x86_64) ;;
+            *) echo "Runner architecture does not match $EXPECTED_ARCH" >&2; exit 1 ;;
+          esac
+      - name: Install desktop dependencies
+        working-directory: apps/desktop
+        run: npm ci
+      - name: Install web dependencies
+        working-directory: apps/web/ui
+        run: npm ci
+      - name: Check desktop
+        working-directory: apps/desktop
+        run: |
+          npm test
+          npm run typecheck
+          npm run build
+      - name: Build relocatable desktop runtime
+        run: python scripts/build_desktop_runtime.py
+      - name: Package macOS desktop release
+        working-directory: apps/desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx electron-builder --mac dmg zip --${{ matrix.target.arch }} --publish never -c.mac.identity=-
+      - name: Verify packaged application
+        env:
+          EXPECTED_ARCH: ${{ matrix.target.arch }}
+        run: |
+          set -euo pipefail
+          app="$(find apps/desktop/dist -maxdepth 3 -name Muteki.app -print -quit)"
+          test -n "$app"
+          codesign --verify --deep --strict "$app"
+          file "$app/Contents/Resources/native/macos-speech.node"
+          case "$EXPECTED_ARCH" in
+            arm64) file "$app/Contents/Resources/runtime/node" | grep -F 'arm64' ;;
+            x64) file "$app/Contents/Resources/runtime/node" | grep -F 'x86_64' ;;
+          esac
+          test -n "$(find apps/desktop/dist -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -n "$(find apps/desktop/dist -maxdepth 1 -name '*.zip' -print -quit)"
+      - name: Run packaged desktop acceptance check
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          apps = list(Path("apps/desktop/dist").glob("mac*/Muteki.app"))
+          if len(apps) != 1:
+              raise SystemExit(f"Expected one packaged Muteki.app, found {apps!r}")
+          app = apps[0]
+          expected_version = json.loads(Path("apps/desktop/package.json").read_text())["version"]
+          profile = Path(os.environ["RUNNER_TEMP"]) / "muteki-desktop-acceptance"
+          profile.mkdir(parents=True, exist_ok=True)
+          env = os.environ.copy()
+          env["MUTEKI_DESKTOP_USER_DATA"] = str(profile / "desktop")
+          env["MUTEKI_DESKTOP_REGISTER_PROTOCOL"] = "0"
+          for key in (
+              "MUTEKI_DESKTOP_URL", "MUTEKI_ENVIRONMENT_ROOT", "MUTEKI_DESKTOP_WORKSPACE",
+              "NODE_OPTIONS", "NODE_PATH", "ELECTRON_RUN_AS_NODE", "PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV",
+          ):
+              env.pop(key, None)
+          executable = app / "Contents/MacOS/Muteki"
+          log_path = profile / "acceptance.log"
+          try:
+              with log_path.open("wb") as log:
+                  result = subprocess.run(
+                      [str(executable), "--muteki-channel=candidate", f"--muteki-environment-root={profile}", "--muteki-self-check"],
+                      stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=env, timeout=180, check=False,
+                  )
+          except subprocess.TimeoutExpired:
+              tail = log_path.read_text(errors="replace")[-12000:]
+              raise SystemExit(f"Packaged app acceptance exceeded 180 seconds\\n{tail}")
+          result_path = profile / "candidate-result.json"
+          payload = json.loads(result_path.read_text()) if result_path.exists() else {}
+          if result.returncode != 0 or payload.get("status") != "passed" or payload.get("version") != expected_version:
+              tail = log_path.read_text(errors="replace")[-12000:]
+              raise SystemExit(f"Packaged app acceptance failed (exit {result.returncode}); expected version={expected_version!r}; result={payload!r}\\n{tail}")
+          print(f"Packaged desktop acceptance passed for version {payload.get('version')}")
+          PY
+      - name: Upload macOS desktop assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-macos-${{ matrix.target.arch }}
+          path: |
+            apps/desktop/dist/*.dmg
+            apps/desktop/dist/*.zip
           if-no-files-found: error
           retention-days: 7
 
@@ -685,15 +816,21 @@ jobs:
 
   publish:
     timeout-minutes: 5
-    needs: [bundle, merge, merge-worker]
+    needs: [bundle, images, desktop-macos, merge, merge-worker]
     # Tag push only — workflow_dispatch must never create a formal GitHub Release.
-    if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.bundle.result == 'success' && needs.merge.result == 'success' && needs.merge-worker.result == 'success' }}
+    if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.bundle.result == 'success' && needs.images.result == 'success' && needs.desktop-macos.result == 'success' && needs.merge.result == 'success' && needs.merge-worker.result == 'success' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: muteki-release-bundle
           path: dist
+      - name: Download macOS desktop assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-macos-*
+          path: dist/desktop
+          merge-multiple: true
       - name: Download merged image digests
         uses: actions/download-artifact@v4
         with:
@@ -729,11 +866,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Attach bundle + image-identity so the GitHub Release lines up with GHCR digests.
+          # Attach desktop, bundle + image-identity so the GitHub Release lines up with GHCR digests.
           TAG="${{ github.ref_name }}"
           RELEASE_ARGS=(--repo "${{ github.repository }}" --verify-tag --generate-notes --title "Muteki $TAG")
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             RELEASE_ARGS+=(--prerelease)
           fi
-          gh release create "$TAG" dist/muteki-*.tar.gz dist/release-manifest.json dist/image-identity.json \
+          gh release create "$TAG" dist/muteki-*.tar.gz dist/release-manifest.json dist/image-identity.json dist/desktop/*.dmg dist/desktop/*.zip \
             "${RELEASE_ARGS[@]}"

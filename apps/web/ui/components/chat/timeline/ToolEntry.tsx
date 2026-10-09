@@ -1,13 +1,16 @@
 "use client";
 
+import { useMemo } from "react";
 import { cn } from "@/lib/cn";
 import { Icon } from "@/components/Icon";
-import { Button, Spinner } from "@/components/chat/ui";
+import { Button, ShimmerText, Spinner } from "@/components/chat/ui";
 import { languageFromPath } from "@/lib/chatHighlighter";
 import { FileDiff } from "@/components/agentui/agents/file-diff";
 import { ToolResult, ToolResultOutput, type ToolResultStatus } from "@/components/agentui/agents/tool-result";
+import { extractUrls } from "@/components/conversation/conversationSources";
 import { ActivityItem } from "./ActivityItem";
 import { LocalUrlChips } from "./LocalUrlChips";
+import { SourceChips } from "./SourceChips";
 import {
   formatToolDuration,
   toolArgSummary,
@@ -64,7 +67,7 @@ function StatusGlyph({ status }: { status: PresentableTool["status"] }) {
     case "declined":
       return <Icon name="minus" size={13} className="text-cx-warning" />;
     case "pending":
-      return <Icon name="circleDashed" size={12} className="text-cx-fg-3/55" />;
+      return <span aria-hidden="true" className="grid size-3 place-items-center"><span className="size-1.5 rounded-full bg-cx-fg-3/45" /></span>;
     default: {
       const exhaustive: never = status;
       return exhaustive;
@@ -100,6 +103,11 @@ export function ToolEntry({
   const duration = formatToolDuration(tool.durationMs);
   const running = tool.status === "running" || tool.status === "pending";
   const failed = tool.status === "failed";
+  const webSources = kind === "browser" || kind === "search";
+  const sourceUrls = useMemo(
+    () => (webSources && tool.status !== "running" ? extractUrls(`${tool.argsSummary || ""}\n${tool.outputSummary || ""}`) : []),
+    [webSources, tool.status, tool.argsSummary, tool.outputSummary],
+  );
   const urlChips = kind === "command" || kind === "browser" ? (
     <LocalUrlChips
       threadId={threadId}
@@ -117,7 +125,7 @@ export function ToolEntry({
       || ((failed || declined || tool.status === "cancelled") && tool.error ? String(tool.error) : "");
     const output = raw.length > MAX_OUTPUT_CHARS ? `${raw.slice(0, MAX_OUTPUT_CHARS)}\n…` : raw;
     return (
-      <div className="min-w-0 px-1.5" data-testid="cx-tool-entry" data-status={tool.status} data-tool-kind={kind}>
+      <div className="min-w-0 px-1.5" data-testid="cx-tool-entry" data-status={tool.status} data-tool-kind={kind} data-timeline-node>
         <ToolResult
           kind="terminal"
           icon={<Icon name={toolKindIcon(kind)} size={15} className={cn(failed ? "text-cx-danger" : "text-cx-fg-3/70")} />}
@@ -132,9 +140,9 @@ export function ToolEntry({
           className={cn(active && "rounded-lg bg-cx-selected")}
         >
           {output ? (
-            <ToolResultOutput language="text" className="text-[11.5px] leading-[1.6]">{output}</ToolResultOutput>
+            <ToolResultOutput language="text" className="text-[12px] leading-[1.6]">{output}</ToolResultOutput>
           ) : (
-            <span className="font-cx-mono text-[11.5px] text-cx-fg-3/60">{
+            <span className="font-cx-mono text-[12px] text-cx-fg-3/60">{
               running ? "等待输出…" : declined ? "未执行" : "没有输出"
             }</span>
           )}
@@ -149,7 +157,7 @@ export function ToolEntry({
     const editStat = toolEditStat(tool, kind);
     const path = editStat?.paths[0];
     return (
-      <div className="min-w-0 px-1.5" data-testid="cx-tool-entry" data-status={tool.status} data-tool-kind={kind}>
+      <div className="min-w-0 px-1.5" data-testid="cx-tool-entry" data-status={tool.status} data-tool-kind={kind} data-timeline-node>
         <FileDiff
           label={label}
           file={summary || path || tool.name}
@@ -188,12 +196,16 @@ export function ToolEntry({
             active ? "bg-cx-selected" : "hover:bg-cx-hover",
           )}
         >
-          <span className={cn("shrink-0 text-[13px] font-medium", failed ? "text-cx-danger" : "text-cx-fg/90")}>{label}</span>
+          {running ? (
+            <ShimmerText className="shrink-0 text-[13px] font-medium">{label}</ShimmerText>
+          ) : (
+            <span className={cn("shrink-0 text-[13px] font-medium", failed ? "text-cx-danger" : "text-cx-fg/90")}>{label}</span>
+          )}
           {summary ? (
-            <span className="min-w-0 truncate rounded-lg bg-cx-hover/80 px-2 py-0.5 font-cx-mono text-[11.5px] text-cx-fg-3">{summary}</span>
+            <span className="min-w-0 truncate rounded-lg bg-cx-hover/80 px-2 py-0.5 font-cx-mono text-[12px] text-cx-fg-3">{summary}</span>
           ) : null}
           <span className="flex-1" />
-          {duration ? <span className="cx-tabular shrink-0 text-[11.5px] text-cx-fg-3/55">{duration}</span> : null}
+          {duration ? <span className="cx-tabular shrink-0 text-[12px] text-cx-fg-3/55">{duration}</span> : null}
           <span className="grid size-4 shrink-0 place-items-center">
             <StatusGlyph status={tool.status} />
           </span>
@@ -210,9 +222,10 @@ export function ToolEntry({
         ) : null}
       </div>
       {failed && tool.error ? (
-        <p className="mb-1 line-clamp-2 break-words font-cx-mono text-[11.5px] leading-5 text-cx-danger">{String(tool.error)}</p>
+        <p className="mb-1 line-clamp-2 break-words font-cx-mono text-[12px] leading-5 text-cx-danger">{String(tool.error)}</p>
       ) : null}
       {urlChips}
+      <SourceChips urls={sourceUrls} className="mb-1.5 mt-0.5" />
     </ActivityItem>
   );
 }

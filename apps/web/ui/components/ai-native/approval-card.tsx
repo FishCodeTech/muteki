@@ -8,10 +8,11 @@
  * #123: path list + Diff from files[], explicit 路径/补丁缺失 empty state.
  * ───────────────────────────────────────────────────────── */
 
-import { useMemo } from "react";
+import { useMemo, type KeyboardEvent } from "react";
 import { cn } from "@/lib/cn";
 import { Icon } from "../Icon";
-import { Callout, CopyButton } from "@/components/chat/ui";
+import { Callout, CopyButton, Shortcut } from "@/components/chat/ui";
+import { isTypingTarget } from "@/lib/conversationReadingPosition";
 import { languageFromPath } from "@/lib/chatHighlighter";
 import { linesFromPatch } from "@/components/chat/timeline/toolPresentation";
 import { FileDiff } from "@/components/agentui/agents/file-diff";
@@ -101,6 +102,51 @@ export function ApprovalCard({
     </>
   ) : undefined;
 
+  // Keyboard decisions only apply while focus is inside this card, so a user
+  // typing in the composer can never approve something by accident.
+  const decidable = status === "pending" && !busy && !resolving;
+  const nativeOption = (kind: string) => nativeOptions?.find((option) => option.kind === kind);
+  const keyActions: Record<string, (() => void) | undefined> = status === "pending"
+    ? nativeOptions
+      ? {
+        y: nativeOption("allow_once") && onNativeOption ? () => onNativeOption(nativeOption("allow_once")!.option_id, "allow_once") : undefined,
+        a: nativeOption("allow_always") && onNativeOption ? () => onNativeOption(nativeOption("allow_always")!.option_id, "allow_always") : undefined,
+        n: nativeOption("reject_once") && onNativeOption ? () => onNativeOption(nativeOption("reject_once")!.option_id, "reject_once") : undefined,
+      }
+      : {
+        y: onAllow ? () => onAllow("once") : undefined,
+        n: onDeny,
+      }
+    : {};
+  const hasKeyActions = Object.values(keyActions).some(Boolean);
+  const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    // Stay focusable while a decision is in flight; just ignore keys until it settles.
+    if (!hasKeyActions || !decidable || event.nativeEvent.isComposing) return;
+    if (event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
+    if (isTypingTarget(event.target)) return;
+    const onCard = event.target === event.currentTarget;
+    const key = event.key.toLowerCase();
+    const run = key === "enter" && onCard ? keyActions.y : keyActions[key];
+    if (key === "escape" && onCard) {
+      event.currentTarget.blur();
+      return;
+    }
+    if (!run) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const card = event.currentTarget;
+    const queue = Array.from(document.querySelectorAll<HTMLElement>('[data-approval-keyboard="true"]'));
+    const next = queue[queue.indexOf(card) + 1] ?? queue.find((item) => item !== card);
+    run();
+    // Keep keyboard flow inside the approval queue once this card stops being decidable.
+    next?.focus();
+  };
+  const shortcutHints = [
+    keyActions.y ? { keys: "y", label: "批准" } : null,
+    keyActions.a ? { keys: "a", label: "记住" } : null,
+    keyActions.n ? { keys: "n", label: "拒绝" } : null,
+  ].filter((hint): hint is { keys: string; label: string } => Boolean(hint));
+
   const pathList = files.filter((f) => f.path);
   const diffFiles = useMemo(() => {
     const withRaw = files
@@ -122,7 +168,16 @@ export function ApprovalCard({
 
   return (
     <div
-      className={cn("flex w-full flex-col items-stretch", className)}
+      className={cn(
+        "group/approval relative flex w-full flex-col items-stretch rounded-2xl outline-none",
+        hasKeyActions && "focus-visible:ring-2 focus-visible:ring-cx-focus focus-visible:ring-offset-2 focus-visible:ring-offset-cx-bg",
+        className,
+      )}
+      tabIndex={hasKeyActions ? 0 : undefined}
+      onKeyDown={hasKeyActions ? handleKeyDown : undefined}
+      aria-keyshortcuts={hasKeyActions ? shortcutHints.map((hint) => hint.keys.toUpperCase()).join(" ") : undefined}
+      aria-label={hasKeyActions ? `${title}：${action}` : undefined}
+      data-approval-keyboard={hasKeyActions ? "true" : undefined}
       data-approval-id={approvalId || undefined}
       data-approval-status={status}
       data-approval-missing-paths={missingPaths ? "true" : undefined}
@@ -132,7 +187,7 @@ export function ApprovalCard({
         title={expired ? "审批已过期" : title}
         tool={
           <span className="flex min-w-0 flex-col gap-0.5">
-            <span className="whitespace-normal break-words font-cx-sans text-[13.5px] font-semibold text-cx-fg">{action}</span>
+            <span className="whitespace-normal break-words font-cx-sans text-[14px] font-semibold text-cx-fg">{action}</span>
           </span>
         }
         description={reason}
@@ -147,6 +202,19 @@ export function ApprovalCard({
         onAlwaysAllow={undefined}
         onDeny={onDeny}
         footer={expired ? "旧批准不能作用于新请求；请处理仍有效的审批项。" : undefined}
+        actionsAside={shortcutHints.length ? (
+          <span
+            className="ml-auto hidden items-center gap-2.5 text-[12px] text-cx-fg-4 opacity-0 transition-opacity group-focus-within/approval:opacity-100 sm:inline-flex"
+            data-testid="approval-shortcut-hints"
+          >
+            {shortcutHints.map((hint) => (
+              <span key={hint.keys} className="inline-flex items-center gap-1">
+                <Shortcut keys={hint.keys} tone="subtle" />
+                {hint.label}
+              </span>
+            ))}
+          </span>
+        ) : undefined}
         className={cn(
           "bg-cx-elevated",
           expired ? "opacity-75" : "border-[color-mix(in_srgb,var(--amber)_38%,transparent)] shadow-cx-md",
@@ -192,7 +260,7 @@ export function ApprovalCard({
                   <Icon name="file" size={13} className="mt-[3px] shrink-0 text-cx-fg-4" />
                   <span className="min-w-0 flex-1 break-all">{file.path}</span>
                   {file.status ? (
-                    <span className="shrink-0 rounded-md bg-cx-bg/70 px-1.5 font-cx-sans text-[11px] leading-5 text-cx-fg-3">
+                    <span className="shrink-0 rounded-md bg-cx-bg/70 px-1.5 font-cx-sans text-[12px] leading-5 text-cx-fg-3">
                       {statusLabel(file.status)}
                     </span>
                   ) : null}

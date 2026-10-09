@@ -12,6 +12,7 @@ import {
 } from "@/lib/chatHighlighter";
 import { chatPanel } from "@/lib/chatPanelStore";
 import type { DiffLineAnnotation, DiffStaging } from "@/lib/conversationDiff";
+import { useThreadEditor } from "@/components/conversation/threadEditorContext";
 import { Badge, Button, CopyButton, DiffStat, IconButton, Skeleton } from "@/components/chat/ui";
 import {
   annotationEnd,
@@ -176,6 +177,8 @@ export const FileHeader = memo(function FileHeader({
   const additions = meta.additions ?? parsed.additions;
   const deletions = meta.deletions ?? parsed.deletions;
   const threadId = ctx.threadId;
+  const editor = useThreadEditor();
+  const firstLine = parsed.hunks.find((hunk) => hunk.newCount > 0)?.newStart;
   return (
     <div
       className={cn("cx-diff-file-header group/file", sticky && "is-sticky", flash && "is-flash")}
@@ -212,8 +215,8 @@ export const FileHeader = memo(function FileHeader({
             <span className="min-w-0 truncate font-medium text-cx-fg">{name}</span>
           </span>
         </button>
-        {staging ? <Badge className="h-[18px] px-1.5 text-[10.5px]" tone={meta.staging === "untracked" ? "success" : meta.staging === "staged" ? "accent" : "neutral"}>{staging}</Badge> : null}
-        {parsed.binary || meta.binary ? <Badge className="h-[18px] px-1.5 text-[10.5px]">二进制</Badge> : null}
+        {staging ? <Badge className="h-[18px] px-1.5 text-[12px]" tone={meta.staging === "untracked" ? "success" : meta.staging === "staged" ? "accent" : "neutral"}>{staging}</Badge> : null}
+        {parsed.binary || meta.binary ? <Badge className="h-[18px] px-1.5 text-[12px]">二进制</Badge> : null}
         <DiffStat additions={additions} deletions={deletions} className="shrink-0 pl-1" />
         <div className="cx-diff-file-actions flex shrink-0 items-center opacity-0 transition-opacity duration-150 focus-within:opacity-100 group-hover/file:opacity-100">
           <CopyButton text={meta.path} label="复制路径" />
@@ -221,6 +224,15 @@ export const FileHeader = memo(function FileHeader({
             <>
               <IconButton size="xs" icon="externalLink" label="打开文件" onClick={() => chatPanel.openFile(threadId, meta.path)} />
               <IconButton size="xs" icon="folderTree" label="在文件中定位" onClick={() => chatPanel.revealInFiles(threadId, { kind: "file", path: meta.path })} />
+              {editor ? (
+                <IconButton
+                  size="xs"
+                  icon="code"
+                  label={firstLine ? `在编辑器中打开（第 ${firstLine} 行）` : "在编辑器中打开"}
+                  loading={editor.busy}
+                  onClick={() => void editor.open(meta.path, firstLine || undefined)}
+                />
+              ) : null}
             </>
           ) : null}
         </div>
@@ -241,7 +253,7 @@ export const HunkRow = memo(function HunkRow({ hunk, hidden }: { hunk: DiffHunk;
         <span className="shrink-0 text-cx-fg-4">{hunkRange(hunk.header)}</span>
         {hunk.context ? <span className="min-w-0 truncate text-cx-fg-3">{hunk.context}</span> : null}
         {hidden > 0 ? (
-          <span className="ml-auto flex shrink-0 items-center gap-1 font-cx-sans text-[11px] text-cx-fg-4">
+          <span className="ml-auto flex shrink-0 items-center gap-1 font-cx-sans text-[12px] text-cx-fg-4">
             <Icon name="foldVertical" size={11} />
             {hidden} 行未变更
           </span>
@@ -480,11 +492,11 @@ export const CommentRow = memo(function CommentRow({ annotations, ctx }: { annot
               <Icon name="messageCircle" size={11} />
             </span>
             <div className="min-w-0 flex-1">
-              <p className="flex items-center gap-1.5 text-[11px] text-cx-fg-4">
+              <p className="flex items-center gap-1.5 text-[12px] text-cx-fg-4">
                 <span>{sideLabel(annotation.side)} · {annotationRangeLabel(annotation)}</span>
-                {annotation.stale ? <Badge tone="warning" className="h-4 px-1 text-[10px]">已过期</Badge> : null}
+                {annotation.stale ? <Badge tone="warning" className="h-4 px-1 text-[12px]">已过期</Badge> : null}
               </p>
-              <p className="whitespace-pre-wrap break-words text-[12.5px] leading-[1.55] text-cx-fg">{annotation.comment}</p>
+              <p className="whitespace-pre-wrap break-words text-[13px] leading-[1.55] text-cx-fg">{annotation.comment}</p>
             </div>
             {ctx.onDeleteAnnotation ? (
               <IconButton size="xs" icon="trash" label="删除评审意见" className="opacity-60 hover:opacity-100" onClick={() => ctx.onDeleteAnnotation?.(annotation.id)} />

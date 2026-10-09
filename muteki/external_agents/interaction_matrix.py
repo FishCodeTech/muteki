@@ -1,6 +1,6 @@
 """Conversation 面向用户的交互能力矩阵（C24）。
 
-把 probe 布尔字段、降级说明和会话目录 revision 收成统一的
+把 Provider descriptor 声明基线、probe 布尔字段和会话目录 revision 收成统一的
 supported / limited / unsupported / unknown / expired 行，供菜单与正文
 控件共用；静态未探测不得显示成确定支持。
 """
@@ -12,14 +12,23 @@ from typing import Any, Literal, Optional
 from pydantic import Field
 
 from muteki.external_agents.capabilities import (
+    BOOL_CAPABILITY_FIELDS,
     SOURCE_PROBE,
-    SOURCE_REPORTED,
     SOURCE_STATIC,
     CapabilityProbeReport,
+)
+from muteki.external_agents.descriptors import (
+    AdapterDescriptor,
+    find_adapter_descriptor,
+    find_descriptor_for_adapter,
+    resolve_capabilities,
 )
 from muteki.external_agents.runtime_capabilities import RuntimeCapabilitySnapshot
 from muteki.platform.contracts.base import ContractModel
 from muteki.platform.contracts.external_agents import AgentCapabilities
+
+# Operation method of Muteki's own history rebuild (not a native rewind).
+HISTORY_REBUILD_METHOD = "muteki.history.rebuild"
 
 InteractionCapabilityLevel = Literal[
     "supported", "limited", "unsupported", "unknown", "expired",
@@ -55,6 +64,7 @@ _BOOL_KEY_MAP: dict[InteractionCapabilityKey, str] = {
     "interrupt": "interrupt",
     "approval": "approval",
     "user_input": "user_input",
+    "plan": "plan",
     "native_history": "resume",
     "fork": "fork",
 }
@@ -73,7 +83,6 @@ _DEFAULT_REASONS: dict[tuple[str, InteractionCapabilityLevel], str] = {
     ("user_input", "unknown"): "多问题能力尚未实测",
     ("plan", "unknown"): "计划能力尚未由 Runtime 确认",
     ("plan", "unsupported"): "当前 Runtime 不暴露结构化计划事件",
-    ("plan", "limited"): "仅有计划权限模式别名，尚无计划事件流",
     ("plan", "supported"): "Runtime 会上报结构化计划 / 任务进度",
     ("plan", "expired"): "计划能力探测已过期，正在刷新",
     ("native_history", "unsupported"): "切换后无法继续同一原生会话历史",
@@ -141,49 +150,60 @@ class InteractionCapabilityMatrix(ContractModel):
 def _reason_for(
     key: InteractionCapabilityKey,
     level: InteractionCapabilityLevel,
-    *,
-    explicit: str = "",
 ) -> str:
-    if explicit:
-        return explicit
     return _DEFAULT_REASONS.get((key, level), "")
 
 
 def _alternative_for(
     key: InteractionCapabilityKey,
     level: InteractionCapabilityLevel,
-    *,
-    explicit: str = "",
 ) -> str:
-    if explicit:
-        return explicit
-    if level in {"supported"}:
+    if level == "supported":
         return ""
     return _DEFAULT_ALTERNATIVES.get(key, "")
 
 
-def _bool_level(
+def _measured_level(
     *,
     value: bool,
     source: str,
     stale: bool,
+    declared_absent: bool,
 ) -> InteractionCapabilityLevel:
-    if stale:
-        return "expired" if source != SOURCE_STATIC else "unknown"
+    """Level of one boolean capability.
+
+    ``declared_absent``: the adapter descriptor declares no code path for the
+    field and nothing measured it, which is unsupported regardless of probe
+    freshness. Other static values are unverified and stay ``unknown``.
+    """
     if source == SOURCE_STATIC:
-        return "unknown"
-    if value:
-        return "supported"
-    return "unsupported"
+        return "unsupported" if declared_absent else "unknown"
+    if stale:
+        return "expired"
+    return "supported" if value else "unsupported"
 
 
-def _degradation_hint(degradations: list[str], *needles: str) -> str:
-    lowered = [str(item) for item in degradations]
-    for needle in needles:
-        for item in lowered:
-            if needle.casefold() in item.casefold():
-                return item[:240]
-    return ""
+def _resolve(
+    adapter_id: str,
+    capabilities: AgentCapabilities | None,
+    field_sources: dict[str, str] | None,
+) -> tuple[AgentCapabilities, dict[str, str], Optional[AdapterDescriptor]]:
+    """Overlay the probe on the adapter's declared baseline when it has one."""
+    adapter = find_adapter_descriptor(adapter_id)
+    descriptor = find_descriptor_for_adapter(adapter_id)
+    if adapter is None or descriptor is None:
+        caps = capabilities or AgentCapabilities(capability_source=SOURCE_STATIC)
+        overall = str(caps.capability_source or SOURCE_STATIC)
+        sources = {name: overall for name in BOOL_CAPABILITY_FIELDS}
+        sources.update(field_sources or {})
+        return caps, sources, None
+    caps, sources = resolve_capabilities(
+        descriptor,
+        capabilities,
+        adapter_id=adapter.adapter_id,
+        probe_sources=field_sources,
+    )
+    return caps, sources, adapter
 
 
 def build_interaction_matrix(
@@ -201,44 +221,44 @@ def build_interaction_matrix(
     """从 probe / 快照构造交互矩阵。
 
     规则：
-    - ``static`` 来源的 True 也最多落到 ``unknown``（未实测不宣称支持）；
-    - ``stale`` 时已有实测行降为 ``expired`` / ``unknown``；
-    - ``attachments``：``image_input`` 为假但工作区路径可用 → ``limited``。
+    - 已知 adapter 先用 Provider descriptor 的声明基线叠加 probe；
+    - ``static`` 来源的 True 最多落到 ``unknown``（未实测不宣称支持），
+      descriptor 声明没有实现路径的 False 落到 ``unsupported``；
+    - ``stale`` 时已有实测行降为 ``expired``；
+    - ``attachments``：``image_input`` 为假但工作区路径可用 → ``limited``；
+    - ``rewind``：会话目录里的 ``rewind`` operation 决定可用性，Muteki 历史
+      重建（``muteki.history.rebuild``）只算 ``limited``；
+    - probe degradations 原文进入 diagnostics，不按关键词映射到行。
     """
-    caps = capabilities or AgentCapabilities(
-        capability_source=SOURCE_STATIC,
-    )
-    sources = dict(field_sources or {})
-    degr = list(degradations or [])
-    rows: list[InteractionCapabilityRow] = []
-    overall_source = str(caps.capability_source or SOURCE_STATIC)
+    caps, sources, adapter = _resolve(adapter_id, capabilities, field_sources)
+    declared = adapter.capabilities if adapter is not None else None
 
+    def declared_absent(field_name: str) -> bool:
+        return declared is not None and not bool(getattr(declared, field_name))
+
+    def bool_row(
+        key: InteractionCapabilityKey, field_name: str,
+    ) -> tuple[InteractionCapabilityLevel, str]:
+        source = sources.get(field_name, SOURCE_STATIC)
+        level = _measured_level(
+            value=bool(getattr(caps, field_name)),
+            source=source,
+            stale=stale,
+            declared_absent=declared_absent(field_name),
+        )
+        return level, source
+
+    rows: list[InteractionCapabilityRow] = []
     for key in _MATRIX_KEYS:
         if key == "attachments":
-            image_source = sources.get("image_input", overall_source)
-            image_value = bool(caps.image_input)
-            if stale and image_source != SOURCE_STATIC:
-                level: InteractionCapabilityLevel = "expired"
-                source = image_source
-            elif image_source == SOURCE_STATIC:
-                level = "unknown"
-                source = SOURCE_STATIC
-            elif image_value:
-                level = "supported"
-                source = image_source
-            else:
+            level, source = bool_row(key, "image_input")
+            if level == "unsupported":
                 # Conversation 仍可把附件落到工作区路径（C03）。
                 level = "limited"
-                source = image_source
-            reason = _reason_for(
-                key,
-                level,
-                explicit=_degradation_hint(degr, "image", "attachment", "multimodal"),
-            )
             rows.append(InteractionCapabilityRow(
                 key=key,
                 level=level,
-                reason=reason,
+                reason=_reason_for(key, level),
                 alternative=_alternative_for(key, level),
                 source=source,
                 invocable=level in {"supported", "limited"},
@@ -271,61 +291,27 @@ def build_interaction_matrix(
             ))
             continue
 
-        if key == "plan":
-            # Prefer first-class AgentCapabilities.plan (C20). Permission-mode
-            # aliases like "plan"/"architect" only count as limited.
-            modes = {
-                str(item).casefold()
-                for item in (caps.permission_modes or caps.access_modes or [])
-            }
-            plan_mode = "plan" in modes or "architect" in modes
-            source = sources.get("plan") or sources.get(
-                "permission_modes") or sources.get(
-                "access_modes", overall_source)
-            if stale and source != SOURCE_STATIC:
-                level = "expired"
-            elif caps.plan:
-                level = "supported"
-                source = sources.get("plan", overall_source)
-            elif source == SOURCE_STATIC and not plan_mode:
-                level = "unknown"
-            elif sources.get("plan") in {SOURCE_PROBE, SOURCE_REPORTED} and not caps.plan:
-                level = "unsupported"
-            elif plan_mode:
-                level = "limited"
-            else:
-                level = "unknown"
-            rows.append(InteractionCapabilityRow(
-                key=key,
-                level=level,
-                reason=_reason_for(key, level),
-                alternative=_alternative_for(key, level),
-                source=source,
-                invocable=level == "supported",
-            ))
-            continue
-
         if key == "rewind":
-            has_op = False
+            operation = None
             if snapshot is not None:
-                has_op = any(
-                    item.kind == "operation"
-                    and item.name.casefold() in {"rewind", "native_fallback", "rollback"}
+                operation = next((
+                    item for item in snapshot.items
+                    if item.kind == "operation"
+                    and item.name == "rewind"
                     and item.verification == "verified"
-                    for item in snapshot.items
-                )
-            if stale:
-                level = "expired" if has_op else "unknown"
-                source = SOURCE_PROBE if has_op else SOURCE_STATIC
-            elif has_op:
-                level = "limited" if any(
-                    item.name == "rewind" and item.invocation.get("method") == "muteki.history.rebuild"
-                    for item in snapshot.items
-                ) else "supported"
-                source = SOURCE_PROBE
-            else:
+                ), None)
+            if operation is None:
                 level = "unknown"
                 source = SOURCE_STATIC
+            elif stale:
+                level = "expired"
+                source = SOURCE_PROBE
+            elif operation.invocation.get("method") == HISTORY_REBUILD_METHOD:
+                level = "limited"
+                source = SOURCE_PROBE
+            else:
+                level = "supported"
+                source = SOURCE_PROBE
             rows.append(InteractionCapabilityRow(
                 key=key,
                 level=level,
@@ -338,37 +324,23 @@ def build_interaction_matrix(
             continue
 
         field_name = _BOOL_KEY_MAP[key]
-        source = sources.get(field_name, overall_source)
-        raw_value = bool(getattr(caps, field_name, False))
-        # 静态来源即使 True 也不得标成 supported。
-        if source == SOURCE_STATIC and raw_value:
-            level = "unknown"
-        else:
-            level = _bool_level(value=raw_value, source=source, stale=stale)
-        reason = _reason_for(
-            key,
-            level,
-            explicit=_degradation_hint(degr, field_name, key),
-        )
+        level, source = bool_row(key, field_name)
         alternative = _alternative_for(key, level)
-        if key == "steer" and level in {"unsupported", "expired", "unknown"}:
-            interrupt_level = _bool_level(
-                value=bool(caps.interrupt),
-                source=sources.get("interrupt", overall_source),
-                stale=stale,
-            )
+        if key == "steer" and level != "supported":
+            interrupt_level, _ = bool_row("interrupt", "interrupt")
             if interrupt_level == "supported":
                 alternative = "可使用停止执行中断当前回合，再发送新消息"
         rows.append(InteractionCapabilityRow(
             key=key,
             level=level,
-            reason=reason,
+            reason=_reason_for(key, level),
             alternative=alternative,
             source=source,
             invocable=level == "supported",
         ))
 
     diag = list(diagnostics or [])
+    diag.extend(str(item) for item in degradations or [])
     if stale:
         diag.append("交互能力矩阵已过期，正在刷新；请勿把过期项当作确定支持")
     return InteractionCapabilityMatrix(
