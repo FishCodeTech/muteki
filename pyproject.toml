@@ -23,6 +23,10 @@ dependencies = [
     "numpy>=2.4.6",
     "scipy>=1.17.1",
     "magika>=1.0.3",
+    # Keep Python 3.13 Intel macOS on the last ORT release with an x86_64 wheel.
+    "onnxruntime==1.23.2; python_version == '3.13' and sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    # This floor forces a separate uv lock fork while allowing future upgrades elsewhere.
+    "onnxruntime>=1.26.0; python_version == '3.13' and (sys_platform != 'darwin' or platform_machine != 'x86_64')",
     "scapy>=2.7.0",
     "pyzbar>=0.1.9",
     "zxing-cpp>=3.0.0",
