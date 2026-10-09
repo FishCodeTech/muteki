@@ -43,6 +43,15 @@ if (updateJournal) {
 const patchUpdate = patch => writeUpdateJournal(updateJournal, { ...JSON.parse(fs.readFileSync(updateJournal, 'utf8')), ...patch });
 let desktopUpdates, applyUpdate = false, quitApproved = false;
 let managedService;
+function updatesController() {
+  if (!desktopUpdates) {
+    const {DesktopUpdates} = require('./updates.cjs');
+    desktopUpdates = new DesktopUpdates(app, environment, status => {
+      for (const record of windows.values()) if (!record.window.isDestroyed()) record.window.webContents.send('desktop:update-status', status);
+    });
+  }
+  return desktopUpdates;
+}
 function managedRuntime() {
   if (!managedService) {
     managedService = new ManagedService(environment, runtimePaths({ packaged: app.isPackaged && buildChannel !== 'dev', resources: process.resourcesPath, workspace }));
@@ -989,6 +998,30 @@ function installIPC() {
     catch (error) { return { ok: false, error: transportError(error) }; }
   });
   handle('desktop:state', record => ({ ...record.state })); handle('desktop:connect', connect);
+  handle('desktop:update-status', () => updatesController().getStatus());
+  handle('desktop:update-check', () => updatesController().check());
+  handle('desktop:update-install', async () => {
+    const controller = updatesController();
+    if (preparingUpdate) throw new DesktopError('update.busy', '更新流程正在进行中。');
+    preparingUpdate = true;
+    try {
+      const ready = await controller.download();
+      if (ready.state !== 'ready') return ready;
+      const { response } = await dialog.showMessageBox({
+        type: 'question',
+        message: text(`版本 ${ready.latestVersion} 已验证，可以安装`, `Version ${ready.latestVersion} is verified and ready to install`),
+        detail: text('安装会等待当前任务结束、保存草稿并重启。日常数据将先备份。', 'Installation saves drafts, waits for active work to finish, backs up daily data, and restarts.'),
+        buttons: [text('稍后', 'Later'), text('应用更新', 'Install update')],
+        defaultId: 0,
+        cancelId: 0,
+      });
+      if (response !== 1) return controller.publish({ state: 'ready', message: '更新包已验证。' });
+      await applyPreparedUpdate();
+      return controller.publish({ state: 'installing', message: '正在退出并安装更新。' });
+    } finally {
+      preparingUpdate = false;
+    }
+  });
   handle('desktop:connect-local', connectLocal);
   handle('desktop:configure', record => { disposePreview(record); record.remote?.setVisible(false); emit(record, { configuring: true }); });
   handle('desktop:resume', record => { if (record.scope && (!record.scope.closed || record.state.draftRecovery)) { record.remote?.setVisible(true); emit(record, { configuring: false }); } });
@@ -1187,27 +1220,34 @@ async function installCandidate() {
   try {
     const picked = await dialog.showOpenDialog({title: text('选择已构建的 Muteki 候选应用', 'Select a built Muteki candidate'), properties: ['openFile'], filters: [{name: 'Muteki', extensions: ['app']}]});
     if (picked.canceled || picked.filePaths.length !== 1) return;
-    const { DesktopUpdates } = require('./updates.cjs');
-    desktopUpdates = new DesktopUpdates(app, environment);
+    desktopUpdates = updatesController();
     const prepared = await desktopUpdates.prepare(picked.filePaths[0]);
     app.setAsDefaultProtocolClient('muteki');
     const {response} = await dialog.showMessageBox({type: 'question', message: text(`候选版本 ${prepared.version} 已通过启动验收`, `Candidate ${prepared.version} passed startup acceptance`), detail: text('应用更新会等待当前任务结束、保存草稿并重启。日常数据将先备份，开发数据不会导入。', 'The update saves drafts and restarts after current tasks finish. Daily data is backed up; development data is not imported.'), buttons: [text('稍后', 'Later'), text('应用更新', 'Apply update')], defaultId: 0, cancelId: 0});
-    if (response !== 1) return;
-    const records = [...windows.values()];
-    try {
-      for (const record of records) {
-        record.window.hide();
-        const saved = await persistenceBarrier(record, 'update');
-        if (!saved.persisted) throw new Error(saved.error || '草稿未保存，更新已暂停。');
-      }
-      if (managedService?.ready) await managedService.drain();
-      for (const record of records) record.allowClose = true;
-      applyUpdate = true; quitApproved = true; app.quit();
-    } catch (error) {
-      for (const record of records) if (!record.window.isDestroyed()) record.window.show();
-      throw error;
+    if (response !== 1) {
+      desktopUpdates.discardPreparedLocal();
+      return;
     }
+    await applyPreparedUpdate();
   } finally { preparingUpdate = false; }
+}
+async function applyPreparedUpdate() {
+  const records = [...windows.values()];
+  try {
+    for (const record of records) {
+      record.window.hide();
+      const saved = await persistenceBarrier(record, 'update');
+      if (!saved.persisted) throw new Error(saved.error || '草稿未保存，更新已暂停。');
+    }
+    if (managedService?.ready) await managedService.drain();
+    for (const record of records) record.allowClose = true;
+    applyUpdate = true;
+    quitApproved = true;
+    app.quit();
+  } catch (error) {
+    for (const record of records) if (!record.window.isDestroyed()) record.window.show();
+    throw error;
+  }
 }
 async function deepLink(value) {
   let url;

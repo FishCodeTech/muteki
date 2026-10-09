@@ -8,7 +8,8 @@ import { Icon, type IconName } from "@/components/Icon";
 import { EngineLogo } from "@/components/EngineLogo";
 import { ModelTestTerminal } from "@/components/ModelTestTerminal";
 import { NumberField } from "@/components/NumberField";
-import { PlatformUpdate } from "@/components/PlatformUpdate";
+import { RetentionSettings } from "@/components/RetentionSettings";
+import { SettingsPage } from "@/components/settings/primitives";
 import {
   type GlobalCredential,
   type ModelEndpoint,
@@ -57,8 +58,8 @@ type Seat = NonNullable<WorkerSettings["seats"]>[number];
 type Credential = NonNullable<WorkerSettings["credentials"]>[number];
 type ReviewPolicy = NonNullable<WorkerSettings["stage_policy"]["coordinator"]["review"]>;
 type VerifierPolicy = NonNullable<WorkerSettings["stage_policy"]["coordinator"]["verifier"]>;
-type SettingsSection = "roster" | "credentials" | "runtime" | "scheduling" | "models" | "system";
-const WORKER_SECTIONS: SettingsSection[] = ["roster", "credentials", "runtime", "system", "scheduling", "models"];
+type SettingsSection = "roster" | "credentials" | "runtime" | "scheduling" | "models" | "retention";
+const WORKER_SECTIONS: SettingsSection[] = ["roster", "credentials", "runtime", "scheduling", "models", "retention"];
 function isWorkerSection(value: string): value is SettingsSection {
   return WORKER_SECTIONS.includes(value as SettingsSection);
 }
@@ -1738,6 +1739,10 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
     const params = new URLSearchParams(window.location.search);
     const requested = (params.get("section") || params.get("tab") || window.location.hash.replace(/^#/, "")).trim();
     if (!requested) return;
+    if (requested === "system") {
+      window.location.replace("/settings/update");
+      return;
+    }
     if (requested === "appearance") {
       window.location.replace("/settings/appearance");
       return;
@@ -2352,7 +2357,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
     { id: "runtime", label: "运行环境", icon: "terminal" },
     { id: "scheduling", label: "调度与预算", icon: "gear" },
     { id: "models", label: "推理模型", icon: "sparkles" },
-    { id: "system", label: "系统更新", icon: "refresh" },
+    { id: "retention", label: "任务保留", icon: "archive" },
   ];
   const refreshCredentials = (action?: "save" | "import" | "create" | "delete") => {
     void getGlobalCredentials().then((rows) => {
@@ -2374,7 +2379,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
     runtime: "运行环境",
     scheduling: "调度与预算",
     models: "推理模型",
-    system: "系统更新",
+    retention: "任务保留",
   };
 
   if (!config) return (
@@ -2419,7 +2424,7 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
       </aside>
 
       <main className="wsettings-main">
-        <header className="wsettings-topbar"><div><h1>{titles[section]}</h1></div>{section === "system" ? <Chip size="sm" variant="soft" color="default" className="wsettings-draft">稳定通道</Chip> : section === "credentials" ? null : <><Chip size="sm" variant="soft" color={dirty ? "warning" : "default"} className={`wsettings-draft${dirty ? " dirty" : ""}`}>{dirty ? "未保存" : "已保存"}</Chip><div className="wsettings-top-actions"><Button type="button" size="sm" variant="primary" onClick={save} isDisabled={!dirty || saveState === "saving"}><Icon name="check" size={14} />{saveState === "saving" ? "保存中…" : "保存配置"}</Button></div></>}</header>
+        {section === "retention" || section === "credentials" ? null : <header className="wsettings-topbar"><div><h1>{titles[section]}</h1></div><Chip size="sm" variant="soft" color={dirty ? "warning" : "default"} className={`wsettings-draft${dirty ? " dirty" : ""}`}>{dirty ? "未保存" : "已保存"}</Chip><div className="wsettings-top-actions"><Button type="button" size="sm" variant="primary" onClick={save} isDisabled={!dirty || saveState === "saving"}><Icon name="check" size={14} />{saveState === "saving" ? "保存中…" : "保存配置"}</Button></div></header>}
 
         <div className="wsettings-content">
           {section === "roster" ? <div className="wsettings-orchestration" data-inspector-open={mobileInspectorOpen}>
@@ -2431,11 +2436,11 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
                 : <SeatInspector seat={selectedSeat && isOrdinarySeat(selectedSeat) ? selectedSeat : null} credentials={credentials} availableCredentials={availableCredentials} models={models} backend={backend} health={selectedSeat ? health[selectedSeat.id] : undefined} testing={selectedSeat ? testingIds.has(selectedSeat.id) : false} testResult={selectedSeat ? testResults[selectedSeat.id] || null : null} onUpdate={(patch) => selectedSeat && updateSeat(selectedSeat.id, patch)} onEngine={(engine) => selectedSeat && changeEngine(selectedSeat.id, engine)} onAccount={(key, globalCredential) => selectedSeat && bindAccount(selectedSeat.id, key, globalCredential)} onDiscoverModels={refreshWorkerModels} discoveringModels={discoveringModels} onDuplicate={() => selectedSeat && duplicateSeat(selectedSeat.id)} onDelete={() => selectedSeat && deleteSeat(selectedSeat.id)} onTest={() => selectedSeat && void testSeat(selectedSeat)} />}
             </div>
           </div>
-            : section === "credentials" ? <div className="wsettings-credentials"><TaskCredentialManager taskSettings onCredentialsChanged={refreshCredentials} /></div>
+            : section === "credentials" ? <div className="wsettings-credentials cx-root cx-settings-content"><SettingsPage wide title="Agent 凭据" description="管理做题 Worker 使用的 Agent 引擎、凭据、运行配置和模型。"><TaskCredentialManager taskSettings onCredentialsChanged={refreshCredentials} /></SettingsPage></div>
             : section === "runtime" ? <RuntimeWorkspace backend={backend} network={network} effectiveNetwork={effectiveNetwork} networkError={networkError} containerScope={containerScope} workerPrivilege={workerPrivilege} vpnEnabled={vpnEnabled} vpnStatus={vpnStatus} vpnUploading={vpnUploading} seatCount={seats.length} imageStatus={imageStatus} imageLoading={imageLoading} pulling={pullingImage} inContainer={inContainer} onBackend={(next) => { setBackend(next); setTestResults({}); markDirty(); if (next === "container" && !imageStatus) void refreshImage(); }} onNetwork={(next) => { setNetwork(next); setTestResults({}); markDirty(); }} onContainerScope={(next) => { setContainerScope(next); markDirty(); }} onWorkerPrivilege={(next) => { setWorkerPrivilege(next); markDirty(); }} onVpnEnabled={(next) => { setVpnEnabled(next); markDirty(); }} onVpnUpload={(file) => { setVpnUploading(true); void uploadOpenVpnConfig(file).then((status) => { setVpnStatus(status); setVpnEnabled(true); markDirty(); showFeedback("OpenVPN 配置已上传"); }).catch((error) => showFeedback(`上传失败：${error instanceof Error ? error.message : String(error)}`)).finally(() => setVpnUploading(false)); }} onRefreshImage={() => void refreshImage()} onPullImage={() => void pullImage()} />
                 : section === "scheduling" ? <SchedulingWorkspace config={config} raceTimeout={raceTimeout} dispatchMode={dispatchMode} startWorkers={startWorkers} maxTotal={maxTotal} wallClock={wallClock} costBudget={costBudget} maxWorkers={maxWorkers} onChange={(patch) => { if (patch.raceTimeout !== undefined) setRaceTimeout(patch.raceTimeout); if (patch.dispatchMode !== undefined) setDispatchMode(patch.dispatchMode); if (patch.startWorkers !== undefined) setStartWorkers(patch.startWorkers); if (patch.maxTotal !== undefined) setMaxTotal(patch.maxTotal); if (patch.wallClock !== undefined) setWallClock(patch.wallClock); if (patch.costBudget !== undefined) setCostBudget(patch.costBudget); markDirty(); }} />
                   : section === "models" ? <ModelsWorkspace value={llmProfiles} endpoints={modelEndpoints} onChange={(next) => { setLlmProfiles(next); markDirty(); }} onEndpointSaved={(endpoint) => setModelEndpoints((current) => [...current.filter((item) => item.id !== endpoint.id), endpoint])} />
-                    : <PlatformUpdate />}
+                    : <RetentionSettings mode={pathname.startsWith("/pentest") ? "pentest" : "ctf"} />}
         </div>
         {feedback ? <div className="wsettings-feedback"><Icon name={saveState === "error" ? "alert" : "check"} size={14} />{feedback}</div> : null}
       </main>

@@ -83,6 +83,8 @@ class RunManager:
         self._control_submit_locks: dict[str, asyncio.Lock] = {}
         self._seq = 0
         self.meta = RunMetaStore(root=self.state_root)
+        self.retention_policies = _run_retention.RunRetentionPolicyStore(
+            self.state_root)
         self.run_summaries = RunSummaryStore(root=self.state_root)
         # CORE-04: binding key → run_id 的幂等索引，重启后可恢复。
         self.bound_runs = BoundRunStore(root=self.state_root)

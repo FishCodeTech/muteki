@@ -95,11 +95,11 @@ tsecbench 托管模式下+deepseek-flash，排名13
 
 ## 版本更新
 
-当前版本为 **0.4.1**。新增功能、行为变化、移除内容及升级说明见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本为 **0.4.2**。新增功能、行为变化、移除内容及升级说明见 [CHANGELOG.md](CHANGELOG.md)。
 
-[0.4.1 发布页](https://github.com/FishCodeTech/muteki/releases/tag/v0.4.1) 提供 Apple 芯片和 Intel Mac 的 macOS 客户端，内置本地服务，也可连接远程 Muteki 服务。本次暂不提供 Windows、Linux 桌面安装包，Web 和容器部署继续支持。
+[0.4.2 发布页](https://github.com/FishCodeTech/muteki/releases/tag/v0.4.2) 提供 Apple 芯片和 Intel Mac 的 macOS 客户端，内置本地服务，也可连接远程 Muteki 服务。本次不提供 Windows、Linux 桌面安装包，Web 和容器部署继续支持。
 
-本次 macOS 安装包使用临时签名，尚未公证。桌面更新请手动安装；应用内候选版本更新流程需要稳定的 Developer ID 签名。
+本次 macOS 安装包使用临时签名，尚未公证。已发布的 0.4.1 桌面版没有应用内更新界面，需要先手动安装一次 0.4.2。0.4.2 可在全局设置中检查并安装官方版本，安装前会校验 GitHub SHA-256 和严格签名。本地候选版本更新需要稳定的 Developer ID 签名。
 
 ---
 
@@ -319,7 +319,7 @@ MUTEKI_WEB_PASSWORD='请替换为强密码' \
 ```bash
 ./run.sh upgrade --check   # 检查稳定版
 ./run.sh install            # 安装托管版本
-muteki upgrade v0.4.1      # 更新到本次版本
+muteki upgrade v0.4.2      # 更新到本次版本
 muteki rollback            # 回滚到上一个已安装版本
 muteki version             # 查看版本与安装形态
 ```

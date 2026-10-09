@@ -74,11 +74,11 @@ After a month of engineering work, tuning, and fixes, Muteki is open source with
 
 ## Release notes
 
-The current version is **0.4.1**. See [CHANGELOG.md](CHANGELOG.md) for new features, behavior changes, removals, and upgrade notes.
+The current version is **0.4.2**. See [CHANGELOG.md](CHANGELOG.md) for new features, behavior changes, removals, and upgrade notes.
 
-The [0.4.1 release](https://github.com/FishCodeTech/muteki/releases/tag/v0.4.1) includes a macOS desktop app for Apple silicon and Intel, with a bundled local service and support for remote Muteki services. Windows and Linux desktop packages are not included in this release. Web and container deployments remain available.
+The [0.4.2 release](https://github.com/FishCodeTech/muteki/releases/tag/v0.4.2) includes a macOS desktop app for Apple silicon and Intel, with a bundled local service and support for remote Muteki services. Windows and Linux desktop packages are not included. Web and container deployments remain available.
 
-The macOS packages are ad-hoc signed and are not notarized. Install desktop updates manually; the in-app signed-candidate update flow requires a stable Developer ID signature.
+The macOS packages are ad-hoc signed and are not notarized. Published 0.4.1 desktop installs need a manual first install of 0.4.2 because they do not include the update screen. In 0.4.2, global settings can check and install official releases after GitHub SHA-256 and strict signature verification. Local candidate updates require a stable Developer ID signature.
 
 ---
 
@@ -295,7 +295,7 @@ The UI remains at `http://localhost:3001` by default. `MUTEKI_HOST_DATA_ROOT` mu
 ```bash
 ./run.sh upgrade --check   # Check the latest stable release
 ./run.sh install            # Set up a managed installation
-muteki upgrade v0.4.1       # Install this release
+muteki upgrade v0.4.2       # Install this release
 muteki rollback             # Return to the previous installed release
 muteki version              # Show version and installation kind
 ```

@@ -110,12 +110,23 @@ test('desktop environment identity persists and runtime inheritance is explicit'
     assert.equal(first.id, second.id);
     assert.notEqual(first.generation, second.generation);
     assert.throws(() => desktopEnvironment({...options, channel: 'candidate'}));
-    const env = serviceEnvironment(first, {PYTHONPATH: '/checkout', NODE_OPTIONS: '--inspect', MUTEKI_STATE_ROOT: '/wrong', OPENAI_API_KEY: 'fixture', LANG: 'en_US.UTF-8'});
+    const host = path.join(root, 'host');
+    fs.mkdirSync(path.join(host, '.nvm', 'versions', 'node', 'v99.1.0', 'bin'), {recursive: true});
+    const env = serviceEnvironment(first, {HOME: host, PATH: '/host/path', PYTHONPATH: '/checkout', NODE_OPTIONS: '--inspect', MUTEKI_STATE_ROOT: '/wrong', OPENAI_API_KEY: 'fixture', LANG: 'en_US.UTF-8'});
     for (const name of ['PYTHONPATH', 'NODE_OPTIONS', 'OPENAI_API_KEY']) assert.equal(env[name], undefined);
     assert.equal(env.MUTEKI_STATE_ROOT, first.paths.state);
-    assert.equal(env.MUTEKI_HOST_DISCOVERY, '0');
-    assert.equal(env.HOME, first.paths.home);
+    assert.equal(env.MUTEKI_HOST_DISCOVERY, '1');
+    assert.equal(env.HOME, host);
+    assert.ok(env.PATH.split(path.delimiter).includes('/host/path'));
+    assert.ok(env.PATH.split(path.delimiter).includes(path.join(host, '.nvm', 'versions', 'node', 'v99.1.0', 'bin')));
     assert.equal(env.LANG, 'en_US.UTF-8');
+    const candidate = desktopEnvironment({...options, root: path.join(root, 'candidate'), channel: 'candidate'});
+    const candidateEnv = serviceEnvironment(candidate, {HOME: host, PATH: '/host/path', OPENAI_API_KEY: 'fixture', MUTEKI_HOST_DISCOVERY: '1'});
+    assert.equal(candidateEnv.HOME, candidate.paths.home);
+    assert.equal(candidateEnv.MUTEKI_HOST_DISCOVERY, '0');
+    assert.ok(!candidateEnv.PATH.split(path.delimiter).includes('/host/path'));
+    assert.ok(!candidateEnv.PATH.includes(path.join(host, '.nvm')));
+    assert.equal(candidateEnv.OPENAI_API_KEY, undefined);
   } finally { fs.rmSync(root, {recursive: true, force: true}); }
 });
 

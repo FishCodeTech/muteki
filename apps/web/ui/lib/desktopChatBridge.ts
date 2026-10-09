@@ -44,6 +44,14 @@ export interface DesktopWorkspaceGrant {
   host: "desktop-client"; mapping: "user-selected";
 }
 
+export interface DesktopUpdateStatus {
+  state: "idle" | "checking" | "current" | "available" | "downloading" | "validating" | "ready" | "installing" | "error";
+  currentVersion: string; latestVersion?: string; progress?: number; message?: string;
+  error?: { code: string; message: string }; canInstall?: boolean; installReason?: string;
+  checkedAt?: string; releaseUrl?: string;
+  lastInstall?: { state: "complete" | "failed"; version: string; at: string; message: string; code?: string };
+}
+
 /** Provider-driven operation on the thread's native preview (see apps/desktop main.cjs). */
 export type DesktopBrowserControlInput = { threadId: string; timeoutMs: number } & DesktopBrowserAction;
 export type DesktopBrowserAction = (
@@ -83,6 +91,8 @@ export interface DesktopPickedElement {
 }
 
 export interface DesktopChatBridge {
+  updates?: { getStatus: () => Promise<DesktopUpdateStatus>; check: () => Promise<DesktopUpdateStatus>; install: () => Promise<DesktopUpdateStatus>; onStatus: (callback: (status: DesktopUpdateStatus) => void) => () => void };
+  openExternal?: (url: string) => Promise<unknown>;
   createVisualization?: (input: { threadId: string; html: string }) => Promise<{ id: string; url: string }>;
   releaseVisualization?: (id: string) => Promise<unknown>;
   removeAttachment?: (input: { id: string; draftId: string }) => Promise<unknown>;
