@@ -1,3 +1,4 @@
+import { readUiPreference, writeUiPreferences, subscribeUiPreferences } from "./uiPreferences";
 import { conversationStorageKey, subscribeConversationStorageScope } from "./conversationStorageScope";
 /**
  * C39: conversation reading preferences (font scale, density, content width).
@@ -23,15 +24,17 @@ export const DEFAULT_CONVERSATION_READING_PREFS: ConversationReadingPrefs = {
 };
 
 const FONT_SCALE_PX: Record<ConversationFontScale, string> = {
-  sm: "12.5px",
-  md: "13.5px",
-  lg: "15.5px",
+  sm: "14px",
+  md: "15px",
+  lg: "17px",
 };
 
 const CONTENT_WIDTH_PX: Record<ConversationContentWidth, { chat: string; composer: string }> = {
-  narrow: { chat: "640px", composer: "680px" },
-  default: { chat: "748px", composer: "780px" },
-  wide: { chat: "960px", composer: "1000px" },
+  // The composer card is 16px narrower per side than the reading column's outer
+  // edge so its inner padding lines the input text up with message text.
+  narrow: { chat: "672px", composer: "656px" },
+  default: { chat: "768px", composer: "752px" },
+  wide: { chat: "960px", composer: "944px" },
 };
 
 type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem">;
@@ -69,6 +72,7 @@ export function __resetConversationReadingPrefsForTests(storage?: StorageLike | 
 }
 
 export function readConversationReadingPrefs(): ConversationReadingPrefs {
+  if (!storageOverride) return {fontScale: readUiPreference("readingFontScale", "md"), density: readUiPreference("readingDensity", "comfortable"), contentWidth: readUiPreference("readingContentWidth", "default")};
   if (dirty) return { ...memoryPrefs };
   const storage = getStorage();
   if (!storage) return { ...memoryPrefs };
@@ -85,6 +89,10 @@ export function writeConversationReadingPrefs(
   patch: Partial<ConversationReadingPrefs>,
 ): ConversationReadingPrefs {
   const next = normalizePrefs({ ...readConversationReadingPrefs(), ...patch });
+  if (!storageOverride) {
+    writeUiPreferences({...(patch.fontScale !== undefined ? {readingFontScale: patch.fontScale} : {}), ...(patch.density !== undefined ? {readingDensity: patch.density} : {}), ...(patch.contentWidth !== undefined ? {readingContentWidth: patch.contentWidth} : {})});
+    return next;
+  }
   memoryPrefs = next; dirty = true;
   const storage = getStorage();
   if (storage) {
@@ -123,6 +131,7 @@ export function conversationReadingCssVars(
   const width = CONTENT_WIDTH_PX[prefs.contentWidth];
   return {
     "--conv-fs-body": FONT_SCALE_PX[prefs.fontScale],
+    "--cx-msg-fs": FONT_SCALE_PX[prefs.fontScale],
     "--dsh-chat-content-width": width.chat,
     "--dsh-composer-card-max-width": width.composer,
   };
@@ -151,3 +160,5 @@ export function runtimeIdentityKey(runtime: {
 }
 
 subscribeConversationStorageScope(() => { memoryPrefs = { ...DEFAULT_CONVERSATION_READING_PREFS }; dirty = false; for (const listener of listeners) listener({ ...memoryPrefs }); });
+
+subscribeUiPreferences(() => { for (const listener of listeners) listener(readConversationReadingPrefs()); });

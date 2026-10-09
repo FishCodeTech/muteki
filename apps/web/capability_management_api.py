@@ -36,6 +36,7 @@ from muteki.platform.contracts.capabilities import (
 from muteki.platform.contracts.objects import AgentSession, Thread
 from muteki.platform.contracts.base import new_id
 from muteki.platform.store import PlatformStore
+from muteki.conversation.computer_control import server_status as computer_server_status
 from muteki.capability_management import (
     enabled as capability_resource_enabled,
     set_enabled as set_capability_resource_enabled,
@@ -403,6 +404,8 @@ def create_capability_management_router(
             and _grant_state(item) == "active"
         )
         mcp_enabled = capability_resource_enabled("mcp", "muteki-control")
+        computer_enabled = capability_resource_enabled("mcp", "computer-use")
+        computer_status = computer_server_status()
         blackboard_enabled = capability_resource_enabled(
             "skills", "muteki-blackboard")
         browser_enabled = capability_resource_enabled("skills", "agent-browser")
@@ -438,6 +441,20 @@ def create_capability_management_router(
                     "endpoint": "/api/capability",
                     "protocol_version": "2026-07-28",
                     "tools": len(tools),
+                    "active_grants": active_mcp,
+                    "lifecycle": "new_sessions",
+                }, {
+                    "id": "computer-use",
+                    "name": "聊天电脑操控（本机 Mac · Codex Computer Use）",
+                    "enabled": computer_enabled,
+                    "health": ("disabled" if not computer_enabled
+                               else "ready" if computer_status["available"] else "unavailable"),
+                    "source": "codex_plugin",
+                    "scope": "local_mac",
+                    "endpoint": "/api/capability",
+                    "protocol_version": "2026-07-28",
+                    "tools": computer_status["tools"],
+                    "status": computer_status,
                     "active_grants": active_mcp,
                     "lifecycle": "new_sessions",
                 }],

@@ -2,7 +2,8 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@/lib/cn";
-import { Shortcut } from "@/components/chat/ui";
+import { ChatMarkdown } from "@/components/chat/markdown/ChatMarkdown";
+import { Badge, Button, Shortcut, TextArea } from "@/components/chat/ui";
 import { ApprovalCard } from "../ai-native/approval-card";
 import {
   ApprovalCard as QuestionCard,
@@ -45,6 +46,7 @@ export interface ConversationApprovalProps {
     decision: "allow" | "deny",
     scopeMode?: "once" | "session",
     optionId?: string,
+    note?: string,
   ) => void;
   onUserInputResolve: (payload: UserInputResolvePayload) => void | Promise<boolean>;
   className?: string;
@@ -153,6 +155,120 @@ function normalizeQuestions(pending: Record<string, unknown>): NormalizedQuestio
   }];
 }
 
+function approvalKindOf(row: Record<string, unknown>): string {
+  return field(row, "approval_kind", "kind").toLowerCase().replace(/-/g, "_");
+}
+
+const UNANSWERABLE_LABELS: Record<string, string> = {
+  session_closed: "所属的 Runtime 会话已关闭",
+  session_replaced: "所属的 Runtime 会话已被新会话替换",
+  stale_generation: "所属的执行代已过期",
+  runtime_restarted: "Runtime 已重启，原请求无法再答复",
+  turn_ended: "回合已结束，原请求已过期",
+};
+
+/** Empty when the issuing Runtime session can still receive the decision. */
+function unanswerableReasonOf(row: Record<string, unknown>): string {
+  const capability = row.response_capability;
+  if (!capability || typeof capability !== "object") return "";
+  const { answerable, reason } = capability as { answerable?: unknown; reason?: unknown };
+  if (answerable !== false) return "";
+  const code = typeof reason === "string" ? reason : "";
+  return `${UNANSWERABLE_LABELS[code] || "原 Runtime 会话不可用"}，不能再作答${code ? `（${code}）` : ""}`;
+}
+
+/** Plan-exit cards require the full plan body. An empty string is not a plan. */
+function planExitMarkdown(row: Record<string, unknown>): string {
+  const value = row.plan_markdown;
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function PlanExitCard({
+  row,
+  busy,
+  onDecision,
+}: {
+  row: Record<string, unknown>;
+  busy: boolean;
+  onDecision: (approvalId: string, decision: "allow" | "deny", note?: string) => void;
+}) {
+  const approvalId = field(row, "approval_id");
+  const markdown = planExitMarkdown(row);
+  const status = field(row, "status") || "pending";
+  const title = field(row, "title") || "计划已就绪";
+  const [note, setNote] = useState("");
+  const pending = status === "pending";
+  const unanswerable = unanswerableReasonOf(row);
+  const decidable = pending && !busy && !unanswerable;
+  const implement = () => {
+    if (!decidable) return;
+    onDecision(approvalId, "allow");
+  };
+  const keepPlanning = () => {
+    if (!decidable) return;
+    onDecision(approvalId, "deny", note);
+  };
+
+  return (
+    <section
+      className="flex flex-col gap-3 rounded-2xl border border-cx-border bg-cx-elevated p-3 shadow-cx-sm"
+      data-testid="plan-approval-card"
+      data-approval-id={approvalId}
+      data-status={status}
+      aria-label="计划确认"
+      onKeyDown={(event) => {
+        if (!decidable) return;
+        if (event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLInputElement) return;
+        if (event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
+        const key = event.key.toLowerCase();
+        if (key !== "y" && key !== "n") return;
+        event.preventDefault();
+        if (key === "y") implement();
+        else keepPlanning();
+      }}
+    >
+      <div className="flex items-center gap-2">
+        <Badge tone="accent" icon="listChecks">规划</Badge>
+        <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-cx-fg">{title}</span>
+        {status === "expired" ? <Badge tone="neutral">已过期</Badge> : null}
+        {status === "resolving" || (pending && busy) ? <Badge tone="running" dot>正在确认</Badge> : null}
+      </div>
+      <div className="max-h-80 overflow-auto rounded-xl bg-cx-bg-subtle px-3 py-2 text-[13px] leading-5 text-cx-fg">
+        <ChatMarkdown text={markdown} />
+      </div>
+      {unanswerable ? (
+        <p className="text-[12px] leading-5 text-cx-warning" role="status" data-testid="approval-unanswerable">{unanswerable}</p>
+      ) : null}
+      {decidable ? (
+        <TextArea
+          value={note}
+          onChange={(event) => setNote(event.target.value)}
+          aria-label="继续规划的补充说明"
+          placeholder="继续规划时可写下要改的地方，也可以留空"
+          rows={2}
+        />
+      ) : null}
+      <div className="flex flex-wrap items-center gap-2">
+        <Button type="button" size="sm" variant="primary" disabled={!decidable} onClick={implement}>
+          实施
+        </Button>
+        <Button type="button" size="sm" variant="secondary" disabled={!decidable} onClick={keepPlanning}>
+          继续规划
+        </Button>
+        {decidable ? (
+          <span className="ml-auto hidden items-center gap-2 text-[12px] text-cx-fg-4 sm:flex">
+            <Shortcut keys="y" /> 实施
+            <Shortcut keys="n" /> 继续规划
+          </span>
+        ) : null}
+      </div>
+      <p className="text-[12px] leading-5 text-cx-fg-3">
+        实施会退出规划模式并按该计划继续。继续规划会留在规划模式，补充说明会交给 Agent。
+      </p>
+    </section>
+  );
+}
+
 function answerSatisfied(question: NormalizedQuestion, entry?: { values: string[]; text?: string }): boolean {
   if (question.kind === "header" || !question.required) return true;
   const values = entry?.values ?? [];
@@ -211,10 +327,24 @@ export function ConversationApproval({
     () => asApprovalRows(pendingApprovals, pendingApproval),
     [pendingApprovals, pendingApproval],
   );
-  const pendingApprovalCount = approvalRows.filter(
+  const { planExitRows, planExitMissing, genericRows } = useMemo(() => {
+    const plans: Record<string, unknown>[] = [];
+    const missing: Record<string, unknown>[] = [];
+    const generic: Record<string, unknown>[] = [];
+    for (const row of approvalRows) {
+      if (approvalKindOf(row) !== "plan_exit") {
+        generic.push(row);
+        continue;
+      }
+      if (planExitMarkdown(row)) plans.push(row);
+      else missing.push(row);
+    }
+    return { planExitRows: plans, planExitMissing: missing, genericRows: generic };
+  }, [approvalRows]);
+  const pendingApprovalCount = genericRows.filter(
     (row) => (field(row, "status") || "pending") === "pending",
   ).length;
-  const expiredApprovalCount = approvalRows.filter(
+  const expiredApprovalCount = genericRows.filter(
     (row) => field(row, "status") === "expired",
   ).length;
 
@@ -224,9 +354,49 @@ export function ConversationApproval({
 
   if (!approvalRows.length && !pendingInput) return null;
 
-  const approvalCards = approvalRows.map((row) => {
+  const decidePlan = (approvalId: string, decision: "allow" | "deny", note?: string) => {
+    onApprovalDecision(approvalId, decision, "once", undefined, note);
+  };
+  const visiblePlanRows = planExitRows.filter((row) => field(row, "status") !== "expired");
+  const expiredPlanRows = planExitRows.filter((row) => field(row, "status") === "expired");
+  const planSection = visiblePlanRows.length || expiredPlanRows.length || planExitMissing.length ? (
+    <div className="flex flex-col gap-2.5" data-testid="plan-approval-queue">
+      {visiblePlanRows.map((row) => (
+        <PlanExitCard key={field(row, "approval_id")} row={row} busy={busy} onDecision={decidePlan} />
+      ))}
+      {planExitMissing.map((row) => {
+        const approvalId = field(row, "approval_id");
+        const status = field(row, "status") || "pending";
+        const pending = status === "pending";
+        return (
+          <p key={approvalId} className="flex flex-wrap items-center gap-2 text-[12px] leading-5 text-cx-fg-3" data-testid="plan-approval-missing" data-approval-id={approvalId} role="status">
+            <span className="min-w-0 flex-1">这条计划确认没有计划正文，未显示计划卡片。</span>
+            {pending ? (
+              <Button type="button" size="xs" variant="ghost" disabled={busy} onClick={() => decidePlan(approvalId, "deny", "")}>
+                忽略
+              </Button>
+            ) : null}
+          </p>
+        );
+      })}
+      {expiredPlanRows.length ? (
+        <details className="rounded-xl border border-cx-border px-3 py-2 text-xs text-cx-fg-3" data-testid="expired-plan-approval-history">
+          <summary className="cursor-pointer">{expiredPlanRows.length} 个已过期的计划确认</summary>
+          <div className="mt-3 flex flex-col gap-2.5">
+            {expiredPlanRows.map((row) => (
+              <PlanExitCard key={field(row, "approval_id")} row={row} busy={busy} onDecision={decidePlan} />
+            ))}
+          </div>
+        </details>
+      ) : null}
+    </div>
+  ) : null;
+
+  const approvalCards = genericRows.map((row) => {
           const preview = buildApprovalPreview(row);
           const approvalId = preview.approvalId;
+          const unanswerable = unanswerableReasonOf(row);
+          const answerable = preview.status === "pending" && !unanswerable;
           const diffFiles = approvalDiffFiles(preview);
           const pathFiles = preview.files.map((f) => {
             const matched = diffFiles.find((d) => d.path === f.path);
@@ -268,30 +438,30 @@ export function ConversationApproval({
               missingDiff={preview.missingDiff}
               scope={preview.scope || undefined}
               expires={preview.expires || undefined}
-              reason={preview.reason || undefined}
+              reason={unanswerable || preview.reason || undefined}
               status={preview.status}
               busy={busy}
-              nativeOptions={preview.nativeOptions}
+              nativeOptions={unanswerable ? undefined : preview.nativeOptions}
               onNativeOption={(optionId, kind) => {
-                if (preview.status !== "pending" || busy) return;
+                if (!answerable || busy) return;
                 if (!["allow_once", "allow_always", "reject_once", "reject_always"].includes(kind)
                   || !preview.nativeOptions?.some((option) => option.option_id === optionId && option.kind === kind)) return;
                 onApprovalDecision(approvalId, kind === "allow_once" || kind === "allow_always" ? "allow" : "deny", kind === "allow_always" || kind === "reject_always" ? "session" : "once", optionId);
               }}
               onAllow={
-                preview.status !== "pending"
+                !answerable
                   ? undefined
                   : (scopeMode) => onApprovalDecision(approvalId, "allow", scopeMode)
               }
               onDeny={
-                preview.status !== "pending"
+                !answerable
                   ? undefined
                   : () => onApprovalDecision(approvalId, "deny")
               }
             />
           );
         });
-  const approvalQueue = approvalRows.length ? (
+  const approvalQueue = genericRows.length ? (
     <div className="flex flex-col gap-2.5" data-testid="approval-queue">
       <div className="flex items-center gap-2 text-[12px] font-medium text-cx-fg-3">
         {pendingApprovalCount > 0 ? <span className="size-1.5 rounded-full bg-cx-warning cx-pulse-dot" /> : null}
@@ -315,6 +485,7 @@ export function ConversationApproval({
         aria-label="待审批操作"
         className={cn("cx-animate-in flex flex-col gap-3", className)}
       >
+        {planSection}
         {approvalQueue}
       </div>
     );
@@ -404,6 +575,7 @@ export function ConversationApproval({
       aria-label="待审批操作"
       className={cn("cx-animate-in flex flex-col gap-3", className)}
     >
+      {planSection}
       {approvalQueue}
 
       <div
@@ -423,7 +595,7 @@ export function ConversationApproval({
           <Icon name="messageCircle" size={13} className="shrink-0 text-cx-accent" />
           <span className="shrink-0 font-medium text-cx-accent">{t("conversation.userInput.badge")}</span>
           {title ? <span className="min-w-0 truncate text-cx-fg-3">· {title}</span> : null}
-          <span className="ml-auto hidden shrink-0 items-center gap-1.5 text-[11.5px] text-cx-fg-4 sm:flex">
+          <span className="ml-auto hidden shrink-0 items-center gap-1.5 text-[12px] text-cx-fg-4 sm:flex">
             <Shortcut keys="mod+enter" tone="subtle" /> 提交
           </span>
         </div>

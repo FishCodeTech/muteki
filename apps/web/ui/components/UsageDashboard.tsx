@@ -1,257 +1,207 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { apiFetch } from "@/lib/useRun";
+import dynamic from "next/dynamic";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { EngineLogo } from "./EngineLogo";
+import { Button } from "./chat/ui/Button";
+import { Callout, Skeleton } from "./chat/ui/Feedback";
+import { SegmentedControl } from "./chat/ui/Tabs";
+import { ProviderUsageChart } from "./usage/ProviderUsageChart";
+import {
+  countValue, engineColor, engineName, exactMoney, fetchUsageLimits, fetchUsageSummary, moneyValue, pricingLabel,
+  slotLabel, statusLabel, timestampLabel, tokenValue, type UsageDays, type UsageLimits, type UsageMetric,
+  type UsageProvider, type UsageScope, type UsageSummary, type UsageTotals,
+} from "@/lib/providerUsage";
+import { formatShare } from "@/lib/usageFormat";
 import styles from "./UsageDashboard.module.css";
 
-type Totals = { input_tokens: number | null; output_tokens: number | null; total_tokens: number | null; cache_read_tokens: number | null; cache_write_tokens: number | null; reasoning_tokens: number | null; records: number; quality: Record<string, number>; observed?: Record<string, number>; token_coverage?: string; reported_cost: number | null; estimated_cost: number | null; unpriced: number; unverified_estimates?: number };
-type UsageRow = Partial<Totals> & { id: string; at: number; model?: string; role?: string; engine?: string; run_id?: string; thread_id?: string; challenge_id?: string; worker_id?: string; generation?: number; quality: string; status: string; cost_status?: string };
-type Snapshot = { revision: number; as_of: number; totals: Totals; groups: Record<string, (Totals & { name: string })[]>; series: (Totals & { at: number })[]; records: UsageRow[]; count: number };
+const UsageLimitsView = dynamic(() => import("./usage/UsageLimitsView").then(module => module.UsageLimitsView));
+const UsageLedger = dynamic(() => import("./usage/UsageLedger").then(module => module.UsageLedger));
+const STORAGE_KEY = "muteki.usage.v2";
+const DEFAULT_ENGINES = ["codex", "claude", "cursor", "grok", "opencode", "pi", "kimi", "omp", "devin", "droid"];
+const ROLES: Record<string, string> = { worker: "Worker", assistant: "对话 Agent", reason: "Reason", titler: "标题 / 摘要", dispatch: "任务列表标题" };
+const PERIODS = [{ value: "1", label: "24 小时" }, { value: "7", label: "7 天" }, { value: "30", label: "30 天" }, { value: "90", label: "90 天" }];
 type ChallengeOption = { id: string; label: string };
+type Preferences = { metric: UsageMetric; days: UsageDays; scope: UsageScope };
+type Resource = { key: string; loading: boolean; error: string; data: UsageSummary | UsageLimits | null };
 
-type QuotaEntry = {
-  credential_id: string;
-  account_id: string;
-  engine: string;
-  label: string;
-  quota_type: "subscription" | "api_key";
-  status: "unknown" | "not_supported" | "ok" | string;
-  remaining: number | null;
-  total: number | null;
-  window_seconds: number | null;
-  reset_at: number | null;
-  updated_at: number | null;
-  unknown_reason: string | null;
-};
-type QuotaSnapshot = { quota: QuotaEntry[]; as_of: number };
-
-const num = (n: number | null | undefined) => n == null ? "—" : n.toLocaleString();
-const money = (n: number | null | undefined) => n == null ? "未定价" : `$${n.toFixed(5)}`;
-const rowMoney = (row: UsageRow) => row.cost_status === "legacy_pi_estimate_unverified"
-  ? "未定价"
-  : row.cost_status === "legacy_estimate_unverified"
-  ? (row.reported_cost != null && row.reported_cost > 0 ? money(row.reported_cost) : "未定价")
-  : money(row.reported_cost ?? row.estimated_cost);
-const rowMoneySource = (row: UsageRow) => row.cost_status === "legacy_pi_estimate_unverified"
-  ? "历史 Pi 估算口径不明"
-  : row.cost_status === "legacy_estimate_unverified"
-  ? (row.reported_cost != null && row.reported_cost > 0 ? "上报 · 历史估算口径不明" : "历史估算口径不明")
-  : row.reported_cost != null ? "上报" : row.estimated_cost != null ? "估算" : "未定价";
-const quality: Record<string, string> = { reported: "已上报", estimated: "估算", partial: "部分缺失", missing: "未上报" };
-const statusName: Record<string, string> = { observed: "已记录", failed: "失败", timeout: "超时", cancelled: "已取消", historical_quality_unknown: "历史口径不完整", counter_reset_unknown: "计数器重置", counter_reset_rebased: "计数器重置（已从零计）" };
-const roleName: Record<string, string> = { worker: "Worker", assistant: "对话 Agent", reason: "Reason", titler: "标题 / 摘要", dispatch: "任务列表标题" };
-
-function formatWindow(seconds: number | null | undefined): string {
-  if (seconds == null) return "—";
-  if (seconds < 120) return `${seconds} 秒`;
-  if (seconds < 7200) return `${Math.round(seconds / 60)} 分钟`;
-  if (seconds < 172800) return `${Math.round(seconds / 3600)} 小时`;
-  return `${Math.round(seconds / 86400)} 天`;
+function EngineName({ engine }: { engine: string }) {
+  const known = DEFAULT_ENGINES.includes(engine);
+  return <span className={styles.engineName}>{known ? <EngineLogo engine={engine} size={19} /> : <span className={styles.unknownEngine} aria-hidden="true">·</span>}<span>{engineName(engine)}</span></span>;
 }
 
-function SubscriptionQuotaPanel({ stateRoot }: { stateRoot?: string }) {
-  const [data, setData] = useState<QuotaSnapshot | null>(null);
-  const [error, setError] = useState("");
-  const [refreshing, setRefreshing] = useState<string | null>(null);
-  const [open, setOpen] = useState(false);
+function Coverage({ totals }: { totals: UsageTotals }) {
+  const records = totals.records;
+  return <div className={styles.coverage}>
+    <span>{countValue(records)} 条记录</span>
+    {totals.historical_scope_unknown ? <span data-warning="true">历史口径未知 {countValue(totals.historical_scope_unknown)} 条 · 已排除原观测数值</span> : null}
+    {records !== null && records > 0 && totals.missing !== null ? <span data-warning={totals.missing > 0}>Token 覆盖 {formatShare(Math.max(0, records - totals.missing) / records)}{totals.missing > 0 ? ` · ${countValue(totals.missing)} 条未上报` : ""}</span> : null}
+    {records !== null && records > 0 && totals.unpriced !== null ? <span data-warning={totals.unpriced > 0}>定价覆盖 {formatShare(Math.max(0, records - totals.unpriced) / records)}{totals.unpriced > 0 ? ` · ${countValue(totals.unpriced)} 条未定价` : ""}</span> : null}
+  </div>;
+}
 
-  const load = async () => {
-    try {
-      const res = await apiFetch(`/api/usage/quota`);
-      if (!res.ok) throw new Error(`额度读取失败（${res.status}）`);
-      setData(await res.json() as QuotaSnapshot);
-      setError("");
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "额度读取失败");
-    }
-  };
+function TokenTotals({ totals }: { totals: UsageTotals }) {
+  return <div className={styles.tokenTotals}>{([
+    ["处理 Token", totals.total_tokens, `${countValue(totals.records)} 条记录`],
+    ["未缓存输入", totals.uncached_input, ""], ["缓存读取", totals.cache_read, ""], ["缓存写入", totals.cache_write, ""],
+    ["输出", totals.output, totals.reasoning !== null ? `含推理 ${tokenValue(totals.reasoning)}` : "推理明细未上报"],
+  ] as [string, number | null, string][]).map(([label, value, note], index) => <div key={label} data-primary={index === 0}><span>{label}</span><strong title={value === null ? "未上报" : countValue(value)}>{tokenValue(value)}</strong>{note ? <small>{note}</small> : null}</div>)}</div>;
+}
 
-  useEffect(() => { void load(); }, []);
+function Composition({ totals, metric }: { totals: UsageTotals; metric: "cost" | "tokens" }) {
+  const parts = metric === "cost" ? [
+    { label: "供应商上报", value: totals.reported_cost, color: "var(--cx-accent)" },
+    { label: "API 估算", value: totals.estimated_cost, color: "color-mix(in oklab, var(--cx-accent) 45%, var(--cx-bg))" },
+  ] : [
+    { label: "未缓存输入", value: totals.uncached_input, color: "var(--cx-accent)" },
+    { label: "缓存读取", value: totals.cache_read, color: "color-mix(in oklab, var(--cx-accent) 62%, var(--cx-bg))" },
+    { label: "缓存写入", value: totals.cache_write, color: "var(--eng-omp, var(--cx-fg-3))" },
+    { label: "输出", value: totals.output, color: "var(--eng-kimi, var(--cx-fg-2))" },
+    ...(totals.unclassified_input !== null && totals.unclassified_input > 0 ? [{ label: "未细分输入", value: totals.unclassified_input, color: "var(--cx-fg-3)" }] : []),
+  ];
+  const known = parts.reduce((sum, part) => sum + (part.value ?? 0), 0);
+  const format = metric === "cost" ? moneyValue : tokenValue;
+  return <section className={styles.composition} aria-label={metric === "cost" ? "费用来源" : "Token 构成"}>
+    <h2>{metric === "cost" ? "费用来源" : "Token 构成"}</h2>
+    {known > 0 ? <div className={styles.compositionBar} aria-hidden="true">{parts.filter(part => part.value !== null && part.value > 0).map(part => <span key={part.label} style={{ width: `${part.value! / known * 100}%`, background: part.color }} />)}</div> : null}
+    {metric === "tokens" && totals.unclassified_input !== null && totals.unclassified_input > 0 ? <p className={styles.unclassifiedInputNote}>未细分输入的缓存明细未上报，已计入处理 Token，不归入未缓存输入。</p> : null}
+    <div className={styles.compositionLegend}>{parts.map(part => <span key={part.label}><i style={{ background: part.color }} aria-hidden="true" />{part.label}<b title={metric === "cost" ? exactMoney(part.value) : countValue(part.value)}>{format(part.value)}</b>{part.value !== null && known > 0 ? <small>{formatShare(part.value / known)}</small> : null}</span>)}</div>
+  </section>;
+}
 
-  const refresh = async (credentialId: string) => {
-    setRefreshing(credentialId);
-    try {
-      const res = await apiFetch(`/api/usage/quota/${encodeURIComponent(credentialId)}/refresh`, { method: "POST" });
-      if (!res.ok) throw new Error(`刷新失败（${res.status}）`);
-      await load();
-    } catch {
-    } finally {
-      setRefreshing(null);
-    }
-  };
+function Breakdown({ data, metric }: { data: UsageSummary; metric: "cost" | "tokens" }) {
+  const [group, setGroup] = useState(metric === "cost" ? "model" : "engine");
+  const [page, setPage] = useState(0);
+  const field = metric === "cost" ? "cost" : "total_tokens";
+  const format = metric === "cost" ? moneyValue : tokenValue;
+  const rows = useMemo(() => {
+    if (group === "day") return data.series.map(row => ({ id: row.slot, label: slotLabel(row.slot), engine: "", value: row[field], tokens: row.total_tokens, cost: row.cost, note: "已知部分", total: null }));
+    const values = group === "engine" ? data.providers : data.models;
+    return values.map((row, index) => ({ id: `${row.engine}-${"model" in row ? row.model : ""}-${index}`, label: "model" in row ? row.model : engineName(row.engine), engine: row.engine, value: row[field], tokens: row.total_tokens, cost: row.cost, note: group === "engine" && (row as UsageProvider).message ? (row as UsageProvider).message! : metric === "cost" ? pricingLabel(row) : "status" in row ? statusLabel(row.status) : `${countValue(row.records)} 条记录`, total: row })).sort((left, right) => (right.value ?? -1) - (left.value ?? -1));
+  }, [data, field, group, metric]);
+  const total = data.totals[field];
+  const lastPage = Math.max(0, Math.ceil(rows.length / 20) - 1);
+  const currentPage = Math.min(page, lastPage);
+  const visible = rows.slice(currentPage * 20, (currentPage + 1) * 20);
+  return <section className={styles.breakdown}><div className={styles.sectionHeading}><h2>{metric === "cost" ? "费用明细" : "用量明细"}</h2><SegmentedControl value={group} onChange={value => { setGroup(value); setPage(0); }} ariaLabel="明细分组" options={[{ value: "engine", label: "引擎" }, { value: "model", label: "模型" }, { value: "day", label: "时间" }]} /></div>
+    {rows.length ? <><div className={styles.tableScroll}><table><thead><tr><th className={styles.rankColumn}>#</th><th>{group === "model" ? "模型" : group === "day" ? "时间" : "引擎"}</th>{group === "model" ? <th>引擎</th> : null}<th className={styles.numeric}>{metric === "cost" ? "已定价费用" : "处理 Token"}</th><th className={styles.numeric}>占比</th><th className={styles.numeric}>{metric === "cost" ? "Token" : "费用"}</th><th>数据状态</th></tr></thead><tbody>{visible.map((row, index) => <tr key={row.id}><td className={styles.rankColumn}>{currentPage * 20 + index + 1}</td><th scope="row">{group === "engine" ? <EngineName engine={row.engine} /> : row.label}</th>{group === "model" ? <td><EngineName engine={row.engine} /></td> : null}<td className={styles.numeric}><strong title={metric === "cost" ? exactMoney(row.value) : countValue(row.value)}>{format(row.value)}</strong></td><td className={styles.numeric}>{row.value !== null && total !== null && total > 0 ? formatShare(row.value / total) : "—"}</td><td className={styles.numeric} title={metric === "tokens" ? exactMoney(row.cost) : countValue(row.tokens)}>{metric === "cost" ? tokenValue(row.tokens) : moneyValue(row.cost)}</td><td className={styles.rowNote}>{row.note}{row.total && (row.total.unpriced || row.total.missing) ? <small>{row.total.unpriced ? `${countValue(row.total.unpriced)} 条未定价` : ""}{row.total.unpriced && row.total.missing ? " · " : ""}{row.total.missing ? `${countValue(row.total.missing)} 条 Token 未上报` : ""}{row.total.historical_scope_unknown ? `（含 ${countValue(row.total.historical_scope_unknown)} 条历史口径未知）` : ""}</small> : null}</td></tr>)}</tbody></table></div>{rows.length > 20 ? <div className={styles.pagination}><span>{rows.length} 项 · 第 {currentPage + 1} / {lastPage + 1} 页</span><Button variant="outline" size="sm" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>上一页</Button><Button variant="outline" size="sm" disabled={currentPage === lastPage} onClick={() => setPage(currentPage + 1)}>下一页</Button></div> : null}</> : <p className={styles.loading}>这个范围暂无{group === "model" ? "模型" : "用量"}明细。</p>}
+  </section>;
+}
 
-  const entries = data?.quota ?? [];
-  const subscriptionEntries = entries.filter(e => e.quota_type === "subscription");
-  const hasKnown = subscriptionEntries.some(e => e.status === "ok" && e.remaining != null);
-
-  return (
-    <div className={styles.quotaPanel}>
-      <button
-        className={styles.quotaToggle}
-        onClick={() => setOpen(v => !v)}
-        aria-expanded={open}
-      >
-        <span className={styles.eyebrow}>SUBSCRIPTION QUOTA</span>
-        <span className={styles.quotaToggleLabel}>订阅额度{hasKnown ? " · 已知" : " · 未知"}</span>
-        <span className={styles.quotaChevron}>{open ? "▲" : "▼"}</span>
-      </button>
-      {open && (
-        <div className={styles.quotaBody}>
-          <p className={styles.quotaNote}>
-            订阅额度与 Token 用量分开统计。CLI 引擎不主动上报额度窗口，默认显示未知；引擎在会话中通过响应头上报后将自动更新。刷新只重读缓存，不启动 Agent 或消耗额度信用。
-          </p>
-          {error && <div role="alert" className={styles.error}>{error}</div>}
-          {!data && !error && <p role="status" className={styles.quotaNote}>正在读取额度信息…</p>}
-          {entries.length === 0 && data && (
-            <p className={styles.quotaNote}>当前没有已配置的凭据账号。</p>
-          )}
-          <div className={styles.quotaTable}>
-            {entries.map(entry => {
-              const isRefreshing = refreshing === entry.credential_id;
-              const statusLabel =
-                entry.status === "ok" ? "已知" :
-                entry.status === "not_supported" ? "不支持" :
-                "未知";
-              const statusData =
-                entry.status === "ok" ? "ok" :
-                entry.status === "not_supported" ? "unsupported" :
-                "unknown";
-              return (
-                <div key={entry.credential_id} className={styles.quotaRow}>
-                  <div className={styles.quotaRowHeader}>
-                    <span className={styles.quotaLabel}>{entry.label}</span>
-                    <span className={styles.quotaEngine}>{entry.engine}</span>
-                    <span className={styles.quotaStatus} data-status={statusData}>{statusLabel}</span>
-                    {entry.quota_type === "subscription" && (
-                      <button
-                        className={styles.quotaRefreshBtn}
-                        disabled={isRefreshing}
-                        onClick={() => void refresh(entry.credential_id)}
-                        title="刷新额度（只重读缓存，不启动 Agent）"
-                      >
-                        {isRefreshing ? "…" : "↻"}
-                      </button>
-                    )}
-                  </div>
-                  {entry.status === "ok" ? (
-                    <div className={styles.quotaDetails}>
-                      <span>剩余 <b>{num(entry.remaining)}</b></span>
-                      {entry.total != null && <span>总量 <b>{num(entry.total)}</b></span>}
-                      {entry.window_seconds != null && <span>窗口 <b>{formatWindow(entry.window_seconds)}</b></span>}
-                      {entry.reset_at != null && (
-                        <span>重置时间 <b>{new Date(entry.reset_at * 1000).toLocaleString()}</b></span>
-                      )}
-                      {entry.updated_at != null && (
-                        <span className={styles.quotaUpdated}>更新于 {new Date(entry.updated_at * 1000).toLocaleTimeString()}</span>
-                      )}
-                    </div>
-                  ) : (
-                    <div className={styles.quotaUnknown}>
-                      {entry.unknown_reason || (entry.quota_type === "api_key" ? "API 密钥账号无订阅窗口" : "未知")}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
-    </div>
-  );
+function SummaryContent({ data, metric, scope }: { data: UsageSummary; metric: "cost" | "tokens"; scope: UsageScope }) {
+  const [providersExpanded, setProvidersExpanded] = useState(false);
+  const visibleProviders = providersExpanded ? data.providers : data.providers.slice(0, 5);
+  const chartEngines = useMemo(() => [...new Set(data.series.flatMap(row => Object.keys(row.providers)))].filter(engine => data.series.some(row => row.providers[engine]?.[metric === "cost" ? "cost" : "total_tokens"] != null)), [data.series, metric]);
+  const chartTitle = `${data.window.resolution === "hour" || data.window.resolution === "hourly" ? "每小时" : "每日"}${metric === "cost" ? "费用" : " Token"}`;
+  const failedSources = data.sources.filter(source => ["error", "partial", "unavailable"].includes(source.status));
+  return <>
+    {failedSources.length ? <div className={styles.sourceWarning}><Callout tone="warning" role="status">{failedSources.map(source => engineName(source.engine)).join("、")} 的数据未完整读取，当前显示可用记录。具体原因见下方数据来源。</Callout></div> : null}
+    {data.cache_warning || data.pricing?.message ? <div className={styles.sourceWarning}><Callout tone="warning" role="status">{[data.cache_warning, data.pricing?.message].filter(Boolean).join(" ")}</Callout></div> : null}
+    {metric === "cost" ? <div className={styles.costOverview}><section className={styles.costSidebar} aria-label="费用概览"><span className={styles.summaryLabel}>已定价费用</span><strong className={styles.heroValue} title={exactMoney(data.totals.cost)}>{moneyValue(data.totals.cost)}</strong><p className={styles.summaryNote}>{pricingLabel(data.totals)} · {countValue(data.totals.sessions)} 个会话</p>{data.totals.unpriced ? <p className={styles.warningNote}>{countValue(data.totals.unpriced)} 条未定价记录，未计入此金额</p> : null}
+      <div className={styles.providerList}>{visibleProviders.map(provider => <div key={provider.engine} className={styles.providerItem} style={{ "--usage-engine": engineColor(provider.engine) } as CSSProperties}><div className={styles.providerTop}><EngineName engine={provider.engine} /><strong title={exactMoney(provider.cost)}>{provider.records === 0 && provider.cost === null ? "暂无记录" : moneyValue(provider.cost)}</strong></div><div className={styles.providerMeta}><span>{tokenValue(provider.total_tokens)} Token</span><span>{provider.records === 0 ? statusLabel(provider.status) : pricingLabel(provider)}</span></div>{provider.message || provider.historical_scope_unknown ? <small className={styles.providerMessage}>{provider.message}{provider.historical_scope_unknown ? ` · ${countValue(provider.historical_scope_unknown)} 条历史口径未知` : ""}</small> : null}</div>)}</div>{data.providers.length > 5 ? <Button variant="ghost" size="sm" className={styles.expandProviders} onClick={() => setProvidersExpanded(value => !value)} aria-expanded={providersExpanded}>{providersExpanded ? "收起引擎列表 ↑" : `展开全部 ${data.providers.length} 个引擎 ↓`}</Button> : null}
+    </section><section className={styles.trend}><div className={styles.sectionHeading}><h2>{chartTitle}</h2><span>{data.window.time_zone}</span></div><ProviderUsageChart series={data.series} metric={metric} engines={chartEngines} /></section></div> : <><TokenTotals totals={data.totals} /><section className={styles.tokenTrend}><div className={styles.sectionHeading}><h2>{chartTitle}</h2><span>{data.window.time_zone}</span></div><ProviderUsageChart series={data.series} metric={metric} engines={chartEngines} /></section></>}
+    <Coverage totals={data.totals} />
+    <Composition totals={data.totals} metric={metric} />
+    <Breakdown key={metric} data={data} metric={metric} />
+    <details className={styles.sources}><summary>查看数据来源 <span>{data.sources.length} 个来源</span></summary><div>{data.pricing ? <div><span>模型价格表</span><span className={styles.sourceStatus}>{data.pricing.status === "fresh" ? "最新价格" : data.pricing.status === "cached" ? "缓存价格" : "价格不可用"}</span><p>{data.pricing.message || "用于无供应商上报金额的已知模型估算。"} {data.pricing.fetched_at !== null ? `价格更新于 ${timestampLabel(data.pricing.fetched_at)}。` : ""}{data.pricing.source ? <small className={styles.priceSource}>来源：{data.pricing.source}</small> : null}</p></div> : null}{data.cache_warning ? <div><span>历史扫描缓存</span><span className={styles.sourceStatus}>缓存异常</span><p>{data.cache_warning}</p></div> : null}{data.sources.map((source, index) => <div key={`${source.engine}-${index}`}><EngineName engine={source.engine} /><span className={styles.sourceStatus}>{statusLabel(source.status)}</span><p>{source.message || (source.status === "ok" ? "已读取当前范围内的记录。" : "当前来源没有可用记录。")}</p></div>)}</div></details>
+    <p className={styles.footnote}>{data.totals.historical_scope_unknown ? "历史口径未知的原始观测仅供追溯，不计入 Token 和费用合计。 " : ""}{scope === "history" ? "引擎历史汇总本机原生记录与账户历史；各来源覆盖范围见上方说明。此范围可能包含 Muteki 内部调用，两种范围不能相加。" : "仅统计此 Muteki 实例归属明确的调用，包含辅助模型。"} {metric === "cost" ? "供应商上报与模型标价估算不代表实际账单。" : (data.totals.unclassified_input !== null && data.totals.unclassified_input > 0 ? "未缓存输入、缓存读取、缓存写入、未细分输入与输出互不重复；推理是输出的明细。" : "未缓存输入、缓存读取、缓存写入与输出互不重复；推理是输出的明细。")} 缺失数据以“—”或“未定价”显示。</p>
+  </>;
 }
 
 export function UsageDashboard({ runId, competitionId, threadId, challenges = [] }: { runId?: string; competitionId?: string; threadId?: string; challenges?: ChallengeOption[] }) {
   const scoped = Boolean(runId || competitionId || threadId);
-  const scope = competitionId ? "competition" : runId ? "run" : threadId ? "thread" : "global";
-  const [days, setDays] = useState(scoped ? "all" : "1");
+  const [preferences, setPreferences] = useState<Preferences>({ metric: scoped ? "tokens" : "limits", days: scoped ? "all" : "7", scope: scoped ? "muteki" : "history" });
+  const [ready, setReady] = useState(false);
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
   const [workspace, setWorkspace] = useState("");
   const [generation, setGeneration] = useState("");
   const [model, setModel] = useState("");
   const [role, setRole] = useState("");
+  const [engine, setEngine] = useState("");
   const [challengeId, setChallengeId] = useState("");
-  const [group, setGroup] = useState(competitionId ? "challenge_id" : "role");
-  const [offset, setOffset] = useState(0);
-  const [data, setData] = useState<Snapshot | null>(null);
-  const [error, setError] = useState("");
+  const [ledgerOpen, setLedgerOpen] = useState(false);
   const [refresh, setRefresh] = useState(0);
-  const [importing, setImporting] = useState(false);
-  const [importNote, setImportNote] = useState("");
-  const importHistory = async () => {
-    setImporting(true);
-    try {
-      const response = await apiFetch(`/api/usage/import-history`, { method: "POST" });
-      if (!response.ok) throw new Error(`历史补录失败（${response.status}）`);
-      const result = await response.json();
-      setImportNote(`补录 ${result.imported} 条旧任务快照，跳过 ${result.skipped} 条异常记录。历史数据精度单独标记；重复补录不会重复计数。`);
-      setRefresh(v => v + 1);
-    } catch (e) { setImportNote(e instanceof Error ? e.message : "历史补录失败"); }
-    finally { setImporting(false); }
-  };
-  useEffect(() => { setOffset(0); }, [days, startDate, endDate, workspace, generation, model, role, challengeId, runId, competitionId, threadId]);
+  const [resource, setResource] = useState<Resource>({ key: "", loading: true, error: "", data: null });
+  const lastRefresh = useRef(0);
   useEffect(() => {
+    if (scoped) {
+      setPreferences({ metric: "tokens", days: "all", scope: "muteki" });
+    } else {
+      try {
+        const stored = JSON.parse(window.localStorage.getItem(STORAGE_KEY) || "null") as (Partial<Preferences> & { startDate?: string; endDate?: string }) | null;
+        if (stored) {
+          const allowedDays = ["1", "7", "30", "90", ...(stored.scope === "muteki" ? ["all", "custom"] : [])];
+          const validDate = (value: unknown) => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(new Date(`${value}T00:00:00`).getTime());
+          setStartDate(validDate(stored.startDate) ? stored.startDate! : "");
+          setEndDate(validDate(stored.endDate) ? stored.endDate! : "");
+          setPreferences({ metric: ["cost", "tokens", "limits"].includes(stored.metric || "") ? stored.metric! : "limits", days: allowedDays.includes(stored.days || "") ? stored.days! : "7", scope: stored.scope === "muteki" ? "muteki" : "history" });
+        }
+      } catch { /* Storage is optional; unavailable storage does not affect usage data. */ }
+    }
+    setReady(true);
+  }, [scoped]);
+  useEffect(() => {
+    if (!ready || scoped) return;
+    try { window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...preferences, startDate, endDate })); } catch { /* Private browsing may disable persistence. */ }
+  }, [preferences, ready, scoped, startDate, endDate]);
+  const metric = scoped && preferences.metric === "limits" ? "tokens" : preferences.metric;
+  const scope = scoped ? "muteki" : preferences.scope;
+  const limits = metric === "limits";
+  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const invalidDates = preferences.days === "custom" && startDate && endDate && startDate > endDate;
+  const query = useMemo(() => {
+    const params = new URLSearchParams({ scope, days: preferences.days === "all" ? "90" : preferences.days === "custom" ? "30" : preferences.days, tz: timeZone });
+    if (preferences.days === "all") params.set("start", "0");
+    else if (preferences.days === "custom") {
+      params.set("start", startDate ? String(new Date(`${startDate}T00:00:00`).getTime() / 1000) : "0");
+      if (endDate) params.set("end", String(new Date(`${endDate}T23:59:59.999`).getTime() / 1000));
+    }
+    for (const [key, value] of Object.entries({ engine, run_id: runId, thread_id: threadId, competition_id: competitionId, ...(scope === "muteki" ? { challenge_id: challengeId, workspace_kind: workspace, generation, model, role } : {}) })) if (value) params.set(key, value);
+    return params.toString();
+  }, [scope, preferences.days, timeZone, startDate, endDate, engine, runId, threadId, competitionId, challengeId, workspace, generation, model, role]);
+  const resourceKey = limits ? "limits" : query;
+  useEffect(() => {
+    if (!ready || (!limits && invalidDates)) return;
     const controller = new AbortController();
     let busy = false;
-    setData(null);
-    const load = async () => {
+    const force = refresh !== lastRefresh.current;
+    lastRefresh.current = refresh;
+    const load = async (forceRefresh: boolean) => {
       if (busy || controller.signal.aborted) return;
       busy = true;
+      setResource(previous => ({ key: resourceKey, data: previous.key === resourceKey ? previous.data : null, loading: true, error: "" }));
       try {
-        const query = new URLSearchParams({ limit: "50", offset: String(offset) });
-        if (days === "custom") {
-          if (startDate) query.set("start", String(new Date(`${startDate}T00:00:00`).getTime() / 1000));
-          if (endDate) query.set("end", String(new Date(`${endDate}T23:59:59.999`).getTime() / 1000));
-        } else if (days !== "all") {
-          const start = new Date(); start.setHours(0, 0, 0, 0); start.setDate(start.getDate() - Number(days) + 1);
-          query.set("start", String(start.getTime() / 1000));
-        }
-        for (const [key, value] of Object.entries({ run_id: runId, thread_id: threadId, competition_id: competitionId, challenge_id: challengeId, workspace_kind: workspace, generation, model, role })) if (value) query.set(key, value);
-        const res = await apiFetch(`/api/usage?${query}`, { signal: controller.signal });
-        if (!res.ok) throw new Error(`用量读取失败（${res.status}）`);
-        const next = await res.json() as Snapshot;
-        if (!controller.signal.aborted) { setData(next); setError(""); }
-      } catch (e) { if (!controller.signal.aborted) setError(e instanceof Error ? e.message : "用量读取失败"); }
-      finally { busy = false; }
+        const data = limits ? await fetchUsageLimits(forceRefresh, controller.signal) : await fetchUsageSummary(`${resourceKey}${forceRefresh ? "&refresh=true" : ""}`, controller.signal);
+        if (!controller.signal.aborted) setResource({ key: resourceKey, data, loading: false, error: "" });
+      } catch (cause) {
+        if (!controller.signal.aborted) setResource(previous => ({ ...previous, loading: false, error: cause instanceof Error ? cause.message : "用量读取失败" }));
+      } finally { busy = false; }
     };
-    void load();
-    const timer = window.setInterval(() => { if (!document.hidden) void load(); }, 3000);
-    return () => { controller.abort(); window.clearInterval(timer); };
-  }, [days, startDate, endDate, workspace, generation, model, role, challengeId, runId, competitionId, threadId, offset, refresh]);
-  const totals = data?.totals;
-  const max = Math.max(1, ...(data?.series.map(row => row.total_tokens ?? 0) ?? []));
-  const challengeNames = Object.fromEntries(challenges.map((item) => [item.id, item.label]));
-  const labelGroup = (name: string) => group === "challenge_id" ? (challengeNames[name] || name) : (roleName[name] || name);
-  return <section className={styles.root} data-scope={scope} aria-label="Token 用量统计">
-    <header className={styles.header}><div><span className={styles.eyebrow}>USAGE</span><h1>{competitionId ? "比赛 Worker 用量" : runId ? "任务用量" : threadId ? "对话用量" : "全局用量"}</h1><p>{competitionId ? "仅本比赛 Worker，包含失败、中断和重试；不含 Reason、标题及摘要调用。" : "输入与输出构成总量，缓存和推理为其中明细。辅助模型调用同样计入。"}</p></div><button onClick={() => setRefresh(v => v + 1)}>刷新</button></header>
-    {!scoped && <div className={styles.health}><button disabled={importing} onClick={() => void importHistory()}>{importing ? "正在补录…" : "补录旧任务用量"}</button><small>{importNote || "仅补录账本启用前的任务快照；对话历史不在此补录范围。"}</small></div>}
-    {!scoped && <SubscriptionQuotaPanel />}
-    <div className={styles.filters}>
-      <label>时间<select value={days} onChange={e => setDays(e.target.value)}><option value="1">今日</option><option value="7">近 7 天</option><option value="30">近 30 天</option><option value="all">全部历史</option><option value="custom">自定义</option></select></label>
-      {days === "custom" && <><label>开始日期<input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} /></label><label>结束日期<input type="date" value={endDate} onChange={e => setEndDate(e.target.value)} /></label></>}
-      {!scoped && <label>工作区<select value={workspace} onChange={e => setWorkspace(e.target.value)}><option value="">全部</option><option value="conversation">对话</option><option value="single-security-task">单任务</option><option value="competition">比赛</option></select></label>}
-      {competitionId && <label>题目<select value={challengeId} onChange={e => setChallengeId(e.target.value)}><option value="">全部题目</option>{challenges.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>}
-      <label>模型<input value={model} placeholder="全部模型（精确匹配）" onChange={e => setModel(e.target.value)} /></label>
-      <label>角色<select value={role} onChange={e => setRole(e.target.value)}><option value="">全部角色</option>{Object.entries(roleName).map(([key, title]) => <option key={key} value={key}>{title}</option>)}</select></label>
-      {runId && <label>执行批次<input type="number" min="0" value={generation} placeholder="全部执行" onChange={e => setGeneration(e.target.value)} /></label>}
-    </div>
-    {error && <div role="alert" className={styles.error}>{error}。下方如有数据，为上次成功读取的结果。</div>}
-    {!data && !error && <p role="status">正在读取用量账本…</p>}
-    {totals && <>
-      <div className={styles.cards}>{[
-        ["已知总 Token", num(totals.total_tokens), `${num(totals.records)} 条调用 / 消息记录`],
-        ["输入", num(totals.input_tokens), `缓存读取 ${num(totals.cache_read_tokens)} · 写入 ${num(totals.cache_write_tokens)}`],
-        ["输出", num(totals.output_tokens), `其中推理 ${num(totals.reasoning_tokens)}（已知部分）`],
-        ["上报金额", money(totals.reported_cost), "CLI / 服务返回值，不代表实际扣款"],
-        ["估算金额", money(totals.estimated_cost), `${num(totals.unpriced)} 条未定价${totals.unverified_estimates ? `（${num(totals.unverified_estimates)} 条历史估算口径不明）` : ""} · 与上报金额分开统计`],
-      ].map(([label, value, note]) => <div key={label} className={styles.card}><span>{label}</span><strong>{value}</strong><small>{note}</small></div>)}</div>
-      <div className={styles.health}><div>{Object.entries(totals.quality).map(([key, value]) => <span key={key} data-warning={key !== "reported" && value > 0}>{quality[key]} <b>{value}</b></span>)}</div><small>每 3 秒刷新 · {new Date(data!.as_of * 1000).toLocaleTimeString()} · 缺失不是零</small></div>
-      {totals.records === 0 ? <div className={styles.empty}><strong>这个范围还没有用量记录</strong><p>新调用上报后会自动显示。历史未记录的标题用量无法补回；运行中的 CLI 可能在调用结束后才上报。</p></div> : <>
-        <div className={styles.panel}><h2>消耗趋势 <small>按小时汇总 · 本地时间</small></h2><div className={styles.chart} role="img" aria-label="每小时已知 Token 消耗柱状图">{data!.series.map(row => <div key={row.at} className={styles.barSlot} title={`${new Date(row.at * 1000).toLocaleString()}：${num(row.total_tokens)} Token`}><div className={styles.bar} style={{ height: `${Math.max(2, (row.total_tokens ?? 0) / max * 100)}%` }} /></div>)}</div><div className={styles.chartLabels}><span>{new Date(data!.series[0].at * 1000).toLocaleString()}</span><span>{new Date(data!.series[data!.series.length - 1].at * 1000).toLocaleString()}</span></div></div>
-        <div className={`${styles.panel} ${styles.distributionPanel}`}><div className={styles.header}><h2>用量分布</h2><select aria-label="分组方式" value={group} onChange={e => setGroup(e.target.value)}>{[...(competitionId ? [["challenge_id","题目"]] : []),["role","角色"],["model","模型"],["engine","引擎"],["workspace_kind","工作区"],["worker_id","Worker"]].map(([v,l]) => <option key={v} value={v}>{l}</option>)}</select></div><div className={styles.tableScroll}><table><thead><tr><th>分组</th><th>输入</th><th>输出</th><th>总 Token</th><th>记录数</th></tr></thead><tbody>{data!.groups[group]?.map(row => <tr key={row.name}><td>{labelGroup(row.name)}</td><td>{num(row.input_tokens)}</td><td>{num(row.output_tokens)}</td><td>{num(row.total_tokens)}</td><td>{num(row.records)}</td></tr>)}</tbody></table></div></div>
-        <div className={styles.panel}><h2>用量明细 <small>每条可观测调用 / 消息，不等同于供应商请求数</small></h2><div className={styles.tableScroll}><table><thead><tr><th>{competitionId ? "题目 / 时间" : "时间 / 归属"}</th><th>角色 / 模型</th><th>输入</th><th>输出</th><th>缓存读 / 写</th><th>推理</th><th>质量 / 状态</th><th>金额</th></tr></thead><tbody>{data!.records.map(row => <tr key={row.id}><td>{competitionId && row.challenge_id ? <strong className={styles.challengeName}>{challengeNames[row.challenge_id] || row.challenge_id}</strong> : null}{new Date(row.at * 1000).toLocaleString()}<small>{row.run_id ? <a href={`/run/${encodeURIComponent(row.run_id)}?view=usage`}>{row.run_id}</a> : row.thread_id || "前置调用"}{row.generation != null && ` · 第 ${row.generation} 代`}</small></td><td>{roleName[row.role || ""] || row.role}<small>{row.model || "模型未上报"}{row.worker_id ? ` · ${row.worker_id}` : ""}</small></td><td>{num(row.input_tokens)}</td><td>{num(row.output_tokens)}</td><td>{num(row.cache_read_tokens)} / {num(row.cache_write_tokens)}</td><td>{num(row.reasoning_tokens)}</td><td>{quality[row.quality]}<small>{statusName[row.status] || row.status}</small></td><td>{rowMoney(row)}<small>{rowMoneySource(row)}</small></td></tr>)}</tbody></table></div><div className={styles.pagination}><span>{data!.count} 条记录</span><button disabled={offset === 0} onClick={() => setOffset(v => Math.max(0,v-50))}>上一页</button><button disabled={offset + 50 >= data!.count} onClick={() => setOffset(v => v+50)}>下一页</button></div></div>
-      </>}
-      <p className={styles.footnote}>仅统计此 Muteki 实例归属明确的消费。历史补录未执行的记录不在此范围内；没有细分上报的字段用“—”显示。订阅和模型标价折算不代表实际账单。</p>
-    </>}
+    void load(force);
+    const timer = limits ? null : window.setInterval(() => { if (!document.hidden) void load(false); }, scope === "muteki" ? 15_000 : 60_000);
+    return () => { controller.abort(); if (timer !== null) window.clearInterval(timer); };
+  }, [ready, resourceKey, limits, scope, refresh, invalidDates]);
+  const data = resource.key === resourceKey && (limits || !invalidDates) ? resource.data : null;
+  const summary = data && "totals" in data ? data : null;
+  const limitData = data && "accounts" in data ? data : null;
+  const ledgerParams = new URLSearchParams(query);
+  if (summary && !["all", "custom"].includes(preferences.days)) {
+    if (summary.window.since_ms !== null) ledgerParams.set("start", String(summary.window.since_ms / 1000));
+    if (summary.window.until_ms !== null) ledgerParams.set("end", String(summary.window.until_ms / 1000));
+  }
+  const ledgerQuery = ledgerParams.toString();
+  const availableEngines = [...new Set([...DEFAULT_ENGINES, ...(summary?.providers.map(provider => provider.engine) || [])])];
+  const updatePreference = <Key extends keyof Preferences>(key: Key, value: Preferences[Key]) => setPreferences(previous => ({ ...previous, [key]: value }));
+  const changeScope = (nextScope: UsageScope) => setPreferences(previous => ({ ...previous, scope: nextScope, days: nextScope === "history" && ["all", "custom"].includes(previous.days) ? "7" : previous.days }));
+  return <section className={styles.root} data-scope={competitionId ? "competition" : runId ? "run" : threadId ? "thread" : "global"} aria-label="用量统计">
+    <header className={styles.pageHeader}><div><span className={styles.eyebrow}>USAGE</span><h1>{competitionId ? "比赛 Worker 用量" : runId ? "任务用量" : threadId ? "对话用量" : "用量"}</h1></div><SegmentedControl<UsageMetric> value={metric} onChange={value => updatePreference("metric", value)} size="md" ariaLabel="用量视图" options={[{ value: "cost", label: "费用 Cost" }, { value: "tokens", label: "Token" }, ...(!scoped ? [{ value: "limits" as const, label: "额度 Limits" }] : [])]} /></header>
+    <div className={styles.toolbar}>{!limits ? <><div className={styles.scopeControls}>{!scoped ? <label className={styles.inlineField}><span className={styles.srOnly}>统计范围</span><select value={scope} onChange={event => changeScope(event.target.value as UsageScope)}><option value="history">引擎历史</option><option value="muteki">Muteki 内部用量</option></select></label> : <span className={styles.scopeLabel}>{competitionId ? "仅本比赛 Worker" : runId ? "当前任务" : "当前对话"}</span>}<label className={styles.inlineField}><span className={styles.srOnly}>引擎筛选</span><select value={engine} onChange={event => setEngine(event.target.value)}><option value="">全部引擎</option>{availableEngines.map(engine => <option key={engine} value={engine}>{engineName(engine)}</option>)}</select></label></div><div className={styles.periodControls}><SegmentedControl<string> value={preferences.days} onChange={value => updatePreference("days", value as UsageDays)} size="md" ariaLabel="时间范围" options={[...PERIODS, ...(["all", "custom"].includes(preferences.days) ? [{ value: preferences.days, label: preferences.days === "all" ? "全部历史" : "自定义" }] : [])]} />{scope === "muteki" ? <label className={styles.inlineField}><span className={styles.srOnly}>其他时间范围</span><select value={["all", "custom"].includes(preferences.days) ? preferences.days : ""} onChange={event => { if (event.target.value) updatePreference("days", event.target.value as UsageDays); }}><option value="">更多时间</option><option value="all">全部历史</option><option value="custom">自定义</option></select></label> : null}</div></> : <p className={styles.toolbarNote}>订阅额度 · 独立于费用和 Token</p>}<Button variant="outline" icon="refresh" loading={resource.loading && ready} disabled={!ready || Boolean(invalidDates && !limits)} onClick={() => setRefresh(value => value + 1)}>{limits ? "刷新额度" : "刷新"}</Button></div>
+    {!limits && scope === "muteki" ? <details className={styles.filters} open={preferences.days === "custom" ? true : undefined}><summary>筛选与归属{[workspace, generation, model, role, challengeId].filter(Boolean).length ? ` · ${[workspace, generation, model, role, challengeId].filter(Boolean).length} 项筛选` : ""}</summary><div>{preferences.days === "custom" ? <><label>开始日期<input type="date" value={startDate} onChange={event => setStartDate(event.target.value)} /></label><label>结束日期<input type="date" value={endDate} onChange={event => setEndDate(event.target.value)} /></label></> : null}{!scoped ? <label>工作区<select value={workspace} onChange={event => setWorkspace(event.target.value)}><option value="">全部工作区</option><option value="conversation">对话</option><option value="single-security-task">单任务</option><option value="competition">比赛</option></select></label> : null}{competitionId ? <label>题目<select value={challengeId} onChange={event => setChallengeId(event.target.value)}><option value="">全部题目</option>{challenges.map(challenge => <option key={challenge.id} value={challenge.id}>{challenge.label}</option>)}</select></label> : null}<label>模型<input value={model} placeholder="全部模型（精确匹配）" onChange={event => setModel(event.target.value)} /></label><label>角色<select value={role} onChange={event => setRole(event.target.value)}><option value="">全部角色</option>{Object.entries(ROLES).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>{runId ? <label>执行批次<input type="number" min="0" step="1" value={generation} placeholder="全部执行" onChange={event => setGeneration(event.target.value)} /></label> : null}<Button size="sm" variant="ghost" onClick={() => { setWorkspace(""); setGeneration(""); setModel(""); setRole(""); setChallengeId(""); setEngine(""); }}>清除筛选</Button></div></details> : null}
+    {!limits && invalidDates ? <Callout tone="danger" role="alert">结束日期不能早于开始日期。</Callout> : null}
+    {resource.error && resource.key === resourceKey ? <Callout tone="danger" role="alert">{resource.error}{data ? "。当前保留上次成功结果。" : ""}</Callout> : null}
+    {!data && !resource.error && (limits || !invalidDates) ? <div className={styles.skeleton} role="status" aria-label="正在读取用量"><span className={styles.srOnly}>正在读取{limits ? "额度" : "用量"}…</span><Skeleton className="h-8 w-44" /><Skeleton className="h-60 w-full rounded-lg" /><Skeleton className="h-32 w-full rounded-lg" /></div> : null}
+    {summary && !limits ? <><div className={styles.contextBar}><p>{scope === "history" ? "原生记录与账户历史，按来源去重" : competitionId ? "包含失败、中断和重试；不含 Reason、标题和摘要" : "此 Muteki 实例的任务、对话及辅助调用"}</p><span>{summary.window.slots.length ? `${slotLabel(summary.window.slots[0])} — ${slotLabel(summary.window.slots[summary.window.slots.length - 1])} · ` : ""}更新于 {timestampLabel(summary.as_of)}</span></div><SummaryContent data={summary} metric={metric} scope={scope} />{scope === "muteki" ? <details className={styles.ledgerDisclosure} onToggle={event => setLedgerOpen(event.currentTarget.open)}><summary>查看调用账本与归属 <span>任务、题目、角色和执行批次</span></summary>{ledgerOpen ? <UsageLedger key={query} query={ledgerQuery} refresh={refresh} competitionId={competitionId} challenges={challenges} allowImport={!scoped} onImport={() => setRefresh(value => value + 1)} /> : null}</details> : null}</> : null}
+    {limitData && limits ? <UsageLimitsView data={limitData} /> : null}
   </section>;
 }

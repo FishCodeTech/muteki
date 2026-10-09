@@ -40,3 +40,56 @@
   pointer-events: none;
   background: linear-gradient(to bottom, transparent, var(--cx-bg));
 }
+
+/* Turn process timeline: a rail joins each row's glyph (16px column at 6px inset) to the next. */
+.cx-activity-timeline > [role="listitem"] {
+  position: relative;
+}
+.cx-activity-timeline > [role="listitem"]:has([data-timeline-node]):not(:has([data-timeline-skip])):not(:last-child)::before {
+  content: "";
+  position: absolute;
+  left: 13.5px;
+  top: 27px;
+  bottom: -8px;
+  width: 1px;
+  border-radius: 1px;
+  background: var(--cx-border);
+  transform-origin: center top;
+  animation: cx-timeline-grow 520ms var(--cx-ease-out) both;
+  pointer-events: none;
+}
+@keyframes cx-timeline-grow {
+  from { transform: scaleY(0); }
+  to { transform: scaleY(1); }
+}
+
+/* Finish row: the badge pops in, then its tick draws itself. */
+.cx-timeline-done {
+  animation: cx-timeline-pop 460ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+.cx-timeline-done [data-tick] {
+  stroke-dasharray: 14;
+  stroke-dashoffset: 14;
+  animation: cx-timeline-draw 360ms var(--cx-ease-out) 180ms forwards;
+}
+@keyframes cx-timeline-pop {
+  0% { transform: scale(0.5); opacity: 0; }
+  60% { transform: scale(1.12); opacity: 1; }
+  100% { transform: scale(1); }
+}
+@keyframes cx-timeline-draw {
+  to { stroke-dashoffset: 0; }
+}
+
+.cx-source-chip {
+  animation: cx-source-chip-in 420ms var(--cx-ease-out) both;
+}
+@keyframes cx-source-chip-in {
+  from { opacity: 0; transform: translateY(4px) scale(0.92); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cx-timeline-done [data-tick] { stroke-dashoffset: 0; animation: none; }
+}
+html[data-motion="reduce"] .cx-timeline-done [data-tick] { stroke-dashoffset: 0; animation: none; }

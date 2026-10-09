@@ -314,7 +314,7 @@ export function ComposerContextStrip({
       </div>
       {pickingExisting ? (
         <div
-          className="px-0.5 text-[11px] leading-snug text-cx-fg-3"
+          className="px-0.5 text-[12px] leading-snug text-cx-fg-3"
           data-testid="existing-worktree-status"
           data-phase={phase}
         >

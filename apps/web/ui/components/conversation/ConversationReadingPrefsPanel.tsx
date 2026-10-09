@@ -31,7 +31,7 @@ function PrefRow({
   return (
     <div className={cn("cx-reading-pref-row flex flex-col", compact ? "gap-1.5" : "gap-2")} data-testid={testId}>
       <div className="flex items-center justify-between gap-3">
-        <span className="text-[12.5px] font-medium text-cx-fg-2">{label}</span>
+        <span className="text-[13px] font-medium text-cx-fg-2">{label}</span>
         {value ? <span className="cx-tabular text-[12px] text-cx-fg-4">{value}</span> : null}
       </div>
       {children}
@@ -69,14 +69,14 @@ export function ConversationReadingPrefsPanel({
       {!compact && !hideIntro ? (
         <header className="flex flex-col gap-1">
           <h3 className="text-[14px] font-semibold text-cx-fg">{t("readingPrefs.title")}</h3>
-          <p className="text-[12.5px] leading-5 text-cx-fg-3">{t("readingPrefs.hint")}</p>
+          <p className="text-[13px] leading-5 text-cx-fg-3">{t("readingPrefs.hint")}</p>
         </header>
       ) : null}
 
       <PrefRow label={t("readingPrefs.fontScale")} value={fontLabel} testId="c39-font-scale" compact={compact}>
         <label className="flex items-center gap-2.5">
           <span className="sr-only">{t("readingPrefs.fontScale")}</span>
-          <span aria-hidden className="w-3 text-center text-[11px] font-semibold text-cx-fg-4">A</span>
+          <span aria-hidden className="w-3 text-center text-[12px] font-semibold text-cx-fg-4">A</span>
           <Slider
             className="min-w-0 flex-1 gap-0"
             min={0}

@@ -162,12 +162,12 @@ export function CodeBlock({
             {filename}
           </span>
         ) : null}
-        <span className="text-[10px] font-medium uppercase tracking-wide text-cx-fg-3/55">
+        <span className="text-[12px] font-medium uppercase tracking-wide text-cx-fg-3/55">
           {languageLabel ?? language}
         </span>
         <span className="ml-auto" />
         {streaming ? (
-          <span className="inline-flex shrink-0 items-center gap-1 text-[10px] font-medium text-cx-accent">
+          <span className="inline-flex shrink-0 items-center gap-1 text-[12px] font-medium text-cx-accent">
             <LoaderCircle className={cn("size-3", !reduce && "animate-spin")} />
             生成中
           </span>

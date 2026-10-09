@@ -22,7 +22,7 @@ export function SurfaceToolbar({ children, className }: { children: ReactNode; c
 export function SectionHeader({ title, count, action, className }: { title: ReactNode; count?: number | string; action?: ReactNode; className?: string }) {
   return (
     <div className={cn("flex h-7 items-center justify-between gap-2 px-1", className)}>
-      <h3 className="flex items-center gap-1.5 text-[11.5px] font-medium text-cx-fg-3">
+      <h3 className="flex items-center gap-1.5 text-[12px] font-medium text-cx-fg-3">
         {title}
         {count !== undefined ? <span className="cx-tabular text-cx-fg-4">{count}</span> : null}
       </h3>

@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { currentAuthScope } from "./useRun";
-import { desktopChatBridge, type DesktopNativeState, type DesktopWorkspaceGrant, type NativeCapabilityId, type NativeCapabilityManifest } from "./desktopChatBridge";
+import { desktopChatBridge, type DesktopEditorOpenResult, type DesktopNativeState, type DesktopWorkspaceGrant, type NativeCapabilityId, type NativeCapabilityManifest } from "./desktopChatBridge";
 
 export const NATIVE_CAPABILITIES: NativeCapabilityId[] = ["pathSelection", "workspaceFileActions", "preview", "attachmentCache", "terminal", "microphone", "notifications", "deepLinks"];
 export class NativeDesktopError extends Error {
@@ -123,4 +123,11 @@ export async function openNativeWorkspaceFile(state: DesktopNativeState | null, 
   const identity = workspaceIdentity(state);
   if (grants.get(workspaceKey(state, context)) !== grant) throw new NativeDesktopError("desktop.workspace_grant_expired", "本机目录映射已过期，请重新选择。");
   await bridge.openWorkspaceFile({ grantId: grant.grantId, threadId: context.threadId, workspaceId: context.workspaceId, ...identity, relativePath: workspaceRelativePath(relativePath), action });
+}
+export async function openNativeWorkspaceInEditor(state: DesktopNativeState | null, context: NativeWorkspaceContext, grant: DesktopWorkspaceGrant, relativePath?: string, line?: number, editor?: string): Promise<DesktopEditorOpenResult> {
+  const bridge = desktopChatBridge();
+  if (!nativeCapability(state, "workspaceFileActions").available || !bridge?.openWorkspaceInEditor) throw new NativeDesktopError("desktop.editor_unavailable", "当前桌面版本不支持在编辑器中打开，请更新桌面端。");
+  const identity = workspaceIdentity(state);
+  if (grants.get(workspaceKey(state, context)) !== grant) throw new NativeDesktopError("desktop.workspace_grant_expired", "本机目录映射已过期，请重新选择。");
+  return bridge.openWorkspaceInEditor({ grantId: grant.grantId, threadId: context.threadId, workspaceId: context.workspaceId, ...identity, ...(editor ? { editor } : {}), ...(relativePath ? { relativePath: workspaceRelativePath(relativePath), line } : {}) });
 }

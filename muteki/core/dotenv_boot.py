@@ -40,6 +40,14 @@ def load_env(path: Optional[Path] = None) -> bool:
     _loaded = True
 
     configured = os.environ.get("MUTEKI_ENV_FILE")
+    if os.environ.get("MUTEKI_MANAGED_DESKTOP") == "1":
+        # Managed releases never import a checkout's .env, including when an
+        # entrypoint accidentally supplies an explicit source-relative path.
+        root = Path(os.environ["MUTEKI_ENVIRONMENT_ROOT"]).resolve()
+        env_path = Path(configured).resolve() if configured else root / "config" / ".env"
+        if path is not None or not env_path.is_relative_to(root):
+            raise ValueError("Managed desktop configuration must belong to its environment")
+        return False  # Managed settings are configured through the service, not dotenv.
     env_path = Path(path) if path is not None else Path(configured).expanduser() if configured else _REPO_ROOT / ".env"
     if not env_path.is_file():
         return False

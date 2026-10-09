@@ -16,6 +16,7 @@ import { useCopied } from "@/lib/useCopied";
 import { Button, ListBox, ListBoxItem, Select } from "@heroui/react";
 import type { ArtifactView } from "@/lib/events";
 import { panelHotkey } from "@/lib/runtimeTabs";
+import { providerEngines, readyCatalog, useProviderDescriptors } from "@/lib/providerDescriptors";
 
 /**
  * The collapsible right-column run inspector (the redesign's floating inspector):
@@ -28,10 +29,6 @@ import { panelHotkey } from "@/lib/runtimeTabs";
  * the compact roster, so the operator always sees WHO is racing without the
  * coordinator conversation being drowned out.
  */
-
-const SPAWN_ENGINES = [
-  "claude", "codex", "cursor", "pi", "omp", "kimi", "grok", "opencode", "devin",
-];
 
 function platformStatusLabel(
   status: PlatformConfirmationStatus,
@@ -208,6 +205,7 @@ export function RunInspector({
   const isPentest = deck.mode === "pentest";
   const { lang } = useLang();
   const [spawnEngine, setSpawnEngine] = useState("");
+  const spawnEngines = providerEngines(readyCatalog(useProviderDescriptors()));
   const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set());
   useEffect(() => {
     if (!isPentest) return;
@@ -555,7 +553,7 @@ export function RunInspector({
               <div className="iwk-spawn">
                 <Select aria-label={t("workerDock.engine")} selectedKey={spawnEngine} onSelectionChange={(key) => setSpawnEngine(String(key ?? ""))}>
                   <Select.Trigger><Select.Value /></Select.Trigger>
-                  <Select.Popover><ListBox><ListBoxItem id="" textValue={t("workerDock.auto")}>{t("workerDock.auto")}</ListBoxItem>{SPAWN_ENGINES.map((engine) => <ListBoxItem key={engine} id={engine} textValue={engine}>{engine}</ListBoxItem>)}</ListBox></Select.Popover>
+                  <Select.Popover><ListBox><ListBoxItem id="" textValue={t("workerDock.auto")}>{t("workerDock.auto")}</ListBoxItem>{spawnEngines.map((engine) => <ListBoxItem key={engine} id={engine} textValue={engine}>{engine}</ListBoxItem>)}</ListBox></Select.Popover>
                 </Select>
                 <Button className="iwk-spawn-btn" onClick={() => onSpawnWorker(spawnEngine || undefined)}
                   data-tooltip={t("workerDock.addTitle")}>＋ {t("workerDock.add")}</Button>

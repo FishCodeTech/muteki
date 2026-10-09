@@ -3,6 +3,11 @@
  * success vs per-engine login/CLI/directory blockers. Pure — no React.
  */
 
+import {
+  isKnownAdapter, isKnownEngine, loginGuidance as descriptorLoginGuidance, runtimeScopesModelCatalog,
+  type ProviderDescriptorCatalog,
+} from "./providerDescriptors";
+
 export const GUIDE_DISMISSED_STORAGE_KEY = "muteki:conversation-readiness:guide-dismissed";
 export const RECENT_PATHS_STORAGE_KEY = "muteki:conversation-readiness:recent-paths";
 
@@ -33,7 +38,7 @@ export type RecoveryAction =
 
 export type ReadinessGuide = "hidden" | "compact" | "first_run";
 
-export type ReadinessSource = "credentials" | "runtimes" | "projects" | "directory" | "selection";
+export type ReadinessSource = "credentials" | "runtimes" | "projects" | "descriptors" | "directory" | "selection";
 
 export interface ReadinessBlocker {
   kind: BlockerKind;
@@ -57,6 +62,7 @@ export interface ConversationReadiness {
     credentials: SourceState;
     runtimes: SourceState;
     projects: SourceState;
+    descriptors: SourceState;
   };
   selected: ConversationReadinessSelected;
   blockers: ReadinessBlocker[];
@@ -115,46 +121,6 @@ export interface ReadinessProject {
   root_path?: string;
 }
 
-/** Host CLI login instructions (not secrets). Mirrors agent_runtime_api.LOGIN_GUIDANCE. */
-export const ENGINE_LOGIN_GUIDANCE: Record<string, { command: string; note: string }> = {
-  devin: {
-    command: "devin auth login",
-    note: "聊天使用本机 Devin CLI 登录；也支持 WINDSURF_API_KEY。",
-  },
-  claude: {
-    command: "claude（进入后执行 /login）",
-    note: "macOS 登录态保存在 Keychain；也可在统一凭据中心导入宿主登录。",
-  },
-  codex: {
-    command: "codex login",
-    note: "登录后可在统一凭据中心从宿主 ~/.codex/auth.json 导入。",
-  },
-  cursor: {
-    command: "cursor-agent login 或设置 CURSOR_API_KEY",
-    note: "headless 模式只读取 CURSOR_API_KEY。",
-  },
-  pi: {
-    command: "pi（完成登录后写入 ~/.pi/agent）",
-    note: "",
-  },
-  omp: {
-    command: "omp（完成登录后写入 ~/.omp/agent）",
-    note: "",
-  },
-  kimi: {
-    command: "kimi（进入后执行 /login，写入 ~/.kimi-code）",
-    note: "",
-  },
-  grok: {
-    command: "grok login",
-    note: "",
-  },
-  opencode: {
-    command: "opencode auth login",
-    note: "",
-  },
-};
-
 const UNAVAILABLE_STATUSES = new Set([
   "missing", "absent", "failed", "invalid", "error", "unavailable",
 ]);
@@ -203,7 +169,7 @@ export function sourceLoading(): SourceState {
 }
 
 export function credentialAvailable(credential: ReadinessCredential | undefined): boolean {
-  if (!credential || credential.engine === "dsh") return false;
+  if (!credential) return false;
   if (credential.present === false) return false;
   return !UNAVAILABLE_STATUSES.has(String(credential.status || "").toLowerCase());
 }
@@ -304,9 +270,13 @@ export function isDirectoryInaccessibleMessage(message: string): boolean {
   return /目录不存在|directory\.inaccessible|directory_inaccessible|不是目录|已经不存在/.test(text);
 }
 
-function loginGuidance(engine: string, runtime?: ReadinessRuntime): { command: string; note: string } {
+function loginGuidance(
+  engine: string,
+  runtime: ReadinessRuntime | undefined,
+  descriptors: ProviderDescriptorCatalog | null,
+): { command: string; note: string } {
   const auth = runtime?.health?.auth || runtime?.auth;
-  const mapped = ENGINE_LOGIN_GUIDANCE[engine] || { command: "", note: "" };
+  const mapped = descriptorLoginGuidance(descriptors, engine);
   return {
     command: String(auth?.login_command || mapped.command || "").trim(),
     note: String(auth?.note || mapped.note || "").trim(),
@@ -329,6 +299,8 @@ export interface ClassifyConversationReadinessInput {
   credentials: ReadinessCredential[];
   runtimes: ReadinessRuntime[];
   projects?: ReadinessProject[];
+  /** Ready catalog, or ``null`` while ``sources.descriptors`` is loading/failed. */
+  descriptors: ProviderDescriptorCatalog | null;
   selected: ConversationReadinessSelected;
   probing?: boolean;
   directoryIssue?: { message: string } | null;
@@ -340,20 +312,20 @@ export function classifyConversationReadiness(
   input: ClassifyConversationReadinessInput,
 ): ConversationReadiness {
   const sources = input.sources;
-  const credentials = input.credentials.filter((row) => row.engine !== "dsh");
+  const descriptors = input.descriptors;
+  // Only engines/adapters the service describes are selectable.
+  const credentials = input.credentials.filter((row) => isKnownEngine(descriptors, row.engine));
   const runtimes = input.runtimes.filter((row) => (
-    row.enabled !== false
-    && row.adapter_id !== "cli.dsh"
-    && row.adapter_id !== "deepseek.harness"
+    row.enabled !== false && isKnownAdapter(descriptors, row.adapter_id)
   ));
   const selected = { ...input.selected };
   const blockers: ReadinessBlocker[] = [];
 
   const connectionSources = (
-    ["credentials", "runtimes", "projects"] as const
+    ["credentials", "runtimes", "projects", "descriptors"] as const
   ).filter((key) => isConnectionSourceFailure(sources[key]));
   const erroredSources = (
-    ["credentials", "runtimes", "projects"] as const
+    ["credentials", "runtimes", "projects", "descriptors"] as const
   ).filter((key) => sources[key].phase === "error");
   // Site down / proxy 502: one disconnect card — never flood with 3× config cards.
   const siteDown = connectionSources.length >= 2
@@ -390,6 +362,14 @@ export function classifyConversationReadiness(
         message: `项目列表加载失败：${sources.projects.message || "未知错误"}`,
       });
     }
+    if (sources.descriptors.phase === "error") {
+      blockers.push({
+        kind: "config_read_failed",
+        source: "descriptors",
+        recovery: "retry",
+        message: `引擎描述加载失败：${sources.descriptors.message || "未知错误"}`,
+      });
+    }
   }
 
   if (input.probing) {
@@ -402,6 +382,7 @@ export function classifyConversationReadiness(
   } else if (
     sources.credentials.phase === "loading"
     || sources.runtimes.phase === "loading"
+    || sources.descriptors.phase === "loading"
   ) {
     blockers.push({
       kind: "connecting",
@@ -422,7 +403,7 @@ export function classifyConversationReadiness(
     ? pickRuntimeForEngine(credential.engine, runtimes)
     : undefined);
 
-  if (sources.credentials.phase === "ok" && sources.runtimes.phase === "ok") {
+  if (sources.credentials.phase === "ok" && sources.runtimes.phase === "ok" && descriptors) {
     const missingRuntime = Boolean(credential && !engineRuntime);
     if (runtimeCliMissing(engineRuntime) || missingRuntime) {
       blockers.push({
@@ -445,7 +426,7 @@ export function classifyConversationReadiness(
     }
     const alreadyInstalled = blockers.some((row) => row.kind === "not_installed");
     if (!alreadyInstalled && !discoveryDisabled && (credentialLoginMissing(credential) || runtimeAuthMissing(runtime))) {
-      const guidance = loginGuidance(engine, runtime);
+      const guidance = loginGuidance(engine, runtime, descriptors);
       const commandLine = guidance.command
         ? `在宿主终端执行 ${guidance.command}，完成后返回此页将自动检查`
         : "请在宿主终端完成 CLI 登录，完成后返回此页将自动检查";
@@ -473,12 +454,13 @@ export function classifyConversationReadiness(
           message: "未发现可用 Agent，请前往设置 → Agents 配置",
         });
       } else if (credential && credentialAvailable(credential) && !modelIds.length) {
+        const scopedCatalog = runtimeScopesModelCatalog(descriptors, runtime?.key);
         blockers.push({
           kind: "model_unavailable",
           source: "selection",
-          recovery: runtime?.adapter_id === "codex.app_server" ? "probe" : "open_agents",
+          recovery: scopedCatalog ? "probe" : "open_agents",
           engine,
-          message: runtime?.adapter_id === "codex.app_server"
+          message: scopedCatalog
             ? "尚未读取当前凭据的原生模型目录，请验证 Agent 后选择模型"
             : "当前接入点没有可用模型，请前往 Agents 补充模型或测连通",
         });
@@ -513,6 +495,7 @@ export function classifyConversationReadiness(
 
   const envReady = Boolean(
     sources.credentials.phase === "ok"
+    && descriptors
     && credential
     && credentialAvailable(credential)
     && modelIds.length,

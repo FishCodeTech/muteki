@@ -31,7 +31,7 @@ function StatusGlyph({ status }: { status: ConversationToolRecord["status"] }) {
     case "declined":
       return <Icon name="minus" size={13} className="text-cx-warning" />;
     case "pending":
-      return <Icon name="circleDashed" size={12} className="text-cx-fg-4" />;
+      return <span aria-hidden="true" className="grid size-3 place-items-center"><span className="size-1.5 rounded-full bg-cx-fg-4/70" /></span>;
     default: {
       const exhaustive: never = status;
       return exhaustive;
@@ -105,9 +105,9 @@ export function ConversationBottomPanel({
                     className="group flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-cx-hover"
                   >
                     <Icon name={toolKindIcon(kind)} size={14} className={cn("shrink-0", tool.status === "failed" ? "text-cx-danger" : "text-cx-fg-4")} />
-                    <span className={cn("shrink-0 text-[12.5px] font-medium", tool.status === "failed" ? "text-cx-danger" : "text-cx-fg-2")}>{toolLabel(tool, kind)}</span>
-                    <span className="min-w-0 flex-1 truncate font-cx-mono text-[11.5px] text-cx-fg-3">{detail || summary}</span>
-                    {duration ? <span className="cx-tabular shrink-0 text-[11px] text-cx-fg-4">{duration}</span> : null}
+                    <span className={cn("shrink-0 text-[13px] font-medium", tool.status === "failed" ? "text-cx-danger" : "text-cx-fg-2")}>{toolLabel(tool, kind)}</span>
+                    <span className="min-w-0 flex-1 truncate font-cx-mono text-[12px] text-cx-fg-3">{detail || summary}</span>
+                    {duration ? <span className="cx-tabular shrink-0 text-[12px] text-cx-fg-4">{duration}</span> : null}
                     <span className="grid size-4 shrink-0 place-items-center"><StatusGlyph status={tool.status} /></span>
                   </button>
                 </li>

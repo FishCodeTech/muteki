@@ -109,3 +109,5 @@ data/
 /docker/tsec-hosted/.build-ctx/
 
 /apps/web/ui/.next-readme/
+/apps/web/ui/.next-desktop/
+/apps/desktop/dist-dev/

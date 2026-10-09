@@ -21,6 +21,7 @@ from muteki.solver.cli_engines.engines.claude import ClaudeCodeDriver
 from muteki.solver.cli_engines.engines.codex import CodexDriver
 from muteki.solver.cli_engines.engines.cursor import CursorDriver
 from muteki.solver.cli_engines.engines.devin import DevinDriver
+from muteki.solver.cli_engines.engines.droid import DroidDriver
 from muteki.solver.cli_engines.engines.grok import GrokDriver
 from muteki.solver.cli_engines.engines.kimi import KimiCodeDriver
 from muteki.solver.cli_engines.engines.omp import OhMyPiDriver
@@ -40,6 +41,7 @@ DRIVERS: dict[str, CliDriver] = {
     "kimi": KimiCodeDriver(),
     "grok": GrokDriver(),
     "opencode": OpenCodeDriver(),
+    "droid": DroidDriver(),
 }
 
 

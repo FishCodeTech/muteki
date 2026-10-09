@@ -27,11 +27,16 @@ import asyncio
 import base64
 import itertools
 import json
+import logging
 import os
-import signal
-import subprocess
+import time
 import uuid
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
+
+from .process_supervisor import SupervisedProcess, TerminateResult, spawn_supervised
+
+_LOG = logging.getLogger(__name__)
 
 #: 出站消息 id 计数器（进程内单调，避免与 Agent 侧 id 冲突加前缀）。
 _ID_COUNTER = itertools.count(1)
@@ -168,8 +173,147 @@ def default_is_response(msg: Any) -> bool:
         "result" in msg or "error" in msg)
 
 
+PEER_CLOSED_CODE = "external_agent.transport.peer_closed"
+
+
 class PeerClosedError(RuntimeError):
-    """对端进程退出 / stdout EOF 后仍有未决请求时抛出。"""
+    """对端进程退出 / stdout EOF 后仍有未决请求时抛出。
+
+    Typed: callers branch on ``code`` / ``reason``, never on the message.
+    ``reason`` is ``closed`` (local close), ``not_running`` (send on a dead
+    peer), ``stdout_eof`` (peer closed stdout) or ``reader_failed`` (framing
+    or dispatch error, cause in ``cause``).  ``stderr`` is the complete
+    stderr captured so far (full text, never truncated).
+    """
+
+    code = PEER_CLOSED_CODE
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        reason: str = "closed",
+        exit_code: Optional[int] = None,
+        stderr: str = "",
+        cause: str = "",
+    ) -> None:
+        self.reason = reason
+        self.exit_code = exit_code
+        self.stderr = stderr
+        self.cause = cause
+        super().__init__(message or reason)
+
+
+def default_process_log_root() -> Path:
+    return Path(os.environ.get("MUTEKI_STATE_ROOT") or "state") / "_logs" / "external_agents"
+
+
+class ProcessOutputLog:
+    """Drain a long-lived server's stdout/stderr into one complete log file.
+
+    Pipes are read continuously so a chatty server never blocks on a full
+    pipe.  Every byte is written to ``path``; ``detail()`` returns only a
+    bounded tail for error messages and always names the complete log file.
+    """
+
+    def __init__(self, path: Path, *, label: str, tail_bytes: int = 8192) -> None:
+        self.path = Path(path)
+        self.label = label
+        self._tail_bytes = int(tail_bytes)
+        self._tail = bytearray()
+        self._dropped = 0
+        self._tasks: list[asyncio.Task] = []
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = open(self.path, "ab")  # noqa: SIM115 — closed in close()
+        self.write_error: Optional[str] = None
+
+    @classmethod
+    def create(cls, root: Optional[Path], *, label: str, tail_bytes: int = 8192) -> "ProcessOutputLog":
+        base = Path(root) if root is not None else default_process_log_root()
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in label)
+        return cls(base / f"{safe}-{stamp}-{uuid.uuid4().hex[:8]}.log", label=label, tail_bytes=tail_bytes)
+
+    def attach(self, proc: "asyncio.subprocess.Process") -> None:
+        for name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr)):
+            if stream is not None:
+                self._tasks.append(asyncio.ensure_future(self._drain(name, stream)))
+
+    async def _drain(self, name: str, stream: asyncio.StreamReader) -> None:
+        pending = b""
+        prefix = f"[{name}] ".encode()
+        while True:
+            chunk = await stream.read(65536)
+            if not chunk:
+                break
+            pending += chunk
+            *lines, pending = pending.split(b"\n")
+            for line in lines:
+                self._write(prefix + line + b"\n")
+        if pending:
+            self._write(prefix + pending + b"\n")
+
+    def append(self, data: bytes) -> None:
+        """Write raw bytes from a stream the caller drains itself."""
+        self._write(data)
+
+    def _write(self, data: bytes) -> None:
+        self._tail.extend(data)
+        if len(self._tail) > self._tail_bytes:
+            excess = len(self._tail) - self._tail_bytes
+            del self._tail[:excess]
+            self._dropped += excess
+        if self._file.closed:
+            return
+        try:
+            self._file.write(data)
+            self._file.flush()
+        except OSError as exc:
+            # The drain must keep running or the child blocks on a full pipe;
+            # the failure is surfaced through detail() instead.
+            self.write_error = f"{type(exc).__name__}: {exc}"
+
+    def read_all(self) -> str:
+        """Complete captured output (everything written to the log file)."""
+        if not self._file.closed:
+            self._file.flush()
+        return self.path.read_bytes().decode("utf-8", errors="replace").strip()
+
+    @property
+    def tail_truncated(self) -> bool:
+        return self._dropped > 0
+
+    def detail(self) -> str:
+        text = bytes(self._tail).decode("utf-8", errors="replace").strip()
+        notes = [f"完整输出日志：{self.path}"]
+        if self.write_error:
+            notes.append(f"日志写入失败：{self.write_error}")
+        if not text:
+            return f"{self.label} 无输出（{'；'.join(notes)}）"
+        return (f"{self.label} 输出末尾（最多 {self._tail_bytes} 字节，{'；'.join(notes)}）：\n"
+                f"{text}")
+
+    async def close(self, *, timeout: float = 5.0) -> None:
+        if self._tasks:
+            done, pending = await asyncio.wait(self._tasks, timeout=timeout)
+            for task in pending:
+                # A grandchild may keep the inherited pipe open after the
+                # server exits; stop reading rather than hang teardown.
+                task.cancel()
+            for task in pending:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            for task in done:
+                if task.cancelled():
+                    continue
+                exc = task.exception()
+                if exc is not None:
+                    self.write_error = self.write_error or f"{type(exc).__name__}: {exc}"
+            self._tasks = []
+        if not self._file.closed:
+            self._file.close()
 
 
 class StdioJsonlPeer:
@@ -197,8 +341,22 @@ class StdioJsonlPeer:
             Callable[[str, str, Optional[dict]], dict[str, Any]]] = None,
         on_message: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None,
         on_raw_line: Optional[Callable[[str], None]] = None,
+        stderr_tail_bytes: int = 8192,
+        owner_adapter_id: str = "",
+        owner_session_id: str = "",
+        stderr_log_root: Optional[Path] = None,
+        terminate_grace_s: float = 5.0,
     ) -> None:
         self.argv = list(argv)
+        self.owner_adapter_id = owner_adapter_id
+        self.owner_session_id = owner_session_id
+        self._stderr_log_root = stderr_log_root
+        self._stderr_log: Optional[ProcessOutputLog] = None
+        self._terminate_grace_s = float(terminate_grace_s)
+        self._supervised: Optional[SupervisedProcess] = None
+        #: Result of the last ``close`` (typed; refused/survived are visible here).
+        self.termination: Optional[TerminateResult] = None
+        self._stderr_tail_bytes = int(stderr_tail_bytes)
         self.cwd = cwd
         self.env = env
         self.label = label or (argv[0] if argv else "peer")
@@ -211,6 +369,7 @@ class StdioJsonlPeer:
         self._reader_task: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._stderr_tail = bytearray()
+        self._stderr_dropped = 0
         self._pending: dict[str, asyncio.Future] = {}
         # 仅保留最后一条 RPC 的无敏感诊断元数据。不得保存 params：其中可能
         # 包含用户输入、凭据或工具参数，错误投影会将本摘要写入持久化事件。
@@ -228,6 +387,11 @@ class StdioJsonlPeer:
         return (self._proc is not None and self._proc.returncode is None
                 and not self._closed)
 
+    async def wait_closed(self) -> None:
+        """Wait for stdout to close without cancelling the shared reader."""
+        if self._reader_task is not None:
+            await asyncio.shield(self._reader_task)
+
     def diagnostics(self) -> dict[str, Any]:
         """返回可安全写入运行事件的 peer 诊断摘要。
 
@@ -236,73 +400,86 @@ class StdioJsonlPeer:
         上限、进程存活状态及完整 stderr 尾部。
         """
         proc = self._proc
+        termination = self.termination
         return {
             "label": self.label,
             "running": self.running,
             "returncode": proc.returncode if proc is not None else None,
             "last_request": dict(self._last_request or {}),
             "stderr_tail": self._stderr_detail(),
+            "stderr_log": str(self._stderr_log.path) if self._stderr_log is not None else "",
+            "termination": (
+                {"code": termination.code, "signals": list(termination.signals),
+                 "detail": termination.detail}
+                if termination is not None else None),
             "stats": dict(self.stats),
         }
 
     async def start(self) -> None:
-        """拉起子进程并启动 stdout reader task。"""
+        """拉起子进程（独立进程组 + 进程台账）并启动 stdout reader task。"""
         if self.running:
             return
         from .probe_environment import subprocess_environment
         env = subprocess_environment(self.env)
-        self._proc = await asyncio.create_subprocess_exec(
-            *self.argv,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=self.cwd or None,
-            env=env,
-        )
+        stderr_log = ProcessOutputLog.create(
+            self._stderr_log_root, label=f"{self.label}-stderr",
+            tail_bytes=self._stderr_tail_bytes)
+        try:
+            self._supervised = await spawn_supervised(
+                self.argv,
+                adapter_id=self.owner_adapter_id or self.label,
+                session_id=self.owner_session_id,
+                label=self.label,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self.cwd or None,
+                env=env,
+            )
+        except BaseException:
+            await stderr_log.close()
+            raise
+        self._stderr_log = stderr_log
+        self._proc = self._supervised.process
+        self.termination = None
         self._closed = False
         self._stderr_tail.clear()
+        self._stderr_dropped = 0
         self._stderr_task = asyncio.ensure_future(self._read_stderr())
         self._reader_task = asyncio.ensure_future(self._read_loop())
 
     async def close(self) -> int:
-        """终止进程并失败所有未决请求；返回退出码（无进程时为 -1）。"""
+        """终止整个进程组并失败所有未决请求；返回退出码（无进程时为 -1）。
+
+        终止结果（含拒绝信号的身份不符等情形）保存在 ``termination``。
+        """
         self._closed = True
         proc = self._proc
         if proc is None:
             return -1
-        descendants: list[int] = []
-        if proc.returncode is None and proc.pid:
-            # 只按 PPID 收子孙。ACP 子进程和 uvicorn 同一进程组，
-            # 不能 killpg。
-            descendants = _descendant_pids(proc.pid)
-        if proc.returncode is None:
+        if self._supervised is not None and self.termination is None:
+            self.termination = await self._supervised.terminate(
+                grace_s=self._terminate_grace_s)
+            if not self.termination.stopped:
+                _LOG.warning("%s process group not stopped: %s %s", self.label,
+                             self.termination.code, self.termination.detail)
+        for name, task in (("reader_error", self._reader_task),
+                           ("stderr_reader_error", self._stderr_task)):
+            if task is None:
+                continue
+            if not task.done():
+                task.cancel()
             try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=5.0)
-            except (asyncio.TimeoutError, ProcessLookupError):
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                await proc.wait()
-        for pid in descendants:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
+                await task
+            except asyncio.CancelledError:
                 pass
-        if self._reader_task is not None:
-            self._reader_task.cancel()
-            try:
-                await self._reader_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-        if self._stderr_task is not None:
-            self._stderr_task.cancel()
-            try:
-                await self._stderr_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-        self._fail_pending(PeerClosedError(f"{self.label} closed"))
+            except Exception as exc:  # noqa: BLE001 — recorded, close must finish
+                self.stats[name] = f"{type(exc).__name__}: {exc}"
+        if self._stderr_log is not None:
+            await self._stderr_log.close()
+        self._fail_pending(PeerClosedError(
+            f"{self.label} closed", reason="closed",
+            exit_code=proc.returncode, stderr=self.stderr_text()))
         return int(proc.returncode if proc.returncode is not None else -1)
 
     # -- 出站 ----------------------------------------------------------------
@@ -310,7 +487,10 @@ class StdioJsonlPeer:
     async def send(self, msg: dict[str, Any]) -> None:
         """写一条 JSON 记录（LF 结尾）。"""
         if not self.running or self._proc is None or self._proc.stdin is None:
-            raise PeerClosedError(f"{self.label} is not running")
+            raise PeerClosedError(
+                f"{self.label} is not running", reason="not_running",
+                exit_code=self._proc.returncode if self._proc is not None else None,
+                stderr=self.stderr_text() if self._proc is not None else "")
         encoded = json.dumps(msg, ensure_ascii=False).encode("utf-8")
         frames = [encoded]
         if self._rpc_chunks_enabled and len(encoded) > RPC_FRAME_BYTES:
@@ -404,25 +584,51 @@ class StdioJsonlPeer:
     # -- 入站 ----------------------------------------------------------------
 
     async def _read_stderr(self) -> None:
-        """持续排空 stderr，并保留经过长度限制的启动错误尾部。"""
+        """持续排空 stderr：完整写入日志文件，并保留有界尾部用于错误投影。"""
         assert self._proc is not None and self._proc.stderr is not None
+        stderr_log = self._stderr_log
         try:
             while True:
                 chunk = await self._proc.stderr.read(4096)
                 if not chunk:
                     return
+                if stderr_log is not None:
+                    stderr_log.append(chunk)
                 self._stderr_tail.extend(chunk)
-                if len(self._stderr_tail) > 8192:
-                    del self._stderr_tail[:-8192]
+                if len(self._stderr_tail) > self._stderr_tail_bytes:
+                    excess = len(self._stderr_tail) - self._stderr_tail_bytes
+                    del self._stderr_tail[:excess]
+                    self._stderr_dropped += excess
         except asyncio.CancelledError:
             raise
 
+    def stderr_tail_text(self) -> str:
+        """Retained stderr tail (bounded by ``stderr_tail_bytes``); see ``stderr_text``."""
+        return bytes(self._stderr_tail).decode("utf-8", errors="replace").strip()
+
+    def stderr_text(self) -> str:
+        """Complete stderr captured so far, read from the log file (no truncation)."""
+        if self._stderr_log is None:
+            return self.stderr_tail_text()
+        return self._stderr_log.read_all()
+
+    async def wait_exit(self) -> Optional[int]:
+        """Resolve with the process exit code (``TurnRunner(exit_watch=...)``)."""
+        if self._proc is None:
+            raise PeerClosedError(f"{self.label} is not running", reason="not_running")
+        return await self._proc.wait()
+
     def _stderr_detail(self) -> str:
-        detail = bytes(self._stderr_tail).decode(
-            "utf-8", errors="replace").strip()
-        if not detail:
-            return ""
-        return detail[-2000:]
+        tail = self.stderr_tail_text()
+        if self._stderr_log is None:
+            return tail
+        note = f"完整 stderr 日志：{self._stderr_log.path}"
+        if self._stderr_dropped:
+            note = (f"以上仅为 stderr 末尾 {self._stderr_tail_bytes} 字节，"
+                    f"已省略前 {self._stderr_dropped} 字节；{note}")
+        if self._stderr_log.write_error:
+            note += f"；日志写入失败：{self._stderr_log.write_error}"
+        return f"{tail}\n（{note}）" if tail else ""
 
     async def _read_loop(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
@@ -442,16 +648,25 @@ class StdioJsonlPeer:
             raise
         except Exception as exc:  # noqa: BLE001
             # reader 异常不能静默吞掉：记录原因并失败所有未决请求。
-            self.stats["reader_error"] = str(exc)[:200]
+            self.stats["reader_error"] = f"{type(exc).__name__}: {exc}"
+            _LOG.warning("%s stdout reader failed: %s", self.label,
+                         self.stats["reader_error"])
         finally:
             # stderr has its own drain task; one loop tick lets the final startup
             # diagnostic reach the bounded tail before pending requests fail.
             await asyncio.sleep(0)
             detail = self._stderr_detail()
+            reader_error = self.stats.get("reader_error")
+            reason = (f"stdout reader failed ({reader_error})" if reader_error
+                      else "reached stdout EOF")
             self._fail_pending(
                 PeerClosedError(
-                    f"{self.label} reached stdout EOF"
-                    + (f": {detail}" if detail else "")))
+                    f"{self.label} {reason}"
+                    + (f": {detail}" if detail else ""),
+                    reason="reader_failed" if reader_error else "stdout_eof",
+                    exit_code=self._proc.returncode,
+                    stderr=self.stderr_text(),
+                    cause=str(reader_error or "")))
 
     async def _dispatch(self, msg: Any) -> None:
         if isinstance(msg, dict) and msg.get("type") == "rpc_chunk":
@@ -488,39 +703,6 @@ class StdioJsonlPeer:
         self._pending.clear()
 
 
-def _descendant_pids(root_pid: int) -> list[int]:
-    """按 PPID 收集 ``root_pid`` 的子孙。不使用 PGID。
-
-    对话 ACP 子进程和 uvicorn 同组；按组杀会误伤 Web 服务。
-    """
-    try:
-        output = subprocess.check_output(
-            ["ps", "-axo", "pid=,ppid="], text=True, timeout=2)
-    except (OSError, subprocess.SubprocessError):
-        return []
-    children: dict[int, list[int]] = {}
-    for line in output.splitlines():
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        try:
-            pid, ppid = int(parts[0]), int(parts[1])
-        except ValueError:
-            continue
-        children.setdefault(ppid, []).append(pid)
-    out: list[int] = []
-    stack = list(children.get(root_pid, []))
-    seen: set[int] = set()
-    while stack:
-        pid = stack.pop()
-        if pid in seen or pid == root_pid:
-            continue
-        seen.add(pid)
-        out.append(pid)
-        stack.extend(children.get(pid, []))
-    return out
-
-
 def _jsonrpc_envelope(
     msg_id: str, method: str, params: Optional[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -531,7 +713,9 @@ def _jsonrpc_envelope(
 
 __all__ = [
     "JsonLineFramer",
+    "PEER_CLOSED_CODE",
     "PeerClosedError",
+    "ProcessOutputLog",
     "RpcChunkAssembler",
     "StdioJsonlPeer",
     "default_is_response",

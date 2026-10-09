@@ -47,6 +47,7 @@ ENGINE_BINS = (
     ("kimi", "kimi"),
     ("grok", "/home/kali/.grok/bin/grok"),
     ("opencode", "opencode"),
+    ("droid", "droid"),
 )
 
 

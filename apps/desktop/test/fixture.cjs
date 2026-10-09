@@ -13,8 +13,9 @@ function createFixture() {
       }
       const bodies = {
         '/api/health': { status: 'ready', ready: true },
-        '/api/auth/me': { authenticated: true, auth_required: false, service_id: 'desktop-smoke', identity_id: 'operator', in_container: false },
-        '/api/auth/ticket': { ticket: '' },
+        '/api/auth/status': { session_protocol: 2, auth_required: false, service_id: 'desktop-smoke', identity_id: 'operator' },
+        '/api/auth/me': { session_protocol: 2, authenticated: true, auth_required: false, service_id: 'desktop-smoke', identity_id: 'operator', in_container: false },
+        '/api/auth/ticket': { ticket: 'desktop-smoke-ticket' },
         '/api/threads': { threads: [] }, '/api/projects': { projects: [] },
         '/api/agent-runtimes': { runtimes: [] }, '/api/sidebar-preferences': { pinned_ids: [], project_order: [] },
         '/api/settings/credentials': { credentials: [] },

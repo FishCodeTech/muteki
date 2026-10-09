@@ -10,6 +10,8 @@ import urllib.error
 import urllib.request
 from typing import Any, Optional, Sequence
 
+GATEWAY_TIMEOUT_SECONDS = 45.0
+
 
 def _call(method: str, params: dict[str, Any]) -> dict[str, Any]:
     endpoint = os.environ.get("MUTEKI_CAPABILITY_ENDPOINT", "").strip()
@@ -34,7 +36,7 @@ def _call(method: str, params: dict[str, Any]) -> dict[str, Any]:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=GATEWAY_TIMEOUT_SECONDS) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         return {

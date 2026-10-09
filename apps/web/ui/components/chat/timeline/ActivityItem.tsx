@@ -36,6 +36,7 @@ export function ActivityItem({
     <div className={cn("grid min-w-0 grid-cols-[1rem_minmax(0,1fr)] gap-x-2.5 px-1.5", className)} data-testid={testId}>
       <span
         aria-hidden
+        data-timeline-node
         className={cn(
           "grid h-8 w-4 place-items-center",
           tone === "default" && "text-cx-fg-3/70",
@@ -44,7 +45,9 @@ export function ActivityItem({
           tone === "danger" && "text-cx-danger",
         )}
       >
-        {running ? <Spinner size={13} /> : <Icon name={icon} size={15} />}
+        {running ? <Spinner size={13} /> : icon === "dot" ? (
+          <span className={cn("size-1.5 rounded-full bg-current", tone === "running" && "cx-pulse-dot")} />
+        ) : <Icon name={icon} size={15} />}
       </span>
       <div className="min-w-0">{children}</div>
     </div>

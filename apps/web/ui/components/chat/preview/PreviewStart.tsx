@@ -57,7 +57,7 @@ export function PreviewStart({
             <Icon name="globe" size={20} />
           </span>
           <h2 className="text-[15px] font-semibold tracking-[-0.01em] text-cx-fg">打开本地服务或网页</h2>
-          <p className="mt-1 text-[12.5px] leading-5 text-cx-fg-3">在面板内预览正在开发的应用，与对话并排调试。</p>
+          <p className="mt-1 text-[13px] leading-5 text-cx-fg-3">在面板内预览正在开发的应用，与对话并排调试。</p>
         </div>
 
         <form
@@ -101,9 +101,9 @@ export function PreviewStart({
                     <span className="absolute -right-0.5 -top-0.5 size-2 rounded-full bg-cx-success ring-2 ring-[var(--cx-elevated)]" />
                   </span>
                   <span className="flex min-w-0 flex-1 flex-col">
-                    <span className="truncate font-cx-mono text-[12.5px] font-medium text-cx-fg">{previewUrlLabel(server.url)}</span>
-                    <span className="mt-0.5 flex items-center gap-1.5 text-[11.5px] text-cx-fg-4">
-                      <Badge tone="neutral" className="h-[18px] px-1 text-[10.5px]">{SOURCE_LABEL[server.source]}</Badge>
+                    <span className="truncate font-cx-mono text-[13px] font-medium text-cx-fg">{previewUrlLabel(server.url)}</span>
+                    <span className="mt-0.5 flex items-center gap-1.5 text-[12px] text-cx-fg-4">
+                      <Badge tone="neutral" className="h-[18px] px-1 text-[12px]">{SOURCE_LABEL[server.source]}</Badge>
                       <span>{relativeTime(server.seenAt, now)}</span>
                     </span>
                   </span>
@@ -120,7 +120,7 @@ export function PreviewStart({
               ))}
             </div>
           ) : (
-            <div className="mt-1 flex items-center gap-2.5 rounded-xl border border-dashed border-cx-border px-3 py-3 text-[12.5px] text-cx-fg-3">
+            <div className="mt-1 flex items-center gap-2.5 rounded-xl border border-dashed border-cx-border px-3 py-3 text-[13px] text-cx-fg-3">
               <span className="relative flex size-2 shrink-0">
                 <span className="cx-pulse-dot absolute inset-0 rounded-full bg-cx-fg-4" />
               </span>
@@ -139,7 +139,7 @@ export function PreviewStart({
                     type="button"
                     onClick={() => onNavigate(item)}
                     className={cn(
-                      "flex h-8 w-full items-center gap-2.5 rounded-lg pl-2 pr-9 text-left text-[12.5px] text-cx-fg-2 outline-none transition-colors",
+                      "flex h-8 w-full items-center gap-2.5 rounded-lg pl-2 pr-9 text-left text-[13px] text-cx-fg-2 outline-none transition-colors",
                       "hover:bg-cx-hover hover:text-cx-fg focus-visible:bg-cx-hover",
                     )}
                   >

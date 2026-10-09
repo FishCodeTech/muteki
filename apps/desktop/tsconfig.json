@@ -21,7 +21,8 @@
       "@/*": [
         "../web/ui/*"
       ]
-    }
+    },
+    "resolveJsonModule": true
   },
   "include": [
     "renderer",

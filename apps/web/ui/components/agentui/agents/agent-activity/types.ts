@@ -82,7 +82,7 @@ export interface AgentActivityProps {
   items: AgentActivityItem[];
   /** Expected activity kind before the first streamed item arrives. */
   contentType?: AgentActivityContentType;
-  /** Current run phase. Active runs always stay expanded. */
+  /** Current run phase. Active runs start expanded and can be collapsed by the reader. */
   status?: AgentActivityStatus;
   /** Elapsed run time, in seconds. Used by the step-only summary. */
   duration?: number;
@@ -108,10 +108,12 @@ export interface AgentActivityProps {
     summary: ReactNode;
     duration: number;
   }) => ReactNode;
-  /** Maximum visible activity height before the stream begins gliding. */
+  /** Maximum live viewport height. Follows new entries until the reader interacts. */
   maxHeight?: number;
   /** Height cap once the run completes and the reader expands it. Defaults to `maxHeight`. */
   completedMaxHeight?: number;
+  /** Connect rows that carry a `data-timeline-node` glyph with a vertical rail. */
+  timeline?: boolean;
   className?: string;
   contentClassName?: string;
 }

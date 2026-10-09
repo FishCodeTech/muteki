@@ -81,12 +81,12 @@ export function AddressBar({
           }
         }}
         className={cn(
-          "h-full w-full min-w-0 rounded-lg bg-transparent pl-7 pr-2.5 font-cx-sans text-[12.5px] outline-none placeholder:text-cx-fg-4",
+          "h-full w-full min-w-0 rounded-lg bg-transparent pl-7 pr-2.5 font-cx-sans text-[13px] outline-none placeholder:text-cx-fg-4",
           showPretty ? "text-transparent caret-transparent selection:bg-transparent" : "text-cx-fg",
         )}
       />
       {showPretty ? (
-        <span aria-hidden className="pointer-events-none absolute inset-y-0 left-7 right-2.5 flex items-center overflow-hidden whitespace-nowrap text-[12.5px]">
+        <span aria-hidden className="pointer-events-none absolute inset-y-0 left-7 right-2.5 flex items-center overflow-hidden whitespace-nowrap text-[13px]">
           {!parts.secure && parts.scheme ? <span className="text-cx-fg-4">{parts.scheme}</span> : null}
           <span className="font-medium text-cx-fg">{parts.host}</span>
           <span className="truncate text-cx-fg-3">{parts.rest}</span>

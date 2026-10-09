@@ -8,6 +8,7 @@ frontend event view when deriving from tool streams.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Optional
 
 from muteki.platform.contracts.base import utcnow
@@ -111,16 +112,75 @@ def normalize_agent(raw: Any, *, index: int = 0) -> Optional[ConversationAgentNo
         agent_id=agent_id,
         parent_id=parent_id,
         title=title,
-        model=str(raw.get("model") or "").strip() or None,
-        turn_id=str(raw.get("turn_id") or "").strip() or None,
-        message_id=str(raw.get("message_id") or "").strip() or None,
-        call_id=str(raw.get("call_id") or raw.get("tool_call_id") or "").strip() or None,
+        nickname=_text(raw.get("nickname")),
+        role=_text(raw.get("role")),
+        model=_text(raw.get("model")),
+        turn_id=_text(raw.get("turn_id")),
+        message_id=_text(raw.get("message_id")),
+        call_id=_text(raw.get("call_id") or raw.get("tool_call_id")),
+        session_ref=_text(raw.get("session_ref")),
         status=_norm_status(raw.get("status")),
         request=request,
         result=result,
-        error=str(raw.get("error") or "").strip() or None,
+        error=_text(raw.get("error")),
+        activity=_text(raw.get("activity")),
+        tool_uses=_count(raw.get("tool_uses")),
+        total_tokens=_count(raw.get("total_tokens")),
+        duration_ms=_count(raw.get("duration_ms")),
+        started_at=raw.get("started_at") or None,
+        completed_at=raw.get("completed_at") or None,
         updated_at=utcnow(),
     )
+
+
+def _text(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _count(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+_TERMINAL = frozenset({"completed", "failed", "cancelled"})
+
+
+def _stamp(
+    node: ConversationAgentNode,
+    previous: Optional[ConversationAgentNode],
+    at: Optional[datetime],
+) -> ConversationAgentNode:
+    """Lifecycle timestamps come from the event clock so replays stay stable."""
+    if at is None:
+        return node
+    update: dict[str, Any] = {}
+    reopened = (
+        previous is not None
+        and previous.status in _TERMINAL
+        and node.status not in _TERMINAL
+    )
+    if node.started_at is None or reopened:
+        update["started_at"] = (
+            at if reopened or previous is None or previous.started_at is None
+            else previous.started_at
+        )
+    if node.status in _TERMINAL:
+        if node.completed_at is None:
+            update["completed_at"] = (
+                previous.completed_at
+                if previous is not None and previous.status in _TERMINAL
+                and previous.completed_at is not None
+                else at
+            )
+    elif node.completed_at is not None:
+        update["completed_at"] = None
+    return node.model_copy(update=update) if update else node
 
 
 def upsert_agent_tree(
@@ -128,8 +188,14 @@ def upsert_agent_tree(
     payload: dict[str, Any],
     *,
     patch: bool = False,
+    at: Optional[datetime] = None,
 ) -> ThreadAgentTreeSnapshot:
-    """Build a versioned agent-tree snapshot; patch upserts by agent_id."""
+    """Build a versioned agent-tree snapshot; patch upserts by agent_id.
+
+    Patch nodes merge field-by-field over the previous node: keys present in
+    the incoming dict win (an explicit ``None`` clears), absent keys keep the
+    previous value, so adapters can send partial lifecycle updates.
+    """
     prev = previous or ThreadAgentTreeSnapshot()
     incoming_revision = payload.get("revision")
     if incoming_revision is None:
@@ -143,14 +209,27 @@ def upsert_agent_tree(
     if not isinstance(raw_agents, list):
         raw_agents = payload.get("nodes") if isinstance(payload.get("nodes"), list) else []
 
+    prev_by_id = {agent.agent_id: agent for agent in prev.agents}
     normalized: list[ConversationAgentNode] = []
     for index, raw in enumerate(raw_agents):
+        if patch and isinstance(raw, dict):
+            raw_id = str(raw.get("agent_id") or raw.get("id") or "").strip()
+            base = prev_by_id.get(raw_id)
+            if base is not None:
+                merged = base.model_dump(mode="python")
+                merged.pop("updated_at", None)
+                merged.update(raw)
+                if base.turn_id:
+                    # An agent belongs to the turn that spawned it, even when
+                    # a background agent reports completion during a later turn.
+                    merged["turn_id"] = base.turn_id
+                raw = merged
         node = normalize_agent(raw, index=index)
         if node is not None:
-            normalized.append(node)
+            normalized.append(_stamp(node, prev_by_id.get(node.agent_id), at))
 
     if patch and prev.agents:
-        by_id = {agent.agent_id: agent for agent in prev.agents}
+        by_id = dict(prev_by_id)
         for agent in normalized:
             by_id[agent.agent_id] = agent
         agents = list(by_id.values())

@@ -25,17 +25,11 @@ from muteki.capability_management import enabled as capability_enabled
 from muteki.capability_bindings.agent_plugin import package_root
 from muteki.solver.worker_skills import project_skill_roots
 
+from muteki.external_agents.descriptors import engine_ids, find_descriptor
 from muteki.external_agents.runtime_capabilities import RuntimeCapabilitySnapshot
 
 
-SUPPORTED_ENGINES = frozenset({
-    "claude", "codex", "cursor", "pi", "omp", "kimi", "grok", "opencode", "devin",
-})
-
-# Engines whose adapters never receive Muteki capability-gateway / plugin
-# injection (see DevinAcpAdapter._resolve_binding / _launch). Composer menus
-# must not claim muteki-control is injected for these runtimes (#120).
-_ENGINES_WITHOUT_CAPABILITY_GATEWAY = frozenset({"devin"})
+SUPPORTED_ENGINES = frozenset(engine_ids())
 
 _MUTEKI_CONTROL_UNSUPPORTED_REASON = (
     "当前 Runtime 未接入 Muteki 能力 Gateway，不会注入 muteki-control"
@@ -44,18 +38,6 @@ _MUTEKI_CONTROL_UNSUPPORTED_ALTERNATIVE = (
     "请改用已接入 Gateway 的 Agent（如 Claude / Codex / Pi），"
     "或使用工作区内文件与该 Runtime 的原生本地工具"
 )
-
-_USER_SKILL_ROOTS: dict[str, tuple[str, ...]] = {
-    "claude": (".claude/skills", ".agents/skills"),
-    "codex": (".codex/skills", ".agents/skills"),
-    "cursor": (".cursor/skills", ".cursor/skills-cursor", ".agents/skills"),
-    "pi": (".pi/agent/skills", ".pi/skills", ".agents/skills"),
-    "omp": (".omp/agent/skills", ".omp/skills", ".agents/skills"),
-    "kimi": (".kimi-code/skills", ".kimi/skills", ".agents/skills"),
-    "grok": (".grok/skills", ".agents/skills"),
-    "opencode": (".config/opencode/skills", ".opencode/skills", ".agents/skills"),
-    "devin": (".config/devin/skills", ".agents/skills"),
-}
 
 _COMMANDS: tuple[dict[str, str], ...] = (
     {"name": "new", "description": "新建对话", "action": "new"},
@@ -93,11 +75,8 @@ def _section_failure(errors: list[dict[str, Any]] | None, section: str, exc: Exc
 
 def engine_receives_capability_gateway(engine: str) -> bool:
     """True when the selected engine's adapter may inject Muteki control tools."""
-    normalized = str(engine or "").strip().lower()
-    return (
-        normalized in SUPPORTED_ENGINES
-        and normalized not in _ENGINES_WITHOUT_CAPABILITY_GATEWAY
-    )
+    descriptor = find_descriptor(engine)
+    return descriptor is not None and descriptor.capability_gateway
 
 
 def _muteki_control_mcp_row(*, engine: str, injected: bool) -> dict[str, Any]:
@@ -209,7 +188,9 @@ def _skill_roots(engine: str, workspace_root: str = "") -> Iterable[tuple[Path, 
             yield workspace / relative, "当前项目", "project", 350 if common else 400
     if os.environ.get("MUTEKI_HOST_DISCOVERY", "1") != "0":
         home = Path.home()
-        for relative in _USER_SKILL_ROOTS.get(engine, ()):
+        descriptor = find_descriptor(engine)
+        roots = descriptor.environment.user_skill_roots if descriptor is not None else ()
+        for relative in roots:
             common = relative == ".agents/skills"
             yield home / relative, "通用 Agent" if common else engine, "personal", 250 if common else 300
 

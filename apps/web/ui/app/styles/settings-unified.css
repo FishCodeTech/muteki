@@ -1,0 +1,65 @@
+/* ─────────────────────────────────────────────────────────
+ * Unified settings (web + desktop): shell, category column, cards, and
+ * restyles for shared managers so every settings page reads the same.
+ * ───────────────────────────────────────────────────────── */
+.cx-settings-card { overflow: hidden; border: 1px solid var(--cx-border); border-radius: 16px; background: var(--cx-elevated); box-shadow: var(--cx-shadow-xs); }
+/* Settings: a quiet category column and one scrolling page, like the chat sidebar + canvas. */
+.cx-settings-shell { display: grid; grid-template-columns: 272px minmax(0, 1fr); height: 100%; min-height: 0; overflow: hidden; background: var(--cx-bg); }
+.cx-settings-nav { display: flex; flex-direction: column; min-height: 0; background: var(--cx-sidebar, var(--cx-bg)); box-shadow: inset -1px 0 0 var(--cx-border-subtle); }
+.cx-settings-content { min-width: 0; min-height: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.cx-settings-search { display: flex; align-items: center; gap: 8px; height: 36px; padding: 0 12px; border-radius: 999px; background: var(--cx-hover); color: var(--cx-fg-3); transition: background-color .15s, box-shadow .15s; }
+.cx-settings-search:focus-within { background: var(--cx-bg); box-shadow: 0 0 0 1px var(--cx-border-strong); }
+.cx-settings-search input { flex: 1; min-width: 0; height: 100%; border: 0; outline: 0; background: transparent; color: var(--cx-fg); font: inherit; font-size: 14px; }
+.cx-settings-search input::placeholder { color: var(--cx-fg-3); }
+.cx-settings-search input::-webkit-search-cancel-button { display: none; }
+@media (max-width: 960px) { .cx-settings-shell { grid-template-columns: 224px minmax(0, 1fr); } }
+@media (max-width: 680px) {
+  .cx-settings-shell { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .cx-settings-nav { box-shadow: inset 0 -1px 0 var(--cx-border-subtle); max-height: 46vh; }
+}
+.cx-hue-slider .cx-slider::-webkit-slider-runnable-track { height: 8px; background: linear-gradient(to right, hsl(0 80% 55%), hsl(60 80% 50%), hsl(120 65% 45%), hsl(180 70% 45%), hsl(240 75% 60%), hsl(300 70% 55%), hsl(360 80% 55%)); }
+.cx-hue-slider .cx-slider::-moz-range-track { height: 8px; background: linear-gradient(to right, hsl(0 80% 55%), hsl(60 80% 50%), hsl(120 65% 45%), hsl(180 70% 45%), hsl(240 75% 60%), hsl(300 70% 55%), hsl(360 80% 55%)); }
+.cx-hue-slider .cx-slider::-webkit-slider-thumb { margin-top: -4px; background: #fff; box-shadow: 0 0 0 1px rgb(0 0 0 / .18), 0 1px 3px rgb(0 0 0 / .25); }
+
+.cx-settings-time { height: 32px; padding: 0 10px; border: 1px solid var(--cx-border); border-radius: 8px; background: var(--cx-bg); color: var(--cx-fg); font: inherit; font-size: 13px; font-variant-numeric: tabular-nums; }
+.cx-settings-time:disabled { opacity: .5; }
+.cx-settings-time:focus-visible { outline: 2px solid var(--cx-focus); outline-offset: 1px; }
+
+.cx-settings-web { height: 100dvh; }
+
+/* Dialogs opened from settings pages render in a portal, so they carry their own scope class. */
+.cx-settings-dialog.modal__dialog { width: min(480px, calc(100vw - 32px)); max-width: calc(100vw - 32px); padding: 0; gap: 0; overflow: hidden; border: 1px solid var(--cx-border); border-radius: 16px; background: var(--cx-elevated); box-shadow: var(--cx-shadow-pop); color: var(--cx-fg); font-family: var(--cx-font-sans); }
+.cx-settings-dialog.modal__dialog--lg { width: min(560px, calc(100vw - 32px)); }
+.cx-settings-dialog .modal__header { gap: 4px; padding: 20px 20px 12px; }
+.cx-settings-dialog .modal__heading { color: var(--cx-fg); font-size: 16px; font-weight: 600; line-height: 24px; overflow-wrap: anywhere; }
+.cx-settings-dialog .modal__header small { color: var(--cx-fg-3); font-size: 13px; line-height: 1.5; }
+.cx-settings-dialog .modal__body { margin: 0; padding: 4px 20px 18px; color: var(--cx-fg-2); font-size: 13px; line-height: 1.6; }
+.cx-settings-dialog .modal__body > p + p { margin-top: 8px; }
+.cx-settings-dialog .modal__footer { gap: 8px; padding: 12px 20px; border-top: 1px solid var(--cx-border-subtle); background: var(--cx-bg-subtle); }
+.cx-settings-dialog .modal__footer .button { height: 32px; min-height: 32px; padding: 0 12px; border-radius: 8px; font-size: 13px; font-weight: 500; }
+.cx-settings-dialog .modal__footer .button--ghost { --button-bg: var(--cx-elevated); --button-bg-hover: var(--cx-hover); --button-bg-pressed: var(--cx-active); --button-fg: var(--cx-fg); box-shadow: inset 0 0 0 1px var(--cx-border); }
+.cx-settings-dialog .modal__footer .button--primary { --button-bg: var(--cx-accent); --button-bg-hover: color-mix(in srgb, var(--cx-accent) 88%, var(--cx-fg)); --button-bg-pressed: var(--button-bg-hover); --button-fg: var(--cx-accent-fg); }
+.cx-settings-dialog .modal__footer .button--danger { --button-bg: var(--cx-danger); --button-bg-hover: color-mix(in srgb, var(--cx-danger) 86%, black); --button-bg-pressed: var(--button-bg-hover); --button-fg: #fff; }
+.cx-settings-dialog .modal__footer .button:is(:disabled, [data-disabled="true"]) { opacity: .5; }
+.cx-settings-dialog .cx-settings-dialog-error { margin: 0; padding: 10px 12px; border: 0; border-radius: 10px; background: var(--cx-danger-soft); color: var(--cx-danger); font-size: 13px; line-height: 1.5; }
+.cx-settings-dialog .action-dialog-options { display: grid; gap: 8px; }
+.cx-settings-dialog .action-dialog-summary { display: grid; gap: 2px; padding: 12px 14px; border: 1px solid var(--cx-border-subtle); border-radius: 12px; background: var(--cx-bg-subtle); }
+.cx-settings-dialog .action-dialog-summary strong { color: var(--cx-fg); font-size: 13px; font-weight: 500; overflow-wrap: anywhere; }
+.cx-settings-dialog .action-dialog-summary span { color: var(--cx-fg-3); font-family: var(--cx-font-sans); font-size: 12px; overflow-wrap: anywhere; }
+.cx-settings-dialog .action-dialog-option { min-height: 0; padding: 12px 14px; border: 1px solid var(--cx-border); border-radius: 12px; background: var(--cx-elevated); color: var(--cx-fg); }
+.cx-settings-dialog .action-dialog-option:is(:has(input:checked), [data-selected="true"]) { border-color: var(--cx-border-strong); background: var(--cx-selected); }
+.cx-settings-dialog .action-dialog-option strong { font-size: 13px; font-weight: 500; }
+.cx-settings-dialog .action-dialog-option small { color: var(--cx-fg-3); font-size: 12px; line-height: 1.5; }
+.cx-settings-dialog .action-dialog-option .checkbox__content > span:has(> strong) { display: grid; gap: 2px; }
+.cx-settings-dialog .action-dialog-option .checkbox__content { align-items: flex-start; gap: 10px; }
+:is(.cx-settings-dialog, .cx-settings-shell) .checkbox:not([data-selected="true"]) .checkbox__control { box-shadow: inset 0 0 0 1px var(--cx-border-strong); }
+
+.cx-settings-flash { animation: cx-settings-flash 1.8s ease-out; border-radius: 12px; }
+@keyframes cx-settings-flash {
+  0%, 35% { background-color: var(--cx-accent-soft); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent); }
+  100% { background-color: transparent; box-shadow: inset 0 0 0 1px transparent; }
+}
+html[data-motion="reduce"] .cx-settings-flash { animation: none; background-color: var(--cx-accent-soft); }
+@media (prefers-reduced-motion: reduce) { .cx-settings-flash { animation: none; background-color: var(--cx-accent-soft); } }
+.cx-settings-shortcut-capture { min-width: 132px; height: 30px; padding: 0 10px; border: 1px dashed var(--cx-border-strong); border-radius: 8px; background: var(--cx-bg); color: var(--cx-fg-3); font: inherit; font-size: 12.5px; }
+.cx-settings-shortcut-capture:focus-visible { outline: 2px solid var(--cx-focus); outline-offset: 1px; }

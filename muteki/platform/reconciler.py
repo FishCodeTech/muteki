@@ -3,8 +3,9 @@
 服务重启后的恢复流程：
 1. 校验事件日志：每条聚合流的 stream_seq 必须从 1 连续、无缺口；
    投影水位不得超过事件日志全局水位。
-2. 回放未完成 receipt：仍处于 accepted 的命令回执列出给调用方
-   （真正的 Handler 重放由 COMMAND-01 的 Command API 消费这份清单）。
+2. 列出未完成 receipt：仍处于 accepted/running/waiting 的命令回执及其按
+   command_type 的计数。领域模块各自落终态（conversation.* 由
+   ``ConversationService.recover`` 结算）；这里只观察，不改写回执。
 3. 列出待处理 outbox：pending / 到点 failed 的副作用记录。
 4. 重建落后 projection：水位落后于事件日志的 projection 增量追平。
 """
@@ -15,9 +16,23 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from muteki.platform.contracts import CommandReceipt, OutboxRecord
+from muteki.platform.contracts.receipts import ReceiptState
 from muteki.platform.outbox import OutboxManager
 from muteki.platform.projections import ProjectionManager
 from muteki.platform.store import PlatformStore
+
+
+def unfinished_receipts_by_command_type(store: PlatformStore) -> dict[str, int]:
+    """Count of accepted/running/waiting receipts per command_type in platform.db."""
+    states = (ReceiptState.ACCEPTED.value, ReceiptState.RUNNING.value,
+              ReceiptState.WAITING.value)
+    with store.lock:
+        rows = list(store.conn.execute(
+            "SELECT command_type, COUNT(*) AS n FROM command_receipts "
+            "WHERE state IN (?, ?, ?) GROUP BY command_type ORDER BY command_type",
+            states,
+        ).fetchall())
+    return {str(row["command_type"]): int(row["n"]) for row in rows}
 
 
 @dataclass
@@ -29,6 +44,8 @@ class ReconcileReport:
     issues: list[str] = field(default_factory=list)
     #: 仍处于 accepted、需要调用方回放的命令回执
     unfinished_receipts: list[CommandReceipt] = field(default_factory=list)
+    #: 未完成回执按 command_type 计数（run.* / conversation.* 等各领域）
+    unfinished_by_command_type: dict[str, int] = field(default_factory=dict)
     #: 待投递的 outbox 记录
     pending_outbox: list[OutboxRecord] = field(default_factory=list)
     #: 本次追平 / 重建的 projection 及各自消费的事件数
@@ -100,8 +117,9 @@ class Reconciler:
         report.event_watermark = self._store.event_watermark()
         report.ok = not report.issues
 
-        # 未完成 receipt：列出给调用方回放（accepted 状态）
+        # 未完成 receipt：列出给领域恢复结算
         report.unfinished_receipts = self._store.pending_receipts()
+        report.unfinished_by_command_type = unfinished_receipts_by_command_type(self._store)
         # 待处理 outbox
         report.pending_outbox = self._outbox.pending(limit=1000)
 

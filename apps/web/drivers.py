@@ -654,14 +654,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             or body.get("worker_container_scope")
             or wc.get("worker_container_scope") or "run"
         ).strip()
-        if mode == "pentest":
-            if (runtime_policy.get("worker_backend") not in {None, "container"}
-                    or runtime_policy.get("worker_container_scope") not in {None, "run"}):
-                from apps.web.run_recovery import WorkerRuntimePolicyUnavailable
-                raise WorkerRuntimePolicyUnavailable(
-                    "Pentest Run isolation conflicts with its saved runtime policy")
-            worker_container_scope = "run"
-        elif (body.get("worker_container_scope") is not None
+        if (body.get("worker_container_scope") is not None
               and runtime_policy.get("worker_backend") == "container"
               and runtime_policy.get("worker_container_scope")
               and str(body["worker_container_scope"]).strip()
@@ -804,14 +797,13 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         # fallback, and the web-container override all owned by the single resolver
         # so the settings health endpoints resolve the SAME effective backend.
         worker_backend = resolve_worker_backend(
-            request_backend=("container" if mode == "pentest"
-                             else runtime_policy.get("worker_backend")
+            request_backend=(runtime_policy.get("worker_backend")
                              or body.get("worker_backend")),
             config_backend=wc.get("worker_backend"),
             env_backend=os.environ.get("MUTEKI_WORKER_BACKEND"),
             in_web_container=is_web_container(),
         )
-        if (mode != "pentest" and body.get("worker_backend") is not None
+        if (body.get("worker_backend") is not None
                 and runtime_policy.get("worker_backend")
                 and resolve_worker_backend(
                     request_backend=body["worker_backend"],
@@ -1569,13 +1561,6 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
         worker_container_scope = str(
             runtime_policy.get("worker_container_scope")
             or wc.get("worker_container_scope") or "run")
-        if mode == "pentest":
-            if (runtime_policy.get("worker_backend") not in {None, "container"}
-                    or runtime_policy.get("worker_container_scope") not in {None, "run"}):
-                from apps.web.run_recovery import WorkerRuntimePolicyUnavailable
-                raise WorkerRuntimePolicyUnavailable(
-                    "Pentest Run isolation conflicts with its saved runtime policy")
-            worker_container_scope = "run"
         if root.is_symlink():
             if root.resolve() != mgr.storage.shared_workspace(run.run_id).resolve():
                 raise RuntimeError("Run workspace points outside its shared pool slot")
@@ -1606,8 +1591,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             )
         transport = base_engine_for_profile(profile or winner_engine)
         worker_backend = resolve_worker_backend(
-            request_backend=("container" if mode == "pentest"
-                             else runtime_policy.get("worker_backend")),
+            request_backend=runtime_policy.get("worker_backend"),
             config_backend=wc.get("worker_backend"),
             env_backend=os.environ.get("MUTEKI_WORKER_BACKEND"),
             in_web_container=is_web_container(),

@@ -128,6 +128,7 @@ export function AgentActivity({
   renderCompletedStatus,
   maxHeight = 208,
   completedMaxHeight,
+  timeline = false,
   className,
   contentClassName,
 }: AgentActivityProps) {
@@ -139,13 +140,17 @@ export function AgentActivity({
   const viewportRef = useRef<HTMLDivElement>(null);
   const previousStatus = useRef(status);
   const [contentHeight, setContentHeight] = useState(0);
+  const [liveCollapsed, setLiveCollapsed] = useState(false);
+  const followLiveRef = useRef(true);
+  const scrollGestureRef = useRef(false);
+  const [followingLive, setFollowingLive] = useState(true);
   const [currentOpen, setOpen] = useControllableOpen({
     open,
     defaultOpen,
     onOpenChange,
   });
   const working = status === "working";
-  const expanded = working || currentOpen;
+  const expanded = working ? !liveCollapsed : currentOpen;
   const contentType = items.length
     ? getContentType(items)
     : (initialContentType ?? "mixed");
@@ -153,9 +158,15 @@ export function AgentActivity({
   const cappedHeight = Math.min(contentHeight, limit);
   const viewportHeight = working ? Math.min(contentHeight, limit) : cappedHeight;
   const capped = contentHeight > limit;
-  const streamOffset = working
-    ? Math.min(0, viewportHeight - contentHeight)
-    : 0;
+
+  const followLive = useCallback((next: boolean) => {
+    followLiveRef.current = next;
+    setFollowingLive(next);
+  }, []);
+
+  const pauseLive = () => {
+    if (working) followLive(false);
+  };
 
   useLayoutEffect(() => {
     const node = contentRef.current;
@@ -174,10 +185,28 @@ export function AgentActivity({
     if (previousStatus.current === "working" && status === "complete") {
       setOpen(!collapseOnComplete);
     }
+    if (previousStatus.current !== status) {
+      setLiveCollapsed(false);
+      followLive(true);
+      scrollGestureRef.current = false;
+    }
     previousStatus.current = status;
-  }, [collapseOnComplete, setOpen, status]);
+  }, [collapseOnComplete, followLive, setOpen, status]);
+
+  // Use the native scroll range, not a translated/clipped list. Pausing before
+  // a disclosure opens keeps its added height from dragging the reader away.
+  useLayoutEffect(() => {
+    const viewport = viewportRef.current;
+    if (viewport && working && expanded && followLiveRef.current) {
+      viewport.scrollTop = viewport.scrollHeight;
+    }
+  }, [contentHeight, expanded, viewportHeight, working]);
 
   const toggle = () => {
+    if (working) {
+      setLiveCollapsed((collapsed) => !collapsed);
+      return;
+    }
     const next = !currentOpen;
     setOpen(next);
     if (next) requestAnimationFrame(() => viewportRef.current?.scrollTo({ top: 0 }));
@@ -185,7 +214,7 @@ export function AgentActivity({
 
   const liveLabel = activeLabel ?? getActiveLabel(contentType);
   const completedSummary = summary ?? getSummary(contentType, items, duration);
-  const maskImage = capped
+  const maskImage = capped && (!working || followingLive)
     ? working
       ? "linear-gradient(to bottom, transparent, black 12px)"
       : "linear-gradient(to bottom, transparent, black 12px, black calc(100% - 12px), transparent)"
@@ -195,43 +224,43 @@ export function AgentActivity({
     <div
       data-state={working ? "working" : expanded ? "open" : "closed"}
       data-content={contentType}
+      data-following={working ? followingLive : undefined}
       aria-busy={working}
       className={cn("w-full text-sm", className)}
     >
-      {working ? (
-        <div
-          id={triggerId}
-          role="status"
-          className="flex h-7 min-w-0 items-center text-cx-fg-3"
+      <button
+        id={triggerId}
+        type="button"
+        aria-expanded={expanded}
+        aria-controls={contentId}
+        onClick={toggle}
+        className={cn(
+          "group flex h-7 min-w-0 max-w-full items-center gap-1 rounded-lg pl-1.5 pr-2 text-left text-cx-fg-3 outline-none transition-colors hover:bg-cx-hover hover:text-cx-fg-2 focus-visible:ring-2 focus-visible:ring-cx-focus focus-visible:ring-offset-2 focus-visible:ring-offset-cx-bg",
+          !working && "font-medium",
+        )}
+      >
+        <motion.span
+          aria-hidden="true"
+          initial={false}
+          animate={{ rotate: expanded ? 0 : -90 }}
+          transition={reduce ? { duration: 0 } : SPRING_SWAP}
+          className="inline-flex size-4 shrink-0 items-center justify-center text-cx-fg-3/70 group-hover:text-cx-fg-2"
         >
-          {renderWorkingStatus
-            ? renderWorkingStatus({ label: liveLabel, duration })
-            : <ThinkingShimmer>{liveLabel}</ThinkingShimmer>}
-        </div>
-      ) : (
-        <button
-          id={triggerId}
-          type="button"
-          aria-expanded={expanded}
-          aria-controls={contentId}
-          onClick={toggle}
-          className="group flex h-7 min-w-0 items-center gap-1.5 rounded-md text-left font-medium text-cx-fg-3 outline-none transition-colors hover:text-cx-fg focus-visible:ring-2 focus-visible:ring-cx-focus focus-visible:ring-offset-2 focus-visible:ring-offset-cx-bg"
-        >
-          <span className="truncate">
-            {renderCompletedStatus
+          <ChevronDown className="size-3.5" />
+        </motion.span>
+        <span className="min-w-0 truncate">
+          {working
+            ? renderWorkingStatus
+              ? renderWorkingStatus({ label: liveLabel, duration })
+              : <ThinkingShimmer>{liveLabel}</ThinkingShimmer>
+            : renderCompletedStatus
               ? renderCompletedStatus({ summary: completedSummary, duration })
               : completedSummary}
-          </span>
-          <motion.span
-            aria-hidden="true"
-            animate={{ rotate: expanded ? 180 : 0 }}
-            transition={reduce ? { duration: 0 } : SPRING_SWAP}
-            className="inline-flex shrink-0 text-cx-fg-3/70 group-hover:text-cx-fg"
-          >
-            <ChevronDown className="size-3.5" />
-          </motion.span>
-        </button>
-      )}
+        </span>
+      </button>
+      {working ? (
+        <span role="status" className="sr-only">{liveLabel}</span>
+      ) : null}
 
       <AgentDisclosure
         id={contentId}
@@ -239,22 +268,53 @@ export function AgentActivity({
         aria-labelledby={triggerId}
         open={expanded}
         openHeight={viewportHeight}
+        className="relative"
       >
         <div
           ref={viewportRef}
+          data-testid="activity-scroll-viewport"
+          tabIndex={capped && expanded ? 0 : undefined}
           className={cn(
-            "scrollbar-hide pr-1",
-            capped && expanded && !working ? "overflow-y-auto" : "overflow-y-hidden",
+            "cx-scroll overflow-x-hidden pr-1 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-cx-focus",
+            capped && expanded ? "overflow-y-auto" : "overflow-y-hidden",
           )}
-          style={{ height: viewportHeight, maskImage, WebkitMaskImage: maskImage }}
+          style={{ height: viewportHeight, maskImage, WebkitMaskImage: maskImage, overflowAnchor: "none" }}
+          onPointerDownCapture={(event) => {
+            pauseLive();
+            scrollGestureRef.current = event.target === event.currentTarget;
+          }}
+          onClickCapture={() => {
+            pauseLive();
+            scrollGestureRef.current = false;
+          }}
+          onWheel={(event) => {
+            scrollGestureRef.current = true;
+            if (event.deltaY < 0) pauseLive();
+          }}
+          onTouchStart={() => {
+            pauseLive();
+            scrollGestureRef.current = true;
+          }}
+          onKeyDownCapture={(event) => {
+            if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) {
+              pauseLive();
+              scrollGestureRef.current = true;
+            }
+          }}
+          onScroll={(event) => {
+            if (!working || !scrollGestureRef.current) return;
+            const viewport = event.currentTarget;
+            const atBottom = viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop <= 8;
+            // Layout changes may also dispatch scroll. Only a reader's scroll
+            // gesture may resume following; a disclosure click must not.
+            if (atBottom) scrollGestureRef.current = false;
+            followLive(atBottom);
+          }}
         >
           <motion.div
             ref={contentRef}
             role="list"
-            initial={false}
-            animate={{ y: streamOffset }}
-            transition={reduce ? { duration: 0 } : SPRING_LAYOUT}
-            className={cn("space-y-0.5 py-2", contentClassName)}
+            className={cn("space-y-0.5 py-2", timeline && "cx-activity-timeline", contentClassName)}
           >
             <AnimatePresence mode="popLayout">
               {items.map((item) => (
@@ -262,14 +322,15 @@ export function AgentActivity({
                   layout="position"
                   key={item.id}
                   role="listitem"
-                  initial={reduce ? { opacity: 1 } : { opacity: 0, y: 6 }}
-                  animate={{ opacity: 1, y: 0 }}
+                  initial={reduce ? { opacity: 1 } : { opacity: 0, y: 6, filter: "blur(3px)" }}
+                  animate={{ opacity: 1, y: 0, filter: "blur(0px)", transitionEnd: { filter: "none" } }}
                   exit={reduce ? { opacity: 0 } : { opacity: 0, y: -3 }}
                   transition={
                     reduce
                       ? { duration: 0 }
                       : {
                           opacity: { duration: 0.18, ease: EASE_OUT },
+                          filter: { duration: 0.32, ease: EASE_OUT },
                           y: SPRING_LAYOUT,
                           layout: SPRING_LAYOUT,
                         }
@@ -281,6 +342,21 @@ export function AgentActivity({
             </AnimatePresence>
           </motion.div>
         </div>
+        {working && capped && !followingLive ? (
+          <button
+            type="button"
+            onClick={() => {
+              followLive(true);
+              scrollGestureRef.current = false;
+              const viewport = viewportRef.current;
+              if (viewport) viewport.scrollTop = viewport.scrollHeight;
+            }}
+            className="absolute bottom-2 right-3 inline-flex h-7 items-center gap-1 rounded-full border border-cx-border bg-cx-elevated px-2.5 text-[12px] text-cx-fg-2 shadow-cx-sm hover:bg-cx-hover focus-visible:outline-2 focus-visible:outline-cx-focus"
+          >
+            <ChevronDown className="size-3.5" aria-hidden />
+            跟随最新进展
+          </button>
+        ) : null}
       </AgentDisclosure>
     </div>
   );

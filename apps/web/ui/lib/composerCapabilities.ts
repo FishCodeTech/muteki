@@ -20,6 +20,7 @@ export interface ComposerCapabilityContext {
   revision?: number;
   threadId?: string;
   adapterId: string;
+  instanceId?: string;
   workspaceId?: string;
   projectId?: string;
 }
@@ -112,13 +113,14 @@ export async function fetchComposerCapabilities(
   trigger: ComposerTrigger,
   query: string,
   signal?: AbortSignal,
-): Promise<{ engine: string; items: ComposerCapabilityItem[]; runtime: ComposerRuntimeState; sectionErrors: ComposerCapabilitySectionError[] }> {
+): Promise<{ engine: string; items: ComposerCapabilityItem[]; runtime: ComposerRuntimeState; sectionErrors: ComposerCapabilitySectionError[]; accessModes: string[]; accessModeNotes: Record<string, string> }> {
   const response = await apiFetch("/api/conversation/composer-capabilities", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       thread_id: context.threadId || "",
       adapter_id: context.adapterId,
+      instance_id: context.instanceId || "",
       workspace_id: context.workspaceId || "",
       project_id: context.projectId || "",
       trigger,
@@ -138,6 +140,8 @@ export async function fetchComposerCapabilities(
   }
   const body = (parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {}) as {
     engine?: string;
+    access_modes?: string[];
+    access_mode_notes?: Record<string, string>;
     items?: ComposerCapabilityItem[];
     runtime?: Partial<ComposerRuntimeState>;
     error?: { message?: string; code?: string; [key: string]: unknown };
@@ -157,6 +161,8 @@ export async function fetchComposerCapabilities(
   }
   return {
     engine: body.engine || "",
+    accessModes: Array.isArray(body.access_modes) ? body.access_modes.map(String) : [],
+    accessModeNotes: body.access_mode_notes || {},
     items: Array.isArray(body.items) ? body.items : [],
     sectionErrors: Array.isArray(body.section_errors) ? body.section_errors.filter((error) =>
       error && typeof error.section === "string" && typeof error.message === "string") : [],

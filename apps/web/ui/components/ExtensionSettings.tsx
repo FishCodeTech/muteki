@@ -17,6 +17,7 @@ import {
   StatusLabel,
 } from "@/components/ui-contributions";
 import { SchemaForm } from "@/components/ui-contributions/SchemaForm";
+import { SettingsSection } from "@/components/settings/primitives";
 
 /**
  * EXT-02：Extension 设置面板（/settings/extensions，任务书 3.5 / 13.1）。
@@ -200,73 +201,28 @@ const ORIGIN_LABELS: Record<string, string> = {
 const page: CSSProperties = {
   minHeight: 0,
   background: "transparent",
-  color: "var(--text)",
-  padding: "0 0 48px",
-  fontFamily: "var(--font-sans)",
+  color: "var(--cx-fg)",
+  fontFamily: "var(--cx-font-sans)",
 };
-const inner: CSSProperties = { maxWidth: 1040, margin: "0 auto", display: "grid", gap: 18 };
-const card: CSSProperties = {
-  border: "1px solid var(--line)",
-  borderRadius: 12,
-  background: "var(--panel)",
-  padding: 16,
-  display: "grid",
-  gap: 10,
-};
-const row: CSSProperties = { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" };
-const muted: CSSProperties = { color: "var(--muted)", fontSize: 12 };
-const mono: CSSProperties = { fontFamily: "var(--font-mono)", fontSize: 11 };
-const btn: CSSProperties = {
-  height: 30,
-  padding: "0 12px",
-  border: "1px solid var(--line2)",
-  borderRadius: 8,
-  background: "var(--panel2)",
-  color: "var(--text)",
-  fontSize: 12,
-  fontWeight: 650,
-  cursor: "pointer",
-};
-const btnPrimary: CSSProperties = {
-  ...btn,
-  borderColor: "color-mix(in srgb, var(--blue) 50%, var(--line2))",
-  background: "color-mix(in srgb, var(--blue) 14%, var(--panel))",
-  color: "var(--bright)",
-};
-const btnDanger: CSSProperties = {
-  ...btn,
-  borderColor: "color-mix(in srgb, var(--red) 45%, var(--line2))",
-  color: "var(--red)",
-};
-const input: CSSProperties = {
-  height: 30,
-  padding: "0 10px",
-  border: "1px solid var(--line2)",
-  borderRadius: 8,
-  background: "var(--panel2)",
-  color: "var(--bright)",
-  fontSize: 12,
-  minWidth: 0,
+const inner: CSSProperties = { display: "grid", gap: 32 };
+const row: CSSProperties = { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" };
+const muted: CSSProperties = { color: "var(--cx-fg-3)", fontSize: 12 };
+const mono: CSSProperties = { fontFamily: "var(--cx-font-mono)", fontSize: 12, color: "var(--cx-fg-2)" };
+const meta: CSSProperties = { ...row, gap: "4px 16px", color: "var(--cx-fg-3)", fontSize: 12, lineHeight: 1.5 };
+const btn = "cx-ext-btn";
+const btnPrimary = "cx-ext-btn cx-ext-btn-primary";
+const btnDanger = "cx-ext-btn cx-ext-btn-danger";
+const input: CSSProperties = { minWidth: 0 };
+
+const TONES: Record<string, string> = {
+  "var(--green)": "success",
+  "var(--amber)": "warning",
+  "var(--red)": "danger",
 };
 
 function badge(color: string, label: string, title?: string) {
   return (
-    <span
-      key={label}
-      data-tooltip={title ?? label}
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        height: 20,
-        padding: "0 7px",
-        borderRadius: 999,
-        border: `1px solid color-mix(in srgb, ${color} 34%, var(--line))`,
-        background: `color-mix(in srgb, ${color} 9%, transparent)`,
-        color,
-        fontSize: 10.5,
-        fontWeight: 700,
-      }}
-    >
+    <span key={label} className="cx-ext-chip" data-tone={TONES[color] ?? "neutral"} data-tooltip={title ?? label}>
       {label}
     </span>
   );
@@ -302,9 +258,9 @@ function PreviewPanel({
 }) {
   const permissions = value.manifest.permissions;
   return (
-    <div style={{ border: "1px solid var(--line2)", borderRadius: 10, padding: 12, display: "grid", gap: 8 }}>
+    <div className="cx-ext-preview">
       <div style={row}>
-        <strong style={{ color: "var(--bright)" }}>{value.extension_id}@{value.version}</strong>
+        <strong style={{ ...mono, color: "var(--cx-fg)", fontWeight: 500 }}>{value.extension_id}@{value.version}</strong>
         {badge(value.verification.signature === "unsigned" ? "var(--amber)" : "var(--green)", value.verification.signature || "unknown")}
         {badge(value.verification.immutable ? "var(--green)" : "var(--amber)", value.verification.immutable ? "来源已固定" : "可变来源")}
         {badge("var(--blue)", value.state)}
@@ -320,14 +276,14 @@ function PreviewPanel({
         <dt>有效期</dt><dd>{new Date(value.expires_at).toLocaleString()}</dd>
       </dl>
       {permissions ? (
-        <div style={{ ...mono, color: "var(--muted)", display: "grid", gap: 3 }}>
+        <div style={{ ...muted, display: "grid", gap: 3 }}>
           <span>文件系统：{permissions.filesystem.join(", ") || "无"}</span>
           <span>网络：{permissions.network.join(", ") || "无"}</span>
           <span>Secret：{permissions.secrets.join(", ") || "无"}</span>
           <span>事件写入：{permissions.events_write.join(", ") || "无"}</span>
         </div>
       ) : null}
-      {value.changes.permission_expansion?.length ? <div style={{ color: "var(--amber)", fontSize: 12 }}>新增权限：{value.changes.permission_expansion.join(", ")}</div> : null}
+      {value.changes.permission_expansion?.length ? <div style={{ color: "var(--cx-warning)", fontSize: 12 }}>新增权限：{value.changes.permission_expansion.join(", ")}</div> : null}
       {value.confirmations_required.map((item) => (
         <Checkbox
           key={item}
@@ -354,49 +310,57 @@ function SourceForm({
     onChange({ ...draft, [key]: e.target.value });
   return (
     <div className="extension-source-form" style={{ display: "grid", gap: 8 }}>
-      <div className="extension-form-row" style={row}>
-        <label style={muted}>来源类型</label>
-        <Select aria-label="来源类型" selectedKey={draft.kind} onSelectionChange={(key) => onChange({ ...draft, kind: String(key) as SourceDraft["kind"] })}>
-          <Select.Trigger><Select.Value /></Select.Trigger>
-          <Select.Popover><ListBox>{SOURCE_KINDS.map(([kind, label]) => <ListBoxItem key={kind} id={kind} textValue={label}>{label}</ListBoxItem>)}</ListBox></Select.Popover>
-        </Select>
+      <div className="extension-form-row cx-ext-fields">
+        <div className="cx-ext-field cx-ext-field-kind">
+          <span>来源类型</span>
+          <Select aria-label="来源类型" selectedKey={draft.kind} onSelectionChange={(key) => onChange({ ...draft, kind: String(key) as SourceDraft["kind"] })}>
+            <Select.Trigger><Select.Value /></Select.Trigger>
+            <Select.Popover><ListBox>{SOURCE_KINDS.map(([kind, label]) => <ListBoxItem key={kind} id={kind} textValue={label}>{label}</ListBoxItem>)}</ListBox></Select.Popover>
+          </Select>
+        </div>
         {draft.kind === "local-dir" || draft.kind === "archive" ? (
-          <>
-            <label style={muted}>路径</label>
+          <label className="cx-ext-field cx-ext-field-grow">
+            <span>路径</span>
             <Input
-              style={{ ...input, flex: 1 }}
+              style={input}
               placeholder={draft.kind === "local-dir" ? "如 /path/to/extension" : "如 /tmp/hello-1.1.0.tar.gz"}
               value={draft.path}
               onChange={set("path")}
             />
-          </>
+          </label>
         ) : null}
         {draft.kind === "git" || draft.kind === "http" ? (
-          <>
-            <label style={muted}>URL</label>
-            <Input style={{ ...input, flex: 1 }} placeholder="https://…" value={draft.url} onChange={set("url")} />
-          </>
+          <label className="cx-ext-field cx-ext-field-grow">
+            <span>URL</span>
+            <Input style={input} placeholder="https://…" value={draft.url} onChange={set("url")} />
+          </label>
         ) : null}
         {draft.kind === "git" ? (
-          <>
-            <label style={muted}>ref</label>
-            <Input style={{ ...input, width: 140 }} placeholder="分支 / tag / commit" value={draft.ref} onChange={set("ref")} />
-          </>
+          <label className="cx-ext-field" style={{ width: 160 }}>
+            <span>ref</span>
+            <Input style={input} placeholder="分支 / tag / commit" value={draft.ref} onChange={set("ref")} />
+          </label>
         ) : null}
         {draft.kind === "http" ? (
-          <>
-            <label style={muted}>sha256</label>
-            <Input style={{ ...input, flex: 1 }} placeholder="归档校验值" value={draft.sha256} onChange={set("sha256")} />
-          </>
+          <label className="cx-ext-field cx-ext-field-grow">
+            <span>sha256</span>
+            <Input style={input} placeholder="归档校验值" value={draft.sha256} onChange={set("sha256")} />
+          </label>
         ) : null}
         {draft.kind === "catalog" ? (
           <>
-            <label style={muted}>catalog 根目录</label>
-            <Input style={{ ...input, flex: 1 }} value={draft.catalog_root} onChange={set("catalog_root")} />
-            <label style={muted}>插件名称</label>
-            <Input style={{ ...input, flex: 1 }} value={draft.extension_id} onChange={set("extension_id")} />
-            <label style={muted}>版本</label>
-            <Input style={{ ...input, width: 100 }} value={draft.version} onChange={set("version")} />
+            <label className="cx-ext-field cx-ext-field-grow">
+              <span>catalog 根目录</span>
+              <Input style={input} value={draft.catalog_root} onChange={set("catalog_root")} />
+            </label>
+            <label className="cx-ext-field cx-ext-field-grow">
+              <span>插件名称</span>
+              <Input style={input} value={draft.extension_id} onChange={set("extension_id")} />
+            </label>
+            <label className="cx-ext-field" style={{ width: 120 }}>
+              <span>版本</span>
+              <Input style={input} value={draft.version} onChange={set("version")} />
+            </label>
           </>
         ) : null}
       </div>
@@ -453,24 +417,30 @@ export function ExtensionSettings() {
   }, [load]);
 
   const loadDetail = useCallback(async (extensionId: string) => {
-    const [rDetail, rUi, rProj, rLogs] = await Promise.all([
-      apiFetch(`/api/extensions/${encodeURIComponent(extensionId)}/detail`),
-      apiFetch(`/api/extensions/${encodeURIComponent(extensionId)}/ui`),
-      apiFetch(`/api/extensions/${encodeURIComponent(extensionId)}/projection`),
-      apiFetch(`/api/extensions/${encodeURIComponent(extensionId)}/logs/page?limit=50`),
+    const base = `/api/extensions/${encodeURIComponent(extensionId)}`;
+    const [rDetail, rUi, rLogs] = await Promise.all([
+      apiFetch(`${base}/detail`),
+      apiFetch(`${base}/ui`),
+      apiFetch(`${base}/logs/page?limit=50`),
     ]);
     if (rDetail.ok) setDetail(await rDetail.json());
+    let nextContributions: UiContributions = {};
     if (rUi.ok) {
       const body = await rUi.json();
-      setContributions((body.contributions as UiContributions) ?? {});
-    } else {
-      setContributions({});
+      nextContributions = (body.contributions as UiContributions) ?? {};
     }
-    if (rProj.ok) {
-      const body = await rProj.json();
-      setProjection(body.status === "ok" ? body.data ?? body : null);
-    } else {
-      setProjection(null);
+    setContributions(nextContributions);
+    // Only boards and artifact viewers read a projection; extensions without
+    // them may not serve one at all.
+    const projectionConsumer = nextContributions.board ?? nextContributions.artifact_viewers?.[0];
+    setProjection(null);
+    if (projectionConsumer) {
+      const query = projectionConsumer.projection ? `?name=${encodeURIComponent(projectionConsumer.projection)}` : "";
+      const rProj = await apiFetch(`${base}/projection${query}`);
+      if (rProj.ok) {
+        const body = await rProj.json();
+        setProjection(body.status === "ok" ? body.data ?? body : null);
+      }
     }
     if (rLogs.ok) setLogs(await rLogs.json());
   }, []);
@@ -728,36 +698,22 @@ export function ExtensionSettings() {
     <div className="extension-settings" style={page}>
       <div style={inner}>
         {error ? (
-          <div
-            role="alert"
-            style={{
-              ...card,
-              borderColor: "color-mix(in srgb, var(--red) 45%, var(--line))",
-              color: "var(--red)",
-              fontSize: 12.5,
-            }}
-          >
+          <div role="alert" className="cx-ext-note" data-tone="danger">
             {error}
           </div>
         ) : null}
         {notice ? (
-          <div
-            style={{
-              ...card,
-              borderColor: "color-mix(in srgb, var(--green) 40%, var(--line))",
-              color: "var(--green)",
-              fontSize: 12.5,
-            }}
-          >
+          <div role="status" className="cx-ext-note" data-tone="success">
             {notice}
           </div>
         ) : null}
 
-        <section className="extension-settings-card" style={card}>
-          <div className="extension-card-heading" style={row}>
-            <strong style={{ color: "var(--bright)", fontSize: 14 }}>安装 Agent Plugin</strong>
-            <span style={muted}>根目录必须包含 Agent Plugins 1.0.0 plugin.json</span>
-          </div>
+        <SettingsSection
+          className="cx-ext-section"
+          bodyClassName="extension-settings-card cx-ext-card"
+          title="安装 Agent Plugin"
+          description={<>根目录必须包含 Agent Plugins 1.0.0 <code className="cx-ext-code">plugin.json</code></>}
+        >
           <SourceForm draft={installDraft} onChange={(draft) => {
             setInstallDraft(draft);
             setInstallPreview(null);
@@ -766,11 +722,11 @@ export function ExtensionSettings() {
           {installPreview ? (
             <PreviewPanel value={installPreview} confirmations={installConfirmations} onConfirmations={setInstallConfirmations} />
           ) : null}
-          <div className="extension-actions" style={row}>
+          <div className="extension-actions cx-ext-footer" style={row}>
             <span style={{ flex: 1 }} />
             <Button
               type="button"
-              style={btn}
+              className={btn}
               isDisabled={Boolean(busy)}
               onClick={() => void preview(installDraft)}
             >
@@ -778,56 +734,62 @@ export function ExtensionSettings() {
             </Button>
             <Button
               type="button"
-              style={btnPrimary}
+              className={btnPrimary}
               isDisabled={Boolean(busy) || !installPreview || installPreview.confirmations_required.some((item) => !installConfirmations.includes(item))}
               onClick={() => void install()}
             >
               {busy === "安装" ? "安装中…" : "安装"}
             </Button>
           </div>
-        </section>
+        </SettingsSection>
 
-        <section className="extension-settings-card" style={card}>
-          <div className="extension-card-heading" style={row}>
-            <strong style={{ color: "var(--bright)", fontSize: 14 }}>Agent Plugin Catalog</strong>
-            <span style={muted}>浏览管理员提供的版本固定清单</span>
-          </div>
-          <div className="extension-catalog-row" style={row}>
-            <label style={muted} htmlFor="extension-catalog-root">Catalog 路径</label>
-            <Input id="extension-catalog-root" style={{ ...input, flex: 1 }} value={catalogRoot} onChange={(event) => setCatalogRoot(event.target.value)} placeholder="目录或 YAML 文件" />
-            <label style={muted} htmlFor="extension-catalog-query">搜索</label>
-            <Input id="extension-catalog-query" style={input} value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} placeholder="id、版本或说明" />
-            <Button type="button" style={btn} isDisabled={Boolean(busy)} onClick={() => void loadCatalog()}>加载</Button>
+        <SettingsSection
+          className="cx-ext-section"
+          bodyClassName="extension-settings-card cx-ext-card"
+          title="Agent Plugin Catalog"
+          description="浏览管理员提供的版本固定清单"
+        >
+          <div className="extension-catalog-row cx-ext-fields">
+            <div className="cx-ext-field cx-ext-field-grow">
+              <label htmlFor="extension-catalog-root">Catalog 路径</label>
+              <Input id="extension-catalog-root" style={input} value={catalogRoot} onChange={(event) => setCatalogRoot(event.target.value)} placeholder="目录或 YAML 文件" />
+            </div>
+            <div className="cx-ext-field" style={{ width: 240 }}>
+              <label htmlFor="extension-catalog-query">搜索</label>
+              <Input id="extension-catalog-query" style={input} value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} placeholder="id、版本或说明" />
+            </div>
+            <Button type="button" className={btn} isDisabled={Boolean(busy)} onClick={() => void loadCatalog()}>加载</Button>
           </div>
           {catalogEntries.map((entry) => (
-            <div key={`${entry.id}:${entry.version}`} style={{ ...row, borderTop: "1px solid var(--line)", paddingTop: 8 }}>
+            <div key={`${entry.id}:${entry.version}`} className="cx-ext-list-row" style={row}>
               <strong style={mono}>{entry.id}@{entry.version}</strong>
               {badge(entry.revoked ? "var(--red)" : entry.trust_status === "verified" ? "var(--green)" : "var(--amber)", entry.revoked ? "revoked" : entry.trust_status || "unsigned", entry.revoke_reason)}
               <span style={muted}>发布者 {entry.publisher || "unknown"}</span>
               <span style={muted}>{entry.description || "无说明"}</span>
               <span style={{ flex: 1 }} />
-              <Button type="button" style={btn} isDisabled={entry.revoked} onClick={() => {
+              <Button type="button" className={btn} isDisabled={entry.revoked} onClick={() => {
                 setInstallDraft({ ...EMPTY_SOURCE, kind: "catalog", catalog_root: catalogRoot, extension_id: entry.id, version: entry.version });
                 setInstallPreview(null);
               }}>选择</Button>
             </div>
           ))}
-        </section>
+        </SettingsSection>
 
-        <section className="extension-settings-card" style={card}>
-          <div className="extension-card-heading extension-installed-heading" style={row}>
-            <strong style={{ color: "var(--bright)", fontSize: 14 }}>已安装 Agent Plugins</strong>
-            <span style={muted}>{loading ? "加载中…" : `${cards.length} 个`}</span>
-            <span style={{ flex: 1 }} />
-            <Button type="button" style={btn} isDisabled={loading} onClick={() => void load()}>
+        <SettingsSection
+          className="cx-ext-section"
+          bodyClassName="extension-settings-card cx-ext-card cx-ext-list"
+          title="已安装 Agent Plugins"
+          description={loading ? "加载中…" : `共 ${cards.length} 个`}
+          actions={
+            <Button type="button" className={btn} isDisabled={loading} onClick={() => void load()}>
               刷新
             </Button>
-          </div>
-
+          }
+        >
           {loading ? (
-            <div style={muted}>正在加载插件列表…</div>
+            <div className="cx-ext-empty">正在加载插件列表…</div>
           ) : cards.length === 0 ? (
-            <div style={muted}>尚未安装任何 Agent Plugin。</div>
+            <div className="cx-ext-empty">尚未安装任何 Agent Plugin。</div>
           ) : (
             cards.map(({ record, manifest, live_health: liveHealth, migrations }) => {
               const state = STATE_LABELS[record.state] ?? { label: record.state, color: "var(--muted)" };
@@ -836,26 +798,20 @@ export function ExtensionSettings() {
               return (
                 <article
                   key={id}
-                  style={{
-                    border: "1px solid var(--line)",
-                    borderRadius: 10,
-                    padding: 12,
-                    display: "grid",
-                    gap: 8,
-                    background: "var(--panel2)",
-                    opacity: record.enabled || record.state === "installed" ? 1 : 0.75,
-                  }}
+                  className="cx-ext-plugin"
+                  data-selected={selected === id || undefined}
+                  style={{ opacity: record.enabled || record.state === "installed" ? 1 : 0.75 }}
                 >
-                  <div style={row}>
-                    <strong style={{ ...mono, color: "var(--bright)", fontSize: 12.5 }}>{id}</strong>
+                  <div className="cx-ext-plugin-head" style={row}>
+                    <strong className="cx-ext-plugin-name">{id}</strong>
                     {badge("var(--blue)", ORIGIN_LABELS[record.origin] ?? record.origin)}
                     {selected === id && selectedStatusLabels ? (
-                      <StatusLabel value={record.state} contribution={selectedStatusLabels} fallback={state.label} />
+                      <StatusLabel value={record.state} contribution={selectedStatusLabels} fallback={badge(state.color, state.label)} />
                     ) : (
                       badge(state.color, state.label)
                     )}
                     {record.active_version
-                      ? badge("var(--green)", `v${record.active_version}`, `已装版本：${record.installed_versions.join(", ")}`)
+                      ? badge("var(--muted)", `v${record.active_version}`, `已装版本：${record.installed_versions.join(", ")}`)
                       : badge("var(--muted)", "未启用版本")}
                     {record.enabled ? (
                       liveHealth?.status === "healthy"
@@ -868,15 +824,15 @@ export function ExtensionSettings() {
                     {manifest.plugin_schema ? badge("var(--blue)", "Agent Plugins 1.0.0") : null}
                     {badge("var(--blue)", `Registry：${manifest.registry_state || "installed"}`)}
                     <span style={{ flex: 1 }} />
-                    <Button type="button" style={btn} onClick={() => void select(id)}>
+                    <Button type="button" className={btn} onClick={() => void select(id)}>
                       {selected === id ? "收起" : "详情"}
                     </Button>
                   </div>
 
-                  <div style={{ ...row, ...mono, color: "var(--muted)" }}>
+                  <div className="cx-ext-meta" style={meta}>
                     {manifest.plugin_version ? <span>plugin v{manifest.plugin_version}</span> : null}
                     {manifest.version && manifest.version !== manifest.plugin_version ? <span>host v{manifest.version}</span> : null}
-                    {manifest.client_namespace ? <span>{manifest.client_namespace}</span> : null}
+                    {manifest.client_namespace ? <code className="cx-ext-code">{manifest.client_namespace}</code> : null}
                     {manifest.requires_core ? <span>core {manifest.requires_core}</span> : null}
                     {manifest.portable_components?.skills?.length ? <span>Skills：{manifest.portable_components.skills.join(", ")}</span> : null}
                     {manifest.portable_components?.mcp_state === "ready" ? <span>MCP</span> : null}
@@ -888,15 +844,15 @@ export function ExtensionSettings() {
                   </div>
 
                   {manifest.verification ? (
-                    <div style={{ ...row, ...mono, color: "var(--muted)" }}>
+                    <div className="cx-ext-meta" style={meta}>
                       <span>签名：{String(manifest.verification.signature || "unsigned")}</span>
                       <span>发布者：{String(manifest.verification.publisher || "unknown")}</span>
-                      <span data-tooltip={String(manifest.verification.content_sha256 || "")}>摘要：{String(manifest.verification.content_sha256 || "").slice(0, 16) || "—"}</span>
+                      <span data-tooltip={String(manifest.verification.content_sha256 || "")}>摘要：<code className="cx-ext-code">{String(manifest.verification.content_sha256 || "").slice(0, 16) || "—"}</code></span>
                     </div>
                   ) : null}
 
                   {record.isolation?.enforcement ? (
-                    <div style={{ ...row, ...mono, color: record.isolation.enforcement === "enforced" ? "var(--green)" : "var(--amber)" }}>
+                    <div className="cx-ext-meta" style={{ ...meta, color: record.isolation.enforcement === "enforced" ? meta.color : "var(--cx-warning)" }}>
                       <span>权限执行：{record.isolation.enforcement}</span>
                       <span>隔离：{record.isolation.backend || "none"}</span>
                       <span>子进程：{record.isolation.subprocess_policy || "未声明"}</span>
@@ -905,13 +861,13 @@ export function ExtensionSettings() {
                   ) : null}
 
                   {record.registry_entries?.length ? (
-                    <div style={{ ...row, ...mono, color: "var(--muted)" }}>
-                      {record.registry_entries.map((entry) => <span key={`${entry.type}:${entry.id}`}>{entry.type} · {entry.id} · {entry.state}</span>)}
+                    <div className="cx-ext-meta" style={meta}>
+                      {record.registry_entries.map((entry) => <span key={`${entry.type}:${entry.id}`}>{entry.type} · <code className="cx-ext-code">{entry.id}</code> · {entry.state}</span>)}
                     </div>
                   ) : null}
 
                   {manifest.permissions ? (
-                    <div style={{ ...row, ...mono, color: "var(--muted)" }}>
+                    <div className="cx-ext-meta" style={meta}>
                       <span>文件系统：{manifest.permissions.filesystem.join(", ") || "无"}</span>
                       <span>网络：{manifest.permissions.network.join(", ") || "无"}</span>
                       <span>
@@ -929,18 +885,18 @@ export function ExtensionSettings() {
                   ) : null}
 
                   {record.last_error ? (
-                    <div style={{ color: "var(--red)", fontSize: 12 }}>{record.last_error}</div>
+                    <div style={{ color: "var(--cx-danger)", fontSize: 12 }}>{record.last_error}</div>
                   ) : null}
 
-                  <div style={row}>
+                  <div className="cx-ext-plugin-actions" style={row}>
                     {record.enabled ? (
-                      <Button type="button" style={btn} isDisabled={Boolean(busy)} onClick={() => void disable(id)}>
+                      <Button type="button" className={btn} isDisabled={Boolean(busy)} onClick={() => void disable(id)}>
                         停用
                       </Button>
                     ) : (
                       <Button
                         type="button"
-                        style={btnPrimary}
+                        className={btnPrimary}
                         isDisabled={Boolean(busy) || !record.installed_versions.length}
                         onClick={() => void enable(id)}
                       >
@@ -949,7 +905,7 @@ export function ExtensionSettings() {
                     )}
                     <Button
                       type="button"
-                      style={btn}
+                      className={btn}
                       isDisabled={Boolean(busy)}
                       onClick={() => {
                         setShowUpgrade(showUpgrade === id ? "" : id);
@@ -960,7 +916,7 @@ export function ExtensionSettings() {
                     </Button>
                     <Button
                       type="button"
-                      style={btn}
+                      className={btn}
                       isDisabled={Boolean(busy) || !rollbackTargets.length}
                       aria-label={rollbackTargets.length ? `回滚到 v${rollbackTargets[rollbackTargets.length - 1]}` : "无其他已装版本"}
                       onClick={() => void rollback(id)}
@@ -969,7 +925,7 @@ export function ExtensionSettings() {
                     </Button>
                     <Button
                       type="button"
-                      style={btn}
+                      className={btn}
                       isDisabled={Boolean(busy) || !record.enabled}
                       onClick={() => void refreshHealth(id)}
                     >
@@ -978,7 +934,7 @@ export function ExtensionSettings() {
                     <span style={{ flex: 1 }} />
                     <Button
                       type="button"
-                      style={btnDanger}
+                      className={btnDanger}
                       isDisabled={Boolean(busy)}
                       onClick={() => {
                         setError("");
@@ -990,16 +946,8 @@ export function ExtensionSettings() {
                   </div>
 
                   {showUpgrade === id ? (
-                    <div
-                      style={{
-                        border: "1px dashed var(--line2)",
-                        borderRadius: 10,
-                        padding: 10,
-                        display: "grid",
-                        gap: 8,
-                      }}
-                    >
-                      <span style={muted}>升级来源（旧版本按插件升级策略处理，状态迁移会写 receipt）：</span>
+                    <div className="cx-ext-upgrade">
+                      <span className="cx-ext-detail-label">升级来源（旧版本按插件升级策略处理，状态迁移会写 receipt）</span>
                       <SourceForm
                         draft={upgradeDraft[id] ?? EMPTY_SOURCE}
                         onChange={(d) => {
@@ -1020,12 +968,12 @@ export function ExtensionSettings() {
                       ) : null}
                       <div style={row}>
                         <span style={{ flex: 1 }} />
-                        <Button type="button" style={btn} isDisabled={Boolean(busy)} onClick={() => void preview(upgradeDraft[id] ?? EMPTY_SOURCE, id)}>
+                        <Button type="button" className={btn} isDisabled={Boolean(busy)} onClick={() => void preview(upgradeDraft[id] ?? EMPTY_SOURCE, id)}>
                           {busy === `预览升级 ${id}` ? "检查中…" : "生成升级预览"}
                         </Button>
                         <Button
                           type="button"
-                          style={btnPrimary}
+                          className={btnPrimary}
                           isDisabled={Boolean(busy) || !upgradePreviews[id] || upgradePreviews[id].confirmations_required.some((item) => !(upgradeConfirmations[id] || []).includes(item))}
                           onClick={() => void upgrade(id)}
                         >
@@ -1038,28 +986,29 @@ export function ExtensionSettings() {
               );
             })
           )}
-        </section>
+        </SettingsSection>
 
         {selected && detail ? (
-          <section style={card}>
-            <div style={row}>
-              <strong style={{ color: "var(--bright)", fontSize: 14 }}>插件详情：{selected}</strong>
-              {detail.live_health
-                ? badge(
-                    detail.live_health.status === "healthy" ? "var(--green)" : "var(--amber)",
-                    `实时健康：${detail.live_health.status ?? "unknown"}`,
-                    detail.live_health.detail,
-                  )
-                : badge("var(--muted)", "未启用，无实时健康")}
-            </div>
+          <SettingsSection
+            className="cx-ext-section"
+            bodyClassName="cx-ext-card cx-ext-detail"
+            title={<>插件详情 <code className="cx-ext-code">{selected}</code></>}
+            actions={detail.live_health
+              ? badge(
+                  detail.live_health.status === "healthy" ? "var(--green)" : "var(--amber)",
+                  `实时健康：${detail.live_health.status ?? "unknown"}`,
+                  detail.live_health.detail,
+                )
+              : badge("var(--muted)", "未启用，无实时健康")}
+          >
 
             {contributions.navigation?.length ? <NavigationItems items={contributions.navigation} /> : null}
 
             {detail.migrations.length ? (
               <div style={{ display: "grid", gap: 4 }}>
-                <span style={muted}>状态迁移 receipt：</span>
+                <span className="cx-ext-detail-label">状态迁移 receipt</span>
                 {detail.migrations.map((m) => (
-                  <span key={`${m.from_version}-${m.to_version}`} style={{ ...mono, color: "var(--muted)" }}>
+                  <span key={`${m.from_version}-${m.to_version}`} style={muted}>
                     {m.from_version ?? "none"} → {m.to_version} · {new Date(m.migrated_at).toLocaleString()} ·{" "}
                     {m.files.length ? `迁移文件：${m.files.join(", ")}` : "无状态文件"}
                   </span>
@@ -1069,10 +1018,10 @@ export function ExtensionSettings() {
 
             {contributions.command_forms?.length && detail.record.enabled ? (
               <div style={{ display: "grid", gap: 8 }}>
-                <span style={muted}>命令表单（声明式 contribution）：</span>
-                {contributions.command_forms.map((form) => (
+                <span className="cx-ext-detail-label">命令表单（声明式 contribution）</span>
+                {contributions.command_forms.map((form, index) => (
                   <CommandFormView
-                    key={form.command_type}
+                    key={form.command_type || form.id || `form-${index}`}
                     form={form}
                     busy={busy === `调用 ${form.command_type}`}
                     result={invokeResults[form.command_type]}
@@ -1084,14 +1033,14 @@ export function ExtensionSettings() {
 
             {contributions.board && projection !== null ? (
               <div style={{ display: "grid", gap: 6 }}>
-                <span style={muted}>看板（projection：{contributions.board.projection ?? "默认"}）：</span>
+                <span className="cx-ext-detail-label">看板（projection：{contributions.board.projection ?? "默认"}）</span>
                 <BoardView board={contributions.board as BoardContribution} data={projection} />
               </div>
             ) : null}
 
             {contributions.artifact_viewers?.length && projection !== null ? (
               <div style={{ display: "grid", gap: 8 }}>
-                <span style={muted}>Artifact viewer（声明式，受控渲染）：</span>
+                <span className="cx-ext-detail-label">Artifact viewer（声明式，受控渲染）</span>
                 {contributions.artifact_viewers.map((viewer) => (
                   <ArtifactViewerView key={viewer.id} viewer={viewer} data={projection} />
                 ))}
@@ -1100,7 +1049,7 @@ export function ExtensionSettings() {
 
             {detail.config_schema ? (
               <div style={{ display: "grid", gap: 6 }}>
-                <span style={muted}>设置 schema（config_schema 声明式渲染，提交即带配置重新启用）：</span>
+                <span className="cx-ext-detail-label">设置 schema（config_schema 声明式渲染，提交即带配置重新启用）</span>
                 <SchemaForm
                   schema={detail.config_schema}
                   initial={detail.record.config}
@@ -1110,48 +1059,35 @@ export function ExtensionSettings() {
                 />
               </div>
             ) : detail.config_schema_error ? (
-              <div style={{ color: "var(--red)", fontSize: 12 }}>config schema 读取失败：{detail.config_schema_error}</div>
+              <div style={{ color: "var(--cx-danger)", fontSize: 12 }}>config schema 读取失败：{detail.config_schema_error}</div>
             ) : null}
 
             <div style={{ display: "grid", gap: 6 }}>
               <div style={row}>
-                <span style={muted}>归档日志（完整内容，尾部共 {logs?.total ?? 0} 行）：</span>
+                <span className="cx-ext-detail-label">归档日志（完整内容，尾部共 {logs?.total ?? 0} 行）</span>
                 {logs?.has_more ? (
-                  <Button type="button" style={btn} onClick={() => void loadMoreLogs()}>
+                  <Button type="button" className={btn} onClick={() => void loadMoreLogs()}>
                     加载更早
                   </Button>
                 ) : null}
               </div>
               {logs && logs.lines.length ? (
-                <pre
-                  style={{
-                    ...mono,
-                    margin: 0,
-                    padding: 10,
-                    borderRadius: 8,
-                    background: "var(--panel2)",
-                    color: "var(--text)",
-                    maxHeight: 240,
-                    overflow: "auto",
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-all",
-                  }}
-                >
+                <pre className="cx-ext-log" style={mono}>
                   {logs.lines.join("\n")}
                 </pre>
               ) : (
                 <span style={muted}>暂无日志。</span>
               )}
             </div>
-          </section>
+          </SettingsSection>
         ) : null}
 
         {selected && !detail ? (
-          <section style={{ ...card, ...muted }}>正在加载 {selected} 的详情…</section>
+          <div className="cx-settings-card cx-ext-empty">正在加载 {selected} 的详情…</div>
         ) : null}
       </div>
       <Modal isOpen={Boolean(uninstallDraft)} onOpenChange={(open) => !open && setUninstallDraft(null)}>
-        <Modal.Backdrop isDismissable={!busy}><Modal.Container><Modal.Dialog>
+        <Modal.Backdrop isDismissable={!busy}><Modal.Container><Modal.Dialog className="cx-settings-dialog">
           <Modal.Header className="flex flex-col gap-1">
             <Modal.Heading>{uninstallDraft ? `卸载 ${uninstallDraft.id}` : "卸载扩展"}</Modal.Heading>
             <small className="font-normal text-foreground-500">卸载会停止并移除扩展。请明确选择需要保留的数据，再确认执行。</small>
@@ -1169,7 +1105,7 @@ export function ExtensionSettings() {
                   <span>状态与日志：<strong>{uninstallDraft.preserveState ? "保留" : "删除"}</strong></span>
                   <span>Artifact：<strong>{uninstallDraft.preserveArtifacts ? "保留" : "删除"}</strong></span>
                 </div>
-                {error ? <p role="alert" style={{ color: "var(--red)" }}>{error}</p> : null}
+                {error ? <p role="alert" className="cx-settings-dialog-error">{error}</p> : null}
               </div>
             ) : null}
           </Modal.Body>

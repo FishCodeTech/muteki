@@ -23,6 +23,7 @@ RECOVERY_EMPTY = "empty"
 
 REASON_RUNTIME_SWITCH = "runtime_switch"
 REASON_PERMISSION = "permission"
+REASON_INTERACTION_MODE = "interaction_mode"
 REASON_CREDENTIAL = "credential"
 REASON_RESTART = "restart"
 REASON_RETRY = "retry"
@@ -102,10 +103,13 @@ def classify_rebuild_reason(
     new_session_key: str,
     previous_runtime_key: str,
     new_runtime_key: str,
+    interaction_mode_changed: bool = False,
 ) -> str:
     """Name why a new session is being created (for UI + events)."""
     if force_new or turn_kind == "retry":
         return REASON_RETRY
+    if interaction_mode_changed:
+        return REASON_INTERACTION_MODE
     if turn_kind == "resume" and not switched:
         return REASON_RESTART
     if not switched and previous_session_key == new_session_key:
@@ -252,6 +256,7 @@ def _boundary_label(kind: str, reason: str, included: int, omitted: int) -> str:
     reason_zh = {
         REASON_RUNTIME_SWITCH: "Runtime 切换",
         REASON_PERMISSION: "权限/访问模式变更",
+        REASON_INTERACTION_MODE: "交互模式切换（计划/默认）",
         REASON_CREDENTIAL: "凭据切换",
         REASON_RESTART: "进程重启接管",
         REASON_RETRY: "重试重建",
@@ -349,6 +354,7 @@ __all__ = [
     "HandoffMessage",
     "REASON_CREDENTIAL",
     "REASON_FORK",
+    "REASON_INTERACTION_MODE",
     "REASON_PERMISSION",
     "REASON_RESTART",
     "REASON_RETRY",

@@ -131,6 +131,9 @@ class TaskQueryHandler:
                     )).casefold()
                 ]
             total = len(tasks)
+            from .pagination import page_items
+            selected, continuation = page_items(tasks, params, limit, ctx, query.query_type,
+                                                 lambda task: task.task_id)
             rows = [
                 {
                     "task_id": item.task_id,
@@ -141,7 +144,7 @@ class TaskQueryHandler:
                     "revision": item.revision,
                     "created_at": item.created_at.isoformat(),
                 }
-                for item in tasks[:limit]
+                for item in selected
             ]
             return QueryResult(
                 query_id=query.query_id,
@@ -150,6 +153,7 @@ class TaskQueryHandler:
                     "tasks": rows,
                     "total": total,
                     "returned": len(rows),
+                    **continuation,
                 },
             )
 

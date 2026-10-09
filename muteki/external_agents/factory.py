@@ -16,20 +16,21 @@ from muteki.solver.engine_registry import (
     EngineTemporarilyUnsupportedError,
 )
 
-from .base import AdapterIdentity
+from .base import AdapterIdentity, BaseExternalAgentAdapter
 from .registry import AdapterRegistry
 
 
 STRUCTURED_ADAPTER_ENGINES: dict[str, str] = {
     "codex.app_server": "codex",
     "claude.sdk": "claude",
-    "cursor.acp": "cursor",
+    "cursor.sdk": "cursor",
     "grok.acp": "grok",
     "pi.rpc": "pi",
     "opencode.server": "opencode",
     "kimi.acp": "kimi",
-    "omp.rpc_v2": "omp",
+    "omp.acp": "omp",
     "devin.acp": "devin",
+    "droid.rpc": "droid",
 }
 
 HISTORICAL_ADAPTER_ENGINES: dict[str, str] = {
@@ -46,7 +47,9 @@ LEGACY_ADAPTER_ALIASES: dict[str, str] = {
 OPTIONAL_STRUCTURED_ADAPTER_ENGINES: dict[str, str] = {
     "kimi.local_server": "kimi",
     "pi.acp": "pi",
-    "omp.acp": "omp",
+    "omp.rpc_v2": "omp",
+    "cursor.acp": "cursor",
+    "droid.acp": "droid",
 }
 
 DEFAULT_STRUCTURED_ADAPTER_BY_ENGINE: dict[str, str] = {
@@ -85,6 +88,39 @@ def engine_for_adapter(adapter_id: str) -> str:
     )
 
 
+MAX_LAUNCH_ARGS = 64
+MAX_LAUNCH_ARG_LENGTH = 4096
+
+
+def normalize_launch_args(value: Any, adapter_id: str) -> tuple[str, ...]:
+    """Validate user CLI arguments for one Runtime instance (raises ValueError)."""
+    if value in (None, "", [], ()):
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("launch_args 必须是字符串数组")
+    adapter_id = canonical_adapter_id(adapter_id)
+    if adapter_id.startswith("cli."):
+        raise ValueError("CLI compatibility transport 不支持 launch_args")
+    if len(value) > MAX_LAUNCH_ARGS:
+        raise ValueError(f"launch_args 最多 {MAX_LAUNCH_ARGS} 项，当前 {len(value)} 项")
+    out: list[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, str):
+            raise ValueError(f"launch_args[{index}] 必须是字符串")
+        if not item.strip():
+            raise ValueError(f"launch_args[{index}] 不能为空")
+        if "\0" in item or "\n" in item:
+            raise ValueError(f"launch_args[{index}] 不能包含换行或 NUL")
+        if len(item) > MAX_LAUNCH_ARG_LENGTH:
+            raise ValueError(f"launch_args[{index}] 超过 {MAX_LAUNCH_ARG_LENGTH} 字符")
+        out.append(item)
+    if adapter_id == "claude.sdk":
+        from .claude import claude_extra_args
+
+        claude_extra_args(out)
+    return tuple(out)
+
+
 def runtime_config_schema(adapter_id: str) -> dict[str, Any]:
     """返回设置页可直接生成表单的 Runtime 配置 schema。"""
     adapter_id = canonical_adapter_id(adapter_id)
@@ -97,6 +133,11 @@ def runtime_config_schema(adapter_id: str) -> dict[str, Any]:
         "binary_path": {"type": "string", "title": "可执行文件"},
         "enabled": {"type": "boolean", "title": "启用", "default": True},
     }
+    if not adapter_id.startswith("cli."):
+        properties["launch_args"] = {
+            "type": "array", "title": "启动参数", "items": {"type": "string"},
+            "maxItems": MAX_LAUNCH_ARGS,
+        }
     if adapter_id in {"opencode.server", "kimi.local_server"}:
         properties["adapter_endpoint"] = {
             "type": "string", "title": "Adapter 服务地址", "format": "uri",
@@ -159,6 +200,7 @@ class RuntimeAdapterConfig:
     default_model: str = ""
     enabled: bool = True
     transport: dict[str, Any] = field(default_factory=dict)
+    launch_args: tuple[str, ...] = ()
 
     @classmethod
     def from_value(cls, value: Any) -> "RuntimeAdapterConfig":
@@ -180,6 +222,7 @@ class RuntimeAdapterConfig:
             default_model=str(read("default_model") or ""),
             enabled=bool(read("enabled", True)),
             transport=dict(read("transport", {}) or {}),
+            launch_args=tuple(str(item) for item in (read("launch_args", ()) or ())),
         )
 
 
@@ -241,10 +284,18 @@ class RuntimeAdapterFactory:
         adapter.identity = AdapterIdentity(adapter_id, instance_id)
         return adapter
 
-    def create(self, value: RuntimeAdapterConfig | Mapping[str, Any] | Any) -> Any:
+    def create(self, value: RuntimeAdapterConfig | Mapping[str, Any] | Any) -> BaseExternalAgentAdapter:
         config = value if isinstance(value, RuntimeAdapterConfig) else RuntimeAdapterConfig.from_value(value)
         adapter = self._create(config)
-        if self.probe_environment_factory is not None and hasattr(adapter, "probe_with_environment"):
+        if not isinstance(adapter, BaseExternalAgentAdapter):
+            raise TypeError(
+                f"runtime builder for {config.adapter_id!r} returned "
+                f"{type(adapter).__name__}, not a BaseExternalAgentAdapter")
+        if self.gateway is not None and self.descriptor_provider is None:
+            adapter.bind_capability_gateway(self.gateway)
+        if config.launch_args and not config.adapter_id.startswith("cli."):
+            adapter.launch_args = normalize_launch_args(config.launch_args, config.adapter_id)
+        if self.probe_environment_factory is not None:
             adapter.probe_environment_factory = lambda: self.probe_environment_factory(
                 engine_for_adapter(config.adapter_id), f"probe:{config.instance_id}", self._env(config))
         return adapter
@@ -281,17 +332,24 @@ class RuntimeAdapterFactory:
 
         from muteki import external_agents as ea
 
+        # Health discovery and structured chat must select the same installation.
+        # Bridge executables with their own resolution remain adapter-owned.
+        if binary is None and adapter_id not in {"cursor.sdk", "cursor.acp", "pi.acp"}:
+            from muteki.solver.cli_engines.bins import resolve_engine_bin
+
+            binary = resolve_engine_bin(engine)
+
         if adapter_id == "devin.acp":
             from .devin import DevinAcpAdapter
 
-            # Conversation-only local runtime, without Worker gateway bindings.
+            # Conversation-only scope is enforced by the adapter. It still
+            # needs the same session-owned gateway bindings as other chats.
             return DevinAcpAdapter(
-                binary=binary, env_extra=env,
-                instance_id=config.instance_id, store=self.store,
+                binary=binary, env_extra=env, **common,
             )
         if adapter_id == "codex.app_server":
             adapter = ea.CodexAppServerAdapter(
-                binary=binary or "codex",
+                binary=binary,
                 default_env=env,
                 experimental_api=bool(transport.get("experimental_api", False)),
                 **common,
@@ -302,6 +360,12 @@ class RuntimeAdapterFactory:
                 default_env=env,
                 permission_mode=str(transport.get("permission_mode") or "default"),
                 gateway=self.gateway,
+                **common,
+            )
+        elif adapter_id == "cursor.sdk":
+            adapter = ea.CursorSdkAdapter(
+                runtime_root=self.sessions_root / "_cursor_sdk_runtime",
+                env_extra=env,
                 **common,
             )
         elif adapter_id == "cursor.acp":
@@ -333,12 +397,13 @@ class RuntimeAdapterFactory:
         elif adapter_id == "opencode.server":
             adapter = ea.OpenCodeServerAdapter(
                 binary=binary, base_url=config.endpoint or None,
-                manage_server=not bool(config.endpoint), extra_env=env, **common,
+                manage_server=not bool(config.endpoint), extra_env=env,
+                log_root=self.sessions_root / "_logs" / "external_agents",
+                **common,
             )
         elif adapter_id == "kimi.acp":
             adapter = ea.KimiAcpAdapter(
                 binary=binary,
-                runtime_root=self.sessions_root / "_kimi_acp_runtime",
                 env_extra=env,
                 **common,
             )
@@ -346,6 +411,7 @@ class RuntimeAdapterFactory:
             adapter = ea.KimiLocalServerAdapter(
                 binary=binary, base_url=config.endpoint or None,
                 extra_env=env,
+                log_root=self.sessions_root / "_logs" / "external_agents",
                 **common,
             )
         elif adapter_id == "omp.rpc_v2":
@@ -357,6 +423,14 @@ class RuntimeAdapterFactory:
             )
         elif adapter_id == "omp.acp":
             adapter = ea.OmpAcpAdapter(binary=binary, env_extra=env, **common)
+        elif adapter_id == "droid.rpc":
+            adapter = ea.DroidRpcAdapter(
+                binary=binary, env_extra=env,
+                log_root=self.sessions_root / "_logs" / "external_agents",
+                **common,
+            )
+        elif adapter_id == "droid.acp":
+            adapter = ea.DroidAcpAdapter(binary=binary, env_extra=env, **common)
         else:
             raise ValueError(f"unsupported Runtime adapter: {adapter_id!r}")
         return self._retag(adapter, adapter_id, config.instance_id)
@@ -377,7 +451,16 @@ class RuntimeAdapterFactory:
         existing = registry.get(config.adapter_id, config.instance_id)
         if existing is not None:
             return existing
-        adapter = self.create(config)
+        from . import ExternalAgentDependencyError
+
+        try:
+            adapter = self.create(config)
+        except ExternalAgentDependencyError as exc:
+            # Keep the exact dependency failure observable in health/start;
+            # registering one unavailable engine must not break all chat.
+            from .unavailable import DependencyUnavailableAdapter
+
+            adapter = DependencyUnavailableAdapter(config.adapter_id, exc, **self._common(config))
         registry.register(adapter, instance_id=config.instance_id, metadata={
             "engine": engine_for_adapter(config.adapter_id),
             "enabled": config.enabled,

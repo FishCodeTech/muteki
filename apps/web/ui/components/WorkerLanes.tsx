@@ -7,7 +7,8 @@ import type { CSSProperties, KeyboardEvent } from "react";
 import { DeckState, SolverLane, isReviewWorkerLane, isVerifierWorkerLane, workerChat, workerIds, currentGenWorkerIds } from "@/lib/events";
 import type { SwarmDigest } from "@/lib/events";
 import { useT } from "@/lib/i18n";
-import { SPAWN_ENGINES, workerColor, workerEngine, workerEngineKey, toWorkerIdentity, workerDisplayName, workerGeneration } from "@/lib/workers";
+import { providerEngines, readyCatalog, useProviderDescriptors } from "@/lib/providerDescriptors";
+import { workerColor, workerEngine, workerEngineKey, toWorkerIdentity, workerDisplayName, workerGeneration } from "@/lib/workers";
 import { compactLaneStatus, laneActivityDetail, laneStatusKind, laneStatusTone, rosterGroup } from "@/lib/workerLanePresentation";
 import type { RosterGroup } from "@/lib/workerLanePresentation";
 import { Icon } from "@/components/Icon";
@@ -28,12 +29,13 @@ function WorkerSpawnControl({
 }) {
   const t = useT();
   const [spawnEngine, setSpawnEngine] = useState("");
+  const spawnEngines = providerEngines(readyCatalog(useProviderDescriptors()));
   if (!running) return null;
   return (
     <div className="wlane-spawn">
       <Select aria-label={t("workerDock.engine")} selectedKey={spawnEngine} onSelectionChange={(key) => setSpawnEngine(String(key ?? ""))}>
         <Select.Trigger><Select.Value /></Select.Trigger>
-        <Select.Popover><ListBox><ListBoxItem id="" textValue={t("workerDock.auto")}>{t("workerDock.auto")}</ListBoxItem>{SPAWN_ENGINES.map((engine) => <ListBoxItem key={engine} id={engine} textValue={engine}>{engine}</ListBoxItem>)}</ListBox></Select.Popover>
+        <Select.Popover><ListBox><ListBoxItem id="" textValue={t("workerDock.auto")}>{t("workerDock.auto")}</ListBoxItem>{spawnEngines.map((engine) => <ListBoxItem key={engine} id={engine} textValue={engine}>{engine}</ListBoxItem>)}</ListBox></Select.Popover>
       </Select>
       <Button className="wlane-spawn-btn" onClick={() => onSpawnWorker(spawnEngine || undefined)}
         data-tooltip={t("workerDock.addTitle")}>＋ {t("workerDock.add")}</Button>

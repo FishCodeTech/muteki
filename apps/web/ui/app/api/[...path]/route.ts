@@ -32,6 +32,18 @@ function apiUrl(req: Request, path: string[] | undefined): string {
 function requestHeaders(req: Request): Headers {
   const headers = new Headers(req.headers);
   for (const name of hopByHopHeaders) headers.delete(name);
+  // Validate the browser origin here, before mapping it to the backend origin.
+  // Caller-supplied forwarding headers never establish that trust.
+  const origin = req.headers.get("origin");
+  headers.delete("forwarded");
+  headers.delete("x-forwarded-for");
+  headers.delete("x-real-ip");
+  headers.delete("x-forwarded-host");
+  headers.delete("x-forwarded-proto");
+  if (origin) {
+    headers.set("origin", backendApiUrl("/").origin);
+    headers.set("x-forwarded-proto", new URL(origin).protocol.slice(0, -1));
+  }
   return headers;
 }
 
@@ -42,11 +54,20 @@ function responseHeaders(upstream: Response): Headers {
 }
 
 async function proxy(req: Request, ctx: RouteContext) {
+  const origin = req.headers.get("origin");
+  if (origin) {
+    let sameHost = false;
+    try { sameHost = new URL(origin).host === req.headers.get("host"); } catch { /* reject malformed origin */ }
+    if (!sameHost || (req.headers.get("sec-fetch-site") === "cross-site")) {
+      return Response.json({ error: { code: "auth.origin_invalid", message: "请求来源不受信任，请从工作台页面重试。" } }, { status: 403 });
+    }
+  }
   const params = await ctx.params;
   const init: RequestInit & { duplex?: "half" } = {
     method: req.method,
     headers: requestHeaders(req),
     cache: "no-store",
+    redirect: "manual",
     // 页面关闭/导航离开时取消上游请求，释放长连接。
     signal: req.signal,
   };

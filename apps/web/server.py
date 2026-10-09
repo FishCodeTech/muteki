@@ -41,7 +41,10 @@ from apps.web.auth import (
     PUBLIC_API_PATHS,
     AuthConfig,
     TicketStore,
-    bearer_from_header,
+    ServiceSessionMiddleware,
+    allowed_web_origins,
+    browser_request_error,
+    request_token,
     verify_token,
 )
 from apps.web.run_manager import RunManager
@@ -77,7 +80,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     # sweep hourly. All env-tunable; set MUTEKI_RETENTION_ENABLED=0 to disable
     # (pinned runs are NEVER auto-touched).
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
+    async def normal_lifespan(app: FastAPI):
         # Start the reverse-connect control receiver: the in-container supervisors
         # DIAL this (host.docker.internal:<port>) — so the host must be listening
         # before any container starts. Lazy-starts on first use too, but starting it
@@ -212,7 +215,59 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             await mgr.shutdown()
             await platform_stack.shutdown()
 
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        if os.environ.get("MUTEKI_DESKTOP_MAINTENANCE") != "1":
+            async with normal_lifespan(app):
+                yield
+            return
+        # Schema construction has completed, but recovery, timers, agents and
+        # external side effects remain stopped until the installer admits writes.
+        app.state.desktop_activate = asyncio.Event()
+        app.state.desktop_activated = asyncio.Event()
+        stopped = asyncio.Event()
+
+        async def activate():
+            await app.state.desktop_activate.wait()
+            try:
+                async with normal_lifespan(app):
+                    app.state.desktop_activated.set()
+                    await stopped.wait()
+            except Exception as exc:
+                app.state.desktop_activation_error = str(exc)
+                app.state.desktop_activated.set()
+                raise
+
+        task = asyncio.create_task(activate())
+        try:
+            yield
+        finally:
+            stopped.set()
+            if not app.state.desktop_activate.is_set():
+                task.cancel()
+                await mgr.shutdown()
+                await platform_stack.shutdown()
+            results = await asyncio.gather(task, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    raise result
+
     app = FastAPI(title="Project Muteki — Agent 安全工作台", lifespan=lifespan)
+    app.state.desktop_draining = os.environ.get("MUTEKI_DESKTOP_MAINTENANCE") == "1"
+    app.state.desktop_writes_in_flight = 0
+
+    @app.middleware("http")
+    async def desktop_write_gate(request: Request, call_next):
+        mutation = request.method not in {"GET", "HEAD", "OPTIONS"} and request.url.path.startswith("/api/") and request.url.path != "/api/desktop/drain"
+        if not mutation:
+            return await call_next(request)
+        if app.state.desktop_draining:
+            return JSONResponse({"error": {"code": "desktop.maintenance", "message": "工作台正在切换版本，暂不接受新操作。"}}, status_code=503)
+        app.state.desktop_writes_in_flight += 1
+        try:
+            return await call_next(request)
+        finally:
+            app.state.desktop_writes_in_flight -= 1
 
     @app.exception_handler(RequestValidationError)
     async def _request_validation_error(
@@ -264,92 +319,51 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     for router in platform_stack.routers():
         app.include_router(router)
 
-    # Auth (P3): a single-password gate in front of /api. fail_fast_check refuses
-    # to start if bound to a non-loopback host with no password — see auth.py and
-    # docs/_local/plan_p3_auth.md. When no password is set AND the bind is
-    # loopback, auth is disabled and the deck behaves exactly as before.
-    auth = AuthConfig.from_env()
+    auth = AuthConfig.from_env(mgr.state_root, service_id=platform_stack.store.installation_id)
     auth.fail_fast_check()
     app.state.auth = auth
     app.state.tickets = TicketStore()
+    cors_origins = allowed_web_origins()
+    app.add_middleware(CORSMiddleware, allow_origins=sorted(cors_origins),
+                       allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-    # Dev convenience: the Next dev server (:3001) can talk to this backend
-    # directly. Connecting the browser's EventSource straight here (instead of
-    # through Next's dev rewrite proxy) avoids the proxy BUFFERING the SSE stream
-    # — the proxy holds events until the connection closes, which makes a live
-    # run look frozen until it finishes. In prod the static UI is served same-
-    # origin by this app, so CORS is a no-op there. Allowlist localhost only.
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    # Auth gate. Added AFTER CORS, so CORS wraps it (outermost) — preflight
-    # OPTIONS are answered by CORS and never reach here. We still bypass OPTIONS
-    # defensively (a same-origin request via the Next proxy often omits Origin,
-    # so CORS does not short-circuit it). Only /api is gated; the Next server
-    # (:3001) owns the UI/login page and must be secured separately when exposed
-    # (reverse proxy / loopback bind) — see docs/_local/plan_p3_auth.md.
-    #
-    # @app.middleware("http") does NOT see websocket scope; the /terminal WS and
-    # the SSE /events stream do their own ticket/token check in-handler.
-    #
-    # IMPORTANT (CORS): a middleware that SHORT-CIRCUITS with its own Response
-    # bypasses CORSMiddleware's response path, so a cross-origin 401 would arrive
-    # at the browser WITHOUT Access-Control-Allow-Origin — the browser then
-    # reports a network error instead of a 401, and the frontend can't tell "needs
-    # login" from "backend down". The Next dev UI (:3001) talks to this backend
-    # (:8000) cross-origin, so we must mirror the CORS allow-origin header onto the
-    # 401 ourselves. (CORSMiddleware only auto-adds headers when the inner app
-    # actually runs; our early return never reaches it.)
-    _cors_origin_re = re.compile(r"http://(localhost|127\.0\.0\.1)(:\d+)?$")
-
-    def _unauthorized(request: Request) -> JSONResponse:
-        resp = JSONResponse({"error": "unauthorized"}, status_code=401)
+    def _auth_error(request: Request, message: str, status: int) -> JSONResponse:
+        resp = JSONResponse({"error": {"code": "auth.unauthorized" if status == 401 else "auth.origin_invalid",
+                                       "message": message}}, status_code=status)
         origin = request.headers.get("origin")
-        if origin and _cors_origin_re.match(origin):
+        if origin in cors_origins:
             resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
             resp.headers["Vary"] = "Origin"
+        resp.headers["Cache-Control"] = "no-store"
         return resp
 
     @app.middleware("http")
     async def _auth_gate(request: Request, call_next):
         cfg: AuthConfig = app.state.auth
-        if not cfg.enabled:
-            return await call_next(request)
         path = request.url.path
-        if request.method == "OPTIONS":
+        if request.method == "OPTIONS" or not path.startswith("/api/"):
             return await call_next(request)
-        if not path.startswith("/api/"):
-            return await call_next(request)  # static/UI (only present if built)
-        if path in PUBLIC_API_PATHS:
+        # The capability bridge authenticates its separate session grants.
+        if path == "/api/capability":
             return await call_next(request)
-        # Only these exact read routes accept a separate snapshot-scoped token.
-        # Their handlers check token, access mode, expiry and revocation.
+        origin_error = browser_request_error(cfg, request)
+        if origin_error:
+            return _auth_error(request, origin_error, 403)
+        if path in PUBLIC_API_PATHS or not cfg.enabled:
+            return await call_next(request)
         from apps.web.conversation_shares import is_public_share_read
         if is_public_share_read(request.method, path):
             return await call_next(request)
-        # Capability Bridge 使用 Session Grant Bearer 自行认证；Web operator
-        # token 不能替代 grant，也不应在此处抢先拒绝。
-        if path == "/api/capability":
-            return await call_next(request)
-        # Legacy run streams enforce their own ticket check. Do not treat an
-        # arbitrary endpoint named /events as a public route.
         if request.method == "GET" and re.fullmatch(r"/api/runs/[^/]+/events", path):
-            return await call_next(request)
+            return await call_next(request)  # handler consumes the one-time ticket
+        token = request_token(cfg, request)
         if request.method == "GET" and (
-            path == "/api/threads/inbox/events"
-            or re.fullmatch(r"/api/threads/[^/]+/events", path)
-        ):
-            token = bearer_from_header(request.headers.get("Authorization"))
-            if not (verify_token(cfg, token) or app.state.tickets.redeem(request.query_params.get("ticket"))):
-                return _unauthorized(request)
+            path == "/api/threads/inbox/events" or re.fullmatch(r"/api/threads/[^/]+/events", path)
+        ) and app.state.tickets.redeem(request.query_params.get("ticket"), scope=request.scope):
             return await call_next(request)
-        token = bearer_from_header(request.headers.get("Authorization"))
         if not verify_token(cfg, token):
-            return _unauthorized(request)
+            return _auth_error(request, "登录已失效，请重新登录。", 401)
         return await call_next(request)
 
     platform_prefixes = (
@@ -398,6 +412,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     if UI_DIR.exists():
         app.mount("/ui", StaticFiles(directory=str(UI_DIR)), name="ui")
 
+    app.add_middleware(ServiceSessionMiddleware, config=auth)
     return app
 
 

@@ -28,6 +28,8 @@ EV_THREAD_METADATA_UPDATED = "core.thread.metadata_updated"
 EV_THREAD_ARCHIVED = "core.thread.archived"
 EV_THREAD_UNARCHIVED = "core.thread.unarchived"
 EV_THREAD_RESUMED = "core.thread.resumed"
+# Server-side "resume once the provider quota resets" schedule (set or cleared).
+EV_THREAD_QUOTA_RESUME_SET = "core.thread.quota_resume_set"
 EV_THREAD_FORKED = "core.thread.forked"
 EV_RUNTIME_SWITCHED = "core.thread.runtime_switched"
 EV_WORKSPACE_CHANGED = "core.workspace.changed"
@@ -74,6 +76,15 @@ EV_PLAN_CLEARED = "core.plan.cleared"
 # -- 委派 Agent 树（只读归属；非普通工具） --------------------------------------
 EV_AGENT_UPDATED = "core.agent.updated"
 EV_AGENT_CLEARED = "core.agent.cleared"
+
+# -- Muteki 自管子 Agent（app_owned；子对话是独立 Thread） ------------------------
+# Child Thread stream: ancestry recorded once, right after core.thread.created.
+EV_THREAD_LINEAGE_SET = "core.thread.lineage_set"
+# Parent Thread stream: the spawned node, later status changes of the child,
+# and cancellation intent.
+EV_SUBAGENT_SPAWNED = "core.subagent.spawned"
+EV_SUBAGENT_UPDATED = "core.subagent.updated"
+EV_SUBAGENT_CANCEL_REQUESTED = "core.subagent.cancel_requested"
 
 # -- Session / Runtime ----------------------------------------------------------
 EV_SESSION_STARTED = "core.session.started"
@@ -176,7 +187,11 @@ __all__ = [
     "EV_SESSION_ERROR",
     "EV_SESSION_RESUMED",
     "EV_SESSION_STARTED",
+    "EV_SUBAGENT_CANCEL_REQUESTED",
+    "EV_SUBAGENT_SPAWNED",
+    "EV_SUBAGENT_UPDATED",
     "EV_THREAD_ARCHIVED",
+    "EV_THREAD_LINEAGE_SET",
     "EV_THREAD_UNARCHIVED",
     "EV_THREAD_CREATED",
     "EV_THREAD_FORKED",
@@ -184,6 +199,7 @@ __all__ = [
     "EV_THREAD_RENAME_REQUESTED",
     "EV_THREAD_RENAMED",
     "EV_THREAD_RESUMED",
+    "EV_THREAD_QUOTA_RESUME_SET",
     "EV_TOOL_COMPLETED",
     "EV_TOOL_PROGRESS",
     "EV_TOOL_STARTED",

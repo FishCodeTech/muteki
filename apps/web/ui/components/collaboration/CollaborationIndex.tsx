@@ -9,7 +9,7 @@ import { LIST_LIMITS } from "@/lib/agentCollaborationLayout";
 import type { BlackboardIntent } from "@/lib/events";
 import type { RunCanvasMode } from "@/lib/swarmProjection";
 import { useT } from "@/lib/i18n";
-import { SPAWN_ENGINES } from "@/lib/workers";
+import { providerEngines, readyCatalog, useProviderDescriptors } from "@/lib/providerDescriptors";
 
 import { EventStamp } from "./EventStamp";
 import { KnowledgeKindChips } from "./KnowledgeKindFilter";
@@ -18,6 +18,7 @@ import { useFeedUnread } from "./useFeedUnread";
 
 function QueueSpawnControl({ onSpawnWorker }: { onSpawnWorker: (engine?: string) => void }) {
   const t = useT();
+  const spawnEngines = providerEngines(readyCatalog(useProviderDescriptors()));
   return (
     <Dropdown>
       <Dropdown.Trigger className="collab-queue-spawn" aria-label={t("collab.action.spawn")}>
@@ -30,7 +31,7 @@ function QueueSpawnControl({ onSpawnWorker }: { onSpawnWorker: (engine?: string)
           onSpawnWorker(engine === "auto" ? undefined : engine);
         }}>
           <Dropdown.Item id="auto" textValue={t("collab.spawn.auto")}>{t("collab.spawn.auto")}</Dropdown.Item>
-          {SPAWN_ENGINES.map((engine) => (
+          {spawnEngines.map((engine) => (
             <Dropdown.Item key={engine} id={engine} textValue={engine}>{engine}</Dropdown.Item>
           ))}
         </Dropdown.Menu>

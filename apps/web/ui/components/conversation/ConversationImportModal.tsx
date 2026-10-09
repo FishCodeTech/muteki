@@ -168,7 +168,7 @@ export function ConversationImportModal({
                       type="button"
                       disabled={scanning || applying || pickingPath}
                       onClick={() => { setAdapter(a); setScans([]); setSelected(new Set()); }}
-                      className={`flex-1 rounded-control border px-3 py-2 text-[12.5px] font-medium transition-colors
+                      className={`flex-1 rounded-control border px-3 py-2 text-[13px] font-medium transition-colors
                         ${adapter === a
                           ? "border-accent bg-accent/10 text-accent"
                           : "border-line bg-surface text-ink-2 hover:bg-hover"
@@ -204,7 +204,7 @@ export function ConversationImportModal({
                     id="import-project"
                     value={projectId}
                     onChange={(e) => setProjectId(e.target.value)}
-                    className="w-full rounded-control border border-line bg-inset px-3 py-2 text-[12.5px] text-ink outline-none focus:border-cx-border-strong"
+                    className="w-full rounded-control border border-line bg-inset px-3 py-2 text-[13px] text-ink outline-none focus:border-cx-border-strong"
                   >
                     <option value="">不归入项目</option>
                     {projects.map((p) => (
@@ -227,13 +227,13 @@ export function ConversationImportModal({
               {/* AC2: scope preview */}
               <div className="flex items-center justify-between rounded-control bg-inset px-3 py-2 text-[12px]">
                 <span className="text-ink-2">
-                  扫描路径 <code className="text-ink text-[11px] font-mono">{basePath}</code>
+                  扫描路径 <code className="text-ink text-[12px] font-mono">{basePath}</code>
                 </span>
                 <span className="font-semibold text-ink">共 {scans.length} 个会话</span>
               </div>
 
               {scans.length === 0 ? (
-                <p className="text-[12.5px] text-ink-3 py-4 text-center">未找到可导入的会话</p>
+                <p className="text-[13px] text-ink-3 py-4 text-center">未找到可导入的会话</p>
               ) : (
                 <>
                   <div className="flex items-center gap-2 text-[12px]">
@@ -265,13 +265,13 @@ export function ConversationImportModal({
                         />
                         <div className="flex-1 min-w-0">
                           <div className="flex items-center justify-between gap-2">
-                            <span className="text-[12.5px] text-ink truncate">{scan.title}</span>
+                            <span className="text-[13px] text-ink truncate">{scan.title}</span>
                             {/* AC3: status badge */}
-                            <span className={`shrink-0 text-[11px] font-medium ${STATUS_COLOR[scan.import_status] || "text-ink-3"}`}>
+                            <span className={`shrink-0 text-[12px] font-medium ${STATUS_COLOR[scan.import_status] || "text-ink-3"}`}>
                               {STATUS_LABEL[scan.import_status] || scan.import_status}
                             </span>
                           </div>
-                          <div className="flex items-center gap-2 mt-0.5 text-[11px] text-ink-3">
+                          <div className="flex items-center gap-2 mt-0.5 text-[12px] text-ink-3">
                             <span>{scan.message_count} 条消息</span>
                             {scan.created_at && <span>· {scan.created_at.slice(0, 10)}</span>}
                             {scan.missing_fields.length > 0 && (
@@ -303,7 +303,7 @@ export function ConversationImportModal({
                 ].map(({ label, count, color }) => (
                   <div key={label} className="rounded-control border border-line bg-inset py-3">
                     <div className={`text-[22px] font-bold ${color}`}>{count}</div>
-                    <div className="text-[11px] text-ink-3 mt-0.5">{label}</div>
+                    <div className="text-[12px] text-ink-3 mt-0.5">{label}</div>
                   </div>
                 ))}
               </div>
@@ -312,14 +312,14 @@ export function ConversationImportModal({
                   <summary className="text-[12px] text-red cursor-pointer">查看失败详情</summary>
                   <ul className="mt-2 flex flex-col gap-1">
                     {result.failed.map((f) => (
-                      <li key={f.session_id} className="text-[11.5px] text-ink-2">
-                        <code className="font-mono text-[11px]">{f.session_id.slice(0, 12)}</code>: {f.error}
+                      <li key={f.session_id} className="text-[12px] text-ink-2">
+                        <code className="font-mono text-[12px]">{f.session_id.slice(0, 12)}</code>: {f.error}
                       </li>
                     ))}
                   </ul>
                 </details>
               )}
-              <p className="text-[12.5px] text-ink-2">
+              <p className="text-[13px] text-ink-2">
                 原始历史文件未被修改。导入内容是历史副本，不会恢复原应用的运行会话，可在对话列表中查看。
               </p>
             </div>

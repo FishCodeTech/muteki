@@ -1,37 +1,22 @@
 """Read-only usage views shared by global, Run and Competition pages."""
 from __future__ import annotations
-import json
 import time
-from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Query, HTTPException, Request
 from muteki.competition.models import RunBinding
+from muteki.core.cursor_usage import CursorAccountUsage, make_window
+from muteki.core.provider_usage import ProviderUsage, make_usage_window
+from muteki.core.provider_limits import ProviderLimits
 
-
-def _quota_cache_path(state_root: str | Path) -> Path:
-    return Path(state_root) / "_quota_cache.json"
-
-
-def _read_quota_cache(state_root: str | Path) -> dict[str, Any]:
-    try:
-        raw = json.loads(_quota_cache_path(state_root).read_text(encoding="utf-8"))
-        return raw if isinstance(raw, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def _write_quota_cache(state_root: str | Path, cache: dict[str, Any]) -> None:
-    path = _quota_cache_path(state_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
 
 
 def create_usage_router(manager, competition_store):
     router = APIRouter(tags=['usage'])
+    cursor_account = CursorAccountUsage(manager.state_root)
+    provider_usage = ProviderUsage(manager.state_root, cursor=cursor_account)
+    provider_limits = ProviderLimits(manager.state_root, keychain=cursor_account.keychain)
     ownership_lock = Lock()
     ownership_signature: tuple[tuple[str, str, str], ...] | None = None
 
@@ -55,7 +40,7 @@ def create_usage_router(manager, competition_store):
     def usage(start: float = Query(0, ge=0), end: float | None = Query(None, ge=0),
               run_id: str | None = None, thread_id: str | None = None,
               competition_id: str | None = None, challenge_id: str | None = None,
-              model: str | None = None,
+              model: str | None = None, engine: str | None = None,
               role: str | None = None, workspace_kind: str | None = None,
               generation: int | None = Query(None, ge=0),
               offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=500)):
@@ -65,7 +50,7 @@ def create_usage_router(manager, competition_store):
         sync_competition_ownership()
         return manager.usage.query(start=start, end=end, run_id=run_id, thread_id=thread_id,
                                    competition_id=competition_id, challenge_id=challenge_id,
-                                   model=model, role=role,
+                                   model=model, engine=engine, role=role,
                                    generation=generation, workspace_kind=workspace_kind,
                                    actor_kind='worker' if competition_id else None,
                                    offset=offset, limit=limit)
@@ -73,155 +58,125 @@ def create_usage_router(manager, competition_store):
     def import_history():
         return manager.usage.import_run_history()
 
+    @router.get('/api/usage/settings')
+    def usage_settings():
+        return cursor_account.settings_view()
+
+    @router.put('/api/usage/settings')
+    async def update_usage_settings(request: Request):
+        body = await request.json()
+        value = body.get('cursor_account_usage_enabled') if isinstance(body, dict) else None
+        if not isinstance(value, bool):
+            raise HTTPException(422, 'cursor_account_usage_enabled 必须是布尔值')
+        return cursor_account.update_settings(cursor_account_usage_enabled=value)
+
+    @router.get('/api/usage/cursor-account')
+    def cursor_account_usage(days: int = Query(30), tz: str = Query('UTC'), refresh: bool = False):
+        """Monthly limits and usage history of this host's Cursor CLI login.
+
+        Reads the macOS Keychain only after the user enables it in settings.
+        """
+        try:
+            window = make_window(days, tz)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        payload = cursor_account.read(window, refresh=refresh)
+        return {key: value for key, value in payload.items() if not key.startswith("_")}
+
+    @router.get('/api/usage/summary')
+    def usage_summary(
+        scope: Literal['history', 'muteki'] = 'history', days: str = '30', tz: str = 'UTC',
+        refresh: bool = False, start: float | None = Query(None, ge=0),
+        end: float | None = Query(None, ge=0), engine: str | None = None,
+        run_id: str | None = None, thread_id: str | None = None,
+        competition_id: str | None = None, challenge_id: str | None = None,
+        model: str | None = None, role: str | None = None, workspace_kind: str | None = None,
+        generation: int | None = Query(None, ge=0),
+    ):
+        """One priced overview for one selected source scope, never overlapping sums."""
+        if days == 'all':
+            numeric_days, start = 90, 0
+        elif days == 'custom':
+            numeric_days = 30
+        else:
+            try:
+                numeric_days = int(days)
+            except ValueError as exc:
+                raise HTTPException(422, '无效时间范围') from exc
+        if scope == 'history' and any(value is not None for value in
+                (run_id, thread_id, competition_id, challenge_id, role, workspace_kind, generation)):
+            raise HTTPException(422, '任务和角色筛选仅适用于 Muteki 内部用量')
+        try:
+            window = make_usage_window(numeric_days, tz, start=start, end=end)
+        except (ValueError, OverflowError, OSError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+        sync_competition_ownership()
+        ledger = manager.usage.query(
+            start=start if start is not None else window.since_ms / 1000,
+            end=end if end is not None else window.until_ms / 1000,
+            run_id=run_id, thread_id=thread_id, competition_id=competition_id,
+            challenge_id=challenge_id, model=model, engine=engine, role=role,
+            workspace_kind=workspace_kind, generation=generation,
+            actor_kind='worker' if competition_id else None,
+            limit=2**31 - 1,
+        )
+        options = dict(refresh=refresh, start=start, end=end, engine=engine, model=model)
+        if scope == 'muteki':
+            result = provider_usage.summarize_ledger(ledger['records'], numeric_days, tz, **options)
+        else:
+            result = provider_usage.read(numeric_days, tz, ledger_records=ledger['records'], **options)
+        result['scope'] = scope
+        result['revision'] = ledger['revision']
+        return result
+
+    @router.get('/api/usage/limits')
+    def usage_limits(refresh: bool = False):
+        """Read actual account windows without creating a model turn."""
+        return provider_limits.read(refresh=refresh)
+
+    def legacy_quota_entry(account: dict[str, Any], credential_id: str) -> dict[str, Any]:
+        windows = account.get('windows') or []
+        tightest = max(windows, key=lambda item: item['used_percent']) if windows else None
+        status = account['status']
+        return {
+            'credential_id': credential_id,
+            'account_id': credential_id.removeprefix('account:') if credential_id.startswith('account:') else '',
+            'engine': account['engine'], 'label': account['label'],
+            'quota_type': 'api_key' if account.get('error_code') == 'api_key' else 'subscription',
+            'status': 'ok' if status == 'ok' and tightest else 'not_supported' if status == 'unsupported' else 'unknown',
+            'remaining': 100 - tightest['used_percent'] if tightest else None,
+            'total': 100 if tightest else None,
+            'window_seconds': tightest['window_seconds'] if tightest else None,
+            'reset_at': tightest['reset_at'] if tightest else None,
+            'updated_at': account.get('updated_at'), 'unknown_reason': account.get('error'),
+            'windows': windows, 'stale': account.get('stale', False),
+        }
+
     @router.get('/api/usage/quota')
     def get_quota() -> Any:
-        """List subscription quota entries for all registered credentials.
-
-        Each entry reports the cached quota state for one credential account.
-        The default state is ``unknown`` — the quota source for most CLI engines
-        cannot be read without a live authenticated request, so Muteki stores only
-        what the engine has explicitly reported via response headers or a prior
-        manual snapshot. Duplicate accounts (same credential_id) are collapsed:
-        the most-recently-updated entry wins.
-
-        Refresh semantics (acceptance criterion 3): this endpoint is read-only.
-        Use POST /api/usage/quota/{credential_id}/refresh to explicitly re-read
-        a credential's quota without starting an agent or consuming any tokens.
-        """
-        from muteki.solver.credential_accounts import (
-            CredentialAccountStore,
-            account_credential_id,
-            account_store_root,
-            system_credential_id,
-        )
-        from muteki.solver.engine_registry import SUPPORTED_ENGINE_IDS
-
-        state_root = manager.state_root
-        store = CredentialAccountStore(account_store_root(state_root))
-        cache = _read_quota_cache(state_root)
-        seen: set[str] = set()
-        entries: list[dict[str, Any]] = []
-
-        for account in store.list():
-            account_id = str(account.get("account_id") or "").strip()
-            if not account_id:
-                continue
-            engine = str(
-                account.get("worker_engine") or account.get("engine") or ""
-            ).strip().lower()
-            credential_id = account_credential_id(account_id)
-            if credential_id in seen:
-                continue
-            seen.add(credential_id)
-            connection = str(account.get("connection") or "official").strip()
-            mode = str(account.get("mode") or "subscription").strip()
-            # API key / custom endpoint accounts do not have a subscription quota window.
-            quota_type = "api_key" if (connection == "custom_endpoint" or mode == "api_key") else "subscription"
-            cached = cache.get(credential_id) or {}
-            entry: dict[str, Any] = {
-                "credential_id": credential_id,
-                "account_id": account_id,
-                "engine": engine,
-                "label": str(account.get("label") or account_id),
-                "quota_type": quota_type,
-                "status": cached.get("status") or ("not_supported" if quota_type == "api_key" else "unknown"),
-                "remaining": cached.get("remaining"),
-                "total": cached.get("total"),
-                "window_seconds": cached.get("window_seconds"),
-                "reset_at": cached.get("reset_at"),
-                "updated_at": cached.get("updated_at"),
-                "unknown_reason": cached.get("unknown_reason") or (
-                    "API 密钥账号无订阅窗口" if quota_type == "api_key"
-                    else "此引擎不主动上报额度；可在会话中使用后手动刷新"
-                ),
-            }
-            entries.append(entry)
-
-        # Append system-login credentials (subscription only, one per engine).
-        for engine in SUPPORTED_ENGINE_IDS:
-            cred_id = system_credential_id(engine)
-            if cred_id in seen:
-                continue
-            seen.add(cred_id)
-            cached = cache.get(cred_id) or {}
-            entry = {
-                "credential_id": cred_id,
-                "account_id": "",
-                "engine": engine,
-                "label": f"{engine}（系统登录）",
-                "quota_type": "subscription",
-                "status": cached.get("status") or "unknown",
-                "remaining": cached.get("remaining"),
-                "total": cached.get("total"),
-                "window_seconds": cached.get("window_seconds"),
-                "reset_at": cached.get("reset_at"),
-                "updated_at": cached.get("updated_at"),
-                "unknown_reason": cached.get("unknown_reason") or "此引擎不主动上报额度；可在会话中使用后手动刷新",
-            }
-            entries.append(entry)
-
-        return {"quota": entries, "as_of": time.time()}
+        """Compatibility view for conversation drawers, backed by live multi-window probes."""
+        result = provider_limits.read()
+        return {'as_of': result['as_of'], 'quota': [
+            legacy_quota_entry(account, identifier)
+            for account in result['accounts']
+            for identifier in account.get('credential_ids', [account['id']])
+        ]}
 
     @router.post('/api/usage/quota/{credential_id}/refresh')
-    async def refresh_quota(credential_id: str) -> Any:
-        """Re-read quota for a specific credential without starting an agent.
-
-        For CLI-based engines the live quota is not available without a billed
-        request; this endpoint clears the unknown_reason and resets the timestamp
-        so the UI knows a refresh was attempted. Explicit quota values must be
-        reported by the engine runtime and stored via the internal quota update
-        path — manual edits are not accepted here.
-        """
+    def refresh_quota(credential_id: str) -> Any:
         from muteki.solver.credential_accounts import canonical_credential_id
-
         try:
-            stable_id = canonical_credential_id(credential_id)
+            identifier = canonical_credential_id(credential_id)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-        state_root = manager.state_root
-        cache = _read_quota_cache(state_root)
-        existing = cache.get(stable_id) or {}
-        # Preserve any previously reported values; only update the refresh timestamp.
-        updated: dict[str, Any] = {
-            **existing,
-            "refreshed_at": time.time(),
-            "unknown_reason": existing.get("unknown_reason") or "此引擎不主动上报额度",
-        }
-        if not existing.get("status"):
-            updated["status"] = "unknown"
-        cache[stable_id] = updated
-        _write_quota_cache(state_root, cache)
-        return {"ok": True, "credential_id": stable_id, "entry": updated}
-
-    @router.put('/api/usage/quota/{credential_id}')
-    async def update_quota(credential_id: str, request: Request) -> Any:
-        """Internal endpoint to store a quota snapshot reported by the runtime.
-
-        Only accepts fields: status, remaining, total, window_seconds, reset_at.
-        Called by the runtime adapter when an engine returns usage/rate-limit
-        headers; never called by the frontend directly.
-        """
-        from muteki.solver.credential_accounts import canonical_credential_id
-
+            raise HTTPException(400, str(exc)) from exc
         try:
-            stable_id = canonical_credential_id(credential_id)
+            result = provider_limits.read(refresh=True, credential_id=identifier)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-        body = await request.json()
-        if not isinstance(body, dict):
-            raise HTTPException(status_code=400, detail="body must be a JSON object")
-        allowed = {"status", "remaining", "total", "window_seconds", "reset_at", "unknown_reason"}
-        payload: dict[str, Any] = {k: v for k, v in body.items() if k in allowed}
-        if not payload:
-            raise HTTPException(status_code=400, detail="no recognized fields in body")
-
-        state_root = manager.state_root
-        cache = _read_quota_cache(state_root)
-        existing = cache.get(stable_id) or {}
-        cache[stable_id] = {**existing, **payload, "updated_at": time.time()}
-        _write_quota_cache(state_root, cache)
-        return {"ok": True, "credential_id": stable_id}
+            raise HTTPException(404, '额度账户不存在') from exc
+        for account in result['accounts']:
+            if identifier in account.get('credential_ids', [account['id']]):
+                return {'ok': account['status'] == 'ok', 'credential_id': identifier,
+                        'entry': legacy_quota_entry(account, identifier)}
+        raise HTTPException(404, '额度账户不存在')
 
     return router

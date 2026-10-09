@@ -11,7 +11,7 @@ from typing import Any
 _LOCK = threading.RLock()
 _PATH: Path | None = None
 _DEFAULTS = {
-    "mcp": {"muteki-control": True},
+    "mcp": {"muteki-control": True, "computer-use": True},
     "skills": {"muteki-blackboard": True, "agent-browser": True},
 }
 

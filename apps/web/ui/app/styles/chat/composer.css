@@ -16,6 +16,70 @@
   box-shadow: var(--cx-shadow-composer-focus);
 }
 
+/* Compact (resting) layout while the reader browses history. Every geometry
+ * change is a padding / margin / min-height tween on the same easing, so the
+ * card height follows one continuous curve. In compact mode the editor pulls
+ * the toolbar row up over its last line with a negative margin; the add and
+ * submit buttons never leave the toolbar, they only slide vertically, and the
+ * middle controls fade out. --cx-composer-submit-w is published by PromptBar. */
+.cx-composer-card {
+  --cx-composer-morph: 320ms var(--cx-ease-drawer);
+}
+.cx-composer-body {
+  padding: 16px 16px 0;
+  margin-bottom: 0;
+  transition:
+    padding var(--cx-composer-morph),
+    margin-bottom var(--cx-composer-morph);
+}
+.cx-composer-body[data-after-chrome] { padding-top: 8px; }
+.cx-composer-body .cx-prompt-editor {
+  transition: min-height var(--cx-composer-morph), max-height var(--cx-composer-morph);
+}
+/* Fixed row heights keep the compact overlap exact even if a toolbar control is
+ * taller than the 28px buttons; such a control overflows into the padding. */
+.cx-composer-toolbar {
+  height: 48px;
+  padding-top: 8px;
+  padding-bottom: 12px;
+  transition: height var(--cx-composer-morph), padding var(--cx-composer-morph);
+}
+.cx-composer-tools {
+  transition:
+    opacity 200ms var(--cx-ease-out) 110ms,
+    transform var(--cx-composer-morph),
+    visibility 0s linear 0s;
+}
+
+.cx-composer-card[data-compact] .cx-composer-body {
+  padding: 10px calc(var(--cx-composer-submit-w, 28px) + 18px) 10px 46px;
+  margin-bottom: -44px;
+}
+.cx-composer-card[data-compact] .cx-composer-body[data-after-chrome] { padding-top: 6px; }
+.cx-composer-card[data-compact]:has(.cx-composer-add:empty) .cx-composer-body { padding-left: 16px; }
+.cx-composer-card[data-compact] .cx-composer-body .cx-prompt-editor {
+  min-height: 24px;
+  max-height: 192px;
+}
+.cx-composer-card[data-compact] .cx-composer-toolbar {
+  height: 44px;
+  padding-bottom: 8px;
+  pointer-events: none;
+}
+.cx-composer-card[data-compact] .cx-composer-add,
+.cx-composer-card[data-compact] .cx-composer-submit {
+  pointer-events: auto;
+}
+.cx-composer-card[data-compact] .cx-composer-tools {
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(4px);
+  transition:
+    opacity 120ms var(--cx-ease-out),
+    transform var(--cx-composer-morph),
+    visibility 0s linear 120ms;
+}
+
 /* Inline context refs are built imperatively inside the contenteditable editor. */
 .cx-ref-chip {
   display: inline-flex;
@@ -27,7 +91,7 @@
   padding: 0 7px;
   vertical-align: -3px;
   border-radius: 6px;
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 500;
   line-height: 22px;
   white-space: nowrap;
@@ -41,7 +105,7 @@
 .cx-ref-chip.is-stale { color: var(--cx-warning); background: var(--cx-warning-soft); }
 .cx-ref-chip.is-missing { color: var(--cx-danger); background: var(--cx-danger-soft); }
 .cx-ref-chip-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.cx-ref-chip-status { font-size: 10.5px; font-weight: 400; opacity: 0.85; }
+.cx-ref-chip-status { font-size: 12px; font-weight: 400; opacity: 0.85; }
 
 .cx-drop-overlay {
   background-image:
@@ -55,7 +119,169 @@
   box-shadow: 0 0 0 1px var(--cx-border-subtle);
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .cx-composer-card { transition-duration: 1ms; }
+/* Effort slider. The top stop "charges" the panel: a comet trail, drifting sparks
+ * and, on arrival, a shockwave that the popover's overflow clips at the edges. */
+.cx-effort-panel {
+  --effort: var(--cx-accent);
+  --effort-hi: color-mix(in srgb, var(--cx-accent) 45%, white);
+  --effort-glow: color-mix(in srgb, var(--cx-accent) 60%, transparent);
 }
-html[data-motion="reduce"] .cx-composer-card { transition-duration: 1ms; }
+.cx-effort-track {
+  background: var(--cx-active);
+  box-shadow: inset 0 1px 2px hsl(var(--cx-shadow-color) / 0.08);
+}
+.cx-effort-glow,
+.cx-effort-fill {
+  position: absolute;
+  inset-block: 0;
+  left: 0;
+  border-radius: 999px;
+  pointer-events: none;
+}
+.cx-effort-glow {
+  background: var(--effort);
+  filter: blur(10px);
+  opacity: calc(var(--effort-level, 0) * 0.32);
+  transition: opacity var(--cx-dur-slow) var(--cx-ease-out);
+}
+.cx-effort-fill {
+  right: 0;
+  overflow: hidden;
+  background: var(--effort);
+  transition: background-color var(--cx-dur-slow) var(--cx-ease-out);
+}
+.cx-effort-track[data-max] .cx-effort-fill {
+  background: linear-gradient(90deg,
+    color-mix(in srgb, var(--effort) 62%, transparent) 0%,
+    var(--effort) 48%,
+    color-mix(in srgb, var(--effort) 70%, white) 100%);
+}
+.cx-effort-track[data-max] .cx-effort-glow {
+  opacity: 0.7;
+  animation: cx-effort-glow 2.4s ease-in-out infinite;
+}
+.cx-effort-beam {
+  position: absolute;
+  inset: 0;
+  clip-path: polygon(0 50%, 100% 10%, 100% 90%);
+  background: linear-gradient(90deg, transparent 0%, color-mix(in srgb, var(--effort-hi) 55%, transparent) 55%, var(--effort-hi) 100%);
+  opacity: 0;
+  transition: opacity 420ms var(--cx-ease-out);
+}
+.cx-effort-track[data-max] .cx-effort-beam { opacity: 0.85; }
+.cx-effort-sheen {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 38%, rgb(255 255 255 / 0.5) 50%, transparent 62%);
+  background-size: 260% 100%;
+  opacity: 0;
+  transition: opacity 320ms var(--cx-ease-out);
+}
+.cx-effort-track[data-max] .cx-effort-sheen {
+  opacity: 1;
+  animation: cx-effort-sheen 2.1s linear infinite;
+}
+.cx-effort-spark {
+  position: absolute;
+  border-radius: 999px;
+  background: white;
+  box-shadow: 0 0 4px rgb(255 255 255 / 0.85);
+  opacity: 0;
+  animation: cx-effort-twinkle var(--d, 2.4s) ease-in-out var(--delay, 0s) infinite;
+}
+.cx-effort-track[data-max] .cx-effort-spark {
+  animation: cx-effort-drift var(--drift, 1.4s) linear var(--delay, 0s) infinite;
+}
+.cx-effort-thumb {
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.28), 0 0 0 0.5px rgb(0 0 0 / 0.08);
+  transition: box-shadow var(--cx-dur-slow) var(--cx-ease-out);
+}
+.cx-effort-thumb:focus-visible {
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.28), 0 0 0 2px var(--cx-bg), 0 0 0 4px var(--cx-focus);
+}
+.cx-effort-track[data-max] .cx-effort-thumb {
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.28), 0 0 12px 2px var(--effort-glow), 0 0 26px 4px color-mix(in srgb, var(--effort) 30%, transparent);
+}
+.cx-effort-thumb::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  opacity: 0;
+  pointer-events: none;
+}
+.cx-effort-track[data-max] .cx-effort-thumb::after {
+  animation: cx-effort-halo 1.8s ease-out infinite;
+}
+.cx-effort-title { color: var(--effort); }
+.cx-effort-title.is-max {
+  color: transparent;
+  background: linear-gradient(90deg, var(--effort) 0%, var(--effort-hi) 50%, var(--effort) 100%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  filter: drop-shadow(0 0 6px var(--effort-glow));
+  animation: cx-shimmer 2.4s linear infinite;
+}
+.cx-effort-bloom {
+  position: absolute;
+  width: 140px;
+  height: 140px;
+  border-radius: 50%;
+  background: radial-gradient(circle, color-mix(in srgb, var(--effort-hi) 80%, transparent) 0%, var(--effort-glow) 30%, transparent 68%);
+}
+.cx-effort-shock {
+  position: absolute;
+  border-radius: 50%;
+  background: radial-gradient(circle closest-side,
+    transparent 86%,
+    color-mix(in srgb, var(--effort) 30%, transparent) 93%,
+    var(--effort-hi) 97.5%,
+    transparent 100%);
+  box-shadow: 0 0 22px var(--effort-glow);
+}
+.cx-effort-edge {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--effort-hi) 75%, transparent),
+    inset 0 0 26px color-mix(in srgb, var(--effort) 38%, transparent);
+}
+
+@keyframes cx-effort-twinkle {
+  0%, 100% { opacity: 0; transform: scale(0.5); }
+  50% { opacity: 0.8; transform: scale(1); }
+}
+@keyframes cx-effort-drift {
+  0% { opacity: 0; transform: translateX(-16px) scale(0.6); }
+  30% { opacity: 1; }
+  100% { opacity: 0; transform: translateX(26px) scale(1.15); }
+}
+@keyframes cx-effort-sheen {
+  from { background-position: 100% 0; }
+  to { background-position: 0% 0; }
+}
+@keyframes cx-effort-glow {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 0.9; }
+}
+@keyframes cx-effort-halo {
+  0% { opacity: 0.9; box-shadow: 0 0 0 0 var(--effort-glow); }
+  100% { opacity: 0; box-shadow: 0 0 0 11px transparent; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cx-composer-card,
+  .cx-composer-body,
+  .cx-composer-body .cx-prompt-editor,
+  .cx-composer-toolbar,
+  .cx-composer-tools { transition-duration: 1ms; transition-delay: 0s; }
+}
+html[data-motion="reduce"] :is(
+  .cx-composer-card,
+  .cx-composer-body,
+  .cx-composer-body .cx-prompt-editor,
+  .cx-composer-toolbar,
+  .cx-composer-tools
+) { transition-duration: 1ms; transition-delay: 0s; }

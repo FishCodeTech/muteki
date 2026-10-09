@@ -71,7 +71,7 @@ from muteki.solver.credential_accounts import CONTAINER_ACCOUNTS_ROOT
 # at runtime; do not bake claude/codex/cursor login state into this image.
 # One generic worker image (NOT a per-recipe tag), published to Docker Hub so any
 # host can `docker pull` it. Default to the moving :latest; override with
-# MUTEKI_WORKER_IMAGE to pin a version (e.g. ghcr.io/fishcodetech/muteki-worker:v0.4.0).
+# MUTEKI_WORKER_IMAGE to pin a version (e.g. ghcr.io/fishcodetech/muteki-worker:v0.4.1).
 WORKER_IMAGE = os.environ.get("MUTEKI_WORKER_IMAGE", "ghcr.io/fishcodetech/muteki-worker:latest")
 CONTAINER_WORKSPACE = "/home/kali/workspace"
 CONTAINER_CONTROL_DIR = "/run/muteki/control"  # bind-mounted; carries the per-run token
@@ -207,6 +207,7 @@ _CONTAINER_BIN = {
     "opencode": "opencode",
     "kimi": "kimi",
     "grok": "/home/kali/.grok/bin/grok",
+    "droid": "droid",
 }
 
 _CONTAINER_OFFLINE_BRIDGE = "/opt/muteki/offline_acp_bridge.py"
@@ -405,7 +406,9 @@ def _run_digest(run_id: str) -> str:
 
 
 def _run_container_name(run_id: str) -> str:
-    return f"{_RUN_PREFIX}{_run_identity(run_id)}"
+    environment = os.environ.get("MUTEKI_ENVIRONMENT_ID", "")
+    namespace = hashlib.sha256(environment.encode()).hexdigest()[:12] + "-" if environment else ""
+    return f"{_RUN_PREFIX}{namespace}{_run_identity(run_id)}"
 
 
 def _bootstrap_dir(
@@ -1050,6 +1053,8 @@ def ensure_container(run_id: str, host_workspace: str, *,
             "--mount",
             f"type=bind,source={_mount_source(host_workspace)},target={CONTAINER_WORKSPACE}",
         ]
+        if os.environ.get("MUTEKI_ENVIRONMENT_ID"):
+            run_cmd += ["--label", f"io.muteki.environment-id={os.environ['MUTEKI_ENVIRONMENT_ID']}"]
         if mode == "rcp" and control_dir:
             run_cmd += [
                 "--mount",
@@ -1106,9 +1111,9 @@ def ensure_container(run_id: str, host_workspace: str, *,
             # form ENTRYPOINT; the supervisor ignores the baked --sock/--workspace and
             # uses --connect/--run-id (token comes from the bind-mounted control file).
             from muteki.solver.control_receiver import (
-                CONTROL_HOST_FROM_CONTAINER, DEFAULT_CONTROL_PORT)
+                CONTROL_HOST_FROM_CONTAINER, ControlReceiver)
             supervisor_args = [
-                "--connect", f"{CONTROL_HOST_FROM_CONTAINER}:{DEFAULT_CONTROL_PORT}",
+                "--connect", f"{CONTROL_HOST_FROM_CONTAINER}:{ControlReceiver.instance().port}",
                 "--run-id", run_id,
             ]
             if container_scope == "shared":

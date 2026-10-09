@@ -1,3 +1,4 @@
+import buildInfo from "./build-info.cjs";
 /**
  * Static export was dropped (FE-routing-workspace): per-run deep links use real
  * dynamic routes (/run/[id]), which `output: "export"` can't prerender (run ids
@@ -9,6 +10,7 @@
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  env: { NEXT_PUBLIC_MUTEKI_UI_BUILD: buildInfo.uiBuildId() },
   async redirects() {
     return [
       { source: "/task", destination: "/ctf", permanent: true },

@@ -2,7 +2,7 @@ export { Button, IconButton, type ButtonProps, type ButtonVariant, type ButtonSi
 export { Tooltip } from "./Tooltip";
 export { Kbd, Shortcut, formatKey, splitShortcut } from "./Kbd";
 export { Popover, useControllableOpen } from "./Popover";
-export { Menu, MenuItem, MenuSeparator, MenuLabel, MenuSub, useContextMenu, handleMenuKeyDown } from "./Menu";
+export { Menu, MenuItem, MenuSeparator, MenuLabel, MenuSub, MenuScope, useContextMenu, handleMenuKeyDown } from "./Menu";
 export { Dialog, Sheet, type DialogProps, type SheetProps } from "./Dialog";
 export { Label, Input, TextField, TextArea, SearchInput, Checkbox, Switch, Slider } from "./Field";
 export { Select, OptionList, useListKeyboard, filterOptions, type ListOption, type SelectProps } from "./ListBox";

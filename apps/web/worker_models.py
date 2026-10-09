@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import asyncio
 import json
+import logging
 import os
 import re
 import signal
@@ -43,7 +44,10 @@ from muteki.solver.credential_accounts import (
     runtime_env_for_engine,
 )
 from muteki.solver.worker_profiles import base_engine_for_profile, profile_uses_endpoint
+from muteki.external_agents.descriptors import ModelParser, find_descriptor
 
+
+_LOG = logging.getLogger(__name__)
 
 ModelOption = dict[str, Any]
 
@@ -104,6 +108,24 @@ def _reasoning(
         "kind": kind, "source": source,
     }
 
+def _service_tiers(value: Any) -> list[dict[str, str]]:
+    """Keep provider-declared service tiers (for example Codex ``priority``)."""
+    out: list[dict[str, str]] = []
+    for tier in value if isinstance(value, list) else []:
+        if not isinstance(tier, dict):
+            continue
+        tier_id = str(tier.get("id") or "").strip()
+        if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", tier_id)
+                or tier_id == "default" or any(row["id"] == tier_id for row in out)):
+            continue
+        out.append({
+            "id": tier_id,
+            "name": str(tier.get("name") or tier_id).strip() or tier_id,
+            "description": str(tier.get("description") or "").strip(),
+        })
+    return out
+
+
 _CONTAINER_BIN = {
     "claude": "claude",
     "codex": "codex",
@@ -117,8 +139,12 @@ _CONTAINER_BIN = {
 
 _CONTAINER_OFFLINE_BRIDGE = "/opt/muteki/offline_acp_bridge.py"
 _CONTAINER_OMP_OFFLINE_CONFIG = "/opt/muteki/omp_offline_config.yml"
-_CONTAINER_KIMI_OFFLINE_AGENT = "/opt/muteki/kimi_offline_agent.md"
-_CONTAINER_GROK_OFFLINE_AGENT = "/opt/muteki/grok_offline_agent.md"
+# Offline agent definitions baked into the worker image, by the CLI flag that
+# selects them in each driver's argv.
+_CONTAINER_OFFLINE_AGENT_ARGS: dict[str, tuple[str, str]] = {
+    "kimi": ("--agent-file", "/opt/muteki/kimi_offline_agent.md"),
+    "grok": ("--agent", "/opt/muteki/grok_offline_agent.md"),
+}
 
 _CONTAINER_BASE_ENV = {
     "PATH": "/home/kali/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -707,6 +733,10 @@ def _dedupe_models(*groups: list[ModelOption]) -> list[ModelOption]:
                 continue
             if mid in seen:
                 existing = next(row for row in out if row["id"] == mid)
+                if "input" not in existing and isinstance(item.get("input"), list):
+                    normalized_input = _dedupe_models([item])[0].get("input")
+                    if normalized_input is not None:
+                        existing["input"] = normalized_input
                 if (not isinstance(existing.get("reasoning"), dict)
                         and isinstance(item.get("reasoning"), dict)):
                     existing["reasoning"] = _dedupe_models([item])[0]["reasoning"]
@@ -719,6 +749,10 @@ def _dedupe_models(*groups: list[ModelOption]) -> list[ModelOption]:
             provider = str(item.get("provider") or "").strip()
             if provider:
                 normalized["provider"] = provider
+            inputs = item.get("input")
+            if (isinstance(inputs, list) and inputs
+                    and all(isinstance(value, str) for value in inputs)):
+                normalized["input"] = list(dict.fromkeys(inputs))
             reasoning = item.get("reasoning")
             if isinstance(reasoning, dict):
                 normalized["reasoning"] = _reasoning(
@@ -727,8 +761,31 @@ def _dedupe_models(*groups: list[ModelOption]) -> list[ModelOption]:
                     kind=str(reasoning.get("kind") or "effort"),
                     source=str(reasoning.get("source") or "model_catalog"),
                 )
+            tiers = _service_tiers(item.get("service_tiers"))
+            if tiers:
+                normalized["service_tiers"] = tiers
+                default_tier = str(item.get("default_service_tier") or "")
+                if any(tier["id"] == default_tier for tier in tiers):
+                    normalized["default_service_tier"] = default_tier
             out.append(normalized)
     return out
+
+
+def conversation_model_input(sessions_root: str | Path, selection: Any) -> list[str] | None:
+    """Only explicit, credential/runtime-scoped model metadata is authoritative."""
+    from muteki.external_agents.factory import engine_for_adapter
+    engine = engine_for_adapter(selection.adapter_id)
+    catalog = CredentialModelCatalogStore(sessions_root).get(
+        selection.credential_id, engine, "local",
+        f"{selection.adapter_id}:{selection.instance_id}",
+    ) or {}
+    if catalog.get("refresh_status") != "fresh":
+        return None
+    model = next((item for item in catalog.get("discovered_models", [])
+                  if isinstance(item, dict) and item.get("id") == selection.model), {})
+    inputs = model.get("input")
+    return (list(inputs) if isinstance(inputs, list) and inputs
+            and all(isinstance(value, str) for value in inputs) else None)
 
 
 def worker_model_options_payload(
@@ -758,7 +815,8 @@ def worker_model_options_payload(
 
 def validate_conversation_effort(sessions_root: str | Path, selection: Any) -> None:
     """Use the same credential / runtime catalog as the chat model picker."""
-    if not selection.effort:
+    service_tier = str(getattr(selection, "service_tier", "") or "")
+    if not selection.effort and not service_tier:
         return
     from muteki.external_agents.factory import engine_for_adapter
 
@@ -770,10 +828,18 @@ def validate_conversation_effort(sessions_root: str | Path, selection: Any) -> N
     model = next((item for item in catalog.get("discovered_models", [])
                   if isinstance(item, dict) and item.get("id") == selection.model), {})
     reasoning = model.get("reasoning") or {}
-    if not reasoning.get("supported") or selection.effort not in reasoning.get("levels", []):
+    if selection.effort and (
+            not reasoning.get("supported") or selection.effort not in reasoning.get("levels", [])):
         raise ValueError(
             f"当前 {engine} 接入的模型 {selection.model} 不支持思考配置 {selection.effort!r}；"
             "请重新选择思考程度或切回默认"
+        )
+    if service_tier and not any(
+            isinstance(tier, dict) and tier.get("id") == service_tier
+            for tier in model.get("service_tiers") or []):
+        raise ValueError(
+            f"当前 {engine} 接入的模型 {selection.model} 不支持速度档位 {service_tier!r}；"
+            "请切回标准速度或刷新模型目录"
         )
 
 
@@ -937,7 +1003,9 @@ def _model_turn_failure(
             "model",
             "provider_request_timeout",
         )
-    if engine == "pi" and "agent_settled" in lowered:
+    descriptor = find_descriptor(engine)
+    settled_event = descriptor.cli.turn_settled_event if descriptor is not None else ""
+    if settled_event and settled_event in lowered:
         return (
             "模型无回复：Pi CLI 已结束任务，但没有返回助手消息",
             "model",
@@ -1129,20 +1197,21 @@ def _containerize_argv(engine: str, argv: list[str]) -> list[str]:
                     arg.removeprefix("--agent-arg=")) == "omp_offline_config.yml":
                 out[index] = f"--agent-arg={_CONTAINER_OMP_OFFLINE_CONFIG}"
         return out
-    if engine == "opencode" and len(out) >= 3 and out[0] == "env":
-        out[2] = bin_in or "opencode"
-    elif engine == "grok" and len(out) >= 4 and out[0] == "env":
-        out[3] = bin_in or "grok"
-    else:
-        out[0] = bin_in or os.path.basename(out[0])
-    if engine == "kimi":
+    binary_index = 0
+    if out[0] == "env":
+        # ``env NAME=VALUE ... <binary>``: the binary is the first operand.
+        binary_index = next(
+            (index for index, arg in enumerate(out[1:], start=1) if "=" not in arg),
+            len(out),
+        )
+    if binary_index < len(out):
+        out[binary_index] = bin_in or os.path.basename(out[binary_index])
+    offline_agent = _CONTAINER_OFFLINE_AGENT_ARGS.get(engine)
+    if offline_agent is not None:
+        flag, container_path = offline_agent
         for index, arg in enumerate(out[:-1]):
-            if arg == "--agent-file":
-                out[index + 1] = _CONTAINER_KIMI_OFFLINE_AGENT
-    if engine == "grok":
-        for index, arg in enumerate(out[:-1]):
-            if arg == "--agent":
-                out[index + 1] = _CONTAINER_GROK_OFFLINE_AGENT
+            if arg == flag:
+                out[index + 1] = container_path
     return out
 
 
@@ -1170,10 +1239,15 @@ def _probe_argv_for_profile(
         # EndpointDriver injects Codex provider/model flags itself. Claude Code
         # custom endpoints receive model selection through their shared
         # ANTHROPIC_* environment mapping.
-        model_from_env = engine == "claude" and bool(
-            (getattr(drv, "env_extra", lambda: {})() or {}).get("ANTHROPIC_MODEL")
+        descriptor = find_descriptor(engine)
+        cli = descriptor.cli if descriptor is not None else None
+        model_from_env = cli is not None and bool(cli.model_env_var) and bool(
+            (getattr(drv, "env_extra", lambda: {})() or {}).get(cli.model_env_var)
         )
-        if not (profile_uses_endpoint(profile) and engine == "codex") and not model_from_env:
+        driver_sets_model = (
+            cli is not None and cli.endpoint_driver_sets_model and profile_uses_endpoint(profile)
+        )
+        if not driver_sets_model and not model_from_env:
             argv = _insert_model(argv, model)
     argv = apply_runtime_argv(
         argv,
@@ -1292,7 +1366,7 @@ def _worker_container_model_probe(
             agent_state_container_path=agent_state_container,
             model=model,
         )
-        if engine in {"pi", "omp", "opencode"}:
+        if _writes_agent_state(engine):
             from muteki.solver.container_exec import _chown_tree_to_worker
             _chown_tree_to_worker(agent_state_dir)
 
@@ -1315,9 +1389,10 @@ def _worker_container_model_probe(
                 engine=engine, model=model, backend="container",
                 command=f"{engine} <minimal-model-turn>", started=started,
             )
-        verify_claude_model = engine == "claude" and profile_uses_endpoint(profile)
-        if verify_claude_model:
-            env["CLAUDE_CONFIG_DIR"] = f"{CONTAINER_WORKSPACE}/.muteki-claude-config"
+        isolated_config = _endpoint_test_config_var(engine, profile)
+        verify_claude_model = bool(isolated_config)
+        if isolated_config:
+            env[isolated_config] = f"{CONTAINER_WORKSPACE}/.muteki-claude-config"
         prelude = [
             'if [ -n "$CLAUDE_CONFIG_DIR" ]; then mkdir -p "$CLAUDE_CONFIG_DIR"; fi',
             'if [ -n "$MUTEKI_CODEX_HOME_SEED" ] && [ -d "$MUTEKI_CODEX_HOME_SEED" ]; then '
@@ -1519,7 +1594,7 @@ def probe_worker_model(
 
     with ExitStack() as stack:
         agent_state_dir = None
-        if engine in {"pi", "omp", "opencode"}:
+        if _writes_agent_state(engine):
             agent_state_dir = stack.enter_context(
                 tempfile.TemporaryDirectory(
                     prefix=f"muteki-{engine}-model-test-"))
@@ -1538,9 +1613,10 @@ def probe_worker_model(
             "MUTEKI_WORKER_REASONING_EFFORT": str(reasoning_effort or "default"),
         }
         env = stack.enter_context(_temporary_model_probe_env(engine, sessions_root, resolved_account_id, env))
-        verify_claude_model = engine == "claude" and profile_uses_endpoint(profile)
-        if verify_claude_model:
-            env["CLAUDE_CONFIG_DIR"] = stack.enter_context(
+        isolated_config = _endpoint_test_config_var(engine, profile)
+        verify_claude_model = bool(isolated_config)
+        if isolated_config:
+            env[isolated_config] = stack.enter_context(
                 tempfile.TemporaryDirectory(prefix="muteki-claude-model-test-")
             )
         # A model test must exercise the same CLI envelope as a real worker.  The old
@@ -1864,7 +1940,7 @@ def _worker_container_model_batch_probe(
 
             state_host = None
             state_container = None
-            if engine in {"pi", "omp", "opencode"}:
+            if _writes_agent_state(engine):
                 state_host = os.path.join(task_host, f".{engine}-agent-state")
                 state_container = f"{task_container}/.{engine}-agent-state"
             resolved = runtime_env_for_engine(
@@ -1918,9 +1994,10 @@ def _worker_container_model_batch_probe(
                 results[task["index"]] = result
                 continue
 
-            verify_claude_model = engine == "claude" and profile_uses_endpoint(profile)
-            if verify_claude_model:
-                env["CLAUDE_CONFIG_DIR"] = f"{task_container}/.muteki-claude-config"
+            isolated_config = _endpoint_test_config_var(engine, profile)
+            verify_claude_model = bool(isolated_config)
+            if isolated_config:
+                env[isolated_config] = f"{task_container}/.muteki-claude-config"
             prelude = [
                 'if [ -n "$CLAUDE_CONFIG_DIR" ]; then mkdir -p "$CLAUDE_CONFIG_DIR"; fi',
                 'if [ -n "$MUTEKI_CODEX_HOME_SEED" ] && [ -d "$MUTEKI_CODEX_HOME_SEED" ]; then '
@@ -2510,6 +2587,7 @@ def parse_openai_models(text: str) -> list[ModelOption]:
             out.append({
                 "id": mid,
                 "label": str(item.get("display_name") or item.get("displayName") or mid),
+                **({"input": item["input"]} if isinstance(item.get("input"), list) else {}),
                 "reasoning": _reasoning(
                     levels,
                     default=item.get("default_reasoning_level", item.get("defaultReasoningEffort", "")),
@@ -2542,6 +2620,49 @@ def parse_kimi_models(text: str) -> list[ModelOption]:
                 metadata.get("supportEfforts"), default=metadata.get("defaultEffort", ""),
                 source="kimi_model_metadata",
             ),
+        })
+    return out
+
+
+def parse_droid_models(text: str) -> list[ModelOption]:
+    """Parse ``droid exec --help`` model tables from Droid 0.234.0."""
+    lines = text.splitlines()
+    models: list[tuple[str, str]] = []
+    in_models = False
+    for line in lines:
+        if line.strip() == "Available Models:":
+            in_models = True
+            continue
+        if in_models:
+            if not line.strip() or line.startswith("Model details"):
+                break
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            model_id = parts[0]
+            label = " ".join(parts[1:]).replace("[Deprecated]", "").strip()
+            models.append((model_id, label))
+    efforts: dict[str, tuple[list[str], str]] = {}
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("- ") or "supported:" not in stripped:
+            continue
+        label = stripped[2:].split(":", 1)[0].strip()
+        supported = ""
+        default = ""
+        if "supported:" in stripped:
+            supported = stripped.split("supported:", 1)[1].split("]", 1)[0].strip(" [")
+        if "default:" in stripped:
+            default = stripped.split("default:", 1)[1].strip().rstrip(".")
+        levels = [item.strip() for item in supported.split(",") if item.strip() and item.strip() != "none"]
+        efforts[label.casefold()] = (levels, default if default != "none" else "")
+    out: list[ModelOption] = []
+    for model_id, label in models:
+        levels, default = efforts.get(label.casefold(), ([], ""))
+        out.append({
+            "id": model_id,
+            "label": label,
+            "reasoning": _reasoning(levels, default=default, source="droid_exec_help"),
         })
     return out
 
@@ -2606,6 +2727,7 @@ def parse_pi_models(text: str) -> list[ModelOption]:
         return [{
             "id": item["id"], "label": item.get("label") or item["id"],
             "provider": item.get("provider", ""),
+            **({"input": item["input"]} if isinstance(item.get("input"), list) else {}),
             "reasoning": _reasoning(item.get("levels"), source="pi_model_runtime"),
         } for item in json.loads(text).get("models", []) if item.get("id")]
     out: list[ModelOption] = []
@@ -2637,6 +2759,7 @@ def parse_omp_models(text: str) -> list[ModelOption]:
         out.append({
             "id": mid,
             "label": str(item.get("name") or mid),
+            **({"input": item["input"]} if isinstance(item.get("input"), list) else {}),
             "provider": str(
                 item.get("provider") or item.get("provider_id")
                 or (mid.split("/", 1)[0] if "/" in mid else "")
@@ -2685,26 +2808,33 @@ def parse_opencode_models(text: str) -> list[ModelOption]:
 
 
 def _discovery_argv(engine: str, binary: str, *, bundled: bool = False) -> list[str]:
-    if engine == "codex":
-        return [binary, "debug", "models", *(["--bundled"] if bundled else [])]
-    if engine == "cursor":
-        return [binary, "models"]
-    if engine == "pi":
-        return [binary, "--list-models"]
-    if engine == "omp":
-        return [binary, "models", "--json"]
-    if engine == "kimi":
-        return [binary, "provider", "list", "--json"]
-    if engine == "grok":
-        return [binary, "models"]
-    if engine == "opencode":
-        return [binary, "models", "--verbose"]
-    if engine == "devin":
-        return [binary, "models", "list", "--format", "json"]
-    raise ModelDiscoveryError(
-        f"{engine} 当前没有非交互模型发现命令",
-        "model_catalog_unsupported",
-    )
+    descriptor = find_descriptor(engine)
+    spec = descriptor.models if descriptor is not None else None
+    if spec is None or spec.method != "cli" or not spec.argv:
+        raise ModelDiscoveryError(
+            f"{engine} 当前没有非交互模型发现命令",
+            "model_catalog_unsupported",
+        )
+    if bundled and not spec.fallback_argv:
+        raise ModelDiscoveryError(
+            f"{engine} 没有内置模型目录命令",
+            "model_catalog_unsupported",
+        )
+    return [binary, *(spec.fallback_argv if bundled else spec.argv)]
+
+
+def _writes_agent_state(engine: str) -> bool:
+    descriptor = find_descriptor(engine)
+    return descriptor is not None and descriptor.credentials.agent_state_dir
+
+
+def _endpoint_test_config_var(engine: str, profile: dict[str, Any]) -> str:
+    """Native config variable to point at a throwaway dir for endpoint model tests."""
+    descriptor = find_descriptor(engine)
+    if (descriptor is not None and descriptor.models.endpoint_test_isolated_config
+            and profile_uses_endpoint(profile)):
+        return descriptor.environment.home_env_var
+    return ""
 
 
 def _private_model_probe_env(
@@ -2746,18 +2876,23 @@ def _run_local_discovery(
     binary = str(profile.get("binary_path") or "").strip() or driver_for(profile).bin
     argv = _discovery_argv(engine, binary, bundled=bundled)
     env = {**os.environ, **driver_for(profile).env_extra(), **resolved.env}
+    descriptor = find_descriptor(engine)
+    metadata_probe = descriptor.models.metadata_probe if descriptor is not None else ""
+    metadata_error = ""
     with _temporary_model_probe_env(engine, sessions_root, resolved_account_id, env) as env:
         try:
-            if engine == "grok":
+            if metadata_probe == "grok_acp_session":
+                # Called from a worker thread (routes use asyncio.to_thread), so
+                # a private event loop here does not nest inside the server loop.
                 try:
                     return subprocess.CompletedProcess(
                         argv, 0, json.dumps(asyncio.run(_grok_model_metadata(binary, env))), "",
                     )
-                except Exception:
+                except Exception as exc:  # noqa: BLE001 — recorded below
                     # Older Grok versions can still list names. No effort options
                     # are invented when the metadata handshake is unavailable.
-                    pass
-            if engine == "pi" and shutil.which("node"):
+                    metadata_error = f"grok ACP model metadata failed: {type(exc).__name__}: {exc}"
+            if metadata_probe == "pi_node_catalog" and shutil.which("node"):
                 probe = Path(__file__).resolve().parents[2] / "muteki/solver/pi_model_catalog.mjs"
                 metadata = subprocess.run(
                     [shutil.which("node"), str(probe), shutil.which(binary) or binary],
@@ -2765,7 +2900,13 @@ def _run_local_discovery(
                 )
                 if metadata.returncode == 0 and metadata.stdout.lstrip().startswith("{"):
                     return metadata
-            return subprocess.run(
+                metadata_error = (
+                    f"pi node model catalog exited {metadata.returncode}: "
+                    f"{(metadata.stderr or metadata.stdout or '').strip()}")
+            if metadata_error:
+                _LOG.warning("%s model metadata unavailable, listing names only: %s",
+                             engine, metadata_error)
+            result = subprocess.run(
                 argv,
                 capture_output=True,
                 text=True,
@@ -2774,6 +2915,10 @@ def _run_local_discovery(
                 timeout=45,
                 env=env,
             )
+            if metadata_error:
+                result.stderr = "\n".join(
+                    part for part in ((result.stderr or "").rstrip(), metadata_error) if part)
+            return result
         except FileNotFoundError as exc:
             raise ModelDiscoveryError("CLI 不存在", "cli_missing") from exc
         except subprocess.TimeoutExpired as exc:
@@ -2898,27 +3043,28 @@ def _run_container_discovery(
             ) from exc
 
 
+_MODEL_PARSERS: dict[ModelParser, Any] = {
+    "openai_models": parse_openai_models,
+    "cursor_models": parse_cursor_models,
+    "pi_models": parse_pi_models,
+    "omp_models": parse_omp_models,
+    "kimi_models": parse_kimi_models,
+    "grok_models": parse_grok_models,
+    "opencode_models": parse_opencode_models,
+    "devin_models": parse_devin_models,
+    "droid_models": parse_droid_models,
+}
+
+
 def _parse_discovery(engine: str, output: str) -> list[ModelOption]:
+    descriptor = find_descriptor(engine)
+    parser = descriptor.models.parser if descriptor is not None else None
+    if parser is None:
+        return []
     try:
-        if engine == "codex":
-            return _dedupe_models(parse_openai_models(output))
-        if engine == "cursor":
-            return _dedupe_models(parse_cursor_models(output))
-        if engine == "pi":
-            return _dedupe_models(parse_pi_models(output))
-        if engine == "omp":
-            return _dedupe_models(parse_omp_models(output))
-        if engine == "kimi":
-            return _dedupe_models(parse_kimi_models(output))
-        if engine == "grok":
-            return _dedupe_models(parse_grok_models(output))
-        if engine == "opencode":
-            return _dedupe_models(parse_opencode_models(output))
-        if engine == "devin":
-            return _dedupe_models(parse_devin_models(output))
+        return _dedupe_models(_MODEL_PARSERS[parser](output))
     except (json.JSONDecodeError, TypeError, ValueError):
         return []
-    return []
 
 
 def discover_worker_models(
@@ -2938,19 +3084,21 @@ def discover_worker_models(
         "updated_at": time.time(),
         "models": [],
     }
-    if engine == "claude":
+    descriptor = find_descriptor(engine)
+    if descriptor is not None and descriptor.models.method == "reference_catalog":
         return {
             **base,
             "ok": True,
-            "source": "claude_reference_catalog",
+            "source": f"{engine}_reference_catalog",
             "models": _dedupe_models(_manual_options(
-                "claude", list(WORKER_MODEL_OPTIONS.get("claude") or [])
+                engine, list(WORKER_MODEL_OPTIONS.get(engine) or [])
             )),
             "detail": (
-                "Claude Code 没有稳定的模型清单命令；这里显示参考目录，真实可用性以手动连通测试为准"
+                f"{descriptor.identity.display_name} 没有稳定的模型清单命令；"
+                "这里显示参考目录，真实可用性以手动连通测试为准"
             ),
         }
-    if engine not in {"codex", "cursor", "pi", "omp", "kimi", "grok", "opencode", "devin"}:
+    if descriptor is None or descriptor.models.method != "cli":
         return {
             **base,
             "ok": False,
@@ -2973,7 +3121,7 @@ def discover_worker_models(
     models = _parse_discovery(engine, result.stdout or "")
     source = f"{engine}_cli"
     detail = ""
-    if engine == "codex" and (result.returncode != 0 or not models):
+    if descriptor.models.fallback_argv and (result.returncode != 0 or not models):
         remote_detail = _detail(result.returncode, result.stdout, result.stderr)
         try:
             bundled_result = runner(profile, sessions_root, bundled=True)
@@ -2981,17 +3129,17 @@ def discover_worker_models(
             return {
                 **base,
                 "ok": False,
-                "source": "codex_cli",
+                "source": source,
                 "detail": f"远程目录失败；内置目录失败: {exc}",
                 "error_code": exc.code,
             }
         models = _parse_discovery(engine, bundled_result.stdout or "")
         result = bundled_result
-        source = "codex_cli_bundled"
+        source = descriptor.models.fallback_source
         detail = f"远程目录不可用，已读取 CLI 内置目录；{remote_detail}"
 
     provider = str(profile.get("provider") or "").strip().lower()
-    if provider and engine in {"pi", "omp", "kimi", "opencode"}:
+    if provider and descriptor.models.provider_scoped:
         filtered = [
             item for item in models
             if str(item.get("provider") or "").strip().lower() == provider

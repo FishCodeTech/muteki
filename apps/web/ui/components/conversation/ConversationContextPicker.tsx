@@ -7,7 +7,6 @@ import type { ConversationProject } from "@/lib/useConversation";
 import {
   Button,
   Callout,
-  Input,
   Popover,
   SearchInput,
   Skeleton,
@@ -16,11 +15,11 @@ import {
   useListKeyboard,
   type ListOption,
 } from "@/components/chat/ui";
-import { Icon } from "../Icon";
+import { Icon, type IconName } from "../Icon";
 import { pathBasename } from "../chat/composer/format";
 import { stripPillClass } from "../chat/composer/stripPill";
-import { NativePathPicker } from "@/components/NativePathPicker";
-import { desktopChatBridge } from "@/lib/desktopChatBridge";
+import { desktopChatBridge, type DesktopSelectedPath } from "@/lib/desktopChatBridge";
+import { nativeCapability, nativeDisplayMessage, useNativeDesktopState } from "@/lib/nativeDesktop";
 
 export interface ConversationContextPickerProps {
   projects: ConversationProject[];
@@ -46,11 +45,14 @@ export interface ConversationContextPickerProps {
 }
 
 type Entry =
+  | { kind: "add"; path: string }
   | { kind: "project"; project: ConversationProject }
   | { kind: "recent"; path: string };
 
 function entryKey(entry: Entry): string {
   switch (entry.kind) {
+    case "add":
+      return `a:${entry.path}`;
     case "project":
       return `p:${entry.project.project_id}`;
     case "recent":
@@ -61,6 +63,18 @@ function entryKey(entry: Entry): string {
     }
   }
 }
+
+const PATH_LIKE = /^(\/|~(\/|$)|\.{1,2}\/|[A-Za-z]:[\\/]|\\\\)/;
+
+/** Home directories collapse to `~` so the distinguishing tail stays visible. */
+function shortPath(path: string): string {
+  return path.replace(/^(\/Users|\/home)\/[^/]+(?=\/|$)/, "~");
+}
+
+const footerRowClass = cn(
+  "cx-press flex h-8 w-full items-center gap-2.5 rounded-lg px-2 text-left text-[13px] text-cx-fg-2",
+  "hover:bg-cx-hover hover:text-cx-fg disabled:cursor-default disabled:opacity-50 disabled:hover:bg-transparent",
+);
 
 export function ConversationContextPicker({
   projects,
@@ -84,43 +98,62 @@ export function ConversationContextPicker({
   const { lang } = useLang();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
-  const [pathDraft, setPathDraft] = useState("");
   const [pickingPath, setPickingPath] = useState(false);
   const [pathError, setPathError] = useState("");
+  const [clientPick, setClientPick] = useState<DesktopSelectedPath | null>(null);
   const listId = useId();
   const pathErrorId = useId();
+  const { desktop, state: nativeState, error: nativeStateError } = useNativeDesktopState();
+  const nativePick = nativeCapability(nativeState, "pathSelection");
+  const nativeAvailable = desktop && nativePick.available && Boolean(desktopChatBridge()?.selectPath);
+  const nativeUnavailableReason = nativeStateError || (nativePick.available ? "桌面路径选择接口不可用，请在搜索框粘贴服务宿主路径" : nativeDisplayMessage(nativePick, lang === "en"));
   const currentProject = projects.find((project) => project.project_id === selectedProjectId);
-  const needle = query.trim().toLocaleLowerCase();
+  const trimmedQuery = query.trim();
+  const needle = trimmedQuery.toLocaleLowerCase();
+  const queryIsPath = Boolean(onCreateFromPath) && PATH_LIKE.test(trimmedQuery);
   const filteredProjects = useMemo(() => {
     if (!needle) return projects;
     return projects.filter((project) => {
       const name = project.name.toLocaleLowerCase();
       const root = project.root_path.toLocaleLowerCase();
       const base = pathBasename(project.root_path).toLocaleLowerCase();
-      return name.includes(needle) || root.includes(needle) || base.includes(needle);
+      const short = shortPath(project.root_path).toLocaleLowerCase();
+      return name.includes(needle) || root.includes(needle) || base.includes(needle) || short.includes(needle);
     });
   }, [needle, projects]);
-  const filteredRecent = useMemo(
-    () => (onCreateFromPath ? recentPaths.filter((path) => !needle || path.toLocaleLowerCase().includes(needle)) : []),
-    [needle, onCreateFromPath, recentPaths],
-  );
-  const entries = useMemo<Entry[]>(() => [
-    ...filteredProjects.map((project) => ({ kind: "project" as const, project })),
-    ...filteredRecent.map((path) => ({ kind: "recent" as const, path })),
-  ], [filteredProjects, filteredRecent]);
+  const filteredRecent = useMemo(() => {
+    if (!onCreateFromPath) return [];
+    const known = new Set(projects.map((project) => project.root_path));
+    return recentPaths.filter((path) => !known.has(path) && (!needle || path.toLocaleLowerCase().includes(needle) || shortPath(path).toLocaleLowerCase().includes(needle)));
+  }, [needle, onCreateFromPath, projects, recentPaths]);
+  const entries = useMemo<Entry[]>(() => {
+    const same = (path: string) => path === trimmedQuery || shortPath(path) === trimmedQuery;
+    const exact = projects.some((project) => same(project.root_path)) || recentPaths.some(same);
+    return [
+      ...(queryIsPath && !exact ? [{ kind: "add" as const, path: trimmedQuery }] : []),
+      ...filteredProjects.map((project) => ({ kind: "project" as const, project })),
+      ...filteredRecent.map((path) => ({ kind: "recent" as const, path })),
+    ];
+  }, [filteredProjects, filteredRecent, projects, queryIsPath, recentPaths, trimmedQuery]);
 
   useEffect(() => {
     if (!requestPathInput) return;
     setOpen(true);
   }, [requestPathInput]);
 
+  // A confirmation belongs to the service connection it was made against.
+  useEffect(() => {
+    setClientPick(null);
+  }, [nativeState?.connectionVersion, nativeState?.serviceId, nativeState?.identityId]);
+
   const close = () => {
     setOpen(false);
     setQuery("");
     setPathError("");
+    setClientPick(null);
   };
 
-  const submitPath = async (path = pathDraft) => {
+  const submitPath = async (path: string) => {
     if (!onCreateFromPath || creatingProject) return;
     const trimmed = path.trim();
     if (!trimmed) {
@@ -136,8 +169,6 @@ export function ConversationContextPicker({
         return;
       }
       onProjectChange(projectId);
-      setPathDraft("");
-      setPathError("");
       close();
     } catch (exc) {
       const message = exc instanceof Error ? exc.message : String(exc);
@@ -158,13 +189,32 @@ export function ConversationContextPicker({
     close();
   };
 
+  const pickClientDirectory = async () => {
+    const bridge = desktopChatBridge();
+    if (!nativeAvailable || !bridge?.selectPath || pickingPath || creatingProject) return;
+    setPickingPath(true);
+    setPathError("");
+    try {
+      const result = await bridge.selectPath({ kind: "directory" });
+      if (!result) return;
+      if (!result.id || !result.path || result.host !== "desktop-client" || result.serverMapped !== false) {
+        throw new Error("桌面返回了无效的路径或宿主范围。");
+      }
+      setClientPick(result);
+    } catch (cause) {
+      setPathError(nativeDisplayMessage(cause instanceof Error ? cause : { message: String(cause) }, lang === "en"));
+    } finally {
+      setPickingPath(false);
+    }
+  };
+
   const activate = (entry: Entry) => {
     switch (entry.kind) {
       case "project":
         chooseProject(entry.project.project_id);
         return;
+      case "add":
       case "recent":
-        setPathDraft(entry.path);
         void submitPath(entry.path);
         return;
       default: {
@@ -178,7 +228,7 @@ export function ConversationContextPicker({
     () => entries.map((entry) => ({
       value: entryKey(entry),
       label: entry.kind === "project" ? entry.project.name : entry.path,
-      disabled: entry.kind === "recent" && creatingProject,
+      disabled: entry.kind !== "project" && creatingProject,
     })),
     [creatingProject, entries],
   );
@@ -210,7 +260,7 @@ export function ConversationContextPicker({
       <Icon name={hasDirectory || disabled ? "folder" : "folderPlus"} size={13} className="shrink-0" />
       <span className="min-w-0 truncate">{triggerLabel}</span>
       {modeLabel && hasDirectory ? (
-        <span className="shrink-0 text-[11.5px] font-normal text-cx-fg-4">{modeLabel}</span>
+        <span className="shrink-0 text-[12px] font-normal text-cx-fg-4">{modeLabel}</span>
       ) : null}
     </>
   );
@@ -231,12 +281,17 @@ export function ConversationContextPicker({
     );
   }
 
-  let lastKind: Entry["kind"] | null = null;
+  const pickerUnavailableHint = preferPathInput && !desktop && onCreateFromPath
+    ? "系统目录选择器不可用，请在上方粘贴目录路径"
+    : "";
+  const showSystemPicker = Boolean(onCreateProject) && !desktop && !preferPathInput;
+  const showClientPicker = desktop && Boolean(onCreateFromPath);
+  let lastGroup: "project" | "recent" | null = null;
 
   return (
     <Popover
       open={open}
-      onOpenChange={(next) => { if (pickingPath) return; setOpen(next); if (!next) { setQuery(""); setPathError(""); } }}
+      onOpenChange={(next) => { if (pickingPath) return; if (next) setOpen(true); else close(); }}
       placement="top-start"
       offset={8}
       ariaLabel="选择项目"
@@ -255,18 +310,38 @@ export function ConversationContextPicker({
       <div className="border-b border-cx-border-subtle p-2">
         <SearchInput
           value={query}
-          onValueChange={(next) => { setQuery(next); keyboard.setActiveIndex(0); }}
+          onValueChange={(next) => { setQuery(next); setPathError(""); keyboard.setActiveIndex(0); }}
           onKeyDown={keyboard.onKeyDown}
-          placeholder="搜索项目或最近路径"
-          aria-label="搜索项目"
+          placeholder={onCreateFromPath ? "搜索项目，或粘贴路径添加" : "搜索项目"}
+          aria-label={onCreateFromPath ? "搜索项目或输入工作目录路径" : "搜索项目"}
+          aria-invalid={pathError ? true : undefined}
+          aria-describedby={pathError ? pathErrorId : undefined}
           autoComplete="off"
+          spellCheck={false}
           role="combobox"
           aria-expanded
           aria-controls={listId}
           aria-activedescendant={keyboard.activeIndex >= 0 && entries.length ? `${listId}-opt-${keyboard.activeIndex}` : undefined}
           data-autofocus
-          className="[&_input]:border-transparent [&_input]:bg-cx-hover [&_input]:shadow-none [&_input:focus]:bg-cx-elevated"
+          data-testid="conversation-directory-path"
+          className={cn(
+            "[&_input]:border-transparent [&_input]:bg-cx-hover [&_input]:shadow-none [&_input:focus]:bg-cx-elevated",
+            queryIsPath && "[&_input]:font-cx-mono",
+          )}
         />
+        {pathError ? (
+          <p
+            id={pathErrorId}
+            role="alert"
+            aria-live="assertive"
+            data-testid="conversation-directory-path-error"
+            className="px-1 pt-1.5 text-[12px] leading-4 text-cx-danger"
+          >
+            {pathError}
+          </p>
+        ) : pickerUnavailableHint ? (
+          <p className="px-1 pt-1.5 text-[12px] leading-4 text-cx-fg-4">{pickerUnavailableHint}</p>
+        ) : null}
       </div>
 
       {loading ? (
@@ -291,16 +366,22 @@ export function ConversationContextPicker({
           </Callout>
         </div>
       ) : entries.length ? (
-        <div id={listId} role="listbox" aria-label="已有项目" className="cx-scroll max-h-72 overflow-y-auto overscroll-contain p-1.5">
+        <div id={listId} role="listbox" aria-label="已有项目" className="cx-scroll max-h-[min(340px,48vh)] overflow-y-auto overscroll-contain p-1.5">
           {entries.map((entry, index) => {
-            const header = entry.kind !== lastKind ? (entry.kind === "project" ? "项目" : "最近路径") : null;
-            lastKind = entry.kind;
+            const group = entry.kind === "add" ? null : entry.kind;
+            const header = group && group !== lastGroup ? (group === "project" ? "项目" : "最近路径") : null;
+            if (group) lastGroup = group;
             const active = index === keyboard.activeIndex;
             const selected = entry.kind === "project" && entry.project.project_id === selectedProjectId;
-            const rowDisabled = entry.kind === "recent" && creatingProject;
+            const rowDisabled = entry.kind !== "project" && creatingProject;
+            const fullPath = entry.kind === "project" ? entry.project.root_path : entry.path;
+            const name = entry.kind === "add"
+              ? "添加工作目录"
+              : pathBasename(fullPath) || (entry.kind === "project" ? entry.project.name : fullPath);
+            const icon: IconName = entry.kind === "add" ? "folderPlus" : entry.kind === "project" ? "folder" : "history";
             return (
               <div key={entryKey(entry)} className="contents">
-                {header ? <div className="px-2 pb-1 pt-2 text-[11px] font-medium text-cx-fg-4 first:pt-1">{header}</div> : null}
+                {header ? <div className="px-2 pb-1 pt-2 text-[11.5px] font-medium text-cx-fg-4 first:pt-1">{header}</div> : null}
                 <div
                   id={`${listId}-opt-${index}`}
                   role="option"
@@ -308,109 +389,95 @@ export function ConversationContextPicker({
                   aria-disabled={rowDisabled || undefined}
                   data-index={index}
                   data-active={active || undefined}
+                  data-entry-kind={entry.kind}
+                  title={fullPath}
                   onPointerMove={() => { if (!active) keyboard.setActiveIndex(index); }}
                   onPointerDown={(event) => event.preventDefault()}
                   onClick={() => { if (!rowDisabled) activate(entry); }}
                   className={cn(
-                    "flex min-h-10 cursor-default select-none items-center gap-2.5 rounded-lg px-2 py-1.5 data-[active=true]:bg-cx-hover",
+                    "flex h-11 cursor-default select-none items-center gap-2.5 rounded-lg px-2 data-[active=true]:bg-cx-hover",
                     rowDisabled && "opacity-45",
                   )}
                 >
-                  <Icon name={entry.kind === "project" ? "folder" : "history"} size={15} className="shrink-0 text-cx-fg-3" />
-                  {entry.kind === "project" ? (
-                    <span className="flex min-w-0 flex-1 flex-col">
-                      <span className="truncate text-[13px] font-medium leading-5 text-cx-fg">
-                        {pathBasename(entry.project.root_path) || entry.project.name}
-                      </span>
-                      <span className="truncate font-cx-mono text-[11px] leading-4 text-cx-fg-4">{entry.project.root_path}</span>
+                  <span
+                    className={cn(
+                      "grid size-7 shrink-0 place-items-center rounded-md",
+                      selected ? "bg-cx-accent-soft text-cx-accent" : entry.kind === "add" ? "bg-cx-accent-soft text-cx-accent" : "bg-cx-hover text-cx-fg-3",
+                    )}
+                  >
+                    {entry.kind === "add" && creatingProject ? <Spinner size={14} /> : <Icon name={icon} size={15} />}
+                  </span>
+                  <span className="flex min-w-0 flex-1 flex-col">
+                    <span className={cn("truncate text-[13px] leading-5", selected ? "font-semibold text-cx-fg" : "font-medium text-cx-fg")}>
+                      {name}
                     </span>
-                  ) : (
-                    <span className="min-w-0 flex-1 truncate font-cx-mono text-[12px] text-cx-fg-2">{entry.path}</span>
-                  )}
-                  <Icon name="check" size={14} className={cn("shrink-0 text-cx-fg", selected ? "opacity-100" : "opacity-0")} />
+                    <span className="truncate font-cx-mono text-[11.5px] leading-4 text-cx-fg-4">{shortPath(fullPath)}</span>
+                  </span>
+                  {selected ? <Icon name="check" size={14} className="shrink-0 text-cx-accent" /> : null}
+                  {entry.kind === "add" && active ? <Icon name="cornerDownLeft" size={13} className="shrink-0 text-cx-fg-4" /> : null}
                 </div>
               </div>
             );
           })}
         </div>
       ) : (
-        <div className="px-4 py-6 text-center text-[12.5px] text-cx-fg-4">
-          {projects.length || recentPaths.length ? "没有匹配的项目" : "还没有项目，请选择一个工作目录"}
+        <div className="px-4 py-6 text-center text-[13px] text-cx-fg-4">
+          {needle
+            ? (onCreateFromPath ? "没有匹配的项目；输入以 / 或 ~ 开头的路径即可添加" : "没有匹配的项目")
+            : "还没有项目，选择或粘贴一个工作目录"}
         </div>
       )}
 
-      <div className="flex flex-col gap-1 border-t border-cx-border-subtle bg-cx-bg-subtle p-1.5">
-        {onCreateFromPath ? (
-          <form
-            className="flex flex-col gap-1.5 px-1.5 pb-1 pt-1"
-            data-testid="conversation-directory-path-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void submitPath();
-            }}
-          >
-            {desktopChatBridge() ? <NativePathPicker id="conversation-directory-path" label={lang === "en" ? "Workspace path" : "工作目录路径"} kind="directory" value={pathDraft} onChange={path => { setPathDraft(path); setPathError(""); }} onServerPath={path => { void submitPath(path); }} disabled={creatingProject} onBusyChange={setPickingPath} inputTestId="conversation-directory-path" invalid={Boolean(pathError)} describedBy={pathError ? pathErrorId : undefined} placeholder={lang === "en" ? "Workspace directory accessible to the service" : "当前服务可访问的工作目录"} /> : <><label className="text-[11.5px] text-cx-fg-3" htmlFor="conversation-directory-path">
-              {preferPathInput ? "系统目录选择器不可用，请输入路径" : "或输入目录路径"}
-            </label>
-            <div className="flex gap-1.5">
-              <Input
-                id="conversation-directory-path"
-                aria-label="工作目录路径"
-                aria-invalid={pathError ? true : undefined}
-                aria-describedby={pathError ? pathErrorId : undefined}
-                data-testid="conversation-directory-path"
-                invalid={Boolean(pathError)}
-                value={pathDraft}
-                onChange={(event) => {
-                  setPathDraft(event.target.value);
-                  if (pathError) setPathError("");
-                }}
-                placeholder="/workspace 或 ~/src"
-                autoComplete="off"
-                spellCheck={false}
-                size="sm"
-                className="flex-1 font-cx-mono text-[12.5px]"
-              />
-              <Button size="sm" variant="secondary" disabled={creatingProject || !pathDraft.trim()} type="submit" className="h-8">
-                添加
-              </Button>
+      {clientPick ? (
+        <div className="border-t border-cx-border-subtle p-2" data-testid="conversation-client-path-confirm">
+          <div className="flex flex-col gap-2 rounded-lg bg-cx-hover p-2.5">
+            <div className="flex min-w-0 items-center gap-2">
+              <Icon name="monitor" size={14} className="shrink-0 text-cx-fg-3" />
+              <span className="min-w-0 flex-1 truncate font-cx-mono text-[12px] text-cx-fg" title={clientPick.path}>{shortPath(clientPick.path)}</span>
             </div>
-            </>}
-            {pathError ? (
-              <p
-                id={pathErrorId}
-                role="alert"
-                aria-live="assertive"
-                data-testid="conversation-directory-path-error"
-                className="text-[12px] leading-4 text-cx-danger"
-              >
-                {pathError}
-              </p>
-            ) : null}
-          </form>
-        ) : null}
-        {onCreateProject ? (
+            <p className="text-[11.5px] leading-4 text-cx-fg-4">这是桌面本机路径。服务若在远程或容器中运行，请先确认它能访问该路径。</p>
+            <div className="flex justify-end gap-1.5">
+              <Button size="xs" variant="ghost" onClick={() => setClientPick(null)} disabled={creatingProject}>取消</Button>
+              <Button size="xs" variant="primary" loading={creatingProject} onClick={() => void submitPath(clientPick.path)}>确认可访问并使用</Button>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-0.5 border-t border-cx-border-subtle p-1.5">
+          {showSystemPicker ? (
+            <button type="button" disabled={creatingProject} onClick={() => void createProject()} className={footerRowClass}>
+              {creatingProject ? <Spinner size={15} className="text-cx-fg-3" /> : <Icon name="folderPlus" size={15} className="text-cx-fg-3" />}
+              <span>{creatingProject ? "正在选择工作目录…" : "选择新的工作目录…"}</span>
+            </button>
+          ) : null}
+          {showClientPicker ? (
+            <Tooltip content={nativeAvailable ? "从桌面本机选择，确认服务可访问后使用" : nativeUnavailableReason} placement="right">
+              <span className="flex">
+                <button
+                  type="button"
+                  disabled={!nativeAvailable || pickingPath || creatingProject}
+                  onClick={() => void pickClientDirectory()}
+                  className={footerRowClass}
+                  data-testid="conversation-client-path-pick"
+                >
+                  {pickingPath ? <Spinner size={15} className="text-cx-fg-3" /> : <Icon name="folderPlus" size={15} className="text-cx-fg-3" />}
+                  <span>{pickingPath ? "正在选择…" : "从本机选择目录…"}</span>
+                </button>
+              </span>
+            </Tooltip>
+          ) : null}
           <button
             type="button"
-            disabled={creatingProject}
-            onClick={() => void createProject()}
-            className="cx-press flex h-9 w-full items-center gap-2.5 rounded-lg px-2 text-left text-[13px] text-cx-fg-2 hover:bg-cx-hover hover:text-cx-fg disabled:opacity-60"
+            data-testid="conversation-skip-project"
+            onClick={() => chooseProject("")}
+            className={footerRowClass}
           >
-            {creatingProject ? <Spinner size={15} className="text-cx-fg-3" /> : <Icon name="folderPlus" size={15} className="text-cx-fg-3" />}
-            <span>{creatingProject ? (preferPathInput ? "正在添加工作目录…" : "正在选择工作目录…") : "选择新的工作目录…"}</span>
+            <Icon name="messages" size={15} className="text-cx-fg-3" />
+            <span className="flex-1">不在项目中工作</span>
+            {!selectedProjectId ? <Icon name="check" size={14} className="text-cx-accent" /> : null}
           </button>
-        ) : null}
-        <button
-          type="button"
-          data-testid="conversation-skip-project"
-          onClick={() => chooseProject("")}
-          className="cx-press flex h-9 w-full items-center gap-2.5 rounded-lg px-2 text-left text-[13px] text-cx-fg-2 hover:bg-cx-hover hover:text-cx-fg"
-        >
-          <Icon name="messages" size={15} className="text-cx-fg-3" />
-          <span className="flex-1">不在项目中工作</span>
-          {!selectedProjectId ? <Icon name="check" size={14} className="text-cx-fg" /> : null}
-        </button>
-      </div>
+        </div>
+      )}
     </Popover>
   );
 }

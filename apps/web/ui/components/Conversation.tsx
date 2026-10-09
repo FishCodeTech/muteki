@@ -965,7 +965,7 @@ function Composer({
   const [expectedFindings, setExpectedFindings] = useState("10");
   const [flagFormat, setFlagFormat] = useState<"brace" | "token" | "custom">("brace");
   const [flagWrapper, setFlagWrapper] = useState("");
-  const [containerMode, setContainerMode] = useState(workspaceMode === "pentest");
+  const [containerMode, setContainerMode] = useState(false);
   const [allowOperatorInput, setAllowOperatorInput] = useState(false);
   // P2-v3: when the coordinator runs inside a container, local worker mode is
   // rejected server-side — force container mode and lock the toggle.
@@ -1082,7 +1082,7 @@ function Composer({
     }
     const dispatched = await onDispatch(v, {
       webSearch: mode === "pentest" ? true : webSearch,
-      mode, collect, containerMode: mode === "pentest" ? true : containerMode,
+      mode, collect, containerMode,
       allowOperatorInput: mode === "pentest" ? true : allowOperatorInput,
       flagFormat,
       flagWrapper: flagFormat === "custom" ? flagWrapper.trim() : undefined,
@@ -1270,7 +1270,7 @@ function Composer({
               <Icon name={webSearch ? "globe" : "lock"} size={14} />
               {webSearch ? t("composer.webOn") : t("composer.webOff")}
             </Button>}
-            {mode === "ctf" && <Button
+            <Button
               size="sm"
               variant="ghost"
               className={`websearch-toggle ${containerMode ? "on" : "off"}${containerLocked ? " locked" : ""}`}
@@ -1283,7 +1283,7 @@ function Composer({
             >
               <Icon name={containerMode ? "lock" : "globe"} size={14} />
               {containerMode ? t("composer.containerOn") : t("composer.containerOff")}
-            </Button>}
+            </Button>
             <Button
               size="sm"
               variant="ghost"
@@ -1370,7 +1370,7 @@ function Composer({
               <div className="advanced-metrics-grid">
                 <div className="advanced-metric-card">
                   <span>{t("composer.raceTimeout")}</span>
-                  <NumberField className="collect-count" min={1} value={raceTimeout}
+                  <NumberField className="collect-count" min={0} value={raceTimeout}
                     onChange={(v) => { setAdvancedTouched((old) => ({ ...old, raceTimeout: true })); setRaceTimeout(v); }}
                     ariaLabel={t("composer.raceTimeout")} title={t("composer.raceTimeoutTitle")} suffix="s" />
                   <small>{t("composer.raceTimeoutHint")}</small>

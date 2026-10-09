@@ -82,11 +82,23 @@ def capability_result_payload(result: CapabilityResult) -> dict[str, Any]:
     }
     if result.receipt is not None:
         payload["receipt"] = result.receipt.model_dump(mode="json")
+    if (isinstance(result.result, dict) and result.result.get("model_image_input") is False
+            and result.images):
+        payload["image_delivery"] = {"supported": False, "image_count": len(result.images),
+            "message": "当前模型不支持图片输入。截图证据已保存；请依据辅助功能树操作，不能声称已目视核验。"}
     if result.result is not None:
         payload["result"] = result.result
     if result.error is not None:
         payload["error"] = result.error.model_dump(mode="json")
     return payload
+
+
+def capability_image_blocks(result: CapabilityResult) -> list[dict[str, Any]]:
+    """CapabilityResult.images → MCP / Agent SDK 图片内容块。"""
+    if isinstance(result.result, dict) and result.result.get("model_image_input") is False:
+        return []
+    return [{"type": "image", "data": image.data, "mimeType": image.mime_type}
+            for image in result.images]
 
 
 @dataclass
@@ -187,8 +199,12 @@ class MutekiHttpJsonRpcBridge:
         # 业务结果（含拒绝 envelope）一律走 JSON-RPC result 返回，保持与
         # MCP isError 结果、Native Tool content 的 envelope 逐字节一致。
         result = await self._gateway.invoke(context, invocation)
-        return BridgeResponse.json(200, jsonrpc_result(
-            request_id, capability_result_payload(result)))
+        payload = capability_result_payload(result)
+        if result.images:
+            # Only the bridges that hand results to a model read this key and
+            # turn it into image blocks; the envelope itself stays unchanged.
+            payload["images"] = capability_image_blocks(result)
+        return BridgeResponse.json(200, jsonrpc_result(request_id, payload))
 
     # -- 认证 --------------------------------------------------------------------
 
@@ -222,6 +238,7 @@ __all__ = [
     "MutekiHttpJsonRpcBridge",
     "PARSE_ERROR",
     "SERVER_ERROR",
+    "capability_image_blocks",
     "capability_result_payload",
     "category_to_jsonrpc_code",
     "envelope_data",

@@ -156,7 +156,8 @@ export function Callout({
     neutral: "border-cx-border bg-cx-bg-subtle text-cx-fg-2",
     accent: "border-cx-accent-line/40 bg-cx-accent-soft text-cx-fg",
     success: "border-[color-mix(in_srgb,var(--green)_30%,transparent)] bg-cx-success-soft text-cx-fg",
-    warning: "border-[color-mix(in_srgb,var(--amber)_32%,transparent)] bg-cx-warning-soft text-cx-fg",
+    // Amber washes read as beige on light surfaces; the icon carries the tone.
+    warning: "border-cx-border bg-cx-elevated text-cx-fg shadow-cx-xs",
     danger: "border-[color-mix(in_srgb,var(--red)_30%,transparent)] bg-cx-danger-soft text-cx-fg",
     running: "border-cx-accent-line/40 bg-cx-accent-soft text-cx-fg",
   };
@@ -185,7 +186,7 @@ export function Callout({
       </div>
       {action ? <div className="flex shrink-0 items-center gap-1">{action}</div> : null}
       {onDismiss ? (
-        <button type="button" aria-label="关闭" onClick={onDismiss} className="-mr-1 grid size-6 shrink-0 place-items-center rounded-md text-cx-fg-3 hover:bg-cx-hover hover:text-cx-fg">
+        <button type="button" aria-label="关闭提示" title="关闭提示" onClick={onDismiss} className="cx-press -mr-1 grid size-6 shrink-0 place-items-center self-start rounded-md text-cx-fg-3 outline-none hover:bg-cx-hover hover:text-cx-fg focus-visible:outline-2 focus-visible:outline-[var(--cx-focus)]">
           <Icon name="x" size={13} />
         </button>
       ) : null}

@@ -116,7 +116,7 @@ function MeterDetails({
             <Badge tone={STATUS_TONE[compactStatus]}>{STATUS_LABEL[compactStatus]}</Badge>
           ) : null}
           {contextWindow?.updated_at ? (
-            <span className="text-[11px] text-cx-fg-4">{relativeTime(contextWindow.updated_at)}更新</span>
+            <span className="text-[12px] text-cx-fg-4">{relativeTime(contextWindow.updated_at)}更新</span>
           ) : null}
         </div>
       </div>
@@ -139,12 +139,12 @@ function MeterDetails({
           ) : null}
         </div>
         {pct != null ? (
-          <p className={cn("text-[11.5px]", level === "ok" ? "text-cx-fg-3" : cn("font-medium", LEVEL_TEXT[level]))}>
+          <p className={cn("text-[12px]", level === "ok" ? "text-cx-fg-3" : cn("font-medium", LEVEL_TEXT[level]))}>
             已占用 {pct}%{level === "danger" ? "，即将达到上限" : level === "warn" ? "，接近上限" : ""}
           </p>
         ) : null}
         {total == null && limit == null ? (
-          <p className="text-[11.5px] text-cx-fg-4">当前 Runtime 暂未上报窗口用量</p>
+          <p className="text-[12px] text-cx-fg-4">当前 Runtime 暂未上报窗口用量</p>
         ) : null}
       </div>
 
@@ -173,14 +173,14 @@ function MeterDetails({
               {compacting || compactStatus === "running" ? "压缩中…" : "手动压缩上下文"}
             </Button>
           ) : null}
-          {compactError ? <p className="text-[11.5px] text-cx-danger">{compactError}</p> : null}
+          {compactError ? <p className="text-[12px] text-cx-danger">{compactError}</p> : null}
           {compacted.length > 0 ? (
             <div className="flex flex-col gap-1.5">
-              <span className="text-[11px] font-medium text-cx-fg-4">压缩历史</span>
+              <span className="text-[12px] font-medium text-cx-fg-4">压缩历史</span>
               {compacted.slice(-3).map((rec, i) => (
-                <div key={i} className="rounded-lg bg-cx-bg-subtle px-2.5 py-1.5 text-[11.5px] shadow-[0_0_0_1px_var(--cx-border-subtle)]">
+                <div key={i} className="rounded-lg bg-cx-bg-subtle px-2.5 py-1.5 text-[12px] shadow-[0_0_0_1px_var(--cx-border-subtle)]">
                   {rec.summary ? <p className="leading-snug text-cx-fg-2">{rec.summary}</p> : null}
-                  <div className="cx-tabular mt-0.5 flex items-center gap-2 font-cx-mono text-[11px] text-cx-fg-4">
+                  <div className="cx-tabular mt-0.5 flex items-center gap-2 font-cx-mono text-[12px] text-cx-fg-4">
                     {rec.tokens_before != null && rec.tokens_after != null ? (
                       <span>{compactNumber(rec.tokens_before)} → {compactNumber(rec.tokens_after)}</span>
                     ) : null}

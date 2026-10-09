@@ -1,9 +1,9 @@
 /* Chat workbench: markdown. Rules are prefixed `.cx-` and never target other pages. */
 
 .cx-prose {
-  --cx-prose-fs: var(--cx-msg-fs, 14px);
-  --cx-prose-lh: 1.72;
-  --cx-prose-gap: 0.85em;
+  --cx-prose-fs: var(--cx-msg-fs, 15px);
+  --cx-prose-lh: 1.7;
+  --cx-prose-gap: 1em;
   min-width: 0;
   max-width: 100%;
   font-size: var(--cx-prose-fs);
@@ -14,7 +14,7 @@
 }
 
 .cx-prose-sm {
-  --cx-prose-fs: calc(var(--cx-msg-fs, 14px) - 1px);
+  --cx-prose-fs: calc(var(--cx-msg-fs, 15px) - 1px);
   --cx-prose-lh: 1.65;
   --cx-prose-gap: 0.6em;
   color: var(--cx-fg-2);
@@ -30,13 +30,12 @@
 
 .cx-prose :where(h1, h2, h3, h4, h5, h6) {
   font-weight: 600;
-  letter-spacing: -0.01em;
-  line-height: 1.35;
+  line-height: 1.4;
   color: var(--cx-fg);
 }
-.cx-prose h1 { font-size: 1.36em; margin-top: 1.5em; }
-.cx-prose h2 { font-size: 1.2em; margin-top: 1.4em; }
-.cx-prose h3 { font-size: 1.07em; margin-top: 1.25em; }
+.cx-prose h1 { font-size: 1.3em; margin-top: 1.7em; }
+.cx-prose h2 { font-size: 1.17em; margin-top: 1.6em; }
+.cx-prose h3 { font-size: 1.05em; margin-top: 1.4em; }
 .cx-prose :where(h4, h5, h6) { font-size: 1em; margin-top: 1.15em; }
 .cx-prose-sm :where(h1, h2, h3, h4, h5, h6) { font-size: 1em; margin-top: 0.9em; }
 
@@ -48,10 +47,10 @@
 .cx-prose ul { list-style: disc; }
 .cx-prose ul ul { list-style: circle; }
 .cx-prose ol { list-style: decimal; }
-.cx-prose li { margin: 0.28em 0 0; padding-left: 0.2em; }
+.cx-prose li { margin: 0.4em 0 0; padding-left: 0.2em; }
 .cx-prose li::marker { color: var(--cx-fg-4); }
 .cx-prose ol > li::marker { font-variant-numeric: tabular-nums; color: var(--cx-fg-3); }
-.cx-prose li > :where(ul, ol) { margin-top: 0.28em; }
+.cx-prose li > :where(ul, ol) { margin-top: 0.4em; }
 .cx-prose li > p { margin-top: 0.35em; }
 
 .cx-prose li.task-list-item { list-style: none; margin-left: -1.3em; padding-left: 0; }
@@ -131,7 +130,7 @@
   vertical-align: 1px;
   background: var(--cx-accent-soft);
   color: var(--cx-accent);
-  font-size: 10.5px;
+  font-size: 12px;
   font-weight: 500;
   line-height: 1;
   text-decoration: none;
@@ -151,7 +150,7 @@
   line-height: 1.55;
 }
 .cx-md-table-wrap :where(th, td) {
-  padding: 7px 12px;
+  padding: 9px 14px;
   border-bottom: 1px solid var(--cx-border-subtle);
   text-align: left;
   vertical-align: top;

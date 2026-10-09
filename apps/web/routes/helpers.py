@@ -10,8 +10,10 @@ from typing import Any, Optional
 
 from fastapi import (
     FastAPI,
+    HTTPException,
 )
 
+from muteki.external_agents.descriptors import find_adapter_descriptor, get_descriptor
 from muteki.platform.contracts.errors import ErrorCategory
 from muteki.solver.engine_registry import (
     SUPPORTED_ENGINE_IDS,
@@ -113,7 +115,7 @@ def make_helpers(app: FastAPI) -> SimpleNamespace:
                     }
                 endpoint_discovery = (
                     discover_anthropic_compatible_models
-                    if selected_engine == "claude"
+                    if get_descriptor(selected_engine).models.endpoint_protocol == "anthropic"
                     else discover_openai_compatible_models
                 )
                 return await asyncio.to_thread(
@@ -124,6 +126,45 @@ def make_helpers(app: FastAPI) -> SimpleNamespace:
             adapter_id, instance_id = selected_runtime.rsplit(":", 1)
             runtime = platform_stack.runtime_service.get_instance(
                 adapter_id, instance_id) or {}
+            adapter = find_adapter_descriptor(adapter_id)
+            if adapter is not None and adapter.scoped_model_catalog_probe:
+                # Runtimes with a scoped catalog probe (Codex App Server, Cursor SDK)
+                # read their own credential-scoped model list.
+                from apps.web.agent_runtime_api import RuntimeProbeScopeChangedError
+
+                if backend != "local" or not persist:
+                    return {
+                        "ok": False, "models": [], "source": adapter_id,
+                        "error_code": "model_catalog.invalid_scope",
+                        "detail": f"{adapter_id} 模型目录需要本地环境与已保存的凭据配置。",
+                    }
+                try:
+                    health = await platform_stack.runtime_service.probe_one(
+                        adapter_id, instance_id, credential_id=credential_id,
+                        environment="local",
+                    )
+                except RuntimeProbeScopeChangedError as exc:
+                    # A result from an obsolete configuration must not be saved
+                    # over the current Runtime's catalog, even as a failure.
+                    raise HTTPException(status_code=409, detail={
+                        "code": exc.code, "message": str(exc),
+                    }) from exc
+                except Exception as exc:
+                    return {
+                        "ok": False, "models": [], "source": adapter_id,
+                        "error_code": str(getattr(exc, "code", "model_catalog.probe_failed")),
+                        "detail": f"{type(exc).__name__}: {exc}",
+                    }
+                catalog = health["model_catalog"]
+                ok = catalog.get("refresh_status") == "fresh"
+                return {
+                    "ok": ok, "models": catalog.get("discovered_models") or [],
+                    "default_model": catalog.get("default_model") or "",
+                    "source": catalog.get("source") or adapter_id,
+                    "error_code": catalog.get("error_code") or "",
+                    "detail": catalog.get("detail") or catalog.get("last_error") or f"已读取 {adapter_id} 模型目录",
+                    "evidence": catalog.get("discovery_evidence") if ok else catalog.get("last_attempt_evidence"),
+                }
             return await asyncio.to_thread(
                 discover_worker_models,
                 profile={
@@ -170,26 +211,26 @@ def make_helpers(app: FastAPI) -> SimpleNamespace:
             runtime_instance=selected_runtime,
             result=result,
             configured_models=configured_models or [],
-            default_model=default_model,
+            default_model=default_model or str(result.get("default_model") or ""),
             preserve_previous_on_failure=not (
                 connection == "custom_endpoint" or bool(base_url)
             ),
         )
         return result, catalog
 
-    async def _refresh_stale_credential_catalogs() -> dict[str, Any]:
+    async def _refresh_stale_credential_catalogs(environment: str = "") -> dict[str, Any]:
         """Refresh only missing/expired credential catalogs; never run a model turn."""
         from apps.web.worker_config import backend_for_profile
         from apps.web.worker_models import CredentialModelCatalogStore
         from muteki.core.runtime_env import is_web_container
         from muteki.solver.credential_accounts import (
-            detect_system_login,
+            detect_system_login_async,
             invalidate_system_login_cache,
         )
 
         invalidate_system_login_cache()
         cfg = mgr.worker_config.get()
-        environment = backend_for_profile(
+        environment = environment or backend_for_profile(
             worker_backend=str(cfg.get("worker_backend") or ""),
             in_web_container=is_web_container(),
         )
@@ -230,7 +271,7 @@ def make_helpers(app: FastAPI) -> SimpleNamespace:
         if environment == "local":
             for engine in SUPPORTED_ENGINE_IDS:
                 credential_id = system_credential_id(engine)
-                if detect_system_login(engine) != "present":
+                if await detect_system_login_async(engine) != "present":
                     continue
                 for runtime_key in runtime_keys.get(engine) or [
                     f"cli.{engine}:default"
@@ -295,7 +336,7 @@ def make_helpers(app: FastAPI) -> SimpleNamespace:
             fields["command_id"] = command_id
         if idempotency_key:
             fields["idempotency_key"] = idempotency_key
-        return await platform_stack.command_api.dispatch(CommandEnvelope(**fields))
+        return await platform_stack.routed_command_api.dispatch(CommandEnvelope(**fields))
 
     async def _dispatch_platform_command(
         command_type: str,
@@ -306,7 +347,7 @@ def make_helpers(app: FastAPI) -> SimpleNamespace:
         """共享平台设置的兼容 HTTP 入口。"""
         from muteki.platform.contracts.commands import ActorRef, CommandEnvelope
 
-        return await platform_stack.command_api.dispatch(CommandEnvelope(
+        return await platform_stack.routed_command_api.dispatch(CommandEnvelope(
             command_type=command_type,
             aggregate_type=aggregate_type,
             aggregate_id=aggregate_id,
