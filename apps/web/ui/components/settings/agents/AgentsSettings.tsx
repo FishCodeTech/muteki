@@ -266,6 +266,14 @@ export function AgentsSettings({ taskSettings = false, navigation, onCredentials
   /* Selection: URL query (?engine=&instance=&credential=) when the host passes
    * navigation, otherwise plain local state (task settings embed). */
   const [localSelection, setLocalSelection] = useState<AgentsSelection>({ engine: null, instanceId: "", credentialId: "" });
+  const taskSelectionInitialized = useRef(false);
+  useEffect(() => {
+    if (!taskSettings || navigation || taskSelectionInitialized.current) return;
+    const first = engines.find((item) => item.supportStatus === "supported");
+    if (!first) return;
+    taskSelectionInitialized.current = true;
+    setLocalSelection({ engine: first.engine, instanceId: "", credentialId: "" });
+  }, [engines, navigation, taskSettings]);
   const selection = useMemo<AgentsSelection>(
     () => navigation ? readSelection(navigation.searchParams, descriptors) : localSelection,
     [descriptors, navigation, localSelection],
@@ -897,10 +905,8 @@ export function AgentsSettings({ taskSettings = false, navigation, onCredentials
 
   return (
     <div className="agents-settings @container/agents flex w-full min-w-0 flex-col gap-6" aria-busy={loading}>
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="text-[13px] leading-5 text-cx-fg-3">
-          {taskSettings ? "在这里新增、导入、测试和管理做题 Worker 使用的凭据。带 Base URL 的自定义端点也可供 Reason / Titler 使用。" : "选择左侧引擎，在右侧管理它的凭据、接入方式与模型。"}
-        </p>
+      <div className={cn("flex flex-wrap items-center gap-3", taskSettings ? "justify-end" : "justify-between")}>
+        {!taskSettings ? <p className="text-[13px] leading-5 text-cx-fg-3">选择左侧引擎，在右侧管理它的凭据、接入方式与模型。</p> : null}
         <div className="flex items-center gap-3">
           {lastCheckedAt ? <span className="inline-flex items-center gap-1.5 text-[12px] text-cx-fg-3"><Icon name="clock" size={13} />{lastCheckedAt}</span> : null}
           <Button size="sm" variant="outline" icon="refresh" loading={refreshing} disabled={loading} onClick={() => void refreshAll()}>
@@ -967,7 +973,7 @@ export function AgentsSettings({ taskSettings = false, navigation, onCredentials
             </div>
 
             <SettingsSection>
-              <div className="flex flex-wrap items-center gap-4 px-5 py-4">
+              <div className="grid grid-cols-[44px_minmax(0,1fr)] items-center gap-3 px-5 py-4 @xl/agents:grid-cols-[44px_minmax(0,1fr)_auto] @xl/agents:gap-4">
                 <span className="grid size-11 shrink-0 place-items-center rounded-xl border border-cx-border bg-cx-bg">
                   <EngineLogo engine={currentEngine.engine} size={24} />
                 </span>
@@ -986,7 +992,7 @@ export function AgentsSettings({ taskSettings = false, navigation, onCredentials
                     {currentInstance ? ` · ${versionStatus(currentInstance.health?.version_check)}` : ""}
                   </p>
                 </div>
-                <div className="flex items-center gap-2.5">
+                <div className="col-span-2 flex items-center justify-end gap-2.5 @xl/agents:col-span-1">
                   <Button size="sm" variant="outline" icon="refresh" loading={busyItem === `probe:${currentEngine.engine}`} onClick={() => void probeEngine(currentEngine)}>探测</Button>
                   <span className="text-[12.5px] text-cx-fg-3">启用</span>
                   <Switch

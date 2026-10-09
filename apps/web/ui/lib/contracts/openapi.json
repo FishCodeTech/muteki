@@ -1118,6 +1118,39 @@
         "title": "RollbackRequest",
         "type": "object"
       },
+      "RunRetentionPolicyBody": {
+        "additionalProperties": false,
+        "properties": {
+          "archive_after_days": {
+            "maximum": 3650.0,
+            "minimum": 1.0,
+            "title": "Archive After Days",
+            "type": "integer"
+          },
+          "archive_enabled": {
+            "title": "Archive Enabled",
+            "type": "boolean"
+          },
+          "delete_after_days": {
+            "maximum": 3650.0,
+            "minimum": 1.0,
+            "title": "Delete After Days",
+            "type": "integer"
+          },
+          "delete_enabled": {
+            "title": "Delete Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "archive_enabled",
+          "archive_after_days",
+          "delete_enabled",
+          "delete_after_days"
+        ],
+        "title": "RunRetentionPolicyBody",
+        "type": "object"
+      },
       "ShareCreateRequest": {
         "properties": {
           "access_mode": {
@@ -8665,6 +8698,73 @@
           }
         },
         "summary": "Probe Profile Health"
+      }
+    },
+    "/api/settings/run-retention": {
+      "get": {
+        "operationId": "get_run_retention_settings_api_settings_run_retention_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Get Run Retention Settings Api Settings Run Retention Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Run Retention Settings"
+      }
+    },
+    "/api/settings/run-retention/{mode}": {
+      "put": {
+        "operationId": "put_run_retention_settings_api_settings_run_retention__mode__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "mode",
+            "required": true,
+            "schema": {
+              "title": "Mode",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunRetentionPolicyBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Put Run Retention Settings Api Settings Run Retention  Mode  Put"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Run Retention Settings"
       }
     },
     "/api/settings/runtime/openvpn": {

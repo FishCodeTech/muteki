@@ -22,8 +22,11 @@ async function run(file, recover = false) {
   try {
     if (recover) throw new Error('Recovered an interrupted update before workspace writes were admitted');
     if (!['prepared', 'waiting-for-owner'].includes(journal.phase)) throw new Error('Update transaction is not prepared');
-    const identity = bundleIdentity(journal.candidate);
-    if (identity.id !== journal.identity.id || identity.team !== journal.identity.team || bundleHash(journal.candidate) !== journal.sha256) throw new Error('Candidate changed after acceptance');
+    const officialProvenance = journal.mode === 'official' && journal.integrity?.kind === 'github-release-asset' && journal.integrity.repository === 'FishCodeTech/muteki' && /^https:\/\/github\.com\/FishCodeTech\/muteki\/releases\/tag\/v?\d+\.\d+\.\d+$/.test(journal.integrity.releaseUrl || '') && typeof journal.integrity.assetName === 'string' && journal.integrity.sha256 === journal.assetDigest && /^sha256:[a-f0-9]{64}$/.test(journal.assetDigest || '');
+    if (journal.mode === 'official' && !officialProvenance) throw new Error('Official update integrity provenance is missing or invalid');
+    const officialAdhoc = officialProvenance && !journal.candidateIdentity.team && !journal.identity.team;
+    const identity = bundleIdentity(journal.candidate, {allowAdhoc: officialAdhoc, expectedArch: process.arch});
+    if (identity.id !== journal.identity.id || identity.team !== journal.candidateIdentity.team || (officialAdhoc ? Boolean(identity.team) : identity.team !== journal.identity.team) || bundleHash(journal.candidate) !== journal.sha256) throw new Error('Candidate changed after acceptance');
     if (bundleHash(journal.current) !== journal.previousSha256) throw new Error('Installed application changed during update preparation');
     fs.mkdirSync(backup, {mode: 0o700});
     write({phase: 'backing-up'});

@@ -2,6 +2,31 @@
 
 All notable public release changes are tracked here.
 
+## 0.4.2 - 2026-10-09
+
+### Fixed
+
+- Restored installed Agent CLI and native login discovery in regular desktop workspaces, including user-local, NVM, and Bun installations. Candidate startup checks retain isolated homes and credentials.
+- Fixed desktop candidate identity checks to hash the physical ASAR archive and report recovery failures clearly.
+- Reused the Agent credential view and fixed Switch CSS and narrow cards in the settings interface.
+
+### Changed
+
+- Moved version updates out of the CTF and penetration-testing settings into global settings. Existing update links redirect to the new page.
+
+### Added
+
+- Added global desktop update settings with official macOS release checks, GitHub SHA-256 verification, strict signature checks, isolated candidate startup, data backups, and restart-based app replacement. Service updates remain available in Web settings.
+- Added separate CTF and penetration-testing retention settings with saved configuration and independent archive and delete switches. Defaults archive after 15 idle days and delete after 30 idle days. Idle time starts at the run's last activity, and deletion applies only to already archived tasks.
+
+### Upgrade
+
+- Use `muteki upgrade v0.4.2` or `./run.sh upgrade v0.4.2` for a managed Web installation, and add `--compose` for a container deployment. Existing `.env`, `state/`, credentials, and sessions remain outside the release bundle.
+- Download the macOS `.dmg` or `.zip` matching your Mac from the release page. Windows and Linux desktop packages are not included.
+- Retention thresholds now come from each mode's saved settings. `MUTEKI_ARCHIVE_DAYS` and `MUTEKI_DELETE_DAYS` no longer set these thresholds; `MUTEKI_RETENTION_ENABLED=0` still disables all automatic retention actions.
+- Published 0.4.1 desktop installs need one manual install of 0.4.2 because 0.4.1 has no in-app update screen. Once on 0.4.2, official updates are available in global settings and verify the release SHA-256 and strict signatures before preparing a candidate.
+- Local candidate updates require a stable Developer ID signature. The published macOS packages remain ad-hoc signed and are not notarized. There is no unsigned update bypass.
+
 ## 0.4.1 - 2026-10-09
 
 ### Added

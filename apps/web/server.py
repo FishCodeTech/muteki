@@ -75,10 +75,8 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
 
     platform_stack = WebPlatformStack(mgr)
 
-    # Retention policy (BE-auto-archive): auto-archive idle runs, then delete the
-    # ones that stay idle. Defaults: archive after 3 days, delete after 7 days,
-    # sweep hourly. All env-tunable; set MUTEKI_RETENTION_ENABLED=0 to disable
-    # (pinned runs are NEVER auto-touched).
+    # Retention settings are persisted per mode. The environment flag remains a
+    # global kill switch; each sweep reads the manager's latest stored policies.
     @asynccontextmanager
     async def normal_lifespan(app: FastAPI):
         # Start the reverse-connect control receiver: the in-container supervisors
@@ -154,8 +152,6 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         if enabled:
             retention_task = asyncio.create_task(mgr.retention_loop(
                 interval_s=_env_float("MUTEKI_RETENTION_INTERVAL", 3600.0),
-                archive_after_s=_env_float("MUTEKI_ARCHIVE_DAYS", 3.0) * 86400.0,
-                delete_after_s=_env_float("MUTEKI_DELETE_DAYS", 7.0) * 86400.0,
             ))
         runtime_refresh_task: Optional[asyncio.Task] = None
         runtime_refresh_interval = max(

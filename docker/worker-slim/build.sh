@@ -9,7 +9,7 @@
 #
 # Usage: ./docker/worker-slim/build.sh [repo] [version] [arch]
 #   repo:    image repository (default: muteki-worker-slim; e.g. ghcr.io/fishcodetech/muteki-worker-slim)
-#   version: version tag       (default: v0.4.1; GHCR release tags keep the leading v)
+#   version: version tag       (default: v0.4.2; GHCR release tags keep the leading v)
 #   arch:    amd64 | arm64     (default: HOST arch — arm64 on Apple Silicon)
 # Tags built: <repo>:<version> AND <repo>:latest.
 #
@@ -28,7 +28,7 @@
 set -euo pipefail
 
 REPO_IMAGE="${1:-muteki-worker-slim}"
-VERSION="${2:-v0.4.1}"
+VERSION="${2:-v0.4.2}"
 # Default arch = host arch (uname -m → docker/go naming). Override with 3rd arg.
 _host_arch="$(uname -m)"
 case "${_host_arch}" in
