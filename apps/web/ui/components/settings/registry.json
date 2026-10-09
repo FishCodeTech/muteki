@@ -476,6 +476,36 @@
         "settings.extensions"
       ]
     },
+    "update": {
+      "id": "update",
+      "icon": "refresh",
+      "label": [
+        "版本更新",
+        "Updates"
+      ],
+      "description": [
+        "查看当前版本，检查并安装更新。",
+        "View the installed version, check for updates, and install a new release."
+      ],
+      "keywords": "版本 更新 升级 回滚 发布 update version upgrade rollback release",
+      "wide": true,
+      "group": "system",
+      "platforms": [
+        "web",
+        "desktop"
+      ],
+      "requiredApis": [
+        {
+          "path": "/api/settings/system-update",
+          "match": "prefix",
+          "methods": [
+            "GET",
+            "POST"
+          ]
+        }
+      ],
+      "requiredFeatures": []
+    },
     "operations": {
       "id": "operations",
       "icon": "activity",

@@ -12,6 +12,7 @@ function subscribe(channel, callback) {
 }
 contextBridge.exposeInMainWorld('mutekiDesktop', {
   getState: () => invoke('desktop:state'), connect: origin => invoke('desktop:connect', origin),
+  updates: { getStatus: () => invoke('desktop:update-status'), check: () => invoke('desktop:update-check'), install: () => invoke('desktop:update-install'), onStatus: callback => subscribe('desktop:update-status', callback) },
   connectLocal: () => invoke('desktop:connect-local'),
   configure: () => invoke('desktop:configure'), resume: () => invoke('desktop:resume'),
   consumeAnchor: id => invoke('desktop:anchor-consumed', id),

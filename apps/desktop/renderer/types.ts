@@ -1,5 +1,12 @@
 export type DesktopCommand = 'back' | 'forward' | 'reload' | 'sidebar' | 'search' | 'theme' | 'new-chat' | 'settings' | 'shortcuts';
 export type DesktopWindowAction = 'minimize' | 'maximize' | 'close';
+export interface DesktopUpdateStatus {
+  state: 'idle' | 'checking' | 'current' | 'available' | 'downloading' | 'validating' | 'ready' | 'installing' | 'error';
+  currentVersion: string; latestVersion?: string; progress?: number; message?: string;
+  error?: {code: string; message: string}; canInstall?: boolean; installReason?: string;
+  checkedAt?: string; releaseUrl?: string;
+  lastInstall?: {state: 'complete' | 'failed'; version: string; at: string; message: string; code?: string};
+}
 import type { DesktopSpeechInput, DesktopSpeechEvent } from '../../web/ui/lib/desktopChatBridge';
 export interface DesktopNotificationScope { connectionVersion: number; serviceId: string; identityId: string }
 export interface DesktopNotificationEvent extends DesktopNotificationScope {
@@ -31,6 +38,7 @@ export type DesktopState = {
   capabilities?: {version: number; host: string; entries?: Record<string, {supported: boolean; host: 'desktop-client' | 'service'; code?: string; reason?: string}>; [key: string]: unknown};
 };
 export interface DesktopBridge {
+  updates: {getStatus(): Promise<DesktopUpdateStatus>; check(): Promise<DesktopUpdateStatus>; install(): Promise<DesktopUpdateStatus>; onStatus(callback: (status: DesktopUpdateStatus) => void): () => void};
   connectLocal(): Promise<DesktopState>;
   consumeAnchor(id: number): Promise<void>;
   getState(): Promise<DesktopState>; connect(origin: string): Promise<DesktopState>;

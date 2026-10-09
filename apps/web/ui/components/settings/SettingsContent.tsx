@@ -17,6 +17,7 @@ export const SETTINGS_LOADERS: Record<SettingsPageId, ComponentType> = {
   import: lazy(() => import("./ImportSettings")),
   extensions: lazy(() => import("../ExtensionSettings").then(m => ({default: () => <div className="cx-settings-extensions"><m.ExtensionSettings /></div>}))),
   operations: lazy(() => import("../OperationsSettings").then(m => ({default: () => <div className="cx-settings-operations"><m.OperationsSettings /></div>}))),
+  update: lazy(() => import("./UpdateSettings").then(m => ({default: m.UpdateSettings}))),
   access: lazy(() => import("./AccessSettings").then(m => ({default: m.AccessSettings}))),
   desktop: lazy(async () => { const { DesktopPage } = await import("./DesktopConnectionSettings"); return {default: function Desktop() { const host = useSettingsHost(); return host.desktop ? <DesktopPage {...host.desktop} /> : null; }}; }),
 };
