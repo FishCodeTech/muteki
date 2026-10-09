@@ -24,6 +24,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, model_validator
 from sse_starlette.sse import EventSourceResponse
 
 from apps.web.run_manager import RunManager
@@ -40,11 +41,42 @@ from muteki.solver.credential_accounts import (
     account_store_root,
 )
 
+
+class RunRetentionPolicyBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    archive_enabled: StrictBool
+    archive_after_days: StrictInt = Field(ge=1, le=3650)
+    delete_enabled: StrictBool
+    delete_after_days: StrictInt = Field(ge=1, le=3650)
+
+    @model_validator(mode="after")
+    def validate_order(self) -> "RunRetentionPolicyBody":
+        if (self.archive_enabled and self.delete_enabled
+                and self.delete_after_days <= self.archive_after_days):
+            raise ValueError(
+                "delete_after_days must be greater than archive_after_days")
+        return self
+
 def register(app: FastAPI) -> None:
     h = app.state.route_helpers
     _reject_temporarily_disabled_engine = h._reject_temporarily_disabled_engine
     _dispatch_run_command = h._dispatch_run_command
     _run_receipt_status = h._run_receipt_status
+
+    @app.get("/api/settings/run-retention")
+    async def get_run_retention_settings() -> Any:
+        return {"policies": app.state.manager.retention_policies.all()}
+
+    @app.put("/api/settings/run-retention/{mode}")
+    async def put_run_retention_settings(
+        mode: str, policy: RunRetentionPolicyBody,
+    ) -> Any:
+        if mode not in {"ctf", "pentest"}:
+            raise HTTPException(status_code=404, detail="unknown run mode")
+        saved = app.state.manager.retention_policies.set(
+            mode, policy.model_dump())
+        return {"policy": saved}
 
     @app.get("/api/runs")
     async def list_runs(archived: int = 0) -> Any:

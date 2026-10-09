@@ -1,4 +1,7 @@
-const fs = require('node:fs');
+// Electron patches fs APIs to expose virtual files inside ASAR archives. Bundle
+// hashes must describe the physical .app tree so the standalone update runner
+// computes the same digest after Electron has prepared the candidate.
+const fs = process.versions.electron ? require('original-fs') : require('node:fs');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
 const { execFileSync } = require('node:child_process');
@@ -24,7 +27,7 @@ function bundleHash(root) {
   };
   walk(root); return hash.digest('hex');
 }
-function bundleIdentity(root) {
+function bundleIdentity(root, {allowAdhoc = false, expectedArch} = {}) {
   if (process.platform !== 'darwin' || !root.endsWith('.app')) throw new Error('Local candidate installation currently requires a macOS .app bundle');
   execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', root], {stdio: ['ignore', 'pipe', 'pipe']});
   const plist = key => execFileSync('/usr/libexec/PlistBuddy', ['-c', `Print :${key}`, path.join(root, 'Contents/Info.plist')], {encoding: 'utf8'}).trim();
@@ -32,10 +35,18 @@ function bundleIdentity(root) {
   const signed = spawnSync('/usr/bin/codesign', ['-dv', '--verbose=4', root], {encoding: 'utf8'});
   if (signed.status !== 0) throw new Error(signed.stderr);
   const team = signed.stderr.match(/^TeamIdentifier=(.+)$/m)?.[1];
-  if (!team || team === 'not set') throw new Error('Candidate must be signed with a stable signing identity');
+  if ((!team || team === 'not set') && !allowAdhoc) throw new Error('Candidate must be signed with a stable signing identity');
   const executable = plist('CFBundleExecutable');
   if (path.basename(executable) !== executable) throw new Error('Invalid bundle executable');
-  return { id: plist('CFBundleIdentifier'), version: plist('CFBundleShortVersionString'), executable, team };
+  const id = plist('CFBundleIdentifier'), version = plist('CFBundleShortVersionString');
+  if (expectedArch) {
+    const archs = execFileSync('/usr/bin/lipo', ['-archs', path.join(root, 'Contents/MacOS', executable)], {encoding: 'utf8'}).trim().split(/\s+/);
+    const binaryArch = expectedArch === 'x64' ? 'x86_64' : expectedArch;
+    if (!archs.includes(binaryArch)) throw new Error(`Application executable does not contain ${binaryArch}`);
+    const runtime = JSON.parse(fs.readFileSync(path.join(root, 'Contents/Resources/runtime/manifest.json'), 'utf8'));
+    if (runtime.platform !== 'darwin' || runtime.arch !== expectedArch) throw new Error(`Application runtime does not match darwin/${expectedArch}`);
+  }
+  return { id, version, executable, team: team && team !== 'not set' ? team : null };
 }
 function copyBundle(source, destination) {
   execFileSync('/usr/bin/ditto', ['--rsrc', '--extattr', source, destination], {stdio: ['ignore', 'pipe', 'pipe']});
