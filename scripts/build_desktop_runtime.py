@@ -171,7 +171,7 @@ def main() -> None:
     if destination.exists():
         shutil.rmtree(destination)
     staging.rename(destination)
-    subprocess.run([str(destination / manifest["python"]), "-I", "-B", "-c", "import fastapi, uvicorn, pydantic, sqlite3, numpy; print('Desktop Python runtime ready')"], cwd=build, check=True)
+    subprocess.run([str(destination / manifest["python"]), "-I", "-B", "-c", "import fastapi, uvicorn, pydantic, sqlite3, numpy; from magika import Magika; Magika(); print('Desktop Python runtime ready')"], cwd=build, check=True)
     subprocess.run([str(destination / manifest["node"]), str(destination / "npm-package/bin/npm-cli.js"), "--version"], cwd=build, check=True)
     print(destination)
 
