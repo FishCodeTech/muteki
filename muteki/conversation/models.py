@@ -83,6 +83,9 @@ class TurnRecord(ContractModel):
     # 参数；执行前会对当前会话的实时能力目录再次校验。
     runtime_invocation: dict[str, Any] = Field(default_factory=dict)
     runtime_snapshot: Optional[dict[str, str]] = None
+    # Context parts sent beside the user's text (key, kind, trust, channel,
+    # sha256, chars); the full text lives in the executor's context ledger.
+    context_delivery: list[dict[str, Any]] = Field(default_factory=list)
     native_turn_id: str = ""
     # Planning mode this turn was sent with; retry/edit-resend replay it.
     interaction_mode: InteractionMode = "default"
@@ -344,7 +347,7 @@ class ThreadState(ContractModel):
     usage: dict[str, Any] = Field(default_factory=dict)
     # C27: latest known context-window fuel gauge.
     # shape: {total, limit, zones, compacted, compact_status, updated_at, source}
-    # limit=None means unknown; compact_status: idle|running|done|failed
+    # limit=None means unknown; compact_status: idle|running|done|failed|interrupted
     context_window: Optional[dict[str, Any]] = None
     last_error: dict[str, Any] = Field(default_factory=dict)
     last_message_preview: str = ""

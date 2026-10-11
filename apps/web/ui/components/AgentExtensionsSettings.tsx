@@ -39,7 +39,7 @@ const MODES: { id: Mode; label: string; description: string }[] = [
 ];
 const ENGINES: Record<string, string> = {
   claude: "Claude", codex: "Codex", cursor: "Cursor", pi: "Pi",
-  omp: "OMP", kimi: "Kimi", grok: "Grok", opencode: "OpenCode", devin: "Devin",
+  omp: "OMP", kimi: "Kimi", grok: "Grok", opencode: "OpenCode", devin: "Devin", droid: "Droid",
 };
 
 class ExtensionRequestError extends Error {
@@ -200,7 +200,16 @@ export function AgentExtensionsSettings({navigation}: {navigation: SettingsNavig
   const activeCount = modeCount(mode);
   const browserVisible = mode === "pentest" && (filter === "all" || filter === "skill")
     && "agent-browser 浏览器 截图".toLowerCase().includes(query.trim().toLowerCase());
-  const nativeSkills = (catalog?.native_skills || []).filter((item) => filter !== "mcp" && filter !== "plugin" && item.name.toLowerCase().includes(query.toLowerCase()));
+  // The composer `$` menu collapses same-named skills from several roots; mirror
+  // that here so Settings and the menu list the same entries.
+  const nativeSkills = Array.from((catalog?.native_skills || [])
+    .filter((item) => filter !== "mcp" && filter !== "plugin" && item.name.toLowerCase().includes(query.toLowerCase()))
+    .reduce((groups, item) => {
+      const existing = groups.get(item.name);
+      if (!existing) groups.set(item.name, { ...item, sources: [item.source] });
+      else if (!existing.sources.includes(item.source)) existing.sources.push(item.source);
+      return groups;
+    }, new Map<string, Catalog["native_skills"][number] & { sources: string[] }>()).values());
   const nativeMcp = (catalog?.native_mcp || []).filter((item) => filter !== "skill" && filter !== "plugin" && item.name.toLowerCase().includes(query.toLowerCase()));
 
   return <div className="agent-extensions cx-root" data-testid="agent-extensions-settings">
@@ -302,9 +311,13 @@ export function AgentExtensionsSettings({navigation}: {navigation: SettingsNavig
     </section> : <section className="ae-native" aria-label="服务宿主 Agent 能力">
       {catalog?.host_discovery_enabled === false ? <p role="status">当前服务已禁用宿主能力发现；这不表示 Agent 未登录。</p> : null}
       <p>这里仅展示 {ENGINES[engine]} 的服务宿主配置。Worker 使用 Muteki 安装并明确启用的包；本机 Agent 的私有目录不会直接挂载进任务容器。</p>
-      {[...nativeSkills.map((item) => ({ key: item.id, name: item.name, info: `${item.source} · Skill`, description: item.description })),
-        ...nativeMcp.map((item) => ({ key: item.name, name: item.name, info: `${item.source} · MCP · ${item.enabled ? "已配置" : "已停用"}`, description: "" }))]
-        .map((item) => <div className="ae-native-row" key={item.key}><strong>{item.name}</strong><span>{item.info}</span>{item.description && <p>{item.description}</p>}</div>)}
+      {nativeSkills.length > 0 && <h3 className="ae-native-group">Skill · {nativeSkills.length}</h3>}
+      {nativeSkills.map((item) => <div className="ae-native-row" key={`skill:${item.name}`}><strong>{item.name}</strong>
+        <span>{item.sources.join(" · ")}</span>{item.description && <p>{item.description}</p>}</div>)}
+      {nativeMcp.length > 0 && <h3 className="ae-native-group">MCP · {nativeMcp.length}</h3>}
+      {nativeMcp.length > 0 && <p>来自 {ENGINES[engine]} 配置文件；会话中的实际连接状态见聊天输入框的 @ 菜单。</p>}
+      {nativeMcp.map((item) => <div className="ae-native-row" key={`mcp:${item.name}`}><strong>{item.name}</strong>
+        <span>{item.source} · {item.transport} · {item.enabled ? "已配置" : "已停用"}</span></div>)}
       {!nativeSkills.length && !nativeMcp.length && <div className="ae-empty">没有发现匹配的服务宿主能力</div>}
     </section>}
 

@@ -1,18 +1,22 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
   rethrowNetworkLoadFailure,
   threadLoadFailureMessage,
   throwThreadLoadFailure,
 } from "@/lib/threadLoadFailure";
 import {
-  acceptConversationStreamEvent,
+  acceptConversationStreamEvents,
+  CONVERSATION_STREAM_WINDOW,
   emptyConversationStreamState,
+  type ConversationLiveTextRun,
+  type ConversationStreamState,
 } from "./conversationStreamReducer";
 import {
   acceptConversationInboxEvent,
   emptyConversationInboxState,
+  reconcileConversationThreads,
   upsertConversationThread,
 } from "./conversationInbox";
 import { countThreadAttention } from "./threadAttention";
@@ -158,8 +162,30 @@ export interface ConversationTurn {
   retry_of_turn_id?: string | null;
   error?: Record<string, unknown>;
   usage?: Record<string, unknown>;
+  /** Context parts sent beside the user's text (no part texts; see fetchTurnContext). */
+  context_delivery?: TurnContextPart[];
   created_at?: string;
   completed_at?: string;
+}
+
+export interface TurnContextPart {
+  key: string;
+  kind: string;
+  trust: "application" | "untrusted" | string;
+  /** "session" parts are host rules; "turn" parts belong to this message. */
+  scope: "session" | "turn" | string;
+  channel: string;
+  sha256: string;
+  chars: number;
+  text?: string;
+}
+
+export interface TurnContextLedger {
+  thread_id: string;
+  turn_id: string;
+  adapter_id?: string;
+  user_text: string;
+  parts: TurnContextPart[];
 }
 
 export interface ConversationQueueItem {
@@ -322,15 +348,20 @@ export interface ContextWindowState {
   limit: number | null;
   /** Breakdown zones: [{label, tokens}] */
   zones: Array<{ label: string; tokens: number }>;
-  /** Compaction records: [{summary, tokens_before, tokens_after, occurred_at}] */
+  /** Compaction records folded from ``core.context.compaction``. */
   compacted: Array<{
+    turn_id?: string;
+    status?: "completed" | "failed" | "interrupted";
+    trigger?: "manual" | "auto";
+    /** False: the engine gave no compaction signal; only the turn ended. */
+    confirmed?: boolean;
     summary?: string;
+    message?: string;
     tokens_before?: number;
     tokens_after?: number;
     occurred_at?: string;
   }>;
-  /** idle | running | done | failed */
-  compact_status: "idle" | "running" | "done" | "failed";
+  compact_status: "idle" | "running" | "done" | "failed" | "interrupted";
   /** ISO timestamp of last update. */
   updated_at?: string;
   /** Event source tag: usage_event | event | manual_compact | … */
@@ -363,6 +394,7 @@ export interface ConversationView {
     /** Legacy fields are returned only for historical threads. */
     permission_mode?: string;
     sandbox_mode?: string;
+    updated_at?: string;
   };
   state: ConversationState;
   binding?: {
@@ -531,7 +563,8 @@ export interface ConversationCredential {
   connection?: string;
   provider?: string;
   base_url?: string;
-  present: boolean;
+  present: boolean | null;
+  detection_status?: "present" | "absent" | "unknown" | "disabled";
   status: string;
   status_detail?: string;
   discovery_code?: string;
@@ -550,6 +583,12 @@ export interface ConversationEvent {
   seq: number;
   occurred_at?: string;
   event_id?: string;
+}
+
+function carriesContextWindow(event: ConversationEvent): boolean {
+  if (event.event_type !== "core.usage.updated") return false;
+  const usage = event.payload?.usage as Record<string, unknown> | undefined;
+  return usage?.context_used != null || usage?.model_context_window != null;
 }
 
 export interface CommandReceiptView {
@@ -1219,6 +1258,19 @@ export async function fetchConversationSearch(
   return body;
 }
 
+export async function fetchTurnContext(threadId: string, turnId: string, signal?: AbortSignal): Promise<TurnContextLedger> {
+  const res = await apiFetch(
+    `/api/threads/${encodeURIComponent(threadId)}/turns/${encodeURIComponent(turnId)}/context`,
+    { signal },
+  );
+  if (!res.ok) throw new Error(`加载实际发送内容失败（HTTP ${res.status}）：${await res.text()}`);
+  const body = await res.json() as TurnContextLedger;
+  if (!body || body.turn_id !== turnId || !Array.isArray(body.parts)) {
+    throw new Error("加载实际发送内容失败：响应格式无效");
+  }
+  return body;
+}
+
 export async function fetchTurnProcess(
   threadId: string,
   turnId: string,
@@ -1408,7 +1460,7 @@ function normalizeCredential(
   const candidateModels = enrichModels(
     row.candidate_models ?? row.models ?? row.available_models,
   ).filter((item) => !verifiedIds.has(item.id));
-  const present = row.present !== false;
+  const present = row.present === null ? null : row.present !== false;
   const statusDetail = String(row.status_detail ?? "").trim();
   return {
     id,
@@ -1434,7 +1486,9 @@ function normalizeCredential(
     provider: String(row.provider ?? ""),
     base_url: String(row.base_url ?? ""),
     present,
-    status: String(row.status ?? (present ? "ready" : "missing")),
+    status: String(row.status ?? (present === null ? "unknown" : present ? "ready" : "missing")),
+    ...(typeof row.detection_status === "string"
+      ? { detection_status: row.detection_status as ConversationCredential["detection_status"] } : {}),
     ...(statusDetail ? { status_detail: statusDetail } : {}),
     ...(typeof row.discovery_code === "string" ? { discovery_code: row.discovery_code } : {}),
     models,
@@ -1472,19 +1526,19 @@ export function allCredentialModels(
   return rows;
 }
 
-/** C27: Request native context compaction for the thread. */
-export async function triggerThreadCompact(threadId: string): Promise<{ status: string }> {
-  const res = await apiFetch(`/api/threads/${encodeURIComponent(threadId)}/compact`, {
-    method: "POST",
-  });
-  const body = await res.json().catch(() => ({} as Record<string, unknown>));
-  if (!res.ok) {
-    throw new Error(
-      (body.error as Record<string, unknown> | undefined)?.message as string
-      || `压缩请求失败（HTTP ${res.status}）`,
-    );
-  }
-  return body as { status: string };
+/**
+ * Native context compaction is the Runtime's own `/compact` command, queued
+ * as a normal turn so its lifecycle and result land in the timeline.
+ */
+export async function requestThreadCompact(threadId: string): Promise<CommandReceiptView> {
+  const commandId = `cmd_compact_${typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID() : `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`}`;
+  return sendConversationCommand(threadId, "conversation.turn.send", {
+    text: "/compact",
+    client_message_id: commandId,
+    attachments: [],
+    capability_refs: [],
+  }, { commandId, idempotencyKey: commandId });
 }
 
 /** Load the canonical credential projection (verified + candidate models). */
@@ -1886,6 +1940,25 @@ export async function createConversationThread(
   return receipt.aggregate.id;
 }
 
+/** Ask the backend to start an idle runtime process before the first message is sent. */
+export async function prewarmConversationRuntime(
+  input: { adapter_id: string; instance_id: string; credential_id: string; model: string; workspace_id: string },
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const res = await apiFetch("/api/conversation/runtime-prewarm", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+    signal,
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const error = (body as { error?: { code?: string; message?: string } }).error;
+    throw new Error(`${error?.code || `HTTP ${res.status}`}: ${error?.message || "Runtime 预启动失败"}`);
+  }
+  return Boolean((body as { started?: unknown }).started);
+}
+
 export async function sendConversationCommand(
   threadId: string,
   commandType: string,
@@ -2253,7 +2326,7 @@ export function useConversationThreads(options?: {
     try {
       const rows = await fetchConversationThreads();
       if (!isCurrent()) return;
-      setThreads(rows);
+      setThreads((current) => reconcileConversationThreads(current, rows));
       setError("");
     } catch (exc) {
       if (!isCurrent()) return;
@@ -2366,7 +2439,8 @@ export function useConversationThreads(options?: {
           if (epoch === streamRef.current.brokerEpoch && inboxSeq < streamRef.current.appliedSeq) return;
           inboxRevisionRef.current += 1;
           if (Array.isArray(payload.threads)) {
-            setThreads(payload.threads);
+            const snapshotThreads = payload.threads;
+            setThreads((current) => reconcileConversationThreads(current, snapshotThreads));
             setLoading(false);
             setError("");
           }
@@ -2463,11 +2537,119 @@ export function useConversationThreads(options?: {
   };
 }
 
+// Admitted stream state of recently viewed threads. Returning to a thread
+// resumes from its applied seq instead of replaying (and re-animating) the
+// whole live window, and the timeline can render the cached process at once.
+const STREAM_CACHE_LIMIT = 8;
+const streamCache = new Map<string, ConversationStreamState>();
+
+function streamCacheKey(threadId: string): string {
+  return [conversationStorageScope(), currentAuthScope(), currentServiceOrigin(), API, threadId].join("\u0000");
+}
+
+function takeCachedStream(key: string): ConversationStreamState | null {
+  const cached = streamCache.get(key);
+  if (!cached) return null;
+  streamCache.delete(key);
+  return cached;
+}
+
+function cacheStream(key: string, state: ConversationStreamState): void {
+  streamCache.delete(key);
+  if (state.appliedSeq <= 0) return;
+  streamCache.set(key, state);
+  while (streamCache.size > STREAM_CACHE_LIMIT) {
+    const oldest = streamCache.keys().next().value;
+    if (oldest === undefined) break;
+    streamCache.delete(oldest);
+  }
+}
+
+// Stream text/process repaints above this rate cost a full shell render each
+// without visibly smoother output.
+const STREAM_PUBLISH_INTERVAL_MS = 50;
+const REFRESH_DEBOUNCE_MS = 100;
+const REFRESH_MAX_WAIT_MS = 1000;
+const NO_EVENTS: ConversationEvent[] = [];
+const NO_LIVE_TEXT_RUNS: ConversationLiveTextRun[] = [];
+
+export interface ConversationStreamSnapshot {
+  /** Thread whose stream produced this snapshot ("" when none). */
+  threadId: string;
+  events: ConversationEvent[];
+  liveText: string;
+  liveTextRuns: ConversationLiveTextRun[];
+}
+
+/**
+ * Live stream state lives outside React state so only the components that
+ * render events subscribe to it; the rest of the shell does not re-render on
+ * every streamed delta.
+ */
+export interface ConversationStreamStore {
+  subscribe(listener: () => void): () => void;
+  getSnapshot(): ConversationStreamSnapshot;
+}
+
+const EMPTY_STREAM_SNAPSHOT: ConversationStreamSnapshot = {
+  threadId: "",
+  events: NO_EVENTS,
+  liveText: "",
+  liveTextRuns: NO_LIVE_TEXT_RUNS,
+};
+
+function createConversationStreamStore() {
+  let snapshot = EMPTY_STREAM_SNAPSHOT;
+  const listeners = new Set<() => void>();
+  return {
+    subscribe(listener: () => void) {
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    },
+    getSnapshot: () => snapshot,
+    publish(next: ConversationStreamSnapshot) {
+      if (
+        next.threadId === snapshot.threadId
+        && next.events === snapshot.events
+        && next.liveText === snapshot.liveText
+        && next.liveTextRuns === snapshot.liveTextRuns
+      ) return;
+      snapshot = next;
+      for (const listener of [...listeners]) listener();
+    },
+  };
+}
+
+/**
+ * Subscribe to the live stream. While the previous thread's view is still
+ * mounted during a switch, the next thread's (possibly restored) stream is
+ * withheld so it is never folded against a foreign view.
+ */
+export function useConversationStream(
+  store: ConversationStreamStore,
+  viewThreadId: string | null | undefined,
+): ConversationStreamSnapshot {
+  const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+  if (viewThreadId && snapshot.threadId !== viewThreadId) return EMPTY_STREAM_SNAPSHOT;
+  return snapshot;
+}
+
+/** Subscribe to one derived primitive; re-renders only when it changes. */
+export function useConversationStreamSelector<T>(
+  store: ConversationStreamStore,
+  viewThreadId: string | null | undefined,
+  select: (snapshot: ConversationStreamSnapshot) => T,
+): T {
+  const read = () => {
+    const snapshot = store.getSnapshot();
+    return select(viewThreadId && snapshot.threadId !== viewThreadId ? EMPTY_STREAM_SNAPSHOT : snapshot);
+  };
+  return useSyncExternalStore(store.subscribe, read, read);
+}
+
 export function useConversation(threadId: string) {
   const [view, setView] = useState<ConversationView | null>(null);
-  const [events, setEvents] = useState<ConversationEvent[]>([]);
-  const [liveText, setLiveText] = useState("");
-  const [liveTextRuns, setLiveTextRuns] = useState<import("./conversationStreamReducer").ConversationLiveTextRun[]>([]);
+  const [streamStore] = useState(createConversationStreamStore);
   const [connected, setConnected] = useState(false);
   const [streamStatus, setStreamStatus] = useState<ConversationStreamStatus>(
     threadId ? "connecting" : "idle",
@@ -2763,9 +2945,14 @@ export function useConversation(threadId: string) {
     setAuditLanding(null);
     setLoadingOlder(false);
     setView((current) => (threadId ? current : null));
-    setEvents([]);
-    setLiveText("");
-    setLiveTextRuns([]);
+    const cacheKey = threadId ? streamCacheKey(threadId) : "";
+    const cachedStream = cacheKey ? takeCachedStream(cacheKey) : null;
+    streamStore.publish({
+      threadId,
+      events: (cachedStream?.events as ConversationEvent[] | undefined) ?? NO_EVENTS,
+      liveText: cachedStream?.liveText ?? "",
+      liveTextRuns: cachedStream?.liveTextRuns ?? NO_LIVE_TEXT_RUNS,
+    });
     setConnected(false);
     setStreamStatus(threadId ? "connecting" : "idle");
     setError("");
@@ -2778,32 +2965,93 @@ export function useConversation(threadId: string) {
     let reconnectDelay = 500;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let connectionVersion = 0;
-    const streamRef = { current: emptyConversationStreamState() };
+    const streamRef = { current: cachedStream ?? emptyConversationStreamState() };
+    // Events at or below the latest snapshot's event watermark are already
+    // reflected in that snapshot, so replaying them must not refetch the view.
+    let snapshotEventWatermark = 0;
+    let pendingEvents: ConversationEvent[] = [];
     let publishFrame: number | null = null;
+    let publishTimer: ReturnType<typeof setTimeout> | null = null;
+    let lastPublishAt = 0;
+    let refreshInFlight = false;
+    let refreshQueued = false;
+    let refreshRequestedAt = 0;
 
     const isCurrentThread = () => (
       !cancelled && activeThreadIdRef.current === threadId
     );
 
-    // streamRef stays authoritative on every event; React only needs the latest
-    // snapshot once per frame, so a burst of text deltas costs one render.
-    const flushStream = () => {
-      publishFrame = null;
-      if (!isCurrentThread()) return;
-      const next = streamRef.current;
-      setEvents(next.events as ConversationEvent[]);
-      setLiveText(next.liveText);
-      setLiveTextRuns(next.liveTextRuns);
-    };
-    const publishStream = (next: ReturnType<typeof emptyConversationStreamState>) => {
-      streamRef.current = next;
-      // Hidden tabs do not run animation frames, but their state must still advance.
-      if (document.hidden) {
-        if (publishFrame !== null) cancelAnimationFrame(publishFrame);
-        flushStream();
+    const runRefresh = () => {
+      refreshTimer.current = null;
+      refreshRequestedAt = 0;
+      if (cancelled) return;
+      if (refreshInFlight) {
+        refreshQueued = true;
         return;
       }
-      if (publishFrame === null) publishFrame = requestAnimationFrame(flushStream);
+      refreshInFlight = true;
+      void refresh().finally(() => {
+        refreshInFlight = false;
+        if (refreshQueued && !cancelled) {
+          refreshQueued = false;
+          scheduleRefresh();
+        }
+      });
+    };
+    // Debounced with a max wait: a steady trickle of state events must still
+    // refresh the view, and overlapping refreshes would discard each other.
+    function scheduleRefresh() {
+      const now = Date.now();
+      if (!refreshRequestedAt) refreshRequestedAt = now;
+      if (refreshTimer.current) clearTimeout(refreshTimer.current);
+      const wait = Math.max(0, Math.min(REFRESH_DEBOUNCE_MS, refreshRequestedAt + REFRESH_MAX_WAIT_MS - now));
+      refreshTimer.current = setTimeout(runRefresh, wait);
+    }
+
+    // streamRef stays authoritative; events queue until the next publish so a
+    // burst (or a reconnect replay) is admitted and rendered as one batch.
+    const flushStream = () => {
+      publishFrame = null;
+      publishTimer = null;
+      if (!isCurrentThread()) return;
+      const batch = pendingEvents;
+      pendingEvents = [];
+      if (!batch.length) return;
+      lastPublishAt = performance.now();
+      const result = acceptConversationStreamEvents(streamRef.current, batch);
+      if (!result.acceptedCount) return;
+      streamRef.current = result.state;
+      streamStore.publish({
+        threadId,
+        events: result.state.events as ConversationEvent[],
+        liveText: result.state.liveText,
+        liveTextRuns: result.state.liveTextRuns,
+      });
+      if (
+        result.refreshEvents.some((event) => (Number(event.seq) || 0) > snapshotEventWatermark)
+        // Usage is transient for the timeline, but a context-window report
+        // moves the projected gauge while the turn is still running.
+        || batch.some((event) => (Number(event.seq) || 0) > snapshotEventWatermark && carriesContextWindow(event))
+      ) {
+        scheduleRefresh();
+      }
+    };
+    const requestFlushFrame = () => {
+      publishTimer = null;
+      // Hidden tabs do not run animation frames, but their state must still advance.
+      if (document.hidden) flushStream();
+      else publishFrame = requestAnimationFrame(flushStream);
+    };
+    const queueStreamEvent = (event: ConversationEvent) => {
+      pendingEvents.push(event);
+      if (document.hidden && publishFrame !== null) {
+        cancelAnimationFrame(publishFrame);
+        publishFrame = null;
+      }
+      if (publishFrame !== null || publishTimer !== null) return;
+      const wait = document.hidden ? 0 : STREAM_PUBLISH_INTERVAL_MS - (performance.now() - lastPublishAt);
+      if (wait > 0 || document.hidden) publishTimer = setTimeout(requestFlushFrame, Math.max(0, wait));
+      else publishFrame = requestAnimationFrame(flushStream);
     };
 
     const mintTicket = async (): Promise<
@@ -2839,10 +3087,15 @@ export function useConversation(threadId: string) {
 
       // snapshot keeps the Thread view fresh; after=appliedSeq skips already
       // admitted events so reconnect cannot replay deltas into liveText.
+      // A fresh subscription only needs the live window (plus the running
+      // turn), not every event the thread ever produced.
       const query = new URLSearchParams({ snapshot: "true", browser_host: browserControlHost() });
-      if (streamRef.current.appliedSeq > 0) {
-        query.set("after", String(streamRef.current.appliedSeq));
-      }
+      const resumeAfter = pendingEvents.reduce(
+        (max, event) => Math.max(max, Number(event.seq) || 0),
+        streamRef.current.appliedSeq,
+      );
+      if (resumeAfter > 0) query.set("after", String(resumeAfter));
+      else query.set("tail", String(CONVERSATION_STREAM_WINDOW));
       if (ticket) query.set("ticket", ticket);
 
       const nextEs = new EventSource(
@@ -2877,6 +3130,7 @@ export function useConversation(threadId: string) {
         if (!isCurrentThread() || es !== nextEs) return;
         try {
           const snapshot = JSON.parse((raw as MessageEvent).data) as ConversationView;
+          snapshotEventWatermark = Math.max(snapshotEventWatermark, Number(snapshot.event_watermark) || 0);
           setView((previous) => consumePendingAround(
             mergeConversationView(previous, snapshot),
           ));
@@ -2888,16 +3142,7 @@ export function useConversation(threadId: string) {
       nextEs.addEventListener("event", (raw) => {
         if (!isCurrentThread() || es !== nextEs) return;
         try {
-          const event = JSON.parse(
-            (raw as MessageEvent).data,
-          ) as ConversationEvent;
-          const result = acceptConversationStreamEvent(streamRef.current, event);
-          if (!result.accepted) return;
-          publishStream(result.state);
-          if (result.scheduleRefresh) {
-            if (refreshTimer.current) clearTimeout(refreshTimer.current);
-            refreshTimer.current = setTimeout(() => void refresh(), 100);
-          }
+          queueStreamEvent(JSON.parse((raw as MessageEvent).data) as ConversationEvent);
         } catch {
           setError("对话事件无法解析");
         }
@@ -2915,16 +3160,26 @@ export function useConversation(threadId: string) {
       if (reconnectTimer !== null) clearTimeout(reconnectTimer);
       if (publishFrame !== null) cancelAnimationFrame(publishFrame);
       publishFrame = null;
+      if (publishTimer !== null) clearTimeout(publishTimer);
+      publishTimer = null;
       es?.close();
       es = null;
       if (refreshTimer.current) clearTimeout(refreshTimer.current);
+      refreshTimer.current = null;
       olderAbortRef.current?.abort();
       olderAbortRef.current = null;
+      cacheStream(
+        cacheKey,
+        pendingEvents.length
+          ? acceptConversationStreamEvents(streamRef.current, pendingEvents).state
+          : streamRef.current,
+      );
+      pendingEvents = [];
       // Drop in-flight stream so a late ticket/open cannot publish into the
       // next thread's React state after this effect is replaced.
       streamRef.current = emptyConversationStreamState();
     };
-  }, [refresh, threadId]);
+  }, [refresh, streamStore, threadId]);
 
   const jumpToLatestMessages = useCallback(async () => {
     if (!threadId) return false;
@@ -3152,9 +3407,7 @@ export function useConversation(threadId: string) {
 
   return {
     view,
-    events,
-    liveText,
-    liveTextRuns,
+    stream: streamStore as ConversationStreamStore,
     connected,
     streamStatus,
     loading,

@@ -5,6 +5,7 @@ import { AnimatePresence, motion } from "motion/react";
 import { cn } from "@/lib/cn";
 import { Icon } from "@/components/Icon";
 import { SPRING_LAYOUT, Tooltip, useReducedMotion } from "@/components/chat/ui";
+import { ImageLightbox } from "@/components/chat/media/ImageViewer";
 import type { ComposerCapabilityRef } from "@/lib/composerCapabilities";
 import { composerAttachmentRecoveryAction } from "@/lib/composerAttachmentRecovery";
 import { isComposerImageAttachment } from "@/lib/composerAttachments";
@@ -61,6 +62,7 @@ function ImageThumb({
   onRetry?: () => void;
 }) {
   const src = useObjectUrl(attachment.file);
+  const [previewOpen, setPreviewOpen] = useState(false);
   const recovery = composerAttachmentRecoveryAction(attachment);
   const uploading = attachment.uploadStatus === "uploading";
   const failed = attachment.uploadStatus === "error";
@@ -74,50 +76,61 @@ function ImageThumb({
         : [attachment.name, formatBytes(attachment.size)].filter(Boolean).join(" · ");
 
   return (
-    <Tooltip content={hint}>
-      <div
-        className={cn(
-          "group relative size-14 shrink-0 rounded-lg bg-cx-sunken",
-          "shadow-[0_0_0_1px_var(--cx-border)]",
-          needsPick && "shadow-[0_0_0_1.5px_var(--cx-warning)]",
-          failed && !needsPick && "shadow-[0_0_0_1.5px_var(--cx-danger)]",
-        )}
-        data-attachment-kind="image"
-        data-upload-status={attachment.uploadStatus || "done"}
-      >
-        <div className="size-full overflow-hidden rounded-lg">
-          {src ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img src={src} alt={attachment.name} draggable={false} className="size-full object-cover" />
-          ) : (
-            <div className="grid size-full place-items-center text-cx-fg-4">
-              <Icon name="image" size={18} />
-            </div>
+    <>
+      <Tooltip content={hint}>
+        <div
+          className={cn(
+            "group relative size-14 shrink-0 rounded-lg bg-cx-sunken",
+            "shadow-[0_0_0_1px_var(--cx-border)]",
+            needsPick && "shadow-[0_0_0_1.5px_var(--cx-warning)]",
+            failed && !needsPick && "shadow-[0_0_0_1.5px_var(--cx-danger)]",
           )}
-        </div>
-        {uploading ? (
-          <div className="absolute inset-0 grid place-items-center rounded-lg bg-[color-mix(in_srgb,black_38%,transparent)] text-white">
-            <ProgressRing value={uploadProgress(attachment)} size={22} stroke={2.25} trackOpacity={0.3} label="正在上传" />
-          </div>
-        ) : null}
-        {(needsPick || (recovery === "retry" && failed)) && onRetry ? (
+          data-attachment-kind="image"
+          data-upload-status={attachment.uploadStatus || "done"}
+        >
           <button
             type="button"
-            aria-label={needsPick ? `重新选择 ${attachment.name}` : `重试上传 ${attachment.name}`}
-            onClick={onRetry}
-            className={cn(
-              "absolute inset-0 grid place-items-center rounded-lg text-white transition-colors",
-              needsPick
-                ? "bg-[color-mix(in_srgb,var(--amber)_58%,transparent)] hover:bg-[color-mix(in_srgb,var(--amber)_70%,transparent)]"
-                : "bg-[color-mix(in_srgb,var(--red)_55%,transparent)] hover:bg-[color-mix(in_srgb,var(--red)_68%,transparent)]",
-            )}
+            aria-label={`预览 ${attachment.name}`}
+            disabled={!src}
+            onClick={() => setPreviewOpen(true)}
+            className="block size-full cursor-zoom-in overflow-hidden rounded-lg focus-visible:outline focus-visible:outline-2 focus-visible:outline-cx-accent disabled:cursor-default"
           >
-            <Icon name="retry" size={16} />
+            {src ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={src} alt={attachment.name} draggable={false} className="size-full object-cover" />
+            ) : (
+              <div className="grid size-full place-items-center text-cx-fg-4">
+                <Icon name="image" size={18} />
+              </div>
+            )}
           </button>
-        ) : null}
-        {onRemove ? <RemoveButton name={attachment.name} onRemove={onRemove} /> : null}
-      </div>
-    </Tooltip>
+          {uploading ? (
+            <div className="pointer-events-none absolute inset-0 grid place-items-center rounded-lg bg-[color-mix(in_srgb,black_38%,transparent)] text-white">
+              <ProgressRing value={uploadProgress(attachment)} size={22} stroke={2.25} trackOpacity={0.3} label="正在上传" />
+            </div>
+          ) : null}
+          {(needsPick || (recovery === "retry" && failed)) && onRetry ? (
+            <button
+              type="button"
+              aria-label={needsPick ? `重新选择 ${attachment.name}` : `重试上传 ${attachment.name}`}
+              onClick={onRetry}
+              className={cn(
+                "absolute inset-0 grid place-items-center rounded-lg text-white transition-colors",
+                needsPick
+                  ? "bg-[color-mix(in_srgb,var(--amber)_58%,transparent)] hover:bg-[color-mix(in_srgb,var(--amber)_70%,transparent)]"
+                  : "bg-[color-mix(in_srgb,var(--red)_55%,transparent)] hover:bg-[color-mix(in_srgb,var(--red)_68%,transparent)]",
+              )}
+            >
+              <Icon name="retry" size={16} />
+            </button>
+          ) : null}
+          {onRemove ? <RemoveButton name={attachment.name} onRemove={onRemove} /> : null}
+        </div>
+      </Tooltip>
+      {src ? (
+        <ImageLightbox images={[{ src, name: attachment.name }]} index={0} open={previewOpen} onOpenChange={setPreviewOpen} />
+      ) : null}
+    </>
   );
 }
 
@@ -203,6 +216,7 @@ function FileCard({
 
 export function CapabilityRefPill({
   kind,
+  refId,
   label,
   status,
   title,
@@ -210,6 +224,7 @@ export function CapabilityRefPill({
   removeLabel,
 }: {
   kind: string;
+  refId?: string;
   label: string;
   status?: string;
   title?: string;
@@ -230,7 +245,7 @@ export function CapabilityRefPill({
         tone === "missing" && "bg-cx-danger-soft text-cx-danger",
       )}
     >
-      <Icon name={capabilityIcon(kind)} size={12} className="shrink-0" />
+      <Icon name={capabilityIcon(kind, refId)} size={12} className="shrink-0" />
       <span className="min-w-0 truncate">{label}</span>
       {badge ? <span className="shrink-0 text-[12px] font-normal opacity-85">{badge}</span> : null}
       {onRemove ? (
@@ -326,6 +341,7 @@ export function AttachmentTray({
             <CapabilityRefPill
               key={ref.node_id || ref.id}
               kind={String(ref.kind)}
+              refId={ref.id}
               label={ref.kind === "skill" ? `$${ref.name}` : `@${ref.name}`}
               status={ref.status}
               title={`${ref.source} · ${ref.status_reason || ref.description || ref.snapshot?.text || ""}`}

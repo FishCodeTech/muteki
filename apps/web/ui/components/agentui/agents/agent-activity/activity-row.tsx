@@ -121,7 +121,6 @@ function SearchRow({ item }: { item: AgentActivitySearch }) {
     : {
         opacity: { duration: 0.18, ease: EASE_OUT },
         y: SPRING_LAYOUT,
-        layout: SPRING_LAYOUT,
       };
 
   return (
@@ -135,7 +134,6 @@ function SearchRow({ item }: { item: AgentActivitySearch }) {
           <AnimatePresence initial mode="popLayout">
             {item.results.map((result) => (
               <motion.div
-                layout="position"
                 key={result.id}
                 initial={enter}
                 animate={visible}

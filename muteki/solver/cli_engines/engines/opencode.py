@@ -60,7 +60,8 @@ class OpenCodeDriver(CliDriver):
         # mutating the operator's OpenCode configuration.
         return [
             "env", f"OPENCODE_CONFIG_CONTENT={self._config(web_access=web_access)}",
-            self.bin, "run", "--pure", "--format", "json",
+            # OpenCode 2 dropped --pure; passing it makes `run` print help and exit.
+            self.bin, "run", "--format", "json",
             *self._permission_flags(launch), prompt,
         ]
 
@@ -72,7 +73,7 @@ class OpenCodeDriver(CliDriver):
         del kb_access, stream
         return [
             "env", f"OPENCODE_CONFIG_CONTENT={self._config(web_access=web_access)}",
-            self.bin, "run", "--pure", "--format", "json",
+            self.bin, "run", "--format", "json",
             *self._permission_flags(launch),
             "--session", session, prompt,
         ]

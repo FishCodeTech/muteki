@@ -39,8 +39,8 @@ def codex_turn_input(
     """Codex ``UserInput[]`` for ``turn/start`` / ``turn/steer``.
 
     Images use ``localImage`` when a workspace path exists, otherwise an
-    inline ``image`` data URL. Non-image files remain workspace context in
-    ``text`` (already merged by the Conversation executor).
+    inline ``image`` data URL. Non-image files reach the model through the
+    turn's attachment manifest context part.
     """
     items: list[dict[str, Any]] = [{"type": "text", "text": text}]
     capability = runtime_capability or {}
@@ -79,9 +79,13 @@ def pi_prompt_images(
 def claude_user_content(
     text: str,
     attachments: Sequence[AttachmentRef] = (),
+    context_blocks: Sequence[dict[str, Any]] = (),
 ) -> list[dict[str, Any]]:
-    """Anthropic-style content blocks for Claude Agent SDK user messages."""
-    content: list[dict[str, Any]] = [{"type": "text", "text": text}]
+    """Anthropic-style content blocks for Claude Agent SDK user messages.
+
+    Context parts are their own text blocks before the user's unchanged text.
+    """
+    content: list[dict[str, Any]] = [*context_blocks, {"type": "text", "text": text}]
     for item in _native_images(attachments):
         content.append({
             "type": "image",
@@ -99,9 +103,10 @@ async def claude_query_prompt(
     attachments: Sequence[AttachmentRef] = (),
     *,
     session_id: str = "default",
+    context_blocks: Sequence[dict[str, Any]] = (),
 ) -> str | AsyncIterator[dict[str, Any]]:
-    """Return a string prompt, or a streaming multimodal user message."""
-    content = claude_user_content(text, attachments)
+    """Return a string prompt, or a streaming multi-block user message."""
+    content = claude_user_content(text, attachments, context_blocks)
     if len(content) == 1 and content[0].get("type") == "text":
         return text
 

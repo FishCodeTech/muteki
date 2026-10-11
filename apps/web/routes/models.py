@@ -26,6 +26,21 @@ from muteki.solver.credential_accounts import (
     system_credential_id,
 )
 
+
+def _model_test_backend(body: dict[str, Any], config: dict[str, Any]) -> str:
+    from apps.web.worker_config import resolve_worker_backend
+    from muteki.core.runtime_env import is_web_container
+
+    requested = body.get("backend")
+    if requested is not None and requested not in ("local", "container"):
+        raise HTTPException(status_code=400, detail="backend must be local or container")
+    return resolve_worker_backend(
+        request_backend=requested,
+        config_backend=config.get("worker_backend"),
+        in_web_container=is_web_container(),
+    )
+
+
 def register(app: FastAPI) -> None:
     h = app.state.route_helpers
     _primary_catalog_runtime_key = h._primary_catalog_runtime_key
@@ -128,18 +143,13 @@ def register(app: FastAPI) -> None:
     async def probe_worker_model(request: Request) -> Any:
         body = await _require_dict_body(request)
         _reject_temporarily_disabled_engine(body)
-        from apps.web.worker_config import backend_for_profile
         from apps.web.worker_models import WorkerModelTestStore, probe_worker_model
-        from muteki.core.runtime_env import is_web_container
 
         profile = body.get("profile")
         if not isinstance(profile, dict):
             raise HTTPException(status_code=400, detail="profile must be an object")
         cfg = app.state.manager.worker_config.get()
-        backend = backend_for_profile(
-            worker_backend=str(cfg.get("worker_backend") or ""),
-            in_web_container=is_web_container(),
-        )
+        backend = _model_test_backend(body, cfg)
         runtime = {"network": str(cfg.get("worker_network") or "bridge")}
         credential_id = str(profile.get("credential_id") or "").strip()
         accounts = CredentialAccountStore(account_store_root(app.state.manager.state_root))
@@ -205,21 +215,16 @@ def register(app: FastAPI) -> None:
     async def probe_worker_models_batch(request: Request) -> Any:
         body = await _require_dict_body(request)
         _reject_temporarily_disabled_engine(body)
-        from apps.web.worker_config import backend_for_profile
         from apps.web.worker_models import (
             WorkerModelTestStore,
             probe_worker_models_batch,
         )
-        from muteki.core.runtime_env import is_web_container
 
         items = body.get("items")
         if not isinstance(items, list):
             raise HTTPException(status_code=400, detail="items must be an array")
         cfg = app.state.manager.worker_config.get()
-        backend = backend_for_profile(
-            worker_backend=str(cfg.get("worker_backend") or ""),
-            in_web_container=is_web_container(),
-        )
+        backend = _model_test_backend(body, cfg)
         runtime = {"network": str(cfg.get("worker_network") or "bridge")}
         accounts = CredentialAccountStore(account_store_root(app.state.manager.state_root))
         revisions = {}

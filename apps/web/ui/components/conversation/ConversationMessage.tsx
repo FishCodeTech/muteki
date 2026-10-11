@@ -10,6 +10,7 @@ import { Icon, type IconName } from "../Icon";
 import { ContextNodeChip } from "./ComposerPromptDocument";
 import { normalizeContextNode, type ComposerContextNode } from "@/lib/composerContextDoc";
 import type { ResourceLinkTarget } from "@/lib/resourcePreview";
+import { MessageImages, isImageAttachment } from "@/components/chat/media/MessageImages";
 import {
   Message,
   MessageBubble,
@@ -48,6 +49,8 @@ export interface ConversationMessageProps {
   onRetry?: () => void;
   onFork?: () => void;
   onEdit?: () => void;
+  /** Open what Muteki sent beside this user message. */
+  onShowSentContext?: () => void;
   onRewind?: () => void;
   rewindDisabled?: boolean;
   rewindTitle?: string;
@@ -169,6 +172,7 @@ export function ConversationMessage({
   onRetry,
   onFork,
   onEdit,
+  onShowSentContext,
   onRewind,
   rewindDisabled = true,
   rewindTitle,
@@ -268,6 +272,9 @@ export function ConversationMessage({
 
   if (role === "user") {
     const time = formatMessageTime(createdAt);
+    const inlineImage = (attachment: MessageAttachmentChip) => Boolean(threadId && attachment.sha256 && isImageAttachment(attachment));
+    const imageAttachments = attachments.filter(inlineImage).map((attachment) => ({ sha256: attachment.sha256!, name: attachment.name }));
+    const fileAttachments = attachments.filter((attachment) => !inlineImage(attachment));
     return (
       <Message
         from="user"
@@ -277,9 +284,12 @@ export function ConversationMessage({
         data-message-id={messageId || undefined}
       >
         <MessageContent className="gap-1">
-          {attachments.length > 0 ? (
+          {imageAttachments.length > 0 ? (
+            <MessageImages threadId={threadId!} items={imageAttachments} className="max-w-[82%]" />
+          ) : null}
+          {fileAttachments.length > 0 ? (
             <div className="flex max-w-[82%] flex-wrap justify-end gap-1.5">
-              {attachments.map((attachment, index) => (
+              {fileAttachments.map((attachment, index) => (
                 <AttachmentChip
                   key={attachment.sha256 || `${attachment.name}-${index}`}
                   attachment={attachment}
@@ -323,6 +333,9 @@ export function ConversationMessage({
           {showActions && !superseded ? (
             <MessageActionBar align="end" meta={time || undefined} className="-mr-1">
               <CopyMessageButton text={text} label="复制消息" />
+              {onShowSentContext ? (
+                <MessageActionButton icon="eye" label="查看实际发送内容" onClick={onShowSentContext} testId="turn-sent-context" />
+              ) : null}
               {onEdit ? (
                 <MessageActionButton icon="edit" label="从此处编辑" onClick={onEdit} disabled={actionsDisabled} testId="c11-edit-user" />
               ) : null}

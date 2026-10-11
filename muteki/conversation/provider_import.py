@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from muteki.external_agents.context_delivery import is_context_block, visible_user_text
 from muteki.platform.contracts.base import utcnow, new_id
 
 _log = logging.getLogger(__name__)
@@ -188,6 +189,29 @@ def _records(path: Path):
                 yield obj
 
 
+def _visible_content(role: str, content: Any) -> Any:
+    """Content as the user wrote it; None when the message is Muteki-delivered context."""
+    if role in {"developer", "system"}:
+        return None
+    if role not in {"user", "human"}:
+        return content
+    if isinstance(content, str):
+        return visible_user_text(content) or None
+    if not isinstance(content, list):
+        return content
+    blocks = []
+    for block in content:
+        if is_context_block(block):
+            continue
+        if isinstance(block, dict) and block.get("type") in {"text", "input_text"}:
+            text = visible_user_text(str(block.get("text") or ""))
+            if not text:
+                continue
+            block = {**block, "text": text}
+        blocks.append(block)
+    return blocks or None
+
+
 def _parse_provider(path: Path, provider: str) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     response_messages: list[dict[str, Any]] = []
@@ -205,19 +229,22 @@ def _parse_provider(path: Path, provider: str) -> list[dict[str, Any]]:
                 response_messages.append({"role": "assistant", "content": [obj]})
                 continue
             role = str(obj.get("role") or "")
-            if role:
-                response_messages.append({"role": role, "content": obj.get("content", obj.get("text", ""))})
+            content = _visible_content(role, obj.get("content", obj.get("text", "")))
+            if role and content is not None:
+                response_messages.append({"role": role, "content": content})
             continue
         elif provider == "codex" and obj.get("type") == "event_msg" and isinstance(obj.get("payload"), dict):
             payload = obj["payload"]
             role = {"user_message": "user", "agent_message": "assistant"}.get(str(payload.get("type")))
-            if role:
-                event_messages.append({"role": role, "content": payload.get("message", "")})
+            content = _visible_content(role or "", payload.get("message", ""))
+            if role and content is not None:
+                event_messages.append({"role": role, "content": content})
             continue
         role = str(obj.get("role") or "")
-        if role:
+        content = _visible_content(role, obj.get("content", obj.get("text", "")))
+        if role and content is not None:
             messages.append({"role": "user" if role == "human" else role,
-                             "content": obj.get("content", obj.get("text", ""))})
+                             "content": content})
     # response_item is the canonical Codex conversation; event_msg mirrors it.
     # Older event-only rollouts remain readable without duplicating both formats.
     return messages + (response_messages if response_messages else event_messages)

@@ -65,6 +65,25 @@ DEFAULT_CLI_ADAPTER_BY_ENGINE: dict[str, str] = {
 DEFAULT_ADAPTER_BY_ENGINE = dict(DEFAULT_STRUCTURED_ADAPTER_BY_ENGINE)
 
 
+def builtin_structured_adapter_ids() -> tuple[str, ...]:
+    """Structured adapters registered and listed without a saved Runtime row.
+
+    A variant is built in when it honors at least one Conversation access
+    mode; variants that honor none (omp.rpc_v2) stay opt-in.
+    """
+    from .descriptors import all_descriptors
+
+    variants = tuple(
+        adapter.adapter_id
+        for descriptor in all_descriptors()
+        for adapter in descriptor.adapters
+        if adapter.role == "variant"
+        and adapter.capabilities.access_modes
+        and adapter.adapter_id in OPTIONAL_STRUCTURED_ADAPTER_ENGINES
+    )
+    return tuple(STRUCTURED_ADAPTER_ENGINES) + variants
+
+
 def canonical_adapter_id(adapter_id: str) -> str:
     """返回产品稳定 Adapter ID；bare engine 解析到 Conversation 默认 transport。"""
     value = str(adapter_id or "").strip()
@@ -491,7 +510,7 @@ class RuntimeAdapterFactory:
         for row in rows:
             self.register(registry, row)
         if include_structured_defaults:
-            for adapter_id in STRUCTURED_ADAPTER_ENGINES:
+            for adapter_id in builtin_structured_adapter_ids():
                 key = (adapter_id, "default")
                 if key not in configured_keys and registry.get(*key) is None:
                     self.register(registry, RuntimeAdapterConfig(adapter_id=adapter_id))
@@ -513,6 +532,7 @@ __all__ = [
     "RuntimeAdapterConfig",
     "RuntimeAdapterFactory",
     "STRUCTURED_ADAPTER_ENGINES",
+    "builtin_structured_adapter_ids",
     "canonical_adapter_id",
     "engine_for_adapter",
     "runtime_config_schema",

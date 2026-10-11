@@ -86,37 +86,22 @@ does not prove a document has closed; report those limits truthfully.
 """
 
 
-def chat_context(access_mode: str, *, gateway_available: bool = True) -> str:
+def chat_host_part() -> Optional["ContextPart"]:
+    """Host rule pointing at the gateway tools; usage lives in the tool descriptions.
+
+    Only the lazy tool-catalog hint stays here: a model that has not loaded
+    the tools cannot read their descriptions yet.
+    """
     from muteki.capability_management import enabled
-    if not enabled("mcp", "computer-use"):
-        return ""
-    status = server_status()
-    if not status["available"]:
-        return f"[Muteki 本机电脑操控不可用]\n{status['code']}: {status['message']}"
-    if not gateway_available:
-        return ("[Muteki 本机电脑操控不可用]\n"
-                "chat.computer.transport_unsupported: 当前 Agent 会话未接入 Muteki 工具网关；"
-                "不能使用本机电脑操控工具，也不要用其他入口绕过。")
-    return ("[Muteki 本机电脑操控]\n"
-            "本机 Mac 由 muteki-control 网关中的 chat_computer_js 和 "
-            "chat_computer_js_reset 操作。js 参数为 code、可选 timeout_ms、title；重置无参数。"
-            "若工具延迟加载，先通过工具发现搜索这些名字，不要凭已加载清单声称不可用。"
-            "不要调用原生 cua_repl 的 js/js_reset；它不属于当前 Muteki 聊天会话。"
-            "手动发图使用 await mutekiComputer.emitImage(bytes)，支持 Uint8Array/Buffer，"
-            "成功发出的图片在后续 JS 异常中仍保存为证据。nodeRepl.emitImage 本身由上游冻结，"
-            "直接调用它后再抛错仍可能丢图；emit:false 本身不会发图或缓存图片。"
-            "文本模型的图片仅保存 CAS，不发给模型，必要辅助功能树请另行读取。"
-            "长结果若返回 full_result_reference，正文尚未全部交付。只用 chat_computer_js 的 "
-            "read_result={ref,sha256,page} 从第 0 页读到 total_pages-1；第 0 页还取回原 CAS 图片，"
-            "这只是读取旧证据成功，不改变原执行错误。Droid 的短图片错误也带引用供取回原图。"
-            "按顺序拼接 data，"
-            "完整 UTF-8 字节数与 SHA-256 须匹配引用，再判断需要完整覆盖的结论。"
-            "read_result 与 code 互斥，只读取本聊天证据，不执行电脑动作。"
-            "绑定应用时优先使用实际应用清单中的 bundle ID。\n"
-            "同一台 Mac 在一轮电脑操作期间由当前聊天独占；若返回 chat.computer.busy，"
-            "等待占用聊天的回合结束后再试，不要改用其他入口绕过占用。\n"
-            f"当前权限模式：{access_mode}。用户已明确授权的动作继续执行，"
-            "不重复询问；超出授权范围时才澄清。完整授权与文本输入契约由工具首次调用文档提供。")
+    from muteki.platform.contracts.external_agents import ContextPart
+    if not enabled("mcp", "computer-use") or not server_status()["available"]:
+        return None
+    return ContextPart(
+        key="muteki.computer", kind="host_instructions", trust="application",
+        requires_gateway=True,
+        text=("本机 Mac 由 muteki-control 网关中的 chat_computer_js 和 chat_computer_js_reset 操作，"
+              "不要调用原生 cua_repl 的 js/js_reset。若工具延迟加载，先通过工具发现搜索这些名字，"
+              "不要凭已加载清单声称不可用。用法、授权和证据读取规则见这两个工具的描述。"))
 
 
 class ComputerControlError(Exception):
@@ -415,7 +400,12 @@ class ComputerControlBroker:
                     "that image. emit:false alone does not emit or capture. Text-only models keep "
                     "image CAS evidence without receiving pixels; read AX separately when needed. "
                     "After reset, a read-only JS check such as nodeRepl.write(typeof app) may run directly; "
-                    "the bundled first-entry API rule applies before UI operations, not this binding check.\n\n"
+                    "the bundled first-entry API rule applies before UI operations, not this binding check. "
+                    "When binding an app, prefer the bundle ID from the actual application list. "
+                    "One chat owns this Mac during a computer turn: on chat.computer.busy, wait for "
+                    "the owning chat's turn to finish and retry; do not bypass it through another "
+                    "entry point. Continue actions the user has explicitly authorized without asking "
+                    "again; ask only beyond that scope.\n\n"
                     + (tool.description or "")),
                  "input_schema": tool.inputSchema}
                 for tool in tools if tool.name in allowed and _visible(tool)]

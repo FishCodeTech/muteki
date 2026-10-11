@@ -196,7 +196,13 @@
 
 .cx-tabular { font-variant-numeric: tabular-nums; }
 
-/* Edge fades for scroll containers (driven by ScrollArea data attributes). */
+/* Edge fades for scroll containers (driven by ScrollArea data attributes).
+   Registered as non-inherited so toggling a fade restyles only the scroll
+   container, not every row inside it. */
+@property --cx-fade-top { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@property --cx-fade-bottom { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@property --cx-fade-left { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@property --cx-fade-right { syntax: "<length>"; inherits: false; initial-value: 0px; }
 .cx-fade-y {
   --cx-fade-top: 0px;
   --cx-fade-bottom: 0px;
@@ -307,7 +313,7 @@
   animation: cx-shimmer 2.4s linear infinite;
 }
 
-.cx-animate-in { animation: cx-fade-up 260ms var(--cx-ease-out) both; }
+.cx-animate-in { animation: cx-fade-up 260ms var(--cx-ease-out) backwards; }
 .cx-spin { animation: cx-spin 0.9s linear infinite; }
 .cx-pulse-dot { animation: cx-pulse-dot 1.4s ease-in-out infinite; }
 

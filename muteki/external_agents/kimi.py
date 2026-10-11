@@ -58,6 +58,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import socket
@@ -118,6 +119,7 @@ from .capabilities import (
     require_access_mode,
     _probe_version,
 )
+from .context_delivery import kimi_block_channel, kimi_context_blocks
 from .events import build_event
 from .probe_environment import subprocess_environment
 from .process_supervisor import SupervisedProcess, spawn_supervised
@@ -194,6 +196,8 @@ class KimiAcpAdapter(BaseAcpAdapter):
     """
 
     adapter_id = "kimi.acp"
+    # Kimi Code sends ``usage_update`` (used/size) after each turn.
+    context_usage_reported = True
     # supervised/auto/full-access select Kimi's default/auto/yolo modes;
     # auto-accept-edits keeps ``default`` and the shared ACP callback allows
     # the ``edit`` kind Kimi reports for Write/Edit.
@@ -212,6 +216,14 @@ class KimiAcpAdapter(BaseAcpAdapter):
     ) -> None:
         super().__init__(**kwargs)
         self._binary = binary or default_kimi_binary()
+
+    def _prompt_content(
+        self, sid: str, transport: Any, input: MessageInput,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        embedded = bool(getattr(getattr(transport, "hello", None), "embedded_context", False))
+        parts = self.turn_context(sid, input, channel=functools.partial(
+            kimi_block_channel, embedded_context=embedded))
+        return input.text, kimi_context_blocks(parts, embedded_context=embedded)
 
     def _agent_argv(self) -> list[str]:
         return [self._binary, "acp"]
@@ -436,6 +448,21 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
     """
 
     adapter_id = "kimi.local_server"
+    turn_context_channel = "text_blocks"
+
+    async def runtime_capability_snapshot(self, session=None):
+        snapshot = await super().runtime_capability_snapshot(session)
+        from .command_providers import operation_item
+        # Measured on kimi web: a prompt "/compact" reaches the model as text;
+        # the local server exposes no compaction endpoint.
+        compact = operation_item(self.id, "kimi", "compact", "", "压缩当前 Kimi 会话上下文").model_copy(update={
+            "id": f"unavailable:{self.id}:compact", "action": "inspect-runtime-capability",
+            "invocation": {}, "support_level": "unsupported", "invocable": False,
+            "reason": "Kimi 本地服务没有压缩接口，/compact 会被当作普通消息交给模型",
+            "alternative": "改用 Kimi ACP 接入（kimi.acp）执行原生 /compact",
+        })
+        return snapshot.model_copy(update={
+            "items": [*(item for item in snapshot.items if item.name != "compact"), compact]})
 
     def __init__(
         self,
@@ -700,6 +727,8 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
         caps.streaming = ws_available
         caps.tool_events = ws_available
         caps.usage_events = ws_available
+        # agent.status.updated carries contextTokens/maxContextTokens.
+        caps.context_usage = ws_available
         caps.approval = ws_available and any("approvals" in p for p in paths)
         prompt_fields = _openapi_request_properties(
             openapi, "/sessions/{session_id}/prompts") or set()
@@ -1059,6 +1088,22 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
             if isinstance(usage, dict) and usage:
                 sink.put_nowait((AgentEventType.USAGE_UPDATED,
                                  f"kimi.{ftype}", _kimi_usage_payload(usage)))
+        elif ftype == "agent.status.updated":
+            used, limit = data.get("contextTokens"), data.get("maxContextTokens")
+            snapshot = tuple(
+                value if isinstance(value, int) and not isinstance(value, bool)
+                and value >= 0 else None
+                for value in (used, limit))
+            # The status frame repeats on every step; report only changes.
+            if any(value is not None for value in snapshot) \
+                    and snapshot != handle.get("context_snapshot"):
+                handle["context_snapshot"] = snapshot
+                sink.put_nowait((AgentEventType.USAGE_UPDATED,
+                                 "kimi.agent.status.updated",
+                                 dump_payload(UsagePayload(
+                                     scope="context_only",
+                                     context_used_tokens=snapshot[0],
+                                     context_window=snapshot[1] or None))))
         # 其余事件（task.*/compaction.*/tool.call.delta/
         # agent.status.updated 等）不改变核心状态机。
 
@@ -1548,7 +1593,8 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
         async def run_prompt() -> Any:
             try:
                 body: dict[str, Any] = {
-                    "content": [{"type": "text", "text": input.text}],
+                    "content": [*kimi_context_blocks(self.turn_context(sid, input, channel=kimi_block_channel)),
+                                {"type": "text", "text": input.text}],
                 }
                 # 0.38.0 实测：session agent_config.model 经 REST 设置不生效，
                 # 模型须按 prompt 下发（POST /prompts 的 model 字段）。

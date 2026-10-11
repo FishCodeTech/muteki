@@ -1142,46 +1142,12 @@ class ConversationCommandHandler:
                         f"当前 {snapshot.adapter_id} Session 没有公布 {prefix}{name}",
                         ErrorCategory.VALIDATION,
                     )
-                if item is not None and item.kind == "operation" and item.resolution == "client":
-                    async def _runtime_operation() -> SideEffectResult:
-                        result = await executor.runtime_operation(
-                            thread.thread_id, item.name, arguments)
-                        return SideEffectResult(
-                            events=[ev.thread_event(
-                                thread.thread_id,
-                                ev.EV_RUNTIME_OPERATION_COMPLETED,
-                                {
-                                    "capability_id": item.id,
-                                    "name": item.name,
-                                    "result": result,
-                                },
-                                actor_id=command.actor.id,
-                                command_id=command.command_id,
-                                correlation_id=correlation_id_of(command),
-                            )],
-                            output={
-                                "runtime_operation": item.name,
-                                "result": result,
-                            },
-                        )
-
-                    return CommandPlan(
-                        events=[ev.thread_event(
-                            thread.thread_id,
-                            ev.EV_RUNTIME_OPERATION_REQUESTED,
-                            {
-                                "capability_id": item.id,
-                                "name": item.name,
-                                "arguments": arguments,
-                            },
-                            actor_id=command.actor.id,
-                            command_id=command.command_id,
-                            correlation_id=correlation_id_of(command),
-                            idempotency_key=command.idempotency_key,
-                        )],
-                        receipt=_receipt(
-                            command, ev.AGGREGATE_THREAD, thread.thread_id),
-                        side_effect=_runtime_operation,
+                if item is not None and not item.invocable:
+                    raise _failed(
+                        command,
+                        "conversation.command.not_invocable",
+                        item.reason or f"{prefix}{name} 当前不可执行",
+                        ErrorCategory.VALIDATION,
                     )
                 if item is not None:
                     runtime_invocation = item.model_dump(mode="json")

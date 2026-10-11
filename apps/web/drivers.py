@@ -624,7 +624,14 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         # 参数、只读配置覆盖或本地工具 allowlist。
         wc = mgr.worker_config.resolve(roster_category or None) if mgr is not None else {}
         runtime_policy = mgr.load_run_launch_limits(run.run_id) if mgr is not None else {}
-        engines = body.get("engines") or wc.get("engines") or ["cursor", "claude", "codex", "pi", "omp"]
+        if "engines" in body:
+            engines = body["engines"]
+        else:
+            engines = wc.get("engines") or []
+        if not isinstance(engines, (list, tuple)) or not engines:
+            raise ValueError(
+                "No Worker engines are configured. Add and enable a Worker before starting a run."
+            )
         worker_profiles = body.get("worker_profiles") or wc.get("worker_profiles") or []
         worker_network = str(
             body.get("worker_network") or wc.get("worker_network") or "bridge"

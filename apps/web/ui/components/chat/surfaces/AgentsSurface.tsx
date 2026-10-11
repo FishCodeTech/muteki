@@ -31,7 +31,7 @@ function agentTone(status: string): Tone {
 export function AgentsSurface({ view, events, tools, onOpenDetails }: SurfaceProps) {
   const { router } = useConversationNavigation();
   const tree = useMemo(() => buildConversationAgentTree(events, view), [events, view]);
-  const shellCount = tools.filter(isShellLikeTool).length;
+  const shellCount = useMemo(() => tools.filter(isShellLikeTool).length, [tools]);
 
   const messageForAgent = (agent: ConversationAgentNodeView) => {
     if (agent.messageId) return agent.messageId;

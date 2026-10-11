@@ -13,6 +13,7 @@ import { Button, IconButton, languageLabel } from "@/components/chat/ui";
 import { ChatMarkdown } from "@/components/chat/markdown/ChatMarkdown";
 import { CodeViewer, type LineRange } from "@/components/chat/preview/CodeViewer";
 import { languageFromPath } from "@/lib/chatHighlighter";
+import { ImageStageView, ZoomMenu, useImageLightbox, useImageStage } from "@/components/chat/media/ImageViewer";
 import {
   type PreviewKind,
   previewKindFromName,
@@ -182,24 +183,44 @@ function Placeholder({
   );
 }
 
-function ImagePreview({ src, name, onMeasure }: { src: string; name: string; onMeasure: (size: string) => void }) {
-  const [actual, setActual] = useState(false);
+function ImagePreview({
+  src,
+  name,
+  fill,
+  onMeasure,
+  renderToolbar,
+  onDownload,
+}: {
+  src: string;
+  name: string;
+  fill: boolean;
+  onMeasure: (size: string) => void;
+  renderToolbar: (extra: ReactNode) => ReactNode;
+  onDownload: (() => void) | null;
+}) {
+  const stage = useImageStage(src, 16);
+  const lightbox = useImageLightbox([{ src, name, onDownload }]);
+  const natural = stage.natural;
+  useEffect(() => {
+    onMeasure(natural ? `${natural.w} × ${natural.h}` : "");
+  }, [natural, onMeasure]);
   return (
-    <div className="cx-checker cx-scroll flex min-h-[240px] flex-1 overflow-auto" data-testid="typed-preview-image">
-      <div className={cn("m-auto p-6", actual ? "w-max" : "flex max-h-full max-w-full items-center justify-center")}>
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          src={src}
-          alt={name}
-          onLoad={(event) => onMeasure(`${event.currentTarget.naturalWidth} × ${event.currentTarget.naturalHeight}`)}
-          onClick={() => setActual((value) => !value)}
-          className={cn(
-            "rounded-md shadow-cx-md ring-1 ring-cx-border-subtle",
-            actual ? "max-w-none cursor-zoom-out" : "max-h-full max-w-full cursor-zoom-in object-contain",
-          )}
-        />
-      </div>
-    </div>
+    <>
+      {renderToolbar(
+        <>
+          <ZoomMenu stage={stage} className="h-6 text-[12px]" />
+          <IconButton size="xs" icon="maximize" label="全屏查看" data-testid="typed-preview-image-expand" onClick={() => lightbox.openAt(0)} />
+        </>,
+      )}
+      <ImageStageView
+        stage={stage}
+        src={src}
+        name={name}
+        className={cn("cx-checker", fill ? "flex-1" : "h-[min(70vh,560px)]")}
+        imageClassName="rounded-md shadow-cx-md ring-1 ring-cx-border-subtle"
+      />
+      {lightbox.element}
+    </>
   );
 }
 
@@ -240,6 +261,7 @@ export function TypedResourcePreview({
   const codeHeight = fill ? undefined : 560;
 
   const canDownload = Boolean(onDownload || downloadUrl);
+  const imageMode = kind === "image" && Boolean(objectUrl);
   const download = () => {
     if (onDownload) {
       onDownload();
@@ -256,7 +278,7 @@ export function TypedResourcePreview({
     typeof maxPreviewBytes === "number" && (kind === "too_large" || kind === "binary") ? `预览上限 ${(maxPreviewBytes / 1024).toFixed(0)} KB` : null,
   ].filter(Boolean);
 
-  const toolbar = (
+  const renderToolbar = (extra?: ReactNode) => (
     <div className="flex h-9 shrink-0 items-center gap-2 border-b border-cx-border-subtle pl-3 pr-1.5" data-testid="typed-preview-toolbar">
       <span className="flex min-w-0 flex-1 items-center gap-2 text-[12px]">
         <span className="inline-flex shrink-0 items-center gap-1.5 font-medium text-cx-fg-2">
@@ -270,6 +292,7 @@ export function TypedResourcePreview({
         {showSource ? (
           <IconButton size="xs" icon="wrapText" label={wrap ? "不换行" : "自动换行"} active={wrap} onClick={() => setWrap((value) => !value)} />
         ) : null}
+        {extra}
         {toolbarActions}
         {canDownload ? (
           <IconButton size="xs" icon="download" label="下载原文件" data-testid="typed-preview-download" onClick={download} />
@@ -306,8 +329,17 @@ export function TypedResourcePreview({
         testId="typed-preview-binary"
       />
     );
-  } else if (kind === "image" && objectUrl) {
-    body = <ImagePreview src={objectUrl} name={name} onMeasure={setImageSize} />;
+  } else if (imageMode && objectUrl) {
+    body = (
+      <ImagePreview
+        src={objectUrl}
+        name={name}
+        fill={fill}
+        onMeasure={setImageSize}
+        renderToolbar={renderToolbar}
+        onDownload={onDownload || (downloadUrl ? download : null)}
+      />
+    );
   } else if (kind === "pdf" && objectUrl) {
     body = (
       <iframe
@@ -372,8 +404,8 @@ export function TypedResourcePreview({
       data-testid={testId}
       data-preview-kind={kind}
     >
-      {toolbar}
-      <div className={cn("flex min-w-0 flex-col", fill && "min-h-0 flex-1")}>{body}</div>
+      {imageMode ? null : renderToolbar()}
+      <div className={cn("flex min-w-0 flex-col", (fill || imageMode) && "min-h-0 flex-1")}>{body}</div>
     </div>
   );
 }

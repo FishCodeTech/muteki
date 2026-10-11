@@ -115,7 +115,7 @@ RUN if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi 
       @anthropic-ai/claude-code@2.1.257 \
       @earendil-works/pi-coding-agent@0.84.1 \
       @moonshot-ai/kimi-code@0.40.1 \
-      opencode-ai@1.18.22
+      @opencode/cli@2.0.26
 
 # cursor-agent is NOT an npm package — installs via cursor.com/install into the kali
 # user's ~/.local/bin. Run as kali so it lands in kali's HOME (container_exec pins the

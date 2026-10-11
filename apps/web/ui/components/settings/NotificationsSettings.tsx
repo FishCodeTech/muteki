@@ -10,7 +10,7 @@ import { useLang } from '@/lib/i18n';
 import {
   defaultNotificationPrefs, readNotificationDelivery, readNotificationPermissionStatus, readNotificationPrefs,
   requestNotificationPermissionStatus, subscribeNotificationDelivery, subscribeNotificationPrefs, unlockNotificationAudio,
-  updateNotificationPrefs, type NotificationDeliveryDiagnostic, type NotificationMode, type NotificationPrefs,
+  sendTestNotification, updateNotificationPrefs, type NotificationDeliveryDiagnostic, type NotificationMode, type NotificationPrefs,
 } from '@/lib/threadNotifications';
 import { SettingsNote, SettingsRow, SettingsSection } from './primitives';
 
@@ -46,6 +46,8 @@ export function NotificationsSettings() {
   const [systemDiagnostic, setSystemDiagnostic] = useState<unknown>(null);
   const [permissionNote, setPermissionNote] = useState('');
   const [requesting, setRequesting] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [testFeedback, setTestFeedback] = useState<{ error: boolean; message: string } | null>(null);
   const [saveError, setSaveError] = useState('');
   const generation = useRef(0); const busy = useRef(false); const mounted = useRef(false);
 
@@ -53,7 +55,7 @@ export function NotificationsSettings() {
   useEffect(() => {
     mounted.current = true;
     const gen = generation;
-    busy.current = false; setRequesting(false); setPermission('default'); setPermissionNote('');
+    busy.current = false; setRequesting(false); setTesting(false); setTestFeedback(null); setPermission('default'); setPermissionNote('');
     const read = () => {
       if (busy.current) return;
       const id = ++gen.current;
@@ -95,6 +97,30 @@ export function NotificationsSettings() {
     }
   }, [native, scope, t]);
 
+  const testNotification = useCallback(async () => {
+    if (busy.current || !mounted.current || scope !== conversationStorageScope()) return;
+    busy.current = true; setTesting(true); setTestFeedback(null);
+    const id = ++generation.current, owner = scope;
+    const current = () => mounted.current && id === generation.current && owner === conversationStorageScope();
+    try {
+      const result = await sendTestNotification();
+      if (current()) {
+        if (result.permissionStatus) {
+          setPermission(result.permissionStatus.permission);
+          setSystemPermission(result.permissionStatus.systemPermission || 'unknown');
+          setSystemDiagnostic(result.permissionStatus.systemPermissionError || result.permissionStatus.systemNotificationSettings || null);
+        }
+        setTestFeedback({ error: false, message: result.host === 'desktop-client'
+          ? t('测试请求已提交，实际投递状态见“最近一次投递”。', 'Test requested. See Latest delivery for the delivery status.')
+          : t('测试通知已提交到浏览器，实际显示由系统决定。', 'Test notification submitted to the browser; the system controls its display.') });
+      }
+    } catch (error) {
+      if (current()) setTestFeedback({ error: true, message: error instanceof Error ? error.message : String(error) });
+    } finally {
+      if (current()) { busy.current = false; setTesting(false); }
+    }
+  }, [scope, t]);
+
   const permissionLabel = permission === 'granted' ? t('已允许', 'Allowed') : permission === 'denied' ? t('已拒绝', 'Denied')
     : permission === 'unsupported' ? t('不支持', 'Unsupported') : t('尚未授权', 'Not requested');
   const bridge = desktopChatBridge();
@@ -124,9 +150,12 @@ export function NotificationsSettings() {
       <SettingsRow title={t('工作台通知授权', 'Workspace permission')} description={`${permissionLabel} · ${native ? t('工作台授权与系统通知设置分别管理。', 'Workspace consent and system settings are separate.') : t('由浏览器管理，可随时在网站设置中更改。', 'Managed by the browser; change it any time in site settings.')}`}
         control={<div className="flex items-center gap-2">
           {native && bridge?.openPermissionSettings ? <Button variant="ghost" onClick={() => { const owner = scope; void bridge.openPermissionSettings?.('notifications').catch(error => { if (mounted.current && owner === conversationStorageScope()) setPermissionNote(error instanceof Error ? error.message : String(error)); }); }}>{t('系统设置', 'System settings')}</Button> : null}
-          <Button variant="secondary" loading={requesting} disabled={requesting || permission === 'unsupported' || (!native && permission === 'granted')} onClick={() => void requestPermission()}>{native && (permission === 'granted' || permission === 'denied') ? t('更改选择', 'Change choice') : t('允许通知', 'Allow')}</Button>
+          <Button variant="secondary" loading={requesting} disabled={requesting || testing || permission === 'unsupported' || (!native && permission === 'granted')} onClick={() => void requestPermission()}>{native && (permission === 'granted' || permission === 'denied') ? t('更改选择', 'Change choice') : t('允许通知', 'Allow')}</Button>
         </div>} />
       {native ? <SettingsRow title={t('系统通知权限', 'System notification permission')} description={systemPermission === 'granted' ? t('系统已允许', 'Allowed by the system') : systemPermission === 'denied' ? t('系统已拒绝，请在系统设置中更改', 'Denied by the system; change it in system settings') : systemPermission === 'default' ? t('系统尚未收到授权选择', 'No system authorization choice yet') : systemPermission === 'provisional' ? t('系统仅允许静默通知', 'Only quiet notifications are allowed') : systemPermission === 'ephemeral' ? t('系统临时允许通知', 'Notifications are temporarily allowed') : t('系统状态未知', 'System status unknown')} >{systemDiagnostic ? <details><summary>{t('系统诊断', 'System diagnostic')}</summary><pre className="whitespace-pre-wrap break-all">{JSON.stringify(systemDiagnostic, null, 2)}</pre></details> : null}</SettingsRow> : null}
+      <SettingsRow title={t('测试系统通知', 'Test system notifications')}
+        description={t('发送一条测试通知，不受提醒方式和静默时段影响。请先允许此工作台发送通知。', 'Send a test notification regardless of alert style or quiet hours. Allow workspace notifications first.')}
+        control={<Button variant="secondary" loading={testing} disabled={testing || requesting || permission !== 'granted'} onClick={() => void testNotification()}>{t('发送测试通知', 'Send test notification')}</Button>} />
       {native ? <SettingsRow title={t('最近一次投递', 'Latest delivery')} description={currentDelivery
         ? currentDelivery.code === 'desktop.notifications_system_denied' ? t('系统未允许通知，本次未投递', 'Denied by the system; not delivered') : currentDelivery.code === 'desktop.notifications_workspace_denied' ? t('当前工作台未允许通知', 'Not allowed by this workspace') : currentDelivery.code === 'desktop.notifications_unsupported' ? t('当前设备不支持通知', 'Notifications are unsupported') : currentDelivery.status === 'failed' && currentDelivery.shown ? t('系统已接收通知，后续操作失败', 'Accepted; a later step failed')
           : currentDelivery.status === 'closed' && !currentDelivery.shown ? t('通知已关闭，接收未确认', 'Closed; acceptance unconfirmed')
@@ -136,6 +165,7 @@ export function NotificationsSettings() {
       </SettingsRow> : null}
     </SettingsSection>
     {permissionNote ? <SettingsNote>{permissionNote}</SettingsNote> : null}
+    {testFeedback ? <SettingsNote tone={testFeedback.error ? 'danger' : 'neutral'}>{testFeedback.message}</SettingsNote> : null}
     {permission === 'denied' || prefs.mode === 'off' ? <SettingsNote>{t('不弹通知时，待办仍会出现在侧栏活动视图里。', 'Without notifications, items still appear in the sidebar activity view.')}</SettingsNote> : null}
 
     <SettingsSection anchor="notifications-quiet" title={t('静默时段', 'Quiet hours')}>

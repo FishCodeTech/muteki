@@ -12,15 +12,22 @@ export function messageDeepLink(messageId: string): string {
   return url.toString();
 }
 
+// toLocale*String with options builds a new Intl formatter per call, and every
+// visible message formats its time on each render.
+let timeFormat: Intl.DateTimeFormat | null = null;
+let dayFormat: Intl.DateTimeFormat | null = null;
+
 export function formatMessageTime(value?: string): string {
   if (!value) return "";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
   const now = new Date();
   const sameDay = date.toDateString() === now.toDateString();
-  const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  timeFormat ??= new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit" });
+  const time = timeFormat.format(date);
   if (sameDay) return time;
-  return `${date.toLocaleDateString([], { month: "numeric", day: "numeric" })} ${time}`;
+  dayFormat ??= new Intl.DateTimeFormat([], { month: "numeric", day: "numeric" });
+  return `${dayFormat.format(date)} ${time}`;
 }
 
 /**

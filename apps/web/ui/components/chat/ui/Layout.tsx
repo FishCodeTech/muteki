@@ -33,12 +33,24 @@ export function ScrollArea({
   const measure = useCallback(() => {
     const el = inner.current;
     if (!el || !fade) return;
+    // Runs per scroll event; rewriting an unchanged flag would still
+    // invalidate the mask styles keyed on it.
+    const flag = (key: "fadeTop" | "fadeBottom" | "fadeLeft" | "fadeRight", on: boolean) => {
+      const value = String(on);
+      if (el.dataset[key] !== value) el.dataset[key] = value;
+    };
+    // Read both edges before writing either flag; a read after a write
+    // forces a synchronous style recalculation inside the scroll event.
     if (axis === "y") {
-      el.dataset.fadeTop = String(el.scrollTop > 2);
-      el.dataset.fadeBottom = String(el.scrollTop + el.clientHeight < el.scrollHeight - 2);
+      const top = el.scrollTop > 2;
+      const bottom = el.scrollTop + el.clientHeight < el.scrollHeight - 2;
+      flag("fadeTop", top);
+      flag("fadeBottom", bottom);
     } else {
-      el.dataset.fadeLeft = String(el.scrollLeft > 2);
-      el.dataset.fadeRight = String(el.scrollLeft + el.clientWidth < el.scrollWidth - 2);
+      const left = el.scrollLeft > 2;
+      const right = el.scrollLeft + el.clientWidth < el.scrollWidth - 2;
+      flag("fadeLeft", left);
+      flag("fadeRight", right);
     }
   }, [axis, fade]);
   useEffect(() => {
@@ -70,8 +82,10 @@ export function ScrollArea({
 /** Height-animated disclosure body. */
 export function Collapse({ open, children, className, initial = false }: { open: boolean; children: ReactNode; className?: string; initial?: boolean }) {
   const reduced = useReducedMotion();
+  // presenceAffectsLayout would hand descendants a new PresenceContext on
+  // every render, re-rendering every motion element inside the body.
   return (
-    <AnimatePresence initial={initial}>
+    <AnimatePresence initial={initial} presenceAffectsLayout={false}>
       {open ? (
         <motion.div
           key="collapse"

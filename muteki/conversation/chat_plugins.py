@@ -6,7 +6,8 @@ run-scoped workspaces without modifying the operator's Agent directories.
 from __future__ import annotations
 
 import asyncio
-from contextlib import AsyncExitStack, closing
+from collections.abc import Iterator
+from contextlib import AsyncExitStack, closing, contextmanager
 import ctypes
 import errno
 from datetime import datetime, timezone
@@ -24,15 +25,16 @@ import tempfile
 import threading
 import time
 import sys
-from typing import Any
+from typing import Any, Optional
 
 import yaml
 
 from muteki.extensions.installer import ExtensionInstaller, InstallError, Source, sha256_file, sha256_tree
 from muteki.extensions.isolation import IsolationUnavailable
-from muteki.conversation.chat_providers import PROVIDERS, provider_for
+from muteki.conversation.chat_providers import PROVIDERS, native_user_home, provider_for
 from muteki.conversation.chat_plugin_components import ENGINES, compatibility, inspect_components, install_native_components
 from muteki.external_agents.descriptors import engines_where, find_descriptor, get_descriptor
+from muteki.platform.contracts.external_agents import ContextPart
 
 MODES = ("chat", "ctf", "pentest")
 # Skills marked ``requires_native`` run only on engines with their own skill
@@ -152,6 +154,31 @@ def _checked_tree_digest(root: Path) -> str:
     return sha256_tree(root)
 
 
+@contextmanager
+def _exclusive_file_lock(path: Path) -> Iterator[None]:
+    """Hold an OS-level exclusive lock that independent processes also observe."""
+    with path.open("a+b") as handle:
+        os.chmod(path, 0o600)
+        if os.name == "nt":
+            import msvcrt
+            if handle.seek(0, 2) == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 class ChatPluginService:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
@@ -167,21 +194,43 @@ class ChatPluginService:
         self._verified_tools: dict[str, set[str]] = {}
         self._diagnostics: dict[str, str] = {}
         self._prepare_locks: dict[str, asyncio.Lock] = {}
-        with self.connect() as conn:
-            conn.execute("CREATE TABLE IF NOT EXISTS packages (id TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            conn.execute("CREATE TABLE IF NOT EXISTS policy (id TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        self.db.chmod(0o600)
-        for record in self.records():
-            if record.get("mode_scope_version") != 1:
-                record.update(modes=["chat"], mode_scope_version=1)
-                self.save(record)
-            if record.get("scope_version") != 2:
-                record.update(enabled=bool(record.get("engines")), engines=list(ENGINES), scope_version=2)
-                self.save(record)
-            if record.get("component_schema_version") != 5:
-                inspected = self._inspect(Path(record["root"]))
-                record.update({key: inspected[key] for key in ("components", "requirements", "declared_engines", "skills", "environment", "allowed_modes", "component_schema_version")})
-                self.save(record)
+        self._registry_depth = 0
+        with self._registry_transaction():
+            with self.connect() as conn:
+                conn.execute("CREATE TABLE IF NOT EXISTS packages (id TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                conn.execute("CREATE TABLE IF NOT EXISTS policy (id TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            self.db.chmod(0o600)
+            for record in self.records():
+                if record.get("mode_scope_version") != 1:
+                    record.update(modes=["chat"], mode_scope_version=1)
+                    self.save(record)
+                if record.get("scope_version") != 2:
+                    record.update(enabled=bool(record.get("engines")), engines=list(ENGINES), scope_version=2)
+                    self.save(record)
+                if record.get("component_schema_version") != 5:
+                    inspected = self._inspect(Path(record["root"]))
+                    record.update({key: inspected[key] for key in ("components", "requirements", "declared_engines", "skills", "environment", "allowed_modes", "component_schema_version")})
+                    self.save(record)
+            self._install_default_visualize_once()
+
+    @contextmanager
+    def _registry_transaction(self) -> Iterator[None]:
+        """Serialize registry read-modify-write across threads, instances and processes.
+
+        Reentrant within one thread of one instance, because flock() on a second
+        descriptor of the same file would block on the lock this thread holds.
+        """
+        with self._lock:
+            outer = self._registry_depth == 0
+            self._registry_depth += 1
+            try:
+                if outer:
+                    with _exclusive_file_lock(self.root / "registry.lock"):
+                        yield
+                else:
+                    yield
+            finally:
+                self._registry_depth -= 1
 
     def connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db, timeout=10)
@@ -215,6 +264,23 @@ class ChatPluginService:
     def remember_session(self, session_id: str, revision: str) -> None:
         with self.connect() as conn:
             conn.execute("INSERT OR REPLACE INTO policy VALUES (?, ?)", ("session:" + session_id, revision))
+
+    def _policy_value(self, key: str) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT value FROM policy WHERE id=?", (key,)).fetchone()
+        return str(row[0]) if row else None
+
+    def _install_default_visualize_once(self) -> None:
+        """Install the bundled chat visualizer once without overriding user choices."""
+        key = "default-install:muteki-visualize:v1"
+        with self._registry_transaction():
+            if self._policy_value(key) is not None:
+                return
+            existing = self.get("muteki-visualize")
+            if not existing and self._policy_value("default-suppressed:muteki-visualize") != "true":
+                self.install_visualize()
+            with self.connect() as conn:
+                conn.execute("INSERT OR IGNORE INTO policy VALUES (?, ?)", (key, "true"))
 
     def enabled(self, engine: str, mode: str = "chat") -> list[dict[str, Any]]:
         if mode not in MODES:
@@ -446,26 +512,36 @@ class ChatPluginService:
             normalized = workdir / "normalized"
             _copy_package(package, normalized)
             record = self._inspect(normalized)
-            previous = self.get(record["id"])
-            record.update(engines=list(ENGINES), enabled=True, scope_version=2,
-                          modes=self.validate_record_modes(record, modes if modes is not None else previous.get("modes", ["chat"])),
-                          mode_scope_version=1)
-            record["source_kind"] = kind
             record["digest"] = sha256_tree(normalized)
             target = self.root / "packages" / record["id"] / record["digest"]
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if not target.exists() and not target.is_symlink():
-                _copy_package(normalized, target)
-            if _checked_tree_digest(target) != record["digest"]:
-                raise ChatPluginError("已安装扩展包内容发生变化", code="chat_plugin.package_modified")
-            record["root"] = str(target)
-            record["previous"] = ({k: v for k, v in previous.items() if k != "previous"} if previous else None)
-            self.save(record)
+            with self._registry_transaction():
+                previous = self.get(record["id"])
+                record.update(engines=list(ENGINES), enabled=True, scope_version=2,
+                              modes=self.validate_record_modes(record, modes if modes is not None else previous.get("modes", ["chat"])),
+                              mode_scope_version=1)
+                record["source_kind"] = kind
+                if not target.exists() and not target.is_symlink():
+                    # The work directory lives under self.root, so a rename
+                    # publishes the snapshot complete or not at all.
+                    try:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        os.rename(normalized, target)
+                    except OSError as exc:
+                        raise ChatPluginError("无法写入扩展包目录", code="chat_plugin.install_failed") from exc
+                if _checked_tree_digest(target) != record["digest"]:
+                    raise ChatPluginError("已安装扩展包内容发生变化", code="chat_plugin.package_modified")
+                record["root"] = str(target)
+                record["previous"] = ({k: v for k, v in previous.items() if k != "previous"} if previous else None)
+                self.save(record)
         return self.public(record)
 
     def install_visualize(self) -> dict[str, Any]:
         """Install the independent, chat-only package through normal lifecycle controls."""
-        return self.install({"path": str(VISUALIZE_PACKAGE)}, modes=["chat"])
+        with self._registry_transaction():
+            result = self.install({"path": str(VISUALIZE_PACKAGE)}, modes=["chat"])
+            with self.connect() as conn:
+                conn.execute("DELETE FROM policy WHERE id='default-suppressed:muteki-visualize'")
+        return result
 
     def _inspect(self, root: Path) -> dict[str, Any]:
         manifest: dict[str, Any] = {}
@@ -603,29 +679,34 @@ class ChatPluginService:
     def update(self, package_id: str, enabled: bool | None = None, rollback: bool = False,
                native_hooks: bool | None = None, digest: str = "",
                modes: list[str] | None = None) -> dict[str, Any]:
-        record = self.get(package_id)
-        if not record:
-            raise ChatPluginError("插件不存在")
-        if rollback:
-            if not record.get("previous"):
-                raise ChatPluginError("没有可回滚的版本")
-            record = {**record["previous"], "engines": list(ENGINES), "enabled": record["enabled"], "scope_version": 2,
-                      "modes": list(record.get("modes", ["chat"])), "mode_scope_version": 1, "previous": None}
-        if enabled is not None:
-            record["enabled"] = enabled
-        if modes is not None:
-            record["modes"] = self.validate_record_modes(record, modes)
-        if native_hooks is not None:
-            if native_hooks and digest != record["digest"]:
-                raise ChatPluginError("插件版本已变化，请重新查看此版本的 hooks 后启用")
-            record["hooks_approved_digest"] = record["digest"] if native_hooks else ""
-        self.save(record)
+        with self._registry_transaction():
+            record = self.get(package_id)
+            if not record:
+                raise ChatPluginError("插件不存在")
+            if rollback:
+                if not record.get("previous"):
+                    raise ChatPluginError("没有可回滚的版本")
+                record = {**record["previous"], "engines": list(ENGINES), "enabled": record["enabled"], "scope_version": 2,
+                          "modes": list(record.get("modes", ["chat"])), "mode_scope_version": 1, "previous": None}
+            if enabled is not None:
+                record["enabled"] = enabled
+            if modes is not None:
+                record["modes"] = self.validate_record_modes(record, modes)
+            if native_hooks is not None:
+                if native_hooks and digest != record["digest"]:
+                    raise ChatPluginError("插件版本已变化，请重新查看此版本的 hooks 后启用")
+                record["hooks_approved_digest"] = record["digest"] if native_hooks else ""
+            self.save(record)
         return self.public(record)
 
     def uninstall(self, package_id: str) -> None:
         # Retain immutable files for in-flight skill references. No host paths are removed.
-        with self.connect() as conn:
+        with self._registry_transaction(), self.connect() as conn:
             conn.execute("DELETE FROM packages WHERE id=?", (package_id,))
+            if package_id == "muteki-visualize":
+                # Persist the user's explicit removal across the one-time default migration.
+                conn.execute("INSERT OR REPLACE INTO policy VALUES (?, ?)",
+                             ("default-suppressed:muteki-visualize", "true"))
 
     def public(self, record: dict[str, Any]) -> dict[str, Any]:
         worker_compatibility = {}
@@ -918,15 +999,17 @@ class ChatPluginService:
             _chown_tree_to_worker(str(home), image=container.image)
         return delivered
 
-    def skill_catalog_context(self, engine: str) -> str:
+    def skill_catalog_part(self, engine: str) -> Optional[ContextPart]:
         rows = [row for row in self.skill_rows(engine, include_automatic=True) if not row.get("native_engine")]
         if not rows:
-            return ""
+            return None
         catalog = [{"name": r["name"], "description": r["description"][:600], "path": r["_path"]} for r in rows]
-        return ("[Muteki 当前引擎的聊天 Skills]\n以下目录来自用户在 Muteki 中为当前引擎启用的插件。"
-                "仅在任务需要时读取相应 SKILL.md，并按其所在目录解析相对资源路径。"
-                "这些插件仅作用于本次聊天，不要安装或写入用户的 Agent 配置目录。\n"
-                + json.dumps(catalog, ensure_ascii=False))
+        return ContextPart(
+            key="muteki.skills", kind="host_instructions", trust="application",
+            text=("以下 Skills 目录来自用户在 Muteki 中为当前引擎启用的聊天插件。"
+                  "仅在任务需要时读取相应 SKILL.md，并按其所在目录解析相对资源路径。"
+                  "这些插件仅作用于本次聊天，不要安装或写入用户的 Agent 配置目录。\n"
+                  + json.dumps(catalog, ensure_ascii=False)))
 
     def descriptor_tools(self, engine: str) -> list[dict[str, Any]]:
         return list(self._tools.get(f"chat:{engine}::{self.revision(engine)}", []))
@@ -963,13 +1046,26 @@ class ChatPluginService:
             raise VisualizationError(result["error"]["code"], result["error"]["message"])
         return result
 
-    def visualization_context(self, thread_id: str) -> str:
+    def _visualize_skill(self, engine: str) -> dict[str, Any] | None:
+        from .composer_capabilities import discover_skills
+        return next((row for row in (*self.skill_rows(engine), *discover_skills(engine))
+                     if str(row.get("name", "")).split(":")[-1] == "visualize"), None)
+
+    def visualization_part(self, thread_id: str, engine: str) -> ContextPart:
         root = self.visualization_root(thread_id)
-        return ("[Muteki 聊天展示接口]\n需要结构图或交互图时，直接输出 muteki-visualize 围栏，"
-                "块内放完整 HTML 片段；宿主保存并内联渲染，无需文件写权限或控制工具。"
-                "不要使用网络 API。主题与交互细节按已启用的 visualize Skill 读取。"
-                f"文件交付与本地图片目录为 {root}；文件交付时单独一行输出 "
-                'muteki-visualize {"path":"绝对路径.html"}。\n')
+        skill = self._visualize_skill(engine)
+        # The Skill is optional (installed from the bundled package or found in
+        # the engine's own skill directories); only point at it when it exists.
+        theme = (f"主题与交互细节读取 visualize Skill：{skill['_path']}。" if skill is not None
+                 else "当前引擎没有启用 visualize Skill，没有可读取的官方主题规范；"
+                      "直接输出自包含的 HTML，不要查找该 Skill。")
+        return ContextPart(
+            key="muteki.visualize", kind="host_instructions", trust="application",
+            text=("Muteki 聊天展示接口：需要结构图或交互图时，直接输出 muteki-visualize 围栏，"
+                  "块内放完整 HTML 片段；宿主保存并内联渲染，无需文件写权限或控制工具。"
+                  f"不要使用网络 API。{theme}"
+                  f"文件交付与本地图片目录为 {root}；文件交付时单独一行输出 "
+                  'muteki-visualize {"path":"绝对路径.html"}。'))
 
     def visualization_assets(self, engine: str) -> dict[str, str]:
         from .composer_capabilities import discover_skills
@@ -1007,9 +1103,17 @@ class ChatPluginService:
         descriptor = find_descriptor(engine)
         packaging = descriptor.components.native_plugin_packages if descriptor is not None else "none"
         if packaging == "none":
-            return {}
+            assets = env.get("MUTEKI_CHAT_ASSETS_ROOT")
+            if not assets or descriptor is None:
+                return {}
+            components = Path(assets) / "components"
+            return {
+                "chat_native_extensions": [str(p) for p in sorted((components / descriptor.components.extension_dir).glob("*.js"))]
+                    if descriptor.components.extension_dir else [],
+                "chat_native_agents": [str(p) for p in sorted((components / "agents").glob("*.md"))],
+            }
         claude_packages = packaging == "claude_local_plugins"
-        private = Path(env["MUTEKI_CHAT_PRIVATE_ROOT"])
+        private = Path(env.get("MUTEKI_CHAT_ASSETS_ROOT") or env["MUTEKI_CHAT_PRIVATE_ROOT"])
         packages = []
         approved_hooks = {}
         for record in self.enabled(engine):
@@ -1096,15 +1200,18 @@ class ChatPluginService:
 
     def prepare_environment(
         self, engine: str, identity: str, supplied: dict[str, str], *,
-        previous_revision: str | None = None, include_assets: bool = True,
+        previous_revision: str | None = None, include_assets: bool = True, isolated: bool = False,
     ) -> dict[str, str]:
-        """Reuse one private home per identity and incrementally refresh imports."""
+        """Use native user state by default; clone a home only for explicit isolation."""
+        if not isolated:
+            return self._prepare_shared_environment(engine, identity, supplied,
+                previous_revision=previous_revision, include_assets=include_assets)
         if engine not in PROVIDERS or not PROVIDERS[engine].managed_environment:
             return supplied
         from .native_environment import NativeEnvironmentError, environment_home, synchronize
         provider = provider_for(engine)
         environment = provider.descriptor.environment
-        host_discovery = os.environ.get("MUTEKI_HOST_DISCOVERY", "1") != "0"
+        host_discovery = supplied.get("MUTEKI_HOST_DISCOVERY", os.environ.get("MUTEKI_HOST_DISCOVERY", "1")) != "0"
         source = provider.native_root() if host_discovery else None
         names = (*provider.configuration_names, *provider.credential_names,
                  *(provider.asset_names if include_assets else ()))
@@ -1115,9 +1222,9 @@ class ChatPluginService:
                 target.mkdir(parents=True, exist_ok=True)
                 imports = [(source / name, Path("home") / provider.home_relative / name) for name in names] if source is not None else []
                 if include_assets and host_discovery:
-                    imports.append((Path.home() / ".agents/skills", Path("home/.agents/skills")))
+                    imports.append((native_user_home() / ".agents/skills", Path("home/.agents/skills")))
                 if host_discovery:
-                    imports.extend((Path.home() / item.host_relative, Path(item.target))
+                    imports.extend((native_user_home() / item.host_relative, Path(item.target))
                                    for item in environment.extra_imports)
                 account = supplied.get(provider.home_variable)
                 if account:
@@ -1173,41 +1280,110 @@ class ChatPluginService:
             env[environment.memory_credential_store_env] = "memory"
         return env
 
+    def _prepare_shared_environment(
+        self, engine: str, identity: str, supplied: dict[str, str], *,
+        previous_revision: str | None, include_assets: bool,
+    ) -> dict[str, str]:
+        from .native_environment import NativeEnvironmentError, environment_home, migrate_history, synchronize
+        if engine not in PROVIDERS:
+            return dict(supplied)
+        provider = provider_for(engine)
+        from muteki.core.runtime_env import native_user_environment
+        env = native_user_environment(supplied)
+        try:
+            with self._lock, environment_home(self.root, engine, identity, previous_revision) as root:
+                if env.get("MUTEKI_HOST_DISCOVERY", os.environ.get("MUTEKI_HOST_DISCOVERY", "1")) != "0":
+                    value = env.get(provider.home_variable, os.environ.get(provider.home_variable))
+                    target = Path(value).expanduser() if value else Path(env.get("HOME") or str(Path.home())) / provider.home_relative
+                    if value and provider.descriptor.environment.home_env_is_parent:
+                        target /= engine
+                    migrate_history(root / "home" / provider.home_relative, target, _snapshot_copy)
+                revision = self.revision(engine) if include_assets else "probe"
+                assets = root / "assets"
+                if assets.is_symlink():
+                    raise NativeEnvironmentError("Native application assets directory is a symlink")
+                assets.mkdir(exist_ok=True, mode=0o700)
+                with tempfile.TemporaryDirectory(prefix=".components-", dir=assets) as stage:
+                    if include_assets:
+                        for record in self.enabled(engine):
+                            if compatibility(record, self._verified_tools)[engine]["status"] != "blocked":
+                                install_native_components(record, engine, Path(stage))
+                    synchronize(assets, [(Path(stage), Path("components"))], _snapshot_copy)
+                ready = assets / ".ready"
+                if ready.exists() and ready.read_text() != revision:
+                    packages = assets / "native-packages"
+                    if packages.is_symlink():
+                        raise NativeEnvironmentError("Native package directory is a symlink")
+                    if packages.exists():
+                        shutil.rmtree(packages)
+                ready.write_text(revision)
+                env["MUTEKI_CHAT_ASSETS_ROOT"] = str(assets)
+        except (NativeEnvironmentError, OSError, sqlite3.Error, ValueError) as exc:
+            raise ChatPluginError(f"Native environment preparation failed: {exc}",
+                                  code="chat_plugin.environment_prepare_failed") from exc
+        environment = provider.descriptor.environment
+        if environment.memory_credential_store_env and any(
+                env.get(key, os.environ.get(key, "")).strip()
+                for key in environment.memory_credential_store_when):
+            env[environment.memory_credential_store_env] = "memory"
+        return env
+
     def prepare_codex_fork_history(
         self, source_identity: str, supplied: dict[str, str], *, previous_revision: str | None = None,
     ) -> None:
-        """T3's shared history/private auth overlay, within managed chat homes.
+        """Make legacy rollout history available in the selected native user store."""
+        from .native_environment import NativeEnvironmentError, environment_home, migrate_history
+        provider = provider_for("codex")
+        target = Path(supplied["CODEX_HOME"]).expanduser() if supplied.get("CODEX_HOME") else Path(supplied.get("HOME") or str(Path.home())) / provider.home_relative
+        try:
+            with self._lock, environment_home(self.root, "codex", source_identity, previous_revision) as root:
+                migrate_history(root / "home" / provider.home_relative, target, _snapshot_copy)
+        except (NativeEnvironmentError, OSError, sqlite3.Error, ValueError) as exc:
+            raise ChatPluginError(f"Native fork history migration failed: {exc}",
+                                  code="conversation.fork.history_migration_failed") from exc
 
-        The target keeps its own auth, provider config, models and assets.
-        Only native history/SQLite state is shared; user homes are unchanged.
-        Conflicting existing target state is an explicit error.
-        """
+    def prepare_cursor_history(
+        self, identity: str, native_session_id: str, supplied: dict[str, str], *,
+        previous_revision: str | None = None,
+    ) -> str:
+        from .native_environment import environment_home, migrate_cursor_history
+        target = Path(supplied["CURSOR_CONFIG_DIR"]).expanduser() if supplied.get("CURSOR_CONFIG_DIR") else Path(supplied.get("HOME") or str(native_user_home())) / ".cursor"
+        try:
+            with self._lock, environment_home(self.root, "cursor", identity, previous_revision) as root:
+                return migrate_cursor_history(root / "home/.cursor", target, native_session_id)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            raise ChatPluginError(f"Legacy Cursor history migration failed: {exc}",
+                                  code="conversation.resume.history_migration_failed") from exc
+
+    def codex_rollout_path(
+        self, identity: str, native_thread_id: str, supplied: dict[str, str], *,
+        previous_revision: str | None = None,
+    ) -> str:
+        """Locate only a recorded legacy thread's migrated rollout for native resume."""
         from .native_environment import environment_home
-        target = Path(supplied["CODEX_HOME"]).resolve()
-        managed = (self.root / "sessions").resolve()
-        if not target.is_relative_to(managed):
-            raise ChatPluginError("Codex fork requires a managed target home", code="conversation.fork.home_invalid")
-        with self._lock, environment_home(self.root, "codex", source_identity, previous_revision) as root:
-            source = root / "home" / provider_for("codex").home_relative
-            if not source.is_dir() or not (source / "sessions").exists():
-                raise ChatPluginError("Native Codex fork history is missing", code="conversation.fork.history_missing")
-            entries = {"sessions", "archived_sessions", "sqlite", "shell_snapshots", "worktrees"}
-            entries.update(path.name for path in source.iterdir()
-                           if path.name.endswith((".sqlite", ".sqlite-wal", ".sqlite-shm")))
-            # Sidecars must address the same store even when currently absent.
-            for name in list(entries):
-                if name.endswith(".sqlite"):
-                    entries.update({name + "-wal", name + "-shm"})
-            for name in sorted(entries):
-                original, link = source / name, target / name
-                resolved = original.resolve()
-                if not resolved.is_relative_to(managed):
-                    raise ChatPluginError("Native history escapes managed homes", code="conversation.fork.home_invalid")
-                if link.is_symlink() and link.resolve() == resolved:
-                    continue
-                if link.exists() or link.is_symlink():
-                    raise ChatPluginError(f"Target native history already exists: {name}", code="conversation.fork.home_conflict")
-                link.symlink_to(resolved, target_is_directory=name in {"sessions", "archived_sessions", "sqlite", "shell_snapshots", "worktrees"})
+        if not re.fullmatch(r"[a-zA-Z0-9-]+", native_thread_id or ""):
+            raise ChatPluginError("Invalid native Codex thread id", code="conversation.resume.history_invalid")
+        provider = provider_for("codex")
+        target = Path(supplied["CODEX_HOME"]).expanduser() if supplied.get("CODEX_HOME") else Path(supplied.get("HOME") or str(Path.home())) / provider.home_relative
+        with self._lock, environment_home(self.root, "codex", identity, previous_revision) as root:
+            legacy = root / "home" / provider.home_relative
+            matches = [p for name in ("sessions", "archived_sessions")
+                       for p in (legacy / name).rglob(f"*-{native_thread_id}.jsonl")]
+            if not matches:
+                return ""
+            if len(matches) != 1:
+                raise ChatPluginError("Legacy Codex rollout is ambiguous", code="conversation.resume.history_conflict")
+            try:
+                with matches[0].open() as stream:
+                    metadata = json.loads(stream.readline())
+            except (OSError, ValueError, UnicodeError) as exc:
+                raise ChatPluginError(f"Cannot read legacy Codex rollout: {exc}", code="conversation.resume.history_invalid") from exc
+            if metadata.get("type") != "session_meta" or metadata.get("payload", {}).get("id") != native_thread_id:
+                raise ChatPluginError("Legacy Codex rollout id does not match its recorded thread", code="conversation.resume.history_invalid")
+            migrated = target / matches[0].relative_to(legacy)
+            if not migrated.is_file():
+                raise ChatPluginError("Migrated Codex rollout is missing", code="conversation.resume.history_missing")
+            return str(migrated)
 
     def release_thread_assets(self, thread_id: str) -> int:
         """Called after successful close when archiving a chat. Keep its history."""
@@ -1226,6 +1402,9 @@ class ChatPluginService:
                              for name in provider.asset_names) + ("home/.agents/skills",)
             with self._lock, environment_home(self.root, engine, identity) as root:
                 removed += evict_imports(root, prefixes)
+                assets = root / "assets"
+                if assets.is_dir():
+                    removed += evict_imports(assets, ("components",))
         return removed
 
 

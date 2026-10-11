@@ -18,6 +18,7 @@ export type ComposerContextKind =
   | "skill"
   | "mcp"
   | "plugin"
+  | "component"
   | "file"
   | "thread"
   | "message_span"

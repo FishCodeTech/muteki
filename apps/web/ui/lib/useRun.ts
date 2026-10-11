@@ -746,6 +746,7 @@ export interface CredentialAccount {
   base_url?: string;
   provider?: string;
   suggested_model?: string;
+  test_status_preserved?: boolean;
   credential_format?: "oauth_token" | "auth_json" | "auth_home" | "api_key" | "unknown";
   mode: string;
   present: boolean;
@@ -772,6 +773,7 @@ export interface GlobalCredentialLastTest {
   tested_at?: number | string;
   backend?: string;
   model?: string;
+  runtime_instance?: string;
 }
 
 export interface GlobalCredentialModelCatalog {
@@ -798,6 +800,7 @@ export interface GlobalCredential {
   sharing?: {scope: "shared" | "environment"; readonly: boolean; reason: string};
   status_detail?: string;
   discovery_code?: string;
+  detection_status?: "present" | "absent" | "unknown" | "disabled";
   id: string;
   revision?: string;
   label: string;
@@ -808,7 +811,7 @@ export interface GlobalCredential {
   credential_format?: "oauth_token" | "auth_json" | "auth_home" | "api_key" | "unknown";
   provider?: string;
   base_url?: string;
-  present: boolean;
+  present: boolean | null;
   status: string;
   models: string[];
   candidate_models?: string[];
@@ -816,6 +819,7 @@ export interface GlobalCredential {
   model_catalog?: GlobalCredentialModelCatalog;
   model_catalogs?: Record<string, GlobalCredentialModelCatalog>;
   last_test?: GlobalCredentialLastTest | null;
+  last_tests?: Record<string, GlobalCredentialLastTest>;
   usage: GlobalCredentialUsage[];
 }
 

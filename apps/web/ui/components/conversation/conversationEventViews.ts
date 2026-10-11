@@ -15,14 +15,25 @@ export interface ConversationToolRecord extends ToolItem {
 
 export type ConversationMessagePhase = "commentary" | "final_answer" | "unknown";
 
+// Event payloads are never mutated after parsing, and the same events are
+// refolded on every stream frame, so their serialized form is cached.
+const serializedEventValues = new WeakMap<object, string>();
+
 function serializeEventValue(value: unknown): string {
   if (value == null) return "";
   if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
+  if (typeof value === "object") {
+    const cached = serializedEventValues.get(value);
+    if (cached !== undefined) return cached;
   }
+  let text: string;
+  try {
+    text = JSON.stringify(value);
+  } catch {
+    text = String(value);
+  }
+  if (typeof value === "object") serializedEventValues.set(value, text);
+  return text;
 }
 
 export function conversationErrorMessage(value: unknown): string {
@@ -64,7 +75,36 @@ export type ConversationTurnSegment =
       text: string;
       phase: ConversationMessagePhase;
     }
-  | { kind: "tools"; turnId: string; tools: ConversationToolRecord[] };
+  | { kind: "tools"; turnId: string; tools: ConversationToolRecord[] }
+  | {
+      kind: "compaction";
+      turnId: string;
+      status: "started" | "completed" | "failed" | "interrupted";
+      trigger: "manual" | "auto";
+      /** False: the engine gave no signal of its own; only the turn ended. */
+      confirmed: boolean;
+      summary?: string;
+      message?: string;
+      tokensBefore?: number;
+      tokensAfter?: number;
+    };
+
+function compactionSegment(turnId: string, payload: Record<string, unknown>): ConversationTurnSegment | null {
+  const status = String(payload.status || "");
+  if (status !== "started" && status !== "completed" && status !== "failed" && status !== "interrupted") return null;
+  const count = (value: unknown) => (typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined);
+  return {
+    kind: "compaction",
+    turnId,
+    status,
+    trigger: payload.trigger === "auto" ? "auto" : "manual",
+    confirmed: payload.confirmed !== false,
+    summary: typeof payload.summary === "string" && payload.summary.trim() ? payload.summary : undefined,
+    message: typeof payload.message === "string" && payload.message.trim() ? payload.message : undefined,
+    tokensBefore: count(payload.tokens_before),
+    tokensAfter: count(payload.tokens_after),
+  };
+}
 
 /** Restore admitted text outside the live event window without guessing its phase. */
 export function restoreConversationStreamPrefix(
@@ -885,6 +925,12 @@ export function resolveConversationLiveActivity(
   if (last.kind === "text") {
     return { kind: "response", label: "Agent 正在生成回复…" };
   }
+  if (last.kind === "compaction") {
+    return last.status === "started"
+      ? { kind: "tool", label: "正在压缩上下文…" }
+      : { kind: "response", label: last.status === "failed" ? "上下文压缩失败"
+        : last.status === "interrupted" ? "上下文压缩已中断" : "上下文压缩已完成" };
+  }
   const tool = last.tools.at(-1);
   if (!tool) return { kind: "idle", label: "Agent 正在处理…" };
   const runningLabel = runningToolActivity(tool);
@@ -1020,6 +1066,18 @@ function applyConversationEventToFold(
         changed = true;
       }
     }
+  } else if (type === "core.context.compaction") {
+    const segment = compactionSegment(turnId, payload);
+    if (!segment || segment.kind !== "compaction") return state;
+    // One lifecycle per turn and trigger: the terminal record replaces its start.
+    const index = segments.findIndex((row) => (
+      row.kind === "compaction" && row.status === "started" && row.trigger === segment.trigger
+    ));
+    nextSegments = index >= 0 && segment.status !== "started"
+      ? segments.map((row, at) => (at === index ? segment : row))
+      : [...segments, segment];
+    textFromDeltas = false;
+    changed = true;
   } else if (type === "core.message.completed" && assistantRole(payload.role)) {
     const text = String(payload.text || "");
     if (!text.trim()) return state;
@@ -1060,6 +1118,27 @@ export function buildConversationTurnFold(
   events: ConversationEvent[] = [],
 ): ConversationTurnFoldState {
   return events.reduce(applyConversationEventToFold, emptyTurnFoldState());
+}
+
+/** Continue a fold with events that follow the ones it was built from. */
+export function extendConversationTurnFold(
+  state: ConversationTurnFoldState,
+  events: ConversationEvent[],
+): ConversationTurnFoldState {
+  return events.reduce(applyConversationEventToFold, state);
+}
+
+/**
+ * True when `next` is `previous` with events appended (same leading objects),
+ * so a fold over `previous` can be extended instead of rebuilt.
+ */
+export function isAppendedEventList(
+  previous: readonly ConversationEvent[],
+  next: readonly ConversationEvent[],
+): boolean {
+  if (next.length < previous.length) return false;
+  if (!previous.length) return true;
+  return next[0] === previous[0] && next[previous.length - 1] === previous[previous.length - 1];
 }
 
 /**

@@ -2,12 +2,48 @@
 from __future__ import annotations
 
 import asyncio
+import faulthandler
 import json
 import os
 from pathlib import Path
 import socket
 import sys
 import threading
+import time
+
+LOOP_STALL_REPORT_S = 10.0
+
+
+def monitor_event_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Report, with thread stacks, an event loop that stops serving callbacks.
+
+    A blocked loop freezes every stream and request of this backend yet leaves
+    no log line; the stacks name the blocking call.
+    """
+    beat = time.monotonic()
+
+    def tick() -> None:
+        nonlocal beat
+        beat = time.monotonic()
+        loop.call_later(1.0, tick)
+
+    def watch() -> None:
+        stalled = False
+        while True:
+            time.sleep(1.0)
+            lag = time.monotonic() - beat
+            if lag >= LOOP_STALL_REPORT_S and not stalled:
+                stalled = True
+                print(f"[muteki-loop-stall] {time.strftime('%Y-%m-%dT%H:%M:%S%z')} event loop "
+                      f"unresponsive for {lag:.1f}s; stacks of all threads:", file=sys.stderr, flush=True)
+                faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            elif lag < LOOP_STALL_REPORT_S and stalled:
+                stalled = False
+                print(f"[muteki-loop-stall] {time.strftime('%Y-%m-%dT%H:%M:%S%z')} event loop "
+                      "responsive again", file=sys.stderr, flush=True)
+
+    loop.call_soon(tick)
+    threading.Thread(target=watch, name="loop-stall-monitor", daemon=True).start()
 
 
 def main() -> None:
@@ -55,6 +91,7 @@ def main() -> None:
     class DesktopServer(uvicorn.Server):
         async def startup(self, sockets=None):
             app.state.desktop_loop = asyncio.get_running_loop()
+            monitor_event_loop(app.state.desktop_loop)
             await super().startup(sockets=sockets)
             if not self.started:
                 return

@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { cn } from "@/lib/cn";
 import { copyToClipboard } from "@/lib/clipboard";
@@ -31,6 +31,7 @@ import {
   SectionLabel,
   SkeletonRows,
   ThreadRow,
+  rowClockLabel,
   type RowDragHandlers,
 } from "./rows";
 import type { NavItem, NavSection, SidebarNavProps, SidebarSortMode } from "./types";
@@ -73,6 +74,27 @@ type PointerDragState = {
   reorder: (sourceId: string, targetId: string) => void;
 };
 
+type DragSource = Omit<PointerDragState, "startX" | "startY" | "active">;
+
+/** Identity-stable wrapper that always calls the latest `handler`; keeps memoized rows from re-rendering. */
+function useStableHandler<Args extends unknown[], Result>(handler: (...args: Args) => Result): (...args: Args) => Result {
+  const ref = useRef(handler);
+  ref.current = handler;
+  return useCallback((...args: Args) => ref.current(...args), []);
+}
+
+/** Identity-stable drag handlers that delegate to the latest render's handlers. */
+function useStableDragHandlers(handlers: RowDragHandlers): RowDragHandlers {
+  const ref = useRef(handlers);
+  ref.current = handlers;
+  return useMemo<RowDragHandlers>(() => ({
+    onPointerDown: (event) => ref.current.onPointerDown(event),
+    onPointerMove: (event) => ref.current.onPointerMove(event),
+    onPointerUp: (event) => ref.current.onPointerUp(event),
+    onPointerCancel: () => ref.current.onPointerCancel(),
+  }), []);
+}
+
 const SORT_LABEL: Record<SidebarSortMode, string> = {
   priority: "优先级",
   updated: "最近更新",
@@ -84,6 +106,10 @@ const SORT_DESCRIPTION: Record<SidebarSortMode, string> = {
   updated: "按最后活动时间分组",
   manual: "拖拽或 ⌥↑ / ⌥↓ 调整顺序",
 };
+
+function sameElementDeps(a: readonly unknown[], b: readonly unknown[]): boolean {
+  return a.length === b.length && a.every((value, index) => Object.is(value, b[index]));
+}
 
 function readCollapsed(): Set<string> {
   try {
@@ -121,7 +147,7 @@ function absoluteHref(href: string): string {
   }
 }
 
-export function SidebarNav({
+export const SidebarNav = memo(function SidebarNav({
   projectFilter,
   bulkActions,
   sections,
@@ -362,9 +388,11 @@ export function SidebarNav({
     if (auto.speed && !auto.frame) auto.frame = window.requestAnimationFrame(autoScrollTick);
   };
 
-  const dragHandlers = (drag: Omit<PointerDragState, "startX" | "startY" | "active">): RowDragHandlers => ({
+  const dragHandlers = (resolve: (element: HTMLElement) => DragSource | null): RowDragHandlers => ({
     onPointerDown: (event) => {
       if (event.button !== 0 || event.pointerType !== "mouse") return;
+      const drag = resolve(event.currentTarget);
+      if (!drag) return;
       event.currentTarget.setPointerCapture(event.pointerId);
       pointerDragRef.current = { ...drag, startX: event.clientX, startY: event.clientY, active: false };
     },
@@ -495,15 +523,55 @@ export function SidebarNav({
     return map;
   }, [sections, activitySections]);
 
+  const sectionsByKey = useMemo(() => {
+    const map = new Map<string, NavSection>();
+    for (const section of activityView ? activitySections : sections) map.set(sectionKeyOf(section), section);
+    return map;
+  }, [activityView, activitySections, sections]);
+
+  // Rows only carry ids in the DOM; the source details are resolved when a drag starts.
+  const itemDrag = useStableDragHandlers(dragHandlers((element) => {
+    const row = element.closest<HTMLElement>("[data-sidebar-item]");
+    const sourceId = row?.dataset.sidebarItem;
+    const sectionKey = row?.dataset.sidebarSection;
+    const reorder = sectionKey ? sectionsByKey.get(sectionKey)?.onReorderItems : undefined;
+    if (!row || !sourceId || !sectionKey || !reorder) return null;
+    return {
+      kind: "item",
+      sourceId,
+      sectionKey,
+      label: itemsById.get(sourceId)?.label || "",
+      startIndex: Number(row.dataset.sidebarIndex || "0"),
+      reorder,
+    };
+  }));
+
+  const folderDrag = useStableDragHandlers(dragHandlers((element) => {
+    const header = element.closest<HTMLElement>("[data-cx-folder-header]");
+    const sectionKey = header?.dataset.sidebarSection;
+    const section = sectionKey ? sectionsByKey.get(sectionKey) : undefined;
+    if (!sectionKey || !section?.onReorderSection) return null;
+    return {
+      kind: "section",
+      sourceId: sectionKey,
+      sectionKey,
+      label: section.title,
+      startIndex: 0,
+      reorder: section.onReorderSection,
+    };
+  }));
+
   /* ── Multi-select ──────────────────────────────────────────────────────── */
 
   /** Thread ids in on-screen order (collapsed sections and hidden rails excluded). */
   const visibleThreadIds = useCallback((): string[] => {
     const ids: string[] = [];
+    const seen = new Set<string>();
     for (const row of Array.from(listRef.current?.querySelectorAll<HTMLElement>("[data-sidebar-item]") ?? [])) {
       const id = row.dataset.sidebarItem;
-      if (!id || ids.includes(id) || !row.getClientRects().length || row.closest("[inert]")) continue;
+      if (!id || seen.has(id) || !row.getClientRects().length || row.closest("[inert]")) continue;
       if (row.closest("[aria-hidden='true']")) continue;
+      seen.add(id);
       ids.push(id);
     }
     return ids;
@@ -523,7 +591,7 @@ export function SidebarNav({
     });
   }, [itemsById]);
 
-  const onRowSelect = useCallback((id: string, event: React.MouseEvent<HTMLElement>) => {
+  const onRowSelect = useStableHandler((id: string, event: React.MouseEvent<HTMLElement>) => {
     const toggle = event.metaKey || event.ctrlKey;
     if (toggle || event.shiftKey) {
       setHoverCard(null);
@@ -554,7 +622,7 @@ export function SidebarNav({
     }
     clearSelection();
     onSelect(id);
-  }, [activeId, clearSelection, itemsById, onSelect, visibleThreadIds]);
+  });
 
   useEffect(() => {
     if (!selectedIds.size) return;
@@ -893,11 +961,57 @@ export function SidebarNav({
     ? visibleSections
     : visibleSections.filter((section) => section.kind !== "pinned" && section.kind !== "folder" && !isFooterSection(section));
 
+  const onRowStartRename = useStableHandler((target: NavItem) => setRenamingId(target.id));
+  const onRowRenameDone = useStableHandler(() => {
+    const id = renamingId;
+    setRenamingId(null);
+    if (id) refocusItem(id);
+  });
+  const onRowOpenSnooze = useStableHandler((target: NavItem, anchor: HTMLElement, sectionKey: string) => openMenuFromButton(
+    `snooze:${sectionKey}:${target.id}`,
+    { kind: "snooze", item: target },
+    anchor,
+    rowFocusTarget(anchor.closest("[data-sidebar-item]")),
+  ));
+  const onRowOpenMenu = useStableHandler((target: NavItem, anchor: HTMLElement, sectionKey: string) => {
+    const section = sectionsByKey.get(sectionKey);
+    if (!section) return;
+    openMenuFromButton(
+      `item:${sectionKey}:${target.id}`,
+      { kind: "item", item: target, section },
+      anchor,
+      rowFocusTarget(anchor.closest("[data-sidebar-item]")),
+    );
+  });
+  const onRowContextMenu = useStableHandler((event: React.MouseEvent<HTMLElement>, target: NavItem, sectionKey: string) => {
+    if (selectedIds.size > 1 && selectedIds.has(target.id)) {
+      openMenuAtPoint(event, "bulk", { kind: "bulk", ids: [...selectedIds] }, rowFocusTarget(event.currentTarget));
+      return;
+    }
+    const section = sectionsByKey.get(sectionKey);
+    if (!section) return;
+    openMenuAtPoint(
+      event,
+      `item:${sectionKey}:${target.id}`,
+      { kind: "item", item: target, section },
+      rowFocusTarget(event.currentTarget),
+    );
+  });
+  const onRowKeyDownStable = useStableHandler((event: React.KeyboardEvent<HTMLElement>, target: NavItem, sectionKey: string) => {
+    const section = sectionsByKey.get(sectionKey);
+    if (section) onRowKeyDown(event, target, section, sectionKey);
+  });
+
+  // A streaming thread updates the nav on every frame. Folders whose inputs are
+  // unchanged hand back their previous element, so React skips the header,
+  // the Collapse and every row's presence wrapper in that folder.
+  const folderElementsRef = useRef(new Map<string, { deps: readonly unknown[]; element: React.ReactElement }>());
+
   const renderRows = (section: NavSection, sectionKey: string, items: NavItem[], indent: boolean) => {
     const isActivity = section.kind === "activity";
     const reorderable = Boolean(section.onReorderItems) && !isActivity && !searching;
     return (
-      <AnimatePresence initial={false}>
+      <AnimatePresence initial={false} presenceAffectsLayout={false}>
         {items.map((item, index) => (
           <ThreadRow
             key={item.id}
@@ -907,7 +1021,7 @@ export function SidebarNav({
             active={item.id === activeId}
             variant={isActivity ? "activity" : "default"}
             indent={indent}
-            nowMs={nowMs}
+            clockLabel={rowClockLabel(item, nowMs)}
             highlight={query}
             menuOpen={menu?.key === `item:${sectionKey}:${item.id}`}
             snoozeOpen={menu?.key === `snooze:${sectionKey}:${item.id}`}
@@ -918,47 +1032,15 @@ export function SidebarNav({
             dragOver={dragOverItem?.itemId === item.id && dragOverItem.sectionKey === sectionKey && draggedItem?.itemId !== item.id}
             reduced={reduced}
             didDragRef={didDragRef}
-            drag={reorderable && section.onReorderItems ? dragHandlers({
-              kind: "item",
-              sourceId: item.id,
-              sectionKey,
-              label: item.label,
-              startIndex: index,
-              reorder: section.onReorderItems,
-            }) : undefined}
+            drag={reorderable ? itemDrag : undefined}
             onSelect={onRowSelect}
-            onStartRename={(target) => setRenamingId(target.id)}
-            onRenameDone={() => {
-              const id = renamingId;
-              setRenamingId(null);
-              if (id) refocusItem(id);
-            }}
+            onStartRename={onRowStartRename}
+            onRenameDone={onRowRenameDone}
             onHover={onRowHover}
-            onOpenSnooze={(target, anchor) => openMenuFromButton(
-              `snooze:${sectionKey}:${target.id}`,
-              { kind: "snooze", item: target },
-              anchor,
-              rowFocusTarget(anchor.closest("[data-sidebar-item]")),
-            )}
-            onOpenMenu={(target, anchor) => openMenuFromButton(
-              `item:${sectionKey}:${target.id}`,
-              { kind: "item", item: target, section },
-              anchor,
-              rowFocusTarget(anchor.closest("[data-sidebar-item]")),
-            )}
-            onContextMenu={(event, target) => {
-              if (selectedIds.size > 1 && selectedIds.has(target.id)) {
-                openMenuAtPoint(event, "bulk", { kind: "bulk", ids: [...selectedIds] }, rowFocusTarget(event.currentTarget));
-                return;
-              }
-              openMenuAtPoint(
-                event,
-                `item:${sectionKey}:${target.id}`,
-                { kind: "item", item: target, section },
-                rowFocusTarget(event.currentTarget),
-              );
-            }}
-            onKeyDown={(event, target) => onRowKeyDown(event, target, section, sectionKey)}
+            onOpenSnooze={onRowOpenSnooze}
+            onOpenMenu={onRowOpenMenu}
+            onContextMenu={onRowContextMenu}
+            onKeyDown={onRowKeyDownStable}
           />
         ))}
       </AnimatePresence>
@@ -982,13 +1064,64 @@ export function SidebarNav({
     return { items, overflow: section.items.length - items.length, expanded, limit };
   };
 
-  const renderFolder = (section: NavSection, sectionIndex: number) => {
+  const onFolderOpenMenu = useStableHandler((anchor: HTMLElement, sectionKey: string) => {
+    const section = sectionsByKey.get(sectionKey);
+    if (!section) return;
+    openMenuFromButton(
+      `folder:${sectionKey}`,
+      { kind: "folder", section, sectionKey },
+      anchor,
+      anchor.closest("[data-cx-folder-header]")?.querySelector<HTMLElement>(ROW_SELECTOR) ?? null,
+    );
+  });
+  const onFolderContextMenu = useStableHandler((event: React.MouseEvent<HTMLElement>, sectionKey: string) => {
+    const section = sectionsByKey.get(sectionKey);
+    if (!section) return;
+    openMenuAtPoint(
+      event,
+      `folder:${sectionKey}`,
+      { kind: "folder", section, sectionKey },
+      event.currentTarget.querySelector<HTMLElement>(ROW_SELECTOR),
+    );
+  });
+  const onFolderKeyDown = useStableHandler((event: React.KeyboardEvent<HTMLElement>, sectionKey: string, collapsed: boolean) => {
+    if (isMenuKey(event)) {
+      event.preventDefault();
+      const section = sectionsByKey.get(sectionKey);
+      const more = event.currentTarget.parentElement?.querySelector<HTMLElement>("[data-cx-row-more]");
+      if (section && more) openMenuFromButton(`folder:${sectionKey}`, { kind: "folder", section, sectionKey }, more, event.currentTarget);
+    } else if (event.key === "ArrowRight" && collapsed) {
+      event.preventDefault();
+      toggleSection(sectionKey);
+    } else if (event.key === "ArrowLeft" && !collapsed) {
+      event.preventDefault();
+      toggleSection(sectionKey);
+    }
+  });
+
+  const renderFolder = (section: NavSection) => {
     const sectionKey = sectionKeyOf(section);
     const collapsed = !searching && collapsedIds.has(sectionKey);
     const bodyId = `sidebar-section-${sectionKey}`;
     const preview = previewItems(section, sectionKey);
     const menuKey = `folder:${sectionKey}`;
-    return (
+    const folderMenuKey = menu && (
+      menu.key === menuKey
+      || menu.key.startsWith(`item:${sectionKey}:`)
+      || menu.key.startsWith(`snooze:${sectionKey}:`)
+    ) ? menu.key : null;
+    // Every value the folder subtree reads besides stable handlers and setters.
+    const deps: readonly unknown[] = [
+      section, collapsed, searching, query, folderMenuKey, reduced, selectedIds, jumpHints, renamingId,
+      draggedItem, dragOverItem, draggedSection === sectionKey, dragOverSection === sectionKey,
+      preview.overflow, preview.expanded, preview.limit,
+      preview.items.some((item) => item.id === activeId) ? activeId : null,
+      ...preview.items,
+      ...preview.items.map((item) => rowClockLabel(item, nowMs)),
+    ];
+    const cachedFolder = folderElementsRef.current.get(sectionKey);
+    if (cachedFolder && sameElementDeps(cachedFolder.deps, deps)) return cachedFolder.element;
+    const element = (
       <div
         key={sectionKey}
         data-sidebar-folder-group=""
@@ -1003,40 +1136,11 @@ export function SidebarNav({
           dragOver={dragOverSection === sectionKey && draggedSection !== sectionKey}
           controlsId={bodyId}
           didDragRef={didDragRef}
-          drag={section.onReorderSection && !searching ? dragHandlers({
-            kind: "section",
-            sourceId: sectionKey,
-            sectionKey,
-            label: section.title,
-            startIndex: sectionIndex,
-            reorder: section.onReorderSection,
-          }) : undefined}
-          onToggle={() => toggleSection(sectionKey)}
-          onOpenMenu={(anchor) => openMenuFromButton(
-            menuKey,
-            { kind: "folder", section, sectionKey },
-            anchor,
-            anchor.closest("[data-cx-folder-header]")?.querySelector<HTMLElement>(ROW_SELECTOR) ?? null,
-          )}
-          onContextMenu={(event) => openMenuAtPoint(
-            event,
-            menuKey,
-            { kind: "folder", section, sectionKey },
-            event.currentTarget.querySelector<HTMLElement>(ROW_SELECTOR),
-          )}
-          onKeyDown={(event) => {
-            if (isMenuKey(event)) {
-              event.preventDefault();
-              const more = event.currentTarget.parentElement?.querySelector<HTMLElement>("[data-cx-row-more]");
-              if (more) openMenuFromButton(menuKey, { kind: "folder", section, sectionKey }, more, event.currentTarget);
-            } else if (event.key === "ArrowRight" && collapsed) {
-              event.preventDefault();
-              toggleSection(sectionKey);
-            } else if (event.key === "ArrowLeft" && !collapsed) {
-              event.preventDefault();
-              toggleSection(sectionKey);
-            }
-          }}
+          drag={section.onReorderSection && !searching ? folderDrag : undefined}
+          onToggle={toggleSection}
+          onOpenMenu={onFolderOpenMenu}
+          onContextMenu={onFolderContextMenu}
+          onKeyDown={onFolderKeyDown}
         />
         <Collapse open={!collapsed}>
           <div id={bodyId} role="group" aria-label={section.title} className="flex flex-col gap-0.5 pb-1.5">
@@ -1070,6 +1174,8 @@ export function SidebarNav({
         </Collapse>
       </div>
     );
+    folderElementsRef.current.set(sectionKey, { deps, element });
+    return element;
   };
 
   const activityMenu = (
@@ -1486,4 +1592,4 @@ export function SidebarNav({
       </Popover>
     </nav>
   );
-}
+});

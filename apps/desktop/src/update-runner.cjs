@@ -4,6 +4,7 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { once } = require('node:events');
 const { bundleHash, bundleIdentity, copyBundle, atomicJson, helperRunning } = require('./update-files.cjs');
+const { hostEnvironment } = require('./environment.cjs');
 const dataDirectories = ['state', 'sessions', 'desktop', 'home', 'config'];
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -16,7 +17,7 @@ async function run(file, recover = false) {
   const incoming = journal.current + `.incoming-${journal.id}.app`;
   const backup = path.join(transaction, 'data-backup');
   let switched = fs.existsSync(previous), backedUp = Boolean(journal.backupComplete), next;
-  const env = {...process.env};
+  const env = hostEnvironment(process.env);
   for (const key of Object.keys(env)) if (key.startsWith('MUTEKI_') || ['NODE_OPTIONS', 'NODE_PATH', 'ELECTRON_RUN_AS_NODE', 'PYTHONPATH', 'PYTHONHOME', 'VIRTUAL_ENV'].includes(key)) delete env[key];
   write({helperPid: process.pid});
   try {

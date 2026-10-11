@@ -210,9 +210,18 @@ export function ConversationInfoDrawer({
     : reportedCost != null ? "上报金额" : "金额";
 
   const contextWindow = activeView.context_window ?? null;
-  const compactionSupported = capabilitiesFor(
+  const runtimeCapabilities = capabilitiesFor(
     descriptors, `${activeView.runtime.adapter_id}:${activeView.runtime.instance_id}`,
-  )?.compaction === true;
+  );
+  const usageSupported = runtimeCapabilities ? runtimeCapabilities.context_usage === true : undefined;
+  const capabilityContext = activeView.runtime.adapter_id ? {
+    threadId: activeView.thread.thread_id,
+    adapterId: activeView.runtime.adapter_id,
+    instanceId: activeView.runtime.instance_id || "default",
+    revision: activeView.runtime_connection?.capability_revision ?? 0,
+    workspaceId: activeView.thread.workspace_id || undefined,
+    projectId: activeView.thread.project_id || undefined,
+  } : undefined;
   const statsItems = conversationStatsSummaryItems(activeView.statistics, activeView.context_window);
   const memories = memory?.memories ?? [];
   const workspacePath = activeView.workspace?.root_path || "";
@@ -432,7 +441,8 @@ export function ConversationInfoDrawer({
       <ContextWindowMeter
         threadId={activeView.thread.thread_id}
         contextWindow={contextWindow}
-        compactionSupported={compactionSupported}
+        usageSupported={usageSupported}
+        capabilityContext={capabilityContext}
         onRefresh={onRefreshView}
       />
 

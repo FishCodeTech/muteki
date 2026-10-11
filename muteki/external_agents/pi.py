@@ -99,12 +99,14 @@ from .capabilities import (
     _probe_version,
 )
 from .command_providers import operation_item
+from .context_delivery import system_append, text_with_envelopes
 from .events import build_event
 from .runtime_capabilities import (
     RuntimeCapabilitySnapshot,
     dynamic_command_item,
 )
 from .rpc import PeerClosedError, StdioJsonlPeer
+from .rpc_commands import rpc_compaction_events, rpc_context_usage_event, rpc_context_window
 from .sessions import classify_exit
 
 PI_EXTENSION_NAMESPACE = "io.github.fishcodetech.pi"
@@ -502,6 +504,7 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
     """
 
     adapter_id = "pi.rpc"
+    host_context_channel = "system_prompt"
     context_compaction_events = True
 
     def __init__(
@@ -537,13 +540,20 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
                   no_session: bool = False,
                   session_dir: Optional[str] = None,
                   extension_path: Optional[str] = None,
+                  native_extensions: Optional[list[str]] = None,
                   chat_mode: bool = False,
-                  mcp_extension: bool = False) -> list[str]:
+                  mcp_extension: bool = False,
+                  append_system_prompt: str = "") -> list[str]:
         argv = self._with_launch_args([self._binary, "--mode", "rpc"])
+        if append_system_prompt:
+            # Repeatable flag: user launch args may carry their own.
+            argv += ["--append-system-prompt", append_system_prompt]
         if no_session:
             argv.append("--no-session")
         elif session_dir or self._session_dir:
             argv += ["--session-dir", session_dir or str(self._session_dir)]
+        for native_extension in native_extensions or []:
+            argv += ["--extension", native_extension]
         # ``approve`` / ``trust_project``：pi ≥0.84 才有 ``--approve``（项目
         # 信任覆盖，非工具 HITL）。目标运行时 0.73.1 传入会
         # ``Unknown option: --approve`` 退出，故忽略该参数。Agent Plugin
@@ -720,6 +730,8 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
         # RPC command "compact" {customInstructions?} 由 runtime 快照以
         # verified operation 暴露（rpc_commands.RPC_OPERATIONS）。
         caps.compaction = True
+        # message_end usage plus get_state model.contextWindow.
+        caps.context_usage = True
         # Pi has no native MCP config. This adapter injects the chat MCP
         # server with an extension in its own runtime directory.
         caps.mcp = True
@@ -878,6 +890,8 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
                 session_dir=options.session_dir,
                 chat_mode=options.is_conversation,
                 mcp_extension=mcp_extension,
+                native_extensions=list(options.chat_native_extensions),
+                append_system_prompt=system_append(options.host_context),
                 extension_path=(
                     str(plugin_extension_path)
                     if plugin_extension_path else None)),
@@ -961,6 +975,10 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
             "model_provider": model_provider,
             "model_id": model_id,
             "capability_revision": 0,
+            # get_state ran before set_model; the stats read after it.
+            "context_window": rpc_context_window(
+                {"model": stats.get("contextUsage")} if isinstance(stats.get("contextUsage"), dict)
+                else state),
         }
         self._rpc[request.agent_session_id] = handle
         try:
@@ -1005,9 +1023,16 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
         if handle is None:
             return
         etype = msg.get("type")
-        if etype in {"compaction_end", "auto_compaction_end"}:
-            if isinstance(msg.get("result"), dict) and not msg.get("aborted") and not msg.get("errorMessage"):
+        if etype in {"compaction_start", "auto_compaction_start",
+                     "compaction_end", "auto_compaction_end"}:
+            succeeded = etype.endswith("_end") and isinstance(msg.get("result"), dict) \
+                and not msg.get("aborted") and not msg.get("errorMessage")
+            if succeeded:
                 self._context_compacted(agent_session_id)
+            sink = handle.get("event_sink")
+            if sink is not None:
+                for event in rpc_compaction_events(msg, handle, succeeded, label="pi"):
+                    sink.put_nowait(event)
             return
         sink = handle.get("event_sink")
         if sink is None:
@@ -1057,6 +1082,9 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
                 sink.put_nowait((AgentEventType.USAGE_UPDATED,
                                  "pi.message_end",
                                  _pi_usage_payload(usage, str(handle.get("usage_message_index", 0)))))
+                context = rpc_context_usage_event(usage, handle, label="pi")
+                if context is not None:
+                    sink.put_nowait(context)
             handle["usage_message_index"] = int(handle.get("usage_message_index", 0)) + 1
             error_message = str(message.get("errorMessage") or "").strip()
             stop_reason = str(message.get("stopReason") or "").strip()
@@ -1237,7 +1265,8 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
             try:
                 # prompt 响应只是 ack；完成由 agent_end/agent_settled 事件
                 # 判定（_dispatch_event 放 __turn_done__ 标记）。
-                prompt_params: dict[str, Any] = {"message": input.text}
+                prompt_params: dict[str, Any] = {"message": text_with_envelopes(
+                    input.text, self.turn_context(session.agent_session_id, input, host=False))}
                 images = pi_prompt_images(input.payload.attachments)
                 if images:
                     prompt_params["images"] = images

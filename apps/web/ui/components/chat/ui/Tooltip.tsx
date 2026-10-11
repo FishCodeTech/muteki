@@ -54,6 +54,10 @@ export interface TooltipProps {
  */
 export function Tooltip({ content, shortcut, placement = "top", disabled, children, className }: TooltipProps) {
   const [open, setOpen] = useState(false);
+  // Lists render hundreds of tooltip triggers; the portal and presence tree
+  // mount on first open and stay so the exit animation can still play.
+  const [mounted, setMounted] = useState(false);
+  if (open && !mounted) setMounted(true);
   const anchorRef = useRef<HTMLElement | null>(null);
   const timer = useRef<number | undefined>(undefined);
   const id = useId();
@@ -116,7 +120,7 @@ export function Tooltip({ content, shortcut, placement = "top", disabled, childr
   return (
     <>
       {trigger}
-      <Portal>
+      {mounted ? <Portal>
         <AnimatePresence>
           {open ? (
             <motion.div
@@ -142,7 +146,7 @@ export function Tooltip({ content, shortcut, placement = "top", disabled, childr
             </motion.div>
           ) : null}
         </AnimatePresence>
-      </Portal>
+      </Portal> : null}
     </>
   );
 }

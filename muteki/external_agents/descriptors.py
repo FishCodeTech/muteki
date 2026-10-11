@@ -437,6 +437,7 @@ _DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
                     session_persistence=True, steer=True, interrupt=True,
                     approval=True, user_input=True, fork=True, mcp=True,
                     usage_events=True, plan=True, image_input=True, compaction=True,
+                    context_usage=True,
                 ),
                 native_rewind=True,
                 scoped_model_catalog_probe=True,
@@ -509,6 +510,7 @@ _DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
                     fork=True, mcp=True, native_tool_binding=True,
                     structured_output=True, subagents=True, tool_events=True,
                     usage_events=True, image_input=True, plan=True, plan_mode=True,
+                    compaction=True, context_usage=True,
                 ),
                 native_rewind=True,
                 transport_settings=(
@@ -648,7 +650,8 @@ _DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
         adapters=(
             AdapterDescriptor(
                 adapter_id="grok.acp", role="default", transport_kind="acp",
-                capabilities=_acp_caps(access_modes=_ALL_ACCESS, subagents=True),
+                capabilities=_acp_caps(access_modes=_ALL_ACCESS, subagents=True, context_usage=True,
+                                       compaction=True),
                 transport_settings=(
                     TransportSetting(
                         name="mcp_ready_wait_seconds", type="number",
@@ -699,16 +702,15 @@ _DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
                     interrupt=True, approval=True, user_input=True, resume=True,
                     session_persistence=True, mcp=True, subagents=True,
                     compaction=True, steer=True, plan=True, plan_mode=True,
+                    context_usage=True,
                 ),
                 accepts_adapter_endpoint=True,
                 access_mode_notes={
                     AccessMode.SUPERVISED.value: (
                         "supervised: shell commands and edits request approval. "
-                        "OpenCode 1.x managed servers install descendant rules "
-                        "through inline config; restricted subagent tools on "
-                        "attached 1.x servers are denied. OpenCode 2.x uses "
-                        "native session rules and routes subagent requests "
-                        "through the parent conversation"
+                        "OpenCode 2 uses native session rules and routes "
+                        "subagent requests through the parent conversation; "
+                        "OpenCode 1.x is rejected as unsupported"
                     ),
                 },
             ),
@@ -768,14 +770,14 @@ _DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
                     "rpc", streaming=True, tool_events=True, usage_events=True,
                     steer=True, interrupt=True, resume=True,
                     session_persistence=True, skills=True, agent_plugin=True,
-                    image_input=True, compaction=True,
+                    image_input=True, compaction=True, context_usage=True,
                 ),
                 transport_settings=(_SESSION_DIR,),
                 notes="No in-band approval: tool scope is fixed by launch flags.",
             ),
             AdapterDescriptor(
                 adapter_id="pi.acp", role="variant", transport_kind="acp",
-                capabilities=_acp_caps(access_modes=_NO_AUTO),
+                capabilities=_acp_caps(access_modes=_NO_AUTO, context_usage=True),
                 binary_resolution="adapter_owned",
                 access_mode_notes={
                     AccessMode.AUTO.value: (
@@ -827,7 +829,7 @@ _DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
                 adapter_id="kimi.acp", role="default", transport_kind="acp",
                 # auto-accept-edits keeps Kimi's native ``default`` mode and the
                 # shared ACP permission callback allows edit-kind tool calls.
-                capabilities=_acp_caps(access_modes=_ALL_ACCESS),
+                capabilities=_acp_caps(access_modes=_ALL_ACCESS, context_usage=True),
             ),
             AdapterDescriptor(
                 adapter_id="kimi.local_server", role="variant", transport_kind="http+ws",
@@ -836,7 +838,7 @@ _DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
                     resume=True, session_persistence=True,
                     interrupt=True, streaming=True, tool_events=True,
                     usage_events=True, approval=True, user_input=True,
-                    steer=True, subagents=True,
+                    steer=True, subagents=True, context_usage=True,
                 ),
                 accepts_adapter_endpoint=True,
                 notes=(
@@ -886,7 +888,7 @@ _DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
         adapters=(
             AdapterDescriptor(
                 adapter_id="omp.acp", role="default", transport_kind="acp",
-                capabilities=_acp_caps(access_modes=_NO_AUTO, subagents=True),
+                capabilities=_acp_caps(access_modes=_NO_AUTO, subagents=True, context_usage=True),
                 access_mode_notes={
                     AccessMode.AUTO.value: (
                         "auto: rejected at session start; OMP --approval-mode "
@@ -901,7 +903,7 @@ _DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
                     "rpc", streaming=True, tool_events=True, usage_events=True,
                     interrupt=True, steer=True, resume=True,
                     session_persistence=True, structured_http_rpc=True,
-                    subagents=True, compaction=True,
+                    subagents=True, compaction=True, context_usage=True,
                 ),
                 transport_settings=(_SESSION_DIR,),
                 notes=(
@@ -955,6 +957,7 @@ _DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
                 adapter_id="devin.acp", role="default", transport_kind="acp",
                 capabilities=_acp_caps(
                     access_modes=("auto-accept-edits", "auto", "full-access"), subagents=True,
+                    context_usage=True, compaction=True,
                 ),
                 access_mode_notes={
                     "supervised": (
@@ -996,9 +999,9 @@ _DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
         ),
         cli=CliSpec(options_before_prompt_flag=True),
         worker=WorkerProfileSpec(transport="devin_cli", protocol_label="Devin CLI"),
-        # No Muteki command catalog: Devin's terminal-only command list is not
-        # known, and its composer relies on the native ACP command list only.
-        commands=CommandCatalogSpec(),
+        # Muteki's own controls work for every engine. Beyond exiting the TUI,
+        # Devin's terminal-only builtins are not known, so no others are claimed.
+        commands=CommandCatalogSpec(client_aliases=dict(_COMMON_ALIASES), terminal_only=("exit", "quit")),
     ),
     ProviderDescriptor(
         identity=_identity("droid", "droid.rpc", "RPC"),
@@ -1009,7 +1012,7 @@ _DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
                     "rpc", access_modes=_ALL_ACCESS,
                     streaming=True, tool_events=True, approval=True, user_input=True,
                     interrupt=True, resume=True, session_persistence=True, mcp=True,
-                    usage_events=True,
+                    usage_events=True, compaction=True, context_usage=True,
                 ),
                 access_mode_notes={
                     "full-access": (
@@ -1061,6 +1064,7 @@ _DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
         ),
         environment=EnvironmentSpec(
             home_env_var="", home_relative=".factory", managed_home=False,
+            user_skill_roots=(".factory/skills", ".agents/skills"),
         ),
         cli=CliSpec(
             reasoning_efforts=_FULL_EFFORTS,
@@ -1071,7 +1075,14 @@ _DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
             protocol_label="Factory Droid CLI",
             official_credential_mode="api_key",
         ),
-        commands=CommandCatalogSpec(client_aliases=dict(_COMMON_ALIASES)),
+        # Droid's own slash commands and skills come from the open session
+        # (droid.list_commands / droid.list_skills); only terminal-bound
+        # builtins are listed here.
+        commands=CommandCatalogSpec(
+            client_aliases=dict(_COMMON_ALIASES),
+            terminal_only=("exit", "quit", "login", "logout", "themes", "statusline",
+                           "terminal-setup", "ide"),
+        ),
     ),
 )
 

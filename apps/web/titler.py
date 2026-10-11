@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import tempfile
 import threading
@@ -42,6 +43,7 @@ from muteki.solver.credential_accounts import (
 )
 
 TITLE_MODEL = "deepseek-v4-flash"
+LOG = logging.getLogger(__name__)
 
 _SYSTEM = (
     "You name chat conversations. Given the user's opening message, reply with a "
@@ -70,6 +72,7 @@ _CONVERSATION_METADATA_ENGINES = frozenset({
     "claude",
     "codex",
     "cursor",
+    "droid",
     "pi",
     "omp",
     "kimi",
@@ -153,6 +156,8 @@ def conversation_metadata_runtime_profile(
     runtime: Any,
     *,
     sessions_root: str | Path,
+    thread_id: str = "",
+    turn_id: str = "",
 ) -> Optional[dict[str, Any]]:
     """Build the CLI profile for a Thread's current Runtime selection.
 
@@ -163,6 +168,15 @@ def conversation_metadata_runtime_profile(
     adapter_id = _runtime_value(runtime, "adapter_id")
     engine = engine_for_adapter(adapter_id) if adapter_id else ""
     if engine not in _CONVERSATION_METADATA_ENGINES:
+        LOG.warning(
+            "conversation metadata runtime is unsupported: thread_id=%s "
+            "turn_id=%s adapter_id=%s engine=%s model=%s",
+            thread_id,
+            turn_id,
+            adapter_id,
+            engine,
+            _runtime_value(runtime, "model"),
+        )
         return None
 
     credential_id = _runtime_value(runtime, "credential_id")
@@ -173,6 +187,14 @@ def conversation_metadata_runtime_profile(
             account_store_root(sessions_root)
         ).inspect(account_id)
         if account is None or not account.present:
+            LOG.warning(
+                "conversation metadata credential account unavailable: "
+                "thread_id=%s turn_id=%s engine=%s model=%s",
+                thread_id,
+                turn_id,
+                engine,
+                _runtime_value(runtime, "model"),
+            )
             return None
         details = dict(account.details or {})
 
@@ -200,6 +222,8 @@ async def generate_conversation_metadata_with_runtime(
     sessions_root: str | Path,
     current_title: str = "",
     generate_title: bool = True,
+    thread_id: str = "",
+    turn_id: str = "",
 ) -> Optional[ConversationMetadata]:
     """Generate metadata through the Thread's currently selected CLI model.
 
@@ -208,9 +232,20 @@ async def generate_conversation_metadata_with_runtime(
     metadata task terminates the subprocess through ``cancel_event``.
     """
     profile = conversation_metadata_runtime_profile(
-        runtime, sessions_root=sessions_root
+        runtime,
+        sessions_root=sessions_root,
+        thread_id=thread_id,
+        turn_id=turn_id,
     )
     if profile is None:
+        LOG.warning(
+            "conversation metadata runtime profile unavailable: thread_id=%s "
+            "turn_id=%s engine=%s model=%s",
+            thread_id,
+            turn_id,
+            _runtime_value(runtime, "adapter_id"),
+            _runtime_value(runtime, "model"),
+        )
         return None
     engine = str(profile["engine"])
     model = str(profile.get("model") or "")
@@ -254,6 +289,11 @@ async def generate_conversation_metadata_with_runtime(
             # Stored credentials must resolve the same account that the Thread
             # selected.  System credentials intentionally resolve to an empty id.
             if account_id and credential.account_id != account_id:
+                LOG.warning(
+                    "conversation metadata credential account mismatch: "
+                    "thread_id=%s turn_id=%s engine=%s model=%s",
+                    thread_id, turn_id, engine, model,
+                )
                 return None
             driver = driver_for(profile)
             driver_env = getattr(driver, "env_extra", lambda: {})() or {}
@@ -301,6 +341,14 @@ async def generate_conversation_metadata_with_runtime(
     except asyncio.CancelledError:
         raise
     except Exception:
+        LOG.exception(
+            "conversation metadata runtime invocation failed: thread_id=%s "
+            "turn_id=%s engine=%s model=%s",
+            thread_id,
+            turn_id,
+            engine,
+            model,
+        )
         return None
 
     if (
@@ -309,16 +357,47 @@ async def generate_conversation_metadata_with_runtime(
         or result.returncode not in (None, 0)
         or result.error
     ):
+        LOG.warning(
+            "conversation metadata runtime returned failure: thread_id=%s "
+            "turn_id=%s engine=%s model=%s cancelled=%s timed_out=%s "
+            "returncode=%s error=%s",
+            thread_id,
+            turn_id,
+            engine,
+            model,
+            result.cancelled,
+            result.timed_out,
+            result.returncode,
+            result.error or "",
+        )
         return None
     metadata = _metadata_json(result.text)
     if metadata is None:
+        LOG.warning(
+            "conversation metadata runtime returned invalid metadata: "
+            "thread_id=%s turn_id=%s engine=%s model=%s",
+            thread_id,
+            turn_id,
+            engine,
+            model,
+        )
         return None
     if not generate_title:
         return ConversationMetadata(
             title=str(current_title or "").strip(),
             summary=metadata.summary,
         )
-    return metadata if metadata.title else None
+    if not metadata.title:
+        LOG.warning(
+            "conversation metadata runtime returned no title: thread_id=%s "
+            "turn_id=%s engine=%s model=%s",
+            thread_id,
+            turn_id,
+            engine,
+            model,
+        )
+        return None
+    return metadata
 
 
 async def generate_conversation_metadata(

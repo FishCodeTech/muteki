@@ -3,7 +3,7 @@
 
 
 import { AnimatePresence, motion, useReducedMotion, type HTMLMotionProps, type Variants } from "motion/react";
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { EASE_OUT, SPRING_PRESS, SPRING_SWAP } from "@/components/agentui/lib/ease";
 import { cn } from "@/lib/cn";
@@ -56,6 +56,9 @@ const ROLL_TRANSITION = SPRING_SWAP;
 const ROLL_EXIT_TRANSITION = { duration: 0.14, ease: EASE_OUT } as const;
 const SWAP_BLUR = "blur(8px)";
 const ROLL_BLUR = "blur(3px)";
+// A resting `blur(0px)` still creates a filter effect per label; with hundreds
+// of tool rows mounted that multiplies paint chunks the compositor must layerize.
+const SETTLED = { filter: "none" } as const;
 
 // Cascade rolls the label one letter at a time, left to right. The leaving
 // and landing strings overlap as independent layers (no shared cells), so
@@ -66,11 +69,12 @@ const CASCADE_OFFSET = 14;
 
 const CASCADE_LETTER_VARIANTS: Variants = {
   initial: { opacity: 0, y: CASCADE_OFFSET, filter: ROLL_BLUR },
-  static: { opacity: 1, y: 0, filter: "blur(0px)" },
+  static: { opacity: 1, y: 0, filter: "none" },
   animate: (delay: number = 0) => ({
     opacity: 1,
     y: 0,
     filter: "blur(0px)",
+    transitionEnd: SETTLED,
     transition: {
       y: { ...SPRING_SWAP, delay },
       opacity: { duration: 0.2, ease: EASE_OUT, delay },
@@ -92,6 +96,7 @@ const TEXT_VARIANTS: Record<CoreAnimation, Variants> = {
       opacity: 1,
       scale: 1,
       filter: "blur(0px)",
+      transitionEnd: SETTLED,
       transition: BLUR_TRANSITION,
     },
     exit: {
@@ -107,6 +112,7 @@ const TEXT_VARIANTS: Record<CoreAnimation, Variants> = {
       opacity: 1,
       y: "0%",
       filter: "blur(0px)",
+      transitionEnd: SETTLED,
       transition: ROLL_TRANSITION,
     },
     exit: {
@@ -125,6 +131,7 @@ const ICON_VARIANTS: Record<CoreAnimation, Variants> = {
       opacity: 1,
       scale: 1,
       filter: "blur(0px)",
+      transitionEnd: SETTLED,
       transition: BLUR_TRANSITION,
     },
     exit: {
@@ -140,6 +147,7 @@ const ICON_VARIANTS: Record<CoreAnimation, Variants> = {
       opacity: 1,
       y: 0,
       filter: "blur(0px)",
+      transitionEnd: SETTLED,
       transition: ROLL_TRANSITION,
     },
     exit: {
@@ -165,6 +173,27 @@ const SIZE_CLASS: Record<ActionSwapButtonSize, string> = {
   icon: "h-10 w-10 rounded-full",
 };
 
+type SwapStage = "static" | "arming" | "live";
+
+/**
+ * Labels in long lists rarely change, so the presence tree mounts only after
+ * the value first changes. The first swap still animates: one layout pass
+ * renders the previous value inside the presence tree, then the new value
+ * replaces it before paint.
+ */
+function useSwapStage(value: string, children: ReactNode, animated: boolean) {
+  const shown = useRef({ value, children });
+  const [stage, setStage] = useState<SwapStage>("static");
+  if (stage === "static" && animated && value !== shown.current.value) setStage("arming");
+  useLayoutEffect(() => {
+    if (stage === "arming") setStage("live");
+  }, [stage]);
+  useLayoutEffect(() => {
+    if (stage === "static") shown.current = { value, children };
+  });
+  return stage === "arming" ? { stage, ...shown.current } : { stage, value, children };
+}
+
 export function ActionSwapText({
   value,
   children,
@@ -184,6 +213,8 @@ export function ActionSwapText({
   const cascade = animation === "cascade" && label !== null;
   const coreAnimation: CoreAnimation =
     animation === "cascade" ? "roll" : animation;
+  const swap = useSwapStage(value, children, motionReady);
+  const shownLabel = typeof swap.children === "string" ? swap.children : (label ?? "");
 
   return (
     <span
@@ -212,26 +243,39 @@ export function ActionSwapText({
             ))
           : children}
       </span>
-      {cascade ? (
+      {swap.stage === "static" ? (
+        cascade ? (
+          <>
+            <span className="sr-only">{label}</span>
+            <span aria-hidden className="absolute left-0 top-[0.08em] inline-block whitespace-pre">
+              {label}
+            </span>
+          </>
+        ) : (
+          <span className="absolute left-0 top-[0.08em] inline-block max-w-full truncate">
+            {children}
+          </span>
+        )
+      ) : cascade ? (
         <>
           {/* Letters are decorative fragments; readers get the whole label. */}
           <span className="sr-only">{label}</span>
           <AnimatePresence initial={false}>
             <motion.span
-              key={`cascade-${value}`}
+              key={`cascade-${swap.value}`}
               aria-hidden
               initial={motionReady ? "initial" : false}
               animate={motionReady ? "animate" : "static"}
               exit={motionReady ? "exit" : undefined}
               className="absolute left-0 top-[0.08em] inline-block whitespace-pre"
             >
-              {label.split("").map((char, i) => (
+              {shownLabel.split("").map((char, i) => (
                 <motion.span
                   // biome-ignore lint/suspicious/noArrayIndexKey: position is the slot identity — the letter at a position is exactly what rolls.
                   key={i}
                   custom={i * CASCADE_STAGGER}
                   variants={CASCADE_LETTER_VARIANTS}
-                  className="inline-block whitespace-pre will-change-[opacity,filter,transform]"
+                  className="inline-block whitespace-pre"
                 >
                   {char}
                 </motion.span>
@@ -242,20 +286,20 @@ export function ActionSwapText({
       ) : (
         <AnimatePresence initial={false}>
           <motion.span
-            key={`${animation}-${value}`}
+            key={`${animation}-${swap.value}`}
             variants={TEXT_VARIANTS[coreAnimation]}
             initial={motionReady ? "initial" : false}
             animate={
               motionReady
                 ? "animate"
-                : { opacity: 1, filter: "blur(0px)", scale: 1, y: 0 }
+                : { opacity: 1, filter: "none", scale: 1, y: 0 }
             }
             exit={motionReady ? "exit" : undefined}
             // Truncation lives on the layer that holds the text — the layer
             // moves as a whole, so clipping it never eats the roll.
-            className="absolute left-0 top-[0.08em] inline-block max-w-full truncate will-change-[opacity,filter,transform]"
+            className="absolute left-0 top-[0.08em] inline-block max-w-full truncate"
           >
-            {children}
+            {swap.children}
           </motion.span>
         </AnimatePresence>
       )}
@@ -276,26 +320,33 @@ export function ActionSwapIcon({
   // Icons are single elements — cascade maps to its closest motion, roll.
   const coreAnimation: CoreAnimation =
     animation === "cascade" ? "roll" : animation;
+  const swap = useSwapStage(value, children, motionReady);
 
   return (
     <span className={cn("relative inline-grid shrink-0 place-items-center overflow-hidden", className)}>
-      <AnimatePresence mode="popLayout" initial={false}>
-        <motion.span
-          key={`${animation}-${value}`}
-          aria-hidden
-          variants={ICON_VARIANTS[coreAnimation]}
-          initial={motionReady ? "initial" : false}
-          animate={
-            motionReady
-              ? "animate"
-              : { opacity: 1, filter: "blur(0px)", scale: 1, y: 0 }
-          }
-          exit={motionReady ? "exit" : undefined}
-          className="col-start-1 row-start-1 inline-flex items-center justify-center will-change-[opacity,filter,transform]"
-        >
+      {swap.stage === "static" ? (
+        <span aria-hidden className="col-start-1 row-start-1 inline-flex items-center justify-center">
           {children}
-        </motion.span>
-      </AnimatePresence>
+        </span>
+      ) : (
+        <AnimatePresence mode="popLayout" initial={false}>
+          <motion.span
+            key={`${animation}-${swap.value}`}
+            aria-hidden
+            variants={ICON_VARIANTS[coreAnimation]}
+            initial={motionReady ? "initial" : false}
+            animate={
+              motionReady
+                ? "animate"
+                : { opacity: 1, filter: "none", scale: 1, y: 0 }
+            }
+            exit={motionReady ? "exit" : undefined}
+            className="col-start-1 row-start-1 inline-flex items-center justify-center"
+          >
+            {swap.children}
+          </motion.span>
+        </AnimatePresence>
+      )}
     </span>
   );
 }

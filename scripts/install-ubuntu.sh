@@ -228,7 +228,7 @@ if [ "$backend" = local ] || [ "$backend" = both ]; then
   install_npm_engine codex '@openai/codex@0.146.0'
   install_npm_engine pi '@earendil-works/pi-coding-agent@0.84.1'
   install_npm_engine kimi '@moonshot-ai/kimi-code@0.40.1'
-  install_npm_engine opencode 'opencode-ai@1.18.22'
+  install_npm_engine opencode '@opencode/cli@2.0.26'
 
   install_droid() {
     if command -v droid >/dev/null 2>&1 && timeout 30 droid --version >/dev/null 2>&1; then

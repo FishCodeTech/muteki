@@ -58,8 +58,10 @@ function CapabilityRows({
         const meta = [
           item.status && item.status !== "available" ? item.status : "",
           ({ limited: "部分支持", unsupported: "暂不可用", unknown: "待验证", expired: "已过期" } as Record<string, string>)[level] || "",
-          disabled && item.reason ? item.reason : "",
         ].filter(Boolean).join(" · ");
+        const disabledReason = disabled
+          ? [item.reason, item.alternative ? `替代：${item.alternative}` : ""].filter(Boolean).join("；")
+          : "";
         return (
           <Fragment key={item.id}>
             {section !== previous ? (
@@ -85,33 +87,44 @@ function CapabilityRows({
               className={cn(
                 "group flex min-h-10 cursor-default select-none items-center gap-2.5 rounded-lg px-2 py-1.5",
                 "data-[active=true]:bg-cx-hover",
-                disabled && "opacity-50",
               )}
             >
               <span
                 className={cn(
                   "grid size-7 shrink-0 place-items-center rounded-lg bg-cx-hover text-cx-fg-3 transition-colors",
                   "group-data-[active=true]:bg-cx-elevated group-data-[active=true]:text-cx-fg group-data-[active=true]:shadow-cx-xs",
+                  disabled && "opacity-50",
                 )}
               >
-                <Icon name={capabilityIcon(item.kind)} size={14} />
+                <Icon name={capabilityIcon(item.kind, item.id)} size={14} />
               </span>
               <span className="flex min-w-0 flex-1 flex-col">
-                <span className="flex min-w-0 items-baseline gap-2">
+                <span className={cn("flex min-w-0 items-baseline gap-2", disabled && "opacity-50")}>
                   <span className="truncate text-[13px] font-medium leading-5 text-cx-fg">{capabilityLabel(item)}</span>
                   {item.argument_hint ? (
                     <span className="truncate font-cx-mono text-[12px] text-cx-fg-4">{item.argument_hint}</span>
                   ) : null}
                 </span>
                 {item.description || meta ? (
-                  <span className="truncate text-[12px] leading-4 text-cx-fg-3">
+                  <span className={cn("truncate text-[12px] leading-4 text-cx-fg-3", disabled && "opacity-50")}>
                     {item.description}
                     {item.description && meta ? " · " : ""}
                     {meta ? <span className="text-cx-fg-4">{meta}</span> : null}
                   </span>
                 ) : null}
+                {disabledReason ? (
+                  <span data-capability-disabled-reason className="text-[12px] leading-4 text-cx-fg-3">{disabledReason}</span>
+                ) : null}
               </span>
-              <span className="ml-2 max-w-[120px] shrink-0 truncate text-[12px] text-cx-fg-4">{item.source}</span>
+              {item.source ? (
+                <span
+                  data-capability-source
+                  title={item.source}
+                  className="ml-2 max-w-[140px] shrink-0 truncate rounded-md bg-cx-hover px-1.5 py-0.5 text-[12px] leading-4 text-cx-fg-3"
+                >
+                  {item.source}
+                </span>
+              ) : null}
             </div>
           </Fragment>
         );

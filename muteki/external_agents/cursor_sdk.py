@@ -72,6 +72,7 @@ from .capabilities import (
     conservative_capabilities,
     require_access_mode,
 )
+from .context_delivery import text_with_envelopes
 from .events import build_event
 from .probe_environment import subprocess_environment
 from .rpc import PeerClosedError, StdioJsonlPeer
@@ -853,7 +854,7 @@ class CursorSdkAdapter(BaseExternalAgentAdapter):
                 ), turn_id=None)
                 return
         turn_id = new_id("turn")
-        text, images = _message_body(input)
+        text, images = _message_body(input, self.turn_context(session.agent_session_id, input))
         record = self.session_record(session.agent_session_id)
         runner = TurnRunner(
             self, session, turn_id=turn_id,
@@ -1491,25 +1492,21 @@ async def _watch_exit(peer: StdioJsonlPeer, queue: asyncio.Queue[dict[str, Any]]
     await queue.put({"type": "event", "kind": "bridge_exited", "exitCode": code})
 
 
-def _message_body(input: MessageInput) -> tuple[str, list[dict[str, str]]]:
-    parts = []
-    if input.payload.capability_context:
-        parts.append(input.payload.capability_context)
-    if input.text:
-        parts.append(input.text)
+def _message_body(
+    input: MessageInput, context_parts: list[Any],
+) -> tuple[str, list[dict[str, str]]]:
+    """Cursor SDK messages carry one text: context envelopes, then the user's text.
+
+    Non-image attachment paths are in the turn's attachment manifest part.
+    """
     images: list[dict[str, str]] = []
-    notes: list[str] = []
     for attachment in input.payload.attachments:
         if attachment.delivery == "native_image" and attachment.content_base64:
             images.append({
                 "data": attachment.content_base64,
                 "mimeType": attachment.media_type or "application/octet-stream",
             })
-        elif attachment.path or attachment.workspace_path:
-            notes.append(attachment.workspace_path or attachment.path)
-    if notes:
-        parts.append("附件路径：\n" + "\n".join(notes))
-    return "\n\n".join(parts), images
+    return text_with_envelopes(input.text, context_parts), images
 
 
 def _token(value: Any) -> Optional[int]:

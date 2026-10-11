@@ -30,8 +30,9 @@ class RunSummaryStore:
     """
 
     # Rebuild indexes written before placeholder run IDs stopped overriding
-    # generated titles. The JSONL event stream is the title source of truth.
-    _VERSION = 3
+    # generated titles, and before Worker placeholder categories stopped
+    # overriding Planner labels. The JSONL event stream is the source of truth.
+    _VERSION = 4
     _FIELDS = (
         "run_id", "name", "category", "mode", "started", "finished", "solved",
         "flag", "flags", "expected_flags", "multi_flag", "events", "ts",
@@ -245,8 +246,9 @@ class RunMetaStore:
     def _mutate(self, run_id: str, **changes: Any) -> dict[str, Any]:
         m = dict(self._data.get(run_id, {}))
         m.update(changes)
-        # drop falsy/None keys so the file stays minimal
-        m = {k: v for k, v in m.items() if v not in (None, False, "")}
+        # Drop unset fields without treating numeric zero as False.
+        m = {k: v for k, v in m.items()
+             if v is not None and v is not False and v != ""}
         if m:
             self._data[run_id] = m
         else:

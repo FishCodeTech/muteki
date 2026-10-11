@@ -425,7 +425,11 @@ def create(self, run_id: str, *, stream_seq: int | None = None) -> Run:
             challenge_name = str(ch.get("name") or "")
             if challenge_name and challenge_name != run.run_id:
                 run.name = challenge_name
-            run.category = ch.get("category", run.category) or run.category
+            # RUN_STARTED carries each Worker's execution copy, whose category
+            # may be a placeholder; only RUN_PREPARING carries the operator's
+            # explicit category. Planner labels arrive via RUN_TITLED.
+            if ev.event_type is EventType.RUN_PREPARING and ch.get("category"):
+                run.category = ch["category"]
             if ch.get("mode") in {"ctf", "pentest"}:
                 run.mode = ch["mode"]
             if ch.get("expected_flags"):

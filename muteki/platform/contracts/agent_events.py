@@ -467,6 +467,31 @@ class UsagePayload(_Payload):
         return self
 
 
+CompactionStatus = Literal["started", "completed", "failed", "interrupted"]
+
+
+class CompactionPayload(_Payload):
+    """Native context compaction, manual (``/compact``) or engine-triggered.
+
+    ``confirmed`` is False only when the engine gives no compaction signal of
+    its own and the executor infers completion from the end of a ``/compact``
+    turn; such records never carry token counts.
+    """
+
+    status: CompactionStatus
+    trigger: Literal["manual", "auto"] = "manual"
+    confirmed: bool = True
+    tokens_before: Optional[int] = Field(default=None, ge=0)
+    tokens_after: Optional[int] = Field(default=None, ge=0)
+    summary: Optional[str] = None
+    message: Optional[str] = None
+
+    @field_validator("message")
+    @classmethod
+    def _redact(cls, value: Optional[str]) -> Optional[str]:
+        return redact_secrets(value) if value else value
+
+
 PlanTaskStatus = Literal["pending", "in_progress", "completed", "blocked", "cancelled"]
 
 
@@ -578,8 +603,8 @@ PayloadModel = Union[
     MessageCompletedPayload, ReasoningPayload, ToolPayload,
     ApprovalRequestedPayload, ApprovalResolvedPayload,
     UserInputRequestedPayload, UserInputResolvedPayload, ArtifactPayload,
-    WorkspaceChangedPayload, UsagePayload, PlanPayload, AgentUpdatedPayload,
-    RuntimeCapabilitiesPayload, RuntimeWarningPayload, RuntimeErrorPayload,
+    WorkspaceChangedPayload, UsagePayload, CompactionPayload, PlanPayload,
+    AgentUpdatedPayload, RuntimeCapabilitiesPayload, RuntimeWarningPayload, RuntimeErrorPayload,
     RuntimeExitedPayload,
 ]
 
@@ -603,6 +628,7 @@ PAYLOAD_MODELS: dict[AgentEventType, type[_Payload]] = {
     AgentEventType.ARTIFACT_CREATED: ArtifactPayload,
     AgentEventType.WORKSPACE_CHANGED: WorkspaceChangedPayload,
     AgentEventType.USAGE_UPDATED: UsagePayload,
+    AgentEventType.COMPACTION_UPDATED: CompactionPayload,
     AgentEventType.PLAN_UPDATED: PlanPayload,
     AgentEventType.AGENT_UPDATED: AgentUpdatedPayload,
     AgentEventType.RUNTIME_CAPABILITIES_UPDATED: RuntimeCapabilitiesPayload,
@@ -670,6 +696,7 @@ __all__ = [
     "ApprovalRequestedPayload",
     "ApprovalResolvedPayload",
     "ArtifactPayload",
+    "CompactionPayload",
     "FailureCategory",
     "MessageCompletedPayload",
     "MessageDeltaPayload",

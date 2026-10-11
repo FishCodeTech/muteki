@@ -65,8 +65,8 @@ DEFAULT_WALL_CLOCK_BUDGET = 0
 DEFAULT_MAX_TOTAL_WORKERS = 0
 DEFAULT_COST_BUDGET_USD = 0.0
 DEFAULT_REVIEW_POLICY = {
-    "enabled": True,
-    "engine": "claude-sub-container",
+    "enabled": False,
+    "engine": "",
     "reasoning_effort": "inherit",
     "after_race": False,
     "after_fruitless_workers": 3,
@@ -114,49 +114,8 @@ DEFAULT_LLM_PROFILES = {
     },
 }
 
-DEFAULT_WORKER_PROFILES = [
-    {"id": "claude-sub-container", "name": "claude-sub-container",
-     "engine": "claude", "transport": "claude_code",
-     "auth": "subscription", "credential_mode": "subscription",
-     "credential_account": "claude-main", "api_key_ref": "", "base_url": "",
-     "wire_api": "",
-     "roles": ["race", "bootstrap", "explore", "respond", "review"],
-     "race": True, "max_running": 2, "max_review_running": 0, "priority": 10, "model": "",
-     "enabled": True},
-    {"id": "codex-sub-container", "name": "codex-sub-container",
-     "engine": "codex", "transport": "codex_cli",
-     "auth": "subscription", "credential_mode": "subscription",
-     "credential_account": "codex-main", "api_key_ref": "", "base_url": "",
-     "wire_api": "responses",
-     "roles": ["race", "bootstrap", "explore", "review"],
-     "race": True, "max_running": 1, "max_review_running": 0, "priority": 20, "model": "",
-     "enabled": True},
-    {"id": "cursor-api-container", "name": "cursor-api-container",
-     "engine": "cursor", "transport": "cursor_agent",
-     "auth": "api_key", "credential_mode": "api_key",
-     "credential_account": "cursor-main", "api_key_ref": "", "base_url": "",
-     "wire_api": "",
-     "roles": ["race", "bootstrap", "explore", "review"],
-     "race": True, "max_running": 2, "max_review_running": 0, "priority": 30, "model": "",
-     "enabled": True},
-    {"id": "pi-sub-container", "name": "pi-sub-container",
-     "engine": "pi", "transport": "pi",
-     "auth": "subscription", "credential_mode": "subscription",
-     "credential_account": "pi-main", "api_key_ref": "", "base_url": "",
-     "wire_api": "",
-     "roles": ["race", "bootstrap", "explore", "review"],
-     "race": True, "max_running": 1, "max_review_running": 0, "priority": 40, "model": "",
-     "enabled": True},
-    {"id": "omp-sub-container", "name": "omp-sub-container",
-     "engine": "omp", "transport": "omp",
-     "auth": "subscription", "credential_mode": "subscription",
-     "credential_account": "omp-main", "api_key_ref": "", "base_url": "",
-     "wire_api": "",
-     "roles": ["race", "bootstrap", "explore", "review"],
-     "race": True, "max_running": 1, "max_review_running": 0, "priority": 50, "model": "",
-     "enabled": True},
-]
-DEFAULT_ENGINES = [p["name"] for p in DEFAULT_WORKER_PROFILES]
+DEFAULT_WORKER_PROFILES = []
+DEFAULT_ENGINES: list[str] = []
 
 
 def resolve_worker_backend(
@@ -229,7 +188,8 @@ def _canonical_profile_aliases(profile: dict[str, Any]) -> set[str]:
 
 def _clean_engines(value: Any, profiles: list[dict[str, Any]] | None = None) -> list[str]:
     """Filter to known profile names, expanding legacy base-engine names."""
-    return normalize_profile_roster(value, profiles or DEFAULT_WORKER_PROFILES)
+    return normalize_profile_roster(
+        value, DEFAULT_WORKER_PROFILES if profiles is None else profiles)
 
 
 def _remap_profile_ref(ref: Any, profiles: list[dict[str, Any]], backend: str) -> Any:
@@ -332,7 +292,7 @@ class WorkerConfigStore:
     def _project_identity_to_legacy(self) -> None:
         """Adapt the stored Seat/Credential model into worker_profiles."""
         d = self._data
-        if not (isinstance(d.get("seats"), list) and d.get("seats")):
+        if not isinstance(d.get("seats"), list):
             return
         try:
             seats = [s for s in d["seats"] if isinstance(s, dict)]
@@ -987,9 +947,9 @@ class WorkerConfigStore:
         worker_pids_limit = resource_limits.pids_limit
         worker_output_limit = resource_limits.output_limit
         worker_disk_limit = resource_limits.disk_limit
-        engines = _clean_engines_for_backend(d.get("engines"), worker_profiles, worker_backend) or [
-            p["name"] for p in worker_profiles if p.get("enabled", True)
-        ]
+        engines = _clean_engines_for_backend(d.get("engines"), worker_profiles, worker_backend)
+        if "engines" not in d:
+            engines = [p["name"] for p in worker_profiles if p.get("enabled", True)]
         start_workers = self._coerce_pos_int(d.get("start_workers"), len(engines))
         max_workers = self._coerce_pos_int(d.get("max_workers"), DEFAULT_MAX_WORKERS)
         race_timeout = self._coerce_pos_int(d.get("race_timeout"), DEFAULT_RACE_TIMEOUT)
@@ -1042,40 +1002,31 @@ class WorkerConfigStore:
                     roles = list(profile.get("roles") or [])
                     if "race" not in roles:
                         profile["roles"] = [*roles, "race"]
-        names = {str(p.get("name") or p.get("id")) for p in worker_profiles}
         review = stage_policy.setdefault("coordinator", {}).setdefault(
             "review", dict(DEFAULT_REVIEW_POLICY))
+        review_ref = (
+            (review.get("engine") or "")
+            if not review.get("enabled")
+            else review.get("engine") or DEFAULT_REVIEW_POLICY["engine"]
+        )
         review_engine = _remap_profile_ref(
-            review.get("engine") or DEFAULT_REVIEW_POLICY["engine"],
+            review_ref,
             worker_profiles,
             worker_backend,
         )
-        if review_engine not in names:
-            review_engine = next(
-                (
-                    str(p.get("name") or p.get("id"))
-                    for p in worker_profiles
-                    if "review" in (p.get("roles") or [])
-                ),
-                engines[0] if engines else DEFAULT_REVIEW_POLICY["engine"],
-            )
         review["engine"] = review_engine
         verifier = stage_policy.setdefault("coordinator", {}).setdefault(
             "verifier", dict(DEFAULT_VERIFIER_POLICY))
+        verifier_ref = (
+            (verifier.get("engine") or "")
+            if not verifier.get("enabled")
+            else verifier.get("engine") or DEFAULT_VERIFIER_POLICY["engine"]
+        )
         verifier_engine = _remap_profile_ref(
-            verifier.get("engine") or DEFAULT_VERIFIER_POLICY["engine"],
+            verifier_ref,
             worker_profiles,
             worker_backend,
         )
-        if verifier_engine not in names:
-            verifier_engine = next(
-                (
-                    str(p.get("name") or p.get("id"))
-                    for p in worker_profiles
-                    if "verifier" in (p.get("roles") or [])
-                ),
-                engines[0] if engines else DEFAULT_VERIFIER_POLICY["engine"],
-            )
         verifier["engine"] = verifier_engine
         overrides: dict[str, Any] = {}
         raw_ov = d.get("overrides")
@@ -1121,7 +1072,7 @@ class WorkerConfigStore:
         # ── additive: attach the Credential/Seat view (Phase A
         # iron rule — old fields above stay; new fields are added alongside so the
         # legacy frontend keeps working while the new UI can consume these). ──
-        if isinstance(self._data.get("seats"), list) and self._data.get("seats"):
+        if isinstance(self._data.get("seats"), list):
             ident = self.identity_model()
         else:
             res = migrate_legacy_config(
@@ -1263,7 +1214,6 @@ class WorkerConfigStore:
                 if isinstance(override, dict) and override.get("start_workers") is not None:
                     self._require_pos_int(override["start_workers"], f"{cat}.start_workers")
         previous_data = copy.deepcopy(self._data)
-        previous_seats = copy.deepcopy(previous_data.get("seats") or [])
         target_backend = (
             self._require_backend(worker_backend)
             if worker_backend is not None
@@ -1277,8 +1227,6 @@ class WorkerConfigStore:
             )
             cleaned = _clean_engines_for_backend(
                 engines, profiles_for_engine_validation, target_backend)
-            if not cleaned:
-                raise ValueError("engines must name at least one enabled worker profile")
             self._data["engines"] = cleaned
         if start_workers is not None:
             self._data["start_workers"] = self._require_pos_int(
@@ -1404,18 +1352,19 @@ class WorkerConfigStore:
         if worker_profiles is not None:
             self._persist_identity_from_legacy()
         try:
-            seeds = self._validate_identity_backend(
-                target_backend,
-                compatible_seats=previous_seats,
-            )
-            self._persist_worker_model_seeds(seeds)
             if llm_profiles is not None:
-                self._persist_llm_credential_migrations(llm_profiles)
-                self._data["llm_profiles"] = self._clean_llm_profiles(
+                clean_llm_profiles = self._clean_llm_profiles(
                     llm_profiles, reject_invalid=True)
+                previous_llm_profiles = self._clean_llm_profiles(
+                    previous_data.get("llm_profiles"))
+                if clean_llm_profiles != previous_llm_profiles:
+                    self._persist_llm_credential_migrations(clean_llm_profiles)
+                self._data["llm_profiles"] = clean_llm_profiles
+            self._validate_seat_credential_references(
+                [row for row in self._data.get("seats") or [] if isinstance(row, dict)],
+                backend=target_backend,
+            )
         except ValueError:
-            # Validation runs after the legacy/new projections have been built;
-            # restore the prior identity projection if the final binding is bad.
             self._data = previous_data
             raise
         effective = self.get()
@@ -1434,8 +1383,52 @@ class WorkerConfigStore:
                     roles = list(profile.get("roles") or [])
                     if "race" not in roles:
                         profile["roles"] = [*roles, "race"]
+        try:
+            self._validate_active_stage_channels(effective)
+        except ValueError:
+            self._data = previous_data
+            raise
         self._flush()
         return self.get()
+
+    @staticmethod
+    def _validate_active_stage_channels(config: dict[str, Any]) -> None:
+        seats = [row for row in config.get("seats") or [] if isinstance(row, dict)]
+        profiles = [
+            row for row in config.get("worker_profiles") or []
+            if isinstance(row, dict)
+        ]
+        seat_refs = {
+            str(ref).strip(): bool(seat.get("enabled", True))
+            for seat in seats
+            for ref in (seat.get("id"), seat.get("label"))
+            if ref
+        }
+        profile_refs = {
+            str(ref).strip(): bool(profile.get("enabled", True))
+            for profile in profiles
+            for ref in (
+                profile.get("id"), profile.get("name"), profile.get("label"),
+                *_canonical_profile_aliases(profile),
+            )
+            if ref
+        }
+        policy = config.get("stage_policy") or {}
+        coordinator = policy.get("coordinator") or {}
+        for channel in ("review", "verifier"):
+            row = coordinator.get(channel) or {}
+            if not row.get("enabled"):
+                continue
+            ref = str(row.get("engine") or "").strip()
+            if not ref:
+                raise ValueError(f"stage_policy.coordinator.{channel}.engine is required when enabled")
+            enabled = seat_refs.get(ref, profile_refs.get(ref))
+            if enabled is None:
+                raise ValueError(
+                    f"stage_policy.coordinator.{channel}.engine must reference a configured Worker")
+            if not enabled:
+                raise ValueError(
+                    f"stage_policy.coordinator.{channel}.engine must reference an enabled Worker")
 
     def _sync_race_engine_roster(self, *, prefer_flat: bool) -> None:
         """Keep the flat race_engines knob and stage_policy.race.engines aligned."""
@@ -1500,12 +1493,12 @@ class WorkerConfigStore:
     ) -> dict[str, Any]:
         """Persist the Credential/Seat model to disk.
 
-        Validates the hard constraint that container execution forbids a
-        system_inherit credential and rejects an illegal combo with ValueError —
-        the save-time gate Codex specified, so an illegal config never persists.
+        Validates structural identity references while leaving credential
+        readiness to the actual execution preflight.
         After writing, re-projects to legacy worker_profiles so the in-memory
         scheduler view stays consistent. Each arg optional; only provided ones
         change. Never silently drops a bad value — it raises."""
+        previous_data = copy.deepcopy(self._data)
         next_seats = self._data.get("seats") or []
         next_credentials = self._data.get("credentials") or []
         if seats is not None:
@@ -1522,18 +1515,12 @@ class WorkerConfigStore:
             if worker_backend is not None
             else self._clean_backend(self._data.get("worker_backend"))
         )
+        self._validate_seat_credential_references(next_seats, backend=backend)
         next_network = (
             self._require_worker_network(worker_network)
             if worker_network is not None
             else self._data.get("worker_network")
         )
-        seeds = self._validate_identity_backend(
-            backend,
-            seats=next_seats,
-            credentials=next_credentials,
-            compatible_seats=self._data.get("seats") or [],
-        )
-        self._persist_worker_model_seeds(seeds)
         self._data["seats"] = next_seats
         self._data["credentials"] = next_credentials
         if worker_backend is not None:
@@ -1543,6 +1530,11 @@ class WorkerConfigStore:
         # keep the legacy projection in sync so get()/scheduler see the change.
         self._project_identity_to_legacy()
         self._sync_worker_counts(link_profile_capacity=True)
+        try:
+            self._validate_active_stage_channels(self.get())
+        except ValueError:
+            self._data = previous_data
+            raise
         self._flush()
         return self.get()
 
@@ -1691,197 +1683,6 @@ class WorkerConfigStore:
             self._data = previous_data
             raise
 
-    def _validate_identity_backend(
-        self,
-        backend: str,
-        *,
-        seats: Any = None,
-        credentials: Any = None,
-        compatible_seats: Any = None,
-    ) -> dict[str, dict[str, Any]]:
-        """Validate enabled seats against one final target backend."""
-        target_seats = (
-            self._data.get("seats") or []
-            if seats is None
-            else seats
-        )
-        from apps.web.worker_models import worker_model_options_payload
-        from muteki.solver.credential_accounts import (
-            CredentialAccountStore,
-            account_id_from_credential_id,
-            account_store_root,
-            canonical_credential_id,
-            detect_system_login,
-            engine_from_system_credential_id,
-        )
-
-        store = CredentialAccountStore(account_store_root(self._root))
-        public_accounts = {
-            str(item.get("account_id") or ""): item
-            for item in store.list()
-            if isinstance(item, dict)
-        }
-        model_catalog = (
-            worker_model_options_payload(self._root).get("models") or {})
-        system_status: dict[str, str] = {}
-        compatibility = {
-            str(item.get("id") or ""): item
-            for item in (compatible_seats or [])
-            if isinstance(item, dict)
-        }
-        seeds: dict[str, dict[str, Any]] = {}
-
-        def catalog_models(engine: str, account_id: str = "") -> list[str]:
-            out: list[str] = []
-            account = public_accounts.get(account_id) or {}
-            for item in [
-                *(account.get("models") or []),
-                *(model_catalog.get(engine) or []),
-            ]:
-                value = str(
-                    item.get("id") if isinstance(item, dict) else item
-                ).strip()
-                if value and value not in out:
-                    out.append(value)
-            return out
-
-        for s in target_seats:
-            # Disabled seats are retained and never dispatched.
-            # They may keep their host-login binding while an active container
-            # roster uses an injectable credential.
-            if not bool(s.get("enabled", True)):
-                continue
-            label = str(s.get("label") or s.get("id") or "未命名 Agent")
-            engine = base_engine_for_profile(s)
-            raw_credential_id = str(s.get("credential_id") or "").strip()
-            try:
-                credential_id = canonical_credential_id(
-                    raw_credential_id, engine=engine)
-            except ValueError as exc:
-                raise ValueError(
-                    f"Agent「{label}」的 credential_id 无效或引擎不匹配") from exc
-            if not credential_id:
-                raise ValueError(f"Agent「{label}」必须选择 credential_id")
-
-            system_engine = engine_from_system_credential_id(credential_id)
-            account_id = account_id_from_credential_id(credential_id)
-            if system_engine:
-                if backend != "local":
-                    raise ValueError(
-                        f"Agent「{label}」在容器环境下不能使用系统登录凭据")
-                if system_engine not in system_status:
-                    system_status[system_engine] = detect_system_login(system_engine)
-                if system_status[system_engine] != "present":
-                    raise ValueError(
-                        f"Agent「{label}」的系统登录凭据 {credential_id} 当前不可用")
-                models = catalog_models(engine)
-            elif account_id:
-                account = store.inspect(account_id)
-                if account is None or not account.present:
-                    raise ValueError(
-                        f"Agent「{label}」引用的凭据账号不存在或未就绪：{credential_id}")
-                details = dict(account.details or {})
-                account_engine = str(
-                    details.get("target_engine") or account.engine or ""
-                ).strip().lower()
-                if account_engine != engine:
-                    raise ValueError(
-                        f"Agent「{label}」使用 {engine}，凭据 {credential_id} "
-                        f"绑定的是 {account_engine or '未知引擎'}")
-                models = catalog_models(engine, account_id)
-            else:
-                raise ValueError(f"Agent「{label}」的 credential_id 无效")
-
-            model = str(s.get("model") or "").strip()
-            if not model:
-                # Empty means the Runtime/CLI default model and remains legal.
-                continue
-            previous_seat = compatibility.get(str(s.get("id") or ""))
-            binding_unchanged = False
-            if previous_seat and bool(previous_seat.get("enabled", True)):
-                previous_engine = base_engine_for_profile(previous_seat)
-                try:
-                    previous_credential_id = canonical_credential_id(
-                        previous_seat.get("credential_id") or "",
-                        engine=previous_engine,
-                    )
-                except ValueError:
-                    previous_credential_id = ""
-                binding_unchanged = (
-                    previous_engine == engine
-                    and previous_credential_id == credential_id
-                    and str(previous_seat.get("model") or "").strip() == model
-                )
-            # A settings save may include the whole roster even when the operator
-            # only changed Planner/Titler, budgets, or another unrelated field.
-            # Preserve an unchanged, already-persisted model binding without
-            # demanding a new test. New/enabled/changed bindings still pass the
-            # real-test and catalog gates below.
-            if binding_unchanged:
-                continue
-            last_test = store.last_test(credential_id, backend=backend, model=model)
-            tested_model = str((last_test or {}).get("model") or "").strip()
-            if last_test and last_test.get("ok") and tested_model and tested_model not in models:
-                models.append(tested_model)
-            if not last_test or not last_test.get("ok") or tested_model != model:
-                raise ValueError(
-                    f"Agent「{label}」的模型 {model!r} 尚未使用凭据 "
-                    f"{credential_id} 完成真实测试")
-            if model not in models:
-                raise ValueError(
-                    f"Agent「{label}」的模型 {model!r} 不属于凭据 "
-                    f"{credential_id} 的 models")
-        return seeds
-
-    def _persist_worker_model_seeds(
-        self, seeds: dict[str, dict[str, Any]]
-    ) -> None:
-        """Seed only unchanged legacy seat models during an explicit save."""
-        if not seeds:
-            return
-        from muteki.solver.credential_accounts import (
-            CredentialAccountStore,
-            account_store_root,
-        )
-
-        store = CredentialAccountStore(account_store_root(self._root))
-        audits = self._data.setdefault("_worker_credential_model_migrations", {})
-        for account_id, seed in seeds.items():
-            account = store.inspect(account_id)
-            if account is None or not account.present:
-                raise ValueError(f"凭据账号不可用：account:{account_id}")
-            details = dict(account.details or {})
-            public = next((
-                item for item in store.list()
-                if str(item.get("account_id") or "") == account_id
-            ), {})
-            models = list(public.get("models") or [])
-            for model in seed.get("models") or []:
-                if model not in models:
-                    models.append(model)
-            metadata_only_engine = (
-                account.engine
-                if account.mode in {"chatgpt_auth_home", "login_home"}
-                or account.engine == "cursor"
-                else "api" if details.get("api_key_file")
-                else account.engine
-            )
-            store.upsert_secret(
-                account_id=account_id,
-                engine=metadata_only_engine,
-                secret=None,
-                base_url=str(details.get("base_url_value") or ""),
-                target_engine=str(
-                    details.get("target_engine") or account.engine or ""),
-                provider=str(details.get("provider") or ""),
-                models=models,
-            )
-            audits[account_id] = {
-                "status": "applied",
-                "models": list(seed.get("models") or []),
-                "seat_ids": list(seed.get("seats") or []),
-            }
-
     def set_configuration(
         self,
         *,
@@ -1912,16 +1713,6 @@ class WorkerConfigStore:
             self._data["seats"] = next_seats
             self._data["credentials"] = next_credentials
             self._project_identity_to_legacy()
-            target_backend = self._require_backend(
-                settings.get("worker_backend")
-                if settings.get("worker_backend") is not None
-                else self._clean_backend(self._data.get("worker_backend"))
-            )
-            seeds = self._validate_identity_backend(
-                target_backend,
-                compatible_seats=previous.get("seats") or [],
-            )
-            self._persist_worker_model_seeds(seeds)
             return self.set(**settings)
         except Exception:
             self._data = previous
@@ -2040,8 +1831,59 @@ class WorkerConfigStore:
             seat = cls._clean_worker_capacity(row, field)
             if "capacity" in seat:
                 seat["capacity"] = cls._clean_worker_capacity(seat["capacity"], f"{field}.capacity")
+            credential_id = str(seat.get("credential_id") or "").strip()
+            if credential_id:
+                from muteki.solver.credential_accounts import canonical_credential_id
+
+                try:
+                    seat["credential_id"] = canonical_credential_id(
+                        credential_id, engine=base_engine_for_profile(seat))
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{field}.credential_id is invalid or belongs to another engine") from exc
             result.append(seat)
         return result
+
+    def _validate_seat_credential_references(
+        self, seats: list[dict[str, Any]], *, backend: str
+    ) -> None:
+        """Check reference shape and known account engine metadata without probing auth."""
+        from muteki.solver.credential_accounts import (
+            CredentialAccountStore,
+            account_id_from_credential_id,
+            account_store_root,
+            engine_from_system_credential_id,
+        )
+
+        store = CredentialAccountStore(account_store_root(self._root))
+        for seat in seats:
+            raw = str(seat.get("credential_id") or "").strip()
+            if not raw:
+                continue
+            engine = base_engine_for_profile(seat)
+            system_engine = engine_from_system_credential_id(raw)
+            if system_engine and system_engine != engine:
+                raise ValueError(
+                    f"seats credential_id {raw!r} does not match engine {engine!r}")
+            if system_engine and backend != "local" and seat.get("enabled", True):
+                raise ValueError(
+                    f"seats credential_id {raw!r} requires the local Worker backend")
+            if system_engine:
+                continue
+            account_id = account_id_from_credential_id(raw)
+            if not account_id:
+                raise ValueError(f"seats credential_id {raw!r} is invalid")
+            account = store.inspect(account_id)
+            if account is None:
+                continue
+            details = dict(account.details or {})
+            account_engine = str(
+                details.get("target_engine") or account.engine or ""
+            ).strip().lower()
+            if account_engine and account_engine != engine:
+                raise ValueError(
+                    f"seats credential_id {raw!r} belongs to {account_engine!r}, "
+                    f"not {engine!r}")
 
     @classmethod
     def _validate_stage_limits(cls, value: Any) -> None:

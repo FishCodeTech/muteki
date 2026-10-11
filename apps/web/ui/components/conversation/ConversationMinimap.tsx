@@ -16,7 +16,9 @@ import { streamCornerTop, useThreadDetailsCardHeight } from "@/lib/threadDetails
 export type MinimapMarker = {
   key: string;
   messageId: string;
-  /** Row offset inside the virtualized list, in px. */
+  /** Virtualizer row index, used to read the live offset via `readRowStart`. */
+  index: number;
+  /** Row offset inside the virtualized list at the parent's last render, in px. */
   start: number;
   seq?: number;
   label: string;
@@ -63,13 +65,21 @@ export function ConversationMinimap({
   streamRef,
   listRef,
   markers,
+  readRowStart,
   onJump,
 }: {
   streamRef: React.RefObject<HTMLDivElement | null>;
   listRef: React.RefObject<HTMLDivElement | null>;
   markers: MinimapMarker[];
+  /**
+   * Row heights can change without the parent re-rendering (the virtualizer
+   * repositions rows directly in the DOM), so offsets are re-read whenever the
+   * list resize observer re-renders the minimap.
+   */
+  readRowStart?: (index: number) => number | undefined;
   onJump: (messageId: string) => void;
 }) {
+  const startOf = (marker: MinimapMarker) => readRowStart?.(marker.index) ?? marker.start;
   const [metrics, setMetrics] = useState<StreamMetrics | null>(null);
   const [hovered, setHovered] = useState<string>("");
   const trackRef = useRef<HTMLDivElement>(null);
@@ -77,22 +87,27 @@ export function ConversationMinimap({
   const frameRef = useRef(0);
   const detailsHeight = useThreadDetailsCardHeight();
 
+  const measureNow = useCallback(() => {
+    cancelAnimationFrame(frameRef.current);
+    const stream = streamRef.current;
+    if (!stream) return;
+    const next = readMetrics(stream, listRef.current);
+    setMetrics((prev) => (sameMetrics(prev, next) ? prev : next));
+  }, [listRef, streamRef]);
   const measure = useCallback(() => {
     cancelAnimationFrame(frameRef.current);
-    frameRef.current = requestAnimationFrame(() => {
-      const stream = streamRef.current;
-      if (!stream) return;
-      const next = readMetrics(stream, listRef.current);
-      setMetrics((prev) => (sameMetrics(prev, next) ? prev : next));
-    });
-  }, [listRef, streamRef]);
+    frameRef.current = requestAnimationFrame(measureNow);
+  }, [measureNow]);
 
   useEffect(() => {
     const stream = streamRef.current;
     if (!stream) return;
     measure();
     stream.addEventListener("scroll", measure, { passive: true });
-    const observer = new ResizeObserver(measure);
+    // Resize callbacks run right after layout, so reading there is free; a
+    // deferred read would land after animation frames have dirtied layout
+    // again and force a second layout every frame of a panel transition.
+    const observer = new ResizeObserver(measureNow);
     observer.observe(stream);
     if (listRef.current) observer.observe(listRef.current);
     return () => {
@@ -100,7 +115,7 @@ export function ConversationMinimap({
       stream.removeEventListener("scroll", measure);
       observer.disconnect();
     };
-  }, [listRef, measure, streamRef]);
+  }, [listRef, measure, measureNow, streamRef]);
 
   // Row measurements change without a scroll or resize on the stream itself.
   useLayoutEffect(() => {
@@ -120,7 +135,7 @@ export function ConversationMinimap({
   const center = metrics.scrollTop + metrics.clientHeight / 3;
   let activeKey = "";
   for (const marker of markers) {
-    if (metrics.listTop + marker.start <= center) activeKey = marker.key;
+    if (metrics.listTop + startOf(marker) <= center) activeKey = marker.key;
     else break;
   }
 
@@ -171,7 +186,7 @@ export function ConversationMinimap({
           data-testid="conversation-minimap-viewport"
         />
         {markers.map((marker) => {
-          const top = Math.min(trackHeight - 2, toTrack(metrics.listTop + marker.start));
+          const top = Math.min(trackHeight - 2, toTrack(metrics.listTop + startOf(marker)));
           const active = marker.key === activeKey;
           return (
             <button
@@ -201,7 +216,7 @@ export function ConversationMinimap({
       {hoveredMarker ? (
         <div
           className="pointer-events-none absolute right-8 w-max max-w-[260px] -translate-y-1/2 rounded-lg bg-cx-overlay px-2.5 py-1.5 shadow-cx-pop"
-          style={{ top: Math.min(trackHeight - 2, toTrack(metrics.listTop + hoveredMarker.start)) }}
+          style={{ top: Math.min(trackHeight - 2, toTrack(metrics.listTop + startOf(hoveredMarker))) }}
           role="tooltip"
           data-testid="conversation-minimap-tooltip"
         >

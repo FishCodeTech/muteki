@@ -64,6 +64,7 @@
 .ae-empty button{margin-top:7px;border:1px solid var(--dsw-alias-border-l1);border-radius:7px;background:var(--panel);color:var(--dsw-alias-label-primary);padding:7px 12px;font-size:12px;cursor:pointer}
 .ae-native{border-top:1px solid var(--dsw-alias-border-l1);border-bottom:1px solid var(--dsw-alias-border-l1)}
 .ae-native>p{margin:0;padding:13px 15px;background:var(--panel2);color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:1.6}
+.ae-native-group{margin:0;padding:10px 15px 6px;border-top:1px solid var(--dsw-alias-border-l1);color:var(--muted);font-size:11px;font-weight:600}
 .ae-native-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:3px 12px;padding:13px 15px;border-top:1px solid var(--dsw-alias-border-l1);font-size:12px}
 .ae-native-row strong{font-weight:600;overflow-wrap:anywhere}
 .ae-native-row span{color:var(--muted);font-size:11px}

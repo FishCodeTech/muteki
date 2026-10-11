@@ -90,6 +90,7 @@ let prefsDirty = false;
 const prefsListeners = new Set<(prefs: NotificationPrefs) => void>();
 let prefsStorageListener = false;
 export interface NotificationDeliveryDiagnostic {
+  test?: boolean;
   status: DesktopNotificationStage | "submitting"; host: "desktop-client";
   threadId: string; eventId: string; dedupeKey: string; id?: string; seq?: number;
   shown?: boolean; code?: string; message?: string;
@@ -237,7 +238,10 @@ function queueDesktopNotification(event: ConversationInboxEvent, dedupeKey: stri
       const status = uncertain ? "outcome_unknown" : "failed";
       publishDelivery({ ...initial, ...pending.input, status, shown: pending.shown || false, code, message,
         history: [...initial.history, { status, at: new Date().toISOString(), code, message }] });
-      return pending.admitted === true;
+      if (pending.admitted) return true;
+      // Preserve the native failure for the inbox diagnostic. Returning false
+      // here hides it behind a generic admission error.
+      throw error;
     }
   })();
   // A sound cue is independent evidence; it is never an OS display receipt.
@@ -639,6 +643,34 @@ async function desktopNotificationPermission(request: boolean): Promise<DesktopN
 export async function readNotificationPermissionStatus(): Promise<NotificationPermissionStatus> {
   if (desktopChatBridge()) return desktopNotificationPermission(false);
   return { host: "browser", permission: typeof window === "undefined" || !("Notification" in window) ? "unsupported" : Notification.permission };
+}
+
+/** Explicit permission test; never creates a chat or changes alert preferences. */
+export async function sendTestNotification(): Promise<{ host: "desktop-client" | "browser"; permissionStatus?: NotificationPermissionStatus }> {
+  const bridge = desktopChatBridge();
+  if (!bridge) {
+    if (typeof window === "undefined" || !("Notification" in window)) throw new Error("当前环境不支持系统通知。");
+    if (Notification.permission !== "granted") throw new Error("请先允许浏览器发送通知。");
+    const note = new Notification("Muteki 测试通知", {
+      body: "这是一条测试通知。点击返回通知设置。", tag: `muteki-test:${crypto.randomUUID()}`,
+    });
+    note.onclick = () => { window.focus(); note.close(); };
+    return { host: "browser" };
+  }
+  const owner = conversationStorageScope(), transport = API;
+  const status = await desktopNotificationPermission(false);
+  if (!bridge.testNotification) throw new Error("desktop.notifications_test_unavailable: 当前桌面版本不支持测试通知，请更新应用。");
+  const reply = await bridge.testNotification({ connectionVersion: status.connectionVersion,
+    serviceId: status.serviceId, identityId: status.identityId,
+    wantSound: ["sound", "notifications-and-sound"].includes(readNotificationPrefs().mode) });
+  if (owner !== conversationStorageScope() || transport !== API || !currentNativeDelivery(reply)) {
+    throw new Error("desktop.notification_scope_changed: 通知所属工作台已改变。");
+  }
+  if (!validNativeDelivery(reply) || !reply.test || reply.threadId !== "__notification_test__") {
+    throw new Error("desktop.notification_reply_invalid: 测试通知回执无效。");
+  }
+  acceptNativeDelivery(reply);
+  return { host: "desktop-client", permissionStatus: status };
 }
 
 export async function requestNotificationPermissionStatus(): Promise<NotificationPermissionStatus> {

@@ -32,6 +32,8 @@ import {
 } from "@/lib/resourcePreview";
 import { isLocalPreviewUrl } from "@/lib/previewUrlDetect";
 import { openLocalUrl } from "@/components/chat/timeline/LocalUrlChips";
+import { ChatImage, isRemoteMarkdownImage } from "./ChatImage";
+import { ExpandableImage } from "@/components/chat/media/ImageViewer";
 
 export interface ChatMarkdownProps {
   text: string;
@@ -210,11 +212,13 @@ function buildComponents(options: {
         </div>
       );
     },
-    img({ src, alt, node: _node, ...props }) {
+    img({ src, alt }) {
       const safeSrc = typeof src === "string" ? safeMarkdownUrlTransform(src) : "";
       if (!safeSrc) return alt ? <span className="cx-md-img-alt">{alt}</span> : null;
-      // eslint-disable-next-line @next/next/no-img-element
-      return <img {...props} src={safeSrc} alt={alt || ""} loading="lazy" decoding="async" className="cx-md-img" />;
+      if (!isRemoteMarkdownImage(safeSrc)) {
+        return <ChatImage src={safeSrc} alt={alt || ""} threadId={threadId} className="cx-md-img" />;
+      }
+      return <ExpandableImage src={safeSrc} alt={alt || ""} className="cx-md-img" />;
     },
     input({ type, checked, node: _node, ...props }) {
       if (type !== "checkbox") return <input type={type} {...props} />;

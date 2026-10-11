@@ -322,7 +322,6 @@ export function TodoList({
                 const status = item.status ?? "pending";
                 return (
                   <motion.li
-                    layout="position"
                     key={item.id}
                     initial={reduce ? { opacity: 1 } : { opacity: 0, y: 6 }}
                     animate={{ opacity: 1, y: 0 }}
@@ -333,7 +332,6 @@ export function TodoList({
                         : {
                             opacity: { duration: 0.18, ease: EASE_OUT },
                             y: SPRING_LAYOUT,
-                            layout: SPRING_LAYOUT,
                           }
                     }
                     className="flex min-h-9 items-center gap-2.5 rounded-xl px-1.5 py-1"

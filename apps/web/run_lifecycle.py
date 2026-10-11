@@ -322,16 +322,32 @@ async def _resolve_launching(
 
     continuation = self.load_winner_continuation(run_id)
     ch = continuation.get("challenge") or {}
+    launch_challenge: dict[str, Any] = {}
+    launch_is_preparing = False
+    try:
+        async for ev in run.store.replay(run_id):
+            if ev.event_type in {
+                EventType.RUN_PREPARING, EventType.RUN_STARTED,
+            }:
+                launch_challenge = (ev.payload or {}).get("challenge") or {}
+                launch_is_preparing = ev.event_type is EventType.RUN_PREPARING
+                break
+    except Exception:
+        LOG.exception("failed to replay launch challenge for %s", run_id)
+        launch_challenge = {}
+        launch_is_preparing = False
     if not ch:
-        try:
-            async for ev in run.store.replay(run_id):
-                if ev.event_type in {
-                    EventType.RUN_PREPARING, EventType.RUN_STARTED,
-                }:
-                    ch = (ev.payload or {}).get("challenge") or {}
-                    break
-        except Exception:
-            ch = {}
+        ch = dict(launch_challenge)
+    elif launch_is_preparing:
+        # The winner's challenge is the Worker execution copy, whose category
+        # may be a placeholder. The launch RUN_PREPARING carries only the
+        # operator's explicit category; keep that so continuation does not
+        # promote the placeholder into an explicit roster category.
+        ch = dict(ch)
+        if launch_challenge.get("category"):
+            ch["category"] = launch_challenge["category"]
+        else:
+            ch.pop("category", None)
     if not ch:  # degrade to rail metadata
         ch = {"name": run.name or run_id, "category": run.category or "web",
               "expected_flags": run.expected_flags,

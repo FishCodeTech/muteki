@@ -399,7 +399,10 @@ export function ComposerPromptDocument({
     publishCaret(next, offset, compositionActive);
   };
 
-  const empty = !plainTextFromDocument(doc).trim()
+  // IME preedit text lives only in the DOM until compositionend, so the
+  // document still looks empty while candidates are being picked.
+  const empty = !composing
+    && !plainTextFromDocument(doc).trim()
     && !doc.segments.some((segment) => segment.type === "ref");
 
   return (
@@ -618,7 +621,7 @@ export function ContextNodeChip({
       data-node-id={node.node_id}
       data-ref-status={tone}
     >
-      <Icon name={capabilityIcon(node.kind)} size={11} className="shrink-0" />
+      <Icon name={capabilityIcon(node.kind, node.id)} size={11} className="shrink-0" />
       <button
         type="button"
         className="min-w-0 truncate rounded-sm text-left enabled:hover:underline enabled:hover:underline-offset-2 disabled:cursor-default"

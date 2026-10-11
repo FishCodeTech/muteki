@@ -81,6 +81,11 @@
           "title": "Compaction",
           "type": "boolean"
         },
+        "context_usage": {
+          "default": false,
+          "title": "Context Usage",
+          "type": "boolean"
+        },
         "fork": {
           "default": false,
           "title": "Fork",
@@ -359,6 +364,7 @@
         "artifact.created",
         "workspace.changed",
         "usage.updated",
+        "compaction.updated",
         "plan.updated",
         "agent.updated",
         "runtime.capabilities_updated",
@@ -1753,6 +1759,58 @@
       "title": "CommandReceipt",
       "type": "object"
     },
+    "ContextPart": {
+      "additionalProperties": false,
+      "description": "Context Muteki adds next to the user's own message.\n\nThe user's text always travels unchanged in ``MessageInput.text``. Every\npart keeps its source (``key``), its role (``kind``) and whether it carries\nhost rules (``application``) or data the model must not obey as\ninstructions (``untrusted``), so each adapter can use a native channel and\nevery display can hide it.",
+      "properties": {
+        "key": {
+          "pattern": "^muteki\\.[a-z0-9][a-z0-9._-]*$",
+          "title": "Key",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "host_instructions",
+            "reference",
+            "attachment_manifest",
+            "history_handoff"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "requires_gateway": {
+          "default": false,
+          "title": "Requires Gateway",
+          "type": "boolean"
+        },
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "text": {
+          "minLength": 1,
+          "title": "Text",
+          "type": "string"
+        },
+        "trust": {
+          "enum": [
+            "application",
+            "untrusted"
+          ],
+          "title": "Trust",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "kind",
+        "trust",
+        "text"
+      ],
+      "title": "ContextPart",
+      "type": "object"
+    },
     "DomainModuleDescriptor": {
       "additionalProperties": false,
       "description": "领域模块声明（任务书 6.8 字段清单）。",
@@ -3056,15 +3114,17 @@
           "title": "Attachments",
           "type": "array"
         },
-        "capability_context": {
-          "default": "",
-          "title": "Capability Context",
-          "type": "string"
-        },
         "client_user_message_id": {
           "default": "",
           "title": "Client User Message Id",
           "type": "string"
+        },
+        "context_parts": {
+          "items": {
+            "$ref": "#/$defs/ContextPart"
+          },
+          "title": "Context Parts",
+          "type": "array"
         },
         "interaction_mode": {
           "default": "default",
@@ -3074,6 +3134,11 @@
           ],
           "title": "Interaction Mode",
           "type": "string"
+        },
+        "native_command": {
+          "default": false,
+          "title": "Native Command",
+          "type": "boolean"
         },
         "runtime_capability": {
           "additionalProperties": true,
@@ -4139,6 +4204,20 @@
           "title": "Chat Hook Approvals",
           "type": "object"
         },
+        "chat_native_agents": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Chat Native Agents",
+          "type": "array"
+        },
+        "chat_native_extensions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Chat Native Extensions",
+          "type": "array"
+        },
         "chat_native_plugins": {
           "items": {
             "additionalProperties": {
@@ -4206,6 +4285,13 @@
           "title": "Hooks",
           "type": "object"
         },
+        "host_context": {
+          "items": {
+            "$ref": "#/$defs/ContextPart"
+          },
+          "title": "Host Context",
+          "type": "array"
+        },
         "kb_access": {
           "default": true,
           "title": "Kb Access",
@@ -4222,6 +4308,11 @@
           ],
           "default": null,
           "title": "Max Turns"
+        },
+        "native_rollout_path": {
+          "default": "",
+          "title": "Native Rollout Path",
+          "type": "string"
         },
         "plugins": {
           "items": {
@@ -4262,6 +4353,13 @@
           ],
           "default": null,
           "title": "Resource Scopes"
+        },
+        "resume_context": {
+          "items": {
+            "$ref": "#/$defs/ContextPart"
+          },
+          "title": "Resume Context",
+          "type": "array"
         },
         "resume_prompt": {
           "default": "",

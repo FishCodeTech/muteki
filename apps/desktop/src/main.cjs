@@ -11,15 +11,21 @@ const { NativeSpeech } = require('./speech.cjs');
 const { ServiceAuthSessions } = require('./auth.cjs');
 let authSessions;
 const { createPreviewControl, pickElement, cancelPick } = require('./preview-control.cjs');
-const { desktopEnvironment, runtimePaths, atomicJson } = require('./environment.cjs');
+const { desktopEnvironment, runtimePaths, atomicJson, hostEnvironment } = require('./environment.cjs');
 const { ManagedService } = require('./managed-service.cjs');
 
 const launchOption = name => process.argv.find(value => value.startsWith(`--muteki-${name}=`))?.split('=').slice(1).join('=');
 const workspace = process.env.MUTEKI_DESKTOP_WORKSPACE || path.resolve(__dirname, '../../..');
 const buildChannel = require(path.join(app.getAppPath(), 'package.json')).mutekiChannel;
 if (app.isPackaged && buildChannel !== 'dev' && launchOption('channel') === 'dev') throw new Error('Use the dedicated Muteki Dev build for desktop automation');
+const channel = launchOption('channel') || buildChannel || (app.isPackaged ? 'stable' : 'dev');
+if (channel !== 'candidate') {
+  const host = hostEnvironment(process.env);
+  for (const key of Object.keys(process.env)) if (!(key in host)) delete process.env[key];
+  Object.assign(process.env, host);
+}
 const environment = desktopEnvironment({ appData: process.env.MUTEKI_DESKTOP_USER_DATA || app.getPath('appData'), packaged: app.isPackaged,
-  channel: launchOption('channel') || buildChannel,
+  channel,
   root: launchOption('environment-root') || process.env.MUTEKI_ENVIRONMENT_ROOT || (process.env.MUTEKI_DESKTOP_USER_DATA ? path.join(process.env.MUTEKI_DESKTOP_USER_DATA, 'environment') : undefined), workspace });
 app.setName(environment.name);
 app.setPath('userData', process.env.MUTEKI_DESKTOP_USER_DATA ? path.resolve(process.env.MUTEKI_DESKTOP_USER_DATA) : environment.paths.desktop);
@@ -399,29 +405,49 @@ async function navigate(record, value, mode = 'push', historyIndex) {
   const remoteRoute = !/^\/(chat|settings)(\/|\?|$)/.test(route) && route !== '/';
   if (route === record.state.route && !record.state.configuring && !record.navigationPending
       && (!remoteRoute || (record.remote && !record.remote.webContents.isDestroyed()))) {
-    if (mode === 'traverse' && historyIndex !== record.navigation?.index) { commitRoute(record, route, mode, historyIndex); persist(record); }
-    if (!remoteRoute) emit(record, {anchorTarget});
-    else if (target.hash) await record.remote.webContents.loadURL(record.scope.origin + route + target.hash);
+    if (!remoteRoute) {
+      if (mode === 'traverse' && historyIndex !== record.navigation?.index) { commitRoute(record, route, mode, historyIndex); persist(record); }
+      emit(record, {anchorTarget});
+    }
+    else if (target.hash) {
+      const generation = record.navigationGeneration = (record.navigationGeneration || 0) + 1;
+      const scope = record.scope, remote = record.remote;
+      record.navigationPending = true;
+      const current = () => generation === record.navigationGeneration && scope === record.scope && !scope.closed
+        && !record.window.isDestroyed() && record.remote === remote;
+      try { await remote.webContents.loadURL(scope.origin + route + target.hash); }
+      catch (cause) {
+        if (!current()) return;
+        throw new DesktopError('desktop.page_load_failed', '工作台页面加载失败，请重试。', { retryable: true, cause });
+      } finally { if (generation === record.navigationGeneration) record.navigationPending = false; }
+      if (current() && mode === 'traverse' && historyIndex !== record.navigation?.index) { commitRoute(record, route, mode, historyIndex); persist(record); }
+    } else if (mode === 'traverse' && historyIndex !== record.navigation?.index) {
+      commitRoute(record, route, mode, historyIndex); persist(record);
+    }
     return;
   }
   const generation = record.navigationGeneration = (record.navigationGeneration || 0) + 1;
-  record.navigationPending = false;
+  const scope = record.scope;
+  const current = () => generation === record.navigationGeneration && scope === record.scope
+    && !scope?.closed && !record.window.isDestroyed();
+  record.navigationPending = true;
   disposePreview(record);
   emit(record, {anchorTarget: undefined});
   if (/^\/(chat|settings)(\/|\?|$)/.test(route) || route === '/') {
     disposeRemote(record); commitRoute(record, route, mode, historyIndex);
     emit(record, {anchorTarget});
-    persist(record); return;
+    persist(record); record.navigationPending = false; return;
   }
-  if (!record.scope) throw new DesktopError('desktop.not_connected', '请先连接工作台。');
+  if (!scope) { record.navigationPending = false; throw new DesktopError('desktop.not_connected', '请先连接工作台。'); }
   disposeRemote(record);
   let remote;
   try {
-    const origin = record.scope.origin, partition = partitionFor(origin, record.scope.environmentId);
+    const origin = scope.origin, partition = partitionFor(origin, scope.environmentId);
     const remoteSession = session.fromPartition(partition);
-    if (record.scope.environmentId && managedService?.ready && record.scope.auth.token) {
-      await remoteSession.cookies.set({ url: origin + '/api', name: managedService.ready.cookie_name, value: record.scope.auth.token, httpOnly: true, sameSite: 'strict', path: '/api' });
+    if (scope.environmentId && managedService?.ready && scope.auth.token) {
+      await remoteSession.cookies.set({ url: origin + '/api', name: managedService.ready.cookie_name, value: scope.auth.token, httpOnly: true, sameSite: 'strict', path: '/api' });
     }
+    if (!current()) return;
     const permitsClipboard = (contents, permission, requestingOrigin, details) =>
       permission === 'clipboard-sanitized-write' && details?.isMainFrame !== false &&
       parseWebUrl(requestingOrigin)?.origin === origin && parseWebUrl(contents?.getURL())?.origin === origin &&
@@ -435,12 +461,11 @@ async function navigate(record, value, mode = 'push', historyIndex) {
     remote.webContents.setUserAgent(remote.webContents.getUserAgent().replace(/\sMutekiDesktop\/[^\s]+/g, '') + ` MutekiDesktop/${app.getVersion()}`);
     remote.webContents.on('dom-ready', () => { if (record.remote === remote) void applyRemoteChrome(record, remote.webContents).catch(error => { if (record.remote === remote) emit(record, {message: `远程界面外观同步失败：${error.message}`}); }); });
     record.remote = remote; record.window.contentView.addChildView(remote); remoteBounds(record);
-    record.navigationPending = true;
-    guardRemote(record, remote.webContents, record.scope.origin);
-    await remote.webContents.loadURL(record.scope.origin + route + target.hash);
-    if (record.remote !== remote || record.scope.closed || generation !== record.navigationGeneration) throw new DesktopError('desktop.navigation_cancelled', '该导航已由较新的请求替代。');
+    guardRemote(record, remote.webContents, scope.origin);
+    await remote.webContents.loadURL(scope.origin + route + target.hash);
+    if (!current() || record.remote !== remote) return;
     await applyRemoteChrome(record, remote.webContents);
-    if (record.remote !== remote || generation !== record.navigationGeneration) return;
+    if (!current() || record.remote !== remote) return;
     remote.setVisible(true);
     const destination = new URL(remote.webContents.getURL());
     const loadedRoute = safeRoute(destination.pathname + destination.search + destination.hash);
@@ -448,7 +473,7 @@ async function navigate(record, value, mode = 'push', historyIndex) {
     if (loadedRoute !== route) commitRoute(record, loadedRoute, 'replace');
     persist(record);
   } catch (cause) {
-    if (record.remote !== remote) throw new DesktopError('desktop.navigation_cancelled', '该导航已由较新的请求替代。');
+    if (!current()) return;
     disposeRemote(record); throw new DesktopError('desktop.page_load_failed', '工作台页面加载失败，请重试。', { retryable: true, cause });
   } finally { if (generation === record.navigationGeneration) record.navigationPending = false; }
 }
@@ -727,15 +752,18 @@ function notificationChoice(record, scope) {
   record.notificationPermission = { scope, key, allowed };
   return allowed;
 }
+async function nativeNotificationOperation(method, timeout = 5000) {
+  const native = require(app.isPackaged ? path.join(process.resourcesPath, 'native', 'macos-speech.node') : path.join(__dirname, '..', 'native', 'build', 'macos-speech.node'));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new DesktopError('desktop.notification_status_timeout', `macOS ${method} did not respond within ${timeout / 1000}s.`)), timeout);
+    try { native[method](raw => { clearTimeout(timer); try { const result = JSON.parse(raw); if (result.error) { const error = new DesktopError(result.error.code, result.error.message, { cause: Object.assign(new Error(result.error.message), result.error) }); error.nativeDetails = result.error; reject(error); } else resolve(result); } catch (error) { reject(error); } }); }
+    catch (error) { clearTimeout(timer); reject(error); }
+  });
+}
 async function systemNotificationPermission() {
   if (process.platform !== 'darwin') return { systemPermission: 'unknown' };
   try {
-    const native = require(app.isPackaged ? path.join(process.resourcesPath, 'native', 'macos-speech.node') : path.join(__dirname, '..', 'native', 'build', 'macos-speech.node'));
-    const settings = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new DesktopError('desktop.notification_status_timeout', 'macOS notification settings did not respond within 5s.')), 5000);
-      try { native.notificationSettings(raw => { clearTimeout(timer); try { const result = JSON.parse(raw); if (result.error) { const error = new DesktopError(result.error.code, result.error.message, { cause: Object.assign(new Error(result.error.message), result.error) }); error.nativeDetails = result.error; reject(error); } else resolve(result); } catch (error) { reject(error); } }); }
-      catch (error) { clearTimeout(timer); reject(error); }
-    });
+    const settings = await nativeNotificationOperation('notificationSettings');
     const permissions = { notDetermined: 'default', denied: 'denied', authorized: 'granted', provisional: 'provisional', ephemeral: 'ephemeral', unknown: 'unknown' };
     if (!(settings.authorizationStatus in permissions)) throw new DesktopError('desktop.notification_status_invalid', `Invalid macOS authorization status: ${JSON.stringify(settings)}`);
     return { systemPermission: permissions[settings.authorizationStatus], systemNotificationSettings: settings };
@@ -793,6 +821,10 @@ async function requestNotifications(record, input) {
           disposeNotifications(owner, 'desktop.notifications_workspace_denied');
         }
       }
+      if (allowed && process.platform === 'darwin') {
+        await nativeNotificationOperation('requestNotifications', 120000);
+        if (notificationScope(record, input) !== scope) throw new DesktopError('desktop.notification_scope_changed', 'Notification workspace changed during authorization.');
+      }
       return notificationStatus(record, input);
     } catch (error) {
       if (error instanceof DesktopError) throw error;
@@ -810,6 +842,7 @@ function notificationEvent(entry, status, code, message) {
   entry.history.push({ status, at: new Date().toISOString(), ...(code ? { code } : {}), ...(message ? { message } : {}) });
   const value = { connectionVersion: scope.version, serviceId: scope.serviceId, identityId: scope.identityId,
     id: entry.id, threadId: entry.threadId, eventId: entry.eventId, dedupeKey: entry.dedupeKey,
+    ...(entry.test ? { test: true } : {}),
     seq: record.notificationSequence = (record.notificationSequence || 0) + 1, status, shown: entry.shown, ...(entry.system || {}), soundRequested: entry.soundRequested === true, shownReceiptMeaning: process.platform === 'darwin' ? 'system-accepted-scheduling' : 'native-show-event',
     ...(code ? { code } : {}), ...(message ? { message } : {}), history: entry.history.map(item => ({ ...item })) };
   entry.last = value;
@@ -836,6 +869,16 @@ function disposeNotifications(record, code) {
     releaseNotification(entry, true);
   }
 }
+// shell.beep() follows the macOS alert volume (often muted) and native
+// notification sounds depend on per-app Notification Center settings and
+// foreground state, so the cue is played explicitly.
+const MAC_CUE_SOUND = '/System/Library/Sounds/Glass.aiff';
+function playCueSound() {
+  if (process.platform !== 'darwin' || !fs.existsSync(MAC_CUE_SOUND)) { shell.beep(); return; }
+  const child = spawn('/usr/bin/afplay', [MAC_CUE_SOUND], { stdio: 'ignore' });
+  child.on('error', error => console.error('muteki.notification.sound_failed', error.stack || error.message || String(error)));
+  child.unref();
+}
 function playNotificationSound(record, input) {
   const scope = notificationScope(record, input);
   if (!isNotificationOwner(record)) throw new DesktopError('desktop.notification_owner_changed', 'This window no longer owns workspace notifications.');
@@ -846,7 +889,7 @@ function playNotificationSound(record, input) {
     && notificationConsentKey(owner.scope) === workspace && !owner.state.configuring && !owner.remote && owner.window.isVisible() && !owner.window.isMinimized() && notificationWindowFocused(owner) && activeThread(owner, input.threadId));
   const status = visible ? 'suppressed' : requestedNotificationSounds.has(key) ? 'already-requested' : 'sound-requested';
   if (status === 'sound-requested') {
-    try { shell.beep(); }
+    try { playCueSound(); }
     catch (cause) { throw new DesktopError('desktop.notification_sound_failed', cause.stack || cause.message || String(cause), { cause }); }
     requestedNotificationSounds.add(key);
   }
@@ -855,9 +898,9 @@ function playNotificationSound(record, input) {
   console.info('muteki.notification.sound', JSON.stringify(receipt));
   return receipt;
 }
-async function sendNotification(record, input) {
+async function sendNotification(record, input, test = false) {
   const scope = notificationScope(record, input);
-  if (!isNotificationOwner(record)) throw new DesktopError('desktop.notification_owner_changed', 'This window no longer owns workspace notifications.');
+  if (!test && !isNotificationOwner(record)) throw new DesktopError('desktop.notification_owner_changed', 'This window no longer owns workspace notifications.');
   if (!notificationsAllowed(record)) throw new DesktopError('desktop.notifications_workspace_denied', text('此工作台尚未获得通知授权。', 'This workspace has not been allowed to send notifications.'));
   if (!input || ['threadId', 'eventId', 'dedupeKey', 'title', 'body'].some(key => typeof input[key] !== 'string') || !input.threadId || !input.eventId || !input.dedupeKey) {
     throw new DesktopError('desktop.notification_input_invalid', 'The notification is missing its thread or event identity.');
@@ -866,22 +909,22 @@ async function sendNotification(record, input) {
   const system = await systemNotificationPermission();
   // OS querying is asynchronous: revalidate every authority before acting.
   if (notificationScope(record, input) !== scope) throw new DesktopError('desktop.notification_scope_changed', 'Notification workspace changed during system settings query.');
-  if (!isNotificationOwner(record)) throw new DesktopError('desktop.notification_owner_changed', 'This window no longer owns workspace notifications.');
+  if (!test && !isNotificationOwner(record)) throw new DesktopError('desktop.notification_owner_changed', 'This window no longer owns workspace notifications.');
   if (!notificationsAllowed(record)) throw new DesktopError('desktop.notifications_workspace_denied', 'This workspace has not allowed notifications.');
   const workspace = notificationConsentKey(scope);
-  if ([...windows.values()].some(owner => owner.scope && !owner.scope.closed && notificationConsentKey(owner.scope) === workspace
+  if (!test && [...windows.values()].some(owner => owner.scope && !owner.scope.closed && notificationConsentKey(owner.scope) === workspace
     && !owner.state.configuring && !owner.remote && owner.window.isVisible() && !owner.window.isMinimized() && notificationWindowFocused(owner) && activeThread(owner, input.threadId))) {
     const suppressed = { id: randomUUID(), record, scope, threadId: input.threadId, eventId: input.eventId, dedupeKey: input.dedupeKey, history: [], shown: false, active: false };
     notificationEvent(suppressed, 'closed', 'desktop.notification_thread_visible', 'This thread is already visible in a workspace window.');
     return suppressed.last;
   }
   if (system.systemPermission === 'denied') {
-    const suppressed = { id: randomUUID(), record, scope, threadId: input.threadId, eventId: input.eventId,
+    const suppressed = { id: randomUUID(), record, scope, test, threadId: input.threadId, eventId: input.eventId,
       dedupeKey: input.dedupeKey, history: [], shown: false, active: false, system };
     notificationEvent(suppressed, 'closed', 'desktop.notifications_system_denied', 'The operating system has denied notification authorization; no native notification was constructed.');
     return suppressed.last;
   }
-  const route = safeRoute(`/chat/${encodeURIComponent(input.threadId)}`);
+  const route = test ? '/settings/notifications' : safeRoute(`/chat/${encodeURIComponent(input.threadId)}`);
   if (!NativeNotification.isSupported()) throw new DesktopError('desktop.notifications_unsupported', 'Native notifications are unsupported on this system.');
   const deliveredKey = JSON.stringify([workspace, input.dedupeKey]);
   const delivered = deliveredNotificationEvents.get(deliveredKey);
@@ -894,7 +937,7 @@ async function sendNotification(record, input) {
     notificationEvent(previous, 'closed', 'desktop.notification_replaced', 'Replaced by a new notification from this thread.');
     releaseNotification(previous, true);
   }
-  const entry = { id: randomUUID(), record, scope, threadId: input.threadId, eventId: input.eventId,
+  const entry = { id: randomUUID(), record, scope, test, threadId: input.threadId, eventId: input.eventId,
     dedupeKey: input.dedupeKey, system, soundRequested: input.wantSound === true, history: [], shown: false, active: true };
   record.notifications.set(entry.threadId, entry);
   notificationEvent(entry, 'submitted');
@@ -902,7 +945,7 @@ async function sendNotification(record, input) {
     && input.serviceId === entry.scope.serviceId && input.identityId === entry.scope.identityId;
   const current = () => entry.active && sameScope();
   try {
-    entry.note = new NativeNotification({ title: input.title, body: input.body, silent: input.wantSound !== true });
+    entry.note = new NativeNotification({ title: input.title, body: input.body, silent: true });
     entry.note.on('show', () => {
       if (!current()) return;
       clearTimeout(entry.timer); entry.shown = true;
@@ -941,12 +984,20 @@ async function sendNotification(record, input) {
         text('系统在 10 秒内未返回显示或失败回执；投递结果未知，不会自动重发。', 'The system returned no show or failure receipt within 10 seconds. Delivery is unknown; it will not be retried automatically.'));
     }, 10000);
     entry.note.show();
+    if (entry.soundRequested) playCueSound();
     if (entry.active && entry.last.status === 'submitted') notificationEvent(entry, 'awaiting_show');
   } catch (error) {
     notificationEvent(entry, 'failed', 'desktop.notification_send_failed', error.stack || error.message || String(error));
     releaseNotification(entry, true);
   }
   return entry.last;
+}
+async function sendTestNotification(record, input) {
+  notificationScope(record, input);
+  const eventId = randomUUID();
+  return sendNotification(record, { ...input, threadId: '__notification_test__', eventId,
+    dedupeKey: `notification-test:${eventId}`, title: text('Muteki 测试通知', 'Muteki test notification'),
+    body: text('这是一条测试通知。点击返回通知设置。', 'This is a test notification. Click to return to notification settings.') }, true);
 }
 // GUI-launched apps on macOS do not inherit the login shell PATH, so the
 // usual CLI install locations are probed explicitly.
@@ -1175,10 +1226,22 @@ function installIPC() {
   handle('desktop:notification-status', notificationStatus);
   handle('desktop:notification-request', requestNotifications);
   handle('desktop:notification-send', sendNotification);
+  handle('desktop:notification-test', sendTestNotification);
   handle('desktop:notification-sound', playNotificationSound);
   handle('desktop:permission-settings', async (_record, name) => {
     if (!['microphone', 'speechRecognition', 'notifications'].includes(name)) throw new DesktopError('desktop.permission_invalid', '权限设置类型无效。');
-    if (process.platform === 'darwin') await shell.openExternal(name === 'microphone' ? 'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone' : name === 'speechRecognition' ? 'x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition' : 'x-apple.systempreferences:com.apple.Notifications-Settings.extension');
+    if (process.platform === 'darwin') {
+      let url = name === 'microphone' ? 'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone' : 'x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition';
+      if (name === 'notifications') {
+        const settings = await nativeNotificationOperation('notificationSettings');
+        if (!settings.bundleIdentifier) throw new DesktopError('desktop.notification_bundle_missing', 'Cannot identify this app for macOS notification settings.');
+        // macOS does not list a never-requested app in Notifications settings.
+        // This explicit settings action registers it through the system prompt.
+        if (settings.authorizationStatus === 'notDetermined') await nativeNotificationOperation('requestNotifications', 120000);
+        url = `x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=${encodeURIComponent(settings.bundleIdentifier)}`;
+      }
+      await shell.openExternal(url);
+    }
     else if (process.platform === 'win32') await shell.openExternal(name === 'microphone' ? 'ms-settings:privacy-microphone' : 'ms-settings:notifications');
     else throw new DesktopError('desktop.permission_settings_manual', '请在系统设置中管理 Muteki 的麦克风或通知权限。');
   });

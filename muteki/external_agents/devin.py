@@ -18,19 +18,28 @@ import time
 from typing import Any, AsyncIterator, Mapping, Optional
 
 from muteki.platform.contracts.agent_events import (
-    ApprovalOption, ApprovalRequestedPayload, UsagePayload, dump_payload, redact_secrets,
+    ApprovalOption, ApprovalRequestedPayload, CompactionPayload, UsagePayload,
+    dump_payload, redact_secrets,
 )
 from muteki.platform.contracts.base import new_id
 from muteki.platform.contracts.capabilities import ThreadMode
 from muteki.platform.contracts.external_agents import (
-    ACCESS_MODE_VALUES, AccessMode, AgentCapabilities, AgentEvent,
-    AgentEventType, AgentSessionRef, MessageInput, ProbeRequest, SessionStart,
+    AccessMode, AgentCapabilities,
+    AgentEventType, ContextPart, MessageInput, ProbeRequest, SessionStart,
 )
 
 from .acp import (
     AcpClientTerminals, AcpError, AcpRequestError, AcpTransport, BaseAcpAdapter,
     _content_text,
 )
+
+
+_DEVIN_PRESENTATION = ContextPart(
+    key="muteki.devin.presentation", kind="host_instructions", trust="application",
+    text=("The ACP client applies and displays session configuration separately from the conversation. "
+          "Treat runtime mode-transition notices as configuration context, not additional user requests. "
+          "Do not acknowledge those notices unless the user asks about the configuration. "
+          "Answer the user's request and follow its requested output format."))
 
 
 def default_devin_binary() -> str:
@@ -181,6 +190,10 @@ _STREAMING_MESSAGE_KINDS = frozenset({
 
 class DevinAcpAdapter(BaseAcpAdapter):
     adapter_id = "devin.acp"
+    # Devin sends root ``usage_update`` (used/size) snapshots each turn.
+    context_usage_reported = True
+    # _cognition.ai/compaction notifications.
+    compaction_reported = True
     # 3000.11.3: Code/Smart/Bypass edit without request_permission; Ask is
     # read-only; Plan approval changes to Code/Bypass instead of gating edits.
     supported_access_modes = (
@@ -301,13 +314,17 @@ class DevinAcpAdapter(BaseAcpAdapter):
         ctx = meta.get("cognition.ai/subagent_context")
         parent = str(ctx.get("parentAgentId") or "") if isinstance(ctx, dict) else ""
         kind = str(update.get("sessionUpdate") or "")
+        if kind == "usage_update" and parent and parent != "root":
+            # A subagent's snapshot describes its own window; forwarding it on
+            # the root session would overwrite the conversation's occupancy.
+            return
         if kind == "usage_update" and not replay:
             handle = self._handle_for(agent_session_id)
             if handle is not None:
                 # Devin repeats each root context snapshot with root
                 # subagent_context metadata. Deduplicate only identical
-                # context snapshots within the same native owner. Child
-                # snapshots and changed cost/token values remain observable.
+                # context snapshots; changed cost/token values remain
+                # observable.
                 scope = parent or "root"
                 snapshots = handle.setdefault("devin_context_usage", {})
                 snapshot = {key: value for key, value in update.items() if key != "_meta"}
@@ -585,23 +602,20 @@ class DevinAcpAdapter(BaseAcpAdapter):
             # suffix or silently run the family's default variant.
             raise AcpError(f"Devin ACP cannot map the native variant {variant.get('label')!r} to its configuration selectors")
 
-    async def _prompt_stream(
-        self, session: AgentSessionRef, input: MessageInput,
-    ) -> AsyncIterator[AgentEvent]:
+    def host_context(self, agent_session_id: str) -> list[Any]:
         # Devin 3000.11.3 appends a system mode_transition after the first user
         # message, even when configuration completed before session/prompt.
         # Explain the host's presentation contract without filtering output or
-        # changing tool permissions. Native slash commands must remain verbatim.
-        if not input.payload.runtime_capability and not input.text.lstrip().startswith("/"):
-            input = input.model_copy(update={"text": (
-                "The ACP client applies and displays session configuration separately from the conversation. "
-                "Treat runtime mode-transition notices as configuration context, not additional user requests. "
-                "Do not acknowledge those notices unless the user asks about the configuration. "
-                "Answer the user request below and follow its requested output format.\n\n"
-                + input.text
-            )})
-        async for event in super()._prompt_stream(session, input):
-            yield event
+        # changing tool permissions.
+        return [*super().host_context(agent_session_id), _DEVIN_PRESENTATION]
+
+    def _prompt_content(
+        self, sid: str, transport: Any, input: MessageInput,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        # A typed slash command must reach Devin alone to stay a command.
+        if input.text.lstrip().startswith("/"):
+            return input.text, []
+        return super()._prompt_content(sid, transport, input)
 
     # -- 子智能体（实测：devin 3000.11.3，2026-11） -----------------------------
 
@@ -686,6 +700,26 @@ class DevinAcpAdapter(BaseAcpAdapter):
         if output.strip():
             patch["result" if patch.get("status") != "failed" else "error"] = output
         return patch
+
+    def _map_agent_extension(
+        self, handle: dict[str, Any], method: str,
+        params: dict[str, Any], is_request: bool,
+    ):
+        if method != "_cognition.ai/compaction":
+            return super()._map_agent_extension(handle, method, params, is_request)
+        session = str(params.get("sessionId") or "")
+        if session and session != str(handle.get("external_session_id") or ""):
+            return {}, []
+        status = str(params.get("status") or "")
+        if status not in ("started", "completed", "failed"):
+            return {}, []
+        # Devin signals manual and automatic compaction the same way; the
+        # executor marks a compaction inside a /compact turn as manual.
+        summary = str(params.get("summary") or "").strip()
+        return {}, [(AgentEventType.COMPACTION_UPDATED, "devin.compaction",
+                     dump_payload(CompactionPayload(
+                         status=status, trigger="auto",
+                         summary=summary or None)))]
 
     def _turn_result_usage(self, result: dict[str, Any]) -> Optional[UsagePayload]:
         usage = result.get("usage") or {}

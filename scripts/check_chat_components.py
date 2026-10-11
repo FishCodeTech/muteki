@@ -19,6 +19,9 @@ with tempfile.TemporaryDirectory(prefix='muteki-components-') as tmp:
  manifest={'name':'components-test','version':'1.0.0','hooks':{'hooks':{'SessionStart':[{'hooks':[{'type':'command','command':'echo HOOK_OK > "$PLUGIN_DATA/marker"; echo HOOK_OK'}]}]}},'muteki':{'extensions':{'pi':['extensions/main.js'],'omp':['extensions/main.js']}}}
  (source/'plugin.json').write_text(json.dumps(manifest))
  service=ChatPluginService(root/'private');public=service.install({'path':str(source)})
+ # The bundled visualize package is always present; scope row checks to this fixture.
+ def fixture_rows(engine):
+  return [r for r in service.skill_rows(engine) if r['name'].startswith('components-test:')]
  public=service.update('components-test',native_hooks=True,digest=public['digest'])
  assert public['compatibility']['claude']['components']==['agents','commands','hooks','skills']
  assert public['compatibility']['kimi']['status']=='partial'
@@ -29,7 +32,9 @@ with tempfile.TemporaryDirectory(prefix='muteki-components-') as tmp:
  with patch('pathlib.Path.home',return_value=home):
   for engine in ['pi','omp']:
    env=service.prepare_environment(engine,'fixture',{})
-   target=next((Path(env['PI_CODING_AGENT_DIR'])/'extensions').glob('muteki-components-test-main-*.js'))
+   target=Path(service.native_launch_options(engine,env)['chat_native_extensions'][0])
+   assert target.is_relative_to(Path(env['MUTEKI_CHAT_ASSETS_ROOT']))
+   assert 'PI_CODING_AGENT_DIR' not in env
    assert target.exists() and 'file://' in target.read_text()
   env=service.prepare_environment('claude','fixture',{})
   options=service.native_launch_options('claude',env)
@@ -39,7 +44,7 @@ with tempfile.TemporaryDirectory(prefix='muteki-components-') as tmp:
   result=subprocess.run(command,shell=True,input='{}',capture_output=True,text=True,timeout=15)
   assert result.returncode==0,(result.returncode,result.stderr)
   assert result.stdout.strip()=='HOOK_OK'
-  assert (Path(env['MUTEKI_CHAT_PRIVATE_ROOT'])/'hook-state/components-test/marker').read_text().strip()=='HOOK_OK'
+  assert (Path(env['MUTEKI_CHAT_ASSETS_ROOT'])/'hook-state/components-test/marker').read_text().strip()=='HOOK_OK'
   assert not (home/'marker').exists()
   old=env['HOME'];service.update('components-test',enabled=False)
   new=service.prepare_environment('claude','fixture',{})
@@ -48,12 +53,12 @@ with tempfile.TemporaryDirectory(prefix='muteki-components-') as tmp:
  manifest['muteki']['requires']={'executables':['muteki-no-such-program-fixture']}
  (source/'plugin.json').write_text(json.dumps(manifest));public=service.install({'path':str(source)})
  assert all(c['status']=='blocked' for c in public['compatibility'].values())
- assert not service.skill_rows('codex')
+ assert not fixture_rows('codex')
  manifest['muteki']['requires']={'tools':['only-native-fixture-tool']}
  (source/'plugin.json').write_text(json.dumps(manifest));public=service.install({'path':str(source)})
  assert public['compatibility']['kimi']['status']=='blocked'
  service._verified_tools['codex']={'only-native-fixture-tool'}
- assert service.skill_rows('codex') and not service.skill_rows('kimi')
+ assert fixture_rows('codex') and not fixture_rows('kimi')
  (source/'skills/native-only').mkdir(parents=True)
  (source/'skills/native-only/SKILL.md').write_text('---\nname: native-only\ndescription: Native permissions\ndisallowed-tools: Bash\n---\nReply NATIVE_SKILL_OK $ARGUMENTS.\n')
  manifest['muteki'].pop('requires');manifest['commands']={'inline':{'content':'First=$0; second=$ARGUMENTS[1]; all=$ARGUMENTS'}}

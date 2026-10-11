@@ -124,6 +124,13 @@ def register(app: FastAPI) -> None:
             )
             runtime_keys = _catalog_runtime_keys_by_engine(transport_kind="")
             for row in rows:
+                row["last_tests"] = {
+                    key: result
+                    for key in runtime_keys.get(row["engine"], [])
+                    if (result := store.last_test(
+                        row["id"], backend=catalog_environment, runtime_instance=key,
+                    )) is not None
+                }
                 row["model_catalogs"] = {
                     key: catalog
                     for key in runtime_keys.get(row["engine"], [])

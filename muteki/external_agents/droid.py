@@ -29,7 +29,9 @@ import contextlib
 import json
 import logging
 import os
+import time
 from collections.abc import Mapping
+from hashlib import sha256
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
@@ -37,6 +39,7 @@ from typing import Any, AsyncIterator, Optional
 from droid_sdk import (
     ApplyPatchAction,
     Autonomy,
+    ContextAccuracy,
     CreateFile,
     DroidConnectionError,
     DroidError,
@@ -71,6 +74,8 @@ from droid_sdk import (
     ToolConfirmationOutcome,
     ToolProgress,
     ToolResult,
+    WorkingState,
+    WorkingStateChanged,
 )
 from droid_sdk._attribution import sdk_process_environment
 from muteki.platform.contracts.agent_events import (
@@ -78,6 +83,7 @@ from muteki.platform.contracts.agent_events import (
     ApprovalOption,
     ApprovalRequestedPayload,
     ApprovalResolvedPayload,
+    CompactionPayload,
     FailureCategory,
     MessageCompletedPayload,
     MessageDeltaPayload,
@@ -125,11 +131,17 @@ from .capabilities import (
     probe_version,
     require_access_mode,
 )
+from .context_delivery import system_append, text_with_envelopes
 from .droid_mcp import DroidMcp, DroidMcpError, stdio_mcp_servers
 from .events import build_event
 from .probe_environment import subprocess_environment
 from .process_supervisor import SupervisedProcess, spawn_supervised
 from .rpc import ProcessOutputLog, default_process_log_root
+from .runtime_capabilities import (
+    RuntimeCapabilityItem,
+    RuntimeCapabilitySnapshot,
+    dynamic_command_item,
+)
 
 _LOG = logging.getLogger(__name__)
 
@@ -169,6 +181,11 @@ _EDIT_ACTIONS = (EditAction, CreateFile, ApplyPatchAction)
 _STDOUT_LIMIT = 10 * 1024 * 1024
 _STDERR_DRAIN_TIMEOUT_S = 5.0
 _DEFAULT_TURN_TIMEOUT_S = 1800
+# A spare process is dropped after this idle time so it does not keep stale
+# Droid settings; at most _SPARE_LIMIT spares (different folders) are kept.
+_SPARE_TTL_S = 600.0
+_SPARE_LIMIT = 2
+_CATALOG_REQUEST_TIMEOUT_S = 30.0
 
 
 class DroidFailure(RuntimeError):
@@ -440,6 +457,13 @@ class _PendingQuestion:
 
 
 @dataclass
+class _Spare:
+    transport: "_SupervisedDroidTransport"
+    started_at: float
+    expiry: Optional[asyncio.TimerHandle] = None
+
+
+@dataclass
 class _Live:
     """Everything one open Droid session owns."""
 
@@ -467,12 +491,15 @@ class _Live:
     questions: dict[str, _PendingQuestion] = field(default_factory=dict)
     text: list[str] = field(default_factory=list)
     turn_closed: bool = False
+    catalog_digest: str = ""
+    catalog_revision: int = 0
 
 
 class DroidRpcAdapter(BaseExternalAgentAdapter):
     """Default Droid conversation transport (``droid.rpc``)."""
 
     adapter_id = "droid.rpc"
+    host_context_channel = "system_prompt"
 
     def __init__(
         self,
@@ -489,6 +516,7 @@ class DroidRpcAdapter(BaseExternalAgentAdapter):
         self._log_root = Path(log_root) if log_root is not None else default_process_log_root()
         self._turn_timeout_s = int(turn_timeout_s)
         self._live: dict[str, _Live] = {}
+        self._spares: dict[str, _Spare] = {}
 
     def probe_binary(self) -> str:
         return self._binary
@@ -529,6 +557,8 @@ class DroidRpcAdapter(BaseExternalAgentAdapter):
             session_persistence=True,
             mcp=True,
             usage_events=True,
+            compaction=True,
+            context_usage=True,
             steer=False,
             plan_mode=False,
             subagents=False,
@@ -542,7 +572,8 @@ class DroidRpcAdapter(BaseExternalAgentAdapter):
                 **{name: SOURCE_STATIC for name in (
                     "streaming", "tool_events", "approval", "user_input",
                     "interrupt", "resume", "session_persistence", "mcp",
-                    "usage_events", "steer", "plan_mode", "subagents",
+                    "usage_events", "compaction", "context_usage", "steer",
+                    "plan_mode", "subagents",
                 )},
                 "runtime_version": SOURCE_PROBE,
             },
@@ -567,6 +598,100 @@ class DroidRpcAdapter(BaseExternalAgentAdapter):
             "--output-format", "stream-jsonrpc",
         ])
 
+    def _process_env(self, supplied: Mapping[str, str]) -> dict[str, str]:
+        env = dict(subprocess_environment({**self._env_extra, **dict(supplied)}) or {})
+        # The per-thread chat asset root is read only by engines that load
+        # native plugin packages; Droid never reads it. Dropping it keeps the
+        # process environment thread-independent so a pre-started process fits.
+        env.pop("MUTEKI_CHAT_ASSETS_ROOT", None)
+        return {**env, **sdk_process_environment()}
+
+    def _spare_key(self, cwd: str, env: Mapping[str, str]) -> str:
+        payload = json.dumps([self._argv(), cwd, sorted(env.items())], ensure_ascii=False)
+        return sha256(payload.encode("utf-8")).hexdigest()
+
+    async def prewarm(self, *, cwd: str, env: Mapping[str, str]) -> bool:
+        """Start one idle ``droid exec`` process for a session that has not been created yet.
+
+        Droid spends 6-15 s booting (settings, tools, connector catalog) before it
+        reads the first JSON-RPC request; none of that depends on the session. The
+        process is adopted only by a session with the same argv, cwd and env.
+        """
+        cwd = str(Path(cwd).expanduser().resolve())
+        if not Path(cwd).is_dir():
+            return False
+        process_env = self._process_env(env)
+        if not str(process_env.get("FACTORY_API_KEY") or "").strip() and not _host_login_present():
+            return False
+        key = self._spare_key(cwd, process_env)
+        current = self._spares.get(key)
+        if current is not None and (not current.transport.is_connected or not current.transport.exited):
+            return False
+        if current is not None:
+            await self._drop_spare(key, current)
+        while len(self._spares) >= _SPARE_LIMIT:
+            ready = [item for item in self._spares.items() if item[1].transport.is_connected]
+            if not ready:
+                return False
+            oldest_key, oldest = min(ready, key=lambda item: item[1].started_at)
+            await self._drop_spare(oldest_key, oldest)
+        transport = _SupervisedDroidTransport(
+            self._argv(), cwd=cwd, env=process_env,
+            adapter_id=self.identity.adapter_id,
+            session_id=new_id("droid-prewarm"),
+            log_root=self._log_root,
+        )
+        spare = _Spare(transport=transport, started_at=time.monotonic())
+        self._spares[key] = spare
+        try:
+            await transport.connect()
+        except BaseException as exc:
+            if self._spares.get(key) is spare:
+                self._spares.pop(key, None)
+            await transport.close()
+            if isinstance(exc, FileNotFoundError):
+                raise DroidFailure(
+                    "droid.binary_missing", f"Droid executable was not found: {self._binary}",
+                    category="transport") from exc
+            if isinstance(exc, DroidError):
+                raise DroidFailure(
+                    "droid.prewarm_failed", f"Droid process could not be started: {exc}",
+                    category="transport") from exc
+            raise
+        if self._spares.get(key) is not spare:
+            # Dropped (shutdown or eviction) while the process was starting.
+            await transport.close()
+            return False
+        spare.expiry = asyncio.get_running_loop().call_later(
+            _SPARE_TTL_S, lambda: asyncio.ensure_future(self._drop_spare(key, spare)))
+        return True
+
+    def _take_spare(self, cwd: str, env: Mapping[str, str]) -> Optional[_SupervisedDroidTransport]:
+        key = self._spare_key(cwd, env)
+        spare = self._spares.get(key)
+        if spare is None or not spare.transport.is_connected:
+            return None
+        self._spares.pop(key, None)
+        if spare.expiry is not None:
+            spare.expiry.cancel()
+        if spare.transport.exited:
+            asyncio.ensure_future(spare.transport.close())
+            return None
+        return spare.transport
+
+    async def _drop_spare(self, key: str, spare: _Spare) -> None:
+        if self._spares.get(key) is spare:
+            self._spares.pop(key, None)
+        if spare.expiry is not None:
+            spare.expiry.cancel()
+        if spare.transport.is_connected:
+            # A spare still starting is closed by prewarm once connect returns.
+            await spare.transport.close()
+
+    async def close_spares(self) -> None:
+        for key, spare in list(self._spares.items()):
+            await self._drop_spare(key, spare)
+
     async def _launch(
         self,
         request: SessionStart,
@@ -583,7 +708,7 @@ class DroidRpcAdapter(BaseExternalAgentAdapter):
                 "droid.rpc does not map Muteki plan mode onto Droid spec mode",
                 category="unsupported",
             )
-        env = dict(subprocess_environment({**self._env_extra, **dict(request.options.env)}) or {})
+        env = self._process_env(request.options.env)
         if not str(env.get("FACTORY_API_KEY") or "").strip() and not _host_login_present():
             raise DroidFailure(
                 "droid.auth_required",
@@ -606,7 +731,7 @@ class DroidRpcAdapter(BaseExternalAgentAdapter):
         live = _Live(
             agent_session_id=request.agent_session_id,
             cwd=cwd,
-            env={**env, **sdk_process_environment()},
+            env=env,
             access_mode=access_mode,
             thread_id=request.thread_id,
             mcp=mcp,
@@ -677,7 +802,8 @@ class DroidRpcAdapter(BaseExternalAgentAdapter):
     async def _open_native(
         self, live: _Live, *, resume_id: Optional[str], effort: Optional[ReasoningEffort],
     ) -> None:
-        transport = _SupervisedDroidTransport(
+        spare = self._take_spare(live.cwd, live.env)
+        transport = spare or _SupervisedDroidTransport(
             self._argv(),
             cwd=live.cwd,
             env=live.env,
@@ -686,7 +812,8 @@ class DroidRpcAdapter(BaseExternalAgentAdapter):
             log_root=self._log_root,
         )
         live.transport = transport
-        await transport.connect()
+        if spare is None:
+            await transport.connect()
         runtime = Runtime(transport=transport)
         if resume_id:
             session = Session.resume(
@@ -696,6 +823,7 @@ class DroidRpcAdapter(BaseExternalAgentAdapter):
                 runtime=runtime,
             )
         else:
+            host = self.host_context(live.agent_session_id)
             session = Session(
                 cwd=live.cwd,
                 model=live.requested_model or None,
@@ -703,6 +831,10 @@ class DroidRpcAdapter(BaseExternalAgentAdapter):
                 config=SessionConfig(
                     autonomy=_AUTONOMY[live.access_mode],
                     mcp_servers=live.mcp_servers,
+                    # Droid stores the creation-time prompt with the session;
+                    # Session.resume keeps it.
+                    system_prompt=({"type": "preset", "preset": "droid",
+                                    "append": system_append(host)} if host else None),
                 ),
                 interactions=live.interactions,
                 runtime=runtime,
@@ -812,6 +944,114 @@ class DroidRpcAdapter(BaseExternalAgentAdapter):
             return self._unsupported_stream(session, "resume", "resume")
         return self._turn_stream(
             session, MessageInput(text="Continue from where you left off."), resumed=True)
+
+    async def runtime_capability_snapshot(
+        self, session: Optional[AgentSessionRef] = None,
+    ) -> RuntimeCapabilitySnapshot:
+        """Skills, custom slash commands and MCP status as Droid reports them.
+
+        Every section is read from the open session over JSON-RPC, so project
+        and personal skill directories, disabled skills and managed settings
+        are Droid's own answer. A section that cannot be read is reported in
+        ``diagnostics``; it is never replaced by a guessed catalog.
+        """
+        base = await super().runtime_capability_snapshot(session)
+        if session is None:
+            return base
+        live = self._live.get(session.agent_session_id)
+        if live is None or live.session is None:
+            return base.model_copy(update={
+                "stale": True,
+                "diagnostics": ["Droid Session 当前不在本进程，动态能力目录已失效"],
+            })
+        native = live.session
+        items = list(base.items)
+        diagnostics: list[str] = []
+        engine = self.identity.adapter_id.split(".", 1)[0]
+
+        async def read(label: str, request: Any) -> Any:
+            try:
+                return await asyncio.wait_for(request, _CATALOG_REQUEST_TIMEOUT_S)
+            except (DroidError, asyncio.TimeoutError) as exc:
+                diagnostics.append(f"{label} 读取失败：{type(exc).__name__}: {exc}")
+                return None
+
+        skills = await read("droid.list_skills", native.list_skills())
+        for skill in (skills.skills if skills is not None else ()):
+            if skill.enabled is False or skill.user_invocable is False:
+                continue
+            items.append(dynamic_command_item(
+                adapter_id=self.id, engine=engine, name=skill.name,
+                description=skill.description or "", channel="provider_native",
+                kind="skill",
+                invocation={
+                    "command": skill.name,
+                    "wire_text": f"/{skill.name}",
+                    "protocol": "droid.add_user_message",
+                    "location": skill.location,
+                    "path": skill.file_path,
+                },
+            ))
+        # The high-level Session has no list_commands; the pinned droid-sdk
+        # client carries the `droid.list_commands` request.
+        commands = await read(
+            "droid.list_commands", native._require_client().list_commands())
+        for command in (commands.commands if commands is not None else ()):
+            items.append(dynamic_command_item(
+                adapter_id=self.id, engine=engine, name=command.name,
+                description=command.description,
+                argument_hint=command.argument_hint or "",
+                channel="provider_native",
+                invocation={
+                    "command": command.name,
+                    "wire_text": f"/{command.name}",
+                    "protocol": "droid.add_user_message",
+                },
+            ))
+        from .command_providers import operation_item
+        items = [item for item in items if item.name != "compact"]
+        items.append(operation_item(
+            self.id, engine, "compact", "droid.compact_session",
+            "压缩当前 Droid 会话上下文", argument_hint="[摘要要求]"))
+        servers = await read("droid.list_mcp_servers", native.list_mcp_servers())
+        if servers is not None:
+            reported = {server.name for server in servers.servers}
+            items = [
+                item for item in items
+                if not (item.kind == "mcp_status" and item.name in reported)
+            ]
+            for server in servers.servers:
+                detail = [f"Runtime 已报告 · {server.status.value}"]
+                if server.tool_count is not None:
+                    detail.append(f"{server.tool_count} 个工具")
+                if server.error:
+                    detail.append(server.error)
+                items.append(RuntimeCapabilityItem(
+                    id=f"runtime:{self.id}:mcp:{server.name}",
+                    kind="mcp_status", name=server.name,
+                    description=" · ".join(detail), source="Droid",
+                    scope="session", engine=engine, channel="provider_native",
+                    resolution="runtime", origin="dynamic", delivery="guaranteed",
+                    verification="verified", status="runtime_reported",
+                    invocation={
+                        "status": server.status.value,
+                        "tool_count": server.tool_count,
+                        "source": server.source,
+                    },
+                ))
+
+        digest = sha256(json.dumps(
+            [item.model_dump(mode="json") for item in items],
+            sort_keys=True, default=str,
+        ).encode()).hexdigest()
+        if digest != live.catalog_digest:
+            live.catalog_digest = digest
+            live.catalog_revision += 1
+        return base.model_copy(update={
+            "revision": live.catalog_revision,
+            "items": items,
+            "diagnostics": diagnostics,
+        })
 
     async def steer(self, session: AgentSessionRef, input: AgentInput) -> CommandReceipt:
         del input
@@ -1018,6 +1258,14 @@ class DroidRpcAdapter(BaseExternalAgentAdapter):
                         kind="degraded", code="droid.usage.cumulative_missing",
                         message="Droid did not report terminal cumulative usage; only observed session updates are counted.")))
                     return
+            elif kind == "session_compacted":
+                removed = notification.get("removedCount")
+                queue.put_nowait(("native", (
+                    AgentEventType.COMPACTION_UPDATED, "droid.session_compacted",
+                    CompactionPayload(
+                        status="completed", trigger="auto",
+                        message=f"Droid 移除了 {removed} 条消息" if isinstance(removed, int) else None))))
+                return
             else:
                 return
             if isinstance(usage, Mapping):
@@ -1050,7 +1298,9 @@ class DroidRpcAdapter(BaseExternalAgentAdapter):
         live.text = []
         live.turn_closed = False
         runner.mark_sent()
-        task = asyncio.create_task(self._consume(live, input.text, queue))
+        text = text_with_envelopes(
+            input.text, self.turn_context(live.agent_session_id, input, host=False))
+        task = asyncio.create_task(self._consume(live, text, queue))
         try:
             while True:
                 kind, payload = await queue.get()
@@ -1069,6 +1319,9 @@ class DroidRpcAdapter(BaseExternalAgentAdapter):
                     return
                 if kind == "event":
                     runner.ack()
+                    if isinstance(payload, RunSuccess) and not live.turn_closed:
+                        # Must precede the terminal event that closes the turn.
+                        yield await self._context_event(live, seq, common)
                     for event in self._map_sdk(live, seq, common, payload):
                         yield event
                     continue
@@ -1085,6 +1338,66 @@ class DroidRpcAdapter(BaseExternalAgentAdapter):
             if not task.done():
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+    async def _context_event(self, live: _Live, seq: Any, common: dict[str, Any]) -> AgentEvent:
+        """``droid.get_context_stats``: Droid's own context meter."""
+        native = "droid.get_context_stats"
+        try:
+            stats = await asyncio.wait_for(live.session.context(), _CATALOG_REQUEST_TIMEOUT_S)
+        except (DroidError, asyncio.TimeoutError) as exc:
+            return self.emit(build_event(
+                AgentEventType.RUNTIME_WARNING, seq, native_type=native,
+                payload=RuntimeWarningPayload(
+                    kind="degraded", code="droid.context_usage_unavailable",
+                    message=f"Droid get_context_stats failed: {type(exc).__name__}: {exc}"),
+                **common))
+        return self.emit(build_event(
+            AgentEventType.USAGE_UPDATED, seq, native_type=native,
+            payload=UsagePayload(
+                scope="context_only", context_used_tokens=max(0, stats.used),
+                context_window=stats.limit if stats.limit > 0 else None,
+                native={"accuracy": stats.accuracy.value}),
+            **common))
+
+    async def runtime_operation(
+        self, session: AgentSessionRef, name: str, arguments: str = "",
+    ) -> dict[str, Any]:
+        """``/compact``: ``droid.compact_session`` replaces the native session
+        with a summarized successor that keeps this connection."""
+        live = self._live.get(session.agent_session_id)
+        if live is None or live.session is None:
+            raise DroidFailure("droid.session_missing", "Droid Session 当前不在本进程")
+        if live.turn_active:
+            raise DroidFailure("droid.session_busy", "请等待当前回复结束后执行命令")
+        if name != "compact":
+            raise DroidFailure("droid.operation_unsupported", f"Droid 不支持操作 /{name}")
+        before = await live.session.context()
+        outcome = await live.session.compact(instructions=arguments or None)
+        live.session = outcome.session
+        live.external_id = str(outcome.session.id)
+        self._tracker.activate(
+            session.agent_session_id, external_session_id=live.external_id,
+            resume_handle=live.external_id)
+        self._context_compacted(session.agent_session_id)
+        after = await live.session.context()
+        # Right after compact_session an "estimated" reading still carries the
+        # pre-compaction figure (updated_at is just the call time); only an
+        # exact measurement describes the successor session.
+        if after.accuracy is ContextAccuracy.EXACT:
+            return {
+                "status": "completed",
+                "message": f"Droid 已压缩上下文，移除 {outcome.removed_count} 条消息",
+                "removed_count": outcome.removed_count,
+                "compaction": {"tokens_before": before.used, "tokens_after": after.used},
+                "context": {"used": after.used, "limit": after.limit},
+            }
+        return {
+            "status": "completed",
+            "message": (f"Droid 已压缩上下文，移除 {outcome.removed_count} 条消息；"
+                        "压缩后的用量会在下一轮回复后更新"),
+            "removed_count": outcome.removed_count,
+            "compaction": {"tokens_before": before.used},
+        }
 
     def _map_sdk(
         self, live: _Live, seq: Any, common: dict[str, Any], event: Any,
@@ -1136,6 +1449,12 @@ class DroidRpcAdapter(BaseExternalAgentAdapter):
                     error=_json_text(output) if event.is_error else None))]
         if isinstance(event, TokenUsageUpdate):
             # The native notification already emitted this cumulative update.
+            return []
+        if isinstance(event, WorkingStateChanged):
+            if event.state is WorkingState.COMPACTING_CONVERSATION:
+                return [make(
+                    AgentEventType.COMPACTION_UPDATED, "droid.working_state",
+                    CompactionPayload(status="started", trigger="auto"))]
             return []
         if isinstance(event, ErrorEvent):
             return [make(

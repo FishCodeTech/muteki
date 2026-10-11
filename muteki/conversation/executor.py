@@ -44,7 +44,9 @@ from muteki.external_agents.user_input_schema import normalize_pending_user_inpu
 from muteki.platform.contracts.agent_events import (
     AgentEventContractError,
     AgentFailure,
+    CompactionPayload,
     FailureCategory,
+    UsagePayload,
     agent_failure,
     dump_payload,
     parse_payload,
@@ -57,6 +59,7 @@ from muteki.platform.contracts.external_agents import (
     AgentEventType,
     AgentSessionRef,
     ApprovalResponseInput,
+    ContextPart,
     MessageInput,
     SessionStart,
     SteerInput,
@@ -88,13 +91,13 @@ from muteki.conversation.approval_queue import (
 )
 from .attachment_delivery import (
     AttachmentDeliveryError,
+    attachment_context_part,
     attachments_payload,
-    merge_attachment_context,
     resolve_attachments,
     thread_authorized_sha256s,
 )
 from .checkpoints import CheckpointError, capture_checkpoint
-from .composer_capabilities import ComposerCapabilityError, resolve_capability_refs
+from .composer_capabilities import ComposerCapabilityError, capability_context_parts
 from .manager import ConversationManager, ConversationError
 from .models import (
     ThreadRuntimeSelection,
@@ -117,9 +120,9 @@ from .session_handoff import (
     SessionHandoffBundle,
     build_session_handoff,
     classify_rebuild_reason,
-    continuation_prompt_from_messages,
-    render_agent_text,
-    render_resume_prompt,
+    continuation_context_from_messages,
+    current_turn_text,
+    handoff_context_part,
 )
 from .store import ConversationStore
 
@@ -182,6 +185,18 @@ def _public_failure(failure: AgentFailure) -> dict[str, Any]:
     return dump_payload(failure)
 
 
+def _is_compact_invocation(invocation: Optional[dict[str, Any]]) -> bool:
+    value = invocation or {}
+    name = str(value.get("name") or value.get("wire_text") or "")
+    return name.strip().lstrip("/").casefold() == "compact"
+
+
+def _non_negative_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value) if value >= 0 else None
+
+
 def _summary_line(text: str) -> str:
     """First non-empty line as the display summary; callers keep the full
     text in ``detail`` next to it."""
@@ -227,11 +242,22 @@ def _match_runtime_capability(
     return matches[0] if len(matches) == 1 else None
 
 
-def _continuation_prompt(
-    turn: TurnRecord, messages: list[Any], turns: list[Any] | None = None,
-) -> str:
-    """把已保存的对话内容还原成可独立执行的继续/重试指令。"""
-    return continuation_prompt_from_messages(turn, messages, turns)
+def _chat_host_context(plugins: Any, thread_id: str, engine: str) -> list[ContextPart]:
+    """Session-level host rules for a conversation chat."""
+    from .computer_control import chat_host_part
+    return [part for part in (chat_host_part(), plugins.skill_catalog_part(engine),
+                              plugins.visualization_part(thread_id, engine))
+            if part is not None]
+
+
+def _fork_history_part(history: list[Any]) -> Optional[ContextPart]:
+    transcript = "\n".join(
+        f"{'用户' if item.role == 'user' else '助手'}：{item.text}" for item in history)
+    if not transcript:
+        return None
+    return ContextPart(
+        key="muteki.history", kind="history_handoff", trust="untrusted",
+        text=f"以下是该分叉继承的对话历史，请在此上下文上继续：\n{transcript}")
 
 
 
@@ -284,17 +310,23 @@ class ExternalAgentSessionExecutor:
         self._stop_fences: dict[str, asyncio.Event] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._session_locks: dict[str, asyncio.Lock] = {}
-        self._runtime_operations: set[str] = set()
+        # Turns whose compaction already reached a terminal state from the
+        # engine's own signal; the /compact fallback must not report it twice.
+        self._compaction_settled: set[str] = set()
+        # Turns with an automatic compaction that started and has no outcome yet.
+        self._compaction_open: set[str] = set()
         self._history_mutations: set[str] = set()
         self._queue_locks: dict[str, asyncio.Lock] = {}
         # 本进程内已 start 的 AgentSession（重启后需经 resume_handle 接管）
         self._live: set[str] = set()
         self._chat_revisions: dict[str, str] = {}
-        self._chat_contexts: dict[str, str] = {}
+        # thread_id → ledger metadata for the next core.turn.started payload
+        self._context_delivery_meta: dict[str, list[dict[str, Any]]] = {}
         # Codex 等 Runtime 会在同一轮的多个 item 完成节点重复上报同一份
         # workspace diff。Artifact 本体虽然按摘要去重，事件仍会重复进入界面。
         self._emitted_workspace_artifacts: set[tuple[str, str]] = set()
         self._capability_cache: dict[str, RuntimeCapabilitySnapshot] = {}
+        self._prewarmed_adapters: set[Any] = set()
         self._capability_tasks: dict[
             str, asyncio.Task[RuntimeCapabilitySnapshot]
         ] = {}
@@ -515,7 +547,7 @@ class ExternalAgentSessionExecutor:
         state = self._conv.get_state(thread_id)
         # #122: never close/replace the live turn's session for a capability probe.
         turn_busy = bool(
-            state.running_turn_id or self._conv.active_turn_id(thread_id) or thread_id in self._runtime_operations
+            state.running_turn_id or self._conv.active_turn_id(thread_id)
         )
         record = self._session_record(thread_id)
         previous_record = record
@@ -630,6 +662,7 @@ class ExternalAgentSessionExecutor:
                 options["cwd"] = str(plugins.visualization_root(thread.thread_id).parent)
             options["chat_tools"] = _chat_tool_descriptions(await plugins.prepare_tools(engine))
             options["chat_control_enabled"] = plugins.control_enabled(engine)
+            options["host_context"] = _chat_host_context(plugins, thread_id, engine)
             credential_env = await asyncio.to_thread(
                 plugins.prepare_environment, engine,
                 thread_id + ":" + selection.credential_id,
@@ -643,6 +676,18 @@ class ExternalAgentSessionExecutor:
         if credential_env:
             options["env"] = credential_env
         resume = record if record is not None and same_selection else None
+        if plugins is not None and thread.mode == "conversation" and engine == "codex" and resume is not None and resume.resume_handle:
+            options["native_rollout_path"] = await asyncio.to_thread(
+                plugins.codex_rollout_path, thread_id + ":" + selection.credential_id,
+                resume.resume_handle, credential_env,
+                previous_revision=plugins.session_revision(resume.agent_session_id),
+            )
+        if plugins is not None and thread.mode == "conversation" and engine == "cursor" and resume is not None and resume.resume_handle:
+            await asyncio.to_thread(
+                plugins.prepare_cursor_history, thread_id + ":" + selection.credential_id,
+                resume.resume_handle, credential_env,
+                previous_revision=plugins.session_revision(resume.agent_session_id),
+            )
         started_generation = state.current_generation + int(fresh)
         ref = await adapter.start(SessionStart(
             **({"agent_session_id": resume.agent_session_id}
@@ -684,7 +729,6 @@ class ExternalAgentSessionExecutor:
             else:
                 await adapter.close(ref)
             self._live.discard(ref.agent_session_id)
-            self._chat_contexts.pop(ref.agent_session_id, None)
             raise LookupError(f"thread {thread_id} 已归档，能力会话已关闭")
         self._conv.save_state(current.model_copy(update={
             "agent_session_id": ref.agent_session_id,
@@ -721,6 +765,45 @@ class ExternalAgentSessionExecutor:
         self._capability_cache[thread_id] = snapshot
         self._capability_failures.pop(thread_id, None)
         return snapshot
+
+    async def prewarm_runtime(
+        self, *, adapter_id: str, instance_id: str, credential_id: str,
+        model: str, workspace_id: str,
+    ) -> bool:
+        """Start an idle runtime process for a conversation that has not been sent yet.
+
+        Only adapters with ``prewarm`` take part. The environment is built the
+        same way ``ensure_session`` builds it; the adapter adopts the process
+        only when the real session's argv, cwd and env are identical.
+        """
+        adapter = self._adapter_for(adapter_id, instance_id or "default")
+        prewarm = getattr(adapter, "prewarm", None)
+        workspace = self._manager.get_workspace(workspace_id) if workspace_id else None
+        if prewarm is None or workspace is None or not workspace.root_path:
+            return False
+        engine = engine_for_adapter(adapter_id)
+        selection = ThreadRuntimeSelection(
+            adapter_id=adapter_id, instance_id=instance_id or "default",
+            credential_id=credential_id, model=model)
+        env: dict[str, str] = {}
+        if credential_id:
+            from apps.web.worker_models import conversation_model_input
+            env = (await asyncio.to_thread(
+                resolve_credential_env,
+                credential_id,
+                engine=engine,
+                sessions_root=self._sessions_root,
+                container=False,
+                model=model,
+                model_input=conversation_model_input(self._sessions_root, selection),
+                agent_state_dir=self._sessions_root / "_conversation_agent_state" / "_prewarm",
+            )).env
+        plugins = getattr(self, "chat_plugins", None)
+        if plugins is not None:
+            env = await asyncio.to_thread(
+                plugins.prepare_environment, engine, "prewarm:" + credential_id, env)
+        self._prewarmed_adapters.add(adapter)
+        return await prewarm(cwd=str(Path(workspace.root_path).expanduser()), env=env)
 
     def cached_runtime_capabilities(
         self, thread_id: str
@@ -1074,55 +1157,11 @@ class ExternalAgentSessionExecutor:
                 if fresh_ref is not None and not committed:
                     await adapter.close(fresh_ref)
                     self._live.discard(fresh_ref.agent_session_id)
-                    self._chat_contexts.pop(fresh_ref.agent_session_id, None)
                 if not committed:
                     self._conv.save_state(before.model_copy(update={"history_recovery_required": True}))
                 raise
             finally:
                 self._history_mutations.discard(thread_id)
-
-    async def runtime_operation(self, thread_id: str, name: str, arguments: str = "") -> dict[str, Any]:
-        lock = self._locks.setdefault(thread_id, asyncio.Lock())
-        if lock.locked():
-            raise RuntimeError("请等待当前回复结束后执行原生操作")
-        async with lock:
-            return await self._runtime_operation(thread_id, name, arguments)
-
-    async def _runtime_operation(
-        self, thread_id: str, name: str, arguments: str = ""
-    ) -> dict[str, Any]:
-        state = self._conv.get_state(thread_id)
-        if state.running_turn_id or self._conv.active_turn_id(thread_id):
-            raise RuntimeError("请等待当前回复结束后执行原生操作")
-        adapter, ref = await self.ensure_capability_session(thread_id)
-        snapshot = await adapter.runtime_capability_snapshot(ref)
-        snapshot = self._enrich_capability_snapshot(
-            thread_id, snapshot, adapter_id=adapter.id,
-            instance_id=adapter.identity.instance_id,
-        )
-        self._capability_cache[thread_id] = snapshot
-        verified = next((
-            item for item in snapshot.items
-            if item.kind == "operation"
-            and item.name.casefold() == name.casefold()
-            and item.verification == "verified"
-            and item.resolution == "client"
-            and bool(getattr(item, "invocable", True))
-        ), None)
-        if verified is None:
-            raise RuntimeError(f"Runtime operation 已失效：{name}")
-        if not isinstance(adapter, RuntimeOperationAdapter):
-            raise RuntimeError(
-                f"{adapter.id} 没有结构化 Runtime operation 通道")
-        self._runtime_operations.add(thread_id)
-        try:
-            if verified.name == "compact":
-                self._chat_contexts.pop(ref.agent_session_id, None)
-            result = await adapter.runtime_operation(ref, name, arguments)
-        finally:
-            self._runtime_operations.discard(thread_id)
-        from muteki.external_agents.command_providers import public_operation_result
-        return public_operation_result(result)
 
     def _chat_revision_matches(self, thread: Thread, record: AgentSession) -> bool:
         plugins = getattr(self, "chat_plugins", None)
@@ -1414,7 +1453,7 @@ class ExternalAgentSessionExecutor:
                 source_adapter_id=previous_adapter_id,
                 source_agent_session_id=previous_agent_session_id,
             )
-            resume_prompt = turn.text or "Continue from where you left off."
+            resume_context: list[ContextPart] = []
             self._pending_handoff.pop(thread.thread_id, None)
         else:
             handoff = build_session_handoff(
@@ -1436,13 +1475,11 @@ class ExternalAgentSessionExecutor:
                     action = "重试"
                 else:
                     action = "切换/重建后继续"
-                resume_prompt = render_resume_prompt(
-                    handoff, turn.text or "Continue from where you left off.",
-                    action=action,
-                )
+                part = handoff_context_part(handoff, action=action)
+                resume_context = [part] if part is not None else []
                 self._pending_handoff[thread.thread_id] = handoff
             else:
-                resume_prompt = turn.text or "Continue from where you left off."
+                resume_context = []
                 self._pending_handoff.pop(thread.thread_id, None)
 
         options: dict[str, Any] = {
@@ -1452,7 +1489,8 @@ class ExternalAgentSessionExecutor:
                 str(Path(workspace.root_path).expanduser().resolve())
                 if workspace and workspace.root_path else ""
             ),
-            "resume_prompt": resume_prompt,
+            "resume_prompt": current_turn_text(turn.text),
+            "resume_context": resume_context,
         }
         plugins = getattr(self, "chat_plugins", None)
         if plugins is not None and thread.mode == "conversation":
@@ -1460,6 +1498,7 @@ class ExternalAgentSessionExecutor:
                 options["cwd"] = str(plugins.visualization_root(thread.thread_id).parent)
             options["chat_tools"] = _chat_tool_descriptions(await plugins.prepare_tools(engine))
             options["chat_control_enabled"] = plugins.control_enabled(engine)
+            options["host_context"] = _chat_host_context(plugins, thread.thread_id, engine)
             credential_env = await asyncio.to_thread(
                 plugins.prepare_environment, engine,
                 thread.thread_id + ":" + selection.credential_id,
@@ -1472,6 +1511,18 @@ class ExternalAgentSessionExecutor:
         await self._prepare_native_fork(state, selection, options, credential_env)
         if credential_env:
             options["env"] = credential_env
+        if plugins is not None and thread.mode == "conversation" and engine == "codex" and native_resume and resume_handle:
+            options["native_rollout_path"] = await asyncio.to_thread(
+                plugins.codex_rollout_path, thread.thread_id + ":" + selection.credential_id,
+                resume_handle, credential_env,
+                previous_revision=plugins.session_revision(previous_agent_session_id) if previous_agent_session_id else None,
+            )
+        if plugins is not None and thread.mode == "conversation" and engine == "cursor" and native_resume and resume_handle:
+            await asyncio.to_thread(
+                plugins.prepare_cursor_history, thread.thread_id + ":" + selection.credential_id,
+                resume_handle, credential_env,
+                previous_revision=plugins.session_revision(previous_agent_session_id) if previous_agent_session_id else None,
+            )
         request = SessionStart(
             **({"agent_session_id": agent_session_id} if agent_session_id else {}),
             thread_id=thread.thread_id,
@@ -1554,6 +1605,12 @@ class ExternalAgentSessionExecutor:
                 source["source_thread_id"] + ":" + source["source_credential_id"], credential_env,
                 previous_revision=plugins.session_revision(source["source_agent_session_id"]),
             )
+            options["native_rollout_path"] = await asyncio.to_thread(
+                plugins.codex_rollout_path,
+                source["source_thread_id"] + ":" + source["source_credential_id"],
+                source["native_thread_id"], credential_env,
+                previous_revision=plugins.session_revision(source["source_agent_session_id"]),
+            )
         options.update(fork_from=source["native_thread_id"], fork_last_turn_id=source["native_turn_id"])
         self._pending_handoff.pop(state.thread_id, None)
 
@@ -1581,7 +1638,6 @@ class ExternalAgentSessionExecutor:
         elif strict:
             raise RuntimeError("Runtime 已确认中断，但无法找到接入点以关闭其资源")
         self._live.discard(record.agent_session_id)
-        self._chat_contexts.pop(record.agent_session_id, None)
         self._session_modes.pop(record.agent_session_id, None)
         self._closed_sessions.add(record.agent_session_id)
         if record.thread_id:
@@ -1843,6 +1899,9 @@ class ExternalAgentSessionExecutor:
                     full += "\n" + redact_secrets(str(detail))
                 native_code = getattr(exc, "code", None)
                 code = native_code if isinstance(native_code, str) and native_code else "conversation.turn.executor_error"
+                self._settle_compact_turn(
+                    turn.thread_id, turn, str(turn.agent_session_id or ""),
+                    failed=True, message=_summary_line(full))
                 self._emit(turn.thread_id, ev.EV_RUNTIME_ERROR, {
                     "turn_id": turn.turn_id,
                     "code": code,
@@ -2000,7 +2059,9 @@ class ExternalAgentSessionExecutor:
         cached_caps = self._capability_cache.get(thread.thread_id)
         if cached_caps is None or cached_caps.stale:
             self.refresh_runtime_capabilities(thread.thread_id)
-        application_context_delivery = None
+        # Native resume/continuation paths also record delivery metadata but
+        # do not build an ordinary message below.
+        text = turn.text
         # Adapters whose session/load restores history during ensure_session
         # do not run another turn on resume; send the continuation prompt.
         if turn.kind == "continuation":
@@ -2023,39 +2084,35 @@ class ExternalAgentSessionExecutor:
                     turns=self._conv.list_turns(thread.thread_id), exclude_turn_id=turn.turn_id,
                     kind=RECOVERY_STRUCTURED_HANDOFF, reason="history_rewind", generation=state.current_generation)
                 self._conv.save_state(state.model_copy(update={"history_rebuild_pending": False}))
-            text = turn.text
+            # The user's text travels unchanged; history, references and the
+            # attachment manifest go beside it as typed context parts.
+            history_part: Optional[ContextPart] = None
             if pending is not None and pending.included:
                 # C38: ordinary message (and retry/resume/edit-resend without native resume)
-                # after session rebuild — inject structured current-branch history.
-                text = render_agent_text(pending, turn.text)
+                # after session rebuild — deliver structured current-branch history.
+                history_part = handoff_context_part(pending, action="切换/重建后继续")
+                text = current_turn_text(turn.text)
             elif turn.kind in {TURN_KIND_RETRY, TURN_KIND_EDIT_RESEND, "resume"}:
-                text = _continuation_prompt(
+                history_part = continuation_context_from_messages(
                     turn,
                     self._conv.list_current_messages(thread.thread_id),
                     self._conv.list_turns(thread.thread_id),
                 )
+                text = current_turn_text(turn.text)
             elif turn.seq == 1:
                 fork_tasks = [
                     item for item in self._store.list(Task, thread_id=thread.thread_id)
                     if item.kind == "conversation.fork"
                 ]
                 if fork_tasks:
-                    history = self._conv.list_current_messages(thread.thread_id)
-                    if history:
-                        transcript = "\n".join(
-                            f"{'用户' if item.role == 'user' else '助手'}：{item.text}"
-                            for item in history
-                        )
-                        text = (
-                            "以下是该分叉继承的对话历史，请在此上下文上继续：\n"
-                            f"{transcript}\n\n当前用户消息：{turn.text}"
-                        )
+                    history_part = _fork_history_part(
+                        self._conv.list_current_messages(thread.thread_id))
             selection = self._manager.runtime_selection(thread.thread_id)
             workspace = (
                 self._manager.get_workspace(str(thread.workspace_id or ""))
                 if thread.workspace_id else None
             )
-            _, capability_context = resolve_capability_refs(
+            _, reference_parts = capability_context_parts(
                 turn.capability_refs,
                 engine=engine_for_adapter(selection.adapter_id),
                 workspace_root=str(workspace.root_path if workspace is not None else ""),
@@ -2094,44 +2151,16 @@ class ExternalAgentSessionExecutor:
                     turn.runtime_invocation.get("arguments") or "")
                 runtime_invocation["revision"] = snapshot.revision
                 if matched.name == "compact":
-                    self._chat_contexts.pop(ref.agent_session_id, None)
+                    adapter.host_context_unsent(ref.agent_session_id)
+                    self._emit_compaction(
+                        thread.thread_id, turn, ref.agent_session_id, "started")
                 if matched.kind == "operation" and matched.resolution == "client":
-                    arguments = str(runtime_invocation.get("arguments") or "")
-                    result = await adapter.runtime_operation(ref, matched.name, arguments) if arguments else await adapter.runtime_operation(ref, matched.name)
-                    from muteki.external_agents.command_providers import public_operation_result
-                    result = public_operation_result(result)
-                    result_text = json.dumps(
-                        result, ensure_ascii=False, indent=2, default=str)
-                    self._emit(thread.thread_id, ev.EV_MESSAGE_COMPLETED, {
-                        "turn_id": turn.turn_id,
-                        "role": "assistant",
-                        "text": result_text,
-                        "runtime_operation": matched.name,
-                    }, command_id=turn.command_id or None)
-                    self._emit(thread.thread_id, ev.EV_TURN_COMPLETED, {
-                        "turn_id": turn.turn_id,
-                        "runtime_operation": matched.name,
-                    }, command_id=turn.command_id or None)
+                    await self._run_operation_turn(
+                        thread.thread_id, turn, adapter, ref, matched,
+                        str(runtime_invocation.get("arguments") or ""))
                     return
-            if capability_context:
-                text = (
-                    "[用户显式添加的参考上下文]\n"
-                    f"{capability_context}\n\n[当前用户请求]\n{text}"
-                )
-            plugins = getattr(self, "chat_plugins", None)
-            if plugins is not None and thread.mode == "conversation":
-                from .computer_control import chat_context as computer_chat_context
-                skill_context = plugins.skill_catalog_context(engine_for_adapter(selection.adapter_id))
-                context = "\n\n".join(part for part in (
-                    computer_chat_context(selection.access_mode, gateway_available=(
-                        adapter.injection_plan(ref.agent_session_id) is not None)), skill_context,
-                    plugins.visualization_context(thread.thread_id)) if part)
-                revision = f"{adapter.context_revision(ref)}:" + sha256(context.encode()).hexdigest()
-                cacheable = adapter.context_compaction_events
-                if not cacheable or self._chat_contexts.get(ref.agent_session_id) != revision:
-                    text = context + "\n\n" + text
-                    if cacheable:
-                        application_context_delivery = (ref.agent_session_id, revision)
+            context_parts: list[ContextPart] = [
+                part for part in (history_part, *reference_parts) if part is not None]
             attachment_payload: list[dict[str, Any]] = []
             if turn.attachments:
                 try:
@@ -2151,20 +2180,26 @@ class ExternalAgentSessionExecutor:
                     }, command_id=turn.command_id or None)
                     return
                 attachment_payload = attachments_payload(resolved)
-                text = merge_attachment_context(text, resolved)
-            if runtime_invocation and runtime_invocation.get("kind") != "skill":
+                attachment_part = attachment_context_part(resolved)
+                if attachment_part is not None:
+                    context_parts.append(attachment_part)
+            if runtime_invocation and (
+                    runtime_invocation.get("kind") != "skill"
+                    or (runtime_invocation.get("invocation") or {}).get("protocol") != "codex.turn/start"):
                 from muteki.external_agents.command_providers import native_prompt
+                # A native command line must reach the runtime as typed;
+                # context parts would turn it into an ordinary prompt.
                 text = native_prompt(runtime_invocation, str(runtime_invocation.get("arguments") or ""))
-                application_context_delivery = None
-            elif runtime_invocation and (runtime_invocation.get("invocation") or {}).get("protocol") != "codex.turn/start":
-                from muteki.external_agents.command_providers import native_prompt
-                text = native_prompt(runtime_invocation, str(runtime_invocation.get("arguments") or ""))
-                application_context_delivery = None
+                context_parts = []
+                native_command = True
+            else:
+                native_command = False
             stream = adapter.send(ref, MessageInput(
                 text=text,
                 payload={
                     "attachments": attachment_payload,
-                    "capability_context": "",
+                    "context_parts": context_parts,
+                    "native_command": native_command,
                     "runtime_capability": runtime_invocation,
                     "runtime_command_arguments": str(
                         runtime_invocation.get("arguments") or ""
@@ -2173,12 +2208,12 @@ class ExternalAgentSessionExecutor:
                 },
             ))
         await self._consume(thread.thread_id, turn, stream,
-                            application_context_delivery=application_context_delivery)
+                            context_session=(adapter, ref.agent_session_id, text))
 
     async def _consume(
         self, thread_id: str, turn: Optional[TurnRecord], stream: Any,
         *, require_control_delivery: bool = False,
-        application_context_delivery: Optional[tuple[str, str]] = None,
+        context_session: Optional[tuple[Any, str, str]] = None,
     ) -> None:
         """消费 Adapter 事件流并翻译为 Thread Public Event。"""
         interrupted = False
@@ -2226,13 +2261,11 @@ class ExternalAgentSessionExecutor:
                             "turn_id": turn_ref,
                             "reason": failure.reason,
                             "error": _public_failure(failure),
+                            **await self._delivery_fields(thread_id, turn, context_session),
                         }, command_id=(turn.command_id or None) if turn else None)
                     saw_failed_turn = True
                     detach_reason = "event_contract"
                     return
-                if application_context_delivery is not None and event.event_type is AgentEventType.TURN_STARTED:
-                    session_id, revision = application_context_delivery
-                    self._chat_contexts[session_id] = revision
                 if event.event_type is AgentEventType.TURN_FAILED:
                     saw_failed_turn = True
                     if not self._turn_failure_keeps_session(model.error):
@@ -2297,13 +2330,20 @@ class ExternalAgentSessionExecutor:
                             )
                         except Exception:  # A failed visual stays a visible local error, never discards the reply.
                             LOG.warning("could not publish visual replies for thread %s", thread_id, exc_info=True)
+                if (event.event_type in (AgentEventType.TURN_STARTED, AgentEventType.TURN_COMPLETED,
+                                         AgentEventType.TURN_FAILED)
+                        and context_session is not None and turn is not None):
+                    self._context_delivery_meta[thread_id] = await asyncio.to_thread(
+                        self._record_context_delivery, thread_id, turn, context_session)
                 interrupted = self._translate(thread_id, turn, event, model) or interrupted
+                self._context_delivery_meta.pop(thread_id, None)
             if interrupted and turn is not None:
                 current = self._conv.get_turn(turn.turn_id)
                 if current is not None and current.status == TURN_RUNNING:
                     self._emit(thread_id, ev.EV_TURN_INTERRUPTED, {
                         "turn_id": turn.turn_id,
                         "phase": "runtime_exited",
+                        **await self._delivery_fields(thread_id, turn, context_session),
                     }, command_id=turn.command_id or None)
                 return
             if turn is None:
@@ -2323,17 +2363,32 @@ class ExternalAgentSessionExecutor:
                     "detail": "runtime event stream ended without a terminal turn event",
                 }
                 self._disposition_hints[thread_id] = DISPOSITION_NEEDS_RESTART
+                self._settle_compact_turn(
+                    thread_id, turn, str(turn.agent_session_id or ""), failed=True,
+                    message=str(error.get("message") or error.get("detail") or ""))
                 self._emit(thread_id, ev.EV_TURN_FAILED, {
                     "turn_id": turn.turn_id,
                     "error": error,
+                    **await self._delivery_fields(thread_id, turn, context_session),
                 }, command_id=turn.command_id or None)
                 detach_reason = "stream_ended"
         except asyncio.CancelledError:
             detach_reason = "consume_cancelled"
             raise
         finally:
-            if application_context_delivery is not None and (saw_failed_turn or runtime_error or interrupted or detach_reason):
-                self._chat_contexts.pop(application_context_delivery[0], None)
+            if context_session is not None and (saw_failed_turn or runtime_error or interrupted or detach_reason):
+                # Host rules carried in this turn's text may never have
+                # reached the runtime's history; send them again next turn.
+                context_session[0].host_context_unsent(context_session[1])
+            if context_session is not None and turn is not None:
+                # Parts handed to a runtime that never reported the turn's end
+                # stay auditable and reachable from the turn.
+                late = await asyncio.to_thread(
+                    self._record_context_delivery, thread_id, turn, context_session)
+                stored = self._conv.get_turn(turn.turn_id) if late else None
+                if stored is not None:
+                    self._conv.save_turn(stored.model_copy(
+                        update={"context_delivery": [*stored.context_delivery, *late]}))
             if detach_reason:
                 await self._stop_detached_runtime(
                     thread_id, reason=f"conversation_runtime_detached:{detach_reason}")
@@ -2475,8 +2530,10 @@ class ExternalAgentSessionExecutor:
             # A session can serve multiple turns.  Snapshot the selection on
             # every turn so the UI can label historical replies after a later
             # endpoint or model switch.
+            delivery = self._context_delivery_meta.pop(thread_id, None)
             out_type, payload = ev.EV_TURN_STARTED, public(
-                fields, runtime=self._runtime_snapshot(thread_id))
+                fields, runtime=self._runtime_snapshot(thread_id),
+                **({"context_delivery": delivery} if delivery else {}))
         elif etype is AgentEventType.MESSAGE_DELTA:
             if model.role != "assistant" or not model.text:
                 return False
@@ -2553,6 +2610,20 @@ class ExternalAgentSessionExecutor:
         elif etype is AgentEventType.USAGE_UPDATED:
             out_type, payload = ev.EV_USAGE_UPDATED, self._usage_payload(
                 thread_id, model, base, event.native_type)
+        elif etype is AgentEventType.COMPACTION_UPDATED:
+            manual = turn is not None and _is_compact_invocation(turn.runtime_invocation)
+            if manual and model.status == "started":
+                # The /compact turn already announced its own start.
+                return False
+            if turn_id and model.status != "started":
+                self._compaction_settled.add(turn_id)
+                self._compaction_open.discard(turn_id)
+            elif turn_id and not manual:
+                self._compaction_open.add(turn_id)
+            if manual:
+                fields["trigger"] = "manual"
+            out_type, payload = ev.EV_CONTEXT_COMPACTION, public(
+                fields, **({"native_type": event.native_type} if event.native_type else {}))
         elif etype is AgentEventType.PLAN_UPDATED:
             out_type, payload = ev.EV_PLAN_UPDATED, public(
                 fields, source="adapter", native_type=event.native_type)
@@ -2616,14 +2687,24 @@ class ExternalAgentSessionExecutor:
             out_type, payload = ev.EV_WORKSPACE_CHANGED, public(
                 {"files": fields.get("files")}, diff=diff, has_diff=bool(diff))
         elif etype is AgentEventType.TURN_COMPLETED:
-            out_type, payload = ev.EV_TURN_COMPLETED, public(fields)
+            self._settle_compact_turn(
+                thread_id, turn, event.agent_session_id, failed=False)
+            delivery = self._context_delivery_meta.pop(thread_id, None)
+            out_type, payload = ev.EV_TURN_COMPLETED, public(
+                fields, **({"context_delivery": delivery} if delivery else {}))
         elif etype is AgentEventType.TURN_FAILED:
             failure = model.error
+            self._settle_compact_turn(
+                thread_id, turn, event.agent_session_id, failed=True,
+                interrupted=failure.category is FailureCategory.CANCELLED,
+                message=failure.message or "")
             out_type = (ev.EV_TURN_INTERRUPTED
                         if failure.category is FailureCategory.CANCELLED
                         else ev.EV_TURN_FAILED)
+            delivery = self._context_delivery_meta.pop(thread_id, None)
             payload = public({}, reason=failure.reason,
-                             error=_public_failure(failure))
+                             error=_public_failure(failure),
+                             **({"context_delivery": delivery} if delivery else {}))
             if failure.category is FailureCategory.CANCELLED:
                 # Retain the terminal event family for existing SSE clients;
                 # its typed status distinguishes refusal from our interrupt.
@@ -2640,6 +2721,126 @@ class ExternalAgentSessionExecutor:
             self._emit(thread_id, out_type, payload,
                        command_id=(turn.command_id or None) if turn else None)
         return False
+
+    def _emit_compaction(
+        self, thread_id: str, turn: TurnRecord, agent_session_id: str,
+        status: str, *, confirmed: bool = True, trigger: str = "manual", **fields: Any,
+    ) -> None:
+        model = CompactionPayload(
+            status=status, trigger=trigger, confirmed=confirmed,
+            **{key: value for key, value in fields.items() if value is not None})
+        self._emit(thread_id, ev.EV_CONTEXT_COMPACTION, {
+            **{key: value for key, value in dump_payload(model).items()
+               if value is not None and key != "native"},
+            "turn_id": turn.turn_id,
+            "agent_session_id": agent_session_id,
+        }, command_id=turn.command_id or None)
+
+    def _settle_compact_turn(
+        self, thread_id: str, turn: Optional[TurnRecord], agent_session_id: str,
+        *, failed: bool, interrupted: bool = False, message: str = "",
+    ) -> None:
+        """Close the lifecycle of a ``/compact`` turn whose engine never
+        reported the compaction itself (Kimi ACP, OMP ACP...)."""
+        if turn is not None and turn.turn_id in self._compaction_open:
+            # An automatic compaction started in this turn but the engine never
+            # reported its outcome; close it so the gauge does not stay running.
+            self._compaction_open.discard(turn.turn_id)
+            if interrupted:
+                self._emit_compaction(
+                    thread_id, turn, agent_session_id, "interrupted", trigger="auto")
+            elif failed:
+                self._emit_compaction(
+                    thread_id, turn, agent_session_id, "failed", trigger="auto",
+                    message=message or "本轮在引擎报告压缩结果前结束")
+            else:
+                self._emit_compaction(
+                    thread_id, turn, agent_session_id, "completed", trigger="auto", confirmed=False)
+        if turn is None:
+            return
+        if not _is_compact_invocation(turn.runtime_invocation):
+            self._compaction_settled.discard(turn.turn_id)
+            return
+        if turn.turn_id in self._compaction_settled:
+            self._compaction_settled.discard(turn.turn_id)
+            return
+        if interrupted:
+            self._emit_compaction(thread_id, turn, agent_session_id, "interrupted")
+        elif failed:
+            self._emit_compaction(
+                thread_id, turn, agent_session_id, "failed",
+                message=message or None)
+        else:
+            self._emit_compaction(
+                thread_id, turn, agent_session_id, "completed", confirmed=False)
+
+    async def _run_operation_turn(
+        self, thread_id: str, turn: TurnRecord, adapter: Any,
+        ref: AgentSessionRef, item: Any, arguments: str,
+    ) -> None:
+        """Run a client-resolved Runtime operation as the whole turn.
+
+        Failures end this turn only; the native session stays attached.
+        """
+        from muteki.external_agents.command_providers import (
+            operation_result_text, public_operation_result,
+        )
+        command_id = turn.command_id or None
+        base = {"turn_id": turn.turn_id, "agent_session_id": ref.agent_session_id}
+        try:
+            if not isinstance(adapter, RuntimeOperationAdapter):
+                raise RuntimeError(f"{adapter.id} 没有结构化 Runtime operation 通道")
+            raw = (await adapter.runtime_operation(ref, item.name, arguments)
+                   if arguments else await adapter.runtime_operation(ref, item.name))
+        except Exception as exc:  # noqa: BLE001 — surfaced as this turn's failure
+            LOG.warning("runtime operation %s failed thread=%s", item.name, thread_id, exc_info=True)
+            detail = redact_secrets(f"{type(exc).__name__}: {exc}")
+            native_code = getattr(exc, "code", None)
+            code = native_code if isinstance(native_code, str) and native_code else "conversation.runtime_operation.failed"
+            if item.name == "compact":
+                self._compaction_settled.discard(turn.turn_id)
+                self._emit_compaction(
+                    thread_id, turn, ref.agent_session_id, "failed",
+                    message=_summary_line(redact_secrets(str(exc)) or detail))
+            self._emit(thread_id, ev.EV_TURN_FAILED, {
+                **base,
+                "runtime_operation": item.name,
+                "error": {"code": code, "message": _summary_line(detail), "detail": detail},
+            }, command_id=command_id)
+            return
+        result = public_operation_result(raw)
+        if item.name == "compact" and turn.turn_id in self._compaction_settled:
+            # The engine's own compaction stream already closed this lifecycle.
+            self._compaction_settled.discard(turn.turn_id)
+        elif item.name == "compact":
+            compaction = result.get("compaction") if isinstance(result, dict) else None
+            compaction = compaction if isinstance(compaction, dict) else {}
+            self._emit_compaction(
+                thread_id, turn, ref.agent_session_id, "completed",
+                tokens_before=_non_negative_int(compaction.get("tokens_before")),
+                tokens_after=_non_negative_int(compaction.get("tokens_after")),
+                summary=str(compaction.get("summary") or "") or None)
+        context = result.get("context") if isinstance(result, dict) else None
+        if isinstance(context, dict):
+            used = _non_negative_int(context.get("used"))
+            limit = _non_negative_int(context.get("limit"))
+            if used is not None or limit is not None:
+                self._emit(thread_id, ev.EV_USAGE_UPDATED, self._usage_payload(
+                    thread_id,
+                    UsagePayload(scope="context_only", context_used_tokens=used,
+                                 context_window=limit),
+                    base, None,
+                ), command_id=command_id)
+        self._emit(thread_id, ev.EV_MESSAGE_COMPLETED, {
+            **base,
+            "role": "assistant",
+            "text": operation_result_text(item.name, result),
+            "runtime_operation": item.name,
+            "operation_result": result,
+        }, command_id=command_id)
+        self._emit(thread_id, ev.EV_TURN_COMPLETED, {
+            **base, "runtime_operation": item.name,
+        }, command_id=command_id)
 
     def _usage_payload(
         self, thread_id: str, model: Any, base: dict[str, Any],
@@ -2686,6 +2887,51 @@ class ExternalAgentSessionExecutor:
             payload["usage_id"] = f"{base['agent_session_id']}:{model.usage_id}"
         payload.update(base)
         return payload
+
+    def _context_ledger_path(self, thread_id: str, turn_id: str) -> Path:
+        digest = sha256(thread_id.encode()).hexdigest()[:24]
+        return self._sessions_root / "_context_ledger" / digest / f"{sha256(turn_id.encode()).hexdigest()[:24]}.json"
+
+    def _record_context_delivery(
+        self, thread_id: str, turn: TurnRecord, context_session: tuple[Any, str, str],
+    ) -> list[dict[str, Any]]:
+        """Append the parts an adapter delivered for this turn to the turn's ledger.
+
+        The ledger keeps every part's full text; the turn event carries only
+        keys, channels and digests.
+        """
+        adapter, session_id, sent_text = context_session
+        entries = adapter.take_context_delivery(session_id)
+        if not entries:
+            return []
+        path = self._context_ledger_path(thread_id, turn.turn_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ledger = (json.loads(path.read_text(encoding="utf-8")) if path.exists() else
+                  {"thread_id": thread_id, "turn_id": turn.turn_id, "adapter_id": adapter.id,
+                   "agent_session_id": session_id, "user_text": sent_text, "parts": []})
+        ledger["parts"].extend(entries)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(ledger, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(path)
+        return [{key: value for key, value in entry.items() if key != "text"} for entry in entries]
+
+    async def _delivery_fields(
+        self, thread_id: str, turn: Optional[TurnRecord],
+        context_session: Optional[tuple[Any, str, str]],
+    ) -> dict[str, Any]:
+        """Terminal-event fields for parts delivered since the last recorded event."""
+        if context_session is None or turn is None:
+            return {}
+        entries = await asyncio.to_thread(
+            self._record_context_delivery, thread_id, turn, context_session)
+        return {"context_delivery": entries} if entries else {}
+
+    def context_delivery(self, thread_id: str, turn_id: str) -> Optional[dict[str, Any]]:
+        """Full ledger of what Muteki sent beside the user's text in a turn."""
+        path = self._context_ledger_path(thread_id, turn_id)
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
 
     def _save_agent_artifact(
         self, thread_id: str, turn: Optional[TurnRecord], payload: dict[str, Any]
@@ -2985,6 +3231,12 @@ class ExternalAgentSessionExecutor:
         self._continuation_tasks.clear()
         self._continuation_sources.clear()
         self._native_wake_turns.clear()
+        for adapter in list(self._prewarmed_adapters):
+            try:
+                await adapter.close_spares()
+            except Exception:  # noqa: BLE001 — 关停路径不阻断
+                LOG.exception("shutdown spare close failed: %s", adapter.id)
+        self._prewarmed_adapters.clear()
 
 
 __all__ = ["ExternalAgentSessionExecutor"]

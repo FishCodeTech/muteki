@@ -1,5 +1,6 @@
 "use client";
 
+import { memo } from "react";
 import type { ChatSurface } from "@/lib/chatPanelStore";
 import type { SurfaceContext } from "./types";
 import { OverviewSurface } from "@/components/chat/surfaces/OverviewSurface";
@@ -12,7 +13,32 @@ import { AgentsSurface } from "@/components/chat/surfaces/AgentsSurface";
 import { PlanSurface } from "@/components/chat/surfaces/PlanSurface";
 import { PullRequestSurface } from "@/components/chat/surfaces/PullRequestSurface";
 
-export function SurfaceRenderer({ surface, ctx }: { surface: ChatSurface; ctx: SurfaceContext }) {
+interface SurfaceRendererProps {
+  surface: ChatSurface;
+  ctx: SurfaceContext;
+}
+
+// Stream-driven data; hidden surfaces keep their last-rendered snapshot and re-sync on activation.
+const LIVE_DATA_KEYS = ["view", "events", "tools"] as const satisfies readonly (keyof SurfaceContext)[];
+
+function sameRendererProps(prev: SurfaceRendererProps, next: SurfaceRendererProps): boolean {
+  if (prev.surface !== next.surface) return false;
+  const a = prev.ctx;
+  const b = next.ctx;
+  if (
+    a.active !== b.active
+    || a.threadId !== b.threadId
+    || a.hasWorkspace !== b.hasWorkspace
+    || a.onOpenDetails !== b.onOpenDetails
+    || a.onCiteToComposer !== b.onCiteToComposer
+    || a.onAttachToComposer !== b.onAttachToComposer
+    || a.onDiffAnnotationSend !== b.onDiffAnnotationSend
+  ) return false;
+  if (!b.active) return true;
+  return LIVE_DATA_KEYS.every((key) => a[key] === b[key]);
+}
+
+export const SurfaceRenderer = memo(function SurfaceRenderer({ surface, ctx }: SurfaceRendererProps) {
   switch (surface.kind) {
     case "overview":
       return <OverviewSurface {...ctx} surface={surface} />;
@@ -37,4 +63,4 @@ export function SurfaceRenderer({ surface, ctx }: { surface: ChatSurface; ctx: S
       return exhaustive;
     }
   }
-}
+}, sameRendererProps);

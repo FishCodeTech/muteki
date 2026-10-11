@@ -374,15 +374,18 @@ async def fixture_baseline(root: Path, repeat: int, count: int, *, verify_wait: 
                     "portable_stdio_timeout_source": "stdio_server.GATEWAY_TIMEOUT_SECONDS",
                     "interpretation": "configured timeout budgets; read-only warm round trips measured separately"}
 
-        prompt = {"empty_managed_skill_catalog_utf8_bytes": len(plugins.skill_catalog_context("codex").encode()),
-                  "visualization_host_hint_utf8_bytes": len(plugins.visualization_context(thread.thread_id).encode()),
-                  "injection_frequency": "with native compaction observability: once per live session, changed catalog/hint revision or compaction; other runtimes receive the shorter hint each turn",
+        def part_bytes(part):
+            return len(part.text.encode()) if part is not None else 0
+
+        prompt = {"empty_managed_skill_catalog_utf8_bytes": part_bytes(plugins.skill_catalog_part("codex")),
+                  "visualization_host_hint_utf8_bytes": part_bytes(plugins.visualization_part(thread.thread_id, "codex")),
+                  "injection_frequency": "session host context: system/application channel where the runtime has one; text-envelope runtimes resend once per compaction revision, or every turn without compaction events",
                   "control_skill_utf8_bytes": (ROOT / "muteki/agent_plugins/muteki-control/skills/muteki-control/SKILL.md").stat().st_size,
                   "visualize_skill_utf8_bytes": (ROOT / "muteki/agent_plugins/muteki-visualize/skills/visualize/SKILL.md").stat().st_size,
                   "skill_body_caveat": "file size is not evidence that its body enters every model turn"}
         plugins.install_visualize()
         prompt["installed_visualize_catalog"] = {engine: {"skill_count": len(plugins.skill_rows(engine)),
-                    "catalog_utf8_bytes": len(plugins.skill_catalog_context(engine).encode())} for engine in PROVIDERS}
+                    "catalog_utf8_bytes": part_bytes(plugins.skill_catalog_part(engine))} for engine in PROVIDERS}
         html = '<div id="baseline-visual"><strong>Baseline visualization</strong></div>'
         message = SimpleNamespace(role="assistant", message_id="msg-baseline", text="```muteki-visualize\n" + html + "\n```")
         reference = references(message.text)[0]

@@ -25,6 +25,9 @@ const METHOD_RULES = [
   { path: '/api/capability-management', match: 'prefix', methods: ['GET', 'POST', 'PUT'] },
   { path: '/api/domain-modules', match: 'prefix', methods: ['GET', 'POST'] },
   { path: '/api/settings/ui', match: 'exact', methods: ['GET', 'PUT'] },
+  { path: '/api/settings/run-retention', match: 'exact', methods: ['GET'] },
+  { path: '/api/settings/run-retention/ctf', match: 'exact', methods: ['PUT'] },
+  { path: '/api/settings/run-retention/pentest', match: 'exact', methods: ['PUT'] },
 ];
 function pathMatches(rule, pathname) {
   return pathname === rule.path || (rule.match === 'prefix' && pathname.startsWith(rule.path + '/'));

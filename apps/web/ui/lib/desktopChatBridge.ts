@@ -23,6 +23,7 @@ export interface DesktopSpeechEvent extends DesktopNotificationScope {
 export interface DesktopNotificationScope { connectionVersion: number; serviceId: string; identityId: string }
 export type DesktopNotificationStage = "submitted" | "awaiting_show" | "shown" | "failed" | "outcome_unknown" | "clicked" | "closed";
 export interface DesktopNotificationEvent extends DesktopNotificationScope {
+  test?: boolean;
   id: string; threadId: string; eventId: string; requestedEventId?: string; dedupeKey: string; seq: number;
   status: DesktopNotificationStage; shown: boolean; code?: string; message?: string;
   history: Array<{ status: DesktopNotificationStage; at: string; code?: string; message?: string }>;
@@ -126,6 +127,7 @@ export interface DesktopChatBridge {
   notificationStatus?: (input: DesktopNotificationScope) => Promise<DesktopNotificationStatus>;
   requestNotifications?: (input: DesktopNotificationScope) => Promise<DesktopNotificationStatus>;
   sendNotification?: (input: DesktopNotificationInput) => Promise<DesktopNotificationEvent>;
+  testNotification?: (input: DesktopNotificationScope & { wantSound: boolean }) => Promise<DesktopNotificationEvent>;
   onNotification?: (callback: (event: DesktopNotificationEvent) => void) => () => void;
   openPermissionSettings?: (kind: "microphone" | "speechRecognition" | "notifications") => Promise<unknown>;
   cacheAttachment?: (input: { data: ArrayBuffer; name: string; type: string; lastModified: number; draftId: string }) => Promise<{ id: string; name: string; type: string; size: number; sha256: string }>;

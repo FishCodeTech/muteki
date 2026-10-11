@@ -97,7 +97,8 @@ export function reduceLifecycle(prev: DeckState, ev: MutekiEvent, s: DeckState):
       if (firstStart) { s.startedAt = ev.ts; s.finishedAt = undefined; }
       if (p.challenge?.name && p.challenge.name !== s.runId) s.challengeName = p.challenge.name;
       if (typeof p.name_autogen === "boolean") s.challengeNameAutogen = p.name_autogen;
-      s.category = p.challenge?.category ?? s.category;
+      // Category comes from RUN_PREPARING (operator) or RUN_TITLED (Planner);
+      // each Worker's challenge copy here may carry a placeholder.
       s.target = p.challenge?.target ?? s.target;
       // multi-flag: pick up the target flag count + mode bit so "collecting" works
       // from the start of the run, not just at RUN_FINISHED.

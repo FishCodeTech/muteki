@@ -51,6 +51,12 @@ export type ComposerDraft = {
   interactionMode?: string;
   projectId?: string;
   updatedAt: number;
+  /**
+   * When the runtime selection (credential/runtime/model/effort/access) last
+   * changed. `updatedAt` moves on every text edit or re-save, so it cannot tell
+   * whether the selection is newer than the server's thread runtime.
+   */
+  runtimeUpdatedAt?: number;
 };
 
 export type ComposerDraftBucket = Record<string, ComposerDraft>;
@@ -454,6 +460,8 @@ export function normalizeComposerDraft(value: unknown): ComposerDraft | null {
     attachments: normalizeAttachments(row.attachments),
     updatedAt: Number(row.updatedAt) || 0,
   };
+  const runtimeUpdatedAt = Number(row.runtimeUpdatedAt) || 0;
+  if (runtimeUpdatedAt) draft.runtimeUpdatedAt = runtimeUpdatedAt;
   if (promptSegments) draft.promptSegments = promptSegments;
   const credentialId = String(row.credentialId || "").trim();
   const runtimeKey = String(row.runtimeKey || "").trim();
@@ -580,6 +588,17 @@ export function writeComposerDraft(draftKey: string, input: ComposerDraftWriteIn
   const interactionMode = String(input.interactionMode || "").trim();
   if (interactionMode) draft.interactionMode = interactionMode;
   if (projectId) draft.projectId = projectId;
+  if (credentialId || runtimeKey || model || effort || accessMode) {
+    const runtimeUnchanged = Boolean(oldDraft)
+      && (oldDraft?.credentialId || "") === credentialId
+      && (oldDraft?.runtimeKey || "") === runtimeKey
+      && (oldDraft?.model || "") === model
+      && (oldDraft?.effort || "") === effort
+      && (oldDraft?.accessMode || "") === accessMode;
+    draft.runtimeUpdatedAt = runtimeUnchanged
+      ? (oldDraft?.runtimeUpdatedAt || oldDraft?.updatedAt || draft.updatedAt)
+      : draft.updatedAt;
+  }
 
   const bucket = readBucketFromStorage();
   if (isComposerDraftEmpty(draft)) {

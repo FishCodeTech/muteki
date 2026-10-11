@@ -439,6 +439,10 @@ class BaseExternalAgentAdapter:
 
     # Enable cross-turn hint caching only with observed native compaction events.
     context_compaction_events = False
+    # Native channels for SessionOptions.host_context and per-turn
+    # MessagePayload.context_parts (recorded in the turn's delivery ledger).
+    host_context_channel = "text_envelope"
+    turn_context_channel = "text_envelope"
 
     # Executable a subclass probes; set in ``__init__`` (``driver`` is the
     # CliDriver of the CLI compatibility adapter, ``_cli_path`` the Claude CLI).
@@ -466,6 +470,9 @@ class BaseExternalAgentAdapter:
         self._descriptor_provider = descriptor_provider
         self._capability_gateway = None
         self._context_revisions: dict[str, int] = {}
+        self._host_context: dict[str, list[Any]] = {}
+        self._host_context_sent: dict[str, int] = {}
+        self._context_deliveries: dict[str, list[dict[str, Any]]] = {}
         self._sequencers: dict[str, EventSequencer] = {}
         self._grants: dict[str, list[str]] = {}
         self._plans: dict[str, CapabilityInjectionPlan] = {}
@@ -572,6 +579,69 @@ class BaseExternalAgentAdapter:
 
     def _context_compacted(self, agent_session_id: str) -> None:
         self._context_revisions[agent_session_id] = self._context_revisions.get(agent_session_id, 0) + 1
+
+    def host_context(self, agent_session_id: str) -> list[Any]:
+        """Host parts this session was started with (after gateway filtering)."""
+        return list(self._host_context.get(agent_session_id, ()))
+
+    def host_context_for_turn(self, agent_session_id: str) -> list[Any]:
+        """Host parts a per-turn channel must carry on this turn.
+
+        Runtimes without a system channel keep host rules only in their
+        conversation history. With observed compaction events they are resent
+        once per context revision; otherwise on every turn, because a silent
+        compaction would drop them.
+        """
+        parts = self.host_context(agent_session_id)
+        if not parts:
+            return []
+        if not self.context_compaction_events:
+            return parts
+        revision = self._context_revisions.get(agent_session_id, 0)
+        if self._host_context_sent.get(agent_session_id) == revision:
+            return []
+        self._host_context_sent[agent_session_id] = revision
+        return parts
+
+    def host_context_unsent(self, agent_session_id: str) -> None:
+        """A turn failed before the runtime accepted it: send host rules again."""
+        self._host_context_sent.pop(agent_session_id, None)
+
+    def turn_context(self, agent_session_id: str, input: Any, *, host: bool = True,
+                     channel: Any = "") -> list[Any]:
+        """Context parts that travel with this message, recorded as delivered.
+
+        ``host`` adds the session host rules for adapters whose host rules
+        ride the same per-turn channel; a native command line gets none.
+        """
+        payload = getattr(input, "payload", None)
+        if payload is None or getattr(payload, "native_command", False):
+            return []
+        channel = channel or self.turn_context_channel
+        parts = list(getattr(payload, "context_parts", ()) or ())
+        self.record_context_delivery(agent_session_id, parts, channel, scope="turn")
+        if host:
+            host_parts = self.host_context_for_turn(agent_session_id)
+            self.record_context_delivery(agent_session_id, host_parts, channel, scope="session")
+            parts = [*host_parts, *parts]
+        return parts
+
+    def turn_text(self, agent_session_id: str, input: Any) -> str:
+        """One-text channel: host rules and turn parts as envelopes, then the user's text."""
+        from .context_delivery import text_with_envelopes
+        return text_with_envelopes(
+            input.text, self.turn_context(agent_session_id, input, channel="text_envelope"))
+
+    def record_context_delivery(self, agent_session_id: str, parts: list[Any], channel: Any,
+                                *, scope: str) -> None:
+        from .context_delivery import ledger_entries
+        if parts:
+            self._context_deliveries.setdefault(agent_session_id, []).extend(
+                ledger_entries(parts, channel, scope=scope))
+
+    def take_context_delivery(self, agent_session_id: str) -> list[dict[str, Any]]:
+        """Context parts delivered since the last call (the session's delivery ledger)."""
+        return self._context_deliveries.pop(agent_session_id, [])
 
     def _describe(self, binding: CapabilityBinding) -> CapabilityDescriptor:
         if self._descriptor_provider is not None:
@@ -787,8 +857,16 @@ class BaseExternalAgentAdapter:
                     request, binding, grant)
                 token = issue_bearer_token(binding, grant, session=record)
 
+            if plan is None and any(p.requires_gateway for p in request.options.host_context):
+                request = request.model_copy(update={"options": request.options.model_copy(update={
+                    "host_context": [p for p in request.options.host_context if not p.requires_gateway]})})
+            self._host_context[record.agent_session_id] = list(request.options.host_context)
+            self._host_context_sent.pop(record.agent_session_id, None)
             # 步骤 4（后半）：在 Runtime 启动参数中完成注入并启动。
             launched = await self._launch(request, plan, token)
+            if self.host_context_channel == "system_prompt":
+                self.record_context_delivery(record.agent_session_id, request.options.host_context,
+                                             "system_prompt", scope="session")
         except BaseException:
             # Cancellation also aborts an open (T3 ProviderSessionManager's
             # onError finalizer). Never leave its grant or preparing record.
@@ -1105,6 +1183,9 @@ class BaseExternalAgentAdapter:
             self.revoke_session_grants(session.agent_session_id)
             self._sequencers.pop(session.agent_session_id, None)
             self._context_revisions.pop(session.agent_session_id, None)
+            self._host_context.pop(session.agent_session_id, None)
+            self._host_context_sent.pop(session.agent_session_id, None)
+            self._context_deliveries.pop(session.agent_session_id, None)
 
     async def _teardown(self, session: AgentSessionRef) -> str:
         """子类钩子：停止 Runtime 进程 / 连接，返回退出分类。"""

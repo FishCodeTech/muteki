@@ -55,3 +55,50 @@ def is_web_container() -> bool:
     except OSError:
         pass
     return False
+
+
+def native_user_environment(env: dict[str, str] | None = None) -> dict[str, str]:
+    """Normalize native launch state without changing explicit account overlays."""
+    from pathlib import Path
+
+    source = dict(os.environ if env is None else env)
+    if source.get("MUTEKI_HOST_DISCOVERY", os.environ.get("MUTEKI_HOST_DISCOVERY")) == "0":
+        return source
+    if os.name != "posix":
+        return source
+    import pwd
+    account = pwd.getpwuid(os.getuid())
+    home = Path(account.pw_dir).resolve()
+    # A supplied HOME denotes a complete inherited environment. An overlay
+    # without HOME may intentionally select a registered account's native root.
+    inherited = source if env is None or "HOME" in source else os.environ
+    homes = [Path(inherited[key]).resolve() for key in ("HOME", "USERPROFILE") if inherited.get(key)]
+    private_roots = [value for value in homes if value != home]
+    if inherited.get("MUTEKI_CHAT_PRIVATE_ROOT"):
+        private_roots.append(Path(inherited["MUTEKI_CHAT_PRIVATE_ROOT"]).resolve())
+    trusted = not private_roots
+
+    def managed_path(value: str) -> bool:
+        path = Path(value).resolve()
+        return (any(path == root or path.is_relative_to(root) for root in private_roots)
+                or any(part in {"_platform", ".muteki-opencode", "muteki_accounts"} for part in path.parts))
+
+    overlay = env is not None and "HOME" not in source
+    source.update(HOME=str(home), USERPROFILE=str(home), USER=account.pw_name, LOGNAME=account.pw_name)
+    for key, relative in {"XDG_CONFIG_HOME": ".config", "XDG_CACHE_HOME": ".cache", "XDG_DATA_HOME": ".local/share"}.items():
+        value = source.get(key) if overlay and key in source else inherited.get(key)
+        source[key] = value if value and ((overlay and key in source) or (trusted and not managed_path(value))) else str(home / relative)
+    for key in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "CURSOR_CONFIG_DIR", "GROK_HOME", "KIMI_CODE_HOME", "PI_CODING_AGENT_DIR"):
+        if overlay and key in source:
+            continue
+        value = inherited.get(key)
+        # Empty overlays also shadow poisoned keys when callers merge os.environ.
+        if not trusted or (value and managed_path(value)):
+            source[key] = ""
+        elif value:
+            source[key] = value
+    path_value = source.get("PATH") if overlay and "PATH" in source else inherited.get("PATH")
+    if path_value:
+        source["PATH"] = os.pathsep.join(value for value in path_value.split(os.pathsep) if value and not managed_path(value))
+    source["MUTEKI_CHAT_PRIVATE_ROOT"] = ""
+    return source
