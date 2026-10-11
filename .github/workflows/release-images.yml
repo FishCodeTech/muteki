@@ -362,6 +362,10 @@ jobs:
           if len(apps) != 1:
               raise SystemExit(f"Expected one packaged Muteki.app, found {apps!r}")
           app = apps[0]
+          subprocess.run([
+              "python3", "scripts/build_desktop_runtime.py", "--verify-runtime",
+              str(app / "Contents/Resources/runtime"),
+          ], check=True)
           expected_version = json.loads(Path("apps/desktop/package.json").read_text())["version"]
           profile = Path(os.environ["RUNNER_TEMP"]) / "muteki-desktop-acceptance"
           profile.mkdir(parents=True, exist_ok=True)

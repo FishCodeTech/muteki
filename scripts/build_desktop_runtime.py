@@ -24,6 +24,118 @@ def run(*args: str, **kwargs):
     return subprocess.run(args, cwd=ROOT, check=True, **kwargs)
 
 
+def copy_application_source(code: Path) -> dict[str, str]:
+    """Copy the source and resources used by the bundled Python application."""
+    excluded = {".git", ".venv", "node_modules", ".next", "state", "sessions", "dist", "build", "__pycache__"}
+    files = run("git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", capture_output=True).stdout.split(b"\0")
+    hashes = {}
+    for raw in files:
+        if not raw:
+            continue
+        relative = Path(os.fsdecode(raw))
+        if any(part in excluded for part in relative.parts):
+            continue
+        if relative.parts[0] not in {"muteki", "apps", "scripts", "skills", "prompts", "config", "configs"} and str(relative) not in {"pyproject.toml", "uv.lock", "LICENSE"}:
+            continue
+        if relative.parts[:3] == ("apps", "web", "ui"):
+            continue
+        source_file = ROOT / relative
+        if not source_file.is_file():
+            continue
+        target = code / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_file, target)
+        hashes[str(relative)] = hashlib.sha256(target.read_bytes()).hexdigest()
+    return hashes
+
+
+def verify_worker_skill_resources(runtime: Path) -> None:
+    """Exercise Worker Skill projection from one relocated desktop runtime."""
+    runtime = runtime.resolve()
+    manifest = json.loads((runtime / "manifest.json").read_text())
+
+    def inside(relative: str) -> Path:
+        path = (runtime / relative).resolve()
+        if not path.is_relative_to(runtime):
+            raise ValueError(f"Desktop runtime path escapes its root: {relative}")
+        return path
+
+    python = inside(manifest["python"])
+    code = inside(manifest["code"])
+    check = r'''
+from pathlib import Path
+import sys
+import tempfile
+
+app = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(app))
+
+from muteki.solver.cli_protocol import _REPO_BLACKBOARD_SCRIPT
+from muteki.solver.cli_workspace import _repo_blackboard_script
+from muteki.models.solve_graph import Challenge
+from muteki.solver.cli_solver import CliSolver
+from muteki.solver.worker_skills import (
+    project_skill_roots,
+    stage_blackboard_skill,
+)
+
+blackboard = app / "skills" / "muteki-blackboard"
+browser = app / "skills" / "muteki-agent-browser"
+required = (
+    blackboard / "SKILL.md",
+    blackboard / "blackboard.py",
+    browser / "SKILL.md",
+)
+missing = [str(path.relative_to(app)) for path in required if not path.is_file()]
+if missing:
+    raise FileNotFoundError(f"Desktop Worker Skill resources missing: {missing}")
+for resource in required:
+    if not resource.read_text(encoding="utf-8").strip():
+        raise ValueError(f"Desktop Worker Skill resource is empty: {resource}")
+if _REPO_BLACKBOARD_SCRIPT.resolve() != (blackboard / "blackboard.py").resolve():
+    raise RuntimeError("Desktop Blackboard script resolved outside bundled app resources")
+if _repo_blackboard_script() != str((blackboard / "blackboard.py").resolve()):
+    raise RuntimeError("Desktop Blackboard script is unavailable to local Workers")
+
+with tempfile.TemporaryDirectory(prefix="muteki-desktop-worker-skills-") as temporary:
+    root = Path(temporary)
+    standard_root = root / "standard"
+    solver = CliSolver(
+        None,
+        Challenge(id="desktop-acceptance", name="Desktop acceptance", category="misc"),
+        engine="codex", workdir=str(standard_root), mode="explore",
+    )
+    worker_env = solver._worker_env(str(standard_root))
+    if Path(worker_env["MUTEKI_BLACKBOARD_SCRIPT"]).resolve() != (blackboard / "blackboard.py").resolve():
+        raise RuntimeError("Worker environment did not select the bundled Blackboard script")
+    standard = [
+        str(standard_root / relative / "muteki-blackboard")
+        for relative in project_skill_roots("codex")
+    ]
+    autonomous = stage_blackboard_skill(
+        root / "autonomous", engine="codex", allow_operator_input=False,
+    )
+    pentest = stage_blackboard_skill(
+        root / "pentest", engine="codex", mode="pentest",
+    )
+    for staged in (*standard, *autonomous, *pentest):
+        skill = Path(staged)
+        if not skill.is_dir() or not (skill / "SKILL.md").is_file():
+            raise FileNotFoundError(f"Worker Skill projection is unusable: {skill}")
+    if not (root / "pentest/.muteki-skills/muteki-blackboard/blackboard.py").is_file():
+        raise FileNotFoundError("Pentest Blackboard script was not staged")
+
+print("Desktop Worker Skill resources ready")
+'''
+    env = os.environ.copy()
+    subprocess.run(
+        [str(python), "-I", "-B", "-c", check, str(code)],
+        cwd=runtime,
+        env=env,
+        check=True,
+    )
+
+
 def node_distribution(build: Path, version: str) -> tuple[Path, str]:
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError("Node version must be an exact release number")
@@ -68,7 +180,14 @@ def main() -> None:
     parser.add_argument("--allow-dirty", action="store_true")
     parser.add_argument("--next-dir", default=".next-desktop")
     parser.add_argument("--skip-web-build", action="store_true")
+    parser.add_argument(
+        "--verify-runtime", type=Path,
+        help="verify Worker Skill preparation in an existing desktop runtime",
+    )
     args = parser.parse_args()
+    if args.verify_runtime is not None:
+        verify_worker_skill_resources(args.verify_runtime)
+        return
     dirty = run("git", "status", "--porcelain", capture_output=True, text=True).stdout
     if dirty and not args.allow_dirty:
         raise SystemExit("Commit source before building a release; --allow-dirty is for local acceptance only")
@@ -110,26 +229,7 @@ def main() -> None:
             if content.startswith(b"#!") and str(staging).encode() in content.split(b"\n", 1)[0]:
                 entry.write_bytes(b"#!/usr/bin/env python3\n" + content.split(b"\n", 1)[1])
     code = staging / "app"
-    excluded = {".git", ".venv", "node_modules", ".next", "state", "sessions", "dist", "build", "__pycache__"}
-    files = run("git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", capture_output=True).stdout.split(b"\0")
-    hashes = {}
-    for raw in files:
-        if not raw:
-            continue
-        relative = Path(os.fsdecode(raw))
-        if any(part in excluded for part in relative.parts):
-            continue
-        if relative.parts[0] not in {"muteki", "apps", "scripts", "prompts", "config", "configs"} and str(relative) not in {"pyproject.toml", "uv.lock", "LICENSE"}:
-            continue
-        if relative.parts[:3] == ("apps", "web", "ui"):
-            continue
-        source_file = ROOT / relative
-        if not source_file.is_file():
-            continue
-        target = code / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_file, target)
-        hashes[str(relative)] = hashlib.sha256(target.read_bytes()).hexdigest()
+    hashes = copy_application_source(code)
     commit = run("git", "rev-parse", "HEAD", capture_output=True, text=True).stdout.strip()
     code_digest = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()
     release = {"version": json.loads((ROOT / "apps/desktop/package.json").read_text())["version"], "commit": commit, "source_sha256": code_digest, "dirty": bool(dirty)}
@@ -172,6 +272,7 @@ def main() -> None:
         shutil.rmtree(destination)
     staging.rename(destination)
     subprocess.run([str(destination / manifest["python"]), "-I", "-B", "-c", "import fastapi, uvicorn, pydantic, sqlite3, numpy; from magika import Magika; Magika(); print('Desktop Python runtime ready')"], cwd=build, check=True)
+    verify_worker_skill_resources(destination)
     subprocess.run([str(destination / manifest["node"]), str(destination / "npm-package/bin/npm-cli.js"), "--version"], cwd=build, check=True)
     print(destination)
 

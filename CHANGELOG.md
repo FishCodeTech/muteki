@@ -2,6 +2,18 @@
 
 All notable public release changes are tracked here.
 
+## 0.4.4 - 2026-10-12
+
+### Fixed
+
+- Included built-in Worker Skills in macOS desktop packages. Local Workers can now prepare their Blackboard and browser resources without failing on a missing `SKILL.md`.
+- Added packaged-runtime checks for ordinary, autonomous, and penetration-testing Worker Skill preparation before desktop assets are published.
+
+### Upgrade
+
+- Use `muteki upgrade v0.4.4` or `./run.sh upgrade v0.4.4` for a managed Web installation, and add `--compose` for a container deployment. Existing `.env`, `state/`, credentials, and sessions remain outside the release bundle.
+- Download the macOS `.dmg` or `.zip` matching your Mac from the release page.
+
 ## 0.4.3 - 2026-10-11
 
 ### Fixed
