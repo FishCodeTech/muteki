@@ -264,7 +264,26 @@ if [ "$backend" = local ] || [ "$backend" = both ]; then
     rm -f "$installer"
   }
   install_script_engine cursor-agent https://cursor.com/install bash
-  install_script_engine omp https://omp.sh/install sh --binary --ref v17.3.5
+  install_omp() {
+    if command -v omp >/dev/null 2>&1 && timeout 30 omp --version >/dev/null 2>&1; then
+      return 0
+    fi
+    note "installing omp 17.3.5"
+    local arch sha temporary
+    case "$(uname -m)" in
+      x86_64) arch="x64"; sha="605b4a8a3a137489a91d59e7028c41f3aff20169f352902b41089fbfdf8a253c" ;;
+      aarch64|arm64) arch="arm64"; sha="c79aba4859d71e6ead797bed2f510a9de97c9d576af9842e7fe63dbc9f4157af" ;;
+      *) die "unsupported OMP architecture: $(uname -m)" ;;
+    esac
+    temporary="$(mktemp)"
+    curl -fsSL --retry 8 --retry-all-errors \
+      "https://github.com/can1357/oh-my-pi/releases/download/v17.3.5/omp-linux-${arch}" \
+      -o "$temporary"
+    echo "${sha}  ${temporary}" | sha256sum -c -
+    install -m 0755 "$temporary" "$HOME/.local/bin/omp"
+    rm -f "$temporary"
+  }
+  install_omp
   install_script_engine grok https://x.ai/cli/install.sh bash 1.0.5
   check_local_engines || die "one or more local engine CLIs failed validation"
 fi
