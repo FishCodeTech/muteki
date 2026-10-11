@@ -411,7 +411,20 @@ USER kali
 RUN curl -fsSL https://cursor.com/install | bash
 # OMP's npm entrypoint requires Bun at runtime. Use its official prebuilt binary and
 # pin the release so full/slim use the same executable.
-RUN curl -fsSL https://omp.sh/install | sh -s -- --binary --ref v17.3.5 && \
+ARG OMP_VERSION=17.3.5
+ARG OMP_SHA256_AMD64=605b4a8a3a137489a91d59e7028c41f3aff20169f352902b41089fbfdf8a253c
+ARG OMP_SHA256_ARM64=c79aba4859d71e6ead797bed2f510a9de97c9d576af9842e7fe63dbc9f4157af
+RUN case "$TARGETARCH" in \
+      amd64) omp_arch="x64"; omp_sha="$OMP_SHA256_AMD64" ;; \
+      arm64) omp_arch="arm64"; omp_sha="$OMP_SHA256_ARM64" ;; \
+      *) echo "unsupported OMP architecture: $TARGETARCH" >&2; exit 2 ;; \
+    esac && \
+    curl -fsSL --retry 8 --retry-all-errors \
+      "https://github.com/can1357/oh-my-pi/releases/download/v${OMP_VERSION}/omp-linux-${omp_arch}" \
+      -o /tmp/omp && \
+    echo "${omp_sha}  /tmp/omp" | sha256sum -c - && \
+    install -m 0755 /tmp/omp /home/kali/.local/bin/omp && \
+    rm -f /tmp/omp && \
     /home/kali/.local/bin/omp --version
 # Grok Build is a native binary. Pin the official installer to the version used by
 # the host integration so image behaviour does not change between rebuilds.
