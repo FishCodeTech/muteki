@@ -332,22 +332,41 @@ const SUMMARY_PHRASE: Record<Exclude<ToolKind, "think">, (count: number) => stri
  * distinct paths when the arguments name them.
  */
 export function summarizeTools(tools: PresentableTool[], maxPhrases = 3): string {
+  return summarizeToolContributions(tools.map(toolSummaryContribution), maxPhrases);
+}
+
+/** What one call adds to `summarizeTools`; null for calls it does not count. */
+export interface ToolSummaryContribution {
+  kind: Exclude<ToolKind, "think">;
+  /** Distinct paths named by a read or edit; empty counts the call itself. */
+  paths: string[];
+}
+
+export function toolSummaryContribution(tool: PresentableTool): ToolSummaryContribution | null {
+  const kind = toolKind(tool);
+  if (kind === "think") return null;
+  if (kind === "read") return { kind, paths: [readPath(tool)].filter(Boolean) };
+  if (kind === "edit") return { kind, paths: toolEditStat(tool, kind)?.paths ?? [] };
+  return { kind, paths: [] };
+}
+
+export function summarizeToolContributions(
+  contributions: Iterable<ToolSummaryContribution | null>,
+  maxPhrases = 3,
+): string {
   const order: Exclude<ToolKind, "think">[] = [];
   const counts = new Map<Exclude<ToolKind, "think">, number>();
   const paths = new Map<"read" | "edit", Set<string>>([["read", new Set()], ["edit", new Set()]]);
-  for (const tool of tools) {
-    const kind = toolKind(tool);
-    if (kind === "think") continue;
+  for (const contribution of contributions) {
+    if (!contribution) continue;
+    const { kind } = contribution;
     if (!counts.has(kind)) order.push(kind);
-    if (kind === "read" || kind === "edit") {
-      const named = kind === "read" ? [readPath(tool)].filter(Boolean) : toolEditStat(tool, kind)?.paths ?? [];
+    if ((kind === "read" || kind === "edit") && contribution.paths.length) {
       const seen = paths.get(kind)!;
-      if (named.length) {
-        const before = seen.size;
-        named.forEach((path) => seen.add(path));
-        counts.set(kind, (counts.get(kind) ?? 0) + (seen.size - before));
-        continue;
-      }
+      const before = seen.size;
+      contribution.paths.forEach((path) => seen.add(path));
+      counts.set(kind, (counts.get(kind) ?? 0) + (seen.size - before));
+      continue;
     }
     counts.set(kind, (counts.get(kind) ?? 0) + 1);
   }

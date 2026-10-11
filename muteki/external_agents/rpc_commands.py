@@ -1,7 +1,10 @@
-"""Native non-prompt commands shared by the Pi and OMP RPC protocols."""
+"""Native non-prompt commands and context signals shared by the Pi and OMP RPC protocols."""
 from __future__ import annotations
 
 from typing import Any, Awaitable, Callable
+
+from muteki.platform.contracts.agent_events import CompactionPayload, UsagePayload, dump_payload
+from muteki.platform.contracts.external_agents import AgentEventType
 
 from .command_providers import operation_item
 
@@ -56,4 +59,92 @@ async def rpc_operation(
     elif arguments:
         raise ValueError(f"/{name} 不接受参数")
     result = await command(peer, method, params, timeout=180 if method == "compact" else 30)
-    return {"status": "completed", "message": "上下文已由引擎原生压缩" if method == "compact" else f"已完成 /{name}", "result": result}
+    outcome: dict[str, Any] = {
+        "status": "completed",
+        "message": "上下文已由引擎原生压缩" if method == "compact" else f"已完成 /{name}",
+        "result": result,
+    }
+    data = result if isinstance(result, dict) else {}
+    if method == "compact":
+        # OMP's preserveData holds base64 snapshot frames the engine already
+        # stored in its own session file; the receipt keeps everything else.
+        if "preserveData" in data:
+            outcome["result"] = {key: value for key, value in data.items() if key != "preserveData"}
+        # Pi reports an estimate after compaction; OMP reports only the size before.
+        after = _tokens(data.get("estimatedTokensAfter"))
+        outcome["compaction"] = {
+            "tokens_before": _tokens(data.get("tokensBefore")),
+            "tokens_after": after,
+            "summary": str(data.get("shortSummary") or "") or None,
+        }
+        if after is not None:
+            outcome["context"] = {"used": after}
+    elif method == "get_session_stats":
+        usage = data.get("contextUsage") if isinstance(data.get("contextUsage"), dict) else {}
+        outcome["context"] = {
+            "used": _tokens(usage.get("tokens")),
+            "limit": _tokens(usage.get("contextWindow")),
+        }
+    elif method == "get_state":
+        model = data.get("model") if isinstance(data.get("model"), dict) else {}
+        outcome["context"] = {"limit": _tokens(model.get("contextWindow"))}
+    return outcome
+
+
+def _tokens(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def rpc_context_window(state: Any) -> int | None:
+    """``get_state`` → the active model's ``contextWindow``."""
+    model = state.get("model") if isinstance(state, dict) else None
+    value = _tokens(model.get("contextWindow")) if isinstance(model, dict) else None
+    return value or None
+
+
+def rpc_context_usage_event(
+    usage: dict[str, Any], handle: dict[str, Any], *, label: str,
+) -> tuple[Any, str, dict[str, Any]] | None:
+    """Occupancy after one assistant message.
+
+    The message's prompt (input plus both cache buckets) and its output are
+    what the next request carries; ``get_session_stats.contextUsage.tokens``
+    reports the same sum.
+    """
+    buckets = [_tokens(usage.get(key)) for key in ("input", "cacheRead", "cacheWrite", "output")]
+    if all(value is None for value in buckets):
+        return None
+    return (AgentEventType.USAGE_UPDATED, f"{label}.context", dump_payload(UsagePayload(
+        scope="context_only",
+        context_used_tokens=sum(value or 0 for value in buckets),
+        context_window=handle.get("context_window"),
+    )))
+
+
+def rpc_compaction_events(
+    msg: dict[str, Any], handle: dict[str, Any], succeeded: bool, *, label: str,
+) -> list[tuple[Any, str, dict[str, Any]]]:
+    """``compaction_start``/``compaction_end`` (and ``auto_*``) → contract events."""
+    etype = str(msg.get("type") or "")
+    trigger = "manual" if str(msg.get("reason") or "") == "manual" else "auto"
+    if etype.endswith("_start"):
+        return [(AgentEventType.COMPACTION_UPDATED, f"{label}.{etype}",
+                 dump_payload(CompactionPayload(status="started", trigger=trigger)))]
+    result = msg.get("result") if isinstance(msg.get("result"), dict) else {}
+    after = _tokens(result.get("estimatedTokensAfter"))
+    if succeeded:
+        payload = CompactionPayload(
+            status="completed", trigger=trigger,
+            tokens_before=_tokens(result.get("tokensBefore")), tokens_after=after,
+            summary=str(result.get("shortSummary") or "") or None)
+    else:
+        reason = msg.get("errorMessage") or (
+            "skipped" if msg.get("skipped") else "aborted" if msg.get("aborted") else "")
+        payload = CompactionPayload(
+            status="failed", trigger=trigger, message=str(reason) or None)
+    events = [(AgentEventType.COMPACTION_UPDATED, f"{label}.{etype}", dump_payload(payload))]
+    if succeeded and after is not None:
+        events.append((AgentEventType.USAGE_UPDATED, f"{label}.context", dump_payload(UsagePayload(
+            scope="context_only", context_used_tokens=after,
+            context_window=handle.get("context_window")))))
+    return events

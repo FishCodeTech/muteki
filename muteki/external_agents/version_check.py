@@ -154,8 +154,10 @@ class VersionCheckCommandError(RuntimeError):
 
 async def _latest_for(engine: str, binary_path: str, version: str = "") -> tuple[str, str]:
     if engine == "opencode":
-        major = int(version.split(".", 1)[0])
-        package = "opencode-ai" if major == 1 else "@opencode/cli"
+        # OpenCode 1.x is unsupported, so an old install is pointed at the
+        # current OpenCode 2 package instead of its own retired major.
+        major = max(int(version.split(".", 1)[0]), 2)
+        package = "@opencode/cli"
         return await _npm_latest(package, major=major), f"npm:{package}"
     if engine in _NPM_PACKAGES:
         package = _NPM_PACKAGES[engine]

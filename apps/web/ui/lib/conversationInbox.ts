@@ -56,14 +56,41 @@ export function upsertConversationThread(
 ): ConversationThread[] {
   const index = threads.findIndex((thread) => thread.thread_id === next.thread_id);
   if (index < 0) return [next, ...threads];
-  const copy = threads.slice();
-  copy[index] = {
-    ...copy[index],
+  const merged = {
+    ...threads[index],
     ...next,
     state: {
-      ...copy[index].state,
+      ...threads[index].state,
       ...next.state,
     },
   };
+  if (sameConversationThread(threads[index], merged)) return threads;
+  const copy = threads.slice();
+  copy[index] = merged;
   return copy;
+}
+
+function sameConversationThread(a: ConversationThread, b: ConversationThread): boolean {
+  return a === b || JSON.stringify(a) === JSON.stringify(b);
+}
+
+/**
+ * Adopt a freshly fetched thread list while keeping the previous objects for
+ * threads whose content did not change. Returns `previous` itself when the
+ * list is unchanged, so memoized sidebar rows and selectors can bail out.
+ */
+export function reconcileConversationThreads(
+  previous: ConversationThread[],
+  next: ConversationThread[],
+): ConversationThread[] {
+  if (previous === next) return previous;
+  const byId = new Map(previous.map((thread) => [thread.thread_id, thread]));
+  let changed = previous.length !== next.length;
+  const result = next.map((thread, index) => {
+    const prior = byId.get(thread.thread_id);
+    const kept = prior && sameConversationThread(prior, thread) ? prior : thread;
+    if (kept !== previous[index]) changed = true;
+    return kept;
+  });
+  return changed ? result : previous;
 }

@@ -368,6 +368,12 @@ class SessionStore:
                 invalidated.update(flags)
                 flags.clear()
 
+        # Rail category precedence: operator (run.preparing), then Planner
+        # (run.titled). Worker run.started copies may carry a placeholder, so
+        # they only count for legacy logs that have neither source.
+        explicit_category = ""
+        titled_category = ""
+        started_category = ""
         finished_solved: bool | None = None  # explicit verdict from run.finished
         flag_implies_solved = False
         terminal_generations: set[int] = set()
@@ -431,7 +437,11 @@ class SessionStore:
                 challenge_name = str(ch.get("name") or "")
                 if challenge_name and challenge_name != run_id:
                     summary["name"] = challenge_name
-                summary["category"] = ch.get("category") or summary["category"]
+                category = str(ch.get("category") or "")
+                if et == "run.preparing":
+                    explicit_category = category or explicit_category
+                else:
+                    started_category = category or started_category
                 if ch.get("mode") == "pentest":
                     summary["mode"] = "pentest"
                 if ch.get("expected_flags"):
@@ -441,6 +451,7 @@ class SessionStore:
             elif et == "run.titled":
                 # ChatGPT-style auto-title persisted on the run — survives restart
                 summary["name"] = p.get("title") or summary["name"]
+                titled_category = str(p.get("category") or "") or titled_category
             elif et == "run.finished":
                 summary["finished"] = True
                 if generation > 0:
@@ -523,6 +534,8 @@ class SessionStore:
             summary["ts"] = max(
                 float(summary["ts"]), float(stat_result.st_mtime))
 
+        summary["category"] = (
+            explicit_category or titled_category or started_category)
         summary["flags"] = flags
         summary["flag"] = flags[0] if flags else None
         summary["terminal_generations"] = sorted(terminal_generations)

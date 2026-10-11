@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@/lib/cn";
 import { Icon } from "../Icon";
 import { ShimmerText, Spinner } from "@/components/chat/ui";
@@ -9,13 +9,19 @@ import { ActivityItem } from "@/components/chat/timeline/ActivityItem";
 import { ElapsedTimer } from "@/components/chat/timeline/ElapsedTimer";
 import { SourceChips } from "@/components/chat/timeline/SourceChips";
 import { ToolEntry } from "@/components/chat/timeline/ToolEntry";
-import { formatTurnDuration, summarizeTools } from "@/components/chat/timeline/toolPresentation";
+import {
+  formatTurnDuration,
+  summarizeToolContributions,
+  toolSummaryContribution,
+  type ToolSummaryContribution,
+} from "@/components/chat/timeline/toolPresentation";
 import { ConversationMessage } from "./ConversationMessage";
 import { ConversationThinking } from "./ConversationThinking";
 import { toolDrawerPayload } from "./ConversationToolFlow";
 import { ConversationSubagentGroup } from "./ConversationSubagentGroup";
 import { extractUrls } from "./conversationSources";
 import { isLocalPreviewUrl } from "@/lib/previewUrlDetect";
+import { compactNumber } from "../chat/composer/format";
 import { isAgentTerminal, type ConversationAgentNodeView } from "./conversationAgentTree";
 import type { DrawerDetailPayload } from "./ConversationDetailsDrawer";
 import {
@@ -24,6 +30,48 @@ import {
   type ConversationTurnSegment,
   type ConversationTurnTiming,
 } from "./conversationEventViews";
+
+function CompactionEntry({
+  segment,
+  active,
+}: {
+  segment: Extract<ConversationTurnSegment, { kind: "compaction" }>;
+  active: boolean;
+}) {
+  const kind = segment.trigger === "auto" ? "自动压缩上下文" : "压缩上下文";
+  const title = active ? `正在${kind}…`
+    : segment.status === "started" ? `${kind}未收到结束信号`
+      : segment.status === "failed" ? `${kind}失败`
+        : segment.status === "interrupted" ? `${kind}已中断`
+        : segment.confirmed ? `已${kind}` : "压缩命令已结束（引擎未上报压缩结果）";
+  const tokens = segment.tokensBefore != null
+    ? `${compactNumber(segment.tokensBefore)} → ${segment.tokensAfter != null ? compactNumber(segment.tokensAfter) : "?"} tok`
+    : "";
+  return (
+    <ActivityItem
+      icon="foldVertical"
+      running={active}
+      tone={segment.status === "failed" ? "danger" : "muted"}
+      testId="conversation-compaction-entry"
+    >
+      <div className="flex min-h-8 flex-col justify-center py-1 text-[13px]">
+        <div className="flex flex-wrap items-center gap-x-2 text-cx-fg-3">
+          {active ? <ShimmerText>{title}</ShimmerText> : <span>{title}</span>}
+          {tokens ? <span className="cx-tabular font-cx-mono text-[12px] text-cx-fg-4">{tokens}</span> : null}
+        </div>
+        {segment.message ? (
+          <p className={cn("text-[12px] leading-snug", segment.status === "failed" ? "text-cx-danger" : "text-cx-fg-4")}>{segment.message}</p>
+        ) : null}
+        {segment.summary ? (
+          <details className="mt-0.5 text-[12px] text-cx-fg-3">
+            <summary className="cursor-pointer select-none text-cx-fg-4 hover:text-cx-fg-3">压缩摘要</summary>
+            <p className="mt-1 whitespace-pre-wrap leading-snug text-cx-fg-2">{segment.summary}</p>
+          </details>
+        ) : null}
+      </div>
+    </ActivityItem>
+  );
+}
 
 export interface ConversationTurnProcessProps {
   turnId: string;
@@ -55,6 +103,67 @@ export interface ConversationTurnProcessProps {
 
 const NO_AGENTS: ConversationAgentNodeView[] = [];
 const NO_AGENT_TOOLS: Record<string, ConversationToolRecord[]> = {};
+
+type CachedActivityItem = { deps: readonly unknown[]; item: AgentActivityItem };
+
+function sameDeps(a: readonly unknown[], b: readonly unknown[]) {
+  return a.length === b.length && a.every((value, index) => Object.is(value, b[index]));
+}
+
+// Tool payloads are never mutated once folded, so each nested value is
+// serialized at most once however many frames compare it.
+const toolFieldJson = new WeakMap<object, string>();
+
+function jsonOf(value: object): string {
+  let text = toolFieldJson.get(value);
+  if (text === undefined) {
+    text = JSON.stringify(value);
+    toolFieldJson.set(value, text);
+  }
+  return text;
+}
+
+// The live event window slides, and a refold rebuilds every tool record even
+// when nothing about the call changed; compare by content instead.
+function sameToolRecord(a: ConversationToolRecord, b: ConversationToolRecord) {
+  if (a === b) return true;
+  const left = a as unknown as Record<string, unknown>;
+  const right = b as unknown as Record<string, unknown>;
+  const leftKeys = Object.keys(left);
+  if (leftKeys.length !== Object.keys(right).length) return false;
+  for (const key of leftKeys) {
+    const l = left[key];
+    const r = right[key];
+    if (!(key in right)) return false;
+    if (Object.is(l, r)) continue;
+    if (typeof l !== "object" || typeof r !== "object" || !l || !r) return false;
+    if (jsonOf(l) !== jsonOf(r)) return false;
+  }
+  return true;
+}
+
+function sameToolDeps(a: readonly unknown[], b: readonly unknown[]) {
+  return sameToolRecord(a[0] as ConversationToolRecord, b[0] as ConversationToolRecord)
+    && sameDeps(a.slice(1), b.slice(1));
+}
+
+// A long run outgrows the live event window, which drops its oldest calls.
+// Calls seen earlier keep counting, so the summary never goes backwards while
+// the window slides or when the reader switches away and back.
+const TOOL_TALLY_TURNS = 16;
+const toolTallies = new Map<string, Map<string, ToolSummaryContribution | null>>();
+
+function toolTallyFor(turnId: string): Map<string, ToolSummaryContribution | null> {
+  let tally = toolTallies.get(turnId);
+  if (tally) {
+    toolTallies.delete(turnId);
+  } else {
+    tally = new Map();
+    if (toolTallies.size >= TOOL_TALLY_TURNS) toolTallies.delete(toolTallies.keys().next().value!);
+  }
+  toolTallies.set(turnId, tally);
+  return tally;
+}
 
 function collectAgentKeys(roots: ConversationAgentNodeView[]): { keys: Set<string>; active: number } {
   const keys = new Set<string>();
@@ -201,8 +310,36 @@ export function ConversationTurnProcess({
     [running, answerText],
   );
 
+  // Every stream update hands over new segment arrays for the running turn,
+  // but unchanged tool records and segments keep their identity. Reusing their
+  // item objects lets the activity list skip re-rendering those rows; cached
+  // handlers read the latest callbacks instead of closing over stale ones.
+  const handlersRef = useRef({ onOpenDrawer, onOpenToolDiff, turnId });
+  useLayoutEffect(() => {
+    handlersRef.current = { onOpenDrawer, onOpenToolDiff, turnId };
+  });
+  const itemCacheRef = useRef(new Map<string, CachedActivityItem>());
+
   const items = useMemo<AgentActivityItem[]>(() => {
     const out: AgentActivityItem[] = [];
+    const previousCache = itemCacheRef.current;
+    const nextCache = new Map<string, CachedActivityItem>();
+    const cached = (
+      id: string,
+      deps: readonly unknown[],
+      build: () => AgentActivityItem,
+      equal: (a: readonly unknown[], b: readonly unknown[]) => boolean = sameDeps,
+    ) => {
+      const hit = previousCache.get(id);
+      if (hit && equal(hit.deps, deps)) {
+        nextCache.set(id, hit);
+        return hit.item;
+      }
+      const item = build();
+      nextCache.set(id, { deps, item });
+      return item;
+    };
+    const canOpenDiff = Boolean(onOpenToolDiff);
     let groupPlaced = false;
     const groupItem = (): AgentActivityItem => ({
       id: `subagents-${turnId}`,
@@ -224,28 +361,41 @@ export function ConversationTurnProcess({
       const last = index === segments.length - 1;
       if (segment.kind === "thinking") {
         const thinkingRunning = running && last && segment.partial !== false;
-        out.push({
-          id: `thinking-${index}`,
+        const id = `thinking-${index}`;
+        out.push(cached(id, [segment.durationMs, segment.text, thinkingRunning], () => ({
+          id,
           type: "custom",
           content: (
             <ActivityItem icon="dot" tone={thinkingRunning ? "running" : "muted"}>
               <ConversationThinking bare working={thinkingRunning} durationMs={segment.durationMs} summary={segment.text} />
             </ActivityItem>
           ),
-        });
+        })));
+        return;
+      }
+      if (segment.kind === "compaction") {
+        const id = `compaction-${index}`;
+        const active = segment.status === "started" && running;
+        out.push(cached(id, [segment, active], () => ({
+          id,
+          type: "custom",
+          content: <CompactionEntry segment={segment} active={active} />,
+        })));
         return;
       }
       if (segment.kind === "text") {
-        out.push({
-          id: `progress-${index}`,
+        const streaming = running && last;
+        const id = `progress-${index}`;
+        out.push(cached(id, [segment.text, streaming, threadId], () => ({
+          id,
           type: "custom",
           content: (
-            <ActivityItem icon="dot" tone={running && last ? "running" : "muted"}>
+            <ActivityItem icon="dot" tone={streaming ? "running" : "muted"}>
               <div className="py-1">
                 <ConversationMessage
                   role="assistant"
                   text={segment.text}
-                  isStreaming={running && last}
+                  isStreaming={streaming}
                   showIdentity={false}
                   showActions={false}
                   threadId={threadId}
@@ -253,7 +403,7 @@ export function ConversationTurnProcess({
               </div>
             </ActivityItem>
           ),
-        });
+        })));
         return;
       }
       for (const tool of segment.tools) {
@@ -265,20 +415,24 @@ export function ConversationTurnProcess({
           }
           continue;
         }
-        out.push({
-          id: `tool-${tool.id}`,
+        const id = `tool-${tool.id}`;
+        out.push(cached(id, [tool, threadId, canOpenDiff], () => ({
+          id,
           type: "custom",
           content: (
             <ToolEntry
               tool={tool}
               threadId={threadId}
-              onSelect={() => onOpenDrawer(toolDrawerPayload(tool))}
-              onOpenDiff={onOpenToolDiff ? (filePath) => onOpenToolDiff(turnId, filePath) : undefined}
+              onSelect={() => handlersRef.current.onOpenDrawer(toolDrawerPayload(tool))}
+              onOpenDiff={canOpenDiff
+                ? (filePath) => handlersRef.current.onOpenToolDiff?.(handlersRef.current.turnId, filePath)
+                : undefined}
             />
           ),
-        });
+        }), sameToolDeps));
       }
     });
+    itemCacheRef.current = nextCache;
     if (!groupPlaced && agentRoots.length) out.push(groupItem());
     const tone = running ? null : finishTone(status);
     if (tone && out.length) {
@@ -291,10 +445,18 @@ export function ConversationTurnProcess({
     return out;
   }, [segments, running, status, settledDurationMs, sources, threadId, onOpenDrawer, onOpenToolDiff, turnId, agentKeys, agentRoots, agentTools, onOpenThread, onCancelSubagent]);
 
-  const toolSummary = useMemo(
-    () => summarizeTools(segments.flatMap((segment) => (segment.kind === "tools" ? segment.tools : []))),
-    [segments],
-  );
+  const toolSummary = useMemo(() => {
+    const tally = toolTallyFor(turnId);
+    for (const segment of segments) {
+      if (segment.kind !== "tools") continue;
+      for (const tool of segment.tools) {
+        // Paths can still arrive while a call is in flight.
+        const settled = tool.status !== "running" && tool.status !== "pending";
+        if (!settled || !tally.has(tool.id)) tally.set(tool.id, toolSummaryContribution(tool));
+      }
+    }
+    return summarizeToolContributions(tally.values());
+  }, [segments, turnId]);
   const summary = toolSummary || (counts.reasoning ? `${counts.reasoning} 段思考` : "");
 
   const waitingAgents = !running && agentKeys.active > 0 ? agentKeys.active : 0;

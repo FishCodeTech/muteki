@@ -15,6 +15,7 @@ import { Chat } from "../ai-native/chat";
 import { ConversationMessage, type MessageAttachmentChip } from "./ConversationMessage";
 import type { ResourceLinkTarget } from "@/lib/resourcePreview";
 import { ConversationTurnProcess } from "./ConversationTurnProcess";
+import { TurnContextDialog } from "./TurnContextDialog";
 import { buildConversationAgentTree, type ConversationAgentNodeView } from "./conversationAgentTree";
 import { ConversationApproval, type UserInputResolvePayload } from "./ConversationApproval";
 import { ConversationProposedPlanCard } from "./ConversationPlanPanel";
@@ -39,6 +40,8 @@ import {
   buildConversationTurnTimingMap,
   conversationErrorMessage,
   EMPTY_TURN_RUNTIME,
+  extendConversationTurnFold,
+  isAppendedEventList,
   presentConversationTurn,
   restoreConversationStreamPrefix,
   resolveConversationLiveActivity,
@@ -309,6 +312,13 @@ function PlanTurnBadge({ turnId, align }: { turnId?: string; align: "start" | "e
   );
 }
 
+function eventsAscending(events: ConversationEvent[]): boolean {
+  for (let index = 1; index < events.length; index += 1) {
+    if ((events[index - 1].seq || 0) > (events[index].seq || 0)) return false;
+  }
+  return true;
+}
+
 // Compacting grows the stream viewport by roughly the composer's height
 // change (112px → 44px), which moves the bottom edge toward the reader. The compact
 // distance must clear that delta plus the 96px near-bottom band, otherwise the
@@ -387,6 +397,7 @@ export function ConversationTimeline({
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const [hasJumpBack, setHasJumpBack] = useState(() => Boolean(peekJumpBack()));
   const [dismissedFailureKey, setDismissedFailureKey] = useState("");
+  const [sentContextTurnId, setSentContextTurnId] = useState<string | null>(null);
   const [hydratedEventsByTurn, setHydratedEventsByTurn] = useState<
     Record<string, ConversationEvent[]>
   >({});
@@ -704,8 +715,12 @@ export function ConversationTimeline({
   }, [view.thread.thread_id]);
 
   const foldEvents = useMemo(() => {
+    const hydratedRows = Object.values(hydratedEventsByTurn);
+    // Live events arrive deduplicated and in seq order; reuse the array so the
+    // fold below can extend incrementally between stream frames.
+    if (!hydratedRows.some((rows) => rows.length) && eventsAscending(events)) return events;
     const byKey = new Map<string, ConversationEvent>();
-    for (const rows of Object.values(hydratedEventsByTurn)) {
+    for (const rows of hydratedRows) {
       for (const event of rows) {
         const key = String(event.event_id || `${event.seq}:${event.event_type}`);
         byKey.set(key, event);
@@ -718,7 +733,15 @@ export function ConversationTimeline({
     return Array.from(byKey.values()).sort((a, b) => (a.seq || 0) - (b.seq || 0));
   }, [events, hydratedEventsByTurn]);
 
-  const turnFold = useMemo(() => buildConversationTurnFold(foldEvents), [foldEvents]);
+  const foldCacheRef = useRef<{ events: ConversationEvent[]; fold: ReturnType<typeof buildConversationTurnFold> } | null>(null);
+  const turnFold = useMemo(() => {
+    const previous = foldCacheRef.current;
+    const fold = previous && isAppendedEventList(previous.events, foldEvents)
+      ? extendConversationTurnFold(previous.fold, foldEvents.slice(previous.events.length))
+      : buildConversationTurnFold(foldEvents);
+    foldCacheRef.current = { events: foldEvents, fold };
+    return fold;
+  }, [foldEvents]);
   const agentTree = useMemo(() => buildConversationAgentTree(foldEvents, view), [foldEvents, view]);
   const agentRootsByTurn = useMemo(() => {
     const map = new Map<string, ConversationAgentNodeView[]>();
@@ -1284,9 +1307,46 @@ export function ConversationTimeline({
     count: timelineRows.length,
     getScrollElement: () => streamRef.current,
     estimateSize: () => 180,
-    overscan: 10,
+    // Rows are whole turns, often taller than the viewport; every overscanned
+    // row is re-laid-out whenever the reading column changes width.
+    overscan: 4,
     getItemKey: (index) => timelineRows[index]?.key || index,
+    // Row resizes and scrolls move rows by writing `top` directly; the whole
+    // feed re-renders only when the mounted range changes. Otherwise every
+    // resized row flushes a synchronous re-render of all visible turns.
+    directDomUpdates: true,
+    // The default transform mode writes translate3d, promoting every turn to
+    // a compositor layer; streamed content overlapping them then explodes into
+    // hundreds of layers that are re-layerized each frame.
+    directDomUpdatesMode: "position",
   });
+  const { containerRef: virtualContainerRef } = rowVirtualizer;
+  const setVirtualListNode = useCallback((node: HTMLDivElement | null) => {
+    virtualListRef.current = node;
+    virtualContainerRef(node);
+  }, [virtualContainerRef]);
+  const readRowStart = useCallback(
+    (index: number) => {
+      rowVirtualizer.getTotalSize();
+      return rowVirtualizer.measurementsCache[index]?.start;
+    },
+    [rowVirtualizer],
+  );
+
+  // At the live edge the content ResizeObserver pins the bottom already. The
+  // virtualizer's own above-viewport compensation would read scrollHeight and
+  // write scrollTop once per resized row (a forced layout each), so it only
+  // runs while the reader holds a history position.
+  useEffect(() => {
+    rowVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item, _delta, instance) => {
+      if (stickToBottomRef.current) return false;
+      const offset = (instance.scrollOffset ?? 0) + instance.scrollAdjustments;
+      const size = instance.itemSizeCache.get(item.key);
+      return size === undefined
+        ? item.start < offset
+        : item.start + size <= offset && instance.scrollDirection !== "backward";
+    };
+  }, [rowVirtualizer]);
 
   useEffect(() => {
     const target = String(highlightedMessageId || "").trim();
@@ -1489,6 +1549,7 @@ export function ConversationTimeline({
     minimapMarkers.push({
       key: row.key,
       messageId: row.messageId,
+      index,
       start: rowMeasurements[index]?.start ?? 0,
       seq: turnById.get(row.turnId)?.seq,
       label: msg.text.replace(/\s+/g, " ").trim(),
@@ -1563,6 +1624,7 @@ export function ConversationTimeline({
             streamRef={streamRef}
             listRef={virtualListRef}
             markers={minimapMarkers}
+            readRowStart={readRowStart}
             onJump={(messageId) => void scrollToMessageAnchor(messageId, 0, { highlight: true })}
           />
           <ConversationSummaryCard
@@ -1675,9 +1737,8 @@ export function ConversationTimeline({
         {/* Virtualized messages feed — only the viewport (+ overscan) mounts.
             count / keys / measure / deep-link all use timelineRows (#211). */}
         <div
-          ref={virtualListRef}
+          ref={setVirtualListNode}
           className="relative w-full"
-          style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
           data-virtualized-timeline="true"
           data-message-count={view.messages.length}
           data-row-count={timelineRows.length}
@@ -1708,7 +1769,6 @@ export function ConversationTimeline({
                   data-turn-id={turnId}
                   ref={rowVirtualizer.measureElement}
                   className={cn("absolute left-0 top-0 flex w-full flex-col gap-7 pb-7", isHighlighted && "conversation-message-highlight")}
-                  style={{ transform: `translateY(${virtualRow.start}px)` }}
                 >
                   {renderAssistantTurn(
                     turnId,
@@ -1799,6 +1859,7 @@ export function ConversationTimeline({
                     text={msg.text}
                     createdAt={msg.created_at}
                     attachments={turnId ? resolveTurnAttachments(turnId) : []}
+                    threadId={threadId || undefined}
                     onOpenAttachment={onOpenAttachment}
                     contextRefs={
                       msg.turn_id
@@ -1806,6 +1867,11 @@ export function ConversationTimeline({
                         : []
                     }
                     onJumpToContext={onJumpToContext}
+                    onShowSentContext={
+                      threadId && turnId && msg.kind !== "steer" && turnById.get(turnId)?.context_delivery?.length
+                        ? () => setSentContextTurnId(turnId)
+                        : undefined
+                    }
                     className={msg.kind === "steer" ? "conversation-steer-message" : ""}
                     onEdit={
                       onEditTurn && turnId && msg.kind !== "steer"
@@ -1855,7 +1921,6 @@ export function ConversationTimeline({
                 data-turn-id={msg.turn_id || undefined}
                 ref={rowVirtualizer.measureElement}
                 className={cn("absolute left-0 top-0 flex w-full flex-col gap-7 pb-7", isHighlighted && "conversation-message-highlight")}
-                style={{ transform: `translateY(${virtualRow.start}px)` }}
               >
                 {body}
               </div>
@@ -1866,6 +1931,10 @@ export function ConversationTimeline({
         {artifactChunks.length > 0 && (
           <ContextCards chunks={artifactChunks} />
         )}
+
+        {threadId ? (
+          <TurnContextDialog threadId={threadId} turnId={sentContextTurnId} onClose={() => setSentContextTurnId(null)} />
+        ) : null}
 
         {connectionBanner}
 

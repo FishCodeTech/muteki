@@ -65,8 +65,8 @@ from muteki.conversation.manager import (
     InteractionModeError,
 )
 from muteki.conversation.module import CONVERSATION_PREFS_KEY, ConversationService
-from muteki.external_agents.descriptors import all_descriptors, find_descriptor
-from muteki.external_agents.factory import engine_for_adapter
+from muteki.external_agents.descriptors import all_descriptors, find_descriptor, find_descriptor_for_adapter
+from muteki.external_agents.factory import canonical_adapter_id
 
 #: Web 传输入口的本地操作员身份（单操作员产品默认，与 RUNTIME-05 一致）。
 OPERATOR = ActorRef(kind="operator", id="local-user")
@@ -250,6 +250,16 @@ class ComposerCapabilitiesBody(BaseModel):
     project_id: str = Field(default="", max_length=160)
     trigger: str = Field(pattern=r"^[/@$]$")
     query: str = Field(default="", max_length=160)
+
+
+class RuntimePrewarmBody(BaseModel):
+    """新对话尚未发送时，预先启动所选 Runtime 的空闲进程。"""
+
+    adapter_id: str = Field(min_length=1, max_length=120)
+    instance_id: str = Field(default="", max_length=120)
+    credential_id: str = Field(default="", max_length=200)
+    model: str = Field(default="", max_length=200)
+    workspace_id: str = Field(min_length=1, max_length=160)
 
 
 class ProjectGitCheckoutBody(BaseModel):
@@ -520,9 +530,57 @@ def create_conversation_router(
 
     # -- Project ---------------------------------------------------------------
 
+    @router.post("/api/conversation/runtime-prewarm")
+    async def runtime_prewarm(body: RuntimePrewarmBody) -> Any:
+        adapter_id = body.adapter_id.strip()
+        if find_descriptor_for_adapter(adapter_id) is None:
+            return _error_response(
+                "conversation.runtime.adapter_unknown",
+                f"未知 Runtime adapter：{adapter_id!r}",
+                ErrorCategory.VALIDATION,
+                status_code=400,
+            )
+        if service.manager.get_workspace(body.workspace_id.strip()) is None:
+            return _error_response(
+                "conversation.workspace.not_found",
+                "当前项目工作目录不存在",
+                ErrorCategory.NOT_FOUND,
+                status_code=404,
+            )
+        try:
+            started = await service.executor.prewarm_runtime(
+                adapter_id=adapter_id,
+                instance_id=body.instance_id.strip() or "default",
+                credential_id=body.credential_id.strip(),
+                model=body.model.strip(),
+                workspace_id=body.workspace_id.strip(),
+            )
+        except LookupError as exc:
+            return _error_response(
+                "conversation.runtime.instance_not_found",
+                str(exc),
+                ErrorCategory.NOT_FOUND,
+                status_code=404,
+            )
+        except ValueError as exc:
+            return _error_response(
+                str(getattr(exc, "code", "") or "conversation.runtime.prewarm_invalid"),
+                str(exc),
+                ErrorCategory.VALIDATION,
+                status_code=400,
+            )
+        except RuntimeError as exc:
+            # Typed adapter start failures (e.g. DroidFailure) carry a stable code.
+            code = str(getattr(exc, "code", "") or "")
+            if not code:
+                raise
+            return _error_response(code, str(exc), ErrorCategory.RUNTIME, status_code=502)
+        return {"started": started}
+
     @router.post("/api/conversation/composer-capabilities")
     async def composer_capabilities(body: ComposerCapabilitiesBody) -> Any:
         adapter_id = body.adapter_id.strip()
+        canonical_id = canonical_adapter_id(adapter_id) if adapter_id else ""
         workspace_id = body.workspace_id.strip()
         runtime_snapshot = None
         runtime_diagnostics: list[str] = []
@@ -537,13 +595,14 @@ def create_conversation_router(
                 )
             selection = service.manager.runtime_selection(thread.thread_id)
             adapter_id = adapter_id or selection.adapter_id
+            canonical_id = canonical_adapter_id(adapter_id)
             workspace_id = str(thread.workspace_id or "")
-            if adapter_id == selection.adapter_id:
+            if canonical_id == canonical_adapter_id(selection.adapter_id):
                 runtime_snapshot = service.executor.cached_runtime_capabilities(
                     thread.thread_id)
                 sel_iid = selection.instance_id or "default"
                 if runtime_snapshot is not None and (
-                    runtime_snapshot.adapter_id != adapter_id
+                    canonical_adapter_id(runtime_snapshot.adapter_id) != canonical_id
                     or (runtime_snapshot.instance_id or "default") != sel_iid
                 ):
                     # Thread cache may still hold the previous Provider.
@@ -591,34 +650,69 @@ def create_conversation_router(
                 status_code=400,
             )
 
-        engine = engine_for_adapter(adapter_id)
+        descriptor = find_descriptor_for_adapter(adapter_id)
+        if descriptor is None:
+            return _error_response(
+                "conversation.composer.adapter_unknown",
+                f"未知 Runtime adapter：{adapter_id!r}",
+                ErrorCategory.VALIDATION,
+                status_code=400,
+            )
+        engine = descriptor.identity.engine
         if engine not in SUPPORTED_ENGINES:
             return _error_response(
                 "conversation.composer.agent_unsupported",
-                "请选择可用的 Agent 后再浏览能力",
+                f"Runtime {adapter_id!r} 当前不支持聊天能力目录",
                 ErrorCategory.VALIDATION,
                 status_code=400,
             )
         section_errors: list[dict[str, Any]] = []
-        try:
-            candidate_threads = service.manager.list_threads(body.project_id)
-        except Exception as exc:
-            candidate_threads = []
-            section_errors.append({"section": "threads", "code": "conversation.composer.section_failed",
-                "message": str(exc), "exception_type": type(exc).__name__})
-        items = resolve_composer_catalog(
-            engine=engine,
-            workspace_root=str(workspace.root_path if workspace is not None else ""),
-            trigger=body.trigger,
-            query=body.query,
-            extension_service=extension_service,
-            threads=candidate_threads,
-            current_thread_id=body.thread_id,
-            runtime_snapshot=runtime_snapshot,
-            plugin_service=(getattr(service.manager, "chat_plugins", None)
-                            if not body.thread_id or thread.mode == "conversation" else None),
-            section_errors=section_errors,
+        access_instance_id = body.instance_id or (
+            (selection.instance_id or "default")
+            if body.thread_id and canonical_id == canonical_adapter_id(selection.adapter_id) else "default"
         )
+        registry = getattr(service.manager, "_adapter_registry", None)
+        if (body.instance_id or (body.thread_id and canonical_id == canonical_adapter_id(selection.adapter_id))):
+            if registry is not None and registry.record(canonical_id, access_instance_id) is None:
+                return _error_response(
+                    "conversation.runtime.instance_not_found",
+                    f"Runtime 实例不存在：{canonical_id}:{access_instance_id}",
+                    ErrorCategory.NOT_FOUND,
+                    status_code=404,
+                )
+        workspace_root = str(workspace.root_path) if workspace is not None else ""
+        plugin_service = (
+            getattr(service.manager, "chat_plugins", None)
+            if not body.thread_id or thread.mode == "conversation" else None
+        )
+
+        def _resolve_catalog() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+            # Skill/file discovery walks the filesystem (an "@" query scans the
+            # whole workspace); on the event loop it stalls every SSE stream
+            # and request of the backend until the walk ends.
+            try:
+                candidate_threads = service.manager.list_threads(body.project_id)
+            except Exception as exc:
+                candidate_threads = []
+                section_errors.append({"section": "threads", "code": "conversation.composer.section_failed",
+                    "message": str(exc), "exception_type": type(exc).__name__})
+            catalog = resolve_composer_catalog(
+                engine=engine,
+                workspace_root=workspace_root,
+                trigger=body.trigger,
+                query=body.query,
+                extension_service=extension_service,
+                threads=candidate_threads,
+                current_thread_id=body.thread_id,
+                runtime_snapshot=runtime_snapshot,
+                plugin_service=plugin_service,
+                section_errors=section_errors,
+            )
+            access = service.manager.access_mode_availability(
+                canonical_id, access_instance_id, workspace_root)
+            return catalog, access
+
+        items, access_modes = await asyncio.to_thread(_resolve_catalog)
         matrix_payload = None
         try:
             if body.thread_id:
@@ -627,12 +721,12 @@ def create_conversation_router(
                 sel = service.manager.runtime_selection(body.thread_id)
                 matrix_iid = (
                     (sel.instance_id or "default")
-                    if adapter_id == (sel.adapter_id or "")
+                    if canonical_id == canonical_adapter_id(sel.adapter_id or "")
                     else "default"
                 )
                 matrix_payload = service.executor.interaction_matrix_for(
                     body.thread_id,
-                    adapter_id=adapter_id,
+                    adapter_id=canonical_id,
                     instance_id=matrix_iid,
                 )
             elif runtime_snapshot is not None and runtime_snapshot.matrix is not None:
@@ -644,12 +738,7 @@ def create_conversation_router(
         return {
             "engine": engine,
             "trigger": body.trigger,
-            **service.manager.access_mode_availability(
-                adapter_id,
-                body.instance_id or ((selection.instance_id or "default")
-                                     if body.thread_id and adapter_id == selection.adapter_id else "default"),
-                str(workspace.root_path) if workspace is not None else "",
-            ),
+            **access_modes,
             "items": items,
             "count": len(items),
             "partial": bool(section_errors),
@@ -1094,6 +1183,16 @@ def create_conversation_router(
             status = 404 if exc.error.category is ErrorCategory.NOT_FOUND else 400
             return JSONResponse(_error_body(exc), status_code=status)
         return result.result
+
+    @router.get("/api/threads/{thread_id}/turns/{turn_id}/context")
+    async def get_turn_context(thread_id: str, turn_id: str) -> Any:
+        """What Muteki sent beside the user's text in this turn (context ledger)."""
+        turn = service.conv.get_turn(turn_id)
+        if service.manager.get_thread(thread_id) is None or turn is None or turn.thread_id != thread_id:
+            return JSONResponse({"error": {"code": "conversation.turn.not_found",
+                                           "message": "回合不存在"}}, status_code=404)
+        ledger = await asyncio.to_thread(service.executor.context_delivery, thread_id, turn_id)
+        return ledger or {"thread_id": thread_id, "turn_id": turn_id, "user_text": turn.text, "parts": []}
 
     def _thread_workspace(thread_id: str):
         thread = service.manager.get_thread(thread_id)
@@ -1654,6 +1753,59 @@ def create_conversation_router(
             headers=headers,
         )
 
+    @router.get("/api/threads/{thread_id}/images/raw")
+    async def thread_image_raw(thread_id: str, path: str) -> Any:
+        """Read an image from this Thread's project, chat, or computer-use folder."""
+        try:
+            await command_api.query(_query(
+                "conversation.thread.view", "thread", thread_id,
+                thread_id=thread_id, mark_read=False))
+        except CommandAPIError as exc:
+            status = 404 if exc.error.category is ErrorCategory.NOT_FOUND else 403
+            return JSONResponse(_error_body(exc), status_code=status)
+
+        from apps.web.conversation_images import (
+            ThreadImageNotFound,
+            read_thread_image_bytes,
+        )
+        from muteki.conversation.workspace_surfaces import safe_raw_content_headers
+
+        computer_control = getattr(service.executor, "computer_control", None)
+        computer_use_root = getattr(computer_control, "state_root", None)
+        if computer_use_root is None:
+            computer_use_root = (
+                Path(service.executor._sessions_root) / "_platform" / "computer-use"
+            )
+        chat_plugins = getattr(service.executor, "chat_plugins", None)
+        chat_workspace_root = (
+            chat_plugins.visualization_root(thread_id).parent
+            if chat_plugins is not None else None
+        )
+        try:
+            image, raw_media_type, filename = await asyncio.to_thread(
+                read_thread_image_bytes,
+                path,
+                thread_id=thread_id,
+                workspace_root=_thread_workspace_root(thread_id),
+                computer_use_root=computer_use_root,
+                chat_workspace_root=chat_workspace_root,
+            )
+        except (ThreadImageNotFound, OSError, ValueError) as exc:
+            return _error_response(
+                "conversation.image.not_found",
+                str(exc) or "Thread 中没有此图片",
+                ErrorCategory.NOT_FOUND,
+                status_code=404,
+            )
+        media_type, headers = safe_raw_content_headers(
+            media_type=raw_media_type,
+            filename=filename,
+        )
+        # SVG stays a forced download on the service origin; the image client
+        # uses its actual type only for a blob rendered in an <img> element.
+        headers["X-Muteki-Image-Media-Type"] = raw_media_type
+        return Response(content=image, media_type=media_type, headers=headers)
+
     @router.get("/api/threads/{thread_id}/workspace/search/files")
     async def workspace_search_files(thread_id: str, q: str = "", limit: int = 60) -> Any:
         from muteki.conversation.workspace_surfaces import WorkspaceSurfaceError, search_workspace_files
@@ -1974,10 +2126,33 @@ def create_conversation_router(
 
     # -- SSE：snapshot + watermark + after sequence --------------------------------
 
+    def _tail_replay_cursor(thread_id: str, tail: int, running_turn_id: str) -> int:
+        """全局 seq 游标：回放 Thread 最近 ``tail`` 条事件，并完整覆盖进行中 Turn。"""
+        aggregate = conv_events.AGGREGATE_THREAD
+        with store.lock:
+            head = store.stream_head(aggregate, thread_id)
+            row = store.conn.execute(
+                "SELECT seq FROM domain_events "
+                "WHERE aggregate_type = ? AND aggregate_id = ? AND stream_seq > ? "
+                "ORDER BY stream_seq LIMIT 1",
+                (aggregate, thread_id, max(0, head - tail)),
+            ).fetchone()
+            cursor = int(row["seq"]) - 1 if row else 0
+            if running_turn_id:
+                started = store.conn.execute(
+                    "SELECT MIN(seq) AS seq FROM domain_events "
+                    "WHERE aggregate_type = ? AND aggregate_id = ? AND event_type = ? "
+                    "AND json_extract(payload, '$.payload.turn_id') = ?",
+                    (aggregate, thread_id, conv_events.EV_TURN_STARTED, running_turn_id),
+                ).fetchone()
+                if started and started["seq"] is not None:
+                    cursor = min(cursor, int(started["seq"]) - 1)
+        return max(0, cursor)
+
     @router.get("/api/threads/{thread_id}/events")
     async def thread_events(
         thread_id: str, request: Request, after: int = 0,
-        snapshot: bool = True, browser_host: str = "",
+        snapshot: bool = True, browser_host: str = "", tail: int = 0,
     ) -> Any:
         """Thread 事件流（SSE）。
 
@@ -1985,6 +2160,9 @@ def create_conversation_router(
         该 Thread 流头，``event_watermark`` 为全局日志水位）；随后
         ``event: event`` 逐条下发 ``seq > after`` 的 Public Event。
         断线重连用最后收到的 seq 作为 ``after`` 参数即可不丢不重。
+        新订阅（``after=0``）可传 ``tail=N``：只回放该 Thread 最近 N 条事件，
+        且始终从进行中 Turn 的 ``core.turn.started`` 起完整回放该 Turn；
+        更早的过程按需走 ``/turns/{turn_id}/process``。
         """
         try:
             snapshot_result = await command_api.query(_query(
@@ -2025,6 +2203,10 @@ def create_conversation_router(
             # Last-Event-ID 后跳过本轮已产生的工具/正文事件。
             # 客户端应在重连时传入 after=<已应用水位>；snapshot 仍可刷新视图。
             cursor = max(0, int(after) if snapshot else resume_after)
+            if snapshot and cursor == 0 and tail > 0:
+                running_turn_id = str(
+                    (snapshot_view.get("state") or {}).get("running_turn_id") or "")
+                cursor = _tail_replay_cursor(thread_id, int(tail), running_turn_id)
             # 右侧浏览器请求不入事件日志：无 id 行，不影响 Last-Event-ID 水位。
             browser = (browser_control.subscribe(thread_id, browser_host)
                        if browser_control is not None and browser_host in {"desktop", "web"} else None)
@@ -2333,32 +2515,6 @@ def create_conversation_router(
             media_type="text/markdown; charset=utf-8",
             headers=_export_headers("md"),
         )
-
-    @router.post("/api/threads/{thread_id}/compact")
-    async def compact_thread(thread_id: str) -> Any:
-        """Invoke the verified native operation, then publish actual completion."""
-        thread = service.manager.get_thread(thread_id)
-        if thread is None:
-            raise HTTPException(404, "对话不存在")
-        state = service.conv.get_state(thread_id)
-        if state.running_turn_id or service.conv.active_turn_id(thread_id):
-            raise HTTPException(409, "请等待当前回复结束后再压缩")
-        try:
-            snapshot = await service.executor.runtime_capabilities(thread_id)
-        except (RuntimeError, LookupError):
-            raise HTTPException(409, "会话尚未就绪，请稍后重试") from None
-        supported = any(item.name == "compact" and item.kind == "operation"
-                        and item.verification == "verified" for item in snapshot.items)
-        if not supported:
-            raise HTTPException(501, "当前 Runtime 不支持结构化上下文压缩，请使用它公布的原生命令")
-        service.manager.emit_context_window_event(thread_id, compact_status="running", source="manual_compact")
-        try:
-            result = await service.executor.runtime_operation(thread_id, "compact")
-        except Exception:
-            service.manager.emit_context_window_event(thread_id, compact_status="failed", source="manual_compact")
-            raise HTTPException(400, "原生压缩未完成，请查看运行时状态后重试") from None
-        service.manager.emit_context_window_event(thread_id, compact_status="done", source="manual_compact")
-        return {"status": result.get("status", "completed"), "thread_id": thread_id, "result": result}
 
     @router.get("/api/threads/{thread_id}/user-input-fixture-capture")
     async def user_input_fixture_capture(thread_id: str) -> Any:

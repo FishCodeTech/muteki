@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
+from muteki.platform.contracts.external_agents import ContextPart
 from muteki.platform.contracts.objects import Artifact
 
 #: Image MIME types eligible for native multimodal delivery.
@@ -273,15 +274,13 @@ def attachment_context_text(attachments: Sequence[ResolvedAttachment]) -> str:
     return "\n".join(lines)
 
 
-def merge_attachment_context(text: str, attachments: Sequence[ResolvedAttachment]) -> str:
-    """Prepend explicit attachment paths when any file is workspace-delivered."""
+def attachment_context_part(attachments: Sequence[ResolvedAttachment]) -> Optional[ContextPart]:
+    """Attachment manifest (paths, types, sizes, digests) as an untrusted part."""
     context = attachment_context_text(attachments)
     if not context:
-        return text
-    body = str(text or "").strip()
-    if not body:
-        return context
-    return f"{context}\n\n[当前用户请求]\n{body}"
+        return None
+    return ContextPart(key="muteki.attachments", kind="attachment_manifest",
+                       trust="untrusted", text=context)
 
 
 def attachments_payload(attachments: Sequence[ResolvedAttachment]) -> list[dict[str, Any]]:
@@ -292,10 +291,10 @@ __all__ = [
     "AttachmentDeliveryError",
     "NATIVE_IMAGE_MIME",
     "ResolvedAttachment",
+    "attachment_context_part",
     "attachment_context_text",
     "attachments_payload",
     "is_native_image_mime",
-    "merge_attachment_context",
     "normalize_media_type",
     "resolve_attachments",
     "safe_attachment_name",

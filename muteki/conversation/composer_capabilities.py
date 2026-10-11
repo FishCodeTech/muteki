@@ -15,6 +15,9 @@ from __future__ import annotations
 from hashlib import sha256
 import os
 import re
+import shutil
+import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -25,6 +28,13 @@ from muteki.capability_management import enabled as capability_enabled
 from muteki.capability_bindings.agent_plugin import package_root
 from muteki.solver.worker_skills import project_skill_roots
 
+from muteki.conversation.builtin_components import (
+    BuiltinComponentError,
+    component_instruction,
+    component_rows,
+    is_component_id,
+    resolve_component,
+)
 from muteki.external_agents.descriptors import engine_ids, find_descriptor
 from muteki.external_agents.runtime_capabilities import RuntimeCapabilitySnapshot
 
@@ -60,7 +70,7 @@ _CONTEXT_SCHEMA_V2 = 2
 # Strip chips (skill/MCP/plugin/thread/command) keep catalog identity even when
 # the composer wires them as schema-v2 nodes. Resolve via the engine catalog,
 # not the structured soft-stale path that treats them as unknown kinds (#118).
-_STRIP_CATALOG_KINDS = frozenset({"skill", "mcp", "plugin", "command", "thread"})
+_STRIP_CATALOG_KINDS = frozenset({"skill", "mcp", "plugin", "command", "thread", "component"})
 
 
 class ComposerCapabilityError(ValueError):
@@ -187,12 +197,17 @@ def _skill_roots(engine: str, workspace_root: str = "") -> Iterable[tuple[Path, 
             common = relative == ".agents/skills"
             yield workspace / relative, "当前项目", "project", 350 if common else 400
     if os.environ.get("MUTEKI_HOST_DISCOVERY", "1") != "0":
-        home = Path.home()
+        from .chat_providers import native_user_home, provider_for
+        home = native_user_home()
         descriptor = find_descriptor(engine)
         roots = descriptor.environment.user_skill_roots if descriptor is not None else ()
         for relative in roots:
             common = relative == ".agents/skills"
-            yield home / relative, "通用 Agent" if common else engine, "personal", 250 if common else 300
+            native_relative = Path(relative)
+            native_home_relative = Path(descriptor.environment.home_relative)
+            path = (provider_for(engine).native_root() / native_relative.relative_to(native_home_relative)
+                    if native_relative.is_relative_to(native_home_relative) else home / relative)
+            yield path, "通用 Agent" if common else engine, "personal", 250 if common else 300
 
 
 def discover_skills(engine: str, workspace_root: str = "", *,
@@ -258,6 +273,55 @@ def discover_skills(engine: str, workspace_root: str = "", *,
     return sorted(deduped.values(), key=lambda item: (-int(item["_priority"]), item["name"].casefold()))
 
 
+_FILE_SCAN_BUDGET_SECONDS = 3.0
+_GIT_LIST_TIMEOUT_SECONDS = 10.0
+_GIT_LIST_CACHE_SECONDS = 5.0
+_git_list_cache: dict[str, tuple[float, list[str] | None]] = {}
+
+
+def _git_listed_files(root: Path) -> list[str] | None:
+    """Tracked + untracked-not-ignored paths relative to ``root``; None outside Git.
+
+    Honouring ``.gitignore`` keeps ``@`` lookups off build output, caches and
+    run data that a raw directory walk would traverse on every keystroke.
+    """
+    key = str(root)
+    now = time.monotonic()
+    cached = _git_list_cache.get(key)
+    if cached is not None and now - cached[0] < _GIT_LIST_CACHE_SECONDS:
+        return cached[1]
+    git = shutil.which("git")
+    if git is None:
+        return None
+    completed = subprocess.run(
+        [git, "-C", key, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        capture_output=True,
+        timeout=_GIT_LIST_TIMEOUT_SECONDS,
+        check=False,
+    )
+    if completed.returncode != 0:
+        # Not a work tree (or no HEAD yet): the directory walk handles it.
+        listed: list[str] | None = None
+    else:
+        listed = sorted(set(
+            item for item in completed.stdout.decode("utf-8", "surrogateescape").split("\0") if item
+        ))
+    _git_list_cache[key] = (now, listed)
+    return listed
+
+
+def _file_row(root: Path, relative: str) -> dict[str, Any]:
+    return {
+        "id": _opaque_id("file", f"{root}\0{relative}"),
+        "kind": "file",
+        "name": relative.rsplit("/", 1)[-1],
+        "description": relative,
+        "source": "当前项目",
+        "scope": "project",
+        "_relative_path": relative,
+    }
+
+
 def discover_files(
     workspace_root: str,
     *,
@@ -276,8 +340,39 @@ def discover_files(
         return []
     rows: list[dict[str, Any]] = []
     needle = str(query or "").casefold().strip()
+    try:
+        listed = _git_listed_files(root)
+    except (OSError, subprocess.SubprocessError) as exc:
+        _section_failure(errors, "files", exc)
+        listed = None
+    if listed is not None:
+        for relative in listed:
+            if needle and needle not in relative.casefold():
+                continue
+            path = root / relative
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+            except OSError:
+                continue
+            rows.append(_file_row(root, relative))
+            if len(rows) >= limit:
+                break
+        return rows
+
+    deadline = time.monotonic() + _FILE_SCAN_BUDGET_SECONDS
     for directory, dirnames, filenames in os.walk(root, followlinks=False,
             onerror=lambda exc: _section_failure(errors, "files", exc)):
+        if time.monotonic() > deadline:
+            if errors is not None:
+                errors.append({
+                    "section": "files",
+                    "code": "conversation.composer.files_scan_incomplete",
+                    "message": (f"目录较大，文件搜索在 {_FILE_SCAN_BUDGET_SECONDS:g} 秒内未扫描完，"
+                                "结果不完整；请输入更具体的文件名，或将该目录初始化为 Git 仓库。"),
+                    "exception_type": "TimeoutError",
+                })
+            return rows
         directory_path = Path(directory)
         dirnames[:] = sorted(
             name for name in dirnames
@@ -294,15 +389,7 @@ def discover_files(
                 continue
             if needle and needle not in relative.casefold():
                 continue
-            rows.append({
-                "id": _opaque_id("file", f"{root}\0{relative}"),
-                "kind": "file",
-                "name": path.name,
-                "description": relative,
-                "source": "当前项目",
-                "scope": "project",
-                "_relative_path": relative,
-            })
+            rows.append(_file_row(root, relative))
             if len(rows) >= limit:
                 return rows
     return rows
@@ -405,7 +492,7 @@ def resolve_composer_catalog(
     kind_filter = ""
     if ":" in raw_query:
         prefix, suffix = raw_query.split(":", 1)
-        if prefix in {"skill", "mcp", "plugin", "file", "thread"}:
+        if prefix in {"skill", "mcp", "plugin", "file", "thread", "component"}:
             kind_filter, raw_query = prefix, suffix
 
     snapshot_items = [item for item in runtime_snapshot.items if not item.engine or item.engine == normalized] if runtime_snapshot else []
@@ -532,7 +619,7 @@ def resolve_composer_catalog(
         if item.get("source") == "Muteki 聊天插件" or str(item.get("name") or "").casefold() not in runtime_skill_names
     ]
 
-    from muteki.external_agents.command_providers import client_commands, unavailable_commands
+    from muteki.external_agents.command_providers import client_commands, unavailable_commands, unavailable_compact
     native_names = {row["name"] for row in runtime_rows}
     client_rows = client_commands(normalized, native_names)
     matrix = runtime_snapshot.public_matrix() if runtime_snapshot else None
@@ -555,9 +642,19 @@ def resolve_composer_catalog(
         rows.extend(client_rows)
         rows.extend(runtime_rows)
         rows.extend(local_skill_rows)
+        rows.extend(read_section("components", lambda: component_rows(
+            normalized, gateway=engine_receives_capability_gateway(normalized), include_apps=False), []))
         rows.extend(unavailable_commands(normalized, native_names | client_names))
+        # Only a fresh live catalog proves the absence; before a session starts
+        # the runtime has not published its commands yet.
+        if (runtime_snapshot is not None and not runtime_snapshot.stale
+                and not any(row["name"].casefold() == "compact" for row in rows)):
+            rows.append(unavailable_compact(normalized, runtime_snapshot.adapter_id))
     elif trigger == "@":
-        rows = _thread_items(threads, current_thread_id=current_thread_id)
+        rows = read_section("components", lambda: component_rows(
+            normalized, gateway=engine_receives_capability_gateway(normalized),
+            query=raw_query, errors=section_errors), [])
+        rows.extend(_thread_items(threads, current_thread_id=current_thread_id))
         runtime_mcp = [
             {
                 "id": capability.id,
@@ -631,8 +728,31 @@ def resolve_composer_catalog(
 
     if kind_filter:
         rows = [item for item in rows if item.get("kind") == kind_filter]
+    if trigger in {"/", "$"}:
+        rows = _dedupe_invocations(rows)
     filtered = [item for item in rows if _matches(item, raw_query)]
     return [_public_item(item) for item in filtered[:1000]]
+
+
+def _dedupe_invocations(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per typed invocation. Sources are listed by priority, so the
+    first row wins unless only a later one can actually run."""
+    kept: dict[tuple[str, str], int] = {}
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        invocation = row.get("invocation") if isinstance(row.get("invocation"), dict) else {}
+        label = str(invocation.get("wire_text") or row.get("name") or "").strip().lstrip("/$").casefold()
+        key = (str(row.get("kind") or ""), label)
+        if not label:
+            out.append(row)
+            continue
+        index = kept.get(key)
+        if index is None:
+            kept[key] = len(out)
+            out.append(row)
+        elif out[index].get("invocable") is False and row.get("invocable") is not False:
+            out[index] = row
+    return out
 
 
 def _cap_snapshot(text: str) -> str:
@@ -970,8 +1090,46 @@ def resolve_capability_refs(
     and enqueue with ``status`` marked, instead of hard-failing the send.
     Legacy opaque mcp/skill/plugin/file/thread chips retain prior behavior.
     """
+    selected, instructions, data = _resolve_capability_refs(
+        refs, engine=engine, workspace_root=workspace_root,
+        extension_service=extension_service, threads=threads,
+        message_loader=message_loader, message_lookup=message_lookup,
+        plugin_service=plugin_service)
+    return selected, "\n\n".join([*instructions, *data])
+
+
+def capability_context_parts(refs: Any, **kwargs: Any) -> tuple[list[dict[str, Any]], list[Any]]:
+    """Selected references as context parts beside the user's text.
+
+    Skills, components and read-this-file requests are what the user chose
+    for the agent to follow (``application``); excerpts and other
+    conversations are quoted data (``untrusted``).
+    """
+    from muteki.platform.contracts.external_agents import ContextPart
+    selected, instructions, data = _resolve_capability_refs(refs, **kwargs)
+    parts = []
+    if instructions:
+        parts.append(ContextPart(key="muteki.references", kind="reference",
+                                 trust="application", text="\n\n".join(instructions)))
+    if data:
+        parts.append(ContextPart(key="muteki.references.data", kind="reference",
+                                 trust="untrusted", text="\n\n".join(data)))
+    return selected, parts
+
+
+def _resolve_capability_refs(
+    refs: Any,
+    *,
+    engine: str,
+    workspace_root: str = "",
+    extension_service: Any = None,
+    threads: Iterable[Any] = (),
+    message_loader: Any = None,
+    message_lookup: Any = None,
+    plugin_service: Any = None,
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
     if not refs:
-        return [], ""
+        return [], [], []
     if not isinstance(refs, list) or len(refs) > _MAX_SELECTED_REFS:
         raise ComposerCapabilityError(f"能力引用最多 {_MAX_SELECTED_REFS} 个")
     normalized = str(engine or "").strip().lower()
@@ -1005,6 +1163,8 @@ def resolve_capability_refs(
 
     selected: list[dict[str, Any]] = []
     instructions: list[str] = []
+    data: list[str] = []
+    components: list[dict[str, Any]] = []
     seen: set[str] = set()
     for raw in refs:
         if not isinstance(raw, dict):
@@ -1027,7 +1187,7 @@ def resolve_capability_refs(
             selected.append(item)
             instruction = _instruction_for_structured(item)
             if instruction:
-                instructions.append(instruction)
+                data.append(instruction)
             continue
 
         item_id = str(raw.get("id") or raw.get("legacy_capability_id") or "").strip()
@@ -1036,6 +1196,12 @@ def resolve_capability_refs(
         item = catalog.get(item_id)
         if item is None and str(raw.get("legacy_capability_id") or "").strip():
             item = catalog.get(str(raw.get("legacy_capability_id")).strip())
+        if item is None and is_component_id(item_id):
+            try:
+                item = resolve_component(item_id, engine=normalized,
+                                         gateway=engine_receives_capability_gateway(normalized))
+            except BuiltinComponentError as exc:
+                raise ComposerCapabilityError(str(exc)) from exc
         if item is None and str(raw.get("kind") or "") == "file" and workspace_root:
             relative = str(raw.get("description") or "").strip()
             try:
@@ -1101,6 +1267,8 @@ def resolve_capability_refs(
                 f"[显式引用的项目文件]\n{item['_relative_path']}\n"
                 "处理当前请求时读取并使用该文件。"
             )
+        elif kind == "component":
+            components.append(item)
         elif kind in {"mcp", "plugin"}:
             # MCP/插件能力已经在 SessionStart 结构化交付；引用只用于 UI
             # 选择与审计，不把“请使用某工具”再次伪装成用户文本。
@@ -1114,18 +1282,19 @@ def resolve_capability_refs(
                 for message in messages[-24:]
                 if str(getattr(message, "text", "") or "").strip()
             )[-_MAX_THREAD_CONTEXT_CHARS:]
-            instructions.append(
+            data.append(
                 f"[显式引用的对话: {name}]\n{transcript or '该对话暂无可引用消息。'}"
             )
 
-    context = "\n\n".join(instructions)
-    if len(context) > _MAX_CONTEXT_CHARS:
+    if components:
+        instructions.append(component_instruction(components))
+    if len("\n\n".join([*instructions, *data])) > _MAX_CONTEXT_CHARS:
         raise ComposerCapabilityError("所选参考上下文过长，请减少选择后重试")
-    return selected, context
+    return selected, instructions, data
 
 
 __all__ = [
-    "ComposerCapabilityError", "SUPPORTED_ENGINES", "discover_files",
+    "ComposerCapabilityError", "SUPPORTED_ENGINES", "capability_context_parts", "discover_files",
     "discover_skills", "engine_receives_capability_gateway",
     "resolve_capability_refs", "resolve_composer_catalog",
 ]

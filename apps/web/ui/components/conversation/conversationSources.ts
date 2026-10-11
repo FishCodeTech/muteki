@@ -55,6 +55,21 @@ export function extractUrls(text: string): string[] {
   return found;
 }
 
+// Sources are recollected over the whole live window on every stream frame;
+// each event's payload is immutable, so its URL scan runs once.
+const toolEventUrlCache = new WeakMap<ConversationEvent, string[]>();
+
+function toolEventUrls(event: ConversationEvent, payload: Record<string, unknown>): string[] {
+  const cached = toolEventUrlCache.get(event);
+  if (cached) return cached;
+  const urls: string[] = [];
+  for (const field of [payload.input, payload.arguments, payload.output, payload.result]) {
+    urls.push(...extractUrls(eventText(field)));
+  }
+  toolEventUrlCache.set(event, urls);
+  return urls;
+}
+
 function mcpIdentity(payload: Record<string, unknown>): { server: string; tool: string } | null {
   const name = String(payload.tool || payload.name || "");
   const server = String(payload.mcp_server || "").trim();
@@ -96,9 +111,7 @@ export function collectConversationSources(
     const payload = (event.payload || {}) as Record<string, unknown>;
     const tool = String(payload.tool || payload.name || "工具");
     const seq = Number(event.seq || 0);
-    for (const field of [payload.input, payload.arguments, payload.output, payload.result]) {
-      for (const url of extractUrls(eventText(field))) addLink(url, tool, seq);
-    }
+    for (const url of toolEventUrls(event, payload)) addLink(url, tool, seq);
     const mcp = mcpIdentity(payload);
     const callId = String(payload.call_id || payload.tool_call_id || "");
     if (mcp && callId && !countedCalls.has(callId)) {

@@ -5,6 +5,7 @@ const { randomUUID, createHash } = require('node:crypto');
 const { spawn, execFileSync } = require('node:child_process');
 const {once} = require('node:events');
 const { bundleHash, bundleIdentity, copyBundle, atomicJson } = require('./update-files.cjs');
+const { hostEnvironment } = require('./environment.cjs');
 const OWNER = 'FishCodeTech/muteki';
 const API = `https://api.github.com/repos/${OWNER}/releases/latest`;
 const MAX_ASSET = 1024 * 1024 * 1024;
@@ -517,7 +518,7 @@ class DesktopUpdates {
     const transactionNode = path.join(transaction, 'node');
     fs.copyFileSync(path.join(process.resourcesPath, 'runtime', runtime.node), transactionNode);
     fs.chmodSync(transactionNode, 0o700);
-    for (const name of ['update-runner.cjs', 'update-files.cjs']) {
+    for (const name of ['update-runner.cjs', 'update-files.cjs', 'environment.cjs']) {
       fs.copyFileSync(path.join(__dirname, name), path.join(transaction, name));
     }
     const journal = {
@@ -546,7 +547,7 @@ class DesktopUpdates {
     if (!this.prepared) throw new Error('No accepted candidate is prepared');
     const { file, transaction } = this.prepared;
     const log = fs.openSync(path.join(transaction, 'install.log'), 'a', 0o600);
-    const env = { ...process.env };
+    const env = hostEnvironment(process.env);
     delete env.NODE_OPTIONS;
     delete env.NODE_PATH;
     const args = [path.join(transaction, 'update-runner.cjs'), file];

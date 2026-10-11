@@ -633,7 +633,9 @@ def _meta_sink_for(self, run: Run):
             run.started = True
             if ch.get("name"):
                 run.name = ch["name"]
-            run.category = ch.get("category", run.category) or run.category
+            # Worker RUN_STARTED copies may carry a placeholder category.
+            if ev.event_type is EventType.RUN_PREPARING and ch.get("category"):
+                run.category = ch["category"]
             if ch.get("mode") in {"ctf", "pentest"}:
                 run.mode = ch["mode"]
             if ch.get("expected_flags"):

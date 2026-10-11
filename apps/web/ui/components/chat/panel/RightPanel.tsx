@@ -1,6 +1,16 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
+import { REFLOW_PANEL_ATTR } from "@/components/ai-native/chat";
 import { focusTargetAfterTabClose, handleTabListKeyDown, isTabId } from "@/components/collaboration/tablist";
 import { cn } from "@/lib/cn";
 import { Icon, type IconName } from "@/components/Icon";
@@ -81,7 +91,7 @@ function Favicon({ url }: { url: string | null }) {
 const WORKSPACE_TAB_ID_PREFIX = "workspace-surface-tab";
 const OPEN_VIEW_CONTROL_ID = "workspace-surface-open-view";
 
-function SurfaceTab({
+const SurfaceTab = memo(function SurfaceTab({
   threadId,
   surface,
   active,
@@ -172,7 +182,7 @@ function SurfaceTab({
       )}
     </>
   );
-}
+});
 
 function AddSurfaceMenu({ threadId, hasWorkspace }: { threadId: string; hasWorkspace: boolean }) {
   return (
@@ -241,15 +251,100 @@ export interface RightPanelProps extends Omit<SurfaceContext, "active"> {
   sidebarWidth: number;
 }
 
-export function RightPanel({ sheet, sidebarWidth, ...ctx }: RightPanelProps) {
-  const { threadId, hasWorkspace } = ctx;
-  const ownsView = ctx.view.thread.thread_id === threadId;
+/**
+ * Returns a function with stable identity that always calls the latest `fn`, or
+ * undefined when `fn` is absent (surfaces treat a missing callback as "feature off").
+ */
+function useLatestCallback<A extends unknown[], R>(fn: ((...args: A) => R) | undefined): ((...args: A) => R) | undefined {
+  const ref = useRef(fn);
+  useLayoutEffect(() => {
+    ref.current = fn;
+  });
+  const stable = useCallback((...args: A) => ref.current!(...args), []);
+  return fn ? stable : undefined;
+}
+
+export function RightPanel({
+  sheet,
+  sidebarWidth,
+  threadId,
+  view,
+  events,
+  tools,
+  hasWorkspace,
+  onOpenDetails,
+  onCiteToComposer,
+  onAttachToComposer,
+  onDiffAnnotationSend,
+}: RightPanelProps) {
+  const ownsView = view.thread.thread_id === threadId;
   const panel = useChatPanel(threadId);
   const width = useChatPanelWidth();
   const [dragging, setDragging] = useState(false);
   const [viewport, setViewport] = useState(1440);
   const dragId = useRef<string | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
+  const asideRef = useRef<HTMLElement | null>(null);
+  const columnRef = useRef<HTMLDivElement | null>(null);
+  const draftWidth = useRef<number | null>(null);
+  const draftFrame = useRef<number | null>(null);
+
+  const stableOpenDetails = useLatestCallback(onOpenDetails)!;
+  const stableCite = useLatestCallback(onCiteToComposer);
+  const stableAttach = useLatestCallback(onAttachToComposer);
+  const stableDiffSend = useLatestCallback(onDiffAnnotationSend);
+  const baseCtx = useMemo<Omit<SurfaceContext, "active">>(
+    () => ({
+      threadId,
+      view,
+      events,
+      tools,
+      hasWorkspace,
+      onOpenDetails: stableOpenDetails,
+      onCiteToComposer: stableCite,
+      onAttachToComposer: stableAttach,
+      onDiffAnnotationSend: stableDiffSend,
+    }),
+    [threadId, view, events, tools, hasWorkspace, stableOpenDetails, stableCite, stableAttach, stableDiffSend],
+  );
+  const activeCtx = useMemo<SurfaceContext>(() => ({ ...baseCtx, active: true }), [baseCtx]);
+  const inactiveCtx = useMemo<SurfaceContext>(() => ({ ...baseCtx, active: false }), [baseCtx]);
+
+  useEffect(() => () => {
+    if (draftFrame.current != null) cancelAnimationFrame(draftFrame.current);
+  }, []);
+
+  // While dragging, widths are written straight to the DOM once per frame and
+  // committed to the store on release, so the shell is not re-rendered per pointermove.
+  // A ref (not `dragging` state) is required: ResizeHandle's move listener keeps the
+  // onChange from the render in which the drag started.
+  const draggingRef = useRef(false);
+  const applyDraftWidth = () => {
+    draftFrame.current = null;
+    const next = draftWidth.current;
+    if (next == null) return;
+    if (asideRef.current) asideRef.current.style.width = `${next}px`;
+    if (columnRef.current) columnRef.current.style.width = `${next}px`;
+  };
+  const onResizeChange = (next: number) => {
+    if (!draggingRef.current) {
+      chatPanel.setWidth(next);
+      return;
+    }
+    draftWidth.current = next;
+    if (draftFrame.current == null) draftFrame.current = requestAnimationFrame(applyDraftWidth);
+  };
+  const onResizeDragStateChange = (active: boolean) => {
+    draggingRef.current = active;
+    if (!active) {
+      if (draftFrame.current != null) cancelAnimationFrame(draftFrame.current);
+      applyDraftWidth();
+      const next = draftWidth.current;
+      draftWidth.current = null;
+      if (next != null) chatPanel.setWidth(next);
+    }
+    setDragging(active);
+  };
 
   useEffect(() => {
     const update = () => setViewport(window.innerWidth);
@@ -301,6 +396,12 @@ export function RightPanel({ sheet, sidebarWidth, ...ctx }: RightPanelProps) {
       document.getElementById(`${WORKSPACE_TAB_ID_PREFIX}-${focusTarget.tab}`)?.focus();
     });
   };
+  const stableCloseSurface = useLatestCallback(closeSurface)!;
+  const onTabDragStart = useCallback((id: string) => { dragId.current = id; }, []);
+  const onTabDrop = useCallback((id: string) => {
+    if (dragId.current) chatPanel.reorder(threadId, dragId.current, id);
+    dragId.current = null;
+  }, [threadId]);
 
   const onSurfaceTabListKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement | null;
@@ -349,9 +450,9 @@ export function RightPanel({ sheet, sidebarWidth, ...ctx }: RightPanelProps) {
               surface={surface}
               active={!showLauncher && surface.id === panel.activeId}
               tabIndex={tablistSelection === surface.id ? 0 : -1}
-              onClose={closeSurface}
-              onDragStart={(id) => { dragId.current = id; }}
-              onDrop={(id) => { if (dragId.current) chatPanel.reorder(threadId, dragId.current, id); dragId.current = null; }}
+              onClose={stableCloseSurface}
+              onDragStart={onTabDragStart}
+              onDrop={onTabDrop}
             />
           ))}
         </div>
@@ -387,7 +488,7 @@ export function RightPanel({ sheet, sidebarWidth, ...ctx }: RightPanelProps) {
             inert={!active}
             className="absolute inset-0 flex flex-col"
           >
-            <SurfaceRenderer surface={surface} ctx={{ ...ctx, active }} />
+            <SurfaceRenderer surface={surface} ctx={active ? activeCtx : inactiveCtx} />
           </div>
         );
       })}
@@ -414,11 +515,13 @@ export function RightPanel({ sheet, sidebarWidth, ...ctx }: RightPanelProps) {
   const maximized = open && panel.maximized;
   return (
     <aside
+      ref={asideRef}
       aria-label="会话工作面板"
       aria-hidden={!open}
       inert={!open}
       data-open={open}
       data-maximized={maximized || undefined}
+      {...{ [REFLOW_PANEL_ATTR]: "" }}
       className={cn(
         "flex h-full shrink-0 overflow-hidden border-l bg-cx-bg",
         open ? "border-cx-border-subtle" : "border-transparent",
@@ -433,14 +536,20 @@ export function RightPanel({ sheet, sidebarWidth, ...ctx }: RightPanelProps) {
           value={effectiveWidth}
           min={PANEL_WIDTH_MIN}
           max={max}
-          onChange={(next) => chatPanel.setWidth(next)}
+          onChange={onResizeChange}
           onReset={() => chatPanel.setWidth(PANEL_WIDTH_DEFAULT)}
-          onDragStateChange={setDragging}
+          onDragStateChange={onResizeDragStateChange}
           label="拖拽调整面板宽度"
           className="left-0"
         />
       ) : null}
-      <div className="flex h-full min-w-0 flex-col" style={{ width: maximized ? "100%" : effectiveWidth }}>
+      {/* The column keeps a fixed width while the aside animates, so containment keeps
+          the outer width transition from relaying out the surface subtree. */}
+      <div
+        ref={columnRef}
+        className="flex h-full min-w-0 flex-col [contain:layout_paint]"
+        style={{ width: maximized ? "100%" : effectiveWidth }}
+      >
         {header}
         {body}
       </div>

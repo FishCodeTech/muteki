@@ -4,7 +4,7 @@
  */
 
 import {
-  isKnownAdapter, isKnownEngine, loginGuidance as descriptorLoginGuidance, runtimeScopesModelCatalog,
+  adapterDescriptor, descriptorForEngine, isKnownAdapter, isKnownEngine, loginGuidance as descriptorLoginGuidance, runtimeScopesModelCatalog,
   type ProviderDescriptorCatalog,
 } from "./providerDescriptors";
 
@@ -77,7 +77,8 @@ export interface ReadinessCredential {
   id: string;
   engine: string;
   source?: string;
-  present?: boolean;
+  present?: boolean | null;
+  detection_status?: "present" | "absent" | "unknown" | "disabled";
   status: string;
   status_detail?: string;
   discovery_code?: string;
@@ -110,6 +111,7 @@ export interface ReadinessRuntime {
   engine?: string;
   enabled?: boolean;
   adapter_id?: string;
+  default_for_engine?: boolean;
   health?: ReadinessRuntimeHealth;
   auth?: ReadinessRuntimeAuth;
   binary_path?: string;
@@ -176,6 +178,7 @@ export function credentialAvailable(credential: ReadinessCredential | undefined)
 
 export function credentialLoginMissing(credential: ReadinessCredential | undefined): boolean {
   if (!credential || credential.discovery_code === "host_discovery_disabled") return false;
+  if (credential.detection_status === "unknown" || credential.detection_status === "disabled") return false;
   const status = String(credential.status || "").toLowerCase();
   return credential.present === false || status === "missing" || status === "absent";
 }
@@ -232,6 +235,20 @@ export function runtimeHealthy(runtime: ReadinessRuntime | undefined): boolean {
   );
 }
 
+/** Unprobed instances remain selectable; explicitly unavailable ones do not. */
+export function runtimeAvailableForSelection(
+  runtime: ReadinessRuntime,
+  descriptors?: ProviderDescriptorCatalog | null,
+): boolean {
+  if (runtime.enabled === false || runtime.health?.healthy === false) return false;
+  // Chat and task CLI instances have independent enable switches. An enabled
+  // task CLI must not bring a disabled structured chat Agent back into the picker.
+  const defaultAdapter = descriptorForEngine(descriptors ?? null, runtime.engine)?.identity.default_adapter_id;
+  const defaultTransport = adapterDescriptor(descriptors ?? null, defaultAdapter)?.transport_kind;
+  const adapter = adapterDescriptor(descriptors ?? null, runtime.adapter_id);
+  return !defaultTransport || defaultTransport === "cli" || Boolean(adapter && adapter.role !== "cli");
+}
+
 export function pickRuntimeForEngine(
   engine: string,
   runtimes: ReadinessRuntime[],
@@ -242,8 +259,11 @@ export function pickRuntimeForEngine(
   const healthy = rows.filter((runtime) => runtime.health?.healthy === true);
   const pool = healthy.length ? healthy : rows;
   return [...pool].sort((left, right) => {
+    // Built-in variants (cursor.acp, pi.acp, …) are listed next to the engine
+    // default; they are chosen only explicitly, never by approval support.
     const score = (runtime: ReadinessRuntime) => (
       Number(runtimeHealthy(runtime)) * 8
+      + Number(Boolean(runtime.default_for_engine)) * 4
       + Number(Boolean(runtime.health?.capabilities?.approval)) * 2
       + Number(runtime.adapter_id && !String(runtime.adapter_id).startsWith("cli."))
     );

@@ -86,6 +86,34 @@ export function artifactUrl(
   return options?.download ? `${base}?download=true` : base;
 }
 
+export function threadImageRawUrl(threadId: string, path: string): string {
+  return `/api/threads/${encodeURIComponent(threadId)}/images/raw?path=${encodeURIComponent(path)}`;
+}
+
+/** Convert Markdown file references to the path expected by authenticated image routes. */
+export function localMarkdownImagePath(src: string): string {
+  let path = src.trim();
+  if (/^file:/i.test(path)) {
+    path = path.replace(/^file:\/\//i, "");
+    path = path.replace(/^localhost(?=\/)/i, "");
+    // file:///Users/... loses only the scheme and keeps the leading slash.
+    if (!path.startsWith("/")) path = `/${path}`;
+  }
+  try {
+    path = decodeURIComponent(path);
+  } catch {
+    // Keep malformed percent sequences intact so the server can return its real error.
+  }
+  return path;
+}
+
+export function markdownImageApiPath(threadId: string, src: string): string {
+  const artifact = /^(?:artifact:|muteki-artifact:)([a-f0-9]{16,64})$/i.exec(src.trim());
+  if (artifact) return artifactUrl(threadId, artifact[1].toLowerCase());
+  if (src.startsWith("/api/")) return src;
+  return threadImageRawUrl(threadId, localMarkdownImagePath(src));
+}
+
 const LINE_SUFFIX = /^(.*?)(?::(\d+)|#L(\d+)(?:-L?\d+)?)$/i;
 
 /**

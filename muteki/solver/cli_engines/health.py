@@ -102,13 +102,14 @@ def engine_liveness(account_root: "Optional[str]" = None) -> dict:
     return out
 
 
-def _claude_oauth() -> "Optional[tuple[str, int]]":
+def _claude_oauth(env: "Optional[dict[str, str]]" = None) -> "Optional[tuple[str, int]]":
     """(access_token, expires_at_ms) from env / macOS Keychain / creds file.
     Returns None when no credential is found. Used by credential_accounts for
     login detection. Never raises."""
-    env_tok = (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-               or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-               or os.environ.get("ANTHROPIC_API_KEY"))
+    source = os.environ if env is None else env
+    env_tok = (source.get("CLAUDE_CODE_OAUTH_TOKEN")
+               or source.get("ANTHROPIC_AUTH_TOKEN")
+               or source.get("ANTHROPIC_API_KEY"))
     if env_tok and env_tok.strip():
         return env_tok.strip(), 0
     raw: Optional[str] = None
@@ -122,7 +123,9 @@ def _claude_oauth() -> "Optional[tuple[str, int]]":
         pass
     if not raw:
         try:
-            p = Path.home() / ".claude" / ".credentials.json"
+            home = Path(source["HOME"]) if source.get("HOME") else Path.home()
+            config = Path(source["CLAUDE_CONFIG_DIR"]) if source.get("CLAUDE_CONFIG_DIR") else home / ".claude"
+            p = config / ".credentials.json"
             if p.exists():
                 raw = p.read_text()
         except Exception:
@@ -141,10 +144,11 @@ def _claude_oauth() -> "Optional[tuple[str, int]]":
     return None
 
 
-def _cursor_session_cookie() -> "Optional[str]":
+def _cursor_session_cookie(env: "Optional[dict[str, str]]" = None) -> "Optional[str]":
     """`WorkosCursorSessionToken=<userId>::<JWT>` from the macOS Keychain +
     cli-config, or None. Never raises. (Linux Cursor stores the token elsewhere;
     we only support the Keychain path today → None elsewhere.)"""
+    source = os.environ if env is None else env
     tok: Optional[str] = None
     try:
         r = subprocess.run(
@@ -158,7 +162,7 @@ def _cursor_session_cookie() -> "Optional[str]":
         return None
     uid: Optional[str] = None
     try:
-        cfg = Path.home() / ".cursor" / "cli-config.json"
+        cfg = Path(source.get("HOME") or str(Path.home())) / ".cursor" / "cli-config.json"
         if cfg.exists():
             uid = str(json.loads(cfg.read_text()).get("authInfo", {}).get("userId") or "")
     except Exception:

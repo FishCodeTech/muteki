@@ -1,4 +1,4 @@
-"""Incremental, session-local copies of native CLI configuration.
+"""Explicit native snapshots, application assets, and legacy history migration.
 
 The index owns directory identity; source revisions never create new homes.
 Only imported files belong to the synchronizer. Native history and files written
@@ -204,3 +204,157 @@ def evict_imports(root: Path, prefixes: tuple[str, ...]) -> int:
             removed += path.stat().st_size
             path.unlink()
     return removed
+
+
+def migrate_history(source: Path, destination: Path, copy_file: Callable) -> None:
+    """Import legacy native transcripts only, retaining the complete old home.
+
+    Never import credentials, configuration, plugins or SQLite/WAL files. The
+    native client owns indexing. Previously imported transcripts may be updated
+    by that client, so a migration receipt prevents replaying stale copies.
+    """
+    if not source.is_dir() or source.resolve() == destination.resolve():
+        return
+    receipt = source.parent.parent / ".history-migration.json"
+    previous = json.loads(receipt.read_text()) if receipt.exists() else {}
+    identity = str(destination.resolve())
+    migrated = previous.get(identity, {})
+    current = dict(migrated)
+    for directory in ("sessions", "archived_sessions", "projects"):
+        for relative, original in source_files(source / directory):
+            name = (Path(directory) / relative).as_posix()
+            # History directories occasionally contain databases; raw database
+            # copying is never safe while a native client may own the target.
+            if original.suffix in {".sqlite", ".db"} or original.name.endswith(("-wal", "-shm")):
+                continue
+            digest = file_digest(original)
+            if migrated.get(name) == digest:
+                continue
+            target = _target(destination, name)
+            if target.exists():
+                if not target.is_file() or file_digest(target) != digest:
+                    raise NativeEnvironmentError(f"Native history migration conflict: {target}; legacy history retained at {original}")
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                fd, temporary = tempfile.mkstemp(prefix=".history-", dir=target.parent)
+                os.close(fd)
+                tmp = Path(temporary)
+                try:
+                    tmp.unlink()
+                    copy_file(original, tmp)
+                    if file_digest(tmp) != digest:
+                        raise NativeEnvironmentError(f"Native history changed during migration: {original}")
+                    tmp.chmod(0o600)
+                    # Publish without replacing a concurrently created native file.
+                    try:
+                        os.link(tmp, target)
+                    except FileExistsError:
+                        if not target.is_file() or file_digest(target) != digest:
+                            raise NativeEnvironmentError(f"Native history migration conflict: {target}")
+                finally:
+                    tmp.unlink(missing_ok=True)
+            current[name] = digest
+    if current == migrated:
+        return
+    previous[identity] = current
+    fd, temporary = tempfile.mkstemp(prefix=".history-receipt-", dir=receipt.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(previous, stream)
+        os.replace(temporary, receipt)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def migrate_cursor_history(source: Path, destination: Path, session_id: str) -> str:
+    """Move one recorded Cursor chat into native storage through SQLite backup."""
+    import re
+    import shutil
+    if not re.fullmatch(r"[a-zA-Z0-9-]+", session_id or ""):
+        raise NativeEnvironmentError("Invalid recorded Cursor session id")
+    chats = source / "chats"
+    matches = list(chats.glob("*/" + session_id)) if chats.is_dir() else []
+    if not matches:
+        return ""
+    if len(matches) != 1:
+        raise NativeEnvironmentError("Legacy Cursor chat directory is ambiguous")
+    original = matches[0]
+    if original.is_symlink() or not original.resolve().is_relative_to(source.resolve()):
+        raise NativeEnvironmentError("Legacy Cursor chat directory escapes its home")
+    unknown = {p.name for p in original.iterdir()} - {"store.db", "store.db-wal", "store.db-shm", "meta.json"}
+    if unknown or not (original / "store.db").is_file():
+        raise NativeEnvironmentError("Legacy Cursor chat layout is unsupported")
+    for path in original.iterdir():
+        if path.is_symlink():
+            raise NativeEnvironmentError("Legacy Cursor chat contains a symlink")
+    relative = original.relative_to(source)
+    target = _target(destination, relative.as_posix())
+    if original.resolve() == target.resolve():
+        return str(target)
+    def database_digest(path: Path) -> str:
+        digest = sha256()
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as conn:
+            conn.execute("BEGIN")
+            for statement in conn.iterdump():
+                digest.update(statement.encode())
+                digest.update(b"\n")
+        return digest.hexdigest()
+    metadata = original / "meta.json"
+    fingerprint = {"database": database_digest(original / "store.db"),
+                   "metadata": file_digest(metadata) if metadata.is_file() else ""}
+    receipt = source.parent.parent / ".cursor-history-migration.json"
+    previous = json.loads(receipt.read_text()) if receipt.exists() else {}
+    key = str(target.resolve())
+    if previous.get(key) == fingerprint and target.is_dir():
+        return str(target)
+    if target.exists():
+        if (not target.is_dir() or not (target / "store.db").is_file()
+                or database_digest(target / "store.db") != fingerprint["database"]
+                or (file_digest(target / "meta.json") if (target / "meta.json").is_file() else "") != fingerprint["metadata"]):
+            raise NativeEnvironmentError(f"Cursor native history conflict at {target}; legacy chat retained at {original}")
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        staging = Path(tempfile.mkdtemp(prefix=".cursor-history-", dir=target.parent))
+        try:
+            backed_up = staging / "store.db"
+            with closing(sqlite3.connect((original / "store.db").as_uri() + "?mode=ro", uri=True)) as native:
+                with closing(sqlite3.connect(backed_up)) as output:
+                    native.backup(output)
+            backed_up.chmod(0o600)
+            if database_digest(backed_up) != fingerprint["database"]:
+                raise NativeEnvironmentError("Cursor history changed during migration")
+            if metadata.is_file():
+                shutil.copy2(metadata, staging / "meta.json")
+                (staging / "meta.json").chmod(0o600)
+                if file_digest(staging / "meta.json") != fingerprint["metadata"]:
+                    raise NativeEnvironmentError("Cursor history metadata changed during migration")
+            # An exclusive directory claim prevents replacing a concurrent native
+            # chat. A failed publish retains the legacy chat and exposes failure.
+            target.mkdir(mode=0o700)
+            published = []
+            try:
+                for name in ("store.db", "meta.json"):
+                    file = staging / name
+                    if not file.is_file():
+                        continue
+                    os.link(file, target / file.name)
+                    published.append((target / file.name, file.stat().st_ino))
+            except Exception:
+                # Roll back only files still owned by this failed publication.
+                for file, inode in published:
+                    if file.is_file() and file.stat().st_ino == inode:
+                        file.unlink()
+                if target.is_dir() and not any(target.iterdir()):
+                    target.rmdir()
+                raise
+        finally:
+            shutil.rmtree(staging)
+    previous[key] = fingerprint
+    fd, temporary = tempfile.mkstemp(prefix=".cursor-receipt-", dir=receipt.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(previous, stream)
+        os.replace(temporary, receipt)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    return str(target)

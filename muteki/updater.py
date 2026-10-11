@@ -25,7 +25,11 @@ from muteki.version import get_version, project_root
 DEFAULT_REPOSITORY = "FishCodeTech/muteki"
 MANIFEST_SCHEMA = 1
 INSTALL_SCHEMA = 1
-_VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?$")
+_VERSION_RE = re.compile(
+    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+)
 
 
 class UpdateError(RuntimeError):
@@ -45,13 +49,27 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _version_tuple(value: str) -> tuple[int, int, int, int, str]:
+def _version_tuple(
+    value: str,
+) -> tuple[int, int, int, int, tuple[tuple[int, int | str], ...]]:
+    """SemVer precedence: numeric prerelease fields precede text; ignore builds."""
     normalized = value.strip().removeprefix("v")
     match = _VERSION_RE.fullmatch(normalized)
     if not match:
         raise UpdateError(f"发布版本格式无效：{value}")
-    suffix = normalized.split("-", 1)[1].split("+", 1)[0] if "-" in normalized else ""
-    return int(match.group(1)), int(match.group(2)), int(match.group(3)), 1 if not suffix else 0, suffix
+    suffix = match.group(4)
+    prerelease: list[tuple[int, int | str]] = []
+    for identifier in suffix.split(".") if suffix else []:
+        if identifier.isdigit():
+            if len(identifier) > 1 and identifier.startswith("0"):
+                raise UpdateError(f"发布版本格式无效：{value}")
+            prerelease.append((0, int(identifier)))
+        else:
+            prerelease.append((1, identifier))
+    return (
+        int(match.group(1)), int(match.group(2)), int(match.group(3)),
+        0 if suffix else 1, tuple(prerelease),
+    )
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:

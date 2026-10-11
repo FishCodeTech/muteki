@@ -10,7 +10,7 @@ export type ThreadMode = "conversation" | "single_task" | "competition" | "manag
 export type InjectionKind = "mcp" | "native_tool" | "acp_mcp_config" | "agent_plugin" | "runtime_plugin" | "http_jsonrpc" | "cli_skill";
 
 /** 统一 AgentEvent 事件类型（任务书 6.7，含 plan.updated）。 */
-export type AgentEventType = "session.started" | "session.resumed" | "session.closed" | "turn.started" | "turn.completed" | "turn.failed" | "message.delta" | "message.completed" | "reasoning.summary" | "tool.started" | "tool.progress" | "tool.completed" | "approval.requested" | "approval.resolved" | "user_input.requested" | "user_input.resolved" | "artifact.created" | "workspace.changed" | "usage.updated" | "plan.updated" | "agent.updated" | "runtime.capabilities_updated" | "runtime.warning" | "runtime.error" | "runtime.exited";
+export type AgentEventType = "session.started" | "session.resumed" | "session.closed" | "turn.started" | "turn.completed" | "turn.failed" | "message.delta" | "message.completed" | "reasoning.summary" | "tool.started" | "tool.progress" | "tool.completed" | "approval.requested" | "approval.resolved" | "user_input.requested" | "user_input.resolved" | "artifact.created" | "workspace.changed" | "usage.updated" | "compaction.updated" | "plan.updated" | "agent.updated" | "runtime.capabilities_updated" | "runtime.warning" | "runtime.error" | "runtime.exited";
 
 /** 命令回执状态。 */
 export type ReceiptState = "accepted" | "running" | "waiting" | "completed" | "failed" | "conflict" | "cancelled";
@@ -358,6 +358,7 @@ export interface AgentCapabilities {
   permission_modes?: string[];
   sandbox_modes?: string[];
   compaction?: boolean;
+  context_usage?: boolean;
   transport_kind?: string;
   protocol_version?: string;
   runtime_version?: string;
@@ -383,7 +384,9 @@ export interface SessionOptions {
   env?: Record<string, unknown>;
   chat_tools?: ToolDescription[] | null;
   chat_control_enabled?: boolean;
+  host_context?: ContextPart[];
   resume_prompt?: string;
+  resume_context?: ContextPart[];
   plugins?: Record<string, unknown>[];
   skills?: "all" | string[] | null;
   hooks?: Record<string, unknown>;
@@ -392,12 +395,15 @@ export interface SessionOptions {
   fork_session?: boolean;
   chat_native_plugins?: Record<string, unknown>[];
   chat_hook_approvals?: Record<string, unknown>;
+  native_rollout_path?: string;
   fork_from?: string;
   fork_last_turn_id?: string;
   role?: string;
   add_dirs?: string[];
   ephemeral?: boolean;
   session_dir?: string;
+  chat_native_extensions?: string[];
+  chat_native_agents?: string[];
   title?: string | null;
   timeout_s?: number | null;
   web_access?: boolean;
@@ -451,11 +457,22 @@ export interface AttachmentRef {
   content_base64?: string;
 }
 
+/** Context Muteki adds next to the user's own message. */
+export interface ContextPart {
+  schema_version?: number;
+  key: string;
+  kind: "host_instructions" | "reference" | "attachment_manifest" | "history_handoff";
+  trust: "application" | "untrusted";
+  text: string;
+  requires_gateway?: boolean;
+}
+
 /** Structured side data of an ordinary user message. */
 export interface MessagePayload {
   schema_version?: number;
   attachments?: AttachmentRef[];
-  capability_context?: string;
+  context_parts?: ContextPart[];
+  native_command?: boolean;
   runtime_capability?: Record<string, unknown>;
   runtime_command_arguments?: string;
   client_user_message_id?: string;

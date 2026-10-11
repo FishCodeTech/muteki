@@ -38,6 +38,7 @@ class AgentEventType(str, Enum):
     ARTIFACT_CREATED = "artifact.created"
     WORKSPACE_CHANGED = "workspace.changed"
     USAGE_UPDATED = "usage.updated"
+    COMPACTION_UPDATED = "compaction.updated"
     PLAN_UPDATED = "plan.updated"
     AGENT_UPDATED = "agent.updated"
     RUNTIME_CAPABILITIES_UPDATED = "runtime.capabilities_updated"
@@ -120,6 +121,10 @@ class AgentCapabilities(ContractModel):
     # C27: Native context compaction (Claude /compact, Codex compact turn).
     # When True the adapter can handle a compact command; False/absent = unknown.
     compaction: bool = False
+    # The adapter reports context-window occupancy through
+    # ``UsagePayload.context_used_tokens``. False means the engine exposes no
+    # occupancy signal, so the UI states that instead of estimating one.
+    context_usage: bool = False
     # 传输形态，例如 cli / sdk / rpc / acp / http
     transport_kind: str = ""
     protocol_version: str = ""
@@ -155,6 +160,34 @@ class SessionOptionsError(Exception):
             f"{self.code}: unsupported session option(s): {', '.join(self.unknown_keys)}")
 
 
+ContextPartKind = Literal[
+    "host_instructions", "reference", "attachment_manifest", "history_handoff"]
+
+
+class ContextPart(ContractModel):
+    """Context Muteki adds next to the user's own message.
+
+    The user's text always travels unchanged in ``MessageInput.text``. Every
+    part keeps its source (``key``), its role (``kind``) and whether it carries
+    host rules (``application``) or data the model must not obey as
+    instructions (``untrusted``), so each adapter can use a native channel and
+    every display can hide it.
+    """
+
+    key: str = Field(pattern=r"^muteki\.[a-z0-9][a-z0-9._-]*$")
+    kind: ContextPartKind
+    trust: Literal["application", "untrusted"]
+    text: str = Field(min_length=1)
+    # Instructions about the muteki-control gateway; dropped when the session
+    # receives no injection plan.
+    requires_gateway: bool = False
+
+    @property
+    def sha256(self) -> str:
+        from hashlib import sha256
+        return sha256(self.text.encode("utf-8")).hexdigest()
+
+
 class SessionOptions(ContractModel):
     """Every launch option an adapter may read from ``SessionStart.options``.
 
@@ -173,8 +206,13 @@ class SessionOptions(ContractModel):
     # Conversation chat plugin tools; None means the caller did not prepare any.
     chat_tools: Optional[list[ToolDescription]] = None
     chat_control_enabled: bool = True
-    # Prompt delivered by adapters that must restart a closed native session.
+    # Host rules for the whole session, delivered through the adapter's native
+    # system/application channel.
+    host_context: list[ContextPart] = Field(default_factory=list)
+    # User text delivered by adapters that must restart a closed native
+    # session, and the context parts (history handoff) sent with it.
     resume_prompt: str = ""
+    resume_context: list[ContextPart] = Field(default_factory=list)
     # Claude Agent SDK.
     plugins: list[dict[str, Any]] = Field(default_factory=list)
     skills: Union[Literal["all"], list[str], None] = "all"
@@ -185,6 +223,7 @@ class SessionOptions(ContractModel):
     # Codex App Server.
     chat_native_plugins: list[dict[str, str]] = Field(default_factory=list)
     chat_hook_approvals: dict[str, Any] = Field(default_factory=dict)
+    native_rollout_path: str = ""
     fork_from: str = ""
     fork_last_turn_id: str = ""
     # Pi / OMP RPC.
@@ -192,6 +231,8 @@ class SessionOptions(ContractModel):
     add_dirs: list[str] = Field(default_factory=list)
     ephemeral: bool = False
     session_dir: str = ""
+    chat_native_extensions: list[str] = Field(default_factory=list)
+    chat_native_agents: list[str] = Field(default_factory=list)
     # OpenCode.
     title: Optional[str] = None
     # Solver CLI driver.
@@ -268,8 +309,11 @@ class MessagePayload(ContractModel):
     """Structured side data of an ordinary user message."""
 
     attachments: list[AttachmentRef] = Field(default_factory=list)
-    # Extra reference context a CLI driver prepends to the prompt.
-    capability_context: str = ""
+    # Per-turn references, attachment manifest and history handoff.
+    context_parts: list[ContextPart] = Field(default_factory=list)
+    # ``text`` is a runtime-native command line: send it alone, without
+    # session host rules in the same text.
+    native_command: bool = False
     # Selected runtime capability item (RuntimeCapabilityItem dump plus
     # ``arguments`` / ``revision``); empty when the user typed plain text.
     runtime_capability: dict[str, Any] = Field(default_factory=dict)

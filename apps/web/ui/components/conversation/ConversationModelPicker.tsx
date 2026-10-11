@@ -4,6 +4,7 @@ import { ConversationRouteLink } from "@/components/conversation/ConversationNav
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { motion } from "motion/react";
 import { cn } from "@/lib/cn";
+import { runtimeAvailableForSelection } from "@/lib/conversationReadiness";
 import { useLang } from "@/lib/i18n";
 import {
   favoriteToggleAnnouncement,
@@ -86,6 +87,7 @@ function usableCredential(credential: ConversationCredential): boolean {
 
 function credentialTone(credential: ConversationCredential): Tone {
   const status = credential.status.toLowerCase();
+  if (credential.present === null) return "warning";
   if (credential.present === false || status === "missing" || status === "absent") return "neutral";
   if (!usableCredential(credential)) return "danger";
   if (credential.last_test && credential.last_test.ok === false) return "warning";
@@ -108,10 +110,11 @@ function engineTone(rows: ConversationCredential[]): Tone {
 function credentialStatusLabel(credential: ConversationCredential | undefined): string {
   if (!credential) return "";
   const status = credential.status.toLowerCase();
-  if (credential.present === false || status === "missing" || status === "absent") return "未登录";
   if (status === "unavailable" || status === "failed" || status === "invalid" || status === "error") {
     return credential.status_detail || "不可用";
   }
+  if (credential.detection_status === "unknown" || credential.present === null || status === "unknown") return "登录状态待确认";
+  if (credential.present === false || status === "missing" || status === "absent") return "未登录";
   return "";
 }
 
@@ -275,10 +278,15 @@ export function ConversationModelPicker({
       }),
     [credentials, descriptors, hiddenModels, selectedCredentialId, selectedModel],
   );
-  const availableCredentials = useMemo(
-    () => listedCredentials.filter(usableCredential),
-    [listedCredentials],
+  const availableRuntimes = useMemo(
+    () => runtimes?.filter((runtime) => runtimeAvailableForSelection(runtime, descriptors)),
+    [runtimes, descriptors],
   );
+  const availableCredentials = useMemo(() => {
+    const engines = availableRuntimes && new Set(availableRuntimes.map((runtime) => runtime.engine));
+    return listedCredentials.filter((credential) => usableCredential(credential)
+      && (!engines || engines.has(credential.engine)));
+  }, [listedCredentials, availableRuntimes]);
   // Exact selection only — never fall back for the trigger label. Falling back
   // made unbound threads (Provider import) look selected while send still
   // required an endpoint (#136). Browse fallback is for the open menu only.
@@ -290,16 +298,17 @@ export function ConversationModelPicker({
     () => boundCredential ? allCredentialModels(boundCredential).find((item) => item.id === selectedModel) || null : null,
     [boundCredential, selectedModel],
   );
-  const browseCredential = boundCredential || availableCredentials[0] || listedCredentials[0];
-  // Engine order first, usable accounts before unusable ones inside each engine.
+  const browseCredential = availableCredentials.find((item) => item.id === selectedCredentialId) || availableCredentials[0];
+  // Browse only usable accounts on enabled, available runtimes. Keep the bound
+  // credential above so an existing thread still displays its saved selection.
   const railGroups = useMemo(
     () => providerEngines(descriptors)
       .map((engine) => {
-        const rows = listedCredentials.filter((item) => item.engine === engine);
-        return { engine, rows: [...rows.filter(usableCredential), ...rows.filter((item) => !usableCredential(item))] };
+        const rows = availableCredentials.filter((item) => item.engine === engine);
+        return { engine, rows };
       })
       .filter((group) => group.rows.length > 0),
-    [descriptors, listedCredentials],
+    [descriptors, availableCredentials],
   );
   const tabOrder = useMemo(() => [FAVORITES_TAB, ...railGroups.map((group) => group.engine)], [railGroups]);
   const hasUnconfiguredEngines = providerEngines(descriptors).some((engine) => !listedCredentials.some((item) => item.engine === engine));
@@ -378,12 +387,12 @@ export function ConversationModelPicker({
 
   // Open on Favorites only when the current selection lives there; otherwise on its own Agent.
   // Re-run once a catalog that was still loading at open time arrives: the search box only mounts then.
-  const catalogReady = !loading && !error && listedCredentials.length > 0;
+  const catalogReady = !loading && !error && availableCredentials.length > 0;
   useEffect(() => {
     if (!open || !catalogReady) return;
     setQuery("");
-    const selectedIsFavorite = boundCredential && readFavoriteModels()
-      .some((item) => item.credentialId === boundCredential.id && item.modelId === selectedModel);
+    const selectedIsFavorite = browseCredential?.id === selectedCredentialId && readFavoriteModels()
+      .some((item) => item.credentialId === selectedCredentialId && item.modelId === selectedModel);
     setActiveTab(selectedIsFavorite || !browseCredential ? FAVORITES_TAB : browseCredential.engine);
     setEndpointByEngine(browseCredential ? { [browseCredential.engine]: browseCredential.id } : {});
     if (effortFocus) return;
@@ -535,7 +544,7 @@ export function ConversationModelPicker({
   // (or whose only endpoint needs attention); search and favorites span engines.
   const showEndpoints = Boolean(
     activeGroup && !searching && !favoritesMode
-    && (activeGroup.rows.length > 1 || activeGroup.rows.some((row) => !usableCredential(row))),
+    && (activeGroup.rows.length > 1 || activeGroup.rows.some((row) => Boolean(credentialStatusLabel(row)))),
   );
   const focusEndpoint = (id: string) => requestAnimationFrame(() => {
     endpointsRef.current?.querySelector<HTMLElement>(`[data-endpoint="${CSS.escape(id)}"]`)?.focus();
@@ -605,7 +614,7 @@ export function ConversationModelPicker({
     }
   };
 
-  const triggerUnavailable = Boolean(boundCredential && (!usableCredential(boundCredential) || (selectedModel && !boundModel)));
+  const triggerUnavailable = Boolean(boundCredential && (!availableCredentials.includes(boundCredential) || (selectedModel && !boundModel)));
   const triggerAria = boundCredential && (boundModel || selectedModel)
     ? `${engineLabel(boundCredential.engine)} · ${boundCredential.label} · ${boundModel?.label || selectedModel}${showEffort && effortSummary ? ` · ${effortSummary}` : ""}`
     : "选择模型";
@@ -939,8 +948,8 @@ export function ConversationModelPicker({
         <span className="mt-1.5 block"><SettingsLink /></span>
       </Callout>
     </div>
-  ) : listedCredentials.length === 0 ? (
-    <EmptyState compact icon="bot" title="未发现可用 Agent" description="先在设置中登录或添加一个 Agent 接入点。" action={<SettingsLink />} />
+  ) : availableCredentials.length === 0 ? (
+    <EmptyState compact icon="bot" title="未发现可用 Agent" description="请在设置中启用可用的 Agent 运行环境并登录接入点。" action={<SettingsLink />} />
   ) : (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col" data-narrow-stacked={narrowStacked || undefined}>
       {rail}
@@ -970,7 +979,7 @@ export function ConversationModelPicker({
     </div>
   );
 
-  const catalogShown = !loading && !error && listedCredentials.length > 0;
+  const catalogShown = !loading && !error && availableCredentials.length > 0;
 
   const effortSection = showEffort && catalogShown ? (
     <div ref={effortRef} className="shrink-0 border-t border-cx-border-subtle" data-testid="composer-effort-section">
@@ -989,20 +998,18 @@ export function ConversationModelPicker({
     </div>
   ) : null;
 
-  const runtimeCandidates = boundCredential ? (runtimes || []).filter((runtime) => runtime.engine === boundCredential.engine) : [];
+  const runtimeCandidates = boundCredential ? (availableRuntimes || []).filter((runtime) => runtime.engine === boundCredential.engine) : [];
   const showRuntime = variant === "conversation" && (runtimes !== undefined || onRuntimeChange !== undefined);
-  const allRuntimesDisabled = runtimeCandidates.length > 0 && !runtimeCandidates.some((runtime) => runtime.enabled !== false);
-  const runtimeDisabled = !onRuntimeChange || !boundCredential || boundCredential.present === false || allRuntimesDisabled
+  const runtimeDisabled = !onRuntimeChange || !boundCredential || boundCredential.present === false
     || !runtimeCandidates.length;
   const selectedRuntime = runtimeCandidates.find((runtime) => runtime.key === runtimeKey);
   const runtimeValue = selectedRuntime
     ? `${selectedRuntime.adapter_id} · ${selectedRuntime.instance_id}`
     : !boundCredential || boundCredential.present === false
       ? (en ? "Select a credential first" : "请先选择凭据")
-      : !runtimeCandidates.length ? (en ? "No Runtime for this Agent" : "此 Agent 没有 Runtime")
-        : allRuntimesDisabled ? (en ? "All Runtime instances are disabled" : "此 Agent 的 Runtime 均已停用")
-          : runtimeKey ? (en ? "Current Runtime unavailable; select again" : "当前 Runtime 不可用，请重新选择")
-            : (en ? "Select Runtime" : "选择 Runtime");
+      : !runtimeCandidates.length ? (en ? "No available Runtime for this Agent" : "此 Agent 没有可用 Runtime")
+        : runtimeKey ? (en ? "Current Runtime unavailable; select again" : "当前 Runtime 不可用，请重新选择")
+          : (en ? "Select Runtime" : "选择 Runtime");
   const runtimeNeedsAttention = !selectedRuntime && Boolean(runtimeKey) && !runtimeDisabled;
 
   const runtimeRow = showRuntime && catalogShown ? (
@@ -1013,7 +1020,7 @@ export function ConversationModelPicker({
         disabled={runtimeDisabled}
         onChange={(key) => {
           if (runtimeDisabled || key === runtimeKey) return;
-          const runtime = runtimeCandidates.find((row) => row.key === key && row.enabled !== false);
+          const runtime = runtimeCandidates.find((row) => row.key === key);
           if (runtime) onRuntimeChange?.(runtime.key);
         }}
         placement="top-end"
@@ -1040,13 +1047,11 @@ export function ConversationModelPicker({
           value: runtime.key,
           label: `${runtime.adapter_id} · ${runtime.instance_id}`,
           description: [
-            runtime.enabled === false ? (en ? "Disabled" : "已停用") : "",
             runtime.health?.healthy === true ? (en ? "Reported healthy" : "上报状态正常")
               : runtime.health?.healthy === false ? (en ? "Reported unhealthy" : "上报状态异常")
                 : (en ? "Not probed" : "未探测"),
             runtime.health?.detail || "",
           ].filter(Boolean).join(" · "),
-          disabled: runtime.enabled === false,
         }))}
       />
     </div>

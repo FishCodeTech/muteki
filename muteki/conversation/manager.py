@@ -79,6 +79,8 @@ from .models import (
     TURN_FAILED,
     TURN_INTERRUPTED,
     TURN_CANCELLED,
+    TURN_QUEUED,
+    TURN_RUNNING,
     TURN_KIND_EDIT_RESEND,
     TURN_KIND_RETRY,
     TURN_SUPERSEDED,
@@ -1327,7 +1329,7 @@ class ConversationManager:
         if (
             turn_id not in active_turn_ids
             or basis_turn is None
-            or basis_turn.status != TURN_COMPLETED
+            or basis_turn.status not in {TURN_QUEUED, TURN_RUNNING, TURN_COMPLETED}
         ):
             return None
 

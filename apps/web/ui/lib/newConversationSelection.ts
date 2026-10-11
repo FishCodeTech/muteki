@@ -1,7 +1,7 @@
 import type { ChatDefaultModel, ChatLastSelection, ProjectConvDefaults } from "./conversationDefaults";
 import type { ComposerLaunchSelection } from "./composerRestoreBinding";
 import type { ConversationCredential, RuntimeInstance } from "./useConversation";
-import { allModelIds, credentialAvailable, pickRuntimeForEngine } from "./conversationReadiness";
+import { allModelIds, credentialAvailable, pickRuntimeForEngine, runtimeAvailableForSelection } from "./conversationReadiness";
 import { readChatPreferences } from "./chatPreferences";
 import { credentialForRuntime, rememberedModelEffort, validModelEffort } from "./modelReasoning";
 import { descriptorForEngine, runtimeScopesModelCatalog, type ProviderDescriptorCatalog } from "./providerDescriptors";
@@ -19,7 +19,10 @@ export function resolveNewConversationSelection(input: {
   /** Defaults to the stored chat preference. */
   globalAccessMode?: string;
 }): ComposerLaunchSelection | null {
-  const available = input.credentials.filter(credentialAvailable);
+  const runtimes = input.runtimes.filter((runtime) => runtimeAvailableForSelection(runtime, input.descriptors));
+  const availableEngines = new Set(runtimes.map((runtime) => runtime.engine));
+  const available = input.credentials.filter((credential) => credentialAvailable(credential)
+    && availableEngines.has(credential.engine));
   const preferences = [input.project, input.configured, input.recent];
   const preferred = preferences.find((item) => item?.credentialId
     && available.some((row) => row.id === item.credentialId));
@@ -29,10 +32,10 @@ export function resolveNewConversationSelection(input: {
   const defaultAdapter = input.preferDefaultAdapter
     ? descriptorForEngine(input.descriptors, credential.engine)?.identity.default_adapter_id : "";
   const native = defaultAdapter
-    ? input.runtimes.filter((row) => row.adapter_id === defaultAdapter && row.enabled !== false) : [];
-  const runtime = input.runtimes.find((row) => row.key === recent?.runtimeKey
-    && row.engine === credential.engine && row.enabled !== false)
-    || input.runtimes.find((row) => row.key === pickRuntimeForEngine(credential.engine, native.length ? native : input.runtimes)?.key);
+    ? runtimes.filter((row) => row.adapter_id === defaultAdapter) : [];
+  const runtime = runtimes.find((row) => row.key === recent?.runtimeKey
+    && row.engine === credential.engine)
+    || runtimes.find((row) => row.key === pickRuntimeForEngine(credential.engine, native.length ? native : runtimes)?.key);
   const scoped = credentialForRuntime(
     credential, runtime?.key || "", runtimeScopesModelCatalog(input.descriptors, runtime?.key));
   const ids = allModelIds(scoped);

@@ -615,7 +615,7 @@ class CredentialAccountStore:
                 continue
             stable_id = system_credential_id(engine)
             detected = detect_system_login(engine)
-            present = detected == "present"
+            present = detected == "present" if detected in {"present", "absent"} else None
             last_test = self.last_test(stable_id, backend=environment, runtime_instance=str((catalogs.get(stable_id) or {}).get("runtime_instance") or "default"))
             status = (
                 "untested" if present else "missing" if detected == "absent"
@@ -647,6 +647,7 @@ class CredentialAccountStore:
                 "source": "system",
                 "connection": "official",
                 "credential_format": "host_login",
+                "detection_status": detected,
                 "provider": "",
                 "base_url": "",
                 "present": present,
@@ -820,14 +821,16 @@ class CredentialAccountStore:
             self._assert_local_credential(account_id)
         with self._account_guard():
             live = self.root / account_id
+            previous_revision = self.revision(account_id) if live.exists() else ""
             if create_only and live.exists():
                 raise FileExistsError("credential.account.already_exists")
-            if expected_revision is not None and self.revision(account_id) != expected_revision:
+            if expected_revision is not None and previous_revision != expected_revision:
                 raise FileExistsError("credential.account.revision_conflict")
             staging_root = Path(tempfile.mkdtemp(prefix=".credential-stage-", dir=self.root.parent))
             backup = staging_root / "previous"
             committed = False
             installed = False
+            test_status_before: dict[str, dict[str, Any]] | None = None
             try:
                 journal = staging_root / "transaction.json"
                 transaction = {"store_root": str(self.root.resolve()), "account_id": account_id,
@@ -840,7 +843,22 @@ class CredentialAccountStore:
                 staging._atomic_write = self._atomic_write
                 written = writer(staging)
                 prepared = staging.root / account_id
-                self._atomic_write(prepared / "REVISION", os.urandom(16).hex())
+                if live.exists() and self._account_material(prepared) == self._account_material(live):
+                    account = self.inspect(account_id)
+                    if account is None:
+                        raise OSError("credential.account.commit_unreadable")
+                    committed = True
+                    result = self._public(account)
+                    if isinstance(written, dict) and written.get("suggested_model"):
+                        result["suggested_model"] = written["suggested_model"]
+                    return result
+                preserve_test_status = (
+                    live.exists()
+                    and self._account_test_material(prepared)
+                    == self._account_test_material(live)
+                )
+                next_revision = os.urandom(16).hex()
+                self._atomic_write(prepared / "REVISION", next_revision)
                 transaction["phase"] = "prepared"
                 self._atomic_write(journal, json.dumps(transaction))
                 if live.exists():
@@ -852,7 +870,13 @@ class CredentialAccountStore:
                     if backup.exists():
                         backup.rename(live)
                     raise
-                self.invalidate_test_status(account_credential_id(account_id))
+                stable_id = account_credential_id(account_id)
+                if preserve_test_status:
+                    test_status_before = self._advance_test_status_revision(
+                        stable_id, previous_revision, next_revision)
+                    _invalidate_runtime_probes()
+                else:
+                    self.invalidate_test_status(stable_id)
                 account = self.inspect(account_id)
                 if account is None:
                     raise OSError("credential.account.commit_unreadable")
@@ -860,6 +884,8 @@ class CredentialAccountStore:
                 self._atomic_write(journal, json.dumps(transaction))
                 committed = True
                 result = self._public(account)
+                if preserve_test_status:
+                    result["test_status_preserved"] = True
                 if isinstance(written, dict) and written.get("suggested_model"):
                     result["suggested_model"] = written["suggested_model"]
                 return result
@@ -870,6 +896,9 @@ class CredentialAccountStore:
                     backup.rename(live)
                 elif installed and live.exists():
                     shutil.rmtree(live)
+                if test_status_before is not None:
+                    self._restore_test_status_rows(
+                        account_credential_id(account_id), test_status_before)
                 raise
             finally:
                 if committed or not backup.exists():
@@ -957,7 +986,6 @@ class CredentialAccountStore:
                 self._atomic_write(base / "PROVIDER", provider_name + "\n")
             refreshed = self.inspect(account_id)
             assert refreshed is not None
-            self.invalidate_test_status(account_credential_id(account_id))
             return self._public(refreshed)
 
         layout = "API_KEY" if engine == "api" else get_descriptor(engine).credentials.secret_file
@@ -1040,7 +1068,6 @@ class CredentialAccountStore:
 
         acct = self.inspect(account_id)
         assert acct is not None
-        self.invalidate_test_status(account_credential_id(account_id))
         return self._public(acct)
 
     def import_host_codex_auth(self, account_id: str) -> dict[str, Any]:
@@ -1468,6 +1495,108 @@ class CredentialAccountStore:
         except OSError:
             pass
 
+    @staticmethod
+    def _account_material(base: Path) -> dict[str, tuple[str, bytes]]:
+        """Return the persisted account content that defines its configuration.
+
+        REVISION records the transaction identity rather than account content.
+        Generated runtime directories are derived from the stored fields and may
+        be rebuilt during an otherwise identical save, so they do not make that
+        save a credential change.
+        """
+        material: dict[str, tuple[str, bytes]] = {}
+        ignored_roots = {"pi-agent", "omp-agent"}
+        for path in base.rglob("*"):
+            relative = path.relative_to(base)
+            if relative == Path("REVISION") or relative.parts[0] in ignored_roots:
+                continue
+            key = relative.as_posix()
+            if path.is_symlink():
+                material[key] = ("symlink", os.readlink(path).encode())
+            elif path.is_dir():
+                material[key] = ("directory", b"")
+            elif path.is_file():
+                content = path.read_bytes()
+                if relative == Path("MODELS.json"):
+                    try:
+                        content = json.dumps(
+                            json.loads(content.decode("utf-8")),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        pass
+                elif relative == Path("DEFAULT_MODEL"):
+                    content = content.strip()
+                material[key] = ("file", content)
+            else:
+                material[key] = ("other", b"")
+        return material
+
+    @classmethod
+    def _account_test_material(cls, base: Path) -> dict[str, tuple[str, bytes]]:
+        """Return only material that can change a real connectivity probe."""
+        metadata = {
+            "DEFAULT_MODEL",
+            "MODELS.json",
+            "PROVIDER",
+            "SHARED_CREDENTIAL.json",
+        }
+        return {
+            path: value
+            for path, value in cls._account_material(base).items()
+            if path not in metadata
+        }
+
+    def _advance_test_status_revision(
+        self,
+        credential_id: str,
+        previous_revision: str,
+        next_revision: str,
+    ) -> dict[str, dict[str, Any]]:
+        """Carry per-model evidence across a metadata-only account revision."""
+        stable_id = canonical_credential_id(credential_id)
+        statuses = self._read_test_statuses()
+        previous = {
+            key: dict(row)
+            for key, row in statuses.items()
+            if key == stable_id or key.startswith(stable_id + "\0")
+        }
+        changed = False
+        for key, original in list(statuses.items()):
+            if key != stable_id and not key.startswith(stable_id + "\0"):
+                continue
+            recorded_revision = str(
+                original.get("configuration_revision") or "")
+            if recorded_revision and recorded_revision != previous_revision:
+                continue
+            row = dict(original)
+            row["configuration_revision"] = next_revision
+            statuses[key] = row
+            changed = True
+        if changed:
+            self._atomic_write(
+                self._test_status_path,
+                json.dumps(statuses, ensure_ascii=False, indent=2),
+            )
+        return previous
+
+    def _restore_test_status_rows(
+        self,
+        credential_id: str,
+        previous: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        stable_id = canonical_credential_id(credential_id)
+        statuses = self._read_test_statuses()
+        for key in list(statuses):
+            if key == stable_id or key.startswith(stable_id + "\0"):
+                statuses.pop(key, None)
+        statuses.update({key: dict(row) for key, row in previous.items()})
+        self._atomic_write(
+            self._test_status_path,
+            json.dumps(statuses, ensure_ascii=False, indent=2),
+        )
+
     def _snapshot_material(self, account_id: str) -> dict[str, str]:
         """Read an existing account's stored secrets/markers before a rewrite.
 
@@ -1788,7 +1917,7 @@ def _opencode_credential_env(
             out["MUTEKI_OPENCODE_PROVIDER"] = provider_id
     elif source.get("OPENCODE_API_KEY"):
         out["OPENCODE_API_KEY"] = str(source["OPENCODE_API_KEY"])
-    if agent_state_dir is not None:
+    if agent_state_dir is not None and (container or base is not None):
         state_root = Path(agent_state_dir).expanduser().resolve()
         for dirname in ("data", "config", "cache"):
             (state_root / dirname).mkdir(parents=True, exist_ok=True)
@@ -1976,6 +2105,8 @@ def runtime_env_for_engine(
 ) -> RuntimeCredentialEnv:
     """Resolve credential env for one engine.
 
+    Local defaults use the system account unless an account override is set.
+    Container defaults retain the engine-main account contract.
     Container mode avoids sending secret values through `docker exec -e` when a
     file-backed account exists: it passes only `*_FILE` paths and lets the
     container shell export the real value inside the process. Local mode reads
@@ -1987,15 +2118,27 @@ def runtime_env_for_engine(
     # "fall back to the host env" — the old `env or os.environ` read host
     # secrets into resolutions that asked for an empty environment.
     source = env if env is not None else os.environ
+    configured_account = source.get(f"MUTEKI_{e.upper()}_ACCOUNT_ID") or source.get("MUTEKI_DEFAULT_ACCOUNT_ID")
+    selected_account = account_id is not None or bool(configured_account)
     if account_id is None:
-        account_id = engine_account_id(e, source)
+        account_id = engine_account_id(e, source) if container or configured_account else ""
     elif account_id != "" and not valid_account_id(account_id):
         account_id = engine_account_id(e, source)
     if not account_id and not container and not host_discovery_enabled(env):
         raise HostDiscoveryDisabledError("此服务未提供宿主登录发现；请选择已登记凭据")
+    if account_id and selected_account:
+        source = {}  # Explicit accounts cannot borrow ambient credentials.
     root = Path(account_root).expanduser().resolve() if account_root is not None else None
     base = root / account_id if root is not None and account_id else None
     out: dict[str, str] = {}
+    if not account_id and not container and (env is None or env is os.environ):
+        from muteki.core.runtime_env import native_user_environment
+        source = native_user_environment()
+        native_keys = ("HOME", "USERPROFILE", "USER", "LOGNAME", "XDG_CONFIG_HOME",
+                       "XDG_DATA_HOME", "XDG_CACHE_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR",
+                       "CURSOR_CONFIG_DIR", "GROK_HOME", "KIMI_CODE_HOME", "PI_CODING_AGENT_DIR",
+                       "MUTEKI_CHAT_PRIVATE_ROOT")
+        out.update({key: source[key] for key in native_keys if key in source})
 
     descriptor = find_descriptor(e)
     if descriptor is not None:
@@ -2012,6 +2155,8 @@ def runtime_env_for_engine(
             agent_state_container_path=agent_state_container_path,
         )
 
+    if account_id and not container:
+        out = {**credential_env_reset(e), **out}
     return RuntimeCredentialEnv(account_id=account_id, env=out)
 
 
@@ -2168,12 +2313,22 @@ async def detect_system_login_async(
     return await asyncio.to_thread(detect_system_login, engine, env, fresh=fresh)
 
 
+def _login_root(source: Mapping[str, str], env: Mapping[str, str] | None,
+                variable: str, relative: str) -> Path | None:
+    if source.get(variable):
+        return Path(source[variable])
+    home = source.get("HOME")
+    return Path(home) / relative if home else None
+
+
 def _login_status_droid(source: Mapping[str, str], env: Mapping[str, str] | None) -> str:
-    del env
     if source.get("FACTORY_API_KEY"):
         return "present"
     try:
-        path = Path.home() / ".factory" / "auth.v2.loginkeychain"
+        root = _login_root(source, env, "", ".factory")
+        if root is None:
+            return "unknown"
+        path = root / "auth.v2.loginkeychain"
         return "present" if path.is_file() else "absent"
     except OSError as exc:
         return _login_status_unknown("droid_login", exc)
@@ -2182,7 +2337,9 @@ def _login_status_droid(source: Mapping[str, str], env: Mapping[str, str] | None
 def _login_status_devin_cli(source: Mapping[str, str], env: Mapping[str, str] | None) -> str:
     from muteki.external_agents.devin import devin_login_status
 
-    return devin_login_status(env=env)
+    if not (source.get("HOME") or source.get("XDG_DATA_HOME") or source.get("WINDSURF_API_KEY")):
+        return "unknown"
+    return devin_login_status(env=source)
 
 
 def _login_status_unknown(probe: str, exc: BaseException) -> str:
@@ -2198,8 +2355,17 @@ def _login_status_claude_oauth(source: Mapping[str, str], env: Mapping[str, str]
             or source.get("ANTHROPIC_API_KEY")):
         return "present"
     try:
+        if env is not None:
+            root = _login_root(source, env, "CLAUDE_CONFIG_DIR", ".claude")
+            if root is None:
+                return "unknown"
+            path = root / ".credentials.json"
+            if not path.exists():
+                return "absent"
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return "present" if (data.get("claudeAiOauth") or data).get("accessToken") else "absent"
         from muteki.solver.cli_driver import _claude_oauth  # lazy: avoid cycle
-        return "present" if _claude_oauth() is not None else "absent"
+        return "present" if _claude_oauth(dict(source)) is not None else "absent"
     except Exception as exc:  # noqa: BLE001 — status contract; attribution logged
         return _login_status_unknown("claude_oauth", exc)
 
@@ -2210,8 +2376,9 @@ def _login_status_codex_auth_json(source: Mapping[str, str], env: Mapping[str, s
     try:
         # An explicit CODEX_HOME is authoritative — don't also fall back to
         # ~/.codex (that would let a host login mask an empty CODEX_HOME).
-        codex_home = source.get("CODEX_HOME")
-        root = Path(codex_home) if codex_home else (Path.home() / ".codex")
+        root = _login_root(source, env, "CODEX_HOME", ".codex")
+        if root is None:
+            return "unknown"
         return "present" if (root / "auth.json").exists() else "absent"
     except (OSError, RuntimeError) as exc:
         return _login_status_unknown("codex_auth_json", exc)
@@ -2221,15 +2388,19 @@ def _login_status_cursor_session(source: Mapping[str, str], env: Mapping[str, st
     if source.get("CURSOR_API_KEY"):
         return "present"
     try:
+        if env is not None:
+            return "unknown"  # No scoped keychain detector is available.
         from muteki.solver.cli_driver import _cursor_session_cookie  # lazy
-        return "present" if _cursor_session_cookie() is not None else "absent"
+        return "present" if _cursor_session_cookie(dict(source)) is not None else "absent"
     except Exception as exc:  # noqa: BLE001 — status contract; attribution logged
         return _login_status_unknown("cursor_session", exc)
 
 
 def _login_status_pi_agent_files(source: Mapping[str, str], env: Mapping[str, str] | None) -> str:
     try:
-        root = Path.home() / ".pi" / "agent"
+        root = _login_root(source, env, "PI_CODING_AGENT_DIR", ".pi/agent")
+        if root is None:
+            return "unknown"
         return ("present"
                 if (root / "auth.json").exists() or (root / "models.json").exists()
                 else "absent")
@@ -2239,7 +2410,10 @@ def _login_status_pi_agent_files(source: Mapping[str, str], env: Mapping[str, st
 
 def _login_status_omp_agent_dir(source: Mapping[str, str], env: Mapping[str, str] | None) -> str:
     try:
-        return "present" if (Path.home() / ".omp" / "agent").exists() else "absent"
+        root = _login_root(source, env, "PI_CODING_AGENT_DIR", ".omp/agent")
+        if root is None:
+            return "unknown"
+        return "present" if root.exists() else "absent"
     except (OSError, RuntimeError) as exc:
         return _login_status_unknown("omp_agent_dir", exc)
 
@@ -2248,7 +2422,9 @@ def _login_status_kimi_credentials(source: Mapping[str, str], env: Mapping[str, 
     if source.get("KIMI_MODEL_API_KEY") and source.get("KIMI_MODEL_NAME"):
         return "present"
     try:
-        root = Path.home() / ".kimi-code"
+        root = _login_root(source, env, "KIMI_CODE_HOME", ".kimi-code")
+        if root is None:
+            return "unknown"
         return (
             "present"
             if (root / "credentials" / "kimi-code.json").exists()
@@ -2262,7 +2438,9 @@ def _login_status_grok_auth_json(source: Mapping[str, str], env: Mapping[str, st
     if source.get("XAI_API_KEY"):
         return "present"
     try:
-        root = Path.home() / ".grok"
+        root = _login_root(source, env, "GROK_HOME", ".grok")
+        if root is None:
+            return "unknown"
         return "present" if (root / "auth.json").exists() else "absent"
     except (OSError, RuntimeError) as exc:
         return _login_status_unknown("grok_auth_json", exc)
@@ -2272,7 +2450,10 @@ def _login_status_opencode_auth(source: Mapping[str, str], env: Mapping[str, str
     if source.get("OPENCODE_API_KEY") or source.get("OPENAI_API_KEY"):
         return "present"
     try:
-        return ("present" if (Path.home() / ".local" / "share" / "opencode" / "auth.json").exists()
+        root = _login_root(source, env, "XDG_DATA_HOME", ".local/share")
+        if root is None:
+            return "unknown"
+        return ("present" if (root / "opencode" / "auth.json").exists()
                 else "absent")
     except (OSError, RuntimeError) as exc:
         return _login_status_unknown("opencode_auth", exc)
@@ -2298,7 +2479,11 @@ def _detect_system_login_uncached(
     descriptor = find_descriptor(e)
     if descriptor is None:
         return "unknown"
-    source = env if env is not None else os.environ
+    if env is None:
+        from muteki.core.runtime_env import native_user_environment
+        source = native_user_environment()
+    else:
+        source = env
     return _LOGIN_STATUS_PROBES[descriptor.login.status_probe](source, env)
 
 

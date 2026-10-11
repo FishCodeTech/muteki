@@ -80,6 +80,7 @@ from .approvals import (
     SessionApprovalGrants,
 )
 from .attachment_input import claude_query_prompt
+from .context_delivery import envelope_text_blocks, system_append
 from .capabilities import (
     CapabilityProbeReport,
     SOURCE_PROBE,
@@ -99,6 +100,7 @@ from muteki.platform.contracts.agent_events import (
     AgentUpdatedPayload,
     ApprovalRequestedPayload,
     ApprovalResolvedPayload,
+    CompactionPayload,
     FailureCategory,
     MessageCompletedPayload,
     MessageDeltaPayload,
@@ -318,6 +320,24 @@ def _cli_version(binary: str, *, timeout: float = 15.0) -> str:
     return lines[0].strip() if result.returncode == 0 and lines else ""
 
 
+def _token_value(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _context_occupancy(usage: Any) -> Optional[int]:
+    """Prompt plus output of one main-thread request: what the next request
+    starts from. Claude reports cache reads/writes outside ``input_tokens``."""
+    if not isinstance(usage, dict):
+        return None
+    values = [usage.get(key) for key in (
+        "input_tokens", "cache_read_input_tokens",
+        "cache_creation_input_tokens", "output_tokens")]
+    if not any(_token_value(value) for value in values):
+        return None
+    total = sum(value for value in values if _token_value(value))
+    return total or None
+
+
 def _jsonable(value: Any) -> Any:
     """把 SDK 消息里的原生对象（dataclass 等）转成 JSON 安全结构。
 
@@ -467,6 +487,8 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
     """
 
     context_compaction_events = True
+    host_context_channel = "system_prompt"
+    turn_context_channel = "claude_content_blocks"
 
     def __init__(
         self,
@@ -562,6 +584,11 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
         caps.subagents = report("subagents", True)
         caps.tool_events = report("tool_events", True)
         caps.usage_events = report("usage_events", True)
+        # Main-thread message usage plus ClaudeSDKClient.get_context_usage.
+        caps.context_usage = report("context_usage", callable(getattr(
+            getattr(sdk_mod, "ClaudeSDKClient", None), "get_context_usage", None)))
+        # Native /compact plus the compacting status and compact_boundary messages.
+        caps.compaction = report("compaction", True)
         # ClaudeSDKClient.query accepts multimodal user content blocks.
         caps.image_input = report("image_input", True)
         caps.permission_modes = list(PERMISSION_MODES)
@@ -742,6 +769,11 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
             kwargs["hooks"] = dict(options.hooks)
         if options.max_turns:
             kwargs["max_turns"] = options.max_turns
+        if options.host_context:
+            # The SDK forwards ``append`` as --append-system-prompt, keeping
+            # Claude Code's own system prompt.
+            kwargs["system_prompt"] = {"type": "preset", "preset": "claude_code",
+                                       "append": system_append(options.host_context)}
         if options.env:
             kwargs["env"] = {**self._default_env, **options.env}
         elif self._default_env:
@@ -1280,6 +1312,10 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
         ctx["turn_last_uuid"] = None
         ctx["streamed_kinds"] = {}
         ctx["stream_message_id"] = ""
+        # The "compacting" status carries no trigger; only compact_boundary does.
+        head = (input.text or "").lstrip().split(maxsplit=1)
+        ctx["manual_compact_turn"] = bool(head) and head[0] == "/compact"
+        ctx["compaction_running"] = False
         yield self.emit(build_event(
             AgentEventType.TURN_STARTED, seq, turn_id=turn_id,
             native_type="claude.sdk.query",
@@ -1336,7 +1372,9 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
                 return
 
         try:
-            prompt = await claude_query_prompt(input.text, input.payload.attachments)
+            prompt = await claude_query_prompt(
+                input.text, input.payload.attachments,
+                context_blocks=envelope_text_blocks(self.turn_context(sid, input, host=False)))
             await ctx["client"].query(prompt)
         except Exception as exc:  # noqa: BLE001
             yield self.emit(build_event(
@@ -1385,6 +1423,13 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
                             message=f"Claude SDK stream failed: {item}")),
                         **common))
                     break
+                if type(item).__name__ == "ResultMessage" and not getattr(item, "is_error", False):
+                    # Authoritative occupancy (the CLI's own /context figure)
+                    # must land before the terminal event closes the turn.
+                    context_event = await self._context_usage_event(
+                        ctx, seq, common, turn_id, item)
+                    if context_event is not None:
+                        yield self.emit(context_event)
                 events, terminal = self._map_message(
                     item, ctx, seq, common, turn_id)
                 terminal_seen = terminal_seen or terminal
@@ -1403,6 +1448,39 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
                     await ctx["client"].disconnect()
             finally:
                 ctx["current_turn_id"] = None
+
+    async def _context_usage_event(
+        self, ctx: dict[str, Any], seq: Any, common: dict[str, Any],
+        turn_id: str, result: Any,
+    ) -> Optional[AgentEvent]:
+        windows = {
+            usage.get("contextWindow") for usage in (getattr(result, "model_usage", None) or {}).values()
+            if isinstance(usage, dict) and _token_value(usage.get("contextWindow"))
+        }
+        if len(windows) == 1:
+            ctx["context_window"] = windows.pop()
+        native = "claude.sdk.get_context_usage"
+        try:
+            usage = await asyncio.wait_for(ctx["client"].get_context_usage(), timeout=15)
+        except Exception as exc:  # noqa: BLE001 — reported, the turn itself succeeded
+            return build_event(
+                AgentEventType.RUNTIME_WARNING, seq, turn_id=turn_id, native_type=native,
+                payload=RuntimeWarningPayload(
+                    kind="degraded", code="claude.context_usage_unavailable",
+                    message=f"Claude get_context_usage failed: {type(exc).__name__}: {exc}"),
+                **common)
+        used = usage.get("totalTokens") if isinstance(usage, dict) else None
+        window = usage.get("rawMaxTokens") if isinstance(usage, dict) else None
+        if _token_value(window) and window > 0:
+            ctx["context_window"] = window
+        if not _token_value(used):
+            return None
+        ctx["context_used"] = used
+        return build_event(
+            AgentEventType.USAGE_UPDATED, seq, turn_id=turn_id, native_type=native,
+            payload=UsagePayload(scope="context_only", context_used_tokens=used,
+                                 context_window=ctx.get("context_window")),
+            **{**common, **({"external_session_id": ctx["session_id"]} if ctx.get("session_id") else {})})
 
     # -- SDK 消息 → 统一 AgentEvent 映射 -------------------------------------------
 
@@ -1434,9 +1512,28 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
             if subtype in {"status", "init"} and isinstance(reported_mode, str) and reported_mode:
                 # Claude can change its own mode (EnterPlanMode); trust what it reports.
                 ctx["applied_permission_mode"] = reported_mode
+            if subtype == "status" and data.get("status") == "compacting":
+                # Claude repeats the status while one compaction runs.
+                if ctx.get("compaction_running"):
+                    return [], False
+                ctx["compaction_running"] = True
+                return [ev(AgentEventType.COMPACTION_UPDATED, dump_payload(
+                    CompactionPayload(status="started",
+                                      trigger="manual" if ctx.get("manual_compact_turn") else "auto")),
+                    native="claude.system.status")], False
             if subtype == "compact_boundary":
+                ctx["compaction_running"] = False
                 self._context_compacted(common["agent_session_id"])
-                return [], False
+                meta = data.get("compact_metadata") or {}
+                before = meta.get("pre_tokens")
+                after = meta.get("post_tokens")
+                return [ev(AgentEventType.COMPACTION_UPDATED, dump_payload(
+                    CompactionPayload(
+                        status="completed",
+                        trigger="manual" if meta.get("trigger") == "manual" else "auto",
+                        tokens_before=before if _token_value(before) else None,
+                        tokens_after=after if _token_value(after) else None)),
+                    native="claude.system.compact_boundary")], False
             if subtype == "init":
                 session_id = str(data.get("session_id") or "")
                 ctx["init_native"] = data
@@ -1490,6 +1587,13 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
             parent = str(getattr(message, "parent_tool_use_id", "") or "")
             if not parent and getattr(message, "uuid", None):
                 ctx["turn_last_uuid"] = str(message.uuid)
+            used = None if parent else _context_occupancy(getattr(message, "usage", None))
+            if used is not None and used != ctx.get("context_used"):
+                ctx["context_used"] = used
+                events.append(ev(AgentEventType.USAGE_UPDATED, dump_payload(UsagePayload(
+                    scope="context_only", context_used_tokens=used,
+                    context_window=ctx.get("context_window"))),
+                    native="claude.assistant.usage"))
             streamed = ctx.get("streamed_kinds", {}).get(
                 str(getattr(message, "message_id", "") or ""), set())
             for block in (getattr(message, "content", None) or []):

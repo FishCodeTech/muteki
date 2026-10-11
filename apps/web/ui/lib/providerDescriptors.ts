@@ -41,6 +41,8 @@ export interface ProviderCapabilities {
   plan_mode: boolean;
   image_input: boolean;
   compaction: boolean;
+  /** The Runtime reports real context-window occupancy (never derived from cumulative usage). */
+  context_usage: boolean;
   supported_models: string[];
   supported_efforts: string[];
   access_modes: string[];

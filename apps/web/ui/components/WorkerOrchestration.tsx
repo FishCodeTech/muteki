@@ -148,7 +148,7 @@ function engineEffortLevels(catalog: Catalog, engine: Engine): string[] {
 const CTF_AUTO_CONCURRENCY = 3;
 
 const DEFAULT_REVIEW: ReviewPolicy = {
-  enabled: true,
+  enabled: false,
   engine: "",
   timeout: 90,
   after_race: false,
@@ -167,7 +167,7 @@ const DEFAULT_REVIEW: ReviewPolicy = {
 };
 
 const DEFAULT_VERIFIER: VerifierPolicy = {
-  enabled: true,
+  enabled: false,
   engine: "",
   timeout: 240,
   max_concurrent: 0,
@@ -293,7 +293,7 @@ function legacyIdentity(config: WorkerSettings, catalog: Catalog): {
   seats: Seat[];
   credentials: Credential[];
 } {
-  if (config.seats?.length) {
+  if (Array.isArray(config.seats)) {
     return {
       seats: config.seats.map((item) => ({
         ...item,
@@ -731,7 +731,7 @@ function RosterWorkspace({
             onOpenMenu={(point) => openContextMenu(seat, point)}
           />
         )) : (
-          <div className="wroster-empty"><Icon name="grid" size={22} /><strong>还没有普通 Worker</strong><span>从上方选择一个 Worker 程序加入阵容。</span></div>
+          <div className="wroster-empty"><Icon name="grid" size={22} /><strong>还没有普通 Worker</strong><span>先在 Agent 凭据中配置账号，再从上方添加 Worker。</span></div>
         )}
       </div>
 
@@ -740,7 +740,7 @@ function RosterWorkspace({
         <Button type="button" variant="ghost" className="wreview-selection" aria-label="配置 Review Worker" aria-pressed={selectedInspector === "review"} onClick={onSelectReview}>
           <span className="wreview-slot-copy"><span className="wreview-symbol"><Icon name="eye" size={17} /></span><span><strong>Review Worker</strong><small>审查建议 · BTW 默认 Worker</small></span><Icon name="chevronRight" size={14} /></span>
           <span className="wreview-assigned">{reviewSeat?.label || "尚未指定 Worker"}</span>
-          <span className="wreview-slot-state">{reviewSeat ? <SelfCheckStatus enabled={Boolean(review.enabled && reviewSeat.enabled)} testing={testingIds.has(reviewSeat.id)} result={testResults[reviewSeat.id]} compact /> : <span>待配置</span>}<span>并发 1</span></span>
+          <span className="wreview-slot-state">{reviewSeat ? <SelfCheckStatus enabled={Boolean(review.enabled && reviewSeat.enabled)} testing={testingIds.has(reviewSeat.id)} result={testResults[reviewSeat.id]} compact /> : <span>{review.enabled ? "待配置" : "已停用"}</span>}<span>并发 1</span></span>
         </Button>
       </section>
 
@@ -748,7 +748,7 @@ function RosterWorkspace({
         <Button type="button" variant="ghost" className="wreview-selection" aria-label="配置 Verifier Worker" aria-pressed={selectedInspector === "verifier"} onClick={onSelectVerifier}>
           <span className="wreview-slot-copy"><span className="wreview-symbol"><Icon name="check" size={17} /></span><span><strong>Verifier Worker</strong><small>独立复现报告</small></span><Icon name="chevronRight" size={14} /></span>
           <span className="wreview-assigned">{verifierSeat?.label || "尚未指定 Worker"}</span>
-          <span className="wreview-slot-state">{verifierSeat ? <SelfCheckStatus enabled={Boolean(verifier.enabled && verifierSeat.enabled)} testing={testingIds.has(verifierSeat.id)} result={testResults[verifierSeat.id]} compact /> : <span>待配置</span>}<span>并发 {verifier.max_concurrent && verifier.max_concurrent > 0 ? verifier.max_concurrent : "按报告"}</span></span>
+          <span className="wreview-slot-state">{verifierSeat ? <SelfCheckStatus enabled={Boolean(verifier.enabled && verifierSeat.enabled)} testing={testingIds.has(verifierSeat.id)} result={testResults[verifierSeat.id]} compact /> : <span>{verifier.enabled ? "待配置" : "已停用"}</span>}<span>并发 {verifier.max_concurrent && verifier.max_concurrent > 0 ? verifier.max_concurrent : "按报告"}</span></span>
         </Button>
       </section>
 
@@ -1060,7 +1060,7 @@ function ReviewInspector({
       <section className="wset-form-section">
         <h3>Review 配置</h3>
         <p className="wsettings-inline-note"><Icon name="info" size={13} />仅 Pentest 生效，占用 1 个总并发名额；同时作为 BTW 默认 Worker。</p>
-        <div className="wset-switch-row"><span><b>启用 Review</b><small>按触发条件启动独立审查进程</small></span><Switch size="sm" aria-label="启用 Review" isSelected={review.enabled ?? true} onChange={(enabled) => onReview({ enabled })}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></div>
+        <div className="wset-switch-row"><span><b>启用 Review</b><small>按触发条件启动独立审查进程</small></span><Switch size="sm" aria-label="启用 Review" isSelected={review.enabled ?? false} onChange={(enabled) => onReview({ enabled })}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></div>
         <label><span>使用 Worker</span><Select aria-label="Review Worker" selectedKey={review.engine || ""} onSelectionChange={(key) => onReview({ engine: String(key) })}><Select.Trigger><Select.Value /></Select.Trigger><Select.Popover><ListBox><ListBoxItem id="">选择 Worker</ListBoxItem>{options.map((seat) => <ListBoxItem key={seat.id} id={seat.id} isDisabled={!seat.enabled}>{seat.label} · {credentials.find((item) => item.id === seat.credential_id)?.secret_ref || "系统登录"}{seat.enabled ? "" : " · 已停用"}</ListBoxItem>)}</ListBox></Select.Popover></Select></label>
         <div className="wset-binding-help"><span>并发固定为 1</span><Button type="button" onClick={onCreateDedicated}>创建独立配置</Button></div>
         <ReasoningEffortSelect engine={selectedEngine} model={selected?.model || ""} options={modelOptions} value={review.reasoning_effort || "inherit"} inherit onChange={(reasoning_effort) => onReview({ reasoning_effort })} />
@@ -1173,7 +1173,7 @@ function VerifierInspector({
       <section className="wset-form-section">
         <h3>Verifier 配置</h3>
         <p className="wsettings-inline-note"><Icon name="info" size={13} />仅 Pentest 生效，独立复现报告并占用总并发名额。</p>
-        <div className="wset-switch-row"><span><b>启用 Verifier</b><small>独立复现已提交报告</small></span><Switch size="sm" aria-label="启用 Verifier" isSelected={verifier.enabled ?? true} onChange={(enabled) => onVerifier({ enabled })}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></div>
+        <div className="wset-switch-row"><span><b>启用 Verifier</b><small>独立复现已提交报告</small></span><Switch size="sm" aria-label="启用 Verifier" isSelected={verifier.enabled ?? false} onChange={(enabled) => onVerifier({ enabled })}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></div>
         <label><span>使用 Worker</span><Select aria-label="Verifier Worker" selectedKey={verifier.engine || ""} onSelectionChange={(key) => onVerifier({ engine: String(key) })}><Select.Trigger><Select.Value /></Select.Trigger><Select.Popover><ListBox><ListBoxItem id="">选择 Worker</ListBoxItem>{options.map((seat) => <ListBoxItem key={seat.id} id={seat.id} isDisabled={!seat.enabled}>{seat.label} · {credentials.find((item) => item.id === seat.credential_id)?.secret_ref || "系统登录"}{seat.enabled ? "" : " · 已停用"}</ListBoxItem>)}</ListBox></Select.Popover></Select></label>
         <div className="wset-binding-help"><span>计入总并发上限</span><Button type="button" onClick={onCreateDedicated}>创建独立配置</Button></div>
         <ReasoningEffortSelect engine={selectedEngine} model={selected?.model || ""} options={modelOptions} value={verifier.reasoning_effort || "inherit"} inherit onChange={(reasoning_effort) => onVerifier({ reasoning_effort })} />
@@ -1887,22 +1887,15 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
   const updateSeat = useCallback((id: string, patch: Partial<Seat>) => {
     const seat = seats.find((item) => item.id === id);
     if (!seat) return;
+    const stoppedChannels: string[] = [];
     if (patch.enabled === false && seat.enabled) {
-      const dependencies = [
-        review.enabled && review.engine === id ? "Review" : "",
-        verifier.enabled && verifier.engine === id ? "Verifier" : "",
-      ].filter(Boolean);
-      if (dependencies.length) {
-        showFeedback(
-          `${seat.label} 正由 ${dependencies.join(" 和 ")} 使用，请先更换对应 Worker 或关闭该通道`,
-        );
-        return;
+      if (review.engine === id) {
+        if (review.enabled) stoppedChannels.push("Review");
+        setReview((current) => ({ ...current, enabled: false, engine: "" }));
       }
-      const isLastOrdinary = isOrdinarySeat(seat)
-        && seats.filter((item) => isOrdinarySeat(item) && item.enabled).length <= 1;
-      if (isLastOrdinary) {
-        showFeedback("至少保留一个启用的普通 Worker");
-        return;
+      if (verifier.engine === id) {
+        if (verifier.enabled) stoppedChannels.push("Verifier");
+        setVerifier((current) => ({ ...current, enabled: false, engine: "" }));
       }
     }
     setSeats((current) => current.map((item) => item.id === id ? { ...item, ...patch } : item));
@@ -1915,7 +1908,8 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
     }
     markDirty();
     if (typeof patch.enabled === "boolean" && patch.enabled !== seat.enabled) {
-      showFeedback(`${seat.label} 已暂存${patch.enabled ? "启用" : "停用"}，点击“保存配置”后生效`);
+      const channelNote = stoppedChannels.length ? `，同时关闭 ${stoppedChannels.join(" 和 ")}` : "";
+      showFeedback(`${seat.label} 已暂存${patch.enabled ? "启用" : "停用"}${channelNote}，点击“保存配置”后生效`);
     }
   }, [markDirty, review.enabled, review.engine, seats, showFeedback, verifier.enabled, verifier.engine]);
   const bindAccount = useCallback((id: string, key: string, resolvedCredential?: GlobalCredential) => {
@@ -1969,13 +1963,15 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
     setSeats(next);
     setSelectedId(next.find(isOrdinarySeat)?.id || next[0]?.id || null);
     if (review.engine === id) {
-      setReview((current) => ({ ...current, engine: next.find((seat) => canServeChannel(seat, "review") && seat.enabled)?.id || "" }));
+      setReview((current) => ({ ...current, enabled: false, engine: "" }));
     }
     if (verifier.engine === id) {
-      setVerifier((current) => ({ ...current, engine: next.find((seat) => canServeChannel(seat, "verifier") && seat.enabled)?.id || "" }));
+      setVerifier((current) => ({ ...current, enabled: false, engine: "" }));
     }
     markDirty();
-  }, [markDirty, review.engine, verifier.engine, seats]);
+    const stoppedChannels = [review.enabled && review.engine === id ? "Review" : "", verifier.enabled && verifier.engine === id ? "Verifier" : ""].filter(Boolean);
+    showFeedback(`Worker 已移除${stoppedChannels.length ? `，同时关闭 ${stoppedChannels.join(" 和 ")}` : ""}，点击“保存配置”后生效`);
+  }, [markDirty, review.enabled, review.engine, verifier.enabled, verifier.engine, seats, showFeedback]);
   const reorderSeats = useCallback((sourceId: string, targetId: string | null) => {
     setSeats((current) => {
       const ordinary = current.filter(isOrdinarySeat);
@@ -2230,21 +2226,8 @@ export function WorkerOrchestration({ defaultReturnTo = "/", navigation }: { def
   const save = async () => {
     if (!config) return;
     const enabledOrdinary = seats.filter((seat) => isOrdinarySeat(seat) && seat.enabled);
-    if (!enabledOrdinary.length) { setSaveState("error"); showFeedback("至少需要一个启用的普通 Worker"); return; }
-    const invalidBinding = seats.find((seat) => {
-      if (!seat.enabled) return false;
-      const legacyCredential = credentials.find((credential) => credential.id === seat.credential_id);
-      return !globalCredentialUsable(globalCredentialForLegacy(legacyCredential, availableCredentials));
-    });
-    if (invalidBinding) { setSaveState("error"); showFeedback(`${invalidBinding.label} 需要选择可用的全局凭据`); return; }
     if (review.enabled && !seats.some((seat) => seat.id === review.engine && seat.enabled && canServeChannel(seat, "review"))) { setSaveState("error"); showFeedback("Review 已启用，但没有指定可用 Worker"); return; }
     if (verifier.enabled && !seats.some((seat) => seat.id === verifier.engine && seat.enabled && canServeChannel(seat, "verifier"))) { setSaveState("error"); showFeedback("Verifier 已启用，但没有指定可用 Worker"); return; }
-    const invalidLlm = (["planner", "titler"] as const).find((which) => {
-      const profile = llmProfiles[which];
-      const selectedEndpoint = modelEndpoints.find((endpoint) => endpoint.id === (profile.endpoint_id || profile.credential_id));
-      return !selectedEndpoint?.present || !profile.model.trim();
-    });
-    if (invalidLlm) { setSaveState("error"); showFeedback(`${invalidLlm === "planner" ? "Reason / Planner" : "Titler"} 需要选择可用的模型端点和端点模型`); return; }
     const invalidTemperature = (["planner", "titler"] as const).find((which) => {
       const profile = llmProfiles[which];
       if (llmTemperatureMode(profile) !== "custom") return false;

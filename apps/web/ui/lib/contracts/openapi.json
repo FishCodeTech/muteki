@@ -1151,6 +1151,47 @@
         "title": "RunRetentionPolicyBody",
         "type": "object"
       },
+      "RuntimePrewarmBody": {
+        "description": "新对话尚未发送时，预先启动所选 Runtime 的空闲进程。",
+        "properties": {
+          "adapter_id": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Adapter Id",
+            "type": "string"
+          },
+          "credential_id": {
+            "default": "",
+            "maxLength": 200,
+            "title": "Credential Id",
+            "type": "string"
+          },
+          "instance_id": {
+            "default": "",
+            "maxLength": 120,
+            "title": "Instance Id",
+            "type": "string"
+          },
+          "model": {
+            "default": "",
+            "maxLength": 200,
+            "title": "Model",
+            "type": "string"
+          },
+          "workspace_id": {
+            "maxLength": 160,
+            "minLength": 1,
+            "title": "Workspace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "adapter_id",
+          "workspace_id"
+        ],
+        "title": "RuntimePrewarmBody",
+        "type": "object"
+      },
       "ShareCreateRequest": {
         "properties": {
           "access_mode": {
@@ -4272,6 +4313,47 @@
           }
         },
         "summary": "Put Conversation Preferences",
+        "tags": [
+          "conversation"
+        ]
+      }
+    },
+    "/api/conversation/runtime-prewarm": {
+      "post": {
+        "operationId": "runtime_prewarm_api_conversation_runtime_prewarm_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuntimePrewarmBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Runtime Prewarm Api Conversation Runtime Prewarm Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Runtime Prewarm",
         "tags": [
           "conversation"
         ]
@@ -9717,52 +9799,9 @@
         ]
       }
     },
-    "/api/threads/{thread_id}/compact": {
-      "post": {
-        "description": "Invoke the verified native operation, then publish actual completion.",
-        "operationId": "compact_thread_api_threads__thread_id__compact_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "thread_id",
-            "required": true,
-            "schema": {
-              "title": "Thread Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "title": "Response Compact Thread Api Threads  Thread Id  Compact Post"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Compact Thread",
-        "tags": [
-          "conversation"
-        ]
-      }
-    },
     "/api/threads/{thread_id}/events": {
       "get": {
-        "description": "Thread 事件流（SSE）。\n\n首帧 ``event: snapshot`` 携带 Thread 视图与水位（``watermark`` 为\n该 Thread 流头，``event_watermark`` 为全局日志水位）；随后\n``event: event`` 逐条下发 ``seq > after`` 的 Public Event。\n断线重连用最后收到的 seq 作为 ``after`` 参数即可不丢不重。",
+        "description": "Thread 事件流（SSE）。\n\n首帧 ``event: snapshot`` 携带 Thread 视图与水位（``watermark`` 为\n该 Thread 流头，``event_watermark`` 为全局日志水位）；随后\n``event: event`` 逐条下发 ``seq > after`` 的 Public Event。\n断线重连用最后收到的 seq 作为 ``after`` 参数即可不丢不重。\n新订阅（``after=0``）可传 ``tail=N``：只回放该 Thread 最近 N 条事件，\n且始终从进行中 Turn 的 ``core.turn.started`` 起完整回放该 Turn；\n更早的过程按需走 ``/turns/{turn_id}/process``。",
         "operationId": "thread_events_api_threads__thread_id__events_get",
         "parameters": [
           {
@@ -9802,6 +9841,16 @@
               "default": "",
               "title": "Browser Host",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tail",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "Tail",
+              "type": "integer"
             }
           }
         ],
@@ -10223,6 +10272,58 @@
           }
         },
         "summary": "Thread Git Push",
+        "tags": [
+          "conversation"
+        ]
+      }
+    },
+    "/api/threads/{thread_id}/images/raw": {
+      "get": {
+        "description": "Read an image from this Thread's project, chat, or computer-use folder.",
+        "operationId": "thread_image_raw_api_threads__thread_id__images_raw_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Thread Image Raw Api Threads  Thread Id  Images Raw Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Thread Image Raw",
         "tags": [
           "conversation"
         ]
@@ -10846,6 +10947,58 @@
           }
         },
         "summary": "Revoke"
+      }
+    },
+    "/api/threads/{thread_id}/turns/{turn_id}/context": {
+      "get": {
+        "description": "What Muteki sent beside the user's text in this turn (context ledger).",
+        "operationId": "get_turn_context_api_threads__thread_id__turns__turn_id__context_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "turn_id",
+            "required": true,
+            "schema": {
+              "title": "Turn Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Get Turn Context Api Threads  Thread Id  Turns  Turn Id  Context Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Turn Context",
+        "tags": [
+          "conversation"
+        ]
       }
     },
     "/api/threads/{thread_id}/turns/{turn_id}/process": {

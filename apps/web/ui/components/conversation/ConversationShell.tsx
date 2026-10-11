@@ -12,9 +12,8 @@
  * ───────────────────────────────────────────────────────── */
 
 import { ConversationRouteLink } from "@/components/conversation/ConversationNavigation";
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Button, Callout, Dialog, IconButton, Popover, TextField, Toaster, toast } from "@/components/chat/ui";
-import { RightPanel } from "@/components/chat/panel/RightPanel";
 import {
   PANEL_SHEET_BREAKPOINT,
   chatPanel,
@@ -25,6 +24,7 @@ import {
   allCredentialModels,
   createConversationProject,
   createConversationThread,
+  prewarmConversationRuntime,
   recoverCommandReceipt,
   bindConversationWorkspace,
   deleteConversationMemory,
@@ -42,6 +42,7 @@ import {
   fetchImpactPreview,
   fetchThreadAudit,
   useConversation,
+  useConversationStreamSelector,
   useConversationThreads,
   type ConversationCredential,
   type ConversationProject,
@@ -78,6 +79,7 @@ import {
   writeChatLastSelection,
 } from "@/lib/conversationDefaults";
 import { resolveNewConversationSelection } from "@/lib/newConversationSelection";
+import { useChatPreferences } from "@/lib/chatPreferences";
 import { projectDefaultPersistFeedback } from "@/lib/projectDefaultPersistFeedback";
 import { resolveComposerRuntimeBind } from "@/lib/conversationComposerBind";
 import { upsertConversationThread } from "@/lib/conversationInbox";
@@ -108,6 +110,7 @@ import {
   parseHttpStatus,
   pickRuntimeForEngine,
   primarySendBlock,
+  runtimeAvailableForSelection,
   RECENT_PATHS_STORAGE_KEY,
   sourceError,
   sourceLoading,
@@ -200,7 +203,13 @@ import { ConversationSidebar } from "./ConversationSidebar";
 import { ConversationHeader } from "./ConversationHeader";
 import { ConversationThreadDetails, useThreadDetailsState } from "./ConversationThreadDetails";
 import { ConversationHome } from "./ConversationHome";
-import { ConversationTimeline } from "./ConversationTimeline";
+import {
+  ConversationStreamBottomPanel,
+  ConversationStreamQuotaResume,
+  ConversationStreamRightPanel,
+  ConversationStreamTimeline,
+  useConversationRunningToolCount,
+} from "./ConversationStreamBindings";
 import { ConversationQueue } from "./ConversationQueue";
 import { ConversationDetailsDrawer, type DrawerDetailPayload } from "./ConversationDetailsDrawer";
 import { ConversationInfoDrawer } from "./ConversationInfoDrawer";
@@ -229,9 +238,7 @@ import {
   readConversationReadingPrefs,
   subscribeConversationReadingPrefs,
 } from "@/lib/conversationReadingPrefs";
-import { ConversationBottomPanel } from "./ConversationWorkspaceDock";
 import type { DiffBaselineRequest } from "./ConversationDiffSurface";
-import { collectConversationTools } from "./conversationEventViews";
 import { PromptBar } from "../ai-native/prompt-bar";
 import { LoadingState } from "../ai-native/loading-state";
 import { Icon } from "../Icon";
@@ -262,7 +269,23 @@ import { useSpeechInput } from "@/lib/useSpeechInput";
 import type { ResourceLinkTarget } from "@/lib/resourcePreview";
 import type { MessageAttachmentChip } from "./ConversationMessage";
 import { ThreadEditorProvider } from "./threadEditorContext";
-import { ConversationQuotaResume } from "./ConversationQuotaResume";
+
+const SIDEBAR_LIST_EVENT_TYPES = new Set([
+  "core.turn.completed",
+  "core.turn.failed",
+  "core.turn.interrupted",
+  "core.approval.requested",
+  "core.user_input.requested",
+]);
+
+/** Stable-identity function that always calls the latest `fn`; lets memoized children skip renders. */
+function useLatestCallback<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R {
+  const ref = useRef(fn);
+  useLayoutEffect(() => {
+    ref.current = fn;
+  });
+  return useCallback((...args: A) => ref.current(...args), []);
+}
 
 function credentialAvailable(credential: ConversationCredential): boolean {
   return credential.present !== false
@@ -310,13 +333,14 @@ function runtimeForEngine(
   runtimes: RuntimeInstance[],
   descriptors: ProviderDescriptorCatalog | null,
 ): RuntimeInstance | undefined {
+  const available = runtimes.filter((runtime) => runtimeAvailableForSelection(runtime, descriptors));
   // The desktop chat prefers the engine's default (structured) adapter over its CLI path.
   const defaultAdapter = desktopChatBridge() ? descriptorForEngine(descriptors, engine)?.identity.default_adapter_id : "";
   if (defaultAdapter) {
-    const native = runtimes.filter((row) => row.adapter_id === defaultAdapter && row.enabled !== false);
+    const native = available.filter((row) => row.adapter_id === defaultAdapter);
     if (native.length) return pickRuntimeForEngine(engine, native) as RuntimeInstance | undefined;
   }
-  return pickRuntimeForEngine(engine, runtimes) as RuntimeInstance | undefined;
+  return pickRuntimeForEngine(engine, available) as RuntimeInstance | undefined;
 }
 
 function pathBasename(path: string): string {
@@ -403,20 +427,21 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     };
   }, []);
 
-  const latestConversationEvent = conversation.events.at(-1);
-  const latestConversationEventId = latestConversationEvent?.event_id;
-  const latestConversationEventType = latestConversationEvent?.event_type;
+  const streamThreadId = conversation.view?.thread.thread_id;
+  // Batches may end with usage or delta events after the transition, so key
+  // off the newest list-relevant event rather than the newest event.
+  const latestListEventKey = useConversationStreamSelector(
+    conversation.stream,
+    streamThreadId,
+    (snapshot) => {
+      const event = snapshot.events.findLast((row) => SIDEBAR_LIST_EVENT_TYPES.has(row.event_type));
+      return event ? String(event.event_id || `${event.seq}:${event.event_type}`) : "";
+    },
+  );
   useEffect(() => {
-    if (!latestConversationEventType) return;
-    if (![
-      "core.turn.completed",
-      "core.turn.failed",
-      "core.turn.interrupted",
-      "core.approval.requested",
-      "core.user_input.requested",
-    ].includes(latestConversationEventType)) return;
+    if (!latestListEventKey) return;
     void refreshList();
-  }, [latestConversationEventId, latestConversationEventType, refreshList]);
+  }, [latestListEventKey, refreshList]);
 
   // Global settings & credentials
   const [credentialRows, setCredentials] = useState<ConversationCredential[]>([]);
@@ -436,10 +461,11 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         : sourceLoading()
   ), [descriptorState]);
   const credentials = useMemo(() => credentialRows.map(credential => {
-    const selected = runtimes.find(runtime => runtime.key === runtimeKey && runtime.engine === credential.engine && runtime.enabled !== false);
+    const selected = runtimes.find(runtime => runtime.key === runtimeKey && runtime.engine === credential.engine
+      && (threadId ? runtime.enabled !== false : runtimeAvailableForSelection(runtime, descriptors)));
     const runtime = selected || runtimeForEngine(credential.engine, runtimes, descriptors);
     return credentialForRuntime(credential, runtime?.key || "", runtimeScopesModelCatalog(descriptors, runtime?.key));
-  }), [credentialRows, credentialId, descriptors, runtimes, runtimeKey]);
+  }), [credentialRows, descriptors, runtimes, runtimeKey, threadId]);
   const restoredBindingContextRef = useRef<{ draftKey: string; projectId: string } | null>(null);
   const [probing, setProbing] = useState(false);
 
@@ -450,7 +476,21 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   const [serviceTier, setServiceTier] = useState("");
   useEffect(() => { setServiceTier(readPreferredServiceTier()); }, []);
   const [accessMode, setAccessMode] = useState("supervised");
+  const { defaultAccessMode } = useChatPreferences();
   const [interactionMode, setInteractionMode] = useState<InteractionMode>("default");
+  // Draft key whose picker values came from a real choice. A thread draft is
+  // ready only after its server runtime was applied; before that the controls
+  // hold reset placeholders that must not be saved as the user's selection.
+  const runtimeSyncedKeyRef = useRef("");
+  const draftRuntimeFields = useCallback((key: string, live: {
+    credentialId: string; runtimeKey: string; model: string; effort: string; accessMode: string;
+  }) => {
+    if (!key.startsWith("thread:") || runtimeSyncedKeyRef.current === key) {
+      return { credentialId: live.credentialId, runtimeKey: live.runtimeKey, model: live.model, effort: live.effort, accessMode: live.accessMode };
+    }
+    const stored = readComposerDraft(key);
+    return { credentialId: stored?.credentialId, runtimeKey: stored?.runtimeKey, model: stored?.model, effort: stored?.effort, accessMode: stored?.accessMode };
+  }, []);
 
   // Projects & workspace
   const [projects, setProjects] = useState<ConversationProject[]>([]);
@@ -682,13 +722,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     observer.observe(main);
     return () => observer.disconnect();
   }, []);
-  const panelTools = useMemo(() => {
-    const view = conversation.view;
-    if (!view) return [];
-    const statuses = Object.fromEntries((view.turns || []).map((turn) => [turn.turn_id, turn.status]));
-    return collectConversationTools(conversation.events, statuses);
-  }, [conversation.events, conversation.view]);
-  const runningToolCount = useMemo(() => panelTools.filter((tool) => tool.status === "running").length, [panelTools]);
+  const runningToolCount = useConversationRunningToolCount(conversation.stream, conversation.view);
 
   const bottomPanelPresence = useTransitionState(bottomPanelOpen, { durationVar: "--panel-close-dur", durationMs: 180 });
   useEffect(() => {
@@ -997,7 +1031,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       const bridge = desktopChatBridge();
       if (!token || !bridge?.acknowledgeClose) return;
       const snapshot = composerSnapshotRef.current;
-      if (conversationStorageScope() && composerStorageScopeRef.current === conversationStorageScope()) writeComposerDraft(snapshot.draftKey, { ...snapshot, promptSegments: snapshot.promptDocument.segments });
+      if (conversationStorageScope() && composerStorageScopeRef.current === conversationStorageScope()) writeComposerDraft(snapshot.draftKey, { ...snapshot, ...draftRuntimeFields(snapshot.draftKey, snapshot), promptSegments: snapshot.promptDocument.segments });
       void flushComposerAttachmentCache().then((cache) => {
         const results = [cache, flushComposerDraftStore(), flushComposerRecallStore(), flushUserInputDraftStore(), flushQueueEditDraftStore(), flushSendIntentStore(), flushTaskReceiptStore()];
         const errors = results.filter((row) => !row.persisted).map((row) => row.error || "草稿保存失败");
@@ -1037,7 +1071,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       window.removeEventListener("muteki:before-close", onClose);
       window.removeEventListener("muteki:attachment-cache", onCache);
     };
-  }, [startNewChat, setError, setNotice]);
+  }, [startNewChat, setError, setNotice, draftRuntimeFields]);
 
   // Restore the composer for the active draft key (thread or new-chat id).
   useEffect(() => {
@@ -1048,16 +1082,13 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         promptSegments: previous.promptDocument.segments,
         capabilityRefs: previous.capabilityRefs,
         attachments: previous.attachments,
-        credentialId: previous.credentialId,
-        runtimeKey: previous.runtimeKey,
-        model: previous.model,
-        effort: previous.effort,
-        accessMode: previous.accessMode,
+        ...draftRuntimeFields(previous.draftKey, previous),
         interactionMode: previous.interactionMode,
         projectId: previous.projectId,
       });
       flushComposerDraftStore();
     }
+    runtimeSyncedKeyRef.current = "";
     if (composerStorageScopeRef.current !== storageScope) {
       setCredentialId(""); setRuntimeKey(""); setModel(""); setEffort(""); setAccessMode("supervised"); setInteractionMode("default"); setProjectId("");
       pendingProjectIdRef.current = "";
@@ -1137,7 +1168,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       setHydratedDraftKey(draftKey);
     }, 0);
     return () => { restoring = false; window.clearTimeout(release); };
-  }, [draftKey, threadId, storageScope]);
+  }, [draftKey, threadId, storageScope, draftRuntimeFields]);
 
   // Persist composer state per draft key (debounced inside the store).
   useEffect(() => {
@@ -1161,15 +1192,12 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       promptSegments: promptDocument.segments,
       capabilityRefs,
       attachments,
-      credentialId,
-      runtimeKey,
-      model,
-      effort,
-      accessMode,
+      ...draftRuntimeFields(draftKey, { credentialId, runtimeKey, model, effort, accessMode }),
       interactionMode,
       projectId,
     });
   }, [
+    draftRuntimeFields,
     accessMode,
     interactionMode,
     attachments,
@@ -1550,9 +1578,11 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
 
   // A batch may contain completion followed by usage or the next queued turn.
   // Refresh from any newly observed completion, not only the final SSE event.
-  const completedModelTurnSeq = conversation.events.findLast(
-    (event) => event.event_type === "core.turn.completed",
-  )?.seq;
+  const completedModelTurnSeq = useConversationStreamSelector(
+    conversation.stream,
+    streamThreadId,
+    (snapshot) => snapshot.events.findLast((event) => event.event_type === "core.turn.completed")?.seq,
+  );
   useEffect(() => {
     if (completedModelTurnSeq === undefined) return;
     void loadCredentials({ silent: true });
@@ -1610,15 +1640,11 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       promptSegments: snap.promptDocument.segments,
       capabilityRefs: snap.capabilityRefs,
       attachments: snap.attachments,
-      credentialId: snap.credentialId,
-      runtimeKey: snap.runtimeKey,
-      model: snap.model,
-      effort: snap.effort,
-      accessMode: snap.accessMode,
+      ...draftRuntimeFields(snap.draftKey, snap),
       interactionMode: mode,
       projectId: snap.projectId,
     });
-  }, []);
+  }, [draftRuntimeFields]);
   const handleInteractionModeChange = useCallback((mode: InteractionMode) => {
     if (mode === "plan" && !planModeSupport.available) return;
     const previous = interactionMode;
@@ -1652,11 +1678,20 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   const viewServiceTier = viewRuntime?.service_tier || "";
   const viewAccessMode = viewRuntime?.access_mode || "supervised";
   const viewInteractionMode = viewRuntime?.interaction_mode || "";
+  const viewRuntimeUpdatedAt = viewRuntime?.updated_at || "";
   const viewMode = conversation.view?.thread.mode;
   const viewProjectId = conversation.view?.thread.project_id || "";
   useEffect(() => {
     if (!viewThreadId || viewThreadId !== threadId) return;
-    const stored = readComposerDraft(composerDraftKey(viewThreadId));
+    const saved = readComposerDraft(composerDraftKey(viewThreadId));
+    // A draft only outranks the thread runtime when its selection was chosen
+    // after the server's last runtime change; sending updates the runtime, so
+    // an older selection must not roll the picker back after the message went out.
+    const serverChangedAt = Date.parse(viewRuntimeUpdatedAt);
+    const draftChosenAt = saved ? (saved.runtimeUpdatedAt || saved.updatedAt) : 0;
+    const stored = saved && viewBound && Number.isFinite(serverChangedAt) && draftChosenAt < serverChangedAt
+      ? null
+      : saved;
     // Imported / unbound threads have empty view runtime. Prefer draft, then
     // view binding, then the same preferred credential the picker would show
     // so display and send readiness stay aligned (#136).
@@ -1679,7 +1714,9 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     setAccessMode(stored?.accessMode || viewAccessMode);
     if (viewMode) setMode(viewMode);
     setProjectId(viewProjectId);
+    runtimeSyncedKeyRef.current = composerDraftKey(viewThreadId);
   }, [
+    viewRuntimeUpdatedAt,
     threadId,
     credentials,
     runtimes,
@@ -1907,7 +1944,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   }) => {
     const credential = credentials.find((item) => item.id === params.credentialId);
     const runtime = credential
-      ? runtimes.find((row) => row.key === runtimeKey && row.engine === credential.engine && row.enabled !== false)
+      ? runtimes.find((row) => row.key === runtimeKey && row.engine === credential.engine && runtimeAvailableForSelection(row, descriptors))
         || runtimeForEngine(credential.engine, runtimes, descriptors)
       : undefined;
     const engineChanged = Boolean(
@@ -1940,7 +1977,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     if (owner.storageScope !== storageScope || conversationStorageScope() !== storageScope
       || owner.draftKey !== draftKey || owner.credentialId !== credentialId) return;
     const credential = credentialRows.find((row) => row.id === credentialId);
-    const runtime = runtimes.find((row) => row.key === nextKey && row.enabled !== false && row.engine === credential?.engine);
+    const runtime = runtimes.find((row) => row.key === nextKey && runtimeAvailableForSelection(row, descriptors) && row.engine === credential?.engine);
     if (!credential || !runtime || nextKey === runtimeKey) return;
     const scoped = credentialForRuntime(credential, nextKey, runtimeScopesModelCatalog(descriptors, nextKey));
     const selectedModel = allCredentialModels(scoped).find((row) => row.id === model);
@@ -2075,6 +2112,28 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     });
     return () => controller.abort();
   }, [composerCapabilityContext, storageScope]);
+  // Runtimes such as Droid spend many seconds booting before they accept the
+  // first request; start that process while the user is still typing.
+  const prewarmWorkspaceId = !threadId && mode === "conversation" && workspaceMode === "shared_checkout"
+    ? selectedProject?.workspace_id || "" : "";
+  useEffect(() => {
+    const adapterId = selectedRuntime?.adapter_id || "";
+    const credential = selectedCredential?.id || "";
+    if (!prewarmWorkspaceId || !adapterId || !credential || !model || hydratedDraftKey !== draftKey) return;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      void prewarmConversationRuntime({
+        adapter_id: adapterId,
+        instance_id: selectedRuntime?.instance_id || "default",
+        credential_id: credential,
+        model,
+        workspace_id: prewarmWorkspaceId,
+      }, controller.signal).catch((failure) => {
+        if (!controller.signal.aborted) console.warn("runtime prewarm failed", failure);
+      });
+    }, 800);
+    return () => { window.clearTimeout(timer); controller.abort(); };
+  }, [draftKey, hydratedDraftKey, model, prewarmWorkspaceId, selectedCredential?.id, selectedRuntime?.adapter_id, selectedRuntime?.instance_id]);
   const currentWorkspaceAccess = workspaceAccess?.context === composerCapabilityContext ? workspaceAccess : null;
   const accessModes = currentWorkspaceAccess?.modes || [];
   const accessModeReason = currentWorkspaceAccess?.notes[accessMode] || "已保存的权限模式在当前工作区不可用，请明确选择其他模式。";
@@ -2086,7 +2145,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   useEffect(() => {
     if (threadId || !selectedCredential || draftHydratingRef.current || hydratedDraftKey !== draftKey) return;
     setRuntimeKey((current) => {
-      const exact = runtimes.find((row) => row.key === current && row.engine === selectedCredential.engine && row.enabled !== false);
+      const exact = runtimes.find((row) => row.key === current && row.engine === selectedCredential.engine && runtimeAvailableForSelection(row, descriptors));
       return exact?.key || runtimeForEngine(selectedCredential.engine, runtimes, descriptors)?.key || "";
     });
     const modelIds = allCredentialModels(selectedCredential).map((m) => m.id);
@@ -2116,12 +2175,12 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     if (restoredContext?.draftKey === draftKey && restoredContext.projectId === projectId) return;
     const project = projects.find((p) => p.project_id === projectId);
     const projDefaults = readProjectConvDefaults(project?.settings as Record<string, unknown> | undefined);
-    const contextKey = JSON.stringify([draftKey, projectId, projDefaults]);
+    const contextKey = JSON.stringify([draftKey, projectId, projDefaults, defaultAccessMode]);
     if (appliedNewChatDefaultsRef.current === contextKey) return;
     const selection = resolveNewConversationSelection({
       credentials: credentialRows, runtimes, project: projDefaults,
       recent: readChatLastSelection(), configured: readChatDefaultModel(),
-      descriptors, preferDefaultAdapter: Boolean(desktopChatBridge()),
+      descriptors, preferDefaultAdapter: Boolean(desktopChatBridge()), globalAccessMode: defaultAccessMode,
     });
     if (!selection) return;
     appliedNewChatDefaultsRef.current = contextKey;
@@ -2130,7 +2189,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     setModel(selection.model);
     setEffort(selection.effort);
     setAccessMode(selection.accessMode);
-  }, [credentialRows, credentialSource.phase, descriptors, draftKey, hydratedDraftKey, projectId, projects, projectSource.phase, runtimes, runtimeSource.phase, threadId]);
+  }, [credentialRows, credentialSource.phase, defaultAccessMode, descriptors, draftKey, hydratedDraftKey, projectId, projects, projectSource.phase, runtimes, runtimeSource.phase, threadId]);
 
   const threadMatrix = useMemo(
     () => matrixFromRuntimeConnection(conversation.view?.runtime_connection),
@@ -2154,8 +2213,16 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
 
   // C38: only show a session rebuild response for the selection/session that
   // produced it; a late response from the previous provider cannot overwrite it.
+  const latestRuntimeSwitchEvent = useConversationStreamSelector(
+    conversation.stream,
+    streamThreadId,
+    (snapshot) => {
+      const latest = snapshot.events.at(-1);
+      return latest?.event_type === "core.thread.runtime_switched" ? latest : null;
+    },
+  );
   useEffect(() => {
-    if (latestConversationEventType !== "core.thread.runtime_switched") return;
+    if (!latestRuntimeSwitchEvent) return;
     const text = runtimeHandoffNotice({
       threadId,
       viewThreadId,
@@ -2163,11 +2230,11 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       credentialId,
       model,
       sessionId: conversation.view?.state.agent_session_id,
-      payload: (latestConversationEvent?.payload || {}) as Record<string, unknown>,
+      payload: (latestRuntimeSwitchEvent.payload || {}) as Record<string, unknown>,
     });
     if (text) setHandoffNotice(text);
   }, [
-    latestConversationEvent, latestConversationEventId, latestConversationEventType,
+    latestRuntimeSwitchEvent,
     threadId, viewThreadId, runtimeKey, credentialId, model,
     conversation.view?.state.agent_session_id, setHandoffNotice,
   ]);
@@ -2755,16 +2822,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
           lastError: "",
         });
         // Accepted receipt ≠ Agent completed — always use the recoverable wording.
-        const runtimeOperation = String(sendReceipt.output?.runtime_operation || "").trim();
-        if (runtimeOperation) {
-          const result = sendReceipt.output?.result as { message?: string } | undefined;
-          setNotice(result?.message || `已完成 /${runtimeOperation}`);
-          if (runtimeOperation !== "compact" && sendReceipt.output?.result) {
-            setDetailsPayload({ type: "tool", title: `/${runtimeOperation}`, output: sendReceipt.output.result });
-          }
-        } else {
-          setNotice(phaseNotice("accepted"), "accepted", sendReceipt.command_id);
-        }
+        setNotice(phaseNotice("accepted"), "accepted", sendReceipt.command_id);
         recordSentPrompt(composerDraftKey(target), {
           prompt: text,
           promptSegments: promptDocument.segments,
@@ -3511,6 +3569,34 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     }, "command", `${conversationStorageScope()}::${composerDraftKey(tId)}`);
   };
 
+  const sidebarSelectThread = useLatestCallback((id: string) => {
+    setMobileSidebarOpen(false);
+    router.push(`/chat/${encodeURIComponent(id)}`);
+  });
+  const sidebarNewChat = useLatestCallback(() => {
+    startNewChat();
+  });
+  const sidebarNewChatForProject = useLatestCallback((nextProjectId: string) => {
+    startNewChat(nextProjectId);
+  });
+  const sidebarCreateFolder = useLatestCallback(() => void handleCreateProjectFromDirectory());
+  const sidebarRenameThread = useLatestCallback((t: ConversationThread) => {
+    setRenameTarget(t);
+    setRenameInput(t.title);
+  });
+  const sidebarRenameThreadTitle = useLatestCallback((id: string, title: string) => {
+    if (title.trim() && title.trim() !== threads.find((item) => item.thread_id === id)?.title) handleRename(id, title);
+  });
+  const sidebarForkThread = useLatestCallback((t: ConversationThread) => handleFork(t.thread_id, t.state.running_turn_id || undefined));
+  const sidebarArchiveThread = useLatestCallback((t: ConversationThread) => handleArchive(t.thread_id));
+  const sidebarArchiveProjectThreads = useLatestCallback(handleArchiveProjectThreads);
+  const sidebarSelectMessageHit = useLatestCallback((nextThreadId: string, messageId: string) => {
+    // Push jump-back before C07 deep-link navigation; leave search/href intact.
+    pushJumpBackFromThread(threadId);
+    setMobileSidebarOpen(false);
+    router.push(buildThreadMessageHref(nextThreadId, messageId));
+  });
+
     // Approval decision — always bind to the card's approval_id (C23).
   const handleApprovalDecision = (
     approvalId: string,
@@ -3830,35 +3916,18 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         threads={sidebarThreads}
         projects={projects}
         activeThreadId={threadId}
-        onSelectThread={(id) => {
-          setMobileSidebarOpen(false);
-          router.push(`/chat/${encodeURIComponent(id)}`);
-        }}
-        onNewChat={() => {
-          startNewChat();
-        }}
-        onNewChatForProject={(nextProjectId) => {
-          startNewChat(nextProjectId);
-        }}
-        onCreateFolder={() => void handleCreateProjectFromDirectory()}
+        onSelectThread={sidebarSelectThread}
+        onNewChat={sidebarNewChat}
+        onNewChatForProject={sidebarNewChatForProject}
+        onCreateFolder={sidebarCreateFolder}
         searchQuery={searchQuery}
         onSearchChange={setSearchQuery}
-        onRenameThread={(t) => {
-          setRenameTarget(t);
-          setRenameInput(t.title);
-        }}
-        onRenameThreadTitle={(id, title) => {
-          if (title.trim() && title.trim() !== threads.find((item) => item.thread_id === id)?.title) handleRename(id, title);
-        }}
-        onForkThread={(t) => handleFork(t.thread_id, t.state.running_turn_id || undefined)}
-        onArchiveThread={(t) => handleArchive(t.thread_id)}
-        onArchiveProjectThreads={handleArchiveProjectThreads}
-        onSelectMessageHit={(nextThreadId, messageId) => {
-          // Push jump-back before C07 deep-link navigation; leave search/href intact.
-          pushJumpBackFromThread(threadId);
-          setMobileSidebarOpen(false);
-          router.push(buildThreadMessageHref(nextThreadId, messageId));
-        }}
+        onRenameThread={sidebarRenameThread}
+        onRenameThreadTitle={sidebarRenameThreadTitle}
+        onForkThread={sidebarForkThread}
+        onArchiveThread={sidebarArchiveThread}
+        onArchiveProjectThreads={sidebarArchiveProjectThreads}
+        onSelectMessageHit={sidebarSelectMessageHit}
         onMarkThreadsRead={markThreadsRead}
         collapsed={sidebarCollapsed}
         width={sidebarWidth}
@@ -4185,14 +4254,13 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
               </div>
             </div>
           ) : null}
-          <ConversationTimeline
+          <ConversationStreamTimeline
             key={commandScope}
+            stream={conversation.stream}
+            streamThreadId={streamThreadId}
             className="min-h-0 flex-1"
             view={controlView || conversation.view}
             credentials={credentials}
-            events={conversation.events}
-            liveText={conversation.liveText}
-            liveTextRuns={conversation.liveTextRuns}
             running={running}
             connected={conversation.connected}
             streamStatus={conversation.streamStatus}
@@ -4261,9 +4329,9 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
                     onDismissGuide={handleDismissGuide}
                   />
                 ) : null}
-            <ConversationQuotaResume
+            <ConversationStreamQuotaResume
+              stream={conversation.stream}
               view={conversation.view}
-              events={conversation.events}
               busy={interactionBusy}
               onResume={handleResume}
               onSchedule={async ({ enabled, turnId, resetsAt, kind }) => {
@@ -4454,7 +4522,9 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
                         variant="ring"
                         threadId={threadId}
                         contextWindow={conversation.view.context_window}
-                        compactionSupported={capabilitiesFor(descriptors, viewRuntimeKey)?.compaction === true}
+                        usageSupported={capabilitiesFor(descriptors, viewRuntimeKey)
+                          ? capabilitiesFor(descriptors, viewRuntimeKey)?.context_usage === true : undefined}
+                        capabilityContext={composerCapabilityContext}
                         onRefresh={() => void conversation.refresh()}
                       />
                     </>
@@ -4486,8 +4556,9 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
             }
           />
           {bottomPanelPresence.present ? (
-            <ConversationBottomPanel
-              events={conversation.events}
+            <ConversationStreamBottomPanel
+              stream={conversation.stream}
+              streamThreadId={streamThreadId}
               onClose={() => setBottomPanelOpen(false)}
               onOpenDetails={openDetails}
               transitionPhase={bottomPanelPresence.phase}
@@ -4498,11 +4569,10 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       </main>
 
       {conversation.view && threadId ? (
-        <RightPanel
+        <ConversationStreamRightPanel
+          stream={conversation.stream}
           threadId={threadId}
           view={conversation.view}
-          events={conversation.events}
-          tools={panelTools}
           hasWorkspace={hasWorkspace}
           sheet={panelSheet}
           sidebarWidth={mainLeft}

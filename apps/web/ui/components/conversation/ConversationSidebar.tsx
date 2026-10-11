@@ -4,7 +4,7 @@
  * CONVERSATION SIDEBAR — Left thread & project sidebar.
  * ───────────────────────────────────────────────────────── */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { SidebarNav, queryLooksSearchable, type NavItem, type NavSection } from "../ai-native/sidebar-nav";
 import { ResizeHandle, dismissToast, toast } from "@/components/chat/ui";
 import { TIME_BUCKETS, parseTimestamp, timeBucketLabel, timeBucketOf, type TimeBucket } from "@/components/chat/sidebar/time";
@@ -175,6 +175,53 @@ function orderByIds<T>(items: T[], ids: string[], getId: (item: T) => string): T
   ));
 }
 
+interface Cached<T> {
+  value: T;
+  extra: string;
+}
+
+/** Equal for rendering: same values, same callback presence, arrays equal by element identity. */
+function sameRenderData(a: object, b: object): boolean {
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  const keys = Object.keys(left);
+  if (keys.length !== Object.keys(right).length) return false;
+  for (const key of keys) {
+    if (!(key in right)) return false;
+    const x = left[key];
+    const y = right[key];
+    if (typeof x === "function" || typeof y === "function") {
+      if (typeof x !== typeof y) return false;
+      continue;
+    }
+    if (Array.isArray(x) && Array.isArray(y)) {
+      if (x.length !== y.length || x.some((value, index) => value !== y[index])) return false;
+      continue;
+    }
+    if (!Object.is(x, y)) return false;
+  }
+  return true;
+}
+
+/**
+ * Reuse the previous object when nothing visible changed so memoized rows skip
+ * re-rendering. Callbacks of a reused object stay in service, so they may only
+ * capture the key, compared fields, or `extra`; everything else must be read
+ * at call time.
+ */
+function reuseStable<T extends object>(
+  previous: Map<string, Cached<T>>,
+  next: Map<string, Cached<T>>,
+  key: string,
+  value: T,
+  extra = "",
+): T {
+  const cached = next.get(key) ?? previous.get(key);
+  const stable = cached && cached.extra === extra && sameRenderData(cached.value, value) ? cached.value : value;
+  next.set(key, { value: stable, extra });
+  return stable;
+}
+
 export interface ConversationSidebarProps {
   threads: ConversationThread[];
   projects: ConversationProject[];
@@ -256,7 +303,7 @@ function threadTimestamp(thread: ConversationThread): number {
   return parseTimestamp(thread.updated_at || thread.created_at);
 }
 
-export function ConversationSidebar({
+export const ConversationSidebar = memo(function ConversationSidebar({
   threads,
   projects,
   activeThreadId,
@@ -583,6 +630,34 @@ export function ConversationSidebar({
 
   const threadsRef = useRef(threads);
   threadsRef.current = threads;
+  // Callback props are read at call time so unstable parent closures neither
+  // rebuild the sections nor defeat row memoization.
+  const callbacks = {
+    onSelectThread, onNewChat, onNewChatForProject, onCreateFolder, onSearchChange, onRenameThread, onForkThread,
+    onArchiveThread, onArchiveProjectThreads, onSelectMessageHit, onMarkThreadsRead, onRenameThreadTitle,
+  };
+  const callbacksRef = useRef(callbacks);
+  callbacksRef.current = callbacks;
+  const hasRename = Boolean(onRenameThread);
+  const hasRenameTitle = Boolean(onRenameThreadTitle);
+  const hasFork = Boolean(onForkThread);
+  const hasArchive = Boolean(onArchiveThread);
+  const hasArchiveProject = Boolean(onArchiveProjectThreads);
+  const hasNewInProject = Boolean(onNewChatForProject);
+  const hasCreateFolder = Boolean(onCreateFolder);
+  const hasMarkRead = Boolean(onMarkThreadsRead);
+  const findThread = useCallback((threadId: string) => threadsRef.current.find((thread) => thread.thread_id === threadId), []);
+  // Latest derived view, read by row and section callbacks at call time.
+  const viewRef = useRef({
+    effectiveProjectFilter: null as string | null,
+    listedIds: [] as string[],
+    pinnedOrderIds: [] as string[],
+    threadsByProject: new Map<string, ConversationThread[]>(),
+  });
+  const mainItemCacheRef = useRef(new Map<string, Cached<NavItem>>());
+  const mainSectionCacheRef = useRef(new Map<string, Cached<NavSection>>());
+  const activityItemCacheRef = useRef(new Map<string, Cached<NavItem>>());
+  const activitySectionCacheRef = useRef(new Map<string, Cached<NavSection>>());
   const undoRef = useRef<{ snapshot: Map<string, InboxSnapshot>; expires: number; toastId: number } | null>(null);
 
   const restoreSnapshot = useCallback((snapshot: Map<string, InboxSnapshot>) => {
@@ -716,13 +791,23 @@ export function ConversationSidebar({
       current.pinned_sort_mode === "manual" ? mergeOrder(current.pinned_ids, visibleIds) : [...visibleIds], sourceId, targetId) }));
   }, [updatePreferences]);
 
+  const reorderListed = useCallback((sourceId: string, targetId: string) => {
+    moveThread(sourceId, targetId, viewRef.current.listedIds);
+  }, [moveThread]);
+
+  const reorderPinned = useCallback((sourceId: string, targetId: string) => {
+    movePinnedThread(sourceId, targetId, viewRef.current.pinnedOrderIds);
+  }, [movePinnedThread]);
+
   const orderedProjects = useMemo(() => orderByIds(projects, projectOrder, (project) => project.project_id), [projects, projectOrder]);
+  const orderedProjectsRef = useRef(orderedProjects);
+  orderedProjectsRef.current = orderedProjects;
   const moveProject = useCallback((sourceSectionId: string, targetSectionId: string) => {
     const sourceId = sourceSectionId.replace(/^project:/, "");
     const targetId = targetSectionId.replace(/^project:/, "");
-    const visibleIds = orderedProjects.map((project) => project.project_id);
+    const visibleIds = orderedProjectsRef.current.map((project) => project.project_id);
     updatePreferences((current) => ({ ...current, project_order: moveBefore(mergeOrder(current.project_order, visibleIds), sourceId, targetId) }));
-  }, [orderedProjects, updatePreferences]);
+  }, [updatePreferences]);
   const changePinnedSortMode = useCallback((next: SidebarPreferences["pinned_sort_mode"]) => updatePreferences((current) => ({ ...current, pinned_sort_mode: next })), [updatePreferences]);
   const changeSortMode = useCallback((next: SidebarPreferences["sort_mode"]) => updatePreferences((current) => ({ ...current, sort_mode: next })), [updatePreferences]);
   const changeGroupMode = useCallback((next: SidebarPreferences["group_mode"]) => updatePreferences((current) => ({ ...current, group_mode: next })), [updatePreferences]);
@@ -733,6 +818,7 @@ export function ConversationSidebar({
     const matchingThreads = threads.filter((thread) => (
       !q || `${thread.title} ${thread.summary || ""} ${thread.thread_id}`.toLowerCase().includes(q)
     ));
+    const manualRank = sortMode === "manual" ? new Map(threadOrder.map((id, index) => [id, index])) : null;
     const sortThreads = (items: ConversationThread[]) => items.sort((a, b) => {
       if (sortMode === "priority") {
         const rank = (thread: ConversationThread) => (
@@ -743,11 +829,9 @@ export function ConversationSidebar({
         );
         return rank(a) - rank(b);
       }
-      if (sortMode === "manual") {
-        const aRank = threadOrder.indexOf(a.thread_id);
-        const bRank = threadOrder.indexOf(b.thread_id);
-        return (aRank < 0 ? Number.MAX_SAFE_INTEGER : aRank) -
-          (bRank < 0 ? Number.MAX_SAFE_INTEGER : bRank);
+      if (manualRank) {
+        return (manualRank.get(a.thread_id) ?? Number.MAX_SAFE_INTEGER) -
+          (manualRank.get(b.thread_id) ?? Number.MAX_SAFE_INTEGER);
       }
       return String(b.updated_at || b.created_at || "").localeCompare(String(a.updated_at || a.created_at || ""));
     });
@@ -776,13 +860,15 @@ export function ConversationSidebar({
     applyInboxChange([activeThreadId], { kind: "wake" }, { announce: false });
   }, [activeThreadId, inboxStates, applyInboxChange]);
 
+  const pinnedSet = useMemo(() => new Set(pinnedIds), [pinnedIds]);
+
   useEffect(() => {
     const next = new Map<string, SidebarThreadState>();
     for (const [id, state] of inboxStates) {
-      next.set(id, { pinned: pinnedIds.includes(id), placement: state.placement, snoozedUntil: state.snoozedUntil });
+      next.set(id, { pinned: pinnedSet.has(id), placement: state.placement, snoozedUntil: state.snoozedUntil });
     }
     publishSidebarThreadStates(next);
-  }, [inboxStates, pinnedIds]);
+  }, [inboxStates, pinnedSet]);
 
   useEffect(() => registerSidebarCommandHandler((threadId, command) => {
     if (command.kind === "filter-project") changeProjectFilter(command.projectId === effectiveProjectFilter ? null : command.projectId);
@@ -790,7 +876,9 @@ export function ConversationSidebar({
     else applyInboxChange([threadId], { kind: command.kind });
   }), [applyInboxChange, changeProjectFilter, effectiveProjectFilter]);
 
+  // Callbacks capture only the thread id and fields compared by `reuseStable`.
   const toItem = useCallback((t: ConversationThread): NavItem => {
+    const threadId = t.thread_id;
     const inbox = inboxStates.get(t.thread_id);
     const project = t.project_id ? projectsById.get(t.project_id) : undefined;
     const placement = inbox?.placement ?? "active";
@@ -813,7 +901,7 @@ export function ConversationSidebar({
       failed: Boolean(t.state.last_error && Object.keys(t.state.last_error).length),
       errorText: errorTextOf(t),
       queueCount: t.state.queue_count || undefined,
-      pinned: pinnedIds.includes(t.thread_id),
+      pinned: pinnedSet.has(t.thread_id),
       projectId: project?.project_id,
       projectName: project?.name,
       projectPath: project?.root_path || undefined,
@@ -821,20 +909,38 @@ export function ConversationSidebar({
       woke: Boolean(inbox?.woke),
       snoozedUntil: placement === "snoozed" ? inbox?.snoozedUntil : undefined,
       settled: placement === "settled",
-      onPin: () => togglePinned(t.thread_id),
-      onSettle: () => setThreadSettled(t.thread_id, placement !== "settled"),
-      onSnooze: (until) => snoozeThread(t.thread_id, until),
-      onRename: onRenameThread ? () => onRenameThread(t) : undefined,
-      onRenameCommit: onRenameThreadTitle ? (title) => onRenameThreadTitle(t.thread_id, title) : undefined,
-      onFork: onForkThread ? () => onForkThread(t) : undefined,
-      onArchive: onArchiveThread ? () => onArchiveThread(t) : undefined,
-      onNewInProject: project && onNewChatForProject ? () => onNewChatForProject(project.project_id) : undefined,
-      onFilterProject: project ? () => changeProjectFilter(effectiveProjectFilter === project.project_id ? null : project.project_id) : undefined,
+      onPin: () => togglePinned(threadId),
+      onSettle: () => setThreadSettled(threadId, placement !== "settled"),
+      onSnooze: (until) => snoozeThread(threadId, until),
+      onRename: hasRename ? () => {
+        const thread = findThread(threadId);
+        if (thread) callbacksRef.current.onRenameThread?.(thread);
+      } : undefined,
+      onRenameCommit: hasRenameTitle ? (title) => callbacksRef.current.onRenameThreadTitle?.(threadId, title) : undefined,
+      onFork: hasFork ? () => {
+        const thread = findThread(threadId);
+        if (thread) callbacksRef.current.onForkThread?.(thread);
+      } : undefined,
+      onArchive: hasArchive ? () => {
+        const thread = findThread(threadId);
+        if (thread) callbacksRef.current.onArchiveThread?.(thread);
+      } : undefined,
+      onNewInProject: project && hasNewInProject ? () => callbacksRef.current.onNewChatForProject?.(project.project_id) : undefined,
+      onFilterProject: project ? () => changeProjectFilter(viewRef.current.effectiveProjectFilter === project.project_id ? null : project.project_id) : undefined,
     };
-  }, [inboxStates, subagentPending, projectsById, activeThreadId, pinnedIds, togglePinned, setThreadSettled, snoozeThread, onRenameThread, onRenameThreadTitle, onForkThread, onArchiveThread, onNewChatForProject, changeProjectFilter, effectiveProjectFilter]);
+  }, [inboxStates, subagentPending, projectsById, activeThreadId, pinnedSet, togglePinned, setThreadSettled, snoozeThread, hasRename, hasRenameTitle, hasFork, hasArchive, hasNewInProject, findThread, changeProjectFilter]);
 
   // Group threads into sections (Recent, Running, or by Project)
-  const sections: NavSection[] = useMemo(() => {
+  const mainView = useMemo(() => {
+    const previousItems = mainItemCacheRef.current;
+    const nextItems = new Map<string, Cached<NavItem>>();
+    const previousSections = mainSectionCacheRef.current;
+    const nextSections = new Map<string, Cached<NavSection>>();
+    mainItemCacheRef.current = nextItems;
+    mainSectionCacheRef.current = nextSections;
+    const stableItem = (thread: ConversationThread) => reuseStable(previousItems, nextItems, thread.thread_id, toItem(thread));
+    const stableSection = (section: NavSection, extra = "") => reuseStable(previousSections, nextSections, section.id || section.title, section, extra);
+
     const scoped = effectiveProjectFilter
       ? activeThreads.filter((thread) => thread.project_id === effectiveProjectFilter)
       : activeThreads;
@@ -858,7 +964,7 @@ export function ConversationSidebar({
       items: children
         .slice()
         .sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")))
-        .map(toItem),
+        .map(stableItem),
     }));
     const placementOf = (thread: ConversationThread) => inboxStates.get(thread.thread_id)?.placement ?? "active";
     const listed = topLevel.filter((thread) => placementOf(thread) === "active");
@@ -866,19 +972,21 @@ export function ConversationSidebar({
       .sort((a, b) => (inboxStates.get(a.thread_id)?.snoozedUntil ?? 0) - (inboxStates.get(b.thread_id)?.snoozedUntil ?? 0));
     const settled = topLevel.filter((thread) => placementOf(thread) === "settled")
       .sort((a, b) => (inboxStates.get(b.thread_id)?.settledAt ?? 0) - (inboxStates.get(a.thread_id)?.settledAt ?? 0));
-    const pinned = listed.filter((t) => pinnedIds.includes(t.thread_id)).sort((a, b) => {
-      if (pinnedSortMode === "manual") return pinnedIds.indexOf(a.thread_id) - pinnedIds.indexOf(b.thread_id);
+    const pinnedRank = new Map(pinnedIds.map((id, index) => [id, index]));
+    const pinned = listed.filter((t) => pinnedSet.has(t.thread_id)).sort((a, b) => {
+      if (pinnedSortMode === "manual") return (pinnedRank.get(a.thread_id) ?? 0) - (pinnedRank.get(b.thread_id) ?? 0);
       if (pinnedSortMode === "priority") return Number(Boolean(b.state.running_turn_id)) - Number(Boolean(a.state.running_turn_id));
       return String(b.updated_at || b.created_at || "").localeCompare(String(a.updated_at || a.created_at || ""));
     });
-    const ordinary = listed.filter((t) => !pinnedIds.includes(t.thread_id));
+    const ordinary = listed.filter((t) => !pinnedSet.has(t.thread_id));
 
     const result: NavSection[] = [];
+    const sectionExtras = new Map<string, string>();
     const searching = Boolean(searchQuery.trim());
 
     const tail: NavSection[] = [];
     if (snoozed.length) {
-      tail.push({ id: "snoozed", title: `稍后提醒 · ${snoozed.length}`, kind: "snoozed", defaultCollapsed: true, items: snoozed.map(toItem) });
+      tail.push({ id: "snoozed", title: `稍后提醒 · ${snoozed.length}`, kind: "snoozed", defaultCollapsed: true, items: snoozed.map(stableItem) });
     }
     if (settled.length) {
       tail.push({
@@ -888,31 +996,32 @@ export function ConversationSidebar({
         defaultCollapsed: true,
         pageSize: SETTLED_PAGE_SIZE,
         pageStep: SETTLED_PAGE_STEP,
-        items: settled.map(toItem),
+        items: settled.map(stableItem),
       });
     }
 
-    const visibleThreadIds = listed.map((thread) => thread.thread_id);
+    const listedIds = listed.map((thread) => thread.thread_id);
+    const pinnedOrderIds = pinned.map((thread) => thread.thread_id);
 
-    const toItems = (
-      items: ConversationThread[],
-      reorder: (sourceId: string, targetId: string, visibleIds: string[]) => void,
-      orderIds: string[],
-    ) => items.map((thread, index): NavItem => ({
-      ...toItem(thread),
-      onMoveUp: index > 0
-        ? () => reorder(thread.thread_id, items[index - 1].thread_id, orderIds)
-        : undefined,
-      onMoveDown: index < items.length - 1
-        ? () => reorder(thread.thread_id, items[index + 1].thread_id, orderIds)
-        : undefined,
-    }));
+    // Neighbour ids go into `extra` because the move callbacks capture them.
+    const toItems = (items: ConversationThread[], group: "listed" | "pinned") => {
+      const reorder = group === "pinned" ? reorderPinned : reorderListed;
+      return items.map((thread, index): NavItem => {
+        const threadId = thread.thread_id;
+        const previousId = index > 0 ? items[index - 1].thread_id : undefined;
+        const nextId = index < items.length - 1 ? items[index + 1].thread_id : undefined;
+        return reuseStable(previousItems, nextItems, threadId, {
+          ...toItem(thread),
+          onMoveUp: previousId ? () => reorder(threadId, previousId) : undefined,
+          onMoveDown: nextId ? () => reorder(threadId, nextId) : undefined,
+        }, `${group}|${previousId ?? ""}|${nextId ?? ""}`);
+      });
+    };
 
     // Recency buckets only make sense when the list is ordered by time.
     const chronological = (idPrefix: string, title: string, items: ConversationThread[]): NavSection[] => {
-      const onReorderItems = (sourceId: string, targetId: string) => moveThread(sourceId, targetId, visibleThreadIds);
       if (sortMode !== "updated") {
-        return [{ id: idPrefix, title, kind: "section", items: toItems(items, moveThread, visibleThreadIds), onReorderItems }];
+        return [{ id: idPrefix, title, kind: "section", items: toItems(items, "listed"), onReorderItems: reorderListed }];
       }
       const now = new Date();
       const buckets = new Map<TimeBucket, ConversationThread[]>();
@@ -926,72 +1035,91 @@ export function ConversationSidebar({
         id: `${idPrefix}:${bucket}`,
         title: timeBucketLabel(bucket),
         kind: "time",
-        items: toItems(buckets.get(bucket) || [], moveThread, visibleThreadIds),
-        onReorderItems,
+        items: toItems(buckets.get(bucket) || [], "listed"),
+        onReorderItems: reorderListed,
       }));
     };
 
-    if (groupMode === "list") {
-      return [
-        { id: "pinned", title: "置顶", kind: "pinned", items: toItems(pinned, movePinnedThread, pinned.map((thread) => thread.thread_id)), sortMode: pinnedSortMode, onSortChange: changePinnedSortMode, onReorderItems: (sourceId, targetId) => movePinnedThread(sourceId, targetId, pinned.map((thread) => thread.thread_id)) },
-        ...chronological("all", "全部对话", ordinary),
-        ...subagentSections,
-        ...tail,
-      ];
-    }
-
-    result.push({
+    const pinnedSection: NavSection = {
       id: "pinned",
       title: "置顶",
       kind: "pinned",
-      items: toItems(pinned, movePinnedThread, pinned.map((thread) => thread.thread_id)),
+      items: toItems(pinned, "pinned"),
       sortMode: pinnedSortMode,
       onSortChange: changePinnedSortMode,
-      onReorderItems: (sourceId, targetId) => movePinnedThread(sourceId, targetId, pinned.map((thread) => thread.thread_id)),
-    });
+      onReorderItems: reorderPinned,
+    };
 
-    for (const [projectIndex, project] of orderedProjects.entries()) {
-      if (effectiveProjectFilter && project.project_id !== effectiveProjectFilter) continue;
-      const projectThreads = ordinary.filter((thread) => thread.project_id === project.project_id);
-      if (searching && !projectThreads.length) continue;
-      result.push({
-        id: `project:${project.project_id}`,
-        title: project.name,
-        subtitle: project.root_path || "服务工作目录未配置",
-        kind: "folder",
-        previewLimit: PROJECT_THREAD_PREVIEW_LIMIT,
-        emptyLabel: "暂无对话",
-        running: projectThreads.some((thread) => Boolean(thread.state.running_turn_id)),
-        onNewChat: onNewChatForProject ? () => onNewChatForProject(project.project_id) : undefined,
-        onArchiveAll: (
-          onArchiveProjectThreads
-            ? () => onArchiveProjectThreads(projectThreads)
-            : onArchiveThread
-              ? () => { projectThreads.forEach(onArchiveThread); }
-              : undefined
-        ),
-        onMoveUp: projectIndex > 0
-          ? () => moveProject(`project:${project.project_id}`, `project:${orderedProjects[projectIndex - 1].project_id}`)
-          : undefined,
-        onMoveDown: projectIndex < orderedProjects.length - 1
-          ? () => moveProject(`project:${project.project_id}`, `project:${orderedProjects[projectIndex + 1].project_id}`)
-          : undefined,
-        onReorderSection: moveProject,
-        items: toItems(projectThreads, moveThread, visibleThreadIds),
-        onReorderItems: (sourceId, targetId) => moveThread(sourceId, targetId, visibleThreadIds),
-      });
+    const threadsByProject = new Map<string, ConversationThread[]>();
+
+    if (groupMode === "list") {
+      result.push(pinnedSection, ...chronological("all", "全部对话", ordinary), ...subagentSections, ...tail);
+    } else {
+      result.push(pinnedSection);
+
+      for (const thread of ordinary) {
+        if (!thread.project_id) continue;
+        const list = threadsByProject.get(thread.project_id);
+        if (list) list.push(thread);
+        else threadsByProject.set(thread.project_id, [thread]);
+      }
+
+      for (const [projectIndex, project] of orderedProjects.entries()) {
+        if (effectiveProjectFilter && project.project_id !== effectiveProjectFilter) continue;
+        const projectId = project.project_id;
+        const projectThreads = threadsByProject.get(projectId) ?? [];
+        if (searching && !projectThreads.length) continue;
+        const previousProjectId = projectIndex > 0 ? orderedProjects[projectIndex - 1].project_id : undefined;
+        const nextProjectId = projectIndex < orderedProjects.length - 1 ? orderedProjects[projectIndex + 1].project_id : undefined;
+        const sectionId = `project:${projectId}`;
+        sectionExtras.set(sectionId, `${previousProjectId ?? ""}|${nextProjectId ?? ""}`);
+        result.push({
+          id: sectionId,
+          title: project.name,
+          subtitle: project.root_path || "服务工作目录未配置",
+          kind: "folder",
+          previewLimit: PROJECT_THREAD_PREVIEW_LIMIT,
+          emptyLabel: "暂无对话",
+          running: projectThreads.some((thread) => Boolean(thread.state.running_turn_id)),
+          onNewChat: hasNewInProject ? () => callbacksRef.current.onNewChatForProject?.(projectId) : undefined,
+          onArchiveAll: hasArchiveProject || hasArchive
+            ? () => {
+              const current = viewRef.current.threadsByProject.get(projectId) ?? [];
+              const { onArchiveProjectThreads: archiveAll, onArchiveThread: archiveOne } = callbacksRef.current;
+              if (archiveAll) archiveAll(current);
+              else if (archiveOne) current.forEach(archiveOne);
+            }
+            : undefined,
+          onMoveUp: previousProjectId ? () => moveProject(sectionId, `project:${previousProjectId}`) : undefined,
+          onMoveDown: nextProjectId ? () => moveProject(sectionId, `project:${nextProjectId}`) : undefined,
+          onReorderSection: moveProject,
+          items: toItems(projectThreads, "listed"),
+          onReorderItems: reorderListed,
+        });
+      }
+
+      const projectIds = new Set(orderedProjects.map((project) => project.project_id));
+      const looseThreads = ordinary.filter((thread) => !thread.project_id || !projectIds.has(thread.project_id));
+      if (!effectiveProjectFilter) result.push(...chronological("recent", "最近对话", looseThreads));
+      result.push(...subagentSections);
+      result.push(...tail);
     }
 
-    const looseThreads = ordinary.filter((thread) => (
-      !thread.project_id || !orderedProjects.some((project) => project.project_id === thread.project_id)
-    ));
-    if (!effectiveProjectFilter) result.push(...chronological("recent", "最近对话", looseThreads));
-    result.push(...subagentSections);
-    result.push(...tail);
-
-    return result;
+    return {
+      sections: result.map((section) => stableSection(section, sectionExtras.get(section.id || "") ?? "")),
+      listedIds,
+      pinnedOrderIds,
+      threadsByProject,
+    };
     // dayStamp re-buckets 今天/昨天 when the date rolls over.
-  }, [activeThreads, threads, inboxStates, toItem, effectiveProjectFilter, groupMode, sortMode, searchQuery, dayStamp, orderedProjects, onArchiveProjectThreads, onArchiveThread, onNewChatForProject, pinnedIds, pinnedSortMode, moveThread, movePinnedThread, moveProject, changePinnedSortMode]);
+  }, [activeThreads, threads, inboxStates, toItem, effectiveProjectFilter, groupMode, sortMode, searchQuery, dayStamp, orderedProjects, hasArchiveProject, hasArchive, hasNewInProject, pinnedIds, pinnedSet, pinnedSortMode, reorderListed, reorderPinned, moveProject, changePinnedSortMode]);
+  const sections = mainView.sections;
+  viewRef.current = {
+    effectiveProjectFilter,
+    listedIds: mainView.listedIds,
+    pinnedOrderIds: mainView.pinnedOrderIds,
+    threadsByProject: mainView.threadsByProject,
+  };
 
   // Reading is not dismissing. Remember rows seen in priority so that read
   // receipts (including receipts from another client) do not move them away.
@@ -1015,6 +1143,12 @@ export function ConversationSidebar({
   }, [activityView, preferenceScope, threads, activeThreadId, subagentPending, loading]);
 
   const inbox = useMemo(() => {
+    const previousItems = activityItemCacheRef.current;
+    const nextItems = new Map<string, Cached<NavItem>>();
+    const previousSections = activitySectionCacheRef.current;
+    const nextSections = new Map<string, Cached<NavSection>>();
+    activityItemCacheRef.current = nextItems;
+    activitySectionCacheRef.current = nextSections;
     const projectNames = new Map(projects.map((project) => [project.project_id, project.name]));
     const activity = buildSidebarActivity({
       threads, activeThreadId: activeThreadId || "", pinnedIds, inboxStates, subagentPending,
@@ -1022,7 +1156,7 @@ export function ConversationSidebar({
       retainedPriorityIds: activityPriorityIds,
     });
 
-    const toActivityItem = (thread: ConversationThread): NavItem => ({
+    const toActivityItem = (thread: ConversationThread): NavItem => reuseStable(previousItems, nextItems, thread.thread_id, {
       ...toItem(thread),
       subtitle: thread.summary
         || (thread.project_id ? projectNames.get(thread.project_id) || "未知项目" : "未归入项目"),
@@ -1058,7 +1192,7 @@ export function ConversationSidebar({
       });
     }
     return {
-      sections: result,
+      sections: result.map((section) => reuseStable(previousSections, nextSections, section.id || section.title, section)),
       count: activity.count,
       unreadIds: activity.unreadIds,
       readCount: activity.readCount,
@@ -1085,7 +1219,7 @@ export function ConversationSidebar({
     ...activityPrefs,
     onShowChange: (key: keyof ActivityPrefs, value: boolean) => updateActivityPrefs({ [key]: value }),
     unreadCount: unreadIds.length,
-    onMarkAllRead: onMarkThreadsRead ? () => onMarkThreadsRead(unreadIds) : undefined,
+    onMarkAllRead: hasMarkRead ? () => callbacksRef.current.onMarkThreadsRead?.(unreadIds) : undefined,
     readCount: inbox.readCount,
     onClearRead: () => {
       const cleared = new Set(inbox.clearableIds);
@@ -1100,7 +1234,7 @@ export function ConversationSidebar({
       updateActivityPrefs(DEFAULT_ACTIVITY_PREFS);
       clearActivityRead(0);
     },
-  }), [activityPrefs, updateActivityPrefs, unreadIds, onMarkThreadsRead, inbox.readCount, inbox.clearableIds, clearActivityRead]);
+  }), [activityPrefs, updateActivityPrefs, unreadIds, hasMarkRead, inbox.readCount, inbox.clearableIds, clearActivityRead]);
 
   const projectFilterProp = useMemo<SidebarProjectFilter | undefined>(() => {
     if (!projects.length) return undefined;
@@ -1131,10 +1265,37 @@ export function ConversationSidebar({
       applyInboxChange(ids, { kind: allSettled ? "unsettle" : "settle" });
     },
     snooze: (ids, until) => applyInboxChange(ids, { kind: "snooze", until }),
-    archive: onArchiveProjectThreads
-      ? (ids) => onArchiveProjectThreads(threadsRef.current.filter((thread) => ids.includes(thread.thread_id)))
+    archive: hasArchiveProject
+      ? (ids) => {
+        const selected = new Set(ids);
+        callbacksRef.current.onArchiveProjectThreads?.(threadsRef.current.filter((thread) => selected.has(thread.thread_id)));
+      }
       : undefined,
-  }), [applyInboxChange, inboxStates, onArchiveProjectThreads]);
+  }), [applyInboxChange, inboxStates, hasArchiveProject]);
+
+  const toggleActivityView = useCallback(() => setActivityView((current) => !current), []);
+  const selectThread = useCallback((threadId: string) => callbacksRef.current.onSelectThread(threadId), []);
+  const startNewChat = useCallback(() => callbacksRef.current.onNewChat(), []);
+  const createFolder = useCallback(() => callbacksRef.current.onCreateFolder?.(), []);
+  const changeSearch = useCallback((q: string) => callbacksRef.current.onSearchChange(q), []);
+  const navBodyHits = useMemo(() => bodyHits.map((hit) => ({
+    threadId: hit.thread_id,
+    messageId: hit.message_id,
+    title: hit.thread_title || "未命名对话",
+    snippet: hit.snippet || "",
+    role: hit.role || "user",
+    archived: hit.archived,
+    superseded: hit.superseded,
+  })), [bodyHits]);
+  const loadMoreBodyHits = useCallback(() => { void loadMoreSearchHits(); }, [loadMoreSearchHits]);
+  const canLoadMoreBodyHits = bodyHits.length > 0 && bodyHitsNextOffset != null;
+  const retryBodyHits = useCallback(() => {
+    if (canLoadMoreBodyHits) void loadMoreSearchHits();
+    else setSearchAttempt((attempt) => attempt + 1);
+  }, [canLoadMoreBodyHits, loadMoreSearchHits]);
+  const selectBodyHit = useCallback((hit: { threadId: string; messageId: string }) => {
+    callbacksRef.current.onSelectMessageHit?.(hit.threadId, hit.messageId);
+  }, []);
 
   // T3-style thread shortcuts: ⌘⇧S settle, ⌘⇧P pin (current thread), ⌘Z undo.
   useEffect(() => {
@@ -1187,44 +1348,31 @@ export function ConversationSidebar({
         activitySections={inbox.sections}
         activityView={activityView}
         activityBadge={inbox.count}
-        onToggleActivityView={() => setActivityView((current) => !current)}
+        onToggleActivityView={toggleActivityView}
         activityOptions={activityOptions}
         projectFilter={projectFilterProp}
         bulkActions={bulkActions}
         activeId={activeThreadId}
-        onSelect={onSelectThread}
-        onNewChat={onNewChat}
-        onCreateFolder={onCreateFolder}
+        onSelect={selectThread}
+        onNewChat={startNewChat}
+        onCreateFolder={hasCreateFolder ? createFolder : undefined}
         searchQuery={searchQuery}
-        onSearchChange={onSearchChange}
+        onSearchChange={changeSearch}
         sortMode={sortMode}
         onSortChange={changeSortMode}
         groupMode={groupMode}
         onGroupChange={changeGroupMode}
         collapsed={false}
-        bodyHits={bodyHits.map((hit) => ({
-          threadId: hit.thread_id,
-          messageId: hit.message_id,
-          title: hit.thread_title || "未命名对话",
-          snippet: hit.snippet || "",
-          role: hit.role || "user",
-          archived: hit.archived,
-          superseded: hit.superseded,
-        }))}
+        bodyHits={navBodyHits}
         bodyHitsLoading={bodyHitsLoading}
         bodyHitsLoadingMore={bodyHitsLoadingMore}
         bodyHitsError={bodyHitsError}
         bodyHitsHasMore={bodyHitsNextOffset != null}
-        onLoadMoreBodyHits={() => void loadMoreSearchHits()}
-        onRetryBodyHits={() => {
-          if (bodyHits.length && bodyHitsNextOffset != null) void loadMoreSearchHits();
-          else setSearchAttempt((attempt) => attempt + 1);
-        }}
+        onLoadMoreBodyHits={loadMoreBodyHits}
+        onRetryBodyHits={retryBodyHits}
         includeSuperseded={includeSuperseded}
         onIncludeSupersededChange={setIncludeSuperseded}
-        onSelectBodyHit={(hit) => {
-          onSelectMessageHit?.(hit.threadId, hit.messageId);
-        }}
+        onSelectBodyHit={selectBodyHit}
         loading={loading}
       />
       {!collapsed ? (
@@ -1242,4 +1390,4 @@ export function ConversationSidebar({
       ) : null}
     </aside>
   );
-}
+});

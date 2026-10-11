@@ -3,7 +3,7 @@
 
 
 import { motion, type HTMLMotionProps, useReducedMotion } from "motion/react";
-import type { CSSProperties } from "react";
+import { useState, type CSSProperties } from "react";
 import { EASE_OUT } from "@/components/agentui/lib/ease";
 import { cn } from "@/lib/cn";
 
@@ -20,13 +20,24 @@ export function AgentDisclosure({
   className,
   style,
   transition,
+  children,
+  onAnimationComplete,
   ...props
 }: AgentDisclosureProps) {
   const reduce = useReducedMotion() ?? false;
+  // Collapsed content is unmounted once the close animation settles: long
+  // agent turns hold hundreds of closed tool results whose hidden output
+  // would otherwise stay in every style, layout and paint pass.
+  const [contentMounted, setContentMounted] = useState(open);
+  if (open && !contentMounted) setContentMounted(true);
 
   return (
     <motion.div
       {...props}
+      onAnimationComplete={(definition) => {
+        if (!open) setContentMounted(false);
+        onAnimationComplete?.(definition);
+      }}
       aria-hidden={!open}
       inert={!open}
       initial={false}
@@ -52,6 +63,8 @@ export function AgentDisclosure({
         pointerEvents: open ? undefined : "none",
         transformOrigin: "top",
       }}
-    />
+    >
+      {contentMounted ? children : null}
+    </motion.div>
   );
 }

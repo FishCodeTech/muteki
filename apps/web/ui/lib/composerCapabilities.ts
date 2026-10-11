@@ -14,7 +14,7 @@ export interface ComposerCapabilitySectionError {
   message: string;
   [key: string]: unknown;
 }
-export type ComposerCapabilityKind = "command" | "skill" | "mcp" | "plugin" | "file" | "thread" | "message_span" | "tool_excerpt";
+export type ComposerCapabilityKind = "command" | "skill" | "mcp" | "plugin" | "component" | "file" | "thread" | "message_span" | "tool_excerpt";
 
 export interface ComposerCapabilityContext {
   revision?: number;
@@ -46,6 +46,10 @@ export interface ComposerCapabilityItem {
   alternative?: string;
   invocable?: boolean;
   revision?: number;
+  /** Built-in Muteki tool behind a `component` item (computer-use / browser / visualize). */
+  component?: string;
+  /** Target macOS app for a computer-use item, resolved by the server. */
+  target?: { type: "mac_app"; bundle_id: string; name: string; path: string };
 }
 
 export interface ComposerRuntimeState {
@@ -90,6 +94,8 @@ export type ComposerCapabilityRef = Omit<
   context_schema?: 2;
 };
 
+const CAPABILITY_REQUEST_TIMEOUT_MS = 20_000;
+
 export class ComposerCapabilityError extends Error {
   constructor(
     message: string,
@@ -108,27 +114,86 @@ export class ComposerCapabilityError extends Error {
   }
 }
 
+export interface ComposerCapabilityResult {
+  engine: string;
+  items: ComposerCapabilityItem[];
+  runtime: ComposerRuntimeState;
+  sectionErrors: ComposerCapabilitySectionError[];
+  accessModes: string[];
+  accessModeNotes: Record<string, string>;
+}
+
+// Last successful snapshot per context/trigger/query, shown immediately while the
+// menu revalidates so reopening `/` does not flash an empty skeleton.
+const SNAPSHOT_CACHE_LIMIT = 64;
+const snapshotCache = new Map<string, ComposerCapabilityResult>();
+
+function snapshotKey(context: ComposerCapabilityContext, trigger: ComposerTrigger, query: string): string {
+  return JSON.stringify([
+    context.adapterId, context.instanceId || "", context.threadId || "", context.workspaceId || "",
+    context.projectId || "", context.revision ?? null, trigger, query,
+  ]);
+}
+
+export function cachedComposerCapabilities(
+  context: ComposerCapabilityContext,
+  trigger: ComposerTrigger,
+  query: string,
+): ComposerCapabilityResult | undefined {
+  return snapshotCache.get(snapshotKey(context, trigger, query));
+}
+
+export function clearComposerCapabilityCache(): void {
+  snapshotCache.clear();
+}
+
+function rememberSnapshot(key: string, result: ComposerCapabilityResult): void {
+  snapshotCache.delete(key);
+  snapshotCache.set(key, result);
+  while (snapshotCache.size > SNAPSHOT_CACHE_LIMIT) {
+    const oldest = snapshotCache.keys().next().value;
+    if (oldest === undefined) break;
+    snapshotCache.delete(oldest);
+  }
+}
+
 export async function fetchComposerCapabilities(
   context: ComposerCapabilityContext,
   trigger: ComposerTrigger,
   query: string,
   signal?: AbortSignal,
-): Promise<{ engine: string; items: ComposerCapabilityItem[]; runtime: ComposerRuntimeState; sectionErrors: ComposerCapabilitySectionError[]; accessModes: string[]; accessModeNotes: Record<string, string> }> {
-  const response = await apiFetch("/api/conversation/composer-capabilities", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      thread_id: context.threadId || "",
-      adapter_id: context.adapterId,
-      instance_id: context.instanceId || "",
-      workspace_id: context.workspaceId || "",
-      project_id: context.projectId || "",
-      trigger,
-      query,
-    }),
-    signal,
-  });
-  const rawBody = await response.text();
+): Promise<ComposerCapabilityResult> {
+  // Without a deadline an unresponsive backend leaves the menu on its loading
+  // skeleton forever; the typed timeout error gives the menu its retry action.
+  const deadline = AbortSignal.timeout(CAPABILITY_REQUEST_TIMEOUT_MS);
+  const requestSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+  let response: Response;
+  let rawBody: string;
+  try {
+    response = await apiFetch("/api/conversation/composer-capabilities", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        thread_id: context.threadId || "",
+        adapter_id: context.adapterId,
+        instance_id: context.instanceId || "",
+        workspace_id: context.workspaceId || "",
+        project_id: context.projectId || "",
+        trigger,
+        query,
+      }),
+      signal: requestSignal,
+    });
+    rawBody = await response.text();
+  } catch (cause) {
+    if (deadline.aborted && !signal?.aborted) {
+      throw new ComposerCapabilityError(
+        `能力目录超过 ${CAPABILITY_REQUEST_TIMEOUT_MS / 1000} 秒没有响应；本机后端可能正忙或已停止，请重试。`,
+        0, "", { code: "capability_request_timeout", timeout_ms: CAPABILITY_REQUEST_TIMEOUT_MS },
+      );
+    }
+    throw cause;
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(rawBody);
@@ -159,7 +224,7 @@ export async function fetchComposerCapabilities(
       { code: "capability_response_invalid_shape" }, response.headers.get("x-request-id") || "",
     );
   }
-  return {
+  const result: ComposerCapabilityResult = {
     engine: body.engine || "",
     accessModes: Array.isArray(body.access_modes) ? body.access_modes.map(String) : [],
     accessModeNotes: body.access_mode_notes || {},
@@ -184,4 +249,6 @@ export async function fetchComposerCapabilities(
       matrix: body.runtime?.matrix ?? null,
     },
   };
+  rememberSnapshot(snapshotKey(context, trigger, query), result);
+  return result;
 }

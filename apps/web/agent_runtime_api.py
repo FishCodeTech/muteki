@@ -57,7 +57,7 @@ from muteki.platform.contracts.receipts import (
 from muteki.external_agents.factory import (
     DEFAULT_ADAPTER_BY_ENGINE,
     DEFAULT_CLI_ADAPTER_BY_ENGINE,
-    DEFAULT_STRUCTURED_ADAPTER_BY_ENGINE,
+    builtin_structured_adapter_ids,
     canonical_adapter_id as _canonical_adapter_id,
     engine_for_adapter,
     normalize_launch_args,
@@ -633,8 +633,7 @@ class AgentRuntimeService:
             if (
                 self.factory is not None
                 and instance_id == "default"
-                and DEFAULT_ADAPTER_BY_ENGINE.get(
-                    engine_of_adapter(adapter_id)) == adapter_id
+                and adapter_id in builtin_structured_adapter_ids()
             ):
                 from muteki.external_agents.factory import RuntimeAdapterConfig
 
@@ -658,6 +657,7 @@ class AgentRuntimeService:
                          adapter_id, type(exc).__name__, exc)
             binary = ""
         structured = not adapter_id.startswith("cli.")
+        health = self.store.health(f"{adapter_id}:default")
         return {
             "adapter_id": adapter_id,
             "instance_id": "default",
@@ -671,7 +671,9 @@ class AgentRuntimeService:
             "adapter_endpoint": "",
             "endpoint": "",
             "env_refs": {},
-            "enabled": True,
+            # Discovery is automatic until the user saves an explicit setting.
+            # An unprobed or unavailable local runtime must not look enabled.
+            "enabled": bool(health and health.get("healthy")),
             "transport": {},
             "launch_args": [],
             "transport_kind": "structured" if structured else "cli",
@@ -720,14 +722,9 @@ class AgentRuntimeService:
                     if engine in DEFAULT_CLI_ADAPTER_BY_ENGINE
                 ]
             elif transport_kind == "structured":
-                adapter_ids = [
-                    adapter.adapter_id for descriptor in all_descriptors()
-                    for adapter in descriptor.adapters
-                    if adapter.role == "default"
-                    or (adapter.role == "variant" and adapter.capabilities.access_modes)
-                ]
+                adapter_ids = list(builtin_structured_adapter_ids())
             else:
-                adapter_ids = list(DEFAULT_STRUCTURED_ADAPTER_BY_ENGINE.values()) + [
+                adapter_ids = list(builtin_structured_adapter_ids()) + [
                     f"cli.{engine}" for engine in VALID_BASE_ENGINES]
             for discovered_adapter_id in adapter_ids:
                 key = f"{discovered_adapter_id}:default"
@@ -971,12 +968,12 @@ class AgentRuntimeService:
         self, adapter_id: str, instance_id: str, credential_id: str,
         configuration: dict[str, Any] | None, *, refresh: bool,
     ) -> tuple[Any, str]:
-        """Probe in a small temporary native home for the selected credential.
+        """Probe in the selected native account environment.
 
         The cache scope carries the credential id and revision, so a changed
-        credential never reads another revision's catalog.  The temporary
-        home lives inside the shared probe task; joined callers do not depend
-        on the first caller's directory.
+        credential never reads another revision's catalog. Stored accounts use
+        an explicit temporary environment owned by the shared probe task;
+        system-login probes use the native OS account.
         """
         from muteki.conversation.chat_plugins import ChatPluginService
         from muteki.external_agents.factory import RuntimeAdapterConfig
@@ -1002,14 +999,16 @@ class AgentRuntimeService:
                 def prepare() -> dict[str, str]:
                     resolved = resolve_credential_env(
                         credential_id, engine=engine, sessions_root=self.sessions_root,
-                        container=False, agent_state_dir=root / "credentials",
+                        container=False, agent_state_dir=root / "credentials" if account_id else None,
                     )
                     cfg = RuntimeAdapterConfig.from_value(configuration or {
                         "adapter_id": adapter_id, "instance_id": instance_id})
                     configured = self.factory._env(cfg) if self.factory is not None else {}
                     return ChatPluginService(root / "native").prepare_environment(
                         engine, f"probe:{adapter_id}:{instance_id}:{credential_id}",
-                        {**configured, **resolved.env}, include_assets=False,
+                        {**configured, **resolved.env,
+                         **({"MUTEKI_HOST_DISCOVERY": "0"} if account_id else {})},
+                        include_assets=False, isolated=bool(account_id),
                     )
 
                 preparation = asyncio.create_task(asyncio.to_thread(prepare))
@@ -1057,9 +1056,7 @@ class AgentRuntimeService:
             and previous.get("installed_version") == result.get("installed_version")
         )
         if engine == "opencode" and result.get("installed_version"):
-            major = str(result["installed_version"]).split(".", 1)[0]
-            same_install = same_install and previous.get("source") == (
-                "npm:opencode-ai" if major == "1" else "npm:@opencode/cli")
+            same_install = same_install and previous.get("source") == "npm:@opencode/cli"
         if same_install and previous.get("latest_version"):
             return {
                 **previous,

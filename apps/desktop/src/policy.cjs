@@ -20,10 +20,6 @@ function normalizeOrigin(value) {
   if (url.pathname !== '/' || url.search || url.hash) {
     throw new Error('请填写工作台的根地址，不要附带路径、参数或登录令牌。');
   }
-  const loopback = ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname);
-  if (url.protocol === 'http:' && !loopback) {
-    throw new Error('远程服务请使用 HTTPS；HTTP 仅用于本机 localhost、127.0.0.1 或 [::1]。');
-  }
   return url.origin;
 }
 

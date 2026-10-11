@@ -3,6 +3,34 @@ const path = require('node:path');
 const os = require('node:os');
 const { randomUUID, createHash } = require('node:crypto');
 
+const nativeHomeVariables = ['CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'CURSOR_CONFIG_DIR', 'GROK_HOME', 'KIMI_CODE_HOME', 'PI_CODING_AGENT_DIR'];
+const xdgDefaults = { XDG_CONFIG_HOME: '.config', XDG_CACHE_HOME: '.cache', XDG_DATA_HOME: '.local/share' };
+
+function hostEnvironment(parent = process.env) {
+  // os.homedir() honors HOME/USERPROFILE; userInfo reads the OS account instead.
+  const accountHome = os.userInfo().homedir;
+  if (!accountHome || !path.isAbsolute(accountHome)) throw new Error('OS account home directory is unavailable');
+  const home = path.resolve(accountHome);
+  const inheritedHomes = [parent.HOME, parent.USERPROFILE].filter(Boolean).map(value => path.resolve(value));
+  const trusted = inheritedHomes.every(value => value === home) && !parent.MUTEKI_CHAT_PRIVATE_ROOT;
+  const privateRoots = [parent.MUTEKI_CHAT_PRIVATE_ROOT, ...inheritedHomes.filter(value => value !== home)].filter(Boolean).map(value => path.resolve(value));
+  const managedPath = value => {
+    const resolved = path.resolve(value);
+    return privateRoots.some(root => resolved === root || resolved.startsWith(root + path.sep))
+      || /[\\/]_platform[\\/]|[\\/]\.muteki-opencode(?:[\\/]|$)|[\\/]muteki_accounts(?:[\\/]|$)/.test(resolved);
+  };
+  const env = { ...parent, HOME: home, USERPROFILE: home };
+  for (const [key, relative] of Object.entries(xdgDefaults)) {
+    env[key] = trusted && parent[key] && !managedPath(parent[key]) ? parent[key] : path.join(home, relative);
+  }
+  for (const key of nativeHomeVariables) {
+    if (!trusted || (parent[key] && managedPath(parent[key]))) delete env[key];
+  }
+  if (parent.PATH) env.PATH = parent.PATH.split(path.delimiter).filter(value => value && !managedPath(value)).join(path.delimiter);
+  delete env.MUTEKI_CHAT_PRIVATE_ROOT;
+  return env;
+}
+
 function atomicJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.${randomUUID()}.tmp`;
@@ -39,7 +67,9 @@ function desktopEnvironment({ appData, packaged, channel, root, workspace }) {
 
 function serviceEnvironment(context, parent = process.env) {
   const candidate = context.channel === 'candidate';
-  const hostHome = path.resolve(parent.HOME || parent.USERPROFILE || os.homedir());
+  // Candidate launches must not even look up the host account or inspect its tools.
+  const host = candidate ? {} : hostEnvironment(parent);
+  const hostHome = candidate ? context.paths.home : host.HOME;
   // Candidate acceptance must not observe host PATH, HOME, or native logins.
   // Regular desktop launches behave like a local app and discover host tools.
   const env = {};
@@ -47,7 +77,7 @@ function serviceEnvironment(context, parent = process.env) {
     if (parent[key]) env[key] = parent[key];
   }
   const hostPath = candidate ? [] : [
-    ...(parent.PATH || '').split(path.delimiter).filter(Boolean),
+    ...(host.PATH || '').split(path.delimiter).filter(Boolean),
     path.join(hostHome, 'bin'), path.join(hostHome, '.local', 'bin'),
     path.join(hostHome, '.bun', 'bin'), path.join(hostHome, '.kimi-code', 'bin'), path.join(hostHome, '.grok', 'bin'),
     path.join(hostHome, '.volta', 'bin'), path.join(hostHome, '.npm-global', 'bin'),
@@ -57,9 +87,9 @@ function serviceEnvironment(context, parent = process.env) {
   const runtimeHome = candidate ? context.paths.home : hostHome;
   Object.assign(env, {
     HOME: runtimeHome, USERPROFILE: runtimeHome,
-    XDG_CONFIG_HOME: candidate ? path.join(runtimeHome, '.config') : parent.XDG_CONFIG_HOME || path.join(hostHome, '.config'),
-    XDG_CACHE_HOME: candidate ? path.join(runtimeHome, '.cache') : parent.XDG_CACHE_HOME || path.join(hostHome, '.cache'),
-    XDG_DATA_HOME: candidate ? path.join(runtimeHome, '.local', 'share') : parent.XDG_DATA_HOME || path.join(hostHome, '.local', 'share'),
+    XDG_CONFIG_HOME: candidate ? path.join(runtimeHome, '.config') : host.XDG_CONFIG_HOME,
+    XDG_CACHE_HOME: candidate ? path.join(runtimeHome, '.cache') : host.XDG_CACHE_HOME,
+    XDG_DATA_HOME: candidate ? path.join(runtimeHome, '.local', 'share') : host.XDG_DATA_HOME,
     TMPDIR: context.paths.tmp, TMP: context.paths.tmp, TEMP: context.paths.tmp,
     PATH: [...new Set([...hostPath, ...standardPath])].join(path.delimiter),
     MUTEKI_ENVIRONMENT_ROOT: context.root, MUTEKI_ENVIRONMENT_ID: context.id,
@@ -73,7 +103,10 @@ function serviceEnvironment(context, parent = process.env) {
     NODE_ENV: 'production', NEXT_TELEMETRY_DISABLED: '1',
     NPM_CONFIG_PREFIX: context.paths.tools, NPM_CONFIG_CACHE: path.join(context.paths.home, '.npm'),
   });
-  if (!candidate) env.MUTEKI_SHARED_CREDENTIALS_ROOT = context.sharedCredentials;
+  if (!candidate) {
+    env.MUTEKI_SHARED_CREDENTIALS_ROOT = context.sharedCredentials;
+    for (const key of nativeHomeVariables) if (host[key]) env[key] = host[key];
+  }
   if (context.maintenance) env.MUTEKI_DESKTOP_MAINTENANCE = '1';
   return env;
 }
@@ -110,4 +143,4 @@ function runtimePaths({ packaged, resources, workspace, node = process.env.MUTEK
   return { code: inside(manifest.code), python: inside(manifest.python), node: inside(manifest.node), next: inside(manifest.next), release: manifest.release };
 }
 
-module.exports = { atomicJson, desktopEnvironment, serviceEnvironment, runtimePaths };
+module.exports = { atomicJson, desktopEnvironment, serviceEnvironment, hostEnvironment, runtimePaths };

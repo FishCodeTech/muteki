@@ -37,6 +37,8 @@ from typing import Any, Optional
 from muteki.platform.contracts.agent_events import (
     ApprovalOption,
     ApprovalRequestedPayload,
+    CompactionPayload,
+    UsagePayload,
     UserInputRequestedPayload,
     dump_payload,
 )
@@ -44,10 +46,12 @@ from muteki.platform.contracts.base import new_id
 from muteki.platform.contracts.external_agents import (
     AccessMode,
     AgentCapabilities,
+    AgentEventType,
     ProbeRequest,
     SessionStart,
 )
 
+from .context_delivery import system_append
 from .acp import AcpRequestError, BaseAcpAdapter, check_response
 from .approvals import ApprovalDecision
 from .descriptors import GROK_MCP_READY_WAIT_SECONDS as _DEFAULT_MCP_READY_WAIT_SECONDS
@@ -227,6 +231,24 @@ def _model_catalog(setup: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return catalog
 
 
+def _context_limits(models: dict[str, Any]) -> dict[str, int]:
+    """``totalContextTokens`` per model id from a Grok model catalog."""
+    limits: dict[str, int] = {}
+    for row in models.get("availableModels") or []:
+        if not isinstance(row, dict):
+            continue
+        meta = row.get("_meta") if isinstance(row.get("_meta"), dict) else {}
+        value = meta.get("totalContextTokens")
+        model_id = str(row.get("modelId") or "").strip()
+        if model_id and isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            limits[model_id] = value
+    return limits
+
+
+def _token_count(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
 def _requested_model(value: Optional[str]) -> Optional[str]:
     model = str(value or "").strip()
     if not model or model == _GROK_PRODUCT_MODEL:
@@ -320,6 +342,9 @@ class GrokAcpAdapter(BaseAcpAdapter):
     """
 
     adapter_id = "grok.acp"
+    # session/new ``_meta.rules`` is appended to Grok's system prompt; the
+    # CLI ``--rules`` flag does not reach ``grok agent stdio``.
+    host_context_channel = "system_prompt"
     # Supervised and auto-accept-edits both launch with ``--permission-mode
     # default`` and a private ask config (``_grok_supervised_config``). The
     # shared permission callback accepts edit/delete/move only for
@@ -347,6 +372,12 @@ class GrokAcpAdapter(BaseAcpAdapter):
         ),
     }
     rate_limit_error_codes = (GROK_RATE_LIMIT_ERROR_CODE,)
+    # Grok sends no ``usage_update``. Each ``response_completed`` carries the
+    # prompt of that model call (occupancy) and ``_x.ai/models/update`` the
+    # model's ``totalContextTokens`` (limit).
+    context_usage_reported = True
+    # _x.ai auto_compact_started / auto_compact_completed notifications.
+    compaction_reported = True
 
     def __init__(
         self,
@@ -397,6 +428,11 @@ class GrokAcpAdapter(BaseAcpAdapter):
         argv += ["agent", "stdio"]
         argv += self._extra_argv
         return argv
+
+    def _session_open_meta(self, request: SessionStart) -> dict[str, Any]:
+        if not request.options.host_context:
+            return {}
+        return {"rules": system_append(request.options.host_context)}
 
     def _agent_argv_for_request(self, request: SessionStart) -> list[str]:
         mode = request.access_mode or AccessMode.SUPERVISED.value
@@ -693,10 +729,37 @@ class GrokAcpAdapter(BaseAcpAdapter):
         if method in _PROMPT_COMPLETE_METHODS:
             self._settle_prompt(handle, params.get("promptId"), params)
             return {}, []
+        if method in ("x.ai/models/update", "_x.ai/models/update"):
+            limits = _context_limits(params)
+            if limits:
+                handle["grok_context_limits"] = limits
+            current = str(params.get("currentModelId") or "").strip()
+            if current:
+                handle["grok_model"] = current
+            return None, []
         if method not in _SESSION_NOTIFICATION_METHODS:
             return None, []
         update = params.get("update") or {}
         kind = str(update.get("sessionUpdate") or "")
+        external = str(handle.get("external_session_id") or "")
+        own_session = str(params.get("sessionId") or external) == external
+        if kind == "model_changed" and own_session:
+            model_id = str(update.get("model_id") or update.get("modelId") or "").strip()
+            if model_id:
+                handle["grok_model"] = model_id
+            return {}, []
+        if kind == "response_completed":
+            usage = update.get("usage") if isinstance(update.get("usage"), dict) else {}
+            if not own_session or not usage:
+                return {}, []
+            # Each model call reports the prompt it sent; the latest one plus its
+            # output is what the conversation now occupies.
+            used = sum(_token_count(usage.get(key)) for key in (
+                "input_tokens", "cache_read_input_tokens",
+                "cache_creation_input_tokens", "output_tokens"))
+            return {}, [self._context_usage_event(handle, used)]
+        if kind.startswith("auto_compact_") and own_session:
+            return {}, self._compaction_events(handle, kind, update)
         if kind == "turn_completed":
             self._settle_prompt(
                 handle, update.get("prompt_id") or update.get("promptId"), {
@@ -768,6 +831,52 @@ class GrokAcpAdapter(BaseAcpAdapter):
                 events.append(event)
             return {}, events
         return {}, []
+
+    def _context_limit(self, handle: dict[str, Any]) -> Optional[int]:
+        transport = handle.get("transport")
+        external = str(handle.get("external_session_id") or "")
+        setup = transport.session_setup(external) if transport is not None and external else {}
+        setup = setup if isinstance(setup, dict) else {}
+        model = handle.get("grok_model") or _live_model(setup)[0]
+        limits = handle.get("grok_context_limits") or _context_limits(
+            setup.get("models") if isinstance(setup.get("models"), dict) else {})
+        return limits.get(model) if model else None
+
+    def _context_usage_event(
+        self, handle: dict[str, Any], used: int,
+    ) -> tuple[Any, str, dict[str, Any]]:
+        return (AgentEventType.USAGE_UPDATED, "grok.context", dump_payload(UsagePayload(
+            scope="context_only", context_used_tokens=used,
+            context_window=self._context_limit(handle))))
+
+    def _compaction_events(
+        self, handle: dict[str, Any], kind: str, update: dict[str, Any],
+    ) -> list[tuple[Any, str, dict[str, Any]]]:
+        """``auto_compact_*`` notifications; Grok sends them for ``/compact`` too."""
+        status = {
+            "auto_compact_started": "started",
+            "auto_compact_completed": "completed",
+            "auto_compact_failed": "failed",
+            "auto_compact_cancelled": "failed",
+        }.get(kind)
+        if status is None:
+            return []
+        before = update.get("tokens_before", update.get("tokens_used"))
+        after = update.get("tokens_after")
+        message = update.get("error") or update.get("reason") or update.get("message")
+        if kind == "auto_compact_cancelled" and not message:
+            message = "Grok cancelled the compaction"
+        summary = update.get("summary_preview")
+        events = [(AgentEventType.COMPACTION_UPDATED, f"grok.{kind}", dump_payload(CompactionPayload(
+            status=status, trigger="auto",
+            tokens_before=_token_count(before) if before is not None else None,
+            tokens_after=_token_count(after) if after is not None else None,
+            summary=summary if isinstance(summary, str) and summary.strip() else None,
+            message=str(message) if message else None,
+        )))]
+        if status == "completed" and after is not None:
+            events.append(self._context_usage_event(handle, _token_count(after)))
+        return events
 
     def _settle_prompt(
         self, handle: dict[str, Any], prompt_id: Any, notice: dict[str, Any]

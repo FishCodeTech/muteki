@@ -33,6 +33,7 @@ contextBridge.exposeInMainWorld('mutekiDesktop', {
   startSpeech: input => invoke('desktop:speech-start', input), finishSpeech: input => invoke('desktop:speech-finish', input), cancelSpeech: input => invoke('desktop:speech-cancel', input),
   onSpeech: callback => subscribe('desktop:speech', callback),
   notificationStatus: input => invoke('desktop:notification-status', input), requestNotifications: input => invoke('desktop:notification-request', input),
+  testNotification: input => invoke('desktop:notification-test', input),
   sendNotification: input => invoke('desktop:notification-send', input), playNotificationSound: input => invoke('desktop:notification-sound', input), onNotification: callback => subscribe('desktop:notification-state', callback),
   acknowledgeClose: input => invoke('desktop:close-ack', input),
   terminalOpen: input => invoke('desktop:terminal-open', input), terminalSend: (id, data) => invoke('desktop:terminal-send', id, data), terminalClose: id => invoke('desktop:terminal-close', id),

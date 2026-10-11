@@ -38,13 +38,31 @@ for line in sys.stdin:
 async def check() -> None:
     with tempfile.TemporaryDirectory(prefix="muteki-chat-check-") as temp:
         root = Path(temp)
+        defaults = ChatPluginService(root / "defaults")
+        try:
+            visualize = defaults.get("muteki-visualize")
+            assert visualize["enabled"] and visualize["modes"] == ["chat"]
+            assert set(visualize["engines"]) == set(ENGINES)
+            defaults.update("muteki-visualize", enabled=False)
+            restarted = ChatPluginService(root / "defaults")
+            assert restarted.get("muteki-visualize")["enabled"] is False
+            restarted.uninstall("muteki-visualize")
+            deleted = ChatPluginService(root / "defaults")
+            assert deleted.get("muteki-visualize") == {}
+            assert deleted.records() == []
+            deleted.install_visualize()
+            assert deleted.get("muteki-visualize")["enabled"] is True
+            await deleted.close()
+            await restarted.close()
+        finally:
+            await defaults.close()
         package = root / "source"
         skill = package / "skills" / "echo"
         skill.mkdir(parents=True)
         (skill / "SKILL.md").write_text("---\nname: echo\ndescription: Reply with the test marker.\n---\nReply TEST_OK.\n")
         (package / "server.py").write_text(SERVER)
         manifest = {"name": "test-chat", "version": "1", "mcpServers": {
-            "echo": {"command": sys.executable, "args": ["${PLUGIN_ROOT}/server.py"], "env": {"TEST_SECRET": "not-a-real-secret"}}
+            "echo": {"command": getattr(sys, "_base_executable", sys.executable), "args": ["${PLUGIN_ROOT}/server.py"], "env": {"TEST_SECRET": "not-a-real-secret"}}
         }}
         (package / "plugin.json").write_text(json.dumps(manifest))
         before = {str(p): sha256(p.read_bytes()).hexdigest() for p in package.rglob("*") if p.is_file()}
@@ -54,7 +72,7 @@ async def check() -> None:
             assert public["enabled"] and set(public["engines"]) == set(ENGINES)
             assert "TEST_SECRET" not in json.dumps(public) and "not-a-real-secret" not in json.dumps(public)
             for engine in ENGINES:
-                rows = service.skill_rows(engine)
+                rows = [row for row in service.skill_rows(engine) if row["name"] == "test-chat:echo"]
                 assert len(rows) == 1
                 _, context = resolve_capability_refs(rows, engine=engine, plugin_service=service)
                 assert "Reply TEST_OK" in context
@@ -62,7 +80,7 @@ async def check() -> None:
             native = native_home / ".codex/skills/native-only"
             native.mkdir(parents=True)
             (native / "SKILL.md").write_text("---\nname: native-only\n---\nTest only.\n")
-            with patch("pathlib.Path.home", return_value=native_home):
+            with patch("pathlib.Path.home", return_value=native_home), patch("muteki.conversation.chat_providers.native_user_home", return_value=native_home), patch("muteki.conversation.chat_plugins.native_user_home", return_value=native_home):
                 codex = next(row for row in discover_skills("codex") if row["name"] == "native-only")
                 assert not any(row["name"] == "native-only" for row in discover_skills("kimi"))
                 try:
@@ -72,7 +90,7 @@ async def check() -> None:
                 else:
                     raise AssertionError("Native Codex skill crossed into Kimi")
                 for engine in ENGINES:
-                    env = service.prepare_environment(engine, "test", {})
+                    env = service.prepare_environment(engine, "test", {}, isolated=True)
                     if not provider_for(engine).managed_environment:
                         assert env == {}, "Unmanaged runtimes must preserve their native session home"
                         continue
@@ -155,7 +173,8 @@ async def check() -> None:
             else:
                 print("stdio check skipped: no supported OS isolation backend")
             service.update("test-chat", enabled=False)
-            assert all(not service.skill_rows(engine) for engine in ENGINES)
+            assert all(not any(row["name"] == "test-chat:echo" for row in service.skill_rows(engine))
+                       for engine in ENGINES)
             manifest["version"] = "2"
             (package / "plugin.json").write_text(json.dumps(manifest))
             service.install({"path": str(package)})
@@ -170,7 +189,7 @@ async def check() -> None:
                 raise AssertionError("Package symlink was accepted")
             service.uninstall("test-chat")
             await service.invalidate()
-            assert not service.records()
+            assert {row["id"] for row in service.records()} == {"muteki-visualize"}
             if platform.system() == "Darwin" or shutil.which("bwrap"):
                 resources = root / "resources"
                 resources.mkdir()
@@ -183,7 +202,7 @@ async def check() -> None:
  elif method=="tools/list":''')
                 (resources / "server.py").write_text(code)
                 (resources / "plugin.json").write_text(json.dumps({"name":"resources-only", "mcpServers":{"resource-server":{
-                    "command":sys.executable,"args":["${PLUGIN_ROOT}/server.py"]}}}))
+                    "command":getattr(sys, "_base_executable", sys.executable),"args":["${PLUGIN_ROOT}/server.py"]}}}))
                 service.install({"path":str(resources)})
                 for engine in ENGINES:
                     tools = await service.prepare_tools(engine)

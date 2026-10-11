@@ -879,18 +879,15 @@ def _detail(returncode: int, stdout: str, stderr: str) -> str:
     return f"模型测试退出 {returncode}"
 
 
-def _safe_output(value: Any, *, limit: int = 12000) -> str:
-    """Keep model-test output useful without returning unbounded terminal data."""
-    text = str(value or "").replace("\x00", "")
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}\n… 输出已截断（原始长度 {len(text)} 字符）"
+def _safe_output(value: Any) -> str:
+    """Preserve the complete model-test evidence, removing only NUL bytes."""
+    return str(value or "").replace("\x00", "")
 
 
 def _test_log(stream: str, message: str, elapsed_ms: int) -> dict[str, Any]:
     return {
         "stream": stream,
-        "message": _safe_output(message, limit=4000),
+        "message": _safe_output(message),
         "elapsed_ms": max(0, int(elapsed_ms)),
     }
 
@@ -991,9 +988,12 @@ def _process_result(
 
 
 def _model_turn_failure(
-    *, engine: str, returncode: int, stdout: Any, stderr: Any,
+    *, profile: dict[str, Any], engine: str, returncode: int, stdout: Any, stderr: Any,
 ) -> tuple[str, str, str]:
     """Classify a completed minimal turn without conflating no reply with auth."""
+    parsed = driver_for(profile).parse(str(stdout or ""), str(stderr or ""))
+    if parsed.error:
+        return (f"模型请求失败：{parsed.error}", "model", "model_rejected")
     output = f"{stdout or ''}\n{stderr or ''}"
     lowered = output.casefold()
     if "request timed out" in lowered or "request timeout" in lowered:
@@ -1073,7 +1073,10 @@ class ProbeProcessOwner:
 
     @staticmethod
     def _terminate(process: subprocess.Popen) -> None:
-        if process.poll() is not None:
+        # A wrapper can exit while its children still hold the output pipes.
+        # On POSIX the owned process group survives its leader, so always stop
+        # the whole group before communicate() drains those pipes.
+        if os.name != "posix" and process.poll() is not None:
             return
         try:
             if os.name == "posix":
@@ -1084,7 +1087,6 @@ class ProbeProcessOwner:
             pass
         try:
             process.wait(timeout=1.0)
-            return
         except (subprocess.TimeoutExpired, OSError):
             pass
         try:
@@ -1511,6 +1513,7 @@ def _worker_container_model_probe(
         failure_code = "model_rejected"
     elif not reply_ok:
         detail, failure_layer, failure_code = _model_turn_failure(
+            profile=profile,
             engine=engine,
             returncode=run.returncode,
             stdout=run.stdout,
@@ -1594,7 +1597,7 @@ def probe_worker_model(
 
     with ExitStack() as stack:
         agent_state_dir = None
-        if _writes_agent_state(engine):
+        if resolved_account_id and _writes_agent_state(engine):
             agent_state_dir = stack.enter_context(
                 tempfile.TemporaryDirectory(
                     prefix=f"muteki-{engine}-model-test-"))
@@ -1637,23 +1640,12 @@ def probe_worker_model(
         command = shlex.join(argv)
         try:
             process_env = {**os.environ, **env}
-            if owner is not None:
-                r = _run_owned_process(
-                    argv,
-                    timeout=getattr(drv, "_HELLO_TIMEOUT", 90),
-                    owner=owner,
-                    env=process_env,
-                )
-            else:
-                r = subprocess.run(
-                    argv,
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8", errors="replace",
-                    timeout=getattr(drv, "_HELLO_TIMEOUT", 90),
-                    env=process_env,
-                )
+            r = _run_owned_process(
+                argv,
+                timeout=getattr(drv, "_HELLO_TIMEOUT", 90),
+                owner=owner if owner is not None else ProbeProcessOwner(),
+                env=process_env,
+            )
         except FileNotFoundError:
             return _process_result(
                 ok=False, detail="CLI 不存在", engine=engine, model=model,
@@ -1694,6 +1686,7 @@ def probe_worker_model(
             failure_code = "model_rejected"
         elif not reply_ok:
             detail, failure_layer, failure_code = _model_turn_failure(
+                profile=profile,
                 engine=engine,
                 returncode=r.returncode,
                 stdout=r.stdout,
@@ -2222,6 +2215,7 @@ def _worker_container_model_batch_probe(
                                     failure_code = "model_rejected"
                                 elif not reply_ok:
                                     detail, failure_layer, failure_code = _model_turn_failure(
+                                        profile=task["profile"],
                                         engine=task["engine"],
                                         returncode=outcome.returncode,
                                         stdout=outcome.stdout,
@@ -2840,17 +2834,24 @@ def _endpoint_test_config_var(engine: str, profile: dict[str, Any]) -> str:
 def _private_model_probe_env(
     engine: str, sessions_root: str | Path, account_id: str, env: dict[str, str],
 ) -> dict[str, str]:
-    # Model catalogs and minimal model tests can refresh auth or write CLI
-    # preferences too. Keep that discovery traffic out of the operator home.
+    # System probes share the native account; stored credentials are isolated.
+    if not account_id:
+        from muteki.core.runtime_env import native_user_environment
+        return native_user_environment(env)
     from muteki.conversation.chat_plugins import ChatPluginService, ENGINES
     if engine not in ENGINES:
         return env
     service = ChatPluginService(Path(sessions_root) / "_model_probe_environments")
-    return service.prepare_environment(engine, "model-probe:" + account_id, env, include_assets=False)
+    return service.prepare_environment(engine, "model-probe:" + account_id,
+                                       {**env, "MUTEKI_HOST_DISCOVERY": "0"},
+                                       include_assets=False, isolated=True)
 
 
 @contextmanager
 def _temporary_model_probe_env(engine: str, sessions_root: str | Path, account_id: str, env: dict[str, str]):
+    if not account_id:
+        yield _private_model_probe_env(engine, sessions_root, account_id, env)
+        return
     base = Path(sessions_root) / "_model_probe_environments"
     base.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Each concurrent request gets its own small home. Success, failure and

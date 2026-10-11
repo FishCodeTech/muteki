@@ -24,6 +24,8 @@ import {
   type ListOption,
 } from "@/components/chat/ui";
 import {
+  cachedComposerCapabilities,
+  clearComposerCapabilityCache,
   fetchComposerCapabilities,
   ComposerCapabilityError,
   type ComposerCapabilityContext,
@@ -313,10 +315,14 @@ export function PromptBar({
   const [pluginRevision, setPluginRevision] = useState(0);
   useEffect(() => {
     const refresh = () => setPluginRevision((n) => n + 1);
-    window.addEventListener("muteki:chat-plugins-changed", refresh);
+    const pluginsChanged = () => {
+      clearComposerCapabilityCache();
+      refresh();
+    };
+    window.addEventListener("muteki:chat-plugins-changed", pluginsChanged);
     window.addEventListener("focus", refresh);
     return () => {
-      window.removeEventListener("muteki:chat-plugins-changed", refresh);
+      window.removeEventListener("muteki:chat-plugins-changed", pluginsChanged);
       window.removeEventListener("focus", refresh);
     };
   }, []);
@@ -333,11 +339,12 @@ export function PromptBar({
     return () => observer.disconnect();
   }, []);
   const capabilityAdapterId = capabilityContext?.adapterId || "";
+  const capabilityInstanceId = capabilityContext?.instanceId || "";
   const capabilityThreadId = capabilityContext?.threadId || "";
   const capabilityWorkspaceId = capabilityContext?.workspaceId || "";
   const capabilityProjectId = capabilityContext?.projectId || "";
   const capabilityQueryKey = JSON.stringify([
-    capabilityAdapterId, capabilityThreadId, capabilityWorkspaceId, capabilityProjectId,
+    capabilityAdapterId, capabilityInstanceId, capabilityThreadId, capabilityWorkspaceId, capabilityProjectId,
     activeCapabilityTrigger, activeCapabilityQuery, capabilityContext?.revision, pluginRevision,
   ]);
   const capabilityItems = capabilityResultKey === capabilityQueryKey ? catalogItems : [];
@@ -385,31 +392,42 @@ export function PromptBar({
   }, [editorElement, useStructuredDoc]);
 
   useEffect(() => {
-    setCapabilityItems([]);
-    setCapabilityResultKey("");
     setCapabilityError("");
     setCapabilityErrorDiagnostic("");
-    setCapabilitySectionErrors([]);
-    setCapabilityRuntime(null);
     if (!activeCapabilityTrigger || !capabilityAdapterId) {
       setCapabilityItems([]);
+      setCapabilityResultKey("");
+      setCapabilitySectionErrors([]);
       setCapabilityLoading(false);
-      setCapabilityError("");
       setCapabilityRuntime(null);
       return;
     }
+    const requestContext = {
+      adapterId: capabilityAdapterId,
+      instanceId: capabilityInstanceId,
+      threadId: capabilityThreadId,
+      workspaceId: capabilityWorkspaceId,
+      projectId: capabilityProjectId,
+      revision: capabilityContext?.revision,
+    };
+    const cached = cachedComposerCapabilities(requestContext, activeCapabilityTrigger, activeCapabilityQuery);
+    if (cached) {
+      setCapabilityItems(cached.items);
+      setCapabilityResultKey(capabilityQueryKey);
+      setCapabilityRuntime(cached.runtime);
+      setCapabilitySectionErrors(cached.sectionErrors);
+      setActiveCapabilityIndex(0);
+    } else {
+      setCapabilityItems([]);
+      setCapabilityResultKey("");
+      setCapabilitySectionErrors([]);
+      setCapabilityRuntime(null);
+    }
     const controller = new AbortController();
-    setCapabilityLoading(true);
+    setCapabilityLoading(!cached);
     const timer = window.setTimeout(() => {
-      setCapabilityLoading(true);
-      setCapabilityError("");
       void fetchComposerCapabilities(
-        {
-          adapterId: capabilityAdapterId,
-          threadId: capabilityThreadId,
-          workspaceId: capabilityWorkspaceId,
-          projectId: capabilityProjectId,
-        },
+        requestContext,
         activeCapabilityTrigger,
         activeCapabilityQuery,
         controller.signal,
@@ -419,10 +437,11 @@ export function PromptBar({
         setCapabilityResultKey(capabilityQueryKey);
         setCapabilityRuntime(runtime);
         setCapabilitySectionErrors(sectionErrors);
-        setActiveCapabilityIndex(0);
+        if (!cached) setActiveCapabilityIndex(0);
       }).catch((error: unknown) => {
         if (controller.signal.aborted) return;
         setCapabilityItems([]);
+        setCapabilityResultKey("");
         setCapabilityError(error instanceof Error ? error.message : String(error));
         setCapabilityErrorDiagnostic(error instanceof ComposerCapabilityError ? error.diagnostic : String(error));
       }).finally(() => {
@@ -439,6 +458,7 @@ export function PromptBar({
     activeCapabilityQuery,
     activeCapabilityTrigger,
     capabilityAdapterId,
+    capabilityInstanceId,
     capabilityProjectId,
     capabilityThreadId,
     capabilityWorkspaceId,

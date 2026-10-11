@@ -404,18 +404,14 @@ def make_helpers(app: FastAPI) -> SimpleNamespace:
         seats = [row for row in (payload.get("seats") or []) if isinstance(row, dict)]
         aliases = payload.get("seat_alias") if isinstance(payload.get("seat_alias"), dict) else {}
         coordinator = (payload.get("stage_policy") or {}).get("coordinator") or {}
-        for key, role in (("review", "review"), ("verifier", "verifier")):
+        for key in ("review", "verifier"):
             policy = coordinator.get(key)
             if not isinstance(policy, dict):
                 continue
             canonical = resolve_seat_ref(
                 policy.get("engine"), seats=seats, alias_table=aliases)
-            if canonical is None:
-                canonical = next((
-                    str(seat.get("id")) for seat in seats
-                    if role in (seat.get("roles") or []) and seat.get("enabled", True)
-                ), None)
-            policy["engine"] = canonical or ""
+            if canonical is not None:
+                policy["engine"] = canonical
         # #171 / MNT-09.04: surface requested vs effective Docker network.
         from muteki.solver.container_exec import (
             WorkerNetworkConfigError,

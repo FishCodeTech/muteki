@@ -189,11 +189,11 @@ static napi_value Start(napi_env env, napi_callback_info info) {
 static napi_value Finish(napi_env, napi_callback_info) { [activeSession endAudio]; return nullptr; }
 static napi_value Cancel(napi_env, napi_callback_info) { [activeSession finish:@{@"type": @"cancelled"}]; return nullptr; }
 static void Cleanup(void *) { [activeSession finish:@{@"type": @"cancelled"}]; }
-static napi_value NotificationSettings(napi_env env, napi_callback_info info) {
+static napi_value NotificationOperation(napi_env env, napi_callback_info info, bool request) {
   size_t argc = 1; napi_value args[1], resource; napi_valuetype type;
   napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
   if (argc != 1 || napi_typeof(env, args[0], &type) != napi_ok || type != napi_function) {
-    napi_throw_type_error(env, nullptr, "notificationSettings requires a callback"); return nullptr;
+    napi_throw_type_error(env, nullptr, "Notification operation requires a callback"); return nullptr;
   }
   napi_create_string_utf8(env, "Muteki notification settings", NAPI_AUTO_LENGTH, &resource);
   napi_threadsafe_function callback;
@@ -207,6 +207,13 @@ static napi_value NotificationSettings(napi_env env, napi_callback_info info) {
     napi_release_threadsafe_function(callback, napi_tsfn_release);
   };
   @try {
+    if (request) {
+      [UNUserNotificationCenter.currentNotificationCenter requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound) completionHandler:^(BOOL granted, NSError *error) {
+        if (error) deliver(@{@"error": @{@"code": @"desktop.notification_authorization_failed", @"message": error.localizedDescription, @"nativeDomain": error.domain, @"nativeCode": @(error.code)}});
+        else deliver(@{@"granted": @(granted)});
+      }];
+      return nullptr;
+    }
     // Read only. Never call requestAuthorization or schedule a notification.
     [UNUserNotificationCenter.currentNotificationCenter getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *settings) {
       NSString *status;
@@ -217,7 +224,7 @@ static napi_value NotificationSettings(napi_env env, napi_callback_info info) {
         case UNAuthorizationStatusProvisional: status = @"provisional"; break;
         default: status = @"unknown"; break;
       }
-      deliver(@{@"authorizationStatus": status, @"authorizationStatusRaw": @(settings.authorizationStatus),
+      deliver(@{@"bundleIdentifier": NSBundle.mainBundle.bundleIdentifier ?: @"", @"authorizationStatus": status, @"authorizationStatusRaw": @(settings.authorizationStatus),
         @"alertSettingRaw": @(settings.alertSetting), @"soundSettingRaw": @(settings.soundSetting), @"notificationCenterSettingRaw": @(settings.notificationCenterSetting), @"lockScreenSettingRaw": @(settings.lockScreenSetting), @"alertStyleRaw": @(settings.alertStyle)});
     }];
   } @catch (NSException *exception) {
@@ -225,8 +232,10 @@ static napi_value NotificationSettings(napi_env env, napi_callback_info info) {
   }
   return nullptr;
 }
+static napi_value NotificationSettings(napi_env env, napi_callback_info info) { return NotificationOperation(env, info, false); }
+static napi_value RequestNotifications(napi_env env, napi_callback_info info) { return NotificationOperation(env, info, true); }
 static napi_value Init(napi_env env, napi_value exports) {
-  napi_property_descriptor methods[] = {{"start", nullptr, Start, nullptr, nullptr, nullptr, napi_default, nullptr}, {"finish", nullptr, Finish, nullptr, nullptr, nullptr, napi_default, nullptr}, {"cancel", nullptr, Cancel, nullptr, nullptr, nullptr, napi_default, nullptr}, {"notificationSettings", nullptr, NotificationSettings, nullptr, nullptr, nullptr, napi_default, nullptr}};
-  napi_define_properties(env, exports, 4, methods); napi_add_env_cleanup_hook(env, Cleanup, nullptr); return exports;
+  napi_property_descriptor methods[] = {{"start", nullptr, Start, nullptr, nullptr, nullptr, napi_default, nullptr}, {"finish", nullptr, Finish, nullptr, nullptr, nullptr, napi_default, nullptr}, {"cancel", nullptr, Cancel, nullptr, nullptr, nullptr, napi_default, nullptr}, {"notificationSettings", nullptr, NotificationSettings, nullptr, nullptr, nullptr, napi_default, nullptr}, {"requestNotifications", nullptr, RequestNotifications, nullptr, nullptr, nullptr, napi_default, nullptr}};
+  napi_define_properties(env, exports, 5, methods); napi_add_env_cleanup_hook(env, Cleanup, nullptr); return exports;
 }
 NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)

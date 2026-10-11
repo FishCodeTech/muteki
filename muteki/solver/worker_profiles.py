@@ -246,7 +246,7 @@ def normalize_worker_profiles(value: Any, *, defaults: list[dict[str, Any]] | No
             continue
         seen.add(profile["name"])
         out.append(profile)
-    return out or [dict(p) for p in (defaults or [])]
+    return out
 
 
 def profile_names(profiles: list[dict[str, Any]]) -> list[str]:

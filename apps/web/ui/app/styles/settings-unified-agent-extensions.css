@@ -72,6 +72,7 @@
 .cx-settings-agent-ext .ae-empty p { line-height: 1.5; }
 .cx-settings-agent-ext .ae-empty button { margin-top: 8px; }
 .cx-settings-agent-ext .ae-native > p { padding: 14px 20px; border-bottom: 1px solid var(--cx-border-subtle); background: transparent; color: var(--cx-fg-3); font-size: 13px; line-height: 1.5; }
+.cx-settings-agent-ext .ae-native-group { margin: 0; padding: 12px 20px 6px; border-top: 1px solid var(--cx-border-subtle); color: var(--cx-fg-3); font-size: 12px; font-weight: 500; }
 .cx-settings-agent-ext .ae-native-row { gap: 2px 12px; padding: 14px 20px; border-top: 0; font-size: 14px; transition: background-color .15s; }
 .cx-settings-agent-ext .ae-native-row + .ae-native-row { border-top: 1px solid var(--cx-border-subtle); }
 .cx-settings-agent-ext .ae-native-row:hover { background: var(--cx-hover); }

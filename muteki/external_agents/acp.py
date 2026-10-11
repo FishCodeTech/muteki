@@ -35,11 +35,12 @@ RUNTIME-04 的 Kimi ACP / OMP ACP 直接复用 ``AcpTransport`` 与
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import inspect
 import os
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Awaitable, Callable, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Sequence
 
 from muteki.capability_bindings.acp_config import TOKEN_PLACEHOLDER
 from muteki.platform.contracts.agent_events import (
@@ -114,6 +115,7 @@ from .capabilities import (
     conservative_capabilities,
     require_access_mode,
 )
+from .context_delivery import acp_block_channel, acp_context_blocks, text_with_envelopes
 from .events import build_event
 from .rpc import PeerClosedError, StdioJsonlPeer
 from .runtime_capabilities import (
@@ -167,6 +169,8 @@ class AcpHello:
     list_sessions: bool = False
     mcp_http: bool = False
     mcp_sse: bool = False
+    # promptCapabilities.embeddedContext: resource blocks in session/prompt.
+    embedded_context: bool = False
     agent_info: dict[str, Any] = field(default_factory=dict)
     auth_methods: list[dict[str, Any]] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
@@ -184,6 +188,7 @@ class AcpHello:
             list_sessions="list" in session_caps,
             mcp_http=bool(mcp_caps.get("http")),
             mcp_sse=bool(mcp_caps.get("sse")),
+            embedded_context=bool((caps.get("promptCapabilities") or {}).get("embeddedContext")),
             agent_info=dict(result.get("agentInfo") or {}),
             auth_methods=list(result.get("authMethods") or []),
             raw=dict(result),
@@ -341,11 +346,12 @@ class AcpTransport:
 
     async def new_session(
         self, cwd: str, mcp_servers: list[dict[str, Any]], *,
-        timeout: float = 60.0,
+        timeout: float = 60.0, meta: Optional[dict[str, Any]] = None,
     ) -> str:
-        resp = await self._peer.request("session/new", {
-            "cwd": cwd, "mcpServers": list(mcp_servers),
-        }, timeout=timeout)
+        params: dict[str, Any] = {"cwd": cwd, "mcpServers": list(mcp_servers)}
+        if meta:
+            params["_meta"] = meta
+        resp = await self._peer.request("session/new", params, timeout=timeout)
         result = check_response("session/new", resp)
         session_id = str(result.get("sessionId") or "")
         if not session_id:
@@ -355,7 +361,7 @@ class AcpTransport:
 
     async def load_session(
         self, session_id: str, cwd: str, mcp_servers: list[dict[str, Any]], *,
-        timeout: float = 120.0,
+        timeout: float = 120.0, meta: Optional[dict[str, Any]] = None,
     ) -> None:
         """``session/load``：回放的历史 update 全部由 replay 判定标记。"""
         if self.hello is not None and not self.hello.load_session:
@@ -364,27 +370,31 @@ class AcpTransport:
         self._replaying_sessions.add(session_id)
         self._session_setup.pop(session_id, None)
         try:
+            params: dict[str, Any] = {"sessionId": session_id, "cwd": cwd,
+                                      "mcpServers": list(mcp_servers)}
+            if meta:
+                params["_meta"] = meta
             result = check_response("session/load", await self._peer.request(
-                "session/load", {"sessionId": session_id, "cwd": cwd,
-                                 "mcpServers": list(mcp_servers)}, timeout=timeout))
+                "session/load", params, timeout=timeout))
         finally:
             self._replaying_sessions.discard(session_id)
         self._session_setup[session_id] = {**result, **self._session_setup.get(session_id, {})}
 
     async def resume_session(
         self, session_id: str, cwd: str, mcp_servers: list[dict[str, Any]], *,
-        timeout: float = 60.0,
+        timeout: float = 60.0, meta: Optional[dict[str, Any]] = None,
     ) -> None:
         """``session/resume``：不重放历史（仅在 resume 能力存在时调用）。"""
         if self.hello is not None and not self.hello.resume:
             raise AcpError("agent does not support session/resume "
                            "(sessionCapabilities.resume absent)")
         self._session_setup.pop(session_id, None)
+        params: dict[str, Any] = {"sessionId": session_id, "cwd": cwd,
+                                  "mcpServers": list(mcp_servers)}
+        if meta:
+            params["_meta"] = meta
         result = check_response("session/resume", await self._peer.request(
-            "session/resume",
-            {"sessionId": session_id, "cwd": cwd,
-             "mcpServers": list(mcp_servers)},
-            timeout=timeout))
+            "session/resume", params, timeout=timeout))
         self._session_setup[session_id] = {**result, **self._session_setup.get(session_id, {})}
 
     def session_setup(self, session_id: str) -> dict[str, Any]:
@@ -452,8 +462,11 @@ class AcpTransport:
         timeout: Optional[float] = 600.0,
         meta: Optional[dict[str, Any]] = None,
         prompt_id: Optional[str] = None,
+        context_blocks: Sequence[dict[str, Any]] = (),
     ) -> dict[str, Any]:
         """一个 prompt turn；返回 ``{stopReason, ...}``。
+
+        ``context_blocks`` (Muteki context parts) precede the user's text block.
 
         ``timeout`` 为 ``None`` 或 ``<= 0`` 时不设上限。对话模式会显式
         传入 ``None``；做题 Worker 仍走默认 600 秒。
@@ -464,7 +477,7 @@ class AcpTransport:
         self._active_prompts.add(session_id)
         params: dict[str, Any] = {
             "sessionId": session_id,
-            "prompt": [{"type": "text", "text": text}],
+            "prompt": [*context_blocks, {"type": "text", "text": text}],
         }
         request_meta = dict(meta or {})
         if prompt_id:
@@ -1233,6 +1246,10 @@ class BaseAcpAdapter(
     """
 
     adapter_id = "acp.base"
+    # ACP has no system channel: host rules and turn parts precede the user's
+    # text block as resource blocks (``embeddedContext``) or text blocks.
+    host_context_channel = "acp_blocks"
+    turn_context_channel = "acp_blocks"
 
     #: Conversation access modes this provider enforces, either through a
     #: native control selected at launch or through the shared permission
@@ -1256,6 +1273,12 @@ class BaseAcpAdapter(
     rate_limit_error_codes: tuple[int, ...] = ()
     #: ``session/set_mode`` id of the engine's read-only planning mode.
     plan_mode_id = "plan"
+    #: The agent was observed sending context-window occupancy (``usage_update``
+    #: or an engine extension). ``initialize`` does not advertise it, so each
+    #: provider declares what a live session showed.
+    context_usage_reported = False
+    #: The adapter maps an engine extension that reports compaction progress.
+    compaction_reported = False
 
     def __init__(
         self,
@@ -1294,6 +1317,21 @@ class BaseAcpAdapter(
 
     def _agent_argv(self) -> list[str]:
         raise NotImplementedError
+
+    def _turn_only_prompt_failure(self, error: Exception) -> Optional[AgentFailure]:
+        """Typed failure for a prompt error after which the engine keeps running.
+
+        ``None`` keeps the default: the turn fails and the runtime is reported
+        as exited.
+        """
+        return None
+
+    async def _prepare_agent(self) -> None:
+        """Provider hook to install the Agent executable before it is launched.
+
+        Runs outside the ``initialize`` timeout so a first-time install is not
+        reported as a protocol handshake failure.
+        """
 
     def _agent_argv_for_request(self, request: SessionStart) -> list[str]:
         """Return this Agent's native launch command for one Conversation session.
@@ -1464,6 +1502,10 @@ class BaseAcpAdapter(
         del request
         return materialize_mcp_servers(plan, bearer_token)
 
+    def _session_open_meta(self, request: SessionStart) -> dict[str, Any]:
+        """``_meta`` for session/new, load and resume (runtime-specific)."""
+        return {}
+
     async def _after_session_open(
         self, transport: "AcpTransport", session_id: str, request: SessionStart
     ) -> None:
@@ -1533,6 +1575,9 @@ class BaseAcpAdapter(
         hello: Optional[AcpHello] = None
         detail = ""
         try:
+            await self._prepare_agent()
+            argv = self._with_launch_args(self._agent_argv())
+            binary = argv[0] if argv else ""
             transport = self._new_transport(
                 argv, client_name=self._client_name,
                 **self._initialize_options())
@@ -1579,6 +1624,8 @@ class BaseAcpAdapter(
         caps.access_modes = list(self.supported_access_modes)
         caps.interrupt = True
         caps.usage_events = True
+        caps.context_usage = self.context_usage_reported
+        caps.compaction = self.compaction_reported
         # ACP sessionUpdate.kind == "plan" is first-class in the wire protocol.
         caps.plan = True
         caps.resume = hello.resume or hello.load_session
@@ -1669,6 +1716,7 @@ class BaseAcpAdapter(
             "interaction_mode": "default",
             "mcp_servers": mcp_servers,
         }
+        await self._prepare_agent()
         transport = self._new_transport(
             self._with_launch_args(self._agent_argv_for_request(request)), cwd=cwd, env=env,
             client_name=self._client_name,
@@ -1698,15 +1746,16 @@ class BaseAcpAdapter(
                     method_id, meta=self._authenticate_meta())
 
             resume_handle = request.resume_handle
+            session_meta = self._session_open_meta(request)
             if resume_handle:
                 # 恢复：优先 session/resume（不重放），load 为降级（重放
                 # 历史，回放事件只入 replay_events，不进投影）。
                 if hello.resume:
                     await transport.resume_session(
-                        resume_handle, cwd, mcp_servers)
+                        resume_handle, cwd, mcp_servers, meta=session_meta)
                 elif hello.load_session:
                     await transport.load_session(
-                        resume_handle, cwd, mcp_servers)
+                        resume_handle, cwd, mcp_servers, meta=session_meta)
                 else:
                     raise AcpError(
                         "agent supports neither session/resume nor "
@@ -1715,7 +1764,8 @@ class BaseAcpAdapter(
                 handle["resumed"] = True
             else:
                 session_id = await transport.new_session(
-                    cwd, mcp_servers, timeout=120 if self.id == "cursor.acp" else 60)
+                    cwd, mcp_servers, timeout=120 if self.id == "cursor.acp" else 60,
+                    meta=session_meta)
             # 子类钩子：session 建立后的 Runtime 特有动作（如 Kimi
             # session/set_model）；默认无操作。
             await self._after_session_open(transport, session_id, request)
@@ -2966,6 +3016,20 @@ class BaseAcpAdapter(
         handle["interaction_mode"] = wanted
         return None
 
+    def _prompt_content(
+        self, sid: str, transport: Any, input: MessageInput,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """The user's text and the context blocks sent before it."""
+        host = self.host_context_channel != "system_prompt"
+        if self.turn_context_channel == "text_envelope":
+            parts = self.turn_context(sid, input, host=host, channel="text_envelope")
+            return text_with_envelopes(input.text, parts), []
+        hello = getattr(transport, "hello", None)
+        embedded = bool(getattr(hello, "embedded_context", False))
+        parts = self.turn_context(sid, input, host=host, channel=functools.partial(
+            acp_block_channel, embedded_context=embedded))
+        return input.text, acp_context_blocks(parts, embedded_context=embedded)
+
     async def _prompt_stream(
         self, session: AgentSessionRef, input: MessageInput
     ) -> AsyncIterator[AgentEvent]:
@@ -3033,15 +3097,17 @@ class BaseAcpAdapter(
 
         queue: asyncio.Queue = asyncio.Queue()
         handle["event_sink"] = queue
+        prompt_text, context_blocks = self._prompt_content(sid, transport, input)
 
         async def run_prompt() -> dict[str, Any]:
             try:
                 return await transport.prompt(
-                    external_id, input.text,
+                    external_id, prompt_text,
                     timeout=self.conversation_turn_timeout(
                         handle.get("thread_id"), self._prompt_timeout),
                     meta=self._prompt_meta(handle),
-                    prompt_id=self._prompt_id(handle))
+                    prompt_id=self._prompt_id(handle),
+                    context_blocks=context_blocks)
             except Exception as exc:  # noqa: BLE001
                 return {"__error__": exc}
             finally:
@@ -3097,6 +3163,15 @@ class BaseAcpAdapter(
                         error, FailureCategory.USAGE_LIMIT, "usage_limit",
                         message=str(error).strip() or "Usage limit reached",
                         retryable=True)),
+                    **common))
+                return
+            turn_only = self._turn_only_prompt_failure(error)
+            if turn_only is not None:
+                yield self.emit(build_event(
+                    AgentEventType.TURN_FAILED, seq,
+                    external_session_id=external_id, turn_id=turn_id,
+                    native_type="acp.prompt.error",
+                    payload=TurnFailedPayload(error=turn_only),
                     **common))
                 return
             timed_out = isinstance(error, asyncio.TimeoutError)

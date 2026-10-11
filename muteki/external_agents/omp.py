@@ -66,6 +66,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
 import httpx
@@ -124,12 +125,14 @@ from .capabilities import (
     conservative_capabilities,
     _probe_version,
 )
+from .context_delivery import system_append, text_with_envelopes
 from .events import build_event
 from .runtime_capabilities import (
     RuntimeCapabilitySnapshot,
     dynamic_command_item,
 )
 from .rpc import PeerClosedError, StdioJsonlPeer
+from .rpc_commands import rpc_compaction_events, rpc_context_usage_event, rpc_context_window
 from .sessions import classify_exit
 
 #: role 选项 → CLI flag（§OMP-6：role 是 modelRoles 配置，非会话参数）。
@@ -353,6 +356,7 @@ class OmpRpcAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
     """OMP 的 NDJSON RPC 结构化 Adapter（``--mode rpc`` / ``rpc-ui``）。"""
 
     adapter_id = "omp.rpc"
+    host_context_channel = "system_prompt"
     context_compaction_events = True
 
     def __init__(
@@ -387,8 +391,13 @@ class OmpRpcAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
         add_dirs: Optional[list[str]] = None,
         no_session: bool = False,
         session_dir: Optional[str] = None,
+        native_extensions: Optional[list[str]] = None,
+        native_agents: Optional[list[str]] = None,
+        append_system_prompt: str = "",
     ) -> list[str]:
         argv = self._with_launch_args([self._binary, "--mode", "rpc-ui" if self._rpc_ui else "rpc"])
+        if append_system_prompt:
+            argv.append(f"--append-system-prompt={append_system_prompt}")
         if cwd:
             argv += ["--cwd", cwd]
         if provider:
@@ -405,6 +414,10 @@ class OmpRpcAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
             argv.append("--no-session")
         elif session_dir or self._session_dir:
             argv += ["--session-dir", session_dir or str(self._session_dir)]
+        for native_extension in native_extensions or []:
+            argv += ["--extension", native_extension]
+        for plugin_dir in dict.fromkeys(str(Path(agent).parent.parent) for agent in native_agents or []):
+            argv += ["--plugin-dir", plugin_dir]
         return argv
 
     @staticmethod
@@ -541,6 +554,8 @@ class OmpRpcAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
         # RPC command "compact" {customInstructions?}（rpc-mode.ts），
         # runtime 快照以 verified operation 暴露。
         caps.compaction = True
+        # message_end usage plus get_state model.contextWindow.
+        caps.context_usage = True
         for field_name in BOOL_CAPABILITY_FIELDS:
             field_sources[field_name] = SOURCE_PROBE
         if not self._rpc_ui:
@@ -752,6 +767,9 @@ class OmpRpcAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
                 add_dirs=list(options.add_dirs),
                 no_session=options.ephemeral,
                 session_dir=options.session_dir or None,
+                native_extensions=list(options.chat_native_extensions),
+                native_agents=list(options.chat_native_agents),
+                append_system_prompt=system_append(options.host_context),
             ),
             cwd=cwd, label="omp.rpc",
             env=process_env,
@@ -799,6 +817,7 @@ class OmpRpcAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
 
         session_id = str(state.get("sessionId") or "")
         handle["external_session_id"] = session_id or None
+        handle["context_window"] = rpc_context_window(state)
         handle["resume_handle"] = str(state.get("sessionFile") or request.resume_handle or "") or None
         return {
             "external_session_id": session_id or None,
@@ -856,9 +875,17 @@ class OmpRpcAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
         if handle is None:
             return
         etype = msg.get("type")
-        if etype in {"compaction_end", "auto_compaction_end"}:
-            if isinstance(msg.get("result"), dict) and not msg.get("aborted") and not msg.get("errorMessage") and not msg.get("skipped"):
+        if etype in {"compaction_start", "auto_compaction_start",
+                     "compaction_end", "auto_compaction_end"}:
+            done = etype.endswith("_end")
+            succeeded = done and isinstance(msg.get("result"), dict) and not msg.get("aborted") \
+                and not msg.get("errorMessage") and not msg.get("skipped")
+            if succeeded:
                 self._context_compacted(agent_session_id)
+            sink = handle.get("event_sink")
+            if sink is not None:
+                for event in rpc_compaction_events(msg, handle, succeeded, label="omp"):
+                    sink.put_nowait(event)
             return
         if etype == "available_commands_update":
             handle["available_commands"] = list(msg.get("commands") or [])
@@ -923,6 +950,9 @@ class OmpRpcAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
                 sink.put_nowait((AgentEventType.USAGE_UPDATED,
                                  "omp.message_end",
                                  _omp_usage_payload(usage, str(handle.get("usage_message_index", 0)))))
+                context = rpc_context_usage_event(usage, handle, label="omp")
+                if context is not None:
+                    sink.put_nowait(context)
             # 消息水位单调递增，无 usage 的消息也占位，避免两条消息的
             # usage 落到同一个 ledger identity 互相覆盖。
             handle["usage_message_index"] = int(handle.get("usage_message_index", 0)) + 1
@@ -1417,7 +1447,8 @@ class OmpRpcAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
             try:
                 # prompt 响应只是 ack（data.agentInvoked）；完成由
                 # agent_end/agent_settled（isTerminal!==false）判定。
-                response = await self._cmd(peer, "prompt", {"message": input.text},
+                response = await self._cmd(peer, "prompt", {"message": text_with_envelopes(
+                    input.text, self.turn_context(session.agent_session_id, input, host=False))},
                                 timeout=self.conversation_turn_timeout(
                                     handle.get("conversation_thread_id"),
                                     self._prompt_timeout))
@@ -1683,6 +1714,12 @@ class OmpAcpAdapter(BaseAcpAdapter):
     """
 
     adapter_id = "omp.acp"
+    # ``omp acp`` sends ``usage_update`` (used/size) after each turn.
+    context_usage_reported = True
+    host_context_channel = "system_prompt"
+    # OMP replays resource and text blocks merged into one user string, so
+    # turn parts travel as envelopes inside the single text block.
+    turn_context_channel = "text_envelope"
     unsupported_access_mode_reasons = {
         AccessMode.AUTO.value: (
             "OMP --approval-mode offers only always-ask, write and yolo; "
@@ -1715,6 +1752,13 @@ class OmpAcpAdapter(BaseAcpAdapter):
             argv += ["--provider", provider]
         if model:
             argv += ["--model", model]
+        for native_extension in request.options.chat_native_extensions:
+            argv += ["--extension", native_extension]
+        for plugin_dir in dict.fromkeys(str(Path(agent).parent.parent) for agent in request.options.chat_native_agents):
+            argv += ["--plugin-dir", plugin_dir]
+        if request.options.host_context:
+            # Global options go before the subcommand.
+            argv.append(f"--append-system-prompt={system_append(request.options.host_context)}")
         argv.append("acp")
         return argv
 

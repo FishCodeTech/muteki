@@ -16,6 +16,11 @@ from typing import Any
 from muteki.external_agents.descriptors import ProviderDescriptor, all_descriptors
 
 
+def native_user_home() -> Path:
+    from muteki.core.runtime_env import native_user_environment
+    return Path(native_user_environment().get("HOME") or str(Path.home()))
+
+
 @dataclass(frozen=True)
 class ChatEngineProvider:
     descriptor: ProviderDescriptor
@@ -52,9 +57,10 @@ class ChatEngineProvider:
 
     def native_root(self) -> Path:
         environment = self.descriptor.environment
-        value = os.environ.get(environment.home_env_var)
+        from muteki.core.runtime_env import native_user_environment
+        value = native_user_environment().get(environment.home_env_var)
         if not value:
-            return Path.home() / environment.home_relative
+            return native_user_home() / environment.home_relative
         root = Path(value).expanduser()
         return root / self.engine if environment.home_env_is_parent else root
 
@@ -63,7 +69,7 @@ class ChatEngineProvider:
             return []
         rows: dict[str, dict[str, Any]] = {}
         paths = [self.native_root() / filename for filename in self.mcp_files]
-        paths.extend(Path.home() / relative for relative in self.descriptor.environment.extra_mcp_home_files)
+        paths.extend(native_user_home() / relative for relative in self.descriptor.environment.extra_mcp_home_files)
         for path in paths:
             try:
                 if not path.is_file() or path.stat().st_size > 2_000_000:
@@ -117,7 +123,7 @@ class ChatEngineProvider:
             "maxMode", "maxModeAutoEnabled", "exploreSubagentModel",
         })
         return content_revision([(name, root / name) for name in (*self.configuration_names, *self.asset_names)]
-                                + [("common-skills", Path.home() / ".agents/skills")],
+                                + [("common-skills", native_user_home() / ".agents/skills")],
                                 json_exclude={"cli-config.json": cursor_runtime_fields}
                                 if self.engine == "cursor" else None)
 

@@ -12,6 +12,7 @@ from typing import Any, Optional
 from muteki.capability_bindings import agent_plugin as capability_agent_plugin
 from muteki.external_agents.base import BaseExternalAgentAdapter
 from muteki.external_agents.capabilities import probe_cli_driver
+from muteki.external_agents.context_delivery import text_with_envelopes
 from muteki.external_agents.events import build_event
 from muteki.external_agents.sessions import (
     EXIT_CLOSED,
@@ -25,6 +26,7 @@ from muteki.platform.contracts.external_agents import (
     AgentEventType,
     AgentInput,
     AgentSessionRef,
+    ContextPart,
     MessageInput,
     ProbeRequest,
     SessionOptions,
@@ -231,9 +233,11 @@ class CliDriverAdapter(BaseExternalAgentAdapter):
             (ctx or {}).get("external_session_id"))
         if (caps is not None and not caps.resume) or not external_id:
             return self._unsupported_stream(session, "resume", "resume")
-        prompt = ctx["options"].resume_prompt or "Continue from where you left off."
-        return self._turn_stream(
-            session, MessageInput(text=prompt), force_resume=True)
+        options = ctx["options"]
+        prompt = options.resume_prompt or "Continue from where you left off."
+        message = MessageInput(text=prompt)
+        message.payload.context_parts = list(options.resume_context or ())
+        return self._turn_stream(session, message, force_resume=True)
 
     def _step_events(
         self, step: StreamStep, seq, *, common: dict, turn_id: str,
@@ -343,16 +347,14 @@ class CliDriverAdapter(BaseExternalAgentAdapter):
         web_access = options.web_access
         kb_access = options.kb_access
         use_resume = bool(external_id) and (force_resume or ctx["turns"] > 0)
-        prompt_text = input.text
-        capability_sections = [
-            str(ctx.get("capability_prompt") or "").strip(),
-            input.payload.capability_context.strip(),
-        ]
-        capability_context = "\n\n".join(
-            section for section in capability_sections if section
-        )
-        if capability_context:
-            prompt_text = f"{capability_context}\n\n[当前用户请求]\n{input.text}"
+        # A CLI prompt is one text: context envelopes, then the user's text.
+        capability_prompt = str(ctx.get("capability_prompt") or "").strip()
+        parts = self.turn_context(session.agent_session_id, input)
+        if capability_prompt and not input.payload.native_command:
+            parts.insert(0, ContextPart(
+                key="muteki.capabilities", kind="host_instructions",
+                trust="application", text=capability_prompt))
+        prompt_text = text_with_envelopes(input.text, parts)
         purpose = {
             ThreadMode.CONVERSATION: LaunchPurpose.CONVERSATION,
             ThreadMode.MANAGEMENT: LaunchPurpose.MANAGEMENT,

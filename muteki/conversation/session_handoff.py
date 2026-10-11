@@ -4,14 +4,17 @@ When ``ensure_session`` closes the live AgentSession and starts a new one
 (Provider switch, permission/access rebuild, credential change, or
 force-new retry without native resume), Muteki must not rely on Thread UI
 history alone. This module builds a branch-scoped handoff bundle that can
-be injected into ``SessionStart.options.resume_prompt`` and/or the first
-``AgentInput`` for an ordinary message turn.
+be delivered as a ``history_handoff`` context part beside the user's
+unchanged message (``SessionStart.options.resume_context`` or the first
+``MessageInput.payload.context_parts``).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Optional, Sequence
+
+from muteki.platform.contracts.external_agents import ContextPart
 
 DEFAULT_MAX_MESSAGES = 40
 DEFAULT_MAX_CHARS = 24_000
@@ -299,41 +302,41 @@ def render_transcript(bundle: SessionHandoffBundle) -> str:
     return "\n".join(lines)
 
 
-def render_resume_prompt(
+EMPTY_CONTINUE_TEXT = "请继续此前未完成的工作。"
+
+
+def current_turn_text(turn_text: str) -> str:
+    """User text of a turn sent after a handoff; an empty resume asks to continue."""
+    return (turn_text or "").strip() or EMPTY_CONTINUE_TEXT
+
+
+def handoff_context_part(
     bundle: SessionHandoffBundle,
-    turn_text: str,
     *,
     action: str = "继续",
-) -> str:
+) -> Optional[ContextPart]:
+    """The branch history as an untrusted context part, or None when empty."""
     transcript = render_transcript(bundle)
-    current = (turn_text or "").strip() or "请继续此前未完成的工作。"
     if not transcript:
-        return current
+        return None
     omitted = ""
     if bundle.omitted_count:
         omitted = (
             f"\n（注：另有 {bundle.omitted_count} 条更早消息因上下文窗口"
             "限制未纳入，请勿臆造未给出的内容。）"
         )
-    return (
-        f"以下是本次{action}前由 Muteki 整理的当前分支对话历史，"
-        "请只基于这些历史和当前用户消息继续："
-        f"{omitted}\n{transcript}\n\n当前用户消息：{current}"
+    return ContextPart(
+        key="muteki.history", kind="history_handoff", trust="untrusted",
+        text=(f"以下是本次{action}前由 Muteki 整理的当前分支对话历史，"
+              f"请只基于这些历史和用户的当前消息继续：{omitted}\n{transcript}"),
     )
 
 
-def render_agent_text(
-    bundle: SessionHandoffBundle,
-    turn_text: str,
-) -> str:
-    return render_resume_prompt(bundle, turn_text, action="切换/重建后继续")
-
-
-def continuation_prompt_from_messages(
+def continuation_context_from_messages(
     turn: Any,
     messages: Sequence[Any],
     turns: Sequence[Any] | None = None,
-) -> str:
+) -> Optional[ContextPart]:
     action = "继续" if getattr(turn, "kind", "") == "resume" else "重试"
     bundle = build_session_handoff(
         thread_id=str(getattr(turn, "thread_id", "") or ""),
@@ -343,9 +346,7 @@ def continuation_prompt_from_messages(
         kind=RECOVERY_STRUCTURED_HANDOFF,
         reason=REASON_RETRY if action == "重试" else REASON_RESTART,
     )
-    return render_resume_prompt(
-        bundle, str(getattr(turn, "text", "") or ""), action=action,
-    )
+    return handoff_context_part(bundle, action=action)
 
 
 __all__ = [
@@ -367,8 +368,9 @@ __all__ = [
     "SessionHandoffBundle",
     "build_session_handoff",
     "classify_rebuild_reason",
-    "continuation_prompt_from_messages",
-    "render_agent_text",
-    "render_resume_prompt",
+    "EMPTY_CONTINUE_TEXT",
+    "continuation_context_from_messages",
+    "current_turn_text",
+    "handoff_context_part",
     "render_transcript",
 ]

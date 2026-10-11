@@ -1,8 +1,7 @@
-"""OpenCode 2's native API, selected explicitly by the OpenCode driver.
+"""OpenCode 2's native API, driven by ``opencode.OpenCodeServerAdapter``.
 
 Protocol and lifecycle follow T3 nightly 611132c: /api/info, /api/event,
 session inbox/execution events, forms, per-session rules and runtime MCP.
-This is independent of the v1 session/status and message-part protocol.
 """
 from __future__ import annotations
 
@@ -25,7 +24,7 @@ from muteki.platform.contracts.external_agents import (
     SessionStart, SteerInput, UserInputResponseInput,
 )
 from muteki.platform.contracts.agent_events import (
-    AgentNodePayload, AgentUpdatedPayload, FailureCategory, MessageDeltaPayload,
+    AgentNodePayload, AgentUpdatedPayload, CompactionPayload, FailureCategory, MessageDeltaPayload,
     MessageCompletedPayload, PlanPayload, ReasoningPayload, RuntimeCapabilitiesPayload, RuntimeWarningPayload,
     SessionPayload, ToolPayload, TurnCompletedPayload, TurnFailedPayload,
     TurnStartedPayload, UsagePayload, UserInputRequestedPayload, UserInputResolvedPayload,
@@ -39,6 +38,7 @@ from .capabilities import (
     AccessModeUnsupportedError, BOOL_CAPABILITY_FIELDS, CapabilityProbeReport,
     SOURCE_PROBE, SOURCE_REPORTED, conservative_capabilities,
 )
+from .context_delivery import system_append, text_with_envelopes
 from .events import build_event
 from .opencode import (
     OpenCodeError, OpenCodeHttpClient, _SUPPORTED_ACCESS_MODES,
@@ -49,6 +49,17 @@ from .process_supervisor import spawn_supervised
 from .rpc import ProcessOutputLog
 from .runtime_capabilities import RuntimeCapabilitySnapshot, dynamic_command_item
 from .user_input_schema import _answer_values, expand_legacy_text_answers, normalize_question
+
+
+# T3 OpenCode2AdapterV2: a lost event stream is resubscribed this many times,
+# this far apart, before the session breaks; a new turn waits this long for a
+# reconnect in progress.
+_RECONNECT_ATTEMPTS = 5
+_RECONNECT_DELAY_S = 2.0
+_RECONCILE_TIMEOUT_S = 15.0
+_RECONNECT_WAIT_S = 30.0
+_LOST_BACKGROUND = ("Muteki lost its connection to OpenCode while this subagent ran, "
+                    "so its result is not shown.")
 
 
 def _data(body: Any, operation: str) -> Any:
@@ -185,7 +196,7 @@ class OpenCode2Runtime:
             caps.resume = caps.session_persistence = caps.subagents = True
             caps.mcp = not owner._attach_url
             caps.resume_continues_turn = False
-            caps.plan = caps.compaction = True
+            caps.plan = caps.compaction = caps.context_usage = True
             caps.plan_mode = any(isinstance(row, dict) and row.get("id") == "plan" for row in agents)
             caps.plan_mode_per_turn = True
             caps.access_modes = list(_SUPPORTED_ACCESS_MODES)
@@ -257,7 +268,7 @@ class OpenCode2Runtime:
         env = dict(request.options.env)
         proc = client = None
         handle: dict[str, Any] = {
-            "generation": "v2", "cwd": cwd, "options": request.options,
+            "cwd": cwd, "options": request.options,
             "conversation_thread_id": request.thread_id, "access_mode": mode,
             "approval_grants": SessionApprovalGrants(mode), "pending_approvals": {},
             "pending_questions": {}, "approval_requests": {}, "background_tasks": set(),
@@ -287,7 +298,10 @@ class OpenCode2Runtime:
             if request.options.fork_from:
                 native = _data(await client.post(f"/api/session/{quote(request.options.fork_from, safe='')}/fork", {}), "session.fork")
             elif request.resume_handle:
-                native = _data(await client.get(f"/api/session/{quote(request.resume_handle, safe='')}"), "session.get")
+                try:
+                    native = _data(await client.get(f"/api/session/{quote(request.resume_handle, safe='')}"), "session.get")
+                except OpenCodeError:
+                    raise
             else:
                 native = _data(await client.post("/api/session", {
                     "location": {"directory": cwd}, "permissions": rules,
@@ -310,21 +324,15 @@ class OpenCode2Runtime:
                 raise OpenCodeError("command.list is not an array", code="opencode2.protocol_invalid")
             handle["available_commands"] = commands
             handle["mcp_statuses"] = _data(await client.get(_location("/api/mcp", cwd)), "mcp.list")
-            stop, connected = asyncio.Event(), asyncio.Event()
+            handle["context_window"] = await self._context_window(handle)
+            stop = asyncio.Event()
             owner._sessions[request.agent_session_id] = handle
-            task = asyncio.create_task(client.stream_sse(
-                "/api/event", lambda name, body: self._dispatch(request.agent_session_id, name, body), stop, connected))
-            handle.update(sse_task=task, sse_stop=stop)
-            waiter = asyncio.create_task(connected.wait())
-            try:
-                await asyncio.wait({task, waiter}, timeout=owner._startup_timeout, return_when=asyncio.FIRST_COMPLETED)
-                if not connected.is_set():
-                    if task.done():
-                        await task
-                    raise OpenCodeError("OpenCode 2 event stream was not accepted", code="opencode2.sse_connect_timeout")
-            finally:
-                waiter.cancel()
-                await asyncio.gather(waiter, return_exceptions=True)
+            handle["sse_stop"] = stop
+            # Kept for a reconnect to a restarted server, which forgot its MCP servers.
+            handle["mcp_injection"] = (plan, bearer_token)
+            # Subscribed before any prompt, so no event of the first turn is missed.
+            stream = await self._subscribe(request.agent_session_id, handle, stop)
+            handle["sse_task"] = asyncio.create_task(self._follow(request.agent_session_id, handle, stop, stream))
             return {"external_session_id": native_id, "resume_handle": native_id}
         except BaseException:
             try:
@@ -383,6 +391,298 @@ class OpenCode2Runtime:
             "config": {"type": "remote", "url": entry.get("url") or plan.gateway_endpoint,
                        "headers": headers, "oauth": False}})
         handle.update(mcp_name=name, mcp_injected=1)
+
+    async def _context_window(self, handle: dict[str, Any]) -> int | None:
+        """The session model's window from ``GET /api/model`` (T3 readModels)."""
+        ref = handle.get("model_ref")
+        if not isinstance(ref, dict) or not ref.get("id"):
+            return None
+        try:
+            models = _data(await handle["client"].get(_location("/api/model", handle["cwd"]), timeout=5), "model.list")
+        except (OpenCodeError, OSError, asyncio.TimeoutError) as exc:
+            handle["warnings"].append(f"opencode2.model_limit_unavailable: {exc}")
+            return None
+        for row in models if isinstance(models, list) else []:
+            if (isinstance(row, dict) and row.get("id") == ref["id"]
+                    and (not ref.get("providerID") or row.get("providerID") == ref["providerID"])):
+                limit = row.get("limit") or {}
+                # A model's input limit, when it has one, is its real headroom.
+                value = limit.get("input") if limit.get("input") is not None else limit.get("context")
+                return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+        return None
+
+    async def _reread_context_window(self, handle: dict[str, Any]) -> None:
+        # A spawned server lists config-defined providers' models lazily,
+        # so an unknown window is read again after the turn, off its path.
+        window = await self._context_window(handle)
+        if window is not None and handle.get("context_window") is None:
+            handle["context_window"] = window
+
+    async def _subscribe(self, sid: str, handle: dict[str, Any], stop: asyncio.Event) -> "asyncio.Task[None]":
+        """A ``/api/event`` stream the server has accepted (``server.connected``)."""
+        connected = asyncio.Event()
+        stream = asyncio.create_task(handle["client"].stream_sse(
+            "/api/event", lambda name, body: self._dispatch(sid, name, body), stop, connected))
+        waiter = asyncio.create_task(connected.wait())
+        try:
+            await asyncio.wait({stream, waiter}, timeout=self.owner._startup_timeout, return_when=asyncio.FIRST_COMPLETED)
+            if not connected.is_set():
+                if stream.done():
+                    await stream
+                raise OpenCodeError("OpenCode 2 event stream was not accepted", code="opencode2.sse_connect_timeout")
+        except BaseException:
+            stream.cancel()
+            await asyncio.gather(stream, return_exceptions=True)
+            raise
+        finally:
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+        return stream
+
+    async def _follow(self, sid: str, handle: dict[str, Any], stop: asyncio.Event, stream: "asyncio.Task[None]") -> None:
+        """T3 follow: the stream is the only terminal signal and it is volatile,
+        so a lost stream reconnects and reconciles running turns from the
+        server's own state. Only when reconnecting keeps failing does this task
+        end with ``opencode2.sse_closed``, which fails the running turn."""
+        try:
+            while True:
+                try:
+                    await stream
+                except OpenCodeError as exc:
+                    if stop.is_set():
+                        return
+                    lost: BaseException = exc
+                else:
+                    if stop.is_set():
+                        return
+                    lost = OpenCodeError("OpenCode 2 event stream ended", code="opencode2.sse_closed")
+                stream = await self._reconnect(sid, handle, stop, lost)
+        finally:
+            if not stream.done():
+                stream.cancel()
+                await asyncio.gather(stream, return_exceptions=True)
+
+    async def _reconnect(self, sid: str, handle: dict[str, Any], stop: asyncio.Event,
+                         lost: BaseException) -> "asyncio.Task[None]":
+        # Set first, so a turn starting meanwhile waits or refuses.
+        handle["stream_failure"] = "The OpenCode event stream was lost. Reconnecting."
+        handle["reconnected"] = asyncio.Event()
+        self.owner._emit_warning(handle, "opencode2.sse_reconnecting", f"{handle['stream_failure']} ({lost})")
+        last: BaseException = lost
+        for attempt in range(_RECONNECT_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(_RECONNECT_DELAY_S)
+            if stop.is_set():
+                raise OpenCodeError("OpenCode 2 session closed while reconnecting", code="opencode2.sse_closed")
+            stream: asyncio.Task[None] | None = None
+            try:
+                await self._ensure_server(sid, handle)
+                stream = await self._subscribe(sid, handle, stop)
+                # T3 holds the event lock while reconciling: the new stream's
+                # events wait until the turn's missed history is emitted.
+                handle["held_events"] = []
+                try:
+                    await asyncio.wait_for(self._reconcile(sid, handle), _RECONCILE_TIMEOUT_S)
+                finally:
+                    held = handle.pop("held_events", None) or []
+                for name, event in held:
+                    self._dispatch(sid, name, event)
+            except BaseException as exc:
+                if stream is not None and not stream.done():
+                    stream.cancel()
+                    await asyncio.gather(stream, return_exceptions=True)
+                if not isinstance(exc, (OpenCodeError, OSError, asyncio.TimeoutError)):
+                    raise
+                last = exc
+                continue
+            handle["stream_failure"] = None
+            handle["reconnected"].set()
+            return stream
+        self._fail_all(handle, "The OpenCode event stream was lost and could not reconnect.")
+        raise OpenCodeError(f"{handle['stream_failure']} ({type(last).__name__}: {last})",
+                            code="opencode2.sse_closed") from last
+
+    def _fail_all(self, handle: dict[str, Any], message: str) -> None:
+        handle["stream_failure"] = message
+        handle["reconnected"].set()
+        # Nothing can report a background subagent's end any more.
+        for key, call in handle["calls"].items():
+            if call["status"] == "running":
+                call["status"] = "failed"
+                if call.get("child"):
+                    self.owner._agent_patch(handle, call["child"], {"status": "failed", "error": message})
+        for wake in handle["wakes"]:
+            wake["dropped"] = True
+        handle["wakes"].clear()
+        handle["reports"].clear()
+
+    async def _ensure_server(self, sid: str, handle: dict[str, Any]) -> None:
+        """Reuse the server, or start the managed one again if it is gone."""
+        owner = self.owner
+        proc = _as_process(handle.get("proc"))
+        if proc is None or proc.returncode is None:
+            return
+        old_client = handle["client"]
+        new_proc, url, info = await self._start_server(handle["cwd"], dict(handle["options"].env), sid)
+        handle.update(proc=new_proc, client=self._client(url), base_url=url, runtime_version=info["version"])
+        await old_client.close()
+        # The native session is stored by OpenCode; the new server forgot
+        # Muteki's runtime MCP server.
+        if handle.get("mcp_name"):
+            plan, bearer = handle.get("mcp_injection") or (None, None)
+            handle["mcp_name"] = None
+            await self._inject_mcp(handle, plan, bearer)
+        await owner._stop_server(proc)
+
+    async def _messages_since(self, handle: dict[str, Any], native_sid: str, start: str | None) -> list[dict[str, Any]] | None:
+        """Session history newest first, through ``start`` (T3 backfill read).
+        None when ``start`` is not in the history."""
+        client, path = handle["client"], f"/api/session/{quote(native_sid, safe='')}/message"
+        query: dict[str, str] = {"order": "desc", "limit": "50"}
+        read: list[dict[str, Any]] = []
+        while True:
+            body = await client.get(path + "?" + urlencode(query), timeout=10)
+            page = _data(body, "session.message.list")
+            if not isinstance(page, list):
+                raise OpenCodeError("session.message.list is not an array", code="opencode2.protocol_invalid")
+            for message in page:
+                read.append(message)
+                if start is not None and message.get("id") == start:
+                    return read
+            cursor = (body.get("cursor") or {}).get("next")
+            if not page or not cursor:
+                return read if start is None else None
+            # OpenCode rejects a cursor combined with order.
+            query = {"limit": "50", "cursor": str(cursor)}
+
+    async def _backfill(self, sid: str, handle: dict[str, Any]) -> dict[str, Any] | None:
+        """T3 backfill: emit what the running turn missed while the stream was
+        down, under the native ids its live events use, and return the
+        ``idle`` item that says how its execution ended (None: no end yet)."""
+        native_sid = handle["external_session_id"]
+        boundary = handle.get("history_start")
+        if boundary is None:
+            return None
+        kind, start = boundary
+        read = await self._messages_since(handle, native_sid, start)
+        if read is None:
+            # The stream dropped before the turn's first message landed.
+            return None
+        recent = read[:-1] if kind == "before" and start is not None else read
+        idle = next((m for m in recent if m.get("type") == "idle"), None)
+        for message in reversed(recent):
+            if message.get("type") != "assistant" or handle.get("execution_ended"):
+                continue
+            ordinals = {"text": 0, "reasoning": 0}
+            for part in message.get("content") or []:
+                ptype = part.get("type")
+                base = {"sessionID": native_sid, "assistantMessageID": message["id"]}
+                if ptype in ordinals:
+                    self._dispatch_checked(sid, f"session.{ptype}.ended", {
+                        "type": f"session.{ptype}.ended",
+                        "data": {**base, "ordinal": ordinals[ptype], "text": part.get("text") or ""}}, replay=True)
+                    # The block may still be streaming: its live end stays
+                    # authoritative, and its live deltas are dropped.
+                    key = f"{native_sid}:{message['id']}:{ordinals[ptype]}"
+                    handle.setdefault("ended_blocks", set()).discard(key)
+                    handle.setdefault("backfilled_blocks", set()).add(key)
+                    ordinals[ptype] += 1
+                    continue
+                if ptype != "tool":
+                    continue
+                call = str(part.get("id") or "")
+                state = part.get("state") or {}
+                tool = handle["tools"].get(f"{native_sid}:{call}")
+                def emit(name: str, data: dict[str, Any]) -> None:
+                    self._dispatch_checked(sid, name, {"type": name, "data": {**base, "id": call, **data}}, replay=True)
+                if tool is None:
+                    emit("session.tool.input.started", {"name": part.get("name") or "tool"})
+                    emit("session.tool.called", {"input": state.get("input") or {}})
+                    tool = handle["tools"].get(f"{native_sid}:{call}") or {}
+                if tool.get("status") in {"completed", "failed"}:
+                    continue
+                if state.get("status") == "completed":
+                    emit("session.tool.success", {"content": state.get("content"), "metadata": state.get("metadata") or {}})
+                elif state.get("status") == "error":
+                    emit("session.tool.failed", {"error": state.get("error"), "content": state.get("content"),
+                                                 "metadata": state.get("metadata") or {}})
+        return idle
+
+    async def _reconcile(self, sid: str, handle: dict[str, Any]) -> None:
+        """T3 reconcile: settle what was running when the stream dropped, from
+        the server. A session still running keeps its turn; one that stopped
+        ends it with the outcome of the ``idle`` item after the turn's start.
+        A restarted server writes no such item for the execution it lost, so
+        no ``idle`` means interrupted. Background work is settled, not resumed."""
+        running = (handle.get("event_sink") is not None and handle.get("current_turn_id")
+                   and not handle.get("execution_ended"))
+        background = any(c["status"] == "running" for c in handle["calls"].values()) or handle["wakes"] or handle["reports"]
+        if not running and not background and not handle["busy"]:
+            return
+        active = _data(await handle["client"].get("/api/session/active", timeout=5), "session.active")
+        if not isinstance(active, dict):
+            raise OpenCodeError("session.active is not an object", code="opencode2.protocol_invalid")
+        # An execution that ended while the stream was down never said so.
+        handle["busy"].intersection_update(active)
+        native_sid = handle["external_session_id"]
+        if running:
+            ended = await self._backfill(sid, handle)
+            if native_sid not in active and not handle.get("execution_ended"):
+                outcome = (ended or {}).get("outcome")
+                if outcome == "succeeded":
+                    terminal, data = "session.execution.succeeded", {}
+                elif outcome == "failed":
+                    terminal, data = "session.execution.failed", {"error": {
+                        "message": "OpenCode ended the turn with an error while Muteki was reconnecting."}}
+                else:
+                    terminal, data = "session.execution.interrupted", {}
+                # T3 finishTurn, not endExecution: an idle session holds no steer.
+                handle["execution_ended"] = True
+                handle["unsettled"] = False
+                self._queue(handle, "__terminal__", terminal, data)
+        for call in handle["calls"].values():
+            # A subagent still running keeps its call; its end arrives on the new stream.
+            child = call.get("child")
+            if call["status"] == "running" and (child is None or child not in active):
+                call["status"] = "cancelled"
+                if child:
+                    self.owner._agent_patch(handle, child, {"status": "cancelled", "result": _LOST_BACKGROUND})
+        for wake in handle["wakes"]:
+            wake["dropped"] = True
+        handle["wakes"].clear()
+        handle["reports"].clear()
+        # Requests asked while the stream was down were never shown; ones
+        # OpenCode no longer lists were answered elsewhere or dropped.
+        listed: set[str] = set()
+        for session_id in active:
+            if not self._belongs(handle, session_id):
+                continue
+            path = f"/api/session/{quote(session_id, safe='')}"
+            permissions = _data(await handle["client"].get(path + "/permission", timeout=5), "session.permission.list")
+            forms = _data(await handle["client"].get(path + "/form", timeout=5), "session.form.list")
+            for request in permissions:
+                listed.add(str(request["id"]))
+                if request["id"] not in handle["pending_approvals"]:
+                    self._dispatch_checked(sid, "permission.asked", {"type": "permission.asked",
+                                                                     "data": {"sessionID": session_id, **request}}, replay=True)
+            for form in forms:
+                listed.add(str(form["id"]))
+                if form["id"] not in handle["pending_questions"]:
+                    self._dispatch_checked(sid, "form.created", {"type": "form.created",
+                                                                 "data": {"sessionID": session_id, "form": form}}, replay=True)
+        from muteki.platform.contracts.agent_events import ApprovalResolvedPayload
+        for request_id in [r for r in handle["pending_approvals"] if r not in listed]:
+            handle["pending_approvals"].pop(request_id, None)
+            handle["approval_requests"].pop(request_id, None)
+            self._queue(handle, AgentEventType.APPROVAL_RESOLVED, "opencode2.reconcile",
+                        ApprovalResolvedPayload(approval_id=request_id, decision="cancelled"))
+        for request_id in [r for r in handle["pending_questions"] if r not in listed]:
+            handle["pending_questions"].pop(request_id, None)
+            self._queue(handle, AgentEventType.USER_INPUT_RESOLVED, "opencode2.reconcile",
+                        UserInputResolvedPayload(request_id=request_id, outcome="cancelled"))
+            if handle.get("presented_form") == request_id:
+                handle["presented_form"] = None
+        self._present_form(handle)
 
     def _queue(self, handle: dict[str, Any], kind: Any, native: str, payload: Any) -> None:
         self.owner._queue_event(handle, kind, native, dump_payload(payload) if hasattr(payload, "model_dump") else payload)
@@ -467,6 +767,10 @@ class OpenCode2Runtime:
             self._dispatch_checked(sid, name, event, replay=True)
 
     def _dispatch(self, sid: str, name: str, event: dict[str, Any]) -> None:
+        held = (self.owner._sessions.get(sid) or {}).get("held_events")
+        if held is not None:
+            held.append((name, event))
+            return
         try:
             self._dispatch_checked(sid, name, event)
         except (TypeError, ValueError, KeyError, AttributeError) as exc:
@@ -552,14 +856,13 @@ class OpenCode2Runtime:
                         self._end_execution(handle, held[0], held[1])
             handle["stranded_steers"].discard(inbox_id)
             if kind == "session.inbox.cancelled":
+                if (inbox_id and inbox_id == handle.get("input_id") and handle.get("event_sink") is not None
+                        and not handle.get("execution_ended") and inbox_id not in handle["delivered"]):
+                    # The turn's own input will never execute, so no execution
+                    # terminal can follow for it.
+                    self._end_execution(handle, "session.execution.interrupted", data)
                 return
             handle["delivered"].add(inbox_id)
-            if handle.get("operation_input") == data.get("inboxID"):
-                handle["operation_delivered"] = True
-                pending = handle.pop("operation_pending", None)
-                operation = handle.get("operation_terminal")
-                if pending is not None and operation is not None and not operation.done():
-                    operation.set_result(pending)
             if handle.get("terminal_pending") and handle.get("input_id") in handle["delivered"]:
                 terminal = handle.pop("terminal_pending")
                 self._end_execution(handle, terminal[0], terminal[1])
@@ -571,13 +874,11 @@ class OpenCode2Runtime:
                 if child:
                     self.owner._agent_patch(handle, native_sid, {"status": "running"})
                 else:
-                    if (not handle.get("current_turn_id") or handle.get("execution_ended")) and handle.get("operation_terminal") is None:
+                    if not handle.get("current_turn_id") or handle.get("execution_ended"):
                         self._on_wake(handle, reports)
                         return
                     handle["native_execution_started"] = True
                     handle.pop("held_terminal", None)
-                    if handle.get("operation_terminal") is not None:
-                        handle["operation_started"] = True
                 return
             if kind not in {"session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"}:
                 return
@@ -590,12 +891,6 @@ class OpenCode2Runtime:
                 self.owner._agent_patch(handle, native_sid, {"status": status, "result": result or None,
                     "error": json.dumps(data["error"], ensure_ascii=False) if data.get("error") else None})
                 return
-            operation = handle.get("operation_terminal")
-            if operation is not None and not operation.done() and handle.get("operation_started"):
-                if handle.get("operation_delivered"):
-                    operation.set_result((kind, data))
-                else:
-                    handle["operation_pending"] = (kind, data)
             if handle.get("settle_event") is not None:
                 handle["settle_event"].set()
                 handle["unsettled"] = False
@@ -649,27 +944,69 @@ class OpenCode2Runtime:
                                    **values, cost_usd=cost if isinstance(cost, (int, float))
                                    and not isinstance(cost, bool) and cost > 0 else None)
             self._queue(handle, AgentEventType.USAGE_UPDATED, kind, payload)
+            if native_sid == handle.get("external_session_id"):
+                # The step's prompt and its output make up the next request,
+                # which is how OpenCode's own context gauge counts.
+                used = sum_token_buckets(tokens.get("input"), tokens.get("output"), tokens.get("reasoning"),
+                                         cache.get("read"), cache.get("write"))
+                if used is not None:
+                    self._queue(handle, AgentEventType.USAGE_UPDATED, kind, UsagePayload(
+                        scope="context_only", context_used_tokens=used,
+                        context_window=handle.get("context_window")))
+        elif kind == "session.compaction.started" and native_sid == handle.get("external_session_id"):
+            trigger = "manual" if data.get("reason") == "manual" else "auto"
+            handle["open_compaction"] = trigger
+            self._queue(handle, AgentEventType.COMPACTION_UPDATED, kind, CompactionPayload(
+                status="started", trigger=trigger))
         elif kind in {"session.compaction.completed", "session.compaction.ended"}:
             self.owner._context_compacted(sid)
+            if native_sid == handle.get("external_session_id"):
+                trigger = handle.pop("open_compaction", None) or (
+                    "manual" if data.get("reason") == "manual" else "auto")
+                # compaction.ended tokens are the summarizer call's usage, not
+                # the context size before/after, so they are not mapped here.
+                summary = str(data.get("text") or "").strip()
+                self._queue(handle, AgentEventType.COMPACTION_UPDATED, kind, CompactionPayload(
+                    status="completed", trigger=trigger, summary=summary or None))
+        elif kind == "session.compaction.failed" and native_sid == handle.get("external_session_id"):
+            trigger = handle.pop("open_compaction", None) or (
+                "manual" if data.get("reason") == "manual" else "auto")
+            error = data.get("error")
+            message = (error.get("message") if isinstance(error, dict) else error) or data.get("message")
+            self._queue(handle, AgentEventType.COMPACTION_UPDATED, kind, CompactionPayload(
+                status="failed", trigger=trigger, message=str(message) if message else None))
 
     def _text_event(self, handle: dict[str, Any], kind: str, data: dict[str, Any], agent_id: str | None) -> None:
         reasoning = kind.startswith("session.reasoning.")
         key = f"{data['sessionID']}:{data.get('assistantMessageID')}:{data.get('ordinal')}"
         texts = handle["reasoning" if reasoning else "texts"]
+        # Message deltas only append, so what was already sent is kept apart
+        # from the block's current text, which an end replaces (T3 emitText).
+        shown = handle.setdefault("shown_texts", {})
         previous = texts.get(key, "")
+        # A block backfilled from history goes on streaming on the new stream
+        # at an offset nothing reports, so its live deltas would repeat text
+        # already shown; its end carries the whole text and finishes it.
+        backfilled = key in handle.setdefault("backfilled_blocks", set())
         if kind.endswith(".delta"):
+            if backfilled:
+                return
             delta = str(data.get("delta") or "")
             texts[key] = previous + delta
         elif kind.endswith(".ended"):
             full = str(data.get("text") or "")
-            delta = full[len(previous):] if full.startswith(previous) else ""
+            ended = handle.setdefault("ended_blocks", set())
+            if previous == full and (key in ended or backfilled):
+                return  # A reconnect's backfill and the live stream can both carry this end.
+            ended.add(key)
             texts[key] = full
-            if not full.startswith(previous):
-                self._queue(handle, AgentEventType.RUNTIME_WARNING, kind, RuntimeWarningPayload(
-                    kind="degraded", code="opencode2.text_reconciled",
-                    message="Native completed text differs from its received deltas; the complete value is retained"))
+            # A history read can hold less than was streamed, even nothing.
+            sent = shown.get(key, "")
+            delta = full[len(sent):] if full.startswith(sent) else ""
         else:
             return
+        if not reasoning and delta:
+            shown[key] = shown.get(key, "") + delta
         if reasoning:
             text = texts[key] if kind.endswith(".ended") else delta
             if text:
@@ -679,7 +1016,7 @@ class OpenCode2Runtime:
         elif delta and not agent_id:
             self._queue(handle, AgentEventType.MESSAGE_DELTA, kind, MessageDeltaPayload(
                 text=delta, message_id=str(data.get("assistantMessageID"))))
-        if not reasoning and not agent_id and kind.endswith(".ended"):
+        if not reasoning and not agent_id and kind.endswith(".ended") and texts[key]:
             # Native ended events are authoritative, including after a lost
             # ephemeral delta. Retain the full value in the canonical stream.
             self._queue(handle, AgentEventType.MESSAGE_COMPLETED, kind, MessageCompletedPayload(
@@ -877,8 +1214,10 @@ class OpenCode2Runtime:
         if handle["model_ref"]:
             await client.post(f"/api/session/{sid}/model", {"model": handle["model_ref"]})
         # Like T3, use a durable instruction entry: v2 prompts have no system field.
-        instructions = ("Muteki conversation tools are available through the connected MCP server."
-                        if handle.get("mcp_name") else "")
+        instructions = "\n\n".join(part for part in (
+            "Muteki conversation tools are available through the connected MCP server."
+            if handle.get("mcp_name") else "",
+            system_append(handle["options"].host_context)) if part)
         if handle.get("instructions") != instructions:
             await client.request("PUT", f"/api/experimental/session/{sid}/instructions/entries/muteki",
                                  body={"value": instructions})
@@ -892,6 +1231,14 @@ class OpenCode2Runtime:
             raise handle["fatal_event_error"]
         if handle.get("current_turn_id"):
             raise OpenCodeError("OpenCode 2 session already has a running turn", code="opencode2.turn_busy")
+        if handle.get("stream_failure") is not None and not handle["sse_task"].done():
+            # A lost stream is reconnecting: wait for it rather than prompt into a dead stream.
+            try:
+                await asyncio.wait_for(handle["reconnected"].wait(), _RECONNECT_WAIT_S)
+            except asyncio.TimeoutError:
+                pass
+            if handle.get("stream_failure") is not None and not handle["sse_task"].done():
+                raise OpenCodeError(handle["stream_failure"], code="opencode2.sse_reconnecting")
         if handle["sse_task"].done():
             await handle["sse_task"]
             raise OpenCodeError("OpenCode 2 event stream is closed", code="opencode2.sse_closed")
@@ -907,12 +1254,15 @@ class OpenCode2Runtime:
         handle["current_turn_id"] = (wake.get("first") if wake else None) or _opencode_message_id()
         root_prefix = handle["external_session_id"] + ":"
         # T3 beginTurn: a new root turn owns fresh buffers; child turns survive.
-        for field in ("texts", "reasoning", "tools"):
-            handle[field] = {key: value for key, value in handle[field].items() if not key.startswith(root_prefix)}
+        for field in ("texts", "reasoning", "tools", "shown_texts"):
+            handle[field] = {key: value for key, value in handle.get(field, {}).items() if not key.startswith(root_prefix)}
+        for field in ("ended_blocks", "backfilled_blocks"):
+            handle[field] = {key for key in handle.get(field, ()) if not key.startswith(root_prefix)}
         handle.update(input_id=handle["current_turn_id"], event_sink=asyncio.Queue(),
                       delivered=set(), admitted=set(), execution_ended=False,
                       interrupted=False, turn_rejected=False, terminal_pending=None,
-                      native_execution_started=False, normal_terminal=False)
+                      native_execution_started=False, normal_terminal=False, open_compaction=None,
+                      history_start=None)
         handle["pending_steers"].clear()
         handle["settled_steers"].clear()
         handle.pop("held_terminal", None)
@@ -932,11 +1282,12 @@ class OpenCode2Runtime:
         record = owner._tracker.get(session.agent_session_id)
         async def abort(_failure: Any) -> None:
             await self.interrupt(session)
-        proc = _as_process(handle.get("proc"))
+        # No exit watch: a managed server that dies drops the event stream, and
+        # the reconnect restarts it and reconciles the turn (T3 parity).
         runner = TurnRunner(owner, session, turn_id=handle["current_turn_id"],
                             limits=TurnLimits(overall_s=owner.conversation_turn_timeout(
                                 handle.get("conversation_thread_id"), owner._prompt_timeout)), auto_ack=False,
-                            exit_watch=proc.wait if proc is not None else None, on_abort=abort,
+                            on_abort=abort,
                             run_id=record.run_id if record else None,
                             execution_generation=record.execution_generation if record else None)
         handle["runner"] = runner
@@ -962,6 +1313,10 @@ class OpenCode2Runtime:
         try:
             if wake_id is None:
                 await self._apply_mode(handle, mode)
+                if not handle.get("host_context_recorded"):
+                    owner.record_context_delivery(session.agent_session_id, handle["options"].host_context,
+                                                  "opencode_instructions", scope="session")
+                    handle["host_context_recorded"] = True
             if handle["interrupted"]:
                 yield self._event(session, AgentEventType.TURN_FAILED, "opencode2.interrupt_before_admission",
                                   TurnFailedPayload(error=owner.failure(FailureCategory.CANCELLED, "interrupted",
@@ -969,6 +1324,13 @@ class OpenCode2Runtime:
                 return
             sid = quote(handle["external_session_id"], safe="")
             invocation = input.payload.runtime_capability.get("invocation") or {}
+            compact = wake_id is None and invocation.get("transport") == "opencode2.compact"
+            if compact and (input.payload.runtime_command_arguments.strip() or input.payload.attachments):
+                yield self._event(session, AgentEventType.TURN_FAILED, "opencode2.compact.invalid",
+                                  TurnFailedPayload(error=owner.failure(
+                                      FailureCategory.VALIDATION, "opencode2.compact_arguments_unsupported",
+                                      message="OpenCode /compact 不接受参数或附件")))
+                return
             runner.mark_sent()
             if wake_id is not None:
                 # T3 runWake: replay the oldest held execution, never submit a prompt.
@@ -978,9 +1340,26 @@ class OpenCode2Runtime:
                 if wake is None:
                     self._end_execution(handle, "session.execution.succeeded", {})
                 else:
+                    if wake.get("after"):
+                        handle["history_start"] = ("before", wake["after"])
                     handle["wakes"].remove(wake)
                     self._replay(session.agent_session_id, wake)
+            elif compact:
+                handle["history_start"] = ("prompt", handle["input_id"])
+                # T3 submit(): a bare /compact is a session.compact inbox item
+                # keyed by the turn's input id, so it ends like any prompt.
+                accepted = _data(await handle["client"].post(
+                    f"/api/session/{sid}/compact", {"id": handle["input_id"]}, timeout=30), "session.compact")
+                if not isinstance(accepted, dict) or accepted.get("id") != handle["input_id"]:
+                    raise OpenCodeError("Compaction acknowledgement has a different input id",
+                                        code="opencode2.admission_invalid")
             elif invocation.get("transport") == "opencode2.command":
+                # T3 markBefore: a command has no prompt id, so a reconnect
+                # backfills from after the newest message before it.
+                newest = _data(await handle["client"].get(
+                    f"/api/session/{sid}/message?" + urlencode({"order": "desc", "limit": "1"}), timeout=10),
+                    "session.message.list")
+                handle["history_start"] = ("before", newest[0]["id"] if newest else None)
                 await handle["client"].post(f"/api/session/{sid}/command", {
                     "name": invocation["command_name"], "text": input.text})
                 handle["compacting"] = True
@@ -991,7 +1370,9 @@ class OpenCode2Runtime:
                     handle["wakes"].pop()
                     handle["native_execution_started"] = True
                     self._replay(session.agent_session_id, wake)
-                body = {"id": handle["input_id"], "text": input.text}
+                handle["history_start"] = ("prompt", handle["input_id"])
+                body = {"id": handle["input_id"], "text": text_with_envelopes(
+                    input.text, owner.turn_context(session.agent_session_id, input, host=False))}
                 if input.payload.attachments:
                     body["files"] = self._files(input.payload.attachments)
                 accepted = _data(await handle["client"].post(f"/api/session/{sid}/prompt", body, timeout=30), "session.prompt")
@@ -1024,6 +1405,11 @@ class OpenCode2Runtime:
                                           PlanPayload(explanation=text, phase="completed", native={"agent": "plan"}))
                     cancelled = handle["turn_rejected"]
                     interrupted = handle["interrupted"] or native == "session.execution.interrupted"
+                    # T3 finishTurn: a compaction still open when its execution
+                    # ended never reported an outcome.
+                    closed = self._close_compaction(session, handle, "interrupted")
+                    if closed is not None:
+                        yield closed
                     if cancelled or interrupted:
                         category = FailureCategory.CANCELLED
                         reason = "approval_denied" if cancelled else "interrupted"
@@ -1044,6 +1430,9 @@ class OpenCode2Runtime:
                 if isinstance(kind, AgentEventType):
                     yield self._event(session, kind, native, payload)
         except (OpenCodeError, ValueError, OSError) as exc:
+            closed = self._close_compaction(session, handle, "failed")
+            if closed is not None:
+                yield closed
             yield self._event(session, AgentEventType.TURN_FAILED, "opencode2.turn.failed", TurnFailedPayload(
                 error=owner.exception_failure(exc, FailureCategory.PROVIDER if getattr(exc, "code", "") == "opencode2.execution_failed"
                                               else FailureCategory.TRANSPORT,
@@ -1052,6 +1441,8 @@ class OpenCode2Runtime:
         finally:
             handle["stranded_steers"].update(handle["pending_steers"])
             handle.pop("compacting", None)
+            if handle.get("context_window") is None:
+                owner._spawn(handle, self._reread_context_window(handle))
             # T3 finishTurn retains requests belonging to live background work.
             for field in ("pending_approvals", "pending_questions"):
                 for request_id, request in list(handle[field].items()):
@@ -1060,6 +1451,13 @@ class OpenCode2Runtime:
                         handle["approval_requests"].pop(request_id, None)
             if handle.get("presented_form") not in handle["pending_questions"]:
                 handle["presented_form"] = None
+
+    def _close_compaction(self, session: AgentSessionRef, handle: dict[str, Any], status: str) -> AgentEvent | None:
+        trigger = handle.pop("open_compaction", None)
+        if trigger is None:
+            return None
+        return self._event(session, AgentEventType.COMPACTION_UPDATED, "opencode2.compaction.unsettled",
+                           CompactionPayload(status=status, trigger=trigger))
 
     async def interrupt(self, session: AgentSessionRef) -> CommandReceipt:
         handle = self.owner._sessions[session.agent_session_id]
@@ -1140,7 +1538,10 @@ class OpenCode2Runtime:
 
     def resume(self, session: AgentSessionRef) -> AsyncIterator[AgentEvent]:
         handle = self.owner._sessions[session.agent_session_id]
-        return self._turn_stream(session, MessageInput(text=handle["options"].resume_prompt or "Continue from where you left off."))
+        options = handle["options"]
+        return self._turn_stream(session, MessageInput(
+            text=options.resume_prompt or "Continue from where you left off.",
+            payload={"context_parts": options.resume_context}))
 
     async def operation(self, session: AgentSessionRef, name: str, arguments: str) -> dict[str, Any]:
         handle = self.owner._sessions[session.agent_session_id]
@@ -1149,31 +1550,7 @@ class OpenCode2Runtime:
         if name in {"mcp", "agents", "status"}:
             path = _location("/api/mcp" if name == "mcp" else "/api/agent", handle["cwd"]) if name != "status" else f"/api/session/{sid}"
             return {"status": "completed", "result": _data(await client.get(path), name)}
-        if name not in {"compact", "summarize"} or arguments or handle.get("current_turn_id"):
-            raise OpenCodeError("Requested OpenCode 2 operation is unavailable", code="opencode2.operation_unsupported")
-        terminal = asyncio.get_running_loop().create_future()
-        handle["operation_terminal"] = terminal
-        try:
-            message_id = _opencode_message_id()
-            handle.update(operation_input=message_id, operation_started=False, operation_delivered=False)
-            accepted = _data(await client.post(f"/api/session/{sid}/compact", {"id": message_id}), "session.compact")
-            if not isinstance(accepted, dict) or accepted.get("id") != message_id:
-                raise OpenCodeError("Compaction acknowledgement has a different id", code="opencode2.admission_invalid")
-            # HTTP accepts an inbox item before execution starts; an immediate
-            # idle snapshot cannot prove that the compaction finished.
-            done, _ = await asyncio.wait({terminal, handle["sse_task"]}, return_when=asyncio.FIRST_COMPLETED)
-            if terminal not in done:
-                await handle["sse_task"]
-                raise OpenCodeError("Event stream ended during compaction", code="opencode2.sse_closed")
-            kind, data = terminal.result()
-            if kind != "session.execution.succeeded":
-                raise OpenCodeError(json.dumps(data, ensure_ascii=False), code="opencode2.compaction_failed")
-            await self._settle(handle, "compaction")
-        finally:
-            for key in ("operation_terminal", "operation_input", "operation_started", "operation_delivered", "operation_pending"):
-                handle.pop(key, None)
-            terminal.cancel()
-        return {"status": "completed", "message": "上下文已由 OpenCode 原生压缩"}
+        raise OpenCodeError("Requested OpenCode 2 operation is unavailable", code="opencode2.operation_unsupported")
 
     async def snapshot(self, session: AgentSessionRef | None) -> RuntimeCapabilitySnapshot:
         owner = self.owner
@@ -1184,10 +1561,13 @@ class OpenCode2Runtime:
         handle = owner._sessions.get(session.agent_session_id)
         if handle is None:
             return snapshot
-        items = list(snapshot.items)
+        items = [*snapshot.items, dynamic_command_item(
+            adapter_id=owner.id, engine="opencode", name="compact", channel="app_server_rpc",
+            description="压缩当前 OpenCode 会话上下文",
+            invocation={"transport": "opencode2.compact", "wire_text": "/compact"})]
         for row in handle.get("available_commands") or []:
             name = str(row.get("name") or row.get("id") or "")
-            if name:
+            if name and name != "compact":
                 items.append(dynamic_command_item(
                     adapter_id=owner.id, engine="opencode", name=name, channel="app_server_rpc",
                     description=str(row.get("description") or ""),

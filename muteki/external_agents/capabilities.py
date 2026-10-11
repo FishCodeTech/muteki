@@ -42,6 +42,7 @@ BOOL_CAPABILITY_FIELDS = (
     "native_tool_binding", "acp_mcp_config", "agent_plugin",
     "structured_http_rpc", "tool_events", "usage_events",
     "session_persistence", "plan", "plan_mode", "image_input", "compaction",
+    "context_usage",
 )
 
 

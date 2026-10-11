@@ -8,8 +8,75 @@
  * The reading width honors the C39 `--dsh-chat-content-width` reading pref.
  * ───────────────────────────────────────────────────────── */
 
-import React from "react";
+import React, { useEffect, useRef } from "react";
 import { cn } from "@/lib/cn";
+
+/** Marks a side panel whose CSS width transition squeezes the chat stream. */
+export const REFLOW_PANEL_ATTR = "data-cx-reflow-panel";
+
+function hasRunningWidthTransition(element: HTMLElement) {
+  return element.getAnimations().some((animation) =>
+    animation.playState === "running"
+    && (animation as CSSTransition).transitionProperty === "width");
+}
+
+/**
+ * A side panel animating its width resizes the stream on every frame. Pinning
+ * the reading column to the narrower of its start and end widths keeps the
+ * transcript from re-wrapping (and every virtual row from re-measuring) each
+ * frame; only the centering offset moves until the transition settles.
+ */
+function usePinColumnDuringPanelTransition(columnRef: React.RefObject<HTMLDivElement | null>) {
+  useEffect(() => {
+    const column = columnRef.current;
+    const stream = column?.parentElement;
+    if (!column || !stream) return;
+    const panels = new Set<HTMLElement>();
+    let fallback = 0;
+    const release = () => {
+      for (const panel of panels) {
+        if (panel.isConnected && hasRunningWidthTransition(panel)) return;
+      }
+      panels.clear();
+      window.clearTimeout(fallback);
+      column.style.width = "";
+    };
+    const panelOf = (event: TransitionEvent) => {
+      if (event.propertyName !== "width") return null;
+      const target = event.target;
+      return target instanceof HTMLElement && target.hasAttribute(REFLOW_PANEL_ATTR) ? target : null;
+    };
+    const onRun = (event: TransitionEvent) => {
+      const panel = panelOf(event);
+      if (!panel) return;
+      const targetWidth = Number.parseFloat(panel.style.width);
+      if (!Number.isFinite(targetWidth)) return;
+      const growth = targetWidth - panel.getBoundingClientRect().width;
+      const current = column.getBoundingClientRect().width;
+      const pinned = Math.max(0, Math.min(current, stream.clientWidth - growth));
+      panels.add(panel);
+      column.style.width = `${Math.round(pinned)}px`;
+      window.clearTimeout(fallback);
+      fallback = window.setTimeout(() => {
+        panels.clear();
+        column.style.width = "";
+      }, 1000);
+    };
+    const onSettle = (event: TransitionEvent) => {
+      if (panelOf(event)) release();
+    };
+    document.addEventListener("transitionrun", onRun);
+    document.addEventListener("transitionend", onSettle);
+    document.addEventListener("transitioncancel", onSettle);
+    return () => {
+      document.removeEventListener("transitionrun", onRun);
+      document.removeEventListener("transitionend", onSettle);
+      document.removeEventListener("transitioncancel", onSettle);
+      window.clearTimeout(fallback);
+      column.style.width = "";
+    };
+  }, [columnRef]);
+}
 
 export interface ChatMessageItem {
   id: string;
@@ -47,6 +114,8 @@ export function Chat({
   emptyState,
   className = "",
 }: ChatProps) {
+  const columnRef = useRef<HTMLDivElement>(null);
+  usePinColumnDuringPanelTransition(columnRef);
   return (
     <div className={cn("cx-chat relative flex min-h-0 w-full flex-1 flex-col overflow-hidden bg-cx-bg", className)}>
       {header ? <div className="shrink-0">{header}</div> : null}
@@ -58,7 +127,7 @@ export function Chat({
           className="ai-chat-stream cx-chat-stream cx-scroll absolute inset-0 overflow-y-auto overflow-x-hidden"
           data-testid="cx-chat-stream"
         >
-          <div className="cx-timeline mx-auto flex w-full max-w-[var(--dsh-chat-content-width,var(--cx-content-w))] flex-col px-5 pb-8 pt-8 sm:px-6">
+          <div ref={columnRef} className="cx-timeline mx-auto flex w-full max-w-[var(--dsh-chat-content-width,var(--cx-content-w))] flex-col px-5 pb-8 pt-8 sm:px-6">
             {emptyState ? emptyState : children}
           </div>
         </div>

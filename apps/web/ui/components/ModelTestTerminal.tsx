@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Button } from "@heroui/react";
 import { Icon } from "@/components/Icon";
 import type { WorkerModelTestResult } from "@/lib/useRun";
@@ -10,7 +10,7 @@ export function ModelTestTerminal({
   result,
   compact = false,
   title = "模型测试终端",
-  runningMessage = "正在启动真实 Worker 模型对话，请等待模型返回…",
+  runningMessage = "正在执行真实 Worker 模型请求，等待模型返回；完成或超时后会显示结果。",
 }: {
   testing: boolean;
   result: WorkerModelTestResult | null;
@@ -19,9 +19,17 @@ export function ModelTestTerminal({
   runningMessage?: string;
 }) {
   const [collapsed, setCollapsed] = useState(false);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  useEffect(() => {
+    if (!testing) return;
+    const startedAt = Date.now();
+    setElapsedSeconds(0);
+    const timer = window.setInterval(() => setElapsedSeconds(Math.floor((Date.now() - startedAt) / 1000)), 1000);
+    return () => window.clearInterval(timer);
+  }, [testing]);
   if (!testing && !result) return null;
   const stateClass = testing ? "running" : result?.ok ? "ok" : "bad";
-  const stateLabel = testing ? "运行中" : result?.ok ? "已通过" : "未通过";
+  const stateLabel = testing ? `运行中 · ${elapsedSeconds}s` : result?.ok ? "已通过" : "未通过";
   if (collapsed) {
     return (
       <Button variant="ghost" className="wmodel-terminal-collapsed" onPress={() => setCollapsed(false)} aria-label={`展开${title}`}>

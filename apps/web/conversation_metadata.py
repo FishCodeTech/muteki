@@ -15,10 +15,9 @@ from typing import Awaitable, Callable, Optional
 
 from apps.web.titler import (
     ConversationMetadata,
-    generate_conversation_metadata,
     generate_conversation_metadata_with_runtime,
 )
-from apps.web.llm_credentials import resolve_llm_profile_credential
+from muteki.external_agents.factory import engine_for_adapter
 from muteki.conversation import events as ev
 from muteki.conversation.manager import ConversationManager
 from muteki.platform.contracts.events import EventEnvelope
@@ -29,22 +28,8 @@ LOG = logging.getLogger(__name__)
 
 MetadataGenerator = Callable[..., Awaitable[Optional[ConversationMetadata]]]
 
-_GREETING_ONLY = re.compile(
-    r"^(?:你好|您好|嗨|哈喽|在吗|早上好|下午好|晚上好|"
-    r"hi|hello|hey|yo|good\s+(?:morning|afternoon|evening))"
-    r"[\s!！,.，。?？~～]*$",
-    re.IGNORECASE,
-)
-
-
-def is_informative_message(text: str) -> bool:
-    """Return whether an opening message contains more than a greeting."""
-    value = re.sub(r"\s+", " ", str(text or "").strip())
-    return bool(value and not _GREETING_ONLY.fullmatch(value))
-
-
 class ConversationMetadataService:
-    """Generate Thread metadata when informative turns start and complete."""
+    """Generate Thread metadata when turns start and complete."""
 
     def __init__(
         self,
@@ -52,16 +37,12 @@ class ConversationMetadataService:
         manager: ConversationManager,
         *,
         sessions_root: str,
-        worker_config: object | None = None,
         generator: MetadataGenerator = generate_conversation_metadata_with_runtime,
-        titler_generator: MetadataGenerator = generate_conversation_metadata,
     ) -> None:
         self._store = store
         self._manager = manager
         self._sessions_root = sessions_root
-        self._worker_config = worker_config
         self._generator = generator
-        self._titler_generator = titler_generator
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._event_hook = self.consume
 
@@ -92,7 +73,11 @@ class ConversationMetadataService:
                 else:
                     self._schedule_update(event.aggregate_id, turn_id)
             return
-        if event.event_type == ev.EV_TURN_RETRIED:
+        if event.event_type in {
+            ev.EV_TURN_RETRIED,
+            ev.EV_TURN_FAILED,
+            ev.EV_TURN_INTERRUPTED,
+        }:
             self._cancel(event.aggregate_id)
             return
         if event.event_type != ev.EV_TURN_COMPLETED:
@@ -157,7 +142,7 @@ class ConversationMetadataService:
         turn = self._manager.conv.get_turn(turn_id)
         if thread is None or turn is None or turn.thread_id != thread_id:
             return
-        if not thread.summary and not is_informative_message(turn.text):
+        if not thread.summary and not str(turn.text or "").strip():
             return
         runtime = self._manager.runtime_selection(thread_id)
         if not runtime.adapter_id:
@@ -171,16 +156,38 @@ class ConversationMetadataService:
         generate_title = reserved.title_source == "fallback"
         transcript = self._transcript(thread_id)
         from muteki.core.usage import usage_context
-        with usage_context(self._sessions_root, thread_id=thread_id, turn_id=turn_id,
-                           workspace_kind="conversation", actor_kind="auxiliary", role="titler"):
-            metadata = await self._generate_metadata(
-                transcript,
-                runtime=runtime,
-                current_title=reserved.title,
-                generate_title=generate_title,
+        try:
+            with usage_context(self._sessions_root, thread_id=thread_id, turn_id=turn_id,
+                               workspace_kind="conversation", actor_kind="auxiliary", role="titler"):
+                metadata = await self._generate_metadata(
+                    transcript,
+                    runtime=runtime,
+                    current_title=reserved.title,
+                    generate_title=generate_title,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - metadata failures stay isolated from turns
+            LOG.exception(
+                "conversation metadata generation failed: thread_id=%s turn_id=%s "
+                "engine=%s model=%s",
+                thread_id,
+                turn_id,
+                engine_for_adapter(runtime.adapter_id),
+                runtime.model,
             )
+            return
         if metadata is None:
-            LOG.warning("conversation metadata model returned no usable result")
+            LOG.warning(
+                "conversation metadata generator returned no result: "
+                "thread_id=%s turn_id=%s engine=%s model=%s",
+                thread_id,
+                turn_id,
+                engine_for_adapter(runtime.adapter_id),
+                runtime.model,
+            )
             return
 
         updated = self._manager.apply_generated_thread_metadata(
@@ -220,49 +227,18 @@ class ConversationMetadataService:
         runtime: object,
         current_title: str,
         generate_title: bool,
+        thread_id: str,
+        turn_id: str,
     ) -> Optional[ConversationMetadata]:
-        """Use the single-task titler first, then the Thread runtime."""
-        profile: dict[str, object] = {}
-        if self._worker_config is not None:
-            try:
-                config = self._worker_config.get()  # type: ignore[attr-defined]
-                profile = dict((config.get("llm_profiles") or {}).get("titler") or {})
-                credential = resolve_llm_profile_credential(
-                    "titler",
-                    profile,
-                    sessions_root=self._sessions_root,
-                )
-                metadata = await self._titler_generator(
-                    transcript,
-                    current_title=current_title,
-                    generate_title=generate_title,
-                    model=profile.get("model"),
-                    base_url=credential.base_url or None,
-                    api_key=credential.api_key or None,
-                    temperature_mode=profile.get("temperature_mode"),
-                    temperature=profile.get("temperature"),
-                )
-                if metadata is not None:
-                    return metadata
-                LOG.warning(
-                    "conversation metadata titler returned no usable result; "
-                    "falling back to the selected runtime"
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - fallback is the intended behavior
-                LOG.warning(
-                    "conversation metadata titler unavailable; falling back to "
-                    "the selected runtime",
-                    exc_info=True,
-                )
-
+        """Generate metadata with the model selected for this conversation."""
         return await self._generator(
             transcript,
             runtime=runtime,
             sessions_root=self._sessions_root,
             current_title=current_title,
             generate_title=generate_title,
+            thread_id=thread_id,
+            turn_id=turn_id,
         )
 
     async def shutdown(self) -> None:
@@ -278,4 +254,4 @@ class ConversationMetadataService:
             await asyncio.gather(*tasks, return_exceptions=True)
 
 
-__all__ = ["ConversationMetadataService", "is_informative_message"]
+__all__ = ["ConversationMetadataService"]

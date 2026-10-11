@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, type CSSProperties, type KeyboardEvent, type MouseEvent, type PointerEvent, type ReactNode, type RefObject } from "react";
+import { memo, useEffect, useRef, useState, type CSSProperties, type KeyboardEvent, type MouseEvent, type PointerEvent, type ReactNode, type RefObject } from "react";
 import { motion } from "motion/react";
 import { useLang } from "@/lib/i18n";
 import { cn } from "@/lib/cn";
@@ -69,8 +69,18 @@ function slotKindOf(item: NavItem): SlotKind {
   return item.updatedAt ? "time" : "none";
 }
 
+/**
+ * The clock-dependent text of a row's status slot. Rows receive this instead
+ * of the ticking clock, so a tick re-renders only rows whose label changed.
+ */
+export function rowClockLabel(item: NavItem, nowMs: number): string {
+  if (item.running || item.pending || item.failed || item.woke) return "";
+  if (item.snoozedUntil) return compactWake(item.snoozedUntil, nowMs);
+  return formatCompactRelative(item.updatedAt, nowMs);
+}
+
 /** Status shown at the row's right edge; hover actions replace it. */
-function StatusSlot({ item, nowMs, exactTime }: { item: NavItem; nowMs: number; exactTime?: string }) {
+function StatusSlot({ item, clockLabel, exactTime }: { item: NavItem; clockLabel: string; exactTime?: string }) {
   if (item.running) {
     return <SlotLabel tone="accent" icon={<Spinner size={11} />} title="Agent 正在运行">运行中</SlotLabel>;
   }
@@ -94,11 +104,11 @@ function StatusSlot({ item, nowMs, exactTime }: { item: NavItem; nowMs: number; 
   if (item.snoozedUntil) {
     return (
       <SlotLabel tone="muted" icon={<Icon name="clock" size={12} />} title={`将于 ${new Date(item.snoozedUntil).toLocaleString()} 提醒`}>
-        {compactWake(item.snoozedUntil, nowMs)}
+        {clockLabel}
       </SlotLabel>
     );
   }
-  const time = formatCompactRelative(item.updatedAt, nowMs);
+  const time = clockLabel;
   return (
     <span className="flex items-center gap-1.5">
       {item.unread ? <StatusDot tone="accent" label="有未读更新" className="size-[7px]" /> : null}
@@ -180,7 +190,8 @@ export interface ThreadRowProps {
   active: boolean;
   variant?: "default" | "activity";
   indent?: boolean;
-  nowMs: number;
+  /** From `rowClockLabel`. */
+  clockLabel: string;
   highlight?: string;
   menuOpen: boolean;
   /** The snooze presets menu is open for this row. */
@@ -196,10 +207,10 @@ export interface ThreadRowProps {
   didDragRef: RefObject<boolean>;
   drag?: RowDragHandlers;
   onSelect: (id: string, event: MouseEvent<HTMLElement>) => void;
-  onOpenMenu: (item: NavItem, anchor: HTMLElement) => void;
-  onOpenSnooze?: (item: NavItem, anchor: HTMLElement) => void;
-  onContextMenu: (event: MouseEvent<HTMLElement>, item: NavItem) => void;
-  onKeyDown: (event: KeyboardEvent<HTMLElement>, item: NavItem) => void;
+  onOpenMenu: (item: NavItem, anchor: HTMLElement, sectionKey: string) => void;
+  onOpenSnooze?: (item: NavItem, anchor: HTMLElement, sectionKey: string) => void;
+  onContextMenu: (event: MouseEvent<HTMLElement>, item: NavItem, sectionKey: string) => void;
+  onKeyDown: (event: KeyboardEvent<HTMLElement>, item: NavItem, sectionKey: string) => void;
   onStartRename?: (item: NavItem) => void;
   onRenameDone?: () => void;
   onHover?: (item: NavItem, element: HTMLElement | null) => void;
@@ -208,14 +219,16 @@ export interface ThreadRowProps {
 const SLOT_PADDING: Record<SlotKind, number> = { label: 72, time: 46, none: 36 };
 const ACTIONS_PADDING = 86;
 
-export function ThreadRow({
+// Memoized with stable callbacks from SidebarNav, so a change to one thread
+// re-renders only its own row.
+export const ThreadRow = memo(function ThreadRow({
   item,
   sectionKey,
   index,
   active,
   variant = "default",
   indent = false,
-  nowMs,
+  clockLabel,
   highlight = "",
   menuOpen,
   snoozeOpen = false,
@@ -246,8 +259,9 @@ export function ThreadRow({
   const engaged = menuOpen || snoozeOpen;
 
   return (
+    // No `layout` animation: it measures every row on every render, which
+    // janks long lists.
     <motion.div
-      layout={reduced ? false : "position"}
       initial={reduced ? false : { opacity: 0, y: -4 }}
       // Motion owns the inline opacity, so the drag fade has to go through `animate` rather than a class.
       animate={{ opacity: dragging ? 0.45 : 1, y: 0 }}
@@ -268,7 +282,7 @@ export function ThreadRow({
       data-multi-selected={selected ? "true" : undefined}
       data-menu-open={engaged ? "true" : undefined}
       data-hinting={hinting ? "true" : undefined}
-      onContextMenu={(event) => onContextMenu(event, item)}
+      onContextMenu={(event) => onContextMenu(event, item, sectionKey)}
       onPointerEnter={(event) => { if (event.pointerType === "mouse") onHover?.(item, event.currentTarget); }}
       onPointerLeave={() => onHover?.(item, null)}
     >
@@ -300,7 +314,7 @@ export function ThreadRow({
             event.preventDefault();
             onStartRename?.(item);
           }}
-          onKeyDown={(event) => onKeyDown(event, item)}
+          onKeyDown={(event) => onKeyDown(event, item, sectionKey)}
           onPointerDown={drag?.onPointerDown}
           onPointerMove={drag?.onPointerMove}
           onPointerUp={drag?.onPointerUp}
@@ -350,7 +364,7 @@ export function ThreadRow({
                   "group-hover/row:opacity-0 group-has-[:focus-visible]/row:opacity-0 group-data-[menu-open=true]/row:opacity-0",
                 )}
               >
-                <StatusSlot item={item} nowMs={nowMs} exactTime={exactTime} />
+                <StatusSlot item={item} clockLabel={clockLabel} exactTime={exactTime} />
               </span>
               <span
                 className={cn(
@@ -366,7 +380,7 @@ export function ThreadRow({
                 ) : (
                   <>
                     {item.onSnooze && onOpenSnooze ? (
-                      <RowAction icon="clock" label="稍后提醒" expanded={snoozeOpen} onClick={(anchor) => onOpenSnooze(item, anchor)} />
+                      <RowAction icon="clock" label="稍后提醒" expanded={snoozeOpen} onClick={(anchor) => onOpenSnooze(item, anchor, sectionKey)} />
                     ) : null}
                     {item.onSettle ? (
                       <RowAction icon="check" label="归置" shortcut="mod+shift+s" onClick={() => item.onSettle?.()} />
@@ -383,7 +397,7 @@ export function ThreadRow({
                   onClick={(event) => {
                     event.preventDefault();
                     event.stopPropagation();
-                    onOpenMenu(item, event.currentTarget);
+                    onOpenMenu(item, event.currentTarget, sectionKey);
                   }}
                   className={cn(
                     "cx-press grid size-6 place-items-center rounded-md text-cx-fg-3 outline-none",
@@ -399,7 +413,7 @@ export function ThreadRow({
       )}
     </motion.div>
   );
-}
+});
 
 export function SectionLabel({
   title,
@@ -445,7 +459,7 @@ export function SectionLabel({
   );
 }
 
-export function FolderHeader({
+export const FolderHeader = memo(function FolderHeader({
   section,
   sectionKey,
   collapsed,
@@ -469,10 +483,10 @@ export function FolderHeader({
   controlsId: string;
   didDragRef: RefObject<boolean>;
   drag?: RowDragHandlers;
-  onToggle: () => void;
-  onOpenMenu: (anchor: HTMLElement) => void;
-  onContextMenu: (event: MouseEvent<HTMLElement>) => void;
-  onKeyDown: (event: KeyboardEvent<HTMLElement>) => void;
+  onToggle: (sectionKey: string) => void;
+  onOpenMenu: (anchor: HTMLElement, sectionKey: string) => void;
+  onContextMenu: (event: MouseEvent<HTMLElement>, sectionKey: string) => void;
+  onKeyDown: (event: KeyboardEvent<HTMLElement>, sectionKey: string, collapsed: boolean) => void;
 }) {
   return (
     <div
@@ -484,7 +498,7 @@ export function FolderHeader({
       data-sidebar-section={sectionKey}
       data-sidebar-label={section.title}
       data-menu-open={menuOpen ? "true" : undefined}
-      onContextMenu={onContextMenu}
+      onContextMenu={(event) => onContextMenu(event, sectionKey)}
     >
       <button
         type="button"
@@ -496,9 +510,9 @@ export function FolderHeader({
         aria-label={[section.title, section.subtitle].filter(Boolean).join(" · ")}
         onClick={() => {
           if (didDragRef.current) return;
-          onToggle();
+          onToggle(sectionKey);
         }}
-        onKeyDown={onKeyDown}
+        onKeyDown={(event) => onKeyDown(event, sectionKey, collapsed)}
         onPointerDown={drag?.onPointerDown}
         onPointerMove={drag?.onPointerMove}
         onPointerUp={drag?.onPointerUp}
@@ -550,7 +564,7 @@ export function FolderHeader({
               aria-expanded={menuOpen}
               onClick={(event) => {
                 event.stopPropagation();
-                onOpenMenu(event.currentTarget);
+                onOpenMenu(event.currentTarget, sectionKey);
               }}
               className="cx-press grid size-6 place-items-center rounded-md text-cx-fg-3 hover:bg-cx-active hover:text-cx-fg"
             >
@@ -561,7 +575,7 @@ export function FolderHeader({
       </div>
     </div>
   );
-}
+});
 
 function roleLabel(role: string): string {
   if (role === "user") return "你";

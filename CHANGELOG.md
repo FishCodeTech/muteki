@@ -2,6 +2,29 @@
 
 All notable public release changes are tracked here.
 
+## 0.4.3 - 2026-10-11
+
+### Fixed
+
+- Fixed Worker settings being blocked by missing model tests when switching execution environments. Model tests now use the current environment selection before the settings are saved.
+- Preserved successful credential tests when saving unchanged credentials or updating model selections. Changes to credentials or endpoints still invalidate earlier test results.
+- Preserved complete model-test commands and output, including the actual model response and provider failure reasons.
+- Allowed desktop connections to remote services over HTTP as well as HTTPS, including services running in local virtual machines.
+- Fixed resumed and continued conversations failing while recording context delivery.
+- Fixed previews of images generated inside a conversation, including conversations without a project and SVG images.
+- Fixed disabled Workers with system-login credentials blocking a switch to container execution.
+- Fixed desktop task-retention settings requests, preserved zero-valued task ordering, and corrected semantic version comparisons during updates.
+
+### Changed
+
+- Improved conversation context controls, attachments, native Agent environment reuse, and provider integration.
+- Updated Worker images and installation support for the current Agent integrations.
+
+### Upgrade
+
+- Use `muteki upgrade v0.4.3` or `./run.sh upgrade v0.4.3` for a managed Web installation, and add `--compose` for a container deployment. Existing `.env`, `state/`, credentials, and sessions remain outside the release bundle.
+- Download the macOS `.dmg` or `.zip` matching your Mac from the release page.
+
 ## 0.4.2 - 2026-10-09
 
 ### Fixed

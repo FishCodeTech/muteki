@@ -6,7 +6,9 @@
  * Displays the current context-window occupancy reported by the active
  * Runtime.  Distinguishes window usage from cumulative token consumption:
  *   - limit=null → "上限未知" (never fabricated from cumulative totals)
- *   - compact_status controls button state and status badge
+ *   - a Runtime without the ``context_usage`` capability shows "此引擎不支持"
+ *   - the compact button runs the Runtime's own ``/compact`` as a turn; its
+ *     availability comes from the live command catalog
  */
 
 import React, { useEffect, useRef, useState } from "react";
@@ -14,7 +16,8 @@ import { cn } from "@/lib/cn";
 import { Icon } from "@/components/Icon";
 import { Badge, Button, Popover, type Tone } from "@/components/chat/ui";
 import type { ContextWindowState } from "@/lib/useConversation";
-import { triggerThreadCompact } from "@/lib/useConversation";
+import { requestThreadCompact } from "@/lib/useConversation";
+import { fetchComposerCapabilities, type ComposerCapabilityContext } from "@/lib/composerCapabilities";
 import { compactNumber, relativeTime } from "../chat/composer/format";
 import { ProgressRing } from "../chat/composer/ProgressRing";
 
@@ -23,6 +26,7 @@ const STATUS_LABEL: Record<ContextWindowState["compact_status"], string> = {
   running: "压缩中…",
   done: "压缩完成",
   failed: "压缩失败",
+  interrupted: "压缩已中断",
 };
 
 const STATUS_TONE: Record<ContextWindowState["compact_status"], Tone> = {
@@ -30,6 +34,7 @@ const STATUS_TONE: Record<ContextWindowState["compact_status"], Tone> = {
   running: "warning",
   done: "success",
   failed: "danger",
+  interrupted: "neutral",
 };
 
 type Level = "unknown" | "ok" | "warn" | "danger";
@@ -58,12 +63,46 @@ const LEVEL_BAR: Record<Level, string> = {
 export interface ContextWindowMeterProps {
   threadId: string;
   contextWindow: ContextWindowState | null | undefined;
-  /** Runtime declares compaction support */
-  compactionSupported?: boolean;
+  /** Runtime ``context_usage`` capability; undefined while descriptors load. */
+  usageSupported?: boolean;
+  /** Live command catalog of the thread's Runtime; resolves ``/compact``. */
+  capabilityContext?: ComposerCapabilityContext;
   onRefresh?: () => void;
   /** "card" (default) renders the full panel; "ring" a compact toolbar gauge with a hover popover. */
   variant?: "card" | "ring";
   className?: string;
+}
+
+type CompactCommand =
+  | { state: "loading" }
+  | { state: "available" }
+  | { state: "unavailable"; reason: string }
+  | { state: "error"; reason: string };
+
+function useCompactCommand(context: ComposerCapabilityContext | undefined): CompactCommand {
+  const [command, setCommand] = useState<CompactCommand>({ state: "loading" });
+  const key = context ? JSON.stringify(context) : "";
+  useEffect(() => {
+    if (!context) {
+      setCommand({ state: "unavailable", reason: "当前对话还没有可用的 Agent Runtime" });
+      return;
+    }
+    const controller = new AbortController();
+    setCommand({ state: "loading" });
+    fetchComposerCapabilities(context, "/", "compact", controller.signal).then((catalog) => {
+      const item = catalog.items.find((row) => row.kind === "command" && row.name.toLowerCase() === "compact");
+      if (!item) setCommand({ state: "unavailable", reason: "此引擎没有公布 /compact 命令" });
+      else if (item.invocable === false) setCommand({ state: "unavailable", reason: item.reason || "/compact 当前不可执行" });
+      else setCommand({ state: "available" });
+    }).catch((err: unknown) => {
+      if (controller.signal.aborted) return;
+      setCommand({ state: "error", reason: err instanceof Error ? err.message : "命令目录加载失败" });
+    });
+    return () => controller.abort();
+    // The serialized key carries every field of the context.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key]);
+  return command;
 }
 
 function useCompaction(threadId: string, onRefresh?: () => void) {
@@ -73,7 +112,7 @@ function useCompaction(threadId: string, onRefresh?: () => void) {
     setCompactError("");
     setCompacting(true);
     try {
-      await triggerThreadCompact(threadId);
+      await requestThreadCompact(threadId);
       onRefresh?.();
     } catch (err) {
       setCompactError(err instanceof Error ? err.message : "压缩请求失败");
@@ -86,17 +125,20 @@ function useCompaction(threadId: string, onRefresh?: () => void) {
 
 function MeterDetails({
   contextWindow,
-  compactionSupported,
+  usageSupported,
+  capabilityContext,
   compacting,
   compactError,
   onCompact,
 }: {
   contextWindow: ContextWindowState | null | undefined;
-  compactionSupported: boolean;
+  usageSupported: boolean | undefined;
+  capabilityContext: ComposerCapabilityContext | undefined;
   compacting: boolean;
   compactError: string;
   onCompact: () => void;
 }) {
+  const compactCommand = useCompactCommand(capabilityContext);
   const total = contextWindow?.total ?? null;
   const limit = contextWindow?.limit ?? null;
   const compactStatus = contextWindow?.compact_status ?? "idle";
@@ -106,6 +148,10 @@ function MeterDetails({
     ? Math.min(100, Math.round((total / limit) * 100))
     : null;
   const level = levelOf(pct);
+  const unsupported = usageSupported === false && total == null && limit == null;
+  const running = compacting || compactStatus === "running";
+  const compactReason = compactCommand.state === "unavailable" || compactCommand.state === "error"
+    ? compactCommand.reason : "";
 
   return (
     <div className="flex flex-col gap-3">
@@ -143,8 +189,10 @@ function MeterDetails({
             已占用 {pct}%{level === "danger" ? "，即将达到上限" : level === "warn" ? "，接近上限" : ""}
           </p>
         ) : null}
-        {total == null && limit == null ? (
-          <p className="text-[12px] text-cx-fg-4">当前 Runtime 暂未上报窗口用量</p>
+        {unsupported ? (
+          <p className="text-[12px] text-cx-fg-4" data-testid="context-window-unsupported">此引擎不支持上报上下文用量</p>
+        ) : total == null && limit == null ? (
+          <p className="text-[12px] text-cx-fg-4">等待引擎在下一次回复后上报窗口用量</p>
         ) : null}
       </div>
 
@@ -159,30 +207,41 @@ function MeterDetails({
         </dl>
       ) : null}
 
-      {compactionSupported || compacted.length > 0 ? (
-        <div className="flex flex-col gap-2 border-t border-cx-border-subtle pt-2.5">
-          {compactionSupported ? (
-            <Button
-              size="sm"
-              variant="secondary"
-              icon="foldVertical"
-              loading={compacting || compactStatus === "running"}
-              onClick={onCompact}
-              className="w-full"
-            >
-              {compacting || compactStatus === "running" ? "压缩中…" : "手动压缩上下文"}
-            </Button>
+      <div className="flex flex-col gap-2 border-t border-cx-border-subtle pt-2.5">
+          <Button
+            size="sm"
+            variant="secondary"
+            icon="foldVertical"
+            loading={running || compactCommand.state === "loading"}
+            disabled={compactCommand.state !== "available" || running}
+            title={compactReason || undefined}
+            onClick={onCompact}
+            className="w-full"
+          >
+            {running ? "压缩中…" : "压缩上下文（/compact）"}
+          </Button>
+          {compactReason ? (
+            <p className={cn("text-[12px]", compactCommand.state === "error" ? "text-cx-danger" : "text-cx-fg-4")}>{compactReason}</p>
           ) : null}
           {compactError ? <p className="text-[12px] text-cx-danger">{compactError}</p> : null}
           {compacted.length > 0 ? (
             <div className="flex flex-col gap-1.5">
               <span className="text-[12px] font-medium text-cx-fg-4">压缩历史</span>
-              {compacted.slice(-3).map((rec, i) => (
+              {compacted.slice().reverse().map((rec, i) => (
                 <div key={i} className="rounded-lg bg-cx-bg-subtle px-2.5 py-1.5 text-[12px] shadow-[0_0_0_1px_var(--cx-border-subtle)]">
-                  {rec.summary ? <p className="leading-snug text-cx-fg-2">{rec.summary}</p> : null}
+                  <div className="flex items-center gap-1.5 text-[12px] text-cx-fg-3">
+                    <span>{rec.trigger === "auto" ? "自动压缩" : "手动压缩"}</span>
+                    <span className={rec.status === "failed" ? "text-cx-danger" : "text-cx-fg-4"}>
+                      {rec.status === "failed" ? "失败"
+                        : rec.status === "interrupted" ? "已中断"
+                          : rec.confirmed === false ? "回合结束（引擎未上报压缩结果）" : "完成"}
+                    </span>
+                  </div>
+                  {rec.summary ? <p className="mt-0.5 line-clamp-3 leading-snug text-cx-fg-2" title={rec.summary}>{rec.summary}</p> : null}
+                  {rec.message ? <p className="mt-0.5 leading-snug text-cx-fg-3">{rec.message}</p> : null}
                   <div className="cx-tabular mt-0.5 flex items-center gap-2 font-cx-mono text-[12px] text-cx-fg-4">
-                    {rec.tokens_before != null && rec.tokens_after != null ? (
-                      <span>{compactNumber(rec.tokens_before)} → {compactNumber(rec.tokens_after)}</span>
+                    {rec.tokens_before != null ? (
+                      <span>{compactNumber(rec.tokens_before)} → {rec.tokens_after != null ? compactNumber(rec.tokens_after) : "?"}</span>
                     ) : null}
                     {rec.occurred_at ? <span>{relativeTime(rec.occurred_at)}</span> : null}
                   </div>
@@ -190,8 +249,7 @@ function MeterDetails({
               ))}
             </div>
           ) : null}
-        </div>
-      ) : null}
+      </div>
     </div>
   );
 }
@@ -201,10 +259,12 @@ const HOVER_CLOSE_MS = 180;
 
 function ContextRingTrigger({
   contextWindow,
+  usageSupported,
   children,
   className,
 }: {
   contextWindow: ContextWindowState | null | undefined;
+  usageSupported: boolean | undefined;
   children: React.ReactNode;
   className?: string;
 }) {
@@ -240,7 +300,8 @@ function ContextRingTrigger({
       trigger={(
         <button
           type="button"
-          aria-label={pct != null ? `上下文窗口已占用 ${pct}%` : "上下文窗口用量"}
+          aria-label={pct != null ? `上下文窗口已占用 ${pct}%`
+            : usageSupported === false && total == null ? "此引擎不支持上报上下文用量" : "上下文窗口用量"}
           data-testid="context-window-ring"
           data-level={level}
           {...hoverHandlers}
@@ -263,7 +324,8 @@ function ContextRingTrigger({
 export function ContextWindowMeter({
   threadId,
   contextWindow,
-  compactionSupported = false,
+  usageSupported,
+  capabilityContext,
   onRefresh,
   variant = "card",
   className,
@@ -272,7 +334,8 @@ export function ContextWindowMeter({
   const details = (
     <MeterDetails
       contextWindow={contextWindow}
-      compactionSupported={compactionSupported}
+      usageSupported={usageSupported}
+      capabilityContext={capabilityContext}
       compacting={compacting}
       compactError={compactError}
       onCompact={() => void compact()}
@@ -281,7 +344,7 @@ export function ContextWindowMeter({
 
   switch (variant) {
     case "ring":
-      return <ContextRingTrigger contextWindow={contextWindow} className={className}>{details}</ContextRingTrigger>;
+      return <ContextRingTrigger contextWindow={contextWindow} usageSupported={usageSupported} className={className}>{details}</ContextRingTrigger>;
     case "card":
       return (
         <div className={cn("rounded-xl bg-cx-elevated p-3.5 shadow-[0_0_0_1px_var(--cx-border)]", className)}>

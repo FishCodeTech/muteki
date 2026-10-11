@@ -105,6 +105,8 @@ EV_ARTIFACT_CREATED = "core.artifact.created"
 EV_USAGE_UPDATED = "core.usage.updated"
 # C27: context-window fuel gauge (total, limit, zones, compacted, compact_status)
 EV_CONTEXT_WINDOW = "core.context.window"
+# Native context compaction lifecycle: started | completed | failed.
+EV_CONTEXT_COMPACTION = "core.context.compaction"
 
 #: Thread 聚合类型常量。
 AGGREGATE_THREAD = "thread"
@@ -160,6 +162,8 @@ __all__ = [
     "EV_APPROVAL_RESOLVED",
     "EV_ARTIFACT_ATTACHED",
     "EV_ARTIFACT_CREATED",
+    "EV_CONTEXT_COMPACTION",
+    "EV_CONTEXT_WINDOW",
     "EV_MESSAGE_COMPLETED",
     "EV_MESSAGE_DELTA",
     "EV_PLAN_CLEARED",

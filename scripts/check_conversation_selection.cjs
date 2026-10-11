@@ -36,6 +36,7 @@ function component(name) {
 const components = new Proxy({}, { get: (_, key) => {
   if (key === '__esModule') return true;
   if (key === 'useConversationChrome') return () => chrome;
+  if (key === 'useConversationRunningToolCount') return () => 0;
   return component(key);
 }});
 const models = [
@@ -82,6 +83,7 @@ const api = {
   fetchConversationProjects: async()=>structuredClone(projects),
   fetchConversationMemory: async()=>null,
   useConversation: () => ({...conv, view}),
+  useConversationStreamSelector: (_store, _threadId, select) => select({ threadId:'', events:conv.events, liveText:'', liveTextRuns:[] }),
   useConversationThreads: () => ({ threads:[], refresh:conv.refresh, attentionCount:0 }),
 };
 const cache = new Map();
@@ -150,6 +152,16 @@ const credentialPayload = normalizeConversationCredential({
     'cli.grok:other':{discovered_models:models,verified_models:['grok-4.7']},
   },
 });
+const { credentialLoginMissing } = load(path.join(ui,'lib/conversationReadiness.ts'));
+const unknownCredential = normalizeConversationCredential({
+  id:'system:grok', engine:'grok', present:null, status:'unknown', detection_status:'unknown',
+});
+assert.equal(unknownCredential.present, null);
+assert.equal(unknownCredential.detection_status, 'unknown');
+assert.equal(credentialLoginMissing(unknownCredential), false);
+assert.equal(credentialLoginMissing(normalizeConversationCredential({
+  id:'system:grok', engine:'grok', present:false, status:'missing', detection_status:'absent',
+})), true);
 assert.deepEqual(reasoning.credentialForRuntime(credentialPayload,'cli.grok:other',false).models.map(m=>m.id),['grok-4.7']);
 assert.deepEqual(reasoning.credentialForRuntime(credentialPayload,'cli.grok:default',false).models.map(m=>m.id),['grok-4.6']);
 assert.deepEqual(reasoning.credentialForRuntime(credentialPayload,'cli.grok:missing',false).models,[]);

@@ -5,7 +5,9 @@
 import { ChevronDown } from "lucide-react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import {
+  memo,
   type ReactNode,
+  type Ref,
   useCallback,
   useEffect,
   useId,
@@ -42,6 +44,77 @@ export type {
   AgentStepStatus,
   AgentTraceKind,
 } from "./types";
+
+// Rows kept mounted while a live list follows its newest entry. The live
+// viewport is capped at a few hundred pixels (about 15 rows); the rest of a
+// long run stays out of the DOM. Once the reader pauses, the window is frozen
+// and slides a batch at a time as they scroll toward either edge, keeping at
+// most PAUSED_WINDOW_ROWS mounted.
+const LIVE_TAIL_ROWS = 24;
+const REVEAL_STEP_ROWS = 24;
+const REVEAL_MARGIN_PX = 320;
+const PAUSED_WINDOW_ROWS = 96;
+
+type ScrollAnchor = { id: string; offset: number };
+
+function findRow(viewport: HTMLElement, id: string) {
+  return viewport.querySelector<HTMLElement>(`[data-activity-id="${CSS.escape(id)}"]`);
+}
+
+function firstVisibleRow(viewport: HTMLElement): ScrollAnchor | null {
+  const top = viewport.getBoundingClientRect().top;
+  for (const row of viewport.querySelectorAll<HTMLElement>("[data-activity-id]")) {
+    const rect = row.getBoundingClientRect();
+    if (rect.bottom > top) return { id: row.dataset.activityId ?? "", offset: rect.top - top };
+  }
+  return null;
+}
+
+const ROW_ENTER = { opacity: 0, y: 6, filter: "blur(3px)" };
+const ROW_ENTER_REDUCED = { opacity: 1 };
+const ROW_SHOWN = { opacity: 1, y: 0, filter: "blur(0px)", transitionEnd: { filter: "none" } };
+const ROW_EXIT = { opacity: 0, y: -3 };
+const ROW_EXIT_REDUCED = { opacity: 0 };
+const ROW_TRANSITION = {
+  opacity: { duration: 0.18, ease: EASE_OUT },
+  filter: { duration: 0.32, ease: EASE_OUT },
+  y: SPRING_LAYOUT,
+};
+const ROW_TRANSITION_REDUCED = { duration: 0 };
+
+// Memoized so a streaming list re-renders only the rows whose item changed;
+// callers keep unchanged item objects stable across updates.
+const ActivityListRow = memo(function ActivityListRow({
+  item,
+  reduce,
+  exitable,
+  enter,
+  ref,
+}: {
+  item: AgentActivityItem;
+  reduce: boolean;
+  exitable: boolean;
+  /** Rows revealed around a paused reader mount in place. */
+  enter: boolean;
+  ref?: Ref<HTMLDivElement>;
+}) {
+  // No `layout` projection here: a long tool list makes every re-render
+  // snapshot and re-measure each row, which forces style recalculation per
+  // row while a run is streaming.
+  return (
+    <motion.div
+      ref={ref}
+      role="listitem"
+      data-activity-id={item.id}
+      initial={!enter ? false : reduce ? ROW_ENTER_REDUCED : ROW_ENTER}
+      animate={ROW_SHOWN}
+      exit={exitable ? (reduce ? ROW_EXIT_REDUCED : ROW_EXIT) : undefined}
+      transition={reduce ? ROW_TRANSITION_REDUCED : ROW_TRANSITION}
+    >
+      <ActivityRow item={item} />
+    </motion.div>
+  );
+});
 
 function formatDuration(duration: number) {
   const seconds = Math.max(0, Math.round(duration));
@@ -136,7 +209,6 @@ export function AgentActivity({
   const baseId = useId();
   const triggerId = `${baseId}-trigger`;
   const contentId = `${baseId}-content`;
-  const contentRef = useRef<HTMLDivElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const previousStatus = useRef(status);
   const [contentHeight, setContentHeight] = useState(0);
@@ -155,28 +227,101 @@ export function AgentActivity({
     ? getContentType(items)
     : (initialContentType ?? "mixed");
   const limit = Math.max(0, working ? maxHeight : completedMaxHeight ?? maxHeight);
-  const cappedHeight = Math.min(contentHeight, limit);
-  const viewportHeight = working ? Math.min(contentHeight, limit) : cappedHeight;
   const capped = contentHeight > limit;
+  // While working, only a window ending at the newest row is mounted. A paused
+  // window is frozen and anchored by item ids because the live event window
+  // can drop rows from the head; rows appended meanwhile stay unmounted until
+  // the reader scrolls toward them.
+  const [pausedWindow, setPausedWindow] = useState<{ startId: string; endId: string } | null>(null);
+  // Rows up to this id were already on screen (list mount, reopen, resume) and
+  // mount without the entry animation.
+  const [quietThroughId, setQuietThroughId] = useState<string | null>(() => items.at(-1)?.id ?? null);
+  const indexOfId = (id: string | null) => (id === null ? -1 : items.findIndex((item) => item.id === id));
+  let windowStart = 0;
+  let windowEnd = items.length;
+  if (working) {
+    if (!followingLive && pausedWindow) {
+      windowStart = Math.max(0, indexOfId(pausedWindow.startId));
+      const end = indexOfId(pausedWindow.endId);
+      windowEnd = end >= windowStart ? end + 1 : Math.min(items.length, windowStart + PAUSED_WINDOW_ROWS);
+    } else {
+      windowStart = Math.max(0, items.length - LIVE_TAIL_ROWS);
+    }
+  }
+  const quietThrough = indexOfId(quietThroughId);
+  const renderedItems = windowStart || windowEnd < items.length ? items.slice(windowStart, windowEnd) : items;
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+  const windowRef = useRef({ start: windowStart, end: windowEnd });
+  windowRef.current = { start: windowStart, end: windowEnd };
+  const scrollAnchorRef = useRef<ScrollAnchor | null>(null);
 
   const followLive = useCallback((next: boolean) => {
+    const current = itemsRef.current;
+    if (!next && followLiveRef.current) {
+      const start = current[Math.max(0, current.length - LIVE_TAIL_ROWS)];
+      const end = current[current.length - 1];
+      setPausedWindow(start && end ? { startId: start.id, endId: end.id } : null);
+    } else if (next && !followLiveRef.current) {
+      setPausedWindow(null);
+      setQuietThroughId(current.at(-1)?.id ?? null);
+    }
     followLiveRef.current = next;
     setFollowingLive(next);
   }, []);
+
+  // Slides the paused window when the reader nears either edge. Rows dropped
+  // from the opposite edge keep the window bounded; the first visible row is
+  // pinned so the reader does not move.
+  const slidePausedWindow = (viewport: HTMLDivElement) => {
+    if (followLiveRef.current || scrollAnchorRef.current) return;
+    const current = itemsRef.current;
+    const { start, end } = windowRef.current;
+    const fromBottom = viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop;
+    let nextStart = start;
+    let nextEnd = end;
+    if (viewport.scrollTop <= REVEAL_MARGIN_PX && start > 0) {
+      nextStart = Math.max(0, start - REVEAL_STEP_ROWS);
+      nextEnd = Math.min(end, nextStart + PAUSED_WINDOW_ROWS);
+    } else if (fromBottom <= REVEAL_MARGIN_PX && end < current.length) {
+      nextEnd = Math.min(current.length, end + REVEAL_STEP_ROWS);
+      nextStart = Math.max(start, nextEnd - PAUSED_WINDOW_ROWS);
+    } else {
+      return;
+    }
+    const startItem = current[nextStart];
+    const endItem = current[nextEnd - 1];
+    if (!startItem || !endItem) return;
+    scrollAnchorRef.current = firstVisibleRow(viewport);
+    setPausedWindow({ startId: startItem.id, endId: endItem.id });
+  };
 
   const pauseLive = () => {
     if (working) followLive(false);
   };
 
+  // A paused window that still fits has no scroll range to slide and no
+  // follow control, so freezing its end would hide every later row until the
+  // list remounts. Keep it ending at the newest row until the list overflows;
+  // from then on the reader's position is preserved as usual.
+  const newestId = items.at(-1)?.id ?? null;
   useLayoutEffect(() => {
-    const node = contentRef.current;
-    if (!node) return;
+    if (!working || followingLive || capped || !pausedWindow || !newestId) return;
+    if (pausedWindow.endId === newestId) return;
+    setPausedWindow({ startId: pausedWindow.startId, endId: newestId });
+  }, [capped, followingLive, newestId, pausedWindow, working]);
 
-    const measure = () => setContentHeight(node.offsetHeight);
-    measure();
-
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(measure);
+  // The viewport is sized by CSS max-height; the observed height only decides
+  // whether the list is capped. Reading it from the observer entry avoids a
+  // forced synchronous layout per instance when a long thread mounts. The list
+  // unmounts while collapsed, so the observer follows the node via a ref callback.
+  const observeContent = useCallback((node: HTMLDivElement | null) => {
+    if (!node || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[entries.length - 1];
+      const size = entry?.borderBoxSize?.[0]?.blockSize;
+      setContentHeight(size ?? node.offsetHeight);
+    });
     observer.observe(node);
     return () => observer.disconnect();
   }, []);
@@ -197,13 +342,26 @@ export function AgentActivity({
   // a disclosure opens keeps its added height from dragging the reader away.
   useLayoutEffect(() => {
     const viewport = viewportRef.current;
-    if (viewport && working && expanded && followLiveRef.current) {
+    const anchor = scrollAnchorRef.current;
+    scrollAnchorRef.current = null;
+    if (!viewport) return;
+    if (anchor && working && !followLiveRef.current) {
+      const row = findRow(viewport, anchor.id);
+      if (row) {
+        const offset = row.getBoundingClientRect().top - viewport.getBoundingClientRect().top;
+        viewport.scrollTop += offset - anchor.offset;
+      }
+      return;
+    }
+    if (working && expanded && followLiveRef.current) {
       viewport.scrollTop = viewport.scrollHeight;
     }
-  }, [contentHeight, expanded, viewportHeight, working]);
+  }, [contentHeight, expanded, working, windowStart, windowEnd]);
 
   const toggle = () => {
     if (working) {
+      // Reopening remounts the rows already seen; they should not animate in.
+      if (liveCollapsed) setQuietThroughId(items.at(-1)?.id ?? null);
       setLiveCollapsed((collapsed) => !collapsed);
       return;
     }
@@ -267,7 +425,6 @@ export function AgentActivity({
         role="region"
         aria-labelledby={triggerId}
         open={expanded}
-        openHeight={viewportHeight}
         className="relative"
       >
         <div
@@ -278,7 +435,7 @@ export function AgentActivity({
             "cx-scroll overflow-x-hidden pr-1 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-cx-focus",
             capped && expanded ? "overflow-y-auto" : "overflow-y-hidden",
           )}
-          style={{ height: viewportHeight, maskImage, WebkitMaskImage: maskImage, overflowAnchor: "none" }}
+          style={{ maxHeight: limit, maskImage, WebkitMaskImage: maskImage, overflowAnchor: "none" }}
           onPointerDownCapture={(event) => {
             pauseLive();
             scrollGestureRef.current = event.target === event.currentTarget;
@@ -302,45 +459,46 @@ export function AgentActivity({
             }
           }}
           onScroll={(event) => {
-            if (!working || !scrollGestureRef.current) return;
+            if (!working) return;
             const viewport = event.currentTarget;
-            const atBottom = viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop <= 8;
+            slidePausedWindow(viewport);
+            if (!scrollGestureRef.current) return;
+            const atBottom = viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop <= 8
+              && windowRef.current.end >= itemsRef.current.length;
             // Layout changes may also dispatch scroll. Only a reader's scroll
             // gesture may resume following; a disclosure click must not.
             if (atBottom) scrollGestureRef.current = false;
             followLive(atBottom);
           }}
         >
-          <motion.div
-            ref={contentRef}
+          <div
+            ref={observeContent}
             role="list"
             className={cn("space-y-0.5 py-2", timeline && "cx-activity-timeline", contentClassName)}
           >
-            <AnimatePresence mode="popLayout">
-              {items.map((item) => (
-                <motion.div
-                  layout="position"
+            {/* While live, rows leave the window without an exit animation, so
+                the list skips AnimatePresence: it would re-render every row on
+                each append, and popLayout would force a layout per append.
+                Only rows appended while following animate in. Settling
+                remounts the list with exit animations. */}
+            {working ? (
+              renderedItems.map((item, index) => (
+                <ActivityListRow
                   key={item.id}
-                  role="listitem"
-                  initial={reduce ? { opacity: 1 } : { opacity: 0, y: 6, filter: "blur(3px)" }}
-                  animate={{ opacity: 1, y: 0, filter: "blur(0px)", transitionEnd: { filter: "none" } }}
-                  exit={reduce ? { opacity: 0 } : { opacity: 0, y: -3 }}
-                  transition={
-                    reduce
-                      ? { duration: 0 }
-                      : {
-                          opacity: { duration: 0.18, ease: EASE_OUT },
-                          filter: { duration: 0.32, ease: EASE_OUT },
-                          y: SPRING_LAYOUT,
-                          layout: SPRING_LAYOUT,
-                        }
-                  }
-                >
-                  <ActivityRow item={item} />
-                </motion.div>
-              ))}
-            </AnimatePresence>
-          </motion.div>
+                  item={item}
+                  reduce={reduce}
+                  exitable={false}
+                  enter={followingLive && windowStart + index > quietThrough}
+                />
+              ))
+            ) : (
+              <AnimatePresence key="all" initial={false} mode="popLayout" presenceAffectsLayout={false}>
+                {renderedItems.map((item) => (
+                  <ActivityListRow key={item.id} item={item} reduce={reduce} exitable enter />
+                ))}
+              </AnimatePresence>
+            )}
+          </div>
         </div>
         {working && capped && !followingLive ? (
           <button

@@ -77,6 +77,18 @@ def unavailable_commands(engine: str, native_names: set[str]) -> list[dict[str, 
     } for name in provider.terminal_only if name not in native_names]
 
 
+def unavailable_compact(engine: str, adapter_id: str) -> dict[str, Any]:
+    """Greyed /compact for a live session whose runtime publishes no compaction."""
+    return {
+        "id": f"unavailable:{engine}:compact", "kind": "command", "name": "compact",
+        "description": "压缩当前会话上下文", "source": adapter_id,
+        "scope": "engine", "engine": engine, "action": "inspect-runtime-capability",
+        "channel": "local_handler", "invocable": False, "support_level": "unsupported",
+        "reason": f"{adapter_id} 当前会话没有公布压缩命令或接口，平台无法触发上下文压缩",
+        "alternative": "用 /new 开始新聊天，或切换到支持压缩的接入；不会把 /compact 当作普通消息发送给模型",
+    }
+
+
 def operation_item(adapter_id: str, engine: str, name: str, method: str, description: str,
                    argument_hint: str = "") -> RuntimeCapabilityItem:
     return RuntimeCapabilityItem(
@@ -105,6 +117,22 @@ def codex_review_target(arguments: str) -> dict[str, str]:
                 raise ValueError(f"{flag} 需要参数")
             return {"type": kind, key: value}
     return {"type": "custom", "instructions": arguments}
+
+
+def operation_result_text(name: str, result: Any) -> str:
+    """Readable reply for an operation turn, persisted as the turn's message.
+
+    Engine data (``/mcp``, ``/status``...) is appended whole as a JSON block so
+    the reply stays complete after reload; compaction details have their own
+    timeline entry and are not repeated.
+    """
+    message = str(result.get("message") or "").strip() if isinstance(result, dict) else ""
+    text = message or f"/{name} 已完成"
+    data = result.get("result") if isinstance(result, dict) else result
+    if data in (None, "", [], {}) or name == "compact":
+        return text
+    import json
+    return f"{text}\n\n```json\n{json.dumps(data, ensure_ascii=False, indent=2, default=str)}\n```"
 
 
 def public_operation_result(value: Any) -> Any:

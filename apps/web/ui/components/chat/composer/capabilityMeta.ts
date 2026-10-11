@@ -4,7 +4,13 @@ import type {
   ComposerTrigger,
 } from "@/lib/composerCapabilities";
 
-export function capabilityIcon(kind: string): IconName {
+export function capabilityIcon(kind: string, id = ""): IconName {
+  if (kind === "component") {
+    if (id.startsWith("component:computer-use:app:")) return "mousePointer";
+    if (id.startsWith("component:computer-use")) return "monitor";
+    if (id.startsWith("component:browser")) return "globe";
+    return "board";
+  }
   if (kind === "skill") return "sparkles";
   if (kind === "mcp") return "plug";
   if (kind === "plugin") return "layers";
@@ -48,12 +54,14 @@ export function capabilitySection(trigger: ComposerTrigger, item: ComposerCapabi
   if (trigger === "/") {
     if (item.kind === "command") {
       if (item.channel === "local_handler" && item.invocable !== false || item.source === "Muteki") return "聊天操作";
-      const labels: Record<string, string> = { claude: "Claude", codex: "Codex", cursor: "Cursor", pi: "Pi", omp: "OMP", kimi: "Kimi", grok: "Grok", opencode: "OpenCode" };
+      const labels: Record<string, string> = { claude: "Claude", codex: "Codex", cursor: "Cursor", pi: "Pi", omp: "OMP", kimi: "Kimi", grok: "Grok", opencode: "OpenCode", droid: "Droid", devin: "Devin" };
       return `${labels[item.engine || ""] || item.source} ${item.invocable === false ? "暂不可用" : "原生命令"}`;
     }
+    if (item.kind === "component") return "Muteki 内置工具";
     return "Skill";
   }
   if (trigger === "$") return "Skill";
+  if (item.kind === "component") return item.target ? "本机应用" : "Muteki 内置工具";
   if (item.kind === "thread") return "对话";
   if (item.kind === "file") return "文件";
   return "插件与内置组件";

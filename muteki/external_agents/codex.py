@@ -74,6 +74,7 @@ from muteki.platform.contracts.receipts import AggregateRef, CommandReceipt, Rec
 from .base import BaseExternalAgentAdapter, TurnLimits, TurnRunner
 from .approvals import ApprovalDecision
 from .attachment_input import codex_turn_input
+from .context_delivery import codex_additional_context, codex_context_items
 from .command_providers import codex_review_target
 from .capabilities import (
     BOOL_CAPABILITY_FIELDS,
@@ -89,6 +90,7 @@ from muteki.platform.contracts.agent_events import (
     AgentUpdatedPayload,
     ApprovalRequestedPayload,
     ApprovalResolvedPayload,
+    CompactionPayload,
     FailureCategory,
     MessageCompletedPayload,
     MessageDeltaPayload,
@@ -145,6 +147,7 @@ M_THREAD_FORK = "thread/fork"
 M_TURN_START = "turn/start"
 M_TURN_STEER = "turn/steer"
 M_TURN_INTERRUPT = "turn/interrupt"
+M_THREAD_INJECT_ITEMS = "thread/inject_items"
 M_MCP_RELOAD = "config/mcpServer/reload"
 M_MODEL_LIST = "model/list"
 M_MCP_STATUS = "mcpServerStatus/list"
@@ -194,6 +197,19 @@ USER_INPUT_REQUEST_METHODS = {
 }
 #: 合法审批 decision（CommandExecution/FileChange schema 共有子集）。
 APPROVAL_DECISIONS = ("accept", "acceptForSession", "decline", "cancel")
+
+def _context_tokens(token_usage: Mapping[str, Any]) -> Optional[int]:
+    """Window occupancy from ``thread/tokenUsage/updated``.
+
+    ``last.totalTokens`` is the latest request's full prompt plus output;
+    ``last.inputTokens`` reads 0 right after a compaction turn, so it cannot
+    stand in for occupancy.
+    """
+    value = (token_usage.get("last") or {}).get("totalTokens")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
 
 def _as_preview_str(value: Any) -> str:
     if value is None:
@@ -593,6 +609,13 @@ class _PlanModeUnavailable(Exception):
     """Plan turn blocked before ``turn/start`` (no collaborationMode sent)."""
 
 
+CODEX_INJECT_CHANNEL = "codex_inject_items"
+
+
+class _HostContextUnavailable(Exception):
+    """Host rules dropped by compaction cannot be re-appended on this build."""
+
+
 class ModelCatalogProtocolError(ValueError):
     code = "codex.model_catalog.protocol_invalid"
 
@@ -973,6 +996,8 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
     """
 
     context_compaction_events = True
+    host_context_channel = "codex_additional_context"
+    turn_context_channel = "codex_additional_context"
 
     def __init__(
         self,
@@ -1113,6 +1138,8 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
         caps.mcp = mark("mcp", M_MCP_RELOAD in client_req, schema_ok)
         caps.usage_events = mark(
             "usage_events", "thread/tokenUsage/updated" in server_ntf, schema_ok)
+        caps.context_usage = mark(
+            "context_usage", "thread/tokenUsage/updated" in server_ntf, schema_ok)
         caps.plan = mark(
             "plan",
             "turn/plan/updated" in server_ntf or "item/plan/delta" in server_ntf,
@@ -1419,6 +1446,8 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
             existing_thread_params = {
                 key: value for key, value in thread_params.items()
                 if key != "serviceName"}
+            if options.native_rollout_path:
+                existing_thread_params["path"] = options.native_rollout_path
             fork_from = options.fork_from
             if fork_from:
                 result = await conn.request(
@@ -1472,7 +1501,10 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
             "mcp_reload": reload_status,
             "mcp_injected": bool(thread_mcp),
             "thread_started_native": None,
-            "resume_prompt": options.resume_prompt or "Continue from where you left off.",
+            # Replayed by resume(): the last user text with its context parts.
+            "resume_input": MessageInput(
+                text=options.resume_prompt or "Continue from where you left off.",
+                payload={"context_parts": options.resume_context}),
         }
         if request.resume_handle:
             self._fork_connections.pop(request.resume_handle, None)
@@ -1818,11 +1850,9 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
         ctx = self._runs.get(session.agent_session_id)
         if ctx is None or not ctx["conn"].alive:
             return self._unsupported_stream(session, "resume", "resume")
-        prompt = str(
-            ctx.get("resume_prompt") or "Continue from where you left off."
-        )
         return self._turn_stream(
-            session, MessageInput(text=prompt), resumed=True)
+            session, ctx.get("resume_input") or MessageInput(text="Continue from where you left off."),
+            resumed=True)
 
     @staticmethod
     def _collaboration_mode(
@@ -1847,12 +1877,15 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
         return {"mode": wanted, "settings": settings}
 
     @staticmethod
-    def _turn_parameters(ctx: dict[str, Any], input: MessageInput) -> dict[str, Any]:
+    def _turn_parameters(ctx: dict[str, Any], input: MessageInput,
+                         additional_context: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         params: dict[str, Any] = {
             "threadId": ctx["thread_id"],
             "input": codex_turn_input(
                 input.text, input.payload.attachments, input.payload.runtime_capability),
         }
+        if additional_context:
+            params["additionalContext"] = additional_context
         # Detailed reasoning summaries are what the Conversation reasoning
         # block renders; the app-server default ("auto") often emits none.
         params["summary"] = "detailed"
@@ -1876,6 +1909,42 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
                            "approvalsReviewer": access["approvalsReviewer"],
                            "sandboxPolicy": access["sandboxPolicy"]})
         return params
+
+    async def _deliver_turn_context(
+        self, sid: str, ctx: dict[str, Any], input: MessageInput,
+    ) -> dict[str, Any]:
+        """Deliver this turn's context; returns ``turn/start.additionalContext``.
+
+        additionalContext needs experimentalApi. Codex records each entry once
+        and skips an identical entry later, also after compaction dropped it
+        from the model-visible history, so host rules are re-appended with
+        ``thread/inject_items`` after every compaction or rewind. Without
+        experimentalApi every part goes through ``thread/inject_items`` (stable
+        API) right before ``turn/start``.
+        """
+        if input.payload.native_command:
+            return {}
+        host = self.host_context_for_turn(sid)
+        compacted = bool(host) and self._context_revisions.get(sid, 0) > 0
+        if self._experimental_api:
+            parts = self.turn_context(sid, input, host=False)
+            if not compacted:
+                if host:
+                    self.record_context_delivery(sid, host, self.turn_context_channel, scope="session")
+                return codex_additional_context([*host, *parts])
+            inject = host
+        else:
+            parts = self.turn_context(sid, input, host=False, channel=CODEX_INJECT_CHANNEL)
+            inject = [*host, *parts]
+        if inject:
+            if M_THREAD_INJECT_ITEMS not in self._client_request_methods:
+                raise _HostContextUnavailable(M_THREAD_INJECT_ITEMS)
+            await ctx["conn"].request(M_THREAD_INJECT_ITEMS, {
+                "threadId": ctx["thread_id"], "items": codex_context_items(inject),
+            }, timeout=30)
+        if host:
+            self.record_context_delivery(sid, host, CODEX_INJECT_CHANNEL, scope="session")
+        return codex_additional_context(parts) if self._experimental_api else {}
 
     def _plan_mode_block(self, ctx: dict[str, Any]) -> str:
         """Why a plan turn cannot be sent, or ``""`` when it can.
@@ -1916,9 +1985,9 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
             ))
             return
         if input.text.strip():
-            # 中断后继续时重放原始完整指令；只保存于 Runtime 会话内，
+            # 中断后继续时重放原始用户消息及其上下文；只保存于 Runtime 会话内，
             # 重启接管则由 SessionStart.options 中的持久对话历史补齐。
-            ctx["resume_prompt"] = input.text
+            ctx["resume_input"] = input
         record = self._tracker.get(sid)
         thread_id = ctx["thread_id"]
         common = dict(
@@ -2002,10 +2071,12 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
                         if input.payload.interaction_mode == "plan" else "")
                     if blocked:
                         raise _PlanModeUnavailable(blocked)
+                    additional_context = await self._deliver_turn_context(sid, ctx, input)
                     if runner is not None:
                         runner.mark_sent()
                     result = await conn.request(
-                        M_TURN_START, self._turn_parameters(ctx, input), timeout=60)
+                        M_TURN_START, self._turn_parameters(ctx, input, additional_context),
+                        timeout=60)
                     ctx["collaboration_mode"] = input.payload.interaction_mode
                 if runner is not None:
                     runner.ack()
@@ -2016,6 +2087,17 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
                     payload=TurnFailedPayload(error=self.failure(
                         FailureCategory.UNSUPPORTED, "plan_mode_unsupported",
                         message=f"Codex plan mode is unavailable: {exc}")),
+                    **common))
+                return
+            except _HostContextUnavailable as exc:
+                self.host_context_unsent(sid)
+                yield self.emit(build_event(
+                    AgentEventType.TURN_FAILED, seq,
+                    native_type="codex.thread/inject_items",
+                    payload=TurnFailedPayload(error=self.failure(
+                        FailureCategory.UNSUPPORTED, "host_context_unsupported",
+                        message=("Codex compacted the thread and this build has no "
+                                 f"{exc} to restore Muteki host instructions"))),
                     **common))
                 return
             except CodexPeerClosedError as exc:
@@ -2546,6 +2628,11 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
         if method == "thread/tokenUsage/updated":
             usage = params.get("tokenUsage") or {}
             total = usage.get("total") or {}
+            # ``last`` is the most recent model request, i.e. what the window
+            # holds now; ``total`` is the session sum.
+            used = _context_tokens(usage)
+            if used is not None:
+                ctx["context_used"] = used
             return [ev(AgentEventType.USAGE_UPDATED,
                        dump_payload(UsagePayload(
                            scope="session_cumulative",
@@ -2555,6 +2642,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
                            reasoning_tokens=total.get("reasoningOutputTokens"),
                            total_tokens=total.get("totalTokens"),
                            context_window=usage.get("modelContextWindow"),
+                           context_used_tokens=used,
                            native=params,
                        )))], False
         if method == "item/agentMessage/delta":
@@ -2601,10 +2689,22 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
                                      or params.get("output") or ""),
                        )))], False
         if method == "item/started":
+            if (params.get("item") or {}).get("type") == "contextCompaction":
+                ctx["compaction_before"] = ctx.get("context_used")
+                ctx.pop("context_used", None)
+                return [ev(AgentEventType.COMPACTION_UPDATED, dump_payload(
+                    CompactionPayload(
+                        status="started", trigger="auto",
+                        tokens_before=ctx.get("compaction_before"))))], False
             return self._map_item(ev, params, ctx, started=True), False
         if method == "item/completed":
             if (params.get("item") or {}).get("type") == "contextCompaction":
                 self._context_compacted(common["agent_session_id"])
+                return [ev(AgentEventType.COMPACTION_UPDATED, dump_payload(
+                    CompactionPayload(
+                        status="completed", trigger="auto",
+                        tokens_before=ctx.pop("compaction_before", None),
+                        tokens_after=ctx.get("context_used"))))], False
             return self._map_item(ev, params, ctx, started=False), False
         if method == "turn/diff/updated":
             diff = str(
@@ -3107,6 +3207,8 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
         if "thread/revert" in self._client_request_methods:
             await conn.request("thread/revert", {"threadId": ctx["thread_id"], "beforeTurnId": native_turn_id}, timeout=60)
             ctx["current_turn_id"] = None
+            # The removed turns may hold the host context Codex already recorded.
+            self._context_compacted(session.agent_session_id)
             return {"strategy": "native", "method": "thread/revert"}
         result = await conn.request("thread/read", {"threadId": ctx["thread_id"], "includeTurns": True})
         turns = (result.get("thread") or {}).get("turns") or []
@@ -3115,6 +3217,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
             raise RuntimeError("目标轮次已不在原生会话中，请刷新聊天后重试")
         await conn.request("thread/rollback", {"threadId": ctx["thread_id"], "numTurns": len(turns) - index}, timeout=60)
         ctx["current_turn_id"] = None
+        self._context_compacted(session.agent_session_id)
         return {"strategy": "native", "removed": len(turns) - index}
 
     async def runtime_operation(
@@ -3146,6 +3249,9 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
             if ctx.get("current_turn_id"):
                 raise RuntimeError("当前 Codex 正在回复，请结束后再压缩")
             conn = ctx["conn"]
+            before = ctx.get("context_used")
+            after: Optional[int] = None
+            limit: Optional[int] = None
             await conn.request(method, {"threadId": ctx["thread_id"]}, timeout=30)
             # The RPC only acknowledges scheduling. Wait for the actual native
             # compaction turn, including its terminal status, before succeeding.
@@ -3163,6 +3269,13 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
                     if params.get("threadId") != ctx["thread_id"]:
                         continue
                     event = message.get("method")
+                    if event == "thread/tokenUsage/updated":
+                        usage = params.get("tokenUsage") or {}
+                        after = _context_tokens(usage)
+                        if after is not None:
+                            ctx["context_used"] = after
+                        if isinstance(usage.get("modelContextWindow"), int):
+                            limit = usage["modelContextWindow"]
                     if event == "turn/started":
                         compact_turn = (params.get("turn") or {}).get("id")
                     if event == "item/started" and (params.get("item") or {}).get("type") == "contextCompaction":
@@ -3171,7 +3284,13 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
                         status = (params.get("turn") or {}).get("status")
                         if status != "completed":
                             raise RuntimeError(f"Codex 压缩未完成：{status}")
-                        return {"status": "completed", "message": "上下文已由 Codex 原生压缩"}
+                        self._context_compacted(session.agent_session_id)
+                        return {
+                            "status": "completed",
+                            "message": "上下文已由 Codex 原生压缩",
+                            "compaction": {"tokens_before": before, "tokens_after": after},
+                            "context": {"used": after, "limit": limit},
+                        }
         cwd = str(ctx.get("cwd") or "")
         method_params: dict[str, tuple[str, dict[str, Any]]] = {
             "status": ("thread/read", {"threadId": ctx["thread_id"], "includeTurns": False}),

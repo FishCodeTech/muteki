@@ -97,6 +97,59 @@ def _pos_int(v: Any) -> int | None:
         return None
 
 
+def _nonneg_int(v: Any) -> int | None:
+    """Return a non-negative int or None; an empty window is a real 0."""
+    if isinstance(v, bool):
+        return None
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 0 else None
+
+
+def _compaction_window(
+    payload: dict[str, Any], occurred_at: str, current: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Fold one ``core.context.compaction`` event into ``context_window``."""
+    prev = dict(current or {})
+    status = str(payload.get("status") or "")
+    window = {
+        "total": prev.get("total"),
+        "limit": prev.get("limit"),
+        "zones": prev.get("zones", []),
+        "compacted": list(prev.get("compacted") or []),
+        "compact_status": prev.get("compact_status", "idle"),
+        "updated_at": occurred_at,
+        "source": "compaction",
+    }
+    if status == "started":
+        window["compact_status"] = "running"
+        return window
+    record = {
+        key: payload.get(key)
+        for key in ("turn_id", "trigger", "confirmed", "summary", "message")
+        if payload.get(key) not in (None, "")
+    }
+    record["status"] = status
+    record["occurred_at"] = occurred_at
+    for key in ("tokens_before", "tokens_after"):
+        value = _nonneg_int(payload.get(key))
+        if value is not None:
+            record[key] = value
+    window["compacted"].append(record)
+    if status == "completed":
+        window["compact_status"] = "done"
+        # The pre-compaction occupancy is no longer true. Without an
+        # engine-reported value the gauge waits for the next usage report.
+        window["total"] = record.get("tokens_after")
+    elif status == "interrupted":
+        window["compact_status"] = "interrupted"
+    else:
+        window["compact_status"] = "failed"
+    return window
+
+
 def _extract_context_window(
     payload: dict[str, Any],
     native_type: str,
@@ -112,19 +165,23 @@ def _extract_context_window(
     usage = payload.get("usage") or {}
     # Codex reports modelContextWindow in the structured usage event.
     limit = _pos_int(usage.get("model_context_window") or usage.get("context_window_tokens"))
-    # Bug-fix (High): only accept explicit window-fill fields — never cumulative
-    # input_tokens, which is a Codex session total, not current window occupancy.
-    total = _pos_int(usage.get("tokens_used") or usage.get("context_used"))
+    # Only explicit window-fill fields count, never cumulative input_tokens,
+    # which is a session total rather than current window occupancy.
+    total = _nonneg_int(usage.get("context_used"))
+    if total is None:
+        total = _nonneg_int(usage.get("tokens_used"))
 
-    # ACP capacity/occupancy events carry context-only data.
-    # Bug-fix (High): ACP nests used/size under the `usage` sub-dict, not top-level.
+    # Events stored before usage normalization nest ACP used/size under usage.
     if native_type == "acp.usage_update":
         cap = _pos_int(usage.get("size") or usage.get("capacity") or payload.get("capacity"))
-        occ = _pos_int(usage.get("used") or usage.get("occupancy") or payload.get("occupancy") or payload.get("used"))
         if cap is not None:
             limit = cap
-        if occ is not None:
-            total = occ
+        if total is None:
+            for value in (usage.get("used"), usage.get("occupancy"),
+                          payload.get("occupancy"), payload.get("used")):
+                total = _nonneg_int(value)
+                if total is not None:
+                    break
 
     if limit is None and total is None:
         return None
@@ -158,6 +215,7 @@ _QUIET_EVENT_TYPES = frozenset({
     ev.EV_RUNTIME_CAPABILITIES_UPDATED,
     ev.EV_USAGE_UPDATED,
     ev.EV_CONTEXT_WINDOW,
+    ev.EV_CONTEXT_COMPACTION,
     # Subagent bookkeeping is consumed by the parent Agent through
     # muteki_subagent_status; the child Thread carries its own unread state.
     ev.EV_THREAD_LINEAGE_SET,
@@ -380,10 +438,12 @@ class ConversationProjection:
             update["running_turn_id"] = str(p.get("turn_id") or "") or None
             update["last_error"] = {}
             turn = self._conv.get_turn(str(p.get("turn_id") or ""))
+            turn_update: dict[str, Any] = {}
             if turn is not None and isinstance(p.get("runtime"), dict):
-                runtime = {key: str(value) for key, value in p["runtime"].items() if key in
+                turn_update["runtime_snapshot"] = {key: str(value) for key, value in p["runtime"].items() if key in
                            {"adapter_id", "instance_id", "credential_id", "model", "effort", "service_tier", "access_mode", "permission_mode", "sandbox_mode", "interaction_mode"} and value is not None}
-                self._conv.save_turn(turn.model_copy(update={"runtime_snapshot": runtime}))
+            if turn is not None and turn_update:
+                self._conv.save_turn(turn.model_copy(update=turn_update))
         elif etype in (ev.EV_TURN_COMPLETED, ev.EV_TURN_FAILED,
                        ev.EV_TURN_INTERRUPTED):
             incoming_turn = str(p.get("turn_id") or "")
@@ -616,6 +676,9 @@ class ConversationProjection:
             cw_updated = _extract_context_window(p, native, event.occurred_at.isoformat(), state.context_window)
             if cw_updated is not None:
                 update["context_window"] = cw_updated
+        elif etype == ev.EV_CONTEXT_COMPACTION:
+            update["context_window"] = _compaction_window(
+                dict(p), event.occurred_at.isoformat(), state.context_window)
         elif etype == ev.EV_CONTEXT_WINDOW:
             # C27: explicit context-window event (adapter or manual compaction).
             prev = state.context_window or {}
@@ -686,6 +749,15 @@ class ConversationProjection:
                 p.get("generation") or state.current_generation)
             update["session_runtime_key"] = str(p.get("runtime_key") or "")
             update["agent_session_id"] = str(p.get("agent_session_id") or "") or None
+            if state.context_window:
+                # Occupancy and limit belong to the previous engine's context;
+                # the new Runtime reports its own.
+                update["context_window"] = {
+                    **state.context_window,
+                    "total": None, "limit": None, "zones": [],
+                    "compact_status": "idle", "source": "runtime_switched",
+                    "updated_at": event.occurred_at.isoformat(),
+                }
             if state.plan is not None and state.plan.phase not in {
                 "cleared", "unsupported",
             }:
@@ -735,6 +807,10 @@ class ConversationProjection:
                         and p.get("status") == TURN_CANCELLED):
                     status = TURN_CANCELLED
                 turn_update: dict[str, Any] = {"status": status}
+                if isinstance(p.get("context_delivery"), list):
+                    # Parts may be delivered after the start event or to a turn
+                    # that then fails; each carrying event adds its own.
+                    turn_update["context_delivery"] = [*turn.context_delivery, *p["context_delivery"]]
                 if status in (TURN_COMPLETED, TURN_FAILED, TURN_INTERRUPTED, TURN_CANCELLED):
                     turn_update["completed_at"] = event.occurred_at
                 if etype == ev.EV_TURN_FAILED or status == TURN_CANCELLED:
