@@ -2,6 +2,25 @@
 
 All notable public release changes are tracked here.
 
+## 0.4.5 - 2026-10-12
+
+### Fixed
+
+- Bundled Node and Pi in the Web API image so containerized CTF and penetration-testing Reason calls can start and generate summaries without `FileNotFoundError` ([#205](https://github.com/FishCodeTech/muteki/issues/205)).
+- Checked browser and Chromium executability before advertising Worker browser Skills, including Slim images, and kept transient Docker failures out of the capability cache.
+- Included Droid in the shared Worker CLI capability mappings and added native amd64/arm64 Web and Worker runtime checks before publishing image indexes.
+- Generated Cursor SDK conversation titles and summaries through the selected SDK runtime and account. Temporary metadata sessions now clean up their resources without appearing in native conversation history.
+- Corrected OpenCode streamed text replacement after reconnects.
+
+### Added
+
+- Added the unauthorized-use disclaimer and responsibility notice in [DISCLAIMER.md](DISCLAIMER.md).
+
+### Upgrade
+
+- Use `muteki upgrade v0.4.5` or `./run.sh upgrade v0.4.5` for a managed Web installation, and add `--compose` for a container deployment. Existing `.env`, `state/`, credentials, and sessions remain outside the release bundle.
+- Download the macOS `.dmg` or `.zip` matching your Mac from the release page. Windows and Linux desktop packages are not included.
+
 ## 0.4.4 - 2026-10-12
 
 ### Fixed
