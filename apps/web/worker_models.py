@@ -135,6 +135,7 @@ _CONTAINER_BIN = {
     "opencode": "opencode",
     "kimi": "kimi",
     "grok": "/home/kali/.grok/bin/grok",
+    "droid": "droid",
 }
 
 _CONTAINER_OFFLINE_BRIDGE = "/opt/muteki/offline_acp_bridge.py"

@@ -35,6 +35,8 @@ export interface ConversationLiveTextRun {
   start: number;
   end: number;
   phase: "commentary" | "final_answer" | "unknown";
+  /** The runtime message these characters belong to, when it names one. */
+  messageId?: string;
 }
 
 export interface ConversationStreamResult {
@@ -129,6 +131,43 @@ function liveDeltaPhase(event: ConversationStreamEvent): ConversationLiveTextRun
     : rawPhase === "final_answer" || rawPhase === "final" ? "final_answer" : "unknown";
 }
 
+function liveDeltaMessageId(event: ConversationStreamEvent): string | undefined {
+  return String(event.payload.message_id || "").trim() || undefined;
+}
+
+/**
+ * A replacing delta (`replace: true`) carries its message's whole current
+ * text: it takes the place of that message's first run, and its later runs
+ * are dropped. Null when no run belongs to the message.
+ */
+function replaceLiveMessage(
+  liveText: string,
+  runs: ConversationLiveTextRun[],
+  messageId: string,
+  text: string,
+): { liveText: string; runs: ConversationLiveTextRun[] } | null {
+  if (!runs.some((run) => run.messageId === messageId)) return null;
+  let next = "";
+  let covered = 0;
+  let placed = false;
+  const nextRuns: ConversationLiveTextRun[] = [];
+  for (const run of runs) {
+    next += liveText.slice(covered, run.start);
+    covered = run.end;
+    if (run.messageId !== messageId) {
+      const start = next.length;
+      next += liveText.slice(run.start, run.end);
+      nextRuns.push({ ...run, start, end: next.length });
+    } else if (!placed) {
+      placed = true;
+      const start = next.length;
+      next += text;
+      nextRuns.push({ ...run, start, end: next.length });
+    }
+  }
+  return { liveText: next + liveText.slice(covered), runs: nextRuns };
+}
+
 function supersededTurnIds(event: ConversationStreamEvent): Set<string> {
   return new Set(
     (Array.isArray(event.payload.superseded_turn_ids)
@@ -166,15 +205,22 @@ export function acceptConversationStreamEvents(
     if (!liveTextRuns) liveTextRuns = (state.liveTextRuns || []).slice();
 
     const delta = liveDelta(event);
-    if (delta) {
+    const messageId = liveDeltaMessageId(event);
+    const replaced: ReturnType<typeof replaceLiveMessage> = delta && messageId && event.payload.replace === true
+      ? replaceLiveMessage(liveText, liveTextRuns, messageId, delta)
+      : null;
+    if (replaced) {
+      liveText = replaced.liveText;
+      liveTextRuns = replaced.runs;
+    } else if (delta) {
       const start = liveText.length;
       liveText += delta;
       const phase = liveDeltaPhase(event);
       const last = liveTextRuns.at(-1);
-      if (last?.phase === phase && last.end === start) {
+      if (last?.phase === phase && last.messageId === messageId && last.end === start) {
         liveTextRuns[liveTextRuns.length - 1] = { ...last, end: liveText.length };
       } else {
-        liveTextRuns.push({ start, end: liveText.length, phase });
+        liveTextRuns.push({ start, end: liveText.length, phase, ...(messageId ? { messageId } : {}) });
       }
     }
     if (LIVE_TEXT_CLEAR_TYPES.has(event.event_type)) {

@@ -8,7 +8,7 @@ running / pending approval / usage / last error）。重启后可用
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from muteki.platform.contracts.base import utcnow
 from muteki.platform.contracts.events import EventEnvelope
@@ -77,6 +77,31 @@ def _user_message_id(turn_id: str) -> str:
 
 def _assistant_message_id(turn_id: str) -> str:
     return f"msg-asst-{turn_id}"
+
+
+def _fold_assistant_delta(runs: list[list[Any]], event: EventEnvelope, turn_id: str) -> None:
+    """Fold one delta into ``[message_id, text]`` runs in arrival order; a
+    replacing delta rewrites its message's latest run."""
+    if event.event_type != ev.EV_MESSAGE_DELTA:
+        return
+    payload = event.payload or {}
+    if str(payload.get("turn_id") or "") != turn_id or payload.get("thinking"):
+        return
+    if str(payload.get("role") or "assistant").lower() not in {"assistant", "agent"}:
+        return
+    chunk = str(payload.get("text") or "")
+    message_id = payload.get("message_id") or None
+    if payload.get("replace"):
+        run = next((r for r in reversed(runs) if r[0] == message_id), None)
+        if run is not None:
+            run[1] = chunk
+            return
+    elif not chunk:
+        return
+    elif runs and runs[-1][0] == message_id:
+        runs[-1][1] += chunk
+        return
+    runs.append([message_id, chunk])
 
 
 def _error_payload(value: Any) -> dict[str, Any]:
@@ -478,7 +503,13 @@ class ConversationProjection:
                 thread_id, turn_id, text, event.stream_seq, state, update)
         elif etype == ev.EV_MESSAGE_DELTA:
             role = str(p.get("role") or "assistant").lower()
-            if role in {"assistant", "agent"} and not p.get("thinking"):
+            if role in {"assistant", "agent"} and not p.get("thinking") and p.get("replace"):
+                turn_id = str(p.get("turn_id") or "")
+                self._save_assistant_message(
+                    thread_id, turn_id,
+                    self._collect_assistant_delta_text(thread_id, turn_id, through=event),
+                    event.stream_seq, state, update)
+            elif role in {"assistant", "agent"} and not p.get("thinking"):
                 self._save_assistant_message(
                     thread_id,
                     str(p.get("turn_id") or ""),
@@ -870,27 +901,32 @@ class ConversationProjection:
             update["message_count"] = state.message_count + 1
         update["last_message_preview"] = text[:200]
 
-    def _collect_assistant_delta_text(self, thread_id: str, turn_id: str) -> str:
+    def _collect_assistant_delta_text(
+        self, thread_id: str, turn_id: str, *, through: Optional[EventEnvelope] = None,
+    ) -> str:
+        """The turn's assistant text as its deltas build it, replacements
+        included; ``through`` ends the read at that event, applied even when
+        it is not stored yet."""
         if not thread_id or not turn_id:
             return ""
-        parts: list[str] = []
-        for event in self._store.read_events(
-            ev.AGGREGATE_THREAD, thread_id, limit=10000,
-        ):
-            if event.event_type != ev.EV_MESSAGE_DELTA:
-                continue
-            payload = event.payload or {}
-            if str(payload.get("turn_id") or "") != turn_id:
-                continue
-            if payload.get("thinking"):
-                continue
-            role = str(payload.get("role") or "assistant").lower()
-            if role not in {"assistant", "agent"}:
-                continue
-            chunk = str(payload.get("text") or "")
-            if chunk:
-                parts.append(chunk)
-        return "".join(parts)
+        runs: list[list[Any]] = []
+        after, applied = 0, False
+        while True:
+            page = self._store.read_events(
+                ev.AGGREGATE_THREAD, thread_id, after_seq=after, limit=1000)
+            for event in page:
+                if through is not None and event.stream_seq > through.stream_seq:
+                    break
+                applied = applied or (through is not None and event.stream_seq == through.stream_seq)
+                _fold_assistant_delta(runs, event, turn_id)
+            else:
+                if len(page) == 1000:
+                    after = page[-1].stream_seq
+                    continue
+            break
+        if through is not None and not applied:
+            _fold_assistant_delta(runs, through, turn_id)
+        return "".join(text for _, text in runs)
 
     def ensure_assistant_from_deltas(self, thread_id: str, turn_id: str) -> None:
         """中断/失败后：若还没有助手消息，用已落库的 delta 拼出一条。"""

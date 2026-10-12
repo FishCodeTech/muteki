@@ -43,6 +43,7 @@ _CONTAINER_BIN = {
     "kimi": "kimi",
     "grok": "/home/kali/.grok/bin/grok",
     "opencode": "opencode",
+    "droid": "droid",
 }
 
 

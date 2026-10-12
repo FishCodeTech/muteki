@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,7 +42,12 @@ from muteki.capability_management import (
     enabled as capability_resource_enabled,
     set_enabled as set_capability_resource_enabled,
 )
-from muteki.solver.worker_skills import legacy_user_skill_paths, project_skill_roots
+from muteki.solver.container_exec import WORKER_IMAGE
+from muteki.solver.worker_skills import (
+    container_agent_browser_available,
+    legacy_user_skill_paths,
+    project_skill_roots,
+)
 from muteki.solver.worker_profiles import VALID_BASE_ENGINES
 
 
@@ -414,6 +420,10 @@ def create_capability_management_router(
             repo_root / "muteki" / "agent_plugins" / "muteki-control")
         blackboard_source = repo_root / "skills" / "muteki-blackboard"
         browser_source = repo_root / "skills" / "muteki-agent-browser"
+        browser_available = False
+        if browser_enabled and (browser_source / "SKILL.md").is_file():
+            browser_available = await asyncio.to_thread(
+                container_agent_browser_available, WORKER_IMAGE)
         legacy_copies = [
             {
                 "path": str(path),
@@ -502,8 +512,9 @@ def create_capability_management_router(
                         "enabled": browser_enabled,
                         "mutable": True,
                         "health": (
-                            "ready" if browser_enabled and (browser_source / "SKILL.md").is_file()
-                            else "disabled" if not browser_enabled else "missing"
+                            "disabled" if not browser_enabled
+                            else "missing" if not (browser_source / "SKILL.md").is_file()
+                            else "ready" if browser_available else "unavailable"
                         ),
                         "source": str(browser_source),
                         "scope": "pentest_worker_workspace",

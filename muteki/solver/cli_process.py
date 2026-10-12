@@ -19,6 +19,7 @@ from muteki.solver.worker_skills import (
     RoleContractStage,
     instruction_file_gitignored,
     role_contract_filename,
+    container_agent_browser_available,
     stage_agent_browser_skill,
     stage_blackboard_skill,
     stage_role_contract,
@@ -106,6 +107,7 @@ def _worker_env(self, cwd: Optional[str] = None) -> dict:
             getattr(self.challenge, "mode", "ctf") == "pentest"
             and self.container is not None
             and capability_enabled("skills", "agent-browser")
+            and container_agent_browser_available(self.container.image)
         )
         self._agent_browser_enabled = browser_enabled
     skill_workdir = cwd or self._workdir
