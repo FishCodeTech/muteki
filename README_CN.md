@@ -23,7 +23,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <strong>简体中文</strong> · <a href="CHANGELOG.md">版本更新</a> · <a href="docs/development.md">开发版编译与更新</a>
+  <a href="README.md">English</a> · <strong>简体中文</strong> · <a href="CHANGELOG.md">版本更新</a> · <a href="DISCLAIMER.md">免责声明</a> · <a href="docs/development.md">开发版编译与更新</a>
 </p>
 
 <p align="center">
@@ -47,7 +47,7 @@
 
 > ## ⚠️ 运行前必读
 >
-> 免责声明：本项目请遵守相关法律，任何未授权的渗透和黑客行为，均与项目作者本人没有任何关系。
+> **任何第三方利用本项目对其他项目、系统或网络实施未授权攻击，均属其自行实施的行为。相关行为及后果由实施者自行承担，与本人及本项目无关。本人及本项目不为该等第三方行为及其后果承担任何责任，也不提供授权或背书。** 完整说明见 [免责声明与未授权行为责任声明](DISCLAIMER.md)。
 >
 > Muteki 是**攻击性安全自动化工具**。它驱动 CLI agent 执行命令、调用安全工具、访问目标服务;
 > **它不承诺隔离恶意 challenge**。

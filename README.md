@@ -23,7 +23,7 @@
 </p>
 
 <p align="center">
-  <strong>English</strong> · <a href="README_CN.md">简体中文</a> · <a href="CHANGELOG.md">Changelog</a> · <a href="docs/development.md">Dev build guide</a>
+  <strong>English</strong> · <a href="README_CN.md">简体中文</a> · <a href="CHANGELOG.md">Changelog</a> · <a href="DISCLAIMER.md">Disclaimer (中文)</a> · <a href="docs/development.md">Dev build guide</a>
 </p>
 
 <p align="center">
@@ -41,6 +41,8 @@
 **無敵 · Project Muteki** is an open-source, multi-agent security framework built with Remix Engineering. A Coordinator schedules different Agent engines toward one goal, manages their context, and lets them collaborate through shared evidence. The current Worker engines are Claude, Codex, Cursor, Pi, OMP, Kimi, Grok, and OpenCode. The project will keep expanding beyond CTF toward a broader Agent workbench.
 
 > ## ⚠️ Read before running
+>
+> **Unauthorized attacks against other projects, systems, or networks carried out by third parties using Muteki are their own actions. Those carrying them out bear responsibility for their actions and the consequences. The author and this project disclaim all responsibility and liability for those third-party actions and do not authorize or endorse them.** See the full [disclaimer and unauthorized-use responsibility statement (中文)](DISCLAIMER.md).
 >
 > Use Muteki only against challenges and targets you own or are authorized to test. Muteki drives CLI Agents that can run commands, invoke security tools, and access target services. **It does not isolate malicious challenges.**
 >
