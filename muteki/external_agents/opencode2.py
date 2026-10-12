@@ -581,11 +581,6 @@ class OpenCode2Runtime:
                     self._dispatch_checked(sid, f"session.{ptype}.ended", {
                         "type": f"session.{ptype}.ended",
                         "data": {**base, "ordinal": ordinals[ptype], "text": part.get("text") or ""}}, replay=True)
-                    # The block may still be streaming: its live end stays
-                    # authoritative, and its live deltas are dropped.
-                    key = f"{native_sid}:{message['id']}:{ordinals[ptype]}"
-                    handle.setdefault("ended_blocks", set()).discard(key)
-                    handle.setdefault("backfilled_blocks", set()).add(key)
                     ordinals[ptype] += 1
                     continue
                 if ptype != "tool":
@@ -979,48 +974,58 @@ class OpenCode2Runtime:
     def _text_event(self, handle: dict[str, Any], kind: str, data: dict[str, Any], agent_id: str | None) -> None:
         reasoning = kind.startswith("session.reasoning.")
         key = f"{data['sessionID']}:{data.get('assistantMessageID')}:{data.get('ordinal')}"
-        texts = handle["reasoning" if reasoning else "texts"]
-        # Message deltas only append, so what was already sent is kept apart
-        # from the block's current text, which an end replaces (T3 emitText).
-        shown = handle.setdefault("shown_texts", {})
-        previous = texts.get(key, "")
-        # A block backfilled from history goes on streaming on the new stream
-        # at an offset nothing reports, so its live deltas would repeat text
-        # already shown; its end carries the whole text and finishes it.
-        backfilled = key in handle.setdefault("backfilled_blocks", set())
         if kind.endswith(".delta"):
-            if backfilled:
-                return
-            delta = str(data.get("delta") or "")
-            texts[key] = previous + delta
+            completed, update = False, lambda current: current + str(data.get("delta") or "")
         elif kind.endswith(".ended"):
-            full = str(data.get("text") or "")
-            ended = handle.setdefault("ended_blocks", set())
-            if previous == full and (key in ended or backfilled):
-                return  # A reconnect's backfill and the live stream can both carry this end.
-            ended.add(key)
-            texts[key] = full
-            # A history read can hold less than was streamed, even nothing.
-            sent = shown.get(key, "")
-            delta = full[len(sent):] if full.startswith(sent) else ""
+            completed, update = True, lambda _current: str(data.get("text") or "")
         else:
             return
-        if not reasoning and delta:
-            shown[key] = shown.get(key, "") + delta
+        # T3 emitText: a block's open entry gathers deltas and an end, live or
+        # backfilled, sets its whole text and closes it. A block that goes on
+        # streaming after a backfill closed it starts a new entry, so it shows
+        # only what arrives from then on until its end sets the whole text.
+        slot = f"{key}:{'reasoning' if reasoning else 'text'}"
+        entries = handle.setdefault("text_entries", {})
+        text = update(entries.get(slot, ""))
+        if completed:
+            entries.pop(slot, None)
+        else:
+            entries[slot] = text
+        if not text:
+            return
+        handle["reasoning" if reasoning else "texts"][key] = text
+        # Sent text: the stream appends while the entry extends it and
+        # replaces it when the entry does not.
+        shown = handle.setdefault("shown_texts", {})
+        sent = shown.get(slot, "")
+        shown[slot] = text
+        extends = text.startswith(sent)
         if reasoning:
-            text = texts[key] if kind.endswith(".ended") else delta
-            if text:
+            # A reasoning frame that is not partial replaces its item.
+            if completed or not extends:
                 self._queue(handle, AgentEventType.REASONING_SUMMARY, kind, ReasoningPayload(
-                    text=text, channel="thinking", partial=not kind.endswith(".ended"), item_id=key,
+                    text=text, channel="thinking", partial=False, item_id=key,
                     native={"agent_id": agent_id} if agent_id else {}))
-        elif delta and not agent_id:
+            elif len(text) > len(sent):
+                self._queue(handle, AgentEventType.REASONING_SUMMARY, kind, ReasoningPayload(
+                    text=text[len(sent):], channel="thinking", partial=True, item_id=key,
+                    native={"agent_id": agent_id} if agent_id else {}))
+            return
+        if agent_id:
+            return
+        message_id = f"{data.get('assistantMessageID')}:{data.get('ordinal')}"
+        if not extends:
             self._queue(handle, AgentEventType.MESSAGE_DELTA, kind, MessageDeltaPayload(
-                text=delta, message_id=str(data.get("assistantMessageID"))))
-        if not reasoning and not agent_id and kind.endswith(".ended") and texts[key]:
-            # Native ended events are authoritative, including after a lost
-            # ephemeral delta. Retain the full value in the canonical stream.
+                text=text, message_id=message_id, replace=True))
+        elif len(text) > len(sent):
+            self._queue(handle, AgentEventType.MESSAGE_DELTA, kind, MessageDeltaPayload(
+                text=text[len(sent):], message_id=message_id))
+        finished = handle.setdefault("completed_texts", {})
+        if completed and finished.get(slot) != text:
+            # The live stream and a reconnect's backfill can both end a block.
+            finished[slot] = text
             self._queue(handle, AgentEventType.MESSAGE_COMPLETED, kind, MessageCompletedPayload(
-                text=texts[key], message_id=str(data.get("assistantMessageID"))))
+                text=text, message_id=message_id))
 
     def _tool_event(self, handle: dict[str, Any], kind: str, data: dict[str, Any], agent_id: str | None) -> None:
         call = str(data.get("id") or "")
@@ -1254,10 +1259,8 @@ class OpenCode2Runtime:
         handle["current_turn_id"] = (wake.get("first") if wake else None) or _opencode_message_id()
         root_prefix = handle["external_session_id"] + ":"
         # T3 beginTurn: a new root turn owns fresh buffers; child turns survive.
-        for field in ("texts", "reasoning", "tools", "shown_texts"):
+        for field in ("texts", "reasoning", "tools", "text_entries", "shown_texts", "completed_texts"):
             handle[field] = {key: value for key, value in handle.get(field, {}).items() if not key.startswith(root_prefix)}
-        for field in ("ended_blocks", "backfilled_blocks"):
-            handle[field] = {key for key in handle.get(field, ()) if not key.startswith(root_prefix)}
         handle.update(input_id=handle["current_turn_id"], event_sink=asyncio.Queue(),
                       delivered=set(), admitted=set(), execution_ended=False,
                       interrupted=False, turn_rejected=False, terminal_pending=None,

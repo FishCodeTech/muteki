@@ -281,10 +281,20 @@ MessageRole = Literal["assistant", "user"]
 
 
 class MessageDeltaPayload(_Payload):
+    """``replace=True``: ``text`` is the whole current text of ``message_id``
+    and takes the place of what that message's earlier deltas carried."""
+
     text: str
     role: MessageRole = "assistant"
     phase: Optional[str] = None
     message_id: Optional[str] = None
+    replace: bool = False
+
+    @model_validator(mode="after")
+    def _replace_names_its_message(self) -> "MessageDeltaPayload":
+        if self.replace and not self.message_id:
+            raise ValueError("a replacing message delta needs message_id")
+        return self
 
 
 class MessageCompletedPayload(_Payload):

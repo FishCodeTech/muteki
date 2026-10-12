@@ -39,6 +39,39 @@ RUN apt-get update && \
       ca-certificates curl git docker-cli && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# CTF and pentest planning run Pi in this control-plane process. Keep its
+# runtime aligned with the full Worker image and verify the mirrored archive
+# against Node's official checksum list before installing it.
+ARG TARGETARCH
+ARG NODE_VERSION="24.11.1"
+ARG NODE_MIRROR="https://nodejs.org/dist"
+RUN case "$TARGETARCH" in \
+      amd64) node_arch="x64" ;; \
+      arm64) node_arch="arm64" ;; \
+      *) echo "unsupported Node architecture: $TARGETARCH" >&2; exit 2 ;; \
+    esac && \
+    node_archive="node-v${NODE_VERSION}-linux-${node_arch}.tar.gz" && \
+    curl -fsSL --retry 8 --retry-all-errors \
+      "$NODE_MIRROR/v$NODE_VERSION/$node_archive" -o "/tmp/$node_archive" && \
+    curl -fsSL --retry 8 --retry-all-errors \
+      "https://nodejs.org/dist/v$NODE_VERSION/SHASUMS256.txt" -o /tmp/SHASUMS256.txt && \
+    grep "  ${node_archive}$" /tmp/SHASUMS256.txt > /tmp/node.sha256 && \
+    (cd /tmp && sha256sum -c node.sha256) && \
+    tar -xzf "/tmp/$node_archive" -C /usr/local --strip-components=1 && \
+    rm -f "/tmp/$node_archive" /tmp/SHASUMS256.txt /tmp/node.sha256 && \
+    test "$(node --version)" = "v$NODE_VERSION" && \
+    npm --version
+
+ARG NPM_REGISTRY=""
+ARG PI_VERSION="0.84.1"
+RUN if [ -n "$NPM_REGISTRY" ]; then \
+      npm install -g --registry "$NPM_REGISTRY" \
+        "@earendil-works/pi-coding-agent@$PI_VERSION"; \
+    else \
+      npm install -g "@earendil-works/pi-coding-agent@$PI_VERSION"; \
+    fi && \
+    test "$(pi --version)" = "$PI_VERSION"
+
 # uv for fast, reproducible installs (the repo uses uv / pyproject).
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 

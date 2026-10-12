@@ -10,15 +10,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Any, Iterable
+
+
+logger = logging.getLogger(__name__)
 
 
 def workspace_root_for_worker(wd: str | Path) -> Path:
@@ -160,10 +165,13 @@ _CONTAINER_BIN_CANDIDATES: dict[str, Path] = {
 
 # Cache immutable image identity + exact probe paths; failed probes are retriable.
 _image_toolbox_path_cache: dict[tuple[str, tuple[str, ...]], frozenset[str]] = {}
+_image_command_cache: dict[tuple[str, tuple[str, ...]], bool] = {}
+_image_command_probe_lock = threading.Lock()
 
 
 def clear_toolbox_probe_cache() -> None:
     _image_toolbox_path_cache.clear()
+    _image_command_cache.clear()
 
 
 def container_toolbox_candidates() -> dict[str, Path]:
@@ -203,6 +211,92 @@ def probe_image_paths(image: str, paths: Iterable[str | Path], *, use_cache: boo
     if use_cache:
         _image_toolbox_path_cache[key] = present
     return set(present)
+
+
+def probe_image_command(
+    image: str, argv: Iterable[str], *, use_cache: bool = True,
+) -> bool:
+    """Return whether one command really starts in the selected immutable image.
+
+    Capability projection must follow the image that will execute the Worker.  A
+    file-presence check is insufficient for script entrypoints whose interpreter
+    or runtime dependency may be absent.  Cache by image ID so settings polling
+    and several Workers do not repeatedly start probe containers.
+    """
+    image = str(image or "").strip()
+    command = tuple(str(arg) for arg in argv if str(arg))
+    if not image or not command or not command[0].startswith("/"):
+        return False
+    with _image_command_probe_lock:
+        return _probe_image_command_locked(image, command, use_cache=use_cache)
+
+
+def _probe_image_command_locked(
+    image: str, command: tuple[str, ...], *, use_cache: bool,
+) -> bool:
+    name = f"muteki-command-probe-{os.getpid()}-{time.time_ns()}"
+    try:
+        identity = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("Worker image command probe inspect timed out: image=%s", image)
+        return False
+    except OSError as exc:
+        logger.warning("Worker image command probe inspect failed: image=%s error=%s", image, exc)
+        return False
+    if identity.returncode != 0 or not identity.stdout.strip():
+        logger.warning(
+            "Worker image unavailable for command probe: image=%s detail=%s",
+            image, (identity.stderr or identity.stdout or "").strip(),
+        )
+        return False
+    image_id = identity.stdout.strip()
+    key = (image_id, command)
+    if use_cache and key in _image_command_cache:
+        return _image_command_cache[key]
+    try:
+        result = subprocess.run([
+            "docker", "run", "--rm", "--name", name, "--pull", "never",
+            "--network", "none", "--read-only", "--user", "kali", "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges=true", "--entrypoint", command[0],
+            image_id, *command[1:],
+        ], capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=20, check=False)
+    except subprocess.TimeoutExpired:
+        # Cleanup is best effort and separately bounded.  A daemon failure here
+        # must leave the capability unavailable, not turn a settings read into 500.
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", name], capture_output=True,
+                timeout=5, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            logger.warning("Timed-out Worker command probe container cleanup failed: name=%s", name)
+        logger.warning(
+            "Worker image command probe timed out: image=%s command=%s",
+            image_id, command,
+        )
+        return False
+    except OSError as exc:
+        logger.warning(
+            "Worker image command probe failed: image=%s command=%s error=%s",
+            image_id, command, exc,
+        )
+        return False
+    available = result.returncode == 0
+    if not available:
+        logger.warning(
+            "Worker image command unavailable: image=%s command=%s exit=%s output=%s",
+            image_id, command, result.returncode,
+            (result.stderr or result.stdout or "").strip(),
+        )
+    # Exit 125 belongs to Docker itself, so a transient daemon/start failure
+    # must not permanently disable a tool in an otherwise unchanged image.
+    if use_cache and result.returncode != 125:
+        _image_command_cache[key] = available
+    return available
 
 
 def stage_worker_toolbox(

@@ -211,6 +211,36 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "ref=${{ steps.image.outputs.repository }}@$digest" >> "$GITHUB_OUTPUT"
 
+      - name: Web Pi runtime smoke
+        if: ${{ matrix.image == 'muteki-web' }}
+        env:
+          IMAGE_REF: ${{ steps.digest.outputs.ref }}
+          PLATFORM: ${{ matrix.target.platform }}
+        run: |
+          set -euo pipefail
+          docker pull --platform "$PLATFORM" "$IMAGE_REF"
+          docker run --rm --platform "$PLATFORM" "$IMAGE_REF" sh -euc '
+            node_version="$(node --version)"
+            npm_version="$(npm --version)"
+            pi_version="$(pi --version)"
+            printf "node=%s\nnpm=%s\npi=%s\n" "$node_version" "$npm_version" "$pi_version"
+            test "$node_version" = "v24.11.1"
+            test "$npm_version" = "11.6.2"
+            test "$pi_version" = "0.84.1"
+          '
+          docker run --rm --platform "$PLATFORM" "$IMAGE_REF" \
+            uv run --no-sync python -c '
+          import os
+          import subprocess
+          from muteki.solver.cli_engines.engines.pi import PiDriver
+          binary = PiDriver().bin
+          assert os.path.isabs(binary), binary
+          assert os.path.isfile(binary), binary
+          assert os.access(binary, os.X_OK), binary
+          subprocess.run([binary, "--version"], check=True)
+          print(f"PiDriver.bin={binary}")
+          '
+
       - name: Record image identity
         run: |
           set -euo pipefail

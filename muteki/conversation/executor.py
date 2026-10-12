@@ -2041,12 +2041,18 @@ class ExternalAgentSessionExecutor:
                         text = model.text
                         if not text or model.role != "assistant":
                             continue
+                        common = {"turn_id": turn.turn_id, "agent_session_id": ref.agent_session_id,
+                                  "role": "assistant", "background": True}
                         if not background_started:
-                            text = "\n\n" + text
+                            # A delta of its own, so a later replacement of the
+                            # message keeps the separator.
+                            self._emit(thread.thread_id, ev.EV_MESSAGE_DELTA, {**common, "text": "\n\n"})
                             background_started = True
+                        replace = kind is AgentEventType.MESSAGE_DELTA and model.replace
                         self._emit(thread.thread_id, ev.EV_MESSAGE_DELTA, {
-                            "turn_id": turn.turn_id, "agent_session_id": ref.agent_session_id,
-                            "text": text, "role": "assistant", "background": True,
+                            **common, "text": text,
+                            **({"message_id": model.message_id} if model.message_id else {}),
+                            **({"replace": True} if replace else {}),
                         })
                     elif kind is AgentEventType.RUNTIME_CAPABILITIES_UPDATED:
                         self._capability_cache.pop(thread.thread_id, None)

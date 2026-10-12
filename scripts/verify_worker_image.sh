@@ -138,6 +138,23 @@ run_verify() {
     fi
     echo "OK core path ${path}"
   done
+  if [[ "$VARIANT" == "full" ]]; then
+    if ! out="$(timeout 20 agent-browser --version 2>&1)" || [[ -z "${out// }" ]]; then
+      echo "FAIL: full image agent-browser did not start via --version" >&2
+      exit 1
+    fi
+    echo "OK full agent-browser: ${out}"
+    if ! out="$(timeout 20 /usr/bin/chromium --version 2>&1)" || [[ -z "${out// }" ]]; then
+      echo "FAIL: full image Chromium runtime did not start via --version" >&2
+      exit 1
+    fi
+    echo "OK full Chromium runtime: ${out}"
+    if ! out="$(timeout 20 agent-browser skills get core 2>&1)" || [[ -z "${out// }" ]]; then
+      echo "FAIL: full image agent-browser core Skill is unavailable" >&2
+      exit 1
+    fi
+    echo "OK full agent-browser core Skill"
+  fi
   if [[ ! -x /opt/muteki/runtime_agent ]]; then
     echo "FAIL: /opt/muteki/runtime_agent not executable" >&2
     exit 1

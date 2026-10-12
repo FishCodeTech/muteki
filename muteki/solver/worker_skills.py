@@ -28,6 +28,8 @@ _REPO_SKILL = (
 _REPO_BROWSER_SKILL = (
     Path(__file__).resolve().parents[2] / "skills" / "muteki-agent-browser"
 )
+_CONTAINER_AGENT_BROWSER = "/usr/local/bin/agent-browser"
+_CONTAINER_CHROMIUM = "/usr/bin/chromium"
 
 _OPERATOR_INPUT_SKILL_BLOCK = (
     "Request operator input only for an external resource or environment problem:\n\n"
@@ -68,6 +70,16 @@ def project_skill_roots(engine: str) -> tuple[str, ...]:
     )
 
 
+def container_agent_browser_available(image: str) -> bool:
+    """Whether the selected Worker image can launch its managed browser CLI."""
+    from muteki.solver.workspace import probe_image_command
+
+    return (
+        probe_image_command(image, (_CONTAINER_AGENT_BROWSER, "--version"))
+        and probe_image_command(image, (_CONTAINER_CHROMIUM, "--version"))
+    )
+
+
 def stage_agent_browser_skill(
     workdir: str | Path, *, engine: str, container: object | None, mode: str,
     enabled: bool,
@@ -78,6 +90,9 @@ def stage_agent_browser_skill(
     on demand, rather than copied into every model prompt or workspace.
     """
     if mode != "pentest" or container is None or not enabled:
+        return []
+    image = str(getattr(container, "image", "") or "").strip()
+    if not image or not container_agent_browser_available(image):
         return []
     root = Path(workdir).resolve()
     target = root / ".muteki-skills" / "agent-browser"

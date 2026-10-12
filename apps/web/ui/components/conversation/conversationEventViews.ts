@@ -74,6 +74,8 @@ export type ConversationTurnSegment =
       turnId: string;
       text: string;
       phase: ConversationMessagePhase;
+      /** Character ranges of runtime-named messages, so a replacing delta can find them. */
+      spans?: ConversationTextSpan[];
     }
   | { kind: "tools"; turnId: string; tools: ConversationToolRecord[] }
   | {
@@ -88,6 +90,12 @@ export type ConversationTurnSegment =
       tokensBefore?: number;
       tokensAfter?: number;
     };
+
+export interface ConversationTextSpan {
+  messageId: string;
+  start: number;
+  end: number;
+}
 
 function compactionSegment(turnId: string, payload: Record<string, unknown>): ConversationTurnSegment | null {
   const status = String(payload.status || "");
@@ -716,24 +724,86 @@ function appendTurnText(
   text: string,
   durationMs?: number,
   phase: ConversationMessagePhase = "unknown",
+  messageId?: string,
 ): ConversationTurnSegment[] {
   const last = segments[segments.length - 1];
-  const canMerge = last?.kind === kind
-    && (last.kind !== "text" || last.phase === phase);
-  if (canMerge) {
-    const merged = kind === "thinking"
-      ? {
-          ...last,
-          text: `${last.text}${text}`,
-          ...(durationMs ? { durationMs } : {}),
-        }
-      : { ...last, text: `${last.text}${text}` };
-    return [...segments.slice(0, -1), merged];
+  if (last?.kind === "text" && kind === "text" && last.phase === phase) {
+    return [...segments.slice(0, -1), {
+      ...last,
+      text: `${last.text}${text}`,
+      ...(messageId || last.spans
+        ? { spans: extendSpans(last.spans, messageId, last.text.length, text.length) }
+        : {}),
+    }];
+  }
+  if (last?.kind === "thinking" && kind === "thinking") {
+    return [...segments.slice(0, -1), {
+      ...last,
+      text: `${last.text}${text}`,
+      ...(durationMs ? { durationMs } : {}),
+    }];
   }
   if (kind === "thinking") {
     return [...segments, { kind, turnId, text, ...(durationMs ? { durationMs } : {}) }];
   }
-  return [...segments, { kind, turnId, text, phase }];
+  return [...segments, {
+    kind, turnId, text, phase,
+    ...(messageId ? { spans: [{ messageId, start: 0, end: text.length }] } : {}),
+  }];
+}
+
+function extendSpans(
+  spans: ConversationTextSpan[] | undefined,
+  messageId: string | undefined,
+  start: number,
+  length: number,
+): ConversationTextSpan[] {
+  const list = spans ? [...spans] : [];
+  if (!messageId) return list;
+  const last = list.at(-1);
+  if (last?.messageId === messageId && last.end === start) {
+    list[list.length - 1] = { ...last, end: start + length };
+  } else {
+    list.push({ messageId, start, end: start + length });
+  }
+  return list;
+}
+
+/**
+ * A replacing delta carries its message's whole current text: it takes the
+ * place of the message's first span, and the message's later spans are
+ * dropped (a segment left empty goes with them). Null when no span of the
+ * turn belongs to the message.
+ */
+function replaceTurnMessage(
+  segments: ConversationTurnSegment[],
+  messageId: string,
+  text: string,
+): ConversationTurnSegment[] | null {
+  let placed = false;
+  const next: ConversationTurnSegment[] = [];
+  for (const segment of segments) {
+    if (segment.kind !== "text" || !segment.spans?.some((span) => span.messageId === messageId)) {
+      next.push(segment);
+      continue;
+    }
+    let rebuilt = "";
+    let covered = 0;
+    const spans: ConversationTextSpan[] = [];
+    for (const span of segment.spans) {
+      rebuilt += segment.text.slice(covered, span.start);
+      covered = span.end;
+      const piece = span.messageId !== messageId ? segment.text.slice(span.start, span.end)
+        : placed ? null : text;
+      if (piece === null) continue;
+      if (span.messageId === messageId) placed = true;
+      spans.push({ messageId: span.messageId, start: rebuilt.length, end: rebuilt.length + piece.length });
+      rebuilt += piece;
+    }
+    rebuilt += segment.text.slice(covered);
+    if (rebuilt) next.push({ ...segment, text: rebuilt, spans });
+  }
+  return placed ? next : null;
 }
 
 function compactActivityValue(value: unknown, maxLength = 32): string {
@@ -1022,14 +1092,19 @@ function applyConversationEventToFold(
   ) {
     const text = String(payload.text || "");
     if (!text) return state;
-    nextSegments = appendTurnText(
-      segments,
-      turnId,
-      "text",
-      text,
-      undefined,
-      messagePhase(payload),
-    );
+    const messageId = String(payload.message_id || "").trim() || undefined;
+    nextSegments = (messageId && payload.replace === true
+      ? replaceTurnMessage(segments, messageId, text)
+      : null)
+      ?? appendTurnText(
+        segments,
+        turnId,
+        "text",
+        text,
+        undefined,
+        messagePhase(payload),
+        messageId,
+      );
     textFromDeltas = true;
     changed = true;
   } else if (type === "core.reasoning.summary") {
@@ -1101,6 +1176,7 @@ function applyConversationEventToFold(
       text,
       undefined,
       phase,
+      String(payload.message_id || "").trim() || undefined,
     );
     textFromDeltas = false;
     changed = true;
