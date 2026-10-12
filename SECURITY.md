@@ -1,5 +1,9 @@
 # Security Policy
 
+## Authorization and Third-Party Conduct
+
+Access to Muteki's open-source code does not grant permission to test someone else's systems. Third-party unauthorized attacks are the actions of those carrying them out, who bear responsibility for those actions and their consequences. The author and this project disclaim all responsibility and liability for those third-party actions and do not authorize or endorse them. Read the [disclaimer and unauthorized-use responsibility statement (中文)](DISCLAIMER.md) alongside this security policy and the unchanged [LICENSE](LICENSE).
+
 ## Reporting a Vulnerability
 
 Please report security vulnerabilities **privately** via GitHub Security Advisories:
