@@ -303,6 +303,7 @@ class WebPlatformStack:
             self.store,
             self.conversation.manager,
             sessions_root=manager.state_root,
+            registry=self.registry,
         )
         from muteki.capability_management import configure as configure_capabilities
         configure_capabilities(

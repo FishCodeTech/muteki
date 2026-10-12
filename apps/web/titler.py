@@ -30,6 +30,15 @@ from muteki.core.prompt_assembly import (
     PromptPart, compile_prompt, estimate_host_tokens, resolve_prompt_budget,
 )
 from muteki.external_agents.factory import engine_for_adapter
+from muteki.platform.contracts.agent_events import (
+    parse_payload,
+)
+from muteki.platform.contracts.external_agents import (
+    AccessMode,
+    AgentEventType,
+    MessageInput,
+    SessionStart,
+)
 from muteki.solver.cli_driver import (
     apply_runtime_argv,
     driver_for,
@@ -79,6 +88,8 @@ _CONVERSATION_METADATA_ENGINES = frozenset({
     "grok",
     "opencode",
 })
+
+_CONVERSATION_METADATA_TIMEOUT_S = 180
 
 
 @dataclass(frozen=True)
@@ -215,6 +226,187 @@ def conversation_metadata_runtime_profile(
     }
 
 
+def _record_runtime_usage(event: Any, *, model: str, engine: str) -> None:
+    """Persist the structured Runtime's own usage under the titler scope."""
+    from muteki.core.usage import record_context, sum_token_buckets
+
+    usage = parse_payload(event.event_type, event.payload)
+    record_context({
+        "input_tokens": sum_token_buckets(
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.cache_write_tokens,
+        ),
+        "output_tokens": usage.output_tokens,
+        "cache_read_tokens": usage.cached_input_tokens,
+        "cache_write_tokens": usage.cache_write_tokens,
+        "reasoning_tokens": usage.reasoning_tokens,
+        "reported_cost": usage.cost_usd,
+        "input_includes_cache": True,
+        "token_schema_version": 2,
+        "measurement_scope": usage.scope,
+        "source": "runtime",
+    }, model=model, engine=engine)
+
+
+async def _run_cursor_sdk_metadata(
+    prompt: str,
+    *,
+    runtime: Any,
+    cwd: str,
+    credential_env: dict[str, str],
+    model: str,
+    thread_id: str,
+    turn_id: str,
+    adapter: Any,
+) -> Optional[str]:
+    """Run metadata in a disposable Cursor SDK agent, never the user's agent."""
+    instance_id = _runtime_value(runtime, "instance_id") or "default"
+    session = None
+    cancel_turn = False
+    completed = False
+    answer = ""
+    cleanup_ok = True
+    try:
+        async with asyncio.timeout(_CONVERSATION_METADATA_TIMEOUT_S):
+            session = await adapter.start(SessionStart(
+                model=model or None,
+                effort=_runtime_value(runtime, "effort") or None,
+                service_tier=_runtime_value(runtime, "service_tier") or None,
+                # Metadata has no reason to inherit a conversation's broad
+                # filesystem policy. The temporary workspace is sufficient.
+                access_mode=AccessMode.SUPERVISED.value,
+                options={
+                    "cwd": cwd,
+                    "env": credential_env,
+                    "ephemeral": True,
+                },
+            ))
+            async for event in adapter.send(session, MessageInput(text=prompt)):
+                if event.event_type is AgentEventType.MESSAGE_COMPLETED:
+                    message = parse_payload(event.event_type, event.payload)
+                    if message.role == "assistant":
+                        answer = message.text
+                elif event.event_type is AgentEventType.USAGE_UPDATED:
+                    _record_runtime_usage(event, model=model, engine="cursor.sdk")
+                elif event.event_type in {
+                    AgentEventType.TURN_FAILED,
+                    AgentEventType.RUNTIME_ERROR,
+                }:
+                    failure = parse_payload(event.event_type, event.payload).error
+                    LOG.warning(
+                        "conversation metadata Cursor SDK failure: thread_id=%s "
+                        "turn_id=%s instance_id=%s model=%s category=%s reason=%s native_code=%s "
+                        "message=%s",
+                        thread_id,
+                        turn_id,
+                        instance_id,
+                        model,
+                        failure.category.value,
+                        failure.reason,
+                        failure.native_code or "",
+                        failure.message or "",
+                    )
+                    return None
+                elif event.event_type is AgentEventType.RUNTIME_EXITED:
+                    exited = parse_payload(event.event_type, event.payload)
+                    LOG.warning(
+                        "conversation metadata Cursor SDK exited: thread_id=%s "
+                        "turn_id=%s instance_id=%s model=%s classification=%s exit_code=%s",
+                        thread_id,
+                        turn_id,
+                        instance_id,
+                        model,
+                        exited.classification,
+                        exited.exit_code,
+                    )
+                    return None
+                elif event.event_type is AgentEventType.TURN_COMPLETED:
+                    completed = True
+    except TimeoutError:
+        cancel_turn = session is not None
+        LOG.warning(
+            "conversation metadata Cursor SDK timed out: thread_id=%s "
+            "turn_id=%s instance_id=%s model=%s timeout=%s",
+            thread_id,
+            turn_id,
+            instance_id,
+            model,
+            _CONVERSATION_METADATA_TIMEOUT_S,
+        )
+        return None
+    except asyncio.CancelledError:
+        cancel_turn = session is not None
+        raise
+    except Exception:
+        cancel_turn = session is not None
+        LOG.exception(
+            "conversation metadata Cursor SDK invocation failed: thread_id=%s "
+            "turn_id=%s instance_id=%s model=%s",
+            thread_id,
+            turn_id,
+            instance_id,
+            model,
+        )
+        return None
+    finally:
+        if session is not None:
+            async def close_session() -> bool:
+                if cancel_turn:
+                    try:
+                        async with asyncio.timeout(35):
+                            await adapter.interrupt(session)
+                    except Exception:
+                        LOG.exception(
+                            "conversation metadata Cursor SDK interrupt failed: "
+                            "thread_id=%s turn_id=%s instance_id=%s model=%s",
+                            thread_id,
+                            turn_id,
+                            instance_id,
+                            model,
+                        )
+                try:
+                    async with asyncio.timeout(30):
+                        await adapter.close(session)
+                except TimeoutError:
+                    LOG.exception(
+                        "conversation metadata Cursor SDK close timed out: "
+                        "thread_id=%s turn_id=%s instance_id=%s model=%s",
+                        thread_id,
+                        turn_id,
+                        instance_id,
+                        model,
+                    )
+                    return False
+                return True
+
+            try:
+                cleanup_ok = await asyncio.shield(close_session())
+            except Exception:
+                cleanup_ok = False
+                LOG.exception(
+                    "conversation metadata Cursor SDK close failed: "
+                    "thread_id=%s turn_id=%s instance_id=%s model=%s",
+                    thread_id,
+                    turn_id,
+                    instance_id,
+                    model,
+                )
+
+    if not cleanup_ok or not completed or not answer.strip():
+        LOG.warning(
+            "conversation metadata Cursor SDK returned no completed answer: "
+            "thread_id=%s turn_id=%s instance_id=%s model=%s completed=%s",
+            thread_id,
+            turn_id,
+            instance_id,
+            model,
+            completed,
+        )
+        return None
+    return answer
+
+
 async def generate_conversation_metadata_with_runtime(
     transcript: str,
     *,
@@ -224,12 +416,13 @@ async def generate_conversation_metadata_with_runtime(
     generate_title: bool = True,
     thread_id: str = "",
     turn_id: str = "",
+    adapter: Any = None,
 ) -> Optional[ConversationMetadata]:
-    """Generate metadata through the Thread's currently selected CLI model.
+    """Generate metadata through the Thread's currently selected Runtime.
 
-    The call uses a fresh, temporary CLI session so its metadata prompt never
-    enters the user's resumable conversation.  A cancelled or superseded
-    metadata task terminates the subprocess through ``cancel_event``.
+    The call uses a fresh, temporary session so its metadata prompt never
+    enters the user's resumable conversation. A cancelled or superseded task
+    terminates its CLI subprocess or structured Runtime session.
     """
     profile = conversation_metadata_runtime_profile(
         runtime,
@@ -295,6 +488,57 @@ async def generate_conversation_metadata_with_runtime(
                     thread_id, turn_id, engine, model,
                 )
                 return None
+            if _runtime_value(runtime, "adapter_id") == "cursor.sdk":
+                if adapter is None:
+                    LOG.warning(
+                        "conversation metadata selected Runtime is unavailable: "
+                        "thread_id=%s turn_id=%s adapter_id=cursor.sdk "
+                        "instance_id=%s model=%s",
+                        thread_id,
+                        turn_id,
+                        _runtime_value(runtime, "instance_id") or "default",
+                        model,
+                    )
+                    return None
+                raw = await _run_cursor_sdk_metadata(
+                    prompt,
+                    runtime=runtime,
+                    cwd=cwd,
+                    credential_env=credential.env,
+                    model=model,
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    adapter=adapter,
+                )
+                if raw is None:
+                    return None
+                metadata = _metadata_json(raw)
+                if metadata is None:
+                    LOG.warning(
+                        "conversation metadata runtime returned invalid metadata: "
+                        "thread_id=%s turn_id=%s engine=%s model=%s",
+                        thread_id,
+                        turn_id,
+                        engine,
+                        model,
+                    )
+                    return None
+                if not generate_title:
+                    return ConversationMetadata(
+                        title=str(current_title or "").strip(),
+                        summary=metadata.summary,
+                    )
+                if not metadata.title:
+                    LOG.warning(
+                        "conversation metadata runtime returned no title: "
+                        "thread_id=%s turn_id=%s engine=%s model=%s",
+                        thread_id,
+                        turn_id,
+                        engine,
+                        model,
+                    )
+                    return None
+                return metadata
             driver = driver_for(profile)
             driver_env = getattr(driver, "env_extra", lambda: {})() or {}
             env = {
