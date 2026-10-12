@@ -18,6 +18,7 @@ from apps.web.titler import (
     generate_conversation_metadata_with_runtime,
 )
 from muteki.external_agents.factory import engine_for_adapter
+from muteki.external_agents.registry import AdapterRegistry
 from muteki.conversation import events as ev
 from muteki.conversation.manager import ConversationManager
 from muteki.platform.contracts.events import EventEnvelope
@@ -37,11 +38,13 @@ class ConversationMetadataService:
         manager: ConversationManager,
         *,
         sessions_root: str,
+        registry: Optional[AdapterRegistry] = None,
         generator: MetadataGenerator = generate_conversation_metadata_with_runtime,
     ) -> None:
         self._store = store
         self._manager = manager
         self._sessions_root = sessions_root
+        self._registry = registry
         self._generator = generator
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._event_hook = self.consume
@@ -231,15 +234,23 @@ class ConversationMetadataService:
         turn_id: str,
     ) -> Optional[ConversationMetadata]:
         """Generate metadata with the model selected for this conversation."""
-        return await self._generator(
-            transcript,
-            runtime=runtime,
-            sessions_root=self._sessions_root,
-            current_title=current_title,
-            generate_title=generate_title,
-            thread_id=thread_id,
-            turn_id=turn_id,
-        )
+        kwargs = {
+            "runtime": runtime,
+            "sessions_root": self._sessions_root,
+            "current_title": current_title,
+            "generate_title": generate_title,
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+        }
+        if (
+            self._registry is not None
+            and self._generator is generate_conversation_metadata_with_runtime
+        ):
+            kwargs["adapter"] = self._registry.get(
+                str(getattr(runtime, "adapter_id", "") or ""),
+                str(getattr(runtime, "instance_id", "") or "default"),
+            )
+        return await self._generator(transcript, **kwargs)
 
     async def shutdown(self) -> None:
         hooks = getattr(self._store, "_conversation_projection_hooks", [])

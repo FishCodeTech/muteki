@@ -76,7 +76,7 @@ from .context_delivery import text_with_envelopes
 from .events import build_event
 from .probe_environment import subprocess_environment
 from .rpc import PeerClosedError, StdioJsonlPeer
-from .sessions import EXIT_FAILED, EXIT_RESUMABLE
+from .sessions import EXIT_CLOSED, EXIT_FAILED, EXIT_RESUMABLE
 
 SDK_PACKAGE = "@cursor/sdk"
 SDK_VERSION = "1.0.36"
@@ -655,6 +655,12 @@ class CursorSdkAdapter(BaseExternalAgentAdapter):
         plan: Optional[CapabilityInjectionPlan],
         bearer_token: Optional[str],
     ) -> dict[str, Any]:
+        if request.options.ephemeral and request.resume_handle:
+            raise CursorSdkFailure(
+                "cursor_sdk.invalid_configuration",
+                "an ephemeral Cursor SDK session cannot resume native history",
+                category="validation",
+            )
         require_access_mode(
             self.identity.adapter_id, request.access_mode, ACCESS_MODE_VALUES,
             reasons=_ACCESS_NOTES,
@@ -677,32 +683,65 @@ class CursorSdkAdapter(BaseExternalAgentAdapter):
         await asyncio.to_thread(_node_version, self._node)
         installed = await self._ensure_installed()
         cwd = request.options.cwd or os.getcwd()
-        store = self._store_for(request.resume_handle)
-        store.mkdir(parents=True, exist_ok=True)
-        log_root = self._runtime_root / "sessions" / request.agent_session_id
-        log_root.mkdir(parents=True, exist_ok=True)
-        env = dict(subprocess_environment({**self._env_extra, **dict(request.options.env)}) or {})
-        env["CURSOR_API_KEY"] = key
-        env = _plugin_git_environment(env, log_root)
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        peer = StdioJsonlPeer(
-            [self.probe_binary(), str(installed / "bridge.mjs")],
-            cwd=str(installed),
-            env=env,
-            label="cursor-sdk",
-            is_response=lambda msg: isinstance(msg, dict) and msg.get("type") == "response",
-            request_envelope=_bridge_envelope,
-            on_message=lambda msg: _enqueue(queue, msg),
-            owner_adapter_id=self.identity.adapter_id,
-            owner_session_id=request.agent_session_id,
-            stderr_log_root=self._runtime_root / "logs",
-        )
-        await peer.start()
+        ephemeral_store: tempfile.TemporaryDirectory[str] | None = None
+        if request.options.ephemeral:
+            ephemeral_root = self._runtime_root / "ephemeral"
+            ephemeral_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            ephemeral_store = tempfile.TemporaryDirectory(
+                prefix="cursor-sdk-", dir=ephemeral_root,
+            )
+            store = Path(ephemeral_store.name) / "store"
+            store.mkdir(mode=0o700)
+        else:
+            store = self._store_for(request.resume_handle)
+            store.mkdir(parents=True, exist_ok=True)
+        peer: StdioJsonlPeer | None = None
+        try:
+            log_root = (
+                Path(ephemeral_store.name) / "logs"
+                if ephemeral_store is not None
+                else self._runtime_root / "sessions" / request.agent_session_id
+            )
+            log_root.mkdir(parents=True, exist_ok=True)
+            env = dict(subprocess_environment({
+                **self._env_extra, **dict(request.options.env),
+            }) or {})
+            env["CURSOR_API_KEY"] = key
+            env = _plugin_git_environment(env, log_root)
+            queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+            peer = StdioJsonlPeer(
+                [self.probe_binary(), str(installed / "bridge.mjs")],
+                cwd=str(installed),
+                env=env,
+                label="cursor-sdk",
+                is_response=lambda msg: (
+                    isinstance(msg, dict) and msg.get("type") == "response"
+                ),
+                request_envelope=_bridge_envelope,
+                on_message=lambda msg: _enqueue(queue, msg),
+                owner_adapter_id=self.identity.adapter_id,
+                owner_session_id=request.agent_session_id,
+                stderr_log_root=(
+                    log_root
+                    if ephemeral_store is not None
+                    else self._runtime_root / "logs"
+                ),
+            )
+            await peer.start()
+        except BaseException:
+            try:
+                if peer is not None:
+                    await peer.close()
+            finally:
+                if ephemeral_store is not None:
+                    ephemeral_store.cleanup()
+            raise
         watcher = asyncio.ensure_future(_watch_exit(peer, queue))
         handle: dict[str, Any] = {
             "peer": peer, "queue": queue, "watcher": watcher, "cwd": cwd,
             "store": str(store), "log_path": log_root / "protocol.jsonl",
             "text": [], "thinking": [], "thinking_index": 0, "nested": {},
+            "ephemeral_store": ephemeral_store,
         }
         self._handles[request.agent_session_id] = handle
         startup_budget = self.conversation_turn_timeout(request.thread_id, _DEFAULT_TURN_TIMEOUT_S) or _DEFAULT_TURN_TIMEOUT_S
@@ -763,12 +802,16 @@ class CursorSdkAdapter(BaseExternalAgentAdapter):
                 category="validation",
             )
         handle["agent_id"] = agent_id
-        try:
-            self._index_store(agent_id, store)
-        except BaseException:
-            await self._stop_peer(request.agent_session_id)
-            raise
-        return {"external_session_id": agent_id, "resume_handle": agent_id}
+        if ephemeral_store is None:
+            try:
+                self._index_store(agent_id, store)
+            except BaseException:
+                await self._stop_peer(request.agent_session_id)
+                raise
+        return {
+            "external_session_id": agent_id,
+            "resume_handle": None if ephemeral_store is not None else agent_id,
+        }
 
     def _store_for(self, agent_id: Optional[str]) -> Path:
         """Native agent identity owns storage, independently of Muteki sessions.
@@ -952,7 +995,10 @@ class CursorSdkAdapter(BaseExternalAgentAdapter):
     async def _teardown(self, session: AgentSessionRef) -> str:
         handle = self._handles.get(session.agent_session_id)
         agent_id = str((handle or {}).get("agent_id") or "")
+        ephemeral = bool((handle or {}).get("ephemeral_store"))
         await self._stop_peer(session.agent_session_id)
+        if ephemeral:
+            return EXIT_CLOSED
         return EXIT_RESUMABLE if agent_id else EXIT_FAILED
 
     async def _abort_turn(self, session: AgentSessionRef, _failure: Any) -> None:
@@ -974,10 +1020,16 @@ class CursorSdkAdapter(BaseExternalAgentAdapter):
                 await self._rpc(peer, "close", timeout=10)
         except (CursorSdkFailure, PeerClosedError):
             pass
-        await peer.close()
-        watcher = handle.get("watcher")
-        if watcher is not None and not watcher.done():
-            watcher.cancel()
+        finally:
+            try:
+                await peer.close()
+            finally:
+                watcher = handle.get("watcher")
+                if watcher is not None and not watcher.done():
+                    watcher.cancel()
+                ephemeral_store = handle.get("ephemeral_store")
+                if ephemeral_store is not None:
+                    ephemeral_store.cleanup()
 
     async def _ensure_installed(self) -> Path:
         async with _INSTALL_LOCK:

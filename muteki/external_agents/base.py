@@ -1176,10 +1176,16 @@ class BaseExternalAgentAdapter:
         """关闭：先 teardown Runtime 侧资源，再落内部状态并同步撤 grant。"""
         try:
             classification = await self._teardown(session)
-            self._tracker.close(session.agent_session_id, classification)
+            ephemeral = self._tracker.close(
+                session.agent_session_id, classification,
+            )
+            if ephemeral:
+                self._projector.discard(session.agent_session_id)
         finally:
             # Scoped credentials must not survive a failed/interrupted close.
             # The teardown error remains visible to the caller.
+            if self._tracker.discard_ephemeral(session.agent_session_id):
+                self._projector.discard(session.agent_session_id)
             self.revoke_session_grants(session.agent_session_id)
             self._sequencers.pop(session.agent_session_id, None)
             self._context_revisions.pop(session.agent_session_id, None)

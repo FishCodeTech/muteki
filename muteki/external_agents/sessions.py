@@ -77,6 +77,7 @@ class SessionTracker:
         self._states: dict[str, str] = {}
         self._generations: dict[str, int] = {}
         self._exit_classifications: dict[str, str] = {}
+        self._ephemeral: set[str] = set()
 
     def attach_store(self, store: Any) -> None:
         """Persist future records to ``store`` unless one is already attached."""
@@ -104,7 +105,9 @@ class SessionTracker:
             resume_handle=request.resume_handle,
         )
         with self._lock:
-            if self._store is not None:
+            if request.options.ephemeral:
+                self._ephemeral.add(record.agent_session_id)
+            elif self._store is not None:
                 self._store.save(record)
             self._memory[record.agent_session_id] = record
             self._states[record.agent_session_id] = STATE_PREPARING
@@ -134,20 +137,35 @@ class SessionTracker:
     def mark_error(self, agent_session_id: str, reason: str = "") -> None:
         """启动/运行失败：状态转 error（调用方负责撤销 grant）。"""
         with self._lock:
+            if agent_session_id in self._ephemeral:
+                self._discard(agent_session_id)
+                return
             self._states[agent_session_id] = STATE_ERROR
 
-    def close(self, agent_session_id: str, classification: str = EXIT_CLOSED) -> None:
+    def close(self, agent_session_id: str, classification: str = EXIT_CLOSED) -> bool:
         """关闭：状态转 closed（退出分类记入 ``_exit_classifications``）。"""
         with self._lock:
+            if agent_session_id in self._ephemeral:
+                self._discard(agent_session_id)
+                return True
             self._states[agent_session_id] = STATE_CLOSED
             record = self._memory.get(agent_session_id)
             if record is not None and record.closed_at is None:
                 record = record.model_copy(update={"closed_at": utcnow()})
                 self._save(record)
         self._exit_classifications[agent_session_id] = classification
+        return False
 
     def exit_classification(self, agent_session_id: str) -> str:
         return self._exit_classifications.get(agent_session_id, "")
+
+    def discard_ephemeral(self, agent_session_id: str) -> bool:
+        """Forget an auxiliary session even when Runtime teardown raised."""
+        with self._lock:
+            if agent_session_id not in self._ephemeral:
+                return False
+            self._discard(agent_session_id)
+            return True
 
     # -- generation fencing ------------------------------------------------
 
@@ -186,9 +204,16 @@ class SessionTracker:
         return record
 
     def _save(self, record: AgentSession) -> None:
-        if self._store is not None:
+        if self._store is not None and record.agent_session_id not in self._ephemeral:
             self._store.save(record)
         self._memory[record.agent_session_id] = record
+
+    def _discard(self, agent_session_id: str) -> None:
+        self._ephemeral.discard(agent_session_id)
+        self._memory.pop(agent_session_id, None)
+        self._states.pop(agent_session_id, None)
+        self._generations.pop(agent_session_id, None)
+        self._exit_classifications.pop(agent_session_id, None)
 
 
 class EventProjector:
@@ -235,6 +260,10 @@ class EventProjector:
                 agent_session_id,
                 AgentSessionSnapshot(agent_session_id=agent_session_id),
             )
+
+    def discard(self, agent_session_id: str) -> None:
+        with self._lock:
+            self._snapshots.pop(agent_session_id, None)
 
     # -- 内部 ---------------------------------------------------------------
 
