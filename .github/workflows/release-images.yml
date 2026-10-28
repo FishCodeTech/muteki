@@ -706,7 +706,10 @@ jobs:
   merge:
     timeout-minutes: 10
     name: merge ${{ matrix.image }}
-    needs: images
+    needs: [bundle, images, desktop-macos, worker]
+    # Publish version/latest image indexes only after the complete release set
+    # has built. workflow_dispatch may intentionally skip the full Kali Worker.
+    if: ${{ always() && needs.bundle.result == 'success' && needs.images.result == 'success' && needs.desktop-macos.result == 'success' && (needs.worker.result == 'success' || (github.event_name == 'workflow_dispatch' && needs.worker.result == 'skipped')) }}
     strategy:
       fail-fast: false
       matrix:
@@ -786,8 +789,8 @@ jobs:
   merge-worker:
     timeout-minutes: 10
     name: merge muteki-worker
-    needs: worker
-    if: ${{ github.event_name == 'push' || github.event.inputs.build_kali_worker == 'true' }}
+    needs: [bundle, images, desktop-macos, worker]
+    if: ${{ always() && (github.event_name == 'push' || github.event.inputs.build_kali_worker == 'true') && needs.bundle.result == 'success' && needs.images.result == 'success' && needs.desktop-macos.result == 'success' && needs.worker.result == 'success' }}
     runs-on: ubuntu-24.04
     steps:
       - name: Download architecture digests

@@ -9,6 +9,8 @@ All notable public release changes are tracked here.
 - Fixed Flag and answer copying on LAN and other ordinary HTTP pages, where `navigator.clipboard` can be unavailable. The run inspector, conversation conclusion, status banner, and expanded result list now use the same copy implementation.
 - Attempted synchronous copying within the click or key gesture, then used the Clipboard API when needed. Success and failure messages reflect the browser's result in Chinese or English.
 - Updated Next.js and its matching lint configuration to `15.5.28`, including patched image-processing, source-map, and development dependencies identified during release checks.
+- Updated the ZCode source-build toolchain to pnpm 10.34.9, which fixes the hoisted-linker race that could abort Worker image builds while installing `esbuild`.
+- Delayed publishing versioned and `latest` image indexes until the complete release image and desktop build set succeeds.
 
 ### Changed
 
