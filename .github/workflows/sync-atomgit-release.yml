@@ -42,11 +42,11 @@ jobs:
       ATOMGIT_REPOSITORY: ${{ vars.ATOMGIT_REPOSITORY || 'FishCodeTech/muteki' }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - name: Require AtomGit credentials
