@@ -247,6 +247,7 @@ export function actorDisplayTitle(
   if (id === "human" || id === "operator") return t("runtime.actor.operator");
   if (id === "system") return t("runtime.actor.system");
   if (id === "report-value") return t("runtime.actor.reportValue");
+  if (id === "challenger") return t("collab.role.challenger");
   if (id === "reason" || id === "coordinator") return t("coord.title");
   return workerDisplayName(id, lane, siblings).title;
 }

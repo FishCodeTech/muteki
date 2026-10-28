@@ -20,6 +20,8 @@ from muteki.external_agents.pi import PiAdapter
 from muteki.external_agents.grok import GrokAcpAdapter
 from muteki.external_agents.acp import AcpTransport
 from muteki.external_agents.codex import CodexAppServerAdapter
+from muteki.platform.capability_catalog import default_tool_set
+from muteki.platform.contracts.capabilities import ThreadMode
 from muteki.platform.contracts.external_agents import AgentInput, AgentSessionRef
 
 
@@ -65,7 +67,8 @@ async def check():
                     channel="provider_native") for i in range(120)]
         snapshot = RuntimeCapabilitySnapshot(adapter_id=adapter, items=commands)
         with patch("muteki.conversation.composer_capabilities.discover_skills", return_value=[]):
-            rows = resolve_composer_catalog(engine=engine, trigger="/", runtime_snapshot=snapshot)
+            rows = resolve_composer_catalog(engine=engine, trigger="/", session_tools=default_tool_set(ThreadMode.CONVERSATION),
+                                            runtime_snapshot=snapshot)
         assert all(any(row["name"] == command.name and row["invocable"] for row in rows) for command in commands)
         assert next(row for row in rows if row["name"] == "model")["action"] == "ui:model"
         assert next(row for row in rows if row["name"] == "quit")["invocable"] is False

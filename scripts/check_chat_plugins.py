@@ -21,6 +21,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from muteki.conversation.chat_plugins import ChatPluginError, ChatPluginService, ENGINES
 from muteki.conversation.chat_providers import provider_for
 from muteki.conversation.composer_capabilities import ComposerCapabilityError, discover_skills, resolve_capability_refs
+from muteki.platform.capability_catalog import default_tool_set
+from muteki.platform.contracts.capabilities import ThreadMode
 
 SERVER = '''import json,sys
 for line in sys.stdin:
@@ -74,7 +76,8 @@ async def check() -> None:
             for engine in ENGINES:
                 rows = [row for row in service.skill_rows(engine) if row["name"] == "test-chat:echo"]
                 assert len(rows) == 1
-                _, context = resolve_capability_refs(rows, engine=engine, plugin_service=service)
+                _, context = resolve_capability_refs(rows, engine=engine, session_tools=default_tool_set(ThreadMode.CONVERSATION),
+                                                     plugin_service=service)
                 assert "Reply TEST_OK" in context
             native_home = root / "operator"
             native = native_home / ".codex/skills/native-only"
@@ -84,7 +87,8 @@ async def check() -> None:
                 codex = next(row for row in discover_skills("codex") if row["name"] == "native-only")
                 assert not any(row["name"] == "native-only" for row in discover_skills("kimi"))
                 try:
-                    resolve_capability_refs([codex], engine="kimi", plugin_service=service)
+                    resolve_capability_refs([codex], engine="kimi", session_tools=default_tool_set(ThreadMode.CONVERSATION),
+                                            plugin_service=service)
                 except ComposerCapabilityError:
                     pass
                 else:

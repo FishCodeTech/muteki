@@ -181,6 +181,12 @@ _PLAN_MODE_DEGRADATION = (
 )
 _THREAD_UPDATE_PLAN_CONFIG = {"tools.update_plan.enabled": True}
 
+#: app-server ``MessagePhase``. Commentary and partial answers are mid-turn
+#: text that more tool calls or output may follow; only ``final_answer`` (or an
+#: absent phase on legacy models) is the turn's terminal answer.
+_MESSAGE_PHASES = frozenset({"commentary", "partial_answer", "final_answer"})
+_PROGRESS_MESSAGE_PHASES = frozenset({"commentary", "partial_answer"})
+
 #: 审批类 server-request（响应 ``{"decision": ...}``）。
 APPROVAL_REQUEST_METHODS = {
     "item/commandExecution/requestApproval": "command_execution",
@@ -276,8 +282,15 @@ def _normalize_file_change_entries(raw: Any) -> list[dict[str, Any]]:
             if not path:
                 continue
             row: dict[str, Any] = {"path": path}
+            kind = item.get("kind")
+            # v2 PatchChangeKind is tagged: {"type": "update", "move_path": ...}.
+            if isinstance(kind, Mapping):
+                move_to = _as_preview_str(kind.get("move_path") or kind.get("movePath"))
+                if move_to:
+                    row["move_path"] = move_to
+                kind = kind.get("type")
             status = _as_preview_str(
-                item.get("kind") or item.get("status") or item.get("change_type")
+                kind or item.get("status") or item.get("change_type")
             )
             if status:
                 row["status"] = status
@@ -333,6 +346,32 @@ def _mcp_result_text(result: Any) -> Any:
             size = len(str(block.get("data") or "")) * 3 // 4
             parts.append(f"[image {block.get('mimeType') or 'unknown'} ~{size} bytes]")
     return "\n".join(parts)
+
+
+# McpServerConnectionStatus / McpAuthStatus (codex-cli 0.160.1 schema). A
+# connected or unreported server, and auth that needs no action, add no hint.
+_MCP_RUNTIME_LABELS = {
+    "connected": "", "notStarted": "未启动", "starting": "启动中",
+    "authenticationRequired": "需要登录", "failed": "连接失败",
+    "cancelled": "已取消", "disabled": "已停用",
+}
+_MCP_AUTH_LABELS = {
+    "unknown": "", "unsupported": "", "notLoggedIn": "未登录",
+    "bearerToken": "已配置令牌", "oAuth": "OAuth 已登录",
+}
+
+
+def _mcp_status_description(status: Mapping[str, Any]) -> str:
+    """One ``mcpServerStatus/list`` row → composer description."""
+    state = str(status.get("runtimeStatus") or "")
+    auth = str(status.get("authStatus") or "unknown")
+    parts = (
+        "Runtime 已报告",
+        _MCP_RUNTIME_LABELS.get(state, state),
+        f"{len(status.get('tools') or {})} 个工具",
+        _MCP_AUTH_LABELS.get(auth, f"认证 {auth}"),
+    )
+    return " · ".join(part for part in parts if part)
 
 
 def _cache_file_change_item(ctx: dict[str, Any], item: Mapping[str, Any]) -> None:
@@ -492,6 +531,55 @@ _FILE_CHANGE_KINDS = {
     "delete": "delete", "deleted": "delete", "remove": "delete",
     "rename": "rename", "renamed": "rename", "move": "rename",
 }
+
+
+def _tool_item_native(item_type: str, item: dict[str, Any]) -> dict[str, Any]:
+    """Runtime facts the UI needs to describe a tool call without guessing.
+
+    ``commandActions`` is app-server's parse of a shell command into
+    read / listFiles / search / unknown actions; clients label "Read X" vs
+    "Ran cmd" from it instead of re-parsing the command text.
+    """
+    native: dict[str, Any] = {}
+    if item_type == "mcpToolCall" and item.get("server"):
+        native["mcp_server"] = str(item["server"])
+    actions = item.get("commandActions")
+    if item_type == "commandExecution" and isinstance(actions, list):
+        native["command_actions"] = [
+            action for action in actions
+            if isinstance(action, dict) and isinstance(action.get("type"), str)
+        ]
+    return native
+
+
+def _web_search_call(item: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """A Codex ``webSearch`` item as a tool name and input.
+
+    The item's ``action`` says what the step did: a search, opening a result
+    page, or finding text in one. Each gets its own tool name so the UI can
+    tell searching from reading.
+    """
+    action = item.get("action") if isinstance(item.get("action"), dict) else {}
+    action_type = str(action.get("type") or "")
+    query = str(action.get("query") or item.get("query") or "")
+    if action_type == "openPage":
+        return "web_open_page", {"url": str(action.get("url") or "")}
+    if action_type == "findInPage":
+        return "web_find_in_page", {
+            "url": str(action.get("url") or ""),
+            "pattern": str(action.get("pattern") or ""),
+        }
+    results = item.get("results")
+    if action_type != "search" and not query and isinstance(results, list) and len(results) == 1:
+        # Codex reports a page view as an action-less item whose only result is that page.
+        page = results[0] if isinstance(results[0], dict) else {}
+        if page.get("url"):
+            return "web_open_page", {"url": str(page["url"])}
+    tool_input: dict[str, Any] = {"query": query}
+    queries = action.get("queries")
+    if isinstance(queries, list) and queries:
+        tool_input["queries"] = [str(entry) for entry in queries if str(entry)]
+    return "web_search", tool_input
 
 
 def _codex_approval_outcome(decision: str) -> str:
@@ -995,6 +1083,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
     - ``schema_probe``：probe 时是否导出 JSON schema 做能力发现。
     """
 
+    chat_model_fields = ("model", "effort", "service_tier")
     context_compaction_events = True
     host_context_channel = "codex_additional_context"
     turn_context_channel = "codex_additional_context"
@@ -1045,6 +1134,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
         # agent_session_id -> 运行上下文（conn/thread/queue 等）
         self._runs: dict[str, dict[str, Any]] = {}
         self._client_request_methods: set[str] = set()
+        self._protocol_methods: dict[str, set[str]] = {}
         self._capability_revisions: dict[str, int] = {}
         self._fork_connections: dict[str, CodexPeer] = {}
 
@@ -1052,65 +1142,29 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
         if self._client_request_methods or not self._schema_probe:
             return
 
-        def load() -> set[str]:
+        def load() -> dict[str, set[str]]:
             with tempfile.TemporaryDirectory(
                 prefix="muteki-codex-schema-"
             ) as tmp:
                 methods = export_protocol_methods(self._binary, Path(tmp))
-            return set(methods.get("client_requests", set()))
+            return methods
 
-        self._client_request_methods = await asyncio.to_thread(load)
+        self._protocol_methods = await asyncio.to_thread(load)
+        self._client_request_methods = set(self._protocol_methods.get("client_requests", set()))
 
     # -- capability probe ----------------------------------------------------
 
-    async def probe(self, request: ProbeRequest) -> AgentCapabilities:
-        """实测 probe：--version + schema 方法面 + initialize/model/list。"""
-        field_sources: dict[str, str] = {}
-        degradations: list[str] = []
-        model_catalog: dict[str, Any] | None = None
-        version = _probe_version(self._binary)
-        probed = bool(version)
-
-        caps = conservative_capabilities(
-            transport_kind="rpc",
-            capability_source=SOURCE_PROBE if probed else SOURCE_STATIC,
-        )
-        caps.runtime_version = version
-
-        if not probed:
-            for name in BOOL_CAPABILITY_FIELDS:
-                field_sources[name] = SOURCE_STATIC
-            degradations.append(
-                "codex binary 不可用或 --version 失败：全部能力保守默认 False；"
-                "CLI 兼容降级路径为 cli_adapter_for('codex')（codex exec --json）")
-            self._probe_cache = CapabilityProbeReport(
-                adapter_id=self.id, instance_id=self.identity.instance_id,
-                capabilities=caps, binary_path=self._binary,
-                field_sources=field_sources, degradations=degradations,
-                detail="binary 不可用，使用保守默认",
-                model_catalog={"ok": False, "models": [], "source": "codex.model/list",
-                               "error_code": "codex.model_catalog.binary_unavailable",
-                               "detail": "Codex binary unavailable"} if request.include_models else None)
-            return caps
-
-        # schema 方法面发现（版本变化探测的主信号）。
-        methods: dict[str, set[str]] = {}
-        if self._schema_probe:
-            with tempfile.TemporaryDirectory(prefix="muteki-codex-schema-") as tmp:
-                methods = export_protocol_methods(self._binary, Path(tmp))
+    def _apply_protocol_capabilities(
+        self, caps: AgentCapabilities, methods: dict[str, set[str]], *,
+        source: str, field_sources: dict[str, str],
+    ) -> None:
         schema_ok = bool(methods)
         client_req = methods.get("client_requests", set())
-        self._client_request_methods = set(client_req)
         server_req = methods.get("server_requests", set())
         server_ntf = methods.get("server_notifications", set())
-        if not schema_ok:
-            degradations.append(
-                "generate-json-schema 导出失败：能力面无法实测，"
-                "结构化传输相关字段回落保守默认")
-
         def mark(field_name: str, value: bool, probed_field: bool) -> bool:
             field_sources[field_name] = (
-                SOURCE_PROBE if probed_field else SOURCE_STATIC)
+                source if probed_field else SOURCE_STATIC)
             return bool(value and probed_field)
 
         caps.streaming = mark("streaming", "item/agentMessage/delta" in server_ntf, schema_ok)
@@ -1160,6 +1214,71 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
             "CollaborationMode" in methods.get("schema_definitions", set()))
         caps.plan_mode = mark(
             "plan_mode", collab_known and self._experimental_api, schema_ok)
+
+    def declared_chat_capabilities(self) -> AgentCapabilities:
+        caps = conservative_capabilities(transport_kind="rpc", capability_source=SOURCE_REPORTED)
+        caps.protocol_version = "app-server-v2"
+        methods = self._protocol_methods or {
+            "client_requests": {M_THREAD_RESUME, M_TURN_STEER, M_TURN_INTERRUPT,
+                                M_THREAD_FORK, M_MCP_RELOAD, M_TURN_START, "thread/compact/start"},
+            "server_requests": {"item/commandExecution/requestApproval", "item/tool/requestUserInput"},
+            "server_notifications": {"item/agentMessage/delta", "item/started",
+                                     "thread/tokenUsage/updated", "turn/plan/updated"},
+            "item_types": {"collabAgentToolCall", "subAgentActivity"},
+            "schema_definitions": {"CollaborationMode"},
+        }
+        self._apply_protocol_capabilities(caps, methods, source=SOURCE_REPORTED, field_sources={})
+        return caps
+
+    async def probe(self, request: ProbeRequest) -> AgentCapabilities:
+        """实测 probe：--version + schema 方法面 + initialize/model/list。"""
+        field_sources: dict[str, str] = {}
+        degradations: list[str] = []
+        model_catalog: dict[str, Any] | None = None
+        version = _probe_version(self._binary)
+        probed = bool(version)
+
+        caps = conservative_capabilities(
+            transport_kind="rpc",
+            capability_source=SOURCE_PROBE if probed else SOURCE_STATIC,
+        )
+        caps.runtime_version = version
+
+        if not probed:
+            for name in BOOL_CAPABILITY_FIELDS:
+                field_sources[name] = SOURCE_STATIC
+            degradations.append(
+                "codex binary 不可用或 --version 失败：全部能力保守默认 False；"
+                "CLI 兼容降级路径为 cli_adapter_for('codex')（codex exec --json）")
+            self._probe_cache = CapabilityProbeReport(
+                adapter_id=self.id, instance_id=self.identity.instance_id,
+                capabilities=caps, binary_path=self._binary,
+                field_sources=field_sources, degradations=degradations,
+                detail="binary 不可用，使用保守默认",
+                model_catalog={"ok": False, "models": [], "source": "codex.model/list",
+                               "error_code": "codex.model_catalog.binary_unavailable",
+                               "detail": "Codex binary unavailable"} if request.include_models else None)
+            return caps
+
+        # schema 方法面发现（版本变化探测的主信号）。
+        methods: dict[str, set[str]] = {}
+        if self._schema_probe:
+            with tempfile.TemporaryDirectory(prefix="muteki-codex-schema-") as tmp:
+                methods = export_protocol_methods(self._binary, Path(tmp))
+        schema_ok = bool(methods)
+        client_req = methods.get("client_requests", set())
+        self._client_request_methods = set(client_req)
+        server_req = methods.get("server_requests", set())
+        server_ntf = methods.get("server_notifications", set())
+        if not schema_ok:
+            degradations.append(
+                "generate-json-schema 导出失败：能力面无法实测，"
+                "结构化传输相关字段回落保守默认")
+
+        self._protocol_methods = methods
+        self._apply_protocol_capabilities(caps, methods, source=SOURCE_PROBE, field_sources=field_sources)
+        collab_in_schema = "collaborationMode" in methods.get("turn_params", set())
+        collab_known = collab_in_schema or "CollaborationMode" in methods.get("schema_definitions", set())
         if collab_known and not self._experimental_api:
             field_sources["plan_mode"] = SOURCE_REPORTED
             degradations.append(
@@ -1404,7 +1523,9 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
                     if isinstance(native_cua, dict):
                         # Codex validates transport even for disabled servers.
                         thread_mcp["cua_repl"] = {**native_cua, "enabled": False}
-                thread_config['plugins."unified-computer-use@openai-bundled".enabled'] = False
+                # Codex splits override keys on "." and keeps quote characters,
+                # so a TOML-quoted segment silently matches no plugin.
+                thread_config["plugins.unified-computer-use@openai-bundled.enabled"] = False
             if thread_mcp:
                 thread_config["mcp_servers"] = thread_mcp
             approvals = options.chat_hook_approvals
@@ -1420,9 +1541,11 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
                     thread_config["hooks.state"] = trusted
             thread_params["config"] = thread_config
             model = request.model or self._model
-            if model:
+            # Chat selection is applied by turn/start. Opening under the native
+            # defaults retains a real reset target without a second process.
+            if model and not options.is_conversation:
                 thread_params["model"] = model
-            if request.service_tier:
+            if request.service_tier and not options.is_conversation:
                 thread_params["serviceTier"] = request.service_tier
             access_config: Optional[dict[str, Any]] = None
             if request.access_mode:
@@ -1485,7 +1608,10 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
             # fork 后 sessionId 保持根线程 id，单独记录（核验 §CODEX 末节）。
             "root_session_id": str(thread.get("sessionId") or thread_id),
             "cwd": cwd,
-            "model": str((result or {}).get("model") or model or ""),
+            "chat_selection": options.is_conversation,
+            "default_model": str(self._model or (result or {}).get("model") or ""),
+            "default_effort": self._effort,
+            "model": str(model or (result or {}).get("model") or ""),
             "effort": request.effort or self._effort,
             "collaboration_mode": str(
                 ((result or {}).get("collaborationMode") or {}).get("mode")
@@ -1855,6 +1981,18 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
             resumed=True)
 
     @staticmethod
+    def _turn_selection(ctx: dict[str, Any], input: MessageInput) -> dict[str, Any]:
+        selection = {key: ctx.get(key) for key in ("model", "effort", "service_tier")}
+        if ctx.get("chat_selection"):
+            for key in selection:
+                value = getattr(input.payload, key)
+                if value is not None:
+                    selection[key] = value or ctx.get("default_" + key)
+            if input.payload.effort == "" and not selection["effort"]:
+                selection["effort"] = (ctx.get("model_default_efforts") or {}).get(selection["model"])
+        return selection
+
+    @staticmethod
     def _collaboration_mode(
         ctx: dict[str, Any], input: MessageInput,
     ) -> Optional[dict[str, Any]]:
@@ -1871,9 +2009,10 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
         if wanted != "plan" and not (
                 wanted == "default" and ctx.get("collaboration_mode") == "plan"):
             return None
-        settings: dict[str, Any] = {"model": ctx["model"]}
-        if ctx.get("effort"):
-            settings["reasoning_effort"] = ctx["effort"]
+        selection = CodexAppServerAdapter._turn_selection(ctx, input)
+        settings: dict[str, Any] = {"model": selection["model"]}
+        if selection.get("effort"):
+            settings["reasoning_effort"] = selection["effort"]
         return {"mode": wanted, "settings": settings}
 
     @staticmethod
@@ -1890,17 +2029,20 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
         # block renders; the app-server default ("auto") often emits none.
         params["summary"] = "detailed"
         params["cwd"] = ctx["cwd"]
-        if ctx.get("model"):
-            params["model"] = ctx["model"]
-        if ctx.get("effort"):
-            params["effort"] = ctx["effort"]
+        selection = CodexAppServerAdapter._turn_selection(ctx, input)
+        if selection.get("model"):
+            params["model"] = selection["model"]
+        if selection.get("effort"):
+            params["effort"] = selection["effort"]
+        elif ctx.get("chat_selection") and input.payload.effort is not None:
+            params["effort"] = None
         collaboration = CodexAppServerAdapter._collaboration_mode(ctx, input)
         if collaboration is not None:
             params["collaborationMode"] = collaboration
-        if ctx.get("service_tier"):
-            # A forked thread is not started with thread params, so the turn
-            # carries the tier as well.
-            params["serviceTier"] = ctx["service_tier"]
+        if selection.get("service_tier"):
+            params["serviceTier"] = selection["service_tier"]
+        elif ctx.get("chat_selection") and input.payload.service_tier is not None:
+            params["serviceTier"] = None
         if input.payload.client_user_message_id:
             params["clientUserMessageId"] = input.payload.client_user_message_id
         access = ctx.get("access_config")
@@ -2072,11 +2214,20 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
                     if blocked:
                         raise _PlanModeUnavailable(blocked)
                     additional_context = await self._deliver_turn_context(sid, ctx, input)
+                    if (ctx.get("chat_selection") and input.payload.effort == ""
+                            and ctx.get("effort") and not ctx.get("default_effort")):
+                        model = self._turn_selection(ctx, input)["model"]
+                        defaults = ctx.setdefault("model_default_efforts", {})
+                        if model not in defaults:
+                            catalog = await read_model_catalog(conn)
+                            for row in catalog["models"]:
+                                defaults[row["id"]] = row["reasoning"]["default"] or None
                     if runner is not None:
                         runner.mark_sent()
                     result = await conn.request(
                         M_TURN_START, self._turn_parameters(ctx, input, additional_context),
                         timeout=60)
+                    ctx.update(self._turn_selection(ctx, input))
                     ctx["collaboration_mode"] = input.payload.interaction_mode
                 if runner is not None:
                     runner.ack()
@@ -2290,7 +2441,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
                     }, timeout=10)
                     for turn in (result or {}).get("data") or []:
                         for item in turn.get("items") or []:
-                            if terminal and item.get("type") == "agentMessage" and item.get("phase") != "commentary" and item.get("text"):
+                            if terminal and item.get("type") == "agentMessage" and item.get("phase") not in _PROGRESS_MESSAGE_PHASES and item.get("text"):
                                 node["result"] = str(item["text"])
                             if item.get("type") == "userMessage" and "request" not in node:
                                 request = "\n".join(str(part.get("text") or "") for part in item.get("content") or [] if part.get("type") == "text")
@@ -2319,9 +2470,36 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
         conn: CodexPeer = ctx["conn"]
         source_thread = str(params.get("threadId") or "")
         agent_id = source_thread if source_thread in (ctx.get("agent_nodes") or {}) else None
+        from .src_policy import NativeToolError, authorize_native_tool, src_task_id
 
         if method in APPROVAL_REQUEST_METHODS:
             kind = APPROVAL_REQUEST_METHODS[method]
+            record = self._tracker.get(common["agent_session_id"])
+            if record is not None and src_task_id(self._tracker._store, record.thread_id):
+                try:
+                    await authorize_native_tool(
+                        self._tracker._store, thread_id=record.thread_id,
+                        invocation_id=f"codex:{common['agent_session_id']}:{request_id}",
+                        tool_name=method, arguments=dict(params), action=kind,
+                        approval_kind=kind, adapter_id="codex.app_server", run_id=record.run_id,
+                        cwd=str(params.get("cwd") or params.get("workdir") or ""),
+                        environment_generation=record.execution_generation or 0,
+                    )
+                    decision = "accept"
+                except NativeToolError:
+                    decision = "decline"
+                await self._send_control_response(ctx, "approval", request_id, {"decision": decision})
+                yield self.emit(build_event(
+                    AgentEventType.APPROVAL_RESOLVED, seq, turn_id=turn_id,
+                    native_type=f"{method}.resolved",
+                    payload=ApprovalResolvedPayload(
+                        approval_id=str(request_id),
+                        decision="allow" if decision == "accept" else "deny",
+                        native={"approval_kind": kind, "native_decision": decision,
+                                "resolved_by": "src_policy"},
+                    ),
+                    **common))
+                return
             future: asyncio.Future = asyncio.get_running_loop().create_future()
             # 统一用 str 键：codex 的 server-request id 可能是 int，
             # 事件 payload 与 respond_approval 入参都是 str 形态。
@@ -2398,6 +2576,33 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
             and params["_meta"].get("codex_approval_kind") == "mcp_tool_call"
         ):
             native_meta = dict(params.get("_meta") or {})
+            record = self._tracker.get(common["agent_session_id"])
+            if record is not None and src_task_id(self._tracker._store, record.thread_id):
+                try:
+                    await authorize_native_tool(
+                        self._tracker._store, thread_id=record.thread_id,
+                        invocation_id=f"codex-mcp:{common['agent_session_id']}:{request_id}",
+                        tool_name=str(native_meta.get("tool_title") or params.get("serverName") or "mcp"),
+                        arguments=dict(native_meta.get("tool_params") or {}), action="invoke",
+                        approval_kind="mcp_tool_call", adapter_id="codex.app_server", run_id=record.run_id,
+                        environment_generation=record.execution_generation or 0,
+                    )
+                    accepted = True
+                except NativeToolError:
+                    accepted = False
+                await self._send_control_response(ctx, "approval", request_id, {
+                    "action": "accept" if accepted else "decline",
+                    "content": {} if accepted else None, "_meta": None,
+                })
+                yield self.emit(build_event(
+                    AgentEventType.APPROVAL_RESOLVED, seq, turn_id=turn_id,
+                    native_type=f"{method}.resolved",
+                    payload=ApprovalResolvedPayload(
+                        approval_id=str(request_id), decision="allow" if accepted else "deny",
+                        native={"approval_kind": "mcp_tool_call", "resolved_by": "src_policy"},
+                    ),
+                    **common))
+                return
             future = asyncio.get_running_loop().create_future()
             ctx["approvals"][str(request_id)] = future
             ctx.setdefault("control_deliveries", {})[("approval", str(request_id))] = asyncio.get_running_loop().create_future()
@@ -2639,6 +2844,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
                            input_tokens=total.get("inputTokens"),
                            output_tokens=total.get("outputTokens"),
                            cached_input_tokens=total.get("cachedInputTokens"),
+                           cache_write_tokens=total.get("cacheWriteInputTokens"),
                            reasoning_tokens=total.get("reasoningOutputTokens"),
                            total_tokens=total.get("totalTokens"),
                            context_window=usage.get("modelContextWindow"),
@@ -2660,8 +2866,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
             return [ev(AgentEventType.MESSAGE_DELTA,
                        dump_payload(MessageDeltaPayload(
                            text=text,
-                           phase=(phase if phase in {"commentary", "final_answer"}
-                                  else None),
+                           phase=(phase if phase in _MESSAGE_PHASES else None),
                            message_id=item_id or None,
                        )))], False
         if method == "item/reasoning/summaryTextDelta":
@@ -2818,7 +3023,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
                            agents=[AgentNodePayload(**node)], patch=True)))]
         if item_type not in ("commandExecution", "mcpToolCall", "fileChange",
                              "dynamicToolCall", "collabToolCall",
-                             "collabAgentToolCall", "subAgentActivity"):
+                             "collabAgentToolCall", "subAgentActivity", "webSearch"):
             return []
         events = cls._map_item(
             ev, params, ctx, started=method == "item/started")
@@ -2945,6 +3150,11 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
                 "mcpToolCall": str(item.get("tool") or item.get("server") or "mcp"),
                 "fileChange": "file_change",
             }.get(item_type, item_type)
+            tool_input: Any = str(item.get("command") or item.get("arguments") or "")
+            if item_type == "fileChange":
+                changes = _normalize_file_change_entries(item.get("changes"))
+                if changes:
+                    tool_input = {"changes": changes}
             if started:
                 if item_type == "fileChange":
                     _cache_file_change_item(ctx, item if isinstance(item, dict) else {})
@@ -2952,17 +3162,14 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
                            dump_payload(ToolPayload(
                                tool_call_id=call_id,
                                name=tool_name,
-                               input=str(item.get("command")
-                                         or item.get("arguments") or ""),
+                               input=tool_input,
                                status="running",
                                kind=("mcp" if item_type == "mcpToolCall"
                                      else "command"
                                      if item_type == "commandExecution"
                                      else "file_change"
                                      if item_type == "fileChange" else None),
-                               native=({"mcp_server": str(item["server"])}
-                                       if item_type == "mcpToolCall"
-                                       and item.get("server") else {}),
+                               native=_tool_item_native(item_type, item),
                            )))]
             if item_type == "fileChange":
                 # Refresh cache on completed so late/retry previews stay accurate.
@@ -2973,6 +3180,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
                        dump_payload(ToolPayload(
                            tool_call_id=call_id,
                            name=tool_name,
+                           input=tool_input if item_type == "fileChange" and tool_input else None,
                            output=str(output),
                            exit_code=(item.get("exitCode")
                                       if isinstance(item.get("exitCode"), int)
@@ -2980,7 +3188,30 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
                            status=("failed"
                                    if str(item.get("status") or "") == "failed"
                                    else "completed"),
-                           native={"native_status": item.get("status")},
+                           duration_ms=(item.get("durationMs")
+                                        if isinstance(item.get("durationMs"), int)
+                                        else None),
+                           native={**_tool_item_native(item_type, item),
+                                   "native_status": item.get("status")},
+                       )))]
+        if item_type == "webSearch" and call_id:
+            tool_name, tool_input = _web_search_call(item)
+            web_native = {"web_action": item.get("action")}
+            if started:
+                return [ev(AgentEventType.TOOL_STARTED,
+                           dump_payload(ToolPayload(
+                               tool_call_id=call_id, name=tool_name, kind="web",
+                               input=tool_input, status="running", native=web_native,
+                           )))]
+            results = item.get("results")
+            output = (json.dumps({"query": tool_input.get("query", ""), "results": results}, ensure_ascii=False)
+                      if isinstance(results, list) and results else "")
+            # The started item usually carries no query yet; the completed one has the final action.
+            return [ev(AgentEventType.TOOL_COMPLETED,
+                       dump_payload(ToolPayload(
+                           tool_call_id=call_id, name=tool_name, kind="web",
+                           input=tool_input, output=output, status="completed",
+                           native=web_native,
                        )))]
         if item_type == "agentMessage" and item.get("delivery") == "async" and item.get("questions"):
             if started or not call_id or call_id in ctx.setdefault("async_question_ids", set()):
@@ -3009,11 +3240,11 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
         if item_type == "agentMessage" and not started:
             text = str(item.get("text") or "")
             phase = str(item.get("phase") or "")
-            if call_id and phase in {"commentary", "final_answer"}:
+            if call_id and phase in _MESSAGE_PHASES:
                 ctx.setdefault("agent_message_phases", {})[call_id] = phase
             if text and phase == "final_answer":
                 ctx["assistant_final_text"] = text
-            elif text and phase != "commentary":
+            elif text and phase not in _PROGRESS_MESSAGE_PHASES:
                 # Older providers omit phase. Keep the last completed message
                 # as the compatibility candidate for the terminal answer.
                 ctx["assistant_legacy_final_text"] = text
@@ -3022,7 +3253,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
             return []
         if item_type == "agentMessage" and started:
             phase = str(item.get("phase") or "")
-            if call_id and phase in {"commentary", "final_answer"}:
+            if call_id and phase in _MESSAGE_PHASES:
                 ctx.setdefault("agent_message_phases", {})[call_id] = phase
             return []
         if item_type == "reasoning" and not started:
@@ -3330,10 +3561,12 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
             return base
         ctx = self._runs.get(session.agent_session_id)
         if ctx is None or not ctx["conn"].alive:
-            return base.model_copy(update={
+            from .command_providers import detached_compaction_snapshot, operation_item
+            return detached_compaction_snapshot(base.model_copy(update={
                 "stale": True,
                 "diagnostics": ["Codex App Server Session 当前不在本进程"],
-            })
+            }), operation_item(self.id, "codex", "compact", "thread/compact/start",
+                               "由 Codex 原生压缩当前上下文，保留对话历史"))
 
         items = list(base.items)
         diagnostics: list[str] = []
@@ -3440,10 +3673,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
                         id=f"runtime:{self.id}:mcp:{name}",
                         kind="mcp_status",
                         name=name,
-                        description=(
-                            f"Runtime 已报告 · {len(tools)} 个工具 · "
-                            f"认证 {status.get('authStatus') or 'unknown'}"
-                        ),
+                        description=_mcp_status_description(status),
                         source="Codex App Server",
                         scope="session",
                         engine="codex",
@@ -3455,6 +3685,7 @@ class CodexAppServerAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, Runti
                         status="runtime_reported",
                         invocation={
                             "method": M_MCP_STATUS,
+                            "runtime_status": status.get("runtimeStatus"),
                             "auth_status": status.get("authStatus"),
                             "tool_count": len(tools),
                         },

@@ -467,6 +467,7 @@ class UsagePayload(_Payload):
     context_window: Optional[int] = Field(default=None, ge=0)
     context_used_tokens: Optional[int] = Field(default=None, ge=0)
     cost_usd: Optional[float] = Field(default=None, ge=0)
+    cost_kind: Literal["reported", "estimated"] = "reported"
     step_count: Optional[int] = Field(default=None, ge=0)
     llm_duration_ms: Optional[int] = Field(default=None, ge=0)
 

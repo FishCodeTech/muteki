@@ -2,7 +2,7 @@
  * Thread attention helpers for Conversation sidebar / activity badge (C29).
  */
 
-import type { ConversationThread } from "./useConversation";
+import type { ConversationState, ConversationThread } from "./useConversation";
 
 function isActionableRequest(row: Record<string, unknown> | null | undefined): boolean {
   if (!row || typeof row !== "object") return false;
@@ -86,6 +86,71 @@ export function subagentPendingByRoot(
     list.sort((a, b) => Number(a.kind !== "approval") - Number(b.kind !== "approval"));
   }
   return result;
+}
+
+export interface SubagentActivity {
+  /** Descendants still in progress: a running turn, or a spawn that has not finished. */
+  active: number;
+  /** Every non-archived descendant the root delegated to. */
+  total: number;
+}
+
+const ACTIVE_SUBAGENT_NODE = new Set(["pending", "running"]);
+
+/**
+ * Mirrors the backend live status: a spawned child's first turn waits in
+ * queued status until the runtime starts it, and follow-ups wait in the
+ * queue, so both count as in progress unless the queue is paused or its
+ * item failed.
+ */
+function threadHasLiveWork(thread: ConversationThread): boolean {
+  if (thread.state.running_turn_id || thread.state.queued_turn) return true;
+  return Boolean(
+    Number(thread.state.queue_count || 0) > 0
+    && !thread.state.queue_paused
+    && !thread.state.queue_failed_item_id,
+  );
+}
+
+/**
+ * Delegation activity of the app-owned subagent descendants of each root
+ * Thread. Child rows are the live source (their running/queue flags reach the
+ * inbox stream); a Thread's own subagent nodes stand in for children whose
+ * rows are not listed yet.
+ */
+export function subagentActivityByRoot(
+  threads: ConversationThread[],
+): Map<string, SubagentActivity> {
+  const byId = new Map(threads.map((thread) => [thread.thread_id, thread]));
+  const result = new Map<string, SubagentActivity>();
+  const add = (rootId: string, active: boolean) => {
+    const entry = result.get(rootId) ?? { active: 0, total: 0 };
+    entry.total += 1;
+    if (active) entry.active += 1;
+    result.set(rootId, entry);
+  };
+  for (const thread of threads) {
+    if (thread.state.status === "archived") continue;
+    const ownerId = attentionOwnerId(thread, byId);
+    if (ownerId) add(ownerId, threadHasLiveWork(thread));
+    for (const node of thread.state.subagents || []) {
+      if (node.origin && node.origin !== "app_owned") continue;
+      const childId = node.thread_id || node.agent_id;
+      if (!childId || byId.has(childId)) continue;
+      add(ownerId || thread.thread_id, ACTIVE_SUBAGENT_NODE.has(String(node.status)));
+    }
+  }
+  return result;
+}
+
+/** Direct subagents of one Thread (Muteki-owned and runtime-reported), for its own controls. */
+export function threadSubagentCounts(state: ConversationState | null | undefined): SubagentActivity {
+  const counts: SubagentActivity = { active: 0, total: 0 };
+  for (const node of [...(state?.subagents || []), ...(state?.agents?.agents || [])]) {
+    counts.total += 1;
+    if (ACTIVE_SUBAGENT_NODE.has(String(node.status))) counts.active += 1;
+  }
+  return counts;
 }
 
 export function countThreadAttention(

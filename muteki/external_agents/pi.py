@@ -48,6 +48,11 @@ from muteki.capability_bindings.agent_plugin import (
     resolve_client_extension_entry,
 )
 from muteki.platform.contracts.agent_events import (
+    ApprovalOption,
+    ApprovalRequestedPayload,
+    ApprovalResolvedPayload,
+    UserInputRequestedPayload,
+    UserInputResolvedPayload,
     FailureCategory,
     MessageDeltaPayload,
     MessageCompletedPayload,
@@ -72,6 +77,8 @@ from muteki.platform.contracts.external_agents import (
     AgentEventType,
     AgentSessionSnapshot,
     AgentInput,
+    ApprovalResponseInput,
+    UserInputResponseInput,
     MessageInput,
     SteerInput,
     AgentSessionRef,
@@ -108,12 +115,51 @@ from .runtime_capabilities import (
 from .rpc import PeerClosedError, StdioJsonlPeer
 from .rpc_commands import rpc_compaction_events, rpc_context_usage_event, rpc_context_window
 from .sessions import classify_exit
+from .user_input_schema import normalize_question
 
 PI_EXTENSION_NAMESPACE = "io.github.fishcodetech.pi"
 PI_EXTENSION_ENTRY = "extension.ts"
 PI_TOOLS_FILE_ENV = "MUTEKI_CAPABILITY_TOOLS_FILE"
 PI_MCP_EXTENSION_FILENAME = "muteki-pi-mcp-extension.ts"
 PI_MCP_PROTOCOL = "2025-11-25"
+PI_PERMISSION_TITLE = "Muteki tool approval"
+PI_ACCESS_MODES = ("supervised", "auto-accept-edits", "full-access")
+
+
+def _write_permission_extension(directory: Path) -> Path:
+    """Independent Pi hook, also installed when no MCP bridge is configured.
+
+    This controls Pi tool calls, not arbitrary extension code or OS access.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "muteki-pi-permissions.ts"
+    path.write_text(r'''
+export default function mutekiPermissions(pi) {
+  const mode = process.env.MUTEKI_PI_ACCESS_MODE;
+  if (!["supervised", "auto-accept-edits", "full-access"].includes(mode)) {
+    throw new Error("Unsupported Muteki Pi access mode: " + mode);
+  }
+  const reads = new Set(["read", "grep", "find", "ls"]);
+  const edits = new Set(["edit", "write"]);
+  const builtin = (name) => typeof pi.getAllTools === "function" &&
+    pi.getAllTools().some(tool => tool.name === name &&
+      tool.sourceInfo?.path === "builtin:" + (name === "tool_search" ? "tool-search" : name));
+  pi.on("tool_call", async (event, ctx) => {
+    if (mode === "full-access") return;
+    if ((reads.has(event.toolName) || event.toolName === "tool_search") && builtin(event.toolName)) return;
+    if (mode === "auto-accept-edits" && edits.has(event.toolName) && builtin(event.toolName)) return;
+    const approved = await ctx.ui.confirm("Muteki tool approval", JSON.stringify({
+      mutekiPermission: 1, toolCallId: event.toolCallId,
+      toolName: event.toolName, input: event.input,
+    }), { signal: ctx.signal });
+    if (!approved || ctx.signal?.aborted) {
+      return { block: true, reason: "Tool call declined or cancelled in Muteki." };
+    }
+  });
+}
+''', encoding="utf-8")
+    path.chmod(0o600)
+    return path
 # Commands present in pi 0.86.1 ``rpc-types`` / ``rpc-mode.js``. ``rewind`` is
 # not one of them; rollback is ``fork`` at the user entry (position "before").
 PI_FORK_COMMAND = "fork"
@@ -198,8 +244,9 @@ def _pi_usage_payload(usage: dict[str, Any], usage_id: str) -> dict[str, Any]:
         cost_usd=(
             value if isinstance(cost, dict)
             and isinstance((value := cost.get("total")), (int, float))
-            and not isinstance(value, bool) else None
+            and not isinstance(value, bool) and value > 0 else None
         ),
+        cost_kind="estimated",
         native=dict(usage),
     ))
 
@@ -507,6 +554,9 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
     host_context_channel = "system_prompt"
     context_compaction_events = True
 
+    chat_model_fields = ("model", "effort")
+    chat_model_reset_requires_restart = ("model", "effort")
+
     def __init__(
         self,
         *,
@@ -657,6 +707,36 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
 
     # -- probe ----------------------------------------------------------------
 
+    def declared_chat_capabilities(self) -> AgentCapabilities:
+        """Pi RPC support; actual startup still validates the native connection."""
+        caps = conservative_capabilities(transport_kind="rpc", capability_source="adapter_reported")
+        caps.protocol_version = "jsonl-rpc"
+        caps.streaming = True
+        caps.tool_events = True
+        caps.usage_events = True
+        caps.steer = True
+        caps.interrupt = True
+        caps.approval = True
+        caps.user_input = True
+        caps.access_modes = list(PI_ACCESS_MODES)
+        caps.resume = True
+        caps.resume_continues_turn = False
+        caps.session_persistence = True
+        caps.skills = True
+        caps.agent_plugin = True
+        # prompt {message, images?} — ImageContent {type, data, mimeType}.
+        caps.image_input = True
+        # RPC command "compact" {customInstructions?} 由 runtime 快照以
+        # verified operation 暴露（rpc_commands.RPC_OPERATIONS）。
+        caps.compaction = True
+        # message_end usage plus get_state model.contextWindow.
+        caps.context_usage = True
+        # Pi has no native MCP config. This adapter injects the chat MCP
+        # server with an extension in its own runtime directory.
+        caps.mcp = True
+        caps.fork = bool(self._rpc_features.get("fork"))
+        return caps
+
     async def probe(self, request: ProbeRequest) -> AgentCapabilities:
         field_sources: dict[str, str] = {}
         degradations: list[str] = []
@@ -711,31 +791,12 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
             )
             return caps
 
-        # 实测能力（命令面逐条与 rpc-types.ts 核验一致）。
+        declared = self.declared_chat_capabilities()
+        declared.runtime_version = caps.runtime_version
+        declared.supported_models = caps.supported_models
+        caps = declared
         caps.capability_source = SOURCE_PROBE
-        caps.protocol_version = "jsonl-rpc"
-        caps.streaming = True
-        caps.tool_events = True
-        caps.usage_events = True
-        caps.steer = True
-        caps.interrupt = True
-        caps.resume = True
-        caps.resume_continues_turn = False
-        caps.session_persistence = True
-        caps.skills = True
-        caps.agent_plugin = True
-        # prompt {message, images?} — ImageContent {type, data, mimeType}.
-        caps.image_input = True
         field_sources["image_input"] = SOURCE_PROBE
-        # RPC command "compact" {customInstructions?} 由 runtime 快照以
-        # verified operation 暴露（rpc_commands.RPC_OPERATIONS）。
-        caps.compaction = True
-        # message_end usage plus get_state model.contextWindow.
-        caps.context_usage = True
-        # Pi has no native MCP config. This adapter injects the chat MCP
-        # server with an extension in its own runtime directory.
-        caps.mcp = True
-        caps.fork = bool(self._rpc_features.get("fork"))
         if not self._rpc_features.get("get_messages"):
             degradations.append(
                 "get_messages：活动分支快照命令未在本进程确认"
@@ -748,14 +809,9 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
                 + (f"（{feature_errors.get('fork')}）"
                    if feature_errors.get("fork") else "")
                 + "；0.86.1 没有 rewind 命令，不声明 fork / native rewind")
-        # approval（RPC 无非阻塞带内审批，工具审批策略由启动参数固化）、
-        # user_input（extension_ui 子协议未接入）、
         # plan（无原生 plan/task 事件流；勿从 markdown 待办臆测进度）。
         for field_name in BOOL_CAPABILITY_FIELDS:
             field_sources[field_name] = SOURCE_PROBE
-        degradations.append(
-            "approval：RPC 模式无带内审批请求；pi 0.73.1 无 --approve，"
-            "工具范围由启动旗标（--tools / --extension）固化，未静默关闭")
         degradations.append(
             "plan：Pi RPC 无结构化计划事件；Conversation 计划面板按 unsupported 降级")
         # caps.subagents 保持保守 False：Pi 无原生子智能体（README 明示
@@ -789,6 +845,14 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
         options = request.options
         cwd = options.cwd or os.getcwd()
         env = {**self._default_env, **options.env}
+        access_mode = request.access_mode or ("supervised" if options.is_conversation else "full-access")
+        if access_mode not in PI_ACCESS_MODES:
+            raise PiRpcError("pi.access_mode.unsupported",
+                             f"Unsupported Pi access mode: {access_mode}",
+                             command="launch")
+        env["MUTEKI_PI_ACCESS_MODE"] = access_mode
+        permission_extension = _write_permission_extension(
+            self._runtime_root / request.agent_session_id)
         # 与 Pi CLI compatibility 路径保持一致：Worker 的本地工具、项目扩展
         # 和 Provider 配置都在非交互 Runtime 内使用。实际命令范围仍由
         # Muteki 的任务、授权与工作目录约束。
@@ -876,10 +940,7 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
                     "error": msg.get("error"),
                 })
             if msg.get("type") == "extension_ui_request" and msg.get("method") in {"select", "confirm", "input", "editor"}:
-                await peer.send({"type": "extension_ui_response", "id": msg.get("id"), "cancelled": True})
-                self._dispatch_event(request.agent_session_id, {
-                    "type": "extension_error", "error": "此扩展请求终端交互，当前 Pi 聊天协议未接入该界面",
-                })
+                await self._extension_ui_request(request.agent_session_id, peer, msg)
                 return
             self._dispatch_event(request.agent_session_id, msg)
 
@@ -890,7 +951,7 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
                 session_dir=options.session_dir,
                 chat_mode=options.is_conversation,
                 mcp_extension=mcp_extension,
-                native_extensions=list(options.chat_native_extensions),
+                native_extensions=[str(permission_extension), *options.chat_native_extensions],
                 append_system_prompt=system_append(options.host_context),
                 extension_path=(
                     str(plugin_extension_path)
@@ -903,6 +964,7 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
             await peer.start()
             state = await self._cmd(peer, "get_state",
                                     timeout=self._startup_timeout)
+            baseline_state = state
             resume_handle = request.resume_handle
             if resume_handle:
                 await self._cmd(peer, "switch_session",
@@ -920,22 +982,25 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
                 await self._cmd(peer, "set_model",
                                 {"provider": model_provider, "modelId": model_id},
                                 timeout=self._startup_timeout)
-            if request.effort and request.effort != "default":
-                await self._cmd(peer, "set_thinking_level",
-                                {"level": request.effort},
-                                timeout=self._startup_timeout)
+            state = await self._cmd(peer, "get_state", timeout=self._startup_timeout)
+            default_effort = self._state_thinking_level(state)
+            level = request.effort if request.effort and request.effort != "default" else default_effort
+            state = await self._set_thinking_level(peer, level)
             stats = await self._cmd(peer, "get_session_stats",
                                     timeout=self._startup_timeout)
-            if mcp_extension and startup_errors:
-                first = startup_errors[0]
+            required_errors = [error for error in startup_errors
+                               if mcp_extension or error.get("extensionPath") == str(permission_extension)]
+            if required_errors:
+                first = required_errors[0]
                 raise PiRpcError(
-                    "pi.mcp.extension_failed",
-                    str(first.get("error") or "Pi MCP extension failed"),
+                    "pi.extension_failed",
+                    str(first.get("error") or "Pi extension failed"),
                     command="extension",
                     data=first,
                 )
         except BaseException:
             await peer.close()
+            permission_extension.unlink(missing_ok=True)
             if mcp_extension and plugin_extension_path is not None:
                 plugin_extension_path.unlink(missing_ok=True)
             raise
@@ -960,6 +1025,9 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
                 else str(plugin_extension_path)),
             "mcp_extension": (
                 str(plugin_extension_path) if mcp_extension else None),
+            "permission_extension": str(permission_extension),
+            "access_mode": access_mode,
+            "pending_interactions": {},
             "entries_cursor": None,
             "entries_cursor_error": None,
             "get_messages_command": False,
@@ -974,8 +1042,14 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
             "resumed": bool(request.resume_handle),
             "model_provider": model_provider,
             "model_id": model_id,
+            "chat_selection": options.is_conversation,
+            "default_model": dict(baseline_state.get("model") or {}),
+            "default_effort": default_effort,
+            "selected_model": requested_model,
+            "selected_effort": request.effort or "",
+            "effective_effort": state.get("thinkingLevel"),
             "capability_revision": 0,
-            # get_state ran before set_model; the stats read after it.
+            # State and stats both describe the selected model.
             "context_window": rpc_context_window(
                 {"model": stats.get("contextUsage")} if isinstance(stats.get("contextUsage"), dict)
                 else state),
@@ -1006,6 +1080,7 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
         except BaseException:
             self._rpc.pop(request.agent_session_id, None)
             await peer.close()
+            permission_extension.unlink(missing_ok=True)
             if mcp_extension and plugin_extension_path is not None:
                 plugin_extension_path.unlink(missing_ok=True)
             raise
@@ -1015,6 +1090,85 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
         }
 
     # -- 事件归一化 -------------------------------------------------------------
+
+    async def _extension_ui_request(self, sid: str, peer: StdioJsonlPeer,
+                                    msg: dict[str, Any]) -> None:
+        """The reader registers a request and returns; it never awaits an operator."""
+        handle = self._rpc.get(sid)
+        request_id = str(msg.get("id") or "")
+        if not handle or handle.get("event_sink") is None or not request_id:
+            await peer.send({"type": "extension_ui_response", "id": msg.get("id"), "cancelled": True})
+            return
+        permission = None
+        if msg.get("method") == "confirm" and msg.get("title") == PI_PERMISSION_TITLE:
+            try:
+                candidate = json.loads(msg.get("message") or "")
+            except (TypeError, ValueError):
+                candidate = None
+            if isinstance(candidate, dict) and candidate.get("mutekiPermission") == 1:
+                permission = candidate
+        pending = {"request": msg, "approval": permission is not None}
+        handle["pending_interactions"][request_id] = pending
+        if permission is not None:
+            tool = str(permission.get("toolName") or "")
+            raw_input = permission.get("input")
+            args = raw_input if isinstance(raw_input, dict) else {}
+            payload = ApprovalRequestedPayload(
+                approval_id=request_id,
+                approval_kind="command_execution" if tool == "bash" else "file_change" if tool in {"edit", "write"} else "tool",
+                title=f"Allow {tool}?", tool_name=tool,
+                tool_call_id=permission.get("toolCallId"), input=raw_input,
+                command=args.get("command") if tool == "bash" else None,
+                path=args.get("path") if tool in {"edit", "write"} else None,
+                cwd=handle.get("cwd"), scopes=["once"],
+                options=[ApprovalOption(option_id="allow", label="Allow once", kind="allow_once"),
+                         ApprovalOption(option_id="deny", label="Deny", kind="reject_once")],
+                native={"access_mode": handle["access_mode"], "method": "confirm"})
+            event_type = AgentEventType.APPROVAL_REQUESTED
+        else:
+            method = msg.get("method")
+            choices = msg.get("options") if method == "select" else ["Yes", "No"] if method == "confirm" else []
+            question = normalize_question({
+                "id": "value", "prompt": msg.get("message") or msg.get("title") or "Pi extension input",
+                "options": choices, "allow_free_text": not bool(choices),
+                "placeholder": msg.get("placeholder") or ""})
+            payload = UserInputRequestedPayload(
+                request_id=request_id, user_input_kind=f"pi.extension.{method}",
+                title=msg.get("title"), message=msg.get("message"),
+                questions=[question] if question else [], response_actions=["submit", "cancel"],
+                native=msg)
+            event_type = AgentEventType.USER_INPUT_REQUESTED
+        handle["event_sink"].put_nowait((event_type, "pi.extension_ui_request", dump_payload(payload)))
+        timeout = msg.get("timeout")
+        if isinstance(timeout, (int, float)) and timeout > 0:
+            async def expire() -> None:
+                await asyncio.sleep(timeout / 1000)
+                await self._cancel_interactions(handle, request_id=request_id, expired=True)
+            pending["timeout_task"] = asyncio.create_task(expire())
+
+    async def _cancel_interactions(self, handle: dict[str, Any], *,
+                                   request_id: Optional[str] = None,
+                                   expired: bool = False) -> None:
+        for key, pending in list(handle.get("pending_interactions", {}).items()):
+            if request_id is not None and request_id != key:
+                continue
+            handle["pending_interactions"].pop(key, None)
+            timer = pending.get("timeout_task")
+            if timer and timer is not asyncio.current_task():
+                timer.cancel()
+            try:
+                await handle["peer"].send({"type": "extension_ui_response", "id": key, "cancelled": True})
+            except (PeerClosedError, BrokenPipeError, ConnectionError):
+                pass  # A closed transport cannot run the blocked tool.
+            sink = handle.get("event_sink")
+            if sink is not None:
+                if pending["approval"]:
+                    event_type = AgentEventType.APPROVAL_RESOLVED
+                    payload = ApprovalResolvedPayload(approval_id=key, decision="expired" if expired else "cancelled")
+                else:
+                    event_type = AgentEventType.USER_INPUT_RESOLVED
+                    payload = UserInputResolvedPayload(request_id=key, outcome="timeout" if expired else "cancelled")
+                sink.put_nowait((event_type, "pi.extension_ui_response", dump_payload(payload)))
 
     def _dispatch_event(self, agent_session_id: str,
                         msg: dict[str, Any]) -> None:
@@ -1160,7 +1314,104 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
     ) -> AsyncIterator[AgentEvent]:
         if isinstance(input, MessageInput):
             return self._turn_stream(session, input)
+        if isinstance(input, (ApprovalResponseInput, UserInputResponseInput)):
+            return self._interaction_response_stream(session, input)
         return self.unsupported_input_stream(session, input)
+
+    async def _interaction_response_stream(
+        self, session: AgentSessionRef,
+        input: ApprovalResponseInput | UserInputResponseInput,
+    ) -> AsyncIterator[AgentEvent]:
+        sid = session.agent_session_id
+        handle = self._rpc.get(sid)
+        approval = isinstance(input, ApprovalResponseInput)
+        key = input.payload.approval_id if approval else input.payload.request_id
+        pending = (handle or {}).get("pending_interactions", {}).get(key)
+        record = self._tracker.get(sid)
+        common = dict(agent_session_id=sid,
+                      external_session_id=(handle or {}).get("external_session_id"),
+                      run_id=record.run_id if record else None,
+                      execution_generation=record.execution_generation if record else None,
+                      turn_id=(handle or {}).get("current_turn_id"))
+        try:
+            if pending is None or pending["approval"] != approval:
+                raise ValueError("Pi interaction is no longer pending")
+            response: dict[str, Any] = {"type": "extension_ui_response", "id": key}
+            if approval:
+                if input.payload.scope != "once" or input.payload.updated_input is not None:
+                    raise ValueError("Pi approvals support once scope and unchanged tool input only")
+                response["confirmed"] = input.payload.decision == "allow"
+                event_type = AgentEventType.APPROVAL_RESOLVED
+                payload = ApprovalResolvedPayload(approval_id=key, decision=input.payload.decision, scope="once")
+            else:
+                method = pending["request"].get("method")
+                cancelled = input.payload.decision in {"cancel", "decline"}
+                if cancelled:
+                    response["cancelled"] = True
+                else:
+                    answer = input.payload.answers.get("value", input.text)
+                    if isinstance(answer, dict):
+                        values = answer.get("values")
+                        answer = values[0] if isinstance(values, list) and len(values) == 1 else answer.get("text", "")
+                    if method == "confirm":
+                        if answer not in {"Yes", "No", "true", "false", True, False}:
+                            raise ValueError("Pi confirmation requires Yes or No")
+                        response["confirmed"] = answer in {"Yes", "true", True}
+                    elif method == "select":
+                        if answer not in (pending["request"].get("options") or []):
+                            raise ValueError("Pi selection must match an offered option")
+                        response["value"] = answer
+                    elif not isinstance(answer, str):
+                        raise ValueError("Pi extension input requires text")
+                    else:
+                        response["value"] = answer
+                event_type = AgentEventType.USER_INPUT_RESOLVED
+                payload = UserInputResolvedPayload(
+                    request_id=key,
+                    outcome="cancelled" if input.payload.decision == "cancel" else "declined" if cancelled else "answered",
+                    answers=input.payload.answers)
+            # Remove before yielding to stdin so interrupt cannot send a second verdict.
+            handle["pending_interactions"].pop(key)
+            timer = pending.get("timeout_task")
+            if timer:
+                timer.cancel()
+            await handle["peer"].send(response)
+        except (ValueError, TypeError, PeerClosedError, BrokenPipeError, ConnectionError) as exc:
+            yield self.emit(build_event(
+                AgentEventType.RUNTIME_ERROR, self.sequencer_for(sid),
+                native_type="pi.interaction.response_failed",
+                payload=RuntimeErrorPayload(error=self.exception_failure(
+                    exc, FailureCategory.VALIDATION if isinstance(exc, (ValueError, TypeError)) else FailureCategory.TRANSPORT,
+                    "pi.interaction.response_failed", message=str(exc))), **common))
+            return
+        yield self.emit(build_event(event_type, self.sequencer_for(sid),
+                                    native_type="pi.extension_ui_response", payload=payload, **common))
+
+    @staticmethod
+    def _state_thinking_level(state: dict[str, Any]) -> str:
+        level = state.get("thinkingLevel")
+        if not isinstance(level, str) or not level:
+            raise PiRpcError("pi.rpc.protocol", "Pi get_state returned no usable thinkingLevel",
+                             command="get_state", data=state)
+        return level
+
+    async def _set_thinking_level(self, peer: StdioJsonlPeer, level: Any,
+                                  handle: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        normalized = "off" if level == "none" else level
+        if not isinstance(normalized, str) or not normalized:
+            raise PiRpcError("pi.rpc.protocol",
+                             "Pi get_state returned no usable thinkingLevel",
+                             command="get_state", data={"thinkingLevel": level})
+        await self._cmd(peer, "set_thinking_level", {"level": normalized}, timeout=self._startup_timeout)
+        state = await self._cmd(peer, "get_state", timeout=self._startup_timeout)
+        effective = self._state_thinking_level(state)
+        if handle is not None:
+            handle["effective_effort"] = effective
+        if effective != normalized:
+            raise PiRpcError("pi.thinking_level.mismatch",
+                             f"Pi requested thinking level {normalized!r}, effective {state.get('thinkingLevel')!r}",
+                             command="set_thinking_level", data=state)
+        return state
 
     async def _turn_stream(
         self, session: AgentSessionRef, input: MessageInput
@@ -1195,6 +1446,51 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
         async for event in runner.stream(
                 self._raw_turn_events(session, input, turn_id, runner)):
             yield event
+
+    async def _apply_chat_selection(self, handle: dict[str, Any], input: MessageInput) -> None:
+        if not handle.get("chat_selection"):
+            return
+        peer = handle["peer"]
+        value = input.payload.model
+        model_changed = False
+        if value is not None and value != handle.get("selected_model"):
+            if value:
+                if "/" in value:
+                    provider, model_id = value.split("/", 1)
+                else:
+                    provider = str(handle["env"].get("MUTEKI_PI_PROVIDER") or "")
+                    model_id = value
+                    if not provider:
+                        available = await self._cmd(peer, "get_available_models", timeout=self._startup_timeout)
+                        providers = {str(row["provider"]) for row in available.get("models", [])
+                                     if row.get("id") == model_id and row.get("provider")}
+                        if len(providers) != 1:
+                            raise PiRpcError("pi.model_ambiguous", "Pi model needs an unambiguous provider/model", command="set_model")
+                        provider = providers.pop()
+            else:
+                baseline = handle["default_model"]
+                provider, model_id = baseline.get("provider"), baseline.get("id")
+            # Pi falls back to the previous model's current level when no
+            # per-model/global default exists. Restore its native baseline
+            # first so an explicit Muteki choice cannot become a new default.
+            if handle.get("effective_effort") != handle.get("default_effort"):
+                await self._set_thinking_level(peer, handle.get("default_effort"), handle)
+            result = await self._cmd(peer, "set_model", {"provider": provider, "modelId": model_id}, timeout=self._startup_timeout)
+            state = await self._cmd(peer, "get_state", timeout=self._startup_timeout)
+            handle["default_effort"] = self._state_thinking_level(state)
+            handle["effective_effort"] = handle["default_effort"]
+            handle.update(model_provider=provider, model_id=model_id, selected_model=value)
+            model_changed = True
+            window = rpc_context_window({"model": result})
+            if window:
+                handle["context_window"] = window
+        effort = input.payload.effort
+        if model_changed or (effort is not None and effort != handle.get("selected_effort")):
+            if effort is None:
+                effort = handle.get("selected_effort") or "default"
+            level = handle.get("default_effort") if effort in {"", "default"} else effort
+            await self._set_thinking_level(peer, level, handle)
+            handle["selected_effort"] = effort
 
     async def _raw_turn_events(
         self, session: AgentSessionRef, input: MessageInput,
@@ -1263,6 +1559,7 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
 
         async def run_prompt() -> Optional[Exception]:
             try:
+                await self._apply_chat_selection(handle, input)
                 # prompt 响应只是 ack；完成由 agent_end/agent_settled 事件
                 # 判定（_dispatch_event 放 __turn_done__ 标记）。
                 prompt_params: dict[str, Any] = {"message": text_with_envelopes(
@@ -1320,6 +1617,7 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
             loop_finished = True
         finally:
             get_task.cancel()
+            await self._cancel_interactions(handle)
             if not loop_finished:
                 # TurnRunner closed this source (process exit, limit, or the
                 # consumer stopped): release the turn state it would leave.
@@ -1480,6 +1778,7 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
         # message_end / tool_execution_end classify as interrupted.
         handle["abort_requested"] = True
         try:
+            await self._cancel_interactions(handle)
             await self._cmd(handle["peer"], "abort")
             return self._receipt(session, True)
         except Exception as exc:  # noqa: BLE001
@@ -1835,7 +2134,10 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
         if handle is None or handle.get("peer") is None:
             base.stale = True
             base.diagnostics.append("Pi RPC Session 当前不在本进程")
-            return base
+            from .command_providers import detached_compaction_snapshot
+            from .rpc_commands import rpc_operation_items
+            return detached_compaction_snapshot(base, next(
+                item for item in rpc_operation_items(self.id, "pi") if item.name == "compact"))
         try:
             result = await self._cmd(
                 handle["peer"], "get_commands", timeout=self._startup_timeout)
@@ -1897,7 +2199,11 @@ class PiAdapter(BaseExternalAgentAdapter, NativeRewindAdapter, RuntimeOperationA
         if not handle:
             return "closed"
         peer: StdioJsonlPeer = handle["peer"]
+        await self._cancel_interactions(handle)
         returncode = await peer.close()
+        permission_extension = handle.get("permission_extension")
+        if permission_extension:
+            Path(permission_extension).unlink(missing_ok=True)
         mcp_extension = handle.get("mcp_extension")
         if mcp_extension:
             # Rewritten by the next launch; leaving it would accumulate one

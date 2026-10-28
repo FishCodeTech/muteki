@@ -16,6 +16,7 @@ import {
   fetchThreadGitStatus,
   type ProjectGitStatus,
 } from "./useConversation";
+import { useConversationLocalPreview } from "./conversationPreviewMode";
 
 export type SharedGitStatusEntry = {
   status: ProjectGitStatus | null;
@@ -140,7 +141,8 @@ export async function checkoutSharedBranch(
 }
 
 export function useSharedGitStatus(threadId?: string, projectId?: string) {
-  const key = gitStatusCacheKey(threadId, projectId);
+  const localPreview = useConversationLocalPreview();
+  const key = localPreview ? "" : gitStatusCacheKey(threadId, projectId);
   const subscribe = useCallback(
     (onStoreChange: () => void) => subscribeSharedGitStatus(key, onStoreChange),
     [key],
@@ -154,8 +156,10 @@ export function useSharedGitStatus(threadId?: string, projectId?: string) {
   }, [key, threadId, projectId]);
 
   const refresh = useCallback(
-    () => refreshSharedGitStatus(threadId, projectId),
-    [threadId, projectId],
+    (): Promise<ProjectGitStatus | null> => (
+      localPreview ? Promise.resolve(null) : refreshSharedGitStatus(threadId, projectId)
+    ),
+    [localPreview, threadId, projectId],
   );
 
   return {

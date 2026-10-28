@@ -4,7 +4,7 @@ import { Fragment, useEffect, useRef } from "react";
 import { ConversationRouteLink as Link } from "@/components/conversation/ConversationNavigation";
 import { AnimatePresence, motion } from "motion/react";
 import { cn } from "@/lib/cn";
-import { Icon } from "@/components/Icon";
+import { Icon, type IconName } from "@/components/Icon";
 import { EASE_OUT, Kbd, Skeleton, useReducedMotion } from "@/components/chat/ui";
 import type {
   ComposerCapabilityItem,
@@ -17,6 +17,7 @@ import {
   capabilityIcon,
   capabilityLabel,
   capabilitySection,
+  capabilityStatusLabel,
   triggerIcon,
   triggerLabel,
 } from "./capabilityMeta";
@@ -35,6 +36,14 @@ export interface CapabilityMenuProps {
   activeIndex: number;
   onActiveIndexChange: (index: number) => void;
   onSelect: (item: ComposerCapabilityItem) => void;
+  /** Host-supplied catalog (not the runtime's): replaces the header, sections, icons and empty text. */
+  local?: {
+    title: string;
+    scopeLabel?: string;
+    emptyLabel?: string;
+    sectionOf: (item: ComposerCapabilityItem) => string;
+    iconOf?: (item: ComposerCapabilityItem) => IconName | undefined;
+  };
 }
 
 function CapabilityRows({
@@ -44,21 +53,21 @@ function CapabilityRows({
   activeIndex,
   onActiveIndexChange,
   onSelect,
-}: Pick<CapabilityMenuProps, "id" | "items" | "activeIndex" | "onActiveIndexChange" | "onSelect"> & {
+  local,
+}: Pick<CapabilityMenuProps, "id" | "items" | "activeIndex" | "onActiveIndexChange" | "onSelect" | "local"> & {
   trigger: ComposerTrigger;
 }) {
+  const sectionOf = (item: ComposerCapabilityItem) => (local ? local.sectionOf(item) : capabilitySection(trigger, item));
   return (
     <>
       {items.map((item, index) => {
-        const section = capabilitySection(trigger, item);
-        const previous = index > 0 ? capabilitySection(trigger, items[index - 1]) : "";
+        const section = sectionOf(item);
+        const previous = index > 0 ? sectionOf(items[index - 1]) : "";
         const disabled = capabilityDisabled(item);
         const level = String(item.support_level || (disabled ? "unknown" : "supported"));
         const active = index === activeIndex;
-        const meta = [
-          item.status && item.status !== "available" ? item.status : "",
-          ({ limited: "部分支持", unsupported: "暂不可用", unknown: "待验证", expired: "已过期" } as Record<string, string>)[level] || "",
-        ].filter(Boolean).join(" · ");
+        const levelLabel = ({ limited: "部分支持", unsupported: "暂不可用", unknown: "待验证", expired: "已过期" } as Record<string, string>)[level] || "";
+        const meta = Array.from(new Set([capabilityStatusLabel(item.status), levelLabel].filter(Boolean))).join(" · ");
         const disabledReason = disabled
           ? [item.reason, item.alternative ? `替代：${item.alternative}` : ""].filter(Boolean).join("；")
           : "";
@@ -96,7 +105,7 @@ function CapabilityRows({
                   disabled && "opacity-50",
                 )}
               >
-                <Icon name={capabilityIcon(item.kind, item.id)} size={14} />
+                <Icon name={local?.iconOf?.(item) ?? capabilityIcon(item.kind, item.id)} size={14} />
               </span>
               <span className="flex min-w-0 flex-1 flex-col">
                 <span className={cn("flex min-w-0 items-baseline gap-2", disabled && "opacity-50")}>
@@ -148,6 +157,7 @@ export function CapabilityMenu({
   activeIndex,
   onActiveIndexChange,
   onSelect,
+  local,
 }: CapabilityMenuProps) {
   const reduced = useReducedMotion();
   const listRef = useRef<HTMLDivElement>(null);
@@ -172,15 +182,21 @@ export function CapabilityMenu({
         >
           <div className="flex h-9 shrink-0 items-center gap-2 border-b border-cx-border-subtle px-3">
             <Icon name={triggerIcon(trigger)} size={13} className="text-cx-fg-3" />
-            <span className="text-[12px] font-medium text-cx-fg-2">{triggerLabel(trigger)}</span>
-            <span className="ml-auto truncate font-cx-mono text-[12px] text-cx-fg-4">{adapterId.replace(/^cli\./, "")}</span>
-            <Link href="/settings/agent-extensions" className="shrink-0 text-[12px] text-cx-fg-3 hover:text-cx-fg" onMouseDown={(e) => e.stopPropagation()}>管理扩展</Link>
+            <span className="text-[12px] font-medium text-cx-fg-2">{local?.title ?? triggerLabel(trigger)}</span>
+            {local ? (
+              local.scopeLabel ? <span className="ml-auto truncate text-[12px] text-cx-fg-4">{local.scopeLabel}</span> : null
+            ) : (
+              <>
+                <span className="ml-auto truncate font-cx-mono text-[12px] text-cx-fg-4">{adapterId.replace(/^cli\./, "")}</span>
+                <Link href="/settings/agent-extensions" className="shrink-0 text-[12px] text-cx-fg-3 hover:text-cx-fg" onMouseDown={(e) => e.stopPropagation()}>管理扩展</Link>
+              </>
+            )}
           </div>
           <div
             ref={listRef}
             id={id}
             role="listbox"
-            aria-label={triggerLabel(trigger)}
+            aria-label={local?.title ?? triggerLabel(trigger)}
             aria-busy={loading || undefined}
             className="cx-scroll min-h-0 max-h-[320px] flex-1 overflow-y-auto overscroll-contain p-1"
           >
@@ -220,11 +236,12 @@ export function CapabilityMenu({
                 activeIndex={activeIndex}
                 onActiveIndexChange={onActiveIndexChange}
                 onSelect={onSelect}
+                local={local}
               />
             ) : (
               <div role="status" className="flex flex-col items-center gap-1.5 px-4 py-6 text-center">
                 <Icon name="search" size={16} className="text-cx-fg-4" />
-                <span className="text-[13px] text-cx-fg-3">{runtime?.diagnostics[0] || "当前 Agent 没有匹配项"}</span>
+                <span className="text-[13px] text-cx-fg-3">{local ? local.emptyLabel ?? "没有匹配项" : runtime?.diagnostics[0] || "当前 Agent 没有匹配项"}</span>
               </div>
             )}
           </div>

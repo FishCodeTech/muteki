@@ -33,6 +33,7 @@ import { descriptorForAdapter, isKnownEngine, loadProviderDescriptors } from "./
 
 export type ThreadMode =
   | "conversation"
+  | "src"
   | "single_task"
   | "competition"
   | "management";
@@ -94,6 +95,8 @@ export interface ConversationState {
   queue_pause_reason?: string;
   queue_revision?: number;
   queue_failed_item_id?: string | null;
+  /** Inbox rows only: the latest turn waits for its runtime to start. */
+  queued_turn?: boolean;
   /** Server-side resume scheduled for after a provider quota reset (Unix seconds). */
   quota_resume?: { turn_id: string; resets_at: number; resume_at: number; kind?: string; scheduled_at?: number } | null;
   /** Latest engine rate-limit hold; `handled` once a schedule decision was made for it. */
@@ -282,6 +285,9 @@ export interface ConversationAgentNode {
   depth?: number | null;
   adapter_id?: string | null;
   access_mode?: string | null;
+  effort?: string | null;
+  acceptance_criteria?: string | null;
+  routing_reason?: string | null;
   /** shared | worktree */
   isolation?: string | null;
   workspace_id?: string | null;

@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import sys
 import time
 from functools import partial
 
@@ -58,10 +60,31 @@ async def abort_preloop_acquisitions(
             per_solver=state.per_solver)
         raise ControlShutdownIncomplete(
             "control shutdown incomplete; runtime owner retained")
+    exc = sys.exc_info()[1]
+    if (
+        exc is not None
+        and not isinstance(exc, asyncio.CancelledError)
+        and not getattr(self, "_operator_stop", False)
+        and not str(getattr(self, "_runtime_failure_code", "") or "").strip()
+    ):
+        self._runtime_failure_code = (
+            str(getattr(exc, "code", "") or "").strip() or "preloop_exception"
+        )
+        self._runtime_failure_phase = (
+            str(getattr(self, "_runtime_failure_phase", "") or "").strip()
+            or "coordinator_bootstrap"
+        )
+        self._runtime_failure_detail = f"{type(exc).__name__}: {exc}"
     try:
         await self._finalize_coordinator_run(
             winner=state.winner, flag=state.flag, goal_complete=state.goal_complete,
-            per_solver=state.per_solver)
+            per_solver=state.per_solver,
+            terminal_reason=(
+                "runtime_failure"
+                if str(getattr(self, "_runtime_failure_code", "") or "").strip()
+                else ""
+            ),
+        )
     except Exception:
         pass
 
@@ -71,6 +94,129 @@ async def start_coordinator(
 ) -> SwarmOutcome | None:
     abort_preloop = partial(abort_preloop_acquisitions, self, state)
     try:
+        generation = int(getattr(self, "_execution_generation", 1) or 1)
+        self._visit_started_monotonic = time.monotonic()
+        if generation <= 1:
+            self._visit_restart_count = 0
+        hosted_visit = getattr(self.stage_policy, "coordinator", {}).get("hosted_visit") or {}
+        probe = bool(hosted_visit.get("probe"))
+        fresh_override = os.getenv("MUTEKI_HOSTED_FRESH_GRAPH_ON_REVISIT")
+        fresh_enabled = (
+            fresh_override.strip().lower() in {"1", "true", "yes", "on"}
+            if fresh_override is not None
+            else False
+        )
+        ctf_decide_first = bool(
+            getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
+            and self._auto_dispatch_enabled()
+        )
+        revisit_campaigns = bool(
+            generation >= 2
+            and getattr(self.challenge, "mode", "ctf") == "ctf"
+            and not ctf_decide_first
+        )
+        if (
+            generation >= 2
+            and getattr(self.challenge, "mode", "ctf") == "ctf"
+            and self.shared_graph is not None
+        ):
+            self._visit_restart_count = 0
+            if not (revisit_campaigns and (probe or fresh_enabled)):
+                self.shared_graph.sync_origin_fact(
+                    workspace_root=self.workspace_root,
+                )
+        if (
+            revisit_campaigns
+            and (probe or fresh_enabled)
+            and self.shared_graph is not None
+        ):
+            latest_wave = self.shared_graph.latest_visit_wave()
+            if int(latest_wave.get("generation") or 0) < generation:
+                digest = self.shared_graph.write_ctf_step_review_markdown(
+                    self.workspace_root,
+                    trigger=f"before_visit_{generation}",
+                    filename=f"prior_visit_g{generation - 1}_digest.md",
+                )
+                if digest is None:
+                    raise RuntimeError("prior_visit_digest_write_failed")
+                digest_ref = f"shared/{digest.name}"
+                active_facts = self.shared_graph._active_fact_seq_set()
+                cutoff = self.shared_graph.current_visit_wave_cutoff()
+                with self.shared_graph._lock:
+                    history = self.shared_graph._conn.execute(
+                        "SELECT seq,kind,payload FROM events WHERE challenge_id=? "
+                        "AND seq>? AND kind IN ('fact_added','dead_end') ORDER BY seq",
+                        (self.challenge.id, cutoff),
+                    ).fetchall()
+                    obs_rows = self.shared_graph._conn.execute(
+                        "SELECT observation_seq,intent_id,text,artifact_id,provenance_json "
+                        "FROM observations WHERE challenge_id=? AND observation_seq>? "
+                        "AND (admitted_fact_seq IS NULL OR admitted_fact_seq<=0) "
+                        "ORDER BY observation_seq DESC LIMIT 8",
+                        (self.challenge.id, cutoff),
+                    ).fetchall()
+                confirmed_index: list[str] = []
+                dead_end_index: list[str] = []
+                unanswered_index: list[str] = []
+                for event_seq, kind, raw in history:
+                    entry = json.loads(raw)
+                    if kind == EV_FACT_ADDED:
+                        if (int(event_seq) not in active_facts
+                                or entry.get("source") == "origin"):
+                            continue
+                        title = str(entry.get("fact") or "").partition("\n")[0]
+                        fields = [f"event_seq={event_seq}: {title}"]
+                        provenance = entry.get("evidence_provenance") or {}
+                        fields.extend(
+                            f"{key}={provenance[key]}" for key in ("enables", "target")
+                            if provenance.get(key)
+                        )
+                        confirmed_index.append("- " + "; ".join(fields))
+                    else:
+                        reason_head = str(entry.get("reason") or "").partition("\n")[0].strip()
+                        scope_head = str(entry.get("tested_scope") or "").partition("\n")[0].strip()
+                        dead_end_index.append(
+                            f"- event_seq={event_seq}: {reason_head}; "
+                            f"tested_scope={scope_head or 'unspecified'}"
+                        )
+                for obs_seq, obs_iid, obs_text, obs_aid, raw_prov in reversed(obs_rows):
+                    try:
+                        prov = json.loads(raw_prov or "{}")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        prov = {}
+                    handoff = prov.get("unanswered") if isinstance(prov, dict) else None
+                    q_text = (
+                        str(handoff.get("question") or "").partition("\n")[0].strip()
+                        if isinstance(handoff, dict) and handoff.get("question")
+                        else str(obs_text or "").partition("\n")[0].strip()
+                    )
+                    aid_str = (
+                        str(handoff.get("artifact_id") or obs_aid or "")
+                        if isinstance(handoff, dict)
+                        else str(obs_aid or "")
+                    )
+                    unanswered_index.append(
+                        f"- observation_{int(obs_seq)} (step={obs_iid or 'unknown'}"
+                        + (f", artifact={aid_str}" if aid_str else "")
+                        + f"): {q_text}"
+                    )
+                prior_summary = "\n".join([
+                    f"前序 Visit #{generation - 1} 的完整探索记录与产物索引: {digest_ref}",
+                    f"当前授权目标端点: {self.challenge.target or ''}",
+                    "前序波次已确认事实、能力与端点索引:",
+                    *(confirmed_index or ["- 无已确认非 origin 事实"]),
+                    "前序波次已排除方向与实验范围:",
+                    *(dead_end_index or ["- 无已记录的有界排除"]),
+                    *(
+                        ["前序波次未收束观察与进行中线索:", *unanswered_index]
+                        if unanswered_index else []
+                    ),
+                    "以上是既有模型记录的索引；需要原始证据时读取复盘中的 event_seq 与产物引用，按当前环境核验后复用。",
+                ])
+                self.shared_graph.reset_for_new_visit_wave(
+                    digest_path=digest_ref, prior_summary=prior_summary,
+                    generation=generation,
+                )
         pentest_contract = getattr(self.challenge, "pentest_contract", None)
         if pentest_contract is not None and self.shared_graph is not None:
             payload = pentest_contract.model_dump(mode="json")
@@ -162,13 +308,8 @@ async def start_coordinator(
     # historical fast/slow completion behavior for callers that need a blocking
     # race. Disabled (race_scout=False) → byte-identical to the plain loop.
     #
-    # run-75379 BUG④ — INVARIANT GUARD: race-scout only ever runs on a genuine
-    # COLD start. On a reopen/resume of a populated graph (prior intents/flags) we
-    # skip the race entirely and go straight to the Reason/Explore loop on the
-    # existing evidence. _is_cold_start is the load-bearing guard (explicit
-    # cold_start hint + a graph-state backstop), so a relaunch that forgot to pass
-    # race_scout=False / cold_start=False is still protected — the web reopen path
-    # (run_manager.resolve) keeps passing race_scout=False as harmless redundancy.
+    # Historical resumes skip cold-start scouting. A new CTF visit explicitly
+    # admits two independent campaigns alongside the coordinator.
     try:
         state.cold_start = self._is_cold_start()
     except BaseException:
@@ -180,7 +321,9 @@ async def start_coordinator(
         getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
         and self._auto_dispatch_enabled()
     )
-    if self.race_scout and state.cold_start and not ctf_decide_first:
+    if self.race_scout and (
+        revisit_campaigns or (state.cold_start and not ctf_decide_first)
+    ):
         try:
             # Adopt still-running race verifiers into the main loop's task
             # maps instead of cancelling them at the race boundary (they
@@ -362,8 +505,8 @@ async def prepare_main_loop(self, state: CoordinatorRunState) -> None:
     # A prior non-solved finalize parked this run's in-flight intents in
     # dispatch_state='resume'. No-op on a fresh run.
     if self.shared_graph is not None:
-        revived = self.shared_graph.revive_resume_intents(
-            actor="coordinator")
+        self.shared_graph._target_epoch = str(getattr(self, "_target_epoch", "") or "1")
+        revived = self.shared_graph.revive_resume_intents(actor="coordinator")
         if revived:
             await emit_bb(
                 "intent_state_changed", intent_id=",".join(revived),
@@ -373,39 +516,31 @@ async def prepare_main_loop(self, state: CoordinatorRunState) -> None:
         self.shared_graph is not None
         and getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
     ):
-        has_origin = any(
-            event.get("kind") == EV_FACT_ADDED
-            and str((event.get("payload") or {}).get("source") or "") == "origin"
-            for event in self.shared_graph.events()
-        )
-        if not has_origin:
-            contract = getattr(self.challenge, "task_contract", None)
-            instruction = str(
-                getattr(contract, "raw_instruction", "") or ""
-            ).strip() or str(self.challenge.description or "").strip()
-            origin_lines = ["题目信息:", instruction]
-            target = str(self.challenge.target or "").strip()
-            if target and target not in instruction:
-                origin_lines.extend(["", f"目标地址: {target}"])
-            attachments = [
-                str(getattr(item, "name", "") or "").strip()
-                for item in (getattr(contract, "attachments", None) or [])
-            ] or [
-                str(item).strip()
-                for item in (self.challenge.attachments or [])
-                if str(item).strip()
-            ]
-            if attachments:
-                origin_lines.append("附件: " + ", ".join(attachments))
-            origin_fact = "\n".join(origin_lines).strip()
-            origin_seq = self.shared_graph.add_evidence(
-                actor="origin",
-                source="origin",
-                fact=origin_fact,
-                verified=True,
-                confidence=1.0,
+        self.shared_graph.challenge = self.challenge
+        contract = getattr(self.challenge, "task_contract", None)
+        instruction = str(
+            getattr(contract, "raw_instruction", "") or ""
+        ).strip() or str(self.challenge.description or "").strip()
+        origin_lines = ["题目信息:", instruction]
+        target = str(self.challenge.target or "").strip()
+        if target and target not in instruction:
+            origin_lines.extend(["", f"目标地址: {target}"])
+        attachments = [
+            str(getattr(item, "name", "") or "").strip()
+            for item in (getattr(contract, "attachments", None) or [])
+        ] or [
+            str(item).strip()
+            for item in (self.challenge.attachments or [])
+            if str(item).strip()
+        ]
+        if attachments:
+            origin_lines.append("附件: " + ", ".join(attachments))
+        origin_fact = "\n".join(origin_lines).strip()
+        if hasattr(self.shared_graph, "sync_origin_fact"):
+            origin_seq, created_origin = self.shared_graph.sync_origin_fact(
+                origin_fact
             )
-            if origin_seq > 0:
+            if created_origin and origin_seq > 0:
                 await emit_bb(
                     "fact_added",
                     actor="origin",
@@ -413,6 +548,28 @@ async def prepare_main_loop(self, state: CoordinatorRunState) -> None:
                     source="origin",
                     fact=origin_fact,
                 )
+        else:
+            has_origin = any(
+                event.get("kind") == EV_FACT_ADDED
+                and str((event.get("payload") or {}).get("source") or "") == "origin"
+                for event in self.shared_graph.events()
+            )
+            if not has_origin:
+                origin_seq = self.shared_graph.add_evidence(
+                    actor="origin",
+                    source="origin",
+                    fact=origin_fact,
+                    verified=True,
+                    confidence=1.0,
+                )
+                if origin_seq > 0:
+                    await emit_bb(
+                        "fact_added",
+                        actor="origin",
+                        fact_seq=origin_seq,
+                        source="origin",
+                        fact=origin_fact,
+                    )
 
     # Auto CTF/pentest dispatches concrete Steps. On a resumed graph, dispatch
     # revived Steps directly; if none remain, let Decide plan from the carried
@@ -429,7 +586,10 @@ async def prepare_main_loop(self, state: CoordinatorRunState) -> None:
     )
     ctf_planned = False
     if ctf_decide_first:
-        requested_intents = self._ordinary_capacity_limit()
+        requested_intents = (
+            -1 if self._worker_concurrency_unlimited()
+            else self._ordinary_capacity_limit()
+        )
         await emit_bb(
             "reason_start",
             trigger=("ctf_cold_start" if state.cold_start else "ctf_resume"),
@@ -482,14 +642,43 @@ async def prepare_main_loop(self, state: CoordinatorRunState) -> None:
         if not self._ordinary_capacity_available(state.tasks):
             break
         try:
-            engine = self._pick_engine(
+            engine = await self._pick_engine(
                 running_engines(), state.healthy, role="bootstrap")
         except RuntimeError as exc:
             await emit_bb(
                 "worker_spawn_rejected", reason=str(exc), phase="bootstrap")
             break
         try:
-            worker = self._make_cli_worker(engine, mode="bootstrap")
+            worker = await self._make_cli_worker(engine, mode="bootstrap")
+        except WorkerRuntimeUnavailable as exc:
+            profile_id = str(getattr(exc, "profile_id", "") or engine)
+            failure_code = str(
+                getattr(exc, "code", "") or WorkerRuntimeUnavailable.code
+            )
+            failure_phase = str(
+                getattr(exc, "phase", "") or "worker_runtime_setup"
+            )
+            await emit_bb(
+                "worker_runtime_unavailable",
+                engine=str(engine),
+                profile_id=profile_id,
+                code=failure_code,
+                phase=failure_phase,
+                detail=str(exc),
+            )
+            if failure_phase == "worker_init" and hasattr(
+                self, "_quarantine_failed_profile"
+            ):
+                can_continue, _ = self._quarantine_failed_profile(
+                    state, str(engine), role="bootstrap", exc=exc
+                )
+                if can_continue:
+                    continue
+            state.runtime_terminal_failure = True
+            self._runtime_failure_code = failure_code
+            self._runtime_failure_phase = failure_phase
+            self._runtime_failure_detail = str(exc)
+            break
         except WorkerSpawnRejected as exc:
             await emit_bb(
                 "worker_spawn_rejected", reason=str(exc),

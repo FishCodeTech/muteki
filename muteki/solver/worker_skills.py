@@ -17,7 +17,6 @@ from pathlib import Path
 
 from muteki.solver.cli_prompts import (
     CTF_ROLE_CONTRACT,
-    _CTF_FACT_ASSERTION_NOTE,
     _CTF_WORKER_SYSTEM,
 )
 
@@ -27,6 +26,10 @@ _REPO_SKILL = (
 )
 _REPO_BROWSER_SKILL = (
     Path(__file__).resolve().parents[2] / "skills" / "muteki-agent-browser"
+)
+_REPO_CTF_AUX_SKILLS: tuple[str, ...] = (
+    "muteki-waf-bypass",
+    "muteki-ctf-local-playbook",
 )
 _CONTAINER_AGENT_BROWSER = "/usr/local/bin/agent-browser"
 _CONTAINER_CHROMIUM = "/usr/bin/chromium"
@@ -178,14 +181,76 @@ def stage_blackboard_skill(
                 staged.append(str(dest))
                 continue
             dest.symlink_to(link_target, target_is_directory=True)
+        except FileExistsError:
+            if dest.is_symlink():
+                staged.append(str(dest))
+                continue
         except OSError:
             # Filesystems without symlink support get a private physical copy for
             # local execution.  The container path is not readable on the host, so
             # that case must fail loudly instead of copying an unrelated source.
             if container:
                 raise
-            shutil.copytree(target, dest)
+            shutil.copytree(target, dest, dirs_exist_ok=True)
         staged.append(str(dest))
+    return staged
+
+
+def stage_ctf_auxiliary_skills(
+    workdir: str | Path,
+    *,
+    engine: str,
+    container: object | bool = False,
+    mode: str = "ctf",
+) -> list[str]:
+    """Expose bundled CTF reference skills (such as muteki-waf-bypass) inside a Worker's cwd."""
+    if str(mode or "ctf") != "ctf":
+        return []
+    root = Path(workdir).resolve()
+    skills_dir = _REPO_SKILL.parent
+    staged: list[str] = []
+    for skill_name in _REPO_CTF_AUX_SKILLS:
+        source = skills_dir / skill_name
+        if not (source / "SKILL.md").is_file():
+            continue
+        if container:
+            target = root / ".muteki-skills" / skill_name
+            target.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source / "SKILL.md", target / "SKILL.md")
+            image = str(getattr(container, "image", "") or "").strip()
+            if image:
+                # Lazy import: container_exec imports worker_skills at module load.
+                from muteki.solver.container_exec import _chown_tree_to_worker
+                _chown_tree_to_worker(str(target), image=image)
+        else:
+            target = source
+        for relative in project_skill_roots(engine):
+            skills_root = root / relative
+            dest = skills_root / skill_name
+            skills_root.mkdir(parents=True, exist_ok=True)
+            link_target = (
+                os.path.relpath(target, start=dest.parent)
+                if container else str(target)
+            )
+            try:
+                if dest.is_symlink():
+                    if os.readlink(dest) == link_target:
+                        staged.append(str(dest))
+                        continue
+                    dest.unlink()
+                elif dest.exists():
+                    staged.append(str(dest))
+                    continue
+                dest.symlink_to(link_target, target_is_directory=True)
+            except FileExistsError:
+                if dest.is_symlink():
+                    staged.append(str(dest))
+                    continue
+            except OSError:
+                if container:
+                    raise
+                shutil.copytree(target, dest, dirs_exist_ok=True)
+            staged.append(str(dest))
     return staged
 
 
@@ -233,7 +298,7 @@ def role_contract_filename(engine: str) -> str:
 
 
 def role_contract_body() -> str:
-    return f"{CTF_ROLE_CONTRACT}\n\n{_CTF_FACT_ASSERTION_NOTE}"
+    return CTF_ROLE_CONTRACT
 
 
 def role_contract_document() -> str:

@@ -14,6 +14,7 @@ import {
   collectConversationTools,
   type ConversationToolRecord,
 } from "./conversationEventViews";
+import { unqualifiedToolName } from "../chat/timeline/toolPresentation";
 
 export type ConversationAgentStatus =
   | "pending"
@@ -32,6 +33,7 @@ export interface ConversationAgentNodeView {
   role?: string | null;
   model?: string | null;
   turnId?: string | null;
+  /** Message in the viewed Thread that carries the delegation. */
   messageId?: string | null;
   callId?: string | null;
   sessionRef?: string | null;
@@ -53,6 +55,9 @@ export interface ConversationAgentNodeView {
   lineageDepth?: number | null;
   adapterId?: string | null;
   accessMode?: string | null;
+  effort?: string | null;
+  acceptanceCriteria?: string | null;
+  routingReason?: string | null;
   isolation?: string | null;
   worktreePath?: string | null;
   worktreeState?: string | null;
@@ -111,15 +116,14 @@ export function isShellLikeTool(record: ConversationToolRecord): boolean {
 }
 
 export function isDelegationTool(record: ConversationToolRecord): boolean {
-  if (record.isAgent) return true;
-  if (isShellLikeTool(record)) return false;
   const name = normalizeToolName(record.name || "");
-  // Muteki task CRUD is resource access. Only its worker-spawn tool delegates.
-  // MCP adapters may prefix the tool with a server namespace separated by __.
-  const toolName = name.split("__").at(-1) || name;
+  // Chat subagents come from their persisted child nodes, not gateway calls.
+  const toolName = unqualifiedToolName(record.name || "");
   if (toolName.startsWith("muteki_")) {
     return toolName === "muteki_spawn_run_worker";
   }
+  if (record.isAgent) return true;
+  if (isShellLikeTool(record)) return false;
   if (
     DELEGATION_NAME_MARKERS.some(
       (marker) =>
@@ -323,14 +327,20 @@ function appOwnedSubagentRoots(view?: ConversationView | null): ConversationAgen
     nickname: node.nickname,
     role: node.role,
     model: node.model,
+    // turn_id is the delegating turn of this Thread; message_id is the
+    // child's own reply, which lives in the child Thread.
     turnId: node.turn_id,
-    messageId: node.message_id,
+    messageId: null,
     callId: node.call_id,
     sessionRef: node.session_ref,
     status: node.status,
     request: node.request,
     result: node.result || node.error,
     error: node.error,
+    activity: node.activity,
+    toolUses: node.tool_uses,
+    totalTokens: node.total_tokens,
+    durationMs: node.duration_ms,
     startedAt: node.started_at,
     completedAt: node.completed_at,
     origin: node.origin || "app_owned",
@@ -338,6 +348,9 @@ function appOwnedSubagentRoots(view?: ConversationView | null): ConversationAgen
     lineageDepth: node.depth ?? null,
     adapterId: node.adapter_id,
     accessMode: node.access_mode,
+    effort: node.effort,
+    acceptanceCriteria: node.acceptance_criteria,
+    routingReason: node.routing_reason,
     isolation: node.isolation,
     worktreePath: node.worktree_path,
     worktreeState: node.worktree_state,
@@ -440,6 +453,36 @@ const AGENT_TERMINAL = new Set(["completed", "failed", "cancelled", "declined", 
 
 export function isAgentTerminal(status: string): boolean {
   return AGENT_TERMINAL.has(status);
+}
+
+/** Markdown reduced to the words a one-line preview shows; code spans stay verbatim. */
+function plainPreviewText(text: string): string {
+  const code: string[] = [];
+  return text
+    .replace(/[\uE000\uE001]/g, "")
+    .replace(/^\s*(?:```|~~~).*$/gm, " ")
+    .replace(/`([^`\n]+)`/g, (_, span: string) => `\uE000${code.push(span) - 1}\uE001`)
+    .replace(/^\s*([-*_])(?:\s*\1){2,}\s*$/gm, " ")
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/^\s{0,3}(?:#{1,6}\s+|>\s?|[-*+]\s+(?:\[[ xX]\]\s+)?)/gm, "")
+    .replace(/(\*\*|~~)(?=\S)([\s\S]*?\S)\1/g, "$2")
+    .replace(/(^|[^\w])__(?=\S)([\s\S]*?\S)__(?!\w)/g, "$1$2")
+    .replace(/(^|[^\w*])\*(?=\S)([^*\n]*?\S)\*(?![\w*])/g, "$1$2")
+    .replace(/\uE000(\d+)\uE001/g, (_, index: string) => code[Number(index)] ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Rows clamp the preview to a line or two, so only the start of a long result is reduced. */
+const PREVIEW_SOURCE_CHARS = 600;
+
+/** What a row says about an agent: its live activity, or how it ended. */
+export function agentPreviewText(agent: ConversationAgentNodeView): string {
+  const raw = isAgentTerminal(String(agent.status))
+    ? (agent.error || agent.result || agent.activity || "")
+    : (agent.activity || agent.request || "");
+  return plainPreviewText(raw.slice(0, PREVIEW_SOURCE_CHARS));
 }
 
 export interface AgentStatusCounts {

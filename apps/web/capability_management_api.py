@@ -380,7 +380,7 @@ def create_capability_management_router(
     )
 
     @router.get("")
-    async def overview() -> Any:
+    def overview() -> Any:
         extensions = _extension_sources(extension_service)
         tools = [
             {
@@ -422,8 +422,7 @@ def create_capability_management_router(
         browser_source = repo_root / "skills" / "muteki-agent-browser"
         browser_available = False
         if browser_enabled and (browser_source / "SKILL.md").is_file():
-            browser_available = await asyncio.to_thread(
-                container_agent_browser_available, WORKER_IMAGE)
+            browser_available = container_agent_browser_available(WORKER_IMAGE)
         legacy_copies = [
             {
                 "path": str(path),
@@ -556,7 +555,7 @@ def create_capability_management_router(
         }
 
     @router.put("/resources/{kind}/{resource_id}")
-    async def update_resource(
+    def update_resource(
         kind: str,
         resource_id: str,
         body: dict[str, Any] = Body(default_factory=dict),

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the SLIM muteki worker image (plain Ubuntu + reverse-connector + 8 agent CLIs).
+# Build the SLIM muteki worker image (plain Ubuntu + reverse-connector + 10 agent CLIs).
 # Local development helper only — formal multi-arch release goes through
 # .github/workflows/release-images.yml (do not docker push GHCR from here).
 # A lightweight alternative to docker/worker/build.sh for FAST testing — same two steps:
@@ -9,7 +9,7 @@
 #
 # Usage: ./docker/worker-slim/build.sh [repo] [version] [arch]
 #   repo:    image repository (default: muteki-worker-slim; e.g. ghcr.io/fishcodetech/muteki-worker-slim)
-#   version: version tag       (default: v0.4.5; GHCR release tags keep the leading v)
+#   version: version tag       (default: v0.4.6; GHCR release tags keep the leading v)
 #   arch:    amd64 | arm64     (default: HOST arch — arm64 on Apple Silicon)
 # Tags built: <repo>:<version> AND <repo>:latest.
 #
@@ -28,7 +28,7 @@
 set -euo pipefail
 
 REPO_IMAGE="${1:-muteki-worker-slim}"
-VERSION="${2:-v0.4.5}"
+VERSION="${2:-v0.4.6}"
 # Default arch = host arch (uname -m → docker/go naming). Override with 3rd arg.
 _host_arch="$(uname -m)"
 case "${_host_arch}" in
@@ -79,6 +79,9 @@ cp "$REPO/muteki/solver/offline_acp_bridge.py" "$HERE/offline_acp_bridge.py"
 cp "$REPO/muteki/solver/omp_offline_config.yml" "$HERE/omp_offline_config.yml"
 cp "$REPO/muteki/solver/kimi_offline_agent.md" "$HERE/kimi_offline_agent.md"
 cp "$REPO/muteki/solver/grok_offline_agent.md" "$HERE/grok_offline_agent.md"
+rm -rf -- "$HERE/muteki-runtime"
+mkdir -p "$HERE/muteki-runtime"
+cp -R "$REPO/muteki" "$HERE/muteki-runtime/muteki"
 chmod +x "$HERE/blackboard.py"
 
 # --platform linux/${ARCH} + --load forces the docker exporter into the local image
@@ -134,9 +137,9 @@ docker build --platform "linux/${ARCH}" --load \
   "${build_args[@]}" \
   -t "$TAG" -t "$LATEST" "$HERE"
 
-echo ">> [3/3] verifying eight container engines + core paths..."
+echo ">> [3/3] verifying ten container engines + core paths..."
 DIGEST="$(docker image inspect --format '{{.Id}}' "$TAG")"
 echo ">> image id: $DIGEST"
 "$REPO/scripts/verify_worker_image.sh" --image "$TAG" --variant slim --platform "linux/${ARCH}" \
   --versions-file "$HERE/.last-engine-versions.txt"
-echo ">> done: $TAG (+ $LATEST); 8 engines verified (local helper only — formal release uses release-images.yml)"
+echo ">> done: $TAG (+ $LATEST); 10 engines verified (local helper only — formal release uses release-images.yml)"

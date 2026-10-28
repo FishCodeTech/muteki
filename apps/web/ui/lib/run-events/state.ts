@@ -17,6 +17,8 @@ export function emptyDeck(runId: string): DeckState {
     terminal: [],
     chat: [],
     blackboard: {
+      challenger: { status: "idle" },
+      subGoals: [],
       intents: [],
       facts: [],
       observations: [],

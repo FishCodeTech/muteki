@@ -299,6 +299,9 @@ class OpenCodeServerAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
     context_compaction_events = True
     host_context_channel = "opencode_instructions"
 
+    chat_model_fields = ("model", "effort")
+    chat_model_reset_requires_restart = ("model",)
+
     def __init__(
         self,
         *,
@@ -419,6 +422,9 @@ class OpenCodeServerAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
         return int(process.returncode if process.returncode is not None else -1)
 
     # -- probe ----------------------------------------------------------------
+
+    def declared_chat_capabilities(self) -> AgentCapabilities:
+        return self._v2.declared_chat_capabilities()
 
     async def probe(self, request: ProbeRequest) -> AgentCapabilities:
         try:
@@ -622,6 +628,35 @@ class OpenCodeServerAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
             **fields,
         )
 
+    async def _src_permission(
+        self, handle: dict[str, Any], props: dict[str, Any], *,
+        request_id: str, session_id: str,
+    ) -> None:
+        from .src_policy import NativeToolError, authorize_native_tool
+        payload = dump_payload(self._permission_request(
+            handle, props, request_id=request_id,
+            agent_id=(handle.get("child_sessions") or {}).get(session_id) or ""))
+        record = self._tracker.get(handle["agent_session_id"])
+        try:
+            await authorize_native_tool(
+                self._tracker._store, thread_id=handle.get("thread_id"),
+                invocation_id=f"opencode:{handle['agent_session_id']}:{request_id}",
+                tool_name=str(payload.get("tool_name") or payload.get("title") or "tool"),
+                arguments=payload, action=str(payload.get("title") or "tool"),
+                approval_kind=str(payload.get("approval_kind") or "tool"),
+                adapter_id="opencode", run_id=record.run_id if record else None,
+                cwd=str(handle.get("cwd") or ""),
+                environment_generation=(record.execution_generation or 0) if record else 0,
+            )
+        except NativeToolError:
+            await self._auto_reply_permission(handle, request_id, "reject", session_id=session_id)
+            return
+        except Exception as exc:
+            self._emit_warning(handle, "opencode.src_policy_unavailable", str(exc))
+            await self._auto_reply_permission(handle, request_id, "reject", session_id=session_id)
+            return
+        await self._auto_reply_permission(handle, request_id, "once", session_id=session_id)
+
     def _handle_permission(
         self, handle: dict[str, Any], props: dict[str, Any]
     ) -> None:
@@ -636,6 +671,11 @@ class OpenCodeServerAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
         )
         session_id = str(props.get("sessionID") or "")
         agent_id = (handle.get("child_sessions") or {}).get(session_id) or ""
+        from .src_policy import src_task_id
+        if src_task_id(self._tracker._store, handle.get("thread_id")):
+            self._spawn(handle, self._src_permission(
+                handle, props, request_id=request_id, session_id=session_id))
+            return
         if access_mode == AccessMode.FULL_ACCESS.value:
             self._spawn(handle, self._auto_reply_permission(
                 handle, request_id, "once", session_id=session_id))

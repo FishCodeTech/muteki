@@ -152,7 +152,7 @@ async def dispatch_stage(self, state) -> str:
         excluded_engines = list(
             state.role_quarantined_engines.get(worker_role, set()))
         try:
-            engine = self._pick_engine(
+            engine = await self._pick_engine(
                 running_engines(), state.healthy, role=worker_role,
                 intent_id=iid, lane=intent_lane,
                 intent=intent,
@@ -241,7 +241,7 @@ async def dispatch_stage(self, state) -> str:
                 )
             if intent_lane:
                 worker_kwargs["lane"] = intent_lane
-            w = self._make_cli_worker(engine, **worker_kwargs)
+            w = await self._make_cli_worker(engine, **worker_kwargs)
             w.intent_worker_class = worker_class
             intent_batch = int(
                 state.ctf_intent_batches.get(iid, state.ctf_batch_id) or 0
@@ -276,14 +276,42 @@ async def dispatch_stage(self, state) -> str:
                     intent_id=iid, deferred=False, retired=True)
             continue
         except WorkerRuntimeUnavailable as exc:
-            # The selected isolation backend is broken for this Run. Retrying
-            # the same configuration cannot produce a Worker and must not be
-            # misreported as a clean no-progress end.
-            state.runtime_terminal_failure = True
-            await emit_bb(
-                "worker_runtime_unavailable", engine=str(engine),
-                intent_id=iid, detail=str(exc),
+            profile_id = str(getattr(exc, "profile_id", "") or engine)
+            failure_code = str(
+                getattr(exc, "code", "") or WorkerRuntimeUnavailable.code
             )
+            failure_phase = str(
+                getattr(exc, "phase", "") or "worker_runtime_setup"
+            )
+            await emit_bb(
+                "worker_runtime_unavailable",
+                engine=str(engine),
+                profile_id=profile_id,
+                code=failure_code,
+                phase=failure_phase,
+                intent_id=iid,
+                detail=str(exc),
+            )
+            if failure_phase == "worker_init" and hasattr(
+                self, "_quarantine_failed_profile"
+            ):
+                can_continue, immediate_capacity = (
+                    self._quarantine_failed_profile(
+                        state, str(engine), role=worker_role, exc=exc
+                    )
+                )
+                if can_continue:
+                    state.open_intents.append(intent)
+                    if immediate_capacity:
+                        scan_remaining += 1
+                    continue
+            # The selected isolation backend or all eligible profiles are broken
+            # for this Run. Retrying the same configuration cannot produce a
+            # Worker and must not be misreported as a clean no-progress end.
+            state.runtime_terminal_failure = True
+            self._runtime_failure_code = failure_code
+            self._runtime_failure_phase = failure_phase
+            self._runtime_failure_detail = str(exc)
             for other, active_solver in list(state.task_solvers.items()):
                 if not other.done():
                     self._cancel_solver(active_solver)

@@ -65,15 +65,6 @@ run 的真实状态回答。
 回答风格: 简洁、中文、直接。如果信息不足,直说"blackboard 里目前没有 X"或"统计块里没有 X"。
 """
 
-# Rough per-message char cap before we even send — keeps a runaway transcript
-# from blowing the flash model's window. The frontend truncates too; this is a
-# server-side second line of defense.
-_MAX_TRANSCRIPT_TURNS = 80
-_MAX_TRANSCRIPT_CHARS = 200000
-_MAX_TRANSCRIPT_SUMMARY_CHARS = 12000
-_MAX_QUESTION_CHARS = 2000
-
-
 @dataclass(frozen=True)
 class BtwWorkerPaths:
     """Paths that the `/btw` worker should inspect.
@@ -145,8 +136,8 @@ def build_btw_worker_prompt(
     a lossy graph summary. This is the main anti-distortion change: the worker can
     query SQLite/JSONL directly and decide which events are evidence versus leads.
     """
-    q = (question or "").strip()[:_MAX_QUESTION_CHARS]
-    hint = (context_hint or "").strip()[:400]
+    q = (question or "").strip()
+    hint = (context_hint or "").strip()
     transcript = sanitize_transcript(transcript or [])
 
     path_lines = [
@@ -309,7 +300,7 @@ async def stream_btw_worker_deltas(
 
 
 def sanitize_transcript(transcript: Any) -> list[dict[str, str]]:
-    """Validate + compact the caller-supplied multi-turn transcript."""
+    """Validate the caller-supplied multi-turn transcript without rewriting it."""
     if not isinstance(transcript, list):
         return []
     clean: list[dict[str, str]] = []
@@ -322,54 +313,7 @@ def sanitize_transcript(transcript: Any) -> list[dict[str, str]]:
         content = str(turn.get("content") or "").strip()
         if content:
             clean.append({"role": role, "content": content})
-    if not clean:
-        return []
-    if (len(clean) <= _MAX_TRANSCRIPT_TURNS
-            and sum(len(turn["content"]) for turn in clean) <= _MAX_TRANSCRIPT_CHARS):
-        return clean
-
-    anchor_index = next((
-        index for index, turn in enumerate(clean)
-        if turn["role"] == "user"
-    ), 0)
-    anchor = clean[anchor_index]
-    recent: list[dict[str, str]] = []
-    used = len(anchor["content"])
-    for turn in reversed(clean[anchor_index + 1:]):
-        if len(recent) >= _MAX_TRANSCRIPT_TURNS - 2:
-            break
-        cost = len(turn["content"])
-        if recent and used + cost > _MAX_TRANSCRIPT_CHARS - _MAX_TRANSCRIPT_SUMMARY_CHARS:
-            break
-        recent.append(turn)
-        used += cost
-    recent.reverse()
-    kept_ids = {id(turn) for turn in recent}
-    omitted = [
-        turn for turn in clean[anchor_index + 1:]
-        if id(turn) not in kept_ids
-    ]
-    summary_lines = []
-    summary_used = 0
-    for turn in omitted:
-        compact = " ".join(turn["content"].split())
-        line = f"{turn['role']}: {compact}"
-        if len(line) > _MAX_TRANSCRIPT_SUMMARY_CHARS:
-            line = (
-                f"{turn['role']}: [message omitted; {len(compact)} characters]"
-            )
-        if summary_lines and summary_used + len(line) > _MAX_TRANSCRIPT_SUMMARY_CHARS:
-            break
-        summary_lines.append(line)
-        summary_used += len(line)
-    summary = {
-        "role": "summary",
-        "content": (
-            f"Earlier /btw history ({len(omitted)} turns):\n"
-            + "\n".join(summary_lines)
-        ),
-    }
-    return [anchor, summary, *recent]
+    return clean
 
 
 def btw_messages(
@@ -386,14 +330,14 @@ def btw_messages(
     """
     sys_content = _BTW_SYSTEM
     if context_hint:
-        sys_content += f"\n操作员关注点: {context_hint[:400]}\n"
+        sys_content += f"\n操作员关注点: {context_hint}\n"
     sys_content += "\n=== 当前 run 状态快照 ===\n"
     sys_content += ctx_text or "(尚无 blackboard 数据 / graph 不可读)"
     sys_content += "\n=== 快照结束 ===\n"
 
     msgs: list[dict[str, Any]] = [{"role": "system", "content": sys_content}]
     msgs.extend(transcript)
-    msgs.append({"role": "user", "content": question[:_MAX_QUESTION_CHARS]})
+    msgs.append({"role": "user", "content": question})
     return msgs
 
 
@@ -530,7 +474,7 @@ def build_btw_run_stats_sync(jsonl_path: str) -> str:
     # ── workers ──
     if workers:
         parts.append(f"Worker 总数: {len(workers)}")
-        for wid, w in list(workers.items())[:12]:
+        for wid, w in workers.items():
             flag_mark = " ★找到flag" if w.get("found_flag") else ""
             parts.append(
                 f"  - {wid} [{w.get('engine','?')}] "
@@ -584,11 +528,11 @@ def build_btw_context_sync(
     if run_meta.get("flags"):
         parts.append(f"已收集 flags 数: {len(run_meta['flags'])}")
     if run_meta.get("awaiting_help"):
-        parts.append(f"有 worker 举手求助: {run_meta.get('help_text', '')[:200]}")
+        parts.append(f"有 worker 举手求助: {run_meta.get('help_text', '')}")
     workers = run_meta.get("workers") or []
     if workers:
         parts.append("Workers:")
-        for w in workers[:12]:
+        for w in workers:
             parts.append(
                 f"  - {w.get('id','?')} [{w.get('engine','?')}] "
                 f"状态={w.get('state','?')}"
@@ -623,7 +567,10 @@ def build_btw_context_sync(
             db_path=graph_db_path, challenge=challenge,
         )
         try:
-            summary = graph.to_summary(max_evidence=24, max_dead_ends=8)
+            summary = graph.to_summary(
+                max_evidence=10**9,
+                max_dead_ends=10**9,
+            )
             if summary and summary.strip():
                 parts.append("=== Facts / Dead-ends 摘要 ===")
                 parts.append(summary)
@@ -633,24 +580,24 @@ def build_btw_context_sync(
             opens = graph.open_goal_texts()
             if opens:
                 parts.append("=== Open Intents ===")
-                for g in opens[:10]:
-                    parts.append(f"  - {g[:200]}")
+                for g in opens:
+                    parts.append(f"  - {g}")
         except Exception:
             pass
         try:
             barren = graph.barren_concluded_goal_texts()
             if barren:
                 parts.append("=== 已尝试但无产出的方向 (dead-ends) ===")
-                for g in barren[:8]:
-                    parts.append(f"  - {g[:200]}")
+                for g in barren:
+                    parts.append(f"  - {g}")
         except Exception:
             pass
         try:
             cands = graph.active_candidates()
             if cands:
                 parts.append(f"=== 候选证据 (未验证) : {len(cands)} 条 ===")
-                for c in cands[:8]:
-                    f = (c.get("fact") or "")[:160]
+                for c in cands:
+                    f = c.get("fact") or ""
                     parts.append(f"  - {f}")
         except Exception:
             pass
@@ -658,8 +605,8 @@ def build_btw_context_sync(
             verified = graph.verified_evidence()
             if verified:
                 parts.append(f"=== 已验证证据 : {len(verified)} 条 ===")
-                for v in verified[:6]:
-                    f = (v.get("fact") or "")[:160]
+                for v in verified:
+                    f = v.get("fact") or ""
                     parts.append(f"  - {f}")
         except Exception:
             pass
@@ -670,17 +617,17 @@ def build_btw_context_sync(
         except Exception:
             pass
         try:
-            recent = graph.recent_events(limit=40)
+            recent = graph.recent_events(limit=10**9)
             if recent:
                 parts.append("=== 最近事件时间线 (最近 40 条,精简) ===")
-                for e in recent[-30:]:
+                for e in recent:
                     kind = e.get("kind", "?")
                     actor = e.get("actor", "?")
                     p = e.get("payload") or {}
                     tag = ""
                     if isinstance(p, dict):
                         tag = str(p.get("fact") or p.get("goal") or
-                                  p.get("text") or p.get("summary") or "")[:120]
+                                  p.get("text") or p.get("summary") or "")
                     parts.append(f"  [{e.get('seq','?')}] {kind} by {actor}: {tag}")
         except Exception:
             pass

@@ -1,6 +1,6 @@
 import type { ConversationThread } from "./useConversation";
 import type { InboxState } from "./sidebarInbox";
-import { attentionOwnerId, threadHasAttention, threadNeedsAction, type SubagentPending } from "./threadAttention";
+import { attentionOwnerId, threadHasAttention, threadNeedsAction, type SubagentActivity, type SubagentPending } from "./threadAttention";
 
 export interface ActivityPrefs {
   showPriority: boolean;
@@ -9,7 +9,7 @@ export interface ActivityPrefs {
 }
 
 export function buildSidebarActivity({
-  threads, activeThreadId, pinnedIds, inboxStates, subagentPending, prefs,
+  threads, activeThreadId, pinnedIds, inboxStates, subagentPending, subagentActivity, prefs,
   clearedAt, searchQuery, projectId, retainedPriorityIds,
 }: {
   threads: ConversationThread[];
@@ -17,6 +17,8 @@ export function buildSidebarActivity({
   pinnedIds: string[];
   inboxStates: Map<string, InboxState>;
   subagentPending: Map<string, SubagentPending[]>;
+  /** A root whose subagents are still in progress counts as running. */
+  subagentActivity?: Map<string, SubagentActivity>;
   prefs: ActivityPrefs;
   clearedAt: number;
   searchQuery: string;
@@ -30,7 +32,7 @@ export function buildSidebarActivity({
   const activeOwner = active ? attentionOwnerId(active, byId) || activeThreadId : activeThreadId;
   const needsAction = (thread: ConversationThread) => threadNeedsAction(thread) || subagentPending.has(thread.thread_id);
   const unread = (thread: ConversationThread) => Boolean(thread.state.unread) && thread.thread_id !== activeThreadId;
-  const running = (thread: ConversationThread) => Boolean(thread.state.running_turn_id);
+  const running = (thread: ConversationThread) => Boolean(thread.state.running_turn_id || subagentActivity?.get(thread.thread_id)?.active);
   const timestamp = (thread: ConversationThread) => Date.parse(thread.updated_at || thread.created_at || "") || 0;
   const candidates = threads.filter((thread) => (
     thread.state.status !== "archived"

@@ -58,6 +58,7 @@ from .subagents import (
     ERR_RECEIPT_UNFINALIZED,
     ERR_SPAWN_RECORD_INVALID,
     SPAWN_COMMAND,
+    SEND_COMMAND,
     SubagentService,
 )
 
@@ -558,6 +559,14 @@ class ConversationReceiptRecovery:
         return self._completed({"queue_id": queue_id, "queued": True,
                                 "queue_status": item.status})
 
+    async def _subagent_send(self, pending: PendingCommand) -> SideEffectResult:
+        result = await self._turn_send(pending)
+        if result.error is None:
+            _seq, added = self._request(pending, ev.EV_QUEUE_ADDED)
+            self._subagents.sync_node(added.aggregate_id)
+            result.output.update(self._subagents.snapshot(added.aggregate_id, include_text=False))
+        return result
+
     async def _turn_steer(self, pending: PendingCommand) -> SideEffectResult:
         _seq, requested = self._request(pending, "core.turn.steer_requested")
         return self._delivery_unknown(pending, turn_id=requested.payload.get("turn_id"))
@@ -765,11 +774,12 @@ SETTLERS: dict[str, Settler] = {
     "conversation.plan.amend": R._plan_amend,
     "conversation.agents.inject": R._no_side_effect,
     SPAWN_COMMAND: R._subagent_spawn,
+    SEND_COMMAND: R._subagent_send,
     CANCEL_COMMAND: R._subagent_cancel,
 }
 del R
 
-_MISSING = (set(COMMAND_TYPES) | {SPAWN_COMMAND, CANCEL_COMMAND}) - set(SETTLERS)
+_MISSING = (set(COMMAND_TYPES) | {SPAWN_COMMAND, SEND_COMMAND, CANCEL_COMMAND}) - set(SETTLERS)
 if _MISSING:
     raise RuntimeError(f"conversation command types without a restart settler: {sorted(_MISSING)}")
 

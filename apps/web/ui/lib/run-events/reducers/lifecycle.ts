@@ -27,9 +27,13 @@ export function reduceLifecycle(prev: DeckState, ev: MutekiEvent, s: DeckState):
         eventType: String(p.agent_event_type || "runtime.event"),
         adapter: String(p.runtime_adapter || "") || undefined,
         nativeType: String(p.native_type || "") || undefined,
-        payload: (p.runtime_payload && typeof p.runtime_payload === "object")
-          ? p.runtime_payload as Record<string, unknown>
-          : {},
+        payload: {
+          ...(p.runtime_payload && typeof p.runtime_payload === "object"
+            ? p.runtime_payload as Record<string, unknown> : {}),
+          ...(p.turn_id != null ? { turn_id: p.turn_id } : {}),
+          ...(p.agent_session_id != null ? { agent_session_id: p.agent_session_id } : {}),
+          ...(p.execution_generation != null ? { execution_generation: p.execution_generation } : {}),
+        },
         ts: ev.ts,
       }].slice(-500);
       return s;
@@ -45,7 +49,8 @@ export function reduceLifecycle(prev: DeckState, ev: MutekiEvent, s: DeckState):
       // races, and a hard-stopped race may never have emitted race_concluded.
       s.racing = false;
       s.verifying = 0;
-      if (firstStart) { s.startedAt = ev.ts; s.finishedAt = undefined; }
+      if (firstStart) s.startedAt = ev.ts;
+      s.finishedAt = undefined;
       if (p.challenge?.name && p.challenge.name !== s.runId) s.challengeName = p.challenge.name;
       if (typeof p.name_autogen === "boolean") s.challengeNameAutogen = p.name_autogen;
       s.category = p.challenge?.category ?? s.category;
@@ -94,7 +99,8 @@ export function reduceLifecycle(prev: DeckState, ev: MutekiEvent, s: DeckState):
       s.started = true;
       s.preparing = false;
       s.finished = false;
-      if (firstStart) { s.startedAt = ev.ts; s.finishedAt = undefined; }
+      if (firstStart) s.startedAt = ev.ts;
+      s.finishedAt = undefined;
       if (p.challenge?.name && p.challenge.name !== s.runId) s.challengeName = p.challenge.name;
       if (typeof p.name_autogen === "boolean") s.challengeNameAutogen = p.name_autogen;
       // Category comes from RUN_PREPARING (operator) or RUN_TITLED (Planner);

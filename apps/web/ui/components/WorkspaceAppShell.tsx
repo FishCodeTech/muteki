@@ -1,11 +1,12 @@
 "use client";
 
 import { usePathname } from "next/navigation";
-import type { ReactNode } from "react";
+import { Suspense, type ReactNode } from "react";
 
 import { LoginGate } from "@/components/LoginGate";
 import { WorkspaceFrame } from "@/components/WorkspaceNav";
 import { I18nProvider } from "@/lib/i18n";
+import { DesktopNavigationBridge } from "@/components/DesktopNavigationBridge";
 
 /** Keep the workspace navigation mounted while the active workspace changes. */
 export function WorkspaceAppShell({ children }: { children: ReactNode }) {
@@ -17,6 +18,7 @@ export function WorkspaceAppShell({ children }: { children: ReactNode }) {
 
   return (
     <I18nProvider>
+      <Suspense fallback={null}><DesktopNavigationBridge /></Suspense>
       <LoginGate>
         <WorkspaceFrame>{children}</WorkspaceFrame>
       </LoginGate>

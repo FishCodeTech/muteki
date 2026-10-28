@@ -7,6 +7,8 @@ import { cn } from "@/lib/cn";
 import { Badge, Button, Callout, IconButton, Spinner, Tooltip, toast, useReducedMotion } from "@/components/chat/ui";
 import { formatMessageTime } from "@/components/chat/timeline/MessageActions";
 import { ChangedFilesCard } from "@/components/chat/timeline/ChangedFilesCard";
+import { SourceChips } from "@/components/chat/timeline/SourceChips";
+import { isLocalPreviewUrl } from "@/lib/previewUrlDetect";
 import { formatTurnDuration } from "@/components/chat/timeline/toolPresentation";
 import { chatPanel } from "@/lib/chatPanelStore";
 import { turnIdFromDiffArtifactName } from "@/lib/conversationDiff";
@@ -19,9 +21,9 @@ import { TurnContextDialog } from "./TurnContextDialog";
 import { buildConversationAgentTree, type ConversationAgentNodeView } from "./conversationAgentTree";
 import { ConversationApproval, type UserInputResolvePayload } from "./ConversationApproval";
 import { ConversationProposedPlanCard } from "./ConversationPlanPanel";
-import { ConversationMinimap, type MinimapMarker } from "./ConversationMinimap";
+import { ConversationMinimap, replyExcerpt, type MinimapMarker } from "./ConversationMinimap";
 import { ConversationSummaryCard } from "./ConversationSummaryCard";
-import { collectConversationSources } from "./conversationSources";
+import { collectConversationSources, extractUrls } from "./conversationSources";
 import { ContextCards } from "../ai-native/context-cards";
 import { LoadingState } from "../ai-native/loading-state";
 import { Icon } from "../Icon";
@@ -71,6 +73,7 @@ import {
   timelineRowIndexForMessageId,
 } from "@/lib/conversationTimelineRows";
 import { runtimeIdentityKey } from "@/lib/conversationReadingPrefs";
+import { useConversationLocalPreview } from "@/lib/conversationPreviewMode";
 
 export interface ConversationTimelineProps {
   view: ConversationView;
@@ -144,6 +147,8 @@ export interface ConversationTimelineProps {
   onEnsureMessageVisible?: (messageId: string) => Promise<"ok" | "missing" | "cancelled" | "superseded">;
   /** Cross-thread jump-back: open thread without `?message=` so C08 restore applies. */
   onOpenThread?: (threadId: string) => void;
+  /** Rendered under a settled assistant turn (host-specific references or follow-ups). */
+  turnAccessory?: (turnId: string) => React.ReactNode;
 }
 
 interface AssistantRuntimeIdentity {
@@ -276,20 +281,19 @@ function AssistantIdentity({
     >
       {runtimeText ? (
         <Tooltip content={`运行接入点与模型：${runtimeText}`}>
-          <span className="inline-flex min-w-0 items-center gap-1.5 text-cx-fg-3" aria-label={`运行接入点与模型：${runtimeText}`}>
-            <span className="max-w-[180px] truncate font-medium text-cx-fg-2">{runtime?.endpoint}</span>
-            {runtime?.model ? (
-              <>
-                <span aria-hidden="true" className="text-cx-fg-4">/</span>
-                <span className="max-w-[220px] truncate font-cx-mono text-[12px]">{runtime.model}</span>
-              </>
-            ) : null}
+          <span className="min-w-0 max-w-[260px] truncate font-medium text-cx-fg-2" aria-label={`运行接入点与模型：${runtimeText}`}>
+            {runtime?.model || runtime?.endpoint}
           </span>
         </Tooltip>
       ) : (
         <span className="font-medium text-cx-fg-2">Agent</span>
       )}
-      {time ? <time dateTime={createdAt} className="cx-tabular text-[12px] text-cx-fg-4">{time}</time> : null}
+      {time ? (
+        <>
+          <span aria-hidden="true" className="-mx-1 text-cx-fg-4">·</span>
+          <time dateTime={createdAt} className="cx-tabular text-[12px] text-cx-fg-4">{time}</time>
+        </>
+      ) : null}
     </div>
   );
 }
@@ -375,6 +379,7 @@ export function ConversationTimeline({
   suppressRestore = false,
   onEnsureMessageVisible,
   onOpenThread,
+  turnAccessory,
 }: ConversationTimelineProps) {
   const streamRef = useRef<HTMLDivElement>(null);
   const composerCompactRef = useRef(composerCompact); composerCompactRef.current = composerCompact;
@@ -383,6 +388,40 @@ export function ConversationTimeline({
   const highlightedMessageIdRef = useRef(highlightedMessageId); highlightedMessageIdRef.current = highlightedMessageId;
   const virtualListRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
+  const reducedMotion = useReducedMotion();
+  const reducedMotionRef = useRef(reducedMotion); reducedMotionRef.current = reducedMotion;
+  const followFrameRef = useRef(0);
+  // While the view glides to the live edge it is briefly far from the bottom; that is not the reader leaving.
+  const glidingRef = useRef(false);
+  const stopGlide = useCallback(() => {
+    cancelAnimationFrame(followFrameRef.current);
+    glidingRef.current = false;
+  }, []);
+  /**
+   * Keeps the live edge in view as content grows. Growth of a line or a
+   * landing row or card glides the view down instead of snapping; a viewport
+   * resize or growth taller than a screen and a half pins at once.
+   */
+  const followLiveEdge = useCallback((element: HTMLElement, instant = false) => {
+    stopGlide();
+    const gap = element.scrollHeight - element.clientHeight - element.scrollTop;
+    if (instant || reducedMotionRef.current || gap > element.clientHeight * 1.5) {
+      element.scrollTop = element.scrollHeight;
+      return;
+    }
+    glidingRef.current = true;
+    const step = () => {
+      const remaining = element.scrollHeight - element.clientHeight - element.scrollTop;
+      if (!stickToBottomRef.current || remaining <= 0.5) {
+        glidingRef.current = false;
+        return;
+      }
+      element.scrollTop += Math.max(1, remaining * 0.2);
+      followFrameRef.current = requestAnimationFrame(step);
+    };
+    followFrameRef.current = requestAnimationFrame(step);
+  }, [stopGlide]);
+  useEffect(() => stopGlide, [stopGlide]);
   const loadingOlderRef = useRef(false);
   const pendingAnchorRef = useRef<{ height: number; top: number; threadId: string; firstMessageId?: string; succeeded: boolean } | null>(null);
   const scrollRequestRef = useRef(0);
@@ -406,6 +445,7 @@ export function ConversationTimeline({
     loading: boolean; error: string; hasMore: boolean; nextAfterSeq?: number | null; watermark?: number;
   }>>({});
   const processRef = useRef(processByTurn); processRef.current = processByTurn;
+  const localPreview = useConversationLocalPreview();
   const processRequestsRef = useRef(new Map<string, AbortController>());
   const [expandByTurn, setExpandByTurn] = useState<TurnExpandState>({});
 
@@ -415,21 +455,29 @@ export function ConversationTimeline({
 
   useEffect(() => subscribeJumpBack(() => setHasJumpBack(Boolean(peekJumpBack()))), []);
 
+  const initializedThreadRef = useRef<string | null>(null);
   useEffect(() => {
-    setHydratedEventsByTurn({});
-    setProcessByTurn({});
-    for (const controller of processRequestsRef.current.values()) controller.abort();
-    processRequestsRef.current.clear();
-    scrollRequestRef.current += 1;
-    pendingAnchorRef.current = null;
-    loadingOlderRef.current = false;
     const threadKey = view.thread.thread_id;
-    setExpandByTurn(readExpandState(threadKey));
-    restoreDoneRef.current = "";
-    restoringAnchorRef.current = false;
-    anchorRequestRef.current += 1;
-    lastAnchorRef.current = null;
-    setDismissedFailureKey("");
+    if (initializedThreadRef.current !== threadKey) {
+      initializedThreadRef.current = threadKey;
+      setHydratedEventsByTurn({});
+      setProcessByTurn({});
+      for (const controller of processRequestsRef.current.values()) controller.abort();
+      processRequestsRef.current.clear();
+      scrollRequestRef.current += 1;
+      pendingAnchorRef.current = null;
+      loadingOlderRef.current = false;
+      setExpandByTurn(readExpandState(threadKey));
+      restoreDoneRef.current = "";
+      restoringAnchorRef.current = false;
+      anchorRequestRef.current += 1;
+      lastAnchorRef.current = null;
+      setDismissedFailureKey("");
+    } else {
+      // Activity reconnects effects on reveal. Aborted fetches can be retried,
+      // while the retained transcript, expansion state and anchor stay intact.
+      setProcessByTurn(previous => Object.fromEntries(Object.entries(previous).map(([id, value]) => [id, value.loading ? { ...value, loading: false } : value])));
+    }
     return () => {
       for (const controller of processRequestsRef.current.values()) controller.abort();
       processRequestsRef.current.clear();
@@ -460,7 +508,7 @@ export function ConversationTimeline({
     if (!jumpTarget?.messageId) return;
     stickToBottomRef.current = false;
     setShowJumpToLatest(true);
-    const el = document.querySelector<HTMLElement>(
+    const el = streamRef.current?.querySelector<HTMLElement>(
       `[data-message-id="${CSS.escape(jumpTarget.messageId)}"]`,
     );
     // Use instant scroll — smooth animation races ResizeObserver re-anchors
@@ -512,7 +560,7 @@ export function ConversationTimeline({
   }, [highlightedMessageId, suppressRestore, view.thread.thread_id]);
 
   const updateReaderPosition = useCallback((element: HTMLElement) => {
-    const nearBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 96;
+    const nearBottom = glidingRef.current || element.scrollHeight - element.scrollTop - element.clientHeight < 96;
     setShowJumpToLatest(!nearBottom);
     return nearBottom;
   }, []);
@@ -623,8 +671,11 @@ export function ConversationTimeline({
   }, [onJumpToLatest, persistCurrentAnchor, view.thread.thread_id]);
 
 
+  const readingVisitRef = useRef<{ threadId: string; suppressRestore: boolean } | null>(null);
   useEffect(() => {
     const threadKey = view.thread.thread_id;
+    if (readingVisitRef.current?.threadId === threadKey && readingVisitRef.current.suppressRestore === suppressRestore) return;
+    readingVisitRef.current = { threadId: threadKey, suppressRestore };
     if (suppressRestore) {
       // C07 deep-link owns this visit — pin off the live edge so follow-latest
       // and re-anchor cannot undo `?message=` after the highlight timeout.
@@ -654,10 +705,11 @@ export function ConversationTimeline({
     const frame = requestAnimationFrame(() => {
       const element = streamRef.current;
       if (!element) return;
-      element.scrollTop = element.scrollHeight;
+      followLiveEdge(element);
     });
     return () => cancelAnimationFrame(frame);
   }, [
+    followLiveEdge,
     view.messages.length,
     highlightedMessageId,
     liveText.length,
@@ -676,7 +728,7 @@ export function ConversationTimeline({
   useEffect(() => {
     const element = streamRef.current;
     if (!element || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => {
+    const observer = new ResizeObserver((entries) => {
       reapplySavedAnchor();
       // The viewport shrinks frame by frame while the composer expands or
       // grows with its draft; keep the latest message pinned instead of
@@ -687,7 +739,7 @@ export function ConversationTimeline({
         && !loadingOlderRef.current
         && !String(highlightedMessageIdRef.current || "").trim()
       ) {
-        element.scrollTop = element.scrollHeight;
+        followLiveEdge(element, entries.some((entry) => entry.target === element));
       }
       updateReaderPosition(element);
       if (composerCompactRef.current && element.scrollHeight - element.clientHeight <= COMPOSER_EXPAND_DISTANCE_PX) {
@@ -698,7 +750,7 @@ export function ConversationTimeline({
     if (content) observer.observe(content);
     observer.observe(element);
     return () => observer.disconnect();
-  }, [reapplySavedAnchor, updateReaderPosition, view.thread.thread_id]);
+  }, [followLiveEdge, reapplySavedAnchor, updateReaderPosition, view.thread.thread_id]);
 
   // Already resting at the end produces no scroll event, so a downward wheel
   // there is the reader's request to return to the latest message.
@@ -706,13 +758,22 @@ export function ConversationTimeline({
     const element = streamRef.current;
     if (!element) return;
     const handleWheel = (event: WheelEvent) => {
+      // Scrolling up mid-glide hands the view back to the reader at once.
+      if (event.deltaY < 0) stopGlide();
       if (!composerCompactRef.current || event.deltaY <= 0) return;
       if (element.scrollHeight - element.scrollTop - element.clientHeight > COMPOSER_EXPAND_DISTANCE_PX) return;
       onComposerCompactChangeRef.current?.(false);
     };
     element.addEventListener("wheel", handleWheel, { passive: true });
-    return () => element.removeEventListener("wheel", handleWheel);
-  }, [view.thread.thread_id]);
+    // A touch or a scrollbar drag is the reader taking the view too.
+    element.addEventListener("touchstart", stopGlide, { passive: true });
+    element.addEventListener("pointerdown", stopGlide, { passive: true });
+    return () => {
+      element.removeEventListener("wheel", handleWheel);
+      element.removeEventListener("touchstart", stopGlide);
+      element.removeEventListener("pointerdown", stopGlide);
+    };
+  }, [stopGlide, view.thread.thread_id]);
 
   const foldEvents = useMemo(() => {
     const hydratedRows = Object.values(hydratedEventsByTurn);
@@ -772,6 +833,10 @@ export function ConversationTimeline({
     if (!turnId || processRequestsRef.current.has(turnId)) return;
     if (!more && hydratedRef.current[turnId] && !previous?.error) return;
     if (more && previous && !previous.hasMore && !previous.error) return;
+    if (localPreview) {
+      setProcessByTurn(current => ({ ...current, [turnId]: { loading: false, error: "", hasMore: false } }));
+      return;
+    }
     const threadId = view.thread.thread_id;
     const controller = new AbortController(); processRequestsRef.current.set(turnId, controller);
     setProcessByTurn(current => ({ ...current, [turnId]: { ...current[turnId], loading: true, error: "", hasMore: previous?.hasMore ?? false } }));
@@ -794,7 +859,7 @@ export function ConversationTimeline({
     } finally {
       if (processRequestsRef.current.get(turnId) === controller) processRequestsRef.current.delete(turnId);
     }
-  }, [view.thread.thread_id]);
+  }, [localPreview, view.thread.thread_id]);
 
   useEffect(() => {
     for (const [turnId, state] of Object.entries(expandByTurn)) {
@@ -1130,13 +1195,16 @@ export function ConversationTimeline({
     );
     const isSettled = ["completed", "failed", "interrupted", "aborted", "cancelled", "canceled"].includes(turnStatus);
     const hasText = segments.some((segment) => segment.kind === "text" && segment.text.trim());
-    const eventText = segments
-      .filter((segment) => segment.kind === "text")
+    const textOf = (keep: (segment: Extract<ConversationTurnSegment, { kind: "text" }>) => boolean) => segments
+      .filter((segment): segment is Extract<ConversationTurnSegment, { kind: "text" }> => segment.kind === "text" && keep(segment))
       .map((segment) => segment.text)
       .join("");
+    const eventText = textOf(() => true);
+    // Runtimes persist only the final answer, so commentary never matches it.
+    const eventAnswerText = textOf((segment) => segment.phase !== "commentary");
     const usePersistedText = Boolean(
       fallbackText
-      && (!hasText || (isSettled && fallbackText !== eventText)),
+      && (!hasText || (isSettled && fallbackText !== eventText && fallbackText !== eventAnswerText)),
     );
     const streamingText = isStreaming && turnId === view.state.running_turn_id ? liveText : "";
     // The event window is intentionally bounded. Once a turn settles, the
@@ -1144,7 +1212,10 @@ export function ConversationTimeline({
     // incomplete, so a refresh cannot replace the beginning with a suffix.
     const display: ConversationTurnSegment[] = usePersistedText
       ? [
-          ...segments.filter((segment) => segment.kind !== "text"),
+          ...segments.filter((segment) => (
+            segment.kind !== "text"
+            || (segment.phase === "commentary" && Boolean(segment.text.trim()) && !fallbackText.includes(segment.text.trim()))
+          )),
           {
           kind: "text",
           turnId,
@@ -1157,16 +1228,10 @@ export function ConversationTimeline({
     const turnRuntime = resolveTurnRuntime(turnId);
     const runtimeIdentity = resolveAssistantRuntimeIdentity(turnRuntime, credentials);
     const lastDisplay = display.at(-1);
-    const lastActivity = presentation.activity.at(-1);
-    const shouldShowWorking = Boolean(
-      isStreaming
-      && !presentation.answerText
-      && (!lastActivity || lastActivity.kind === "tools"),
-    );
-    const workingLabel = shouldShowWorking && !pendingApproval && !pendingInput
-      ? resolveConversationLiveActivity(presentation.activity).label
-      : "";
-    if (!display.length && !workingLabel && !isSettled) return null;
+    if (!display.length && !isStreaming && !isSettled) return null;
+    const answerSources = isSettled && !isStreaming
+      ? [...new Set(extractUrls(presentation.answerText))].filter((url) => !isLocalPreviewUrl(url))
+      : [];
     const turnDiffArtifact = isSettled
       ? diffArtifacts.find((artifact) => (
         (artifact as { turn_id?: string }).turn_id === turnId
@@ -1208,7 +1273,7 @@ export function ConversationTimeline({
           segments={presentation.activity}
           answerText={presentation.answerText}
           running={isStreaming}
-          workingLabel={workingLabel}
+          liveIndicator={!pendingApproval && !pendingInput}
           timing={timingByTurn[turnId]}
           turnCreatedAt={turnById.get(turnId)?.created_at}
           turnCompletedAt={turnById.get(turnId)?.completed_at}
@@ -1286,6 +1351,8 @@ export function ConversationTimeline({
             className="mt-1"
           />
         ) : null}
+        {answerSources.length ? <SourceChips urls={answerSources} className="mt-2" /> : null}
+        {turnAccessory && isSettled && !isStreaming ? turnAccessory(turnId) : null}
         {turnDiffArtifact && threadId ? (
           <ChangedFilesCard
             threadId={threadId}
@@ -1384,14 +1451,14 @@ export function ConversationTimeline({
     const frame = window.requestAnimationFrame(scrollToTarget);
     const retry = window.setTimeout(() => {
       scrollToTarget();
-      const el = document.querySelector(`[data-message-id="${CSS.escape(target)}"]`);
+      const el = streamRef.current?.querySelector(`[data-message-id="${CSS.escape(target)}"]`);
       if (el) {
         el.scrollIntoView({ block: "center", behavior: "auto" });
         highlightScrollDoneRef.current = target;
       }
     }, 80);
     const retry2 = window.setTimeout(() => {
-      const el = document.querySelector(`[data-message-id="${CSS.escape(target)}"]`);
+      const el = streamRef.current?.querySelector(`[data-message-id="${CSS.escape(target)}"]`);
       if (el) {
         el.scrollIntoView({ block: "center", behavior: "auto" });
         highlightScrollDoneRef.current = target;
@@ -1551,8 +1618,8 @@ export function ConversationTimeline({
       messageId: row.messageId,
       index,
       start: rowMeasurements[index]?.start ?? 0,
-      seq: turnById.get(row.turnId)?.seq,
       label: msg.text.replace(/\s+/g, " ").trim(),
+      preview: replyExcerpt(assistantMessagesByTurn.get(row.turnId)?.text || ""),
       tone: running && row.turnId && row.turnId === view.state.running_turn_id
         ? "running"
         : status === "failed"
@@ -1570,20 +1637,13 @@ export function ConversationTimeline({
   const lineage = view.lineage ?? view.state?.lineage ?? null;
   const lineageParentTitle = (view.lineage && view.lineage.parent_title) || "父会话";
 
+  // The cancel dialog shows a failed request in place, so only success toasts.
   const handleCancelSubagent = useCallback(async (subagentId: string) => {
-    try {
-      await sendConversationCommand(view.thread.thread_id, "conversation.subagent.cancel", {
-        subagent_id: subagentId,
-        reason: "user_cancelled",
-      });
-      toast({ title: "已请求取消子代理", tone: "neutral", duration: 2400 });
-    } catch (error) {
-      toast({
-        title: "取消子代理失败",
-        description: error instanceof Error ? error.message : String(error),
-        tone: "danger",
-      });
-    }
+    await sendConversationCommand(view.thread.thread_id, "conversation.subagent.cancel", {
+      subagent_id: subagentId,
+      reason: "user_cancelled",
+    });
+    toast({ title: "已请求取消子代理", tone: "neutral", duration: 2400 });
   }, [view.thread.thread_id]);
 
   return (

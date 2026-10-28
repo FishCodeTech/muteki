@@ -66,11 +66,18 @@ function normalizeDesktopRoute(value) {
   let url;
   try { url = new URL(value, SHELL_URL); } catch { throw invalid(); }
   if (url.protocol !== 'muteki-desktop:' || url.host !== 'app' || url.username || url.password
-      || !/^\/(chat(?:\/[^/]+)?|settings(?:\/[a-z-]+)?|ctf(?:\/.*)?|pentest(?:\/.*)?|competitions(?:\/.*)?|run\/[^/]+|task(?:\/.*)?|usage)?$/.test(url.pathname)) throw invalid();
+      || !/^\/(chat(?:\/[^/]+)?|src(?:\/tasks\/[^/]+(?:\/.*)?)?|settings(?:\/[a-z-]+)?|ctf(?:\/.*)?|pentest(?:\/.*)?|competitions(?:\/.*)?|run\/[^/]+(?:\/collaboration)?|task(?:\/.*)?|usage)?$/.test(url.pathname)) throw invalid();
   if (url.pathname.startsWith('/chat/')) {
     try { decodeURIComponent(url.pathname.split('/')[2]); } catch { throw invalid(); }
   }
   return url.pathname + url.search;
+}
+
+/** Sidebar modes share a document only within the same workspace. */
+function desktopRouteMode(value) {
+  const pathname = new URL(normalizeDesktopRoute(value), SHELL_URL).pathname;
+  if (/^\/(run|task)(\/|$)/.test(pathname)) return 'ctf';
+  return pathname.split('/')[1] || 'chat';
 }
 
 /** A hash is a transient location target, never part of shell history or saved routes. */
@@ -80,4 +87,4 @@ function desktopNavigationTarget(value) {
   return { route, hash };
 }
 
-module.exports = { DEFAULT_ORIGIN, SHELL_URL, parseWebUrl, normalizeOrigin, normalizeDesktopRoute, desktopNavigationTarget, sameOrigin, allowedNavigation, partitionFor, webPreferences };
+module.exports = { DEFAULT_ORIGIN, SHELL_URL, parseWebUrl, normalizeOrigin, normalizeDesktopRoute, desktopNavigationTarget, desktopRouteMode, sameOrigin, allowedNavigation, partitionFor, webPreferences };

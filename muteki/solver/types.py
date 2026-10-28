@@ -17,7 +17,9 @@ class SolverConfig:
     max_steps: int = 12
     code_timeout: float = 90.0
     temperature: Optional[float] = None
-    max_tokens: int = 8000
+    # None lets the provider use the selected model's real generation limit.
+    # A positive value is reserved for integrations with a physical API maximum.
+    max_tokens: Optional[int] = None
     stdout_limit: int = 6000  # chars of stdout shown inline before overflow->artifact
     # P-C: auto-trigger the Reason phase (planner + evidence audit) when the
     # shared graph's fact/dead-end count grows. Off when there's no shared graph

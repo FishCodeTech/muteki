@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import re
 import signal
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -22,14 +24,32 @@ from muteki.solver.worker_skills import (
     container_agent_browser_available,
     stage_agent_browser_skill,
     stage_blackboard_skill,
+    stage_ctf_auxiliary_skills,
     stage_role_contract,
 )
 
 _SAFE_HOST_ENV = {
     "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "TERM",
+    "PYTHONPATH",
+    "PLAYWRIGHT_BROWSERS_PATH", "PWTEST_CLI_GLOBAL_CONFIG",
     "SSH_AUTH_SOCK", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
     "CURL_CA_BUNDLE", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
     "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    "MUTEKI_HOSTED_KNOWLEDGE_ROOT",
+    "MUTEKI_HOSTED_POC_ROOT",
+    "MUTEKI_HOSTED_NUCLEI_TEMPLATES_ROOT",
+    "MUTEKI_HOSTED_KNOWLEDGE_INDEX",
+    "MUTEKI_HOSTED_WORDLISTS_ROOT",
+    "MUTEKI_HOSTED_RUNTIME_ROOT",
+    "MUTEKI_LOCAL_WORKER_ROOT",
+    "MUTEKI_MAC_WORKER_ROOT",
+    "MUTEKI_OFFLINE_KNOWLEDGE_DIR",
+    "MUTEKI_OFFLINE_KNOWLEDGE_INDEX",
+    "MUTEKI_POC_DIR",
+    "POC_DIR",
+    "NUCLEI_TEMPLATES",
+    "MUTEKI_SECLISTS_DIR",
+    "KIMI_CODE_EXPERIMENTAL_FLAG",
 }
 _CONTROL_SECRET_ENV = {
     "MUTEKI_WEB_PASSWORD", "MUTEKI_CONTROL_TOKEN", "TSEC_AGENT_TOKEN",
@@ -38,6 +58,32 @@ _CONTROL_SECRET_ENV = {
 _SCOPED_WORKER_SECRET_ENV = {
     "MUTEKI_CAPABILITY_TOKEN", "MUTEKI_CAPABILITY_BEARER_TOKEN",
 }
+
+
+def _worker_execution_deadline_unix(self) -> float | None:
+    """Project the original live lease, leaving only its cleanup tail unused."""
+    budget = getattr(self, "execution_budget", None)
+    try:
+        if budget is not None:
+            deadline = min(
+                budget.deadline_utc.timestamp(),
+                time.time() + budget.remaining_seconds(),
+            ) - budget.finalization_seconds
+        elif getattr(self, "campaign_mode", False):
+            deadline = getattr(self, "_campaign_execution_deadline_unix", None)
+        else:
+            return None
+        if deadline is None:
+            return None
+        deadline = float(deadline)
+        if not math.isfinite(deadline):
+            raise ValueError("Worker tool deadline must be finite")
+        return deadline
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise LaunchContractError(
+            f"Worker execution deadline is invalid: {exc}",
+            code=LAUNCH_CODE_ENVIRONMENT, source="worker_execution_deadline",
+        ) from exc
 
 
 def _claude_uses_bare(driver: Any) -> bool:
@@ -122,6 +168,12 @@ def _worker_env(self, cwd: Optional[str] = None) -> dict:
                 ),
                 mode=str(getattr(self.challenge, "mode", "ctf")),
             )
+            stage_ctf_auxiliary_skills(
+                skill_workdir,
+                engine=self.driver.name,
+                container=self.container,
+                mode=str(getattr(self.challenge, "mode", "ctf") or "ctf"),
+            )
             stage_agent_browser_skill(
                 skill_workdir, engine=self.driver.name, container=self.container,
                 mode=str(getattr(self.challenge, "mode", "ctf") or "ctf"),
@@ -166,31 +218,42 @@ def _worker_env(self, cwd: Optional[str] = None) -> dict:
     # container Workers.  The role checks below grant back only the capabilities
     # assigned to this Worker.
     for controlled_name in (
+        "MUTEKI_TSECBENCH_RESTART_URL", "MUTEKI_TSECBENCH_RESTART_TOKEN",
         "MUTEKI_BLACKBOARD_DB",
         "MUTEKI_BLACKBOARD_INGRESS_DIR", "MUTEKI_BLACKBOARD_PROFILE",
         "MUTEKI_BLACKBOARD_ROLE",
     ):
         env[controlled_name] = ""
+    env["MUTEKI_TARGET_RESTART_AVAILABLE"] = "1" if callable(getattr(self, "_target_restarter", None)) else ""
     if not bool(getattr(self.challenge, "allow_operator_input", True)):
         env["MUTEKI_BLACKBOARD_PROFILE"] = "autonomous"
     state_root = Path(cwd or self._workdir).resolve() if (cwd or self._workdir) else None
     if state_root is not None:
         temp_host = state_root / ".tmp"
         temp_host.mkdir(parents=True, exist_ok=True)
+        cache_host = state_root / ".cache"
+        cache_host.mkdir(parents=True, exist_ok=True)
         if self.container is not None:
             from muteki.solver.container_exec import _chown_tree_to_worker
 
             _chown_tree_to_worker(str(temp_host), image=self.container.image)
+            _chown_tree_to_worker(str(cache_host), image=self.container.image)
         temp_path = str(temp_host)
+        cache_path = str(cache_host)
         mapper = getattr(self.container, "to_container_path", None)
         if callable(mapper):
             try:
                 temp_path = mapper(temp_path)
             except Exception:
                 pass
+            try:
+                cache_path = mapper(cache_path)
+            except Exception:
+                pass
         env["TMPDIR"] = temp_path
         env["TMP"] = temp_path
         env["TEMP"] = temp_path
+        env.setdefault("XDG_CACHE_HOME", cache_path)
     if self.driver.name == "opencode" and state_root is not None:
         opencode_root = state_root / ".muteki-opencode"
         for dirname in ("data", "config", "cache"):
@@ -270,23 +333,24 @@ def _worker_env(self, cwd: Optional[str] = None) -> dict:
         if browser_enabled:
             env["AGENT_BROWSER_EXECUTABLE_PATH"] = "/usr/bin/chromium"
     if (
-        self.driver.name == "pi"
+        self.driver.name in {"pi", "omp"}
         and env["MUTEKI_CHALLENGE_MODE"] in {"ctf", "pentest"}
-        and self.mode in {"explore", "fact_verifier"}
+        and self.mode in {"explore", "bootstrap", "fact_verifier"}
     ):
-        env["MUTEKI_PI_SYSTEM_PROMPT"] = (
-            pentest_worker_system(browser_enabled=browser_enabled) if env["MUTEKI_CHALLENGE_MODE"] == "pentest"
+        worker_sys = (
+            pentest_worker_system(browser_enabled=browser_enabled)
+            if env["MUTEKI_CHALLENGE_MODE"] == "pentest"
             else _CTF_WORKER_SYSTEM
         )
-    if (
-        self.driver.name == "omp"
-        and env["MUTEKI_CHALLENGE_MODE"] in {"ctf", "pentest"}
-        and self.mode in {"explore", "fact_verifier"}
-    ):
-        env["MUTEKI_OMP_SYSTEM_PROMPT"] = (
-            pentest_worker_system(browser_enabled=browser_enabled) if env["MUTEKI_CHALLENGE_MODE"] == "pentest"
-            else _CTF_WORKER_SYSTEM
-        )
+        if self.mode == "fact_verifier" and env["MUTEKI_CHALLENGE_MODE"] == "ctf":
+            worker_sys = "\n".join(
+                line for line in worker_sys.splitlines()
+                if "submit-flag" not in line and "submit_flag" not in line
+            )
+        if self.driver.name == "pi":
+            env["MUTEKI_PI_SYSTEM_PROMPT"] = worker_sys
+        else:
+            env["MUTEKI_OMP_SYSTEM_PROMPT"] = worker_sys
     env["MUTEKI_BLACKBOARD_ROLE"] = (
         "review" if self.mode == "review"
         else "verifier" if self.mode == "fact_verifier"
@@ -313,10 +377,19 @@ def _worker_env(self, cwd: Optional[str] = None) -> dict:
     env["NO_PROXY"] = "*"
     env["no_proxy"] = "*"
     env["MUTEKI_BLACKBOARD_SCRIPT"] = self._blackboard_script_path(cwd)
+    env["MUTEKI_WORKER_EXECUTION_MODE"] = (
+        "campaign" if getattr(self, "campaign_mode", False) else "step")
+    env["MUTEKI_SETTLEMENT_ACTIVE"] = (
+        "1" if bool(getattr(self, "_session_handoff_active", False)) else "")
+    env["MUTEKI_PLATFORM_CONFIRMATION_REQUIRED"] = (
+        "1" if getattr(self.challenge, "platform_confirmation_required", False) else "0")
+    deadline = _worker_execution_deadline_unix(self)
+    env["MUTEKI_EXECUTION_DEADLINE_UNIX"] = (
+        str(deadline) if deadline is not None else "")
     if cwd and (self.mode != "respond"
                 or str(self.hitl_cmd.get("action") or "") == "mark_false"):
         mapper = getattr(self.container, "to_container_path", None)
-        ingress_host = Path(cwd).resolve() / ".muteki-blackboard-ingress"
+        ingress_host = Path(cwd).resolve() / ".muteki-blackboard-ingress" / self.solver_id
         ingress_host.mkdir(parents=True, exist_ok=True)
         if self.container is not None:
             from muteki.solver.container_exec import _chown_tree_to_worker

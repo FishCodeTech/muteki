@@ -58,7 +58,7 @@ function IntentDetail({
             onSelect={onSelectKnowledge}
           />
         </dd>
-        <dt>{t("collab.field.status")}</dt><dd>{intentStatusLabel(intent.dispatchState || intent.status, t)}</dd>
+        <dt>{t("collab.field.status")}</dt><dd>{intentStatusLabel(intent.dispatchState && intent.dispatchState !== "active" ? intent.dispatchState : intent.status, t)}</dd>
         {intent.requestedPriority && <><dt>{t("collab.field.requestedPriority")}</dt><dd>{intent.requestedPriority}</dd></>}
         {intent.priority !== undefined && <><dt>{t("collab.field.effectivePriority")}</dt><dd>{intent.priority}</dd></>}
         {intent.priorityReason && <><dt>{t("collab.field.priorityReason")}</dt><dd>{intent.priorityReason}</dd></>}
@@ -573,7 +573,7 @@ export function AgentInspector({
   );
   const isWorker = isCollaborationWorker(agent);
   const inspectorTabs: InspectorTab[] = agent.role === "decision" ? ["overview", "decisions", "relations"]
-    : agent.role === "source" ? ["overview", "knowledge", "relations"]
+    : agent.role === "source" || agent.role === "challenger" ? ["overview", "knowledge", "relations"]
     : isWorker ? INSPECTOR_TABS : COORDINATOR_INSPECTOR_TABS;
   const activeTab = inspectorTabs.includes(tab) ? tab : "overview";
   const searchedKnowledge = useMemo(
@@ -604,7 +604,7 @@ export function AgentInspector({
         <span className="collab-inspector-avatar" aria-hidden="true">
           {display.engineKey
             ? <EngineLogo engine={display.engineKey} size={20} />
-            : <Icon name={agent.role === "decision" ? "sparkles" : agent.role === "source" ? "file" : "network"} size={18} />}
+            : <Icon name={agent.role === "decision" || agent.role === "challenger" ? "sparkles" : agent.role === "source" ? "file" : "network"} size={18} />}
         </span>
         <span>
           <strong>{unselected ? t("collab.runOverview") : display.title}</strong>
@@ -672,6 +672,20 @@ export function AgentInspector({
             </div>
           </section>
         )}
+        {activeTab === "overview" && agent.role === "challenger" && (
+          <section className="collab-detail-section">
+            <h3>{t("collab.role.challenger")}</h3>
+            <p className="collab-section-empty">{t("collab.challenger.description")}</p>
+            <dl className="collab-runtime-detail">
+              <dt>{t("collab.field.status")}</dt><dd>{statusLabel(agent, t, canvasMode)}</dd>
+              <dt>{t("collab.workspace.tasks")}</dt><dd>{agent.challenger?.proposed ?? 0}</dd>
+              {agent.startedAt && <><dt>{t("collab.field.started")}</dt><dd><EventStamp ts={agent.startedAt} /></dd></>}
+              {agent.endedAt && <><dt>{t("collab.field.finished")}</dt><dd><EventStamp ts={agent.endedAt} /></dd></>}
+            </dl>
+            {agent.challenger?.error && <p className="tone-danger">{agent.challenger.error}{agent.challenger.code ? ` · ${agent.challenger.code}` : ""}</p>}
+            {agent.knowledge.map((item) => <KnowledgeRow key={item.id} item={item} actor={display.title} selected={false} onSelect={onSelectRow} mode={canvasMode} />)}
+          </section>
+        )}
         {activeTab === "overview" && agent.role === "source" && (
           <section className="collab-detail-section">
             <h3>{t("collab.source.title")}</h3>
@@ -679,7 +693,7 @@ export function AgentInspector({
             {agent.knowledge.map((item) => <KnowledgeRow key={item.id} item={item} actor={display.title} selected={false} onSelect={onSelectRow} mode={canvasMode} />)}
           </section>
         )}
-        {activeTab === "overview" && agent.role !== "decision" && agent.role !== "source" && (isWorker
+        {activeTab === "overview" && agent.role !== "decision" && agent.role !== "source" && agent.role !== "challenger" && (isWorker
           ? <WorkerOverview agent={agent} display={display} actorName={actorName} knowledge={knowledge} onSelectKnowledge={onSelectKnowledge} t={t} mode={canvasMode} />
           : <CoordinatorOverview deck={deck} agent={agent} runStats={runStats} onViewActivity={() => onTab("activity")} t={t} mode={canvasMode} />)}
         {activeTab === "knowledge" && (

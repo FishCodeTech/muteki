@@ -1,11 +1,15 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { cn } from "@/lib/cn";
+import { effectiveServiceTier, modelEffortLevels, modelServiceTiers, rememberServiceTier } from "@/lib/modelReasoning";
+import type { ConversationCredentialModel } from "@/lib/useConversation";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import { isMacPlatform, matchesBinding, shortcutBinding, useShortcutBindings } from "@/lib/shortcutBindings";
 import { Icon, type IconName } from "@/components/Icon";
-import { Menu, MenuItem, MenuLabel, Tooltip, splitShortcut } from "@/components/chat/ui";
+import { Menu, MenuItem, MenuLabel, Popover, Tooltip, splitShortcut, useControllableOpen } from "@/components/chat/ui";
+import { ComposerEffortSlider, serviceTierLabel } from "./ComposerEffortSlider";
+import { ComposerSpeedIcon } from "./ComposerSpeedIcon";
 
 const EFFORT_LABELS: Record<string, string> = {
   "": "默认", none: "关闭", minimal: "极低", low: "低", medium: "中",
@@ -47,29 +51,53 @@ export interface ConversationComposerModesProps {
   selectedCredentialId: string;
   selectedModel: string;
   selectedAccessMode: string;
+  selectedModelMetadata?: ConversationCredentialModel;
+  selectedEffort?: string;
+  selectedServiceTier?: string;
   accessModes: string[];
   accessModeReason?: string;
-  onSelect: (params: { credentialId: string; model: string; accessMode?: string }) => void;
+  onSelect: (params: { credentialId: string; model: string; effort?: string; serviceTier?: string; accessMode?: string }) => void;
   /** Per-thread interaction-mode preference; the toggle renders only when onInteractionModeChange is set. */
   interactionMode?: "default" | "plan";
   /** Resolved plan_mode capability of the selected runtime; false disables the toggle with a reason. */
   planModeAvailable?: boolean;
   planModeReason?: string;
   onInteractionModeChange?: (mode: "default" | "plan") => void;
+  effortOpen?: boolean;
+  onEffortOpenChange?: (open: boolean) => void;
+  accessOpen?: boolean;
+  onAccessOpenChange?: (open: boolean) => void;
   className?: string;
 }
 
-/** Plan mode and approval mode beside the send button; thinking effort lives in the model picker. */
+/** Model-specific thinking, plan mode and approval controls beside the send button. */
 export function ConversationComposerModes({
-  selectedCredentialId, selectedModel, selectedAccessMode, accessModes, accessModeReason = "", onSelect,
-  interactionMode = "default", planModeAvailable = false, planModeReason = "", onInteractionModeChange, className,
+  selectedCredentialId, selectedModel, selectedModelMetadata, selectedEffort = "", selectedServiceTier = "", selectedAccessMode, accessModes, accessModeReason = "", onSelect,
+  interactionMode = "default", planModeAvailable = false, planModeReason = "", onInteractionModeChange, effortOpen: effortOpenProp, onEffortOpenChange, accessOpen: accessOpenProp, onAccessOpenChange, className,
 }: ConversationComposerModesProps) {
   const compact = useMediaQuery(COMPACT_MQ);
   const bindings = useShortcutBindings();
-  const [accessOpen, setAccessOpen] = useState(false);
+  const [accessOpen, setAccessOpen] = useControllableOpen(accessOpenProp, false, onAccessOpenChange);
+  const [effortOpen, setEffortOpen] = useControllableOpen(effortOpenProp, false, onEffortOpenChange);
+  const effortLevels = modelEffortLevels(selectedModelMetadata);
+  const serviceTiers = modelServiceTiers(selectedModelMetadata);
+  const activeTier = effectiveServiceTier(selectedModelMetadata, selectedServiceTier);
+  const activeTierMeta = serviceTiers.find((tier) => tier.id === activeTier);
+  const hasEffort = effortLevels.length > 0;
+  const showEffort = hasEffort || serviceTiers.length > 0;
+  const activeEffort = selectedEffort === "default" ? "" : selectedEffort;
+  const effortUnavailable = Boolean(hasEffort && activeEffort && !effortLevels.includes(activeEffort));
+  const declaredDefault = selectedModelMetadata?.reasoning?.default || "";
+  const modelDefault = effortLevels.includes(declaredDefault) ? declaredDefault : "";
+  const labelOf = (level: string) => selectedModelMetadata?.reasoning?.kind === "variant" && level ? level : effortLabelOf(level);
+  const effortSummary = [
+    hasEffort ? effortUnavailable ? "思考档位不可用，请重新选择" : `思考：${activeEffort ? labelOf(activeEffort) : modelDefault ? `${labelOf(modelDefault)}（默认）` : "跟随模型默认"}` : "",
+    serviceTiers.length ? [`速度：${serviceTierLabel(activeTierMeta)}`, activeTierMeta?.description].filter(Boolean).join(" · ") : "",
+  ].filter(Boolean).join(" · ");
   const showAccess = accessModes.length > 0;
-  const showInteractionMode = typeof onInteractionModeChange === "function";
   const planMode = interactionMode === "plan";
+  // A runtime without plan mode gets no toggle; it stays visible while a plan turn needs a way back.
+  const showInteractionMode = typeof onInteractionModeChange === "function" && (planMode || planModeAvailable);
   const planToggleDisabled = !planMode && !planModeAvailable;
   const planSummary = planMode
     ? (planModeAvailable
@@ -84,8 +112,10 @@ export function ConversationComposerModes({
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const mac = isMacPlatform();
-      if (showAccess && matchesBinding(event, shortcutBinding("accessPicker"), mac)) {
-        event.preventDefault(); setAccessOpen((value) => !value);
+      if (showEffort && matchesBinding(event, shortcutBinding("effortPicker"), mac)) {
+        event.preventDefault(); setEffortOpen(!effortOpen); setAccessOpen(false);
+      } else if (showAccess && matchesBinding(event, shortcutBinding("accessPicker"), mac)) {
+        event.preventDefault(); setAccessOpen(!accessOpen); setEffortOpen(false);
       } else if (
         showInteractionMode
         && !planToggleDisabled
@@ -100,9 +130,9 @@ export function ConversationComposerModes({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [showAccess, showInteractionMode, planToggleDisabled, interactionMode, onInteractionModeChange]);
+  }, [showEffort, showAccess, effortOpen, accessOpen, setEffortOpen, setAccessOpen, showInteractionMode, planToggleDisabled, interactionMode, onInteractionModeChange]);
 
-  if (!showAccess && !showInteractionMode) return null;
+  if (!showEffort && !showAccess && !showInteractionMode) return null;
 
   const chooseAccess = (mode: string) => {
     if (mode === activeAccess || !accessModes.includes(mode)) return;
@@ -138,13 +168,55 @@ export function ConversationComposerModes({
           </span>
         </Tooltip>
       ) : null}
+      {showEffort ? (
+        <Tooltip content={effortSummary} shortcut={splitShortcut(bindings.effortPicker)} disabled={effortOpen}>
+          <span className="inline-flex min-w-0">
+            <Popover
+              open={effortOpen}
+              onOpenChange={(open) => { setEffortOpen(open); if (open) setAccessOpen(false); }}
+              placement="top-end"
+              ariaLabel={hasEffort ? serviceTiers.length ? "思考强度与速度" : "思考强度" : "速度"}
+              className="w-[300px] max-w-[calc(100vw-24px)]"
+              trigger={(
+                <button type="button" aria-label={effortSummary} aria-keyshortcuts="Meta+Shift+E"
+                  className={cn(controlClass, effortUnavailable && "text-cx-warning")}
+                  data-testid="composer-effort-control">
+                  {hasEffort && !activeTierMeta ? <Icon name="brain" size={14} className="shrink-0" /> : (
+                    <ComposerSpeedIcon tier={activeTierMeta} size={14} className={activeTierMeta ? "text-cx-accent" : undefined} />
+                  )}
+                  <span className="max-w-24 truncate">{hasEffort ? effortUnavailable ? "重选思考" : compact ? "思考" : `思考 · ${labelOf(activeEffort || modelDefault)}` : compact ? "速度" : `速度 · ${serviceTierLabel(activeTierMeta)}`}</span>
+                  <Icon name="chevronDown" size={12} className="shrink-0 text-cx-fg-4" />
+                </button>
+              )}
+            >
+              {effortUnavailable ? <p role="status" className="px-3.5 pt-3 text-xs text-cx-warning">当前模型不支持已保存的档位，请重新选择。</p> : null}
+              <ComposerEffortSlider
+                key={`${selectedCredentialId}:${selectedModel}`}
+                levels={effortLevels}
+                value={activeEffort}
+                modelDefault={modelDefault}
+                modelLabel={selectedModelMetadata?.label || selectedModel}
+                labelOf={labelOf}
+                onChange={(level) => onSelect({ credentialId: selectedCredentialId, model: selectedModel, effort: level })}
+                serviceTiers={serviceTiers}
+                serviceTier={activeTier}
+                onServiceTierChange={(tier) => {
+                  if (tier === activeTier || (tier && !serviceTiers.some((item) => item.id === tier))) return;
+                  rememberServiceTier(tier);
+                  onSelect({ credentialId: selectedCredentialId, model: selectedModel, serviceTier: tier });
+                }}
+              />
+            </Popover>
+          </span>
+        </Tooltip>
+      ) : null}
       {showInteractionMode && showAccess ? <span aria-hidden className="mx-0.5 h-4 w-px shrink-0 bg-cx-border-subtle" /> : null}
       {showAccess ? (
         <Tooltip content={accessUnavailable ? accessModeReason || "当前权限模式不可用，请重新选择" : access.detail} shortcut={splitShortcut(bindings.accessPicker)} disabled={accessOpen}>
           <span className="inline-flex">
             <Menu
               open={accessOpen}
-              onOpenChange={setAccessOpen}
+              onOpenChange={(open) => { setAccessOpen(open); if (open) setEffortOpen(false); }}
               placement="top-end"
               ariaLabel="Agent 操作权限"
               className="w-[300px]"

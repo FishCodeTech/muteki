@@ -86,6 +86,7 @@ class TurnRecord(ContractModel):
     # Context parts sent beside the user's text (key, kind, trust, channel,
     # sha256, chars); the full text lives in the executor's context ledger.
     context_delivery: list[dict[str, Any]] = Field(default_factory=list)
+    session_resolution: str = ""
     native_turn_id: str = ""
     # Planning mode this turn was sent with; retry/edit-resend replay it.
     interaction_mode: InteractionMode = "default"
@@ -148,7 +149,7 @@ class ThreadRuntimeSelection(ContractModel):
 
     @property
     def session_key(self) -> str:
-        """Launch-time identity; model options must reach a new native session."""
+        """Desired launch options; native history compatibility is checked separately."""
         # The tier segment is appended only when set so sessions recorded
         # before service tiers existed keep matching their launch identity.
         return (f"{self.runtime_key}|{self.credential_id}"
@@ -262,6 +263,9 @@ class ConversationAgentNode(ContractModel):
     depth: Optional[int] = None
     adapter_id: Optional[str] = None
     access_mode: Optional[str] = None
+    effort: Optional[str] = None
+    acceptance_criteria: Optional[str] = None
+    routing_reason: Optional[str] = None
     # shared | worktree
     isolation: Optional[str] = None
     workspace_id: Optional[str] = None
@@ -320,6 +324,8 @@ class ThreadState(ContractModel):
     running_turn_id: Optional[str] = None
     current_generation: int = 1
     history_rebuild_pending: bool = False
+    # Current branch history awaiting delivery to the native session.
+    pending_handoff: Optional[dict[str, Any]] = None
     # Durable journal for a crash between provider rewind and branch commit.
     history_recovery_required: bool = False
     # Deferred native fork, created on the target connection with its own
@@ -328,6 +334,8 @@ class ThreadState(ContractModel):
     # 当前活跃 AgentSession 及其 Runtime key（切换检测用）
     agent_session_id: Optional[str] = None
     session_runtime_key: str = ""
+    session_launch_cwd: Optional[str] = None
+    session_workspace_id: str = ""
     # C23: approval queue keyed by approval_id. ``pending_approval`` remains the
     # oldest actionable entry for list badges / inbox deep-links (#29).
     pending_approvals: dict[str, dict[str, Any]] = Field(default_factory=dict)

@@ -52,6 +52,9 @@ from muteki.swarm.graph_defs import (  # noqa: E402,F401
     EV_OBSERVATION_ADDED,
     EV_HYP_PROPOSED,
     EV_HYP_REFUTED,
+    EV_SUB_GOAL_ADDED,
+    EV_SUB_GOAL_SATISFIED,
+    EV_VISIT_WAVE_RESET,
     EV_DEAD_END,
     EV_INTENT_PROPOSED,
     EV_INTENT_CLAIMED,
@@ -60,6 +63,7 @@ from muteki.swarm.graph_defs import (  # noqa: E402,F401
     EV_FLAG_INVALIDATED,
     EV_FLAG_SUBMISSION,
     EV_FLAG_SUBMISSION_DECISION,
+    EV_PLATFORM_VERDICT,
     EV_FINDING_FOUND,
     EV_FINDING_INVALIDATED,
     EV_POC_SAVED,
@@ -143,7 +147,11 @@ class SharedGraph(Protocol):
     def add_dead_end(self, *, actor: str, reason: str, intent_id: str = "",
                      route_hash: str = "", coverage_key: str = "",
                      target_epoch: str = "", tested_scope: str = "",
-                     observed_result: str = "") -> int: ...
+                     observed_result: str = "", provenance: Optional[dict] = None) -> int: ...
+
+    def ctf_scheduling_evidence(
+        self, *, event_seq: int, run_id: str, target_epoch: str,
+    ) -> Optional[dict[str, Any]]: ...
 
     def flag_found(self, *, actor: str, flag: str,
                    artifact_id: Optional[str] = None,
@@ -160,6 +168,14 @@ class SharedGraph(Protocol):
         self, *, actor: str, submission_id: str, accepted: bool,
         code: str, detail: str = "",
     ) -> int: ...
+
+    def record_platform_verdict(
+        self, *, submission_id: str, flag: str, status: str,
+        completed: bool = False, correct_flag_count: int | None = None,
+        total_flag_count: int | None = None, detail: str = "",
+    ) -> dict[str, Any]: ...
+
+    def platform_verdicts(self) -> list[dict[str, Any]]: ...
 
     def resolve_flag_submission(
         self, *, actor: str, submission_id: str, flag: str,
@@ -239,6 +255,7 @@ class SharedGraph(Protocol):
                              pocs: Optional[list[dict]] = None,
                              artifacts: Optional[list[str]] = None,
                              vulnerability_report: Optional[dict] = None,
+                             supersedes: Optional[list[int]] = None,
                              need_input: Optional[dict] = None,
                              conclude: bool = True,
                              successor_intent_id: str = "") -> dict: ...
@@ -433,7 +450,11 @@ class SharedGraph(Protocol):
         tokens_before: int,
     ) -> dict: ...
 
-    def revive_resume_intents(self, *, actor: str = "coordinator") -> list[str]: ...
+    def revive_resume_intents(
+        self,
+        *,
+        actor: str = "coordinator",
+    ) -> list[str]: ...
 
     def prior_intent_count(self) -> int: ...
 
@@ -484,6 +505,34 @@ class SharedGraph(Protocol):
     ) -> str: ...
 
     def to_ctf_graph_yaml(self) -> str: ...
+
+    def sub_goals(self) -> list[dict]: ...
+
+    def add_sub_goal(self, *, actor: str, criterion: str, goal_id: str = "") -> str: ...
+
+    def satisfy_sub_goal(
+        self, *, actor: str, goal_id: str, reason: str, evidence_fact_seqs: list[int],
+    ) -> int: ...
+
+    def reset_for_new_visit_wave(
+        self, *, digest_path: str, prior_summary: str, generation: int | None = None,
+    ) -> dict: ...
+
+    def latest_visit_wave(self) -> dict: ...
+
+    def current_visit_wave_cutoff(self) -> int: ...
+
+    def shared_markdown_docs(
+        self, workspace_root: Optional[Path | str] = None,
+    ) -> list[dict[str, Any]]: ...
+
+    def write_ctf_step_review_markdown(
+        self,
+        workspace_root: Optional[Path | str] = None,
+        *,
+        trigger: str = "",
+        filename: str = "step_history_review.md",
+    ) -> Optional[Path]: ...
 
     def reason_compaction_cutoff(
         self, keep_recent_tokens: int, *, after_seq: int = 0,
@@ -540,9 +589,11 @@ from muteki.swarm.graph_intents import _IntentsPocsMixin  # noqa: E402
 from muteki.swarm.graph_views import _QueriesViewsMixin  # noqa: E402
 from muteki.swarm.graph_render import _RenderMixin  # noqa: E402
 from muteki.swarm.graph_capabilities import _CapabilitiesMixin  # noqa: E402
+from muteki.swarm.graph_planning import _PlanningMixin  # noqa: E402
 
 
 class SQLiteSharedGraph(
+    _PlanningMixin,
     _FactsMixin,
     _RoutesDirectivesMixin,
     _LanesLocksMixin,

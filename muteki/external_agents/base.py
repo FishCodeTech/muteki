@@ -563,6 +563,24 @@ class BaseExternalAgentAdapter:
                 self._probe_cache.capabilities = caps
         return self._probe_cache.capabilities
 
+    def declared_chat_capabilities(self) -> Optional[AgentCapabilities]:
+        """Return native adapter declarations without running discovery."""
+        return None
+
+    async def chat_capabilities(self) -> AgentCapabilities:
+        """Use existing discovery or native declarations for chat startup.
+
+        Declarations do not populate the probe report or claim a healthy
+        installed runtime. The real session launch validates availability.
+        Other adapters retain their existing discovery path.
+        """
+        if self._probe_cache is not None:
+            return self._probe_cache.capabilities
+        declared = self.declared_chat_capabilities()
+        if declared is not None:
+            return declared
+        return await self._capabilities()
+
     async def capabilities(self, *, refresh: bool = False) -> AgentCapabilities:
         """返回缓存后的实测能力，供调度层选择明确的降级路径。"""
         return await self._capabilities(refresh=refresh)
@@ -674,7 +692,8 @@ class BaseExternalAgentAdapter:
         本体只在 ``start`` 的启动参数 / 环境注入时经
         ``auth.issue_bearer_token`` 现场签发。
         """
-        caps = await self._capabilities()
+        caps = (await self.chat_capabilities() if request.options.is_conversation
+                else await self._capabilities())
         from muteki.capability_management import enabled as capability_enabled
         if self._capability_gateway is not None:
             descriptor = await self._capability_gateway.describe(binding.binding_id)
@@ -822,6 +841,9 @@ class BaseExternalAgentAdapter:
 
     async def start(self, request: SessionStart) -> AgentSessionRef:
         """创建（或接管）一个外部 Agent Session，完成 Binding 交付。"""
+        from .src_policy import assert_src_access_mode
+        assert_src_access_mode(
+            self._tracker._store, request.thread_id, request.access_mode, self.id)
         # 步骤 1：先建内部 AgentSession（preparing），取得稳定 id。
         record = self._tracker.create(
             request,
@@ -841,7 +863,8 @@ class BaseExternalAgentAdapter:
             binding = self._resolve_binding(request)
             if binding is not None and self._binding_service is not None:
                 # 步骤 3：probe 选 InjectionPlan；步骤 4：签发短期 grant。
-                caps = await self._capabilities()
+                caps = (await self.chat_capabilities() if request.options.is_conversation
+                        else await self._capabilities())
                 kind = select_injection_kind(caps)
                 audience = request.options.audience or f"adapter:{self.identity.key}"
                 grant = self._binding_service.issue_grant(

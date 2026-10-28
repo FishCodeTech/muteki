@@ -25,6 +25,7 @@ CommandReceipt）。本模块在它之上做 EXT-02 需要的聚合与适配，�
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any, Optional
@@ -220,17 +221,17 @@ def create_extension_router(
     async def overview() -> Any:
         """设置页卡片聚合：record + manifest 摘要 + 实时健康。"""
         cards: list[dict[str, Any]] = []
-        for record in service.list_records():
+        for record in await asyncio.to_thread(service.list_records):
             cards.append({
                 "record": record.model_dump(mode="json"),
-                "manifest": _manifest_summary(service, record),
+                "manifest": await asyncio.to_thread(_manifest_summary, service, record),
                 "live_health": await _live_health(service, record),
-                "migrations": service.migration_receipts(record.extension_id),
+                "migrations": await asyncio.to_thread(service.migration_receipts, record.extension_id),
             })
         return {"extensions": cards, "install_policy": service.install_policy}
 
     @router.get(f"{prefix}/catalog")
-    async def catalog(
+    def catalog(
         root: str = Query(default=""),
         q: str = Query(default="", max_length=200),
     ) -> Any:
@@ -265,12 +266,12 @@ def create_extension_router(
         if error is not None:
             return error
         try:
-            manifest = service.manifest_of(extension_id).model_dump(mode="json")
+            manifest = (await asyncio.to_thread(service.manifest_of, extension_id)).model_dump(mode="json")
             manifest_error = ""
         except (ExtensionError, ManifestError) as exc:
             manifest, manifest_error = None, str(exc)
         try:
-            config_schema = _read_config_schema(service, record)
+            config_schema = await asyncio.to_thread(_read_config_schema, service, record)
             schema_error = ""
         except (ExtensionError, ManifestError) as exc:
             config_schema, schema_error = None, str(exc)
@@ -280,12 +281,12 @@ def create_extension_router(
             "manifest_error": manifest_error,
             "config_schema": config_schema,
             "config_schema_error": schema_error,
-            "migrations": service.migration_receipts(extension_id),
+            "migrations": await asyncio.to_thread(service.migration_receipts, extension_id),
             "live_health": await _live_health(service, record),
         }
 
     @router.get(prefix + "/{extension_id}/ui")
-    async def ui_contributions(extension_id: str) -> Any:
+    def ui_contributions(extension_id: str) -> Any:
         record, error = _record_or_error(extension_id)
         if error is not None:
             return error
@@ -300,7 +301,7 @@ def create_extension_router(
             )
 
     @router.get(prefix + "/{extension_id}/logs/page")
-    async def logs_page(
+    def logs_page(
         extension_id: str,
         offset: int = Query(default=0, ge=0),
         limit: int = Query(default=200, ge=1, le=MAX_LOG_PAGE),

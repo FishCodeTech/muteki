@@ -22,6 +22,7 @@ import {
 import { DialogSection, MetaList, MetaRow, MetricTile } from "@/components/chat/dialogs/parts";
 import { apiFetch } from "@/lib/useRun";
 import { useSharedGitStatus } from "@/lib/threadGitStatusStore";
+import { useConversationLocalPreview } from "@/lib/conversationPreviewMode";
 import { capabilitiesFor, readyCatalog, useProviderDescriptors } from "@/lib/providerDescriptors";
 import type {
   ConversationView,
@@ -99,6 +100,7 @@ export function ConversationInfoDrawer({
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [retainedView, setRetainedView] = useState(view);
 
+  const localPreview = useConversationLocalPreview();
   const [quotaData, setQuotaData] = useState<QuotaEntry[] | null>(null);
   const [quotaError, setQuotaError] = useState("");
   const [quotaLoading, setQuotaLoading] = useState(false);
@@ -109,6 +111,7 @@ export function ConversationInfoDrawer({
 
   const loadQuota = async () => {
     if (quotaLoading) return;
+    if (localPreview) { setQuotaData([]); setQuotaError(""); return; }
     setQuotaLoading(true);
     try {
       const res = await apiFetch(`/api/usage/quota`);

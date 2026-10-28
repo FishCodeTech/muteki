@@ -24,10 +24,10 @@ _KEY_RE = re.compile(r"^[a-z0-9][a-z0-9:._/@-]{0,191}$")
 _SECRET_KEY_RE = re.compile(r"(?:token|password|secret|cookie|api[_-]?key|auth)", re.I)
 
 
-def _json_list(value: Any, *, limit: int = 64) -> list[str]:
+def _json_list(value: Any) -> list[str]:
     if not isinstance(value, (list, tuple, set)):
         return []
-    return list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))[:limit]
+    return list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
 
 
 class _CapabilitiesMixin:
@@ -48,8 +48,8 @@ class _CapabilitiesMixin:
         if any(seq not in active for seq in facts):
             return -1
         payload = {
-            "capability_key": key, "target_epoch": epoch, "kind": str(kind or "generic")[:80],
-            "quality": str(quality or "")[:80], "sharing": str(sharing or "run-shared")[:40],
+            "capability_key": key, "target_epoch": epoch, "kind": str(kind or "generic"),
+            "quality": str(quality or ""), "sharing": str(sharing or "run-shared"),
             "source_intent": str(source_intent or ""), "access_path_id": str(access_path_id or ""),
             "evidence_fact_seqs": facts, "metadata": dict(metadata or {}),
         }
@@ -191,7 +191,7 @@ class _CapabilitiesMixin:
             if not row:
                 return -1
             payload = {"capability_key": key, "target_epoch": str(target_epoch),
-                       "state": "retired", "reason": str(reason or "")[:1000]}
+                       "state": "retired", "reason": str(reason or "")}
             seq = self._append_locked(EV_CAPABILITY_RETIRED, actor, payload)
             self._conn.execute(
                 "UPDATE capabilities SET state='retired', updated_seq=? WHERE challenge_id=? "
@@ -241,7 +241,7 @@ class _CapabilitiesMixin:
         required_capabilities: list[str] | None = None,
         consumers: list[str] | None = None,
     ) -> dict[str, Any] | None:
-        clean = " ".join(str(description or "").split())[:2000]
+        clean = " ".join(str(description or "").split())
         epoch = str(target_epoch or "").strip()
         if not clean or not epoch:
             return None
@@ -314,7 +314,7 @@ class _CapabilitiesMixin:
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'running',?,?)",
                 (resource_id, self.challenge.id, str(target_epoch), actor, owner_intent, backend,
                  pid, container_name, log_path, str(cwd or ""),
-                 json.dumps(dict(env or {})), str(cleanup_command or "")[:4096],
+                 json.dumps(dict(env or {})), str(cleanup_command or ""),
                  json.dumps(health or {}), seq, seq),
             )
             self._conn.commit()
@@ -375,8 +375,8 @@ class _CapabilitiesMixin:
         payload = {"access_path_id": access_path_id, "target_epoch": epoch,
                    "runtime_resource_id": runtime_resource_id,
                    "source_intent": source_intent, "reach": _json_list(reach),
-                   "operations": _json_list(operations), "quality": str(quality or "multiplexed")[:40],
-                   "endpoint": str(endpoint or "")[:1000], "use_spec": spec,
+                   "operations": _json_list(operations), "quality": str(quality or "multiplexed"),
+                   "endpoint": str(endpoint or ""), "use_spec": spec,
                    "health": dict(health or {}), "dependency_fact_seqs": facts,
                    "capability_keys": keys, "state": "ready"}
         with self._lock:
@@ -462,7 +462,7 @@ class _CapabilitiesMixin:
             if not row or str(row[2]) == state:
                 return -1
             payload = {"access_path_id": access_path_id, "target_epoch": row[1],
-                       "state": state, "reason": str(reason or "")[:1000]}
+                       "state": state, "reason": str(reason or "")}
             seq = self._append_locked(EV_ACCESS_PATH_STATE_CHANGED, actor, payload)
             failures = "consecutive_failures+1" if state == "degraded" else "0"
             self._conn.execute(

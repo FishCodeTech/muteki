@@ -21,6 +21,7 @@ class ThreadMode(str, Enum):
     """Thread 对话模式，决定 CapabilityBinding 的默认能力集合。"""
 
     CONVERSATION = "conversation"
+    SRC = "src"
     SINGLE_TASK = "single_task"
     COMPETITION = "competition"
     MANAGEMENT = "management"

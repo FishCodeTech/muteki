@@ -32,12 +32,13 @@
     "**/*.ts",
     "**/*.tsx",
     ".next-build/types/**/*.ts",
+    ".next-desktop/types/**/*.ts",
+    ".next-verify/types/**/*.ts",
     ".next/dev-report/types/**/*.ts",
     ".next/types/**/*.ts",
+    "/tmp/src-verify/next-dist/types/**/*.ts",
     "next-env.d.ts",
-    "out/types/**/*.ts",
-    ".next-verify/types/**/*.ts",
-    ".next-desktop/types/**/*.ts"
+    "out/types/**/*.ts"
   ],
   "exclude": [
     "node_modules",

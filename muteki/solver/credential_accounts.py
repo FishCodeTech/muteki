@@ -20,6 +20,7 @@ from contextlib import contextmanager
 import os
 import re
 import shutil
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -88,6 +89,52 @@ _PI_PROVIDER_REQUEST_TIMEOUT_MS = 300_000
 # 不可达时，这只会把一次约 5 秒的连接失败扩大为两次尝试；上游恢复后由下一
 # 次调度健康检查重新纳入即可，因此这里保持单次请求并让真实错误尽快显现。
 _PI_PROVIDER_MAX_RETRIES = 0
+
+
+class ModelCapabilityMetadataError(ValueError):
+    """A custom provider model lacks the physical limits its CLI requires."""
+
+    code = "credential.model_capabilities_required"
+
+
+# Provider-owned physical limits for Ark Agent Plan model names. These values
+# are used only for the exact Agent Plan endpoints below. Third-party gateways
+# and aliases must persist explicit metadata instead of inheriting assumptions.
+_ARK_AGENT_PLAN_CAPABILITIES: dict[str, dict[str, Any]] = {
+    # Ark's published Agent Plan integration metadata:
+    # https://docs.volcengine.com/docs/ark/coding-plan-personal-ai-openclaw?lang=en
+    "kimi-k3": {
+        "context_window": 1_024_000,
+        "max_output_tokens": 65_536,
+        "input": ["text", "image"],
+    },
+    "glm-5.3": {
+        "context_window": 1_024_000,
+        "max_output_tokens": 65_536,
+        "input": ["text"],
+    },
+    "deepseek-v4.1-flash": {
+        "context_window": 1_024_000,
+        "max_output_tokens": 393_216,
+        "input": ["text", "image"],
+    },
+    "deepseek-v4-flash": {
+        "context_window": 1_024_000,
+        "max_output_tokens": 393_216,
+        "input": ["text"],
+    },
+    "deepseek-v4-pro": {
+        "context_window": 1_024_000,
+        "max_output_tokens": 393_216,
+        "input": ["text"],
+    },
+}
+_ARK_AGENT_PLAN_BASE_URLS = frozenset({
+    "https://ark.cn-beijing.volces.com/api/plan",
+    "https://ark.cn-beijing.volces.com/api/plan/v3",
+    "https://qianfan.baidubce.com/v2/tokenplan/personal",
+})
+_LEGACY_FABRICATED_PI_CAPABILITY = (128_000, 8_192)
 
 # Official endpoints are product/runtime configuration, not credential data.
 # The credentials UI therefore never asks the operator for these values.  A
@@ -329,7 +376,8 @@ class CredentialAccountStore:
                 if os.name == "nt":
                     import msvcrt
                     if not handle.tell():
-                        handle.write(b"0"); handle.flush()
+                        handle.write(b"0")
+                        handle.flush()
                     handle.seek(0)
                     msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
                 else:
@@ -350,7 +398,8 @@ class CredentialAccountStore:
                 finally:
                     del _ACCOUNT_GUARD_DEPTHS[lock_key]
                     if os.name == "nt":
-                        handle.seek(0); msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
                     else:
                         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
@@ -783,7 +832,7 @@ class CredentialAccountStore:
 
     def upsert_secret(self, *, account_id: str, engine: str,
                       create_only: bool = False, expected_revision: str | None = None,
-                      **fields: Any) -> dict[str, Any]:
+                      publish: bool = True, **fields: Any) -> dict[str, Any]:
         if not valid_account_id(account_id):
             raise ValueError("invalid account id")
         from muteki.solver.shared_credentials import MARKER
@@ -805,6 +854,8 @@ class CredentialAccountStore:
         result = self._stage_account_update(account_id,
             lambda staged: staged._write_secret(account_id=account_id, engine=engine, **fields),
             create_only=create_only, expected_revision=expected_revision)
+        if not publish:
+            return result
         try:
             self._publish_shared_credential(account_id)
         except (OSError, ValueError) as exc:
@@ -916,6 +967,7 @@ class CredentialAccountStore:
         provider: str | None = None,
         target_model: str | None = None,
         models: Any = None,
+        model_capabilities: Any = None,
         clear_base_url: bool = False,
     ) -> dict[str, Any]:
         account_id = account_id.strip()
@@ -1055,6 +1107,24 @@ class CredentialAccountStore:
             self._atomic_write(
                 base / "MODELS.json",
                 json.dumps(requested_models, ensure_ascii=False) + "\n",
+            )
+        if model_capabilities is not None:
+            normalized_capabilities = _normalize_model_capabilities(
+                model_capabilities
+            )
+            self._atomic_write(
+                base / "MODEL_CAPABILITIES.json",
+                json.dumps(
+                    normalized_capabilities,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    indent=2,
+                ) + "\n",
+            )
+        elif prior.get("MODEL_CAPABILITIES.json"):
+            self._atomic_write(
+                base / "MODEL_CAPABILITIES.json",
+                prior["MODEL_CAPABILITIES.json"] + "\n",
             )
         if target_model is not None:
             selected_default = str(target_model or "").strip()
@@ -1539,6 +1609,7 @@ class CredentialAccountStore:
         metadata = {
             "DEFAULT_MODEL",
             "MODELS.json",
+            "MODEL_CAPABILITIES.json",
             "PROVIDER",
             "SHARED_CREDENTIAL.json",
         }
@@ -1608,7 +1679,10 @@ class CredentialAccountStore:
         """
         base = self.root / account_id
         out: dict[str, str] = {}
-        for rel in ("CLAUDE_CODE_OAUTH_TOKEN", "CURSOR_API_KEY", "API_KEY", "BASE_URL", "ENGINE", "PROVIDER", "MODELS.json"):
+        for rel in (
+            "CLAUDE_CODE_OAUTH_TOKEN", "CURSOR_API_KEY", "API_KEY", "BASE_URL",
+            "ENGINE", "PROVIDER", "MODELS.json", "MODEL_CAPABILITIES.json",
+        ):
             p = base / rel
             try:
                 out[rel] = p.read_text(encoding="utf-8").strip() if p.exists() else ""
@@ -1625,7 +1699,10 @@ class CredentialAccountStore:
 
     @staticmethod
     def _clear_account_material(base: Path) -> None:
-        for rel in ("CLAUDE_CODE_OAUTH_TOKEN", "CURSOR_API_KEY", "API_KEY", "BASE_URL", "ENGINE", "PROVIDER", "MODELS.json"):
+        for rel in (
+            "CLAUDE_CODE_OAUTH_TOKEN", "CURSOR_API_KEY", "API_KEY", "BASE_URL",
+            "ENGINE", "PROVIDER", "MODELS.json", "MODEL_CAPABILITIES.json",
+        ):
             try:
                 (base / rel).unlink(missing_ok=True)
             except OSError:
@@ -1784,24 +1861,52 @@ def _kimi_credential_env(
         # id sent to the API, so remove only the built-in alias namespace.
         out["KIMI_MODEL_NAME"] = selected_model.removeprefix("kimi-code/")
         base_url = CredentialAccountStore._read_base_url(base)
+        stored_provider = CredentialAccountStore._read_provider(base)
         provider_type = str(
             source.get("KIMI_MODEL_PROVIDER_TYPE")
-            or ("openai" if base_url else "kimi")
+            or ("kimi" if stored_provider == "kimi" else "openai" if base_url else "kimi")
         )
         out["KIMI_MODEL_PROVIDER_TYPE"] = provider_type
-        if provider_type == "openai":
-            # Kimi Code synthesizes custom OpenAI-compatible models with a
-            # 256K context window unless told otherwise.  Its derived output
-            # request can then exceed the 64K completion ceiling used by
-            # common DeepSeek endpoints.  The documented runtime override
-            # keeps custom providers at the conventional 128K window while
-            # still allowing an explicit deployment value to win.
-            out["KIMI_MODEL_MAX_CONTEXT_SIZE"] = str(
-                source.get("KIMI_MODEL_MAX_CONTEXT_SIZE") or 131072
-            )
-            out["KIMI_MODEL_MAX_OUTPUT_SIZE"] = str(
-                source.get("KIMI_MODEL_MAX_OUTPUT_SIZE") or 65536
-            )
+        capability = resolve_model_capabilities(
+            base_url, [out["KIMI_MODEL_NAME"]], _read_model_capabilities(base),
+            engine=engine, provider=stored_provider, account_base=base,
+        )[out["KIMI_MODEL_NAME"]]
+        if "context_window" in capability:
+            out["KIMI_MODEL_MAX_CONTEXT_SIZE"] = str(capability["context_window"])
+        tags = ["tool_use"]
+        if capability.get("reasoning") is True:
+            tags.append("thinking")
+        if "image" in capability.get("input", []):
+            tags.append("image_in")
+        if "video" in capability.get("input", []):
+            tags.append("video_in")
+        if stored_provider == "kimi":
+            tags.append("dynamically_loaded_tools")
+        out["KIMI_MODEL_CAPABILITIES"] = ",".join(tags)
+        if provider_type == "openai" and "max_output_tokens" in capability:
+            out["KIMI_MODEL_MAX_OUTPUT_SIZE"] = str(capability["max_output_tokens"])
+    if agent_state_dir is not None and has_key:
+        root = Path(agent_state_dir).expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        CredentialAccountStore._chmod_private_dir(root)
+        loop_control = ""
+        if "context_window" in capability:
+            reserve_tokens = max(16384, int(round(int(capability["context_window"]) * 0.10)))
+            loop_control = "[loop_control]\ncompaction_trigger_ratio = 0.9\n" + f"reserved_context_size = {reserve_tokens}\n\n"
+        config_toml = loop_control + (
+            "[experimental]\n"
+            "notify_user = true\n"
+            "subagent_fork = true\n"
+            "wait_for = true\n"
+            "tower = false\n"
+            '"tool-select" = true\n'
+        )
+        CredentialAccountStore._atomic_write(root / "config.toml", config_toml)
+        runtime_root = agent_state_container_path if container else str(root)
+        if not runtime_root:
+            raise ValueError("Kimi container credentials require agent_state_container_path")
+        out["KIMI_CODE_HOME"] = runtime_root
+        return
     kimi_home = base / "kimi-home" if base is not None else None
     if not has_key and kimi_home is not None and kimi_home.exists():
         out["KIMI_CODE_HOME"] = (
@@ -1810,6 +1915,105 @@ def _kimi_credential_env(
         )
     elif not has_key and source.get("KIMI_CODE_HOME"):
         out["KIMI_CODE_HOME"] = str(source["KIMI_CODE_HOME"])
+
+
+def _zcode_credential_env(
+    out: dict[str, str], *, engine: str, base: Path | None, account_id: str,
+    container: bool, source: Mapping[str, str], model: str | None,
+    runtime_max_output_tokens: int | None = None,
+    agent_state_dir: str | Path | None, agent_state_container_path: str | None,
+) -> None:
+    if base is None:
+        out.update({key: source[key] for key in get_descriptor(engine).credentials.env_keys
+                    if source.get(key)})
+        return
+    if agent_state_dir is None:
+        raise ValueError("ZCode requires a credential-scoped agent_state_dir")
+    selected_model = str(model or "").strip()
+    if not selected_model:
+        raise ValueError("ZCode requires an explicit model")
+    base_url = CredentialAccountStore._read_base_url(base)
+    if not base_url:
+        raise ValueError("ZCode requires an explicit OpenAI-compatible base URL")
+    capability = resolve_model_capabilities(
+        base_url, [selected_model], _read_model_capabilities(base),
+        engine=engine, account_base=base,
+    )[selected_model]
+    try:
+        output_limit = int(runtime_max_output_tokens or capability.get("max_output_tokens") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ModelCapabilityMetadataError(
+            f"ZCode model {selected_model!r} has an invalid output-token limit"
+        ) from exc
+    missing_limits = [name for name, present in (
+        ("context_window", "context_window" in capability),
+        ("max_output_tokens or worker profile max_output_tokens", output_limit > 0),
+    ) if not present]
+    if missing_limits:
+        raise ModelCapabilityMetadataError(
+            f"ZCode model {selected_model!r} requires explicit model limits: "
+            + ", ".join(missing_limits)
+        )
+    root = Path(agent_state_dir).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    CredentialAccountStore._chmod_private_dir(root)
+    key = (base / "API_KEY").read_text(encoding="utf-8").strip()
+    config = {"schemaVersion": 1, "config": {
+        "providerConfigRules": {"providerRules": [{
+            "providerId": "muteki", "enabled": True, "config": {
+                "group": "standard-personal",
+                "access": {"type": "api-key", "apiKey": key},
+                "api": {"type": "openai-chat-completions", "baseUrl": base_url},
+                "personalModelIds": [selected_model],
+            },
+        }]},
+        "modelConfigRules": {"providerModelRules": [{
+            "providerId": "muteki", "modelId": selected_model, "config": {
+                "enabled": True,
+                "properties": {
+                    **({"contextWindow": capability["context_window"]} if "context_window" in capability else {}),
+                    "inputFormat": {"supportsText": True,
+                                    "supportsImage": "image" in capability.get("input", []),
+                                    "supportsVideo": False, "supportsAudio": False,
+                                    "supportsPdf": False},
+                    "outputFormat": {"supportsText": True},
+                    "supportsToolCall": True,
+                    "supportsJsonSchemaOutput": False,
+                    "supportsNativeWebSearch": False,
+                    "supportsMidConversationSystem": False,
+                    "requiresMfjsToolSchema": False,
+                },
+                "optionSpecs": {"reasoningLevel": {"values": ["default"], "map": "{}"},
+                                "maxOutputTokens": {
+                    # ZCode requires a finite per-run output ceiling before it
+                    # publishes a custom model. An explicit Worker Profile value
+                    # is an execution limit, not a claim about the provider's
+                    # physical model capacity.
+                    "max": output_limit,
+                    "map": "{'max_completion_tokens': maxOutputTokens}",
+                }},
+            },
+        }], "manualProviderModelRules": []},
+        "defaultModelSelection": {"providerId": "muteki", "modelId": selected_model,
+                                  "options": {"reasoningLevel": "default"}},
+    }}
+    CredentialAccountStore._atomic_write(root / "provider.json", json.dumps(config))
+    # A valid empty built-in release prevents borrowing another provider.
+    builtin = {"schemaVersion": 1, "revision": 1, "config": {
+        "providerConfigRules": {"providerRules": [], "templateRules": []},
+        "modelConfigRules": {"modelRules": [], "modelApiRules": [],
+                             "providerSiteRules": [], "templateModelRules": [],
+                             "builtinProviderModelRules": []},
+    }}
+    CredentialAccountStore._atomic_write(root / "builtin.json", json.dumps(builtin))
+    runtime_root = agent_state_container_path if container else str(root)
+    if not runtime_root:
+        raise ValueError("ZCode container credentials require agent_state_container_path")
+    out.update({
+        "ZCODE_DATA_BASE_DIR": runtime_root,
+        "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE": f"{runtime_root}/provider.json",
+        "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE": f"{runtime_root}/builtin.json",
+    })
 
 
 def _grok_credential_env(
@@ -1896,13 +2100,13 @@ def _opencode_credential_env(
             )
             out["OPENCODE_CONFIG_CONTENT"] = json.dumps({
                 "$schema": "https://opencode.ai/config.json",
-                "provider": {
+                "providers": {
                     provider_id: {
-                        "npm": "@ai-sdk/openai-compatible",
+                        "package": "@opencode/ai/providers/openai-compatible",
                         "name": provider_name,
-                        "options": {
+                        "env": ["OPENCODE_API_KEY"],
+                        "settings": {
                             "baseURL": base_url,
-                            "apiKey": "{env:OPENCODE_API_KEY}",
                         },
                         "models": {
                             model_id: {"name": model_id}
@@ -1930,6 +2134,301 @@ def _opencode_credential_env(
             "XDG_CONFIG_HOME": f"{runtime_root}/config",
             "XDG_CACHE_HOME": f"{runtime_root}/cache",
         })
+
+
+def _normalize_model_capabilities(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        raise ValueError("model_capabilities must be an object keyed by model id")
+    normalized: dict[str, dict[str, Any]] = {}
+    for raw_model, raw_capability in value.items():
+        model_id = str(raw_model or "").strip()
+        if not model_id or not isinstance(raw_capability, Mapping):
+            raise ValueError(
+                "each model_capabilities entry must name a model and an object"
+            )
+        limits: dict[str, int] = {}
+        for key, alias in (("context_window", "contextWindow"), ("max_output_tokens", "maxTokens")):
+            raw_limit = raw_capability.get(key, raw_capability.get(alias))
+            if raw_limit is None:
+                continue
+            try:
+                limit = int(raw_limit)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"model_capabilities[{model_id}].{key} must be an integer") from exc
+            if limit <= 0:
+                raise ValueError(f"model_capabilities[{model_id}].{key} must be positive")
+            limits[key] = limit
+        raw_input = raw_capability.get("input") or ["text"]
+        if (
+            not isinstance(raw_input, list)
+            or not raw_input
+            or not all(isinstance(item, str) and item.strip() for item in raw_input)
+        ):
+            raise ValueError(
+                f"model_capabilities[{model_id}].input must be a non-empty string list"
+            )
+        normalized[model_id] = {
+            **limits,
+            "input": list(dict.fromkeys(item.strip() for item in raw_input)),
+        }
+        if "reasoning" in raw_capability:
+            if not isinstance(raw_capability.get("reasoning"), bool):
+                raise ValueError(
+                    f"model_capabilities[{model_id}].reasoning must be boolean"
+                )
+            normalized[model_id]["reasoning"] = raw_capability["reasoning"]
+        raw_map = raw_capability.get("thinkingLevelMap", raw_capability.get("thinking_level_map"))
+        if raw_map is not None:
+            if not isinstance(raw_map, Mapping):
+                raise ValueError(f"model_capabilities[{model_id}].thinkingLevelMap must be an object")
+            level_map: dict[str, str | None] = {}
+            for raw_level, wire_value in raw_map.items():
+                level = "off" if raw_level == "none" else raw_level
+                if level not in {"off", "minimal", "low", "medium", "high", "xhigh", "max"}:
+                    raise ValueError(f"model_capabilities[{model_id}].thinkingLevelMap has an invalid level")
+                if wire_value is not None and not isinstance(wire_value, str):
+                    raise ValueError(f"model_capabilities[{model_id}].thinkingLevelMap values must be strings or null")
+                if level in level_map and level_map[level] != wire_value:
+                    raise ValueError(f"model_capabilities[{model_id}].thinkingLevelMap has conflicting off/none aliases")
+                level_map[level] = wire_value
+            normalized[model_id]["thinkingLevelMap"] = level_map
+    return normalized
+
+
+def _read_model_capabilities(base: Path | None) -> dict[str, dict[str, Any]]:
+    if base is None:
+        return {}
+    path = base / "MODEL_CAPABILITIES.json"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise ModelCapabilityMetadataError(
+            f"cannot read MODEL_CAPABILITIES.json: {exc}"
+        ) from exc
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ModelCapabilityMetadataError(
+            f"invalid MODEL_CAPABILITIES.json: {exc}"
+        ) from exc
+    try:
+        return _normalize_model_capabilities(raw)
+    except ValueError as exc:
+        raise ModelCapabilityMetadataError(
+            f"invalid MODEL_CAPABILITIES.json: {exc}"
+        ) from exc
+
+
+_PI_RPC_MODEL_CACHE: list[dict[str, Any]] | None = None
+
+
+def _pi_rpc_models() -> list[dict[str, Any]]:
+    global _PI_RPC_MODEL_CACHE
+    if _PI_RPC_MODEL_CACHE is not None:
+        return _PI_RPC_MODEL_CACHE
+    node = shutil.which("node")
+    pi = shutil.which("pi")
+    script = Path(__file__).with_name("pi_model_catalog.mjs")
+    if not node or not pi or not script.is_file():
+        _PI_RPC_MODEL_CACHE = []
+        return _PI_RPC_MODEL_CACHE
+    try:
+        completed = subprocess.run(
+            [node, str(script), pi],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=True,
+        )
+        payload = json.loads(completed.stdout)
+        rows = payload.get("models") if isinstance(payload, dict) else []
+        _PI_RPC_MODEL_CACHE = [
+            dict(row) for row in rows if isinstance(row, dict)
+        ]
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        _PI_RPC_MODEL_CACHE = []
+    return _PI_RPC_MODEL_CACHE
+
+
+def _pi_model_capability(model: str, provider: str) -> dict[str, Any] | None:
+    candidates = [
+        row for row in _pi_rpc_models()
+        if str(row.get("id") or "") == model
+        and (not provider or str(row.get("provider") or "") == provider)
+    ]
+    normalized: list[dict[str, Any]] = []
+    for row in candidates:
+        try:
+            normalized.append(_normalize_model_capabilities({model: {
+                "contextWindow": row.get("contextWindow"),
+                "maxTokens": row.get("maxTokens"),
+                "input": row.get("input") or ["text"],
+                "reasoning": row.get("reasoning", False),
+                **({"thinkingLevelMap": row["thinkingLevelMap"]} if "thinkingLevelMap" in row else {}),
+            }})[model])
+        except ValueError:
+            continue
+    if not normalized:
+        return None
+    first = normalized[0]
+    if all(row == first for row in normalized[1:]):
+        return first
+    return None
+
+
+def _generated_model_capability(
+    base: Path | None, *, engine: str, model: str,
+) -> dict[str, Any] | None:
+    if base is None:
+        return None
+    if engine == "pi":
+        path = base / "pi-agent" / "models.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except json.JSONDecodeError as exc:
+            raise ModelCapabilityMetadataError(
+                f"invalid existing Pi model metadata: {exc}"
+            ) from exc
+        except OSError as exc:
+            raise ModelCapabilityMetadataError(
+                f"cannot read existing Pi model metadata: {exc}"
+            ) from exc
+        providers = payload.get("providers") if isinstance(payload, dict) else {}
+        for provider_row in (providers or {}).values():
+            if not isinstance(provider_row, Mapping):
+                continue
+            for row in provider_row.get("models") or []:
+                if isinstance(row, Mapping) and str(row.get("id") or "") == model:
+                    try:
+                        capability = _normalize_model_capabilities({model: row})[model]
+                    except ValueError:
+                        return None
+                    if (
+                        capability.get("context_window"),
+                        capability.get("max_output_tokens"),
+                    ) == _LEGACY_FABRICATED_PI_CAPABILITY:
+                        return None
+                    return capability
+    elif engine == "omp":
+        path = base / "omp-agent" / "models.yml"
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ModelCapabilityMetadataError(
+                f"cannot read existing OMP model metadata: {exc}"
+            ) from exc
+        model_match = re.search(
+            rf"(?m)^\s*-\s+id:\s*{re.escape(json.dumps(model))}\s*$",
+            text,
+        )
+        if model_match:
+            tail = text[model_match.end():]
+            context_match = re.search(r"(?m)^\s*contextWindow:\s*(\d+)\s*$", tail)
+            output_match = re.search(r"(?m)^\s*maxTokens:\s*(\d+)\s*$", tail)
+            if context_match and output_match:
+                capability = {
+                    "context_window": int(context_match.group(1)),
+                    "max_output_tokens": int(output_match.group(1)),
+                    "input": ["text"],
+                }
+                if (
+                    capability["context_window"],
+                    capability["max_output_tokens"],
+                ) == _LEGACY_FABRICATED_PI_CAPABILITY:
+                    return None
+                return capability
+    return None
+
+
+def _resolve_model_capability(
+    *, base: Path | None, base_url: str, engine: str, model: str,
+    provider: str, stored: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    explicit = stored.get(model)
+    if explicit is not None:
+        return dict(explicit)
+    normalized_url = str(base_url or "").rstrip("/")
+    if normalized_url in _ARK_AGENT_PLAN_BASE_URLS:
+        known = _ARK_AGENT_PLAN_CAPABILITIES.get(model)
+        if known is not None:
+            return dict(known)
+    # Pi custom endpoints use their own model metadata. A matching native
+    # model ID does not establish the endpoint's reasoning or wire mapping.
+    if engine != "pi":
+        native = _pi_model_capability(model, provider)
+        if native is not None:
+            return native
+    generated = _generated_model_capability(base, engine=engine, model=model)
+    if generated is not None:
+        return generated
+    # Custom providers may expose only model IDs. Missing optional limits must
+    # not prevent a previously configured CLI account from starting. Leave
+    # absent overrides to the CLI's own provider configuration.
+    return {}
+
+
+def resolve_model_capabilities(
+    base_url: str,
+    models: Iterable[str],
+    metadata: Mapping[str, Mapping[str, Any]] | None = None,
+    *,
+    provider: str = "",
+    engine: str = "pi",
+    account_base: str | Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Resolve physical context/output limits for custom-provider models.
+
+    Explicit provider metadata wins. Known provider and native CLI metadata are used
+    only when their model identity is unambiguous. Unknown limits remain absent
+    so the CLI retains its native behavior without a fabricated override.
+    """
+    try:
+        stored = _normalize_model_capabilities(metadata or {})
+    except ValueError as exc:
+        raise ModelCapabilityMetadataError(
+            f"invalid explicit model capability metadata: {exc}"
+        ) from exc
+    base = Path(account_base).expanduser().resolve() if account_base else None
+    resolved: dict[str, dict[str, Any]] = {}
+    for raw_model in models:
+        model = str(raw_model or "").strip()
+        if not model or model in resolved:
+            continue
+        resolved[model] = _resolve_model_capability(
+            base=base,
+            base_url=base_url,
+            engine=engine,
+            model=model,
+            provider=str(provider or "").strip(),
+            stored=stored,
+        )
+    if not resolved:
+        raise ModelCapabilityMetadataError(
+            "at least one model id is required to resolve provider capabilities"
+        )
+    return resolved
+
+
+def pi_model_definition(
+    model: str, capability: Mapping[str, Any], *, model_input: list[str] | None = None,
+) -> dict[str, Any]:
+    """One model definition shared by endpoint catalog probes and Pi runs."""
+    return {
+        "id": model,
+        "input": list(model_input if model_input is not None else capability.get("input") or ["text"]),
+        **({"contextWindow": capability["context_window"]} if "context_window" in capability else {}),
+        **({"maxTokens": capability["max_output_tokens"]} if "max_output_tokens" in capability else {}),
+        "reasoning": capability.get("reasoning", False),
+        **({"thinkingLevelMap": capability["thinkingLevelMap"]} if "thinkingLevelMap" in capability else {}),
+    }
 
 
 def _pi_like_credential_env(
@@ -1975,6 +2474,19 @@ def _pi_like_credential_env(
         if not selected_model:
             raise ValueError(
                 f"{engine} 自定义端点必须指定已经通过真实测试的模型 ID")
+        capability = resolve_model_capabilities(
+            base_url,
+            [selected_model],
+            _read_model_capabilities(base),
+            engine=engine,
+            provider=CredentialAccountStore._read_provider(base),
+            account_base=base,
+        )[selected_model]
+        resolved_input = (
+            list(model_input)
+            if model_input is not None
+            else list(capability.get("input") or ["text"])
+        )
         agent_dir = (
             Path(agent_state_dir).expanduser().resolve()
             if agent_state_dir is not None
@@ -1988,12 +2500,9 @@ def _pi_like_credential_env(
                     "baseUrl": base_url,
                     "api": "openai-completions",
                     "apiKey": api_key,
-                    "models": [{
-                        "id": selected_model,
-                        **({"input": model_input} if model_input is not None else {}),
-                        "contextWindow": 128000,
-                        "maxTokens": 8192,
-                    }],
+                    "models": [pi_model_definition(
+                        selected_model, capability, model_input=resolved_input,
+                    )],
                 }},
             }, indent=2) + "\n"
             config_name = "models.json"
@@ -2002,8 +2511,12 @@ def _pi_like_credential_env(
             # 固定为 5 分钟（与 Pi 当前默认一致）并保持单次请求，使
             # 受管 profile 不受宿主全局设置变化影响；连接失败则立即
             # 交给健康检查判为不可用，不在同一轮重复提交请求。
+            compaction = {"enabled": True}
+            if "context_window" in capability:
+                compaction["reserveTokens"] = max(16384, int(round(int(capability["context_window"]) * 0.10)))
             settings_text = json.dumps({
                 "httpIdleTimeoutMs": _PI_PROVIDER_REQUEST_TIMEOUT_MS,
+                "compaction": compaction,
                 "retry": {
                     "provider": {
                         "timeoutMs": _PI_PROVIDER_REQUEST_TIMEOUT_MS,
@@ -2015,7 +2528,12 @@ def _pi_like_credential_env(
                 agent_dir / "settings.json", settings_text)
         else:
             config_text = _omp_models_yml(
-                base_url, api_key, selected_model)
+                base_url,
+                api_key,
+                selected_model,
+                context_window=capability.get("context_window"),
+                max_output_tokens=capability.get("max_output_tokens"),
+            )
             config_name = "models.yml"
         CredentialAccountStore._atomic_write(agent_dir / config_name, config_text)
         out["PI_CODING_AGENT_DIR"] = (
@@ -2082,6 +2600,7 @@ _CREDENTIAL_ENV_RESOLVERS: dict[CredentialEnvResolver, Callable[..., None]] = {
     "codex": _codex_credential_env,
     "cursor": _cursor_credential_env,
     "kimi": _kimi_credential_env,
+    "zcode": _zcode_credential_env,
     "grok": _grok_credential_env,
     "opencode": _opencode_credential_env,
     "pi": _pi_credential_env,
@@ -2089,6 +2608,12 @@ _CREDENTIAL_ENV_RESOLVERS: dict[CredentialEnvResolver, Callable[..., None]] = {
     "devin_host_only": _host_only_credential_env,
     "droid": _droid_credential_env,
 }
+
+
+def engine_writes_agent_state(engine: str) -> bool:
+    """Return True when the engine descriptor requires a credential-scoped agent_state_dir."""
+    descriptor = find_descriptor(str(engine or "").strip().lower())
+    return bool(descriptor is not None and descriptor.credentials.agent_state_dir)
 
 
 def runtime_env_for_engine(
@@ -2102,6 +2627,7 @@ def runtime_env_for_engine(
     agent_state_container_path: str | None = None,
     model: str | None = None,
     model_input: list[str] | None = None,
+    runtime_max_output_tokens: int | None = None,
 ) -> RuntimeCredentialEnv:
     """Resolve credential env for one engine.
 
@@ -2151,6 +2677,8 @@ def runtime_env_for_engine(
             source=source,
             model=model,
             **({"model_input": model_input} if e == "pi" else {}),
+            **({"runtime_max_output_tokens": runtime_max_output_tokens}
+               if e == "zcode" else {}),
             agent_state_dir=agent_state_dir,
             agent_state_container_path=agent_state_container_path,
         )
@@ -2164,7 +2692,14 @@ def _container_secret_path(account_id: str, filename: str) -> str:
     return f"{CONTAINER_ACCOUNTS_ROOT}/{account_id}/{filename}"
 
 
-def _omp_models_yml(base_url: str, api_key: str, model: str) -> str:
+def _omp_models_yml(
+    base_url: str,
+    api_key: str,
+    model: str,
+    *,
+    context_window: int | None = None,
+    max_output_tokens: int | None = None,
+) -> str:
     """Hand-written omp provider config (no pyyaml dependency). Values are
     JSON-double-quoted, which YAML 1.2 parses as flow scalars — safe for URLs and
     model ids containing ':' or '#'."""
@@ -2181,8 +2716,8 @@ def _omp_models_yml(base_url: str, api_key: str, model: str) -> str:
         f"    apiKey: {_q(api_key)}\n"
         "    models:\n"
         f"      - id: {_q(model)}\n"
-        "        contextWindow: 128000\n"
-        "        maxTokens: 8192\n"
+        + (f"        contextWindow: {int(context_window)}\n" if context_window is not None else "")
+        + (f"        maxTokens: {int(max_output_tokens)}\n" if max_output_tokens is not None else "")
     )
 
 
@@ -2434,6 +2969,11 @@ def _login_status_kimi_credentials(source: Mapping[str, str], env: Mapping[str, 
         return _login_status_unknown("kimi_credentials", exc)
 
 
+def _login_status_zcode_config(source: Mapping[str, str], env: Mapping[str, str] | None) -> str:
+    # File presence does not prove provider login or a working model call.
+    return "unknown"
+
+
 def _login_status_grok_auth_json(source: Mapping[str, str], env: Mapping[str, str] | None) -> str:
     if source.get("XAI_API_KEY"):
         return "present"
@@ -2468,6 +3008,7 @@ _LOGIN_STATUS_PROBES: dict[LoginStatusProbe, Callable[[Mapping[str, str], Mappin
     "pi_agent_files": _login_status_pi_agent_files,
     "omp_agent_dir": _login_status_omp_agent_dir,
     "kimi_credentials": _login_status_kimi_credentials,
+    "zcode_config": _login_status_zcode_config,
     "grok_auth_json": _login_status_grok_auth_json,
     "opencode_auth": _login_status_opencode_auth,
 }

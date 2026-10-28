@@ -173,7 +173,7 @@ class AgentCapabilityGatewayImpl:
                             if "default" in schema}
                 if defaults:
                     invocation = invocation.model_copy(update={"arguments": {**defaults, **invocation.arguments}})
-            return await self._dispatch_to_command_api(
+            return await self._dispatch_with_src_policy(
                 binding, spec, invocation, correlation_id)
         except CommandAPIError as exc:
             return CapabilityResult(
@@ -305,6 +305,106 @@ class AgentCapabilityGatewayImpl:
 
     # -- 归一化到 MutekiCommandAPI ---------------------------------------------
 
+    async def _dispatch_with_src_policy(
+        self,
+        binding: CapabilityBinding,
+        spec: CapabilityToolSpec,
+        invocation: CapabilityInvocation,
+        correlation_id: str,
+    ) -> CapabilityResult:
+        src = getattr(self, "src", None)
+        if src is None:
+            return await self._dispatch_to_command_api(binding, spec, invocation, correlation_id)
+        from muteki.src.store import SrcStoreError
+        from muteki.platform.contracts.objects import Thread
+        try:
+            task_binding = src.task_for_thread(binding.thread_id)
+        except SrcStoreError as exc:
+            thread_obj = src.platform.get(Thread, binding.thread_id)
+            if binding.mode == ThreadMode.SRC or (thread_obj is not None and getattr(thread_obj, "mode", "") == "src"):
+                return CapabilityResult(
+                    ok=False, invocation_id=invocation.invocation_id,
+                    error=make_error(
+                        exc.code, exc.message, ErrorCategory.PERMISSION,
+                        correlation_id=correlation_id,
+                    ),
+                )
+            return await self._dispatch_to_command_api(binding, spec, invocation, correlation_id)
+        from muteki.src.contracts import ExecutionRequest
+        tool_name = invocation.tool_name
+        resource_kind = "browser" if tool_name.startswith("chat_browser_") else "http" if "http_request" in tool_name else "control" if tool_name.startswith("muteki_") else "mcp"
+        action = tool_name.removeprefix("chat_browser_") if resource_kind == "browser" else str(spec.command_type or spec.query_type or tool_name)
+        arguments = dict(invocation.arguments)
+        arguments.pop("idempotent", None)
+        run_id = str(arguments.get("run_id") or "").strip() or None
+        if run_id and resource_kind == "control":
+            try:
+                src.run_binding(task_binding.task_id, run_id)
+            except SrcStoreError as exc:
+                return CapabilityResult(
+                    ok=False, invocation_id=invocation.invocation_id,
+                    error=make_error(
+                        "task_binding_invalid", exc.message, ErrorCategory.PERMISSION,
+                        correlation_id=correlation_id,
+                    ).model_copy(update={"detail": {
+                        "task_id": task_binding.task_id, "run_id": run_id,
+                    }}),
+                )
+        policy = src.execution.current_policy(task_binding.task_id)
+        identity_ref = str(arguments.get("context_id") or "default")
+        trusted_identity_revision = 0
+        try:
+            identity_record = src.domain("identity").identity(task_binding.task_id, identity_ref)
+            trusted_identity_revision = int(identity_record.payload.get("config_revision") or identity_record.revision)
+        except SrcStoreError as exc:
+            if exc.code != "identity_unverified":
+                return CapabilityResult(
+                    ok=False, invocation_id=invocation.invocation_id,
+                    error=make_error(exc.code, exc.message, ErrorCategory.PERMISSION, correlation_id=correlation_id),
+                )
+        supplied_identity_rev = arguments.get("identity_revision")
+        if supplied_identity_rev is not None and int(supplied_identity_rev) not in {0, trusted_identity_revision}:
+            return CapabilityResult(
+                ok=False, invocation_id=invocation.invocation_id,
+                error=make_error("authorization_stale", "supplied identity_revision does not match trusted identity state", ErrorCategory.CONFLICT, correlation_id=correlation_id),
+            )
+        trusted_env_generation = int(policy.activation.get("generation") or 0)
+        request = ExecutionRequest(
+            invocation_id=invocation.invocation_id, task_id=task_binding.task_id,
+            thread_id=binding.thread_id,
+            run_id=run_id,
+            worker_id=str(arguments.get("worker_id") or "").strip() or None,
+            tool_name=tool_name, action=action, arguments=arguments,
+            arguments_hash=src.store.digest(arguments), resource_kind=resource_kind,
+            identity_ref=identity_ref,
+            identity_revision=trusted_identity_revision,
+            cwd=str(arguments.get("cwd") or ""),
+            environment_generation=trusted_env_generation,
+            policy_version=policy.version,
+        )
+
+        async def dispatch(_request: Any) -> CapabilityResult:
+            return await self._dispatch_to_command_api(binding, spec, invocation, correlation_id)
+
+        receipt = await src.execution.execute(request, dispatch, wait_for_approval=True)
+        if receipt.dispatch_state == "completed" and isinstance(receipt.result, CapabilityResult):
+            return receipt.result
+        if receipt.dispatch_state == "completed":
+            result = src.execution.read_result(task_binding.task_id, receipt)
+            if isinstance(result, CapabilityResult):
+                return result
+            return CapabilityResult(ok=True, invocation_id=invocation.invocation_id, result=result)
+        code = receipt.error_code or ("approval_required" if receipt.dispatch_state == "waiting_approval" else "outcome_unknown")
+        error = make_error(
+            code, f"SRC execution did not complete: {receipt.dispatch_state}",
+            ErrorCategory.PERMISSION if code in {"policy_denied", "authorization_unresolved"} else ErrorCategory.STATE,
+            correlation_id=correlation_id,
+        ).model_copy(update={"detail": {
+            "invocation_id": invocation.invocation_id, "dispatch_state": receipt.dispatch_state,
+            "outcome_known": receipt.outcome_known,
+        }})
+        return CapabilityResult(ok=False, invocation_id=invocation.invocation_id, error=error)
+
     async def _dispatch_to_command_api(
         self,
         binding: CapabilityBinding,
@@ -343,6 +443,30 @@ class AgentCapabilityGatewayImpl:
                 actor=actor,
                 params=args,
             ))
+            if isinstance(result.result, dict) and "image_bytes" in result.result:
+                import base64
+                from muteki.platform.contracts.capabilities import CapabilityImage
+                encoded = result.result["image_bytes"]
+                if not isinstance(encoded, dict) or encoded.get("encoding") != "base64":
+                    raise CommandAPIError(make_error(
+                        "src.image.encoding_invalid", "review image is not a base64 artifact",
+                        ErrorCategory.INTERNAL, correlation_id=correlation_id,
+                    ))
+                data = encoded.get("data")
+                if not isinstance(data, str):
+                    raise CommandAPIError(make_error(
+                        "src.image.encoding_invalid", "review image payload is missing",
+                        ErrorCategory.INTERNAL, correlation_id=correlation_id,
+                    ))
+                base64.b64decode(data, validate=True)
+                return CapabilityResult(
+                    ok=True, invocation_id=invocation.invocation_id,
+                    result={key: value for key, value in result.result.items() if key != "image_bytes"},
+                    images=[CapabilityImage(
+                        mime_type=str(result.result.get("media_type") or "application/octet-stream"),
+                        data=data,
+                    )],
+                )
             return CapabilityResult(
                 ok=True,
                 invocation_id=invocation.invocation_id,

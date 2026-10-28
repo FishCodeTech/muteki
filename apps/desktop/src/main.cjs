@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { randomUUID, createHash } = require('node:crypto');
-const { SHELL_URL, normalizeOrigin, normalizeDesktopRoute, desktopNavigationTarget, parseWebUrl, partitionFor, webPreferences } = require('./policy.cjs');
+const { SHELL_URL, normalizeOrigin, normalizeDesktopRoute, desktopNavigationTarget, desktopRouteMode, parseWebUrl, partitionFor, webPreferences } = require('./policy.cjs');
 const { readPreferences, writePreferences, notificationConsentKey } = require('./preferences.cjs');
 const { DesktopError, transportError, errorResponse, probeService, forwardService, closeScope } = require('./transport.cjs');
 const { saveAttachment, restoreAttachment, removeAttachment, cacheUsage } = require('./attachment-cache.cjs');
@@ -149,20 +149,27 @@ function command(name, record = focused()) {
 }
 function resetNavigation(record, route) {
   route = safeRoute(route);
-  record.navigation = { entries: [route], index: 0 };
-  return { route, canGoBack: false, canGoForward: false };
+  record.navigation = { entries: [route], modes: [desktopRouteMode(route)], index: 0 };
+  record.modeRoutes = new Map([[desktopRouteMode(route), route]]);
+  return { route, workspaceMode: desktopRouteMode(route), canGoBack: false, canGoForward: false };
 }
-function commitRoute(record, route, mode, historyIndex) {
+function commitRoute(record, route, mode, historyIndex, workspaceMode = desktopRouteMode(route)) {
   route = safeRoute(route);
   const history = record.navigation || { entries: [record.state.route], index: 0 };
+  history.modes ||= history.entries.map(desktopRouteMode);
   if (mode === 'traverse') history.index = historyIndex;
-  else if (mode === 'replace') history.entries[history.index] = route;
-  else if (history.entries[history.index] !== route) {
+  else if (mode === 'replace') {
+    history.entries[history.index] = route; history.modes[history.index] = workspaceMode;
+  } else if (history.entries[history.index] !== route || history.modes[history.index] !== workspaceMode) {
     history.entries = [...history.entries.slice(0, history.index + 1), route];
+    history.modes = [...history.modes.slice(0, history.index + 1), workspaceMode];
     history.index = history.entries.length - 1;
   }
   record.navigation = history;
-  emit(record, { route, configuring: false, canGoBack: history.index > 0, canGoForward: history.index < history.entries.length - 1 });
+  record.modeRoutes ||= new Map();
+  record.modeRoutes.set(workspaceMode, route);
+  if (record.remote) record.remote.desktopMode = workspaceMode;
+  emit(record, { route, workspaceMode, configuring: false, canGoBack: history.index > 0, canGoForward: history.index < history.entries.length - 1 });
 }
 async function executeCommand(name, record = focused()) {
   if (!record) return;
@@ -184,7 +191,7 @@ async function executeCommand(name, record = focused()) {
     return;
   }
   if (name === 'reload') emit(record, {anchorTarget: undefined});
-  if (name === 'reload' && record.scope && (record.state.route.startsWith('/chat') || record.state.route.startsWith('/settings'))) {
+  if (name === 'reload' && record.scope && (record.state.route.startsWith('/chat') || record.state.route.startsWith('/src') || record.state.route.startsWith('/settings'))) {
     const scope = record.scope, route = record.state.route, generation = record.generation;
     const saved = await persistenceBarrier(record, 'reload');
     if (!saved.persisted) throw new DesktopError('desktop.draft_save_failed', saved.error || '草稿未保存，刷新已暂停。', { retryable: true });
@@ -215,11 +222,17 @@ function disposePreview(record) {
   if (!record.window.isDestroyed()) record.window.contentView.removeChildView(preview);
   if (!preview.webContents.isDestroyed()) preview.webContents.close();
 }
-function disposeRemote(record) {
-  if (!record.remote) return;
-  const remote = record.remote; record.remote = undefined;
-  if (!record.window.isDestroyed()) record.window.contentView.removeChildView(remote);
+function disposeRemoteView(record, remote) {
+  if (!remote) return;
+  if (record.remote === remote) record.remote = undefined;
+  for (const [mode, parked] of record.parkedRemotes || []) if (parked.view === remote) record.parkedRemotes.delete(mode);
+  if (!record.window.isDestroyed() && record.window.contentView.children.includes(remote)) record.window.contentView.removeChildView(remote);
   if (!remote.webContents.isDestroyed()) remote.webContents.close();
+}
+function disposeRemote(record) {
+  const views = new Set([record.remote, ...[...(record.parkedRemotes?.values() || [])].map(parked => parked.view)]);
+  for (const remote of views) disposeRemoteView(record, remote);
+  record.parkedRemotes = new Map();
 }
 function handoffNotificationEntries(record) {
   for (const entry of [...(record.notifications?.values() || [])]) {
@@ -243,6 +256,7 @@ function disposeConnection(record) {
   disposeNotifications(record, 'desktop.notification_scope_closed');
   if (record.scope) scopes.delete(record.scope.host);
   record.scope = undefined;
+  record.modeRoutes = new Map();
   for (const socket of record.terminals.values()) socket.close();
   record.terminals.clear(); disposePreview(record); disposeRemote(record);
   record.workspaceGrants.clear();
@@ -329,7 +343,9 @@ async function renewManagedSessions() {
     const scope = record.scope;
     if (generation !== environment.generation || scope?.environmentId !== environment.id || scope.closed || !scope.auth.token) continue;
     scope.auth.accept({...runtime, auth_required: true, session_protocol: 2, session_owner: 'desktop'}, false, scope);
-    if (record.remote && !record.remote.webContents.isDestroyed()) await record.remote.webContents.session.cookies.set({url: runtime.origin + '/api', name: runtime.cookie_name, value: runtime.token, httpOnly: true, sameSite: 'strict', path: '/api'});
+    const sessions = new Set([record.remote, ...[...(record.parkedRemotes?.values() || [])].map(parked => parked.view)]
+      .filter(remote => remote && !remote.webContents.isDestroyed()).map(remote => remote.webContents.session));
+    for (const remoteSession of sessions) await remoteSession.cookies.set({url: runtime.origin + '/api', name: runtime.cookie_name, value: runtime.token, httpOnly: true, sameSite: 'strict', path: '/api'});
   }
 }
 async function openExternal(record, value) {
@@ -347,7 +363,7 @@ function safeRoute(value) {
 const SURFACE_INSET = { left: 56, top: 46, right: 8, bottom: 8 }, SURFACE_RADIUS = 12;
 // The desktop activity rail replaces the web app's own rail on remote pages,
 // which also hides that rail's theme toggle; applyRemoteAppearance takes over.
-const REMOTE_CHROME_CSS = '.workspace-frame { --workspace-rail-width: 0px; grid-template-columns: minmax(0, 1fr) !important; } .workspace-activity-rail { display: none !important; }';
+const REMOTE_CHROME_CSS = '.workspace-frame { --workspace-rail-width: 0px; grid-template-columns: minmax(0, 1fr) !important; } .workspace-activity-rail { display: none !important; } .workspace-frame-content { margin: 0 !important; border-radius: 0 !important; box-shadow: none !important; }';
 async function applyRemoteAppearance(record, contents = record.remote?.webContents) {
   const appearance = record.appearance;
   if (!appearance || !contents || contents.isDestroyed()) return;
@@ -396,33 +412,86 @@ function remoteBounds(record) {
   const [width, height] = record.window.getContentSize(), { left, top, right, bottom } = SURFACE_INSET;
   record.remote.setBounds({ x: left, y: top, width: Math.max(0, width - left - right), height: Math.max(0, height - top - bottom) });
 }
+async function setRemoteActive(remote, active) {
+  return remote.webContents.executeJavaScript(`(() => {
+    const active = ${JSON.stringify(active)};
+    if (!active) window.dispatchEvent(new Event('muteki:desktop-navigation-cancel'));
+    return !window.dispatchEvent(new CustomEvent('muteki:desktop-visibility', {cancelable: true, detail: {active}}));
+  })()`);
+}
+async function parkRemote(record, current) {
+  const remote = record.remote;
+  if (!remote) return;
+  const supported = !remote.webContents.isDestroyed() && await setRemoteActive(remote, false);
+  if (!current() || record.remote !== remote) return;
+  if (!supported) { disposeRemoteView(record, remote); return; }
+  // Pages consume one-shot view/focus query keys after the router's early ACK.
+  // Remember the document actually being parked, including that canonical URL.
+  const destination = parseWebUrl(remote.webContents.getURL());
+  if (destination?.origin === record.scope?.origin) {
+    record.modeRoutes ||= new Map();
+    record.modeRoutes.set(remote.desktopMode, safeRoute(destination.pathname + destination.search));
+  }
+  remote.setVisible(false);
+  record.window.contentView.removeChildView(remote);
+  record.remote = undefined;
+  record.parkedRemotes ||= new Map();
+  const previous = record.parkedRemotes.get(remote.desktopMode);
+  if (previous) disposeRemoteView(record, previous.view);
+  record.parkedRemotes.set(remote.desktopMode, {view: remote, scope: record.scope});
+  record.window.webContents.focus();
+}
+// Resolves after React commits the requested client navigation, not when the URL
+// first changes. A newer request releases the previous wait immediately.
+async function navigateRemoteClient(contents, href, id) {
+  return contents.executeJavaScript(`new Promise((resolve, reject) => {
+    const id = ${JSON.stringify(id)}, href = ${JSON.stringify(href)};
+    let timer;
+    const cleanup = () => {
+      clearTimeout(timer);
+      window.removeEventListener('muteki:desktop-navigated', committed);
+      window.removeEventListener('muteki:desktop-navigate', superseded);
+      window.removeEventListener('muteki:desktop-navigation-cancel', cancelled);
+    };
+    const committed = event => {
+      if (event.detail?.id !== id) return;
+      cleanup(); resolve({supported: true, href: event.detail.href});
+    };
+    const superseded = event => {
+      if (event.detail?.id === id) return;
+      cancelled();
+    };
+    const cancelled = () => { cleanup(); resolve({supported: true, cancelled: true}); };
+    window.addEventListener('muteki:desktop-navigated', committed);
+    window.addEventListener('muteki:desktop-navigate', superseded);
+    window.addEventListener('muteki:desktop-navigation-cancel', cancelled);
+    timer = setTimeout(() => { cleanup(); reject(new Error('工作台页面导航未完成，请重试。')); }, 15000);
+    const request = new CustomEvent('muteki:desktop-navigate', {cancelable: true, detail: {id, href}});
+    if (window.dispatchEvent(request)) { cleanup(); resolve({supported: false}); }
+  })`);
+}
 async function navigate(record, value, mode = 'push', historyIndex) {
-  const target = desktopNavigationTarget(value);
+  let target = desktopNavigationTarget(value);
+  const workspaceMode = mode === 'traverse'
+    ? record.navigation?.modes?.[historyIndex] || desktopRouteMode(target.route)
+    : desktopRouteMode(target.route);
+  if (mode === 'activate') {
+    const remembered = record.modeRoutes?.get(workspaceMode);
+    if (remembered) target = desktopNavigationTarget(remembered);
+  }
   const route = target.route === '/' ? '/chat' : target.route;
   const anchorTarget = target.hash ? {hash: target.hash, id: (record.anchorSequence = (record.anchorSequence || 0) + 1)} : undefined;
-  if (!['push', 'replace', 'traverse'].includes(mode) || (mode === 'traverse' && (!Number.isInteger(historyIndex) || record.navigation?.entries[historyIndex] !== route))) throw new DesktopError('desktop.navigation_invalid', '导航历史请求无效。');
+  if (!['push', 'replace', 'traverse', 'activate'].includes(mode) || (mode === 'traverse' && (!Number.isInteger(historyIndex) || record.navigation?.entries[historyIndex] !== route))) throw new DesktopError('desktop.navigation_invalid', '导航历史请求无效。');
   record.routeRequested = true;
-  const remoteRoute = !/^\/(chat|settings)(\/|\?|$)/.test(route) && route !== '/';
-  if (route === record.state.route && !record.state.configuring && !record.navigationPending
-      && (!remoteRoute || (record.remote && !record.remote.webContents.isDestroyed()))) {
+  const remoteRoute = !['chat', 'src', 'settings'].includes(workspaceMode);
+  if (route === record.state.route && workspaceMode === record.state.workspaceMode && !record.state.configuring && !record.navigationPending
+      && (!remoteRoute || (!target.hash && record.remote && !record.remote.webContents.isDestroyed()))) {
     if (!remoteRoute) {
-      if (mode === 'traverse' && historyIndex !== record.navigation?.index) { commitRoute(record, route, mode, historyIndex); persist(record); }
+      if (mode === 'traverse' && historyIndex !== record.navigation?.index) { commitRoute(record, route, mode, historyIndex, workspaceMode); persist(record); }
       emit(record, {anchorTarget});
     }
-    else if (target.hash) {
-      const generation = record.navigationGeneration = (record.navigationGeneration || 0) + 1;
-      const scope = record.scope, remote = record.remote;
-      record.navigationPending = true;
-      const current = () => generation === record.navigationGeneration && scope === record.scope && !scope.closed
-        && !record.window.isDestroyed() && record.remote === remote;
-      try { await remote.webContents.loadURL(scope.origin + route + target.hash); }
-      catch (cause) {
-        if (!current()) return;
-        throw new DesktopError('desktop.page_load_failed', '工作台页面加载失败，请重试。', { retryable: true, cause });
-      } finally { if (generation === record.navigationGeneration) record.navigationPending = false; }
-      if (current() && mode === 'traverse' && historyIndex !== record.navigation?.index) { commitRoute(record, route, mode, historyIndex); persist(record); }
-    } else if (mode === 'traverse' && historyIndex !== record.navigation?.index) {
-      commitRoute(record, route, mode, historyIndex); persist(record);
+    else if (!target.hash && mode === 'traverse' && historyIndex !== record.navigation?.index) {
+      commitRoute(record, route, mode, historyIndex, workspaceMode); persist(record);
     }
     return;
   }
@@ -433,15 +502,73 @@ async function navigate(record, value, mode = 'push', historyIndex) {
   record.navigationPending = true;
   disposePreview(record);
   emit(record, {anchorTarget: undefined});
-  if (/^\/(chat|settings)(\/|\?|$)/.test(route) || route === '/') {
-    disposeRemote(record); commitRoute(record, route, mode, historyIndex);
+  if (/^\/(chat|src|settings)(\/|\?|$)/.test(route) || route === '/') {
+    try { await parkRemote(record, current); }
+    catch (cause) {
+      if (!current()) return;
+      record.navigationPending = false;
+      disposeRemoteView(record, record.remote);
+      throw new DesktopError('desktop.page_load_failed', '工作台页面状态保存失败，请重试。', { retryable: true, cause });
+    }
+    if (!current()) return;
+    commitRoute(record, route, mode, historyIndex, workspaceMode);
     emit(record, {anchorTarget});
     persist(record); record.navigationPending = false; return;
   }
   if (!scope) { record.navigationPending = false; throw new DesktopError('desktop.not_connected', '请先连接工作台。'); }
-  disposeRemote(record);
-  let remote;
+  let remote = record.remote;
   try {
+    if (remote && remote.desktopMode !== workspaceMode) {
+      await parkRemote(record, current);
+      if (!current()) return;
+      remote = record.remote;
+    }
+    const parked = record.parkedRemotes?.get(workspaceMode);
+    if (!remote && parked) {
+      if (parked.scope === scope && !parked.view.webContents.isDestroyed()) {
+        remote = parked.view;
+        record.parkedRemotes.delete(workspaceMode); record.remote = remote;
+        record.window.contentView.addChildView(remote);
+        remoteBounds(record);
+        await applyRemoteAppearance(record, remote.webContents);
+        if (!current() || record.remote !== remote) return;
+      } else disposeRemoteView(record, parked.view);
+    }
+    if (remote && !remote.webContents.isDestroyed() && parseWebUrl(remote.webContents.getURL())?.origin === scope.origin) {
+      // Also reverses an interrupted park when another rail click wins.
+      await setRemoteActive(remote, true);
+      if (!current() || record.remote !== remote) return;
+      const existing = new URL(remote.webContents.getURL());
+      if (!target.hash && safeRoute(existing.pathname + existing.search) === route) {
+        remote.setVisible(true); remote.webContents.focus();
+        commitRoute(record, route, mode, historyIndex, workspaceMode); persist(record);
+        return;
+      }
+      const result = await navigateRemoteClient(remote.webContents, route + target.hash, generation);
+      if (!current() || record.remote !== remote || result.cancelled) return;
+      if (result.supported) {
+        const destination = new URL(remote.webContents.getURL());
+        const loadedRoute = safeRoute(destination.pathname + destination.search);
+        remote.setVisible(true); remote.webContents.focus();
+        commitRoute(record, route, mode, historyIndex, workspaceMode);
+        if (loadedRoute !== route) commitRoute(record, loadedRoute, 'replace', undefined, remoteRouteMode(loadedRoute, workspaceMode));
+        persist(record);
+        return;
+      }
+      // Older services have no router contract, so retain their full-page load.
+      await remote.webContents.loadURL(scope.origin + route + target.hash);
+      if (!current() || record.remote !== remote) return;
+      await remote.chromeReady;
+      if (!current() || record.remote !== remote) return;
+      remote.setVisible(true); remote.webContents.focus();
+      const destination = new URL(remote.webContents.getURL());
+      const loadedRoute = safeRoute(destination.pathname + destination.search);
+      commitRoute(record, route, mode, historyIndex, workspaceMode);
+      if (loadedRoute !== route) commitRoute(record, loadedRoute, 'replace', undefined, remoteRouteMode(loadedRoute, workspaceMode));
+      persist(record);
+      return;
+    }
+    disposeRemoteView(record, remote);
     const origin = scope.origin, partition = partitionFor(origin, scope.environmentId);
     const remoteSession = session.fromPartition(partition);
     if (scope.environmentId && managedService?.ready && scope.auth.token) {
@@ -456,33 +583,51 @@ async function navigate(record, value, mode = 'push', historyIndex) {
     remoteSession.setPermissionRequestHandler((contents, permission, callback, details) =>
       callback(permitsClipboard(contents, permission, details?.requestingUrl, details)));
     remote = new WebContentsView({ webPreferences: webPreferences(partition) });
+    remote.desktopMode = workspaceMode;
     remote.setBorderRadius(SURFACE_RADIUS);
     remote.setVisible(false);
     remote.webContents.setUserAgent(remote.webContents.getUserAgent().replace(/\sMutekiDesktop\/[^\s]+/g, '') + ` MutekiDesktop/${app.getVersion()}`);
-    remote.webContents.on('dom-ready', () => { if (record.remote === remote) void applyRemoteChrome(record, remote.webContents).catch(error => { if (record.remote === remote) emit(record, {message: `远程界面外观同步失败：${error.message}`}); }); });
+    remote.webContents.on('dom-ready', () => {
+      if (record.remote !== remote) return;
+      remote.chromeReady = applyRemoteChrome(record, remote.webContents);
+      void remote.chromeReady.catch(error => { if (record.remote === remote) emit(record, {message: `远程界面外观同步失败：${error.message}`}); });
+    });
     record.remote = remote; record.window.contentView.addChildView(remote); remoteBounds(record);
     guardRemote(record, remote.webContents, scope.origin);
     await remote.webContents.loadURL(scope.origin + route + target.hash);
     if (!current() || record.remote !== remote) return;
-    await applyRemoteChrome(record, remote.webContents);
+    await remote.chromeReady;
     if (!current() || record.remote !== remote) return;
-    remote.setVisible(true);
+    remote.setVisible(true); remote.webContents.focus();
     const destination = new URL(remote.webContents.getURL());
     const loadedRoute = safeRoute(destination.pathname + destination.search + destination.hash);
-    commitRoute(record, route, mode, historyIndex);
-    if (loadedRoute !== route) commitRoute(record, loadedRoute, 'replace');
+    commitRoute(record, route, mode, historyIndex, workspaceMode);
+    if (loadedRoute !== route) commitRoute(record, loadedRoute, 'replace', undefined, remoteRouteMode(loadedRoute, workspaceMode));
     persist(record);
   } catch (cause) {
     if (!current()) return;
-    disposeRemote(record); throw new DesktopError('desktop.page_load_failed', '工作台页面加载失败，请重试。', { retryable: true, cause });
+    disposeRemoteView(record, remote); throw new DesktopError('desktop.page_load_failed', '工作台页面加载失败，请重试。', { retryable: true, cause });
   } finally { if (generation === record.navigationGeneration) record.navigationPending = false; }
+}
+function remoteRouteMode(route, ownerMode) {
+  const pathname = new URL(route, SHELL_URL).pathname;
+  // RunWorkbench's graph route is shared by CTF and Pentest.
+  return ownerMode === 'pentest' && /^\/run\/[^/]+\/collaboration$/.test(pathname)
+    ? 'pentest' : desktopRouteMode(route);
 }
 function guardRemote(record, contents, origin, preview = false) {
   installKeyboard(record, contents);
   const guard = event => {
     const url = parseWebUrl(event.url);
     if (!url || (!preview && url.origin !== origin)) { event.preventDefault(); if (url) void openExternal(record, url.href).catch(error => emit(record, { message: error.message })); }
-    else if (!preview && /^\/(chat|settings)(\/|$)/.test(url.pathname)) { event.preventDefault(); void navigate(record, url.pathname + url.search + url.hash).catch(error => emit(record, { message: error.message })); }
+    else if (!preview) {
+      let targetMode;
+      try { targetMode = desktopRouteMode(url.pathname + url.search); } catch { return; }
+      if (targetMode !== record.remote?.desktopMode || ['chat', 'src', 'settings'].includes(targetMode)) {
+        event.preventDefault();
+        if (record.remote?.webContents === contents) void navigate(record, url.pathname + url.search + url.hash).catch(error => emit(record, { message: error.message }));
+      }
+    }
   };
   contents.on('will-navigate', guard); contents.on('will-redirect', event => { if (event.isMainFrame) guard(event); });
   if (!preview) {
@@ -496,10 +641,10 @@ function guardRemote(record, contents, origin, preview = false) {
         emit(record, { message: error.message, error: transportError(error) });
         return;
       }
-      if (/^\/(chat|settings)(\/|\?|$)/.test(route)) {
+      if (/^\/(chat|src|settings)(\/|\?|$)/.test(route)) {
         void navigate(record, route + url.hash).catch(error => emit(record, { message: error.message }));
       } else if (route !== record.state.route) {
-        commitRoute(record, route, 'push'); persist(record);
+        commitRoute(record, route, 'push', undefined, remoteRouteMode(route, record.remote.desktopMode)); persist(record);
       }
     };
     contents.on('did-navigate', (event, url) => navigated(event, url));
@@ -732,7 +877,7 @@ function identity(record, scope, data) {
   const restoreRoute = firstIdentity && !record.routeRequested;
   emit(record, { serviceId: scope.serviceId, identityId: scope.identityId, ...(restoreRoute ? resetNavigation(record, safeRoute(route)) : {}) });
   persist(record);
-  if (restoreRoute && (new URL(route, SHELL_URL).hash || (!/^\/(chat|settings)(\/|\?|$)/.test(route) && route !== '/'))) {
+  if (restoreRoute && (new URL(route, SHELL_URL).hash || (!/^\/(chat|src|settings)(\/|\?|$)/.test(route) && route !== '/'))) {
     void navigate(record, route, 'replace').catch(error => emit(record, { message: error.message, error: transportError(error) }));
   }
 }
@@ -1398,7 +1543,7 @@ else {
       }
       try {
         const pathname = decodeURIComponent(url.pathname);
-        const asset = pathname === '/' || /^\/(chat|settings)(\/|$)/.test(pathname) ? '/index.html' : pathname;
+        const asset = pathname === '/' || /^\/(chat|src|settings)(\/|$)/.test(pathname) ? '/index.html' : pathname;
         const file = path.resolve(root, `.${asset}`), type = types[path.extname(file)];
         if (!file.startsWith(`${root}${path.sep}`) || !type) return new Response('Not found', { status: 404 });
         return new Response(await fs.promises.readFile(file), { headers: { 'Content-Type': type, 'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src muteki-desktop:; frame-src muteki-desktop: blob:; base-uri 'self'; form-action 'none'; frame-ancestors 'none'", 'X-Content-Type-Options': 'nosniff' } });

@@ -92,7 +92,238 @@
   to { opacity: 1; transform: none; }
 }
 
+.cx-favicon {
+  background: hsl(var(--cx-fav-h, 220) 70% 50% / 0.16);
+  color: hsl(var(--cx-fav-h, 220) 55% 38%);
+}
+.dark .cx-favicon {
+  background: hsl(var(--cx-fav-h, 220) 60% 60% / 0.22);
+  color: hsl(var(--cx-fav-h, 220) 70% 78%);
+}
+
+/* Web research trail: each step hangs off a curved guide; a step that
+   found sources branches once more. Rows are 28px tall, so elbows meet
+   their row at 14px. */
+.cx-tree {
+  --cx-tree-line: var(--cx-border);
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  margin-left: 6px;
+}
+.cx-tree-item {
+  position: relative;
+  padding-left: 20px;
+}
+.cx-tree-item::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 12px;
+  height: 14px;
+  border-left: 1px solid var(--cx-tree-line);
+  border-bottom: 1px solid var(--cx-tree-line);
+  border-bottom-left-radius: 7px;
+}
+.cx-tree-item:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  border-left: 1px solid var(--cx-tree-line);
+}
+.cx-tree-item[data-fresh]::before {
+  animation: cx-tree-elbow 320ms var(--cx-ease-out) backwards;
+  animation-delay: inherit;
+}
+/* While the trail is live, the guide reaching down to a newly landed row grows into it. */
+.cx-tree[data-live] > .cx-tree-item:not(:last-child)::after {
+  transform-origin: top;
+  animation: cx-guide-grow 320ms var(--cx-ease-out) backwards;
+}
+@keyframes cx-guide-grow {
+  from { transform: scaleY(0.5); opacity: 0; }
+}
+@keyframes cx-tree-elbow {
+  from { clip-path: inset(0 100% 100% 0); }
+  to { clip-path: inset(0 0 0 0); }
+}
+
+.cx-stack-mark { transition: transform 160ms var(--cx-ease-out); }
+.cx-stack-mark:hover { z-index: 1; transform: translateY(-2px) scale(1.12); }
+.cx-stack-in { animation: cx-stack-in 360ms var(--cx-ease-out) backwards; }
+@keyframes cx-stack-in {
+  from { opacity: 0; transform: translateX(-6px) scale(0.6); }
+  to { opacity: 1; transform: none; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .cx-timeline-done [data-tick] { stroke-dashoffset: 0; animation: none; }
 }
 html[data-motion="reduce"] .cx-timeline-done [data-tick] { stroke-dashoffset: 0; animation: none; }
+
+/* ── Turn work motion ─────────────────────────────────────────────────────
+   Entry animations fill `backwards` only, so a finished one leaves no
+   transform behind to keep the node on its own compositor layer. */
+@keyframes cx-enter {
+  from { opacity: 0; transform: translateY(6px); filter: blur(3px); }
+  to { opacity: 1; transform: none; filter: none; }
+}
+@keyframes cx-enter-soft {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes cx-pop {
+  0% { opacity: 0; transform: scale(0.4); }
+  60% { opacity: 1; transform: scale(1.18); }
+  100% { transform: scale(1); }
+}
+@keyframes cx-diff-in {
+  from { opacity: 0; transform: translateX(-6px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes cx-rule-sweep {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(260%); }
+}
+@keyframes cx-glyph {
+  0%, 100% { opacity: 0.18; transform: scale(0.7); }
+  35% { opacity: 1; transform: scale(1); }
+}
+
+.cx-enter { animation: cx-enter 360ms var(--cx-ease-out) backwards; }
+.cx-enter-soft { animation: cx-enter-soft 300ms var(--cx-ease-out) backwards; }
+.cx-pop { animation: cx-pop 360ms cubic-bezier(0.34, 1.56, 0.64, 1) backwards; }
+.cx-diff-in { animation: cx-diff-in 280ms var(--cx-ease-out) backwards; }
+
+/* ── Arrival colour ──────────────────────────────────────────────────────
+   A streamed word fades in over 180 ms while its colour runs linearly from
+   the accent through two neighbouring hues (+45°, +100°) to the text colour.
+   One word lands per frame, so about a dozen are mid-sweep at once and the
+   edge of the answer reads as one soft gradient. The hue follows the scheme
+   accent, whichever colour the user picked. */
+:is(.cx-stream-word, .cx-hue-in) {
+  --cx-arrive-1: var(--cx-accent);
+  --cx-arrive-2: color-mix(in oklch, var(--cx-accent) 55%, var(--violet, var(--cx-accent)));
+  --cx-arrive-3: color-mix(in oklch, var(--cx-accent) 45%, var(--magenta, var(--cx-accent)));
+}
+@supports (color: oklch(from red l c h)) {
+  :is(.cx-stream-word, .cx-hue-in) {
+    --cx-arrive-1: oklch(from var(--cx-accent) 0.7 0.14 h);
+    --cx-arrive-2: oklch(from var(--cx-accent) 0.58 0.17 calc(h + 45));
+    --cx-arrive-3: oklch(from var(--cx-accent) 0.62 0.13 calc(h + 100));
+  }
+  .dark :is(.cx-stream-word, .cx-hue-in) {
+    --cx-arrive-1: oklch(from var(--cx-accent) 0.78 0.13 h);
+    --cx-arrive-2: oklch(from var(--cx-accent) 0.72 0.16 calc(h + 45));
+    --cx-arrive-3: oklch(from var(--cx-accent) 0.76 0.12 calc(h + 100));
+  }
+}
+@keyframes cx-word-fade {
+  from { opacity: 0; }
+}
+@keyframes cx-arrive-hue {
+  0% { color: var(--cx-arrive-1); }
+  30% { color: var(--cx-arrive-2); }
+  60% { color: var(--cx-arrive-3); }
+  /* No 100% stop: the sweep settles on whatever colour the element already has. */
+}
+.cx-stream-word {
+  animation:
+    cx-word-fade 180ms cubic-bezier(0.25, 0.1, 0.25, 1) both,
+    cx-arrive-hue 180ms linear both;
+}.cx-hue-in { animation: cx-arrive-hue 900ms linear backwards; animation-delay: inherit; }
+
+/* ── Row reveal ──────────────────────────────────────────────────────────
+   A landing row opens its own height, so the rows below slide instead of
+   jumping, and sharpens out of a blur behind a clipping edge. */
+.cx-reveal {
+  display: grid;
+  grid-template-rows: 1fr;
+  /* Content of a still-opening row must not count toward the scroll height ahead of the row itself. */
+  overflow-y: clip;
+  overflow-clip-margin: 4px;
+  animation:
+    cx-reveal-open 380ms var(--cx-ease-out) backwards,
+    cx-reveal-clarity 460ms var(--cx-ease-out) backwards;
+}
+.cx-reveal > * { min-height: 0; }
+@keyframes cx-reveal-open {
+  from { grid-template-rows: 0fr; clip-path: inset(0 -24px 100% -24px); }
+  to { grid-template-rows: 1fr; clip-path: inset(0 -24px 0 -24px); }
+}
+@keyframes cx-reveal-clarity {
+  from { opacity: 0; filter: blur(6px); transform: translateY(2px); }
+  to { opacity: 1; filter: none; transform: none; }
+}
+
+.cx-chevron {
+  transition: transform 340ms cubic-bezier(0.34, 1.56, 0.64, 1), opacity 150ms var(--cx-ease-out);
+}
+.cx-chevron[data-open] { transform: rotate(90deg); }
+
+/* Hairline under the turn header; a soft light travels along it while the agent works. */
+.cx-turn-rule {
+  position: relative;
+  height: 1px;
+  overflow: hidden;
+  background: var(--cx-border);
+}
+.cx-turn-rule[data-live]::after {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 38%;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--cx-fg) 55%, transparent), transparent);
+  animation: cx-rule-sweep 2.4s cubic-bezier(0.45, 0, 0.25, 1) infinite;
+}
+
+/* About one row deep, so the row gliding out under the header dissolves instead of clipping. */
+.cx-live-tail.cx-fade-y[data-fade-top="true"] { --cx-fade-top: 30px; }
+
+/* Output peek: older lines dissolve as new ones push in from below. */
+.cx-peek-mask {
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 1.4em);
+  mask-image: linear-gradient(to bottom, transparent, #000 1.4em);
+}
+
+/* 3×3 dot matrix; the ripple runs diagonally from the top-left corner. */
+.cx-working-glyph {
+  display: inline-grid;
+  flex: none;
+  grid-template-columns: repeat(3, 3px);
+  gap: 1.5px;
+  width: 12px;
+  height: 12px;
+  align-content: center;
+  justify-content: center;
+  color: var(--cx-fg-2);
+}
+.cx-working-glyph > i {
+  width: 3px;
+  height: 3px;
+  border-radius: 1px;
+  background: currentColor;
+  animation: cx-glyph 1.4s ease-in-out infinite;
+}
+.cx-working-glyph > i:nth-child(2), .cx-working-glyph > i:nth-child(4) { animation-delay: 0.12s; }
+.cx-working-glyph > i:nth-child(3), .cx-working-glyph > i:nth-child(5), .cx-working-glyph > i:nth-child(7) { animation-delay: 0.24s; }
+.cx-working-glyph > i:nth-child(6), .cx-working-glyph > i:nth-child(8) { animation-delay: 0.36s; }
+.cx-working-glyph > i:nth-child(9) { animation-delay: 0.48s; }
+.cx-working-glyph[data-paused] > i { animation-play-state: paused; opacity: 0.35; transform: none; }
+
+/* Delayed cascades would otherwise hold rows hidden for their delay. */
+@media (prefers-reduced-motion: reduce) {
+  .cx-enter-soft, .cx-diff-in, .cx-stream-word, .cx-hue-in, .cx-reveal { animation: none; }
+  .cx-turn-rule[data-live]::after { display: none; }
+  .cx-working-glyph > i { animation: none; opacity: 0.6; }
+  .cx-source-chip, .cx-stack-in, .cx-tree-item[data-fresh]::before, .cx-tree[data-live] > .cx-tree-item::after { animation: none; }
+}
+html[data-motion="reduce"] :is(.cx-enter-soft, .cx-diff-in, .cx-stream-word, .cx-hue-in, .cx-reveal) { animation: none; }
+html[data-motion="reduce"] :is(.cx-source-chip, .cx-stack-in) { animation: none; }
+html[data-motion="reduce"] .cx-tree-item[data-fresh]::before,
+html[data-motion="reduce"] .cx-tree[data-live] > .cx-tree-item::after { animation: none; }
+html[data-motion="reduce"] .cx-turn-rule[data-live]::after { display: none; }
+html[data-motion="reduce"] .cx-working-glyph > i { animation: none; opacity: 0.6; }

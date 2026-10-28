@@ -16,6 +16,9 @@ async def _handle_run_lifecycle_control(self, context: ControlCommandContext) ->
     # the lever for a challenge that never yields a gated flag. Wake the
     # coordinator so it checks the flag at its next iteration boundary.
     if action in ("stop", "complete"):
+        reason = str(cmd.get("reason") or "").strip()
+        if reason in {"hosted_deadline", "budget_exhausted", "visit_deadline"}:
+            self._budget_exhausted_kind = "wall_clock_budget_exhausted"
         self._operator_stop = True
         self._pending_help = []
         if self._operator_event is not None:

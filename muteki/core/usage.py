@@ -18,7 +18,9 @@ from uuid import uuid4
 from muteki.core.cost import PRICES
 
 FIELDS = ('input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens', 'reasoning_tokens')
-DIMS = ('run_id', 'thread_id', 'turn_id', 'competition_id', 'challenge_id', 'worker_id', 'role', 'actor_kind', 'model', 'engine', 'generation', 'workspace_kind')
+AMOUNT_FIELDS = ('reported_cost', 'estimated_cost')
+CUMULATIVE_FIELDS = (*FIELDS, *AMOUNT_FIELDS)
+DIMS = ('run_id', 'thread_id', 'turn_id', 'competition_id', 'challenge_id', 'worker_id', 'role', 'actor_kind', 'model', 'engine', 'generation', 'workspace_kind', 'credential_id', 'provider_id', 'speed', 'catalog_provider')
 request_identity: ContextVar[str | None] = ContextVar('usage_request_identity', default=None)
 _context: ContextVar[tuple | None] = ContextVar('usage_context', default=None)
 _TRUSTED_PRICE_SOURCES = frozenset({'model_price', 'driver_estimate'})
@@ -130,6 +132,11 @@ def normalize(raw: dict) -> dict:
     read = pick('cache_read_tokens', 'cached_input_tokens', 'cache_read_input_tokens', 'cacheRead', 'cacheReadTokens')
     write = pick('cache_write_tokens', 'cache_creation_input_tokens', 'cacheWrite', 'cacheWriteTokens')
     reasoning = pick('reasoning_tokens', 'reasoning_output_tokens', 'reasoningOutputTokens')
+    # DeepSeek reports an inclusive prompt total plus hit/miss cache details.
+    if read is None:
+        read = number(raw.get('prompt_cache_hit_tokens'))
+    if inp is None and read is not None and number(raw.get('prompt_cache_miss_tokens')) is not None:
+        inp = read + number(raw.get('prompt_cache_miss_tokens'))
     details = raw.get('prompt_tokens_details') or {}
     if read is None and isinstance(details, dict):
         read = number(details.get('cached_tokens'))
@@ -145,7 +152,7 @@ def normalize(raw: dict) -> dict:
     result['quality'] = 'estimated' if raw.get('estimated') else ('reported' if inp is not None and out is not None else 'partial' if inp is not None or out is not None else 'missing')
     result['source'] = str(raw.get('source') or 'runtime')
     result['input_includes_cache'] = True
-    result['token_schema_version'] = 2
+    result['token_schema_version'] = max(2, number(raw.get('token_schema_version')) or 0)
     if raw.get('normalization_repair'):
         result['normalization_repair'] = raw['normalization_repair']
     if isinstance(raw.get('historical_observation'), dict):
@@ -162,7 +169,7 @@ def _cumulative_delta(current: dict, previous: dict) -> dict:
     """
     delta = {"source": "runtime-cumulative", "measurement_scope": "interval", "input_includes_cache": True}
     rebased = False
-    for key in FIELDS:
+    for key in CUMULATIVE_FIELDS:
         value = current.get(key)
         baseline = previous.get(key)
         if value is None:
@@ -176,6 +183,74 @@ def _cumulative_delta(current: dict, previous: dict) -> dict:
         delta["status"] = "counter_reset_rebased"
     return delta
 
+
+
+def usage_view(row: dict) -> dict:
+    """Repair the proven old Cursor SDK disjoint-input schema on read only."""
+    if (row.get('engine') != 'cursor.sdk' or row.get('source') != 'runtime'
+            or (number(row.get('token_schema_version')) or 0) >= 3):
+        return row
+    result = dict(row)
+    result['captured_tokens'] = {key: row.get(key) for key in (*FIELDS, 'token_schema_version', 'quality')}
+    inp, read, write = (number(row.get(key)) for key in ('input_tokens', 'cache_read_tokens', 'cache_write_tokens'))
+    result['input_tokens'] = inp + sum(value for value in (read, write) if value is not None) if inp is not None else None
+    result['input_lower_bound'] = read is None or write is None
+    result['quality'] = ('reported' if not result['input_lower_bound'] and result['input_tokens'] is not None and result.get('output_tokens') is not None
+                         else 'partial' if result['input_tokens'] is not None or result.get('output_tokens') is not None else 'missing')
+    result['normalization_repair'] = 'cursor_sdk_disjoint_v3_view'
+    result['token_schema_version'] = 3
+    return result
+
+
+def is_context_only(row: dict) -> bool:
+    """Capacity observations are not unreported consumption invocations.
+
+    A monetary observation remains consumption evidence even if emitted on an
+    occupancy notification. Genuine invocations with missing usage stay visible.
+    """
+    occupancy = row.get('source') == 'context-only' or row.get('measurement_scope') == 'context_only'
+    has_amount = any(isinstance(row.get(key), (float, int)) and not isinstance(row[key], bool)
+                     and math.isfinite(row[key]) and row[key] >= 0 for key in AMOUNT_FIELDS)
+    return occupancy and not has_amount
+
+
+def merge_usage_observations(rows: list[dict]) -> list[dict]:
+    """Join separate turn tokens and session-cost deltas for display only.
+
+    The amount checkpoint remains durable. A unique matching turn observation
+    receives its estimate so catalog/custom pricing can replace it once. Without
+    an explicit turn identity or a unique recipient, retain the original rows.
+    """
+    dimensions = ('thread_id', 'turn_id', 'run_id', 'generation', 'worker_id', 'role', 'actor_kind',
+                  'engine', 'model', 'credential_id', 'provider_id')
+    buckets = {}
+    for index, row in enumerate(rows):
+        if row.get('thread_id') and row.get('turn_id'):
+            buckets.setdefault(tuple(row.get(key) for key in dimensions), []).append(index)
+    result = list(rows)
+    removed = set()
+    for indexes in buckets.values():
+        tokens = [index for index in indexes if any(number(rows[index].get(key)) is not None for key in FIELDS[:2])]
+        amounts = [index for index in indexes if rows[index].get('source') == 'runtime-cumulative'
+                   and rows[index].get('measurement_scope') == 'interval'
+                   and rows[index].get('price_source') == 'driver_estimate'
+                   and all(number(rows[index].get(key)) is None for key in FIELDS)
+                   and any(rows[index].get(key) is not None for key in AMOUNT_FIELDS)]
+        if len(tokens) != 1 or not amounts:
+            continue
+        target = dict(rows[tokens[0]])
+        target['captured_cost'] = {key: target.get(key) for key in (*AMOUNT_FIELDS, 'price_source', 'cost_status')}
+        target['amount_observations'] = [{key: rows[index].get(key) for key in
+                                          ('id', 'reported_cost', 'estimated_cost', 'source', 'measurement_scope')}
+                                         for index in amounts]
+        if target.get('reported_cost') is None:
+            values = [rows[index].get('estimated_cost') for index in amounts if rows[index].get('estimated_cost') is not None]
+            if values:
+                target['estimated_cost'] = sum(values)
+                target['price_source'] = 'driver_estimate'
+        result[tokens[0]] = target
+        removed.update(amounts)
+    return [row for index, row in enumerate(result) if index not in removed]
 
 
 def _token_coverage(items, inp, out) -> str:
@@ -382,7 +457,14 @@ class UsageStore:
         identity = identity or uuid4().hex
         raw = _repair_runtime_observation(raw, str(context.get('engine') or ''))
         data = {k: context[k] for k in DIMS if context.get(k) is not None}
+        for key in ('credential_id', 'provider_id', 'speed', 'catalog_provider'):
+            if isinstance(data.get(key), str) and not data[key].strip():
+                data.pop(key)
         data.update(normalize(raw))
+        if raw.get('catalog_provider') == 'ollama-cloud' and isinstance(raw.get('route_provenance'), dict):
+            data['catalog_provider'] = 'ollama-cloud'
+            data['route_provenance'] = {key: raw['route_provenance'][key] for key in
+                                        ('source', 'evidence', 'generation') if key in raw['route_provenance']}
         for key in ('reported_cost', 'estimated_cost'):
             value = raw.get(key)
             if isinstance(value, (float, int)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
@@ -466,18 +548,43 @@ class UsageStore:
         change consumption. A decreasing counter is explicitly incomplete.
         """
         sample = normalize(raw)
+        if raw.get('price_source') in _TRUSTED_PRICE_SOURCES and not context.get('price_source'):
+            context['price_source'] = raw['price_source']
+        for key in AMOUNT_FIELDS:
+            value = raw.get(key)
+            if isinstance(value, (float, int)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+                sample[key] = value
+        # Adapters can publish amount and token totals separately. Each field
+        # retains its own preceding checkpoint rather than clearing the other
+        # channel's baseline when an event omits it.
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
+            old = db.execute('SELECT data FROM usage_samples WHERE series=? AND seq=?', (series, seq)).fetchone()
+            previous_sample = json.loads(old[0]) if old else {}
+            changed_fields = {key for key in CUMULATIVE_FIELDS if sample.get(key) is not None or previous_sample.get(key) is not None}
             db.execute('INSERT OR REPLACE INTO usage_samples VALUES (?,?,?,?,?,?)',
                        (series, seq, f"{series}:{seq}", at, json.dumps(sample), json.dumps(context)))
-            predecessor = db.execute('SELECT data FROM usage_samples WHERE series=? AND seq<? ORDER BY seq DESC LIMIT 1', (series, seq)).fetchone()
-            rows = db.execute('SELECT seq,identity,at,data,context FROM usage_samples WHERE series=? AND seq>=? ORDER BY seq LIMIT 2', (series, seq)).fetchall()
-            previous = json.loads(predecessor[0]) if predecessor else {}
-            for index, uid, stamp, encoded, scope in rows:
-                current = json.loads(encoded)
+            affected = {seq}
+            for key in changed_fields:
+                successor = db.execute(
+                    f"SELECT seq FROM usage_samples WHERE series=? AND seq>? AND json_extract(data,'$.{key}') IS NOT NULL ORDER BY seq LIMIT 1",
+                    (series, seq)).fetchone()
+                if successor:
+                    affected.add(successor[0])
+            for index in sorted(affected):
+                uid, stamp, encoded, scope = db.execute(
+                    'SELECT identity,at,data,context FROM usage_samples WHERE series=? AND seq=?', (series, index)).fetchone()
+                current, previous = json.loads(encoded), {}
+                for key in CUMULATIVE_FIELDS:
+                    if current.get(key) is None:
+                        continue
+                    baseline = db.execute(
+                        f"SELECT json_extract(data,'$.{key}') FROM usage_samples WHERE series=? AND seq<? AND json_extract(data,'$.{key}') IS NOT NULL ORDER BY seq DESC LIMIT 1",
+                        (series, index)).fetchone()
+                    if baseline:
+                        previous[key] = baseline[0]
                 delta = _cumulative_delta(current, previous)
                 self.record(delta, identity=uid, seq=index, at=stamp, _db=db, **json.loads(scope))
-                previous = current
 
     def run_totals(self, run_id: str) -> dict[str, int | float | None]:
         """Read additive durable usage for Run recovery without loading records."""
@@ -526,7 +633,8 @@ class UsageStore:
             "unverified_estimates": int(row[6] or 0),
         }
 
-    def query(self, *, start: float = 0, end: float | None = None, offset: int = 0, limit: int = 100, **filters):
+    def read_records(self, *, start: float = 0, end: float | None = None, **filters):
+        """Read filtered observations without pricing or unused ledger aggregates."""
         with self.connect() as db:
             db.execute('BEGIN')
             revision = db.execute("SELECT value FROM usage_meta WHERE key='revision'").fetchone()[0]
@@ -545,8 +653,10 @@ class UsageStore:
             rows = db.execute('SELECT id,at,data FROM usage WHERE ' + ' AND '.join(clauses) + ' ORDER BY at DESC,id DESC', values).fetchall()
         records = []
         for uid, at, encoded in rows:
-            row = json.loads(encoded)
+            row = usage_view(json.loads(encoded))
             row.update(id=uid, at=at)
+            if is_context_only(row):
+                continue
             if row.get('run_id') in owners:
                 competition_id, challenge_id = owners[row['run_id']]
                 row['competition_id'] = competition_id
@@ -562,6 +672,14 @@ class UsageStore:
             elif _unverified_estimate(row):
                 row['cost_status'] = 'legacy_estimate_unverified'
             records.append(row)
+        return dict(revision=revision, records=records)
+
+    def query(self, *, start: float = 0, end: float | None = None, offset: int = 0, limit: int = 100, **filters):
+        snapshot = self.read_records(start=start, end=end, **filters)
+        revision, records = snapshot['revision'], snapshot['records']
+        from muteki.core.model_pricing import price_ledger_rows, pricing_service
+        from muteki.core.usage_routes import recover_usage_routes
+        records = price_ledger_rows(merge_usage_observations(recover_usage_routes(records, self.path.parent)), pricing_service(self.path.parent))
         def aggregate(items):
             # Sum only observed fields. Missing stays None so callers can tell
             # "never reported" from an explicit zero consumption.
@@ -585,6 +703,12 @@ class UsageStore:
                                 ('estimated_cost', _estimated_amount)):
                 values = [value for r in items if (value := amount(r)) is not None]
                 result[key] = sum(values) if values else None
+            known_costs = [r['cost'] for r in items if r.get('cost') is not None]
+            result['cost'] = sum(known_costs) if known_costs else None
+            from muteki.core.model_pricing import aggregate_pricing_issues
+            result['pricing_issues'] = aggregate_pricing_issues(items)
+            result['pricing_coverage'] = {kind: sum(r.get('amount_source') == kind for r in items)
+                                          for kind in ('provider_reported', 'driver_estimate', 'catalog', 'custom', 'captured_estimate', 'unpriced')}
             result['unpriced'] = sum(
                 _reported_amount(r) is None and _estimated_amount(r) is None
                 for r in items

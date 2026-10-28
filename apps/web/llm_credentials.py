@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-LLM_PROFILE_NAMES = {"planner", "titler"}
+LLM_PROFILE_NAMES = {"planner", "titler", "reviewer"}
 MODEL_ENDPOINT_PREFIX = "endpoint:"
 
 
@@ -53,6 +53,7 @@ class ResolvedLlmCredential:
     base_url: str
     models: tuple[str, ...]
     source: str
+    provider_id: str = ""
 
 
 class LlmCredentialStore:
@@ -242,6 +243,7 @@ def resolve_llm_profile_credential(
         ),
         models=tuple(models),
         source="global",
+        provider_id=str(public.get("provider") or "").strip(),
     )
 
 

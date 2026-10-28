@@ -207,11 +207,12 @@
 .cx-prose .cx-md-code { margin-top: var(--cx-prose-gap); margin-bottom: 0; }
 .cx-prose-sm .cx-md-code { font-size: 12px; }
 
-/* Streaming caret rides the end of the last inline block without reflowing it. */
-.cx-prose[data-streaming="true"] > .cx-md-block:last-child > :is(p, h1, h2, h3, h4, h5, h6):last-child::after,
-.cx-prose[data-streaming="true"] > .cx-md-block:last-child > :is(ul, ol):last-child > li:last-child:not(:has(> :is(ul, ol, p)))::after,
-.cx-prose[data-streaming="true"] > .cx-md-block:last-child > :is(ul, ol):last-child > li:last-child > p:last-child::after,
-.cx-prose[data-streaming="true"] > .cx-md-block:last-child > blockquote:last-child > p:last-child::after {
+/* Streaming caret rides the end of the last inline block without reflowing it.
+   Word-by-word reveal has no caret: the fading words are the live edge. */
+.cx-prose[data-streaming="true"]:not([data-words]) > .cx-md-block:last-child > :is(p, h1, h2, h3, h4, h5, h6):last-child::after,
+.cx-prose[data-streaming="true"]:not([data-words]) > .cx-md-block:last-child > :is(ul, ol):last-child > li:last-child:not(:has(> :is(ul, ol, p)))::after,
+.cx-prose[data-streaming="true"]:not([data-words]) > .cx-md-block:last-child > :is(ul, ol):last-child > li:last-child > p:last-child::after,
+.cx-prose[data-streaming="true"]:not([data-words]) > .cx-md-block:last-child > blockquote:last-child > p:last-child::after {
   content: "";
   display: inline-block;
   width: 0.5em;

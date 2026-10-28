@@ -8,6 +8,7 @@ import os
 import uuid
 from typing import Any, Optional
 
+from muteki.core.blocking import run_blocking
 from muteki.control import (
     ControlScope,
     WorkerRef,
@@ -430,14 +431,15 @@ async def _cancel_standby(self, run: Run, *, timeout: float) -> dict[str, Any]:
     }
 
 
-def _fresh_bus(self, run: Run) -> None:
+def _fresh_bus(self, run: Run, *, durable_seq: int | None = None) -> None:
     """Replace a run's CLOSED bus with a live one (same sinks) so a standby
     worker's events reach a freshly-opened SSE stream. After the main run
     ended, run.bus was close()d — its subscribers got the end sentinel and the
     browser's EventSource reconnected, but the closed bus won't fan out to new
     subscribers. A new bus, re-wired to the SessionStore + rail meta sinks,
     keeps the durable JSONL append-only and the rail metadata fresh."""
-    durable_seq = run.store.last_stream_seq(run.run_id)
+    if durable_seq is None:
+        durable_seq = run.store.last_stream_seq(run.run_id)
     self._bump_bus_seq(run.bus, durable_seq)
     if not getattr(run.bus, "_closed", False):
         return  # still open (live run) — keep it
@@ -455,14 +457,15 @@ def _fresh_bus(self, run: Run) -> None:
     run.cost.bus = new_bus  # cost updates emit onto the live bus too
 
 
-def _ensure_standby(self, run_id: str, cmd: dict[str, Any]) -> bool:
+async def _ensure_standby(self, run_id: str, cmd: dict[str, Any]) -> bool:
     """Spin up a standby worker to serve `cmd`, unless one is already running
     (serialized — one standby per run). Fire-and-forget; events stream live."""
     run = self.runs.get(run_id)
     if run is None:
         return False
-    if (self._shutting_down or run_id in self._closing_runs
-            or run_id in self._launching_runs):
+    durable_seq = await run_blocking(run.store.last_stream_seq, run.run_id)
+    if (self.runs.get(run_id) is not run or self._shutting_down
+            or run_id in self._closing_runs or run_id in self._launching_runs):
         return False
     if self._standby_busy(run):
         return False  # a standby is already serving this run — don't pile on
@@ -485,7 +488,7 @@ def _ensure_standby(self, run_id: str, cmd: dict[str, Any]) -> bool:
         cleanup_task.cancel()
     run.standby_runtime_cleanup_task = None
     if bool(getattr(run.bus, "_closed", False)):
-        self._fresh_bus(run)
+        self._fresh_bus(run, durable_seq=durable_seq)
     from apps.web.drivers import build_standby_driver
     driver = build_standby_driver(cmd, mgr=self)
 
@@ -510,7 +513,8 @@ def _ensure_standby(self, run_id: str, cmd: dict[str, Any]) -> bool:
                 return
             try:
                 if bool(getattr(run.bus, "_closed", False)):
-                    self._fresh_bus(run)
+                    self._fresh_bus(run, durable_seq=await run_blocking(
+                        run.store.last_stream_seq, run.run_id))
                 await run.bus.emit(Event(
                     event_type=EventType.FOLLOWUP_FAILED,
                     run_id=run_id,
@@ -625,7 +629,7 @@ def _meta_sink_for(self, run: Run):
         run.updated_seq = self._seq
         run.updated_at = ev.ts
         if ev.event_type is EventType.HITL_REQUEST:
-            self._record_decision_request(run, ev)
+            await self._record_decision_request(run, ev)
         if _apply_operator_meta(run, ev):
             return
         if ev.event_type in {EventType.RUN_PREPARING, EventType.RUN_STARTED}:

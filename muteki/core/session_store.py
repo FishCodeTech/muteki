@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator, Mapping
 
+from muteki.core.blocking import run_blocking
 from muteki.core.events import Event
 from muteki.core.path_ids import decode_run_id, encode_run_id
 
@@ -93,10 +94,13 @@ class SessionStore:
         path = self._path(event.run_id)
         line = event.model_dump_json() + "\n"
         async with self._lock_for(event.run_id):
-            # Synchronous append under an async lock; writes are small and the
-            # OS buffers them. Keeps ordering per run without a thread pool.
-            with path.open("a", encoding="utf-8") as f:
-                f.write(line)
+            def write() -> None:
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(line)
+
+            # Keep the lock until disk work actually ends, even on cancellation.
+            # A cancelled writer must not race the next append for this Run.
+            await run_blocking(write)
 
     def _append_if_absent_unlocked(
         self, event: Event, *, identity_field: str, identity: str
@@ -169,40 +173,51 @@ class SessionStore:
         """
 
         async with self._lock_for(event.run_id):
-            return self._append_if_absent_unlocked(
-                event, identity_field=identity_field, identity=identity
+            return await run_blocking(
+                self._append_if_absent_unlocked, event,
+                identity_field=identity_field, identity=identity,
             )
 
     # EventBus sink signature
     async def sink(self, event: Event) -> None:
         await self.append(event)
 
-    async def replay(self, run_id: str) -> AsyncIterator[Event]:
+    def _replay_sync(self, run_id: str) -> Iterator[Event]:
         path = self._path(run_id)
         if not path.exists():
             return
-        with path.open("r", encoding="utf-8") as f:
-            n = 0
-            for raw in f:
+        with path.open("r", encoding="utf-8") as source:
+            for raw in source:
                 raw = raw.strip()
                 if not raw:
                     continue
                 try:
                     parsed = _object_row(json.loads(raw))
-                    if parsed is None:
-                        continue
-                    event = Event.model_validate(parsed)
+                    if parsed is not None:
+                        yield Event.model_validate(parsed)
                 except (json.JSONDecodeError, TypeError, ValueError):
-                    # JSONL is append-only operational history: one torn, scalar, or
-                    # schema-invalid row must not hide later valid events.
+                    # Preserve later valid events after torn or invalid history.
                     continue
-                n += 1
-                yield event
-                if n % _REPLAY_YIELD_EVERY == 0:
-                    # Historical SSE subscribers can replay tens of thousands
-                    # of JSONL events. Cooperate with the uvicorn loop so
-                    # unrelated API calls do not look globally frozen.
-                    await asyncio.sleep(0)
+
+    async def replay(self, run_id: str) -> AsyncIterator[Event]:
+        # Read and validate complete records in bounded batches outside the loop.
+        # Skipped invalid rows can be arbitrarily large too, so yielding only
+        # after valid records on the loop does not isolate historical replay.
+        iterator = self._replay_sync(run_id)
+
+        def read_batch() -> list[Event]:
+            from itertools import islice
+            return list(islice(iterator, _REPLAY_YIELD_EVERY))
+
+        try:
+            while True:
+                batch = await run_blocking(read_batch)
+                if not batch:
+                    break
+                for event in batch:
+                    yield event
+        finally:
+            await run_blocking(iterator.close)
 
     def last_stream_seq(self, run_id: str) -> int:
         """Return the monotonic SSE sequence after normalizing persisted history.

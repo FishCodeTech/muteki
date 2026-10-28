@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -83,6 +84,30 @@ class GrokDriver(ClaudeCodeDriver):
             self.bin, *self._base_flags(
                 web_access=web_access, launch=launch), "-p", prompt,
         ]
+
+    def build_execute_input(
+        self, prompt: str, session: Optional[str], *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        argv = self.build_execute(
+            "", session, web_access=web_access, kb_access=kb_access,
+            stream=stream, launch=launch)
+        prefix = self._offline_prefix(web_access=web_access)
+        return [*prefix, sys.executable, str(_SOLVER_DIR / "grok_prompt_bridge.py"),
+                "--binary", self.bin, *argv[len(prefix) + 1:-2]], prompt
+
+    def build_resume_input(
+        self, prompt: str, session: str, *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        argv = self.build_resume(
+            "", session, web_access=web_access, kb_access=kb_access,
+            stream=stream, launch=launch)
+        prefix = self._offline_prefix(web_access=web_access)
+        return [*prefix, sys.executable, str(_SOLVER_DIR / "grok_prompt_bridge.py"),
+                "--binary", self.bin, *argv[len(prefix) + 1:-2]], prompt
 
     def build_execute_stdin(
         self, prompt: str, session: Optional[str], *,

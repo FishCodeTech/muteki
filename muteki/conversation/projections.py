@@ -165,9 +165,10 @@ def _compaction_window(
     window["compacted"].append(record)
     if status == "completed":
         window["compact_status"] = "done"
-        # The pre-compaction occupancy is no longer true. Without an
-        # engine-reported value the gauge waits for the next usage report.
-        window["total"] = record.get("tokens_after")
+        # Confirmed compaction invalidates the old occupancy. An unconfirmed
+        # command ending is not evidence that the context changed.
+        if payload.get("confirmed") is not False:
+            window["total"] = record.get("tokens_after")
     elif status == "interrupted":
         window["compact_status"] = "interrupted"
     else:
@@ -253,6 +254,7 @@ _QUIET_EVENT_TYPES = frozenset({
 _SUBAGENT_PATCH_FIELDS = (
     "status", "child_turn_id", "message_id", "error_code", "error",
     "worktree_state", "spawn_state", "started_at", "completed_at",
+    "turn_id", "result", "activity", "adapter_id", "model", "effort", "access_mode",
 )
 
 
@@ -690,12 +692,18 @@ class ConversationProjection:
             if native == "acp.usage_update":
                 # Capacity/occupancy is not consumption; keep token fields missing
                 # so aggregate/UI can show 未上报 instead of a fake 0.
-                raw = {"source": "context-only"}
+                raw = {"source": "context-only", "measurement_scope": "context_only"}
             context = dict(thread_id=thread_id, turn_id=p.get("turn_id"),
                            workspace_kind="conversation", actor_kind="worker", role="assistant",
-                           model=runtime.get("model"), engine=runtime.get("adapter_id"))
+                           model=runtime.get("model"), engine=runtime.get("adapter_id"),
+                           credential_id=runtime.get("credential_id") or None,
+                           provider_id=runtime.get("provider_id") or None,
+                           speed={"priority": "fast", "fast": "fast", "standard": "standard", "ultrafast": "ultrafast"}.get(runtime.get("service_tier")),
+                           price_source=raw.get("price_source"))
             if native == "thread/tokenUsage/updated":
-                self.usage.cumulative(raw, series=f"conversation:{thread_id}:{session}",
+                epoch = str(p.get("usage_epoch") or "")
+                series = f"conversation:{thread_id}:{session}" + (f":{epoch}" if epoch else "")
+                self.usage.cumulative(raw, series=series,
                                       seq=event.stream_seq, at=event.occurred_at.timestamp(), **context)
             else:
                 self.usage.record(raw, identity=f"conversation:{thread_id}:{key}",
@@ -760,17 +768,16 @@ class ConversationProjection:
                 or not state.agent_session_id
                 or state.agent_session_id == closed_id
             )
+            keep_history = bool(p.get("resume_available") or p.get("history_preserved"))
             if still_active:
-                if matches_pointer:
+                if matches_pointer and not keep_history:
                     update["agent_session_id"] = None
                 # Keep running_turn_id, session_runtime_key, pending approvals
                 # and pending_user_input so the user retains control.
             else:
                 update["running_turn_id"] = None
-                keep_resume = bool(p.get("resume_available")) and p.get("reason") == "operator_stopped"
-                if matches_pointer and not keep_resume:
+                if matches_pointer and not keep_history:
                     update["agent_session_id"] = None
-                if not keep_resume:
                     update["session_runtime_key"] = ""
                 update.update(_queue_update(
                     state, expire_reason="Runtime 会话已关闭，待审请求已过期"))
@@ -780,16 +787,17 @@ class ConversationProjection:
                 p.get("generation") or state.current_generation)
             update["session_runtime_key"] = str(p.get("runtime_key") or "")
             update["agent_session_id"] = str(p.get("agent_session_id") or "") or None
+            same_native_history = p.get("recovery_kind") in {"native_resume", "reuse_live"}
             if state.context_window:
                 # Occupancy and limit belong to the previous engine's context;
                 # the new Runtime reports its own.
                 update["context_window"] = {
                     **state.context_window,
                     "total": None, "limit": None, "zones": [],
-                    "compact_status": "idle", "source": "runtime_switched",
+                    "compact_status": "idle", "source": "native_resumed" if same_native_history else "runtime_switched",
                     "updated_at": event.occurred_at.isoformat(),
                 }
-            if state.plan is not None and state.plan.phase not in {
+            if not same_native_history and state.plan is not None and state.plan.phase not in {
                 "cleared", "unsupported",
             }:
                 # Keep last snapshot visible but mark continuity risk until the
@@ -912,8 +920,11 @@ class ConversationProjection:
         runs: list[list[Any]] = []
         after, applied = 0, False
         while True:
-            page = self._store.read_events(
-                ev.AGGREGATE_THREAD, thread_id, after_seq=after, limit=1000)
+            page = self._store.read_turn_event_candidates(
+                ev.AGGREGATE_THREAD, thread_id, turn_id, ev.EV_MESSAGE_DELTA,
+                after_seq=after,
+                through_seq=through.stream_seq if through is not None else None,
+                limit=1000)
             for event in page:
                 if through is not None and event.stream_seq > through.stream_seq:
                     break
@@ -937,12 +948,15 @@ class ConversationProjection:
         text = self._collect_assistant_delta_text(thread_id, turn_id)
         if not text.strip():
             return
-        state = self._conv.get_state(thread_id)
-        update: dict[str, Any] = {}
-        self._save_assistant_message(
-            thread_id, turn_id, text, state.head_stream_seq, state, update)
-        if update:
-            self._conv.save_state(state.model_copy(update=update))
+        with self._store.transaction():
+            if self._conv.get_message(_assistant_message_id(turn_id)) is not None:
+                return
+            state = self._conv.get_state(thread_id)
+            update: dict[str, Any] = {}
+            self._save_assistant_message(
+                thread_id, turn_id, text, state.head_stream_seq, state, update)
+            if update:
+                self._conv.save_state(state.model_copy(update=update))
 
     # -- 重建 / 已读 -----------------------------------------------------------
 
@@ -996,9 +1010,10 @@ class ConversationProjection:
 
     def mark_read(self, thread_id: str) -> ThreadState:
         """用户查看 Thread：已读水位推进到当前流头（清除 unread）。"""
-        state = self._conv.get_state(thread_id)
-        return self._conv.save_state(state.model_copy(
-            update={"read_stream_seq": state.head_stream_seq}))
+        with self._store.transaction():
+            state = self._conv.get_state(thread_id)
+            return self._conv.save_state(state.model_copy(
+                update={"read_stream_seq": state.head_stream_seq}))
 
 
 __all__ = ["ConversationProjection"]

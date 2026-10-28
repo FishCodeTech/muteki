@@ -531,6 +531,7 @@ export function ThreadGitActions({
       className="min-w-[230px]"
       trigger={(
         <IconButton
+          size="md"
           icon="gitBranch"
           loading={Boolean(busy) && !primaryBusy}
           label={hint ? `Git 操作 · ${hint}` : "Git 操作"}

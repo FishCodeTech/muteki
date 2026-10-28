@@ -9,7 +9,7 @@ import { desktopChatBridge } from "@/lib/desktopChatBridge";
  */
 export type ShortcutActionId =
   | "newChat" | "search" | "toggleSidebar" | "focusComposer" | "help"
-  | "togglePanel" | "panelDiff" | "panelPreview" | "panelFiles" | "panelTerminal" | "panelOverview"
+  | "togglePanel" | "panelDiff" | "panelPreview" | "panelFiles" | "panelTerminal" | "panelOverview" | "panelAgents"
   | "toggleLog" | "modelPicker" | "effortPicker" | "accessPicker" | "interactionMode";
 
 export interface ShortcutActionMeta {
@@ -32,6 +32,7 @@ export const SHORTCUT_ACTIONS: ShortcutActionMeta[] = [
   { id: "panelFiles", label: ["文件面板", "Files panel"], defaultBinding: "mod+alt+f" },
   { id: "panelTerminal", label: ["终端面板", "Terminal panel"], defaultBinding: "mod+alt+t" },
   { id: "panelOverview", label: ["概览面板", "Overview panel"], defaultBinding: "mod+alt+o" },
+  { id: "panelAgents", label: ["子代理面板", "Subagents panel"], defaultBinding: "mod+alt+a" },
   { id: "toggleLog", label: ["执行日志", "Execution log"], defaultBinding: "mod+j" },
   { id: "modelPicker", label: ["选择模型", "Select model"], defaultBinding: "mod+shift+m" },
   { id: "effortPicker", label: ["思考强度", "Reasoning effort"], defaultBinding: "mod+shift+e" },

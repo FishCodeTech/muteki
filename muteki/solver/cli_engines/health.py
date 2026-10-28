@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -95,7 +96,7 @@ def engine_liveness(account_root: "Optional[str]" = None) -> dict:
         try:
             healthy, detail = _probe_health_with_creds(name, drv, account_root)
         except Exception as exc:  # noqa: BLE001 — bar must never break
-            healthy, detail = False, str(exc)[:160]
+            healthy, detail = False, str(exc)
         out[name] = {"healthy": bool(healthy), "detail": detail or ""}
     _health_cache["data"] = out
     _health_cache["ts"] = now
@@ -197,11 +198,16 @@ def engine_status(account_root: "Optional[str]" = None,
     else:
         selected = [(name, None) for name in DRIVERS]
     out: list[dict] = []
+    # Profile rows share a binary-only probe within this status request.
+    binary_status: dict[str, bool] = {}
     for name, profile in selected:
         drv = driver_for(profile) if profile else DRIVERS[name]
         try:
             b = drv.bin
-            ok = _runs_ok(b)
+            resolved_binary = os.path.abspath(shutil.which(b) or b)
+            if resolved_binary not in binary_status:
+                binary_status[resolved_binary] = _runs_ok(b)
+            ok = binary_status[resolved_binary]
         except Exception:
             b, ok = name, False
         row = {
@@ -253,7 +259,10 @@ def engine_health(backend: str = "local",
         return _engine_health_container()
     profile_rows = [p for p in (profiles or []) if isinstance(p, dict)]
     if profile_rows:
-        from muteki.solver.credential_accounts import runtime_env_for_engine
+        from muteki.solver.credential_accounts import (
+            engine_writes_agent_state,
+            runtime_env_for_engine,
+        )
 
         def _insert_model(argv: list[str], model: str) -> list[str]:
             model = (model or "").strip()
@@ -281,44 +290,59 @@ def engine_health(backend: str = "local",
                 else:
                     account_id = str(profile.get("credential_account") or "").strip()
                     resolved_account_id = account_id if account_id else ""
-                    env = runtime_env_for_engine(
-                        name,
-                        account_root=Path(account_root) if account_root else None,
-                        account_id=resolved_account_id,
-                        container=False,
-                    ).env
-                    old = {k: os.environ.get(k) for k in env}
-                    try:
-                        os.environ.update(env)
-                        if profile_uses_endpoint(profile):
-                            healthy, detail = drv.health_detail()
-                        else:
-                            argv = _insert_model(
-                                drv._hello_argv(),  # noqa: SLF001 - self-check mirrors driver probe.
-                                str(profile.get("model") or ""))
-                            if not argv:
-                                healthy, detail = False, "driver has no hello probe"
+                    with _contextlib.ExitStack() as stack:
+                        agent_state_dir = (
+                            Path(
+                                stack.enter_context(
+                                    tempfile.TemporaryDirectory(
+                                        prefix=f"muteki-{name}-health-"
+                                    )
+                                )
+                            )
+                            if engine_writes_agent_state(name)
+                            else None
+                        )
+                        env = runtime_env_for_engine(
+                            name,
+                            account_root=Path(account_root) if account_root else None,
+                            account_id=resolved_account_id,
+                            container=False,
+                            agent_state_dir=agent_state_dir,
+                            model=str(profile.get("model") or ""),
+                            runtime_max_output_tokens=profile.get("max_output_tokens"),
+                        ).env
+                        old = {k: os.environ.get(k) for k in env}
+                        try:
+                            os.environ.update(env)
+                            if profile_uses_endpoint(profile):
+                                healthy, detail = drv.health_detail()
                             else:
-                                rr = subprocess.run(
-                                    argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                    timeout=getattr(drv, "_HELLO_TIMEOUT", 90))
-                                healthy = bool(drv._hello_ok(rr))  # noqa: SLF001
-                                if not healthy:
-                                    tail = (rr.stderr or rr.stdout or "").strip().splitlines()
-                                    detail = (f"hello exited {rr.returncode}"
-                                              + (f": {tail[-1][:120]}" if tail else ""))
-                    finally:
-                        for k, v in old.items():
-                            if v is None:
-                                os.environ.pop(k, None)
-                            else:
-                                os.environ[k] = v
+                                argv = _insert_model(
+                                    drv._hello_argv(),  # noqa: SLF001 - self-check mirrors driver probe.
+                                    str(profile.get("model") or ""))
+                                if not argv:
+                                    healthy, detail = False, "driver has no hello probe"
+                                else:
+                                    rr = subprocess.run(
+                                        argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                        timeout=getattr(drv, "_HELLO_TIMEOUT", 90))
+                                    healthy = bool(drv._hello_ok(rr))  # noqa: SLF001
+                                    if not healthy:
+                                        tail = (rr.stderr or rr.stdout or "").strip().splitlines()
+                                        detail = (f"hello exited {rr.returncode}"
+                                                  + (f": {tail[-1]}" if tail else ""))
+                        finally:
+                            for k, v in old.items():
+                                if v is None:
+                                    os.environ.pop(k, None)
+                                else:
+                                    os.environ[k] = v
             except FileNotFoundError:
                 detail = "binary not found on PATH"
             except subprocess.TimeoutExpired:
                 detail = "probe timed out"
             except Exception as e:  # noqa: BLE001
-                detail = str(e)[:160]
+                detail = str(e)
             out.append({"engine": name, "profile_id": profile.get("id") or "",
                         "profile_name": profile.get("name") or profile.get("id") or name,
                         "model": str(profile.get("model") or ""),
@@ -348,7 +372,7 @@ def engine_health(backend: str = "local",
         except subprocess.TimeoutExpired:
             detail = "probe timed out"
         except Exception as e:  # noqa: BLE001 — surface the message to the operator
-            detail = str(e)[:160]
+            detail = str(e)
         # bin_source tells the FE whether this path was explicitly pinned (env) or
         # auto-discovered (known-good / path) so it can warn that an unpinned local
         # default may resolve to the wrong version, and point at the env var to fix.
@@ -367,6 +391,7 @@ _CONTAINER_ENGINE_BIN = {
     "pi": "pi",
     "omp": "/home/kali/.local/bin/omp",
     "kimi": "kimi",
+    "zcode": "zcode",
     "grok": "/home/kali/.grok/bin/grok",
     "opencode": "opencode",
     "droid": "droid",
@@ -396,7 +421,7 @@ def _engine_health_container() -> list[dict]:
         except subprocess.TimeoutExpired:
             image_detail = "docker image inspect timed out"
         except Exception as e:  # noqa: BLE001
-            image_detail = str(e)[:120]
+            image_detail = str(e)
 
     for name in DRIVERS:
         bin_in = _CONTAINER_ENGINE_BIN.get(name, name)
@@ -422,7 +447,7 @@ def _engine_health_container() -> list[dict]:
             except subprocess.TimeoutExpired:
                 detail = "container probe timed out"
             except Exception as e:  # noqa: BLE001
-                detail = str(e)[:120]
+                detail = str(e)
         out.append({"engine": name, "bin": bin_in, "version": version,
                     "healthy": healthy, "detail": detail, "backend": "container"})
     return out

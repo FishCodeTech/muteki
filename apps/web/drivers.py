@@ -27,9 +27,11 @@ from apps.web.worker_config import (
     backend_for_profile,
     resolve_worker_backend,
 )
+from muteki.core.blocking import run_blocking
 from muteki.solver.credential_accounts import account_store_root
 from muteki.core.runtime_env import is_web_container
 from muteki.solver.worker_profiles import (
+    freeze_worker_price_identity,
     apply_worker_identity_env,
     base_engine_for_profile,
     normalize_profile_roster,
@@ -165,12 +167,13 @@ def _profile_readiness_key(
     *,
     runtime: dict,
     backend: str,
+    sessions_root: Path | None = None,
 ) -> str:
     """Identify the exact runnable profile configuration for task-level reuse."""
     material = {
-        # v2 只接受真实 CLI model probe；使旧版由 structured Runtime 健康
+        # 只接受真实 CLI model probe；使旧版由 structured Runtime 健康
         # 状态写入的绿色缓存立即失效。
-        "readiness_contract": "worker-cli-v2",
+        "readiness_contract": "worker-cli-v3",
         "execution_transport": "cli",
         "profile_id": str(
             profile.get("id") or profile.get("name") or profile.get("engine") or ""
@@ -182,6 +185,13 @@ def _profile_readiness_key(
         "backend": backend,
         "runtime": runtime,
     }
+    if sessions_root is not None and material["credential_account"]:
+        from muteki.solver.credential_accounts import CredentialAccountStore
+
+        root = account_store_root(sessions_root)
+        material["credential_root"] = str(root.resolve())
+        material["credential_revision"] = CredentialAccountStore(root).revision(
+            material["credential_account"])
     encoded = json.dumps(
         material, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         default=str,
@@ -199,13 +209,18 @@ async def _startup_readiness(
     effective_network: str = "",
     cost_budget_usd: float | None = None,
     price_for: Callable[[str], Any] | None = None,
+    cache_ttl_seconds: float | None = None,
 ) -> tuple[dict[str, bool], list[dict[str, Any]]]:
     """Send one real CLI model request for every participating Worker profile."""
     from apps.web.worker_models import ProbeProcessOwner, probe_worker_model
     from muteki.solver.profile_health import evaluate_profile_health
+    from muteki.solver.worker_readiness import (
+        readiness_cache_ttl, readiness_identity, worker_readiness_cache,
+    )
 
     runtime = {"network": worker_network}
     owner = ProbeProcessOwner()
+    ttl = readiness_cache_ttl() if cache_ttl_seconds is None else cache_ttl_seconds
 
     async def _probe(profile: dict) -> tuple[str, bool, dict[str, Any] | None]:
         profile_id = str(
@@ -234,8 +249,11 @@ async def _startup_readiness(
                 "detail": detail,
             }
         cache_key = _profile_readiness_key(
-            profile, runtime=runtime, backend=backend)
-        cached = cached_results.get(cache_key)
+            profile, runtime=runtime, backend=backend,
+            sessions_root=sessions_root)
+        # Hosted batches use only live, expiring CLI evidence. A persisted Run
+        # readiness row must not bypass TTL or a changed credential revision.
+        cached = cached_results.get(cache_key) if ttl <= 0 else None
         if cached is not None:
             cached_ok, cached_failure = cached
             return profile_id, cached_ok, copy.deepcopy(cached_failure)
@@ -253,21 +271,54 @@ async def _startup_readiness(
                 "detail": binding.detail or binding.blocker or "凭据未配置",
             }
         else:
-            result = await asyncio.to_thread(
-                probe_worker_model,
-                profile=profile,
-                model=str(profile.get("model") or ""),
-                reasoning_effort=str(
-                    profile.get("reasoning_effort") or "default"),
-                sessions_root=sessions_root,
-                backend=backend,
-                runtime=runtime,
-                owner=owner,
-            )
+            identity = None
+            if ttl > 0:
+                identity = await asyncio.to_thread(
+                    readiness_identity, profile, runtime=runtime, backend=backend,
+                    sessions_root=sessions_root,
+                )
+
+            async def real_cli_probe() -> dict[str, Any]:
+                probe_owner = ProbeProcessOwner() if ttl > 0 else owner
+                try:
+                    return await asyncio.to_thread(
+                        probe_worker_model,
+                        profile=profile,
+                        model=str(profile.get("model") or ""),
+                        reasoning_effort=str(
+                            profile.get("reasoning_effort") or "default"),
+                        sessions_root=sessions_root,
+                        backend=backend,
+                        runtime=runtime,
+                        owner=probe_owner,
+                    )
+                except asyncio.CancelledError:
+                    await asyncio.to_thread(probe_owner.cancel)
+                    await asyncio.to_thread(probe_owner.wait, 15.0)
+                    raise
+
+            if identity is not None:
+                result = await worker_readiness_cache.get(
+                    identity, real_cli_probe, ttl_seconds=ttl,
+                )
+            else:
+                result = await real_cli_probe()
+            if identity is not None:
+                current_identity = await asyncio.to_thread(
+                    readiness_identity, profile, runtime=runtime, backend=backend,
+                    sessions_root=sessions_root,
+                )
+                if current_identity != identity:
+                    worker_readiness_cache.invalidate()
+                    result = {
+                        "ok": False, "layer": "binding",
+                        "detail": "Worker configuration changed during its CLI model preflight; run readiness again",
+                    }
         if result.get("ok"):
             cached_results[cache_key] = (True, None)
             return profile_id, True, None
         layer = str(result.get("layer") or "model")
+        error_code = str(result.get("error_code") or "").strip()
         detail = _safe_preflight_detail(result.get("detail"), layer=layer)
         code = f"preflight_{layer}_failed"
         failure = {
@@ -284,6 +335,7 @@ async def _startup_readiness(
             "stage": "preflight",
             "layer": layer,
             "code": code,
+            "error_code": error_code,
             "detail": detail,
         }
         cached_results[cache_key] = (False, copy.deepcopy(failure))
@@ -348,8 +400,8 @@ def _flag_format_fields(ch: dict[str, Any], body: dict[str, Any]) -> tuple[str, 
     hint = str(ch.get("flag_format_hint") or ch.get("flagFormatHint") or "").strip()
     cleaned_wrapper = _clean_flag_wrapper(wrapper)
     # The helper owns the selector/wrapper precedence for every start path:
-    # custom-or-empty format may use the wrapper as a contract, while an explicit
-    # regex or token mode remains authoritative.
+    # custom-or-empty format may use the wrapper as prompt guidance; these
+    # fields never validate or rewrite a submitted candidate.
     contract = normalize_flag_contract(raw_format, cleaned_wrapper)
     flag_format = contract.flag_format
     cleaned_wrapper = contract.flag_format_wrapper
@@ -363,12 +415,7 @@ def _flag_format_fields(ch: dict[str, Any], body: dict[str, Any]) -> tuple[str, 
 
 
 def _normalize_start_flag_contract(body: dict[str, Any] | None) -> dict[str, Any]:
-    """Copy and normalize the start payload's flag contract synchronously.
-
-    ``build_driver`` is shared by HTTP, Command API and RunGateway starts.  Doing
-    this before a Driver coroutine is returned makes an invalid regex an admission
-    error, rather than a delayed runtime failure after Workers have started.
-    """
+    """Copy Flag prompt metadata shared by HTTP, Command API and RunGateway."""
     normalized = dict(body or {})
     challenge = dict(normalized.get("challenge") or {})
     flag_format, hint, wrapper = _flag_format_fields(challenge, normalized)
@@ -440,9 +487,11 @@ async def _open_planner_llm(
         "bus": run.bus,
         **llm_temperature_kwargs(planner_profile),
     }
+    usage_identity = {"engine": "api", "speed": str(planner_profile.get("speed") or "")}
     if mgr is not None:
         credential = resolve_llm_profile_credential(
             "planner", planner_profile, sessions_root=mgr.state_root)
+        usage_identity.update(credential_id=credential.endpoint_id, provider_id=credential.provider_id)
         if credential.base_url:
             llm_kwargs["base_url"] = credential.base_url
         if credential.api_key:
@@ -454,6 +503,7 @@ async def _open_planner_llm(
         raise ValueError("planner API key is missing")
     llm = await llm_cm.__aenter__()
     llm.usage_generation = run.execution_generation
+    llm.usage_identity = usage_identity
     return llm_cm, llm
 
 
@@ -494,7 +544,22 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         from muteki.sandbox.manager import SandboxManager
         from muteki.solver.result import ArtifactStore
         from muteki.solver.types import SolverConfig
+        from muteki.solver.execution_budget import ExecutionBudget
         from muteki.swarm.models import default_lineup
+
+        execution_budget_record = body.get("execution_budget")
+        if execution_budget_record is None and mgr is not None:
+            execution_budget_record = mgr.load_run_launch_limits(
+                run.run_id).get("execution_budget")
+        if execution_budget_record is not None and not isinstance(execution_budget_record, dict):
+            raise ValueError("execution_budget must be an object")
+        execution_budget = (
+            ExecutionBudget.from_record(execution_budget_record)
+            if execution_budget_record is not None else None
+        )
+        if execution_budget is not None:
+            execution_budget.require_action(
+                reserve_seconds=execution_budget.finalization_seconds)
 
         # Legacy explicit standard spec is accepted; research implementations
         # are no longer shipped.
@@ -636,8 +701,10 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         worker_network = str(
             body.get("worker_network") or wc.get("worker_network") or "bridge"
         ).strip()
-        if worker_network not in {"bridge", "host", "none"}:
-            raise RuntimeError("worker_network must be bridge, host, or none")
+        if worker_network not in {"bridge", "host", "none"} and not re.fullmatch(
+            r"(?:container|src-record):muteki-src-egress-[a-f0-9]{24}", worker_network
+        ):
+            raise RuntimeError("worker_network must be bridge, host, none, or a managed SRC gateway")
         # #171 / MNT-09.04: offline / web_access=false denies WebSearch/WebFetch
         # only. It must NOT silently force Docker --network none, and must not
         # report "cannot reach network". Container egress is a separate knob.
@@ -775,9 +842,28 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         if mode == "pentest":
             dispatch_mode = "auto"
         stage_policy["coordinator"]["dispatch_mode"] = dispatch_mode
-        race_scout = dispatch_mode == "fixed"
-        race_engines = list(engines) if race_scout else []
-        race_timeout = int(body.get("race_timeout", wc.get("race_timeout", 300)))
+        # Hosted revisits run a bounded independent campaign race before
+        # returning to automatic coordination. Web scheduling keeps its defaults.
+        hosted_visit = stage_policy["coordinator"].get("hosted_visit")
+        hosted_generation = (
+            hosted_visit.get("generation") if isinstance(hosted_visit, dict) else None
+        )
+        hosted_revisit_race = (
+            mode == "ctf"
+            and type(hosted_generation) is int
+            and hosted_generation >= 2
+            and bool(stage_policy.get("race", {}).get("enabled"))
+        )
+        race_scout = dispatch_mode == "fixed" or hosted_revisit_race
+        race_engines = (
+            list(stage_policy["race"].get("engines") or engines)
+            if hosted_revisit_race else list(engines) if race_scout else []
+        )
+        race_timeout = int(
+            stage_policy["race"].get("timeout", 300)
+            if hosted_revisit_race
+            else body.get("race_timeout", wc.get("race_timeout", 300))
+        )
         stage_policy.setdefault("race", {})["enabled"] = race_scout
         stage_policy["race"]["engines"] = list(race_engines)
         if race_scout:
@@ -810,6 +896,11 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
             env_backend=os.environ.get("MUTEKI_WORKER_BACKEND"),
             in_web_container=is_web_container(),
         )
+        if (runtime_policy.get("worker_backend")
+                and worker_backend != runtime_policy["worker_backend"]):
+            from apps.web.run_recovery import WorkerRuntimePolicyUnavailable
+            raise WorkerRuntimePolicyUnavailable(
+                "Run Worker backend differs from its saved isolation policy")
         if (body.get("worker_backend") is not None
                 and runtime_policy.get("worker_backend")
                 and resolve_worker_backend(
@@ -880,6 +971,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                                     worker_backend=worker_backend,
                                     in_web_container=is_web_container(),
                                 ),
+                                sessions_root=mgr.state_root,
                             ) in run.profile_readiness,
                         }
                         for profile in precheck_profiles
@@ -974,7 +1066,12 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                     for ref in unknown_profile_refs
                 ]
             else:
-                startup_health_snapshot, preflight_failures = await _startup_readiness(
+                readiness_timeout = (
+                    execution_budget.call_limit_seconds(
+                        reserve_seconds=execution_budget.finalization_seconds)
+                    if execution_budget is not None else None
+                )
+                readiness = _startup_readiness(
                     profiles=precheck_profiles,
                     worker_network=worker_network,
                     worker_backend=worker_backend,
@@ -984,6 +1081,12 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                     cost_budget_usd=effective_cost_budget_usd,
                     price_for=run.cost.price_for,
                 )
+                if execution_budget is None:
+                    startup_health_snapshot, preflight_failures = await readiness
+                else:
+                    startup_health_snapshot, preflight_failures = await asyncio.wait_for(
+                        readiness, timeout=readiness_timeout,
+                    )
                 mgr.persist_profile_readiness(run)
             # A stale optional profile must not make a task unusable when another
             # selected profile has passed its real model preflight.  The Swarm
@@ -1075,7 +1178,9 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
 
         # §16 flywheel store (optional; recall prior + distill on solve)
         from muteki.learning.distill import TemplateStore
-        knowledge = TemplateStore(root=os.environ.get("MUTEKI_KNOWLEDGE_DIR", "knowledge"))
+        # 默认放在可写的服务状态目录，不依赖只读源码工作目录。
+        knowledge_root = (mgr.state_root if mgr is not None else root) / "knowledge"
+        knowledge = TemplateStore(root=os.environ.get("MUTEKI_KNOWLEDGE_DIR", str(knowledge_root)))
 
         # Initialise the run-local control boundary before workers are built so
         # every spawn registers against the same registry and secret:// values can
@@ -1094,7 +1199,7 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         worker_registry = getattr(run, "worker_registry", None)
         if mgr is not None:
             try:
-                _actor, control_journal, secret_store = mgr._ensure_control(run)
+                _actor, control_journal, secret_store = await mgr._ensure_control_async(run)
                 secret_resolver = secret_store.resolve
                 context_provider = control_journal.context_resources
                 context_binder = control_journal.bind_context
@@ -1113,68 +1218,106 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
                 # an otherwise valid solve from starting.
                 secret_resolver = None
 
-        swarm = swarm_cls(
-            challenge, default_lineup(n), llm=llm, sandbox=sandbox,
-            bus=run.bus, cost=run.cost, artifacts=arts,
-            config=SolverConfig(), run_id=run.run_id, knowledge=knowledge,
-            execution_generation=int(getattr(run, "execution_generation", 1) or 1),
-            hitl_inbox=run.hitl,
-            worker_cmds=run.worker_cmds,
-            control_ready=run.control_ready,
-            worker_control_ready=run.worker_control_ready,
-            executor=executor, cli_engine=cli_engine, cli_race=cli_race,
-            engines=engines, start_workers=start_workers, max_workers=max_workers,
-            web_access=web_access, kb=kb, coordinator=coordinator,
-            graph_dir=graph_dir, worker_root=worker_root,
-            wall_clock_budget=wall_clock_budget,
-            race_scout=race_scout, race_engines=race_engines,
-            race_timeout=race_timeout, cold_start=cold_start,
-            max_total_workers=max_total_workers,
-            cost_budget_usd=cost_budget_usd,
-            stage_policy=stage_policy,
-            llm_profiles=llm_profiles,
-            reason_model=(llm_profiles.get("planner") or {}).get("model", "deepseek-v4-pro"),
-            worker_backend=worker_backend,
-            worker_network=worker_network,
-            worker_container_scope=worker_container_scope,
-            worker_privilege=worker_privilege,
-            worker_memory=worker_memory,
-            worker_cpus=worker_cpus,
-            worker_pids_limit=worker_pids_limit,
-            worker_output_limit=worker_output_limit,
-            worker_disk_limit=worker_disk_limit,
-            shared_mount_root=(
-                mgr.storage.shared_worker_mount() if mgr is not None else None
-            ),
-            account_projection_root=(
-                mgr.account_projection_root if mgr is not None else None
-            ),
-            container_bootstrap_root=(
-                mgr.container_bootstrap_root if mgr is not None else None
-            ),
-            worker_vpn_config=worker_vpn_config,
-            worker_profiles=worker_profiles,
-            startup_health_snapshot=startup_health_snapshot,
-            credential_accounts_root=(
-                account_store_root(mgr.state_root) if mgr is not None else None
-            ),
-            worker_registry=worker_registry,
-            worker_plugins=getattr(mgr, "chat_plugins", None) if mgr is not None else None,
-            secret_resolver=secret_resolver,
-            context_provider=context_provider,
-            context_binder=context_binder,
-            context_reserver=context_reserver,
-            context_committer=context_committer,
-            context_releaser=context_releaser,
-            context_delivery_unknown_marker=context_delivery_unknown_marker,
-            context_status_provider=context_status_provider,
-            context_expirer=context_expirer,
-            standing_clear_provider=standing_clear_provider,
-            control_state_provider=control_state_provider,
-            # 做题模式只使用已注册的无交互 CLI Worker。Conversation 的 ACP、
-            # App Server、SDK 注册表不得进入 Swarm。
-            adapter_registry=None,
-        )
+        if execution_budget is not None:
+            execution_budget.require_action(
+                reserve_seconds=execution_budget.finalization_seconds)
+        created: list[Any] = []
+
+        def construct_swarm() -> None:
+            created.append(swarm_cls(
+                challenge, default_lineup(n), llm=llm, sandbox=sandbox,
+                bus=run.bus, cost=run.cost, artifacts=arts,
+                config=SolverConfig(), run_id=run.run_id, knowledge=knowledge,
+                execution_generation=int(getattr(run, "execution_generation", 1) or 1),
+                hitl_inbox=run.hitl,
+                worker_cmds=run.worker_cmds,
+                control_ready=run.control_ready,
+                worker_control_ready=run.worker_control_ready,
+                executor=executor, cli_engine=cli_engine, cli_race=cli_race,
+                engines=engines, start_workers=start_workers, max_workers=max_workers,
+                web_access=web_access, kb=kb, coordinator=coordinator,
+                graph_dir=graph_dir, worker_root=worker_root,
+                wall_clock_budget=wall_clock_budget,
+                execution_budget=execution_budget,
+                race_scout=race_scout, race_engines=race_engines,
+                race_timeout=race_timeout, cold_start=cold_start,
+                max_total_workers=max_total_workers,
+                cost_budget_usd=cost_budget_usd,
+                stage_policy=stage_policy,
+                llm_profiles=llm_profiles,
+                reason_model=(llm_profiles.get("planner") or {}).get("model", "deepseek-v4-pro"),
+                worker_backend=worker_backend,
+                worker_network=worker_network,
+                worker_container_scope=worker_container_scope,
+                worker_privilege=worker_privilege,
+                worker_memory=worker_memory,
+                worker_cpus=worker_cpus,
+                worker_pids_limit=worker_pids_limit,
+                worker_output_limit=worker_output_limit,
+                worker_disk_limit=worker_disk_limit,
+                shared_mount_root=(
+                    mgr.storage.shared_worker_mount() if mgr is not None else None
+                ),
+                account_projection_root=(
+                    mgr.account_projection_root if mgr is not None else None
+                ),
+                container_bootstrap_root=(
+                    mgr.container_bootstrap_root if mgr is not None else None
+                ),
+                worker_vpn_config=worker_vpn_config,
+                worker_profiles=worker_profiles,
+                startup_health_snapshot=startup_health_snapshot,
+                credential_accounts_root=(
+                    account_store_root(mgr.state_root) if mgr is not None else None
+                ),
+                worker_registry=worker_registry,
+                worker_plugins=getattr(mgr, "chat_plugins", None) if mgr is not None else None,
+                secret_resolver=secret_resolver,
+                context_provider=context_provider,
+                context_binder=context_binder,
+                context_reserver=context_reserver,
+                context_committer=context_committer,
+                context_releaser=context_releaser,
+                context_delivery_unknown_marker=context_delivery_unknown_marker,
+                context_status_provider=context_status_provider,
+                context_expirer=context_expirer,
+                standing_clear_provider=standing_clear_provider,
+                control_state_provider=control_state_provider,
+                # 做题模式只使用已注册的无交互 CLI Worker。Conversation 的 ACP、
+                # App Server、SDK 注册表不得进入 Swarm。
+                adapter_registry=None,
+            ))
+
+        try:
+            await run_blocking(construct_swarm)
+        except BaseException as original:
+            # Construction performs graph/attachment/Docker metadata I/O. A
+            # cancelled caller still owns the completed constructor's resources.
+            cleanup_failures: list[BaseException] = []
+            try:
+                if created and getattr(created[0], "shared_graph", None) is not None:
+                    await run_blocking(created[0].shared_graph.close)
+            except BaseException as cleanup_exc:
+                cleanup_failures.append(cleanup_exc)
+            try:
+                await sandbox.shutdown_all()
+            except BaseException as cleanup_exc:
+                cleanup_failures.append(cleanup_exc)
+            if llm_cm is not None:
+                try:
+                    await llm_cm.__aexit__(None, None, None)
+                except BaseException as cleanup_exc:
+                    cleanup_failures.append(cleanup_exc)
+            if mgr is not None and getattr(mgr, "chat_plugins", None) is not None:
+                try:
+                    await mgr.chat_plugins.release_scope(run.run_id)
+                except BaseException as cleanup_exc:
+                    cleanup_failures.append(cleanup_exc)
+            if cleanup_failures:
+                original.add_note("Swarm construction cleanup errors: " + ", ".join(
+                    type(error).__name__ for error in cleanup_failures))
+            raise
+        swarm = created[0]
         if mgr is not None:
             # Swarm owns the trusted winning outcome; RunManager owns storage that
             # Worker containers cannot modify. Keep this hook process-local so
@@ -1307,11 +1450,14 @@ def _standby_worker_env(
     account_root: Path | None,
     container: object | None,
 ) -> dict[str, str]:
-    from muteki.solver.credential_accounts import runtime_env_for_engine
+    from muteki.solver.credential_accounts import (
+        engine_writes_agent_state,
+        runtime_env_for_engine,
+    )
 
     agent_state_dir: Path | None = None
     agent_state_container_path: str | None = None
-    if engine in {"pi", "omp", "opencode"}:
+    if engine_writes_agent_state(engine):
         agent_state_dir = root / ".muteki-agent-state" / label
         agent_state_dir.mkdir(parents=True, exist_ok=True)
         if container is not None:
@@ -1409,7 +1555,7 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             cmd.get("_control_context_reservations") or [])
         context_owner = str(cmd.get("_control_context_owner") or "")
         if mgr is not None:
-            _actor, control_journal, control_secrets = mgr._ensure_control(run)
+            _actor, control_journal, control_secrets = await mgr._ensure_control_async(run)
         else:
             control_journal = None
             control_secrets = None
@@ -1603,6 +1749,11 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
             env_backend=os.environ.get("MUTEKI_WORKER_BACKEND"),
             in_web_container=is_web_container(),
         )
+        if (runtime_policy.get("worker_backend")
+                and worker_backend != runtime_policy["worker_backend"]):
+            from apps.web.run_recovery import WorkerRuntimePolicyUnavailable
+            raise WorkerRuntimePolicyUnavailable(
+                "Run Worker backend differs from its saved isolation policy")
         backend = (
             backend_for_profile(
                 worker_backend=worker_backend,
@@ -1759,283 +1910,310 @@ def build_standby_driver(cmd: dict[str, Any], mgr: "RunManager | None" = None) -
 
         # re-open the persisted shared graph (verified facts / dead-ends / flag).
         shared_graph = None
-        try:
-            graph_dir.mkdir(parents=True, exist_ok=True)
-            shared_graph = SQLiteSharedGraph.open(
+        acquired_graphs: list[Any] = []
+
+        def open_shared_graph():
+            graph = SQLiteSharedGraph.open(
                 db_path=graph_dir / "shared_graph.db", challenge=challenge,
                 artifacts=arts)
-        except Exception:
-            shared_graph = None
+            acquired_graphs.append(graph)
+            return graph
 
-        canonical_graph_flags: list[str] = []
-        graph_flags_authoritative = False
-        if shared_graph is not None:
+        try:
             try:
-                canonical_graph_flags = list(shared_graph.snapshot().flags)
-                graph_flags_authoritative = any(
-                    row.get("kind") in {"flag_found", "flag_invalidated"}
-                    for row in shared_graph.events()
-                )
+                graph_dir.mkdir(parents=True, exist_ok=True)
+                shared_graph = await run_blocking(open_shared_graph)
             except Exception:
-                canonical_graph_flags = []
-                graph_flags_authoritative = False
-        stored_flag = (
-            run.flag
-            or (canonical_graph_flags[0]
-                if graph_flags_authoritative and canonical_graph_flags else "")
-            or winner.get("flag")
-            or ""
-        )
+                shared_graph = None
 
-        def _flag_from_operator_cmd() -> str:
-            explicit = str(runtime_cmd.get("flag") or "").strip()
-            if explicit:
-                return explicit
-            raw = str(runtime_cmd.get("text") or "").strip()
-            if not raw:
-                return ""
-            m = re.search(r"[A-Za-z0-9_]{0,15}\{[^}]{1,200}\}", raw)
-            if m:
-                return m.group(0)
-            # Allows advanced/API callers to pass a bare token as the command text.
-            return raw if " " not in raw and len(raw) <= 240 else ""
+            canonical_graph_flags: list[str] = []
+            graph_flags_authoritative = False
+            if shared_graph is not None:
+                try:
+                    canonical_graph_flags = list((await run_blocking(shared_graph.snapshot)).flags)
+                    graph_flags_authoritative = any(
+                        row.get("kind") in {"flag_found", "flag_invalidated"}
+                        for row in await run_blocking(shared_graph.events)
+                    )
+                except Exception:
+                    canonical_graph_flags = []
+                    graph_flags_authoritative = False
+            stored_flag = (
+                run.flag
+                or (canonical_graph_flags[0]
+                    if graph_flags_authoritative and canonical_graph_flags else "")
+                or winner.get("flag")
+                or ""
+            )
 
-        flag = (_flag_from_operator_cmd() if action == "mark_false" else "") or stored_flag
-        # Multi-flag: the flags already collected, minus the one
-        # the operator is marking false — so a mark_false re-solve worker is seeded
-        # with the SURVIVING flags and re-finds only the missing one, not the rest.
-        prior_flags = list(
-            canonical_graph_flags
-            if graph_flags_authoritative
-            else run.flags
-            if (run.flags or run.invalidated_flags)
-            else winner.get("flags")
-            or ([stored_flag] if stored_flag else [])
-        )
-        if action == "mark_false":
-            prior_flags = [f for f in prior_flags if f != flag]
+            def _flag_from_operator_cmd() -> str:
+                explicit = str(runtime_cmd.get("flag") or "").strip()
+                if explicit:
+                    return explicit
+                raw = str(runtime_cmd.get("text") or "").strip()
+                if not raw:
+                    return ""
+                m = re.search(r"[A-Za-z0-9_]{0,15}\{[^}]{1,200}\}", raw)
+                if m:
+                    return m.group(0)
+                # Allows advanced/API callers to pass a bare token as the command text.
+                return raw if " " not in raw and len(raw) <= 240 else ""
 
-        async def _emit_bb(kind: str, **fields: Any) -> None:
-            from muteki.core.events import (
-                Event, EventType, blackboard_delta_payload)
-            await run.bus.emit(Event(
-                event_type=EventType.BLACKBOARD_DELTA, run_id=run.run_id,
-                challenge_id=challenge.id,
-                payload=blackboard_delta_payload(kind, actor="operator", **fields)))
+            flag = (_flag_from_operator_cmd() if action == "mark_false" else "") or stored_flag
+            # Multi-flag: the flags already collected, minus the one
+            # the operator is marking false — so a mark_false re-solve worker is seeded
+            # with the SURVIVING flags and re-finds only the missing one, not the rest.
+            prior_flags = list(
+                canonical_graph_flags
+                if graph_flags_authoritative
+                else run.flags
+                if (run.flags or run.invalidated_flags)
+                else winner.get("flags")
+                or ([stored_flag] if stored_flag else [])
+            )
+            if action == "mark_false":
+                prior_flags = [f for f in prior_flags if f != flag]
 
-        # mark_false: re-open the solve BEFORE the worker runs, so the board shows a
-        # dead-end + reopened intents (fact-graph + blackboard grow the dead-end
-        # node), and the rail flips back to running (RUN_REOPENED).
-        if (action == "mark_false" and not mark_false_already_applied
-                and shared_graph is not None and flag):
-            try:
-                info = shared_graph.reopen_after_false_positive(
-                    actor="operator", flag=flag)
-                await _emit_bb("dead_end", reason=info["dead_end_reason"])
-                for iid in info.get("reopened", []):
-                    await _emit_bb("intent_reopened", intent_id=iid)
-                await _emit_bb("flag_invalidated", flag=flag)
-                from muteki.core.events import Event, EventType
-                # tell the rail this run is solving again (status → running)
+            async def _emit_bb(kind: str, **fields: Any) -> None:
+                from muteki.core.events import (
+                    Event, EventType, blackboard_delta_payload)
                 await run.bus.emit(Event(
-                    event_type=EventType.RUN_REOPENED, run_id=run.run_id,
-                    challenge_id=challenge.id, payload={"flag": flag}))
-            except Exception:
-                pass
+                    event_type=EventType.BLACKBOARD_DELTA, run_id=run.run_id,
+                    challenge_id=challenge.id,
+                    payload=blackboard_delta_payload(kind, actor="operator", **fields)))
 
-        workdir = ""
-        workdir_rel = str(winner.get("workdir_rel") or "").strip()
-        if workdir_rel:
-            try:
-                candidate = (root / workdir_rel).resolve()
-                candidate.relative_to(worker_root.resolve())
-                if candidate.exists():
-                    workdir = str(candidate)
-            except (OSError, ValueError):
-                workdir = ""
-        if not workdir:
-            workdir = str(worker_root / f"standby-{transport}")
-        Path(workdir).mkdir(parents=True, exist_ok=True)
-        if container is not None:
-            from muteki.solver.container_exec import _chown_tree_to_worker
-            _chown_tree_to_worker(workdir)
-        solver_label = f"cli-{transport}-standby"
-        home_label = ""
-        agent_state_rel = str(winner.get("agent_state_rel") or "").strip()
-        if agent_state_rel:
-            try:
-                state_root = (root / ".muteki-agent-state").resolve()
-                state_dir = (root / agent_state_rel).resolve()
-                state_dir.relative_to(state_root)
-                if state_dir.is_dir():
-                    home_label = state_dir.name
-            except (OSError, ValueError):
-                home_label = ""
-        if not home_label:
-            home_label = _standby_home_label(
-                root, transport, str(winner.get("session") or ""))
-        worker_env = _standby_worker_env(
-            root=root,
-            label=home_label,
-            engine=transport,
-            profile=profile,
-            account_root=account_root,
-            container=container,
-        )
-
-        session_supervisor = WorkerSessionSupervisor(
-            run_id=run.run_id,
-            execution_generation=max(
-                1, int(getattr(run, "execution_generation", 1) or 1)),
-            shared_graph=shared_graph,
-        )
-        worker = CliSolver(
-            None, challenge, bus=run.bus, cost=run.cost, artifacts=arts,
-            config=SolverConfig(), run_id=run.run_id, shared_graph=shared_graph,
-            engine=transport,
-            driver=driver_for(profile or transport),
-            workdir=workdir,
-            web_access=True, kb=False,
-            mode="respond",
-            resume_session=winner.get("session") or None,
-            hitl_cmd={**runtime_cmd, "flag": flag},
-            found_flags=prior_flags,
-            solver_label=solver_label,
-            container=container,
-            worker_env=worker_env,
-            identity=worker_identity_fields(profile),
-            target_epoch=max(
-                1, int(getattr(run, "execution_generation", 1) or 1)),
-            session_supervisor=session_supervisor,
-            worker_profile=profile or {"engine": transport},
-            plugin_service=getattr(mgr, "chat_plugins", None) if mgr is not None else None,
-        )
-        worker._control_secret_values = list(materialized_secret_values)
-        if context_reservations and control_journal is not None:
-            worker._pending_control_context_reservations = context_reservations
-            worker._context_committer = control_journal.commit_context_binding
-            worker._context_releaser = control_journal.release_context_reservation
-            worker._context_delivery_unknown_marker = (
-                control_journal.mark_context_delivery_unknown)
-            worker._context_binding_worker_id = context_owner
-        delivery_ack = cmd.get("_standby_delivery_ack")
-        delivery_loop = asyncio.get_running_loop()
-
-        def _confirm_delivery(ok: bool) -> None:
-            if not isinstance(delivery_ack, asyncio.Future):
-                return
-
-            def _set() -> None:
-                if not delivery_ack.done():
-                    delivery_ack.set_result(bool(ok))
-
-            delivery_loop.call_soon_threadsafe(_set)
-
-        worker._context_delivery_callback = _confirm_delivery
-        # Publish the REAL worker cancellation boundary before awaiting it.  A
-        # RunManager STOP can then kill the shelled CLI process tree first instead
-        # of merely cancelling this Python coroutine and leaking the child.
-        worker_cancel = getattr(worker, "cancel", None)
-        worker_runtime_exited = getattr(worker, "runtime_exit_confirmed", None)
-        worker_wait_runtime_exit = getattr(worker, "wait_runtime_exit", None)
-
-        async def _cancel_runtime_owner() -> None:
-            if callable(worker_cancel):
-                result = worker_cancel()
-                if inspect.isawaitable(result):
-                    await result
-            if callable(setup_cancel_boundary):
-                result = setup_cancel_boundary()
-                if inspect.isawaitable(result):
-                    await result
-
-        def _runtime_owner_exited() -> bool:
-            worker_done = True
-            if callable(worker_runtime_exited):
+            # mark_false: re-open the solve BEFORE the worker runs, so the board shows a
+            # dead-end + reopened intents (fact-graph + blackboard grow the dead-end
+            # node), and the rail flips back to running (RUN_REOPENED).
+            if (action == "mark_false" and not mark_false_already_applied
+                    and shared_graph is not None and flag):
                 try:
-                    worker_done = bool(worker_runtime_exited())
+                    info = await run_blocking(
+                        shared_graph.reopen_after_false_positive, actor="operator", flag=flag)
+                    await _emit_bb("dead_end", reason=info["dead_end_reason"])
+                    for iid in info.get("reopened", []):
+                        await _emit_bb("intent_reopened", intent_id=iid)
+                    await _emit_bb("flag_invalidated", flag=flag)
+                    from muteki.core.events import Event, EventType
+                    # tell the rail this run is solving again (status → running)
+                    await run.bus.emit(Event(
+                        event_type=EventType.RUN_REOPENED, run_id=run.run_id,
+                        challenge_id=challenge.id, payload={"flag": flag}))
                 except Exception:
-                    worker_done = False
-            container_done = True
-            if callable(setup_exit_query):
-                try:
-                    container_done = bool(setup_exit_query())
-                except Exception:
-                    container_done = False
-            return worker_done and container_done
+                    pass
 
-        async def _wait_runtime_owner_exit(timeout=None) -> bool:
-            loop = asyncio.get_running_loop()
-            deadline = None if timeout is None else (
-                loop.time() + max(0.0, float(timeout)))
-            if callable(worker_wait_runtime_exit):
-                remaining = None if deadline is None else max(
-                    0.0, deadline - loop.time())
-                result = worker_wait_runtime_exit(remaining)
-                worker_done = bool(
-                    await result if inspect.isawaitable(result) else result)
-                if not worker_done:
-                    return False
-            if callable(setup_cancel_boundary) and not bool(setup_exit_query()):
+            workdir = ""
+            workdir_rel = str(winner.get("workdir_rel") or "").strip()
+            if workdir_rel:
                 try:
+                    candidate = (root / workdir_rel).resolve()
+                    worker_root_resolved = worker_root.resolve()
+                    if candidate != root.resolve():
+                        candidate.relative_to(worker_root_resolved)
+                    if candidate.exists() and (
+                        candidate == root.resolve()
+                        or candidate.is_relative_to(worker_root_resolved)
+                    ):
+                        workdir = str(candidate)
+                except (OSError, ValueError):
+                    workdir = ""
+            # Compatibility for continuations persisted before workspace-root
+            # CTF workdirs were encoded as ".".  Pentest workers use dedicated
+            # worker directories and must never be widened to the root.
+            if not workdir and challenge.mode == "ctf":
+                workdir = str(root.resolve())
+            if not workdir:
+                workdir = str(worker_root / f"standby-{transport}")
+            Path(workdir).mkdir(parents=True, exist_ok=True)
+            if container is not None:
+                from muteki.solver.container_exec import _chown_tree_to_worker
+                await run_blocking(_chown_tree_to_worker, workdir)
+            solver_label = f"cli-{transport}-standby"
+            home_label = ""
+            agent_state_rel = str(winner.get("agent_state_rel") or "").strip()
+            if agent_state_rel:
+                try:
+                    state_root = (root / ".muteki-agent-state").resolve()
+                    state_dir = (root / agent_state_rel).resolve()
+                    state_dir.relative_to(state_root)
+                    if state_dir.is_dir():
+                        home_label = state_dir.name
+                except (OSError, ValueError):
+                    home_label = ""
+            if not home_label:
+                home_label = await asyncio.to_thread(
+                    _standby_home_label, root, transport,
+                    str(winner.get("session") or ""))
+            worker_env = await run_blocking(
+                _standby_worker_env, root=root,
+                label=home_label,
+                engine=transport,
+                profile=profile,
+                account_root=account_root,
+                container=container,
+            )
+
+            session_supervisor = WorkerSessionSupervisor(
+                run_id=run.run_id,
+                execution_generation=max(
+                    1, int(getattr(run, "execution_generation", 1) or 1)),
+                shared_graph=shared_graph,
+            )
+            worker = CliSolver(
+                None, challenge, bus=run.bus, cost=run.cost, artifacts=arts,
+                config=SolverConfig(), run_id=run.run_id, shared_graph=shared_graph,
+                engine=transport,
+                driver=driver_for(profile or transport),
+                workdir=workdir,
+                web_access=True, kb=False,
+                mode="respond",
+                resume_session=winner.get("session") or None,
+                hitl_cmd={**runtime_cmd, "flag": flag},
+                found_flags=prior_flags,
+                solver_label=solver_label,
+                container=container,
+                worker_env=worker_env,
+                identity=worker_identity_fields(profile),
+                target_epoch=max(
+                    1, int(getattr(run, "execution_generation", 1) or 1)),
+                session_supervisor=session_supervisor,
+                worker_profile=freeze_worker_price_identity(profile or {"engine": transport}, account_root),
+                plugin_service=getattr(mgr, "chat_plugins", None) if mgr is not None else None,
+            )
+            worker._control_secret_values = list(materialized_secret_values)
+            if context_reservations and control_journal is not None:
+                worker._pending_control_context_reservations = context_reservations
+                worker._context_committer = control_journal.commit_context_binding
+                worker._context_releaser = control_journal.release_context_reservation
+                worker._context_delivery_unknown_marker = (
+                    control_journal.mark_context_delivery_unknown)
+                worker._context_binding_worker_id = context_owner
+            delivery_ack = cmd.get("_standby_delivery_ack")
+            delivery_loop = asyncio.get_running_loop()
+
+            def _confirm_delivery(ok: bool) -> None:
+                if not isinstance(delivery_ack, asyncio.Future):
+                    return
+
+                def _set() -> None:
+                    if not delivery_ack.done():
+                        delivery_ack.set_result(bool(ok))
+
+                delivery_loop.call_soon_threadsafe(_set)
+
+            worker._context_delivery_callback = _confirm_delivery
+            # Publish the REAL worker cancellation boundary before awaiting it.  A
+            # RunManager STOP can then kill the shelled CLI process tree first instead
+            # of merely cancelling this Python coroutine and leaking the child.
+            worker_cancel = getattr(worker, "cancel", None)
+            worker_runtime_exited = getattr(worker, "runtime_exit_confirmed", None)
+            worker_wait_runtime_exit = getattr(worker, "wait_runtime_exit", None)
+
+            async def _cancel_runtime_owner() -> None:
+                if callable(worker_cancel):
+                    result = worker_cancel()
+                    if inspect.isawaitable(result):
+                        await result
+                if callable(setup_cancel_boundary):
                     result = setup_cancel_boundary()
                     if inspect.isawaitable(result):
                         await result
-                except Exception:
-                    return False
-            return _runtime_owner_exited()
 
-        run.standby_cancel = _cancel_runtime_owner
-        run.standby_runtime_exited = _runtime_owner_exited
-        run.standby_wait_runtime_exit = _wait_runtime_owner_exit
-
-        def _clear_runtime_registration() -> None:
-            if shared_graph is not None:
-                try:
-                    shared_graph.close()
-                except Exception:
-                    pass
-            if run.standby_cancel is _cancel_runtime_owner:
-                run.standby_cancel = None
-            if run.standby_runtime_exited is _runtime_owner_exited:
-                run.standby_runtime_exited = None
-            if run.standby_wait_runtime_exit is _wait_runtime_owner_exit:
-                run.standby_wait_runtime_exit = None
-            try:
-                current = asyncio.current_task()
-            except RuntimeError:
-                current = None
-            if run.standby_runtime_cleanup_task is current:
-                run.standby_runtime_cleanup_task = None
-
-        async def _reap_runtime_until_exit() -> None:
-            """Keep the real kill boundary alive after the wrapper task exits.
-
-            A PARTIAL control receipt is an audit fact, not permission to orphan the
-            child. Re-signal and poll until CliSolver proves every runner/process is
-            gone; later STOP/FORCE_CANCEL commands can use the same retained callbacks.
-            """
-            confirmed = False
-            try:
-                while not confirmed:
+            def _runtime_owner_exited() -> bool:
+                worker_done = True
+                if callable(worker_runtime_exited):
                     try:
-                        await _cancel_runtime_owner()
-                        confirmed = await _wait_runtime_owner_exit(0.5)
-                        if not confirmed:
-                            await asyncio.sleep(0.1)
-                    except asyncio.CancelledError:
-                        raise
+                        worker_done = bool(worker_runtime_exited())
                     except Exception:
-                        # A transient signal/poll failure must not abandon the only
-                        # remaining process handle. Keep this watcher and retry.
-                        await asyncio.sleep(0.1)
-            except asyncio.CancelledError:
-                # Preserve the callbacks when server shutdown interrupts the watcher;
-                # clearing them would turn an unproved runtime into a fake clean exit.
-                raise
-            finally:
-                if confirmed:
-                    _clear_runtime_registration()
+                        worker_done = False
+                container_done = True
+                if callable(setup_exit_query):
+                    try:
+                        container_done = bool(setup_exit_query())
+                    except Exception:
+                        container_done = False
+                return worker_done and container_done
+
+            async def _wait_runtime_owner_exit(timeout=None) -> bool:
+                loop = asyncio.get_running_loop()
+                deadline = None if timeout is None else (
+                    loop.time() + max(0.0, float(timeout)))
+                if callable(worker_wait_runtime_exit):
+                    remaining = None if deadline is None else max(
+                        0.0, deadline - loop.time())
+                    result = worker_wait_runtime_exit(remaining)
+                    worker_done = bool(
+                        await result if inspect.isawaitable(result) else result)
+                    if not worker_done:
+                        return False
+                if callable(setup_cancel_boundary) and not bool(setup_exit_query()):
+                    try:
+                        result = setup_cancel_boundary()
+                        if inspect.isawaitable(result):
+                            await result
+                    except Exception:
+                        return False
+                return _runtime_owner_exited()
+
+            run.standby_cancel = _cancel_runtime_owner
+            run.standby_runtime_exited = _runtime_owner_exited
+            run.standby_wait_runtime_exit = _wait_runtime_owner_exit
+
+            def _clear_runtime_registration() -> None:
+                if shared_graph is not None:
+                    try:
+                        shared_graph.close()
+                    except Exception:
+                        pass
+                if run.standby_cancel is _cancel_runtime_owner:
+                    run.standby_cancel = None
+                if run.standby_runtime_exited is _runtime_owner_exited:
+                    run.standby_runtime_exited = None
+                if run.standby_wait_runtime_exit is _wait_runtime_owner_exit:
+                    run.standby_wait_runtime_exit = None
+                try:
+                    current = asyncio.current_task()
+                except RuntimeError:
+                    current = None
+                if run.standby_runtime_cleanup_task is current:
+                    run.standby_runtime_cleanup_task = None
+
+            async def _reap_runtime_until_exit() -> None:
+                """Keep the real kill boundary alive after the wrapper task exits.
+
+                A PARTIAL control receipt is an audit fact, not permission to orphan the
+                child. Re-signal and poll until CliSolver proves every runner/process is
+                gone; later STOP/FORCE_CANCEL commands can use the same retained callbacks.
+                """
+                confirmed = False
+                try:
+                    while not confirmed:
+                        try:
+                            await _cancel_runtime_owner()
+                            confirmed = await _wait_runtime_owner_exit(0.5)
+                            if not confirmed:
+                                await asyncio.sleep(0.1)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            # A transient signal/poll failure must not abandon the only
+                            # remaining process handle. Keep this watcher and retry.
+                            await asyncio.sleep(0.1)
+                except asyncio.CancelledError:
+                    # Preserve the callbacks when server shutdown interrupts the watcher;
+                    # clearing them would turn an unproved runtime into a fake clean exit.
+                    raise
+                finally:
+                    if confirmed:
+                        _clear_runtime_registration()
+        except BaseException as original:
+            for graph in acquired_graphs:
+                try:
+                    await run_blocking(graph.close)
+                except BaseException as cleanup_exc:
+                    original.add_note(
+                        "Standby graph cleanup failed: " + type(cleanup_exc).__name__)
+            raise
         try:
             out = await worker.run()
             # writeup: persist the body to sessions/{id}/writeup.md (and it already

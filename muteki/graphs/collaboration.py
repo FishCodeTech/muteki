@@ -10,6 +10,8 @@ branch、review、directive。独立 SQLite 库，append-only 事件 + 投影；
 
 from __future__ import annotations
 
+from muteki.core.blocking import run_blocking
+
 import json
 from typing import Any
 
@@ -228,6 +230,9 @@ class CollaborationGraph(SQLiteGraphBase):
     # -- GraphService.snapshot ---------------------------------------------------
 
     async def snapshot(self, scope: GraphScope) -> GraphSnapshot:
+        return await run_blocking(self._snapshot_sync, scope)
+
+    def _snapshot_sync(self, scope: GraphScope) -> GraphSnapshot:
         """投影读取模型；scope 支持 branch_id / fact_status / intent_status 过滤。"""
         self._check_graph_id(scope.graph_id)
         branch_id = scope.scope.get("branch_id")

@@ -3,6 +3,7 @@
 import { ConversationRouteLink } from "@/components/conversation/ConversationNavigation";
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { motion } from "motion/react";
+import { priceKey, priceLabel, useModelPrices } from "@/lib/modelPricing";
 import { cn } from "@/lib/cn";
 import { runtimeAvailableForSelection } from "@/lib/conversationReadiness";
 import { useLang } from "@/lib/i18n";
@@ -59,6 +60,8 @@ export interface ConversationModelPickerProps {
   /** Thinking effort of the bound model; together with onSelect it adds the effort section. */
   selectedEffort?: string;
   selectedServiceTier?: string;
+  /** Composer renders a dedicated thinking menu; keep only speed here. */
+  separateEffortControl?: boolean;
   runtimes?: RuntimeInstance[];
   runtimeKey?: string;
   onRuntimeChange?: (key: string) => void;
@@ -213,7 +216,7 @@ function PickerSkeleton() {
 }
 
 export function ConversationModelPicker({
-  credentials, selectedCredentialId, selectedModel, selectedEffort, selectedServiceTier = "",
+  credentials, selectedCredentialId, selectedModel, selectedEffort, selectedServiceTier = "", separateEffortControl = false,
   loading: catalogLoading = false, error: catalogError = "", onRetry: retryCatalog, variant = "conversation",
   runtimes, runtimeKey = "", onRuntimeChange,
   onSelect, className = "", open: openProp, onOpenChange,
@@ -314,7 +317,7 @@ export function ConversationModelPicker({
   const hasUnconfiguredEngines = providerEngines(descriptors).some((engine) => !listedCredentials.some((item) => item.engine === engine));
 
   // Thinking effort and speed always describe the bound model, whatever tab is being browsed.
-  const effortLevels = useMemo(() => modelEffortLevels(boundModel), [boundModel]);
+  const effortLevels = useMemo(() => separateEffortControl ? [] : modelEffortLevels(boundModel), [boundModel, separateEffortControl]);
   const serviceTiers = useMemo(() => modelServiceTiers(boundModel), [boundModel]);
   const activeTier = effectiveServiceTier(boundModel, selectedServiceTier);
   const activeTierMeta = serviceTiers.find((tier) => tier.id === activeTier);
@@ -323,7 +326,7 @@ export function ConversationModelPicker({
   const levelLabel = (level: string) => variantNames && level ? level : effortLabelOf(level);
   const modelDefault = boundModel?.reasoning?.default && effortLevels.includes(boundModel.reasoning.default)
     ? boundModel.reasoning.default : "";
-  const showEffort = variant === "conversation" && selectedEffort !== undefined
+  const showEffort = !separateEffortControl && variant === "conversation" && selectedEffort !== undefined
     && Boolean(boundCredential && boundModel && (effortLevels.length || serviceTiers.length));
   const effortText = effortLevels.length ? levelLabel(activeEffort || modelDefault) : "";
   const effortSummary = [
@@ -346,7 +349,7 @@ export function ConversationModelPicker({
     ?? effortRef.current?.querySelector<HTMLElement>("[role='radio'], button"))?.focus({ preventScroll: true });
 
   useEffect(() => {
-    if (!showEffort) return;
+    if (!showEffort || separateEffortControl) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (!matchesBinding(event, shortcutBinding("effortPicker"), isMacPlatform())) return;
       event.preventDefault();
@@ -361,7 +364,7 @@ export function ConversationModelPicker({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [showEffort, open, setOpen]);
+  }, [showEffort, separateEffortControl, open, setOpen]);
 
   useEffect(() => {
     if (!open) {
@@ -647,7 +650,7 @@ export function ConversationModelPicker({
     <button
       type="button"
       aria-label={triggerAria}
-      aria-keyshortcuts={showEffort ? "Meta+Shift+M Meta+Shift+E" : "Meta+Shift+M"}
+      aria-keyshortcuts={showEffort && !separateEffortControl ? "Meta+Shift+M Meta+Shift+E" : "Meta+Shift+M"}
       data-testid="composer-model-trigger"
       data-service-tier={showEffort && activeTier ? activeTier : undefined}
       className={cn(
@@ -667,6 +670,10 @@ export function ConversationModelPicker({
     </button>
   );
 
+  // Quote the same effective tier that execution sends, including each row's
+  // own catalog capabilities when browsing another engine or model.
+  const priceIdentities = visibleRows.map(row => ({ engine: row.credential.engine, model: row.model.id, credential_id: row.credential.id, provider_id: row.credential.provider, speed: effectiveServiceTier(row.model, selectedServiceTier) || undefined }));
+  const pricing = useModelPrices(priceIdentities, open);
   const renderRow = (row: ModelRow, index: number) => {
     const selected = row.credential.id === selectedCredentialId && row.model.id === selectedModel;
     const favorited = favoriteKeys.has(row.key);
@@ -726,6 +733,7 @@ export function ConversationModelPicker({
                 </Tooltip>
               ) : null}
             </span>
+            <span className="break-words text-[11.5px] leading-4 text-cx-fg-3" title={pricing.error || (en ? "Estimated USD per million tokens; not subscription charges" : "USD / 百万 Token 标价估算，不代表订阅实际账单")}>{priceLabel(pricing.values.get(priceKey(priceIdentities[index])), pricing.error, pricing.loading, en)}</span>
             {showProvider ? (
               <span className={cn("text-[11.5px] leading-4 text-cx-fg-4", narrowStacked ? "break-words [overflow-wrap:anywhere]" : "truncate")}>
                 {`${engineLabel(row.credential.engine)} · ${row.credential.label}`}
@@ -1065,7 +1073,7 @@ export function ConversationModelPicker({
       placement={variant === "conversation" ? "top-start" : "bottom-start"}
       offset={8}
       initialFocus={effortFocus ? "none" : "first"}
-      ariaLabel={showEffort ? "选择 Agent、模型和思考强度" : "选择 Agent 和模型"}
+      ariaLabel={showEffort && !separateEffortControl ? "选择 Agent、模型和思考强度" : "选择 Agent 和模型"}
       className="w-[min(400px,calc(100vw-16px))] p-0"
     >
       {body}

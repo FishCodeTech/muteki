@@ -212,7 +212,7 @@ class _LanesLocksMixin:
                 ]
                 payload = {
                     "operation_id": op_id,
-                    "reason": (reason or "freeze_resume")[:200],
+                    "reason": reason or "freeze_resume",
                     "scope": {"kind": scope, "id": value},
                     "observed_at": at,
                     "delta_s": delta,
@@ -275,7 +275,7 @@ class _LanesLocksMixin:
                 ]
                 payload = {
                     "suspension_id": sid,
-                    "reason": (reason or "freeze")[:200],
+                    "reason": reason or "freeze",
                     "scope": {"kind": scope, "id": value},
                     "started_at": at,
                     "guard_s": guard,
@@ -362,7 +362,7 @@ class _LanesLocksMixin:
 
                 payload = {
                     "suspension_id": sid,
-                    "reason": (reason or "thaw")[:200],
+                    "reason": reason or "thaw",
                     "suspended_seq": int(started[0]),
                     "started_at": started_at,
                     "resumed_at": at,
@@ -686,7 +686,7 @@ class _LanesLocksMixin:
         raw = (resource_key or "").strip().lower()
         raw = re.sub(r"\s+", "", raw)
         raw = re.sub(r"[^a-z0-9_:@.*/-]+", "-", raw).strip("-")
-        return raw[:180]
+        return raw
 
     def request_resource_lock(self, *, actor: str, resource_key: str,
                               scope: str = "activity", risk_class: str = "",
@@ -824,9 +824,9 @@ class _LanesLocksMixin:
         if lane_key and self.is_lane_held_by_other(lane_key, by_worker):
             lane = self.normalize_lane_key(lane_key)
             owner = ""
-            for l in self.active_lanes():
-                if l["lane_key"] == lane:
-                    owner = l["owner_worker"]
+            for active_lane in self.active_lanes():
+                if active_lane["lane_key"] == lane:
+                    owner = active_lane["owner_worker"]
                     break
             blockers.append({"kind": "lane", "key": lane, "owner": owner})
         if resource_key:

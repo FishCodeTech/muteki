@@ -26,6 +26,9 @@ EV_FACT_PROMOTED = "fact_promoted"
 EV_OBSERVATION_ADDED = "observation_added"
 EV_HYP_PROPOSED = "hyp_proposed"
 EV_HYP_REFUTED = "hyp_refuted"
+EV_SUB_GOAL_ADDED = "sub_goal_added"
+EV_SUB_GOAL_SATISFIED = "sub_goal_satisfied"
+EV_VISIT_WAVE_RESET = "visit_wave_reset"
 EV_DEAD_END = "dead_end"
 EV_INTENT_PROPOSED = "intent_proposed"
 EV_INTENT_CLAIMED = "intent_claimed"
@@ -34,6 +37,8 @@ EV_FLAG_FOUND = "flag_found"
 EV_FLAG_INVALIDATED = "flag_invalidated"  # multi-flag: a false-positive flag is removed
 EV_FLAG_SUBMISSION = "flag_submission"
 EV_FLAG_SUBMISSION_DECISION = "flag_submission_decision"
+# External platform truth is distinct from the local Blackboard admission gate.
+EV_PLATFORM_VERDICT = "platform_verdict"
 EV_FINDING_FOUND = "finding_found"
 EV_FINDING_INVALIDATED = "finding_invalidated"
 EV_FINDING_REVIEWED = "finding_reviewed"
@@ -107,12 +112,14 @@ WORKER_RUNTIME_CAPABILITY_KEYS = frozenset({
 # telemetry, spawn-rejection counters, and ordinary logs are excluded.
 SEMANTIC_GRAPH_KINDS = frozenset({
     EV_FACT_ADDED,
+    EV_SUB_GOAL_ADDED, EV_SUB_GOAL_SATISFIED, EV_VISIT_WAVE_RESET,
     EV_FACT_CHALLENGED, EV_FACT_REVALIDATED, EV_FACT_REJECTED,
     EV_FACT_MERGED, EV_FACT_SUPERSEDED, EV_FACT_PINNED,
     EV_INTENT_PROPOSED, EV_INTENT_CONCLUDED, EV_INTENT_STATE_CHANGED,
     EV_INTENT_LANE_DEFERRED,
     EV_DEAD_END,
     EV_FLAG_FOUND, EV_FLAG_INVALIDATED, EV_FLAG_SUBMISSION_DECISION,
+    EV_PLATFORM_VERDICT,
     EV_FINDING_FOUND, EV_FINDING_INVALIDATED, EV_FINDING_REVIEWED,
     EV_FINDING_EVIDENCE_ADDED,
     EV_POC_SAVED, EV_POC_CLAIMED, EV_POC_CONCLUDED,
@@ -202,6 +209,11 @@ _LANE_RISK_CLASSES = {
 _FACT_ENGINE_PREFIX_RE = re.compile(r"^\[[a-z0-9 _.-]{1,40}\]\s*", re.IGNORECASE)
 
 
+def _canonical_fact_whitespace(fact: str) -> str:
+    """Preserve case, punctuation and line boundaries in exact Fact identity."""
+    return "\n".join(" ".join(line.split()) for line in str(fact).strip().splitlines())
+
+
 def _normalize_fact_identity(fact: str) -> str:
     # Deterministic, conservative identity normalization: Unicode compatibility
     # folding, engine-prefix removal, typographic punctuation normalization and
@@ -236,7 +248,7 @@ def _clean_lane_host(host: str) -> tuple[str, float, str]:
     candidate = candidate.strip().strip("[]")
     if not candidate:
         if raw:
-            bucket = re.sub(r"[^a-z0-9_.-]+", "-", raw.lower()).strip("-")[:120]
+            bucket = re.sub(r"[^a-z0-9_.-]+", "-", raw.lower()).strip("-")
             return f"unknown-host:{bucket or hashlib.sha1(raw.encode()).hexdigest()[:10]}", 0.30, "host_unparsed"
         return "", 0.0, "missing_host"
     if re.fullmatch(r"[0-9a-f:.]+", candidate) and ":" in candidate:
@@ -246,7 +258,7 @@ def _clean_lane_host(host: str) -> tuple[str, float, str]:
         return candidate, 1.0, ""
     if re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,252}", candidate):
         return candidate.rstrip("."), 0.85, "host_not_verified"
-    bucket = re.sub(r"[^a-z0-9_.-]+", "-", raw.lower()).strip("-")[:120]
+    bucket = re.sub(r"[^a-z0-9_.-]+", "-", raw.lower()).strip("-")
     return f"unknown-host:{bucket or hashlib.sha1(raw.encode()).hexdigest()[:10]}", 0.30, "host_unparsed"
 
 

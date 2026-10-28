@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .descriptors import all_descriptors
-from .runtime_capabilities import RuntimeCapabilityItem
+from .runtime_capabilities import RuntimeCapabilityItem, RuntimeCapabilitySnapshot
 
 
 @dataclass(frozen=True)
@@ -98,6 +98,22 @@ def operation_item(adapter_id: str, engine: str, name: str, method: str, descrip
         delivery="guaranteed", verification="verified", action="invoke-runtime-operation",
         invocation={"method": method}, argument_hint=argument_hint,
     )
+
+
+def detached_compaction_snapshot(
+    snapshot: RuntimeCapabilitySnapshot, compact: RuntimeCapabilityItem,
+) -> RuntimeCapabilitySnapshot:
+    """Keep an explicit native compact contract usable before session resume.
+
+    Dynamic session commands remain stale. The real send must resume the
+    runtime and resolve this command again against its live capabilities.
+    """
+    return snapshot.model_copy(update={
+        "stale": True,
+        "items": [*snapshot.items, compact.model_copy(update={
+            "origin": "verified_static", "scope": "engine",
+        })],
+    })
 
 
 def native_prompt(capability: dict[str, Any], arguments: str) -> str:

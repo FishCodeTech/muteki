@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -21,6 +22,9 @@ _GRAPH_BRIDGE_KINDS = {
         "intent_claimed",
         "intent_concluded",
         "intent_state_changed",
+        "sub_goal_added",
+        "sub_goal_satisfied",
+        "visit_wave_reset",
         "fact_challenged",
         "fact_revalidated",
         "fact_rejected",
@@ -111,7 +115,7 @@ def install_coordinator_sinks(self) -> None:
                 # re-enter the bus and reorder/deadlock the NEED_INPUT pause path.
                 try:
                     asyncio.create_task(self._emit_coord_bb(
-                        "hitl_classified", worker=worker, need=need_text[:200],
+                        "hitl_classified", worker=worker, need=need_text,
                         need_kind=need_kind, pauses_behavior=True))
                 except Exception:
                     pass
@@ -193,7 +197,7 @@ def _graph_event_to_bb(self, ev: dict) -> list[tuple[str, dict]]:
         # Candidate concept in the UI.
         if not bool(ev.get("verified")):
             return []
-        return [("fact_added", {
+        emissions = [("fact_added", {
             "fact": p.get("fact", ""),
             "source": p.get("source", ""),
             "source_solver": p.get("source_solver") or actor,
@@ -210,6 +214,12 @@ def _graph_event_to_bb(self, ev: dict) -> list[tuple[str, dict]]:
             "fact_identity_sha256": p.get("fact_identity_sha256", ""),
             "evidence_provenance": p.get("evidence_provenance") or {},
         })]
+        signal = self.shared_graph.ctf_scheduling_evidence(
+            event_seq=seq, run_id=self.run_id, target_epoch=str(self._target_epoch),
+        )
+        if signal:
+            emissions.append((signal.pop("kind"), signal))
+        return emissions
     if kind == "fact_observed":
         fields = dict(p)
         fields.update({
@@ -228,20 +238,34 @@ def _graph_event_to_bb(self, ev: dict) -> list[tuple[str, dict]]:
         })
         return [("fact_promoted", fields)]
     if kind == "dead_end":
-        return [("dead_end", {
+        emissions = [("dead_end", {
             "reason": p.get("reason", ""),
             "tested_scope": p.get("tested_scope", ""),
             "observed_result": p.get("observed_result", ""),
             "intent_id": p.get("intent_id", ""),
             "target_epoch": p.get("target_epoch", ""),
             "dead_end_seq": seq,
+            "coverage_key": p.get("coverage_key", ""),
+            "evidence_provenance": p.get("evidence_provenance") or {},
         })]
+        signal = self.shared_graph.ctf_scheduling_evidence(
+            event_seq=seq, run_id=self.run_id, target_epoch=str(self._target_epoch),
+        )
+        if signal:
+            emissions.append((signal.pop("kind"), signal))
+        return emissions
     if kind == "intent_proposed":
         fields = dict(p)
         fields["intent_id"] = p.get("intent_id", "")
         fields["goal"] = p.get("goal", "")
         fields["intent_seq"] = seq
-        return [("intent_proposed", fields)]
+        emissions = [("intent_proposed", fields)]
+        signal = self.shared_graph.ctf_scheduling_evidence(
+            event_seq=seq, run_id=self.run_id, target_epoch=str(self._target_epoch),
+        )
+        if signal:
+            emissions.append((signal.pop("kind"), signal))
+        return emissions
     if kind == "intent_claimed":
         return [("intent_claimed", {
             "intent_id": p.get("intent_id", ""),
@@ -302,7 +326,8 @@ def _graph_event_to_bb(self, ev: dict) -> list[tuple[str, dict]]:
             fields["finding_kind"] = fields.pop("kind")
         return [("review_finding", fields)]
     if kind in {"route_suppressed", "route_reopened", "branch_split",
-                "branch_resolved", "coordinator_directive"}:
+                "branch_resolved", "coordinator_directive", "sub_goal_added",
+                "sub_goal_satisfied", "visit_wave_reset"}:
         fields = dict(p)
         fields["seq"] = seq
         return [(kind, fields)]
@@ -341,8 +366,14 @@ async def _drain_graph_to_bus(self, *, emit_bb) -> None:
             self._last_graph_event_seq = max(self._last_graph_event_seq, seq)
             self._graph_bridge_failures.pop(seq, None)
             continue
-        emissions = self._graph_event_to_bb(ev)
         try:
+            if str(ev.get("kind") or "") in {"intent_proposed", "dead_end"}:
+                # Evidence projection verifies full artifact bytes. Keep this
+                # I/O outside the event loop; SQLite uses its existing lock and
+                # check_same_thread=False connection for the scoped reads.
+                emissions = await asyncio.to_thread(self._graph_event_to_bb, ev)
+            else:
+                emissions = self._graph_event_to_bb(ev)
             for kind, fields in emissions:
                 await emit_bb(
                     kind,
@@ -385,7 +416,7 @@ def _persist_runtime_diagnostics(self, *, reason: str, solved: bool) -> None:
             "failure_phase": str(
                 getattr(self, "_runtime_failure_phase", "") or ""),
             "failure_detail": str(
-                getattr(self, "_runtime_failure_detail", "") or "")[:800],
+                getattr(self, "_runtime_failure_detail", "") or ""),
         }
         path = run_dir / "runtime-diagnostics.json"
         path.write_text(
@@ -418,19 +449,22 @@ async def _emit_run_finished(self, *, flag: "Optional[str]", solved: bool,
                    "reason": reason,
                    **runtime_meta}
         if reason == "runtime_failure":
-            detail = str(getattr(self, "_runtime_failure_detail", "") or "")[:800]
-            if detail:
-                payload.update({
-                    "detail": detail,
-                    "failure_code": str(
-                        getattr(self, "_runtime_failure_code", "")
-                        or "runtime_failure"
-                    ),
-                    "failure_phase": str(
-                        getattr(self, "_runtime_failure_phase", "")
-                        or "runtime"
-                    ),
-                })
+            detail = str(
+                getattr(self, "_runtime_failure_detail", "")
+                or getattr(self, "_runtime_failure_code", "")
+                or "runtime failure"
+            )
+            payload.update({
+                "detail": detail,
+                "failure_code": str(
+                    getattr(self, "_runtime_failure_code", "")
+                    or "runtime_failure"
+                ),
+                "failure_phase": str(
+                    getattr(self, "_runtime_failure_phase", "")
+                    or "runtime"
+                ),
+            })
         await self.bus.emit(Event(
             event_type=EventType.RUN_FINISHED, run_id=self.run_id,
             challenge_id=self.challenge.id,

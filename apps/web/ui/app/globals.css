@@ -7,6 +7,7 @@
 @import "./styles/solve-collaboration-page.css";
 @import "./styles/solve-orchestration.css";
 @import "./styles/solve-runtime.css";
+@import "./styles/activity-timeline.css";
 @import "./styles/solve-panels.css";
 @import "./styles/workers-conversation.css";
 @import "./styles/workers-inspector.css";
@@ -46,3 +47,4 @@
 @import "./styles/chat/interaction.css";
 @import "./styles/workspace-rail.css";
 @import "./styles/chat/refine.css";
+@import "./styles/src-workbench.css";

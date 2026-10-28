@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import {
   DeckState,
   verifiedFactTexts,
@@ -9,7 +9,9 @@ import {
   workerIds,
   type ArtifactView,
 } from "@/lib/events";
-import { API, apiFetch } from "@/lib/useRun";
+import { PricingIssues } from "@/components/usage/PricingIssues";
+import type { PricingIssue } from "@/lib/modelPricing";
+import { runUsageAmount, runUsageTokens, useRunUsageLedger } from "@/lib/useRunUsageLedger";
 import { useT } from "@/lib/i18n";
 import { canvasModeOf } from "@/lib/swarmProjection";
 import {
@@ -28,30 +30,13 @@ export type SignalCostRow = {
   id: string;
   label: string;
   engine: string;
-  usd: number;
-  tokens: number;
+  usd: number | null;
+  tokens: number | null;
+  tokenLabel: string;
   amount: string;
   amountSource: string;
+  pricingIssues?: PricingIssue[];
 };
-
-type LedgerCost = {
-  records: number;
-  total_tokens: number | null;
-  reported_cost: number | null;
-  estimated_cost: number | null;
-  unpriced: number;
-  token_coverage?: string;
-};
-
-function amountLabel(cost: Pick<LedgerCost, "reported_cost" | "estimated_cost" | "unpriced">): { amount: string; source: string } {
-  const known = cost.reported_cost != null || cost.estimated_cost != null;
-  if (!known) return { amount: "未定价", source: "" };
-  const source = cost.estimated_cost != null
-    ? (cost.reported_cost != null ? "含估算" : "估算")
-    : "上报";
-  const amount = `${source} $${((cost.reported_cost ?? 0) + (cost.estimated_cost ?? 0)).toFixed(4)}`;
-  return { amount, source: cost.unpriced > 0 ? "部分未定价" : "" };
-}
 
 function compactNumber(value: number): string {
   if (value < 1000) return String(value);
@@ -133,7 +118,27 @@ export function RunSignalsStrip({
   const factItems = deck.mode === "pentest"
     ? deck.blackboard.facts.filter((fact) => fact.verified && fact.actor !== "origin").map((fact) => fact.fact)
     : [...verifiedFactTexts(deck), ...deadEndTexts(deck)];
-  const goalItems = [(deck.taskContract?.completion.goal || "").trim() || t("insp.run.taskGoal")].filter(Boolean);
+  const stepItems = useMemo(() => {
+    const seen = new Set<string>();
+    return deck.blackboard.intents.flatMap((intent) => {
+      const text = intent.summary || intent.goal || intent.id;
+      if (!text || seen.has(text)) return [];
+      seen.add(text);
+      return [text];
+    });
+  }, [deck.blackboard.intents]);
+  const goalItems = useMemo(() => {
+    const seen = new Set<string>();
+    const values = [
+      (deck.taskContract?.completion.goal || "").trim() || t("insp.run.taskGoal"),
+      ...deck.blackboard.subGoals.map((goal) => goal.criterion),
+    ];
+    return values.filter((value) => {
+      if (!value || seen.has(value)) return false;
+      seen.add(value);
+      return true;
+    });
+  }, [deck.blackboard.subGoals, deck.taskContract?.completion.goal, t]);
   const flagItems = deck.flagConfirmations.length
     ? deck.flagConfirmations.map((row) => {
       switch (row.status) {
@@ -158,64 +163,52 @@ export function RunSignalsStrip({
     [deck],
   );
 
-  const [ledger, setLedger] = useState<LedgerCost | null>(null);
-  const [ledgerByWorker, setLedgerByWorker] = useState<Record<string, LedgerCost>>({});
+  const { data: usage, error: usageError } = useRunUsageLedger(deck.runId, deck.executionGeneration > 0 ? deck.executionGeneration : undefined);
+  const ledger = usage?.totals;
+  const ledgerByWorker = useMemo(() => Object.fromEntries(
+    (usage?.groups?.worker_id ?? []).map(row => [row.name, row]),
+  ), [usage]);
 
   const costRows = useMemo<SignalCostRow[]>(
-    () =>
-      Object.entries(deck.costBySolver)
-        .map(([id, cost]) => {
-          const priced = ledgerByWorker[id];
-          const display = priced ? amountLabel(priced) : {
-            amount: ledger ? "记账中" : "读取中", source: "",
-          };
-          return {
-            id,
-            label: actorDisplayTitle(id, t, toWorkerIdentity(id, deck.lanes[id]), workerSiblings),
-            engine: cost.engine || workerEngine(id, deck.lanes[id]?.engine),
-            usd: priced ? (priced.reported_cost ?? 0) + (priced.estimated_cost ?? 0) : cost.usd,
-            tokens: cost.tokensIn + cost.tokensOut,
-            amount: display.amount,
-            amountSource: display.source,
-          };
-        })
-        .filter((row) => row.usd > 0 || row.tokens > 0)
-        .sort((a, b) => b.usd - a.usd || b.tokens - a.tokens),
-    [deck.costBySolver, deck.lanes, ledger, ledgerByWorker, t, workerSiblings],
+    () => [...new Set([...Object.keys(deck.costBySolver), ...Object.keys(ledgerByWorker).filter(id => id !== "未上报")])]
+      .map(id => {
+        const cost = deck.costBySolver[id];
+        const priced = ledgerByWorker[id];
+        const display = priced ? runUsageAmount(priced) : {
+          amount: usageError ? "读取失败" : ledger ? "未上报" : "读取中", source: "",
+        };
+        return {
+          id,
+          label: actorDisplayTitle(id, t, toWorkerIdentity(id, deck.lanes[id]), workerSiblings),
+          engine: cost?.engine || workerEngine(id, deck.lanes[id]?.engine),
+          usd: priced?.cost ?? null,
+          tokens: priced?.total_tokens ?? null,
+          tokenLabel: runUsageTokens(priced, compactNumber),
+          amount: display.amount,
+          amountSource: display.source,
+          pricingIssues: priced?.pricing_issues,
+        };
+      })
+      .sort((a, b) => (b.usd ?? -1) - (a.usd ?? -1) || (b.tokens ?? -1) - (a.tokens ?? -1)),
+    [deck.costBySolver, deck.lanes, ledger, ledgerByWorker, t, usageError, workerSiblings],
   );
-
-  useEffect(() => {
-    const controller = new AbortController();
-    let busy = false;
-    setLedger(null);
-    setLedgerByWorker({});
-    const read = async () => {
-      if (busy || !deck.runId) return;
-      busy = true;
-      try {
-        const response = await apiFetch(`${API}/api/usage?run_id=${encodeURIComponent(deck.runId)}&limit=1`, { signal: controller.signal });
-        if (response.ok) {
-          const snapshot = await response.json();
-          if (!controller.signal.aborted) {
-            setLedger(snapshot.totals);
-            setLedgerByWorker(Object.fromEntries(
-              (snapshot.groups?.worker_id ?? []).map((row: LedgerCost & { name: string }) => [row.name, row]),
-            ));
-          }
-        }
-      } catch { /* Existing event telemetry remains visible during disconnection. */ }
-      finally { busy = false; }
-    };
-    void read();
-    const timer = window.setInterval(read, 3000);
-    return () => { controller.abort(); window.clearInterval(timer); };
-  }, [deck.runId]);
-  const totalTokens = ledger?.records
-    ? (ledger.total_tokens ?? (ledger.token_coverage === "missing" ? null : 0))
-    : deck.tokensIn + deck.tokensOut;
-  const totalCost = ledger?.records ? amountLabel(ledger) : {
-    amount: ledger ? "—" : "读取中", source: "",
+  const unassignedPricingIssues = useMemo(() => {
+    const byRole = new Map<string, PricingIssue[]>();
+    for (const issue of ledger?.pricing_issues ?? []) {
+      if (issue.worker_id) continue;
+      const role = issue.role || "auxiliary";
+      byRole.set(role, [...(byRole.get(role) ?? []), issue]);
+    }
+    return [...byRole];
+  }, [ledger]);
+  const totalTokens = ledger?.total_tokens ?? null;
+  const totalTokenLabel = runUsageTokens(ledger, compactNumber);
+  const rawTotalCost = ledger ? runUsageAmount(ledger) : {
+    amount: usageError ? "读取失败" : "读取中", source: "",
   };
+  const totalCost = ledger && usageError
+    ? { amount: rawTotalCost.amount, source: [rawTotalCost.source, "刷新失败（旧值）"].filter(Boolean).join(" · ") }
+    : rawTotalCost;
 
   const signalItems: Record<InspectorSignal, string[]> = {
     verified: verifiedItems,
@@ -223,7 +216,7 @@ export function RunSignalsStrip({
     intents: openIntentItems.map((item) => item.text),
     dead: deadItems,
     facts: factItems,
-    steps: openIntentItems.map((item) => item.text),
+    steps: stepItems,
     goals: goalItems,
     flags: flagItems,
     cost: [],
@@ -245,12 +238,14 @@ export function RunSignalsStrip({
     key: "cost" as const,
     icon: "terminal" as const,
     label: "记账金额",
-    value: totalCost.amount,
-    count: costRows.length,
+    value: ledger?.cost != null
+      ? `${ledger.estimated_cost != null ? "≈" : ""}$${ledger.cost.toFixed(4)}`
+      : totalCost.amount,
+    count: costRows.length + unassignedPricingIssues.length,
     iconBoxTone: "bg-ink/10 text-ink-2",
     cardTone: "hover:border-accent/40 hover:bg-panel2 border-line/60 bg-panel/80",
     activeCardTone: "border-accent/60 bg-accent/10 ring-1 ring-accent/30",
-    tooltip: `记账金额: ${totalCost.amount}${totalCost.source ? `（${totalCost.source}）` : ""}${(totalTokens != null && totalTokens > 0) ? ` · ${compactNumber(totalTokens)} ${t("meta.tokens")}` : ""}`,
+    tooltip: `记账金额: ${totalCost.amount}${totalCost.source ? `（${totalCost.source}）` : ""} · ${totalTokenLabel} ${t("meta.tokens")}`,
   };
   const signals: Array<{
     key: InspectorSignal;
@@ -279,12 +274,12 @@ export function RunSignalsStrip({
           key: "steps",
           icon: "crosshair",
           label: t("meta.steps"),
-          value: String(intents),
-          count: intents,
+          value: String(stepItems.length),
+          count: stepItems.length,
           iconBoxTone: "bg-accent/15 text-accent",
           cardTone: "hover:border-accent/40 hover:bg-accent/5 border-line/60 bg-panel/80",
           activeCardTone: "border-accent/60 bg-accent/10 ring-1 ring-accent/30",
-          tooltip: `${t("meta.steps")}: ${intents}`,
+          tooltip: `${t("meta.steps")}: ${stepItems.length}`,
         },
         {
           key: "goals",
@@ -370,12 +365,12 @@ export function RunSignalsStrip({
             const target = signalTargets[sig.key];
             const items = signalItems[sig.key];
             const visibleItems = items.slice(0, 4);
-            const visibleCosts = costRows.slice(0, 4);
+            const visibleCosts = costRows;
             const remaining =
               sig.key === "cost"
                 ? Math.max(0, costRows.length - visibleCosts.length)
                 : Math.max(0, items.length - visibleItems.length);
-            const empty = sig.key === "cost" ? visibleCosts.length === 0 : visibleItems.length === 0;
+            const empty = sig.key === "cost" ? visibleCosts.length === 0 && unassignedPricingIssues.length === 0 : visibleItems.length === 0;
 
             return (
               <Popover
@@ -391,27 +386,25 @@ export function RunSignalsStrip({
                   aria-label={sig.tooltip}
                   aria-expanded={isOpen}
                 >
-                  <div className="flex items-center gap-1.5 min-w-0">
+                  <div className={`flex items-center gap-1.5 ${sig.key === "cost" ? "shrink-0" : "min-w-0"}`}>
                     <div className={`size-4.5 rounded flex items-center justify-center shrink-0 ${sig.iconBoxTone}`}>
                       <Icon name={sig.icon} size={11} />
                     </div>
-                    <span className="text-[11px] font-medium text-ink-2 group-hover:text-ink truncate transition-colors">
+                    <span className={sig.key === "cost" ? "sr-only" : "text-[11px] font-medium text-ink-2 group-hover:text-ink truncate transition-colors"}>
                       {sig.label}
                     </span>
                   </div>
-                  <div className="flex items-center gap-1 shrink-0">
-                    <span className="text-[12px] font-bold font-mono text-ink tabular-nums">
-                      {sig.value}
-                    </span>
-                    {sig.key === "cost" && totalTokens != null && totalTokens > 0 ? (
-                      <span className="hidden xl:inline-block text-[9.5px] font-mono text-ink-3">
-                        ({compactNumber(totalTokens)})
+                  <div className={`flex items-center gap-1 ${sig.key === "cost" ? "min-w-0 flex-1 justify-end" : "shrink-0"}`}>
+                    <div className={sig.key === "cost" ? "min-w-0 text-right leading-tight" : "contents"}>
+                      <span className={`text-[12px] font-bold font-mono text-ink tabular-nums ${sig.key === "cost" ? "block truncate leading-tight" : ""}`}>
+                        {sig.value}
                       </span>
-                    ) : null}
+                      {sig.key === "cost" && ledger?.cost != null && ledger.unpriced > 0 ? <span className="block truncate text-[9px] leading-tight text-ink-2">部分未定价</span> : null}
+                    </div>
                     <Icon
                       name={isOpen ? "chevronDown" : "chevronRight"}
                       size={10}
-                      className={`text-ink-3/60 group-hover:text-ink transition-all ${
+                      className={`shrink-0 text-ink-3/60 group-hover:text-ink transition-all ${
                         isOpen ? "text-accent" : "group-hover:translate-x-0.5"
                       }`}
                     />
@@ -454,12 +447,12 @@ export function RunSignalsStrip({
 
                     <div className="p-0 max-h-60 overflow-y-auto">
                       {sig.key === "cost" && (
-                        <div className="flex items-center justify-between px-3 py-2 border-b border-line/60 bg-surface/50">
-                          <button className="text-[11px] text-ink-3" onClick={() => onOpenArtifact("usage")}>用量明细 · {totalCost.source || "金额口径"}</button>
-                          <div className="flex items-baseline gap-2">
-                            <b className="text-[13px] font-bold font-mono text-ink">{totalCost.amount}</b>
-                            <small className="text-[10px] font-mono text-ink-3">
-                              {totalTokens == null ? "未上报" : `${compactNumber(totalTokens)} ${t("meta.tokens")}`}
+                        <div className="flex flex-col gap-1.5 px-3 py-2 border-b border-line/60 bg-surface/50">
+                          <button className="self-start text-[11px] text-ink-3" onClick={() => onOpenArtifact("usage")}>用量明细 · {totalCost.source || "金额口径"}</button>
+                          <div className="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-1">
+                            <b className="whitespace-nowrap text-[13px] font-bold font-mono text-ink">{totalCost.amount}</b>
+                            <small className="whitespace-nowrap text-[10px] font-mono text-ink-3">
+                              {totalTokens == null ? totalTokenLabel : `${totalTokenLabel} ${t("meta.tokens")}`}
                             </small>
                           </div>
                         </div>
@@ -473,10 +466,11 @@ export function RunSignalsStrip({
                         <div className="divide-y divide-line/40">
                           {visibleCosts.map((row) => (
                             <div
-                              className="flex items-center justify-between px-3 py-2 hover:bg-panel2/50 transition-colors"
+                              className="flex flex-col gap-1.5 px-3 py-2 hover:bg-panel2/50 transition-colors"
                               key={row.id}
                             >
-                              <div className="flex flex-col min-w-0 gap-0.5">
+                              <div className="flex items-start justify-between gap-3">
+                                <div className="flex flex-col min-w-0 gap-0.5">
                                 <b className="text-[11px] font-medium text-ink truncate max-w-[140px]">{row.label}</b>
                                 <small className="text-[9.5px] font-mono text-ink-3">{row.engine}</small>
                               </div>
@@ -484,11 +478,14 @@ export function RunSignalsStrip({
                                 <b className="text-[11px] font-mono font-semibold text-ink">{row.amount}</b>
                                 {row.amountSource ? <small className="text-[9.5px] text-ink-3">{row.amountSource}</small> : null}
                                 <small className="text-[9.5px] font-mono text-ink-3">
-                                  {compactNumber(row.tokens)} {t("meta.tokens")}
+                                  {row.tokenLabel}{row.tokens != null ? ` ${t("meta.tokens")}` : ""}
                                 </small>
                               </div>
+                              </div>
+                              <PricingIssues issues={row.pricingIssues} />
                             </div>
                           ))}
+                          {unassignedPricingIssues.map(([role, issues]) => <div key={`pricing:${role}`} className="flex flex-col gap-1.5 px-3 py-2"><b className="text-[11px] font-medium text-ink">{{ reason: "协调器", planner: "协调器", dispatch: "任务标题", titler: "标题 / 摘要", auxiliary: "辅助调用" }[role] || role}</b><PricingIssues issues={issues} /></div>)}
                         </div>
                       ) : sig.key === "intents" || sig.key === "steps" ? (
                         <ol className="divide-y divide-line/40 m-0 p-0 list-none">

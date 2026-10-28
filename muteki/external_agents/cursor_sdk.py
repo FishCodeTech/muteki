@@ -19,6 +19,7 @@ import time
 import threading
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -543,6 +544,24 @@ def _catalog(models: list[Any]) -> dict[str, Any]:
     }
 
 
+class _ChatSessionPeer:
+    """Session ownership over a shared transport, never a mutable current session."""
+
+    def __init__(self, peer: StdioJsonlPeer, session_id: str) -> None:
+        self.peer = peer
+        self.session_id = session_id
+
+    async def request(self, op: str, params: dict[str, Any], *, timeout: float | None) -> dict[str, Any]:
+        return await self.peer.request(op, {**params, "agentSessionId": self.session_id}, timeout=timeout)
+
+    @property
+    def running(self) -> bool:
+        return self.peer.running
+
+    def stderr_text(self) -> str:
+        return self.peer.stderr_text()
+
+
 class CursorSdkAdapter(BaseExternalAgentAdapter):
     """Local Cursor SDK runtime. ``adapter_id`` is ``cursor.sdk``."""
 
@@ -563,6 +582,9 @@ class CursorSdkAdapter(BaseExternalAgentAdapter):
         ).expanduser().resolve()
         self._env_extra = dict(env_extra or {})
         self._handles: dict[str, dict[str, Any]] = {}
+        self._chat_runtimes: dict[str, dict[str, Any]] = {}
+        self._chat_runtime_lock = asyncio.Lock()
+        self._chat_install: asyncio.Task[Path] | None = None
 
     def probe_binary(self) -> str:
         return shutil.which(self._node) or self._node
@@ -640,14 +662,20 @@ class CursorSdkAdapter(BaseExternalAgentAdapter):
         caps.mcp = True
         caps.plan = True
         caps.plan_mode = True
+        caps.model_options_per_turn = True
         caps.image_input = True
         caps.access_modes = list(ACCESS_MODE_VALUES)
         for name in (
             "streaming", "resume", "steer", "interrupt", "approval", "user_input",
             "subagents", "tool_events", "usage_events", "session_persistence",
-            "mcp", "plan", "plan_mode", "image_input",
+            "mcp", "plan", "plan_mode", "model_options_per_turn", "image_input",
         ):
             sources[name] = source
+
+    def declared_chat_capabilities(self) -> AgentCapabilities:
+        caps = conservative_capabilities(transport_kind="sdk", capability_source=SOURCE_REPORTED)
+        self._declare(caps, {}, SOURCE_REPORTED)
+        return caps
 
     async def _launch(
         self,
@@ -666,7 +694,7 @@ class CursorSdkAdapter(BaseExternalAgentAdapter):
             reasons=_ACCESS_NOTES,
         )
         if request.interaction_mode == "plan":
-            caps = await self._capabilities()
+            caps = await self.chat_capabilities() if request.options.is_conversation else await self._capabilities()
             if not caps.plan_mode:
                 raise CursorSdkFailure(
                     "cursor_sdk.plan_mode_unsupported",
@@ -680,8 +708,11 @@ class CursorSdkAdapter(BaseExternalAgentAdapter):
                 "CURSOR_API_KEY is not set for the Cursor SDK bridge",
                 category="auth",
             )
-        await asyncio.to_thread(_node_version, self._node)
-        installed = await self._ensure_installed()
+        if request.options.is_conversation:
+            installed = await self._chat_installation()
+        else:
+            await asyncio.to_thread(_node_version, self._node)
+            installed = await self._ensure_installed()
         cwd = request.options.cwd or os.getcwd()
         ephemeral_store: tempfile.TemporaryDirectory[str] | None = None
         if request.options.ephemeral:
@@ -693,8 +724,9 @@ class CursorSdkAdapter(BaseExternalAgentAdapter):
             store = Path(ephemeral_store.name) / "store"
             store.mkdir(mode=0o700)
         else:
-            store = self._store_for(request.resume_handle)
-            store.mkdir(parents=True, exist_ok=True)
+            store = None if request.options.is_conversation and not request.resume_handle else self._store_for(request.resume_handle)
+            if store is not None:
+                store.mkdir(parents=True, exist_ok=True)
         peer: StdioJsonlPeer | None = None
         try:
             log_root = (
@@ -707,38 +739,42 @@ class CursorSdkAdapter(BaseExternalAgentAdapter):
                 **self._env_extra, **dict(request.options.env),
             }) or {})
             env["CURSOR_API_KEY"] = key
-            env = _plugin_git_environment(env, log_root)
             queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-            peer = StdioJsonlPeer(
-                [self.probe_binary(), str(installed / "bridge.mjs")],
-                cwd=str(installed),
-                env=env,
-                label="cursor-sdk",
-                is_response=lambda msg: (
-                    isinstance(msg, dict) and msg.get("type") == "response"
-                ),
-                request_envelope=_bridge_envelope,
-                on_message=lambda msg: _enqueue(queue, msg),
-                owner_adapter_id=self.identity.adapter_id,
-                owner_session_id=request.agent_session_id,
-                stderr_log_root=(
-                    log_root
-                    if ephemeral_store is not None
-                    else self._runtime_root / "logs"
-                ),
-            )
-            await peer.start()
+            shared_runtime = None
+            if request.options.thread_mode == "conversation":
+                shared_runtime = await self._chat_runtime(installed, env)
+                if store is None:
+                    store = shared_runtime["store"]
+                    store.mkdir(parents=True, exist_ok=True)
+                shared_runtime["queues"][request.agent_session_id] = queue
+                peer = _ChatSessionPeer(shared_runtime["peer"], request.agent_session_id)
+                env = shared_runtime["env"]
+            else:
+                env = _plugin_git_environment(env, log_root)
+                peer = StdioJsonlPeer(
+                    [self.probe_binary(), str(installed / "bridge.mjs")],
+                    cwd=str(installed), env=env, label="cursor-sdk",
+                    is_response=lambda msg: isinstance(msg, dict) and msg.get("type") == "response",
+                    request_envelope=_bridge_envelope,
+                    on_message=lambda msg: _enqueue(queue, msg),
+                    owner_adapter_id=self.identity.adapter_id,
+                    owner_session_id=request.agent_session_id,
+                    stderr_log_root=log_root if ephemeral_store is not None else self._runtime_root / "logs",
+                )
+                await peer.start()
         except BaseException:
             try:
-                if peer is not None:
+                if peer is not None and not isinstance(peer, _ChatSessionPeer):
                     await peer.close()
             finally:
                 if ephemeral_store is not None:
                     ephemeral_store.cleanup()
             raise
-        watcher = asyncio.ensure_future(_watch_exit(peer, queue))
+        watcher = None if shared_runtime is not None else asyncio.ensure_future(_watch_exit(peer, queue))
         handle: dict[str, Any] = {
             "peer": peer, "queue": queue, "watcher": watcher, "cwd": cwd,
+            "shared_runtime": shared_runtime,
+            "is_conversation": request.options.is_conversation,
             "store": str(store), "log_path": log_root / "protocol.jsonl",
             "text": [], "thinking": [], "thinking_index": 0, "nested": {},
             "ephemeral_store": ephemeral_store,
@@ -752,33 +788,51 @@ class CursorSdkAdapter(BaseExternalAgentAdapter):
                 raise CursorSdkFailure("cursor_sdk.startup_timeout", "Cursor startup budget exhausted", category="timeout")
             return remaining
         try:
-            hello = await self._rpc(peer, "hello", timeout=min(60, startup_remaining()))
+            hello = shared_runtime["hello"] if shared_runtime is not None else await self._rpc(peer, "hello", timeout=min(60, startup_remaining()))
             if int(hello.get("protocol") or 0) != PROTOCOL_VERSION:
                 raise CursorSdkFailure(
                     "cursor_sdk.protocol",
                     f"bridge protocol {hello.get('protocol')!r} != {PROTOCOL_VERSION}",
                     category="validation",
                 )
-            if env.get("MUTEKI_CHAT_PRIVATE_ROOT"):
-                metadata = await self._rpc(peer, "publicPluginMetadata", timeout=min(60, startup_remaining()))
-                public_cache = _PublicPluginGitCache(self._runtime_root, env, key, startup_deadline)
+            if shared_runtime is not None:
+                if shared_runtime.get("prepare") is None:
+                    shared_runtime["prepare"] = asyncio.create_task(
+                        self._prepare_chat_runtime(shared_runtime, key, startup_deadline))
+                preparation = shared_runtime["prepare"]
                 try:
-                    cached = await asyncio.to_thread(public_cache.prepare, metadata)
-                except BaseException:
-                    public_cache.cancel()
+                    cached = await asyncio.shield(preparation)
+                except Exception:
+                    # Surface this failure; a later explicit launch may retry.
+                    if shared_runtime["prepare"] is preparation:
+                        shared_runtime["prepare"] = None
                     raise
-                self._append_log(handle, {"kind": "public_plugin_git_cache", "cache": cached})
+                if cached is not None:
+                    self._append_log(handle, {"kind": "public_plugin_git_cache", "cache": cached})
+            else:
+                if env.get("MUTEKI_CHAT_PRIVATE_ROOT"):
+                    metadata = await self._rpc(peer, "publicPluginMetadata", timeout=min(60, startup_remaining()))
+                    public_cache = _PublicPluginGitCache(self._runtime_root, env, key, startup_deadline)
+                    try:
+                        cached = await asyncio.to_thread(public_cache.prepare, metadata)
+                    except BaseException:
+                        public_cache.cancel()
+                        raise
+                    self._append_log(handle, {"kind": "public_plugin_git_cache", "cache": cached})
             policy = _access_policy(request.access_mode)
             opened = await self._rpc(peer, "open", {
                 "cwd": cwd,
                 "storeDir": str(store),
+                **({"sharedPlatform": True} if request.options.is_conversation and not request.options.ephemeral else {}),
                 "model": _model_selection(request.model),
                 "effort": _effort(request.effort),
                 "serviceTier": str(request.service_tier or "").strip() or None,
                 "mode": "plan" if request.interaction_mode == "plan" else "agent",
                 "autoReview": policy["autoReview"],
                 "sandbox": policy["sandbox"],
-                "settingSources": ["project", "user", "team", "mdm", "plugins"],
+                # T3's chat title helper creates an isolated one-shot agent
+                # without loading the conversation's tool/plugin settings.
+                "settingSources": [] if request.options.is_conversation and request.options.ephemeral else ["project", "user", "team", "mdm", "plugins"],
                 "mcpServers": _sdk_mcp_servers(materialize_mcp_servers(plan, bearer_token)),
                 **({"agentId": request.resume_handle} if request.resume_handle else {}),
             # Plugin prewarm may fetch the public repository more than once.
@@ -888,7 +942,7 @@ class CursorSdkAdapter(BaseExternalAgentAdapter):
             ))
             return
         if input.payload.interaction_mode == "plan":
-            caps = await self._capabilities()
+            caps = await self.chat_capabilities() if handle.get("is_conversation") else await self._capabilities()
             if not caps.plan_mode:
                 yield self._failed(session, CursorSdkFailure(
                     "cursor_sdk.plan_mode_unsupported",
@@ -913,11 +967,20 @@ class CursorSdkAdapter(BaseExternalAgentAdapter):
             execution_generation=record.execution_generation if record else None,
         )
         runner.mark_sent()
+        model_options: dict[str, Any] = {}
+        if handle.get("is_conversation"):
+            if input.payload.model is not None:
+                model_options["model"] = _model_selection(input.payload.model)
+            if input.payload.effort is not None:
+                model_options["effort"] = _effort(input.payload.effort) or ""
+            if input.payload.service_tier is not None:
+                model_options["serviceTier"] = input.payload.service_tier.strip()
         try:
             await self._rpc(handle["peer"], "send", {
                 "turn": turn_id,
                 "text": text,
                 "mode": "plan" if input.payload.interaction_mode == "plan" else "agent",
+                **model_options,
                 **({"images": images} if images else {}),
             }, timeout=120)
         except CursorSdkFailure as exc:
@@ -1017,12 +1080,17 @@ class CursorSdkAdapter(BaseExternalAgentAdapter):
         peer: StdioJsonlPeer = handle["peer"]
         try:
             if peer.running:
-                await self._rpc(peer, "close", timeout=10)
+                await self._rpc(peer, "close", timeout=None if handle.get("shared_runtime") is not None else 10)
         except (CursorSdkFailure, PeerClosedError):
-            pass
+            if handle.get("shared_runtime") is not None:
+                raise
         finally:
             try:
-                await peer.close()
+                shared_runtime = handle.get("shared_runtime")
+                if shared_runtime is None:
+                    await peer.close()
+                else:
+                    shared_runtime["queues"].pop(agent_session_id, None)
             finally:
                 watcher = handle.get("watcher")
                 if watcher is not None and not watcher.done():
@@ -1030,6 +1098,119 @@ class CursorSdkAdapter(BaseExternalAgentAdapter):
                 ephemeral_store = handle.get("ephemeral_store")
                 if ephemeral_store is not None:
                     ephemeral_store.cleanup()
+
+    async def _chat_installation(self) -> Path:
+        async def install() -> Path:
+            await asyncio.to_thread(_node_version, self._node)
+            return await self._ensure_installed()
+
+        if self._chat_install is None:
+            self._chat_install = asyncio.create_task(install())
+        task = self._chat_install
+        try:
+            return await asyncio.shield(task)
+        except Exception:
+            if self._chat_install is task:
+                self._chat_install = None
+            raise
+
+    async def _chat_runtime(self, installed: Path, env: dict[str, str]) -> dict[str, Any]:
+        # Only ChatPluginService.native_launch_options consumes this per-thread
+        # staging path. The materialized launch descriptors already carry their
+        # concrete paths; @cursor/sdk must not inherit another chat's asset root.
+        env = {name: value for name, value in env.items() if name != "MUTEKI_CHAT_ASSETS_ROOT"}
+        # Hash the effective environment before adding our generated Git config.
+        # Session log paths must never split an otherwise identical runtime.
+        identity = hashlib.sha256(json.dumps(
+            [self.probe_binary(), str(installed), sorted(env.items())],
+            ensure_ascii=False, separators=(",", ":"),
+        ).encode()).hexdigest()
+        async with self._chat_runtime_lock:
+            runtime = self._chat_runtimes.get(identity)
+            if runtime is not None:
+                if runtime["peer"].running:
+                    return runtime
+                # A new explicit launch may replace the transport host. Native
+                # agent/store selection remains unchanged, including resume ids.
+                preparation = runtime.get("prepare")
+                if preparation is not None and not preparation.done():
+                    preparation.cancel()
+                    await asyncio.gather(preparation, return_exceptions=True)
+                await runtime["peer"].close()
+                runtime["watcher"].cancel()
+                self._chat_runtimes.pop(identity)
+            root = self._runtime_root / "chat-runtimes" / identity
+            env = _plugin_git_environment(env, root)
+            queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
+
+            async def route(message: dict[str, Any]) -> None:
+                queue = queues.get(str(message.get("agentSessionId") or ""))
+                if queue is not None:
+                    await _enqueue(queue, message)
+
+            peer = StdioJsonlPeer(
+                [self.probe_binary(), str(installed / "bridge.mjs")], cwd=str(installed),
+                env=env, label="cursor-sdk-chat",
+                is_response=lambda msg: isinstance(msg, dict) and msg.get("type") == "response",
+                request_envelope=_bridge_envelope, on_message=route,
+                owner_adapter_id=self.identity.adapter_id, stderr_log_root=root / "logs",
+            )
+            await peer.start()
+            try:
+                hello = await self._rpc(peer, "hello", timeout=60)
+            except BaseException:
+                await peer.close()
+                raise
+            runtime = {"peer": peer, "env": env, "queues": queues, "prepare": None, "hello": hello,
+                       "store": self._runtime_root / "agents" / ("chat-" + identity)}
+            self._chat_runtimes[identity] = runtime
+
+            async def watch() -> None:
+                try:
+                    code = await peer.wait_exit()
+                except PeerClosedError:
+                    code = None
+                for queue in list(queues.values()):
+                    await queue.put({"type": "event", "kind": "bridge_exited", "exitCode": code})
+
+            runtime["watcher"] = asyncio.create_task(watch())
+            return runtime
+
+    async def _prepare_chat_runtime(self, runtime: dict[str, Any], key: str, deadline: float) -> dict[str, Any] | None:
+        env = runtime["env"]
+        if not env.get("MUTEKI_CHAT_PRIVATE_ROOT"):
+            return None
+        metadata = await self._rpc(runtime["peer"], "publicPluginMetadata", timeout=60)
+        cache = _PublicPluginGitCache(self._runtime_root, env, key, deadline)
+        try:
+            return await asyncio.to_thread(cache.prepare, metadata)
+        except BaseException:
+            cache.cancel()
+            raise
+
+    async def shutdown_chat_runtimes(self) -> None:
+        """Release chat agents and executor leases at explicit host shutdown."""
+        sessions = [session_id for session_id, handle in list(self._handles.items())
+                    if handle.get("shared_runtime") is not None]
+        session_results = await asyncio.gather(*(self._stop_peer(session_id) for session_id in sessions), return_exceptions=True)
+        runtimes, self._chat_runtimes = self._chat_runtimes, {}
+        async def close_runtime(runtime: dict[str, Any]) -> None:
+            preparation = runtime.get("prepare")
+            if preparation is not None and not preparation.done():
+                preparation.cancel()
+                await asyncio.gather(preparation, return_exceptions=True)
+            peer = runtime["peer"]
+            try:
+                if peer.running:
+                    await self._rpc(peer, "shutdown", timeout=None)
+            finally:
+                await peer.close()
+                runtime["watcher"].cancel()
+
+        results = await asyncio.gather(*(close_runtime(runtime) for runtime in runtimes.values()), return_exceptions=True)
+        failures = [result for result in [*session_results, *results] if isinstance(result, Exception)]
+        if failures:
+            raise ExceptionGroup("Cursor chat runtime shutdown failed", failures)
 
     async def _ensure_installed(self) -> Path:
         async with _INSTALL_LOCK:
@@ -1151,8 +1332,8 @@ class CursorSdkAdapter(BaseExternalAgentAdapter):
         return str(merged.get("CURSOR_API_KEY") or "").strip()
 
     async def _rpc(
-        self, peer: StdioJsonlPeer, op: str, params: Optional[dict[str, Any]] = None,
-        *, timeout: float,
+        self, peer: StdioJsonlPeer | _ChatSessionPeer, op: str, params: Optional[dict[str, Any]] = None,
+        *, timeout: float | None,
     ) -> dict[str, Any]:
         try:
             response = await peer.request(op, params or {}, timeout=timeout)
@@ -1389,14 +1570,7 @@ class CursorSdkAdapter(BaseExternalAgentAdapter):
         if usage:
             events.append(self._event(
                 session, turn_id, AgentEventType.USAGE_UPDATED,
-                UsagePayload(
-                    scope="turn",
-                    usage_id=turn_id,
-                    input_tokens=_token(usage.get("inputTokens")),
-                    output_tokens=_token(usage.get("outputTokens")),
-                    cached_input_tokens=_token(usage.get("cacheReadTokens") or usage.get("cacheRead")),
-                    cache_write_tokens=_token(usage.get("cacheWriteTokens") or usage.get("cacheWrite")),
-                ),
+                _cursor_usage_payload(usage, turn_id),
             ))
         status = str(msg.get("status") or "")
         if status == "cancelled":
@@ -1566,9 +1740,27 @@ def _token(value: Any) -> Optional[int]:
         return None
     if isinstance(value, int) and value >= 0:
         return value
-    if isinstance(value, float) and value >= 0:
+    if isinstance(value, float) and math.isfinite(value) and value >= 0:
         return int(value)
     return None
+
+
+def _cursor_usage_payload(usage: dict[str, Any], turn_id: str) -> UsagePayload:
+    # SDK inputTokens is uncached input; cache buckets are disjoint. The
+    # normalized contract includes caches in input and reasoning in output.
+    fresh = _token(usage.get("inputTokens"))
+    read = _token(usage.get("cacheReadTokens", usage.get("cacheRead")))
+    write = _token(usage.get("cacheWriteTokens", usage.get("cacheWrite")))
+    inp = None if fresh is None else fresh + (read or 0) + (write or 0)
+    out = _token(usage.get("outputTokens"))
+    total = _token(usage.get("totalTokens"))
+    if total is None and inp is not None and out is not None:
+        total = inp + out
+    return UsagePayload(
+        scope="turn", usage_id=turn_id, input_tokens=inp, output_tokens=out,
+        cached_input_tokens=read, cache_write_tokens=write,
+        reasoning_tokens=_token(usage.get("reasoningTokens")), total_tokens=total,
+    )
 
 
 __all__ = ["CursorSdkAdapter", "CursorSdkFailure", "SDK_VERSION"]

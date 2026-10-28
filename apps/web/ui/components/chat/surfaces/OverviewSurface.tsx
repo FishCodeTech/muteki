@@ -27,6 +27,8 @@ function Row({
   onClick,
   trailing,
   tone = "default",
+  leading,
+  selected,
 }: {
   icon: IconName;
   title: ReactNode;
@@ -34,29 +36,51 @@ function Row({
   onClick?: () => void;
   trailing?: ReactNode;
   tone?: "default" | "running" | "accent";
+  /** Replaces the icon tile (e.g. a Checkbox in selection mode). */
+  leading?: ReactNode;
+  selected?: boolean;
 }) {
-  const body = (
-    <>
-      <span
-        className={cn(
-          "grid size-8 shrink-0 place-items-center rounded-lg",
-          tone === "running" ? "bg-cx-accent-soft text-cx-accent" : tone === "accent" ? "bg-cx-accent-soft text-cx-accent" : "bg-cx-hover text-cx-fg-3",
-        )}
-      >
-        {tone === "running" ? <Spinner size={14} /> : <Icon name={icon} size={15} />}
-      </span>
-      <span className="flex min-w-0 flex-1 flex-col text-left">
-        <span className="truncate text-[13px] font-medium text-cx-fg">{title}</span>
-        {subtitle ? <span className="truncate text-[12px] text-cx-fg-4">{subtitle}</span> : null}
-      </span>
-      {trailing ?? (onClick ? <Icon name="chevronRight" size={14} className="shrink-0 text-cx-fg-4" /> : null)}
-    </>
+  const lead = leading ?? (
+    <span
+      className={cn(
+        "grid size-8 shrink-0 place-items-center rounded-lg",
+        tone === "running" ? "bg-cx-accent-soft text-cx-accent" : tone === "accent" ? "bg-cx-accent-soft text-cx-accent" : "bg-cx-hover text-cx-fg-3",
+      )}
+    >
+      {tone === "running" ? <Spinner size={14} /> : <Icon name={icon} size={15} />}
+    </span>
   );
-  if (!onClick) return <div className="flex items-center gap-3 rounded-xl px-2 py-1.5">{body}</div>;
+  const text = (
+    <span className="flex min-w-0 flex-1 flex-col text-left">
+      <span className="truncate text-[13px] font-medium text-cx-fg">{title}</span>
+      {subtitle ? <span className="truncate text-[12px] text-cx-fg-4">{subtitle}</span> : null}
+    </span>
+  );
+  const tail = trailing ?? (onClick ? <Icon name="chevronRight" size={14} className="shrink-0 text-cx-fg-4" /> : null);
+  if (leading === undefined && trailing === undefined) {
+    if (!onClick) return <div className="flex items-center gap-3 rounded-xl px-2 py-1.5">{lead}{text}{tail}</div>;
+    return (
+      <button type="button" onClick={onClick} className="cx-press flex w-full items-center gap-3 rounded-xl px-2 py-1.5 text-left transition-colors hover:bg-cx-hover">
+        {lead}
+        {text}
+        {tail}
+      </button>
+    );
+  }
+  const rowCls = cn("relative flex items-center gap-3 rounded-xl px-2 py-1.5 transition-colors hover:bg-cx-hover has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-[var(--cx-focus)]", selected && "bg-cx-active");
+  const clickCls = "cx-press after:absolute after:inset-0 after:rounded-xl text-left outline-none";
   return (
-    <button type="button" onClick={onClick} className="cx-press flex w-full items-center gap-3 rounded-xl px-2 py-1.5 transition-colors hover:bg-cx-hover">
-      {body}
-    </button>
+    <div className={rowCls}>
+      <span className="relative z-[1] shrink-0">{lead}</span>
+      {onClick ? (
+        <button type="button" onClick={onClick} className={cn(clickCls, "flex min-w-0 flex-1 items-center")}>
+          {text}
+        </button>
+      ) : (
+        text
+      )}
+      {tail ? <span className="relative z-[1] shrink-0">{tail}</span> : null}
+    </div>
   );
 }
 
@@ -211,3 +235,5 @@ export function OverviewSurface({ threadId, view, events, tools, onOpenDetails }
     </ScrollArea>
   );
 }
+
+export { Row as SurfaceRow, Card as SurfaceCard };

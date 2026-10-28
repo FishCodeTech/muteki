@@ -20,6 +20,8 @@ handle 都在 PlatformStore 中，Executor 在下一个 Turn 时用 resume_handl
 
 from __future__ import annotations
 
+from muteki.core.blocking import run_blocking
+
 import asyncio
 import logging
 import time
@@ -148,7 +150,7 @@ class ConversationService:
         因此这里只对遗留活动 Turn 对应的 Runtime 做窄范围 probe；正常没有
         活动 Turn 的启动不会等待所有引擎探测。
         """
-        rebuilt = self.projection.rebuild_all()
+        rebuilt = await run_blocking(self.projection.rebuild_all)
         interrupted: list[dict[str, Any]] = []
         for turn in self.conv.list_active_turns():
             session = (

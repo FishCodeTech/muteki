@@ -1,10 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchWorkspaceKindEntries, type WorkspaceKindEntry } from "./workspace-kinds";
 import { apiFetch, type RunSummary } from "./useRun";
 import type { ConversationThread } from "./useConversation";
 import type { CompetitionInfo, CompetitionSnapshotView } from "./competition-events";
+import { isDesktopWorkspaceActive } from "./desktopEnvironment";
 
 export interface RecentWorkspace {
   id: string;
@@ -60,13 +61,15 @@ function competitionApproval(snapshot: CompetitionSnapshotView | null): boolean 
   ));
 }
 
-export function useWorkspaceOverview(pollMs = 10000, solveOnly = false): WorkspaceOverview {
+export function useWorkspaceOverview(pollMs = 10000, solveOnly = false, enabled = true): WorkspaceOverview {
   const [kinds, setKinds] = useState<WorkspaceKindEntry[]>([]);
   const [recent, setRecent] = useState<RecentWorkspace[]>([]);
   const [activity, setActivity] = useState<Record<string, WorkspaceKindActivity>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [refreshedAt, setRefreshedAt] = useState(0);
+  const enabledRef = useRef(enabled);
+  enabledRef.current = enabled;
 
   const refresh = useCallback(async () => {
     try {
@@ -144,6 +147,8 @@ export function useWorkspaceOverview(pollMs = 10000, solveOnly = false): Workspa
         });
       });
       rows.sort((a, b) => b.updatedAt - a.updatedAt);
+      // A read that started before the frame paused must not repopulate it.
+      if (!enabledRef.current) return;
 
       const nextActivity: Record<string, WorkspaceKindActivity> = {};
       for (const kind of nextKinds) nextActivity[kind.id] = { ...EMPTY_ACTIVITY };
@@ -162,16 +167,25 @@ export function useWorkspaceOverview(pollMs = 10000, solveOnly = false): Workspa
       setError("");
       setRefreshedAt(Date.now());
     } catch (exc) {
-      setError(exc instanceof Error ? exc.message : String(exc));
+      if (enabledRef.current) setError(exc instanceof Error ? exc.message : String(exc));
     } finally {
       setLoading(false);
     }
   }, [solveOnly]);
 
   useEffect(() => {
+    if (!enabled) {
+      // Drop rows read earlier so a paused frame shows nothing from the service.
+      setKinds([]);
+      setRecent([]);
+      setActivity({});
+      setError("");
+      setLoading(false);
+      return;
+    }
     let active = true;
     const run = async () => {
-      if (active) await refresh();
+      if (active && isDesktopWorkspaceActive()) await refresh();
     };
     void run();
     const timer = window.setInterval(() => void run(), pollMs);
@@ -182,7 +196,8 @@ export function useWorkspaceOverview(pollMs = 10000, solveOnly = false): Workspa
       window.clearInterval(timer);
       window.removeEventListener("focus", onFocus);
     };
-  }, [pollMs, refresh]);
+  }, [enabled, pollMs, refresh]);
 
-  return { kinds, recent, activity, loading, error, refreshedAt, refresh };
+  const pausedRefresh = useCallback(async () => undefined, []);
+  return { kinds, recent, activity, loading, error, refreshedAt, refresh: enabled ? refresh : pausedRefresh };
 }

@@ -509,8 +509,8 @@ export function RunInspector({
               </Button>
             ) : (
               <div className="insp-run-flag pending t-flag-target">
-                <span className="insp-pending-row"><Icon name="flag" size={13} /> {t("insp.run.pending")}</span>
-                <span className="insp-pending-hint">{t("insp.run.pendingHint")}</span>
+                <span className="insp-pending-row"><Icon name="flag" size={13} /> {deck.finished ? t("insp.run.notCollected") : t("insp.run.pending")}</span>
+                {!deck.finished && <span className="insp-pending-hint">{t("insp.run.pendingHint")}</span>}
               </div>
             )}
           </>

@@ -108,6 +108,20 @@ class CapabilityBindingService:
             return None
         return max(active, key=lambda b: (b.binding_version, b.created_at))
 
+    def session_tool_set(
+        self, thread_id: str, principal_id: str, mode: ThreadMode | str
+    ) -> list[str]:
+        """该 (thread, principal) 的 Session 获得的工具集合。
+
+        与 ``issue_binding`` 签发或复用的 Binding 一致；只读，不签发。
+        """
+        if not isinstance(mode, ThreadMode):
+            mode = ThreadMode(str(mode))
+        existing = self.active_binding_for_thread(thread_id, principal_id)
+        if existing is not None and existing.mode is mode:
+            return effective_tool_set(mode, existing.tool_set)
+        return default_tool_set(mode)
+
     def issue_binding(
         self,
         thread_id: str,

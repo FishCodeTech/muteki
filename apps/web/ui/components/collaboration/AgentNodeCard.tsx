@@ -364,8 +364,8 @@ export function AgentNodeCard({ data }: NodeProps<AgentFlowNode>) {
                 <span className="collab-agent-avatar" aria-hidden="true">
                   {data.engineKey
                     ? <EngineLogo engine={data.engineKey} size={12} />
-                    : data.role === "decision" || data.role === "source"
-                      ? <Icon name={data.role === "decision" ? "sparkles" : "file"} size={12} />
+                    : data.role === "decision" || data.role === "challenger" || data.role === "source"
+                      ? <Icon name={data.role === "decision" || data.role === "challenger" ? "sparkles" : "file"} size={12} />
                       : data.initial}
                 </span>
                 <b>{data.roleLabel}</b>

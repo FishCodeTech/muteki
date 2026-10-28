@@ -57,6 +57,7 @@ export interface ComposerContextStripProps {
   className?: string;
   /** Right-aligned slot (usage stats, context meter). */
   trailing?: ReactNode;
+  onUnboundRecover?: () => void;
 }
 
 const MODE_OPTIONS: Array<{ value: WorkspaceBindMode; label: string; description: string }> = [
@@ -114,6 +115,7 @@ export function ComposerContextStrip({
   modeDisabled = false,
   className = "",
   trailing,
+  onUnboundRecover,
 }: ComposerContextStripProps) {
   const currentProject = projects.find((project) => project.project_id === selectedProjectId);
   const rootPath = (workspaceRootPath || currentProject?.root_path || "").trim();
@@ -243,6 +245,7 @@ export function ComposerContextStrip({
           directoryLabel={directoryLabel || undefined}
           directoryTitle={rootPath || undefined}
           modeLabel={modeLabel(workspaceMode, bound) || (currentProject || rootPath ? "本地检出" : undefined)}
+          onUnboundRecover={onUnboundRecover}
         />
         {showModeControls ? (
           <>
@@ -304,12 +307,13 @@ export function ComposerContextStrip({
             ) : null}
           </>
         ) : null}
-        <ComposerBranchPicker
-          projectId={selectedProjectId}
-          threadId={threadId}
-          disabled={branchDisabled}
-
-        />
+        {threadId && !workspaceRootPath ? null : (
+          <ComposerBranchPicker
+            projectId={selectedProjectId}
+            threadId={threadId}
+            disabled={branchDisabled}
+          />
+        )}
         {trailing ? <div className="ml-auto flex min-w-0 items-center gap-1.5">{trailing}</div> : null}
       </div>
       {pickingExisting ? (

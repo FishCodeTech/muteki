@@ -19,7 +19,7 @@ import type {
 // "dispatch" is the rail-label Planner's actor.
 // "preflight" stamps preflight checks; "legacy-reconciler" stamps backfilled
 // flag_found records. Neither is a worker.
-const CONTROL_SOLVER_IDS = new Set(["reason", "coordinator", "report-value", "dispatch", "operator", "preflight", "legacy-reconciler"]);
+const CONTROL_SOLVER_IDS = new Set(["reason", "challenger", "coordinator", "report-value", "dispatch", "operator", "preflight", "legacy-reconciler"]);
 
 /** Is this solver id a shell WORKER (vs the coordinator / unscoped)? */
 export function isWorkerLane(id?: string | null): boolean {
@@ -89,7 +89,7 @@ function isCoordinatorMessage(m: ChatMessage): boolean {
   if (m.mainThread) return true;
   // Reason is a structured planner. Historical recordings may contain its raw
   // JSON as text/reasoning deltas; keep those out of the operator conversation.
-  if (m.solverId === "reason" && (m.kind === "text" || m.kind === "reasoning")) return false;
+  if ((m.solverId === "reason" || m.solverId === "challenger") && (m.kind === "text" || m.kind === "reasoning")) return false;
   return !m.solverId || CONTROL_SOLVER_IDS.has(m.solverId);
 }
 
@@ -231,6 +231,8 @@ export interface SwarmDigest {
   platformPending: number;
   platformRejected: number;
   openSteps: number;
+  /** Total steps recorded on the blackboard, open or closed. */
+  steps: number;
   goals: number;
   /** Active race-scout workers (when racing). */
   raceActive: number;
@@ -306,7 +308,8 @@ export function swarmDigest(deck: DeckState): SwarmDigest {
     candidates: candidates.length,
     openIntents: intents.length,
     openSteps: intents.length,
-    goals: deck.mode === "pentest" ? 0 : 1,
+    steps: deck.blackboard.intents.length,
+    goals: (deck.blackboard.subGoals?.length ?? 0) + (deck.taskContract?.completion.goal || deck.challengeName ? 1 : 0),
     deadEnds: deads.length,
     onlineWorkers: online,
     totalWorkers: curIds.length,

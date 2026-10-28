@@ -199,7 +199,7 @@ class _IntentsPocsMixin:
             ).fetchall()
             retired = [str(r[0]) for r in rows]
         compact_id = f"C-{hashlib.sha1(f'{trigger}:{now_seq}'.encode()).hexdigest()[:10]}"
-        clean_summary = (summary or f"compacted at seq {now_seq} ({trigger})").strip()[:4000]
+        clean_summary = (summary or f"compacted at seq {now_seq} ({trigger})").strip()
         seq = self._append(
             EV_GRAPH_COMPACTED, actor,
             {"compact_id": compact_id, "trigger": trigger, "cutoff_seq": now_seq,
@@ -364,9 +364,9 @@ class _IntentsPocsMixin:
                     return -1
                 value_claim = {
                     "asset": asset,
-                    "identity": str(source_claim.get("identity") or "anonymous").strip()[:120],
+                    "identity": str(source_claim.get("identity") or "anonymous").strip(),
                     "risk_tier": risk_tier,
-                    "evidence_requirement": str(source_claim.get("evidence_requirement") or payload.get("expected_observable") or "tool output").strip()[:1000],
+                    "evidence_requirement": str(source_claim.get("evidence_requirement") or payload.get("expected_observable") or "tool output").strip(),
                     "authorization_version": auth_version,
                 }
             expected_observable = str(payload.get("expected_observable") or "").strip()
@@ -374,6 +374,10 @@ class _IntentsPocsMixin:
             coverage_key = str(payload.get("coverage_key") or "").strip()
             required_pocs = list(dict.fromkeys(
                 str(item).strip() for item in (payload.get("required_pocs") or [])
+                if str(item).strip()
+            ))
+            requires_capabilities = list(dict.fromkeys(
+                str(item).strip() for item in (payload.get("requires_capabilities") or [])
                 if str(item).strip()
             ))
             worker_class = str(payload.get("worker_class") or "code").strip()
@@ -409,15 +413,9 @@ class _IntentsPocsMixin:
                 self._conn.execute("BEGIN IMMEDIATE")
                 try:
                     if source_fact_seqs:
-                        marks = ",".join("?" for _ in source_fact_seqs)
-                        known = {
-                            int(row[0]) for row in self._conn.execute(
-                                f"SELECT seq FROM events WHERE challenge_id=? "
-                                f"AND kind=? AND seq IN ({marks})",
-                                (self.challenge.id, EV_FACT_ADDED, *source_fact_seqs),
-                            ).fetchall()
-                        }
-                        if known != set(source_fact_seqs):
+                        if not set(source_fact_seqs).issubset(
+                            self._active_fact_seq_set_locked()
+                        ):
                             self._conn.rollback()
                             return -1
                     if required_pocs:
@@ -447,6 +445,15 @@ class _IntentsPocsMixin:
                             "stop_condition": stop_condition,
                             "coverage_key": coverage_key,
                             "required_pocs": required_pocs,
+                            "requires_capabilities": requires_capabilities,
+                            "target": str(getattr(self.challenge, "target", "") or ""),
+                            "scope": str(getattr(self.challenge, "scope", "") or ""),
+                            "target_epoch": str(
+                                getattr(self, "_target_epoch", "")
+                                or getattr(self.challenge, "target_epoch", "")
+                                or "1"
+                            ),
+                            "run_id": str(getattr(self, "_run_id", "") or ""),
                             **({"value_claim": value_claim} if pentest_mode else {}),
                         },
                         dedupe_key=f"intent::{intent_id}",
@@ -458,8 +465,8 @@ class _IntentsPocsMixin:
                         "INSERT OR IGNORE INTO intents "
                         "(intent_id,challenge_id,goal,worker_class,priority,status,"
                         "dispatch_state,created_seq,requested_priority,"
-                        "expected_observable,stop_condition,coverage_key,required_pocs_json,value_claim_json) "
-                        "VALUES (?,?,?,?,?,'open','active',?,?,?,?,?,?,?)",
+                        "expected_observable,stop_condition,coverage_key,required_pocs_json,value_claim_json,requires_capabilities_json) "
+                        "VALUES (?,?,?,?,?,'open','active',?,?,?,?,?,?,?,?)",
                         (
                             intent_id,
                             self.challenge.id,
@@ -473,6 +480,7 @@ class _IntentsPocsMixin:
                             coverage_key or None,
                             json.dumps(required_pocs, ensure_ascii=False),
                             json.dumps(value_claim, ensure_ascii=False, sort_keys=True) if pentest_mode else None,
+                            json.dumps(requires_capabilities, ensure_ascii=False),
                         ),
                     )
                     if int(cur.rowcount or 0) != 1:
@@ -500,8 +508,8 @@ class _IntentsPocsMixin:
             if lane_key else ""
         )
         raw_priority = payload.get("priority")
-        requested_priority = str(payload.get("requested_priority") or raw_priority or "normal")[:20]
-        priority_reason = str(payload.get("priority_reason") or "")[:1000]
+        requested_priority = str(payload.get("requested_priority") or raw_priority or "normal")
+        priority_reason = str(payload.get("priority_reason") or "")
         value_claim = payload.get("value_claim")
         value_claim_json = (
             json.dumps(value_claim, ensure_ascii=False, sort_keys=True)
@@ -509,12 +517,12 @@ class _IntentsPocsMixin:
         )
         novelty_key = str(payload.get("novelty_key") or (
             value_claim.get("novelty_key") if isinstance(value_claim, dict) else ""
-        ) or "").strip().casefold()[:300]
+        ) or "").strip().casefold()
         requires_capabilities = list(dict.fromkeys(
             str(item).strip().casefold()
             for item in (payload.get("requires_capabilities") or [])
             if str(item).strip()
-        ))[:32]
+        ))
         requires_capabilities_json = json.dumps(requires_capabilities)
         if raw_priority is None and payload.get("source") == "operator_hint":
             raw_priority = "operator"
@@ -807,6 +815,16 @@ class _IntentsPocsMixin:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                sources = {
+                    int(row[0]) for row in self._conn.execute(
+                        "SELECT s.fact_seq FROM intent_sources s JOIN intents i "
+                        "ON i.intent_id=s.intent_id WHERE i.challenge_id=? AND i.intent_id=?",
+                        (self.challenge.id, intent_id),
+                    ).fetchall()
+                }
+                if not sources.issubset(self._active_fact_seq_set_locked()):
+                    self._conn.rollback()
+                    return False
                 cur = self._conn.execute(
                     "UPDATE intents SET worker=?, status='claimed', "
                     "lease_until=NULL WHERE intent_id=? AND challenge_id=? "
@@ -861,7 +879,7 @@ class _IntentsPocsMixin:
                         {
                             "intent_id": intent_id,
                             "status": "open",
-                            "reason": str(reason or "claim released")[:500],
+                            "reason": str(reason or "claim released"),
                         },
                     )
                     if event_seq <= 0:
@@ -996,8 +1014,8 @@ class _IntentsPocsMixin:
         iid = str(intent_id or "").strip()
         if not iid:
             return False
-        caps = [str(m) for m in (missing or []) if str(m or "").strip()][:8]
-        detail = str(reason or "")[:500]
+        caps = [str(m) for m in (missing or []) if str(m or "").strip()]
+        detail = str(reason or "")
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1077,7 +1095,7 @@ class _IntentsPocsMixin:
         if (state.get("status") != "claimed"
                 or state.get("worker") != worker):
             return False
-        detail = str(reason or "worker runtime ended after process start")[:500]
+        detail = str(reason or "worker runtime ended after process start")
         dedupe_key = f"runtime-retire::{intent_id}::{worker}"
         seq = self._append(
             EV_INTENT_CONCLUDED, worker,
@@ -1259,7 +1277,14 @@ class _IntentsPocsMixin:
             return 0, False
 
         detail = str(result_detail or "")
-        payload = {"intent_id": intent_id, "result": result}
+        payload: dict[str, Any] = {"intent_id": intent_id, "result": result}
+        current_epoch = str(
+            getattr(self, "_target_epoch", "")
+            or getattr(getattr(self, "challenge", None), "target_epoch", "")
+            or ""
+        ).strip()
+        if current_epoch:
+            payload["target_epoch"] = current_epoch
         if detail:
             payload["result_detail"] = detail
         if to_fact_seq is not None:
@@ -1274,7 +1299,7 @@ class _IntentsPocsMixin:
             " AND (worker=? OR worker IS NULL)")
         # A/J: a concluded intent also leaves the dispatch pool (closed), with the
         # conclusion text as its close_reason — distinguishes it from resume/retired.
-        close_reason = (result or "concluded").strip()[:200]
+        close_reason = (result or "concluded").strip()
         if to_fact_seq is not None:
             sql = ("UPDATE intents SET status='done', dispatch_state='closed', "
                    "close_reason=?, result_seq=?, result_detail=?, to_fact_seq=? "
@@ -1474,6 +1499,7 @@ class _IntentsPocsMixin:
                              pocs: Optional[list[dict]] = None,
                              artifacts: Optional[list[str]] = None,
                              vulnerability_report: Optional[dict] = None,
+                             supersedes: Optional[list[int]] = None,
                              need_input: Optional[dict] = None,
                              conclude: bool = True,
                              successor_intent_id: str = "") -> dict:
@@ -1490,23 +1516,41 @@ class _IntentsPocsMixin:
         """
         iid = (intent_id or "").strip()
         next_iid = str(successor_intent_id or "").strip()
-        # handoff_missing always wins over the caller-passed status.
-        final_result = "handoff_missing" if handoff_missing else (status or "")
+        norm_status = str(status or "").strip()
+        if norm_status.lower() in {
+            "cancelled",
+            "timed_out",
+            "interrupted",
+            "operator_stop",
+            "steered",
+        }:
+            final_result = norm_status.lower()
+        else:
+            final_result = "handoff_missing" if handoff_missing else norm_status
         detail = (result_detail or "").strip()
         obs_list = [o for o in (observations or []) if isinstance(o, dict)]
         dead_list = [d for d in (dead_ends or []) if isinstance(d, dict)]
         rejected_dead_ends: list[dict[str, str]] = []
         if getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}:
+            is_pentest_mode = getattr(self.challenge, "mode", "ctf") == "pentest"
             bounded_dead_ends: list[dict] = []
             for dead in dead_list:
                 reason = str(dead.get("reason") or "").strip()
                 tested_scope = str(dead.get("tested_scope") or "").strip()
                 observed_result = str(dead.get("observed_result") or "").strip()
+                if not is_pentest_mode and reason:
+                    tested_scope = tested_scope or iid or "current_step"
+                    observed_result = observed_result or reason
+                    dead = {
+                        **dead,
+                        "tested_scope": tested_scope,
+                        "observed_result": observed_result,
+                    }
                 if reason and tested_scope and observed_result:
                     bounded_dead_ends.append(dead)
                     continue
                 rejected_dead_ends.append({
-                    "reason": reason[:300],
+                    "reason": reason,
                     "missing": ",".join(
                         name for name, value in (
                             ("reason", reason),
@@ -1575,6 +1619,7 @@ class _IntentsPocsMixin:
                     "concluded": conclude_seq,
                 },
                 "facts": facts,
+                "superseded_fact_seqs": list(prior.get("superseded_fact_seqs") or []),
                 "candidates": candidates,
                 "dead_ends": dead_end_ids,
                 "dead_end_rejections": list(
@@ -1624,6 +1669,57 @@ class _IntentsPocsMixin:
                 if prior_receipt is not None:
                     self._conn.rollback()
                     return prior_receipt
+                cutoff = self._current_visit_wave_cutoff_locked()
+                if iid and cutoff:
+                    old_step = self._conn.execute(
+                        "SELECT 1 FROM intents WHERE challenge_id=? AND intent_id=? "
+                        "AND created_seq<?",
+                        (self.challenge.id, iid, cutoff),
+                    ).fetchone()
+                    if old_step is not None:
+                        raise ValueError("worker result belongs to an archived visit wave")
+                step_already_closed = False
+                if iid and final_result != "solved" and actor != "coordinator":
+                    step_row = self._conn.execute(
+                        "SELECT status, dispatch_state, worker, close_reason FROM intents "
+                        "WHERE challenge_id=? AND intent_id=?",
+                        (self.challenge.id, iid),
+                    ).fetchone()
+                    if step_row is not None:
+                        st_status = str(step_row[0] or "")
+                        st_dispatch = str(step_row[1] or "")
+                        st_owner = str(step_row[2] or "")
+                        st_close_reason = str(step_row[3] or "")
+                        if (
+                            st_status == "done"
+                            or st_dispatch in {"retired", "closed"}
+                            or (st_owner and st_owner not in {actor, worker_id})
+                        ):
+                            if (
+                                st_owner in {actor, worker_id}
+                                and (
+                                    st_close_reason in {
+                                        "superseded",
+                                        "retired",
+                                        "cancelled",
+                                        "timed_out",
+                                        "operator_stop",
+                                        "handoff_missing",
+                                    }
+                                    or final_result in {
+                                        "cancelled",
+                                        "timed_out",
+                                        "interrupted",
+                                        "operator_stop",
+                                        "steered",
+                                        "handoff_missing",
+                                    }
+                                )
+                                and (obs_list or dead_list or poc_list or bool(artifact_refs))
+                            ):
+                                step_already_closed = True
+                            else:
+                                raise ValueError("worker no longer owns active step")
                 fact_seqs: list[int] = []
                 candidate_seqs: list[int] = []
                 observation_seqs: list[int] = []
@@ -1637,7 +1733,17 @@ class _IntentsPocsMixin:
                     seq = self._add_evidence_locked(
                         actor=worker_id, source="worker_result", fact=text,
                         artifact_id=artifact_id,
-                        verified=bool(obs.get("claim_verified")),
+                        verified=(
+                            bool(obs.get("claim_verified"))
+                            if (
+                                not step_already_closed
+                                or (
+                                    getattr(self.challenge, "mode", "ctf") == "ctf"
+                                    and bool(obs.get("claim_verified"))
+                                )
+                            )
+                            else False
+                        ),
                         intent_id=iid or None, provenance=provenance,
                         subject=str(obs.get("subject") or ""),
                         predicate=str(obs.get("predicate") or ""),
@@ -1651,6 +1757,18 @@ class _IntentsPocsMixin:
                     if seq <= 0:
                         continue
                     fact_seqs.append(int(seq))
+                superseded_fact_seqs: list[int] = []
+                if not step_already_closed:
+                    if supersedes and not fact_seqs:
+                        raise ValueError("supersedes requires a verified replacement Fact")
+                    for old_seq in dict.fromkeys(int(seq) for seq in supersedes or []):
+                        if old_seq == fact_seqs[-1]:
+                            continue
+                        self._supersede_fact_locked(
+                            actor=actor, fact_seq=old_seq, reason=detail,
+                            by_fact_seq=fact_seqs[-1],
+                        )
+                        superseded_fact_seqs.append(old_seq)
                 dead_end_seqs: list[int] = []
                 for dead in dead_list:
                     reason = str(dead.get("reason") or "").strip()
@@ -1663,6 +1781,8 @@ class _IntentsPocsMixin:
                         target_epoch=target_epoch,
                         tested_scope=str(dead.get("tested_scope") or ""),
                         observed_result=str(dead.get("observed_result") or ""),
+                        provenance={**dict(dead.get("provenance") or {}),
+                                    "committed_at": time.time()},
                     )
                     if seq > 0:
                         dead_end_seqs.append(int(seq))
@@ -1865,10 +1985,11 @@ class _IntentsPocsMixin:
                     },
                     "fact_seqs": fact_seqs,
                     "verified_fact_seqs": fact_seqs,
+                    "superseded_fact_seqs": superseded_fact_seqs,
                     "candidate_fact_seqs": candidate_seqs,
                     "observation_seqs": observation_seqs,
                     "dead_end_seqs": dead_end_seqs,
-                    "dead_end_rejections": rejected_dead_ends[:20],
+                    "dead_end_rejections": rejected_dead_ends,
                     "poc_seqs": poc_seqs,
                     "report_seq": report_seq,
                     "evidence_event_seq": evidence_event_seq,
@@ -1895,7 +2016,7 @@ class _IntentsPocsMixin:
                 concluded = False
                 conclude_seq: Optional[int] = None
                 successor_claimed = False
-                if conclude and iid:
+                if conclude and iid and not step_already_closed:
                     # Conclusion is LAST in the transaction: facts/dead-ends/pocs
                     # must already be written when the intent closes.
                     primary_fact_seq = (
@@ -1910,6 +2031,14 @@ class _IntentsPocsMixin:
                     if not concluded:
                         raise RuntimeError(
                             "successor claim requires a concluded predecessor")
+                    successor_sources = {
+                        int(row[0]) for row in self._conn.execute(
+                            "SELECT fact_seq FROM intent_sources WHERE intent_id=?",
+                            (next_iid,),
+                        ).fetchall()
+                    }
+                    if not successor_sources.issubset(self._active_fact_seq_set_locked()):
+                        raise ValueError("Successor Step references an inactive Fact")
                     cur = self._conn.execute(
                         "UPDATE intents SET worker=?, status='claimed', "
                         "lease_until=NULL WHERE intent_id=? AND challenge_id=? "
@@ -1964,6 +2093,7 @@ class _IntentsPocsMixin:
                               if conclude_seq is not None else None),
             },
             "facts": fact_seqs,
+            "superseded_fact_seqs": superseded_fact_seqs,
             "candidates": candidate_seqs,
             "observations": observation_seqs,
             "dead_ends": dead_end_seqs,
@@ -1973,6 +2103,7 @@ class _IntentsPocsMixin:
             "evidence_event_seq": evidence_event_seq,
             "revision_event_seq": revision_event_seq,
             "concluded": concluded,
+            "step_already_closed": bool(step_already_closed),
             "result": final_result,
             "successor_intent_id": next_iid,
             "successor_claimed": successor_claimed,
@@ -2166,7 +2297,7 @@ class _IntentsPocsMixin:
                         "intent_id": ",".join(accepted),
                         "intent_ids": accepted,
                         "result": "superseded",
-                        "reason": str(reason or "new evidence superseded queued work")[:1000],
+                        "reason": str(reason or "new evidence superseded queued work"),
                     },
                 )
                 accepted_marks = ",".join("?" for _ in accepted)
@@ -2178,7 +2309,7 @@ class _IntentsPocsMixin:
                     f"AND intent_id IN ({accepted_marks})",
                     (
                         marker_seq if marker_seq > 0 else None,
-                        str(reason or "")[:1000] or None,
+                        str(reason or "") or None,
                         self.challenge.id,
                         *accepted,
                     ),
@@ -2224,7 +2355,8 @@ class _IntentsPocsMixin:
                         "FROM intents WHERE challenge_id=? AND intent_id=?",
                         (self.challenge.id, intent_id),
                     ).fetchone()
-                    if priority == values["high"]:
+                    fgs_mode = getattr(getattr(self, "challenge", None), "mode", "ctf") in {"ctf", "pentest"}
+                    if priority == values["high"] and not fgs_mode:
                         try:
                             claim = json.loads(row[0] or "{}") if row else {}
                         except (TypeError, ValueError, json.JSONDecodeError):

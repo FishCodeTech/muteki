@@ -190,7 +190,7 @@ def _probe_endpoint_account(*, account_id: str, acct: Any, root: Path) -> dict[s
     if code in ("401", "403"):
         return _result(False, f"端点拒绝凭据（HTTP {code}，key 可能无效）", layer="auth")
     if code == "404":
-        return _result(False, f"端点路径不存在（HTTP 404，base_url 或目标引擎不匹配）", layer="auth")
+        return _result(False, "端点路径不存在（HTTP 404，base_url 或目标引擎不匹配）", layer="auth")
     return _result(False, f"端点探测失败（HTTP {code or '?'}）", layer="auth")
 
 

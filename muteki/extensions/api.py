@@ -162,7 +162,7 @@ def create_extension_router(
     # -- 生命周期（经 Command API） -------------------------------------------------
 
     @router.post("/preview")
-    async def preview(body: PreviewRequest) -> Any:
+    def preview(body: PreviewRequest) -> Any:
         try:
             return service.preview_install(
                 Source(**body.source.model_dump()),

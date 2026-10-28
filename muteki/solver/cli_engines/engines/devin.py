@@ -49,6 +49,26 @@ class DevinDriver(CliDriver):
         del web_access, kb_access, stream, launch
         return self._argv(prompt, session)
 
+    def build_execute_input(
+        self, prompt: str, session: Optional[str], *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        argv = self.build_execute(
+            "", session, web_access=web_access, kb_access=kb_access,
+            stream=stream, launch=launch)
+        return [*argv[:-2], "--prompt-stdin"], prompt
+
+    def build_resume_input(
+        self, prompt: str, session: str, *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        argv = self.build_resume(
+            "", session, web_access=web_access, kb_access=kb_access,
+            stream=stream, launch=launch)
+        return [*argv[:-2], "--prompt-stdin"], prompt
+
     @staticmethod
     def _event(line: str) -> dict:
         try:
@@ -70,7 +90,7 @@ class DevinDriver(CliDriver):
         if kind == "tool":
             return StreamStep(
                 "tool", tool=str(event.get("tool") or "tool"),
-                text=str(event.get("text") or "")[:300],
+                text=str(event.get("text") or ""),
                 call_id=str(event.get("call_id") or ""),
             )
         if kind == "tool_result":

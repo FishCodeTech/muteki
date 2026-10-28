@@ -5,6 +5,7 @@ disallowedTools:
   - WebSearch
   - FetchURL
   - Agent
+  - AgentSwarm
 ---
 
 ${base_prompt}

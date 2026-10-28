@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
+from muteki.platform.contracts.base import new_id
 from muteki.platform.contracts.external_agents import ContextPart
 
 DEFAULT_MAX_MESSAGES = 40
@@ -28,6 +29,8 @@ REASON_RUNTIME_SWITCH = "runtime_switch"
 REASON_PERMISSION = "permission"
 REASON_INTERACTION_MODE = "interaction_mode"
 REASON_CREDENTIAL = "credential"
+REASON_MODEL_OPTIONS = "model_options"
+REASON_ENVIRONMENT = "environment"
 REASON_RESTART = "restart"
 REASON_RETRY = "retry"
 REASON_FORK = "fork"
@@ -69,16 +72,47 @@ class SessionHandoffBundle:
     omitted_count: int = 0
     omitted_reason: str = ""
     boundary_label: str = ""
+    handoff_id: str = field(default_factory=lambda: new_id("handoff"))
+    target_agent_session_id: str = ""
+    delivery_turn_id: str = ""
+    delivery_state: str = "prepared"
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> SessionHandoffBundle:
+        """Restore the history bundle saved by ``to_dict``."""
+        return cls(
+            kind=value["recovery_kind"], reason=value["recovery_reason"],
+            thread_id=value["thread_id"], generation=value["generation"],
+            source_adapter_id=value["source_adapter_id"],
+            source_agent_session_id=value["source_agent_session_id"],
+            branch_message_count=value["handoff_branch_message_count"],
+            included=[HandoffMessage(**item) for item in value["included"]],
+            omitted_count=value["handoff_omitted_count"],
+            omitted_reason=value["handoff_omitted_reason"],
+            boundary_label=value["handoff_boundary_label"],
+            handoff_id=value["handoff_id"],
+            target_agent_session_id=value["handoff_target_agent_session_id"],
+            delivery_turn_id=value["handoff_delivery_turn_id"],
+            delivery_state=value["handoff_delivery_state"],
+        )
 
     def to_event_payload(self) -> dict[str, Any]:
         return {
+            "handoff_id": self.handoff_id,
+            "handoff_target_agent_session_id": self.target_agent_session_id,
+            "handoff_delivery_turn_id": self.delivery_turn_id,
+            "handoff_delivery_state": self.delivery_state,
+            "handoff_message_ids": [item.message_id for item in self.included if item.message_id],
             "recovery_kind": self.kind,
             "recovery_reason": self.reason,
             "handoff_included_count": len(self.included),
             "handoff_omitted_count": self.omitted_count,
             "handoff_omitted_reason": self.omitted_reason,
             "handoff_branch_message_count": self.branch_message_count,
-            "handoff_boundary_label": self.boundary_label,
+            "handoff_boundary_label": _boundary_label(
+                self.kind, self.reason, len(self.included), self.omitted_count,
+                delivered=self.delivery_state == "delivered",
+            ),
             "handoff_attachment_ids": sorted({
                 aid for item in self.included for aid in item.attachment_ids
             }),
@@ -107,16 +141,13 @@ def classify_rebuild_reason(
     previous_runtime_key: str,
     new_runtime_key: str,
     interaction_mode_changed: bool = False,
+    environment_changed: bool = False,
 ) -> str:
     """Name why a new session is being created (for UI + events)."""
     if force_new or turn_kind == "retry":
         return REASON_RETRY
     if interaction_mode_changed:
         return REASON_INTERACTION_MODE
-    if turn_kind == "resume" and not switched:
-        return REASON_RESTART
-    if not switched and previous_session_key == new_session_key:
-        return REASON_RESTART
     if previous_runtime_key and previous_runtime_key != new_runtime_key:
         return REASON_RUNTIME_SWITCH
     prev = _split_session_key(previous_session_key)
@@ -129,8 +160,12 @@ def classify_rebuild_reason(
         or prev.get("sandbox_mode") != new.get("sandbox_mode")
     ):
         return REASON_PERMISSION
-    if switched:
-        return REASON_RUNTIME_SWITCH
+    if any(prev.get(key) != new.get(key) for key in ("model", "effort", "service_tier")):
+        return REASON_MODEL_OPTIONS
+    if environment_changed:
+        return REASON_ENVIRONMENT
+    if not switched and (turn_kind == "resume" or previous_session_key == new_session_key):
+        return REASON_RESTART
     return REASON_UNKNOWN
 
 
@@ -143,6 +178,9 @@ def _split_session_key(session_key: str) -> dict[str, str]:
         "access_mode": "",
         "permission_mode": "",
         "sandbox_mode": "",
+        "model": "",
+        "effort": "",
+        "service_tier": "",
     }
     for part in parts[2:]:
         if "=" in part:
@@ -255,12 +293,16 @@ def _turn_attachments(turn_by_id: dict[str, Any], message: Any) -> list[str]:
     return [str(item) for item in raw if str(item)]
 
 
-def _boundary_label(kind: str, reason: str, included: int, omitted: int) -> str:
+def _boundary_label(
+    kind: str, reason: str, included: int, omitted: int, *, delivered: bool = False,
+) -> str:
     reason_zh = {
         REASON_RUNTIME_SWITCH: "Runtime 切换",
         REASON_PERMISSION: "权限/访问模式变更",
         REASON_INTERACTION_MODE: "交互模式切换（计划/默认）",
         REASON_CREDENTIAL: "凭据切换",
+        REASON_MODEL_OPTIONS: "模型参数更新",
+        REASON_ENVIRONMENT: "运行配置更新",
         REASON_RESTART: "进程重启接管",
         REASON_RETRY: "重试重建",
         REASON_FORK: "分叉继承",
@@ -270,8 +312,9 @@ def _boundary_label(kind: str, reason: str, included: int, omitted: int) -> str:
         return f"{reason_zh}：已尝试原生 resume 续接会话"
     if kind == RECOVERY_EMPTY:
         return f"{reason_zh}：无当前分支历史可交接"
+    delivery = "已向新会话传递当前分支历史" if delivered else "准备向新会话传递当前分支历史"
     base = (
-        f"{reason_zh}：Muteki 已注入整理后的当前分支历史"
+        f"{reason_zh}：Muteki {delivery}"
         f"（{included} 条"
     )
     if omitted:
@@ -354,6 +397,8 @@ __all__ = [
     "DEFAULT_MAX_MESSAGES",
     "HandoffMessage",
     "REASON_CREDENTIAL",
+    "REASON_MODEL_OPTIONS",
+    "REASON_ENVIRONMENT",
     "REASON_FORK",
     "REASON_INTERACTION_MODE",
     "REASON_PERMISSION",

@@ -33,14 +33,14 @@ class OpenCodeDriver(CliDriver):
     @staticmethod
     def _config(*, web_access: bool) -> str:
         config: dict[str, Any] = {
-            "snapshot": False,
-            "autoupdate": False,
+            "snapshots": False,
+            "update": "disable",
         }
         if not web_access:
-            config["permission"] = {
-                "webfetch": "deny",
-                "websearch": "deny",
-            }
+            config["permissions"] = [
+                {"action": action, "resource": "*", "effect": "deny"}
+                for action in ("webfetch", "websearch")
+            ]
         return json.dumps(config, separators=(",", ":"))
 
     def env_extra(self) -> "dict[str, str]":
@@ -61,7 +61,7 @@ class OpenCodeDriver(CliDriver):
         return [
             "env", f"OPENCODE_CONFIG_CONTENT={self._config(web_access=web_access)}",
             # OpenCode 2 dropped --pure; passing it makes `run` print help and exit.
-            self.bin, "run", "--format", "json",
+            self.bin, "run", "--standalone", "--format", "json",
             *self._permission_flags(launch), prompt,
         ]
 
@@ -73,10 +73,32 @@ class OpenCodeDriver(CliDriver):
         del kb_access, stream
         return [
             "env", f"OPENCODE_CONFIG_CONTENT={self._config(web_access=web_access)}",
-            self.bin, "run", "--format", "json",
+            self.bin, "run", "--standalone", "--format", "json",
             *self._permission_flags(launch),
             "--session", session, prompt,
         ]
+
+    def build_execute_input(
+        self, prompt: str, session: Optional[str], *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        argv = self.build_execute(
+            "", session, web_access=web_access, kb_access=kb_access,
+            stream=stream, launch=launch,
+        )
+        return argv[:-1], prompt
+
+    def build_resume_input(
+        self, prompt: str, session: str, *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        argv = self.build_resume(
+            "", session, web_access=web_access, kb_access=kb_access,
+            stream=stream, launch=launch,
+        )
+        return argv[:-1], prompt
 
     @staticmethod
     def _tool_text(value: Any) -> str:
@@ -191,7 +213,7 @@ class OpenCodeDriver(CliDriver):
             cache_write_tokens=cache_write if turns else None,
             reasoning_tokens=reasoning if turns else None,
             num_turns=turns or None,
-            raw_stderr=stderr[-2000:],
+            raw_stderr=stderr,
         )
 
     def _hello_argv(self) -> list[str]:

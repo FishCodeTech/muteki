@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import tempfile
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from muteki.core.events import EventType
 from muteki.solver.cli_driver import CliResult
+from muteki.solver.cli_results import ModelOutputTruncated
+from muteki.solver.execution_budget import ExecutionBudget, ExecutionBudgetExpired
 from muteki.solver.cli_prompts import (
     _CHECKPOINT_PROMPT,
     _CTF_WORKER_REMINDERS,
@@ -29,6 +32,14 @@ from muteki.solver.result_codes import (
 from muteki.solver.types import SolveOutcome
 
 
+_STEP_TOOL_CAP_CHECKPOINT_PROMPT = (
+    "本 Step 工具调用步数已达上限，立即停止新增探测实验。"
+    "按「本步目标 / 响应判别器（状态码、长度、关键报错） / 剩余缺口」收敛结论："
+    "用 submit-fact 简明记录本步已确认的能力原语或实测响应判别器（若明确排除了某条有界假设，配合 mark-deadend 登记排除边界），"
+    "随后调用 commit-step 收束本 Step。"
+)
+
+
 def _limit_flags(result: CliResult) -> tuple[bool, bool, bool]:
     """Return (oom, output_limit, disk_limit) for a CliResult-like object."""
     return (
@@ -41,6 +52,22 @@ def _limit_flags(result: CliResult) -> tuple[bool, bool, bool]:
 def _any_resource_limit(result: CliResult) -> bool:
     oom, out, disk = _limit_flags(result)
     return oom or out or disk
+
+
+def _ctf_first_slice(self, execute_timeout: int) -> int:
+    """Return the first execution lease before an optional soft reminder.
+
+    Zero explicitly disables the reminder for one continuous direct Worker. The
+    hard run deadline and cancellation boundary remain owned by the harness.
+    """
+    reminder_seconds = max(
+        0, int(getattr(self, "soft_reminder_seconds", 600) or 0),
+    )
+    return (
+        execute_timeout
+        if reminder_seconds == 0
+        else min(reminder_seconds, execute_timeout)
+    )
 
 
 def _checkpoint_prompt(self) -> str:
@@ -71,8 +98,11 @@ def _checkpoint_resumable(self, result: CliResult, session: Optional[str]) -> bo
 
 async def _run_forced_checkpoint(
     self, *, result: CliResult, session: Optional[str], wd: Path,
-    timeout: Optional[int] = None, prompt: Optional[str] = None,
+    timeout: Optional[float] = None, prompt: Optional[str] = None,
 ) -> Optional[CliResult]:
+    lease = float(self.conclude_timeout if timeout is None else timeout)
+    if lease <= 0:
+        return None
     if result.cancelled or _any_resource_limit(result):
         return None
     if not _checkpoint_resumable(self, result, session):
@@ -96,7 +126,7 @@ async def _run_forced_checkpoint(
             checkpoint_prompt, str(session))
         checkpoint = await self._run_invocation(
             argv, cwd=str(wd),
-            timeout=max(1, int(timeout or self.conclude_timeout)),
+            timeout=lease,
             stdin_text=stdin_text)
     finally:
         self._session_handoff_active = False
@@ -110,6 +140,246 @@ async def _run_forced_checkpoint(
     return checkpoint
 
 
+async def _run_campaign(
+    self, *, initial_prompt: str, session: Optional[str], wd: Path,
+    absorb: Callable[[CliResult], Awaitable[None]],
+    step_scoped: bool = False,
+) -> tuple[CliResult, Optional[str]]:
+    """Continue one established CLI session within its original finite lease."""
+    parent_budget = getattr(self, "execution_budget", None)
+    if parent_budget is None:
+        budget = ExecutionBudget.start(
+            float(self.timeout) + float(self.conclude_timeout),
+            conclude_seconds=float(self.conclude_timeout),
+        )
+    else:
+        remaining_after_finalization = parent_budget.remaining_seconds(
+            reserve_seconds=parent_budget.finalization_seconds,
+        )
+        if remaining_after_finalization <= 0:
+            return CliResult(text="", timed_out=True), session
+        parent_conclude = (
+            float(parent_budget.conclude_seconds)
+            if float(parent_budget.conclude_seconds or 0.0) > 0
+            else float(self.conclude_timeout)
+        )
+        effective_conclude = min(
+            float(self.conclude_timeout),
+            parent_conclude,
+            max(0.0, remaining_after_finalization / 3.0),
+        )
+        budget = ExecutionBudget(
+            deadline_monotonic=parent_budget.deadline_monotonic,
+            deadline_utc=parent_budget.deadline_utc,
+            conclude_seconds=effective_conclude,
+            finalization_seconds=parent_budget.finalization_seconds,
+        )
+    # Give every invocation and its tools the same physical execution lease,
+    # including callers that did not supply a parent budget.
+    if parent_budget is None:
+        self.execution_budget = budget
+    execution_reserve = budget.conclude_seconds + budget.finalization_seconds
+    self._campaign_execution_deadline_unix = (
+        min(
+            budget.deadline_utc.timestamp(),
+            time.time() + budget.remaining_seconds(),
+        ) - budget.finalization_seconds)
+    try:
+        lease = budget.call_limit_seconds(
+            _ctf_first_slice(self, self.timeout),
+            reserve_seconds=execution_reserve,
+        )
+    except ExecutionBudgetExpired:
+        return CliResult(text="", timed_out=True), session
+    argv, stdin_text = self._execute_invocation(initial_prompt, session)
+    continuations = 0
+    last_context: Optional[str] = self._live_blackboard_context()
+    while True:
+        result = await self._run_invocation(
+            argv, cwd=str(wd), timeout=lease, stdin_text=stdin_text,
+        )
+        await absorb(result)
+        session = None if self._control_secret_values else (result.session or session)
+        await self._note_cli_session(session)
+        if self._cancel_event.is_set():
+            result.cancelled = True
+        if (result.cancelled or result.finished or _any_resource_limit(result)
+                or self._step_committed or self._cancel_event.is_set()):
+            return result, session
+        # Controlled timeout/steer can have a nonzero exit. Provider/transport
+        # errors surface with their real detail instead of an in-band retry that
+        # could replay side effects or silently cold-start another session.
+        if result.error:
+            raise RuntimeError(result.error)
+        if result.returncode not in (None, 0) and not (result.timed_out or result.steered):
+            raise RuntimeError(f"{self.driver.name} campaign exited with code {result.returncode}")
+        remaining = budget.remaining_seconds(reserve_seconds=execution_reserve)
+        continuation_limit = int(getattr(self, "max_continuations", 0) or 0)
+        conclude_requested = bool(getattr(self, "_conclude_requested", False))
+        if (
+            remaining <= 0
+            or conclude_requested
+            or (continuation_limit > 0 and continuations >= continuation_limit)
+        ):
+            await self._emit_bb(
+                "worker_campaign_boundary", worker=self.solver_id,
+                intent_id=self._intent_id, continuations=continuations,
+                reason=(
+                    "conclude_requested" if conclude_requested
+                    else "execution_deadline" if remaining <= 0
+                    else "continuation_limit"
+                ),
+            )
+            break
+        if not _checkpoint_resumable(self, result, session):
+            if result.model_truncated:
+                raise ModelOutputTruncated(
+                    "Model output reached its token limit before a resumable CLI session was established"
+                )
+            raise RuntimeError("Campaign continuation requires an established CLI session; cold start is not permitted")
+        self._drain_control()
+        if self._cancel_event.is_set():
+            result.cancelled = True
+            return result, session
+        if bool(getattr(self, "_conclude_requested", False)):
+            break
+        reminder_cfg = max(0, int(getattr(self, "soft_reminder_seconds", 600) or 0))
+        pending_restart_notice = str(
+            getattr(self, "_pending_target_restart_notice", "") or ""
+        ).strip()
+        use_worker_soft_reminder = bool(
+            not pending_restart_notice
+            and step_scoped
+            and not result.model_truncated
+            and not result.steered
+            and getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
+            and (
+                (result.timed_out and reminder_cfg > 0 and not getattr(self, "_soft_reminder_sent", False))
+                or not result.timed_out
+            )
+        )
+        if pending_restart_notice:
+            self._pending_target_restart_notice = ""
+            prompt = pending_restart_notice
+            context_reused = True
+            context_to_send = ""
+            context = ""
+        elif use_worker_soft_reminder:
+            if result.timed_out and reminder_cfg > 0 and not getattr(self, "_soft_reminder_sent", False):
+                reminder_text = _CTF_WORKER_REMINDERS[1]
+                self._soft_reminder_sent = True
+            else:
+                reminder_text = _CTF_WORKER_REMINDERS[0]
+            prompt = reminder_text
+            context_reused = True
+            context_to_send = ""
+            context = ""
+        else:
+            context = self._live_blackboard_context()
+            context_reused = bool(context and context == last_context)
+            context_to_send = (
+                "Shared graph unchanged since the previous continuation. Use the graph "
+                "already in this session, or call Blackboard context to inspect it again."
+                if context_reused else context
+            )
+            last_context = context
+            scope = (
+                "Continue only the assigned Step in this existing session and workspace. "
+                f"Step goal: {self.intent_goal}. "
+                f"Expected observable: {self.expected_observable or '(not specified)'}. "
+                f"Stop condition: {self.stop_condition or 'complete the assigned Step'}. "
+                "Use actual tool results to choose the next action within this Step; "
+                "use submit-fact + commit-step when a positive finding is confirmed, "
+                "or mark-deadend + commit-step when the tested hypothesis is ruled out. "
+                "A completed CLI turn alone does not conclude the assigned Step. "
+                "Platform confirmation remains authoritative for Flag acceptance. "
+                if step_scoped else
+                "Continue the same authorized CTF challenge in this existing session and workspace. "
+                "A completed CLI turn or an atomic checkpoint does not complete the challenge. "
+                "Read current platform verdicts in the shared graph; local candidate registration is not acceptance. "
+                "Preserve useful evidence and reusable PoCs, choose the next action from actual results, "
+                "and continue until the platform confirms every required flag or the harness stops you. "
+            )
+            if step_scoped and getattr(self.challenge, "mode", "ctf") == "pentest":
+                scope = scope.replace(
+                    "Platform confirmation remains authoritative for Flag acceptance. ",
+                    "Keep the engagement evidence and report requirements authoritative. ",
+                )
+            lease_line = (
+                ""
+                if (step_scoped and getattr(self.challenge, "mode", "ctf") == "ctf")
+                else f"The original execution lease has {remaining:.3f} seconds left.\n\n"
+            )
+            prompt = (
+                (
+                    "The preceding model response reached its output token limit. "
+                    "Continue in this existing session without repeating prior reasoning; "
+                    "make the next tool call or give a concise answer. "
+                    if result.model_truncated else ""
+                )
+                + scope
+                + lease_line
+                + context_to_send
+            )
+        argv, stdin_text = self._resume_invocation(prompt, str(session))
+        continuations += 1
+        try:
+            lease = budget.call_limit_seconds(
+                None,
+                reserve_seconds=execution_reserve,
+            )
+        except ExecutionBudgetExpired:
+            remaining = 0.0
+            result.timed_out = True
+            break
+        if use_worker_soft_reminder:
+            await self._emit_bb(
+                "worker_soft_reminder",
+                worker=self.solver_id,
+                intent_id=self._intent_id,
+                reminder_index=1,
+                session=str(session),
+                next_slice_s=lease,
+            )
+        await self._emit_bb(
+            "worker_campaign_continued", worker=self.solver_id,
+            intent_id=self._intent_id, continuation=continuations,
+            session=str(session), remaining_seconds=lease,
+            model_truncated=bool(result.model_truncated),
+            context_reused=context_reused,
+            context_bytes=len(context_to_send.encode("utf-8")),
+            shared_graph_bytes=len(context.encode("utf-8")),
+        )
+    checkpoint_prompt = _CTF_WORKER_REMINDERS[0]
+    avail_for_checkpoint = budget.remaining_seconds(
+        reserve_seconds=budget.finalization_seconds,
+    )
+    checkpoint = await _run_forced_checkpoint(
+        self, result=result, session=session, wd=wd,
+        timeout=min(
+            float(self.conclude_timeout),
+            avail_for_checkpoint,
+        ),
+        prompt=checkpoint_prompt,
+    )
+    if checkpoint is not None:
+        session = checkpoint.session or session
+        await self._note_cli_session(session)
+        await absorb(checkpoint)
+        if remaining <= 0:
+            checkpoint.timed_out = True
+            checkpoint.steered = False
+        result = checkpoint
+    elif remaining <= 0:
+        result.timed_out = True
+        result.steered = False
+    if result.model_truncated and not result.timed_out:
+        raise ModelOutputTruncated(
+            "Model output reached its token limit at the campaign continuation boundary"
+        )
+    return result, session
+
+
 async def _run_bootstrap(self) -> SolveOutcome:
     await self._emit(EventType.RUN_STARTED, challenge=self.challenge.model_dump())
     mode = "offline" if not self.web_access else "web"
@@ -117,7 +387,7 @@ async def _run_bootstrap(self) -> SolveOutcome:
     await self._emit(
         EventType.REASONING_DELTA,
         text=f"[{self.driver.name}] delegating to shelled CLI agent — full shell, "
-             f"black-box, {mode}{kb_note}, up to {self.max_turns} turns.\n")
+             f"black-box, {mode}{kb_note}.\n")
 
     # Blackboard collaboration layer: a CLI worker takes the WHOLE challenge as
     # one intent it owns end-to-end. Planning architectures assign and persist an
@@ -148,8 +418,8 @@ async def _run_bootstrap(self) -> SolveOutcome:
     wd.mkdir(parents=True, exist_ok=True)
     self._staged_files = self._stage_attachments(wd)
 
-    # CTF keeps one logical Worker/Pi session across one 600s reminder boundary,
-    # its configured execute boundary, and a final conclude invocation.
+    # CTF keeps one logical Worker/Pi session across its optional soft-reminder
+    # boundary, configured execute boundary, and final conclude invocation.
     session = None if self._control_secret_values else self.driver.new_session()
     await self._note_cli_session(session)  # claude pre-seeds; codex stays None
     worker_timed_out = False
@@ -166,14 +436,22 @@ async def _run_bootstrap(self) -> SolveOutcome:
         self._mark_session_if_live(r)
         await self._emit_empty_stderr_diagnostic(r)
         try:
-            result_text = self._result_text_with_stderr(r)
+            result_text = (
+                r.text or ""
+                if (getattr(self, "campaign_mode", False) and r.model_truncated
+                    and not r.error and r.returncode in (None, 0))
+                else self._result_text_with_stderr(r)
+            )
         except RuntimeError as exc:
+            if isinstance(exc, ModelOutputTruncated):
+                raise
             if (
-                getattr(self.challenge, "mode", "ctf") not in {"ctf", "pentest"}
+                getattr(self, "campaign_mode", False)
+                or getattr(self.challenge, "mode", "ctf") not in {"ctf", "pentest"}
                 or not self._session_established
             ):
                 raise
-            runtime_error_after_session = str(exc)[:500]
+            runtime_error_after_session = str(exc)
             result_text = r.text or ""
         all_text = (all_text + "\n" + result_text).strip()
         await self._stream_cost(r)
@@ -181,7 +459,7 @@ async def _run_bootstrap(self) -> SolveOutcome:
         concl = result_text.strip().splitlines()
         if concl:
             await self._emit(EventType.REASONING_DELTA,
-                             text=f"[{self.driver.name}] ⮑ {concl[-1][:300]}\n")
+                             text=f"[{self.driver.name}] ⮑ {concl[-1]}\n")
         if self._stream_accepted and accepted is None:
             accepted = self._stream_accepted[0]
 
@@ -190,18 +468,27 @@ async def _run_bootstrap(self) -> SolveOutcome:
     # second, unscoped context path outside ContextManifest accounting.
     self._remove_unscoped_board_file(wd)
     initial_prompt = self._build_prompt()
-    if getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}:
+    if getattr(self, "campaign_mode", False):
+        res, session = await _run_campaign(
+            self, initial_prompt=initial_prompt, session=session, wd=wd,
+            absorb=_absorb,
+        )
+        worker_cancelled = res.cancelled
+        worker_steered = res.steered
+        worker_timed_out = res.timed_out
+        worker_oom_killed, worker_output_limit, worker_disk_limit = _limit_flags(res)
+    elif getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}:
         execute_timeout = max(1, int(self.timeout))
-        first_slice = min(600, execute_timeout)
+        first_slice = _ctf_first_slice(self, execute_timeout)
         worker_oom_killed = False
         worker_output_limit = False
         worker_disk_limit = False
         argv, stdin_text = self._execute_invocation(initial_prompt, session)
         res = await self._run_invocation(
             argv, cwd=str(wd), timeout=first_slice, stdin_text=stdin_text)
+        await _absorb(res)
         session = None if self._control_secret_values else (res.session or session)
         await self._note_cli_session(session)
-        await _absorb(res)
         worker_cancelled = res.cancelled
         worker_steered = res.steered
         worker_oom_killed = bool(getattr(res, "oom_killed", False))
@@ -215,6 +502,39 @@ async def _run_bootstrap(self) -> SolveOutcome:
             or worker_output_limit
             or worker_disk_limit
         )
+        pending_restart_notice = str(
+            getattr(self, "_pending_target_restart_notice", "") or ""
+        ).strip()
+        if not terminal and res.steered and pending_restart_notice:
+            self._pending_target_restart_notice = ""
+            argv, stdin_text = self._resume_or_execute_argv(
+                pending_restart_notice,
+                session,
+                fresh_prompt=f"{initial_prompt}\n\n{pending_restart_notice}",
+            )
+            res = await self._run_invocation(
+                argv, cwd=str(wd), timeout=first_slice,
+                stdin_text=stdin_text)
+            session = (
+                None if self._control_secret_values else (res.session or session)
+            )
+            await self._note_cli_session(session)
+            await _absorb(res)
+            worker_cancelled = worker_cancelled or res.cancelled
+            worker_steered = worker_steered or res.steered
+            worker_oom_killed = worker_oom_killed or bool(
+                getattr(res, "oom_killed", False))
+            worker_output_limit = worker_output_limit or bool(
+                getattr(res, "output_limit", False))
+            worker_disk_limit = worker_disk_limit or bool(
+                getattr(res, "disk_limit", False))
+            worker_timed_out = res.timed_out
+            terminal = bool(
+                self._step_committed or res.finished or res.cancelled
+                or worker_oom_killed
+                or worker_output_limit
+                or worker_disk_limit
+            )
         if not terminal and res.timed_out and execute_timeout > first_slice:
             reminder = _CTF_WORKER_REMINDERS[1]
             await self._emit_bb(
@@ -376,7 +696,10 @@ async def _run_bootstrap(self) -> SolveOutcome:
             True, accepted, 1, self.graph, f"solved via {self.driver.name} CLI",
             session=session, engine=self.driver.name, workdir=str(wd),
             flags=found, worker_result=self._last_worker_result)
-    if accepted is not None:
+    if accepted is not None and not (
+        getattr(self, "campaign_mode", False)
+        and (worker_cancelled or worker_oom_killed or worker_output_limit or worker_disk_limit)
+    ):
         found = self._accepted_flags_for_outcome()
         detail = (
             f"Flag submitted; {len(self._known_flags())}/"
@@ -412,7 +735,7 @@ async def _run_bootstrap(self) -> SolveOutcome:
     deadends = list(getattr(self, "_pending_dead_ends", None) or [])
     if deadends:
         result_code = RESULT_DEAD_END
-        detail = f"Worker explicitly ruled out: {deadends[0].reason[:220]}"
+        detail = f"Worker explicitly ruled out: {deadends[0].reason}"
     elif worker_cancelled:
         result_code = RESULT_CANCELLED
         detail = "Worker was cancelled before a Flag submission."
@@ -459,13 +782,13 @@ async def _run_bootstrap(self) -> SolveOutcome:
 
 
 async def _run_explore(self) -> SolveOutcome:
-    """Claim one intent and run one short, scoped exploration Worker."""
+    """Claim one intent and run its scoped exploration Worker."""
     await self._emit(EventType.RUN_STARTED, challenge=self.challenge.model_dump())
     mode_str = "offline" if not self.web_access else "web"
     kb_note = " +KB" if self.kb else ""
     await self._emit(
         EventType.REASONING_DELTA,
-        text=f"[{self.driver.name}] explore mode — intent: {self.intent_goal[:120]}, "
+        text=f"[{self.driver.name}] explore mode — intent: {self.intent_goal}, "
              f"{mode_str}{kb_note}\n")
 
     self._intent_id = getattr(self, "intent_id_assigned", "") or f"intent:{self.solver_id}"
@@ -499,8 +822,16 @@ async def _run_explore(self) -> SolveOutcome:
         await self._stream_cost(r)
         await self._drain_blackboard_requests_once()
         try:
-            result_text = self._result_text_with_stderr(r)
+            result_text = (
+                r.text or ""
+                if (getattr(self, "same_session_continuation", False)
+                    and r.model_truncated and not r.error
+                    and r.returncode in (None, 0))
+                else self._result_text_with_stderr(r)
+            )
         except RuntimeError as exc:
+            if isinstance(exc, ModelOutputTruncated):
+                raise
             resumable_or_handed_off = bool(
                 self._session_established
                 or int(getattr(self, "_last_fact_seq", -1) or -1) > 0
@@ -509,25 +840,35 @@ async def _run_explore(self) -> SolveOutcome:
                 or getattr(self, "_pending_pocs", None)
             )
             if (
-                getattr(self.challenge, "mode", "ctf") not in {"ctf", "pentest"}
+                getattr(self, "same_session_continuation", False)
+                or getattr(self.challenge, "mode", "ctf") not in {"ctf", "pentest"}
                 or not resumable_or_handed_off
             ):
                 raise
-            runtime_error_after_handoff = str(exc)[:500]
+            runtime_error_after_handoff = str(exc)
             result_text = r.text or ""
         all_text = (all_text + "\n" + result_text).strip()
 
     self._remove_unscoped_board_file(wd)
     initial_prompt = self._build_explore_prompt()
-    if getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}:
+    if getattr(self, "same_session_continuation", False):
+        res, session = await _run_campaign(
+            self, initial_prompt=initial_prompt, session=session, wd=wd,
+            absorb=_absorb, step_scoped=True,
+        )
+        worker_cancelled = res.cancelled
+        worker_steered = res.steered
+        worker_timed_out = res.timed_out
+        worker_oom_killed, worker_output_limit, worker_disk_limit = _limit_flags(res)
+    elif getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}:
         execute_timeout = max(1, int(self.timeout))
-        first_slice = min(600, execute_timeout)
+        first_slice = _ctf_first_slice(self, execute_timeout)
         argv, stdin_text = self._execute_invocation(initial_prompt, session)
         res = await self._run_invocation(
             argv, cwd=str(wd), timeout=first_slice, stdin_text=stdin_text)
+        await _absorb(res)
         session = None if self._control_secret_values else (res.session or session)
         await self._note_cli_session(session)
-        await _absorb(res)
         worker_cancelled = res.cancelled
         worker_steered = res.steered
         worker_oom_killed = bool(getattr(res, "oom_killed", False))
@@ -541,6 +882,39 @@ async def _run_explore(self) -> SolveOutcome:
             or worker_output_limit
             or worker_disk_limit
         )
+        pending_restart_notice = str(
+            getattr(self, "_pending_target_restart_notice", "") or ""
+        ).strip()
+        if not terminal and res.steered and pending_restart_notice:
+            self._pending_target_restart_notice = ""
+            argv, stdin_text = self._resume_or_execute_argv(
+                pending_restart_notice,
+                session,
+                fresh_prompt=f"{initial_prompt}\n\n{pending_restart_notice}",
+            )
+            res = await self._run_invocation(
+                argv, cwd=str(wd), timeout=first_slice,
+                stdin_text=stdin_text)
+            session = (
+                None if self._control_secret_values else (res.session or session)
+            )
+            await self._note_cli_session(session)
+            await _absorb(res)
+            worker_cancelled = worker_cancelled or res.cancelled
+            worker_steered = worker_steered or res.steered
+            worker_oom_killed = worker_oom_killed or bool(
+                getattr(res, "oom_killed", False))
+            worker_output_limit = worker_output_limit or bool(
+                getattr(res, "output_limit", False))
+            worker_disk_limit = worker_disk_limit or bool(
+                getattr(res, "disk_limit", False))
+            worker_timed_out = res.timed_out
+            terminal = bool(
+                self._step_committed or res.finished or res.cancelled
+                or worker_oom_killed
+                or worker_output_limit
+                or worker_disk_limit
+            )
         if not terminal and res.timed_out and execute_timeout > first_slice:
             reminder = _CTF_WORKER_REMINDERS[1]
             await self._emit_bb(
@@ -745,16 +1119,16 @@ async def _run_explore(self) -> SolveOutcome:
     elif worker_timed_out:
         result_label = RESULT_TIMED_OUT
         result_detail = "Timed out before finishing this intent."
+    elif runtime_error_after_handoff:
+        result_label = "error"
+        result_detail = (
+            "Worker session ended with a runtime error and its final "
+            "checkpoint produced no Fact: "
+            f"{runtime_error_after_handoff}"
+        )
     else:
         result_label = RESULT_EXPLORED
-        if runtime_error_after_handoff:
-            result_detail = (
-                "Worker session ended with a runtime error and its final "
-                "checkpoint produced no Fact: "
-                f"{runtime_error_after_handoff}"
-            )
-        else:
-            result_detail = "Explored this intent and produced no explicit dead-end."
+        result_detail = "Explored this intent and produced no explicit dead-end."
     # ALWAYS flip the intent to done on exit — even when this worker recorded NO
     # new fact (lfs is None). Previously the DB conclude was gated on `lfs is not
     # None`, so a "need operator" / no-fact dead-end left the intent status=
@@ -896,7 +1270,7 @@ async def _run_respond(self) -> SolveOutcome:
         await self._emit(
             EventType.REASONING_DELTA,
             text=f"[{self.driver.name}] standby — resuming session for "
-                 f"{action}{(': ' + text[:80]) if text else ''}\n")
+                 f"{action}{(': ' + text) if text else ''}\n")
 
     # per-worker cwd: reuse the winner's workdir if it still exists (keeps any
     # files it downloaded), else a fresh scratch dir. Computed FIRST so we can

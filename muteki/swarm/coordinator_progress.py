@@ -115,6 +115,7 @@ def _request_active_worker_conclusion(state) -> int:
             and str(getattr(solver, "solver_id", "") or "") != target_worker
         ):
             continue
+        solver._conclude_requested = True
         if task in state.termination_conclude_requested:
             continue
         if not bool(getattr(solver, "_turn_active", False)):
@@ -246,6 +247,8 @@ async def progress_guard_stage(self, state) -> str:
 
     if self._operator_stop and not state.termination_conclude_reason:
         reserve = _active_worker_conclude_reserve(state)
+        if ctf_mode and reserve > 0:
+            reserve = min(reserve, 22.0)
         state.termination_conclude_reason = "operator_stop"
         state.termination_conclude_deadline = now + reserve
         self._operator_draining = True
@@ -488,13 +491,13 @@ async def soft_pause_stage(self, state) -> str:
                 state.reason_next_trigger = "operator_resume"
                 return "continue"
             try:
-                engine = self._pick_engine(running_engines(), state.healthy, role="bootstrap")
+                engine = await self._pick_engine(running_engines(), state.healthy, role="bootstrap")
             except RuntimeError as exc:
                 await emit_bb("worker_spawn_rejected", reason=str(exc),
                                phase="resume_bootstrap")
                 return "continue"
             try:
-                w = self._make_cli_worker(
+                w = await self._make_cli_worker(
                     engine, mode="bootstrap",
                     intent_goal=self._retry_goal())
             except WorkerSpawnRejected as exc:
@@ -549,15 +552,10 @@ async def pending_help_stage(self, state) -> str:
     # interruptible — _drain_hitl sets _operator_event on ANY operator
     # command (and clears _pending_help), and STOP wakes us to break.
     if self._pending_help and self.bus is not None:
-        # Per-ask clip raised 120→300 (+ ellipsis on truncation) so the
-        # amber "awaiting operator" banner shows enough of each ask to be
-        # actionable. The full text rides the HITL_REQUEST card, which the
-        # worker now emits without truncation; this is just the summary.
-        def _clip(s: str) -> str:
-            s = str(s)
-            return s if len(s) <= 300 else (s[:300] + " …")
+        # Keep each pending request complete in the operator status as well as
+        # its original HITL_REQUEST event.
         needs = "; ".join(
-            _clip(h.get("need", "")) for h in self._pending_help[-3:])
+            str(h.get("need", "")) for h in self._pending_help)
         # LOST-WAKEUP FIX: clear the event BEFORE emitting / awaiting.
         # _drain_hitl runs concurrently; if the operator answers during the
         # `await` of the awaiting_operator emit below, it sets _operator_event
@@ -591,7 +589,7 @@ async def pending_help_stage(self, state) -> str:
             help_freeze_owned = self._begin_operator_help_freeze()
         except Exception as exc:
             await emit_bb(
-                "operator_freeze_failed", reason=str(exc)[:300])
+                "operator_freeze_failed", reason=str(exc))
             for other in state.tasks:
                 self._cancel_solver(state.task_solvers.get(other))
                 other.cancel()
@@ -617,7 +615,7 @@ async def pending_help_stage(self, state) -> str:
                             reason="operator help wait timed out")
                     except Exception as exc:
                         await emit_bb(
-                            "operator_thaw_failed", reason=str(exc)[:300])
+                            "operator_thaw_failed", reason=str(exc))
                 # L6: balance the paused-state bracket so the FE clears its
                 # "awaiting operator / paused" banner on this exit too.
                 self._budget_exhausted_kind = "wall_clock_budget_exhausted"
@@ -636,7 +634,7 @@ async def pending_help_stage(self, state) -> str:
                         reason="operator stopped help wait")
                 except Exception as exc:
                     await emit_bb(
-                        "operator_thaw_failed", reason=str(exc)[:300])
+                        "operator_thaw_failed", reason=str(exc))
             # L6: balance the paused-state bracket (see above).
             self._operator_paused = False
             await emit_bb("operator_resumed")
@@ -654,7 +652,7 @@ async def pending_help_stage(self, state) -> str:
                     reason="operator answered help wait")
             except Exception as exc:
                 await emit_bb(
-                    "operator_thaw_failed", reason=str(exc)[:300])
+                    "operator_thaw_failed", reason=str(exc))
                 for other in state.tasks:
                     self._cancel_solver(state.task_solvers.get(other))
                     other.cancel()
@@ -692,13 +690,13 @@ async def pending_help_stage(self, state) -> str:
                 state.reason_next_trigger = "operator_resume"
                 return "continue"
             try:
-                engine = self._pick_engine(running_engines(), state.healthy, role="bootstrap")
+                engine = await self._pick_engine(running_engines(), state.healthy, role="bootstrap")
             except RuntimeError as exc:
                 await emit_bb("worker_spawn_rejected", reason=str(exc),
                                phase="resume_bootstrap")
                 return "continue"
             try:
-                w = self._make_cli_worker(
+                w = await self._make_cli_worker(
                     engine, mode="bootstrap",
                     intent_goal=self._retry_goal())
             except WorkerSpawnRejected as exc:

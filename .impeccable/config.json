@@ -1,0 +1,37 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "side-tab",
+        "value": "*",
+        "files": [
+          "apps/web/ui/app/styles/runtime-waterfall.css"
+        ],
+        "createdAt": "2026-10-24T16:14:17.059Z",
+        "reason": "assistant reviewed: .rtw-bar.live:after is the 9px breathing highlight at the advancing end of a real runtime duration bar, not a card accent border. It implements the motion requested in this task and was verified in the real Web UI."
+      },
+      {
+        "rule": "clipped-overflow-container",
+        "value": "*",
+        "files": [
+          "prototypes/src-canvas/index.html",
+          "prototypes/src-canvas/src-canvas.html"
+        ],
+        "createdAt": "2026-10-27T19:48:22.966Z",
+        "reason": "Agent verified: this free canvas intentionally clips world-space objects and attached windows at the viewport boundary. Panning, zoom, fit, objects menu restoration, active-window visibility on viewport resize and fixed-screen windows have been checked. Persistent composer and camera controls remain outside the clipped canvas."
+      },
+      {
+        "rule": "dark-glow",
+        "value": "*",
+        "files": [
+          "prototypes/src-canvas/index.html",
+          "prototypes/src-canvas/src-canvas.html"
+        ],
+        "createdAt": "2026-10-27T19:49:54.936Z",
+        "reason": "Agent verified the rendered prototype page background is rgb(248,249,247), not dark. The small blue focus indicator follows the approved concept. Current dark-page glow findings are misclassified on this light canvas; exception limited to its two HTML files."
+      }
+    ]
+  }
+}

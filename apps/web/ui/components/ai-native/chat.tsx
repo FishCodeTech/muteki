@@ -120,7 +120,7 @@ export function Chat({
     <div className={cn("cx-chat relative flex min-h-0 w-full flex-1 flex-col overflow-hidden bg-cx-bg", className)}>
       {header ? <div className="shrink-0">{header}</div> : null}
 
-      <div className="relative min-h-0 flex-1" aria-busy={streamBusy}>
+      <div className="cx-chat-viewport relative min-h-0 flex-1" aria-busy={streamBusy}>
         <div
           ref={streamRef}
           onScroll={onStreamScroll}

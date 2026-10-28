@@ -132,6 +132,7 @@ class CostController:
         input_tokens: int = 0, output_tokens: int = 0,
         usage: Optional[dict] = None, usage_id: Optional[str] = None,
         model: str = "", actor_kind: str = "worker", generation: Optional[int] = None, engine: str = "",
+        credential_id: str = "", provider_id: str = "", speed: str = "",
     ) -> float:
         """Charge a raw USD amount that did NOT go through our token pricing — e.g.
         a shelled CLI worker which reports its cost in dollars (claude's
@@ -145,7 +146,7 @@ class CostController:
         re-derive the cost. Pass 0 (the default) when the engine reports no tokens."""
         if self.usage_sink is not None:
             observed_usage = usage or {"input_tokens": input_tokens, "output_tokens": output_tokens, "reported_cost": usd}
-            inserted = self.usage_sink(observed_usage, identity=usage_id, model=model, worker_id=solver_id, role=("worker" if actor_kind == "worker" else solver_id or "auxiliary"), actor_kind=actor_kind, generation=generation, engine=engine, price_source=("driver_estimate" if observed_usage.get("estimated_cost") is not None else None))
+            inserted = self.usage_sink(observed_usage, identity=usage_id, model=model, worker_id=solver_id, role=("worker" if actor_kind == "worker" else solver_id or "auxiliary"), actor_kind=actor_kind, generation=generation, engine=engine, credential_id=credential_id, provider_id=provider_id, speed=speed, price_source=("driver_estimate" if observed_usage.get("estimated_cost") is not None else None))
             if inserted is False:
                 return 0.0
         usd = max(0.0, float(usd))
@@ -198,6 +199,7 @@ class CostController:
         solver_id: Optional[str] = None,
         usage: Optional[dict] = None, usage_id: Optional[str] = None,
         actor_kind: str = "auxiliary", generation: Optional[int] = None, engine: str = "",
+        credential_id: str = "", provider_id: str = "", speed: str = "",
         estimate_cost: bool = True,
     ) -> float | None:
         """Record usage; emit COST_UPDATE; return None when the price is unknown."""
@@ -214,23 +216,50 @@ class CostController:
             observed_usage.pop("estimated_cost", None)
             if price is not None:
                 observed_usage["estimated_cost"] = price.cost(input_tokens, output_tokens)
-            inserted = self.usage_sink(observed_usage, identity=usage_id, model=model, worker_id=solver_id, role=("worker" if actor_kind == "worker" else solver_id or "auxiliary"), actor_kind=actor_kind, generation=generation, engine=engine, price_source=("model_price" if price is not None else None))
+            inserted = self.usage_sink(observed_usage, identity=usage_id, model=model, worker_id=solver_id, role=("worker" if actor_kind == "worker" else solver_id or "auxiliary"), actor_kind=actor_kind, generation=generation, engine=engine, credential_id=credential_id, provider_id=provider_id, speed=speed, price_source=("model_price" if price is not None else None))
             if inserted is False:
                 return 0.0
-        cost = self._global.add(price, input_tokens, output_tokens)
-        if challenge_id:
-            self._by_challenge.setdefault(challenge_id, Ledger()).add(
-                price, input_tokens, output_tokens
-            )
-        if solver_id:
-            self._by_solver.setdefault(solver_id, Ledger()).add(
-                price, input_tokens, output_tokens
-            )
+        seen = getattr(self, "_seen_invocations", None)
+        if seen is None:
+            seen = {}
+            self._seen_invocations = seen
         window_id = self._usage_context.get()
-        if window_id is not None and window_id in self._usage_windows:
-            self._usage_windows[window_id].add(
-                price, input_tokens, output_tokens
-            )
+        if usage_id and usage_id in seen:
+            prev_in, prev_out, prev_usd = seen[usage_id]
+            delta_in = input_tokens - prev_in
+            delta_out = output_tokens - prev_out
+            new_usd = price.cost(input_tokens, output_tokens) if price is not None else 0.0
+            delta_usd = new_usd - prev_usd
+            seen[usage_id] = (input_tokens, output_tokens, new_usd)
+            targets = [self._global]
+            if challenge_id:
+                targets.append(self._by_challenge.setdefault(challenge_id, Ledger()))
+            if solver_id:
+                targets.append(self._by_solver.setdefault(solver_id, Ledger()))
+            if window_id is not None and window_id in self._usage_windows:
+                targets.append(self._usage_windows[window_id])
+            for led in targets:
+                led.input_tokens += delta_in
+                led.output_tokens += delta_out
+                led.tokens += delta_in + delta_out
+                led.usd += delta_usd
+            cost = new_usd if price is not None else None
+        else:
+            if usage_id:
+                seen[usage_id] = (input_tokens, output_tokens, price.cost(input_tokens, output_tokens) if price is not None else 0.0)
+            cost = self._global.add(price, input_tokens, output_tokens)
+            if challenge_id:
+                self._by_challenge.setdefault(challenge_id, Ledger()).add(
+                    price, input_tokens, output_tokens
+                )
+            if solver_id:
+                self._by_solver.setdefault(solver_id, Ledger()).add(
+                    price, input_tokens, output_tokens
+                )
+            if window_id is not None and window_id in self._usage_windows:
+                self._usage_windows[window_id].add(
+                    price, input_tokens, output_tokens
+                )
         if self.bus is not None:
             # emit the most specific scope available
             if solver_id:

@@ -24,6 +24,7 @@ import { CompetitionResources } from "./CompetitionResources";
 import { InstanceLeasePanel } from "./InstanceLeasePanel";
 import { UsageDashboard } from "./UsageDashboard";
 import { SubmissionLedger } from "./SubmissionLedger";
+import { isDesktopWorkspaceActive } from "@/lib/desktopEnvironment";
 
 const muted: CSSProperties = { color: "var(--muted)", fontSize: 11 };
 
@@ -131,7 +132,7 @@ export function CompetitionWorkspace({
   })) ?? [], [snapshot]);
 
   useEffect(() => {
-    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    const timer = window.setInterval(() => { if (isDesktopWorkspaceActive()) setNowMs(Date.now()); }, 1000);
     return () => window.clearInterval(timer);
   }, []);
 

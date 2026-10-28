@@ -144,7 +144,13 @@ class CommandPlan:
 
 
 class CommandHandler(Protocol):
-    """一个 command_type 命名空间的属主。"""
+    """一个 command_type 命名空间的属主。
+
+    An optional ``dispatch_with_plan(command, continuation)`` hook may own
+    admission through delivery. It calls ``await continuation(planner)`` once;
+    the planner has the same signature as ``plan`` and the normal Command API
+    policy, idempotency, error, commit and receipt boundaries remain in force.
+    """
 
     command_types: set[str]
 

@@ -131,7 +131,7 @@
 .qm { min-height: 58px; padding: 9px 12px; justify-content: center; gap: 4px;
   background: transparent; border-right: 1px solid var(--line); }
 .qm:last-child { border-right: 0; }
-.qm .qk { color: var(--dim); font-size: 9px; font-weight: 620; letter-spacing: .07em; }
+.qm .qk { color: var(--dim); font-size: 11px; font-weight: 620; letter-spacing: .07em; }
 .qm .qv { font-family: var(--font-mono); font-size: 14px; font-weight: 620; }
 
 .coord-thread { padding: 12px 20px 16px; background: var(--bg); }
@@ -148,14 +148,14 @@
 .coord-bubble.digest, .coord-bubble.answer { background: var(--panel); border: 1px solid var(--line); }
 .coord-bubble.answer { box-shadow: var(--shadow-md); border-color: color-mix(in srgb, var(--green) 32%, var(--line)); }
 .coord-bubble.digest { box-shadow: var(--shadow-md); border-color: color-mix(in srgb, var(--accent) 32%, var(--line)); }
-.coord-bubble .who { color: var(--dim); font-size: 10.5px; }
+.coord-bubble .who { color: var(--dim); font-size: 11px; }
 
 .insp-tabs { padding: 3px; border-color: var(--line); border-radius: 8px; background: var(--panel2); }
 .insp-tab { border-radius: 6px; color: var(--muted); font-weight: 560; }
 .insp-tab.on { color: var(--text); background: var(--panel); box-shadow: var(--shadow-sm); }
 .insp-sec { padding: 14px; border: 1px solid var(--line); border-radius: 10px;
   background: var(--panel); box-shadow: var(--shadow-md); }
-.insp-sec-h { color: var(--dim); font-size: 10px; font-weight: 620; letter-spacing: .07em; }
+.insp-sec-h { color: var(--dim); font-size: 11px; font-weight: 620; letter-spacing: .07em; }
 .insp-run-flag { border-color: var(--line); border-radius: 8px; background: var(--panel2); }
 .insp-chip { border-color: var(--line); border-radius: 6px; background: var(--panel2); }
 .insp-panel-btn { min-height: 44px; border-color: var(--line); border-radius: 8px;
@@ -185,7 +185,7 @@
 .coord-bubble { position: relative; align-self: stretch; max-width: none; min-height: 54px; margin: 0; padding: 11px 10px 13px 14px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; box-shadow: none; line-height: 1.55; }
 .coord-bubble:hover { transform: none; border-color: var(--line2); background: color-mix(in srgb, var(--bright) 2.5%, transparent); box-shadow: none; }
 .coord-bubble .coord-node { position: absolute; z-index: 1; top: 12px; left: -38px; width: 21px; height: 21px; display: grid; place-items: center; color: var(--muted); border: 1px solid var(--line2); border-radius: 7px; background: var(--bg); box-shadow: 0 0 0 4px var(--bg); }
-.coord-bubble .who { min-height: 18px; margin: 0 0 3px; color: var(--muted); font-size: 10px; font-weight: 560; letter-spacing: .01em; }
+.coord-bubble .who { min-height: 18px; margin: 0 0 3px; color: var(--muted); font-size: 11px; font-weight: 560; letter-spacing: .01em; }
 .coord-bubble .who .k { color: var(--dim); }
 .coord-bubble .body { color: var(--text); font-size: 12.5px; line-height: 1.6; }
 .coord-bubble.you, .coord-bubble.coordinator, .coord-bubble.system { align-self: stretch; max-width: none; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; box-shadow: none; }
@@ -225,7 +225,7 @@
 .status-hero .sh-detail,
 .status-hero .sh-detail-flag { font-size: 12px; line-height: 1.35; }
 .status-hero .sh-meta { display: inline-flex; align-items: center; gap: 5px; }
-.status-hero .sh-workers, .status-hero .sh-elapsed { min-height: 26px; padding: 0 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel2); font-size: 10.5px; font-weight: 550; }
+.status-hero .sh-workers, .status-hero .sh-elapsed { min-height: 26px; padding: 0 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel2); font-size: 11px; font-weight: 550; }
 .status-hero .sh-flow { min-height: 28px; padding: 4px 7px; cursor: pointer; }
 
 /* The page-level 对话 / 运行时 switch owns navigation. The inspector is one
@@ -241,7 +241,7 @@
 .command-composer .command-wrap { max-width: 940px; padding: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 11px; background: var(--panel); box-shadow: var(--shadow-pop); }
 .command-composer .command-wrap:focus-within { border-color: color-mix(in srgb, var(--accent) 28%, var(--line)); box-shadow: var(--shadow-pop); }
 .command-row { min-height: 50px; display: flex; align-items: center; gap: 10px; padding: 7px 9px 7px 12px; }
-.command-target { flex: none; min-width: 0; display: inline-flex; align-items: center; gap: 6px; padding-right: 11px; color: var(--dim); border-right: 1px solid var(--line); font-size: 10.5px; white-space: nowrap; }
+.command-target { flex: none; min-width: 0; display: inline-flex; align-items: center; gap: 6px; padding-right: 11px; color: var(--dim); border-right: 1px solid var(--line); font-size: 11px; white-space: nowrap; }
 .command-target select { max-width: 142px; appearance: none; color: var(--text); border: 0; outline: 0; background: transparent; font: 560 11.5px/1.2 var(--font-sans); cursor: pointer; }
 .command-target svg { color: var(--dim); pointer-events: none; }
 .command-input { flex: 1 1 auto; min-width: 0; height: 34px; padding: 0 2px; color: var(--text); border: 0; outline: 0; background: transparent; font: 13px/1.45 var(--font-sans); }
@@ -249,14 +249,14 @@
 .command-composer .send { flex: none; width: 34px; height: 34px; display: grid; place-items: center; border-radius: 8px; }
 .command-actionbar { min-height: 39px; display: flex; align-items: center; gap: 12px; padding: 5px 9px; border-top: 1px solid var(--line); background: var(--panel2); }
 .command-actionbar .quick { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 3px; margin: 0; max-width: none; }
-.command-actionbar .quick button { min-height: 28px; display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; border: 0; border-radius: 6px; color: var(--muted); background: transparent; font-size: 10.5px; font-weight: 550; }
+.command-actionbar .quick button { min-height: 28px; display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; border: 0; border-radius: 6px; color: var(--muted); background: transparent; font-size: 11px; font-weight: 550; }
 .command-actionbar .quick button:hover { color: var(--bright); background: var(--panel3); }
 .command-actionbar .quick button.primary { color: var(--on-accent, #fff); background: var(--accent); }
 .command-actionbar .quick button.primary:hover { color: var(--on-accent, #fff); background: color-mix(in srgb, var(--accent) 88%, #fff); }
 .command-actionbar .quick button.danger { color: var(--red); background: transparent; }
 .command-actionbar .quick button.danger:hover { color: var(--red); background: color-mix(in srgb, var(--red) 8%, transparent); }
 .command-actionbar .quick .quick-sep { height: 20px; align-self: center; margin: 0 3px; background: var(--line); }
-.command-hint { flex: 0 1 310px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); font-size: 9.5px; text-align: right; }
+.command-hint { flex: 0 1 310px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 11px; text-align: right; }
 .command-composer .markfalse-picker { max-width: none; margin: 0; padding: 7px 9px; border-top: 1px solid var(--line); background: var(--panel2); }
 
 /* The inspector leaves the conversation column intentionally compact on common
@@ -430,7 +430,7 @@
 }
 .status-hero .sh-results-toggle:hover { background: var(--panel3); }
 .status-hero .sh-results-toggle:focus-visible { outline: 1px solid var(--line2); outline-offset: 1px; }
-.status-hero .sh-results-count { font-size: 10.5px; font-weight: 650; white-space: nowrap; }
+.status-hero .sh-results-count { font-size: 11px; font-weight: 650; white-space: nowrap; }
 .status-hero .sh-results-preview {
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   color: var(--muted); font: 10.5px/1.3 var(--font-mono);
@@ -449,7 +449,7 @@
 .sh-results-head {
   min-height: 34px; display: flex; align-items: center; justify-content: space-between; gap: 12px;
   padding: 6px 10px; border-bottom: 1px solid var(--line); color: var(--muted);
-  background: var(--panel2); font-size: 10px; font-weight: 600;
+  background: var(--panel2); font-size: 11px; font-weight: 600;
 }
 .sh-results-head span { display: inline-flex; align-items: center; gap: 6px; }
 .sh-results-list { max-height: 184px; overflow: auto; }
@@ -519,20 +519,20 @@
 }
 .progress-brief-head {
   min-height: 20px; display: flex; align-items: center; gap: 8px;
-  color: var(--muted); font-size: 10px; font-weight: 560;
+  color: var(--muted); font-size: 11px; font-weight: 560;
 }
 .progress-brief-head .k { color: var(--dim); }
 .progress-brief-head time { margin-left: auto; color: var(--dim); font: 9.5px/1 var(--font-mono); }
 .progress-brief-kind {
   padding: 2px 6px; border: 1px solid var(--line); border-radius: 999px;
-  color: var(--muted); background: var(--panel2); font-size: 9px;
+  color: var(--muted); background: var(--panel2); font-size: 11px;
 }
 .progress-brief-summary { margin-top: 3px; color: var(--text); font-size: 12.5px; line-height: 1.5; }
 .progress-brief-details { margin-top: 9px; border-top: 1px solid var(--line); }
 .progress-brief-details [data-slot="accordion-item"] { border: 0; }
 .progress-brief-details [data-slot="accordion-trigger"] {
   min-height: 32px; padding: 0; color: var(--muted); background: transparent;
-  font-size: 10.5px; font-weight: 600;
+  font-size: 11px; font-weight: 600;
 }
 .progress-brief-details [data-slot="accordion-trigger"]:hover { color: var(--text); background: transparent; }
 .progress-brief-details [data-slot="accordion-trigger"]:focus-visible {
@@ -548,7 +548,7 @@
 .progress-brief-section { min-width: 0; padding: 9px 0 6px; }
 .progress-brief-section h3 {
   display: flex; align-items: center; gap: 5px; margin: 0 0 5px;
-  color: var(--muted); font-size: 10px; font-weight: 620;
+  color: var(--muted); font-size: 11px; font-weight: 620;
 }
 .progress-brief-section ul { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
 .progress-brief-section li {

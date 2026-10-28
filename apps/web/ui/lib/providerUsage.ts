@@ -42,8 +42,8 @@ export const tokenValue = (value: unknown) => { const number = finiteValue(value
 export const moneyValue = (value: unknown) => { const number = finiteValue(value); return number === null ? "未定价" : number > 0 && number < .01 ? "<$0.01" : formatUsd(number); };
 export const exactMoney = (value: unknown) => { const number = finiteValue(value); return number === null ? "未定价" : `$${number}`; };
 export const countValue = (value: unknown) => { const number = finiteValue(value); return number === null ? "—" : number.toLocaleString(); };
-export const pricingLabel = (totals: UsageTotals) => totals.reported_cost !== null && totals.estimated_cost !== null ? "上报 + API 估算"
-  : totals.reported_cost !== null ? "供应商上报" : totals.estimated_cost !== null ? "API 估算" : "未定价";
+export const pricingLabel = (totals: UsageTotals) => totals.reported_cost !== null && totals.estimated_cost !== null ? "上报 + 估算"
+  : totals.reported_cost !== null ? "上报金额" : totals.estimated_cost !== null ? "估算费用" : "未定价";
 export const statusLabel = (status: string) => ({ ok: "已读取", ready: "已读取", partial: "部分可用", empty: "暂无记录", unsupported: "暂未支持", unauthenticated: "未登录", disabled: "未开启", error: "读取失败", missing: "暂无记录", unavailable: "不可用", ledger: "Muteki 记录" }[status] || status || "未知");
 
 function object(value: unknown): Record<string, unknown> {

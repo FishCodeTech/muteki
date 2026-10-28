@@ -1411,9 +1411,12 @@ class ChatPluginService:
     async def prepare_tools(self, engine: str, mode: str = "chat", scope: str = "") -> list[dict[str, Any]]:
         if mode == "chat" and engine in PROVIDERS and not PROVIDERS[engine].gateway_tools:
             return []  # Portable skills work without claiming MCP injection.
-        cache_key = f"{mode}:{engine}:{scope}:{self.revision(engine, mode)}"
+        revision = (await asyncio.to_thread(self.revision, engine, mode)
+                    if mode == "chat" else self.revision(engine, mode))
+        cache_key = f"{mode}:{engine}:{scope}:{revision}"
         async with self._prepare_locks.setdefault(cache_key, asyncio.Lock()):
-            return await self._prepare_tools(engine, mode, scope)
+            return await self._prepare_tools(engine, mode, scope,
+                                             cache_key=cache_key if mode == "chat" else None)
 
     async def _discover_mcp_server(self, engine: str, mode: str, scope: str,
                                    record: dict[str, Any], server: str,
@@ -1447,8 +1450,9 @@ class ChatPluginService:
                               "_tool": method, "_method": method, "_digest": record["digest"]})
         return tools
 
-    async def _prepare_tools(self, engine: str, mode: str = "chat", scope: str = "") -> list[dict[str, Any]]:
-        key = f"{mode}:{engine}:{scope}:{self.revision(engine, mode)}"
+    async def _prepare_tools(self, engine: str, mode: str = "chat", scope: str = "", *, cache_key: str | None = None) -> list[dict[str, Any]]:
+        # The lock and discovery must use the same freshly measured snapshot.
+        key = cache_key or f"{mode}:{engine}:{scope}:{self.revision(engine, mode)}"
         selected = [(record, server, config) for record in self.enabled(engine, mode)
                     for server, config in record["mcp"].items() if not config.get("disabled")]
         server_tools: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
