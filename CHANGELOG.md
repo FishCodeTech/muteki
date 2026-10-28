@@ -8,6 +8,7 @@ All notable public release changes are tracked here.
 
 - Fixed Flag and answer copying on LAN and other ordinary HTTP pages, where `navigator.clipboard` can be unavailable. The run inspector, conversation conclusion, status banner, and expanded result list now use the same copy implementation.
 - Attempted synchronous copying within the click or key gesture, then used the Clipboard API when needed. Success and failure messages reflect the browser's result in Chinese or English.
+- Updated Next.js and its matching lint configuration to `15.5.28`, including patched image-processing, source-map, and development dependencies identified during release checks.
 
 ### Changed
 
@@ -19,6 +20,7 @@ All notable public release changes are tracked here.
 - Reproduced the original error on a LAN HTTP page. Single-click copies from the inspector, status banner, and conversation conclusion wrote the expected text to the system clipboard.
 - Verified Enter, Space, and touch at a 390px viewport; also verified the secure-context Clipboard API fallback and failure feedback when both copy methods were unavailable.
 - TypeScript passed. ESLint reported no errors and 33 existing warnings. The affected Windows deployment was not retested directly.
+- The dependency audit reported no critical or high findings after the update. Three low-severity findings remain in the math-rendering dependency chain; the suggested change crosses a major-version boundary.
 
 ### Upgrade
 
