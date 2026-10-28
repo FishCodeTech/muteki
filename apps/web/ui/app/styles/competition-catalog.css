@@ -40,7 +40,7 @@
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--panel);
-  font-size: 10px;
+  font-size: 11px;
 }
 .cap-grant-item-main {
   display: flex;
@@ -128,7 +128,7 @@
   color: var(--bright);
 }
 .cap-service-card-id {
-  font-size: 10px;
+  font-size: 11px;
   color: var(--dim);
   font-family: var(--font-mono);
 }
@@ -141,7 +141,7 @@
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel2);
-  font-size: 10.5px;
+  font-size: 11px;
 }
 .cap-service-card-props dt {
   color: var(--muted);
@@ -161,7 +161,7 @@
   gap: 10px;
 }
 .cap-service-lifecycle-note {
-  font-size: 10px;
+  font-size: 11px;
   color: var(--dim);
 }
 
@@ -223,7 +223,7 @@
   white-space: nowrap;
 }
 .cap-adapter-id {
-  font-size: 9.5px;
+  font-size: 11px;
   color: var(--dim);
   font-family: var(--font-mono);
   overflow: hidden;
@@ -244,7 +244,7 @@
   border-radius: 5px;
   background: var(--panel2);
   color: var(--dim);
-  font-size: 9.5px;
+  font-size: 11px;
 }
 .cap-injection-chip.supported {
   border-color: color-mix(in srgb, var(--green) 35%, var(--line));
@@ -260,7 +260,7 @@
   border: 1px solid var(--line);
   border-radius: 7px;
   background: var(--panel2);
-  font-size: 10px;
+  font-size: 11px;
 }
 .cap-adapter-props dt { color: var(--muted); }
 .cap-adapter-props dd { margin: 0; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -271,7 +271,7 @@
   gap: 3px;
   border: 1px dashed var(--line);
   border-radius: 7px;
-  font-size: 10px;
+  font-size: 11px;
 }
 .cap-recent-injection-head {
   display: flex;
@@ -283,7 +283,7 @@
 .cap-recent-injection-desc {
   color: var(--dim);
   font-family: var(--font-mono);
-  font-size: 9px;
+  font-size: 11px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -333,7 +333,7 @@
   color: var(--bright);
 }
 .cap-extension-sub {
-  font-size: 10px;
+  font-size: 11px;
   color: var(--dim);
   font-family: var(--font-mono);
 }
@@ -348,14 +348,14 @@
   border-radius: 5px;
   background: var(--panel2);
   color: var(--muted);
-  font-size: 9.5px;
+  font-size: 11px;
 }
 .cap-extension-secrets {
   display: flex;
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
-  font-size: 10px;
+  font-size: 11px;
   color: var(--dim);
 }
 

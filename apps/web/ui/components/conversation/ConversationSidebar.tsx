@@ -22,11 +22,12 @@ import {
   RAIL_WIDTH_MAX,
   RAIL_WIDTH_MIN,
 } from "@/lib/railSizing";
-import { attentionOwnerId, subagentPendingByRoot, threadHasActionableApproval, threadHasAttention, threadNeedsAction, type SubagentPending } from "@/lib/threadAttention";
+import { attentionOwnerId, subagentActivityByRoot, subagentPendingByRoot, threadHasActionableApproval, threadHasAttention, threadNeedsAction, type SubagentPending } from "@/lib/threadAttention";
 import { buildSidebarActivity, type ActivityPrefs } from "@/lib/sidebarActivity";
 import { subagentPendingLabel } from "@/lib/threadNotifications";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import { conversationStorageKey, conversationStorageScope, subscribeConversationStorageScope } from "@/lib/conversationStorageScope";
+import { useConversationLocalPreview } from "@/lib/conversationPreviewMode";
 import { mergeSidebarSearchHits, sidebarSearchFailure } from "@/lib/sidebarSearch";
 import { rebaseSidebarPreferences, sameSidebarPreferences } from "@/lib/sidebarPreferenceMerge";
 import { formatWakeTime, inboxStateOf, nextWakeAt, pruneTimeMap, type InboxState } from "@/lib/sidebarInbox";
@@ -222,7 +223,19 @@ function reuseStable<T extends object>(
   return stable;
 }
 
+export interface ConversationSidebarLabels {
+  title?: string;
+  newThread?: string;
+  search?: string;
+  thread?: string;
+}
+
 export interface ConversationSidebarProps {
+  /** Landmark id; must stay unique while retained shells coexist off-screen. */
+  sidebarId?: string;
+  threadHref?: (threadId: string) => string;
+  labels?: ConversationSidebarLabels;
+  restrictSearchToThreads?: boolean;
   threads: ConversationThread[];
   projects: ConversationProject[];
   activeThreadId?: string;
@@ -295,7 +308,7 @@ function persistActivityClearedAt(at: number): void {
   }
 }
 
-function threadHref(threadId: string): string {
+function defaultThreadHref(threadId: string): string {
   return `/chat/${encodeURIComponent(threadId)}`;
 }
 
@@ -304,6 +317,10 @@ function threadTimestamp(thread: ConversationThread): number {
 }
 
 export const ConversationSidebar = memo(function ConversationSidebar({
+  sidebarId = "conversation-sidebar",
+  threadHref = defaultThreadHref,
+  labels,
+  restrictSearchToThreads = false,
   threads,
   projects,
   activeThreadId,
@@ -327,6 +344,8 @@ export const ConversationSidebar = memo(function ConversationSidebar({
   className = "",
 }: ConversationSidebarProps) {
   const mobile = useMediaQuery("(max-width: 768px)");
+  // Local preview threads are not server rows: keep preferences and search off the server.
+  const localPreview = useConversationLocalPreview();
   const [activityPrefs, setActivityPrefs] = useState<ActivityPrefs>(DEFAULT_ACTIVITY_PREFS);
   // "清除已读对话" hides chats with no activity since this moment; any newer
   // activity brings them back into the list.
@@ -419,7 +438,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
     setPreferencesReady(false);
     applyPreferences(local);
     serverLoadInProgressRef.current = true;
-    if (!preferenceScope) {
+    if (!preferenceScope || localPreview) {
       serverLoadInProgressRef.current = false;
       return () => { cancelled = true; };
     }
@@ -440,7 +459,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
       setPreferencesReady(true);
     });
     return () => { cancelled = true; };
-  }, [applyPreferences, preferenceScope]);
+  }, [applyPreferences, preferenceScope, localPreview]);
 
   // Rebase only fields changed in this tab, so a concurrent tab's unrelated
   // edits survive. Serialize writes and preserve edits made during a request.
@@ -568,7 +587,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
     setBodyHitsLoadingMore(false);
     searchMoreRequestRef.current = null;
     searchPageRef.current = { query: searchQuery.trim(), includeSuperseded, offset: null };
-    if (!queryLooksSearchable(searchQuery) || !preferenceScope) {
+    if (!queryLooksSearchable(searchQuery) || !preferenceScope || localPreview) {
       setBodyHitsLoading(false);
       return;
     }
@@ -592,7 +611,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
       });
     }, 250);
     return () => { window.clearTimeout(timer); controller.abort(); };
-  }, [searchQuery, includeSuperseded, searchAttempt, preferenceScope]);
+  }, [searchQuery, includeSuperseded, searchAttempt, preferenceScope, localPreview]);
 
   const loadMoreSearchHits = useCallback(async () => {
     const controller = searchAbortRef.current;
@@ -783,7 +802,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
 
   const moveThread = useCallback((sourceId: string, targetId: string, visibleIds: string[]) => {
     updatePreferences((current) => ({ ...current, sort_mode: "manual", thread_order: moveBefore(
-      current.sort_mode === "manual" ? mergeOrder(current.thread_order, visibleIds) : [...visibleIds], sourceId, targetId) }));
+      [...visibleIds], sourceId, targetId) }));
   }, [updatePreferences]);
 
   const movePinnedThread = useCallback((sourceId: string, targetId: string, visibleIds: string[]) => {
@@ -812,6 +831,10 @@ export const ConversationSidebar = memo(function ConversationSidebar({
   const changeSortMode = useCallback((next: SidebarPreferences["sort_mode"]) => updatePreferences((current) => ({ ...current, sort_mode: next })), [updatePreferences]);
   const changeGroupMode = useCallback((next: SidebarPreferences["group_mode"]) => updatePreferences((current) => ({ ...current, group_mode: next })), [updatePreferences]);
 
+  const threadsById = useMemo(() => new Map(threads.map((thread) => [thread.thread_id, thread])), [threads]);
+  // Delegation per root Thread; a root whose subagents still work reads as busy.
+  const subagentActivity = useMemo(() => subagentActivityByRoot(threads), [threads]);
+
   // Archived conversations are managed from Settings instead of this rail.
   const activeThreads = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -822,7 +845,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
     const sortThreads = (items: ConversationThread[]) => items.sort((a, b) => {
       if (sortMode === "priority") {
         const rank = (thread: ConversationThread) => (
-          thread.state.running_turn_id ? 0
+          thread.state.running_turn_id || subagentActivity.get(thread.thread_id)?.active ? 0
             : threadNeedsAction(thread) ? 1
               : thread.state.unread ? 2
                 : 3
@@ -830,14 +853,15 @@ export const ConversationSidebar = memo(function ConversationSidebar({
         return rank(a) - rank(b);
       }
       if (manualRank) {
-        return (manualRank.get(a.thread_id) ?? Number.MAX_SAFE_INTEGER) -
-          (manualRank.get(b.thread_id) ?? Number.MAX_SAFE_INTEGER);
+        // New threads precede the saved order until the next manual reorder.
+        return (manualRank.get(a.thread_id) ?? -1) -
+          (manualRank.get(b.thread_id) ?? -1) || threadTimestamp(b) - threadTimestamp(a);
       }
       return String(b.updated_at || b.created_at || "").localeCompare(String(a.updated_at || a.created_at || ""));
     });
 
     return sortThreads(matchingThreads.filter((thread) => thread.state.status !== "archived"));
-  }, [threads, searchQuery, sortMode, threadOrder]);
+  }, [threads, searchQuery, sortMode, threadOrder, subagentActivity]);
 
   const projectsById = useMemo(() => new Map(projects.map((project) => [project.project_id, project])), [projects]);
   const effectiveProjectFilter = projectFilter && projectsById.has(projectFilter) ? projectFilter : null;
@@ -887,7 +911,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
     const needsAction = ownNeedsAction || Boolean(delegated?.length);
     return {
       id: t.thread_id,
-      label: t.title || "未命名对话",
+      label: t.title || `未命名${labels?.thread ?? "对话"}`,
       href: threadHref(t.thread_id),
       updatedAt: t.updated_at || t.created_at,
       status: t.state.status,
@@ -901,6 +925,8 @@ export const ConversationSidebar = memo(function ConversationSidebar({
       failed: Boolean(t.state.last_error && Object.keys(t.state.last_error).length),
       errorText: errorTextOf(t),
       queueCount: t.state.queue_count || undefined,
+      agentsActive: subagentActivity.get(threadId)?.active || undefined,
+      agentsTotal: subagentActivity.get(threadId)?.total || undefined,
       pinned: pinnedSet.has(t.thread_id),
       projectId: project?.project_id,
       projectName: project?.name,
@@ -928,7 +954,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
       onNewInProject: project && hasNewInProject ? () => callbacksRef.current.onNewChatForProject?.(project.project_id) : undefined,
       onFilterProject: project ? () => changeProjectFilter(viewRef.current.effectiveProjectFilter === project.project_id ? null : project.project_id) : undefined,
     };
-  }, [inboxStates, subagentPending, projectsById, activeThreadId, pinnedSet, togglePinned, setThreadSettled, snoozeThread, hasRename, hasRenameTitle, hasFork, hasArchive, hasNewInProject, findThread, changeProjectFilter]);
+  }, [inboxStates, subagentPending, subagentActivity, projectsById, activeThreadId, pinnedSet, togglePinned, setThreadSettled, snoozeThread, hasRename, hasRenameTitle, hasFork, hasArchive, hasNewInProject, findThread, changeProjectFilter, threadHref, labels?.thread]);
 
   // Group threads into sections (Recent, Running, or by Project)
   const mainView = useMemo(() => {
@@ -944,28 +970,16 @@ export const ConversationSidebar = memo(function ConversationSidebar({
     const scoped = effectiveProjectFilter
       ? activeThreads.filter((thread) => thread.project_id === effectiveProjectFilter)
       : activeThreads;
-    // Muteki subagent Threads never appear as unrelated top-level chats; they
-    // are grouped under their parent in collapsed sections below.
-    const topLevel = scoped.filter((thread) => !thread.state.lineage?.parent_thread_id);
-    const childrenByParent = new Map<string, ConversationThread[]>();
-    for (const thread of scoped) {
-      const parentId = thread.state.lineage?.parent_thread_id;
-      if (!parentId) continue;
-      const siblings = childrenByParent.get(parentId);
-      if (siblings) siblings.push(thread);
-      else childrenByParent.set(parentId, [thread]);
-    }
-    const titleByThreadId = new Map(threads.map((thread) => [thread.thread_id, thread.title]));
-    const subagentSections: NavSection[] = [...childrenByParent.entries()].map(([parentId, children]) => ({
-      id: `subagents:${parentId}`,
-      title: `子代理 · ${titleByThreadId.get(parentId) || "未知会话"} · ${children.length}`,
-      kind: "section",
-      defaultCollapsed: true,
-      items: children
-        .slice()
-        .sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")))
-        .map(stableItem),
-    }));
+    const searching = Boolean(searchQuery.trim());
+    const busy = (thread: ConversationThread) => Boolean(thread.state.running_turn_id || subagentActivity.get(thread.thread_id)?.active);
+    // A subagent Thread belongs to its root conversation: the root row reports
+    // its activity and the conversation opens it. Only a search lists it, so a
+    // matching child stays reachable. Orphans keep a row of their own.
+    const topLevel = scoped.filter((thread) => !attentionOwnerId(thread, threadsById));
+    const childMatches = searching ? scoped.filter((thread) => attentionOwnerId(thread, threadsById)) : [];
+    const subagentMatches: NavSection[] = childMatches.length
+      ? [{ id: "subagent-matches", title: `子代理 · ${childMatches.length}`, kind: "section", items: childMatches.map(stableItem) }]
+      : [];
     const placementOf = (thread: ConversationThread) => inboxStates.get(thread.thread_id)?.placement ?? "active";
     const listed = topLevel.filter((thread) => placementOf(thread) === "active");
     const snoozed = topLevel.filter((thread) => placementOf(thread) === "snoozed")
@@ -975,14 +989,13 @@ export const ConversationSidebar = memo(function ConversationSidebar({
     const pinnedRank = new Map(pinnedIds.map((id, index) => [id, index]));
     const pinned = listed.filter((t) => pinnedSet.has(t.thread_id)).sort((a, b) => {
       if (pinnedSortMode === "manual") return (pinnedRank.get(a.thread_id) ?? 0) - (pinnedRank.get(b.thread_id) ?? 0);
-      if (pinnedSortMode === "priority") return Number(Boolean(b.state.running_turn_id)) - Number(Boolean(a.state.running_turn_id));
+      if (pinnedSortMode === "priority") return Number(busy(b)) - Number(busy(a));
       return String(b.updated_at || b.created_at || "").localeCompare(String(a.updated_at || a.created_at || ""));
     });
     const ordinary = listed.filter((t) => !pinnedSet.has(t.thread_id));
 
     const result: NavSection[] = [];
     const sectionExtras = new Map<string, string>();
-    const searching = Boolean(searchQuery.trim());
 
     const tail: NavSection[] = [];
     if (snoozed.length) {
@@ -1053,7 +1066,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
     const threadsByProject = new Map<string, ConversationThread[]>();
 
     if (groupMode === "list") {
-      result.push(pinnedSection, ...chronological("all", "全部对话", ordinary), ...subagentSections, ...tail);
+      result.push(pinnedSection, ...chronological("all", `全部${labels?.thread ?? "对话"}`, ordinary), ...subagentMatches, ...tail);
     } else {
       result.push(pinnedSection);
 
@@ -1079,8 +1092,8 @@ export const ConversationSidebar = memo(function ConversationSidebar({
           subtitle: project.root_path || "服务工作目录未配置",
           kind: "folder",
           previewLimit: PROJECT_THREAD_PREVIEW_LIMIT,
-          emptyLabel: "暂无对话",
-          running: projectThreads.some((thread) => Boolean(thread.state.running_turn_id)),
+          emptyLabel: `暂无${labels?.thread ?? "对话"}`,
+          running: projectThreads.some(busy),
           onNewChat: hasNewInProject ? () => callbacksRef.current.onNewChatForProject?.(projectId) : undefined,
           onArchiveAll: hasArchiveProject || hasArchive
             ? () => {
@@ -1100,8 +1113,8 @@ export const ConversationSidebar = memo(function ConversationSidebar({
 
       const projectIds = new Set(orderedProjects.map((project) => project.project_id));
       const looseThreads = ordinary.filter((thread) => !thread.project_id || !projectIds.has(thread.project_id));
-      if (!effectiveProjectFilter) result.push(...chronological("recent", "最近对话", looseThreads));
-      result.push(...subagentSections);
+      if (!effectiveProjectFilter) result.push(...chronological("recent", `最近${labels?.thread ?? "对话"}`, looseThreads));
+      result.push(...subagentMatches);
       result.push(...tail);
     }
 
@@ -1110,9 +1123,10 @@ export const ConversationSidebar = memo(function ConversationSidebar({
       listedIds,
       pinnedOrderIds,
       threadsByProject,
+      childRowIds: new Set(childMatches.map((thread) => thread.thread_id)),
     };
     // dayStamp re-buckets 今天/昨天 when the date rolls over.
-  }, [activeThreads, threads, inboxStates, toItem, effectiveProjectFilter, groupMode, sortMode, searchQuery, dayStamp, orderedProjects, hasArchiveProject, hasArchive, hasNewInProject, pinnedIds, pinnedSet, pinnedSortMode, reorderListed, reorderPinned, moveProject, changePinnedSortMode]);
+  }, [activeThreads, threadsById, subagentActivity, inboxStates, toItem, effectiveProjectFilter, groupMode, sortMode, searchQuery, dayStamp, orderedProjects, hasArchiveProject, hasArchive, hasNewInProject, pinnedIds, pinnedSet, pinnedSortMode, reorderListed, reorderPinned, moveProject, changePinnedSortMode, labels?.thread]);
   const sections = mainView.sections;
   viewRef.current = {
     effectiveProjectFilter,
@@ -1120,6 +1134,13 @@ export const ConversationSidebar = memo(function ConversationSidebar({
     pinnedOrderIds: mainView.pinnedOrderIds,
     threadsByProject: mainView.threadsByProject,
   };
+
+  // An open subagent Thread has no row of its own; its root row stands for it.
+  const navActiveId = useMemo(() => {
+    const active = activeThreadId ? threadsById.get(activeThreadId) : undefined;
+    if (!active || (!activityView && mainView.childRowIds.has(active.thread_id))) return activeThreadId;
+    return attentionOwnerId(active, threadsById) || activeThreadId;
+  }, [activeThreadId, threadsById, activityView, mainView.childRowIds]);
 
   // Reading is not dismissing. Remember rows seen in priority so that read
   // receipts (including receipts from another client) do not move them away.
@@ -1133,14 +1154,14 @@ export const ConversationSidebar = memo(function ConversationSidebar({
     setActivityPriorityIds((previous) => {
       const next = new Set(previous.filter((id) => eligibleIds.has(id)));
       for (const thread of eligible) {
-        if (thread.thread_id === activeOwner || threadHasAttention(thread) || thread.state.running_turn_id || subagentPending.has(thread.thread_id)) next.add(thread.thread_id);
+        if (thread.thread_id === activeOwner || threadHasAttention(thread) || thread.state.running_turn_id || subagentPending.has(thread.thread_id) || subagentActivity.get(thread.thread_id)?.active) next.add(thread.thread_id);
       }
       if (next.size === previous.length && previous.every((id) => next.has(id))) return previous;
       const ids = [...next];
       persistStringList(ACTIVITY_PRIORITY_KEY, ids);
       return ids;
     });
-  }, [activityView, preferenceScope, threads, activeThreadId, subagentPending, loading]);
+  }, [activityView, preferenceScope, threads, activeThreadId, subagentPending, subagentActivity, loading]);
 
   const inbox = useMemo(() => {
     const previousItems = activityItemCacheRef.current;
@@ -1151,7 +1172,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
     activitySectionCacheRef.current = nextSections;
     const projectNames = new Map(projects.map((project) => [project.project_id, project.name]));
     const activity = buildSidebarActivity({
-      threads, activeThreadId: activeThreadId || "", pinnedIds, inboxStates, subagentPending,
+      threads, activeThreadId: activeThreadId || "", pinnedIds, inboxStates, subagentPending, subagentActivity,
       prefs: activityPrefs, clearedAt: activityClearedAt, searchQuery, projectId: effectiveProjectFilter,
       retainedPriorityIds: activityPriorityIds,
     });
@@ -1199,7 +1220,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
       clearableIds: activity.clearableIds,
     };
     // dayStamp re-buckets 今天/昨天 when the date rolls over.
-  }, [threads, projects, activeThreadId, pinnedIds, inboxStates, subagentPending, toItem, activityPrefs, activityClearedAt, dayStamp, searchQuery, effectiveProjectFilter, activityPriorityIds]);
+  }, [threads, projects, activeThreadId, pinnedIds, inboxStates, subagentPending, subagentActivity, toItem, activityPrefs, activityClearedAt, dayStamp, searchQuery, effectiveProjectFilter, activityPriorityIds]);
 
   const updateActivityPrefs = useCallback((patch: Partial<ActivityPrefs>) => {
     setActivityPrefs((current) => {
@@ -1240,7 +1261,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
     if (!projects.length) return undefined;
     const counts = new Map<string, number>();
     for (const thread of threads) {
-      if (thread.state.status === "archived" || !thread.project_id) continue;
+      if (thread.state.status === "archived" || !thread.project_id || attentionOwnerId(thread, threadsById)) continue;
       counts.set(thread.project_id, (counts.get(thread.project_id) || 0) + 1);
     }
     return {
@@ -1253,7 +1274,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
       value: effectiveProjectFilter,
       onChange: changeProjectFilter,
     };
-  }, [projects.length, threads, orderedProjects, effectiveProjectFilter, changeProjectFilter]);
+  }, [projects.length, threads, threadsById, orderedProjects, effectiveProjectFilter, changeProjectFilter]);
 
   const bulkActions = useMemo<SidebarBulkActions>(() => ({
     pin: (ids) => {
@@ -1278,7 +1299,10 @@ export const ConversationSidebar = memo(function ConversationSidebar({
   const startNewChat = useCallback(() => callbacksRef.current.onNewChat(), []);
   const createFolder = useCallback(() => callbacksRef.current.onCreateFolder?.(), []);
   const changeSearch = useCallback((q: string) => callbacksRef.current.onSearchChange(q), []);
-  const navBodyHits = useMemo(() => bodyHits.map((hit) => ({
+  const visibleBodyHits = useMemo(() => restrictSearchToThreads
+    ? bodyHits.filter((hit) => threadsById.has(hit.thread_id))
+    : bodyHits, [bodyHits, restrictSearchToThreads, threadsById]);
+  const navBodyHits = useMemo(() => visibleBodyHits.map((hit) => ({
     threadId: hit.thread_id,
     messageId: hit.message_id,
     title: hit.thread_title || "未命名对话",
@@ -1286,7 +1310,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
     role: hit.role || "user",
     archived: hit.archived,
     superseded: hit.superseded,
-  })), [bodyHits]);
+  })), [visibleBodyHits]);
   const loadMoreBodyHits = useCallback(() => { void loadMoreSearchHits(); }, [loadMoreSearchHits]);
   const canLoadMoreBodyHits = bodyHits.length > 0 && bodyHitsNextOffset != null;
   const retryBodyHits = useCallback(() => {
@@ -1294,10 +1318,11 @@ export const ConversationSidebar = memo(function ConversationSidebar({
     else setSearchAttempt((attempt) => attempt + 1);
   }, [canLoadMoreBodyHits, loadMoreSearchHits]);
   const selectBodyHit = useCallback((hit: { threadId: string; messageId: string }) => {
+    if (restrictSearchToThreads && !threadsById.has(hit.threadId)) return;
     callbacksRef.current.onSelectMessageHit?.(hit.threadId, hit.messageId);
-  }, []);
+  }, [restrictSearchToThreads, threadsById]);
 
-  // T3-style thread shortcuts: ⌘⇧S settle, ⌘⇧P pin (current thread), ⌘Z undo.
+  // T3-style thread shortcuts: ⌘⇧S settle, ⌘⇧P pin (the highlighted row), ⌘Z undo.
   useEffect(() => {
     const inTextField = (target: EventTarget | null) => target instanceof HTMLElement
       && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable || Boolean(target.closest("[data-c34-terminal]")));
@@ -1305,10 +1330,10 @@ export const ConversationSidebar = memo(function ConversationSidebar({
       if (event.isComposing || event.defaultPrevented) return;
       const mod = event.metaKey || event.ctrlKey;
       if (!mod || event.altKey) return;
-      if (event.shiftKey && (event.code === "KeyS" || event.code === "KeyP") && activeThreadId) {
+      if (event.shiftKey && (event.code === "KeyS" || event.code === "KeyP") && navActiveId) {
         event.preventDefault();
-        if (event.code === "KeyS") setThreadSettled(activeThreadId, inboxStates.get(activeThreadId)?.placement !== "settled");
-        else togglePinned(activeThreadId);
+        if (event.code === "KeyS") setThreadSettled(navActiveId, inboxStates.get(navActiveId)?.placement !== "settled");
+        else togglePinned(navActiveId);
         return;
       }
       if (!event.shiftKey && event.code === "KeyZ" && !inTextField(event.target)) {
@@ -1317,7 +1342,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [activeThreadId, inboxStates, setThreadSettled, togglePinned, undoLastInboxChange]);
+  }, [navActiveId, inboxStates, setThreadSettled, togglePinned, undoLastInboxChange]);
 
   const mobileOpen = className.split(/\s+/).includes("open");
   const drawerHidden = mobile ? !mobileOpen : collapsed;
@@ -1330,12 +1355,12 @@ export const ConversationSidebar = memo(function ConversationSidebar({
       className={`ai-conv-sidebar cx-sidebar flex h-full flex-col select-none ${
         resizing ? "resizing" : ""
       } ${className}`}
-      id="conversation-sidebar"
+      id={sidebarId}
       data-collapsed={collapsed ? "true" : "false"}
       role={mobileModal ? "dialog" : undefined}
       aria-modal={mobileModal ? true : undefined}
       tabIndex={mobileModal ? -1 : undefined}
-      aria-label="对话导航"
+      aria-label={labels?.title ?? "对话导航"}
       aria-hidden={drawerHidden || undefined}
       inert={drawerHidden ? true : undefined}
     >
@@ -1344,6 +1369,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
         <button type="button" className="mt-1 rounded px-2 py-1 text-cx-accent focus-visible:outline-2" onClick={() => void retryPreferences()}>重试保存</button>
       </div> : null}
       <SidebarNav
+        labels={labels}
         sections={sections}
         activitySections={inbox.sections}
         activityView={activityView}
@@ -1352,7 +1378,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
         activityOptions={activityOptions}
         projectFilter={projectFilterProp}
         bulkActions={bulkActions}
-        activeId={activeThreadId}
+        activeId={navActiveId}
         onSelect={selectThread}
         onNewChat={startNewChat}
         onCreateFolder={hasCreateFolder ? createFolder : undefined}

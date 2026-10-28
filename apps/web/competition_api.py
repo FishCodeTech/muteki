@@ -48,6 +48,7 @@ try:  # FastAPI 注解需模块级可解析（__future__ annotations 下按模�
 except ImportError:  # pragma: no cover - 非 Web 环境仅导入类型名
     Request = Any  # type: ignore[assignment]
 
+from muteki.core.blocking import run_blocking
 from muteki.competition.commands import (
     COMPETITION_COMMAND_TYPES,
     CompetitionCommandApi,
@@ -214,7 +215,7 @@ def create_competition_router(
     router = APIRouter(tags=["competitions"])
 
     @router.get("/api/platform-kinds")
-    async def list_platform_kinds() -> Any:
+    def list_platform_kinds() -> Any:
         """builtin ∪ 已启用扩展 platform-adapter，供大厅平台下拉。"""
         if platform_adapter_factory is not None and hasattr(
             platform_adapter_factory, "list_kinds"
@@ -385,7 +386,7 @@ def create_competition_router(
                 ErrorCategory.RUNTIME,
                 status_code=503,
             )
-        reference = secret_store.put(
+        reference = await run_blocking(secret_store.put,
             receipt.aggregate.id,
             body.credential_key,
             credential.get_secret_value(),
@@ -400,7 +401,7 @@ def create_competition_router(
         return JSONResponse({
             "receipt": credential_receipt.model_dump(mode="json"),
             "connection_receipt": receipt.model_dump(mode="json"),
-            "secret": asdict(secret_store.get(reference)),
+            "secret": asdict(await run_blocking(secret_store.get, reference)),
         }, status_code=_receipt_status(credential_receipt))
 
     @router.get("/api/platform-secrets")
@@ -412,7 +413,7 @@ def create_competition_router(
                 ErrorCategory.RUNTIME,
                 status_code=503,
             )
-        return [asdict(item) for item in secret_store.list(
+        return [asdict(item) for item in await run_blocking(secret_store.list,
             connection_id or None)]
 
     @router.get("/api/platform-secrets/inspect")
@@ -425,7 +426,7 @@ def create_competition_router(
                 status_code=503,
             )
         try:
-            return asdict(secret_store.get(reference))
+            return asdict(await run_blocking(secret_store.get, reference))
         except PlatformSecretError as exc:
             return _error_response(
                 "competition.secret.not_found",
@@ -437,7 +438,7 @@ def create_competition_router(
     async def rotate_platform_secret(
         connection_id: str, body: PlatformSecretWriteBody
     ) -> Any:
-        connection = store.get(PlatformConnection, connection_id)
+        connection = await run_blocking(store.get, PlatformConnection, connection_id)
         if connection is None:
             return _error_response(
                 "competition.connection.not_found",
@@ -453,15 +454,15 @@ def create_competition_router(
             )
         old_reference = str(connection.credential_ref or "")
         if body.mode == "update" and old_reference:
-            metadata = secret_store.get(old_reference)
-            reference = secret_store.put(
+            metadata = await run_blocking(secret_store.get, old_reference)
+            reference = await run_blocking(secret_store.put,
                 connection_id,
                 metadata.key,
                 body.credential.get_secret_value(),
                 expires_at=body.expires_at,
             )
         elif old_reference:
-            metadata = secret_store.rotate(
+            metadata = await run_blocking(secret_store.rotate,
                 old_reference,
                 body.credential.get_secret_value(),
                 key=body.key,
@@ -470,7 +471,7 @@ def create_competition_router(
             )
             reference = metadata.reference
         else:
-            reference = secret_store.put(
+            reference = await run_blocking(secret_store.put,
                 connection_id,
                 body.key,
                 body.credential.get_secret_value(),
@@ -485,14 +486,14 @@ def create_competition_router(
         change_effect: dict[str, Any] = {}
         if (receipt.state is ReceiptState.COMPLETED
                 and old_reference and reference != old_reference):
-            secret_store.delete(old_reference)
+            await run_blocking(secret_store.delete, old_reference)
         elif receipt.state is not ReceiptState.COMPLETED and reference != old_reference:
-            secret_store.delete(reference)
+            await run_blocking(secret_store.delete, reference)
         if receipt.state is ReceiptState.COMPLETED and on_secret_changed is not None:
             change_effect = await on_secret_changed(
                 old_reference, reference, body.mode)
         secret_metadata = (
-            asdict(secret_store.get(reference))
+            asdict(await run_blocking(secret_store.get, reference))
             if receipt.state is ReceiptState.COMPLETED else None
         )
         return JSONResponse({
@@ -509,7 +510,7 @@ def create_competition_router(
     async def revoke_platform_secret(
         connection_id: str, body: PlatformSecretRevokeBody
     ) -> Any:
-        connection = store.get(PlatformConnection, connection_id)
+        connection = await run_blocking(store.get, PlatformConnection, connection_id)
         if connection is None:
             return _error_response(
                 "competition.connection.not_found",
@@ -536,7 +537,7 @@ def create_competition_router(
             idempotency_key=body.idempotency_key,
         ))
         if receipt.state is ReceiptState.COMPLETED:
-            secret_store.delete(reference)
+            await run_blocking(secret_store.delete, reference)
             change_effect = (
                 await on_secret_changed(reference, "", "revoked")
                 if on_secret_changed is not None else {})
@@ -549,7 +550,7 @@ def create_competition_router(
         }, status_code=_receipt_status(receipt))
 
     @router.get("/api/platform-connections/{connection_id}/browser-session")
-    async def browser_session_status(connection_id: str) -> Any:
+    def browser_session_status(connection_id: str) -> Any:
         connection = store.get(PlatformConnection, connection_id)
         if connection is None:
             return _error_response(
@@ -581,7 +582,7 @@ def create_competition_router(
     async def import_browser_session(
         connection_id: str, body: BrowserStorageStateBody
     ) -> Any:
-        connection = store.get(PlatformConnection, connection_id)
+        connection = await run_blocking(store.get, PlatformConnection, connection_id)
         if connection is None:
             return _error_response(
                 "competition.connection.not_found",
@@ -599,7 +600,7 @@ def create_competition_router(
         state_ref = ""
         if not body.renew:
             staging_key = new_id("browser_state").replace("-", "_")
-            state_ref = secret_store.put(
+            state_ref = await run_blocking(secret_store.put,
                 connection_id,
                 staging_key,
                 json.dumps(body.storage_state, ensure_ascii=False),
@@ -733,7 +734,7 @@ def create_competition_router(
     async def post_command(
         competition_id: str, body: dict[str, Any] = Body(...)
     ) -> Any:
-        not_found = _require_competition(competition_id)
+        not_found = await run_blocking(_require_competition, competition_id)
         if not_found is not None:
             return not_found
         envelope = _typed_command(competition_id, dict(body))
@@ -750,7 +751,7 @@ def create_competition_router(
         可选附带结构化命令（``body.command``）：先 dispatch 得到 receipt，
         再把 receipt 引用随消息事件落库，响应同时携带两份 receipt。
         """
-        not_found = _require_competition(competition_id)
+        not_found = await run_blocking(_require_competition, competition_id)
         if not_found is not None:
             return not_found
         text = body.text.strip()
@@ -822,8 +823,8 @@ def create_competition_router(
         authorized = await _query("competition.snapshot", competition_id=competition_id)
         if isinstance(authorized, JSONResponse):
             return authorized
-        cursor = before if before is not None else store.event_watermark() + 1
-        rows = store.read_competition_history(
+        cursor = before if before is not None else await run_blocking(store.event_watermark) + 1
+        rows = await run_blocking(store.read_competition_history,
             competition_id, before_seq=cursor, limit=limit + 1)
         page = rows[:limit]
         return {
@@ -842,7 +843,7 @@ def create_competition_router(
         Last-Event-ID / after 仅记录重连信息，不触发历史日志回放。
         中间状态可以合并，历史记录通过 events/history 分页查看。
         """
-        not_found = _require_competition(competition_id)
+        not_found = await run_blocking(_require_competition, competition_id)
         if not_found is not None:
             return not_found
 

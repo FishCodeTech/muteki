@@ -1,21 +1,21 @@
-"""Asynchronous model-authored metadata for Conversation Threads.
+"""Asynchronous initial titles for Conversation Threads.
 
 The event hook only schedules work. Runtime completion and SSE delivery never
 wait for the Thread's selected model. A persisted revision/turn fence ensures
-that a late response cannot overwrite a manual rename or metadata based on a
-newer turn.
+that a late response cannot overwrite a manual rename or metadata whose
+basis turn has been replaced.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-import re
 from typing import Awaitable, Callable, Optional
 
 from apps.web.titler import (
-    ConversationMetadata,
-    generate_conversation_metadata_with_runtime,
+    ConversationTitle,
+    generate_conversation_title_with_runtime,
 )
 from muteki.external_agents.factory import engine_for_adapter
 from muteki.external_agents.registry import AdapterRegistry
@@ -23,14 +23,15 @@ from muteki.conversation import events as ev
 from muteki.conversation.manager import ConversationManager
 from muteki.platform.contracts.events import EventEnvelope
 from muteki.platform.store import PlatformStore
+from muteki.platform.contracts.objects import Artifact
 
 
 LOG = logging.getLogger(__name__)
 
-MetadataGenerator = Callable[..., Awaitable[Optional[ConversationMetadata]]]
+TitleGenerator = Callable[..., Awaitable[Optional[ConversationTitle]]]
 
 class ConversationMetadataService:
-    """Generate Thread metadata when turns start and complete."""
+    """Title the first user request without blocking the conversation Runtime."""
 
     def __init__(
         self,
@@ -39,7 +40,7 @@ class ConversationMetadataService:
         *,
         sessions_root: str,
         registry: Optional[AdapterRegistry] = None,
-        generator: MetadataGenerator = generate_conversation_metadata_with_runtime,
+        generator: TitleGenerator = generate_conversation_title_with_runtime,
     ) -> None:
         self._store = store
         self._manager = manager
@@ -60,35 +61,52 @@ class ConversationMetadataService:
         """Schedule metadata work from normalized public Conversation events."""
         if event.aggregate_type != ev.AGGREGATE_THREAD:
             return
-        if event.event_type == ev.EV_TURN_REQUESTED:
-            turn_id = str(event.payload.get("turn_id") or "").strip()
-            self._cancel(event.aggregate_id)
-            if turn_id:
-                try:
-                    self._manager.reserve_thread_metadata(
-                        event.aggregate_id, turn_id
-                    )
-                except Exception:  # noqa: BLE001 - event delivery stays isolated
-                    LOG.exception(
-                        "failed to invalidate stale conversation metadata: %s",
-                        event.aggregate_id,
-                    )
-                else:
-                    self._schedule_update(event.aggregate_id, turn_id)
-            return
-        if event.event_type in {
-            ev.EV_TURN_RETRIED,
-            ev.EV_TURN_FAILED,
-            ev.EV_TURN_INTERRUPTED,
-        }:
-            self._cancel(event.aggregate_id)
-            return
-        if event.event_type != ev.EV_TURN_COMPLETED:
-            return
         turn_id = str(event.payload.get("turn_id") or "").strip()
         if not turn_id:
             return
-        self._schedule_update(event.aggregate_id, turn_id)
+        thread = self._manager.get_thread(event.aggregate_id)
+        if thread is None or thread.mode != "conversation":
+            return
+        if event.event_type in {
+            ev.EV_TURN_RETRIED,
+            ev.EV_TURN_EDIT_RESENT,
+            ev.EV_TURN_FAILED,
+            ev.EV_TURN_INTERRUPTED,
+        }:
+            replaced = event.payload.get("superseded_turn_ids") or []
+            if (thread.metadata_turn_id == turn_id
+                    or thread.metadata_turn_id in replaced
+                    or thread.metadata_turn_id == event.payload.get("retry_of_turn_id")):
+                self._cancel(event.aggregate_id)
+            return
+        if event.event_type != ev.EV_TURN_REQUESTED:
+            return
+        if thread.title_source != "fallback":
+            return
+        # Initial titles describe the opening request. A later turn neither
+        # regenerates metadata nor cancels an initial title still in flight.
+        first = next((turn for turn in self._manager.conv.list_current_turns(
+            event.aggregate_id
+        ) if self._is_user_request(turn)), None)
+        if first is None or first.turn_id != turn_id:
+            return
+        if thread.metadata_turn_id == turn_id:
+            return
+        try:
+            self._manager.reserve_thread_metadata(event.aggregate_id, turn_id)
+        except Exception:  # noqa: BLE001 - event delivery stays isolated
+            LOG.exception("failed to reserve conversation title: %s", event.aggregate_id)
+        else:
+            self._schedule_update(event.aggregate_id, turn_id)
+
+    @staticmethod
+    def _is_user_request(turn: object) -> bool:
+        invocation = getattr(turn, "runtime_invocation", {}) or {}
+        return invocation.get("kind") != "command" and bool(
+            str(getattr(turn, "text", "") or "").strip()
+            or getattr(turn, "attachments", [])
+            or getattr(turn, "capability_refs", [])
+        )
 
     def _schedule_update(self, thread_id: str, turn_id: str) -> None:
         try:
@@ -126,18 +144,20 @@ class ConversationMetadataService:
         except Exception:  # noqa: BLE001 - background work must stay isolated
             LOG.exception("conversation metadata task failed: %s", thread_id)
 
-    def _transcript(self, thread_id: str) -> str:
-        thread = self._manager.get_thread(thread_id)
-        messages = self._manager.conv.list_current_messages(thread_id)
-        rows: list[str] = []
-        if thread is not None and thread.summary:
-            rows.append(f"已有摘要：{thread.summary}")
-        labels = {"user": "用户", "assistant": "助手", "system": "系统"}
-        for message in messages:
-            text = re.sub(r"\s+", " ", str(message.text or "").strip())
-            if not text:
-                continue
-            rows.append(f"{labels.get(message.role, message.role)}：{text}")
+    def _opening_request(self, turn: object) -> str:
+        rows = [str(getattr(turn, "text", "") or "")]
+        for digest in getattr(turn, "attachments", []):
+            artifact = self._store.get(Artifact, digest)
+            details = (
+                {"sha256": artifact.sha256, "name": artifact.name,
+                 "media_type": artifact.media_type, "size": artifact.size,
+                 "kind": artifact.kind}
+                if artifact is not None else {"sha256": digest, "metadata": "unavailable"}
+            )
+            rows.append("Attachment metadata: " + json.dumps(details, ensure_ascii=False))
+        refs = getattr(turn, "capability_refs", [])
+        if refs:
+            rows.append("Selected context: " + json.dumps(refs, ensure_ascii=False))
         return "\n".join(rows)
 
     async def _update(self, thread_id: str, turn_id: str) -> None:
@@ -145,7 +165,7 @@ class ConversationMetadataService:
         turn = self._manager.conv.get_turn(turn_id)
         if thread is None or turn is None or turn.thread_id != thread_id:
             return
-        if not thread.summary and not str(turn.text or "").strip():
+        if thread.title_source != "fallback" or not self._is_user_request(turn):
             return
         runtime = self._manager.runtime_selection(thread_id)
         if not runtime.adapter_id:
@@ -155,50 +175,56 @@ class ConversationMetadataService:
             )
             return
 
-        reserved = self._manager.reserve_thread_metadata(thread_id, turn_id)
-        generate_title = reserved.title_source == "fallback"
-        transcript = self._transcript(thread_id)
-        from muteki.core.usage import usage_context
-        try:
-            with usage_context(self._sessions_root, thread_id=thread_id, turn_id=turn_id,
-                               workspace_kind="conversation", actor_kind="auxiliary", role="titler"):
-                metadata = await self._generate_metadata(
-                    transcript,
-                    runtime=runtime,
-                    current_title=reserved.title,
-                    generate_title=generate_title,
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 - metadata failures stay isolated from turns
-            LOG.exception(
-                "conversation metadata generation failed: thread_id=%s turn_id=%s "
-                "engine=%s model=%s",
-                thread_id,
-                turn_id,
-                engine_for_adapter(runtime.adapter_id),
-                runtime.model,
-            )
+        # The event hook reserved this revision before scheduling. Do not
+        # reserve again: a manual rename in between must invalidate this job.
+        reserved = thread
+        if reserved.metadata_turn_id != turn_id:
             return
-        if metadata is None:
+        transcript = await asyncio.to_thread(self._opening_request, turn)
+        from muteki.core.usage import usage_context
+        metadata = None
+        for attempt, delay in enumerate((0, 2, 4)):
+            if delay:
+                await asyncio.sleep(delay)
+            current = self._manager.get_thread(thread_id)
+            if (current is None or current.title_source != "fallback"
+                    or current.metadata_revision != reserved.metadata_revision
+                    or current.metadata_turn_id != turn_id):
+                return
+            try:
+                with usage_context(self._sessions_root, thread_id=thread_id, turn_id=turn_id,
+                                   workspace_kind="conversation", actor_kind="auxiliary", role="titler",
+                                   credential_id=runtime.credential_id,
+                                   speed={"priority": "fast", "fast": "fast", "ultrafast": "ultrafast"}.get(
+                                       runtime.service_tier, "standard")):
+                    metadata = await self._generate_title(
+                        transcript, runtime=runtime, thread_id=thread_id, turn_id=turn_id,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - title failures stay isolated from turns
+                LOG.exception(
+                    "conversation title generation failed: thread_id=%s turn_id=%s "
+                    "engine=%s model=%s attempt=%s",
+                    thread_id, turn_id, engine_for_adapter(runtime.adapter_id),
+                    runtime.model, attempt + 1,
+                )
+            if metadata is not None and metadata.title:
+                break
             LOG.warning(
-                "conversation metadata generator returned no result: "
-                "thread_id=%s turn_id=%s engine=%s model=%s",
-                thread_id,
-                turn_id,
-                engine_for_adapter(runtime.adapter_id),
-                runtime.model,
+                "conversation title returned no result: thread_id=%s turn_id=%s "
+                "engine=%s model=%s attempt=%s",
+                thread_id, turn_id, engine_for_adapter(runtime.adapter_id),
+                runtime.model, attempt + 1,
             )
+        if metadata is None or not metadata.title:
             return
 
         updated = self._manager.apply_generated_thread_metadata(
             thread_id,
             expected_revision=reserved.metadata_revision,
             turn_id=turn_id,
-            title=metadata.title if generate_title else "",
-            summary=metadata.summary,
+            title=metadata.title,
         )
         if updated is None:
             return
@@ -223,28 +249,26 @@ class ConversationMetadataService:
             actor_id="system",
         ))
 
-    async def _generate_metadata(
+    async def _generate_title(
         self,
         transcript: str,
         *,
         runtime: object,
-        current_title: str,
-        generate_title: bool,
         thread_id: str,
         turn_id: str,
-    ) -> Optional[ConversationMetadata]:
-        """Generate metadata with the model selected for this conversation."""
+    ) -> Optional[ConversationTitle]:
+        """Generate a title with the model selected for this conversation."""
         kwargs = {
             "runtime": runtime,
             "sessions_root": self._sessions_root,
-            "current_title": current_title,
-            "generate_title": generate_title,
             "thread_id": thread_id,
             "turn_id": turn_id,
         }
+        if self._generator is generate_conversation_title_with_runtime:
+            kwargs["chat_runtime"] = True
         if (
             self._registry is not None
-            and self._generator is generate_conversation_metadata_with_runtime
+            and self._generator is generate_conversation_title_with_runtime
         ):
             kwargs["adapter"] = self._registry.get(
                 str(getattr(runtime, "adapter_id", "") or ""),

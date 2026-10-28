@@ -1,5 +1,7 @@
 "use client";
 
+import { ConversationRouteLink } from "@/components/conversation/ConversationNavigation";
+
 import dynamic from "next/dynamic";
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { EngineLogo } from "./EngineLogo";
@@ -7,15 +9,16 @@ import { Button } from "./chat/ui/Button";
 import { Callout, Skeleton } from "./chat/ui/Feedback";
 import { SegmentedControl } from "./chat/ui/Tabs";
 import { ProviderUsageChart } from "./usage/ProviderUsageChart";
+import { UsageLimitsView } from "./usage/UsageLimitsView";
 import {
   countValue, engineColor, engineName, exactMoney, fetchUsageLimits, fetchUsageSummary, moneyValue, pricingLabel,
   slotLabel, statusLabel, timestampLabel, tokenValue, type UsageDays, type UsageLimits, type UsageMetric,
   type UsageProvider, type UsageScope, type UsageSummary, type UsageTotals,
 } from "@/lib/providerUsage";
 import { formatShare } from "@/lib/usageFormat";
+import { isDesktopWorkspaceActive } from "@/lib/desktopEnvironment";
 import styles from "./UsageDashboard.module.css";
 
-const UsageLimitsView = dynamic(() => import("./usage/UsageLimitsView").then(module => module.UsageLimitsView));
 const UsageLedger = dynamic(() => import("./usage/UsageLedger").then(module => module.UsageLedger));
 const STORAGE_KEY = "muteki.usage.v2";
 const DEFAULT_ENGINES = ["codex", "claude", "cursor", "grok", "opencode", "pi", "kimi", "omp", "devin", "droid"];
@@ -50,8 +53,8 @@ function TokenTotals({ totals }: { totals: UsageTotals }) {
 
 function Composition({ totals, metric }: { totals: UsageTotals; metric: "cost" | "tokens" }) {
   const parts = metric === "cost" ? [
-    { label: "供应商上报", value: totals.reported_cost, color: "var(--cx-accent)" },
-    { label: "API 估算", value: totals.estimated_cost, color: "color-mix(in oklab, var(--cx-accent) 45%, var(--cx-bg))" },
+    { label: "上报金额", value: totals.reported_cost, color: "var(--cx-accent)" },
+    { label: "估算费用", value: totals.estimated_cost, color: "color-mix(in oklab, var(--cx-accent) 45%, var(--cx-bg))" },
   ] : [
     { label: "未缓存输入", value: totals.uncached_input, color: "var(--cx-accent)" },
     { label: "缓存读取", value: totals.cache_read, color: "color-mix(in oklab, var(--cx-accent) 62%, var(--cx-bg))" },
@@ -100,6 +103,7 @@ function SummaryContent({ data, metric, scope }: { data: UsageSummary; metric: "
     {metric === "cost" ? <div className={styles.costOverview}><section className={styles.costSidebar} aria-label="费用概览"><span className={styles.summaryLabel}>已定价费用</span><strong className={styles.heroValue} title={exactMoney(data.totals.cost)}>{moneyValue(data.totals.cost)}</strong><p className={styles.summaryNote}>{pricingLabel(data.totals)} · {countValue(data.totals.sessions)} 个会话</p>{data.totals.unpriced ? <p className={styles.warningNote}>{countValue(data.totals.unpriced)} 条未定价记录，未计入此金额</p> : null}
       <div className={styles.providerList}>{visibleProviders.map(provider => <div key={provider.engine} className={styles.providerItem} style={{ "--usage-engine": engineColor(provider.engine) } as CSSProperties}><div className={styles.providerTop}><EngineName engine={provider.engine} /><strong title={exactMoney(provider.cost)}>{provider.records === 0 && provider.cost === null ? "暂无记录" : moneyValue(provider.cost)}</strong></div><div className={styles.providerMeta}><span>{tokenValue(provider.total_tokens)} Token</span><span>{provider.records === 0 ? statusLabel(provider.status) : pricingLabel(provider)}</span></div>{provider.message || provider.historical_scope_unknown ? <small className={styles.providerMessage}>{provider.message}{provider.historical_scope_unknown ? ` · ${countValue(provider.historical_scope_unknown)} 条历史口径未知` : ""}</small> : null}</div>)}</div>{data.providers.length > 5 ? <Button variant="ghost" size="sm" className={styles.expandProviders} onClick={() => setProvidersExpanded(value => !value)} aria-expanded={providersExpanded}>{providersExpanded ? "收起引擎列表 ↑" : `展开全部 ${data.providers.length} 个引擎 ↓`}</Button> : null}
     </section><section className={styles.trend}><div className={styles.sectionHeading}><h2>{chartTitle}</h2><span>{data.window.time_zone}</span></div><ProviderUsageChart series={data.series} metric={metric} engines={chartEngines} /></section></div> : <><TokenTotals totals={data.totals} /><section className={styles.tokenTrend}><div className={styles.sectionHeading}><h2>{chartTitle}</h2><span>{data.window.time_zone}</span></div><ProviderUsageChart series={data.series} metric={metric} engines={chartEngines} /></section></>}
+    <p className={styles.footnote}><ConversationRouteLink className="text-cx-accent underline underline-offset-4" href="/settings/agents#setting-model-pricing">管理模型价格与目录映射</ConversationRouteLink> · 所有价格单位为 USD / 百万 Token，标价估算不代表订阅实际收费。</p>
     <Coverage totals={data.totals} />
     <Composition totals={data.totals} metric={metric} />
     <Breakdown key={metric} data={data} metric={metric} />
@@ -122,8 +126,15 @@ export function UsageDashboard({ runId, competitionId, threadId, challenges = []
   const [challengeId, setChallengeId] = useState("");
   const [ledgerOpen, setLedgerOpen] = useState(false);
   const [refresh, setRefresh] = useState(0);
+  const [pricingRevision, setPricingRevision] = useState(0);
   const [resource, setResource] = useState<Resource>({ key: "", loading: true, error: "", data: null });
   const lastRefresh = useRef(0);
+  const lastResourceKey = useRef<string | null>(null);
+  useEffect(() => {
+    const invalidate = () => setPricingRevision(value => value + 1);
+    window.addEventListener("muteki:model-pricing", invalidate);
+    return () => window.removeEventListener("muteki:model-pricing", invalidate);
+  }, []);
   useEffect(() => {
     if (scoped) {
       setPreferences({ metric: "tokens", days: "all", scope: "muteki" });
@@ -165,10 +176,8 @@ export function UsageDashboard({ runId, competitionId, threadId, challenges = []
     if (!ready || (!limits && invalidDates)) return;
     const controller = new AbortController();
     let busy = false;
-    const force = refresh !== lastRefresh.current;
-    lastRefresh.current = refresh;
     const load = async (forceRefresh: boolean) => {
-      if (busy || controller.signal.aborted) return;
+      if (busy || controller.signal.aborted || !isDesktopWorkspaceActive()) return;
       busy = true;
       setResource(previous => ({ key: resourceKey, data: previous.key === resourceKey ? previous.data : null, loading: true, error: "" }));
       try {
@@ -178,10 +187,19 @@ export function UsageDashboard({ runId, competitionId, threadId, challenges = []
         if (!controller.signal.aborted) setResource(previous => ({ ...previous, loading: false, error: cause instanceof Error ? cause.message : "用量读取失败" }));
       } finally { busy = false; }
     };
-    void load(force);
+    // Only filter changes need coalescing. Initial reads and explicit refreshes
+    // start immediately; Cost and Token still share the same resource lifecycle.
+    const force = refresh !== lastRefresh.current;
+    const debounce = lastResourceKey.current !== null && lastResourceKey.current !== resourceKey && !force;
+    lastResourceKey.current = resourceKey;
+    lastRefresh.current = refresh;
+    const initialTimer = debounce ? window.setTimeout(() => void load(force), 200) : null;
+    if (!debounce) void load(force);
     const timer = limits ? null : window.setInterval(() => { if (!document.hidden) void load(false); }, scope === "muteki" ? 15_000 : 60_000);
-    return () => { controller.abort(); if (timer !== null) window.clearInterval(timer); };
-  }, [ready, resourceKey, limits, scope, refresh, invalidDates]);
+    const resume = () => { if (!document.hidden && !limits) void load(false); };
+    document.addEventListener("visibilitychange", resume);
+    return () => { controller.abort(); if (initialTimer !== null) window.clearTimeout(initialTimer); if (timer !== null) window.clearInterval(timer); document.removeEventListener("visibilitychange", resume); };
+  }, [ready, resourceKey, limits, scope, refresh, invalidDates, pricingRevision]);
   const data = resource.key === resourceKey && (limits || !invalidDates) ? resource.data : null;
   const summary = data && "totals" in data ? data : null;
   const limitData = data && "accounts" in data ? data : null;
@@ -201,7 +219,7 @@ export function UsageDashboard({ runId, competitionId, threadId, challenges = []
     {!limits && invalidDates ? <Callout tone="danger" role="alert">结束日期不能早于开始日期。</Callout> : null}
     {resource.error && resource.key === resourceKey ? <Callout tone="danger" role="alert">{resource.error}{data ? "。当前保留上次成功结果。" : ""}</Callout> : null}
     {!data && !resource.error && (limits || !invalidDates) ? <div className={styles.skeleton} role="status" aria-label="正在读取用量"><span className={styles.srOnly}>正在读取{limits ? "额度" : "用量"}…</span><Skeleton className="h-8 w-44" /><Skeleton className="h-60 w-full rounded-lg" /><Skeleton className="h-32 w-full rounded-lg" /></div> : null}
-    {summary && !limits ? <><div className={styles.contextBar}><p>{scope === "history" ? "原生记录与账户历史，按来源去重" : competitionId ? "包含失败、中断和重试；不含 Reason、标题和摘要" : "此 Muteki 实例的任务、对话及辅助调用"}</p><span>{summary.window.slots.length ? `${slotLabel(summary.window.slots[0])} — ${slotLabel(summary.window.slots[summary.window.slots.length - 1])} · ` : ""}更新于 {timestampLabel(summary.as_of)}</span></div><SummaryContent data={summary} metric={metric} scope={scope} />{scope === "muteki" ? <details className={styles.ledgerDisclosure} onToggle={event => setLedgerOpen(event.currentTarget.open)}><summary>查看调用账本与归属 <span>任务、题目、角色和执行批次</span></summary>{ledgerOpen ? <UsageLedger key={query} query={ledgerQuery} refresh={refresh} competitionId={competitionId} challenges={challenges} allowImport={!scoped} onImport={() => setRefresh(value => value + 1)} /> : null}</details> : null}</> : null}
+    {summary && !limits ? <><div className={styles.contextBar}><p>{scope === "history" ? "原生记录与账户历史，按来源去重" : competitionId ? "包含失败、中断和重试；不含 Reason、标题和摘要" : "此 Muteki 实例的任务、对话及辅助调用"}</p><span>{summary.window.slots.length ? `${slotLabel(summary.window.slots[0])} — ${slotLabel(summary.window.slots[summary.window.slots.length - 1])} · ` : ""}更新于 {timestampLabel(summary.as_of)}</span></div><SummaryContent data={summary} metric={metric} scope={scope} />{scope === "muteki" ? <details className={styles.ledgerDisclosure} onToggle={event => setLedgerOpen(event.currentTarget.open)}><summary>查看调用账本与归属 <span>任务、题目、角色和执行批次</span></summary>{ledgerOpen ? <UsageLedger key={query} query={ledgerQuery} refresh={refresh + pricingRevision} competitionId={competitionId} challenges={challenges} allowImport={!scoped} onImport={() => setRefresh(value => value + 1)} /> : null}</details> : null}</> : null}
     {limitData && limits ? <UsageLimitsView data={limitData} /> : null}
   </section>;
 }

@@ -83,6 +83,30 @@ class ClaudeCodeDriver(CliDriver):
         argv += ["--", prompt]
         return argv
 
+    def build_execute_input(
+        self, prompt: str, session: Optional[str], *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        argv = [self.bin, "-p", *self._fmt(stream),
+                *self._permission_flags(launch)]
+        if session:
+            argv += ["--session-id", session]
+        argv += [*self._mcp_isolation(kb_access=kb_access),
+                 *self._denied(web_access=web_access, kb_access=kb_access), "--"]
+        return argv, prompt
+
+    def build_resume_input(
+        self, prompt: str, session: str, *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        return ([self.bin, "-r", session, "-p", *self._fmt(stream),
+                 *self._permission_flags(launch),
+                 *self._mcp_isolation(kb_access=kb_access),
+                 *self._denied(web_access=web_access, kb_access=kb_access), "--"],
+                prompt)
+
     def build_execute_stdin(
         self, prompt: str, session: Optional[str], *,
         web_access: bool = True, kb_access: bool = True, stream: bool = False,
@@ -167,7 +191,7 @@ class ClaudeCodeDriver(CliDriver):
                 input_tokens=inp,
                 output_tokens=outp,
                 num_turns=d.get("num_turns"),
-                raw_stderr=stderr[-2000:],
+                raw_stderr=stderr,
                 error=error or _structured_cli_error(stdout),
             )
         except json.JSONDecodeError:
@@ -243,7 +267,7 @@ class ClaudeCodeDriver(CliDriver):
         return CliResult(text=result_text, session=session, cost_usd=cost,
                          usage_estimated=estimated,
                          input_tokens=inp, output_tokens=outp,
-                         num_turns=turns, raw_stderr=stderr[-2000:],
+                         num_turns=turns, raw_stderr=stderr,
                          error=error)
 
     def parse_stream_line(self, line: str) -> Optional[StreamStep]:
@@ -281,7 +305,7 @@ class ClaudeCodeDriver(CliDriver):
                     inp = b.get("input", {}) or {}
                     arg = inp.get("command") or inp.get("query") or inp.get("file_path") or ""
                     steps.append(StreamStep(
-                        "tool", tool=str(b.get("name", "")), text=str(arg)[:300],
+                        "tool", tool=str(b.get("name", "")), text=str(arg),
                         call_id=str(b.get("id") or "")))
         elif t == "user":
             for b in (ev.get("message", {}) or {}).get("content", []) or []:

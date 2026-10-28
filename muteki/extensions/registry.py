@@ -25,11 +25,16 @@ import asyncio
 import json
 import logging
 import shutil
+import tempfile
+from contextlib import asynccontextmanager
+from functools import wraps
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
+
+from muteki.core.blocking import run_blocking
 
 from pydantic import Field
 
@@ -125,6 +130,14 @@ class ExtensionRecord(ContractModel):
 ProposalHandler = Callable[[str, str, dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
+def _serialized_lifecycle(method: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    @wraps(method)
+    async def serialized(self: ExtensionService, extension_id: str, *args: Any, **kwargs: Any) -> Any:
+        async with self._lifecycle(extension_id):
+            return await method(self, extension_id, *args, **kwargs)
+    return serialized
+
+
 class ExtensionService:
     """扩展生命周期编排。
 
@@ -166,6 +179,24 @@ class ExtensionService:
         self.permission_change_callback = permission_change_callback
         self._processes: dict[str, ExtensionProcess] = {}
         self._monitor_task: Optional[asyncio.Task] = None
+        self._lifecycle_locks: dict[str, asyncio.Lock] = {}
+        self._lifecycle_owners: dict[str, asyncio.Task[Any]] = {}
+
+    @asynccontextmanager
+    async def _lifecycle(self, extension_id: str):
+        """Serialize one extension's mutations; nested calls share task ownership."""
+        owner = asyncio.current_task()
+        assert owner is not None
+        if self._lifecycle_owners.get(extension_id) is owner:
+            yield
+            return
+        lock = self._lifecycle_locks.setdefault(extension_id, asyncio.Lock())
+        async with lock:
+            self._lifecycle_owners[extension_id] = owner
+            try:
+                yield
+            finally:
+                self._lifecycle_owners.pop(extension_id, None)
 
     # ------------------------------------------------------------------
     # 状态目录与记录
@@ -180,17 +211,28 @@ class ExtensionService:
 
     def get_record(self, extension_id: str) -> Optional[ExtensionRecord]:
         path = self._record_path(extension_id)
-        if not path.is_file():
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
             return None
-        return ExtensionRecord.model_validate_json(
-            path.read_text(encoding="utf-8")
-        )
+        return ExtensionRecord.model_validate_json(raw)
 
     def _save_record(self, record: ExtensionRecord) -> ExtensionRecord:
         record = record.model_copy(update={"updated_at": utcnow()})
         path = self._record_path(record.extension_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(record.model_dump_json(indent=2), encoding="utf-8")
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=path.parent,
+                prefix=".record-", suffix=".json", delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                handle.write(record.model_dump_json(indent=2))
+            temporary.replace(path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
         return record
 
     def list_records(self) -> list[ExtensionRecord]:
@@ -204,6 +246,8 @@ class ExtensionService:
                         path.read_text(encoding="utf-8")
                     )
                 )
+            except FileNotFoundError:
+                continue
             except ValueError:
                 LOG.warning("unreadable extension record: %s", path)
         return records
@@ -413,12 +457,41 @@ class ExtensionService:
         path.unlink()
         return preview
 
-    def install(
+    async def install(
+        self, source: Source, *, preview_id: str = "",
+        confirmations: Optional[list[str]] = None,
+        expected_extension_id: str = "",
+    ) -> ExtensionRecord:
+        """Discover and validate package identity before serialized installation."""
+        extension_id = expected_extension_id or source.extension_id or await run_blocking(
+            self._install_identity, source, preview_id,
+        )
+        async with self._lifecycle(extension_id):
+            return await run_blocking(
+                self._install, source, preview_id=preview_id,
+                confirmations=confirmations, expected_extension_id=extension_id,
+            )
+
+    def _install_identity(self, source: Source, preview_id: str) -> str:
+        if preview_id:
+            path = self.state_root / "_previews" / f"{preview_id}.json"
+            if path.is_file():
+                preview = json.loads(path.read_text(encoding="utf-8"))
+                if preview.get("extension_id"):
+                    return str(preview["extension_id"])
+        installer = ExtensionInstaller(
+            self.install_root, core_version=self.core_version,
+            capabilities=self._available_capabilities(),
+        )
+        return installer.preview(source).manifest.id
+
+    def _install(
         self,
         source: Source,
         *,
         preview_id: str = "",
         confirmations: Optional[list[str]] = None,
+        expected_extension_id: str = "",
     ) -> ExtensionRecord:
         """安装一个来源包：fetch → verify → unpack → validate → 登记。"""
         installer = ExtensionInstaller(
@@ -431,7 +504,7 @@ class ExtensionService:
             candidate = installer.preview(source)
             preview = self._consume_preview(
                 preview_id, candidate, list(confirmations or []))
-        package = installer.install(source)
+        package = installer.install(source, expected_extension_id=expected_extension_id)
         if (preview
                 and (preview.get("verification") or {}).get("content_sha256")
                 != package.verification.get("content_sha256")):
@@ -471,6 +544,7 @@ class ExtensionService:
         })
         return self._save_record(record)
 
+    @_serialized_lifecycle
     async def uninstall(
         self,
         extension_id: str,
@@ -490,6 +564,16 @@ class ExtensionService:
         await self._stop_process(extension_id)
         if self.registration_bridge is not None:
             self.registration_bridge.uninstall(extension_id)
+        return await run_blocking(
+            self._uninstall_files, extension_id, record,
+            preserve_state=preserve_state, preserve_logs=preserve_logs,
+            preserve_artifacts=preserve_artifacts,
+        )
+
+    def _uninstall_files(
+        self, extension_id: str, record: ExtensionRecord, *,
+        preserve_state: bool, preserve_logs: bool, preserve_artifacts: bool,
+    ) -> ExtensionRecord:
         ext_root = self.install_root / extension_id
         if ext_root.is_dir():
             shutil.rmtree(ext_root)
@@ -534,6 +618,7 @@ class ExtensionService:
     # enable / disable
     # ------------------------------------------------------------------
 
+    @_serialized_lifecycle
     async def enable(
         self,
         extension_id: str,
@@ -618,6 +703,7 @@ class ExtensionService:
         self._ensure_monitor()
         return record
 
+    @_serialized_lifecycle
     async def disable(
         self, extension_id: str, *, reason: str = "operator_disabled"
     ) -> ExtensionRecord:
@@ -645,27 +731,30 @@ class ExtensionService:
         restarted: list[str] = []
         stopped: list[str] = []
         for record in self.list_records():
-            if not record.enabled:
-                continue
-            manifest = self.manifest_of(record.extension_id)
-            if old_reference not in manifest.permissions.secrets:
-                continue
-            config = dict(record.config)
-            version = record.active_version
-            await self.disable(record.extension_id, reason="secret_rotated")
-            if new_reference == old_reference:
-                await self.enable(
-                    record.extension_id, version=version, config=config,
-                    allow_rollback=False)
-                restarted.append(record.extension_id)
-            else:
-                stopped.append(record.extension_id)
+            async with self._lifecycle(record.extension_id):
+                record = self.get_record(record.extension_id)
+                if record is None or not record.enabled:
+                    continue
+                manifest = self.manifest_of(record.extension_id)
+                if old_reference not in manifest.permissions.secrets:
+                    continue
+                config = dict(record.config)
+                version = record.active_version
+                await self.disable(record.extension_id, reason="secret_rotated")
+                if new_reference == old_reference:
+                    await self.enable(
+                        record.extension_id, version=version, config=config,
+                        allow_rollback=False)
+                    restarted.append(record.extension_id)
+                else:
+                    stopped.append(record.extension_id)
         return {"restarted": restarted, "stopped": stopped}
 
     # ------------------------------------------------------------------
     # upgrade / rollback / migration
     # ------------------------------------------------------------------
 
+    @_serialized_lifecycle
     async def upgrade(
         self,
         extension_id: str,
@@ -682,10 +771,9 @@ class ExtensionService:
             self.manifest_of(extension_id, previous) if previous else None)
         was_enabled = record.enabled
         effective_config = config if config is not None else record.config
-        record = self.install(
-            source,
-            preview_id=preview_id,
-            confirmations=confirmations,
+        record = await self.install(
+            source, preview_id=preview_id, confirmations=confirmations,
+            expected_extension_id=extension_id,
         )
         target = record.installed_versions[-1]
         if target == previous:
@@ -693,7 +781,7 @@ class ExtensionService:
                 "extension.upgrade_noop",
                 f"upgrade source resolved to the active version {target}",
             )
-        receipt_path = self._migrate_state(extension_id, previous, target)
+        receipt_path = await run_blocking(self._migrate_state, extension_id, previous, target)
         target_manifest = self.manifest_of(extension_id, target)
         if (previous_manifest is not None
                 and previous_manifest.permissions != target_manifest.permissions
@@ -720,10 +808,10 @@ class ExtensionService:
                 )
             except Exception:
                 if not retain_previous:
-                    self._prune_versions(extension_id, target, active=False)
+                    await run_blocking(self._prune_versions, extension_id, target, active=False)
                 raise
         if not retain_previous:
-            result = self._prune_versions(extension_id, target, active=was_enabled)
+            result = await run_blocking(self._prune_versions, extension_id, target, active=was_enabled)
         return result
 
     def _prune_versions(
@@ -760,6 +848,7 @@ class ExtensionService:
             "state": state,
         }))
 
+    @_serialized_lifecycle
     async def rollback(
         self, extension_id: str, *, version: Optional[str] = None
     ) -> ExtensionRecord:
@@ -781,7 +870,7 @@ class ExtensionService:
                 "extension.version_not_installed",
                 f"{extension_id}@{version} is not installed",
             )
-        self._migrate_state(extension_id, current, version)
+        await run_blocking(self._migrate_state, extension_id, current, version)
         # 回滚目标本身启动失败时不再二次回滚，如实落 unavailable
         return await self.enable(
             extension_id, version=version, allow_rollback=False
@@ -882,6 +971,7 @@ class ExtensionService:
         result = await process.health()
         return {"extension_id": extension_id, **result}
 
+    @_serialized_lifecycle
     async def check_health(self, extension_id: str) -> ExtensionRecord:
         """监管健康检查：连续失败达到阈值时自动恢复上一活动版本。"""
         record = self._require_record(extension_id)
@@ -996,21 +1086,22 @@ class ExtensionService:
                 recovered.append(extension_id)
 
         for extension_id, detail in failed.items():
-            record = self.get_record(extension_id)
-            if record is None:
-                continue
-            registry_entries = (
-                self.registration_bridge.disable(extension_id)
-                if self.registration_bridge is not None
-                else record.registry_entries
-            )
-            self._save_record(record.model_copy(update={
-                "enabled": True,
-                "state": ExtensionState.UNAVAILABLE,
-                "health": "unavailable",
-                "last_error": detail,
-                "registry_entries": registry_entries,
-            }))
+            async with self._lifecycle(extension_id):
+                record = self.get_record(extension_id)
+                if record is None:
+                    continue
+                registry_entries = (
+                    self.registration_bridge.disable(extension_id)
+                    if self.registration_bridge is not None
+                    else record.registry_entries
+                )
+                self._save_record(record.model_copy(update={
+                    "enabled": True,
+                    "state": ExtensionState.UNAVAILABLE,
+                    "health": "unavailable",
+                    "last_error": detail,
+                    "registry_entries": registry_entries,
+                }))
         return {
             "requested": sorted(desired),
             "order": order,
@@ -1189,9 +1280,10 @@ class ExtensionService:
                 pass
             self._monitor_task = None
         for extension_id in list(self._processes):
-            if self.registration_bridge is not None:
-                self.registration_bridge.disable(extension_id)
-            await self._stop_process(extension_id)
+            async with self._lifecycle(extension_id):
+                if self.registration_bridge is not None:
+                    self.registration_bridge.disable(extension_id)
+                await self._stop_process(extension_id)
 
 
 __all__ = [

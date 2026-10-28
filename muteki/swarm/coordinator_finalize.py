@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import os
+from pathlib import Path
 import shutil
+import signal
 import subprocess
+import sys
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
@@ -16,6 +20,78 @@ from muteki.swarm.swarm_support import (
     ControlShutdownIncomplete,
     SwarmOutcome,
 )
+
+def _cleanup_run_tmux_and_orphans(tmux_socket: Path) -> None:
+    tmux_bin = shutil.which("tmux")
+    sudo_bin = shutil.which("sudo")
+    sock_str = str(tmux_socket)
+    if tmux_bin:
+        try:
+            subprocess.run(
+                [tmux_bin, "-S", sock_str, "kill-server"],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if tmux_socket.exists() and sudo_bin:
+            try:
+                subprocess.run(
+                    [sudo_bin, "-n", tmux_bin, "-S", sock_str, "kill-server"],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+    proc_root = Path("/proc")
+    marker = f"MUTEKI_TMUX_SOCKET={sock_str}".encode("utf-8", errors="ignore")
+    my_pid = os.getpid()
+    if marker and proc_root.is_dir():
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid <= 1 or pid == my_pid:
+                continue
+            try:
+                env_bytes = (entry / "environ").read_bytes()
+            except OSError:
+                continue
+            if marker not in env_bytes.split(b"\x00"):
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except PermissionError:
+                if sudo_bin:
+                    try:
+                        subprocess.run(
+                            [sudo_bin, "-n", "kill", "-TERM", str(pid)],
+                            capture_output=True,
+                            timeout=3,
+                            check=False,
+                        )
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+            except OSError:
+                pass
+    try:
+        tmux_socket.unlink(missing_ok=True)
+    except PermissionError:
+        if sudo_bin:
+            try:
+                subprocess.run(
+                    [sudo_bin, "-n", "rm", "-f", sock_str],
+                    capture_output=True,
+                    timeout=3,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+    except OSError:
+        pass
+
 
 async def _finalize_coordinator_run(
     self, *, winner: "Optional[str]", flag: "Optional[str]",
@@ -59,18 +135,7 @@ async def _finalize_coordinator_run(
             per_solver.get(winner), flag, worker_id=str(winner or ""))
     tmux_socket = getattr(self, "_ctf_tmux_socket", None)
     if tmux_socket is not None:
-        tmux_bin = shutil.which("tmux")
-        try:
-            if tmux_bin:
-                await asyncio.to_thread(
-                    subprocess.run,
-                    [tmux_bin, "-S", str(tmux_socket), "kill-server"],
-                    capture_output=True,
-                    timeout=5,
-                )
-        except (OSError, subprocess.SubprocessError):
-            pass
-        tmux_socket.unlink(missing_ok=True)
+        await asyncio.to_thread(_cleanup_run_tmux_and_orphans, tmux_socket)
         self._ctf_tmux_socket = None
     pentest_product = getattr(self.challenge, "mode", "ctf") == "pentest"
     if pentest_product:
@@ -120,16 +185,19 @@ async def _finalize_coordinator_run(
                 reason = "goal_met"
             else:
                 reason = "solved" if winner is not None or self._flags_complete() else "goal_met"
+        elif self._budget_exhausted_kind:
+            reason = "budget_exhausted"
         elif self._operator_stop:
             reason = "operator_stop"
         elif getattr(self, "_coverage_exhausted", False):
             reason = "coverage_complete"
-        elif self._budget_exhausted_kind:
-            reason = "budget_exhausted"
-        elif not str(getattr(self, "_runtime_failure_detail", "") or "").strip():
-            reason = "no_progress"
-        else:
+        elif (
+            str(getattr(self, "_runtime_failure_detail", "") or "").strip()
+            or str(getattr(self, "_runtime_failure_code", "") or "").strip()
+        ):
             reason = "runtime_failure"
+        else:
+            reason = "no_progress"
     if pentest_product and self.shared_graph is not None:
         from muteki.pentest.judgement import generate_report
         contract = getattr(self.challenge, "pentest_contract", None)
@@ -349,6 +417,12 @@ async def teardown_coordinator_stage(self, state) -> None:
                 )
             except Exception:
                 pass
+    challenger_task = getattr(self, "_challenger_task", None)
+    if challenger_task is not None:
+        if not challenger_task.done():
+            challenger_task.cancel()
+        await asyncio.gather(challenger_task, return_exceptions=True)
+        self._challenger_task = None
     if "__help__" in self._freeze_suspensions:
         try:
             self._end_operator_help_freeze(
@@ -440,10 +514,40 @@ async def teardown_coordinator_stage(self, state) -> None:
     # M11: if we are leaving via cancel/exception, finalize HERE so the shared
     # graph handle is closed and worker scratch is swept even on the error path
     # (the post-finally finalize below only runs on a clean return). Idempotent.
+    active_exc = sys.exception()
+    if active_exc is not None and not isinstance(
+        active_exc, (asyncio.CancelledError, ControlShutdownIncomplete)
+    ):
+        state.runtime_terminal_failure = True
+        if not str(getattr(self, "_runtime_failure_code", "") or "").strip():
+            self._runtime_failure_code = str(
+                getattr(active_exc, "code", "") or "coordinator_runtime_error"
+            )
+        if not str(getattr(self, "_runtime_failure_phase", "") or "").strip():
+            self._runtime_failure_phase = str(
+                getattr(active_exc, "phase", "") or "coordinator"
+            )
+        if not str(getattr(self, "_runtime_failure_detail", "") or "").strip():
+            self._runtime_failure_detail = (
+                f"{type(active_exc).__name__}: {active_exc}"
+            )
+    elif state.runtime_terminal_failure and not str(
+        getattr(self, "_runtime_failure_detail", "") or ""
+    ).strip():
+        self._runtime_failure_code = (
+            str(getattr(self, "_runtime_failure_code", "") or "").strip()
+            or "runtime_failure"
+        )
+        self._runtime_failure_detail = (
+            "Coordinator exited due to a runtime terminal failure"
+        )
     try:
         await self._finalize_coordinator_run(
             winner=state.winner, flag=state.flag, goal_complete=state.goal_complete,
-            per_solver=state.per_solver)
+            per_solver=state.per_solver,
+            terminal_reason=(
+                "runtime_failure" if state.runtime_terminal_failure else ""
+            ))
     except Exception:
         pass
 
@@ -467,5 +571,11 @@ async def coordinator_outcome(self, state) -> SwarmOutcome:
     if self._budget_exhausted_kind:
         return SwarmOutcome(False, None, None, state.per_solver,
                             "budget_exhausted")
+    if (
+        state.runtime_terminal_failure
+        or str(getattr(self, "_runtime_failure_detail", "") or "").strip()
+        or str(getattr(self, "_runtime_failure_code", "") or "").strip()
+    ):
+        return SwarmOutcome(False, None, None, state.per_solver, "runtime_failure")
     return SwarmOutcome(False, None, None, state.per_solver,
                         "coordinator: no verified flag")

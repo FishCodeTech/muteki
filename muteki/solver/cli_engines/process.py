@@ -12,6 +12,7 @@ from typing import Callable, Optional
 from muteki.solver.cli_engines.base import CliDriver
 from muteki.solver.cli_engines.types import CliResult, StreamStep, finalize_cli_result
 from muteki.solver.cli_launch_check import LaunchContractError, check_process_launch
+from muteki.solver.worker_resource_limits import resolve_worker_resource_limits
 
 def _local_process_table() -> "dict[int, tuple[int, int, str]]":
     """Return pid -> (ppid, pgid, start identity) for local process ownership.
@@ -564,6 +565,11 @@ def run_cli_streaming(
     run_env["PWD"] = os.path.abspath(cwd)
     check_process_launch(
         argv, cwd=cwd, env=run_env, stdin_text=stdin_text, source="host-stream")
+    host_output_budget = int(
+        resolve_worker_resource_limits(
+            output_limit=run_env.get("MUTEKI_WORKER_OUTPUT_LIMIT") or None,
+        ).output_limit_bytes
+    )
     # start_new_session=True puts the worker (and every descendant — the CLI agent
     # spawns curl/python/sh helpers) in its OWN process group. Killing just the
     # parent leaves a `sleep`/`curl` child holding the stdout pipe open, so the read
@@ -712,12 +718,38 @@ def run_cli_streaming(
     err_lines: list[str] = []
     parser_errors: list[str] = []
     stream_error = ""
+    output_limit = False
+    captured_bytes = 0
+    stream_lock = threading.Lock()
+
+    def _append_bounded(target: list[str], chunk: str) -> tuple[bool, bool]:
+        nonlocal captured_bytes, output_limit
+        raw = chunk.encode("utf-8", errors="replace")
+        with stream_lock:
+            available = max(0, host_output_budget - captured_bytes)
+            kept = raw[:available]
+            captured_bytes += len(kept)
+            if kept:
+                target.append(kept.decode("utf-8", errors="replace"))
+            within_budget = len(raw) <= available
+            first_exceed = not within_budget and not output_limit
+            if first_exceed:
+                output_limit = True
+        return within_budget, first_exceed
+
+    _STREAM_READ_CHARS = 65536
 
     def _drain_stderr() -> None:
         try:
             assert proc.stderr is not None
-            for err_line in proc.stderr:
-                err_lines.append(err_line)
+            while True:
+                err_chunk = proc.stderr.readline(_STREAM_READ_CHARS)
+                if not err_chunk:
+                    break
+                _, first_exceed = _append_bounded(err_lines, err_chunk)
+                if first_exceed:
+                    _kill_proc_tree(proc, pgid=proc_pgid)
+                    break
         except Exception:
             pass
 
@@ -726,8 +758,29 @@ def run_cli_streaming(
     stderr_thread.start()
     try:
         assert proc.stdout is not None
-        for line in proc.stdout:
-            out_lines.append(line)
+        pending_line_parts: list[str] = []
+        while True:
+            chunk = proc.stdout.readline(_STREAM_READ_CHARS)
+            if not chunk:
+                if pending_line_parts:
+                    tail_line = "".join(pending_line_parts)
+                    pending_line_parts.clear()
+                    try:
+                        steps = driver.parse_stream_steps(tail_line)
+                    except Exception as exc:  # noqa: BLE001
+                        steps = []
+                        parser_errors.append(
+                            f"stream parser failed: {type(exc).__name__}: {exc}")
+                    for step in steps:
+                        try:
+                            on_step(step)
+                        except Exception:
+                            pass
+                break
+            within_budget, first_exceed = _append_bounded(out_lines, chunk)
+            if first_exceed or not within_budget:
+                _kill_proc_tree(proc, pgid=proc_pgid)
+                break
             if cancel_event is not None and cancel_event.is_set():
                 cancelled = True
                 _kill_proc_tree(proc, pgid=proc_pgid)
@@ -740,6 +793,11 @@ def run_cli_streaming(
                 _kill_proc_tree(proc, pgid=proc_pgid)
                 timed_out = True
                 break
+            if not chunk.endswith("\n"):
+                pending_line_parts.append(chunk)
+                continue
+            line = "".join([*pending_line_parts, chunk]) if pending_line_parts else chunk
+            pending_line_parts.clear()
             try:
                 steps = driver.parse_stream_steps(line)  # #18: ALL blocks, not just first
             except Exception as exc:  # noqa: BLE001
@@ -790,8 +848,11 @@ def run_cli_streaming(
     # sealed is UNKNOWN, never a successful unaccounted observation.
     if on_raw_streams is not None:
         on_raw_streams(stdout, stderr)
+    if output_limit:
+        timed_out = False
     res = driver.parse(stdout, stderr or "")
     res.timed_out = timed_out
+    res.output_limit = output_limit
     res.cancelled = cancelled
     res.steered = steered
     finalize_cli_result(

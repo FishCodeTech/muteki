@@ -227,7 +227,12 @@ class LLMClient:
         metered = {**(usage or {}), "source": "http"}
         if model in PRICES and "prompt_tokens" in usage and "completion_tokens" in usage:
             metered["estimated_cost"] = PRICES[model].cost(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
-        record_context(metered, model=model)
+        # Public price selectors only; never carry endpoint URLs or credentials.
+        identity = {
+            key: str(value) for key, value in getattr(self, "usage_identity", {}).items()
+            if key in {"engine", "credential_id", "provider_id", "speed"} and value
+        }
+        record_context(metered, model=model, **identity)
         if self.cost is not None and run_id is not None:
             await self.cost.record(
                 model=model,
@@ -237,7 +242,7 @@ class LLMClient:
                 challenge_id=challenge_id,
                 solver_id=solver_id,
                 usage=metered, usage_id=request_identity.get(),
-                generation=getattr(self, "usage_generation", None),
+                generation=getattr(self, "usage_generation", None), **identity,
             )
 
     async def chat(

@@ -322,6 +322,7 @@ class CompetitionStore:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self._transaction_depth = 0
+        self._transaction_owner: int | None = None
         cur = self._conn.cursor()
         # 新建库从一开始启用增量回收；已有库会在运维 VACUUM 后采用该模式。
         # 这样后续清理历史事件时可以归还空页，不再永久保留峰值文件体积。
@@ -346,6 +347,7 @@ class CompetitionStore:
                 self._conn.execute(f"SAVEPOINT {savepoint}")
             else:
                 self._conn.execute("BEGIN IMMEDIATE")
+                self._transaction_owner = threading.get_ident()
             self._transaction_depth += 1
             try:
                 yield
@@ -371,6 +373,29 @@ class CompetitionStore:
                     raise
             finally:
                 self._transaction_depth -= 1
+                if not self._transaction_depth:
+                    self._transaction_owner = None
+
+    @contextmanager
+    def read_snapshot(self):
+        """Read a consistent file snapshot without holding the writer lock.
+
+        Private in-memory databases and reads inside this thread's active
+        transaction must reuse the existing connection to see its contents.
+        """
+        if self.db_path == ":memory:" or self._transaction_owner == threading.get_ident():
+            with self._lock:
+                yield self._conn
+            return
+        uri = Path(self.db_path).resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("BEGIN")
+            yield conn
+        finally:
+            conn.close()
 
     def save_effect_result(self, command_id: str, payload: dict[str, Any]) -> None:
         with self.transaction():
@@ -493,7 +518,8 @@ class CompetitionStore:
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY created_at, rowid"
-        rows = self._conn.execute(sql, values).fetchall()
+        with self.read_snapshot() as conn:
+            rows = conn.execute(sql, values).fetchall()
         return [model_cls.model_validate_json(row["payload"]) for row in rows]
 
     # -- 领域查询助手（Command Handler / Reconciler 使用） ---------------------

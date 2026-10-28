@@ -32,6 +32,7 @@ so the scheduler and drivers need no change.
 from __future__ import annotations
 
 import hashlib
+import re as _re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -40,7 +41,6 @@ from muteki.solver.worker_profiles import (
     DEFAULT_ROLES,
     base_engine_for_profile,
     coerce_nonneg_int,
-    coerce_pos_int,
     normalize_reasoning_effort,
 )
 from muteki.solver.credential_accounts import (
@@ -66,8 +66,6 @@ _MODE_TO_KIND: dict[str, str] = {
     "custom_endpoint": "custom_endpoint",
 }
 
-
-import re as _re
 
 # a well-formed new id: seat_<engine>_<6hex> / cred_<engine>_<6hex>. Used to make
 # migration IDEMPOTENT — re-migrating an already-migrated config (the v2 frontend
@@ -306,7 +304,7 @@ def migrate_legacy_config(
                 p.get("reasoning_effort"), "default"),
             roles=roles,
             race=bool(p.get("race", "race" in roles)),
-            max_running=coerce_pos_int(p.get("max_running", cap.get("max_running")), 1),
+            max_running=coerce_nonneg_int(p.get("max_running", cap.get("max_running")), 1),
             max_review_running=coerce_nonneg_int(p.get("max_review_running", cap.get("max_review_running")), 0),
             priority=coerce_nonneg_int(p.get("priority"), 100),
             enabled=bool(p.get("enabled", True)),
@@ -401,7 +399,7 @@ def seat_to_legacy_profile(
         "wire_api": wire_api or ("responses" if engine == "codex" and base_url else ""),
         "roles": roles,
         "race": bool(seat.get("race", "race" in roles)),
-        "max_running": coerce_pos_int(seat.get("max_running", cap.get("max_running")), 1),
+        "max_running": coerce_nonneg_int(seat.get("max_running", cap.get("max_running")), 1),
         "max_review_running": coerce_nonneg_int(seat.get("max_review_running", cap.get("max_review_running")), 0),
         "priority": coerce_nonneg_int(seat.get("priority"), 100),
         "model": str(seat.get("model") or "").strip(),

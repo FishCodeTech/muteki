@@ -35,6 +35,8 @@ export function reduce(prev: DeckState, ev: MutekiEvent): DeckState {
     reason: { ...prev.reason },
     blackboard: {
       ...prev.blackboard,
+      challenger: prev.blackboard.challenger ?? { status: "idle" },
+      subGoals: orEmpty(prev.blackboard.subGoals),
       observations: orEmpty(prev.blackboard.observations),
       capabilities: orEmpty(prev.blackboard.capabilities),
       accessPaths: orEmpty(prev.blackboard.accessPaths),

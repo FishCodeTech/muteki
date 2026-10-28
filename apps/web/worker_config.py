@@ -22,7 +22,7 @@ from typing import Any, Optional
 from urllib.parse import urlsplit
 
 from muteki.core.llm import normalize_llm_temperature
-from muteki.core.runtime_env import is_web_container
+from muteki.core.runtime_env import is_web_container, worker_container_mode
 from muteki.solver.credential_accounts import CredentialAccountLockTimeoutError
 from muteki.solver.shared_credentials import SharedCredentialError
 from muteki.solver.engine_registry import canonical_engine_id
@@ -135,11 +135,18 @@ def resolve_worker_backend(
       - `container_dockerexec` is the CONTAINER transport selector; it still means
         "container" for the backend choice, so normalize it.
       - anything not in VALID_BACKENDS falls back to `local`.
-      - WEB-CONTAINER OVERRIDE (always applied, NOT optional): when this process
-        runs inside a container, `local` would spawn a host-native CLI inside the
-        web container (no tools, wrong creds). Force `container`. The override is
-        unconditional precisely so settings and dispatch are identical.
+      - A sibling web container always uses separate Worker containers.
+      - An explicit single-container deployment uses local subprocesses. Stale
+        settings are projected to local, but an explicit request for a separate
+        container is rejected, including a saved Run isolation policy.
     """
+    container_mode = worker_container_mode()
+    if in_web_container and container_mode == "single":
+        if request_backend not in (None, "", "local"):
+            raise ValueError(
+                "MUTEKI_CONTAINER_MODE=single requires worker_backend 'local'; "
+                "a separate Worker container cannot be requested")
+        return "local"
     backend = request_backend or config_backend or env_backend or default_backend
     if backend == "container_dockerexec":
         backend = "container"
@@ -931,7 +938,7 @@ class WorkerConfigStore:
         }
 
     def get(self) -> dict[str, Any]:
-        """The current default config with everything filled in (never raises)."""
+        """Fill config defaults and validate the container deployment selection."""
         d = self._data
         worker_profiles = self._hydrate_profiles_from_accounts(
             self._clean_worker_profiles(d.get("worker_profiles"))
@@ -2089,8 +2096,7 @@ class WorkerConfigStore:
     @staticmethod
     def _clean_backend(value: Any) -> str:
         # Single source of truth for the effective backend (precedence + alias +
-        # fallback + the web-container override that coerces local→container so a
-        # stale/explicit "local" never reaches the swarm). No-op on a bare host.
+        # fallback + the explicit container deployment). No-op on a bare host.
         return resolve_worker_backend(
             config_backend=value if isinstance(value, str) else None,
             in_web_container=is_web_container(),
@@ -2098,11 +2104,14 @@ class WorkerConfigStore:
 
     @staticmethod
     def _require_backend(value: Any) -> str:
+        container_mode = worker_container_mode()
         if isinstance(value, str) and value in VALID_BACKENDS:
-            if value == "local" and is_web_container():
-                raise ValueError(
-                    "worker_backend 'local' is not allowed when the web control "
-                    "plane runs inside a container — use 'container'")
+            if is_web_container():
+                required = "local" if container_mode == "single" else "container"
+                if value != required:
+                    raise ValueError(
+                        f"worker_backend must be '{required}' for "
+                        f"MUTEKI_CONTAINER_MODE={container_mode}")
             return value
         raise ValueError("worker_backend must be local or container")
 

@@ -141,6 +141,7 @@ class Run:
     # Lazily-created per-run control plane. Its journal and SecretStore live under
     # RunManager.control_root, which is coordinator-private and deliberately outside
     # every bind-mounted worker workspace. The actor is the sole async writer/router.
+    control_initialization_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     control_actor: Optional[ControlActor] = None
     control_journal: Optional[SQLiteControlJournal] = None
     control_secrets: Optional[SecretStore] = None

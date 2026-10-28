@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useId, useRef, useState } from "react";
 import type { ConversationView } from "@/lib/useConversation";
 import { cn } from "@/lib/cn";
 import { useT } from "@/lib/i18n";
@@ -15,6 +15,7 @@ import { sendSidebarCommand, useSidebarThreadState } from "@/lib/sidebarThreadBr
 import { Icon, type IconName } from "../Icon";
 import { SnoozeDialog } from "@/components/chat/sidebar/SnoozeDialog";
 import { ThreadGitActions } from "./ThreadGitActions";
+import { ConversationRouteLink } from "./ConversationNavigation";
 import {
   Badge,
   Button,
@@ -125,6 +126,7 @@ function TitleEditor({
   const [value, setValue] = useState(initial);
   const settledRef = useRef(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const titleInputId = useId();
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -148,9 +150,9 @@ function TitleEditor({
         commit(true);
       }}
     >
-      <label className="sr-only" htmlFor="conversation-title-input">对话标题</label>
+      <label className="sr-only" htmlFor={titleInputId}>对话标题</label>
       <input
-        id="conversation-title-input"
+        id={titleInputId}
         ref={inputRef}
         value={value}
         maxLength={200}
@@ -212,7 +214,7 @@ export function ConversationHeader({
   const threadId = view?.thread.thread_id;
   const projectId = view?.thread.project_id || view?.workspace?.project_id || undefined;
   const git = useSharedGitStatus(threadId, projectId || undefined);
-  const inbox = useSidebarThreadState(threadId);
+  const sidebarState = useSidebarThreadState(threadId);
 
   useEffect(() => {
     setEditing(false);
@@ -230,6 +232,11 @@ export function ConversationHeader({
     loading: git.loading,
   });
   const projectLabel = projectName?.trim() || (view.thread.project_id ? "未知项目" : "");
+  // A subagent Thread leads back to the conversation that delegated it.
+  const parentId = (view.lineage ?? view.state.lineage)?.parent_thread_id || "";
+  const parentTitle = view.lineage?.parent_title || "父会话";
+  // Its root conversation's row stands in the list, so list placement belongs there.
+  const inbox = parentId ? undefined : sidebarState;
   const rootPath = view.workspace?.root_path || "";
   const legacyDock = panelControls === undefined;
   const outputLabel = outputCardOpen ? "关闭任务输出" : "打开任务输出";
@@ -256,7 +263,22 @@ export function ConversationHeader({
     >
       {sidebarToggle ? <div className="-ml-1 flex flex-none items-center">{sidebarToggle}</div> : null}
       <div className="flex min-w-0 flex-1 items-center gap-1">
-        {!editing && projectLabel ? (
+        {!editing && parentId ? (
+          <nav aria-label="对话位置" className="flex min-w-0 flex-none items-center gap-1">
+            <Tooltip content={`返回父会话「${parentTitle}」`} placement="bottom">
+              <ConversationRouteLink
+                href={`/chat/${encodeURIComponent(parentId)}`}
+                aria-label={`返回父会话：${parentTitle}`}
+                data-testid="conversation-parent-link"
+                className="cx-press flex h-7 max-w-[200px] items-center gap-1.5 rounded-md px-1.5 text-[13px] text-cx-fg-3 no-underline outline-none hover:bg-cx-hover hover:text-cx-fg focus-visible:outline-2 focus-visible:outline-[var(--cx-focus)]"
+              >
+                <Icon name="arrowLeft" size={13} className="shrink-0" />
+                <span className="hidden truncate @[520px]/header:inline">{parentTitle}</span>
+              </ConversationRouteLink>
+            </Tooltip>
+            <span aria-hidden="true" className="text-[13px] text-cx-fg-4">/</span>
+          </nav>
+        ) : !editing && projectLabel ? (
           <nav aria-label="对话位置" className="hidden min-w-0 flex-none items-center gap-1 @[520px]/header:flex">
             <Tooltip content={projectId ? `侧栏只看「${projectLabel}」，再次点击显示全部` : projectLabel} placement="bottom">
               <button
@@ -395,6 +417,12 @@ export function ConversationHeader({
             <Icon name={workspace.icon} size={12} className="shrink-0" />
             <Chip title={workspace.title}>{workspace.label}</Chip>
           </div>
+        ) : null}
+
+        {!editing && parentId ? (
+          <span className="ml-1 hidden flex-none @[420px]/header:inline-flex" title="由父会话委派的子代理会话">
+            <Badge tone="neutral" icon="bot">子代理</Badge>
+          </span>
         ) : null}
 
         {!editing && (isArchived || status.running || status.tone === "danger" || ["已中断", "已取消"].includes(status.label)) ? (

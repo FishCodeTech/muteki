@@ -9,6 +9,7 @@ export function capabilityIcon(kind: string, id = ""): IconName {
     if (id.startsWith("component:computer-use:app:")) return "mousePointer";
     if (id.startsWith("component:computer-use")) return "monitor";
     if (id.startsWith("component:browser")) return "globe";
+    if (id === "component:orchestrate") return "layers";
     return "board";
   }
   if (kind === "skill") return "sparkles";
@@ -81,6 +82,15 @@ export function refStatusTone(status?: string): RefStatusTone {
   if (status === "stale") return "stale";
   if (status === "missing" || status === "forbidden") return "missing";
   return "ok";
+}
+
+export function capabilityStatusLabel(status?: string): string {
+  // runtime_reported is the normal state of a runtime-listed MCP; its description carries the runtime's report.
+  if (!status || status === "available" || status === "runtime_reported") return "";
+  if (status === "unavailable") return "暂不可用";
+  if (status === "requested") return "待确认";
+  if (status === "failed") return "未连接";
+  return status;
 }
 
 export function refStatusLabel(status?: string): string {

@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional, Protocol, Sequence, runtime_checkable
 
+from muteki.core.blocking import run_blocking
 from muteki.control.admission import AdmissionError, ControlAdmission
 from muteki.control.models import (
     ApplyResult,
@@ -284,7 +285,7 @@ class ControlActor:
 
     async def _process(self, envelope: _Envelope) -> None:
         command = envelope.command
-        appended = self.journal.append_command(command)
+        appended = await run_blocking(self.journal.append_command, command)
         if not appended.inserted:
             # Exactly-once boundary: an existing command is observational only.
             # If the prior process crashed after RECEIVED/PERSISTED/ROUTED, we can
@@ -293,12 +294,12 @@ class ControlActor:
             # it were final: close the audit trail with an explicit UNKNOWN recovery.
             latest = appended.latest_receipt
             if not latest.state.terminal:
-                latest = self.journal.append_effect(EffectReceipt(
+                latest = await run_blocking(self.journal.append_effect, EffectReceipt(
                     command_id=command.command_id,
                     run_id=self.run_id,
                     state=EffectState.UNKNOWN,
                     scope=command.scope,
-                    observed_generation=self.journal.current_state().generation,
+                    observed_generation=(await run_blocking(self.journal.current_state)).generation,
                     detail=("recovered an incomplete command after "
                             f"{latest.state.value}; command was not re-executed"),
                     metadata={
@@ -325,11 +326,11 @@ class ControlActor:
             self._set_result(envelope.terminal, latest)
             return
 
-        current = self.journal.current_state()
+        current = await run_blocking(self.journal.current_state)
         try:
             decision = self.admission.admit(command, current)
         except AdmissionError as exc:
-            rejected = self.journal.append_effect(EffectReceipt(
+            rejected = await run_blocking(self.journal.append_effect, EffectReceipt(
                 command_id=command.command_id,
                 run_id=self.run_id,
                 state=EffectState.REJECTED,
@@ -352,7 +353,7 @@ class ControlActor:
         # SQLite transaction. A process crash after PERSISTED can therefore never
         # strand a context/decision/expiration behind an exactly-once command id.
         try:
-            companion = self._plan_durable_companion(command, targets)
+            companion = await run_blocking(self._plan_durable_companion, command, targets)
             persisted_metadata = dict(companion.metadata)
             if command.action in {
                     ControlAction.CLEAR_STANDING,
@@ -361,7 +362,8 @@ class ControlActor:
             }:
                 persisted_metadata["expired_context_count"] = len(
                     companion.expiration_context_ids)
-            persisted, expired_count = self.journal.append_persisted_with_companion(
+            persisted, expired_count = await run_blocking(
+                self.journal.append_persisted_with_companion,
                 EffectReceipt(
                     command_id=command.command_id,
                     run_id=self.run_id,
@@ -385,7 +387,7 @@ class ControlActor:
             }):
                 companion_metadata["expired_context_count"] = expired_count
         except Exception as exc:
-            failed = self.journal.append_effect(EffectReceipt(
+            failed = await run_blocking(self.journal.append_effect, EffectReceipt(
                 command_id=command.command_id,
                 run_id=self.run_id,
                 state=EffectState.FAILED,
@@ -414,9 +416,9 @@ class ControlActor:
                 reason=f"operator action {command.action.value}",
                 updated_at=time.time(),
             )
-            self.journal.append_state(desired)
+            await run_blocking(self.journal.append_state, desired)
 
-        routed = self.journal.append_effect(EffectReceipt(
+        routed = await run_blocking(self.journal.append_effect, EffectReceipt(
             command_id=command.command_id,
             run_id=self.run_id,
             state=EffectState.ROUTED,
@@ -459,7 +461,7 @@ class ControlActor:
                 detail=f"runtime adapter failed: {type(exc).__name__}",
                 metadata={**companion_metadata, "code": "adapter_failure"},
             )
-        terminal = self.journal.append_effect(receipt)
+        terminal = await run_blocking(self.journal.append_effect, receipt)
         await self._emit(terminal)
         self._set_result(envelope.terminal, terminal)
 

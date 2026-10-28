@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import tempfile
+from pathlib import Path
 from typing import Any
 
 from fastapi import (
@@ -210,6 +212,7 @@ def register(app: FastAPI) -> None:
                 provider=provider or None,
                 target_model=model,
                 models=[model],
+                model_capabilities=body.get("model_capabilities"),
             )
         except SharedCredentialError:
             raise
@@ -355,6 +358,93 @@ def register(app: FastAPI) -> None:
             ok=bool(result.get("ok")),
         )
         return {**result, "credential_id": stable_id, "last_test": last_test}
+
+    @app.post("/api/settings/credential-drafts/test")
+    async def test_credential_draft(request: Request) -> Any:
+        """Run the real model turn for a credential that is not saved yet.
+
+        The draft lives in a throwaway account store for the duration of the
+        probe: nothing is written to the real store or published to the shared
+        vault, so a failed draft leaves no trace.
+        """
+        body = await _require_dict_body(request)
+        _reject_temporarily_disabled_engine(body)
+        engine = str(body.get("engine") or "").strip().lower()
+        ensure_engine_supported(engine)
+        connection = str(body.get("connection") or "").strip().lower()
+        if connection not in {"official", "custom_endpoint"}:
+            raise HTTPException(status_code=400, detail="connection must be official or custom_endpoint")
+        base_url = str(body.get("base_url") or "").strip()
+        if connection == "custom_endpoint" and not base_url:
+            raise HTTPException(status_code=400, detail="自定义端点必须填写 Base URL")
+        model = str(body.get("model") or "").strip()
+        if not model:
+            raise HTTPException(status_code=400, detail="请选择一个模型后执行真实测试")
+        secret = str(body.get("secret") or "").strip()
+        auth_json = str(body.get("codex_auth_json") or "").strip()
+        if not (secret or auth_json):
+            raise HTTPException(status_code=400, detail="请填写凭据后再测试")
+        custom = connection == "custom_endpoint"
+        provider = str(body.get("provider") or "").strip()
+        draft_id = "draft-test"
+        from apps.web.worker_config import resolve_worker_backend
+        from muteki.core.runtime_env import is_web_container
+
+        cfg = app.state.manager.worker_config.get()
+        try:
+            backend = resolve_worker_backend(
+                request_backend=body.get("backend"),
+                config_backend=cfg.get("worker_backend"),
+                in_web_container=is_web_container(),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        network = str(cfg.get("worker_network") or "bridge")
+
+        def run() -> dict[str, Any]:
+            from apps.web.worker_models import probe_worker_model
+
+            tmp_base = None
+            if backend == "container":
+                tmp_base = Path(app.state.manager.state_root) / "_tmp" / "credential-drafts"
+                tmp_base.mkdir(parents=True, exist_ok=True)
+            # The container probe copies this account into its shared-data
+            # projection and translates that mount path for the host daemon.
+            with tempfile.TemporaryDirectory(prefix="muteki-credential-draft-", dir=tmp_base) as root:
+                store = CredentialAccountStore(account_store_root(root))
+                store.upsert_secret(
+                    account_id=draft_id,
+                    engine="api" if custom else engine,
+                    create_only=True,
+                    publish=False,
+                    secret=secret or None,
+                    codex_auth_json=auth_json or None,
+                    base_url=base_url,
+                    target_engine=engine if custom else None,
+                    provider=provider or None,
+                    target_model=model,
+                    models=[model],
+                )
+                details = dict((store.inspect(draft_id).details or {}))
+                return probe_worker_model(
+                    profile={
+                        "id": f"account:{draft_id}", "name": draft_id, "engine": engine,
+                        "credential_id": f"account:{draft_id}",
+                        "credential_account": draft_id,
+                        "credential_mode": "api_key" if details.get("api_key_file") else "subscription",
+                        "base_url": str(details.get("base_url_value") or ""),
+                        "model": model, "enabled": True,
+                    },
+                    model=model,
+                    sessions_root=root,
+                    backend=backend,
+                    runtime={"network": network},
+                )
+
+        try:
+            return await asyncio.to_thread(run)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/settings/credentials/{credential_id}/models/refresh")
     async def refresh_credential_models(credential_id: str, request: Request) -> Any:
@@ -507,6 +597,7 @@ def register(app: FastAPI) -> None:
                     else body.get("model")
                 ),
                 models=body.get("models"),
+                model_capabilities=body.get("model_capabilities"),
                 clear_base_url=connection == "official",
             )
         except FileExistsError as exc:

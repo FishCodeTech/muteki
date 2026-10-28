@@ -6,6 +6,7 @@ import asyncio
 import logging
 from typing import Any, Optional
 
+from muteki.core.blocking import run_blocking
 from muteki.control import SQLiteControlJournal
 from apps.web.run_state import Run
 
@@ -43,50 +44,58 @@ async def apply_standby_control(
                      else {})
         expired_context_count = int(
             companion.get("expired_context_count") or 0)
-        graph = None
         if graph_db.exists():
-            try:
-                from muteki.models.solve_graph import Challenge
-                from muteki.swarm.shared_graph import SQLiteSharedGraph
-                graph = SQLiteSharedGraph.open(
-                    db_path=graph_db,
-                    challenge=Challenge(
-                        id=run.run_id,
-                        name=run.name or run.run_id,
-                        category=run.category or "web",
-                    ),
-                )
-                source_command_id = str(
-                    wire.get("command_id") or "").strip()
-                matched_source_ids = sorted({
-                    str(value or "").strip()
-                    for value in (
-                        companion.get("matched_source_command_ids") or [])
-                    if str(value or "").strip()
-                })
-                if source_command_id:
-                    clear_result = graph.apply_standing_clear(
-                        command_id=source_command_id,
-                        actor="operator",
-                        text=("" if exact_text.startswith("secret://")
-                              else exact_text),
-                        eligible_command_ids=(
-                            matched_source_ids if exact_text else None),
-                        match_by_source_ids=exact_text.startswith(
-                            "secret://"),
+            def expire_graph() -> list[str]:
+                graph = None
+                try:
+                    from muteki.models.solve_graph import Challenge
+                    from muteki.swarm.shared_graph import SQLiteSharedGraph
+                    graph = SQLiteSharedGraph.open(
+                        db_path=graph_db,
+                        challenge=Challenge(
+                            id=run.run_id,
+                            name=run.name or run.run_id,
+                            category=run.category or "web",
+                        ),
                     )
-                    expired_directives = list(
-                        clear_result.get("expired_directives") or [])
-                else:
-                    expired_directives = graph.expire_standing_directives(
-                        actor="operator", text=exact_text)
-                remaining = [
-                    row for row in graph.operator_directives(active_only=True)
-                    if row.get("standing")
-                    and (not exact_text or row.get("text") == exact_text)
-                ]
-                if remaining:
-                    raise RuntimeError("standing directive remained active")
+                    source_command_id = str(
+                        wire.get("command_id") or "").strip()
+                    matched_source_ids = sorted({
+                        str(value or "").strip()
+                        for value in (
+                            companion.get("matched_source_command_ids") or [])
+                        if str(value or "").strip()
+                    })
+                    if source_command_id:
+                        clear_result = graph.apply_standing_clear(
+                            command_id=source_command_id,
+                            actor="operator",
+                            text=("" if exact_text.startswith("secret://")
+                                  else exact_text),
+                            eligible_command_ids=(
+                                matched_source_ids if exact_text else None),
+                            match_by_source_ids=exact_text.startswith(
+                                "secret://"),
+                        )
+                        expired_directives = list(
+                            clear_result.get("expired_directives") or [])
+                    else:
+                        expired_directives = graph.expire_standing_directives(
+                            actor="operator", text=exact_text)
+                    remaining = [
+                        row for row in graph.operator_directives(active_only=True)
+                        if row.get("standing")
+                        and (not exact_text or row.get("text") == exact_text)
+                    ]
+                    if remaining:
+                        raise RuntimeError("standing directive remained active")
+                    return expired_directives
+                finally:
+                    if graph is not None:
+                        graph.close()
+
+            try:
+                expired_directives = await run_blocking(expire_graph)
             except Exception:
                 return {
                     "state": ("partial" if expired_context_count else "failed"),
@@ -97,9 +106,6 @@ async def apply_standby_control(
                         "expired_context_count": expired_context_count,
                     },
                 }
-            finally:
-                if graph is not None:
-                    graph.close()
         remaining_context = [
             resource for resource in journal.context_resources(active_only=True)
             if resource.standing
@@ -152,20 +158,28 @@ async def apply_standby_control(
                 "target_ids": [],
                 "metadata": {"code": "flag_graph_unavailable"},
             }
-        graph = None
+        def invalidate_graph() -> dict[str, Any]:
+            graph = None
+            try:
+                from muteki.models.solve_graph import Challenge
+                from muteki.swarm.shared_graph import SQLiteSharedGraph
+                graph = SQLiteSharedGraph.open(
+                    db_path=graph_db,
+                    challenge=Challenge(
+                        id=run.run_id,
+                        name=run.name or run.run_id,
+                        category=run.category or "web",
+                    ),
+                )
+                info = graph.reopen_after_false_positive(
+                    actor="operator", flag=flag)
+                return info
+            finally:
+                if graph is not None:
+                    graph.close()
+
         try:
-            from muteki.models.solve_graph import Challenge
-            from muteki.swarm.shared_graph import SQLiteSharedGraph
-            graph = SQLiteSharedGraph.open(
-                db_path=graph_db,
-                challenge=Challenge(
-                    id=run.run_id,
-                    name=run.name or run.run_id,
-                    category=run.category or "web",
-                ),
-            )
-            info = graph.reopen_after_false_positive(
-                actor="operator", flag=flag)
+            info = await run_blocking(invalidate_graph)
         except Exception:
             return {
                 "state": "failed",
@@ -173,9 +187,6 @@ async def apply_standby_control(
                 "target_ids": [],
                 "metadata": {"code": "flag_invalidation_failed"},
             }
-        finally:
-            if graph is not None:
-                graph.close()
 
         run.invalidate_flag(flag)
         try:
@@ -307,7 +318,7 @@ async def apply_standby_control(
     from apps.web.run_recovery import WorkerRuntimePolicyUnavailable
     policy_error = None
     try:
-        accepted = self._ensure_standby(run.run_id, runtime_wire)
+        accepted = await self._ensure_standby(run.run_id, runtime_wire)
     except WorkerRuntimePolicyUnavailable as exc:
         accepted = False
         policy_error = exc

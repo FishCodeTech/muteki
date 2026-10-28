@@ -1,4 +1,5 @@
 "use client";
+import { priceKey, priceLabel, useModelPrices } from "@/lib/modelPricing";
 
 import { ConversationRouteLink } from "@/components/conversation/ConversationNavigation";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -831,6 +832,8 @@ function CredentialBindingEditor({
     return [...byId.values()];
   }, [model, selectedCredential?.candidate_models, selectedCredential?.default_model, selectedCredential?.models]);
 
+  const pricing = useModelPrices(modelDirectory.filter(row => row.id).map(row => ({ engine, model: row.id, credential_id: selectedCredential?.id, provider_id: selectedCredential?.provider })));
+  const modelPriceLabel = (id: string) => priceLabel(pricing.values.get(priceKey({ engine, model: id, credential_id: selectedCredential?.id, provider_id: selectedCredential?.provider })), pricing.error, pricing.loading);
   const chooseCredential = (credentialId: string) => {
     const next = availableCredentials.find((item) => item.id === credentialId);
     if (!globalCredentialUsable(next)) {
@@ -900,7 +903,7 @@ function CredentialBindingEditor({
               <ListBox renderEmptyState={() => "没有匹配的模型"}>
                 {(item: { id: string; label: string }) => (
                   <ListBoxItem id={item.id || "__runtime_default__"} textValue={item.id || item.label}>
-                    <span className="wbinding-model-option"><strong>{item.id || item.label}</strong>{item.id && <small>{item.label}</small>}</span>
+                    <span className="wbinding-model-option"><strong>{item.id || item.label}</strong>{item.id && <small>{item.label} · {modelPriceLabel(item.id)}</small>}</span>
                     <ListBoxItem.Indicator />
                   </ListBoxItem>
                 )}
@@ -908,6 +911,7 @@ function CredentialBindingEditor({
             </ComboBox.Popover>
           </ComboBox>
         </div>
+        {model ? <p className="text-[12px] text-cx-fg-3" title={pricing.error || "USD / 百万 Token 标价估算"}>{modelPriceLabel(model)}</p> : null}
         {discoveryResult ? <p className={`wbinding-discovery-result ${discoveryResult.ok ? "ok" : "failed"}`}><Icon name={discoveryResult.ok ? "check" : "alert"} size={11} />{discoveryResult.detail}</p> : null}
       </div>
       {selectedCredential ? <div className="wbinding-center-link"><span>账户与服务地址</span><a href={credentialCenterHref}>管理凭据<Icon name="arrowUpRight" size={12} /></a></div> : null}
@@ -1361,6 +1365,7 @@ function RuntimeWorkspace({ backend, network, effectiveNetwork, networkError, co
 function SchedulingWorkspace({ config, raceTimeout, dispatchMode, startWorkers, maxTotal, wallClock, costBudget, maxWorkers, onChange }: { config: WorkerSettings; raceTimeout: number; dispatchMode: "fixed" | "auto"; startWorkers: number; maxTotal: number; wallClock: number; costBudget: number; maxWorkers: number; onChange: (patch: Partial<{ raceTimeout: number; dispatchMode: "fixed" | "auto"; startWorkers: number; maxTotal: number; wallClock: number; costBudget: number }>) => void }) {
   const auto = dispatchMode === "auto";
   const rosterCap = Math.max(1, maxWorkers);
+  const ctfAvailable = Math.min(Math.max(0, maxWorkers), CTF_AUTO_CONCURRENCY);
   return (
     <div className="wsettings-simple-page wscheduling-page">
       <div className="wscheduling-layout">
@@ -1371,10 +1376,10 @@ function SchedulingWorkspace({ config, raceTimeout, dispatchMode, startWorkers, 
               <Radio className="wruntime-mode" value="auto"><Radio.Content className="wruntime-mode-face"><Radio.Control><Radio.Indicator /></Radio.Control><span className="wruntime-mode-copy"><strong>自动调度</strong><small>CTF 由 Pi Decide 规划 Step，按可用槽位派发</small></span></Radio.Content></Radio>
               <Radio className="wruntime-mode" value="fixed"><Radio.Content className="wruntime-mode-face"><Radio.Control><Radio.Indicator /></Radio.Control><span className="wruntime-mode-copy"><strong>固定并跑（Race）</strong><small>入选 Worker 并行开局，后续由 Coordinator 补位</small></span></Radio.Content></Radio>
             </RadioGroup>
-            <p className="wsettings-inline-note">固定并跑（Race）为过渡模式；未来只保留自动调度。</p>
+            <p className="wsettings-inline-note">CTF 自动调度最多同时运行 3 个普通 Worker；固定并跑使用已配置的阵容容量。</p>
           </Card.Content>
           <Card.Footer className="wscheduling-capacity" aria-live="polite">
-            <div><span>{auto ? "CTF 自动调度并发" : "固定并跑总并发"}</span><strong>{auto ? CTF_AUTO_CONCURRENCY : rosterCap}</strong><small>{auto ? "普通 Worker 上限；不执行首轮 Race" : "启用席位的并发上限之和"}</small></div>
+            <div><span>{auto ? "CTF 自动调度并发" : "固定并跑总并发"}</span><strong>{auto ? ctfAvailable : rosterCap}</strong><small>{auto ? "当前阵容可用并发；普通 Worker 最多 3 个" : "启用席位的并发上限之和"}</small></div>
             <div><span>{auto ? "阵容并发合计" : "CTF 自动调度并发 · 未启用"}</span><strong>{auto ? rosterCap : CTF_AUTO_CONCURRENCY}</strong><small>{auto ? "固定并跑可用容量" : "仅 CTF 自动调度生效"}</small></div>
           </Card.Footer>
         </Card>
@@ -1382,7 +1387,7 @@ function SchedulingWorkspace({ config, raceTimeout, dispatchMode, startWorkers, 
         <Card className="wscheduling-card">
           <Card.Header className="wsettings-card-heading"><Icon name="play" size={17} /><Card.Title>{auto ? "自动启动" : "固定并跑首轮"}</Card.Title></Card.Header>
           <Card.Content className="wscheduling-fields">
-            {auto ? <p className="wsettings-inline-note">CTF 首轮由 Pi Decide 规划；可执行 Step 按需启动，普通 Worker 同时最多 3 个。</p> : <>
+            {auto ? <p className="wsettings-inline-note">CTF 首轮由 Pi Decide 规划；可执行 Step 按需启动，普通 Worker 同时最多 3 个。实际并发受启用阵容容量限制，不执行首轮 Race。</p> : <>
               <div className="wscheduling-field">
                 <label><span>Race 超时</span><NumberField ariaLabel="Race 超时" min={60} suffix="秒" value={raceTimeout} onChange={(next) => onChange({ raceTimeout: Math.max(60, Number(next) || 60) })} /></label>
                 <small>每个首轮 Worker 的执行时限</small>
@@ -1444,6 +1449,8 @@ function LlmProfileCard({
     if (profile.model && !rows.has(profile.model)) rows.set(profile.model, "当前已保存模型");
     return [...rows.entries()].map(([id, label]) => ({ id, label }));
   }, [profile.model, selectedEndpoint?.default_model, selectedEndpoint?.models]);
+  const profilePricing = useModelPrices(modelOptions.map(row => ({ engine: "api", model: row.id, credential_id: selectedEndpoint?.id, provider_id: selectedEndpoint?.provider || profile.provider })));
+  const profilePriceLabel = (id: string) => priceLabel(profilePricing.values.get(priceKey({ engine: "api", model: id, credential_id: selectedEndpoint?.id, provider_id: selectedEndpoint?.provider || profile.provider })), profilePricing.error, profilePricing.loading);
   const resetCustomDraft = () => {
     setCustomDraft({ id: "", provider: "", base_url: "", api_key: "", model: "" });
     setShowCustomKey(false);
@@ -1592,10 +1599,11 @@ function LlmProfileCard({
         </div>
         <Button type="button" className="wmodel-edit-endpoint" onClick={beginEditEndpoint}><Icon name="pencil" size={13} />编辑端点</Button>
       </div> : <p className="wmodel-credential-note missing"><Icon name="alert" size={13} />选择已有端点，或在列表中添加自定义端点。</p>}
-      {!customEndpoint ? <label><span>端点模型</span><Select aria-label="端点模型" selectedKey={profile.model || ""} isDisabled={!selectedEndpoint?.present || modelOptions.length === 0} onSelectionChange={(key) => onUpdate({ model: String(key) })}><Select.Trigger><Select.Value /></Select.Trigger><Select.Popover><ListBox><ListBoxItem id="">选择该端点已有模型</ListBoxItem>{modelOptions.map((model) => <ListBoxItem key={model.id} id={model.id}>{model.id} · {model.label}</ListBoxItem>)}</ListBox></Select.Popover></Select></label> : null}
+      {!customEndpoint ? <label><span>端点模型</span><Select aria-label="端点模型" selectedKey={profile.model || ""} isDisabled={!selectedEndpoint?.present || modelOptions.length === 0} onSelectionChange={(key) => onUpdate({ model: String(key) })}><Select.Trigger><Select.Value /></Select.Trigger><Select.Popover><ListBox><ListBoxItem id="">选择该端点已有模型</ListBoxItem>{modelOptions.map((model) => <ListBoxItem key={model.id} id={model.id}>{model.id} · {model.label} · {profilePriceLabel(model.id)}</ListBoxItem>)}</ListBox></Select.Popover></Select></label> : null}
         </section>
         <section className="wmodel-parameters-section" aria-label="生成参数">
-          <h3>生成参数</h3>
+          {profile.model ? <p className="text-[12px] text-cx-fg-3" title={profilePricing.error || "USD / 百万 Token 标价估算"}>{profilePriceLabel(profile.model)}</p> : null}
+    <h3>生成参数</h3>
       <div className="wset-switch-row wmodel-temperature-switch"><span><b>自定义 Temperature</b><small>{which === "planner" ? "用于 Reason 与任务列表标题" : "关闭时使用默认值"}</small></span><Switch size="sm" aria-label="自定义 Temperature" isSelected={customTemperature} onChange={(on) => onUpdate({ temperature_mode: on ? (temperatureMode === "omit" ? "omit" : "custom") : "default", temperature: profile.temperature ?? 1 })}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></div>
       {customTemperature ? <>
         <label><span>发送策略</span><Select aria-label="Temperature 发送策略" selectedKey={temperatureMode === "omit" ? "omit" : "custom"} onSelectionChange={(key) => onUpdate({ temperature_mode: key === "omit" ? "omit" : "custom" })}><Select.Trigger><Select.Value /></Select.Trigger><Select.Popover><ListBox><ListBoxItem id="custom">发送指定值</ListBoxItem><ListBoxItem id="omit">不发送该参数</ListBoxItem></ListBox></Select.Popover></Select></label>

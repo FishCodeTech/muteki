@@ -7,6 +7,7 @@ import { Icon } from "@/components/Icon";
 import { SegmentedControl, Tooltip } from "@/components/chat/ui";
 import { useReducedMotion } from "@/components/chat/ui/motion";
 import type { ConversationServiceTier } from "@/lib/useConversation";
+import { ComposerSpeedIcon } from "./ComposerSpeedIcon";
 
 const SNAP: Transition = { type: "spring", stiffness: 520, damping: 34, mass: 0.7 };
 const FOLLOW: Transition = { type: "spring", stiffness: 1400, damping: 60, mass: 0.4 };
@@ -153,10 +154,15 @@ export function ComposerEffortSlider({
 
   const headline = labelOf(previewLevel);
   const activeTier = serviceTiers.find((tier) => tier.id === serviceTier);
+  const speed = activeTier
+    ? [activeTier.name, activeTier.id].some((value) => value.trim().toLowerCase() === "ultrafast") ? "ultrafast" : "fast"
+    : undefined;
   const tierCycle = [""].concat(serviceTiers.map((tier) => tier.id));
   const nextTierId = tierCycle[(tierCycle.indexOf(activeTier?.id || "") + 1) % tierCycle.length] ?? "";
   const nextTier = serviceTiers.find((tier) => tier.id === nextTierId);
-  const speedHint = `速度：${serviceTierLabel(activeTier)}，点击切换为${serviceTierLabel(nextTier)}`;
+  const speedDescription = activeTier?.description || (activeTier ? "更快响应，用量更高" : "标准速度与用量");
+  const speedSummary = `速度：${serviceTierLabel(activeTier)} · ${speedDescription}`;
+  const speedHint = `${speedSummary}，点击切换为${serviceTierLabel(nextTier)}`;
   const subtitle = [modelLabel || "思考强度", followsDefault && modelDefault ? "默认" : ""].filter(Boolean).join(" · ");
 
   if (!stops.length) {
@@ -164,22 +170,21 @@ export function ComposerEffortSlider({
       <div className="flex flex-col gap-2 p-3" data-testid="composer-effort-panel">
         {serviceTiers.length ? (
           <section className="flex flex-col gap-2" data-testid="composer-speed-panel">
-            <div className="flex items-center justify-between gap-2">
-              <span className="flex items-center gap-1.5 text-[12px] font-medium text-cx-fg-3">
-                <Icon name="zap" size={13} />
-                速度
-              </span>
-              <SegmentedControl
-                size="xs"
-                ariaLabel="速度"
-                value={activeTier ? activeTier.id : ""}
-                onChange={onServiceTierChange}
-                options={[{ value: "", label: "标准" }].concat(serviceTiers.map((tier) => ({ value: tier.id, label: serviceTierLabel(tier) })))}
-              />
-            </div>
-            <p className={cn("text-[11.5px] leading-4", activeTier ? "text-cx-warning" : "text-cx-fg-4")} data-testid="composer-speed-detail">
-              {activeTier ? activeTier.description || "更快响应，用量更高" : "标准速度与用量"}
-            </p>
+            <Tooltip content={speedSummary}>
+              <div className="flex items-center justify-between gap-2">
+                <span className="flex items-center gap-1.5 text-[12px] font-medium text-cx-fg-3">
+                  <ComposerSpeedIcon tier={activeTier} size={13} />
+                  速度
+                </span>
+                <SegmentedControl
+                  size="xs"
+                  ariaLabel={speedSummary}
+                  value={activeTier ? activeTier.id : ""}
+                  onChange={onServiceTierChange}
+                  options={[{ value: "", label: "标准" }].concat(serviceTiers.map((tier) => ({ value: tier.id, label: serviceTierLabel(tier) })))}
+                />
+              </div>
+            </Tooltip>
           </section>
         ) : null}
       </div>
@@ -205,12 +210,12 @@ export function ComposerEffortSlider({
               aria-pressed={Boolean(activeTier)}
               className={cn(
                 "cx-press grid size-7 place-items-center rounded-full outline-none focus-visible:shadow-[0_0_0_2px_var(--cx-focus)]",
-                activeTier ? "bg-cx-warning-soft text-cx-warning" : "text-cx-fg-4 hover:bg-cx-hover hover:text-cx-fg",
+                activeTier ? "bg-cx-accent-soft text-cx-accent" : "text-cx-fg-4 hover:bg-cx-hover hover:text-cx-fg",
               )}
               data-testid="composer-speed-toggle"
               data-service-tier={activeTier?.id || undefined}
             >
-              <Icon name="zap" size={15} />
+              <ComposerSpeedIcon tier={activeTier} />
             </button>
           </Tooltip>
         ) : (
@@ -279,6 +284,7 @@ export function ComposerEffortSlider({
         onLostPointerCapture={() => setDrag(null)}
         data-dragging={dragging || undefined}
         data-max={isMax || undefined}
+        data-speed={speed}
         data-testid="composer-effort-track"
       >
         <motion.span aria-hidden className="cx-effort-glow" style={{ width: fillWidth }} />
@@ -319,23 +325,6 @@ export function ComposerEffortSlider({
           data-testid="composer-effort-thumb"
         />
       </div>
-
-      <AnimatePresence initial={false}>
-        {activeTier ? (
-          <motion.p
-            key="tier"
-            initial={reduced ? { opacity: 0 } : { opacity: 0, y: -3 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={reduced ? { opacity: 0 } : { opacity: 0, y: -3 }}
-            transition={{ duration: 0.14 }}
-            className="-mt-1 flex items-center justify-center gap-1 truncate text-[11.5px] leading-4 text-cx-warning"
-            data-testid="composer-speed-detail"
-          >
-            <Icon name="zap" size={11} className="shrink-0" />
-            <span className="truncate">{serviceTierLabel(activeTier)} · {activeTier.description || "更快响应，用量更高"}</span>
-          </motion.p>
-        ) : null}
-      </AnimatePresence>
 
       <div
         ref={fxRef}

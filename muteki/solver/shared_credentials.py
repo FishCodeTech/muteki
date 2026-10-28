@@ -35,8 +35,10 @@ class SharedCredentialStore:
             if os.name == "nt":
                 import msvcrt
                 if handle.seek(0, 2) == 0:
-                    handle.write(b"0"); handle.flush()
-                handle.seek(0); msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                    handle.write(b"0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
             else:
                 import fcntl
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -44,7 +46,8 @@ class SharedCredentialStore:
                 yield
             finally:
                 if os.name == "nt":
-                    handle.seek(0); msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
                 else:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
@@ -82,7 +85,8 @@ class SharedCredentialStore:
                 try:
                     os.chmod(temporary, 0o600)
                     json.dump(value, handle)
-                    handle.flush(); os.fsync(handle.fileno())
+                    handle.flush()
+                    os.fsync(handle.fileno())
                     os.replace(temporary, self.path)
                 finally:
                     temporary.unlink(missing_ok=True)

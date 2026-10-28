@@ -5,8 +5,11 @@ import { cn } from "@/lib/cn";
 import { Popover, Tooltip } from "@/components/chat/ui";
 import type { ContextWindowState, ConversationStatistics } from "@/lib/useConversation";
 import { compactNumber, formatDuration } from "../chat/composer/format";
+import { useConversationUsageLedger } from "@/lib/useConversationUsageLedger";
+import { runUsageTokens, usageAmountDetails, type RunUsageTotals } from "@/lib/useRunUsageLedger";
+import { pricingIssueMessage } from "@/lib/modelPricing";
 
-function buildStatItems(statistics?: ConversationStatistics): string[] {
+function buildStatItems(statistics?: ConversationStatistics, totals?: RunUsageTotals | null): string[] {
   if (!statistics || statistics.turn_count < 1) return [];
   const result: string[] = [];
   const cadence = [
@@ -43,6 +46,15 @@ function buildStatItems(statistics?: ConversationStatistics): string[] {
     result.push(`缓存命中 ${Math.round(statistics.cache_hit_rate * 100)}%`);
   }
 
+  if (totals && totals.records > 0) {
+    result.push(`处理 Token ${runUsageTokens(totals, compactNumber)}`);
+    const parts = [
+      totals.input_tokens != null ? `输入 ${compactNumber(totals.input_tokens)} tok（含缓存）` : "",
+      totals.output_tokens != null ? `输出 ${compactNumber(totals.output_tokens)} tok` : "",
+    ].filter(Boolean);
+    if (parts.length) result.push(parts.join(" · "));
+    return result;
+  }
   const coverage = statistics.token_coverage ?? (
     statistics.input_tokens === undefined && statistics.output_tokens === undefined
       ? "missing"
@@ -110,29 +122,25 @@ function StatsChipList({
 }
 
 /** Compact "tokens · duration" summary for the composer context strip; full list on hover. */
-function InlineStats({ statistics, items }: { statistics: ConversationStatistics; items: string[] }) {
+function InlineStats({ statistics, items, totals, costLabel }: { statistics: ConversationStatistics; items: string[]; totals: RunUsageTotals | null; costLabel: string }) {
   const coverage = statistics.token_coverage;
   const hasTokenFields =
     statistics.input_tokens !== undefined
     || statistics.output_tokens !== undefined;
   const tokens = (statistics.input_tokens ?? 0) + (statistics.output_tokens ?? 0);
-  const durationMs = statistics.total_duration_ms || statistics.llm_duration_ms || 0;
-  const tokenLabel = coverage === "missing"
+  const tokenLabel = totals && totals.records > 0 ? totals.total_tokens == null ? "Token 未上报" : `${runUsageTokens(totals, compactNumber)} tok` : coverage === "missing"
     ? "Token 未上报"
     : hasTokenFields
       ? `${compactNumber(tokens)} tok${coverage === "partial" ? "·不完整" : ""}`
       : "";
-  const parts = [
-    tokenLabel,
-    durationMs > 0 ? formatDuration(durationMs) : "",
-    `${statistics.turn_count} 轮`,
-  ].filter(Boolean);
+  // Duration and turn count stay in the hover list; the strip only carries cost and volume.
+  const parts = [costLabel, tokenLabel].filter(Boolean);
   return (
     <Tooltip
       placement="top-end"
       content={(
         <span className="flex flex-col gap-0.5 py-0.5">
-          {items.map((item) => <span key={item} className="cx-tabular whitespace-nowrap">{item}</span>)}
+          {items.map((item) => <span key={item} className="cx-tabular whitespace-normal break-words">{item}</span>)}
         </span>
       )}
     >
@@ -141,12 +149,12 @@ function InlineStats({ statistics, items }: { statistics: ConversationStatistics
         role="note"
         aria-label={`会话统计：${items.join("，")}`}
         data-testid="c39-stats-inline"
-        className="cx-tabular inline-flex h-7 shrink-0 cursor-default items-center gap-1.5 rounded-full px-2 font-cx-mono text-[12px] text-cx-fg-4 outline-none hover:bg-cx-hover hover:text-cx-fg-3 focus-visible:outline-2 focus-visible:outline-[var(--cx-focus)]"
+        className="cx-tabular inline-flex h-7 min-w-0 cursor-default items-center gap-1 rounded-full px-1.5 text-[11px] text-cx-fg-4 outline-none hover:bg-cx-hover hover:text-cx-fg-3 focus-visible:outline-2 focus-visible:outline-[var(--cx-focus)] sm:gap-1.5 sm:px-2 sm:text-[12px]"
       >
         {parts.map((part, index) => (
           <React.Fragment key={part}>
             {index > 0 ? <span aria-hidden="true" className="text-cx-border-strong">·</span> : null}
-            <span>{part}</span>
+            <span className="whitespace-nowrap">{part}</span>
           </React.Fragment>
         ))}
       </span>
@@ -155,11 +163,17 @@ function InlineStats({ statistics, items }: { statistics: ConversationStatistics
 }
 
 export function ConversationStatsBar({
+  threadId = "",
+  usageRevision,
+  running = false,
   statistics,
   contextWindow,
   variant = "bar",
   className,
 }: {
+  threadId?: string;
+  usageRevision?: number;
+  running?: boolean;
   statistics?: ConversationStatistics;
   /** C27: context-window state for the ctx% chip */
   contextWindow?: ContextWindowState | null;
@@ -171,7 +185,21 @@ export function ConversationStatsBar({
   const [clipped, setClipped] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
 
-  const items = useMemo(() => buildStatItems(statistics), [statistics]);
+  const revision = [statistics?.turn_count, statistics?.step_count, statistics?.input_tokens, statistics?.output_tokens, statistics?.token_coverage, usageRevision, running].join(":");
+  const ledger = useConversationUsageLedger(threadId, revision);
+  const amount = ledger.totals ? usageAmountDetails(ledger.totals) : null;
+  const costLabel = !threadId ? "" : amount ? `${ledger.totals?.estimated_cost != null && ledger.totals.cost != null ? "≈" : ""}${amount.amount}${amount.incomplete ? "*" : ""}` : ledger.error ? "费用不可用" : "费用…";
+  const items = useMemo(() => {
+    const result = buildStatItems(statistics, ledger.totals);
+    const amount = ledger.totals ? usageAmountDetails(ledger.totals) : null;
+    if (threadId) {
+      result.push(amount ? `费用 ${amount.amount}${amount.source ? ` · ${amount.source}` : ""}${amount.incomplete ? ` · ${amount.incomplete}` : ""}` : ledger.error || "正在读取费用…");
+      if (ledger.totals?.unpriced) result.push(`${ledger.totals.unpriced} 条记录未定价，未计入金额`);
+      for (const issue of ledger.totals?.pricing_issues?.slice(0, 2) ?? []) result.push(pricingIssueMessage(issue));
+      if (ledger.error && ledger.totals) result.push(`${ledger.error}，保留上次成功结果`);
+    }
+    return result;
+  }, [statistics, ledger.totals, ledger.error, threadId]);
   const ctxChip = useMemo(() => contextChip(contextWindow), [contextWindow]);
   const fullText = items.join("  |  ");
 
@@ -187,7 +215,7 @@ export function ConversationStatsBar({
 
   if (variant === "inline") {
     if (!statistics || !items.length) return null;
-    return <InlineStats statistics={statistics} items={items} />;
+    return <InlineStats statistics={statistics} items={items} totals={ledger.totals} costLabel={costLabel} />;
   }
 
   if (!items.length && !ctxChip) return null;

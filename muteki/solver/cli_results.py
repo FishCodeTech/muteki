@@ -24,6 +24,7 @@ from muteki.solver.cli_driver import (
 )
 from muteki.solver.result_codes import (
     RESULT_CANCELLED,
+    RESULT_DEAD_END,
     RESULT_EXPLORED,
     RESULT_OOM,
     RESULT_OUTPUT_LIMIT,
@@ -59,6 +60,12 @@ class WorkerRuntimeUnavailable(RuntimeError):
     def __init__(self, detail: str, *, code: str) -> None:
         super().__init__(detail)
         self.code = code
+
+
+class ModelOutputTruncated(RuntimeError):
+    """A model response hit its token cap without a safe continuation path."""
+
+    code = "model_output_truncated"
 
 
 class ToolArtifactPersistenceError(RuntimeError):
@@ -180,11 +187,13 @@ def _fact_claim_provenance(
 ) -> dict[str, object]:
     """Attach the current Worker/Intent/target identity to every Fact claim."""
     result: dict[str, object] = dict(provenance or {})
+    result.setdefault("run_id", str(getattr(self, "run_id", "") or ""))
     result.setdefault("worker_id", self.solver_id)
     result.setdefault("intent_id", _current_intent_id(self))
     result.setdefault(
         "target_epoch", str(getattr(self, "_target_epoch", "") or "1"))
     result.setdefault("observed_at", time.time())
+    result.setdefault("target", str(self._target() or ""))
     return result
 
 
@@ -197,6 +206,7 @@ def _ctf_step_artifact_refs(self) -> list[dict[str, object]]:
         if (row.get("worker_id") != self.solver_id
                 or row.get("intent_id") != current_intent
                 or row.get("target_epoch") != epoch
+                or row.get("attributed") is not True
                 or int(row.get("tool_event_seq") or 0) <= 0):
             continue
         artifact_id = str(row.get("artifact_id") or "")
@@ -207,11 +217,17 @@ def _ctf_step_artifact_refs(self) -> list[dict[str, object]]:
                 f"tool artifact missing or changed: {artifact_id or '(empty)'}"
             )
         refs.append({
+            "kind": "tool_result",
             "artifact_id": artifact_id,
             "sha256": expected,
             "size": int(row.get("size") or 0),
             "command": str(row.get("command") or ""),
             "tool_event_seq": int(row.get("tool_event_seq") or 0),
+            "tool_event_id": f"{self.run_id}:{int(row.get('tool_event_seq') or 0)}",
+            "run_id": str(self.run_id),
+            "worker_id": str(self.solver_id),
+            "intent_id": current_intent,
+            "target_epoch": epoch,
         })
     return refs
 
@@ -317,6 +333,7 @@ def _persist_raw_tool_output(
             "intent_id": record.intent_id,
             "target_epoch": record.target_epoch,
             "tool_event_seq": 0,
+            "attributed": bool(attributed),
         })
         self._tool_artifact_refs = refs
     # Build the complete trimmed state off to the side, then swap all parallel
@@ -336,8 +353,74 @@ def _persist_raw_tool_output(
     self._raw_tool_attributed = attributed_rows
     self._tool_evidence_records = records
     self._raw_tool_outputs_chars = chars
+    self._tool_evidence_total_count = (
+        int(getattr(self, "_tool_evidence_total_count", 0) or 0) + 1
+    )
+    try:
+        self._sync_worker_cwd_to_shared()
+    except Exception:
+        pass
+    try:
+        _persist_step_trace_snapshot(self)
+    except Exception:
+        pass
     self._maybe_steer_idle_repeat()
     return record
+
+
+def _persist_step_trace_snapshot(self) -> None:
+    """Persist a live per-step command/output trace snapshot for peek_step."""
+    intent_id = str(_current_intent_id(self) or "").strip()
+    if not intent_id or intent_id.startswith("intent:"):
+        return
+    state_root: Optional[Path] = None
+    raw_env = (
+        getattr(self, "_runtime_env", None)
+        or getattr(self, "_extra_worker_env", None)
+        or {}
+    )
+    if isinstance(raw_env, dict) and raw_env.get("PI_CODING_AGENT_DIR"):
+        cand = Path(str(raw_env["PI_CODING_AGENT_DIR"])).expanduser()
+        if cand.parent.name == ".muteki-agent-state":
+            state_root = cand.parent
+    if state_root is None:
+        raw_wd = getattr(self, "_current_workdir", None) or getattr(self, "_workdir", None)
+        if raw_wd:
+            from muteki.solver.cli_workspace import workspace_root_for_worker
+            root = workspace_root_for_worker(Path(str(raw_wd)).resolve())
+            state_root = root / ".muteki-agent-state"
+    if state_root is None:
+        return
+    traces_dir = state_root / "step_traces"
+    traces_dir.mkdir(parents=True, exist_ok=True)
+    traces: list[dict[str, str]] = []
+    for rec in list(getattr(self, "_tool_evidence_records", None) or []):
+        if getattr(rec, "intent_id", "") and str(rec.intent_id) != intent_id:
+            continue
+        cmd = " ".join(str(getattr(rec, "command", "") or "").split())[:360]
+        out = " ".join(str(getattr(rec, "output", "") or "").split())[:420]
+        if not cmd and not out:
+            continue
+        traces.append({
+            "tool": "bash",
+            "command": cmd,
+            "output": out or "(empty output)",
+            "artifact_id": str(getattr(rec, "artifact_id", "") or ""),
+        })
+    started_at = float(getattr(self, "_worker_started_at", 0.0) or 0.0)
+    elapsed_s = max(0.0, time.time() - started_at) if started_at > 0 else 0.0
+    payload = {
+        "step_id": intent_id,
+        "worker_id": str(getattr(self, "solver_id", "") or ""),
+        "started_at": started_at,
+        "elapsed_seconds": round(elapsed_s, 1),
+        "tool_calls": max(len(traces), int(getattr(self, "_tool_evidence_total_count", 0) or 0)),
+        "recent_traces": traces[-15:],
+    }
+    target_path = traces_dir / f"{intent_id}.json"
+    tmp_path = traces_dir / f".{intent_id}.json.tmp"
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp_path.replace(target_path)
 
 
 def _bind_tool_evidence_event(self, record: ToolEvidenceRecord, event: object) -> None:
@@ -379,14 +462,25 @@ def _finding_evidence_corpus(self) -> str:
 
 
 async def _accept_submitted_flag(self, flag: str) -> bool:
-    if flag in self._rejected_flags() or flag in self._already_found:
+    if flag in self._rejected_flags():
         return False
+    if flag in self._already_found:
+        return True
     return await self._accept_flag(flag)
 
 
 def _blackboard_operation_allowed(self, operation: str) -> bool:
     if operation == "context":
         return True
+    if operation == "restart_target":
+        return (getattr(self.challenge, "mode", "ctf") == "ctf"
+                and self.mode in {"bootstrap", "explore"}
+                and callable(getattr(self, "_target_restarter", None)))
+    if operation == "platform_verdict":
+        return bool(
+            getattr(self, "campaign_mode", False)
+            or getattr(self.challenge, "platform_confirmation_required", False)
+        )
     if operation in {"mcp_tools", "mcp_schema", "mcp_call"}:
         return (getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
                 and self.mode in {"bootstrap", "explore", "fact_verifier", "review"})
@@ -467,6 +561,7 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
                     "detail": "Managed MCP service is unavailable in this execution"}
         mode = str(getattr(self.challenge, "mode", "ctf") or "ctf")
         engine = str(self.driver.name)
+        from muteki.conversation.chat_plugins import ChatPluginError
         try:
             tools = await service.prepare_tools(engine, mode, self.run_id)
             if operation == "mcp_tools":
@@ -488,14 +583,35 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
                 return {"ok": False, "code": "worker_mcp.invalid_arguments",
                         "detail": "MCP arguments must be a JSON object"}
             result = await service.invoke(engine, name, arguments, mode=mode, scope=self.run_id)
+            if result.get("isError", False):
+                return {"ok": False, "code": "worker_mcp.tool_error",
+                        "message": json.dumps(result, ensure_ascii=False)}
             return {"ok": True, "message": json.dumps(result, ensure_ascii=False)}
         except asyncio.TimeoutError:
             return {"ok": False, "code": "worker_mcp.timeout", "detail": "MCP tool timed out"}
+        except ChatPluginError as exc:
+            return {"ok": False, "code": exc.code, "detail": str(exc)}
         except Exception as exc:
             return {"ok": False, "code": "worker_mcp.failed",
                     "detail": f"MCP {type(exc).__name__}: {exc}"}
     if operation == "context":
         return {"ok": True, "content": self._live_blackboard_context()}
+    if operation == "restart_target":
+        evidence = payload.get("evidence")
+        if payload.get("confirmed_fault") is not True or not isinstance(evidence, str) or not evidence.strip() or "\x00" in evidence:
+            return {"ok": False, "code": "restart_evidence_invalid", "detail": "confirmed_fault=true and nonempty fault evidence are required"}
+        return await self._target_restarter(worker=self, request_id=str(payload.get("request_id") or ""), evidence=evidence)
+    if operation == "platform_verdict":
+        if shared_graph is None:
+            return {"ok": False, "detail": "SharedGraph is unavailable"}
+        candidate = str(payload.get("flag") or "")
+        receipt = next(
+            (row for row in reversed(shared_graph.platform_verdicts())
+             if str(row.get("flag") or "") == candidate), None,
+        )
+        return {"ok": True, "status": (
+            str(receipt.get("status")) if receipt else "pending"),
+            "receipt": receipt}
     if operation == "recent_evidence":
         records = []
         for row in getattr(self, "_tool_evidence_records", None) or []:
@@ -516,10 +632,12 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
         return {"ok": True, "content": json.dumps(records, ensure_ascii=False)}
     if operation == "read_artifact":
         artifact_id = str(payload.get("artifact_id") or "")
-        expected = (
-            shared_graph.ctf_artifact_digest(artifact_id)
+        reference = (
+            shared_graph.ctf_artifact_reference(artifact_id)
             if shared_graph is not None else None
         )
+        expected = str(reference.get("sha256") or "") if reference else None
+        own = None
         if not expected:
             own = _referenced_fact_evidence(self, artifact_id)
             expected = own.artifact_sha256 if own is not None else None
@@ -532,18 +650,46 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
             return {"ok": False, "detail": "artifact is missing"}
         if "\x00" in content:
             return {"ok": False, "detail": "artifact contains binary NUL bytes"}
-        return {"ok": True, "content": content}
+        result = {"ok": True, "content": content}
+        if payload.get("include_command") is True:
+            result["command"] = str(
+                (reference.get("command") or "") if reference is not None
+                else own.command if own is not None else ""
+            )
+        return result
     if operation == "submit_fact":
         title = str(payload.get("title") or "").strip()
         content = str(payload.get("content") or "")
         if not title or not content.strip():
             return {"ok": False, "detail": "title and content are required"}
         evidence_artifact_id = str(payload.get("evidence_artifact_id") or "").strip()
+        enables = payload.get("enables", "")
+        if not isinstance(enables, str):
+            return {"ok": False, "detail": "enables must describe a confirmed capability as text"}
         if getattr(self.challenge, "mode", "ctf") == "pentest" and not _referenced_fact_evidence(self, evidence_artifact_id):
             return {"ok": False, "detail": "evidence artifact is missing or not attributed to this Step; call recent-evidence"}
+        supersedes_raw = str(payload.get("supersedes") or "").strip()
+        supersedes_seqs: list[int] = []
+        if supersedes_raw:
+            if shared_graph is None or not hasattr(shared_graph, "resolve_ctf_fact_seq"):
+                return {"ok": False, "detail": "shared graph cannot resolve --supersedes references"}
+            for token in (part.strip() for part in supersedes_raw.split(",") if part.strip()):
+                resolved = int(shared_graph.resolve_ctf_fact_seq(token))
+                if resolved <= 0:
+                    return {
+                        "ok": False,
+                        "detail": (
+                            f"unknown or non-revisable Fact reference in --supersedes: {token} "
+                            "(use fact_XXX from the graph, never fact_origin)"
+                        ),
+                    }
+                if resolved not in supersedes_seqs:
+                    supersedes_seqs.append(resolved)
         self._draft_fact = {
             "title": title, "content": content,
             "evidence_artifact_id": evidence_artifact_id,
+            "enables": enables.strip(),
+            "supersedes": supersedes_seqs,
         }
         self._draft_report = None
         self._accepted_blackboard_requests += 1
@@ -615,6 +761,10 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
         self._accepted_blackboard_requests += 1
         return {"ok": True, "message": "REPORT_DRAFTED; commit-step will atomically submit it with the cited Fact"}
     if operation == "commit_step":
+        ctf_mode = getattr(self.challenge, "mode", "ctf") == "ctf"
+        campaign = bool(getattr(self, "campaign_mode", False)) or (
+            not ctf_mode and bool(payload.get("keep_going", False))
+        )
         if self._worker_result_committed:
             prior = dict(getattr(self, "_last_worker_result_commit", None) or {})
             prior_facts = list(prior.get("facts") or [])
@@ -625,6 +775,7 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
                             else "STEP_COMMITTED REPORT_SUBMITTED"
                             if int(prior.get("report_seq") or 0) > 0 else "STEP_COMMITTED"),
                 "fact_seq": int(prior_facts[-1]) if prior_facts else 0,
+                "superseded_fact_seqs": list(prior.get("superseded_fact_seqs") or []),
                 "report_seq": int(prior.get("report_seq") or 0),
                 "evidence_event_seq": int(prior.get("evidence_event_seq") or 0),
                 "finish_worker": True,
@@ -632,16 +783,112 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
         draft = dict(getattr(self, "_draft_fact", None) or {})
         title = str(draft.get("title") or "").strip()
         content = str(draft.get("content") or "")
-        if not title or not content.strip():
-            return {"ok": False, "detail": "submit-fact draft is missing"}
+        pending_dead_ends = list(getattr(self, "_pending_dead_ends", None) or [])
+        ctf_mode = getattr(self.challenge, "mode", "ctf") == "ctf"
         if shared_graph is None:
             return {"ok": False, "detail": "shared graph is unavailable"}
 
         intent_id = _current_intent_id(self)
+        if not title or not content.strip():
+            solved = ctf_mode and self._flags_complete_for_worker()
+            if pending_dead_ends:
+                status = RESULT_SOLVED if solved else RESULT_DEAD_END
+                detail = f"Worker explicitly ruled out: {pending_dead_ends[-1].reason}"
+            else:
+                status = RESULT_SOLVED if solved else RESULT_EXPLORED
+                detail = "Step completed without a confirmed new Fact"
+            worker_result = WorkerResult(
+                status=status,
+                result_detail=detail,
+                produced_new_info=False,
+                stop_condition_result="met" if solved else "",
+                observations=list(
+                    getattr(self, "_pending_observations", None) or []),
+                dead_ends=pending_dead_ends,
+                need_input=getattr(self, "_pending_need_input", None),
+                pocs=list(getattr(self, "_pending_pocs", None) or []),
+                artifact_ids=(
+                    [str(self._transcript_artifact_id)]
+                    if getattr(self, "_transcript_artifact_id", "") else []
+                ),
+            )
+            commit_kwargs = worker_result.to_commit_kwargs(
+                actor=self.solver_id,
+                worker_id=self.solver_id,
+                intent_id=intent_id,
+                target_epoch=str(getattr(self, "_target_epoch", "") or ""),
+                run_id=str(getattr(self, "run_id", "") or ""),
+            )
+            checkpoint_id = (
+                "deadend-" + hashlib.sha256(json.dumps(
+                    commit_kwargs, sort_keys=True, ensure_ascii=False,
+                    default=str).encode()).hexdigest()
+                if campaign else ""
+            )
+            try:
+                commit = shared_graph.commit_worker_result(
+                    **commit_kwargs,
+                    checkpoint_id=checkpoint_id,
+                    conclude=not campaign,
+                )
+            except ValueError as exc:
+                if "no longer owns active step" in str(exc) or "archived visit wave" in str(exc):
+                    self._worker_result_committed = True
+                    self._step_committed = True
+                    self._draft_fact = None
+                    self._draft_report = None
+                    self._pending_observations = []
+                    self._pending_observation_index = {}
+                    self._pending_dead_ends = []
+                    self._pending_pocs = []
+                    self._pending_need_input = None
+                    return {
+                        "ok": True,
+                        "disposition": "not_applied",
+                        "message": "STEP_NOT_OWNED",
+                        "fact_seq": 0,
+                        "report_seq": 0,
+                        "evidence_event_seq": 0,
+                        "finish_worker": True,
+                    }
+                raise
+            if not isinstance(commit, dict):
+                return {"ok": False, "detail": "step commit was not applied"}
+            already_closed = bool(commit.get("step_already_closed"))
+            terminal_no_draft = (not campaign) or already_closed
+            self._last_worker_result = worker_result
+            self._last_worker_result_commit = dict(commit)
+            self._worker_result_committed = terminal_no_draft
+            self._step_committed = terminal_no_draft
+            self._draft_fact = None
+            self._draft_report = None
+            self._pending_observations = []
+            self._pending_observation_index = {}
+            self._pending_dead_ends = []
+            self._pending_pocs = []
+            self._pending_need_input = None
+            self._accepted_blackboard_requests += 1
+            return {
+                "ok": True,
+                "message": (
+                    "STEP_CONCLUDED_BY_OTHER"
+                    if (terminal_no_draft and not commit.get("concluded"))
+                    else ("STEP_CHECKPOINT_COMMITTED" if not terminal_no_draft else "STEP_COMMITTED")
+                ),
+                "fact_seq": 0,
+                "report_seq": 0,
+                "evidence_event_seq": 0,
+                "finish_worker": terminal_no_draft,
+            }
+
         fact_text = f"{title}\n{content}"
         provenance = _fact_claim_provenance(
             self, {"artifact_refs": _ctf_step_artifact_refs(self)}
         )
+        if ctf_mode and draft.get("enables"):
+            if not provenance["artifact_refs"]:
+                return {"ok": False, "detail": "enabling evidence needs a persisted tool result from this Step"}
+            provenance["enables"] = draft["enables"]
         if getattr(self.challenge, "mode", "ctf") == "pentest":
             record = _referenced_fact_evidence(
                 self, str(draft.get("evidence_artifact_id") or ""),
@@ -667,8 +914,9 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
             result_detail=title,
             produced_new_info=True,
             stop_condition_result="met" if solved else "",
-            observations=[claim],
-            dead_ends=list(getattr(self, "_pending_dead_ends", None) or []),
+            observations=[*list(getattr(self, "_pending_observations", None) or []), claim]
+            if campaign else [claim],
+            dead_ends=pending_dead_ends,
             pocs=list(getattr(self, "_pending_pocs", None) or []),
             artifact_ids=(
                 [str(self._transcript_artifact_id)]
@@ -676,33 +924,123 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
             ),
         )
         report_proposed = bool(getattr(self, "_draft_report", None))
-        commit = shared_graph.commit_worker_result(
-            **worker_result.to_commit_kwargs(
+        commit_kwargs = worker_result.to_commit_kwargs(
                 actor=self.solver_id,
                 worker_id=self.solver_id,
                 intent_id=intent_id,
                 target_epoch=str(getattr(self, "_target_epoch", "") or ""),
                 run_id=str(getattr(self, "run_id", "") or ""),
-            ),
-            vulnerability_report=(dict(self._draft_report) if getattr(self, "_draft_report", None) else None),
-            conclude=True,
+            )
+        checkpoint_id = (
+            "fact-" + hashlib.sha256(json.dumps(
+                {**commit_kwargs, "supersedes": list(draft.get("supersedes") or [])},
+                sort_keys=True, ensure_ascii=False,
+                default=str).encode()).hexdigest()
+            if campaign else ""
         )
-        if not isinstance(commit, dict) or not commit.get("concluded"):
+        try:
+            commit = shared_graph.commit_worker_result(
+                **commit_kwargs,
+                supersedes=list(draft.get("supersedes") or []),
+                vulnerability_report=(dict(self._draft_report) if getattr(self, "_draft_report", None) else None),
+                checkpoint_id=checkpoint_id,
+                conclude=not campaign,
+            )
+        except ValueError as exc:
+            if "no longer owns active step" in str(exc) or "archived visit wave" in str(exc):
+                self._worker_result_committed = True
+                self._step_committed = True
+                self._draft_fact = None
+                self._draft_report = None
+                self._pending_observations = []
+                self._pending_observation_index = {}
+                self._pending_dead_ends = []
+                self._pending_pocs = []
+                self._pending_need_input = None
+                return {
+                    "ok": True,
+                    "disposition": "not_applied",
+                    "message": "STEP_NOT_OWNED",
+                    "fact_seq": 0,
+                    "superseded_fact_seqs": [],
+                    "report_seq": 0,
+                    "evidence_event_seq": 0,
+                    "finish_worker": True,
+                }
+            raise
+        if not isinstance(commit, dict):
             return {"ok": False, "detail": "step commit was not applied"}
-        fact_seqs = [int(seq) for seq in commit.get("facts") or [] if int(seq) > 0]
+        fact_seqs: list[int] = []
+        for raw_seq in commit.get("facts") or []:
+            try:
+                val = int(raw_seq)
+            except (TypeError, ValueError):
+                continue
+            if val > 0:
+                fact_seqs.append(val)
         if not fact_seqs:
+            if not commit.get("concluded") and (
+                not campaign
+                or commit.get("step_already_closed")
+            ):
+                self._last_worker_result = worker_result
+                self._last_worker_result_commit = dict(commit)
+                self._worker_result_committed = True
+                self._step_committed = True
+                self._draft_fact = None
+                self._draft_report = None
+                self._pending_observations = []
+                self._pending_observation_index = {}
+                self._pending_dead_ends = []
+                self._pending_pocs = []
+                self._pending_need_input = None
+                self._accepted_blackboard_requests += 1
+                return {
+                    "ok": True,
+                    "disposition": "observation_only_retired",
+                    "message": "STEP_CONCLUDED_BY_OTHER",
+                    "fact_seq": 0,
+                    "superseded_fact_seqs": [],
+                    "report_seq": 0,
+                    "evidence_event_seq": 0,
+                    "finish_worker": True,
+                }
             return {"ok": False, "detail": "step commit produced no Fact"}
 
-        self._last_fact_seq = max(fact_seqs)
+        # The final observation is the submitted draft; exact deduplication can
+        # resolve it to an older event than other campaign observations.
+        self._last_fact_seq = fact_seqs[-1]
+        superseded_seqs: list[int] = []
+        for raw_seq in commit.get("superseded_fact_seqs") or []:
+            try:
+                superseded_seqs.append(int(raw_seq))
+            except (TypeError, ValueError):
+                continue
         self._last_worker_result = worker_result
         self._last_worker_result_commit = dict(commit)
-        self._worker_result_committed = True
-        self._step_committed = True
+        self._worker_result_committed = not campaign
+        self._step_committed = not campaign
         self._draft_fact = None
         self._draft_report = None
-        self.graph.add_evidence(
-            source=self.driver.name, fact=fact_text, verified=True,
-        )
+        self._pending_observations = []
+        self._pending_observation_index = {}
+        self._pending_dead_ends = []
+        self._pending_pocs = []
+        self._pending_need_input = None
+        try:
+            self.graph.add_evidence(
+                source=self.driver.name, fact=fact_text, verified=True,
+            )
+        except Exception:
+            pass
+        for old_seq in superseded_seqs:
+            try:
+                await self._emit_bb(
+                    "fact_superseded", fact_seq=old_seq,
+                    by_fact_seq=self._last_fact_seq, reason=title,
+                )
+            except Exception:
+                pass
         try:
             await self._emit(
                 EventType.SHARED_GRAPH_DELTA,
@@ -734,11 +1072,13 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
                         if int(commit.get("evidence_event_seq") or 0) > 0
                         else "STEP_COMMITTED REPORT_SUBMITTED" if int(commit.get("report_seq") or 0) > 0
                         else "STEP_COMMITTED REPORT_DUPLICATE" if report_proposed
+                        else "STEP_CHECKPOINT_COMMITTED" if campaign
                         else "STEP_COMMITTED"),
             "fact_seq": self._last_fact_seq,
+            "superseded_fact_seqs": superseded_seqs,
             "report_seq": int(commit.get("report_seq") or 0),
             "evidence_event_seq": int(commit.get("evidence_event_seq") or 0),
-            "finish_worker": True,
+            "finish_worker": not campaign,
         }
     if operation == "fact":
         text = str(payload.get("text") or "").strip()
@@ -782,24 +1122,53 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
         observed_result = str(payload.get("observed_result") or "").strip()
         if not reason:
             return {"ok": False, "detail": "dead-end reason is empty"}
-        if ctf_mode and (not tested_scope or not observed_result):
+        is_pentest = getattr(self.challenge, "mode", "ctf") == "pentest"
+        if is_pentest and (not tested_scope or not observed_result):
             return {"ok": False, "detail": "tested_scope and observed_result are required"}
+        if ctf_mode:
+            tested_scope = tested_scope or str(getattr(self, "intent_goal", "") or _current_intent_id(self) or "current_step").strip()
+            observed_result = observed_result or reason
+        clean_reason = re.sub(r"^(?:\[[a-z0-9_.-]+\]\s*)+", "", reason, flags=re.IGNORECASE).strip() or reason
         claim = DeadEndClaim(
-            reason=f"[{self.driver.name}] {reason}",
+            reason=clean_reason if ctf_mode else f"[{self.driver.name}] {clean_reason}",
             tested_scope=tested_scope,
             observed_result=observed_result,
             route_hash=str(getattr(self, "route_hash", "") or ""),
             coverage_key=str(getattr(self, "coverage_key", "") or ""),
+            provenance=_fact_claim_provenance(
+                self, {"artifact_refs": _ctf_step_artifact_refs(self)}
+            ) if ctf_mode else None,
         )
-        if claim not in self._pending_dead_ends:
+        if ctf_mode and getattr(self, "_pending_dead_ends", None):
+            replaced = False
+            for idx, existing in enumerate(self._pending_dead_ends):
+                if (
+                    existing.reason == claim.reason
+                    or (
+                        existing.tested_scope == claim.tested_scope
+                        and existing.observed_result == claim.observed_result
+                    )
+                ):
+                    self._pending_dead_ends[idx] = claim
+                    replaced = True
+                    break
+            if not replaced:
+                self._pending_dead_ends.append(claim)
+        elif claim in self._pending_dead_ends:
+            idx = self._pending_dead_ends.index(claim)
+            self._pending_dead_ends[idx] = claim
+        else:
             self._pending_dead_ends.append(claim)
         self._accepted_blackboard_requests += 1
-        return {"ok": True, "message": "STAGED"}
+        return {
+            "ok": True,
+            "message": "STAGED; call commit-step to conclude this Step with the recorded DeadEnd",
+        }
     if operation == "need_input":
         need = str(payload.get("need") or "").strip()
         if not need:
             return {"ok": False, "detail": "operator request is empty"}
-        need_card = need if len(need) <= 1000 else need[:1000] + " …"
+        need_card = need
         request_id, correlation = self._decision_request_identity(
             need_card, "external_blocker")
         await self._emit(
@@ -814,12 +1183,17 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
         self._accepted_blackboard_requests += 1
         return {"ok": True, "message": "OPERATOR_REQUESTED"}
     if operation == "save_poc":
-        accepted = await self._handle_poc_save(
-            str(payload.get("path") or ""),
-            str(payload.get("entry_command") or ""),
-            str(payload.get("status") or "available"),
-            str(payload.get("note") or ""),
-        )
+        from muteki.solver.cli_poc_review import PocSaveError
+
+        try:
+            accepted = await self._handle_poc_save(
+                str(payload.get("path") or ""),
+                str(payload.get("entry_command") or ""),
+                str(payload.get("status") or "available"),
+                str(payload.get("note") or ""),
+            )
+        except PocSaveError as exc:
+            return {"ok": False, "code": exc.code, "detail": str(exc)}
         if accepted:
             self._accepted_blackboard_requests += 1
         poc_id = str(getattr(self, "_last_saved_poc_id", "") or "") if accepted else ""
@@ -954,10 +1328,37 @@ async def _handle_blackboard_request(self, payload: dict) -> dict:
         return {"ok": True, "message": "ACCESS_PATH_READY",
                 "access_path_id": access_path_id, "seq": seq}
     if operation == "submit_flag":
-        if not await self._accept_submitted_flag(str(payload.get("flag") or "")):
-            return {"ok": False, "detail": "Flag was empty, duplicate, or rejected"}
+        flag = payload.get("flag")
+        if not isinstance(flag, str):
+            return {"ok": False, "detail": "flag must be a string"}
+        if flag in self._rejected_flags():
+            receipt = None
+            if shared_graph is not None and callable(getattr(shared_graph, "platform_verdicts", None)):
+                receipt = next(
+                    (row for row in reversed(shared_graph.platform_verdicts())
+                     if row.get("flag") == flag), None,
+                )
+            return {
+                "ok": False,
+                "status": "rejected",
+                "detail": "Flag was already rejected by platform verifier (known false positive / decoy)",
+                **({"receipt": receipt} if receipt is not None else {}),
+            }
+        if not await self._accept_submitted_flag(flag):
+            return {"ok": False, "detail": "Flag could not be recorded"}
         self._accepted_blackboard_requests += 1
-        return {"ok": True, "message": "SUBMITTED"}
+        platform_required = getattr(self.challenge, "platform_confirmation_required", False)
+        if platform_required and shared_graph is not None:
+            receipt = next(
+                (row for row in reversed(shared_graph.platform_verdicts())
+                 if row.get("flag") == flag), None,
+            )
+            if receipt is not None:
+                return {"ok": True, "message": "RECORDED_LOCALLY",
+                        "status": receipt["status"], "receipt": receipt}
+        return {"ok": True, "message": (
+            "RECORDED_LOCALLY; platform verdict pending"
+            if platform_required else "SUBMITTED")}
     if operation == "branch_proposal":
         if shared_graph is None:
             return {"ok": False, "detail": "SharedGraph is unavailable"}
@@ -1125,7 +1526,7 @@ async def _drain_blackboard_requests_locked(self) -> int:
             )
             _stop_for_blackboard_terminal_error(self, failure)
             raise failure from exc
-        if result.get("ok") and result.get("finish_worker"):
+        if result.get("finish_worker"):
             # The commit receipt is durable and its response file now exists.
             # End only the current CLI invocation; the logical Worker completes
             # normally in cli_modes.
@@ -1181,6 +1582,7 @@ def _write_blackboard_result(self, request_id: str, result: dict) -> None:
             os.unlink(temporary)
         except OSError:
             pass
+        raise
 
 
 async def _maybe_broadcast_lockout(self, text: str) -> None:
@@ -1214,11 +1616,9 @@ async def _maybe_broadcast_lockout(self, text: str) -> None:
 
 
 @staticmethod
-def _stderr_tail(res: CliResult, *, max_chars: int = 1800) -> str:
-    err = (getattr(res, "raw_stderr", "") or "").strip()
-    if not err:
-        return ""
-    return "\n".join(err.splitlines()[-12:])[-max_chars:]
+def _stderr_tail(res: CliResult) -> str:
+    """Legacy hook name; retain complete diagnostics for recovery and audit."""
+    return (getattr(res, "raw_stderr", "") or "").strip()
 
 
 def _result_text_with_stderr(self, res: CliResult) -> str:
@@ -1263,7 +1663,11 @@ def _result_text_with_stderr(self, res: CliResult) -> str:
         if runtime_code:
             raise WorkerRuntimeUnavailable(
                 diagnostic, code=runtime_code)
-        raise RuntimeError(error)
+        raise RuntimeError(diagnostic)
+    if res.model_truncated:
+        raise ModelOutputTruncated(
+            f"{self.driver.name} model response reached its output token limit"
+        )
     if not text.strip():
         raise RuntimeError(
             f"{self.driver.name} turn ended without assistant text")
@@ -1313,11 +1717,11 @@ def _controlled_result_stop(
 async def _emit_empty_stderr_diagnostic(self, res: CliResult) -> None:
     if (res.text or "").strip():
         return
-    tail = self._stderr_tail(res, max_chars=1200)
+    tail = self._stderr_tail(res)
     if tail:
         await self._emit(
             EventType.REASONING_DELTA,
-            text=f"[{self.driver.name}] produced no stdout; stderr tail:\n{tail}\n",
+            text=f"[{self.driver.name}] produced no stdout; stderr:\n{tail}\n",
         )
 
 
@@ -1428,6 +1832,12 @@ async def _stream_cost(self, res: CliResult) -> None:
         or getattr(self, "cli_engine", "")
         or ""
     ).strip()
+    price_identity = {
+        "engine": engine,
+        "credential_id": str(profile.get("credential_id") or "").strip(),
+        "provider_id": str(profile.get("provider_id") or profile.get("provider") or "").strip(),
+        "speed": str(profile.get("speed") or "").strip(),
+    }
     usd = res.cost_usd
     in_tok = int(res.input_tokens or 0)
     out_tok = int(res.output_tokens or 0)
@@ -1443,7 +1853,7 @@ async def _stream_cost(self, res: CliResult) -> None:
         out_tok = int(est.output_tokens or 0)
         if not (in_tok or out_tok):
             if self.cost.usage_sink is not None:
-                self.cost.usage_sink(observed_usage, identity=res.usage_id, model=model_name, worker_id=self.solver_id, role="worker", actor_kind="worker")
+                self.cost.usage_sink(observed_usage, identity=res.usage_id, model=model_name, worker_id=self.solver_id, role="worker", actor_kind="worker", generation=generation, **price_identity)
             return
     try:
         reported = None if usd is None else float(usd)
@@ -1458,7 +1868,7 @@ async def _stream_cost(self, res: CliResult) -> None:
                 run_id=self.run_id,
                 solver_id=self.solver_id,
                 challenge_id=self.challenge.id,
-                usage=observed_usage, usage_id=res.usage_id, actor_kind="worker", generation=generation, engine=engine,
+                usage=observed_usage, usage_id=res.usage_id, actor_kind="worker", generation=generation, **price_identity,
             )
             self._stream_cost_flushed = True
             return
@@ -1466,7 +1876,7 @@ async def _stream_cost(self, res: CliResult) -> None:
             float(reported or 0.0), run_id=self.run_id,
             solver_id=self.solver_id, challenge_id=self.challenge.id,
             input_tokens=in_tok, output_tokens=out_tok,
-            usage=observed_usage, usage_id=res.usage_id, model=model_name, actor_kind="worker", generation=generation, engine=engine)
+            usage=observed_usage, usage_id=res.usage_id, model=model_name, actor_kind="worker", generation=generation, **price_identity)
         self._stream_cost_flushed = True
     except Exception:
         __import__("logging").getLogger(__name__).exception("usage settlement failed for worker %s", self.solver_id)
@@ -1509,7 +1919,7 @@ async def _record_fact(self, fact: str, *, verified: bool, artifact_id: str,
         )
         if verified and self._is_solved_claim(fact):
             verified = False
-            await self._emit_bb("claim_solved_rejected", claim=fact[:200],
+            await self._emit_bb("claim_solved_rejected", claim=fact,
                                 worker=self.solver_id)
         elif verified and not (
             (artifact_id and artifact_id.strip()) or (witness and witness.strip())
@@ -1602,6 +2012,29 @@ async def _commit_worker_result(self, status: str, result_detail: str = "",
     if not checkpoint and self._worker_result_committed:
         return dict(getattr(self, "_last_worker_result_commit", None) or {})
     wr = self._build_worker_result(status, result_detail=result_detail)
+    draft_for_salvage = dict(getattr(self, "_draft_fact", None) or {})
+    draft_title = str(draft_for_salvage.get("title") or "").strip()
+    draft_content = str(draft_for_salvage.get("content") or "").strip()
+    if (
+        not checkpoint
+        and getattr(self.challenge, "mode", "ctf") == "ctf"
+        and draft_title
+        and draft_content
+    ):
+        prov = _fact_claim_provenance(
+            self, {"artifact_refs": _ctf_step_artifact_refs(self)}
+        )
+        if draft_for_salvage.get("enables") and prov.get("artifact_refs"):
+            prov["enables"] = draft_for_salvage["enables"]
+        draft_claim = ObservationClaim(
+            text=f"{draft_title}\n{draft_content}",
+            claim_verified=False,
+            provenance=prov,
+        )
+        wr = replace(
+            wr,
+            observations=[*list(wr.observations), draft_claim],
+        )
     if not checkpoint:
         salvage = unanswered_observation_claim(self, status)
         if salvage is not None:
@@ -1656,7 +2089,7 @@ async def _commit_worker_result(self, status: str, result_detail: str = "",
             last_error = exc
             self._worker_result_commit_error = (
                 f"{type(exc).__name__}: {exc}"
-            )[:1000]
+            )
             if attempt == 0:
                 await asyncio.sleep(0)
     if last_error is not None:
@@ -1787,11 +2220,6 @@ async def _accept_flag(self, flag: str) -> bool:
     terminal lifecycle event — that fires once in run() with ALL flags, so a
     multi-flag worker can accept several and finish once."""
     if flag in self._already_found:
-        return False
-    if flag in self._rejected_flags():
-        await self._emit_bb(
-            "flag_reaccept_blocked", flag=flag,
-            reason="operator marked this flag false-positive; permanently rejected")
         return False
     # Persist first. If the host is interrupted before the request file is
     # removed, the next drain sees the durable graph row and safely consumes the

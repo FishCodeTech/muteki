@@ -1,12 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { Button, SegmentedControl, Select, Switch } from "@/components/chat/ui";
+import { useState } from "react";
+import { SegmentedControl, Select, Switch } from "@/components/chat/ui";
 import { accessModeMeta } from "@/components/conversation/ConversationComposerModes";
 import { EDITOR_CHOICES, useChatPreferences, writeChatPreferences, type DiffViewDefault, type EditorChoice, type RunningSendDefault, type SendKey } from "@/lib/chatPreferences";
 import { useConversationServerPreferences, writeConversationServerPreferences } from "@/lib/conversationServerPreferences";
 import { useLang } from "@/lib/i18n";
-import { apiFetch, type LlmProfile } from "@/lib/useRun";
 import { isMacPlatform } from "@/lib/shortcutBindings";
 import { SettingsNote, SettingsRow, SettingsSection } from "./primitives";
 
@@ -21,32 +20,10 @@ const EDITOR_LABELS: Record<EditorChoice, [string, string]> = {
   system: ["系统默认应用", "System default application"],
 };
 
-type TitlerState = { status: "loading" } | { status: "ready"; profile: LlmProfile | null } | { status: "error"; message: string };
-
-function useTitlerProfile(): TitlerState {
-  const [state, setState] = useState<TitlerState>({ status: "loading" });
-  useEffect(() => {
-    let alive = true;
-    void (async () => {
-      try {
-        const response = await apiFetch("/api/settings/workers");
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const body = await response.json() as { config?: { llm_profiles?: { titler?: LlmProfile } } };
-        if (alive) setState({ status: "ready", profile: body.config?.llm_profiles?.titler ?? null });
-      } catch (error) {
-        if (alive) setState({ status: "error", message: error instanceof Error ? error.message : String(error) });
-      }
-    })();
-    return () => { alive = false; };
-  }, []);
-  return state;
-}
-
-export function ChatSettings({ navigate }: { navigate: (href: string) => void }) {
+export function ChatSettings() {
   const { lang } = useLang(); const en = lang === "en";
   const t = (zh: string, english: string) => en ? english : zh;
   const prefs = useChatPreferences();
-  const titler = useTitlerProfile();
   const [storageError, setStorageError] = useState("");
   const mac = isMacPlatform();
   const mod = mac ? "⌘" : "Ctrl";
@@ -63,10 +40,6 @@ export function ChatSettings({ navigate }: { navigate: (href: string) => void })
       "引擎报告额度用尽并给出重置时间时（目前为 Claude 与 Codex），Muteki 服务会安排在重置后自动继续被中断的对话。关闭窗口也会执行，只需服务保持运行；对话页横幅可单独取消某个对话的安排。",
       "When the engine reports an exhausted quota with a reset time (currently Claude and Codex), the Muteki service schedules the interrupted chat to continue after the reset. This runs with no window open as long as the service is running; the chat banner can cancel it for one chat.");
   const accessValue = prefs.defaultAccessMode || "supervised";
-  const titlerText = titler.status === "loading" ? t("正在读取…", "Loading…")
-    : titler.status === "error" ? t(`读取失败：${titler.message}`, `Could not load: ${titler.message}`)
-    : titler.profile?.model ? `${titler.profile.provider ? `${titler.profile.provider} · ` : ""}${titler.profile.model}`
-    : t("未单独配置", "Not configured");
 
   return <>
     <SettingsSection title={t("输入与发送", "Compose and send")}>
@@ -104,11 +77,6 @@ export function ChatSettings({ navigate }: { navigate: (href: string) => void })
         control={<Select<string> size="md" ariaLabel={t("默认权限模式", "Default permission mode")} value={accessValue} onChange={mode => save({ defaultAccessMode: mode === "supervised" ? "" : mode })}
           popoverClassName="w-[300px]"
           options={ACCESS_OPTIONS.map(mode => { const meta = accessModeMeta(mode); return { value: mode, label: meta.label, textValue: meta.label, description: meta.detail, icon: meta.icon }; })} />} />
-      <SettingsRow anchor="chat-title-model" title={t("标题生成模型", "Title generation model")}
-        description={t(
-          `当前：${titlerText}。标题与摘要优先使用 Titler 配置；不可用时回退到该对话正在使用的模型。`,
-          `Current: ${titlerText}. Titles and summaries use the Titler profile first and fall back to the chat's own model when it is unavailable.`)}
-        control={<Button size="sm" variant="secondary" icon="arrowUpRight" onClick={() => navigate("/ctf/workers")}>{t("配置 Titler", "Configure Titler")}</Button>} />
     </SettingsSection>
 
     <SettingsSection title={t("工作区", "Workspace")}>

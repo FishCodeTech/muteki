@@ -23,7 +23,8 @@ export type SurfaceKind =
   | "terminal"
   | "agents"
   | "plan"
-  | "pull-request";
+  | "pull-request"
+  | "extension";
 
 export type ChatSurface =
   | { id: "overview"; kind: "overview" }
@@ -34,9 +35,11 @@ export type ChatSurface =
   | { id: "terminal"; kind: "terminal" }
   | { id: "agents"; kind: "agents" }
   | { id: "plan"; kind: "plan" }
-  | { id: "pull-request"; kind: "pull-request" };
+  | { id: "pull-request"; kind: "pull-request" }
+  /** Host-provided surface; rendered only where a panel extension registry supplies `key`. */
+  | { id: `ext:${string}`; kind: "extension"; key: string; title?: string };
 
-export type SingletonKind = Exclude<SurfaceKind, "preview" | "file">;
+export type SingletonKind = Exclude<SurfaceKind, "preview" | "file" | "extension">;
 
 export interface ThreadPanelState {
   isOpen: boolean;
@@ -446,9 +449,10 @@ const SURFACE_META: Record<SurfaceKind, { label: string; icon: string; shortcut?
   file: { label: "文件", icon: "fileCode" },
   files: { label: "文件", icon: "folderTree", shortcut: "F" },
   terminal: { label: "终端", icon: "terminal", shortcut: "T" },
-  agents: { label: "Agents", icon: "bot", shortcut: "A" },
+  agents: { label: "子代理", icon: "bot", shortcut: "A" },
   plan: { label: "计划", icon: "listTodo", shortcut: "P" },
   "pull-request": { label: "Pull request", icon: "gitPullRequest", shortcut: "R" },
+  extension: { label: "工作区", icon: "layers" },
 };
 
 export function surfaceMeta(kind: SurfaceKind) {
@@ -467,5 +471,6 @@ export function surfaceTitle(surface: ChatSurface): string {
     }
   }
   if (surface.kind === "file") return surface.path.split("/").pop() || surface.path;
+  if (surface.kind === "extension") return surface.title || SURFACE_META.extension.label;
   return SURFACE_META[surface.kind].label;
 }

@@ -39,6 +39,7 @@ export function knowledgeKindsForMode(mode: RunCanvasMode): CollaborationKnowled
 export function roleLabel(agent: CollaborationAgent, t: Translate): string {
   if (agent.role === "coordinator") return t("collab.role.coordinator");
   if (agent.role === "decision") return t("collab.role.decision");
+  if (agent.role === "challenger") return t("collab.role.challenger");
   if (agent.role === "source") return t("collab.role.source");
   if (agent.role === "review") return t("collab.role.review");
   if (agent.role === "verifier") return t("collab.role.verifier");
@@ -56,6 +57,7 @@ export function coordinatorStatus(agent: CollaborationAgent, t: Translate, mode?
 }
 
 export function statusLabel(agent: CollaborationAgent, t: Translate, mode?: RunCanvasMode): string {
+  if (agent.role === "challenger") return t(`collab.challenger.status.${agent.challenger?.status || "idle"}`);
   if (agent.role === "source") return t("collab.source.recorded");
   if (agent.role === "decision") return t(agent.online ? "collab.decision.running" : "collab.decision.recorded");
   if (mode === "pentest" && agent.statusKind === "solved") return t("collab.legend.goalProven");
@@ -85,13 +87,13 @@ export function knowledgeLabel(
   t: Translate,
   mode?: RunCanvasMode,
 ): string {
+  if (kind === "intent" || kind === "step") return t("collab.knowledge.step");
+  if (kind === "goal") return t("collab.knowledge.goal");
   if (mode === "ctf") {
-    if (kind === "intent" || kind === "step") return t("collab.knowledge.step");
     if (kind === "fact") return t("collab.knowledge.factRecord");
     if (kind === "observation") return t("collab.knowledge.observation");
     if (kind === "dead_end") return t("collab.knowledge.dead_end");
     if (kind === "poc") return t("collab.knowledge.resource");
-    if (kind === "goal") return t("collab.knowledge.goal");
     if (kind === "finding") return t("collab.knowledge.findingResult");
   }
   return t(`collab.knowledge.${kind}`);

@@ -42,6 +42,9 @@ async def _record_worker_dispatch_failure(
     if (solver is not None
             and bool(getattr(solver, "_muteki_worker_dispatch_failure_recorded", False))):
         return bool(getattr(self, "_worker_dispatch_failure_limit_reached", False))
+    from muteki.solver.worker_readiness import worker_readiness_cache
+
+    worker_readiness_cache.invalidate()
     active = (state.task_solvers if state is not None else active_solvers) or {}
     await _observe_started_workers(self, state, active.values())
     if solver is not None:
@@ -211,6 +214,7 @@ async def _retire_finished_worker(self, state, t):
                 self._active_verifier_tasks.discard(t)
             if not is_review_task and not is_verifier_task:
                 state.completed_for_review_n += 1
+                state.total_completed_steps_n += 1
             _mark_ctf_batch_reaped(
                 state,
                 batch_id=ctf_batch_id,
@@ -358,6 +362,7 @@ async def _fold_finished_worker(self, state, retired) -> str:
                     pass
             if not is_review_task and not is_verifier_task:
                 state.completed_for_review_n += 1
+                state.total_completed_steps_n += 1
             if t in self._active_verifier_tasks:
                 self._active_verifier_tasks.discard(t)
             _mark_ctf_batch_reaped(
@@ -376,6 +381,43 @@ async def _fold_finished_worker(self, state, retired) -> str:
         runtime_unavailable = isinstance(e, WorkerRuntimeUnavailable)
         launch_code = launch_failure_code(e)
         terminal_code = str(getattr(e, "code", "") or "")
+        budget_expired = terminal_code == "execution_budget_exhausted"
+        if budget_expired:
+            self._budget_exhausted_kind = "execution_budget_exhausted"
+            if (
+                intent_id
+                and not is_review_task
+                and not is_verifier_task
+                and self.shared_graph is not None
+                and not bool(getattr(solver, "_runtime_process_started", True))
+            ):
+                try:
+                    self.shared_graph.release_intent_claim(
+                        worker=sid,
+                        intent_id=str(intent_id),
+                        reason="execution budget expired before worker process start",
+                    )
+                except Exception:
+                    pass
+            await emit_bb(
+                "worker_finished",
+                worker=sid,
+                result="budget_exhausted",
+                retire_deferred=retire_deferred,
+            )
+            self._active_review_tasks.discard(t)
+            self._active_verifier_tasks.discard(t)
+            if not is_review_task and not is_verifier_task:
+                state.completed_for_review_n += 1
+                state.total_completed_steps_n += 1
+            _mark_ctf_batch_reaped(
+                state,
+                batch_id=ctf_batch_id,
+                is_review_task=is_review_task,
+                is_verifier_task=is_verifier_task,
+            )
+            state.reaped_n += 1
+            return "proceed"
         terminal_state_failure = terminal_code in {
             "event_persistence_failed",
             "tool_artifact_persistence_failed",
@@ -452,9 +494,91 @@ async def _fold_finished_worker(self, state, retired) -> str:
                 solver=solver,
             )
         if runtime_unavailable:
-            # A missing provider/model catalog is a deterministic runtime setup
-            # failure. Reopening the semantic Intent cannot change it; with one
-            # configured profile that produced an unbounded spawn/fail/reopen loop.
+            role_for_task = (
+                "review" if is_review_task
+                else "verifier" if is_verifier_task
+                else "explore"
+            )
+            await emit_bb(
+                "worker_runtime_unavailable",
+                worker=sid,
+                engine=str(engine),
+                code=str(e.code),
+                detail=str(e),
+            )
+            can_continue = False
+            if not terminal_state_failure and hasattr(
+                self, "_quarantine_failed_profile"
+            ):
+                can_continue, _ = self._quarantine_failed_profile(
+                    state, str(engine), role=role_for_task, exc=e
+                )
+            if can_continue:
+                if (
+                    intent_id
+                    and not is_review_task
+                    and not is_verifier_task
+                    and self.shared_graph is not None
+                ):
+                    iid = str(intent_id)
+                    state.intent_failed_engines.setdefault(iid, set()).add(
+                        str(engine)
+                    )
+                    try:
+                        reopened = bool(
+                            self.shared_graph.reopen_intent(
+                                actor="coordinator",
+                                intent_id=iid,
+                                reason=(
+                                    f"retry after worker runtime unavailable on {engine}: "
+                                    f"{e}"
+                                ),
+                            )
+                        )
+                    except Exception:
+                        reopened = False
+                    if not reopened:
+                        try:
+                            reopened = bool(
+                                self.shared_graph.release_intent_claim(
+                                    worker=sid,
+                                    intent_id=iid,
+                                    reason=(
+                                        f"retry after worker runtime unavailable on {engine}"
+                                    ),
+                                )
+                            )
+                        except Exception:
+                            reopened = False
+                    if reopened:
+                        await emit_bb(
+                            "intent_reopened",
+                            intent_id=iid,
+                            previous_result="runtime_unavailable",
+                            failed_engine=str(engine),
+                            retry_engine_selection="scheduler",
+                        )
+                await emit_bb(
+                    "worker_finished", worker=sid, result="runtime_unavailable",
+                    retire_deferred=retire_deferred,
+                )
+                if t in self._active_review_tasks:
+                    self._active_review_tasks.discard(t)
+                if t in self._active_verifier_tasks:
+                    self._active_verifier_tasks.discard(t)
+                if not is_review_task and not is_verifier_task:
+                    state.completed_for_review_n += 1
+                    state.total_completed_steps_n += 1
+                _mark_ctf_batch_reaped(
+                    state,
+                    batch_id=ctf_batch_id,
+                    is_review_task=is_review_task,
+                    is_verifier_task=is_verifier_task,
+                )
+                state.reaped_n += 1
+                return "proceed"
+            # A missing provider/model catalog with no remaining healthy profile
+            # is a deterministic runtime setup failure.
             state.runtime_terminal_failure = True
             self._runtime_failure_detail = (
                 f"Worker execution failed ({e.code}): {e}"
@@ -468,13 +592,6 @@ async def _fold_finished_worker(self, state, retired) -> str:
                     self._cancel_solver(other_solver)
                     other.cancel()
             await emit_bb(
-                "worker_runtime_unavailable",
-                worker=sid,
-                engine=str(engine),
-                code=str(e.code),
-                detail=str(e),
-            )
-            await emit_bb(
                 "worker_finished", worker=sid, result="runtime_unavailable",
                 retire_deferred=retire_deferred,
             )
@@ -484,6 +601,7 @@ async def _fold_finished_worker(self, state, retired) -> str:
                 self._active_verifier_tasks.discard(t)
             if not is_review_task and not is_verifier_task:
                 state.completed_for_review_n += 1
+                state.total_completed_steps_n += 1
             _mark_ctf_batch_reaped(
                 state,
                 batch_id=ctf_batch_id,
@@ -502,6 +620,7 @@ async def _fold_finished_worker(self, state, retired) -> str:
             self._active_verifier_tasks.discard(t)
             if not is_review_task and not is_verifier_task:
                 state.completed_for_review_n += 1
+                state.total_completed_steps_n += 1
             _mark_ctf_batch_reaped(
                 state, batch_id=ctf_batch_id,
                 is_review_task=is_review_task,
@@ -520,9 +639,12 @@ async def _fold_finished_worker(self, state, retired) -> str:
                 reason=f"runtime supervisor/link failed mid-worker: {e}",
                 requested_backend="container",
                 fallback_backend="none")
-        if (getattr(self.challenge, "mode", "ctf") != "ctf"
-                and intent_id and not is_review_task and not is_verifier_task
-                and self.shared_graph is not None):
+        if (intent_id and not is_review_task and not is_verifier_task
+                and self.shared_graph is not None
+                and (
+                    getattr(self.challenge, "mode", "ctf") != "ctf"
+                    or len(state.intent_failed_engines.get(str(intent_id), ())) < 1
+                )):
             iid = str(intent_id)
             state.intent_failed_engines.setdefault(iid, set()).add(
                 str(engine)
@@ -534,7 +656,7 @@ async def _fold_finished_worker(self, state, retired) -> str:
                     reason=(
                         f"retry after worker execution failure on {engine}: "
                         f"{type(e).__name__}: {e}"
-                    )[:500],
+                    ),
                 ))
             except Exception:
                 reopened = False
@@ -569,6 +691,7 @@ async def _fold_finished_worker(self, state, retired) -> str:
             self._active_verifier_tasks.discard(t)
         if not is_review_task and not is_verifier_task:
             state.completed_for_review_n += 1
+            state.total_completed_steps_n += 1
         _mark_ctf_batch_reaped(
             state,
             batch_id=ctf_batch_id,
@@ -586,6 +709,7 @@ async def _fold_finished_worker(self, state, retired) -> str:
     state.reaped_n += 1
     if not is_review_task and not is_verifier_task:
         state.completed_for_review_n += 1
+        state.total_completed_steps_n += 1
         if intent_id:
             iid = str(intent_id)
             result_status = str(

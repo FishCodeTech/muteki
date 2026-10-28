@@ -13,11 +13,12 @@ const API_PATHS = [
   /^\/api\/(health|readiness|workspace-kinds|engines|agent-runtimes)(\/|$)/,
   /^\/api\/auth\/(login|me|ticket|status|logout)$/,
   /^\/api\/(threads|projects|workspaces|import|sidebar-preferences|receipts|usage)(\/|$)/,
+  /^\/api\/src(\/|$)/,
   /^\/api\/directories\/select$/,
   /^\/api\/settings\/(credentials|credential-accounts|model-endpoints|workers|worker-model|worker-models|worker-image|profiles|runtime|llm|extensions|agent-extensions|conversation|notifications|capabilities|operations)(\/|$)/,
   /^\/api\/(conversation|agent-runtime|capabilities|extensions|platform-extensions|operations)(\/|$)/,
   /^\/api\/(agent-extensions|chat-plugins|conversation-shares|commands|queries|effects)(\/|$)/,
-  /^\/api\/settings\/(credential-models|identity|system-login|system-update|access)(\/|$)/,
+  /^\/api\/settings\/(credential-models|credential-drafts|identity|system-login|system-update|access)(\/|$)/,
   /^\/api\/events\/(read|wait)$/,
 ];
 const METHOD_RULES = [

@@ -80,7 +80,21 @@ export function ScrollArea({
 }
 
 /** Height-animated disclosure body. */
-export function Collapse({ open, children, className, initial = false }: { open: boolean; children: ReactNode; className?: string; initial?: boolean }) {
+export function Collapse({
+  open,
+  children,
+  className,
+  initial = false,
+  enterDuration = 0.22,
+  exitDuration = 0.14,
+}: {
+  open: boolean;
+  children: ReactNode;
+  className?: string;
+  initial?: boolean;
+  enterDuration?: number;
+  exitDuration?: number;
+}) {
   const reduced = useReducedMotion();
   // presenceAffectsLayout would hand descendants a new PresenceContext on
   // every render, re-rendering every motion element inside the body.
@@ -90,8 +104,8 @@ export function Collapse({ open, children, className, initial = false }: { open:
         <motion.div
           key="collapse"
           initial={reduced ? { opacity: 0 } : { height: 0, opacity: 0, y: -4, clipPath: "inset(0 0 100% 0)" }}
-          animate={reduced ? { opacity: 1 } : { height: "auto", opacity: 1, y: 0, clipPath: "inset(0 0 0% 0)", transition: { duration: 0.22, ease: EASE_OUT } }}
-          exit={reduced ? { opacity: 0 } : { height: 0, opacity: 0, y: -4, clipPath: "inset(0 0 100% 0)", transition: { duration: 0.14, ease: EASE_OUT } }}
+          animate={reduced ? { opacity: 1 } : { height: "auto", opacity: 1, y: 0, clipPath: "inset(0 0 0% 0)", transition: { duration: enterDuration, ease: EASE_OUT } }}
+          exit={reduced ? { opacity: 0 } : { height: 0, opacity: 0, y: -4, clipPath: "inset(0 0 100% 0)", transition: { duration: exitDuration, ease: EASE_OUT } }}
           style={{ transformOrigin: "top" }}
           className={cn("overflow-hidden", className)}
         >

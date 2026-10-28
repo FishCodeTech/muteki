@@ -23,7 +23,7 @@ import uuid
 from difflib import SequenceMatcher
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Final, Optional
+from typing import Any, Optional
 
 import httpx
 
@@ -119,6 +119,7 @@ class PlannerFailureKind(str, Enum):
     TIMEOUT = "planner_timeout"
     EXCEPTION = "planner_exception"
     INVALID_PLAN = "invalid_plan"
+    STALE_PLAN = "stale_plan"
     EMPTY_PLAN = "empty_plan"
     NEEDS_NEW_INFORMATION = "needs_new_information"
 
@@ -162,7 +163,11 @@ class ReasonResult:
     pinned_facts: list[int] = field(default_factory=list)
     supersede_intents: list[str] = field(default_factory=list)
     supersede_why: str = ""
+    supersede_facts: list[dict[str, Any]] = field(default_factory=list)
+    sub_goal_operations: list[dict[str, Any]] = field(default_factory=list)
     reprioritize_intents: dict[str, str] = field(default_factory=dict)
+    yield_visit: bool = False
+    planning_graph_seq: int = -1
     planner_failure: PlannerFailure | None = None
     diagnostics: ReasonDiagnostics = field(default_factory=ReasonDiagnostics)
     intent_parse_rejections: list[dict[str, Any]] = field(default_factory=list)
@@ -173,19 +178,22 @@ REASON_SYSTEM = """你负责读取完整 Fact-Goal-Step 图并决定下一步，
 只返回 JSON：
 {"verdict":"explore|complete","goal_met":false,"complete_why":"",
 "progress":{"summary":""},"intents":[
-{"id":"I1","from":[],"goal":"当前可执行的方向","priority":"high|normal|low"}]}
+{"id":"I1","from":[],"goal":"当前可执行的方向","priority":"high|normal|low",
+"expected_observable":"本 Step 可观察到的结果","stop_condition":"有界且可检验的停止条件",
+"coverage_key":"范围与假设对应的稳定标识"}]}
 
 规则：
 - Goal 已由图中的 Fact 或平台结果满足时返回 complete。
-- 尚未完成时创建最多 {max_intents} 个当前可执行、尽量互补的 Step。
+- 尚未完成时创建{max_intents_instruction}当前可执行、尽量互补的 Step。
 - Step 只描述要向目标取的那条信息，不写分步方法；一个 Step 只产出一个可独立交接的结果。
 - 同批 Step 没有先后顺序，全部前置必须已经是 Fact。后续动作依赖尚未形成 Fact 的共享入口时，留到下一轮再创建。
 - from 可以引用相关 Fact id；冷启动时可以为空。
-- 不创建能力、资源、访问路径、风险、路线、覆盖、审计或抢占合同。
+- 每个 Step 必须写 expected_observable、stop_condition 和 coverage_key。同一范围与假设沿用已有 coverage_key；已有明确排除时，重开需引用支持变化的新 Fact，不靠换措辞重试。
+- 没有证据支持新的可执行假设时，intents 可为空，并在 progress.summary 写清依据与缺口；不宣称 Goal 完成，也不制造复盘工作耗满预算。
+- 不创建额外的能力、资源、访问路径、风险、路线、审计或抢占合同。
 - progress.summary 使用简体中文概括当前进展和下一步。
 - 只输出 JSON。"""
 
-REASON_COMPACTION_RESERVE_TOKENS = 16_384
 REASON_KEEP_RECENT_TOKENS = 20_000
 
 REASON_COMPACTION_SYSTEM = """You compact historical state for a long-running CTF Reason planner.
@@ -246,7 +254,6 @@ async def compact_reason_context(
             {"role": "user", "content": prompt},
         ],
         reasoning_effort="none",
-        max_tokens=REASON_COMPACTION_RESERVE_TOKENS,
         stream=False,
         run_id=run_id,
         challenge_id=challenge_id,
@@ -273,7 +280,12 @@ def build_reason_prompt(
 ) -> list[dict]:
     if mode != "ctf":
         raise ValueError("legacy JSON Reason supports CTF only")
-    system = REASON_SYSTEM.replace("{max_intents}", str(max_intents))
+    instruction = (
+        "任意数量的" if int(max_intents) < 0
+        else "零个新的" if int(max_intents) == 0
+        else f"最多 {int(max_intents)} 个"
+    )
+    system = REASON_SYSTEM.replace("{max_intents_instruction}", instruction)
     return [
         {"role": "system", "content": system},
         {
@@ -325,7 +337,8 @@ def parse_reason_reply(
     intents: list[Intent] = []
     parse_rejections: list[dict[str, Any]] = []
     raw_intents = d.get("intents", []) if isinstance(d.get("intents"), list) else []
-    for i, raw in enumerate(raw_intents[:max_intents]):
+    accepted_raw = raw_intents if max_intents < 0 else raw_intents[:max_intents]
+    for i, raw in enumerate(accepted_raw):
         if not isinstance(raw, dict):
             parse_rejections.append({
                 "raw_index": i,
@@ -365,10 +378,10 @@ def parse_reason_reply(
                     str(item).strip().casefold()
                     for item in (value_claim.get(key) or [])
                     if str(item).strip()
-                ))[:32]
+                ))
             value_claim["novelty_key"] = str(
                 value_claim.get("novelty_key") or ""
-            ).strip().casefold()[:300]
+            ).strip().casefold()
             value_claim["cost_class"] = str(
                 value_claim.get("cost_class") or "medium"
             ).strip().lower()
@@ -380,7 +393,7 @@ def parse_reason_reply(
             str(item).strip().casefold()
             for item in (raw.get("requires_capabilities") or [])
             if str(item).strip()
-        ))[:32]
+        ))
         route_hash = str(raw.get("route_hash") or "").strip()
         coverage_key = str(raw.get("coverage_key") or "").strip()
         if not coverage_key and wc != "review":
@@ -413,7 +426,9 @@ def parse_reason_reply(
                 initial=bool(raw.get("initial")),
             )
         )
-    for i, raw in enumerate(raw_intents[max_intents:], start=max_intents):
+    rejected_raw = [] if max_intents < 0 else raw_intents[max_intents:]
+    rejected_start = len(raw_intents) if max_intents < 0 else max_intents
+    for i, raw in enumerate(rejected_raw, start=rejected_start):
         parse_rejections.append({
             "raw_index": i,
             "model_intent_id": (
@@ -429,18 +444,18 @@ def parse_reason_reply(
     raw_audit = d.get("audit", [])
     if not isinstance(raw_audit, list):
         raw_audit = []
-    for raw in raw_audit[:8]:
+    for raw in raw_audit:
         if isinstance(raw, dict):
             try:
                 fact_seq = int(raw.get("fact") or 0)
             except (TypeError, ValueError):
                 fact_seq = 0
-            reason = " ".join(str(raw.get("reason") or "").split())[:500]
+            reason = " ".join(str(raw.get("reason") or "").split())
             goal = " ".join(
                 str(raw.get("verification_goal") or "").split()
-            )[:1000]
+            )
         else:
-            text = " ".join(str(raw or "").split())[:1000]
+            text = " ".join(str(raw or "").split())
             match = re.search(r"\[#(\d+)\]", text)
             fact_seq = int(match.group(1)) if match else 0
             reason = text
@@ -469,19 +484,19 @@ def parse_reason_reply(
     if not isinstance(raw_supersede, list):
         raw_supersede = []
     for raw in raw_supersede:
-        intent_id = str(raw or "").strip()[:180]
+        intent_id = str(raw or "").strip()
         if intent_id and intent_id not in supersede_intents:
             supersede_intents.append(intent_id)
         if len(supersede_intents) >= 24:
             break
     supersede_why = " ".join(
         str(d.get("supersede_why") or "").split()
-    )[:1000]
+    )
     reprioritize_intents: dict[str, str] = {}
     raw_reprioritize = d.get("reprioritize_intents")
     if isinstance(raw_reprioritize, dict):
         for raw_id, raw_priority in raw_reprioritize.items():
-            intent_id = str(raw_id or "").strip()[:180]
+            intent_id = str(raw_id or "").strip()
             priority = str(raw_priority or "").strip().lower()
             if intent_id and priority in {"high", "normal", "low"}:
                 reprioritize_intents[intent_id] = priority
@@ -491,18 +506,16 @@ def parse_reason_reply(
     progress = raw_progress if isinstance(raw_progress, dict) else {}
     progress_summary = " ".join(
         str(progress.get("summary") or "").split()
-    )[:1600]
+    )
     progress_sections: dict[str, list[str]] = {}
     for key in ("confirmed", "active", "blocked", "next"):
         rows: list[str] = []
         raw_rows = progress.get(key)
         if isinstance(raw_rows, list):
             for raw in raw_rows:
-                text = " ".join(str(raw or "").split())[:500]
+                text = " ".join(str(raw or "").split())
                 if text and text not in rows:
                     rows.append(text)
-                if len(rows) >= 3:
-                    break
         progress_sections[key] = rows
     # Rolling upgrades and weaker JSON models may omit the new progress object.
     # Keep the fallback strictly within this Reason response; never substitute
@@ -517,18 +530,18 @@ def parse_reason_reply(
             value for value in (
                 complete_why,
                 drift,
-                "；".join(rationales[:2]),
-                "；".join(intent.goal for intent in intents[:2]),
-                "；".join(audit_texts[:2]),
+                "；".join(rationales),
+                "；".join(intent.goal for intent in intents),
+                "；".join(audit_texts),
             ) if value
-        )[:1600]
+        )
     if not progress_sections["blocked"]:
         progress_sections["blocked"] = (
-            [drift[:500]] if drift else audit_texts[:3]
+            [drift] if drift else audit_texts
         )
     if not progress_sections["next"]:
         progress_sections["next"] = [
-            " ".join(intent.goal.split())[:500] for intent in intents[:3]
+            " ".join(intent.goal.split()) for intent in intents
         ]
     # verdict: honor the model's explicit choice; else derive it (back-compat with
     # the old goal_met-only schema). goal_met → complete; otherwise → explore.
@@ -539,7 +552,16 @@ def parse_reason_reply(
     if verdict == VERDICT_COMPLETE:
         goal_met = True
     planner_failure = None
-    if not plan_is_valid:
+    if str(finish_reason or "").strip().lower() in {
+        "length", "max_tokens", "max_output_tokens",
+    }:
+        planner_failure = PlannerFailure(
+            PlannerFailureKind.INVALID_PLAN,
+            "provider ended the planner generation at its output limit",
+        )
+        parse_status = "provider_output_limit"
+        parse_detail = planner_failure.detail
+    elif not plan_is_valid:
         planner_failure = PlannerFailure(
             PlannerFailureKind.INVALID_PLAN,
             "planner reply did not contain the required JSON intents array",
@@ -618,7 +640,7 @@ async def run_reason(
             solver_id="reason",
         )
     except (TimeoutError, httpx.TimeoutException) as exc:
-        detail = f"{type(exc).__name__}: {exc}"[:500]
+        detail = f"{type(exc).__name__}: {exc}"
         return ReasonResult(
             goal_met=False,
             intents=[],
@@ -638,7 +660,7 @@ async def run_reason(
             ),
         )
     except Exception as exc:
-        detail = f"{type(exc).__name__}: {exc}"[:500]
+        detail = f"{type(exc).__name__}: {exc}"
         return ReasonResult(
             goal_met=False,
             intents=[],
@@ -991,8 +1013,14 @@ def dispatch_intents(
     graph_mode = getattr(getattr(shared_graph, "challenge", None), "mode", "ctf")
     ctf_mode = graph_mode in {"ctf", "pentest"}
     if ctf_mode:
+        existing_ids = {
+            str((event.get("payload") or {}).get("intent_id") or "")
+            for event in shared_graph.events()
+            if event.get("kind") == "intent_proposed"
+        } if graph_mode == "ctf" else set()
+        next_step = shared_graph.prior_intent_count() + 1 if graph_mode == "ctf" else 1
         for raw_index, intent in enumerate(result.intents):
-            if not all((
+            if graph_mode == "pentest" and not all((
                 str(intent.expected_observable or "").strip(),
                 str(intent.stop_condition or "").strip(),
                 str(intent.coverage_key or "").strip(),
@@ -1013,7 +1041,14 @@ def dispatch_intents(
                 if intent.priority in {"high", "normal", "low"}
                 else "normal"
             )
-            intent_id = f"I-reason-{uuid.uuid4().hex[:16]}"
+            if graph_mode == "ctf":
+                while f"step_{next_step:03d}" in existing_ids:
+                    next_step += 1
+                intent_id = f"step_{next_step:03d}"
+                existing_ids.add(intent_id)
+                next_step += 1
+            else:
+                intent_id = f"I-reason-{uuid.uuid4().hex[:16]}"
             seq = shared_graph.propose_intent(
                 actor=actor,
                 intent_id=intent_id,
@@ -1026,6 +1061,7 @@ def dispatch_intents(
                     "stop_condition": intent.stop_condition,
                     "coverage_key": intent.coverage_key,
                     "required_pocs": list(intent.required_pocs),
+                    "requires_capabilities": list(intent.requires_capabilities),
                     **({"value_claim": dict(intent.value_claim)} if graph_mode == "pentest" else {}),
                 },
                 from_fact_seqs=intent.from_facts or None,
@@ -1052,7 +1088,7 @@ def dispatch_intents(
                 "requested_priority": priority,
                 "priority_reason": "planner",
                 "value_claim": dict(intent.value_claim) if graph_mode == "pentest" else {},
-                "requires_capabilities": [],
+                "requires_capabilities": list(intent.requires_capabilities),
                 "dup_of": "",
                 "reopen_because": "",
                 "declares": None,

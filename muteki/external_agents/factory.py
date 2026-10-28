@@ -35,6 +35,7 @@ STRUCTURED_ADAPTER_ENGINES: dict[str, str] = {
 
 HISTORICAL_ADAPTER_ENGINES: dict[str, str] = {
     "deepseek.harness": "dsh",
+    "pi.acp": "pi",
 }
 
 # 已发布过的内部 ID 继续可读；新配置和 UI 一律返回左侧产品 ID。
@@ -46,7 +47,6 @@ LEGACY_ADAPTER_ALIASES: dict[str, str] = {
 
 OPTIONAL_STRUCTURED_ADAPTER_ENGINES: dict[str, str] = {
     "kimi.local_server": "kimi",
-    "pi.acp": "pi",
     "omp.rpc_v2": "omp",
     "cursor.acp": "cursor",
     "droid.acp": "droid",
@@ -330,6 +330,8 @@ class RuntimeAdapterFactory:
             raise ValueError(f"unknown Runtime adapter: {config.adapter_id!r}")
         if engine == "dsh":
             raise EngineTemporarilyUnsupportedError("dsh")
+        if adapter_id == "pi.acp":
+            raise ValueError("Pi ACP 已移除。请选择 Pi RPC；历史记录保持可读，旧 ACP 会话不会自动迁移。")
         common = self._common(config)
         binary = config.binary_path or None
         transport = config.transport
@@ -353,7 +355,7 @@ class RuntimeAdapterFactory:
 
         # Health discovery and structured chat must select the same installation.
         # Bridge executables with their own resolution remain adapter-owned.
-        if binary is None and adapter_id not in {"cursor.sdk", "cursor.acp", "pi.acp"}:
+        if binary is None and adapter_id not in {"cursor.sdk", "cursor.acp"}:
             from muteki.solver.cli_engines.bins import resolve_engine_bin
 
             binary = resolve_engine_bin(engine)
@@ -395,13 +397,6 @@ class RuntimeAdapterFactory:
                 runtime_root=self.sessions_root / "_grok_acp_runtime",
                 mcp_ready_wait_seconds=transport.get(
                     "mcp_ready_wait_seconds"),
-                env_extra=env,
-                **common,
-            )
-        elif adapter_id == "pi.acp":
-            adapter = ea.PiAcpAdapter(
-                binary=binary,
-                runtime_root=self.sessions_root / "_pi_acp_runtime",
                 env_extra=env,
                 **common,
             )
@@ -508,6 +503,11 @@ class RuntimeAdapterFactory:
             (row.adapter_id, row.instance_id) for row in rows if row.enabled
         }
         for row in rows:
+            # Keep persisted ACP identities readable without trying to launch
+            # the removed transport during server startup. Explicit create
+            # still returns its retirement error; never migrate sessions.
+            if row.adapter_id == "pi.acp":
+                continue
             self.register(registry, row)
         if include_structured_defaults:
             for adapter_id in builtin_structured_adapter_ids():

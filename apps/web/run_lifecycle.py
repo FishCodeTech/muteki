@@ -6,6 +6,7 @@ import asyncio
 import os
 from typing import Any
 
+from muteki.core.blocking import run_blocking
 from muteki.control import StateConflict
 from muteki.core.events import Event, EventType
 
@@ -216,6 +217,7 @@ async def start(self, run_id: str, driver: Driver,
     handle. Finished generations may be explicitly restarted on the same run
     id, with a fresh bus/control epoch and cleared terminal projection.
     """
+    await self.create_async(run_id)
     async with self._lifecycle_lock:
         if self._shutting_down:
             raise StateConflict("run manager is shutting down")
@@ -234,6 +236,9 @@ async def start(self, run_id: str, driver: Driver,
         if not await self._drain_control_before_launch(run_id, run):
             raise StateConflict(
                 f"run {run_id} prior control epoch is still draining")
+        durable_seq = await run_blocking(run.store.last_stream_seq, run.run_id)
+        if run.started:
+            await self._ensure_control_async(run)
         async with self._lifecycle_lock:
             if (self._shutting_down or self.runs.get(run_id) is not run
                     or run_id in self._closing_runs
@@ -243,13 +248,13 @@ async def start(self, run_id: str, driver: Driver,
                 raise StateConflict(
                     f"run {run_id} lifecycle changed before launch")
             self.persist_run_launch_limits(run_id, launch_limits or {})
-            self._fresh_bus(run)
+            self._fresh_bus(run, durable_seq=durable_seq)
             self._retire_hitl_epoch(run, terminal=False)
             self._retire_worker_command_epoch(run)
             if run.started:
-                _actor, journal, _secrets = self._ensure_control(run)
-                state = journal.reopen_state(
-                    reason="explicit start generation")
+                _actor, journal, _secrets = await self._ensure_control_async(run)
+                state = await run_blocking(
+                    journal.reopen_state, reason="explicit start generation")
                 run.control_generation = state.generation
             self._launch_generation(run, driver)
             run.finished = False
@@ -367,9 +372,25 @@ async def _resolve_launching(
         if body and key in body and body[key] != saved_limits[key]:
             raise WorkerRuntimePolicyUnavailable(
                 f"Run {run_id} cannot change its saved {key} during continuation")
+    if body and "execution_budget" in body:
+        from muteki.solver.execution_budget import ExecutionBudget
+
+        budget_record = body["execution_budget"]
+        if not isinstance(budget_record, dict):
+            raise WorkerRuntimePolicyUnavailable(
+                f"Run {run_id} continuation execution budget must be an object")
+        renewed_budget = ExecutionBudget.from_record(budget_record)
+        renewed_budget.require_action(
+            reserve_seconds=renewed_budget.finalization_seconds)
     merged = {"challenge": ch, **saved_limits, **(body or {})}
     if requested_challenge:
         merged["challenge"] = {**ch, **requested_challenge}
+    if saved_mode == "ctf" and body and ("prompt" in body or requested_challenge):
+        from apps.web.task_contract import prepare_dispatch_contract
+
+        merged.pop("task_contract", None)
+        merged["challenge"].pop("task_contract", None)
+        merged, _ = prepare_dispatch_contract(merged)
     if merged["challenge"].get("mode") == "pentest":
         from apps.web.task_contract import prepare_dispatch_contract
         requested = dict((body or {}).get("challenge") or {})
@@ -431,19 +452,24 @@ async def _resolve_launching(
     # transaction. Holding the lifecycle lock across the replayable bus emit is
     # acceptable; it is a short local sink operation and prevents shutdown from
     # observing a half-reopened generation.
+    durable_seq = await run_blocking(run.store.last_stream_seq, run.run_id)
+    await self._ensure_control_async(run)
     async with self._lifecycle_lock:
         if (self._shutting_down or self.runs.get(run_id) is not run
                 or run_id in self._closing_runs
                 or (run.task is not None and not run.task.done())):
             return False
+        self.persist_run_launch_limits(
+            run_id, merged, renew_execution_budget=True,
+        )
         try:
-            _actor, control_journal, _secrets = self._ensure_control(run)
-            state = control_journal.reopen_state(reason="operator resolve")
+            _actor, control_journal, _secrets = await self._ensure_control_async(run)
+            state = await run_blocking(control_journal.reopen_state, reason="operator resolve")
             run.control_generation = state.generation
         except Exception:
             LOG.exception("failed to reopen control epoch for %s", run_id)
             return False
-        self._fresh_bus(run)
+        self._fresh_bus(run, durable_seq=durable_seq)
         self._retire_hitl_epoch(run, terminal=False)
         self._retire_worker_command_epoch(run)
         run.finished = False

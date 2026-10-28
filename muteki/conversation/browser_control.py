@@ -478,6 +478,62 @@ class BrowserControlBroker:
         return max(desktop or rows, key=lambda row: row.opened_at)
 
     async def invoke(self, thread_id: str, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        src = getattr(self, "src", None)
+        if src is None:
+            return await self._invoke_unchecked(thread_id, tool_name, arguments)
+        from muteki.src.store import SrcStoreError
+        try:
+            binding = src.task_for_thread(thread_id)
+        except SrcStoreError:
+            return await self._invoke_unchecked(thread_id, tool_name, arguments)
+        from muteki.src.contracts import ExecutionRequest
+        action = _ACTIONS.get(tool_name) or tool_name
+        policy = src.execution.current_policy(binding.task_id)
+        inspection_mode = str(policy.inspection_requirements.get("mode") or "off")
+        if policy.network_mode == "enforced" or inspection_mode == "enforce":
+            raise BrowserControlError(
+                "chat.browser.managed_task_required",
+                "当前 Task 要求强制网络 Scope 或内容检查；桌面 chat_browser 无法证明页面子请求经过受管网关和检查器。"
+                "请改用受管 Task 浏览器的命名 context 执行此动作。",
+                ErrorCategory.PERMISSION,
+                recovery_hint="使用受管 Task 浏览器，不要以桌面预览覆盖 enforced 保证。",
+                detail={"task_id": binding.task_id, "managed_browser_required": True},
+            )
+        invocation_id = f"browser-{uuid.uuid4().hex}"
+        request = ExecutionRequest(
+            invocation_id=invocation_id, task_id=binding.task_id, thread_id=thread_id,
+            tool_name=tool_name, action=action,
+            arguments={key: value for key, value in dict(arguments).items() if key != "idempotent"},
+            arguments_hash=src.store.digest(arguments), resource_kind="browser",
+            identity_ref=str(arguments.get("context_id") or "default"),
+            identity_revision=int(arguments.get("identity_revision") or 0),
+            policy_version=policy.version,
+        )
+
+        async def dispatch(_request: Any) -> dict[str, Any]:
+            return await self._invoke_unchecked(thread_id, tool_name, arguments)
+
+        receipt = await src.execution.execute(request, dispatch, wait_for_approval=True)
+        if receipt.dispatch_state != "completed":
+            raise BrowserControlError(
+                receipt.error_code or "outcome_unknown",
+                f"SRC 浏览器动作未完成：{receipt.dispatch_state}",
+                retryable=receipt.dispatch_state == "waiting_approval",
+            )
+        result = dict(src.execution.read_result(binding.task_id, receipt) or {})
+        if inspection_mode == "record":
+            result["inspection"] = {
+                "mode": "record", "coverage": "desktop_chat_browser",
+                "capture_state": "partial", "uninspected": True,
+                "reasons": [
+                    "desktop_subrequests_not_observed",
+                    "desktop_not_in_task_gateway_netns",
+                    "raw_http_content_not_inspected",
+                ],
+            }
+        return result
+
+    async def _invoke_unchecked(self, thread_id: str, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         action = _ACTIONS.get(tool_name)
         if action is None:
             raise BrowserControlError("chat.browser.tool_unknown", f"未知浏览器工具 {tool_name!r}",

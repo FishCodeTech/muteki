@@ -11,8 +11,8 @@
   请求关联、反向请求应答）。
 - ``acp``：ACP v1 transport 与 ``BaseAcpAdapter``（replay/live 区分、
   mcpServers 注入、request_permission 审批策略）。
-- ``cursor`` / ``cursor_sdk`` / ``grok`` / ``pi_acp``：RUNTIME-03 的结构化 Adapter
-  （Grok 默认走 ACP；Pi ACP 仅保留为显式兼容入口）。
+- ``cursor`` / ``cursor_sdk`` / ``grok``：RUNTIME-03 的结构化 Adapter
+  （Grok 默认走 ACP）。
   Cursor chat 默认是 ``cursor.sdk``；``cursor.acp`` 保留为显式变体。
 - ``codex``：Codex app-server stdio JSON-RPC 结构化 Adapter（RUNTIME-02）。
 - ``claude``：Claude Agent SDK 结构化 Adapter（RUNTIME-02）。
@@ -66,7 +66,6 @@ from .kimi import KimiAcpAdapter, KimiLocalServerAdapter
 from .omp import OmpAcpAdapter, OmpRpcAdapter
 from .opencode import OpenCodeServerAdapter
 from .pi import PiAdapter
-from .pi_acp import PI_ACP_PACKAGE, PiAcpAdapter
 from .registry import AdapterInstanceRecord, AdapterRegistry
 from .rpc import JsonLineFramer, PeerClosedError, StdioJsonlPeer
 from .sessions import (
@@ -132,8 +131,6 @@ __all__ = [
     "OpenCodeServerAdapter",
     "PeerClosedError",
     "PiAdapter",
-    "PiAcpAdapter",
-    "PI_ACP_PACKAGE",
     "RuntimeAdapterConfig",
     "RuntimeAdapterFactory",
     "SessionTracker",

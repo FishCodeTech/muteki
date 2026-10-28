@@ -320,6 +320,43 @@ def _cli_version(binary: str, *, timeout: float = 15.0) -> str:
     return lines[0].strip() if result.returncode == 0 and lines else ""
 
 
+def _cost_usage_epoch(version: str) -> str:
+    """CLI before 2.1.277 starts resumed process totals from zero."""
+    value = str(version).split(" ", 1)[0].split(".")
+    if len(value) == 3 and all(part.isdigit() for part in value):
+        if tuple(map(int, value)) < (2, 1, 277):
+            return uuid_module.uuid4().hex
+    return ""
+
+
+def _cost_metadata(message: Any) -> dict[str, Any]:
+    """Only numeric pricing/usage metadata and the declared price-table basis."""
+    native: dict[str, Any] = {}
+    models = getattr(message, "model_usage", None)
+    if isinstance(models, dict):
+        allowed = {"inputTokens", "outputTokens", "cacheReadInputTokens",
+                   "cacheCreationInputTokens", "webSearchRequests", "costUSD",
+                   "contextWindow", "maxOutputTokens"}
+        values = {}
+        for model, usage in models.items():
+            if not isinstance(usage, dict):
+                continue
+            row = {key: value for key, value in usage.items()
+                   if key in allowed and isinstance(value, (int, float))
+                   and not isinstance(value, bool) and 0 <= value < float("inf")}
+            if isinstance(usage.get("costBasis"), str) and usage["costBasis"] in {"list", "managed", "unknown"}:
+                row["costBasis"] = usage["costBasis"]
+            if row:
+                values[str(model)] = row
+        if values:
+            native["model_usage"] = values
+    for key in ("costBasis", "cost_basis"):
+        basis = getattr(message, key, None)
+        if isinstance(basis, str) and basis in {"list", "managed", "unknown"}:
+            native[key] = basis
+    return native
+
+
 def _token_value(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
@@ -486,6 +523,7 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
       deny 应答（不悬挂 Runtime）。
     """
 
+    chat_model_fields = ("model",)
     context_compaction_events = True
     host_context_channel = "system_prompt"
     turn_context_channel = "claude_content_blocks"
@@ -529,34 +567,14 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
 
     # -- capability probe ------------------------------------------------------
 
-    async def probe(self, request: ProbeRequest) -> AgentCapabilities:
-        """probe：CLI --version 实测 + SDK 可用性；SDK 方法面如实标注来源。
-
-        SDK 行为面（can_use_tool 回调语义、resume、interrupt）无法用
-        无模型调用的方式实测，按 SDK 类型契约标注 ``adapter_reported``；
-        binary 与 SDK 安装状态为 ``probe`` 实测。
-        """
-        field_sources: dict[str, str] = {}
-        degradations: list[str] = []
-        version = _cli_version(self._cli_path)
-        sdk_ok = _sdk_available()
-        sdk_mod = _import_sdk() if sdk_ok else None
-        probed = bool(version) and sdk_ok
-
+    def _sdk_capabilities(
+        self, sdk_mod: Any, *, probed: bool, version: str = "",
+        field_sources: Optional[dict[str, str]] = None,
+    ) -> AgentCapabilities:
+        field_sources = field_sources if field_sources is not None else {}
         caps = conservative_capabilities(
-            transport_kind="sdk",
-            capability_source=SOURCE_PROBE if probed else SOURCE_STATIC,
-        )
+            transport_kind="sdk", capability_source=(SOURCE_PROBE if version and probed else SOURCE_REPORTED if probed else SOURCE_STATIC))
         caps.runtime_version = version
-
-        if not version:
-            degradations.append(
-                f"claude CLI 不可用或 --version 失败（{self._cli_path}）")
-        if not sdk_ok:
-            degradations.append(
-                "claude_agent_sdk 未安装：pip install claude-agent-sdk；"
-                f"结构化能力整体降级，Headless 兼容路径：{HEADLESS_FALLBACK}")
-
         def report(field_name: str, value: bool) -> bool:
             field_sources[field_name] = (
                 SOURCE_REPORTED if probed else SOURCE_STATIC)
@@ -598,6 +616,42 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
         field_sources["access_modes"] = (
             SOURCE_REPORTED if probed else SOURCE_STATIC)
         caps.protocol_version = version
+
+        return caps
+
+    def declared_chat_capabilities(self) -> AgentCapabilities:
+        return self._sdk_capabilities(_import_sdk(), probed=True)
+
+    async def probe(self, request: ProbeRequest) -> AgentCapabilities:
+        """probe：CLI --version 实测 + SDK 可用性；SDK 方法面如实标注来源。
+
+        SDK 行为面（can_use_tool 回调语义、resume、interrupt）无法用
+        无模型调用的方式实测，按 SDK 类型契约标注 ``adapter_reported``；
+        binary 与 SDK 安装状态为 ``probe`` 实测。
+        """
+        field_sources: dict[str, str] = {}
+        degradations: list[str] = []
+        version = _cli_version(self._cli_path)
+        sdk_ok = _sdk_available()
+        sdk_mod = _import_sdk() if sdk_ok else None
+        probed = bool(version) and sdk_ok
+
+        caps = conservative_capabilities(
+            transport_kind="sdk",
+            capability_source=SOURCE_PROBE if probed else SOURCE_STATIC,
+        )
+        caps.runtime_version = version
+
+        if not version:
+            degradations.append(
+                f"claude CLI 不可用或 --version 失败（{self._cli_path}）")
+        if not sdk_ok:
+            degradations.append(
+                "claude_agent_sdk 未安装：pip install claude-agent-sdk；"
+                f"结构化能力整体降级，Headless 兼容路径：{HEADLESS_FALLBACK}")
+
+        caps = self._sdk_capabilities(sdk_mod, probed=probed, version=version, field_sources=field_sources)
+        plan_supported = _sdk_plan_mode_supported(sdk_mod) if sdk_mod is not None else False
 
         # 核验确认的能力边界，必须显式记录（不静默关闭）。
         degradations.append(
@@ -764,9 +818,14 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
         # allowed tools，并按 setting sources 让 Runtime 自行发现/按需加载。
         # 不再由 Muteki 读取 SKILL.md 全文塞进用户消息。
         kwargs["skills"] = options.skills
-        if options.hooks:
+        hooks = dict(options.hooks)
+        from .src_policy import src_task_id
+        if src_task_id(self._tracker._store, request.thread_id):
+            for event, matchers in self._make_src_hooks(request).items():
+                hooks.setdefault(event, []).extend(matchers)
+        if hooks:
             # PreToolUse 等 hook 透传（§CLAUDE-3：全程工具门控通道）。
-            kwargs["hooks"] = dict(options.hooks)
+            kwargs["hooks"] = hooks
         if options.max_turns:
             kwargs["max_turns"] = options.max_turns
         if options.host_context:
@@ -820,8 +879,13 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
         reconnect_kwargs = {
             key: value for key, value in kwargs.items()
             if key not in {"fork_session", "resume_session_at", "resume"}}
+        cost_cli_version = await asyncio.to_thread(_cli_version, self._cli_path)
         self._runs[sid] = {
             "client": client,
+            "cost_cli_version": cost_cli_version,
+            "usage_epoch": _cost_usage_epoch(cost_cli_version),
+            "chat_selection": request.options.is_conversation,
+            "selected_model": request.model or self._model,
             "options_kwargs": reconnect_kwargs,
             "mcp_injected": bool(mcp_servers),
             "mcp_kind": (plan.injection_kind.value if plan else ""),
@@ -861,6 +925,85 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
 
     # -- 审批（can_use_tool → APPROVAL_REQUESTED/RESOLVED） ----------------------
 
+    def _make_src_hooks(self, request: SessionStart) -> dict[str, list[dict[str, Any]]]:
+        agent_session_id = request.agent_session_id
+
+        def ordinary(tool_name: str) -> bool:
+            return (
+                tool_name not in {ASK_USER_QUESTION_TOOL, EXIT_PLAN_MODE_TOOL}
+                and "muteki-control" not in tool_name
+                and not tool_name.startswith("muteki_")
+            )
+
+        async def pre(hook_input: dict[str, Any], _tool_use_id: Any, _context: Any) -> dict[str, Any]:
+            from .src_policy import NativeToolError, authorize_native_tool
+            tool_name = str(hook_input.get("tool_name") or "")
+            if not ordinary(tool_name):
+                return {}
+            tool_use_id = str(hook_input.get("tool_use_id") or _tool_use_id or uuid_module.uuid4().hex)
+            tool_input = dict(hook_input.get("tool_input") or {})
+            approval_kind = (
+                "command_execution" if tool_name in {"Bash", "Shell"}
+                else "file_change" if tool_name in {"Edit", "Write", "NotebookEdit"}
+                else "mcp_tool_call" if tool_name.startswith("mcp__") else "tool"
+            )
+            record = self._tracker.get(agent_session_id)
+            try:
+                authorization = await authorize_native_tool(
+                    self._tracker._store, thread_id=request.thread_id,
+                    invocation_id=f"claude:{agent_session_id}:{tool_use_id}",
+                    tool_name=tool_name, arguments=tool_input, action=tool_name,
+                    approval_kind=approval_kind,
+                    adapter_id="claude.agent_sdk",
+                    run_id=record.run_id if record else None,
+                    cwd=str(hook_input.get("cwd") or request.options.cwd or ""),
+                    environment_generation=(record.execution_generation or 0) if record else 0,
+                    idempotent=tool_name in {"Read", "Grep", "Glob", "LS", "WebFetch"},
+                )
+            except NativeToolError as exc:
+                return {"hookSpecificOutput": {
+                    "hookEventName": "PreToolUse", "permissionDecision": "deny",
+                    "permissionDecisionReason": f"{exc.code}: {exc.message}",
+                }}
+            except Exception as exc:
+                return {"hookSpecificOutput": {
+                    "hookEventName": "PreToolUse", "permissionDecision": "deny",
+                    "permissionDecisionReason": f"policy_unavailable: {type(exc).__name__}: {exc}",
+                }}
+            ctx = self._runs.get(agent_session_id)
+            if ctx is not None:
+                ctx.setdefault("src_authorizations", {})[tool_use_id] = authorization
+            return {"hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "permissionDecision": "allow",
+            }}
+
+        async def post(hook_input: dict[str, Any], _tool_use_id: Any, _context: Any) -> dict[str, Any]:
+            from .src_policy import complete_native_tool
+            tool_use_id = str(hook_input.get("tool_use_id") or _tool_use_id or "")
+            ctx = self._runs.get(agent_session_id) or {}
+            authorization = ctx.get("src_authorizations", {}).pop(tool_use_id, None)
+            if authorization is not None:
+                complete_native_tool(authorization, result=hook_input.get("tool_response"))
+            return {}
+
+        async def failed(hook_input: dict[str, Any], _tool_use_id: Any, _context: Any) -> dict[str, Any]:
+            from .src_policy import complete_native_tool
+            tool_use_id = str(hook_input.get("tool_use_id") or _tool_use_id or "")
+            ctx = self._runs.get(agent_session_id) or {}
+            authorization = ctx.get("src_authorizations", {}).pop(tool_use_id, None)
+            if authorization is not None:
+                error = RuntimeError(str(hook_input.get("error") or "native tool failed"))
+                setattr(error, "code", "native_tool_failed")
+                complete_native_tool(authorization, error=error)
+            return {}
+
+        matcher = {"matcher": "*", "hooks": [pre], "timeout": 1800.0}
+        return {
+            "PreToolUse": [matcher],
+            "PostToolUse": [{"matcher": "*", "hooks": [post]}],
+            "PostToolUseFailure": [{"matcher": "*", "hooks": [failed]}],
+        }
+
     def _make_can_use_tool(self, agent_session_id: str):
         """生成 SDK can_use_tool 回调。
 
@@ -894,6 +1037,31 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
             if tool_name == EXIT_PLAN_MODE_TOOL:
                 return await self._exit_plan_mode(
                     sdk, ctx, seq, common(), input, tool_use_id)
+            if "muteki-control" not in tool_name and not tool_name.startswith("muteki_"):
+                from .src_policy import NativeToolError, authorize_native_tool, src_task_id
+                if src_task_id(self._tracker._store, record.thread_id if record else None):
+                    tool_use_id = tool_use_id or uuid_module.uuid4().hex
+                    if tool_use_id not in ctx.get("src_authorizations", {}):
+                        try:
+                            authorization = await authorize_native_tool(
+                                self._tracker._store, thread_id=record.thread_id if record else None,
+                                invocation_id=f"claude:{agent_session_id}:{tool_use_id}",
+                                tool_name=tool_name, arguments=input, action=tool_name,
+                                approval_kind=("command_execution" if tool_name in {"Bash", "Shell"}
+                                               else "file_change" if tool_name in {"Edit", "Write", "NotebookEdit"}
+                                               else "mcp_tool_call" if tool_name.startswith("mcp__") else "tool"),
+                                adapter_id="claude.agent_sdk",
+                                run_id=record.run_id if record else None, cwd=str(ctx["options_kwargs"].get("cwd") or ""),
+                                environment_generation=(record.execution_generation or 0) if record else 0,
+                                idempotent=tool_name in {"Read", "Grep", "Glob", "LS", "WebFetch"},
+                            )
+                        except NativeToolError as exc:
+                            return sdk.PermissionResultDeny(
+                                behavior="deny", message=f"{exc.code}: {exc.message}")
+                        except Exception as exc:
+                            return sdk.PermissionResultDeny(
+                                behavior="deny", message=f"policy_unavailable: {type(exc).__name__}: {exc}")
+                        ctx.setdefault("src_authorizations", {})[tool_use_id] = authorization
             if ctx.get("applied_permission_mode") == "bypassPermissions":
                 return sdk.PermissionResultAllow(behavior="allow")
 
@@ -1251,8 +1419,22 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
             options=sdk_options, transport=owned_claude_transport(sdk_options, session_id=sid))
         await client.connect()
         ctx["client"] = client
+        ctx["cost_cli_version"] = await asyncio.to_thread(_cli_version, self._cli_path)
+        ctx["usage_epoch"] = _cost_usage_epoch(ctx["cost_cli_version"])
         ctx["applied_permission_mode"] = kwargs["permission_mode"]
         return client
+
+    async def _apply_chat_selection(self, ctx: dict[str, Any], input: MessageInput) -> None:
+        if not ctx.get("chat_selection") or input.payload.model is None:
+            return
+        selected = input.payload.model or self._model
+        if selected != ctx.get("selected_model"):
+            await ctx["client"].set_model(selected)
+            ctx["selected_model"] = selected
+            if selected:
+                ctx["options_kwargs"]["model"] = selected
+            else:
+                ctx["options_kwargs"].pop("model", None)
 
     async def _turn_stream(
         self,
@@ -1372,6 +1554,7 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
                 return
 
         try:
+            await self._apply_chat_selection(ctx, input)
             prompt = await claude_query_prompt(
                 input.text, input.payload.attachments,
                 context_blocks=envelope_text_blocks(self.turn_context(sid, input, host=False)))
@@ -1714,7 +1897,7 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
             usage = getattr(message, "usage", None) or {}
             events = [ev(AgentEventType.USAGE_UPDATED,
                          dump_payload(UsagePayload(
-                             scope="turn",
+                             scope="turn", usage_id=f"{turn_id}:tokens",
                              input_tokens=sum_token_buckets(
                                  usage.get("input_tokens"), usage.get("cache_read_input_tokens"),
                                  usage.get("cache_creation_input_tokens")),
@@ -1723,11 +1906,24 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
                                  usage.get("cache_read_input_tokens"),
                              cache_write_tokens=
                                  usage.get("cache_creation_input_tokens"),
-                             cost_usd=getattr(message, "total_cost_usd", None),
                              step_count=getattr(message, "num_turns", None),
                              llm_duration_ms=
                                  getattr(message, "duration_ms", None),
                          )))]
+            # SDK dollar amounts are local price-table estimates. Streaming
+            # result tokens cover this turn; dollars include the session so far.
+            cost = getattr(message, "total_cost_usd", None)
+            if (isinstance(cost, (int, float)) and not isinstance(cost, bool)
+                    and 0 <= cost < float("inf")):
+                native_cost = {"total_cost_usd": cost, **_cost_metadata(message)}
+                if ctx.get("usage_epoch"):
+                    native_cost["usage_epoch"] = ctx["usage_epoch"]
+                events.append(ev(
+                    AgentEventType.USAGE_UPDATED,
+                    dump_payload(UsagePayload(
+                        scope="session_cumulative", usage_id=f"{turn_id}:session_cost",
+                        cost_usd=float(cost), cost_kind="estimated", native=native_cost)),
+                    native="claude.session_cost"))
             is_error = bool(getattr(message, "is_error", False))
             terminal_reason = str(
                 getattr(message, "terminal_reason", "") or "")
@@ -2030,6 +2226,8 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
             options=sdk_options, transport=owned_claude_transport(sdk_options, session_id=session.agent_session_id))
         await client.connect()
         ctx["client"] = client
+        ctx["cost_cli_version"] = await asyncio.to_thread(_cli_version, self._cli_path)
+        ctx["usage_epoch"] = _cost_usage_epoch(ctx["cost_cli_version"])
         ctx["applied_permission_mode"] = kwargs["permission_mode"]
         del ctx["turn_log"][index:]
         if not resume_at:
@@ -2094,10 +2292,15 @@ class ClaudeSDKAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
             return base
         ctx = self._runs.get(session.agent_session_id)
         if ctx is None:
-            return base.model_copy(update={
+            from .command_providers import detached_compaction_snapshot
+            return detached_compaction_snapshot(base.model_copy(update={
                 "stale": True,
                 "diagnostics": ["Claude SDK Session 当前不在本进程"],
-            })
+            }), dynamic_command_item(
+                adapter_id=self.id, engine="claude", name="compact",
+                description="压缩当前 Claude 会话上下文", channel="provider_native",
+                invocation={"command": "compact", "wire_text": "/compact",
+                            "protocol": "claude.sdk.query"}))
         init = ctx.get("init_native") or {}
         items = list(base.items)
         for raw in init.get("slash_commands") or []:

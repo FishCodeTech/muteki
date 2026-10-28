@@ -10,6 +10,8 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from muteki.conversation.chat_plugins import ChatPluginService
 from muteki.conversation.composer_capabilities import resolve_capability_refs
 from muteki.conversation.chat_plugin_components import inspect_components
+from muteki.platform.capability_catalog import default_tool_set
+from muteki.platform.contracts.capabilities import ThreadMode
 
 with tempfile.TemporaryDirectory(prefix='muteki-components-') as tmp:
  root=Path(tmp);source=root/'source';source.mkdir();home=root/'operator';home.mkdir()
@@ -27,7 +29,7 @@ with tempfile.TemporaryDirectory(prefix='muteki-components-') as tmp:
  assert public['compatibility']['kimi']['status']=='partial'
  assert any(x['name']=='components-test:greet' for x in service.skill_rows('kimi'))
  row=next(x for x in service.skill_rows('kimi') if x['name']=='components-test:greet')
- selected,context=resolve_capability_refs([{**row,'arguments':'quoted value'}],engine='kimi',plugin_service=service)
+ selected,context=resolve_capability_refs([{**row,'arguments':'quoted value'}],engine='kimi',session_tools=default_tool_set(ThreadMode.CONVERSATION),plugin_service=service)
  assert 'Reply GREETING_OK with quoted value.' in context and selected[0]['arguments']=='quoted value'
  with patch('pathlib.Path.home',return_value=home):
   for engine in ['pi','omp']:
@@ -66,7 +68,7 @@ with tempfile.TemporaryDirectory(prefix='muteki-components-') as tmp:
  assert any(r['native_name']=='muteki-components-test:native-only' for r in service.skill_rows('claude'))
  assert not any(r['name'].endswith(':native-only') for r in service.skill_rows('kimi'))
  row=next(r for r in service.skill_rows('kimi') if r['name'].endswith(':inline'))
- _,context=resolve_capability_refs([{**row,'arguments':'"one two" $0'}],engine='kimi',plugin_service=service)
+ _,context=resolve_capability_refs([{**row,'arguments':'"one two" $0'}],engine='kimi',session_tools=default_tool_set(ThreadMode.CONVERSATION),plugin_service=service)
  assert 'First=one two; second=$0; all="one two" $0' in context,'arguments were re-expanded'
  with patch('pathlib.Path.home',return_value=home):
   env=service.prepare_environment('claude','native-only',{})

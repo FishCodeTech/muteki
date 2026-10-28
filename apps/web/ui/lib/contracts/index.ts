@@ -4,7 +4,7 @@
 export const CONTRACTS_SCHEMA_VERSION = 1;
 
 /** Thread 对话模式，决定 CapabilityBinding 的默认能力集合。 */
-export type ThreadMode = "conversation" | "single_task" | "competition" | "management";
+export type ThreadMode = "conversation" | "src" | "single_task" | "competition" | "management";
 
 /** prepare_capability_injection 可选的能力注入方式（MCP 优先）。 */
 export type InjectionKind = "mcp" | "native_tool" | "acp_mcp_config" | "agent_plugin" | "runtime_plugin" | "http_jsonrpc" | "cli_skill";
@@ -351,6 +351,7 @@ export interface AgentCapabilities {
   plan?: boolean;
   plan_mode?: boolean;
   plan_mode_per_turn?: boolean;
+  model_options_per_turn?: boolean;
   image_input?: boolean;
   supported_models?: string[];
   supported_efforts?: string[];
@@ -477,6 +478,9 @@ export interface MessagePayload {
   runtime_command_arguments?: string;
   client_user_message_id?: string;
   interaction_mode?: "default" | "plan";
+  model?: string | null;
+  effort?: string | null;
+  service_tier?: string | null;
 }
 
 export interface SteerPayload {

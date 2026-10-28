@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import shutil
+from copy import copy
 from pathlib import Path, PurePosixPath
 from typing import Optional
 
@@ -24,10 +25,24 @@ from muteki.solver.cli_protocol import (
 )
 
 def _stable_worker_path(current: str) -> str:
-    """Put system tool dirs before host shims without dropping the user's PATH."""
+    """Put system tool dirs before host shims while preserving active virtualenv bins."""
+    current_parts = [item for item in current.split(os.pathsep) if item]
+    venv_first: list[str] = []
+    hosted_runtime = os.environ.get("MUTEKI_HOSTED_RUNTIME_ROOT", "").strip()
+    if hosted_runtime:
+        hosted_venv_bin = str(Path(hosted_runtime) / ".venv" / "bin")
+        if hosted_venv_bin in current_parts or Path(hosted_venv_bin).is_dir():
+            venv_first.append(hosted_venv_bin)
+    for item in current_parts:
+        norm = item.rstrip("/")
+        if (
+            (norm.endswith("/.venv/bin") or norm.endswith("/venv/bin"))
+            and item not in venv_first
+        ):
+            venv_first.append(item)
     parts: list[str] = []
     seen: set[str] = set()
-    for item in [*_WORKER_PATH_PREFIX, *current.split(os.pathsep)]:
+    for item in [*venv_first, *_WORKER_PATH_PREFIX, *current_parts]:
         if not item or item in seen:
             continue
         seen.add(item)
@@ -72,15 +87,17 @@ def sync_deployed_blackboard_skills() -> list[dict]:
 
 
 def _blackboard_script_path(self, cwd: str | None = None) -> str:
-    # Container: baked into the worker image at /usr/local/bin/blackboard.py
-    # (docker/worker/blackboard.py), kept fresh by image rebuilds.
+    # Container: prefer the run-staged .muteki/blackboard.py when present so
+    # container Workers always execute the exact checkout protocol without
+    # waiting for a base image rebuild; fall back to /usr/local/bin/blackboard.py.
     if self.container is not None:
-        if getattr(self.challenge, "mode", "ctf") == "pentest" and cwd:
+        if cwd:
             staged = Path(cwd).resolve() / ".muteki" / "blackboard.py"
             mapper = getattr(self.container, "to_container_path", None)
             if staged.is_file() and callable(mapper):
                 return str(mapper(str(staged)))
-            raise FileNotFoundError("Pentest Blackboard tool was not staged")
+            if getattr(self.challenge, "mode", "ctf") == "pentest":
+                raise FileNotFoundError("Pentest Blackboard tool was not staged")
         return "/usr/local/bin/blackboard.py"
     # Source checkout: run the repo copy DIRECTLY — no deployed copy to drift
     # out of sync (see _repo_blackboard_script). This is the common case for
@@ -126,6 +143,28 @@ def _spill_host_path(self, spill_path: str) -> "Optional[tuple[Path, Path]]":
     return cwd, cwd.joinpath(*rel.parts)
 
 
+def _stage_pi_tool_timeout(self, wd: Path) -> None:
+    extension = Path(__file__).with_name("pi_pentest_tool_timeout.ts")
+    staged_extension = wd / ".muteki" / extension.name
+    staged_extension.parent.mkdir(parents=True, exist_ok=True)
+    if not staged_extension.is_file():
+        staged_extension.write_bytes(extension.read_bytes())
+    extension_arg = str(Path(".muteki") / extension.name)
+    base = getattr(self.driver, "base", self.driver)
+    flags = tuple(getattr(base, "_CONTEXT_FLAGS", ()) or ())
+    if extension_arg not in flags:
+        # Profile/endpoint wrappers build argv through their shared base driver.
+        # Give this Worker its own base before adding its run-scoped extension.
+        scoped_driver = copy(self.driver)
+        scoped_base = copy(base)
+        scoped_base._CONTEXT_FLAGS = (*flags, "--extension", extension_arg)
+        if base is self.driver:
+            self.driver = scoped_base
+        else:
+            scoped_driver.base = scoped_base
+            self.driver = scoped_driver
+
+
 def _stage_attachments(self, wd: Path) -> list[str]:
     """Materialize challenge attachments into the run workspace CAS, then link
     them into the worker cwd using their original basenames.
@@ -136,22 +175,22 @@ def _stage_attachments(self, wd: Path) -> list[str]:
     points at the immutable object, and the cwd entry points at `inputs/by-name`.
     """
     wd = Path(wd).resolve()
-    if getattr(self.challenge, "mode", "ctf") == "pentest":
+    if getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}:
         staged_board = wd / ".muteki" / "blackboard.py"
         staged_board.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(_REPO_BLACKBOARD_SCRIPT, staged_board)
-        staged_board.chmod(0o444)
-    if (getattr(self.challenge, "mode", "ctf") == "pentest"
-            and getattr(self.driver, "name", "") == "pi"):
-        extension = Path(__file__).with_name("pi_pentest_tool_timeout.ts")
-        staged_extension = wd / ".muteki" / extension.name
-        staged_extension.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(extension, staged_extension)
-        staged_extension.chmod(0o444)
-        flags = tuple(getattr(self.driver, "_CONTEXT_FLAGS", ()) or ())
-        extension_arg = str(Path(".muteki") / extension.name)
-        if extension_arg not in flags:
-            self.driver._CONTEXT_FLAGS = (*flags, "--extension", extension_arg)
+        if not staged_board.is_file():
+            shutil.copyfile(_REPO_BLACKBOARD_SCRIPT, staged_board)
+        staged_bb = wd / ".muteki" / "bin" / "bb"
+        staged_bb.parent.mkdir(parents=True, exist_ok=True)
+        if not staged_bb.is_file():
+            staged_bb.write_text(
+                '#!/bin/sh\nexec python3 "$MUTEKI_BLACKBOARD_SCRIPT" "$@"\n',
+                encoding="utf-8",
+            )
+            staged_bb.chmod(0o755)
+    if (getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
+            and getattr(self.driver, "name", "") in {"pi", "omp"}):
+        _stage_pi_tool_timeout(self, wd)
     root = workspace_root_for_worker(wd)
     ensure_workspace(root, runtime={
         "backend": "container" if getattr(self, "container", None) is not None else "local",
@@ -159,9 +198,27 @@ def _stage_attachments(self, wd: Path) -> list[str]:
     })
     if (
         getattr(self.challenge, "mode", "ctf") == "ctf"
-        and wd.parent.name == "workers"
+        and wd != root
+        and (wd.parent.name == "workers" or not (wd / "shared").exists())
     ):
-        relative_symlink(wd / "shared", root / "shared" / "live")
+        shared_live = root / "shared" / "live"
+        shared_live.mkdir(parents=True, exist_ok=True)
+        relative_symlink(wd / "shared", shared_live)
+        nested_shared = shared_live / "shared"
+        if not nested_shared.exists() and not nested_shared.is_symlink():
+            try:
+                os.symlink(".", nested_shared)
+            except OSError:
+                pass
+        for item in shared_live.iterdir():
+            if item.name.startswith(".") or item.name in {"shared", "inherited", "toolbox"}:
+                continue
+            dst_entry = wd / item.name
+            if not dst_entry.exists() and not dst_entry.is_symlink():
+                try:
+                    relative_symlink(dst_entry, item)
+                except OSError:
+                    pass
     container = getattr(self, "container", None)
     self._toolbox_manifest = stage_worker_toolbox(
         wd,
@@ -174,27 +231,79 @@ def _stage_attachments(self, wd: Path) -> list[str]:
         or ""
     )
     task_path = wd / ".muteki_task.md"
+    if task_path.exists():
+        try:
+            task_path.chmod(0o644)
+        except OSError:
+            pass
     task_path.write_text(instruction, encoding="utf-8")
-    task_path.chmod(0o444)
     self._task_file_name = task_path.name
     self._task_file_sha256 = hashlib.sha256(
         instruction.encode("utf-8", errors="replace")
     ).hexdigest()
     staged: list[str] = []
+    ctf_shared_root = getattr(self.challenge, "mode", "ctf") == "ctf" and wd == root
+    if ctf_shared_root:
+        (wd / "shared").mkdir(parents=True, exist_ok=True)
     for src in (self.challenge.attachments or []):
         logical_name = Path(src).name
         p = Path(src).resolve()
         if not p.exists():
             continue
         try:
-            materialize_input(root, p, name=logical_name)
-            link_input_into_worker(root, wd, logical_name)
+            if ctf_shared_root:
+                dst = wd / logical_name
+                if not dst.exists():
+                    if p.is_dir():
+                        shutil.copytree(p, dst, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(p, dst)
+            else:
+                materialize_input(root, p, name=logical_name)
+                link_input_into_worker(root, wd, logical_name)
             staged.append(logical_name)
         except (OSError, FileNotFoundError):
             continue
-    self._link_existing_shared_artifacts(root, wd)
+    if not ctf_shared_root:
+        self._link_existing_shared_artifacts(root, wd)
     self._link_inherited_pocs(root, wd)
     return staged
+
+
+def _sync_worker_cwd_to_shared(self, wd: Optional[Path] = None) -> None:
+    """Publish non-hidden user files written in a CTF Worker cwd into shared/live."""
+    if getattr(getattr(self, "challenge", None), "mode", "ctf") != "ctf":
+        return
+    raw_wd = wd or getattr(self, "_current_workdir", None) or getattr(self, "_workdir", None)
+    if not raw_wd:
+        return
+    try:
+        worker_dir = Path(raw_wd).resolve()
+        if not worker_dir.is_dir():
+            return
+        root = workspace_root_for_worker(worker_dir)
+        shared_live = root / "shared" / "live"
+        if not shared_live.is_dir() or worker_dir in {shared_live, root}:
+            return
+        reserved = {
+            "shared", "inherited", "toolbox", "manifest.json",
+            "runtime-diagnostics.json",
+            str(getattr(self, "BOARD_FILENAME", "TEAM_BOARD.md")),
+        }
+        for item in list(worker_dir.iterdir()):
+            name = item.name
+            if name.startswith(".") or name in reserved or item.is_symlink():
+                continue
+            target = shared_live / name
+            if target.exists() or target.is_symlink():
+                continue
+            try:
+                shutil.move(str(item), str(target))
+                relative_symlink(item, target)
+            except OSError:
+                continue
+    except Exception:
+        pass
 
 
 @staticmethod
@@ -285,7 +394,8 @@ def _link_inherited_pocs(self, root: Path, wd: Path) -> None:
                 name = Path(str(row.get("name") or source.name)).name
                 target = wd / "inherited" / poc_id / name
                 target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(source, target)
+                if not target.is_file():
+                    shutil.copyfile(source, target)
                 if expected:
                     copied_digest = hashlib.sha256()
                     with target.open("rb") as handle:
@@ -293,7 +403,6 @@ def _link_inherited_pocs(self, root: Path, wd: Path) -> None:
                             copied_digest.update(chunk)
                     if copied_digest.hexdigest() != expected:
                         raise ValueError("materialized PoC digest mismatch")
-                target.chmod(0o444)
             except (OSError, ValueError) as exc:
                 raise RequiredPocUnavailableError(
                     f"required PoC materialization failed: {poc_id}: {exc}"
@@ -326,7 +435,11 @@ def _link_inherited_pocs(self, root: Path, wd: Path) -> None:
         src = root / rel
         dst = wd / "inherited" / poc_id / name
         try:
-            relative_symlink(dst, src)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if src.is_dir():
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
         except OSError:
             continue
         self._claimed_pocs.add(poc_id)

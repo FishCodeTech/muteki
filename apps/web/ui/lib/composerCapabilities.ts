@@ -46,7 +46,7 @@ export interface ComposerCapabilityItem {
   alternative?: string;
   invocable?: boolean;
   revision?: number;
-  /** Built-in Muteki tool behind a `component` item (computer-use / browser / visualize). */
+  /** Built-in Muteki tool (computer-use / browser / visualize / orchestrate). */
   component?: string;
   /** Target macOS app for a computer-use item, resolved by the server. */
   target?: { type: "mac_app"; bundle_id: string; name: string; path: string };

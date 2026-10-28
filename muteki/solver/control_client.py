@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 import weakref
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 from muteki.solver.cli_driver import CliResult, StreamStep
 from muteki.solver.cli_launch_check import check_process_launch

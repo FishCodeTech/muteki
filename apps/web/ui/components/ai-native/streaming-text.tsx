@@ -19,6 +19,7 @@ import {
   messageDeepLink,
 } from "@/components/chat/timeline/MessageActions";
 import type { ResourceLinkTarget } from "@/lib/resourcePreview";
+import { useEver, useSmoothText } from "@/components/chat/timeline/turnMotion";
 
 export interface Citation {
   id?: string;
@@ -169,18 +170,22 @@ export function StreamingText({
   const toggleViewMode = useCallback(() => {
     setViewMode((current) => (current === "rendered" ? "source" : "rendered"));
   }, []);
+  // Deltas arrive in bursts; the reveal is paced and still catches up fast.
+  const shownText = useSmoothText(text, isStreaming);
+  const revealing = isStreaming || shownText.length < text.length;
+  const streamed = useEver(isStreaming);
   const hasText = Boolean(text.trim());
-  const showMessageActions = showActions && !isStreaming;
+  const showMessageActions = showActions && !revealing;
 
   return (
     <div className={cn("group/msg flex w-full flex-col", className)}>
       <div aria-busy={isStreaming || undefined}>
-        {viewMode === "source" && !isStreaming ? (
+        {viewMode === "source" && !revealing ? (
           <pre className="m-0 whitespace-pre-wrap break-words rounded-xl bg-cx-sunken px-4 py-3 font-cx-mono text-[13px] leading-6 text-cx-fg-2">
             {text}
           </pre>
         ) : (
-          <ChatMarkdown text={text} streaming={isStreaming} threadId={threadId} messageId={messageId} onResourceLink={onResourceLink} />
+          <ChatMarkdown text={shownText} streaming={revealing} threadId={threadId} messageId={messageId} onResourceLink={onResourceLink} />
         )}
       </div>
 
@@ -230,7 +235,7 @@ export function StreamingText({
           messageId={messageId}
           meta={meta}
           pinned={pinActions}
-          className="mt-1.5 -ml-1.5"
+          className={cn("mt-1.5 -ml-1.5", streamed && "cx-enter")}
         />
       ) : null}
     </div>

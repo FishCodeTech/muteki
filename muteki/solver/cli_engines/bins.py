@@ -30,6 +30,7 @@ _ENV_OVERRIDE = {
     "pi": "MUTEKI_PI_BIN",
     "omp": "MUTEKI_OMP_BIN",
     "kimi": "MUTEKI_KIMI_BIN",
+    "zcode": "MUTEKI_ZCODE_BIN",
     "grok": "MUTEKI_GROK_BIN",
     "opencode": "MUTEKI_OPENCODE_BIN",
     "devin": "MUTEKI_DEVIN_BIN",

@@ -30,7 +30,12 @@ def register(app: FastAPI) -> None:
         command_id = str(body.pop("command_id", "") or "")
         receipt = await _dispatch_run_command(
             "run.resolve", run_id, body, command_id=command_id)
-        return {"ok": receipt.error is None}
+        if receipt.error is not None:
+            return JSONResponse(
+                {"ok": False, "error": receipt.error.model_dump(mode="json")},
+                status_code=_run_receipt_status(receipt),
+            )
+        return {"ok": True, "command_id": receipt.command_id}
 
     @app.post("/api/runs/{run_id}/progress")
     async def request_progress(run_id: str) -> Any:
@@ -110,7 +115,7 @@ def register(app: FastAPI) -> None:
                  "detail": error.message, "command_id": receipt.command_id},
                 status_code=_run_receipt_status(receipt),
             )
-        result = app.state.manager.control_receipt(run_id, receipt.command_id)
+        result = await app.state.manager.control_receipt(run_id, receipt.command_id)
         if result is not None and result.get("status") == "routed":
             result = {**result, "status": "persisted", "terminal": False}
         return result or {"ok": True, "status": "persisted",
@@ -121,7 +126,7 @@ def register(app: FastAPI) -> None:
         """Reconcile a command whose SSE terminal projection was interrupted."""
         if app.state.manager.get(run_id) is None:
             raise HTTPException(status_code=404, detail="unknown run")
-        receipt = app.state.manager.control_receipt(run_id, command_id)
+        receipt = await app.state.manager.control_receipt(run_id, command_id)
         if receipt is None:
             raise HTTPException(status_code=404, detail="unknown control command")
         return receipt

@@ -1,6 +1,7 @@
 import type { ConversationEvent } from "@/lib/useConversation";
 import type { ToolItem } from "../ai-native/tool-chips";
 import type { ConversationLiveTextRun } from "@/lib/conversationStreamReducer";
+import { toolActivityRows, toolActivityText, type ToolCommandAction } from "../chat/timeline/toolPresentation";
 
 export interface ConversationToolRecord extends ToolItem {
   turnId?: string;
@@ -11,6 +12,8 @@ export interface ConversationToolRecord extends ToolItem {
   agentId?: string | null;
   model?: string | null;
   messageId?: string | null;
+  commandActions?: ToolCommandAction[];
+  mcpServer?: string;
 }
 
 export type ConversationMessagePhase = "commentary" | "final_answer" | "unknown";
@@ -390,7 +393,8 @@ function messagePhase(payload: Record<string, unknown>): ConversationMessagePhas
   const value = String(
     payload.phase || payload.message_phase || payload.channel || "",
   ).toLowerCase();
-  if (value === "commentary") return "commentary";
+  // A partial answer is mid-turn text that more work may follow.
+  if (value === "commentary" || value === "partial_answer") return "commentary";
   if (value === "final_answer" || value === "final") return "final_answer";
   return "unknown";
 }
@@ -653,6 +657,15 @@ function mergeConversationTool(
   // Late progress must not revive running; prior declined/cancelled survive.
   const status = resolveToolOutcomeStatus(payload, type, previous);
   const suppliedOutput = payload.output ?? payload.result ?? payload.summary;
+  const native = payload.native && typeof payload.native === "object"
+    ? payload.native as Record<string, unknown>
+    : {};
+  const commandActions = Array.isArray(native.command_actions)
+    ? (native.command_actions as unknown[]).filter((action): action is ToolCommandAction => (
+      Boolean(action) && typeof action === "object" && typeof (action as ToolCommandAction).type === "string"
+    ))
+    : previous?.commandActions;
+  const mcpServer = String(native.mcp_server || "").trim() || previous?.mcpServer;
   return {
     id: conversationToolKey(payload, turnId),
     name: provisionalName || previous?.name || "未知工具",
@@ -677,6 +690,8 @@ function mergeConversationTool(
     messageId: String(payload.message_id || previous?.messageId || "").trim()
       || previous?.messageId
       || null,
+    ...(commandActions?.length ? { commandActions } : {}),
+    ...(mcpServer ? { mcpServer } : {}),
   };
 }
 
@@ -806,217 +821,25 @@ function replaceTurnMessage(
   return placed ? next : null;
 }
 
-function compactActivityValue(value: unknown, maxLength = 32): string {
-  return String(value ?? "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, maxLength);
-}
-
-function toolArgumentRecord(value: string): Record<string, unknown> {
-  const text = String(value || "").trim();
-  if (!text) return {};
-  try {
-    const parsed = JSON.parse(text) as unknown;
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-    return { command: parsed };
-  } catch {
-    return { command: text };
-  }
-}
-
-function activityBasename(value: unknown): string {
-  const text = compactActivityValue(value, 120).replace(/\\/g, "/");
-  return compactActivityValue(text.split("/").filter(Boolean).at(-1), 28);
-}
-
-function runningToolActivity(record: ConversationToolRecord): string {
-  const name = record.name.toLowerCase();
-  const args = toolArgumentRecord(record.argsSummary || "");
-  const command = compactActivityValue(
-    args.command ?? args.cmd ?? args.shell_command,
-    500,
-  );
-  const path = activityBasename(
-    args.path ?? args.file_path ?? args.filePath ?? args.filename ?? args.cwd,
-  );
-  const query = compactActivityValue(
-    args.query ?? args.pattern ?? args.search ?? args.q,
-    28,
-  );
-
-  const mutekiActivity: Record<string, string> = {
-    muteki_list_projects: "正在查询 Muteki 项目",
-    muteki_list_threads: "正在查询 Muteki 对话",
-    muteki_list_tasks: "正在查询单题任务",
-    muteki_get_task: "正在读取单题任务",
-    muteki_list_runs: "正在查询 Run 列表",
-    muteki_get_command_receipt: "正在核对控制命令结果",
-    muteki_create_task: "正在创建单题任务",
-    muteki_dispatch_challenge: "正在下发 CTF 单题任务",
-    muteki_create_run: "正在创建 Run",
-    muteki_start_swarm: "正在启动 Coordinator",
-    muteki_resolve_run: "正在汇总 Run 结果",
-    muteki_get_run_snapshot: "正在读取 Run 快照",
-    muteki_read_run_events: "正在读取 Run 事件",
-    muteki_wait_run: "正在等待 Run 进展",
-    muteki_read_shared_graph: "正在读取 Run 共享图",
-    muteki_pause_run: "正在暂停 Run",
-    muteki_resume_run: "正在恢复 Run",
-    muteki_stop_run: "正在停止 Run",
-    muteki_send_operator_directive: "正在发送 Operator 指令",
-    muteki_add_run_context: "正在注入 Run 上下文",
-    muteki_spawn_run_worker: "正在增加 Worker",
-    muteki_cancel_run_worker: "正在取消 Worker",
-  };
-  const mutekiName = Object.keys(mutekiActivity).find((toolName) => (
-    name === toolName || name.endsWith(`.${toolName}`) || name.endsWith(`/${toolName}`)
-  ));
-  if (mutekiName) return mutekiActivity[mutekiName];
-
-  const terminalTool = [
-    "terminal", "shell", "bash", "exec", "command", "run_terminal",
-  ].some((marker) => name.includes(marker));
-  if (terminalTool) {
-    if (/(^|[;&|]\s*|\s)(ls|find|fd)(\s|$)|\brg\s+--files\b/.test(command)) {
-      return path ? `正在列出 ${path} 中的文件` : "正在列出当前工作目录下的文件";
-    }
-    if (/(^|[;&|]\s*|\s)(rg|grep|ag)(\s|$)/.test(command)) {
-      return "正在搜索工作区";
-    }
-    if (/(^|[;&|]\s*|\s)(cat|sed|head|tail|less)(\s|$)/.test(command)) {
-      return "正在读取文件";
-    }
-    if (/\bgit\s+(status|diff|show)\b/.test(command)) {
-      return "正在检查工作区变更";
-    }
-    if (/\b(pytest|vitest|jest|pnpm\s+(?:test|lint|build)|npm\s+(?:test|run)|tsc)\b/.test(command)) {
-      return "正在运行项目检查";
-    }
-    return "正在运行命令";
-  }
-  if (name.includes("list") || name.includes("directory")) {
-    return path ? `正在列出 ${path} 中的文件` : "正在列出文件";
-  }
-  if (name.includes("read") || name.includes("open_file") || name.includes("view_file")) {
-    return path ? `正在读取 ${path}` : "正在读取文件";
-  }
-  if (name.includes("web") && name.includes("search")) {
-    return query ? `正在联网搜索“${query}”` : "正在联网搜索";
-  }
-  if (name.includes("search") || name.includes("grep") || name.includes("find")) {
-    return query ? `正在搜索“${query}”` : "正在搜索工作区";
-  }
-  if (name.includes("edit") || name.includes("write") || name.includes("patch")) {
-    return path ? `正在更新 ${path}` : "正在更新文件";
-  }
-  if (isBrowserTool(record) || name.includes("web")) return "正在查看网页";
-  if (name.includes("image") || name.includes("screenshot")) return "正在处理图片";
-  return "正在调用工具";
-}
-
-function completedToolActivity(label: string): string {
-  const exact: Record<string, string> = {
-    "正在搜索工作区": "已完成工作区搜索",
-    "正在联网搜索": "已完成联网搜索",
-    "正在检查工作区变更": "已完成工作区变更检查",
-    "正在运行命令": "命令已完成",
-    "正在运行项目检查": "项目检查已完成",
-    "正在查看网页": "网页查看已完成",
-    "正在处理图片": "图片处理已完成",
-    "正在调用工具": "工具调用已完成",
-    "正在查询 Muteki 项目": "已查询 Muteki 项目",
-    "正在查询 Muteki 对话": "已查询 Muteki 对话",
-    "正在查询单题任务": "已查询单题任务",
-    "正在读取单题任务": "已读取单题任务",
-    "正在查询 Run 列表": "已查询 Run 列表",
-    "正在核对控制命令结果": "已核对控制命令结果",
-    "正在创建单题任务": "已创建单题任务",
-    "正在下发 CTF 单题任务": "已下发 CTF 单题任务",
-    "正在创建 Run": "已创建 Run",
-    "正在启动 Coordinator": "已启动 Coordinator",
-    "正在汇总 Run 结果": "已汇总 Run 结果",
-    "正在读取 Run 快照": "已读取 Run 快照",
-    "正在读取 Run 事件": "已读取 Run 事件",
-    "正在等待 Run 进展": "Run 等待已结束",
-    "正在读取 Run 共享图": "已读取 Run 共享图",
-    "正在暂停 Run": "Run 已暂停",
-    "正在恢复 Run": "Run 已恢复",
-    "正在停止 Run": "Run 已停止",
-    "正在发送 Operator 指令": "已发送 Operator 指令",
-    "正在注入 Run 上下文": "已注入 Run 上下文",
-    "正在增加 Worker": "已增加 Worker",
-    "正在取消 Worker": "已取消 Worker",
-  };
-  if (exact[label]) return `${exact[label]}，正在整理回复…`;
-  const replacements: Array<[string, string]> = [
-    ["正在查询", "已查询"],
-    ["正在列出", "已列出"],
-    ["正在读取", "已读取"],
-    ["正在搜索", "已完成搜索"],
-    ["正在联网搜索", "已完成联网搜索"],
-    ["正在检查", "已完成检查"],
-    ["正在运行", "已完成运行"],
-    ["正在更新", "已更新"],
-    ["正在查看", "已查看"],
-    ["正在处理", "已处理"],
-    ["正在调用", "已完成"],
-    ["正在创建", "已创建"],
-    ["正在下发", "已下发"],
-    ["正在启动", "已启动"],
-    ["正在汇总", "已汇总"],
-    ["正在等待", "等待已结束："],
-    ["正在暂停", "已暂停"],
-    ["正在恢复", "已恢复"],
-    ["正在停止", "已停止"],
-    ["正在发送", "已发送"],
-    ["正在注入", "已注入"],
-    ["正在增加", "已增加"],
-    ["正在取消", "已取消"],
-  ];
-  const match = replacements.find(([prefix]) => label.startsWith(prefix));
-  const completed = match
-    ? `${match[1]}${label.slice(match[0].length)}`
-    : "工具调用已完成";
-  return `${completed}，正在整理回复…`;
-}
-
 /** Resolve a truthful live label from normalized Conversation events. */
 export function resolveConversationLiveActivity(
   segments: ConversationTurnSegment[],
 ): ConversationLiveActivity {
   const last = segments.at(-1);
-  if (!last) return { kind: "idle", label: "Agent 正在处理…" };
-  if (last.kind === "thinking") {
-    return { kind: "reasoning", label: "Agent 正在思考…" };
-  }
-  if (last.kind === "text") {
-    return { kind: "response", label: "Agent 正在生成回复…" };
-  }
+  if (!last) return { kind: "idle", label: "正在思考" };
+  if (last.kind === "thinking") return { kind: "reasoning", label: "正在思考" };
+  if (last.kind === "text") return { kind: "response", label: "正在生成回复" };
   if (last.kind === "compaction") {
     return last.status === "started"
-      ? { kind: "tool", label: "正在压缩上下文…" }
-      : { kind: "response", label: last.status === "failed" ? "上下文压缩失败"
-        : last.status === "interrupted" ? "上下文压缩已中断" : "上下文压缩已完成" };
+      ? { kind: "tool", label: "正在压缩上下文" }
+      : { kind: "reasoning", label: "正在思考" };
   }
   const tool = last.tools.at(-1);
-  if (!tool) return { kind: "idle", label: "Agent 正在处理…" };
-  const runningLabel = runningToolActivity(tool);
-  if (tool.status === "running" || tool.status === "pending") {
-    return { kind: "tool", label: runningLabel };
+  if (tool && (tool.status === "running" || tool.status === "pending")) {
+    const row = toolActivityRows(tool).at(-1);
+    if (row) return { kind: "tool", label: toolActivityText(row) };
   }
-  if (tool.status === "declined") {
-    return { kind: "response", label: "工具调用已拒绝" };
-  }
-  if (tool.status === "cancelled") {
-    return { kind: "response", label: "工具调用已取消" };
-  }
-  if (tool.status === "failed") {
-    return { kind: "response", label: "工具调用失败" };
-  }
-  return { kind: "response", label: completedToolActivity(runningLabel) };
+  return { kind: "reasoning", label: "正在思考" };
 }
 
 function emptyTurnFoldState(): ConversationTurnFoldState {

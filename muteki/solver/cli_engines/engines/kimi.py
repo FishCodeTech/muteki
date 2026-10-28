@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,7 @@ class KimiCodeDriver(CliDriver):
     # enforces the same denylist again before execution.  Keep the profile in
     # the Muteki source tree: no user-level Agent or Skill directory is changed.
     _OFFLINE_AGENT_FILE = _SOLVER_DIR / "kimi_offline_agent.md"
+    _OFFLINE_TOOLS = ("WebSearch", "FetchURL", "Agent", "AgentSwarm")
 
     def native_permission_modes(self) -> tuple[str, ...]:
         return ("yolo", "auto", "plan")
@@ -78,8 +80,47 @@ class KimiCodeDriver(CliDriver):
             "--output-format", "stream-json", "-p", prompt,
         ]
 
+    def build_execute_input(
+        self, prompt: str, session: Optional[str], *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        del session
+        self.validate_launch_context(launch)
+        if launch.interactive:
+            # Conversation and management callers retain the native CLI path.
+            if len(prompt.encode("utf-8")) >= 128 * 1024:
+                raise ValueError("Kimi interactive prompt exceeds the CLI argument limit")
+            return self.build_execute(
+                prompt, None, web_access=web_access, kb_access=kb_access,
+                stream=stream, launch=launch), None
+        argv = [sys.executable, str(_SOLVER_DIR / "native_prompt_bridge.py"),
+                "--binary", self.bin]
+        if not web_access:
+            for tool in self._OFFLINE_TOOLS:
+                argv.extend(["--disable-tool", tool])
+        return argv, prompt
+
+    def build_resume_input(
+        self, prompt: str, session: str, *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        if launch.interactive:
+            if len(prompt.encode("utf-8")) >= 128 * 1024:
+                raise ValueError("Kimi interactive prompt exceeds the CLI argument limit")
+            return self.build_resume(
+                prompt, session, web_access=web_access, kb_access=kb_access,
+                stream=stream, launch=launch), None
+        argv, body = self.build_execute_input(
+            prompt, None, web_access=web_access, kb_access=kb_access,
+            stream=stream, launch=launch,
+        )
+        return [*argv, "--session", session], body
+
     def parse(self, stdout: str, stderr: str) -> CliResult:
         text_out, session = "", None
+        turns = 0
         for line in stdout.splitlines():
             try:
                 ev = json.loads(line)
@@ -87,13 +128,15 @@ class KimiCodeDriver(CliDriver):
                 continue
             if not isinstance(ev, dict):
                 continue
-            if ev.get("role") == "assistant" and isinstance(ev.get("content"), str):
-                text_out = str(ev["content"])
+            if ev.get("role") == "assistant":
+                turns += 1
+                if isinstance(ev.get("content"), str):
+                    text_out = str(ev["content"])
             if ev.get("role") == "meta" and ev.get("type") == "session.resume_hint":
                 session = str(ev.get("session_id") or "") or session
         return CliResult(
-            text=text_out, session=session, raw_stderr=stderr[-2000:],
-            error=_structured_cli_error(stdout))
+            text=text_out, session=session, num_turns=turns or None,
+            raw_stderr=stderr, error=_structured_cli_error(stdout))
 
     def parse_stream_steps(self, line: str) -> list[StreamStep]:
         try:
@@ -122,7 +165,7 @@ class KimiCodeDriver(CliDriver):
                 fn = call.get("function") if isinstance(call.get("function"), dict) else {}
                 steps.append(StreamStep(
                     "tool", tool=str(fn.get("name") or call.get("type") or ""),
-                    text=str(fn.get("arguments") or "")[:300],
+                    text=str(fn.get("arguments") or ""),
                     call_id=str(call.get("id") or ""),
                 ))
             return steps

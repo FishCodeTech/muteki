@@ -32,12 +32,15 @@ import {
   RAIL_WIDTH_DEFAULT,
 } from "@/lib/railSizing";
 import {
+  isConversationLayoutPath,
   workspaceFrameContentId,
   workspaceSkipTargetId,
 } from "@/lib/workspaceSkipTarget";
 import { useSolveOnlyMode } from "@/lib/workspaceMode";
+import { isLocalPreviewPath } from "@/lib/conversationPreviewMode";
 import { useActiveRunWorkspace } from "@/lib/activeRunWorkspace";
 import { runIdFromPathname } from "@/lib/runWorkspaceRoutes";
+import { RetainedWorkspaces } from "@/components/RetainedWorkspaces";
 
 const OverviewContext = createContext<WorkspaceOverview | null>(null);
 
@@ -49,10 +52,18 @@ export function useSharedWorkspaceOverview(): WorkspaceOverview {
 
 function iconOf(entry: WorkspaceKindEntry): IconName {
   if (entry.id === "pentest") return "target";
+  if (entry.id === "src") return "shield";
   if (entry.icon === "flag") return "crosshair";
   if (entry.icon === "trophy") return "trophy";
   if (entry.icon === "chat") return "messages";
   return "layers";
+}
+
+/** Rail order mirrors the desktop shell; unknown kinds keep their backend order last. */
+const RAIL_KIND_ORDER = ["/chat", "/ctf", "/pentest", "/src", "/competitions"];
+function railKindRank(route: string): number {
+  const index = RAIL_KIND_ORDER.indexOf(route);
+  return index < 0 ? RAIL_KIND_ORDER.length : index;
 }
 
 function publicDescriptionOf(entry: WorkspaceKindEntry): string {
@@ -309,7 +320,9 @@ function WorkspaceNav({ overview, sidebarToggle, onOpenSearch }: {
 }) {
   const pathname = usePathname();
   const solveOnly = useSolveOnlyMode();
-  const visibleKinds = overview.kinds.filter((kind) => !solveOnly || kind.aggregateType === "run");
+  const visibleKinds = overview.kinds
+    .filter((kind) => !solveOnly || kind.aggregateType === "run")
+    .sort((a, b) => railKindRank(a.route) - railKindRank(b.route));
   const pathRunId = runIdFromPathname(pathname);
   const published = useActiveRunWorkspace();
   const recentKind = pathRunId
@@ -406,7 +419,8 @@ export function WorkspaceFrame({ children }: { children: ReactNode }) {
   const solveOnly = useSolveOnlyMode();
   // /chat already receives thread changes over its inbox stream, so the
   // cross-workspace overview only needs a slow refresh there.
-  const overview = useWorkspaceOverview(pathname.startsWith("/chat") ? 60000 : 10000, solveOnly);
+  const conversationLayout = isConversationLayoutPath(pathname);
+  const overview = useWorkspaceOverview(conversationLayout ? 60000 : 10000, solveOnly, !isLocalPreviewPath(pathname));
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [sidebarWidth, setSidebarWidthState] = useState(RAIL_WIDTH_DEFAULT);
   const [sidebarWidthReady, setSidebarWidthReady] = useState(false);
@@ -436,7 +450,7 @@ export function WorkspaceFrame({ children }: { children: ReactNode }) {
   }, [sidebarWidth, sidebarWidthReady]);
 
   useEffect(() => {
-    if (!pathname.startsWith("/chat")) setMobileSidebarOpen(false);
+    if (!isConversationLayoutPath(pathname)) setMobileSidebarOpen(false);
   }, [pathname]);
 
   const toggleSidebarCollapsed = useCallback(() => {
@@ -473,6 +487,10 @@ export function WorkspaceFrame({ children }: { children: ReactNode }) {
 
   const skipTargetId = workspaceSkipTargetId(pathname);
   const frameContentId = workspaceFrameContentId(pathname);
+  // The retained /chat shell owns a scoped sidebar id; studio keeps the default.
+  const conversationSidebarId = pathname === "/chat" || pathname.startsWith("/chat/")
+    ? "chat-conversation-sidebar"
+    : "conversation-sidebar";
 
   return (
     <OverviewContext.Provider value={overview}>
@@ -480,27 +498,28 @@ export function WorkspaceFrame({ children }: { children: ReactNode }) {
       <div
         className="workspace-frame"
         data-solve-only={solveOnly ? "true" : undefined}
-        data-conversation-layout={pathname.startsWith("/chat") ? "true" : undefined}
+        data-conversation-layout={conversationLayout ? "true" : undefined}
         data-conversation-sidebar-collapsed={sidebarCollapsed ? "true" : "false"}
         style={{ "--conv-sidebar-width": `${sidebarWidth}px` } as CSSProperties}
       >
         <a className="skip-link" href={`#${skipTargetId}`}>跳到主要内容</a>
-        <WorkspaceNav overview={overview} onOpenSearch={() => setSearchOpen(true)} sidebarToggle={pathname.startsWith("/chat") ? (
+        <WorkspaceNav overview={overview} onOpenSearch={() => setSearchOpen(true)} sidebarToggle={conversationLayout ? (
           <Tooltip content={sidebarLabel} placement="right">
             <button type="button" className="workspace-rail-control workspace-rail-sidebar-toggle" data-workspace-action="sidebar"
-              aria-label={sidebarLabel} aria-expanded={sidebarExpanded} aria-controls="conversation-sidebar" onClick={toggleConversationSidebar}>
+              aria-label={sidebarLabel} aria-expanded={sidebarExpanded} aria-controls={conversationSidebarId} onClick={toggleConversationSidebar}>
               <Icon name="panelLeft" size={19} />
             </button>
           </Tooltip>
         ) : null} />
         <div id={frameContentId} tabIndex={frameContentId ? -1 : undefined} className="workspace-frame-content" data-workspace-path={pathname}>
-          {pathname.startsWith("/chat") ? <div className="workspace-shared-brand-dock">
+          {conversationLayout ? <div className="workspace-shared-brand-dock">
             <Link href="/" className="workspace-nav-brand" aria-label="返回 Muteki 首页"><MutekiLogo size={30} wordmark decorative /></Link>
             <button type="button" className="workspace-brand-sidebar-toggle" aria-label={sidebarLabel}
-              aria-expanded={sidebarExpanded} aria-controls="conversation-sidebar" onClick={toggleConversationSidebar}>
+              aria-expanded={sidebarExpanded} aria-controls={conversationSidebarId} onClick={toggleConversationSidebar}>
               <Icon name="panelLeft" size={17} />
             </button>
           </div> : null}
+          <RetainedWorkspaces />
           {children}
         </div>
         <GlobalWorkspacePalette overview={overview} open={searchOpen} setOpen={setSearchOpen} />

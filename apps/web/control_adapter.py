@@ -31,7 +31,7 @@ from muteki.core.events import control_command_payload
 
 _RESERVED_BODY_KEYS = {
     "action", "target", "scope", "payload", "command_id",
-    "expected_generation", "deadline_at",
+    "expected_generation", "deadline_at", "actor",
 }
 class ControlPayloadError(ValueError):
     """A clean client error while compiling a wire request."""
@@ -43,8 +43,14 @@ def compile_control_command(
     *,
     secrets: SecretStore,
     existing_command: Optional[ControlCommand] = None,
+    actor: str = "operator",
 ) -> ControlCommand:
-    """Compile the typed endpoint and legacy flat HITL shape into one command."""
+    """Compile the typed endpoint and legacy flat HITL shape into one command.
+
+    ``actor`` 是控制 journal 的归因字段：Web/operator 入口保持 ``operator``，
+    经 CapabilityBinding 的 Agent 调用必须传真实身份（如 ``agent:<id>``），
+    不得把 Agent 发起的命令记成 operator。
+    """
     raw_payload = body.get("payload") or {}
     if not isinstance(raw_payload, Mapping):
         raise ControlPayloadError("payload must be a JSON object")
@@ -75,6 +81,7 @@ def compile_control_command(
         "action": action,
         "scope": scope,
         "payload": payload,
+        "actor": str(actor or "operator").strip() or "operator",
     }
     if body.get("command_id") is not None:
         values["command_id"] = body.get("command_id")
@@ -239,9 +246,9 @@ class QueueControlPort:
     @staticmethod
     def wire_command(command: ControlCommand) -> dict[str, Any]:
         return {
+            **dict(command.payload),
             "target": command.scope.as_legacy_target(),
             "action": command.action.value,
-            **dict(command.payload),
             "command_id": command.command_id,
         }
 

@@ -44,6 +44,7 @@ ENGINE_DESCRIPTORS: tuple[EngineDescriptor, ...] = (
     EngineDescriptor("opencode", "OpenCode", "supported"),
     EngineDescriptor("pi", "Pi", "supported"),
     EngineDescriptor("kimi", "Kimi Code", "supported"),
+    EngineDescriptor("zcode", "ZCode CLI", "supported"),
     EngineDescriptor("omp", "OMP", "supported"),
     EngineDescriptor("devin", "Devin CLI", "supported"),
     EngineDescriptor("droid", "Droid", "supported"),

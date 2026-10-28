@@ -23,6 +23,7 @@
 /* Landmarks, scroll panes and overlay shells are focus destinations, not
  * selected controls. In particular, never outline the entire chat canvas. */
 #conversation-main-content:focus,
+#chat-main-content:focus,
 .cx-root :is(.cx-scroll, [data-cx-layer], [data-cx-focus-scope], [role="dialog"], [role="tabpanel"], [role="menu"], [role="listbox"]):focus,
 .cx-portal :is(.cx-scroll, [data-cx-layer], [data-cx-focus-scope], [role="dialog"], [role="tabpanel"], [role="menu"], [role="listbox"]):focus {
   outline: none;

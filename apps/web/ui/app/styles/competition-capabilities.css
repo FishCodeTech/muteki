@@ -142,7 +142,7 @@
   gap: 5px;
   padding: 2px 7px;
   border-radius: 5px;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
   white-space: nowrap;
   background: color-mix(in srgb, var(--muted) 12%, transparent);
@@ -216,7 +216,7 @@
 .cap-stat-sub {
   margin: 0;
   color: var(--dim);
-  font-size: 10px;
+  font-size: 11px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -261,7 +261,7 @@
   border-radius: 10px;
   background: color-mix(in srgb, var(--muted) 15%, transparent);
   color: var(--muted);
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
   font-family: var(--font-mono);
 }
@@ -381,7 +381,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 10px;
+  font-size: 11px;
   color: var(--muted);
   font-family: var(--font-mono);
 }
@@ -393,7 +393,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  font-size: 10px;
+  font-size: 11px;
   color: var(--dim);
 }
 
@@ -441,7 +441,7 @@
 .cap-badge {
   padding: 2px 7px;
   border-radius: 5px;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 550;
   border: 1px solid var(--line);
   background: var(--panel2);
@@ -560,7 +560,7 @@
   gap: 6px;
   margin-top: 2px;
   flex-wrap: wrap;
-  font-size: 9.5px;
+  font-size: 11px;
   color: var(--dim);
 }
 

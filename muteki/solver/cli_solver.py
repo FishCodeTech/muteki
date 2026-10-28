@@ -105,6 +105,7 @@ class CliSolver:
         intent_goal: str = "",
         intent_id: str = "",
         conclude_timeout: int = 120,
+        execution_budget: Optional[Any] = None,
         checkpoint_interval: int = 300,
         resume_session: Optional[str] = None,
         hitl_cmd: Optional[dict] = None,
@@ -383,6 +384,7 @@ class CliSolver:
         # retained for transcript/interrupt consumers; Fact admission reads only
         # these records because they carry exact event and target identity.
         self._tool_evidence_records: "list[Any]" = []
+        self._tool_evidence_total_count: int = 0
         # Structured worker result. CTF publishes its one final Fact at
         # commit-step; other result types are accumulated until conclusion.
         self._pending_observations: "list[Any]" = []
@@ -440,6 +442,26 @@ class CliSolver:
         self._session_supervisor = session_supervisor
         self._worker_profile: Optional[dict] = (
             dict(worker_profile) if isinstance(worker_profile, dict) else None)
+        self.execution_budget = execution_budget
+        self.same_session_continuation = bool(
+            (self._worker_profile or {}).get("execution_mode") == "campaign"
+            and self.mode in {"bootstrap", "explore"}
+            and getattr(self.challenge, "mode", "ctf") == "ctf"
+            and getattr(self.challenge, "platform_confirmation_required", False)
+        )
+        # Campaign checkpoints belong only to a whole-challenge Worker. A scoped
+        # explore Worker resumes its session but still concludes on commit-step.
+        self.campaign_mode = self.same_session_continuation and self.mode == "bootstrap"
+        self.max_continuations = max(
+            0, int((self._worker_profile or {}).get("max_continuations", 0)))
+        raw_soft_reminder = (
+            self._worker_profile.get("soft_reminder_seconds", 600)
+            if self._worker_profile is not None else 600
+        )
+        try:
+            self.soft_reminder_seconds = max(0, int(raw_soft_reminder))
+        except (TypeError, ValueError):
+            self.soft_reminder_seconds = 600
         self._adapter_resolution: Optional[Any] = None
         self._agent_session_ref: Optional[Any] = None
 
@@ -533,20 +555,52 @@ class CliSolver:
                             ),
                         )
                     else:
-                        await self._commit_worker_result(
-                            RESULT_CANCELLED,
-                            result_detail=(
-                                "Worker was cancelled before handing off its result."
-                            ),
-                            handoff_missing=True,
+                        has_work_evidence = bool(
+                            getattr(self, "_stream_tool_starts", 0)
+                            or getattr(self, "_tool_evidence_records", None)
+                            or getattr(self, "_pending_tool_calls", None)
+                            or getattr(self, "_pending_observations", None)
+                            or getattr(self, "_pending_dead_ends", None)
+                            or getattr(self, "_pending_pocs", None)
+                            or getattr(self, "_draft_fact", None)
+                            or getattr(self, "_stream_accepted", None)
                         )
+                        iid = str(
+                            getattr(self, "_intent_id", "")
+                            or self.intent_id_assigned
+                            or ""
+                        )
+                        if (
+                            not has_work_evidence
+                            and not getattr(self, "_dropped_by_decide", False)
+                            and not self._flags_complete_for_worker()
+                            and iid
+                            and self.shared_graph is not None
+                        ):
+                            self._zero_action_cancel_released = True
+                            self.shared_graph.release_intent_claim(
+                                worker=self.solver_id,
+                                intent_id=iid,
+                                reason="worker cancelled before first tool call",
+                            )
+                        else:
+                            await self._commit_worker_result(
+                                RESULT_CANCELLED,
+                                result_detail=(
+                                    "Worker was cancelled before handing off its result."
+                                ),
+                                handoff_missing=True,
+                            )
                 except asyncio.CancelledError:
                     pass
                 except Exception:
                     pass
             raise
         except Exception as e:
-            self._note_worker_stop("error")
+            budget_expired = (
+                str(getattr(e, "code", "") or "") == "execution_budget_exhausted"
+            )
+            self._note_worker_stop("timeout" if budget_expired else "error")
             launch_code = launch_failure_code(e)
             if launch_code and not isinstance(
                     e, _cli_results.WorkerRuntimeUnavailable):
@@ -565,17 +619,50 @@ class CliSolver:
                         "crossed the process boundary"),
                 )
             elif not exact_control_intent and self.mode != "respond":
-                # Crash/cancel salvage: commit whatever this worker accumulated,
-                # marked handoff_missing. Once, and never raise from cleanup.
-                # Control intents are coordinator-owned: no commit here.
-                try:
-                    await self._commit_worker_result(
-                        "error", result_detail=str(e),
-                        handoff_missing=True)
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    pass
+                has_work_evidence = bool(
+                    getattr(self, "_stream_tool_starts", 0)
+                    or getattr(self, "_tool_evidence_records", None)
+                    or getattr(self, "_pending_tool_calls", None)
+                    or getattr(self, "_pending_observations", None)
+                    or getattr(self, "_pending_dead_ends", None)
+                    or getattr(self, "_pending_pocs", None)
+                    or getattr(self, "_draft_fact", None)
+                    or getattr(self, "_stream_accepted", None)
+                )
+                iid = str(
+                    getattr(self, "_intent_id", "")
+                    or self.intent_id_assigned
+                    or ""
+                )
+                if (
+                    budget_expired
+                    and not has_work_evidence
+                    and not self._flags_complete_for_worker()
+                    and iid
+                    and self.shared_graph is not None
+                ):
+                    self._zero_action_cancel_released = True
+                    try:
+                        self.shared_graph.release_intent_claim(
+                            worker=self.solver_id,
+                            intent_id=iid,
+                            reason="execution budget expired before first tool call",
+                        )
+                    except Exception:
+                        pass
+                else:
+                    # Crash/cancel salvage: commit whatever this worker accumulated,
+                    # marked handoff_missing. Once, and never raise from cleanup.
+                    # Control intents are coordinator-owned: no commit here.
+                    try:
+                        await self._commit_worker_result(
+                            "timed_out" if budget_expired else "error",
+                            result_detail=str(e),
+                            handoff_missing=True)
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
             raise e
         finally:
             drain_task = self._blackboard_drain_task
@@ -590,6 +677,10 @@ class CliSolver:
                     pass
             try:
                 await self._drain_blackboard_requests_once()
+            except Exception:
+                pass
+            try:
+                self._sync_worker_cwd_to_shared()
             except Exception:
                 pass
             # A runner thread can outlive cancellation of the coroutine awaiting it.
@@ -655,6 +746,7 @@ CliSolver._link_inherited_pocs = _cli_workspace._link_inherited_pocs
 CliSolver._link_shared_attachment = _cli_workspace._link_shared_attachment
 CliSolver._spill_host_path = _cli_workspace._spill_host_path
 CliSolver._stage_attachments = _cli_workspace._stage_attachments
+CliSolver._sync_worker_cwd_to_shared = _cli_workspace._sync_worker_cwd_to_shared
 CliSolver._workdir_path = _cli_workspace._workdir_path
 CliSolver._board_context = _cli_board._board_context
 CliSolver._board_markdown = _cli_board._board_markdown

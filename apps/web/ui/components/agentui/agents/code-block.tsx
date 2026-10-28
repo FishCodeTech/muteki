@@ -148,11 +148,11 @@ export function CodeBlock({
       data-state={status}
       aria-busy={streaming}
       className={cn(
-        "group/code w-full overflow-hidden rounded-2xl bg-cx-hover/80 text-sm",
+        "group/code w-full overflow-hidden rounded-2xl border border-cx-border-subtle bg-cx-hover/80 text-sm",
         className,
       )}
     >
-      <div className="flex h-10 items-center gap-2.5 pl-3 pr-1.5">
+      <div className="flex h-9 items-center gap-2.5 pl-3 pr-1.5">
         <FileCode2
           aria-hidden="true"
           className="size-3.5 shrink-0 text-cx-fg-3/70"
@@ -162,7 +162,7 @@ export function CodeBlock({
             {filename}
           </span>
         ) : null}
-        <span className="text-[12px] font-medium uppercase tracking-wide text-cx-fg-3/55">
+        <span className="text-[12px] font-medium uppercase tracking-wide text-cx-fg-3">
           {languageLabel ?? language}
         </span>
         <span className="ml-auto" />
@@ -196,7 +196,7 @@ export function CodeBlock({
         className="cx-scroll overflow-auto border-t border-cx-fg/[0.06] py-2"
         style={{ maxHeight }}
       >
-        <pre className={cn("m-0 font-cx-mono text-xs leading-5 text-cx-fg/85", wrap ? "min-w-0" : "min-w-max")}>
+        <pre className={cn("m-0 font-cx-mono text-[13px] leading-5 text-cx-fg/90", wrap ? "min-w-0" : "min-w-max")}>
           <code>
             {lines.map((line, index) => {
               const lineNumber = index + 1;

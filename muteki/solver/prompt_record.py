@@ -15,11 +15,20 @@ from muteki.core.events import EventType
 class PromptArgv(list[str]):
     """Keep the exact prompt beside argv without changing runner signatures."""
 
-    def __init__(self, argv: list[str], prompt: str, session: str | None, kind: str):
+    def __init__(
+        self,
+        argv: list[str],
+        prompt: str,
+        session: str | None,
+        kind: str,
+        *,
+        has_positional_prompt: bool = True,
+    ):
         super().__init__(argv)
         self.prompt = prompt
         self.session = session or ""
         self.kind = kind
+        self.has_positional_prompt = bool(has_positional_prompt)
 
 
 _SECRET_ENV = re.compile(

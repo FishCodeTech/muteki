@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -11,9 +12,11 @@ if TYPE_CHECKING:
     pass
 
 from muteki.solver.worker_profiles import (
+    freeze_worker_price_identity,
     base_engine_for_profile,
     worker_identity_fields,
 )
+from muteki.core.blocking import run_blocking
 from muteki.core.events import Event, EventType, blackboard_delta_payload
 from muteki.solver.types import SolveOutcome
 from muteki.swarm.swarm_support import (
@@ -131,6 +134,8 @@ class CoordinatorRunState:
     done: set[asyncio.Task[Any]] = field(default_factory=set)
     reaped_n: int = 0
     completed_for_review_n: int = 0
+    total_completed_steps_n: int = 0
+    last_ctf_compact_completed_n: int = 0
     open_intents: list[dict[str, Any]] = field(default_factory=list)
     need_reason: bool = False
     wm_now: int = 0
@@ -139,6 +144,8 @@ class CoordinatorRunState:
     semantic_changed: bool = False
     reason_proposed_n: int = 0
     last_reason_error: str = ""
+    _ctf_settle_wm: int = -1
+    _ctf_settle_since: float = 0.0
 
 
 async def emit_scheduler_bb(
@@ -258,7 +265,7 @@ def _clean_review_policy(value: Any) -> dict[str, Any]:
         "on_semantic_duplicate": False,
         "every_completed_workers": 0,
         "candidate_spike_threshold": 5,
-        "max_concurrent": 1,
+        "max_concurrent": 0,
         "allow_review_fallback": False,
         "cooldown_events": 8,
         "timeout": 90,
@@ -294,7 +301,6 @@ def _clean_review_policy(value: Any) -> dict[str, Any]:
         "on_operator_hint": False,
         "on_semantic_duplicate": False,
         "every_completed_workers": 0,
-        "max_concurrent": 1,
     })
     out["timeout"] = max(30, min(90, int(out["timeout"])))
     return out
@@ -357,22 +363,22 @@ def _engine_healthcheck_cached(self, name: str, role: str) -> bool:
     return ok
 
 
-def _build_solvers(self) -> list:
+async def _build_solvers(self) -> list:
     from muteki.solver.cli_driver import driver_for
     from muteki.solver.cli_solver import CliSolver
 
-    def _healthy(name: str, role: str) -> bool:
-        return self._engine_healthcheck_cached(name, role)
+    async def _healthy(name: str, role: str) -> bool:
+        return await run_blocking(self._engine_healthcheck_cached, name, role)
 
     if self.cli_race:
         # race the configured engine roster (heterogeneous). Keep only the
         # engines whose healthcheck passes. ONE worker per healthy engine — independent of
         # the lineup size — so they genuinely race the same challenge (the
         # lineup specs only supply solver_id labels, cycled).
-        engines = [e for e in self.engines if _healthy(e, "race")]
+        engines = [e for e in self.engines if await _healthy(e, "race")]
     else:
         # A failed selected engine is explicit; never substitute another CLI.
-        if _healthy(self.cli_engine, "bootstrap"):
+        if await _healthy(self.cli_engine, "bootstrap"):
             engines = [self.cli_engine]
         else:
             engines = []
@@ -394,9 +400,24 @@ def _build_solvers(self) -> list:
         if self.worker_profiles and profile is None:
             continue
         transport = base_engine_for_profile(profile or engine)
-        if (self._context_requires_secure_prompt(engine=transport)
-                and not self._secure_prompt_candidate_ready(
-                    engine, role=role)):
+        try:
+            secure_ready = (
+                not self._context_requires_secure_prompt(engine=transport)
+                or await run_blocking(self._secure_prompt_candidate_ready,
+                                      engine, role=role)
+            )
+        except asyncio.CancelledError as exc:
+            rollback_ok = True
+            for built in workers:
+                if not self._release_worker_account(built):
+                    self._retain_worker_retirement_owner(
+                        built, reason="race capability preflight cancelled")
+                    rollback_ok = False
+            if not rollback_ok:
+                raise ControlShutdownIncomplete(
+                    "race capability preflight rollback unconfirmed") from exc
+            raise
+        if not secure_ready:
             # Secret delivery capability is a scheduling constraint, not a
             # failed spawn. Skip before charging the lifetime worker budget or
             # reserving one-shot context so a higher-priority Cursor profile
@@ -435,7 +456,28 @@ def _build_solvers(self) -> list:
                 worker_id=expected_solver_id, engine=transport))
         try:
             workdir = self._alloc_workdir(engine)
-            container = self._container_for_engine(engine, profile)
+            container = await self._container_for_engine(engine, profile)
+            campaign_limits = {}
+            if (isinstance(profile, dict)
+                    and profile.get("execution_mode") == "campaign"
+                    and getattr(self.challenge, "mode", "ctf") == "ctf"
+                    and getattr(self.challenge, "platform_confirmation_required", False)):
+                total_timeout = float(self.race_timeout)
+                execution_budget = getattr(self, "execution_budget", None)
+                if execution_budget is not None:
+                    total_timeout = min(
+                        total_timeout,
+                        execution_budget.remaining_seconds(
+                            reserve_seconds=execution_budget.finalization_seconds),
+                    )
+                if not math.isfinite(total_timeout) or total_timeout <= 0:
+                    raise ValueError("Campaign race timeout must be finite and positive")
+                conclude_timeout = min(75.0, total_timeout / 3.0)
+                finalization_timeout = min(5.0, total_timeout / 10.0)
+                campaign_limits = {
+                    "timeout": total_timeout - conclude_timeout - finalization_timeout,
+                    "conclude_timeout": conclude_timeout,
+                }
             worker = CliSolver(
                 None if self.cli_race else specs[i % len(specs)],
                 self.challenge, bus=self.bus, cost=self.cost,
@@ -457,10 +499,12 @@ def _build_solvers(self) -> list:
                 identity=worker_identity_fields(profile),
             # EXEC-01: Profile→Adapter 解析与 AgentSession 监督（CLI 路径不变）。
                 session_supervisor=self._worker_session_supervisor(),
-                worker_profile=profile,
+                worker_profile=freeze_worker_price_identity(profile, self.credential_accounts_root),
                 plugin_service=self.worker_plugins,
+                execution_budget=getattr(self, "execution_budget", None),
+                **campaign_limits,
             )
-        except Exception as exc:
+        except BaseException as exc:
             rollback_ok = self._release_typed_context_reservations(
                 typed_context_reservations, expected_solver_id)
             for built in workers:

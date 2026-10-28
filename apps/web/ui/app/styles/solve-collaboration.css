@@ -141,7 +141,7 @@
   border-radius: 6px;
   color: var(--muted);
   background: transparent;
-  font-size: 10.5px;
+  font-size: 11px;
   font-weight: 650;
   white-space: nowrap;
 }
@@ -364,7 +364,7 @@
   border-radius: 6px;
   color: var(--muted);
   background: var(--panel);
-  font-size: 10.5px;
+  font-size: 11px;
   font-weight: 650;
   letter-spacing: 0;
   text-transform: none;
@@ -601,7 +601,7 @@
 .collab-agent-card {
   position: relative;
   width: 100%;
-  height: 164px;
+  min-height: 164px;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -665,7 +665,7 @@
   align-self: start;
   max-width: none;
   gap: 7px;
-  font-size: 15px;
+  font-size: 16px;
 }
 .collab-agent-node.compact .collab-agent-state i { width: 11px; height: 11px; }
 .collab-coordinator-card.compact {
@@ -703,7 +703,7 @@
   grid-column: 3;
   max-width: none;
   gap: 7px;
-  font-size: 15px;
+  font-size: 16px;
 }
 .collab-coordinator-card.compact .collab-agent-state i { width: 11px; height: 11px; }
 /* A fresh event (lastEventAt moved): one glow in the card's own colour, then a
@@ -777,17 +777,17 @@
 .collab-coordinator-head:has(.collab-agent-badges) { grid-template-columns: 26px minmax(0, 1fr) auto auto; }
 .collab-coordinator-avatar { width: 24px; height: 24px; display: grid; place-items: center; border: 1px solid color-mix(in srgb, var(--blue) 45%, var(--line)); border-radius: 7px; color: var(--blue); background: transparent; }
 .collab-coordinator-identity { min-width: 0; display: grid; gap: 1px; }
-.collab-coordinator-identity strong { overflow: hidden; color: var(--bright); font-size: 12.5px; font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }
-.collab-coordinator-identity small { overflow: hidden; color: var(--muted); font-size: var(--fs-label); text-overflow: ellipsis; white-space: nowrap; }
+.collab-coordinator-identity strong { overflow: hidden; color: var(--bright); font-size: 17px; font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }
+.collab-coordinator-identity small { overflow: hidden; color: var(--muted); font-size: 16px; text-overflow: ellipsis; white-space: nowrap; }
 .collab-coordinator-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: center; align-content: center; gap: 4px; padding: 8px 12px; }
 .collab-coordinator-metrics span { min-width: 0; display: grid; justify-items: center; gap: 3px; padding: 5px 2px; border-radius: 7px; background: color-mix(in srgb, var(--panel2) 70%, transparent); }
-.collab-coordinator-metrics b { color: var(--bright); font: 800 14px/1 var(--font-mono); font-variant-numeric: tabular-nums; }
+.collab-coordinator-metrics b { color: var(--bright); font: 800 17px/1 var(--font-mono); font-variant-numeric: tabular-nums; }
 .collab-coordinator-metrics b.zero { color: var(--muted); font-weight: 600; opacity: .55; }
-.collab-coordinator-metrics small { color: var(--muted); font-size: var(--fs-label); text-align: center; white-space: nowrap; }
-.collab-coordinator-foot { min-width: 0; display: flex; align-items: center; gap: 8px; padding: 5px 12px 7px; color: var(--muted); font: var(--fs-label)/1 var(--font-mono); border-top: 1px solid color-mix(in srgb, var(--line) 70%, transparent); }
+.collab-coordinator-metrics small { color: var(--muted); font-size: 16px; text-align: center; white-space: nowrap; }
+.collab-coordinator-foot { min-width: 0; display: flex; align-items: center; gap: 8px; padding: 5px 12px 7px; color: var(--muted); font: 16px/1 var(--font-mono); border-top: 1px solid color-mix(in srgb, var(--line) 70%, transparent); }
 .collab-coordinator-activity { min-width: 0; display: inline-flex; align-items: center; gap: 5px; color: var(--muted); }
 .collab-coordinator-activity span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.collab-coordinator-foot time { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+.collab-coordinator-foot time { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; font-size: inherit; }
 /* Generation grouping box (all-executions view): a labelled background frame
    behind one generation's worker band. */
 .collab-group {
@@ -813,7 +813,7 @@
 .collab-canvas .react-flow__node-group { border: 0; background: transparent; }
 /* Wide, quiet head borrowed from AgentTrail: metadata first, then one clear title. */
 .collab-agent-head { min-width: 0; min-height: 31px; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 8px; padding: 8px 14px 2px; }
-.collab-agent-kicker { min-width: 0; display: flex; align-items: center; gap: 5px; overflow: hidden; color: var(--muted); font: 700 9.5px/1.2 var(--font-mono); letter-spacing: .045em; text-transform: uppercase; white-space: nowrap; }
+.collab-agent-kicker { min-width: 0; display: flex; align-items: center; gap: 5px; overflow: hidden; color: var(--muted); font: 700 16px/1.2 var(--font-mono); letter-spacing: .045em; text-transform: uppercase; white-space: nowrap; }
 .collab-agent-kicker > b { color: var(--muted); font-weight: 700; }
 .collab-agent-kicker > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .collab-agent-badges { display: inline-flex; align-items: center; gap: 4px; }
@@ -823,13 +823,13 @@
 .collab-agent-node.compact .collab-agent-badges,
 .collab-coordinator-card.compact .collab-agent-badges { display: none; }
 .collab-agent-avatar,
-.collab-inspector-avatar { width: 20px; height: 20px; display: grid; place-items: center; flex: none; border: 1px solid color-mix(in srgb, var(--agent-color) 50%, var(--line)); border-radius: 6px; color: var(--agent-color); background: transparent; font-size: 8px; font-weight: 800; line-height: 1; }
+.collab-inspector-avatar { width: 20px; height: 20px; display: grid; place-items: center; flex: none; border: 1px solid color-mix(in srgb, var(--agent-color) 50%, var(--line)); border-radius: 6px; color: var(--agent-color); background: transparent; font-size: 11px; font-weight: 800; line-height: 1; }
 .collab-agent-avatar .engine-logo,
 .collab-inspector-avatar .engine-logo { display: block; }
 .collab-inspector-avatar { width: 36px; height: 36px; border-radius: 9px; font-size: 11px; }
-.collab-agent-title { min-width: 0; overflow: hidden; padding: 0 14px; color: var(--bright); font-size: 15px; font-weight: 680; line-height: 25px; text-overflow: ellipsis; white-space: nowrap; }
+.collab-agent-title { min-width: 0; overflow: hidden; padding: 0 14px; color: var(--bright); font-size: 17px; font-weight: 680; line-height: 25px; text-overflow: ellipsis; white-space: nowrap; }
 .collab-agent-state,
-.collab-inspector-status { min-width: 0; display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: var(--fs-label); font-weight: 650; white-space: nowrap; }
+.collab-inspector-status { min-width: 0; display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: 16px; font-weight: 650; white-space: nowrap; }
 /* Fixed cap (not a percentage: the head's auto column would resolve it against itself). */
 .collab-agent-state { max-width: 130px; }
 .collab-agent-state > span,
@@ -858,9 +858,9 @@
 .collab-inspector-status.state-thinking i,
 .collab-inspector-status.state-running-tool i { animation: collab-pulse 1.7s ease-in-out infinite; }
 @keyframes collab-pulse { 50% { box-shadow: 0 0 0 4px color-mix(in srgb, currentColor 16%, transparent); } }
-.collab-agent-intent { min-width: 0; min-height: 32px; padding: 1px 14px 4px; }
-.collab-agent-intent span { overflow: hidden; color: var(--text); font-size: 11px; font-weight: 550; line-height: 1.35; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
-.collab-agent-activity { min-width: 0; min-height: 27px; display: flex; align-items: center; gap: 6px; margin: 0 14px; padding: 5px 0; border-top: 1px solid var(--line); color: var(--muted); font: var(--fs-label)/1.2 var(--font-mono); }
+.collab-agent-intent { min-width: 0; min-height: 32px; padding: 1px 14px 12px; }
+.collab-agent-intent span { overflow: hidden; color: var(--text); font-size: 16px; font-weight: 550; line-height: 1.35; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.collab-agent-activity { min-width: 0; min-height: 27px; display: flex; align-items: center; gap: 6px; margin: 0 14px; padding: 5px 0; border-top: 1px solid var(--line); color: var(--muted); font: 16px/1.2 var(--font-mono); }
 .collab-agent-activity span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .collab-sparkline {
   flex: none;
@@ -896,13 +896,13 @@
 }
 .collab-timeline-ruler i { width: 1px; height: 8px; background: var(--line2); }
 .collab-canvas .react-flow__node-ruler { border: 0; background: transparent; }
-.collab-agent-foot { min-width: 0; min-height: 22px; margin-top: auto; display: flex; align-items: center; gap: 10px; padding: 2px 14px 5px; color: var(--muted); font: var(--fs-label)/1 var(--font-mono); }
+.collab-agent-foot { min-width: 0; min-height: 22px; margin-top: auto; display: flex; align-items: center; gap: 10px; padding: 2px 14px 5px; color: var(--muted); font: 16px/1 var(--font-mono); }
 .collab-agent-foot > span { display: inline-flex; align-items: center; gap: 2px; }
 .collab-agent-foot .ok { color: var(--green); }
 .collab-agent-foot .warn { color: var(--amber); }
 .collab-agent-foot .bad { color: var(--red); }
-.collab-agent-foot time { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
-.collab-agent-expand { width: 100%; min-height: 27px; display: flex; align-items: center; justify-content: space-between; padding: 0 14px; border: 0; border-top: 1px solid var(--line); border-radius: 0; color: var(--muted); background: transparent; font: 700 9px/1 var(--font-mono); letter-spacing: .05em; text-transform: uppercase; cursor: pointer; }
+.collab-agent-foot time { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; font-size: inherit; }
+.collab-agent-expand { width: 100%; min-height: 27px; display: flex; align-items: center; justify-content: space-between; padding: 0 14px; border: 0; border-top: 1px solid var(--line); border-radius: 0; color: var(--muted); background: transparent; font: 700 16px/1 var(--font-mono); letter-spacing: .05em; text-transform: uppercase; cursor: pointer; }
 .collab-agent-expand span { display: inline-flex; align-items: center; gap: 5px; }
 .collab-agent-expand b { color: var(--text); font-weight: 700; }
 .collab-agent-expand:hover { color: var(--text); background: var(--panel2); }
@@ -919,7 +919,7 @@
 .collab-agent-workitem.tone-danger > svg:first-child { color: var(--red); }
 .collab-agent-workitem.tone-accent > svg:first-child { color: var(--blue); }
 .collab-agent-workitem > span { min-width: 0; overflow: hidden; color: var(--text); text-overflow: ellipsis; white-space: nowrap; }
-.collab-agent-workitem > b { max-width: 108px; overflow: hidden; padding: 2px 6px; border-radius: 5px; color: var(--muted); background: var(--panel2); font: 700 9px/1.2 var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
+.collab-agent-workitem > b { max-width: 108px; overflow: hidden; padding: 2px 6px; border-radius: 5px; color: var(--muted); background: var(--panel2); font: 700 11px/1.2 var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
 .collab-agent-show-all { grid-template-columns: 16px minmax(0, 1fr); color: var(--blue); }
 .collab-agent-show-all > span { color: var(--blue); }
 /* Knowledge-flow matrix (P3-06): source × target grid, kind colours match the edges. */
@@ -1613,7 +1613,7 @@
 /* Detail-area buttons share one control shape with the toolbar (28px, 7px radius)
    instead of the heroui pill; both action rows use size="sm" variant="ghost". */
 .collab-detail-actions button,
-.collab-inspector-actions button { height: 28px; min-height: 28px; padding: 0 9px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: var(--panel2); font-size: 10.5px; font-weight: 600; }
+.collab-inspector-actions button { height: 28px; min-height: 28px; padding: 0 9px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: var(--panel2); font-size: 11px; font-weight: 600; }
 .collab-detail-actions button:hover,
 .collab-inspector-actions button:hover { color: var(--blue); border-color: color-mix(in srgb, var(--blue) 35%, var(--line)); background: var(--panel3); }
 .collab-detail-actions button.copied { color: var(--green); }
@@ -1685,7 +1685,7 @@
 .collab-activity-row.tone-runtime > i { background: var(--blue); }
 .collab-activity-row > span { min-width: 0; display: grid; gap: 2px; }
 .collab-activity-row strong { overflow: hidden; color: var(--text); font: 700 var(--fs-label)/1.3 var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
-.collab-activity-row p { max-height: 46px; margin: 0; overflow: hidden; color: var(--muted); font-size: 10.5px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+.collab-activity-row p { max-height: 46px; margin: 0; overflow: hidden; color: var(--muted); font-size: 11px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
 .collab-activity-row.is-open p { max-height: none; }
 .collab-activity-row time { color: var(--muted); font: var(--fs-meta)/1.3 var(--font-mono); }
 .collab-relation-row {
@@ -1740,7 +1740,7 @@
 .collab-relation-route.relation-report > i { color: var(--amber); background: color-mix(in srgb, var(--amber) 8%, var(--panel)); }
 .collab-relation-route.relation-directive > i { color: var(--magenta); background: color-mix(in srgb, var(--magenta) 8%, var(--panel)); }
 .collab-relation-route.relation-lock > i { color: var(--red); background: color-mix(in srgb, var(--red) 8%, var(--panel)); }
-.collab-relation-direction { margin: 8px 0 0; color: var(--muted); font-size: 10.5px; line-height: 1.5; }
+.collab-relation-direction { margin: 8px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
 /* loading skeleton for the dynamically imported canvas: same grid as the live shell */
 .collab-skeleton .collab-toolbar > .skel-box { flex: none; }
 .collab-skeleton .collab-skeleton-search { flex: 1 1 200px; min-width: 160px; max-width: 260px; }
@@ -1850,7 +1850,7 @@
     background: var(--panel);
   }
   .collab-mobile-tablist { min-width: 0; display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px; }
-  .collab-mobile-tablist button { width: 100%; min-height: 29px; border: 0; border-radius: 6px; color: var(--muted); background: transparent; font-size: 10.5px; }
+  .collab-mobile-tablist button { width: 100%; min-height: 29px; border: 0; border-radius: 6px; color: var(--muted); background: transparent; font-size: 11px; }
   .collab-mobile-tablist button.on { color: var(--blue); background: color-mix(in srgb, var(--blue) 8%, var(--panel)); }
   .collab-mobile-tabs .collab-scope { height: 29px; padding: 2px; }
   .collab-mobile-tabs .collab-scope button { height: 25px; min-height: 25px; padding: 0 7px; }
@@ -1890,7 +1890,7 @@
   padding: 8px 10px;
 }
 .collab-node-tip > strong { color: var(--bright); font-size: 11.5px; font-weight: 700; line-height: 1.4; overflow-wrap: anywhere; }
-.collab-node-tip > span { color: var(--muted); font-size: 10.5px; line-height: 1.4; }
+.collab-node-tip > span { color: var(--muted); font-size: 11px; line-height: 1.4; }
 .collab-edge-tip {
   position: absolute;
   z-index: 8;

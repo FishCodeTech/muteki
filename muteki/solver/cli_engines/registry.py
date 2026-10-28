@@ -27,6 +27,7 @@ from muteki.solver.cli_engines.engines.kimi import KimiCodeDriver
 from muteki.solver.cli_engines.engines.omp import OhMyPiDriver
 from muteki.solver.cli_engines.engines.opencode import OpenCodeDriver
 from muteki.solver.cli_engines.engines.pi import PiDriver
+from muteki.solver.cli_engines.engines.zcode import ZCodeDriver
 from muteki.solver.cli_engines.types import (
     CliResult, LaunchContext, StreamStep, WORKER_LAUNCH,
 )
@@ -39,6 +40,7 @@ DRIVERS: dict[str, CliDriver] = {
     "pi": PiDriver(),
     "omp": OhMyPiDriver(),
     "kimi": KimiCodeDriver(),
+    "zcode": ZCodeDriver(),
     "grok": GrokDriver(),
     "opencode": OpenCodeDriver(),
     "droid": DroidDriver(),
@@ -69,8 +71,6 @@ class ProfileDriver(CliDriver):
         self.name = base.name
         self.secure_prompt_transport = bool(
             getattr(base, "secure_prompt_transport", False))
-        self.persistent_stdin_prompt = bool(
-            getattr(base, "persistent_stdin_prompt", False))
         self.offline_web_isolation = bool(
             getattr(base, "offline_web_isolation", False))
         self.HELLO_PROMPT = base.HELLO_PROMPT
@@ -139,6 +139,26 @@ class ProfileDriver(CliDriver):
             prompt, session, web_access=web_access, kb_access=kb_access,
             stream=stream, launch=launch))
 
+    def build_execute_input(
+        self, prompt: str, session: Optional[str], *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        argv, stdin_text = self.base.build_execute_input(
+            prompt, session, web_access=web_access, kb_access=kb_access,
+            stream=stream, launch=launch)
+        return self._with_profile_options(argv), stdin_text
+
+    def build_resume_input(
+        self, prompt: str, session: str, *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        argv, stdin_text = self.base.build_resume_input(
+            prompt, session, web_access=web_access, kb_access=kb_access,
+            stream=stream, launch=launch)
+        return self._with_profile_options(argv), stdin_text
+
     def secure_prompt_preflight(self) -> "tuple[bool, str]":
         return self.base.secure_prompt_preflight()
 
@@ -180,8 +200,6 @@ class EndpointDriver(CliDriver):
         self.name = base.name
         self.secure_prompt_transport = bool(
             getattr(base, "secure_prompt_transport", False))
-        self.persistent_stdin_prompt = bool(
-            getattr(base, "persistent_stdin_prompt", False))
         # Endpoint profiles change model transport/authentication, not the CLI's
         # exposed tool set.  Therefore Claude's explicit WebSearch/WebFetch deny
         # and Codex's opt-in-only --search contract remain enforceable.
@@ -253,13 +271,13 @@ class EndpointDriver(CliDriver):
                 config = json.loads(str(arg)[len(prefix):])
             except json.JSONDecodeError:
                 config = {}
-            provider = config.setdefault("provider", {})
+            provider = config.setdefault("providers", {})
             provider["muteki"] = {
-                "npm": "@ai-sdk/openai-compatible",
+                "package": "@opencode/ai/providers/openai-compatible",
                 "name": "Muteki",
-                "options": {
+                "env": ["OPENAI_API_KEY"],
+                "settings": {
                     "baseURL": base_url,
-                    "apiKey": "{env:OPENAI_API_KEY}",
                 },
                 "models": {model: {"name": model}},
             }
@@ -317,6 +335,26 @@ class EndpointDriver(CliDriver):
             self.base.build_execute_stdin(
                 prompt, session, web_access=web_access,
                 kb_access=kb_access, stream=stream, launch=launch)))
+
+    def build_execute_input(
+        self, prompt: str, session: Optional[str], *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        argv, stdin_text = self.base.build_execute_input(
+            prompt, session, web_access=web_access, kb_access=kb_access,
+            stream=stream, launch=launch)
+        return self._with_profile_options(self._inject_before_exec(argv)), stdin_text
+
+    def build_resume_input(
+        self, prompt: str, session: str, *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        argv, stdin_text = self.base.build_resume_input(
+            prompt, session, web_access=web_access, kb_access=kb_access,
+            stream=stream, launch=launch)
+        return self._with_profile_options(self._inject_before_exec(argv)), stdin_text
 
     def secure_prompt_preflight(self) -> "tuple[bool, str]":
         return self.base.secure_prompt_preflight()

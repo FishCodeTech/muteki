@@ -34,6 +34,8 @@ def workspace_root_for_worker(wd: str | Path) -> Path:
     lightweight workspace root so local execution still uses the CAS protocol.
     """
     p = Path(wd).resolve()
+    if p.name == "workspace" or (p / "manifest.json").exists() or (p / "workers").is_dir():
+        return p
     if p.parent.name == "workers":
         return p.parent.parent
     return p.parent
@@ -350,7 +352,39 @@ def stage_worker_toolbox(
         if present_paths is not None:
             available = {str(Path(p)) for p in present_paths}
         else:
+            hosted_fallbacks: dict[str, tuple[Path, ...]] = {
+                "target-binaries": (Path("/usr/share/chisel-common-binaries"),),
+                "wordlists": (
+                    Path(os.environ.get("MUTEKI_HOSTED_WORDLISTS_ROOT") or "/usr/share/wordlists"),
+                    Path("/usr/share/seclists"),
+                ),
+                "pocs": (
+                    Path(os.environ.get("MUTEKI_HOSTED_POC_ROOT") or "/home/kali/pocs"),
+                ),
+                "knowledge": (
+                    Path(os.environ.get("MUTEKI_HOSTED_KNOWLEDGE_ROOT") or "/home/kali/knowledges"),
+                ),
+                "nuclei-templates": (
+                    Path(
+                        os.environ.get("MUTEKI_HOSTED_NUCLEI_TEMPLATES_ROOT")
+                        or "/home/kali/.local/nuclei-templates"
+                    ),
+                ),
+            }
+            for key, candidates_list in hosted_fallbacks.items():
+                if not dir_mappings[key].exists():
+                    for candidate in candidates_list:
+                        if candidate.exists():
+                            dir_mappings[key] = candidate
+                            break
             available = {str(target) for target in dir_mappings.values() if target.exists()}
+            if not (local_root / "bin").exists():
+                bin_mappings = {
+                    name: target
+                    for name, target in _CONTAINER_BIN_CANDIDATES.items()
+                    if target.exists()
+                }
+                available.update(str(target) for target in bin_mappings.values())
 
     kept_dirs: set[str] = set()
     kept_bins: set[str] = set()
@@ -458,10 +492,12 @@ def _atomic_materialize(src: Path, dst: Path) -> None:
         if src.is_dir():
             shutil.copytree(src, tmp)
         else:
+            shutil.copy2(src, tmp)
             try:
-                os.link(src, tmp)
+                exec_bits = src.stat().st_mode & 0o111
+                tmp.chmod(0o555 if exec_bits else 0o444)
             except OSError:
-                shutil.copy2(src, tmp)
+                pass
         os.replace(tmp, dst)
     except FileExistsError:
         pass
@@ -478,17 +514,28 @@ def _atomic_materialize(src: Path, dst: Path) -> None:
 
 def _replace_symlink(link: Path, target: Path) -> None:
     link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink():
+        try:
+            if os.readlink(link) == str(target):
+                return
+            link.unlink()
+        except OSError:
+            pass
     try:
-        link.unlink()
-    except FileNotFoundError:
+        link.symlink_to(target)
+    except FileExistsError:
         pass
-    link.symlink_to(target)
 
 
 def relative_symlink(link: str | Path, target: str | Path) -> None:
     link = Path(link)
     target = Path(target)
-    rel = os.path.relpath(target, start=link.parent)
+    link.parent.mkdir(parents=True, exist_ok=True)
+    parent_real = link.parent.resolve()
+    target_real = (
+        target.resolve() if target.exists() else Path(os.path.abspath(target))
+    )
+    rel = os.path.relpath(target_real, start=parent_real)
     _replace_symlink(link, Path(rel))
 
 
@@ -561,6 +608,8 @@ def link_shared_into_worker(root: str | Path, wd: str | Path, name: str, sha256:
     root = ensure_workspace(root)
     dst = Path(wd) / "shared" / Path(name).name
     src = object_path(root, "shared", sha256)
+    if dst.exists() and not dst.is_symlink():
+        return dst
     relative_symlink(dst, src)
     return dst
 

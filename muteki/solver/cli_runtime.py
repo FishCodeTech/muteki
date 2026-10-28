@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import stat
@@ -412,6 +413,26 @@ def _mark_session_if_live(self, res: "CliResult") -> None:
     # Treat the persisted-turn count as the success fence; a startup failure has
     # no completed turn and remains non-resumable.
     if (
+        not getattr(res, "session", None)
+        and getattr(self.driver, "name", "") == "kimi"
+    ):
+        try:
+            kimi_home = (getattr(self, "_extra_worker_env", None) or {}).get("KIMI_CODE_HOME") or os.environ.get("KIMI_CODE_HOME")
+            idx_path = Path(str(kimi_home)) / "session_index.jsonl" if kimi_home else None
+            if idx_path is not None and idx_path.is_file():
+                for line in reversed(
+                    idx_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                ):
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    sid = str((row if isinstance(row, dict) else {}).get("sessionId") or "").strip()
+                    if sid:
+                        res.session = sid
+                        break
+        except Exception:
+            pass
+    if (
         bool(getattr(res, "session", None))
         and int(getattr(res, "num_turns", 0) or 0) > 0
     ):
@@ -451,17 +472,20 @@ def _execute_invocation(
         argv = self.driver.build_execute_stdin(
             prompt, session, web_access=self.web_access,
             kb_access=self.kb, stream=True)
-        return PromptArgv(argv, prompt, None, "execute"), prompt
-    argv = self.driver.build_execute(
+        return (
+            PromptArgv(
+                argv, prompt, None, "execute", has_positional_prompt=False
+            ),
+            prompt,
+        )
+    argv, stdin_text = self.driver.build_execute_input(
         prompt, session, web_access=self.web_access,
         kb_access=self.kb, stream=True)
-    if (getattr(self.driver, "persistent_stdin_prompt", False)
-            and len(prompt.encode("utf-8")) >= 64 * 1024):
-        if not argv or argv[-1] != prompt:
-            raise SecurePromptUnsupported(
-                f"{self.driver.name} persistent stdin prompt contract changed")
-        return PromptArgv(argv[:-1], prompt, session, "execute"), prompt
-    return PromptArgv(argv, prompt, session, "execute"), None
+    return (
+        PromptArgv(argv, prompt, session, "execute",
+                   has_positional_prompt=stdin_text is None),
+        stdin_text,
+    )
 
 
 def _resume_invocation(
@@ -478,16 +502,14 @@ def _resume_invocation(
     self._finalize_control_context_prompt_manifest(prompt)
     if self._control_secret_values:
         return self._execute_invocation(prompt, None)
-    argv = self.driver.build_resume(
+    argv, stdin_text = self.driver.build_resume_input(
         prompt, session, web_access=self.web_access,
         kb_access=self.kb, stream=True)
-    if (getattr(self.driver, "persistent_stdin_prompt", False)
-            and len(prompt.encode("utf-8")) >= 64 * 1024):
-        if not argv or argv[-1] != prompt:
-            raise SecurePromptUnsupported(
-                f"{self.driver.name} persistent stdin resume contract changed")
-        return PromptArgv(argv[:-1], prompt, session, "resume"), prompt
-    return PromptArgv(argv, prompt, session, "resume"), None
+    return (
+        PromptArgv(argv, prompt, session, "resume",
+                   has_positional_prompt=stdin_text is None),
+        stdin_text,
+    )
 
 
 async def _run_invocation(
@@ -555,16 +577,20 @@ async def _emit_step(self, step: StreamStep) -> None:
             self._reasoning_turn_acc = ""
             self._stream_tool_starts += 1
             label = f"{step.tool}: {step.text}" if step.text else step.tool
-            await self._emit(EventType.TOOL_CALL_START, tool=label[:200])
+            await self._emit(
+                EventType.TOOL_CALL_START, tool=label,
+                tool_call_id=step.call_id,
+            )
         # Capture tool invocations for provenance. Text in commands, reasoning,
         # tool output, and final replies never mutates shared state; only a
         # host-validated Skill request does so.
         if step.kind == "tool":
             # Keep command/output identity when the engine exposes a call id. The
             # FIFO fallback covers older stream shapes that preserve order only.
-            command = (step.text or "")[:2000]
+            command = step.text or ""
             self._pending_tool_calls.append({
                 "call_id": step.call_id,
+                "tool": str(step.tool or ""),
                 "command": command,
                 "intent_id": str(
                     getattr(self, "intent_id_assigned", "")
@@ -596,14 +622,23 @@ async def _emit_step(self, step: StreamStep) -> None:
             attributed = match_idx is not None
             pending = self._pending_tool_calls[match_idx] if attributed else {}
             command = pending.get("command", "")
+            tool_name = str(pending.get("tool") or getattr(step, "tool", "") or "")
+            is_handover_tool = tool_name in {
+                "submit_fact", "commit_step", "submit_flag", "mark_deadend",
+            }
             if raw:
                 evidence_record = self._persist_raw_tool_output(
                     raw, command=command, call_id=step.call_id,
-                    attributed=attributed,
+                    attributed=bool(attributed and not is_handover_tool),
                     intent_id=pending.get("intent_id", ""),
                     target_epoch=pending.get("target_epoch", ""),
                     target=pending.get("target", ""),
                 )
+            else:
+                self._tool_evidence_total_count = (
+                    int(getattr(self, "_tool_evidence_total_count", 0) or 0) + 1
+                )
+                self._maybe_steer_idle_repeat()
             if attributed:
                 self._pending_tool_calls.pop(match_idx)
             result_text = raw[:600] if raw else ""

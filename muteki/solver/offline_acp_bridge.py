@@ -270,7 +270,7 @@ class OfflineAcpClient:
                 message = json.loads(line)
             except json.JSONDecodeError:
                 sys.stderr.write(
-                    f"{self.agent_label} ACP emitted invalid JSON: {line[:500]}\n")
+                    f"{self.agent_label} ACP emitted invalid JSON: {line}\n")
                 sys.stderr.flush()
                 continue
             if "method" in message and "id" in message:

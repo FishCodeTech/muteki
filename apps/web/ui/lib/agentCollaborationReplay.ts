@@ -9,7 +9,7 @@
  * Omitted relative to a full historical replay:
  * - Lane phase / statusReason / tokens / cost stay terminal.
  * - statusKind is only online vs offline (SolverLane has no history).
- * - Retired / challenged / lock state has no dedicated timestamp.
+ * - Challenged / lock state has no dedicated timestamp.
  * - Reason-round counts have no per-round clock.
  * - Blackboard events cap at 300 and runtime events at 500, so long runs
  *   can miss early markers (see replayTruncated).
@@ -121,10 +121,19 @@ function projectKnowledgeItem(item: CollaborationKnowledgeItem, asOf: number): C
     };
   }
 
+  if (item.kind === "goal" && item.concludedTs && !atOrBefore(item.concludedTs, asOf)) {
+    return { ...item, status: "open", statusKey: knowledgeStatusKey("goal", "open"), tone: "neutral", ts: item.appearedTs };
+  }
+
+  if (item.kind === "fact" && item.retiredTs && !atOrBefore(item.retiredTs, asOf)) {
+    return { ...item, status: "recorded", statusKey: knowledgeStatusKey("fact", "recorded"), tone: "success", retirementReason: undefined, retirementActorId: undefined, replacementFactSeq: undefined, retiredTs: undefined };
+  }
+
   if (
     item.kind === "fact"
     && item.status !== "recorded"
     && item.status !== "scoped_negative"
+    && !!item.promotedTs
     && !atOrBefore(item.promotedTs, asOf)
   ) {
     return {
@@ -207,8 +216,8 @@ function knowledgeForAgent(
   const owned: CollaborationKnowledgeItem[] = [];
   for (const row of rows) {
     const owner = row.agentId || COORDINATOR_ID;
-    if (owner === agentId) owned.push(row);
-    else if (agentId === COORDINATOR_ID && row.kind === "intent" && row.proposerId === COORDINATOR_ID) owned.push(row);
+    if (owner === agentId || (agentId === "challenger" && (row.proposerId === agentId || row.retirementActorId === agentId))) owned.push(row);
+    else if (agentId === COORDINATOR_ID && (row.kind === "intent" || row.kind === "step") && row.proposerId === COORDINATOR_ID) owned.push(row);
     else if (agentId === COORDINATOR_ID && row.kind === "directive" && row.proposerId === OPERATOR_ID) owned.push(row);
   }
   return owned;
@@ -305,6 +314,15 @@ export function projectCollaborationAsOf(model: AgentCollaborationModel, asOf: n
     if (projected) knowledge.push(projected);
   }
 
+  // Goal satisfaction follows the supporting facts at this point in the replay.
+  for (let i = 0; i < knowledge.length; i += 1) {
+    const goal = knowledge[i];
+    if (goal.kind !== "goal" || !goal.concludedTs || !atOrBefore(goal.concludedTs, asOf)) continue;
+    const satisfied = !!goal.evidenceFactSeqs?.length && goal.evidenceFactSeqs.every((seq) =>
+      knowledge.some((row) => row.kind === "fact" && row.factSeq === seq && row.tone !== "muted"));
+    knowledge[i] = { ...goal, status: satisfied ? "satisfied" : "open", statusKey: knowledgeStatusKey("goal", satisfied ? "satisfied" : "open"), tone: satisfied ? "success" : "neutral" };
+  }
+
   const knowledgeById = new Map<string, CollaborationKnowledgeItem>();
   for (const item of knowledge) knowledgeById.set(item.id, item);
 
@@ -326,6 +344,16 @@ export function projectCollaborationAsOf(model: AgentCollaborationModel, asOf: n
   const projectAgent = (agent: CollaborationAgent): CollaborationAgent => {
     const present = presentIds.has(agent.id);
     const online = present && agent.role !== "source" && (agent.role === "decision" ? agent.online : agentOnlineAt(agent, asOf));
+    const challenger = agent.challenger ? {
+      ...agent.challenger,
+      status: (atOrBefore(agent.challenger.failedTs, asOf) ? "failed"
+        : atOrBefore(agent.challenger.committedTs, asOf) ? "committed"
+        : atOrBefore(agent.challenger.finishedTs, asOf) ? "finished"
+        : online ? "running" : "stopped") as NonNullable<CollaborationAgent["challenger"]>["status"],
+      proposed: atOrBefore(agent.challenger.committedTs, asOf) ? agent.challenger.proposed : undefined,
+      error: atOrBefore(agent.challenger.failedTs, asOf) ? agent.challenger.error : undefined,
+      code: atOrBefore(agent.challenger.failedTs, asOf) ? agent.challenger.code : undefined,
+    } : undefined;
     const rows = present ? knowledgeForAgent(agent.id, knowledge) : [];
     const metrics = summarizeKnowledge(rows);
     const chronological = agent.intents.filter((intent) => atOrBefore(intent.claimedTs ?? intent.proposedTs, asOf));
@@ -333,6 +361,7 @@ export function projectCollaborationAsOf(model: AgentCollaborationModel, asOf: n
     return {
       ...agent,
       ...metrics,
+      challenger,
       knowledge: rows,
       online,
       statusKind,

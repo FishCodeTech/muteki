@@ -164,12 +164,12 @@
 }
 .wflow-canvas-head > div:first-child { display: grid; gap: 1px; }
 .wflow-canvas-head strong { color: var(--bright); font-size: 14px; }
-.wflow-canvas-head span { color: var(--muted); font-size: 10.5px; }
+.wflow-canvas-head span { color: var(--muted); font-size: 11px; }
 .wflow-toolbar { margin-left: auto; display: flex; gap: 6px; }
-.wflow-toolbar button { min-height: 31px; padding: 0 10px; font-size: 10.5px; box-shadow: none; }
+.wflow-toolbar button { min-height: 31px; padding: 0 10px; font-size: 11px; box-shadow: none; }
 .wflow-canvas-body { flex: 1; min-height: 0; min-width: 0; display: grid; grid-template-columns: 140px minmax(0, 1fr); }
 .wflow-library { z-index: 4; min-width: 0; display: flex; flex-direction: column; border-right: 1px solid var(--line); background: var(--panel); }
-.wflow-library > strong { min-height: 38px; display: flex; align-items: center; padding: 0 13px; color: var(--muted); border-bottom: 1px solid var(--line); font-size: 10.5px; letter-spacing: .05em; }
+.wflow-library > strong { min-height: 38px; display: flex; align-items: center; padding: 0 13px; color: var(--muted); border-bottom: 1px solid var(--line); font-size: 11px; letter-spacing: .05em; }
 .wflow-library button {
   min-height: 53px; display: grid; grid-template-columns: 23px minmax(0, 1fr) 12px;
   align-items: center; gap: 7px; padding: 0 12px; border: 0; border-bottom: 1px solid var(--line);
@@ -197,7 +197,7 @@
   position: absolute; z-index: 6; left: 50%; bottom: 14px; transform: translateX(-50%);
   padding: 6px 10px; border: 1px solid var(--line); border-radius: 7px;
   color: var(--dim); background: color-mix(in srgb, var(--panel) 90%, transparent);
-  box-shadow: var(--shadow-sm); backdrop-filter: blur(12px); font-size: 9px; white-space: nowrap;
+  box-shadow: var(--shadow-sm); backdrop-filter: blur(12px); font-size: 11px; white-space: nowrap;
 }
 
 .wflow-node {
@@ -213,14 +213,14 @@
 .wflow-drag { color: var(--dim); cursor: grab; }
 .wflow-icon-btn { width: 24px; height: 24px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 6px; color: var(--muted); background: transparent; }
 .wflow-icon-btn:hover { color: var(--bright); background: var(--panel3); }
-.wflow-role { display: block; padding: 8px 11px 5px; color: var(--muted); font-size: 10.5px; }
+.wflow-role { display: block; padding: 8px 11px 5px; color: var(--muted); font-size: 11px; }
 .wflow-node-meta { display: grid; gap: 4px; margin: 0; padding: 3px 11px 9px; }
 .wflow-node-meta div { min-width: 0; display: grid; grid-template-columns: 38px minmax(0, 1fr); gap: 7px; align-items: center; }
-.wflow-node-meta dt { color: var(--dim); font-size: 10px; }
+.wflow-node-meta dt { color: var(--dim); font-size: 11px; }
 .wflow-node-meta dd { margin: 0; overflow: hidden; text-overflow: ellipsis; color: var(--text); font: 10.5px/1.35 var(--font-mono); white-space: nowrap; }
 .wflow-node-meta dd.account { width: fit-content; max-width: 100%; padding: 2px 5px; border-radius: 4px; color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
 .wflow-node-foot { height: 31px; display: flex; align-items: center; justify-content: space-between; padding: 0 11px; border-top: 1px solid var(--line); }
-.wflow-node-foot span { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 10px; }
+.wflow-node-foot span { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 11px; }
 .wflow-node-foot span i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .wflow-node-foot span.ok { color: var(--green); }
 .wflow-node-foot span.off { color: var(--red); }
@@ -233,7 +233,7 @@
   box-shadow: var(--shadow-sm);
 }
 .wflow-boundary svg { color: var(--accent); }
-.wflow-boundary strong { font-size: 10.5px; }
+.wflow-boundary strong { font-size: 11px; }
 
 .wflow-inspector, .wsettings-editor {
   min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: auto;
@@ -241,20 +241,20 @@
 }
 .wflow-inspector.empty { align-items: center; justify-content: center; gap: 7px; padding: 24px; color: var(--dim); text-align: center; }
 .wflow-inspector.empty strong { color: var(--text); font-size: 12px; }
-.wflow-inspector.empty span { max-width: 220px; font-size: 10px; }
+.wflow-inspector.empty span { max-width: 220px; font-size: 11px; }
 .wflow-inspector-head { flex: none; display: grid; gap: 4px; padding: 15px 16px 13px; border-bottom: 1px solid var(--line); }
-.wflow-inspector-head > span { color: var(--dim); font-size: 10px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+.wflow-inspector-head > span { color: var(--dim); font-size: 11px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
 .wflow-inspector-head > strong { overflow: hidden; text-overflow: ellipsis; color: var(--bright); font-size: 16px; white-space: nowrap; }
 .wflow-inspector-head > p { margin: 2px 0 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
 .wflow-binding-line { min-width: 0; display: flex; align-items: center; gap: 8px; }
 .wflow-binding-line code { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; color: var(--muted); font: 10.5px/1.4 var(--font-mono); white-space: nowrap; }
-.wflow-binding-line em { flex: none; display: inline-flex; align-items: center; gap: 4px; color: var(--amber); font-size: 9px; font-style: normal; }
+.wflow-binding-line em { flex: none; display: inline-flex; align-items: center; gap: 4px; color: var(--amber); font-size: 11px; font-style: normal; }
 .wflow-binding-line em i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .wflow-binding-line em.ok { color: var(--green); }
 .wflow-form-section { display: grid; gap: 9px; padding: 13px 16px; border-bottom: 1px solid var(--line); }
 .wflow-form-section h3 { margin: 0 0 2px; color: var(--text); font-size: 11.5px; }
 .wflow-form-section label { min-width: 0; display: grid; grid-template-columns: 86px minmax(0, 1fr); align-items: center; gap: 8px; }
-.wflow-form-section label > span, .wflow-role-field > span { color: var(--muted); font-size: 10.5px; }
+.wflow-form-section label > span, .wflow-role-field > span { color: var(--muted); font-size: 11px; }
 .wflow-form-section input, .wflow-form-section select, .wflow-form-section textarea {
   min-width: 0; width: 100%; min-height: 33px; padding: 6px 9px; border: 1px solid var(--line2);
   border-radius: 7px; outline: 0; color: var(--text); background: var(--panel);
@@ -268,15 +268,15 @@
 .wflow-role-field { display: grid; grid-template-columns: 86px minmax(0, 1fr); align-items: start; gap: 8px; }
 .wflow-role-field > span { padding-top: 5px; }
 .wflow-role-field > div { display: flex; flex-wrap: wrap; gap: 5px; }
-.wflow-role-field button { min-height: 26px; padding: 0 8px; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); background: transparent; font-size: 10px; }
+.wflow-role-field button { min-height: 26px; padding: 0 8px; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); background: transparent; font-size: 11px; }
 .wflow-role-field button:hover { color: var(--text); border-color: var(--line2); }
 .wflow-role-field button.on { color: var(--bright); border-color: color-mix(in srgb, var(--accent) 40%, var(--line2)); background: color-mix(in srgb, var(--accent) 9%, var(--panel)); }
 .wflow-account-state { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-left: 94px; }
-.wflow-account-state > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--dim); font-size: 10px; white-space: nowrap; }
-.wflow-account-state button { min-height: 27px; padding-inline: 8px; box-shadow: none; font-size: 9px; }
+.wflow-account-state > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--dim); font-size: 11px; white-space: nowrap; }
+.wflow-account-state button { min-height: 27px; padding-inline: 8px; box-shadow: none; font-size: 11px; }
 .wflow-switch-row > span { display: grid; gap: 1px; }
-.wflow-switch-row > span b { color: var(--text); font-size: 10px; }
-.wflow-switch-row > span small { color: var(--dim); font-size: 8.5px; }
+.wflow-switch-row > span b { color: var(--text); font-size: 11px; }
+.wflow-switch-row > span small { color: var(--dim); font-size: 11px; }
 .wflow-switch { justify-self: end; width: 34px; height: 19px; position: relative; padding: 0; border: 1px solid var(--line2); border-radius: 999px; background: var(--panel3); }
 .wflow-switch i { position: absolute; top: 3px; left: 3px; width: 11px; height: 11px; border-radius: 50%; background: var(--muted); transition: transform var(--control-press-dur) var(--ease-out-soft), background-color var(--control-feedback-dur) var(--ease-out); }
 .wflow-switch.on { border-color: color-mix(in srgb, var(--accent) 50%, var(--line2)); background: color-mix(in srgb, var(--accent) 22%, var(--panel3)); }
@@ -284,7 +284,7 @@
 .wflow-inspector-actions { margin-top: auto; flex: none; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; padding: 12px; border-top: 1px solid var(--line); background: var(--panel2); }
 .wflow-inspector-actions button {
   min-width: 0; min-height: 32px; display: inline-flex; align-items: center; justify-content: center; gap: 5px;
-  padding: 0 7px; border: 1px solid var(--line2); border-radius: 7px; color: var(--muted); background: var(--panel); font-size: 9px;
+  padding: 0 7px; border: 1px solid var(--line2); border-radius: 7px; color: var(--muted); background: var(--panel); font-size: 11px;
 }
 .wflow-inspector-actions button:hover { color: var(--bright); background: var(--panel3); }
 .wflow-inspector-actions button.danger { color: var(--red); }

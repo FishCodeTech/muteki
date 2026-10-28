@@ -1,7 +1,9 @@
 const { contextBridge, ipcRenderer } = require('electron');
 async function invoke(channel, ...args) {
   const result = await ipcRenderer.invoke(channel, ...args);
-  if (!result.ok) { const error = new Error(result.error?.message || '桌面操作失败。'); Object.assign(error, result.error); throw error; }
+  // contextBridge drops custom Error properties such as `code`; reject with a plain envelope
+  // that the page rebuilds into an Error (see rehydrateDesktopBridge in web/ui).
+  if (!result.ok) throw { ...result.error, __mutekiDesktopError: true, message: result.error?.message || '桌面操作失败。' };
   return result.value;
 }
 function subscribe(channel, callback) {

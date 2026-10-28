@@ -10,6 +10,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+from muteki.core.blocking import run_blocking
 from muteki.core.cost import CostController
 from muteki.core.event_bus import EventBus
 from muteki.core.events import Event, EventType
@@ -75,6 +76,7 @@ def list_runs(self, *, include_archived: bool = False) -> list[dict[str, Any]]:
         r.summary()
         for r in sorted(self.runs.values(), key=_key, reverse=True)
         if r.started and (include_archived or not r.archived)
+        and (getattr(self, "src", None) is None or self.src.task_id_for_run(r.run_id) is None)
     ]
 
 
@@ -146,6 +148,8 @@ def delete_folder(self, fid: str) -> bool:
 
 async def delete(self, run_id: str) -> bool:
     """Hard-delete under a published per-run lifecycle fence."""
+    if getattr(self, "src", None) is not None and not self.src.run_delete_allowed(run_id):
+        return False
     async with self._lifecycle_lock:
         if run_id in self._closing_runs or run_id in self._launching_runs:
             return False
@@ -249,26 +253,30 @@ async def _delete_owned_run(self, run_id: str, run: Run) -> bool:
         if self.runs.get(run_id) is not run:
             return False
         self.runs.pop(run_id, None)
-    if run.control_actor is not None:
-        try:
-            await run.control_actor.close()
-        except Exception:
-            LOG.exception("failed to close control actor for %s", run_id)
-    if run.control_journal is not None:
-        try:
-            run.control_journal.close()
-        except Exception:
-            LOG.exception("failed to close control journal for %s", run_id)
+    async with run.control_initialization_lock:
+        if run.control_actor is not None:
+            try:
+                await run.control_actor.close()
+            except Exception:
+                LOG.exception("failed to close control actor for %s", run_id)
+        if run.control_journal is not None:
+            try:
+                run.control_journal.close()
+            except Exception:
+                LOG.exception("failed to close control journal for %s", run_id)
     if run.progress_publisher is not None:
         run.progress_publisher.close()
     await run.bus.close()
-    self._delete_artifacts(run_id)
+    self.meta.forget(run_id)
+    self.run_summaries.forget(run_id)
+    await run_blocking(self._delete_artifacts, run_id, forget_metadata=False)
     return True
 
 
-def _delete_artifacts(self, run_id: str) -> None:
-    self.meta.forget(run_id)
-    self.run_summaries.forget(run_id)
+def _delete_artifacts(self, run_id: str, *, forget_metadata: bool = True) -> None:
+    if forget_metadata:
+        self.meta.forget(run_id)
+        self.run_summaries.forget(run_id)
     safe = self._safe_run_id(run_id)
     shared = self.storage.shared_workspace(run_id)
     logical = self.storage.workspace(run_id)
@@ -370,7 +378,25 @@ def uploads_dir(self, run_id: str) -> Path:
     return d
 
 
-def create(self, run_id: str, *, stream_seq: int | None = None) -> Run:
+async def create_async(self, run_id: str) -> Run:
+    if run_id in self.runs:
+        return self.runs[run_id]
+
+    def recover():
+        store = SessionStore(root=self.event_root)
+        return {
+            "stream_seq": store.last_stream_seq(run_id),
+            "usage": self.usage.run_totals(run_id),
+            "event_usd": _recorded_run_cost_usd(store, run_id),
+            "readiness": self._load_profile_readiness(run_id),
+        }
+
+    recovery = await run_blocking(recover)
+    # All asyncio objects and the shared Run registry are committed on the loop.
+    return self.create(run_id, stream_seq=recovery["stream_seq"], recovery=recovery)
+
+
+def create(self, run_id: str, *, stream_seq: int | None = None, recovery=None) -> Run:
     if run_id in self.runs:
         return self.runs[run_id]
     bus = EventBus()
@@ -388,15 +414,17 @@ def create(self, run_id: str, *, stream_seq: int | None = None) -> Run:
     # usage and graph remain. Continue the same run's ledger instead of showing
     # only the latest execution generation (and resetting its budget gate).
     run.cost.restore_run_totals(
-        self.usage.run_totals(run_id),
-        event_usd=_recorded_run_cost_usd(store, run_id),
+        self.usage.run_totals(run_id) if recovery is None else recovery["usage"],
+        event_usd=(_recorded_run_cost_usd(store, run_id)
+                   if recovery is None else recovery["event_usd"]),
     )
     def record_usage(raw, **scope):
         generation = scope.pop("generation", None)
         return self.usage.record(raw, run_id=run_id, generation=generation if generation is not None else run.execution_generation,
                                  workspace_kind="single-security-task", **scope)
     run.cost.usage_sink = record_usage
-    run.profile_readiness = self._load_profile_readiness(run_id)
+    run.profile_readiness = (self._load_profile_readiness(run_id)
+                             if recovery is None else recovery["readiness"])
     run.progress_publisher = RunProgressPublisher(run)
     bus.add_filter(self._generation_filter_for(run))
     bus.add_sink(store.sink, required=True)
@@ -412,7 +440,7 @@ def create(self, run_id: str, *, stream_seq: int | None = None) -> Run:
         run.updated_seq = self._seq
         run.updated_at = ev.ts
         if ev.event_type is EventType.HITL_REQUEST:
-            self._record_decision_request(run, ev)
+            await self._record_decision_request(run, ev)
         if _apply_operator_meta(run, ev):
             self.run_summaries.update(run, ev)
             return
@@ -547,6 +575,22 @@ async def ensure_bound_run(self, request: BoundRunRequest) -> Run:
     async with self._bound_run_lock:
         record = self.bound_runs.get(key)
         if record is not None:
+            bound_task_id = str(record.get("task_id") or "")
+            if bound_task_id and request.task_id and bound_task_id != str(request.task_id):
+                raise BoundRunConflictError(ErrorEnvelope(
+                    code="run.binding.task_conflict",
+                    message=(
+                        f"binding {key!r} is bound to task {bound_task_id!r}, "
+                        f"got {request.task_id!r}"
+                    ),
+                    category=ErrorCategory.CONFLICT,
+                    recovery_hint="use a Task-scoped binding_key",
+                    detail={
+                        "run_id": record.get("run_id"),
+                        "bound_task_id": bound_task_id,
+                        "requested_task_id": request.task_id,
+                    },
+                ))
             if int(record.get("task_revision") or 0) != int(
                     request.task_revision):
                 raise BoundRunConflictError(ErrorEnvelope(
@@ -562,7 +606,7 @@ async def ensure_bound_run(self, request: BoundRunRequest) -> Run:
                         "bound_revision": record.get("task_revision"),
                         "requested_revision": request.task_revision,
                     }))
-            return self.create(str(record["run_id"]))
+            return await self.create_async(str(record["run_id"]))
         run_id = str(request.run_id or "").strip()
         if run_id:
             if not run_id.startswith(BOUND_RUN_ID_PREFIX):
@@ -598,4 +642,4 @@ async def ensure_bound_run(self, request: BoundRunRequest) -> Run:
             task_kind=request.task_kind,
             task_revision=request.task_revision,
             executor_id=request.executor_id)
-        return self.create(run_id)
+        return await self.create_async(run_id)

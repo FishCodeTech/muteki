@@ -16,9 +16,9 @@
   box-shadow: var(--cx-shadow-composer-focus);
 }
 
-/* Compact (resting) layout while the reader browses history. Every geometry
- * change is a padding / margin / min-height tween on the same easing, so the
- * card height follows one continuous curve. In compact mode the editor pulls
+/* Compact (resting) layout while the reader browses history. Geometry changes
+ * once at each endpoint; PromptBar projects the card and contents with transforms
+ * to avoid laying out the timeline on every animation frame. The editor pulls
  * the toolbar row up over its last line with a negative margin; the add and
  * submit buttons never leave the toolbar, they only slide vertically, and the
  * middle controls fade out. --cx-composer-submit-w is published by PromptBar. */
@@ -28,21 +28,14 @@
 .cx-composer-body {
   padding: 16px 16px 0;
   margin-bottom: 0;
-  transition:
-    padding var(--cx-composer-morph),
-    margin-bottom var(--cx-composer-morph);
 }
 .cx-composer-body[data-after-chrome] { padding-top: 8px; }
-.cx-composer-body .cx-prompt-editor {
-  transition: min-height var(--cx-composer-morph), max-height var(--cx-composer-morph);
-}
 /* Fixed row heights keep the compact overlap exact even if a toolbar control is
  * taller than the 28px buttons; such a control overflows into the padding. */
 .cx-composer-toolbar {
   height: 48px;
   padding-top: 8px;
   padding-bottom: 12px;
-  transition: height var(--cx-composer-morph), padding var(--cx-composer-morph);
 }
 .cx-composer-tools {
   transition:
@@ -191,6 +184,12 @@
 }
 .cx-effort-track[data-max] .cx-effort-spark {
   animation: cx-effort-drift var(--drift, 1.4s) linear var(--delay, 0s) infinite;
+}
+.cx-effort-track[data-speed="fast"] .cx-effort-spark {
+  animation: cx-effort-drift calc(var(--drift, 1.4s) / 2) linear var(--delay, 0s) infinite;
+}
+.cx-effort-track[data-speed="ultrafast"] .cx-effort-spark {
+  animation: cx-effort-drift calc(var(--drift, 1.4s) / 4) linear var(--delay, 0s) infinite;
 }
 .cx-effort-thumb {
   box-shadow: 0 1px 3px rgb(0 0 0 / 0.28), 0 0 0 0.5px rgb(0 0 0 / 0.08);

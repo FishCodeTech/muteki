@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -75,9 +76,12 @@ class ProductObservability:
         return {"by_state": by_state, "oldest_pending_seconds": round(oldest, 3)}
 
     def metrics(self) -> dict[str, Any]:
+        with (self.stack.store.read_snapshot() as platform_conn,
+              self.stack.competition_store.read_snapshot() as competition_conn):
+            return self._metrics(platform_conn, competition_conn)
+
+    def _metrics(self, platform_conn: Any, competition_conn: Any) -> dict[str, Any]:
         platform = self.stack.store.snapshot()
-        competition_conn = self.stack.competition_store.conn
-        platform_conn = self.stack.store.conn
         submissions = self.stack.competition_store.list(PlatformSubmission)
         submission_states = Counter(item.state for item in submissions)
         sessions = self.stack.store.list(AgentSession)
@@ -265,16 +269,18 @@ class ProductObservability:
 
     def outbox_rows(self, *, limit: int = 200) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
-        for domain, conn, table in (
-            ("platform", self.stack.store.conn, "outbox"),
-            ("competition", self.stack.competition_store.conn,
+        for domain, store, table in (
+            ("platform", self.stack.store, "outbox"),
+            ("competition", self.stack.competition_store,
              "competition_outbox"),
         ):
-            for row in conn.execute(
-                f"SELECT outbox_id, command_id, destination, status, attempts, "  # noqa: S608
-                f"created_at, updated_at, last_error FROM {table} "  # noqa: S608
-                "ORDER BY created_at DESC LIMIT ?", (int(limit),),
-            ).fetchall():
+            with store.read_snapshot() as conn:
+                batch = conn.execute(
+                    f"SELECT outbox_id, command_id, destination, status, attempts, "  # noqa: S608
+                    f"created_at, updated_at, last_error FROM {table} "  # noqa: S608
+                    "ORDER BY created_at DESC LIMIT ?", (int(limit),),
+                ).fetchall()
+            for row in batch:
                 rows.append({
                     "domain": domain,
                     "outbox_id": row["outbox_id"],
@@ -290,6 +296,9 @@ class ProductObservability:
 
     async def receipt_trace(self, command_id: str) -> dict[str, Any]:
         receipt = await self.stack.routed_command_api.get_receipt(command_id)
+        return await asyncio.to_thread(self._receipt_trace, command_id, receipt)
+
+    def _receipt_trace(self, command_id: str, receipt: Any) -> dict[str, Any]:
         domain = self.stack.store.command_domain(command_id)
         effects = self.stack.store.effects_for_command(command_id)
         outbox = (
@@ -298,10 +307,11 @@ class ProductObservability:
             else []
         )
         if domain == "platform":
-            rows = self.stack.store.conn.execute(
-                "SELECT payload FROM outbox WHERE command_id=? ORDER BY created_at",
-                (command_id,),
-            ).fetchall()
+            with self.stack.store.read_snapshot() as conn:
+                rows = conn.execute(
+                    "SELECT payload FROM outbox WHERE command_id=? ORDER BY created_at",
+                    (command_id,),
+                ).fetchall()
             from muteki.platform.contracts.receipts import OutboxRecord
             outbox = [OutboxRecord.model_validate_json(row["payload"]) for row in rows]
         return {
@@ -323,11 +333,12 @@ class ProductObservability:
     def recovery_preview(self) -> dict[str, Any]:
         platform = self.stack.store.snapshot()
         competition_pending = self.stack.competition_store.pending_receipts()
-        event_gaps = self.stack.store.conn.execute(
-            "SELECT COUNT(*) FROM ("
-            "SELECT aggregate_type, aggregate_id, MAX(stream_seq)-COUNT(*) AS gap "
-            "FROM domain_events GROUP BY aggregate_type, aggregate_id HAVING gap != 0)"
-        ).fetchone()[0]
+        with self.stack.store.read_snapshot() as conn:
+            event_gaps = conn.execute(
+                "SELECT COUNT(*) FROM ("
+                "SELECT aggregate_type, aggregate_id, MAX(stream_seq)-COUNT(*) AS gap "
+                "FROM domain_events GROUP BY aggregate_type, aggregate_id HAVING gap != 0)"
+            ).fetchone()[0]
         return {
             "dry_run": True,
             "writes_performed": False,
@@ -467,11 +478,11 @@ def create_operations_router(observability: ProductObservability) -> APIRouter:
     router = APIRouter(prefix="/api/operations", tags=["operations"])
 
     @router.get("/overview")
-    async def overview() -> Any:
+    def overview() -> Any:
         return observability.overview()
 
     @router.get("/outbox")
-    async def outbox(limit: int = 200) -> Any:
+    def outbox(limit: int = 200) -> Any:
         return {"items": observability.outbox_rows(limit=max(1, min(limit, 1000)))}
 
     @router.get("/receipts/{command_id}")
@@ -493,15 +504,15 @@ def create_operations_router(observability: ProductObservability) -> APIRouter:
             )
 
     @router.get("/recovery-preview")
-    async def recovery_preview() -> Any:
+    def recovery_preview() -> Any:
         return observability.recovery_preview()
 
     @router.get("/maintenance-preview")
-    async def maintenance_preview() -> Any:
+    def maintenance_preview() -> Any:
         return observability.maintenance_preview()
 
     @router.post("/maintenance")
-    async def maintenance(body: MaintenanceApplyBody) -> Any:
+    def maintenance(body: MaintenanceApplyBody) -> Any:
         if not body.confirm:
             return Response(
                 content=json.dumps({"error": {
@@ -524,7 +535,7 @@ def create_operations_router(observability: ProductObservability) -> APIRouter:
             )
 
     @router.get("/diagnostic-bundle")
-    async def diagnostic_bundle() -> Response:
+    def diagnostic_bundle() -> Response:
         return Response(
             observability.diagnostic_bundle(),
             media_type="application/zip",

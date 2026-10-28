@@ -13,9 +13,12 @@ import {
   clampCollabPanelWidth,
 } from "@/lib/agentCollaborationLayout";
 
-export const FIT_VIEW_OPTIONS = { padding: 0.14, minZoom: FIT_MIN_ZOOM, maxZoom: ZOOM.fitMax } as const;
-
 const FIT_PAD = 0.14;
+/* The finished-run scrubber dock overlays the canvas bottom (~56px offset +
+ * ~70px height), so the fit reserves that space for every fit, not just
+ * overlay ones. */
+const FIT_BOTTOM_INSET = "150px";
+export const FIT_VIEW_OPTIONS = { padding: { top: FIT_PAD, bottom: FIT_BOTTOM_INSET, left: FIT_PAD, right: FIT_PAD }, minZoom: FIT_MIN_ZOOM, maxZoom: 1.3 } as const;
 const OVERLAY_FIT_GAP = 16;
 
 function overlayFitPadding(
@@ -24,10 +27,10 @@ function overlayFitPadding(
   detailOpen: boolean,
   containerWidth: number,
 ): NonNullable<FitViewOptions["padding"]> {
-  if (!overlay || (!indexOpen && !detailOpen)) return FIT_PAD;
+  if (!overlay || (!indexOpen && !detailOpen)) return { top: FIT_PAD, bottom: FIT_BOTTOM_INSET, left: FIT_PAD, right: FIT_PAD };
   return {
     top: FIT_PAD,
-    bottom: FIT_PAD,
+    bottom: FIT_BOTTOM_INSET,
     left: indexOpen ? `${clampCollabPanelWidth(containerWidth, COLLAB_INDEX_W) + OVERLAY_FIT_GAP}px` : FIT_PAD,
     right: detailOpen ? `${clampCollabPanelWidth(containerWidth, COLLAB_DETAIL_W) + OVERLAY_FIT_GAP}px` : FIT_PAD,
   };

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from muteki.core.blocking import run_blocking
+
 import asyncio
 import os
 import json
@@ -299,6 +301,11 @@ class WebPlatformStack:
         self.conversation.manager.bind_model_effort_validator(
             lambda selection: validate_conversation_effort(manager.state_root, selection)
         )
+        from apps.web.conversation_runtime_catalog import subagent_runtime_catalog
+        self.conversation.subagents.bind_runtime_catalog(
+            lambda engine: subagent_runtime_catalog(
+                self.runtime_service, manager.state_root, engine=engine)
+        )
         self.conversation_metadata = ConversationMetadataService(
             self.store,
             self.conversation.manager,
@@ -314,6 +321,53 @@ class WebPlatformStack:
         self.conversation.manager.chat_plugins = self.chat_plugins
         self.conversation.executor.chat_plugins = self.chat_plugins
         self.conversation.register(self.command_api)
+        from muteki.src import SrcService
+        from muteki.src.commands import (
+            SrcCommandHandler, SrcDomainCommandHandler, SrcDomainQueryHandler,
+            SrcQueryHandler,
+        )
+        self.src = SrcService(
+            self.store, artifact_root=self.root / "src" / "tasks",
+            conversation=self.conversation.manager, run_gateway=self.run_gateway,
+        )
+        self.manager.src = self.src
+        self.src.worker_config = self.worker_config
+        self.src.conversation_executor = self.conversation.executor
+        self.conversation.executor.src_execution = self.src.execution
+        from apps.web.llm_credentials import resolve_llm_profile_credential
+        from muteki.core.llm import LLMClient, llm_temperature_kwargs
+        from muteki.src.reviewer import LLMImageReviewer
+        reviewer_profiles = self.worker_config.get().get("llm_profiles", {})
+        reviewer_name = "reviewer" if reviewer_profiles.get("reviewer") else "planner"
+        reviewer_profile = dict(reviewer_profiles.get(reviewer_name) or {})
+        try:
+            reviewer_credential = resolve_llm_profile_credential(
+                reviewer_name, reviewer_profile, sessions_root=manager.state_root,
+            )
+            reviewer_model = str(reviewer_profile.get("model") or "").strip() or next(
+                iter(reviewer_credential.models), "",
+            )
+            if not reviewer_credential.api_key or not reviewer_model:
+                raise ValueError("image reviewer credential or model is missing")
+            reviewer_client = LLMClient(
+                base_url=reviewer_credential.base_url,
+                api_key=reviewer_credential.api_key,
+                **llm_temperature_kwargs(reviewer_profile),
+            )
+            self.src_reviewer_client = reviewer_client
+            self.src.domain("browser").set_reviewer_reader(LLMImageReviewer(
+                reviewer_client, reviewer_model, run_id="src-image-review",
+            ))
+        except Exception:
+            LOG.exception("SRC image reviewer is unavailable; screenshots will remain unreviewed")
+        from muteki.src.control_commands import SrcControlCommandHandler, SrcControlQueryHandler
+        self.command_api.register_command(SrcCommandHandler(self.src))
+        self.command_api.register_query(SrcQueryHandler(self.src))
+        self.command_api.register_command(SrcControlCommandHandler(self.src))
+        self.command_api.register_query(SrcControlQueryHandler(self.src))
+        self.command_api.register_command(SrcDomainCommandHandler(self.src))
+        self.command_api.register_query(SrcDomainQueryHandler(self.src))
+        self.manager.add_product_event_sink(self.src.consume_run_event)
         self.runtime_factory = RuntimeAdapterFactory(
             store=self.store,
             binding_service=self.conversation.bindings,
@@ -434,6 +488,7 @@ class WebPlatformStack:
         from muteki.conversation.computer_control import ComputerControlBroker
         from apps.web.worker_models import conversation_model_input
         self.browser_control = BrowserControlBroker(self.root / "browser-captures")
+        self.browser_control.src = self.src
         self.computer_control = ComputerControlBroker(self.root / "computer-use")
         self.conversation.executor.computer_control = self.computer_control
         self.capability_gateway = ChatPluginGateway(
@@ -452,6 +507,7 @@ class WebPlatformStack:
         # Adapter 只在真实 Gateway 就绪后创建。Claude 的 in-process
         # Native Tool 会直接调用这个对象；若在 Gateway 创建前 populate，
         # Adapter 会永久持有 None，后续即使服务已启动也无法修复。
+        self.capability_gateway.src = self.src
         self.runtime_factory.gateway = self.capability_gateway
         self.runtime_factory.populate(
             self.registry,
@@ -525,6 +581,7 @@ class WebPlatformStack:
     def routers(self) -> list[Any]:
         from apps.web.usage_api import create_usage_router
         from apps.web.chat_plugins_api import create_chat_plugins_router
+        from apps.web.src_api import create_src_router
         capability_router = APIRouter(tags=["capabilities"])
 
         async def _capability_http(request: Request) -> Response:
@@ -571,6 +628,7 @@ class WebPlatformStack:
             create_usage_router(self.manager, self.competition_store),
             create_registry_router(self.domain_registry, self.routed_command_api),
             create_platform_router(self.routed_command_api),
+            create_src_router(command_api=self.routed_command_api, service=self.src),
             create_operations_router(self.observability),
             capability_router,
             create_capability_management_router(
@@ -650,7 +708,7 @@ class WebPlatformStack:
 
     async def recover(self) -> None:
         report = StartupRecoveryReport()
-        platform = self.platform_reconciler.recover()
+        platform = await run_blocking(self.platform_reconciler.recover)
         report.add(
             "platform.store_and_receipts",
             "ready" if platform.ok else "unavailable",
@@ -683,6 +741,16 @@ class WebPlatformStack:
                 detail="projection rebuilt and orphan Turns reconciled",
                 evidence=conversation,
             )
+        try:
+            src_recovery = await self.src.recover()
+        except Exception as exc:
+            src_recovery = {"error": f"{type(exc).__name__}: {exc}"}
+        report.add(
+            "src", "unavailable" if src_recovery.get("error") or src_recovery.get("failures") else "ready",
+            detail=src_recovery.get("error") or "SRC Task/Run bindings recovered",
+            impact="SRC Run bindings remain read-only when recovery fails",
+            evidence=src_recovery,
+        )
         startup_probe_enabled = os.environ.get(
             "MUTEKI_STARTUP_RUNTIME_PROBE", "0"
         ).strip().lower() not in {"0", "false", "no", "off", ""}
@@ -868,6 +936,7 @@ class WebPlatformStack:
                 for item in self.extension.list_records()
             ],
             "control_receiver": dict(self.control_receiver_status),
+            "src": self.src.health(),
         }
 
     def startup_summary(self) -> dict[str, Any]:
@@ -910,6 +979,7 @@ class WebPlatformStack:
         self.ready = False
         self.manager.remove_product_event_sink(
             self.competition_gate_bridge.consume)
+        self.manager.remove_product_event_sink(self.src.consume_run_event)
         recovery_task = self._competition_recovery_task
         self._competition_recovery_task = None
         if recovery_task is not None and not recovery_task.done():
@@ -919,6 +989,10 @@ class WebPlatformStack:
         await self.extension.shutdown()
         await self.conversation_metadata.shutdown()
         await self.conversation.shutdown()
+        await self.run_gateway.shutdown()
+        if getattr(self, "src_reviewer_client", None) is not None:
+            await self.src_reviewer_client.aclose()
+        await self.src.shutdown()
         await self._terminate_runtime_processes()
         await self.chat_plugins.close()
         await self.computer_control.close()

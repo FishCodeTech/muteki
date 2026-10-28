@@ -1,7 +1,7 @@
 """平台事件契约（任务书 6.1、设计文档 8.3/8.5）。
 
 事件命名空间约定：``core.*`` / ``run.*`` / ``competition.*`` / ``ctf.*`` /
-``pentest.*`` / ``ext.<id>.*``。内部 Domain Event、查询 Projection 和前端
+``pentest.*`` / ``src.*`` / ``ext.<id>.*``。内部 Domain Event、查询 Projection 和前端
 Public Event 使用同一份完整事件内容。
 """
 
@@ -20,10 +20,11 @@ NS_RUN = "run."
 NS_COMPETITION = "competition."
 NS_CTF = "ctf."
 NS_PENTEST = "pentest."
+NS_SRC = "src."
 NS_EXT_PREFIX = "ext."
 
 #: 全部内置命名空间前缀（ext.<id>.* 单独判断）
-BUILTIN_NAMESPACES = (NS_CORE, NS_RUN, NS_COMPETITION, NS_CTF, NS_PENTEST)
+BUILTIN_NAMESPACES = (NS_CORE, NS_RUN, NS_COMPETITION, NS_CTF, NS_PENTEST, NS_SRC)
 
 
 def ext_namespace(extension_id: str) -> str:
@@ -70,7 +71,7 @@ class EventEnvelope(ContractModel):
         if not is_known_namespace(text):
             raise ValueError(
                 f"event_type must use a known namespace "
-                f"(core.*/run.*/competition.*/ctf.*/pentest.*/ext.<id>.*): {text!r}"
+                f"(core.*/run.*/competition.*/ctf.*/pentest.*/src.*/ext.<id>.*): {text!r}"
             )
         return text
 

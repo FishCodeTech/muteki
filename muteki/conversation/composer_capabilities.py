@@ -20,7 +20,7 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Collection, Iterable
 
 import yaml
 
@@ -466,6 +466,7 @@ def resolve_composer_catalog(
     engine: str,
     workspace_root: str = "",
     trigger: str,
+    session_tools: Collection[str],
     query: str = "",
     extension_service: Any = None,
     threads: Iterable[Any] = (),
@@ -539,7 +540,13 @@ def resolve_composer_catalog(
             # Muteki 本地命令拥有固定优先级；同名 Runtime 命令不进入菜单。
             continue
         verified = capability.verification == "verified"
-        if snapshot_stale:
+        # Engine protocol commands do not depend on the detached session's
+        # dynamic catalog. Sending still resumes and validates the live runtime.
+        static_engine_command = (
+            verified and capability.origin == "verified_static"
+            and capability.scope == "engine"
+        )
+        if snapshot_stale and not static_engine_command:
             support_level = "expired"
             invocable = False
             reason = capability.reason or "能力目录已过期，正在刷新"
@@ -643,7 +650,8 @@ def resolve_composer_catalog(
         rows.extend(runtime_rows)
         rows.extend(local_skill_rows)
         rows.extend(read_section("components", lambda: component_rows(
-            normalized, gateway=engine_receives_capability_gateway(normalized), include_apps=False), []))
+            normalized, gateway=engine_receives_capability_gateway(normalized),
+            control=control_enabled, session_tools=session_tools, include_apps=False), []))
         rows.extend(unavailable_commands(normalized, native_names | client_names))
         # Only a fresh live catalog proves the absence; before a session starts
         # the runtime has not published its commands yet.
@@ -653,7 +661,7 @@ def resolve_composer_catalog(
     elif trigger == "@":
         rows = read_section("components", lambda: component_rows(
             normalized, gateway=engine_receives_capability_gateway(normalized),
-            query=raw_query, errors=section_errors), [])
+            control=control_enabled, session_tools=session_tools, query=raw_query, errors=section_errors), [])
         rows.extend(_thread_items(threads, current_thread_id=current_thread_id))
         runtime_mcp = [
             {
@@ -848,6 +856,7 @@ def _resolve_structured_ref(
     *,
     workspace_root: str,
     message_lookup: Any = None,
+    src_object_resolver: Any = None,
 ) -> dict[str, Any]:
     """Resolve a schema-v2 context node with soft-stale semantics."""
     kind = str(raw.get("kind") or "").strip()
@@ -1019,6 +1028,40 @@ def _resolve_structured_ref(
             legacy_id=legacy_id,
         )
 
+    # src_object: workbench objects resolved against the bound SRC task.
+    if kind == "src_object":
+        locator_kind = str(locator.get("kind") or "")
+        locator_id = str(locator.get("id") or "")
+        if src_object_resolver is not None and locator_kind and locator_id:
+            try:
+                resolved = src_object_resolver(locator_kind, locator_id)
+                return _structured_public(
+                    raw=raw, kind=kind,
+                    name=resolved.get("name") or locator_id,
+                    description=resolved.get("description") or "SRC 工作台对象",
+                    source="src-task", scope="task",
+                    locator=locator,
+                    snapshot=_snapshot_dict(raw, fallback_label=resolved.get("name") or locator_id,
+                                            fallback_text=resolved.get("text") or ""),
+                    status="fresh" if resolved.get("status") == "fresh" else "stale",
+                    status_reason=resolved.get("reason") or "",
+                )
+            except Exception as exc:  # typed stale: record missing/out-of-task
+                return _structured_public(
+                    raw=raw, kind=kind, name=name or locator_id,
+                    description="SRC 工作台对象", source="src-task", scope="task",
+                    locator=locator,
+                    snapshot=_snapshot_dict(raw, fallback_label=locator_id, fallback_text=""),
+                    status="stale", status_reason=str(exc),
+                )
+        return _structured_public(
+            raw=raw, kind=kind, name=name or locator_id or "SRC 对象",
+            description="SRC 工作台对象（未配置解析器）", source="src-task", scope="task",
+            locator=locator,
+            snapshot=_snapshot_dict(raw, fallback_label=locator_id, fallback_text=""),
+            status="stale", status_reason="src_object resolver not configured",
+        )
+
     # Unknown future kinds: soft-stale with snapshot, never hard-fail.
     return _structured_public(
         raw=raw, kind=kind or "unknown",
@@ -1076,12 +1119,14 @@ def resolve_capability_refs(
     refs: Any,
     *,
     engine: str,
+    session_tools: Collection[str],
     workspace_root: str = "",
     extension_service: Any = None,
     threads: Iterable[Any] = (),
     message_loader: Any = None,
     message_lookup: Any = None,
     plugin_service: Any = None,
+    src_object_resolver: Any = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Validate client refs and build the explicit Agent instruction block.
 
@@ -1091,7 +1136,8 @@ def resolve_capability_refs(
     Legacy opaque mcp/skill/plugin/file/thread chips retain prior behavior.
     """
     selected, instructions, data = _resolve_capability_refs(
-        refs, engine=engine, workspace_root=workspace_root,
+        refs, engine=engine, session_tools=session_tools, workspace_root=workspace_root,
+        src_object_resolver=src_object_resolver,
         extension_service=extension_service, threads=threads,
         message_loader=message_loader, message_lookup=message_lookup,
         plugin_service=plugin_service)
@@ -1118,9 +1164,10 @@ def capability_context_parts(refs: Any, **kwargs: Any) -> tuple[list[dict[str, A
 
 
 def _resolve_capability_refs(
-    refs: Any,
+    refs: Any, src_object_resolver: Any = None,
     *,
     engine: str,
+    session_tools: Collection[str],
     workspace_root: str = "",
     extension_service: Any = None,
     threads: Iterable[Any] = (),
@@ -1175,6 +1222,7 @@ def _resolve_capability_refs(
                 raw,
                 workspace_root=workspace_root,
                 message_lookup=message_lookup,
+                src_object_resolver=src_object_resolver,
             )
             dedupe_key = str(item.get("node_id") or item.get("id") or "")
             if not dedupe_key or dedupe_key in seen:
@@ -1198,8 +1246,10 @@ def _resolve_capability_refs(
             item = catalog.get(str(raw.get("legacy_capability_id")).strip())
         if item is None and is_component_id(item_id):
             try:
-                item = resolve_component(item_id, engine=normalized,
-                                         gateway=engine_receives_capability_gateway(normalized))
+                item = resolve_component(
+                    item_id, engine=normalized, gateway=engine_receives_capability_gateway(normalized),
+                    control=plugin_service is None or plugin_service.control_enabled(normalized),
+                    session_tools=session_tools)
             except BuiltinComponentError as exc:
                 raise ComposerCapabilityError(str(exc)) from exc
         if item is None and str(raw.get("kind") or "") == "file" and workspace_root:

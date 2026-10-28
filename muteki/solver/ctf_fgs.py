@@ -11,8 +11,8 @@ records the unfinished question and tool references without a verdict.
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 import re
-from difflib import SequenceMatcher
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
@@ -22,15 +22,18 @@ from muteki.solver.result_codes import (
     RESULT_TIMED_OUT,
 )
 from muteki.solver.worker_result import ObservationClaim
-from muteki.swarm.graph_defs import EV_FACT_ADDED, EV_OBSERVATION_ADDED
+from muteki.swarm.graph_defs import EV_DEAD_END, EV_FACT_ADDED, EV_OBSERVATION_ADDED
 
 
 FINDING_CLASS_FLAG = "flag"
 FINDING_CLASS_PRODUCT = "product"
-SALVAGE_REASONS = frozenset({"timeout", "cancel", "conclude_timeout"})
-_UNANSWERED_TITLE_RE = re.compile(
-    r"^UNANSWERED\((timeout|cancel|conclude_timeout)\)\s*:\s*(.*)$"
+SALVAGE_REASONS = frozenset(
+    {"timeout", "cancel", "conclude_timeout", "step_tool_cap", "runtime_error"}
 )
+_UNANSWERED_TITLE_RE = re.compile(
+    r"^UNANSWERED\((timeout|cancel|conclude_timeout|step_tool_cap|runtime_error)\)\s*:\s*(.*)$"
+)
+_TOOL_CALLS_RE = re.compile(r"(?m)^tool_calls:\s*(\d+)\s*$")
 _URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.I)
 _PATH_RE = re.compile(
     r"(?:^|[\s'\"=])"
@@ -40,6 +43,7 @@ _SALVAGE_STATUSES = {
     RESULT_TIMED_OUT: "timeout",
     RESULT_CANCELLED: "cancel",
     RESULT_EXPLORED: "conclude_timeout",
+    "error": "runtime_error",
 }
 def is_salvage_fact(text: str) -> bool:
     title = str(text or "").split("\n", 1)[0].strip()
@@ -139,6 +143,7 @@ def build_unanswered_fact(
     traces: list[tuple[str, ...]],
     draft_title: str = "",
     draft_content: str = "",
+    total_tool_calls: Optional[int] = None,
 ) -> str:
     reason = reason if reason in SALVAGE_REASONS else "timeout"
     question = " ".join(str(question or "").split())
@@ -160,14 +165,19 @@ def build_unanswered_fact(
             continue
         suffix = f" ({len(output)} chars)"
         if artifact:
-            suffix += f" artifact:{artifact}"
-        call_lines.append(f"- {command}{suffix}")
-        if output and not artifact:
-            call_lines.append(output)
+            call_lines.append(f"- artifact:{artifact}{suffix}")
+        else:
+            call_lines.append(f"- {command}{suffix}")
+            if output:
+                call_lines.append(output)
+    recorded_calls = (
+        max(len(traces), int(total_tool_calls))
+        if total_tool_calls is not None
+        else len(traces)
+    )
     lines = [
         f"UNANSWERED({reason}): {question}",
-        f"question: {question}",
-        f"tool_calls: {len(traces)}",
+        f"tool_calls: {recorded_calls}",
         "targets:",
     ]
     if targets:
@@ -194,39 +204,68 @@ def salvage_reason_for_status(status: str) -> str:
     return _SALVAGE_STATUSES.get(str(status or ""), "")
 
 
+def _shared_step_file_excerpts(solver: Any) -> list[str]:
+    total_calls = int(getattr(solver, "_tool_evidence_total_count", 0) or 0)
+    if total_calls <= 0 and not _tool_traces(solver):
+        return []
+    workdir_fn = getattr(solver, "_workdir_path", None)
+    wd = workdir_fn() if callable(workdir_fn) else None
+    if wd is None:
+        raw_wd = getattr(solver, "_current_workdir", None) or getattr(solver, "_workdir", None)
+        wd = Path(str(raw_wd)).resolve() if raw_wd else None
+    if wd is None:
+        return []
+    shared_dir = wd / "shared"
+    if not shared_dir.exists():
+        return []
+    intent_id = str(
+        getattr(solver, "intent_id_assigned", "")
+        or getattr(solver, "_intent_id", "")
+        or ""
+    ).strip()
+    started_at = float(getattr(solver, "_worker_started_at", 0.0) or 0.0)
+    candidates: list[tuple[int, float, Path]] = []
+    try:
+        for path in shared_dir.rglob("*"):
+            if not path.is_file() or path.name.startswith("."):
+                continue
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            if st.st_size <= 0 or st.st_size > 512 * 1024:
+                continue
+            rel_str = str(path.relative_to(shared_dir))
+            matches_step = bool(intent_id and intent_id.lower() in rel_str.lower())
+            is_recent = bool(started_at > 0 and st.st_mtime >= started_at - 1.0)
+            if not matches_step and not is_recent:
+                continue
+            priority = 0 if matches_step else 1
+            candidates.append((priority, -float(st.st_mtime), path))
+    except OSError:
+        return []
+    excerpts: list[str] = []
+    for _prio, _neg_mtime, path in sorted(candidates)[:3]:
+        try:
+            raw = path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        if not raw or "\x00" in raw:
+            continue
+        rel_str = f"shared/{path.relative_to(shared_dir)}"
+        snippet_lines = raw.splitlines()[:25]
+        snippet = "\n".join(snippet_lines)[:1200]
+        excerpts.append(f"- {rel_str}:\n{snippet}")
+    return excerpts
+
+
 def unanswered_observation_claim(
     solver: Any, status: str,
 ) -> Optional[ObservationClaim]:
-    """Keep an unfinished Step as an unadmitted Observation."""
-    if getattr(solver, "_step_committed", False):
-        return None
-    if getattr(getattr(solver, "challenge", None), "mode", "ctf") != "ctf":
-        return None
-    reason = salvage_reason_for_status(status)
-    if not reason:
-        return None
-    for existing in list(getattr(solver, "_pending_observations", None) or []):
-        if is_salvage_fact(getattr(existing, "text", "")):
-            return None
-    traces = _tool_traces(solver)
-    draft = dict(getattr(solver, "_draft_fact", None) or {})
-    text = build_unanswered_fact(
-        reason=reason,
-        question=_step_question(solver),
-        traces=traces,
-        draft_title=str(draft.get("title") or ""),
-        draft_content=str(draft.get("content") or ""),
-    )
-    from muteki.solver.cli_results import (
-        _ctf_step_artifact_refs, _fact_claim_provenance,
-    )
-    return ObservationClaim(
-        text=text,
-        claim_verified=False,
-        provenance=_fact_claim_provenance(
-            solver, {"artifact_refs": _ctf_step_artifact_refs(solver)}
-        ),
-    )
+    """In CTF mode, raw tool outputs remain in CAS artifacts and SQLite events;
+    never inject UNANSWERED salvage ObservationClaims into the FGS graph."""
+    del solver, status
+    return None
 
 
 def _salvage_lineage(shared_graph: Any) -> list[dict[str, Any]]:
@@ -263,6 +302,12 @@ def _salvage_lineage(shared_graph: Any) -> list[dict[str, Any]]:
         question = salvage_question(text)
         title = str(text or "").split("\n", 1)[0].strip()
         match = _UNANSWERED_TITLE_RE.match(title)
+        tc_match = _TOOL_CALLS_RE.search(text)
+        tool_calls = int(tc_match.group(1)) if tc_match else None
+        prov = payload.get("evidence_provenance") or payload.get("provenance") or {}
+        target_epoch = str(
+            prov.get("target_epoch") or payload.get("target_epoch") or ""
+        ).strip()
         rows.append({
             "seq": seq,
             "question": question,
@@ -270,6 +315,9 @@ def _salvage_lineage(shared_graph: Any) -> list[dict[str, Any]]:
             "goal": question,
             "reason": str(match.group(1) if match else ""),
             "is_fact": kind == EV_FACT_ADDED,
+            "tool_calls": tool_calls,
+            "target_epoch": target_epoch,
+            "coverage_key": str(prov.get("coverage_key") or ""),
         })
     return rows
 
@@ -279,9 +327,17 @@ def _same_question(left: str, right: str) -> bool:
     b = " ".join(str(right or "").split()).casefold()
     if not a or not b:
         return False
-    if a[:48] in b or b[:48] in a:
-        return True
-    return SequenceMatcher(None, a, b).ratio() >= 0.55
+    return a == b
+
+
+def _normalize_coverage_key(value: str) -> str:
+    return re.sub(r"[\s_]+", "-", str(value or "").strip().casefold()).strip("-")
+
+
+def _same_coverage_surface(left: str, right: str) -> bool:
+    norm_a = _normalize_coverage_key(left)
+    norm_b = _normalize_coverage_key(right)
+    return bool(norm_a and norm_b and norm_a == norm_b)
 
 
 def apply_ctf_decide_frontier(result: Any, shared_graph: Any) -> None:
@@ -313,11 +369,27 @@ def ctf_frontier_prompt_note() -> str:
     return ""
 
 
-def cancelled_reopen_rows(shared_graph: Any) -> list[dict[str, Any]]:
-    """Cancelled UNANSWERED rows used by stale-reopen checks and Decide preview."""
+def closed_reopen_rows(shared_graph: Any) -> list[dict[str, Any]]:
+    """Cancelled handoffs and bounded exclusions used by reopen checks.
+
+    Zero-tool-call cancellations and rows from an older or unknown target epoch
+    are excluded because they never tested the current target instance.
+    """
     rows: list[dict[str, Any]] = []
+    current_epoch = str(
+        getattr(shared_graph, "_target_epoch", "")
+        or getattr(getattr(shared_graph, "challenge", None), "target_epoch", "")
+        or ""
+    ).strip()
     for row in _salvage_lineage(shared_graph):
         if str(row.get("reason") or "") != "cancel":
+            continue
+        if getattr(getattr(shared_graph, "challenge", None), "mode", "ctf") == "ctf":
+            continue
+        if row.get("tool_calls") == 0:
+            continue
+        row_epoch = str(row.get("target_epoch") or "").strip()
+        if current_epoch and row_epoch and row_epoch != current_epoch:
             continue
         try:
             seq = int(row.get("seq") or 0)
@@ -328,24 +400,117 @@ def cancelled_reopen_rows(shared_graph: Any) -> list[dict[str, Any]]:
         rows.append({
             "seq": seq,
             "question": str(row.get("question") or row.get("goal") or ""),
+            "tool_calls": row.get("tool_calls"),
+            "target_epoch": row_epoch,
+            "coverage_key": str(row.get("coverage_key") or ""),
         })
+    if getattr(getattr(shared_graph, "challenge", None), "mode", "ctf") != "ctf":
+        return rows
+    intent_goals: dict[str, str] = {}
+    intent_coverages: dict[str, str] = {}
+    all_events = shared_graph.events()
+    for event in all_events:
+        if event.get("kind") == "intent_proposed":
+            ep = event.get("payload") or {}
+            iid = str(ep.get("intent_id") or "").strip()
+            if iid:
+                intent_goals[iid] = str(ep.get("goal") or "").strip()
+                cov = str(ep.get("coverage_key") or "").strip()
+                if cov:
+                    intent_coverages[iid] = cov
+    for event in all_events:
+        kind = str(event.get("kind") or "")
+        payload = event.get("payload") or {}
+        if kind == EV_DEAD_END:
+            coverage = str(payload.get("coverage_key") or "").strip()
+            if (
+                not payload.get("tested_scope")
+                or not payload.get("observed_result")
+            ):
+                continue
+            row_epoch = str(payload.get("target_epoch") or "").strip()
+            if current_epoch and row_epoch and row_epoch != current_epoch:
+                continue
+            dead_intent_id = str(payload.get("intent_id") or "").strip()
+            rows.append({
+                "seq": int(event["seq"]),
+                "question": intent_goals.get(dead_intent_id, ""),
+                "tested_scope": str(payload.get("tested_scope") or "").strip(),
+                "coverage_key": coverage,
+                "target_epoch": row_epoch,
+            })
+        elif kind == "intent_concluded":
+            conclude_result = str(payload.get("result") or "").strip().lower()
+            if conclude_result in {
+                "cancelled",
+                "timed_out",
+                "superseded",
+                "operator_stop",
+                "interrupted",
+                "handoff_missing",
+                "steered",
+                "error",
+                "oom",
+            } or bool(payload.get("handoff_missing")):
+                continue
+            row_epoch = str(payload.get("target_epoch") or "").strip()
+            if current_epoch and row_epoch and row_epoch != current_epoch:
+                continue
+            raw_ids = payload.get("intent_ids")
+            if isinstance(raw_ids, list) and raw_ids:
+                iids = [str(item or "").strip() for item in raw_ids if str(item or "").strip()]
+            else:
+                raw_iid = str(payload.get("intent_id") or "").strip()
+                iids = [part.strip() for part in raw_iid.split(",") if part.strip()]
+            to_fact = payload.get("to_fact_seq")
+            has_positive_fact = isinstance(to_fact, int) and to_fact > 0
+            if has_positive_fact:
+                continue
+            for iid in iids:
+                coverage = str(
+                    payload.get("coverage_key") or intent_coverages.get(iid, "")
+                ).strip()
+                rows.append({
+                    "seq": int(event["seq"]),
+                    "question": intent_goals.get(iid, ""),
+                    "tested_scope": str(payload.get("result_detail") or payload.get("reason") or "").strip(),
+                    "coverage_key": coverage,
+                    "target_epoch": str(payload.get("target_epoch") or "").strip(),
+                })
     return rows
+
+
+def cancelled_reopen_rows(shared_graph: Any) -> list[dict[str, Any]]:
+    """Compatibility name for the closed-route preview catalog."""
+    return closed_reopen_rows(shared_graph)
 
 
 def stale_reopen_from_cancelled(
     action: str,
     from_facts: list[int],
     cancelled: list[dict[str, Any]] | None,
+    *,
+    coverage_key: str = "",
 ) -> bool:
-    """True when action repeats a cancelled question and from has no newer Fact."""
+    """Compare stable coverage IDs or exact questions, without semantic guesses."""
     cited = [int(item) for item in from_facts if int(item) > 0]
     for row in cancelled or []:
+        if row.get("tool_calls") == 0:
+            continue
         try:
             seq = int(row.get("seq") or 0)
         except (TypeError, ValueError):
             continue
         question = str(row.get("question") or row.get("goal") or "")
-        if seq <= 0 or not _same_question(action, question):
+        tested_scope = str(row.get("tested_scope") or "")
+        same_action = (
+            _same_question(action, question)
+            or (bool(tested_scope) and _same_question(action, tested_scope))
+        )
+        same_coverage = _same_coverage_surface(
+            coverage_key, str(row.get("coverage_key") or "")
+        )
+        if seq <= 0 or (not same_action and not same_coverage):
             continue
         if any(item > seq for item in cited):
             continue
@@ -354,9 +519,16 @@ def stale_reopen_from_cancelled(
 
 
 def stale_reopen_without_newer_fact(
-    action: str, from_facts: list[int], shared_graph: Any,
+    action: str,
+    from_facts: list[int],
+    shared_graph: Any,
+    *,
+    coverage_key: str = "",
 ) -> bool:
-    """True when this open_step repeats a cancelled question with no newer Fact."""
+    """Reject the same closed route without a newer Fact or a changed epoch."""
     return stale_reopen_from_cancelled(
-        action, from_facts, cancelled_reopen_rows(shared_graph),
+        action,
+        from_facts,
+        closed_reopen_rows(shared_graph),
+        coverage_key=coverage_key,
     )

@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import sqlite3
+import tempfile
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -23,9 +24,11 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, model_validator
 from sse_starlette.sse import EventSourceResponse
+from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 
 from apps.web.run_manager import RunManager
 from apps.web.routes.common import (
@@ -34,6 +37,7 @@ from apps.web.routes.common import (
     _env_int,
     _require_dict_body,
 )
+from muteki.core.blocking import run_blocking
 from muteki.solver.engine_registry import (
     SUPPORTED_ENGINE_IDS,
 )
@@ -150,7 +154,7 @@ def register(app: FastAPI) -> None:
         return receipt.output
 
     @app.get("/api/runs/{run_id}/credentials")
-    async def run_credentials(run_id: str) -> Any:
+    def run_credentials(run_id: str) -> Any:
         from muteki.models.solve_graph import Challenge
         from muteki.swarm.shared_graph import SQLiteSharedGraph
 
@@ -173,6 +177,148 @@ def register(app: FastAPI) -> None:
         finally:
             if graph is not None:
                 graph.close()
+
+    @app.get("/api/runs/{run_id}/graph/export")
+    async def export_run_graph(run_id: str, format: str = "jsonl") -> Any:
+        """Export one Run's durable graph as a snapshot or event timeline."""
+        if format not in {"jsonl", "timeline", "sqlite"}:
+            raise HTTPException(status_code=400, detail="format must be jsonl, timeline, or sqlite")
+        mgr: RunManager = app.state.manager
+        run = mgr.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="unknown run")
+        graph_db = mgr.storage.run_graph(run_id) / "shared_graph.db"
+        if not graph_db.is_file():
+            raise HTTPException(status_code=404, detail="run graph unavailable")
+        graph_uri = graph_db.resolve().as_uri() + "?mode=ro"
+        def preflight_graph() -> None:
+            preflight = sqlite3.connect(graph_uri, uri=True)
+            try:
+                preflight.execute(
+                    "SELECT seq, challenge_id, ts, actor, kind, payload, "
+                    "artifact_id, verified, confidence FROM events LIMIT 0"
+                )
+            finally:
+                preflight.close()
+
+        try:
+            await run_in_threadpool(preflight_graph)
+        except sqlite3.Error as exc:
+            raise HTTPException(
+                status_code=409, detail=f"run graph unreadable: {exc}"
+            ) from exc
+
+        filename_id = re.sub(r"[^A-Za-z0-9_-]", "_", run_id)[:80] or "run"
+        if format == "sqlite":
+            def backup_graph() -> str:
+                # A live WAL file cannot be copied safely with a plain file read.
+                fd, path = tempfile.mkstemp(prefix="muteki-graph-", suffix=".sqlite")
+                os.close(fd)
+                source = target = None
+                completed = False
+                try:
+                    source = sqlite3.connect(graph_uri, uri=True)
+                    target = sqlite3.connect(path)
+                    source.backup(target)
+                    completed = True
+                    return path
+                finally:
+                    if target is not None:
+                        target.close()
+                    if source is not None:
+                        source.close()
+                    if not completed:
+                        os.unlink(path)
+
+            try:
+                backup_path = await asyncio.to_thread(backup_graph)
+            except sqlite3.Error as exc:
+                raise HTTPException(
+                    status_code=409, detail=f"run graph unreadable: {exc}"
+                ) from exc
+            return FileResponse(
+                backup_path,
+                media_type="application/vnd.sqlite3",
+                filename=f"muteki-graph-{filename_id}.sqlite",
+                headers={"Cache-Control": "no-store"},
+                background=BackgroundTask(os.unlink, backup_path),
+            )
+
+        def stream() -> Any:
+            # Keep one read transaction for a stable watermark while Workers write.
+            # Starlette may resume a sync streaming iterator on another worker thread.
+            connection = sqlite3.connect(graph_uri, uri=True, check_same_thread=False)
+            try:
+                connection.execute("BEGIN")
+                count, watermark = connection.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(seq), 0) FROM events "
+                    "WHERE challenge_id=?", (run_id,),
+                ).fetchone()
+                metadata = {
+                    "record": "graph_export",
+                    "schema_version": 1,
+                    "run_id": run_id,
+                    "name": run.name,
+                    "category": run.category,
+                    "event_count": count,
+                    "watermark": watermark,
+                }
+                if format == "jsonl":
+                    yield json.dumps(metadata, ensure_ascii=False) + "\n"
+                else:
+                    yield (
+                        f"Run: {run.name or run_id} ({run_id})\n"
+                        f"Category: {run.category or 'unknown'}\n"
+                        f"Events: {count} | Watermark: #{watermark}\n\n"
+                    )
+                rows = connection.execute(
+                    "SELECT seq, ts, actor, kind, payload, artifact_id, "
+                    "verified, confidence FROM events WHERE challenge_id=? "
+                    "ORDER BY seq", (run_id,),
+                )
+                for seq, ts, actor, kind, payload, artifact_id, verified, confidence in rows:
+                    try:
+                        parsed_payload = json.loads(payload)
+                        payload_error = ""
+                    except (TypeError, json.JSONDecodeError) as exc:
+                        parsed_payload = None
+                        payload_error = f"{type(exc).__name__}: {exc}"
+                    event = {
+                        "record": "event", "seq": seq, "ts": ts,
+                        "actor": actor, "kind": kind,
+                        "payload": parsed_payload,
+                        "artifact_id": artifact_id,
+                        "verified": bool(verified),
+                        "confidence": confidence,
+                    }
+                    if payload_error:
+                        event["payload_raw"] = payload
+                        event["payload_error"] = payload_error
+                    if format == "jsonl":
+                        yield json.dumps(event, ensure_ascii=False) + "\n"
+                    else:
+                        yield (
+                            f"[{ts}] #{seq} {kind} by {actor}\n"
+                            + (
+                                f"invalid JSON payload ({payload_error}):\n{payload}"
+                                if payload_error else
+                                json.dumps(parsed_payload, ensure_ascii=False, indent=2)
+                            )
+                            + (f"\nartifact: {artifact_id}" if artifact_id else "")
+                            + f"\nverified: {bool(verified)} | confidence: {confidence}\n\n"
+                        )
+            finally:
+                connection.close()
+
+        suffix = "jsonl" if format == "jsonl" else "txt"
+        return StreamingResponse(
+            stream(),
+            media_type=("application/x-ndjson" if format == "jsonl" else "text/plain"),
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": f'attachment; filename="muteki-graph-{filename_id}.{suffix}"',
+            },
+        )
 
     # ── BTW side-query worker (separate one-shot process, no swarm slot) ──────
     # Independent route (not /hitl), no run.hitl queue, no InsightBus GUIDANCE,
@@ -554,7 +700,7 @@ def register(app: FastAPI) -> None:
         view.update(walk(view))
 
     @app.get("/api/runs/{run_id}/pentest-report")
-    async def pentest_report(run_id: str, report_seq: int | None = None) -> Any:
+    def pentest_report(run_id: str, report_seq: int | None = None) -> Any:
         """Read one immutable report version and the version list from the graph."""
         from muteki.pentest.judgement import report
 
@@ -790,9 +936,9 @@ def register(app: FastAPI) -> None:
         return "\n".join(lines)
 
     @app.get("/api/runs/{run_id}/pentest-report.md")
-    async def pentest_report_markdown(run_id: str, report_seq: int | None = None) -> Any:
+    def pentest_report_markdown(run_id: str, report_seq: int | None = None) -> Any:
         """Export the selected report version without rewriting its evidence."""
-        view = await pentest_report(run_id, report_seq=report_seq)
+        view = pentest_report(run_id, report_seq=report_seq)
         filename_suffix = f"-v{view['report_seq']}" if view.get("report_seq") else ""
         return PlainTextResponse(
             _pentest_markdown(view), media_type="text/markdown; charset=utf-8",
@@ -801,8 +947,8 @@ def register(app: FastAPI) -> None:
         )
 
     @app.get("/api/runs/{run_id}/pentest-report.zip")
-    async def pentest_report_bundle(run_id: str, report_seq: int | None = None) -> Any:
-        view = await pentest_report(run_id, report_seq=report_seq)
+    def pentest_report_bundle(run_id: str, report_seq: int | None = None) -> Any:
+        view = pentest_report(run_id, report_seq=report_seq)
         selected_seq = view.get("report_seq")
         filename_suffix = f"-v{selected_seq}" if selected_seq else ""
         output = io.BytesIO()
@@ -1036,7 +1182,7 @@ def register(app: FastAPI) -> None:
         return path, f"{row[2]}{suffix}", media_types[suffix]
 
     @app.get("/api/runs/{run_id}/pentest-report-images/{poc_id}")
-    async def pentest_report_image(run_id: str, poc_id: str, report_seq: int | None = None) -> Any:
+    def pentest_report_image(run_id: str, poc_id: str, report_seq: int | None = None) -> Any:
         path, filename, media_type = _pentest_report_image_source(
             run_id, poc_id, report_seq=report_seq)
         content = path.read_bytes()
@@ -1046,7 +1192,7 @@ def register(app: FastAPI) -> None:
                         headers={"Cache-Control": "no-store", "Content-Disposition": "inline"})
 
     @app.get("/api/runs/{run_id}/pentest-evidence/{fact_seq}/artifacts/{artifact_id}")
-    async def pentest_evidence_artifact(run_id: str, fact_seq: int, artifact_id: str,
+    def pentest_evidence_artifact(run_id: str, fact_seq: int, artifact_id: str,
                                         report_seq: int | None = None) -> Any:
         path, digest, size, content = _pentest_artifact_source(
             run_id, fact_seq, artifact_id, report_seq=report_seq)
@@ -1093,7 +1239,7 @@ def register(app: FastAPI) -> None:
         from muteki.pentest.judgement import generate_report
         from muteki.swarm.shared_graph import SQLiteSharedGraph
 
-        run, path, events, contract = _pentest_report_source(run_id)
+        run, path, events, contract = await run_in_threadpool(_pentest_report_source, run_id)
         if not run.finished:
             raise HTTPException(status_code=409, detail="test is still running")
         mgr: RunManager = app.state.manager
@@ -1115,30 +1261,33 @@ def register(app: FastAPI) -> None:
             target=contract.target, mode="pentest", goal=contract.goal,
             pentest_contract=contract,
         )
-        graph = SQLiteSharedGraph.open(db_path=path, challenge=challenge)
-        try:
+        def record_report(payload: dict[str, Any], *, error: bool = False) -> None:
+            graph = SQLiteSharedGraph.open(db_path=path, challenge=challenge)
             try:
-                async with LLMClient(**kwargs) as llm:
-                    generated = await generate_report(
-                        llm, str(profile.get("model") or ""), events, contract,
-                        terminal_reason=run.terminal_reason,
-                        run_id=run_id, challenge_id=run_id,
-                    )
-                graph.record_pentest_report(payload=generated)
-            except Exception as exc:
-                graph.record_pentest_report(payload={
-                    "code": "report_generation_failed",
-                    "error_type": type(exc).__name__,
-                    "detail": str(exc),
-                    "raw_response": str(getattr(exc, "raw_response", "") or ""),
-                }, error=True)
-                raise HTTPException(status_code=502, detail={
-                    "code": "report_generation_failed",
-                    "error_type": type(exc).__name__,
-                }) from exc
-        finally:
-            graph.close()
-        return await pentest_report(run_id)
+                graph.record_pentest_report(payload=payload, error=error)
+            finally:
+                graph.close()
+
+        try:
+            async with LLMClient(**kwargs) as llm:
+                generated = await generate_report(
+                    llm, str(profile.get("model") or ""), events, contract,
+                    terminal_reason=run.terminal_reason,
+                    run_id=run_id, challenge_id=run_id,
+                )
+            await run_in_threadpool(record_report, generated)
+        except Exception as exc:
+            await run_in_threadpool(record_report, {
+                "code": "report_generation_failed",
+                "error_type": type(exc).__name__,
+                "detail": str(exc),
+                "raw_response": str(getattr(exc, "raw_response", "") or ""),
+            }, error=True)
+            raise HTTPException(status_code=502, detail={
+                "code": "report_generation_failed",
+                "error_type": type(exc).__name__,
+            }) from exc
+        return await run_in_threadpool(pentest_report, run_id)
 
     @app.post("/api/dispatch/parse")
     async def dispatch_parse_preflight(request: Request) -> Any:
@@ -1191,31 +1340,44 @@ def register(app: FastAPI) -> None:
             name = Path(uf.filename or "file").name
             if not name or name in (".", ".."):
                 name = "file"
-            # dedupe collisions within this run's folder: foo.txt, foo-1.txt, ...
-            target = dest_dir / name
-            if target.exists():
-                stem, suf = target.stem, target.suffix
-                i = 1
-                while (dest_dir / f"{stem}-{i}{suf}").exists():
-                    i += 1
-                target = dest_dir / f"{stem}-{i}{suf}"
             # stream to disk in chunks with a running size guard (never buffer a
             # whole file in memory; abort + clean up if it blows the cap).
-            size = 0
+            def save_upload() -> tuple[Path, int]:
+                # Reserve the destination with O_EXCL in the same worker that
+                # writes it. Checking exists() before offloading leaves a race
+                # where concurrent uploads can select and overwrite one path.
+                requested = dest_dir / name
+                stem, suf = requested.stem, requested.suffix
+                target = requested
+                i = 0
+                while True:
+                    try:
+                        out = target.open("xb")
+                        break
+                    except FileExistsError:
+                        i += 1
+                        target = dest_dir / f"{stem}-{i}{suf}"
+                size = 0
+                try:
+                    with out:
+                        while True:
+                            chunk = uf.file.read(1 << 20)
+                            if not chunk:
+                                break
+                            size += len(chunk)
+                            if size > MAX_UPLOAD_BYTES:
+                                raise HTTPException(
+                                    status_code=413,
+                                    detail=f"{name} too large",
+                                )
+                            out.write(chunk)
+                except BaseException:
+                    target.unlink(missing_ok=True)
+                    raise
+                return target, size
+
             try:
-                with target.open("wb") as out:
-                    while True:
-                        chunk = await uf.read(1 << 20)  # 1 MB
-                        if not chunk:
-                            break
-                        size += len(chunk)
-                        if size > MAX_UPLOAD_BYTES:
-                            out.close()
-                            target.unlink(missing_ok=True)
-                            raise HTTPException(
-                                status_code=413, detail=f"{name} too large"
-                            )
-                        out.write(chunk)
+                target, size = await run_blocking(save_upload)
             finally:
                 await uf.close()
             saved.append(

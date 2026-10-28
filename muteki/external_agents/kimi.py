@@ -23,8 +23,9 @@
 
 - 官方 WARNING：REST/WS API 为 experimental，接口稳定性不保证——启动后
   必须读实例 ``/openapi.json`` 与 ``/asyncapi.json``（本 Adapter 在
-  ``_launch`` 与 probe 中实际读取，端点可用性以 spec paths 实测为准，
-  不把字段写成跨版本常量）；
+  ``_launch`` 与 probe 中实际读取）；2.2.0 的 ``:compact`` 虽未列入
+  OpenAPI，服务端和官方 Web UI 均实现，且已隔离实测 HTTP 接受与 WS
+  完成事件，因此作为显式原生契约调用，失败不回退为普通 prompt；
 - Bearer token：所有 ``/api/*`` 要求 bearer；token 引用解析顺序：
   显式参数 > ``KIMI_CODE_SERVER_TOKEN`` > ``~/.kimi-code/server.token``
   （0600，由 ``kimi web`` 首启生成）；token 本体只进进程内存与
@@ -69,6 +70,7 @@ import httpx
 
 from muteki.platform.contracts.agent_events import (
     AgentNodePayload,
+    CompactionPayload,
     AgentUpdatedPayload,
     ApprovalRequestedPayload,
     ApprovalResolvedPayload,
@@ -106,6 +108,8 @@ from muteki.platform.contracts.receipts import (
     ReceiptState,
 )
 
+from muteki.platform.contracts.protocols import RuntimeOperationAdapter
+
 from .acp import AcpHello, AcpTransport, BaseAcpAdapter, check_response
 from .approvals import ApprovalDecision, ApprovalScope
 from .base import BaseExternalAgentAdapter
@@ -124,6 +128,7 @@ from .events import build_event
 from .probe_environment import subprocess_environment
 from .process_supervisor import SupervisedProcess, spawn_supervised
 from .rpc import ProcessOutputLog
+from .runtime_capabilities import RuntimeCapabilityItem, RuntimeCapabilitySnapshot
 from .sessions import classify_exit
 
 #: Stable codes. Callers branch on these, not on the message text.
@@ -196,6 +201,32 @@ class KimiAcpAdapter(BaseAcpAdapter):
     """
 
     adapter_id = "kimi.acp"
+    chat_model_fields = ("model", "effort")
+    chat_model_reset_requires_restart = ("model", "effort")
+    chat_model_config_ids = {"model": "model", "effort": "thinking"}
+
+    async def runtime_capability_snapshot(
+        self, session: Optional[AgentSessionRef] = None,
+    ) -> RuntimeCapabilitySnapshot:
+        snapshot = await super().runtime_capability_snapshot(session)
+        if session is None:
+            return snapshot
+        from .command_providers import detached_compaction_snapshot
+        from .runtime_capabilities import dynamic_command_item
+        handle = self._handle_for(session.agent_session_id)
+        if handle is None:
+            # Kimi advertises this builtin via available_commands_update; the
+            # command is native ACP syntax even before a persisted session resumes.
+            return detached_compaction_snapshot(snapshot, dynamic_command_item(
+                adapter_id=self.id, engine="kimi", name="compact", channel="acp_prompt",
+                description="压缩当前 Kimi 会话上下文", argument_hint="<可选摘要要求>",
+                invocation={"command": "compact", "wire_text": "/compact",
+                            "protocol": "acp.session/prompt"}))
+        return snapshot
+
+    def declared_chat_capabilities(self) -> AgentCapabilities:
+        return self._declared_acp_chat_capabilities()
+
     # Kimi Code sends ``usage_update`` (used/size) after each turn.
     context_usage_reported = True
     # supervised/auto/full-access select Kimi's default/auto/yolo modes;
@@ -227,6 +258,74 @@ class KimiAcpAdapter(BaseAcpAdapter):
 
     def _agent_argv(self) -> list[str]:
         return [self._binary, "acp"]
+
+    @staticmethod
+    def _native_usage_file(handle: dict[str, Any]) -> Path:
+        env = handle.get("env") or {}
+        home = Path(env.get("KIMI_CODE_HOME") or Path(env.get("HOME") or Path.home()) / ".kimi-code")
+        external = handle.get("external_session_id")
+        cwd = Path(handle["cwd"]).resolve()
+        found = None
+        with (home / "session_index.jsonl").open(encoding="utf-8") as index:
+            for line in index:
+                row = json.loads(line)
+                if (row.get("sessionId") == external
+                        and Path(row.get("workDir") or "").resolve() == cwd):
+                    found = Path(row["sessionDir"]) / "agents" / "main" / "wire.jsonl"
+        if found is None:
+            raise ValueError("Current Kimi session is missing from its native session index")
+        return found
+
+    async def _prompt_stream(self, session: AgentSessionRef, input: MessageInput) -> AsyncIterator[AgentEvent]:
+        handle = self._handle_for(session.agent_session_id)
+        if handle is not None:
+            try:
+                path = self._native_usage_file(handle)
+                # Only the new append belongs to this turn, including on resume.
+                handle["kimi_usage_checkpoint"] = (path, path.stat().st_size if path.exists() else 0)
+                handle.pop("kimi_usage_error", None)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                handle["kimi_usage_checkpoint"] = None
+                handle["kimi_usage_error"] = str(exc)
+        async for event in super()._prompt_stream(session, input):
+            yield event
+
+    def _turn_usage_events(self, handle: dict[str, Any]) -> list[tuple[Any, str, dict[str, Any]]]:
+        try:
+            checkpoint = handle.pop("kimi_usage_checkpoint", None)
+            if checkpoint is None:
+                raise ValueError(handle.pop("kimi_usage_error", "Native usage checkpoint unavailable"))
+            path, offset = checkpoint
+            if path.stat().st_size < offset:
+                raise ValueError("Kimi native usage file shrank during the turn")
+            totals = {key: 0 for key in ("inputOther", "output", "inputCacheRead", "inputCacheCreation")}
+            records = 0
+            with path.open("rb") as wire:
+                wire.seek(offset)
+                for line in wire:
+                    row = json.loads(line)
+                    if row.get("type") != "usage.record" or row.get("agentId") != "main":
+                        continue
+                    usage = row.get("usage")
+                    if not isinstance(usage, dict):
+                        raise ValueError("Kimi native usage record has no counters")
+                    for key in totals:
+                        value = usage.get(key)
+                        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                            raise ValueError("Kimi native usage record has invalid counters")
+                        totals[key] += value
+                    records += 1
+            if not records:
+                raise ValueError("Kimi did not persist consumption counters for this turn")
+            payload = _kimi_usage_payload(totals)
+            payload["total_tokens"] = sum(totals.values())
+            payload["native"] = {"usage": totals, "records": records, "source": "same_session_wire"}
+            return [(AgentEventType.USAGE_UPDATED, "kimi.acp.native_usage", payload)]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return [(AgentEventType.RUNTIME_WARNING, "kimi.acp.native_usage_missing",
+                     dump_payload(RuntimeWarningPayload(
+                         kind="degraded", code="kimi.usage_unavailable",
+                         message=f"Kimi consumption usage is unavailable: {exc}")))]
 
     def _agent_argv_for_request(self, request: SessionStart) -> list[str]:
         del request
@@ -434,14 +533,16 @@ def _kimi_usage_payload(usage: dict[str, Any]) -> dict[str, Any]:
     ))
 
 
-class KimiLocalServerAdapter(BaseExternalAgentAdapter):
+class KimiLocalServerAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
     """Kimi Local Server（``kimi web``）REST + WebSocket Adapter。
 
     experimental 接口纪律（核验 §KIMI-3 的硬性要求）：
 
-    - 启动后读取该实例 ``/openapi.json`` 与 ``/asyncapi.json``，端点
-      可用性以 spec paths 实测为准（``probe`` 与 ``_launch`` 都做）；
+    - 启动后读取该实例 ``/openapi.json`` 与 ``/asyncapi.json``
+      （``probe`` 与 ``_launch`` 都做），用于端点与字段探测；
       字段名仅在单版本内核验过，不作为跨版本常量承诺；
+      2.2.0 的 :compact 未投影进 OpenAPI，使用已核验的原生 action，
+      以 HTTP 业务码与 WS 完成事件判断执行结果；
     - 事件走 WS ``/api/v1/ws``（durable seq/epoch 游标）；WS 不可用
       （缺 ``websockets`` 包或握手失败）时显式降级：probe 记录
       degradation，``send`` 返回 unsupported，不伪造完成事件。
@@ -450,19 +551,77 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
     adapter_id = "kimi.local_server"
     turn_context_channel = "text_blocks"
 
-    async def runtime_capability_snapshot(self, session=None):
-        snapshot = await super().runtime_capability_snapshot(session)
+    @staticmethod
+    def _compact_item(adapter_id: str) -> RuntimeCapabilityItem:
         from .command_providers import operation_item
-        # Measured on kimi web: a prompt "/compact" reaches the model as text;
-        # the local server exposes no compaction endpoint.
-        compact = operation_item(self.id, "kimi", "compact", "", "压缩当前 Kimi 会话上下文").model_copy(update={
-            "id": f"unavailable:{self.id}:compact", "action": "inspect-runtime-capability",
-            "invocation": {}, "support_level": "unsupported", "invocable": False,
-            "reason": "Kimi 本地服务没有压缩接口，/compact 会被当作普通消息交给模型",
-            "alternative": "改用 Kimi ACP 接入（kimi.acp）执行原生 /compact",
-        })
-        return snapshot.model_copy(update={
-            "items": [*(item for item in snapshot.items if item.name != "compact"), compact]})
+        # Kimi 2.2.0 registers this session action but omits it from OpenAPI.
+        # Its web UI uses the same native endpoint, with optional instruction.
+        return operation_item(adapter_id, "kimi", "compact", "sessions:compact",
+                              "压缩当前 Kimi 会话上下文", argument_hint="<可选摘要要求>")
+
+    async def runtime_capability_snapshot(
+        self, session: Optional[AgentSessionRef] = None,
+    ) -> RuntimeCapabilitySnapshot:
+        snapshot = await super().runtime_capability_snapshot(session)
+        if session is None:
+            return snapshot
+        compact = self._compact_item(self.id)
+        snapshot = snapshot.model_copy(update={
+            "items": [item for item in snapshot.items if item.name != "compact"]})
+        handle = self._sessions.get(session.agent_session_id)
+        if handle is None or handle.get("client") is None:
+            from .command_providers import detached_compaction_snapshot
+            return detached_compaction_snapshot(snapshot, compact)
+        return snapshot.model_copy(update={"items": [*snapshot.items, compact]})
+
+    async def runtime_operation(
+        self, session: AgentSessionRef, name: str, arguments: str = "",
+    ) -> dict[str, Any]:
+        if name != "compact":
+            raise KimiLocalServerError(f"Unsupported operation: {name}",
+                                       code="kimi.operation.unsupported")
+        handle = self._sessions.get(session.agent_session_id)
+        if not handle or handle.get("client") is None:
+            raise KimiLocalServerError("Kimi 会话未连接", code="kimi.session.unavailable")
+        if handle.get("event_sink") is not None or handle.get("current_turn_id"):
+            raise KimiLocalServerError("请等待当前回复结束后压缩", code="kimi.session.busy")
+        handle["agent_session_id"] = session.agent_session_id
+        if not await self._ensure_ws(handle):
+            raise KimiLocalServerError("Kimi 事件流不可用", code="kimi.ws.unavailable")
+        queue = asyncio.Queue()
+        handle["event_sink"] = queue
+        try:
+            async with asyncio.timeout(self._prompt_timeout):
+                response = await handle["client"].post(
+                    f"/api/v1/sessions/{handle['external_session_id']}:compact",
+                    json={"instruction": arguments} if arguments else {})
+                # HTTP acceptance only starts background compaction. Wait for the
+                # native terminal event before reporting completion and token counts.
+                try:
+                    envelope = response.json()
+                except ValueError as exc:
+                    raise KimiLocalServerError(
+                        f"HTTP {response.status_code}: {response.text}",
+                        code="kimi.compact.http_error") from exc
+                code = envelope.get("code") if isinstance(envelope, dict) else None
+                if response.is_error or not isinstance(envelope, dict) or code not in (0, "0"):
+                    raise KimiLocalServerError(
+                        f"HTTP {response.status_code}: {envelope}",
+                        code=f"kimi.compact.{code}" if code is not None else "kimi.compact.http_error")
+                while True:
+                    event_type, native_type, payload = await queue.get()
+                    if event_type == AgentEventType.COMPACTION_UPDATED:
+                        if payload["status"] == "completed":
+                            return {"compaction": payload, "message": "Kimi 上下文压缩已完成"}
+                        if payload["status"] in {"failed", "interrupted"}:
+                            raise KimiLocalServerError(payload.get("message") or native_type,
+                                                       code=native_type)
+                    elif event_type == AgentEventType.RUNTIME_ERROR:
+                        raise KimiLocalServerError(str(payload), code=native_type)
+        except TimeoutError as exc:
+            raise KimiLocalServerError("等待 Kimi 原生压缩结果超时", code="kimi.compact.timeout") from exc
+        finally:
+            handle["event_sink"] = None
 
     def __init__(
         self,
@@ -729,6 +888,7 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
         caps.usage_events = ws_available
         # agent.status.updated carries contextTokens/maxContextTokens.
         caps.context_usage = ws_available
+        caps.compaction = ws_available
         caps.approval = ws_available and any("approvals" in p for p in paths)
         prompt_fields = _openapi_request_properties(
             openapi, "/sessions/{session_id}/prompts") or set()
@@ -749,6 +909,8 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
         caps.subagents = ws_available
         for field_name in BOOL_CAPABILITY_FIELDS:
             field_sources[field_name] = SOURCE_PROBE
+        # The compact action is a verified native contract, omitted by 2.2.0 OpenAPI.
+        field_sources["compaction"] = SOURCE_STATIC
         if not ws_available:
             degradations.append(
                 "websockets 包不可用：WS 事件流/中断/审批未启用，send 将"
@@ -810,6 +972,15 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
                         "permission_mode on POST /sessions/{session_id}/prompts, "
                         "so the native permission mode cannot be selected",
                     )
+            if request.options.disabled_tools:
+                prompt_fields = _openapi_request_properties(
+                    openapi, "/sessions/{session_id}/prompts")
+                if prompt_fields is None or "disabled_tools" not in prompt_fields:
+                    raise KimiLocalServerError(
+                        "该实例 OpenAPI 未声明 prompt disabled_tools："
+                        "无法保证离线工具隔离",
+                        code=KIMI_LOCAL_SERVER_UNAVAILABLE,
+                    )
 
             resume_handle = request.resume_handle
             if resume_handle:
@@ -846,6 +1017,7 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
             "turns": 0,
             "external_session_id": session_id,
             "model": request.model,
+            "disabled_tools": list(request.options.disabled_tools),
             "resumed": bool(resume_handle),
             "event_sink": None,
             "current_turn_id": None,
@@ -1024,6 +1196,25 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
         if ftype.startswith("subagent."):
             self._handle_subagent_lifecycle(handle, sink, ftype, data)
             return
+        if ftype.startswith("compaction."):
+            status = {"compaction.started": "started", "compaction.completed": "completed",
+                      "compaction.cancelled": "interrupted", "compaction.blocked": "failed"}.get(ftype)
+            if status is not None:
+                if status == "started":
+                    handle["compaction_trigger"] = data.get("trigger") or "auto"
+                result = data.get("result") if isinstance(data.get("result"), dict) else {}
+                sink.put_nowait((AgentEventType.COMPACTION_UPDATED, f"kimi.{ftype}",
+                                 dump_payload(CompactionPayload(
+                                     status=status,
+                                     trigger=handle.get("compaction_trigger", "manual"),
+                                     tokens_before=result.get("tokensBefore"),
+                                     tokens_after=result.get("tokensAfter"),
+                                     summary=result.get("summary"),
+                                     message=("Kimi 当前回合阻止压缩" if ftype == "compaction.blocked"
+                                              else "Kimi 压缩已取消" if ftype == "compaction.cancelled" else None)))))
+                if status == "completed":
+                    self._context_compacted(agent_session_id)
+            return
         if ftype == "turn.started":
             return
         if ftype == "turn.ended":
@@ -1104,7 +1295,7 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
                                      scope="context_only",
                                      context_used_tokens=snapshot[0],
                                      context_window=snapshot[1] or None))))
-        # 其余事件（task.*/compaction.*/tool.call.delta/
+        # 其余事件（task.*/tool.call.delta/
         # agent.status.updated 等）不改变核心状态机。
 
     # -- 子智能体 -------------------------------------------------------------
@@ -1126,6 +1317,40 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
             "output": data.get("output") or data.get("content"),
             "is_error": bool(data.get("is_error")),
         }
+
+    async def _src_approval(
+        self, handle: dict[str, Any], sink: Any, data: dict[str, Any],
+        agent_id: Optional[str], approval_id: str, tool_name: str,
+    ) -> None:
+        from .src_policy import NativeToolError, authorize_native_tool
+        record = self._tracker.get(handle["agent_session_id"])
+        try:
+            await authorize_native_tool(
+                self._tracker._store, thread_id=handle.get("thread_id"),
+                invocation_id=f"kimi:{handle['agent_session_id']}:{approval_id}",
+                tool_name=tool_name or str(data.get("action") or "tool"),
+                arguments=dict(data.get("input") or data.get("arguments") or data),
+                action=str(data.get("action") or tool_name or "tool"),
+                approval_kind=("file_change" if tool_name in _KIMI_EDIT_TOOLS
+                               else "command_execution" if tool_name in {"Bash", "Shell"} else "tool"),
+                adapter_id="kimi", run_id=record.run_id if record else None,
+                cwd=str(data.get("cwd") or handle.get("cwd") or ""),
+                environment_generation=(record.execution_generation or 0) if record else 0,
+            )
+        except NativeToolError as exc:
+            _code, error = await self._post_approval_decision(
+                handle, approval_id, {"decision": "rejected"})
+            if error is not None:
+                sink.put_nowait((AgentEventType.RUNTIME_ERROR, "kimi.approval.reply_failed",
+                                 dump_payload(RuntimeErrorPayload(error=error))))
+                return
+            sink.put_nowait((AgentEventType.APPROVAL_RESOLVED, "kimi.approval.src_denied",
+                             dump_payload(ApprovalResolvedPayload(
+                                 approval_id=approval_id, agent_id=agent_id,
+                                 decision="deny", scope="once", automatic=True,
+                                 native={"resolved_by": "src_policy", "reason": exc.code}))))
+            return
+        await self._auto_approve(handle, sink, approval_id, tool_name, agent_id, "src_policy")
 
     def _emit_approval(
         self, handle: dict[str, Any], sink: Any, data: dict[str, Any],
@@ -1150,6 +1375,11 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
                                      "approval.missing_id",
                                      message="Kimi approval request has no approval_id"),
                                  native={"data": data}))))
+            return
+        from .src_policy import src_task_id
+        if src_task_id(self._tracker._store, handle.get("thread_id")):
+            asyncio.ensure_future(self._src_approval(
+                handle, sink, data, agent_id, approval_id, tool_name))
             return
         policy = ""
         if access_mode is None:
@@ -1603,6 +1833,8 @@ class KimiLocalServerAdapter(BaseExternalAgentAdapter):
                     body["model"] = str(model)
                 if handle.get("permission_mode"):
                     body["permission_mode"] = handle["permission_mode"]
+                if handle.get("disabled_tools"):
+                    body["disabled_tools"] = list(handle["disabled_tools"])
                 resp = await client.post(
                     f"/api/v1/sessions/{external_id}/prompts",
                     json=body,
