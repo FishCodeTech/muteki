@@ -52,16 +52,20 @@ function fallbackCopyText(text: string): boolean {
 export async function copyToClipboard(text: string): Promise<boolean> {
   if (!text) return false;
 
+  // Keep the synchronous copy inside the user's click/key gesture. Waiting for
+  // a rejected async write first can lose that activation in some browsers.
+  // This path also works on LAN HTTP origins without navigator.clipboard.
+  if (fallbackCopyText(text)) return true;
+
   const clipboard = typeof navigator !== "undefined" ? navigator.clipboard : undefined;
   if (clipboard && typeof clipboard.writeText === "function") {
     try {
       await clipboard.writeText(text);
       return true;
     } catch {
-      // Fall through to the textarea path for denied permissions, unfocused docs,
-      // or non-secure origins where the async clipboard API is exposed but rejects.
+      return false;
     }
   }
 
-  return fallbackCopyText(text);
+  return false;
 }

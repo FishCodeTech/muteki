@@ -1,6 +1,6 @@
 {
   "name": "muteki-command-deck",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "private": true,
   "type": "module",
   "description": "Project Muteki web command deck — a conversation-first frontend with a live agent collaboration map, evidence views, worker controls, and HITL operations.",
@@ -22,7 +22,7 @@
     "katex": "0.18.9",
     "lucide-react": "^1.34.0",
     "motion": "^13.4.4",
-    "next": "15.5.24",
+    "next": "15.5.28",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "react-markdown": "^10.1.0",
@@ -37,7 +37,7 @@
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "eslint": "^8.57.1",
-    "eslint-config-next": "^15.5.24",
+    "eslint-config-next": "15.5.28",
     "react-test-renderer": "19.2.8",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.5.3"

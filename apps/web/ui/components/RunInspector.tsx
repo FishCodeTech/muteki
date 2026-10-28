@@ -13,6 +13,7 @@ import { workerColor, workerEngine, workerEngineKey, resumeCommand, toWorkerIden
 import { Icon, type IconName } from "@/components/Icon";
 import { EngineLogo } from "@/components/EngineLogo";
 import { useCopied } from "@/lib/useCopied";
+import { useCopyText } from "@/lib/useCopyText";
 import { Button, ListBox, ListBoxItem, Select } from "@heroui/react";
 import type { ArtifactView } from "@/lib/events";
 import { panelHotkey } from "@/lib/runtimeTabs";
@@ -203,6 +204,7 @@ export function RunInspector({
 }) {
   const t = useT();
   const isPentest = deck.mode === "pentest";
+  const copyText = useCopyText();
   const { lang } = useLang();
   const [spawnEngine, setSpawnEngine] = useState("");
   const spawnEngines = providerEngines(readyCatalog(useProviderDescriptors()));
@@ -496,7 +498,7 @@ export function RunInspector({
                         </Button>
                       )}
                     </div>
-                    <Button size="sm" variant="ghost" className="copytext insp-run-flag t-flag-target" aria-label={t("common.copyFlagAria", { flag: f })} onPress={() => void navigator.clipboard.writeText(f)}>
+                    <Button size="sm" variant="ghost" className="copytext insp-run-flag t-flag-target" aria-label={t("common.copyFlagAria", { flag: f })} onPress={() => copyText(f)}>
                       <code>{f}</code><Icon name="copy" size={13} className="insp-flag-copy-icon" />
                     </Button>
                   </div>
@@ -504,7 +506,7 @@ export function RunInspector({
                 })}
               </div>
             ) : deck.outcomeReason === "goal_met" ? (
-              <Button size="sm" variant="outline" className="copytext insp-run-flag goal t-flag-target" aria-label={t("common.copyAnswer")} onPress={() => void navigator.clipboard.writeText(deck.goalWhy || t("insp.run.goalMet"))}>
+              <Button size="sm" variant="outline" className="copytext insp-run-flag goal t-flag-target" aria-label={t("common.copyAnswer")} onPress={() => copyText(deck.goalWhy || t("insp.run.goalMet"))}>
                 {deck.goalWhy || t("insp.run.goalMet")}
               </Button>
             ) : (

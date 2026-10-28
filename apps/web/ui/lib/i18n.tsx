@@ -281,6 +281,7 @@ const STRINGS: Dict = {
   "runtime.actor.systemLogin": { zh: "系统登录", en: "Host login" },
   "runtime.actor.customEndpoint": { zh: "自定义 API", en: "Custom API" },
   "common.copied": { zh: "已复制", en: "copied" },
+  "common.copyFailed": { zh: "复制失败，请重试或手动复制", en: "Copy failed. Try again or copy the text manually." },
   "common.copyShort": { zh: "复制", en: "copy" },
   "common.copyFlag": { zh: "点击复制 flag", en: "Click to copy flag" },
   "common.copyFlagAria": { zh: "复制 {flag}", en: "Copy {flag}" },

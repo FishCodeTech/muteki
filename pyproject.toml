@@ -1,6 +1,6 @@
 [project]
 name = "project-muteki"
-version = "0.4.6"
+version = "0.4.7"
 description = "Project Muteki (無敵): autonomous multi-model CTF-solving AI agent swarm"
 requires-python = ">=3.13"
 dependencies = [
