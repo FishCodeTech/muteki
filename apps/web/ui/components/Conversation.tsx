@@ -20,6 +20,7 @@ import { RunInspector } from "@/components/RunInspector";
 import { RunSignalsStrip } from "@/components/RunSignalsStrip";
 import { NumberField } from "@/components/NumberField";
 import { useCopied } from "@/lib/useCopied";
+import { useCopyText } from "@/lib/useCopyText";
 import { Accordion, Button, Chip, Input, Label, ListBox, ListBoxItem, Popover, Select, Skeleton, Spinner, Tabs, TextArea } from "@heroui/react";
 import type { ArtifactView } from "@/lib/events";
 
@@ -361,6 +362,7 @@ function ProgressBriefBubble({
 }
 
 function AnswerBubble({ digest, t }: { digest: SwarmDigest; t: (k: string, v?: Record<string, string | number>) => string }) {
+  const copyText = useCopyText();
   const none = digest.flags.length === 0 && digest.phase !== "goal_met";
   const multi = digest.expectedFlags > 1;
   return (
@@ -378,7 +380,7 @@ function AnswerBubble({ digest, t }: { digest: SwarmDigest; t: (k: string, v?: R
         <div className="body">
           {digest.flags.map((f) => (
             <div key={f}>
-              <Button size="sm" variant="outline" className="copytext ans-flag" aria-label={t("common.copyFlag")} onPress={() => void navigator.clipboard.writeText(f)}>{t("coord.answerFlag", { flag: f })}</Button>
+              <Button size="sm" variant="outline" className="copytext ans-flag" aria-label={t("common.copyFlag")} onPress={() => copyText(f)}>{t("coord.answerFlag", { flag: f })}</Button>
             </div>
           ))}
         </div>
@@ -386,7 +388,7 @@ function AnswerBubble({ digest, t }: { digest: SwarmDigest; t: (k: string, v?: R
         <div className="body">{t("coord.pentestAnswer")}</div>
       ) : digest.phase === "goal_met" ? (
         <div className="body">
-          <Button size="sm" variant="outline" className="copytext ans-flag goal" aria-label={t("common.copyAnswer")} onPress={() => void navigator.clipboard.writeText(digest.goalWhy || "")}>
+          <Button size="sm" variant="outline" className="copytext ans-flag goal" aria-label={t("common.copyAnswer")} onPress={() => copyText(digest.goalWhy || "")}>
             {t("coord.answerGoal", { why: digest.goalWhy || "" })}
           </Button>
         </div>
@@ -475,6 +477,7 @@ function FlowPopover({
 }
 
 function StatusHero({ digest, hitlCount, progress, t }: { digest: SwarmDigest; hitlCount: number; progress?: ProgressBrief; t: (k: string, v?: Record<string, string | number>) => string }) {
+  const copyText = useCopyText();
   const [flowOpen, setFlowOpen] = useState(false);
   const [resultsOpen, setResultsOpen] = useState(false);
   const elapsed = useElapsed(
@@ -608,7 +611,7 @@ function StatusHero({ digest, hitlCount, progress, t }: { digest: SwarmDigest; h
               <Icon name="chevronDown" size={13} />
             </Button>
           ) : singleFlag ? (
-            <Button size="sm" variant="outline" className="copytext sh-detail sh-detail-flag" aria-label={t("common.copyFlag")} onPress={() => void navigator.clipboard.writeText(singleFlag)}>{singleFlag}</Button>
+            <Button size="sm" variant="outline" className="copytext sh-detail sh-detail-flag" aria-label={t("common.copyFlag")} onPress={() => copyText(singleFlag)}>{singleFlag}</Button>
           ) : (
             <span className="sh-detail" data-tooltip={detail}>{detail}</span>
           )}
@@ -641,7 +644,7 @@ function StatusHero({ digest, hitlCount, progress, t }: { digest: SwarmDigest; h
             {digest.flags.map((flag, index) => (
                 <div className="sh-result-row" key={`${index}-${flag}`}>
                   <span className="sh-result-index">{String(index + 1).padStart(2, "0")}</span>
-                  <Button size="sm" variant="outline" className="copytext sh-result-value" aria-label={t("common.copyFlag")} onPress={() => void navigator.clipboard.writeText(flag)}>{flag}</Button>
+                  <Button size="sm" variant="outline" className="copytext sh-result-value" aria-label={t("common.copyFlag")} onPress={() => copyText(flag)}>{flag}</Button>
                 </div>
               ))}
           </div>
