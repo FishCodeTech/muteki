@@ -32,15 +32,15 @@ ARG MUTEKI_WORKER_BASE=worker-base
 FROM node:24.14.0-bookworm-slim AS zcode-builder
 ARG ZCODE_COMMIT=3c5b227649371507ddc4eb46ac5133afe6db1cab
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && \
-    rm -rf /var/lib/apt/lists/* && \
-    git init /src && cd /src && \
+    rm -rf /var/lib/apt/lists/*
+RUN git init /src && cd /src && \
     git remote add origin https://github.com/zai-org/ZCode.git && \
     git fetch --depth=1 origin "$ZCODE_COMMIT" && \
     git checkout --detach FETCH_HEAD && \
-    test "$(git rev-parse HEAD)" = "$ZCODE_COMMIT" && \
-    corepack enable && corepack prepare pnpm@10.33.2 --activate && \
-    pnpm install --frozen-lockfile --ignore-scripts && \
-    pnpm --filter @zcode/cli... build
+    test "$(git rev-parse HEAD)" = "$ZCODE_COMMIT"
+RUN cd /src && \
+    corepack pnpm@10.34.9 install --frozen-lockfile --ignore-scripts && \
+    corepack pnpm@10.34.9 --filter @zcode/cli... build
 
 # Pinned to a specific Kali rolling digest for reproducible builds (rolling:latest
 # changes daily). Re-pin periodically: `docker pull kalilinux/kali-rolling:latest`
