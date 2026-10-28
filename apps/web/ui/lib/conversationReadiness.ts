@@ -259,7 +259,7 @@ export function pickRuntimeForEngine(
   const healthy = rows.filter((runtime) => runtime.health?.healthy === true);
   const pool = healthy.length ? healthy : rows;
   return [...pool].sort((left, right) => {
-    // Built-in variants (cursor.acp, pi.acp, …) are listed next to the engine
+    // Built-in variants (cursor.acp, droid.acp, …) are listed next to the engine
     // default; they are chosen only explicitly, never by approval support.
     const score = (runtime: ReadinessRuntime) => (
       Number(runtimeHealthy(runtime)) * 8

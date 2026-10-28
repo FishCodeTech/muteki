@@ -270,6 +270,10 @@ class UpcasterRegistry:
             raise ValueError(f"upcaster already registered: {key}")
         self._upcasters[key] = func
 
+    def source_versions(self) -> tuple[tuple[str, int], ...]:
+        """Stored event versions that may change type or payload on read."""
+        return tuple(self._upcasters)
+
     def upcast(self, event: EventEnvelope) -> EventEnvelope:
         current = event
         while True:
@@ -336,6 +340,7 @@ class PlatformStore:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self._transaction_depth = 0
+        self._transaction_owner: int | None = None
         cur = self._conn.cursor()
         cur.execute("PRAGMA journal_mode=WAL")
         cur.execute("PRAGMA busy_timeout=5000")
@@ -358,6 +363,7 @@ class PlatformStore:
                 self._conn.execute(f"SAVEPOINT {savepoint}")
             else:
                 self._conn.execute("BEGIN IMMEDIATE")
+                self._transaction_owner = threading.get_ident()
             self._transaction_depth += 1
             try:
                 yield
@@ -383,6 +389,29 @@ class PlatformStore:
                     raise
             finally:
                 self._transaction_depth -= 1
+                if not self._transaction_depth:
+                    self._transaction_owner = None
+
+    @contextmanager
+    def read_snapshot(self):
+        """Read a consistent file snapshot without holding the writer lock.
+
+        Private in-memory databases and reads inside this thread's active
+        transaction must reuse the existing connection to see its contents.
+        """
+        if self.db_path == ":memory:" or self._transaction_owner == threading.get_ident():
+            with self._lock:
+                yield self._conn
+            return
+        uri = Path(self.db_path).resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("BEGIN")
+            yield conn
+        finally:
+            conn.close()
 
     @property
     def installation_id(self) -> str:
@@ -690,7 +719,8 @@ class PlatformStore:
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY created_at, rowid"
-        rows = self._fetchall(sql, values)
+        with self.read_snapshot() as conn:
+            rows = conn.execute(sql, values).fetchall()
         return [model_cls.model_validate_json(row["payload"]) for row in rows]
 
     def delete(self, model_cls: type[ContractModel], *pk: Any) -> bool:
@@ -1142,6 +1172,48 @@ class PlatformStore:
             ).fetchall()
         return [self._row_to_event(row, upcast=upcast) for row in rows]
 
+    def read_turn_event_candidates(
+        self,
+        aggregate_type: str,
+        aggregate_id: str,
+        turn_id: str,
+        event_type: str,
+        *,
+        after_seq: int = 0,
+        through_seq: int | None = None,
+        limit: int = 1000,
+    ) -> list[EventEnvelope]:
+        """Read a bounded page for a turn without decoding unrelated history.
+
+        Upcasters may change event types and turn IDs. Include their stored
+        source versions as candidates and let the caller fold the upgraded
+        events. Pages therefore count candidates, including rejected ones.
+        """
+        bounds = "aggregate_type = ? AND aggregate_id = ? AND stream_seq > ?"
+        bound_params: list[Any] = [aggregate_type, aggregate_id, int(after_seq)]
+        if through_seq is not None:
+            bounds += " AND stream_seq <= ?"
+            bound_params.append(int(through_seq))
+        sources = self.upcasters.source_versions()
+        direct = ("SELECT stream_seq, payload FROM domain_events WHERE " + bounds
+                  + " AND event_type = ?"
+                  + " AND CAST(json_extract(payload, '$.payload.turn_id') AS TEXT) = ?")
+        params = [*bound_params, event_type, turn_id]
+        source_versions = [version for kind, version in sources if kind == event_type]
+        if source_versions:
+            direct += " AND event_schema_version NOT IN (" + ",".join("?" for _ in source_versions) + ")"
+            params.extend(source_versions)
+        queries = [direct]
+        for source_type, source_version in sources:
+            queries.append("SELECT stream_seq, payload FROM domain_events WHERE " + bounds
+                           + " AND event_type = ? AND event_schema_version = ?")
+            params.extend([*bound_params, source_type, source_version])
+        sql = " UNION ALL ".join(queries) + " ORDER BY stream_seq LIMIT ?"
+        params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [self._row_to_event(row, upcast=True) for row in rows]
+
     def read_all_events(
         self,
         *,
@@ -1203,14 +1275,14 @@ class PlatformStore:
 
     def snapshot(self) -> PlatformSnapshot:
         """Platform 级快照：对象计数、事件水位、流 head、投影与待处理工作。"""
-        with self._lock:
+        with self.read_snapshot() as conn:
             counts: dict[str, int] = {}
             for spec in {id(s): s for s in _OBJECT_SPECS.values()}.values():
-                row = self._conn.execute(
+                row = conn.execute(
                     f"SELECT COUNT(*) FROM {spec.table}"  # noqa: S608 表名来自代码常量
                 ).fetchone()
                 counts[spec.table] = int(row[0])
-            stream_rows = self._conn.execute(
+            stream_rows = conn.execute(
                 "SELECT aggregate_type, aggregate_id, MAX(stream_seq) AS head "
                 "FROM domain_events GROUP BY aggregate_type, aggregate_id "
                 "ORDER BY aggregate_type, aggregate_id"
@@ -1223,22 +1295,22 @@ class PlatformStore:
                 )
                 for row in stream_rows
             ]
-            watermark_rows = self._conn.execute(
+            watermark_rows = conn.execute(
                 "SELECT projection_name, last_event_seq FROM projection_watermarks"
             ).fetchall()
             watermarks = {
                 row["projection_name"]: int(row["last_event_seq"])
                 for row in watermark_rows
             }
-            pending_receipts = self._conn.execute(
+            pending_receipts = conn.execute(
                 "SELECT COUNT(*) FROM command_receipts WHERE state = ?",
                 (ReceiptState.ACCEPTED.value,),
             ).fetchone()[0]
-            pending_outbox = self._conn.execute(
+            pending_outbox = conn.execute(
                 "SELECT COUNT(*) FROM outbox WHERE status != 'delivered'"
             ).fetchone()[0]
-            schema_version_db = current_version(self._conn)
-            event_row = self._conn.execute(
+            schema_version_db = current_version(conn)
+            event_row = conn.execute(
                 "SELECT MAX(seq) FROM domain_events"
             ).fetchone()
             event_wm = int(event_row[0]) if event_row and event_row[0] is not None else 0

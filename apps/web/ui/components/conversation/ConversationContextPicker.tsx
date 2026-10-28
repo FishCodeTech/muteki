@@ -41,6 +41,8 @@ export interface ConversationContextPickerProps {
   directoryTitle?: string;
   /** 次要模式标签，例如「本地检出」。 */
   modeLabel?: string;
+  /** Read-only unbound threads offer this recovery action next to the chip. */
+  onUnboundRecover?: () => void;
   className?: string;
 }
 
@@ -93,6 +95,7 @@ export function ConversationContextPicker({
   directoryLabel,
   directoryTitle,
   modeLabel,
+  onUnboundRecover,
   className = "",
 }: ConversationContextPickerProps) {
   const { lang } = useLang();
@@ -252,7 +255,7 @@ export function ConversationContextPicker({
   const triggerTitle = currentProject || resolvedRoot
     ? [currentProject?.name, resolvedRoot || directoryTitle].filter(Boolean).join("\n")
     : (disabled
-      ? "当前会话未绑定工作目录；文件/终端需新建已绑定目录的会话"
+      ? "当前会话未绑定工作目录，文件、终端和变更不可用；需新建已绑定目录的会话"
       : "选择本机工作目录");
 
   const labelBody = (
@@ -264,6 +267,33 @@ export function ConversationContextPicker({
       ) : null}
     </>
   );
+
+  if (disabled && !hasDirectory && onUnboundRecover) {
+    return (
+      <span className={cn("inline-flex min-w-0 items-center", className)} data-testid="unbound-workspace-recovery">
+        <Tooltip content={<span className="whitespace-pre-line">{triggerTitle}</span>}>
+          <span
+            tabIndex={0}
+            className={cn(stripPillClass(false), "pr-1.5")}
+            data-readonly="true"
+            aria-label={`工作目录：${triggerTitle}`}
+          >
+            <Icon name="folder" size={13} className="shrink-0 text-cx-warning" />
+            <span className="truncate">{triggerLabel}</span>
+          </span>
+        </Tooltip>
+        <button
+          type="button"
+          className={cn(stripPillClass(true), "px-2 font-normal text-cx-fg-2")}
+          data-testid="unbound-workspace-new-chat"
+          title="已开始的会话不能补绑目录，请新建会话并先选择目录"
+          onClick={onUnboundRecover}
+        >
+          新建会话
+        </button>
+      </span>
+    );
+  }
 
   // 会话内项目已锁定：只读展示目录名，不呈现可切换选择器。
   if (disabled) {

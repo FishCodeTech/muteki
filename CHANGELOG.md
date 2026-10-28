@@ -2,6 +2,33 @@
 
 All notable public release changes are tracked here.
 
+## 0.4.6 - 2026-10-28
+
+### Added
+
+- Added the SRC bounty workbench with task-bound conversations, assets, findings, evidence, reports, and budgeted monitoring cycles.
+- Added cross-provider conversation subagents and Orchestrate controls, with child conversations, live activity, routing details, and cancellation in the sidebar and Subagents panel.
+- Added shared model pricing controls and usage cost views across conversations and runs, including service-tier pricing and missing-price feedback.
+
+### Changed
+
+- Replaced the run trace waterfall with an activity timeline, linked event ledger, and history replay. Expanded tool details retain both inputs and outputs.
+- Refined conversation streaming, Pi controls, desktop chat layout, CTF and penetration-testing run readability, workspace navigation, and remote desktop chrome.
+- Kept desktop mode pages and reading positions when switching workspaces, and restored canonical routes after panel handoffs.
+
+### Fixed
+
+- Moved large Worker prompts out of process arguments to avoid command-line size limits.
+- Moved blocking project operations off the server event loop, serialized extension lifecycle changes, and reserved concurrent upload filenames atomically.
+- Fixed conversation retry and project admission handling, preserved native sessions, and corrected Codex MCP and authentication status labels.
+- Fixed Ubuntu systemd installation and made credential draft probes honor the selected Worker backend.
+- Enforced SRC HTTP authority boundaries and corrected monitoring acquisition, run-once controls, cost reconciliation, and revision-safe editing.
+
+### Upgrade
+
+- Use `muteki upgrade v0.4.6` or `./run.sh upgrade v0.4.6` for a managed Web installation, and add `--compose` for a container deployment. Existing `.env`, `state/`, credentials, and sessions remain outside the release bundle.
+- Download the macOS `.dmg` or `.zip` matching your Apple silicon or Intel Mac from the release page. Windows and Linux desktop packages are not included; Web and container deployments remain available.
+
 ## 0.4.5 - 2026-10-12
 
 ### Fixed

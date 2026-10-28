@@ -68,7 +68,7 @@ export function WorkerLanes({
 }) {
   const t = useT();
   const [onlyAnomaly, setOnlyAnomaly] = useState(false);
-  const [doneOpen, setDoneOpen] = useState(false);
+  const [doneOpen, setDoneOpen] = useState<boolean | null>(null);
   const allIds = useMemo(() => workerIds(deck), [deck]);
   // Headcount = current execution generation only: a continued run (resolve)
   // keeps the previous generation's finished workers listed, but they are not
@@ -124,6 +124,7 @@ export function WorkerLanes({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [allIds, deck.lanes, deck.finished, running]);
 
+  const totalRows = grouped.live.length + grouped.issue.length + grouped.done.length;
   const renderRow = (id: string) => {
     const lane = laneFor(id);
     const online = lane.online !== false;
@@ -233,6 +234,13 @@ export function WorkerLanes({
             </Button>
           ) : onOpenAgent ? null : <span />}
         </div>
+        {totalRows <= 4 && (
+          <dl className="wlane-detail">
+            <dt>引擎</dt><dd>{engine}</dd>
+            <dt>状态</dt><dd>{statusLabel}</dd>
+            {activity ? <><dt>最近活动</dt><dd>{activity}</dd></> : null}
+          </dl>
+        )}
       </div>
     );
   };
@@ -297,7 +305,7 @@ export function WorkerLanes({
         <div className="wlane-roster">
           {renderGroup("live", grouped.live, true)}
           {renderGroup("issue", grouped.issue, true)}
-          {renderGroup("done", grouped.done, doneOpen, () => setDoneOpen((value) => !value))}
+          {renderGroup("done", grouped.done, doneOpen ?? (!grouped.live.length && !grouped.issue.length), () => setDoneOpen((value) => !(value ?? (!grouped.live.length && !grouped.issue.length))))}
         </div>
       )}
     </div>

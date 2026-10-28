@@ -15,6 +15,7 @@ from apps.web.control_adapter import (
     safe_receipt_detail,
     safe_hitl_echo,
 )
+from muteki.core.blocking import run_blocking
 from muteki.control import (
     ApplyResult,
     ControlAction,
@@ -40,35 +41,26 @@ from apps.web.run_state import (  # noqa: F401
     _apply_blackboard_meta, _apply_operator_meta,
 )
 
-def has_control_command(self, run_id: str, command_id: str) -> bool:
+async def has_control_command(self, run_id: str, command_id: str) -> bool:
     """持久控制 journal 是否已知该 command_id（RunGateway 幂等去重用）。"""
     run = self.runs.get(run_id)
     if run is None:
         return False
-    _actor, journal, _secrets = self._ensure_control(run)
+    _actor, journal, _secrets = await self._ensure_control_async(run)
     return journal.get_command(str(command_id or "")) is not None
 
 
-def _ensure_control(self, run: Run) -> tuple[ControlActor, SQLiteControlJournal,
+def _ensure_control(self, run: Run, *, prepared=None) -> tuple[ControlActor, SQLiteControlJournal,
                                               SecretStore]:
     """Create the one actor/journal/secret boundary owned by this run."""
     if (run.control_actor is not None and run.control_journal is not None
             and run.control_secrets is not None):
         return run.control_actor, run.control_journal, run.control_secrets
 
-    db_path, secrets_path = control_paths(
-        self.coordinator_control_dir(run.run_id))
-    journal = SQLiteControlJournal.open(db_path=db_path, run_id=run.run_id)
-    # SessionStore and the control journal are separate durable sinks. A crash
-    # can persist HITL_REQUEST to JSONL before the live metadata sink appends
-    # its DecisionRequest. Rebuild that idempotent edge before validating any
-    # answer so a replayed card can never become permanently unanswerable.
-    self._reconcile_decision_requests(run, journal)
-    # This is the sole owner boundary for a fresh web runtime generation. Any
-    # pre-Popen reservation left by the prior process has an unknowable delivery
-    # outcome and must be terminalised append-only, never silently replayed.
-    journal.recover_context_reservations(actor="web-runtime-recovery")
-    secrets = SecretStore(secrets_path)
+    if prepared is None:
+        journal, secrets, generation = _prepare_control(self, run)
+    else:
+        journal, secrets, generation = prepared
 
     def _live() -> bool:
         return run.task is not None and not run.task.done()
@@ -126,6 +118,23 @@ def _ensure_control(self, run: Run) -> tuple[ControlActor, SQLiteControlJournal,
             return result
 
         task = run.task
+        if (
+            task is not None
+            and not task.done()
+            and command.action in {ControlAction.STOP, ControlAction.COMPLETE}
+            and result.state is EffectState.EFFECT_OBSERVED
+        ):
+            try:
+                grace = float(
+                    os.environ.get("MUTEKI_OPERATOR_CONCLUDE_GRACE_SECONDS", "25")
+                )
+            except (TypeError, ValueError):
+                grace = 25.0
+            if grace > 0:
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=grace)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
         cancel_requested = bool(task is not None and not task.done())
         if cancel_requested:
             run.termination_reasons[run.execution_generation] = "operator_stop"
@@ -188,7 +197,8 @@ def _ensure_control(self, run: Run) -> tuple[ControlActor, SQLiteControlJournal,
         command = journal.get_command(receipt.command_id)
         if command is None:
             return
-        run.control_generation = journal.current_state().generation
+        state = await run_blocking(journal.current_state)
+        run.control_generation = state.generation
         await run.bus.emit(Event(
             event_type=EventType.CONTROL_COMMAND,
             run_id=run.run_id,
@@ -207,8 +217,45 @@ def _ensure_control(self, run: Run) -> tuple[ControlActor, SQLiteControlJournal,
     run.control_actor = actor
     run.control_journal = journal
     run.control_secrets = secrets
-    run.control_generation = journal.current_state().generation
+    run.control_generation = generation
     return actor, journal, secrets
+
+
+def _prepare_control(self, run: Run) -> tuple[SQLiteControlJournal, SecretStore, int]:
+    db_path, secrets_path = control_paths(self.coordinator_control_dir(run.run_id))
+    journal = SQLiteControlJournal.open(db_path=db_path, run_id=run.run_id)
+    try:
+        self._reconcile_decision_requests(run, journal)
+        journal.recover_context_reservations(actor="web-runtime-recovery")
+        return journal, SecretStore(secrets_path), journal.current_state().generation
+    except BaseException:
+        journal.close()
+        raise
+
+
+async def _ensure_control_async(
+    self, run: Run,
+) -> tuple[ControlActor, SQLiteControlJournal, SecretStore]:
+    async with run.control_initialization_lock:
+        if self.runs.get(run.run_id) is not run or run.run_id in self._closing_runs:
+            raise StateConflict("run control boundary is closing")
+        if (run.control_actor is not None and run.control_journal is not None
+                and run.control_secrets is not None):
+            return run.control_actor, run.control_journal, run.control_secrets
+        prepared: list[tuple[SQLiteControlJournal, SecretStore, int]] = []
+
+        def prepare():
+            prepared.append(_prepare_control(self, run))
+
+        try:
+            await run_blocking(prepare)
+            if self.runs.get(run.run_id) is not run or run.run_id in self._closing_runs:
+                raise StateConflict("run control boundary closed during initialization")
+            return self._ensure_control(run, prepared=prepared[0])
+        except BaseException:
+            if prepared and run.control_journal is not prepared[0][0]:
+                await run_blocking(prepared[0][0].close)
+            raise
 
 
 def _decision_request_from_event(
@@ -302,13 +349,13 @@ def _reconcile_decision_requests(
     return appended
 
 
-def _record_decision_request(self, run: Run, ev: Event) -> None:
+async def _record_decision_request(self, run: Run, ev: Event) -> None:
     request = self._decision_request_from_event(run, ev)
     if request is None:
         return
     try:
-        _actor, journal, _secrets = self._ensure_control(run)
-        journal.append_decision_request(request)
+        _actor, journal, _secrets = await self._ensure_control_async(run)
+        await run_blocking(journal.append_decision_request, request)
     except Exception:
         LOG.exception(
             "failed to journal decision request %s", request.request_id)
@@ -364,7 +411,7 @@ async def _post_control_serialized(
             "detail": "runtime shutdown is incomplete",
             "code": "runtime_shutdown_incomplete",
         }
-    actor, journal, secrets = self._ensure_control(run)
+    actor, journal, secrets = await self._ensure_control_async(run)
     requested_id = str(body.get("command_id") or "").strip()
     existing = journal.get_command(requested_id) if requested_id else None
 
@@ -395,7 +442,7 @@ async def _post_control_serialized(
         or (raw_action in {"answer", "submit"} and bool(raw_request_id))
     )
     if is_decision_answer:
-        decision_status = _decision_status_with_reconcile(raw_request_id)
+        decision_status = await run_blocking(_decision_status_with_reconcile, raw_request_id)
         if decision_status is None:
             raise ControlPayloadError(
                 f"unknown decision request: {raw_request_id}")
@@ -404,13 +451,14 @@ async def _post_control_serialized(
                 f"decision {raw_request_id!r} is already {decision_status.value}")
 
     command = compile_control_command(
-        run_id, body, secrets=secrets, existing_command=existing)
+        run_id, body, secrets=secrets, existing_command=existing,
+        actor=str(body.get("actor") or "operator"))
     if existing is None:
         existing = journal.get_command(command.command_id)
 
     request_id = str(command.payload.get("request_id") or "").strip()
     if command.action is ControlAction.ANSWER_DECISION:
-        decision_status = _decision_status_with_reconcile(request_id)
+        decision_status = await run_blocking(_decision_status_with_reconcile, request_id)
         if decision_status is None:
             raise ControlPayloadError(f"unknown decision request: {request_id}")
         if decision_status is not DecisionStatus.OPEN and existing is None:
@@ -428,7 +476,8 @@ async def _post_control_serialized(
             and bool(getattr(run.bus, "_closed", False))):
         # Finished buses are closed; make receipt events visible before the actor
         # emits them and before the standby worker starts.
-        self._fresh_bus(run)
+        self._fresh_bus(run, durable_seq=await run_blocking(
+                run.store.last_stream_seq, run.run_id))
 
     receipt = await (
         actor.submit_and_wait(command)
@@ -457,12 +506,12 @@ async def _post_control_serialized(
     return result
 
 
-def control_receipt(self, run_id: str, command_id: str) -> Optional[dict[str, Any]]:
+async def control_receipt(self, run_id: str, command_id: str) -> Optional[dict[str, Any]]:
     """Return a safe durable receipt projection for crash/event reconciliation."""
     run = self.runs.get(run_id)
     if run is None:
         return None
-    _actor, journal, _secrets = self._ensure_control(run)
+    _actor, journal, _secrets = await self._ensure_control_async(run)
     command = journal.get_command(str(command_id or ""))
     if command is None:
         return None

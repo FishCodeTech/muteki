@@ -9,14 +9,17 @@ from __future__ import annotations
 
 import plistlib
 import time
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
 from muteki.capability_management import enabled as capability_enabled
+from muteki.conversation.orchestration import missing_subagent_tools
 
 COMPUTER = "computer-use"
 BROWSER = "browser"
 VISUALIZE = "visualize"
+ORCHESTRATE = "orchestrate"
 _PREFIX = "component:"
 _APP_PREFIX = f"{_PREFIX}{COMPUTER}:app:"
 _SOURCE = "Muteki 内置"
@@ -73,12 +76,25 @@ def mac_app_inventory() -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
     return listed, errors
 
 
-def _availability(component: str, engine: str, *, gateway: bool) -> tuple[bool, str, str]:
+def _availability(component: str, engine: str, *, gateway: bool, control: bool,
+                  session_tools: Collection[str]) -> tuple[bool, str, str]:
     if component == VISUALIZE:
         return True, "", ""
     if not gateway:
         return (False, "当前 Runtime 未接入 Muteki 工具网关，无法使用该内置工具",
                 "请改用已接入 Muteki 工具网关的 Agent")
+    if component == ORCHESTRATE:
+        # muteki_subagent_* are platform tools; the gateway strips them when either switch is off
+        # and lists only the tools in the Thread binding.
+        if not control:
+            return False, "Muteki 平台工具已停用，当前会话没有子代理工具", "在设置 → Agent 扩展中启用 Muteki 平台工具"
+        if not capability_enabled("mcp", "muteki-control"):
+            return (False, "muteki-control 已在能力管理中停用，当前会话没有子代理工具",
+                    "在设置 → 能力管理中启用 muteki-control")
+        missing = missing_subagent_tools(session_tools)
+        if missing:
+            return (False, f"当前会话的 Thread 授权未包含子代理工具：{'、'.join(missing)}",
+                    "在设置 → 能力管理的 Thread 授权中加回这些工具")
     if component == COMPUTER:
         from muteki.conversation.computer_control import server_status
         if not capability_enabled("mcp", COMPUTER):
@@ -89,9 +105,10 @@ def _availability(component: str, engine: str, *, gateway: bool) -> tuple[bool, 
     return True, "", ""
 
 
-def _row(component: str, *, engine: str, gateway: bool, name: str, description: str,
-         item_id: str = "", target: dict[str, str] | None = None) -> dict[str, Any]:
-    invocable, reason, alternative = _availability(component, engine, gateway=gateway)
+def _row(component: str, *, engine: str, gateway: bool, control: bool, session_tools: Collection[str],
+         name: str, description: str, item_id: str = "", target: dict[str, str] | None = None) -> dict[str, Any]:
+    invocable, reason, alternative = _availability(
+        component, engine, gateway=gateway, control=control, session_tools=session_tools)
     row: dict[str, Any] = {
         "id": item_id or f"{_PREFIX}{component}",
         "kind": "component",
@@ -116,21 +133,25 @@ def _row(component: str, *, engine: str, gateway: bool, name: str, description: 
     return row
 
 
-def _app_row(app: dict[str, str], *, engine: str, gateway: bool) -> dict[str, Any]:
-    return _row(COMPUTER, engine=engine, gateway=gateway, name=app["name"],
-                description=f"用电脑操控本机应用 · {app['bundle_id']}",
+def _app_row(app: dict[str, str], *, engine: str, gateway: bool, control: bool,
+             session_tools: Collection[str]) -> dict[str, Any]:
+    return _row(COMPUTER, engine=engine, gateway=gateway, control=control, session_tools=session_tools,
+                name=app["name"], description=f"用电脑操控本机应用 · {app['bundle_id']}",
                 item_id=f"{_APP_PREFIX}{app['bundle_id']}", target=app)
 
 
-def component_rows(engine: str, *, gateway: bool, query: str = "", include_apps: bool = True,
+def component_rows(engine: str, *, gateway: bool, control: bool, session_tools: Collection[str],
+                   query: str = "", include_apps: bool = True,
                    errors: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     rows = [
-        _row(COMPUTER, engine=engine, gateway=gateway, name="电脑操控 Computer Use",
-             description="让 Agent 操作这台 Mac；输入应用名可指定目标应用"),
-        _row(BROWSER, engine=engine, gateway=gateway, name="Muteki 浏览器 Browser",
-             description="让 Agent 使用右侧内置浏览器打开、读取和操作网页"),
-        _row(VISUALIZE, engine=engine, gateway=gateway, name="Visualize 图形展示",
-             description="让 Agent 用 muteki-visualize 输出可交互图形"),
+        _row(COMPUTER, engine=engine, gateway=gateway, control=control, session_tools=session_tools,
+             name="电脑操控 Computer Use", description="让 Agent 操作这台 Mac；输入应用名可指定目标应用"),
+        _row(BROWSER, engine=engine, gateway=gateway, control=control, session_tools=session_tools,
+             name="Muteki 浏览器 Browser", description="让 Agent 使用右侧内置浏览器打开、读取和操作网页"),
+        _row(VISUALIZE, engine=engine, gateway=gateway, control=control, session_tools=session_tools,
+             name="Visualize 图形展示", description="让 Agent 用 muteki-visualize 输出可交互图形"),
+        _row(ORCHESTRATE, engine=engine, gateway=gateway, control=control, session_tools=session_tools,
+             name="编排 Orchestrate", description="先定义验收条件，按任务选择模型，委派可观测子代理并独立验收"),
     ]
     needle = query.casefold().strip()
     if include_apps and needle:
@@ -139,7 +160,8 @@ def component_rows(engine: str, *, gateway: bool, query: str = "", include_apps:
             errors.extend(app_errors)
         matched = [app for app in apps
                    if needle in app["name"].casefold() or needle in app["bundle_id"].casefold()]
-        rows.extend(_app_row(app, engine=engine, gateway=gateway) for app in matched[:_APP_ROWS_LIMIT])
+        rows.extend(_app_row(app, engine=engine, gateway=gateway, control=control, session_tools=session_tools)
+                    for app in matched[:_APP_ROWS_LIMIT])
     return rows
 
 
@@ -147,16 +169,18 @@ def is_component_id(item_id: str) -> bool:
     return item_id.startswith(_PREFIX)
 
 
-def resolve_component(item_id: str, *, engine: str, gateway: bool) -> dict[str, Any]:
+def resolve_component(item_id: str, *, engine: str, gateway: bool, control: bool,
+                      session_tools: Collection[str]) -> dict[str, Any]:
     if item_id.startswith(_APP_PREFIX):
         bundle_id = item_id.removeprefix(_APP_PREFIX)
         apps, _ = mac_app_inventory()
         app = next((candidate for candidate in apps if candidate["bundle_id"] == bundle_id), None)
         if app is None:
             raise BuiltinComponentError(f"本机未找到应用 {bundle_id}，请重新选择目标应用")
-        row = _app_row(app, engine=engine, gateway=gateway)
+        row = _app_row(app, engine=engine, gateway=gateway, control=control, session_tools=session_tools)
     else:
-        rows = {row["id"]: row for row in component_rows(engine, gateway=gateway, include_apps=False)}
+        rows = {row["id"]: row for row in component_rows(
+            engine, gateway=gateway, control=control, session_tools=session_tools, include_apps=False)}
         row = rows.get(item_id)
         if row is None:
             raise BuiltinComponentError("所选内置工具不存在，请重新选择")
@@ -188,6 +212,11 @@ def component_instruction(items: list[dict[str, Any]]) -> str:
             "电脑操控或 curl 代替。工具返回 chat.browser.* 错误时如实报告。")
     if VISUALIZE in selected:
         lines.append("- Visualize：本轮回答用 muteki-visualize 围栏输出图形或交互界面，遵循 [Muteki 聊天展示接口] 的约定。")
+    if ORCHESTRATE in selected:
+        lines.append(
+            "- 编排 Orchestrate：本轮按 [Muteki 聊天编排 Orchestrate] 工作。先写验收条件，"
+            "通过 muteki_subagent_runtimes 选择真实接入，再用 muteki_spawn_subagent 委派；"
+            "独立验证结果后才接受。任务很小时直接完成，不强制拆分。")
     return "\n".join(lines)
 
 

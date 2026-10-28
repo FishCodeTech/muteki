@@ -7,7 +7,7 @@ import { useSettingsHost } from "./SettingsHost";
 // Every registered page has exactly one shared loader. No Next imports cross this boundary.
 export const SETTINGS_LOADERS: Record<SettingsPageId, ComponentType> = {
   appearance: lazy(async () => { const { AppearanceSettings } = await import("./AppearanceSettings"); return {default: function Appearance() { return <AppearanceSettings />; }}; }),
-  chat: lazy(async () => { const { ChatSettings } = await import("./ChatSettings"); return {default: function Chat() { const host = useSettingsHost(); return <ChatSettings navigate={href => host.navigation.router.push(href)} />; }}; }),
+  chat: lazy(async () => { const { ChatSettings } = await import("./ChatSettings"); return {default: function Chat() { return <ChatSettings />; }}; }),
   notifications: lazy(() => import("./NotificationsSettings").then(m => ({default: m.NotificationsSettings}))),
   shortcuts: lazy(() => import("./ShortcutsSettings").then(m => ({default: m.ShortcutsSettings}))),
   agents: lazy(async () => { const { AgentsSettings } = await import("./agents/AgentsSettings"); return {default: function Agents() { const host = useSettingsHost(); return <div className="cx-settings-agents"><AgentsSettings navigation={host.navigation} /></div>; }}; }),

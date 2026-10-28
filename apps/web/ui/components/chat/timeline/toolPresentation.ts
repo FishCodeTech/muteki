@@ -13,7 +13,25 @@ export type ToolKind =
   | "agent"
   | "other";
 
-export type PresentableTool = ToolItem & { isAgent?: boolean };
+/**
+ * A runtime's own parse of a shell command (Codex app-server
+ * `commandActions`), so a read is labeled from the runtime instead of by
+ * re-parsing the command text.
+ */
+export interface ToolCommandAction {
+  type: string;
+  command?: string;
+  name?: string;
+  path?: string | null;
+  query?: string | null;
+}
+
+export type PresentableTool = ToolItem & {
+  isAgent?: boolean;
+  commandActions?: ToolCommandAction[];
+  /** MCP server that owns the call, when the runtime names it. */
+  mcpServer?: string;
+};
 
 export interface ToolEditStat {
   additions: number;
@@ -40,7 +58,15 @@ const ICON_HINT: Record<string, ToolKind> = {
   think: "think",
 };
 
+export function unqualifiedToolName(name: string): string {
+  const normalized = name.toLowerCase();
+  return normalized.split(/__+|[./:]/).at(-1) || normalized;
+}
+
 export function toolKind(tool: PresentableTool): ToolKind {
+  // Gateway controls are tool calls; persisted child nodes represent subagents.
+  if (unqualifiedToolName(tool.name).startsWith("muteki_")) return "mcp";
+  if (tool.mcpServer) return "mcp";
   const hinted = tool.icon ? ICON_HINT[tool.icon] : undefined;
   if (hinted) return hinted;
   const name = tool.name.toLowerCase();
@@ -485,6 +511,316 @@ export function formatElapsedClock(ms: number): string {
   const seconds = total % 60;
   const pad = (value: number) => String(value).padStart(2, "0");
   return hours ? `${hours}:${pad(minutes)}:${pad(seconds)}` : `${minutes}:${pad(seconds)}`;
+}
+
+export type ToolActivityCategory = "tool" | "edit" | "explore" | "command" | "web" | "browse";
+
+export interface ToolActivityPart {
+  text: string;
+  tone?: "verb" | "mono";
+}
+
+/** One line of a turn's work log ("已读取 a.ts", "已运行 npm test"). */
+export interface ToolActivityRow {
+  key: string;
+  category: ToolActivityCategory;
+  parts: ToolActivityPart[];
+  /** Full path or command behind a shortened detail. */
+  title?: string;
+  /** What expanding the row reveals inline; other rows open the details drawer. */
+  body?: "output" | "diff";
+  additions?: number;
+  deletions?: number;
+}
+
+/** Muteki gateway tools: [verb, object] → "正在查询 Muteki 项目" / "已查询 Muteki 项目". */
+const MUTEKI_ACTIVITY: Record<string, [string, string]> = {
+  muteki_list_projects: ["查询", "Muteki 项目"],
+  muteki_list_threads: ["查询", "Muteki 对话"],
+  muteki_list_tasks: ["查询", "单题任务"],
+  muteki_get_task: ["读取", "单题任务"],
+  muteki_list_runs: ["查询", "Run 列表"],
+  muteki_get_command_receipt: ["核对", "控制命令结果"],
+  muteki_create_task: ["创建", "单题任务"],
+  muteki_dispatch_challenge: ["下发", "CTF 单题任务"],
+  muteki_create_run: ["创建", "Run"],
+  muteki_start_swarm: ["启动", "Coordinator"],
+  muteki_resolve_run: ["汇总", "Run 结果"],
+  muteki_get_run_snapshot: ["读取", "Run 快照"],
+  muteki_read_run_events: ["读取", "Run 事件"],
+  muteki_wait_run: ["等待", "Run 进展"],
+  muteki_read_shared_graph: ["读取", "Run 共享图"],
+  muteki_pause_run: ["暂停", "Run"],
+  muteki_resume_run: ["恢复", "Run"],
+  muteki_stop_run: ["停止", "Run"],
+  muteki_send_operator_directive: ["发送", "Operator 指令"],
+  muteki_add_run_context: ["注入", "Run 上下文"],
+  muteki_spawn_run_worker: ["增加", "Worker"],
+  muteki_cancel_run_worker: ["取消", "Worker"],
+};
+
+const EXPLORE_ACTIONS = new Set(["read", "listFiles", "search"]);
+
+function pathBase(path: string): string {
+  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  return normalized.split("/").filter(Boolean).at(-1) || path;
+}
+
+function verbPart(active: boolean, verb: string): ToolActivityPart {
+  return { text: `${active ? "正在" : "已"}${verb}`, tone: "verb" };
+}
+
+function exploreRow(key: string, action: ToolCommandAction, active: boolean): ToolActivityRow {
+  const path = String(action.path || "").trim();
+  const query = String(action.query || "").trim();
+  const title = path || action.command || undefined;
+  if (action.type === "read") {
+    const name = String(action.name || "").trim() || (path ? pathBase(path) : "");
+    return {
+      key, category: "explore", title,
+      parts: name ? [verbPart(active, "读取"), { text: " " }, { text: name, tone: "mono" }] : [verbPart(active, "读取"), { text: "文件" }],
+    };
+  }
+  if (action.type === "listFiles") {
+    return {
+      key, category: "explore", title,
+      parts: path
+        ? [verbPart(active, "列出"), { text: " " }, { text: compact(path, 80), tone: "mono" }, { text: " 中的文件" }]
+        : [verbPart(active, "列出"), { text: "文件" }],
+    };
+  }
+  const quoted = query ? `“${compact(query, 80)}”` : "";
+  if (path && quoted) {
+    return {
+      key, category: "explore", title,
+      parts: [{ text: active ? "正在" : "已在", tone: "verb" }, { text: " " }, { text: compact(path, 80), tone: "mono" }, { text: ` 中搜索${quoted}` }],
+    };
+  }
+  return {
+    key, category: "explore", title,
+    parts: quoted
+      ? [{ text: active ? "正在搜索" : "已对", tone: "verb" }, { text: active ? quoted : `${quoted}进行搜索` }]
+      : [verbPart(active, "搜索"), { text: "文件" }],
+  };
+}
+
+function editVerb(tool: PresentableTool, args: Record<string, unknown>): string {
+  const kinds = new Set(changeEntries(args).map((entry) => entry.kind));
+  if (kinds.size === 1) {
+    if (kinds.has("add") || kinds.has("create") || kinds.has("added")) return "创建";
+    if (kinds.has("delete") || kinds.has("deleted") || kinds.has("remove")) return "删除";
+  }
+  const name = tool.name.toLowerCase();
+  return name.includes("create") || (name.includes("write") && !name.includes("edit")) ? "创建" : "编辑";
+}
+
+/**
+ * Work-log rows for one call, worded the way Codex words its turn activity.
+ * A shell command the runtime parsed into reads, listings and searches shows
+ * one exploration row per action instead of the raw command.
+ */
+export function toolActivityRows(tool: PresentableTool): ToolActivityRow[] {
+  const kind = toolKind(tool);
+  const active = tool.status === "running" || tool.status === "pending";
+  const args = parseToolArgs(tool.argsSummary);
+  switch (kind) {
+    case "command": {
+      const actions = (tool.commandActions || []).filter((action) => action && typeof action.type === "string");
+      if (actions.length && actions.every((action) => EXPLORE_ACTIONS.has(action.type))) {
+        return actions.map((action, index) => exploreRow(`${tool.id}:${index}`, action, active));
+      }
+      const full = stripCommandWrapper(firstOf(args, ["command", "cmd", "shell_command", "script", "input"]));
+      const verb = active ? "正在运行"
+        : tool.status === "declined" ? "已拒绝运行"
+          : tool.status === "cancelled" ? "已停止" : "已运行";
+      return [{
+        key: tool.id, category: "command", body: "output", title: full || undefined,
+        parts: full
+          ? [{ text: verb, tone: "verb" }, { text: " " }, { text: compact(full), tone: "mono" }]
+          : [{ text: `${verb}命令`, tone: "verb" }],
+      }];
+    }
+    case "read":
+      return [exploreRow(tool.id, { type: "read", path: firstOf(args, PATH_KEYS) }, active)];
+    case "list":
+      return [exploreRow(tool.id, { type: "listFiles", path: firstOf(args, [...PATH_KEYS, "directory", "dir", "cwd"]) }, active)];
+    case "search":
+      return [exploreRow(tool.id, {
+        type: "search",
+        query: firstOf(args, ["query", "pattern", "regex", "search", "q", "glob_pattern", "glob"]),
+        path: firstOf(args, ["path", "directory"]),
+      }, active)];
+    case "edit": {
+      const stat = toolEditStat(tool, kind);
+      const paths = stat?.paths ?? [];
+      const target = paths.length === 1 ? pathBase(paths[0]) : paths.length ? `${paths.length} 个文件` : "文件";
+      return [{
+        key: tool.id, category: "edit", title: paths.join("\n") || undefined,
+        body: toolEditLines(tool, kind) ? "diff" : undefined,
+        additions: stat?.additions, deletions: stat?.deletions,
+        parts: [verbPart(active, editVerb(tool, args)), { text: " " }, { text: target, tone: paths.length === 1 ? "mono" : undefined }],
+      }];
+    }
+    case "browser": {
+      if (isWebSearchTool(tool, kind)) {
+        const query = firstOf(args, ["query", "search_term", "q"]);
+        return [{
+          key: tool.id, category: "web",
+          parts: [{ text: active ? "正在搜索网页" : "已搜索网页", tone: "verb" }, ...(query ? [{ text: `：${compact(query, 80)}` }] : [])],
+        }];
+      }
+      const url = firstOf(args, ["url", "href", "uri"]);
+      const pattern = firstOf(args, ["pattern"]);
+      if (pattern && tool.name.toLowerCase().includes("find_in_page")) {
+        return [{
+          key: tool.id, category: "browse", title: url || undefined,
+          parts: [{ text: active ? "正在页面中查找" : "已在页面中查找", tone: "verb" }, { text: `“${compact(pattern, 60)}”` }],
+        }];
+      }
+      return [{
+        key: tool.id, category: "browse", title: url || undefined,
+        parts: url ? [verbPart(active, "浏览"), { text: " " }, { text: compact(readableUrl(url), 80), tone: "mono" }] : [verbPart(active, "浏览"), { text: "网页" }],
+      }];
+    }
+    case "mcp": {
+      const unqualified = unqualifiedToolName(tool.name);
+      const muteki = MUTEKI_ACTIVITY[unqualified];
+      if (muteki) return [{ key: tool.id, category: "tool", parts: [verbPart(active, muteki[0]), { text: ` ${muteki[1]}` }] }];
+      const label = tool.mcpServer && !tool.name.includes("__") ? `${tool.mcpServer} · ${tool.name}` : prettyMcpName(tool.name);
+      return [{ key: tool.id, category: "tool", parts: [verbPart(active, "调用"), { text: " " }, { text: label, tone: "mono" }] }];
+    }
+    case "agent": {
+      const description = toolArgSummary(tool, kind);
+      return [{ key: tool.id, category: "tool", parts: [verbPart(active, "委派"), { text: "子 Agent" }, ...(description ? [{ text: `：${description}` }] : [])] }];
+    }
+    case "think":
+      return [{ key: tool.id, category: "tool", parts: [verbPart(active, "思考")] }];
+    case "other":
+      return [{ key: tool.id, category: "tool", parts: [verbPart(active, "调用"), { text: " " }, { text: tool.name, tone: "mono" }] }];
+    default: {
+      const exhaustive: never = kind;
+      return exhaustive;
+    }
+  }
+}
+
+/** A web search call, whose results render as source chips under its row. */
+export function isWebSearchTool(tool: PresentableTool, kind = toolKind(tool)): boolean {
+  return kind === "browser" && tool.name.toLowerCase().includes("search");
+}
+
+const PAGE_READ_MARKERS = ["fetch", "open_page", "open_url", "read_url", "read_page", "find_in_page"];
+
+/**
+ * Looking things up on the web: searches and the result pages opened to read
+ * them. Browser automation (navigate, click, screenshot) is not research.
+ */
+export function isWebResearchTool(tool: PresentableTool, kind = toolKind(tool)): boolean {
+  return isWebSearchTool(tool, kind) || (kind === "browser" && hasMarker(tool.name.toLowerCase(), PAGE_READ_MARKERS));
+}
+
+/** "https://www.nhm.ac.uk/discover/x" → "nhm.ac.uk/discover/x". */
+function readableUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const path = parsed.pathname.replace(/\/+$/, "");
+    return `${parsed.hostname.replace(/^www\./, "")}${path}`;
+  } catch {
+    return url;
+  }
+}
+
+export interface WebSource {
+  url: string;
+  title?: string;
+}
+
+const RESULT_LIST_KEYS = ["results", "sources", "items", "organic", "web", "links", "urls"];
+const URL_PATTERN = /https?:\/\/[^\s"'<>()\]]+/g;
+
+function webSourceOf(value: unknown): WebSource | null {
+  if (typeof value === "string") return /^https?:\/\//.test(value) ? { url: value } : null;
+  if (!value || typeof value !== "object") return null;
+  const row = value as Record<string, unknown>;
+  const url = firstOf(row, ["url", "link", "href", "uri"]);
+  if (!/^https?:\/\//.test(url)) return null;
+  const title = firstOf(row, ["title", "name", "site_name"]);
+  return title ? { url, title } : { url };
+}
+
+/**
+ * Result pages of a web search call: a JSON list (bare, or under results /
+ * sources / items …) of URLs or { url, title } records, else every URL the
+ * output text mentions.
+ */
+export function toolWebSources(tool: PresentableTool): WebSource[] {
+  const raw = String(tool.outputSummary || "").trim();
+  if (!raw) return [];
+  let list: unknown[] | null = null;
+  if (raw.startsWith("{") || raw.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (Array.isArray(parsed)) list = parsed;
+      else if (parsed && typeof parsed === "object") {
+        const row = parsed as Record<string, unknown>;
+        const key = RESULT_LIST_KEYS.find((name) => Array.isArray(row[name]));
+        if (key) list = row[key] as unknown[];
+      }
+    } catch {
+      list = null;
+    }
+  }
+  const candidates = list ? list.map(webSourceOf) : [...raw.matchAll(URL_PATTERN)].map((match) => ({ url: match[0].replace(/[.,;:]+$/, "") }));
+  const seen = new Set<string>();
+  const out: WebSource[] = [];
+  for (const source of candidates) {
+    if (!source || seen.has(source.url)) continue;
+    seen.add(source.url);
+    out.push(source);
+  }
+  return out;
+}
+
+export function toolActivityText(row: ToolActivityRow): string {
+  return row.parts.map((part) => part.text).join("");
+}
+
+const ACTIVITY_ORDER: ToolActivityCategory[] = ["tool", "edit", "explore", "command", "web", "browse"];
+
+const ACTIVITY_PHRASE: Record<ToolActivityCategory, (count: number, leading: boolean) => string> = {
+  tool: (n) => (n === 1 ? "调用了一个工具" : "调用了工具"),
+  edit: (n, leading) => (n === 1 ? "编辑了一个文件" : leading ? "编辑了文件" : "编辑了多个文件"),
+  explore: (_, leading) => (leading ? "已读取文件" : "读取文件"),
+  command: () => "运行了命令",
+  web: (_, leading) => (leading ? "已搜索网页" : "搜索了网页"),
+  browse: (n, leading) => (leading ? `已浏览 ${n} 个网页` : `浏览了 ${n} 个网页`),
+};
+
+let unitListFormat: Intl.ListFormat | null | undefined;
+
+function joinUnits(parts: string[]): string {
+  if (unitListFormat === undefined) {
+    try {
+      unitListFormat = new Intl.ListFormat("zh-CN", { type: "unit" });
+    } catch {
+      unitListFormat = null;
+    }
+  }
+  return unitListFormat ? unitListFormat.format(parts) : parts.join("");
+}
+
+/** Group header in Codex's fixed category order: "已读取文件运行了命令". */
+export function summarizeToolActivity(rows: ToolActivityRow[]): string {
+  const counts = new Map<ToolActivityCategory, number>();
+  for (const row of rows) counts.set(row.category, (counts.get(row.category) ?? 0) + 1);
+  const present = ACTIVITY_ORDER.filter((category) => counts.has(category));
+  return joinUnits(present.map((category, index) => ACTIVITY_PHRASE[category](counts.get(category) ?? 0, index === 0)));
+}
+
+/** Leading bold line of a reasoning summary ("**Inspecting files**"), Codex's live thinking title. */
+export function reasoningSummaryTitle(text: string): string {
+  const match = /^\s*\*\*([^*\n]+?)\*\*/.exec(text || "");
+  return match ? match[1].trim() : "";
 }
 
 export function toolOutputText(tool: PresentableTool): string {

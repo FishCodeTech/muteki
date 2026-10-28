@@ -175,7 +175,7 @@ class _DispatchReasonMixin:
                             continue
                         engine = matches[0]
                     else:
-                        engine = requested or self._pick_engine(
+                        engine = requested or await self._pick_engine(
                             running_engines_fn(), healthy, role="bootstrap"
                         )
                 except RuntimeError as exc:
@@ -220,7 +220,7 @@ class _DispatchReasonMixin:
                     )
                     continue
                 try:
-                    w = self._make_cli_worker(engine, mode="bootstrap")
+                    w = await self._make_cli_worker(engine, mode="bootstrap")
                 except WorkerSpawnRejected as exc:
                     _ack(
                         cmd,
@@ -361,7 +361,7 @@ class _DispatchReasonMixin:
                             p.get("reason") or p.get("text") or e.get("reason") or ""
                         ).strip()
                         if r:
-                            deadends.append(r[:160])
+                            deadends.append(r)
             except Exception:
                 deadends = []
         head = (
@@ -377,7 +377,7 @@ class _DispatchReasonMixin:
             "probes."
         )
         if deadends:
-            body = "\n".join(f"  - {d}" for d in deadends[-12:])
+            body = "\n".join(f"  - {d}" for d in deadends)
             return (
                 f"{head}\n\nAlready ruled out (do NOT retry these — pick "
                 f"something else):\n{body}"
@@ -453,9 +453,9 @@ class _DispatchReasonMixin:
                         "resource_key": resource_key,
                         "from_facts": list(r.get("from_facts") or []),
                         "depends_on": [] if ctf_mode else list(r.get("depends_on") or []),
-                        "expected_observable": str(r.get("expected_observable") or "") if not ctf_mode or getattr(self.challenge, "mode", "ctf") == "pentest" else "",
-                        "stop_condition": str(r.get("stop_condition") or "") if not ctf_mode or getattr(self.challenge, "mode", "ctf") == "pentest" else "",
-                        "coverage_key": str(r.get("coverage_key") or "") if not ctf_mode or getattr(self.challenge, "mode", "ctf") == "pentest" else "",
+                        "expected_observable": str(r.get("expected_observable") or ""),
+                        "stop_condition": str(r.get("stop_condition") or ""),
+                        "coverage_key": str(r.get("coverage_key") or ""),
                         "required_pocs": list(r.get("required_pocs") or []),
                         "requires_capabilities": [] if ctf_mode else list(
                             r.get("requires_capabilities") or []),
@@ -478,6 +478,8 @@ class _DispatchReasonMixin:
         )
 
     def _reason_backpressure_active(self, open_intents: list[dict]) -> bool:
+        if self._worker_concurrency_unlimited():
+            return False
         return self._ordinary_open_queue_depth(open_intents) >= max(
             1, 2 * self._ordinary_capacity_limit()
         )
@@ -502,8 +504,10 @@ class _DispatchReasonMixin:
         # max_workers is the one run-wide concurrency ceiling.  Review and
         # verifier processes consume the same capacity; role-specific limits below
         # may narrow it further but can never expand it.
-        configured = int(self.max_workers)
         return max(0, int(self.max_workers))
+
+    def _worker_concurrency_unlimited(self) -> bool:
+        return self._ordinary_capacity_limit() == 0
 
     def _total_active_count(self, tasks: Optional[dict] = None) -> int:
         # _live_solvers includes workers constructed before their asyncio task is
@@ -515,6 +519,8 @@ class _DispatchReasonMixin:
         return max(live, scheduled)
 
     def _total_free_slots(self, tasks: Optional[dict] = None) -> int:
+        if self._worker_concurrency_unlimited():
+            return 0
         return max(
             0, self._ordinary_capacity_limit() - self._total_active_count(tasks))
 
@@ -525,13 +531,16 @@ class _DispatchReasonMixin:
         return self._ordinary_free_slots(tasks)
 
     def _ordinary_capacity_available(self, tasks: dict) -> bool:
-        return self._ordinary_free_slots(tasks) > 0
+        return (
+            self._worker_concurrency_unlimited()
+            or self._ordinary_free_slots(tasks) > 0
+        )
 
     def _review_capacity_available(self, tasks: Optional[dict] = None) -> bool:
+        review_limit = int(self.review_policy.get("max_concurrent") or 0)
         return (
-            self._total_free_slots(tasks) > 0
-            and self._active_review_count() < int(
-                self.review_policy.get("max_concurrent") or 1)
+            (self._worker_concurrency_unlimited() or self._total_free_slots(tasks) > 0)
+            and (review_limit == 0 or self._active_review_count() < review_limit)
         )
 
     def _pending_verification_count(self) -> int:
@@ -560,6 +569,8 @@ class _DispatchReasonMixin:
             configured = 0
         if configured > 0:
             return max(1, min(configured, pending))
+        if self._worker_concurrency_unlimited():
+            return pending
         auto_cap = max(1, self._ordinary_capacity_limit() // 3)
         return min(pending, auto_cap)
 
@@ -574,9 +585,12 @@ class _DispatchReasonMixin:
             and not self.verifier_policy.get("enabled", True)
         ):
             return False
-        if self._total_free_slots(tasks) <= 0:
+        if (
+            not self._worker_concurrency_unlimited()
+            and self._total_free_slots(tasks) <= 0
+        ):
             return False
-        if self._verifier_workers_spawned >= int(
+        if not self._worker_concurrency_unlimited() and self._verifier_workers_spawned >= int(
                 self.verifier_policy.get("max_verifier_workers") or 24):
             return False
         return self._active_verifier_count() < self._verifier_concurrency_cap()
@@ -646,7 +660,7 @@ class _DispatchReasonMixin:
             raw_ops = note.get("operations")
             if isinstance(raw_ops, list):
                 draft_receipts = [
-                    row for row in raw_ops[:32] if isinstance(row, dict)
+                    row for row in raw_ops if isinstance(row, dict)
                 ]
             break
         return {
@@ -672,7 +686,7 @@ class _DispatchReasonMixin:
             ),
             "parse_detail": str(
                 getattr(diagnostics, "parse_detail", "") or ""
-            )[:500],
+            ),
             "raw_intent_count": int(
                 getattr(diagnostics, "raw_intent_count", 0) or 0
             ),
@@ -686,6 +700,207 @@ class _DispatchReasonMixin:
                 getattr(diagnostics, "output_tokens", 0) or 0
             ),
         }
+
+    def _challenger_task_pending(self) -> bool:
+        task = getattr(self, "_challenger_task", None)
+        return task is not None and not task.done()
+
+    async def _reap_challenger_task(self) -> None:
+        """Observe a finished parallel challenger without touching Decide state."""
+        task = getattr(self, "_challenger_task", None)
+        if task is None or not task.done():
+            return
+        self._challenger_task = None
+        try:
+            proposed_n = task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            await self._emit_coord_bb(
+                "challenger_failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return
+        if proposed_n:
+            await self._emit_coord_bb(
+                "challenger_committed",
+                proposed=int(proposed_n),
+            )
+
+    def _maybe_start_parallel_challenger(self, *, max_intents: int) -> None:
+        """Start one challenger beside Decide. Never occupies Decide's slot."""
+        if getattr(self.challenge, "mode", "ctf") not in {"ctf", "pentest"}:
+            return
+        if self.shared_graph is None or getattr(self, "_challenger_task", None) is not None:
+            return
+        try:
+            conn = getattr(self.shared_graph, "_conn", None)
+            lock = getattr(self.shared_graph, "_lock", None)
+            done_count = 0
+            if conn is not None and lock is not None:
+                with lock:
+                    row = conn.execute(
+                        "SELECT COUNT(*) FROM intents WHERE challenge_id=? "
+                        "AND status='done' AND dispatch_state!='retired'",
+                        (self.challenge.id,),
+                    ).fetchone()
+                    done_count = int(row[0] or 0) if row else 0
+            if getattr(self.challenge, "mode", "ctf") == "pentest":
+                progress_count = self._qualified_report_count()
+            else:
+                flags = set(self.shared_graph.snapshot().flags)
+                if self.challenge.platform_confirmation_required:
+                    flags.intersection_update(
+                        receipt.get("flag")
+                        for receipt in self.shared_graph.platform_verdicts()
+                        if receipt.get("status") in {"accepted", "duplicate"}
+                    )
+                progress_count = len(flags)
+            last_progress = self._challenger_last_progress_count
+            if progress_count > last_progress:
+                self._challenger_last_progress_count = progress_count
+                self._challenger_baseline_done = done_count
+                self._last_challenger_done_count = done_count
+            baseline_done = int(getattr(self, "_challenger_baseline_done", 0) or 0)
+            last_chal_done = int(getattr(self, "_last_challenger_done_count", 0) or 0)
+            if (
+                done_count - baseline_done < 6
+                or done_count - last_chal_done < 6
+            ):
+                return
+        except Exception:
+            return
+        self._challenger_task = asyncio.create_task(
+            self._run_challenger_pass(max_intents=max(1, int(max_intents)))
+        )
+        self._last_challenger_done_count = done_count
+
+    async def _run_challenger_pass(self, *, max_intents: int) -> int:
+        from muteki.solver.pi_decide import run_ctf_pi_reason
+
+        if self.shared_graph is None:
+            return 0
+        self.shared_graph.challenge = self.challenge
+        summary = self.shared_graph.to_reason_summary(
+            standing_guidance=list(getattr(self, "_standing_guidance", []) or []),
+        )
+        planner_profile = dict(
+            (getattr(self, "llm_profiles", {}) or {}).get("planner") or {}
+        )
+        endpoint_id = str(
+            planner_profile.get("endpoint_id")
+            or planner_profile.get("credential_id")
+            or ""
+        ).strip()
+        account_id = (
+            endpoint_id.split(":", 1)[1]
+            if endpoint_id.startswith(("endpoint:", "account:"))
+            else endpoint_id
+        )
+        state_base = Path(
+            getattr(self, "workspace_root", None)
+            or getattr(self, "worker_root", None)
+            or Path.cwd()
+        )
+        await self._emit_coord_bb(
+            "challenger_started", mode=getattr(self.challenge, "mode", "ctf"),
+        )
+        result = await run_ctf_pi_reason(
+            graph_summary=summary,
+            max_intents=max(1, int(max_intents)),
+            model=self.reason_model,
+            account_root=getattr(self, "credential_accounts_root", None),
+            account_id=account_id,
+            state_root=state_base / ".muteki-agent-state" / "challenger",
+            shared_graph=self.shared_graph,
+            mode=getattr(self.challenge, "mode", "ctf"),
+            cost=self.cost,
+            run_id=self.run_id,
+            challenge_id=self.challenge.id,
+            generation=getattr(self, "_execution_generation", None),
+            cost_budget_usd=self.cost_budget_usd,
+            reasoning_effort=str(
+                planner_profile.get("reasoning_effort") or "default"
+            ),
+            live_solvers=dict(getattr(self, "_live_solvers", {}) or {}),
+            challenger=True,
+            plugin_service=self.worker_plugins,
+        )
+        if result.planner_failure is not None:
+            await self._emit_coord_bb(
+                "challenger_failed", mode=getattr(self.challenge, "mode", "ctf"),
+                code=result.planner_failure.kind.value,
+                error=result.planner_failure.detail,
+            )
+            return 0
+        proposed = await self._apply_challenger_result(result)
+        await self._emit_coord_bb(
+            "challenger_finished", mode=getattr(self.challenge, "mode", "ctf"),
+            proposed=proposed,
+        )
+        return proposed
+
+    async def _apply_challenger_result(self, result: Any) -> int:
+        """Commit supersede and open_step onto the shared graph.
+
+        Bookkeeping stays off Decide's `_last_reason*` fields. Actor is
+        `challenger`, so the writes remain external planning input.
+        """
+        from muteki.solver.ctf_fgs import apply_ctf_decide_frontier
+        from muteki.solver.reason import dispatch_intents
+
+        if self.shared_graph is None:
+            return 0
+        for s_item in list(getattr(result, "supersede_facts", None) or []):
+            f_seq = int(s_item.get("fact_seq") or 0)
+            by_seq = s_item.get("by_fact_seq")
+            s_reason = str(s_item.get("reason") or "").strip()
+            self.shared_graph.supersede_fact(
+                actor="challenger",
+                fact_seq=f_seq,
+                reason=s_reason,
+                by_fact_seq=int(by_seq) if by_seq else None,
+            )
+            await self._emit_coord_bb(
+                "fact_superseded",
+                actor="challenger",
+                fact_seq=f_seq,
+                by_fact_seq=int(by_seq) if by_seq else None,
+                reason=s_reason,
+            )
+        for operation in list(getattr(result, "sub_goal_operations", None) or []):
+            try:
+                if operation["op"] == "add_sub_goal":
+                    self.shared_graph.add_sub_goal(
+                        actor="challenger",
+                        criterion=operation["criterion"],
+                        goal_id=operation["goal_id"],
+                    )
+                elif operation["op"] == "satisfy_goal":
+                    self.shared_graph.satisfy_sub_goal(
+                        actor="challenger",
+                        goal_id=operation["goal_id"],
+                        reason=operation["reason"],
+                        evidence_fact_seqs=operation["evidence_fact_seqs"],
+                    )
+            except ValueError as exc:
+                await self._emit_coord_bb(
+                    "reason_operation_rejected",
+                    actor="challenger",
+                    operation=str(operation.get("op") or ""),
+                    goal_id=str(operation.get("goal_id") or ""),
+                    reason_code="invalid_goal_reference",
+                    detail=str(exc),
+                )
+        apply_ctf_decide_frontier(result, self.shared_graph)
+        proposed = dispatch_intents(
+            self.shared_graph,
+            result,
+            actor="challenger",
+        )
+        for it in proposed:
+            self._summarize_intent_async(it["intent_id"], it["goal"])
+        return len(proposed)
 
     async def _run_reason(self, *, max_intents: int | None = None) -> int:
         """Reason phase: pro model reads the board, proposes intents. Returns the
@@ -793,6 +1008,8 @@ class _DispatchReasonMixin:
                 compact_cutoff_seq = 0
 
             def _render_graph_context() -> str:
+                if self.shared_graph is not None:
+                    self.shared_graph.challenge = self.challenge
                 return self.shared_graph.to_reason_summary(
                     standing_guidance=list(self._standing_guidance),
                     compact_summary=compact_summary,
@@ -897,19 +1114,53 @@ class _DispatchReasonMixin:
                     self, "_reason_max_intents_override", None
                 )
             planning_limit = self._ordinary_capacity_limit()
-            requested_intents = planning_limit if requested is None else int(requested)
-            requested_intents = max(
-                0,
-                min(planning_limit, requested_intents),
+            fgs_queue_cap = (
+                max(4, planning_limit)
+                if getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"} and planning_limit > 0
+                else planning_limit
             )
+            requested_intents = (
+                -1 if requested is None and self._worker_concurrency_unlimited()
+                else fgs_queue_cap if requested is None
+                else int(requested)
+            )
+            requested_intents = max(-1, requested_intents)
+            if fgs_queue_cap > 0:
+                requested_intents = (
+                    fgs_queue_cap if requested_intents < 0
+                    else min(fgs_queue_cap, requested_intents)
+                )
             ctf_pi_decide = (
                 getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
             )
+            ws_files_block = ""
+            if (
+                ctf_pi_decide
+                and hasattr(self.shared_graph, "decide_workspace_files_block")
+            ):
+                try:
+                    ws_files_block = self.shared_graph.decide_workspace_files_block(
+                        getattr(self, "workspace_root", None)
+                        or getattr(self, "worker_root", None)
+                    )
+                except Exception:
+                    ws_files_block = ""
 
             def _assemble_summary(graph_body: str) -> str:
-                if ctf_pi_decide:
-                    return graph_body
+                if (
+                    ctf_pi_decide
+                    and getattr(self.challenge, "mode", "ctf") == "ctf"
+                    and "id: fact_origin" in graph_body
+                ):
+                    value = graph_body
+                    if ws_files_block:
+                        value = f"{value}\n\n{ws_files_block}"
+                    if retry_context:
+                        value = f"{value}\n\n{retry_context}"
+                    return f"{value}\n\n请判断下一步,操作记入草稿后 commit。"
                 value = f"{task_context}\n\n{graph_body}"
+                if ws_files_block:
+                    value = f"{value}\n\n{ws_files_block}"
                 if retry_context:
                     value = f"{value}\n\n{retry_context}"
                 return value
@@ -970,7 +1221,7 @@ class _DispatchReasonMixin:
                 except Exception as exc:
                     await self._emit_coord_bb(
                         "reason_context_compact_failed",
-                        error=f"{type(exc).__name__}: {exc}"[:500],
+                        error=f"{type(exc).__name__}: {exc}",
                         tokens_before=tokens_before,
                     )
                     return False
@@ -1029,6 +1280,11 @@ class _DispatchReasonMixin:
                 "scope": (getattr(self.challenge, "scope", "") or None),
             }
 
+            if ctf_pi_decide:
+                self._maybe_start_parallel_challenger(
+                    max_intents=int(reason_args["max_intents"]),
+                )
+
             async def _call_reason() -> Any:
                 if not ctf_pi_decide:
                     return await run_reason(**reason_args)
@@ -1067,6 +1323,12 @@ class _DispatchReasonMixin:
                     challenge_id=self.challenge.id,
                     generation=getattr(self, "_execution_generation", None),
                     cost_budget_usd=self.cost_budget_usd,
+                    reasoning_effort=str(
+                        planner_profile.get("reasoning_effort") or "default"
+                    ),
+                    live_solvers=dict(getattr(self, "_live_solvers", {}) or {}),
+                    challenger=False,
+                    plugin_service=self.worker_plugins,
                 )
             # Context manifest for the assembled Reason prompt. Measurement-only;
             # a manifest failure must never break planning.
@@ -1076,6 +1338,7 @@ class _DispatchReasonMixin:
                         summary,
                         max_intents=int(reason_args["max_intents"]),
                         mode=getattr(self.challenge, "mode", "ctf"),
+                        challenger=False,
                     )
                     if ctf_pi_decide
                     else build_reason_prompt(
@@ -1094,11 +1357,7 @@ class _DispatchReasonMixin:
                     ),
                     "reason_summary": reason_summary_chars,
                 }
-                if ctf_pi_decide:
-                    section_chars["workspace_files"] = len(
-                        _ctf_workspace_files()
-                    )
-                else:
+                if not ctf_pi_decide:
                     section_chars["operator_task"] = len(task_context)
                 if retry_note_chars:
                     section_chars["planner_retry"] = retry_note_chars
@@ -1222,29 +1481,63 @@ class _DispatchReasonMixin:
                         intent_id=",".join(reprioritized),
                         priority_changed=True,
                     )
+            operation_rejections: list[dict[str, Any]] = []
             if ctf_mode:
-                try:
-                    apply_ctf_decide_frontier(result, self.shared_graph)
-                except Exception:
-                    pass
-            dispatch_decisions: list[dict[str, Any]] = []
-            proposed = dispatch_intents(
-                self.shared_graph,
-                result,
-                actor="reason",
-                decision_log=dispatch_decisions,
-            )
-            if ctf_mode and requested_supersede:
-                try:
-                    superseded = self.shared_graph.supersede_open_intent_ids(
-                        actor="reason",
-                        intent_ids=requested_supersede,
-                        reason=str(
-                            getattr(result, "supersede_why", "") or ""
-                        ),
+                for s_item in list(getattr(result, "supersede_facts", None) or []):
+                    f_seq = int(s_item.get("fact_seq") or 0)
+                    by_seq = s_item.get("by_fact_seq")
+                    s_reason = str(s_item.get("reason") or "").strip()
+                    self.shared_graph.supersede_fact(
+                        actor="reason", fact_seq=f_seq, reason=s_reason,
+                        by_fact_seq=int(by_seq) if by_seq else None,
                     )
-                except Exception:
-                    superseded = []
+                    await self._emit_coord_bb(
+                        "fact_superseded", actor="reason", fact_seq=f_seq,
+                        by_fact_seq=int(by_seq) if by_seq else None,
+                        reason=s_reason,
+                    )
+                for operation in result.sub_goal_operations:
+                    try:
+                        if operation["op"] == "add_sub_goal":
+                            self.shared_graph.add_sub_goal(
+                                actor="reason", criterion=operation["criterion"],
+                                goal_id=operation["goal_id"],
+                            )
+                        elif operation["op"] == "satisfy_goal":
+                            self.shared_graph.satisfy_sub_goal(
+                                actor="reason", goal_id=operation["goal_id"],
+                                reason=operation["reason"],
+                                evidence_fact_seqs=operation["evidence_fact_seqs"],
+                            )
+                    except ValueError as exc:
+                        rejection = {
+                            "operation": str(operation.get("op") or ""),
+                            "goal_id": str(operation.get("goal_id") or ""),
+                            "reason_code": "invalid_goal_reference",
+                            "detail": str(exc),
+                        }
+                        operation_rejections.append(rejection)
+                        audit_notes = getattr(result, "audit_notes", None)
+                        if isinstance(audit_notes, list):
+                            audit_notes.append({
+                                "kind": "reason_operation_rejected",
+                                "schema": "muteki.decide-operation-rejection.v1",
+                                "operations": [rejection],
+                            })
+                        await self._emit_coord_bb(
+                            "reason_operation_rejected",
+                            operation=rejection["operation"],
+                            goal_id=rejection["goal_id"],
+                            reason_code=rejection["reason_code"],
+                            detail=rejection["detail"],
+                        )
+                apply_ctf_decide_frontier(result, self.shared_graph)
+            if ctf_mode and requested_supersede:
+                superseded = self.shared_graph.supersede_open_intent_ids(
+                    actor="reason",
+                    intent_ids=requested_supersede,
+                    reason=str(getattr(result, "supersede_why", "") or ""),
+                )
                 if superseded:
                     await self._emit_coord_bb(
                         "intent_state_changed",
@@ -1254,8 +1547,24 @@ class _DispatchReasonMixin:
                         result="superseded",
                         reason=str(
                             getattr(result, "supersede_why", "") or ""
-                        )[:1000],
+                        ),
                     )
+            dispatch_decisions: list[dict[str, Any]] = list(
+                getattr(result, "intent_parse_rejections", None) or []
+            )
+            for rej in operation_rejections:
+                dispatch_decisions.append({
+                    "outcome": "dropped",
+                    "stage": "parse",
+                    "reason_code": str(rej.get("reason_code") or "invalid_operation"),
+                    "goal": f"{rej.get('operation', '')} {rej.get('goal_id', '')}: {rej.get('detail', '')}".strip(),
+                })
+            proposed = dispatch_intents(
+                self.shared_graph,
+                result,
+                actor="reason",
+                decision_log=dispatch_decisions,
+            )
             try:
                 verified_fact_ids = {
                     int(row.get("fact_seq") or 0)
@@ -1279,14 +1588,11 @@ class _DispatchReasonMixin:
                 and requested_supersede
                 and evidence_backed_replacements
             ):
-                try:
-                    superseded = self.shared_graph.supersede_open_intent_ids(
-                        actor="reason",
-                        intent_ids=requested_supersede,
-                        reason=str(getattr(result, "supersede_why", "") or ""),
-                    )
-                except Exception:
-                    superseded = []
+                superseded = self.shared_graph.supersede_open_intent_ids(
+                    actor="reason",
+                    intent_ids=requested_supersede,
+                    reason=str(getattr(result, "supersede_why", "") or ""),
+                )
                 if superseded:
                     await self._emit_coord_bb(
                         "intent_state_changed",
@@ -1296,7 +1602,7 @@ class _DispatchReasonMixin:
                         result="superseded",
                         reason=str(
                             getattr(result, "supersede_why", "") or ""
-                        )[:1000],
+                        ),
                     )
             self._last_reason_superseded = superseded
             supersede_why = str(
@@ -1371,16 +1677,57 @@ class _DispatchReasonMixin:
                         "replacement_intent_id": str(
                             (replacement or {}).get("intent_id") or ""
                         ),
-                        "reason": supersede_why[:1000],
+                        "reason": supersede_why,
                     })
                 self._last_reason_preemptions = preemptions
             self._last_dispatch_decisions = dispatch_decisions
             failure = result.planner_failure
-            if not proposed and result.intents and failure is None:
-                failure = PlannerFailure(
-                    PlannerFailureKind.NEEDS_NEW_INFORMATION,
-                    "all proposed intents were already covered or not reopenable",
-                )
+            if not proposed and failure is None:
+                if operation_rejections:
+                    failure = PlannerFailure(
+                        PlannerFailureKind.INVALID_PLAN,
+                        "; ".join(
+                            f"{row['operation']} {row['goal_id']}: "
+                            f"{row['detail']}"
+                            for row in operation_rejections
+                        ),
+                    )
+                elif result.intents:
+                    base_seq = int(
+                        getattr(result, "planning_graph_seq", -1) or -1)
+                    current_seq = -1
+                    if callable(getattr(
+                            self.shared_graph, "semantic_graph_watermark", None)):
+                        try:
+                            current_seq = int(
+                                self.shared_graph.semantic_graph_watermark() or 0)
+                        except Exception:
+                            current_seq = -1
+                    if base_seq >= 0 and current_seq > base_seq:
+                        failure = PlannerFailure(
+                            PlannerFailureKind.STALE_PLAN,
+                            f"Decide graph changed while planning "
+                            f"(draft graph_seq={base_seq}, "
+                            f"current={current_seq}); all drafted Steps "
+                            f"became non-dispatchable",
+                        )
+                    else:
+                        failure = PlannerFailure(
+                            PlannerFailureKind.NEEDS_NEW_INFORMATION,
+                            "all proposed intents were already covered or not reopenable",
+                        )
+                elif (
+                    int(getattr(
+                        getattr(result, "diagnostics", None),
+                        "raw_intent_count", 0) or 0) > 0
+                    and not getattr(result, "goal_met", False)
+                    and not getattr(result, "yield_visit", False)
+                ):
+                    failure = PlannerFailure(
+                        PlannerFailureKind.INVALID_PLAN,
+                        "All drafted Steps were rejected; inspect draft "
+                        "receipts and replan from current Facts",
+                    )
             self._last_planner_failure = failure
             for it in proposed:
                 # Graph projection is the single source of intent_proposed events.
@@ -1393,7 +1740,7 @@ class _DispatchReasonMixin:
             self._last_dispatch_decisions = []
             self._last_planner_failure = PlannerFailure(
                 PlannerFailureKind.EXCEPTION,
-                f"{type(exc).__name__}: {exc}"[:500],
+                f"{type(exc).__name__}: {exc}",
             )
             if not self._last_reason_attempts:
                 self._last_reason_attempts = [{
@@ -1405,7 +1752,7 @@ class _DispatchReasonMixin:
                     "raw_response_sha256": "",
                     "raw_response_chars": 0,
                     "parse_status": "not_run_exception",
-                    "parse_detail": f"{type(exc).__name__}: {exc}"[:500],
+                    "parse_detail": f"{type(exc).__name__}: {exc}",
                     "raw_intent_count": 0,
                     "parsed_intent_count": 0,
                 }]
@@ -1453,7 +1800,7 @@ class _DispatchReasonMixin:
         failure_kind = getattr(failure, "kind", "")
         if hasattr(failure_kind, "value"):
             failure_kind = failure_kind.value
-        failure_detail = str(getattr(failure, "detail", "") or "")[:300]
+        failure_detail = str(getattr(failure, "detail", "") or "")
         reason_failed = str(failure_kind or "") in (
             PlannerFailureKind.EXCEPTION.value,
             PlannerFailureKind.TIMEOUT.value,
@@ -1465,7 +1812,7 @@ class _DispatchReasonMixin:
             "proposed": int(proposed or 0),
             "status": "failed" if reason_failed else "ok",
             "error": (
-                f"{failure_kind}: {failure_detail}"[:300]
+                f"{failure_kind}: {failure_detail}"
                 if reason_failed else ""
             ),
             "dropped_total": sum(
@@ -1529,9 +1876,9 @@ class _DispatchReasonMixin:
             "planner_failure_detail": failure_detail,
             "progress_summary": str(
                 getattr(result, "progress_summary", "") or ""
-            )[:1600],
+            ),
             "progress_sections": {
-                key: [str(item)[:500] for item in progress_sections.get(key, [])[:3]]
+                key: [str(item) for item in progress_sections.get(key, [])]
                 for key in ("confirmed", "active", "blocked", "next")
             },
             "progress_verdict": str(getattr(result, "verdict", "") or ""),

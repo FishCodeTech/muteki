@@ -15,6 +15,10 @@
 
 from __future__ import annotations
 
+from muteki.core.blocking import run_blocking
+
+import sqlite3
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -144,6 +148,9 @@ class CtfSharedGraphService:
         return None
 
     async def append(self, event: GraphEvent) -> GraphReceipt:
+        return await run_blocking(self._append_sync, event)
+
+    def _append_sync(self, event: GraphEvent) -> GraphReceipt:
         """追加一条 CTF 领域事件；返回事件日志 seq 作为 stream_seq。
 
         底层去重（dedupe_key 冲突或 fact 级去重）时 seq=-1，回执标记
@@ -171,6 +178,9 @@ class CtfSharedGraphService:
     # -- GraphService.snapshot -------------------------------------------------
 
     async def snapshot(self, scope: GraphScope) -> GraphSnapshot:
+        return await run_blocking(self._snapshot_sync, scope)
+
+    def _snapshot_sync(self, scope: GraphScope) -> GraphSnapshot:
         """CTF 图状态快照。
 
         默认返回 SolveGraph 投影（evidence / dead_ends / flags / findings /
@@ -178,31 +188,53 @@ class CtfSharedGraphService:
         ``state["events"]``。
         """
         self._check_graph_id(scope.graph_id)
-        solve = self._graph.snapshot()
+        # All projections, optional events and the replay cursor must come
+        # from one database version, including direct coordinator writes.
+        if self._graph.db_path == ":memory:":
+            reader = SQLiteSharedGraph.__new__(SQLiteSharedGraph)
+            reader.__dict__ = self._graph.__dict__.copy()
+            reader._conn = sqlite3.connect(":memory:")
+            reader._lock = threading.Lock()
+            with self._graph._lock:
+                self._graph._conn.backup(reader._conn)
+        else:
+            reader = SQLiteSharedGraph.open_readonly(
+                db_path=self._graph.db_path, challenge=self._graph.challenge)
+        try:
+            reader._conn.execute("BEGIN")
+            return self._snapshot_from_graph(scope, reader)
+        finally:
+            reader.close()
+
+    def _snapshot_from_graph(self, scope: GraphScope, graph: SQLiteSharedGraph) -> GraphSnapshot:
+        solve = graph.snapshot()
         state: dict[str, Any] = {
-            "challenge_id": self._graph.challenge.id,
+            "challenge_id": graph.challenge.id,
             "evidence": [e.model_dump() for e in solve.evidence],
             "dead_ends": list(solve.dead_ends),
             "flag": solve.flag,
             "flags": list(solve.flags),
             "rejected_flags": list(solve.rejected_flags),
             "findings": list(solve.findings),
-            "intents": self._graph.coverage_intent_rows(),
+            "intents": graph.coverage_intent_rows(),
         }
         after_seq = scope.scope.get("after_seq")
         kinds = scope.scope.get("kinds")
         if after_seq is not None or kinds is not None:
-            state["events"] = self._graph.events_since(
+            state["events"] = graph.events_since(
                 int(after_seq or 0),
                 [str(k) for k in kinds] if kinds else None,
             )
-        return GraphSnapshot(
-            graph_id=self.id, watermark=self._watermark(), state=state
-        )
+        row = graph._conn.execute("SELECT MAX(seq) FROM events").fetchone()
+        watermark = int(row[0]) if row and row[0] is not None else 0
+        return GraphSnapshot(graph_id=self.id, watermark=watermark, state=state)
 
     # -- GraphService.claim ----------------------------------------------------
 
     async def claim(self, request: ClaimRequest) -> ClaimReceipt:
+        return await run_blocking(self._claim_sync, request)
+
+    def _claim_sync(self, request: ClaimRequest) -> ClaimReceipt:
         """原子领取开放 Intent：映射到底层单 UPDATE 的 ``claim_intent``。"""
         self._check_graph_id(request.graph_id)
         if not request.intent_id:
@@ -230,6 +262,9 @@ class CtfSharedGraphService:
     # -- GraphService.lease ----------------------------------------------------
 
     async def lease(self, request: LeaseRequest) -> LeaseReceipt:
+        return await run_blocking(self._lease_sync, request)
+
+    def _lease_sync(self, request: LeaseRequest) -> LeaseReceipt:
         """图内独占资源租约：映射到现有 ``request_resource_lock``（自愈过期）。"""
         self._check_graph_id(request.graph_id)
         if not request.resource_kind or not request.resource_key:

@@ -72,11 +72,19 @@ class Reconciler:
     def _validate_event_log(self) -> list[str]:
         """每条聚合流 stream_seq 必须 1..N 连续（唯一性由表约束保证）。"""
         issues: list[str] = []
-        with self._store.lock:
-            rows = list(self._store.conn.execute(
+        # The unique stream index makes min=1 and max=count sufficient for a
+        # contiguous stream. Only damaged streams need per-event diagnostics.
+        with self._store.read_snapshot() as conn:
+            streams = conn.execute(
+                "SELECT aggregate_type, aggregate_id FROM domain_events "
+                "GROUP BY aggregate_type, aggregate_id "
+                "HAVING MIN(stream_seq) != 1 OR MAX(stream_seq) != COUNT(*)"
+            ).fetchall()
+            rows = [row for stream in streams for row in conn.execute(
                 "SELECT aggregate_type, aggregate_id, stream_seq FROM domain_events "
-                "ORDER BY aggregate_type, aggregate_id, stream_seq"
-            ).fetchall())
+                "WHERE aggregate_type=? AND aggregate_id=? ORDER BY stream_seq",
+                (stream["aggregate_type"], stream["aggregate_id"]),
+            )]
         current: Optional[tuple[str, str]] = None
         expected = 1
         for row in rows:

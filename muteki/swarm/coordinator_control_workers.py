@@ -183,7 +183,7 @@ async def _handle_dismiss_control(self, context: ControlCommandContext) -> bool:
                 try:
                     await self.insight.dead_end(
                         "coordinator",
-                        f"operator dismissed the ask «{need[:160]}» — "
+                        f"operator dismissed the ask «{need}» — "
                         f"not supplying it; do not re-raise")
                 except Exception:
                     pass

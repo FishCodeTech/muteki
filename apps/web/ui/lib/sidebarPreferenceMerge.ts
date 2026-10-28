@@ -46,7 +46,12 @@ export function rebaseSidebarList(base: string[], local: string[], remote: strin
   const removed = new Set(base.filter((id) => !current.has(id)));
   const added = local.filter((id) => !old.has(id));
   const result = [...new Set(remote.filter((id) => !removed.has(id)))];
-  for (const id of added) if (!result.includes(id)) result.push(id);
+  for (const id of added) {
+    if (result.includes(id)) continue;
+    // Keep an addition beside its local predecessor without undoing remote reorders.
+    const previous = local.slice(0, local.indexOf(id)).reverse().find((candidate) => result.includes(candidate));
+    result.splice(previous === undefined ? 0 : result.indexOf(previous) + 1, 0, id);
+  }
   const oldCommon = base.filter((id) => current.has(id));
   const localCommon = local.filter((id) => old.has(id));
   if (!sameList(oldCommon, localCommon)) {

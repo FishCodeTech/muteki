@@ -6,7 +6,12 @@ import argparse
 import asyncio
 import json
 import os
+import sys
+from pathlib import Path
 from typing import Any, Optional
+
+# The CLI invokes this file by absolute path from the session workspace.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from muteki.external_agents.acp import (
     AcpError,
@@ -224,8 +229,8 @@ async def _run(args: argparse.Namespace) -> int:
         stderr_tail = str(diagnostics.get("stderr_tail") or "").strip()
         detail = str(exc).strip() or type(exc).__name__
         if stderr_tail and stderr_tail not in detail:
-            detail = f"{detail}: {stderr_tail[-1200:]}"
-        _emit({"type": "error", "message": detail[-1800:]})
+            detail = f"{detail}: {stderr_tail}"
+        _emit({"type": "error", "message": detail})
         return 1
     finally:
         await transport.close()
@@ -236,8 +241,13 @@ def main() -> int:
     parser.add_argument("--binary", required=True)
     parser.add_argument("--model", default="")
     parser.add_argument("--session", default="")
-    parser.add_argument("--prompt", required=True)
-    return asyncio.run(_run(parser.parse_args()))
+    prompt = parser.add_mutually_exclusive_group(required=True)
+    prompt.add_argument("--prompt")
+    prompt.add_argument("--prompt-stdin", action="store_true")
+    args = parser.parse_args()
+    if args.prompt_stdin:
+        args.prompt = sys.stdin.buffer.read().decode("utf-8")
+    return asyncio.run(_run(args))
 
 
 if __name__ == "__main__":

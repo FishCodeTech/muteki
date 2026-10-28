@@ -338,6 +338,59 @@ FROM command_receipts
 """
 
 
+_SCHEMA_V4 = """
+CREATE INDEX IF NOT EXISTS idx_domain_events_turn_type
+    ON domain_events (aggregate_type, aggregate_id, event_type,
+                      CAST(json_extract(payload, '$.payload.turn_id') AS TEXT), stream_seq);
+CREATE INDEX IF NOT EXISTS idx_domain_events_stream_global
+    ON domain_events (aggregate_type, aggregate_id, seq);
+"""
+
+
+_SCHEMA_V5 = """
+CREATE TABLE IF NOT EXISTS src_records (
+    record_id      TEXT NOT NULL,
+    task_id        TEXT NOT NULL,
+    kind           TEXT NOT NULL,
+    revision       INTEGER NOT NULL DEFAULT 1,
+    parent_id      TEXT NOT NULL DEFAULT '',
+    natural_key    TEXT NOT NULL DEFAULT '',
+    generation     INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    payload        TEXT NOT NULL,
+    PRIMARY KEY (kind, record_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_src_natural_key
+    ON src_records(task_id, kind, natural_key) WHERE natural_key != '';
+CREATE INDEX IF NOT EXISTS idx_src_task_kind
+    ON src_records(task_id, kind, updated_at);
+CREATE INDEX IF NOT EXISTS idx_src_parent
+    ON src_records(task_id, kind, parent_id);
+
+CREATE TABLE IF NOT EXISTS src_idempotency (
+    task_id         TEXT NOT NULL,
+    operation       TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_hash    TEXT NOT NULL,
+    response        TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    PRIMARY KEY (task_id, operation, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS src_sources (
+    task_id           TEXT NOT NULL,
+    source_id         TEXT NOT NULL,
+    generation        INTEGER NOT NULL DEFAULT 0,
+    next_seq          INTEGER NOT NULL DEFAULT 0,
+    extractor_version TEXT NOT NULL DEFAULT '',
+    state             TEXT NOT NULL DEFAULT 'pending',
+    error             TEXT NOT NULL DEFAULT '',
+    updated_at        TEXT NOT NULL,
+    PRIMARY KEY (task_id, source_id)
+)
+"""
+
 @dataclass(frozen=True)
 class Migration:
     """一次单调递增的 schema 迁移。"""
@@ -356,6 +409,8 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, name="core_schema", ddl=_SCHEMA_V1),
     Migration(version=2, name="global_command_and_effect_receipts", ddl=_SCHEMA_V2),
     Migration(version=3, name="backfill_platform_command_index", ddl=_SCHEMA_V3),
+    Migration(version=4, name="indexed_turn_and_public_event_reads", ddl=_SCHEMA_V4),
+    Migration(version=5, name="src_workbench_records", ddl=_SCHEMA_V5),
 )
 
 _HISTORY_DDL = """

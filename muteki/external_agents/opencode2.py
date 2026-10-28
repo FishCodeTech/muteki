@@ -157,6 +157,21 @@ class OpenCode2Runtime:
                     await owner._stop_server(proc)
                 raise
 
+    def declared_chat_capabilities(self) -> AgentCapabilities:
+        owner = self.owner
+        caps = conservative_capabilities(transport_kind="http", capability_source=SOURCE_REPORTED)
+        caps.protocol_version = "opencode-v2"
+        caps.streaming = caps.tool_events = caps.usage_events = True
+        caps.approval = caps.user_input = caps.interrupt = caps.steer = True
+        caps.resume = caps.session_persistence = caps.subagents = True
+        caps.mcp = not owner._attach_url
+        caps.resume_continues_turn = False
+        caps.plan = caps.compaction = caps.context_usage = True
+        caps.plan_mode = True
+        caps.plan_mode_per_turn = True
+        caps.access_modes = list(_SUPPORTED_ACCESS_MODES)
+        return caps
+
     async def probe(self, request: ProbeRequest) -> AgentCapabilities:
         # Inventory discovery scans its location. A health probe must not scan
         # the service checkout (including its unrelated native agent assets).
@@ -189,17 +204,9 @@ class OpenCode2Runtime:
                 ready.cancel()
                 stream.cancel()
                 await asyncio.gather(stream, ready, return_exceptions=True)
+            caps = self.declared_chat_capabilities()
             caps.runtime_version = str(info["version"])
-            caps.protocol_version = "opencode-v2"
-            caps.streaming = caps.tool_events = caps.usage_events = True
-            caps.approval = caps.user_input = caps.interrupt = caps.steer = True
-            caps.resume = caps.session_persistence = caps.subagents = True
-            caps.mcp = not owner._attach_url
-            caps.resume_continues_turn = False
-            caps.plan = caps.compaction = caps.context_usage = True
             caps.plan_mode = any(isinstance(row, dict) and row.get("id") == "plan" for row in agents)
-            caps.plan_mode_per_turn = True
-            caps.access_modes = list(_SUPPORTED_ACCESS_MODES)
             if request.include_models:
                 models = _data(await client.get(_location("/api/model", cwd), timeout=15), "model.list")
                 if not isinstance(models, list):
@@ -277,6 +284,9 @@ class OpenCode2Runtime:
             "texts": {}, "reasoning": {}, "delivered": set(), "admitted": set(),
             "resumed": bool(request.resume_handle), "interrupted": False,
             "model_ref": self._model(request.model, env, request.effort),
+            "chat_selection": request.options.is_conversation,
+            "selection_env": {"MUTEKI_OPENCODE_PROVIDER": env.get("MUTEKI_OPENCODE_PROVIDER", "")},
+            "selected_model": request.model or "", "selected_effort": request.effort or "",
             "mcp_name": None, "mcp_injected": 0, "unsettled": False,
             "pending_steers": set(), "settled_steers": set(), "stranded_steers": set(),
             # T3 OpenCode2AdapterV2: SubagentCall, Wake, reports, stoppedChildren.
@@ -312,7 +322,7 @@ class OpenCode2Runtime:
                 raise OpenCodeError("session operation did not return a native id", code="opencode2.protocol_invalid")
             native_id = native["id"]
             handle.update(external_session_id=native_id, permissions=rules, agent=native.get("agent") or "build",
-                          model_ref=model or native.get("model"))
+                          model_ref=model or native.get("model"), default_model_ref=native.get("model"))
             native_cwd = (native.get("location") or {}).get("directory")
             if native_cwd and native_cwd != cwd:
                 await client.post(f"/api/session/{quote(native_id, safe='')}/move", {"directory": cwd})
@@ -1204,6 +1214,27 @@ class OpenCode2Runtime:
             await asyncio.sleep(.1)
         handle["unsettled"] = False
 
+    async def _apply_chat_selection(self, handle: dict[str, Any], input: MessageInput) -> None:
+        if not handle.get("chat_selection"):
+            return
+        model = input.payload.model
+        effort = input.payload.effort
+        selected_model = handle.get("selected_model", "") if model is None else model
+        selected_effort = handle.get("selected_effort", "") if effort is None else effort
+        if (selected_model, selected_effort) == (handle.get("selected_model", ""), handle.get("selected_effort", "")):
+            return
+        ref = self._model(selected_model, handle.get("selection_env") or {}, selected_effort)
+        if ref is None:
+            ref = handle.get("default_model_ref")
+            if ref is not None:
+                ref = dict(ref)
+                if selected_effort and selected_effort != "default":
+                    ref["variant"] = selected_effort
+        sid = quote(handle["external_session_id"], safe="")
+        await handle["client"].post(f"/api/session/{sid}/model", {"model": ref})
+        handle.update(model_ref=ref, applied_model_ref=ref,
+                      selected_model=selected_model, selected_effort=selected_effort)
+
     async def _apply_mode(self, handle: dict[str, Any], mode: str) -> None:
         sid, client = quote(handle["external_session_id"], safe=""), handle["client"]
         agent = "plan" if mode == "plan" else "build"
@@ -1216,8 +1247,9 @@ class OpenCode2Runtime:
         if rules != handle["permissions"]:
             await client.patch(f"/api/session/{sid}", {"permissions": rules})
             handle["permissions"] = rules
-        if handle["model_ref"]:
+        if handle["model_ref"] and (not handle.get("chat_selection") or handle.get("applied_model_ref") != handle["model_ref"]):
             await client.post(f"/api/session/{sid}/model", {"model": handle["model_ref"]})
+            handle["applied_model_ref"] = handle["model_ref"]
         # Like T3, use a durable instruction entry: v2 prompts have no system field.
         instructions = "\n\n".join(part for part in (
             "Muteki conversation tools are available through the connected MCP server."
@@ -1315,6 +1347,7 @@ class OpenCode2Runtime:
         started = time.monotonic()
         try:
             if wake_id is None:
+                await self._apply_chat_selection(handle, input)
                 await self._apply_mode(handle, mode)
                 if not handle.get("host_context_recorded"):
                     owner.record_context_delivery(session.agent_session_id, handle["options"].host_context,
@@ -1563,7 +1596,11 @@ class OpenCode2Runtime:
             return snapshot
         handle = owner._sessions.get(session.agent_session_id)
         if handle is None:
-            return snapshot
+            from .command_providers import detached_compaction_snapshot
+            return detached_compaction_snapshot(snapshot, dynamic_command_item(
+                adapter_id=owner.id, engine="opencode", name="compact", channel="app_server_rpc",
+                description="压缩当前 OpenCode 会话上下文",
+                invocation={"transport": "opencode2.compact", "wire_text": "/compact"}))
         items = [*snapshot.items, dynamic_command_item(
             adapter_id=owner.id, engine="opencode", name="compact", channel="app_server_rpc",
             description="压缩当前 OpenCode 会话上下文",

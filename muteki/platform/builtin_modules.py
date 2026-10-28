@@ -302,6 +302,26 @@ def competition_components() -> list[ModuleComponent]:
     ]
 
 
+def src_descriptor() -> DomainModuleDescriptor:
+    """Persistent SRC bounty Task with one Conversation and independent Runs."""
+    return DomainModuleDescriptor(
+        id="builtin.src", version="1.0.0", task_kinds=["src.bounty"],
+        required_capabilities=["graph.shared@1", "run.coordinator@1"],
+        default_executor="swarm.coordinator", command_handlers={},
+        event_namespaces=["src."],
+        api_routes=["/api/src/tasks", "/api/src/tasks/{task_id}"],
+        workspace_kind="src",
+        ui_contributions={
+            "title": "SRC 赏金",
+            "description": "在一个持续任务中研究授权资产、复用证据并交付可复现报告。",
+            "icon": "target", "route": "/src", "create_entry": "/src",
+            "aggregate_type": "task",
+        },
+        artifact_types=["src.evidence", "src.report", "src.exchange"],
+        graph_binding="ctf.shared_graph.v1",
+    )
+
+
 def register_builtin_modules(
     registry: DomainModuleRegistry | None = None,
 ) -> DomainModuleRegistry:
@@ -329,6 +349,13 @@ def register_builtin_modules(
     registry.register(
         competition_descriptor(), components=competition_components(),
     )
+    registry.register(src_descriptor(), components=[
+        ModuleComponent(name="src.service", module_path="muteki.src.service"),
+        ModuleComponent(name="src.store", module_path="muteki.src.store"),
+        ModuleComponent(name="src.execution", module_path="muteki.src.execution"),
+        ModuleComponent(name="src.egress", module_path="muteki.src.egress"),
+        ModuleComponent(name="src.commands", module_path="muteki.src.commands"),
+    ])
     return registry
 
 
@@ -343,6 +370,7 @@ def builtin_registrations(
             "builtin.single-security-task",
             "builtin.pentest",
             "builtin.competition",
+            "builtin.src",
         )
         if registry.get(module_id) is not None
     ]

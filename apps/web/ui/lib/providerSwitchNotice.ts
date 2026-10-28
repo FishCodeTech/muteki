@@ -53,8 +53,8 @@ export function providerSwitchPreview(input: {
     : "切换 Provider 后将新建 Session；Muteki 会注入整理后的当前分支历史，发送前请确认附件、审批、计划与回退能力";
 }
 
-/** A late runtime response may describe another selection or another session. */
-export function runtimeHandoffNotice(input: {
+/** null ignores another scope; an empty string clears this scope's old notice. */
+export function runtimeHandoffNoticeUpdate(input: {
   threadId: string;
   viewThreadId?: string;
   runtimeKey: string;
@@ -62,17 +62,24 @@ export function runtimeHandoffNotice(input: {
   model: string;
   sessionId?: string | null;
   payload: Record<string, unknown>;
-}): string {
+}): string | null {
   const p = input.payload;
-  if (!input.threadId || input.viewThreadId !== input.threadId) return "";
-  if (!p.adapter_id || `${p.adapter_id}:${p.instance_id || "default"}` !== input.runtimeKey) return "";
-  if (String(p.credential_id || "") !== input.credentialId || String(p.model || "") !== input.model) return "";
-  if (p.agent_session_id && p.agent_session_id !== input.sessionId) return "";
+  if (!input.threadId || input.viewThreadId !== input.threadId) return null;
+  if (!p.adapter_id || `${p.adapter_id}:${p.instance_id || "default"}` !== input.runtimeKey) return null;
+  if (String(p.credential_id || "") !== input.credentialId || String(p.model || "") !== input.model) return null;
+  // Missing session identity cannot safely set or clear a current-session notice.
+  if (!input.sessionId || p.agent_session_id !== input.sessionId) return null;
+  if (p.recovery_kind !== "structured_handoff" || p.handoff_delivery_state !== "delivered") return "";
+  if (!String(p.handoff_id || "").trim() || p.handoff_target_agent_session_id !== input.sessionId) return "";
+  if (!String(p.handoff_delivery_turn_id || "").trim()) return "";
+  const included = Number(p.handoff_included_count || 0);
+  if (!Number.isInteger(included) || included <= 0) return "";
   const label = String(p.handoff_boundary_label || "").trim();
   if (label) return label;
-  const included = Number(p.handoff_included_count || 0);
-  if (p.recovery_kind === "structured_handoff" && included > 0) {
-    return `Runtime 会话已重建：Muteki 已向新 Session 注入当前分支历史（${included} 条）`;
-  }
-  return p.recovery_kind === "native_resume" ? "已尝试原生 resume 续接会话" : "";
+  return `Runtime 会话已重建：Muteki 已向新 Session 注入当前分支历史（${included} 条）`;
+}
+
+/** Text-only callers do not need to distinguish ignored events from clearing. */
+export function runtimeHandoffNotice(input: Parameters<typeof runtimeHandoffNoticeUpdate>[0]): string {
+  return runtimeHandoffNoticeUpdate(input) ?? "";
 }

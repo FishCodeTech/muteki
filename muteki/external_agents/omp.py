@@ -346,8 +346,9 @@ def _omp_usage_payload(usage: dict[str, Any], usage_id: str) -> dict[str, Any]:
         cost_usd=(
             value if isinstance(cost, dict)
             and isinstance((value := cost.get("total")), (int, float))
-            and not isinstance(value, bool) else None
+            and not isinstance(value, bool) and value > 0 else None
         ),
+        cost_kind="estimated",
         native=dict(usage),
     ))
 
@@ -1631,7 +1632,10 @@ class OmpRpcAdapter(BaseExternalAgentAdapter, RuntimeOperationAdapter):
         if handle is None or handle.get("peer") is None:
             base.stale = True
             base.diagnostics.append("OMP RPC Session 当前不在本进程")
-            return base
+            from .command_providers import detached_compaction_snapshot
+            from .rpc_commands import rpc_operation_items
+            return detached_compaction_snapshot(base, next(
+                item for item in rpc_operation_items(self.id, "omp") if item.name == "compact"))
         try:
             result = await self._cmd(
                 handle["peer"], "get_available_commands",
@@ -1714,6 +1718,13 @@ class OmpAcpAdapter(BaseAcpAdapter):
     """
 
     adapter_id = "omp.acp"
+    chat_model_fields = ("model", "effort")
+    chat_model_reset_requires_restart = ("model", "effort")
+    chat_model_config_ids = {"model": "model", "effort": "thinking"}
+
+    def declared_chat_capabilities(self) -> AgentCapabilities:
+        return self._declared_acp_chat_capabilities()
+
     # ``omp acp`` sends ``usage_update`` (used/size) after each turn.
     context_usage_reported = True
     host_context_channel = "system_prompt"
@@ -1731,6 +1742,19 @@ class OmpAcpAdapter(BaseAcpAdapter):
                  **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._binary = binary or os.environ.get("MUTEKI_OMP_BIN", "omp")
+
+    def _turn_result_usage(self, result: dict[str, Any]) -> Optional[UsagePayload]:
+        payload = super()._turn_result_usage(result)
+        if payload is not None and payload.input_tokens is not None:
+            # OMP derives these turn deltas from disjoint native usage buckets.
+            payload.input_tokens += (payload.cached_input_tokens or 0) + (payload.cache_write_tokens or 0)
+        return payload
+
+    def _chat_model_config_value(self, handle: dict[str, Any], field: str, value: str) -> str:
+        if field == "model":
+            provider, model = OmpRpcAdapter._resolve_provider_model(SessionStart(model=value), handle["env"])
+            return (model if not provider or model.startswith(provider + "/") else f"{provider}/{model}")
+        return value
 
     def _agent_argv(self) -> list[str]:
         return [self._binary, "acp"]
@@ -1774,6 +1798,9 @@ class OmpAcpAdapter(BaseAcpAdapter):
         native form is shown to the user.
         """
         handle = self._handle_for(agent_session_id)
+        from .src_policy import src_task_id
+        if handle is not None and src_task_id(self._tracker._store, handle.get("thread_id")):
+            return await super()._request_permission(agent_session_id, params)
         mode = str((handle or {}).get("access_mode") or "")
         if mode in {
             AccessMode.SUPERVISED.value,
@@ -1884,6 +1911,20 @@ class OmpAcpAdapter(BaseAcpAdapter):
             return
         handle = self._handle_for(agent_session_id)
         if handle is None:
+            return
+        if (str(update.get("sessionUpdate") or "") == "usage_update"
+                and session_id == handle.get("external_session_id")):
+            cost = update.get("cost")
+            amount = cost.get("amount") if isinstance(cost, dict) else None
+            if (isinstance(cost, dict) and cost.get("currency") == "USD"
+                    and isinstance(amount, (int, float)) and not isinstance(amount, bool)
+                    and 0 <= amount < float("inf")):
+                self._emit_handle_events(handle, [(
+                    AgentEventType.USAGE_UPDATED, "omp.acp.session_cost",
+                    dump_payload(UsagePayload(
+                        scope="session_cumulative", cost_usd=float(amount),
+                        cost_kind="estimated", native={"cost": dict(cost)})),
+                )])
             return
         if str(update.get("sessionUpdate") or "") != "tool_call_update":
             return

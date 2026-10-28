@@ -76,6 +76,21 @@ class WorkerRuntimeUnavailable(RuntimeError):
 
     code = "worker_runtime_unavailable"
 
+    def __init__(
+        self,
+        detail: str,
+        *,
+        code: str = "worker_runtime_unavailable",
+        phase: str = "worker_runtime_setup",
+        profile_id: str = "",
+        engine: str = "",
+    ) -> None:
+        super().__init__(detail)
+        self.code = str(code or "worker_runtime_unavailable")
+        self.phase = str(phase or "worker_runtime_setup")
+        self.profile_id = str(profile_id or "")
+        self.engine = str(engine or "")
+
 
 class RequiredContextUnavailable(WorkerSpawnRejected):
     """An exact operator continuation is not deliverable at this spawn.

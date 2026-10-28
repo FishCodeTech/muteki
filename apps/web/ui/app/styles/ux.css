@@ -4,6 +4,8 @@
   padding: clamp(24px, 4vw, 52px) clamp(16px, 5vw, 72px) 32px;
   gap: clamp(24px, 3vw, 36px);
   scrollbar-gutter: stable;
+  max-width: 1120px;
+  margin-inline: auto;
 }
 .workspace-home-hero h1 { font-size: clamp(28px, 3.4vw, 42px); line-height: 1.2; }
 .workspace-home-hero p { font-size: 14px; }
@@ -74,7 +76,6 @@
 .global-search-list > [role="option"] > kbd { color: var(--muted); font-size: 11px; }
 
 @media (min-width: 841px) and (max-width: 1100px) {
-  .workspace-home-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .workspace-home-card { padding: 18px; }
 }
 @media (max-width: 840px) {
@@ -109,3 +110,8 @@
 @media (hover: none) {
   .workspace-home-card:hover, .workspace-home-card:hover .workspace-home-action svg { transform: none; }
 }
+time, .when { font-size: 11px; }
+.thread-item .sub { font-size: 11px; }
+.composer2 .hintline { font-size: 12px; }
+.collab-tool-label { font-size: 11px !important; }
+.chip__label { font-size: 11px; }

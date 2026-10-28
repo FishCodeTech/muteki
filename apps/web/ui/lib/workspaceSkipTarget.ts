@@ -8,10 +8,20 @@
 
 export const WORKSPACE_MAIN_CONTENT_ID = "main-content";
 export const CONVERSATION_MAIN_CONTENT_ID = "conversation-main-content";
+/** The retained /chat shell owns this id; the reserved one stays on /studio-prototype. */
+export const CHAT_MAIN_CONTENT_ID = "chat-main-content";
+
+/** Routes that render ConversationShell inside the frame and share its chat layout. */
+export function isConversationLayoutPath(pathname: string): boolean {
+  if (pathname.startsWith("/chat")) return true;
+  if (pathname === "/studio-prototype/workspace" || pathname.startsWith("/studio-prototype/workspace/")) return false;
+  return pathname === "/studio-prototype" || pathname.startsWith("/studio-prototype/");
+}
 
 /** Fragment id the WorkspaceFrame skip link should target for this pathname. */
 export function workspaceSkipTargetId(pathname: string): string {
-  return pathname.startsWith("/chat")
+  if (pathname === "/chat" || pathname.startsWith("/chat/")) return CHAT_MAIN_CONTENT_ID;
+  return isConversationLayoutPath(pathname)
     ? CONVERSATION_MAIN_CONTENT_ID
     : WORKSPACE_MAIN_CONTENT_ID;
 }
@@ -21,7 +31,7 @@ export function workspaceSkipTargetId(pathname: string): string {
  * Undefined on /chat so the conversation <main> owns the unique skip target.
  */
 export function workspaceFrameContentId(pathname: string): string | undefined {
-  return pathname.startsWith("/chat") ? undefined : WORKSPACE_MAIN_CONTENT_ID;
+  return isConversationLayoutPath(pathname) ? undefined : WORKSPACE_MAIN_CONTENT_ID;
 }
 
 /** Assert a document only exposes one of each landmark id (no duplicates). */

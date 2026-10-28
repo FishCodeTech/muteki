@@ -2,9 +2,8 @@ import type { DeckState } from "./events";
 
 const DATABASE_NAME = "muteki-run-projections";
 const DATABASE_VERSION = 1;
-// Rebuild stored projections after the mode-specific event rendering changes,
-// including Pentest Fact target provenance used in the evidence workspace.
-const SNAPSHOT_VERSION = 7;
+// Rehydrate original tool start/end timestamps for the runtime waterfall.
+const SNAPSHOT_VERSION = 10;
 const STORE_NAME = "snapshots";
 const MAX_SNAPSHOTS = 6;
 

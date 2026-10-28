@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+from muteki.core.blocking import run_blocking
 import base64
 import hashlib
 from pathlib import Path
@@ -1276,6 +1277,10 @@ class ConversationManager:
         self._store.save(thread.model_copy(update={"mode": str(mode)}))
         return self._bindings.issue_binding(thread_id, principal_id, str(mode))
 
+    def session_tool_set(self, thread: Thread, *, principal_id: str = "local-user") -> list[str]:
+        """Thread 的 Runtime Session 从 CapabilityBinding 获得的工具名。"""
+        return self._bindings.session_tool_set(thread.thread_id, principal_id, thread.mode)
+
     def rename_thread(self, thread_id: str, title: str) -> Thread:
         """更新 Thread 标题；标题属于对象本体，事件用于 SSE 和审计。"""
         thread = self.get_thread(thread_id)
@@ -2124,11 +2129,20 @@ class ConversationManager:
             view["pending_approval"] = refreshed(view["pending_approval"])
         return view
 
+    async def thread_view_async(self, thread_id: str, **kwargs: Any) -> dict[str, Any]:
+        """Read history off-loop and inspect live Runtime state on its owning loop."""
+        mark_read = bool(kwargs.pop("mark_read", False))
+        context = await run_blocking(self._thread_view_context, thread_id, mark_read=mark_read)
+        _thread, state, selection, _workspace, binding, grants, session, _head, _watermark = context
+        connection = self._thread_runtime_connection(
+            thread_id, selection, binding, grants, session)
+        view = await run_blocking(
+            self._thread_view_snapshot, thread_id, context, connection, **kwargs)
+        view["state"] = self._with_response_capability(view["state"], state, session)
+        return view
+
     def thread_view(
-        self,
-        thread_id: str,
-        *,
-        mark_read: bool = False,
+        self, thread_id: str, *, mark_read: bool = False,
         messages_limit: Any = None,
         before_stream_seq: Optional[int] = None,
         after_stream_seq: Optional[int] = None,
@@ -2136,11 +2150,28 @@ class ConversationManager:
         include_superseded: bool = False,
     ) -> dict[str, Any]:
         """Thread 页面快照：元数据 + 消息页（默认页大小，非整段历史）。"""
+        context = self._thread_view_context(thread_id, mark_read=mark_read)
+        _thread, state, selection, _workspace, binding, grants, session, _head, _watermark = context
+        connection = self._thread_runtime_connection(
+            thread_id, selection, binding, grants, session)
+        view = self._thread_view_snapshot(
+            thread_id, context, connection, messages_limit=messages_limit,
+            before_stream_seq=before_stream_seq, after_stream_seq=after_stream_seq,
+            include_events=include_events, include_superseded=include_superseded)
+        view["state"] = self._with_response_capability(view["state"], state, session)
+        return view
+
+    def _thread_view_context(self, thread_id: str, *, mark_read: bool) -> tuple[Any, ...]:
         thread = self.get_thread(thread_id)
         if thread is None:
             raise ConversationError(f"unknown thread: {thread_id}", code=THREAD_NOT_FOUND_CODE)
-        state = (self._projection.mark_read(thread_id) if mark_read
-                 else self._conv.get_state(thread_id))
+        # Keep the replay cursors at this state capture. New events committed
+        # while live Runtime inspection runs must still replay after the view.
+        with self._store.transaction():
+            state = (self._projection.mark_read(thread_id) if mark_read
+                     else self._conv.get_state(thread_id))
+            head = self._store.stream_head("thread", thread_id)
+            watermark = self._store.event_watermark()
         selection = self.runtime_selection(thread_id)
         workspace = (
             self.get_workspace(thread.workspace_id)
@@ -2157,6 +2188,11 @@ class ConversationManager:
             self._store.get(AgentSession, state.agent_session_id)
             if state.agent_session_id else None
         )
+        return thread, state, selection, workspace, binding, grants, session, head, watermark
+
+    def _thread_runtime_connection(
+        self, thread_id: str, selection: Any, binding: Any, grants: Any, session: Any,
+    ) -> dict[str, Any]:
         runtime_connection: dict[str, Any] = {
             "configured": False,
             "connected": False,
@@ -2302,6 +2338,17 @@ class ConversationManager:
                 latest_grant.expires_at.isoformat()
                 if latest_grant.expires_at else None)
 
+        return runtime_connection
+
+    def _thread_view_snapshot(
+        self, thread_id: str, context: tuple[Any, ...], runtime_connection: dict[str, Any], *,
+        messages_limit: Any = None,
+        before_stream_seq: Optional[int] = None,
+        after_stream_seq: Optional[int] = None,
+        include_events: bool = False,
+        include_superseded: bool = False,
+    ) -> dict[str, Any]:
+        thread, state, selection, workspace, binding, grants, session, head, watermark = context
         turns = self._conv.list_current_turns(thread_id)
         catalog_turns = self._conv.list_turns(thread_id)
         superseded_turns = [
@@ -2347,7 +2394,6 @@ class ConversationManager:
             visible_turns = all_turns[-min(len(all_turns), effective_limit):]
 
         artifact_rows: dict[str, dict[str, Any]] = {}
-        head = self._store.stream_head("thread", thread_id)
         if include_events:
             events = self._store.read_events(
                 "thread", thread_id, after_seq=0, limit=10_000)
@@ -2358,6 +2404,8 @@ class ConversationManager:
                 limit=SLIM_EVENT_SCAN_LIMIT)
         current_events = []
         for event in events:
+            if event.stream_seq > head:
+                continue
             event_turn_id = str(event.payload.get("turn_id") or "")
             if event_turn_id and event_turn_id not in active_turn_ids:
                 continue
@@ -2394,11 +2442,11 @@ class ConversationManager:
                 if workspace is not None else None
             ),
             "runtime": selection.model_dump(mode="json"),
-            "state": self._with_response_capability({
+            "state": {
                 **state.model_dump(mode="json"),
                 "unread": state.unread,
                 "usage": visible_usage,
-            }, state, session),
+            },
             "binding": binding.model_dump(mode="json") if binding else None,
             "grants": [grant.model_dump(mode="json") for grant in grants],
             "agent_session": (
@@ -2419,7 +2467,7 @@ class ConversationManager:
                 for r in self._conv.list_current_runs(thread_id)
             ],
             "watermark": head,
-            "event_watermark": self._store.event_watermark(),
+            "event_watermark": watermark,
             "rewind_capability": resolve_rewind_capability(runtime_connection),
             # C27: context-window fuel gauge — top-level for frontend convenience.
             "context_window": state.context_window,
@@ -2654,16 +2702,30 @@ class ConversationManager:
         """Read one consistent, complete current-branch snapshot without a UI cap."""
         from muteki.platform.contracts.events import EventEnvelope
         from . import events as ev
-        with self._store.transaction():
-            thread = self.get_thread(thread_id)
+        from muteki.platform.contracts.receipts import CommandReceipt
+
+        # A WAL read transaction keeps a consistent export without holding the
+        # shared writer lock while the complete history is decoded.
+        with self._store.read_snapshot() as conn:
+            thread_row = conn.execute(
+                "SELECT payload FROM threads WHERE thread_id=?", (thread_id,)).fetchone()
+            thread = Thread.model_validate_json(thread_row["payload"]) if thread_row else None
             if thread is None:
                 raise ConversationError(f"unknown thread: {thread_id}", code=THREAD_NOT_FOUND_CODE)
-            watermark = self._store.stream_head("thread", thread_id)
-            all_turns = self._conv.list_turns(thread_id)
+            head = conn.execute(
+                "SELECT MAX(stream_seq) AS head FROM domain_events "
+                "WHERE aggregate_type='thread' AND aggregate_id=?", (thread_id,)).fetchone()
+            watermark = int(head["head"] or 0)
+            all_turns = [TurnRecord.model_validate_json(row["payload"]) for row in conn.execute(
+                "SELECT payload FROM conv_turns WHERE thread_id=? ORDER BY seq", (thread_id,))]
+            runtime_row = conn.execute(
+                "SELECT payload FROM conv_thread_runtime WHERE thread_id=?", (thread_id,)).fetchone()
+            runtime = (ThreadRuntimeSelection.model_validate_json(runtime_row["payload"])
+                       if runtime_row else ThreadRuntimeSelection(thread_id=thread_id))
             turns = [turn for turn in all_turns if turn.status != TURN_SUPERSEDED]
             superseded_turn_ids = {turn.turn_id for turn in all_turns if turn.status == TURN_SUPERSEDED}
             messages: list[dict[str, Any]] = []
-            cursor = self._store.conn.execute(
+            cursor = conn.execute(
                 "SELECT m.payload FROM conv_messages m WHERE m.thread_id=? "
                 "AND (m.turn_id IS NULL OR m.turn_id='' OR m.turn_id NOT IN "
                 "(SELECT turn_id FROM conv_turns WHERE thread_id=? AND status=?)) "
@@ -2672,7 +2734,7 @@ class ConversationManager:
                 messages.extend(ConversationMessage.model_validate_json(row["payload"]).model_dump(mode="json") for row in rows)
             artifacts: list[dict[str, Any]] = []
             tools: dict[tuple[str, str], dict[str, Any]] = {}
-            cursor = self._store.conn.execute(
+            cursor = conn.execute(
                 "SELECT payload FROM domain_events WHERE aggregate_type='thread' AND aggregate_id=? "
                 "AND stream_seq<=? AND event_type IN ('core.tool.started','core.tool.invoked',"
                 "'core.tool.progress','core.tool.completed','core.tool.failed') ORDER BY stream_seq",
@@ -2728,7 +2790,7 @@ class ConversationManager:
                                                   "event_type": event.event_type})
             tool_rows = [{**tool, "output_summary": tool.get("summary", tool["output"])} for tool in tools.values()]
             runtime_sources: dict[str, list[dict[str, Any]]] = {}
-            cursor = self._store.conn.execute(
+            cursor = conn.execute(
                 "SELECT payload FROM domain_events WHERE aggregate_type='thread' AND aggregate_id=? "
                 "AND stream_seq<=? AND event_type=? ORDER BY stream_seq",
                 (thread_id, watermark, ev.EV_TURN_STARTED))
@@ -2739,7 +2801,7 @@ class ConversationManager:
                     if turn_id and isinstance(event.payload.get("runtime"), dict):
                         runtime_sources.setdefault(turn_id, []).append({"event_id": event.event_id,
                             "stream_seq": event.stream_seq, "runtime": event.payload["runtime"]})
-            cursor = self._store.conn.execute(
+            cursor = conn.execute(
                 "SELECT payload FROM domain_events WHERE aggregate_type='thread' AND aggregate_id=? "
                 "AND stream_seq<=? AND event_type IN ('core.artifact.attached','core.artifact.created') "
                 "ORDER BY stream_seq", (thread_id, watermark))
@@ -2753,13 +2815,17 @@ class ConversationManager:
                                       "stream_seq": event.stream_seq, "turn_id": turn_id or None})
             turn_rows = []
             for turn in turns:
-                receipt = self._store.get_receipt(turn.command_id) if turn.command_id else None
+                receipt_row = (conn.execute(
+                    "SELECT payload FROM command_receipts WHERE command_id=?",
+                    (turn.command_id,)).fetchone() if turn.command_id else None)
+                receipt = (CommandReceipt.model_validate_json(receipt_row["payload"])
+                           if receipt_row else None)
                 turn_rows.append({**turn.model_dump(mode="json"),
                     "runtime_sources": runtime_sources.get(turn.turn_id, []),
                     "receipt_source": ({"command_id": receipt.command_id, "state": receipt.state.value,
                                         "event_cursor": receipt.event_cursor} if receipt is not None else None)})
             return {"thread": thread.model_dump(mode="json"),
-                    "runtime": self.runtime_selection(thread_id).model_dump(mode="json"),
+                    "runtime": runtime.model_dump(mode="json"),
                     "turns": turn_rows,
                     "messages": messages, "artifacts": artifacts, "tools": tool_rows,
                     "watermark": watermark, "complete": True, "message_count": len(messages)}

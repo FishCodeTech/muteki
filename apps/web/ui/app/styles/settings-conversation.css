@@ -253,7 +253,7 @@
   align-items: flex-end;
   padding: 0 7px 4px;
   color: var(--ink-3);
-  font-size: 10px;
+  font-size: 11px;
   line-height: 1;
 }
 .ai-composer-capability-list > button {
@@ -286,12 +286,12 @@
 .ai-composer-capability-copy strong,
 .ai-composer-capability-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ai-composer-capability-copy strong { color: inherit; font: 550 12px/1.25 var(--font-mono); }
-.ai-composer-capability-copy small { color: var(--ink-3); font-size: 10.5px; line-height: 1.3; }
+.ai-composer-capability-copy small { color: var(--ink-3); font-size: 11px; line-height: 1.3; }
 .ai-composer-capability-source {
   max-width: 96px;
   overflow: hidden;
   color: var(--ink-3);
-  font-size: 9.5px;
+  font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -619,7 +619,7 @@
   color: var(--red, #b91c1c);
 }
 
-.composer-context-chip-status { font-size: 10px; opacity: 0.92; }
+.composer-context-chip-status { font-size: 11px; opacity: 0.92; }
 
 .composer-prompt-document-editor [data-node-id] { cursor: default; }
 

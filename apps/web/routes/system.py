@@ -35,12 +35,12 @@ def register(app: FastAPI) -> None:
                 "identity_id": "operator"}
 
     @app.get("/api/health")
-    async def health() -> Any:
+    def health() -> Any:
         return {"version": get_version(), "features": SETTINGS_FEATURES, **platform_stack.health(),
                 **({"desktop_runtime": app.state.desktop_runtime} if hasattr(app.state, "desktop_runtime") else {})}
 
     @app.get("/api/readiness")
-    async def readiness() -> Any:
+    def readiness() -> Any:
         payload = {"version": get_version(), "features": SETTINGS_FEATURES, **platform_stack.health()}
         return JSONResponse(payload, status_code=200 if platform_stack.ready else 503)
 
@@ -48,7 +48,7 @@ def register(app: FastAPI) -> None:
     async def desktop_activity() -> Any:
         if not hasattr(app.state, "desktop_runtime"):
             raise HTTPException(404, "Not a managed desktop service")
-        turns = platform_stack.conversation.conv.list_active_turns()
+        turns = await run_in_threadpool(platform_stack.conversation.conv.list_active_turns)
         runs = [run.run_id for run in app.state.manager.runs.values() if run.task is not None and not run.task.done()]
         return {"active": len(turns) + len(runs), "turns": len(turns), "runs": len(runs)}
 

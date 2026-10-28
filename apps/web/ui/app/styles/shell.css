@@ -56,12 +56,12 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
 .rail-scroll { flex: 1; overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; }
 .rail-sec { font-size: var(--fs-label); text-transform: uppercase; letter-spacing: var(--ls-label); color: var(--dim); padding: 10px 16px 4px; }
 .rail-empty { font-size: 11px; color: var(--dim); padding: 6px 18px 8px; }
-.rail-empty-hint { display: block; margin-top: 3px; font-size: 10.5px; color: var(--dim); opacity: .8; line-height: 1.4; }
+.rail-empty-hint { display: block; margin-top: 3px; font-size: 11px; color: var(--dim); opacity: .8; line-height: 1.4; }
 .thread { display: flex; flex-direction: column; gap: 2px; padding: 0 8px; }
 .rail-archtoggle { margin: 8px 12px; background: transparent; border: 1px solid var(--border);
   color: var(--dim); border-radius: 7px; padding: 6px; font-size: 11px; cursor: pointer; text-align: center; }
 .rail-archtoggle:hover { color: var(--text); border-color: var(--border2); }
-.rail-archhint { font-size: 10px; color: var(--dim); padding: 0 16px 6px; line-height: 1.4; }
+.rail-archhint { font-size: 11px; color: var(--dim); padding: 0 16px 6px; line-height: 1.4; }
 /* folders + drag-and-drop (FE-session-folder) */
 .rail-recent-head { display: flex; align-items: center; justify-content: space-between; }
 .rail-newfolder { background: transparent; border: 0; color: var(--dim); cursor: pointer; font-size: 12px;
@@ -76,8 +76,8 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
   border: 0; color: var(--text); cursor: pointer; font-size: 12px; text-align: left; padding: 2px 0; }
 .rail-folder-caret { color: var(--dim); width: 10px; flex: none; }
 .rail-folder-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
-.rail-folder-count { margin-left: auto; color: var(--dim); font-size: 10px; padding-right: 4px; font-variant-numeric: tabular-nums; }
-.rail-folder-empty { font-size: 10.5px; color: var(--dim); padding: 4px 18px 6px; font-style: italic; }
+.rail-folder-count { margin-left: auto; color: var(--dim); font-size: 11px; padding-right: 4px; font-variant-numeric: tabular-nums; }
+.rail-folder-empty { font-size: 11px; color: var(--dim); padding: 4px 18px 6px; font-style: italic; }
 .thread-item.dragging { opacity: .4; }
 .thread-item[draggable="true"] { cursor: grab; }
 .thread-item.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
@@ -108,18 +108,18 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
 @keyframes railspin { to { transform: rotate(360deg); } }
 /* finish flash: a brief golden/green pulse when a run lands */
 @keyframes railflash { 0% { background: rgba(80,220,150,.28); } 100% { background: transparent; } }
-.thread-item.is-pinned .pin-badge { flex: none; font-size: 10px; opacity: .8; }
+.thread-item.is-pinned .pin-badge { flex: none; font-size: 11px; opacity: .8; }
 
 .thread-item .nm-wrap { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .thread-item .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .thread-item .sub { display: flex; align-items: center; flex-wrap: nowrap; overflow: hidden; gap: 4px; min-width: 0;
-  font-size: 9px; line-height: 1.35; color: var(--dim); }
+  font-size: 11px; line-height: 1.35; color: var(--muted); }
 .thread-item .sub .ct, .thread-item .sub .st, .thread-item .sub .when {
   max-width: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   border: 1px solid var(--border2); border-radius: 4px; padding: 0 4px; }
 .thread-item .sub .ct { text-transform: uppercase; }
 .thread-item .sub .st { text-transform: none; background: color-mix(in srgb, var(--panel) 72%, transparent); }
-.thread-item .sub .when { font-variant-numeric: tabular-nums; color: var(--dim); border-color: transparent; padding-left: 0; }
+.thread-item .sub .when { font-variant-numeric: tabular-nums; color: var(--muted); border-color: transparent; padding-left: 0; }
 .thread-item:hover .sub .when, .thread-item:focus-within .sub .when { display: none; }
 .rename-input { width: 100%; background: var(--bg); border: 1px solid var(--accent); border-radius: 5px;
   color: var(--text); font: inherit; font-size: 12px; padding: 2px 6px; outline: none; }
@@ -214,14 +214,19 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
 }
 .convo-top .title {
   display: inline-block;
+  flex: 1 1 auto;
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--bright);
   font-size: 13.5px;
   font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  flex: 0 1 auto;
+}
+.convo-top .rid { flex: 0 1 auto; min-width: 0; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.convo-top-controls { flex: none; white-space: nowrap; }
+@media (max-width: 1280px) {
+  .convo-top .rid.rid { display: none; }
 }
 .convo-top-meta {
   min-width: 0;
@@ -232,7 +237,7 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
 }
 .convo-top .cat {
   font-family: var(--mono, ui-monospace, monospace);
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.05em;
   height: 22px;
@@ -240,7 +245,7 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
 }
 .convo-top .rid {
   font-family: var(--mono, ui-monospace, monospace);
-  font-size: 10.5px;
+  font-size: 11px;
   height: 22px;
   padding: 0 6px 0 8px;
   display: inline-flex;
@@ -267,7 +272,7 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
 .engine-chip {
   display: inline-flex; align-items: center; gap: 7px; min-height: 26px;
   padding: 2px 8px 2px 7px; border: 1px solid var(--line2); border-radius: var(--r-pill);
-  background: var(--panel2); color: var(--muted); font: inherit; font-size: 10.5px;
+  background: var(--panel2); color: var(--muted); font: inherit; font-size: 11px;
   font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; cursor: pointer;
 }
 .engine-chip:hover, .engine-bar.open .engine-chip {
@@ -287,7 +292,7 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
 .engine-dot.degraded { background: var(--amber); }
 .engine-count { font-weight: 700; }
 .engine-exception { max-width: 88px; overflow: hidden; text-overflow: ellipsis; font-weight: 650; }
-.engine-pill { display: inline-flex; align-items: center; gap: 4px; font-size: 10.5px; color: var(--dim);
+.engine-pill { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--dim);
   border: 1px solid var(--border2); border-radius: 999px; padding: 1px 7px 1px 5px; }
 .engine-pill .engine-dot { width: 6px; height: 6px; border-radius: 99px; background: var(--dim); }
 .engine-pill.up { color: var(--text); }
@@ -329,7 +334,7 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
   white-space: nowrap;
   height: 24px;
   padding: 0 8px;
-  font-size: 10.5px;
+  font-size: 11px;
   font-variant-numeric: tabular-nums;
   font-family: var(--mono, ui-monospace, monospace);
 }
@@ -431,6 +436,8 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
 
 .convo-body { flex: 1; min-height: 0; min-width: 0; display: flex; align-items: stretch; position: relative; overflow: hidden; }
 .convo-mainpane { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.convo-mainpane:has(.welcome) { justify-content: center; }
+.convo-mainpane:has(.welcome) .convo-scroll { flex: none; }
 .convo.has-inspector .convo-mainpane { max-width: calc(100% - var(--inspector-width, 360px)); }
 .convo-runtime-peer { display:none; flex:1 1 auto; min-width:0; min-height:0; overflow:hidden; }
 .convo.runtime-peer-open .convo-mainpane { display:none; }
@@ -459,7 +466,7 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
 .welcome .wm em { color: var(--accent); font-style: normal; font-weight: 600; font-size: 19px;
   margin-left: 2px; }
 .welcome .sub { color: var(--dim); font-size: 13px; line-height: 1.75; max-width: 540px; text-wrap: pretty; }
-.suggest-label { font-size: 10px; text-transform: uppercase; letter-spacing: .1em; color: var(--muted);
+.suggest-label { font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--muted);
   font-weight: 700; }
 .suggest { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px;
   width: 100%; max-width: 660px; margin-top: -8px; }
@@ -581,7 +588,7 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
 .advanced-metrics-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
 .advanced-metric-card { display: flex; min-width: 0; flex-direction: column; gap: 5px; padding: 9px 10px; }
 .advanced-metric-card > span { color: var(--text); font-size: 11px; font-weight: 600; }
-.advanced-metric-card > small { color: var(--dim); font-size: 10px; line-height: 1.25; }
+.advanced-metric-card > small { color: var(--dim); font-size: 11px; line-height: 1.25; }
 .composer2 .advanced-metric-card .num-field { width: 100%; min-width: 0; }
 .advanced-select { min-width: 0; width: 100%; min-height: 31px; color: var(--text); font: inherit;
   background: var(--bg); border: 1px solid var(--border2); border-radius: 7px; padding: 4px 7px;
@@ -630,8 +637,8 @@ body.rail-resizing, body.rail-resizing * { cursor: col-resize !important; user-s
   color: var(--red); background: color-mix(in srgb, var(--red) 7%, var(--panel)); border: 1px solid color-mix(in srgb, var(--red) 35%, var(--border2));
   border-radius: 8px; padding: 6px 9px; font-family: var(--mono, monospace); font-size: 11px; }
 .composer2 .markfalse-picker button:hover { border-color: var(--red); background: color-mix(in srgb, var(--red) 11%, var(--panel)); }
-.composer2 .hintline { max-width: 1120px; margin: 7px auto 0; color: var(--dim); font-size: 11px; text-align: center; }
-.composer2 .auto-note { font-size: 12px; color: var(--dim); display: inline-flex; align-items: center; gap: 4px; }
+.composer2 .hintline { max-width: 1120px; margin: 7px auto 0; color: var(--muted); font-size: 11px; text-align: center; }
+.composer2 .auto-note { font-size: 12px; color: var(--muted); display: inline-flex; align-items: center; gap: 4px; }
 .composer2 .auto-note b { color: var(--accent); font-weight: 400; }
 /* engagement-mode segmented toggle (CTF / Pentest) + pentest goal/scope inputs */
 .composer2 .mode-row { display: flex; align-items: center; margin-bottom: 8px; }

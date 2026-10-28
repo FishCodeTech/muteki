@@ -29,6 +29,7 @@ import os
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable, Optional
+from urllib.parse import quote
 
 from muteki.external_agents.descriptors import UnknownProviderError, get_descriptor
 from muteki.external_agents.factory import engine_for_adapter
@@ -42,7 +43,7 @@ from muteki.platform.command_handlers.base import (
     correlation_id_of,
     make_error,
 )
-from muteki.platform.contracts.base import new_id
+from muteki.platform.contracts.base import new_id, utcnow
 from muteki.platform.contracts.commands import ActorRef, CommandEnvelope, QueryResult
 from muteki.platform.contracts.errors import ErrorCategory, ErrorEnvelope
 from muteki.platform.contracts.events import EventEnvelope
@@ -67,13 +68,16 @@ from .models import (
     ThreadRuntimeSelection,
 )
 from .projections import _assistant_message_id
+from .orchestration import subagent_prompt
 from .store import ConversationStore
 
 LOG = logging.getLogger(__name__)
 
 SPAWN_COMMAND = "conversation.subagent.spawn"
+SEND_COMMAND = "conversation.subagent.send"
 CANCEL_COMMAND = "conversation.subagent.cancel"
 STATUS_QUERY = "conversation.subagent.status"
+RUNTIMES_QUERY = "conversation.subagent.runtimes"
 
 ERR_DEPTH_EXCEEDED = "conversation.subagent.depth_exceeded"
 ERR_CONCURRENCY_EXCEEDED = "conversation.subagent.concurrency_exceeded"
@@ -95,6 +99,9 @@ ERR_CANCEL_INCOMPLETE = "conversation.subagent.cancel_incomplete"
 ERR_ORCHESTRATOR_UNBOUND = "conversation.subagent.orchestrator_unbound"
 ERR_SPAWN_RECORD_INVALID = "conversation.subagent.spawn_record_invalid"
 ERR_RECEIPT_UNFINALIZED = "conversation.subagent.receipt_unfinalized"
+ERR_BUSY = "conversation.subagent.busy"
+ERR_NOT_CONTINUABLE = "conversation.subagent.not_continuable"
+ERR_CATALOG_UNAVAILABLE = "conversation.subagent.catalog_unavailable"
 
 STATUS_PENDING = "pending"
 STATUS_RUNNING = "running"
@@ -145,6 +152,13 @@ _CHILD_EVENTS = frozenset({
     ev.EV_TURN_FAILED,
     ev.EV_TURN_INTERRUPTED,
     ev.EV_QUEUE_DISPATCH_FAILED,
+    ev.EV_QUEUE_ADDED,
+    ev.EV_TOOL_STARTED,
+    ev.EV_TOOL_COMPLETED,
+    ev.EV_APPROVAL_REQUESTED,
+    ev.EV_APPROVAL_RESOLVED,
+    ev.EV_USER_INPUT_REQUESTED,
+    ev.EV_USER_INPUT_RESOLVED,
     ev.EV_THREAD_ARCHIVED,
 })
 _PARENT_EVENTS = frozenset({ev.EV_TURN_INTERRUPTED, ev.EV_THREAD_ARCHIVED})
@@ -278,11 +292,15 @@ class SubagentService:
         self._spawning: set[str] = set()
         # One pending cascade per (parent, kind) so re-triggers coalesce.
         self._cascade_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
+        self.runtime_catalog: Optional[Callable[[str], list[dict[str, Any]]]] = None
 
     # -- wiring ------------------------------------------------------------------
 
     def bind_command_api(self, api: Any) -> None:
         self._api = api
+
+    def bind_runtime_catalog(self, provider: Callable[[str], list[dict[str, Any]]]) -> None:
+        self.runtime_catalog = provider
 
     def _require_api(self, correlation_id: str = "") -> Any:
         if self._api is None:
@@ -398,8 +416,14 @@ class SubagentService:
         cancel_requested = bool(node and node.cancel_requested)
         turns = self._conv.list_current_turns(subagent_id)
         last = turns[-1] if turns else None
-        if last is None:
-            queue = self._conv.list_queue(subagent_id)
+        queue = self._conv.list_queue(subagent_id)
+        if last is not None and last.status == TURN_RUNNING:
+            return _LiveStatus(status=STATUS_RUNNING, child_turn_id=last.turn_id)
+        # A continuation is durably queued before it becomes a Turn. Never
+        # return the previous Turn's completed result while that work is pending.
+        if queue:
+            if cancel_requested and not any(item.status == "dispatching" for item in queue):
+                return _LiveStatus(status=STATUS_CANCELLED)
             failed_item = next((item for item in queue if item.status == "failed"), None)
             if failed_item is not None:
                 return _LiveStatus(
@@ -407,17 +431,17 @@ class SubagentService:
                     error_code=str(failed_item.error.get("code") or "conversation.queue.dispatch_failed"),
                     error=str(failed_item.error.get("message") or ""),
                 )
+            return _LiveStatus(status=STATUS_PENDING)
+        if last is None:
             if node is not None and node.status in TERMINAL_STATUSES:
                 return _LiveStatus(status=node.status, error_code=node.error_code, error=node.error)
-            if cancel_requested and not any(item.status == "dispatching" for item in queue):
+            if cancel_requested:
                 return _LiveStatus(status=STATUS_CANCELLED)
             return _LiveStatus(status=STATUS_PENDING)
         message = self._conv.get_message(_assistant_message_id(last.turn_id))
         message_id = message.message_id if message is not None else None
         if last.status == TURN_QUEUED:
             return _LiveStatus(status=STATUS_PENDING, child_turn_id=last.turn_id)
-        if last.status == TURN_RUNNING:
-            return _LiveStatus(status=STATUS_RUNNING, child_turn_id=last.turn_id)
         if last.status == TURN_COMPLETED:
             return _LiveStatus(status=STATUS_COMPLETED, child_turn_id=last.turn_id,
                                message_id=message_id)
@@ -460,6 +484,7 @@ class SubagentService:
         return {
             "subagent_id": subagent_id,
             "thread_id": subagent_id,
+            "conversation_url": f"/chat/{quote(subagent_id, safe='')}",
             "origin": SUBAGENT_ORIGIN_APP,
             "title": thread.title if thread is not None else (node.title if node else ""),
             "status": live.status,
@@ -474,6 +499,9 @@ class SubagentService:
             "worktree_path": lineage.worktree_path,
             "worktree_state": node.worktree_state if node is not None else None,
             "cancel_requested": bool(node and node.cancel_requested),
+            "activity": node.activity if node is not None else None,
+            "acceptance_criteria": node.acceptance_criteria if node is not None else None,
+            "routing_reason": node.routing_reason if node is not None else None,
             "final_message": final,
             "error": ({"code": live.error_code, "message": live.error or ""}
                       if live.error_code else None),
@@ -482,7 +510,9 @@ class SubagentService:
             ],
         }
 
-    def sync_node(self, subagent_id: str) -> Optional[EventEnvelope]:
+    def sync_node(
+        self, subagent_id: str, event: Optional[EventEnvelope] = None,
+    ) -> Optional[EventEnvelope]:
         """Mirror the child's live status onto the parent node when it changed."""
         lineage = self.lineage(subagent_id)
         node = self.node(subagent_id)
@@ -492,14 +522,54 @@ class SubagentService:
         patch: dict[str, Any] = {}
         for key in ("status", "child_turn_id", "message_id", "error_code", "error"):
             value = getattr(live, key)
-            if key in {"error_code", "error"} and value is None and live.status in TERMINAL_STATUSES:
+            # Worktree cleanup records its error after the Turn ended; only a
+            # different Turn's outcome replaces it.
+            if (key in {"error_code", "error"} and value is None and live.status in TERMINAL_STATUSES
+                    and live.child_turn_id == node.child_turn_id):
                 continue
+            if getattr(node, key) != value:
+                patch[key] = value
+        turn = self._conv.get_turn(live.child_turn_id) if live.child_turn_id else None
+        message = self._conv.get_message(live.message_id) if live.message_id else None
+        state = self._conv.get_state(subagent_id)
+        selection = self._conv.get_runtime_selection(subagent_id)
+        values: dict[str, Any] = {
+            # Keep the complete reply, not a clipped success-looking summary.
+            "result": message.text if message is not None else None,
+        }
+        if turn is not None:
+            values.update(started_at=turn.created_at, completed_at=turn.completed_at)
+        if live.status in ACTIVE_STATUSES:
+            values["completed_at"] = None
+        runtime = turn.runtime_snapshot if turn is not None else None
+        if runtime is None and selection is not None:
+            runtime = _runtime_view(selection)
+        if runtime:
+            for key in ("adapter_id", "model", "effort", "access_mode"):
+                values[key] = runtime.get(key) or None
+        if state.pending_approvals or state.pending_approval:
+            values["activity"] = "等待你的审批，请打开子会话处理"
+        elif state.pending_user_input:
+            values["activity"] = "等待你的回答，请打开子会话处理"
+        elif live.status == STATUS_COMPLETED:
+            values["activity"] = "执行结束，结果仍需主代理独立验收"
+        elif live.status in TERMINAL_STATUSES:
+            values["activity"] = None
+        elif event is not None and (
+                not event.payload.get("turn_id")
+                or event.payload.get("turn_id") == live.child_turn_id):
+            if event.event_type in {ev.EV_TOOL_STARTED, ev.EV_TOOL_COMPLETED}:
+                tool = str(event.payload.get("tool") or event.payload.get("name") or "工具")
+                values["activity"] = f"{'正在调用' if event.event_type == ev.EV_TOOL_STARTED else '工具已返回'}：{tool}"
+            else:
+                values["activity"] = "正在执行" if live.status == STATUS_RUNNING else "等待执行"
+        for key, value in values.items():
             if getattr(node, key) != value:
                 patch[key] = value
         if not patch:
             return None
-        if live.status in TERMINAL_STATUSES and node.completed_at is None:
-            patch["completed_at"] = time.time()
+        if live.status in TERMINAL_STATUSES and not (values.get("completed_at") or node.completed_at):
+            patch["completed_at"] = utcnow()
         stored = self._store.append_events([ev.thread_event(
             lineage.parent_thread_id, ev.EV_SUBAGENT_UPDATED,
             {"subagent_id": subagent_id, **_json_safe_times(patch)},
@@ -701,7 +771,7 @@ class SubagentService:
             raise ValueError(f"child stream of {subagent_id} lacks created/lineage events")
         created_payload = dict(created.payload or {})
         spawn_command_id = str(created.command_id or "")
-        prompt = str(node.request or "")
+        prompt = subagent_prompt(str(node.request or ""), node.acceptance_criteria)
         principal_id = str(node.principal_id or "")
         if not spawn_command_id or not prompt or not principal_id:
             raise ValueError(
@@ -1012,18 +1082,18 @@ class SubagentService:
                     f"child {thread_id} archived")
             else:
                 self._spawn_task(
-                    lambda: self._on_child_turn_event(thread_id, etype, event.event_id),
+                    lambda: self._on_child_turn_event(thread_id, event),
                     f"child {thread_id} {etype}")
         if state.subagents and etype in _PARENT_EVENTS:
             self._schedule_cascade(thread_id, etype, payload)
 
-    async def _on_child_turn_event(self, subagent_id: str, etype: str, event_id: str) -> None:
+    async def _on_child_turn_event(self, subagent_id: str, event: EventEnvelope) -> None:
         node = self.node(subagent_id)
-        if (etype == ev.EV_TURN_STARTED and node is not None and node.cancel_requested
+        if (event.event_type == ev.EV_TURN_STARTED and node is not None and node.cancel_requested
                 and node.status not in TERMINAL_STATUSES):
             # Cancellation arrived before this Turn could be interrupted.
-            await self.stop_child(subagent_id, f"subagent-cancel-on-start:{event_id}")
-        self.sync_node(subagent_id)
+            await self.stop_child(subagent_id, f"subagent-cancel-on-start:{event.event_id}")
+        self.sync_node(subagent_id, event)
 
     async def _on_child_archived(self, subagent_id: str, event_id: str) -> None:
         self.sync_node(subagent_id)
@@ -1237,6 +1307,9 @@ def _json_safe_times(patch: dict[str, Any]) -> dict[str, Any]:
     if isinstance(result.get("completed_at"), float):
         result["completed_at"] = datetime.fromtimestamp(
             result["completed_at"], tz=timezone.utc).isoformat()
+    for key in ("started_at", "completed_at"):
+        if isinstance(result.get(key), datetime):
+            result[key] = result[key].isoformat()
     return result
 
 
@@ -1260,9 +1333,9 @@ def _caller_thread(command_or_query: Any, *, aggregate_id: str, payload: dict[st
 
 
 class SubagentCommandHandler:
-    """``conversation.subagent.spawn`` / ``conversation.subagent.cancel``."""
+    """Spawn, continue and cancel real child conversation Threads."""
 
-    command_types = {SPAWN_COMMAND, CANCEL_COMMAND}
+    command_types = {SPAWN_COMMAND, SEND_COMMAND, CANCEL_COMMAND}
 
     def __init__(self, service: SubagentService) -> None:
         self._svc = service
@@ -1274,7 +1347,25 @@ class SubagentCommandHandler:
         self._svc._require_api(correlation_id_of(command))
         if command.command_type == SPAWN_COMMAND:
             return self._plan_spawn(command, ctx)
+        if command.command_type == SEND_COMMAND:
+            return await self._plan_send(command, ctx)
         return self._plan_cancel(command)
+
+    def _wait_options(self, command: Any) -> tuple[bool, float]:
+        payload = command.payload
+        wait = payload.get("wait", False)
+        if not isinstance(wait, bool):
+            raise _failed(command, ERR_ARGUMENT_INVALID, "wait must be a boolean",
+                          ErrorCategory.VALIDATION)
+        timeout = payload.get("timeout_seconds", self._svc.limits.default_wait_seconds)
+        if timeout is None:
+            timeout = self._svc.limits.default_wait_seconds
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not (
+                0 < float(timeout) <= self._svc.limits.max_wait_seconds):
+            raise _failed(command, ERR_TIMEOUT_INVALID,
+                          f"timeout_seconds must be within (0, {self._svc.limits.max_wait_seconds}]",
+                          ErrorCategory.VALIDATION)
+        return wait, float(timeout)
 
     # -- spawn -------------------------------------------------------------------
 
@@ -1368,20 +1459,14 @@ class SubagentCommandHandler:
         if isolation not in (ISOLATION_SHARED, ISOLATION_WORKTREE):
             raise _failed(command, ERR_ARGUMENT_INVALID, "isolation must be 'shared' or 'worktree'",
                           ErrorCategory.VALIDATION)
-        wait = payload.get("wait", False)
-        if not isinstance(wait, bool):
-            raise _failed(command, ERR_ARGUMENT_INVALID, "wait must be a boolean",
-                          ErrorCategory.VALIDATION)
-        timeout = payload.get("timeout_seconds")
-        if timeout is None:
-            timeout = svc.limits.default_wait_seconds
-        elif isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not (
-                0 < float(timeout) <= svc.limits.max_wait_seconds):
-            raise _failed(command, ERR_TIMEOUT_INVALID,
-                          f"timeout_seconds must be within (0, {svc.limits.max_wait_seconds}]",
-                          ErrorCategory.VALIDATION,
-                          detail={"max_wait_seconds": svc.limits.max_wait_seconds})
-        timeout = float(timeout)
+        wait, timeout = self._wait_options(command)
+        brief: dict[str, Any] = {}
+        for key in ("acceptance_criteria", "routing_reason"):
+            value = payload.get(key)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise _failed(command, ERR_ARGUMENT_INVALID, f"{key} must be a non-empty string",
+                              ErrorCategory.VALIDATION)
+            brief[key] = value
 
         depth = (parent_lineage.depth if parent_lineage is not None else 0) + 1
         if depth > svc.limits.max_depth:
@@ -1468,6 +1553,8 @@ class SubagentCommandHandler:
             "depth": depth,
             "adapter_id": selection.adapter_id,
             "access_mode": selection.access_mode,
+            "effort": selection.effort or None,
+            **brief,
             "isolation": isolation,
             "workspace_id": child.workspace_id,
             "worktree_path": lineage["worktree_path"],
@@ -1518,7 +1605,7 @@ class SubagentCommandHandler:
             principal_id=principal,
             title=child.title,
             title_source=child.title_source,
-            prompt=prompt,
+            prompt=subagent_prompt(prompt, brief["acceptance_criteria"]),
             spawn_state=SPAWN_STATE_PLANNED,
             isolation=isolation,
             workspace_id=str(child.workspace_id or "") or None,
@@ -1543,6 +1630,83 @@ class SubagentCommandHandler:
             receipt=_receipt(command, ev.AGGREGATE_THREAD, caller),
             side_effect=_spawn,
         )
+
+    async def _plan_send(self, command: Any, ctx: HandlerContext) -> CommandPlan:
+        svc = self._svc
+        caller = _caller_thread(command, aggregate_id=command.aggregate_id, payload=command.payload)
+        parent = self._manager.get_thread(caller)
+        parent_state = self._conv.get_state(caller)
+        if parent is None or parent.mode != "conversation" or parent_state.status == "archived":
+            raise _failed(command, ERR_MODE_INVALID, "an active conversation Thread is required",
+                          ErrorCategory.STATE)
+        own_node = svc.node(caller)
+        if own_node is not None and own_node.cancel_requested:
+            raise _failed(command, ERR_PARENT_CANCELLED, "the calling subagent has been cancelled",
+                          ErrorCategory.STATE)
+        subagent_id = command.payload.get("subagent_id")
+        lineage = svc.lineage(subagent_id) if isinstance(subagent_id, str) else None
+        if lineage is None or lineage.parent_thread_id != caller:
+            raise _failed(command, ERR_NOT_FOUND, "subagent_id must identify a direct child of this Thread",
+                          ErrorCategory.NOT_FOUND)
+        node = svc.node(subagent_id)
+        child_state = self._conv.get_state(subagent_id)
+        if (node is None or node.cancel_requested or child_state.status == "archived"
+                or node.spawn_state not in {None, SPAWN_STATE_DISPATCHED}
+                or child_state.queue_paused or self._conv.list_queue(subagent_id)):
+            raise _failed(command, ERR_NOT_CONTINUABLE,
+                          "the child is cancelled, archived, not dispatched, or has an unresolved queue; open its conversation",
+                          ErrorCategory.STATE)
+        if svc.live_status(subagent_id, node).status in ACTIVE_STATUSES:
+            raise _failed(command, ERR_BUSY, "the child is still active; wait for its result or cancel it",
+                          ErrorCategory.STATE)
+        if len(svc.active_in_root(lineage.root_thread_id)) >= svc.limits.max_running_per_root:
+            raise _failed(command, ERR_CONCURRENCY_EXCEEDED, "the root Thread's subagent concurrency limit is reached",
+                          ErrorCategory.STATE)
+        parent_access = self._manager.runtime_selection(caller).access_mode
+        child_access = self._manager.runtime_selection(subagent_id).access_mode
+        if _ACCESS_RANK[child_access] > _ACCESS_RANK[parent_access]:
+            raise _failed(command, ERR_ACCESS_EXCEEDS_PARENT, "the child's access mode exceeds the parent's current mode",
+                          ErrorCategory.PERMISSION)
+        prompt = command.payload.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise _failed(command, ERR_ARGUMENT_INVALID, "prompt must be a non-empty string",
+                          ErrorCategory.VALIDATION)
+        wait, timeout = self._wait_options(command)
+        # Reuse the ordinary durable queue transaction, not a second dispatch
+        # that could be lost between accepting this command and enqueueing it.
+        api = svc._require_api(correlation_id_of(command))
+        child_command = command.model_copy(update={
+            "command_type": "conversation.turn.send", "aggregate_id": subagent_id,
+            "actor": ORCHESTRATOR_ACTOR,
+            "payload": {"text": prompt, "client_message_id": command.command_id,
+                        "correlation_id": correlation_id_of(command)},
+        })
+        plan = await api.handlers.command_handler("conversation.turn.send").plan(child_command, ctx)
+        plan.receipt = _receipt(command, ev.AGGREGATE_THREAD, caller)
+        plan.events.append(ev.thread_event(caller, ev.EV_SUBAGENT_UPDATED, {
+            "subagent_id": subagent_id, "turn_id": parent_state.running_turn_id,
+            "status": STATUS_PENDING, "child_turn_id": None, "message_id": None,
+            "started_at": None, "completed_at": None, "result": None,
+            "error": None, "error_code": None, "activity": "等待继续执行",
+        }, command_id=command.command_id, correlation_id=correlation_id_of(command)))
+        start = plan.side_effect
+
+        async def _send() -> SideEffectResult:
+            result = await start() if start is not None else SideEffectResult()
+            if result.error is not None:
+                return result
+            svc.sync_node(subagent_id)
+            if wait:
+                snapshot, finished, waited = await svc.wait_for_terminal(subagent_id, timeout)
+                waiting = {"requested": True, "outcome": "finished" if finished else "pending",
+                           "timeout_seconds": timeout, "waited_seconds": waited}
+            else:
+                snapshot = svc.snapshot(subagent_id, include_text=False)
+                waiting = {"requested": False}
+            return SideEffectResult(output={**result.output, **snapshot, "wait": waiting})
+
+        plan.side_effect = _send
+        return plan
 
     # -- cancel ------------------------------------------------------------------
 
@@ -1658,6 +1822,50 @@ class SubagentStatusQueryHandler:
         return QueryResult(query_id=query.query_id, query_type=query.query_type, result=result)
 
 
+class SubagentRuntimesQueryHandler:
+    query_types = {RUNTIMES_QUERY}
+
+    def __init__(self, service: SubagentService) -> None:
+        self._svc = service
+
+    async def handle(self, query: Any, ctx: HandlerContext) -> QueryResult:
+        svc = self._svc
+        caller = _caller_thread(query, aggregate_id=str(query.aggregate_id or ""), payload=query.params)
+        parent = svc._manager.get_thread(caller)
+        if parent is None or parent.mode != "conversation":
+            raise CommandFailed(_error(ERR_MODE_INVALID, "a conversation Thread is required",
+                                       ErrorCategory.PERMISSION, correlation_id=query.query_id))
+        engine = query.params.get("engine", "")
+        if not isinstance(engine, str):
+            raise CommandFailed(_error(ERR_ARGUMENT_INVALID, "engine must be a string",
+                                       ErrorCategory.VALIDATION, correlation_id=query.query_id))
+        engine = engine.strip().lower()
+        if engine:
+            try:
+                get_descriptor(engine)
+            except UnknownProviderError as exc:
+                raise CommandFailed(_error(ERR_RUNTIME_INVALID, f"unknown engine {engine!r}",
+                                           ErrorCategory.VALIDATION, correlation_id=query.query_id)) from exc
+        if svc.runtime_catalog is None:
+            raise CommandFailed(_error(ERR_CATALOG_UNAVAILABLE, "the chat Runtime catalog is not connected",
+                                       ErrorCategory.STATE, correlation_id=query.query_id))
+        selection = svc._manager.runtime_selection(caller)
+        rows = await asyncio.to_thread(svc.runtime_catalog, engine)
+        for row in rows:
+            row["access_modes"] = [
+                mode for mode in row.get("access_modes", [])
+                if mode in _ACCESS_RANK and _ACCESS_RANK[mode] <= _ACCESS_RANK[selection.access_mode]
+            ]
+            if not row["access_modes"]:
+                row["available"] = False
+                row["reason"] = "此 Runtime 没有不高于父会话权限的访问模式"
+        return QueryResult(query_id=query.query_id, query_type=query.query_type, result={
+            "thread_id": caller, "current_runtime": _runtime_view(selection),
+            "runtimes": rows, "limits": svc.limits.describe(),
+            "note": "目录与实际调用结果不同；未标记 verified 的模型尚未验证。成本未知时不要猜测价格。",
+        })
+
+
 def register_subagent_handlers(api: Any, service: SubagentService) -> None:
     """Register subagent handlers on the shared Command API (idempotent)."""
     service.bind_command_api(api)
@@ -1665,13 +1873,17 @@ def register_subagent_handlers(api: Any, service: SubagentService) -> None:
         api.register_command(SubagentCommandHandler(service))
     if STATUS_QUERY not in api.handlers.known_query_types():
         api.register_query(SubagentStatusQueryHandler(service))
+    if RUNTIMES_QUERY not in api.handlers.known_query_types():
+        api.register_query(SubagentRuntimesQueryHandler(service))
 
 
 __all__ = [
     "ACTIVE_STATUSES",
     "CANCEL_COMMAND",
     "SPAWN_COMMAND",
+    "SEND_COMMAND",
     "STATUS_QUERY",
+    "RUNTIMES_QUERY",
     "TERMINAL_STATUSES",
     "SubagentCommandHandler",
     "SubagentLimits",

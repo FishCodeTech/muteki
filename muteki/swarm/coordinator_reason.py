@@ -15,7 +15,6 @@ from muteki.swarm.graph_defs import (
 )
 
 MAX_CONSECUTIVE_PLANNER_FAILURES = 3
-MAX_DUPLICATE_PLAN_RETRIES = 2
 
 # These graph writes describe scheduler ownership, not a changed solve
 # frontier. They must not hold queued work behind another Reason pass. All
@@ -40,8 +39,10 @@ _CTF_PLANNING_INPUT_KINDS = frozenset({
     "finding_found",
     "flag_found",
     "flag_invalidated",
+    "platform_verdict",
     "operator_directive",
     "operator_directive_status",
+    "branch_facts_bound",
 })
 
 
@@ -53,11 +54,6 @@ def _is_external_planning_input(
     kind = str(event.get("kind") or "")
     if kind in _SCHEDULER_ONLY_SEMANTIC_KINDS:
         return False
-    if ctf_mode:
-        # Worker/process lifecycle changes do not change the solve frontier.
-        # A finished Worker either publishes a Fact/dead-end or, when the whole
-        # queue becomes idle, is handled by the quiescence trigger below.
-        return kind in _CTF_PLANNING_INPUT_KINDS
     if ctf_mode and kind == "branch_split":
         # A branch declared before its source Worker's checkpoint is a pending
         # handoff.  The commit path emits branch_facts_bound after attaching the
@@ -72,6 +68,11 @@ def _is_external_planning_input(
             for row in branches
             if isinstance(row, dict)
         )
+    if ctf_mode:
+        # Worker/process lifecycle changes do not change the solve frontier.
+        # A finished Worker either publishes a Fact/dead-end or, when the whole
+        # queue becomes idle, is handled by the quiescence trigger below.
+        return kind in _CTF_PLANNING_INPUT_KINDS
     if kind == "coordinator_directive":
         raw_payload = event.get("payload")
         payload = raw_payload if isinstance(raw_payload, dict) else {}
@@ -84,14 +85,21 @@ async def reason_trigger_stage(self, state) -> str:
     """Start one coalesced Decide pass for each changed planning frontier."""
     emit_bb = partial(emit_scheduler_bb, self, state)
     ctf_mode = getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
-    planning_limit = self._ordinary_planning_slots(state.tasks)
+    unlimited_planning = self._worker_concurrency_unlimited()
+    planning_limit = (
+        -1 if unlimited_planning
+        else self._ordinary_planning_slots(state.tasks)
+    )
     state.open_intents = self._open_intents()
     dispatchable = self._dispatchable_open_intents(
         state.open_intents, state.tasks)
     queue_depth = self._ordinary_open_queue_depth(dispatchable)
     state.reason_free_slots = planning_limit
     state.reason_queue_depth = queue_depth
-    state.reason_requested_intents = max(0, planning_limit - queue_depth)
+    state.reason_requested_intents = (
+        -1 if unlimited_planning
+        else max(0, planning_limit - queue_depth)
+    )
     state.graph_grew = state.last_fact_count > state.reason_fact_ckpt
     state.intents_consumed = (
         state.reason_open_intent_ckpt > 0 and not state.open_intents
@@ -125,7 +133,9 @@ async def reason_trigger_stage(self, state) -> str:
                 for event in external_events
             )
         except Exception:
-            state.planning_input_changed = False if ctf_mode else just_reaped
+            state.planning_input_changed = (
+                False if ctf_mode else state.reaped_n > 0
+            )
 
         if ctf_mode and not state.planning_input_changed:
             # Consume scheduler-only/lifecycle writes so the same watermark is
@@ -153,7 +163,7 @@ async def reason_trigger_stage(self, state) -> str:
         semantic_replan = bool(state.semantic_changed)
         state.need_reason = bool(
             wm_pending
-            and (state.reason_requested_intents > 0 or semantic_replan)
+            and (state.reason_requested_intents != 0 or semantic_replan)
         )
         if state.reason_task is not None:
             if state.planning_input_changed:
@@ -177,7 +187,7 @@ async def reason_trigger_stage(self, state) -> str:
                 dispatch_mode=self.dispatch_mode,
                 planning_limit=self._ordinary_capacity_limit(),
             )
-        if state.need_reason and state.reason_requested_intents <= 0:
+        if state.need_reason and state.reason_requested_intents == 0:
             state.reason_requested_intents = max(1, planning_limit)
         if (
             state.need_reason
@@ -223,10 +233,21 @@ async def reason_trigger_stage(self, state) -> str:
     )
     state.need_reason = candidate_trigger
     if state.need_reason:
-        # Plan only for real capacity. Zero is a valid upper bound: the model may
-        # still drop/reprioritize Steps or commit a no-op after reading new Facts.
-        capacity_deficit = max(0, planning_limit - queue_depth)
-        state.reason_requested_intents = capacity_deficit
+        # FGS Decide maintains an open-step queue on the graph
+        # decoupled from instantaneous running worker slots so that an in-flight
+        # worker does not starve complementary step creation down to 0 or 1.
+        fgs_mode = getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}
+        queue_target = (
+            max(4, self._ordinary_capacity_limit())
+            if fgs_mode
+            else planning_limit
+        )
+        state.reason_requested_intents = (
+            -1 if unlimited_planning
+            else max(2, queue_target - queue_depth)
+            if fgs_mode
+            else max(0, queue_target - queue_depth)
+        )
         if not state.reason_next_trigger:
             state.reason_next_trigger = (
                 "operator" if operator_replan
@@ -273,7 +294,7 @@ async def reason_execute_stage(self, state) -> str:
         retry_index = 0
         state.reason_next_trigger = ""
     state.reason_started_wm = state.wm_now
-    requested_intents = max(0, int(state.reason_requested_intents or 0))
+    requested_intents = max(-1, int(state.reason_requested_intents or 0))
     state.reason_started_max_intents = requested_intents
     if ctf_mode:
         state.ctf_batch_id += 1
@@ -298,12 +319,12 @@ async def reason_execute_stage(self, state) -> str:
     )
     retry_rejections = [
         {
-            "reason": str(row.get("reason_code") or "unknown")[:80],
-            "goal": str(row.get("goal") or "")[:300],
+            "reason": str(row.get("reason_code") or "unknown"),
+            "goal": str(row.get("goal") or ""),
         }
         for row in list(getattr(self, "_last_dispatch_decisions", []) or [])
         if str(row.get("outcome") or "") == "dropped"
-    ][:8]
+    ]
     self._reason_retry_note = (
         {
             "retry_index": retry_index,
@@ -331,6 +352,7 @@ async def reason_execute_stage(self, state) -> str:
 
 async def reason_collect_stage(self, state) -> str:
     """Fold one completed Decide task without blocking Worker scheduling."""
+    await self._reap_challenger_task()
     task = state.reason_task
     if task is None or not task.done():
         return "proceed"
@@ -457,10 +479,24 @@ async def reason_collect_stage(self, state) -> str:
         state.last_consumed_wm = decision_wm
 
     reason_result = getattr(self, "_last_reason", None)
+    effective_failure = getattr(self, "_last_planner_failure", None)
+    raw_step_count = int(
+        getattr(
+            getattr(reason_result, "diagnostics", None), "raw_intent_count", 0,
+        ) or 0
+    )
+    all_rejected_raw_steps = bool(
+        raw_step_count > 0
+        and not getattr(reason_result, "intents", None)
+        and not getattr(reason_result, "goal_met", False)
+        and not getattr(reason_result, "yield_visit", False)
+    )
     clean_noop = bool(
         not reason_error
         and reason_result is not None
         and getattr(reason_result, "planner_failure", None) is None
+        and effective_failure is None
+        and not all_rejected_raw_steps
         and state.reason_proposed_n == 0
     )
     if state.reason_proposed_n > 0 or clean_noop:
@@ -482,9 +518,13 @@ async def reason_collect_stage(self, state) -> str:
         if hasattr(failure_kind, "value"):
             failure_kind = failure_kind.value
         state.open_intents = self._open_intents()
-        all_proposals_dropped = bool(
-            getattr(reason_result, "intents", None)
-        ) and str(failure_kind) == PlannerFailureKind.NEEDS_NEW_INFORMATION.value
+        all_proposals_dropped = (
+            str(failure_kind) == PlannerFailureKind.INVALID_PLAN.value
+            or (
+                str(failure_kind) == PlannerFailureKind.NEEDS_NEW_INFORMATION.value
+                and bool(getattr(reason_result, "intents", None))
+            )
+        )
         dropped_codes = {
             str(row.get("reason_code") or "")
             for row in list(getattr(self, "_last_dispatch_decisions", []) or [])
@@ -506,7 +546,26 @@ async def reason_collect_stage(self, state) -> str:
         }
         if all_proposals_dropped and self._auto_dispatch_enabled():
             state.reason_duplicate_fact_ckpt = self._total_fact_count()
-        if (all_proposals_dropped
+        if str(failure_kind) == PlannerFailureKind.STALE_PLAN.value:
+            # The draft was validated against an older graph snapshot. The fix
+            # is an event-driven replan on the newer Facts, not a counted retry
+            # of the same stale input.
+            state.reason_retry_pending = False
+            state.reason_retry_count = 0
+            state.reason_retry_not_before = 0.0
+            state.reason_retry_failure = ""
+            self._reason_retry_note = None
+            state.reason_stale_refresh = True
+            state.decide_followup_pending = True
+            state.reason_next_trigger = "graph_changed_during_plan"
+            await emit_bb(
+                "reason_stale_refresh",
+                planner_failure=str(failure_kind or ""),
+                detail=str(getattr(failure, "detail", "") or ""),
+                active_workers=len(state.tasks),
+                open_intents=len(state.open_intents),
+            )
+        elif (all_proposals_dropped
                 and covered_by_inflight_work
                 and (state.tasks or state.open_intents)):
             # The proposed work already has an active or queued owner. Waiting
@@ -526,23 +585,6 @@ async def reason_collect_stage(self, state) -> str:
                 planner_failure=str(failure_kind or "empty_plan"),
                 detail="all proposed intents already have active or queued owners",
             )
-        elif (all_proposals_dropped
-                and state.reason_started_max_intents > 0
-                and state.reason_retry_count < MAX_DUPLICATE_PLAN_RETRIES):
-            # The model can identify a novel action in progress.next yet return
-            # only rejected intents. A bounded correction pass fills otherwise-
-            # idle capacity even while unrelated Workers remain active.
-            state.reason_retry_count += 1
-            state.reason_retry_pending = True
-            state.reason_retry_not_before = time.monotonic() + 2.0
-            state.reason_retry_failure = "all_proposals_dropped"
-            await emit_bb(
-                "reason_retry_scheduled",
-                retry_index=state.reason_retry_count + 1,
-                delay_s=2.0,
-                planner_failure=state.reason_retry_failure,
-                detail="all proposed intents were duplicate or already active",
-            )
         elif state.tasks or state.open_intents:
             state.reason_retry_pending = False
             state.reason_retry_count = 0
@@ -559,10 +601,18 @@ async def reason_collect_stage(self, state) -> str:
             )
         else:
             state.reason_retry_count += 1
+            is_invalid_plan = str(failure_kind) in {
+                PlannerFailureKind.INVALID_PLAN.value,
+                PlannerFailureKind.NEEDS_NEW_INFORMATION.value,
+            }
             terminal_planner_failure = (
-                reason_error
+                (reason_error or is_invalid_plan)
                 and state.reason_retry_count >= MAX_CONSECUTIVE_PLANNER_FAILURES
-                and (not ctf_mode or str(failure_kind) == PlannerFailureKind.UNAVAILABLE.value)
+                and (
+                    not ctf_mode
+                    or str(failure_kind) == PlannerFailureKind.UNAVAILABLE.value
+                    or is_invalid_plan
+                )
             )
             if terminal_planner_failure:
                 detail = str(
@@ -572,18 +622,32 @@ async def reason_collect_stage(self, state) -> str:
                 state.reason_retry_not_before = 0.0
                 state.reason_retry_failure = str(failure_kind or "planner_exception")
                 state.planner_terminal_failure = True
-                self._runtime_failure_detail = (
-                    f"Planner unavailable after {state.reason_retry_count} attempts: "
-                    f"{detail}"
-                )
-                self._runtime_failure_code = "planner_unavailable"
-                self._runtime_failure_phase = "planner"
-                await emit_bb(
-                    "planner_unavailable",
-                    attempts=state.reason_retry_count,
-                    planner_failure=state.reason_retry_failure,
-                    detail=detail,
-                )
+                if is_invalid_plan:
+                    self._runtime_failure_detail = (
+                        f"Planner returned only rejected Steps after {state.reason_retry_count} attempts: "
+                        f"{detail}"
+                    )
+                    self._runtime_failure_code = "planner_invalid_plan"
+                    self._runtime_failure_phase = "planner"
+                    await emit_bb(
+                        "planner_invalid_plan",
+                        attempts=state.reason_retry_count,
+                        planner_failure=state.reason_retry_failure,
+                        detail=detail,
+                    )
+                else:
+                    self._runtime_failure_detail = (
+                        f"Planner unavailable after {state.reason_retry_count} attempts: "
+                        f"{detail}"
+                    )
+                    self._runtime_failure_code = "planner_unavailable"
+                    self._runtime_failure_phase = "planner"
+                    await emit_bb(
+                        "planner_unavailable",
+                        attempts=state.reason_retry_count,
+                        planner_failure=state.reason_retry_failure,
+                        detail=detail,
+                    )
             else:
                 retry_delay = min(
                     30.0,
@@ -647,6 +711,9 @@ async def reason_result_stage(self, state) -> str:
         )
         if state.reason_task is not None and not state.reason_task.done():
             state.reason_task.cancel()
+        challenger_task = getattr(self, "_challenger_task", None)
+        if challenger_task is not None and not challenger_task.done():
+            challenger_task.cancel()
         if state.pentest_review_task is not None and not state.pentest_review_task.done():
             state.pentest_review_task.cancel()
         for task, solver in list(state.task_solvers.items()):
@@ -703,6 +770,8 @@ async def reason_result_stage(self, state) -> str:
                 if task.done() or str(task_intent or "") != str(intent_id):
                     continue
                 solver = state.task_solvers.get(task)
+                if solver is not None:
+                    solver._dropped_by_decide = True
                 worker_id = str(getattr(solver, "solver_id", "") or "")
                 if not self._cancel_solver(solver):
                     continue
@@ -751,7 +820,7 @@ async def reason_result_stage(self, state) -> str:
                     replacement_intent_id=str(
                         preemption.get("replacement_intent_id") or ""
                     ),
-                    reason=str(preemption.get("reason") or "")[:1000],
+                    reason=str(preemption.get("reason") or ""),
                     checkpoint_first=False,
                 )
                 break
@@ -791,7 +860,7 @@ async def reason_result_stage(self, state) -> str:
                 return "break"
             if rr is not None and getattr(rr, "verdict", "") == "complete":
                 citations = list(getattr(rr, "goal_evidence_facts", None) or [])
-                committed = self.shared_graph.record_pentest_goal_completion(
+                self.shared_graph.record_pentest_goal_completion(
                     fact_seqs=citations,
                     reason=str(getattr(rr, "complete_why", "") or ""),
                 )
@@ -831,7 +900,7 @@ async def reason_result_stage(self, state) -> str:
                 state.flag = self._found_flags[0] if self._found_flags else None
             await emit_bb(
                 "goal_complete",
-                why=getattr(rr, "complete_why", "")[:300],
+                why=getattr(rr, "complete_why", ""),
                 flags=len(self._found_flags))
             for other in state.tasks:
                 self._cancel_solver(state.task_solvers.get(other))

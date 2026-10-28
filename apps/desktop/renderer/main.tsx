@@ -50,6 +50,7 @@ import "@/app/styles/chat/surfaces.css";
 import "@/app/styles/chat/dialogs.css";
 import "@/app/styles/chat/interaction.css";
 import "@/app/styles/workspace-rail.css";
+import "@/app/styles/src-workbench.css";
 import "@/app/styles/chat/refine.css";
 import '@/styles/transitions/_root.css';
 import '@/styles/transitions/index.css';

@@ -41,6 +41,7 @@ class DeadEndClaim:
     observed_result: str = ""
     route_hash: str = ""
     coverage_key: str = ""
+    provenance: Optional[dict] = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +119,7 @@ class WorkerResult:
                     "observed_result": d.observed_result,
                     "route_hash": d.route_hash,
                     "coverage_key": d.coverage_key,
+                    "provenance": dict(d.provenance or {}),
                 }
                 for d in self.dead_ends
             ],

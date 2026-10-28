@@ -168,9 +168,9 @@
 .wbinding-model-field > * { width: 100%; min-width: 0; }
 .wbinding-model-field input { width: 100%; min-width: 0; font-family: var(--font-mono); font-size: 12px; text-overflow: ellipsis; }
 .wbinding-model-popover { max-width: calc(100vw - 24px); }
-.wbinding-model-option { display: grid; min-width: 0; gap: 3px; }
+.wbinding-model-option { display: grid; min-width: 0; gap: 3px; min-height: 44px; padding: 8px 0; align-content: center; }
 .wbinding-model-option strong { font: 500 12px/1.5 var(--font-mono); overflow-wrap: anywhere; }
-.wbinding-model-option small { color: var(--muted); font-size: 10px; }
+.wbinding-model-option small { color: var(--muted); font-size: 11px; }
 .wbinding-model-section .wbinding-form-group-title.model { flex-wrap: wrap; gap: 8px; }
 .wbinding-model-tools { flex-wrap: wrap; }
 .wbinding-model-tools > small { white-space: normal; }
@@ -536,7 +536,9 @@
 /* HeroUI Radio.Control / Radio.Indicator keep the official dial. Only force a
    circle (HeroUI ships a squircle) and drop the vertical-group `mt-4` indent. */
 .wruntime-modes [data-slot="radio-control"],
-.wruntime-networks [data-slot="radio-control"] { flex: none; border-radius: 50%; }
+.wruntime-networks [data-slot="radio-control"] { flex: none; border-radius: 50%; border: 1.5px solid #8a93a0 !important; }
+.wruntime-modes [data-slot="radio"][data-selected] [data-slot="radio-control"],
+.wruntime-networks [data-slot="radio"][data-selected] [data-slot="radio-control"] { border-color: var(--blue) !important; }
 .wruntime-modes [data-slot="radio-indicator"],
 .wruntime-networks [data-slot="radio-indicator"],
 .wruntime-modes [data-slot="radio-indicator"]:empty::before,
@@ -734,7 +736,7 @@
   background: color-mix(in srgb, var(--accent) 7%, var(--panel)); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent); }
 .wappearance-preset i { grid-row: 1 / 3; width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--line2); }
 .wappearance-preset strong { color: var(--bright); font-size: 12px; }
-.wappearance-preset code { color: var(--dim); font-size: 9.5px; font-family: var(--font-mono); }
+.wappearance-preset code { color: var(--dim); font-size: 11px; font-family: var(--font-mono); }
 .wappearance-hue { width: 100%; height: 20px; margin: 2px 0; cursor: pointer; }
 .wappearance-hue-track { width: 100%; height: 14px; border-radius: var(--r-pill);
   border: 1px solid var(--line2); outline: 0;
@@ -744,11 +746,11 @@
 .wappearance-family { display: grid; grid-template-columns: repeat(9, minmax(0, 1fr)); gap: 6px; }
 .wappearance-swatch { display: grid; gap: 3px; justify-items: center; }
 .wappearance-swatch i { width: 100%; height: 26px; border-radius: 7px; border: 1px solid var(--line2); }
-.wappearance-swatch em { color: var(--muted); font-size: 9px; font-style: normal; }
-.wappearance-swatch code { color: var(--dim); font-size: 8px; font-family: var(--font-mono); }
+.wappearance-swatch em { color: var(--muted); font-size: 11px; font-style: normal; }
+.wappearance-swatch code { color: var(--dim); font-size: 11px; font-family: var(--font-mono); }
 .wappearance-preview { display: grid; gap: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel2); }
 .wp-chips { display: flex; flex-wrap: wrap; gap: 6px; }
-.wp-chips span { font-size: 10px; font-weight: 700; padding: 3px 8px; border-radius: 6px; color: var(--c);
+.wp-chips span { font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 6px; color: var(--c);
   background: color-mix(in srgb, var(--c) 10%, var(--panel)); border: 1px solid color-mix(in srgb, var(--c) 30%, var(--line)); }
 .wp-ledger { display: grid; gap: 2px; font-family: var(--font-mono); font-size: 11px; }
 .wp-ledger > div { display: flex; gap: 10px; padding: 5px 8px; border-radius: 6px; background: var(--panel); border: 1px solid var(--line); color: var(--text); }

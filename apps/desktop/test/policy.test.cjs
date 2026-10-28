@@ -76,6 +76,9 @@ test('shared settings declarations are covered by desktop path and method policy
     }
   }
   assert.equal(allowedApiRequest('/api/runs', 'GET'), true);
+  assert.equal(allowedApiRequest('/api/src/tasks', 'GET'), true);
+  assert.equal(allowedApiRequest('/api/src/tasks', 'POST'), true);
+  assert.equal(allowedApiRequest('/api/src/tasks/task-example/records', 'GET'), true);
   for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) assert.equal(allowedApiRequest('/api/runs', method), false);
   for (const target of ['/api/runs/run-example', '/api/runs/run-example/control', '/api/runs-extra', '/api/domain-modules-extra', '/api/capability-management-extra']) {
     for (const method of ['GET', 'POST', 'DELETE']) assert.equal(allowedApiRequest(target, method), false, `${method} ${target}`);

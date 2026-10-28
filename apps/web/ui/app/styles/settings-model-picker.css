@@ -119,7 +119,7 @@
 }
 .conversation-model-pick > span { min-width:0; display:flex; flex-direction:column; gap:3px; }
 .conversation-model-list-scroll strong { overflow:hidden; font-size:13px; font-weight:570; text-overflow:ellipsis; white-space:nowrap; }
-.conversation-model-list-scroll small { overflow:hidden; color:var(--dsw-alias-label-tertiary); font-size:10.5px; text-overflow:ellipsis; white-space:nowrap; }
+.conversation-model-list-scroll small { overflow:hidden; color:var(--dsw-alias-label-tertiary); font-size: 11px; text-overflow:ellipsis; white-space:nowrap; }
 .conversation-model-list-scroll b { color:var(--blue); }
 .conversation-model-star {
   width: 28px;
@@ -178,7 +178,7 @@
 .conversation-model-pending small {
   overflow: hidden;
   color: var(--amber);
-  font-size: 10.5px;
+  font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }

@@ -52,7 +52,7 @@ class _RoutesDirectivesMixin:
         payload = {
             "route_hash": route,
             "label": clean_label,
-            "reason": (reason or "").strip()[:1000],
+            "reason": (reason or "").strip(),
             "until": (until or "new_evidence").strip(),
             "matching_intents": [str(i) for i in (matching_intents or []) if i],
             "suppressed_by": actor,
@@ -120,7 +120,7 @@ class _RoutesDirectivesMixin:
         route = self.normalize_route_hash(route_hash)
         payload = {
             "route_hash": route,
-            "reason": (reason or "").strip()[:1000],
+            "reason": (reason or "").strip(),
             "reopened_by": actor,
         }
         seq = self._append(EV_ROUTE_REOPENED, actor, payload,
@@ -327,7 +327,7 @@ class _RoutesDirectivesMixin:
         payload = {
             "branch_id": bid,
             "status": clean_status,
-            "reason": (reason or "").strip()[:1000],
+            "reason": (reason or "").strip(),
             "resolved_by": actor,
         }
         seq = self._append(EV_BRANCH_RESOLVED, actor, payload,
@@ -349,7 +349,7 @@ class _RoutesDirectivesMixin:
         payload = {
             "action": (action or "").strip() or "note",
             "priority": (priority or "normal").strip(),
-            "directive": (directive or "").strip()[:2000],
+            "directive": (directive or "").strip(),
             "route_hash": route,
         }
         return self._append(EV_COORDINATOR_DIRECTIVE, actor, payload,
@@ -369,7 +369,7 @@ class _RoutesDirectivesMixin:
         """B: record an operator directive as a first-class steering object. Returns
         {directive_id, seq}. The caller binds it to intents/workers per preemption."""
         act = (action or "hint").strip().lower() or "hint"
-        clean_text = (text or "").strip()[:2000]
+        clean_text = (text or "").strip()
         scope = (scope or "global").strip() or "global"
         policy = preempt_policy if preempt_policy in self._PREEMPT_POLICIES else "soft_rebind"
         prio = priority if priority is not None else self._DIRECTIVE_PRIORITY.get(
@@ -713,7 +713,7 @@ class _RoutesDirectivesMixin:
             digest = hashlib.sha1(
                 f"{worker}:{need}:{nk}".encode("utf-8", "ignore")).hexdigest()[:10]
             rid = f"H-{digest}"
-        payload = {"request_id": rid, "worker": worker, "need": (need or "")[:1000],
+        payload = {"request_id": rid, "worker": worker, "need": need or "",
                    "need_kind": nk, "status": status,
                    "classification_confidence": float(classification_confidence)}
         seq = self._append(EV_HITL_CLASSIFIED, worker or "worker", payload,
@@ -725,7 +725,7 @@ class _RoutesDirectivesMixin:
                 " classification_confidence, status, auto_action_seq, directive_id, "
                 " resource_lock_id, created_seq) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (rid, self.challenge.id, worker or "worker", (need or "")[:1000],
+                (rid, self.challenge.id, worker or "worker", need or "",
                  nk, float(classification_confidence), status,
                  auto_action_seq, directive_id, resource_lock_id, seq if seq > 0 else 0),
             )

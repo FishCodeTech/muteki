@@ -42,7 +42,9 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from apps.web.ui_preferences import UiPreferencesWrite
 
+from muteki.platform.capability_catalog import default_tool_set
 from muteki.platform.command_handlers.base import CommandAPIError
+from muteki.platform.contracts.capabilities import ThreadMode
 from muteki.platform.contracts.commands import (
     ActorRef,
     CommandEnvelope,
@@ -685,6 +687,11 @@ def create_conversation_router(
             getattr(service.manager, "chat_plugins", None)
             if not body.thread_id or thread.mode == "conversation" else None
         )
+        # A new chat becomes a conversation Thread whose Binding starts from the mode default.
+        session_tools = (
+            service.manager.session_tool_set(thread)
+            if body.thread_id else default_tool_set(ThreadMode.CONVERSATION)
+        )
 
         def _resolve_catalog() -> tuple[list[dict[str, Any]], dict[str, Any]]:
             # Skill/file discovery walks the filesystem (an "@" query scans the
@@ -700,6 +707,7 @@ def create_conversation_router(
                 engine=engine,
                 workspace_root=workspace_root,
                 trigger=body.trigger,
+                session_tools=session_tools,
                 query=body.query,
                 extension_service=extension_service,
                 threads=candidate_threads,
@@ -1079,6 +1087,18 @@ def create_conversation_router(
             return JSONResponse(_error_body(exc), status_code=status)
         return result.result
 
+    def _with_lineage_title(view: dict[str, Any]) -> dict[str, Any]:
+        """Subagent Threads surface a lineage banner; resolve the parent title
+        here so the UI does not need a second lookup."""
+        lineage = (view.get("state") or {}).get("lineage")
+        if lineage:
+            parent = service.manager.get_thread(str(lineage.get("parent_thread_id") or ""))
+            view["lineage"] = {
+                **lineage,
+                "parent_title": (parent.title if parent is not None else "") or None,
+            }
+        return view
+
     @router.get("/api/threads/{thread_id}")
     async def get_thread(
         thread_id: str,
@@ -1103,17 +1123,7 @@ def create_conversation_router(
         except CommandAPIError as exc:
             status = 404 if exc.error.category is ErrorCategory.NOT_FOUND else 400
             return JSONResponse(_error_body(exc), status_code=status)
-        view = result.result
-        # Subagent Threads surface a lineage banner; resolve the parent title
-        # here so the UI does not need a second lookup.
-        lineage = (view.get("state") or {}).get("lineage")
-        if lineage:
-            parent = service.manager.get_thread(str(lineage.get("parent_thread_id") or ""))
-            view["lineage"] = {
-                **lineage,
-                "parent_title": (parent.title if parent is not None else "") or None,
-            }
-        return view
+        return _with_lineage_title(result.result)
 
     @router.get("/api/threads/{thread_id}/impact-preview")
     async def impact_preview(
@@ -1124,8 +1134,8 @@ def create_conversation_router(
         file_mode: str = "keep_files",
     ) -> Any:
         try:
-            return service.manager.preview_turn_impact(
-                thread_id,
+            return await asyncio.to_thread(
+                service.manager.preview_turn_impact, thread_id,
                 turn_id,
                 mode=mode,
                 text=text,
@@ -2142,7 +2152,7 @@ def create_conversation_router(
                 started = store.conn.execute(
                     "SELECT MIN(seq) AS seq FROM domain_events "
                     "WHERE aggregate_type = ? AND aggregate_id = ? AND event_type = ? "
-                    "AND json_extract(payload, '$.payload.turn_id') = ?",
+                    "AND CAST(json_extract(payload, '$.payload.turn_id') AS TEXT) = ?",
                     (aggregate, thread_id, conv_events.EV_TURN_STARTED, running_turn_id),
                 ).fetchone()
                 if started and started["seq"] is not None:
@@ -2176,7 +2186,8 @@ def create_conversation_router(
             status = 404 if exc.error.category is ErrorCategory.NOT_FOUND else 400
             return JSONResponse(
                 _error_body(exc), status_code=status)
-        snapshot_view = snapshot_result.result
+        # The snapshot replaces the client view, so it carries the same lineage.
+        snapshot_view = _with_lineage_title(snapshot_result.result)
         last_event_id = request.headers.get("last-event-id", "").strip()
         try:
             resume_after = int(last_event_id) if last_event_id else int(after)
@@ -2206,7 +2217,8 @@ def create_conversation_router(
             if snapshot and cursor == 0 and tail > 0:
                 running_turn_id = str(
                     (snapshot_view.get("state") or {}).get("running_turn_id") or "")
-                cursor = _tail_replay_cursor(thread_id, int(tail), running_turn_id)
+                cursor = await asyncio.to_thread(
+                    _tail_replay_cursor, thread_id, int(tail), running_turn_id)
             # 右侧浏览器请求不入事件日志：无 id 行，不影响 Last-Event-ID 水位。
             browser = (browser_control.subscribe(thread_id, browser_host)
                        if browser_control is not None and browser_host in {"desktop", "web"} else None)
@@ -2218,8 +2230,8 @@ def create_conversation_router(
                     for item in browser.drain() if browser else ():
                         yield _frame("browser_request", item)
                         sent = True
-                    page = store.public_events_for(
-                        conv_events.AGGREGATE_THREAD, thread_id,
+                    page = await asyncio.to_thread(
+                        store.public_events_for, conv_events.AGGREGATE_THREAD, thread_id,
                         after_seq=cursor, limit=SSE_PAGE_LIMIT)
                     for seq, event in page:
                         cursor = max(cursor, seq)
@@ -2319,202 +2331,205 @@ def create_conversation_router(
         except (ValueError, OSError, sqlite3.Error) as exc:
             return _error_response("conversation.export.incomplete", str(exc),
                 ErrorCategory.STATE, status_code=409)
-        thread = view.get("thread") or {}
-        runtime = view.get("runtime") or {}
-        messages: list[dict[str, Any]] = view.get("messages") or []
-        turns: list[dict[str, Any]] = view.get("turns") or []
-        artifacts: list[dict[str, Any]] = view.get("artifacts") or []
-        tools: list[dict[str, Any]] = view.get("tools") or []
-        watermark: int = int(view.get("watermark") or 0)
+        def _render_export(view: dict[str, Any]) -> Response:
+            thread = view.get("thread") or {}
+            runtime = view.get("runtime") or {}
+            messages: list[dict[str, Any]] = view.get("messages") or []
+            turns: list[dict[str, Any]] = view.get("turns") or []
+            artifacts: list[dict[str, Any]] = view.get("artifacts") or []
+            tools: list[dict[str, Any]] = view.get("tools") or []
+            watermark: int = int(view.get("watermark") or 0)
 
-        title = str(thread.get("title") or "Conversation").strip() or "Conversation"
-        model = str(runtime.get("model") or runtime.get("adapter_id") or "未知模型")
-        tid = str(thread.get("thread_id") or thread_id)
-        exported_at = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        date_slug = datetime.datetime.utcnow().strftime("%Y%m%d")
+            title = str(thread.get("title") or "Conversation").strip() or "Conversation"
+            model = str(runtime.get("model") or runtime.get("adapter_id") or "未知模型")
+            tid = str(thread.get("thread_id") or thread_id)
+            exported_at = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            date_slug = datetime.datetime.utcnow().strftime("%Y%m%d")
 
-        _abs_path_re = _re.compile(
-            r"(?<![\w:/\\])(?:[A-Za-z]:[\\/]|\\\\|//|/)[^\s\"'`<>\[\]{}(),;]+"
-        )
-        _quoted_path_re = _re.compile(r'''(["'`])((?:[A-Za-z]:[\\/]|\\\\|//|/)[^\n]*?)\1''')
+            _abs_path_re = _re.compile(
+                r"(?<![\w:/\\])(?:[A-Za-z]:[\\/]|\\\\|//|/)[^\s\"'`<>\[\]{}(),;]+"
+            )
+            _quoted_path_re = _re.compile(r'''(["'`])((?:[A-Za-z]:[\\/]|\\\\|//|/)[^\n]*?)\1''')
 
-        def _clean(text: str) -> str:
-            if not text:
-                return ""
-            if exclude_paths:
-                text = _quoted_path_re.sub(lambda match: match[1] + "<path>" + match[1], text)
-                text = _abs_path_re.sub("<path>", text)
-            return text
+            def _clean(text: str) -> str:
+                if not text:
+                    return ""
+                if exclude_paths:
+                    text = _quoted_path_re.sub(lambda match: match[1] + "<path>" + match[1], text)
+                    text = _abs_path_re.sub("<path>", text)
+                return text
 
-        def _clean_fields(value: Any) -> Any:
-            if isinstance(value, str):
-                return _clean(value)
-            if isinstance(value, list):
-                return [_clean_fields(item) for item in value]
-            if isinstance(value, dict):
-                return {_clean(str(key)): _clean_fields(item) for key, item in value.items()}
-            return value
+            def _clean_fields(value: Any) -> Any:
+                if isinstance(value, str):
+                    return _clean(value)
+                if isinstance(value, list):
+                    return [_clean_fields(item) for item in value]
+                if isinstance(value, dict):
+                    return {_clean(str(key)): _clean_fields(item) for key, item in value.items()}
+                return value
 
-        view = _clean_fields(view)
-        thread, runtime = view["thread"], view["runtime"]
-        messages, turns, artifacts, tools = view["messages"], view["turns"], view["artifacts"], view["tools"]
-        title = str(thread.get("title") or "Conversation").strip() or "Conversation"
-        model = str(runtime.get("model") or runtime.get("adapter_id") or "未知模型")
-        tid = str(thread.get("thread_id") or thread_id)
-        path_redaction = {"enabled": bool(exclude_paths), "mode": "lexical_best_effort",
-                          "limitation": "路径文本有歧义；分享前请检查导出内容" if exclude_paths else ""}
-        if exclude_tools:
-            tools = [{key: value for key, value in tool.items() if key != "arguments"} for tool in tools]
-        export_metadata = {"complete": True, "message_count": len(messages), "turn_count": len(turns),
-            "artifact_count": len(artifacts), "artifact_count_kind": "associations", "tool_count": len(tools),
-            "watermark": watermark, "schema_version": 2, "scope": "current_branch",
-            "binary_content_included": False, "path_redaction": "lexical_best_effort" if exclude_paths else None}
+            view = _clean_fields(view)
+            thread, runtime = view["thread"], view["runtime"]
+            messages, turns, artifacts, tools = view["messages"], view["turns"], view["artifacts"], view["tools"]
+            title = str(thread.get("title") or "Conversation").strip() or "Conversation"
+            model = str(runtime.get("model") or runtime.get("adapter_id") or "未知模型")
+            tid = str(thread.get("thread_id") or thread_id)
+            path_redaction = {"enabled": bool(exclude_paths), "mode": "lexical_best_effort",
+                              "limitation": "路径文本有歧义；分享前请检查导出内容" if exclude_paths else ""}
+            if exclude_tools:
+                tools = [{key: value for key, value in tool.items() if key != "arguments"} for tool in tools]
+            export_metadata = {"complete": True, "message_count": len(messages), "turn_count": len(turns),
+                "artifact_count": len(artifacts), "artifact_count_kind": "associations", "tool_count": len(tools),
+                "watermark": watermark, "schema_version": 2, "scope": "current_branch",
+                "binary_content_included": False, "path_redaction": "lexical_best_effort" if exclude_paths else None}
 
-        def _export_headers(ext: str) -> dict[str, str]:
-            return {"Content-Disposition": _content_disposition(ext),
-                    "X-Muteki-Export-Metadata": json.dumps(export_metadata, separators=(",", ":")),
-                    "Access-Control-Expose-Headers": "Content-Disposition, X-Muteki-Export-Metadata"}
+            def _export_headers(ext: str) -> dict[str, str]:
+                return {"Content-Disposition": _content_disposition(ext),
+                        "X-Muteki-Export-Metadata": json.dumps(export_metadata, separators=(",", ":")),
+                        "Access-Control-Expose-Headers": "Content-Disposition, X-Muteki-Export-Metadata"}
 
-        # Group messages by turn_id for ordered rendering.
-        # Bug-fix (High): messages with turn_id=None (fork-inherited history) are
-        # bucketed to "_no_turn" and rendered separately after the turn loop.
-        turn_messages: dict[str, list[dict[str, Any]]] = {}
-        for msg in messages:
-            tid_key = str(msg.get("turn_id") or "_no_turn")
-            turn_messages.setdefault(tid_key, []).append(msg)
-
-        # Build turn order from turns list (respects seq ordering)
-        ordered_turns = sorted(turns, key=lambda t: int(t.get("seq") or 0))
-
-        # Bug-fix (High): preserve CJK / non-ASCII chars in filename; strip only
-        # chars that are unsafe in HTTP headers and filenames.
-        import urllib.parse as _urlparse
-        safe_title = _re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', title).strip()[:80] or "export"
-        ascii_title = _re.sub(r'[^\x20-\x7e]', '', safe_title).strip()[:60] or "export"
-        ascii_slug = ascii_title.replace(' ', '-')
-        filename_base = f"{ascii_slug}-{date_slug}"
-
-        def _content_disposition(ext: str) -> str:
-            """RFC 5987 Content-Disposition with UTF-8 filename* fallback."""
-            fname_ascii = f"{filename_base}.{ext}"
-            fname_utf8 = f"{safe_title.replace(' ', '-')}-{date_slug}.{ext}"
-            encoded = _urlparse.quote(fname_utf8, safe='')
-            return f'attachment; filename="{fname_ascii}"; filename*=UTF-8\'\'{encoded}'
-
-        if format == "jsonl":
-            import io as _io
-            buf = _io.StringIO()
-            # Header record
-            buf.write(json.dumps({
-                "record": "header", "schema_version": 2, "title": title, "thread_id": tid,
-                "model": model, "exported_at": exported_at, "watermark": watermark,
-                **export_metadata,
-                "current_runtime": runtime, "path_redaction": path_redaction,
-                "binary_content_included": False,
-                "event_source": {"aggregate_type": "thread", "aggregate_id": tid, "watermark": watermark},
-                "options": {"exclude_tools": bool(exclude_tools), "exclude_paths": bool(exclude_paths)},
-            }, ensure_ascii=False) + "\n")
-            for turn in ordered_turns:
-                record = {"record": "turn", "schema_version": 2, **turn}
-                if exclude_tools:
-                    record.pop("runtime_invocation", None)
-                buf.write(json.dumps(record, ensure_ascii=False) + "\n")
-            turns_by_id = {turn["turn_id"]: turn for turn in ordered_turns}
+            # Group messages by turn_id for ordered rendering.
+            # Bug-fix (High): messages with turn_id=None (fork-inherited history) are
+            # bucketed to "_no_turn" and rendered separately after the turn loop.
+            turn_messages: dict[str, list[dict[str, Any]]] = {}
             for msg in messages:
-                turn = turns_by_id.get(str(msg.get("turn_id") or "")) or {}
-                record = {"record": "message", "schema_version": 2, **msg,
-                          "turn_kind": turn.get("kind") or "history",
-                          "turn_status": turn.get("status") or "not_available"}
-                if exclude_tools and (msg.get("role") == "tool" or msg.get("kind") == "imported_tool"):
-                    record.pop("source_content", None)
-                buf.write(json.dumps(record, ensure_ascii=False) + "\n")
-            for art in artifacts:
+                tid_key = str(msg.get("turn_id") or "_no_turn")
+                turn_messages.setdefault(tid_key, []).append(msg)
+
+            # Build turn order from turns list (respects seq ordering)
+            ordered_turns = sorted(turns, key=lambda t: int(t.get("seq") or 0))
+
+            # Bug-fix (High): preserve CJK / non-ASCII chars in filename; strip only
+            # chars that are unsafe in HTTP headers and filenames.
+            import urllib.parse as _urlparse
+            safe_title = _re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', title).strip()[:80] or "export"
+            ascii_title = _re.sub(r'[^\x20-\x7e]', '', safe_title).strip()[:60] or "export"
+            ascii_slug = ascii_title.replace(' ', '-')
+            filename_base = f"{ascii_slug}-{date_slug}"
+
+            def _content_disposition(ext: str) -> str:
+                """RFC 5987 Content-Disposition with UTF-8 filename* fallback."""
+                fname_ascii = f"{filename_base}.{ext}"
+                fname_utf8 = f"{safe_title.replace(' ', '-')}-{date_slug}.{ext}"
+                encoded = _urlparse.quote(fname_utf8, safe='')
+                return f'attachment; filename="{fname_ascii}"; filename*=UTF-8\'\'{encoded}'
+
+            if format == "jsonl":
+                import io as _io
+                buf = _io.StringIO()
+                # Header record
                 buf.write(json.dumps({
-                    "record": "artifact", "schema_version": 2, "sha256": art.get("sha256"),
-                    "name": art.get("name"), "kind": art.get("kind"),
-                    "media_type": art.get("media_type"), "size": art.get("size"),
-                    "turn_id": art.get("turn_id"), "event_id": art.get("event_id"),
-                    "stream_seq": art.get("stream_seq"),
+                    "record": "header", "schema_version": 2, "title": title, "thread_id": tid,
+                    "model": model, "exported_at": exported_at, "watermark": watermark,
+                    **export_metadata,
+                    "current_runtime": runtime, "path_redaction": path_redaction,
+                    "binary_content_included": False,
+                    "event_source": {"aggregate_type": "thread", "aggregate_id": tid, "watermark": watermark},
+                    "options": {"exclude_tools": bool(exclude_tools), "exclude_paths": bool(exclude_paths)},
                 }, ensure_ascii=False) + "\n")
-            for tool in tools:
-                buf.write(json.dumps({"record": "tool", "schema_version": 2, **tool}, ensure_ascii=False) + "\n")
-            content = buf.getvalue().encode("utf-8")
+                for turn in ordered_turns:
+                    record = {"record": "turn", "schema_version": 2, **turn}
+                    if exclude_tools:
+                        record.pop("runtime_invocation", None)
+                    buf.write(json.dumps(record, ensure_ascii=False) + "\n")
+                turns_by_id = {turn["turn_id"]: turn for turn in ordered_turns}
+                for msg in messages:
+                    turn = turns_by_id.get(str(msg.get("turn_id") or "")) or {}
+                    record = {"record": "message", "schema_version": 2, **msg,
+                              "turn_kind": turn.get("kind") or "history",
+                              "turn_status": turn.get("status") or "not_available"}
+                    if exclude_tools and (msg.get("role") == "tool" or msg.get("kind") == "imported_tool"):
+                        record.pop("source_content", None)
+                    buf.write(json.dumps(record, ensure_ascii=False) + "\n")
+                for art in artifacts:
+                    buf.write(json.dumps({
+                        "record": "artifact", "schema_version": 2, "sha256": art.get("sha256"),
+                        "name": art.get("name"), "kind": art.get("kind"),
+                        "media_type": art.get("media_type"), "size": art.get("size"),
+                        "turn_id": art.get("turn_id"), "event_id": art.get("event_id"),
+                        "stream_seq": art.get("stream_seq"),
+                    }, ensure_ascii=False) + "\n")
+                for tool in tools:
+                    buf.write(json.dumps({"record": "tool", "schema_version": 2, **tool}, ensure_ascii=False) + "\n")
+                content = buf.getvalue().encode("utf-8")
+                return Response(
+                    content=content,
+                    media_type="application/x-ndjson",
+                    headers=_export_headers("jsonl"),
+                )
+
+            # Markdown format
+            lines: list[str] = []
+            lines.append(f"# {title}")
+            lines.append(f"> 模型: {model} | Thread: {tid}")
+            lines.append(f"> 导出时间: {exported_at} | 水位: #{watermark}")
+            lines.append(f"> 当前分支完整快照 · {len(messages)} 条消息 · 二进制附件仅列索引")
+            if exclude_tools or exclude_paths:
+                opts = []
+                if exclude_tools: opts.append("已排除工具参数")
+                if exclude_paths: opts.append("路径已按词法规则脱敏，分享前请检查内容")
+                lines.append(f"> 选项: {' · '.join(opts)}")
+            lines.append("")
+
+            turns_by_id = {turn["turn_id"]: turn for turn in ordered_turns}
+            turn_ordinals = {turn["turn_id"]: index for index, turn in enumerate(ordered_turns, 1)}
+            for msg in messages:
+                turn_id = str(msg.get("turn_id") or "")
+                turn = turns_by_id.get(turn_id) or {}
+                role = str(msg.get("role") or "")
+                role_label = {"user": "用户", "assistant": "助手", "tool": "工具", "system": "系统"}.get(role, "来源记录")
+                text = str(msg.get("text") or "")
+                status = str(turn.get("status") or "")
+                status_note = f" ⚠ {status}" if status in {"failed", "interrupted"} else ""
+                if not text and role == "user" and (turn.get("attachments") or turn.get("capability_refs")):
+                    text = "（仅附件或上下文引用）"
+                if not text:
+                    continue
+                prefix = f"轮次 {turn_ordinals[turn_id]}" if turn_id in turn_ordinals else "历史消息"
+                lines.extend([f"## {prefix} — {role_label}{status_note}", "", text, ""])
+                if role == "user":
+                    for digest in turn.get("attachments") or []:
+                        lines.append(f"- 附件 SHA-256: `{digest}`")
+                    for ref in turn.get("capability_refs") or []:
+                        lines.append(f"- 上下文引用: {ref.get('name') or ref.get('id') or '未命名'} ({ref.get('kind') or 'unknown'}) · ID `{ref.get('id') or ref.get('node_id') or ''}`")
+                    if turn.get("attachments") or turn.get("capability_refs"):
+                        lines.append("")
+
+            if artifacts:
+                lines.append("---")
+                lines.append("## 附件索引")
+                lines.append("")
+                for art in artifacts:
+                    sha = str(art.get("sha256") or "")
+                    name = str(art.get("name") or "未命名")
+                    kind = str(art.get("kind") or "")
+                    size = art.get("size")
+                    size_str = f", {size} bytes" if size else ""
+                    lines.append(f"- `{sha}` — **{name}** ({kind}{size_str})")
+                lines.append("")
+
+            if tools:
+                lines.extend(["---", "## 工具记录", ""])
+                for tool in tools:
+                    lines.extend([f"### {tool['name']} — {tool['status']}",
+                        f"> 轮次: {tool['turn_id'] or '未关联'} | 工具 ID: {tool['tool_id']}", ""])
+                    if not exclude_tools and "arguments" in tool:
+                        lines.extend(["参数:", "", json.dumps(tool["arguments"], ensure_ascii=False), ""])
+                    summary = tool["output_summary"]
+                    lines.extend(["结果摘要:", "", summary if isinstance(summary, str) else json.dumps(summary, ensure_ascii=False), ""])
+                    if not tool["output_complete"]:
+                        lines.extend(["> 输出来源为已保存的过程更新，未记录完整最终输出。", ""])
+                    if tool.get("error"):
+                        lines.extend(["错误:", "", json.dumps(tool["error"], ensure_ascii=False), ""])
+
+            content = "\n".join(lines).encode("utf-8")
             return Response(
                 content=content,
-                media_type="application/x-ndjson",
-                headers=_export_headers("jsonl"),
+                media_type="text/markdown; charset=utf-8",
+                headers=_export_headers("md"),
             )
 
-        # Markdown format
-        lines: list[str] = []
-        lines.append(f"# {title}")
-        lines.append(f"> 模型: {model} | Thread: {tid}")
-        lines.append(f"> 导出时间: {exported_at} | 水位: #{watermark}")
-        lines.append(f"> 当前分支完整快照 · {len(messages)} 条消息 · 二进制附件仅列索引")
-        if exclude_tools or exclude_paths:
-            opts = []
-            if exclude_tools: opts.append("已排除工具参数")
-            if exclude_paths: opts.append("路径已按词法规则脱敏，分享前请检查内容")
-            lines.append(f"> 选项: {' · '.join(opts)}")
-        lines.append("")
-
-        turns_by_id = {turn["turn_id"]: turn for turn in ordered_turns}
-        turn_ordinals = {turn["turn_id"]: index for index, turn in enumerate(ordered_turns, 1)}
-        for msg in messages:
-            turn_id = str(msg.get("turn_id") or "")
-            turn = turns_by_id.get(turn_id) or {}
-            role = str(msg.get("role") or "")
-            role_label = {"user": "用户", "assistant": "助手", "tool": "工具", "system": "系统"}.get(role, "来源记录")
-            text = str(msg.get("text") or "")
-            status = str(turn.get("status") or "")
-            status_note = f" ⚠ {status}" if status in {"failed", "interrupted"} else ""
-            if not text and role == "user" and (turn.get("attachments") or turn.get("capability_refs")):
-                text = "（仅附件或上下文引用）"
-            if not text:
-                continue
-            prefix = f"轮次 {turn_ordinals[turn_id]}" if turn_id in turn_ordinals else "历史消息"
-            lines.extend([f"## {prefix} — {role_label}{status_note}", "", text, ""])
-            if role == "user":
-                for digest in turn.get("attachments") or []:
-                    lines.append(f"- 附件 SHA-256: `{digest}`")
-                for ref in turn.get("capability_refs") or []:
-                    lines.append(f"- 上下文引用: {ref.get('name') or ref.get('id') or '未命名'} ({ref.get('kind') or 'unknown'}) · ID `{ref.get('id') or ref.get('node_id') or ''}`")
-                if turn.get("attachments") or turn.get("capability_refs"):
-                    lines.append("")
-
-        if artifacts:
-            lines.append("---")
-            lines.append("## 附件索引")
-            lines.append("")
-            for art in artifacts:
-                sha = str(art.get("sha256") or "")
-                name = str(art.get("name") or "未命名")
-                kind = str(art.get("kind") or "")
-                size = art.get("size")
-                size_str = f", {size} bytes" if size else ""
-                lines.append(f"- `{sha}` — **{name}** ({kind}{size_str})")
-            lines.append("")
-
-        if tools:
-            lines.extend(["---", "## 工具记录", ""])
-            for tool in tools:
-                lines.extend([f"### {tool['name']} — {tool['status']}",
-                    f"> 轮次: {tool['turn_id'] or '未关联'} | 工具 ID: {tool['tool_id']}", ""])
-                if not exclude_tools and "arguments" in tool:
-                    lines.extend(["参数:", "", json.dumps(tool["arguments"], ensure_ascii=False), ""])
-                summary = tool["output_summary"]
-                lines.extend(["结果摘要:", "", summary if isinstance(summary, str) else json.dumps(summary, ensure_ascii=False), ""])
-                if not tool["output_complete"]:
-                    lines.extend(["> 输出来源为已保存的过程更新，未记录完整最终输出。", ""])
-                if tool.get("error"):
-                    lines.extend(["错误:", "", json.dumps(tool["error"], ensure_ascii=False), ""])
-
-        content = "\n".join(lines).encode("utf-8")
-        return Response(
-            content=content,
-            media_type="text/markdown; charset=utf-8",
-            headers=_export_headers("md"),
-        )
+        return await asyncio.to_thread(_render_export, view)
 
     @router.get("/api/threads/{thread_id}/user-input-fixture-capture")
     async def user_input_fixture_capture(thread_id: str) -> Any:
@@ -2544,9 +2559,10 @@ def create_conversation_router(
         except CommandAPIError as exc:
             status = 404 if exc.error.category is ErrorCategory.NOT_FOUND else 403
             return JSONResponse(_error_body(exc), status_code=status)
-        metadata = service.platform.artifact_metadata(thread_id, sha256)
-        attached = metadata is not None
-        content = service.conv.read_artifact_content(sha256) if attached else None
+        metadata = await asyncio.to_thread(
+            service.platform.artifact_metadata, thread_id, sha256)
+        content = (await asyncio.to_thread(service.conv.read_artifact_content, sha256)
+                   if metadata is not None else None)
         if content is None:
             return _error_response(
                 "conversation.artifact.not_found",

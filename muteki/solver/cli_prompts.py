@@ -31,7 +31,8 @@ _CTF_WORKER_SYSTEM = """完成交给你的一个 step。根据真实工具反馈
 - save_poc: `python3 "$MUTEKI_BLACKBOARD_SCRIPT" save-poc '<路径>' --entry-command '<命令>'`
 - 读取最新整图: `python3 "$MUTEKI_BLACKBOARD_SCRIPT" context`
 - 核对图中引用的原始工具输出: `python3 "$MUTEKI_BLACKBOARD_SCRIPT" read-artifact '<artifact ID>'`
-真实输出出现候选 Flag 时立即原样 submit-flag；只有另有确认的新结论才提交 Fact。"""
+真实输出出现候选 Flag 时立即原样 submit-flag；只有另有确认的新结论才提交 Fact。
+修正旧 Fact 时可在 submit-fact 中使用 --supersedes，保留其中仍成立的已测信息并写明修正依据。"""
 
 _PENTEST_WORKER_PREFIX = """你是授权渗透测试 Worker，只执行分配的一个有界 Step。
 先读初始 Prompt 已交付的当前 Step 共享图投影和授权范围。无需为重复读取这些内容而在开始时调用 context；当团队状态有新变化，或确需核对最新状态时再调用，它会返回当前完整的角色范围内容。可联网查阅公开文档、漏洞资料和工具说明，但只对明确授权的目标执行渗透测试；不要把外部资料站点当成测试目标。公开资料只能帮助提出假设，不能替代本次目标的工具证据。不进行破坏性测试、持久化或横向移动。若范围或授权有歧义，立即 request-input。
@@ -74,7 +75,8 @@ _PENTEST_FGS_EXPLORE_PROMPT = (
 
 _CTF_BLACKBOARD_PROTOCOL = (
     "团队操作：`python3 \"$MUTEKI_BLACKBOARD_SCRIPT\" context` 读取最新整图；"
-    "`python3 \"$MUTEKI_BLACKBOARD_SCRIPT\" read-artifact '<artifact ID>'` 核对图中引用的原始工具输出；"
+    "`python3 \"$MUTEKI_BLACKBOARD_SCRIPT\" read-artifact '<artifact ID>'` 核对图中引用的原始工具输出，"
+    "需要原始执行命令时加 `--with-command`；"
     "`python3 \"$MUTEKI_BLACKBOARD_SCRIPT\" submit-fact '<title>' '<content>'` "
     "起草确认的新事实，再用 `python3 \"$MUTEKI_BLACKBOARD_SCRIPT\" commit-step` 定稿；"
     "有限实验排除了明确假设时用 `python3 \"$MUTEKI_BLACKBOARD_SCRIPT\" "
@@ -89,8 +91,8 @@ _CTF_FACT_ASSERTION_NOTE = (
 )
 
 _CTF_WORKER_REMINDERS = (
-    "停止新增实验。确认的新事实用 submit-fact、commit-step 交接；有界排除用 mark-deadend；未完成则交接实际进度，不制造 Fact。",
-    "本轮探索时间已超建议上限。聚焦当前 Step，交接已试和未试范围；没有确认事实时如实结束。",
+    "尚未收束:请立即停止新的探测命令。若已有实测增量观察,调用 submit_fact 起草结论后再调 commit_step 定稿;若尚未开展新探测,直接调 commit_step 收束本 Step(不要提交“尚未验证”的占位 Fact)。",
+    "本轮探索时间已超建议上限,请尽快汇总已确认的实测事实并调用 submit_fact + commit_step 收束本 Step(若无新探测结果可直接调 commit_step)。",
 )
 
 
@@ -110,6 +112,20 @@ _EXEC_PROMPT = (
     "Flag 格式为 {fmt}。真实输出出现准确值后立即提交。"
 )
 
+_CAMPAIGN_PROMPT = (
+    "Complete the entire authorized CTF challenge in this one Worker session.\n\n"
+    "{ctx}\n{kb}\n"
+    "Use real tools and inspect their complete evidence. Save useful observations, "
+    "bounded dead ends and reusable PoCs. submit-fact followed by commit-step "
+    "publishes an atomic checkpoint in this campaign; its finish_worker=false "
+    "receipt means continue working in the same session. A reusable primitive "
+    "is progress toward the challenge, not its completion.\n"
+    "Submit each evidence-backed candidate with submit-flag immediately. Read "
+    "platform feedback through Blackboard context; local candidate registration "
+    "does not prove acceptance. Continue until the platform confirms every "
+    "required flag or the harness stops this Worker. Flag format: {fmt}.\n"
+)
+
 _EXPLORE_PROMPT = (
     "完成当前 CTF Step。\n\n"
     "{ctx}\n"
@@ -121,7 +137,9 @@ _EXPLORE_PROMPT = (
     "系统 `/tmp` 里的同名题目目录。有限方向被排除时用 mark-deadend；未完成时如实结束，不制造 Fact。"
     "真实输出出现候选 Flag 时先原样提交；仅有确认的新结论才完成 Fact 交接。\n\n"
     "需要让隧道、代理或监听器跨 Worker 持续运行时，使用共享 tmux server："
-    "`tmux -S \"$MUTEKI_TMUX_SOCKET\" new-window -d -t shared -n <名称> "
+    "`(tmux -S \"$MUTEKI_TMUX_SOCKET\" has-session -t shared 2>/dev/null || "
+    "tmux -S \"$MUTEKI_TMUX_SOCKET\" new-session -d -s shared) && "
+    "tmux -S \"$MUTEKI_TMUX_SOCKET\" new-window -d -t shared -n <名称> "
     "-c \"$PWD/shared\" '<命令> >> <名称>.log 2>&1'`。\n\n"
     f"{_CTF_BLACKBOARD_PROTOCOL}"
     "Flag 格式为 {fmt}。真实输出出现准确值后立即提交。"

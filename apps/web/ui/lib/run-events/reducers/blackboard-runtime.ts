@@ -12,6 +12,30 @@ import type { BlackboardReducerContext } from "./blackboard-context";
 
 export function reduceBlackboardRuntime({ ev, s, p, bb, actor, tlabel }: BlackboardReducerContext): boolean {
   switch (p.kind) {
+        case "challenger_started": {
+          bb.challenger = {
+            status: "running", startedTs: ev.ts,
+            mode: p.mode === "pentest" || p.mode === "ctf" ? p.mode : s.mode,
+          };
+          tlabel("Challenger started");
+          break;
+        }
+        case "challenger_finished":
+        case "challenger_committed":
+        case "challenger_failed": {
+          const status = p.kind === "challenger_failed" ? "failed"
+            : p.kind === "challenger_committed" ? "committed" : "finished";
+          bb.challenger = {
+            ...bb.challenger, status,
+            mode: p.mode === "pentest" || p.mode === "ctf" ? p.mode : bb.challenger.mode ?? s.mode,
+            ...(status === "failed" ? { failedTs: ev.ts, finishedTs: ev.ts,
+              error: String(p.error ?? ""), code: p.code ? String(p.code) : undefined }
+              : status === "committed" ? { committedTs: ev.ts } : { finishedTs: ev.ts }),
+            ...(typeof p.proposed === "number" ? { proposed: p.proposed } : {}),
+          };
+          tlabel(`Challenger ${status}${typeof p.proposed === "number" ? ` · ${p.proposed} step(s)` : ""}${p.error ? `: ${p.error}` : ""}`);
+          break;
+        }
         case "runtime_degraded":
         case "worker_backend_degraded": {
           tlabel(`${actor} runtime degraded: ${p.reason ?? p.backend ?? "unknown"}`);

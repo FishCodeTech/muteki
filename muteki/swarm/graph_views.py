@@ -23,7 +23,8 @@ from muteki.models.solve_graph import Challenge, Evidence, SolveGraph  # noqa: F
 from muteki.swarm.graph_defs import (  # noqa: F401
     EV_FACT_ADDED, EV_HYP_PROPOSED, EV_HYP_REFUTED, EV_DEAD_END,
     EV_INTENT_PROPOSED, EV_INTENT_CLAIMED, EV_INTENT_CONCLUDED,
-    EV_FLAG_FOUND, EV_FLAG_INVALIDATED,     EV_FINDING_FOUND, EV_FINDING_INVALIDATED,
+    EV_FLAG_FOUND, EV_FLAG_INVALIDATED, EV_PLATFORM_VERDICT,
+    EV_FINDING_FOUND, EV_FINDING_INVALIDATED,
     EV_POC_SAVED, EV_POC_CLAIMED, EV_POC_CONCLUDED,
     EV_REVIEW_FINDING, EV_FACT_CHALLENGED, EV_FACT_REVALIDATED,
     EV_ROUTE_SUPPRESSED, EV_ROUTE_REOPENED, EV_BRANCH_SPLIT, EV_BRANCH_RESOLVED,
@@ -44,6 +45,16 @@ from muteki.swarm.graph_defs import (  # noqa: F401
 
 
 class _QueriesViewsMixin:
+    def platform_verdicts(self) -> list[dict[str, Any]]:
+        """Read exact external receipts for the current challenge, in sequence."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT payload FROM events WHERE challenge_id=? AND kind=? "
+                "ORDER BY seq",
+                (self.challenge.id, EV_PLATFORM_VERDICT),
+            ).fetchall()
+        return [json.loads(raw or "{}") for (raw,) in rows]
+
     def invalidated_flags(self) -> set[str]:
         """Every flag the operator marked false (an EV_FLAG_INVALIDATED event).
 
@@ -300,9 +311,9 @@ class _QueriesViewsMixin:
 
         Only active, admitted Facts enter this materialized planning view."""
         g = SolveGraph(challenge=self.challenge)
-        ctf_mode = getattr(self.challenge, "mode", "ctf") == "ctf"
-        fact_reviews = {} if ctf_mode else self._fact_review_map()
-        fact_states = {} if ctf_mode else self._fact_state_map()
+        fact_reviews = self._fact_review_map()
+        fact_states = self._fact_state_map()
+        cutoff = self.current_visit_wave_cutoff()
         for e in self.events():
             p = e["payload"]
             if e["kind"] == EV_FACT_ADDED:
@@ -331,7 +342,8 @@ class _QueriesViewsMixin:
                     witness=p.get("witness"), verifier=p.get("verifier", ""),
                 )
             elif e["kind"] == EV_DEAD_END:
-                g.mark_dead_end(p.get("reason", ""))
+                if int(e["seq"]) > cutoff:
+                    g.mark_dead_end(p.get("reason", ""))
             elif e["kind"] == EV_FLAG_FOUND:
                 # multi-flag: ACCUMULATE (was a last-wins overwrite that lost every
                 # flag but the last). add_flag dedups + keeps flag==flags[0].
@@ -356,15 +368,23 @@ class _QueriesViewsMixin:
                    max_dead_ends: Optional[int] = None) -> str:
         """Like SolveGraph.to_summary but with [seq] labels on each fact so the
         Reason model can reference specific facts by number in its `from` field."""
-        base = self.snapshot().to_summary(max_evidence=max_evidence,
-                                          max_dead_ends=max_dead_ends)
+        snapshot = self.snapshot()
+        if getattr(self.challenge, "platform_confirmation_required", False):
+            accepted = {
+                str(receipt.get("flag") or "")
+                for receipt in self.platform_verdicts()
+                if receipt.get("status") in {"accepted", "duplicate"}
+            }
+            snapshot.flags = [flag for flag in snapshot.flags if flag in accepted]
+            snapshot.flag = snapshot.flags[0] if snapshot.flags else None
+        base = snapshot.to_summary(max_evidence=max_evidence,
+                                   max_dead_ends=max_dead_ends)
         seq_map = self._fact_seq_map()
         if not seq_map:
             return base
         for fact_text, seq in seq_map.items():
-            short = fact_text[:80]
-            old_marker = f") {short}"
-            new_marker = f") [#{seq}] {short}"
+            old_marker = f") {fact_text}"
+            new_marker = f") [#{seq}] {fact_text}"
             base = base.replace(old_marker, new_marker, 1)
         return base
 
@@ -406,30 +426,20 @@ class _QueriesViewsMixin:
         Unadmitted legacy candidates and challenged/terminal Facts are audit
         history only.  The returned set is the sole default planning boundary.
         """
-        states = (
-            {}
-            if getattr(self.challenge, "mode", "ctf") == "ctf"
-            else self._fact_state_map()
-        )
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT seq,verified FROM events WHERE challenge_id=? AND kind=?",
-                (self.challenge.id, EV_FACT_ADDED),
-            ).fetchall()
-        out: set[int] = set()
-        for seq_raw, original_verified in rows:
-            seq = int(seq_raw)
-            st = states.get(seq, {})
-            state = st.get("state", FACT_STATE_UNRESOLVED)
-            if (st.get("retired") or state in _FACT_TERMINAL_STATES
-                    or state == FACT_STATE_CHALLENGED):
-                continue
-            effective = st.get("verified_effective")
-            admitted = bool(original_verified) if effective is None else bool(effective)
-            if not admitted:
-                continue
-            out.add(seq)
-        return out
+            return self._active_fact_seq_set_locked()
+
+    def _active_fact_seq_set_locked(self) -> set[int]:
+        """Read the same admission boundary inside a caller-owned transaction."""
+        rows = self._conn.execute(
+            "SELECT e.seq FROM events e LEFT JOIN fact_states fs ON fs.fact_seq=e.seq "
+            "WHERE e.challenge_id=? AND e.kind=? AND fs.retired_seq IS NULL "
+            "AND COALESCE(fs.state,'unresolved') NOT IN "
+            "('challenged','rejected','merged','superseded') "
+            "AND COALESCE(fs.verified_effective,e.verified)=1",
+            (self.challenge.id, EV_FACT_ADDED),
+        ).fetchall()
+        return {int(row[0]) for row in rows}
 
     def fact_seqs_for_texts(self, texts: list[str]) -> list[int]:
         """Resolve fact description strings to their event seq numbers."""
@@ -513,7 +523,7 @@ class _QueriesViewsMixin:
                 t = texts.get(s)
                 if t:
                     chain.append(t)
-            out[flag] = chain[:12]
+            out[flag] = chain
         return out
 
     # ── P2A: canonical credential / unlock chain (read-side, text-derived) ────
@@ -834,7 +844,7 @@ class _QueriesViewsMixin:
         if not clean:
             return []
         pinned: list[int] = []
-        detail = (reason or "").strip()[:500]
+        detail = (reason or "").strip()
         for seq in clean:
             ev_seq = self._append(
                 EV_FACT_PINNED,
@@ -916,7 +926,7 @@ class _QueriesViewsMixin:
             verdict = "verified" if is_verified else "candidate"
             lines.append(
                 f"- [#{seq}] {verdict} ({source or 'unknown'}, "
-                f"confidence={float(confidence or 0):.2f}) {str(fact)[:220]}"
+                f"confidence={float(confidence or 0):.2f}) {str(fact)}"
             )
         if not lines:
             return ""
@@ -971,11 +981,8 @@ class _QueriesViewsMixin:
             if getattr(c, "mode", "ctf") == "ctf"
             else [f"# Challenge: {c.name} [{c.category}] ({c.points} pts)"]
         )
-        fact_states = (
-            {}
-            if getattr(self.challenge, "mode", "ctf") == "ctf"
-            else self._fact_state_map()
-        )
+        fact_states = self._fact_state_map()
+        after_seq = max(int(after_seq), self.current_visit_wave_cutoff())
         want = sorted(fact_seqs)
         if want:
             q = ",".join("?" for _ in want)
@@ -1042,10 +1049,10 @@ class _QueriesViewsMixin:
             iid = str(row["intent_id"])
             src = sources.get(iid, [])
             prod = products.get(iid, [])
-            src_txt = ", ".join(f"#{seq} {texts.get(seq, '')[:80]}" for seq in src) or "no source facts"
+            src_txt = ", ".join(f"#{seq} {texts.get(seq, '')}" for seq in src) or "no source facts"
             prod_txt = ", ".join(f"#{seq}" for seq in prod) or "no products yet"
             lines.append(
-                f"- {iid} ({row['status']}): {str(row['goal'])[:140]} <= {src_txt}; "
+                f"- {iid} ({row['status']}): {str(row['goal'])} <= {src_txt}; "
                 f"products: {prod_txt}")
         return "\n".join(lines)
 
@@ -1146,10 +1153,11 @@ class _QueriesViewsMixin:
         route = (route_hash or "").strip()
         epoch = (target_epoch or "").strip()
         with self._lock:
+            cutoff = self._current_visit_wave_cutoff_locked()
             rows = self._conn.execute(
                 "SELECT seq, ts, actor, payload FROM events "
-                "WHERE challenge_id=? AND kind=? ORDER BY seq DESC",
-                (self.challenge.id, EV_DEAD_END),
+                "WHERE challenge_id=? AND kind=? AND seq>? ORDER BY seq DESC",
+                (self.challenge.id, EV_DEAD_END, cutoff),
             ).fetchall()
         out: list[dict] = []
         for seq, ts, actor, payload in rows:

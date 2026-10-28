@@ -211,6 +211,14 @@ function CoordBubble({
           <summary>{text.slice(0, 240).trimEnd()}…</summary>
           <div className="body">{text}</div>
         </details>
+      ) : text.trimStart().startsWith("{") && /error|request_id|too many|quota|rate.?limit/i.test(text) && text.trim().length > 60 ? (
+        <details className="coord-fold coord-error">
+          <summary>{(() => {
+            const code = text.match(/\b([45]\d\d)\b/);
+            return code ? t("msg.errorHttp", { code: code[1] }) : (text.split("\n")[0] || text).slice(0, 120);
+          })()}</summary>
+          <div className="body">{text}</div>
+        </details>
       ) : (
         <div className="body">{text}</div>
       )}
@@ -299,9 +307,20 @@ function ProgressBriefBubble({
         {clock(ts) && <time>{clock(ts)}</time>}
       </header>
       <div className="progress-brief-summary">
-        {brief.summaryKey
-          ? t(brief.summaryKey, brief.summaryVars)
-          : brief.summary || t(`progress.headline.${brief.kind}`)}
+        {(() => {
+          const summary = brief.summaryKey
+            ? t(brief.summaryKey, brief.summaryVars)
+            : brief.summary || t(`progress.headline.${brief.kind}`);
+          const rawAt = summary.indexOf('{"');
+          if (rawAt < 0 || !/error|request.?id|too many|quota|rate.?limit/i.test(summary.slice(rawAt))) return summary;
+          const code = summary.match(/\b([45]\d\d)\b/);
+          return (
+            <details className="coord-fold coord-error">
+              <summary>{code ? t("msg.errorHttp", { code: code[1] }) : summary.slice(0, rawAt).trim()}</summary>
+              <div className="body">{summary}</div>
+            </details>
+          );
+        })()}
       </div>
       {visible.length > 0 && (
         <Accordion hideSeparator className="progress-brief-details">
@@ -446,7 +465,7 @@ function FlowPopover({
           : t("flow.metricsCtf", {
               workers: `${digest.onlineWorkers}/${digest.totalWorkers}`,
               facts: digest.verified,
-              steps: digest.openSteps,
+              steps: digest.steps,
               goals: digest.goals,
               hitl: hitlCount,
             })}</span>
@@ -502,7 +521,7 @@ function StatusHero({ digest, hitlCount, progress, t }: { digest: SwarmDigest; h
       ? t("hero.pentestGoalMet")
       : digest.goalWhy || t("hero.detail.goalMet");
   } else if (digest.phase === "finished") {
-    detail = t("hero.detail.finishedCtf", { facts: digest.verified, steps: digest.openSteps });
+    detail = t("hero.detail.finishedCtf", { facts: digest.verified, steps: digest.steps });
   } else if (digest.phase === "racing") {
     detail = digest.verifyingActive > 0 || digest.raceTotal > 0
       ? t("hero.detail.racingVerify", {
@@ -1458,7 +1477,7 @@ function Composer({
                 </>
               ) : null}
             </div>
-            <div className="command-hint">{followupPending ? "正在处理后续操作…" : t("composer.finishedHint")}</div>
+            <div className="command-hint">{followupPending ? "正在处理后续操作…" : mode === "pentest" ? t("composer.finishedHint.pentest") : t("composer.finishedHint")}</div>
           </div>
           {mode === "ctf" && solved && markFalseOpen && flags.length > 1 ? (
             <div className="markfalse-picker" role="group" aria-label={t("quick.markFalseTitle")}>{flags.map((flag) => (
@@ -1520,7 +1539,7 @@ function Composer({
               <span className="command-hint">任务正在结束，请等待完成事件</span>
             )}
           </div>
-          <div className="command-hint">{running ? t("composer.steerHint") : t("composer.finishedHint")}</div>
+          <div className="command-hint">{running ? t("composer.steerHint") : mode === "pentest" ? t("composer.finishedHint.pentest") : t("composer.finishedHint")}</div>
         </div>
         {mode === "ctf" && solved && markFalseOpen && flags.length > 1 && (
           <div className="markfalse-picker" role="group" aria-label={t("quick.markFalseTitle")}>

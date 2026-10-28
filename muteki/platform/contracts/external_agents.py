@@ -107,6 +107,9 @@ class AgentCapabilities(ContractModel):
     # changes. True: the adapter honors ``MessagePayload.interaction_mode`` on
     # every turn of a live session.
     plan_mode_per_turn: bool = True
+    # True only when all three MessagePayload model, effort and service_tier
+    # selections are honored on each send without reopening the native agent.
+    model_options_per_turn: bool = False
     # Native multimodal image input (Codex localImage/image, Claude image
     # content blocks, Pi prompt.images). When False, Conversation still
     # stages attachments into the workspace and injects explicit paths.
@@ -233,6 +236,9 @@ class SessionOptions(ContractModel):
     session_dir: str = ""
     chat_native_extensions: list[str] = Field(default_factory=list)
     chat_native_agents: list[str] = Field(default_factory=list)
+    # Kimi Local Server prompt policy. The server applies this list before
+    # exposing tools to the model and persists it with the native session.
+    disabled_tools: list[str] = Field(default_factory=list)
     # OpenCode.
     title: Optional[str] = None
     # Solver CLI driver.
@@ -321,6 +327,11 @@ class MessagePayload(ContractModel):
     client_user_message_id: str = ""
     # Per-turn planning mode; "plan" requires AgentCapabilities.plan_mode.
     interaction_mode: Literal["default", "plan"] = "default"
+    # None keeps the session's launch selection for this field; an explicit
+    # empty string resets it to the runtime default on this turn.
+    model: Optional[str] = None
+    effort: Optional[str] = None
+    service_tier: Optional[str] = None
 
 
 class SteerPayload(ContractModel):

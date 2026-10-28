@@ -523,6 +523,28 @@ class DroidRpcAdapter(BaseExternalAgentAdapter):
 
     # -- probe ---------------------------------------------------------------
 
+    def declared_chat_capabilities(self) -> AgentCapabilities:
+        caps = AgentCapabilities(
+            transport_kind="rpc",
+            capability_source="adapter_reported",
+            access_modes=list(ACCESS_MODE_VALUES),
+            streaming=True,
+            tool_events=True,
+            approval=True,
+            user_input=True,
+            interrupt=True,
+            resume=True,
+            session_persistence=True,
+            mcp=True,
+            usage_events=True,
+            compaction=True,
+            context_usage=True,
+            steer=False,
+            plan_mode=False,
+            subagents=False,
+        )
+        return caps
+
     async def probe(self, request: ProbeRequest) -> AgentCapabilities:
         del request
         result = await probe_version(
@@ -543,26 +565,9 @@ class DroidRpcAdapter(BaseExternalAgentAdapter):
                 detail=detail,
             )
             return caps
-        caps = AgentCapabilities(
-            transport_kind="rpc",
-            capability_source=SOURCE_PROBE,
-            runtime_version=result.version,
-            access_modes=list(ACCESS_MODE_VALUES),
-            streaming=True,
-            tool_events=True,
-            approval=True,
-            user_input=True,
-            interrupt=True,
-            resume=True,
-            session_persistence=True,
-            mcp=True,
-            usage_events=True,
-            compaction=True,
-            context_usage=True,
-            steer=False,
-            plan_mode=False,
-            subagents=False,
-        )
+        caps = self.declared_chat_capabilities()
+        caps.capability_source = SOURCE_PROBE
+        caps.runtime_version = result.version
         self._probe_cache = CapabilityProbeReport(
             adapter_id=self.identity.adapter_id,
             instance_id=self.identity.instance_id,
@@ -960,10 +965,12 @@ class DroidRpcAdapter(BaseExternalAgentAdapter):
             return base
         live = self._live.get(session.agent_session_id)
         if live is None or live.session is None:
-            return base.model_copy(update={
+            from .command_providers import detached_compaction_snapshot, operation_item
+            return detached_compaction_snapshot(base.model_copy(update={
                 "stale": True,
                 "diagnostics": ["Droid Session 当前不在本进程，动态能力目录已失效"],
-            })
+            }), operation_item(self.id, "droid", "compact", "droid.compact_session",
+                               "压缩当前 Droid 会话上下文"))
         native = live.session
         items = list(base.items)
         diagnostics: list[str] = []
@@ -1628,6 +1635,30 @@ class DroidRpcAdapter(BaseExternalAgentAdapter):
             cwd=live.cwd,
             **fields,
         ))
+        from .src_policy import NativeToolError, authorize_native_tool, src_task_id
+        if src_task_id(self._tracker._store, live.thread_id):
+            record = self._tracker.get(live.agent_session_id)
+            try:
+                await authorize_native_tool(
+                    self._tracker._store, thread_id=live.thread_id,
+                    invocation_id=f"droid:{live.agent_session_id}:{approval_id}",
+                    tool_name=str(fields.get("title") or "tool"),
+                    arguments=dict(fields), action=str(fields.get("title") or "tool"),
+                    approval_kind=str(fields.get("approval_kind") or "tool"),
+                    adapter_id="droid.rpc", run_id=record.run_id if record else None, cwd=live.cwd,
+                    environment_generation=(record.execution_generation or 0) if record else 0,
+                )
+            except NativeToolError:
+                if _CANCEL not in offered:
+                    raise DroidFailure(
+                        "droid.approval.no_turn",
+                        "SRC policy denied an action that cannot be cancelled")
+                return request.respond(ToolConfirmationOutcome(_CANCEL))
+            if _ONCE not in offered:
+                raise DroidFailure(
+                    "droid.approval.no_turn",
+                    "SRC policy allowed an action but Droid has no once option")
+            return request.respond(ToolConfirmationOutcome(_ONCE))
         if _ONCE in offered and self._auto_allow(live, request, payload):
             return request.respond(ToolConfirmationOutcome(_ONCE))
         queue = live.queue

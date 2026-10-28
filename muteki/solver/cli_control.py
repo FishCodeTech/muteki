@@ -177,9 +177,13 @@ def _stop_on_sibling_flag(self) -> bool:
 
     Only the legacy single-flag path does this. Multi-flag collection keeps
     live workers running until ALL_FLAGS_FOUND, while still recording each peer
-    flag in _already_found so prompts avoid re-hunting it.
+    flag in _already_found so prompts avoid re-hunting it. When platform
+    confirmation is required, only platform-verified completion (ALL_FLAGS_FOUND)
+    stops sibling workers.
     """
     if bool(getattr(self.challenge, "multi_flag", False)):
+        return False
+    if bool(getattr(self.challenge, "platform_confirmation_required", False)):
         return False
     return self._expected_flags() <= 1
 
@@ -312,7 +316,7 @@ def _drain_control(self) -> None:
             continue
 
 def _maybe_steer_idle_repeat(self) -> None:
-    """Soft-correct a worker repeating the same command with unchanged output."""
+    """Record passive guidance if a worker repeats identical commands/output."""
     if self.mode in ("review", "fact_verifier"):
         return
     self._stalled_at = None
@@ -336,9 +340,7 @@ def _maybe_steer_idle_repeat(self) -> None:
     with self._guidance_lock:
         if _IDLE_REPEAT_STEER not in self._standing_guidance:
             self._standing_guidance.append(_IDLE_REPEAT_STEER)
-    if self._enable_in_turn_steer():
-        self._idle_repeat_steered = True
-        self._steer_event.set()
+    self._idle_repeat_steered = True
 
 
 def _finalize_control_context_prompt_manifest(self, prompt: str) -> None:

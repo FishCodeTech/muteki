@@ -56,13 +56,15 @@ function nodeSupported() {
 }
 
 let sdk;
+let sdkLoading;
 async function loadSdk() {
   if (!nodeSupported()) {
     throw bridgeError("cursor_sdk.node_unsupported", `Node ${process.versions.node} is older than ${MIN_NODE.join(".")}`, {
       category: "validation",
     });
   }
-  sdk ??= await import("@cursor/sdk");
+  sdkLoading ??= import("@cursor/sdk");
+  sdk ??= await sdkLoading;
   return sdk;
 }
 
@@ -215,9 +217,13 @@ function subagentResult(call) {
 
 // -- session ------------------------------------------------------------------
 
-let session = null;
+const sessions = new Map();
+const openings = new Map();
+const DEFAULT_SESSION = "standalone";
+const sessionId = (params = {}) => params.agentSessionId ?? DEFAULT_SESSION;
 
-function requireSession() {
+function requireSession(params) {
+  const session = sessions.get(sessionId(params));
   if (!session) throw bridgeError("cursor_sdk.no_session", "no agent is open in this bridge", { category: "validation" });
   return session;
 }
@@ -243,9 +249,39 @@ const FAST_PARAMETER = "fast";
 // service tier maps to Cursor's boolean `fast` parameter. Without a tier the
 // run is pinned to fast=false, because some default variants are Fast and the
 // picker labels an empty tier as standard speed.
-async function resolveModel(model, effort, serviceTier, key) {
+// One in-flight catalog per runtime; a failure stays visible and is retried
+// only when a later explicit operation requests the catalog again.
+let catalogPromise;
+function modelCatalog(key, shared = false) {
+  if (!shared) return sdk.Cursor.models.list({ apiKey: key });
+  if (!catalogPromise) {
+    catalogPromise = sdk.Cursor.models.list({ apiKey: key }).catch((error) => {
+      catalogPromise = undefined;
+      throw error;
+    });
+  }
+  return catalogPromise;
+}
+
+let sandboxPrime;
+function primeSandboxSupport(params, key, platform) {
+  sandboxPrime ??= (async () => {
+    const release = await platform.prewarmLocalWorkspace({
+      apiKey: key,
+      local: { cwd: params.cwd, settingSources: [], sandboxOptions: { enabled: true } },
+    });
+    await release();
+  })().catch((error) => {
+    // Match T3: sandbox capability priming is optional and never blocks
+    // an otherwise supported full-access agent from opening.
+    console.error("Cursor sandbox support priming failed", error);
+  });
+  return sandboxPrime;
+}
+
+async function resolveModel(model, effort, serviceTier, key, shared = false) {
   if (!effort && !serviceTier && model.id === "default") return model;
-  const catalog = await sdk.Cursor.models.list({ apiKey: key });
+  const catalog = await modelCatalog(key, shared);
   const entry = catalog.find((item) => item.id === model.id || (item.aliases ?? []).includes(model.id));
   const params = [...(model.params ?? [])];
   if (effort) {
@@ -271,15 +307,54 @@ async function resolveModel(model, effort, serviceTier, key) {
   return params.length ? { ...model, params } : model;
 }
 
+// Public platforms own their native model-validation cache. Persistent chats
+// share a store/platform; historical stores retain their original paths.
+const platforms = new Map();
+function platformFor(params, store) {
+  const create = () => sdk.createAgentPlatform({ workspaceRef: params.cwd, localStore: store });
+  if (!params.sharedPlatform) return create();
+  const key = JSON.stringify([params.cwd, params.storeDir]);
+  let platform = platforms.get(key);
+  if (!platform) {
+    platform = create().catch((error) => {
+      platforms.delete(key);
+      throw error;
+    });
+    platforms.set(key, platform);
+  }
+  return platform;
+}
+
 async function opOpen(params) {
+  if (!params.agentSessionId) return openSession(params);
+  const id = sessionId(params);
+  if (openings.has(id) || sessions.has(id)) {
+    throw bridgeError("cursor_sdk.session_open", "an agent is already opening or open in this bridge", { category: "validation" });
+  }
+  const opening = openSession(params);
+  openings.set(id, opening);
+  try {
+    return await opening;
+  } finally {
+    if (openings.get(id) === opening) openings.delete(id);
+  }
+}
+
+async function openSession(params) {
   await loadSdk();
   const key = apiKey();
-  if (session) throw bridgeError("cursor_sdk.session_open", "an agent is already open in this bridge", { category: "validation" });
+  if (sessions.has(sessionId(params))) throw bridgeError("cursor_sdk.session_open", "an agent is already open in this bridge", { category: "validation" });
   const store = new sdk.JsonlLocalAgentStore(params.storeDir);
-  const model = await resolveModel(params.model, params.effort, params.serviceTier, key);
+  // Keep the unresolved launch selection separate: a later reset must never
+  // inherit parameters appended for a previous send.
+  const launchModelOptions = {
+    model: params.model,
+    effort: params.effort ?? "",
+    serviceTier: params.serviceTier ?? "",
+  };
   const options = {
     apiKey: key,
-    model,
+    model: launchModelOptions.model,
     name: params.name ?? "muteki",
     mode: params.mode ?? "agent",
     local: localOptions(params, store),
@@ -288,11 +363,37 @@ async function opOpen(params) {
   // Keep the executor lease alive with the exact same settings and access
   // policy used by send(). Plugin installation belongs to open's startup
   // budget rather than the first send's acknowledgement budget.
-  const platform = await sdk.createAgentPlatform({ workspaceRef: params.cwd, localStore: store });
-  const releasePrewarm = await platform.prewarmLocalWorkspace(options);
+  // SDK 1.0.36 derives the executor key from local settings, access policy,
+  // MCP and subagents, independently of the selected model. Resolve the
+  // catalog while that same executor warms, rather than serializing network
+  // requests. Settle both before cleanup so a rejected catalog cannot leak a
+  // lease that finishes warming later.
+  // T3 primes the process-wide sandbox probe before full-access runs.
+  const platform = await platformFor(params, store);
+  if (params.agentSessionId && !params.sandbox) await primeSandboxSupport(params, key, platform);
+  const [selection, prewarm] = await Promise.allSettled([
+    resolveModel(launchModelOptions.model, launchModelOptions.effort, launchModelOptions.serviceTier, key, Boolean(params.agentSessionId)),
+    platform.prewarmLocalWorkspace(options),
+  ]);
+  if (selection.status === "rejected" || prewarm.status === "rejected") {
+    const errors = [];
+    if (selection.status === "rejected") errors.push(selection.reason);
+    if (prewarm.status === "rejected") errors.push(prewarm.reason);
+    else {
+      try { await prewarm.value(); }
+      catch (error) { errors.push(error); }
+    }
+    if (errors.length === 1) throw errors[0];
+    throw new AggregateError(errors, "Model selection and executor warmup failed", { cause: errors[0] });
+  }
+  const model = selection.value;
+  options.model = model;
+  const releasePrewarm = prewarm.value;
   let agent;
   try {
-    agent = params.agentId ? await sdk.Agent.resume(params.agentId, options) : await sdk.Agent.create(options);
+    agent = params.sharedPlatform
+      ? (params.agentId ? await platform.resumeAgent(params.agentId, options) : await platform.createAgent(options))
+      : (params.agentId ? await sdk.Agent.resume(params.agentId, options) : await sdk.Agent.create(options));
   } catch (error) {
     try {
       await releasePrewarm();
@@ -301,12 +402,16 @@ async function opOpen(params) {
     }
     throw error;
   }
-  session = {
+  const session = {
+    id: sessionId(params),
+    multiplexed: Boolean(params.agentSessionId),
     agent,
     releasePrewarm,
     key,
     store,
     model,
+    launchModelOptions,
+    modelOptionsKey: JSON.stringify(launchModelOptions),
     cwd: params.cwd,
     runOptions: { runtime: "local", cwd: params.cwd, store },
     run: null,
@@ -314,18 +419,19 @@ async function opOpen(params) {
     recovered: false,
     resumed: Boolean(params.agentId),
   };
+  sessions.set(session.id, session);
   return { agentId: agent.agentId, resumed: session.resumed };
 }
 
-function emit(turn, kind, fields = {}) {
-  send({ type: "event", kind, turn, ...fields });
+function emit(s, turn, kind, fields = {}) {
+  send({ type: "event", ...(s.multiplexed ? { agentSessionId: s.id } : {}), kind, turn, ...fields });
 }
 
-function handleUpdate(turn, update, nestedOf) {
+function handleUpdate(s, turn, update, nestedOf) {
   const type = update?.type;
   const wrap = (kind, fields) => {
-    if (nestedOf) emit(turn, "nested", { parentCallId: nestedOf, update: { kind, ...fields } });
-    else emit(turn, kind, fields);
+    if (nestedOf) emit(s, turn, "nested", { parentCallId: nestedOf, update: { kind, ...fields } });
+    else emit(s, turn, kind, fields);
   };
   switch (type) {
     case "text-delta":
@@ -344,7 +450,7 @@ function handleUpdate(turn, update, nestedOf) {
       const call = update.toolCall;
       if (call?.type === "task" && !nestedOf) {
         const a = call.args ?? {};
-        emit(turn, "tool_start", {
+        emit(s, turn, "tool_start", {
           callId: update.callId,
           ...describeTool(call),
           subagent: {
@@ -372,13 +478,13 @@ function handleUpdate(turn, update, nestedOf) {
       break;
     }
     case "tool-call-delta":
-      if (!nestedOf && update.taskUpdate) handleUpdate(turn, update.taskUpdate, update.callId);
+      if (!nestedOf && update.taskUpdate) handleUpdate(s, turn, update.taskUpdate, update.callId);
       break;
     case "shell-output-delta":
       wrap("tool_output", { event: update.event ?? null });
       break;
     case "turn-ended":
-      if (!nestedOf && update.usage) session.turnUsage = update.usage;
+      if (!nestedOf && update.usage) s.turnUsage = update.usage;
       break;
     default:
       break;
@@ -386,26 +492,49 @@ function handleUpdate(turn, update, nestedOf) {
 }
 
 async function opSend(params) {
-  const s = requireSession();
+  const s = requireSession(params);
+  if (!s.multiplexed) return sendSession(s, params);
+  if (s.sending) throw bridgeError("cursor_sdk.turn_active", "a turn is already starting in this bridge", { category: "provider" });
+  const sending = sendSession(s, params);
+  s.sending = sending;
+  try {
+    return await sending;
+  } finally {
+    if (s.sending === sending) s.sending = null;
+  }
+}
+
+async function sendSession(s, params) {
   if (s.run) throw bridgeError("cursor_sdk.turn_active", "a turn is already running in this bridge", { category: "provider" });
   const turn = String(params.turn);
+  const modelOptions = {
+    model: params.model ?? s.launchModelOptions.model,
+    effort: params.effort ?? s.launchModelOptions.effort,
+    serviceTier: params.serviceTier ?? s.launchModelOptions.serviceTier,
+  };
+  const modelOptionsKey = JSON.stringify(modelOptions);
+  // Reuse the validated selection for unchanged turns, including the first
+  // send after open. Changed selections still use the real model catalog.
+  const model = modelOptionsKey === s.modelOptionsKey ? s.model : await resolveModel(
+    modelOptions.model, modelOptions.effort, modelOptions.serviceTier, s.key, s.multiplexed,
+  );
   // Match T3's CursorAgentSdk callback chain: the SDK may finish successfully
   // even when onDelta failed. Preserve that first failure through run.wait().
   const callbacks = { chain: Promise.resolve(), failure: null };
   const sendOptions = {
     mode: params.mode ?? "agent",
-    model: s.model,
+    model,
     ...(params.mcpServers && Object.keys(params.mcpServers).length ? { mcpServers: params.mcpServers } : {}),
     onDelta: ({ update }) => {
       callbacks.chain = callbacks.chain.then(() => {
         if (callbacks.failure) return;
-        handleUpdate(turn, update, null);
+        handleUpdate(s, turn, update, null);
       }).catch((error) => {
         callbacks.failure ??= bridgeError("cursor_sdk.delta_mapping_failed",
           String(error?.message ?? error), { category: "transport",
             detail: error?.stack ? String(error.stack) : "", cause: describeError(error) });
         console.error("delta mapping failed", error);
-        emit(turn, "bridge_warning", { code: "cursor_sdk.delta_mapping_failed",
+        emit(s, turn, "bridge_warning", { code: "cursor_sdk.delta_mapping_failed",
           message: String(error?.message ?? error), detail: error?.stack ? String(error.stack) : "" });
       });
       return callbacks.chain;
@@ -431,14 +560,22 @@ async function opSend(params) {
       throw error;
     }
   }
+  // SDKAgent.model changes after send accepts the selection. A refused send
+  // must leave our cached selection untouched as well.
+  s.model = model;
+  s.modelOptionsKey = modelOptionsKey;
   s.run = run;
   s.turnKey = turn;
-  settle(s, run, turn, callbacks);
-  return { runId: run.id, steer: typeof run.steer === "function" };
+  s.settled = settle(s, run, turn, callbacks);
+  return {
+    runId: run.id,
+    steer: typeof run.steer === "function",
+    modelOptions: { ...modelOptions, model },
+  };
 }
 
 function settle(s, run, turn, callbacks) {
-  (async () => {
+  return (async () => {
     let result = null;
     let failure = null;
     try {
@@ -451,9 +588,9 @@ function settle(s, run, turn, callbacks) {
     s.run = null;
     if (failure) {
       if (s.cancelRequested && isAbortChain(failure)) {
-        emit(turn, "turn_end", { status: "cancelled", usage: s.turnUsage ?? null });
+        emit(s, turn, "turn_end", { status: "cancelled", usage: s.turnUsage ?? null });
       } else {
-        emit(turn, "turn_end", { status: "error", error: describeError(failure), usage: s.turnUsage ?? null });
+        emit(s, turn, "turn_end", { status: "error", error: describeError(failure), usage: s.turnUsage ?? null });
       }
       return;
     }
@@ -475,12 +612,13 @@ function settle(s, run, turn, callbacks) {
           : {}),
       };
     }
-    emit(turn, "turn_end", fields);
+    emit(s, turn, "turn_end", fields);
   })();
 }
 
-async function opCancel() {
-  const s = requireSession();
+async function opCancel(params) {
+  const s = requireSession(params);
+  if (s.multiplexed) await s.sending;
   const run = s.run;
   if (!run) return { cancelled: false };
   s.cancelRequested = true;
@@ -493,7 +631,7 @@ async function opCancel() {
 }
 
 async function opSteer(params) {
-  const s = requireSession();
+  const s = requireSession(params);
   const run = s.run;
   if (!run) throw bridgeError("cursor_sdk.no_active_turn", "no turn is running", { category: "validation" });
   if (params.turn && String(params.turn) !== s.turnKey) {
@@ -523,29 +661,63 @@ async function cancelActiveRuns(s) {
   return active.map((run) => run.id);
 }
 
-async function opRecover() {
-  const s = requireSession();
+async function opRecover(params) {
+  const s = requireSession(params);
   const cancelledRunIds = await cancelActiveRuns(s);
   if (s.run && cancelledRunIds.includes(s.run.id)) s.run = null;
   return { cancelledRunIds };
 }
 
-async function opHistory() {
-  const s = requireSession();
+async function opHistory(params) {
+  const s = requireSession(params);
   const messages = await sdk.Agent.messages.list(s.agent.agentId, { runtime: "local", cwd: s.cwd, store: s.store });
   return { messages };
 }
 
-async function opClose() {
-  if (session) {
-    const closing = session;
-    try {
-      closing.agent.close();
-    } finally {
-      session = null;
-      await closing.releasePrewarm();
-    }
+async function opClose(params = {}) {
+  const id = sessionId(params);
+  // Own the real opening promise so close cannot acknowledge while a later
+  // Agent.create/resume is still able to publish a native agent and lease.
+  const opening = openings.get(id);
+  if (opening) await opening;
+  const closing = sessions.get(id);
+  if (!closing) return {};
+  sessions.delete(id);
+  if (!closing.multiplexed) {
+    try { closing.agent.close(); }
+    finally { await closing.releasePrewarm(); }
+    return {};
   }
+  const errors = [];
+  try { await closing.sending; }
+  catch (error) { errors.push(error); }
+  try {
+    if (closing.run) await opCancelSession(closing);
+  } catch (error) { errors.push(error); }
+  // Native close must run even when cancellation failed.
+  try { closing.agent.close(); }
+  catch (error) { errors.push(error); }
+  try { await closing.settled; }
+  catch (error) { errors.push(error); }
+  try { await closing.releasePrewarm(); }
+  catch (error) { errors.push(error); }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length) throw new AggregateError(errors, "Cursor agent cleanup failed", { cause: errors[0] });
+  return {};
+}
+
+async function opCancelSession(s) {
+  s.cancelRequested = true;
+  try { await s.run.cancel(); }
+  catch (error) { if (!isAbortChain(error)) throw error; }
+}
+
+async function opShutdown() {
+  const results = await Promise.allSettled([...new Set([...sessions.keys(), ...openings.keys()])].map((agentSessionId) => opClose({ agentSessionId })));
+  platforms.clear();
+  const errors = results.filter((result) => result.status === "rejected").map((result) => result.reason);
+  if (errors.length === 1) throw errors[0];
+  if (errors.length) throw new AggregateError(errors, "Cursor runtime cleanup failed", { cause: errors[0] });
   return {};
 }
 
@@ -561,7 +733,7 @@ async function opHello() {
 
 async function opModels() {
   await loadSdk();
-  return { models: await sdk.Cursor.models.list({ apiKey: apiKey() }) };
+  return { models: await modelCatalog(apiKey()) };
 }
 
 // This uses the SDK 1.0.36's actual auth/dashboard endpoints and excludes variables.
@@ -611,6 +783,7 @@ const OPS = {
   recover: opRecover,
   history: opHistory,
   close: opClose,
+  shutdown: opShutdown,
 };
 
 async function dispatch(request) {
@@ -646,6 +819,6 @@ process.stdin.on("data", (chunk) => {
   }
 });
 process.stdin.on("end", async () => {
-  await opClose().catch((error) => console.error("close failed", error));
+  await opShutdown().catch((error) => console.error("close failed", error));
   process.exit(0);
 });

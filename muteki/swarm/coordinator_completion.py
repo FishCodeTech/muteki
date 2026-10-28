@@ -127,6 +127,9 @@ async def wait_for_workers_stage(self, state) -> None:
     waitables = set(state.tasks.keys())
     if state.reason_task is not None:
         waitables.add(state.reason_task)
+    challenger_task = getattr(self, "_challenger_task", None)
+    if challenger_task is not None:
+        waitables.add(challenger_task)
     if state.pentest_review_task is not None:
         waitables.add(state.pentest_review_task)
     if waitables:

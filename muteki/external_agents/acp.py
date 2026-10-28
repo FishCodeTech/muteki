@@ -1559,11 +1559,81 @@ class BaseAcpAdapter(
         """
         return None, []
 
+    def _declared_acp_chat_capabilities(self) -> AgentCapabilities:
+        """Known ACP providers opt in; initialize still validates each connection."""
+        caps = AgentCapabilities(
+            transport_kind="acp", protocol_version="1", capability_source="adapter_reported",
+            streaming=True, tool_events=True, approval=True, interrupt=True,
+            usage_events=True, context_usage=self.context_usage_reported,
+            compaction=self.compaction_reported, plan=True, resume=True,
+            session_persistence=True, acp_mcp_config=True,
+            access_modes=list(self.supported_access_modes))
+        self._probe_extra_caps(caps, None)
+        return caps
+
+    def _chat_model_config_value(self, handle: dict[str, Any], field: str, value: str) -> str:
+        return value
+
+    async def _apply_chat_model_selection(
+        self, handle: dict[str, Any], transport: AcpTransport,
+        session_id: str, input: MessageInput,
+    ) -> None:
+        config_ids = getattr(self, "chat_model_config_ids", {})
+        if not config_ids or not handle["options"].is_conversation:
+            return
+        def native_mode() -> Optional[str]:
+            setup = transport.session_setup(session_id)
+            option = next((row for row in setup.get("configOptions") or []
+                           if row.get("id") == "mode" or row.get("category") == "mode"), {})
+            return option.get("currentValue") or (setup.get("modes") or {}).get("currentModeId")
+
+        mode_before = native_mode()
+        for field, config_id in config_ids.items():
+            value = getattr(input.payload, field)
+            if value is None:
+                continue
+            value = self._chat_model_config_value(handle, field, value)
+            options = transport.session_setup(session_id).get("configOptions") or []
+            option = next((row for row in options if row.get("id") == config_id), None)
+            if option is None or option.get("currentValue") != value:
+                await transport.set_config_option(session_id, config_id, value)
+                # Model/profile changes must retain the selected access policy
+                # even if a following effort request is rejected.
+                if field == "model" and mode_before and native_mode() != mode_before:
+                    await transport.set_mode(session_id, mode_before)
+            resume = self._resume_ctx.get(str(handle.get("agent_session_id") or ""))
+            if resume is not None:
+                resume[field] = getattr(input.payload, field)
+
     # -- probe（真实 initialize 协商） -----------------------------------------
 
     def _turn_result_usage(self, result: dict[str, Any]) -> Optional[UsagePayload]:
-        """Provider-specific per-turn usage returned by session/prompt."""
-        return None
+        """ACP PromptResponse consumption, distinct from usage_update occupancy."""
+        usage = result.get("usage")
+        if not isinstance(usage, dict):
+            return None
+
+        def count(*keys: str) -> Optional[int]:
+            for key in keys:
+                value = usage.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    return value
+            return None
+
+        values = {
+            "input_tokens": count("inputTokens"),
+            "output_tokens": count("outputTokens"),
+            "total_tokens": count("totalTokens"),
+            "cached_input_tokens": count("cachedReadTokens"),
+            "cache_write_tokens": count("cachedWriteTokens"),
+        }
+        if not any(value is not None for value in values.values()):
+            return None
+        return UsagePayload(scope="turn", **values, native=dict(usage))
+
+    def _turn_usage_events(self, handle: dict[str, Any]) -> list[tuple[Any, str, dict[str, Any]]]:
+        """Optional same-session native usage at the prompt completion boundary."""
+        return []
 
     async def probe(self, request: ProbeRequest) -> AgentCapabilities:
         argv = self._with_launch_args(self._agent_argv())
@@ -1680,6 +1750,7 @@ class BaseAcpAdapter(
         env = self._prepare_session_environment(request, env, cwd)
 
         handle: dict[str, Any] = {
+            "agent_session_id": request.agent_session_id,
             "cwd": cwd,
             "env": env,
             "options": request.options,
@@ -2034,6 +2105,19 @@ class BaseAcpAdapter(
                     event = self._patch_agent_node(handle, target, patch)
                     if event is not None:
                         extra.append(event)
+        if not replay and kind == "tool_call_update":
+            status = str(update.get("status") or "")
+            if status in {"completed", "failed", "cancelled", "canceled"}:
+                call_id = str(update.get("toolCallId") or "")
+                approval_id = handle.get("src_authorization_calls", {}).pop(call_id, None)
+                authorization = handle.get("src_authorizations", {}).pop(approval_id, None) if approval_id else None
+                if authorization is not None:
+                    from .src_policy import complete_native_tool
+                    error = None
+                    if status != "completed":
+                        error = RuntimeError(f"native tool {status}")
+                        setattr(error, "code", "native_tool_failed")
+                    complete_native_tool(authorization, result=update, error=error)
         mapped = [
             (etype, native_kind, contract)
             for etype, native_kind, legacy in (
@@ -2240,6 +2324,39 @@ class BaseAcpAdapter(
             tool_call.get("kind")
             or handle.get("tool_kinds", {}).get(str(tool_call.get("toolCallId") or ""))
             or "other")
+
+        # SRC policy is evaluated before provider-native auto-allow modes. A
+        # Task Grant never becomes an engine-wide allow_always grant.
+        from .src_policy import NativeToolError, authorize_native_tool, src_task_id
+        if src_task_id(self._tracker._store, handle.get("thread_id")):
+            approval_id = str(params.get("requestId") or tool_call.get("toolCallId") or new_id("approval"))
+            approval_kind = {
+                "execute": "command_execution", "edit": "file_change",
+                "delete": "file_change", "move": "file_change",
+            }.get(tool_kind, "tool")
+            raw_input = tool_call.get("rawInput")
+            if raw_input is None:
+                raw_input = handle.get("tool_raw_inputs", {}).get(str(tool_call.get("toolCallId") or ""))
+            record = self._tracker.get(agent_session_id)
+            try:
+                authorization = await authorize_native_tool(
+                    self._tracker._store, thread_id=handle.get("thread_id"),
+                    invocation_id=f"acp:{agent_session_id}:{approval_id}",
+                    tool_name=str(tool_call.get("title") or tool_kind),
+                    arguments=dict(raw_input) if isinstance(raw_input, dict) else {"rawInput": raw_input, "toolCall": tool_call},
+                    action=str(tool_call.get("title") or tool_kind), approval_kind=approval_kind,
+                    adapter_id="acp", run_id=record.run_id if record else None, cwd=str(handle.get("cwd") or ""),
+                    environment_generation=(record.execution_generation or 0) if record else 0,
+                )
+            except NativeToolError:
+                return self._permission_option_for_mode(options, ("reject_once", "cancel"), access_mode)
+            except Exception as exc:
+                raise RuntimeError(f"SRC policy evaluation failed: {type(exc).__name__}: {exc}") from exc
+            call_id = str(tool_call.get("toolCallId") or "")
+            handle.setdefault("src_authorizations", {})[approval_id] = authorization
+            if call_id:
+                handle.setdefault("src_authorization_calls", {})[call_id] = approval_id
+            return self._permission_option_for_mode(options, ("allow_once",), access_mode)
 
         # These decisions are made by the ACP client exactly as the protocol
         # intends. Provider-native modes run first and only requests that reach
@@ -3101,6 +3218,7 @@ class BaseAcpAdapter(
 
         async def run_prompt() -> dict[str, Any]:
             try:
+                await self._apply_chat_model_selection(handle, transport, external_id, input)
                 return await transport.prompt(
                     external_id, prompt_text,
                     timeout=self.conversation_turn_timeout(
@@ -3117,6 +3235,7 @@ class BaseAcpAdapter(
         stop_reason = ""
         error: Optional[Exception] = None
         text_parts: list[str] = []
+        confirmed_compact = False
         released = False
         while True:
             if (self._release_background_turn(handle)
@@ -3134,6 +3253,10 @@ class BaseAcpAdapter(
                     and payload.get("role") == "assistant"
                     and payload.get("phase") != "commentary"):
                 text_parts.append(str(payload.get("text") or ""))
+            if (etype is AgentEventType.COMPACTION_UPDATED
+                    and payload.get("status") == "completed"
+                    and payload.get("confirmed") is not False):
+                confirmed_compact = True
             yield self.emit(build_event(
                 etype, seq,
                 external_session_id=external_id, turn_id=turn_id,
@@ -3201,6 +3324,10 @@ class BaseAcpAdapter(
             return
 
         stop_reason = str(result.get("stopReason") or "")
+        for etype, native_type, payload in self._turn_usage_events(handle):
+            yield self.emit(build_event(
+                etype, seq, external_session_id=external_id, turn_id=turn_id,
+                native_type=native_type, payload=payload, **common))
         result_usage = self._turn_result_usage(result)
         if result_usage is not None:
             yield self.emit(build_event(
@@ -3223,6 +3350,17 @@ class BaseAcpAdapter(
                     native={"stop_reason": stop_reason}),
                 **common))
         else:
+            if (confirmed_compact and input.payload.native_command
+                    and input.payload.runtime_capability.get("name") == "compact"
+                    and not "".join(text_parts).strip()):
+                # A confirmed native compact has no assistant reply by design.
+                yield self.emit(build_event(
+                    AgentEventType.TURN_COMPLETED, seq,
+                    external_session_id=external_id, turn_id=turn_id,
+                    native_type="acp.prompt.completed",
+                    payload=TurnCompletedPayload(stop_reason=stop_reason or "end_turn"),
+                    **common))
+                return
             for event in self.completed_turn_events(
                 seq, text="".join(text_parts),
                 common={**common, "external_session_id": external_id, "turn_id": turn_id},

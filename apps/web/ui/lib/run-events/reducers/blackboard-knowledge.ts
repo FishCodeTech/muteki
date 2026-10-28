@@ -66,11 +66,47 @@ function appendObservation(rows: FactObservation[] | undefined, row: FactObserva
 
 export function reduceBlackboardKnowledge({ ev, s, p, bb, actor, tlabel }: BlackboardReducerContext): boolean {
   switch (p.kind) {
+        case "sub_goal_added": {
+          const id = String(p.goal_id ?? "");
+          if (!id) break;
+          if (!bb.subGoals.some((goal) => goal.id === id)) {
+            bb.subGoals = [...bb.subGoals, { id, criterion: String(p.criterion ?? ""),
+              state: "open", evidenceFactSeqs: [], actor, createdTs: ev.ts }];
+          }
+          tlabel(`sub-goal ${id}: ${String(p.criterion ?? "")}`);
+          break;
+        }
+        case "sub_goal_satisfied": {
+          const id = String(p.goal_id ?? "");
+          bb.subGoals = bb.subGoals.map((goal) => goal.id === id ? {
+            ...goal, state: "satisfied", reason: String(p.reason ?? ""), satisfiedTs: ev.ts,
+            evidenceFactSeqs: Array.isArray(p.evidence_fact_seqs) ? p.evidence_fact_seqs.map(Number).filter((seq: number) => seq > 0) : [],
+          } : goal);
+          tlabel(`sub-goal ${id} satisfied`);
+          break;
+        }
+        case "visit_wave_reset": {
+          bb.subGoals = [];
+          const retiredFacts = new Set(Array.isArray(p.fact_seqs) ? p.fact_seqs.map(Number) : []);
+          bb.facts = bb.facts.map((fact) => fact.factSeq !== undefined && retiredFacts.has(fact.factSeq) ? {
+            ...fact, state: "superseded", verified: false, retiredTs: fact.retiredTs ?? ev.ts,
+            retirementReason: `Archived before Visit #${p.generation ?? "?"}${p.digest_path ? `; see ${p.digest_path}` : ""}`,
+            revisionSeq: Number(p.seq) || fact.revisionSeq,
+          } : fact);
+          tlabel("New visit wave");
+          break;
+        }
         case "intent_proposed": {
           const fromFacts: number[] = Array.isArray(p.from_facts)
             ? p.from_facts.filter((seq: any) => typeof seq === "number" && seq > 0)
             : [];
           const intentFields = {
+            question: p.question ? String(p.question) : undefined,
+            answer: p.answer ? String(p.answer) : undefined,
+            description: p.description ? String(p.description) : undefined,
+            goalId: p.goal_id ? String(p.goal_id) : undefined,
+            kind: p.step_kind ? String(p.step_kind) : undefined,
+            stepSeq: Number(p.step_seq ?? p.intent_seq) || undefined,
             dependsOn: Array.isArray(p.depends_on) ? p.depends_on.map(String).filter(Boolean) : undefined,
             expectedObservable: p.expected_observable ? String(p.expected_observable) : undefined,
             stopCondition: p.stop_condition ? String(p.stop_condition) : undefined,
@@ -95,7 +131,7 @@ export function reduceBlackboardKnowledge({ ev, s, p, bb, actor, tlabel }: Black
           } else {
             bb.intents = bb.intents.map((i) =>
               i.id === p.intent_id ? {
-                ...i, ...intentFields,
+                ...i, ...Object.fromEntries(Object.entries(intentFields).filter(([, value]) => value !== undefined)),
                 fromFacts: fromFacts.length ? fromFacts : i.fromFacts,
                 proposedBy: i.proposedBy || actor || undefined,
               } : i);
@@ -143,7 +179,7 @@ export function reduceBlackboardKnowledge({ ev, s, p, bb, actor, tlabel }: Black
         case "intent_concluded": {
           const toFactSeq = typeof p.to_fact_seq === "number" && p.to_fact_seq > 0 ? p.to_fact_seq : undefined;
           bb.intents = bb.intents.map((i) =>
-            i.id === p.intent_id ? { ...i, status: "done", dispatchState: "closed", closeReason: p.result ?? i.closeReason, worker: i.worker ?? p.worker ?? actor, concludedTs: ev.ts, toFactSeq: toFactSeq ?? i.toFactSeq } : i);
+            i.id === p.intent_id ? { ...i, status: "done", dispatchState: "closed", closeReason: p.result ?? i.closeReason, worker: i.worker ?? p.worker ?? actor, concludedTs: ev.ts, resultDetail: p.result_detail ? String(p.result_detail) : i.resultDetail, answer: p.answer ? String(p.answer) : i.answer, toFactSeq: toFactSeq ?? i.toFactSeq } : i);
           tlabel(`${p.worker ?? actor} concluded ${p.intent_id}`);
           break;
         }
@@ -303,7 +339,11 @@ export function reduceBlackboardKnowledge({ ev, s, p, bb, actor, tlabel }: Black
           const fs = typeof p.fact_seq === "number" ? p.fact_seq : undefined;
           const newState: FactLifecycleState = p.kind === "fact_rejected" ? "rejected" : "superseded";
           bb.facts = bb.facts.map((f) =>
-            f.factSeq === fs ? { ...f, state: newState, verified: false } : f);
+            f.factSeq === fs && fs !== undefined ? { ...f, state: newState, verified: false,
+              retirementReason: p.reason !== undefined ? String(p.reason) : f.retirementReason,
+              supersededBy: String(p.superseded_by ?? actor),
+              replacementFactSeq: Number(p.by_fact_seq) || f.replacementFactSeq,
+              retiredTs: f.retiredTs ?? ev.ts, revisionSeq: Number(p.seq) || f.revisionSeq } : f);
           tlabel(`${actor} ${newState} fact #${fs ?? "?"}`);
           break;
         }
@@ -311,7 +351,9 @@ export function reduceBlackboardKnowledge({ ev, s, p, bb, actor, tlabel }: Black
           const fromSeq = typeof p.from_fact_seq === "number" ? p.from_fact_seq : undefined;
           const intoSeq = typeof p.to_fact_seq === "number" ? p.to_fact_seq : undefined;
           bb.facts = bb.facts.map((f) =>
-            f.factSeq === fromSeq ? { ...f, state: "merged", mergedInto: intoSeq, verified: false } : f);
+            f.factSeq === fromSeq && fromSeq !== undefined ? { ...f, state: "merged", mergedInto: intoSeq, verified: false,
+              retirementReason: p.reason !== undefined ? String(p.reason) : f.retirementReason,
+              retiredTs: f.retiredTs ?? ev.ts, revisionSeq: Number(p.seq) || f.revisionSeq } : f);
           tlabel(`${actor} merged fact #${fromSeq ?? "?"} → #${intoSeq ?? "?"}`);
           break;
         }
@@ -324,6 +366,7 @@ export function reduceBlackboardKnowledge({ ev, s, p, bb, actor, tlabel }: Black
           bb.intents = bb.intents.map((i) =>
             idSet.has(i.id)
               ? { ...i, dispatchState: ds ?? i.dispatchState,
+                status: p.status === "open" || p.status === "claimed" || p.status === "done" ? p.status : i.status,
                 closeReason: ds
                   ? (p.close_reason ?? p.stop_reason ?? p.reason ?? i.closeReason)
                   : i.closeReason,

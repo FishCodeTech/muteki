@@ -2,22 +2,29 @@
 
 from __future__ import annotations
 
-async def compact_rebootstrap_stage(self, state) -> str:
-    import time
-    from functools import partial
-    from muteki.swarm.coordinator_state import (
-        emit_scheduler_bb,
-        running_engines as scheduler_running_engines,
-    )
-    from muteki.core.events import Event, EventType
+import time
+from functools import partial
 
+from muteki.core.events import Event, EventType
+from muteki.swarm.coordinator_state import (
+    emit_scheduler_bb,
+    running_engines as scheduler_running_engines,
+)
+
+
+async def compact_rebootstrap_stage(self, state) -> str:
     emit_bb = partial(emit_scheduler_bb, self, state)
     running_engines = partial(scheduler_running_engines, state)
     now_mono = time.monotonic()
     no_progress_elapsed = now_mono - state.last_progress_t
+    ctf_mode = getattr(self.challenge, "mode", "ctf") == "ctf"
+    completed_steps_total = max(
+        int(getattr(state, "total_completed_steps_n", 0) or 0),
+        int(getattr(state, "completed_for_review_n", 0) or 0),
+    )
     compact_due = (
-        getattr(self.challenge, "mode", "ctf") != "ctf"
-        and self.shared_graph is not None
+        self.shared_graph is not None
+        and not ctf_mode
         and (now_mono - state.last_compact_t) > 60.0  # don't thrash
         and (
             (self.barren_limit > 0 and state.fruitless_workers >= 2 * self.barren_limit)
@@ -25,15 +32,33 @@ async def compact_rebootstrap_stage(self, state) -> str:
         )
     )
     if compact_due:
-        trigger = ("fruitless_workers"
-                   if state.fruitless_workers >= 2 * self.barren_limit
-                   else "no_progress_time")
+        trigger = (
+            "step_threshold"
+            if ctf_mode
+            else "fruitless_workers"
+            if state.fruitless_workers >= 2 * self.barren_limit
+            else "no_progress_time"
+        )
+        summary = (
+            f"compacted after {completed_steps_total} completed steps"
+            if ctf_mode
+            else f"compacted after {state.fruitless_workers} fruitless "
+                 f"workers / {int(no_progress_elapsed)}s no progress"
+        )
         try:
             info = self.shared_graph.compact_graph(
-                actor="coordinator", trigger=trigger,
-                summary=(f"compacted after {state.fruitless_workers} fruitless "
-                         f"workers / {int(no_progress_elapsed)}s no progress"))
+                actor="coordinator", trigger=trigger, summary=summary)
             state.last_compact_t = now_mono
+            if ctf_mode:
+                state.last_ctf_compact_completed_n = completed_steps_total
+                ws_root = (
+                    getattr(self, "workspace_root", None)
+                    or getattr(self, "worker_root", None)
+                )
+                if hasattr(self.shared_graph, "write_ctf_step_review_markdown"):
+                    self.shared_graph.write_ctf_step_review_markdown(
+                        ws_root, trigger=trigger,
+                    )
             if self.bus is not None:
                 try:
                     await self.bus.emit(Event(
@@ -124,7 +149,8 @@ async def idle_stage(self, state) -> str:
         state.pending_interrupt_reason_recovery = False
     if (not state.tasks and not state.open_intents
             and state.reason_task is None
-            and not state.reason_result_ready):
+            and not state.reason_result_ready
+            and not self._challenger_task_pending()):
         last_reason = getattr(self, "_last_reason", None)
         clean_empty_plan = bool(
             last_reason is not None
@@ -165,7 +191,7 @@ async def idle_stage(self, state) -> str:
                 retry_index=state.reason_retry_count + 1,
                 delay_s=0,
                 planner_failure=state.reason_retry_failure,
-                detail=str(getattr(failure, "detail", ""))[:300],
+                detail=str(getattr(failure, "detail", "")),
             )
         return "continue"
     return "proceed"

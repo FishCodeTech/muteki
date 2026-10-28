@@ -108,6 +108,26 @@ class CodexDriver(CliDriver):
                 "--json", *self._permission_exec_flags(launch),
                 "--", prompt]
 
+    def build_execute_input(
+        self, prompt: str, session: Optional[str], *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        return ([self.bin, *self._globals(web_access=web_access),
+                 *self._permission_globals(launch), "exec",
+                 *self._config_isolation(web_access=web_access, kb_access=kb_access),
+                 "--json", *self._permission_exec_flags(launch), "-"], prompt)
+
+    def build_resume_input(
+        self, prompt: str, session: str, *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        return ([self.bin, *self._globals(web_access=web_access),
+                 *self._permission_globals(launch), "exec", "resume", session,
+                 *self._config_isolation(web_access=web_access, kb_access=kb_access),
+                 "--json", *self._permission_exec_flags(launch), "-"], prompt)
+
     def build_execute_stdin(
         self, prompt: str, session: Optional[str], *,
         web_access: bool = True, kb_access: bool = True, stream: bool = False,
@@ -159,7 +179,7 @@ class CodexDriver(CliDriver):
         # a shell command the agent is about to / did run
         if t == "item.started" and it == "command_execution":
             return StreamStep(
-                "tool", tool="shell", text=str(item.get("command", ""))[:300],
+                "tool", tool="shell", text=str(item.get("command", "")),
                 call_id=str(item.get("id") or ""))
         if t == "item.completed":
             if it == "command_execution":
@@ -241,14 +261,14 @@ class CodexDriver(CliDriver):
         # The JSONL stream does not identify a billing tariff. Unknown models
         # remain unpriced; configured profiles can supply an explicit estimate.
         estimated_cost = False
-        return CliResult(text=text[-8000:], session=session,
+        return CliResult(text=text, session=session,
                          cost_usd=cost, num_turns=turns or None,
                          input_tokens=(in_tok if turns else None), output_tokens=(out_tok if turns else None),
                          cache_read_tokens=cached_tok if turns else None,
                          cache_write_tokens=cache_write_tok if "cache_write_input_tokens" in observed_usage_fields else None,
                          reasoning_tokens=reasoning_tok if "reasoning_output_tokens" in observed_usage_fields else None,
                          cost_estimated=estimated_cost,
-                         raw_stderr=stderr[-2000:],
+                         raw_stderr=stderr,
                          error=_structured_cli_error(stdout))
 
     def _hello_argv(self) -> list[str]:

@@ -10,6 +10,7 @@ behavior and the public surface are unchanged. Instance state built in
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import inspect
 import json
@@ -25,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Optional
 if TYPE_CHECKING:
     from muteki.learning.distill import TemplateStore
 
+from muteki.core.blocking import run_blocking
 from muteki.core.cost import CostController
 from muteki.core.event_bus import EventBus
 from muteki.core.runtime_env import is_web_container
@@ -34,8 +36,15 @@ from muteki.models.solve_graph import Challenge
 from muteki.sandbox.manager import SandboxManager
 from muteki.solver.result import ArtifactStore
 from muteki.solver.types import SolverConfig, SolveOutcome
-from muteki.solver.credential_accounts import runtime_env_for_engine, engine_account_id
+from muteki.solver.credential_accounts import (
+    CredentialAccountStore,
+    engine_account_id,
+    engine_writes_agent_state,
+    runtime_env_for_engine,
+)
+from muteki.solver.worker_readiness import worker_readiness_cache
 from muteki.solver.worker_profiles import (
+    freeze_worker_price_identity,
     base_engine_for_profile,
     coerce_nonneg_int,
     normalize_profile_roster,
@@ -151,7 +160,9 @@ class _RaceRunMixin:
         return False
 
     async def _run_race(self) -> SwarmOutcome:
-        solvers = self._build_solvers()[:self._ordinary_capacity_limit()]
+        solvers = await self._build_solvers()
+        if self._ordinary_capacity_limit() > 0:
+            solvers = solvers[:self._ordinary_capacity_limit()]
         hitl_task: Optional[asyncio.Task] = None
         tasks: dict[asyncio.Task[SolveOutcome], Any] = {}
         per_solver: dict[str, SolveOutcome] = {}
@@ -349,11 +360,17 @@ class _RaceRunMixin:
                 self.shared_graph.close()
             except Exception:
                 pass
-        terminal_reason = "runtime_failure" if dispatch_limit_reached else "finished"
+        terminal_reason = (
+            "budget_exhausted" if self._budget_exhausted_kind
+            else "runtime_failure" if dispatch_limit_reached
+            else "finished"
+        )
         await self._emit_run_finished(flag=None, solved=False, reason=terminal_reason)
         return SwarmOutcome(
             False, None, None, per_solver,
-            "runtime_failure" if dispatch_limit_reached else "no solver found a flag",
+            "budget_exhausted" if self._budget_exhausted_kind
+            else "runtime_failure" if dispatch_limit_reached
+            else "no solver found a flag",
         )
 
     # ════════════════════════════════════════════════════════════════════════
@@ -363,9 +380,112 @@ class _RaceRunMixin:
     # (anti-stall), provenance facts, dead-end-as-first-class, first-valid-flag-wins.
     # ════════════════════════════════════════════════════════════════════════
 
+    def _profile_quarantine_key(self, name: str, role: str) -> tuple:
+        try:
+            profile = self._profile_for_engine(name, role=role, advance=False)
+        except Exception:  # noqa: BLE001
+            profile = None
+        if profile is None:
+            profile = getattr(self, "_profiles_by_name", {}).get(name)
+        base = base_engine_for_profile(profile) if profile else name
+        profile_id = str(
+            (profile or {}).get("id") or (profile or {}).get("name") or name
+        )
+        model = str((profile or {}).get("model") or "")
+        account = str((profile or {}).get("credential_account") or "")
+        root = str(self.credential_accounts_root or "")
+        revision = ""
+        if self.credential_accounts_root and account:
+            try:
+                revision = CredentialAccountStore(
+                    self.credential_accounts_root
+                ).revision(account)
+            except Exception:
+                revision = ""
+        return (base, profile_id, model, account, root, revision)
+
+    def _quarantine_failed_profile(
+        self,
+        state: Any,
+        candidate: str,
+        *,
+        role: str,
+        exc: BaseException,
+    ) -> tuple[bool, bool]:
+        """Quarantine a profile that failed deterministic initialization/startup.
+
+        Returns ``(can_continue, has_immediate_capacity)``. ``can_continue`` is
+        True when at least one other healthy, role-eligible profile remains in
+        the roster (or other tasks are still active for auxiliary roles).
+        """
+        profile = getattr(self, "_profiles_by_name", {}).get(candidate)
+        if profile is None:
+            try:
+                profile = self._profile_for_engine(
+                    candidate, role=role, advance=False
+                )
+            except Exception:
+                profile = None
+        profile_id = str(
+            (profile or {}).get("id")
+            or (profile or {}).get("name")
+            or candidate
+        )
+        detail = str(exc)
+        worker_readiness_cache.quarantine(
+            self._profile_quarantine_key(candidate, role), detail
+        )
+        snapshot = getattr(self, "_startup_health_snapshot", None)
+        if isinstance(snapshot, dict):
+            snapshot[profile_id] = False
+            snapshot[str(candidate)] = False
+        for r in ("race", "bootstrap", "explore", "respond", "review", "verifier"):
+            quarantined = state.role_quarantined_engines.setdefault(r, set())
+            quarantined.add(str(candidate))
+            quarantined.add(profile_id)
+        if hasattr(state, "healthy") and isinstance(state.healthy, list):
+            state.healthy = [
+                h for h in state.healthy if h not in {str(candidate), profile_id}
+            ]
+        self._note_engine_degraded(profile_id, detail, role=role)
+        quarantined_for_role = set(
+            state.role_quarantined_engines.get(role, set())
+        )
+        roster = (
+            list(getattr(self, "engines", []))
+            if getattr(self, "worker_profiles", [])
+            else list(getattr(state, "healthy", []))
+        )
+        eligible_remaining = False
+        immediate_capacity = False
+        for entry in roster:
+            if entry in quarantined_for_role:
+                continue
+            if not self._healthy_matches(entry, getattr(state, "healthy", [])):
+                continue
+            entry_profile = getattr(self, "_profiles_by_name", {}).get(entry)
+            if entry_profile is not None and not self._profile_role_eligible(
+                entry_profile, role
+            ):
+                continue
+            eligible_remaining = True
+            if self._engine_available_for_role(entry, role):
+                immediate_capacity = True
+                break
+        if eligible_remaining:
+            return True, immediate_capacity
+        if role in {"review", "verifier"} and bool(getattr(state, "tasks", None)):
+            return True, False
+        return False, False
+
     def _startup_health_verdict(
         self, name: str, role: str,
     ) -> tuple[bool, str] | None:
+        quarantined = worker_readiness_cache.quarantined_detail(
+            self._profile_quarantine_key(name, role)
+        )
+        if quarantined:
+            return False, quarantined
         snapshot = getattr(self, "_startup_health_snapshot", None)
         if snapshot is None:
             return None
@@ -419,7 +539,7 @@ class _RaceRunMixin:
         # real auth on spawn; defer to it instead of false-failing here. Mirrors the
         # dispatch precheck guard in profile_health.evaluate_profile_health.
         from muteki.core.runtime_env import is_web_container
-        if is_web_container():
+        if self.worker_backend == "container" and is_web_container():
             return True, "deferred to worker container"
         from muteki.solver.cli_driver import driver_for
         try:
@@ -432,20 +552,34 @@ class _RaceRunMixin:
             # profile id like "cursor-api-container", which would miss the cursor
             # branch and inject nothing. Mirror _make_cli_worker exactly.
             base = base_engine_for_profile(profile) if profile else name
-            overlay = runtime_env_for_engine(
-                base,
-                account_root=self.credential_accounts_root,
-                account_id=(profile.get("credential_account") if profile else None),
-                container=False,
-            ).env
-            # Pass the COMPLETE env to the probe explicitly (os.environ + overlay)
-            # instead of the old global os.environ patch — that global mutation was
-            # only safe serially, and these probes now run in PARALLEL. An explicit
-            # env keeps each engine's credentials isolated to its own subprocess.
-            env = {**os.environ, **overlay}
-            return driver_for(profile or name).health_detail(env=env)
+            model = str((profile or {}).get("model") or "")
+            with contextlib.ExitStack() as stack:
+                agent_state_dir: Path | None = None
+                if engine_writes_agent_state(base):
+                    agent_state_dir = Path(
+                        stack.enter_context(
+                            tempfile.TemporaryDirectory(
+                                prefix=f"muteki-{base}-health-"
+                            )
+                        )
+                    )
+                overlay = runtime_env_for_engine(
+                    base,
+                    account_root=self.credential_accounts_root,
+                    account_id=(profile.get("credential_account") if profile else None),
+                    container=False,
+                    agent_state_dir=agent_state_dir,
+                    model=model,
+                    runtime_max_output_tokens=(profile or {}).get("max_output_tokens"),
+                ).env
+                # Pass the COMPLETE env to the probe explicitly (os.environ + overlay)
+                # instead of the old global os.environ patch — that global mutation was
+                # only safe serially, and these probes now run in PARALLEL. An explicit
+                # env keeps each engine's credentials isolated to its own subprocess.
+                env = {**os.environ, **overlay}
+                return driver_for(profile or name).health_detail(env=env)
         except Exception as exc:  # noqa: BLE001
-            return False, str(exc)[:160]
+            return False, str(exc)
 
     def _healthy_engines(
         self,
@@ -506,6 +640,12 @@ class _RaceRunMixin:
         results: dict[str, "tuple[bool, str]"] = {}
         to_probe: list[str] = []
         for e in candidates:
+            quarantined = worker_readiness_cache.quarantined_detail(
+                self._profile_quarantine_key(e, role)
+            )
+            if quarantined:
+                results[e] = (False, quarantined)
+                continue
             cached = (
                 _health_cache_get(self._health_probe_key(e, role), ttl, now)
                 if ttl > 0 else None
@@ -575,7 +715,7 @@ class _RaceRunMixin:
             kwargs["role"] = role
         if "owner_loop" in parameters:
             kwargs["owner_loop"] = owner_loop
-        return await asyncio.to_thread(health_check, **kwargs)
+        return await run_blocking(health_check, **kwargs)
 
     def _context_scope_applies(
         self, scope: Any, *, worker_id: str = "", engine: str = "",
@@ -683,7 +823,7 @@ class _RaceRunMixin:
         except Exception:
             return False
 
-    def _pick_engine(
+    async def _pick_engine(
         self,
         running_engines: list[str],
         healthy: list[str],
@@ -731,7 +871,7 @@ class _RaceRunMixin:
                     engine=transport, intent_id=intent_id, lane=lane):
                 secure_available.append(candidate)
                 continue
-            if self._secure_prompt_candidate_ready(candidate, role=role):
+            if await run_blocking(self._secure_prompt_candidate_ready, candidate, role=role):
                 secure_available.append(candidate)
         available = secure_available
         if not available:
@@ -782,6 +922,7 @@ class _RaceRunMixin:
             available,
             key=lambda e: (
                 self._running_profile_count_for_candidate(e, running_engines),
+                getattr(self, "_spawned_profile_counts", {}).get(e, 0),
                 self._running_count_for_candidate(e, running_engines),
             ),
         )
@@ -819,6 +960,23 @@ class _RaceRunMixin:
 
     def _profile_available(self, profile: dict, role: "Optional[str]" = None) -> bool:
         pid = profile["id"]
+        if profile.get("unlimited_workers") is True:
+            return True
+        # A zero ordinary profile capacity is explicit unlimited. Role-specific
+        # zero retains its established inherit-global-policy meaning.
+        capacity_field = (
+            "max_review_running" if role == "review"
+            else "max_verifier_running" if role == "verifier"
+            else "max_running"
+        )
+        try:
+            if (
+                role not in {"review", "verifier"}
+                and int(profile.get(capacity_field, 1)) == 0
+            ):
+                return True
+        except (TypeError, ValueError):
+            pass
         if role == "review":
             return (
                 self._active_review_profile_counts.get(pid, 0)
@@ -829,8 +987,6 @@ class _RaceRunMixin:
                 self._active_verifier_profile_counts.get(pid, 0)
                 < self._verifier_profile_limit(profile)
             )
-        if self._auto_dispatch_enabled():
-            return True
         return self._active_profile_counts.get(pid, 0) < int(profile.get("max_running") or 1)
 
     def _worker_session_supervisor(self):
@@ -1015,6 +1171,8 @@ class _RaceRunMixin:
                 self._active_verifier_profile_counts.get(pid, 0) + 1)
         else:
             self._active_profile_counts[pid] = self._active_profile_counts.get(pid, 0) + 1
+            if hasattr(self, "_spawned_profile_counts"):
+                self._spawned_profile_counts[pid] = self._spawned_profile_counts.get(pid, 0) + 1
         account_id = profile.get("credential_account")
         if not account_id:
             return
@@ -1040,6 +1198,11 @@ class _RaceRunMixin:
         if not sid:
             return
         self._live_solvers[sid] = worker
+        worker._target_restarter = getattr(self, "_target_restarter", None)
+        if getattr(self, "_target_restart_in_progress", False) and not worker._paused:
+            if not worker._set_paused(True):
+                raise RuntimeError(f"failed to pause new Worker {sid} during target restart")
+            worker._restart_pause_owned = True
         registry = getattr(self, "worker_registry", None)
         register = getattr(registry, "register", None)
         if callable(register):
@@ -1264,6 +1427,17 @@ class _RaceRunMixin:
 
     async def _run_control_worker(self, worker: Any) -> Any:
         """Run a worker; CliSolver commits reserved context from ``_on_proc``."""
+        execution_budget = getattr(worker, "execution_budget", None)
+        if (
+            execution_budget is not None
+            and execution_budget.remaining_seconds(
+                reserve_seconds=execution_budget.finalization_seconds,
+            ) <= 0
+        ):
+            self._budget_exhausted_kind = "execution_budget_exhausted"
+            return SolveOutcome(
+                False, None, 0, worker.graph, "execution_budget_exhausted",
+            )
         outcome = await worker.run()
         profile = getattr(getattr(worker, "driver", None), "profile", None)
         if isinstance(profile, dict):
@@ -1393,11 +1567,16 @@ class _RaceRunMixin:
         claimed_intent = bool(str(intent_id or ""))
         process_started = bool(
             getattr(solver, "_runtime_process_started", True))
+        zero_action_cancel = bool(
+            getattr(solver, "_zero_action_cancel_released", False)
+        )
         crossed_boundary = bool(
             getattr(solver, "_control_context_delivery_committed", False)
             or getattr(solver, "_control_context_delivery_unknown", False)
         )
-        prestart = not process_started and not crossed_boundary
+        prestart = (not process_started and not crossed_boundary) or (
+            zero_action_cancel and not crossed_boundary
+        )
         # Stage 1: release pre-delivery context claims durably.  Do not clear the
         # solver's immutable reservation list until every
         # idempotent release confirms its postcondition.
@@ -1519,7 +1698,7 @@ class _RaceRunMixin:
                         else:
                             transition_result = self.shared_graph.conclude_intent(
                                 actor=sid, intent_id=str(intent_id),
-                                result="cancelled", result_detail=str(reason)[:500])
+                                result="cancelled", result_detail=str(reason))
                 except Exception:
                     return False
                 if callable(state_reader):
@@ -1769,6 +1948,8 @@ class _RaceRunMixin:
             return None
         if self.workspace_root is not None:
             ensure_workspace(self.workspace_root)
+            if getattr(self.challenge, "mode", "ctf") == "ctf":
+                return str(self.workspace_root)
         self._worker_seq += 1
         wd = self.worker_root / f"cli-{engine}-{self._worker_seq}{self._gen_suffix()}"
         try:
@@ -1788,7 +1969,7 @@ class _RaceRunMixin:
         """Per-worker runtime env: Credential Account plus isolated HOME."""
         agent_state_dir: Path | None = None
         agent_state_container_path: str | None = None
-        if engine in {"pi", "omp", "opencode"}:
+        if engine_writes_agent_state(engine):
             if self.workspace_root is not None:
                 state_root = self.workspace_root / ".muteki-agent-state"
                 agent_state_dir = state_root / label
@@ -1809,6 +1990,7 @@ class _RaceRunMixin:
             agent_state_dir=agent_state_dir,
             agent_state_container_path=agent_state_container_path,
             model=str((profile or {}).get("model") or ""),
+            runtime_max_output_tokens=(profile or {}).get("max_output_tokens"),
         ).env
         if getattr(self, "_ctf_tmux_socket", None) is not None:
             env["MUTEKI_TMUX_SOCKET"] = str(self._ctf_tmux_socket)
@@ -1919,7 +2101,7 @@ class _RaceRunMixin:
         roster. Emit an `engine_degraded` blackboard delta ONCE per transition (not
         once per spawn) so the operator sees WHY the engine never showed up, instead
         of it silently vanishing from the worker panel."""
-        reason = (reason or "health check failed")[:300]
+        reason = reason or "health check failed"
         if self._degraded_engines.get(engine) == reason:
             return  # already announced this exact failure — don't spam the timeline
         self._degraded_engines[engine] = reason
@@ -1988,7 +2170,7 @@ class _RaceRunMixin:
             "requested_backend": requested_backend,
             "backend": fallback_backend,
             "status": "degraded",
-            "reason": reason[:300],
+            "reason": reason,
         }
         self._runtime_degraded.append(payload)
         try:
@@ -2017,7 +2199,7 @@ class _RaceRunMixin:
             "runtime_degraded": list(self._runtime_degraded),
         }
 
-    def _container_for_engine(self, engine: str, profile: "Optional[dict]" = None) -> "Optional[object]":
+    async def _container_for_engine(self, engine: str, profile: "Optional[dict]" = None) -> "Optional[object]":
         """The run's container ContainerHandle when worker_backend=="container",
         else None (local host backend). Created lazily — worker_root must exist so
         it can be bind-mounted as the shared workspace (only the run workspace +
@@ -2047,7 +2229,8 @@ class _RaceRunMixin:
             if not self.worker_profiles:
                 account_ids = sorted({engine_account_id(e) for e in self.engines})
             privilege = getattr(self, "worker_privilege", "default") or "default"
-            self._container_handle = ensure_container(
+            self._container_handle = await run_blocking(
+                ensure_container,
                 self.run_id,
                 str(self.workspace_root or self.worker_root),
                 network=self.worker_network,
@@ -2091,6 +2274,14 @@ class _RaceRunMixin:
         return float(getattr(ledger, "usd", 0.0) or 0.0)
 
     def _budget_exhausted(self) -> str | None:
+        execution_budget = getattr(self, "execution_budget", None)
+        if (
+            execution_budget is not None
+            and execution_budget.remaining_seconds(
+                reserve_seconds=execution_budget.finalization_seconds,
+            ) <= 0
+        ):
+            return "execution_budget_exhausted"
         if self.cost_budget_usd is not None and self._current_cost_usd() >= self.cost_budget_usd:
             return "cost_budget_exhausted"
         if self.max_total_workers is not None and self._spawned_total >= self.max_total_workers:
@@ -2134,18 +2325,18 @@ class _RaceRunMixin:
         worker.stop_condition = str(row.get("stop_condition") or "")
         worker.coverage_key = str(row.get("coverage_key") or "")
         worker.required_pocs = list(row.get("required_pocs") or [])
-        worker.route_hash = str(row.get("route_hash") or "")[:180]
-        worker.branch_id = str(row.get("branch_id") or "")[:180]
-        worker.risk_class = str(row.get("risk_class") or "")[:80]
-        worker.resource_key = str(row.get("resource_key") or "")[:240]
+        worker.route_hash = str(row.get("route_hash") or "")
+        worker.branch_id = str(row.get("branch_id") or "")
+        worker.risk_class = str(row.get("risk_class") or "")
+        worker.resource_key = str(row.get("resource_key") or "")
         worker.requires_capabilities = [
             str(item).strip().casefold()
             for item in (row.get("requires_capabilities") or [])
             if str(item).strip()
-        ][:32]
+        ]
         worker.value_claim = dict(row.get("value_claim") or {})
 
-    def _make_cli_worker(self, engine: str, *, mode: str, intent_goal: str = "",
+    async def _make_cli_worker(self, engine: str, *, mode: str, intent_goal: str = "",
                          intent_id: str = "", timeout_override: "Optional[int]" = None,
                          profile_role: "Optional[str]" = None,
                          lane: str = ""):
@@ -2199,14 +2390,16 @@ class _RaceRunMixin:
                     f"worker profile {engine} cannot securely deliver secret context")
             preflight = getattr(driver, "secure_prompt_preflight", None)
             try:
-                supported, detail = preflight() if callable(preflight) else (
-                    False, "secure prompt preflight unavailable")
+                supported, detail = (
+                    await run_blocking(preflight) if callable(preflight)
+                    else (False, "secure prompt preflight unavailable")
+                )
             except Exception as exc:
                 supported, detail = False, str(exc)
             if not supported:
                 raise WorkerSpawnRejected(
                     f"worker profile {engine} secure prompt preflight failed: "
-                    f"{str(detail or 'unsupported')[:240]}")
+                    f"{str(detail or 'unsupported')}")
 
         # Reject an exhausted run before allocating anything, but do not COMMIT
         # the lifetime spawn budget until construction, exact-context acquisition,
@@ -2332,7 +2525,7 @@ class _RaceRunMixin:
 
         try:
             workdir = self._alloc_workdir(engine)
-            container = self._container_for_engine(engine, profile)
+            container = await self._container_for_engine(engine, profile)
             from muteki.solver.cli_driver import driver_for
             worker = CliSolver(
                 None, self.challenge, bus=self.bus, cost=self.cost,
@@ -2365,14 +2558,40 @@ class _RaceRunMixin:
                 identity=worker_identity_fields(profile),
             # EXEC-01: Profile→Adapter 解析与 AgentSession 监督（CLI 路径不变）。
                 session_supervisor=self._worker_session_supervisor(),
-                worker_profile=profile,
+                worker_profile=freeze_worker_price_identity(profile, self.credential_accounts_root),
                 plugin_service=self.worker_plugins,
+                execution_budget=getattr(self, "execution_budget", None),
             )
-        except Exception as exc:
+        except BaseException as exc:
             if not self._release_typed_context_reservations(
                     consumed_context_reservations, label):
                 raise ControlShutdownIncomplete(
                     "worker construction context rollback unconfirmed") from exc
+            if not isinstance(exc, Exception):
+                raise
+            if not isinstance(
+                exc,
+                (
+                    WorkerRuntimeUnavailable,
+                    WorkerSpawnRejected,
+                    WorkerBudgetExhausted,
+                    ControlShutdownIncomplete,
+                ),
+            ):
+                profile_id = str(
+                    (profile or {}).get("id")
+                    or (profile or {}).get("name")
+                    or engine
+                )
+                code = str(getattr(exc, "code", "") or "worker_init_failed")
+                raise WorkerRuntimeUnavailable(
+                    f"Worker initialization failed for profile {profile_id} ({transport}): "
+                    f"{type(exc).__name__}: {exc}",
+                    code=code,
+                    phase="worker_init",
+                    profile_id=profile_id,
+                    engine=transport,
+                ) from exc
             raise
         worker.engine = transport
         worker.lane = str(lane or "")

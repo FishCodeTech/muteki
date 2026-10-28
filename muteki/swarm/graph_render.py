@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import json  # noqa: F401
 import hashlib  # noqa: F401
+import os
 import re  # noqa: F401
+import tempfile
 import time  # noqa: F401
 from datetime import datetime, timezone
 from difflib import SequenceMatcher  # noqa: F401
@@ -26,7 +28,7 @@ from muteki.swarm.graph_defs import (  # noqa: F401
     EV_FACT_ADDED, EV_FACT_OBSERVED, EV_HYP_PROPOSED, EV_HYP_REFUTED, EV_DEAD_END,
     EV_INTENT_PROPOSED, EV_INTENT_CLAIMED, EV_INTENT_CONCLUDED, EV_FLAG_FOUND,
     EV_FLAG_INVALIDATED, EV_FLAG_SUBMISSION, EV_FLAG_SUBMISSION_DECISION,
-    EV_FINDING_FOUND, EV_DEAD_END,
+    EV_FINDING_FOUND,
     EV_POC_SAVED, EV_POC_CLAIMED, EV_POC_CONCLUDED,
     EV_REVIEW_FINDING, EV_FACT_CHALLENGED, EV_FACT_REVALIDATED,
     EV_ROUTE_SUPPRESSED, EV_ROUTE_REOPENED, EV_BRANCH_SPLIT, EV_BRANCH_RESOLVED,
@@ -50,6 +52,31 @@ class _RenderMixin:
     def _ctf_yaml_scalar(value: Any) -> str:
         return json.dumps(str(value or ""), ensure_ascii=False)
 
+    @classmethod
+    def _ctf_yaml_content_lines(
+        cls, content: str, *, encoded: int = 0, is_pentest: bool = False
+    ) -> list[str]:
+        if not content:
+            return ['    content: ""']
+        first_nonempty = next((ln for ln in content.split("\n") if ln), "")
+        if (
+            not is_pentest
+            and "\n" in content
+            and not encoded
+            and "\r" not in content
+            and "\u2028" not in content
+            and "\u2029" not in content
+            and "\x85" not in content
+            and not content.endswith("\n")
+            and first_nonempty
+            and not first_nonempty.startswith((" ", "\t"))
+        ):
+            out = ["    content: |-"]
+            for c_line in content.split("\n"):
+                out.append(f"      {c_line}" if c_line else "")
+            return out
+        return [f"    content: {cls._ctf_yaml_scalar(content)}"]
+
     @staticmethod
     def _ctf_created_at(value: Any) -> str:
         try:
@@ -59,8 +86,161 @@ class _RenderMixin:
         except (TypeError, ValueError, OSError):
             return ""
 
+    def _live_origin_fact_text(self, stored_text: str = "") -> str:
+        challenge = getattr(self, "challenge", None)
+        if challenge is None:
+            return stored_text
+        if getattr(challenge, "mode", "ctf") == "pentest":
+            # The authorization contract is rendered in engagement below. Keep
+            # its original evidence text instead of applying CTF endpoint rewrites.
+            return stored_text or str(getattr(challenge, "description", "") or "")
+        contract = getattr(challenge, "task_contract", None)
+        raw_instruction = str(
+            getattr(contract, "raw_instruction", "") or ""
+        ).strip()
+        description = str(getattr(challenge, "description", "") or "").strip()
+        raw_scope = str(getattr(challenge, "scope", "") or "").strip()
+        target = str(getattr(challenge, "target", "") or "").strip()
+        endpoints = [
+            item.strip() for item in raw_scope.split(",") if item.strip()
+        ]
+        if target and target not in endpoints:
+            endpoints.insert(0, target)
+        target_summary = ", ".join(endpoints) if endpoints else target
+        if (
+            endpoints
+            and description
+            and all(ep in description for ep in endpoints)
+            and not all(ep in raw_instruction for ep in endpoints)
+        ):
+            instruction = description
+        else:
+            instruction = raw_instruction or description
+        if endpoints and instruction and '"container_addr"' in instruction:
+            addr_json = json.dumps(list(endpoints), ensure_ascii=False, indent=4)
+            if "\n" in addr_json:
+                addr_json = addr_json[:-1] + "  ]"
+            replacement = f'"container_addr": {addr_json}'
+            instruction = re.sub(
+                r'"container_addr"\s*:\s*\[[\s\S]*?\](?=\s*[,}\n])',
+                lambda _: replacement,
+                instruction,
+                count=1,
+            )
+            instruction = re.sub(
+                r'\n\s*"container_status"\s*:\s*"stopped"\s*,',
+                "",
+                instruction,
+                count=1,
+            )
+        if (
+            endpoints
+            and instruction
+            and "Target endpoints:\n" in instruction
+        ):
+            desired_block = "Target endpoints:\n" + "".join(
+                f"- {ep}\n" for ep in endpoints
+            )
+            if desired_block.strip() not in instruction:
+                instruction = re.sub(
+                    r"Target endpoints:\n(?:- [^\n]+\n?)+",
+                    desired_block,
+                    instruction,
+                    count=1,
+                )
+        if (
+            "The target address may have changed." in instruction
+            and "interact ONLY with the current Target endpoints" not in instruction
+        ):
+            instruction = instruction.replace(
+                "The target address may have changed.",
+                "The target address may have changed; interact ONLY with the "
+                "current Target endpoints listed above and do not probe "
+                "recycled IPs from earlier epochs.",
+            )
+        attachments = [
+            str(getattr(item, "name", "") or "").strip()
+            for item in (getattr(contract, "attachments", None) or [])
+            if str(getattr(item, "name", "") or "").strip()
+        ] or [
+            str(item).strip()
+            for item in (getattr(challenge, "attachments", None) or [])
+            if str(item).strip()
+        ]
+        if not instruction and not target_summary and not attachments:
+            return stored_text
+        if not stored_text or stored_text.lstrip().startswith("题目信息:"):
+            origin_lines = ["题目信息:", instruction] if instruction else [stored_text or "题目信息:"]
+            joined = "\n".join(origin_lines)
+            if endpoints and not all(ep in joined for ep in endpoints):
+                origin_lines.extend(["", f"目标地址: {target_summary}"])
+            if attachments:
+                att_line = "附件: " + ", ".join(attachments)
+                if att_line not in "\n".join(origin_lines):
+                    origin_lines.append(att_line)
+            return "\n".join(origin_lines).strip()
+        updated = stored_text.strip()
+        if instruction and instruction not in updated:
+            updated = f"{updated}\n{instruction}"
+        if endpoints and not all(ep in updated for ep in endpoints):
+            updated = f"{updated}\n\n目标地址: {target_summary}"
+        if attachments:
+            att_line = "附件: " + ", ".join(attachments)
+            if att_line not in updated:
+                updated = f"{updated}\n{att_line}"
+        return updated.strip()
+
+    def sync_origin_fact(
+        self,
+        origin_fact: str = "",
+        workspace_root: Optional[Path | str] = None,
+    ) -> tuple[int, bool]:
+        """Ensure ``fact_origin`` exists and refresh its live target text on revisit."""
+        desired = (origin_fact or self._live_origin_fact_text("")).strip()
+        if not desired:
+            return 0, False
+        old_origin_text = ""
+        existing_seq = 0
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT seq, payload FROM events WHERE challenge_id=? AND kind=? ORDER BY seq",
+                (self.challenge.id, EV_FACT_ADDED),
+            ).fetchall()
+            for seq, raw_payload in rows:
+                try:
+                    payload = json.loads(raw_payload or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    payload = {}
+                if str(payload.get("source") or "") == "origin":
+                    existing_seq = int(seq)
+                    old_origin_text = str(payload.get("fact") or "")
+                    if old_origin_text.strip() != desired:
+                        payload["fact"] = desired
+                        self._conn.execute(
+                            "UPDATE events SET payload=? WHERE seq=?",
+                            (
+                                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                                existing_seq,
+                            ),
+                        )
+                        self._conn.commit()
+                    break
+        if existing_seq > 0:
+            return existing_seq, False
+        created_seq = self.add_evidence(
+            actor="origin",
+            source="origin",
+            fact=desired,
+            verified=True,
+            confidence=1.0,
+        )
+        return int(created_seq or 0), created_seq > 0
+
     def to_ctf_graph_yaml(self) -> str:
-        """Render the complete CTF Fact-Goal-Step graph in Cairn's wire shape."""
+        """Render facts once; unfinished handoffs retain readable full artifacts."""
+        cutoff = self.current_visit_wave_cutoff()
+        has_compact_epochs = self._table_exists("compact_epochs")
+        has_branches = self._table_exists("branches")
         with self._lock:
             fact_rows = self._conn.execute(
                 "SELECT seq,ts,payload FROM events "
@@ -106,9 +286,64 @@ class _RenderMixin:
                 "FROM pocs WHERE challenge_id=? ORDER BY created_seq",
                 (self.challenge.id,),
             ).fetchall()
+            compact_rows = (
+                self._conn.execute(
+                    "SELECT compact_id, trigger, cutoff_seq, retired_intent_ids "
+                    "FROM compact_epochs WHERE challenge_id=? AND created_seq>? ORDER BY created_seq",
+                    (self.challenge.id, cutoff),
+                ).fetchall()
+                if has_compact_epochs
+                else []
+            )
+            branch_rows = (
+                self._conn.execute(
+                    "SELECT branch_id, parent_id, title, assumption, prove_or_disprove, "
+                    "status, source_intent, from_facts_json, expected_observable, "
+                    "stop_condition, coverage_key "
+                    "FROM branches WHERE challenge_id=? AND status='open' AND created_seq>? "
+                    "ORDER BY created_seq, branch_id",
+                    (self.challenge.id, cutoff),
+                ).fetchall()
+                if has_branches
+                else []
+            )
 
+        if cutoff:
+            fact_rows = [row for row in fact_rows if int(row[0]) > cutoff or
+                         json.loads(row[2] or "{}").get("source") == "origin"]
+            step_rows = [row for row in step_rows if int(row[7] or 0) > cutoff]
+            observation_rows = [row for row in observation_rows if int(row[0]) > cutoff]
+            dead_end_rows = [row for row in dead_end_rows if int(row[0]) > cutoff]
+            finding_rows = [row for row in finding_rows if int(row[0]) > cutoff]
+        is_pentest = getattr(self.challenge, "mode", "ctf") == "pentest"
+        fact_states = self._fact_state_map()
+        retired_meta: dict[int, dict[str, Any]] = {}
+        if self._table_exists("fact_states"):
+            with self._lock:
+                retired_meta = {
+                    int(seq): {"reason": reason or ""}
+                    for seq, reason in self._conn.execute(
+                        "SELECT fact_seq,reason FROM fact_states WHERE challenge_id=?",
+                        (self.challenge.id,),
+                    ).fetchall()
+                }
+        with self._lock:
+            for raw, actor in self._conn.execute(
+                "SELECT payload,actor FROM events WHERE challenge_id=? "
+                "AND kind IN ('fact_superseded','fact_rejected','fact_merged') "
+                "ORDER BY seq", (self.challenge.id,),
+            ).fetchall():
+                payload = json.loads(raw or "{}")
+                retired_seq = payload.get("fact_seq") or payload.get("from_fact_seq")
+                if retired_seq is not None:
+                    retired_meta[int(retired_seq)] = {
+                        **retired_meta.get(int(retired_seq), {}),
+                        **payload, "actor": actor,
+                    }
+        superseded_facts: list[dict[str, Any]] = []
         facts: list[dict[str, Any]] = []
         fact_ids: dict[int, str] = {}
+        all_fact_ids: dict[int, str] = {}
         next_fact_index = 0
         for seq, ts, raw_payload in fact_rows:
             try:
@@ -121,9 +356,26 @@ class _RenderMixin:
             source = str(payload.get("source") or "")
             if source == "origin":
                 fact_id = "fact_origin"
+                text = self._live_origin_fact_text(text)
+                all_fact_ids[int(seq)] = fact_id
             else:
                 next_fact_index += 1
                 fact_id = f"fact_{next_fact_index:03d}"
+                all_fact_ids[int(seq)] = fact_id
+                f_state = fact_states.get(int(seq), {})
+                if (
+                    str(f_state.get("state") or "") in _FACT_TERMINAL_STATES
+                    or bool(f_state.get("retired"))
+                ):
+                    if is_pentest:
+                        superseded_facts.append({
+                            "seq": int(seq), "id": fact_id,
+                            "title": text.partition("\n")[0],
+                            **retired_meta.get(int(seq), {}),
+                        })
+                    continue
+                if is_pentest and f_state.get("verified_effective") is False:
+                    continue
             fact_ids[int(seq)] = fact_id
             title, separator, content = text.partition("\n")
             facts.append({
@@ -136,6 +388,9 @@ class _RenderMixin:
                 "target_epoch": str(
                     (payload.get("evidence_provenance") or {}).get("target_epoch") or ""
                 ),
+                "enables": str(
+                    (payload.get("evidence_provenance") or {}).get("enables") or ""
+                ),
             })
 
         intent_ids = {str(row[0]) for row in step_rows}
@@ -146,15 +401,42 @@ class _RenderMixin:
             for intent_id, seqs in products.items()
             for fact_seq in seqs
         }
+        closed_intent_ids = {
+            str(row[0])
+            for row in step_rows
+            if (
+                str(row[4] or "") == "done"
+                or str(row[5] or "") == INTENT_DISPATCH_RETIRED
+            )
+            and str(row[5] or "") != INTENT_DISPATCH_ACTIVE
+        }
+        compacted_intent_ids: set[str] = set()
+        for _cid, _trig, _cseq, raw_retired in compact_rows:
+            try:
+                for rid in json.loads(raw_retired or "[]"):
+                    rid_str = str(rid or "")
+                    if (
+                        rid_str
+                        and rid_str in closed_intent_ids
+                        and not products.get(rid_str)
+                    ):
+                        compacted_intent_ids.add(rid_str)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
 
         observations_by_fact: dict[int, list[str]] = {}
         artifacts_by_fact: dict[int, list[dict[str, Any]]] = {}
+        fact_by_seq = {int(fact["seq"]): fact for fact in facts}
         fact_text_by_seq = {
             int(fact["seq"]): str(fact["text"]) for fact in facts
+        }
+        origin_fact_seqs = {
+            int(fact["seq"]) for fact in facts if fact["id"] == "fact_origin"
         }
         standalone_observations: list[
             tuple[int, str, str, str, str, float, bool, str, list[dict[str, Any]]]
         ] = []
+        unanswered: dict[int, dict[str, Any]] = {}
         for (obs_seq, intent_id, body, witness, artifact_id, admitted_seq,
              created_at, target_epoch, raw_provenance) in observation_rows:
             admitted = int(admitted_seq) if admitted_seq is not None else 0
@@ -168,6 +450,9 @@ class _RenderMixin:
                 str(ref.get("artifact_id")) == str(artifact_id) for ref in refs
             ):
                 refs.append({"artifact_id": str(artifact_id)})
+            handoff = provenance.get("unanswered")
+            if isinstance(handoff, dict) and handoff.get("artifact_id"):
+                unanswered[int(obs_seq)] = handoff
             if admitted in fact_text_by_seq:
                 observations_by_fact.setdefault(admitted, []).append(obs_id)
                 known = artifacts_by_fact.setdefault(admitted, [])
@@ -177,184 +462,301 @@ class _RenderMixin:
                     if ref_id not in seen:
                         known.append(ref)
                         seen.add(ref_id)
-            if not admitted or str(body or "") != fact_text_by_seq.get(admitted, ""):
+                # Keep the rendered Fact aligned with supplemental capability
+                # declarations admitted on the same Fact.
+                obs_enables = str(provenance.get("enables") or "").strip()
+                if obs_enables and admitted in fact_by_seq:
+                    fact_by_seq[admitted]["enables"] = obs_enables
+                    if target_epoch:
+                        fact_by_seq[admitted]["target_epoch"] = str(target_epoch)
+            if admitted in origin_fact_seqs:
+                continue
+            if not admitted or (is_pentest and str(body or "") != fact_text_by_seq.get(admitted, "")):
                 standalone_observations.append((
                     int(obs_seq), str(intent_id or ""), str(body or ""),
                     str(witness or ""), str(artifact_id or ""), float(created_at or 0),
                     bool(admitted), str(target_epoch or ""), refs,
                 ))
 
+        current_epoch = str(
+            getattr(self, "_target_epoch", "")
+            or getattr(self.challenge, "target_epoch", "")
+            or next((str(row[7]) for row in reversed(standalone_observations) if row[7]), "")
+        )
+        recent_unanswered = {
+            row[0] for row in [
+                row for row in standalone_observations
+                if row[0] in unanswered
+            ][-5:]
+        }
+        unanswered_ref_by_step: dict[str, str] = {}
+        for obs_seq, obs_iid, obs_body, *_rest in standalone_observations:
+            if obs_iid and obs_body and obs_seq in recent_unanswered:
+                unanswered_ref_by_step[obs_iid] = f"observation_{int(obs_seq)}"
+
+        dead_end_steps: set[str] = set()
+        for _dseq, _dts, raw_dp in dead_end_rows:
+            try:
+                dp = json.loads(raw_dp or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                dp = {}
+            diid = str(dp.get("intent_id") or "").strip()
+            if diid:
+                dead_end_steps.add(diid)
+
+        derived_steps_by_fact: dict[int, int] = {}
+        fruitless_steps_by_fact: dict[int, int] = {}
+        enabling_steps_by_fact: dict[int, int] = {}
+        for s_row in step_rows:
+            s_id = str(s_row[0] or "")
+            s_status = str(s_row[4] or "")
+            s_disp = str(s_row[5] or "")
+            if s_status != "done" and s_disp != INTENT_DISPATCH_RETIRED:
+                continue
+            try:
+                s_rp = json.loads(s_row[9] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                s_rp = {}
+            s_res = str(s_rp.get("result") or s_row[6] or "").strip().lower()
+            if s_res in {
+                "cancelled", "timed_out", "superseded",
+                "operator_stop", "interrupted", "handoff_missing",
+                "steered", "error", "oom",
+            } or bool(s_rp.get("handoff_missing")):
+                continue
+            s_from = [int(seq) for seq in sources.get(s_id, []) if int(seq) in fact_by_seq]
+            s_prods = [int(seq) for seq in products.get(s_id, []) if int(seq) in fact_by_seq]
+            has_enabling_prod = any(
+                bool(fact_by_seq[p_seq].get("enables"))
+                for p_seq in s_prods
+            )
+            has_valid_prod = bool(s_prods) and (s_id not in dead_end_steps)
+            is_fruitless = (not s_prods) or (s_id in dead_end_steps)
+            for f_seq in s_from:
+                derived_steps_by_fact[f_seq] = derived_steps_by_fact.get(f_seq, 0) + 1
+                if has_enabling_prod or has_valid_prod:
+                    enabling_steps_by_fact[f_seq] = enabling_steps_by_fact.get(f_seq, 0) + 1
+                elif is_fruitless:
+                    fruitless_steps_by_fact[f_seq] = fruitless_steps_by_fact.get(f_seq, 0) + 1
+
         lines = ["facts:" if facts else "facts: []"]
         for fact in facts:
             title, title_encoded = encode_graph_text(fact["title"])
             content, content_encoded = encode_graph_text(fact["content"])
-            encoded = title_encoded + content_encoded
+            encoded = (title_encoded + content_encoded) if is_pentest else 0
             lines.extend([
                 f"  - id: {fact['id']}",
                 f"    title: {self._ctf_yaml_scalar(title)}",
             ])
             producer = producer_by_fact.get(int(fact["seq"]))
             if producer:
-                lines.append(f"    producedBy: {self._ctf_yaml_scalar(producer)}")
-            source_observations = observations_by_fact.get(int(fact["seq"]), [])
-            if source_observations:
-                lines.append("    sourceObservations:")
-                lines.extend(f"      - {obs_id}" for obs_id in source_observations)
-            source_artifacts = artifacts_by_fact.get(int(fact["seq"]), [])
-            if source_artifacts:
-                lines.append("    sourceArtifacts:")
-                for ref in source_artifacts:
-                    lines.append(
-                        f"      - id: {self._ctf_yaml_scalar(ref.get('artifact_id'))}"
-                    )
-                    if getattr(self.challenge, "mode", "ctf") == "pentest":
-                        # Canonical provenance still retains every exact command
-                        # and tool output. The pentest graph can accumulate
-                        # hundreds of these references; its projection carries
-                        # stable IDs instead of replaying command text in every
-                        # later Worker prompt. Keep the CTF projection unchanged.
+                lines.append(
+                    f"    producedBy: {self._ctf_yaml_scalar(producer) if is_pentest else producer}"
+                )
+            if is_pentest:
+                source_observations = observations_by_fact.get(int(fact["seq"]), [])
+                if source_observations:
+                    lines.append("    sourceObservations:")
+                    lines.extend(f"      - {obs_id}" for obs_id in source_observations)
+                source_artifacts = artifacts_by_fact.get(int(fact["seq"]), [])
+                if source_artifacts:
+                    lines.append("    sourceArtifacts:")
+                    for ref in source_artifacts:
+                        lines.append(
+                            f"      - id: {self._ctf_yaml_scalar(ref.get('artifact_id'))}"
+                        )
+                        # Canonical provenance in SQLite retains every exact command
+                        # and tool output. The Pentest graph YAML projection carries
+                        # stable IDs for report evidence verification.
                         if ref.get("sha256"):
                             lines.append(
                                 f"        sha256: {self._ctf_yaml_scalar(ref['sha256'])}"
                             )
                         if ref.get("tool_event_seq") is not None:
                             lines.append(f"        toolEventSeq: {int(ref['tool_event_seq'])}")
-                    else:
-                        for key, field in (("sha256", "sha256"), ("command", "command")):
-                            if ref.get(field):
-                                visible, _ = encode_graph_text(ref[field])
-                                lines.append(
-                                    f"        {key}: {self._ctf_yaml_scalar(visible)}"
-                                )
-                    if ref.get("size") is not None:
-                        lines.append(f"        bytes: {int(ref['size'])}")
-            if fact["created_at"]:
+                        if ref.get("size") is not None:
+                            lines.append(f"        bytes: {int(ref['size'])}")
+            is_origin = fact["id"] == "fact_origin"
+            if fact["created_at"] and (not is_pentest or not is_origin):
                 lines.append(f"    createdAt: {fact['created_at']}")
-            if fact["target_epoch"]:
+            effective_epoch = (
+                current_epoch if is_origin and current_epoch else fact["target_epoch"]
+            )
+            if is_pentest and effective_epoch:
                 lines.append(
-                    f"    targetEpoch: {self._ctf_yaml_scalar(fact['target_epoch'])}"
+                    f"    targetEpoch: {self._ctf_yaml_scalar(effective_epoch)}"
                 )
-            if encoded:
+            if is_pentest and fact["enables"]:
+                visible_enables, _ = encode_graph_text(fact["enables"])
+                lines.append(f"    enables: {self._ctf_yaml_scalar(visible_enables)}")
+            if is_pentest and encoded:
                 lines.append(f"    representation: {GRAPH_TEXT_REPR}")
                 lines.append(f"    encoded_controls: {encoded}")
-            if content:
-                lines.append(f"    content: {self._ctf_yaml_scalar(content)}")
+            lines.extend(
+                self._ctf_yaml_content_lines(
+                    content, encoded=encoded, is_pentest=is_pentest
+                )
+            )
+
+        if is_pentest:
+            if superseded_facts:
+                lines.append("supersededFacts:")
             else:
-                lines.append('    content: ""')
+                lines.append("supersededFacts: []")
+            for retired in superseded_facts:
+                title, _ = encode_graph_text(retired["title"])
+                lines.extend([
+                    f"  - id: {retired['id']}",
+                    f"    title: {self._ctf_yaml_scalar(title)}",
+                ])
+                if retired.get("reason"):
+                    lines.append(f"    reason: {self._ctf_yaml_scalar(retired['reason'])}")
+                by_seq = retired.get("by_fact_seq") or retired.get("to_fact_seq")
+                by = (all_fact_ids.get(int(by_seq), retired.get("actor"))
+                      if by_seq else retired.get("actor"))
+                if by:
+                    lines.append(f"    by: {self._ctf_yaml_scalar(by)}")
 
-        lines.append("observations:" if standalone_observations else "observations: []")
-        for (obs_seq, intent_id, body, witness, artifact_id, created_at,
-             admitted, target_epoch, refs) in standalone_observations:
-            visible_body, encoded = encode_graph_text(body)
-            lines.extend([
-                f"  - id: observation_{obs_seq}",
-                f"    status: {'admitted' if admitted else 'unadmitted'}",
-                f"    text: {self._ctf_yaml_scalar(visible_body)}",
-            ])
-            if intent_id:
-                lines.append(f"    step: {self._ctf_yaml_scalar(intent_id)}")
-            if target_epoch:
-                lines.append(f"    targetEpoch: {self._ctf_yaml_scalar(target_epoch)}")
-            if witness and witness != body:
-                visible_witness, _ = encode_graph_text(witness)
-                lines.append(f"    witness: {self._ctf_yaml_scalar(visible_witness)}")
-            if artifact_id:
-                lines.append(f"    artifact: {self._ctf_yaml_scalar(artifact_id)}")
-            if refs:
-                lines.append("    artifactRefs:")
-                lines.extend(
-                    f"      - {self._ctf_yaml_scalar(ref.get('artifact_id'))}"
-                    for ref in refs
-                )
-            if encoded:
-                lines.append(f"    representation: {GRAPH_TEXT_REPR}")
-            created = self._ctf_created_at(created_at)
-            if created:
-                lines.append(f"    createdAt: {created}")
-
-        lines.append("deadEnds:" if dead_end_rows else "deadEnds: []")
-        for dead_seq, dead_ts, raw_payload in dead_end_rows:
-            payload = json.loads(raw_payload or "{}")
-            lines.extend([
-                f"  - id: dead_end_{int(dead_seq)}",
-                f"    reason: {self._ctf_yaml_scalar(payload.get('reason'))}",
-            ])
-            for key, field in (("tested", "tested_scope"), ("observed", "observed_result"),
-                               ("step", "intent_id"), ("targetEpoch", "target_epoch")):
-                value = str(payload.get(field) or "")
-                if value:
-                    visible, _ = encode_graph_text(value)
-                    lines.append(f"    {key}: {self._ctf_yaml_scalar(visible)}")
-            created = self._ctf_created_at(dead_ts)
-            if created:
-                lines.append(f"    createdAt: {created}")
-
-        lines.append("resources:" if poc_rows else "resources: []")
-        for poc_id, name, entry_command, status, artifact_id in poc_rows:
-            lines.extend([
-                f"  - id: {self._ctf_yaml_scalar(poc_id)}",
-                "    kind: poc",
-                f"    status: {self._ctf_yaml_scalar(status)}",
-                f"    name: {self._ctf_yaml_scalar(name)}",
-                f"    entryCommand: {self._ctf_yaml_scalar(entry_command)}",
-            ])
-            if artifact_id:
-                lines.append(f"    artifact: {self._ctf_yaml_scalar(artifact_id)}")
-
-        finding_reviews: dict[int, dict[str, Any]] = {}
-        for (raw_review,) in finding_review_rows:
-            review = json.loads(raw_review or "{}")
-            seq = review.get("finding_seq")
-            if type(seq) is int and seq > 0:
-                finding_reviews[seq] = review
-        findings: list[dict[str, Any]] = []
-        next_finding_index = 0
-        for finding_seq, ts, raw_payload in finding_rows:
-            try:
-                payload = json.loads(raw_payload or "{}")
-            except (TypeError, ValueError, json.JSONDecodeError):
-                payload = {}
-            finding_class = str(payload.get("finding_class") or "").strip().lower()
-            if finding_class not in {"product", "flag"} and payload.get("report_status") != "submitted":
-                continue
-            next_finding_index += 1
-            from_fact_seq = 0
-            try:
-                from_fact_seq = int(payload.get("from_fact") or (payload.get("fact_seqs") or [0])[0])
-            except (TypeError, ValueError):
-                from_fact_seq = 0
-            findings.append({
-                "id": f"finding_{next_finding_index:03d}",
-                "class": "vulnerability_report" if payload.get("report_status") == "submitted" else finding_class,
-                "title": str(payload.get("title") or "").strip(),
-                "from_fact": fact_ids.get(from_fact_seq, ""),
-                "from_step": str(payload.get("from_step") or payload.get("intent_id") or ""),
-                "created_at": self._ctf_created_at(ts),
-                "review": finding_reviews.get(int(finding_seq)),
-            })
-        lines.append("findings:" if findings else "findings: []")
-        for finding in findings:
-            lines.extend([
-                f"  - id: {finding['id']}",
-                f"    class: {finding['class']}",
-                f"    title: {self._ctf_yaml_scalar(finding['title'])}",
-            ])
-            if finding["from_fact"]:
-                lines.append(f"    from_fact: {finding['from_fact']}")
-            if finding["from_step"]:
-                lines.append(
-                    f"    from_step: {self._ctf_yaml_scalar(finding['from_step'])}"
-                )
-            if finding["created_at"]:
-                lines.append(f"    createdAt: {finding['created_at']}")
-            if finding["review"] is not None:
-                lines.append(
-                    f"    reviewStatus: {self._ctf_yaml_scalar(finding['review'].get('status'))}"
-                )
-                if finding["review"].get("reason"):
-                    lines.append(
-                        f"    reviewReason: {self._ctf_yaml_scalar(finding['review']['reason'])}"
+            visible_observations = list(standalone_observations)
+            if visible_observations:
+                lines.append("observations:")
+            else:
+                lines.append("observations: []")
+            for (obs_seq, intent_id, body, witness, artifact_id, created_at,
+                 admitted, target_epoch, refs) in visible_observations:
+                visible_body, encoded = encode_graph_text(body)
+                lines.extend([
+                    f"  - id: observation_{obs_seq}",
+                    f"    status: {'admitted' if admitted else 'unadmitted'}",
+                    f"    text: {self._ctf_yaml_scalar(visible_body)}",
+                ])
+                if intent_id:
+                    lines.append(f"    step: {self._ctf_yaml_scalar(intent_id)}")
+                if target_epoch:
+                    lines.append(f"    targetEpoch: {self._ctf_yaml_scalar(target_epoch)}")
+                if witness and witness != body:
+                    visible_witness, _ = encode_graph_text(witness)
+                    lines.append(f"    witness: {self._ctf_yaml_scalar(visible_witness)}")
+                if artifact_id:
+                    lines.append(f"    artifact: {self._ctf_yaml_scalar(artifact_id)}")
+                if refs:
+                    lines.append("    artifactRefs:")
+                    lines.extend(
+                        f"      - {self._ctf_yaml_scalar(ref.get('artifact_id'))}"
+                        for ref in refs
                     )
+                if encoded:
+                    lines.append(f"    representation: {GRAPH_TEXT_REPR}")
+                created = self._ctf_created_at(created_at)
+                if created:
+                    lines.append(f"    createdAt: {created}")
+
+            deduped_dead_end_rows: list[tuple[int, float, str, dict[str, Any]]] = []
+            for dead_seq, dead_ts, raw_payload in dead_end_rows:
+                try:
+                    payload = json.loads(raw_payload or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    payload = {}
+                deduped_dead_end_rows.append((
+                    int(dead_seq), float(dead_ts or 0), str(raw_payload or ""), payload,
+                ))
+            if deduped_dead_end_rows:
+                lines.append("deadEnds:")
+            else:
+                lines.append("deadEnds: []")
+            dead_end_fields = (
+                ("tested", "tested_scope"),
+                ("observed", "observed_result"),
+                ("coverageKey", "coverage_key"),
+                ("step", "intent_id"),
+                ("targetEpoch", "target_epoch"),
+            )
+            for dead_seq, dead_ts, _raw_payload, payload in deduped_dead_end_rows:
+                lines.extend([
+                    f"  - id: dead_end_{int(dead_seq)}",
+                    f"    reason: {self._ctf_yaml_scalar(payload.get('reason'))}",
+                ])
+                for key, field in dead_end_fields:
+                    value = str(payload.get(field) or "")
+                    if value:
+                        visible, _ = encode_graph_text(value)
+                        lines.append(f"    {key}: {self._ctf_yaml_scalar(visible)}")
+                created = self._ctf_created_at(dead_ts)
+                if created:
+                    lines.append(f"    createdAt: {created}")
+
+            if poc_rows:
+                lines.append("resources:")
+            else:
+                lines.append("resources: []")
+            for poc_id, name, entry_command, status, artifact_id in poc_rows:
+                lines.extend([
+                    f"  - id: {self._ctf_yaml_scalar(poc_id)}",
+                    "    kind: poc",
+                    f"    status: {self._ctf_yaml_scalar(status)}",
+                    f"    name: {self._ctf_yaml_scalar(name)}",
+                    f"    entryCommand: {self._ctf_yaml_scalar(entry_command)}",
+                ])
+                if artifact_id:
+                    lines.append(f"    artifact: {self._ctf_yaml_scalar(artifact_id)}")
+
+            finding_reviews: dict[int, dict[str, Any]] = {}
+            for (raw_review,) in finding_review_rows:
+                review = json.loads(raw_review or "{}")
+                seq = review.get("finding_seq")
+                if type(seq) is int and seq > 0:
+                    finding_reviews[seq] = review
+            findings: list[dict[str, Any]] = []
+            next_finding_index = 0
+            for finding_seq, ts, raw_payload in finding_rows:
+                try:
+                    payload = json.loads(raw_payload or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    payload = {}
+                finding_class = str(payload.get("finding_class") or "").strip().lower()
+                if finding_class not in {"product", "flag"} and payload.get("report_status") != "submitted":
+                    continue
+                next_finding_index += 1
+                from_fact_seq = 0
+                try:
+                    from_fact_seq = int(payload.get("from_fact") or (payload.get("fact_seqs") or [0])[0])
+                except (TypeError, ValueError):
+                    from_fact_seq = 0
+                findings.append({
+                    "id": f"finding_{next_finding_index:03d}",
+                    "class": "vulnerability_report" if payload.get("report_status") == "submitted" else finding_class,
+                    "title": str(payload.get("title") or "").strip(),
+                    "from_fact": fact_ids.get(from_fact_seq, ""),
+                    "from_step": str(payload.get("from_step") or payload.get("intent_id") or ""),
+                    "created_at": self._ctf_created_at(ts),
+                    "review": finding_reviews.get(int(finding_seq)),
+                })
+            if findings:
+                lines.append("findings:")
+            else:
+                lines.append("findings: []")
+            for finding in findings:
+                lines.extend([
+                    f"  - id: {finding['id']}",
+                    f"    class: {finding['class']}",
+                    f"    title: {self._ctf_yaml_scalar(finding['title'])}",
+                ])
+                if finding["from_fact"]:
+                    lines.append(f"    from_fact: {finding['from_fact']}")
+                if finding["from_step"]:
+                    lines.append(
+                        f"    from_step: {self._ctf_yaml_scalar(finding['from_step'])}"
+                    )
+                if finding["created_at"]:
+                    lines.append(f"    createdAt: {finding['created_at']}")
+                if finding["review"] is not None:
+                    lines.append(
+                        f"    reviewStatus: {self._ctf_yaml_scalar(finding['review'].get('status'))}"
+                    )
+                    if finding["review"].get("reason"):
+                        lines.append(
+                            f"    reviewReason: {self._ctf_yaml_scalar(finding['review']['reason'])}"
+                        )
 
         created_at = facts[0]["created_at"] if facts else ""
         if getattr(self.challenge, "mode", "ctf") == "pentest":
@@ -380,28 +782,95 @@ class _RenderMixin:
                 "    kind: pentest_objective",
                 f"    criterion: {self._ctf_yaml_scalar(getattr(pentest, 'goal', '') or self.challenge.goal)}",
             ])
+            if created_at:
+                lines.append(f"    createdAt: {created_at}")
         else:
-            expected_flags = max(
-                1, int(getattr(self.challenge, "expected_flags", 1) or 1)
-            )
             lines.extend([
                 "goals:",
                 "  - id: goal_final",
                 "    kind: final",
-                "    finding_class: flag",
-                f"    expected: {expected_flags}",
                 "    criterion: 解决这道 CTF 题目，并提交全部 FLAG，多 FLAG 题目要找到全部 FLAG 并有效提交",
             ])
-        if created_at:
-            lines.append(f"    createdAt: {created_at}")
-        lines.append("steps:" if step_rows else "steps: []")
+            if created_at:
+                lines.append(f"    createdAt: {created_at}")
+        goal_end = next(
+            (index for index in range(lines.index("goals:") + 1, len(lines))
+             if lines[index] and not lines[index].startswith(" ")),
+            len(lines),
+        )
+        sub_goal_lines: list[str] = []
+        for sub_goal in self.sub_goals():
+            if is_pentest:
+                sub_goal_lines.extend([
+                    f"  - id: {self._ctf_yaml_scalar(sub_goal['goal_id'])}",
+                    "    kind: sub",
+                    f"    state: {self._ctf_yaml_scalar(sub_goal['state'])}",
+                    f"    criterion: {self._ctf_yaml_scalar(sub_goal['criterion'])}",
+                ])
+            else:
+                sub_goal_lines.extend([
+                    f"  - id: {sub_goal['goal_id']}",
+                    "    kind: sub",
+                    f"    criterion: {self._ctf_yaml_scalar(sub_goal['criterion'])}",
+                ])
+                if sub_goal.get("state") == "satisfied":
+                    sat_by = [
+                        all_fact_ids[int(s)]
+                        for s in (sub_goal.get("evidence_fact_seqs") or [])
+                        if int(s) in all_fact_ids
+                    ]
+                    if sat_by:
+                        sub_goal_lines.append("    satisfiedBy:")
+                        sub_goal_lines.extend(f"      - {fid}" for fid in sat_by)
+                    if sub_goal.get("reason"):
+                        sub_goal_lines.append(
+                            f"    satisfiedReason: {self._ctf_yaml_scalar(sub_goal['reason'])}"
+                        )
+                    if sub_goal.get("satisfied_at"):
+                        sub_goal_lines.append(f"    satisfiedAt: {sub_goal['satisfied_at']}")
+                if sub_goal.get("created_at"):
+                    sub_goal_lines.append(f"    createdAt: {sub_goal['created_at']}")
+        lines[goal_end:goal_end] = sub_goal_lines
+        compacted_step_rows = [
+            row for row in step_rows
+            if str(row[0]) in compacted_intent_ids
+        ]
+        if is_pentest and compacted_step_rows:
+            lines.append("compactedSteps:")
+            for (
+                c_id, c_action, _cpv, _crp, _cst, _cds, c_detail,
+                _ccseq, _ccts, c_raw_rp, c_expected, c_stop, c_cov, _crc, _crpocs, _cvc,
+            ) in compacted_step_rows:
+                try:
+                    c_rp = json.loads(c_raw_rp or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    c_rp = {}
+                c_res = str(c_detail or c_rp.get("result") or "retired").strip()
+                lines.append(f"  - stepId: {self._ctf_yaml_scalar(c_id)}")
+                for key, value in (
+                    ("coverageKey", c_cov),
+                    ("stopCondition", c_stop),
+                    ("expectedObservable", c_expected),
+                ):
+                    if value:
+                        visible, _ = encode_graph_text(value)
+                        lines.append(f"    {key}: {self._ctf_yaml_scalar(visible)}")
+                lines.extend([
+                    f"    action: {self._ctf_yaml_scalar(c_action)}",
+                    f"    result: {self._ctf_yaml_scalar(c_res)}",
+                ])
+        visible_step_rows = [
+            row for row in step_rows
+            if not is_pentest or str(row[0]) not in compacted_intent_ids
+        ]
+        lines.append("steps:" if visible_step_rows else "steps: []")
         for (
             intent_id, action, priority_value, requested_priority, status,
             dispatch_state, result_detail, _created_seq, created_ts,
             raw_result_payload, expected_observable, stop_condition,
             coverage_key, requires_capabilities_json, required_pocs_json,
             value_claim_json,
-        ) in step_rows:
+        ) in visible_step_rows:
             try:
                 result_payload = json.loads(raw_result_payload or "{}")
             except (TypeError, ValueError, json.JSONDecodeError):
@@ -412,22 +881,40 @@ class _RenderMixin:
                 else "low" if int(priority_value or 0) < 0
                 else "normal"
             )
+            to_fact_map = all_fact_ids
+            to_ids = [
+                to_fact_map[int(seq)]
+                for seq in products.get(str(intent_id), [])
+                if int(seq) in to_fact_map
+            ]
+            raw_res = str(result_payload.get("result") or "").strip().lower()
             dropped = (
-                str(result_payload.get("result") or "") == "superseded"
-                or str(dispatch_state or "") == INTENT_DISPATCH_RETIRED
+                raw_res == "superseded"
+                or (
+                    str(status or "") != "done"
+                    and str(dispatch_state or "") == INTENT_DISPATCH_RETIRED
+                )
             )
-            state = "dropped" if dropped else (
-                "done" if str(status or "") == "done" else "open"
-            )
+            if not is_pentest:
+                if dropped:
+                    state = "dropped"
+                elif str(status or "") == "done":
+                    state = "done"
+                else:
+                    state = "open"
+            else:
+                state = "dropped" if dropped else (
+                    "done" if str(status or "") == "done" else "open"
+                )
             lines.extend([
-                f"  - id: {self._ctf_yaml_scalar(intent_id)}",
+                f"  - id: {self._ctf_yaml_scalar(intent_id) if is_pentest else intent_id}",
                 f"    action: {self._ctf_yaml_scalar(action)}",
                 "    from:",
             ])
             from_ids = [
-                fact_ids[int(seq)]
+                all_fact_ids[int(seq)]
                 for seq in sources.get(str(intent_id), [])
-                if int(seq) in fact_ids
+                if int(seq) in all_fact_ids
             ]
             if from_ids:
                 lines.extend(f"      - {fact_id}" for fact_id in from_ids)
@@ -438,13 +925,29 @@ class _RenderMixin:
                 f"    priority: {priority}",
                 f"    state: {state}",
             ])
-            for key, value in (("expectedObservable", expected_observable),
-                               ("stopCondition", stop_condition),
-                               ("coverageKey", coverage_key)):
-                if value:
-                    visible, _ = encode_graph_text(value)
-                    lines.append(f"    {key}: {self._ctf_yaml_scalar(visible)}")
-            if getattr(self.challenge, "mode", "ctf") == "pentest":
+            is_running_claimed = (
+                state == "open"
+                and str(status or "") == "claimed"
+                and str(dispatch_state or "active") == "active"
+            )
+            if is_pentest:
+                if is_running_claimed:
+                    lines.append("    execution: running")
+                    live_map = getattr(self, "_live_step_activity", None)
+                    if isinstance(live_map, dict):
+                        live_info = live_map.get(str(intent_id))
+                        if isinstance(live_info, dict) and live_info.get("summary"):
+                            visible_live, _ = encode_graph_text(str(live_info["summary"]))
+                            lines.append(f"    liveActivity: {self._ctf_yaml_scalar(visible_live)}")
+                contract_fields = (
+                    ("expectedObservable", expected_observable),
+                    ("stopCondition", stop_condition),
+                    ("coverageKey", coverage_key),
+                )
+                for key, value in contract_fields:
+                    if value:
+                        visible, _ = encode_graph_text(value)
+                        lines.append(f"    {key}: {self._ctf_yaml_scalar(visible)}")
                 claim = json.loads(value_claim_json or "{}")
                 for key, field in (("asset", "asset"), ("identity", "identity"),
                                    ("riskTier", "risk_tier"),
@@ -466,23 +969,62 @@ class _RenderMixin:
                 lines.extend(
                     f"      - {self._ctf_yaml_scalar(item)}" for item in required_pocs
                 )
-            to_ids = [
-                fact_ids[int(seq)]
-                for seq in products.get(str(intent_id), [])
-                if int(seq) in fact_ids
-            ]
             if len(to_ids) == 1:
                 lines.append(f"    to: {to_ids[0]}")
             elif to_ids:
                 lines.append("    to:")
                 lines.extend(f"      - {fact_id}" for fact_id in to_ids)
-            if state == "done" and str(result_detail or "").strip():
+            if state == "dropped" and str(result_detail or "").strip():
+                lines.append(
+                    f"    reason: {self._ctf_yaml_scalar(result_detail)}"
+                )
+            elif is_pentest and state == "done" and str(result_detail or "").strip():
                 lines.append(
                     f"    result: {self._ctf_yaml_scalar(result_detail)}"
                 )
             timestamp = self._ctf_created_at(created_ts)
             if timestamp:
                 lines.append(f"    createdAt: {timestamp}")
+        if is_pentest and branch_rows:
+            lines.append("branches:")
+            for (
+                b_id, b_parent, b_title, b_assumption, b_prove,
+                b_status, b_source_intent, b_from_json, b_expected,
+                b_stop, b_coverage,
+            ) in branch_rows:
+                try:
+                    b_from_seqs = [int(seq) for seq in json.loads(b_from_json or "[]")]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    b_from_seqs = []
+                b_from_ids = [
+                    fact_ids.get(int(seq), f"fact_{int(seq):03d}")
+                    for seq in b_from_seqs
+                    if int(seq) > 0
+                ]
+                b_action = str(b_assumption or b_title or "").strip()
+                visible_action, _ = encode_graph_text(b_action)
+                lines.extend([
+                    f"  - id: {self._ctf_yaml_scalar(b_id)}",
+                    f"    action: {self._ctf_yaml_scalar(visible_action)}",
+                    f"    state: {self._ctf_yaml_scalar(b_status or 'open')}",
+                    "    from:",
+                ])
+                if b_from_ids:
+                    lines.extend(f"      - {fid}" for fid in b_from_ids)
+                else:
+                    lines.append("      []")
+                if b_source_intent:
+                    lines.append(f"    sourceStep: {self._ctf_yaml_scalar(b_source_intent)}")
+                if b_parent:
+                    lines.append(f"    parentBranch: {self._ctf_yaml_scalar(b_parent)}")
+                for key, value in (
+                    ("expectedObservable", b_expected or b_prove),
+                    ("stopCondition", b_stop),
+                    ("coverageKey", b_coverage),
+                ):
+                    if value:
+                        visible, _ = encode_graph_text(value)
+                        lines.append(f"    {key}: {self._ctf_yaml_scalar(visible)}")
         notes: list[str] = []
         for directive in self.operator_directives(active_only=True):
             action = str(directive.get("action") or "").strip().lower()
@@ -497,7 +1039,542 @@ class _RenderMixin:
             lines.append("operatorNotes:")
             for text in notes:
                 lines.append(f"  - {self._ctf_yaml_scalar(text)}")
+        rendered_yaml = "\n".join(lines)
+        self._persist_ctf_fgs_snapshot(rendered_yaml)
+        return rendered_yaml
+
+    def _persist_ctf_fgs_snapshot(
+        self,
+        yaml_text: str,
+        workspace_root: Optional[Path | str] = None,
+    ) -> Optional[Path]:
+        """Atomically persist the latest compact FGS graph YAML into shared/graph.yaml."""
+        root = self._resolve_workspace_root(workspace_root)
+        if root is None:
+            return None
+        live_dir = root / "shared" / "live"
+        target_dir = live_dir if live_dir.is_dir() else (root / "shared")
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            out_path = target_dir / "graph.yaml"
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=".graph.", suffix=".yaml", dir=str(target_dir)
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(yaml_text + "\n")
+                os.replace(tmp_name, out_path)
+            finally:
+                if os.path.exists(tmp_name):
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        pass
+            return out_path
+        except OSError:
+            return None
+
+    def _resolve_workspace_root(
+        self, workspace_root: Optional[Path | str] = None,
+    ) -> Optional[Path]:
+        raw = workspace_root or getattr(self, "_workspace_root", None)
+        if raw:
+            try:
+                resolved = Path(raw).expanduser().resolve()
+                if resolved.name == "workers":
+                    resolved = resolved.parent
+                self._workspace_root = resolved
+                return resolved
+            except OSError:
+                pass
+        db_file = str(getattr(self, "db_path", "") or "").strip()
+        if db_file and db_file != ":memory:":
+            try:
+                candidate = Path(db_file).expanduser().resolve().parent.parent
+                if (candidate / "shared").exists():
+                    self._workspace_root = candidate
+                    return candidate
+            except OSError:
+                pass
+        return None
+
+    def shared_markdown_docs(
+        self, workspace_root: Optional[Path | str] = None,
+    ) -> list[dict[str, Any]]:
+        """Discover landed Markdown files under shared/live for Decide and Workers."""
+        root = self._resolve_workspace_root(workspace_root)
+        if root is None:
+            return []
+        live_dir = root / "shared" / "live"
+        target_dir = live_dir if live_dir.is_dir() else (root if root.is_dir() else None)
+        if target_dir is None:
+            return []
+        try:
+            entries = [
+                p for p in target_dir.iterdir()
+                if p.suffix.lower() == ".md"
+                and not p.name.startswith(".")
+                and p.name != "00_step_history_review.md"
+                and p.is_file()
+            ]
+        except OSError:
+            return []
+        if not entries:
+            return []
+
+        def _sort_key(item: Path) -> tuple[int, float, str]:
+            try:
+                mtime = float(item.stat().st_mtime)
+            except OSError:
+                mtime = 0.0
+            is_primary = 0 if item.name == "step_history_review.md" else 1
+            return (is_primary, -mtime, item.name)
+
+        docs: list[dict[str, Any]] = []
+        for item in sorted(entries, key=_sort_key)[:24]:
+            try:
+                size = int(item.stat().st_size)
+                raw_head = item.read_text(encoding="utf-8", errors="replace")[:4096]
+            except OSError:
+                continue
+            headings = [
+                line.strip()
+                for line in raw_head.splitlines()
+                if line.strip().startswith("#")
+            ][:5]
+            if not headings:
+                headings = [
+                    line.strip()
+                    for line in raw_head.splitlines()
+                    if line.strip()
+                ][:2]
+            summary = " | ".join(headings)[:240]
+            docs.append({
+                "name": item.name,
+                "path": f"shared/{item.name}",
+                "bytes": size,
+                "summary": summary or item.name,
+            })
+        return docs
+
+    def decide_workspace_files_block(
+        self,
+        workspace_root: Optional[Path | str] = None,
+        *,
+        max_items: int = 30,
+    ) -> str:
+        """List initial attachments and landed files from the resolved workspace."""
+        root = self._resolve_workspace_root(workspace_root)
+        items: dict[str, float] = {}
+        internal_names = {
+            "manifest.json",
+            "runtime-diagnostics.json",
+            "00_step_history_review.md",
+            "graph.yaml",
+            "graph.jsonl",
+        }
+
+        def _is_internal_name(name: str) -> bool:
+            low = name.lower()
+            if name in internal_names or low.endswith((".lock", ".db", ".db-wal", ".db-shm")):
+                return True
+            if name.startswith("graph_wave_") and name.endswith(".yaml"):
+                return True
+            return False
+
+        in_flight_prefixes: tuple[str, ...] = ()
+        try:
+            with self._lock:
+                claimed_rows = self._conn.execute(
+                    "SELECT intent_id FROM intents WHERE challenge_id=? "
+                    "AND status='claimed' AND COALESCE(dispatch_state,'active')='active'",
+                    (self.challenge.id,),
+                ).fetchall()
+            prefixes: set[str] = set()
+            for (raw_iid,) in claimed_rows:
+                iid = str(raw_iid or "").strip().lower()
+                if not iid:
+                    continue
+                prefixes.add(iid)
+                compact = iid.replace("_", "").replace("-", "")
+                if compact:
+                    prefixes.add(compact)
+            in_flight_prefixes = tuple(sorted(prefixes))
+        except Exception:
+            in_flight_prefixes = ()
+
+        def _matches_in_flight_step(name: str) -> bool:
+            if not in_flight_prefixes:
+                return False
+            stem = Path(name).stem.lower()
+            norm = stem.replace("_", "").replace("-", "")
+            for pref in in_flight_prefixes:
+                if stem == pref or stem.startswith(pref + "_") or stem.startswith(pref + "-"):
+                    return True
+                pref_norm = pref.replace("_", "").replace("-", "")
+                if pref_norm and norm.startswith(pref_norm) and (
+                    len(norm) == len(pref_norm) or not norm[len(pref_norm)].isdigit()
+                ):
+                    return True
+            return False
+
+        def include(path: Path, display: str) -> None:
+            if (any(part.startswith(".") for part in Path(display).parts)
+                    or _is_internal_name(path.name)
+                    or _matches_in_flight_step(path.name)):
+                return
+            try:
+                items[display] = path.stat().st_mtime if path.is_file() else 0.0
+            except OSError:
+                items.setdefault(display, 0.0)
+
+        attachment_names: set[str] = set()
+        for raw in getattr(self.challenge, "attachments", ()) or ():
+            attachment = Path(str(raw))
+            if attachment.name and not _is_internal_name(attachment.name):
+                attachment_names.add(attachment.name)
+                if root is not None and (root / attachment.name).is_file():
+                    include(root / attachment.name, attachment.name)
+                elif attachment.is_file():
+                    include(attachment, attachment.name)
+        if root is not None and root.is_dir():
+            shared = root / "shared"
+            live = shared / "live"
+            shared_reserved = {"live", "objects", "links", "index.jsonl", "shared"}
+            for artifact_root in (shared, live):
+                if not artifact_root.is_dir():
+                    continue
+                for child in artifact_root.iterdir():
+                    if (
+                        child.name.startswith(".")
+                        or (artifact_root == shared and child.name in shared_reserved)
+                        or (child.name == "shared" and child.is_symlink())
+                        or _matches_in_flight_step(child.name)
+                    ):
+                        continue
+                    if child.is_file():
+                        include(child, f"shared/{child.name}")
+                    elif child.is_dir():
+                        subfiles = [
+                            p for p in child.rglob("*")
+                            if p.is_file()
+                            and not (p.name == "shared" and p.is_symlink())
+                            and not any(part.startswith(".") for part in p.relative_to(artifact_root).parts)
+                            and not _is_internal_name(p.name)
+                            and not _matches_in_flight_step(p.name)
+                        ]
+                        if len(subfiles) > 8:
+                            latest_mtime = max(
+                                (p.stat().st_mtime for p in subfiles if p.exists()),
+                                default=0.0,
+                            )
+                            items[f"shared/{child.name}/ (目录, {len(subfiles)} 个文件)"] = latest_mtime
+                        else:
+                            for p in subfiles:
+                                include(p, "shared/" + p.relative_to(artifact_root).as_posix())
+            for path in root.iterdir():
+                if path.is_file() and (
+                    path.name in attachment_names or not _is_internal_name(path.name)
+                ):
+                    if path.name not in internal_names:
+                        include(path, path.name)
+        if not items:
+            return ""
+        ordered = sorted(items, key=lambda name: (-items[name], name))
+        shown = ordered[:max_items]
+        lines = [
+            "【工作目录里的文件】(随项目附带的物料,或已结案 step 留下的产物;你没有读取工具,要用到内容就开一个 step 交给 execute 读。注意:仍在 open 状态的 step 可能正在后台写入文件,不要因看到相关文件名就 drop_step 取消仍在运行的 open step)"
+        ]
+        lines.extend(f"- {entry}" for entry in shown)
+        remaining = len(ordered) - len(shown)
+        if remaining > 0:
+            lines.append(f"- …还有 {remaining} 项(略)")
         return "\n".join(lines)
+
+    def write_ctf_step_review_markdown(
+        self,
+        workspace_root: Optional[Path | str] = None,
+        *,
+        trigger: str = "",
+        filename: str = "step_history_review.md",
+    ) -> Optional[Path]:
+        """Materialize a structured Markdown review of all Facts, DeadEnds, and Steps."""
+        root = self._resolve_workspace_root(workspace_root)
+        if root is None:
+            return None
+        with self._lock:
+            fact_rows = self._conn.execute(
+                "SELECT seq,ts,payload FROM events "
+                "WHERE challenge_id=? AND kind=? ORDER BY seq",
+                (self.challenge.id, EV_FACT_ADDED),
+            ).fetchall()
+            step_rows = self._conn.execute(
+                "SELECT i.intent_id,i.goal,i.status,i.dispatch_state,"
+                "i.result_detail,i.coverage_key,ce.ts,re.payload "
+                "FROM intents i "
+                "LEFT JOIN events ce ON ce.seq=i.created_seq "
+                "LEFT JOIN events re ON re.seq=i.result_seq "
+                "WHERE i.challenge_id=? ORDER BY i.created_seq,i.intent_id",
+                (self.challenge.id,),
+            ).fetchall()
+            dead_end_rows = self._conn.execute(
+                "SELECT seq,ts,payload FROM events "
+                "WHERE challenge_id=? AND kind=? ORDER BY seq",
+                (self.challenge.id, EV_DEAD_END),
+            ).fetchall()
+            observation_rows = self._conn.execute(
+                "SELECT observation_seq,intent_id,text,admitted_fact_seq,target_epoch,"
+                "artifact_id,provenance_json "
+                "FROM observations WHERE challenge_id=? ORDER BY observation_seq",
+                (self.challenge.id,),
+            ).fetchall()
+            poc_rows = self._conn.execute(
+                "SELECT poc_id,name,entry_command,status,artifact_id "
+                "FROM pocs WHERE challenge_id=? ORDER BY created_seq",
+                (self.challenge.id,),
+            ).fetchall()
+
+        fact_states = self._fact_state_map()
+        lifecycle_events: dict[int, dict[str, Any]] = {}
+        with self._lock:
+            invalidations = self._conn.execute(
+                "SELECT seq,kind,actor,payload FROM events WHERE challenge_id=? "
+                "AND kind IN ('fact_rejected','fact_merged','fact_superseded') ORDER BY seq",
+                (self.challenge.id,),
+            ).fetchall()
+            observation_witnesses = dict(self._conn.execute(
+                "SELECT observation_seq,witness FROM observations WHERE challenge_id=?",
+                (self.challenge.id,),
+            ).fetchall())
+        for event_seq, kind, actor, raw in invalidations:
+            payload = json.loads(raw or "{}")
+            fact_seq = payload.get("fact_seq") or payload.get("from_fact_seq")
+            if fact_seq is not None:
+                lifecycle_events[int(fact_seq)] = {
+                    **payload, "event_seq": event_seq, "kind": kind, "actor": actor,
+                }
+
+        intent_ids = {str(row[0]) for row in step_rows}
+        sources = self._intent_sources_map(intent_ids, include_retired=True)
+        products = self._intent_products_map(intent_ids, include_retired=True)
+
+        fact_ids: dict[int, str] = {}
+        facts: list[dict[str, Any]] = []
+        next_fact_idx = 0
+        for seq, ts, raw_payload in fact_rows:
+            try:
+                payload = json.loads(raw_payload or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            text = str(payload.get("fact") or "").strip()
+            if not text:
+                continue
+            source = str(payload.get("source") or "")
+            if source == "origin":
+                fid = "fact_origin"
+                text = self._live_origin_fact_text(text)
+            else:
+                next_fact_idx += 1
+                fid = f"fact_{next_fact_idx:03d}"
+            fact_ids[int(seq)] = fid
+            title, sep, content = text.partition("\n")
+            facts.append({
+                "seq": int(seq),
+                "id": fid,
+                "title": title.strip(),
+                "content": content.strip() if sep else "",
+                "created_at": self._ctf_created_at(ts),
+                "target_epoch": str(
+                    (payload.get("evidence_provenance") or {}).get("target_epoch") or ""
+                ),
+            })
+
+        epoch_now = str(
+            getattr(self, "_target_epoch", "")
+            or getattr(self.challenge, "target_epoch", "")
+            or "1"
+        )
+        now_iso = self._ctf_created_at(time.time())
+        md: list[str] = [
+            f"# 阶段复盘与历史意图总结 ({self.challenge.name or self.challenge.id})",
+            "",
+            f"- 更新时间: `{now_iso}` | 触发原因: `{trigger or 'checkpoint'}` | 当前 Target Epoch: `{epoch_now}`",
+            f"- 当前目标端点: `{self.challenge.target or ''}` (Scope: `{self.challenge.scope or ''}`)",
+            f"- 累计统计: 历史 Fact **{len(facts)}** 条 | 已排除死路 **{len(dead_end_rows)}** 条 | 历史 Step **{len(step_rows)}** 条",
+            "- 本复盘的 fact 编号按完整审计历史排列；跨波次引用以 event_seq 为准，当前工作图的 fact 编号会重新起算。",
+            "",
+        ]
+
+        verdicts = self.platform_verdicts()
+        if verdicts:
+            md.append("## 一、平台提交回执 (Platform Verdicts — 切勿重复提交 rejected 候选)")
+            for v in verdicts:
+                md.append(
+                    f"- `{v.get('status')}`: `{v.get('flag')}` "
+                    f"(completed={v.get('completed')}, correct={v.get('correct_flag_count')}/{v.get('total_flag_count')})"
+                )
+            md.append("")
+
+        md.append("## 二、历史 Fact 与生命周期 (Historical Facts & Lifecycle)")
+        for f in facts:
+            if f["id"] == "fact_origin":
+                continue
+            ep_tag = f" [epoch={f['target_epoch']}]" if f["target_epoch"] else ""
+            lifecycle = fact_states.get(int(f["seq"]), {})
+            invalidation = lifecycle_events.get(int(f["seq"]), {})
+            state = lifecycle.get("state") or "active"
+            retired = bool(lifecycle.get("retired")) or state in _FACT_TERMINAL_STATES
+            md.append(
+                f"### `{f['id']}` [event_seq={f['seq']}] "
+                f"[state={state}, retired={str(retired).lower()}]{ep_tag}: {f['title']}"
+            )
+            if retired:
+                md.append("- 已失效的历史记录，不得作为当前已确认事实使用。")
+            reason = lifecycle.get("reason") or invalidation.get("reason")
+            if reason:
+                md.append(f"- 生命周期原因: {reason}")
+            if invalidation:
+                md.append(
+                    f"- 生命周期事件: event_seq={invalidation['event_seq']}, "
+                    f"kind={invalidation['kind']}, actor={invalidation['actor']}"
+                )
+            replacement = invalidation.get("by_fact_seq") or invalidation.get("to_fact_seq")
+            if replacement:
+                md.append(f"- 替代 Fact: event_seq={replacement}")
+            if f["content"]:
+                md.append(f["content"])
+            md.append("")
+
+        if observation_rows:
+            md.append("## 观察证据与未完成交接 (Observations & Handoffs)")
+            fact_texts = {
+                int(f["seq"]): f["title"] + ("\n" + f["content"] if f["content"] else "")
+                for f in facts
+            }
+            for obs_seq, obs_iid, body, admitted_seq, epoch, artifact_id, raw_provenance in observation_rows:
+                admitted = int(admitted_seq or 0)
+                provenance = json.loads(raw_provenance or "{}")
+                witness = str(observation_witnesses.get(obs_seq) or "")
+                fact_ref = fact_ids.get(admitted, "")
+                md.append(
+                    f"### observation_{obs_seq} (step={obs_iid or '-'}, epoch={epoch or '-'})"
+                )
+                if fact_ref:
+                    md.append(f"- 对应 Fact: {fact_ref} (event_seq={admitted})")
+                # Fact bodies already appear above; keep separate observations
+                # and incomplete handoffs without replaying identical evidence.
+                fact_text = fact_texts.get(admitted, "")
+                if body and str(body).strip() != fact_text.strip():
+                    md.append(str(body))
+                if witness and witness.strip() not in {str(body or "").strip(), fact_text.strip()}:
+                    md.append(witness)
+                artifact_ids = list(dict.fromkeys(
+                    [str(artifact_id)] if artifact_id else []
+                ))
+                for ref in provenance.get("artifact_refs") or []:
+                    aid = str(ref.get("artifact_id") or "") if isinstance(ref, dict) else ""
+                    if aid and aid not in artifact_ids:
+                        artifact_ids.append(aid)
+                if artifact_ids:
+                    md.append("- 原始工具证据: " + ", ".join(f"artifact:{aid}" for aid in artifact_ids))
+                md.append("")
+
+        if dead_end_rows:
+            md.append("## 三、已排除死路 (Ruled-Out Dead Ends — 禁止原样重测)")
+            for dseq, _dts, raw_dp in dead_end_rows:
+                try:
+                    dp = json.loads(raw_dp or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    dp = {}
+                md.append(
+                    f"- **`dead_end_{int(dseq)}`** (step=`{dp.get('intent_id') or '-'}`, "
+                    f"epoch=`{dp.get('target_epoch') or '-'}`): {dp.get('reason') or ''}"
+                )
+                if dp.get("tested_scope"):
+                    md.append(f"  - 测试范围: {dp.get('tested_scope')}")
+                if dp.get("observed_result"):
+                    md.append(f"  - 实际观察: {dp.get('observed_result')}")
+            md.append("")
+
+        md.append("## 四、全部历史意图与执行结论 (All Steps & Outcomes)")
+        for (
+            iid, goal, status, dispatch_state, result_detail, coverage_key,
+            created_ts, raw_rp,
+        ) in step_rows:
+            try:
+                rp = json.loads(raw_rp or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                rp = {}
+            dropped = (
+                str(rp.get("result") or "") == "superseded"
+                or str(dispatch_state or "") == INTENT_DISPATCH_RETIRED
+            )
+            st_label = (
+                "retired" if str(dispatch_state or "") == INTENT_DISPATCH_RETIRED
+                else "dropped" if dropped
+                else "done" if str(status or "") == "done"
+                else "open"
+            )
+            from_list = [fact_ids[s] for s in sources.get(str(iid), []) if s in fact_ids]
+            to_list = [fact_ids[s] for s in products.get(str(iid), []) if s in fact_ids]
+            md.append(
+                f"- **`{iid}`** [`{st_label}`] coverage=`{coverage_key or '-'}` "
+                f"from=`{','.join(from_list) or '-'}` to=`{','.join(to_list) or '-'}` "
+                f"({self._ctf_created_at(created_ts)})"
+            )
+            md.append(f"  - 意图: {goal}")
+            if str(result_detail or "").strip():
+                md.append(f"  - 结论: {str(result_detail).strip()}")
+        md.append("")
+
+        if poc_rows:
+            md.append("## 五、已登记可复用 PoC 资源 (Registered PoCs)")
+            for pid, pname, pcmd, pst, paid in poc_rows:
+                md.append(
+                    f"- `{pid}` [`{pst}`] name=`{pname}` cmd=`{pcmd}` artifact=`{paid or '-'}`"
+                )
+            md.append("")
+
+        file_index = self.decide_workspace_files_block(root, max_items=10**9)
+        if file_index:
+            md.extend(["## 工作目录产物索引", "", file_index, ""])
+        content_text = "\n".join(md)
+        live_dir = root / "shared" / "live"
+        target_dir = (
+            live_dir if live_dir.is_dir()
+            else (root / "shared") if (root / "shared").is_dir()
+            else root
+        )
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            if Path(filename).name != filename or not filename.endswith(".md"):
+                raise ValueError("review filename must be a Markdown basename")
+            out_path = target_dir / filename
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=".step_review.", suffix=".md", dir=str(target_dir)
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(content_text)
+                os.replace(tmp_name, out_path)
+            finally:
+                if os.path.exists(tmp_name):
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        pass
+            if filename != "step_history_review.md":
+                return out_path
+            top_link = target_dir / "00_step_history_review.md"
+            try:
+                if top_link.exists() or top_link.is_symlink():
+                    top_link.unlink()
+                top_link.symlink_to("step_history_review.md")
+            except OSError:
+                pass
+            return out_path
+        except OSError:
+            return None
 
     @staticmethod
     def _norm_guidance_text(text: Any) -> str:
@@ -1079,12 +2156,23 @@ class _RenderMixin:
                 expected = max(1, int(self.challenge.expected_flags or 1))
             except (TypeError, ValueError):
                 expected = 1
-            captured = len(self.snapshot().flags)
-            lines.append(f"- Objective progress: {captured}/{expected} flags captured")
+            if getattr(self.challenge, "platform_confirmation_required", False):
+                captured = len({
+                    str(receipt.get("flag") or "")
+                    for receipt in self.platform_verdicts()
+                    if receipt.get("status") in {"accepted", "duplicate"}
+                })
+                lines.append(
+                    f"- Platform-confirmed flags in this run: {captured}; "
+                    f"current remaining goal: {expected}"
+                )
+            else:
+                captured = len(self.snapshot().flags)
+                lines.append(f"- Objective progress: {captured}/{expected} flags captured")
         for seq in reversed(verified):
             fact = str(texts.get(int(seq), "") or "").strip()
             if fact:
-                lines.append(f"- verified [#{int(seq)}] {fact[:700]}")
+                lines.append(f"- verified [#{int(seq)}] {fact}")
         return "\n".join(lines)
 
     def _captured_flags_block(self) -> str:
@@ -1095,6 +2183,32 @@ class _RenderMixin:
         flags = self.snapshot().flags
         if not flags:
             return ""
+        if getattr(self.challenge, "platform_confirmation_required", False):
+            receipts = self.platform_verdicts()
+            by_flag = {
+                str(receipt.get("flag") or ""): str(receipt.get("status") or "")
+                for receipt in receipts
+            }
+            confirmed = [
+                flag for flag in flags
+                if by_flag.get(flag) in {"accepted", "duplicate"}
+            ]
+            unconfirmed = [flag for flag in flags if flag not in confirmed]
+            parts: list[str] = []
+            if confirmed:
+                parts.append(
+                    "\n## Platform-confirmed flags\n"
+                    + "\n".join(f"  - {flag}" for flag in confirmed)
+                )
+            if unconfirmed:
+                parts.append(
+                    "\n## Proposed flags without platform confirmation\n"
+                    + "\n".join(
+                        f"  - {flag} ({by_flag.get(flag) or 'not submitted'})"
+                        for flag in unconfirmed
+                    )
+                )
+            return "\n".join(parts)
         lines = "\n".join(f"  - {f}" for f in flags)
         if getattr(self.challenge, "mode", "ctf") == "ctf":
             return f"\n## Captured flags\n{lines}\n"
@@ -1162,6 +2276,9 @@ class _RenderMixin:
         creds = self.canonical_credentials()
         parts = [self._credential_block(creds), self._brief_block(),
                  self.to_summary(max_evidence=10**9, max_dead_ends=10**9),
+                 (self._captured_flags_block()
+                  if getattr(self.challenge, "platform_confirmation_required", False)
+                  else ""),
                  self._review_state_block(),
                  self._open_intents_block(),
                  self._poc_block(),
@@ -1191,16 +2308,16 @@ class _RenderMixin:
             self._captured_findings_block(),
             self._review_state_block(),
             self._open_intents_block(),
-            self._poc_block(limit=80),
+            self._poc_block(limit=10**9),
             self._activity_locks_block(),
             self._lane_locks_block(),
             self._resource_locks_block(),
-            self._attempted_intents_block(limit=120),
+            self._attempted_intents_block(limit=10**9),
             "\n## Recent raw events",
         ]
-        for e in self.events()[-80:]:
+        for e in self.events():
             payload = dict(e.get("payload") or {})
-            preview = json.dumps(payload, ensure_ascii=False, default=str)[:500]
+            preview = json.dumps(payload, ensure_ascii=False, default=str)
             parts.append(
                 f"- #{e.get('seq')} {e.get('kind')} actor={e.get('actor')} "
                 f"verified={e.get('verified')} {preview}")

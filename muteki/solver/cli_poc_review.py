@@ -4,12 +4,21 @@ from __future__ import annotations
 import asyncio
 from hashlib import sha256
 import json
-from pathlib import Path
-from typing import Any, Optional
+from pathlib import Path, PurePosixPath
+from typing import Any
 
 from muteki.swarm.graph_defs import REVIEW_FACT_MARKERS
 from muteki.solver.worker_result import PocClaim
 from muteki.solver.workspace import materialize_shared_artifact, workspace_root_for_worker
+
+
+class PocSaveError(ValueError):
+    """可修正的产物发布错误；原因必须回传给 Worker。"""
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+
 
 async def _handle_poc_save(self, path_text: str, entry_command: str,
                            status: str, note: str) -> bool:
@@ -17,34 +26,47 @@ async def _handle_poc_save(self, path_text: str, entry_command: str,
                or (Path(self._workdir) if self._workdir else None))
     cwd = Path(current).resolve() if current is not None else None
     if cwd is None:
-        return False
+        raise PocSaveError("poc.cwd_missing", "Worker 工作目录尚未初始化")
+    root = workspace_root_for_worker(cwd)
+    # shared/ 是指向本 Run 的 shared/live 的投影，解析后不在私有 cwd 内。
+    # 只允许这两个数据目录，不能把整张 workspace（含其他 Worker/控制面）放行。
+    shared = root / "shared" / "live"
     try:
         if getattr(self, "container", None) is not None:
-            # The CLI reports its container-visible $PWD. Reuse the same exact
-            # cwd mapping as engine spill artifacts, then verify the resolved
-            # host file is still owned by this Worker.
             mapped = self._spill_host_path(path_text)
             if mapped is None:
-                raise ValueError("PoC path is outside the container Worker cwd")
+                mapper = getattr(self.container, "to_container_cwd", None)
+                if not callable(mapper):
+                    raise ValueError("容器未提供路径映射")
+                relative = PurePosixPath(path_text).relative_to(
+                    PurePosixPath(mapper(str(shared))))
+                if ".." in relative.parts:
+                    raise ValueError("共享路径不能越界")
+                mapped = (cwd, shared.joinpath(*relative.parts))
             src = Path(mapped[1]).resolve()
         else:
             supplied = Path(path_text)
-            src = (cwd / supplied).resolve() if not supplied.is_absolute() else supplied.resolve()
-        src.relative_to(cwd)
-    except (OSError, ValueError):
+            if supplied.is_absolute():
+                src = supplied.resolve()
+            else:
+                candidate_cwd = (cwd / supplied).resolve()
+                candidate_shared = (shared / supplied).resolve()
+                src = (
+                    candidate_cwd
+                    if candidate_cwd.exists() or not candidate_shared.exists()
+                    else candidate_shared
+                )
+        if not (src.is_relative_to(cwd) or src.is_relative_to(shared)):
+            raise ValueError("路径不属于允许的产物目录")
+    except (OSError, ValueError) as exc:
+        detail = "PoC 路径必须位于当前 Worker 工作目录或本 Run 的 shared/live 内"
         await self._emit_bb("poc_saved", status="rejected", path=path_text,
-                            note="POC_SAVE path must stay inside this worker cwd")
-        return False
+                            note=detail)
+        raise PocSaveError("poc.path_outside_scope", detail) from exc
     if not src.exists() or not src.is_file():
         await self._emit_bb("poc_saved", status="rejected", path=path_text,
                             note="POC_SAVE path is not a regular file")
-        return False
-    marker_key = f"{src}:{entry_command}:{status}:{note}"
-    if marker_key in self._published_pocs:
-        self._last_saved_poc_id = str(
-            (getattr(self, "_saved_poc_ids_by_marker", None) or {}).get(marker_key) or "")
-        return bool(self._last_saved_poc_id)
-    self._published_pocs.add(marker_key)
+        raise PocSaveError("poc.not_regular_file", "PoC 路径不存在或不是普通文件；目录请先打包为文件")
 
     # The PoC save does blocking filesystem + hashing work (read_text,
     # write_text, sha256-stream + possible copytree in materialize_shared_
@@ -52,14 +74,13 @@ async def _handle_poc_save(self, path_text: str, entry_command: str,
     # it inline would stall every other
     # worker's stream during a large PoC write (#13). Push the whole sync block
     # to a thread, exactly like the subprocess paths already do.
-    def _save_blocking() -> "Optional[tuple[dict, str, str]]":
+    def _save_blocking() -> tuple[dict, str, str]:
         status_ = (status or "available").strip().lower()
         if status_ not in {"available", "wip", "directional", "spent"}:
             status_ = "available"
         local_note = note
         save_src = src
         try:
-            root = workspace_root_for_worker(cwd)
             browser_evidence = None
             if save_src.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
                 sidecar = save_src.with_name(save_src.name + ".muteki-browser.json")
@@ -86,24 +107,30 @@ async def _handle_poc_save(self, path_text: str, entry_command: str,
                     **({"browser_evidence": browser_evidence} if browser_evidence else {}),
                 },
             )
-        except (OSError, FileNotFoundError):
-            return None
+        except OSError as exc:
+            raise PocSaveError("poc.persistence_failed", f"PoC 保存失败：{exc}") from exc
         return art, status_, local_note
 
     try:
         result = await asyncio.to_thread(_save_blocking)
+    except PocSaveError as exc:
+        await self._emit_bb("poc_saved", status="rejected", path=path_text,
+                            note=str(exc))
+        raise
     except (ValueError, TypeError) as exc:
         await self._emit_bb("poc_saved", status="rejected", path=path_text,
                             note=str(exc))
-        return False
-    if result is None:
-        return False
+        raise PocSaveError("poc.metadata_invalid", str(exc)) from exc
     artifact, clean_status, note = result
     poc_id = f"poc-{artifact['sha256'][:12]}"
     self._last_saved_poc_id = poc_id
+    marker_key = f"{src}:{artifact['sha256']}:{entry_command}:{clean_status}:{note}"
+    if marker_key in self._published_pocs:
+        return True
     saved_ids = dict(getattr(self, "_saved_poc_ids_by_marker", None) or {})
     saved_ids[marker_key] = poc_id
     self._saved_poc_ids_by_marker = saved_ids
+    self._published_pocs.add(marker_key)
     intent_id = getattr(self, "intent_id_assigned", "") or getattr(self, "_intent_id", "") or None
     # The artifact/CAS materialization above stays immediate; only the graph
     # row defers into this worker's atomic end-of-life result commit.
@@ -125,12 +152,12 @@ async def _mark_claimed_pocs_spent(self, reason: str) -> None:
         try:
             self.shared_graph.conclude_poc(
                 actor=self.solver_id, poc_id=poc_id, status="spent",
-                note=f"direction dead-end: {reason[:160]}")
+                note=f"direction dead-end: {reason}")
         except Exception:
             continue
         await self._emit_bb(
             "poc_concluded", poc_id=poc_id, status="spent",
-            note=f"direction dead-end: {reason[:160]}")
+            note=f"direction dead-end: {reason}")
 
 
 async def _apply_review_actions(self, actions: list[tuple[str, Any]]) -> int:
@@ -157,7 +184,7 @@ async def _apply_review_actions(self, actions: list[tuple[str, Any]]) -> int:
                     payload.get("summary") or payload.get("reason")
                     or payload.get("goal") or payload.get("directive")
                     or marker
-                )[:240],
+                ),
             )
             proposed += 1
         except Exception as exc:  # noqa: BLE001

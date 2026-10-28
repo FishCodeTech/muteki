@@ -72,6 +72,8 @@ async def _emit_bb(self, kind: str, **fields: Any) -> None:
                 ),
             )
             return
+    fields.pop("kind", None)
+    fields.pop("actor", None)
     await self._emit(
         EventType.BLACKBOARD_DELTA,
         **blackboard_delta_payload(kind, actor=self.solver_id, **fields))

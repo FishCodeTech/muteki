@@ -118,7 +118,7 @@ HostLoginImport = Literal[
 LoginStatusProbe = Literal[
     "claude_oauth", "codex_auth_json", "cursor_session", "pi_agent_files",
     "omp_agent_dir", "kimi_credentials", "grok_auth_json", "opencode_auth",
-    "devin_cli", "droid_login",
+    "devin_cli", "droid_login", "zcode_config",
 ]
 
 
@@ -139,7 +139,7 @@ class LoginSpec(_Frozen):
 
 CredentialEnvResolver = Literal[
     "claude", "codex", "cursor", "kimi", "grok", "opencode", "pi", "omp",
-    "devin_host_only", "droid",
+    "devin_host_only", "droid", "zcode",
 ]
 
 
@@ -176,7 +176,7 @@ class ModelDiscoverySpec(_Frozen):
     fallback_source: str = ""
     parser: Optional[ModelParser] = None
     # Richer metadata source tried before ``argv``.
-    metadata_probe: Literal["", "grok_acp_session", "pi_node_catalog"] = ""
+    metadata_probe: Literal["", "grok_acp_session", "pi_cli_rpc"] = ""
     # Catalog rows carry a provider namespace that a profile may pin.
     provider_scoped: bool = False
     # Wire protocol of custom endpoint model discovery.
@@ -262,6 +262,8 @@ class CliSpec(_Frozen):
     runtime_argv: tuple[RuntimeArgvHook, ...] = ()
     # Model selected through this variable instead of ``--model``.
     model_env_var: str = ""
+    # The CLI selects its model from the credential-scoped configuration.
+    model_via_credentials: bool = False
     # Endpoint profiles inject provider/model flags in the driver itself.
     endpoint_driver_sets_model: bool = False
     # Prefix of MUTEKI_<X>_PROVIDER / _MODEL / _SYSTEM_PROMPT variables.
@@ -768,21 +770,16 @@ _DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
                 adapter_id="pi.rpc", role="default", transport_kind="rpc",
                 capabilities=_caps(
                     "rpc", streaming=True, tool_events=True, usage_events=True,
+                    approval=True, user_input=True, access_modes=_NO_AUTO,
                     steer=True, interrupt=True, resume=True,
                     session_persistence=True, skills=True, agent_plugin=True,
                     image_input=True, compaction=True, context_usage=True,
                 ),
                 transport_settings=(_SESSION_DIR,),
-                notes="No in-band approval: tool scope is fixed by launch flags.",
-            ),
-            AdapterDescriptor(
-                adapter_id="pi.acp", role="variant", transport_kind="acp",
-                capabilities=_acp_caps(access_modes=_NO_AUTO, context_usage=True),
-                binary_resolution="adapter_owned",
+                notes="Pi CLI RPC with a tool-call approval extension; client boundary, not an OS sandbox.",
                 access_mode_notes={
                     AccessMode.AUTO.value: (
-                        "auto: rejected at session start; the pi-acp bridge asks "
-                        "before every tool call and Pi has no native auto policy"
+                        "auto: unsupported; choose supervised, auto-accept-edits, or full-access"
                     ),
                 },
             ),
@@ -799,7 +796,7 @@ _DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
         ),
         models=ModelDiscoverySpec(
             method="cli", argv=("--list-models",), parser="pi_models",
-            metadata_probe="pi_node_catalog", provider_scoped=True,
+            metadata_probe="pi_cli_rpc", provider_scoped=True,
         ),
         environment=EnvironmentSpec(
             home_env_var="PI_CODING_AGENT_DIR", home_relative=".pi/agent",
@@ -823,6 +820,29 @@ _DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
         ),
     ),
     ProviderDescriptor(
+        identity=_identity("zcode", "cli.zcode", "CLI"),
+        adapters=(_cli_adapter("zcode", usage_events=True),),
+        login=LoginSpec(
+            guidance_command="Configure a ZCode API credential and model in Muteki",
+            status_probe="zcode_config",
+        ),
+        credentials=CredentialSpec(
+            env_resolver="zcode", secret_file="API_KEY", agent_state_dir=True,
+            env_keys=("ZCODE_DATA_BASE_DIR", "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE",
+                      "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE", "ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE"),
+        ),
+        models=ModelDiscoverySpec(method="reference_catalog"),
+        environment=EnvironmentSpec(
+            home_env_var="ZCODE_DATA_BASE_DIR", home_relative=".zcode",
+            home_env_is_parent=True,
+        ),
+        cli=CliSpec(options_before_prompt_flag=True, model_via_credentials=True),
+        worker=WorkerProfileSpec(
+            transport="zcode", endpoint_wire_api="chat_completions",
+            protocol_label="OpenAI 兼容接口", official_credential_mode="api_key",
+        ),
+    ),
+    ProviderDescriptor(
         identity=_identity("kimi", "kimi.acp", "ACP / Wire"),
         adapters=(
             AdapterDescriptor(
@@ -838,7 +858,7 @@ _DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
                     resume=True, session_persistence=True,
                     interrupt=True, streaming=True, tool_events=True,
                     usage_events=True, approval=True, user_input=True,
-                    steer=True, subagents=True, context_usage=True,
+                    steer=True, subagents=True, context_usage=True, compaction=True,
                 ),
                 accepts_adapter_endpoint=True,
                 notes=(
@@ -863,6 +883,7 @@ _DESCRIPTORS: tuple[ProviderDescriptor, ...] = (
                 "KIMI_MODEL_MAX_OUTPUT_SIZE", "KIMI_CODE_HOME",
             ),
             secret_file="API_KEY",
+            agent_state_dir=True,
         ),
         models=ModelDiscoverySpec(
             method="cli", argv=("provider", "list", "--json"), parser="kimi_models",

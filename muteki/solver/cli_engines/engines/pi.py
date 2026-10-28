@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -36,7 +37,6 @@ class PiLikeDriver(CliDriver):
     """
     name = "pi"
     secure_prompt_transport = True
-    persistent_stdin_prompt = True
     offline_web_isolation = True
 
     # optional pinned model/provider (e.g. "muteki"/"deepseek-v4-flash:0731-cloud");
@@ -85,6 +85,26 @@ class PiLikeDriver(CliDriver):
                 *self._CONTEXT_FLAGS,
                 *self._offline_flags(web_access=web_access),
                 *self._provider_model_flags(), prompt]
+
+    def build_execute_input(
+        self, prompt: str, session: Optional[str], *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        return ([self.bin, "-p", "--mode", "json",
+                 *self._permission_flags(launch), *self._CONTEXT_FLAGS,
+                 *self._offline_flags(web_access=web_access),
+                 *self._provider_model_flags()], prompt)
+
+    def build_resume_input(
+        self, prompt: str, session: str, *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        return ([self.bin, self._RESUME_FLAG, session, "-p", "--mode", "json",
+                 *self._permission_flags(launch), *self._CONTEXT_FLAGS,
+                 *self._offline_flags(web_access=web_access),
+                 *self._provider_model_flags()], prompt)
 
     def build_execute_stdin(
         self, prompt: str, session: Optional[str], *,
@@ -150,6 +170,7 @@ class PiLikeDriver(CliDriver):
         # partial stream — so parse whatever events exist regardless of exit code.
         text, session, cost = "", None, None
         explicit_error = ""
+        model_truncated = False
         inp = outp = None
         turns = 0
         saw_assistant = False
@@ -190,6 +211,7 @@ class PiLikeDriver(CliDriver):
                     # turn, so a successful retry clears the earlier attempt's
                     # transient error.
                     explicit_error = ""
+                model_truncated = message_stop == "length"
                 saw_assistant = True
                 remember(msg)
                 text = self._message_text(msg)
@@ -211,6 +233,7 @@ class PiLikeDriver(CliDriver):
                             # killed mid-stream before message_end: the agent_end
                             # assistant message is the best text/usage we have.
                             saw_assistant = True
+                            model_truncated = str(m.get("stopReason") or "").lower() == "length"
                             if inp is None and outp is None:
                                 inp, outp = self._usage_tokens(m.get("usage") or {})
                                 c = (m.get("usage") or {}).get("cost") or {}
@@ -236,8 +259,9 @@ class PiLikeDriver(CliDriver):
                          cache_read_tokens=sum(u.get("cacheRead") or 0 for u in samples) if samples else None,
                          cache_write_tokens=sum(u.get("cacheWrite") or 0 for u in samples) if samples else None,
                          input_tokens=inp, output_tokens=outp,
+                         model_truncated=model_truncated,
                          num_turns=turns or (1 if saw_assistant else None),
-                         raw_stderr=stderr[-2000:], error=final_error)
+                         raw_stderr=stderr, error=final_error)
 
     def parse_stream_line(self, line: str) -> Optional[StreamStep]:
         steps = self.parse_stream_steps(line)
@@ -294,9 +318,9 @@ class PiLikeDriver(CliDriver):
             arg = ""
             if isinstance(args, dict):
                 arg = str(args.get("command") or args.get("path")
-                          or args.get("query") or "")[:300]
+                          or args.get("query") or "")
                 if not arg and args:
-                    arg = json.dumps(args, ensure_ascii=False)[:300]
+                    arg = json.dumps(args, ensure_ascii=False)
             return [StreamStep(
                 "tool", tool=str(ev.get("toolName") or ""), text=arg,
                 call_id=str(ev.get("toolCallId") or ""))]
@@ -350,6 +374,34 @@ class PiDriver(PiLikeDriver):
         "You are an autonomous agent. Use the available tools to complete the assigned task.",
     )
     _ENV_EXTRA = {"PI_OFFLINE": "1", "PI_SKIP_VERSION_CHECK": "1"}
+
+    def _rpc_input(
+        self, prompt: str, *, session: Optional[str] = None,
+        web_access: bool = True, launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        argv = [sys.executable, str(_SOLVER_DIR / "pi_prompt_bridge.py"),
+                "--binary", self.bin]
+        if session:
+            argv += [self._RESUME_FLAG, session]
+        argv += [*self._permission_flags(launch), *self._CONTEXT_FLAGS,
+                 *self._offline_flags(web_access=web_access),
+                 *self._provider_model_flags()]
+        return argv, prompt
+
+    def build_execute_input(
+        self, prompt: str, session: Optional[str], *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        return self._rpc_input(prompt, web_access=web_access, launch=launch)
+
+    def build_resume_input(
+        self, prompt: str, session: str, *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        return self._rpc_input(prompt, session=session, web_access=web_access,
+                               launch=launch)
 
     def native_permission_modes(self) -> tuple[str, ...]:
         # Pi has no tool-operation permission modes. Project-trust --approve

@@ -78,7 +78,7 @@ export function ConversationSummaryCard({
   if (!agents.length && !sourceCount) return null;
 
   const pillLabel = [
-    agents.length ? `${agents.length} 个子智能体` : "",
+    agents.length ? `${agents.length} 个子代理` : "",
     sourceCount ? `${sourceCount} 个来源` : "",
   ].filter(Boolean).join(" · ");
 
@@ -125,7 +125,7 @@ export function ConversationSummaryCard({
           >
             {agents.length ? (
               <MenuItem icon="bot" onSelect={() => { setOpen(false); chatPanel.open(threadId, "agents"); }}>
-                打开子智能体面板
+                打开子代理面板
               </MenuItem>
             ) : null}
             {sources.linkCount ? (
@@ -144,9 +144,9 @@ export function ConversationSummaryCard({
         </div>
         <div className="cx-scroll max-h-[min(28rem,60vh)] overflow-y-auto pb-2">
           {agents.length ? (
-            <section aria-label="子智能体">
+            <section aria-label="子代理">
               <SectionTitle icon="bot" aside={<span className="normal-case tracking-normal">{formatAgentCounts(counts)}</span>}>
-                子智能体
+                子代理
               </SectionTitle>
               <ul>
                 {agents.map((agent) => (

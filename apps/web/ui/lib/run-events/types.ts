@@ -251,6 +251,13 @@ export interface ChatMessage {
   toolOutput?: string;
   toolFailed?: boolean;
   toolPending?: boolean;
+  /** Original tool lifecycle times, independent of the ledger's last-update ts. */
+  toolCallId?: string;
+  toolStartedAt?: number;
+  toolEndedAt?: number;
+  /** Only correlated or unambiguous serial calls have a measurable duration. */
+  toolTimingSource?: "call_id" | "serial";
+  executionGeneration?: number;
 }
 
 /** A pending human-in-the-loop decision the agent asked for. */
@@ -406,6 +413,13 @@ export interface FactObservation {
 export interface BlackboardIntent {
   id: string;
   goal: string;
+  question?: string;
+  answer?: string;
+  description?: string;
+  goalId?: string;
+  kind?: string;
+  stepSeq?: number;
+  resultDetail?: string;
   summary?: string;      // deepseek-flash zh gist (replaces goal in the card head)
   workerClass: string;
   fromFacts: number[];   // shared_graph fact seqs that motivated this intent
@@ -513,6 +527,11 @@ export interface BlackboardFact {
   challengeReason?: string;
   revalidated?: boolean;
   state?: FactLifecycleState;  // A: lifecycle state (rejected/merged/superseded retire it)
+  retirementReason?: string;
+  supersededBy?: string;
+  replacementFactSeq?: number;
+  retiredTs?: number;
+  revisionSeq?: number;
   mergedInto?: number;         // when state=merged: the fact seq it folded into
   intentId?: string;           // G0: the intent that PRODUCED this fact (intent_products edge)
   ts: number;
@@ -674,7 +693,32 @@ export interface ReasonRunView {
   intentDecisions: ReasonIntentDecisionView[];
 }
 
+export interface ChallengerView {
+  status: "idle" | "running" | "finished" | "committed" | "failed" | "stopped";
+  mode?: "ctf" | "pentest";
+  startedTs?: number;
+  finishedTs?: number;
+  committedTs?: number;
+  failedTs?: number;
+  proposed?: number;
+  error?: string;
+  code?: string;
+}
+
+export interface BlackboardSubGoal {
+  id: string;
+  criterion: string;
+  state: "open" | "satisfied";
+  reason?: string;
+  evidenceFactSeqs: number[];
+  actor: string;
+  createdTs: number;
+  satisfiedTs?: number;
+}
+
 export interface BlackboardView {
+  challenger: ChallengerView;
+  subGoals: BlackboardSubGoal[];
   intents: BlackboardIntent[];
   facts: BlackboardFact[];
   observations: BlackboardObservation[];

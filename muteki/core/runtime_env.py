@@ -1,11 +1,10 @@
 """Runtime-environment detection shared by the swarm and the web app.
 
-P2-v3 (unified containerization): when the WEB control plane itself runs inside a
-container, worker_backend MUST be "container" — host-native agent CLIs cannot run
-there, and a silent fallback to local would spawn the CLI inside the web container
-(no tools, wrong credentials, broken isolation). So every place that could degrade
-container→local, or that lets the operator pick "local", consults is_web_container()
-and HARD-FAILS / refuses instead of falling back.
+The default sibling deployment keeps Worker CLIs in separate containers.
+MUTEKI_CONTAINER_MODE=single explicitly selects a self-contained image that has
+the controller, Worker CLIs and tools together; Workers use local subprocesses.
+Container detection remains factual in both deployments. This mode is a deployment
+choice, never a fallback when Docker is unavailable.
 
 Detection order (most authoritative first):
   1. MUTEKI_IN_CONTAINER — explicit, set by docker-compose. Wins outright (incl. an
@@ -24,6 +23,19 @@ import os
 
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off", ""}
+
+
+def worker_container_mode() -> str:
+    """Return the explicitly selected container deployment (default: sibling)."""
+    mode = os.environ.get("MUTEKI_CONTAINER_MODE", "sibling").strip().lower()
+    if mode not in {"sibling", "single"}:
+        raise ValueError("MUTEKI_CONTAINER_MODE must be sibling or single")
+    return mode
+
+
+def is_single_container() -> bool:
+    """Whether this controller explicitly shares its container with Workers."""
+    return worker_container_mode() == "single" and is_web_container()
 
 
 def is_web_container() -> bool:

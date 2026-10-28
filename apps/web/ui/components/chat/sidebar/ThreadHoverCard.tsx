@@ -8,11 +8,14 @@ import { Portal, Shortcut, Spinner, useFloating, useReducedMotion } from "@/comp
 import { formatWakeTime } from "@/lib/sidebarInbox";
 import type { NavItem } from "./types";
 
+/** Same precedence as the row's status slot: what waits on the user comes first. */
 function statusLine(item: NavItem): { icon: React.ReactNode; text: string; tone: string } {
-  if (item.running) return { icon: <Spinner size={12} />, text: "Agent 正在运行", tone: "text-cx-accent" };
-  if (item.pending === "approval") return { icon: <Icon name="shieldAlert" size={13} />, text: "等待你审批工具调用", tone: "text-cx-warning" };
-  if (item.pending === "input") return { icon: <Icon name="messageCircle" size={13} />, text: "Agent 在等待你的回复", tone: "text-cx-accent" };
+  const agents = item.agentsActive ? `${item.agentsActive} 个子代理进行中` : "";
+  if (item.pending === "approval") return { icon: <Icon name="shieldAlert" size={13} />, text: item.pendingNote || "等待你审批工具调用", tone: "text-cx-warning" };
+  if (item.pending === "input") return { icon: <Icon name="messageCircle" size={13} />, text: item.pendingNote || "Agent 在等待你的回复", tone: "text-cx-accent" };
+  if (item.running) return { icon: <Spinner size={12} />, text: agents ? `Agent 正在运行 · ${agents}` : "Agent 正在运行", tone: "text-cx-accent" };
   if (item.failed) return { icon: <Icon name="circleAlert" size={13} />, text: "上一次运行失败", tone: "text-cx-danger" };
+  if (agents) return { icon: <Icon name="bot" size={13} />, text: agents, tone: "text-cx-fg-2" };
   if (item.woke) return { icon: <Icon name="bell" size={13} />, text: "稍后提醒时间已到", tone: "text-cx-accent" };
   if (item.snoozedUntil) return { icon: <Icon name="clock" size={13} />, text: `将于${formatWakeTime(item.snoozedUntil)}提醒`, tone: "text-cx-fg-3" };
   if (item.settled) return { icon: <Icon name="checkCheck" size={13} />, text: "已归置，有新动态时会回到列表", tone: "text-cx-fg-3" };
@@ -70,6 +73,7 @@ export function ThreadHoverCard({ item, anchor }: { item: NavItem | null; anchor
             <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11.5px] text-cx-fg-4">
               {updated ? <span className="flex items-center gap-1"><Icon name="history" size={12} />{updated}</span> : null}
               {item.queueCount ? <span className="flex items-center gap-1"><Icon name="listTodo" size={12} />队列 {item.queueCount} 条</span> : null}
+              {item.agentsTotal ? <span className="flex items-center gap-1"><Icon name="bot" size={12} />{item.agentsTotal} 个子代理</span> : null}
               {item.pinned ? <span className="flex items-center gap-1"><Icon name="pin" size={12} />已置顶</span> : null}
             </div>
             <div className="mt-2.5 flex items-center gap-3 border-t border-cx-border-subtle pt-2 text-[11px] text-cx-fg-4">

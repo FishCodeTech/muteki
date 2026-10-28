@@ -44,6 +44,13 @@ USAGE
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 note() { printf '==> %s\n' "$*"; }
+systemd_quoted_value() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//%/%%}"
+  printf '"%s"' "$value"
+}
 vm_address() {
   local address
   address="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n 1)"
@@ -365,7 +372,9 @@ chmod 600 "$config_file"
 
 if [ "$no_service" -eq 0 ]; then
   command -v systemctl >/dev/null 2>&1 || die "systemd is required unless --no-service is set"
-  service_tmp="$(mktemp)"
+  service_tmp_dir="$(mktemp -d)"
+  service_tmp="$service_tmp_dir/muteki-web.service"
+  # These path directives take literal paths, not shell-style quoted words.
   cat > "$service_tmp" <<UNIT
 [Unit]
 Description=Muteki single-node Web workbench
@@ -376,12 +385,12 @@ Wants=network-online.target
 Type=simple
 User=$(id -un)
 Group=$(id -gn)
-WorkingDirectory="$app_root"
-EnvironmentFile="$config_file"
-EnvironmentFile=-"$config_dir/operator.env"
-Environment="HOME=$HOME"
-Environment="PATH=$node_root/bin:$HOME/.local/bin:$HOME/.grok/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart="$launcher" web --host 127.0.0.1 --ui-host 0.0.0.0 --ui-port $ui_port
+WorkingDirectory=${app_root//%/%%}
+EnvironmentFile=${config_file//%/%%}
+EnvironmentFile=-${config_dir//%/%%}/operator.env
+Environment=$(systemd_quoted_value "HOME=$HOME")
+Environment=$(systemd_quoted_value "PATH=$node_root/bin:$HOME/.local/bin:$HOME/.grok/bin:/usr/local/bin:/usr/bin:/bin")
+ExecStart=$(systemd_quoted_value "$launcher") web --host 127.0.0.1 --ui-host 0.0.0.0 --ui-port $ui_port
 Restart=on-failure
 RestartSec=5
 
@@ -392,8 +401,12 @@ UNIT
     sed -i '/^Group=/a SupplementaryGroups=docker' "$service_tmp"
     sed -i '/^After=/s/$/ docker.service/; /^Wants=/s/$/ docker.service/' "$service_tmp"
   fi
+  if ! systemd-analyze verify "$service_tmp"; then
+    rm -rf "$service_tmp_dir"
+    die "generated systemd service failed validation; existing service was not replaced"
+  fi
   sudo install -m 0644 "$service_tmp" "$service_file"
-  rm -f "$service_tmp"
+  rm -rf "$service_tmp_dir"
   sudo systemctl daemon-reload
   sudo systemctl enable muteki-web.service
   sudo systemctl restart muteki-web.service

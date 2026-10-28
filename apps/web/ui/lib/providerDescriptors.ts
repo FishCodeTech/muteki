@@ -2,6 +2,7 @@
 
 import { useEffect, useSyncExternalStore } from "react";
 import { apiFetch, onAuthRequired } from "./serviceAuth";
+import { useConversationLocalPreview } from "./conversationPreviewMode";
 
 /**
  * Typed client for ``GET /api/agent-runtimes/descriptors``: one static
@@ -338,13 +339,21 @@ function subscribe(listener: () => void): () => void {
  * resets are not retried automatically (a 401 would otherwise loop through
  * invalidateAuth); callers retry with ``loadProviderDescriptors({ fresh: true })``.
  */
-export function useProviderDescriptors(): ProviderDescriptorState {
+export function useProviderDescriptors(options?: { enabled?: boolean }): ProviderDescriptorState {
+  const localPreview = useConversationLocalPreview();
+  const enabled = options?.enabled !== false && !localPreview;
   const current = useSyncExternalStore(subscribe, () => state, () => LOADING);
   useEffect(() => {
-    if (state.status === "loading") void loadProviderDescriptors().catch(() => undefined);
-  }, []);
-  return current;
+    if (enabled && state.status === "loading") void loadProviderDescriptors().catch(() => undefined);
+  }, [enabled]);
+  return enabled ? current : LOCAL_PREVIEW_STATE;
 }
+
+// Local previews describe no engines, so nothing reads the service catalog.
+const LOCAL_PREVIEW_STATE: ProviderDescriptorState = {
+  status: "ready",
+  catalog: { schemaVersion: PROVIDER_DESCRIPTOR_SCHEMA_VERSION, descriptors: [], instances: [] },
+};
 
 export function readyCatalog(current: ProviderDescriptorState): ProviderDescriptorCatalog | null {
   return current.status === "ready" ? current.catalog : null;

@@ -17,10 +17,56 @@ from muteki.solver.cli_engines.types import CliResult  # noqa: F401
 
 _NO_CLI_SPEC = CliSpec()
 
+_VALUE_TAKING_FLAGS = frozenset({
+    "--system-prompt",
+    "--tools",
+    "--mode",
+    "--session",
+    "--resume",
+    "--model",
+    "-m",
+    "--provider",
+    "--thinking",
+    "--effort",
+    "--reasoning-effort",
+    "--variant",
+    "--settings",
+    "--endpoint",
+    "-c",
+    "--agent-file",
+    "--output-format",
+    "--disallowed-tools",
+    "--mcp-config",
+    "--permission-mode",
+    "--format",
+    "--file",
+    "--prompt-file",
+    "--binary",
+    "--session-id",
+    "--disable-tool",
+    # Pi/OMP run-scoped extensions are option values, not positional prompts.
+    # Missing this entry made model/provider injection split
+    # ``--extension <path>`` into ``--extension --model ... <path>``.
+    "--extension",
+    "-e",
+})
+
 
 def _cli_spec(engine: str) -> CliSpec:
     descriptor = find_descriptor(engine)
     return descriptor.cli if descriptor is not None else _NO_CLI_SPEC
+
+
+def _has_trailing_positional_prompt(argv: list[str]) -> bool:
+    if getattr(argv, "has_positional_prompt", None) is False:
+        return False
+    if len(argv) <= 1:
+        return False
+    if str(argv[-1]).startswith("-"):
+        return False
+    if len(argv) >= 2 and str(argv[-2]) in _VALUE_TAKING_FLAGS:
+        return False
+    return True
 
 
 def _insert_before_prompt(argv: list[str], extra: list[str], *, engine: str = "") -> list[str]:
@@ -34,13 +80,15 @@ def _insert_before_prompt(argv: list[str], extra: list[str], *, engine: str = ""
     if "--" in argv:
         idx = argv.index("--")
         return [*argv[:idx], *extra, *argv[idx:]]
-    if len(argv) <= 1:
+    if not _has_trailing_positional_prompt(argv):
         return [*argv, *extra]
     return [*argv[:-1], *extra, argv[-1]]
 
 
 def _insert_model_arg(argv: list[str], model: str, *, engine: str = "") -> list[str]:
     model = (model or "").strip()
+    if _cli_spec(engine).model_via_credentials:
+        return argv
     if not model or "--model" in argv or "-m" in argv:
         return argv
     return _insert_before_prompt(argv, ["--model", model], engine=engine)

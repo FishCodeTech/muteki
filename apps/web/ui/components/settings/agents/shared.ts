@@ -223,6 +223,16 @@ export function formatTestTime(value?: number) {
   return date.toLocaleString("zh-CN", { hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
 
+/** "刚刚 / 5 分钟前 / 3 小时前 / 2 天前" for an epoch-seconds timestamp. */
+export function relativeTime(epochSeconds?: number | null) {
+  if (!epochSeconds) return "";
+  const seconds = Math.max(0, Date.now() / 1000 - epochSeconds);
+  if (seconds < 60) return "刚刚";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时前`;
+  return `${Math.floor(seconds / 86400)} 天前`;
+}
+
 export function statusTone(kind: StatusKind): "success" | "warning" | "danger" | "neutral" {
   if (kind === "ok") return "success";
   if (kind === "warn") return "warning";

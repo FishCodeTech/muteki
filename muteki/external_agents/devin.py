@@ -190,6 +190,8 @@ _STREAMING_MESSAGE_KINDS = frozenset({
 
 class DevinAcpAdapter(BaseAcpAdapter):
     adapter_id = "devin.acp"
+    chat_model_fields = ("model",)
+    chat_model_reset_requires_restart = ("model",)
     # Devin sends root ``usage_update`` (used/size) snapshots each turn.
     context_usage_reported = True
     # _cognition.ai/compaction notifications.
@@ -437,6 +439,23 @@ class DevinAcpAdapter(BaseAcpAdapter):
             raise AcpRequestError(
                 "terminal/create has no session",
                 code=-32000, data={"reason": "access_mode"})
+        from .src_policy import NativeToolError, authorize_native_tool, src_task_id
+        if src_task_id(self._tracker._store, handle.get("thread_id")):
+            record = self._tracker.get(agent_session_id)
+            try:
+                await authorize_native_tool(
+                    self._tracker._store, thread_id=handle.get("thread_id"),
+                    invocation_id=f"devin:{agent_session_id}:{new_id('terminal')}",
+                    tool_name="terminal/create", arguments=dict(params), action="spawn",
+                    approval_kind="command_execution", adapter_id="devin.acp", run_id=record.run_id if record else None,
+                    cwd=str(handle.get("cwd") or ""),
+                    environment_generation=(record.execution_generation or 0) if record else 0,
+                )
+            except Exception as exc:
+                raise AcpRequestError(
+                    f"terminal/create rejected by SRC policy: {exc}",
+                    code=-32000, data={"reason": "src_policy"}) from exc
+            return
         mode = str(handle.get("access_mode") or AccessMode.SUPERVISED.value)
         if mode in _TERMINAL_UNATTENDED_MODES:
             return
@@ -493,6 +512,17 @@ class DevinAcpAdapter(BaseAcpAdapter):
             handle, command, session=option_id == "allow-session",
         )
 
+    def declared_chat_capabilities(self) -> AgentCapabilities:
+        caps = self._declared_acp_chat_capabilities()
+        self._native_capabilities(caps)
+        return caps
+
+    @staticmethod
+    def _native_capabilities(caps: AgentCapabilities) -> None:
+        caps.user_input = False  # Provider-specific question requests unverified.
+        # Native run_subagent notifications carry lifecycle and tool ownership.
+        caps.subagents = True
+
     async def probe(self, request: ProbeRequest) -> AgentCapabilities:
         caps = await super().probe(request)
         try:
@@ -511,11 +541,7 @@ class DevinAcpAdapter(BaseAcpAdapter):
                 caps.supported_models = []
                 if self._probe_cache is not None:
                     self._probe_cache.degradations.append(f"{exc.code}: {exc}\n{exc.detail}".rstrip())
-        caps.user_input = False  # Provider-specific question requests unverified.
-        # 本机实测（devin 3000.11.3）：run_subagent 委派经
-        # _meta["cognition.ai/subagent_started|completed|subagent_context"]
-        # 公布子智能体生命周期与工具归属。
-        caps.subagents = True
+        self._native_capabilities(caps)
         if self._probe_cache is not None:
             self._probe_cache.binary_path = self._binary
             self._probe_cache.field_sources["user_input"] = "static"
@@ -564,6 +590,36 @@ class DevinAcpAdapter(BaseAcpAdapter):
                     f"current={option.get('currentValue')!r}, available={advertised!r}")
             if option.get("currentValue") != value:
                 await transport.set_config_option(session_id, option["id"], value)
+
+        handle = self._handle_for(request.agent_session_id)
+        if handle is not None and request.options.is_conversation:
+            handle["chat_selected_model"] = request.model or ""
+
+    async def _apply_chat_model_selection(
+        self, handle: dict[str, Any], transport: AcpTransport,
+        session_id: str, input: MessageInput,
+    ) -> None:
+        model = input.payload.model
+        if not handle["options"].is_conversation or model is None:
+            return
+        if model == handle.get("chat_selected_model"):
+            return
+
+        def mode() -> Optional[str]:
+            option = next((item for item in transport.session_setup(session_id).get("configOptions", [])
+                           if item.get("category") == "mode" or item.get("id") == "mode"), {})
+            return option.get("currentValue")
+
+        before = mode()
+        try:
+            await self._configure_model(transport, session_id, model)
+        finally:
+            if before and mode() != before:
+                await transport.set_config_option(session_id, "mode", before)
+        handle["chat_selected_model"] = model
+        resume = self._resume_ctx.get(str(handle.get("agent_session_id") or ""))
+        if resume is not None:
+            resume["model"] = model
 
     async def _configure_model(self, transport: AcpTransport, session_id: str, model: str) -> None:
         families = await asyncio.to_thread(_model_families, self._binary, int(time.time() // 60))
@@ -739,8 +795,8 @@ class DevinAcpAdapter(BaseAcpAdapter):
             input_tokens=pick("inputTokens", "input_tokens"),
             output_tokens=pick("outputTokens", "output_tokens"),
             cached_input_tokens=pick(
-                "cacheReadTokens", "cachedTokens", "cache_read_tokens"),
-            cache_write_tokens=pick("cacheWriteTokens", "cache_write_tokens"),
+                "cachedReadTokens", "cacheReadTokens", "cachedTokens", "cache_read_tokens"),
+            cache_write_tokens=pick("cachedWriteTokens", "cacheWriteTokens", "cache_write_tokens"),
             reasoning_tokens=pick("reasoningTokens", "reasoning_tokens"),
             cost_usd=(
                 float(cost)

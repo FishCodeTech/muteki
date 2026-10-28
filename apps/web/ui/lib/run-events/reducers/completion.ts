@@ -70,6 +70,9 @@ export function reduceCompletion(ev: MutekiEvent, s: DeckState): DeckState | und
       // the UI never sticks on "racing" past the terminal event.
       s.racing = false;
       s.verifying = 0;
+      if (s.blackboard.challenger.status === "running") {
+        s.blackboard.challenger = { ...s.blackboard.challenger, status: "stopped", finishedTs: ev.ts };
+      }
       s.awaitingOperator = undefined;
       s.hitlRequests = [];
       // Keep the FIRST finish ts of the current run cycle — the backend re-emits

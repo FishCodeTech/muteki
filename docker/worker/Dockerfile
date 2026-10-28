@@ -1,6 +1,7 @@
 # muteki worker image — clean Kali build (only public tooling, no baked login state).
-# Ships the full Kali/CTF toolchain + offline knowledge base + the eight container
-# engine CLIs (claude, codex, cursor, pi, omp, kimi, grok, opencode) + the
+# Ships the full Kali/CTF toolchain + offline knowledge base + the ten container
+# engine CLIs (claude, codex, cursor, pi, omp, kimi, grok, opencode, droid,
+# zcode) + the
 # in-container Runtime Control Plane supervisor (runtime_agent, PID1/ENTRYPOINT).
 # Devin is host-local only; DeepSeek Harness is temporarily disabled and is not
 # baked here. Credentials are injected at runtime from Credential Accounts.
@@ -24,6 +25,22 @@
 # GitHub Actions exports this stage first, then starts the final stage on a fresh
 # runner from the pushed digest. Local builds keep using this stage directly.
 ARG MUTEKI_WORKER_BASE=worker-base
+
+# ZCode is source-only upstream. Build its official CLI bundle from an immutable
+# commit with the upstream-pinned Node/pnpm toolchain, then copy only the runtime
+# bundle into the final image.
+FROM node:24.14.0-bookworm-slim AS zcode-builder
+ARG ZCODE_COMMIT=3c5b227649371507ddc4eb46ac5133afe6db1cab
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    git init /src && cd /src && \
+    git remote add origin https://github.com/zai-org/ZCode.git && \
+    git fetch --depth=1 origin "$ZCODE_COMMIT" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "$ZCODE_COMMIT" && \
+    corepack enable && corepack prepare pnpm@10.33.2 --activate && \
+    pnpm install --frozen-lockfile --ignore-scripts && \
+    pnpm --filter @zcode/cli... build
 
 # Pinned to a specific Kali rolling digest for reproducible builds (rolling:latest
 # changes daily). Re-pin periodically: `docker pull kalilinux/kali-rolling:latest`
@@ -529,7 +546,19 @@ COPY ./offline_acp_bridge.py /opt/muteki/offline_acp_bridge.py
 COPY ./omp_offline_config.yml /opt/muteki/omp_offline_config.yml
 COPY ./kimi_offline_agent.md /opt/muteki/kimi_offline_agent.md
 COPY ./grok_offline_agent.md /opt/muteki/grok_offline_agent.md
-RUN chmod +x /opt/muteki/runtime_agent
+COPY ./muteki-runtime/muteki /opt/muteki/python/muteki
+COPY --from=zcode-builder /src/apps/zcode-cli/packages/cli/dist/zcode.cjs /opt/zcode/zcode.cjs
+COPY --from=zcode-builder /src/apps/zcode-cli/packages/cli/dist/provider /opt/zcode/provider
+COPY --from=zcode-builder /src/apps/zcode-cli/packages/cli/dist/THIRD-PARTY-NOTICES.md /opt/zcode/THIRD-PARTY-NOTICES.md
+ENV PYTHONPATH=/opt/muteki/python
+RUN pip3 install --break-system-packages --no-cache-dir --ignore-installed \
+      pydantic==2.12.3 httpx==0.28.1 websockets==15.0.1 \
+      jsonschema==4.23.0 PyJWT==2.13.0 && \
+    python3 -c 'import site; from pathlib import Path; Path(site.getsitepackages()[0], "muteki-runtime.pth").write_text("/opt/muteki/python\n")' && \
+    chmod +x /opt/muteki/runtime_agent /opt/zcode/zcode.cjs && \
+    ln -s /opt/zcode/zcode.cjs /usr/local/bin/zcode && \
+    zcode --version && \
+    python3 -c 'import muteki.external_agents.kimi, muteki.external_agents.rpc'
 
 # 8) Tool-awareness map, baked OUTSIDE the mounted workspace (坑 A). The supervisor
 #    cp's these into /home/kali/workspace AFTER the host bind-mount, so the CLIs

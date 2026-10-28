@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+from muteki.core.blocking import run_blocking
+
 import json
 import sqlite3
 import threading
@@ -229,6 +231,9 @@ class SQLiteGraphBase:
     # -- GraphService.append -------------------------------------------------
 
     async def append(self, event: GraphEvent) -> GraphReceipt:
+        return await run_blocking(self._append_sync, event)
+
+    def _append_sync(self, event: GraphEvent) -> GraphReceipt:
         """追加一条事件并同事务更新投影；idempotency_key 去重。"""
         self._check_graph_id(event.graph_id)
         if not event.event_type:
@@ -271,6 +276,9 @@ class SQLiteGraphBase:
     # -- GraphService.claim --------------------------------------------------
 
     async def claim(self, request: ClaimRequest) -> ClaimReceipt:
+        return await run_blocking(self._claim_sync, request)
+
+    def _claim_sync(self, request: ClaimRequest) -> ClaimReceipt:
         """原子领取一个开放 Intent：单事务条件 UPDATE + fencing token。
 
         状态为 open、或已 claim 但租约过期的工作项才可被领取；并发调用只有
@@ -331,6 +339,9 @@ class SQLiteGraphBase:
     # -- GraphService.lease --------------------------------------------------
 
     async def lease(self, request: LeaseRequest) -> LeaseReceipt:
+        return await run_blocking(self._lease_sync, request)
+
+    def _lease_sync(self, request: LeaseRequest) -> LeaseReceipt:
         """申请图内独占资源租约：fencing token 单调递增，过期或被释放后可转移。"""
         self._check_graph_id(request.graph_id)
         if not request.resource_kind or not request.resource_key:

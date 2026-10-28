@@ -56,7 +56,7 @@ export function reduceConversation(ev: MutekiEvent, s: DeckState): DeckState | u
     case EventType.REASONING_DELTA: {
       // Unscoped reasoning has no lane to attach to (see TEXT_MESSAGE_DELTA).
       if (!ev.solver_id) break;
-      if (ev.solver_id === "reason" && p.main_thread !== true) break;
+      if ((ev.solver_id === "reason" || ev.solver_id === "challenger") && p.main_thread !== true) break;
       const l = lane(s, ev.solver_id);
       const incoming = stripEnginePrefix(String(p.text ?? ""));
       s.lanes[l.solverId] = {
@@ -90,7 +90,7 @@ export function reduceConversation(ev: MutekiEvent, s: DeckState): DeckState | u
       // Unscoped text (legacy summarizer output) has no lane to attach to; its
       // content already lives in intent.summary / fact.summary via NODE_SUMMARIZED.
       if (!ev.solver_id) break;
-      if (ev.solver_id === "reason" && p.main_thread !== true) break;
+      if ((ev.solver_id === "reason" || ev.solver_id === "challenger") && p.main_thread !== true) break;
       const l = lane(s, ev.solver_id);
       s.lanes[l.solverId] = { ...l, online: activityOnline(s), statusReason: undefined };
       const mainThread = !!p.main_thread || l.statusReason === "standby";
@@ -182,6 +182,9 @@ export function reduceConversation(ev: MutekiEvent, s: DeckState): DeckState | u
         content: command,
         ts: ev.ts,
         toolPending: true,
+        toolCallId: String(p.tool_call_id || p.call_id || "") || undefined,
+        toolStartedAt: ev.ts,
+        executionGeneration: s.executionGeneration,
       });
       break;
     }
@@ -198,9 +201,31 @@ export function reduceConversation(ev: MutekiEvent, s: DeckState): DeckState | u
         online: activityOnline(s),
         statusReason: undefined,
       };
-      const pendingIdx = s.chat.findIndex((m) => m.solverId === l.solverId && m.kind === "tool" && m.toolPending);
+      const callId = String(p.tool_call_id || p.call_id || "") || undefined;
+      const pending = s.chat.flatMap((message, index) =>
+        message.solverId === l.solverId && message.kind === "tool" && message.toolPending
+          && (message.executionGeneration == null || message.executionGeneration === s.executionGeneration)
+          ? [{ message, index }] : []);
+      const correlated = callId ? pending.filter(({ message }) => message.toolCallId === callId) : [];
+      const serial = pending.length === 1
+        && (!callId || !pending[0].message.toolCallId);
+      // Legacy streams omitted call IDs on starts. Keep their existing ledger
+      // ordering, but never assert an interval for an ambiguous concurrent pair.
+      const legacy = pending.filter(({ message }) => !message.toolCallId);
+      const pendingIdx = correlated.length === 1 ? correlated[0].index
+        : serial ? pending[0].index
+          : legacy[0]?.index ?? -1;
+      const timingSource = correlated.length === 1 ? "call_id" as const
+        : serial ? "serial" as const : undefined;
       if (pendingIdx >= 0) {
         const next = s.chat.slice();
+        if (!timingSource && legacy.length > 1) {
+          // Once concurrent legacy calls become ambiguous, the remaining one
+          // cannot later become a known pair merely because it is last in FIFO.
+          for (const candidate of legacy) {
+            next[candidate.index] = { ...next[candidate.index], toolStartedAt: undefined };
+          }
+        }
         const open = next[pendingIdx];
         next[pendingIdx] = {
           ...open,
@@ -208,6 +233,10 @@ export function reduceConversation(ev: MutekiEvent, s: DeckState): DeckState | u
           toolPending: false,
           toolOutput: preview,
           toolFailed: failed,
+          toolCallId: callId || open.toolCallId,
+          toolStartedAt: timingSource ? open.toolStartedAt : undefined,
+          toolEndedAt: ev.ts,
+          toolTimingSource: open.toolStartedAt != null ? timingSource : undefined,
         };
         s.chat = next;
       } else if (preview) {
@@ -219,6 +248,9 @@ export function reduceConversation(ev: MutekiEvent, s: DeckState): DeckState | u
           ts: ev.ts,
           toolOutput: preview,
           toolFailed: failed,
+          toolCallId: callId,
+          toolEndedAt: ev.ts,
+          executionGeneration: s.executionGeneration,
         });
       }
       break;

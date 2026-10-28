@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from muteki.extensions.host import ExtensionProcessError
@@ -280,7 +281,7 @@ class ExtensionCommandHandler:
 
         async def _apply() -> SideEffectResult:
             try:
-                record = self._service.install(
+                record = await self._service.install(
                     source,
                     preview_id=str(command.payload.get("preview_id") or ""),
                     confirmations=list(command.payload.get("confirmations") or []),
@@ -382,7 +383,7 @@ class ExtensionQueryHandler:
         params = dict(query.params)
         ext_id = str(params.get("extension_id") or query.aggregate_id or "").strip()
         if qt == "extension.list":
-            result = [r.model_dump(mode="json") for r in self._service.list_records()]
+            result = [r.model_dump(mode="json") for r in await asyncio.to_thread(self._service.list_records)]
         elif not ext_id:
             raise CommandFailed(make_error(
                 "extension.id_required",
@@ -422,8 +423,8 @@ class ExtensionQueryHandler:
         if qt == "extension.projection":
             return await self._service.read_projection(
                 ext_id, str(params.get("name") or ""))
-        return {"lines": self._service.logs(
-            ext_id, limit=int(params.get("limit") or 200))}
+        return {"lines": await asyncio.to_thread(
+            self._service.logs, ext_id, limit=int(params.get("limit") or 200))}
 
 
 def register_extension_handlers(api: Any, service: ExtensionService) -> None:

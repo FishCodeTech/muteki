@@ -106,6 +106,11 @@
           "title": "Mcp",
           "type": "boolean"
         },
+        "model_options_per_turn": {
+          "default": false,
+          "title": "Model Options Per Turn",
+          "type": "boolean"
+        },
         "native_tool_binding": {
           "default": false,
           "title": "Native Tool Binding",
@@ -3126,6 +3131,18 @@
           "title": "Context Parts",
           "type": "array"
         },
+        "effort": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Effort"
+        },
         "interaction_mode": {
           "default": "default",
           "enum": [
@@ -3134,6 +3151,18 @@
           ],
           "title": "Interaction Mode",
           "type": "string"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
         },
         "native_command": {
           "default": false,
@@ -3154,6 +3183,18 @@
           "default": 1,
           "title": "Schema Version",
           "type": "integer"
+        },
+        "service_tier": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Service Tier"
         }
       },
       "title": "MessagePayload",
@@ -5018,6 +5059,7 @@
       "description": "Thread 对话模式，决定 CapabilityBinding 的默认能力集合。",
       "enum": [
         "conversation",
+        "src",
         "single_task",
         "competition",
         "management"

@@ -7,6 +7,7 @@ selects; ``profile["engine"]`` is the concrete CLI transport family.
 from __future__ import annotations
 
 from typing import Any
+from pathlib import Path
 from urllib.parse import urlparse
 
 from muteki.solver.engine_registry import (
@@ -41,6 +42,7 @@ TRANSPORT_TO_ENGINE = {
     "oh_my_pi": "omp",
     "oh-my-pi": "omp",
     "ohmypi": "omp",
+    "zcode": "zcode",
     "kimi": "kimi",
     "kimi_code": "kimi",
     "kimi-code": "kimi",
@@ -186,6 +188,9 @@ def normalize_worker_profile(item: dict[str, Any], *, reject_invalid: bool = Fal
         if reject_invalid:
             raise ValueError("worker profile credential_id is invalid")
         credential_id = ""
+    execution_mode = str(item.get("execution_mode") or "step").strip()
+    if execution_mode not in {"step", "campaign"}:
+        raise ValueError("worker profile execution_mode must be step or campaign")
     normalized = {
         "id": pid,
         "name": pid,
@@ -199,19 +204,31 @@ def normalize_worker_profile(item: dict[str, Any], *, reject_invalid: bool = Fal
         "auth": credential_mode,
         "credential_account": credential_account,
         "credential_id": credential_id,
+        "provider_id": str(item.get("provider_id") or "").strip(),
         "api_key_ref": str(item.get("api_key_ref") or "").strip(),
         "base_url": str(item.get("base_url") or "").strip(),
         "wire_api": str(item.get("wire_api") or ("responses" if engine == "codex" else "")).strip(),
         "roles": roles,
         "implicit_roles": implicit_roles,
         "race": bool(item.get("race", "race" in roles)),
-        "max_running": coerce_pos_int(item.get("max_running"), 1),
+        # Zero is an explicit unlimited profile capacity. Missing/invalid values
+        # retain the historical single-seat default for generic callers.
+        "max_running": coerce_nonneg_int(item.get("max_running"), 1),
         # 0 means "inherit the global review.max_concurrent"; review capacity is
         # intentionally separate from max_running, which now only gates ordinary
         # race/bootstrap/explore/respond workers.
         "max_review_running": coerce_nonneg_int(item.get("max_review_running"), 0),
         "max_verifier_running": coerce_nonneg_int(item.get("max_verifier_running"), 0),
+        "unlimited_workers": bool(item.get("unlimited_workers", False)),
         "priority": coerce_nonneg_int(item.get("priority"), 100),
+        # A long-lived direct Worker can disable the generic mid-run handoff
+        # reminder with 0. Coordinator-managed profiles retain the 600s default.
+        "soft_reminder_seconds": coerce_nonneg_int(
+            item.get("soft_reminder_seconds"), 600),
+        "execution_mode": execution_mode,
+        # Zero means continue until the execution deadline. Positive values keep
+        # the generic finite continuation contract.
+        "max_continuations": coerce_nonneg_int(item.get("max_continuations"), 3),
         "model": str(item.get("model") or "").strip(),
         "reasoning_effort": normalize_reasoning_effort(
             item.get("reasoning_effort"), "default"),
@@ -223,7 +240,34 @@ def normalize_worker_profile(item: dict[str, Any], *, reject_invalid: bool = Fal
         "credential_seat_ref": str(item.get("credential_seat_ref") or "").strip(),
         "enabled": True,
     }
+    for key in ("context_window_tokens", "max_output_tokens"):
+        if key not in item:
+            continue
+        try:
+            capacity = int(item[key])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"worker profile {key} must be a positive integer") from exc
+        if capacity <= 0:
+            raise ValueError(f"worker profile {key} must be a positive integer")
+        normalized[key] = capacity
     return normalized
+
+
+def freeze_worker_price_identity(
+    profile: dict[str, Any] | None, account_root: str | Path | None,
+) -> dict[str, Any] | None:
+    """Freeze the selected account's public provider when launching a Worker."""
+    if profile is None:
+        return None
+    frozen = dict(profile)
+    account_id = str(frozen.get("credential_account") or "").strip()
+    if account_root is not None and account_id:
+        from muteki.solver.credential_accounts import CredentialAccountStore
+
+        account = CredentialAccountStore(account_root).inspect(account_id)
+        details = (account.details or {}) if account is not None else {}
+        frozen["provider_id"] = str(details.get("provider") or "").strip()
+    return frozen
 
 
 def normalize_worker_profiles(value: Any, *, defaults: list[dict[str, Any]] | None = None,

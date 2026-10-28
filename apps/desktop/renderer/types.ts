@@ -29,6 +29,7 @@ export type DesktopState = {
   authSessionVersion?: number;
   anchorTarget?: {hash: string; id: number};
   serviceVersion?: string; serviceFeatures?: Record<string, number>; desktopVersion?: string; remoteUiBuild?: string; remoteAppearanceContract?: string;
+  workspaceMode?: 'chat' | 'src' | 'settings' | 'ctf' | 'pentest' | 'competitions' | 'usage';
   origin: string; transportOrigin: string; status: 'idle' | 'connecting' | 'connected' | 'error';
   message: string; configuring: boolean; platform: string; route: string; connectionVersion?: number;
   serviceId?: string; identityId?: string; persistenceWarning?: string;
@@ -42,7 +43,7 @@ export interface DesktopBridge {
   connectLocal(): Promise<DesktopState>;
   consumeAnchor(id: number): Promise<void>;
   getState(): Promise<DesktopState>; connect(origin: string): Promise<DesktopState>;
-  configure(): Promise<void>; resume(): Promise<void>; navigate(href: string, mode?: 'push' | 'replace'): Promise<void>;
+  configure(): Promise<void>; resume(): Promise<void>; navigate(href: string, mode?: 'push' | 'replace' | 'activate'): Promise<void>;
   action(name: DesktopCommand): Promise<void>; setLocale(lang: 'zh' | 'en'): Promise<void>;
   syncAppearance(input: {preference: 'system' | 'light' | 'dark'; resolvedTheme: 'light' | 'dark'; selection: {kind: 'preset'; id: string} | {kind: 'custom'; hue: number}}): Promise<void>;
   windowAction(name: DesktopWindowAction): Promise<void>; newWindow(route: string): Promise<{windowId: number}>;

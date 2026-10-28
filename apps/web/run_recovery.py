@@ -179,13 +179,22 @@ def _trusted_worker_runtime_history(self, run_id: str) -> dict[str, str]:
     }
 
 
-def persist_run_launch_limits(self, run_id: str, body: dict[str, Any]) -> None:
+def persist_run_launch_limits(
+    self, run_id: str, body: dict[str, Any], *, renew_execution_budget: bool = False,
+) -> None:
     """Keep launch bounds and the selected Worker isolation across generations."""
     is_shared = _shared_workspace_link(self, run_id)
     directory = self.coordinator_control_dir(run_id)
     path = directory / "run-launch-limits.json"
     temporary = directory / f".run-launch-limits-{os.getpid()}-{time.time_ns()}.tmp"
     values = {key: body[key] for key in _RUN_LAUNCH_LIMITS if key in body}
+    from muteki.solver.execution_budget import ExecutionBudget
+
+    budget_record = body.get("execution_budget")
+    if budget_record is not None:
+        if not isinstance(budget_record, dict):
+            raise ValueError("execution_budget must be an object")
+        ExecutionBudget.from_record(budget_record)
     challenge = body.get("challenge") or {}
     from apps.web.worker_config import resolve_worker_backend
     from muteki.core.runtime_env import is_web_container
@@ -208,6 +217,16 @@ def persist_run_launch_limits(self, run_id: str, body: dict[str, Any]) -> None:
     if runtime_scope not in {"run", "shared"}:
         raise RuntimeError("invalid Worker container scope")
     prior_payload = _load_run_launch_policy(self, run_id)
+    prior_budget = prior_payload.get("execution_budget")
+    if prior_budget is not None:
+        if not isinstance(prior_budget, dict):
+            raise RuntimeError(f"Run execution budget is invalid: {run_id}")
+        ExecutionBudget.from_record(prior_budget)
+        if (budget_record is not None and budget_record != prior_budget
+                and not renew_execution_budget):
+            raise ValueError("Run execution budget cannot change during continuation")
+        if budget_record is None:
+            budget_record = prior_budget
     prior_history = _trusted_worker_runtime_history(self, run_id)
     if prior_payload or prior_history or is_shared:
         previous = load_run_launch_limits(self, run_id)
@@ -223,6 +242,7 @@ def persist_run_launch_limits(self, run_id: str, body: dict[str, Any]) -> None:
             else {})
     try:
         temporary.write_text(json.dumps({"version": 1, "limits": values,
+                                         "execution_budget": budget_record,
                                          "worker_runtime": {
                                              "worker_backend": runtime_backend,
                                              "worker_container_scope": runtime_scope,
@@ -243,6 +263,14 @@ def load_run_launch_limits(self, run_id: str) -> dict[str, Any]:
            or isinstance(value, bool) for key, value in values.items()):
         raise RuntimeError(f"Run launch limits contain invalid values: {run_id}")
     result = dict(values)
+    budget_record = payload.get("execution_budget")
+    if budget_record is not None:
+        from muteki.solver.execution_budget import ExecutionBudget
+
+        if not isinstance(budget_record, dict):
+            raise RuntimeError(f"Run execution budget is invalid: {run_id}")
+        ExecutionBudget.from_record(budget_record)
+        result["execution_budget"] = dict(budget_record)
     runtime = payload.get("worker_runtime")
     history = _trusted_worker_runtime_history(self, run_id)
     if runtime is not None:
@@ -330,7 +358,13 @@ def persist_winner_continuation(
     if raw_workdir:
         try:
             resolved_workdir = Path(raw_workdir).resolve()
-            if self._is_within(resolved_workdir, worker_root):
+            if resolved_workdir == workspace:
+                # CTF workers intentionally run at the workspace root so staged
+                # attachments and their native CLI session keep one project
+                # identity.  Empty means "unknown" in the continuation schema;
+                # store the root explicitly as "." instead of losing it.
+                workdir_rel = "."
+            elif self._is_within(resolved_workdir, worker_root):
                 workdir_rel = str(resolved_workdir.relative_to(workspace))
         except (OSError, ValueError):
             workdir_rel = ""

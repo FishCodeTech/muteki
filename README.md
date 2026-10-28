@@ -77,9 +77,9 @@ After a month of engineering work, tuning, and fixes, Muteki is open source with
 
 ## Release notes
 
-The current version is **0.4.5**. See [CHANGELOG.md](CHANGELOG.md) for new features, behavior changes, removals, and upgrade notes.
+The current version is **0.4.6**. See [CHANGELOG.md](CHANGELOG.md) for new features, behavior changes, removals, and upgrade notes.
 
-The [0.4.5 release](https://github.com/FishCodeTech/muteki/releases/tag/v0.4.5) includes a macOS desktop app for Apple silicon and Intel, with a bundled local service and support for remote Muteki services. Windows and Linux desktop packages are not included. Web and container deployments remain available.
+The [0.4.6 release](https://github.com/FishCodeTech/muteki/releases/tag/v0.4.6) includes a macOS desktop app for Apple silicon and Intel, with a bundled local service and support for remote Muteki services. Windows and Linux desktop packages are not included. Web and container deployments remain available.
 
 The macOS packages are ad-hoc signed and are not notarized. Published 0.4.1 desktop installs need a manual first install of 0.4.2 because they do not include the update screen. In 0.4.2, global settings can check and install official releases after GitHub SHA-256 and strict signature verification. Local candidate updates require a stable Developer ID signature.
 
@@ -205,7 +205,19 @@ Muteki, Agent CLIs, CTF tools, and run data stay inside Ubuntu. Open `http://<VM
 
 The UI can configure Claude Code, Codex, Cursor, Pi, OMP, Kimi, Grok, and OpenCode. Whether each one works depends on installation, vendor login, and the chosen runtime. DeepSeek Harness is registered but cannot currently be selected as a Worker because its CLI does not provide the required structured provider capabilities. Follow each vendor's installation and login instructions.
 
+Pi chat uses the installed Pi CLI through its native RPC protocol, following the [T3 Code Pi integration](https://github.com/pingdotgg/t3code/tree/main/packages/provider-pi). It does not install a separate Pi SDK or ACP bridge. Thinking levels come from the selected model's RPC metadata and are checked against the effective setting. The composer provides supervised, auto-accept-edits, and full-access modes through a tool-call approval extension. These modes control Pi tool calls and are not an operating-system sandbox. Existing Pi ACP records remain readable; select Pi RPC to start a new session.
+
 If the page says **Needs self-check** or **No usable credential**, test the account under Agent credentials, then check the Worker's account, model, and runtime binding. Self-check sends a real model request and may incur usage.
+
+### Model price feed
+
+Muteki's usage overview reads the public [model-prices](https://github.com/jiayuqi7813/model-prices) feed. Its GitHub Actions workflow synchronizes LiteLLM, models.dev, Cursor's official model prices, Devin's public SWE-2 list prices, and official Grok Build Fast prices every day at **03:17 UTC / 11:17 Asia/Shanghai** and publishes one [prices.json](https://raw.githubusercontent.com/jiayuqi7813/model-prices/main/prices.json). Muteki checks this feed when loading usage, caches it for 24 hours, and keeps the last valid prices if an update fails. The feed includes its generation time and source metadata; snapshots older than 48 hours are shown as cached prices.
+
+Cursor, Devin, and Grok Build use their own price namespaces. Grok Build's `grok-4.7-build-fast` uses its published Fast tariff, including the rate above 200,000 prompt tokens, rather than the standard Grok API price. Cursor standard, Fast, and long-context prices stay separate; Auto and requests without enough tier information remain unpriced. Pi, OMP, OpenCode, and other configurable engines use the serving provider's model prices, not one flat price for the Agent.
+
+Under **Settings → Agents and endpoints → Model pricing**, detect exact model IDs, confirm catalog mappings, or create, edit, and delete custom rates. Rates use USD per million tokens and can be scoped to a credential and provider. An explicit `0` is a zero rate; blank cache rates are unknown. Daily catalog refreshes preserve custom rates. Chat, CTF, and Pentest cost views share the same pricing results while retaining captured usage for audit. Tool estimates, catalog estimates, and custom estimates are labeled separately; a price table never supplies missing token measurements.
+
+Prices are public list-price estimates, not subscription bills or guaranteed relay prices. Provider-qualified model entries remain separate, missing prices are not replaced with zero, and upstream changes may take time to reach the daily feed. This feed supplies usage estimates; it does not replace the separate execution-budget pricing rules.
 
 ## Solving a challenge
 
@@ -298,7 +310,7 @@ The UI remains at `http://localhost:3001` by default. `MUTEKI_HOST_DATA_ROOT` mu
 ```bash
 ./run.sh upgrade --check   # Check the latest stable release
 ./run.sh install            # Set up a managed installation
-muteki upgrade v0.4.5       # Install this release
+muteki upgrade v0.4.6       # Install this release
 muteki rollback             # Return to the previous installed release
 muteki version              # Show version and installation kind
 ```

@@ -12,6 +12,7 @@ import { TerminalSurface } from "@/components/chat/surfaces/TerminalSurface";
 import { AgentsSurface } from "@/components/chat/surfaces/AgentsSurface";
 import { PlanSurface } from "@/components/chat/surfaces/PlanSurface";
 import { PullRequestSurface } from "@/components/chat/surfaces/PullRequestSurface";
+import { ExtensionSurfaceHost } from "./extensions";
 
 interface SurfaceRendererProps {
   surface: ChatSurface;
@@ -58,6 +59,8 @@ export const SurfaceRenderer = memo(function SurfaceRenderer({ surface, ctx }: S
       return <PlanSurface {...ctx} surface={surface} />;
     case "pull-request":
       return <PullRequestSurface {...ctx} surface={surface} />;
+    case "extension":
+      return <ExtensionSurfaceHost surface={surface} threadId={ctx.threadId} active={ctx.active} />;
     default: {
       const exhaustive: never = surface;
       return exhaustive;

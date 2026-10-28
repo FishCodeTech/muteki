@@ -1,0 +1,367 @@
+.shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+.header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid var(--line);
+}
+.heading {
+  min-width: 0;
+}
+.heading h1 {
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.heading p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.headerActions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.content {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 16px 20px 32px;
+}
+.tabs {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  margin: 0 0 16px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel2);
+}
+.tabs button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.tabs button span {
+  opacity: 0.72;
+  font-size: 11px;
+}
+.tabs button:hover {
+  color: var(--text);
+  background: var(--panel3);
+}
+.tabs .activeTab {
+  color: var(--text);
+  background: var(--panel);
+  box-shadow: 0 1px 3px var(--shadow-card);
+}
+.centerState {
+  display: grid;
+  place-items: center;
+  gap: 10px;
+  min-height: 180px;
+  color: var(--muted);
+  text-align: center;
+}
+.centerState p {
+  max-width: 52ch;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.textButton {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+.muted {
+  color: var(--muted);
+}
+.evidenceList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px 12px;
+  margin: 8px 0;
+  padding: 0;
+  list-style: none;
+}
+.evidenceList li {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+.evidenceList button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.evidenceList small {
+  color: var(--muted);
+}
+.keyValue {
+  display: contents;
+}
+.rawDetails {
+  margin: 10px 0;
+}
+.rawDetails summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.rawDetails pre,
+.codeBlock {
+  max-width: 100%;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel2);
+  color: var(--text);
+  font: 12px/1.6 var(--font-mono, monospace);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 10px;
+  margin: 0 0 16px;
+}
+.field {
+  display: grid;
+  gap: 6px;
+  min-width: 140px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.fieldGrow {
+  flex: 1;
+  min-width: 220px;
+}
+.field input,
+.field select,
+.field textarea {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel2);
+  color: var(--text);
+  padding: 8px 9px;
+  font: inherit;
+}
+.field textarea {
+  resize: vertical;
+  min-height: 76px;
+}
+.field input:focus,
+.field select:focus,
+.field textarea:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.checkbox input {
+  accent-color: var(--accent);
+}
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0;
+}
+.actions button,
+.secondaryButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel2);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.actions button:hover,
+.secondaryButton:hover {
+  background: var(--panel3);
+}
+.actions button:disabled,
+.secondaryButton:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.primaryButton {
+  composes: secondaryButton;
+  border-color: var(--accent) !important;
+  background: var(--accent) !important;
+  color: var(--accent-contrast, #fff) !important;
+}
+.cardGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
+  gap: 12px;
+}
+.card {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel);
+}
+.card h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+.card p {
+  overflow-wrap: anywhere;
+}
+.stack {
+  display: grid;
+  gap: 12px;
+}
+.metaLine {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.metaLine code {
+  overflow-wrap: anywhere;
+}
+.diffGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
+  gap: 10px;
+}
+.diffBefore,
+.diffAfter {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel2);
+}
+.diffBefore h4,
+.diffAfter h4 {
+  margin: 0 0 6px;
+  font-size: 12px;
+}
+.diffBefore h4 {
+  color: var(--red, #b44);
+}
+.diffAfter h4 {
+  color: var(--green, #287d46);
+}
+.list {
+  margin: 0;
+  padding-left: 20px;
+}
+.list li {
+  margin: 5px 0;
+  overflow-wrap: anywhere;
+}
+.separator {
+  height: 1px;
+  margin: 16px 0;
+  border: 0;
+  background: var(--line);
+}
+.footnote {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+.fullWidth {
+  grid-column: 1/-1;
+}
+@media (max-width: 640px) {
+  .header {
+    padding: 14px;
+    flex-direction: column;
+  }
+  .headerActions {
+    justify-content: flex-start;
+  }
+  .content {
+    padding: 12px 12px 28px;
+  }
+  .toolbar {
+    align-items: stretch;
+  }
+  .field,
+  .fieldGrow {
+    min-width: 100%;
+    width: 100%;
+  }
+  .tabs {
+    margin-left: -4px;
+    margin-right: -4px;
+  }
+  .diffGrid {
+    grid-template-columns: 1fr;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .shell * {
+    scroll-behavior: auto !important;
+    transition: none !important;
+  }
+}

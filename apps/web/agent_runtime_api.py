@@ -33,6 +33,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Optional
 
+from muteki.core.blocking import run_blocking
 from muteki.platform.command_handlers.base import (
     CommandFailed,
     CommandPlan,
@@ -315,6 +316,8 @@ class RuntimeInstanceConfig:
             return base.get(name, default)
 
         adapter_id = canonical_adapter_id(str(_pick("adapter_id") or ""))
+        if adapter_id == "pi.acp":
+            raise ValueError("Pi ACP 已移除。请选择 Pi RPC；历史记录保持可读，旧 ACP 会话不会自动迁移。")
         engine = engine_of_adapter(adapter_id)
         if not engine:
             raise ValueError(
@@ -948,7 +951,7 @@ class AgentRuntimeService:
         engine = engine_of_adapter(adapter_id)
         previous = self.store.health(key) or {}
         auth = await asyncio.to_thread(self._auth_view, engine, "") if engine else {}
-        self.store.save_health(key, {
+        await run_blocking(self.store.save_health, key, {
             "healthy": False,
             "detail": detail,
             **({"error_code": code} if code else {}),
@@ -993,8 +996,9 @@ class AgentRuntimeService:
         async def run() -> CapabilityProbeReport:
             base = self.sessions_root / "_runtime_probe_environments"
             base.mkdir(parents=True, exist_ok=True, mode=0o700)
-            with tempfile.TemporaryDirectory(prefix="probe-", dir=base) as directory:
-                root = Path(directory)
+            temporary = tempfile.TemporaryDirectory(prefix="probe-", dir=base)
+            try:
+                root = Path(temporary.name)
 
                 def prepare() -> dict[str, str]:
                     resolved = resolve_credential_env(
@@ -1011,19 +1015,14 @@ class AgentRuntimeService:
                         include_assets=False, isolated=bool(account_id),
                     )
 
-                preparation = asyncio.create_task(asyncio.to_thread(prepare))
-                try:
-                    env = await asyncio.shield(preparation)
-                except asyncio.CancelledError:
-                    # to_thread cannot be stopped. Wait for its writes to finish
-                    # before removing the temporary credential/home tree.
-                    await preparation
-                    raise
+                env = await run_blocking(prepare)
                 token = PROBE_ENVIRONMENT.set(env)
                 try:
                     return await self.registry.run_probe(adapter_id, instance_id, request)
                 finally:
                     PROBE_ENVIRONMENT.reset(token)
+            finally:
+                await run_blocking(temporary.cleanup)
 
         key = self.registry.probe_key(
             adapter_id, instance_id, request=request,
@@ -1175,7 +1174,7 @@ class AgentRuntimeService:
                     resolve_engine_bin_source,
                 )
 
-                binary_source = resolve_engine_bin_source(engine)
+                binary_source = await run_blocking(resolve_engine_bin_source, engine)
                 binary_env = str(_ENV_OVERRIDE.get(engine) or "")
             except Exception as exc:  # noqa: BLE001 — 仅影响诊断元数据，原因写入该字段
                 binary_source = f"unresolved: {type(exc).__name__}: {exc}"
@@ -1230,7 +1229,7 @@ class AgentRuntimeService:
             # Retain the complete native diagnostic in the probe response too.
             health["model_catalog"]["detail"] = str(result.get("detail") or "")
         if not credential_id:
-            self.store.save_health(key, health)
+            await run_blocking(self.store.save_health, key, health)
         return health
 
     async def probe_all(
@@ -1246,8 +1245,8 @@ class AgentRuntimeService:
         单实例失败被隔离进结果条目，不中断其余实例。``refresh=False``
         时 TTL 内的缓存结果直接复用。
         """
-        views = self.list_instances(
-            adapter_id,
+        views = await run_blocking(
+            self.list_instances, adapter_id,
             include_discovered=True,
             transport_kind=transport_kind,
         )
@@ -1451,12 +1450,12 @@ class RuntimeInstanceCommandHandler:
         if ct == "runtime.instance.remove":
             return self._plan_remove(command)
         if ct == "runtime.instance.probe":
-            return self._plan_probe(command)
+            return await run_blocking(self._plan_probe, command)
         if ct == "runtime.instance.capability.refresh":
-            return self._plan_probe(command)
+            return await run_blocking(self._plan_probe, command)
         if ct == "runtime.instance.refresh":
             return self._plan_refresh(command)
-        return self._plan_auth(command)
+        return await run_blocking(self._plan_auth, command)
 
     def _plan_upsert(self, command: CommandEnvelope) -> CommandPlan:
         _ensure_command_engine_supported(
@@ -1484,7 +1483,7 @@ class RuntimeInstanceCommandHandler:
 
         async def _save() -> SideEffectResult:
             try:
-                store.upsert(cfg, expected_revision=command.payload.get("expected_revision"))
+                await run_blocking(store.upsert, cfg, expected_revision=command.payload.get("expected_revision"))
             except ValueError as exc:
                 raise CommandFailed(make_error("runtime.instance.revision_conflict", "运行配置已被其它视图修改，请刷新后重试。", ErrorCategory.CONFLICT, correlation_id=correlation_id_of(command))) from exc
             self._service.apply_live_config(cfg)
@@ -1517,7 +1516,7 @@ class RuntimeInstanceCommandHandler:
         store = self._service.store
 
         async def _remove() -> SideEffectResult:
-            store.remove(adapter_id, instance_id)
+            await run_blocking(store.remove, adapter_id, instance_id)
             self._service.remove_live_config(adapter_id, instance_id)
             return SideEffectResult()
 
@@ -1724,15 +1723,15 @@ class RuntimeInstanceCommandHandler:
                     "credential_ref": "",
                     "updated_at": utcnow().isoformat(),
                 })
-                service.store.upsert(cfg)
+                await run_blocking(service.store.upsert, cfg)
                 service.apply_live_config(cfg)
-            auth = service._auth_view(
-                engine_of_adapter(adapter_id),
+            auth = await run_blocking(
+                service._auth_view, engine_of_adapter(adapter_id),
                 str(cfg.credential_ref if cfg is not None else ""),
             )
             health = service.store.health(key)
             if health is not None:
-                service.store.save_health(key, {**health, "auth": auth})
+                await run_blocking(service.store.save_health, key, {**health, "auth": auth})
             output = {
                 "instance": key,
                 "auth": auth,
@@ -1959,8 +1958,8 @@ class RuntimeInstanceQueryHandler:
             or query.params.get("transport")
             or ""
         ).strip().lower()
-        instances = self._service.list_instances(
-            canonical_adapter_id(adapter_id) or None,
+        instances = await run_blocking(
+            self._service.list_instances, canonical_adapter_id(adapter_id) or None,
             include_discovered=include_discovered,
             transport_kind=transport_kind,
         )
@@ -2053,10 +2052,12 @@ class ProviderDescriptorQueryHandler:
         engine = str(query.params.get("engine") or "").strip().lower()
         descriptors = (get_descriptor(engine),) if engine else all_descriptors()
         engines = {item.engine for item in descriptors}
+        views = await run_blocking(self._service.list_instances, include_discovered=True)
         instances = [
             _instance_capabilities(view)
-            for view in self._service.list_instances(include_discovered=True)
+            for view in views
             if engine_of_adapter(str(view.get("adapter_id") or "")) in engines
+            and find_descriptor_for_adapter(str(view.get("adapter_id") or "")) is not None
         ]
         return QueryResult(
             query_id=query.query_id,
@@ -2233,7 +2234,7 @@ def create_agent_runtime_router(
     @router.get("/api/agent-runtimes/{instance_key}")
     async def get_runtime(instance_key: str) -> Any:
         adapter_id, instance_id = _parse_key(instance_key)
-        view = service.get_instance(adapter_id, instance_id) if adapter_id else None
+        view = await run_blocking(service.get_instance, adapter_id, instance_id) if adapter_id else None
         if view is None:
             error = ErrorEnvelope(
                 code="runtime.instance.not_found",
@@ -2274,7 +2275,7 @@ def create_agent_runtime_router(
              "credential_id": body.get("credential_id", ""), "environment": body.get("environment", "local")}))
         body = json.loads(response.body)
         # probe 完成后把最新健康快照一并返回，前端无需二次请求。
-        view = service.get_instance(adapter_id, instance_id) if adapter_id else None
+        view = await run_blocking(service.get_instance, adapter_id, instance_id) if adapter_id else None
         if view is not None:
             body["instance"] = view
         return JSONResponse(body, status_code=response.status_code)
