@@ -2,32 +2,102 @@
 
 All notable public release changes are tracked here.
 
-## 0.4.6 - 2026-10-28
-
-### Added
-
-- Added the SRC bounty workbench with task-bound conversations, assets, findings, evidence, reports, and budgeted monitoring cycles.
-- Added cross-provider conversation subagents and Orchestrate controls, with child conversations, live activity, routing details, and cancellation in the sidebar and Subagents panel.
-- Added shared model pricing controls and usage cost views across conversations and runs, including service-tier pricing and missing-price feedback.
-
-### Changed
-
-- Replaced the run trace waterfall with an activity timeline, linked event ledger, and history replay. Expanded tool details retain both inputs and outputs.
-- Refined conversation streaming, Pi controls, desktop chat layout, CTF and penetration-testing run readability, workspace navigation, and remote desktop chrome.
-- Kept desktop mode pages and reading positions when switching workspaces, and restored canonical routes after panel handoffs.
+## 0.4.7 - 2026-10-28
 
 ### Fixed
 
-- Moved large Worker prompts out of process arguments to avoid command-line size limits.
-- Moved blocking project operations off the server event loop, serialized extension lifecycle changes, and reserved concurrent upload filenames atomically.
-- Fixed conversation retry and project admission handling, preserved native sessions, and corrected Codex MCP and authentication status labels.
-- Fixed Ubuntu systemd installation and made credential draft probes honor the selected Worker backend.
-- Enforced SRC HTTP authority boundaries and corrected monitoring acquisition, run-once controls, cost reconciliation, and revision-safe editing.
+- Fixed Flag and answer copying on LAN and other ordinary HTTP pages, where `navigator.clipboard` can be unavailable. The run inspector, conversation conclusion, status banner, and expanded result list now use the same copy implementation.
+- Attempted synchronous copying within the click or key gesture, then used the Clipboard API when needed. Success and failure messages reflect the browser's result in Chinese or English.
+
+### Changed
+
+- Updated application versions, lock metadata, Compose image tags, Worker build defaults, and installation examples to `0.4.7` / `v0.4.7`.
+- Expanded the `0.4.6` notes below with the features, design decisions, fixes, and implementation areas included since `0.4.5`.
+
+### Validation
+
+- Reproduced the original error on a LAN HTTP page. Single-click copies from the inspector, status banner, and conversation conclusion wrote the expected text to the system clipboard.
+- Verified Enter, Space, and touch at a 390px viewport; also verified the secure-context Clipboard API fallback and failure feedback when both copy methods were unavailable.
+- TypeScript passed. ESLint reported no errors and 33 existing warnings. The affected Windows deployment was not retested directly.
 
 ### Upgrade
 
-- Use `muteki upgrade v0.4.6` or `./run.sh upgrade v0.4.6` for a managed Web installation, and add `--compose` for a container deployment. Existing `.env`, `state/`, credentials, and sessions remain outside the release bundle.
-- Download the macOS `.dmg` or `.zip` matching your Apple silicon or Intel Mac from the release page. Windows and Linux desktop packages are not included; Web and container deployments remain available.
+- Use `muteki upgrade v0.4.7` or `./run.sh upgrade v0.4.7` for a managed Web installation; add `--compose` for a container deployment. Existing `.env`, `state/`, credentials, and sessions remain outside the release bundle.
+- Rebuild or replace the deployed Web frontend and reload the page to receive the copy fix. Updating a source checkout does not replace an already running production build.
+- Desktop packages target Apple silicon and Intel macOS. Windows and Linux desktop installers are not included; Web and container deployments remain available.
+- macOS packages are ad-hoc signed and are not notarized. The in-app candidate updater requires a stable Developer ID signature; manual installation remains available.
+
+[Patch comparison](https://github.com/FishCodeTech/muteki/compare/v0.4.6...v0.4.7) · [All changes since 0.4.5](https://github.com/FishCodeTech/muteki/compare/v0.4.5...v0.4.7)
+
+## 0.4.6 - 2026-10-28
+
+This section covers the implementation interval after `0.4.5`, including changes grouped into the public release snapshot.
+
+### Conversations and subagents
+
+- Added cross-provider subagent delegation and Orchestrate controls. Parent and child conversations, the sidebar, and the Subagents panel show progress, results, elapsed time, routing details, navigation, and cancellation for application-managed agents.
+- Recorded runtime, model, reasoning effort, acceptance criteria, routing rationale, and worktree state. Provider-native and application-managed subagents remain distinguishable; Orchestrate follows the capabilities bound to the current thread.
+- Preserved native sessions and structured handoff history when changing runtimes. Fixed retry and project-admission boundaries, sidebar ordering, and Codex MCP/authentication status labels.
+- Refined streamed tool activity, command output, file differences, and research sources. Reduced-motion preferences remain supported.
+- Separated Pi effort and speed controls, retained supported choices, hid unavailable plan controls, and reduced composer layout movement.
+
+### Activity, evidence, and run views
+
+- Replaced the run trace waterfall with an activity timeline, event ledger, and history replay. Hierarchy, parallel work, duration, errors, token usage, and cost are visible across agent, model, and tool activity.
+- Added search, category and error filters, interval selection, zoom, live following, alternate layouts, and narrow-screen stacking. Compressed idle periods retain their actual timestamp mapping.
+- Kept tool inputs and outputs in expanded details. Collaboration views show subgoals, step results, evidence references, retired facts, and replacement links; exports are available as JSONL, text timeline, and SQLite.
+- Improved CTF and penetration-testing typography, contrast, wrapping, charts, model lists, empty states, statistics, provider error details, and completed Worker presentation.
+
+### Pricing and usage
+
+- Centralized model pricing, model mappings, custom rates, and missing-model entries in Agent settings. Conversations, runs, orchestration, and global usage views use shared accounting.
+- Distinguished provider-reported amounts, estimates, partial records, subscription pricing, and missing prices. Standard and fast service-tier rates remain separate, and model matching preserves pricing scope.
+- Made credential draft probes honor the selected local or container Worker backend.
+
+### SRC workspace and research records
+
+- Added a task-bound SRC workspace with conversations, search, assets, findings, evidence, reports, research material, and budgeted monitoring.
+- Connected the real workspace to persistent backend domains for assets, findings, tasks, reports, and suggestions. Mentions, references, drag-to-composer, save state, and pending proposals connect conversations with structured records.
+- Added source-aware asset ingestion, relationships, revisions, selected reuse, artifact preservation, request and protocol evidence, review states, frozen reports, exports, feedback, and retest records.
+- Added policy and approval records, task-bound browser and identity context, and controlled access to retained evidence. Fixed scope checks, HTTP authority handling, and evidence integrity.
+- Added versioned monitoring definitions, baselines, candidate review, notifications, and bounded cycles. Corrected run-once acquisition, revision checks, and cost reconciliation.
+- Kept independent prototypes and demonstration routes identifiable. Some prototype interactions remain local; planned external integrations and operating environments require their own acceptance.
+
+### Backend reliability and deployment
+
+- Moved blocking project operations off the server event loop, serialized extension lifecycle changes by extension, and atomically reserved concurrent upload filenames.
+- Moved large Worker prompts out of process arguments while retaining full prompt text and session continuation, avoiding operating-system argument-size limits.
+- Improved scheduling and shared-graph provenance, fact replacement, lifecycle state, deadline handling, and the distinction between provider failures, timeouts, cancellations, and output limits.
+- Updated Pi RPC controls, runtime adapters, Worker readiness, packaged dependencies, and desktop runtime resources. Fixed Ubuntu systemd installation and service validation.
+- Cleaned up stray root components, stopped tracking local prototype material, and kept generated contracts and existing checks aligned with the interfaces.
+
+### Desktop and navigation
+
+- Retained workspace pages, mode-specific routes, drafts, and reading positions when switching contexts. Hidden desktop pages reduce refresh work, and panel handoffs restore canonical routes and history navigation.
+- Consolidated chat and SRC controls in the desktop title bar, hid thread controls in other modes, simplified workspace navigation, and removed duplicate remote-page chrome.
+- Added a conversation turn rail with previews and jump navigation, bounded around the current reading position for long threads.
+- Designed activity, pricing, provenance, and capability-dependent controls to show recorded state while keeping conversation and structured records connected.
+
+### Implementation map
+
+| Area | Main source locations |
+| --- | --- |
+| Conversations and runtime adapters | `muteki/conversation/`, `muteki/external_agents/`, `apps/web/conversation_api.py`, `apps/web/ui/components/conversation/` |
+| Activity and collaboration | `apps/web/ui/components/activity-timeline/`, `apps/web/ui/components/collaboration/`, `muteki/swarm/` |
+| Pricing and accounting | `muteki/core/model_pricing.py`, `apps/web/ui/lib/modelPricing.ts`, `apps/web/ui/components/settings/agents/`, `apps/web/ui/components/UsageDashboard.tsx` |
+| SRC records, evidence, and monitoring | `muteki/src/`, `apps/web/ui/components/src/`, `apps/web/ui/components/studio-prototype/real/`, `docker/src-browser/`, `docker/src-egress/` |
+| Desktop and navigation | `apps/desktop/src/`, `apps/desktop/renderer/`, `apps/web/ui/components/RetainedWorkspaces.tsx`, `apps/web/ui/components/WorkspaceNav.tsx` |
+| Worker transport and packaging | `muteki/solver/`, `docker/worker/`, `docker/worker-slim/`, `scripts/build_desktop_runtime.py`, `scripts/verify_worker_image.sh` |
+| HTTP copy fix in 0.4.7 | `apps/web/ui/lib/clipboard.ts`, `apps/web/ui/lib/useCopyText.ts`, `apps/web/ui/components/Conversation.tsx`, `apps/web/ui/components/RunInspector.tsx` |
+
+### Upgrade and verification scope
+
+- Use `muteki upgrade v0.4.6` or `./run.sh upgrade v0.4.6` for this release, or install `0.4.7` to include the HTTP copy fix. Container installations can add `--compose`; application state and credentials remain outside the release archive.
+- The `0.4.6` release workflow passed application-bundle creation, native amd64/arm64 image checks, and Apple silicon/Intel macOS packaging and startup checks. External-provider and SRC operational acceptance depend on the configured environment.
+- The default monitoring runner supports configured asset sources with query capabilities; other source types need a suitable runner. Report export and recorded manual status do not submit to external platforms automatically.
+- Windows and Linux desktop installers are not included. macOS packages are ad-hoc signed and are not notarized.
+
+[Release validation](https://github.com/FishCodeTech/muteki/actions/runs/40639311562) · [Full code comparison](https://github.com/FishCodeTech/muteki/compare/v0.4.5...v0.4.6)
 
 ## 0.4.5 - 2026-10-12
 
