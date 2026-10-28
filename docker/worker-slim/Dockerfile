@@ -1,8 +1,8 @@
-# muteki worker image — SLIM build (plain Ubuntu + reverse-connector + 8 engine CLIs).
+# muteki worker image — SLIM build (plain Ubuntu + reverse-connector + 10 engine CLIs).
 # A lightweight alternative to the full Kali image for FAST testing: it ships ONLY
 #   - the in-container Runtime Control Plane supervisor (runtime_agent, PID1/ENTRYPOINT)
-#   - the eight container Worker CLIs (claude, codex, cursor, pi, omp, kimi, grok,
-#     opencode). Devin is host-local; DeepSeek Harness is not baked.
+#   - the ten container Worker CLIs (claude, codex, cursor, pi, omp, kimi, grok,
+#     opencode, droid, zcode). Devin is host-local; DeepSeek Harness is not baked.
 #   - the muteki-blackboard skill
 # and no full Kali toolchain (no kali-linux-headless, sagemath, volatility3 or
 # knowledge base). It pulls/builds in a fraction of the
@@ -27,6 +27,22 @@
 # Then run a slim swarm with:  MUTEKI_WORKER_IMAGE=muteki-worker-slim:latest ./run.sh …
 #
 # Platform defaults to the host architecture and can be selected by build.sh.
+
+# ZCode is source-only upstream. Build its official CLI bundle from an immutable
+# commit with the upstream-pinned Node/pnpm toolchain, then copy only the runtime
+# bundle into the worker image.
+FROM node:24.14.0-bookworm-slim AS zcode-builder
+ARG ZCODE_COMMIT=3c5b227649371507ddc4eb46ac5133afe6db1cab
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    git init /src && cd /src && \
+    git remote add origin https://github.com/zai-org/ZCode.git && \
+    git fetch --depth=1 origin "$ZCODE_COMMIT" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "$ZCODE_COMMIT" && \
+    corepack enable && corepack prepare pnpm@10.33.2 --activate && \
+    pnpm install --frozen-lockfile --ignore-scripts && \
+    pnpm --filter @zcode/cli... build
 
 FROM ubuntu:24.04
 
@@ -168,7 +184,19 @@ COPY ./offline_acp_bridge.py /opt/muteki/offline_acp_bridge.py
 COPY ./omp_offline_config.yml /opt/muteki/omp_offline_config.yml
 COPY ./kimi_offline_agent.md /opt/muteki/kimi_offline_agent.md
 COPY ./grok_offline_agent.md /opt/muteki/grok_offline_agent.md
-RUN chmod +x /opt/muteki/runtime_agent
+COPY ./muteki-runtime/muteki /opt/muteki/python/muteki
+COPY --from=zcode-builder /src/apps/zcode-cli/packages/cli/dist/zcode.cjs /opt/zcode/zcode.cjs
+COPY --from=zcode-builder /src/apps/zcode-cli/packages/cli/dist/provider /opt/zcode/provider
+COPY --from=zcode-builder /src/apps/zcode-cli/packages/cli/dist/THIRD-PARTY-NOTICES.md /opt/zcode/THIRD-PARTY-NOTICES.md
+ENV PYTHONPATH=/opt/muteki/python
+RUN pip3 install --break-system-packages --no-cache-dir \
+      pydantic==2.12.3 httpx==0.28.1 websockets==15.0.1 \
+      jsonschema==4.23.0 PyJWT==2.13.0 && \
+    python3 -c 'import site; from pathlib import Path; Path(site.getsitepackages()[0], "muteki-runtime.pth").write_text("/opt/muteki/python\n")' && \
+    chmod +x /opt/muteki/runtime_agent /opt/zcode/zcode.cjs && \
+    ln -s /opt/zcode/zcode.cjs /usr/local/bin/zcode && \
+    zcode --version && \
+    python3 -c 'import muteki.external_agents.kimi, muteki.external_agents.rpc'
 
 # 6) Tool-awareness map + blackboard skill, baked OUTSIDE the mounted workspace. The
 #    supervisor cp's AGENTS.md/CLAUDE.md into the workspace AFTER the host bind-mount so
@@ -194,7 +222,7 @@ RUN mkdir -p /home/kali/workspace && chown kali:kali /home/kali/workspace && \
 ARG IMAGE_VERSION=dev
 ARG IMAGE_REVISION=unknown
 LABEL org.opencontainers.image.title="muteki-worker-slim" \
-      org.opencontainers.image.description="Slim Ubuntu muteki worker: reverse-connector + 8 container agent CLIs, no full Kali toolchain" \
+      org.opencontainers.image.description="Slim Ubuntu muteki worker: reverse-connector + 10 container agent CLIs, no full Kali toolchain" \
       org.opencontainers.image.version="${IMAGE_VERSION}" \
       org.opencontainers.image.revision="${IMAGE_REVISION}"
 

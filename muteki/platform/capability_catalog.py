@@ -631,17 +631,35 @@ _TOOL_SPECS: tuple[CapabilityToolSpec, ...] = (
     ),
     # -- 对话子 Agent（Muteki 自管；子对话是独立 Thread） -------------------------
     CapabilityToolSpec(
+        name="muteki_subagent_runtimes",
+        description=(
+            "查询聊天子代理可选的真实 provider/Runtime、凭据引用、模型、支持的 effort 和权限。"
+            "可按 engine 筛选；不返回秘密，不猜测模型能力或价格，不触发付费推理。"
+            "跨 provider 委派前先查询，使用 available=true 的接入；目录缺失时请用户在设置中刷新。"
+        ),
+        target_kind=ToolTargetKind.QUERY,
+        query_type="conversation.subagent.runtimes",
+        aggregate_type="thread",
+        aggregate_from_caller_thread=True,
+        input_schema={
+            "type": "object",
+            "properties": {"engine": {"type": "string", "description": "可选：provider id，如 codex / claude"}},
+            "additionalProperties": False,
+        },
+    ),
+    CapabilityToolSpec(
         name="muteki_spawn_subagent",
         description=(
             "创建一个由 Muteki 管理的子 Agent：新建一个与当前对话关联的子对话"
             "并把 prompt 作为它的第一条消息发出。子 Agent 看不到当前对话历史，"
-            "prompt 必须自包含目标、已知事实、约束和期望的产出。默认继承当前"
+            "prompt 必须自包含目标、已知事实、精确范围、约束和报告格式；长任务填写"
+            "acceptance_criteria 与 routing_reason。completed 仅代表执行结束，主代理仍需独立验收。默认继承当前"
             "对话的引擎、凭据、模型、effort 与访问模式；访问模式不能高于当前"
             "对话。isolation=worktree 时在 Muteki 托管目录为子 Agent 新建 Git "
             "worktree（基于当前 HEAD，不含未提交改动）。wait=true 时最多等待 "
             "timeout_seconds，返回最终回复全文；超时返回 wait.outcome=pending，"
             "之后用 muteki_subagent_status 查询。层级上限与每个根对话的并发上限"
-            "超出时返回带稳定 code 的错误。"
+            "超出时返回带稳定 code 的错误。返回的 conversation_url 是可直接打开的子会话链接，不要猜域名或端口。"
         ),
         target_kind=ToolTargetKind.COMMAND,
         command_type="conversation.subagent.spawn",
@@ -653,6 +671,10 @@ _TOOL_SPECS: tuple[CapabilityToolSpec, ...] = (
                 "prompt": {"type": "string", "minLength": 1,
                            "description": "子 Agent 的完整任务说明（自包含）"},
                 "title": {"type": "string", "description": "可选：子对话标题"},
+                "acceptance_criteria": {"type": "string", "minLength": 1,
+                                        "description": "验收条件：检查命令、预期退出码及人工检查项；会完整交付子代理并在 UI 展示"},
+                "routing_reason": {"type": "string", "minLength": 1,
+                                   "description": "为何该 provider/模型/effort 适合这项任务；不要臆测价格或能力排名"},
                 "engine": {"type": "string",
                            "description": "可选：引擎 id（如 codex / claude）；省略时继承当前对话"},
                 "adapter_id": {"type": "string",
@@ -700,6 +722,31 @@ _TOOL_SPECS: tuple[CapabilityToolSpec, ...] = (
                 "wait_seconds": {"type": "number", "minimum": 0,
                                  "description": "可选：与 subagent_id 同用，最多等待其结束的秒数"},
             },
+            "additionalProperties": False,
+        },
+    ),
+    CapabilityToolSpec(
+        name="muteki_subagent_send",
+        description=(
+            "在当前对话的一个已结束的直接子代理会话中继续发送任务或修正说明，沿用其会话上下文，"
+            "不新建子代理、不更换 provider/model/effort。prompt 写明聚焦的反馈和验收要求。"
+            "仍在执行、已取消、已归档或队列待处理时明确报错。wait=true 可有界等待，"
+            "pending 不代表完成；重试相同投递时复用 idempotency_key。"
+        ),
+        target_kind=ToolTargetKind.COMMAND,
+        command_type="conversation.subagent.send",
+        aggregate_type="thread",
+        aggregate_from_caller_thread=True,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "subagent_id": {"type": "string", "minLength": 1},
+                "prompt": {"type": "string", "minLength": 1},
+                "wait": {"type": "boolean", "default": False},
+                "timeout_seconds": {"type": "number", "exclusiveMinimum": 0},
+                "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 200},
+            },
+            "required": ["subagent_id", "prompt"],
             "additionalProperties": False,
         },
     ),
@@ -993,6 +1040,127 @@ _TOOL_SPECS: tuple[CapabilityToolSpec, ...] = (
             artifact_path=("可选：来源产物路径", False),
         ),
     ),
+    # -- SRC 赏金工作台（Task 身份从调用方 Binding 的 Thread 反解） -------------
+    CapabilityToolSpec(
+        name="muteki_list_src_tasks",
+        description="列出当前可信身份可读的 SRC 长期任务及其主 Thread、Run 数量和来源水位。",
+        target_kind=ToolTargetKind.QUERY, query_type="src.task.list",
+        input_schema=_props(),
+    ),
+    CapabilityToolSpec(
+        name="muteki_get_src_task",
+        description="读取当前 SRC Task 的目标、授权输入、主 Thread 和投影水位。",
+        target_kind=ToolTargetKind.QUERY, query_type="src.task.get",
+        aggregate_type="thread", aggregate_from_caller_thread=True,
+        input_schema=_props(),
+    ),
+    CapabilityToolSpec(
+        name="muteki_list_src_runs",
+        description="列出当前 SRC Task 绑定的全部 Pentest Run 及双向绑定、目标和快照。",
+        target_kind=ToolTargetKind.QUERY, query_type="src.run.list",
+        aggregate_type="thread", aggregate_from_caller_thread=True,
+        input_schema=_props(),
+    ),
+    CapabilityToolSpec(
+        name="muteki_ensure_src_run",
+        description="为当前 SRC Task 幂等取得或创建一个具体 URL 的深入 Run；公司名或搜索候选不是有效目标。",
+        target_kind=ToolTargetKind.COMMAND, command_type="src.run.ensure",
+        aggregate_type="thread", aggregate_from_caller_thread=True,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "target_url": {"type": "string", "description": "完整 http(s) 目标 URL"},
+                "question": {"type": "string", "description": "此 Run 要回答的具体研究问题"},
+                "binding_key": {"type": "string", "description": "稳定深入目标键；续跑复用"},
+                "binding_revision": {"type": "integer", "minimum": 1},
+                "plan_ref": {"type": "string"}, "authorization_ref": {"type": "string"},
+                "evidence_refs": {"type": "array", "items": {"type": "string"}},
+                "identity": {"type": "object"}, "object_state": {"type": "object"},
+                "budget": {"type": "object"}, "target_version": {"type": "string"},
+                "source_message_id": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["target_url", "question"], "additionalProperties": True,
+        },
+    ),
+    CapabilityToolSpec(
+        name="muteki_list_src_records",
+        description="按 kind 读取当前 SRC Task 的持久记录；控制面记录仍受服务端权限限制。",
+        target_kind=ToolTargetKind.QUERY, query_type="src.record.list",
+        aggregate_type="thread", aggregate_from_caller_thread=True,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string"}, "parent_id": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100},
+                "cursor": {"type": "string", "description": "上一页 next_cursor；必须沿用原筛选"},
+                "after_cursor": {"type": "string", "description": "cursor 的兼容别名"},
+            },
+        },
+    ),
+    CapabilityToolSpec(
+        name="muteki_get_src_record",
+        description="按 kind 和 record_id 读取当前 SRC Task 的一条完整持久记录。",
+        target_kind=ToolTargetKind.QUERY, query_type="src.record.get",
+        aggregate_type="thread", aggregate_from_caller_thread=True,
+        input_schema=_props(kind=("记录类型", True), record_id=("记录 ID", True)),
+    ),
+    CapabilityToolSpec(
+        name="muteki_start_src_run",
+        description="启动当前 SRC Task 已绑定 Run 的标准 Pentest 执行器；目标默认使用冻结契约，续跑使用原 Run。",
+        target_kind=ToolTargetKind.COMMAND, command_type="src.run.start",
+        aggregate_type="thread", aggregate_from_caller_thread=True,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "description": "muteki_ensure_src_run 返回的 Run ID"},
+                "target_url": {"type": "string", "description": "可选，必须与冻结契约一致"},
+                "prompt": {"type": "string"}, "goal": {"type": "string"},
+                "scope": {"type": "string"}, "idempotency_key": {"type": "string"},
+            },
+            "required": ["run_id"], "additionalProperties": True,
+        },
+    ),
+    CapabilityToolSpec(
+        name="muteki_get_src_policy",
+        description="读取当前 SRC Task 的有效执行策略、授权目标、排除项、规则与版本。",
+        target_kind=ToolTargetKind.QUERY, query_type="src.policy.current",
+        aggregate_type="thread", aggregate_from_caller_thread=True,
+        input_schema=_props(),
+    ),
+    CapabilityToolSpec(
+        name="muteki_get_src_execution_capabilities",
+        description="读取当前 Task 各执行通道的真实环境 generation 与覆盖能力，不把声明当强制保护。",
+        target_kind=ToolTargetKind.QUERY, query_type="src.execution.capabilities",
+        aggregate_type="thread", aggregate_from_caller_thread=True,
+        input_schema=_props(),
+    ),
+    CapabilityToolSpec(
+        name="muteki_get_src_execution_receipt",
+        description="按 invocation_id 读取策略决定、审批等待、真实下发、完成或 outcome_unknown 回执。",
+        target_kind=ToolTargetKind.QUERY, query_type="src.execution.receipt",
+        aggregate_type="thread", aggregate_from_caller_thread=True,
+        input_schema=_props(invocation_id=("执行调用 ID", True)),
+    ),
+    CapabilityToolSpec(
+        name="muteki_workbench_suggestion_propose",
+        description="向工作台提出一项变更建议（src.workbench.suggestion.propose）。只记录建议数据，由操作者决定是否采纳；不要自行应用变更。",
+        target_kind=ToolTargetKind.COMMAND,
+        command_type="src.workbench.suggestion.propose",
+        aggregate_type="task",
+        aggregate_arg="task_id",
+        input_schema={
+            "type": "object", "required": ["kind", "proposal"],
+            "properties": {
+                "kind": {"type": "string", "enum": ["classify", "new_finding", "merge", "conflict_resolve", "plan_update", "report_draft", "retest_record"],
+                         "description": "建议类型"},
+                "proposal": {"type": "object", "description": "建议内容（按 kind 的结构化字段，如 finding_id/asset_id/report_id/primary_id/member_ids/chosen_value/summary/sections/verdict）"},
+                "rationale": {"type": "string", "description": "给出建议的理由"},
+                "turn_id": {"type": "string", "description": "关联的对话轮次 id（可选）"},
+                "source_message_id": {"type": "string", "description": "关联的消息 id（可选）"},
+            },
+        },
+    ),
     # -- 管理模式（Runtime / Profile / 全局运行管理） -------------------------
     CapabilityToolSpec(
         name="muteki_list_runtime_instances",
@@ -1011,6 +1179,98 @@ _TOOL_SPECS: tuple[CapabilityToolSpec, ...] = (
         input_schema=_props(),
     ),
 )
+
+
+def _src_agent_command_spec(operation: str) -> CapabilityToolSpec:
+    name = "muteki_" + operation.removeprefix("src.").replace(".", "_")
+    return CapabilityToolSpec(
+        name=name,
+        description=(
+            f"在当前可信 SRC Task 执行 {operation}。输入使用该领域版本化契约；"
+            "服务端重新校验身份、参数、授权与执行策略，不允许跨 Task 或修改控制面。"
+        ),
+        target_kind=ToolTargetKind.COMMAND, command_type=operation,
+        aggregate_type="thread", aggregate_from_caller_thread=True,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "idempotency_key": {"type": "string", "description": "可选：同一次逻辑操作的稳定幂等键"},
+            },
+            "additionalProperties": True,
+        },
+    )
+
+
+_SRC_AGENT_DOMAIN_OPERATIONS = (
+    "src.exchange.record", "src.exchange.draft.save", "src.exchange.draft.execute",
+    "src.research.plan.save", "src.research.skill.register",
+    "src.research.openapi.ingest", "src.research.javascript.ingest",
+    "src.research.runtime.register", "src.research.dataflow.register",
+    "src.research.page_action.register", "src.research.business.save",
+    "src.research.permission_question.add", "src.research.experiment.record",
+    "src.research.capability_chain.record", "src.research.precondition_trial.record",
+    "src.asset.observe", "src.asset.relate", "src.asset.derive",
+    "src.ingestion.ingest", "src.query.save", "src.vocabulary.save",
+    "src.tag.save", "src.tag.assign", "src.note.save",
+    "src.connector.import", "src.connector.query", "src.connector.repository",
+    "src.report.freeze", "src.report.reproduction.record", "src.submission.export",
+    "src.report.render", "src.review.record",
+    "src.retest.request", "src.retest.dispatch", "src.retest.complete",
+    "src.finding.claim.create", "src.finding.review.record", "src.finding.invalidate",
+    "src.finding.deduplicate", "src.browser.ensure", "src.browser.context.ensure",
+    "src.browser.tab.open", "src.browser.tab.release", "src.browser.screenshot.capture",
+    "src.browser.image.review", "src.browser.execution.record", "src.browser.run.finish",
+    "src.identity.verify", "src.identity.recover", "src.object.lease.acquire",
+    "src.object.lease.release", "src.object.register", "src.object.experiment.begin",
+    "src.object.experiment.after", "src.object.experiment.restore",
+    "src.oast.allocate", "src.oast.poll", "src.oast.expire", "src.oast.health",
+    "src.oast.local.start", "src.stream.websocket.connect", "src.stream.websocket.send",
+    "src.stream.websocket.receive", "src.stream.websocket.acknowledge",
+    "src.stream.websocket.close", "src.stream.sse.connect", "src.stream.sse.read",
+    "src.stream.sse.close",
+)
+_SRC_AGENT_DOMAIN_SPECS = tuple(
+    _src_agent_command_spec(operation) for operation in _SRC_AGENT_DOMAIN_OPERATIONS
+)
+_TOOL_SPECS = (*_TOOL_SPECS, *_SRC_AGENT_DOMAIN_SPECS)
+
+
+def _src_agent_query_spec(operation: str) -> CapabilityToolSpec:
+    return CapabilityToolSpec(
+        name="muteki_" + operation.removeprefix("src.").replace(".", "_"),
+        description=f"读取当前可信 SRC Task 的 {operation} 投影；包含真实来源、版本、完整性与错误状态。",
+        target_kind=ToolTargetKind.QUERY, query_type=operation,
+        aggregate_type="thread", aggregate_from_caller_thread=True,
+        input_schema={"type": "object", "additionalProperties": True},
+    )
+
+
+_SRC_AGENT_QUERY_OPERATIONS = (
+    "src.exchange.query", "src.exchange.read", "src.exchange.draft.read",
+    "src.exchange.compare", "src.exchange.export", "src.research.records",
+    "src.research.record.get", "src.research.plan.current", "src.research.skill.read",
+    "src.research.openapi.read", "src.research.openapi.compare",
+    "src.research.javascript.read", "src.research.backlog", "src.research.history",
+    "src.research.precondition.summary", "src.asset.detail", "src.asset.published",
+    "src.asset.query", "src.asset.saved_query.read", "src.asset.full_text",
+    "src.asset.pivot", "src.asset.export", "src.report.get", "src.report.list",
+    "src.report.templates", "src.artifact.read",
+    "src.feedback.diff", "src.feedback.platform_status", "src.feedback.history",
+    "src.finding.claims", "src.finding.claim.get", "src.finding.reviews",
+    "src.finding.status", "src.finding.deduplications", "src.connector.manifests",
+    "src.connector.manifest", "src.connector.config", "src.monitor.get",
+    "src.monitor.list", "src.monitor.changes", "src.monitor.notifications",
+    "src.retest.recover", "src.identity.get", "src.identity.verifications",
+    "src.identity.compare", "src.object.history", "src.oast.events",
+    "src.stream.export", "src.knowledge.search", "src.knowledge.read",
+    "src.knowledge.source.read", "src.knowledge.history", "src.browser.service",
+    "src.browser.context", "src.browser.generation", "src.browser.image.read",
+    "src.inspection.requests",
+)
+_SRC_AGENT_QUERY_SPECS = tuple(
+    _src_agent_query_spec(operation) for operation in _SRC_AGENT_QUERY_OPERATIONS
+)
+_TOOL_SPECS = (*_TOOL_SPECS, *_SRC_AGENT_QUERY_SPECS)
 
 
 class CapabilityCatalog:
@@ -1103,8 +1363,10 @@ _SINGLE_TASK_TOOLS: tuple[str, ...] = (
 )
 
 #: Muteki 自管子 Agent：子 Agent 本身是 conversation Thread，所以只在对话模式提供。
-_SUBAGENT_TOOLS: tuple[str, ...] = (
+SUBAGENT_TOOLS: tuple[str, ...] = (
+    "muteki_subagent_runtimes",
     "muteki_spawn_subagent",
+    "muteki_subagent_send",
     "muteki_subagent_status",
     "muteki_subagent_cancel",
 )
@@ -1112,7 +1374,7 @@ _SUBAGENT_TOOLS: tuple[str, ...] = (
 #: conversation：普通聊天也可以直接下发和控制一个单题任务。这样 Agent 不必
 #: 切换到单题页面、读取 sessions 或绕过能力网关；在 single_task 范围之外只
 #: 增加子 Agent 工具，故意不带任何比赛平台或全局管理工具。
-_CONVERSATION_TOOLS: tuple[str, ...] = (*_SINGLE_TASK_TOOLS, *_SUBAGENT_TOOLS)
+_CONVERSATION_TOOLS: tuple[str, ...] = (*_SINGLE_TASK_TOOLS, *SUBAGENT_TOOLS)
 
 #: 2026-08-29 之前 conversation 的产品默认工具。仅用于把当时由产品自动
 #: 签发的 Binding 迁移到新的对话控制集合；它不代表用户手工自定义的工具集。
@@ -1158,9 +1420,26 @@ _MANAGEMENT_TOOLS: tuple[str, ...] = (
     "muteki_list_worker_profiles",
 )
 
+_SRC_TOOLS: tuple[str, ...] = (
+    *_CONVERSATION_TOOLS,
+    "muteki_list_src_tasks",
+    "muteki_get_src_task",
+    "muteki_list_src_runs",
+    "muteki_ensure_src_run",
+    "muteki_list_src_records",
+    "muteki_get_src_record",
+    "muteki_start_src_run",
+    "muteki_get_src_policy",
+    "muteki_get_src_execution_capabilities",
+    "muteki_get_src_execution_receipt",
+    *(spec.name for spec in _SRC_AGENT_DOMAIN_SPECS),
+    *(spec.name for spec in _SRC_AGENT_QUERY_SPECS),
+)
+
 #: 模式 → 默认工具集合。
 MODE_TOOL_TEMPLATES: dict[ThreadMode, tuple[str, ...]] = {
     ThreadMode.CONVERSATION: _CONVERSATION_TOOLS,
+    ThreadMode.SRC: _SRC_TOOLS,
     ThreadMode.SINGLE_TASK: _SINGLE_TASK_TOOLS,
     ThreadMode.COMPETITION: _COMPETITION_TOOLS,
     ThreadMode.MANAGEMENT: _MANAGEMENT_TOOLS,
@@ -1170,6 +1449,7 @@ MODE_TOOL_TEMPLATES: dict[ThreadMode, tuple[str, ...]] = {
 # 精确元组，因此继续按原集合执行；历史默认 Binding 会在下一次 Session
 # 签发时轮换到当前目录和相应 scope，不必让 Agent 回退读取目录或数据库。
 _LEGACY_MODE_TOOL_TEMPLATES: dict[ThreadMode, tuple[tuple[str, ...], ...]] = {
+    ThreadMode.SRC: (),
     ThreadMode.CONVERSATION: (
         (
             "muteki_list_projects",
@@ -1180,6 +1460,8 @@ _LEGACY_MODE_TOOL_TEMPLATES: dict[ThreadMode, tuple[tuple[str, ...], ...]] = {
         _PREVIOUS_CONVERSATION_TOOLS,
         # Product default before subagent tools existed.
         _SINGLE_TASK_TOOLS,
+        # Product default before built-in orchestration and continuations.
+        (*_SINGLE_TASK_TOOLS, "muteki_spawn_subagent", "muteki_subagent_status", "muteki_subagent_cancel"),
     ),
     ThreadMode.SINGLE_TASK: ((
         "muteki_list_projects",
@@ -1267,7 +1549,7 @@ def default_resource_scopes(mode: ThreadMode, thread_id: str) -> list[str]:
     CommandPolicy 里不视为通配，所以这里显式给出。
     """
     thread_scope = f"thread:{thread_id}" if thread_id else "thread:*"
-    if mode is ThreadMode.CONVERSATION:
+    if mode in {ThreadMode.CONVERSATION, ThreadMode.SRC}:
         return [thread_scope, "task:*", "project:*", "run:*"]
     if mode is ThreadMode.SINGLE_TASK:
         return [thread_scope, "task:*", "project:*", "run:*"]
@@ -1314,6 +1596,7 @@ __all__ = [
     "CapabilityToolSpec",
     "DEFAULT_CATALOG",
     "MODE_TOOL_TEMPLATES",
+    "SUBAGENT_TOOLS",
     "ToolTargetKind",
     "default_resource_scopes",
     "resource_scopes_for_tool_set",

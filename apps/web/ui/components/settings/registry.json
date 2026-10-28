@@ -62,7 +62,7 @@
         "发送方式、新对话默认权限、编辑器与 Diff 偏好。",
         "Sending, default permissions, editor and diff preferences."
       ],
-      "keywords": "对话 发送 回车 换行 排队 引导 权限 访问模式 diff 合并 分栏 换行 折叠 标题 chat send enter queue steer permission access diff title",
+      "keywords": "对话 发送 回车 换行 排队 引导 权限 访问模式 diff 合并 分栏 换行 折叠 chat send enter queue steer permission access diff",
       "group": "general",
       "platforms": [
         "web",
@@ -83,13 +83,6 @@
           "methods": [
             "GET",
             "PUT"
-          ]
-        },
-        {
-          "path": "/api/settings/workers",
-          "match": "prefix",
-          "methods": [
-            "GET"
           ]
         }
       ],
@@ -149,10 +142,10 @@
         "Agents and providers"
       ],
       "description": [
-        "管理 Agent 引擎、凭据、模型与新对话默认模型。配置保存在当前连接的服务中。",
-        "Manage Agent engines, credentials, models and the default model for new chats. Settings are stored on the connected service."
+        "选择引擎，查看它的接入方式、模型和价格。配置保存在当前连接的服务中。",
+        "Pick an engine to see its access methods, models and prices. Settings are stored on the connected service."
       ],
-      "keywords": "agent provider runtime adapter 引擎 登录 凭据 模型 默认模型 接入点 API key claude codex cursor",
+      "keywords": "agent provider runtime adapter 引擎 登录 凭据 模型 默认模型 接入点 API key claude codex cursor 价格 定价 pricing price cache tokens cost",
       "wide": true,
       "group": "agent",
       "platforms": [
@@ -196,6 +189,13 @@
           ]
         },
         {
+          "path": "/api/settings/credential-drafts",
+          "match": "prefix",
+          "methods": [
+            "POST"
+          ]
+        },
+        {
           "path": "/api/settings/workers",
           "match": "prefix",
           "methods": [
@@ -217,7 +217,8 @@
           "methods": [
             "GET",
             "PUT",
-            "POST"
+            "POST",
+            "DELETE"
           ]
         }
       ],
@@ -785,20 +786,6 @@
     },
     {
       "page": "chat",
-      "anchor": "chat-title-model",
-      "section": [
-        "新对话",
-        "New chats"
-      ],
-      "label": [
-        "标题生成模型",
-        "Title generation model"
-      ],
-      "keywords": "标题 摘要 titler 生成 模型 title summary model",
-      "storage": "service"
-    },
-    {
-      "page": "chat",
       "anchor": "chat-editor",
       "section": [
         "工作区",
@@ -903,8 +890,8 @@
         "Agent engine"
       ],
       "label": [
-        "凭据与登录",
-        "Credentials and login"
+        "接入方式（登录与凭据）",
+        "Access methods (login and credentials)"
       ],
       "keywords": "凭据 登录 账号 api key token credential login",
       "storage": "service"
@@ -917,8 +904,8 @@
         "Agent engine"
       ],
       "label": [
-        "运行配置、二进制路径与环境变量",
-        "Runtime, binary path and environment"
+        "配置：二进制路径、端点与环境变量",
+        "Config: binary path, endpoint and environment"
       ],
       "keywords": "运行配置 二进制 端点 环境变量 env 传输 runtime binary endpoint environment transport",
       "storage": "service"
@@ -931,11 +918,19 @@
         "Agent engine"
       ],
       "label": [
-        "模型显隐与默认模型",
-        "Hidden and default models"
+        "模型列表、价格与显隐",
+        "Models, prices and visibility"
       ],
       "keywords": "模型 默认模型 隐藏 model default hidden",
       "storage": "ui"
+    },
+    {
+      "page": "agents",
+      "anchor": "model-pricing",
+      "section": ["模型价格", "Model pricing"],
+      "label": ["自定义模型价格与目录映射", "Custom model pricing and catalog mappings"],
+      "keywords": "价格 费用 成本 定价 自定义 缓存 Token pricing price cost tokens cache catalog mapping",
+      "storage": "service"
     },
     {
       "page": "agents",

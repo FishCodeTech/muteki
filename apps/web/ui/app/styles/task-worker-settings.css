@@ -110,7 +110,7 @@
 .single-task-workers .wreview-selection { grid-template-columns: 24px minmax(0, 1fr) 14px; gap: 8px; padding: 8px; border-radius: 7px; }
 .single-task-workers .wreview-engine { width: 24px; height: 28px; border: 0; }
 .single-task-workers .wreview-selection strong { font-size: 12px; }
-.single-task-workers .wreview-selection em { grid-column: 2; grid-row: 2; justify-self: start; padding: 2px 6px; font-size: 10px; }
+.single-task-workers .wreview-selection em { grid-column: 2; grid-row: 2; justify-self: start; padding: 2px 6px; font-size: 11px; }
 .single-task-workers .wreview-selection > svg:last-child { grid-column: 3; grid-row: 1 / 3; }
 .single-task-workers .wreview-slot-state { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
 .single-task-workers .wroster-note { margin-top: 18px; font-size: 11px; color: var(--muted); }
@@ -276,6 +276,9 @@
   display: inline-flex; grid-template-columns: none; width: max-content; gap: 0;
 }
 .single-task-workers .wsettings-page .wset-switch-row > .switch { justify-self: end; }
+.single-task-workers .switch .switch__control { border: 1px solid var(--line); box-shadow: inset 0 0 0 1px var(--line2, #cdd3dc); }
+.single-task-workers .switch__thumb { box-shadow: 0 1px 2px rgba(0,0,0,.2); }
+.single-task-workers .wsettings-page small { font-size: 11px; text-wrap: pretty; word-break: keep-all; }
 .single-task-workers .wreview-slot { padding: 0; overflow: hidden; }
 .single-task-workers .wreview-selection { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; padding: 14px; border: 0; border-radius: 9px; background: transparent; }
 .single-task-workers .wreview-slot-copy { width: 100%; gap: 8px; }
@@ -357,7 +360,7 @@
 .single-task-workers .wruntime-image-card .wruntime-image-check .chip { justify-self: start; max-width: 100%; height: auto; white-space: normal; overflow-wrap: anywhere; }
 .single-task-workers .wruntime-image-card .wruntime-card-foot { flex-direction: column; align-items: stretch; padding: 16px 22px; gap: 12px; }
 .single-task-workers .wruntime-image-card .wruntime-card-foot button { width: 100%; }
-.single-task-workers .wruntime-image-card .wruntime-card-foot-hint { display: block; text-align: center; font-size: 10px; }
+.single-task-workers .wruntime-image-card .wruntime-card-foot-hint { display: block; text-align: center; font-size: 11px; }
 
 .single-task-workers .wscheduling-layout { display: grid; max-width: 1160px; margin-inline: auto; gap: 20px; }
 .single-task-workers .wscheduling-card { display: flex; flex-direction: column; gap: 0; padding: 0; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); box-shadow: none; overflow: hidden; }
@@ -378,16 +381,18 @@
 .single-task-workers .wscheduling-field + .wscheduling-field { border-left: 1px solid var(--line); padding-left: 24px; }
 .single-task-workers .wscheduling-field > label { display: grid; gap: 12px; min-width: 0; }
 .single-task-workers .wscheduling-field > label > span { font-size: 12px; color: var(--text); }
-.single-task-workers .wscheduling-field > small { font-size: 11px; color: var(--muted); line-height: 1.55; }
+.single-task-workers .wscheduling-field > small { font-size: 11px; color: var(--muted); line-height: 1.55; grid-column: 1 / -1; }
 .single-task-workers .wscheduling-field .wset-switch-row { min-height: 36px; }
 .single-task-workers .wscheduling-field .num-field { width: 100%; }
 .single-task-workers .wscheduling-layout > .wsettings-inline-note { max-width: none; }
+.single-task-workers .wscheduling-card .wsettings-inline-note { max-width: none; width: 100%; grid-column: 1 / -1; }
 
 .single-task-workers .wmodels-layout { display: grid; grid-template-columns: 232px minmax(0, 1fr); padding: 0; overflow: hidden; }
 .single-task-workers .wmodels-profile-nav { min-width: 0; display: flex; flex-direction: column; gap: 18px; padding: 24px 16px; background: var(--panel2); border-right: 1px solid var(--line); overflow: auto; }
 .single-task-workers .wmodels-profile-nav h2 { margin: 0 8px; font-size: 12px; color: var(--muted); font-weight: 550; }
 .single-task-workers .wmodels-profile-nav nav { display: grid; gap: 8px; }
-.single-task-workers .wmodels-profile-nav nav button { display: flex; align-items: center; justify-content: flex-start; gap: 10px; width: 100%; min-height: 72px; padding: 12px; border: 1px solid transparent; border-radius: 9px; background: transparent; text-align: left; }
+.single-task-workers .wmodels-profile-nav nav button { display: flex; align-items: center; justify-content: flex-start; gap: 10px; width: 100%; min-height: 52px !important; height: auto !important; padding: 8px 12px !important; line-height: 1.35; border: 1px solid transparent; border-radius: 9px; background: transparent; text-align: left; }
+.single-task-workers .wmodels-profile-nav nav button > span { padding: 8px 0; }
 .single-task-workers .wmodels-profile-nav nav button > span { display: grid; gap: 5px; flex: 1; min-width: 0; }
 .single-task-workers .wmodels-profile-nav nav button strong { font-size: 13px; font-weight: 600; }
 .single-task-workers .wmodels-profile-nav nav button small { font-size: 11px; color: var(--muted); }

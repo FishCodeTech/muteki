@@ -2,7 +2,7 @@
 
 import type { LargePasteSelection } from "@/lib/composerLargePasteKeep";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { motion } from "motion/react";
 import { cn } from "@/lib/cn";
 import { Icon, type IconName } from "../Icon";
@@ -10,6 +10,7 @@ import { Tooltip, useReducedMotion } from "@/components/chat/ui";
 import { PromptBar, type PromptBarAttachment } from "../ai-native/prompt-bar";
 import { ConversationModelPicker } from "./ConversationModelPicker";
 import { ConversationComposerModes } from "./ConversationComposerModes";
+import { allCredentialModels } from "@/lib/useConversation";
 import { ComposerContextStrip } from "./ComposerContextStrip";
 import type {
   ConversationCredential,
@@ -26,6 +27,12 @@ import { ConversationReadinessBanner } from "./ConversationReadinessBanner";
 import { documentFromPromptAndRefs, type PromptDocument } from "@/lib/composerContextDoc";
 
 export interface ConversationHomeProps {
+  title?: string;
+  subtitle?: string;
+  placeholder?: string;
+  suggestions?: ConversationHomeSuggestion[];
+  hideWorkspaceControls?: boolean;
+  hideReadinessGuide?: boolean;
   prompt: string;
   onPromptChange: (val: string) => void;
   promptDocument?: PromptDocument;
@@ -40,6 +47,10 @@ export interface ConversationHomeProps {
   selectedAccessMode: string;
   accessModes?: string[];
   accessModeReason?: string;
+  effortOpen?: boolean;
+  onEffortOpenChange?: (open: boolean) => void;
+  accessOpen?: boolean;
+  onAccessOpenChange?: (open: boolean) => void;
   interactionMode?: "default" | "plan";
   planModeAvailable?: boolean;
   planModeReason?: string;
@@ -106,7 +117,14 @@ export interface ConversationHomeProps {
   onModelPickerOpenChange?: (open: boolean) => void;
 }
 
-const SUGGESTIONS: Array<{ icon: IconName; label: string; prompt: string; workspace?: boolean }> = [
+export interface ConversationHomeSuggestion {
+  icon: IconName;
+  label: string;
+  prompt: string;
+  workspace?: boolean;
+}
+
+const SUGGESTIONS: ConversationHomeSuggestion[] = [
   { icon: "gitCompare", label: "审查当前改动", prompt: "审查当前工作区的未提交改动，指出潜在问题并给出修改建议。", workspace: true },
   { icon: "book", label: "解释这个项目", prompt: "阅读这个项目，概述它的架构、关键模块和运行方式。", workspace: true },
   { icon: "wrench", label: "修复失败的测试", prompt: "运行测试，定位失败原因并修复，完成后再次验证。", workspace: true },
@@ -122,6 +140,12 @@ function greeting(hour: number): string {
 }
 
 export function ConversationHome({
+  title,
+  subtitle,
+  placeholder = "描述你想完成的任务",
+  suggestions = SUGGESTIONS,
+  hideWorkspaceControls = false,
+  hideReadinessGuide = false,
   prompt,
   onPromptChange,
   promptDocument,
@@ -136,6 +160,7 @@ export function ConversationHome({
   selectedAccessMode,
   accessModes = [],
   accessModeReason = "",
+  effortOpen, onEffortOpenChange, accessOpen, onAccessOpenChange,
   interactionMode = "default",
   planModeAvailable = false,
   planModeReason = "",
@@ -196,6 +221,8 @@ export function ConversationHome({
   onModelPickerOpenChange,
 }: ConversationHomeProps) {
   const reduced = useReducedMotion();
+  const selectedCredential = credentials.find((row) => row.id === selectedCredentialId);
+  const modelMetadata = selectedCredential ? allCredentialModels(selectedCredential).find((row) => row.id === selectedModel) : undefined;
   const [hello, setHello] = useState("你好");
   useEffect(() => setHello(greeting(new Date().getHours())), []);
   const reveal = (delay: number) => (reduced
@@ -204,25 +231,26 @@ export function ConversationHome({
       initial: { opacity: 0, y: 10, filter: "blur(4px)" },
       animate: { opacity: 1, y: 0, filter: "blur(0px)", transition: { duration: 0.42, delay, ease: [0.16, 1, 0.3, 1] as const } },
     });
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const applySuggestion = (text: string) => {
     if (onPromptDocumentChange) onPromptDocumentChange(documentFromPromptAndRefs(text, []));
     else onPromptChange(text);
     window.requestAnimationFrame(() => {
-      const composer = document.querySelector<HTMLElement>("[data-c34-composer]");
+      const composer = rootRef.current?.querySelector<HTMLElement>("[data-c34-composer]");
       composer?.focus();
     });
   };
   const composerEmpty = !prompt.trim() && !attachments.length;
 
   return (
-    <div className={cn("cx-scroll flex min-h-0 flex-1 flex-col items-center overflow-y-auto px-4", className)}>
+    <div ref={rootRef} className={cn("cx-scroll flex min-h-0 flex-1 flex-col items-center overflow-y-auto px-4", className)}>
       <div className="flex w-full max-w-[var(--dsh-composer-card-max-width,752px)] flex-1 flex-col items-center justify-center gap-8 pb-[12vh] pt-10">
         <motion.div className="flex flex-col items-center gap-2 text-center" {...reveal(0)}>
-          <h1 className="text-[28px] font-semibold leading-9 text-cx-fg">{hello}，想让 Agent 做点什么？</h1>
-          <p className="text-[14px] text-cx-fg-3">{selectedProjectId ? "描述任务，Agent 可使用已选择的工作区执行并汇报。" : "描述任务即可开始普通聊天。读取文件、审查代码和终端操作需要先选择工作目录。"}</p>
+          <h1 className="text-[28px] font-semibold leading-9 text-cx-fg">{title ?? `${hello}，想让 Agent 做点什么？`}</h1>
+          <p className="text-[14px] text-cx-fg-3">{subtitle ?? (selectedProjectId ? "描述任务，Agent 可使用已选择的工作区执行并汇报。" : "描述任务即可开始普通聊天。读取文件、审查代码和终端操作需要先选择工作目录。")}</p>
         </motion.div>
 
-        {readiness && onRetryReadiness && onProbeAgent && onDismissGuide ? (
+        {!hideReadinessGuide && readiness && onRetryReadiness && onProbeAgent && onDismissGuide ? (
           <ConversationReadinessBanner
             readiness={readiness}
             probing={probing}
@@ -241,7 +269,7 @@ export function ConversationHome({
             onPromptDocumentChange={onPromptDocumentChange}
             onSubmit={onSubmit}
             busy={busy}
-            placeholder="描述你想完成的任务"
+            placeholder={placeholder}
             attachments={attachments}
             onAddAttachment={onAddAttachment}
             onAddFiles={onAddFiles}
@@ -262,6 +290,13 @@ export function ConversationHome({
               <ConversationComposerModes
                 selectedCredentialId={selectedCredentialId}
                 selectedModel={selectedModel}
+                selectedModelMetadata={modelMetadata}
+                selectedEffort={selectedEffort}
+                selectedServiceTier={selectedServiceTier}
+                effortOpen={effortOpen}
+                onEffortOpenChange={onEffortOpenChange}
+                accessOpen={accessOpen}
+                onAccessOpenChange={onAccessOpenChange}
                 selectedAccessMode={selectedAccessMode}
                 accessModes={accessModes}
                 accessModeReason={accessModeReason}
@@ -279,6 +314,7 @@ export function ConversationHome({
                   selectedCredentialId={selectedCredentialId}
                   selectedModel={selectedModel}
                   selectedEffort={selectedEffort}
+                  separateEffortControl
                   selectedServiceTier={selectedServiceTier}
                   runtimes={runtimes}
                   runtimeKey={runtimeKey}
@@ -290,7 +326,7 @@ export function ConversationHome({
                   open={modelPickerOpen}
                   onOpenChange={onModelPickerOpenChange}
                 />
-                {selectedProjectId ? (
+                {!hideWorkspaceControls && selectedProjectId ? (
                   <div className="flex items-center gap-0.5">
                     {projectHasDefault ? (
                       <>
@@ -339,7 +375,7 @@ export function ConversationHome({
               </div>
             }
           />
-          <ComposerContextStrip
+          {!hideWorkspaceControls ? <ComposerContextStrip
             projects={projects}
             selectedProjectId={selectedProjectId}
             onProjectChange={onProjectChange}
@@ -361,7 +397,7 @@ export function ConversationHome({
             onWorktreeBranchChange={onWorktreeBranchChange}
             existingWorktreePath={existingWorktreePath}
             onExistingWorktreePathChange={onExistingWorktreePathChange}
-          />
+          /> : null}
         </motion.div>
 
         <motion.div
@@ -369,7 +405,7 @@ export function ConversationHome({
           aria-hidden={!composerEmpty || undefined}
           {...reveal(0.12)}
         >
-          {SUGGESTIONS.map((item) => (
+          {suggestions.map((item) => (
             <button
               key={item.label}
               type="button"

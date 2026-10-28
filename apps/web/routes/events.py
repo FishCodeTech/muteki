@@ -159,7 +159,8 @@ def register(app: FastAPI) -> None:
             if (fresh and not live
                     and last_lifecycle in (
                         "run.preparing", "run.started", "run.reopened")):
-                replayed_seq = max(replayed_seq, run.store.last_stream_seq(run_id)) + 1
+                durable_seq = await asyncio.to_thread(run.store.last_stream_seq, run_id)
+                replayed_seq = max(replayed_seq, durable_seq) + 1
                 synth = Event(
                     event_type=EventType.RUN_FINISHED, run_id=run_id,
                     seq=replayed_seq,

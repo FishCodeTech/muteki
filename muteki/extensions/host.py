@@ -18,6 +18,8 @@ Extension Host 不执行模型调用和 Agent Loop，也不加载第三方任意
 
 from __future__ import annotations
 
+from muteki.core.blocking import run_blocking
+
 import asyncio
 import logging
 import os
@@ -155,8 +157,8 @@ class ExtensionProcess:
         env = self._build_env(secrets)
         command = list(self.manifest.entrypoints.command)
         try:
-            self._isolation = build_isolation_plan(
-                self.manifest,
+            self._isolation = await run_blocking(
+                build_isolation_plan, self.manifest,
                 command,
                 package_dir=self.package_dir,
                 state_dir=self.state_dir,
@@ -371,13 +373,16 @@ class ExtensionProcess:
         path = log_dir / f"{self.manifest.version}-{int(time.time())}.log"
         try:
             with path.open("a", encoding="utf-8") as handle:
+                def _write_log(text: str) -> None:
+                    handle.write(text)
+                    handle.flush()
+
                 while True:
                     line = await stream.readline()
                     if not line:
                         break
                     text = line.decode("utf-8", errors="replace")
-                    handle.write(text)
-                    handle.flush()
+                    await run_blocking(_write_log, text)
         except asyncio.CancelledError:
             raise
         except OSError:

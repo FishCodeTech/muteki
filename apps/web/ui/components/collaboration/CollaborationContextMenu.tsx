@@ -3,7 +3,7 @@
 import { Dropdown } from "@heroui/react";
 
 import { Icon } from "@/components/Icon";
-import { COORDINATOR_ID, DECISION_ID, INPUT_SOURCE_ID } from "@/lib/agentCollaboration";
+import { COORDINATOR_ID, DECISION_ID, CHALLENGER_ID, INPUT_SOURCE_ID } from "@/lib/agentCollaboration";
 import { copyToClipboard } from "@/lib/clipboard";
 import { useT } from "@/lib/i18n";
 
@@ -34,7 +34,7 @@ export function CollaborationContextMenu({
 }) {
   const t = useT();
   const nodeId = menu.nodeId;
-  const isWorker = !!nodeId && ![COORDINATOR_ID, DECISION_ID, INPUT_SOURCE_ID].includes(nodeId);
+  const isWorker = !!nodeId && ![COORDINATOR_ID, DECISION_ID, CHALLENGER_ID, INPUT_SOURCE_ID].includes(nodeId);
   const label = nodeId ? t("collab.menu.agent") : t("collab.menu.canvas");
 
   return (

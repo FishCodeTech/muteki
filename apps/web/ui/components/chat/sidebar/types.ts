@@ -29,6 +29,10 @@ export interface NavItem {
   pendingNote?: string;
   errorText?: string;
   queueCount?: number;
+  /** Subagent descendants still waiting or running, while the row itself may be idle. */
+  agentsActive?: number;
+  /** Every subagent descendant this conversation delegated to. */
+  agentsTotal?: number;
   /** Snooze ended (or ended early) and the thread has not been opened since. */
   woke?: boolean;
   snoozedUntil?: number;
@@ -122,6 +126,7 @@ export interface SidebarBulkActions {
 }
 
 export interface SidebarNavProps {
+  labels?: { title?: string; newThread?: string; search?: string; thread?: string };
   projectFilter?: SidebarProjectFilter;
   bulkActions?: SidebarBulkActions;
   sections: NavSection[];

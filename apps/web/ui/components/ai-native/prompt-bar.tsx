@@ -10,12 +10,12 @@
  * reasoning intensity, permission mode, attachments, workspace pill, and stop/send states.
  * ───────────────────────────────────────────────────────── */
 
-import React, { useCallback, useEffect, useId, useRef, useState } from "react";
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { cn } from "@/lib/cn";
 import { isSendChord, useChatPreferences, type SendKey } from "@/lib/chatPreferences";
 import { isMacPlatform } from "@/lib/shortcutBindings";
-import { Icon } from "../Icon";
+import { Icon, type IconName } from "../Icon";
 import {
   Callout,
   IconButton,
@@ -80,6 +80,11 @@ export interface PromptBarAttachment {
   uploadProgress?: number;
 }
 
+const COMPOSER_LAYOUT_TRANSITION = {
+  duration: 0.32,
+  ease: [0.32, 0.72, 0, 1] as const,
+};
+
 export interface ModelOption {
   id: string;
   label: string;
@@ -87,6 +92,30 @@ export interface ModelOption {
   group?: string;
   reasoningLevels?: string[];
   defaultEffort?: string;
+}
+
+export interface ComposerLocalMentionItem {
+  id: string;
+  label: string;
+  description?: string;
+  section: string;
+  icon?: IconName;
+}
+
+/** Host-side `@` catalog. Picking an item removes the typed `@query` and hands the item to the host. */
+export interface ComposerLocalMentions {
+  title: string;
+  scopeLabel?: string;
+  emptyLabel?: string;
+  search: (query: string) => ComposerLocalMentionItem[];
+  onSelect: (item: ComposerLocalMentionItem) => void;
+}
+
+/** Non-file payloads (custom MIME types) the composer accepts as drops. */
+export interface ComposerCustomDrop {
+  types: string[];
+  label: string;
+  onDrop: (data: DataTransfer) => void;
 }
 
 export interface PromptBarProps {
@@ -141,6 +170,8 @@ export interface PromptBarProps {
   compact?: boolean;
   /** Double-clicking the compact composer asks the host to restore the full layout. */
   onRequestExpand?: () => void;
+  localMentions?: ComposerLocalMentions;
+  customDrop?: ComposerCustomDrop;
 }
 
 interface ActiveComposerToken {
@@ -283,6 +314,8 @@ export function PromptBar({
   stashCount = 0,
   compact = false,
   onRequestExpand,
+  localMentions,
+  customDrop,
 }: PromptBarProps) {
   const rootRef = useRef<HTMLDivElement>(null);
   const cardRef = useRef<HTMLDivElement>(null);
@@ -304,6 +337,7 @@ export function PromptBar({
   const [composing, setComposing] = useState(false);
   const chatPrefs = useChatPreferences();
   const [dragOver, setDragOver] = useState(false);
+  const [customDragOver, setCustomDragOver] = useState(false);
   const [pasteHint, setPasteHint] = useState<string | null>(null);
   const [caretMarkedOffset, setCaretMarkedOffset] = useState(0);
   const useStructuredDoc = Boolean(onPromptDocumentChange);
@@ -347,8 +381,26 @@ export function PromptBar({
     capabilityAdapterId, capabilityInstanceId, capabilityThreadId, capabilityWorkspaceId, capabilityProjectId,
     activeCapabilityTrigger, activeCapabilityQuery, capabilityContext?.revision, pluginRevision,
   ]);
-  const capabilityItems = capabilityResultKey === capabilityQueryKey ? catalogItems : [];
-  const capabilityMenuOpen = Boolean(activeToken && capabilityAdapterId);
+  const runtimeCapabilityItems = capabilityResultKey === capabilityQueryKey ? catalogItems : [];
+  const localMentionActive = Boolean(localMentions && activeCapabilityTrigger === "@");
+  const localMentionItems = useMemo(
+    () => (localMentionActive && localMentions ? localMentions.search(activeCapabilityQuery) : []),
+    [localMentionActive, localMentions, activeCapabilityQuery],
+  );
+  const localMentionById = useMemo(() => new Map(localMentionItems.map((item) => [item.id, item])), [localMentionItems]);
+  const localCatalog = useMemo<ComposerCapabilityItem[]>(() => localMentionItems.map((item) => ({
+    id: item.id,
+    kind: "file",
+    name: item.label,
+    description: item.description ?? "",
+    source: "",
+    scope: "local",
+  })), [localMentionItems]);
+  const capabilityItems = localMentionActive ? localCatalog : runtimeCapabilityItems;
+  const capabilityMenuOpen = Boolean(activeToken && (capabilityAdapterId || localMentionActive));
+  useEffect(() => {
+    if (localMentionActive) setActiveCapabilityIndex(0);
+  }, [localMentionActive, activeCapabilityQuery]);
 
   const editorElement = useCallback(
     () => rootRef.current?.querySelector<HTMLElement>("[data-c34-composer]") ?? null,
@@ -394,7 +446,7 @@ export function PromptBar({
   useEffect(() => {
     setCapabilityError("");
     setCapabilityErrorDiagnostic("");
-    if (!activeCapabilityTrigger || !capabilityAdapterId) {
+    if (!activeCapabilityTrigger || !capabilityAdapterId || localMentionActive) {
       setCapabilityItems([]);
       setCapabilityResultKey("");
       setCapabilitySectionErrors([]);
@@ -464,6 +516,7 @@ export function PromptBar({
     capabilityWorkspaceId,
     capabilityQueryKey,
     capabilityRetry,
+    localMentionActive,
   ]);
 
   const hasBody = useStructuredDoc
@@ -527,6 +580,14 @@ export function PromptBar({
   };
 
   const selectCapabilityItem = (item: ComposerCapabilityItem) => {
+    if (localMentionActive && localMentions) {
+      const picked = localMentionById.get(item.id);
+      replaceActiveToken("");
+      setActiveToken(null);
+      if (picked) localMentions.onSelect(picked);
+      window.requestAnimationFrame(() => editorElement()?.focus());
+      return;
+    }
     if (capabilityResultKey !== capabilityQueryKey || capabilityLoading) return;
     if (capabilityDisabled(item)) {
       setCapabilityError(
@@ -722,21 +783,32 @@ export function PromptBar({
           trigger={capabilityMenuOpen ? activeToken?.trigger ?? null : null}
           adapterId={capabilityAdapterId}
           items={capabilityItems}
-          loading={capabilityLoading}
-          error={capabilityError}
-          errorDiagnostic={capabilityErrorDiagnostic}
-          onRetry={() => setCapabilityRetry((revision) => revision + 1)}
-          sectionErrors={capabilitySectionErrors}
-          runtime={capabilityRuntime}
+          loading={localMentionActive ? false : capabilityLoading}
+          error={localMentionActive ? "" : capabilityError}
+          errorDiagnostic={localMentionActive ? "" : capabilityErrorDiagnostic}
+          onRetry={localMentionActive ? undefined : () => setCapabilityRetry((revision) => revision + 1)}
+          sectionErrors={localMentionActive ? [] : capabilitySectionErrors}
+          runtime={localMentionActive ? null : capabilityRuntime}
           activeIndex={activeCapabilityIndex}
           onActiveIndexChange={setActiveCapabilityIndex}
           onSelect={selectCapabilityItem}
+          local={localMentionActive && localMentions ? {
+            title: localMentions.title,
+            scopeLabel: localMentions.scopeLabel,
+            emptyLabel: localMentions.emptyLabel,
+            sectionOf: (item) => localMentionById.get(item.id)?.section ?? "",
+            iconOf: (item) => localMentionById.get(item.id)?.icon,
+          } : undefined}
         />
 
-        <div
+        <motion.div
           ref={cardRef}
+          layout={!reduced}
+          layoutDependency={compact}
+          transition={{ layout: COMPOSER_LAYOUT_TRANSITION }}
+          style={{ borderRadius: 22 }}
           className="cx-composer-card relative flex flex-col rounded-[22px] bg-cx-elevated"
-          data-drag-over={dragOver ? "true" : undefined}
+          data-drag-over={dragOver || customDragOver ? "true" : undefined}
           data-compact={compact ? "true" : undefined}
           onDoubleClick={(event) => {
             if (!compact || !onRequestExpand) return;
@@ -744,6 +816,12 @@ export function PromptBar({
             onRequestExpand();
           }}
           onDragOver={(event) => {
+            if (customDrop && customDrop.types.some((type) => event.dataTransfer.types.includes(type))) {
+              event.preventDefault();
+              event.dataTransfer.dropEffect = "copy";
+              if (!customDragOver) setCustomDragOver(true);
+              return;
+            }
             if (!onAddFiles || !dataTransferHasFiles(event.dataTransfer)) return;
             event.preventDefault();
             event.dataTransfer.dropEffect = "copy";
@@ -752,8 +830,15 @@ export function PromptBar({
           onDragLeave={(event) => {
             if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
             setDragOver(false);
+            setCustomDragOver(false);
           }}
           onDrop={(event) => {
+            if (customDrop && customDrop.types.some((type) => event.dataTransfer.types.includes(type))) {
+              event.preventDefault();
+              setCustomDragOver(false);
+              customDrop.onDrop(event.dataTransfer);
+              return;
+            }
             if (!onAddFiles || !dataTransferHasFiles(event.dataTransfer)) return;
             event.preventDefault();
             setDragOver(false);
@@ -761,7 +846,7 @@ export function PromptBar({
           }}
         >
           <AnimatePresence>
-            {dragOver ? (
+            {dragOver || customDragOver ? (
               <motion.div
                 key="drop"
                 aria-hidden="true"
@@ -770,55 +855,66 @@ export function PromptBar({
                 animate={{ opacity: 1, transition: { duration: 0.12 } }}
                 exit={{ opacity: 0, transition: { duration: 0.1 } }}
               >
-                <Icon name="upload" size={16} />
-                释放以添加附件
+                <Icon name={customDragOver ? "at" : "upload"} size={16} />
+                {customDragOver ? customDrop?.label : "释放以添加附件"}
               </motion.div>
             ) : null}
           </AnimatePresence>
 
-          {historyBrowsing && historyStatus ? (
-            <div
-              className="flex items-center gap-1.5 px-4 pt-2.5 text-[12px] text-cx-fg-3"
-              role="status"
-              data-testid="composer-history-status"
+          {showTray || pasteHint || (historyBrowsing && historyStatus) ? (
+            <motion.div
+              layout={reduced ? false : "position"}
+              layoutDependency={compact}
+              transition={{ layout: COMPOSER_LAYOUT_TRANSITION }}
             >
-              <Icon name="history" size={13} className="text-cx-fg-4" />
-              <span className="truncate">{historyStatus}</span>
-            </div>
+              {historyBrowsing && historyStatus ? (
+                <div
+                  className="flex items-center gap-1.5 px-4 pt-2.5 text-[12px] text-cx-fg-3"
+                  role="status"
+                  data-testid="composer-history-status"
+                >
+                  <Icon name="history" size={13} className="text-cx-fg-4" />
+                  <span className="truncate">{historyStatus}</span>
+                </div>
+              ) : null}
+
+              {pasteHint ? (
+                <div className="px-3.5 pt-2.5">
+                  <Callout
+                    tone="warning"
+                    role="status"
+                    testId="composer-paste-hint"
+                    onDismiss={() => setPasteHint(null)}
+                    className="px-3 py-2 text-[13px] leading-5"
+                  >
+                    {pasteHint}
+                  </Callout>
+                </div>
+              ) : null}
+
+              {showTray ? (
+                <AttachmentTray
+                  attachments={attachments}
+                  refs={chipStripRefs}
+                  contextPill={contextPill}
+                  onRemoveAttachment={onRemoveAttachment}
+                  onRetryAttachment={onRetryAttachment}
+                  onRemoveRef={onCapabilityRefsChange ? (ref) => {
+                    if (useStructuredDoc && ref.node_id) {
+                      syncDocument(removeNode(resolvedDoc, ref.node_id));
+                      return;
+                    }
+                    onCapabilityRefsChange(capabilityRefs.filter((item) => item.id !== ref.id));
+                  } : undefined}
+                />
+              ) : null}
+            </motion.div>
           ) : null}
 
-          {pasteHint ? (
-            <div className="px-3.5 pt-2.5">
-              <Callout
-                tone="warning"
-                role="status"
-                testId="composer-paste-hint"
-                onDismiss={() => setPasteHint(null)}
-                className="px-3 py-2 text-[13px] leading-5"
-              >
-                {pasteHint}
-              </Callout>
-            </div>
-          ) : null}
-
-          {showTray ? (
-            <AttachmentTray
-              attachments={attachments}
-              refs={chipStripRefs}
-              contextPill={contextPill}
-              onRemoveAttachment={onRemoveAttachment}
-              onRetryAttachment={onRetryAttachment}
-              onRemoveRef={onCapabilityRefsChange ? (ref) => {
-                if (useStructuredDoc && ref.node_id) {
-                  syncDocument(removeNode(resolvedDoc, ref.node_id));
-                  return;
-                }
-                onCapabilityRefsChange(capabilityRefs.filter((item) => item.id !== ref.id));
-              } : undefined}
-            />
-          ) : null}
-
-          <div
+          <motion.div
+            layout={reduced ? false : "position"}
+            layoutDependency={compact}
+            transition={{ layout: COMPOSER_LAYOUT_TRANSITION }}
             className="cx-composer-body cursor-text"
             data-after-chrome={showTray || pasteHint || (historyBrowsing && historyStatus) ? "true" : undefined}
             onMouseDown={(event) => {
@@ -944,9 +1040,14 @@ export function PromptBar({
                 data-c34-composer="true"
               />
             )}
-          </div>
+          </motion.div>
 
-          <div className="cx-composer-toolbar relative z-[1] flex items-center gap-1.5 px-3">
+          <motion.div
+            layout={reduced ? false : "position"}
+            layoutDependency={compact}
+            transition={{ layout: COMPOSER_LAYOUT_TRANSITION }}
+            className="cx-composer-toolbar relative z-[1] flex items-center gap-1.5 px-3"
+          >
             <div className="flex min-w-0 flex-1 items-center gap-0.5">
               <div className="cx-composer-add flex shrink-0">
                 <ComposerAddMenu
@@ -985,8 +1086,8 @@ export function PromptBar({
                 />
               </div>
             </div>
-          </div>
-        </div>
+          </motion.div>
+        </motion.div>
       </div>
     </div>
   );

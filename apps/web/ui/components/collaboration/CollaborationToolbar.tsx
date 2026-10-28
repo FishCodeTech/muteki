@@ -1,12 +1,13 @@
 "use client";
 
 import { Button, Input, Popover, Tooltip } from "@heroui/react";
-import { type KeyboardEvent, type ReactNode } from "react";
+import { useState, type KeyboardEvent, type ReactNode } from "react";
 
 import { Icon } from "@/components/Icon";
 import type { CollaborationRelationKind, CollaborationScope } from "@/lib/agentCollaboration";
 import type { CollabCanvasLayout } from "@/lib/agentCollaborationLayout";
 import { useT } from "@/lib/i18n";
+import { apiFetch } from "@/lib/serviceAuth";
 
 import { RELATION_KINDS, relationLabel } from "./collaborationPresentation";
 import { RelationSwatch } from "./RelationSwatch";
@@ -48,6 +49,7 @@ function IconTool({
  * toggle on the right. Below 1080px the trailing group folds into "more".
  */
 export function CollaborationToolbar({
+  runId,
   query,
   onQueryChange,
   searchHits,
@@ -76,6 +78,7 @@ export function CollaborationToolbar({
   onToggleDetail,
   onFit,
 }: {
+  runId?: string;
   query: string;
   onQueryChange: (value: string) => void;
   searchHits?: string;
@@ -105,6 +108,30 @@ export function CollaborationToolbar({
   onFit: () => void;
 }) {
   const t = useT();
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState("");
+  const exportGraph = async (format: "jsonl" | "timeline" | "sqlite") => {
+    if (!runId || exporting) return;
+    setExporting(true);
+    setExportError("");
+    try {
+      const response = await apiFetch(`/api/runs/${encodeURIComponent(runId)}/graph/export?format=${format}`);
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(detail || `HTTP ${response.status}`);
+      }
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${runId}-graph.${format === "timeline" ? "txt" : format}`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setExporting(false);
+    }
+  };
   const relationTotal = RELATION_KINDS.length;
   const relationsFiltered = relationKinds.size < relationTotal;
   const relationsLabel = relationsFiltered
@@ -272,6 +299,13 @@ export function CollaborationToolbar({
         <Popover.Content className="collab-relation-menu collab-export-menu" placement="bottom">
           <Popover.Arrow />
           <Popover.Dialog aria-label={t("collab.export")}>
+            {runId && (["jsonl", "timeline", "sqlite"] as const).map((format) => (
+              <Button key={format} isDisabled={exporting} onClick={() => void exportGraph(format)}>
+                <Icon name="download" size={13} />
+                <span>{t(`collab.export.graph.${format}`)}</span>
+              </Button>
+            ))}
+            {exportError && <p className="tone-danger" role="alert">{exportError}</p>}
             <Button onClick={onExportJson}>
               <Icon name="file" size={13} />
               <span>{t("collab.export.json")}</span>
@@ -332,6 +366,13 @@ export function CollaborationToolbar({
               <span>{t("collab.layout.timeline")}</span>
               <Icon name={layoutMode === "timeline" ? "check" : "minus"} size={12} />
             </Button>
+            {runId && (["jsonl", "timeline", "sqlite"] as const).map((format) => (
+              <Button key={format} isDisabled={exporting} onClick={() => void exportGraph(format)}>
+                <Icon name="download" size={13} />
+                <span>{t(`collab.export.graph.${format}`)}</span>
+              </Button>
+            ))}
+            {exportError && <p className="tone-danger" role="alert">{exportError}</p>}
             <Button onClick={onExportJson}>
               <Icon name="file" size={13} />
               <span>{t("collab.export.json")}</span>

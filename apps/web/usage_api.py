@@ -5,17 +5,20 @@ from threading import Lock
 from typing import Any, Literal
 
 from fastapi import APIRouter, Query, HTTPException, Request
+from muteki.core.blocking import run_blocking
 from muteki.competition.models import RunBinding
 from muteki.core.cursor_usage import CursorAccountUsage, make_window
-from muteki.core.provider_usage import ProviderUsage, make_usage_window
+from muteki.core.provider_usage import make_usage_window
 from muteki.core.provider_limits import ProviderLimits
+from muteki.core.model_pricing import pricing_service, BUCKETS
 
 
 
 def create_usage_router(manager, competition_store):
     router = APIRouter(tags=['usage'])
     cursor_account = CursorAccountUsage(manager.state_root)
-    provider_usage = ProviderUsage(manager.state_root, cursor=cursor_account)
+    provider_usage = pricing_service(manager.state_root)
+    provider_usage.cursor = cursor_account
     provider_limits = ProviderLimits(manager.state_root, keychain=cursor_account.keychain)
     ownership_lock = Lock()
     ownership_signature: tuple[tuple[str, str, str], ...] | None = None
@@ -54,6 +57,56 @@ def create_usage_router(manager, competition_store):
                                    generation=generation, workspace_kind=workspace_kind,
                                    actor_kind='worker' if competition_id else None,
                                    offset=offset, limit=limit)
+    @router.get('/api/usage/pricing')
+    def pricing(search: str = '', engine: str | None = None, refresh: bool = False):
+        rates, meta = provider_usage.pricing_snapshot(refresh)
+        catalog = [dict(model=model, status=rate.get('pricing_status', 'catalog'),
+                        rates={field: rate['standard'].get(bucket) * 1e6 if rate['standard'].get(bucket) is not None else None
+                               for field, bucket in BUCKETS.items()},
+                        tiers=[tier for tier in ('standard', 'fast', 'ultrafast') if rate.get(tier)])
+                   for model, rate in sorted(rates.items()) if search.lower() in model.lower()]
+        def selected(kind):
+            return [entry for entry in provider_usage.price_store.entries(kind)
+                    if (not engine or entry['engine'] == engine) and (not search or search.lower() in entry['model'])]
+        return dict(catalog=catalog, overrides=selected('override'), references=selected('reference'), meta=meta)
+
+    @router.post('/api/usage/pricing/resolve')
+    def resolve_pricing(body: dict):
+        items = body.get('items')
+        if not isinstance(items, list) or len(items) > 1000 or any(not isinstance(item, dict) for item in items):
+            raise HTTPException(422, 'items 必须是最多 1000 项的对象数组')
+        try:
+            rates, _ = provider_usage.pricing_snapshot()
+            resolver = provider_usage.price_store.resolver(rates)
+            from muteki.core.usage_routes import current_pricing_route
+            return {'items': [resolver(current_pricing_route(item, manager.state_root)) for item in items]}
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    def write_pricing(kind: str, body: dict, delete: bool = False):
+        try:
+            if delete:
+                return provider_usage.price_store.delete(kind, body)
+            return provider_usage.price_store.put(kind, body)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @router.put('/api/usage/pricing/override')
+    def put_price_override(body: dict):
+        return write_pricing('override', body)
+
+    @router.delete('/api/usage/pricing/override')
+    def delete_price_override(body: dict):
+        return write_pricing('override', body, True)
+
+    @router.put('/api/usage/pricing/reference')
+    def put_price_reference(body: dict):
+        return write_pricing('reference', body)
+
+    @router.delete('/api/usage/pricing/reference')
+    def delete_price_reference(body: dict):
+        return write_pricing('reference', body, True)
+
     @router.post('/api/usage/import-history')
     def import_history():
         return manager.usage.import_run_history()
@@ -68,7 +121,7 @@ def create_usage_router(manager, competition_store):
         value = body.get('cursor_account_usage_enabled') if isinstance(body, dict) else None
         if not isinstance(value, bool):
             raise HTTPException(422, 'cursor_account_usage_enabled 必须是布尔值')
-        return cursor_account.update_settings(cursor_account_usage_enabled=value)
+        return await run_blocking(cursor_account.update_settings, cursor_account_usage_enabled=value)
 
     @router.get('/api/usage/cursor-account')
     def cursor_account_usage(days: int = Query(30), tz: str = Query('UTC'), refresh: bool = False):
@@ -111,14 +164,13 @@ def create_usage_router(manager, competition_store):
         except (ValueError, OverflowError, OSError) as exc:
             raise HTTPException(422, str(exc)) from exc
         sync_competition_ownership()
-        ledger = manager.usage.query(
+        ledger = manager.usage.read_records(
             start=start if start is not None else window.since_ms / 1000,
             end=end if end is not None else window.until_ms / 1000,
             run_id=run_id, thread_id=thread_id, competition_id=competition_id,
             challenge_id=challenge_id, model=model, engine=engine, role=role,
             workspace_kind=workspace_kind, generation=generation,
             actor_kind='worker' if competition_id else None,
-            limit=2**31 - 1,
         )
         options = dict(refresh=refresh, start=start, end=end, engine=engine, model=model)
         if scope == 'muteki':

@@ -87,6 +87,7 @@ def make_helpers(app: FastAPI) -> SimpleNamespace:
             credential_catalog_runtime_key,
             discover_anthropic_compatible_models,
             discover_openai_compatible_models,
+            discover_pi_endpoint_models,
             discover_worker_models,
         )
 
@@ -96,9 +97,19 @@ def make_helpers(app: FastAPI) -> SimpleNamespace:
         backend = "container" if environment == "container" else "local"
         selected_runtime = credential_catalog_runtime_key(
             selected_engine, runtime_instance)
+        credential_revision = (
+            CredentialAccountStore(account_store_root(mgr.state_root)).revision(account_id)
+            if account_id else ""
+        )
+        if account_id and expected_revision is not None and credential_revision != expected_revision:
+            return {"ok": False, "models": [], "error_code": "credential.configuration_changed",
+                    "detail": "凭据配置在刷新期间已改变，请重新刷新。"}, {"discovered_models": []}
         request_identity = hashlib.sha256(json.dumps({
             "connection": connection, "base_url": base_url.rstrip("/"),
             "secret": secret, "provider": provider,
+            # A later request must not join a discovery started with an older
+            # credential, even if its public Runtime configuration is unchanged.
+            "credential_revision": credential_revision,
             "runtime": platform_stack.runtime_service.get_instance(*selected_runtime.rsplit(":", 1)) or {},
         }, sort_keys=True, default=str).encode()).hexdigest()
         refresh_key = f"{credential_id}\0{selected_engine}\0{backend}\0{selected_runtime}\0{request_identity}"
@@ -118,11 +129,23 @@ def make_helpers(app: FastAPI) -> SimpleNamespace:
                     if get_descriptor(selected_engine).models.endpoint_protocol == "anthropic"
                     else discover_openai_compatible_models
                 )
-                return await asyncio.to_thread(
+                result = await asyncio.to_thread(
                     endpoint_discovery,
                     base_url=base_url,
                     secret=secret,
                 )
+                if selected_engine == "pi" and result.get("ok"):
+                    adapter_id, instance_id = selected_runtime.rsplit(":", 1)
+                    runtime = platform_stack.runtime_service.get_instance(adapter_id, instance_id) or {}
+                    return await asyncio.to_thread(
+                        discover_pi_endpoint_models,
+                        result=result, base_url=base_url, secret=secret,
+                        sessions_root=mgr.state_root, account_id=account_id,
+                        provider=provider, configured_models=configured_models,
+                        default_model=default_model,
+                        binary=str(runtime.get("binary_path") or ""), backend=backend,
+                    )
+                return result
             adapter_id, instance_id = selected_runtime.rsplit(":", 1)
             runtime = platform_stack.runtime_service.get_instance(
                 adapter_id, instance_id) or {}
@@ -195,9 +218,9 @@ def make_helpers(app: FastAPI) -> SimpleNamespace:
         finally:
             if task.done() and tasks.get(refresh_key) is task:
                 tasks.pop(refresh_key, None)
-        if account_id and expected_revision is not None:
+        if account_id:
             current_revision = CredentialAccountStore(account_store_root(mgr.state_root)).revision(account_id)
-            if current_revision != expected_revision:
+            if current_revision != credential_revision:
                 return {"ok": False, "models": [], "error_code": "credential.configuration_changed",
                         "detail": "凭据配置在刷新期间已改变，请重新刷新。"}, {"discovered_models": []}
         if not persist:

@@ -4,16 +4,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { subscribeUiPreferences } from "@/lib/uiPreferences";
 import { EngineLogo } from "@/components/EngineLogo";
 import { Icon } from "@/components/Icon";
-import { ModelTestTerminal } from "@/components/ModelTestTerminal";
-import { ConversationModelPicker } from "@/components/conversation/ConversationModelPicker";
 import {
-  Badge, Button, Callout, Checkbox, Collapse, CopyButton, Dialog, EmptyState, IconButton,
-  Select, StatusDot, Switch, TextArea, TextField, type ListOption,
+  Badge, Button, Callout, EmptyState, IconButton, Select, Switch, type ListOption,
 } from "@/components/chat/ui";
-import { SettingsEmpty, SettingsSection } from "@/components/settings/primitives";
 import { UsageProviderSettings } from "@/components/settings/UsageProviderSettings";
 import { cn } from "@/lib/cn";
-import { pickRuntimeForEngine, runtimeAvailableForSelection } from "@/lib/conversationReadiness";
 import { type ChatDefaultModel, readChatDefaultModel, writeChatDefaultModel } from "@/lib/conversationDefaults";
 import { credentialForRuntime } from "@/lib/modelReasoning";
 import {
@@ -21,106 +16,39 @@ import {
   runtimeScopesModelCatalog, useProviderDescriptors,
 } from "@/lib/providerDescriptors";
 import { readHiddenModels, setModelHidden, subscribeHiddenModels } from "@/lib/modelVisibility";
+import { priceKey, readPricingPrefill, usePricingCatalog, type PriceIdentity } from "@/lib/modelPricing";
 import { recordTaskReceipt } from "@/lib/task-center";
 import {
-  allCredentialModels, normalizeConversationCredential,
-  type ConversationCredential, type ConversationCredentialModel,
+  allCredentialModels, normalizeConversationCredential, type ConversationCredentialModel,
 } from "@/lib/useConversation";
 import {
   type GlobalCredential, type WorkerModelTestResult, type WorkerSettings, apiFetch, deleteCredentialAccount,
   getGlobalCredentials, getWorkerSettings, importHostCodexAuth, importHostWorkerLogin,
-  putCredentialAccount, refreshCredentialModels, testGlobalCredential,
+  putCredentialAccount, refreshCredentialModels, testCredentialDraft, testGlobalCredential,
 } from "@/lib/useRun";
+import { CredentialEditor, type CredentialValues, type DraftTestValues } from "./CredentialEditor";
 import { EngineList } from "./EngineList";
-import { ModelDirectory, type AgentModelRow } from "./ModelDirectory";
-import { EnvRefsEditor, envRefRows, envRefsPayload, type EnvRefRow } from "./EnvRefsEditor";
+import { DeleteConfirm, ImportRow, TestSummary } from "./InlinePanels";
+import { ModelTable, rowIdentity, type AgentModelRow, type ModelGroup } from "./ModelTable";
+import { PricingFooter } from "./PricingFooter";
+import { RuntimeConfigPanel, type RuntimeValues } from "./RuntimeConfigPanel";
 import {
-  CAPABILITY_LABELS, EMPTY_DRAFT, asEngine, catalogSummary, credentialLiveStatus, declaredTransportFields, engineCliAdapter,
-  credentialModels, credentialName, credentialReady, formatTestTime, installedVersion, lastTestAsResult,
-  readSelection, runtimeLabel, selectionHref, splitModels, statusTone, versionCheckDetail, versionStatus,
-  type AgentsSelection, type AgentsSettingsNavigation, type Connection, type CredentialDraft,
-  type Engine, type EngineSummary, type Feedback, type ModelRefreshFeedback,
-  type RuntimeInstance,
+  asEngine, catalogSummary, credentialLiveStatus, declaredTransportFields, engineCliAdapter, credentialModels, credentialName,
+  credentialReady, installedVersion, lastTestAsResult, readSelection, relativeTime, selectionHref, statusTone, versionCheckDetail,
+  type AgentsSelection, type AgentsSettingsNavigation, type Engine, type EngineSummary, type Feedback, type RuntimeInstance,
 } from "./shared";
 
 const AUTO_REFRESH_MS = 300_000;
 const MODEL_REFRESH_CONCURRENCY = 3;
-const ACCESS_MODE_LABELS: Record<string, string> = {
-  supervised: "严格监督", "auto-accept-edits": "自动接受编辑",
-  auto: "自动审查", "full-access": "完全访问",
-};
+/** Container width (px) at which the engine list and detail sit side by side (`@3xl`). */
+const SPLIT_LAYOUT_WIDTH = 768;
 
-const CONNECTION_OPTIONS: ListOption<Connection>[] = [
-  { value: "official", label: "官方账号" },
-  { value: "custom_endpoint", label: "自定义端点" },
-];
 const BACKEND_OPTIONS: ListOption<WorkerSettings["worker_backend"]>[] = [
   { value: "local", label: "本地环境测试" },
   { value: "container", label: "容器环境测试" },
 ];
 
-function CandidateModelsField({
-  value,
-  refreshing,
-  onRefresh,
-  catalog,
-  feedback,
-}: {
-  value: string;
-  refreshing: boolean;
-  onRefresh: () => void;
-  catalog?: GlobalCredential["model_catalog"];
-  feedback: ModelRefreshFeedback;
-}) {
-  const [open, setOpen] = useState(false);
-  const models = splitModels(value);
-  const failed = feedback?.kind === "bad" || (!feedback && catalog?.refresh_status === "failed");
-  const statusText = refreshing ? "正在更新候选模型…" : feedback?.detail || catalogSummary(catalog);
-  return (
-    <div className="rounded-xl border border-cx-border bg-cx-bg-subtle px-4 py-3" aria-busy={refreshing}>
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-[12.5px] font-medium text-cx-fg-2">候选模型清单</span>
-        <Button size="xs" variant="outline" icon="refresh" loading={refreshing} onClick={onRefresh}>
-          {refreshing ? "更新中…" : "一键更新"}
-        </Button>
-      </div>
-      <button
-        type="button"
-        aria-expanded={open}
-        onClick={() => setOpen((value) => !value)}
-        className="mt-2 inline-flex items-center gap-1.5 rounded-md text-[12.5px] text-cx-fg-3 outline-none transition-colors hover:text-cx-fg focus-visible:outline-2 focus-visible:outline-[var(--cx-focus)]"
-      >
-        <Icon name="chevronDown" size={13} className={cn("transition-transform", open && "rotate-180")} />
-        {models.length ? `${models.length} 个候选模型` : "尚无候选模型"}
-      </button>
-      <Collapse open={open}>
-        {models.length ? (
-          <ul aria-label="候选模型清单" className="mt-2 flex max-h-44 flex-col gap-1 overflow-y-auto">
-            {models.map((model) => <li key={model}><code className="text-[12px] text-cx-fg-2">{model}</code></li>)}
-          </ul>
-        ) : (
-          <p className="mt-2 text-[12.5px] text-cx-fg-3">点击“一键更新”从当前凭据读取模型目录。</p>
-        )}
-      </Collapse>
-      <p
-        role={failed ? "alert" : "status"}
-        className={cn("mt-2 flex items-start gap-1.5 text-[12px] leading-4", failed ? "text-cx-danger" : feedback?.kind === "ok" ? "text-cx-success" : "text-cx-fg-3")}
-      >
-        <Icon
-          name={refreshing ? "refresh" : feedback?.kind === "ok" ? "checkCircle" : failed ? "alert" : "clock"}
-          size={12}
-          className={cn("mt-0.5 shrink-0", refreshing && "cx-spin")}
-        />
-        <span>{statusText}</span>
-      </p>
-    </div>
-  );
-}
-
-/** One argument per line; blank lines are ignored and the service validates the rest. */
-function launchArgsPayload(text: string): string[] {
-  return text.split("\n").map((line) => line.trim()).filter(Boolean);
-}
+type Panel = { kind: "create"; engine: Engine; nonce: number } | { kind: "edit" | "delete" | "import"; id: string; engine: Engine; nonce: number };
 
 export function AgentsSettings({ taskSettings = false, navigation, onCredentialsChanged }: {
   taskSettings?: boolean;
@@ -136,50 +64,33 @@ export function AgentsSettings({ taskSettings = false, navigation, onCredentials
   const [refreshReport, setRefreshReport] = useState<Feedback>(null);
   const [lastCheckedAt, setLastCheckedAt] = useState("");
   const [chatDefault, setChatDefault] = useState<ChatDefaultModel | null>(null);
-  const [chatDefaultCredentialId, setChatDefaultCredentialId] = useState("");
-  const [chatDefaultModelId, setChatDefaultModelId] = useState("");
   const [feedback, setFeedback] = useState<Feedback>(null);
   const [busyItem, setBusyItem] = useState("");
-  const [testOpen, setTestOpen] = useState(false);
+  const [testShown, setTestShown] = useState<ReadonlySet<string>>(new Set());
   const [testResults, setTestResults] = useState<Record<string, WorkerModelTestResult>>({});
+  const [listQuery, setListQuery] = useState("");
+  const [panel, setPanel] = useState<Panel | null>(null);
+  const [runtimeOpen, setRuntimeOpen] = useState({ open: false, nonce: 0 });
+  const [deleteError, setDeleteError] = useState("");
+  const [deleting, setDeleting] = useState(false);
+  const [importError, setImportError] = useState("");
+  const [focusGroup, setFocusGroup] = useState("");
+  const panelDirty = useRef(false);
+  const [expandedPrice, setExpandedPrice] = useState("");
+  const [extraPrice, setExtraPrice] = useState<PriceIdentity | null>(null);
+  const [hiddenModels, setHiddenModels] = useState<ReadonlySet<string>>(() => readHiddenModels());
   const descriptors = readyCatalog(useProviderDescriptors());
+  const pricing = usePricingCatalog();
   // An auth-home account layout takes the whole auth.json, not a single secret.
   const authHomeSecret = (engine: Engine) => descriptorForEngine(descriptors, engine)?.credentials.secret_file === "CODEX_AUTH_HOME";
   const hostLoginImport = (engine: Engine) => descriptorForEngine(descriptors, engine)?.login.host_login_import ?? "none";
-  const [listQuery, setListQuery] = useState("");
-  const [capabilitiesOpen, setCapabilitiesOpen] = useState(false);
-  const [createOpen, setCreateOpen] = useState(false);
-  const [createEngine, setCreateEngine] = useState<Engine | null>(null);
-  const [newDraft, setNewDraft] = useState<CredentialDraft>(EMPTY_DRAFT);
-  const [createError, setCreateError] = useState("");
-  const [creating, setCreating] = useState(false);
-  const [deleteTarget, setDeleteTarget] = useState<GlobalCredential | null>(null);
-  const [deleteError, setDeleteError] = useState("");
-  const [deleting, setDeleting] = useState(false);
-  const [editSecret, setEditSecret] = useState("");
-  const [editBaseRevision, setEditBaseRevision] = useState<string | undefined>();
-  const [showSecret, setShowSecret] = useState(false);
-  const [editConnection, setEditConnection] = useState<Connection>("official");
-  const [editProvider, setEditProvider] = useState("");
-  const [editBaseUrl, setEditBaseUrl] = useState("");
-  const [editDefaultModel, setEditDefaultModel] = useState("");
-  const [editModelsText, setEditModelsText] = useState("");
-  const [modelRefreshFeedback, setModelRefreshFeedback] = useState<ModelRefreshFeedback>(null);
-  const [editBinaryPath, setEditBinaryPath] = useState("");
-  const [editLaunchArgs, setEditLaunchArgs] = useState("");
-  const [runtimeBaseRevision, setRuntimeBaseRevision] = useState("");
-  const [editEndpoint, setEditEndpoint] = useState("");
-  const [editTransport, setEditTransport] = useState<Record<string, string | number | boolean>>({});
-  const [editEnvRefs, setEditEnvRefs] = useState<EnvRefRow[]>([]);
-  const [importAccountId, setImportAccountId] = useState("");
-  const [hiddenModels, setHiddenModels] = useState<ReadonlySet<string>>(() => readHiddenModels());
   const feedbackTimer = useRef<number | null>(null);
   const loadGeneration = useRef(0);
   const backendInitialized = useRef(false);
   const refreshInFlight = useRef(false);
   const lastAutomaticRefreshAt = useRef(Date.now());
 
-  useEffect(() => subscribeUiPreferences(() => { const saved = readChatDefaultModel(); setChatDefault(saved); setChatDefaultCredentialId(saved?.credentialId || ""); setChatDefaultModelId(saved?.modelId || ""); }), []);
+  useEffect(() => subscribeUiPreferences(() => setChatDefault(readChatDefaultModel())), []);
   useEffect(() => subscribeHiddenModels(() => setHiddenModels(readHiddenModels())), []);
 
   const showFeedback = useCallback((kind: "ok" | "warn" | "bad", detail: string) => {
@@ -199,7 +110,7 @@ export function AgentsSettings({ taskSettings = false, navigation, onCredentials
     const generation = ++loadGeneration.current;
     if (!silent) setLoading(true);
     try {
-      const [rows, runtimePayload, settings, descriptorCatalog] = await Promise.all([
+      const [rows, runtimePayload, settings] = await Promise.all([
         getGlobalCredentials(backend),
         apiFetch(`/api/agent-runtimes?transport=${taskSettings ? "cli" : "structured"}`).then(async (response) => {
           if (!response.ok) throw new Error(`运行环境读取失败（HTTP ${response.status}）`);
@@ -212,21 +123,10 @@ export function AgentsSettings({ taskSettings = false, navigation, onCredentials
         loadProviderDescriptors({ fresh: true }),
       ]);
       if (generation !== loadGeneration.current) return false;
-      const nextCredentials = Array.isArray(rows) ? rows : [];
-      setCredentials(nextCredentials);
+      setCredentials(Array.isArray(rows) ? rows : []);
       setInstances(Array.isArray(runtimePayload.instances) ? runtimePayload.instances : []);
       if (taskSettings && !backendInitialized.current && settings?.worker_backend) { setBackend(settings.worker_backend); backendInitialized.current = true; }
-      if (!taskSettings) {
-        const saved = readChatDefaultModel();
-        const savedCredential = saved && nextCredentials.find((item) => item.id === saved.credentialId && asEngine(descriptorCatalog, item.engine) && credentialReady(item));
-        const activeCredentials = nextCredentials.filter((item) => asEngine(descriptorCatalog, item.engine));
-        const validSaved = saved;
-        setChatDefault(validSaved);
-        const ready = savedCredential || activeCredentials.find(credentialReady) || activeCredentials[0] || null;
-        const models = ready ? credentialModels(ready) : [];
-        setChatDefaultCredentialId(ready?.id || "");
-        setChatDefaultModelId(validSaved && ready?.id === validSaved.credentialId && models.includes(validSaved.modelId) ? validSaved.modelId : ready?.default_model || models[0] || "");
-      }
+      if (!taskSettings) setChatDefault(readChatDefaultModel());
       const probedAt = String(runtimePayload.probed_at || "");
       const checkedAt = probedAt ? new Date(probedAt) : null;
       if (checkedAt && !Number.isNaN(checkedAt.getTime())) {
@@ -267,8 +167,8 @@ export function AgentsSettings({ taskSettings = false, navigation, onCredentials
     return { engine, label, cliAdapterId: identity.cli_adapter_id, credentials: engineCredentials, instances: engineInstances, primaryCredential, primaryInstance, enabled, version: primaryInstance?.health?.runtime_version || "", readyCredentialCount, modelCount, environmentCount: engineInstances.length, statusKind, statusText, supportStatus: "supported", disabledReason: "" };
   }), [credentials, descriptors, instances, taskSettings]);
 
-  /* Selection: URL query (?engine=&instance=&credential=) when the host passes
-   * navigation, otherwise plain local state (task settings embed). */
+  /* Selection: URL query (?engine=&instance=) when the host passes navigation,
+   * otherwise plain local state (task settings embed). */
   const [localSelection, setLocalSelection] = useState<AgentsSelection>({ engine: null, instanceId: "", credentialId: "" });
   const taskSelectionInitialized = useRef(false);
   useEffect(() => {
@@ -291,6 +191,17 @@ export function AgentsSettings({ taskSettings = false, navigation, onCredentials
     }
   }, [descriptors, navigation]);
 
+  const prefill = taskSettings ? null : readPricingPrefill(navigation?.searchParams);
+  const prefillKey = prefill ? priceKey(prefill) : "";
+  const prefillStage = useRef("");
+  const rootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (taskSettings || !navigation || loading || selection.engine || prefillKey) return;
+    if ((rootRef.current?.offsetWidth ?? 0) < SPLIT_LAYOUT_WIDTH) return;
+    const first = engines.find((item) => item.supportStatus === "supported" && item.enabled) || engines.find((item) => item.supportStatus === "supported");
+    if (first) applySelection({ engine: first.engine, instanceId: "", credentialId: "" }, "replace");
+  }, [applySelection, engines, loading, navigation, prefillKey, selection.engine, taskSettings]);
+
   const currentEngine = useMemo(() => {
     if (!selection.engine) return null;
     const found = engines.find((item) => item.engine === selection.engine) || null;
@@ -305,9 +216,14 @@ export function AgentsSettings({ taskSettings = false, navigation, onCredentials
     }
     return currentEngine.primaryInstance;
   }, [currentEngine, selection.instanceId]);
-  const selectedCredential = useMemo(() => {
-    const item = currentEngine?.credentials.find((row) => row.id === selection.credentialId);
-    if (!item) return null;
+  const currentEngineRef = useRef(currentEngine);
+  const currentInstanceRef = useRef(currentInstance);
+  currentEngineRef.current = currentEngine;
+  currentInstanceRef.current = currentInstance;
+  const runtimeKey = currentEngine ? currentInstance?.key || `${engineCliAdapter(descriptors, currentEngine.engine)}:default` : "";
+
+  /** A credential as seen through the selected runtime instance (its own model catalog and last test). */
+  const scopeCredential = useCallback((item: GlobalCredential): GlobalCredential => {
     const normalized = normalizeConversationCredential(item);
     if (!normalized || !currentInstance) return item;
     const scopedCatalog = runtimeScopesModelCatalog(descriptors, currentInstance.key);
@@ -322,76 +238,79 @@ export function AgentsSettings({ taskSettings = false, navigation, onCredentials
       model_catalog: catalog || (scopedCatalog ? undefined : item.model_catalog),
       last_test: item.last_tests ? item.last_tests[currentInstance.key] || null : item.last_test,
     };
-  }, [currentEngine, currentInstance, descriptors, selection.credentialId]);
-  const currentEngineRef = useRef(currentEngine);
-  const selectedCredentialRef = useRef(selectedCredential);
-  const currentInstanceRef = useRef(currentInstance);
-  currentEngineRef.current = currentEngine;
-  selectedCredentialRef.current = selectedCredential;
-  currentInstanceRef.current = currentInstance;
-  const currentTransportFields = useMemo(() => currentInstance ? currentInstance.config_schema?.properties?.transport?.properties ?? declaredTransportFields(descriptors, currentInstance.adapter_id) : {}, [currentInstance, descriptors]);
-  const conversationRuntimes = useMemo(() => instances.map((instance) => ({
-    ...instance, health: instance.health ?? undefined,
-  })).filter((runtime) => runtimeAvailableForSelection(runtime, descriptors)), [instances, descriptors]);
-  const conversationCredentials = useMemo(() => credentials
-    .filter((item) => asEngine(descriptors, item.engine))
-    .map(normalizeConversationCredential)
-    .filter((item): item is ConversationCredential => item !== null)
-    .map((item) => {
-      const selected = item.engine === currentEngine?.engine
-        ? conversationRuntimes.find((runtime) => runtime.key === currentInstance?.key) : undefined;
-      const runtime = selected || pickRuntimeForEngine(item.engine, conversationRuntimes);
-      return runtime ? credentialForRuntime(item, runtime.key, runtimeScopesModelCatalog(descriptors, runtime.key)) : item;
-    }), [credentials, currentEngine, currentInstance, descriptors, conversationRuntimes]);
+  }, [currentInstance, descriptors]);
 
-  const runtimeKey = currentEngine ? currentInstance?.key || `${engineCliAdapter(descriptors, currentEngine.engine)}:default` : "";
-  const modelRows = useMemo<AgentModelRow[]>(() => {
+  const groups = useMemo<ModelGroup[]>(() => {
     if (!currentEngine || !runtimeKey) return [];
-    return currentEngine.credentials.flatMap((item) => {
+    return currentEngine.credentials.map((item) => {
+      const scoped = scopeCredential(item);
       const normalized = normalizeConversationCredential(item);
-      if (!normalized) return [];
-      const scoped = credentialForRuntime(normalized, runtimeKey, runtimeScopesModelCatalog(descriptors, runtimeKey));
-      return allCredentialModels(scoped).map((model: ConversationCredentialModel) => ({
-        key: `${item.id}${model.id}`,
-        credentialId: item.id,
-        credentialName: credentialName(item),
-        model,
-        verified: scoped.models.some((probed) => probed.id === model.id),
-      }));
+      const runtimeCredential = normalized ? credentialForRuntime(normalized, runtimeKey, runtimeScopesModelCatalog(descriptors, runtimeKey)) : null;
+      const rows: AgentModelRow[] = runtimeCredential
+        ? allCredentialModels(runtimeCredential).map((model: ConversationCredentialModel) => ({
+          key: `${item.id}${model.id}`,
+          credentialId: item.id,
+          engine: runtimeCredential.engine,
+          providerId: runtimeCredential.provider,
+          credentialName: credentialName(item),
+          model,
+          verified: runtimeCredential.models.some((probed) => probed.id === model.id),
+        }))
+        : [];
+      const testing = busyItem === `test:${item.id}`;
+      const result = testResults[item.id] || lastTestAsResult(scoped, currentEngine.engine);
+      const status = credentialLiveStatus(scoped, result, testing);
+      const refreshedAgo = relativeTime(scoped.model_catalog?.refreshed_at);
+      const system = item.source === "system";
+      return {
+        id: item.id,
+        name: credentialName(item),
+        typeLabel: system ? "宿主登录" : item.connection === "custom_endpoint" ? "自定义端点" : "官方账号",
+        statusKind: status.kind,
+        statusText: status.text,
+        summary: `${rows.length} 个模型${refreshedAgo ? ` · ${refreshedAgo}更新` : ""}`,
+        detail: [
+          system ? "系统检测到的宿主登录状态；容器 Worker 需导入为独立凭据。" : `凭据 ID：${item.account_id || item.id.replace(/^account:/, "")}`,
+          catalogSummary(scoped.model_catalog),
+          result ? `最近连通测试：${result.ok ? "可用" : "不可用"}${result.detail ? `（${result.detail}）` : ""}` : "",
+        ].filter(Boolean).join("\n"),
+        rows,
+        ready: Boolean(credentialReady(item)),
+        isDefaultSource: chatDefault?.credentialId === item.id,
+        testing,
+        refreshing: busyItem === `refresh:${item.id}`,
+        canEdit: !system,
+        canImport: system && hostLoginImport(currentEngine.engine) !== "none" && Boolean(credentialReady(item)),
+        canDelete: !system && !item.sharing?.readonly,
+        isSystem: system,
+        hasTestResult: Boolean(result),
+      };
     });
-  }, [currentEngine, descriptors, runtimeKey]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [busyItem, chatDefault, currentEngine, descriptors, runtimeKey, scopeCredential, testResults]);
+
+  const knownModels = useMemo(() => new Set(credentials.flatMap((item) => {
+    const normalized = normalizeConversationCredential(item);
+    return normalized ? allCredentialModels(normalized).map((model) => `${normalized.engine}\u0000${model.id}`) : [];
+  })), [credentials]);
+  const pricingEngines = useMemo(() => engines.filter((item) => item.supportStatus === "supported").map((item) => ({ value: item.engine, label: item.label })), [engines]);
 
   useEffect(() => {
-    const engine = currentEngineRef.current;
-    const item = selectedCredentialRef.current;
-    setEditBaseRevision(item?.revision);
-    setEditConnection(item?.connection === "custom_endpoint" ? "custom_endpoint" : "official");
-    setEditProvider(item?.provider || ""); setEditBaseUrl(item?.base_url || "");
-    setEditDefaultModel(item?.default_model || item?.candidate_models?.[0] || item?.models[0] || "");
-    setEditModelsText((item?.candidate_models || item?.models || []).join("\n"));
-    setModelRefreshFeedback(null);
-    setEditSecret(""); setShowSecret(false); setImportAccountId(`${engine?.engine || "agent"}-account`);
-  }, [selection.engine, selectedCredential?.id]);
-  useEffect(() => { const instance = currentInstanceRef.current; setRuntimeBaseRevision(instance?.updated_at || ""); setEditBinaryPath(instance?.binary_path || ""); setEditEndpoint(instance?.endpoint || ""); setEditTransport({ ...(instance?.transport || {}) }); setEditEnvRefs(envRefRows(instance?.env_refs)); setEditLaunchArgs((instance?.launch_args || []).join("\n")); }, [currentInstance?.key]);
+    if (!prefill || loading) return;
+    const engine = asEngine(descriptors, prefill.engine);
+    if (engine && selection.engine !== engine) {
+      if (prefillStage.current === `${prefillKey}:select`) return;
+      prefillStage.current = `${prefillKey}:select`;
+      applySelection({ engine, instanceId: "", credentialId: "" }, "replace");
+      return;
+    }
+    if (prefillStage.current === prefillKey) return;
+    prefillStage.current = prefillKey;
+    const row = groups.flatMap((group) => group.rows).find((item) => item.engine === prefill.engine && item.model.id === prefill.model && (!prefill.credential_id || item.credentialId === prefill.credential_id));
+    if (row) setExpandedPrice(priceKey(rowIdentity(row))); else setExtraPrice(prefill);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [applySelection, descriptors, groups, loading, prefillKey, selection.engine]);
 
-  const editIdentity = JSON.stringify([selectedCredential?.id, editConnection, editProvider, editBaseUrl,
-    editSecret, editDefaultModel, editModelsText, backend, currentInstance?.key]);
-  const editIdentityRef = useRef(editIdentity);
-  editIdentityRef.current = editIdentity;
-  const editHasUnsavedEndpoint = Boolean(selectedCredential?.source === "stored" && (
-    editSecret.trim() || editConnection !== selectedCredential.connection
-    || editBaseUrl.trim().replace(/\/$/, "") !== (selectedCredential.base_url || "").replace(/\/$/, "")
-    || (selectedCredential.revision && selectedCredential.revision !== editBaseRevision)
-  ));
-  useEffect(() => {
-    const item = selectedCredentialRef.current;
-    if (!item) return;
-    const credentialId = item.id;
-    setTestResults((current) => {
-      if (!current[credentialId]) return current;
-      const next = { ...current }; delete next[credentialId]; return next;
-    });
-  }, [selectedCredential?.id, selectedCredential?.revision, editConnection, editBaseUrl, editSecret, editDefaultModel, backend, currentInstance?.key]);
   const assertRuntimeResponse = async (response: Response, title = "Agent 运行环境操作") => {
     const payload = await response.json();
     if (payload.receipt) recordTaskReceipt(payload.receipt, title, "runtime");
@@ -410,22 +329,11 @@ export function AgentsSettings({ taskSettings = false, navigation, onCredentials
   const selectEngineRow = (engine: Engine, instanceId: string) => {
     const item = engines.find((entry) => entry.engine === engine);
     if (!item || item.supportStatus !== "supported") return;
-    setTestOpen(false);
-    setCreateOpen(false);
-    if (selection.engine === engine && selection.instanceId === instanceId) {
-      applySelection({ engine: null, instanceId: "", credentialId: "" }, "push");
-    } else {
-      applySelection({ engine, instanceId, credentialId: "" }, "push");
-    }
-  };
-  const toggleCredentialRow = (item: GlobalCredential) => {
-    if (!currentEngine) return;
-    setTestOpen(false);
-    const expanding = selectedCredential?.id !== item.id;
-    applySelection(
-      { engine: currentEngine.engine, instanceId: selection.instanceId, credentialId: expanding ? item.id : "" },
-      "replace",
-    );
+    if (selection.engine === engine && selection.instanceId === instanceId) return;
+    if (!requestPanel(null)) return;
+    setRuntimeOpen((current) => ({ ...current, open: false }));
+    setExpandedPrice("");
+    applySelection({ engine, instanceId, credentialId: "" }, "push");
   };
 
   const refreshAll = async () => {
@@ -435,12 +343,6 @@ export function AgentsSettings({ taskSettings = false, navigation, onCredentials
     setRefreshReport(null);
     setRefreshProgress("正在探测全部运行环境…");
     const failures: string[] = [];
-    const requestIdentity = editIdentity;
-    const selectedId = selectedCredential?.id;
-    const selectedRuntimeKey = currentInstance?.key;
-    const canUpdateSelectedModels = !editHasUnsavedEndpoint
-      && editModelsText === (selectedCredential?.candidate_models || selectedCredential?.models || []).join("\n");
-    let selectedModels: string[] | undefined;
     let completed = 0;
     let succeeded = 0;
     let skipped = 0;
@@ -491,10 +393,8 @@ export function AgentsSettings({ taskSettings = false, navigation, onCredentials
               backend: credential.source === "system" ? "local" : backend,
               runtime_instance: instance.key,
             });
-            if (result.ok) {
-              succeeded += 1;
-              if (credential.id === selectedId && instance.key === selectedRuntimeKey) selectedModels = result.models;
-            } else failures.push(`${descriptorForEngine(catalog, engine)?.identity.display_name || engine} · ${credentialName(credential)} · ${instance.key}：${result.detail || "未返回模型"}`);
+            if (result.ok) succeeded += 1;
+            else failures.push(`${descriptorForEngine(catalog, engine)?.identity.display_name || engine} · ${credentialName(credential)} · ${instance.key}：${result.detail || "未返回模型"}`);
           } catch (error) {
             failures.push(`${credentialName(credential)} · ${instance.key}：${error instanceof Error ? error.message : String(error)}`);
           } finally {
@@ -504,9 +404,6 @@ export function AgentsSettings({ taskSettings = false, navigation, onCredentials
         }
       };
       await Promise.all(Array.from({ length: Math.min(MODEL_REFRESH_CONCURRENCY, jobs.length) }, worker));
-      if (selectedModels && canUpdateSelectedModels && editIdentityRef.current === requestIdentity) {
-        setEditModelsText(selectedModels.join("\n"));
-      }
       const detail = `全部 Agent 探测完成，已更新 ${succeeded} / ${jobs.length} 项模型目录。${skipped ? `另有 ${skipped} 项因运行环境不可用而跳过。` : ""}${failures.length ? `刷新失败：${failures.join("；")}` : jobs.length ? "" : "请先登录或添加可用凭据。"}`;
       setRefreshReport({ kind: failures.length || skipped || !jobs.length ? "warn" : "ok", detail });
     } catch (error) {
@@ -538,6 +435,10 @@ export function AgentsSettings({ taskSettings = false, navigation, onCredentials
     };
   }, [loadData]);
 
+  const pendingAware = (error: unknown, prefix: string) => {
+    const pending = error instanceof Error && error.name === "RuntimeOperationPending";
+    showFeedback(pending ? "warn" : "bad", pending ? (error as Error).message : `${prefix}：${error instanceof Error ? error.message : String(error)}`);
+  };
   const probeEngine = async (item: EngineSummary) => {
     if (item.supportStatus !== "supported" || refreshInFlight.current) return;
     const key = currentInstanceRef.current?.key || item.primaryInstance?.key || `${engineCliAdapter(descriptors, item.engine)}:default`;
@@ -557,7 +458,7 @@ export function AgentsSettings({ taskSettings = false, navigation, onCredentials
       if (await loadData(true)) showFeedback(failed.length ? "warn" : "ok", failed.length
         ? `${item.label} 运行环境探测完成；模型目录刷新失败：${failed.map(({ credential, result }) => `${credential.label}：${result.detail}`).join("；")}`
         : `${item.label} 运行环境与模型目录已刷新。`);
-    } catch (error) { showFeedback(error instanceof Error && error.name === "RuntimeOperationPending" ? "warn" : "bad", error instanceof Error && error.name === "RuntimeOperationPending" ? error.message : `探测失败：${error instanceof Error ? error.message : String(error)}`); }
+    } catch (error) { pendingAware(error, "探测失败"); }
     finally { setBusyItem(""); }
   };
   const toggleEngine = async (item: EngineSummary) => {
@@ -568,118 +469,162 @@ export function AgentsSettings({ taskSettings = false, navigation, onCredentials
       const response = await apiFetch("/api/agent-runtimes", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ adapter_id: inst?.adapter_id || engineCliAdapter(descriptors, item.engine), instance_id: inst?.instance_id || "default", expected_revision: inst?.updated_at || "", enabled: !item.enabled }) });
       await assertRuntimeResponse(response, `${item.enabled ? "停用" : "启用"} ${item.label}`);
       if (await loadData(true)) showFeedback("ok", `${item.label} 已${item.enabled ? "停用" : "启用"}。`);
-    } catch (error) { showFeedback(error instanceof Error && error.name === "RuntimeOperationPending" ? "warn" : "bad", error instanceof Error && error.name === "RuntimeOperationPending" ? error.message : `操作失败：${error instanceof Error ? error.message : String(error)}`); }
+    } catch (error) { pendingAware(error, "操作失败"); }
     finally { setBusyItem(""); }
   };
-  const refreshCandidateModels = async () => {
-    if (!currentEngine || !selectedCredential || refreshInFlight.current) return;
-    const system = selectedCredential.source === "system";
-    if (!system && editConnection === "custom_endpoint" && !editBaseUrl.trim()) {
-      setModelRefreshFeedback({ kind: "bad", detail: "更新失败：请先填写 Base URL。" });
-      showFeedback("bad", "自定义端点需要填写 Base URL，才能更新候选模型。");
-      return;
-    }
-    const requestIdentity = editIdentity;
-    setModelRefreshFeedback(null);
-    setBusyItem("refresh-models");
+
+  const findCredential = (id: string) => currentEngine?.credentials.find((item) => item.id === id) || null;
+  const refreshGroupModels = async (id: string) => {
+    const item = findCredential(id);
+    if (!currentEngine || !item || refreshInFlight.current) return;
+    const system = item.source === "system";
+    setBusyItem(`refresh:${id}`);
     try {
-      const result = await refreshCredentialModels(selectedCredential.id, {
+      const result = await refreshCredentialModels(id, {
         engine: currentEngine.engine,
-        connection: system ? "official" : editConnection,
-        base_url: !system && editConnection === "custom_endpoint" ? editBaseUrl.trim() : "",
-        secret: system ? "" : editSecret.trim(),
+        connection: system || item.connection !== "custom_endpoint" ? "official" : "custom_endpoint",
+        base_url: !system && item.connection === "custom_endpoint" ? item.base_url || "" : "",
         backend: system ? "local" : backend,
         runtime_instance: runtimeKey,
       });
-      if (editIdentityRef.current !== requestIdentity) return;
-      if (!result.ok) {
-        const detail = `更新失败：${result.detail || "服务未返回模型"}`;
-        await loadData(true);
-        if (editIdentityRef.current !== requestIdentity) return;
-        setModelRefreshFeedback({ kind: "bad", detail });
-        showFeedback("bad", `更新候选模型失败：${result.detail || "服务未返回模型"}`);
-        return;
-      }
-      setEditModelsText(result.models.join("\n"));
-      if (editDefaultModel && !result.models.includes(editDefaultModel)) {
-        setEditDefaultModel(result.models[0] || "");
-      } else if (!editDefaultModel && result.models[0]) {
-        setEditDefaultModel(result.models[0]);
-      }
       await loadData(true);
-      if (selectedCredentialRef.current?.id !== selectedCredential.id) return;
-      setModelRefreshFeedback({
-        kind: "ok",
-        detail: `更新成功：${result.detail || `已获取 ${result.models.length} 个候选模型。`}`,
-      });
-      showFeedback("ok", result.detail || `已更新 ${result.models.length} 个候选模型。`);
-    } catch (error) {
-      if (editIdentityRef.current !== requestIdentity) return;
-      const detail = `更新失败：${error instanceof Error ? error.message : String(error)}`;
-      setModelRefreshFeedback({ kind: "bad", detail });
-      showFeedback("bad", `更新候选模型失败：${error instanceof Error ? error.message : String(error)}`);
-    } finally {
-      setBusyItem("");
-    }
-  };
-  const saveCredential = async () => {
-    if (!currentEngine || !selectedCredential || selectedCredential.source !== "stored") return;
-    if (editConnection === "custom_endpoint" && !editBaseUrl.trim()) { showFeedback("bad", "自定义端点需要填写 Base URL。"); return; }
-    const accountId = selectedCredential.account_id || selectedCredential.id.replace(/^account:/, "");
-    const requestIdentity = editIdentity;
-    const savedCredentialId = selectedCredential.id;
-    setBusyItem("save-credential");
-    try {
-      const secretPatch = editSecret.trim() ? editConnection === "official" && authHomeSecret(currentEngine.engine) ? { codex_auth_json: editSecret.trim() } : { secret: editSecret.trim() } : {};
-      const savedAccount = await putCredentialAccount(accountId, { expected_revision: editBaseRevision, engine: editConnection === "custom_endpoint" ? "api" : currentEngine.engine, worker_engine: currentEngine.engine, target_engine: editConnection === "custom_endpoint" ? currentEngine.engine : undefined, connection: editConnection, provider: editConnection === "custom_endpoint" ? editProvider.trim() : undefined, base_url: editConnection === "custom_endpoint" ? editBaseUrl.trim() : "", target_model: editDefaultModel.trim(), models: splitModels(editModelsText), ...secretPatch });
-      const testStatusPreserved = Boolean(savedAccount?.test_status_preserved);
-      if (savedAccount?.revision !== editBaseRevision && !testStatusPreserved) {
-        setTestResults((current) => { const next = { ...current }; delete next[savedCredentialId]; return next; });
-      }
-      if (editIdentityRef.current === requestIdentity) setEditSecret("");
-      await loadData(true); onCredentialsChanged?.("save");
-      if (selectedCredentialRef.current?.id !== savedCredentialId) return;
-      setEditBaseRevision(savedAccount?.revision);
-      showFeedback("ok", `${credentialName(selectedCredential)} 已保存。`);
-    } catch (error) { showFeedback("bad", `保存失败：${error instanceof Error ? error.message : String(error)}`); }
+      showFeedback(result.ok ? "ok" : "bad", result.ok ? result.detail || `${credentialName(item)}：已更新 ${result.models.length} 个模型。` : `更新模型失败：${result.detail || "服务未返回模型"}`);
+    } catch (error) { showFeedback("bad", `更新模型失败：${error instanceof Error ? error.message : String(error)}`); }
     finally { setBusyItem(""); }
   };
-  const testModel = editDefaultModel.trim() || selectedCredential?.default_model || (selectedCredential ? credentialModels(selectedCredential)[0] : "") || "";
-  const testCredential = async () => {
-    if (!currentEngine || !selectedCredential) return;
-    if (editHasUnsavedEndpoint) { showFeedback("bad", "请先保存当前端点与凭据，再测试已保存配置。"); return; }
-    const credentialId = selectedCredential.id;
-    const requestIdentity = editIdentity;
-    setBusyItem("test-credential");
-    setTestOpen(true);
-    setTestResults((current) => {
-      const next = { ...current };
-      delete next[credentialId];
-      return next;
-    });
+  const testGroup = async (id: string) => {
+    const item = findCredential(id);
+    if (!currentEngine || !item) return;
+    const model = scopeCredential(item).default_model || credentialModels(scopeCredential(item))[0] || "";
+    viewTest(id);
+    setBusyItem(`test:${id}`);
+    setTestResults((current) => { const next = { ...current }; delete next[id]; return next; });
     try {
-      const result = await testGlobalCredential(credentialId, currentEngine.engine, backend, testModel, runtimeKey);
-      if (editIdentityRef.current !== requestIdentity) return;
-      setTestResults((current) => ({ ...current, [credentialId]: result }));
+      const result = await testGlobalCredential(id, currentEngine.engine, backend, model, runtimeKey);
+      setTestResults((current) => ({ ...current, [id]: result }));
       await loadData(true);
     } catch (error) {
       const detail = `测试异常：${error instanceof Error ? error.message : String(error)}`;
-      setTestResults((current) => ({
-        ...current,
-        [credentialId]: {
-          ok: false,
-          detail,
-          model: testModel,
-          engine: currentEngine.engine,
-          backend,
-          logs: [{ stream: "error", message: detail, elapsed_ms: 0 }],
-        },
-      }));
+      setTestResults((current) => ({ ...current, [id]: { ok: false, detail, model, engine: currentEngine.engine, backend, logs: [{ stream: "error", message: detail, elapsed_ms: 0 }] } }));
     } finally { setBusyItem(""); }
   };
-  // Only structured adapters receive resolved env_refs; the CLI compatibility builder ignores them.
+  const viewTest = (id: string) => setTestShown((current) => new Set(current).add(id));
+  const hideTest = (id: string) => setTestShown((current) => { const next = new Set(current); next.delete(id); return next; });
+
+  /** Opening another in-place panel drops an unsaved draft, so ask first. Returns false when the user keeps editing. */
+  const requestPanel = (next: Panel | null) => {
+    if (panelDirty.current && !window.confirm("当前编辑尚未保存，放弃这些修改？")) return false;
+    panelDirty.current = false;
+    setDeleteError(""); setImportError("");
+    setPanel(next);
+    return true;
+  };
+  const closePanel = () => {
+    panelDirty.current = false;
+    setPanel(null);
+    if (selection.credentialId && currentEngine) applySelection({ engine: currentEngine.engine, instanceId: selection.instanceId, credentialId: "" }, "replace");
+  };
+  useEffect(() => {
+    if (panel && panel.engine !== currentEngine?.engine) { panelDirty.current = false; setPanel(null); }
+  }, [currentEngine?.engine, panel]);
+  const openCreate = () => { if (currentEngine) requestPanel({ kind: "create", engine: currentEngine.engine, nonce: Date.now() }); };
+  const openFor = (kind: "edit" | "delete" | "import") => (id: string) => { if (currentEngine) requestPanel({ kind, id, engine: currentEngine.engine, nonce: Date.now() }); };
+  const urlCredentialHandled = useRef("");
+  useEffect(() => {
+    if (!selection.credentialId || urlCredentialHandled.current === selection.credentialId || !currentEngine) return;
+    const item = currentEngine.credentials.find((row) => row.id === selection.credentialId && row.source === "stored");
+    if (!item) return;
+    urlCredentialHandled.current = selection.credentialId;
+    setPanel({ kind: "edit", id: item.id, engine: currentEngine.engine, nonce: Date.now() });
+  }, [currentEngine, selection.credentialId]);
+
+  const submitCredential = async (values: CredentialValues, baseRevision?: string) => {
+    if (!panel || (panel.kind !== "create" && panel.kind !== "edit")) return;
+    const engine = panel.engine;
+    const label = engines.find((item) => item.engine === engine)?.label || engine;
+    const custom = values.connection === "custom_endpoint";
+    const secretPatch = values.secret ? (!custom && authHomeSecret(engine) ? { codex_auth_json: values.secret } : { secret: values.secret }) : {};
+    const common = {
+      engine: custom ? "api" : engine, worker_engine: engine, target_engine: custom ? engine : undefined, connection: values.connection,
+      provider: custom ? values.provider : undefined, base_url: custom ? values.baseUrl : "", target_model: values.defaultModel, models: values.models, ...secretPatch,
+    };
+    if (panel.kind === "edit") {
+      const item = findCredential(panel.id);
+      if (!item) throw new Error("该凭据已不存在。");
+      const saved = await putCredentialAccount(item.account_id || item.id.replace(/^account:/, ""), { expected_revision: baseRevision, ...common });
+      if (saved?.revision !== baseRevision && !saved?.test_status_preserved) {
+        setTestResults((current) => { const next = { ...current }; delete next[item.id]; return next; });
+        hideTest(item.id);
+      }
+      await loadData(true); onCredentialsChanged?.("save");
+      showFeedback("ok", `${credentialName(item)} 已保存。`);
+      return;
+    }
+    const id = values.accountId;
+    if (!id) throw new Error("请填写凭据 ID。");
+    if (credentials.some((item) => item.account_id === id || item.id === `account:${id}`)) throw new Error("该凭据 ID 已存在，请使用不同 ID。");
+    await putCredentialAccount(id, { create_only: true, ...common });
+    await loadData(true); onCredentialsChanged?.("create");
+    setFocusGroup(`account:${id}`);
+    if (values.models.length) { showFeedback("ok", `${label} 已新增接入方式 ${id}。`); return; }
+    // The new card is already on screen; its models arrive while it shows a refreshing state.
+    setBusyItem(`refresh:account:${id}`);
+    void refreshCredentialModels(`account:${id}`, { engine, backend, runtime_instance: runtimeKey }).then(async (result) => {
+      await loadData(true);
+      showFeedback(result.ok ? "ok" : "warn", result.ok ? `${label} 已添加 ${id}，读取到 ${result.models.length} 个模型。` : `${label} 已添加 ${id}，但读取模型失败：${result.detail || "服务未返回模型"}`);
+    }).finally(() => setBusyItem(""));
+  };
+  const refreshEditorModels = async (values: { connection: "official" | "custom_endpoint"; baseUrl: string; secret: string }) => {
+    const item = panel?.kind === "edit" ? findCredential(panel.id) : null;
+    if (!currentEngine || (panel?.kind === "edit" && !item)) return { ok: false, models: [], detail: "该凭据已不存在。" };
+    // A new access method has no id yet; the draft is read with its own connection and key and nothing is stored.
+    const result = await refreshCredentialModels(item?.id ?? "account:draft-check", {
+      engine: currentEngine.engine, connection: values.connection, base_url: values.connection === "custom_endpoint" ? values.baseUrl : "",
+      secret: values.secret, backend, runtime_instance: runtimeKey,
+    });
+    if (item) void loadData(true);
+    return { ok: result.ok, models: result.models, detail: result.ok ? result.detail || `已获取 ${result.models.length} 个模型。` : result.detail };
+  };
+  const testEditorDraft = (values: DraftTestValues) => {
+    const engine = currentEngine?.engine || "";
+    const official = values.connection === "official";
+    return testCredentialDraft({
+      engine, backend, connection: values.connection, model: values.model, provider: values.provider,
+      base_url: official ? "" : values.baseUrl,
+      ...(official && authHomeSecret(engine) ? { codex_auth_json: values.secret } : { secret: values.secret }),
+    });
+  };
+  const deleteCredential = async (item: GlobalCredential) => {
+    const id = item.account_id || item.id.replace(/^account:/, "");
+    setDeleting(true); setDeleteError("");
+    try {
+      const deleted = await deleteCredentialAccount(id, true);
+      if (!deleted) throw new Error("服务未确认删除成功，引用保持原状，请刷新后重试。");
+      setPanel(null); hideTest(item.id);
+      await loadData(true); onCredentialsChanged?.("delete");
+      showFeedback("ok", `凭据 ${id} 及其配置引用已删除。`);
+    }
+    catch (error) { setDeleteError(error instanceof Error ? error.message : String(error)); }
+    finally { setDeleting(false); }
+  };
+  const importSystemLogin = async (id: string) => {
+    if (!currentEngine) return;
+    setBusyItem("import-system"); setImportError("");
+    try {
+      const engine = currentEngine.engine;
+      const hostImport = hostLoginImport(engine);
+      const result = hostImport === "codex_auth_json" ? await importHostCodexAuth(id) : hostImport !== "none" ? await importHostWorkerLogin(id, engine) : { ok: false, detail: "该引擎暂不支持导入宿主登录。" };
+      if (!result.ok) throw new Error(result.detail || "请检查宿主 CLI 登录状态");
+      setPanel(null); setFocusGroup(`account:${id}`);
+      await loadData(true); onCredentialsChanged?.("import");
+      showFeedback("ok", `宿主登录已导入为 ${id}。`);
+    } catch (error) { setImportError(error instanceof Error ? error.message : String(error)); }
+    finally { setBusyItem(""); }
+  };
+
   const currentAdapter = currentInstance ? adapterDescriptor(descriptors, currentInstance.adapter_id) : undefined;
   const currentDescriptor = currentEngine ? descriptorForEngine(descriptors, currentEngine.engine) : undefined;
+  const currentTransportFields = currentInstance ? currentInstance.config_schema?.properties?.transport?.properties ?? declaredTransportFields(descriptors, currentInstance.adapter_id) : {};
   const connectionOptions: ListOption[] = !taskSettings ? (currentDescriptor?.adapters || [])
     .filter((item) => item.role === "default" || item.role === "variant")
     .map((item) => ({
@@ -691,361 +636,107 @@ export function AgentsSettings({ taskSettings = false, navigation, onCredentials
   const accessModeRows = currentAdapter ? Array.from(new Set([
     ...currentAdapter.capabilities.access_modes, ...Object.keys(currentAdapter.access_mode_notes),
   ])) : [];
+  // Only structured adapters receive resolved env_refs; the CLI compatibility builder ignores them.
   const envEditable = Boolean(currentAdapter && currentAdapter.role !== "cli");
-  const saveRuntime = async () => {
+  const saveRuntime = async (values: RuntimeValues, baseRevision: string) => {
     if (!currentEngine) return;
-    const targetKey = currentInstance?.key || `${engineCliAdapter(descriptors, currentEngine.engine)}:default`;
-    const env = envRefsPayload(editEnvRefs);
-    if (envEditable && env.error) { showFeedback("bad", `保存失败：环境变量 ${env.error}`); return; }
-    setBusyItem("save-runtime");
     try {
-      const response = await apiFetch("/api/agent-runtimes", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expected_revision: runtimeBaseRevision, adapter_id: currentInstance?.adapter_id || engineCliAdapter(descriptors, currentEngine.engine), instance_id: currentInstance?.instance_id || "default", label: currentInstance?.label || currentEngine.label, binary_path: editBinaryPath.trim(), endpoint: editEndpoint.trim(), transport: editTransport, ...(envEditable ? { env_refs: env.refs, launch_args: launchArgsPayload(editLaunchArgs) } : {}), enabled: currentEngine.enabled }) });
+      const response = await apiFetch("/api/agent-runtimes", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expected_revision: baseRevision, adapter_id: currentInstance?.adapter_id || engineCliAdapter(descriptors, currentEngine.engine), instance_id: currentInstance?.instance_id || "default", label: currentInstance?.label || currentEngine.label, ...values, enabled: currentEngine.enabled }) });
       const payload = await assertRuntimeResponse(response, `保存 ${currentEngine.label} 接入配置`);
-      if (currentInstanceRef.current?.key === targetKey) setRuntimeBaseRevision(payload.receipt?.output?.instance?.updated_at || runtimeBaseRevision);
       if (await loadData(true)) showFeedback("ok", `${currentEngine.label} 的接入与环境配置已保存。`);
-    } catch (error) { showFeedback(error instanceof Error && error.name === "RuntimeOperationPending" ? "warn" : "bad", error instanceof Error && error.name === "RuntimeOperationPending" ? error.message : `保存失败：${error instanceof Error ? error.message : String(error)}`); }
-    finally { setBusyItem(""); }
-  };
-  const importSystemLogin = async () => {
-    if (!currentEngine || !selectedCredential || selectedCredential.source !== "system") return;
-    const id = importAccountId.trim(); if (!id) { showFeedback("bad", "请填写导入后的凭据 ID。"); return; }
-    setBusyItem("import-system");
-    try {
-      const engine = currentEngine.engine;
-      const hostImport = hostLoginImport(engine);
-      const result = hostImport === "codex_auth_json" ? await importHostCodexAuth(id) : hostImport !== "none" ? await importHostWorkerLogin(id, engine) : { ok: false, detail: "该引擎暂不支持导入宿主登录。" };
-      if (!result.ok) throw new Error(result.detail || "请检查宿主 CLI 登录状态");
-      await loadData(true); onCredentialsChanged?.("import");
-      applySelection({ engine, instanceId: selection.instanceId, credentialId: `account:${id}` }, "replace");
-      showFeedback("ok", `宿主登录已导入为 ${id}。`);
-    } catch (error) { showFeedback("bad", `导入失败：${error instanceof Error ? error.message : String(error)}`); }
-    finally { setBusyItem(""); }
-  };
-  const openCreateCredential = () => {
-    if (!currentEngine) return;
-    setNewDraft(EMPTY_DRAFT); setCreateError(""); setCreateEngine(currentEngine.engine); setCreateOpen(true);
-  };
-  const closeCreateCredential = () => {
-    setCreateOpen(false); setCreateError(""); setNewDraft(EMPTY_DRAFT); setCreateEngine(null);
-  };
-  const createCredential = async () => {
-    if (!currentEngine || createEngine !== currentEngine.engine) { setCreateError("新增目标已改变，请重新打开新增凭据。"); return; }
-    const engine = currentEngine.engine;
-    const id = newDraft.accountId.trim();
-    if (!id) { setCreateError("请填写凭据 ID。"); return; }
-    if (credentials.some((item) => item.account_id === id || item.id === `account:${id}`)) { setCreateError("该凭据 ID 已存在，请使用不同 ID。"); return; }
-    if (newDraft.connection === "custom_endpoint" && !newDraft.baseUrl.trim()) { setCreateError("请填写 Base URL。"); return; }
-    if (newDraft.connection === "custom_endpoint" && !newDraft.secret.trim()) { setCreateError("请填写 API Key。"); return; }
-    setCreating(true); setCreateError("");
-    try {
-      const secretPatch = newDraft.secret.trim() ? newDraft.connection === "official" && authHomeSecret(engine) ? { codex_auth_json: newDraft.secret.trim() } : { secret: newDraft.secret.trim() } : {};
-      await putCredentialAccount(id, { create_only: true, engine: newDraft.connection === "custom_endpoint" ? "api" : engine, worker_engine: engine, target_engine: newDraft.connection === "custom_endpoint" ? engine : undefined, connection: newDraft.connection, provider: newDraft.connection === "custom_endpoint" ? newDraft.provider.trim() : undefined, base_url: newDraft.connection === "custom_endpoint" ? newDraft.baseUrl.trim() : "", target_model: newDraft.defaultModel.trim(), models: splitModels(newDraft.modelsText), ...secretPatch });
-      setCreateOpen(false); setNewDraft(EMPTY_DRAFT);
-      await loadData(true); onCredentialsChanged?.("create");
-      applySelection({ engine, instanceId: selection.instanceId, credentialId: `account:${id}` }, "replace");
-      showFeedback("ok", `${currentEngine.label} 已新增凭据 ${id}。`);
-    } catch (error) { setCreateError(error instanceof Error ? error.message : String(error)); }
-    finally { setCreating(false); }
-  };
-  const deleteCredential = async () => {
-    if (!deleteTarget) return;
-    const id = deleteTarget.account_id || deleteTarget.id.replace(/^account:/, "");
-    const deletedId = deleteTarget.id;
-    setDeleting(true); setDeleteError("");
-    try {
-      const deleted = await deleteCredentialAccount(id, true);
-      if (!deleted) throw new Error("服务未确认删除成功，引用保持原状，请刷新后重试。");
-      setDeleteTarget(null);
-      if (selectedCredentialRef.current?.id === deletedId && currentEngineRef.current) {
-        applySelection({ engine: currentEngineRef.current.engine, instanceId: selection.instanceId, credentialId: "" }, "replace");
-      }
-      await loadData(true); onCredentialsChanged?.("delete");
-      showFeedback("ok", `凭据 ${id} 及其配置引用已删除。`);
+      return String(payload.receipt?.output?.instance?.updated_at || baseRevision);
+    } catch (error) {
+      if (error instanceof Error && error.name === "RuntimeOperationPending") { showFeedback("warn", error.message); return; }
+      throw error;
     }
-    catch (error) { setDeleteError(error instanceof Error ? error.message : String(error)); }
-    finally { setDeleting(false); }
   };
+
   const selectChatDefault = (credentialId: string, modelId: string) => {
     if (!credentialId || !modelId) return;
     const next = { credentialId, modelId };
     if (!writeChatDefaultModel(next)) { showFeedback("bad", "默认模型未保存：共享偏好未能提交，请查看同步提示。"); return; }
-    setChatDefaultCredentialId(credentialId); setChatDefaultModelId(modelId); setChatDefault(next);
+    setChatDefault(next);
   };
+  const defaultLabel = useMemo(() => {
+    if (!chatDefault) return "";
+    const credential = credentials.find((item) => item.id === chatDefault.credentialId);
+    const engine = credential ? engines.find((item) => item.engine === asEngine(descriptors, credential.engine)) : null;
+    return `${engine?.label || credential?.engine || ""} · ${credential ? credentialName(credential) : chatDefault.credentialId} / ${chatDefault.modelId}`;
+  }, [chatDefault, credentials, descriptors, engines]);
 
-  const testingCredential = busyItem === "test-credential";
-  const liveTestResult = selectedCredential && !editHasUnsavedEndpoint ? testResults[selectedCredential.id] || null : null;
-  const candidateTestResult = liveTestResult || (!editHasUnsavedEndpoint && selectedCredential && currentEngine ? lastTestAsResult(selectedCredential, currentEngine.engine) : null);
-  const displayedTestResult = candidateTestResult?.backend === backend && (!testModel || candidateTestResult.model === testModel) ? candidateTestResult : null;
-  const liveStatus = selectedCredential ? credentialLiveStatus(selectedCredential, displayedTestResult, testingCredential) : null;
-  const systemModels = selectedCredential ? credentialModels(selectedCredential) : [];
-  const verifiedModels = selectedCredential?.models || [];
-  const firstSystemModel = systemModels[0] || "";
-  useEffect(() => {
-    if (editDefaultModel || !firstSystemModel) return;
-    setEditDefaultModel(firstSystemModel);
-  }, [editDefaultModel, firstSystemModel]);
-
-  const capabilityEntries = Object.entries(currentInstance?.health?.capabilities || {});
-  const instanceOptions: ListOption<string>[] = (currentEngine?.instances || []).map((instance) => ({
-    value: instance.instance_id,
-    label: instance.label || instance.instance_id,
-    description: instance.key,
-  }));
-
-  const renderCredentialRow = (item: GlobalCredential) => {
-    if (!currentEngine) return null;
-    const scopedItem = item.last_tests ? { ...item, last_test: item.last_tests[runtimeKey] || null } : item;
-    const expanded = selectedCredential?.id === item.id;
-    const rowResult = testResults[item.id] || lastTestAsResult(scopedItem, currentEngine.engine);
-    const rowStatus = credentialLiveStatus(scopedItem, expanded ? displayedTestResult : rowResult, expanded && testingCredential);
+  const probing = Boolean(currentEngine && busyItem === `probe:${currentEngine.engine}`);
+  const authJson = currentEngine ? authHomeSecret(currentEngine.engine) : false;
+  const createPanel = currentEngine && panel?.kind === "create" ? (
+    <CredentialEditor
+      key={panel.nonce} mode="create" engineLabel={currentEngine.label} credential={null} authJson={authJson}
+      onClose={closePanel} onSubmit={submitCredential} onRefreshModels={refreshEditorModels} onTestDraft={testEditorDraft} onDirtyChange={(dirty) => { panelDirty.current = dirty; }}
+    />
+  ) : null;
+  const renderExtra = (group: ModelGroup) => {
+    const item = findCredential(group.id);
+    if (!currentEngine || !item) return null;
+    const active = panel && panel.kind !== "create" && panel.id === group.id ? panel : null;
+    const result = testResults[item.id] || lastTestAsResult(scopeCredential(item), currentEngine.engine);
     return (
-      <div key={item.id} className="border-b border-cx-border-subtle last:border-b-0">
-        <button
-          type="button"
-          aria-expanded={expanded}
-          onClick={() => toggleCredentialRow(item)}
-          className="flex w-full items-center gap-3 px-5 py-3 text-left outline-none transition-colors hover:bg-cx-hover focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-[var(--cx-focus)]"
-        >
-          {["warn", "bad"].includes(rowStatus.kind) ? <StatusDot tone={statusTone(rowStatus.kind)} label={rowStatus.text} /> : null}
-          <span className="min-w-0 flex-1">
-            <span className="flex items-center gap-1.5 text-[13.5px] font-medium text-cx-fg">
-              <span className="truncate">{credentialName(item)}</span>
-              {chatDefault?.credentialId === item.id ? <Icon name="star" size={12} filled className="shrink-0 text-cx-warning" aria-label="新对话默认凭据" /> : null}
-            </span>
-            <span className="mt-0.5 block truncate text-[11.5px] leading-4 text-cx-fg-3">
-              {item.source === "system" ? "宿主登录" : item.connection === "custom_endpoint" ? "自定义端点" : "官方账号"} · {rowStatus.text}
-            </span>
-          </span>
-          <Icon name="chevronDown" size={15} className={cn("shrink-0 text-cx-fg-3 transition-transform", expanded && "rotate-180")} />
-        </button>
-        <Collapse open={expanded}>
-          {expanded && selectedCredential && liveStatus ? (
-            <div className="flex flex-col gap-4 border-t border-cx-border-subtle px-5 py-4">
-              <div className="flex flex-wrap items-center gap-2">
-                <Badge tone={statusTone(liveStatus.kind)} dot>{liveStatus.text}</Badge>
-                <span className="text-[12px] text-cx-fg-3">
-                  {selectedCredential.source === "system" ? "系统检测到的宿主登录状态" : `凭据 ID：${selectedCredential.account_id || selectedCredential.id.replace(/^account:/, "")}`}
-                </span>
-              </div>
-              {selectedCredential.sharing && <p className="text-[12.5px] text-cx-fg-3">{selectedCredential.sharing.reason}</p>}
-              {selectedCredential.source === "stored" && selectedCredential.revision !== editBaseRevision ? (
-                <Callout
-                  tone="warning"
-                  icon="alert"
-                  role="alert"
-                  action={<Button size="xs" variant="outline" onClick={() => {
-                    setEditBaseRevision(selectedCredential.revision); setEditConnection(selectedCredential.connection === "custom_endpoint" ? "custom_endpoint" : "official");
-                    setEditProvider(selectedCredential.provider || ""); setEditBaseUrl(selectedCredential.base_url || "");
-                    setEditDefaultModel(selectedCredential.default_model || ""); setEditModelsText((selectedCredential.candidate_models || selectedCredential.models).join("\n")); setEditSecret("");
-                  }}>载入最新配置并清除本地编辑</Button>}
-                >
-                  配置已在其它视图更新，本地编辑仍保留；请载入最新配置后重新核对。
-                </Callout>
-              ) : null}
-              {selectedCredential.source === "system" ? (
-                <>
-                  <div className="flex items-start gap-3 rounded-xl border border-cx-border bg-cx-bg-subtle px-4 py-3">
-                    <Icon name={credentialReady(selectedCredential) ? "checkCircle" : "info"} size={17} className={cn("mt-0.5 shrink-0", credentialReady(selectedCredential) ? "text-cx-success" : "text-cx-fg-3")} />
-                    <div className="min-w-0">
-                      <p className="text-[13px] font-medium text-cx-fg">{credentialReady(selectedCredential) ? "本机 CLI 登录可用" : "未检测到可用的本机 CLI 登录"}</p>
-                      <p className="mt-0.5 text-[12.5px] leading-5 text-cx-fg-3">{credentialReady(selectedCredential) ? "本地聊天与本地 Worker 可以直接使用。容器 Worker 需要导入为独立凭据。" : "请先完成该 CLI 的登录，再刷新探测。"}</p>
-                    </div>
-                  </div>
-                  {hostLoginImport(currentEngine.engine) !== "none" ? (
-                    <div className="flex flex-wrap items-end gap-2">
-                      <TextField
-                        label="导入后的凭据 ID"
-                        value={importAccountId}
-                        onChange={(event) => setImportAccountId(event.target.value)}
-                        containerClassName="min-w-[220px] flex-1"
-                      />
-                      <Button size="sm" variant="outline" icon="upload" loading={busyItem === "import-system"} disabled={!credentialReady(selectedCredential)} onClick={() => void importSystemLogin()}>
-                        {busyItem === "import-system" ? "导入中…" : "导入为独立凭据"}
-                      </Button>
-                    </div>
-                  ) : null}
-                  <div>
-                    <div className="flex items-center justify-between gap-3">
-                      <p className="text-[13px] font-medium text-cx-fg">模型目录</p>
-                      <Button size="xs" variant="outline" icon="refresh" loading={busyItem === "refresh-models"} disabled={refreshing} onClick={() => void refreshCandidateModels()}>刷新模型</Button>
-                    </div>
-                    {modelRefreshFeedback ? <p role={modelRefreshFeedback.kind === "bad" ? "alert" : "status"} className={cn("mt-2 text-[12.5px]", modelRefreshFeedback.kind === "bad" ? "text-cx-danger" : "text-cx-success")}>{modelRefreshFeedback.detail}</p> : null}
-                    <p className="mt-0.5 text-[12.5px] leading-5 text-cx-fg-3">
-                      {credentialReady(selectedCredential) ? `来自当前运行环境的模型目录。选中的模型会用于真实连通测试。${catalogSummary(selectedCredential.model_catalog)}` : "本机登录可用后，会列出该引擎当前可用的模型。"}
-                    </p>
-                    {systemModels.length ? (
-                      <div className="mt-2 flex flex-wrap gap-1.5" role="list">
-                        {systemModels.map((model) => (
-                          <Button
-                            key={model}
-                            size="xs"
-                            variant={editDefaultModel === model ? "primary" : "outline"}
-                            aria-pressed={editDefaultModel === model}
-                            onClick={() => setEditDefaultModel(model)}
-                          >
-                            <code>{model}</code>
-                            {verifiedModels.includes(model) ? <span className="text-[10.5px] opacity-80">已测通</span> : null}
-                          </Button>
-                        ))}
-                      </div>
-                    ) : (
-                      <p className="mt-2 text-[12.5px] text-cx-fg-3">尚未发现可用模型。</p>
-                    )}
-                  </div>
-                </>
-              ) : (
-                <div className="grid gap-4">
-                  <fieldset disabled={selectedCredential.sharing?.readonly} className="grid gap-4">
-                  <div>
-                    <span className="mb-1.5 block text-[12.5px] font-medium text-cx-fg-2">连接方式</span>
-                    <Select value={editConnection} onChange={(value) => setEditConnection(value)} options={CONNECTION_OPTIONS} ariaLabel="连接方式" className="w-full sm:max-w-[280px]" />
-                  </div>
-                  {editConnection === "custom_endpoint" ? (
-                    <>
-                      <p className="flex items-start gap-1.5 rounded-xl border border-cx-border bg-cx-bg-subtle px-3 py-2 text-[12.5px] leading-5 text-cx-fg-3">
-                        <Icon name="info" size={14} className="mt-0.5 shrink-0" />
-                        <span><strong className="text-cx-fg-2">两种使用方式：</strong>Worker 使用当前 {currentEngine.label} 引擎调用；Reason / Titler 复用同一端点时，由 Muteki 后端直接发送 HTTP 请求，不会启动该 Agent。</span>
-                      </p>
-                      <div className="grid gap-4 sm:grid-cols-2">
-                        <TextField label="Base URL" placeholder="https://api.example.com/v1" value={editBaseUrl} onChange={(event) => setEditBaseUrl(event.target.value)} />
-                        <TextField label="服务名称" placeholder="团队网关 / 模型服务" value={editProvider} onChange={(event) => setEditProvider(event.target.value)} />
-                      </div>
-                    </>
-                  ) : null}
-                  <TextField
-                    label={authHomeSecret(currentEngine.engine) && editConnection === "official" ? "Auth JSON" : "Secret / Token / API Key"}
-                    type={showSecret ? "text" : "password"}
-                    placeholder="留空时保留已保存的凭据"
-                    value={editSecret}
-                    onChange={(event) => setEditSecret(event.target.value)}
-                    trailing={
-                      <button
-                        type="button"
-                        aria-label={showSecret ? "隐藏凭据" : "显示凭据"}
-                        onClick={() => setShowSecret((value) => !value)}
-                        className="grid size-6 place-items-center rounded-md text-cx-fg-4 hover:bg-cx-hover hover:text-cx-fg"
-                      >
-                        <Icon name={showSecret ? "eyeOff" : "eye"} size={14} />
-                      </button>
-                    }
-                  />
-                  </fieldset>
-                  <div>
-                    <TextField
-                      label="默认模型"
-                      list={`agent-credential-models-${selectedCredential.id}`}
-                      autoComplete="off"
-                      placeholder="输入或选择模型 ID"
-                      value={editDefaultModel}
-                      onChange={(event) => setEditDefaultModel(event.target.value)}
-                    />
-                    <datalist id={`agent-credential-models-${selectedCredential.id}`}>
-                      {splitModels(editModelsText).map((model) => <option key={model} value={model} />)}
-                    </datalist>
-                  </div>
-                  <CandidateModelsField value={editModelsText} refreshing={refreshing || busyItem === "refresh-models"} onRefresh={() => void refreshCandidateModels()} catalog={selectedCredential.model_catalog} feedback={modelRefreshFeedback} />
-                </div>
-              )}
-              {displayedTestResult ? (
-                <button
-                  type="button"
-                  onClick={() => setTestOpen(true)}
-                  className={cn(
-                    "flex items-center gap-2 rounded-xl border px-3 py-2 text-left outline-none transition-colors focus-visible:outline-2 focus-visible:outline-[var(--cx-focus)]",
-                    displayedTestResult.ok ? "border-cx-border bg-cx-success-soft/40 hover:bg-cx-success-soft" : "border-cx-border bg-cx-danger-soft/40 hover:bg-cx-danger-soft",
-                  )}
-                >
-                  <Icon name={displayedTestResult.ok ? "checkCircle" : "alert"} size={15} className={displayedTestResult.ok ? "text-cx-success" : "text-cx-danger"} />
-                  <span className="min-w-0 flex-1">
-                    <span className="block text-[12.5px] font-medium text-cx-fg">{displayedTestResult.ok ? "最近一次真实连通：可用" : "最近一次真实连通：不可用"}</span>
-                    <span className="block truncate text-[11.5px] text-cx-fg-3">{[displayedTestResult.detail, displayedTestResult.backend === "container" ? "容器环境" : "本地环境", formatTestTime(displayedTestResult.tested_at)].filter(Boolean).join(" · ")}</span>
-                  </span>
-                  <Icon name="chevronRight" size={14} className="shrink-0 text-cx-fg-3" />
-                </button>
-              ) : (
-                <p className="text-[12.5px] text-cx-fg-3">还没有真实连通记录。点下方按钮后会弹出测试终端，显示该凭据是否可用。</p>
-              )}
-              <div className="flex flex-wrap items-center gap-2">
-                {taskSettings && <Select size="sm" value={backend} onChange={(value) => setBackend(value)} options={BACKEND_OPTIONS} ariaLabel="连通测试后端" />}
-                <Button size="sm" variant="outline" icon="plug" loading={testingCredential} onClick={() => void testCredential()}>
-                  {testingCredential ? "测试中…" : "真实连通测试"}
-                </Button>
-                {selectedCredential.source === "stored" ? (
-                  <>
-                    <span className="flex-1" />
-                    <Button size="sm" variant="primary" icon="check" loading={busyItem === "save-credential"} onClick={() => void saveCredential()}>
-                      {busyItem === "save-credential" ? "保存中…" : selectedCredential.sharing?.readonly ? "保存本环境模型设置" : "保存凭据"}
-                    </Button>
-                    <Button size="sm" variant="danger-soft" icon="trash" disabled={selectedCredential.sharing?.readonly} onClick={() => { setDeleteError(""); setDeleteTarget(selectedCredential); }}>删除</Button>
-                  </>
-                ) : null}
-              </div>
-            </div>
-          ) : null}
-        </Collapse>
-      </div>
+      <>
+        {active?.kind === "edit" ? (
+          <CredentialEditor
+            key={active.nonce} mode="edit" engineLabel={currentEngine.label} credential={scopeCredential(item)} authJson={authJson}
+            onClose={closePanel} onSubmit={submitCredential} onRefreshModels={refreshEditorModels} onTestDraft={testEditorDraft} onDirtyChange={(dirty) => { panelDirty.current = dirty; }}
+            onDelete={() => openFor("delete")(item.id)}
+          />
+        ) : null}
+        {active?.kind === "delete" ? <DeleteConfirm key={active.nonce} credential={item} busy={deleting} error={deleteError} onCancel={closePanel} onConfirm={() => void deleteCredential(item)} /> : null}
+        {active?.kind === "import" ? (
+          <ImportRow key={active.nonce} initialId={`${currentEngine.engine}-account`} busy={busyItem === "import-system"} error={importError} onCancel={closePanel} onImport={(id) => void importSystemLogin(id)} />
+        ) : null}
+        {testShown.has(item.id) && (result || group.testing) ? <TestSummary result={group.testing ? null : result} testing={group.testing} onClose={() => hideTest(item.id)} /> : null}
+      </>
     );
   };
+  const emptyGroups = currentEngine && !groups.length ? (
+    <div className="cx-settings-card"><EmptyState icon="plug" title="尚未添加接入方式" description="添加官方账号或自定义端点后，这里会列出它的模型和价格。" action={<Button size="sm" variant="primary" icon="plus" onClick={openCreate}>新增接入方式</Button>} /></div>
+  ) : null;
 
   return (
-    <div className="agents-settings @container/agents flex w-full min-w-0 flex-col gap-6" aria-busy={loading || refreshing}>
+    <div ref={rootRef} className="agents-settings @container/agents flex w-full min-w-0 flex-col gap-4" aria-busy={loading || refreshing}>
       <div className={cn("flex flex-wrap items-center gap-3", taskSettings ? "justify-end" : "justify-between")}>
-        {!taskSettings ? <p className="text-[13px] leading-5 text-cx-fg-3">选择左侧引擎，在右侧管理它的凭据、接入方式与模型。</p> : null}
+        {!taskSettings ? (
+          <div data-settings-anchor="agents-default-model" id="setting-agents-default-model" className="flex min-w-0 items-center gap-2 text-[13px]">
+            <Icon name="star" size={14} filled={Boolean(chatDefault)} className={chatDefault ? "shrink-0 text-cx-warning" : "shrink-0 text-cx-fg-4"} />
+            <span className="shrink-0 text-cx-fg-3">新对话默认</span>
+            {chatDefault ? (
+              <>
+                <code className="min-w-0 truncate rounded-md bg-cx-code px-1.5 py-0.5 text-[12px] text-cx-fg" title={defaultLabel}>{defaultLabel}</code>
+                <IconButton icon="x" label="清除新对话默认模型" onClick={() => {
+                  if (!writeChatDefaultModel(null)) { showFeedback("bad", "默认模型未清除：共享偏好未能提交，请查看同步提示。"); return; }
+                  setChatDefault(null);
+                  showFeedback("ok", "已提交清除新对话默认模型的设置。");
+                }} />
+              </>
+            ) : <span className="text-cx-fg-3">未设定，点模型前的 ★ 设置</span>}
+          </div>
+        ) : null}
         <div className="flex items-center gap-3">
           {lastCheckedAt ? <span className="inline-flex items-center gap-1.5 text-[12px] text-cx-fg-3"><Icon name="clock" size={13} />{lastCheckedAt}</span> : null}
           <Button size="sm" variant="outline" icon="refresh" loading={refreshing} disabled={loading || Boolean(busyItem)} onClick={() => void refreshAll()}>
-            {refreshing ? "探测中…" : "一键探测全部模型"}
+            {refreshing ? "探测中…" : "探测全部"}
           </Button>
         </div>
       </div>
       {refreshing ? <p role="status" aria-live="polite" className="text-[12.5px] text-cx-fg-3">{refreshProgress}</p> : null}
       {refreshReport ? (
-        <Callout
-          tone={refreshReport.kind === "ok" ? "success" : refreshReport.kind === "warn" ? "warning" : "danger"}
-          icon={refreshReport.kind === "ok" ? "checkCircle" : "alert"}
-          role="status"
-          onDismiss={() => setRefreshReport(null)}
-        >
+        <Callout tone={refreshReport.kind === "ok" ? "success" : refreshReport.kind === "warn" ? "warning" : "danger"} icon={refreshReport.kind === "ok" ? "checkCircle" : "alert"} role="status" onDismiss={() => setRefreshReport(null)}>
           {refreshReport.detail}
         </Callout>
       ) : null}
       {feedback ? (
-        <Callout
-          tone={feedback.kind === "ok" ? "success" : feedback.kind === "warn" ? "warning" : "danger"}
-          icon={feedback.kind === "ok" ? "checkCircle" : feedback.kind === "warn" ? "info" : "alert"}
-          role="alert"
-          onDismiss={() => setFeedback(null)}
-        >
+        <Callout tone={feedback.kind === "ok" ? "success" : feedback.kind === "warn" ? "warning" : "danger"} icon={feedback.kind === "ok" ? "checkCircle" : feedback.kind === "warn" ? "info" : "alert"} role="alert" onDismiss={() => setFeedback(null)}>
           {feedback.detail}
         </Callout>
       ) : null}
 
-      {!taskSettings ? (
-        <SettingsSection anchor="agents-default-model" title="新对话默认模型" description="打开新对话时优先使用的凭据和基座模型。">
-          <div className="flex flex-wrap items-center gap-3 px-5 py-4">
-            <ConversationModelPicker
-              credentials={conversationCredentials}
-              runtimes={conversationRuntimes}
-              selectedCredentialId={chatDefaultCredentialId}
-              selectedModel={chatDefaultModelId}
-              loading={loading}
-              variant="default-model"
-              className="provider-default-model-picker min-w-0 flex-1"
-              onSelect={({ credentialId, model }) => selectChatDefault(credentialId, model)}
-            />
-            <Badge tone={chatDefault ? "success" : "neutral"} icon={chatDefault ? "check" : undefined}>{chatDefault ? "已设定" : "未固定"}</Badge>
-            {chatDefault ? (
-              <IconButton icon="trash" label="清除新对话默认模型" onClick={() => {
-                if (!writeChatDefaultModel(null)) { showFeedback("bad", "默认模型未清除：共享偏好未能提交，请查看同步提示。"); return; }
-                setChatDefault(null);
-                showFeedback("ok", "已提交清除新对话默认模型的设置。");
-              }} />
-            ) : null}
-          </div>
-        </SettingsSection>
-      ) : null}
-
-      <div className="grid grid-cols-1 items-start gap-6 @3xl/agents:grid-cols-[17rem_minmax(0,1fr)]">
+      <div className="grid grid-cols-1 items-start gap-4 @3xl/agents:grid-cols-[17rem_minmax(0,1fr)]">
         <EngineList
           engines={engines}
           loading={loading}
@@ -1061,279 +752,98 @@ export function AgentsSettings({ taskSettings = false, navigation, onCredentials
         />
 
         {currentEngine ? (
-          <div className="flex min-w-0 flex-col gap-6">
+          <div className="flex min-w-0 flex-col gap-4">
             <div className="@3xl/agents:hidden">
-              <Button size="sm" variant="ghost" icon="arrowLeft" onClick={() => applySelection({ engine: null, instanceId: "", credentialId: "" }, "push")}>
-                返回引擎列表
-              </Button>
+              <Button size="sm" variant="ghost" icon="arrowLeft" onClick={() => applySelection({ engine: null, instanceId: "", credentialId: "" }, "push")}>返回引擎列表</Button>
             </div>
 
-            <SettingsSection>
-              <div className="grid grid-cols-[44px_minmax(0,1fr)] items-center gap-3 px-5 py-4 @xl/agents:grid-cols-[44px_minmax(0,1fr)_auto] @xl/agents:gap-4">
-                <span className="grid size-11 shrink-0 place-items-center rounded-xl border border-cx-border bg-cx-bg">
-                  <EngineLogo engine={currentEngine.engine} size={24} />
-                </span>
+            <div className="cx-settings-card" data-settings-anchor="agents-runtime" id="setting-agents-runtime">
+              <div className="grid grid-cols-[44px_minmax(0,1fr)] items-center gap-3 px-4 py-3.5 @xl/agents:grid-cols-[44px_minmax(0,1fr)_auto] @xl/agents:gap-4">
+                <span className="grid size-11 shrink-0 place-items-center rounded-xl border border-cx-border bg-cx-bg"><EngineLogo engine={currentEngine.engine} size={24} /></span>
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
                     <h2 className="text-[16px] font-semibold text-cx-fg">{currentEngine.label}</h2>
-                    {currentEngine.version ? (
-                      <code title={versionCheckDetail(currentInstance?.health?.version_check)} className="rounded-md bg-cx-code px-1.5 py-0.5 text-[11.5px] text-cx-fg-2">
-                        {installedVersion(currentEngine.version, currentInstance?.health?.version_check)}
-                      </code>
-                    ) : null}
+                    {currentEngine.version ? <code title={versionCheckDetail(currentInstance?.health?.version_check)} className="rounded-md bg-cx-code px-1.5 py-0.5 text-[11.5px] text-cx-fg-2">{installedVersion(currentEngine.version, currentInstance?.health?.version_check)}</code> : null}
                     <Badge tone={statusTone(currentEngine.statusKind)} dot>{currentEngine.statusText}</Badge>
                   </div>
-                  <p className="mt-1 text-[12.5px] leading-5 text-cx-fg-3">
-                    {currentEngine.readyCredentialCount} / {currentEngine.credentials.length} 凭据可用 · {currentEngine.environmentCount} 个运行环境 · 当前环境：{backend === "container" ? "容器 Worker" : taskSettings ? "本地 Worker" : "本地聊天"}
-                    {currentInstance ? ` · ${versionStatus(currentInstance.health?.version_check)}` : ""}
-                  </p>
+                  <p className="mt-1 text-[12.5px] leading-5 text-cx-fg-3">{currentEngine.readyCredentialCount} / {currentEngine.credentials.length} 个接入方式可用 · {currentEngine.modelCount} 个模型</p>
                 </div>
-                <div className="col-span-2 flex items-center justify-end gap-2.5 @xl/agents:col-span-1">
-                  <Button size="sm" variant="outline" icon="refresh" loading={busyItem === `probe:${currentEngine.engine}`} disabled={refreshing} onClick={() => void probeEngine(currentEngine)}>探测</Button>
-                  <span className="text-[12.5px] text-cx-fg-3">启用</span>
-                  <Switch
-                    size="sm"
-                    checked={currentEngine.enabled}
-                    disabled={busyItem === `toggle:${currentEngine.engine}`}
-                    ariaLabel={`${currentEngine.label} 启用状态`}
-                    onCheckedChange={() => void toggleEngine(currentEngine)}
-                  />
+                <div className="col-span-2 flex flex-wrap items-center justify-end gap-2 @xl/agents:col-span-1">
+                  <Button size="sm" variant="outline" icon="refresh" loading={probing} disabled={refreshing} onClick={() => void probeEngine(currentEngine)}>探测</Button>
+                  <Button size="sm" variant="outline" icon="settings2" aria-expanded={runtimeOpen.open} onClick={() => setRuntimeOpen((current) => current.open ? { ...current, open: false } : { open: true, nonce: Date.now() })}>配置</Button>
+                  <Switch size="sm" checked={currentEngine.enabled} disabled={busyItem === `toggle:${currentEngine.engine}`} ariaLabel={`${currentEngine.label} 启用状态`} onCheckedChange={() => void toggleEngine(currentEngine)} />
                 </div>
               </div>
-              {currentEngine.instances.length > 1 ? (
-                <div className="flex flex-wrap items-center gap-3 border-t border-cx-border-subtle px-5 py-3">
-                  <span className="text-[12.5px] text-cx-fg-3">运行环境实例</span>
-                  <Select
-                    size="sm"
-                    value={currentInstance?.instance_id || ""}
-                    onChange={(value) => applySelection({ engine: currentEngine.engine, instanceId: value, credentialId: selection.credentialId }, "push")}
-                    options={instanceOptions}
-                    ariaLabel="运行环境实例"
-                    className="w-full max-w-[300px]"
-                  />
-                </div>
-              ) : null}
-              {currentInstance?.auth.login_command ? (
-                <div className="flex flex-wrap items-center gap-2 border-t border-cx-border-subtle px-5 py-3">
-                  <Icon name="terminal" size={14} className="shrink-0 text-cx-fg-3" />
-                  <span className="text-[12.5px] text-cx-fg-3">登录命令</span>
-                  <code className="min-w-0 flex-1 truncate rounded-md bg-cx-code px-2 py-1 text-[12px] text-cx-fg">{currentInstance.auth.login_command}</code>
-                  <CopyButton text={currentInstance.auth.login_command} label="复制登录命令" />
-                </div>
-              ) : null}
-            </SettingsSection>
+            </div>
 
-            <SettingsSection
-              anchor="agents-credentials"
-              title="账号与凭据"
-              description="凭据可以是官方账号，也可以是带 Base URL 的自定义端点。自定义端点也可供 Reason / Titler 使用。"
-              actions={<Button size="sm" variant="outline" icon="plus" onClick={openCreateCredential}>新增凭据</Button>}
-            >
-              {createOpen ? (
-                <div className="flex flex-col gap-4 border-b border-cx-border-subtle px-5 py-4">
-                  <p className="text-[13px] font-medium text-cx-fg">为 {currentEngine.label} 新增凭据</p>
-                  {createError ? <p role="alert" className="rounded-lg bg-cx-danger-soft px-3 py-2 text-[12.5px] text-cx-danger">{createError}</p> : null}
-                  <div className="grid gap-4 sm:grid-cols-2">
-                    <TextField label="凭据 ID" autoComplete="off" placeholder="例如 work-account" value={newDraft.accountId} onChange={(event) => setNewDraft((value) => ({ ...value, accountId: event.target.value }))} />
-                    <div>
-                      <span className="mb-1.5 block text-[12.5px] font-medium text-cx-fg-2">连接方式</span>
-                      <Select value={newDraft.connection} onChange={(value) => setNewDraft((draft) => ({ ...draft, connection: value }))} options={CONNECTION_OPTIONS} ariaLabel="连接方式" className="w-full" />
-                    </div>
-                  </div>
-                  {newDraft.connection === "custom_endpoint" ? (
-                    <>
-                      <p className="text-[12.5px] leading-5 text-cx-fg-3">Reason / Titler 只复用这里保存的 Base URL、API Key 和模型目录，不会调用当前 Agent。</p>
-                      <div className="grid gap-4 sm:grid-cols-2">
-                        <TextField label="Base URL" placeholder="https://api.example.com/v1" value={newDraft.baseUrl} onChange={(event) => setNewDraft((value) => ({ ...value, baseUrl: event.target.value }))} />
-                        <TextField label="服务名称" value={newDraft.provider} onChange={(event) => setNewDraft((value) => ({ ...value, provider: event.target.value }))} />
-                      </div>
-                    </>
-                  ) : null}
-                  <TextArea label={createEngine && authHomeSecret(createEngine) && newDraft.connection === "official" ? "Auth JSON" : "Secret / Token / API Key"} rows={3} className="resize-none" value={newDraft.secret} onChange={(event) => setNewDraft((value) => ({ ...value, secret: event.target.value }))} />
-                  <div className="grid gap-4 sm:grid-cols-2">
-                    <TextField label="默认模型" placeholder="model-id" value={newDraft.defaultModel} onChange={(event) => setNewDraft((value) => ({ ...value, defaultModel: event.target.value }))} />
-                    <TextArea label="候选模型" rows={3} className="resize-none" placeholder="每行一个模型 ID" value={newDraft.modelsText} onChange={(event) => setNewDraft((value) => ({ ...value, modelsText: event.target.value }))} />
-                  </div>
-                  <div className="flex justify-end gap-2">
-                    <Button size="sm" variant="ghost" onClick={closeCreateCredential} disabled={creating}>取消</Button>
-                    <Button size="sm" variant="primary" icon="plus" loading={creating} disabled={!newDraft.accountId.trim()} onClick={() => void createCredential()}>新增凭据</Button>
-                  </div>
-                </div>
-              ) : null}
-              {currentEngine.credentials.length ? currentEngine.credentials.map(renderCredentialRow) : !createOpen ? (
-                <SettingsEmpty>尚未添加凭据，可新增官方账号或自定义端点。</SettingsEmpty>
-              ) : null}
-            </SettingsSection>
+            {runtimeOpen.open ? (
+              <RuntimeConfigPanel
+                key={`${currentInstance?.key || currentEngine.engine}:${runtimeOpen.nonce}`}
+                onClose={() => setRuntimeOpen((current) => ({ ...current, open: false }))}
+                engine={currentEngine}
+                instance={currentInstance}
+                adapter={currentAdapter}
+                fallbackKey={`${engineCliAdapter(descriptors, currentEngine.engine)}:default`}
+                transportFields={currentTransportFields}
+                connectionOptions={connectionOptions}
+                accessModes={accessModeRows}
+                envEditable={envEditable}
+                showAccessModes={!taskSettings}
+                probing={probing}
+                refreshing={refreshing}
+                onSwitchAdapter={(adapterId) => {
+                  const instance = currentEngine.instances.find((row) => row.adapter_id === adapterId);
+                  if (instance) applySelection({ ...selection, instanceId: instance.key }, "push");
+                }}
+                onProbe={() => void probeEngine(currentEngine)}
+                onSave={saveRuntime}
+              />
+            ) : null}
 
-            <SettingsSection anchor="agents-runtime" title="运行配置" description="设置本机二进制、服务端点、环境变量和该引擎的传输参数。">
-              <div className="flex flex-col gap-4 px-5 py-4">
-                {connectionOptions.length > 1 ? (
-                  <Select
-                    ariaLabel="接入方式"
-                    value={currentInstance?.adapter_id || currentDescriptor?.identity.default_adapter_id || ""}
-                    options={connectionOptions}
-                    onChange={(adapterId) => {
-                      const instance = currentEngine.instances.find((row) => row.adapter_id === adapterId);
-                      if (instance) applySelection({ ...selection, instanceId: instance.key }, "push");
-                    }}
-                  />
-                ) : null}
-                <div className="flex min-w-0 items-center gap-2 text-[12px] text-cx-fg-3">
-                  <Icon name="terminal" size={13} className="shrink-0" />
-                  <code className="truncate">{currentInstance?.key || `${engineCliAdapter(descriptors, currentEngine.engine)}:default`}</code>
-                  {currentInstance ? <span className="shrink-0">· {runtimeLabel(currentInstance)}</span> : null}
-                </div>
-                {!taskSettings && accessModeRows.length ? (
-                  <div aria-label="权限模式说明" className="flex flex-col gap-2 text-[12.5px]">
-                    {accessModeRows.map((mode) => (
-                      <div key={mode}>
-                        <p className="font-medium text-cx-fg-2">{ACCESS_MODE_LABELS[mode] || mode}{currentAdapter?.capabilities.access_modes.includes(mode) ? "" : "（不可用）"}</p>
-                        {currentAdapter?.access_mode_notes[mode] ? <p className="mt-0.5 whitespace-pre-wrap text-cx-fg-3">{currentAdapter.access_mode_notes[mode]}</p> : null}
-                      </div>
-                    ))}
-                  </div>
-                ) : null}
-                {(currentInstance?.updated_at || "") !== runtimeBaseRevision ? (
-                  <Callout
-                    tone="warning"
-                    icon="alert"
-                    role="alert"
-                    action={<Button size="xs" variant="outline" onClick={() => { setRuntimeBaseRevision(currentInstance?.updated_at || ""); setEditBinaryPath(currentInstance?.binary_path || ""); setEditEndpoint(currentInstance?.endpoint || ""); setEditTransport({ ...(currentInstance?.transport || {}) }); setEditEnvRefs(envRefRows(currentInstance?.env_refs)); setEditLaunchArgs((currentInstance?.launch_args || []).join("\n")); }}>载入最新配置并清除本地编辑</Button>}
-                  >
-                    运行配置已在其它视图更新，请重新核对。
-                  </Callout>
-                ) : null}
-                <div className="grid gap-4 sm:grid-cols-2">
-                  <TextField label="二进制路径" placeholder="留空时自动探测" value={editBinaryPath} onChange={(event) => setEditBinaryPath(event.target.value)} />
-                  <TextField label="服务端点" placeholder="留空时使用本地进程" value={editEndpoint} onChange={(event) => setEditEndpoint(event.target.value)} />
-                  {Object.entries(currentTransportFields).map(([key, field]) => field.type === "boolean" ? (
-                    <Checkbox
-                      key={key}
-                      checked={Boolean(editTransport[key] ?? field.default)}
-                      onCheckedChange={(selected) => setEditTransport((value) => ({ ...value, [key]: selected }))}
-                      label={field.title || key}
-                    />
-                  ) : (
-                    <TextField
-                      key={key}
-                      label={field.title || key}
-                      type={field.type === "integer" || field.type === "number" ? "number" : "text"}
-                      value={String(editTransport[key] ?? field.default ?? "")}
-                      onChange={(event) => setEditTransport((value) => ({ ...value, [key]: field.type === "integer" || field.type === "number" ? Number(event.target.value) : event.target.value }))}
-                    />
-                  ))}
-                </div>
-                {envEditable ? <TextArea
-                  label="启动参数"
-                  description="每行一个参数，原样插在可执行文件之后（全局选项位置），不经过 shell 解析。Claude 只支持 --flag [值] 形式。"
-                  placeholder={"例如：\n--config\nmodel_reasoning_summary=detailed"}
-                  rows={3}
-                  autoResize
-                  spellCheck={false}
-                  className="font-mono text-[12px]"
-                  value={editLaunchArgs}
-                  onChange={(event) => setEditLaunchArgs(event.target.value)}
-                /> : null}
-                {envEditable ? <EnvRefsEditor rows={editEnvRefs} onChange={setEditEnvRefs} /> : null}
-                <div className={cn("flex items-start gap-2.5 rounded-xl border px-3 py-2.5", currentInstance?.health?.healthy ? "border-cx-border bg-cx-success-soft/40" : "border-cx-border bg-cx-bg-subtle")}>
-                  <Icon name={currentInstance?.health?.healthy ? "checkCircle" : "info"} size={15} className={cn("mt-0.5 shrink-0", currentInstance?.health?.healthy ? "text-cx-success" : "text-cx-fg-3")} />
-                  <div className="min-w-0">
-                    <p className="text-[12.5px] font-medium text-cx-fg">{currentInstance?.health?.healthy ? "运行环境健康" : "尚未得到健康结果"}</p>
-                    <p className="mt-0.5 text-[12px] leading-5 text-cx-fg-3">
-                      {currentInstance?.health?.detail || currentInstance?.auth.detail || "保存后执行探测，以读取版本、登录状态和运行能力。"} {versionCheckDetail(currentInstance?.health?.version_check)}
-                    </p>
-                  </div>
-                </div>
-                <div className="flex justify-end gap-2">
-                  <Button size="sm" variant="outline" icon="refresh" loading={busyItem === `probe:${currentEngine.engine}`} disabled={refreshing} onClick={() => void probeEngine(currentEngine)}>重新探测</Button>
-                  <Button size="sm" variant="primary" icon="check" loading={busyItem === "save-runtime"} onClick={() => void saveRuntime()}>
-                    {busyItem === "save-runtime" ? "保存中…" : "保存接入配置"}
-                  </Button>
-                </div>
-              </div>
-            </SettingsSection>
-
-            <SettingsSection anchor="agents-models" title="模型" description="按当前运行环境汇总各凭据的模型。★ 设为新对话默认模型；眼睛控制模型是否出现在对话的模型选择器中。">
-              <ModelDirectory
-                rows={modelRows}
+            <div data-settings-anchor="agents-models" id="setting-agents-models">
+              <ModelTable
+                groups={groups}
                 chatDefault={chatDefault}
                 hidden={hiddenModels}
+                catalog={pricing.catalog}
+                expandedPrice={expandedPrice}
+                onExpandPrice={setExpandedPrice}
                 onSetDefault={selectChatDefault}
                 onToggleHidden={(credentialId, modelId, hide) => {
                   if (!setModelHidden(credentialId, modelId, hide)) showFeedback("bad", "模型显隐未保存：共享偏好未能提交，请查看同步提示。");
                 }}
+                onTest={(id) => void testGroup(id)}
+                onRefresh={(id) => void refreshGroupModels(id)}
+                onViewTest={viewTest}
+                onEdit={openFor("edit")}
+                onImport={openFor("import")}
+                onDelete={openFor("delete")}
+                renderExtra={renderExtra}
+                createPanel={createPanel}
+                focusId={focusGroup}
+                refreshDisabled={refreshing}
+                loginCommand={currentInstance?.auth.login_command}
+                showDefault={!taskSettings}
+                showPrice={!taskSettings}
+                empty={emptyGroups}
+                toolbarActions={<>
+                  {taskSettings ? <Select size="sm" value={backend} onChange={(value) => setBackend(value)} options={BACKEND_OPTIONS} ariaLabel="连通测试后端" /> : null}
+                  <Button size="sm" variant="outline" icon="plus" disabled={panel?.kind === "create"} onClick={openCreate}>新增接入方式</Button>
+                </>}
               />
-            </SettingsSection>
-
-            <SettingsSection>
-              <button
-                type="button"
-                aria-expanded={capabilitiesOpen}
-                onClick={() => setCapabilitiesOpen((value) => !value)}
-                className="flex w-full items-center gap-3 px-5 py-3.5 text-left outline-none transition-colors hover:bg-cx-hover focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-[var(--cx-focus)]"
-              >
-                <Icon name="network" size={15} className="shrink-0 text-cx-fg-3" />
-                <span className="min-w-0 flex-1 text-[13.5px] font-medium text-cx-fg">探测到的能力</span>
-                {capabilityEntries.length ? <span className="text-[12px] text-cx-fg-3">{capabilityEntries.length} 项</span> : null}
-                <Icon name="chevronDown" size={15} className={cn("shrink-0 text-cx-fg-3 transition-transform", capabilitiesOpen && "rotate-180")} />
-              </button>
-              <Collapse open={capabilitiesOpen}>
-                <div className="grid gap-x-6 gap-y-1 border-t border-cx-border-subtle px-5 py-3 sm:grid-cols-2">
-                  {capabilityEntries.length ? capabilityEntries.map(([key, value]) => (
-                    <div key={key} className="flex items-center gap-2 py-1">
-                      <Icon name={value ? "checkCircle" : "minus"} size={14} className={value ? "shrink-0 text-cx-success" : "shrink-0 text-cx-fg-4"} />
-                      <span className="min-w-0 flex-1 text-[12.5px] text-cx-fg-2">{CAPABILITY_LABELS[key] || key}</span>
-                      <span className="shrink-0 text-[11.5px] text-cx-fg-4">{typeof value === "boolean" ? value ? "支持" : "未启用" : String(value)}</span>
-                    </div>
-                  )) : <p className="py-2 text-[12.5px] text-cx-fg-3">探测运行环境后显示能力。</p>}
-                </div>
-              </Collapse>
-            </SettingsSection>
+            </div>
           </div>
         ) : (
           <div className="cx-settings-card hidden @3xl/agents:block">
-            <EmptyState icon="bot" title="选择一个 Agent 引擎" description="在左侧列表选择引擎后，这里会显示它的凭据、运行配置与模型。" />
+            <EmptyState icon="bot" title="选择一个 Agent 引擎" description="在左侧选择引擎，查看它的模型、价格和接入方式。" />
           </div>
         )}
       </div>
 
+      {!taskSettings ? (
+        <PricingFooter catalog={pricing.catalog} error={pricing.error} onCatalog={pricing.setCatalog} knownModels={knownModels} engines={pricingEngines} defaultEngine={currentEngine?.engine} extra={extraPrice} />
+      ) : null}
       {!taskSettings ? <UsageProviderSettings /> : null}
-
-      <Dialog
-        open={Boolean(deleteTarget)}
-        onOpenChange={(open) => { if (!open) { setDeleteTarget(null); setDeleteError(""); } }}
-        tone="danger"
-        title="删除凭据"
-        description={`将删除 ${deleteTarget ? credentialName(deleteTarget) : "该凭据"}。该操作不会删除对应的 Agent 引擎。`}
-        dismissable={!deleting}
-        footer={
-          <>
-            <Button variant="secondary" size="sm" onClick={() => { setDeleteTarget(null); setDeleteError(""); }} disabled={deleting}>取消</Button>
-            <Button variant="danger" size="sm" loading={deleting} onClick={() => void deleteCredential()}>
-              {deleteTarget?.usage?.length ? `解除 ${deleteTarget.usage.length} 处引用并删除` : "确认删除"}
-            </Button>
-          </>
-        }
-      >
-        {deleteError ? (
-          <p role="alert" className="rounded-lg bg-cx-danger-soft px-3 py-2 text-[12.5px] text-cx-danger">{deleteError}</p>
-        ) : deleteTarget?.usage?.length ? (
-          <p className="text-[12.5px] leading-5 text-cx-fg-3">将同步解除以下配置引用：{deleteTarget.usage.map((item) => item.label || item.id).join("、")}。关联对话和产物会保留，相关 Worker 会停用，系统角色会恢复默认接入。</p>
-        ) : (
-          <p className="text-[12.5px] leading-5 text-cx-fg-3">该凭据当前没有配置引用，可以直接删除。</p>
-        )}
-      </Dialog>
-
-      <Dialog
-        open={testOpen && (testingCredential || Boolean(testingCredential ? liveTestResult : displayedTestResult))}
-        onOpenChange={(open) => { if (!open) setTestOpen(false); }}
-        title={`${currentEngine?.label || "Agent"} · ${selectedCredential ? credentialName(selectedCredential) : "凭据"}`}
-        description={testingCredential ? "正在向模型发起真实请求" : (testingCredential ? liveTestResult : displayedTestResult)?.ok ? "该凭据当前可用" : "该凭据当前不可用"}
-        size="lg"
-        footer={<Button variant="secondary" size="sm" onClick={() => setTestOpen(false)}>关闭</Button>}
-      >
-        <ModelTestTerminal testing={testingCredential} result={testingCredential ? liveTestResult : displayedTestResult} title="连通测试终端" />
-      </Dialog>
     </div>
   );
 }

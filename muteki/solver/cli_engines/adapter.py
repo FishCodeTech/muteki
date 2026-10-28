@@ -374,12 +374,12 @@ class CliDriverAdapter(BaseExternalAgentAdapter):
                     launch=launch)
                 stdin_text = prompt_text
             elif use_resume:
-                argv = self._driver.build_resume(
+                argv, stdin_text = self._driver.build_resume_input(
                     prompt_text, external_id,
                     web_access=web_access, kb_access=kb_access, stream=True,
                     launch=launch)
             else:
-                argv = self._driver.build_execute(
+                argv, stdin_text = self._driver.build_execute_input(
                     prompt_text, external_id,
                     web_access=web_access, kb_access=kb_access, stream=True,
                     launch=launch)
@@ -407,7 +407,7 @@ class CliDriverAdapter(BaseExternalAgentAdapter):
                 AgentEventType.TURN_FAILED, seq,
                 external_session_id=external_id, turn_id=turn_id,
                 native_type="cli.argv_error",
-                payload={"error": str(exc)[:300]},
+                payload={"error": str(exc)},
                 **common))
             return
 
@@ -459,7 +459,7 @@ class CliDriverAdapter(BaseExternalAgentAdapter):
                 AgentEventType.TURN_FAILED, seq,
                 external_session_id=external_id, turn_id=turn_id,
                 native_type="cli.spawn_error",
-                payload={"error": str(result)[:300]},
+                payload={"error": str(result)},
                 **common))
             yield self.emit(build_event(
                 AgentEventType.RUNTIME_EXITED, seq,
@@ -499,7 +499,7 @@ class CliDriverAdapter(BaseExternalAgentAdapter):
                 external_session_id=external_id, turn_id=turn_id,
                 native_type="cli.turn.interrupted",
                 payload={"reason": classification,
-                         "stderr_tail": (result.raw_stderr or "")[-500:]},
+                         "stderr": result.raw_stderr or ""},
                 **common))
             yield self.emit(build_event(
                 AgentEventType.RUNTIME_EXITED, seq,
@@ -510,17 +510,22 @@ class CliDriverAdapter(BaseExternalAgentAdapter):
             return
 
         if result.returncode not in (None, 0) or result.error \
-                or not (result.text or "").strip():
-            error = result.error or (
-                f"{self._driver.name} exited with code {result.returncode}"
-                if result.returncode not in (None, 0)
-                else f"{self._driver.name} turn ended without assistant text"
-            )
-            error_code = (
-                "provider_request_timeout"
-                if "timed out" in error.casefold()
-                else "cli.turn_failed"
-            )
+                or result.model_truncated or not (result.text or "").strip():
+            if result.error:
+                error = result.error
+            elif result.returncode not in (None, 0):
+                error = f"{self._driver.name} exited with code {result.returncode}"
+            elif result.model_truncated:
+                error = f"{self._driver.name} model response reached its output token limit"
+            else:
+                error = f"{self._driver.name} turn ended without assistant text"
+            if result.model_truncated and not result.error \
+                    and result.returncode in (None, 0):
+                error_code = "model_output_truncated"
+            elif "timed out" in error.casefold():
+                error_code = "provider_request_timeout"
+            else:
+                error_code = "cli.turn_failed"
             yield self.emit(build_event(
                 AgentEventType.TURN_FAILED, seq,
                 external_session_id=external_id, turn_id=turn_id,
@@ -529,10 +534,10 @@ class CliDriverAdapter(BaseExternalAgentAdapter):
                     "reason": "failed",
                     "error": {
                         "code": error_code,
-                        "message": error[:1800],
+                        "message": error,
                     },
                     "returncode": result.returncode,
-                    "stderr_tail": (result.raw_stderr or "")[-1800:],
+                    "stderr": result.raw_stderr or "",
                 },
                 **common))
             yield self.emit(build_event(

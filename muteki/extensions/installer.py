@@ -132,7 +132,8 @@ class ExtensionInstaller:
     # -- 入口 -----------------------------------------------------------------
 
     def install(
-        self, source: Source, *, overwrite: bool = False
+        self, source: Source, *, overwrite: bool = False,
+        expected_extension_id: str = "",
     ) -> InstalledPackage:
         """fetch → verify → unpack → validate plugin.json，返回安装记录。"""
         resolved = self._resolve(source)
@@ -141,6 +142,11 @@ class ExtensionInstaller:
             package_dir, verification = self._fetch(resolved, workdir)
             manifest, verification = self._inspect(
                 package_dir, resolved, verification)
+            if expected_extension_id and manifest.id != expected_extension_id:
+                raise InstallError(
+                    "extension.catalog_identity_mismatch",
+                    f"expected {expected_extension_id!r}, but plugin.json declares {manifest.id!r}",
+                )
             target = self.install_root / manifest.id / manifest.version
             if target.exists():
                 if not overwrite:

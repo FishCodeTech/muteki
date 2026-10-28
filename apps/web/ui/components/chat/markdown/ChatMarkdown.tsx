@@ -4,8 +4,10 @@ import {
   Children,
   isValidElement,
   memo,
+  useEffect,
   useMemo,
   useRef,
+  useState,
   type ReactElement,
   type ReactNode,
   type RefObject,
@@ -15,6 +17,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import type { PluggableList } from "unified";
 import { remarkChatMath } from "@/lib/chatMath";
+import { closeOpenLink, closeOpenTable, rehypeStreamWords } from "@/lib/rehypeStreamWords";
 import { ChatMath } from "./ChatMath";
 import { ChatVisualization, parseVisualization } from "./ChatVisualization";
 import { cn } from "@/lib/cn";
@@ -48,6 +51,22 @@ export interface ChatMarkdownProps {
 }
 
 export const CHAT_REMARK_PLUGINS: PluggableList = [remarkGfm, remarkMath, remarkChatMath];
+const STREAM_WORD_PLUGINS: PluggableList = [rehypeStreamWords];
+/** Words stay wrapped this long after the stream ends, so the last ones finish their reveal. */
+const WORD_REVEAL_LINGER_MS = 400;
+
+function useLinger(value: boolean, ms: number): boolean {
+  const [held, setHeld] = useState(value);
+  useEffect(() => {
+    if (value) {
+      setHeld(true);
+      return;
+    }
+    const timer = window.setTimeout(() => setHeld(false), ms);
+    return () => window.clearTimeout(timer);
+  }, [value, ms]);
+  return value || held;
+}
 const FENCE_RE = /^\s{0,3}(`{3,}|~{3,})/;
 
 function endsInOpenFence(block: string): boolean {
@@ -231,10 +250,10 @@ function buildComponents(options: {
   };
 }
 
-const MarkdownBlock = memo(function MarkdownBlock({ text, components, sourceStart }: { text: string; components: Components; sourceStart: number }) {
+const MarkdownBlock = memo(function MarkdownBlock({ text, components, sourceStart, words = false }: { text: string; components: Components; sourceStart: number; words?: boolean }) {
   return (
     <div className="cx-md-block" data-md-source-start={sourceStart} data-md-source-end={sourceStart + text.length}>
-      <ReactMarkdown remarkPlugins={CHAT_REMARK_PLUGINS} components={components} urlTransform={safeMarkdownUrlTransform}>
+      <ReactMarkdown remarkPlugins={CHAT_REMARK_PLUGINS} rehypePlugins={words ? STREAM_WORD_PLUGINS : undefined} components={components} urlTransform={safeMarkdownUrlTransform}>
         {text}
       </ReactMarkdown>
     </div>
@@ -256,9 +275,13 @@ export function ChatMarkdown({ text, streaming = false, threadId, messageId, onR
     [threadId, resourceLinks],
   );
   const crossReferences = useMemo(() => hasCrossBlockReferences(text), [text]);
-  const blocks = useMemo(() => splitMarkdownBlocks(text, !streaming), [text, streaming]);
-  const sourceStarts = useMemo(() => { let offset = 0; return blocks.map(block => { const start = text.indexOf(block, offset); offset = start + block.length; return start; }); }, [blocks, text]);
+  // A link or table header cut off mid-stream renders as what it will become instead of flashing raw syntax.
+  const source = useMemo(() => (streaming ? closeOpenTable(closeOpenLink(text)) : text), [text, streaming]);
+  const blocks = useMemo(() => splitMarkdownBlocks(source, !streaming), [source, streaming]);
+  const sourceStarts = useMemo(() => { let offset = 0; return blocks.map(block => { const start = source.indexOf(block, offset); offset = start + block.length; return start; }); }, [blocks, source]);
   const tailOpenFence = streaming && blocks.length > 0 && endsInOpenFence(blocks[blocks.length - 1]);
+  // Only text that streamed in front of the reader reveals word by word; settled history renders plain.
+  const words = useLinger(streaming, WORD_REVEAL_LINGER_MS);
   if (!text) {
     return streaming ? (
       <div className={cn("cx-prose", size === "sm" && "cx-prose-sm", className)} data-streaming="true">
@@ -270,6 +293,7 @@ export function ChatMarkdown({ text, streaming = false, threadId, messageId, onR
     <div
       className={cn("cx-prose", size === "sm" && "cx-prose-sm", className)}
       data-streaming={streaming ? "true" : undefined}
+      data-words={words || undefined}
     >
       {streaming && crossReferences ? <p className="text-[12px] text-cx-fg-4" role="status">{lang === "en" ? "Footnotes and cross-paragraph references will be linked when the answer finishes." : "脚注与跨段引用会在回答完成后连接。"}</p> : null}
       {blocks.map((block, index) => {
@@ -280,6 +304,7 @@ export function ChatMarkdown({ text, streaming = false, threadId, messageId, onR
           key={index}
           text={block}
           sourceStart={sourceStarts[index]}
+          words={words}
           components={tailOpenFence && index === blocks.length - 1 ? tailComponents : components}
         />
         );

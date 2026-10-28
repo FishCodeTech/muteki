@@ -18,8 +18,8 @@ from muteki.solver.workspace import (
 from muteki.solver.graph_text import ContextRenderError
 from muteki.solver.cli_prompts import (
     _EXEC_PROMPT,
+    _CAMPAIGN_PROMPT,
     _EXPLORE_PROMPT,
-    _CTF_FACT_ASSERTION_NOTE,
     _CTF_FACT_VERIFY_PROMPT,
     _FACT_VERIFY_PROMPT,
     _KB_PROMPT,
@@ -529,6 +529,13 @@ def _ctf_shared_state_block(self) -> str:
     if graph is None:
         return ""
     try:
+        wd = (
+            getattr(self, "_current_workdir", None)
+            or getattr(self, "_workdir", None)
+            or getattr(self, "_owned_scratch", None)
+        )
+        if wd and getattr(graph, "_workspace_root", None) is None:
+            graph._workspace_root = workspace_root_for_worker(wd)
         return str(graph.to_ctf_graph_yaml() or "")
     except ContextRenderError:
         raise
@@ -835,8 +842,23 @@ def _live_blackboard_context(self) -> str:
                 since_seq=int(scope.get("since_seq", 0) or 0),
                 directive=self.intent_goal,
             )
-    if getattr(self.challenge, "mode", "ctf") == "ctf":
-        return _ctf_shared_state_block(self)
+    if getattr(self.challenge, "mode", "ctf") in {"ctf", "pentest"}:
+        context = _ctf_shared_state_block(self)
+        if callable(getattr(self, "_target_restarter", None)):
+            context = (
+                f"Current target: {self._target()}\n"
+                f"Scope: {self.challenge.scope}\n"
+                "Use the current task's authorized scope. "
+                "Prior findings retain their tested bounds; "
+                "an endpoint change alone is not evidence of a code or build change. "
+                "Check only mutable prerequisites needed by this Step, or findings "
+                "contradicted by concrete new evidence.\n"
+                + context
+            )
+        standing = self._standing_block()
+        if standing:
+            context = f"{context}\n{standing}" if context else standing
+        return context
     if getattr(self.challenge, "mode", "ctf") == "pentest" and self.mode != "bootstrap":
         source_facts, _source_meta = self._source_facts_block()
         parts = (
@@ -884,14 +906,20 @@ def _build_prompt(self) -> str:
             "Attached files (already in your working directory — inspect them "
             "FIRST): " + ", ".join(self._staged_files))
     sections.append(("header", "\n".join(ctx_lines), {}))
-    sections.append((
-        "task-instruction", _task_reference_block(self),
-        {"external_files": [str(getattr(self, "_task_file_name", ""))]},
-    ))
+    mode_name = getattr(c, "mode", "ctf")
+    shared_state = (
+        _ctf_shared_state_block(self)
+        if mode_name in {"ctf", "pentest"}
+        else ""
+    )
+    if not (mode_name == "ctf" and "id: fact_origin" in shared_state):
+        sections.append((
+            "task-instruction", _task_reference_block(self),
+            {"external_files": [str(getattr(self, "_task_file_name", ""))]},
+        ))
     if not bool(getattr(self, "web_access", True)):
         sections.append(("offline-boundary", _OFFLINE_BOUNDARY_BLOCK, {}))
-    if getattr(c, "mode", "ctf") in {"ctf", "pentest"}:
-        shared_state = _ctf_shared_state_block(self)
+    if mode_name in {"ctf", "pentest"}:
         if shared_state:
             sections.append(("shared-state", shared_state, {}))
         sections.append(("workspace-protocol", self._workspace_protocol_block(), {}))
@@ -908,11 +936,19 @@ def _build_prompt(self) -> str:
         rejected = self._rejected_flags_block()
         if rejected:
             sections.append(("rejected-flags", rejected, {}))
+        if mode_name == "ctf" and getattr(self, "intent_goal", ""):
+            assigned_id = getattr(self, "intent_id_assigned", "") or "bootstrap"
+            sections.append((
+                "assigned-step",
+                f"【你负责的 step】{assigned_id}\n{self.intent_goal}",
+                {"intent_ids": [assigned_id]},
+            ))
         fixed = (
             _PENTEST_FGS_EXPLORE_PROMPT.format(
                 ctx="{context}", intent_goal=self.intent_goal or "authorized assessment")
-            if getattr(c, "mode", "ctf") == "pentest"
-            else _EXEC_PROMPT.format(
+            if mode_name == "pentest"
+            else (_CAMPAIGN_PROMPT if getattr(self, "campaign_mode", False)
+                  else _EXEC_PROMPT).format(
                 ctx="{context}", kb=_KB_PROMPT if self.kb else "",
                 fmt=self._flag_hint())
         )
@@ -996,6 +1032,7 @@ def _known_flags(self) -> "list[str]":
     if sg is not None:
         try:
             known.update(sg.snapshot().flags or [])
+            known.difference_update(sg.invalidated_flags() or set())
         except Exception:
             pass
     return sorted(known)
@@ -1105,26 +1142,13 @@ def _build_explore_prompt(self) -> str:
         )
         sections = [
             ("shared-graph", graph, {}),
-            ("assigned-step", assigned, {
-                "intent_ids": [self.intent_id_assigned]
-                if self.intent_id_assigned else [],
-            }),
         ]
-        contract = self._step_contract_block()
-        if contract:
-            sections.append(("step-contract", contract, {}))
+        rejected = self._rejected_flags_block()
+        if rejected:
+            sections.append(("rejected-flags", rejected, {}))
         standing = self._standing_block()
         if standing:
             sections.append(("standing-guidance", standing, {}))
-        toolbox = _toolbox_block(self)
-        if toolbox:
-            sections.append(("toolbox", toolbox, {
-                "external_files": ["toolbox"],
-            }))
-        inherited = self._poc_prompt_block()
-        if inherited:
-            sections.append(("inherited-pocs", inherited, {}))
-        sections.append(("fact-assertion", _CTF_FACT_ASSERTION_NOTE, {}))
         engine = str(getattr(getattr(self, "driver", None), "name", "") or "").strip().lower()
         ensure_role_contract = getattr(self, "_ensure_role_contract", None)
         if engine and engine != "pi" and callable(ensure_role_contract):
@@ -1136,6 +1160,12 @@ def _build_explore_prompt(self) -> str:
                     fold,
                     {"user_fold_fallback": True},
                 ))
+        sections.append((
+            "assigned-step", assigned, {
+                "intent_ids": [self.intent_id_assigned]
+                if self.intent_id_assigned else [],
+            },
+        ))
         self._persist_context_manifest(
             "worker_explore",
             sections,
@@ -1159,7 +1189,7 @@ def _build_explore_prompt(self) -> str:
     ))
     if not bool(getattr(self, "web_access", True)):
         sections.append(("offline-boundary", _OFFLINE_BOUNDARY_BLOCK, {}))
-    if getattr(c, "mode", "ctf") == "ctf":
+    if getattr(c, "mode", "ctf") in {"ctf", "pentest"}:
         shared_state = _ctf_shared_state_block(self)
         if shared_state:
             sections.append(("shared-state", shared_state, {}))

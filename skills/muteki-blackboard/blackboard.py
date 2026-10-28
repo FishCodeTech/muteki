@@ -27,10 +27,9 @@ any worker container without setup.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
-import re
+from pathlib import Path
 import sqlite3
 import sys
 import tempfile
@@ -56,6 +55,9 @@ _SOLVE_COMMANDS = (
     if _CHALLENGE_MODE in {"ctf", "pentest"}
     else {"context", "write-fact", "mark-deadend", "request-input", "save-poc", "submit-flag"}
 )
+
+if _CHALLENGE_MODE == "ctf" and os.environ.get("MUTEKI_TARGET_RESTART_AVAILABLE") == "1":
+    _SOLVE_COMMANDS.add("restart-target")
 
 _ROLE_COMMANDS = {
     "solve": _SOLVE_COMMANDS,
@@ -193,13 +195,43 @@ def read_flags() -> None:
 
 def submit_flag(flag: str) -> None:
     _submit_request("submit_flag", {"flag": str(flag)})
+    if (
+        os.environ.get("MUTEKI_WORKER_EXECUTION_MODE") != "campaign"
+        and os.environ.get("MUTEKI_PLATFORM_CONFIRMATION_REQUIRED") != "1"
+    ):
+        return
+    # The first receipt only records the local candidate.  The hosted runner
+    # submits it to the platform independently; wait briefly for that distinct
+    # verdict so the current model turn can react without losing its session.
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        request_id = _write_request("platform_verdict", {"flag": str(flag)})
+        result = _await_request_result(request_id, timeout_s=2.0)
+        if result is None:
+            print("PLATFORM_VERDICT_PENDING (host receipt unavailable)")
+            return
+        if not result.get("ok"):
+            print(str(result.get("detail") or "platform verdict unavailable"),
+                  file=sys.stderr)
+            return
+        status = str(result.get("status") or "pending")
+        if status != "pending":
+            print("PLATFORM_VERDICT_" + status.upper())
+            return
+        time.sleep(0.25)
+    print("PLATFORM_VERDICT_PENDING (use `context` to check again)")
 
 
-def submit_fact(title: str, content: str, evidence: str = "") -> None:
+def submit_fact(
+    title: str, content: str, evidence: str = "", enables: str = "",
+    supersedes: str = "",
+) -> None:
     _submit_request("submit_fact", {
         "title": str(title),
         "content": str(content),
         "evidence_artifact_id": str(evidence or ""),
+        "enables": str(enables or ""),
+        "supersedes": str(supersedes or ""),
     })
 
 
@@ -216,8 +248,8 @@ def submit_report(path: str) -> None:
     _submit_request("submit_report", {"report": report})
 
 
-def commit_step() -> None:
-    _submit_request("commit_step", {})
+def commit_step(*, keep_going: bool = False) -> None:
+    _submit_request("commit_step", {"keep_going": bool(keep_going)})
 
 
 def _ingress_dir() -> str:
@@ -290,7 +322,9 @@ def _submit_request(operation: str, payload: dict, *, timeout_s: float = 30.0) -
         _request_timeout(timeout_s)
     message = str(result.get("message") or result.get("detail") or "")
     if not result.get("ok"):
-        print(f"REJECTED{(': ' + message) if message else ''}", file=sys.stderr)
+        code = str(result.get("code") or "")
+        status = f"REJECTED [{code}]" if code else "REJECTED"
+        print(f"{status}{(': ' + message) if message else ''}", file=sys.stderr)
         sys.exit(2)
     print(message or "OK")
     return result
@@ -524,8 +558,13 @@ def request_input(need: str) -> None:
 
 
 def save_poc(path: str, entry_command: str, status: str, note: str) -> None:
+    raw_path = str(path or "").strip()
+    if raw_path and not os.path.isabs(raw_path):
+        candidate = Path.cwd() / raw_path
+        if candidate.exists():
+            raw_path = str(candidate.resolve())
     _submit_request("save_poc", {
-        "path": path,
+        "path": raw_path,
         "entry_command": entry_command,
         "status": status,
         "note": note,
@@ -596,14 +635,20 @@ def refresh_context() -> None:
     print(str(result.get("content") or "(no scoped context available)"))
 
 
-def read_artifact(artifact_id: str) -> None:
-    request_id = _write_request("read_artifact", {"artifact_id": artifact_id})
+def read_artifact(artifact_id: str, *, with_command: bool = False) -> None:
+    request_id = _write_request("read_artifact", {
+        "artifact_id": artifact_id, "include_command": with_command,
+    })
     result = _await_request_result(request_id)
     if result is None:
         _request_timeout()
     if not result.get("ok"):
         print(str(result.get("detail") or "artifact unavailable"), file=sys.stderr)
         sys.exit(2)
+    if with_command and result.get("command"):
+        sys.stdout.write("Source command: " + json.dumps(
+            str(result["command"]), ensure_ascii=False,
+        ) + "\n\n")
     sys.stdout.write(str(result.get("content") or ""))
 
 
@@ -791,6 +836,10 @@ def main() -> None:
     p = _reg("submit-flag")
     if p is not None:
         p.add_argument("flag")
+    p = _reg("restart-target")
+    if p is not None:
+        p.add_argument("--confirmed-fault", action="store_true", required=True)
+        p.add_argument("--evidence", required=True)
     _reg("list-intents")
     p = _reg("write-fact")
     if p is not None:
@@ -799,6 +848,11 @@ def main() -> None:
     if p is not None:
         p.add_argument("title")
         p.add_argument("content")
+        p.add_argument("--supersedes", default="",
+                       help="comma-separated Fact IDs (e.g. fact_003) that this Fact corrects or replaces")
+        if _CHALLENGE_MODE == "ctf":
+            p.add_argument("--enables", default="",
+                           help="confirmed new capability and the concrete next action it enables; omit for ordinary observations")
         if _CHALLENGE_MODE == "pentest":
             p.add_argument("--evidence", required=True,
                            help="artifact ID from recent-evidence supporting this Fact")
@@ -808,7 +862,10 @@ def main() -> None:
             "JSON file containing one vulnerability report; evidence_note must include "
             "artifact_id from submit-fact --evidence, observed, and significance"
         ))
-    _reg("commit-step")
+    p = _reg("commit-step")
+    if p is not None:
+        p.add_argument("--continue", "--checkpoint", dest="keep_going", action="store_true",
+                       help="publish the drafted Fact/PoC as an intermediate checkpoint and continue working in this session")
     _reg("mcp-tools")
     p = _reg("mcp-schema")
     if p is not None:
@@ -873,6 +930,7 @@ def main() -> None:
     p = _reg("read-artifact")
     if p is not None:
         p.add_argument("artifact_id")
+        p.add_argument("--with-command", action="store_true")
     p = _reg("submission-lock")
     if p is not None:
         p.add_argument("action", choices=("acquire", "release"))
@@ -944,11 +1002,16 @@ def main() -> None:
     elif args.cmd == "write-fact":
         write_fact(args.text, False)
     elif args.cmd == "submit-fact":
-        submit_fact(args.title, args.content, getattr(args, "evidence", ""))
+        submit_fact(
+            args.title, args.content, getattr(args, "evidence", ""),
+            getattr(args, "enables", ""), getattr(args, "supersedes", ""),
+        )
     elif args.cmd == "submit-report":
         submit_report(args.json_file)
     elif args.cmd == "commit-step":
-        commit_step()
+        commit_step(keep_going=bool(getattr(args, "keep_going", False)))
+    elif args.cmd == "restart-target":
+        _submit_request("restart_target", {"confirmed_fault": args.confirmed_fault, "evidence": args.evidence}, timeout_s=310)
     elif args.cmd == "mcp-tools":
         _submit_request("mcp_tools", {}, timeout_s=120)
     elif args.cmd == "mcp-schema":
@@ -987,7 +1050,7 @@ def main() -> None:
     elif args.cmd == "recent-evidence":
         recent_evidence()
     elif args.cmd == "read-artifact":
-        read_artifact(args.artifact_id)
+        read_artifact(args.artifact_id, with_command=args.with_command)
     elif args.cmd == "submission-lock":
         submission_lock(args.action, args.note)
     elif args.cmd == "claim":

@@ -2,12 +2,14 @@
 
 import { setThemePreference, subscribeThemePreference } from "@/lib/themePreference";
 import { UsageDashboard } from "@/components/UsageDashboard";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
-import type { CSSProperties, ReactNode, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
+import { ActivityTimeline } from "@/components/activity-timeline/ActivityTimeline";
+import { countTimelineEvents } from "@/components/activity-timeline/fromDeck";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import type { ReactNode, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import { useRun, useRunList, useFolders, newRun, patchRun, deleteRun, uploadFiles, spawnWorker, killWorker, openWorkspace, createFolder, renameFolder, deleteFolder, SavedFile, apiFetch } from "@/lib/useRun";
 import { useT, useLang } from "@/lib/i18n";
-import { DeckState, ChatMessage, isFactRetired, isRunActive, isWorkerLane, workerIds, swarmDigest } from "@/lib/events";
+import { DeckState, isFactRetired, isRunActive, workerIds, swarmDigest } from "@/lib/events";
 import { ThreadRail } from "@/components/ThreadRail";
 import { Conversation } from "@/components/Conversation";
 import type { ControlCommandOpts, DispatchOpts } from "@/components/Conversation";
@@ -21,27 +23,14 @@ import { WorkerLanes } from "@/components/WorkerLanes";
 import { EvidenceChain } from "@/components/EvidenceChain";
 import { PentestEvidence } from "@/components/PentestEvidence";
 import { PentestReport } from "@/components/PentestReport";
-import { Input, Button, Modal, Skeleton, Slider, Tabs, toast } from "@heroui/react";
-import { actorDisplayTitle, toWorkerIdentity, workerColor, workerDisplayName, workerEngine } from "@/lib/workers";
+import { Button, Modal, Skeleton, Tabs, toast } from "@heroui/react";
+import { toWorkerIdentity, workerDisplayName, workerEngine } from "@/lib/workers";
 import { applySelection, readSavedTheme, readSavedSelection } from "@/lib/palette-engine";
-import { formatClock, formatElapsed, toEpochMs } from "@/lib/format";
+import { formatElapsed, toEpochMs } from "@/lib/format";
 import { PANEL_HOTKEYS, RUNTIME_TABS, type RuntimeGroup } from "@/lib/runtimeTabs";
 import { shouldResetRuntimePanelForRun, shouldRestoreRuntimePanelOpen } from "@/lib/draftRuntimePanel";
 import { collabPagePath, readCollabUrlState } from "@/lib/collabUrlState";
 import { directiveStatusLabel, pocStatusLabel, reviewKindLabel, reviewSeverityLabel } from "@/lib/statusLabels";
-import {
-  abbreviateWorkspacePaths,
-  expandedHeightCeiling,
-  LEDGER_METRICS,
-  ledgerItemContainsId,
-  ledgerItemHeight,
-  measureExpandedHeight,
-  projectActivityLedger,
-  splitToolCommand,
-  toolCommandLabel,
-  toolGroupFailedCommand,
-  toolGroupLatestCommand,
-} from "@/lib/activityLedger";
 
 function PanelLoading({ rows = 4 }: { rows?: number }) {
   return (
@@ -243,10 +232,10 @@ function useRuntimeElapsed(startedAt?: number, finishedAt?: number): string {
   return formatElapsed(end - toEpochMs(startedAt));
 }
 
-function runtimeTabCount(view: ArtifactView, deck: DeckState, runMode: "ctf" | "pentest"): number | null {
+function runtimeTabCount(view: ArtifactView, deck: DeckState, running: boolean, runMode: "ctf" | "pentest"): number | null {
   switch (view) {
     case "usage": return null;
-    case "timeline": return deck.chat.length;
+    case "timeline": return countTimelineEvents(deck, running);
     case "workers": return Object.keys(deck.lanes).length;
     // The agent map is its own page; never a runtime tab here.
     case "collaboration": return null;
@@ -267,732 +256,6 @@ function runtimeTabCount(view: ArtifactView, deck: DeckState, runMode: "ctf" | "
       return _exhaustive;
     }
   }
-}
-
-type RuntimeTraceLane = "control" | "worker" | "tool" | "evidence";
-type RuntimeTraceRecord = {
-  message: ChatMessage;
-  index: number;
-  time: number;
-  lane: RuntimeTraceLane;
-  actor: string;
-};
-
-const RUNTIME_TRACE_LANE_Y: Record<RuntimeTraceLane, number> = { control: 18, worker: 50, tool: 82, evidence: 114 };
-
-function runtimeTraceLane(message: ChatMessage): RuntimeTraceLane {
-  if (message.kind === "flag" || message.kind === "insight") return "evidence";
-  if (message.kind === "tool") return "tool";
-  if (message.solverId && isWorkerLane(message.solverId)) return "worker";
-  return "control";
-}
-
-function RuntimeTraceOverview({ deck, running, selectedId, onSelect }: {
-  deck: DeckState;
-  running: boolean;
-  selectedId: string | null;
-  onSelect: (id: string | null) => void;
-}) {
-  const t = useRuntimeT();
-  const [zoom, setZoom] = useState(1);
-  const [pan, setPan] = useState(0);
-  const [showRelations, setShowRelations] = useState(true);
-  // Collapse state persists per browser; the graph body folds away but the
-  // head row stays as a compact summary strip.
-  const [collapsed, setCollapsed] = useState(() => {
-    if (typeof window === "undefined") return false;
-    try { return window.localStorage.getItem("muteki.traceCollapsed") === "1"; } catch { return false; }
-  });
-  const toggleCollapsed = useCallback(() => {
-    setCollapsed((value) => {
-      const next = !value;
-      try { window.localStorage.setItem("muteki.traceCollapsed", next ? "1" : "0"); } catch { /* storage unavailable */ }
-      return next;
-    });
-  }, []);
-  const [dragging, setDragging] = useState(false);
-  const plotRef = useRef<HTMLDivElement>(null);
-  const navigatorRef = useRef<HTMLDivElement>(null);
-  const dragRef = useRef<{ pointerId: number; startX: number; startPan: number } | null>(null);
-  const navDragRef = useRef<number | null>(null);
-  const zoomRef = useRef(zoom);
-  const panRef = useRef(pan);
-  const wheelFrameRef = useRef<number | null>(null);
-  const wheelIntentRef = useRef<{ mode: "pan" | "zoom"; delta: number; focus: number } | null>(null);
-  const dragFrameRef = useRef<number | null>(null);
-  const pendingDragPanRef = useRef<number | null>(null);
-  const records = useMemo<RuntimeTraceRecord[]>(() => deck.chat
-    .map((message, index) => ({
-      message,
-      index,
-      time: toEpochMs(message.ts),
-      lane: runtimeTraceLane(message),
-      actor: message.solverId || message.role,
-    }))
-    .filter((record) => record.time > 0), [deck.chat]);
-  const workerSiblings = useMemo(
-    () => workerIds(deck).map((id) => toWorkerIdentity(id, deck.lanes[id])),
-    [deck],
-  );
-  const start = toEpochMs(deck.startedAt) || records[0]?.time || Date.now();
-  const last = records[records.length - 1]?.time || start;
-  const runtimeNow = Date.now();
-  const end = running ? Math.max(runtimeNow, last, start + 1) : Math.max(toEpochMs(deck.finishedAt), last, start + 1);
-  const domain = Math.max(1, end - start);
-  const visibleDuration = domain / zoom;
-  const maxOffset = Math.max(0, domain - visibleDuration);
-  const viewStart = start + pan * maxOffset;
-  const viewEnd = viewStart + visibleDuration;
-  const selectedRecord = useMemo(() => records.find((record) => record.message.id === selectedId) ?? null, [records, selectedId]);
-  const lanes = [
-    { id: "control", label: t("runtime.trace.coordinator") },
-    { id: "worker", label: t("runtime.trace.workers") },
-    { id: "tool", label: t("runtime.trace.tools") },
-    { id: "evidence", label: t("runtime.trace.evidence") },
-  ] as { id: RuntimeTraceLane; label: string }[];
-  const laneCounts = useMemo(() => records.reduce<Record<RuntimeTraceLane, number>>((counts, record) => {
-    counts[record.lane] += 1;
-    return counts;
-  }, { control: 0, worker: 0, tool: 0, evidence: 0 }), [records]);
-  const visibleRecords = useMemo(() => records.filter((record) => record.time >= viewStart && record.time <= viewEnd), [records, viewStart, viewEnd]);
-  const renderedRecords = useMemo(() => {
-    // Keep the graph responsive on long runs by grouping dense events into
-    // lane-aware time buckets. Evidence and the selected event always remain
-    // individually addressable.
-    const bucketCount = 76;
-    const buckets = new Map<string, RuntimeTraceRecord>();
-    const priority = new Map<string, RuntimeTraceRecord>();
-    visibleRecords.forEach((record) => {
-      if (record.message.id === selectedId || record.lane === "evidence") {
-        priority.set(record.message.id, record);
-        return;
-      }
-      const ratio = Math.max(0, Math.min(.9999, (record.time - viewStart) / visibleDuration));
-      const key = `${record.lane}-${Math.floor(ratio * bucketCount)}`;
-      const current = buckets.get(key);
-      if (!current || record.message.kind === "flag" || record.index > current.index) buckets.set(key, record);
-    });
-    return [...buckets.values(), ...priority.values()].sort((a, b) => a.time - b.time || a.index - b.index);
-  }, [visibleRecords, selectedId, viewStart, visibleDuration]);
-  const positionFor = useCallback((time: number) => Math.max(0, Math.min(99.35, ((time - viewStart) / visibleDuration) * 100)), [viewStart, visibleDuration]);
-  const connections = useMemo(() => {
-    const links: { id: string; from: RuntimeTraceRecord; to: RuntimeTraceRecord; kind: "actor" | "flow" }[] = [];
-    const lastByActor = new Map<string, RuntimeTraceRecord>();
-    let previous: RuntimeTraceRecord | null = null;
-    renderedRecords.forEach((record) => {
-      const actorPrevious = lastByActor.get(record.actor);
-      if (actorPrevious && actorPrevious.message.id !== record.message.id) links.push({ id: `actor-${actorPrevious.message.id}-${record.message.id}`, from: actorPrevious, to: record, kind: "actor" });
-      if (previous && previous.actor !== record.actor && previous.lane !== record.lane) links.push({ id: `flow-${previous.message.id}-${record.message.id}`, from: previous, to: record, kind: "flow" });
-      lastByActor.set(record.actor, record);
-      previous = record;
-    });
-    if (links.length <= 144) return links;
-    const selectedLinks = links.filter((link) => link.from.message.id === selectedId || link.to.message.id === selectedId);
-    const stride = Math.ceil(links.length / Math.max(1, 144 - selectedLinks.length));
-    const sampled = links.filter((_, index) => index % stride === 0);
-    return [...new Map([...sampled, ...selectedLinks].map((link) => [link.id, link])).values()].slice(-144);
-  }, [renderedRecords, selectedId]);
-
-  const navigatorRecords = useMemo(() => {
-    const stride = Math.max(1, Math.ceil(records.length / 220));
-    return records.filter((_, index) => index % stride === 0);
-  }, [records]);
-
-  useEffect(() => { zoomRef.current = zoom; }, [zoom]);
-  useEffect(() => { panRef.current = pan; }, [pan]);
-
-  // Recenter on the selected event exactly ONCE per selection change. This
-  // must NOT depend on the viewport (viewStart/viewEnd/zoom/…): otherwise any
-  // operator pan that moves the selection out of the window gets yanked back
-  // by this effect, fighting the user's own scroll and producing visible
-  // jitter. After the initial centering, the operator owns the viewport.
-  const selectedMessageId = selectedRecord?.message.id ?? null;
-  useEffect(() => {
-    if (!selectedRecord || zoom <= 1 || (selectedRecord.time >= viewStart && selectedRecord.time <= viewEnd)) return;
-    const nextStart = Math.max(start, Math.min(end - visibleDuration, selectedRecord.time - visibleDuration / 2));
-    setPan(maxOffset ? (nextStart - start) / maxOffset : 0);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedMessageId]);
-
-  const commitViewport = useCallback((nextZoom: number, nextPan: number) => {
-    const safeZoom = Math.max(1, Math.min(12, nextZoom));
-    const safePan = safeZoom <= 1.001 ? 0 : Math.max(0, Math.min(1, nextPan));
-    zoomRef.current = safeZoom;
-    panRef.current = safePan;
-    setZoom(safeZoom);
-    setPan(safePan);
-  }, []);
-  const fitView = useCallback(() => commitViewport(1, 0), [commitViewport]);
-
-  useEffect(() => {
-    const canvas = plotRef.current;
-    if (!canvas) return;
-    const onWheel = (event: WheelEvent) => {
-      event.preventDefault();
-      const rect = canvas.getBoundingClientRect();
-      if (!rect.width) return;
-      const unit = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? rect.width : 1;
-      const horizontal = event.shiftKey || Math.abs(event.deltaX) > Math.abs(event.deltaY) * .8;
-      const pinchScale = event.ctrlKey ? 5 : 1;
-      const delta = horizontal ? (Math.abs(event.deltaX) > 0 ? event.deltaX : event.deltaY) * unit : event.deltaY * unit * pinchScale;
-      const focus = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
-      const previous = wheelIntentRef.current;
-      wheelIntentRef.current = previous?.mode === (horizontal ? "pan" : "zoom")
-        ? { mode: previous.mode, delta: previous.delta + delta, focus }
-        : { mode: horizontal ? "pan" : "zoom", delta, focus };
-      if (wheelFrameRef.current !== null) return;
-      wheelFrameRef.current = window.requestAnimationFrame(() => {
-        wheelFrameRef.current = null;
-        const intent = wheelIntentRef.current;
-        wheelIntentRef.current = null;
-        if (!intent) return;
-        const currentZoom = zoomRef.current;
-        const currentPan = panRef.current;
-        if (intent.mode === "pan") {
-          if (currentZoom <= 1) return;
-          commitViewport(currentZoom, currentPan + intent.delta / (rect.width * Math.max(1, currentZoom - 1)));
-          return;
-        }
-        const nextZoom = Math.max(1, Math.min(12, currentZoom * Math.exp(-intent.delta * .0018)));
-        const currentDuration = domain / currentZoom;
-        const currentOffset = currentPan * Math.max(0, domain - currentDuration);
-        const focusTime = start + currentOffset + intent.focus * currentDuration;
-        const nextDuration = domain / nextZoom;
-        const nextMaxOffset = Math.max(0, domain - nextDuration);
-        const nextStart = Math.max(start, Math.min(end - nextDuration, focusTime - intent.focus * nextDuration));
-        commitViewport(nextZoom, nextMaxOffset ? (nextStart - start) / nextMaxOffset : 0);
-      });
-    };
-    canvas.addEventListener("wheel", onWheel, { passive: false });
-    return () => {
-      canvas.removeEventListener("wheel", onWheel);
-      if (wheelFrameRef.current !== null) window.cancelAnimationFrame(wheelFrameRef.current);
-      if (dragFrameRef.current !== null) window.cancelAnimationFrame(dragFrameRef.current);
-      wheelFrameRef.current = null;
-      wheelIntentRef.current = null;
-      dragFrameRef.current = null;
-      pendingDragPanRef.current = null;
-    };
-  }, [commitViewport, domain, end, start]);
-  const moveNavigator = (clientX: number) => {
-    const rect = navigatorRef.current?.getBoundingClientRect();
-    if (!rect || zoom <= 1) return;
-    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    const windowRatio = 1 / zoom;
-    const startRatio = Math.max(0, Math.min(1 - windowRatio, ratio - windowRatio / 2));
-    commitViewport(zoomRef.current, startRatio / (1 - windowRatio));
-  };
-  const startPlotDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (zoom <= 1 || (event.target as HTMLElement).closest("button")) return;
-    event.currentTarget.setPointerCapture(event.pointerId);
-    dragRef.current = { pointerId: event.pointerId, startX: event.clientX, startPan: pan };
-    setDragging(true);
-  };
-  const movePlotDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const origin = dragRef.current;
-    const width = plotRef.current?.clientWidth || 1;
-    if (!origin || origin.pointerId !== event.pointerId || zoom <= 1) return;
-    pendingDragPanRef.current = Math.max(0, Math.min(1, origin.startPan - (event.clientX - origin.startX) / (width * (zoomRef.current - 1))));
-    if (dragFrameRef.current !== null) return;
-    dragFrameRef.current = window.requestAnimationFrame(() => {
-      dragFrameRef.current = null;
-      if (pendingDragPanRef.current === null) return;
-      commitViewport(zoomRef.current, pendingDragPanRef.current);
-      pendingDragPanRef.current = null;
-    });
-  };
-  const stopPlotDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (dragRef.current?.pointerId !== event.pointerId) return;
-    dragRef.current = null;
-    setDragging(false);
-  };
-  return (
-    <section className={`runtime-trace ${collapsed ? "collapsed" : ""}`} aria-label={t("runtime.trace.title")}>
-      <div className="runtime-trace-head">
-        <Button type="button" className="runtime-trace-collapse" onClick={toggleCollapsed} aria-expanded={!collapsed} aria-label={t(collapsed ? "runtime.trace.expand" : "runtime.trace.collapse")}><Icon name={collapsed ? "chevronDown" : "chevronUp"} size={13} /></Button>
-        <div className="runtime-trace-title"><Icon name="radio" size={13} /><span>{t("runtime.trace.title")}</span>{running && <span className="runtime-trace-live">{t("runtime.status.live")}</span>}</div>
-        {collapsed
-          ? <span className="runtime-trace-hint">{t("runtime.trace.events", { n: records.length })} · {formatElapsed(end - start)}</span>
-          : <span className="runtime-trace-hint">{t("runtime.trace.dragHint")}</span>}
-        {!collapsed && <div className="runtime-trace-controls" role="toolbar" aria-label={t("runtime.trace.title")}>
-          <Button type="button" className={showRelations ? "on" : ""} onClick={() => setShowRelations((value) => !value)} aria-pressed={showRelations} data-tooltip={t("runtime.trace.relations")}><Icon name="network" size={13} /><span>{t("runtime.trace.relations")}</span></Button>
-          <Button type="button" onClick={fitView} aria-label={t("runtime.trace.fit")}><Icon name="crosshair" size={13} /><span>{t("runtime.trace.fit")}</span></Button>
-          <output className="runtime-trace-zoom" aria-label={t("runtime.trace.zoomLevel")} data-tooltip={t("runtime.trace.dragHint")}>{zoom.toFixed(zoom % 1 ? 1 : 0)}×</output>
-          <time>{formatElapsed(end - start)}</time>
-        </div>}
-      </div>
-      <div className="runtime-trace-fold">
-      <div className="runtime-trace-stage">
-        <div className="runtime-trace-labels" aria-hidden="true">
-          {lanes.map((lane) => <span key={lane.id} className={`lane-${lane.id}`}><i /> <em>{lane.label}</em><b>{laneCounts[lane.id]}</b></span>)}
-        </div>
-        <div className={`runtime-trace-plot ${dragging ? "dragging" : ""}`}>
-          <div ref={plotRef} className="runtime-trace-canvas" onDoubleClick={fitView} onPointerDown={startPlotDrag} onPointerMove={movePlotDrag} onPointerUp={stopPlotDrag} onPointerCancel={stopPlotDrag}>
-            <svg className={`runtime-trace-relations ${showRelations ? "visible" : ""}`} viewBox="0 0 1000 132" preserveAspectRatio="none" aria-hidden="true">
-              {connections.map((link) => {
-                const x1 = positionFor(link.from.time) * 10;
-                const x2 = positionFor(link.to.time) * 10;
-                const y1 = RUNTIME_TRACE_LANE_Y[link.from.lane];
-                const y2 = RUNTIME_TRACE_LANE_Y[link.to.lane];
-                const cls = `${link.kind} ${link.from.message.id === selectedId || link.to.message.id === selectedId ? "selected" : ""}`;
-                if (link.from.lane === link.to.lane) {
-                  // Same-lane actor chains stay horizontal-tangent sweeps.
-                  const curve = Math.max(8, Math.min(80, Math.abs(x2 - x1) * .35));
-                  return <path key={link.id} className={cls} d={`M ${x1} ${y1} C ${x1 + curve} ${y1}, ${x2 - curve} ${y2}, ${x2} ${y2}`} />;
-                }
-                // Cross-lane links drop out of the upper block's bottom edge
-                // and land on the lower block's top edge with vertical
-                // tangents — no floating rounded elbow mid-air.
-                const dir = y2 > y1 ? 1 : -1;
-                const sy = y1 + 6 * dir;
-                const ey = y2 - 6 * dir;
-                const k = Math.max(10, Math.min(28, Math.abs(ey - sy) * .5));
-                return <path key={link.id} className={cls} d={`M ${x1} ${sy} C ${x1} ${sy + k * dir}, ${x2} ${ey - k * dir}, ${x2} ${ey}`} />;
-              })}
-            </svg>
-            {lanes.map((lane) => <div className={`runtime-trace-track lane-${lane.id}`} key={lane.id}>
-              {renderedRecords.map((record, index) => {
-                if (record.lane !== lane.id) return null;
-                const nextTime = renderedRecords[index + 1]?.time ?? record.time + visibleDuration * .006;
-                const width = Math.max(.42, Math.min(3.2, ((Math.max(record.time, nextTime) - record.time) / visibleDuration) * 100));
-                const style = {
-                  "--rt-left": `${positionFor(record.time)}%`,
-                  "--rt-width": `${width}%`,
-                  ...(lane.id === "worker" && record.message.solverId ? { "--rt-color": workerColor(record.message.solverId) } : {}),
-                } as CSSProperties;
-                return <Button type="button" key={record.message.id || record.index} className={`runtime-trace-mark kind-${record.message.kind} ${record.message.id === selectedId ? "selected" : ""}`} style={style} aria-label={`${formatClock(record.message.ts)} · ${actorDisplayTitle(record.actor, t, toWorkerIdentity(record.actor, deck.lanes[record.actor]), workerSiblings)} · ${record.message.content}`} aria-pressed={record.message.id === selectedId} onClick={() => onSelect(record.message.id === selectedId ? null : record.message.id)} />;
-              })}
-            </div>)}
-            {running && viewEnd >= end - 1000 && <span className="runtime-trace-now" aria-hidden="true" />}
-          </div>
-          <div className="runtime-trace-scale" aria-hidden="true"><span>{formatClock(viewStart)}</span><span>{t("runtime.trace.window")}</span><span>{formatClock(viewEnd)}</span></div>
-          <div ref={navigatorRef} className="runtime-trace-navigator" onPointerDown={(event) => { event.currentTarget.setPointerCapture(event.pointerId); navDragRef.current = event.pointerId; moveNavigator(event.clientX); }} onPointerMove={(event) => { if (navDragRef.current === event.pointerId) moveNavigator(event.clientX); }} onPointerUp={(event) => { if (navDragRef.current === event.pointerId) navDragRef.current = null; }} onPointerCancel={() => { navDragRef.current = null; }}>
-            <div className="runtime-trace-density" aria-hidden="true">{navigatorRecords.map((record) => <i key={record.message.id} className={`lane-${record.lane}`} style={{ left: `${Math.max(0, Math.min(100, ((record.time - start) / domain) * 100))}%` }} />)}</div>
-            <Slider value={pan * 100} minValue={0} maxValue={100} onChange={(value) => setPan(Number(value) / 100)} className="runtime-trace-window" style={{ left: `${pan * (100 - 100 / zoom)}%`, width: `${100 / zoom}%` }} aria-label={t("runtime.trace.window")}><Slider.Track className="h-full w-full"><Slider.Thumb className="sr-only" /></Slider.Track></Slider>
-          </div>
-        </div>
-      </div>
-      </div>
-    </section>
-  );
-}
-
-function RuntimeActivityStream({ deck, selectedEventId, onSelectEvent, focusSpeaker }: { deck: DeckState; selectedEventId: string | null; onSelectEvent: (id: string | null) => void; focusSpeaker?: { id: string; nonce: number } | null }) {
-  const t = useRuntimeT();
-  const { lang } = useLang();
-  const [query, setQuery] = useState("");
-  const [compact, setCompact] = useState(() => {
-    if (typeof window === "undefined") return false;
-    try { return window.localStorage.getItem("muteki.activity.compact") === "1"; } catch { return false; }
-  });
-  const [expandedId, setExpandedId] = useState<string | null>(null);
-  const [expandedGroupId, setExpandedGroupId] = useState<string | null>(null);
-  const [shown, setShown] = useState<Set<string>>(new Set());
-  // Reverse focus-seed: when the operator clicks "在活动流中查看" in Worker 详情,
-  // seed the speaker filter to that worker (nonce-gated so re-clicks re-seed).
-  const lastSpeakerNonce = useRef<number | null>(null);
-  useEffect(() => {
-    if (!focusSpeaker || focusSpeaker.nonce === lastSpeakerNonce.current) return;
-    lastSpeakerNonce.current = focusSpeaker.nonce;
-    setShown(new Set([focusSpeaker.id]));
-  }, [focusSpeaker]);
-  const [viewport, setViewport] = useState({ top: 0, height: 360, width: 0 });
-  const scrollerRef = useRef<HTMLDivElement>(null);
-  const scrollFrameRef = useRef<number | null>(null);
-  const pendingViewportRef = useRef<{ top: number; height: number; width: number } | null>(null);
-  // Expanded rows are sized to their content (measured after render) instead
-  // of a fixed slab: a one-line status opens to one line, a long transcript to
-  // the ceiling and then scrolls. Only the active expansion is ever measured.
-  const [measured, setMeasured] = useState<{ id: string; height: number } | null>(null);
-  // Follow-latest semantics (chat-app style): the ledger pins itself to the
-  // newest event until the operator scrolls away; while unpinned, incoming
-  // events only increment the "jump to latest" badge instead of yanking the
-  // scroll position. `pinned` mirrors pinnedRef into state for the button.
-  const [pinned, setPinned] = useState(true);
-  const [unread, setUnread] = useState(0);
-  const pinnedRef = useRef(true);
-  const jumpingRef = useRef(false);
-  const prevLenRef = useRef(0);
-  const speakerKey = (message: ChatMessage) => message.solverId || message.role;
-  const workerSiblings = useMemo(
-    () => workerIds(deck).map((id) => toWorkerIdentity(id, deck.lanes[id])),
-    [deck],
-  );
-  const speakers = useMemo(() => {
-    const seen = new Map<string, string>();
-    deck.chat.forEach((message) => seen.set(speakerKey(message), message.solverId || message.role));
-    return [...seen.entries()];
-  }, [deck.chat]);
-  const visible = useMemo(() => {
-    const needle = query.trim().toLocaleLowerCase();
-    return deck.chat.filter((message) => {
-      if (shown.size && !shown.has(speakerKey(message))) return false;
-      if (!needle) return true;
-      const text = message.i18nKey ? t(message.i18nKey, message.i18nVars) : message.content;
-      const actorId = speakerKey(message);
-      const actor = actorDisplayTitle(actorId, t, toWorkerIdentity(actorId, deck.lanes[actorId]), workerSiblings);
-      return `${text} ${message.toolOutput || ""} ${message.solverId || ""} ${actor} ${message.role} ${message.kind}`.toLocaleLowerCase().includes(needle);
-    });
-  }, [deck.chat, deck.lanes, query, shown, t, workerSiblings]);
-  const items = useMemo(() => projectActivityLedger(visible), [visible]);
-  // Drill-down edge case: operator arrived from Worker 详情 for a worker that
-  // hasn't emitted any chat event yet (its speaker chip won't even render). Show
-  // a targeted hint instead of the generic "adjust your filter" empty state.
-  const silentFocusedWorker = useMemo(() => {
-    if (shown.size !== 1 || query.trim()) return null;
-    const only = [...shown][0];
-    const hasEvents = deck.chat.some((message) => speakerKey(message) === only);
-    return hasEvents ? null : only;
-  }, [shown, query, deck.chat]);
-  const labelFor = (message: ChatMessage) => {
-    if (message.role === "human") return t("runtime.event.input");
-    if (message.role === "system") return t("runtime.event.system");
-    switch (message.kind) {
-      case "tool": return t("runtime.event.tool");
-      case "reasoning": return t("runtime.event.reasoning");
-      case "insight": return t("runtime.event.insight");
-      case "guidance": return t("runtime.event.guidance");
-      case "flag": return t("runtime.event.result");
-      case "progress": return t("runtime.event.progress");
-      case "text":
-      case "status":
-        return message.solverId && isWorkerLane(message.solverId) ? t("runtime.event.worker") : t("runtime.event.agent");
-      default: {
-        const exhaustive: never = message.kind;
-        return exhaustive;
-      }
-    }
-  };
-  // The secondary label next to the actor: workers show their engine unless the
-  // display name already spells it out ("Claude Code Worker 1 · Claude Code"
-  // says nothing twice); everything else shows the localized message kind.
-  const actorDetail = (message: ChatMessage, actorTitle: string): string | null => {
-    if (message.solverId && isWorkerLane(message.solverId)) {
-      const engine = workerEngine(message.solverId, deck.lanes[message.solverId]?.engine);
-      const words = (text: string) => text.toLocaleLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
-      const titleWords = new Set(words(actorTitle));
-      return words(engine).every((word) => titleWords.has(word)) ? null : engine;
-    }
-    return message.kind === "tool" ? t("runtime.event.tool") : t(`msg.kind.${message.kind}`);
-  };
-  const baseMetrics = compact ? LEDGER_METRICS.compact : LEDGER_METRICS.comfortable;
-  const headerHeight = 28;
-  const activeExpandedId = selectedEventId || expandedId;
-  const expandedHeight = measured && measured.id === activeExpandedId ? measured.height : baseMetrics.expanded;
-  const metrics = useMemo(() => ({ ...baseMetrics, expanded: expandedHeight }), [baseMetrics, expandedHeight]);
-  const groupOpen = useCallback(
-    (itemId: string) => expandedGroupId === itemId || items.some((item) => item.id === itemId && ledgerItemContainsId(item, activeExpandedId)),
-    [activeExpandedId, expandedGroupId, items],
-  );
-  const heights = useMemo(() => items.map((item) => ledgerItemHeight(item, {
-    metrics,
-    groupOpen: item.type === "tools" && groupOpen(item.id),
-    expandedMessageId: activeExpandedId,
-  })), [activeExpandedId, groupOpen, items, metrics]);
-  const offsets = useMemo(() => {
-    const next = [0];
-    for (const height of heights) next.push(next[next.length - 1] + height);
-    return next;
-  }, [heights]);
-  const totalRowsHeight = offsets[offsets.length - 1] || 0;
-  const indexAtOffset = useCallback((offset: number) => {
-    let lo = 0;
-    let hi = items.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (offsets[mid + 1] <= offset) lo = mid + 1;
-      else hi = mid;
-    }
-    return Math.min(items.length, Math.max(0, lo));
-  }, [items.length, offsets]);
-  const viewportStart = Math.max(0, viewport.top - headerHeight);
-  const startIndex = Math.max(0, indexAtOffset(viewportStart) - 4);
-  const endIndex = Math.min(items.length, indexAtOffset(viewportStart + viewport.height) + 6);
-  const virtualRows = items.slice(startIndex, endIndex);
-
-  const updateViewport = useCallback((node: HTMLDivElement) => {
-    pendingViewportRef.current = { top: node.scrollTop, height: node.clientHeight, width: node.clientWidth };
-    if (scrollFrameRef.current !== null) return;
-    scrollFrameRef.current = window.requestAnimationFrame(() => {
-      scrollFrameRef.current = null;
-      if (!pendingViewportRef.current) return;
-      setViewport(pendingViewportRef.current);
-      pendingViewportRef.current = null;
-    });
-  }, []);
-
-  useEffect(() => {
-    const node = scrollerRef.current;
-    if (!node) return;
-    updateViewport(node);
-    const observer = new ResizeObserver(() => updateViewport(node));
-    observer.observe(node);
-    return () => {
-      observer.disconnect();
-      if (scrollFrameRef.current !== null) window.cancelAnimationFrame(scrollFrameRef.current);
-      scrollFrameRef.current = null;
-      pendingViewportRef.current = null;
-    };
-  }, [updateViewport]);
-
-  // Size the open row to its text. Runs before paint so the row never flashes
-  // at the fallback height; re-measures when the panel width changes because
-  // that changes how the text wraps. Converges in one pass: the measured value
-  // depends on the content, not on the height currently assigned to the row.
-  useLayoutEffect(() => {
-    const node = scrollerRef.current;
-    if (!activeExpandedId || !node) return;
-    const target = node.querySelector<HTMLElement>(`[data-ledger-id="${CSS.escape(activeExpandedId)}"]`);
-    if (!target) return;
-    const needed = measureExpandedHeight(target);
-    if (needed == null) return;
-    const ceiling = expandedHeightCeiling(baseMetrics, viewport.height);
-    const floor = target.classList.contains("act-tool-child") ? baseMetrics.child : baseMetrics.row;
-    const next = Math.ceil(Math.min(ceiling, Math.max(floor, needed)));
-    if (measured?.id !== activeExpandedId || measured.height !== next) setMeasured({ id: activeExpandedId, height: next });
-  }, [activeExpandedId, baseMetrics, items, measured, viewport.height, viewport.width]);
-
-  // Filter/density changes re-pin to the newest event: this is a live ledger,
-  // so the meaningful default end is always the bottom (not the first row).
-  useEffect(() => {
-    const node = scrollerRef.current;
-    if (!node) return;
-    pinnedRef.current = true;
-    setPinned(true);
-    setUnread(0);
-    prevLenRef.current = items.length;
-    node.scrollTop = node.scrollHeight;
-    updateViewport(node);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [compact, query, shown, updateViewport]);
-
-  // Live tail: while pinned, keep the latest event in view as rows stream in;
-  // while unpinned, just accumulate the unread count for the jump button.
-  useEffect(() => {
-    const prev = prevLenRef.current;
-    prevLenRef.current = items.length;
-    const node = scrollerRef.current;
-    if (!node) return;
-    if (pinnedRef.current) {
-      node.scrollTop = node.scrollHeight;
-      updateViewport(node);
-      setUnread(0);
-      return;
-    }
-    if (items.length > prev) setUnread((count) => count + (items.length - prev));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [items.length]);
-
-  // Scroll tracking: leaving the bottom unpins; returning to the bottom (by
-  // any means) re-pins. During a programmatic smooth jump, intermediate
-  // positions are ignored until the bottom is reached.
-  const handleLedgerScroll = useCallback((node: HTMLDivElement) => {
-    updateViewport(node);
-    const atBottom = node.scrollTop + node.clientHeight >= node.scrollHeight - 48;
-    if (jumpingRef.current) {
-      if (atBottom) {
-        jumpingRef.current = false;
-        pinnedRef.current = true;
-        setPinned(true);
-        setUnread(0);
-      }
-      return;
-    }
-    if (atBottom !== pinnedRef.current) {
-      pinnedRef.current = atBottom;
-      setPinned(atBottom);
-      if (atBottom) setUnread(0);
-    }
-  }, [updateViewport]);
-
-  const jumpToLatest = useCallback(() => {
-    const node = scrollerRef.current;
-    if (!node) return;
-    jumpingRef.current = true;
-    pinnedRef.current = true;
-    node.scrollTo({ top: node.scrollHeight, behavior: "smooth" });
-    updateViewport(node);
-  }, [updateViewport]);
-
-  useEffect(() => {
-    if (!selectedEventId) return;
-    const index = items.findIndex((item) => ledgerItemContainsId(item, selectedEventId));
-    const node = scrollerRef.current;
-    if (index < 0 || !node) return;
-    const target = headerHeight + offsets[index];
-    const nextTop = Math.max(0, Math.min(target - node.clientHeight * .35, headerHeight + totalRowsHeight - node.clientHeight));
-    node.scrollTo({ top: nextTop, behavior: "smooth" });
-  }, [items, offsets, selectedEventId, totalRowsHeight]);
-  return (
-    <div className="panel-scroll-wrap activity-panel">
-      <div className="activity-toolbar" role="toolbar" aria-label={t("activity.title")}>
-        <div className="activity-toolbar-title"><strong>{t("runtime.ledger.title")}</strong><span>{t("runtime.ledger.visible", { visible: items.length, total: deck.chat.length })}</span></div>
-        <label className="activity-search"><Icon name="search" size={13} /><Input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("runtime.ledger.search")} aria-label={t("runtime.ledger.search")} /></label>
-        <Button type="button" className={`density-toggle ${compact ? "on" : ""}`} onClick={() => setCompact((value) => { const next = !value; try { window.localStorage.setItem("muteki.activity.compact", next ? "1" : "0"); } catch { /* storage unavailable */ } return next; })} aria-pressed={compact}><Icon name="rows" size={14} /><span>{t("activity.densityLabel")}</span></Button>
-      </div>
-      {speakers.length > 1 && <div className="runtime-speaker-filter" aria-label={t("activity.filter")}>
-        <Button type="button" className={!shown.size ? "on" : ""} onClick={() => setShown(new Set())}>{t("activity.filterAll")}</Button>
-        {speakers.map(([key]) => {
-          const identity = toWorkerIdentity(key, deck.lanes[key]);
-          const label = actorDisplayTitle(key, t, identity, workerSiblings);
-          const worker = isWorkerLane(key);
-          const color = worker ? workerColor(key, deck.lanes[key]?.engine) : undefined;
-          const title = worker ? workerDisplayName(key, identity, workerSiblings).titleAttr : label;
-          return <Button type="button" key={key} className={!shown.size || shown.has(key) ? "on" : ""} style={color ? ({ "--wc": color } as CSSProperties) : undefined} aria-label={title} onClick={() => setShown((current) => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next; })}>{worker && <i className="spk-dot" />}<span>{label}</span></Button>;
-        })}
-      </div>}
-      <div ref={scrollerRef} className="panel-scroll runtime-ledger-scroll" onScroll={(event) => handleLedgerScroll(event.currentTarget)}>
-        {!deck.chat.length ? <div className="panel-empty"><span className="panel-empty-ico" aria-hidden="true"><Icon name="list" size={26} /></span><span className="panel-empty-title">{t("activity.empty")}</span><span className="panel-empty-hint">{t("activity.emptyHint")}</span></div> : !visible.length ? (silentFocusedWorker ? <div className="panel-empty"><span className="panel-empty-ico" aria-hidden="true"><Icon name="clock" size={26} /></span><span className="panel-empty-title">{t("activity.workerSilent")}</span><span className="panel-empty-hint">{t("activity.workerSilentHint")}</span></div> : <div className="panel-empty"><span className="panel-empty-ico" aria-hidden="true"><Icon name="search" size={26} /></span><span className="panel-empty-title">{t("activity.filterEmpty")}</span><span className="panel-empty-hint">{t("activity.filterEmptyHint")}</span></div>) :
-          <div
-            className={`activity-feed trace-ledger virtualized ${compact ? "compact" : ""}`}
-            style={{
-              height: headerHeight + totalRowsHeight,
-              "--ledger-row-h": `${metrics.row}px`,
-              "--ledger-child-h": `${metrics.child}px`,
-              "--ledger-expanded-h": `${metrics.expanded}px`,
-            } as CSSProperties}
-          >
-            <div className="trace-ledger-head" aria-hidden="true"><span>#</span><span>{t("runtime.ledger.event")}</span><span>{t("runtime.ledger.content")}</span><span>{t("runtime.ledger.time")}</span></div>
-            {virtualRows.map((item, virtualIndex) => {
-              const index = startIndex + virtualIndex;
-              const top = headerHeight + offsets[index];
-              const height = heights[index];
-              if (item.type === "tools") {
-                const solverId = item.solverId;
-                const isWorker = !!solverId && isWorkerLane(solverId);
-                const color = isWorker ? workerColor(solverId, deck.lanes[solverId]?.engine) : undefined;
-                const actorTitle = actorDisplayTitle(solverId, t, toWorkerIdentity(solverId, deck.lanes[solverId]), workerSiblings);
-                const open = groupOpen(item.id);
-                const failed = toolGroupFailedCommand(item.messages);
-                // A failed call is what the operator needs to see first; otherwise
-                // the newest call stands for the group.
-                const headline = failed || toolGroupLatestCommand(item.messages);
-                const { name: headName, args: headArgs } = splitToolCommand(headline);
-                const pending = item.messages.some((message) => message.toolPending);
-                const count = item.messages.length;
-                const selected = item.messages.some((message) => message.id === selectedEventId);
-                const detail = actorDetail(item.messages[0], actorTitle);
-                return (
-                  <div
-                    key={item.id}
-                    className={`act-msg tool-group ${open ? "expanded" : ""} ${selected ? "selected" : ""} ${failed ? "tool-failed" : ""}`}
-                    style={{ top, height, ...(color ? { "--wc": color } : {}) } as CSSProperties}
-                  >
-                    <Button
-                      type="button"
-                      className="act-group-head"
-                      aria-expanded={open}
-                      aria-posinset={index + 1}
-                      aria-setsize={items.length}
-                      onClick={() => setExpandedGroupId((current) => current === item.id ? null : item.id)}
-                      aria-label={t("runtime.ledger.toolGroupAria", { n: count, cmd: headline })}
-                      data-tooltip={new Date(toEpochMs(item.ts)).toLocaleString(lang)}
-                    >
-                      <span className="act-index">{String(index + 1).padStart(2, "0")}</span>
-                      <span className="act-kind kind-tool"><Icon name="terminal" size={12} />{t(count > 1 ? "runtime.event.tools" : "runtime.event.tool")}</span>
-                      <div className="act-main">
-                        <div className="act-who">
-                          <span className="act-actor">{actorTitle}</span>
-                          {detail && <span className="k">{detail}</span>}
-                          {pending && <span className="k state-pending">{t("runtime.ledger.toolPending")}</span>}
-                        </div>
-                        <div className="act-body act-summary" title={headline}>
-                          {count > 1 && <b className="act-summary-chip">{t("runtime.ledger.toolGroup", { n: count })}</b>}
-                          {failed && <b className="act-summary-chip is-failed">{t("runtime.ledger.toolFailed")}</b>}
-                          {headName && <span className="act-summary-name">{headName}</span>}
-                          <span className="act-summary-args">{abbreviateWorkspacePaths(headArgs)}</span>
-                        </div>
-                      </div>
-                      <time className="act-time">{formatClock(item.ts)}</time>
-                      <Icon className="act-expand" name="chevronDown" size={12} />
-                    </Button>
-                    {open && (
-                      <div className="act-tool-list">
-                        {item.messages.map((message) => {
-                          const childExpanded = activeExpandedId === message.id;
-                          const command = toolCommandLabel(message);
-                          const { name, args } = splitToolCommand(command);
-                          const state = message.toolFailed
-                            ? t("runtime.ledger.toolCallFailed")
-                            : message.toolPending
-                              ? t("runtime.ledger.toolPending")
-                              : t("runtime.ledger.toolCallOk");
-                          return (
-                            <Button
-                              type="button"
-                              key={message.id}
-                              className={`act-tool-child ${childExpanded ? "expanded" : ""} ${message.toolFailed ? "tool-failed" : ""} ${message.toolPending ? "tool-pending" : ""} ${selectedEventId === message.id ? "selected" : ""}`}
-                              data-ledger-id={message.id}
-                              style={childExpanded ? { height: metrics.expanded } : undefined}
-                              onClick={() => {
-                                const next = selectedEventId === message.id ? null : message.id;
-                                setExpandedId(next);
-                                onSelectEvent(next);
-                              }}
-                            >
-                              {/* title= is the full-command affordance: a per-row overlay
-                                  component would cost too much in this virtualized feed. */}
-                              <span className="act-tool-cmd" title={command}>
-                                <i className="act-tool-state" aria-hidden="true" />
-                                <span className="sr-only">{state}</span>
-                                {name && <span className="act-tool-name">{name}</span>}
-                                <span className="act-tool-args">{childExpanded ? args : abbreviateWorkspacePaths(args)}</span>
-                              </span>
-                              {childExpanded && message.toolOutput && <span className="act-tool-out">{message.toolOutput}</span>}
-                            </Button>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                );
-              }
-              if (item.type !== "single") {
-                const exhaustive: never = item;
-                void exhaustive;
-                return null;
-              }
-              const message = item.message;
-              const text = message.i18nKey ? t(message.i18nKey, message.i18nVars) : message.content;
-              const isWorker = !!message.solverId && isWorkerLane(message.solverId);
-              const selected = selectedEventId === message.id;
-              const expanded = expandedId === message.id || selected;
-              const color = isWorker ? workerColor(message.solverId!) : undefined;
-              const actorId = message.solverId || message.role;
-              const actorTitle = actorDisplayTitle(actorId, t, toWorkerIdentity(actorId, deck.lanes[actorId]), workerSiblings);
-              const detail = actorDetail(message, actorTitle);
-              return (
-                <Button
-                  type="button"
-                  key={item.id}
-                  className={`act-msg ${message.role} ${message.kind} ${expanded ? "expanded" : ""} ${selected ? "selected" : ""}`}
-                  aria-expanded={expanded}
-                  aria-current={selected ? "true" : undefined}
-                  aria-posinset={index + 1}
-                  aria-setsize={items.length}
-                  data-ledger-id={message.id}
-                  onClick={() => {
-                    const next = selected ? null : message.id;
-                    setExpandedId(next);
-                    onSelectEvent(next);
-                  }}
-                  style={{ top, height, ...(color ? { "--wc": color } : {}) } as CSSProperties}
-                  data-tooltip={new Date(toEpochMs(message.ts)).toLocaleString(lang)}
-                >
-                  <span className="act-index">{String(index + 1).padStart(2, "0")}</span>
-                  <span className={`act-kind kind-${message.kind}`}>{message.kind === "tool" ? <Icon name="terminal" size={12} /> : message.kind === "reasoning" ? <Icon name="radio" size={12} /> : message.kind === "flag" ? <Icon name="flag" size={12} /> : <Icon name="dot" size={9} />}{labelFor(message)}</span>
-                  <div className="act-main"><div className="act-who"><span className="act-actor">{actorTitle}</span>{detail && <span className="k">{detail}</span>}</div><div className="act-body">{text}</div></div>
-                  <time className="act-time">{formatClock(message.ts)}</time><Icon className="act-expand" name="chevronDown" size={12} />
-                </Button>
-              );
-            })}
-          </div>}
-      </div>
-      {!pinned && items.length > 0 && <Button type="button" className="activity-jump-latest" onClick={jumpToLatest} aria-label={t("runtime.ledger.jumpLatest")}>
-        <Icon name="chevronDown" size={13} /><span>{t("runtime.ledger.jumpLatest")}</span>{unread > 0 && <b>{unread > 99 ? "99+" : unread}</b>}
-      </Button>}
-    </div>
-  );
 }
 
 function RuntimeWorkerView({ deck, running, focusWorker, onSpawnWorker, onKillWorker, onOpenSpeakerTimeline, onOpenAgent }: {
@@ -1023,7 +286,14 @@ function RuntimeWorkerView({ deck, running, focusWorker, onSpawnWorker, onKillWo
 }
 
 function RuntimeList({ children }: { children: ReactNode }) { return <div className="artifact-list">{children}</div>; }
-function RuntimeEmpty() { const t = useRuntimeT(); return <div className="artifact-list-empty">{t("panel.empty")}</div>; }
+function RuntimeEmpty({ kind = "generic" }: { kind?: "generic" | "credentials" | "pocs" | "routes" | "directives" | "findings" }) {
+  const t = useRuntimeT();
+  return <div className="artifact-list-empty"><div className="panel-empty">
+    <span className="panel-empty-ico" aria-hidden="true"><Icon name="info" size={22} /></span>
+    <strong className="panel-empty-title">{t(`runtime.empty.${kind}.title`)}</strong>
+    <span className="panel-empty-hint">{t(`runtime.empty.${kind}.hint`)}</span>
+  </div></div>;
+}
 type CredRow = { entity: string; value: string; seq?: number };
 type CredFetch = { status: "loading" | "ready" | "error"; rows: CredRow[]; message?: string; retry: () => void };
 
@@ -1080,7 +350,7 @@ function RuntimeCredentials({ creds, onOpenFact }: { creds: CredFetch; onOpenFac
       <Button type="button" className="evi-filter-btn" onClick={creds.retry}>{t("runtime.credentials.retry")}</Button>
     </div>;
   }
-  if (!creds.rows.length) return <div className="artifact-list-empty">{t("runtime.credentials.empty")}</div>;
+  if (!creds.rows.length) return <RuntimeEmpty kind="credentials" />;
   return <RuntimeList>{creds.rows.map((row) => {
     const key = `${row.entity}-${row.seq ?? row.value}`;
     const open = !!revealed[key];
@@ -1136,7 +406,7 @@ function RuntimeDataView({ view, deck, focusPoc, onAdoptReview }: {
   if (view === "findings") {
     const reviewed = [...(deck.blackboard.reviewFindings ?? [])]
       .sort((a, b) => reviewSeverityRank(a.severity) - reviewSeverityRank(b.severity) || b.ts - a.ts);
-    if (!reviewed.length) return <div className="artifact-list-empty">{t("runtime.findings.empty")}</div>;
+    if (!reviewed.length) return <RuntimeEmpty kind="findings" />;
     const groups = new Map<string, typeof reviewed>();
     for (const row of reviewed) {
       const key = row.routeHash || "";
@@ -1172,7 +442,7 @@ function RuntimeDataView({ view, deck, focusPoc, onAdoptReview }: {
     </div>;
   }
   if (view === "pocs") {
-    const rows = deck.blackboard.pocs ?? []; if (!rows.length) return <RuntimeEmpty />;
+    const rows = deck.blackboard.pocs ?? []; if (!rows.length) return <RuntimeEmpty kind="pocs" />;
     return <RuntimeList>
       {deck.blackboard.truncated?.pocs && <div className="evi-density-note">{t("runtime.truncated", { n: 80 })}</div>}
       {[...rows].reverse().map((row) => <div className={`artifact-row ${focusPoc?.id === row.id ? "report-focused" : ""}`} key={row.id} id={`poc-${row.id}`}>
@@ -1186,7 +456,7 @@ function RuntimeDataView({ view, deck, focusPoc, onAdoptReview }: {
   if (view === "routes") {
     const routes = deck.blackboard.suppressedRoutes ?? [];
     const branches = deck.blackboard.branches ?? [];
-    if (!routes.length && !branches.length) return <RuntimeEmpty />;
+    if (!routes.length && !branches.length) return <RuntimeEmpty kind="routes" />;
     const suppressed = routes.filter((row) => !row.reopened);
     const reopened = routes.filter((row) => row.reopened);
     return <div className="panel-scroll-wrap">
@@ -1206,7 +476,7 @@ function RuntimeDataView({ view, deck, focusPoc, onAdoptReview }: {
   }
   const rows = deck.blackboard.directives ?? [];
   const lifecycle = deck.operatorDirectives ?? [];
-  if (!rows.length && !lifecycle.length) return <RuntimeEmpty />;
+  if (!rows.length && !lifecycle.length) return <RuntimeEmpty kind="directives" />;
   return <div className="panel-scroll-wrap">
     {deck.blackboard.truncated?.directives && <div className="evi-density-note">{t("runtime.truncated", { n: 60 })}</div>}
     <RuntimeList>
@@ -1231,7 +501,13 @@ function RuntimeArtifactPanel({ runId, open, width, view, deck, running, loading
   const creds = useRunCredentials(credentialsNeeded ? deck.runId : "", factGen);
   const workspaceActive = workspaceMode && open;
   const [resizing, setResizing] = useState(false);
-  const [selectedRuntimeEventId, setSelectedRuntimeEventId] = useState<string | null>(null);
+  const [pentestEvidenceView, setPentestEvidenceView] = useState<"detail" | "context">("detail");
+  const focusedFact = focusFact?.seq ? deck.blackboard.facts.find((item) => item.factSeq === focusFact.seq) : undefined;
+  const focusedFactHasEvidence = !!focusedFact?.verified && !isFactRetired(focusedFact);
+  useEffect(() => {
+    if (runMode !== "pentest" || !focusFact?.seq) return;
+    setPentestEvidenceView(focusedFactHasEvidence ? "detail" : "context");
+  }, [runMode, focusFact?.seq, focusFact?.nonce, focusedFactHasEvidence]);
   const currentTab = RUNTIME_TABS.find((tab) => tab.view === view) ?? RUNTIME_TABS[0];
   const currentGroup = RUNTIME_GROUPS.find((group) => group.id === currentTab.group) ?? RUNTIME_GROUPS[0];
   const visibleTabs = RUNTIME_TABS.filter((tab) => runMode !== "pentest" || tab.view !== "findings");
@@ -1255,14 +531,21 @@ function RuntimeArtifactPanel({ runId, open, width, view, deck, running, loading
     </Tabs>
     <span className="runtime-nav-divider" aria-hidden="true" />
     <Tabs selectedKey={view} onSelectionChange={(key) => onView(key as ArtifactView)}>
-      <Tabs.List className="runtime-view-nav" aria-label={t("runtime.nav.views")}>{groupTabs.map((tab) => { const count = runtimeTabCount(tab.view, deck, runMode); return <Tabs.Tab id={tab.view} key={tab.view}><Icon name={tab.icon} size={13} /><span>{t(runMode === "pentest" && tab.view === "routes" ? "runtime.pentest.process" : tab.key)}</span>{count !== null && <b>{count}</b>}<Tabs.Indicator /></Tabs.Tab>; })}</Tabs.List>
+      <Tabs.List className="runtime-view-nav" aria-label={t("runtime.nav.views")}>{groupTabs.map((tab) => { const count = runtimeTabCount(tab.view, deck, running, runMode); return <Tabs.Tab id={tab.view} key={tab.view}><Icon name={tab.icon} size={13} /><span>{t(runMode === "pentest" && tab.view === "routes" ? "runtime.pentest.process" : tab.key)}</span>{count !== null && <b>{count}</b>}<Tabs.Indicator /></Tabs.Tab>; })}</Tabs.List>
     </Tabs>
   </div>;
   if (runMode === "pentest" && workspaceActive) {
     const body = <div className="pentest-runtime-content">
         {loading ? <div className="panel-scroll"><PanelLoading rows={4} /></div>
-          : view === "evidence" ? <PentestEvidence deck={deck} runId={runId} focusFactSeq={focusFact?.seq} focusNonce={focusFact?.nonce} onOpenReport={onOpenReport} />
-          : view === "timeline" ? <RuntimeActivityStream deck={deck} selectedEventId={selectedRuntimeEventId} onSelectEvent={setSelectedRuntimeEventId} focusSpeaker={focusSpeaker} />
+          : view === "evidence" ? <Tabs className="pentest-evidence-views" selectedKey={pentestEvidenceView} onSelectionChange={(key) => setPentestEvidenceView(key as "detail" | "context")}>
+              <Tabs.List className="runtime-view-nav" aria-label={t("runtime.evidence.views")}>
+                <Tabs.Tab id="detail">{t("runtime.evidence.detail")}<Tabs.Indicator /></Tabs.Tab>
+                <Tabs.Tab id="context">{t("runtime.evidence.context")}<Tabs.Indicator /></Tabs.Tab>
+              </Tabs.List>
+              <Tabs.Panel id="detail"><PentestEvidence deck={deck} runId={runId} focusFactSeq={focusFact?.seq} focusNonce={focusFact?.nonce} onOpenReport={onOpenReport} /></Tabs.Panel>
+              <Tabs.Panel id="context"><EvidenceChain deck={deck} focusFactSeq={focusFact?.seq} focusNonce={focusFact?.nonce} /></Tabs.Panel>
+            </Tabs>
+          : view === "timeline" ? <ActivityTimeline deck={deck} running={running} focusSpeaker={focusSpeaker} />
           : view === "workers" ? <RuntimeWorkerView deck={deck} running={running} focusWorker={focusWorker} onSpawnWorker={onSpawnWorker} onKillWorker={onKillWorker} onOpenSpeakerTimeline={onOpenSpeakerTimeline} onOpenAgent={onOpenAgent} />
           : view === "routes" ? <div className="pentest-process"><h2>实际执行过程</h2><p>按共享图中真实记录的 Step 展示，不预设攻击路径。</p>{deck.blackboard.intents.length ? deck.blackboard.intents.map((intent, index) => <article key={intent.id}><span>{String(index + 1).padStart(2, "0")}</span><div><h3>{intent.summary || intent.goal}</h3><small>{intent.worker || intent.proposedBy || "Coordinator"} · {intent.status} · {intent.proposedTs ? new Date(toEpochMs(intent.proposedTs)).toLocaleString() : "—"}</small></div></article>) : <div className="panel-empty">尚无 Step 记录</div>}</div>
           : view === "credentials" ? <RuntimeCredentials creds={creds} onOpenFact={onOpenFact} />
@@ -1271,10 +554,7 @@ function RuntimeArtifactPanel({ runId, open, width, view, deck, running, loading
       </div>;
     return <div className="artifact workspace-mode pentest-runtime" role="region" aria-label="渗透测试运行时">
       {runtimeNavigation}
-      {view === "timeline" ? <div className="runtime-console">
-        <RuntimeTraceOverview deck={deck} running={running} selectedId={selectedRuntimeEventId} onSelect={setSelectedRuntimeEventId} />
-        {body}
-      </div> : body}
+      {body}
     </div>;
   }
   return <div className={`artifact t-page-slide ${workspaceActive ? "workspace-mode" : ""} ${resizing ? "resizing" : ""}`} style={workspaceActive ? undefined : { width: open ? width : 0, flexBasis: open ? width : 0 }} role="region" aria-label={t("a11y.artifact")}>
@@ -1282,34 +562,25 @@ function RuntimeArtifactPanel({ runId, open, width, view, deck, running, loading
       {!workspaceActive && <div className="artifact-resizer" role="separator" tabIndex={0} aria-label={t("art.resizeCanvas")} aria-valuemin={minWidth} aria-valuemax={maxWidth} aria-valuenow={width} onPointerDown={startResize} onKeyDown={resizeKey} onDoubleClick={() => onResize(defaultWidth)} />}
       {!workspaceActive && <div className="artifact-head runtime-head"><div className="runtime-titlemark"><Icon name={currentTab.icon} size={16} /></div><div className="runtime-heading"><span className="runtime-eyebrow">{t("runtime.title")}</span><div className="runtime-titleline"><strong>{t(currentTab.key)}</strong><span className={`runtime-state ${running ? "live" : deck.finished ? "complete" : "standby"}`}><span className="runtime-state-dot" />{t(running ? "runtime.status.live" : deck.finished ? "runtime.status.complete" : "runtime.status.standby")}</span></div><span className="runtime-context">{deck.challengeName || t("runtime.untitled")} · {deck.runId}</span></div><span className="spacer" /><Button className="x" onClick={onClose} aria-label={t("art.closeCanvas")}><Icon name="x" size={15} /></Button></div>}
       {runtimeNavigation}
-      {(() => {
-        const body = <div className="artifact-body"><div className="artifact-view t-skeleton-reveal" key={loading ? "loading" : view}>
+      <div className="artifact-body"><div className="artifact-view t-skeleton-reveal" key={loading ? "loading" : view}>
           {loading ? <div className="panel-scroll"><PanelLoading rows={4} /></div>
             : view === "usage" ? <UsageDashboard runId={runId} />
             : view === "workers" ? <RuntimeWorkerView deck={deck} running={running} focusWorker={focusWorker} onSpawnWorker={onSpawnWorker} onKillWorker={onKillWorker} onOpenSpeakerTimeline={onOpenSpeakerTimeline} onOpenAgent={onOpenAgent} />
-            : view === "timeline" ? <RuntimeActivityStream deck={deck} selectedEventId={selectedRuntimeEventId} onSelectEvent={setSelectedRuntimeEventId} focusSpeaker={focusSpeaker} />
+            : view === "timeline" ? <ActivityTimeline deck={deck} running={running} focusSpeaker={focusSpeaker} />
             : view === "evidence" ? <EvidenceChain deck={deck} focusFactSeq={focusFact?.seq} focusNonce={focusFact?.nonce} />
             : view === "credentials" ? <RuntimeCredentials creds={creds} onOpenFact={onOpenFact} />
             : <RuntimeDataView view={view} deck={deck} focusPoc={focusPoc} onAdoptReview={onAdoptReview} />}
-        </div></div>;
-        // The time-lane graph only belongs on the activity timeline. Worker
-        // detail and the collaboration canvas need the height for their own content.
-        if (currentGroup.id !== "observe" || view !== "timeline") return body;
-        return <div className="runtime-console">
-          <RuntimeTraceOverview deck={deck} running={running} selectedId={selectedRuntimeEventId} onSelect={setSelectedRuntimeEventId} />
-          {body}
-        </div>;
-      })()}
+        </div></div>
     </>}
   </div>;
 }
 
 export default function Page() {
-  return <Deck workspaceMode="ctf" />;
+  return <Suspense fallback={<PanelLoading />}><Deck workspaceMode="ctf" /></Suspense>;
 }
 
 export function PentestWorkbench() {
-  return <Deck workspaceMode="pentest" />;
+  return <Suspense fallback={<PanelLoading />}><Deck workspaceMode="pentest" /></Suspense>;
 }
 
 function Deck({ workspaceMode }: { workspaceMode: "ctf" | "pentest" }) {
@@ -1331,11 +602,14 @@ function Deck({ workspaceMode }: { workspaceMode: "ctf" | "pentest" }) {
   // error. Deferring to a post-mount effect keeps the first render identical.
   const [runId, setRunId] = useState("");
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const requestedRunId = workspaceMode === "pentest" ? searchParams.get("run") || "" : "";
+  const requestedSearch = searchParams.toString();
   useEffect(() => {
     // Legacy deep link (/run/<id>?view=collaboration&agent=…) → the standalone
     // page, keeping the agent / knowledge / relation / scope selection.
     const legacyRun = workspaceMode === "pentest"
-      ? new URLSearchParams(window.location.search).get("run") || ""
+      ? requestedRunId
       : runIdFromPath();
     if (workspaceMode === "ctf" && legacyRun && readCollabUrlState().view === "collaboration") {
       const params = new URLSearchParams(window.location.search);
@@ -1345,14 +619,14 @@ function Deck({ workspaceMode }: { workspaceMode: "ctf" | "pentest" }) {
       return;
     }
     // seed from the URL (/run/<id> deep-link / refresh); else a fresh draft.
-    setRunId(legacyRun || newDraftId());
+    setRunId(current => legacyRun || (isDraft(current) ? current : newDraftId()));
     // back/forward navigation between runs → re-read the path.
     const onPop = () => setRunId((workspaceMode === "pentest"
       ? new URLSearchParams(window.location.search).get("run") || ""
       : runIdFromPath()) || newDraftId());
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
-  }, [router, workspaceMode]);
+  }, [requestedRunId, router, workspaceMode]);
   // keep the URL in sync with the active run (replace, not push — internal run
   // switches shouldn't pile up history entries; deep-link/refresh still work).
   // Keep search so a draft→run promotion does not drop collaboration params.
@@ -1393,7 +667,7 @@ function Deck({ workspaceMode }: { workspaceMode: "ctf" | "pentest" }) {
 
   const [railCollapsed, setRailCollapsed] = useState(false);
   useEffect(() => {
-    const narrow = window.matchMedia("(max-width: 900px)");
+    const narrow = window.matchMedia("(max-width: 1180px)");
     const syncRail = () => setRailCollapsed(narrow.matches);
     syncRail();
     narrow.addEventListener("change", syncRail);
@@ -1441,12 +715,11 @@ function Deck({ workspaceMode }: { workspaceMode: "ctf" | "pentest" }) {
     setArtifactOpen(false);
     setReportOpen(false);
   }, [runId]);
+  const previousReportOpen = useRef(reportOpen);
   useEffect(() => {
-    if (workspaceMode !== "pentest") return;
-    const params = new URLSearchParams(window.location.search);
-    if (params.get("view") === "report" && params.has("run")) setReportOpen(true);
-  }, [workspaceMode]);
-  useEffect(() => {
+    // Route changes must not let the previous panel erase a pending report URL.
+    if (previousReportOpen.current === reportOpen) return;
+    previousReportOpen.current = reportOpen;
     if (workspaceMode !== "pentest" || !runId) return;
     const params = new URLSearchParams(window.location.search);
     if (reportOpen && !isDraft(runId)) params.set("view", "report");
@@ -1454,7 +727,7 @@ function Deck({ workspaceMode }: { workspaceMode: "ctf" | "pentest" }) {
     const query = params.toString();
     const url = `/pentest${query ? `?${query}` : ""}`;
     if (`${window.location.pathname}${window.location.search}` !== url) {
-      window.history.replaceState(window.history.state ?? {}, "", url);
+      window.history.replaceState({}, "", url);
     }
   }, [reportOpen, runId, workspaceMode]);
   // Default runtime view is the activity stream (live event ledger); the last
@@ -1500,9 +773,20 @@ function Deck({ workspaceMode }: { workspaceMode: "ctf" | "pentest" }) {
   // run mode is known and matches this shell — otherwise a cross-mode replace
   // remounts without view/worker/speaker/poc/fact and the requested panel is lost.
   useEffect(() => {
-    if (!deck.started || (deck.mode !== "ctf" && deck.mode !== "pentest") || deck.mode !== workspaceMode) return;
+    if (!deck.started || deck.runId !== runId || (deck.mode !== "ctf" && deck.mode !== "pentest") || deck.mode !== workspaceMode) return;
+    if (workspaceMode === "pentest" && requestedRunId !== runId) return;
     const params = new URLSearchParams(window.location.search);
-    if (!params.has("view") || params.get("view") === "collaboration" || params.get("view") === "report") return;
+    const view = params.get("view");
+    if (!view || view === "collaboration") return;
+    if (view === "report") {
+      if (workspaceMode === "pentest") { setArtifactOpen(false); setReportOpen(true); }
+      return;
+    }
+    if (RUNTIME_TABS.some((tab) => tab.view === view)) {
+      setReportOpen(false);
+      setArtifactView(view as ArtifactView);
+      setArtifactOpen(true);
+    }
     const nonce = Date.now();
     const worker = params.get("worker"); if (worker) setFocusedWorker({ id: worker, nonce });
     const speaker = params.get("speaker"); if (speaker) setFocusedSpeaker({ id: speaker, nonce });
@@ -1510,8 +794,9 @@ function Deck({ workspaceMode }: { workspaceMode: "ctf" | "pentest" }) {
     const fact = Number(params.get("fact")); if (params.has("fact") && Number.isFinite(fact)) setFocusedFact({ seq: fact, nonce });
     for (const key of ["view", "worker", "speaker", "poc", "fact"]) params.delete(key);
     const query = params.toString();
-    window.history.replaceState(window.history.state ?? {}, "", `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash}`);
-  }, [deck.started, deck.mode, workspaceMode]);
+    // App-owned history updates must let Next refresh its search-param snapshot.
+    window.history.replaceState({}, "", `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash}`);
+  }, [deck.started, deck.runId, deck.mode, requestedRunId, requestedSearch, runId, setArtifactView, workspaceMode]);
   const [winW, setWinW] = useState(typeof window !== "undefined" ? window.innerWidth : 1280);
   const [listBump, setListBump] = useState(0);
   const pushToast = useCallback((input: { msg: string; variant?: "success" | "error" | "info"; undo?: () => void; icon?: IconName }) => {

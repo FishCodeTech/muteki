@@ -127,7 +127,7 @@ function liveDelta(event: ConversationStreamEvent): string {
 
 function liveDeltaPhase(event: ConversationStreamEvent): ConversationLiveTextRun["phase"] {
   const rawPhase = String(event.payload.phase || event.payload.message_phase || event.payload.channel || "").toLowerCase();
-  return rawPhase === "commentary" ? "commentary"
+  return rawPhase === "commentary" || rawPhase === "partial_answer" ? "commentary"
     : rawPhase === "final_answer" || rawPhase === "final" ? "final_answer" : "unknown";
 }
 

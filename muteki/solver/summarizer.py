@@ -157,12 +157,6 @@ async def summarize_node(
                     {"role": "system", "content": _SYSTEM},
                     {"role": "user", "content": user},
                 ],
-                # reasoning model (deepseek-v4-flash): most tokens go to the thinking
-                # phase, so 2000 frequently left the ACTUAL one-line answer truncated
-                # → flash "failed" → fell back to a hard-clipped head (the high-
-                # frequency source of operator-seen "flag2{9f23aa1…" being cut). Give
-                # the answer enough room to land after reasoning.
-                max_tokens=6000,
                 stream=False,
                 run_id=run_id,
                 challenge_id=challenge_id,
@@ -241,7 +235,6 @@ async def translate_need(
                     {"role": "system", "content": _TRANSLATE_SYSTEM},
                     {"role": "user", "content": user},
                 ],
-                max_tokens=6000,   # reasoning model: leave room past the thinking phase
                 stream=False,
                 run_id=run_id,
                 challenge_id=challenge_id,

@@ -4,7 +4,7 @@ import { MotionIcon } from "@/components/MotionIcon";
 
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { DeckState, BlackboardDeadEnd, BlackboardFact, isFactRetired } from "@/lib/events";
-import { canvasModeOf } from "@/lib/swarmProjection";
+import { canvasModeOf, subGoalState } from "@/lib/swarmProjection";
 import { formatRelativeTime } from "@/lib/format";
 import { useT, useLang } from "@/lib/i18n";
 import { useCopied } from "@/lib/useCopied";
@@ -26,8 +26,8 @@ import { Button, Tabs } from "@heroui/react";
  */
 
 const SORT_KEY = "muteki.evidence.newestFirst";
-type PentestEvidenceFilter = "all" | "verified" | "observations" | "dead";
-type CtfEvidenceFilter = "all" | "facts" | "observations" | "dead" | "steps" | "resources" | "goals" | "flags";
+type PentestEvidenceFilter = "all" | "facts" | "verified" | "observations" | "dead" | "steps" | "resources" | "goals" | "history";
+type CtfEvidenceFilter = "all" | "facts" | "observations" | "dead" | "steps" | "resources" | "goals" | "flags" | "history";
 type EvidenceFilter = PentestEvidenceFilter | CtfEvidenceFilter;
 
 // ts may be unix seconds or ms — normalise to ms (mirrors ActivityStream).
@@ -60,7 +60,7 @@ function factKey(f: BlackboardFact, prefix: string, index: number): string {
   return `${prefix}${f.factSeq ?? `${f.actor}-${f.ts}-${index}`}`;
 }
 
-function FactItem({ f, t, zh, expanded, onToggle, statusLabel, ctf }: {
+function FactItem({ f, t, zh, expanded, onToggle, statusLabel, ctf, onFocusFact }: {
   f: BlackboardFact;
   t: (k: string, v?: Record<string, string | number>) => string;
   zh: boolean;
@@ -68,17 +68,16 @@ function FactItem({ f, t, zh, expanded, onToggle, statusLabel, ctf }: {
   onToggle: () => void;
   statusLabel?: string;
   ctf?: boolean;
+  onFocusFact?: (seq: number) => void;
 }) {
   const gist = (f.summary || "").trim();
-  const text = gist || f.fact;
-  // When a gist is shown as the label, the FULL raw fact must stay one click away —
-  // a gist can truncate/omit an anchor (flag/cred/port), so the operator needs the
-  // verbatim text. Mirror the Blackboard card's <details> disclosure. Only render it
-  // when the gist actually differs from the raw (no point disclosing identical text).
-  const hasRaw = !!gist && gist !== f.fact;
+  const text = f.fact || gist;
+  const hasSummary = !!gist && gist !== f.fact;
+  const retired = isFactRetired(f);
+  const replacement = f.replacementFactSeq ?? f.mergedInto;
   const when = formatRelativeTime(f.ts, t);
   return (
-    <div id={f.factSeq ? `fact-${f.factSeq}` : undefined} className={`evi-item ${f.verified ? "v" : "c"} ${expanded ? "expanded" : ""}`.trim()}>
+    <div id={f.factSeq ? `fact-${f.factSeq}` : undefined} className={`evi-item ${retired ? "retired" : f.verified ? "v" : "c"} ${expanded ? "expanded" : ""}`.trim()}>
       <div className="evi-head">
         <Button
           type="button"
@@ -102,16 +101,18 @@ function FactItem({ f, t, zh, expanded, onToggle, statusLabel, ctf }: {
       </div>
       {expanded && (
         <div className="evi-detail">
-          {hasRaw && (
-            <details className="evi-raw-d">
-              <summary className="evi-raw-more">{t("insp.raw")}</summary>
-              <div className="evi-raw-t">{f.fact}</div>
-            </details>
-          )}
+          {hasSummary && <div className="evi-raw-t">{gist}</div>}
           <dl className="evi-prov">
             <dt>{t("insp.provenance")}</dt>
             <dd className={f.verified ? "ok" : "warn"}>{statusLabel ?? (ctf ? t("insp.run.factRecorded") : (f.verified ? t("insp.verified") : t("insp.unverified")))}</dd>
             <dt>{t("insp.confidence")}</dt><dd>{Number(f.confidence).toFixed(2)}</dd>
+            {f.factSeq != null && <><dt>Fact</dt><dd>#{f.factSeq}</dd></>}
+            {f.state && <><dt>{zh ? "状态" : "State"}</dt><dd>{f.state}</dd></>}
+            {f.retirementReason && <><dt>{zh ? "变更原因" : "Revision reason"}</dt><dd>{f.retirementReason}</dd></>}
+            {f.supersededBy && <><dt>{zh ? "变更者" : "Revised by"}</dt><dd>{f.supersededBy}</dd></>}
+            {f.retiredTs && <><dt>{zh ? "变更时间" : "Revised at"}</dt><dd>{exactTime(f.retiredTs)}</dd></>}
+            {replacement != null && <><dt>{zh ? "替代事实" : "Replacement fact"}</dt><dd><a href={`#fact-${replacement}`} onClick={(event) => { if (onFocusFact) { event.preventDefault(); onFocusFact(replacement); } }}>#{replacement}</a></dd></>}
+            {f.challengeReason && <><dt>{zh ? "质疑原因" : "Challenge reason"}</dt><dd>{f.challengeReason}</dd></>}
             {!ctf && f.verifier && f.verifier !== "none" && <><dt>{t("insp.verifier")}</dt><dd>{f.verifier}</dd></>}
             {f.witness && <><dt>{t("evidence.witness")}</dt><dd className="witness">{f.witness}</dd></>}
             {f.artifactId && <><dt>{t("evidence.artifact")}</dt><dd>{f.artifactId}</dd></>}
@@ -287,6 +288,12 @@ export function EvidenceChain({ deck, focusFactSeq, focusNonce }: { deck: DeckSt
   const [newestFirst, setNewestFirst] = useState(true);
   const [filter, setFilter] = useState<EvidenceFilter>("all");
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+  const [pendingFactSeq, setPendingFactSeq] = useState<number>();
+  const openFact = useCallback((seq: number) => {
+    setFilter("all");
+    setExpandedIds((prev) => new Set(prev).add(`fact${seq}`));
+    setPendingFactSeq(seq);
+  }, []);
   useEffect(() => {
     try {
       const v = localStorage.getItem(SORT_KEY);
@@ -294,12 +301,16 @@ export function EvidenceChain({ deck, focusFactSeq, focusNonce }: { deck: DeckSt
     } catch { /* private mode — keep default */ }
   }, []);
   useEffect(() => {
-    if (!focusFactSeq) return;
-    const id = `v${focusFactSeq}`;
-    setExpandedIds((prev) => { const next = new Set(prev); next.add(id); return next; });
-    const node = document.getElementById(`fact-${focusFactSeq}`);
-    node?.scrollIntoView({ block: "nearest" });
-  }, [focusFactSeq, focusNonce]);
+    if (focusFactSeq != null) openFact(focusFactSeq);
+  }, [focusFactSeq, focusNonce, openFact]);
+  useEffect(() => {
+    if (pendingFactSeq == null) return;
+    const node = document.getElementById(`fact-${pendingFactSeq}`);
+    if (!node) return;
+    node.scrollIntoView({ block: "nearest" });
+    node.querySelector<HTMLButtonElement>(".evi-row")?.focus({ preventScroll: true });
+    setPendingFactSeq(undefined);
+  }, [deck.blackboard.facts, expandedIds, filter, pendingFactSeq]);
   const toggleSort = (next: boolean) => {
     setNewestFirst(next);
     try { localStorage.setItem(SORT_KEY, next ? "1" : "0"); } catch { /* best effort */ }
@@ -309,8 +320,7 @@ export function EvidenceChain({ deck, focusFactSeq, focusNonce }: { deck: DeckSt
   // untouched (memo over a copy) so other panels reading deck stay stable.
   const order = useCallback(<T,>(arr: T[]): T[] => (newestFirst ? [...arr].reverse() : arr), [newestFirst]);
 
-  // A: review-retired facts (rejected/merged/superseded) are NOT evidence — they
-  // failed review and must not appear in the proof chain.
+  // Retired facts remain in history, separate from active proof.
   const verified = useMemo(
     () => order(deck.blackboard.facts.filter((f) => f.verified && !isFactRetired(f) && (!isPentest || f.actor !== "origin"))),
     [deck.blackboard.facts, isPentest, order],
@@ -351,14 +361,19 @@ export function EvidenceChain({ deck, focusFactSeq, focusNonce }: { deck: DeckSt
     () => order(deck.blackboard.facts.filter((f) => !isFactRetired(f))),
     [deck.blackboard.facts, order],
   );
+  const retiredFacts = useMemo(
+    () => order(deck.blackboard.facts.filter(isFactRetired)),
+    [deck.blackboard.facts, order],
+  );
   const ctfSteps = useMemo(
     () => order(deck.blackboard.intents.map((intent) => ({
       intent,
       id: intent.id,
-      text: intent.summary || intent.goal,
+      text: intent.goal || intent.summary || intent.id,
       actor: intent.worker || intent.proposedBy || "",
       ts: intent.proposedTs,
-      status: intent.dispatchState || intent.status,
+      status: intent.dispatchState && intent.dispatchState !== "active"
+        ? intent.dispatchState : intent.status,
     }))),
     [deck.blackboard.intents, order],
   );
@@ -367,7 +382,7 @@ export function EvidenceChain({ deck, focusFactSeq, focusNonce }: { deck: DeckSt
     [deck.blackboard.pocs, order],
   );
   const ctfGoals = useMemo(() => {
-    const title = (deck.taskContract?.completion.goal || "").trim() || (zh ? "提交全部 FLAG" : "Submit every FLAG");
+    const title = (deck.taskContract?.completion.goal || "").trim() || (isCtf ? (zh ? "提交全部 FLAG" : "Submit every FLAG") : (deck.challengeName || (zh ? "完成渗透测试目标" : "Complete the engagement goal")));
     const satisfied = !!deck.solved || !!deck.reason.goalMet;
     return [{
       id: "goal:final",
@@ -375,13 +390,23 @@ export function EvidenceChain({ deck, focusFactSeq, focusNonce }: { deck: DeckSt
       status: satisfied ? t("collab.status.satisfied") : t("collab.status.open"),
       actor: "",
       ts: deck.finishedAt || deck.startedAt || 0,
-    }];
-  }, [deck.finishedAt, deck.reason.goalMet, deck.solved, deck.startedAt, deck.taskContract, t, zh]);
+      reason: deck.goalWhy,
+      evidenceFactSeqs: [] as number[],
+    }, ...deck.blackboard.subGoals.map((goal) => ({
+      id: `goal:${goal.id}`,
+      text: goal.criterion,
+      status: t(subGoalState(goal, deck) === "satisfied" ? "collab.status.satisfied" : "collab.status.open"),
+      actor: goal.actor,
+      ts: goal.satisfiedTs || goal.createdTs,
+      reason: goal.reason,
+      evidenceFactSeqs: goal.evidenceFactSeqs,
+    }))];
+  }, [deck, isCtf, t, zh]);
   const ctfFlags = useMemo(() => {
     if (deck.flagConfirmations.length) {
       return order(deck.flagConfirmations.map((row) => ({
         id: row.id,
-        text: row.title || row.flag,
+        text: row.flag || row.title || "",
         status: flagStatusLabel(row.status, t),
         actor: row.actor || "",
         ts: row.ts,
@@ -398,12 +423,10 @@ export function EvidenceChain({ deck, focusFactSeq, focusNonce }: { deck: DeckSt
     })));
   }, [deck.flagConfirmations, deck.flags, order, t]);
   const latestReason = deck.blackboard.reasonRuns?.at(-1);
-  const empty = isCtf
-    ? ctfFacts.length === 0 && observations.length === 0 && deadEnds.length === 0 && ctfSteps.length === 0 && ctfResources.length === 0 && ctfGoals.length === 0 && ctfFlags.length === 0
-    : verified.length === 0 && observations.length === 0 && deadEnds.length === 0;
-  const total = isCtf
-    ? ctfFacts.length + observations.length + deadEnds.length + ctfSteps.length + ctfResources.length + ctfGoals.length + ctfFlags.length
-    : verified.length + observations.length + deadEnds.length;
+  const activeFacts = ctfFacts;
+  const factRows = isCtf || filter === "facts" ? ctfFacts : ctfFacts.filter((fact) => !fact.verified || fact.actor === "origin");
+  const total = activeFacts.length + observations.length + deadEnds.length + ctfSteps.length + ctfResources.length + ctfGoals.length + retiredFacts.length + (isCtf ? ctfFlags.length : 0);
+  const empty = total === 0;
   const actorCount = useMemo(() => new Set([
     ...deck.blackboard.facts.map((f) => f.actor),
     ...deck.blackboard.observations.map((observation) => observation.actor),
@@ -424,9 +447,14 @@ export function EvidenceChain({ deck, focusFactSeq, focusNonce }: { deck: DeckSt
     : [
         { key: "all", label: t("evidence.all"), n: total },
         { key: "verified", label: t("evidence.verifiedShort"), n: verified.length },
+        { key: "facts", label: t("evidence.factsShort"), n: ctfFacts.length },
         { key: "observations", label: t("evidence.observationsShort"), n: observations.length },
         { key: "dead", label: t("evidence.deadShort"), n: deadEnds.length },
+        { key: "steps", label: t("evidence.stepsShort"), n: ctfSteps.length },
+        { key: "resources", label: t("evidence.resourcesShort"), n: ctfResources.length },
+        { key: "goals", label: t("evidence.goalsShort"), n: ctfGoals.length },
       ];
+  filterButtons.push({ key: "history", label: zh ? "历史事实" : "Fact history", n: retiredFacts.length });
   const toggleExpanded = (id: string) =>
     setExpandedIds((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
 
@@ -533,19 +561,20 @@ export function EvidenceChain({ deck, focusFactSeq, focusNonce }: { deck: DeckSt
         <div className="panel-empty"><span className="panel-empty-ico" aria-hidden="true"><Icon name="layers" size={26} /></span><span className="panel-empty-title">{t("evidence.empty")}</span><span className="panel-empty-hint">{t(isCtf ? "evidence.emptyHintCtf" : "evidence.emptyHint")}</span></div>
       ) : (
         <>
-          {isCtf && (filter === "all" || filter === "facts") && ctfFacts.length > 0 && (
-            <div className="evi-group verified">
-              <div className="evi-group-h">{t("evidence.facts", { n: ctfFacts.length })}</div>
-              {ctfFacts.map((f, i) => {
-                const id = factKey(f, "f", i);
+          {(filter === "all" || filter === "facts") && factRows.length > 0 && (
+            <div className="evi-group">
+              <div className="evi-group-h">{t("evidence.facts", { n: factRows.length })}</div>
+              {factRows.map((f, i) => {
+                const id = factKey(f, "fact", i);
                 return (
                   <FactItem
                     key={id}
                     f={f}
+                    onFocusFact={openFact}
                     t={t}
                     zh={zh}
-                    ctf
-                    statusLabel={t("insp.run.factRecorded")}
+                    ctf={isCtf}
+                    statusLabel={isCtf ? t("insp.run.factRecorded") : undefined}
                     expanded={expandedIds.has(id)}
                     onToggle={() => toggleExpanded(id)}
                   />
@@ -572,7 +601,7 @@ export function EvidenceChain({ deck, focusFactSeq, focusNonce }: { deck: DeckSt
               })}
             </div>
           )}
-          {isCtf && (filter === "all" || filter === "steps") && ctfSteps.length > 0 && (
+          {(filter === "all" || filter === "steps") && ctfSteps.length > 0 && (
             <div className="evi-group">
               <div className="evi-group-h">{t("evidence.steps", { n: ctfSteps.length })}</div>
               {ctfSteps.map((step) => {
@@ -586,6 +615,11 @@ export function EvidenceChain({ deck, focusFactSeq, focusNonce }: { deck: DeckSt
                     ts={step.ts}
                     detailRows={[
                       { label: t("collab.field.step"), value: step.id },
+                      { label: zh ? "目标" : "Goal", value: step.intent.goal },
+                      ...(step.intent.question ? [{ label: zh ? "问题" : "Question", value: step.intent.question }] : []),
+                      ...(step.intent.answer ? [{ label: zh ? "结果" : "Answer", value: step.intent.answer }] : []),
+                      ...(step.intent.description ? [{ label: zh ? "说明" : "Description", value: step.intent.description }] : []),
+                      ...(step.intent.closeReason ? [{ label: zh ? "结束原因" : "Close reason", value: step.intent.closeReason }] : []),
                       ...(step.intent.fromFacts.length ? [{ label: t("collab.field.inputs"), value: step.intent.fromFacts.map((seq) => `#${seq}`).join(", ") }] : []),
                       ...(step.intent.expectedObservable ? [{ label: t("collab.field.expected"), value: step.intent.expectedObservable }] : []),
                       ...(step.intent.stopCondition ? [{ label: t("collab.field.stop"), value: step.intent.stopCondition }] : []),
@@ -600,7 +634,7 @@ export function EvidenceChain({ deck, focusFactSeq, focusNonce }: { deck: DeckSt
               })}
             </div>
           )}
-          {isCtf && (filter === "all" || filter === "resources") && ctfResources.length > 0 && (
+          {(filter === "all" || filter === "resources") && ctfResources.length > 0 && (
             <div className="evi-group">
               <div className="evi-group-h">{t("evidence.resources", { n: ctfResources.length })}</div>
               {ctfResources.map((resource) => {
@@ -628,7 +662,7 @@ export function EvidenceChain({ deck, focusFactSeq, focusNonce }: { deck: DeckSt
               })}
             </div>
           )}
-          {isCtf && (filter === "all" || filter === "goals") && ctfGoals.length > 0 && (
+          {(filter === "all" || filter === "goals") && ctfGoals.length > 0 && (
             <div className="evi-group">
               <div className="evi-group-h">{t("evidence.goals", { n: ctfGoals.length })}</div>
               {ctfGoals.map((goal) => {
@@ -640,11 +674,26 @@ export function EvidenceChain({ deck, focusFactSeq, focusNonce }: { deck: DeckSt
                     status={goal.status}
                     ts={goal.ts}
                     t={t}
-                    tone={deck.solved || deck.reason.goalMet ? "v" : "c"}
+                    actor={goal.actor}
+                    detailRows={[
+                      { label: "ID", value: goal.id },
+                      ...(goal.reason ? [{ label: t("evidence.note"), value: goal.reason }] : []),
+                      ...(goal.evidenceFactSeqs.length ? [{ label: t("collab.field.inputs"), value: goal.evidenceFactSeqs.map((seq) => `#${seq}`).join(", ") }] : []),
+                    ]}
+                    tone={goal.status === t("collab.status.satisfied") ? "v" : "c"}
                     expanded={expandedIds.has(id)}
                     onToggle={() => toggleExpanded(id)}
                   />
                 );
+              })}
+            </div>
+          )}
+          {(filter === "all" || filter === "history") && retiredFacts.length > 0 && (
+            <div className="evi-group history">
+              <div className="evi-group-h">{zh ? "历史事实" : "Fact history"} · {retiredFacts.length}</div>
+              {retiredFacts.map((f, i) => {
+                const id = factKey(f, "fact", i);
+                return <FactItem key={id} f={f} t={t} zh={zh} ctf={isCtf} statusLabel={f.state} onFocusFact={openFact} expanded={expandedIds.has(id)} onToggle={() => toggleExpanded(id)} />;
               })}
             </div>
           )}
@@ -670,8 +719,8 @@ export function EvidenceChain({ deck, focusFactSeq, focusNonce }: { deck: DeckSt
             <div className="evi-group verified">
               <div className="evi-group-h">{t("evidence.verified", { n: verified.length })}</div>
               {verified.map((f, i) => {
-                const id = factKey(f, "v", i);
-                return <FactItem key={id} f={f} t={t} zh={zh} expanded={expandedIds.has(id)} onToggle={() => toggleExpanded(id)} />;
+                const id = factKey(f, "fact", i);
+                return <FactItem key={id} f={f} t={t} zh={zh} onFocusFact={openFact} expanded={expandedIds.has(id)} onToggle={() => toggleExpanded(id)} />;
               })}
             </div>
           )}

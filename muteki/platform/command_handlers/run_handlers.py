@@ -5,6 +5,13 @@ RunGateway（CORE-04）→ RunManager.post_control → ``muteki/control`` 持久
 journal。这里不重建第二套暂停/恢复/Operator 指令状态机：command_id 幂等、
 acceptance/effect receipt、执行代（generation）语义全部沿用控制层。
 
+非 operator 的 ``run.*`` 命令必须作用于自己边界内的 Run：CapabilityBinding
+所属 Thread 绑定到 SRC Task 时，目标 Run 必须在该 Task 的 run_binding 之下
+（``_assert_run_ownership``）；普通对话 / 单题 / 比赛 Thread 保持既有行为。
+该归属校验与 SRC 执行策略门（AgentCapabilityGateway 的
+``_dispatch_with_src_policy``）构成双层防护：策略层拒绝未授权的工具调用，
+本层在命令归属上兜底，且不受策略配置放宽的影响。
+
 长任务（run.start 启动 Swarm、run.resolve 续做执行代）在接收事件与回执
 持久化后立即执行副作用并返回；RunManager.start 本身只启动执行代协程即返回，
 调用方经 get_receipt / snapshot / read_events / 有界 wait 继续追踪。
@@ -21,11 +28,13 @@ acceptance/effect receipt、执行代（generation）语义全部沿用控制层
 
 from __future__ import annotations
 
+import sqlite3
 from typing import Any, Optional
 
 from muteki.control import ControlAction
 
 from muteki.platform.command_handlers.base import (
+    OPERATOR_ACTOR_KINDS,
     CommandFailed,
     CommandPlan,
     HandlerContext,
@@ -140,6 +149,79 @@ def _require_run_id(command_envelope: Any, command_type: str) -> str:
     return run_id
 
 
+def _src_task_for_thread(store: Any, thread_id: str) -> Optional[str]:
+    """Thread 绑定的 SRC Task id；非 SRC Thread 或未初始化 SRC 产品时返回 None。
+
+    与 ``SrcService.task_for_thread`` 保持同一查询口径（src_records 按
+    natural_key 取 task_binding），让命令归属判定与领域服务一致。
+    """
+    if not thread_id:
+        return None
+    try:
+        with store.lock:
+            row = store.conn.execute(
+                "SELECT task_id FROM src_records"
+                " WHERE kind='task_binding' AND natural_key=?",
+                (thread_id,),
+            ).fetchone()
+    except sqlite3.Error:
+        # SRC 产品未在该 store 初始化：task_binding 不可能存在。
+        return None
+    return str(row["task_id"]) if row is not None else None
+
+
+def _src_task_for_run(store: Any, run_id: str) -> Optional[str]:
+    """Run 绑定的 SRC Task id（与 ``SrcService.task_id_for_run`` 同口径）。"""
+    try:
+        with store.lock:
+            row = store.conn.execute(
+                "SELECT task_id FROM src_records"
+                " WHERE kind='run_binding' AND record_id=?",
+                (run_id,),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    return str(row["task_id"]) if row is not None else None
+
+
+def _assert_run_ownership(
+    command: Any, ctx: HandlerContext, run_id: str, command_type: str,
+) -> None:
+    """非 operator 的 run.* 命令必须作用于自己边界内的 Run。
+
+    CapabilityBinding 所属 Thread 绑定到 SRC Task 时，目标 Run 必须在该
+    Task 的 run_binding 之下；普通对话 / 单题 / 比赛 Thread 没有 Task 边界，
+    保持既有行为。operator / system 主体现有路径完全不变。
+    """
+    if ctx.principal.kind in OPERATOR_ACTOR_KINDS:
+        return
+    thread_id = str(
+        (ctx.binding.thread_id if ctx.binding is not None else "")
+        or ctx.principal.thread_id or "")
+    task_id = _src_task_for_thread(ctx.store, thread_id)
+    if task_id is None:
+        return
+    if _src_task_for_run(ctx.store, run_id) != task_id:
+        raise CommandFailed(make_error(
+            "run.not_owner",
+            f"run {run_id!r} is not bound to this SRC Task",
+            ErrorCategory.PERMISSION,
+            correlation_id=correlation_id_of(command),
+            recovery_hint=(
+                "control only runs created by your own SRC Task")),
+            state=ReceiptState.FAILED)
+
+
+def _control_actor_label(actor: Any) -> str:
+    """控制 journal 的 actor 文本：operator 路径保持历史 ``operator`` 记录，
+    Agent 路径保留真实身份（``<kind>:<principal_id>``），不得记成 operator。"""
+    kind = str(getattr(actor, "kind", "") or "").strip()
+    if kind in OPERATOR_ACTOR_KINDS:
+        return "operator"
+    actor_id = str(getattr(actor, "id", "") or "").strip()
+    return f"{kind}:{actor_id}"[:256] if actor_id else (kind or "operator")
+
+
 class RunCommandHandler:
     """run.* 命令命名空间的属主。"""
 
@@ -165,10 +247,10 @@ class RunCommandHandler:
         if ct == "run.create":
             return await self._plan_create(gateway, command)
         if ct in ("run.start", "run.resolve"):
-            return await self._plan_lifecycle(gateway, command, ct)
+            return await self._plan_lifecycle(gateway, command, ct, ctx)
         if ct in _MAINTENANCE_ACTIONS:
             return await self._plan_maintenance(gateway, command, ct)
-        return await self._plan_control(gateway, command, ct)
+        return await self._plan_control(gateway, command, ct, ctx)
 
     @staticmethod
     async def _ensure_run_handle(gateway: Any, command: Any, run_id: str) -> None:
@@ -254,9 +336,12 @@ class RunCommandHandler:
 
     # -- run.start / run.resolve ----------------------------------------------
 
-    async def _plan_lifecycle(self, gateway: Any, command: Any, ct: str) -> CommandPlan:
+    async def _plan_lifecycle(
+            self, gateway: Any, command: Any, ct: str, ctx: HandlerContext,
+    ) -> CommandPlan:
         run_id = _require_run_id(command, ct)
         await self._ensure_run_handle(gateway, command, run_id)
+        _assert_run_ownership(command, ctx, run_id, ct)
         action = ct.rsplit(".", 1)[1]  # start | resolve
         forward = _forward_payload(command)
         receipt = CommandReceipt(
@@ -286,9 +371,12 @@ class RunCommandHandler:
 
     # -- 控制命令（pause/resume/stop/directive/worker 等） ----------------------
 
-    async def _plan_control(self, gateway: Any, command: Any, ct: str) -> CommandPlan:
+    async def _plan_control(
+            self, gateway: Any, command: Any, ct: str, ctx: HandlerContext,
+    ) -> CommandPlan:
         run_id = _require_run_id(command, ct)
         await self._ensure_run_handle(gateway, command, run_id)
+        _assert_run_ownership(command, ctx, run_id, ct)
         if ct == "run.control":
             action = str(command.payload.get("control_action") or "").strip()
             if action not in {item.value for item in ControlAction}:
@@ -313,7 +401,7 @@ class RunCommandHandler:
             run_command = RunCommand(
                 command_type=action,
                 command_id=command.command_id,
-                actor_id=command.actor.id,
+                actor_id=_control_actor_label(command.actor),
                 expected_generation=(
                     int(expected_generation)
                     if expected_generation is not None else None),

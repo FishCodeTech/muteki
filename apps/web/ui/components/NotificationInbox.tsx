@@ -5,6 +5,8 @@ import { desktopChatBridge, type DesktopNativeState } from '@/lib/desktopChatBri
 import { conversationStorageScope, subscribeConversationStorageScope } from '@/lib/conversationStorageScope';
 import { dispatchThreadNotification, type ConversationInboxEvent } from '@/lib/threadNotifications';
 import { useConversationThreads } from '@/lib/useConversation';
+import { usePathname } from 'next/navigation';
+import { isLocalPreviewPath } from '@/lib/conversationPreviewMode';
 
 /** The authenticated workspace owns notification delivery independently of its current page. */
 export function NotificationInbox() {
@@ -32,7 +34,9 @@ export function NotificationInbox() {
   }, [bridge]);
   const identity = bridge ? state.notificationWorkspaceKey || '' : scope;
   const admissionScopeKey = bridge ? JSON.stringify([state.connectionVersion, state.transportOrigin]) : String(currentAuthGeneration());
-  const { error } = useConversationThreads({ enabled: Boolean(identity) && (!bridge || state.notificationOwner === true),
+  // Local previews must not read or announce real threads.
+  const localPreview = isLocalPreviewPath(usePathname());
+  const { error } = useConversationThreads({ enabled: !localPreview && Boolean(identity) && (!bridge || state.notificationOwner === true),
     admissionScopeKey,
     canAdmitInboxEvent: (key, generation) => bridge
       ? stateRef.current.notificationOwner === true && key === `muteki.notification-inbox.v1:${stateRef.current.notificationWorkspaceKey}`

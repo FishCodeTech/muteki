@@ -366,8 +366,7 @@ class SolveGraph(BaseModel):
         if c.target:
             lines.append(f"Target: {c.target}")
         if c.description:
-            desc = c.description.strip().replace("\n", " ")
-            lines.append(f"Brief: {desc[:300]}")
+            lines.append(f"Brief: {c.description.strip()}")
         if c.attachments:
             # player-facing files a real competitor was given — READ THESE FIRST.
             # For many challenges (esp. code-review) the attachment IS the input.

@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+from muteki.core.blocking import run_blocking
+
 import json
 from datetime import datetime, timezone
 from typing import Any
@@ -107,6 +109,9 @@ class MemoryTimelineGraph(SQLiteGraphBase):
     # -- GraphService.snapshot ---------------------------------------------------
 
     async def snapshot(self, scope: GraphScope) -> GraphSnapshot:
+        return await run_blocking(self._snapshot_sync, scope)
+
+    def _snapshot_sync(self, scope: GraphScope) -> GraphSnapshot:
         """记忆读取模型；scope 支持 thread_id 过滤与 include_deleted 开关。"""
         self._check_graph_id(scope.graph_id)
         thread_id = scope.scope.get("thread_id")

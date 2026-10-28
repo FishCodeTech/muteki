@@ -32,6 +32,41 @@ def register(app: FastAPI) -> None:
     _engine_refresh_lock = h._engine_refresh_lock
     _invalidate_engine_cache = h._invalidate_engine_cache
 
+    @app.post("/api/settings/profiles/preflight-batch")
+    async def preflight_worker_batch(request: Request) -> Any:
+        """Warm the same CLI readiness cache used by Run admission.
+
+        The hosted runner calls this before it allocates a challenge instance.
+        Its backend and network are fixed here so a caller cannot make this
+        endpoint probe an arbitrary image or network configuration.
+        """
+        from apps.web.drivers import _startup_readiness
+        from muteki.solver.worker_profiles import normalize_worker_profile
+
+        body = await _require_dict_body(request)
+        raw_profiles = body.get("worker_profiles")
+        if not isinstance(raw_profiles, list) or not 1 <= len(raw_profiles) <= 8:
+            raise HTTPException(status_code=400, detail="one to eight worker profiles required")
+        try:
+            for profile in raw_profiles:
+                if normalize_worker_profile(profile, reject_invalid=True) is None:
+                    raise ValueError("disabled worker profile cannot be prewarmed")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Keep the exact submitted dictionaries. Run startup probes those same
+        # profiles, and the success cache includes the entire profile identity.
+        profiles = [dict(profile) for profile in raw_profiles]
+        snapshot, failures = await _startup_readiness(
+            profiles=profiles,
+            worker_network="host",
+            worker_backend="local",
+            sessions_root=app.state.manager.state_root,
+            cached_results={},
+        )
+        if failures:
+            raise HTTPException(status_code=503, detail={"failures": failures})
+        return {"ok": True, "profiles": snapshot}
+
     @app.get("/api/engines")
     async def engines() -> Any:
         from muteki.solver.cli_driver import engine_status

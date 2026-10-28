@@ -28,7 +28,7 @@ import {
   type LaneStatusKind,
   type WorkerLanePresentationInput,
 } from "./workerLanePresentation";
-import { canvasModeOf } from "./swarmProjection";
+import { canvasModeOf, subGoalState } from "./swarmProjection";
 
 export type CollaborationScope = "current" | "all";
 export type CollaborationRelationKind =
@@ -37,7 +37,7 @@ export type CollaborationKnowledgeKind =
   | "intent" | "step" | "fact" | "observation" | "candidate" | "dead_end" | "poc" | "report"
   | "review" | "finding" | "route" | "branch" | "directive" | "flag" | "lock" | "goal";
 export type CollaborationTone = "neutral" | "accent" | "success" | "warning" | "danger" | "muted";
-export type CollaborationAgentRole = "coordinator" | "decision" | "source" | "worker" | "review" | "verifier";
+export type CollaborationAgentRole = "coordinator" | "decision" | "challenger" | "source" | "worker" | "review" | "verifier";
 /** Where an agent's start/end timestamps were taken from. */
 export type CollaborationLifecycleSource = "lane" | "runtime" | "inferred" | "run";
 
@@ -60,6 +60,18 @@ export interface CollaborationKnowledgeItem {
   intentId?: string;
   factSeq?: number;
   artifactId?: string;
+  goalId?: string;
+  question?: string;
+  answer?: string;
+  description?: string;
+  fromFactSeqs?: number[];
+  requiresCapabilities?: string[];
+  requiredPocs?: string[];
+  evidenceFactSeqs?: number[];
+  retirementReason?: string;
+  retirementActorId?: string;
+  replacementFactSeq?: number;
+  retiredTs?: number;
   witness?: string;
   confidence?: number;
   /** Intent rows: who proposed it (coordinator, operator, or a worker id). */
@@ -153,6 +165,7 @@ export interface CollaborationAgent extends CollaborationMetrics {
   /** Open HITL prompts raised by this worker. */
   pendingHitl: number;
   coordination?: CoordinatorMetrics;
+  challenger?: BlackboardView["challenger"];
 }
 
 export interface CollaborationRelation {
@@ -219,6 +232,7 @@ export interface CollaborationRecency {
 
 export const COORDINATOR_ID = "coordinator";
 export const DECISION_ID = "decision-model";
+export const CHALLENGER_ID = "challenger";
 export const INPUT_SOURCE_ID = "origin";
 
 /** Presentation entities are never executable worker lanes. */
@@ -644,6 +658,15 @@ function knowledgeRows(
       kind: "intent",
       title: intentTitle(intent),
       detail: intent.goal,
+      description: intent.description,
+      goalId: intent.goalId,
+      question: intent.question,
+      answer: intent.answer || intent.resultDetail,
+      fromFactSeqs: intent.fromFacts,
+      requiresCapabilities: intent.requiresCapabilities,
+      requiredPocs: intent.requiredPocs,
+      evidenceFactSeqs: intent.toFactSeq ? [intent.toFactSeq] : [],
+      retirementReason: intent.closeReason,
       agentId: collaborationAgentId(intent.worker) || (intent.status === "open" ? COORDINATOR_ID : undefined),
       proposerId: collaborationAgentId(intent.proposedBy) || COORDINATOR_ID,
       ts: intent.concludedTs ?? intent.claimedTs ?? intent.proposedTs,
@@ -651,19 +674,22 @@ function knowledgeRows(
       claimedTs: intent.claimedTs,
       concludedTs: intent.concludedTs,
       tone: intent.dispatchState === "retired" ? "muted" : intent.status === "claimed" ? "accent" : intent.status === "done" ? "success" : "neutral",
-      ...rowStatus("intent", intent.dispatchState || intent.status),
+      ...rowStatus("step", intent.dispatchState && intent.dispatchState !== "active" ? intent.dispatchState : intent.status),
       intentId: intent.id,
     });
   }
 
   for (const fact of bb.facts) {
     const retired = isFactRetired(fact);
+    // Retirement clears verified in the reducer, but the historical Fact and
+    // its replacement remain inspectable without counting as active evidence.
+    const kind = fact.verified || retired ? "fact" : "candidate";
     const producer = collaborationAgentId(fact.actor);
     const verifierAgentId = resolveVerifierAgent(fact.verifier, roster);
     const selfReported = !!producer && (verifierAgentId === producer || collaborationAgentId(fact.verifier) === producer);
     rows.push({
       id: `fact:${fact.factSeq ?? `${fact.actor}:${fact.ts}`}`,
-      kind: fact.verified ? "fact" : "candidate",
+      kind,
       title: factTitle(fact),
       detail: fact.fact,
       agentId: producer,
@@ -671,14 +697,32 @@ function knowledgeRows(
       appearedTs: fact.ts,
       promotedTs: fact.promotedTs,
       tone: retired ? "muted" : fact.challenged ? "warning" : fact.verified ? "success" : "warning",
-      ...rowStatus(fact.verified ? "fact" : "candidate", fact.state || (fact.verified ? "verified" : "candidate")),
+      ...rowStatus(kind, fact.state || (fact.verified ? "verified" : "candidate")),
       intentId: fact.intentId,
       factSeq: fact.factSeq,
       artifactId: fact.artifactId,
       witness: fact.witness,
       confidence: fact.confidence,
+      retirementReason: fact.retirementReason,
+      retirementActorId: retired ? collaborationAgentId(fact.supersededBy) : undefined,
+      replacementFactSeq: fact.replacementFactSeq ?? fact.mergedInto,
+      retiredTs: fact.retiredTs,
       verifier: selfReported ? undefined : (String(fact.verifier || "").trim() || undefined),
       verifierAgentId: selfReported ? undefined : verifierAgentId,
+    });
+  }
+
+  for (const goal of bb.subGoals) {
+    const state = subGoalState(goal, { blackboard: bb });
+    rows.push({
+      id: `goal:${goal.id}`, kind: "goal", goalId: goal.id,
+      title: goal.criterion, detail: goal.reason || goal.criterion,
+      agentId: collaborationAgentId(goal.actor) || COORDINATOR_ID,
+      ts: goal.satisfiedTs ?? goal.createdTs, appearedTs: goal.createdTs,
+      concludedTs: goal.satisfiedTs,
+      evidenceFactSeqs: goal.evidenceFactSeqs,
+      tone: state === "satisfied" ? "success" : "neutral",
+      ...rowStatus("goal", state),
     });
   }
 
@@ -881,7 +925,7 @@ function projectCtfKnowledgeRows(
       }
     }
   }
-  if (!projected.some((row) => row.kind === "goal")) {
+  if (!projected.some((row) => row.id === "goal:final")) {
     const title = (deck.taskContract?.completion.goal || "").trim() || "提交全部 FLAG";
     const expected = Math.max(1, deck.taskContract?.completion.expectedFlags || deck.expectedFlags || 1);
     const satisfied = !!deck.solved || !!deck.reason.goalMet;
@@ -989,7 +1033,7 @@ const knowledgeLayerOf = layer((
         finishedAt,
         reason: { goalMet, intents: [], audit: [] },
       })
-    : rawRows;
+    : rawRows.map((row) => row.kind === "intent" ? { ...row, kind: "step" as const } : row);
   const byId = new Map<string, CollaborationKnowledgeItem>();
   const byAgent = new Map<string, AgentKnowledge>();
   const floor = startedAt || 0;
@@ -1054,7 +1098,7 @@ const relationLayerOf = layer((
   lockRequests: LockRequest[],
   startedAt: number | undefined,
 ): RelationLayer => {
-  const allAgentIds = new Set<string>([COORDINATOR_ID, INPUT_SOURCE_ID, ...roster.workers]);
+  const allAgentIds = new Set<string>([COORDINATOR_ID, CHALLENGER_ID, INPUT_SOURCE_ID, ...roster.workers]);
   const relationMap = new Map<string, CollaborationRelation>();
 
   const addRelation = (
@@ -1140,7 +1184,7 @@ const relationLayerOf = layer((
   for (const id of roster.workers) {
     for (const item of knowledge.byAgent.get(id)?.rows || EMPTY_ROWS) {
       const conclusion = item.kind === "fact" || item.kind === "candidate" || item.kind === "observation" || item.kind === "dead_end" || item.kind === "flag"
-        || (item.kind === "intent" && item.status !== "active" && item.status !== "claimed" && item.status !== "open");
+        || ((item.kind === "intent" || item.kind === "step") && item.status !== "active" && item.status !== "claimed" && item.status !== "open");
       if (conclusion) addRelation("report", id, COORDINATOR_ID, item.id, item.ts);
     }
   }
@@ -1630,6 +1674,31 @@ export function buildAgentCollaborationModel(deck: DeckState, scope: Collaborati
     isAnomaly: rounds.some((round) => !!round.plannerFailure),
     searchText: searchHaystack("Decide", "Reason", "决策模型", decisionIdentity.model),
   } : undefined;
+  const challengerState = deck.blackboard.challenger;
+  const challengerKnowledge = knowledge.rows.filter((item) => item.agentId === CHALLENGER_ID || item.proposerId === CHALLENGER_ID || item.retirementActorId === CHALLENGER_ID);
+  const challengerActive = !deck.finished && challengerState.status === "running";
+  const challengerEnd = challengerState.failedTs ?? challengerState.committedTs ?? challengerState.finishedTs;
+  const challenger: CollaborationAgent | undefined = challengerState.status !== "idle" || challengerKnowledge.length ? {
+    ...coordinator,
+    id: CHALLENGER_ID, role: "challenger", phase: "Challenger",
+    identity: deck.lanes.challenger ? agentIdentity(laneFactsOf(deck.lanes.challenger)) : {},
+    presentation: {}, challenger: challengerState,
+    statusKind: challengerState.status === "failed" ? "error" : challengerActive ? "thinking" : "offline",
+    online: challengerActive, intents: [], knowledge: challengerKnowledge,
+    ...summarizeKnowledge(challengerKnowledge), coordination: undefined,
+    tokens: (deck.costBySolver.challenger?.tokensIn || 0) + (deck.costBySolver.challenger?.tokensOut || 0),
+    usd: deck.costBySolver.challenger?.usd || 0,
+    unpricedCalls: deck.costBySolver.challenger?.unpricedCalls,
+    locks: 0, pendingHitl: 0, isAnomaly: challengerState.status === "failed",
+    latestActivity: challengerState.error || "", latestActivityTs: challengerEnd ?? challengerState.startedTs,
+    firstSeenAt: challengerState.startedTs ?? challengerKnowledge[0]?.appearedTs,
+    startedAt: challengerState.startedTs,
+    finishedAt: challengerActive ? undefined : challengerEnd,
+    endedAt: challengerActive ? undefined : challengerEnd,
+    lastEventAt: challengerEnd ?? challengerState.startedTs,
+    lastProgressAt: challengerState.committedTs,
+    searchText: searchHaystack("Challenger", challengerState.status, challengerState.error, ...challengerKnowledge.map((item) => item.title)),
+  } : undefined;
   const inputKnowledge = knowledge.rows.filter((item) => item.agentId === INPUT_SOURCE_ID);
   const source: CollaborationAgent | undefined = inputKnowledge.length ? {
     ...coordinator,
@@ -1656,7 +1725,7 @@ export function buildAgentCollaborationModel(deck: DeckState, scope: Collaborati
     lastProgressAt: inputKnowledge[inputKnowledge.length - 1].ts,
     searchText: searchHaystack("origin", "任务输入", "input source", ...inputKnowledge.map((item) => item.title)),
   } : undefined;
-  const fullAgents = [coordinator, ...(decision ? [decision] : []), ...(source ? [source] : []), ...workers];
+  const fullAgents = [coordinator, ...(decision ? [decision] : []), ...(challenger ? [challenger] : []), ...(source ? [source] : []), ...workers];
   const visibleAgents = scope === "all" ? fullAgents : fullAgents.filter((agent) => agent.isCurrent);
   const agentById = new Map(fullAgents.map((agent) => [agent.id, agent]));
   const visibleIds = new Set(visibleAgents.map((agent) => agent.id));
@@ -1668,6 +1737,18 @@ export function buildAgentCollaborationModel(deck: DeckState, scope: Collaborati
       count: callTimes.length, refIds: callTimes.map((ts) => `reason:${ts}`),
       timestamps: callTimes, ts: callTimes[0], lastTs: callTimes[callTimes.length - 1],
       active: decisionActive,
+    });
+  }
+
+  if (challenger) {
+    const outputs = [...challengerKnowledge].sort((a, b) => a.ts - b.ts || a.id.localeCompare(b.id));
+    const refs = outputs.map((item) => item.id);
+    const ts = challengerState.startedTs ?? challenger.firstSeenAt ?? 0;
+    relations.push({
+      id: "model:coordinator:challenger", kind: "model", source: COORDINATOR_ID, target: CHALLENGER_ID,
+      count: Math.max(1, refs.length), refIds: refs.length ? refs : [`challenger:${ts}`],
+      timestamps: refs.length ? outputs.map((item) => item.ts) : [ts],
+      ts, lastTs: challengerEnd ?? ts, active: challengerActive,
     });
   }
 

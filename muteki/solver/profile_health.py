@@ -32,7 +32,9 @@ Three explicit depth layers, chosen by the caller (NOT by the backend):
 
 from __future__ import annotations
 
+import contextlib
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -42,11 +44,11 @@ from muteki.solver.credential_accounts import (
     account_store_root,
     detect_system_login,
     engine_account_id,
+    engine_writes_agent_state,
     runtime_env_for_engine,
 )
 from muteki.solver.worker_profiles import (
     base_engine_for_profile,
-    profile_uses_endpoint,
 )
 
 Depth = Literal["binding", "plumbing", "auth"]
@@ -194,11 +196,10 @@ def evaluate_profile_health(
                   binding_kind=bk, effective_credential_id=effective_account_id)
 
     # ── layer 3: auth (real one-turn hello, host-local, profile-pinned model) ─
-    # Web 容器本身不带 Worker CLI，因此调度前只接受此前针对同一凭据和同一
-    # 模型完成的真实容器探针。没有证据时直接阻断，不能把认证推迟到正式
-    # Worker 再碰运气。
+    # 分离部署的 Web 容器不带 Worker CLI，只接受真实容器探针。
+    # 单容器部署使用 local 后端，必须继续执行下面的真实本地 CLI 检查。
     from muteki.core.runtime_env import is_web_container
-    if is_web_container():
+    if backend == "container" and is_web_container():
         credential_id = (
             f"account:{effective_account_id}" if effective_account_id
             else f"system:{engine}"
@@ -220,20 +221,34 @@ def evaluate_profile_health(
     # subprocess; an in-container overlay would point at paths that don't exist
     # on the host.
     try:
-        overlay = runtime_env_for_engine(
-            engine,
-            account_root=root,
-            account_id=effective_account_id or None,
-            container=False,
-            model=model,
-        ).env
-        env = {**os.environ, **overlay}
-        # driver_for(<dict>) returns a ProfileDriver/EndpointDriver that pins the
-        # profile's model into the hello argv — so a quota-exhausted DEFAULT model
-        # can't false-fail a profile that runs on a different model.
-        ok, detail = driver_for(profile).health_detail(env=env)
+        with contextlib.ExitStack() as stack:
+            agent_state_dir = (
+                Path(
+                    stack.enter_context(
+                        tempfile.TemporaryDirectory(
+                            prefix=f"muteki-{engine}-health-"
+                        )
+                    )
+                )
+                if engine_writes_agent_state(engine)
+                else None
+            )
+            overlay = runtime_env_for_engine(
+                engine,
+                account_root=root,
+                account_id=effective_account_id or None,
+                container=False,
+                agent_state_dir=agent_state_dir,
+                model=model,
+                runtime_max_output_tokens=profile.get("max_output_tokens"),
+            ).env
+            env = {**os.environ, **overlay}
+            # driver_for(<dict>) returns a ProfileDriver/EndpointDriver that pins the
+            # profile's model into the hello argv — so a quota-exhausted DEFAULT model
+            # can't false-fail a profile that runs on a different model.
+            ok, detail = driver_for(profile).health_detail(env=env)
     except Exception as exc:  # noqa: BLE001
-        return mk("auth_failed", layer="auth", detail=str(exc)[:160],
+        return mk("auth_failed", layer="auth", detail=str(exc),
                   binding_kind=bk, effective_credential_id=effective_account_id)
     return mk(
         "ok" if ok else "auth_failed",

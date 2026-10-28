@@ -40,9 +40,7 @@ def normalize_flag_wrapper(flag_format_wrapper: Any) -> str:
     wrapper = str(flag_format_wrapper or "").strip()
     if not wrapper:
         return ""
-    # A wrapper is a compact human sample rather than a free-form regex.  Keep
-    # the existing Web input semantics for direct/legacy callers as well.
-    return "".join(wrapper.split())
+    return wrapper
 
 
 def normalize_flag_contract(

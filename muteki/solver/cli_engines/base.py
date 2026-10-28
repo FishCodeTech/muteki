@@ -64,9 +64,6 @@ class CliDriver(abc.ABC):
     # Scheduler-visible capability: exact secret context may only select drivers
     # that guarantee stdin transport AND non-persistent CLI state.
     secure_prompt_transport = False
-    # A non-secret prompt may be piped without disabling the CLI's persisted
-    # session. Drivers must opt in only when their print mode supports this.
-    persistent_stdin_prompt = False
     # Scheduler-visible capability: ``web_access=False`` is meaningful only when
     # this transport can make the worker's native web tools unavailable.  Keep
     # this separate from endpoint choice: a Claude CLI pointed at an Anthropic-
@@ -95,6 +92,31 @@ class CliDriver(abc.ABC):
     def new_session(self) -> Optional[str]:
         """A pre-seeded session id, or None if the engine assigns one itself."""
         return None
+
+    def build_execute_input(
+        self, prompt: str, session: Optional[str], *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        """Build an ordinary invocation and its exact input payload.
+
+        Native payload transports override this method independently of the
+        secret-only, non-persistent ``build_execute_stdin`` contract. Legacy
+        CLIs with no native payload input retain argv and its launch validation.
+        """
+        return self.build_execute(
+            prompt, session, web_access=web_access, kb_access=kb_access,
+            stream=stream, launch=launch), None
+
+    def build_resume_input(
+        self, prompt: str, session: str, *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        """Build input for the specified session without changing its identity."""
+        return self.build_resume(
+            prompt, session, web_access=web_access, kb_access=kb_access,
+            stream=stream, launch=launch), None
 
     def build_execute_stdin(
         self,
@@ -271,7 +293,7 @@ class CliDriver(abc.ABC):
             except subprocess.TimeoutExpired:
                 return False, "version probe timed out"
             except Exception as e:  # noqa: BLE001
-                return False, str(e)[:160]
+                return False, str(e)
 
         # Health callers pass the resolved profile/account environment explicitly.
         # Apply it to argv here too, so Pi/OMP provider/model selection and the
@@ -289,7 +311,7 @@ class CliDriver(abc.ABC):
             except subprocess.TimeoutExpired:
                 last = f"hello probe timed out (>{self._HELLO_TIMEOUT}s)"
             except Exception as e:  # noqa: BLE001
-                last = str(e)[:160]
+                last = str(e)
             else:
                 if self._hello_ok(r):
                     return True, ""
@@ -312,7 +334,7 @@ class CliDriver(abc.ABC):
                     detail_src = failed_detail or r.stderr or r.stdout or ""
                     tail = detail_src.strip().splitlines()
                     last = (f"hello exited {r.returncode}"
-                            + (f": {tail[-1][:300]}" if tail else ""))
+                            + (f": {tail[-1]}" if tail else ""))
                 else:
                     last = "hello returned no model reply"
             if attempt < self._HELLO_RETRIES:

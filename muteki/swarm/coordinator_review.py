@@ -101,8 +101,18 @@ class _ReviewLocksMixin:
             if (self._healthy_matches(e, healthy)
                 and self._engine_available_for_role(e, "race"))
         ]
-        race_limit = min(
-            max(0, int(self.start_workers)), self._ordinary_capacity_limit())
+        revisit_campaigns = bool(
+            int(getattr(self, "_execution_generation", 1) or 1) >= 2
+            and getattr(self.challenge, "mode", "ctf") == "ctf"
+            and not self._auto_dispatch_enabled()
+        )
+        race_limit = 2 if revisit_campaigns else max(0, int(self.start_workers))
+        if self._ordinary_capacity_limit() > 0:
+            race_limit = min(race_limit, self._ordinary_capacity_limit())
+        if revisit_campaigns and len(engines) == 1 and race_limit >= 2:
+            # Each construction reserves its own profile/account and worker slot.
+            # The worker factory remains authoritative for resource admission.
+            engines = engines * 2
         engines = engines[:race_limit]
         if not engines:
             return None, None, {}
@@ -134,7 +144,7 @@ class _ReviewLocksMixin:
                             "and publish concrete observations immediately."
                         )
                     )
-                    worker = self._make_cli_worker(
+                    worker = await self._make_cli_worker(
                         e, mode="bootstrap", intent_goal=direction,
                         timeout_override=self.race_timeout,
                         profile_role="race")
@@ -526,7 +536,7 @@ class _ReviewLocksMixin:
         except Exception:
             return 0
 
-    def _select_review_engine(self, healthy: list[str]) -> str:
+    async def _select_review_engine(self, healthy: list[str]) -> str:
         configured = str(self.review_policy.get("engine") or "").strip()
         if configured:
             candidates: list[str] = []
@@ -545,9 +555,9 @@ class _ReviewLocksMixin:
             if not self.review_policy.get("allow_review_fallback", False):
                 raise RuntimeError(
                     f"configured review engine unavailable: {configured}")
-        return self._pick_engine([], healthy, role="review")
+        return await self._pick_engine([], healthy, role="review")
 
-    def _select_verifier_engine(self, healthy: list[str]) -> str:
+    async def _select_verifier_engine(self, healthy: list[str]) -> str:
         configured = str(self.verifier_policy.get("engine") or "").strip()
         if configured:
             candidates: list[str] = []
@@ -569,7 +579,7 @@ class _ReviewLocksMixin:
             if not self.verifier_policy.get("allow_verifier_fallback", False):
                 raise RuntimeError(
                     f"configured verifier engine unavailable: {configured}")
-        return self._pick_engine([], healthy, role="verifier")
+        return await self._pick_engine([], healthy, role="verifier")
 
     async def _reap_verifier_tasks(
         self,
@@ -698,7 +708,12 @@ class _ReviewLocksMixin:
                 return False
         if not self._review_capacity_available(tasks):
             return False
-        if self._review_workers_spawned >= int(self.review_policy.get("max_review_workers") or 12):
+        if (
+            not self._worker_concurrency_unlimited()
+            and self._review_workers_spawned >= int(
+                self.review_policy.get("max_review_workers") or 12
+            )
+        ):
             return False
         seq = self._current_graph_seq()
         cooldown = int(self.review_policy.get("cooldown_events") or 0)
@@ -721,12 +736,12 @@ class _ReviewLocksMixin:
                 if item not in self._queued_review_requests:
                     self._queued_review_requests.append(item)
         try:
-            engine = self._select_review_engine(healthy)
+            engine = await self._select_review_engine(healthy)
         except RuntimeError as exc:
             await emit_bb("worker_spawn_rejected", reason=str(exc), phase="review")
             return False
         try:
-            w = self._make_cli_worker(
+            w = await self._make_cli_worker(
                 engine, mode="review", intent_goal=directive,
                 timeout_override=(
                     120
@@ -769,7 +784,7 @@ class _ReviewLocksMixin:
         self._completed_workers_since_review = 0
         self._last_candidate_review_count = self._candidate_fact_count()
         await emit_bb("review_started", trigger=trigger, worker=w.solver_id,
-                      engine=str(engine), directive=directive[:300])
+                      engine=str(engine), directive=directive)
         await emit_bb("worker_spawned", worker=w.solver_id,
                       phase="review", worker_role="review",
                       **worker_identity_event_fields(w))
@@ -1206,11 +1221,11 @@ class _ReviewLocksMixin:
                 try:
                     self.shared_graph.decide_review_proposal(  # type: ignore[attr-defined]
                         actor="coordinator", proposal_seq=seq,
-                        decision="rejected", reason=str(exc)[:500])
+                        decision="rejected", reason=str(exc))
                     self._decided_proposal_seqs.add(seq)
                     await emit_bb("review_proposal_decision", proposal_seq=seq,
                                   marker=marker, decision="rejected",
-                                  reason=str(exc)[:500])
+                                  reason=str(exc))
                 except Exception:
                     pass
         return applied

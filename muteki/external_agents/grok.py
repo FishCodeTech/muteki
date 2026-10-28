@@ -32,7 +32,7 @@ import shutil
 import tomllib
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
 from muteki.platform.contracts.agent_events import (
     ApprovalOption,
@@ -47,6 +47,9 @@ from muteki.platform.contracts.external_agents import (
     AccessMode,
     AgentCapabilities,
     AgentEventType,
+    AgentEvent,
+    AgentSessionRef,
+    MessageInput,
     ProbeRequest,
     SessionStart,
 )
@@ -56,6 +59,7 @@ from .acp import AcpRequestError, BaseAcpAdapter, check_response
 from .approvals import ApprovalDecision
 from .descriptors import GROK_MCP_READY_WAIT_SECONDS as _DEFAULT_MCP_READY_WAIT_SECONDS
 from .user_input_schema import normalize_question
+from .runtime_capabilities import RuntimeCapabilityItem, RuntimeCapabilitySnapshot
 
 #: 认证方式优先级：本机登录态优先，其次 API key（需环境变量在场）。
 _AUTH_CACHED_TOKEN = "cached_token"
@@ -342,6 +346,8 @@ class GrokAcpAdapter(BaseAcpAdapter):
     """
 
     adapter_id = "grok.acp"
+    chat_model_fields = ("model", "effort")
+    chat_model_reset_requires_restart = ("model", "effort")
     # session/new ``_meta.rules`` is appended to Grok's system prompt; the
     # CLI ``--rules`` flag does not reach ``grok agent stdio``.
     host_context_channel = "system_prompt"
@@ -408,6 +414,27 @@ class GrokAcpAdapter(BaseAcpAdapter):
 
     def _agent_argv(self) -> list[str]:
         return self._argv()
+
+    async def runtime_capability_snapshot(
+        self, session: Optional[AgentSessionRef] = None,
+    ) -> RuntimeCapabilitySnapshot:
+        snapshot = await super().runtime_capability_snapshot(session)
+        if session is None or any(
+            item.name == "compact" for item in snapshot.items
+        ):
+            return snapshot
+        # Grok exposes native /compact over session/prompt independently of
+        # its asynchronous available_commands_update catalog. Verified against
+        # Grok 1.0.70: auto_compact_completed is the authoritative outcome.
+        compact = RuntimeCapabilityItem(
+            id=f"runtime:{self.id}:command:compact", kind="command", name="compact",
+            description="压缩当前会话上下文", source=self.id, scope="engine", engine="grok",
+            channel="acp_prompt", origin="verified_static", delivery="guaranteed",
+            verification="verified", action="invoke-runtime-command",
+            invocation={"command": "compact", "wire_text": "/compact",
+                        "protocol": "acp.session/prompt"},
+        )
+        return snapshot.model_copy(update={"items": [*snapshot.items, compact]})
 
     def _argv(
         self,
@@ -671,6 +698,9 @@ class GrokAcpAdapter(BaseAcpAdapter):
         # subagent_progress / subagent_finished 汇报进展与结果。
         caps.subagents = True
 
+    def declared_chat_capabilities(self) -> AgentCapabilities:
+        return self._declared_acp_chat_capabilities()
+
     async def probe(self, request: ProbeRequest) -> AgentCapabilities:
         caps = await super().probe(request)
         report = self._probe_cache
@@ -766,6 +796,7 @@ class GrokAcpAdapter(BaseAcpAdapter):
                     "sessionId": params.get("sessionId"),
                     "stopReason": update.get("stop_reason") or update.get("stopReason"),
                     "agentResult": update.get("agent_result"),
+                    "usage": update.get("usage"),
                 })
             return {}, []
         if not kind.startswith("subagent"):
@@ -906,8 +937,26 @@ class GrokAcpAdapter(BaseAcpAdapter):
             result={
                 "stopReason": stop_reason if stop_reason in _ACP_STOP_REASONS else "end_turn",
                 "_meta": {"sessionId": session_id, "promptId": prompt},
+                "usage": notice.get("usage"),
             },
             error=error)
+
+    def _turn_result_usage(self, result: dict[str, Any]) -> Optional[UsagePayload]:
+        payload = super()._turn_result_usage(result)
+        if payload is None:
+            return None
+        usage = result["usage"]
+        # Grok's turn counters include cache in input and reasoning in output.
+        for field, key in (
+            ("cache_write_tokens", "cacheCreationTokens"),
+            ("reasoning_tokens", "reasoningTokens"),
+            ("step_count", "modelCalls"),
+            ("llm_duration_ms", "apiDurationMs"),
+        ):
+            value = usage.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                setattr(payload, field, value)
+        return payload
 
     async def _set_session_model(
         self, transport: Any, session_id: str, request: SessionStart
@@ -964,14 +1013,44 @@ class GrokAcpAdapter(BaseAcpAdapter):
         self, transport: Any, session_id: str, request: SessionStart
     ) -> None:
         """Select the requested model inside the session that just opened."""
-        await self._set_session_model(transport, session_id, request)
         handle = self._handle_for(request.agent_session_id)
+        if handle is not None and request.options.is_conversation:
+            handle.update(chat_selection=True, selected_model=request.model or "",
+                          selected_effort=request.effort or "")
+        await self._set_session_model(transport, session_id, request)
         supervised = getattr(getattr(transport, "peer", None), "_supervised", None)
         if handle is not None and supervised is not None:
             handle["process_ownership"] = supervised.record.containment
         await self._await_injected_mcp_ready(
             transport, session_id, request,
             (handle or {}).get("mcp_servers") or [])
+
+    async def _apply_chat_selection(self, handle: dict[str, Any], input: MessageInput) -> None:
+        if not handle.get("chat_selection"):
+            return
+        updates = {key: getattr(input.payload, key) for key in self.chat_model_fields
+                   if getattr(input.payload, key) is not None
+                   and getattr(input.payload, key) != handle.get("selected_" + key)}
+        if not updates:
+            return
+        model = updates.get("model", handle.get("selected_model"))
+        effort = updates.get("effort", handle.get("selected_effort"))
+        target_model = _requested_model(model)
+        target_effort = _requested_effort(effort)
+        await self._set_session_model(handle["transport"], handle["external_session_id"],
+                                      SessionStart(model=target_model, effort=target_effort))
+        for key, value in updates.items():
+            handle["selected_" + key] = value
+
+    async def _prompt_stream(self, session: AgentSessionRef, input: MessageInput) -> AsyncIterator[AgentEvent]:
+        handle = self._handle_for(session.agent_session_id)
+        if handle is not None:
+            await self._apply_chat_selection(handle, input)
+            resume = self._resume_ctx.get(session.agent_session_id)
+            if resume is not None and handle.get("chat_selection"):
+                resume.update(model=handle.get("selected_model"), effort=handle.get("selected_effort"))
+        async for event in super()._prompt_stream(session, input):
+            yield event
 
     async def _await_injected_mcp_ready(
         self,

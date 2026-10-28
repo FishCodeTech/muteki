@@ -29,8 +29,12 @@ let route = '/chat?draft=one';
 const router = { push: value => { route = value; }, replace: noop };
 const chrome = { sidebarCollapsed: false, mobileSidebarOpen: false, setMobileSidebarOpen: noop, setSidebarCollapsed: noop };
 const stubs = new Map();
+let observedHomeProps = null;
 function component(name) {
-  if (!stubs.has(name)) stubs.set(name, Object.assign(props => React.createElement(name, props, props.children), { displayName: name }));
+  if (!stubs.has(name)) stubs.set(name, Object.assign(props => {
+    if (name === 'ConversationHome' && observedHomeProps) observedHomeProps.push(props);
+    return React.createElement(name, props, props.children, name === 'ConversationStreamTimeline' ? props.footer : null);
+  }, { displayName: name }));
   return stubs.get(name);
 }
 const components = new Proxy({}, { get: (_, key) => {
@@ -69,8 +73,11 @@ const descriptorCatalog = {
 };
 const descriptors = { schemaVersion:1, descriptors:descriptorCatalog.descriptors, instances:descriptorCatalog.instances };
 const nodeFetch = global.fetch;
+const accessCatalog = (modes=['supervised','full-access']) => new Response(JSON.stringify({items:[],access_modes:modes,access_mode_notes:{'full-access':'当前工作区不允许完整权限'}}),{status:200,headers:{'content-type':'application/json'}});
+let composerCapabilityFetch = async()=>accessCatalog();
 global.fetch = (url, init) => String(url).endsWith('/api/agent-runtimes/descriptors')
   ? Promise.resolve(new Response(JSON.stringify(descriptorCatalog), { status:200, headers:{'content-type':'application/json'} }))
+  : String(url).endsWith('/api/conversation/composer-capabilities') ? composerCapabilityFetch(url,init)
   : nodeFetch(url, init);
 const projects = [{ project_id:'project-a', name:'A', settings:{} }, { project_id:'project-b', name:'B', settings:{conv_default_credential_id:'system:codex',conv_default_model:'codex-model',conv_default_effort:'',conv_default_access_mode:'supervised'} }];
 let view = null;
@@ -166,6 +173,27 @@ assert.deepEqual(reasoning.credentialForRuntime(credentialPayload,'cli.grok:othe
 assert.deepEqual(reasoning.credentialForRuntime(credentialPayload,'cli.grok:default',false).models.map(m=>m.id),['grok-4.6']);
 assert.deepEqual(reasoning.credentialForRuntime(credentialPayload,'cli.grok:missing',false).models,[]);
 console.log('Runtime-scoped model verification projection passed');
+const { runtimeHandoffNoticeUpdate: handoffUpdate, runtimeHandoffNotice } = load(path.join(ui,'lib/providerSwitchNotice.ts'));
+const deliveredHandoff = {
+  adapter_id:'cli.grok', instance_id:'other', credential_id:'system:grok', model:'grok-4.6',
+  agent_session_id:'current-session', recovery_kind:'structured_handoff', handoff_delivery_state:'delivered',
+  handoff_id:'handoff-fixture', handoff_target_agent_session_id:'current-session', handoff_included_count:2,
+  handoff_delivery_turn_id:'handoff-turn',
+  handoff_message_ids:['message-1','message-2'], handoff_boundary_label:'已向新会话传递当前分支历史（2 条）',
+};
+const handoffInput = {threadId:'old',viewThreadId:'old',runtimeKey:'cli.grok:other',credentialId:'system:grok',model:'grok-4.6',sessionId:'current-session',payload:deliveredHandoff};
+assert.equal(handoffUpdate(handoffInput), deliveredHandoff.handoff_boundary_label);
+for (const patch of [
+  {handoff_delivery_state:'prepared'}, {handoff_delivery_state:'sending'}, {handoff_delivery_state:undefined},
+  {recovery_kind:'native_resume'}, {recovery_kind:'reuse_live'}, {recovery_kind:'empty'},
+  {handoff_id:''}, {handoff_target_agent_session_id:'old-session'}, {handoff_included_count:0}, {handoff_delivery_turn_id:''},
+]) assert.equal(handoffUpdate({...handoffInput,payload:{...deliveredHandoff,...patch}}), '');
+for (const patch of [{viewThreadId:'another'}, {runtimeKey:'cli.codex:default'}, {credentialId:'another'}, {model:'another'}, {sessionId:'old-session'}, {sessionId:undefined}]) {
+  assert.equal(handoffUpdate({...handoffInput,...patch}), null);
+}
+assert.equal(handoffUpdate({...handoffInput,payload:{...deliveredHandoff,agent_session_id:undefined}}), null);
+assert.equal(runtimeHandoffNotice({...handoffInput,sessionId:'old-session'}), '');
+console.log('Handoff notice requires matching session and acknowledged delivery proof');
 const { ConversationShell }=load(path.join(ui,'components/conversation/ConversationShell.tsx'));
 // The chat host (Next layout or desktop renderer) owns routing and passes it in.
 const shell=(props={})=>React.createElement(ConversationShell,{
@@ -235,6 +263,40 @@ const selection=()=>{const p=home();return [p.selectedCredentialId,p.selectedMod
   view={thread:{thread_id:'old',project_id:'',mode:'conversation'},state:{status:'idle'},turns:[],queue:[],artifacts:[],runtime:{adapter_id:'cli.grok',instance_id:'other',credential_id:'system:grok',model:'grok-4.6',effort:'',access_mode:'full-access'}};
   await act(async()=>tree.update(shell({threadId:'old'})));
   await settle();
+  // Real Shell effects: later events in a batch cannot hide a delivery, and
+  // late events from another session cannot erase the current notice.
+  view={...view,state:{...view.state,agent_session_id:'current-session'}};
+  const handoffEvent = payload => ({event_type:'core.thread.runtime_switched',payload});
+  const banner = () => tree.root.findByType(component('PromptBar')).props.capabilityBanner;
+  conv.events=[handoffEvent(deliveredHandoff),{event_type:'core.usage.updated',payload:{}}];
+  await act(async()=>tree.update(shell({threadId:'old'})));
+  assert.equal(banner(),deliveredHandoff.handoff_boundary_label);
+  conv.events.push(handoffEvent({...deliveredHandoff,agent_session_id:'old-session',recovery_kind:'native_resume'}));
+  await act(async()=>tree.update(shell({threadId:'old'})));
+  assert.equal(banner(),deliveredHandoff.handoff_boundary_label);
+  const turnStarted = (turnId, sessionId = 'current-session') => ({event_type:'core.turn.started',payload:{turn_id:turnId,agent_session_id:sessionId}});
+  conv.events.push(turnStarted('handoff-turn'));
+  await act(async()=>tree.update(shell({threadId:'old'})));
+  assert.equal(banner(),deliveredHandoff.handoff_boundary_label);
+  conv.events.push(turnStarted('late-previous-turn','old-session'));
+  await act(async()=>tree.update(shell({threadId:'old'})));
+  assert.equal(banner(),deliveredHandoff.handoff_boundary_label);
+  conv.events.push(turnStarted('next-ordinary-turn'));
+  await act(async()=>tree.update(shell({threadId:'old'})));
+  assert.equal(banner(),'');
+  conv.events.push(handoffEvent(deliveredHandoff),turnStarted('handoff-turn'),{event_type:'core.usage.updated',payload:{}});
+  await act(async()=>tree.update(shell({threadId:'old'})));
+  assert.equal(banner(),deliveredHandoff.handoff_boundary_label);
+  for (const patch of [{handoff_delivery_state:'prepared'}, {handoff_delivery_state:'sending'}, {recovery_kind:'native_resume'}, {recovery_kind:'reuse_live'}]) {
+    conv.events.push(handoffEvent({...deliveredHandoff,...patch}));
+    await act(async()=>tree.update(shell({threadId:'old'})));
+    assert.equal(banner(),'');
+    conv.events.push(handoffEvent(deliveredHandoff));
+    await act(async()=>tree.update(shell({threadId:'old'})));
+    assert.equal(banner(),deliveredHandoff.handoff_boundary_label);
+  }
+  conv.events=[];
+  console.log('Shell handoff delivery batching, stale-session isolation, and lifecycle clearing passed');
   await act(async()=>tree.root.findByType(component('ConversationSidebar')).props.onNewChat());
   view=null;
   await act(async()=>tree.update(shell()));
@@ -246,6 +308,106 @@ const selection=()=>{const p=home();return [p.selectedCredentialId,p.selectedMod
   assert.deepEqual(selection(),['system:codex','codex-model','','supervised']);
   await act(async()=>tree.unmount());
   console.log('Shell route/project/refresh/draft/remount/thread regression passed');
+  // Activity keeps state while disconnecting effects. Hold the resume requests
+  // so a false loading/onboarding render cannot hide behind a quick fixture reply.
+  route='/chat?draft=activity-resume';
+  defaults.writeChatLastSelection(recent);
+  const activityShell=mode=>React.createElement(React.Activity,{mode},shell());
+  await act(async()=>{tree=create(activityShell('visible'));});
+  await settle();
+  await act(async()=>home().onProjectChange('project-a'));
+  await act(async()=>home().onSelectModelParams({credentialId:'system:grok',model:'grok-4.7',effort:'high',accessMode:'full-access'}));
+  const retainedSelection=selection();
+  assert.equal(home().readiness.guide,'hidden');
+  const resumeFetchers={
+    fetchConversationCredentials:api.fetchConversationCredentials,
+    fetchRuntimeInstances:api.fetchRuntimeInstances,
+    fetchConversationProjects:api.fetchConversationProjects,
+  };
+  let resumeRequests;
+  const holdResumeRequests=()=>{
+    resumeRequests={};
+    for(const name of Object.keys(resumeFetchers)) api[name]=()=>new Promise((resolve,reject)=>{resumeRequests[name]={resolve,reject};});
+  };
+  const assertRetainedResume=()=>{
+    assert.ok(observedHomeProps.length,'resume did not render the retained chat');
+    for(const props of observedHomeProps){
+      assert.equal(props.credentialsLoading,false,'Activity resume flashed model loading');
+      assert.equal(props.projectsLoading,false,'Activity resume flashed project loading');
+      assert.equal(props.readiness.guide,'hidden','Activity resume flashed onboarding');
+      assert.equal(props.readiness.blockers.some(row=>row.kind==='connecting'),false,'Activity resume flashed connecting');
+      assert.deepEqual([props.selectedCredentialId,props.selectedModel,props.selectedEffort,props.selectedAccessMode],retainedSelection,'Activity resume reset model selection');
+      assert.equal(props.selectedProjectId,'project-a','Activity resume reset the workspace');
+    }
+  };
+  await act(async()=>tree.update(activityShell('hidden')));
+  holdResumeRequests();
+  observedHomeProps=[];
+  await act(async()=>tree.update(activityShell('visible')));
+  await settle();
+  assertRetainedResume();
+  assert.deepEqual(Object.keys(resumeRequests).sort(),Object.keys(resumeFetchers).sort(),'resume must revalidate every metadata source');
+  const refreshedCredentials=structuredClone(credentials);
+  refreshedCredentials[1].label='Grok refreshed';
+  const refreshedProjects=structuredClone(projects);
+  refreshedProjects[0].name='A refreshed';
+  await act(async()=>{
+    resumeRequests.fetchConversationCredentials.resolve(refreshedCredentials);
+    resumeRequests.fetchRuntimeInstances.resolve(structuredClone(runtimes));
+    resumeRequests.fetchConversationProjects.resolve(refreshedProjects);
+  });
+  assertRetainedResume();
+  assert.equal(home().credentials.find(row=>row.id==='system:grok').label,'Grok refreshed');
+  assert.equal(home().projects.find(row=>row.project_id==='project-a').name,'A refreshed');
+  observedHomeProps=null;
+  await act(async()=>tree.update(activityShell('hidden')));
+  holdResumeRequests();
+  observedHomeProps=[];
+  await act(async()=>tree.update(activityShell('visible')));
+  await settle();
+  assertRetainedResume();
+  observedHomeProps=null;
+  await act(async()=>{
+    for(const request of Object.values(resumeRequests)) request.reject(new Error('HTTP 503: resume metadata unavailable'));
+  });
+  assert.match(home().credentialsError,/503/,'resume refresh failure must remain visible');
+  assert.match(home().projectsError,/503/,'resume project failure must remain visible');
+  assert.equal(home().readiness.sources.runtimes.phase,'error','resume runtime failure must replace prior success');
+  assert.deepEqual(selection(),retainedSelection);
+  await act(async()=>tree.unmount());
+  Object.assign(api,resumeFetchers);
+  console.log('Activity resume preserves metadata and selections without loading/onboarding flashes, applies refreshes, and exposes failures');
+
+  // Native mode activation reconnects the same thread's effects. Preserve its
+  // open details drawer, while a real thread change still closes the drawer.
+  route='/chat/retained-thread?message=linked-message';
+  const originalEnsureMessageVisible=conv.ensureMessageVisible;
+  let deepLinkLoads=0;
+  conv.ensureMessageVisible=async()=>{deepLinkLoads++;return 'ok';};
+  view={thread:{thread_id:'retained-thread',project_id:'',mode:'conversation'},state:{status:'idle'},turns:[],queue:[],artifacts:[],runtime:{adapter_id:'cli.grok',instance_id:'other',credential_id:'system:grok',model:'grok-4.6',effort:'',access_mode:'supervised'}};
+  const threadActivity=(mode,id='retained-thread')=>React.createElement(React.Activity,{mode},shell({threadId:id}));
+  await act(async()=>{tree=create(threadActivity('visible'));});
+  await settle();
+  assert.equal(deepLinkLoads,1);
+  const drawerPayload={kind:'message',messageId:'retained-message'};
+  await act(async()=>tree.root.findByType(component('ConversationStreamTimeline')).props.onOpenDrawer(drawerPayload));
+  const details=()=>tree.root.findByType(component('ConversationDetailsDrawer')).props.payload;
+  assert.deepEqual(details(),drawerPayload);
+  await act(async()=>tree.update(threadActivity('hidden')));
+  await act(async()=>tree.update(threadActivity('visible')));
+  await settle();
+  assert.deepEqual(details(),drawerPayload,'Activity reveal closed the retained details drawer');
+  assert.equal(deepLinkLoads,1,'Activity reveal reapplied the consumed message deep-link');
+  route='/chat/next-thread';
+  view={...view,thread:{...view.thread,thread_id:'next-thread'}};
+  await act(async()=>tree.update(threadActivity('visible','next-thread')));
+  await settle();
+  assert.equal(details(),null,'a real thread switch must close the details drawer');
+  await act(async()=>tree.unmount());
+  view=null;
+  conv.ensureMessageVisible=originalEnsureMessageVisible;
+  console.log('Activity retains thread details/handled deep-links and a real thread switch closes details');
+
   // Catalogs arrive separately; a late project response must not lose its defaults.
   defaults.writeChatLastSelection(recent);
   let releaseCredentials, releaseRuntimes, releaseProjects;
@@ -264,6 +426,47 @@ const selection=()=>{const p=home();return [p.selectedCredentialId,p.selectedMod
   assert.deepEqual(selection(),['system:codex','codex-model','','supervised']);
   await act(async()=>tree.unmount());
   console.log('Delayed catalog and project defaults regression passed');
+  // A pending permission catalog must not eat an enabled Send click. Returning
+  // to the same context retains its validated modes while the catalog refreshes.
+  api.fetchConversationCredentials=async()=>structuredClone(credentials);
+  api.fetchRuntimeInstances=async()=>structuredClone(runtimes);
+  api.fetchConversationProjects=async()=>structuredClone(projects);
+  const accessRequests=[];
+  composerCapabilityFetch=(_url,init)=>new Promise(resolve=>accessRequests.push({context:JSON.parse(init.body),resolve}));
+  const sends=[];
+  api.sendConversationCommand=async(...args)=>{sends.push(args);return {state:'accepted',command_id:'offline-send'};};
+  const accessView=id=>({thread:{thread_id:id,project_id:'',mode:'conversation'},state:{status:'idle'},turns:[],queue:[],artifacts:[],runtime:{adapter_id:'cli.grok',instance_id:'other',credential_id:'system:grok',model:'grok-4.6',effort:'',access_mode:'full-access'}});
+  route='/chat/access-first';view=accessView('access-first');conv.events=[];
+  await act(async()=>{tree=create(shell({threadId:'access-first'}));});
+  await settle();
+  const promptBar=()=>tree.root.findByType(component('PromptBar')).props;
+  const composerModes=()=>promptBar().contextMeter.props.children[0].props;
+  const documentFromText=load(path.join(ui,'lib/composerContextDoc.ts')).documentFromPromptAndRefs;
+  assert.equal(composerModes().selectedAccessMode,'full-access');
+  await act(async()=>promptBar().onPromptDocumentChange(documentFromText('send before catalog',[])));
+  await act(async()=>promptBar().onSubmit());
+  assert.equal(sends.length,1,'pending catalog dropped enabled Send click');
+  assert.equal(sends[0][2].runtime.access_mode,'full-access','send silently changed permission');
+  for(const request of accessRequests.filter(r=>r.context.thread_id==='access-first')) await act(async()=>request.resolve(accessCatalog()));
+  route='/chat/access-second';view=accessView('access-second');
+  await act(async()=>tree.update(shell({threadId:'access-second'})));
+  await settle();
+  route='/chat/access-first';view=accessView('access-first');
+  await act(async()=>tree.update(shell({threadId:'access-first'})));
+  await settle();
+  assert.ok(composerModes().accessModes.includes('full-access'),'switch back lost validated permission modes');
+  for(const request of accessRequests.filter(r=>r.context.thread_id==='access-second')) await act(async()=>request.resolve(accessCatalog(['supervised'])));
+  assert.ok(composerModes().accessModes.includes('full-access'),'another context overwrote current permission modes');
+  await act(async()=>promptBar().onPromptDocumentChange(documentFromText('send after switch back',[])));
+  await act(async()=>promptBar().onSubmit());
+  assert.equal(sends.length,2,'switch back dropped Send click');
+  await act(async()=>accessRequests.at(-1).resolve(accessCatalog(['supervised'])));
+  await act(async()=>promptBar().onPromptDocumentChange(documentFromText('explicitly unavailable permission',[])));
+  await act(async()=>promptBar().onSubmit());
+  assert.equal(sends.length,2,'explicitly unavailable permission was submitted');
+  assert.equal(composerModes().selectedAccessMode,'full-access','unavailable permission silently fell back');
+  await act(async()=>tree.unmount());
+  console.log('Shell sends during catalog refresh, reuses same-context modes, and preserves explicit permission validation');
 })().catch(error=>{console.error(error);process.exitCode=1;});
 
 // Shared UI preference migration and concurrency use independent simulated clients.

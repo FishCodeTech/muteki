@@ -9,12 +9,12 @@
 #
 # Usage: ./docker/worker/build.sh [repo] [version]
 #   repo:    image repository (default: muteki-worker; e.g. ghcr.io/fishcodetech/muteki-worker)
-#   version: version tag       (default: v0.4.5; GHCR release tags keep the leading v)
+#   version: version tag       (default: v0.4.6; GHCR release tags keep the leading v)
 # Tags built: <repo>:<version> AND <repo>:latest (code defaults to :latest).
 set -euo pipefail
 
 REPO_IMAGE="${1:-muteki-worker}"
-VERSION="${2:-v0.4.5}"
+VERSION="${2:-v0.4.6}"
 TAG="${REPO_IMAGE}:${VERSION}"
 LATEST="${REPO_IMAGE}:latest"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -47,6 +47,9 @@ cp "$REPO/muteki/solver/offline_acp_bridge.py" "$HERE/offline_acp_bridge.py"
 cp "$REPO/muteki/solver/omp_offline_config.yml" "$HERE/omp_offline_config.yml"
 cp "$REPO/muteki/solver/kimi_offline_agent.md" "$HERE/kimi_offline_agent.md"
 cp "$REPO/muteki/solver/grok_offline_agent.md" "$HERE/grok_offline_agent.md"
+rm -rf -- "$HERE/muteki-runtime"
+mkdir -p "$HERE/muteki-runtime"
+cp -R "$REPO/muteki" "$HERE/muteki-runtime/muteki"
 chmod +x "$HERE/blackboard.py"
 
 # --platform linux/amd64 (full form, not the "amd64" shorthand) + --load forces the
@@ -103,9 +106,9 @@ docker build --platform linux/amd64 --load \
   "${build_args[@]}" \
   -t "$TAG" -t "$LATEST" "$HERE"
 
-echo ">> [3/3] verifying eight container engines + core tools..."
+echo ">> [3/3] verifying ten container engines + core tools..."
 DIGEST="$(docker image inspect --format '{{.Id}}' "$TAG")"
 echo ">> image id: $DIGEST"
 "$REPO/scripts/verify_worker_image.sh" --image "$TAG" --variant full --platform linux/amd64 \
   --versions-file "$HERE/.last-engine-versions.txt"
-echo ">> done: $TAG (+ $LATEST); 8 engines + core tools verified (local helper only — formal release uses release-images.yml)"
+echo ">> done: $TAG (+ $LATEST); 10 engines + core tools verified (local helper only — formal release uses release-images.yml)"

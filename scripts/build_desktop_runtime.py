@@ -35,7 +35,7 @@ def copy_application_source(code: Path) -> dict[str, str]:
         relative = Path(os.fsdecode(raw))
         if any(part in excluded for part in relative.parts):
             continue
-        if relative.parts[0] not in {"muteki", "apps", "scripts", "skills", "prompts", "config", "configs"} and str(relative) not in {"pyproject.toml", "uv.lock", "LICENSE"}:
+        if relative.parts[0] not in {"muteki", "apps", "scripts", "skills", "prompts", "config", "configs", "docker"} and str(relative) not in {"pyproject.toml", "uv.lock", "LICENSE"}:
             continue
         if relative.parts[:3] == ("apps", "web", "ui"):
             continue
@@ -169,6 +169,16 @@ def node_distribution(build: Path, version: str) -> tuple[Path, str]:
             source.extractall(cache)
     else:
         with tarfile.open(archive) as source:
+            for member in source.getmembers():
+                if member.isdev() or member.isfifo() or member.ischr() or member.isblk():
+                    raise ValueError("Node archive contains unsupported special file")
+                destination = (cache / member.name).resolve()
+                if not destination.is_relative_to(cache.resolve()):
+                    raise ValueError("Node archive path escapes its distribution")
+                if member.issym() or member.islnk():
+                    linked = (destination.parent / member.linkname).resolve()
+                    if not linked.is_relative_to(cache.resolve()):
+                        raise ValueError("Node archive link escapes its distribution")
             source.extractall(cache, filter="data")
     return target, expected
 

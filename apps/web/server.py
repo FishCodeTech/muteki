@@ -343,6 +343,12 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         # The capability bridge authenticates its separate session grants.
         if path == "/api/capability":
             return await call_next(request)
+        run_match = re.match(r"^/api/runs/([^/]+)(?:/|$)", path)
+        if run_match:
+            run_id = run_match.group(1)
+            src_task_id = platform_stack.src.task_id_for_run(run_id)
+            if src_task_id is not None and request.query_params.get("src_task_id") != src_task_id:
+                return JSONResponse({"error": {"code": "task_binding_invalid", "message": "Run 不属于当前 SRC Task"}}, status_code=404)
         origin_error = browser_request_error(cfg, request)
         if origin_error:
             return _auth_error(request, origin_error, 403)

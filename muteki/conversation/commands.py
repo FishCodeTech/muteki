@@ -19,10 +19,14 @@ Turn 或重复交付消息。
 
 from __future__ import annotations
 
+import asyncio
+
+from muteki.core.blocking import run_blocking
 import math
 import os
 import re
 import time
+from weakref import WeakValueDictionary
 from typing import Any, Optional
 
 from muteki.platform.command_handlers.base import (
@@ -79,6 +83,7 @@ from .manager import (
 )
 from .models import (
     TURN_KIND_MESSAGE,
+    TURN_QUEUED,
     TURN_RUNNING,
     QueuedTurnRequest,
     TurnRecord,
@@ -204,22 +209,60 @@ class ConversationCommandHandler:
     ) -> None:
         self._manager = manager
         self._executor = executor
+        self._thread_plan_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+        self._project_create_lock = asyncio.Lock()
 
     # -- 入口 --------------------------------------------------------------------
 
+    async def dispatch_with_plan(self, command: Any, continuation: Any) -> Any:
+        if command.command_type == "conversation.project.create":
+            async with self._project_create_lock:
+                return await continuation(self._plan)
+        if command.command_type not in {
+            "conversation.turn.retry", "conversation.turn.edit_resend",
+        }:
+            return await continuation(self.plan)
+        thread_id = str(command.payload.get("thread_id") or command.aggregate_id or "")
+        lock = self._thread_plan_locks.setdefault(thread_id, asyncio.Lock())
+        # Waiting for admission is cancellable. Once admitted, retry changes
+        # branch ownership in its worker and must finish events, receipt and
+        # the loop-local start before caller cancellation can take effect.
+        async with lock:
+            operation = asyncio.create_task(continuation(self._plan))
+            try:
+                return await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                while not operation.done():
+                    try:
+                        await asyncio.shield(operation)
+                    except asyncio.CancelledError:
+                        continue
+                operation.result()
+                raise
+
     async def plan(self, command: Any, ctx: HandlerContext) -> CommandPlan:
+        # Off-loop history mutations must still serialize with send/retry plans
+        # for this thread. Other threads keep their own independent admission.
+        thread_id = str(command.payload.get("thread_id") or command.aggregate_id or "")
+        if thread_id and command.aggregate_type == "thread":
+            lock = self._thread_plan_locks.setdefault(thread_id, asyncio.Lock())
+            async with lock:
+                return await self._plan(command, ctx)
+        return await self._plan(command, ctx)
+
+    async def _plan(self, command: Any, ctx: HandlerContext) -> CommandPlan:
         ct = command.command_type
         if command.aggregate_id in self._executor._history_mutations:
             raise _failed(command, "conversation.history.busy", "正在回退聊天历史，请稍后重试", ErrorCategory.STATE)
         try:
             if ct == "conversation.project.create":
-                return self._plan_project_create(command)
+                return await asyncio.to_thread(self._plan_project_create, command)
             if ct == "conversation.project.update":
                 return self._plan_project_update(command)
             if ct == "conversation.workspace.bind":
-                return self._plan_workspace_bind(command)
+                return await asyncio.to_thread(self._plan_workspace_bind, command)
             if ct == "conversation.workspace.delete_worktree":
-                return self._plan_workspace_delete_worktree(command)
+                return await asyncio.to_thread(self._plan_workspace_delete_worktree, command)
             if ct == "conversation.thread.create":
                 return self._plan_thread_create(command)
             if ct == "conversation.thread.rename":
@@ -237,11 +280,11 @@ class ConversationCommandHandler:
             if ct == "conversation.turn.send":
                 return await self._plan_turn_send(command)
             if ct == "conversation.turn.retry":
-                return self._plan_turn_retry(command)
+                return await run_blocking(self._plan_turn_retry, command)
             if ct == "conversation.turn.edit_resend":
-                return self._plan_turn_edit_resend(command)
+                return await run_blocking(self._plan_turn_edit_resend, command)
             if ct == "conversation.turn.native_rewind":
-                return self._plan_turn_native_rewind(command)
+                return await run_blocking(self._plan_turn_native_rewind, command)
             if ct == "conversation.turn.steer":
                 return self._plan_turn_steer(command)
             if ct == "conversation.turn.interrupt":
@@ -343,15 +386,15 @@ class ConversationCommandHandler:
                         },
                     )
 
-        async def _save() -> SideEffectResult:
+        def _save() -> None:
             manager.store.save(project)
             if workspace is not None:
-                manager.save_workspace(workspace)
-            return SideEffectResult(output={
-                **({"workspace_id": workspace.workspace_id,
-                    "root_path": workspace.root_path}
-                   if workspace is not None else {}),
-            })
+                # Planning already validated this existing local directory.
+                manager.store.save(workspace)
+
+        output = ({"workspace_id": workspace.workspace_id,
+                   "root_path": workspace.root_path}
+                  if workspace is not None else {})
 
         return CommandPlan(
             events=[ev.conversation_event(
@@ -379,8 +422,9 @@ class ConversationCommandHandler:
                     idempotency_key=command.idempotency_key,
                 )] if workspace is not None else []),
             ],
-            receipt=_receipt(command, ev.AGGREGATE_PROJECT, project.project_id),
-            side_effect=_save,
+            receipt=_receipt(command, ev.AGGREGATE_PROJECT, project.project_id).model_copy(
+                update={"output": output}),
+            local_commit=_save,
         )
 
     def _plan_project_update(self, command: Any) -> CommandPlan:
@@ -457,7 +501,7 @@ class ConversationCommandHandler:
 
         async def _save() -> SideEffectResult:
             try:
-                saved = manager.save_workspace(planned)
+                saved = await run_blocking(manager.save_workspace, planned)
             except ConversationError as exc:
                 raise _failed(
                     command,
@@ -514,8 +558,8 @@ class ConversationCommandHandler:
 
         async def _delete() -> SideEffectResult:
             try:
-                result = manager.delete_worktree_workspace(
-                    workspace_id, force=force,
+                result = await run_blocking(
+                    manager.delete_worktree_workspace, workspace_id, force=force,
                 )
             except ConversationError as exc:
                 raise _failed(
@@ -919,8 +963,8 @@ class ConversationCommandHandler:
 
         async def _fork() -> SideEffectResult:
             # 复制 Thread / Binding / Runtime 选择；从历史 Turn 派生新 Task。
-            manager.complete_fork(
-                forked, thread.thread_id,
+            await run_blocking(
+                manager.complete_fork, forked, thread.thread_id,
                 from_turn_id=from_turn_id, principal_id=principal)
             return SideEffectResult()
 
@@ -1080,16 +1124,25 @@ class ConversationCommandHandler:
             )
         runtime_invocation: dict[str, Any] = {}
         invocation_match = _RUNTIME_INVOCATION_RE.fullmatch(text)
+        if (thread.mode == "conversation" and invocation_match is not None
+                and invocation_match.group("prefix") == "/"
+                and invocation_match.group("name").casefold() == "orchestrate"):
+            capability_refs_payload = [
+                *(capability_refs_payload if isinstance(capability_refs_payload, list) else []),
+                {"id": "component:orchestrate", "kind": "component"},
+            ]
+            text = str(invocation_match.group("args") or "").strip()
+            invocation_match = None
         plugins = getattr(manager, "chat_plugins", None) if thread.mode == "conversation" else None
         if invocation_match is not None and plugins is not None:
             from muteki.conversation.composer_capabilities import discover_skills
             skill_name = invocation_match.group("name")
             managed_name = skill_name.removeprefix("muteki:")
-            managed = next((row for row in plugins.skill_rows(engine_for_adapter(adapter_id))
+            managed = next((row for row in await asyncio.to_thread(plugins.skill_rows, engine_for_adapter(adapter_id))
                             if row["name"].casefold() == managed_name.casefold()), None)
             workspace_for_skill = manager.get_workspace(str(thread.workspace_id)) if thread.workspace_id else None
-            native_names = {row["name"].casefold() for row in discover_skills(
-                engine_for_adapter(adapter_id), workspace_for_skill.root_path if workspace_for_skill else "")}
+            native_names = {row["name"].casefold() for row in await asyncio.to_thread(
+                discover_skills, engine_for_adapter(adapter_id), workspace_for_skill.root_path if workspace_for_skill else "")}
             if managed is not None and (skill_name.startswith("muteki:") or skill_name.casefold() not in native_names):
                 managed = {**managed, "arguments": str(invocation_match.group("args") or "")}
                 if managed.get("native_engine"):
@@ -1157,15 +1210,18 @@ class ConversationCommandHandler:
             if thread.workspace_id else None
         )
         try:
-            capability_refs, _ = resolve_capability_refs(
+            capability_refs, _ = await asyncio.to_thread(
+                resolve_capability_refs,
                 capability_refs_payload if isinstance(capability_refs_payload, list) else [],
                 engine=engine_for_adapter(adapter_id),
+                session_tools=manager.session_tool_set(thread),
                 workspace_root=str(workspace.root_path if workspace is not None else ""),
                 extension_service=manager.extension_service,
                 plugin_service=getattr(manager, "chat_plugins", None) if thread.mode == "conversation" else None,
                 threads=manager.list_threads(),
                 message_loader=manager.conv.list_current_messages,
                 message_lookup=manager.conv.get_message,
+                src_object_resolver=_src_object_resolver(manager.store, thread.thread_id),
             )
         except ComposerCapabilityError as exc:
             raise _failed(
@@ -1413,11 +1469,13 @@ class ConversationCommandHandler:
                 capability_refs, _ = resolve_capability_refs(
                     list(item.capability_refs),
                     engine=engine_for_adapter(str(runtime.get("adapter_id") or "")),
+                    session_tools=self._manager.session_tool_set(thread),
                     workspace_root=str(workspace.root_path if workspace is not None else ""),
                     extension_service=self._manager.extension_service,
                     threads=self._manager.list_threads(),
                     message_loader=self._manager.conv.list_current_messages,
                     message_lookup=self._manager.conv.get_message,
+                    src_object_resolver=_src_object_resolver(manager.store, thread.thread_id),
                 )
             except ComposerCapabilityError as exc:
                 raise _failed(
@@ -1723,8 +1781,8 @@ class ConversationCommandHandler:
 
         async def _attach() -> SideEffectResult:
             try:
-                artifact = manager.attach_artifact(
-                    thread.thread_id,
+                artifact = await run_blocking(
+                    manager.attach_artifact, thread.thread_id,
                     name=name,
                     content_base64=str(payload.get("content_base64") or ""),
                     path=str(payload.get("path") or ""),
@@ -2547,7 +2605,7 @@ class ConversationThreadViewQueryHandler:
         before = query.params.get("before_stream_seq")
         after = query.params.get("after_stream_seq")
         try:
-            view = self._manager.thread_view(
+            view = await self._manager.thread_view_async(
                 thread_id,
                 mark_read=bool(query.params.get("mark_read")),
                 messages_limit=query.params.get("messages_limit"),
@@ -2591,7 +2649,8 @@ class ConversationThreadMessagesQueryHandler:
         after = query.params.get("after_stream_seq")
         around = query.params.get("around_message_id")
         try:
-            result = self._manager.messages_page(
+            result = await asyncio.to_thread(
+                self._manager.messages_page,
                 thread_id,
                 limit=query.params.get("limit"),
                 before_stream_seq=(
@@ -2634,7 +2693,8 @@ class ConversationTurnProcessQueryHandler:
         turn_id = str(query.params.get("turn_id") or "").strip()
         limit = query.params.get("limit")
         try:
-            result = self._manager.turn_process(
+            result = await asyncio.to_thread(
+                self._manager.turn_process,
                 thread_id,
                 turn_id,
                 limit=int(limit) if limit not in (None, "") else 2000,
@@ -2668,7 +2728,8 @@ class ConversationThreadSearchQueryHandler:
         include_superseded = bool(query.params.get("include_superseded"))
         limit = query.params.get("limit")
         try:
-            result = self._manager.search_messages(
+            result = await asyncio.to_thread(
+                self._manager.search_messages,
                 q,
                 project_id=project_id,
                 include_archived=include_archived,
@@ -2697,15 +2758,26 @@ class ConversationThreadListQueryHandler:
         self._manager = manager
 
     async def handle(self, query: Any, ctx: HandlerContext) -> QueryResult:
+        return await asyncio.to_thread(self._handle, query, ctx)
+
+    def _handle(self, query: Any, ctx: HandlerContext) -> QueryResult:
         project_id = str(query.params.get("project_id") or "").strip()
         threads = self._manager.list_threads(project_id)
+        # Same inbox-only signal as collect_attention_rows: a turn waiting in
+        # queued status still counts as live delegated work.
+        queued_turn_threads = {
+            str(turn.thread_id)
+            for turn in self._manager.conv.list_active_turns()
+            if str(turn.status) == TURN_QUEUED
+        }
         rows = []
         for thread in threads:
             state = self._manager.conv.get_state(thread.thread_id)
             rows.append({
                 **thread.model_dump(mode="json"),
                 "state": {**state.model_dump(mode="json"),
-                          "unread": state.unread},
+                          "unread": state.unread,
+                          "queued_turn": thread.thread_id in queued_turn_threads},
             })
         return QueryResult(
             query_id=query.query_id,
@@ -2723,6 +2795,9 @@ class ConversationProjectDirectoryListQueryHandler:
         self._manager = manager
 
     async def handle(self, query: Any, ctx: HandlerContext) -> QueryResult:
+        return await asyncio.to_thread(self._handle, query, ctx)
+
+    def _handle(self, query: Any, ctx: HandlerContext) -> QueryResult:
         from muteki.platform.contracts.objects import Project, Workspace
 
         latest_workspace: dict[str, Workspace] = {}
@@ -2815,3 +2890,11 @@ __all__ = [
     "ConversationMemoryQueryHandler",
     "register_conversation_handlers",
 ]
+
+
+# --- workbench object refs (src_object) -------------------------------------
+
+def _src_object_resolver(store: Any, thread_id: str):
+    """Resolve StudioRefKind/id refs against the SRC task bound to this thread."""
+    from muteki.src.assets_workbench import make_src_object_resolver
+    return make_src_object_resolver(store, thread_id)

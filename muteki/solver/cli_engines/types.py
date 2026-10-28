@@ -74,6 +74,9 @@ class CliResult:
     oom_killed: bool = False
     # Stream capture exceeded the configured stdout/stderr budget (#170).
     output_limit: bool = False
+    # The model reached its per-response token cap. This differs from the
+    # subprocess stdout/stderr budget above and may be resumable in one session.
+    model_truncated: bool = False
     # Workdir growth exceeded the configured disk budget (#170).
     disk_limit: bool = False
     cancelled: bool = False         # killed by a cancel_event (winner found / abort)
@@ -116,9 +119,9 @@ def _structured_cli_error(stdout: str) -> str:
                 text = detail(value.get(key))
                 if text:
                     return text
-            return json.dumps(value, ensure_ascii=False)[:1000]
+            return json.dumps(value, ensure_ascii=False)
         if isinstance(value, list):
-            return "; ".join(filter(None, (detail(item) for item in value)))[:1000]
+            return "; ".join(filter(None, (detail(item) for item in value)))
         return str(value).strip() if value is not None else ""
 
     for item in documents:
@@ -172,7 +175,7 @@ def _cli_stderr_failure_detail(stderr: str) -> str:
         if "run 'claude update'" in lower or 'run "claude update"' in lower:
             continue
         kept.append(text)
-    return "\n".join(kept[-12:])[-1800:]
+    return "\n".join(kept)
 
 
 def finalize_cli_result(
@@ -196,7 +199,7 @@ def finalize_cli_result(
             tail = _cli_stderr_failure_detail(stderr)
             result.error = tail or f"{driver_name} exited with code {returncode}"
     if not (result.text or "").strip() and not result.error and not (
-        result.cancelled or result.steered or result.timed_out or result.oom_killed or getattr(result, "output_limit", False) or getattr(result, "disk_limit", False)
+        result.cancelled or result.steered or result.timed_out or result.oom_killed or getattr(result, "output_limit", False) or getattr(result, "disk_limit", False) or result.model_truncated
     ):
         result.error = f"{driver_name} turn ended without assistant text"
     return result

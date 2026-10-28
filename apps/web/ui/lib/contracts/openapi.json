@@ -7417,6 +7417,56 @@
         "summary": "Events"
       }
     },
+    "/api/runs/{run_id}/graph/export": {
+      "get": {
+        "description": "Export one Run's durable graph as a snapshot or event timeline.",
+        "operationId": "export_run_graph_api_runs__run_id__graph_export_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "format",
+            "required": false,
+            "schema": {
+              "default": "jsonl",
+              "title": "Format",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Export Run Graph Api Runs  Run Id  Graph Export Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Export Run Graph"
+      }
+    },
     "/api/runs/{run_id}/hitl": {
       "post": {
         "operationId": "hitl_api_runs__run_id__hitl_post",
@@ -8485,6 +8535,25 @@
         "summary": "Probe Credential Account"
       }
     },
+    "/api/settings/credential-drafts/test": {
+      "post": {
+        "description": "Run the real model turn for a credential that is not saved yet.\n\nThe draft lives in a throwaway account store for the duration of the\nprobe: nothing is written to the real store or published to the shared\nvault, so a failed draft leaves no trace.",
+        "operationId": "test_credential_draft_api_settings_credential_drafts_test_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Test Credential Draft Api Settings Credential Drafts Test Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Test Credential Draft"
+      }
+    },
     "/api/settings/credential-models/refresh-stale": {
       "post": {
         "operationId": "refresh_stale_credential_models_api_settings_credential_models_refresh_stale_post",
@@ -8741,6 +8810,25 @@
           }
         },
         "summary": "Get Profiles Health"
+      }
+    },
+    "/api/settings/profiles/preflight-batch": {
+      "post": {
+        "description": "Warm the same CLI readiness cache used by Run admission.\n\nThe hosted runner calls this before it allocates a challenge instance.\nIts backend and network are fixed here so a caller cannot make this\nendpoint probe an arbitrary image or network configuration.",
+        "operationId": "preflight_worker_batch_api_settings_profiles_preflight_batch_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Preflight Worker Batch Api Settings Profiles Preflight Batch Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Preflight Worker Batch"
       }
     },
     "/api/settings/profiles/{profile_id}/health": {
@@ -12159,6 +12247,274 @@
           }
         },
         "summary": "Usage Limits",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/api/usage/pricing": {
+      "get": {
+        "operationId": "pricing_api_usage_pricing_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Search",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "engine",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Engine"
+            }
+          },
+          {
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Refresh",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pricing",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/api/usage/pricing/override": {
+      "delete": {
+        "operationId": "delete_price_override_api_usage_pricing_override_delete",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Body",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Price Override",
+        "tags": [
+          "usage"
+        ]
+      },
+      "put": {
+        "operationId": "put_price_override_api_usage_pricing_override_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Body",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Price Override",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/api/usage/pricing/reference": {
+      "delete": {
+        "operationId": "delete_price_reference_api_usage_pricing_reference_delete",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Body",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Price Reference",
+        "tags": [
+          "usage"
+        ]
+      },
+      "put": {
+        "operationId": "put_price_reference_api_usage_pricing_reference_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Body",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Price Reference",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/api/usage/pricing/resolve": {
+      "post": {
+        "operationId": "resolve_pricing_api_usage_pricing_resolve_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Body",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resolve Pricing",
         "tags": [
           "usage"
         ]

@@ -8,6 +8,7 @@ completed。幂等由 command_id / idempotency_key 保证：重试不会生成�
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from muteki.platform.command_handlers.base import (
@@ -96,6 +97,9 @@ class TaskQueryHandler:
     query_types = {"task.get", "task.list"}
 
     async def handle(self, query: Any, ctx: HandlerContext) -> QueryResult:
+        return await asyncio.to_thread(self._read, query, ctx)
+
+    def _read(self, query: Any, ctx: HandlerContext) -> QueryResult:
         if query.query_type == "task.list":
             params = dict(query.params or {})
             kind = str(params.get("kind") or "").strip()

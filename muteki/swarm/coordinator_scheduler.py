@@ -92,6 +92,7 @@ async def _run_coordinator(self) -> SwarmOutcome:
     try:
         while (state.tasks or self._has_dispatchable_open_intents(state.tasks)
                or state.reason_task is not None
+               or getattr(self, "_challenger_task", None) is not None
                or state.pentest_review_task is not None
                or bool(state.pentest_review_retry_after)
                or state.reason_result_ready
@@ -186,6 +187,22 @@ async def _run_coordinator(self) -> SwarmOutcome:
                 break
             if action == "continue":
                 continue
+    except Exception as exc:
+        from muteki.swarm.swarm_support import ControlShutdownIncomplete
+
+        if not isinstance(exc, ControlShutdownIncomplete):
+            state.runtime_terminal_failure = True
+            if not str(getattr(self, "_runtime_failure_code", "") or "").strip():
+                self._runtime_failure_code = str(
+                    getattr(exc, "code", "") or "coordinator_runtime_error"
+                )
+            if not str(getattr(self, "_runtime_failure_phase", "") or "").strip():
+                self._runtime_failure_phase = str(
+                    getattr(exc, "phase", "") or "coordinator"
+                )
+            if not str(getattr(self, "_runtime_failure_detail", "") or "").strip():
+                self._runtime_failure_detail = f"{type(exc).__name__}: {exc}"
+        raise
     finally:
         await teardown_coordinator_stage(self, state)
 

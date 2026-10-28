@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Optional
 
@@ -23,10 +24,11 @@ from apps.web.control_adapter import ControlPayloadError
 from apps.web.dispatch_parse import explicit_category, parse_dispatch
 from apps.web.llm_credentials import resolve_llm_profile_credential
 from apps.web.run_manager import RunManager
-from apps.web.titler import generate_title
+from apps.web.titler import fallback_title, generate_title
+from muteki.core.blocking import run_blocking
 from muteki.control import IdempotencyConflict, StateConflict
 from muteki.core.events import Event, EventType
-from muteki.core.llm import LLMClient, llm_temperature_kwargs
+from muteki.core.llm import DEFAULT_BASE_URL, LLMClient, llm_temperature_kwargs
 from muteki.core.path_ids import RunIdPathError
 from muteki.core.usage import usage_context
 from muteki.platform.contracts.errors import ErrorCategory, ErrorEnvelope
@@ -69,6 +71,47 @@ class RunGateway:
 
     def __init__(self, manager: RunManager) -> None:
         self._mgr = manager
+        self._label_clients: dict[tuple[Any, ...], LLMClient] = {}
+
+    def _label_client(
+        self, profile: dict[str, Any], *, base_url: str, api_key: str,
+    ) -> LLMClient:
+        """Reuse stateless label transports; usage and models stay call-local."""
+        temperature = llm_temperature_kwargs(profile)
+        endpoint = (base_url.strip() or DEFAULT_BASE_URL).rstrip("/")
+        key = api_key.strip() or os.environ.get("MUTEKI_DEEPSEEK_API_KEY", "")
+        trust_env = os.environ.get("MUTEKI_LLM_TRUST_ENV", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        transport_env = tuple(
+            (name, os.environ.get(name))
+            for name in (
+                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+                "SSL_CERT_FILE", "SSL_CERT_DIR",
+            )
+        ) if trust_env else ()
+        identity = (
+            endpoint, key, temperature["temperature_mode"],
+            temperature["temperature_value"], trust_env, transport_env,
+        )
+        client = self._label_clients.get(identity)
+        if client is None:
+            client = LLMClient(
+                base_url=endpoint, api_key=key, trust_env=trust_env, **temperature)
+            self._label_clients[identity] = client
+        return client
+
+    async def shutdown(self) -> None:
+        """Close label transports after RunManager has stopped title tasks."""
+        clients, self._label_clients = self._label_clients, {}
+        results = await asyncio.gather(
+            *(client.aclose() for client in clients.values()),
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, Exception)]
+        if failures:
+            raise ExceptionGroup("Run label client shutdown failed", failures)
 
     # ---- ensure_bound_run -------------------------------------------------
 
@@ -78,8 +121,8 @@ class RunGateway:
         record = self._mgr.bound_runs.get(str(request.binding_key).strip()) or {}
         return RunRef(
             run_id=run.run_id,
-            task_id=request.task_id,
-            executor_id=request.executor_id or record.get("executor_id"),
+            task_id=str(record.get("task_id") or request.task_id or ""),
+            executor_id=record.get("executor_id") or request.executor_id,
             binding_key=str(request.binding_key).strip(),
             created_at=_epoch_to_dt(record.get("created_at"))
             or datetime.now(timezone.utc),
@@ -93,7 +136,7 @@ class RunGateway:
         Gateway，Web route 只构造 typed command。
         """
         try:
-            run = self._mgr.create(run_id) if run_id else self._mgr.create_new()
+            run = await self._mgr.create_async(run_id) if run_id else self._mgr.create_new()
         except RunIdPathError as exc:
             from muteki.platform.command_handlers.base import CommandFailed, make_error
 
@@ -233,6 +276,47 @@ class RunGateway:
                 category=ErrorCategory.VALIDATION,
                 recovery_hint="omit swarm_class; the standard Swarm is resolved")
         body.pop("swarm_class", None)
+        src_task_id = str(body.get("src_task_id") or "").strip()
+        if str(body.get("worker_network") or "").startswith("container:") and not src_task_id:
+            return self._error_receipt(
+                run_id, command, code="task_binding_invalid",
+                message="container-scoped Worker networking requires a trusted SRC Task",
+                category=ErrorCategory.PERMISSION,
+            )
+        if src_task_id:
+            try:
+                from muteki.src.store import SrcStoreError
+                src = getattr(self._mgr, "src", None)
+                if src is None:
+                    raise SrcStoreError("task_binding_invalid", "SRC services are unavailable")
+                src.run_binding(src_task_id, run_id)
+                src_policy = src.execution.current_policy(src_task_id)
+                if (src_policy.network_mode == "enforced"
+                        or str(src_policy.inspection_requirements.get("mode") or "off") != "off"):
+                    environment = await asyncio.to_thread(
+                        src.egress.activate, src_task_id, src_policy)
+                    if src_policy.network_mode == "enforced":
+                        body["worker_network"] = environment["network"]
+                    else:
+                        body["worker_network"] = f"src-record:{environment['container']}"
+                    if environment.get("http_proxy"):
+                        body["src_http_proxy"] = environment["http_proxy"]
+                    body["src_environment_generation"] = environment["generation"]
+                else:
+                    body["src_environment_generation"] = 0
+            except SrcStoreError as exc:
+                return self._error_receipt(
+                    run_id, command, code=exc.code, message=exc.message,
+                    category=(ErrorCategory.PERMISSION
+                              if exc.code in {"task_binding_invalid", "policy_denied"}
+                              else ErrorCategory.STATE),
+                )
+            except Exception as exc:
+                return self._error_receipt(
+                    run_id, command, code="capability_unavailable",
+                    message=f"SRC environment activation failed: {type(exc).__name__}: {exc}",
+                    category=ErrorCategory.STATE,
+                )
         from apps.web.drivers import build_driver  # 延迟导入，避免模块环
         from muteki.solver.gate import FlagFormatError
         try:
@@ -270,7 +354,7 @@ class RunGateway:
                 code="run.start.failed",
                 message=f"{type(exc).__name__}: {exc}",
                 category=ErrorCategory.INTERNAL)
-        return self._accepted_receipt(run_id, command)
+        return await self._accepted_receipt(run_id, command)
 
     def _apply_start_metadata(self, run_id: str, body: dict[str, Any]) -> None:
         """Apply explicit rail labels, then label missing title/category in the background.
@@ -318,7 +402,7 @@ class RunGateway:
 
     def _start_titler_label(self, run: Any, prompt: str) -> None:
         profiles = self._mgr.worker_config.get().get("llm_profiles", {})
-        profile = profiles.get("titler") or {}
+        profile = dict(profiles.get("titler") or {})
         try:
             credential = resolve_llm_profile_credential(
                 "titler", profile, sessions_root=self._mgr.state_root)
@@ -335,18 +419,22 @@ class RunGateway:
                 with usage_context(
                     self._mgr.event_root, run_id=run_id, generation=generation,
                     workspace_kind="single-security-task",
-                    actor_kind="auxiliary", role="titler",
+                    actor_kind="auxiliary", role="titler", engine="api",
+                    credential_id=credential.endpoint_id, provider_id=credential.provider_id,
+                    speed=str(profile.get("speed") or ""),
                 ):
-                    title = await generate_title(
-                        prompt,
-                        bus=None,
-                        run_id=None,
-                        model=profile.get("model"),
-                        base_url=credential.base_url or None,
-                        api_key=credential.api_key,
-                        temperature_mode=profile.get("temperature_mode"),
-                        temperature=profile.get("temperature"),
-                    )
+                    try:
+                        title = await generate_title(
+                            prompt,
+                            llm=self._label_client(
+                                profile, base_url=credential.base_url,
+                                api_key=credential.api_key),
+                            model=profile.get("model"),
+                        )
+                    except Exception:
+                        # Client construction used to be inside generate_title's
+                        # fallback boundary too. Preserve that behavior.
+                        title = fallback_title(prompt)
                 if (
                     run.execution_generation == generation
                     and run.bus is bus
@@ -388,19 +476,19 @@ class RunGateway:
         async def _generate_owned_labels() -> None:
             current = asyncio.current_task()
             try:
-                kwargs: dict[str, Any] = dict(llm_temperature_kwargs(profile))
-                if credential.base_url:
-                    kwargs["base_url"] = credential.base_url
-                if credential.api_key:
-                    kwargs["api_key"] = credential.api_key
                 with usage_context(
                     self._mgr.event_root, run_id=run_id, generation=generation,
                     workspace_kind="single-security-task",
-                    actor_kind="auxiliary", role="dispatch",
+                    actor_kind="auxiliary", role="dispatch", engine="api",
+                    credential_id=credential.endpoint_id, provider_id=credential.provider_id,
+                    speed=str(profile.get("speed") or ""),
                 ):
-                    async with LLMClient(**kwargs) as llm:
-                        parsed = await parse_dispatch(
-                            prompt, llm=llm, model=str(profile.get("model") or "") or None)
+                    parsed = await parse_dispatch(
+                        prompt,
+                        llm=self._label_client(
+                            profile, base_url=credential.base_url,
+                            api_key=credential.api_key),
+                        model=str(profile.get("model") or "") or None)
                 if (
                     run.execution_generation != generation
                     or run.bus is not bus
@@ -456,13 +544,13 @@ class RunGateway:
                 message="run is not resolvable in its current state",
                 category=ErrorCategory.STATE,
                 recovery_hint="inspect snapshot and retry after the run settles")
-        return self._accepted_receipt(run_id, command)
+        return await self._accepted_receipt(run_id, command)
 
     async def _command_control(
             self, run_id: str, command: RunCommand,
             command_type: str) -> CommandReceipt:
         """pause/resume/stop/hint/directive 等走持久控制命令路径。"""
-        deduplicated = self._mgr.has_control_command(run_id, command.command_id)
+        deduplicated = await self._mgr.has_control_command(run_id, command.command_id)
         body: dict[str, Any] = {
             "command_id": command.command_id,
             "action": command_type,
@@ -474,6 +562,10 @@ class RunGateway:
         target = command.payload.get("scope", command.payload.get("target"))
         if target not in (None, ""):
             body["target"] = target
+        # 控制 journal 必须保留真实发起身份：Agent 经 CapabilityBinding 下发
+        # 的命令记为 agent:<principal>，operator/Web 路径保持 "operator"。
+        if command.actor_id:
+            body["actor"] = str(command.actor_id).strip()[:256]
         if command.expected_generation is not None:
             body["expected_generation"] = command.expected_generation
         try:
@@ -516,7 +608,7 @@ class RunGateway:
         # terminal effect projection for every control action so Agent Plugin
         # clients do not need action-specific guesses or a second storage path.
         output: dict[str, Any] = {}
-        control_receipt = self._mgr.control_receipt(
+        control_receipt = await self._mgr.control_receipt(
             run_id, command.command_id)
         if control_receipt is not None:
             output["control_receipt"] = control_receipt
@@ -528,7 +620,7 @@ class RunGateway:
                 )
                 if target_ids and effect_observed:
                     output["worker_id"] = str(target_ids[0])
-        return self._accepted_receipt(
+        return await self._accepted_receipt(
             run_id,
             command,
             deduplicated=deduplicated,
@@ -556,7 +648,7 @@ class RunGateway:
                     root=self._mgr.event_root).list_runs()
             if not known:
                 raise LookupError(f"unknown run {run_id!r}")
-            run = self._mgr.create(run_id)
+            run = await self._mgr.create_async(run_id)
         binding_key = self._mgr.bound_runs.run_id_owner(run_id)
         record = (self._mgr.bound_runs.get(binding_key)
                   if binding_key is not None else None) or {}
@@ -608,7 +700,7 @@ class RunGateway:
 
     # ---- receipt 构造 ------------------------------------------------------
 
-    def _accepted_receipt(
+    async def _accepted_receipt(
             self, run_id: str, command: RunCommand, *,
             deduplicated: bool = False,
             output: Optional[dict[str, Any]] = None) -> CommandReceipt:
@@ -616,7 +708,7 @@ class RunGateway:
         cursor = 0
         if run is not None:
             try:
-                cursor = run.store.last_stream_seq(run_id)
+                cursor = await run_blocking(run.store.last_stream_seq, run_id)
             except Exception:
                 cursor = 0
         return CommandReceipt(

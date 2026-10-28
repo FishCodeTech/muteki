@@ -43,6 +43,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -71,7 +72,7 @@ from muteki.solver.credential_accounts import CONTAINER_ACCOUNTS_ROOT
 # at runtime; do not bake claude/codex/cursor login state into this image.
 # One generic worker image (NOT a per-recipe tag), published to Docker Hub so any
 # host can `docker pull` it. Default to the moving :latest; override with
-# MUTEKI_WORKER_IMAGE to pin a version (e.g. ghcr.io/fishcodetech/muteki-worker:v0.4.5).
+# MUTEKI_WORKER_IMAGE to pin a version (e.g. ghcr.io/fishcodetech/muteki-worker:v0.4.6).
 WORKER_IMAGE = os.environ.get("MUTEKI_WORKER_IMAGE", "ghcr.io/fishcodetech/muteki-worker:latest")
 CONTAINER_WORKSPACE = "/home/kali/workspace"
 CONTAINER_CONTROL_DIR = "/run/muteki/control"  # bind-mounted; carries the per-run token
@@ -100,9 +101,11 @@ _VALID_WORKER_NETWORKS = frozenset({"bridge", "host", "none"})
 
 def _normalize_requested_network(requested: str | None) -> str:
     network = str(requested or "").strip() or "bridge"
-    if network not in _VALID_WORKER_NETWORKS:
+    if network not in _VALID_WORKER_NETWORKS and not re.fullmatch(
+        r"(?:container|src-record):muteki-src-egress-[a-f0-9]{24}", network
+    ):
         raise WorkerNetworkConfigError(
-            f"worker_network must be bridge, host, or none; got {network!r}"
+            f"worker_network must be bridge, host, none, or a managed SRC gateway; got {network!r}"
         )
     return network
 
@@ -124,6 +127,10 @@ def project_worker_network(requested: str | None = None) -> dict[str, str]:
     override = (os.environ.get("MUTEKI_WORKER_NETWORK") or "").strip()
     if req == "host":
         return {"requested": "host", "effective": "host", "reason": ""}
+    if req.startswith("container:muteki-src-egress-"):
+        return {"requested": req, "effective": req, "reason": "SRC enforced gateway"}
+    if req.startswith("src-record:muteki-src-egress-"):
+        return {"requested": req, "effective": "bridge", "reason": "SRC declared traffic recording"}
     if req == "none":
         if override:
             raise WorkerNetworkConfigError(
@@ -206,6 +213,7 @@ _CONTAINER_BIN = {
     "omp": "/home/kali/.local/bin/omp",
     "opencode": "opencode",
     "kimi": "kimi",
+    "zcode": "zcode",
     "grok": "/home/kali/.grok/bin/grok",
     "droid": "droid",
 }
@@ -214,6 +222,12 @@ _CONTAINER_OFFLINE_BRIDGE = "/opt/muteki/offline_acp_bridge.py"
 _CONTAINER_OMP_OFFLINE_CONFIG = "/opt/muteki/omp_offline_config.yml"
 _CONTAINER_KIMI_OFFLINE_AGENT = "/opt/muteki/kimi_offline_agent.md"
 _CONTAINER_GROK_OFFLINE_AGENT = "/opt/muteki/grok_offline_agent.md"
+_CONTAINER_PROMPT_BRIDGE_MODULES = {
+    "native_prompt_bridge.py": "muteki.solver.native_prompt_bridge",
+    "zcode_prompt_bridge.py": "muteki.solver.zcode_prompt_bridge",
+    "pi_prompt_bridge.py": "muteki.solver.pi_prompt_bridge",
+    "grok_prompt_bridge.py": "muteki.solver.grok_prompt_bridge",
+}
 
 
 # P2-v3 BLOCKER-c: when the coordinator runs INSIDE the web container, a
@@ -1053,6 +1067,30 @@ def ensure_container(run_id: str, host_workspace: str, *,
             "--mount",
             f"type=bind,source={_mount_source(host_workspace)},target={CONTAINER_WORKSPACE}",
         ]
+        if str(requested_network or "").startswith(("container:muteki-src-egress-", "src-record:muteki-src-egress-")):
+            from muteki.src.egress import SrcEgressManager
+            if str(requested_network).startswith("src-record:"):
+                gateway_mount, _gateway_name, gateway_proxy = SrcEgressManager.record_for_gateway(str(requested_network))
+                run_cmd += [
+                    "--env", f"HTTP_PROXY={gateway_proxy}", "--env", f"HTTPS_PROXY={gateway_proxy}",
+                    "--env", f"ALL_PROXY={gateway_proxy}", "--env", "NO_PROXY=",
+                    "--env", f"http_proxy={gateway_proxy}", "--env", f"https_proxy={gateway_proxy}",
+                    "--env", f"all_proxy={gateway_proxy}", "--env", "no_proxy=",
+                ]
+            else:
+                gateway_mount, _gateway_name = SrcEgressManager.mount_for_gateway(network)
+            run_cmd += [
+                "--mount", f"type=bind,source={_mount_source(gateway_mount + '/policy.json')},target=/run/src/policy.json,readonly",
+            ]
+            if Path(gateway_mount, "ca.pem").is_file():
+                run_cmd += [
+                    "--mount", f"type=bind,source={_mount_source(gateway_mount + '/ca.pem')},target=/run/src/ca.pem,readonly",
+                    "--env", "SSL_CERT_FILE=/run/src/ca.pem",
+                    "--env", "REQUESTS_CA_BUNDLE=/run/src/ca.pem",
+                    "--env", "CURL_CA_BUNDLE=/run/src/ca.pem",
+                    "--env", "NODE_EXTRA_CA_CERTS=/run/src/ca.pem",
+                    "--env", "GIT_SSL_CAINFO=/run/src/ca.pem",
+                ]
         if os.environ.get("MUTEKI_ENVIRONMENT_ID"):
             run_cmd += ["--label", f"io.muteki.environment-id={os.environ['MUTEKI_ENVIRONMENT_ID']}"]
         if mode == "rcp" and control_dir:
@@ -1133,7 +1171,7 @@ def ensure_container(run_id: str, host_workspace: str, *,
                 assert receiver is not None
                 receiver.forget(run_id)
                 _cleanup_bootstrap_dir(run_id)
-            raise RuntimeError(f"failed to start run container {name}: {run.stderr.strip()[:300]}")
+            raise RuntimeError(f"failed to start run container {name}: {run.stderr.strip()}")
         if mode == "dockerexec" and _container_state(name) != "running":
             _docker("rm", "-f", name, timeout=20)
             raise RuntimeError(f"docker-exec runtime {name} exited during startup")
@@ -1182,7 +1220,7 @@ def _ensure_openvpn(handle: ContainerHandle) -> None:
             "exec", handle.container, "tail", "-n", "30",
             "/run/muteki-openvpn.log", timeout=10,
         )
-        return (detail.stdout or detail.stderr or "")[-800:]
+        return detail.stdout or detail.stderr or ""
 
     # TSec permits only one client per profile.  Immediately reconnecting after a
     # previous client exits can briefly return AUTH_FAILED while the server still
@@ -1198,7 +1236,7 @@ def _ensure_openvpn(handle: ContainerHandle) -> None:
         )
         if started.returncode != 0:
             raise RuntimeError(
-                f"OpenVPN 启动失败: {(started.stderr or started.stdout or '')[:240]}"
+                f"OpenVPN 启动失败: {started.stderr or started.stdout or ''}"
             )
         attempt_deadline = time.monotonic() + 30
         while time.monotonic() < attempt_deadline:
@@ -1449,6 +1487,32 @@ def _containerize_argv(driver_name: str, argv: list[str]) -> list[str]:
         return argv
     bin_in_container = _CONTAINER_BIN.get(driver_name)
     out = list(argv)
+    # Large-prompt bridges live in the image and receive the complete prompt on
+    # stdin.  The bridge may follow an ``env NAME=value ...`` prefix (Grok), so
+    # locate it by basename instead of assuming argv[1].
+    for script_index, arg in enumerate(out):
+        bridge_module = _CONTAINER_PROMPT_BRIDGE_MODULES.get(os.path.basename(arg))
+        if bridge_module is None:
+            continue
+        if script_index == 0:
+            raise LaunchContractError(
+                f"{driver_name}: prompt bridge has no Python interpreter",
+                code=LAUNCH_CODE_ENVIRONMENT,
+                field="argv",
+                source="container",
+            )
+        out[script_index - 1] = "python3"
+        # ``python /opt/.../muteki/solver/bridge.py`` puts the solver directory
+        # first on sys.path, where ``solver/types.py`` can shadow the stdlib
+        # ``types`` module during Python startup. Module execution keeps only the
+        # package root on sys.path and avoids that filename collision.
+        out[script_index:script_index + 1] = ["-m", bridge_module]
+        for index, value in enumerate(out[:-1]):
+            if value == "--binary":
+                out[index + 1] = bin_in_container or os.path.basename(out[index + 1])
+            elif driver_name == "grok" and value == "--agent":
+                out[index + 1] = _CONTAINER_GROK_OFFLINE_AGENT
+        return out
     if len(out) >= 2 and os.path.basename(out[1]) == "offline_acp_bridge.py":
         out[0] = "python3"
         out[1] = _CONTAINER_OFFLINE_BRIDGE
@@ -1597,7 +1661,7 @@ def run_cli_container(driver: CliDriver, argv: list[str], *, handle: ContainerHa
         res.runtime_status = {**rs, **_RUNTIME_REGISTRY.finish(
             rec, status=status, rc=observed_rc,
             timed_out=res.timed_out, oom_killed=res.oom_killed,
-            error=(res.raw_stderr or "").strip()[:300])}
+            error=(res.raw_stderr or "").strip())}
         return res
     return _DockerExecBackend.run(driver, argv, handle=handle, cwd=cwd,
                                   timeout=timeout, env=env, stdin_text=stdin_text)
@@ -1675,7 +1739,7 @@ def run_cli_streaming_container(
             rec, status=rs.get("status", "finished"), rc=rs.get("rc"),
             timed_out=res.timed_out, oom_killed=res.oom_killed,
             cancelled=res.cancelled, steered=res.steered,
-            error=(res.raw_stderr or "").strip()[:300])}
+            error=(res.raw_stderr or "").strip())}
         return res
     return _DockerExecBackend.run_streaming(
         driver, argv, handle=handle, cwd=cwd, timeout=timeout, on_step=on_step,
@@ -1855,7 +1919,7 @@ class _DockerExecBackend:
         res.runtime_status = _RUNTIME_REGISTRY.finish(
             rec, status=status, rc=proc.returncode,
             timed_out=res.timed_out, oom_killed=res.oom_killed,
-            error=(proc.stderr or "").strip()[:300])
+            error=(proc.stderr or "").strip())
         return res
 
     @staticmethod
@@ -2058,5 +2122,5 @@ class _DockerExecBackend:
         res.runtime_status = _RUNTIME_REGISTRY.finish(
             rec, status=status, rc=rc, timed_out=timed_out,
             oom_killed=oom_killed, cancelled=cancelled, steered=steered,
-            error=(stderr or "").strip()[:300])
+            error=(stderr or "").strip())
         return res

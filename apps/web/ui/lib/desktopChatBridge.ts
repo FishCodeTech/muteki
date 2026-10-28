@@ -139,9 +139,38 @@ export interface DesktopChatBridge {
   acknowledgeClose?: (input: { token: string; persisted: boolean; error?: string }) => Promise<unknown>;
 }
 
+function desktopError(value: unknown): unknown {
+  if (!value || typeof value !== "object" || (value as Record<string, unknown>).__mutekiDesktopError !== true) return value;
+  const fields: Record<string, unknown> = { ...(value as Record<string, unknown>) };
+  delete fields.__mutekiDesktopError;
+  return Object.assign(new Error(String(fields.message || "桌面操作失败。")), fields);
+}
+
+const rehydratedBridges = new WeakMap<object, unknown>();
+
+/** Restores typed `code` fields on bridge rejections, which contextBridge cannot carry on Error objects. */
+export function rehydrateDesktopBridge<T>(raw: T): T {
+  if (!raw || typeof raw !== "object") return raw;
+  const cached = rehydratedBridges.get(raw as object);
+  if (cached) return cached as T;
+  const bridge: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    bridge[key] = typeof value === "function"
+      ? (...args: unknown[]) => {
+        const result = (value as (...input: unknown[]) => unknown)(...args);
+        return result instanceof Promise || (result && typeof (result as PromiseLike<unknown>).then === "function")
+          ? Promise.resolve(result).catch((error: unknown) => { throw desktopError(error); })
+          : result;
+      }
+      : value && typeof value === "object" ? rehydrateDesktopBridge(value) : value;
+  }
+  rehydratedBridges.set(raw as object, bridge);
+  return bridge as T;
+}
+
 export function desktopChatBridge(): DesktopChatBridge | undefined {
   if (typeof window === "undefined") return undefined;
-  return (window as Window & { mutekiDesktop?: DesktopChatBridge }).mutekiDesktop;
+  return rehydrateDesktopBridge((window as Window & { mutekiDesktop?: DesktopChatBridge }).mutekiDesktop);
 }
 
 export type TerminalSocket = Pick<WebSocket, "send" | "close" | "onopen" | "onmessage" | "onclose" | "onerror"> & { readyState: number };

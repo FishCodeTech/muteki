@@ -65,7 +65,7 @@ function compactWake(until: number, nowMs: number): string {
 type SlotKind = "label" | "time" | "none";
 
 function slotKindOf(item: NavItem): SlotKind {
-  if (item.running || item.pending || item.failed || item.woke || item.snoozedUntil) return "label";
+  if (item.running || item.pending || item.failed || item.agentsActive || item.woke || item.snoozedUntil) return "label";
   return item.updatedAt ? "time" : "none";
 }
 
@@ -74,24 +74,32 @@ function slotKindOf(item: NavItem): SlotKind {
  * of the ticking clock, so a tick re-renders only rows whose label changed.
  */
 export function rowClockLabel(item: NavItem, nowMs: number): string {
-  if (item.running || item.pending || item.failed || item.woke) return "";
+  if (item.running || item.pending || item.failed || item.agentsActive || item.woke) return "";
   if (item.snoozedUntil) return compactWake(item.snoozedUntil, nowMs);
   return formatCompactRelative(item.updatedAt, nowMs);
 }
 
-/** Status shown at the row's right edge; hover actions replace it. */
+/**
+ * Status shown at the row's right edge; hover actions replace it. A request
+ * waiting on the user outranks a running turn, which is usually blocked on it.
+ */
 function StatusSlot({ item, clockLabel, exactTime }: { item: NavItem; clockLabel: string; exactTime?: string }) {
-  if (item.running) {
-    return <SlotLabel tone="accent" icon={<Spinner size={11} />} title="Agent 正在运行">运行中</SlotLabel>;
-  }
+  const agentsNote = item.agentsActive ? `${item.agentsActive} 个子代理进行中` : "";
   if (item.pending === "approval") {
     return <SlotLabel tone="warning" icon={<Icon name="shieldAlert" size={12} />} title={item.pendingNote || "等待你审批工具调用"}>待审批</SlotLabel>;
   }
   if (item.pending === "input") {
     return <SlotLabel tone="accent" icon={<Icon name="messageCircle" size={12} />} title={item.pendingNote || "Agent 在等待你的回复"}>待回复</SlotLabel>;
   }
+  if (item.running) {
+    return <SlotLabel tone="accent" icon={<Spinner size={11} />} title={agentsNote ? `Agent 正在运行 · ${agentsNote}` : "Agent 正在运行"}>运行中</SlotLabel>;
+  }
   if (item.failed) {
     return <SlotLabel tone="danger" icon={<Icon name="circleAlert" size={12} />} title={item.errorText || "会话异常"}>失败</SlotLabel>;
+  }
+  // The conversation itself is idle but delegated work is still in progress.
+  if (agentsNote) {
+    return <SlotLabel tone="muted" icon={<Icon name="bot" size={12} />} title={agentsNote}>委派中</SlotLabel>;
   }
   if (item.woke) {
     return (
@@ -438,7 +446,7 @@ export function SectionLabel({
         aria-expanded={!collapsed}
         aria-controls={controlsId}
         onClick={onToggle}
-        className="-ml-1 flex h-6 min-w-0 items-center gap-1 rounded-md px-1 text-[12px] font-medium text-cx-fg-4 outline-none transition-colors hover:text-cx-fg-2 focus-visible:outline-2 focus-visible:outline-[var(--cx-focus)]"
+        className="-ml-1 flex h-6 min-w-0 items-center gap-1 rounded-md px-1 text-[12px] font-medium text-cx-fg-3 outline-none transition-colors hover:text-cx-fg-2 focus-visible:outline-2 focus-visible:outline-[var(--cx-focus)]"
       >
         <span className="truncate">{title}</span>
         <Icon

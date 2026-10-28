@@ -48,6 +48,7 @@ class OhMyPiDriver(PiLikeDriver):
             self.bin, "-p", "--mode", "json",
             "--config", str(self._OFFLINE_CONFIG),
             *self._permission_flags(launch),
+            *self._CONTEXT_FLAGS,
             *self._provider_model_flags(),
         ]
         if resume:
@@ -77,6 +78,43 @@ class OhMyPiDriver(PiLikeDriver):
         return super().build_resume(
             prompt, session, web_access=True, launch=launch)
 
+    def build_execute_input(
+        self, prompt: str, session: Optional[str], *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        if not web_access:
+            return self._offline_input(prompt, launch=launch)
+        return super().build_execute_input(
+            prompt, session, web_access=web_access, kb_access=kb_access,
+            stream=stream, launch=launch)
+
+    def build_resume_input(
+        self, prompt: str, session: str, *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        if not web_access:
+            return self._offline_input(prompt, resume=session, launch=launch)
+        return super().build_resume_input(
+            prompt, session, web_access=web_access, kb_access=kb_access,
+            stream=stream, launch=launch)
+
+    def _offline_input(
+        self, prompt: str, *, resume: str = "",
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        if not self._OFFLINE_CONFIG.is_file():
+            raise FileNotFoundError(
+                f"OMP offline runtime file missing: {self._OFFLINE_CONFIG}")
+        argv = [self.bin, "-p", "--mode", "json",
+                "--config", str(self._OFFLINE_CONFIG),
+                *self._permission_flags(launch), *self._CONTEXT_FLAGS,
+                *self._provider_model_flags()]
+        if resume:
+            argv += ["--resume", resume]
+        return argv, prompt
+
     def build_execute_stdin(
         self, prompt: str, session: Optional[str], *,
         web_access: bool = True, kb_access: bool = True, stream: bool = False,
@@ -91,6 +129,7 @@ class OhMyPiDriver(PiLikeDriver):
                 self.bin, "-p", "--mode", "json", "--no-session",
                 "--config", str(self._OFFLINE_CONFIG),
                 *self._permission_flags(launch),
+                *self._CONTEXT_FLAGS,
                 *self._provider_model_flags(),
             ]
         return super().build_execute_stdin(

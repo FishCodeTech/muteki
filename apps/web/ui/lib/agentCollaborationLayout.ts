@@ -111,7 +111,7 @@ function roleRank(agent: CollaborationAgent): number {
   if (agent.role === "review") return 1;
   if (agent.role === "verifier") return 2;
   if (agent.role === "coordinator") return -3;
-  if (agent.role === "decision") return -2;
+  if (agent.role === "decision" || agent.role === "challenger") return -2;
   return -1;
 }
 
@@ -324,12 +324,13 @@ export type TimelineLayout = {
   usableWidth: number;
 };
 
-const TIMELINE_ROLES: CollaborationAgentRole[] = ["coordinator", "decision", "source", "worker", "review", "verifier"];
+const TIMELINE_ROLES: CollaborationAgentRole[] = ["coordinator", "decision", "challenger", "source", "worker", "review", "verifier"];
 
 function roleLane(role: CollaborationAgentRole): number {
   switch (role) {
     case "coordinator": return 0;
     case "decision": return 0.3;
+    case "challenger": return 0.45;
     case "source": return 0.6;
     case "worker": return 1;
     case "review": return 2;

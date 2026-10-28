@@ -1,4 +1,8 @@
 export const DESKTOP_APPEARANCE_KEY = "muteki.desktop.appearanceOverride";
+let workspaceActive = true;
+/** Native mode tabs retain their DOM; background list polling can pause. */
+export function isDesktopWorkspaceActive(): boolean { return workspaceActive; }
+export function setDesktopWorkspaceActive(active: boolean): void { workspaceActive = active; }
 export function isDesktopRemote(): boolean {
   return typeof navigator !== "undefined" && /(?:^|\s)MutekiDesktop\/[\w.+-]+(?:\s|$)/.test(navigator.userAgent);
 }

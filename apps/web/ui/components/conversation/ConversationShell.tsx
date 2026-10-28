@@ -12,7 +12,8 @@
  * ───────────────────────────────────────────────────────── */
 
 import { ConversationRouteLink } from "@/components/conversation/ConversationNavigation";
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { createPortal } from "react-dom";
 import { Button, Callout, Dialog, IconButton, Popover, TextField, Toaster, toast } from "@/components/chat/ui";
 import {
   PANEL_SHEET_BREAKPOINT,
@@ -51,6 +52,7 @@ import {
   type ConversationThread,
   type ConversationTurn,
   type ConversationMessage,
+  type ConversationView,
   type ThreadMode,
   type WorkspaceBindMode,
   type ImpactPreviewResponse,
@@ -67,7 +69,6 @@ import {
   worktreeMissingSelectionCopy,
 } from "@/lib/existingWorktreePicker";
 import {
-  buildThreadMessageHref,
   readMessageDeepLink,
   replaceMessageDeepLink,
 } from "@/lib/conversationDeepLink";
@@ -84,7 +85,7 @@ import { projectDefaultPersistFeedback } from "@/lib/projectDefaultPersistFeedba
 import { resolveComposerRuntimeBind } from "@/lib/conversationComposerBind";
 import { upsertConversationThread } from "@/lib/conversationInbox";
 import { resolveComposerBindingRestore } from "@/lib/composerRestoreBinding";
-import { providerNoticeScope, providerSwitchPreview, runtimeHandoffNotice } from "@/lib/providerSwitchNotice";
+import { providerNoticeScope, providerSwitchPreview, runtimeHandoffNoticeUpdate } from "@/lib/providerSwitchNotice";
 import {
   pushJumpBackFromThread,
   shouldRestoreReadingPosition,
@@ -197,12 +198,17 @@ import {
   readEditBuffer,
   writeEditBuffer,
 } from "@/lib/editResendBuffer";
-import type { PromptBarAttachment } from "../ai-native/prompt-bar";
+import type { ComposerCustomDrop, ComposerLocalMentions, PromptBarAttachment } from "../ai-native/prompt-bar";
+import {
+  PanelExtensionContext,
+  togglePanelWithExtensions,
+  type PanelExtensionConfig,
+} from "@/components/chat/panel/extensions";
 
-import { ConversationSidebar } from "./ConversationSidebar";
+import { ConversationSidebar, type ConversationSidebarLabels } from "./ConversationSidebar";
 import { ConversationHeader } from "./ConversationHeader";
 import { ConversationThreadDetails, useThreadDetailsState } from "./ConversationThreadDetails";
-import { ConversationHome } from "./ConversationHome";
+import { ConversationHome, type ConversationHomeProps } from "./ConversationHome";
 import {
   ConversationStreamBottomPanel,
   ConversationStreamQuotaResume,
@@ -211,6 +217,8 @@ import {
   useConversationRunningToolCount,
 } from "./ConversationStreamBindings";
 import { ConversationQueue } from "./ConversationQueue";
+import { SubagentActivityPill } from "./ConversationSubagentGroup";
+import { threadSubagentCounts } from "@/lib/threadAttention";
 import { ConversationDetailsDrawer, type DrawerDetailPayload } from "./ConversationDetailsDrawer";
 import { ConversationInfoDrawer } from "./ConversationInfoDrawer";
 import { ConversationSearchDialog } from "./ConversationSearchDialog";
@@ -223,10 +231,11 @@ import {
 } from "./ImpactConfirmModal";
 import { useConversationChrome } from "@/components/conversationChrome";
 import { ConversationNavigationContext, type ConversationNavigation } from "./ConversationNavigation";
+import { ConversationLocalPreviewContext } from "@/lib/conversationPreviewMode";
 export type { ConversationNavigation } from "./ConversationNavigation";
 import { ConversationModelPicker } from "./ConversationModelPicker";
 import { ConversationComposerModes } from "./ConversationComposerModes";
-import { credentialForRuntime, effectiveServiceTier, readPreferredServiceTier, validModelEffort } from "@/lib/modelReasoning";
+import { credentialForRuntime, effectiveServiceTier, modelEffortLevels, readPreferredServiceTier, rememberedModelEffort, rememberModelEffort, validModelEffort } from "@/lib/modelReasoning";
 import { ComposerContextStrip } from "./ComposerContextStrip";
 import { ComposerStashModal } from "./ComposerStashModal";
 import { ConversationReadinessBanner } from "./ConversationReadinessBanner";
@@ -381,15 +390,133 @@ function composerRefs(doc: PromptDocument): ComposerCapabilityRef[] {
   return refsFromDocument(doc) as ComposerCapabilityRef[];
 }
 
-export function ConversationShell({ threadId = "", navigation }: { threadId?: string; navigation: ConversationNavigation }) {
+export interface ConversationExperience {
+  defaultMode?: ThreadMode;
+  draftScope?: string;
+  hideProjects?: boolean;
+  allowFork?: boolean;
+  threadFilter?: (thread: ConversationThread) => boolean;
+  threadHref?: (threadId: string) => string;
+  newThreadHref?: (draftId: string) => string;
+  home?: Pick<ConversationHomeProps, "title" | "subtitle" | "placeholder" | "suggestions" | "hideWorkspaceControls" | "hideReadinessGuide">;
+  sidebarLabels?: ConversationSidebarLabels;
+  headerActions?: React.ReactNode;
+  /** Rendered directly above the composer, e.g. objects a workbench pinned as chat context. */
+  composerAccessory?: React.ReactNode;
+  /*
+   * The options below are honored only together with `preview`, so the
+   * regular chat never renders host surfaces or host composer behavior.
+   */
+  /** Host surfaces for the right panel. */
+  panelExtensions?: PanelExtensionConfig;
+  /** Rendered under each settled assistant turn. */
+  turnAccessory?: (turnId: string) => React.ReactNode;
+  /** Extra refs merged into the outgoing send (one-shot; resolved server-side). */
+  composerRefs?: () => ComposerCapabilityRef[];
+  /** Called once a send receipt is accepted, e.g. to reset one-shot context exclusions. */
+  onSent?: () => void;
+  /** Host `@` catalog for the composer. */
+  localMentions?: ComposerLocalMentions;
+  /** Custom drag payloads the composer accepts. */
+  composerDrop?: ComposerCustomDrop;
+  /** Replaces the default read-only preview label in the composer toolbar. */
+  composerControls?: React.ReactNode;
+  composerPlaceholder?: string;
+  /** Filled with imperative composer actions while the shell is mounted. */
+  composerHandle?: React.MutableRefObject<ConversationComposerHandle | null>;
+  preview?: {
+    threads: ConversationThread[];
+    view: ConversationView;
+    notice?: string;
+    /** Called after a preview message is appended locally; nothing is sent. */
+    onSend?: (text: string) => void;
+  };
+  createThread?: (
+    input: Parameters<typeof createConversationThread>[0],
+    options: Parameters<typeof createConversationThread>[1],
+    context: { promptText: string },
+  ) => Promise<{ threadId: string; href?: string }>;
+}
+
+export interface ConversationComposerHandle {
+  /**
+   * Appends a paragraph to the draft and focuses the composer. With
+   * `focus: false` only the draft changes, so focus and text selection stay
+   * where the user is reading.
+   */
+  insertText: (text: string, options?: { focus?: boolean }) => void;
+  focus: () => void;
+  /** Makes the replies visible: opens the replies layer while the panel is docked over them. */
+  showReplies: () => void;
+}
+
+function defaultThreadHref(threadId: string): string {
+  return `/chat/${encodeURIComponent(threadId)}`;
+}
+
+function defaultNewThreadHref(draftId: string): string {
+  return `/chat?draft=${encodeURIComponent(draftId)}`;
+}
+
+function experienceDraftKey(threadId: string, draftId: string, scope?: string): string {
+  if (!threadId && scope) return `experience:${encodeURIComponent(scope)}:${composerDraftKey("", draftId)}`;
+  return composerDraftKey(threadId, draftId);
+}
+
+export function ConversationShell({ threadId = "", navigation, experience, mainContentId = CONVERSATION_MAIN_CONTENT_ID, sidebarId = "conversation-sidebar" }: {
+  threadId?: string;
+  navigation: ConversationNavigation;
+  experience?: ConversationExperience;
+  /** Landmark ids must stay unique while retained shells coexist off-screen. */
+  mainContentId?: string;
+  sidebarId?: string;
+}) {
   const { router, pathname, searchParams } = navigation;
-  const { threads, refresh: refreshList, markThreadsRead } = useConversationThreads({
+  const threadHref = experience?.threadHref ?? defaultThreadHref;
+  const newThreadHref = experience?.newThreadHref ?? defaultNewThreadHref;
+  const defaultMode = experience?.defaultMode ?? "conversation";
+  const threadMessageHref = (id: string, messageId: string) => {
+    const href = threadHref(id);
+    return `${href}${href.includes("?") ? "&" : "?"}message=${encodeURIComponent(messageId)}`;
+  };
+  const preview = experience?.preview;
+  // Host workbench options (panel extensions, local mentions, custom drops,
+  // turn/composer accessories, composer handle) are honored for any host that
+  // passes them — preview remains the only thing swapped for fake data.
+  const panelExtensions = experience?.panelExtensions ?? null;
+  const previewHost = experience;
+  const liveThreads = useConversationThreads({
+    enabled: !preview,
     activeThreadId: threadId,
   });
-  const conversation = useConversation(threadId);
-  const [unboundNoticeDismissed, setUnboundNoticeDismissed] = useState<ReadonlySet<string>>(() => new Set());
+  const liveRefreshList = liveThreads.refresh;
+  const liveMarkThreadsRead = liveThreads.markThreadsRead;
+  const liveConversation = useConversation(preview ? "" : threadId);
+  const [previewView, setPreviewView] = useState<ConversationView | null>(preview?.view || null);
+  useEffect(() => setPreviewView(preview?.view || null), [preview]);
+  const threads = preview?.threads || liveThreads.threads;
+  const refreshList = useCallback(async () => {
+    if (!preview) await liveRefreshList();
+  }, [liveRefreshList, preview]);
+  const markThreadsRead = useCallback((...args: Parameters<typeof liveMarkThreadsRead>) => {
+    if (preview) return Promise.resolve();
+    return liveMarkThreadsRead(...args);
+  }, [liveMarkThreadsRead, preview]);
+  const conversation = useMemo(() => preview ? {
+    ...liveConversation,
+    view: previewView,
+    loading: false,
+    loadingOlder: false,
+    error: "",
+    connected: false,
+    streamStatus: "idle" as const,
+    refresh: async () => undefined,
+    loadOlderMessages: async () => false,
+    jumpToLatestMessages: async () => false,
+  } : liveConversation, [liveConversation, preview, previewView]);
   const draftParam = searchParams.get("draft") || "";
-  const draftKey = composerDraftKey(threadId, draftParam);
+  const draftScope = experience?.draftScope;
+  const draftKey = experienceDraftKey(threadId, draftParam, draftScope);
   // Retry awaits a configuration refresh. Keep the active route/view current
   // during render so an old async callback cannot submit after navigation.
   const activeSendContextRef = useRef({ draftKey, viewThreadId: "" });
@@ -401,6 +528,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   // stored draft before the hydrate effect runs on first mount / remount.
   const draftHydratingRef = useRef(true);
   const [hydratedDraftKey, setHydratedDraftKey] = useState("");
+  const hydratedDraftRef = useRef<{ draftKey: string; storageScope: string } | null>(null);
   const appliedNewChatDefaultsRef = useRef("");
   const composerSnapshotRef = useRef({
     draftKey,
@@ -453,7 +581,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   const [runtimes, setRuntimes] = useState<RuntimeInstance[]>([]);
   const [runtimeSource, setRuntimeSource] = useState<SourceState>(sourceLoading());
   const [runtimeKey, setRuntimeKey] = useState("");
-  const descriptorState = useProviderDescriptors();
+  const descriptorState = useProviderDescriptors({ enabled: !preview });
   const descriptors = readyCatalog(descriptorState);
   const descriptorSource = useMemo<SourceState>(() => (
     descriptorState.status === "ready" ? sourceOk()
@@ -498,7 +626,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   const [projectId, setProjectId] = useState("");
   const [savingProjectDefault, setSavingProjectDefault] = useState(false);
   const [projectCreating, setProjectCreating] = useState(false);
-  const [mode, setMode] = useState<ThreadMode>("conversation");
+  const [mode, setMode] = useState<ThreadMode>(defaultMode);
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceBindMode>("shared_checkout");
   const [worktreeBranch, setWorktreeBranch] = useState("");
   const [existingWorktreePath, setExistingWorktreePath] = useState("");
@@ -514,8 +642,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   const [capabilityRefs, setCapabilityRefs] = useState<ComposerCapabilityRef[]>([]);
   const commandScopesRef = useRef(new Set<string>());
   const [, setCommandRevision] = useState(0);
-  const [storageScope, setStorageScope] = useState(conversationStorageScope);
-  useEffect(() => subscribeConversationStorageScope(() => setStorageScope(conversationStorageScope())), []);
+  const storageScope = useSyncExternalStore(subscribeConversationStorageScope, conversationStorageScope, () => "");
   const commandScope = `${storageScope}::${draftKey}`;
   const composerStorageScopeRef = useRef(storageScope);
   const [controlRevision, setControlRevision] = useState(0);
@@ -607,18 +734,26 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   const [highlightedMessageId, setHighlightedMessageId] = useState("");
   const ensureMessageVisible = conversation.ensureMessageVisible;
 
+  const deepLinkThreadRef = useRef(threadId);
   useEffect(() => {
+    if (deepLinkThreadRef.current === threadId) return;
+    deepLinkThreadRef.current = threadId;
     setDeepLinkDismissed(false);
   }, [threadId]);
 
+  const deepLinkParamRef = useRef(rawMessageParam);
   useEffect(() => {
+    if (deepLinkParamRef.current === rawMessageParam) return;
+    deepLinkParamRef.current = rawMessageParam;
     // A new ?message= re-arms the deep-link. Clearing the query (回到最新)
     // must keep dismissed so C08 restore stays off for this visit.
     if (rawMessageParam) setDeepLinkDismissed(false);
   }, [rawMessageParam]);
 
+  const appliedMessageDeepLinkRef = useRef("");
   useEffect(() => {
     if (!threadId || !messageParam) {
+      appliedMessageDeepLinkRef.current = "";
       setHighlightedMessageId("");
       return;
     }
@@ -629,6 +764,13 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       conversation.loading
       || conversation.view?.thread.thread_id !== threadId
     ) {
+      return;
+    }
+    const requestKey = JSON.stringify([threadId, messageParam]);
+    if (appliedMessageDeepLinkRef.current === requestKey) {
+      // Revealing an Activity should keep the reader's position after the
+      // original deep-link was handled, rather than jumping there again.
+      setHighlightedMessageId("");
       return;
     }
     let cancelled = false;
@@ -645,6 +787,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         replaceMessageDeepLink(null);
         return;
       }
+      appliedMessageDeepLinkRef.current = requestKey;
       setHighlightedMessageId(messageParam);
       clearTimer = setTimeout(() => {
         if (!cancelled) setHighlightedMessageId("");
@@ -653,6 +796,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     return () => {
       cancelled = true;
       if (clearTimer) clearTimeout(clearTimer);
+      setHighlightedMessageId("");
     };
   }, [
     threadId,
@@ -688,14 +832,56 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   const panel = useChatPanel(threadId);
   const rightPanelOpen = Boolean(threadId) && panel.isOpen;
   const [panelSheet, setPanelSheet] = useState(false);
+  const sheetBreakpoint = panelExtensions?.sheetBreakpoint ?? PANEL_SHEET_BREAKPOINT;
   useEffect(() => {
-    const mq = window.matchMedia(`(max-width: ${PANEL_SHEET_BREAKPOINT}px)`);
+    const mq = window.matchMedia(`(max-width: ${sheetBreakpoint}px)`);
     const sync = () => setPanelSheet(mq.matches);
     sync();
     mq.addEventListener("change", sync);
     return () => mq.removeEventListener("change", sync);
-  }, []);
+  }, [sheetBreakpoint]);
+  // Docked focus (preview hosts only): the panel covers the conversation and
+  // ends above the composer; replies open as a layer between the two.
+  const dockFocus = panelExtensions?.focusLayout === "dock" && rightPanelOpen && panel.maximized && !panelSheet;
+  const [dockRepliesOpen, setDockRepliesOpen] = useState(false);
+  const composerDockRef = useRef<HTMLDivElement | null>(null);
+  const [dockInset, setDockInset] = useState(0);
+  const [dockReplyHeight, setDockReplyHeight] = useState(320);
+  useEffect(() => {
+    if (!dockFocus) {
+      setDockRepliesOpen(false);
+      return;
+    }
+    const footer = composerDockRef.current;
+    const shell = shellRef.current;
+    if (!footer || !shell || typeof ResizeObserver === "undefined") return;
+    const measure = () => {
+      const shellRect = shell.getBoundingClientRect();
+      setDockInset(Math.max(0, Math.round(shellRect.bottom - footer.getBoundingClientRect().top)));
+      setDockReplyHeight(Math.round(Math.min(520, Math.max(220, shellRect.height * 0.45))));
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(footer);
+    observer.observe(shell);
+    return () => observer.disconnect();
+  }, [dockFocus]);
+  const dockMessages = conversation.view?.messages;
+  const dockSnippet = useMemo(() => {
+    if (!dockFocus || !dockMessages) return "";
+    const last = [...dockMessages].reverse().find((message) => message.role === "assistant" && message.kind === "message" && message.text);
+    return last?.text ? `最新回复：${last.text.replace(/[*#>`_]/g, "").replace(/\s+/g, " ").trim().slice(0, 80)}` : "";
+  }, [dockFocus, dockMessages]);
+  // A message sent from the docked composer opens the replies layer so its answer is visible.
+  const dockTurnCount = conversation.view?.turns?.length ?? 0;
+  const dockTurnCountRef = useRef(dockTurnCount);
+  useEffect(() => {
+    if (dockFocus && dockTurnCount > dockTurnCountRef.current) setDockRepliesOpen(true);
+    dockTurnCountRef.current = dockTurnCount;
+  }, [dockFocus, dockTurnCount]);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  const [effortPickerOpen, setEffortPickerOpen] = useState(false);
+  const [accessPickerOpen, setAccessPickerOpen] = useState(false);
   // Keyed by thread scope so switching threads always starts expanded.
   const [compactComposerScope, setCompactComposerScope] = useState("");
   const composerCompact = compactComposerScope === commandScope;
@@ -769,7 +955,9 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     setSidebarWidth,
     mobileSidebarOpen,
     setMobileSidebarOpen,
+    headerSlot,
   } = useConversationChrome();
+  const renderHeader = (header: React.ReactNode) => (headerSlot ? createPortal(header, headerSlot) : header);
   // #199: mobile sidebar overlay acts like a modal Sheet — trap Tab + inert main.
   // Desktop persistent sidebar never sets mobileSidebarOpen, so it stays non-modal.
   useEffect(() => {
@@ -784,7 +972,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     closeOnDesktop();
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Tab") return;
-      const sidebar = document.getElementById("conversation-sidebar");
+      const sidebar = document.getElementById(sidebarId);
       const active = document.activeElement as HTMLElement | null;
       const focusRoot = mobileSidebarTabRoot(sidebar, active);
       // Dialogs already own their Tab loop; allow their document handler to run.
@@ -809,7 +997,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       window.removeEventListener("keydown", onKey, true);
       document.querySelector<HTMLButtonElement>(".workspace-brand-sidebar-toggle")?.focus();
     };
-  }, [mobileSidebarOpen]);
+  }, [mobileSidebarOpen, sidebarId]);
 
   // Large-paste dialog
   const [largePasteText, setLargePasteText] = useState<string | null>(null);
@@ -842,7 +1030,10 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   const [memoryLoading, setMemoryLoading] = useState(false);
 
   // Auto-close details drawer on threadId change; the right panel is per-thread state.
+  const detailsThreadRef = useRef(threadId);
   useEffect(() => {
+    if (detailsThreadRef.current === threadId) return;
+    detailsThreadRef.current = threadId;
     setDetailsPayload(null);
   }, [threadId]);
 
@@ -878,7 +1069,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       runtimeKey: current.runtimeKey, effort: current.effort, accessMode: current.accessMode,
     });
     if (preserveRuntime) {
-      writeComposerDraft(composerDraftKey("", nextDraft), {
+      writeComposerDraft(experienceDraftKey("", nextDraft, draftScope), {
         prompt: "", promptSegments: [], capabilityRefs: [], attachments: [],
         credentialId: current.credentialId, runtimeKey: current.runtimeKey,
         model: current.model, effort: current.effort, accessMode: current.accessMode,
@@ -887,8 +1078,8 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       flushComposerDraftStore();
     }
     setMobileSidebarOpen(false);
-    router.push(`/chat?draft=${nextDraft}`);
-  }, [router]);
+    router.push(newThreadHref(nextDraft));
+  }, [router, newThreadHref, draftScope]);
 
   useDesktopMenuAcceleratorSync();
 
@@ -896,7 +1087,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   // Guard: skip when focus is inside a text input, contenteditable, or the xterm terminal.
   useEffect(() => {
     const focusComposer = () => {
-      document.querySelector<HTMLElement>("[data-c34-composer]")?.focus();
+      shellRef.current?.querySelector<HTMLElement>("[data-c34-composer]")?.focus();
     };
     const inTextField = (t: EventTarget | null): boolean => {
       if (!(t instanceof Element)) return false;
@@ -940,8 +1131,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         return;
       }
       if (threadId) {
-        const surfaces: Array<[ShortcutActionId, () => void]> = [
-          ["togglePanel", () => chatPanel.toggle(threadId)],
+        const builtInSurfaces: Array<[ShortcutActionId, () => void]> = panelExtensions?.exclusive ? [] : [
           ["panelDiff", () => chatPanel.toggle(threadId, "diff")],
           ["panelPreview", () => {
             const current = panel.surfaces.find((item) => item.id === panel.activeId);
@@ -951,6 +1141,11 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
           ["panelFiles", () => chatPanel.toggle(threadId, "files")],
           ["panelTerminal", () => chatPanel.toggle(threadId, "terminal")],
           ["panelOverview", () => chatPanel.toggle(threadId, "overview")],
+          ["panelAgents", () => chatPanel.toggle(threadId, "agents")],
+        ];
+        const surfaces: Array<[ShortcutActionId, () => void]> = [
+          ["togglePanel", () => (panelExtensions ? togglePanelWithExtensions(threadId, panelExtensions) : chatPanel.toggle(threadId))],
+          ...builtInSurfaces,
         ];
         const action = surfaces.find(([id]) => hit(id))?.[1];
         if (action) {
@@ -972,6 +1167,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         if (readingPrefsOpen) { setReadingPrefsOpen(false); focusComposer(); return; }
         if (infoDrawerOpen) { setInfoDrawerOpen(false); focusComposer(); return; }
         if (bottomPanelOpen) { setBottomPanelOpen(false); focusComposer(); return; }
+        if (dockRepliesOpen) { setDockRepliesOpen(false); return; }
         if (rightPanelOpen && panel.maximized) { chatPanel.setMaximized(threadId, false); return; }
         focusComposer();
         return;
@@ -988,7 +1184,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [startNewChat, shortcutsHelpOpen, detailsPayload, infoDrawerOpen, readingPrefsOpen, rightPanelOpen, bottomPanelOpen, mobileSidebarOpen, threadId, panel, toggleSidebarCollapsed]);
+  }, [startNewChat, shortcutsHelpOpen, detailsPayload, infoDrawerOpen, readingPrefsOpen, rightPanelOpen, bottomPanelOpen, mobileSidebarOpen, threadId, panel, toggleSidebarCollapsed, panelExtensions, dockRepliesOpen]);
 
   // #134: the dialog restores focus to its opener on the next frame; land on the
   // composer one frame later so closing help always returns to typing.
@@ -999,7 +1195,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     let inner = 0;
     const outer = window.requestAnimationFrame(() => {
       inner = window.requestAnimationFrame(() => {
-        document.querySelector<HTMLElement>("[data-c34-composer]")?.focus();
+        shellRef.current?.querySelector<HTMLElement>("[data-c34-composer]")?.focus();
       });
     });
     return () => {
@@ -1075,6 +1271,9 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
 
   // Restore the composer for the active draft key (thread or new-chat id).
   useEffect(() => {
+    // Activity reconnects effects when chat becomes visible. Its retained
+    // composer already owns this draft; only a new draft or identity rehydrates.
+    if (hydratedDraftRef.current?.draftKey === draftKey && hydratedDraftRef.current.storageScope === storageScope) return;
     const previous = composerSnapshotRef.current;
     if (composerStorageScopeRef.current === storageScope && previous.draftKey && previous.draftKey !== draftKey) {
       writeComposerDraft(previous.draftKey, {
@@ -1100,6 +1299,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     // A newly opened thread must not persist the previous thread's selection
     // while its view is loading. Missing draft fields are empty, not inherited.
     setCredentialId(""); setRuntimeKey(""); setModel(""); setEffort(""); setAccessMode("supervised"); setInteractionMode("default");
+    if (!threadId) setMode(defaultMode);
     const { draft, attachments: nextAttachments, restoredNeedsReselect } = hydrateComposerDraft(draftKey);
     if (draft) {
       const doc = promptDocumentFromDraft(draft);
@@ -1136,7 +1336,6 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         } else {
           setProjectId("");
         }
-        setMode("conversation");
         const recent = readChatLastSelection();
         setCredentialId(recent?.credentialId || "");
         setRuntimeKey(recent?.runtimeKey || "");
@@ -1153,8 +1352,21 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     setHistoryIndex(null);
     historyIndexRef.current = null;
     historyScratchRef.current = null;
+    const release = window.setTimeout(() => {
+      draftHydratingRef.current = false;
+      hydratedDraftRef.current = { draftKey, storageScope };
+      setHydratedDraftKey(draftKey);
+    }, 0);
+    return () => window.clearTimeout(release);
+  }, [draftKey, threadId, storageScope, draftRuntimeFields, defaultMode]);
+
+  // File recovery may be interrupted while chat is hidden. Resume it separately
+  // without resetting the model, workspace, or the rest of the retained draft.
+  useEffect(() => {
+    if (!desktopChatBridge()) return;
+    const { attachments: nextAttachments } = hydrateComposerDraft(draftKey);
     let restoring = true;
-    if (desktopChatBridge()) void restoreComposerDraftAttachments(draftKey).then((restored) => {
+    void restoreComposerDraftAttachments(draftKey).then((restored) => {
       if (!restoring || composerSnapshotRef.current.draftKey !== draftKey) return;
       if (restored.restoredNeedsReselect) setNotice("部分附件无法从桌面缓存恢复，请重新选择后再发送");
       setAttachments((current) => current.map((item) => {
@@ -1163,12 +1375,8 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         return original && !item.file && replacement?.file && item.name === original.name ? { ...item, ...replacement } : item;
       }));
     });
-    const release = window.setTimeout(() => {
-      draftHydratingRef.current = false;
-      setHydratedDraftKey(draftKey);
-    }, 0);
-    return () => { restoring = false; window.clearTimeout(release); };
-  }, [draftKey, threadId, storageScope, draftRuntimeFields]);
+    return () => { restoring = false; };
+  }, [draftKey, storageScope, setNotice]);
 
   // Persist composer state per draft key (debounced inside the store).
   useEffect(() => {
@@ -1503,7 +1711,13 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   const probeCredentialRef = useRef(credentialId);
   probeCredentialRef.current = credentialId;
   const projectLoadSeqRef = useRef(0);
+  // Preview data never selects a runtime, credential or project.
+  const previewModeRef = useRef(Boolean(preview));
+  previewModeRef.current = Boolean(preview);
+  const metadataScopeRef = useRef(storageScope);
   useEffect(() => {
+    if (metadataScopeRef.current === storageScope) return;
+    metadataScopeRef.current = storageScope;
     ++runtimeLoadSeqRef.current; ++credentialLoadSeqRef.current; ++projectLoadSeqRef.current;
     setRuntimes([]); setCredentials([]); setProjects([]);
     setRuntimeSource(sourceLoading()); setCredentialSource(sourceLoading()); setProjectSource(sourceLoading());
@@ -1513,6 +1727,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   useEffect(() => { ++probeGenerationRef.current; setProjectCreating(false); setPendingSendQuery(false); setProbing(false); }, [commandScope]);
   const loadRuntimes = useCallback(async (opts?: { silent?: boolean }) => {
     const requestSeq = ++runtimeLoadSeqRef.current;
+    if (previewModeRef.current) { setRuntimeSource(sourceOk()); return; }
     const ownerScope = conversationStorageScope();
     if (!opts?.silent) setRuntimeSource(sourceLoading());
     try {
@@ -1530,6 +1745,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
 
   const loadCredentials = useCallback(async (opts?: { fresh?: boolean; silent?: boolean }) => {
     const requestSeq = ++credentialLoadSeqRef.current;
+    if (previewModeRef.current) { setCredentialSource(sourceOk()); return; }
     const ownerScope = conversationStorageScope();
     if (!opts?.silent) setCredentialSource(sourceLoading());
     try {
@@ -1551,6 +1767,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
 
   const loadProjects = useCallback(async (opts?: { silent?: boolean }) => {
     const requestSeq = ++projectLoadSeqRef.current;
+    if (previewModeRef.current) { setProjectSource(sourceOk()); return; }
     const ownerScope = conversationStorageScope();
     if (!opts?.silent) setProjectSource(sourceLoading());
     try {
@@ -1588,14 +1805,16 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     void loadCredentials({ silent: true });
   }, [threadId, completedModelTurnSeq, loadCredentials]);
 
+  // Initial/scope-change state is already loading. On reveal, revalidate in the
+  // background so an existing selection never passes through empty/loading UI.
   useEffect(() => {
-    void loadRuntimes();
+    void loadRuntimes({ silent: true });
   }, [loadRuntimes, storageScope]);
   useEffect(() => {
-    void loadCredentials();
+    void loadCredentials({ silent: true });
   }, [loadCredentials, storageScope]);
   useEffect(() => {
-    void loadProjects();
+    void loadProjects({ silent: true });
   }, [loadProjects, storageScope]);
 
   // Recheck after returning from Agents / host CLI login without wiping drafts.
@@ -1749,6 +1968,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     const ownerThread = threadId;
     const ownerScope = conversationStorageScope();
     setMemory(null);
+    if (preview) { setMemoryLoading(false); return; }
     if (!ownerThread) { setMemoryLoading(false); return; }
     setMemoryLoading(true);
     try {
@@ -1760,7 +1980,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     } finally {
       if (request === memoryRequestSeqRef.current && ownerScope === conversationStorageScope()) setMemoryLoading(false);
     }
-  }, [threadId, setError]);
+  }, [preview, threadId, setError]);
 
   useEffect(() => { void loadMemory(); return () => { ++memoryRequestSeqRef.current; }; }, [loadMemory, storageScope]);
 
@@ -1952,23 +2172,29 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       && selectedCredential
       && credential.engine !== selectedCredential.engine,
     );
+    const targetModel = credential ? allCredentialModels(credential).find((row) => row.id === params.model) : undefined;
+    const bindingChanged = params.credentialId !== credentialId || params.model !== model || (runtime?.key || "") !== runtimeKey;
+    const memoryScope = `${params.credentialId}:${runtime?.key || ""}`;
+    const requestedEffort = params.effort ?? (bindingChanged ? rememberedModelEffort(memoryScope, targetModel) : effort);
+    const nextEffort = validModelEffort(targetModel, requestedEffort) ? requestedEffort : "";
+    if (params.effort !== undefined && targetModel) rememberModelEffort(memoryScope, targetModel, nextEffort);
     setCredentialId(params.credentialId);
     setModel(params.model);
     setRuntimeKey(runtime?.key || "");
-    if (params.effort !== undefined) setEffort(params.effort);
+    setEffort(nextEffort);
     if (params.serviceTier !== undefined) setServiceTier(params.serviceTier);
     if (params.accessMode !== undefined) setAccessMode(params.accessMode);
     restoredBindingContextRef.current = { draftKey, projectId };
     writeChatLastSelection({
       credentialId: params.credentialId, modelId: params.model,
-      runtimeKey: runtime?.key || "", effort: params.effort ?? effort,
+      runtimeKey: runtime?.key || "", effort: nextEffort,
       accessMode: params.accessMode ?? accessMode,
     });
     if (engineChanged) {
       invalidateComposerReferences("Agent 引擎已改变，请在当前引擎重新选择引用");
       setNotice("原引用与快照已保留，但未验证新引擎能使用；发送前请重新选择或明确移除引用", "warning");
     }
-  }, [credentials, descriptors, runtimes, runtimeKey, selectedCredential, invalidateComposerReferences, draftKey, projectId, effort, accessMode, setNotice]);
+  }, [credentials, credentialId, model, descriptors, runtimes, runtimeKey, selectedCredential, invalidateComposerReferences, draftKey, projectId, effort, accessMode, setNotice]);
 
   const runtimePickerOwnerRef = useRef({ storageScope, draftKey, credentialId });
   runtimePickerOwnerRef.current = { storageScope, draftKey, credentialId };
@@ -2099,19 +2325,23 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     }
   }, [projectId, savingProjectDefault, setError, setNotice]);
 
-  const [workspaceAccess, setWorkspaceAccess] = useState<{
-    context: ComposerCapabilityContext; modes: string[]; notes: Record<string, string>; error?: string;
-  } | null>(null);
+  type WorkspaceAccess = { modes: string[]; notes: Record<string, string>; error?: string };
+  const workspaceAccessContextKey = JSON.stringify([storageScope, composerCapabilityContext]);
+  const [workspaceAccess, setWorkspaceAccess] = useState<Record<string, WorkspaceAccess>>({});
   useEffect(() => {
     if (!composerCapabilityContext) return;
     const controller = new AbortController();
     void fetchComposerCapabilities(composerCapabilityContext, "/", "", controller.signal).then((catalog) => {
-      if (!controller.signal.aborted) setWorkspaceAccess({ context: composerCapabilityContext, modes: catalog.accessModes, notes: catalog.accessModeNotes });
+      if (!controller.signal.aborted) setWorkspaceAccess((current) => ({ ...current,
+        [workspaceAccessContextKey]: { modes: catalog.accessModes, notes: catalog.accessModeNotes },
+      }));
     }).catch((failure) => {
-      if (!controller.signal.aborted) setWorkspaceAccess({ context: composerCapabilityContext, modes: [], notes: {}, error: failure instanceof Error ? failure.message : String(failure) });
+      if (!controller.signal.aborted) setWorkspaceAccess((current) => ({ ...current,
+        [workspaceAccessContextKey]: { modes: [], notes: {}, error: failure instanceof Error ? failure.message : String(failure) },
+      }));
     });
     return () => controller.abort();
-  }, [composerCapabilityContext, storageScope]);
+  }, [composerCapabilityContext, workspaceAccessContextKey]);
   // Runtimes such as Droid spend many seconds booting before they accept the
   // first request; start that process while the user is still typing.
   const prewarmWorkspaceId = !threadId && mode === "conversation" && workspaceMode === "shared_checkout"
@@ -2134,12 +2364,13 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     }, 800);
     return () => { window.clearTimeout(timer); controller.abort(); };
   }, [draftKey, hydratedDraftKey, model, prewarmWorkspaceId, selectedCredential?.id, selectedRuntime?.adapter_id, selectedRuntime?.instance_id]);
-  const currentWorkspaceAccess = workspaceAccess?.context === composerCapabilityContext ? workspaceAccess : null;
+  const currentWorkspaceAccess = workspaceAccess[workspaceAccessContextKey];
   const accessModes = currentWorkspaceAccess?.modes || [];
   const accessModeReason = currentWorkspaceAccess?.notes[accessMode] || "已保存的权限模式在当前工作区不可用，请明确选择其他模式。";
-  const accessModeIssue = !currentWorkspaceAccess
-    ? "正在确认当前工作区可用的权限模式，请稍后发送。"
-    : currentWorkspaceAccess.error || (accessModes.length > 0 && !accessModes.includes(accessMode) ? accessModeReason : "");
+  // The backend validates permissions when accepting the send. A pending catalog
+  // refresh must not discard a click or change the user's saved access mode.
+  const accessModeIssue = currentWorkspaceAccess?.error
+    || (accessModes.length > 0 && !accessModes.includes(accessMode) ? accessModeReason : "");
 
   // Sync default runtime & model when credential changes in new-thread mode
   useEffect(() => {
@@ -2207,36 +2438,49 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     matrix: threadMatrix,
   });
   const providerPreviewKey = JSON.stringify([providerScope, viewRuntimeKey, viewCredentialId, providerPreview]);
-  const providerSwitchNotice = providerPreview
+  const providerSwitchNotice = preview ? "" : providerPreview
     ? (dismissedProviderPreview === providerPreviewKey ? "" : providerPreview)
     : (viewThreadId === threadId ? handoffNotice : "");
 
-  // C38: only show a session rebuild response for the selection/session that
-  // produced it; a late response from the previous provider cannot overwrite it.
-  const latestRuntimeSwitchEvent = useConversationStreamSelector(
+  // Only the latest lifecycle event for this selection/session may set or clear
+  // its notice. Other events in the same SSE batch must not hide delivery proof.
+  const latestRuntimeHandoffNotice = useConversationStreamSelector(
     conversation.stream,
     streamThreadId,
     (snapshot) => {
-      const latest = snapshot.events.at(-1);
-      return latest?.event_type === "core.thread.runtime_switched" ? latest : null;
+      let latestTurnId = "";
+      for (let index = snapshot.events.length - 1; index >= 0; index--) {
+        const event = snapshot.events[index];
+        const payload = (event.payload || {}) as Record<string, unknown>;
+        if (event.event_type === "core.turn.started"
+          && viewThreadId === threadId
+          && conversation.view?.state.agent_session_id
+          && payload.agent_session_id === conversation.view.state.agent_session_id) {
+          latestTurnId ||= String(payload.turn_id || "");
+        }
+        if (event.event_type !== "core.thread.runtime_switched") continue;
+        const update = runtimeHandoffNoticeUpdate({
+          threadId,
+          viewThreadId,
+          runtimeKey,
+          credentialId,
+          model,
+          sessionId: conversation.view?.state.agent_session_id,
+          payload,
+        });
+        if (update !== null) {
+          // Delivery is emitted before its own turn.started acknowledgement.
+          // Preserve that batch, then retire the banner on the next reused turn.
+          return update && latestTurnId && latestTurnId !== payload.handoff_delivery_turn_id ? "" : update;
+        }
+      }
+      return latestTurnId ? "" : null;
     },
   );
   useEffect(() => {
-    if (!latestRuntimeSwitchEvent) return;
-    const text = runtimeHandoffNotice({
-      threadId,
-      viewThreadId,
-      runtimeKey,
-      credentialId,
-      model,
-      sessionId: conversation.view?.state.agent_session_id,
-      payload: (latestRuntimeSwitchEvent.payload || {}) as Record<string, unknown>,
-    });
-    if (text) setHandoffNotice(text);
+    if (latestRuntimeHandoffNotice !== null) setHandoffNotice(latestRuntimeHandoffNotice);
   }, [
-    latestRuntimeSwitchEvent,
-    threadId, viewThreadId, runtimeKey, credentialId, model,
-    conversation.view?.state.agent_session_id, setHandoffNotice,
+    latestRuntimeHandoffNotice, setHandoffNotice,
   ]);
 
   const running = Boolean(conversation.view?.state.running_turn_id);
@@ -2276,11 +2520,16 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   );
   const sidebarThreads = useMemo(() => {
     const view = conversation.view;
-    if (!view || view.thread.thread_id !== threadId) return threads;
     // The new thread view can arrive before the inbox/list refresh. Insert it
     // immediately with its persisted project so its folder and count agree.
-    return upsertConversationThread(threads, { ...view.thread, state: view.state });
-  }, [conversation.view, threadId, threads]);
+    const rows = view && view.thread.thread_id === threadId
+      ? upsertConversationThread(threads, { ...view.thread, state: view.state })
+      : threads;
+    return experience?.threadFilter ? rows.filter(experience.threadFilter) : rows;
+  }, [conversation.view, threadId, threads, experience?.threadFilter]);
+  const sidebarProjects = useMemo(() => (
+    experience?.hideProjects ? [] : projects
+  ), [experience?.hideProjects, projects]);
 
   // 打开对话时后端会 mark_read；回合结束后同步侧栏转圈 / 未读点。
   useEffect(() => {
@@ -2453,7 +2702,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     if (name === "help") {
       const text = `/${args}`;
       setPrompt(text); setPromptDocument(documentFromPromptAndRefs(text, []));
-      requestAnimationFrame(() => document.querySelector<HTMLElement>("[data-c34-composer]")?.focus());
+      requestAnimationFrame(() => shellRef.current?.querySelector<HTMLElement>("[data-c34-composer]")?.focus());
       return;
     }
     if (["model", "effort", "permissions"].includes(name)) {
@@ -2461,9 +2710,16 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         handleSelectModelParams({ credentialId, model: args }); setNotice(`已选择模型 ${args}`); return;
       }
       if (args && name === "effort" && selectedCredential && validModelEffort(allCredentialModels(selectedCredential).find((m) => m.id === model), args)) {
-        setEffort(args); setNotice(`已设置思考强度 ${args}`); return;
+        handleSelectModelParams({ credentialId, model, effort: args }); setNotice(`已设置思考强度 ${args}`); return;
       }
-      setModelPickerOpen(true);
+      if (name === "effort") {
+        if (modelEffortLevels(selectedCredential ? allCredentialModels(selectedCredential).find((row) => row.id === model) : undefined).length) setEffortPickerOpen(true);
+        else { setNotice("当前模型没有可选的思考档位"); return; }
+      } else if (name === "permissions") {
+        if (accessModes.length) setAccessPickerOpen(true);
+        else { setNotice("当前 Agent 没有可选的权限模式"); return; }
+      }
+      else setModelPickerOpen(true);
       if (args) setNotice("请在选择器中确认当前引擎支持的设置");
       return;
     }
@@ -2498,13 +2754,55 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
 
   // Send message or Create Thread + Send (C02: stable idempotent intent)
   const handleSend = async () => {
+    const text = plainTextFromDocument(promptDocument).trim();
+    if (preview) {
+      if (!text || busy) return;
+      const suffix = Date.now().toString(36);
+      const turnId = `preview-turn-${suffix}`;
+      const messageId = `preview-message-${suffix}`;
+      const createdAt = new Date().toISOString();
+      setPreviewView((current) => current ? {
+        ...current,
+        messages: [...current.messages, {
+          message_id: messageId,
+          turn_id: turnId,
+          role: "user",
+          kind: "message",
+          text,
+          stream_seq: current.event_watermark + 1,
+          created_at: createdAt,
+        }],
+        turns: [...current.turns, {
+          turn_id: turnId,
+          kind: "user",
+          status: "completed",
+          text,
+          created_at: createdAt,
+          completed_at: createdAt,
+        }],
+        messages_page: {
+          ...(current.messages_page || { limit: 50, has_more_before: false, has_more_after: false }),
+          newest_stream_seq: current.event_watermark + 1,
+          newest_message_id: messageId,
+        },
+        watermark: current.watermark + 1,
+        event_watermark: current.event_watermark + 1,
+      } : current);
+      setPromptDocument(emptyPromptDocument());
+      setPrompt("");
+      setAttachments([]);
+      setCapabilityRefs([]);
+      // An explicit empty notice means the host already labels the simulation.
+      if (preview.notice !== "") setNotice(preview.notice || "演示消息已加入当前预览，不会发送请求或运行工具。", "success");
+      preview.onSend?.(text);
+      return;
+    }
     if (accessModeIssue) { setError(accessModeIssue); return; }
     const ownerScope = conversationStorageScope();
     const ensureOwner = () => { if (conversationStorageScope() !== ownerScope) throw new Error("conversation.scope_changed: 服务身份已改变，原发送身份保留在原范围"); };
     const activeContext = activeSendContextRef.current;
     if (activeContext.draftKey !== draftKey) return;
     if (threadId && activeContext.viewThreadId !== threadId) return;
-    const text = plainTextFromDocument(promptDocument).trim();
     const unresolved = refsFromDocument(promptDocument).find((node) => node.status !== "ok");
     if (unresolved) { setError(`引用“${unresolved.name}”尚未按当前项目和引擎确认。${unresolved.status_reason || "请重新选择或移除后发送"}`); return; }
     if (["/clear", "/new", "/clear-input"].includes(text)) {
@@ -2554,6 +2852,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
 
     await execute(async () => {
       let target = threadId;
+      let createdHref: string | undefined;
       const cred = selectedCredential;
       if (!cred || !credentialAvailable(cred)) {
         throw new Error("请选择可用的 Agent 接入点；可前往设置 → Agents 配置");
@@ -2690,22 +2989,28 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
             }
 
             updateSendIntent(draftKey, { pendingCommandId: intent.createCommandId, pendingPhase: "creating_thread" });
-            target = await createConversationThread(
-              {
-                title: "新对话",
-                title_source: "fallback",
-                mode,
-                ...(selectedProject ? {
-                  project_id: selectedProject.project_id,
-                  workspace_id: workspaceId,
-                } : {}),
-                runtime: runtimePayload,
-              },
-              {
-                commandId: intent.createCommandId,
-                idempotencyKey: intent.createCommandId,
-              },
-            );
+            const createInput: Parameters<typeof createConversationThread>[0] = {
+              title: "新对话",
+              title_source: "fallback",
+              mode,
+              ...(selectedProject ? {
+                project_id: selectedProject.project_id,
+                workspace_id: workspaceId,
+              } : {}),
+              runtime: runtimePayload,
+            };
+            const createOptions = {
+              commandId: intent.createCommandId,
+              idempotencyKey: intent.createCommandId,
+            };
+            if (experience?.createThread) {
+              const created = await experience.createThread(createInput, createOptions, { promptText: text });
+              target = created.threadId;
+              createdHref = created.href;
+              if (!target.trim()) throw new Error("创建会话未返回有效的会话 ID");
+            } else {
+              target = await createConversationThread(createInput, createOptions);
+            }
             ensureOwner();
             updateSendIntent(draftKey, { threadId: target, phase: "uploading", pendingCommandId: undefined, pendingPhase: undefined });
           }
@@ -2805,9 +3110,10 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
             client_message_id: intent.clientMessageId,
             attachments: attachmentHashes,
             runtime: runtimePayload,
-            capability_refs: intent.capabilityRefs?.length
-              ? intent.capabilityRefs
-              : structuredRefs,
+            capability_refs: [
+              ...(intent.capabilityRefs ?? []),
+              ...(experience?.composerRefs?.() ?? []),
+            ].length ? [...(intent.capabilityRefs ?? []), ...(experience?.composerRefs?.() ?? [])] : structuredRefs,
           },
           {
             commandId: intent.sendCommandId,
@@ -2815,6 +3121,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
           },
         );
         ensureOwner();
+        experience?.onSent?.();
         const receiptState = String(sendReceipt.state || "accepted");
         updateSendIntent(draftKey, {
           phase: "accepted",
@@ -2880,7 +3187,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
             });
             flushComposerDraftStore();
           }
-          router.push(`/chat/${encodeURIComponent(target)}`);
+          router.push(createdHref ?? threadHref(target));
         }
       } catch (exc) {
         const message = formatSendFailureMessage(exc, { keepDraft: true });
@@ -2998,7 +3305,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       return next;
     });
     if (panelSheet && threadId) chatPanel.close(threadId);
-    window.requestAnimationFrame(() => document.querySelector<HTMLElement>("[data-c34-composer]")?.focus());
+    window.requestAnimationFrame(() => shellRef.current?.querySelector<HTMLElement>("[data-c34-composer]")?.focus());
   }, [panelSheet, threadId]);
 
   const handleJumpToContext = useCallback((payload: {
@@ -3298,7 +3605,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
           );
           const forkedId = receipt.aggregate?.id;
           if (forkedId) {
-            router.push(`/chat/${encodeURIComponent(forkedId)}`);
+            router.push(threadHref(forkedId));
           }
         });
         return;
@@ -3352,7 +3659,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         closeImpact();
         const forkedId = receipt.aggregate?.id;
         if (forkedId) {
-          router.push(`/chat/${encodeURIComponent(forkedId)}`);
+          router.push(threadHref(forkedId));
         }
         setNotice("已 Fork；源 Thread 保留，当前共享工作区", "success");
         return;
@@ -3460,6 +3767,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
   const threadArchived = Boolean(threadId && isThreadArchived(threadId));
 
   const runArchiveCommand = async (target: string, archived: boolean) => {
+    if (preview) throw new Error("演示数据只读，不会修改真实会话。");
     const commandType = archived
       ? "conversation.thread.unarchive"
       : "conversation.thread.archive";
@@ -3559,6 +3867,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
 
   // Rename thread
   const handleRename = (tId: string, newTitle: string) => {
+    if (preview) { setNotice("演示数据只读，不会修改真实会话。", "warning"); return; }
     if (!tId || !newTitle.trim()) return;
     void execute(async () => {
       await sendConversationCommand(tId, "conversation.thread.rename", {
@@ -3571,7 +3880,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
 
   const sidebarSelectThread = useLatestCallback((id: string) => {
     setMobileSidebarOpen(false);
-    router.push(`/chat/${encodeURIComponent(id)}`);
+    router.push(threadHref(id));
   });
   const sidebarNewChat = useLatestCallback(() => {
     startNewChat();
@@ -3594,7 +3903,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     // Push jump-back before C07 deep-link navigation; leave search/href intact.
     pushJumpBackFromThread(threadId);
     setMobileSidebarOpen(false);
-    router.push(buildThreadMessageHref(nextThreadId, messageId));
+    router.push(threadMessageHref(nextThreadId, messageId));
   });
 
     // Approval decision — always bind to the card's approval_id (C23).
@@ -3700,6 +4009,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
 
   // Add memory
   const handleAddMemory = async (content: string) => {
+    if (preview) { setNotice("演示数据只读，不会写入长期记忆。", "warning"); return; }
     if (!threadId) return;
     const ownerScope = conversationStorageScope();
     await recordConversationMemory(threadId, content);
@@ -3710,6 +4020,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
 
   // Delete memory
   const handleDeleteMemory = async (memId: string) => {
+    if (preview) { setNotice("演示数据只读，不会删除长期记忆。", "warning"); return; }
     if (!threadId) return;
     const ownerScope = conversationStorageScope();
     await deleteConversationMemory(threadId, memId);
@@ -3753,6 +4064,40 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       return documentFromPromptAndRefs(next, refsFromDocument(current));
     });
   };
+
+  const appendComposerTextRef = useRef(appendComposerText);
+  appendComposerTextRef.current = appendComposerText;
+  const dockFocusRef = useRef(dockFocus);
+  dockFocusRef.current = dockFocus;
+  const composerHandle = previewHost?.composerHandle;
+  useEffect(() => {
+    if (!composerHandle) return;
+    const focusEnd = () => window.requestAnimationFrame(() => {
+      const editor = shellRef.current?.querySelector<HTMLElement>("[data-c34-composer]");
+      if (!editor) return;
+      editor.focus({ preventScroll: true });
+      if (editor instanceof HTMLTextAreaElement) {
+        editor.setSelectionRange(editor.value.length, editor.value.length);
+        return;
+      }
+      const selection = window.getSelection();
+      if (!selection) return;
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      range.collapse(false);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    });
+    composerHandle.current = {
+      insertText: (text, options) => {
+        appendComposerTextRef.current(text);
+        if (options?.focus !== false) focusEnd();
+      },
+      focus: focusEnd,
+      showReplies: () => { if (dockFocusRef.current) setDockRepliesOpen(true); },
+    };
+    return () => { composerHandle.current = null; };
+  }, [composerHandle]);
 
   const handleRetryAttachment = (index: number) => {
     const attachment = attachments[index];
@@ -3851,11 +4196,20 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     : (projectSource.phase === "error" ? (projectSource.message || "项目加载失败") : "");
 
   const activeSurface = panel.surfaces.find((item) => item.id === panel.activeId);
-  const panelMaximized = rightPanelOpen && panel.maximized && !panelSheet;
+  const panelMaximized = rightPanelOpen && panel.maximized && !panelSheet && !dockFocus;
   const hasWorkspace = Boolean(conversation.view?.workspace?.root_path);
+  const subagentCounts = threadSubagentCounts(conversation.view?.state);
+  const agentsPanelShown = rightPanelOpen && activeSurface?.kind === "agents";
+  const openAgentsPanel = () => {
+    if (!threadId) return;
+    setDetailsPayload(null);
+    chatPanel.open(threadId, "agents");
+  };
   const panelControls = conversation.view && threadId ? (
-    <div ref={panelControlsRef} className="flex items-center gap-0.5" data-testid="conversation-panel-controls">
+    <div ref={panelControlsRef} className="flex items-center gap-1" data-testid="conversation-panel-controls">
+      {experience?.headerActions}
       <IconButton
+        size="md"
         ref={detailsButtonRef}
         icon="alignJustify"
         label={threadDetails.visible ? "隐藏对话详情" : "显示对话详情"}
@@ -3864,26 +4218,48 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         data-testid="thread-details-toggle"
         onClick={threadDetails.toggle}
       />
+      {!panelExtensions?.exclusive ? (
+        <IconButton
+          size="md"
+          icon="gitCompare"
+          label="变更"
+          shortcut="mod+alt+d"
+          active={rightPanelOpen && activeSurface?.kind === "diff"}
+          disabled={!hasWorkspace && !(conversation.view.artifacts || []).length}
+          onClick={() => { setDetailsPayload(null); chatPanel.toggle(threadId, "diff"); }}
+        />
+      ) : null}
+      {subagentCounts.total ? (
+        <IconButton
+          size="md"
+          icon="bot"
+          label={subagentCounts.active ? `子代理 · ${subagentCounts.active} 个进行中` : `子代理 · 共 ${subagentCounts.total} 个`}
+          shortcut="mod+alt+a"
+          active={agentsPanelShown}
+          badge={subagentCounts.active && !agentsPanelShown ? subagentCounts.active : undefined}
+          data-testid="conversation-agents-toggle"
+          onClick={() => { setDetailsPayload(null); chatPanel.toggle(threadId, "agents"); }}
+        />
+      ) : null}
       <IconButton
-        icon="gitCompare"
-        label="变更"
-        shortcut="mod+alt+d"
-        active={rightPanelOpen && activeSurface?.kind === "diff"}
-        disabled={!hasWorkspace && !(conversation.view.artifacts || []).length}
-        onClick={() => { setDetailsPayload(null); chatPanel.toggle(threadId, "diff"); }}
-      />
-      <IconButton
+        size="md"
         icon={rightPanelOpen ? "panelRightClose" : "panelRightOpen"}
         label={rightPanelOpen ? "关闭工作面板" : "打开工作面板"}
         shortcut="mod+alt+b"
         active={rightPanelOpen}
         badge={runningToolCount > 0 && !rightPanelOpen ? runningToolCount : undefined}
-        onClick={() => { setDetailsPayload(null); chatPanel.toggle(threadId); }}
+        onClick={() => {
+          setDetailsPayload(null);
+          if (panelExtensions) togglePanelWithExtensions(threadId, panelExtensions);
+          else chatPanel.toggle(threadId);
+        }}
       />
     </div>
   ) : null;
 
   return (
+    <ConversationLocalPreviewContext.Provider value={Boolean(preview)}>
+    <PanelExtensionContext.Provider value={panelExtensions}>
     <ConversationNavigationContext.Provider value={navigation}>
     <ThreadEditorProvider view={conversation.view}>
     <>
@@ -3893,6 +4269,10 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       data-sidebar-collapsed={sidebarCollapsed ? "true" : "false"}
       data-mobile-sidebar-open={mobileSidebarOpen ? "true" : "false"}
       data-panel-open={rightPanelOpen ? "true" : "false"}
+      data-panel-docked={dockFocus ? "true" : undefined}
+      style={dockFocus
+        ? ({ "--cx-panel-dock-inset": `${dockInset + (dockRepliesOpen ? dockReplyHeight : 0)}px` } as React.CSSProperties)
+        : undefined}
     >
       {/* Hidden file input */}
       <input
@@ -3913,20 +4293,24 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
 
       {/* Left Sidebar */}
       <ConversationSidebar
+        sidebarId={sidebarId}
+        threadHref={threadHref}
+        labels={experience?.sidebarLabels}
+        restrictSearchToThreads={Boolean(experience?.threadFilter)}
         threads={sidebarThreads}
-        projects={projects}
+        projects={sidebarProjects}
         activeThreadId={threadId}
         onSelectThread={sidebarSelectThread}
         onNewChat={sidebarNewChat}
-        onNewChatForProject={sidebarNewChatForProject}
-        onCreateFolder={sidebarCreateFolder}
+        onNewChatForProject={experience?.hideProjects ? undefined : sidebarNewChatForProject}
+        onCreateFolder={experience?.hideProjects ? undefined : sidebarCreateFolder}
         searchQuery={searchQuery}
         onSearchChange={setSearchQuery}
-        onRenameThread={sidebarRenameThread}
-        onRenameThreadTitle={sidebarRenameThreadTitle}
-        onForkThread={sidebarForkThread}
-        onArchiveThread={sidebarArchiveThread}
-        onArchiveProjectThreads={sidebarArchiveProjectThreads}
+        onRenameThread={preview ? undefined : sidebarRenameThread}
+        onRenameThreadTitle={preview ? undefined : sidebarRenameThreadTitle}
+        onForkThread={experience?.allowFork === false ? undefined : sidebarForkThread}
+        onArchiveThread={preview ? undefined : sidebarArchiveThread}
+        onArchiveProjectThreads={experience?.hideProjects ? undefined : sidebarArchiveProjectThreads}
         onSelectMessageHit={sidebarSelectMessageHit}
         onMarkThreadsRead={markThreadsRead}
         collapsed={sidebarCollapsed}
@@ -3950,27 +4334,29 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
       {/* Central Chat Area — inert while mobile sidebar overlay is open (#199) */}
       <main
         ref={mainRef}
-        id={CONVERSATION_MAIN_CONTENT_ID}
+        id={mainContentId}
         tabIndex={-1}
         className="ai-conv-main relative flex min-w-0 flex-1 flex-col overflow-hidden bg-cx-bg"
+        style={headerSlot ? ({ "--cx-header-h": "0px" } as React.CSSProperties) : undefined}
         aria-label="对话主内容"
         inert={mobileSidebarOpen || panelMaximized || undefined}
         aria-hidden={mobileSidebarOpen || panelMaximized || undefined}
       >
         {conversation.view ? (
           <>
-            <ConversationHeader
+            {renderHeader(<ConversationHeader
               view={conversation.view}
               projectName={activeProjectName}
               panelControls={panelControls}
               bottomPanelOpen={bottomPanelOpen}
               onToggleBottomPanel={() => setBottomPanelOpen((open) => !open)}
-              sidebarToggle={sidebarCollapsed ? (
+              className={headerSlot ? "h-full border-b-0 bg-transparent pr-0 sm:pr-0" : undefined}
+              sidebarToggle={sidebarCollapsed && !headerSlot ? (
                 <IconButton
                   icon="panelLeft"
                   label="展开对话导航"
                   aria-expanded={false}
-                  aria-controls="conversation-sidebar"
+                  aria-controls={sidebarId}
                   onClick={toggleSidebarCollapsed}
                   className="max-md:hidden"
                 />
@@ -3981,12 +4367,12 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
               onOpenReadingPrefs={() => setReadingPrefsOpen((v) => !v)}
               readingPrefsOpen={readingPrefsOpen}
               onOpenShortcuts={() => setShortcutsHelpOpen(true)}
-              onExport={() => setExportDialogOpen(true)}
-              onFork={() => handleFork(threadId)}
-              onRename={(newT) => handleRename(threadId, newT)}
-              onArchive={() => handleArchive(threadId)}
+              onExport={preview ? undefined : () => setExportDialogOpen(true)}
+              onFork={experience?.allowFork === false ? undefined : () => handleFork(threadId)}
+              onRename={preview ? undefined : (newT) => handleRename(threadId, newT)}
+              onArchive={preview ? undefined : () => handleArchive(threadId)}
               busy={interactionBusy}
-            />
+            />)}
             <ConversationThreadDetails
               view={conversation.view}
               projectName={activeProjectName}
@@ -4111,6 +4497,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         {/* Main Content Area: Landing Home / first-load error / Message Timeline */}
         {!threadId ? (
           <ConversationHome
+            {...experience?.home}
             prompt={prompt}
             onPromptChange={handlePromptChange}
             promptDocument={promptDocument}
@@ -4121,6 +4508,10 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
             selectedCredentialId={credentialId}
             selectedModel={model}
             selectedEffort={effort}
+            effortOpen={effortPickerOpen}
+            onEffortOpenChange={setEffortPickerOpen}
+            accessOpen={accessPickerOpen}
+            onAccessOpenChange={setAccessPickerOpen}
             selectedServiceTier={serviceTier}
             selectedAccessMode={accessMode}
             accessModes={accessModes}
@@ -4288,20 +4679,20 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
             onOpenDiffBaseline={openDiffBaseline}
             onOpenAttachment={openAttachmentPreview}
             onResourceLink={handleResourceLink}
-            onApprovalDecision={handleApprovalDecision}
-            onUserInputResolve={handleUserInputResolve}
+            onApprovalDecision={preview ? () => setNotice("演示数据只读，不会提交审批决定。", "warning") : handleApprovalDecision}
+            onUserInputResolve={preview ? async () => { setNotice("演示数据只读，不会提交输入。", "warning"); return false; } : handleUserInputResolve}
             threadId={threadId || ""}
-            onRetryTurn={handleRetry}
-            onEditTurn={handleEditTurn}
-            onRewindTurn={handleRewindTurn}
+            onRetryTurn={preview ? undefined : handleRetry}
+            onEditTurn={preview ? undefined : handleEditTurn}
+            onRewindTurn={preview ? undefined : handleRewindTurn}
             rewindDisabled={rewindDisabled}
             rewindReason={rewindReason}
             showSuperseded={showSuperseded}
-            onToggleSuperseded={handleToggleSuperseded}
+            onToggleSuperseded={preview ? undefined : handleToggleSuperseded}
             supersededTurns={auditTurns}
             supersededMessages={auditMessages}
-            onContinueTurn={handleResume}
-            onForkTurn={(tId) => handleFork(threadId, tId)}
+            onContinueTurn={preview ? undefined : handleResume}
+            onForkTurn={preview ? undefined : (tId) => handleFork(threadId, tId)}
             onCiteMessageSpan={handleCiteMessageSpan}
             jumpTarget={jumpTarget}
             onJumpTargetConsumed={() => setJumpTarget(null)}
@@ -4314,13 +4705,14 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
             suppressRestore={!shouldRestoreReadingPosition(rawMessageParam) || deepLinkDismissed}
             onEnsureMessageVisible={ensureMessageVisible}
             onOpenThread={(nextThreadId) => {
-              router.push(`/chat/${encodeURIComponent(nextThreadId)}`);
+              router.push(threadHref(nextThreadId));
             }}
             composerCompact={composerCompact}
             onComposerCompactChange={handleComposerCompactChange}
+            turnAccessory={previewHost?.turnAccessory}
             footer={
-              <div className="w-full">
-                {readinessForBanner.blockers.length ? (
+              <div ref={composerDockRef} className={cn("w-full", dockFocus && "bg-cx-bg")}>
+                {!preview && readinessForBanner.blockers.length ? (
                   <ConversationReadinessBanner
                     readiness={readinessForBanner}
                     probing={probing}
@@ -4385,6 +4777,30 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
                     子任务仍在后台运行，完成后会自动续接回复。
                   </Callout>
                 ) : null}
+                {!agentsPanelShown ? (
+                  <SubagentActivityPill active={subagentCounts.active} total={subagentCounts.total} onOpen={openAgentsPanel} />
+                ) : null}
+                {dockFocus ? (
+                  <div className="mb-2 flex min-w-0 items-center gap-2" data-testid="composer-dock-bar">
+                    <Button
+                      size="md"
+                      variant={dockRepliesOpen ? "soft" : "ghost"}
+                      icon={dockRepliesOpen ? "chevronDown" : "chevronUp"}
+                      aria-expanded={dockRepliesOpen}
+                      className="h-[32px]"
+                      onClick={() => setDockRepliesOpen((open) => !open)}
+                    >
+                      {dockRepliesOpen ? "收起回复" : "展开回复"}
+                    </Button>
+                    <span className="min-w-0 flex-1 truncate text-[13px] text-cx-fg-3">
+                      {dockRepliesOpen ? "回复显示在工作区下方，按 Esc 收起" : dockSnippet || "专注工作区：对话收在这条输入栏里"}
+                    </span>
+                    <Button size="md" variant="ghost" icon="minimize" className="h-[32px]" onClick={() => chatPanel.setMaximized(threadId, false)}>
+                      并排显示
+                    </Button>
+                  </div>
+                ) : null}
+                {experience?.composerAccessory}
                 <PromptBar
                   value={prompt}
                   onChange={handlePromptChange}
@@ -4409,8 +4825,10 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
                       ? "已归档 — 取消归档后可继续发送；草稿已保留"
                       : running
                         ? "输入消息，按 Enter 加入后续队列…"
-                        : "输入消息，按 Enter 发送…"
+                        : previewHost?.composerPlaceholder || "输入消息，按 Enter 发送…"
                   }
+                  localMentions={previewHost?.localMentions}
+                  customDrop={previewHost?.composerDrop}
                   attachments={attachments}
                   onAddAttachment={() => fileInputRef.current?.click()}
                   onAddFiles={handleAddFiles}
@@ -4429,13 +4847,16 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
                   {...stashRecallProps}
                   compact={composerCompact}
                   onRequestExpand={() => handleComposerCompactChange(false)}
-                  extraControls={
+                  extraControls={preview ? (
+                    previewHost?.composerControls ?? <span className="px-2 text-xs text-ink-3">演示数据 · 只读预览</span>
+                  ) : (
                     <div className="flex min-w-0 flex-1 items-center gap-1">
                       <ConversationModelPicker
                         credentials={credentials}
                         selectedCredentialId={credentialId}
                         selectedModel={model}
                         selectedEffort={effort}
+                        separateEffortControl
                         selectedServiceTier={serviceTier}
                         loading={credentialSource.phase === "loading"}
                         error={credentialsErrorText}
@@ -4448,12 +4869,19 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
                         onOpenChange={setModelPickerOpen}
                       />
                     </div>
-                  }
-                  contextMeter={
+                  )}
+                  contextMeter={preview ? null : (
                     <div className="flex min-w-0 items-center gap-0.5">
                       <ConversationComposerModes
                         selectedCredentialId={credentialId}
                         selectedModel={model}
+                        selectedModelMetadata={selectedCredential ? allCredentialModels(selectedCredential).find((row) => row.id === model) : undefined}
+                        selectedEffort={effort}
+                        selectedServiceTier={serviceTier}
+                        effortOpen={effortPickerOpen}
+                        onEffortOpenChange={setEffortPickerOpen}
+                        accessOpen={accessPickerOpen}
+                        onAccessOpenChange={setAccessPickerOpen}
                         selectedAccessMode={accessMode}
                         accessModes={accessModes}
                         accessModeReason={accessModeReason}
@@ -4487,7 +4915,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
                       )}
                       {speech.state === "listening" && desktopChatBridge() ? <button type="button" className="text-xs text-ink-3" onClick={speech.cancel}>取消</button> : null}
                     </div>
-                  }
+                  )}
                 />
                 {desktopChatBridge() && (speech.state === "listening" || speech.state === "processing") ? <p role="status" className="mt-2 whitespace-pre-wrap break-words text-xs text-ink-3">{speech.state === "processing" ? "正在整理识别结果…" : "正在使用 macOS 设备端语音识别；说完后点「完成录音」。"}{speech.partialTranscript ? `\n${speech.partialTranscript}` : ""}</p> : null}
                 {(speech.state === "error" || speech.state === "unsupported") && speech.errorMessage ? (
@@ -4496,7 +4924,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
                     {speech.permissionDenied && desktopChatBridge()?.openPermissionSettings ? <button type="button" className="ml-2 underline" onClick={() => void speech.openPermissionSettings()}>{speech.permissionKind === "speechRecognition" ? "打开系统语音识别设置" : "打开系统麦克风设置"}</button> : null}
                   </p>
                 ) : null}
-                <ComposerContextStrip
+                {!preview ? <ComposerContextStrip
                   projects={projects}
                   selectedProjectId={conversation.view.thread.project_id || ""}
                   onProjectChange={handleProjectChange}
@@ -4511,10 +4939,14 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
                   }
                   projectDisabled={true}
                   modeDisabled={true}
+                  onUnboundRecover={hasWorkspace ? undefined : () => startNewChat()}
                   trailing={(
                     <>
                       <ConversationStatsBar
                         variant="inline"
+                        threadId={threadId}
+                        usageRevision={completedModelTurnSeq}
+                        running={running}
                         statistics={conversation.view.statistics}
                         contextWindow={conversation.view.context_window}
                       />
@@ -4529,29 +4961,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
                       />
                     </>
                   )}
-                />
-                {!hasWorkspace && !unboundNoticeDismissed.has(threadId) ? (
-                  <Callout
-                    tone="warning"
-                    className="mt-2"
-                    testId="unbound-workspace-recovery"
-                    role="status"
-                    onDismiss={() => setUnboundNoticeDismissed((current) => new Set(current).add(threadId))}
-                    action={(
-                      <Button
-                        size="xs"
-                        variant="secondary"
-                        data-testid="unbound-workspace-new-chat"
-                        title="已开始的会话不能补绑目录，请新建会话并先选择目录"
-                        onClick={() => startNewChat()}
-                      >
-                        新建会话
-                      </Button>
-                    )}
-                  >
-                    未绑定工作目录，文件、终端和变更不可用。
-                  </Callout>
-                ) : null}
+                /> : null}
               </div>
             }
           />
@@ -4606,8 +5016,8 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         view={conversation.view}
         memory={memory}
         memoryLoading={memoryLoading}
-        onAddMemory={handleAddMemory}
-        onDeleteMemory={handleDeleteMemory}
+        onAddMemory={preview ? undefined : handleAddMemory}
+        onDeleteMemory={preview ? undefined : handleDeleteMemory}
       />
 
       {/* C32: Export Dialog */}
@@ -4667,9 +5077,12 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
         {legacyRecoveryError ? <p role="alert" className="text-xs text-cx-danger">{legacyRecoveryError}</p> : null}
       </Dialog>
 
-      <ConversationSearchDialog open={commandSessionsOpen} query={searchQuery} onQueryChange={setSearchQuery} onClose={() => setCommandSessionsOpen(false)} threads={threads}
-        onSelectThread={(id) => router.push(`/chat/${encodeURIComponent(id)}`)}
-        onSelectMessage={(id, messageId) => { pushJumpBackFromThread(threadId); router.push(buildThreadMessageHref(id, messageId)); }} />
+      <ConversationSearchDialog open={commandSessionsOpen} query={searchQuery} onQueryChange={setSearchQuery} onClose={() => setCommandSessionsOpen(false)} threads={sidebarThreads}
+        restrictSearchToThreads={Boolean(experience?.threadFilter)}
+        threadLabel={experience?.sidebarLabels?.thread}
+        searchLabel={experience?.sidebarLabels?.search}
+        onSelectThread={(id) => router.push(threadHref(id))}
+        onSelectMessage={(id, messageId) => { pushJumpBackFromThread(threadId); router.push(threadMessageHref(id, messageId)); }} />
 
       <Dialog open={Boolean(pendingStashRestore && pendingStashRestore.draftKey === draftKey && pendingStashRestore.scope === conversationStorageScope())} onOpenChange={(open) => { if (!open) setPendingStashRestore(null); }} title="恢复暂存前保留当前草稿" description="恢复会替换当前尚未发送的正文、引用和附件。" footer={<><Button variant="ghost" onClick={() => setPendingStashRestore(null)}>取消</Button><Button variant="danger" onClick={() => confirmStashRestore(false)}>放弃当前草稿并恢复</Button><Button variant="primary" onClick={() => confirmStashRestore(true)}>先暂存当前草稿再恢复</Button></>}><pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words text-xs">{plainTextFromDocument(promptDocument)}</pre><p className="mt-2 text-xs text-cx-fg-3">当前引用 {capabilityRefs.length} 项 · 附件 {attachments.length} 项</p></Dialog>
 
@@ -4796,5 +5209,7 @@ export function ConversationShell({ threadId = "", navigation }: { threadId?: st
     </>
     </ThreadEditorProvider>
     </ConversationNavigationContext.Provider>
+    </PanelExtensionContext.Provider>
+    </ConversationLocalPreviewContext.Provider>
   );
 }

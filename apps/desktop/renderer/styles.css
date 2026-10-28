@@ -11,10 +11,10 @@
   svg { flex-shrink: 0; }
 }
 .desktop-shell { display: grid; grid-template-columns: 56px minmax(0, 1fr); grid-template-rows: 44px minmax(0, 1fr); width: 100vw; height: 100dvh; overflow: hidden; }
-.titlebar { grid-column: 1 / -1; display: flex; align-items: center; gap: 7px; padding: 0 10px; -webkit-app-region: drag; user-select: none; }
-.titlebar.mac { padding-left: 92px; }
+.titlebar { --titlebar-start: 10px; grid-column: 1 / -1; display: flex; align-items: center; gap: 7px; padding: 0 10px; -webkit-app-region: drag; user-select: none; }
+.titlebar.mac { padding-left: 92px; --titlebar-start: 92px; }
 .window-navigation { display: flex; align-items: center; gap: 3px; margin-right: 17px; }
-.titlebar h1 { font-size: 13px; font-weight: 500; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.titlebar > h1 { font-size: 13px; font-weight: 500; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .server-name { color: var(--muted); font-size: 10px; margin-right: 10px; }
 .window-controls { display: flex; }
 .icon-button { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border-radius: 7px; color: var(--muted); }
@@ -23,7 +23,7 @@
 .rail-main, .rail-bottom { display: flex; flex-direction: column; align-items: center; gap: 8px; }
 .activity-rail .icon-button { width: 38px; height: 38px; border-radius: 10px; }
 .activity-rail .icon-button svg { width: 19px; height: 19px; }
-.activity-rail .icon-button[aria-current="page"], .activity-rail .icon-button.active { background: var(--hover); color: var(--fg); }
+.activity-rail .icon-button[aria-current="page"], .activity-rail .icon-button.active { background: var(--surface); color: var(--fg); box-shadow: 0 0 0 1px var(--border), 0 1px 2px rgb(0 0 0 / 6%); }
 .rail-item { position: relative; }
 .nav-badge { position: absolute; top: 1px; right: -1px; min-width: 14px; height: 14px; border-radius: 8px; padding: 0 3px; font-size: 9px; line-height: 14px; background: var(--accent); color: #fff; text-align: center; pointer-events: none; }
 .rail-divider { height: 1px; width: 22px; background: var(--border); margin: 2px 0; }
@@ -47,11 +47,12 @@
 @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
 @media (max-width: 1000px) { .server-name { display: none; } }
 
-.local-workspace { height: 100%; min-width: 0; min-height: 0; overflow: hidden; }
+.local-workspace { display: flex; flex-direction: column; height: 100%; min-width: 0; min-height: 0; overflow: hidden; }
 .local-workspace[hidden] { display: none; }
 .local-workspace .login-gate { position: absolute; inset: 0; }
 
-.local-workspace .ai-conv-shell { height: 100%; }
+/* Workspace notices render above the shell; it takes the remaining height so the composer stays in view. */
+.local-workspace .ai-conv-shell { flex: 1 1 0; height: auto; min-height: 0; }
 
 /* Floating workspace: every mode renders inside one raised rounded card that
    stands off the window frame. Remote pages (CTF, pentest, competitions) are
@@ -77,4 +78,20 @@
 
 
 .local-service-choice { margin: 20px 0 28px; }
-.environment-label { margin-left: 10px; font-size: 11px; font-weight: 600; opacity: .65; }
+/* Fixed widths let the thread slot below subtract the label's footprint from its alignment offset. */
+.environment-label { box-sizing: border-box; flex: none; width: var(--env-label-w); margin-left: -10px; padding: 1px 0; border-radius: 5px; background: var(--hover); color: var(--muted); font-size: 10px; font-weight: 600; letter-spacing: .04em; line-height: 16px; text-align: center; }
+.environment-label.dev { --env-label-w: 34px; }
+.environment-label.candidate { --env-label-w: 76px; }
+.titlebar:has(> .environment-label.dev) { --titlebar-env-space: 31px; }
+.titlebar:has(> .environment-label.candidate) { --titlebar-env-space: 73px; }
+
+/* The chat page portals its conversation header into the title bar so the window keeps a single
+   header row. The slot's left edge follows the main column: rail (56px) + chat sidebar, minus the
+   title bar's own start padding and the navigation group (3 x 28px buttons, 2 x 3px gaps, 17px
+   margin, 7px flex gap = 114px) and, when shown, the environment label (width - 10px pull + 7px gap). */
+.titlebar-thread { flex: 1; min-width: 0; height: 100%; display: flex; align-items: center; margin-left: max(0px, calc(56px + var(--titlebar-sidebar-width, 0px) - var(--titlebar-start) - 114px - var(--titlebar-env-space, 0px))); }
+.titlebar-thread[hidden], .titlebar-thread:empty { display: none; }
+.titlebar:has(.titlebar-thread:not([hidden]):not(:empty)) > h1 { display: none; }
+.titlebar-thread > * { flex: 1; min-width: 0; }
+.titlebar-thread a, .titlebar-thread input, .titlebar-thread [role="button"] { -webkit-app-region: no-drag; }
+@media (max-width: 768px) { .titlebar-thread { margin-left: 0; } }

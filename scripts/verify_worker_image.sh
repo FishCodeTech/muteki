@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify a Muteki Worker image (full or slim) against the eight container engines
+# Verify a Muteki Worker image (full or slim) against the ten container engines
 # and core tools. Optional tools are probed and reported, but missing optionals
 # do not fail the check.
 #
@@ -7,7 +7,7 @@
 #   ./scripts/verify_worker_image.sh --image <ref> --variant slim|full [--platform linux/amd64|linux/arm64]
 #   ./scripts/verify_worker_image.sh --in-container --variant slim|full
 #
-# Exit 0 only when all eight engines start (--version) and every required core
+# Exit 0 only when all ten engines start (--version) and every required core
 # tool is present and runnable. Prints a version inventory to stdout.
 set -euo pipefail
 
@@ -42,7 +42,7 @@ case "${VARIANT}" in
   *) echo "--variant must be slim or full" >&2; exit 2 ;;
 esac
 
-# Eight container engines — matches muteki/solver/container_exec._CONTAINER_BIN.
+# Ten container engines — matches muteki/solver/container_exec._CONTAINER_BIN.
 # Devin is host-local only; DeepSeek Harness (dsh) is temporarily disabled.
 ENGINE_CHECKS=(
   "claude:claude"
@@ -54,6 +54,7 @@ ENGINE_CHECKS=(
   "grok:/home/kali/.grok/bin/grok"
   "opencode:opencode"
   "droid:droid"
+  "zcode:zcode"
 )
 
 CORE_BOTH=(
@@ -63,6 +64,10 @@ CORE_BOTH=(
   "/opt/muteki/omp_offline_config.yml"
   "/opt/muteki/kimi_offline_agent.md"
   "/opt/muteki/grok_offline_agent.md"
+  "/opt/muteki/python/muteki/solver/native_prompt_bridge.py"
+  "/opt/muteki/python/muteki/solver/zcode_prompt_bridge.py"
+  "/opt/muteki/python/muteki/solver/pi_prompt_bridge.py"
+  "/opt/muteki/python/muteki/solver/grok_prompt_bridge.py"
   "/opt/muteki/AGENTS.md"
   "/opt/muteki/CLAUDE.md"
 )
@@ -124,11 +129,11 @@ run_verify() {
     versions+=("${name}=${out//$'\n'/ }")
   done
   local engine_count="${#ENGINE_CHECKS[@]}"
-  if [[ "$engine_count" -ne 9 ]]; then
-    echo "FAIL: expected 9 engines, got ${engine_count}" >&2
+  if [[ "$engine_count" -ne 10 ]]; then
+    echo "FAIL: expected 10 engines, got ${engine_count}" >&2
     exit 1
   fi
-  echo "OK: all 9 container engines started"
+  echo "OK: all 10 container engines started"
 
   local path
   for path in "${CORE_BOTH[@]}"; do
@@ -296,7 +301,7 @@ run_verify() {
     printf '%s\n' "${versions[@]}" > "$VERSIONS_FILE"
     echo "wrote engine versions to ${VERSIONS_FILE}"
   fi
-  echo "== verify passed (8 engines + core tools) =="
+  echo "== verify passed (10 engines + core tools) =="
 }
 
 if [[ "$IN_CONTAINER" -eq 1 ]]; then

@@ -224,7 +224,14 @@ class CredentialModelCatalogStore:
             if not isinstance(value, dict):
                 continue
             row = dict(value)
-            if row.get("reasoning_catalog_version") != REASONING_CATALOG_VERSION:
+            old_pi_capabilities = (
+                row.get("engine") == "pi" and any(
+                    isinstance(item, dict)
+                    and (item.get("reasoning") or {}).get("source") != "pi_cli_rpc"
+                    for item in row.get("discovered_models") or []
+                )
+            )
+            if row.get("reasoning_catalog_version") != REASONING_CATALOG_VERSION or old_pi_capabilities:
                 # Older catalogs guessed levels from an engine or a boolean
                 # reasoning flag. Keep model identities, discard those guesses.
                 row["discovered_models"] = [
@@ -651,7 +658,7 @@ class WorkerModelTestStore:
         stable_id = str(profile_id or profile.get("id") or profile.get("name") or "").strip()
         if not stable_id:
             return {}
-        credential_store = CredentialAccountStore(
+        _credential_store = CredentialAccountStore(
             account_store_root(self.sessions_root)
         )
         detail = str(result.get("detail") or "")[:320]
@@ -993,17 +1000,30 @@ def _model_turn_failure(
 ) -> tuple[str, str, str]:
     """Classify a completed minimal turn without conflating no reply with auth."""
     parsed = driver_for(profile).parse(str(stdout or ""), str(stderr or ""))
-    if parsed.error:
-        return (f"模型请求失败：{parsed.error}", "model", "model_rejected")
-    output = f"{stdout or ''}\n{stderr or ''}"
+    output = f"{stdout or ''}\n{stderr or ''}\n{parsed.error or ''}"
     lowered = output.casefold()
-    if "request timed out" in lowered or "request timeout" in lowered:
+    if "request timed out" in lowered or "request timeout" in lowered or "timed out" in lowered:
         attempts = output.count('"type":"auto_retry_start"') + 1
         return (
             f"模型请求超时：Pi CLI 的 {attempts} 次请求均未收到模型响应",
             "model",
             "provider_request_timeout",
         )
+    transient_markers = (
+        "too many requests", "rate limit", "rate_limit", "overloaded",
+        "bad gateway", "service unavailable", "gateway timeout",
+        "connection reset", "socket hang up", "econnreset",
+        "http 429", "http 502", "http 503", "http 504",
+        "\"status\":429", "\"status\":502", "\"status\":503", "\"status\":504",
+    )
+    if any(marker in lowered for marker in transient_markers):
+        return (
+            f"模型请求瞬态失败：{parsed.error or _detail(returncode, str(stdout or ''), str(stderr or ''))}",
+            "model",
+            "provider_transient_error",
+        )
+    if parsed.error:
+        return (f"模型请求失败：{parsed.error}", "model", "model_rejected")
     descriptor = find_descriptor(engine)
     settled_event = descriptor.cli.turn_settled_event if descriptor is not None else ""
     if settled_event and settled_event in lowered:
@@ -1639,37 +1659,46 @@ def probe_worker_model(
                 command=f"{engine} <minimal-model-turn>", started=started,
             )
         command = shlex.join(argv)
-        try:
-            process_env = {**os.environ, **env}
-            r = _run_owned_process(
-                argv,
-                timeout=getattr(drv, "_HELLO_TIMEOUT", 90),
-                owner=owner if owner is not None else ProbeProcessOwner(),
-                env=process_env,
-            )
-        except FileNotFoundError:
-            return _process_result(
-                ok=False, detail="CLI 不存在", engine=engine, model=model,
-                backend=backend if backend in ("local", "container") else "local",
-                command=command, started=started, layer="cli", error_code="cli_missing",
-            )
-        except subprocess.TimeoutExpired as exc:
-            return _process_result(
-                ok=False, detail="模型测试超时", engine=engine, model=model,
-                backend=backend if backend in ("local", "container") else "local",
-                command=command, started=started,
-                stdout=getattr(exc, "stdout", ""), stderr=getattr(exc, "stderr", ""),
-                layer="model", error_code="timeout",
-            )
-        except ProbeCancelled:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            return _process_result(
-                ok=False, detail=str(exc)[:600],
-                engine=engine, model=model,
-                backend=backend if backend in ("local", "container") else "local",
-                command=command, started=started,
-            )
+        process_env = {**os.environ, **env}
+        probe_timeout = getattr(drv, "_HELLO_TIMEOUT", 90)
+        max_attempts = int(getattr(drv, "_HELLO_RETRIES", 1)) + 1
+        r = None
+        for attempt in range(max_attempts):
+            try:
+                r = _run_owned_process(
+                    argv,
+                    timeout=probe_timeout,
+                    owner=owner if owner is not None else ProbeProcessOwner(),
+                    env=process_env,
+                )
+            except FileNotFoundError:
+                return _process_result(
+                    ok=False, detail="CLI 不存在", engine=engine, model=model,
+                    backend=backend if backend in ("local", "container") else "local",
+                    command=command, started=started, layer="cli", error_code="cli_missing",
+                )
+            except subprocess.TimeoutExpired as exc:
+                if attempt + 1 < max_attempts:
+                    continue
+                return _process_result(
+                    ok=False, detail="模型测试超时", engine=engine, model=model,
+                    backend=backend if backend in ("local", "container") else "local",
+                    command=command, started=started,
+                    stdout=getattr(exc, "stdout", ""), stderr=getattr(exc, "stderr", ""),
+                    layer="model", error_code="timeout",
+                )
+            except ProbeCancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                return _process_result(
+                    ok=False, detail=str(exc)[:600],
+                    engine=engine, model=model,
+                    backend=backend if backend in ("local", "container") else "local",
+                    command=command, started=started,
+                )
+            if drv._hello_ok(r) or attempt + 1 >= max_attempts:  # noqa: SLF001
+                break
+        assert r is not None
 
         reply_ok = drv._hello_ok(r)  # noqa: SLF001 - same model round-trip predicate.
         actual_models = _claude_actual_models(r.stdout) if verify_claude_model else None
@@ -2471,6 +2500,91 @@ def discover_openai_compatible_models(
     }
 
 
+def discover_pi_endpoint_models(
+    *, result: dict[str, Any], base_url: str, secret: str,
+    sessions_root: str | Path, account_id: str = "", provider: str = "",
+    configured_models: list[str] | None = None, default_model: str = "",
+    binary: str = "", backend: str = "local",
+) -> dict[str, Any]:
+    """Use one ephemeral Pi RPC inventory for every endpoint model's options.
+
+    Endpoint IDs/names are useful catalog metadata; their effort labels are not
+    evidence of what this Pi runtime accepts. Both runs and this probe build
+    models from the same credential-scoped capability metadata.
+    """
+    from muteki.solver.credential_accounts import (
+        _read_model_capabilities, credential_env_reset, pi_model_definition,
+        resolve_model_capabilities,
+    )
+
+    if not result.get("ok"):
+        return result
+    models = list(result.get("models") or [])
+    known = {str(row.get("id") or "") for row in models}
+    for model in [*(configured_models or []), default_model]:
+        if model and model not in known:
+            models.append({"id": model, "label": model})
+            known.add(model)
+    base = account_store_root(sessions_root) / account_id if account_id else None
+    try:
+        capabilities = resolve_model_capabilities(
+            base_url, [row["id"] for row in models], _read_model_capabilities(base),
+            provider=provider, engine="pi", account_base=base,
+        )
+        probe_root = Path(sessions_root) / "_model_probe_environments"
+        probe_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.TemporaryDirectory(prefix="pi-endpoint-", dir=probe_root) as directory:
+            agent_dir = Path(directory) / "agent"
+            agent_dir.mkdir(mode=0o755)
+            config = {"providers": {"muteki": {
+                "baseUrl": base_url, "api": "openai-completions", "apiKey": secret,
+                "models": [pi_model_definition(row["id"], capabilities[row["id"]]) for row in models],
+            }}}
+            (agent_dir / "models.json").write_text(json.dumps(config), encoding="utf-8")
+            (agent_dir / "settings.json").write_text(json.dumps({
+                "defaultProvider": "muteki", "defaultModel": default_model or models[0]["id"],
+            }), encoding="utf-8")
+            script = Path(__file__).resolve().parents[2] / "muteki/solver/pi_model_catalog.mjs"
+            if backend == "container":
+                from muteki.solver.container_exec import WORKER_IMAGE, _mount_source
+                completed = _docker(
+                    "run", "--rm", "--init", "--network", "none", "--user", "kali",
+                    "--entrypoint", "node",
+                    "--mount", f"type=bind,source={_mount_source(str(agent_dir.resolve()))},target=/tmp/pi-agent,readonly",
+                    "--mount", f"type=bind,source={_mount_source(str(script))},target=/tmp/pi-catalog.mjs,readonly",
+                    "-e", "PI_CODING_AGENT_DIR=/tmp/pi-agent",
+                    WORKER_IMAGE, "/tmp/pi-catalog.mjs", binary or "pi", timeout=35,
+                )
+            else:
+                node = shutil.which("node")
+                if not node:
+                    raise ModelDiscoveryError("Node.js 不存在", "cli_missing")
+                completed = subprocess.run(
+                    [node, str(script), binary or shutil.which("pi") or "pi"],
+                    env={**os.environ, **credential_env_reset("pi"), "PI_CODING_AGENT_DIR": str(agent_dir.resolve())},
+                    capture_output=True, text=True, timeout=30,
+                )
+            if completed.returncode != 0:
+                return {**result, "ok": False, "models": [], "source": "pi_cli_rpc",
+                        "error_code": "catalog_request_failed",
+                        "detail": f"Pi RPC 模型能力读取失败：{(completed.stderr or completed.stdout or '').strip()}"}
+            discovered = {
+                row["id"]: row for row in parse_pi_models(completed.stdout)
+                if row.get("provider") == "muteki"
+            }
+            if any(row["id"] not in discovered for row in models):
+                raise ModelDiscoveryError("Pi RPC 返回的端点模型目录不完整", "model_catalog_unsupported")
+            return {
+                **result, "source": "pi_cli_rpc",
+                "models": [{**row, "reasoning": discovered[row["id"]]["reasoning"]} for row in models],
+                "detail": f"从端点读到 {len(models)} 个模型，已由 Pi RPC 确认思考选项",
+            }
+    except (OSError, subprocess.SubprocessError, ValueError, ModelDiscoveryError) as exc:
+        return {**result, "ok": False, "models": [], "source": "pi_cli_rpc",
+                "error_code": str(getattr(exc, "code", "catalog_request_failed")),
+                "detail": f"Pi RPC 模型能力读取失败：{type(exc).__name__}: {exc}"}
+
+
 def _anthropic_models_url(base_url: str) -> str:
     root = str(base_url or "").strip().rstrip("/")
     if root.endswith("/models"):
@@ -2723,7 +2837,9 @@ def parse_pi_models(text: str) -> list[ModelOption]:
             "id": item["id"], "label": item.get("label") or item["id"],
             "provider": item.get("provider", ""),
             **({"input": item["input"]} if isinstance(item.get("input"), list) else {}),
-            "reasoning": _reasoning(item.get("levels"), source="pi_model_runtime"),
+            "reasoning": _reasoning(
+                item.get("levels"), default=item.get("default", ""), source="pi_cli_rpc",
+            ),
         } for item in json.loads(text).get("models", []) if item.get("id")]
     out: list[ModelOption] = []
     for line in text.splitlines()[1:]:
@@ -2894,7 +3010,7 @@ def _run_local_discovery(
                     # Older Grok versions can still list names. No effort options
                     # are invented when the metadata handshake is unavailable.
                     metadata_error = f"grok ACP model metadata failed: {type(exc).__name__}: {exc}"
-            if metadata_probe == "pi_node_catalog" and shutil.which("node"):
+            if metadata_probe in {"pi_node_catalog", "pi_cli_rpc"} and shutil.which("node"):
                 probe = Path(__file__).resolve().parents[2] / "muteki/solver/pi_model_catalog.mjs"
                 metadata = subprocess.run(
                     [shutil.which("node"), str(probe), shutil.which(binary) or binary],
@@ -2903,7 +3019,7 @@ def _run_local_discovery(
                 if metadata.returncode == 0 and metadata.stdout.lstrip().startswith("{"):
                     return metadata
                 metadata_error = (
-                    f"pi node model catalog exited {metadata.returncode}: "
+                    f"pi RPC model catalog exited {metadata.returncode}: "
                     f"{(metadata.stderr or metadata.stdout or '').strip()}")
             if metadata_error:
                 _LOG.warning("%s model metadata unavailable, listing names only: %s",
@@ -2950,7 +3066,6 @@ def _run_container_discovery(
     from muteki.solver.container_exec import (
         CONTAINER_WORKSPACE,
         WORKER_IMAGE,
-        WorkerNetworkConfigError,
         _HOST_DATA_ROOT,
         _mount_source,
         resolve_worker_run_network,
@@ -2977,6 +3092,13 @@ def _run_container_discovery(
         or engine
     )
     argv = _discovery_argv(engine, binary, bundled=bundled)
+    descriptor = find_descriptor(engine)
+    pi_rpc_probe = (
+        descriptor is not None
+        and descriptor.models.metadata_probe in {"pi_node_catalog", "pi_cli_rpc"}
+    )
+    if pi_rpc_probe:
+        argv = ["node", "/tmp/muteki-pi-model-catalog.mjs", binary]
     tmp_base = None
     if _HOST_DATA_ROOT:
         tmp_base = os.path.join(
@@ -3030,6 +3152,12 @@ def _run_container_discovery(
             "--mount", f"type=bind,source={_mount_source(workspace)},target={CONTAINER_WORKSPACE}",
             "--mount", f"type=bind,source={_mount_source(projection)},target={CONTAINER_ACCOUNTS_ROOT}",
         ]
+        if pi_rpc_probe:
+            probe = Path(__file__).resolve().parents[2] / "muteki/solver/pi_model_catalog.mjs"
+            run_cmd += [
+                "--mount",
+                f"type=bind,source={_mount_source(str(probe))},target=/tmp/muteki-pi-model-catalog.mjs,readonly",
+            ]
         if network != "host":
             run_cmd += ["--add-host", "host.docker.internal:host-gateway"]
         for key, value in {**_CONTAINER_BASE_ENV, **resolved.env}.items():

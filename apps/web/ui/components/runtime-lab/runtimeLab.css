@@ -1,0 +1,79 @@
+/* ---------- lab shell ---------- */
+.rtl-page {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100dvh;
+  padding: 16px 20px 20px;
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+  box-sizing: border-box;
+}
+.rtl-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+.rtl-bar h1 {
+  margin: 0 8px 0 0;
+  font-size: 15px;
+  color: var(--bright);
+}
+.rtl-bar small {
+  color: var(--dim);
+}
+.rtl-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.rtl-group select,
+.rtl-btn {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.rtl-btn[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  background: color-mix(in srgb, var(--accent) 7%, var(--panel));
+}
+.rtl-keys {
+  margin-left: auto;
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--dim);
+}
+.rtl-keys kbd {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 0 4px;
+  margin-right: 3px;
+  border-radius: 4px;
+  border: 1px solid var(--line2);
+  color: var(--muted);
+}
+.rtl-stage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  justify-content: center;
+}
+.rtl-stage > .rt-console {
+  width: 100%;
+  max-width: var(--rtl-width, 100%);
+  transition: max-width 360ms var(--rt-ease, ease);
+}

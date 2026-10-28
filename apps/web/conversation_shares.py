@@ -23,6 +23,9 @@ from pydantic import BaseModel, Field
 
 from apps.web.auth import request_token, verify_token
 from muteki.conversation.workspace_surfaces import content_disposition_header
+from muteki.conversation.models import ConversationMessage, TurnRecord, TURN_SUPERSEDED
+from muteki.platform.contracts.events import EventEnvelope
+from muteki.platform.contracts.objects import Thread
 
 MAX_MESSAGES = 500
 MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024
@@ -143,20 +146,32 @@ class ConversationShareStore:
         return {"share_id": share_id, "access_mode": row["mode"], "created_at": row["created"], "expires_at": row["expires"], "snapshot": json.loads(row["snapshot"])}
 
 
+def _share_messages(conn: sqlite3.Connection, thread_id: str) -> list[ConversationMessage]:
+    rows = conn.execute(
+        "SELECT m.payload FROM conv_messages m WHERE m.thread_id=? "
+        "AND (m.turn_id IS NULL OR m.turn_id='' OR m.turn_id NOT IN "
+        "(SELECT turn_id FROM conv_turns WHERE thread_id=? AND status=?)) "
+        "ORDER BY m.stream_seq,m.rowid", (thread_id, thread_id, TURN_SUPERSEDED))
+    return [message for row in rows
+            if (message := ConversationMessage.model_validate_json(row["payload"])).role in {"user", "assistant"}
+            and message.kind in {"message", "steer"}]
+
+
 def build_share_snapshot(service: Any, thread_id: str, body: SharePreviewRequest) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]:
     def clean(value: Any) -> str:
         text = str(value or "")
         return ABSOLUTE_PATH.sub("<path>", text) if body.redact_paths else text
 
-    # One database lock fixes branch membership, message order, and watermark.
-    # Reading these records does not probe or start a Runtime session.
-    with service.platform.lock:
-        thread = service.manager.get_thread(thread_id)
+    # A WAL snapshot fixes branch membership, message order and watermark
+    # without keeping other projects behind a full-history writer lock.
+    with service.platform.read_snapshot() as conn:
+        thread_row = conn.execute(
+            "SELECT payload FROM threads WHERE thread_id=?", (thread_id,)).fetchone()
+        thread = Thread.model_validate_json(thread_row["payload"]) if thread_row else None
         if thread is None:
             raise HTTPException(404, "对话不存在")
-        messages = service.conv.list_current_messages(thread_id)
         # Only conversational prose; never expose reasoning, tools, or arbitrary metadata.
-        messages = [m for m in messages if m.role in {"user", "assistant"} and m.kind in {"message", "steer"}]
+        messages = _share_messages(conn, thread_id)
         if body.message_ids is not None:
             selected = set(body.message_ids)
             if not selected or not selected.issubset({m.message_id for m in messages}):
@@ -166,25 +181,29 @@ def build_share_snapshot(service: Any, thread_id: str, body: SharePreviewRequest
             raise HTTPException(400, "当前有效分支还没有可分享的正文")
         if len(messages) > MAX_MESSAGES:
             raise HTTPException(413, "消息超过 500 条，请选择部分回复及必要上下文")
-        watermark = service.platform.stream_head("thread", thread_id)
-        # Page to the captured watermark. Long conversations must not silently
-        # lose recent attachment membership or tool summaries after 10k events.
-        # Retain only the event kinds needed by this snapshot.
+        head = conn.execute(
+            "SELECT MAX(stream_seq) AS head FROM domain_events "
+            "WHERE aggregate_type='thread' AND aggregate_id=?", (thread_id,)).fetchone()
+        watermark = int(head["head"] or 0)
+        event_kinds = {"core.artifact.attached", "core.artifact.created", "core.tool.completed"}
+        # Include registered old schemas because upcasters may change event kinds.
+        stored_kinds = sorted(event_kinds | {kind for kind, _version in service.platform.upcasters.source_versions()})
+        placeholders = ",".join("?" for _ in stored_kinds)
         events = []
-        after_seq = 0
-        while after_seq < watermark:
-            page = service.platform.read_events("thread", thread_id, after_seq=after_seq, limit=1000)
-            if not page:
-                break
-            events.extend(event for event in page if event.stream_seq <= watermark
-                          and event.event_type in {"core.artifact.attached", "core.artifact.created", "core.tool.completed"})
-            next_seq = int(page[-1].stream_seq)
-            if next_seq <= after_seq:
-                raise HTTPException(409, "对话事件水位已变化，请重新生成预览")
-            after_seq = next_seq
+        for row in conn.execute(
+            "SELECT payload FROM domain_events WHERE aggregate_type='thread' "
+            "AND aggregate_id=? AND stream_seq<=? "
+            f"AND event_type IN ({placeholders}) ORDER BY stream_seq",
+            (thread_id, watermark, *stored_kinds),
+        ):
+            event = service.platform.upcasters.upcast(EventEnvelope.model_validate_json(row["payload"]))
+            if event.event_type in event_kinds:
+                events.append(event)
         selected_turns = {m.turn_id for m in messages if m.turn_id}
         # Attachment membership comes from selected messages, never global digest lookup.
-        referenced = {str(digest) for turn in service.conv.list_turns(thread_id) if turn.turn_id in selected_turns for digest in turn.attachments if DIGEST.fullmatch(str(digest))}
+        turns = [TurnRecord.model_validate_json(row["payload"]) for row in conn.execute(
+            "SELECT payload FROM conv_turns WHERE thread_id=? ORDER BY seq", (thread_id,))]
+        referenced = {str(digest) for turn in turns if turn.turn_id in selected_turns for digest in turn.attachments if DIGEST.fullmatch(str(digest))}
         attached = {str(e.payload.get("sha256") or ""): e.payload
                     for e in events if e.event_type in {"core.artifact.attached", "core.artifact.created"}}
         allowed = referenced & attached.keys()
@@ -252,10 +271,10 @@ def create_conversation_shares_router(*, service: Any) -> APIRouter:
             raise HTTPException(404, "对话不存在")
 
     @router.get("/api/threads/{thread_id}/shares/source")
-    async def source(thread_id: str, offset: int = Query(0, ge=0)):
+    def source(thread_id: str, offset: int = Query(0, ge=0)):
         assert_thread(thread_id)
-        with service.platform.lock:
-            messages = [m for m in service.conv.list_current_messages(thread_id) if m.role in {"user", "assistant"} and m.kind in {"message", "steer"}]
+        with service.platform.read_snapshot() as conn:
+            messages = _share_messages(conn, thread_id)
         end = max(0, len(messages) - offset)
         selected = [m.message_id for m in messages[max(0, end - MAX_MESSAGES):end]]
         initial_ids = selected if len(messages) > MAX_MESSAGES else None
@@ -267,25 +286,25 @@ def create_conversation_shares_router(*, service: Any) -> APIRouter:
         return JSONResponse({"choices": choices, "initial_message_ids": initial_ids, "total_message_count": len(messages), "offset": offset, "has_older": offset + MAX_MESSAGES < len(messages)}, headers=PRIVATE_HEADERS)
 
     @router.post("/api/threads/{thread_id}/shares/preview")
-    async def preview(thread_id: str, body: SharePreviewRequest):
+    def preview(thread_id: str, body: SharePreviewRequest):
         snapshot, choices = build_share_snapshot(service, thread_id, body)
         preview_id = store.preview(thread_id, snapshot)
         return JSONResponse({"preview_id": preview_id, "snapshot": snapshot, "choices": choices, "preview_expires_in_seconds": PREVIEW_TTL}, headers=PRIVATE_HEADERS)
 
     @router.post("/api/threads/{thread_id}/shares", status_code=201)
-    async def create(thread_id: str, body: ShareCreateRequest, request: Request):
+    def create(thread_id: str, body: ShareCreateRequest, request: Request):
         assert_thread(thread_id)
         if body.access_mode == "authenticated" and not request.app.state.auth.enabled:
             raise HTTPException(409, "工作台尚未启用登录认证，请先配置认证，或明确选择链接持有人访问")
         return JSONResponse(store.create(thread_id, body), headers=PRIVATE_HEADERS, status_code=201)
 
     @router.get("/api/threads/{thread_id}/shares")
-    async def list_shares(thread_id: str):
+    def list_shares(thread_id: str):
         assert_thread(thread_id)
         return JSONResponse({"shares": store.list(thread_id)}, headers=PRIVATE_HEADERS)
 
     @router.delete("/api/threads/{thread_id}/shares/{share_id}")
-    async def revoke(thread_id: str, share_id: str):
+    def revoke(thread_id: str, share_id: str):
         assert_thread(thread_id)
         store.revoke(thread_id, share_id)
         return JSONResponse({"revoked": True}, headers=PRIVATE_HEADERS)
@@ -299,14 +318,14 @@ def create_conversation_shares_router(*, service: Any) -> APIRouter:
         return store.read(share_id, token, authenticated=authenticated)
 
     @router.get("/api/conversation-shares/{share_id}")
-    async def read(share_id: str, request: Request):
+    def read(share_id: str, request: Request):
         try:
             return JSONResponse(read_scope(share_id, request), headers=PRIVATE_HEADERS)
         except HTTPException as exc:
             return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=PRIVATE_HEADERS)
 
     @router.get("/api/conversation-shares/{share_id}/attachments/{attachment_id}")
-    async def attachment(share_id: str, attachment_id: str, request: Request):
+    def attachment(share_id: str, attachment_id: str, request: Request):
         try:
             share = read_scope(share_id, request)
         except HTTPException as exc:

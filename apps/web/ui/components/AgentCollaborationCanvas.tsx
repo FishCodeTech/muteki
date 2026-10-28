@@ -24,6 +24,7 @@ import {
   ACTIVITY_FILTER_WINDOW_MS,
   buildAgentCollaborationModel,
   COORDINATOR_ID,
+  CHALLENGER_ID,
   DECISION_ID,
   INPUT_SOURCE_ID,
   isCollaborationWorker,
@@ -152,7 +153,7 @@ const FIELD_SEPARATOR = "";
 const PRO_OPTIONS = { hideAttribution: true };
 const DEFAULT_EDGE_OPTIONS = { type: "floating" };
 const EDGE_MARKER = { type: MarkerType.ArrowClosed, width: 15, height: 15 };
-const EDGE_LABEL_STYLE = { fontSize: 10.5, fontWeight: 650 };
+const EDGE_LABEL_STYLE = { fontSize: 16, fontWeight: 650 };
 const EDGE_LABEL_PADDING: [number, number] = [5, 3];
 const RELATED_STYLE = { opacity: 1 };
 const UNRELATED_STYLE = { opacity: 0.12 };
@@ -533,6 +534,7 @@ function AgentCollaborationInner({ deck, running, onKillWorker, onOpenTimeline, 
       color: "var(--blue)",
     });
     result.set(DECISION_ID, { title: canvasMode === "ctf" ? "Decide" : "Reason", initial: "AI", engineKey: "", subtitle: t("collab.role.decision"), engine: t("collab.role.decision"), color: "var(--violet)" });
+    result.set(CHALLENGER_ID, { title: "Challenger", initial: "CH", engineKey: "", subtitle: t("collab.role.challenger"), engine: t("collab.role.challenger"), color: "var(--violet)" });
     result.set(INPUT_SOURCE_ID, { title: t("collab.source.title"), initial: "IN", engineKey: "", subtitle: t("collab.role.source"), engine: t("collab.role.source"), color: "var(--muted)" });
     for (const [id, identity] of identities) {
       const display = workerDisplayName(id, identity, identityList);
@@ -1016,7 +1018,7 @@ function AgentCollaborationInner({ deck, running, onKillWorker, onOpenTimeline, 
       return { id: agent.id, signature: [coordinatorSignature(data), absolute.x, absolute.y, node.width, matched, present].join(FIELD_SEPARATOR), item: node };
     }
 
-    const workItems = isCollaborationWorker(agent) ? workItemsByAgent.get(agent.id) ?? [] : [];
+    const workItems = workItemsByAgent.get(agent.id) ?? [];
     const mode = expansionMode(agent.id);
     const expanded = mode !== "none" && workItems.length > 0;
     const manualExpanded = mode === "full";
@@ -1037,10 +1039,11 @@ function AgentCollaborationInner({ deck, running, onKillWorker, onOpenTimeline, 
       statusLabel: status,
       intentText: agent.role === "decision"
         ? (agent.identity.model || t("collab.decision.unknown"))
+        : agent.role === "challenger" ? t("collab.challenger.description")
         : agent.role === "source" ? t("collab.source.description")
         : (agent.currentIntent?.summary || agent.currentIntent?.goal || agent.lastIntent?.summary || agent.lastIntent?.goal || t("collab.workspace.noTask")),
       intentTitle: (agent.currentIntent ?? agent.lastIntent)?.goal || agent.latestActivity,
-      latestActivity: agent.role === "decision" ? `${deck.blackboard.reasonRuns.length} ${t("collab.workspace.rounds")}` : agent.role === "source" ? t("collab.workspace.inputHint") : agent.latestActivity,
+      latestActivity: agent.role === "challenger" ? (agent.challenger?.error || t("collab.challenger.proposed", { n: agent.challenger?.proposed ?? 0 })) : agent.role === "decision" ? `${deck.blackboard.reasonRuns.length} ${t("collab.workspace.rounds")}` : agent.role === "source" ? t("collab.workspace.inputHint") : agent.latestActivity,
       facts: agent.facts,
       observations: agent.observations,
       candidates: agent.candidates,
@@ -1443,6 +1446,7 @@ function AgentCollaborationInner({ deck, running, onKillWorker, onOpenTimeline, 
     <div ref={shellRef} className={shellClass} style={shellStyle} onKeyDownCapture={onShellKeyDown}>
       <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">{liveStatus}</div>
       <CollaborationToolbar
+        runId={deck.runId}
         query={query}
         onQueryChange={setQuery}
         searchHits={searchHits}

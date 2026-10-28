@@ -259,7 +259,7 @@
 }
 .conversation-output-card [data-slot="card-header"] > span {
   color: var(--dsw-alias-label-tertiary);
-  font-size: 10.5px;
+  font-size: 11px;
 }
 .conversation-output-scroll {
   max-height: min(568px, calc(100dvh - var(--workspace-nav-height, 48px) - 124px));
@@ -350,7 +350,7 @@
 }
 .conversation-output-row-copy small {
   color: var(--dsw-alias-label-tertiary);
-  font-size: 10.5px;
+  font-size: 11px;
 }
 .conversation-output-empty {
   min-height: 42px;
@@ -456,7 +456,7 @@
   border-radius: 8px;
   color: var(--dsw-alias-label-tertiary);
   background: transparent;
-  font-size: 10.5px;
+  font-size: 11px;
   line-height: 1;
   white-space:nowrap;
   cursor: pointer;
@@ -494,7 +494,7 @@
 .conversation-inspector-section > header { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
 .conversation-inspector-section h2 { color: var(--dsw-alias-label-tertiary); font-size: 11.5px; font-weight: 620; }
 .conversation-inspector-section > header > span:not(.conversation-status-chip) { color: var(--dsw-alias-label-caption); font: 10px/1 var(--font-mono); }
-.conversation-status-chip { padding: 3px 7px; border-radius: 999px; color: var(--dsw-alias-label-tertiary); background: var(--dsw-alias-interactive-bg-hover); font-size: 9.5px; font-weight: 600; }
+.conversation-status-chip { padding: 3px 7px; border-radius: 999px; color: var(--dsw-alias-label-tertiary); background: var(--dsw-alias-interactive-bg-hover); font-size: 11px; font-weight: 600; }
 .conversation-status-chip.is-running { color: var(--blue); background: color-mix(in srgb, var(--blue) 12%, transparent); }
 .conversation-status-chip.is-success { color: var(--green); background: color-mix(in srgb, var(--green) 11%, transparent); }
 .conversation-status-chip.is-danger { color: var(--red); background: color-mix(in srgb, var(--red) 11%, transparent); }
@@ -658,7 +658,7 @@
 .conversation-terminal-title > span {
   flex: none;
   color: var(--dsw-alias-label-caption);
-  font-size: 9px;
+  font-size: 11px;
   line-height: 1.2;
 }
 .conversation-terminal-command,
@@ -778,4 +778,4 @@
 .conversation-workspace-empty { min-height: 230px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 26px; color: var(--dsw-alias-label-tertiary); text-align: center; }
 .conversation-workspace-empty-icon { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 11px; background: var(--dsw-alias-interactive-bg-hover); }
 .conversation-workspace-empty strong { color: var(--dsw-alias-label-secondary); font-size: 12px; }
-.conversation-workspace-empty p { max-width: 240px; font-size: 10.5px; line-height: 1.6; }
+.conversation-workspace-empty p { max-width: 240px; font-size: 11px; line-height: 1.6; }

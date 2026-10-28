@@ -96,9 +96,9 @@ tsecbench 托管模式下+deepseek-flash，排名13
 
 ## 版本更新
 
-当前版本为 **0.4.5**。新增功能、行为变化、移除内容及升级说明见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本为 **0.4.6**。新增功能、行为变化、移除内容及升级说明见 [CHANGELOG.md](CHANGELOG.md)。
 
-[0.4.5 发布页](https://github.com/FishCodeTech/muteki/releases/tag/v0.4.5) 提供 Apple 芯片和 Intel Mac 的 macOS 客户端，内置本地服务，也可连接远程 Muteki 服务。本次不提供 Windows、Linux 桌面安装包，Web 和容器部署继续支持。
+[0.4.6 发布页](https://github.com/FishCodeTech/muteki/releases/tag/v0.4.6) 提供 Apple 芯片和 Intel Mac 的 macOS 客户端，内置本地服务，也可连接远程 Muteki 服务。本次不提供 Windows、Linux 桌面安装包，Web 和容器部署继续支持。
 
 本次 macOS 安装包使用临时签名，尚未公证。已发布的 0.4.1 桌面版没有应用内更新界面，需要先手动安装一次 0.4.2。0.4.2 可在全局设置中检查并安装官方版本，安装前会校验 GitHub SHA-256 和严格签名。本地候选版本更新需要稳定的 Developer ID 签名。
 
@@ -126,7 +126,7 @@ cd muteki
 ### 2. 完成最小配置
 
 1. 在首页点“单题 Worker”，或进入单题页面后点左下角“Worker 设置”。
-2. 在“Agent 凭据”中确认已有的 CLI 登录可用，或新增 Token、API Key、自定义 Base URL 等凭据；使用“真实连通测试”检查连接。
+2. 在“Agent 凭据”中确认已有的 CLI 登录可用，或新增 Token、API Key、自定义 Base URL 等凭据；使用接入方式标题行上的“测试”做真实连通测试。
 3. 回到“出战配置”，选择至少一个已启用的 Worker，为它绑定可用凭据和模型；点“一键检查”或单独自检。
 4. 在“运行环境”中选“本地运行”（使用宿主机 CLI）或“容器运行”（需要 Docker、Worker 镜像及可注入凭据）。
 5. 在“推理模型”中为 Planner 选择模型端点和端点模型，并运行页面提供的测试；按需配置 Titler。
@@ -226,7 +226,19 @@ Muteki、Agent CLI、CTF 工具和运行目录都在 Ubuntu 虚拟机内；Windo
 
 当前界面可配置 Claude Code、Codex、Cursor、Pi、OMP、Kimi、Grok 和 OpenCode 等 CLI；具体能否使用取决于本机安装、厂商登录和所选运行环境。至少准备其中一个。DeepSeek Harness 由于其没有acp、等provider内容，目前只保留登记信息，暂不可作为出战 Worker。各 CLI 的安装和授权流程以对应厂商说明为准。
 
+Pi 聊天参照 [T3 Code 的 Pi 接入](https://github.com/pingdotgg/t3code/tree/main/packages/provider-pi)，直接调用本机 Pi CLI 的原生 RPC，不再另装 Pi SDK 或 ACP 桥接。思考档位来自所选模型的 RPC 元数据，设置后会核实实际生效档位。输入框提供严格监督、自动接受修改、完全访问三档权限，由工具调用扩展执行审批；它控制 Pi 工具调用，不是操作系统沙箱。已有 Pi ACP 历史记录保持可读，新会话请选择 Pi RPC。
+
 **注意：**如果页面显示“待自检”或“没有可用凭据”，先到“Agent 凭据”测试连接，再检查“出战配置”中的凭据绑定、模型和运行环境。自检会发起真实模型请求，可能产生用量。
+
+### 模型价格表
+
+Muteki 用量总览使用独立公开项目 [model-prices](https://github.com/jiayuqi7813/model-prices) 提供的价格表。该项目通过 GitHub Actions 每天在 **UTC 03:17 / 北京时间 11:17** 同步 LiteLLM、models.dev、Cursor 官方模型价格、Devin 的 SWE-2 公开标价和 Grok Build Fast 官方价格，发布统一的 [prices.json](https://raw.githubusercontent.com/jiayuqi7813/model-prices/main/prices.json)。Muteki 在读取用量时检查该地址，缓存 24 小时；更新失败时保留上次有效价格。JSON 包含生成时间及来源信息，超过 48 小时未更新的快照会显示为缓存价格。
+
+Cursor、Devin 和 Grok Build 优先使用各自渠道的价格。Grok Build 的 `grok-4.7-build-fast` 使用官方 Fast 报价，并区分超过 200,000 prompt tokens 的长上下文价格，不套用标准版 Grok API 价格。Cursor 标准、Fast、长上下文档分别保留；Auto 或缺少必要档位信息的调用继续显示未定价。Pi、OMP、OpenCode 等可切换供应商的引擎按实际供应商和模型查价，不设统一的“Agent 单价”。
+
+在 **设置 → Agents 和接入点 → 模型价格** 中可检测完整模型 ID、确认目录映射，或新增、修改、删除自定义价格。单位为 USD / 百万 Token，可按凭据和供应商限定范围；填写 `0` 表示明确零价，缓存价格留空表示未知。自定义价格不会被每日目录更新覆盖。聊天、CTF 和 Pentest 的费用视图共用计价结果，原始 Token 和上报金额保留用于追溯；工具估价、目录估价和自定义估价分别标明，缺失 Token 不会通过价格表补造。
+
+这些价格用于公开标价估算，不代表订阅账单或中转商实际收费。不同供应商的模型条目分别保留，缺失价格不会补成零；上游改价到每日价格表更新之间可能存在延迟。该价格表用于用量估算，执行预算仍使用独立的价格规则。
 
 ## 如何做题
 
@@ -320,7 +332,7 @@ MUTEKI_WEB_PASSWORD='请替换为强密码' \
 ```bash
 ./run.sh upgrade --check   # 检查稳定版
 ./run.sh install            # 安装托管版本
-muteki upgrade v0.4.5      # 更新到本次版本
+muteki upgrade v0.4.6      # 更新到本次版本
 muteki rollback            # 回滚到上一个已安装版本
 muteki version             # 查看版本与安装形态
 ```

@@ -58,7 +58,7 @@
   --cx-shadow-md: 0 6px 16px -6px hsl(var(--cx-shadow-color) / 0.12), 0 2px 4px -2px hsl(var(--cx-shadow-color) / 0.06);
   --cx-shadow-pop: 0 0 0 1px var(--cx-border), 0 18px 44px -14px hsl(var(--cx-shadow-color) / 0.26), 0 6px 14px -6px hsl(var(--cx-shadow-color) / 0.12);
   --cx-shadow-composer: 0 0 0 1px var(--cx-border), 0 10px 30px -14px hsl(var(--cx-shadow-color) / 0.2), 0 2px 6px -2px hsl(var(--cx-shadow-color) / 0.06);
-  --cx-shadow-composer-focus: 0 0 0 1px var(--cx-border-strong), 0 14px 38px -14px hsl(var(--cx-shadow-color) / 0.26), 0 2px 6px -2px hsl(var(--cx-shadow-color) / 0.08);
+  --cx-shadow-composer-focus: 0 0 0 1px color-mix(in srgb, var(--cx-border-strong) 50%, var(--cx-border)), 0 14px 38px -14px hsl(var(--cx-shadow-color) / 0.26), 0 2px 6px -2px hsl(var(--cx-shadow-color) / 0.08);
 
   --cx-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   --cx-ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);

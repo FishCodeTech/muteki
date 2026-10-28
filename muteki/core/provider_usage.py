@@ -31,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import hashlib
+import copy
 import json
 import math
 import os
@@ -39,19 +40,20 @@ import re
 import sqlite3
 import threading
 import time
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
 from muteki.core.cursor_usage import CursorAccountUsage, CursorUsageError, UsageWindow, make_window
 
-RATE_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+RATE_URL = "https://raw.githubusercontent.com/jiayuqi7813/model-prices/main/prices.json"
+LEGACY_RATE_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 NATIVE_ENGINES = frozenset(("codex", "claude", "grok", "opencode", "cursor"))
 LEDGER_ENGINES = ("pi", "kimi", "omp", "devin", "droid")
 TOKEN_FIELDS = ("uncached_input", "cache_read", "cache_write", "unclassified_input", "output", "reasoning")
 AMOUNT_FIELDS = ("total_tokens", *TOKEN_FIELDS, "cost", "reported_cost", "estimated_cost")
-COUNT_FIELDS = ("unpriced", "records", "sessions", "missing", "historical_scope_unknown")
+COUNT_FIELDS = ("unpriced", "records", "sessions", "missing", "historical_scope_unknown", "provider_reported", "driver_estimate", "catalog", "custom", "captured_estimate")
 UNPRICEABLE = frozenset(("<synthetic>", "synthetic", "opus", "sonnet", "haiku", "fable", "auto", "default", "unknown"))
 
 
@@ -91,7 +93,7 @@ def _timestamp(value: Any) -> int | None:
 def _record(engine: str, at: int, model: str, session: str, *, inp: int = 0,
             read: int = 0, write: int = 0, out: int = 0, reasoning: int = 0,
             reported: float | None = None, key: str | None = None,
-            speed: str = "standard") -> dict:
+            speed: str | None = None) -> dict:
     return {"engine": engine, "at_ms": at, "model": model, "session": session,
             "uncached_input": inp, "cache_read": read, "cache_write": write,
             "unclassified_input": 0,
@@ -108,12 +110,16 @@ def parse_claude(record: dict) -> list[dict]:
     if record.get("type") != "assistant" or not isinstance(usage, dict) or at is None or not model:
         return []
     message_id, request_id = message.get("id"), record.get("requestId")
-    return [_record("claude", at, str(model), str(record.get("sessionId") or ""),
-                    inp=_tokens(usage.get("input_tokens")), read=_tokens(usage.get("cache_read_input_tokens")),
-                    write=_tokens(usage.get("cache_creation_input_tokens")), out=_tokens(usage.get("output_tokens")),
-                    reported=_number(record.get("costUSD")),
-                    key=f"{message_id or ''}:{request_id or ''}" if message_id or request_id else None,
-                    speed="fast" if usage.get("speed") == "fast" else "standard")]
+    missing_buckets = int("input_tokens" not in usage) + int("output_tokens" not in usage)
+    row = _record("claude", at, str(model), str(record.get("sessionId") or ""),
+                  inp=_tokens(usage.get("input_tokens")), read=_tokens(usage.get("cache_read_input_tokens")),
+                  write=_tokens(usage.get("cache_creation_input_tokens")), out=_tokens(usage.get("output_tokens")),
+                  key=f"{message_id or ''}:{request_id or ''}" if message_id or request_id else None,
+                  speed="fast" if usage.get("speed") == "fast" else "standard")
+    row["missing"] = missing_buckets
+    # Claude CLI/SDK costs come from its local tariff table, not a bill receipt.
+    row.update(estimated_cost=_number(record.get("costUSD")), estimated_amount_source="driver_estimate")
+    return [row]
 
 
 def parse_codex(record: dict, state: dict) -> list[dict]:
@@ -137,10 +143,13 @@ def parse_codex(record: dict, state: dict) -> list[dict]:
         return []
     if event != "token_count" or at is None or not state.get("model"):
         return []
-    usage = _object(payload.get("info")).get("last_token_usage")
+    info = _object(payload.get("info"))
+    usage = info.get("last_token_usage")
     if not isinstance(usage, dict):
         return []
-    signature = hashlib.sha256(json.dumps(usage, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    total_usage = info.get("total_token_usage")
+    signature_input = {"last": usage, "total": total_usage} if isinstance(total_usage, dict) else {"last": usage, "at": at}
+    signature = hashlib.sha256(json.dumps(signature_input, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     if signature == state.get("signature"):
         return []
     state["signature"] = signature
@@ -211,8 +220,12 @@ def parse_opencode(message: dict, *, uid: str = "", session: str = "", at: Any =
 
 def ledger_to_records(rows: Iterable[dict]) -> list[dict]:
     """Adapt canonical ledger IO (cache in input, reasoning in output)."""
+    from muteki.core.usage import is_context_only, usage_view, merge_usage_observations
     result = []
-    for row in rows:
+    for row in merge_usage_observations(list(rows)):
+        row = usage_view(row)
+        if is_context_only(row):
+            continue
         at = _timestamp(row.get("at"))
         if at is None:
             continue
@@ -225,12 +238,20 @@ def ledger_to_records(rows: Iterable[dict]) -> list[dict]:
                   or row.get("source") == "legacy-snapshot"
                   or (engine in ("pi", "omp") and row.get("source") == "cli"
                       and row.get("price_source") not in ("model_price", "driver_estimate")))
-        reported = None if legacy else _number(row.get("reported_cost"))
+        driver_amount = (row.get("price_source") == "driver_estimate"
+                         or row.get("engine") in ("pi.rpc", "omp.rpc", "claude.sdk", "claude.agent_sdk") and row.get("source") == "runtime")
+        driver_reported = _number(row.get("reported_cost")) if driver_amount else None
+        # These RPC adapters calculate a tariff estimate, including an unknown
+        # price placeholder of zero. Neither is evidence of a provider bill.
+        if row.get("engine") in ("pi.rpc", "omp.rpc") and driver_reported == 0:
+            driver_reported = None
+        reported = None if legacy or driver_amount else _number(row.get("reported_cost"))
         if engine == "opencode" and reported == 0:
             reported = None
         entry = _record(engine, at, str(row.get("model") or "unknown"),
                         str(row.get("thread_id") or row.get("run_id") or ""), reported=reported,
                         key=str(row["id"]) if row.get("id") else None)
+        entry.update({field: row[field] for field in ("credential_id", "provider_id", "speed", "catalog_provider", "route_provenance", "worker_id", "role") if row.get(field) and (not isinstance(row[field], str) or row[field].strip())})
         entry.update(uncached_input=max(0, int(inp) - int(read) - int(write))
                      if inp is not None and read is not None and write is not None else None,
                      unclassified_input=(0 if read is not None and write is not None
@@ -241,16 +262,29 @@ def ledger_to_records(rows: Iterable[dict]) -> list[dict]:
                      output=int(out) if out is not None else None,
                      reasoning=min(int(out), int(reasoning)) if out is not None and reasoning is not None else None,
                      total_tokens=int(inp + out) if inp is not None and out is not None else None,
-                     missing=int(inp is None or out is None), input_tokens=int(inp) if inp is not None else None,
+                     missing=int(inp is None or out is None or bool(row.get("input_lower_bound"))), input_tokens=int(inp) if inp is not None else None,
                      scope="muteki")
         # The pricing path must know if the cache breakdown was actually given.
-        entry["cache_breakdown_known"] = read is not None and write is not None
+        if engine == "codex" and write is None:
+            # Codex/OpenAI usage exposes cached input, with no separately billed
+            # cache-write bucket. This is price applicability, not measured zero.
+            entry["cache_write"] = 0
+            entry["cache_write_applicability"] = "not_applicable"
+            if inp is not None and read is not None:
+                entry["uncached_input"] = max(0, int(inp) - int(read))
+                entry["unclassified_input"] = 0
+        entry["cache_breakdown_known"] = read is not None and (write is not None or entry.get("cache_write_applicability") == "not_applicable")
         entry["historical_scope_unknown"] = int(
             row.get("measurement_scope") == "historical_scope_unknown"
             or row.get("normalization_repair") == "droid_historical_scope_unknown"
         )
-        entry["estimated_cost"] = (_number(row.get("estimated_cost")) if not legacy
-                                   and row.get("price_source") in ("model_price", "driver_estimate") else None)
+        entry["reported_amount_source"] = "driver_estimate" if row.get("price_source") == "driver_estimate" else "provider_reported"
+        entry["token_quality"] = row.get("quality")
+        entry["estimated_amount_source"] = (row.get("amount_source") if row.get("amount_source") in
+                                             ("driver_estimate", "catalog", "custom", "captured_estimate")
+                                             else "driver_estimate" if driver_amount else "captured_estimate")
+        entry["estimated_cost"] = ((_number(row.get("estimated_cost")) if row.get("estimated_cost") is not None else driver_reported)
+                                   if not legacy and (driver_amount or row.get("price_source") in ("model_price", "driver_estimate")) else None)
         result.append(entry)
     return result
 
@@ -263,8 +297,7 @@ def parse_rate_table(document: dict) -> dict[str, dict]:
         result = {"uncached_input": inp, "output": out}
         for field, name in (("cache_read", "cache_read_input_token_cost"), ("cache_write", "cache_creation_input_token_cost")):
             value = _number(raw.get(name + suffix))
-            result[field] = value if value is not None else (standard[field] / standard["uncached_input"] * inp
-                           if standard and standard["uncached_input"] else inp)
+            result[field] = value
         return result
 
     table: dict[str, dict] = {}
@@ -274,41 +307,130 @@ def parse_rate_table(document: dict) -> dict[str, dict]:
         multiple = _number(_object(raw.get("provider_specific_entry")).get("fast"))
         table[model.strip().lower()] = {
             "standard": standard,
-            "fast": {key: value * multiple for key, value in standard.items()} if multiple else rates(raw, "_priority", standard),
+            "fast": {key: value * multiple if value is not None else None for key, value in standard.items()} if multiple else rates(raw, "_priority", standard),
             "ultrafast": rates(raw, "_ultrafast", standard),
+            "long_context": rates(raw, "_above_200k_tokens") if model.lower().startswith(("xai/grok-", "grok/grok-")) else None,
+            "long_context_threshold": 200000 if model.lower().startswith(("xai/grok-", "grok/grok-")) and any(
+                name.endswith("_above_200k_tokens") for name in raw) else None,
         }
-    aliases: dict[str, dict | None] = {}
-    for model, rate in table.items():
-        bare = model.rsplit("/", 1)[-1]
-        if bare == model or bare in table:
-            continue
-        if bare not in aliases:
-            aliases[bare] = rate
-        elif aliases[bare] != rate:
-            aliases[bare] = None
-    table.update({name: rate for name, rate in aliases.items() if rate is not None})
+        if model.strip().lower().startswith(("kimi-code-plan-cn/", "kimi-code-plan-global/")):
+            # models.dev's zero here describes a subscription plan, not a free
+            # token tariff. Official Kimi Code bills quota/extra usage separately.
+            table[model.strip().lower()].update(
+                pricing_status="subscription_unknown", standard={key: None for key in standard},
+                fast=None, ultrafast=None)
+        if model.strip().lower().startswith("cursor/"):
+            table[model.strip().lower()]["cursor_pricing"] = _object(raw.get("_cursor_pricing"))
     return table
 
 
-def price_records(records: Iterable[dict], rates: dict[str, dict]) -> list[dict]:
+def _record_rate(row: dict, key: str, rates: dict[str, dict]) -> dict | None:
+    engine = canonical_engine(row.get("engine"))
+    if engine in ("cursor", "devin") and not row.get("rate_model") and not key.startswith(f"{engine}/"):
+        key = f"{engine}/{key}"
+    rate = rates.get(key)
+    if rate is None or engine != "cursor":
+        return rate
+    metadata = rate.get("cursor_pricing", {})
+    speed = row.get("speed")
+    fast_id = metadata.get("fast_model_id")
+    if speed is None and fast_id:
+        # A product's default Fast setting varies by plan; a bare model ID
+        # does not prove the request's tier. An explicit Fast ID is sufficient.
+        return None
+    if speed not in (None, "standard", "fast"):
+        return None
+    if speed == "fast" and "fast" not in str(metadata.get("variant", "")):
+        rate = rates.get(f"cursor/{fast_id}") if fast_id else None
+        if rate is None:
+            return None
+        metadata = rate.get("cursor_pricing", {})
+    threshold = _number(metadata.get("long_context_threshold_input_tokens"))
+    if threshold is not None:
+        prompt_tokens = _number(row.get("input_tokens"))
+        if prompt_tokens is None:
+            parts = [_number(row.get(field)) for field in ("uncached_input", "cache_read", "cache_write")]
+            if any(part is None for part in parts):
+                return None
+            prompt_tokens = sum(parts)
+        target = metadata.get("long_context_model_id" if prompt_tokens > threshold else "short_context_model_id")
+        if target:
+            rate = rates.get(f"cursor/{target}")
+    return rate
+
+
+def price_records(records: Iterable[dict], rates: dict[str, dict], *, resolver: Callable | None = None) -> list[dict]:
     result = []
     for original in records:
         row = dict(original)
         reported = _number(row.get("reported_cost"))
-        key = str(row.get("rate_model") or row.get("model") or "").strip().lower().split("[", 1)[0]
+        if row.get("engine") == "claude" and row.get("scope") != "muteki" and reported is not None:
+            # Existing numerical scan caches can predate parse_claude's source
+            # correction. Reclassify their local costUSD in the view as well.
+            row["estimated_cost"] = reported
+            row["estimated_amount_source"] = "driver_estimate"
+            reported = None
+        key = str(row.get("rate_model") or row.get("model") or "").strip().lower()
         unpriceable = key.rsplit("/", 1)[-1] in UNPRICEABLE
-        rate = None if unpriceable else rates.get(key)
-        estimated = _number(row.get("estimated_cost")) if reported is None and not unpriceable else None
-        if reported is None and rate is not None and not row.get("missing"):
-            tier = rate.get(row.get("speed", "standard")) or rate["standard"]
-            # Native records have complete disjoint buckets; the ledger's
-            # undisclosed cache mix cannot be priced as all uncached input.
+        quote = resolver(row) if resolver else None
+        if quote:
+            tier = ({"uncached_input": quote["rates"]["input"] / 1e6 if quote["rates"]["input"] is not None else None,
+                     **{field: quote["rates"][field] / 1e6 if quote["rates"][field] is not None else None
+                        for field in ("output", "cache_read", "cache_write")}} if quote.get("rates") else None)
+            row["pricing"] = quote
+        else:
+            rate = None if unpriceable else _record_rate(row, key, rates)
+            tier_name = "standard" if canonical_engine(row.get("engine")) == "cursor" else (row.get("speed") or "standard")
+            tier = rate.get(tier_name) if rate and rate.get("pricing_status") != "subscription_unknown" else None
+            prompt_tokens = _number(row.get("input_tokens"))
+            if prompt_tokens is None:
+                parts = [_number(row.get(field)) for field in ("uncached_input", "cache_read", "cache_write")]
+                if all(part is not None for part in parts):
+                    prompt_tokens = sum(parts)
+            if rate and rate.get("long_context_threshold") and (prompt_tokens or 0) > rate["long_context_threshold"]:
+                tier = rate.get("long_context") if tier_name == "standard" else None
+        if (quote and quote.get("status") == "catalog"
+                and quote.get("catalog_model") in ("devin/swe-2-medium", "devin/swe-2-high", "devin/swe-2-max")
+                and canonical_engine(row.get("engine")) == "devin"
+                and row.get("cache_write") is None
+                and all(_number(row.get(field)) is not None for field in ("input_tokens", "cache_read", "output"))):
+            # SWE-2's public list tariff prices inclusive input, cache reads and
+            # output, with no independent cache-write dimension. Do not turn an
+            # absent measured bucket into zero, or extend this to custom rates.
+            row.update(uncached_input=max(0, row["input_tokens"] - row["cache_read"]),
+                       unclassified_input=0, cache_breakdown_known=True,
+                       cache_write_applicability="not_separately_priced")
+            row["pricing"] = {**quote, "pricing_basis": "public_list_estimate"}
+        # A trusted tool estimate remains evidence even when the model identity
+        # is insufficient for catalog pricing.
+        estimated = _number(row.get("estimated_cost")) if reported is None else None
+        estimated_source = row.get("estimated_amount_source", "driver_estimate")
+        # An estimate of zero without observed consumption is a missing-usage
+        # placeholder. Explicit reported zero and computed zero tariffs remain.
+        if estimated == 0 and (row.get("missing") or quote and quote.get("status") == "subscription_unknown"):
+            estimated = None
+        if reported is None and tier is not None and not row.get("missing"):
             cache_known = row.get("cache_breakdown_known", True)
+            calculated = None
             if cache_known:
-                estimated = sum((row.get(field) or 0) * tier[field] for field in ("uncached_input", "cache_read", "cache_write", "output"))
-            elif tier["uncached_input"] == tier["cache_read"] == tier["cache_write"]:
-                estimated = (row.get("input_tokens") or 0) * tier["uncached_input"] + (row.get("output") or 0) * tier["output"]
+                fields = ("uncached_input", "cache_read", "cache_write", "output")
+                if all(not row.get(field) or tier.get(field) is not None for field in fields):
+                    calculated = sum((row.get(field) or 0) * (tier.get(field) or 0) for field in fields)
+            elif (tier.get("uncached_input") is not None
+                  and tier["uncached_input"] == tier.get("cache_read") == tier.get("cache_write")
+                  and tier.get("output") is not None):
+                calculated = (row.get("input_tokens") or 0) * tier["uncached_input"] + (row.get("output") or 0) * tier["output"]
+            if calculated is not None:
+                estimated = calculated
+                estimated_source = quote["status"] if quote else "catalog"
+            elif estimated_source != "driver_estimate":
+                # Incomplete custom/catalog rates cannot silently reuse an old
+                # model tariff. A separately reported tool estimate is retained.
+                estimated = None
         row.update(reported_cost=reported, estimated_cost=estimated, cost=reported if reported is not None else estimated)
+        row["amount_source"] = row.get("reported_amount_source", "provider_reported") if reported is not None else (estimated_source if estimated is not None else "unpriced")
+        from muteki.core.model_pricing import pricing_issues
+        row["pricing_issues"] = pricing_issues(row)
         result.append(row)
     return result
 
@@ -367,6 +489,7 @@ def summarize(records: Iterable[dict], window: UsageWindow) -> dict:
     series = {slot: {"slot": slot, "total_tokens": 0, "cost": 0, "providers": {}} for slot in window.slots}
     dedupe: set[tuple] = set()
     session_sets: dict[tuple, set[tuple]] = {}
+    issue_rows: dict[tuple, list[dict]] = {}
     for row in records:
         if not window.since_ms <= row["at_ms"] <= window.until_ms:
             continue
@@ -379,8 +502,11 @@ def summarize(records: Iterable[dict], window: UsageWindow) -> dict:
         provider = providers.setdefault(engine, {"engine": engine, "status": "ready", **_empty_totals()})
         model_row = models.setdefault((engine, model), {"engine": engine, "model": model, **_empty_totals()})
         for aggregate, group in ((totals, ()), (provider, (engine,)), (model_row, (engine, model))):
+            issue_rows.setdefault(group, []).append(row)
             _sum_known(aggregate, row, AMOUNT_FIELDS)
             aggregate["records"] += 1
+            if row.get("amount_source") in ("provider_reported", "driver_estimate", "catalog", "custom", "captured_estimate"):
+                aggregate[row["amount_source"]] += 1
             aggregate["unpriced"] += int(row.get("cost") is None)
             aggregate["missing"] += int(bool(row.get("missing")))
             aggregate["historical_scope_unknown"] += int(bool(row.get("historical_scope_unknown")))
@@ -405,6 +531,12 @@ def summarize(records: Iterable[dict], window: UsageWindow) -> dict:
             for field in ("total_tokens", "cost"):
                 values = [item[field] for item in point["providers"].values() if item[field] is not None]
                 point[field] = sum(values) if values else None
+    from muteki.core.model_pricing import aggregate_pricing_issues
+    totals['pricing_issues'] = aggregate_pricing_issues(issue_rows.get((), []))
+    for engine, provider in providers.items():
+        provider['pricing_issues'] = aggregate_pricing_issues(issue_rows.get((engine,), []))
+    for key, model in models.items():
+        model['pricing_issues'] = aggregate_pricing_issues(issue_rows.get(key, []))
     order = lambda row: (-(row["cost"] or 0), -(row["total_tokens"] or 0), row.get("model", row.get("engine", "")))
     return {"as_of": time.time(), "window": asdict(window), "totals": totals,
             "providers": sorted(providers.values(), key=order), "models": sorted(models.values(), key=order),
@@ -421,6 +553,8 @@ class ProviderUsage:
         self.home = home or Path.home()
         self.cursor = cursor or CursorAccountUsage(self.root, env=self.env)
         self._lock = threading.Lock()
+        self._history_lock = threading.Lock()
+        self._rate_refresh_lock = threading.Lock()
         self._files: dict[str, dict] = {}
         self._dirty_files: set[str] = set()
         self._rates: dict[str, dict] = {}
@@ -429,8 +563,35 @@ class ProviderUsage:
         self._pricing: dict = {"status": "unavailable", "source": RATE_URL, "fetched_at": None}
         self._cache_loaded = False
         self._cache_issue: str | None = None
+        from muteki.core.model_pricing import PricingStore
+        self.price_store = PricingStore(self.root)
+
+    def pricing_snapshot(self, refresh: bool = False) -> tuple[dict, dict]:
+        """Publish complete feed snapshots; slow refreshes never lock local quotes."""
+        acquired = self._rate_refresh_lock.acquire(blocking=refresh)
+        if not acquired:
+            with self._lock:
+                if self._rates:
+                    return self._rates, dict(self._pricing)
+            # The first load has no usable tariff yet. Join it rather than
+            # publishing temporary missing prices to concurrent model pickers.
+            self._rate_refresh_lock.acquire()
+        try:
+            with self._lock:
+                working = copy.copy(self)
+                working._pricing = dict(self._pricing)
+            working._refresh_rates(refresh)
+            with self._lock:
+                self._rates, self._rates_at = working._rates, working._rates_at
+                self._rate_attempt_at, self._pricing = working._rate_attempt_at, working._pricing
+                return self._rates, dict(self._pricing)
+        finally:
+            self._rate_refresh_lock.release()
 
     def _load_rates(self, refresh: bool) -> dict:
+        return self.pricing_snapshot(refresh)[0]
+
+    def _refresh_rates(self, refresh: bool) -> dict:
         now = time.time()
         max_age = 60 if refresh else 86400
         path = self.root / "_usage_model_rates.json"
@@ -439,31 +600,54 @@ class ProviderUsage:
                 cache = json.loads(path.read_text())
                 self._rates = parse_rate_table(cache["document"])
                 self._rates_at = float(cache["fetched_at"]) if self._rates else 0
-                self._pricing.update(status="cached" if self._rates else "unavailable", fetched_at=self._rates_at or None)
+                self._pricing.update(status="cached" if self._rates else "unavailable",
+                                     source=cache.get("source") or LEGACY_RATE_URL,
+                                     fetched_at=self._rates_at or None)
+                self._describe_feed(cache["document"], now)
             except FileNotFoundError:
                 pass
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 self._pricing["message"] = f"价格缓存读取失败（{type(exc).__name__}）"
-        if now - self._rates_at < max_age or now - self._rate_attempt_at < 60:
+        if ((self._pricing["source"] == RATE_URL and now - self._rates_at < max_age)
+                or now - self._rate_attempt_at < 60):
+            if self._pricing["status"] == "fresh":
+                self._describe_feed({"_meta": {"generated_at": self._pricing.get("generated_at")}}, now)
             return self._rates
         self._rate_attempt_at = now
         try:
             response = httpx.get(RATE_URL, timeout=10, follow_redirects=False)
             response.raise_for_status()
             document = response.json()
+            metadata = _object(_object(document).get("_meta"))
+            if (type(metadata.get("schema_version")) is not int or metadata["schema_version"] != 1
+                    or _timestamp(metadata.get("generated_at")) is None):
+                raise ValueError("invalid model price feed metadata")
             parsed = parse_rate_table(document)
             if not parsed:
                 raise ValueError("empty rate table")
             self._rates, self._rates_at = parsed, now
             self._pricing = {"status": "fresh", "source": RATE_URL, "fetched_at": now}
+            self._describe_feed(document, now)
             self.root.mkdir(parents=True, exist_ok=True)
             temporary = path.with_suffix(".tmp")
-            temporary.write_text(json.dumps({"fetched_at": now, "document": document}))
+            temporary.write_text(json.dumps({"source": RATE_URL, "fetched_at": now, "document": document}))
             temporary.replace(path)
         except (httpx.HTTPError, OSError, ValueError, TypeError) as exc:
             self._pricing.update(status="cached" if self._rates else "unavailable",
                                  message=f"价格表更新失败（{type(exc).__name__}）；" + ("使用已缓存价格。" if self._rates else "未知模型保持未定价。"))
         return self._rates
+
+    def _describe_feed(self, document: dict, now: float) -> None:
+        metadata = _object(_object(document).get("_meta"))
+        generated_at = metadata.get("generated_at")
+        generated_ms = _timestamp(generated_at)
+        if generated_ms is None:
+            return
+        self._pricing["generated_at"] = generated_at
+        if now * 1000 - generated_ms > 48 * 3600 * 1000:
+            self._pricing.update(status="cached", message=f"价格表生成于 {generated_at}，已超过 48 小时未更新；继续使用上次有效价格。")
+        else:
+            self._pricing["message"] = f"价格表生成于 {generated_at}；每日同步公开目录，仅用于费用估算。"
 
     def _homes(self, engine: str) -> list[Path]:
         from muteki.solver.credential_accounts import host_discovery_enabled
@@ -684,13 +868,15 @@ class ProviderUsage:
     def summarize_ledger(self, rows: Iterable[dict], days: int, tz: str, *, refresh: bool = False,
                          start: float | None = None, end: float | None = None,
                          engine: str | None = None, model: str | None = None) -> dict:
-        with self._lock:
-            records = _select(price_records(ledger_to_records(rows), self._load_rates(refresh)), engine, model)
-            if start == 0:
-                start = min((row["at_ms"] / 1000 for row in records), default=end or time.time())
-            window = make_usage_window(days, tz, start, end)
-            result = summarize(records, window)
-            result["pricing"] = dict(self._pricing)
+        rates, pricing = self.pricing_snapshot(refresh)
+        from muteki.core.usage_routes import recover_usage_routes
+        rows = recover_usage_routes(list(rows), self.root)
+        records = _select(price_records(ledger_to_records(rows), rates, resolver=self.price_store.resolver(rates)), engine, model)
+        if start == 0:
+            start = min((row["at_ms"] / 1000 for row in records), default=end or time.time())
+        window = make_usage_window(days, tz, start, end)
+        result = summarize(records, window)
+        result["pricing"] = pricing
         result["sources"] = [{"engine": row["engine"], "status": "ready", "scope": "muteki", "message": "仅统计 Muteki 内部用量"}
                              for row in result["providers"]]
         return result
@@ -716,21 +902,23 @@ class ProviderUsage:
              engine: str | None = None, model: str | None = None) -> dict:
         window = make_usage_window(days, tz, start, end)
         cutoff = min(int((time.time() - 91 * 86400) * 1000), window.since_ms)
-        with self._lock:
+        with self._history_lock:
             self._load_scan_cache()
             records, sources, active = [], [], set()
             with ThreadPoolExecutor(max_workers=4, thread_name_prefix="usage-read") as pool:
                 scans = [pool.submit(self._scan_transcripts, engine, cutoff) for engine in ("codex", "claude", "grok")]
                 scans.append(pool.submit(self._scan_opencode, cutoff))
                 cursor_future = pool.submit(self._read_cursor, window, refresh or start is not None or end is not None)
-                rates_future = pool.submit(self._load_rates, refresh)
+                rates_future = pool.submit(self.pricing_snapshot, refresh)
                 for future in scans:
                     rows, source, paths = future.result()
                     records.extend(rows)
                     sources.append(source)
                     active.update(paths)
-                rates = rates_future.result()
+                rates, pricing = rates_future.result()
                 cursor = cursor_future.result()
+            from muteki.core.usage_routes import recover_usage_routes
+            ledger_records = recover_usage_routes(list(ledger_records), self.root)
             supplemental = [row for row in ledger_to_records(ledger_records) if row["engine"] not in NATIVE_ENGINES]
             records.extend(supplemental)
             for ledger_engine in sorted(set(LEDGER_ENGINES) | {row["engine"] for row in supplemental}):
@@ -743,7 +931,7 @@ class ProviderUsage:
                 error = cursor.get("error") or cursor.get("history_error")
                 sources.append({"engine": "cursor", "scope": "account", "status": "error" if error else "ready",
                                 "message": error.get("message") if error else "Cursor 账户历史", "code": error.get("code") if error else None})
-            records = _select(price_records(records, rates), engine, model)
+            records = _select(price_records(records, rates, resolver=self.price_store.resolver(rates)), engine, model)
             if start == 0:
                 first = min((row["at_ms"] / 1000 for row in records), default=end or time.time())
                 window = make_usage_window(days, tz, first, end)
@@ -756,7 +944,7 @@ class ProviderUsage:
             sources.extend(result["sources"])
             sources = [source for source in sources if not engine or source["engine"] == canonical_engine(engine)]
             result["sources"] = sources
-            result["pricing"] = dict(self._pricing)
+            result["pricing"] = pricing
             self._save_scan_cache(active)
             if self._cache_issue:
                 result["cache_warning"] = self._cache_issue

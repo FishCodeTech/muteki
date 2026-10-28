@@ -47,9 +47,12 @@
   cursor: pointer;
   transition: color var(--control-feedback-dur), background-color var(--control-feedback-dur);
 }
-.workspace-rail-control:hover, .workspace-rail-control[aria-current="page"] {
+.workspace-rail-control:hover { color: var(--bright); background: var(--panel2); }
+.workspace-rail-control[aria-current="page"],
+.workspace-rail-control[aria-current="page"]:hover {
   color: var(--bright);
-  background: var(--panel2);
+  background: var(--cx-bg, var(--bg));
+  box-shadow: 0 0 0 1px var(--line), 0 1px 2px rgb(0 0 0 / 6%);
 }
 .workspace-rail-control:focus-visible { outline: 2px solid var(--focus-ring, var(--blue)); outline-offset: 2px; }
 .workspace-rail-badge {
@@ -69,6 +72,27 @@
 .workspace-rail-divider { width: 22px; height: 1px; margin: 2px 0; background: var(--line); }
 .workspace-rail-sidebar-toggle { display: none; }
 .workspace-frame[data-conversation-sidebar-collapsed="true"] .workspace-rail-sidebar-toggle { display: inline-flex; }
+
+/* Wide screens float the workspace on a raised rounded card like the desktop
+ * shell: the rail keeps the frame color with no divider; narrow screens stay
+ * flush so the mobile drawer can slide in from the rail edge. */
+@media (min-width: 769px) {
+  .workspace-frame {
+    --workspace-card-radius: 12px;
+    --workspace-card-shadow: 0 0 0 1px var(--cx-border-subtle, var(--line)), 0 1px 3px hsl(var(--cx-shadow-color, 220 40% 8%) / .07), 0 10px 30px -10px hsl(var(--cx-shadow-color, 220 40% 8%) / .2);
+    background: var(--rail);
+  }
+  .workspace-frame-content {
+    margin: 8px 8px 8px 0;
+    border-radius: var(--workspace-card-radius);
+    background: var(--cx-bg, var(--bg));
+    box-shadow: var(--workspace-card-shadow);
+  }
+  .workspace-activity-rail { border-right: 0; }
+}
+:root[data-theme="dark"] .workspace-frame {
+  --workspace-card-shadow: 0 0 0 1px var(--cx-border, var(--line)), 0 1px 3px hsl(0 0% 0% / .4), 0 12px 34px -10px hsl(0 0% 0% / .7);
+}
 
 /* A narrower workbench can wrap its controls without overlapping the canvas. */
 @container conversation (max-width: 760px) {
@@ -102,6 +126,7 @@
     max-height: none !important;
     overflow: visible !important;
   }
+  .workspace-frame-content { margin: 0; border-radius: 0; box-shadow: none; }
   .workspace-activity-rail,
   .workspace-rail-control { display: none !important; }
 }

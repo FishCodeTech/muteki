@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { DeckState, EventType, MutekiEvent, emptyDeck, reduce } from "./events";
 import { deleteRunProjection, loadRunProjection, saveRunProjection } from "./runProjectionCache";
 import { API, apiFetch, authTicket } from "./serviceAuth";
+import { isDesktopWorkspaceActive } from "./desktopEnvironment";
 export { API, apiFetch, authTicket, login, logout, checkAuth, onAuthRequired, currentAuthGeneration, currentAuthScope, currentAuthPersistenceWarning, resetAuthForServiceChange } from "./serviceAuth";
 
 const CONTROL_CAS_ACTIONS = new Set([
@@ -372,7 +373,7 @@ export function useRunList(pollMs = 4000, bump = 0) {
     let alive = true;
     let inFlight: AbortController | null = null;
     const load = async () => {
-      if (inFlight) return;
+      if (inFlight || !isDesktopWorkspaceActive()) return;
       const ctrl = new AbortController();
       inFlight = ctrl;
       const timeout = window.setTimeout(() => ctrl.abort(), Math.max(3000, Math.min(10000, pollMs * 2)));
@@ -522,7 +523,7 @@ export function useEngines(pollMs = 300000): EngineStatus[] {
   useEffect(() => {
     let alive = true;
     const load = async () => {
-      if (inFlight.current) return;
+      if (inFlight.current || !isDesktopWorkspaceActive()) return;
       inFlight.current = true;
       try {
         const r = await apiFetch(`/api/engines`);
@@ -594,6 +595,7 @@ export function useFolders(pollMs = 8000, bump = 0): Folder[] {
   useEffect(() => {
     let alive = true;
     const load = async () => {
+      if (!isDesktopWorkspaceActive()) return;
       const f = await listFolders();
       if (alive) setFolders(f);
     };
@@ -949,6 +951,37 @@ export async function testGlobalCredential(
       ? "测试超时（>180s），请检查引擎状态后重试"
       : String(error);
     return parseWorkerModelTestResult(null, { ok: false, detail, engine, backend, model });
+  }
+}
+
+/** Real model turn for a credential that is not saved yet; the service keeps nothing from it. */
+export async function testCredentialDraft(body: {
+  engine: string;
+  backend: "local" | "container";
+  connection: "official" | "custom_endpoint";
+  model: string;
+  base_url?: string;
+  secret?: string;
+  codex_auth_json?: string;
+  provider?: string;
+}): Promise<WorkerModelTestResult> {
+  const fallback = { engine: body.engine, backend: body.backend, model: body.model };
+  try {
+    const response = await apiFetch(`/api/settings/credential-drafts/test`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(180_000),
+    });
+    const payload = await response.json().catch(() => ({}));
+    return parseWorkerModelTestResult(payload, {
+      ...fallback,
+      ok: response.ok && Boolean(payload.ok),
+      detail: String(payload.detail?.message ?? payload.detail ?? (response.ok ? "" : `HTTP ${response.status}`)),
+    });
+  } catch (error) {
+    const detail = (error as Error)?.name === "TimeoutError" ? "测试超时（>180s），请检查端点后重试" : String(error);
+    return parseWorkerModelTestResult(null, { ...fallback, ok: false, detail });
   }
 }
 

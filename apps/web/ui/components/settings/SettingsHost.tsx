@@ -4,7 +4,7 @@ import { createContext, useContext, useEffect, useMemo, useRef, type AnchorHTMLA
 import { useLang } from "@/lib/i18n";
 import { conversationStorageScope, subscribeConversationStorageScope } from "@/lib/conversationStorageScope";
 import { useSyncExternalStore } from "react";
-import { SETTINGS_PAGES, SETTINGS_GROUP_LABELS, settingsGroups, settingsPageFromPath, settingsStorageDescription, type SettingsClient } from "./catalog";
+import { SETTINGS_PAGES, SETTINGS_GROUP_LABELS, settingsGroups, settingsPageFromPath, type SettingsClient } from "./catalog";
 import { localizedSettingsEntries, settingsAnchorFromHash } from "./settingsIndex";
 import { SettingsNav, SettingsPage, revealSettingsAnchor, type SettingsNavLinkProps } from "./primitives";
 import { SettingsCompatibility } from "./SettingsCompatibility";
@@ -51,7 +51,12 @@ export function SettingsHost({ children, back, ...host }: SettingsHostValue & {
   const scope = useSyncExternalStore(subscribeConversationStorageScope, conversationStorageScope, () => "");
   const {hash, anchorRequestId, consumeAnchor} = host.navigation;
   const scroller = useRef<HTMLDivElement>(null);
-  useEffect(() => { scroller.current?.scrollTo({ top: 0 }); }, [active]);
+  const previousPageRef = useRef(active);
+  useEffect(() => {
+    if (previousPageRef.current === active) return;
+    previousPageRef.current = active;
+    scroller.current?.scrollTo({ top: 0 });
+  }, [active]);
   useEffect(() => {
     const anchor = settingsAnchorFromHash(hash || "");
     if (!anchor || !active) return;
@@ -76,7 +81,7 @@ export function SettingsHost({ children, back, ...host }: SettingsHostValue & {
         labels={{search: en ? "Search settings" : "搜索设置", clear: en ? "Clear search" : "清除搜索", empty: en ? "No matching settings" : "没有匹配的设置", nav: en ? "Settings categories" : "设置分类", items: en ? "Settings" : "设置项"}} />
       <div ref={scroller} id="settings-main" className="cx-settings-content">
         <SettingsPage wide={meta?.wide} title={meta?.label[en ? 1 : 0] || (en ? "Page not found" : "设置页面不存在")}
-          description={meta ? <>{meta.description[en ? 1 : 0]}<span className="mt-1 block text-[12px]">{settingsStorageDescription(meta.id, en)}</span></> : undefined}>
+          description={meta?.description[en ? 1 : 0]}>
           <SettingsCompatibility page={active}>{children}</SettingsCompatibility>
         </SettingsPage>
       </div>

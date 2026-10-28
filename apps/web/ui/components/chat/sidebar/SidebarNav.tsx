@@ -1,6 +1,6 @@
 "use client";
 
-import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { cn } from "@/lib/cn";
 import { copyToClipboard } from "@/lib/clipboard";
@@ -148,6 +148,7 @@ function absoluteHref(href: string): string {
 }
 
 export const SidebarNav = memo(function SidebarNav({
+  labels,
   projectFilter,
   bulkActions,
   sections,
@@ -179,6 +180,11 @@ export const SidebarNav = memo(function SidebarNav({
   onSelectBodyHit,
   loading = false,
 }: SidebarNavProps) {
+  // Retained shells coexist off-screen; aria-referenced ids must stay unique.
+  const instanceId = useId();
+  const listId = `${instanceId}-list`;
+  const searchHintId = `${instanceId}-search-hint`;
+  const projectsId = `${instanceId}-projects`;
   const reduced = useReducedMotion();
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [collapsedIds, setCollapsedIds] = useState<Set<string>>(() => new Set());
@@ -1299,13 +1305,13 @@ export const SidebarNav = memo(function SidebarNav({
   const renderedMenu = menu ?? lastMenuRef.current;
 
   return (
-    <nav className={cn("cx-sidebar-nav flex h-full min-h-0 flex-col", className)} aria-label="对话列表">
+    <nav className={cn("cx-sidebar-nav flex h-full min-h-0 flex-col", className)} aria-label={labels?.title ?? "对话列表"}>
       <p className="sr-only" aria-live="polite" aria-atomic="true">{liveMessage}</p>
 
       <div className="flex flex-none flex-col gap-2 px-3 pb-3 pt-2">
         <button type="button" onClick={onNewChat} data-cx-new-chat="" className="cx-sb-new group/new">
           <Icon name="edit" size={16} />
-          <span className="flex-1 text-left">新对话</span>
+          <span className="flex-1 text-left">{labels?.newThread ?? "新对话"}</span>
           <Shortcut keys="mod+shift+n" tone="subtle" className="cx-sb-new-kbd" />
         </button>
         {onSearchChange ? (
@@ -1315,12 +1321,12 @@ export const SidebarNav = memo(function SidebarNav({
               value={searchQuery}
               onValueChange={onSearchChange}
               onKeyDown={onSearchKeyDown}
-              placeholder="搜索对话"
-              aria-label="搜索对话"
-              aria-describedby="cx-sidebar-search-hint"
+              placeholder={labels?.search ?? "搜索对话"}
+              aria-label={labels?.search ?? "搜索对话"}
+              aria-describedby={searchHintId}
               className="min-w-0 flex-1"
             />
-            <span id="cx-sidebar-search-hint" className="sr-only">回车打开第一个结果，方向键下移到列表</span>
+            <span id={searchHintId} className="sr-only">回车打开第一个结果，方向键下移到列表</span>
             {onToggleActivityView ? (
               <IconButton
                 icon="bell"
@@ -1329,7 +1335,7 @@ export const SidebarNav = memo(function SidebarNav({
                 shortcut="alt+mod+u"
                 size="md"
                 active={activityView}
-                aria-controls="cx-sidebar-list"
+                aria-controls={listId}
                 onClick={onToggleActivityView}
                 className="rounded-lg"
                 badge={activityBadge > 0 ? (activityBadge > 99 ? "99+" : activityBadge) : undefined}
@@ -1411,7 +1417,7 @@ export const SidebarNav = memo(function SidebarNav({
 
       <ScrollArea
         ref={listRef}
-        id="cx-sidebar-list"
+        id={listId}
         className="flex-1 overscroll-contain px-3 pb-4"
         onKeyDown={onListKeyDown}
         onPointerDownCapture={() => {
@@ -1457,7 +1463,7 @@ export const SidebarNav = memo(function SidebarNav({
             <SectionLabel
               title="项目"
               collapsed={!searching && projectsCollapsed}
-              controlsId="sidebar-projects"
+              controlsId={projectsId}
               onToggle={() => setProjectsCollapsed((value) => !value)}
               actions={onCreateFolder ? (
                 <button
@@ -1472,14 +1478,14 @@ export const SidebarNav = memo(function SidebarNav({
               ) : undefined}
             />
             <Collapse open={searching || !projectsCollapsed}>
-              <div id="sidebar-projects" className="flex flex-col gap-0.5">
+              <div id={projectsId} className="flex flex-col gap-0.5">
                 {visibleFolders.map(renderFolder)}
                 {!visibleFolders.length && onCreateFolder ? (
                   <button
                     type="button"
                     data-cx-nav-row=""
                     onClick={onCreateFolder}
-                    className="cx-press flex h-8 items-center gap-2 rounded-lg pl-2.5 text-left text-[14px] text-cx-fg-3 outline-none hover:bg-cx-hover hover:text-cx-fg focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-[var(--cx-focus)]"
+                    className="cx-press flex h-8 items-center gap-2 rounded-lg pl-2.5 text-left text-[13px] text-cx-fg-4 outline-none hover:bg-cx-hover hover:text-cx-fg focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-[var(--cx-focus)]"
                   >
                     <Icon name="folderPlus" size={15} />
                     新建项目文件夹
@@ -1494,12 +1500,12 @@ export const SidebarNav = memo(function SidebarNav({
 
         {showEmpty ? (
           searching ? (
-            <EmptyState compact icon="search" title="没有匹配的对话" description={`找不到标题包含「${query}」的对话`} />
+            <EmptyState compact icon="search" title={`没有匹配的${labels?.thread ?? "对话"}`} description={`找不到标题包含「${query}」的${labels?.thread ?? "对话"}`} />
           ) : (
             <EmptyState
               compact
-              title="还没有对话"
-              description="开始一段新对话，它会出现在这里。"
+              title={`还没有${labels?.thread ?? "对话"}`}
+              description={`开始一段新${labels?.thread ?? "对话"}，它会出现在这里。`}
             />
           )
         ) : null}

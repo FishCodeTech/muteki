@@ -22,7 +22,7 @@ import {
 } from "@/components/chat/surfaces/shared";
 
 /** Below this main-column width the card would cover the transcript, so it becomes a popover. */
-const FLOATING_MIN_WIDTH = 880;
+const FLOATING_MIN_WIDTH = 1000;
 
 type ChangesState =
   | { phase: "idle" | "loading" }

@@ -55,6 +55,9 @@ export function citingKnowledge(
   const cited = new Map<string, CollaborationKnowledgeItem>();
   for (const row of knowledge) {
     if (row.id === item.id) continue;
+    if (item.goalId && row.goalId === item.goalId && (item.kind === "goal" || row.kind === "goal")) cited.set(row.id, row);
+    if (typeof item.factSeq === "number" && (row.fromFactSeqs?.includes(item.factSeq) || row.evidenceFactSeqs?.includes(item.factSeq) || row.replacementFactSeq === item.factSeq)) cited.set(row.id, row);
+    if (typeof row.factSeq === "number" && (item.fromFactSeqs?.includes(row.factSeq) || item.evidenceFactSeqs?.includes(row.factSeq) || item.replacementFactSeq === row.factSeq)) cited.set(row.id, row);
     if (item.intentId && row.intentId === item.intentId) cited.set(row.id, row);
     if (typeof item.factSeq === "number" && row.factSeq === item.factSeq) cited.set(row.id, row);
   }
@@ -234,6 +237,7 @@ export function KnowledgeDetail({
       <div className="collab-selected-knowledge-content">
         <strong>{item.title}</strong>
         {item.detail && item.detail !== item.title && <p>{item.detail}</p>}
+        {item.description && item.description !== item.detail && <p>{item.description}</p>}
       </div>
       <dl>
         <dt>{t("collab.field.agent")}</dt><dd>{actor || t("collab.unassigned")}</dd>
@@ -262,6 +266,16 @@ export function KnowledgeDetail({
             </dd>
           </>
         )}
+        {item.goalId && item.kind !== "goal" && <><dt>{t("collab.field.goal")}</dt><dd><KnowledgeLink target={findKnowledge(knowledge, `goal:${item.goalId}`)} label={item.goalId} onSelect={onSelectKnowledge} /></dd></>}
+        {item.question && <><dt>{t("collab.field.question")}</dt><dd>{item.question}</dd></>}
+        {item.answer && <><dt>{t("collab.field.answer")}</dt><dd>{item.answer}</dd></>}
+        {!!item.fromFactSeqs?.length && <><dt>{t("collab.field.inputs")}</dt><dd>{onSelectKnowledge ? <FactSeqLinks seqs={item.fromFactSeqs} knowledge={knowledge} onSelect={onSelectKnowledge} /> : item.fromFactSeqs.map((seq) => `#${seq}`).join(", ")}</dd></>}
+        {!!item.evidenceFactSeqs?.length && <><dt>{t("collab.field.evidence")}</dt><dd>{onSelectKnowledge ? <FactSeqLinks seqs={item.evidenceFactSeqs} knowledge={knowledge} onSelect={onSelectKnowledge} /> : item.evidenceFactSeqs.map((seq) => `#${seq}`).join(", ")}</dd></>}
+        {!!item.requiresCapabilities?.length && <><dt>{t("collab.field.requiresCapabilities")}</dt><dd>{item.requiresCapabilities.join(", ")}</dd></>}
+        {!!item.requiredPocs?.length && <><dt>{t("collab.knowledge.resource")}</dt><dd>{item.requiredPocs.join(", ")}</dd></>}
+        {item.retirementReason && <><dt>{t("collab.field.retirementReason")}</dt><dd>{item.retirementReason}</dd></>}
+        {item.retiredTs && <><dt>{t("collab.field.retiredAt")}</dt><dd><EventStamp ts={item.retiredTs} /></dd></>}
+        {item.replacementFactSeq !== undefined && <><dt>{t("collab.field.replacement")}</dt><dd><KnowledgeLink target={findKnowledge(knowledge, `fact:${item.replacementFactSeq}`)} label={`#${item.replacementFactSeq}`} onSelect={onSelectKnowledge} /></dd></>}
         {verifier && <><dt>{t("collab.field.verifier")}</dt><dd>{verifier}</dd></>}
         {typeof item.confidence === "number" && <><dt>{t("collab.field.confidence")}</dt><dd>{item.confidence.toFixed(2)}</dd></>}
         {item.witness && <><dt>{t("collab.field.witness")}</dt><dd>{item.witness}</dd></>}

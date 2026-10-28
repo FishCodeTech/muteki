@@ -242,8 +242,23 @@ class MutekiCommandApiImpl:
             handler = self._registry.command_handler(command.command_type)
         except CommandAPIError as exc:
             return self._transient_receipt(command, ReceiptState.FAILED, exc.error)
+        continuation_hook = getattr(handler, "dispatch_with_plan", None)
+        if callable(continuation_hook):
+            async def continue_dispatch(planner: Any) -> CommandReceipt:
+                return await self._dispatch_with_planner(
+                    command, planner, binding, correlation_id)
+
+            return await continuation_hook(command, continue_dispatch)
+        return await self._dispatch_with_planner(
+            command, handler.plan, binding, correlation_id)
+
+    async def _dispatch_with_planner(
+        self, command: CommandEnvelope, planner: Any,
+        binding: Optional[CapabilityBinding], correlation_id: str,
+    ) -> CommandReceipt:
+        """Keep normal error, commit and delivery semantics inside admission."""
         try:
-            plan = await handler.plan(
+            plan = await planner(
                 command, self._ctx(command.actor, binding, correlation_id))
         except CommandFailed as exc:
             # 业务终态（校验 / not_found / 冲突）：持久化，重试返回同一回执。
@@ -538,7 +553,8 @@ class MutekiCommandApiImpl:
             request.aggregate_type, request.aggregate_id)
         limit = self._clamp_limit(request.limit)
         # 多读一条判断是否还有后续；next_cursor 仅在还有后续事件时返回。
-        rows = self._store.read_events(
+        rows = await asyncio.to_thread(
+            self._store.read_events,
             request.aggregate_type, request.aggregate_id,
             after_seq=after, limit=limit + 1)
         has_more = len(rows) > limit
@@ -563,7 +579,8 @@ class MutekiCommandApiImpl:
                                self._max_wait_seconds))
         deadline = time.monotonic() + timeout
         while True:
-            rows = self._store.read_events(
+            rows = await asyncio.to_thread(
+                self._store.read_events,
                 request.aggregate_type, request.aggregate_id,
                 after_seq=after, limit=limit)
             if rows:

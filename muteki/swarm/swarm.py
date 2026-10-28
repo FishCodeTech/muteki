@@ -22,9 +22,11 @@ from typing import TYPE_CHECKING, Any, Optional
 if TYPE_CHECKING:
     from muteki.learning.distill import TemplateStore
 
+from muteki.core.blocking import run_blocking
 from muteki.core.cost import CostController
 from muteki.core.event_bus import EventBus
 from muteki.core.llm import LLMClient, ModelSpec
+from muteki.core.runtime_env import is_single_container
 from muteki.models.solve_graph import Challenge
 from muteki.sandbox.manager import SandboxManager
 from muteki.solver.container_exec import WORKER_IMAGE
@@ -259,6 +261,7 @@ class Swarm(
         # fresh attempts until it solves or the operator stops it. A clean/offline
         # eval can still cap this by passing a finite budget.
         wall_clock_budget: float = float("inf"),
+        execution_budget: "Optional[Any]" = None,
         # ── race-scout layer (DESIGN_race_scout_layer.md) ────────────────────
         # A one-round, multi-engine, SINGLE-SHOT race in front of the coordinator
         # loop: 3 fresh single-shot bootstrap workers (claude/codex/cursor) probe the
@@ -339,7 +342,11 @@ class Swarm(
         # 注册表；Conversation 的 ACP/App Server/SDK Runtime 不参与调度。
         adapter_registry: "Optional[Any]" = None,
     ) -> None:
+        if is_single_container() and worker_backend != "local":
+            raise ValueError(
+                "MUTEKI_CONTAINER_MODE=single requires worker_backend 'local'")
         self.challenge = challenge
+        self.execution_budget = execution_budget
         self.lineup = lineup
         self.llm = llm
         self._reason_max_intents_override: int | None = None
@@ -395,8 +402,9 @@ class Swarm(
             if raw_dispatch_mode in {"fixed", "auto"}
             else "fixed"
         )
-        # Cairn-y runs at most three Workers for one challenge.  Auto mode may
-        # reuse healthy profiles, but that must not increase per-run concurrency.
+        max_workers = max(0, int(max_workers))
+        # Keep the product's automatic CTF mode at three concurrent Workers;
+        # fixed dispatch continues to use the operator's configured capacity.
         if (
             getattr(self.challenge, "mode", "ctf") == "ctf"
             and self.dispatch_mode == "auto"
@@ -534,6 +542,11 @@ class Swarm(
         self._active_profile_by_solver: dict[str, str] = {}
         self._active_profile_role_by_solver: dict[str, str] = {}
         self._active_profile_counts: dict[str, int] = {}
+        self._spawned_profile_counts: dict[str, int] = {}
+        self._challenger_task: Optional[asyncio.Task[int]] = None
+        self._challenger_last_progress_count = 0
+        self._challenger_baseline_done = 0
+        self._last_challenger_done_count = 0
         self._active_review_profile_counts: dict[str, int] = {}
         self._active_verifier_profile_counts: dict[str, int] = {}
         self._active_account_by_solver: dict[str, str] = {}
@@ -750,6 +763,9 @@ class Swarm(
         # consumed by the next _make_cli_worker spawn, then cleared. This is the
         # accepted granularity degrade: turn-level live steering → intent-level.
         self._target_redirect: "Optional[str]" = None
+        self._target_restart_in_progress = False
+        from muteki.hosted.target_restart import install_swarm_restart
+        install_swarm_restart(self)
         self._next_worker_guidance: "list[str]" = []
         # ── operator-blocked state (worker raised its hand / env down) ────────
         # When a worker emits a HITL_REQUEST (NEED_INPUT / env_down), the coordinator
@@ -844,6 +860,9 @@ class Swarm(
                 challenge=challenge,
                 artifacts=artifacts,
             )
+            self.shared_graph._target_epoch = str(self._target_epoch)
+            self.shared_graph._run_id = self.run_id
+            self.shared_graph._workspace_root = self.workspace_root
             from muteki.swarm.state_port import V1SearchStatePort
 
             self._search_state_port = V1SearchStatePort(
@@ -900,14 +919,29 @@ async def run_swarm(
     run_id: Optional[str] = None,
 ) -> SwarmOutcome:
     """Functional entry point mirroring §5.4's run_swarm signature."""
-    return await Swarm(
-        challenge,
-        lineup,
-        llm=llm,
-        sandbox=sandbox,
-        bus=bus,
-        cost=cost,
-        artifacts=artifacts,
-        config=config,
-        run_id=run_id,
-    ).run()
+    created: list[Swarm] = []
+
+    def construct() -> Swarm:
+        swarm = Swarm(
+            challenge,
+            lineup,
+            llm=llm,
+            sandbox=sandbox,
+            bus=bus,
+            cost=cost,
+            artifacts=artifacts,
+            config=config,
+            run_id=run_id,
+        )
+        created.append(swarm)
+        return swarm
+
+    try:
+        swarm = await run_blocking(construct)
+    except BaseException:
+        for instance in created:
+            graph = getattr(instance, "shared_graph", None)
+            if graph is not None:
+                await run_blocking(graph.close)
+        raise
+    return await swarm.run()

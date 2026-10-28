@@ -17,6 +17,7 @@ docker/worker/offline_acp_bridge.py
 docker/worker/omp_offline_config.yml
 docker/worker/kimi_offline_agent.md
 docker/worker/grok_offline_agent.md
+docker/worker/muteki-runtime/
 
 # Slim worker image build context. build.sh cross-compiles runtime_agent and copies
 # skill/bridges/profiles from maintained sources. AGENTS.md is tracked here with
@@ -30,6 +31,7 @@ docker/worker-slim/offline_acp_bridge.py
 docker/worker-slim/omp_offline_config.yml
 docker/worker-slim/kimi_offline_agent.md
 docker/worker-slim/grok_offline_agent.md
+docker/worker-slim/muteki-runtime/
 
 # Virtual environments
 .venv
@@ -111,3 +113,6 @@ data/
 /apps/web/ui/.next-readme/
 /apps/web/ui/.next-desktop/
 /apps/desktop/dist-dev/
+
+# Local design prototypes (not part of the app build)
+/prototypes/

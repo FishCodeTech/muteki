@@ -173,7 +173,7 @@ class Result(BaseModel):
         )
 
     def for_model(self) -> str:
-        """Compact text the LLM consumes (never the raw artifact)."""
+        """Keep selected fields complete and reference the original artifact."""
         parts: list[str] = []
         if self.error:
             parts.append(f"ERROR: {self.error}")
@@ -182,7 +182,7 @@ class Result(BaseModel):
         if self.evidence:
             parts.append(f"evidence: {self.evidence}")
         if self.data:
-            parts.append(f"data: {json.dumps(self.data, default=str)[:1000]}")
+            parts.append(f"data: {json.dumps(self.data, default=str)}")
         if self.artifact_id:
             parts.append(
                 f"[full output saved as artifact {self.artifact_id}; "

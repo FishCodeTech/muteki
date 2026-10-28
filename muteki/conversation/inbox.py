@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 from uuid import uuid4
 
+from .models import TURN_QUEUED
+
 
 PENDING_NONE = "none"
 PENDING_APPROVAL = "approval"
@@ -79,6 +81,7 @@ def attention_fingerprint(
     pending_thread_id: Optional[str] = None,
     attention_owner_id: Optional[str] = None,
     subagent_attention: Iterable[dict[str, Any]] = (),
+    work_pending: bool = False,
 ) -> str:
     delegated = ",".join(
         f"{row['thread_id']}:{row['pending_kind']}:{row.get('pending_id') or ''}:{row.get('title') or ''}"
@@ -90,6 +93,7 @@ def attention_fingerprint(
             str(int(revision or 0)),
             str(status or ""),
             "1" if running else "0",
+            "1" if work_pending else "0",
             "1" if unread else "0",
             str(pending_kind or PENDING_NONE),
             str(pending_id or ""),
@@ -113,6 +117,7 @@ def build_attention_summary(
     *,
     attention_owner_id: Optional[str] = None,
     subagent_attention: Optional[list[dict[str, Any]]] = None,
+    queued_turn: bool = False,
 ) -> dict[str, Any]:
     """Build one ThreadAttentionSummary (+ list row) from Thread + ThreadState.
 
@@ -135,6 +140,16 @@ def build_attention_summary(
     owner = attention_owner_id or thread_id
     unread = bool(getattr(state, "unread", False))
     running = bool(getattr(state, "running_turn_id", None))
+    # A spawned child's first turn sits in queued status until the runtime
+    # starts it (its queue row is already consumed by then); queued follow-ups
+    # wait in the active queue. Either way the Thread still holds live work, so
+    # surface it so a re-emitted row keeps the delegation visible.
+    queue_active = bool(
+        int(getattr(state, "queue_count", 0) or 0) > 0
+        and not bool(getattr(state, "queue_paused", False))
+        and not getattr(state, "queue_failed_item_id", None)
+    )
+    work_pending = queue_active or queued_turn
     revision = int(getattr(state, "attention_stream_seq", 0) or 0)
     status = str(getattr(state, "status", "") or "active")
     title = str(getattr(thread, "title", "") or "")
@@ -150,12 +165,14 @@ def build_attention_summary(
         pending_thread_id=pending_thread_id,
         attention_owner_id=owner,
         subagent_attention=delegated,
+        work_pending=work_pending,
     )
     thread_row = {
         **thread.model_dump(mode="json"),
         "state": {
             **state.model_dump(mode="json"),
             "unread": unread,
+            "queued_turn": queued_turn,
         },
     }
     summary = {
@@ -341,6 +358,11 @@ def collect_attention_rows(manager: Any, project_id: str = "") -> list[dict[str,
     """
     threads = manager.list_threads(project_id)
     states = {thread.thread_id: manager.conv.get_state(thread.thread_id) for thread in threads}
+    queued_turn_threads = {
+        str(turn.thread_id)
+        for turn in manager.conv.list_active_turns()
+        if str(turn.status) == TURN_QUEUED
+    }
     owners: dict[str, str] = {}
     delegated: dict[str, list[dict[str, Any]]] = {}
     for thread in threads:
@@ -375,5 +397,6 @@ def collect_attention_rows(manager: Any, project_id: str = "") -> list[dict[str,
             thread, states[thread.thread_id],
             attention_owner_id=owners.get(thread.thread_id),
             subagent_attention=items,
+            queued_turn=thread.thread_id in queued_turn_threads,
         ))
     return rows

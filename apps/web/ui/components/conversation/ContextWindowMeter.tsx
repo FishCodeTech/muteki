@@ -13,7 +13,6 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/cn";
-import { Icon } from "@/components/Icon";
 import { Badge, Button, Popover, type Tone } from "@/components/chat/ui";
 import type { ContextWindowState } from "@/lib/useConversation";
 import { requestThreadCompact } from "@/lib/useConversation";
@@ -79,30 +78,43 @@ type CompactCommand =
   | { state: "unavailable"; reason: string }
   | { state: "error"; reason: string };
 
-function useCompactCommand(context: ComposerCapabilityContext | undefined): CompactCommand {
-  const [command, setCommand] = useState<CompactCommand>({ state: "loading" });
+function useCompactCommand(context: ComposerCapabilityContext | undefined): { command: CompactCommand; retry: () => void } {
   const key = context ? JSON.stringify(context) : "";
+  const [retry, setRetry] = useState(0);
+  const [result, setResult] = useState<{ key: string; command: CompactCommand }>({ key, command: { state: "loading" } });
   useEffect(() => {
+    const setCommand = (command: CompactCommand) => setResult({ key, command });
     if (!context) {
       setCommand({ state: "unavailable", reason: "当前对话还没有可用的 Agent Runtime" });
       return;
     }
     const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
     setCommand({ state: "loading" });
-    fetchComposerCapabilities(context, "/", "compact", controller.signal).then((catalog) => {
+    const load = () => fetchComposerCapabilities(context, "/", "compact", controller.signal).then((catalog) => {
+      if (controller.signal.aborted) return;
       const item = catalog.items.find((row) => row.kind === "command" && row.name.toLowerCase() === "compact");
-      if (!item) setCommand({ state: "unavailable", reason: "此引擎没有公布 /compact 命令" });
+      if ((!item || item.invocable === false) && catalog.runtime.refresh_status === "refreshing") {
+        setCommand({ state: "loading" });
+        timer = setTimeout(() => void load(), 1_000);
+      } else if (catalog.runtime.refresh_status === "failed" && (!item || item.invocable === false)) {
+        setCommand({ state: "error", reason: catalog.runtime.last_error || "命令目录刷新失败" });
+      } else if (!item) setCommand({ state: "unavailable", reason: "此引擎没有公布 /compact 命令" });
       else if (item.invocable === false) setCommand({ state: "unavailable", reason: item.reason || "/compact 当前不可执行" });
       else setCommand({ state: "available" });
     }).catch((err: unknown) => {
       if (controller.signal.aborted) return;
       setCommand({ state: "error", reason: err instanceof Error ? err.message : "命令目录加载失败" });
     });
-    return () => controller.abort();
+    void load();
+    return () => { controller.abort(); clearTimeout(timer); };
     // The serialized key carries every field of the context.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key]);
-  return command;
+  }, [key, retry]);
+  return {
+    command: result.key === key ? result.command : { state: "loading" },
+    retry: () => setRetry((value) => value + 1),
+  };
 }
 
 function useCompaction(threadId: string, onRefresh?: () => void) {
@@ -138,11 +150,12 @@ function MeterDetails({
   compactError: string;
   onCompact: () => void;
 }) {
-  const compactCommand = useCompactCommand(capabilityContext);
+  const { command: compactCommand, retry: retryCompactCommand } = useCompactCommand(capabilityContext);
   const total = contextWindow?.total ?? null;
   const limit = contextWindow?.limit ?? null;
   const compactStatus = contextWindow?.compact_status ?? "idle";
   const compacted = contextWindow?.compacted ?? [];
+  const compactUnconfirmed = compactStatus === "done" && compacted.at(-1)?.confirmed === false;
   const zones = contextWindow?.zones ?? [];
   const pct = total != null && limit != null && limit > 0
     ? Math.min(100, Math.round((total / limit) * 100))
@@ -159,7 +172,9 @@ function MeterDetails({
         <h3 className="text-[13px] font-semibold text-cx-fg">上下文窗口</h3>
         <div className="flex items-center gap-2">
           {compactStatus !== "idle" ? (
-            <Badge tone={STATUS_TONE[compactStatus]}>{STATUS_LABEL[compactStatus]}</Badge>
+            <Badge tone={compactUnconfirmed ? "neutral" : STATUS_TONE[compactStatus]}>
+              {compactUnconfirmed ? "压缩结果未确认" : STATUS_LABEL[compactStatus]}
+            </Badge>
           ) : null}
           {contextWindow?.updated_at ? (
             <span className="text-[12px] text-cx-fg-4">{relativeTime(contextWindow.updated_at)}更新</span>
@@ -223,6 +238,9 @@ function MeterDetails({
           {compactReason ? (
             <p className={cn("text-[12px]", compactCommand.state === "error" ? "text-cx-danger" : "text-cx-fg-4")}>{compactReason}</p>
           ) : null}
+          {compactReason && capabilityContext ? (
+            <Button size="sm" variant="secondary" onClick={retryCompactCommand}>刷新命令目录</Button>
+          ) : null}
           {compactError ? <p className="text-[12px] text-cx-danger">{compactError}</p> : null}
           {compacted.length > 0 ? (
             <div className="flex flex-col gap-1.5">
@@ -234,7 +252,7 @@ function MeterDetails({
                     <span className={rec.status === "failed" ? "text-cx-danger" : "text-cx-fg-4"}>
                       {rec.status === "failed" ? "失败"
                         : rec.status === "interrupted" ? "已中断"
-                          : rec.confirmed === false ? "回合结束（引擎未上报压缩结果）" : "完成"}
+                          : rec.confirmed === false ? "结果未确认（引擎未上报压缩结果）" : "完成"}
                     </span>
                   </div>
                   {rec.summary ? <p className="mt-0.5 line-clamp-3 leading-snug text-cx-fg-2" title={rec.summary}>{rec.summary}</p> : null}
@@ -306,13 +324,15 @@ function ContextRingTrigger({
           data-level={level}
           {...hoverHandlers}
           className={cn(
-            "cx-press relative grid size-8 shrink-0 place-items-center rounded-full hover:bg-cx-hover data-[state=open]:bg-cx-active",
+            "cx-press relative inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-full hover:bg-cx-hover data-[state=open]:bg-cx-active",
+            pct != null ? "px-2" : "w-8",
             "outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--cx-focus)]",
             LEVEL_TEXT[level],
             className,
           )}
         >
-          <ProgressRing value={running ? null : pct === null ? 0 : pct / 100} size={18} stroke={2.25} trackOpacity={level === "ok" ? 0.2 : 0.26} />
+          {pct != null ? <span aria-hidden="true" className="cx-tabular text-[12px] font-medium">{pct}%</span> : null}
+          <ProgressRing value={running ? null : pct === null ? 0 : pct / 100} size={16} stroke={2.25} trackOpacity={level === "ok" ? 0.34 : 0.4} />
         </button>
       )}
     >

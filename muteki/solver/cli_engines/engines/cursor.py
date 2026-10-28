@@ -98,6 +98,31 @@ class CursorDriver(CliDriver):
                 *self._permission_flags(launch), "--trust",
                 *self._model(), prompt]
 
+    def build_execute_input(
+        self, prompt: str, session: Optional[str], *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        if not web_access:
+            raise RuntimeError(
+                "Cursor CLI 没有可核验的原生离线 Web 工具开关；"
+                "离线评测不允许改走 ACP")
+        return ([self.bin, "-p", *self._fmt(stream),
+                 *self._permission_flags(launch), "--trust", *self._model()], prompt)
+
+    def build_resume_input(
+        self, prompt: str, session: str, *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+        launch: LaunchContext = WORKER_LAUNCH,
+    ) -> tuple[list[str], Optional[str]]:
+        if not web_access:
+            raise RuntimeError(
+                "Cursor CLI 没有可核验的原生离线 Web 工具开关；"
+                "离线评测不允许改走 ACP")
+        return ([self.bin, "-p", *self._fmt(stream),
+                 *self._permission_flags(launch), "--trust", "--resume", session,
+                 *self._model()], prompt)
+
     def build_execute_stdin(
         self, prompt: str, session: Optional[str], *,
         web_access: bool = True, kb_access: bool = True, stream: bool = False,
@@ -153,12 +178,12 @@ class CursorDriver(CliDriver):
         body = tc.get(key) or {}
         if key == "function" and isinstance(body, dict):
             return (str(body.get("name", "function")),
-                    str(body.get("arguments", ""))[:300])
+                    str(body.get("arguments", "")))
         name = key[:-8] if key.endswith("ToolCall") else key  # readToolCall → read
         arg = ""
         if isinstance(body, dict) and isinstance(body.get("args"), dict):
             a = body["args"]
-            arg = str(a.get("path") or a.get("command") or a.get("query") or "")[:300]
+            arg = str(a.get("path") or a.get("command") or a.get("query") or "")
         return (name, arg)
 
     def parse(self, stdout: str, stderr: str) -> CliResult:
@@ -190,7 +215,7 @@ class CursorDriver(CliDriver):
                     input_tokens=inp,
                     output_tokens=outp,
                     num_turns=None,
-                    raw_stderr=stderr[-2000:],
+                    raw_stderr=stderr,
                     error=_policy_refusal_error(
                         result_text, used_tools=False),
                 )
@@ -221,7 +246,7 @@ class CursorDriver(CliDriver):
             error = _policy_refusal_error(result_text, used_tools=used_tools)
         return CliResult(text=result_text, session=session, cost_usd=None,
                          input_tokens=inp, output_tokens=outp,
-                         num_turns=None, raw_stderr=stderr[-2000:],
+                         num_turns=None, raw_stderr=stderr,
                          error=error)
 
     def parse_stream_line(self, line: str) -> Optional[StreamStep]:
