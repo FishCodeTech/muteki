@@ -1,0 +1,135 @@
+name: sync-atomgit-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing GitHub release tag to mirror (for example v0.4.7)"
+        required: true
+        type: string
+      dry_run:
+        description: "Compare assets without changing AtomGit"
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      dry_run:
+        type: boolean
+        default: false
+    secrets:
+      ATOMGIT_USERNAME:
+        required: true
+      ATOMGIT_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+# Automatic and manual syncs share one lock for each release.
+concurrency:
+  group: atomgit-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      ATOMGIT_REPOSITORY: ${{ vars.ATOMGIT_REPOSITORY || 'FishCodeTech/muteki' }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Require AtomGit credentials
+        env:
+          ATOMGIT_USERNAME: ${{ secrets.ATOMGIT_USERNAME }}
+          ATOMGIT_TOKEN: ${{ secrets.ATOMGIT_TOKEN }}
+        run: |
+          if [ -z "$ATOMGIT_USERNAME" ] || [ -z "$ATOMGIT_TOKEN" ]; then
+            echo 'ATOMGIT_USERNAME and ATOMGIT_TOKEN repository secrets are required' >&2
+            exit 1
+          fi
+      - name: Download the published GitHub release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]
+          mkdir -p "$RUNNER_TEMP/atomgit-assets"
+          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > "$RUNNER_TEMP/github-release.json"
+          gh release download "$RELEASE_TAG" --dir "$RUNNER_TEMP/atomgit-assets"
+          COMMIT="$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)"
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+      - name: Mirror main and the annotated release tag to AtomGit
+        env:
+          SOURCE_COMMIT: ${{ steps.release.outputs.commit }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          ATOMGIT_USERNAME: ${{ secrets.ATOMGIT_USERNAME }}
+          ATOMGIT_TOKEN: ${{ secrets.ATOMGIT_TOKEN }}
+        run: |
+          set +x
+          set -euo pipefail
+          git fetch --no-tags origin \
+            '+refs/heads/main:refs/remotes/origin/main' \
+            "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          TAG_REF="refs/tags/$RELEASE_TAG"
+          test "$(git cat-file -t "$TAG_REF")" = tag
+          TAG_OBJECT="$(git rev-parse "$TAG_REF")"
+          test "$(git rev-parse "$TAG_REF^{commit}")" = "$SOURCE_COMMIT"
+          MAIN_COMMIT="$(git rev-parse refs/remotes/origin/main)"
+          REMOTE="https://atomgit.com/$ATOMGIT_REPOSITORY.git"
+          ASKPASS="$(mktemp "$RUNNER_TEMP/atomgit-askpass.XXXXXX")"
+          trap 'rm -f "$ASKPASS"' EXIT
+          cat > "$ASKPASS" <<'SH'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' "$ATOMGIT_USERNAME" ;;
+            *Password*) printf '%s\n' "$ATOMGIT_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          SH
+          chmod 700 "$ASKPASS"
+          export GIT_ASKPASS="$ASKPASS" GIT_TERMINAL_PROMPT=0
+          unset GIT_TRACE GIT_TRACE_PACKET GIT_TRACE_CURL GIT_CURL_VERBOSE
+          REMOTE_TAG="$(git -c credential.helper= ls-remote "$REMOTE" "$TAG_REF" | awk '{print $1}')"
+          if [ -n "$REMOTE_TAG" ] && [ "$REMOTE_TAG" != "$TAG_OBJECT" ]; then
+            echo 'AtomGit release tag differs from GitHub; refusing to overwrite it' >&2
+            exit 1
+          fi
+          PUSH_ARGS=()
+          if [ "$DRY_RUN" = true ]; then PUSH_ARGS+=(--dry-run); fi
+          git -c credential.helper= push "${PUSH_ARGS[@]}" "$REMOTE" \
+            'refs/remotes/origin/main:refs/heads/main' "$TAG_REF:$TAG_REF"
+          if [ "$DRY_RUN" = true ]; then
+            echo 'Dry run: main and tag push checked without changing AtomGit'
+            exit 0
+          fi
+          REMOTE_REFS="$(git -c credential.helper= ls-remote "$REMOTE" refs/heads/main "$TAG_REF" "$TAG_REF^{}")"
+          test "$(awk '$2 == "refs/heads/main" {print $1}' <<< "$REMOTE_REFS")" = "$MAIN_COMMIT"
+          test "$(awk -v ref="$TAG_REF" '$2 == ref {print $1}' <<< "$REMOTE_REFS")" = "$TAG_OBJECT"
+          test "$(awk -v ref="$TAG_REF^{}" '$2 == ref {print $1}' <<< "$REMOTE_REFS")" = "$SOURCE_COMMIT"
+          echo "Verified AtomGit main and annotated $RELEASE_TAG tag against GitHub"
+      - name: Synchronize AtomGit release and verify attachment hashes
+        env:
+          SOURCE_COMMIT: ${{ steps.release.outputs.commit }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          ATOMGIT_TOKEN: ${{ secrets.ATOMGIT_TOKEN }}
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [ "$DRY_RUN" = true ]; then ARGS+=(--dry-run); fi
+          python scripts/sync_atomgit_release.py \
+            --release-json "$RUNNER_TEMP/github-release.json" \
+            --assets-dir "$RUNNER_TEMP/atomgit-assets" \
+            --target-commitish "$SOURCE_COMMIT" \
+            --repository "$ATOMGIT_REPOSITORY" "${ARGS[@]}"
