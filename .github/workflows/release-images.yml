@@ -917,3 +917,13 @@ jobs:
           fi
           gh release create "$TAG" dist/muteki-*.tar.gz dist/release-manifest.json dist/image-identity.json dist/desktop/*.dmg dist/desktop/*.zip \
             "${RELEASE_ARGS[@]}"
+
+  sync-atomgit:
+    needs: publish
+    if: ${{ needs.publish.result == 'success' }}
+    uses: ./.github/workflows/sync-atomgit-release.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets:
+      ATOMGIT_USERNAME: ${{ secrets.ATOMGIT_USERNAME }}
+      ATOMGIT_TOKEN: ${{ secrets.ATOMGIT_TOKEN }}
